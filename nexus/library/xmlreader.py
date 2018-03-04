@@ -253,8 +253,9 @@ class XMLreader(DevBase):
         pair='<!--','-->'
         self.xml = remove_pair_sections(self.xml,pair)
         #process includes
-        while self.xml.find('<include')!=-1:
-            self.include_files()
+        nreplaced = 1
+        while nreplaced>0 and self.xml.find('<include')!=-1:
+            nreplaced = self.include_files()
             self.xml = remove_pair_sections(self.xml,pair)
         #end while
         #remove empty lines
@@ -283,20 +284,29 @@ class XMLreader(DevBase):
     def include_files(self):
         pair = '<include','/>'
         qpair = '<?','?>'
+        nreplaced = 0
         ir=0
         while ir!=-1:
             il,ir = find_matching_pair(self.xml,pair,ir)
             if ir!=-1:
                 cont = self.xml[il:ir].strip(pair[0]).rstrip(pair[1])
-                fname = cont.split('=',1)[1].strip().strip('"')
-                fobj = open(os.path.join(self.base_path,fname),'r')
-                fcont = fobj.read()
-                fcont = remove_pair_sections(fcont,qpair)
-                fobj.close()
-                self.xml = self.xml.replace(self.xml[il:ir],fcont)
+                # workaround for fdlr include statement overloading
+                nearcont = cont[:min(len(cont),100)]
+                fdlr_include = 'wfn_x' in nearcont or 'wfn_d' in nearcont
+                if not fdlr_include:
+                    fname = cont.split('=',1)[1].strip().strip('"')
+                    fobj = open(os.path.join(self.base_path,fname),'r')
+                    fcont = fobj.read()
+                    fcont = remove_pair_sections(fcont,qpair)
+                    fobj.close()
+                    self.xml = self.xml.replace(self.xml[il:ir],fcont)
+                    nreplaced += 1
+                else:
+                    ir=-1 # ignore fldr include
+                #end if
             #end if
         #end while
-        return
+        return nreplaced
     #end def include_files
 
     def increment_level(self):

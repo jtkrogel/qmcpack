@@ -695,7 +695,16 @@ class QIxml(Names):
                 for p in value:
                     name = self.condense_name(p.name)
                     if name in self.params:
-                        self[name] = param(p)
+                        pval = param(p)
+                        if name in self.write_types and self.write_types[name] in bool_write_types:
+                            if pval in boolmap:
+                                self[name] = boolmap[pval]
+                            else:
+                                self.error('{0} is not a valid value for boolean parameter {1}\nvalid values are: {2}'.format(pval,name,boolmap.keys()))
+                            #end if
+                        else:
+                            self[name] = pval
+                        #end if
                     else:
                         junk_elem.append(name)
                     #end if
@@ -709,7 +718,7 @@ class QIxml(Names):
             self.collect_profile(xml,al,el,junk)
         #end for
         if not QIobj.permissive_read:
-            self.check_junk(junk)
+            self.check_junk(junk,exit=True)
         #end if
         if self.attr_types!=None:
             typed_attr = attr & set(self.attr_types.keys())
@@ -1704,7 +1713,11 @@ class random(QIxml):
 #end class random
 
 class include(QIxml):
-    attributes = ['href']
+    attributes = ['href',
+                  # odd overloads for fdlrwfn
+                  'wfn_x_href','wfn_d_href','opt_x','opt_d','singlet',
+                  ] 
+    write_types = obj(opt_x=yesno,opt_d=yesno,singlet=yesno)
 #end def include
 
 class mcwalkerset(QIxml):
@@ -1798,7 +1811,7 @@ sposet_builder = QIxmlFactory(
 
 class wavefunction(QIxml):
     attributes = ['name','target','id','ref']
-    elements   = ['sposet_builder','determinantset','jastrow']
+    elements   = ['sposet_builder','determinantset','fdlrwfn','jastrow']
     identifier = 'name','id'
 #end class wavefunction
 
@@ -1906,6 +1919,14 @@ class transformation(QIxml):
     elements   = ['correlation']
     identifier = 'name'
 #end class transformation
+
+
+class fdlrwfn(QIxml):
+    attributes = ['name']
+    elements = ['include']
+    identifier = 'name'
+#end class fdlrwfn
+
 
 class jastrow1(QIxml):
     tag = 'jastrow'
@@ -2365,9 +2386,16 @@ class linear(QIxml):
                   'walkers','nonlocalpp','usebuffer','gevmethod','steps','substeps',
                   'stabilizermethod','rnwarmupsteps','walkersperthread','minke',
                   'gradtol','alpha','tries','min_walkers','samplesperthread',
-                  'use_nonlocalpp_deriv']
+                  'use_nonlocalpp_deriv',
+                  'targetexcited','block_lm','nblocks','nolds','nkept',
+                  'nsamp_comp','omega','max_relative_cost_change',
+                  'max_param_change','shift_i','shift_s','num_shifts',
+                  'chase_lowest','chase_closest','variance_correctstr',
+                  'var_weight','build_matrix','spam','lm_spam_inner_iter',
+                  'appro_degree'
+                  ]
     costs      = ['energy','unreweightedvariance','reweightedvariance','variance','difference']
-    write_types = obj(gpu=yesno,usedrift=yesno,nonlocalpp=yesno,usebuffer=yesno,use_nonlocalpp_deriv=yesno)
+    write_types = obj(gpu=yesno,usedrift=yesno,nonlocalpp=yesno,usebuffer=yesno,use_nonlocalpp_deriv=yesno,targetexcited=yesno,variance_correctstr=yesno,block_lm=yesno,build_matrix=yesno,spam=yesno,chase_lowest=yesno,chase_closest=yesno)
 #end class linear
 
 class cslinear(QIxml):
@@ -2465,7 +2493,7 @@ classes = [   #standard classes
     header,local,force,forwardwalking,observable,record,rmc,pressure,dmccorrection,
     nofk,mpc_est,flux,distancetable,cpp,element,spline,setparams,
     backflow,transformation,cubicgrid,molecular_orbital_builder,cmc,sk,skall,gofr,
-    host,date,user,rpa_jastrow,momentum
+    host,date,user,rpa_jastrow,momentum,fdlrwfn
     ]
 types = dict( #simple types and factories
     #host           = param,
@@ -2515,42 +2543,44 @@ plurals_inv = plurals.inverse()
 plural_names = set(plurals.keys())
 single_names = set(plurals.values())
 Names.set_expanded_names(
-    elementtype      = 'elementType',
-    energydensity    = 'EnergyDensity',
-    gevmethod        = 'GEVMethod',
-    localenergy      = 'LocalEnergy',
-    lr_dim_cutoff    = 'LR_dim_cutoff',
-    minmethod        = 'MinMethod',
-    one_body         = 'One-Body',
-    speciesa         = 'speciesA',
-    speciesb         = 'speciesB',
-    substeps         = 'subSteps',
-    two_body         = 'Two-Body',
-    usedrift         = 'useDrift',
-    maxweight        = 'maxWeight',
-    warmupsteps      = 'warmupSteps',
-    twistindex       = 'twistIndex',
-    twistangle       = 'twistAngle',
-    usebuffer        = 'useBuffer',
-    mpc              = 'MPC',
-    kecorr           = 'KEcorr',
-    ionion           = 'IonIon',
-    elecelec         = 'ElecElec',
-    pseudopot        = 'PseudoPot',
-    posarray         = 'posArray',
-    #array            = 'Array',  # handle separately, namespace collision
-    atomicbasisset   = 'atomicBasisSet',
-    basisgroup       = 'basisGroup',
-    expandylm        = 'expandYlm',
-    mo               = 'MO',
-    numerical        = 'Numerical',
-    nearestneighbors = 'NearestNeighbors',
-    cuspcorrection   = 'cuspCorrection',
-    cuspinfo         = 'cuspInfo',
-    exctlvl          = 'exctLvl',
-    pairtype         = 'pairType',
-    printeloc        = 'printEloc',
-    spindependent    = 'spinDependent',
+    elementtype         = 'elementType',
+    energydensity       = 'EnergyDensity',
+    gevmethod           = 'GEVMethod',
+    localenergy         = 'LocalEnergy',
+    lr_dim_cutoff       = 'LR_dim_cutoff',
+    minmethod           = 'MinMethod',
+    one_body            = 'One-Body',
+    speciesa            = 'speciesA',
+    speciesb            = 'speciesB',
+    substeps            = 'subSteps',
+    two_body            = 'Two-Body',
+    usedrift            = 'useDrift',
+    maxweight           = 'maxWeight',
+    warmupsteps         = 'warmupSteps',
+    twistindex          = 'twistIndex',
+    twistangle          = 'twistAngle',
+    usebuffer           = 'useBuffer',
+    mpc                 = 'MPC',
+    kecorr              = 'KEcorr',
+    ionion              = 'IonIon',
+    elecelec            = 'ElecElec',
+    pseudopot           = 'PseudoPot',
+    posarray            = 'posArray',
+    #array               = 'Array',  # handle separately, namespace collision
+    atomicbasisset      = 'atomicBasisSet',
+    basisgroup          = 'basisGroup',
+    expandylm           = 'expandYlm',
+    mo                  = 'MO',
+    numerical           = 'Numerical',
+    nearestneighbors    = 'NearestNeighbors',
+    cuspcorrection      = 'cuspCorrection',
+    cuspinfo            = 'cuspInfo',
+    exctlvl             = 'exctLvl',
+    pairtype            = 'pairType',
+    printeloc           = 'printEloc',
+    spindependent       = 'spinDependent',
+    targetexcited       = 'targetExcited',
+    variance_correctstr = 'variance_correctStr',
    )
 for c in classes:
     c.init_class()
