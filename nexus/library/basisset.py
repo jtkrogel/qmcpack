@@ -82,17 +82,24 @@ class BasisSets(DevBase):
     #end def readbs
 
 
-    def bases_by_atom(self,*bsfiles):
+    def bases_by_atom(self,bsfiles,permissive=False):
         bss = obj()
+        extra = []
         for bsfile in bsfiles:
             if bsfile in self:
                 bs = self[bsfile]
                 bss[bs.element_label] = bs
+            elif permissive:
+                extra.append(bsfile)
             else:
                 self.error('basis file not found\nmissing file: {0}'.format(bsfile))
             #end if
         #end for
-        return bss
+        if not permissive:
+            return bss
+        else:
+            return bss,extra
+        #end if
     #end def bases_by_atom
 #end class BasisSets
 

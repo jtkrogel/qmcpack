@@ -35,7 +35,7 @@
 import os
 from numpy import array,ndarray,abs
 from generic import obj
-from periodic_table import pt
+from periodic_table import pt,is_element
 from developer import DevBase
 from nexus_base import nexus_noncore
 from simulation import SimulationInput
@@ -1113,46 +1113,70 @@ def generate_any_gamess_input(**kwargs):
         if pskw.symmetry!='C1':
             data+='\n'
         #end if
-        if pskw.pseudos is None:
-            if pskw.bases!=None:
-                bss = nexus_noncore.basissets.bases_by_atom(*pskw.bases)
-            else:
-                bss = obj()
-                if 'coord' not in gi.contrl:
-                    gi.contrl.coord = 'unique'
+        bss = obj()
+        if pskw.bases is not None:
+            standard_basissets = set(['ACCD'])
+            bss,extra = nexus_noncore.basissets.bases_by_atom(pskw.bases,permissive=True)
+            for basis in extra:
+                tokens = basis.split('.',1)
+                if len(tokens)!=2:
+                    self.error('cannot determine element for basis set: {0}\nbasis set names must be prefixed by an atomic symbol or label followed by a period\n(e.g. H.ACCD, etc)'.format(basis))
                 #end if
-            #end if
-            for i in range(len(elem)):
-                a = elem[i]
-                Z = pt[a].atomic_number
-                data+='{0} {1:3.2f} {2:16.8f} {3:16.8f} {4:16.8f}\n'.format(a,Z,*pos[i])
-                if a in bss:
-                    data+=bss[a].text+'\n\n'
+                elem_label,basisname = tokens
+                is_elem,symbol = is_element(elem_label,symbol=True)
+                if not is_elem:
+                    self.error('cannot determine element for basis set: {0}\nbasis set names must be prefixed by an atomic symbol or label\n(e.g. Si, Si1, etc)'.format(basis))
                 #end if
+                if basisname not in standard_basissets:
+                    self.error('unrecognized basis set for element {0}: {1}\nvalid options are: {2}'.format(symbol,basisname,sorted(standard_basissets)))
+                #end if
+                bss[elem_label] = obj(text=basisname)
             #end for
-        else:
-            gi.contrl.set(
-                coord = 'unique',
-                ecp   = 'read'
-                )
-            ecp = ''
+        #end if
+        pps = obj()
+        if pskw.pseudos is not None:
             pps = nexus_noncore.pseudopotentials.pseudos_by_atom(*pskw.pseudos)
-            atoms = set()
-            for i in range(len(elem)):
-                a = elem[i]
-                Z = pt[a].atomic_number
-                data+='{0} {1} {2:16.8f} {3:16.8f} {4:16.8f}\n'.format(a,Z,*pos[i])
-                if a in pps:
-                    pp = pps[a]
+        #end if
+        have_ecp = len(pps)>0
+        if 'coord' not in gi.contrl:
+            gi.contrl.coord = 'unique'
+        #end if
+        if have_ecp and 'ecp' not in gi.contrl:
+            gi.contrl.ecp = 'read'
+        #end if
+        ecp = ''
+        ecp_atoms = set()
+        for i,a in enumerate(elem):
+            Z = pt[a].atomic_number
+            data+='{0} {1:3.2f} {2:16.8f} {3:16.8f} {4:16.8f}\n'.format(a,Z,*pos[i])
+            set_basis = False
+            set_ecp   = False
+            if a in bss:
+                data+=bss[a].text+'\n\n'
+                set_basis = True
+            #end if
+            if a in pps:
+                pp = pps[a]
+                if pp.basis_text is not None:
                     data += pp.basis_text+'\n\n'
-                    if a in atoms:
-                        ecp += pp.pp_name+'\n'
-                    else:
-                        ecp += pp.pp_text+'\n'
-                    #end if
+                    set_basis = True
                 #end if
-                atoms.add(a)
-            #end for
+                if a in ecp_atoms:
+                    ecp += pp.pp_name+'\n'
+                else:
+                    ecp += pp.pp_text+'\n'
+                #end if
+                set_ecp = True
+                ecp_atoms.add(a)
+            #end if
+            if have_ecp and not set_ecp:
+                ecp += '  {0}-ECP NONE\n'.format(a)
+            #end if
+            if not set_basis:
+                self.error('basis set not found for species {0}\nplease provide a basis set'.format(a))
+            #end if
+        #end for
+        if have_ecp:
             gi.ecp = FormattedGroup(ecp)
         #end if
         gi.data = FormattedGroup(data)
