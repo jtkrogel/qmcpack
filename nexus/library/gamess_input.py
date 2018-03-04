@@ -622,11 +622,11 @@ class CidrtGroup(KeywordSpecGroup):
     keywords = set([
             'group','fors'  ,'foci'  ,'soci','iexcit','intact','nfzc' ,
             'ndoc' ,'naos'  ,'nbos'  ,'nalp','nval'  ,'next'  ,'nfzv' ,'stsym',
-            'noirr','mxnint','mxneme','nprt'
+            'noirr','mxnint','mxneme','nprt','istsym'
             ])
 
     integers = set(['iexcit','nfzc','ndoc','naos','nbos','nalp','nval',
-                    'next','nfzv','noirr','mxnint','mxneme','nprt'])
+                    'next','nfzv','noirr','mxnint','mxneme','nprt','istsym'])
     bools    = set(['fors','foci','soci','intact'])
     strings  = set(['group','stsym'])
 
