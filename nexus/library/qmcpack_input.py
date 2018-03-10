@@ -4472,6 +4472,42 @@ def generate_determinantset_old(type           = 'bspline',
 #end def generate_determinantset_old
 
 
+def generate_fdlrwfn(
+    name = 'FDLR',
+    wfn_x_href = None,
+    wfn_d_href = None,
+    opt_x      = None,
+    opt_d      = None,
+    singlet    = None
+    ):
+    
+    fdlr = fdlrwfn(
+        name = name,
+        )
+    inc = include()
+    if wfn_x_href is not None:
+        inc.wfn_x_href = wfn_x_href
+    #end if
+    if wfn_d_href is not None:
+        inc.wfn_d_href = wfn_d_href
+    #end if
+    if opt_x is not None:
+        inc.opt_x = opt_x
+    #end if 
+    if opt_d is not None:
+        inc.opt_d = opt_d
+    #end if 
+    if singlet is not None:
+        inc.singlet = singlet
+    #end if
+    if len(inc)>0:
+        fdlr.include = inc
+    #end if
+
+    return fdlr
+#end def generate_fdlrwfn
+
+
 def generate_hamiltonian(name         = 'h0',
                          type         = 'generic',
                          electrons    = 'e',
@@ -4871,7 +4907,7 @@ def generate_jastrow1(function='bspline',size=8,rcut=None,coeff=None,cusp=0.,ena
         corr = correlation(
             elementtype = element,
             size        = len(lcoeff),
-            cusp        = cusp,
+            cusp        = lcusp,
             coefficients=section(
                 id    = ename+element,
                 type  = 'Array',
@@ -5373,6 +5409,7 @@ def generate_basic_input(id             = 'qmc',
                          system         = 'missing',
                          pseudos        = None,
                          jastrows       = 'generateJ12',
+                         fdlr           = None,
                          interactions   = 'all',
                          corrections    = 'default',
                          observables    = None,
@@ -5451,8 +5488,17 @@ def generate_basic_input(id             = 'qmc',
             )
     #end if
 
-
-    if det_format=='new':
+    dset        = None
+    spobuilders = None
+    if fdlr is not None:
+        if isinstance(fdlr,fdlrwfn):
+            None
+        elif isinstance(fdlr,(dict,obj)):
+            fldr = generate_fdlrwfn(**fdlr)
+        else:
+            QmcpackInput.class_error('fdlr input is incorrect\nplease provide fldr input as an obj or dict\nyou provided type: {0}\nwith value'.format(fdlr.__class__.__name__,fdlr))
+        #end if
+    elif det_format=='new':
         if system!=None and isinstance(system.structure,Jellium):
             ssb = generate_sposet_builder(
                 type           = 'heg',
@@ -5513,9 +5559,13 @@ def generate_basic_input(id             = 'qmc',
     wfn = wavefunction(        
         name           = 'psi0',
         target         = 'e',
-        determinantset = dset
         )
 
+    if fdlr is not None:
+        wfn.fdlrwfn = fdlr
+    elif dset is not None:
+        wfn.determinantset = dset
+    #end if
 
     if jastrows!=None:
         wfn.jastrows = generate_jastrows(jastrows,system,check_ions=True)

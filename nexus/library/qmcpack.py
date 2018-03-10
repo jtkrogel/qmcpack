@@ -36,6 +36,7 @@ from qmcpack_input import TracedQmcpackInput
 from qmcpack_input import loop,linear,cslinear,vmc,dmc,collection,determinantset,hamiltonian,init,pairpot,bspline_builder
 from qmcpack_input import generate_jastrows,generate_jastrow,generate_jastrow1,generate_jastrow2,generate_jastrow3
 from qmcpack_input import generate_opt,generate_opts
+from qmcpack_input import fdlrwfn,include
 from qmcpack_analyzer import QmcpackAnalyzer
 from qmcpack_converters import Pw2qmcpack,Wfconvert,Convert4qmc
 from sqd import Sqd
@@ -399,6 +400,32 @@ class Qmcpack(Simulation):
             opt = QmcpackInput(result.opt_file)
             qs = input.get('qmcsystem')
             qs.wavefunction = opt.qmcsystem.wavefunction.copy()
+        elif result_name=='fdlr_wavefunction':
+            if not isinstance(sim,Convert4qmc):
+                self.error('incorporating fdlr wavefunction from {0} is not supported'.format(sim.__class__.__name__))
+            #end if
+            qs = input.get('qmcsystem')
+            wf = qs.wavefunction
+            if 'determinantset' in wf:
+                del wf.determinantset
+            #end if
+            if 'sposet_builders' in wf:
+                del wf.sposet_builders
+            #end if
+            if fdlrwfn in wf:
+                fdlr = wf.fdlrwfn
+            else:
+                fdlr = fdlrwfn(
+                    name = 'FDLR',
+                    include = include(opt_x=True,opt_d=False,singlet=True),
+                    )
+                wf.fdlrwfn = fdlr
+            #end if
+            fdlr.include.wfn_x_href = os.path.relpath(result.wfn_x,self.locdir)
+            fdlr.include.wfn_d_href = os.path.relpath(result.wfn_d,self.locdir)
+            print wf
+            print input.write()
+            exit()
         else:
             self.error('ability to incorporate result '+result_name+' has not been implemented')
         #end if        

@@ -887,8 +887,18 @@ class Simulation(NexusCore):
     #end def load_image
 
 
+    def load_input_image(self,imagepath=None):
+        if imagepath is None:
+            imagepath = os.path.join(self.imlocdir,self.input_image)
+        #end if
+        input = self.input.__class__()
+        input.load(imagepath)
+        return input
+    #end def load_input_image
+
+
     def load_analyzer_image(self,imagepath=None):
-        if imagepath==None:
+        if imagepath is None:
             imagepath = os.path.join(self.imresdir,self.analyzer_image)
         #end if
         analyzer = self.analyzer_type(self)

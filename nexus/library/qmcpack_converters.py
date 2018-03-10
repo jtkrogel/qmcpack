@@ -58,9 +58,11 @@
 
 
 import os
+from numpy import array,zeros
 from generic import obj
 from simulation import Simulation,SimulationInput,SimulationAnalyzer
 from gamess import Gamess
+from fileio import TextFile
 
 # read/write functions associated with pw2qmcpack only
 def read_str(sv):
@@ -576,8 +578,116 @@ def generate_wfconvert(**kwargs):
 
 
 
+# extract_fdlr_coeffs contributed by Nick Blunt
+def extract_fdlr_coeffs(data_file, state, norbs, ndoub):
+    '''Extract the CIS coefficients and orbital pairs for the corresponding
+       single excitations, from a GAMESS output file.'''
 
+    # Strings to search for, which mark the start of the section that we want
+    # to read from.
+    target_str = 'STATE #'
+    state_str = '  ' + str(state) + '  '
 
+    # String to mark the end of the CI wave function specifications.
+    end_str = "...... END OF CI-MATRIX DIAGONALIZATION ......"
+
+    # Have we found the header for the desired state?
+    state_found = False
+    # Are we reading lines which contain the actual data for the desired state?
+    have_data = False
+    # The first det has label 1, so the next one will be 2.
+    next_det = 2
+    # String to hold the orbital occupancy.
+    orb_string = ''
+
+    # List of all of orbitals and associated coefficients. Each element is
+    # itself a list, of the form:
+    # [ orb excited from, orb excited to, coefficient value ]
+    coeffs = []
+
+    f = open(data_file)
+
+    for line in f:
+        if have_data:
+            values = line.split()
+            next_det_str = '  ' + str(next_det) + '  '
+
+            # If we've finished reading the current determinant's data, and
+            # are about to get the next one (or are at the end of this
+            # state's data section).
+            if next_det_str in line or target_str in line or end_str in line:
+                # This should only be true if on the first configuration.
+                if orb_string != '':
+                    occ_string = orb_string[0:ndoub]
+                    from_orb = occ_string.find("1")
+
+                    virt_string = orb_string[ndoub:]
+                    to_orb = virt_string.find("1")
+
+                    # If a "1" was not found, and therefore we probably have
+                    # the HF det itself.
+                    if from_orb == -1 or to_orb == -1:
+                        coeff = float(values[1])
+                        orb_string = values[2]
+                        next_det += 1
+                        continue
+                    else:
+                        # If we have a configuration to add to the list.
+                        from_orb += 1
+                        to_orb += ndoub + 1
+                        # If the orbital excited from is not an even number of
+                        # moves from the end of the occupied section, then we
+                        # need to add a minus sign to the coefficient, to
+                        # correct for ordering of fermionic excitations.
+                        perm_test = ndoub - from_orb
+                        # (Note that from_orb is zero-indexed).
+                        if perm_test%2 == 0:
+                            coeff *= -1.0
+                        #end if
+                        coeffs.append( [from_orb, to_orb, coeff] )
+                        # If we're actually at the end of this state's section.
+                        if target_str in line or end_str in line:
+                            have_data = False
+                            continue
+                        #end if
+                    #end if
+                #end if
+                # Coefficient and start of the orbital string for the
+                # configuration we're now starting to read.
+                coeff = float(values[1])
+                orb_string = values[2]
+                next_det += 1
+
+            # If not a blank line, then add this line's orbitals to the full
+            # configuration, which will in general be split over many lines.
+            elif len(values) != 0:
+                orb_string += values[0]
+            #end if
+        elif state_found:
+            # If this is true then section with actual data is about to begin.
+            if " --- " in line:
+                have_data = True
+                state_found = False
+            #end if
+        # If this is true then we have the start of a new state's section.
+        elif target_str in line:
+            # If this is true then we have the state that we want.
+            if state_str in line:
+                state_found = True
+            # Otherwise we have a state that we don't want - stop reading in
+            # and storing data for the next sections.
+            else:
+                state_found = False
+            #end if
+        #end if
+    #end for
+
+    f.close()
+
+    coeffs.sort()
+
+    return coeffs
+#end def extract_fdlr_coeffs
 
 
 
@@ -692,12 +802,35 @@ class Convert4qmcInput(SimulationInput):
         add_3body_J        = False,# deprecated
         )
 
+    fdlr_inputs = ['fdlr_state','norbs','double_occ','coeff_factor']
 
     def __init__(self,**kwargs):
+        kwargs = obj(kwargs)
         # check that only allowed keyword inputs are provided
-        invalid = set(kwargs.keys())-set(self.input_types.keys())
+        invalid = set(kwargs.keys())-set(self.input_types.keys())-set(self.fdlr_inputs)
         if len(invalid)>0:
             self.error('invalid inputs encountered\nvalid keyword inputs are: {0}'.format(sorted(self.input_types.keys())))
+        #end if
+
+        # get fdlr inputs first, if present
+        fdlr = obj()
+        for k in self.fdlr_inputs:
+            if k in kwargs:
+                fdlr[k] = kwargs.delete(k)
+            #end if
+        #end for
+        if len(fdlr)>0:
+            fdlr.set_optional(
+                coeff_factor = 0.01,
+                norbs        = None,
+                )
+            required = ('fdlr_state','double_occ')
+            for k in required:
+                if k not in fdlr:
+                    self.error('{0} is a required fdlr input'.format(k))
+                #end if
+            #end for
+            self.fdlr = fdlr
         #end if
 
         # assign inputs
@@ -715,7 +848,7 @@ class Convert4qmcInput(SimulationInput):
         valid = True
         # check that all inputs have valid types and assign them
         for k,v in self.iteritems():
-            if v is not None and not isinstance(v,self.input_types[k]):
+            if v is not None and k!='fdlr' and not isinstance(v,self.input_types[k]):
                 valid = False
                 if exit:
                     self.error('keyword input {0} must be of type {1}\nyou provided a value of type {2}\nplease revise your input and try again'.format(k,self.input_types[k].__name__),v.__class__.__name__)
@@ -824,7 +957,7 @@ class Convert4qmc(Simulation):
     generic_identifier     = 'convert4qmc'
     application            = 'convert4qmc'
     application_properties = set(['serial'])
-    application_results    = set(['orbitals','particles'])
+    application_results    = set(['orbitals','particles','fdlr_wavefunction'])
 
 
     def set_app_name(self,app_name):
@@ -868,6 +1001,8 @@ class Convert4qmc(Simulation):
             calculating_result = True
         elif result_name=='particles':
             calculating_result = True
+        elif result_name=='fdlr_wavefunction':
+            calculating_result = 'fdlr' in self.input
         else:
             calculating_result = False
             self.error('ability to check for result '+result_name+' has not been implemented')
@@ -888,6 +1023,11 @@ class Convert4qmc(Simulation):
             #end if
         elif result_name=='particles':
             result.location = os.path.join(self.locdir,ptcl_file)
+        elif result_name=='fdlr_wavefunction':
+            wfn_d = self.input.prefix+'.wfn_d.xml'
+            wfn_x = self.input.prefix+'.wfn_x.xml'
+            result.wfn_d = os.path.join(self.locdir,wfn_d) 
+            result.wfn_x = os.path.join(self.locdir,wfn_x) 
         else:
             self.error('ability to get result '+result_name+' has not been implemented')
         #end if        
@@ -951,6 +1091,128 @@ class Convert4qmc(Simulation):
     def app_command(self):
         return self.input.app_command()
     #end def app_command
+
+
+    def post_analyze(self,analyzer):
+        input = self.input
+        # prepare fdlr wavefunction files
+        if 'fdlr' in input:
+            if self.input.hdf5:
+                self.error('fdlr is currently incompatible with orbitals stored in hdf5 format')
+            #end if
+
+            # get fdlr inputs
+            fdlr = input.fdlr
+            norbs = fdlr.norbs
+            stored_input = self.load_input_image() # input w/ orbital count info
+            if norbs is None:
+                norbs = stored_input.read_initial_guess
+            #end if
+
+            # locate gamess output
+            gms_out = os.path.abspath(os.path.join(self.locdir,stored_input.gamess_ascii))
+            if not os.path.exists(gms_out):
+                self.warn('GAMESS output file does not exist\nfilepath: {0}\ncannot proceed with FDLR wavefunction'.format(gms_out))
+                self.failed = True
+                return
+            #end if
+
+            # extract state coefficients
+            failed = False
+            try:
+                coeffs = extract_fdlr_coeffs(
+                    data_file = gms_out,
+                    state     = fdlr.fdlr_state,
+                    norbs     = norbs,
+                    ndoub     = fdlr.double_occ,
+                    )
+            except:
+                failed = True
+            #end try
+            if failed or len(coeffs)==0:
+                self.warn('FDLR state coefficient extraction failed\ncannot proceed with FDLR wavefunction')
+                self.failed = True
+                return
+            #end if
+            coeffs  = fdlr.coeff_factor*array(coeffs,dtype=float)[:,2]
+            zcoeffs = zeros(coeffs.shape)
+            
+            # open wavefunction file made by convert4qmc
+            wfn_file,ptcl_file = self.list_output_files()
+            temp_file = os.path.join(self.locdir,wfn_file)
+            if not os.path.exists(temp_file):
+                self.warn('QMCPACK input file does not exist\nfilepath: {0}\ncannot proceed with FDLR wavefunction'.format(temp_file))
+                self.failed = True
+                return
+            #end if
+            tf = TextFile(temp_file)
+
+            # get determinantset block
+            tf.seek('<wavefunction',0)
+            tf.seek('\n',1)
+            i1 = tf.tell()+1
+            tf.seek('</basisset>',1)
+            tf.seek('\n',1)
+            i2 = tf.tell()+1
+            dset = tf[i1:i2]
+            
+            # get up det contents
+            tf.seek('<determinant',1)
+            tf.seek('\n',1)
+            i1 = tf.tell()+1
+            tf.seek('</coefficient>',1)
+            tf.seek('\n',1)
+            i2 = tf.tell()+1
+            updet = tf[i1:i2]
+            
+            # get down det contents
+            tf.seek('<determinant',1)
+            tf.seek('\n',1)
+            i1 = tf.tell()+1
+            tf.seek('</coefficient>',1)
+            tf.seek('\n',1)
+            i2 = tf.tell()+1
+            dndet = tf[i1:i2]
+
+            # create wfn_d and wfn_x files
+            for wfn,coef in [('wfn_d',coeffs),('wfn_x',zcoeffs)]:
+                scoef = ''
+                for cv in coef:
+                    scoef += '           {0: 16.8e}\n'.format(cv)
+                #end for
+                c = '<?xml version="1.0"?>\n'
+                c += '<{0}>\n'.format(wfn)
+                c += dset
+                c += '     <slaterdeterminant optimize="yes">\n'
+                c += '       <determinant id="det_up" sposet="spo-up">\n'
+                c += '         <opt_vars size="{0}">\n'.format(len(coef))
+                c += scoef
+                c += '         </opt_vars>\n'
+                c += '       </determinant>\n'
+                c += '       <determinant id="det_down" sposet="spo-dn">\n'
+                c += '         <opt_vars size="{0}">\n'.format(len(coef))
+                c += scoef
+                c += '         </opt_vars>\n'
+                c += '       </determinant>\n'
+                c += '     </slaterdeterminant>\n'
+                c += '     <sposet basisset="LCAOBSet" name="spo-up" size="{0}" optimize="yes">\n'.format(norbs)
+                c += updet
+                c += '     </sposet>\n'
+                c += '     <sposet basisset="LCAOBSet" name="spo-dn" size="{0}" optimize="yes">\n'.format(norbs)
+                c += dndet
+                c += '     </sposet>\n'
+                c += '  </determinantset>\n'
+                c += '</{0}>\n'.format(wfn)
+                filename = '{0}.{1}.xml'.format(self.input.prefix,wfn)
+                filepath = os.path.join(self.locdir,filename)
+                fobj = open(filepath,'w')
+                fobj.write(c)
+                fobj.close()
+            #end for
+
+            tf.close()
+        #end if
+    #end def post_analyze
 #end class Convert4qmc
 
 

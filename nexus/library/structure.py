@@ -5389,7 +5389,7 @@ def generate_crystal_structure(lattice=None,cell=None,centering=None,
                                kpoints=None,kweights=None,kgrid=None,kshift=(0,0,0),permute=None,
                                structure=None,shape=None,element=None,scale=None, #legacy inputs
                                operations=None,
-                               struct_type=Crystal,elem=None,pos=None,frozen=None,
+                               struct_type=Crystal,elem=None,pos=None,frozen=None,bconds=None,
                                posu=None):    
 
     if structure!=None:
