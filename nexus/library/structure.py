@@ -697,7 +697,9 @@ class Structure(Sobj):
                  background_charge = 0,
                  frozen            = None,
                  bconds            = None,
-                 posu              = None):
+                 posu              = None,
+                 kpointsu          = None,
+                 ):
 
         if center is None:
             if axes is not None:
@@ -716,7 +718,7 @@ class Structure(Sobj):
         if elem is None:
             elem = []
         #end if
-        if posu!=None:
+        if posu is not None:
             pos = posu
         #end if
         if pos is None:
@@ -747,10 +749,10 @@ class Structure(Sobj):
         else:
             self.kaxes=2*pi*inv(self.axes).T
         #end if
-        if posu!=None:
+        if posu is not None:
             self.pos_to_cartesian()
         #end if
-        if frozen!=None:
+        if frozen is not None:
             self.frozen = array(frozen,dtype=bool)
             if self.frozen.shape!=self.pos.shape:
                 self.error('frozen directions must have the same shape as positions\n  positions shape: {0}\n  frozen directions shape: {1}'.format(self.pos.shape,self.frozen.shape))
@@ -764,8 +766,11 @@ class Structure(Sobj):
                       magnetic_prim  = magnetic_prim
                       )
         #end if
+        if kpointsu is not None:
+            kpoints = kpointsu
+        #end if
         if kpoints is not None:
-            self.add_kpoints(kpoints,kweights)
+            self.add_kpoints(kpoints,kweights,unitcoord=kpointsu is not None)
         #end if
         if kgrid is not None:
             self.add_kmesh(kgrid,kshift)
@@ -775,10 +780,10 @@ class Structure(Sobj):
         else:
             self.scale = scale
         #end if
-        if permute!=None:
+        if permute is not None:
             self.permute(permute)
         #end if
-        if operations!=None:
+        if operations is not None:
             self.operate(operations)
         #end if
     #end def __init__
@@ -3205,9 +3210,12 @@ class Structure(Sobj):
     #end def tilematrix
             
 
-    def add_kpoints(self,kpoints,kweights=None,unique=False):
+    def add_kpoints(self,kpoints,kweights=None,unique=False,unitcoord=False):
         if kweights is None:
             kweights = ones((len(kpoints),))
+        #end if
+        if unitcoord:
+            kpoints = self.kpoints_to_cartesian(kpoints)
         #end if
         self.kpoints  = append(self.kpoints,kpoints,axis=0)
         self.kweights = append(self.kweights,kweights)
@@ -3534,9 +3542,22 @@ class Structure(Sobj):
     #end def pos_unit
 
 
-    def pos_to_cartesian(self):
-        self.pos = dot(self.pos,self.axes)
+    def pos_to_cartesian(self,pos=None):
+        if pos is not None:
+            return dot(pos,self.axes)
+        else:
+            self.pos = dot(self.pos,self.axes)
+        #end if
     #end def pos_to_cartesian
+
+
+    def kpoints_to_cartesian(self,kpoints=None):
+        if kpoints is not None:
+            return dot(kpoints,self.kaxes)
+        else:
+            self.kpoints = dot(self.kpoints,self.kaxes)
+        #end if
+    #end def kpoints_to_cartesian
 
 
     def at_Gpoint(self):
@@ -4878,6 +4899,22 @@ class Crystal(Structure):
                  pos            = None):
 
         if lattice is None and cell is None and atoms is None and units is None:
+            Structure.__init__(
+                self,
+                tiling         = tiling,
+                axes           = axes,
+                units          = units,
+                kpoints        = kpoints,
+                kgrid          = kgrid,
+                kshift         = kshift,
+                frozen         = frozen,
+                magnetization  = magnetization,
+                magnetic_order = magnetic_order,
+                magnetic_prim  = magnetic_prim,
+                permute        = permute,
+                operations     = operations,
+                elem           = elem,
+                pos            = pos)
             return
         #end if
 
@@ -5245,7 +5282,299 @@ class Jellium(Structure):
 #end class Jellium
 
 
-    
+
+def quantum_espresso_axes(ibrav,celldm,alias='',loc='quantum_espresso_axes'):
+
+    celldm_required = {
+        0   : [1],           # free
+        1   : [1],           # cubic P (sc)
+        2   : [1],           # cubic F (fcc)
+        3   : [1],           # cubic I (bcc)
+        -3  : [1],           # cubic I (bcc), more symmetric axis
+        4   : [1,3],         # Hexagonal and Trigonal P
+        5   : [1,3,4],       # Trigonal R, 3fold axis c
+        -5  : [1,3,4],       # Trigonal R, 3fold axis <111>
+        6   : [1,3],         # Tetragonal P (st)
+        7   : [1,3],         # Tetragonal I (bct)
+        8   : [1,2,3],       # Orthorhombic P
+        9   : [1,2,3],       # Orthorhombic base-centered(bco)
+        -9  : [1,2,3],       # Orthorhombic base-centered(bco), alternate
+        10  : [1,2,3],       # Orthorhombic face-centered
+        11  : [1,2,3],       # Orthorhombic body-centered
+        12  : [1,2,3,4],     # Monoclinic P, unique axis c
+        -12 : [1,2,3,5],     # Monoclinic P, unique axis b
+        13  : [1,2,3,4],     # Monoclinic base-centered
+        14  : [1,2,3,4,5,6], # Triclinic 
+        }
+    valid_ibrav  = set(celldm_required.keys())
+
+    # check for any errors in the user input
+    if not isinstance(ibrav,int) or ibrav not in valid_ibrav:
+        error('{0}ibrav must be one of the following integers\nvalid values: {1}\nyou provided: {2}'.format(alias,sorted(valid_ibrav),ibrav),loc)
+    #end if
+    if not isinstance(celldm,(dict,obj)):
+        error('{0}celldm must be a dictionary of integer/real-value pairs\nfor example, to specify celldm(1)=15, celldm(2)=0.95, and celldm(3)=1.23\nprovide {0}celldm = {{1:15, 2:0.95, 3:1.23}}\nyou provided type: {1}\nwith value: {2}'.format(alias,celldm.__class__.__name__,celldm),loc)
+    elif set(celldm.keys())!=set(celldm_required[ibrav]):
+        cin  = set(celldm.keys())
+        creq = set(celldm_required[ibrav])
+        extra   = sorted(cin-creq)
+        missing = sorted(creq-cin)
+        msg = '{0}celldm keys for {0}ibrav={1} must be integers in set: {2}\nyou provided keys: {3}'.format(alias,ibrav,sorted(creq),sorted(cin))
+        if len(extra)>0:
+            msg+= '\ninvalid keys: {0}'.format(extra)
+        #end if
+        if len(missing)>0:
+            msg+='\nmissing keys: {0}'.format(missing)
+        #end if
+        msg+= '\nfull {0}celldm provided: {1}'.format(alias,celldm)
+        error(msg,loc)
+    else:
+        for k,v in celldm.iteritems():
+            if not isinstance(v,(int,float)):
+                error('{0}celldm values must be real numbers\ninvalid type encountered for key {1}: {2}\nfull {0}celldm provided: {3}'.format(alias,k,v,celldm),loc)
+            #end if
+        #end for
+    #end if
+
+    # ensure all celldm values are floats
+    for k,v in celldm.iteritems():
+        celldm[k] = float(v)
+    #end for
+
+    # generate the axes according to the QM Espresso input specification
+    a = celldm[1]
+    # free
+    if ibrav==0:
+        return None
+    # cubic P (sc)
+    elif ibrav==1:
+        v1 = a*array((1,0,0))
+        v2 = a*array((0,1,0))
+        v3 = a*array((0,0,1))
+    # cubic F (fcc)
+    elif ibrav==2:
+        v1 = (a/2)*array((-1, 0, 1))
+        v2 = (a/2)*array(( 0, 1, 1))
+        v3 = (a/2)*array((-1, 1, 0))
+    # cubic I (bcc)
+    elif ibrav==3:
+        v1 = (a/2)*array(( 1, 1, 1))  
+        v2 = (a/2)*array((-1, 1, 1))  
+        v3 = (a/2)*array((-1,-1, 1))
+    # cubic I (bcc), more symmetric axis
+    elif ibrav==-3:
+        v1 = (a/2)*array((-1, 1, 1))
+        v2 = (a/2)*array(( 1,-1, 1))
+        v3 = (a/2)*array(( 1, 1,-1))
+    # Hexagonal and Trigonal P
+    elif ibrav==4:
+        c_a = celldm[3]
+        v1 = a*array((    1,          0,   0))
+        v2 = a*array((-1./2, sqrt(3.)/2,   0))
+        v3 = a*array((    0,          0, c_a))
+    # Trigonal R, 3fold axis c
+    elif ibrav==5:
+        c  = celldm[4] # cos(gamma)
+        tx = sqrt((1-c)/2) 
+        ty = sqrt((1-c)/6) 
+        tz = sqrt((1+2*c)/3)
+        v1 = a*array(( tx,  -ty, tz))
+        v2 = a*array((  0, 2*ty, tz))
+        v3 = a*array((-tx,  -ty, tz))
+    # Trigonal R, 3fold axis <111>    
+    elif ibrav==-5:
+        c  = celldm[4] # cos(gamma)
+        tx = sqrt((1-c)/2) 
+        ty = sqrt((1-c)/6) 
+        tz = sqrt((1+2*c)/3)
+        u  = tz - 2*sqrt(2.)*ty
+        v  = tz + sqrt(2.)*ty
+        ap = a/sqrt(3.)
+        v1 = ap*array((u,v,v))
+        v2 = ap*array((v,u,v))
+        v3 = ap*array((v,v,u))
+    # Tetragonal P (st)
+    elif ibrav==6:
+        c_a = celldm[3]
+        v1 = a*array(( 1, 0,  0))
+        v2 = a*array(( 0, 1,  0))
+        v3 = a*array(( 0, 0,c_a))
+    # Tetragonal I (bct)
+    elif ibrav==7:
+        c_a = celldm[3]
+        v1 = (a/2)*array(( 1,-1,c_a))
+        v2 = (a/2)*array(( 1, 1,c_a))
+        v3 = (a/2)*array((-1,-1,c_a))
+    # Orthorhombic P
+    elif ibrav==8:
+        b  = a*celldm[2]
+        c  = a*celldm[3]
+        v1 = array((a,0,0))
+        v2 = array((0,b,0))
+        v3 = array((0,0,c))
+    # Orthorhombic base-centered(bco)
+    elif ibrav==9:
+        b  = a*celldm[2]
+        c  = a*celldm[3]
+        v1 = array(( a/2, b/2, 0))
+        v2 = array((-a/2, b/2, 0))
+        v3 = array((   0,   0, c))
+    # Orthorhombic base-centered(bco), alternate description
+    elif ibrav==-9:
+        b  = a*celldm[2]
+        c  = a*celldm[3]
+        v1 = (a/2,-b/2, 0)
+        v2 = (a/2, b/2, 0)
+        v3 = (  0,   0, c)
+    # Orthorhombic face-centered
+    elif ibrav==10:
+        b = a*celldm[2]
+        c = a*celldm[3]
+        v1 = (a/2,   0, c/2)
+        v2 = (a/2, b/2,   0)
+        v3 = (  0, b/2, c/2)
+    # Orthorhombic body-centered
+    elif ibrav==11:
+        b = a*celldm[2]
+        c = a*celldm[3]
+        v1 = ( a/2, b/2, c/2)
+        v2 = (-a/2, b/2, c/2)
+        v3 = (-a/2,-b/2, c/2)
+    # Monoclinic P, unique axis c
+    elif ibrav==12:
+        b = a*celldm[2]
+        c = a*celldm[3]
+        cosab = celldm[4]
+        sinab = sqrt(1.-cosab**2)
+        v1 = (      a,       0, 0)
+        v2 = (b*cosab, b*sinab, 0)
+        v3 = (      0,       0, c)
+    # Monoclinic P, unique axis b
+    elif ibrav==-12:
+        b = a*celldm[2]
+        c = a*celldm[3]
+        cosac = celldm[5]
+        sinac = sqrt(1.-cosac**2)
+        v1 = (      a, 0,       0)
+        v2 = (      0, b,       0)
+        v3 = (c*cosac, 0, c*sinac)
+    # Monoclinic base-centered
+    elif ibrav==13:
+        b = a*celldm[2]
+        c = a*celldm[3]
+        cosab = celldm[4]
+        sinab = sqrt(1.-cosab**2)
+        v1 = (    a/2,       0, -c/2)
+        v2 = (b*cosab, b*sinab,    0)
+        v3 = (    a/2,       0,  c/2)
+    # Triclinic
+    elif ibrav==14:
+        b = a*celldm[2]
+        c = a*celldm[3]
+        cosbc = celldm[4]
+        cosac = celldm[5]
+        cosab = celldm[6]
+        sinab = sqrt(1.-cosab**2)
+        v3ay = (cosbc-cosac*cosab)/sinab
+        v3az = sqrt(1.+2*cosbc*cosac*cosab-cosbc^2-cosac^2-cosab^2)/sinab
+        v1 = (      a,       0,      0)
+        v2 = (b*cosab, b*sinab,      0)
+        v3 = (c*cosac,  c*v3ay, c*v3az)
+    else:
+        error('ibrav error',loc)
+    #end if
+
+    axes = array((v1,v2,v3),dtype=float)
+
+    return axes
+#end def quantum_espresso_axes
+
+
+def get_formatted_kwarg(kwargs,key):
+    if key in kwargs:
+        kw = kwargs[key]
+        if isinstance(kw,str):
+            return kw
+        else:
+            return None
+        #end if
+    #end if
+#end def get_formatted_kwarg
+
+
+def read_formatted_fields(kwargs,loc='generate_structure'):
+    axes = get_formatted_kwarg(kwargs,'axes')
+    if axes is not None:
+        try:
+            axes = array(axes.split(),dtype=float)
+            axes.shape = 3,3
+            kwargs['axes'] = axes
+        except:
+            error('failed to read axes in text format\naxes must be specified by 9 real numbers separated by spaces\nyou provided:\n{0}'.format(axes),loc)
+        #end try
+    #end if
+    elem = get_formatted_kwarg(kwargs,'elem')
+    if elem is not None:
+        kwargs['elem'] = elem.split()
+    #end if
+    for key in ['kweights']:
+        val = get_formatted_kwarg(kwargs,key)
+        if val is not None:
+            try:
+                kwargs[key] = array(val.split(),dtype=float)
+            except:
+                error('failed to read {0} in text format\n{0} must be a list of real numbers separated by spaces\nyou provided:\n{1}'.format(key,val),loc)
+            #end try
+        #end if
+    #end for
+    for key in ['pos','posu','kpoints','kpointsu']:
+        val = get_formatted_kwarg(kwargs,key)
+        if val is not None:
+            try:
+                val = array(val.split(),dtype=float)
+                val.shape = len(val)/3,3
+                kwargs[key] = val
+            except:
+                error('failed to read {0} in text format\n{0} must be a list of real number separated by spaces\nthe number of entries must be a multiple of three\nyou provided:\n{1}'.format(key,val),loc)
+            #end try
+        #end if
+    #end for
+    table_descriptors = [
+        ('elem_pos'         ,1,3,str  ,float),
+        ('elem_posu'        ,1,3,str  ,float),
+        ('kpoints_kweights' ,3,1,float,float),
+        ('kpointsu_kweights',3,1,float,float),
+        ]
+    for pair,nleft,nright,tleft,tright in table_descriptors:
+        val = get_formatted_kwarg(kwargs,pair)
+        if val is not None:
+            kleft,kright = pair.split('_')
+            try:
+                ntot = nleft+nright
+                sval = array(val.split(),dtype=str)
+                sval.shape = len(sval)/ntot,ntot
+                vleft  = array(sval[:,    0:nleft],dtype=tleft )
+                vright = array(sval[:,nleft:ntot ],dtype=tright)
+                if nleft==1:
+                    vleft = vleft.ravel()
+                #end if
+                if nright==1:
+                    vright = vright.ravel()
+                #end if
+                kwargs[kleft]  = vleft
+                kwargs[kright] = vright
+                del kwargs[pair]
+            except:
+                stypes = {str:'element labels',float:'real numbers'}
+                error('failed to read {0} in text format\n{0} must be a table containing {1} columns\nthe left {2} columns must be {3}\nthe right {4} columns must be {5}\nyou provided:\n{6}'.format(pair,ntot,nleft,stypes[tleft],nright,stypes[tright],val),loc)
+            #end try
+        elif pair in kwargs:
+            error('{0} must be provided in text format as a table\nyou provided:\n{1}'.format(pair,val))
+        #end if
+    #end for
+
+    return kwargs
+#end def read_formatted_fields
     
 
 
@@ -5271,6 +5600,7 @@ def generate_cell(shape,tiling=None,scale=1.,units=None,struct_type=Structure):
 
 
 def generate_structure(type='crystal',*args,**kwargs):
+    kwargs = read_formatted_fields(kwargs)
     if type=='crystal':
         s = generate_crystal_structure(*args,**kwargs)
     elif type=='defect':
@@ -5480,9 +5810,13 @@ def generate_crystal_structure(
     pos            = None,
     frozen         = None,
     posu           = None,
+    kpointsu       = None,
     folded_elem    = None,
     folded_pos     = None,
     folded_units   = None,
+    #additional quantum espresso support
+    qe_ibrav       = None,
+    qe_celldm      = None,
     #legacy inputs
     structure      = None,
     shape          = None,
@@ -5503,10 +5837,23 @@ def generate_crystal_structure(
         constants = scale
     #end if
 
+    # handle quantum espresso inputs
+    if qe_ibrav is not None or qe_celldm is not None:
+        axes = quantum_espresso_axes(
+            ibrav  = qe_ibrav,
+            celldm = qe_celldm,
+            alias  = 'qe_',
+            loc    = 'generate_crystal_structure'
+            )
+        if units is None:
+            units = 'B'
+        #end if
+    #end if
+
     #interface for total manual specification
     # this is only here because 'crystal' is default and must handle other cases
     s = None
-    if elem is not None and (pos is not None or posu is not None):  
+    if elem is not None and (pos is not None or posu is not None):
         s = Structure(
             axes           = axes,
             elem           = elem,
@@ -5518,12 +5865,15 @@ def generate_crystal_structure(
             magnetic_prim  = magnetic_prim,
             tiling         = tiling,
             kpoints        = kpoints,
+            kweights       = kweights,
             kgrid          = kgrid,
             kshift         = kshift,
             permute        = permute,
             rescale        = False,
             operations     = operations,
-            posu           = posu)
+            posu           = posu,
+            kpointsu       = kpointsu,
+            )
     elif isinstance(structure,Structure):
         s = structure
         if tiling is not None:
@@ -5571,12 +5921,14 @@ def generate_crystal_structure(
         magnetic_order = magnetic_order,
         magnetic_prim  = magnetic_prim ,
         kpoints        = kpoints       ,
+        kweights       = kweights      ,
         kgrid          = kgrid         ,
         kshift         = kshift        ,
         permute        = permute       ,
         operations     = operations    ,
         elem           = elem          ,
-        pos            = pos
+        pos            = pos           ,
+        kpointsu       = kpointsu      ,
         )
 
     if struct_type!=Crystal:

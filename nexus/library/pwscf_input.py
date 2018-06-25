@@ -996,7 +996,7 @@ class k_points(Card):
         elif spec=='tpiba_b' or spec=='crystal_b':
             self.error('specifiers tpiba_b and crystal_b have not yet been implemented in change_specifier')
         else:
-            self.error('old specifier for k_points is invalid\n  old specifier: '+spec+'\n  valid options: tpiba, gamma, crystal, automatic, tpiba_b, crystal_b')
+            self.error('old specifier for k_points is invalid\nold specifier: '+spec+'\nvalid options: tpiba, gamma, crystal, automatic, tpiba_b, crystal_b')
         #end if
 
         spec = new_specifier
@@ -1013,7 +1013,7 @@ class k_points(Card):
         elif spec=='tpiba_b' or spec=='crystal_b':
             self.error('specifiers tpiba_b and crystal_b have not yet been implemented in change_specifier')
         else:
-            self.error('new specifier for k_points is invalid\n  new specifier: '+spec+'\n  valid options: tpiba, gamma, crystal, automatic, tpiba_b, crystal_b')
+            self.error('new specifier for k_points is invalid\nnew specifier: '+spec+'\nvalid options: tpiba, gamma, crystal, automatic, tpiba_b, crystal_b')
         #end if
             
         self.kpoints   = kpoints
@@ -1569,7 +1569,7 @@ class PwscfInput(SimulationInput):
 
 
 
-def generate_pwscf_input(selector,**kwargs):
+def generate_pwscf_input(selector='generic',**kwargs):
     if 'system' in kwargs:
         system = kwargs['system']
         if isinstance(system,PhysicalSystem):
@@ -1594,6 +1594,14 @@ def generate_pwscf_input(selector,**kwargs):
 
 
 generate_any_defaults = obj(
+    none     = obj(
+        pseudos    = list,
+        kgrid      = None,
+        kshift     = None,
+        use_folded = True,
+        hubbard_u  = None,
+        start_mag  = None,
+        ),
     standard = obj(
         prefix     = 'pwscf',
         outdir     = 'pwscf_output',
@@ -1751,6 +1759,7 @@ def generate_any_pwscf_input(**kwargs):
     nogamma    = kwargs.delete_optional('nogamma',False)
     totmag_sys = kwargs.delete_optional('totmag_sys',False)
     bandfac    = kwargs.delete_optional('bandfac',None)
+    klines     = kwargs.delete_optional('klines',None)
 
     #  pseudopotentials
     pseudopotentials = obj()
@@ -1867,6 +1876,31 @@ def generate_any_pwscf_input(**kwargs):
             grid      = (1,1,1),
             shift     = (0,0,0)
             )
+    elif klines is not None:
+        pw.k_points.clear()
+        try:
+            kl = array(klines.split())
+            kl.shape = len(kl)/7,7
+            kpstart  = array(kl[:,0:3],dtype=float)
+            kpend    = array(kl[:,3:6],dtype=float)
+            nkpoints = array(kl[:,6]  ,dtype=int  )
+            kpoints  = []
+            for kps,kpe,nkp in zip(kpstart,kpend,nkpoints):
+                dk = (kpe-kps)/nkp
+                for i in range(nkp+1):
+                    kpoints.append(kps+i*dk)
+                #end for
+            #end for
+            kweights = len(kpoints)*[1.0]
+            pw.k_points.set(
+                specifier = 'crystal',
+                nkpoints  = len(kpoints),
+                kpoints   = array(kpoints),
+                weights   = array(kweights),
+                )
+        except:
+            PwscfInput.class_error('could not read klines input\nklines must be a table with seven columns and any number of rows\nthe first three columns give starting kpoints\nthe next three columns give ending kpoints\nthe last column gives the number of intervals between the kpoints\nyou provided: {0}'.format(klines),'generate_pwscf_input')
+        #end try
     #elif shifted:
     #    pw.k_points.clear()
     #    pw.k_points.set(
@@ -2344,7 +2378,7 @@ def generate_vcrelax_input(
     # end if
 
     return pw
-# end def
+# end def generate_vcrelax_input
 
 
 #def generate_nscf_input(prefix='pwscf',outdir='pwscf_output',ecut=200.,kpoints=None,weights=None,pseudos=None,system=None):
