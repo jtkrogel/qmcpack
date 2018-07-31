@@ -131,6 +131,28 @@ TrialWaveFunction::evaluateLog(ParticleSet& P)
   }
 
   convert(logpsi,LogValue);
+
+  // compute the laplacian the direct way
+  ValueType lap = Dot(P.G,P.G) + Sum(P.L);
+  app_log()<<"Hcheck: direct laplacian: "<<lap<<std::endl;
+
+  // compute the laplacian as the trace of the hessian
+  HessVector_t H;
+  evaluateHessian(P,H); // logarithmic hessian
+
+  size_t N = P.getTotalNum(); // include derivative cross terms
+  for(int n=0;n<N;n++)
+    for(int i=0;i<OHMMS_DIM;i++)
+      for(int j=0;j<OHMMS_DIM;j++)
+        H[n](i,j) += P.G[n][i]*P.G[n][j];
+
+  ValueType L=0;
+  for(int n=0;n<N;n++)
+    for(int d=0;d<OHMMS_DIM;d++)
+      L += H[n](d,d);
+
+  app_log()<<"Hcheck: lap from hessian: "<<L<<std::endl;
+
   return LogValue;
   //return LogValue=real(logpsi);
 }
