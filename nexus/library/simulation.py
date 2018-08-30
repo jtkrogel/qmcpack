@@ -70,7 +70,7 @@ import sys
 import shutil
 import string
 from subprocess import Popen,PIPE
-from developer import unavailable,ci
+from developer import unavailable,ci,DevBase
 from generic import obj
 from periodic_table import is_element
 from physical_system import PhysicalSystem
@@ -1385,6 +1385,196 @@ class Simulation(NexusCore):
 
 
 
+from numpy import ndarray
+class ScanSet(DevBase):
+    def __init__(self,scan_lists=None,covarying=False):
+        self.parameters = None
+        self.values     = None
+        self.indices    = None
+        self.labels     = None
+        self.values_in  = None
+        self.labels_in  = None
+        self.scan_lists = []
+        if scan_lists is not None:
+            self.add_scan_lists(scan_lists,covarying)
+        #end if
+    #end def __init__
+
+
+    def add_scan_lists(self,scan_lists,covarying=False):
+        if isinstance(scan_lists,obj):
+            scan_in = scan_lists
+            scan_lists = []
+            if not covarying:
+                for parameter in sorted(scan_in.keys()):
+                    value_list = scan_in[parameter]
+                    scan_list = (parameter,value_list)
+                    scan_lists.append(scan_list)
+                #end for
+            else:
+                scan_list = []
+                for parameter in sorted(scan_in.keys()):
+                    value_list = scan_in[parameter]
+                    scan_list.append(parameter)
+                    scan_list.append(value_list)
+                #end for
+                scan_lists.append(scan_list)
+            #end if
+        #end if
+        for scan_list in scan_lists:
+            self.add_scan_list(scan_list)
+        #end for
+    #end def add_scan_lists
+
+
+    def add_scan_list(self,scan_list):
+        if not isinstance(scan_list,(tuple,list)):
+            self.error('scan list must be a tuple or list\ntype received: {0}'.format(scan_list.__class__.__name__))
+        #end if
+        misformatted = len(scan_list)<2 or len(scan_list)%2!=0
+        if not misformatted:
+            vars_in = scan_list[0::2]
+            vals_in = scan_list[1::2]
+            all_vars = set(vars_in)
+            vars = []
+            values_in = obj()
+            labels_in = obj()
+            for var,val_list in zip(vars_in,vals_in):
+                misformatted |= not isinstance(var,str) or not isinstance(val_list,(tuple,list,ndarray))
+                if isinstance(var,str):
+                    if var.endswith('_labels'):
+                        vname = var.rsplit('_',1)[0]
+                        if vname in all_vars:
+                            labels_in[vname] = val_list
+                        else:
+                            values_in[var] = val_list
+                            vars.append(var)
+                        #end if
+                    else:
+                        values_in[var] = val_list
+                        vars.append(var)
+                    #end if
+                #end if
+            #end for
+            vals = []
+            labs = []
+            for var in vars_in:
+                if var in values_in:
+                    vin = values_in[var]
+                    vals.append(vin)
+                    if var in labels_in:
+                        lin = labels_in[var]
+                        if len(lin)!=len(vin):
+                            self.error('scan list is formatted improperly\nincorrect number of labels provided for scan parameter "{0}"\nnumber of parameter values provided: {1}\nnumber of parameter labels provided: {2}\nparameter labels provided: {3}'.format(var,len(vin),len(lin),lin))
+                        #end if
+                        labs.append(lin)
+                    else:
+                        labs.append(len(vin)*[None])
+                    #end if
+                #end if
+            #end for
+            del vars_in
+            del vals_in
+            if not misformatted:
+                if len(vars)==1:
+                    vals_in = vals[0]
+                    labs_in = labs[0]
+                    vals = []
+                    inds = []
+                    labs = []
+                    i = 1
+                    for v,l in zip(vals_in,labs_in):
+                        vals.append((v,))
+                        inds.append((i,))
+                        labs.append((l,))
+                        i+=1
+                    #end for
+                else:
+                    vars = tuple(vars)
+                    n=1
+                    for vals_in in vals[1:]:
+                        if len(vals_in)!=len(vals[0]):
+                            self.error('problem with "scan" input\nall value_lists for section "{0}" must have the same length (they are covarying)\nvalue_list "{1}" has length {2}\nvalue_list "{3}" has length {4}'.format(section,vars[0],len(vals[0]),vars[n],len(vals[n])))
+                        #end if
+                        n+=1
+                    #end for
+                    vals = zip(*vals)
+                    labs = zip(*labs)
+                    r = range(1,len(vals)+1)
+                    inds = zip(*[r for n in range(len(vars))])
+                #end if
+                if len(self.scan_lists)==0:
+                    self.set(
+                        parameters = list(vars),
+                        values     = vals,
+                        indices    = inds,
+                        labels     = labs,
+                        values_in  = values_in,
+                        labels_in  = labels_in,
+                        )
+                else:
+                    self.values_in.transfer_from(values_in)
+                    self.labels_in.transfer_from(labels_in)
+                    self.parameters.extend(vars)
+                    values = []
+                    for v in self.values:
+                        for v2 in vals:
+                            val = tuple(list(v)+list(v2))
+                            values.append(val)
+                        #end for
+                    #end for
+                    self.values = values
+                    indices = []
+                    for i in self.indices:
+                        for i2 in inds:
+                            ind = tuple(list(i)+list(i2))
+                            indices.append(ind)
+                        #end for
+                    #end for
+                    self.indices = indices
+                    labels = []
+                    for l in self.labels:
+                        for l2 in labs:
+                            lab = tuple(list(l)+list(l2))
+                            labels.append(lab)
+                        #end for
+                    #end for
+                    self.labels = labels
+                #end if
+                self.scan_lists.append(scan_list)
+            #end if
+        #end if
+        if misformatted:
+            self.error('problem with "scan" input\nscan list is formatted improperly\nmust be list of parameter-value_list pairs\nnumber of entries present (should be even): {0}\nvalue_lists must be of type tuple/list/array\nscan list contents: {1}'.format(len(scan_list),scan_list))
+        #end if
+        first = False
+    #end def add_scan_list
+#end class ScanSet
+
+
+
+class SimulationScan(NexusCore):
+    def __init__(self,generator,inputs):
+        scans = ScanSet(inputs['scan'])
+        del inputs['scan']
+
+        sims          = obj()
+        scan_order    = []
+        scan_keywords = None
+        scan_values   = obj()
+
+        print scans
+        exit()
+
+        self.sims        = sims
+        self.scan_order  = scan_order
+        self.scan_names  = set(scan_order)
+        self.scan_values = scan_values
+
+    #end def __init__
+
+
+#end class SimulationScan
 
 
 
