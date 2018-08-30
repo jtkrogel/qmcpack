@@ -1579,6 +1579,11 @@ class ScanSet(DevBase):
 
 
 
+# implementation tasks left to do 
+#   capture simulation dependencies and handle merge of any SimulationScan dependencies
+#     merge should exclude parameters already present (emulate scans of e.g. two sims under same for loop)
+#     this will expand scan set, also needs to work if ScanSet dependency is present w/o "scan" input
+#   capture input simulation path and modify according to parameters
 class SimulationScan(NexusCore):
     def __init__(self,generator,inputs):
         # construct set of all scanned parameter combinations
