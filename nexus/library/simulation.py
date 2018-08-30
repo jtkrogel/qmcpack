@@ -1388,13 +1388,32 @@ class Simulation(NexusCore):
 from numpy import ndarray
 class ScanSet(DevBase):
     def __init__(self,scan_lists=None,covarying=False):
-        self.parameters = None
-        self.values     = None
+        # list of parameters being scanned (length=# of parameters)
+        self.parameters = None 
+
+        # list of parameter values (nrows=# of param combinations, ncols=# of parameters)
+        self.values     = None 
+
+        # list of parameter indices (nrows=# of param combinations, ncols=# of parameters)
         self.indices    = None
+
+        # list of parameter labels (nrows=# of param combinations, ncols=# of parameters)
         self.labels     = None
+
+        # map of parameter names to inputted parameter value lists
         self.values_in  = None
+
+        # map of parameter names to inputted parameter label lists
         self.labels_in  = None
+
+        # list of scan lists
+        #   primary data structure for initialization and merging
+        #   each scan list consists of at least one parameter-value_list pair
+        #   adding scan lists results in cartesian products of parameter values (like nested for loops)
+        #   a scan list containing multiple parameters results in the parameters varying together (covarying)
         self.scan_lists = []
+
+        # add all scan lists
         if scan_lists is not None:
             self.add_scan_lists(scan_lists,covarying)
         #end if
@@ -1549,31 +1568,38 @@ class ScanSet(DevBase):
         #end if
         first = False
     #end def add_scan_list
+
+
+    def incorporate(self,other):
+        for scan_list in other.scan_lists:
+            self.add_scan_list(scan_list)
+        #end for
+    #end def incorporate
 #end class ScanSet
 
 
 
 class SimulationScan(NexusCore):
     def __init__(self,generator,inputs):
-        scans = ScanSet(inputs['scan'])
+        # construct set of all scanned parameter combinations
+        scan_set = ScanSet(inputs['scan'])
+
+        # remove "scan" from generator inputs
         del inputs['scan']
 
-        sims          = obj()
-        scan_order    = []
-        scan_keywords = None
-        scan_values   = obj()
+        # generate a simulation for each set of parameters in the scan
+        sims = obj()
+        for values in scan_set.values:
+            for p,v in zip(scan_set.parameters,values):
+                inputs[p] = v
+            #end for
+            sims[values] = generator(**inputs)
+        #end for
 
-        print scans
-        exit()
-
+        # save scan set and simulation data
+        self.scan_set    = scan_set
         self.sims        = sims
-        self.scan_order  = scan_order
-        self.scan_names  = set(scan_order)
-        self.scan_values = scan_values
-
     #end def __init__
-
-
 #end class SimulationScan
 
 
