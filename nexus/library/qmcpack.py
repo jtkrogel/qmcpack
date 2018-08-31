@@ -30,7 +30,7 @@ from numpy.linalg import inv,norm
 from generic import obj
 from periodic_table import periodic_table
 from physical_system import PhysicalSystem
-from simulation import Simulation
+from simulation import Simulation,SimulationScan
 from qmcpack_input import QmcpackInput,generate_qmcpack_input
 from qmcpack_input import TracedQmcpackInput
 from qmcpack_input import loop,linear,cslinear,vmc,dmc,collection,determinantset,hamiltonian,init,pairpot,bspline_builder
@@ -527,6 +527,10 @@ class Qmcpack(Simulation):
 
 
 def generate_qmcpack(**kwargs):
+    if SimulationScan.scan_present(kwargs):
+        return SimulationScan(generate_qmcpack,kwargs)
+    #end if
+
     sim_args,inp_args = Qmcpack.separate_inputs(kwargs)
 
     if not 'input' in sim_args:

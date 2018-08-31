@@ -1488,7 +1488,27 @@ class ScanSet(DevBase):
                         #end if
                         labs.append(lin)
                     else:
-                        labs.append(len(vin)*[None])
+                        #labs.append(len(vin)*[None])
+                        lin = []
+                        for i,v in enumerate(vin):
+                            if isinstance(v,(int,float,str)):
+                                l = str(v)
+                            elif isinstance(v,tuple) and len(v)<=3:
+                                tuple_label = True
+                                for tv in v:
+                                    tuple_label &= isinstance(tv,(int,float,str))
+                                #end for
+                                if tuple_label:
+                                    l = str(v).replace('(','').replace(')','').replace(' ','').replace(',','_')
+                                else:
+                                    l = str(i)
+                                #end if
+                            else:
+                                l = str(i)
+                            #end if
+                            lin.append(var+'_'+l)
+                        #end for
+                        labs.append(lin)
                     #end if
                 #end if
             #end for
@@ -1501,7 +1521,8 @@ class ScanSet(DevBase):
                     vals = []
                     inds = []
                     labs = []
-                    i = 1
+                    #i = 1
+                    i = 0
                     for v,l in zip(vals_in,labs_in):
                         vals.append((v,))
                         inds.append((i,))
@@ -1519,7 +1540,8 @@ class ScanSet(DevBase):
                     #end for
                     vals = zip(*vals)
                     labs = zip(*labs)
-                    r = range(1,len(vals)+1)
+                    #r = range(1,len(vals)+1)
+                    r = range(len(vals))
                     inds = zip(*[r for n in range(len(vars))])
                 #end if
                 if len(self.scan_lists)==0:
@@ -1585,6 +1607,14 @@ class ScanSet(DevBase):
 #     this will expand scan set, also needs to work if ScanSet dependency is present w/o "scan" input
 #   capture input simulation path and modify according to parameters
 class SimulationScan(NexusCore):
+
+    @staticmethod
+    def scan_present(inputs):
+        scan_present = 'scan' in inputs
+        return scan_present
+    #end def scan_present
+
+
     def __init__(self,generator,inputs):
         # construct set of all scanned parameter combinations
         scan_set = ScanSet(inputs['scan'])
@@ -1594,16 +1624,37 @@ class SimulationScan(NexusCore):
 
         # generate a simulation for each set of parameters in the scan
         sims = obj()
-        for values in scan_set.values:
-            for p,v in zip(scan_set.parameters,values):
+        baseid = inputs['identifier']
+        basepath,dir = os.path.split(inputs['path'])
+        scan_loc_path  = nexus_core.scan_loc=='path'
+        scan_loc_pathj = nexus_core.scan_loc=='path_join'
+        scan_loc_dir   = nexus_core.scan_loc=='directory'
+        scan_loc_id    = nexus_core.scan_loc=='identifier' 
+        if scan_loc_path:
+            label_sep = '/'
+        else:
+            label_sep = '_'
+        #end if
+        for values,labels,indices in zip(scan_set.values,scan_set.labels,scan_set.indices):
+            label = ''
+            for p,v,l in zip(scan_set.parameters,values,labels):
+                label += l+label_sep
                 inputs[p] = v
             #end for
-            sims[values] = generator(**inputs)
+            label = label[:-1]
+            if scan_loc_path or scan_loc_pathj:
+                inputs['path'] = os.path.join(basepath,label,dir)
+            elif scan_loc_dir:
+                inputs['path'] = os.path.join(basepath,dir+'_'+label)
+            elif scan_loc_id:
+                inputs['identifier'] = baseid+'_'+label
+            #end if
+            sims[indices] = generator(**inputs)
         #end for
 
         # save scan set and simulation data
-        self.scan_set    = scan_set
-        self.sims        = sims
+        self.scan_set = scan_set
+        self.sims     = sims
     #end def __init__
 #end class SimulationScan
 

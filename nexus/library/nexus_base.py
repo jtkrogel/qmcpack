@@ -100,6 +100,8 @@ nexus_core_defaults = obj(
     emulate           = False,             # unused
     progress_tty      = False,             # used by: ProjectManager
     command_line      = True,              # used by: Settings
+    scan_loc_options  = ['path','path_join','directory','identifier'], # used by: Settings
+    scan_loc          = 'path',            # used by: SimulationScan
     **nexus_core_noncore_defaults
     )
 

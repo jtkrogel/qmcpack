@@ -88,7 +88,7 @@ class Settings(NexusCore):
         pseudo_dir      sleep           local_directory remote_directory 
         monitor         skip_submit     load_images     stages          
         verbose         debug           trace           progress_tty
-        command_line
+        command_line    scan_loc
         '''.split())
 
     core_process_vars = set('''
@@ -476,6 +476,12 @@ class Settings(NexusCore):
                 #end if
             #end for
             nexus_core.pseudopotentials = Pseudopotentials(ppfiles)        
+        #end if
+        if 'scan_loc' in kw:
+            if kw.scan_loc not in nexus_core.scan_loc_options:
+                self.error('invalid value given for "scan_loc"\ninvalid value: {0}\nvalid options are: {1}'.format(kw.scan_loc,nexus_core.scan_loc_options),trace=False)
+            #end if
+            nexus_core.scan_loc = kw.scan_loc
         #end if
     #end def process_core_settings
 
