@@ -1387,7 +1387,37 @@ class Simulation(NexusCore):
 
 from numpy import ndarray
 class ScanSet(DevBase):
+
+    types = obj(
+        empty      = 1,
+        progenitor = 2,
+        merger     = 3,
+        )
+
+    # count of all scan sets, used to set unique id
+    count = 0
+
+    # collection of all scan sets
+    all_scan_sets = obj()
+
+    # original scans, created with scan_lists in __init__
+    #   analogous to prime numbers
+    #   all other scan sets are formed from merges (products) of these
+    progenitors = obj()
+
+    # composite scans, created empty
+    #   formed as products of progenitor sets
+    mergers = obj()
+
     def __init__(self,scan_lists=None,covarying=False):
+        # assign a unique id
+        self.scan_id = ScanSet.count
+        ScanSet.all_scan_sets[self.scan_id] = self
+        ScanSet.count += 1
+
+        # heritage of native scan lists (list of scan_id's)
+        self.heritage = []
+
         # list of parameters being scanned (length=# of parameters)
         self.parameters = None 
 
@@ -1412,13 +1442,32 @@ class ScanSet(DevBase):
         #   adding scan lists results in cartesian products of parameter values (like nested for loops)
         #   a scan list containing multiple parameters results in the parameters varying together (covarying)
         self.scan_lists = []
+        self.native_scan_lists = None
 
         # add all scan lists
         if scan_lists is not None:
             self.add_scan_lists(scan_lists,covarying)
+            self.native_scan_lists = tuple(self.scan_lists)
+            self.heritage.append(self.scan_id)
+            ScanSets.progenitors[self.scan_id] = self
         #end if
     #end def __init__
 
+
+    def initialized(self):
+        return len(self.scan_lists)>0
+    #end def initialized
+
+
+    def is_progenitor(self):
+        return self.native_scan_lists is not None
+    #end def is_progenitor
+
+
+    def is_merger(self):
+        return not self.is_progenitor() and self.initialized()
+    #end def is_merger
+            
 
     def add_scan_lists(self,scan_lists,covarying=False):
         if isinstance(scan_lists,obj):
@@ -1592,35 +1641,91 @@ class ScanSet(DevBase):
     #end def add_scan_list
 
 
-    def incorporate(self,other):
-        for scan_list in other.scan_lists:
-            self.add_scan_list(scan_list)
+    def merge(self,other):
+        heritage = set(self.heritage)
+        for scan_id in other.heritage:
+            if scan_id not in heritage:
+                progenitor = ScanSets.all_scan_sets[scan_id]
+                if progenitor.native_scan_lists is None:
+                    self.error('attempted to add non-native scan set\nthis is a developer error')
+                #end if
+                self.add_scan_lists(progenitor.native_scan_lists)
+                self.heritage.append(scan_id)
+            #end if
         #end for
-    #end def incorporate
+    #end def merge
 #end class ScanSet
 
 
 
 # implementation tasks left to do 
-#   capture simulation dependencies and handle merge of any SimulationScan dependencies
-#     merge should exclude parameters already present (emulate scans of e.g. two sims under same for loop)
-#     this will expand scan set, also needs to work if ScanSet dependency is present w/o "scan" input
-#   capture input simulation path and modify according to parameters
+#   rename ScanSet as ScanProduct
+#     ScanProduct keeps a list of all scan factors (now scan lists)
+#     this internal listing replaces the need for "native scan_lists"
+#     relabel "heritage" as "factorization", now tracks scan factors
+#     add "unique_products" class level member to ScanProduct, track unique products
+#     whenever a new scan is requested (via scan or dependency input)
+#       first check whether a scan of this type exists in unique_products
+#       load the nearest available product from unique_products
+#       each time a factor is added, expand unique_products
+#       this will reuse work, ensuring only one product is generated
+#   handle dependency situations
+#     if dependent sim has product with NxMxPxQxR
+#     and dependency has factors PxQxR
+#     then for each dependency (loop on PxQxR), loop over NxM
+#     to get NxMxPxQxR and process set dependencies
+#     will also need way to keep track of constant deps
+#   implement "ScanProduct.fix" function to be called by user in dependencies 
+#     this should search for products with some factors removed
 class SimulationScan(NexusCore):
 
     @staticmethod
     def scan_present(inputs):
         scan_present = 'scan' in inputs
+        if not scan_present and 'dependencies' in inputs:
+            deps = inputs['dependencies']
+            if isinstance(deps[0],(Simulation,SimulationScan)):
+                deps = [deps]
+            #end if
+            for d in deps:
+                sim = d[0]
+                scan_present |= isinstance(sim,SimulationScan)
+            #end for
+        #end if
         return scan_present
     #end def scan_present
 
 
     def __init__(self,generator,inputs):
-        # construct set of all scanned parameter combinations
-        scan_set = ScanSet(inputs['scan'])
+        if 'scan' in inputs:
+            # construct set of all scanned parameter combinations
+            scan_set = ScanSet(inputs['scan'])
 
-        # remove "scan" from generator inputs
-        del inputs['scan']
+            # remove "scan" from generator inputs
+            del inputs['scan']
+        else:
+            scan_set = ScanSet()
+        #end if
+
+        deps = None
+        if 'dependencies' in inputs:
+            deps = inputs['dependencies']
+            if isinstance(deps[0],(Simulation,SimulationScan)):
+                deps = [deps]
+            #end if
+            n = 0
+            scan_deps     = []
+            scan_dep_locs = []
+            for d in deps:
+                sim = d[0]
+                if isinstance(sim,SimulationScan):
+                    scan_set.merge(sim.scan_set)
+                    scan_deps.append(sim)
+                    scan_locs.append(n)
+                #end if
+                n+=1
+            #end for
+        #end if
 
         # generate a simulation for each set of parameters in the scan
         sims = obj()
