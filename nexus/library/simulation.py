@@ -1548,10 +1548,10 @@ class ScanProduct(DevBase):
         self.labels     = []
 
         # map of parameter names to inputted parameter value lists
-        self.values_in  = []
+        self.values_in  = obj()
 
         # map of parameter names to inputted parameter label lists
-        self.labels_in  = []
+        self.labels_in  = obj()
 
         # list of scan factors
         #   primary data structure for initialization and merging
@@ -1698,8 +1698,8 @@ class ScanProduct(DevBase):
         self.values        = list(other.values)
         self.indices       = list(other.indices)
         self.labels        = list(other.labels)
-        self.values_in     = list(other.values_in)
-        self.labels_in     = list(other.labels_in)
+        self.values_in     = obj(other.values_in)
+        self.labels_in     = obj(other.labels_in)
         self.scan_factors  = list(other.scan_factors)
     #end def mimick
 
@@ -1717,12 +1717,6 @@ class ScanProduct(DevBase):
 
 
 # implementation tasks left to do 
-#   handle dependency situations
-#     if dependent sim has product with NxMxPxQxR
-#     and dependency has factors PxQxR
-#     then for each dependency (loop on PxQxR), loop over NxM
-#     to get NxMxPxQxR and process set dependencies
-#     will also need way to keep track of constant deps
 #   implement "ScanProduct.fix" function to be called by user in dependencies 
 #     this should search for products with some factors removed
 class SimulationScan(NexusCore):
@@ -1765,15 +1759,18 @@ class SimulationScan(NexusCore):
             scan_deps     = []
             scan_dep_locs = []
             scan_dep_maps = []
+            sp = ScanProduct()
             for d in deps:
                 sim = d[0]
                 if isinstance(sim,SimulationScan):
-                    scan_prod.merge(sim.scan_prod)
+                    sp.merge(sim.scan_prod)
                     scan_deps.append(sim)
                     scan_dep_locs.append(n)
                 #end if
                 n+=1
             #end for
+            sp.merge(scan_prod)
+            scan_prod = sp
             for sim_scan in scan_deps:
                 dep_params = sim_scan.scan_prod.parameters
                 params     = scan_prod.parameters
