@@ -1385,290 +1385,338 @@ class Simulation(NexusCore):
 
 
 
-from numpy import ndarray
-class ScanSet(DevBase):
-
-    types = obj(
-        empty      = 1,
-        progenitor = 2,
-        merger     = 3,
-        )
-
-    # count of all scan sets, used to set unique id
+class ScanFactor(DevBase):
     count = 0
 
-    # collection of all scan sets
-    all_scan_sets = obj()
+    unique_factors = obj()
 
-    # original scans, created with scan_lists in __init__
-    #   analogous to prime numbers
-    #   all other scan sets are formed from merges (products) of these
-    progenitors = obj()
+    all_factors = obj()
 
-    # composite scans, created empty
-    #   formed as products of progenitor sets
-    mergers = obj()
-
-    def __init__(self,scan_lists=None,covarying=False):
-        # assign a unique id
-        self.scan_id = ScanSet.count
-        ScanSet.all_scan_sets[self.scan_id] = self
-        ScanSet.count += 1
-
-        # heritage of native scan lists (list of scan_id's)
-        self.heritage = []
-
-        # list of parameters being scanned (length=# of parameters)
-        self.parameters = None 
-
-        # list of parameter values (nrows=# of param combinations, ncols=# of parameters)
-        self.values     = None 
-
-        # list of parameter indices (nrows=# of param combinations, ncols=# of parameters)
-        self.indices    = None
-
-        # list of parameter labels (nrows=# of param combinations, ncols=# of parameters)
-        self.labels     = None
-
-        # map of parameter names to inputted parameter value lists
-        self.values_in  = None
-
-        # map of parameter names to inputted parameter label lists
-        self.labels_in  = None
-
-        # list of scan lists
-        #   primary data structure for initialization and merging
-        #   each scan list consists of at least one parameter-value_list pair
-        #   adding scan lists results in cartesian products of parameter values (like nested for loops)
-        #   a scan list containing multiple parameters results in the parameters varying together (covarying)
-        self.scan_lists = []
-        self.native_scan_lists = None
-
-        # add all scan lists
-        if scan_lists is not None:
-            self.add_scan_lists(scan_lists,covarying)
-            self.native_scan_lists = tuple(self.scan_lists)
-            self.heritage.append(self.scan_id)
-            ScanSets.progenitors[self.scan_id] = self
+    def __init__(self,param_values):
+        self.factor_id = ScanFactor.count
+        ScanFactor.all_factors[self.factor_id] = self
+        ScanFactor.count += 1
+        
+        if not isinstance(param_values,(tuple,list)):
+            self.error('scan factor input must be a tuple or list\ntype received: '+param_values.__class__.__name__)
         #end if
-    #end def __init__
+        param_values = list(param_values) # shallow copy
 
+        if len(param_values)<2 or len(param_values)%2!=0:
+            self.misformatted()
+            self.error('input list misformatted\ninput list mus')
+        #end if
 
-    def initialized(self):
-        return len(self.scan_lists)>0
-    #end def initialized
-
-
-    def is_progenitor(self):
-        return self.native_scan_lists is not None
-    #end def is_progenitor
-
-
-    def is_merger(self):
-        return not self.is_progenitor() and self.initialized()
-    #end def is_merger
-            
-
-    def add_scan_lists(self,scan_lists,covarying=False):
-        if isinstance(scan_lists,obj):
-            scan_in = scan_lists
-            scan_lists = []
-            if not covarying:
-                for parameter in sorted(scan_in.keys()):
-                    value_list = scan_in[parameter]
-                    scan_list = (parameter,value_list)
-                    scan_lists.append(scan_list)
-                #end for
-            else:
-                scan_list = []
-                for parameter in sorted(scan_in.keys()):
-                    value_list = scan_in[parameter]
-                    scan_list.append(parameter)
-                    scan_list.append(value_list)
-                #end for
-                scan_lists.append(scan_list)
+        vars_in = param_values[0::2]
+        vals_in = param_values[1::2]
+        all_vars = set(vars_in)
+        vars = []
+        values_in = obj()
+        labels_in = obj()
+        for var,val_list in zip(vars_in,vals_in):
+            if not isinstance(var,str) or not isinstance(val_list,(tuple,list,ndarray)):
+                self.misformatted()
             #end if
-        #end if
-        for scan_list in scan_lists:
-            self.add_scan_list(scan_list)
-        #end for
-    #end def add_scan_lists
-
-
-    def add_scan_list(self,scan_list):
-        if not isinstance(scan_list,(tuple,list)):
-            self.error('scan list must be a tuple or list\ntype received: {0}'.format(scan_list.__class__.__name__))
-        #end if
-        misformatted = len(scan_list)<2 or len(scan_list)%2!=0
-        if not misformatted:
-            vars_in = scan_list[0::2]
-            vals_in = scan_list[1::2]
-            all_vars = set(vars_in)
-            vars = []
-            values_in = obj()
-            labels_in = obj()
-            for var,val_list in zip(vars_in,vals_in):
-                misformatted |= not isinstance(var,str) or not isinstance(val_list,(tuple,list,ndarray))
-                if isinstance(var,str):
-                    if var.endswith('_labels'):
-                        vname = var.rsplit('_',1)[0]
-                        if vname in all_vars:
-                            labels_in[vname] = val_list
-                        else:
-                            values_in[var] = val_list
-                            vars.append(var)
-                        #end if
+            if isinstance(var,str):
+                if var.endswith('_labels'):
+                    vname = var.rsplit('_',1)[0]
+                    if vname in all_vars:
+                        labels_in[vname] = val_list
                     else:
                         values_in[var] = val_list
                         vars.append(var)
                     #end if
+                else:
+                    values_in[var] = val_list
+                    vars.append(var)
                 #end if
-            #end for
-            vals = []
-            labs = []
-            for var in vars_in:
-                if var in values_in:
-                    vin = values_in[var]
-                    vals.append(vin)
-                    if var in labels_in:
-                        lin = labels_in[var]
-                        if len(lin)!=len(vin):
-                            self.error('scan list is formatted improperly\nincorrect number of labels provided for scan parameter "{0}"\nnumber of parameter values provided: {1}\nnumber of parameter labels provided: {2}\nparameter labels provided: {3}'.format(var,len(vin),len(lin),lin))
-                        #end if
-                        labs.append(lin)
-                    else:
-                        #labs.append(len(vin)*[None])
-                        lin = []
-                        for i,v in enumerate(vin):
-                            if isinstance(v,(int,float,str)):
-                                l = str(v)
-                            elif isinstance(v,tuple) and len(v)<=3:
-                                tuple_label = True
-                                for tv in v:
-                                    tuple_label &= isinstance(tv,(int,float,str))
-                                #end for
-                                if tuple_label:
-                                    l = str(v).replace('(','').replace(')','').replace(' ','').replace(',','_')
-                                else:
-                                    l = str(i)
-                                #end if
+            #end if
+        #end for
+        vals = []
+        labs = []
+        for var in vars_in:
+            if var in values_in:
+                vin = values_in[var]
+                vals.append(vin)
+                if var in labels_in:
+                    lin = labels_in[var]
+                    if len(lin)!=len(vin):
+                        self.error('scan list is formatted improperly\nincorrect number of labels provided for scan parameter "{0}"\nnumber of parameter values provided: {1}\nnumber of parameter labels provided: {2}\nparameter labels provided: {3}'.format(var,len(vin),len(lin),lin))
+                    #end if
+                    labs.append(lin)
+                else:
+                    #labs.append(len(vin)*[None])
+                    lin = []
+                    for i,v in enumerate(vin):
+                        if isinstance(v,(int,float,str)):
+                            l = str(v)
+                        elif isinstance(v,tuple) and len(v)<=3:
+                            tuple_label = True
+                            for tv in v:
+                                tuple_label &= isinstance(tv,(int,float,str))
+                            #end for
+                            if tuple_label:
+                                l = str(v).replace('(','').replace(')','').replace(' ','').replace(',','_')
                             else:
                                 l = str(i)
                             #end if
-                            lin.append(var+'_'+l)
-                        #end for
-                        labs.append(lin)
-                    #end if
-                #end if
-            #end for
-            del vars_in
-            del vals_in
-            if not misformatted:
-                if len(vars)==1:
-                    vals_in = vals[0]
-                    labs_in = labs[0]
-                    vals = []
-                    inds = []
-                    labs = []
-                    #i = 1
-                    i = 0
-                    for v,l in zip(vals_in,labs_in):
-                        vals.append((v,))
-                        inds.append((i,))
-                        labs.append((l,))
-                        i+=1
-                    #end for
-                else:
-                    vars = tuple(vars)
-                    n=1
-                    for vals_in in vals[1:]:
-                        if len(vals_in)!=len(vals[0]):
-                            self.error('problem with "scan" input\nall value_lists for section "{0}" must have the same length (they are covarying)\nvalue_list "{1}" has length {2}\nvalue_list "{3}" has length {4}'.format(section,vars[0],len(vals[0]),vars[n],len(vals[n])))
+                        else:
+                            l = str(i)
                         #end if
-                        n+=1
+                        lin.append(var+'_'+l)
                     #end for
-                    vals = zip(*vals)
-                    labs = zip(*labs)
-                    #r = range(1,len(vals)+1)
-                    r = range(len(vals))
-                    inds = zip(*[r for n in range(len(vars))])
+                    labs.append(lin)
                 #end if
-                if len(self.scan_lists)==0:
-                    self.set(
-                        parameters = list(vars),
-                        values     = vals,
-                        indices    = inds,
-                        labels     = labs,
-                        values_in  = values_in,
-                        labels_in  = labels_in,
-                        )
-                else:
-                    self.values_in.transfer_from(values_in)
-                    self.labels_in.transfer_from(labels_in)
-                    self.parameters.extend(vars)
-                    values = []
-                    for v in self.values:
-                        for v2 in vals:
-                            val = tuple(list(v)+list(v2))
-                            values.append(val)
-                        #end for
-                    #end for
-                    self.values = values
-                    indices = []
-                    for i in self.indices:
-                        for i2 in inds:
-                            ind = tuple(list(i)+list(i2))
-                            indices.append(ind)
-                        #end for
-                    #end for
-                    self.indices = indices
-                    labels = []
-                    for l in self.labels:
-                        for l2 in labs:
-                            lab = tuple(list(l)+list(l2))
-                            labels.append(lab)
-                        #end for
-                    #end for
-                    self.labels = labels
+            #end if
+        #end for
+        if len(vars)==1:
+            vals_in = vals[0]
+            labs_in = labs[0]
+            vals = []
+            inds = []
+            labs = []
+            #i = 1
+            i = 0
+            for v,l in zip(vals_in,labs_in):
+                vals.append((v,))
+                inds.append((i,))
+                labs.append((l,))
+                i+=1
+            #end for
+        else:
+            vars = tuple(vars)
+            n=1
+            for vals_in in vals[1:]:
+                if len(vals_in)!=len(vals[0]):
+                    self.error('problem with "scan" input\nall value_lists for section "{0}" must have the same length (they are covarying)\nvalue_list "{1}" has length {2}\nvalue_list "{3}" has length {4}'.format(section,vars[0],len(vals[0]),vars[n],len(vals[n])))
                 #end if
-                self.scan_lists.append(scan_list)
+                n+=1
+            #end for
+            vals = zip(*vals)
+            labs = zip(*labs)
+            #r = range(1,len(vals)+1)
+            r = range(len(vals))
+            inds = zip(*[r for n in range(len(vars))])
+        #end if
+
+        self.parameters = vars
+        self.values     = vals
+        self.indices    = inds
+        self.labels     = labs
+        self.values_in  = values_in
+        self.labels_in  = labels_in
+
+        self.param_values = param_values
+    #end def __init__
+
+
+    def misformatted(self):
+        pvals = self.param_values
+        self.error('problem with "scan" input\nscan list is formatted improperly\nmust be list of parameter-value_list pairs\nnumber of entries present (should be even): {0}\nvalue_lists must be of type tuple/list/array\nscan list contents: {1}'.format(len(pvals),pvals))
+    #end def misformatted
+#end class ScanFactor
+
+
+
+from numpy import ndarray,array
+class ScanProduct(DevBase):
+    count = 0
+
+    unique_products = obj()
+
+    all_products = obj()
+
+    def __init__(self,scan_factors=None,covarying=False):
+        # assign a unique id
+        self.product_id = ScanProduct.count
+        ScanProduct.all_products[self.product_id] = self
+        ScanProduct.count += 1
+
+        # list of scan_factor ids
+        self.factorization = []
+
+        # list of parameters being scanned (length=# of parameters)
+        self.parameters = []
+
+        # list of parameter values (nrows=# of param combinations, ncols=# of parameters)
+        self.values     = [] 
+
+        # list of parameter indices (nrows=# of param combinations, ncols=# of parameters)
+        self.indices    = []
+
+        # list of parameter labels (nrows=# of param combinations, ncols=# of parameters)
+        self.labels     = []
+
+        # map of parameter names to inputted parameter value lists
+        self.values_in  = []
+
+        # map of parameter names to inputted parameter label lists
+        self.labels_in  = []
+
+        # list of scan factors
+        #   primary data structure for initialization and merging
+        #   each scan list consists of at least one parameter-value_list pair
+        #   adding scan lists results in cartesian products of parameter values (like nested for loops)
+        #   a scan list containing multiple parameters results in the parameters varying together (covarying)
+        self.scan_factors = []
+
+        # add all scan factors
+        if scan_factors is not None:
+            self.add_scan_factors(scan_factors,covarying)
+        #end if
+    #end def __init__
+            
+
+    def add_scan_factors(self,scan_factors,covarying=False):
+        # translate object input into list input
+        if isinstance(scan_factors,obj):
+            scan_in = scan_factors
+            scan_factors = []
+            if not covarying:
+                for parameter in sorted(scan_in.keys()):
+                    value_list = scan_in[parameter]
+                    scan_factor = (parameter,value_list)
+                    scan_factors.append(scan_factor)
+                #end for
+            else:
+                scan_factor = []
+                for parameter in sorted(scan_in.keys()):
+                    value_list = scan_in[parameter]
+                    scan_factor.append(parameter)
+                    scan_factor.append(value_list)
+                #end for
+                scan_factors.append(scan_factor)
             #end if
         #end if
-        if misformatted:
-            self.error('problem with "scan" input\nscan list is formatted improperly\nmust be list of parameter-value_list pairs\nnumber of entries present (should be even): {0}\nvalue_lists must be of type tuple/list/array\nscan list contents: {1}'.format(len(scan_list),scan_list))
+        scan_factors_in = scan_factors
+        scan_factors = []
+        for scan_factor in scan_factors_in:
+            if not isinstance(scan_factor,ScanFactor):
+                scan_factor = ScanFactor(scan_factor)
+            #end if
+            scan_factors.append(scan_factor)
+        #end for
+        # check if product already exists
+        f = list(self.factorization)
+        for scan_factor in scan_factors:
+            f.append(scan_factor.factor_id)
+        #end for
+        f = tuple(f)
+        if f in ScanProduct.unique_products:
+            self.mimick(ScanProduct.unique_products[f])
+            return
         #end if
-        first = False
-    #end def add_scan_list
+        # if the product does not exist, create it
+        for scan_factor in scan_factors:
+            self.add_scan_factor(scan_factor)
+        #end for
+    #end def add_scan_factors
+
+
+    def add_scan_factor(self,scan_factor):
+        if isinstance(scan_factor,(tuple,list)):
+            scan_factor = ScanFactor(scan_factor)
+        elif not isinstance(scan_factor,ScanFactor):
+            self.error('add_scan_factor expects ScanFactor object as input\nreceived object of type: {0}'.format(scan_factor.__class__.__name__))
+        #end if
+
+        # check if product already exists
+        f = list(self.factorization)
+        f.append(scan_factor.factor_id)
+        f = tuple(f)
+        if f in ScanProduct.unique_products:
+            self.mimick(ScanProduct.unique_products[f])
+            return
+        #end if
+
+        vars      = list(scan_factor.parameters)
+        vals      = list(scan_factor.values)
+        inds      = list(scan_factor.indices)
+        labs      = list(scan_factor.labels)
+        values_in = obj(scan_factor.values_in)
+        labels_in = obj(scan_factor.labels_in)
+
+        if len(self.scan_factors)==0:
+            self.set(
+                parameters = vars,
+                values     = vals,
+                indices    = inds,
+                labels     = labs,
+                values_in  = values_in,
+                labels_in  = labels_in,
+                )
+        else:
+            self.values_in.transfer_from(values_in)
+            self.labels_in.transfer_from(labels_in)
+            self.parameters.extend(vars)
+            values = []
+            for v in self.values:
+                for v2 in vals:
+                    val = tuple(list(v)+list(v2))
+                    values.append(val)
+                #end for
+            #end for
+            self.values = values
+            indices = []
+            for i in self.indices:
+                for i2 in inds:
+                    ind = tuple(list(i)+list(i2))
+                    indices.append(ind)
+                #end for
+            #end for
+            self.indices = indices
+            labels = []
+            for l in self.labels:
+                for l2 in labs:
+                    lab = tuple(list(l)+list(l2))
+                    labels.append(lab)
+                #end for
+            #end for
+            self.labels = labels
+        #end if
+
+        self.factorization.append(scan_factor.factor_id)
+        self.scan_factors.append(scan_factor)
+
+        f = tuple(self.factorization)
+        if f not in ScanProduct.unique_products:
+            ScanProduct.unique_products[f] = self.clone()
+        #end if
+    #end def add_scan_factor
+
+
+    def clone(self):
+        c = ScanProduct()
+        c.mimick(self)
+        return c
+    #end def clone
+
+
+    def mimick(self,other):
+        self.factorization = list(other.factorization)
+        self.parameters    = list(other.parameters)
+        self.values        = list(other.values)
+        self.indices       = list(other.indices)
+        self.labels        = list(other.labels)
+        self.values_in     = list(other.values_in)
+        self.labels_in     = list(other.labels_in)
+        self.scan_factors  = list(other.scan_factors)
+    #end def mimick
 
 
     def merge(self,other):
-        heritage = set(self.heritage)
-        for scan_id in other.heritage:
-            if scan_id not in heritage:
-                progenitor = ScanSets.all_scan_sets[scan_id]
-                if progenitor.native_scan_lists is None:
-                    self.error('attempted to add non-native scan set\nthis is a developer error')
-                #end if
-                self.add_scan_lists(progenitor.native_scan_lists)
-                self.heritage.append(scan_id)
+        factors = set(self.factorization)
+        for scan_factor in other.scan_factors:
+            if scan_factor.factor_id not in factors:
+                self.add_scan_factor(scan_factor)
             #end if
         #end for
     #end def merge
-#end class ScanSet
+#end class ScanProduct
 
 
 
 # implementation tasks left to do 
-#   rename ScanSet as ScanProduct
-#     ScanProduct keeps a list of all scan factors (now scan lists)
-#     this internal listing replaces the need for "native scan_lists"
-#     relabel "heritage" as "factorization", now tracks scan factors
-#     add "unique_products" class level member to ScanProduct, track unique products
-#     whenever a new scan is requested (via scan or dependency input)
-#       first check whether a scan of this type exists in unique_products
-#       load the nearest available product from unique_products
-#       each time a factor is added, expand unique_products
-#       this will reuse work, ensuring only one product is generated
 #   handle dependency situations
 #     if dependent sim has product with NxMxPxQxR
 #     and dependency has factors PxQxR
@@ -1699,12 +1747,12 @@ class SimulationScan(NexusCore):
     def __init__(self,generator,inputs):
         if 'scan' in inputs:
             # construct set of all scanned parameter combinations
-            scan_set = ScanSet(inputs['scan'])
+            scan_prod = ScanProduct(inputs['scan'])
 
             # remove "scan" from generator inputs
             del inputs['scan']
         else:
-            scan_set = ScanSet()
+            scan_prod = ScanProduct()
         #end if
 
         deps = None
@@ -1716,15 +1764,34 @@ class SimulationScan(NexusCore):
             n = 0
             scan_deps     = []
             scan_dep_locs = []
+            scan_dep_maps = []
             for d in deps:
                 sim = d[0]
                 if isinstance(sim,SimulationScan):
-                    scan_set.merge(sim.scan_set)
+                    scan_prod.merge(sim.scan_prod)
                     scan_deps.append(sim)
-                    scan_locs.append(n)
+                    scan_dep_locs.append(n)
                 #end if
                 n+=1
             #end for
+            for sim_scan in scan_deps:
+                dep_params = sim_scan.scan_prod.parameters
+                params     = scan_prod.parameters
+                ind_map = []
+                for p in dep_params:
+                    ind_map.append(params.index(p))
+                #end for
+                scan_dep_maps.append(tuple(ind_map))
+            #end for
+            if len(scan_deps)==0:
+                deps = None
+            else:
+                deps_in = deps
+                deps = []
+                for dep in deps_in:
+                    deps.append(list(dep))
+                #end for
+            #end if
         #end if
 
         # generate a simulation for each set of parameters in the scan
@@ -1740,11 +1807,14 @@ class SimulationScan(NexusCore):
         else:
             label_sep = '_'
         #end if
-        for values,labels,indices in zip(scan_set.values,scan_set.labels,scan_set.indices):
+        input_keys = set(inputs.keys())
+        for values,labels,indices in zip(scan_prod.values,scan_prod.labels,scan_prod.indices):
             label = ''
-            for p,v,l in zip(scan_set.parameters,values,labels):
+            for p,v,l in zip(scan_prod.parameters,values,labels):
                 label += l+label_sep
-                inputs[p] = v
+                if p in input_keys:
+                    inputs[p] = v
+                #end if
             #end for
             label = label[:-1]
             if scan_loc_path or scan_loc_pathj:
@@ -1754,12 +1824,28 @@ class SimulationScan(NexusCore):
             elif scan_loc_id:
                 inputs['identifier'] = baseid+'_'+label
             #end if
+            if deps is not None:
+                for sim_scan,dep_loc,ind_map in zip(scan_deps,scan_dep_locs,scan_dep_maps):
+                    dep = deps[dep_loc]
+                    ind = array(indices)[ind_map]
+                    if isinstance(ind,int):
+                        ind = (ind,)
+                    else:
+                        ind = tuple(ind)
+                    #end if
+                    dep[0] = sim_scan.sims[ind]
+                #end for
+                inputs['dependencies'] = deps
+            #end if
+            #if len(indices)==1:
+            #    indices = indices[0]
+            ##end if
             sims[indices] = generator(**inputs)
         #end for
 
         # save scan set and simulation data
-        self.scan_set = scan_set
-        self.sims     = sims
+        self.scan_prod = scan_prod
+        self.sims      = sims
     #end def __init__
 #end class SimulationScan
 

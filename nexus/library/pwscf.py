@@ -22,7 +22,7 @@ from numpy import array
 from generic import obj
 from physical_system import PhysicalSystem
 from qmcpack_converters import Pw2qmcpack
-from simulation import Simulation
+from simulation import Simulation,SimulationScan
 from pwscf_input import PwscfInput,generate_pwscf_input
 from pwscf_analyzer import PwscfAnalyzer
 from execute import execute
@@ -309,6 +309,10 @@ class Pwscf(Simulation):
 
 
 def generate_pwscf(**kwargs):
+    if SimulationScan.scan_present(kwargs):
+        return SimulationScan(generate_pwscf,kwargs)
+    #end if
+
     sim_args,inp_args = Pwscf.separate_inputs(kwargs)
 
     if not 'input' in sim_args:

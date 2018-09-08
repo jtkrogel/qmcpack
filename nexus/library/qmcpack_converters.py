@@ -60,6 +60,7 @@
 import os
 from generic import obj
 from simulation import Simulation,SimulationInput,SimulationAnalyzer
+from simulation import SimulationScan
 from gamess import Gamess
 
 # read/write functions associated with pw2qmcpack only
@@ -378,6 +379,10 @@ class Pw2qmcpack(Simulation):
 
 
 def generate_pw2qmcpack(**kwargs):
+    if SimulationScan.scan_present(kwargs):
+        return SimulationScan(generate_pw2qmcpack,kwargs)
+    #end if
+
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
 
     if not 'input' in sim_args:
