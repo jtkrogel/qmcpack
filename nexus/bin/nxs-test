@@ -81,13 +81,14 @@ generic_settings.raise_error = True
 
 
 # determine if two values differ
+import numpy as np
 def value_diff(v1,v2,tol=1e-6):
     diff = False
     if not isinstance(v1,type(v2)):
         diff = True
-    elif isinstance(v1,(bool,int,str)):
+    elif isinstance(v1,(bool,int,str,np.integer,np.bool_,np.character)):
         diff = v1!=v2
-    elif isinstance(v1,float):
+    elif isinstance(v1,(float,np.floating)):
         diff = abs(v1-v2)>tol
     elif isinstance(v1,(list,tuple)):
         v1 = array(v1,dtype=object).ravel()
@@ -152,18 +153,18 @@ def object_diff(o1,o2,tol=1e-6,full=False):
 
 # print the difference between two objects
 def print_diff(o1,o2): # used in debugging, not actual tests
-    from nexus import obj
-    print 20*'='
-    print o1
-    print 20*'='
-    print o2
+    from generic import obj
+    print(20*'=')
+    print(o1)
+    print(20*'=')
+    print(o2)
     diff,diff1,diff2 = object_diff(o1,o2,full=True)
     d1 = obj(diff1)
     d2 = obj(diff2)
-    print 20*'='
-    print d1
-    print 20*'='
-    print d2
+    print(20*'=')
+    print(d1)
+    print(20*'=')
+    print(d2)
 #end def print_diff
 
 
@@ -412,7 +413,7 @@ class NexusTest(NexusTestBase):
         )
 
     status_map = dict()
-    for k,v in status_options.iteritems():
+    for k,v in status_options.items():
         status_map[v] = k
     #end for
 
@@ -490,7 +491,7 @@ class NexusTest(NexusTestBase):
                 raise NexusTestMisconstructed
             #end if
             self.status=NexusTest.status_options['passed']
-        except Exception,e:
+        except Exception as e:
             self.exception = e
             self.traceback = sys.exc_info()[2]
             self.status=NexusTest.status_options['failed']
@@ -703,21 +704,21 @@ def generic_intrinsics():
     for v in o:
         l.append(v)
     #end for
-    l = sorted(l)
-    l2 = ['b', (1, 1, 1), (5, 6, 7)]
+    l = set(l)
+    l2 = {'b', (1, 1, 1), (5, 6, 7)}
     nassert(l2==l)
 
     # test dict-like iterability
     d = dict()
-    for k,v in o.iteritems():
+    for k,v in o.items():
         d[k] = v
     #end for
     o2 = obj()
     o2.__dict__ = d
     nassert(object_eq(o,o2))
-    nassert(sorted(o.keys())==sorted(d.keys()))
-    nassert(sorted(o.values())==sorted(d.values()))
-    nassert(sorted(o.items())==sorted(d.items()))
+    nassert(set(o.keys())==set(d.keys()))
+    nassert(set(o.values())==set(d.values()))
+    nassert(set(o.items())==set(d.items()))
 
     # test repr
     nlabel('repr')
@@ -1071,6 +1072,11 @@ def generic_extensions():
 
     # test dict extensions
     nlabel('dict_extensions')
+
+    # test sorted_keys
+    skeys = ['a', 'b', 'c', (3, 4, 5)]
+    nassert(o.sorted_keys()==skeys)
+
     # test random_key
     k = o.random_key()
     nassert(k in o)
@@ -1091,7 +1097,7 @@ def generic_extensions():
     o4 = obj()
     o4.set(o1,o2,o3)
     for on in (o1,o2,o3):
-        for k,v in on.iteritems():
+        for k,v in on.items():
             nassert(o4[k]==v)
         #end for
     #end for
@@ -1110,7 +1116,7 @@ def generic_extensions():
     o4 = obj()
     o4.set_optional(o1,o2,o3)
     for on in (o1,o2,o3):
-        for k,v in on.iteritems():
+        for k,v in on.items():
             nassert(o4[k]==v)
         #end for
     #end for
@@ -1470,8 +1476,8 @@ def generic_extensions():
     # test inverse
     nlabel('inverse')
     oi = do.inverse()
-    nassert(sorted(oi.keys())==sorted(do.values()))
-    nassert(sorted(oi.values())==sorted(do.keys()))
+    nassert(set(oi.keys())==set(do.values()))
+    nassert(set(oi.values())==set(do.keys()))
 
     nassert(oi[1]=='a')
     nassert(oi.b=='b')
@@ -1604,7 +1610,7 @@ def generic_extensions():
         'c/c3/c31/c311/c3110/c31100/c311000/c3110000/c3110000':7,
         })
 
-    for k,v in oref.iteritems():
+    for k,v in oref.items():
         nassert(o.get_path(k)==v)
     #end for
     o2 = o.serial()
@@ -2320,7 +2326,7 @@ def machines():
             if global_data['job_ref_table']:
                 sname = "'{0}'".format(name)
                 stype = "'{0}'".format(jtype)
-                print "        ({0:<16} , {1:<16}) : '{2}',".format(sname,stype,command)
+                print("        ({0:<16} , {1:<16}) : '{2}',".format(sname,stype,command))
                 continue
             #end if
             ref_command = job_run_ref[name,jtype]
@@ -2573,8 +2579,8 @@ def user_examples(label):
                 # then it is not a failure
                 check_pbc = False
                 if len(dgen)==1 and len(dref)==1:
-                    kgen = dgen.keys()[0].rsplit('/',1)[1]
-                    kref = dref.keys()[0].rsplit('/',1)[1]
+                    kgen = list(dgen.keys())[0].rsplit('/',1)[1]
+                    kref = list(dref.keys())[0].rsplit('/',1)[1]
                     check_pbc |= code=='qmcpack' and kgen==kref=='position'
                     check_pbc |= code=='pwscf'   and kgen==kref=='positions'
                 #end if
@@ -2664,11 +2670,11 @@ def execute(command,verbose=False,skip=False):
     out,err = '',''
     if skip:
         if verbose:
-            print 'Would have executed:\n  '+command
+            print('Would have executed:\n  '+command)
         #end if
     else:
         if verbose:
-            print 'Executing:\n  '+command
+            print('Executing:\n  '+command)
         #end if
         process = Popen(command,shell=True,stdout=PIPE,stderr=PIPE,close_fds=True)
         out,err = process.communicate()
@@ -2686,7 +2692,7 @@ def regenerate_reference(update=False,overwrite=True):
     #end if
     os.makedirs(refgen_dir)
 
-    print 'generating reference data in {0}'.format(refgen_dir)
+    print('generating reference data in {0}'.format(refgen_dir))
 
     # create directory for example reference generation
     refgen_example_dir = os.path.join(refgen_dir,'user_examples')
@@ -2697,14 +2703,14 @@ def regenerate_reference(update=False,overwrite=True):
     # copy over nexus user examples into reference generation directory
     out,err,rc = execute('rsync -av {0}/* {1}/'.format(example_dir,refgen_example_dir))
     if rc>0:
-        print '  rsync of example directory failed, exiting'
+        print('  rsync of example directory failed, exiting')
         exit(1)
     #end if
 
     # execute all example scripts in generate_only mode
-    for label,einfo in example_information.iteritems():
+    for label,einfo in example_information.items():
         for script_path in einfo['scripts']:
-            print '  generating reference data for '+script_path
+            print('  generating reference data for '+script_path)
             path,script = os.path.split(script_path)
             path = os.path.join(refgen_example_dir,path)
             cwd = os.getcwd()
@@ -2712,7 +2718,7 @@ def regenerate_reference(update=False,overwrite=True):
             command = './'+script+' --generate_only --sleep=0.1'
             out,err,rc = execute(command)
             if rc>0:
-                print('example script failed to run\nattempted command: {0}\nlocation: {1}'.format(command,script_path))
+                print(('example script failed to run\nattempted command: {0}\nlocation: {1}'.format(command,script_path)))
                 exit(1)
             #end if
             os.chdir(cwd)
@@ -2723,7 +2729,7 @@ def regenerate_reference(update=False,overwrite=True):
     if update:
         overwrite = False
         ref_example_dir = os.path.join(reference_dir,'user_examples')
-        for label,einfo in example_information.iteritems():
+        for label,einfo in example_information.items():
             for code,filetype,filepath in einfo['files']:
                 ref_filepath = os.path.join(ref_example_dir,filepath)
                 gen_filepath = os.path.join(refgen_example_dir,filepath)
@@ -2844,9 +2850,9 @@ if __name__=='__main__':
         #end if
     #end for
     if options.list:
-        print 'Test list:'
+        print('Test list:')
         for test in tests:
-            print ' ',test.name
+            print(' ',test.name)
         #end for
         exit()
     #end if
@@ -2867,7 +2873,7 @@ if __name__=='__main__':
 
     # run each test and print the test outcome
     if not ctest:
-        print
+        print()
     #end if
     n=0
     npassed = 0
@@ -2901,14 +2907,14 @@ if __name__=='__main__':
             if len(sn)<len(slt):
                 sn = (len(slt)-len(sn))*' '+sn
             #end if
-            print ' {0}/{1} {2}   {3}  {4:3.2f} sec'.format(sn,slt,title,status,t2-t1)
+            print(' {0}/{1} {2}   {3}  {4:3.2f} sec'.format(sn,slt,title,status,t2-t1))
         #end if
         
         # print more information if failed
         msg = test.message()
         if test.failed:
             if not ctest:
-                print msg
+                print(msg)
             else:
                 exit_fail(msg)
             #end if
@@ -2921,9 +2927,9 @@ if __name__=='__main__':
 
     # print pass/fail and timing summary
     if not ctest:
-        print
-        print '{0}% tests passed, {1} tests failed out of {2}'.format(int(100*float(npassed)/(1e-16+len(tests))),nfailed,len(tests))
-        print
-        print 'Total test time = {0:3.2f} sec'.format(tstop_all-tstart_all)
+        print()
+        print('{0}% tests passed, {1} tests failed out of {2}'.format(int(100*float(npassed)/(1e-16+len(tests))),nfailed,len(tests)))
+        print()
+        print('Total test time = {0:3.2f} sec'.format(tstop_all-tstart_all))
     #end if
 #end if
