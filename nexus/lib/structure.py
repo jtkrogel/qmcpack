@@ -4016,7 +4016,7 @@ class Structure(Sobj):
             self.read_xyz(filepath)
         elif format=='xsf':
             self.read_xsf(filepath)
-        elif format=='poscar':
+        elif format=='poscar' or format=='vasp':
             self.read_poscar(filepath,elem=elem)
         elif format=='cif':
             self.read_cif(filepath,block=block,grammar=grammar,cell=cell)
