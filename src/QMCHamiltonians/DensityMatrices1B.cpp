@@ -27,6 +27,121 @@ using MatrixOperators::product;
 using MatrixOperators::product_AtB;
 
 
+Basis::Basis(ParticleSet& P)
+  : Lattice(P.Lattice), Pq(P)
+{
+  normalized    = false;
+  volume_normed = false;
+  volume        = 0.0;
+  metropolis    = false;
+  size          = -1;
+}
+
+Basis::Basis(Basis& master)
+  : Lattice(master.Lattice), Pq(master.Pq)
+{
+  volume_normed = master.volume_normed;
+  metropolis    = master.metropolis;
+  scale         = master.scale;
+  center        = master.center;
+  rcorner       = master.rcorner;
+  volume        = master.volume;
+
+  functions.clone_from(master.functions);
+
+  initialize();
+
+  for (int i = 0; i < size; ++i)
+    norms[i] = master.norms[i];
+}
+
+void Basis::initialize()
+{
+  size = functions.size();
+
+  values.resize(size);
+  integrated_values.resize(size);
+  norms.resize(size);
+  if(metropolis)
+  {
+    gradients.resize(size);
+    laplacians.resize(size);
+  }
+
+  RealType norm = 1.0;
+  if (volume_normed)
+    norm = 1.0 / std::sqrt(volume);
+  for (int i = 0; i < size; ++i)
+    norms[i] = norm;
+}
+
+
+void Basis::normalize()
+{
+  int ngrid   = 200;
+  int ngtot   = pow(ngrid, DIM);
+  RealType du = scale / ngrid;
+  RealType dV = volume / ngtot;
+  PosType rp;
+  ValueVector_t bnorms;
+  int gdims[DIM];
+  gdims[0] = pow(ngrid, DIM - 1);
+  for (int d = 1; d < DIM; ++d)
+    gdims[d] = gdims[d - 1] / ngrid;
+  bnorms.resize(size);
+  for (int i = 0; i < size; ++i)
+    bnorms[i] = 0.0;
+  std::fill(norms.begin(), norms.end(), 1.0);
+  for (int p = 0; p < ngtot; ++p)
+  {
+    int nrem = p;
+    for (int d = 0; d < DIM - 1; ++d)
+    {
+      int ind = nrem / gdims[d];
+      rp[d]   = ind * du + du / 2;
+      nrem -= ind * gdims[d];
+    }
+    rp[DIM - 1] = nrem * du + du / 2;
+    rp          = Lattice.toCart(rp) + rcorner;
+    update(rp);
+    for (int i = 0; i < size; ++i)
+      bnorms[i] += qmcplusplus::conj(values[i]) * values[i] * dV;
+  }
+  for (int i = 0; i < size; ++i)
+    norms[i] = 1.0 / std::sqrt(real(bnorms[i]));
+  normalized = true;
+}
+
+
+void Basis::update(const PosType& r)
+{
+  Pq.makeMove(0, r - Pq.R[0]);
+  functions.evaluate(Pq, 0, values);
+  Pq.rejectMove(0);
+  for (int i = 0; i < size; ++i)
+    values[i] *= norms[i];
+}
+
+
+void Basis::update_d012(const PosType& r)
+{
+  Pq.makeMove(0, r - Pq.R[0]);
+  functions.evaluate(Pq, 0, values, gradients, laplacians);
+  Pq.rejectMove(0);
+  for (int i = 0; i < size; ++i)
+    values[i] *= norms[i];
+  for (int i = 0; i < size; ++i)
+    gradients[i] *= norms[i];
+  for (int i = 0; i < size; ++i)
+    laplacians[i] *= norms[i];
+}
+
+
+
+
+
+
+
 DensityMatrices1B::DensityMatrices1B(ParticleSet& P, TrialWaveFunction& psi, ParticleSet* Pcl)
     : Lattice(P.Lattice), Pq(P), Psi(psi), Pc(Pcl)
 {
@@ -140,6 +255,8 @@ void DensityMatrices1B::set_state(xmlNodePtr cur)
   std::string nmstr   = "yes";
   std::string vnstr   = "yes";
   std::vector<std::string> sposets;
+  std::vector<std::string> sposets_up;
+  std::vector<std::string> sposets_down;
 
   xmlNodePtr element = cur->xmlChildrenNode;
   while (element != NULL)
@@ -150,6 +267,10 @@ void DensityMatrices1B::set_state(xmlNodePtr cur)
       const XMLAttrString name(element, "name");
       if (name == "basis")
         putContent(sposets, element);
+      else if (name == "basis_up")
+        putContent(sposets_up, element);
+      else if (name == "basis_down")
+        putContent(sposets_down, element);
       else if (name == "energy_matrix")
         putContent(emstr, element);
       else if (name == "integrator")

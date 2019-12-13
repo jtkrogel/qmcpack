@@ -20,6 +20,52 @@
 
 namespace qmcplusplus
 {
+
+
+class Basis : public QMCTraits
+{
+  typedef SPOSet::ValueVector_t ValueVector_t;
+  typedef SPOSet::GradVector_t GradVector_t;
+  typedef ParticleSet::ParticleLayout_t Lattice_t;
+
+private:
+
+  bool normalized;
+  bool volume_normed;
+  bool metropolis;
+
+  Lattice_t&   Lattice;
+  ParticleSet& Pq;
+
+  RealType scale;
+  PosType  center, rcorner;
+  RealType volume;
+
+public:
+
+  int             size;
+  CompositeSPOSet functions;
+  ValueVector_t   values;
+  ValueVector_t   norms;
+  GradVector_t    gradients;
+  ValueVector_t   laplacians;
+  ValueVector_t   integrated_values;
+
+  Basis(ParticleSet& P);
+
+  Basis(Basis& master);
+
+  void initialize();
+
+  void update(const PosType& r);
+
+  void update_d012(const PosType& r);
+
+  void normalize();
+};
+
+
+
 class DensityMatrices1B : public QMCHamiltonianBase
 {
 protected:
