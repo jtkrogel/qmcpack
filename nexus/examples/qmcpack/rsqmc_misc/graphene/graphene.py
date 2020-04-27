@@ -55,78 +55,7 @@ scf = generate_pwscf(
     use_folded   = True,            # use primitive rep of graphene
     )
 
-# nscf run to produce orbitals for jastrow optimization
-nscf_opt = generate_pwscf(
-    # nexus inputs
-    identifier   = 'nscf',          # identifier/file prefix      
-    path         = 'graphene/nscf_opt', # directory for nscf run       
-    job          = job(cores=16),   # run on 16 cores             
-    pseudos      = ['C.BFD.upf'],   # pwscf PP file               
-    system       = graphene,        # run graphene                
-    # input format selector                                      
-    input_type   = 'nscf',          # scf, nscf, relax, or generic
-    # pwscf input parameters
-    input_dft    = 'lda',           # dft functional
-    ecut         =  150 ,           # planewave energy cutoff (Ry)
-    conv_thr     =  1e-6,           # scf convergence threshold (Ry)
-    mixing_beta  =    .7,           # charge mixing factor
-    nosym        = True,            # don't symmetrize k-points
-    use_folded   = True,            # use primitive rep of graphene
-    wf_collect   = True,            # write out orbitals
-    kgrid        = (1,1,1),         # single k-point for opt
-    kshift       = (0,0,0),         # gamma point
-    # workflow dependencies
-    dependencies = (scf,'charge_density'),
-    )
-
-# orbital conversion job for jastrow optimization
-p2q_opt = generate_pw2qmcpack(
-    # nexus inputs
-    identifier   = 'p2q',
-    path         = 'graphene/nscf_opt',
-    job          = job(cores=1),
-    # pw2qmcpack input parameters
-    write_psir   = False,
-    # workflow dependencies
-    dependencies = (nscf_opt,'orbitals'),
-    )
-
-# Jastrow optimization
-opt = generate_qmcpack(
-    # nexus inputs
-    identifier   = 'opt',           # identifier/file prefix
-    path         = 'graphene/opt',  # directory for opt run
-    job          = job(cores=16,app='qmcpack'),
-    pseudos      = ['C.BFD.xml'],   # qmcpack PP file
-    system       = graphene,        # run graphene
-    # input format selector   
-    input_type   = 'basic',
-    # qmcpack input parameters
-    corrections  = [], 
-    jastrows     = [('J1','bspline',8),   # 1 body bspline jastrow
-                    ('J2','bspline',8)],  # 2 body bspline jastrow
-    calculations = [
-        loop(max = 6,                        # No. of loop iterations
-             qmc = linear(                   # linearized optimization method
-                energy               =  0.0, # cost function
-                unreweightedvariance =  1.0, #   is all unreweighted variance
-                reweightedvariance   =  0.0, #   no energy or r.w. var. 
-                timestep             =  0.5, # vmc timestep (1/Ha)
-                warmupsteps          =  100, # MC steps before data collected 
-                samples              = 16000,# samples used for cost function 
-                stepsbetweensamples  =   10, # steps between uncorr. samples
-                blocks               =   10, # ignore this  
-                minwalkers           =   0.1,#  and this
-                bigchange            =  15.0,#  and this
-                alloweddifference    =  1e-4 #  and this, for now
-                )
-             )        
-        ],
-    # workflow dependencies
-    dependencies = (p2q_opt,'orbitals'),
-    )
-
-# nscf run to produce orbitals for final dmc
+# nscf run to produce orbitals for qmc
 nscf = generate_pwscf(
     # nexus inputs
     identifier   = 'nscf',          # identifier/file prefix      
@@ -148,7 +77,7 @@ nscf = generate_pwscf(
     dependencies = (scf,'charge_density'),
     )
 
-# orbital conversion job for final dmc
+# orbital conversion job for qmc
 p2q = generate_pw2qmcpack(
     # nexus inputs
     identifier   = 'p2q',
@@ -158,6 +87,42 @@ p2q = generate_pw2qmcpack(
     write_psir   = False,
     # workflow dependencies
     dependencies = (nscf,'orbitals'),
+    )
+
+# Jastrow optimization
+opt = generate_qmcpack(
+    # nexus inputs
+    identifier   = 'opt',           # identifier/file prefix
+    path         = 'graphene/opt',  # directory for opt run
+    job          = job(cores=16,app='qmcpack'),
+    pseudos      = ['C.BFD.xml'],   # qmcpack PP file
+    system       = graphene,        # run graphene
+    # input format selector   
+    input_type   = 'basic',
+    # qmcpack input parameters
+    twistnum     = 0,               # run at a single twist
+    corrections  = [], 
+    jastrows     = [('J1','bspline',8),   # 1 body bspline jastrow
+                    ('J2','bspline',8)],  # 2 body bspline jastrow
+    calculations = [
+        loop(max = 6,                        # No. of loop iterations
+             qmc = linear(                   # linearized optimization method
+                energy               =  0.0, # cost function
+                unreweightedvariance =  1.0, #   is all unreweighted variance
+                reweightedvariance   =  0.0, #   no energy or r.w. var. 
+                timestep             =  0.5, # vmc timestep (1/Ha)
+                warmupsteps          =  100, # MC steps before data collected 
+                samples              = 16000,# samples used for cost function 
+                stepsbetweensamples  =   10, # steps between uncorr. samples
+                blocks               =   10, # ignore this  
+                minwalkers           =   0.1,#  and this
+                bigchange            =  15.0,#  and this
+                alloweddifference    =  1e-4 #  and this, for now
+                )
+             )        
+        ],
+    # workflow dependencies
+    dependencies = (p2q,'orbitals'),
     )
     
 # final dmc run
