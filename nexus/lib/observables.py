@@ -17,8 +17,9 @@ from unit_converter import convert
 from generic import obj
 from developer import DevBase,log,error,ci
 from numerics import simstats
-from grid_functions import grid_function,read_grid,StructuredGrid,grid as generate_grid
+from grid_functions import grid_function,read_grid,grid as generate_grid
 from grid_functions import SpheroidGrid
+from grid_functions import ParallelotopeGrid,ParallelotopeGridFunction
 from structure import Structure,read_structure
 from fileio import XsfFile
 
@@ -26,6 +27,9 @@ from fileio import XsfFile
 
 
 class VLog(DevBase):
+    """
+    Functor class to handle logging with verbosity, memory, and time options.
+    """
 
     verbosity_levels = obj(
         none = 0,
@@ -101,11 +105,18 @@ vlog = VLog()
 
 
 def set_verbosity(level):
+    """
+    Set verbosity level.
+    """
     vlog.set_verbosity(level)
 #end def set_verbosity
 
 
+
 class Missing:
+    """
+    Represents missing keyword argments to functions.
+    """
     def __call__(self,value):
         return isinstance(value,Missing)
     #end def __call__
@@ -115,6 +126,43 @@ missing = Missing()
 
 
 class AttributeProperties(DevBase):
+    """
+    Descriptive properties of attributes assignable to classes derived from 
+    `DefinedAttributeBase`.
+
+    Attributes
+    ----------
+    assigned : `set`
+        Set of names of attribute properties that have been assigned.
+    name : `str`
+        Name of the attribute.  This is set internally for consistency and is not
+        required at the time of definition.
+    dest : `str`
+        Assignment destination for the value of the named attribute.  This refers
+        to the name of a collection object (usually of type `obj`) at the top level
+        of the class.  In this way, attributed properties of two level container 
+        classes can be defined in a single level manner.
+    type : `class object, optional`
+        Expected class/type of the values assigned to this attribute.  If provided, 
+        explicit type checks will be made upon assignment.  This allows for strong
+        typing applied to any or all of an object's attributes.
+    default : `optional`
+        Default value to be assigned if none is provided for the attribute.  This 
+        can be a simple value (e.g. an integer/float/bool), or it can be a class 
+        or function.  If a class is provided as the default, it's empty constructor 
+        is called at the time of default assignment.  If a function is provided as 
+        the default, the value it returns will be used at the time of default 
+        assignment.
+    no_default : `bool, optional, default False`
+        Do not assign any default value for this attribute.  If True, then the 
+        default behavior is for the attribute key to be missing from the 
+        instantiated object's attribute dictionary.
+    deepcopy : `bool, optional, default False`
+        Use a deep copy operation upon assignment for this attribute.
+    required : `bool, optional, default False`
+        Declare that this attribute is required.  This enables presence checks 
+        upon request.
+    """
     def __init__(self,**kwargs):
         self.assigned   = set(kwargs.keys())
         self.name       = kwargs.pop('name'      , None )
@@ -133,16 +181,60 @@ class AttributeProperties(DevBase):
 
 
 class DefinedAttributeBase(DevBase):
+    """
+    Enables detailed attribute requirements to be enforced for derived classes.
+
+    This includes specifications of required/optional attributes, controlled 
+    attribute assignment including name/type checks and/or deep copying, use of 
+    static or functional assignment of default values, and controlled retrieval 
+    of attributes including presence checks.  The attribute definitions comprise 
+    a namespace of allowed attributes that are strictly enforced.  In these 
+    ways, the typical fully dynamic nature of objects is more strictly controlled 
+    to give greater confidence in runtime correctness.
+
+    Includes mechanisms for simple composition of attribute requirements for 
+    multi-level inheritance of classes derived from this base class.
+    """
 
     @classmethod
     def set_unassigned_default(cls,default):
+        """
+        Set a global default value for attributes when attribute level defaults
+        are not specified.  A reasonable choice is the `None` value.
+        """
         cls.unassigned_default = default
     #end def set_unassigned_default
 
+
     @classmethod
     def define_attributes(cls,*other_cls,**attribute_properties):
-        if len(other_cls)==1 and issubclass(other_cls[0],DefinedAttributeBase):
-            cls.obtain_attributes(other_cls[0])
+        """
+        Main class-level interface to specify properties of each attribute.
+
+        Listed value arguments (`other_cls`), correspond to the parent classes 
+        of the current class in the inheritance hierarchy that also descend from
+        `DefinedAttributeBase`.  The attribute properties of the parent classes 
+        are concatenated for inclusion as requirements for the child class. 
+        Currently inheritance via a single parent class is supported.
+
+        Keyword inputs (`attribute_properties`) are key-value pairs, with the 
+        key corresponding to an allowed attribute name, and the value being 
+        simple dictionary inputs corresponding to the inputs of the 
+        `AttributeProperties` class.
+
+        This function assigns the class-level attributes `requried_attributes`, 
+        `deepcopy_attributes`, `typed_attributes`, `toplevel_attributes`, and 
+        `sublevel_attributes` which contain attribute names allowed in 
+        instances of the class.
+        """
+        if len(other_cls)==1:
+            if issubclass(other_cls[0],DefinedAttributeBase):
+                cls.obtain_attributes(other_cls[0])
+            else:
+                cls.class_error('Parent class must derive from DefinedAttributeBase.\nThis is a developer error.')
+            #end if
+        elif len(other_cls)>1:
+            cls.class_error('Only a single parent class is supported by DefinedAttributeBase.\nThis is a developer error.')
         #end if
         if cls.class_has('attribute_definitions'):
             attr_defs = cls.attribute_definitions
@@ -204,6 +296,9 @@ class DefinedAttributeBase(DevBase):
 
     @classmethod
     def obtain_attributes(cls,super_cls):
+        """
+        Collect attribute properties from the parent class.
+        """
         cls.class_set(
             attribute_definitions = super_cls.attribute_definitions.copy()
             )
@@ -211,6 +306,14 @@ class DefinedAttributeBase(DevBase):
 
 
     def __init__(self,**values):
+        """
+        Provides a general default constructor.
+
+        Arbitrary named attributes are accepted, with defaults first set.
+        Comprehensive attribute checks are left to the implementer, as 
+        deemed appropriate, but are generically available via the 
+        `check_attributes` member function.
+        """
         if len(values)>0:
             self.set_default_attributes()
             self.set_attributes(**values)
@@ -219,6 +322,9 @@ class DefinedAttributeBase(DevBase):
 
 
     def initialize(self,**values):
+        """
+        Enable deferred initialization following empty contruction.
+        """
         self.set_default_attributes()
         if len(values)>0:
             self.set_attributes(**values)
@@ -227,6 +333,9 @@ class DefinedAttributeBase(DevBase):
 
 
     def set_default_attributes(self):
+        """
+        Assign values to named attributes that have specified defaults.
+        """
         cls = self.__class__
         props = cls.attribute_definitions
         for name in cls.toplevel_attributes:
@@ -239,6 +348,12 @@ class DefinedAttributeBase(DevBase):
 
 
     def set_attributes(self,**values):
+        """
+        Assign values to attributes.
+
+        All required attributes must be provided in a single call.  Requirements
+        on each attribute, such as type, are strictly enforced.
+        """
         cls = self.__class__
         value_names = set(values.keys())
         attr_names  = set(cls.attribute_definitions.keys())
@@ -273,6 +388,10 @@ class DefinedAttributeBase(DevBase):
 
 
     def check_attributes(self,exit=False):
+        """
+        Check the integrity of the attributes of the instance according to the 
+        defined attribute properties.
+        """
         msg = ''
         cls = self.__class__
         a = obj()
@@ -318,6 +437,9 @@ class DefinedAttributeBase(DevBase):
 
 
     def check_unassigned(self,value):
+        """
+        Determine whether an attribute has been assigned a value.
+        """
         cls = self.__class__
         unassigned = cls.class_has('unassigned_default') and value is cls.unassigned_default
         return unassigned
@@ -325,6 +447,13 @@ class DefinedAttributeBase(DevBase):
 
 
     def set_attribute(self,name,value):
+        """
+        Assign a value to a named attribute.
+
+        Assignment includes checks against the allowed namespace and, 
+        if requested, type checks, deepcopying, and assignment to a nested 
+        destination.
+        """
         cls = self.__class__
         props = cls.attribute_definitions
         if name not in props:
@@ -348,6 +477,20 @@ class DefinedAttributeBase(DevBase):
 
 
     def get_attribute(self,name,value=missing,assigned=True):
+        """
+        Retrieve the value of a named attribute.
+
+        Parameters
+        ----------
+        name : `str`
+            Name of the attribute.
+        value : `optional`
+            Default value to be returned if the attribute has not been assigned.
+        assigned : `bool, default True`
+            Require that the attribute has been assigned and explicitly check 
+            for assignment before returning the value.  This requirement is not 
+            enforced if `value` is provided.
+        """
         default_value    = value
         default_provided = not missing(default_value)
         require_assigned = assigned and not default_provided
@@ -360,10 +503,10 @@ class DefinedAttributeBase(DevBase):
         value = missing
         if p.dest is None:
             if name in self:
-                value   = self[name]
+                value = self[name]
             #end if
         elif p.dest in self and name in self[p.dest]:
-            value   = self[p.dest][name]
+            value = self[p.dest][name]
         #end if
         present = not missing(value)
         if not present and default_provided:
@@ -391,11 +534,17 @@ class DefinedAttributeBase(DevBase):
 
 
     def has_attribute(self,name):
+        """
+        Check for the presence of a named attribute.
+        """
         return not (name not in self or self.check_unassigned(self[name]))
     #end def has_attribute
 
 
     def _set_default_attribute(self,name,props):
+        """
+        Internal function used to assign default values without protective interfaces.
+        """
         p = props
         if p.no_default:
             return
@@ -415,6 +564,9 @@ class DefinedAttributeBase(DevBase):
 
 
     def _set_attribute(self,container,name,value,props):
+        """
+        Internal function used to assign attribute values without protective interfaces.
+        """
         p = props
         if p.type is not None and not isinstance(value,p.type):
             self.error('Cannot set attribute "{}".\nExpected value with type: {}\nReceived value with type: {}'.format(name,p.type.__name__,value.__class__.__name__))
@@ -430,6 +582,18 @@ class DefinedAttributeBase(DevBase):
 
 
 class Observable(DefinedAttributeBase):
+    """
+    Base class for generic observables.
+
+    Attributes
+    ----------
+    info : `obj`
+        Container for extra information, including data for derived classes.
+    initialized : `bool, default False`
+        Record whether instance initialization is complete.  Contained in `info`.
+    structure : `Structure, optional, default None`
+        Atomic structure of the system under observation.
+    """
     def __init__(self,**values):
         self.initialize(**values)
     #end def __init__
@@ -437,7 +601,7 @@ class Observable(DefinedAttributeBase):
     def initialize(self,**values):
         DefinedAttributeBase.initialize(self,**values)
         if len(values)>0:
-            self.info.initialized = True
+            self.set_attribute('initialized',True)
         #end if
     #end def initialize
 #end class Observable
@@ -465,6 +629,19 @@ Observable.define_attributes(
 
 
 class ObservableWithComponents(Observable):
+    """
+    Base class for observables with multiple components, e.g. spin up and down.
+
+    Components are to be represented by simple container classes (e.g. `obj`), 
+    each having the same internal structure of the data.
+
+    Class attributes
+    ----------------
+    component_names : `tuple`
+        List of allowed components appearing as attributes in instances.
+    default_component_name : `str`
+        Default component name if no other is specified in a request.
+    """
 
     component_names        = None
     default_component_name = None
@@ -481,11 +658,17 @@ class ObservableWithComponents(Observable):
 
 
     def default_component(self):
+        """
+        Return the default component
+        """
         return self.component(self.default_component_name)
     #end def default_component
 
 
     def component(self,name):
+        """
+        Return a requested named component.
+        """
         if name is None:
             return self.default_component()
         #end if
@@ -500,6 +683,9 @@ class ObservableWithComponents(Observable):
 
 
     def components(self,names=None):
+        """
+        Return all (or a subset of) the components.
+        """
         comps = obj()
         if names is None:
             for c in self.component_names:
@@ -528,10 +714,34 @@ class ObservableWithComponents(Observable):
 
 #end class ObservableWithComponents
 
+ObservableWithComponents.define_attributes(Observable)
+
+
+
+def rinscribe(axes):
+    radius = 1e99
+    dim = len(axes)
+    volume = abs(np.linalg.det(axes))
+    for i in range(dim):
+        j = (i+1)%dim
+        rc = np.cross(axes[i,:],axes[j,:])
+        radius = min(radius,.5*volume/np.linalg.norm(rc))
+    #end for
+    return radius
+#end def rinscribe
 
 
 
 def read_eshdf_nofk_data(filename,Ef):
+    """
+    Read n(k) data from an ESHDF file based on a provided Fermi energy.
+
+    Parameters
+    ----------
+    Ef : `float`
+        Fermi energy threshold in eV.  Orbitals with energies lower than 
+        `Ef` are included to form the momentum distribution.
+    """
     from numpy import array,pi,dot,sqrt,abs,zeros
     from numpy.linalg import inv,det
     from hdfreader import read_hdf
@@ -629,11 +839,40 @@ def read_eshdf_nofk_data(filename,Ef):
 
 
 class MomentumDistribution(ObservableWithComponents):
+    """
+    Momentum distribution analysis class.
+
+    This class contains shared functionality for both deterministic (e.g. 
+    DFT derived) and statistical (e.g. QMC derived) momentum distributions.
+    Each of the processed up/down/up+down/up-down components are represented 
+    by `GridFunction` objects.
+
+    Attributes
+    ----------
+    raw : `obj`
+        Container holding raw n(k) data prior to any filtering or grid mapping.
+    u : `ParallelotopeGridFunction`
+        Processed component data for the up spin channel.
+    d : `ParallelotopeGridFunction`
+        Processed component data for the down spin channel.
+    tot : `ParallelotopeGridFunction`
+        Processed component data for the up+down.
+    pol : `ParallelotopeGridFunction`
+        Processed component data for the up-down.
+    kaxes : `ndarray`
+        K-space axes of the simulation cell.  Stored in in `info`.
+    raw_filter_tol : `float`
+        Tolerance applied when filtering the raw data.  Stored in `info`.
+    """
+
     component_names = ('tot','pol','u','d')
     
     default_component_name = 'tot'
 
     def get_raw_data(self):
+        """
+        Return raw data, checking that it has been initialized first.
+        """
         data = self.get_attribute('raw')
         if len(data)==0:
             self.error('Raw n(k) data is not present.')
@@ -643,6 +882,19 @@ class MomentumDistribution(ObservableWithComponents):
 
 
     def filter_raw_data(self,filter_tol=1e-5,store=True):
+        """
+        Filter out small values from the raw data.
+
+        A maximum value of k-space radius is found such that no n(k) value 
+        within the radius exceeds a tolerance.
+
+        Parameters
+        ----------
+        filter_tol : `float, default 1e-5`
+            Defines kmax = |km| such that n(k<km)>filter_tol.
+        store : `bool, default True`
+            Overwrite current raw data with truncated/filtered data.
+        """
         vlog('Filtering raw n(k) data with tolerance {:6.4e}'.format(filter_tol))
         prior_tol = self.get_attribute('raw_filter_tol',assigned=False)
         data  = self.get_raw_data()
@@ -688,6 +940,7 @@ class MomentumDistribution(ObservableWithComponents):
         #end for
         if store:
             vlog('Overwriting original raw n(k) with filtered data',n=1)
+            self.set_attribute('raw',new_data)
         #end if
         vlog('Filtering complete',n=1,time=True)
         return new_data
@@ -695,6 +948,25 @@ class MomentumDistribution(ObservableWithComponents):
 
 
     def map_raw_data_onto_grid(self,unfold=False,filter_tol=1e-5):
+        """
+        Initialize component data from raw data by creating rectilinear 
+        bounding grids around all defined raw data values.
+
+        Defined values may fall on a regularly spaced, but irregularly shaped 
+        grid, e.g. cartesian points defined within a sphere.  In this case, 
+        the rectilinear grid is padded with zeros around the irregular volume.
+        This function also has the capability to unfold points by symmetry and 
+        average over multi-valued points arising from invariance under some 
+        symmetry operations.
+
+        Parameters
+        ----------
+        unfold : `bool, default False`
+            Use point group symmetries to unfold the data.  Requires presence 
+            of `structure` attribute.
+        filter_tol : `float, default=1e-5`
+            Filter out n(k) data with values larger than `filter_tol`.
+        """
         vlog('\nMapping raw n(k) data onto regular grid')
         data = self.get_raw_data()
         structure = self.get_attribute('structure',assigned=unfold)
@@ -711,11 +983,15 @@ class MomentumDistribution(ObservableWithComponents):
         if not unfold:
             for s,sdata in data.items():
                 vlog('Mapping {} data onto grid'.format(s),n=1,time=True)
-                self[s] = grid_function(
-                    points = sdata.k,
-                    values = sdata.nk,
-                    axes   = kaxes,
+                vlog.increment(2)
+                gf = grid_function(
+                    points        = sdata.k,
+                    values        = sdata.nk,
+                    axes          = kaxes,
+                    check_compact = True,
                     )
+                self.set_attribute(s,gf)
+                vlog.decrement(2)
             #end for
         else:
             rotations = structure.point_group_operations()
@@ -739,12 +1015,14 @@ class MomentumDistribution(ObservableWithComponents):
 
                 vlog('Mapping {} data onto grid'.format(s),n=1,time=True)
                 vlog.increment(2)
-                self[s] = grid_function(
-                    points  = k,
-                    values  = nk,
-                    axes    = kaxes,
-                    average = True,
+                gf = grid_function(
+                    points        = k,
+                    values        = nk,
+                    axes          = kaxes,
+                    average       = True, # Avg any multi-valued points
+                    check_compact = True,
                     )
+                self.set_attribute(s,gf)
                 vlog.decrement(2)
             #end for
         #end if
@@ -757,17 +1035,66 @@ class MomentumDistribution(ObservableWithComponents):
 
 
     def backfold(self):
+        """
+        Fold extended zone n(k) data back into the reciprocal primitive cell.
+        """
+        # implementation needs more work
+        self.not_implemented()
+
         structure = self.get_attribute('structure',assigned=True)
         kaxes     = structure.kaxes
         c         = self.default_component()
         dk        = c.grid.dr
-        print(kaxes)
-        print(dk)
-        print(np.diag(kaxes)/np.diag(dk))
-        print(c.grid.cell_grid_shape)
-        ci()
-        exit()
+        #print(kaxes)
+        #print(dk)
+        #print(np.diag(kaxes)/np.diag(dk))
+        #print(c.grid.cell_grid_shape)
+        #ci()
+        #exit()
     #end def backfold
+
+
+    def radial_average(self,component=None,dk=0.01,ntheta=100,kmax=None,single=False,interp_kwargs=None,comps_return=False):
+        """
+        Compute radial average of interpolated n(k).
+        """
+        # implementation needs more work
+        self.not_implemented()
+
+        vlog('Computing radial average',time=True)
+        vlog('Current memory:',n=1,mem=True)
+        if interp_kwargs is None:
+            interp_kwargs = obj(order=1)
+        #end if
+        vlog('Constructing spherical grid',n=1,time=True)
+        if kmax is None:
+            c = self.default_component()
+            kmax = rinscribe(c.grid.axes)
+        #end if
+        nkp = int(np.ceil(kmax/dk))
+        sgrid = SpheroidGrid(
+            axes     = kmax*np.eye(3),
+            cells    = (nkp,ntheta,2*ntheta),
+            centered = True,
+            )
+        nkrs = obj()
+        for cname,nk in self.components(component).items():
+            vlog('Processing radial average for component "{}"'.format(cname),n=1,time=True)
+
+            rsphere = sgrid.r
+            nksphere = nk.interpolate(sgrid.r,**interp_kwargs)
+            nksphere.shape = sgrid.shape
+            nksphere.shape = len(nksphere),nksphere.size//len(nksphere)
+            rrad    = sgrid.radii()
+            arad    = nksphere.mean(axis=1)#*4*np.pi*rrad**2
+            nkrs[cname] = obj(
+                radius  = rrad,
+                average = fac*arad,
+                )
+        #end for
+        vlog('Current memory:',n=2,mem=True)
+        return nkrs
+    #end def radial_average
 
 
     def plot_plane_contours(self,
@@ -782,6 +1109,9 @@ class MomentumDistribution(ObservableWithComponents):
                             unit_out     = False,
                             boundary     = True,
                             ):
+        """
+        Plot n(k) contours along a planar slice.
+        """
         c  = self.component(quantity)
         o  = np.asarray(origin)
         a1 = np.asarray(a1)
@@ -815,116 +1145,190 @@ class MomentumDistribution(ObservableWithComponents):
     #end def plot_plane_contours
 
 
-    def plot_radial_raw(self,quants='all',kmax=None,fmt='b.',fig=True,show=True):
+    def plot_radial_average(self,quants='all',kmax=None,fmt='b-',fig=True,show=True):
+        """
+        Plot radially averaged n(k) data.
+        """
+        if quants=='all':
+            quants = list(data.keys())
+        #end if
+        nkrs = self.radial_average(component=quants,kmax=kmax)
+        for q in quants:
+            nk = nkrs[q]
+            if fig:
+                plt.figure()
+            #end if
+            plt.plot(nk.radius,nk.average,fmt)
+            plt.xlabel('k (a.u.)')
+            plt.ylabel('n(k) {}'.format(q))
+        #end if
+        if show:
+            plt.show()
+        #end if
+    #end def plot_radial_average
+
+
+    def plot_radial_scatter(self,quants='all',kmax=None,fmt='b.',fig=True,show=True,grid=True,raw=False,raw_fmt=None):
+        """
+        Plot all n(k) data points as a function of k-space radius.
+        """
         data = self.get_raw_data()
         if quants=='all':
             quants = list(data.keys())
         #end if
+        source_formats = []
+        if grid:
+            source_formats.append(('grid',fmt))
+        #end if
+        if raw:
+            if raw_fmt is not None:
+                rfmt = raw_fmt
+            elif grid:
+                rfmt = 'rx'
+            else:
+                rfmt = fmt
+            #end if
+            source_formats.append(('raw',rfmt))
+        #end if
         for q in quants:
-            d = data[q]
-            k  = np.linalg.norm(d.k,axis=1)
-            nk = d.nk
-            has_error = 'nk_err' in d
-            if has_error:
-                nke = d.nk_err
-            #end if
-            if kmax is not None:
-                rng = k<kmax
-                k   = k[rng]
-                nk  = nk[rng]
-                if has_error:
-                    nke = nke[rng]
-                #end if
-            #end if
             if fig:
                 plt.figure()
             #end if
-            if not has_error:
-                plt.plot(k,nk,fmt)
-            else:
-                plt.errorbar(k,nk,nke,fmt=fmt)
-            #end if
+            for source,fmt in source_formats:
+                if source=='grid':
+                    d  = self.component(q)
+                    k  = d.r
+                    nk = d.f
+                elif source=='raw':
+                    d  = data[q]
+                    k  = d.k
+                    nk = d.nk
+                #end if
+                k  = np.linalg.norm(k,axis=1)
+                has_error = 'nk_err' in d
+                if has_error:
+                    nke = d.nk_err
+                #end if
+                if kmax is not None:
+                    rng = k<kmax
+                    k   = k[rng]
+                    nk  = nk[rng]
+                    if has_error:
+                        nke = nke[rng]
+                    #end if
+                #end if
+                if not has_error:
+                    plt.plot(k,nk,fmt)
+                else:
+                    plt.errorbar(k,nk,nke,fmt=fmt)
+                #end if
+            #end for
             plt.xlabel('k (a.u.)')
             plt.ylabel('n(k) {}'.format(q))
         #end for
         if show:
             plt.show()
         #end if
-    #end def plot_radial_raw
+    #end def plot_radial_scatter
 
 
-    def plot_directional_raw(self,kdir,quants='all',kmax=None,fmt='b.',fig=True,show=True,reflect=False):
+    def plot_directional(self,kdir,quants='all',kmax=None,fmt='b.',fig=True,show=True,reflect=False,grid=True,raw=False,raw_fmt=None):
+        """
+        Plot all n(k) data points along a k-space direction.
+        """
         data = self.get_raw_data()
         kdir = np.array(kdir,dtype=float)
         kdir /= np.linalg.norm(kdir)
         if quants=='all':
             quants = list(data.keys())
         #end if
+        source_formats = []
+        if grid:
+            source_formats.append(('grid',fmt))
+        #end if
+        if raw:
+            if raw_fmt is not None:
+                rfmt = raw_fmt
+            elif grid:
+                rfmt = 'rx'
+            else:
+                rfmt = fmt
+            #end if
+            source_formats.append(('raw',rfmt))
+        #end if
         for q in quants:
-            d = data[q]
-            k  = d.k
-            nk = d.nk
-            has_error = 'nk_err' in d
-            if has_error:
-                nke = d.nk_err
-            #end if
-            km = np.linalg.norm(d.k,axis=1)
-            if kmax is not None:
-                rng = km<kmax
-                km  = km[rng]
-                k   = k[rng]
-                nk  = nk[rng]
-                if has_error:
-                    nke = nke[rng]
-                #end if
-            #end if
-            kd = np.dot(k,kdir)
-            along_dir = (np.abs(km-np.abs(kd)) < 1e-8*km) | (km<1e-8)
-            kd = kd[along_dir]
-            nk = nk[along_dir]
-            if has_error:
-                nke = nke[along_dir]
-            #end if
             if fig:
                 plt.figure()
             #end if
-            if not has_error:
-                plt.plot(kd,nk,fmt)
-                if reflect:
-                    plt.plot(-kd,nk,fmt)
+            for source,fmt in source_formats:
+                if source=='grid':
+                    d  = self.component(q)
+                    k  = d.r
+                    nk = d.f
+                elif source=='raw':
+                    d  = data[q]
+                    k  = d.k
+                    nk = d.nk
                 #end if
-            else:
-                plt.errorbar(kd,nk,nke,fmt=fmt)
-                if reflect:
-                    plt.errorbar(-kd,nk,nke,fmt=fmt)
+                has_error = 'nk_err' in d
+                if has_error:
+                    nke = d.nk_err
                 #end if
-            #end if
+                km = np.linalg.norm(k,axis=1)
+                if kmax is not None:
+                    rng = km<kmax
+                    km  = km[rng]
+                    k   = k[rng]
+                    nk  = nk[rng]
+                    if has_error:
+                        nke = nke[rng]
+                    #end if
+                #end if
+                kd = np.dot(k,kdir)
+                along_dir = (np.abs(km-np.abs(kd)) < 1e-8*km) | (km<1e-8)
+                kd = kd[along_dir]
+                nk = nk[along_dir]
+                if has_error:
+                    nke = nke[along_dir]
+                #end if
+                if not has_error:
+                    plt.plot(kd,nk,fmt)
+                    if reflect:
+                        plt.plot(-kd,nk,fmt)
+                    #end if
+                else:
+                    plt.errorbar(kd,nk,nke,fmt=fmt)
+                    if reflect:
+                        plt.errorbar(-kd,nk,nke,fmt=fmt)
+                    #end if
+                #end if
+            #end for
             plt.xlabel('k (a.u.)')
             plt.ylabel('directional n(k) {}'.format(q))
         #end for
-    #end def plot_directional_raw
+    #end def plot_directional
 #end class MomentumDistribution
 
 MomentumDistribution.define_attributes(
-    Observable,
+    ObservableWithComponents,
     raw = obj(
         type       = obj,
         no_default = True,
         ),
     u = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     d = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     tot = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     pol = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     kaxes = obj(
@@ -942,8 +1346,19 @@ MomentumDistribution.define_attributes(
 
 
 class MomentumDistributionDFT(MomentumDistribution):
+    """
+    Momentum distribution class for DFT data.
+
+    Attributes
+    ----------
+    E_fermi : `float`
+        Fermi energy (eV) defining the occupied orbitals.
+    """
 
     def read_eshdf(self,filepath,E_fermi=None,savefile=None,unfold=False,grid=True):
+        """
+        Read raw n(k) data from an ESHDF file.
+        """
 
         save = False
         if savefile is not None:
@@ -1026,8 +1441,18 @@ MomentumDistributionDFT.define_attributes(
 
 
 class MomentumDistributionQMC(MomentumDistribution):
-    def read_stat_h5(self,*files,equil=0,savefile=None):
+    """
+    Momentum distribution class for QMC data.
+    """
 
+    def read_stat_h5(self,*files,equil=0,savefile=None):
+        """
+        Read raw n(k) data from QMCPACK stat.h5 files.
+
+        Data is roughly postprocessed to obtain means and errorbars.
+        Data from multiple files (e.g. from different twists) is simply 
+        appended for later postprocessing.
+        """
         save = False
         if savefile is not None:
             if os.path.exists(savefile):
@@ -1089,12 +1514,38 @@ class MomentumDistributionQMC(MomentumDistribution):
 
 
 class Density(ObservableWithComponents):
+    """
+    Density analysis class.
+
+    Attributes
+    ----------
+    raw : `obj`
+        Container holding raw density data prior to any filtering or grid mapping.
+    u : `ParallelotopeGridFunction`
+        Processed component data for the up spin channel.
+    d : `ParallelotopeGridFunction`
+        Processed component data for the down spin channel.
+    tot : `ParallelotopeGridFunction`
+        Processed component data for the up+down.
+    pol : `ParallelotopeGridFunction`
+        Processed component data for the up-down.
+    grid : `ParallelotopeGrid`
+        Grid on which all density components are defined.
+    distance_units : `str`
+        Spatial distance units (e.g. A=Angstrom, B=Bohr).
+    density_units : `str`
+        Density units.
+    """
+
     component_names = ('tot','pol','u','d')
 
     default_component_name = 'tot'
 
 
     def read_xsf(self,filepath,component=None):
+        """
+        Read density data for a particular component from an XSF file.
+        """
         component = self.process_component_name(component)
 
         vlog('Reading density data from XSF file for component "{}"'.format(component),time=True)
@@ -1155,6 +1606,9 @@ class Density(ObservableWithComponents):
 
     
     def volume_normalize(self):
+        """
+        Normalize data by volume so that volume integrals converge to electron counts.
+        """
         g = self.get_attribute('grid')
         dV = g.volume()/g.ncells
         for c in self.components():
@@ -1164,6 +1618,9 @@ class Density(ObservableWithComponents):
 
 
     def norm(self,component=None):
+        """
+        Perform volume integrals of all density components.
+        """
         norms = obj()
         comps = self.components(component)
         for name,d in comps.items():
@@ -1180,6 +1637,9 @@ class Density(ObservableWithComponents):
 
 
     def change_distance_units(self,units):
+        """
+        Change internal distance units.
+        """
         units_old = self.get_attribute('distance_units')
         rscale    = 1.0/convert(1.0,units_old,units)
         dscale    = 1./rscale**3
@@ -1192,6 +1652,9 @@ class Density(ObservableWithComponents):
 
 
     def change_density_units(self,units):
+        """
+        Change internal density units.
+        """
         units_old = self.get_attribute('density_units')
         dscale    = 1.0/convert(1.0,units_old,units)
         for c in self.components():
@@ -1201,7 +1664,11 @@ class Density(ObservableWithComponents):
 
 
     def radial_density(self,component=None,dr=0.01,ntheta=100,rmax=None,single=False,interp_kwargs=None,comps_return=False):
-        
+        """
+        Compute radial density profiles around selected atoms.
+
+        Capable of identifying and averaging over sets of symmetry equivalent atoms. 
+        """
         vlog('Computing radial density',time=True)
         vlog('Current memory:',n=1,mem=True)
         if interp_kwargs is None:
@@ -1284,6 +1751,9 @@ class Density(ObservableWithComponents):
 
 
     def cumulative_radial_density(self,rdfs=None,comps_return=False,**kwargs):
+        """
+        Compute cumulative radial density profiles around selected atoms.
+        """
         component = kwargs.get('component',None)
         if rdfs is None:
             kwargs['comps_return'] = True
@@ -1306,6 +1776,9 @@ class Density(ObservableWithComponents):
 
 
     def plot_radial_density(self,component=None,show=True,cumulative=False,**kwargs):
+        """
+        Plot radial density profiles around selected atoms.
+        """
         vlog('Plotting radial density')
         kwargs['comps_return'] = True
         if not cumulative:
@@ -1346,6 +1819,9 @@ class Density(ObservableWithComponents):
 
 
     def save_radial_density(self,prefix,rdfs=None,**kwargs):
+        """
+        Save radial density profiles for selected atoms.
+        """
         path = ''
         if '/' in prefix:
             path,prefix = os.path.split(prefix)
@@ -1386,32 +1862,32 @@ Density.define_attributes(
         no_default = True,
         ),
     u = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     d = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     tot = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     pol = obj(
-        type       = obj,
+        type       = ParallelotopeGridFunction,
         no_default = True,
         ),
     grid = obj(
-        type       = StructuredGrid,
+        type       = ParallelotopeGrid,
         no_default = True,
         ),
     distance_units = obj(
-        dest = 'info',
-        type = str,
+        dest       = 'info',
+        type       = str,
         ),
     density_units = obj(
-        dest = 'info',
-        type = str,
+        dest      = 'info',
+        type      = str,
         )
     )
 
@@ -1430,6 +1906,10 @@ class EnergyDensity(Density):
 
 
 class StatFile(DevBase):
+    """
+    Class to organize and extract raw observable data from QMCPACK's
+    stat.h5 files.
+    """
 
     scalars = set('''
         LocalEnergy   

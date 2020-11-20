@@ -3978,8 +3978,8 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
 
 
     # test needed
-    def read_from_points(self,points,values,axes,tol=1e-6,average=False):
-        self.vlog('Reading grid function values from scattered data.')
+    def read_from_points(self,points,values,axes,tol=1e-6,average=False,check_compact=False):
+        self.vlog('Reading grid function values from scattered data')
 
         # check data types and shapes
         d = self.ensure_array(
@@ -4110,6 +4110,67 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
         max_count = point_counts.max()
         if not average and max_count>1:
             self.error('Mapping to grid points is not one-to-one.\nMax no. of read points mapped to a grid point: {}'.format(max_count))
+        #end if
+
+        # check for compactness of the mapping, if requested
+        #   this is only appropriate if the input data are compact
+        if check_compact:
+            self.vlog('Checking grid mapping for compactness',n=1,time=True)
+            bgrid         = np.zeros((grid.npoints,),dtype=bool)
+            bgrid[ipflat] = True
+            bgrid.shape   = grid.shape
+            bshape        = tuple(grid.shape)
+            nbpoints      = np.prod(bshape)
+            # check for compactness along each projection dimension
+            compact = True
+            coverage_pairs = []
+            for d in range(D):
+                npara  = bshape[-1]
+                ntrans = nbpoints//npara
+                bgrid.shape = (ntrans,npara)
+                ncovered  = 0
+                ninterior = 0
+                for bline in bgrid:
+                    ntot  = npara
+                    ncov  = bline.sum()
+                    if ncov==0:
+                        nedge = ntot
+                    else:
+                        nedge = 0
+                        for b in bline:
+                            if not b:
+                                nedge += 1
+                            else:
+                                break
+                            #end if
+                        #end for
+                        for b in reversed(bline):
+                            if not b:
+                                nedge += 1
+                            else:
+                                break
+                            #end if
+                        #end for
+                    #end if
+                    nint = ntot-ncov-nedge
+                    ncovered  += ncov
+                    ninterior += nint
+                #end for
+                coverage_pairs.append((ncovered,ninterior))
+                compact &= ninterior==0
+                # permute the axes
+                bgrid.shape = bshape
+                bgrid = np.moveaxis(bgrid,-1,0)
+                bgrid = bgrid.copy() # needed to make array contiguous again
+                bshape = (bshape[-1],)+bshape[:-1]
+            #end for
+            if not compact:
+                msg = 'Grid function cannot be read from points.\nInput data do not map compactly onto the underlying grid.\nResults from compactness scans along projected dimensions:'
+                for d,(nc,ni) in enumerate(coverage_pairs):
+                    msg += '\n  Compactness scan along dimension {}:\n    Total grid points      : {}\n    Inputted points        : {}\n    Non-compact grid points: {}\n    Non-compact fraction   : {}'.format(d,nc+ni,nc,ni,ni/(nc+ni))
+                #end for
+                self.error(msg)
+            #end if
         #end if
 
         # map the inputted values onto the generated grid
@@ -4308,7 +4369,7 @@ def parallelotope_grid_function(
         gf = ParallelotopeGridFunction(**kwargs)
     else:
         required = set(('points','values','axes'))
-        optional = set(('tol','average'))
+        optional = set(('tol','average','check_compact'))
         present  = set(kwargs.keys())
         if len(required-present)>0:
             error('Grid function cannot be created.\nWhen "points" is provided, "axes" and "values" must also be given.\nInputs provided: {}'.format(sorted(present)),loc)
