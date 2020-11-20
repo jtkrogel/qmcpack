@@ -4279,6 +4279,32 @@ class SpheroidGridFunction(StructuredGridFunctionWithAxes):
         Datatype of the function values.
     """
     grid_class = SpheroidGrid
+
+    def angular_average(self):
+        self.reshape_points_full()
+        g = self.grid
+        nr,nt,nh = g.shape
+        r = g.r[-1,:,:,:]
+        r.shape = (nt*nh,3)
+        th = cartesian_to_spherical(r,surface=True)[:,0]
+        sin_theta = np.sin(th)
+        sin_theta.shape = nt,nh
+        fa = np.empty((self.nvalues,nr),dtype=self.dtype)
+        f = self.f
+        for iv,fav in enumerate(fa):
+            for i in range(nr):
+                fav[i] = (f[i,:,:,iv]*sin_theta).sum()
+            #end for
+        #end for
+        fa /= sin_theta.sum()
+        fa = fa.T
+        if self.nvalues==1:
+            fa = fa.flatten()
+        #end if
+        self.reshape_points_flat()
+        ra = g.radii()
+        return ra,fa
+    #end def angular_average
 #end class SpheroidGridFunction
 
 
