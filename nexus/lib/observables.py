@@ -1347,7 +1347,7 @@ class MomentumDistributionDFT(MomentumDistribution):
         Fermi energy (eV) defining the occupied orbitals.
     """
 
-    def read_eshdf(self,filepath,E_fermi=None,savefile=None,unfold=False,grid=True):
+    def read_eshdf(self,filepath,E_fermi=None,savefile=None,tiling=None,unfold=False,grid=True):
         """
         Read raw n(k) data from an ESHDF file.
         """
@@ -1405,8 +1405,18 @@ class MomentumDistributionDFT(MomentumDistribution):
             nk = spin_data.u.nk + spin_data.d.nk,
             )
 
-        self.set_attribute('raw'  ,spin_data)
-        self.set_attribute('kaxes',d.kaxes  )
+        kaxes = d.kaxes
+        if tiling is not None:
+            tiling = np.array(tiling,dtype=float)
+            if tiling.size==3:
+                tiling = np.diag(tiling)
+            #end if
+            tiling.shape = (3,3)
+            kaxes = np.dot(np.linalg.inv(tiling.T),kaxes)
+        #end if
+
+        self.set_attribute('raw'  , spin_data)
+        self.set_attribute('kaxes', kaxes    )
 
         if grid:
             self.map_raw_data_onto_grid(unfold=unfold)
