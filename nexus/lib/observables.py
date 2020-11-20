@@ -1077,7 +1077,6 @@ class MomentumDistribution(ObservableWithComponents):
         nkrs = obj()
         for cname,nk in self.components(component).items():
             vlog('Processing angular average for component "{}"'.format(cname),n=1,time=True)
-
             nksphere = nk.interpolate(sgrid,**interp_kwargs)
             r,nkr = nksphere.angular_average()
             nkrs[cname] = obj(
@@ -1138,14 +1137,14 @@ class MomentumDistribution(ObservableWithComponents):
     #end def plot_plane_contours
 
 
-    def plot_radial_average(self,quants='all',kmax=None,fmt='b-',fig=True,show=True):
+    def plot_radial_average(self,quants='all',kmax=None,fmt='b-',fig=True,show=True,interp_kwargs=None):
         """
         Plot radial n(k) following angular average.
         """
         if quants=='all':
             quants = list(data.keys())
         #end if
-        nkrs = self.angular_average(component=quants,kmax=kmax)
+        nkrs = self.angular_average(component=quants,kmax=kmax,interp_kwargs=interp_kwargs)
         for q in quants:
             nk = nkrs[q]
             if fig:

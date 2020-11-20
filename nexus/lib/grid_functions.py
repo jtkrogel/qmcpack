@@ -106,6 +106,11 @@ try:
 except:
     scipy_ndimage = unavailable('scipy','ndimage')
 #end try
+try:
+    import scipy.interpolate as scipy_interpolate
+except:
+    scipy_interpolate = unavailable('scipy','interpolate')
+#end try
 
 
 
@@ -1569,6 +1574,20 @@ class StructuredGrid(Grid):
         """
         return self.unit_metric_bare(upoints)
     #end def unit_metric
+
+
+    def unit_linear_grids(self):
+        ugrids = []
+        c = self.centered
+        for n,e in zip(self.shape,self.has_endpoints()):
+            u = np.linspace(0.0,1.0,n,endpoint=e)
+            if c:
+                u += 0.5/n
+            #end if
+            ugrids.append(u)
+        #end for
+        return tuple(ugrids)
+    #end def unit_linear_grids
 
 
     def cell_indices(self,points=None,project=True):
@@ -3686,9 +3705,10 @@ class StructuredGridFunctionWithAxes(StructuredGridFunction):
             r = grid.r
         #end if
         if type is None:
-            type = 'map_coordinates'
+            type = 'linear'
         #end if
         if type=='map_coordinates':
+            self.warn('map_coordinates interpolation is known to be buggy in scipy.  Proceed at your own risk!')
             if 'mode' not in kw:
                 if self.periodic:
                     kw.mode = 'wrap'
@@ -3710,6 +3730,31 @@ class StructuredGridFunctionWithAxes(StructuredGridFunction):
             v.shape = v_shape[:-1]
             values = scipy_ndimage.map_coordinates(v, indices, **kw)
             v.shape = v_shape
+        elif type=='griddata':
+            if self.periodic:
+                self.error('Interpolation via griddata is not yet supported in periodic boundary conditions.')
+            #end if
+            values = np.empty((self.nvalues,len(r)),dtype=self.dtype)
+            for iv in range(len(values)):
+                values[iv] = scipy_interpolate.griddata(self.r,self.f[:,iv],r,**kw)
+            #end for
+            values = values.T
+        elif type=='linear':
+            if self.periodic:
+                self.error('Linear interpolation is not yet supported in periodic boundary conditions.')
+            #end if
+            values = np.empty((self.nvalues,len(r)),dtype=self.dtype)
+            vshape = self.grid.shape
+            ugrids = self.grid.unit_linear_grids()
+            u = self.grid.unit_points(r)
+            for iv in range(len(values)):
+                f = self.f[:,iv].flatten()
+                f.shape = vshape
+                interp = scipy_interpolate.RegularGridInterpolator(ugrids,f,**kw)
+                values[iv] = interp(u)
+            #end for
+            self.reshape_flat()
+            values = values.T
         else:
             self.error('Interpolation of type "{}" is not supported.\nValid options are: map_coordinates'.format(type))
         #end if
