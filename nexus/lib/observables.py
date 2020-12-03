@@ -1447,7 +1447,7 @@ class MomentumDistributionQMC(MomentumDistribution):
     Momentum distribution class for QMC data.
     """
 
-    def read_stat_h5(self,*files,equil=0,savefile=None):
+    def read_stat_h5(self,*files,equil=0,grid=True,unfold=False,savefile=None):
         """
         Read raw n(k) data from QMCPACK stat.h5 files.
 
@@ -1503,6 +1503,10 @@ class MomentumDistributionQMC(MomentumDistribution):
                 )
             )
         self.set_attribute('raw',data)
+
+        if grid:
+            self.map_raw_data_onto_grid(unfold=unfold)
+        #end if
 
         if save:
             vlog('Saving to file {}'.format(savefile),n=1)
