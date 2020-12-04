@@ -4280,24 +4280,32 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
 
 
     def tile(self,*tiling):
+        # tile the grid
         g = self.grid.tile(*tiling)
 
+        # tile the values
         values = np.zeros(g.shape+(self.nvalues,),self.dtype)
+        #   index vectors for tiling translations
         ivecs  = index_grid_points(tiling)
+        #   cell grid shape of untiled grid
         cshape = np.array(self.grid.cell_grid_shape)
         self.reshape_points_full()
         for ivec in ivecs:
+            # lower and upper sub-grid indices in the tiled space
             ilow  = ivec*cshape
             ihigh = (ivec+1)*cshape
+            # construct multidimensional slice for sub-volume
             vslice = tuple()
             for i1,i2 in zip(ilow,ihigh):
                 vslice += (slice(i1,i2,None),) # i1:i2
             #end for
-            vslice += (slice(None,None,None),) # :
+            vslice += (slice(None,None,None),) # :   (for values)
+            # assign untiled values to tiled sub-volume 
             values[vslice] = self.values
         #end for
         self.reshape_points_flat()
 
+        # construct grid function from tiled grid and values
         gf = ParallelotopeGridFunction(
             grid   = g,
             values = values,
