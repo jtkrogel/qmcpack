@@ -3121,7 +3121,7 @@ class SpheroidSurfaceGrid(StructuredGridWithAxes):
             endpoints = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
         #end if
 
-        points,shape = spheroid_surface_grid_points(axes,shape=shape,cells=cells,centered=centered,endpoints=endpoint,return_shape=True)
+        points,shape = spheroid_surface_grid_points(axes,shape=shape,cells=cells,centered=centered,endpoint=endpoints,return_shape=True)
 
         kwargs['axes']     = axes
         if center is not None:
