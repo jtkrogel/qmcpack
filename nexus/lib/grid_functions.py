@@ -302,6 +302,17 @@ def cartesian_to_spherical(points,surface=False):
 
 
 
+def index_grid_points(shape,dtype=int):
+    linear_indices = [np.arange(n,dtype=dtype) for n in shape]
+    ipoints = np.meshgrid(*linear_indices,indexing='ij')
+    ipoints = np.array(ipoints,dtype=dtype)
+    ipoints.shape = (len(ipoints),np.prod(shape))
+    ipoints = ipoints.T
+    return ipoints
+#end def index_grid_points
+
+
+
 def unit_grid_points(shape,centered=False,endpoint=None):
     """
     Generation of uniform grids in N dimensions.
@@ -2409,6 +2420,26 @@ class ParallelotopeGrid(StructuredGridWithAxes):
         return cell_vols
     #end def cell_volumes
 
+
+    def tile(self,*tiling):
+        if len(tiling)!=self.grid_dim:
+            self.error('Cannot tile grid.\nTiling does not match grid dimensions.\nGrid dimensions  : {}\nTiling dimensions: {}\nInputted tiling  : {}'.format(self.grid_dim,len(tiling),tiling))
+        #end if
+        
+        tiling = np.array(tiling,dtype=int)
+        axes  = tiling*self.axes
+        cells = np.array(self.cell_grid_shape)*tiling
+
+        g = ParallelotopeGrid(
+            bconds   = self.bconds,
+            centered = self.centered,
+            cells    = cells,
+            axes     = axes,
+            )
+
+        return g
+    #end def tile
+
 #end class ParallelotopeGrid
 
 
@@ -3362,7 +3393,7 @@ class GridFunction(GBase):
         elif value_shape is None:
             if len(values)==grid.npoints:
                 value_shape = values.shape[1:]
-            elif len(value.shape)>len(grid.shape) and value.shape[:len(grid.shape)]==grid.shape:
+            elif len(values.shape)>len(grid.shape) and values.shape[:len(grid.shape)]==grid.shape:
                 value_shape = values.shape[len(grid.shape):]
             #end if
         elif isinstance(value_shape,(list,np.ndarray)):
@@ -4246,6 +4277,34 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
 
         self.vlog('Read complete',n=1,time=True)
     #end def read_from_points
+
+
+    def tile(self,*tiling):
+        g = self.grid.tile(*tiling)
+
+        values = np.zeros(g.shape+(self.nvalues,),self.dtype)
+        ivecs  = index_grid_points(tiling)
+        cshape = np.array(self.grid.cell_grid_shape)
+        self.reshape_points_full()
+        for ivec in ivecs:
+            ilow  = ivec*cshape
+            ihigh = (ivec+1)*cshape
+            vslice = tuple()
+            for i1,i2 in zip(ilow,ihigh):
+                vslice += (slice(i1,i2,None),) # i1:i2
+            #end for
+            vslice += (slice(None,None,None),) # :
+            values[vslice] = self.values
+        #end for
+        self.reshape_points_flat()
+
+        gf = ParallelotopeGridFunction(
+            grid   = g,
+            values = values,
+            )
+
+        return gf
+    #end def tile
 
 #end class ParallelotopeGridFunction
 
