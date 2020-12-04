@@ -1267,6 +1267,9 @@ class StructuredGrid(Grid):
     bconds : `array_like, str, shape (d,), {'o','p'}, optional, default d*['o']`
         Boundary conditions for each dimension.  Options are open (`'o'`) 
         and periodic (`'p'`).  `d` is the dimension of the grid (`grid_dim`).
+    endpoints : `array_like, bool, shape (d,), optional, default bonds=='o'`
+        Whether the final grid point falls at the endpoint of the spanned 
+        interval.
     surface : `bool`
         If `True`, then the grid is known to reside on the surface of another 
         space.  Otherwise, the grid spans the volume of that space.
@@ -1278,8 +1281,11 @@ class StructuredGrid(Grid):
     centered : `bool`
         Grid points are located at lower cell corners (`False`) or cell 
         centers (`True`).
-    bconds : `ndarray, str`
+    bconds : `ndarray, str, shape (d,)`
         Boundary conditions for each dimension.
+    endpoints : `array_like, bool, shape (d,)`
+        Whether the final grid point falls at the endpoint of the spanned 
+        interval.
     surface : `bool`
         The grid is resides on the surface of a space (`True`), otherwise, it 
         spans the volume of the space (`False`).  This attribute is intended 
@@ -2292,9 +2298,12 @@ class ParallelotopeGrid(StructuredGridWithAxes):
         elif dr is not None:
             grid_dim = len(dr)
         #end if
-        bconds = kwargs.get('bconds',None)
 
-        endpoint = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
+        endpoints = kwargs.get('endpoints',None) 
+        if endpoints is None:
+            bconds    = kwargs.get('bconds',None)
+            endpoints = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
+        #end if
 
         points,shape,axes = parallelotope_grid_points(
             axes         = axes,
@@ -2302,7 +2311,7 @@ class ParallelotopeGrid(StructuredGridWithAxes):
             cells        = cells,
             dr           = dr,
             centered     = centered,
-            endpoint     = endpoint,
+            endpoint     = endpoints,
             return_shape = True,
             return_axes  = True
             )
@@ -2736,9 +2745,12 @@ class SpheroidGrid(StructuredGridWithAxes):
             #end if
         #end if
 
-        endpoint = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
+        endpoints = kwargs.get('endpoints',None)
+        if endpoints is None:
+            endpoints = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
+        #end if
 
-        points,shape = spheroid_grid_points(axes,shape=shape,cells=cells,centered=centered,endpoint=endpoint,return_shape=True)
+        points,shape = spheroid_grid_points(axes,shape=shape,cells=cells,centered=centered,endpoint=endpoints,return_shape=True)
 
         kwargs['axes']     = axes
         if center is not None:
@@ -3104,9 +3116,12 @@ class SpheroidSurfaceGrid(StructuredGridWithAxes):
             self.error('only 1 and 2 dimensional spheroid surface grids are supported\nrequested dimension: {}'.format(grid_dim))
         #end if
 
-        endpoint = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
+        endpoints = kwargs.get('endpoints',None)
+        if endpoints is None:
+            endpoints = self.has_endpoints(bconds=bconds,grid_dim=grid_dim)
+        #end if
 
-        points,shape = spheroid_surface_grid_points(axes,shape=shape,cells=cells,centered=centered,endpoint=endpoint,return_shape=True)
+        points,shape = spheroid_surface_grid_points(axes,shape=shape,cells=cells,centered=centered,endpoints=endpoint,return_shape=True)
 
         kwargs['axes']     = axes
         if center is not None:
