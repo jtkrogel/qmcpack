@@ -2463,22 +2463,23 @@ class ParallelotopeGrid(StructuredGridWithAxes):
         #end if
         
         tiling = np.array(tiling,dtype=int)
-        axes  = tiling*self.axes
-        cells = np.array(self.cell_grid_shape)*tiling
+        axes   = tiling*self.axes
+        cells  = np.array(self.cell_grid_shape)*tiling
 
         g = ParallelotopeGrid(
-            bconds   = self.bconds,
-            centered = self.centered,
-            cells    = cells,
-            axes     = axes,
-            origin   = self.origin,
+            bconds    = self.bconds,
+            endpoints = self.endpoints,
+            centered  = self.centered,
+            cells     = cells,
+            axes      = axes,
+            origin    = self.origin,
             )
 
         return g
     #end def tile
 
 
-    def slice(self,slc,axis=0,ret_slice_obj=False):
+    def slice(self,slc,axis=0,drop_axis=False,ret_slice_obj=False):
         if axis<0 or axis>self.grid_dim-1:
             self.error('Cannot slice grid.\nRequested axis is out of range.\nRequested axis: {}\nAllowed axes  : {}'.format(axis,tuple(range(self.grid_dim))))
         #end if
@@ -2534,6 +2535,12 @@ class ParallelotopeGrid(StructuredGridWithAxes):
                     shape.append(pshape[i])
                 #end if
             #end for
+            if drop_axis:
+                axes = np.array(axes)
+                axes   = np.delete(axes,axis,axis=1)
+                points = np.delete(points,axis,axis=1)
+                origin = np.delete(origin,axis)
+            #end if
         else:
             # case 2: slice has finite length along the sliced axis
             shape = pshape
@@ -2577,6 +2584,7 @@ class ParallelotopeGrid(StructuredGridWithAxes):
             shape    = shape,
             centered = self.centered,
             points   = points,
+            copy     = False,
             )
 
         if not ret_slice_obj:
@@ -4184,7 +4192,7 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
             copy = True
         else:
             xsf  = XsfFile(filepath)
-            copy = False,
+            copy = False
         #end if
 
         grid = self.grid_class()
@@ -4469,8 +4477,23 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
     #end def tile
 
 
-    def slice(self,slc,axis=0):
-        None
+    def slice(self,slc,axis=0,drop_axis=False):
+        # slice the grid
+        g,gslice = self.grid.slice(slc,axis,drop_axis,ret_slice_obj=True)
+
+        # slice the values
+        self.reshape_points_full()
+        values = self.values[gslice].copy()
+        self.reshape_points_flat()
+
+        # construct grid function from sliced grid and values
+        gf = ParallelotopeGridFunction(
+            grid   = g,
+            values = values,
+            copy   = False,
+            )
+
+        return gf        
     #end def slice
 
 #end class ParallelotopeGridFunction
