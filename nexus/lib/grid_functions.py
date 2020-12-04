@@ -1305,10 +1305,11 @@ class StructuredGrid(Grid):
     #: (`obj`) Collection of attributes for the class.  Used to check assigned 
     #: members for type conformity and to assign default values.
     persistent_data_types = obj(
-        shape    = (tuple     ,None),
-        centered = (bool      ,None),
-        bconds   = (np.ndarray,None),
-        surface  = (bool      ,None),
+        shape     = (tuple     ,None),
+        centered  = (bool      ,None),
+        bconds    = (np.ndarray,None),
+        endpoints = (np.ndarray,None),
+        surface   = (bool      ,None),
         **Grid.persistent_data_types
         )
 
@@ -1336,7 +1337,7 @@ class StructuredGrid(Grid):
     def cell_grid_shape(self):
         shape = np.array(self.shape,dtype=int)
         if not self.centered:
-            shape -= np.array(self.has_endpoints(),dtype=int)
+            shape -= np.array(self.endpoints,dtype=int)
         #end if
         return tuple(shape)
     #end def cell_grid_shape
@@ -1378,9 +1379,10 @@ class StructuredGrid(Grid):
         The `surface` attribute is set to `False`.  It is the responsibility 
         of the derived classes to set this in an appropriate way.
         """
-        shape    = kwargs.pop('shape'   ,None)
-        centered = kwargs.pop('centered',False)
-        bconds   = kwargs.pop('bconds'  ,None)
+        shape     = kwargs.pop('shape'    ,None)
+        centered  = kwargs.pop('centered' ,False)
+        bconds    = kwargs.pop('bconds'   ,None)
+        endpoints = kwargs.pop('endpoints',None)
         Grid.initialize_local(self,**kwargs)
         self.centered = centered
         self.surface  = False
@@ -1394,7 +1396,11 @@ class StructuredGrid(Grid):
         if bconds is None:
             bconds = len(shape)*[self.bcond_types.open]
         #end if
+        if endpoints is None:
+            endpoints = [bc==self.bcond_types.open for bc in bconds]
+        #end if
         self.set_bconds(bconds)
+        self.set_endpoints(endpoints)
         self.set_shape(shape)
     #end def initialize_local
 
@@ -1436,6 +1442,17 @@ class StructuredGrid(Grid):
     #end def set_bconds
 
 
+    def set_endpoints(self,endpoints):
+        """
+        (`Internal API`) Sets the `endpoints` attribute in a protected way.
+        """
+        if not isinstance(endpoints,(tuple,list,np.ndarray)):
+            self.error('cannot set endpoints from data with type "{}"\nplease use tuple, list, or array for inputted endpoints'.format(endpoints.__class__.__name__))
+        #end if
+        self.endpoints = np.array(endpoints,dtype=bool)
+    #end def set_endpoints
+
+
     def has_endpoints(self,bconds=None,grid_dim=None):
         """
         (`Internal API`) Determine whether a grid should have endpoints at its
@@ -1443,18 +1460,22 @@ class StructuredGrid(Grid):
 
         Endpoints should not be present in periodic boundary conditions.
         """
-        if grid_dim is not None:
-            if bconds is None:
-                bconds = grid_dim*[self.bcond_types.open]
-            elif isinstance(bconds,str):
-                bconds = tuple(bconds)
+        if bconds is None and grid_dim is None:
+            return self.endpoints
+        else:
+            if grid_dim is not None:
+                if bconds is None:
+                    bconds = grid_dim*[self.bcond_types.open]
+                elif isinstance(bconds,str):
+                    bconds = tuple(bconds)
+                #end if
+                bconds = np.array(bconds,dtype=object)
             #end if
-            bconds = np.array(bconds,dtype=object)
+            if bconds is None:
+                bconds = self.bconds
+            #end if
+            return bconds==self.bcond_types.open
         #end if
-        if bconds is None:
-            bconds = self.bconds
-        #end if
-        return bconds==self.bcond_types.open
     #end def has_endpoints
 
 
@@ -1590,7 +1611,7 @@ class StructuredGrid(Grid):
     def unit_linear_grids(self):
         ugrids = []
         c = self.centered
-        for n,e in zip(self.shape,self.has_endpoints()):
+        for n,e in zip(self.shape,self.endpoints):
             u = np.linspace(0.0,1.0,n,endpoint=e)
             if c:
                 u += 0.5/n
@@ -2303,6 +2324,12 @@ class ParallelotopeGrid(StructuredGridWithAxes):
     #end def initialize_local
 
 
+    def _initialize_with_points(self,points,**kwargs):
+        kwargs['points'] = points
+        StructuredGridWithAxes.initialize_local(self,**kwargs)
+    #end def _initialize_with_points
+
+
     def read_local(self,filepath,format):
         if format=='xsf':
             self.read_xsf(filepath)
@@ -2435,10 +2462,120 @@ class ParallelotopeGrid(StructuredGridWithAxes):
             centered = self.centered,
             cells    = cells,
             axes     = axes,
+            origin   = self.origin,
             )
 
         return g
     #end def tile
+
+
+    def slice(self,slc,axis=0,ret_slice_obj=False):
+        if axis<0 or axis>self.grid_dim-1:
+            self.error('Cannot slice grid.\nRequested axis is out of range.\nRequested axis: {}\nAllowed axes  : {}'.format(axis,tuple(range(self.grid_dim))))
+        #end if
+        if not isinstance(slc,slice):
+            if not isinstance(slc,(int,np.int_)):
+                self.error('Cannot slice grid.\nSlice input must be either a Python slice object or an integer.\nReceived object of type: {}'.format(slc.__class__.__name__))
+            #end if
+            slc = slice(slc,slc+1,None)
+        #end if
+
+        # get the integer extent and stride of the slice
+        ngrid  = self.shape[axis]
+        igrid  = np.arange(ngrid,dtype=int)
+        islice = igrid[slc]
+        nslice = len(islice)
+        imin   = islice[0]
+        imax   = islice[-1]
+        di     = 1
+        if slc.step is not None:
+            di = slc.step
+        #end if
+
+        # construct the multi-dimensional grid slice object
+        gslice = tuple()
+        for i in range(self.grid_dim):
+            if i==axis:
+                gslice += (slc,)
+            else:
+                gslice += (slice(None,None,None),)
+            #end if
+        #end for
+
+        # obtain the grid points in the slice
+        self.reshape_full()
+        points = self.points[gslice].copy()
+        self.reshape_flat()
+
+        # contruct a new grid object from the sliced points
+        origin       = self.origin + imin*self.dr[axis]
+        pshape       = points.shape[:-1]
+        space_dim    = points.shape[-1]
+        npoints      = np.prod(pshape)
+        points.shape = (npoints,space_dim) 
+        if pshape[axis]==1:
+            # case 1: slice drops a full dimension
+            axes   = []
+            bconds = []
+            shape  = []
+            for i in range(self.grid_dim):
+                if i!=axis:
+                    axes.append(self.axes[i])
+                    bconds.append(self.bconds[i])
+                    shape.append(pshape[i])
+                #end if
+            #end for
+        else:
+            # case 2: slice has finite length along the sliced axis
+            shape = pshape
+
+            endp = self.endpoints[axis]
+            if endp:
+                ncells = nslice-1
+                bc     = self.bconds[axis]
+            else:
+                pbc = self.bconds[axis]==self.bcond_types.periodic
+                keep_periodic = imin==0 and imax+di==ngrid and ngrid%di==0
+                if pbc and keep_periodic:
+                    bc     = self.bcond_types.periodic
+                    ncells = nslice
+                else:
+                    bc  = self.bcond_types.open
+                    #if imax+di>ngrid:
+                    #    self.error('')
+                    self.error('endpoint case not yet handled')
+                #end if
+            #end if
+            ax = (ncells*di)/ngrid*self.axes[axis]
+
+            axes   = []
+            bconds = []
+            for i in range(self.grid_dim):
+                if i!=axis:
+                    axes.append(self.axes[i])
+                    bconds.append(self.bconds[i])
+                else:
+                    axes.append(ax)
+                    bconds.append(bc)
+                #end if
+            #end for
+        #end if
+        g = ParallelotopeGrid()
+        g._initialize_with_points(
+            origin   = origin,
+            axes     = axes,
+            bconds   = bconds,
+            shape    = shape,
+            centered = self.centered,
+            points   = points,
+            )
+
+        if not ret_slice_obj:
+            return g
+        else:
+            return g,gslice
+        #end if
+    #end def slice
 
 #end class ParallelotopeGrid
 
@@ -4289,11 +4426,12 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
         ivecs  = index_grid_points(tiling)
         #   cell grid shape of untiled grid
         cshape = np.array(self.grid.cell_grid_shape)
+        endp = np.array(self.grid.endpoints,dtype=int)
         self.reshape_points_full()
         for ivec in ivecs:
             # lower and upper sub-grid indices in the tiled space
             ilow  = ivec*cshape
-            ihigh = (ivec+1)*cshape
+            ihigh = (ivec+1)*cshape + endp
             # construct multidimensional slice for sub-volume
             vslice = tuple()
             for i1,i2 in zip(ilow,ihigh):
@@ -4309,10 +4447,16 @@ class ParallelotopeGridFunction(StructuredGridFunctionWithAxes):
         gf = ParallelotopeGridFunction(
             grid   = g,
             values = values,
+            copy   = False,
             )
 
         return gf
     #end def tile
+
+
+    def slice(self,slc,axis=0):
+        None
+    #end def slice
 
 #end class ParallelotopeGridFunction
 

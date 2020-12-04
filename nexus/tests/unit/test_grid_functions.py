@@ -335,9 +335,29 @@ def properties_from_name(grid_name):
     space_dim = int(grid_name[2])
     extra_prop = grid_name[3:]
     bconds = None
+    endpoints = None
     if '_' in extra_prop:
         extra_prop,bc = extra_prop.split('_')
         bconds = tuple(bc)
+    elif grid_type=='parallelotope':
+        bconds = grid_dim*('o',)
+    elif grid_type=='spheroid':
+        if grid_dim==3:
+            bconds = tuple('oop')
+        elif grid_dim==2:
+            bconds = tuple('op')
+        #end if
+    elif grid_type=='spheroid_surface':
+        if grid_dim==2:
+            bconds = tuple('op')
+        elif grid_dim==1:
+            bconds = tuple('p')
+        #end if
+    else:
+        assert(1==0)
+    #end if
+    if bconds is not None:
+        endpoints = tuple([b=='o' for b in bconds])
     #end if
     centered   = 'c' in extra_prop
     sheared    = 's' in extra_prop
@@ -350,6 +370,7 @@ def properties_from_name(grid_name):
         sheared    = sheared,
         translated = translated,
         bconds     = bconds,
+        endpoints  = endpoints,
         cells      = grid_dim*(5,),
         )
     return properties
@@ -544,6 +565,8 @@ def test_grid_initialization():
         assert(g.flat_points_shape==(npoints,p.space_dim))
         assert(g.full_points_shape==g.shape+(p.space_dim,))
         assert(len(set(g.bconds)-bcs)==0)
+        assert(p.bconds==tuple(g.bconds))
+        assert(p.endpoints==tuple(g.endpoints))
         if not p.translated:
             assert(value_eq(g.origin,np.zeros((p.space_dim,))))
         else:
