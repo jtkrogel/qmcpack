@@ -1384,7 +1384,7 @@ class Simulation(NexusCore):
             #end if
             command = ('\n'+command).replace('\n','\n  '+pad)
             run_command = command
-            command = job.run_command(machine.app_launcher)
+            run_command = job.run_command(machine.app_launcher)
         #end if
         print('executing: ',[run_command])
         if self.job is None:
