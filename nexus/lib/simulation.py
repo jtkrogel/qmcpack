@@ -1371,6 +1371,7 @@ class Simulation(NexusCore):
     def execute(self,run_command=None):
         pad = self.enter(self.locdir)
         if run_command is None:
+            print('getting command from job')
             job = self.job
             command = 'export OMP_NUM_THREADS='+str(job.threads)+'\n'
             if len(job.presub)>0:
@@ -1384,6 +1385,7 @@ class Simulation(NexusCore):
             command = ('\n'+command).replace('\n','\n  '+pad)
             run_command = command
         #end if
+        print('executing: ',[run_command])
         if self.job is None:
             env = os.environ.copy()
         else:
