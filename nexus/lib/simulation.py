@@ -1398,9 +1398,11 @@ class Simulation(NexusCore):
             self.log(pad+'Executing:  '+command)
             fout = open(self.outfile,'w')
             ferr = open(self.errfile,'w')
-            out,err = Popen(command,env=env,stdout=fout,stderr=ferr,shell=True,close_fds=True).communicate()
+            process = Popen(command,env=env,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = process.communicate()
             print('out',[out])
             print('err',[err])
+            print('rc',[process.returncode])
         #end if
         self.leave()
         self.submitted = True
