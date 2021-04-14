@@ -2384,6 +2384,10 @@ def test_execute():
     assert(os.path.exists(outfile))
     assert(os.path.exists(errfile))
 
+    print()
+    print('in test')
+    print(outfile)
+    print(os.listdir(s.locdir))
     print([open(outfile,'r').read().strip()])
 
     assert(open(outfile,'r').read().strip()=='run')
