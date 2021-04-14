@@ -1398,6 +1398,8 @@ class Simulation(NexusCore):
             fout = open(self.outfile,'w')
             ferr = open(self.errfile,'w')
             out,err = Popen(command,env=env,stdout=fout,stderr=ferr,shell=True,close_fds=True).communicate()
+            print('out',[out])
+            print('err',[err])
         #end if
         self.leave()
         self.submitted = True
