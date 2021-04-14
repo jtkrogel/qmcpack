@@ -2383,6 +2383,9 @@ def test_execute():
     assert(s.job.status==4)
     assert(os.path.exists(outfile))
     assert(os.path.exists(errfile))
+
+    print([open(outfile,'r').read().strip()])
+
     assert(open(outfile,'r').read().strip()=='run')
     assert(open(errfile,'r').read().strip()=='')
 
