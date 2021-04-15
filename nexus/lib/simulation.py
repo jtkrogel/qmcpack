@@ -1398,6 +1398,8 @@ class Simulation(NexusCore):
             self.log(pad+'Executing:  '+command)
             fout = open(self.outfile,'w')
             ferr = open(self.errfile,'w')
+            print()
+            print('orig')
             print([command])
             print(command)
             print(env)
@@ -1408,14 +1410,41 @@ class Simulation(NexusCore):
             print('rc',[process.returncode])
             print('fcont',open(self.outfile,'r').read())
 
+
             fout = open('out','w')
             ferr = open('err','w')
             command = 'mpirun -np 1 echo run'
             p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
             out,err = p.communicate()
             print()
+            print('retry 1')
             print('rc',p.returncode)
             print('fcont',open('out','r').read())
+
+
+            fout = open('out2','w')
+            ferr = open('err2','w')
+            command = 'echo run'
+            p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = p.communicate()
+            print()
+            print('retry 2')
+            print('rc',p.returncode)
+            print('fcont',open('out2','r').read())
+
+
+            fout = open('out3','w')
+            ferr = open('err3','w')
+            command = '/usr/bin/echo run'
+            p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = p.communicate()
+            print()
+            print('retry 3')
+            print('rc',p.returncode)
+            print('fcont',open('out2','r').read())
+
+
+
         #end if
         self.leave()
         self.submitted = True
