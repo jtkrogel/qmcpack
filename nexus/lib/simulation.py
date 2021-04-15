@@ -1387,7 +1387,7 @@ class Simulation(NexusCore):
             run_command = job.run_command(machine.app_launcher)
         #end if
         print('executing: ',[run_command])
-        if self.job is None:
+        if self.job is None or self.job.env is None:
             env = os.environ.copy()
         else:
             env = job.env
