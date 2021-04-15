@@ -1444,6 +1444,17 @@ class Simulation(NexusCore):
             print('fcont',open('out2','r').read())
 
 
+            fout = open('out4','w')
+            ferr = open('err4','w')
+            command = '/usr/bin/mpirun -np 1 echo run'
+            p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = p.communicate()
+            print()
+            print('retry 4')
+            print('rc',p.returncode)
+            print('fcont',open('out2','r').read())
+
+
 
         #end if
         self.leave()
