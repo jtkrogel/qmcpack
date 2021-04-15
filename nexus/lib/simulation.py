@@ -1441,7 +1441,7 @@ class Simulation(NexusCore):
             print()
             print('retry 3')
             print('rc',p.returncode)
-            print('fcont',open('out2','r').read())
+            print('fcont',open('out3','r').read())
 
 
             fout = open('out4','w')
@@ -1452,7 +1452,29 @@ class Simulation(NexusCore):
             print()
             print('retry 4')
             print('rc',p.returncode)
-            print('fcont',open('out2','r').read())
+            print('fcont',open('out4','r').read())
+
+
+            fout = open('out5','w')
+            ferr = open('err5','w')
+            command = 'mpirun -n 1 echo run'
+            p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = p.communicate()
+            print()
+            print('retry 5')
+            print('rc',p.returncode)
+            print('fcont',open('out5','r').read())
+
+
+            fout = open('out6','w')
+            ferr = open('err6','w')
+            command = 'mpiexec -n 1 echo run'
+            p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = p.communicate()
+            print()
+            print('retry 6')
+            print('rc',p.returncode)
+            print('fcont',open('out6','r').read())
 
 
 
