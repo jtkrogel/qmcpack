@@ -1398,11 +1398,24 @@ class Simulation(NexusCore):
             self.log(pad+'Executing:  '+command)
             fout = open(self.outfile,'w')
             ferr = open(self.errfile,'w')
+            print([command])
+            print(command)
+            print(env)
             process = Popen(command,env=env,stdout=fout,stderr=ferr,shell=True,close_fds=True)
             out,err = process.communicate()
             print('out',[out])
             print('err',[err])
             print('rc',[process.returncode])
+            print('fcont',open(self.outfile,'r').read())
+
+            fout = open('out','w')
+            ferr = open('err','w')
+            command = 'mpirun -np 1 echo run'
+            p = Popen(command,stdout=fout,stderr=ferr,shell=True,close_fds=True)
+            out,err = p.communicate()
+            print()
+            print('rc',p.returncode)
+            print('fcont',open('out','r').read())
         #end if
         self.leave()
         self.submitted = True
