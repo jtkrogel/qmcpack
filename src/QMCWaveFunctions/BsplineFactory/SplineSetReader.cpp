@@ -184,7 +184,7 @@ void SplineSetReader<SA>::initialize_spline_pio_gather(const int spin,
       const auto& cur_band = cur_bands[bspline.BandIndexMap[iorb]];
       const int ti         = cur_band.TwistIndex;
       readOneOrbitalCoefs(psi_g_path(ti, spin, cur_band.BandIndex), h5f, cG);
-      oneband.fft_spline(cG, mybuilder->Gvecs[0], mybuilder->primcell_kpoints[ti], rotate);
+      oneband.fft_spline(cG, mybuilder->Gvecs[0], mybuilder->primcell_kpoints[ti], false);
       bspline.set_spline(&oneband.get_spline_r(), &oneband.get_spline_i(), cur_band.TwistIndex, iorb, 0);
     }
 
