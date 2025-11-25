@@ -15,29 +15,18 @@ Merging:
 - Demonstrates 'first', 'any', 'all', and custom selector options
 """
 
-from nexus import settings, Job, run_project
+from nexus import settings, job, run_project
 from nexus import generate_physical_system
 from nexus import generate_pwscf
 
 from enhanced_simulation import make_enhanced, create_branch
 
-# Computer configuration
-computer = 'baseline'
-
-if computer == 'baseline':
-    qe_modules = 'module purge; module load Core/25.05   gcc/12.4.0   openmpi/5.0.5   DefApps hdf5'
-    qe_bin = '/ccsopen/home/ksu/SOFTWARE/qe/q-e-qe-7.4.1/build/bin'
-    account = 'phy191'
-else:
-    print('Undefined computer')
-    exit()
 
 settings(
     pseudo_dir = '../pseudopotentials',
     results    = '',
     sleep      = 1,
-    machine    = computer,
-    account    = account,
+    machine    = 'ws8',
     )
 
 # Define physical system (diamond)
@@ -53,18 +42,8 @@ system = generate_physical_system(
     C        = 4,
     )
 
-# Create reusable job definition for baseline
-qe_job = Job(nodes=1,
-             queue='batch',
-             hours=1,
-             presub=qe_modules,
-             app=qe_bin+'/pw.x')
-
-# Parent simulation
-scf1 = generate_pwscf(
-    identifier   = 'scf1',
-    path         = 'diamond/branch_merge/scf1',
-    job          = qe_job,
+scf_inputs = dict(
+    job          = job(cores=4,app='pw.x'),
     input_type   = 'generic',
     calculation  = 'scf',
     input_dft    = 'lda', 
@@ -72,8 +51,15 @@ scf1 = generate_pwscf(
     conv_thr     = 1e-8, 
     system       = system,
     pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
+    kgrid        = (2,2,1),
     kshift       = (0,0,0),
+    )
+
+# Parent simulation
+scf1 = generate_pwscf(
+    identifier   = 'scf1',
+    path         = 'diamond/branch_merge/scf1',
+    **scf_inputs
     )
 
 # Conditional functions for branching
@@ -91,31 +77,13 @@ def condition_b(sim):
 scf2_base = generate_pwscf(
     identifier   = 'scf2',
     path         = 'diamond/branch_merge/scf2',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
+    **scf_inputs
     )
 
 scf3_base = generate_pwscf(
     identifier   = 'scf3',
     path         = 'diamond/branch_merge/scf3',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
+    **scf_inputs
     )
 
 # Natural branching: scf2 runs if condition_a, scf3 runs if condition_b
@@ -134,16 +102,7 @@ scf2, scf3 = create_branch(
 scf4_first = generate_pwscf(
     identifier   = 'scf4_first',
     path         = 'diamond/branch_merge/scf4_first',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
+    **scf_inputs
     )
 
 scf4_first_enhanced = make_enhanced(scf4_first)
@@ -155,16 +114,7 @@ scf4_first_enhanced.depends((scf2, 'charge_density'), (scf3, 'charge_density'), 
 scf4_all = generate_pwscf(
     identifier   = 'scf4_all',
     path         = 'diamond/branch_merge/scf4_all',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
+    **scf_inputs
     )
 
 scf4_all_enhanced = make_enhanced(scf4_all)
@@ -207,16 +157,7 @@ def select_lowest_energy(sims):
 scf4_custom = generate_pwscf(
     identifier   = 'scf4_custom',
     path         = 'diamond/branch_merge/scf4_custom',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
+    **scf_inputs
     )
 
 scf4_custom_enhanced = make_enhanced(scf4_custom)
