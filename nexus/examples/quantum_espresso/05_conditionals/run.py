@@ -13,32 +13,22 @@ The workflow:
 - scf3: SCF that checks scf2's energy result (custom conditional function)
 """
 
-from nexus import settings, Job, run_project
+from nexus import settings, job, run_project
 from nexus import generate_physical_system
 from nexus import generate_pwscf
 
 from enhanced_simulation import make_enhanced
-from conditionals import (
-    machine_conditional,
-)
+from conditionals import machine_conditional
 
 # Computer configuration
-computer = 'baseline'
-
-if computer == 'baseline':
-    qe_modules = 'module purge; module load Core/25.05   gcc/12.4.0   openmpi/5.0.5   DefApps hdf5'
-    qe_bin = '/ccsopen/home/ksu/SOFTWARE/qe/q-e-qe-7.4.1/build/bin'
-    account = 'phy191'
-else:
-    print('Undefined computer')
-    exit()
+#computer = 'ws4' # don't run scf2 and beyond
+computer = 'ws8' # run scf2 and beyond
 
 settings(
     pseudo_dir = '../pseudopotentials',
     results    = '',
     sleep      = 1,
     machine    = computer,
-    account    = account,
     )
 
 # Define physical system (diamond)
@@ -54,18 +44,8 @@ system = generate_physical_system(
     C        = 4,
     )
 
-# Create reusable job definition for baseline
-qe_job = Job(nodes=1,
-             queue='batch',
-             hours=1,
-             presub=qe_modules,
-             app=qe_bin+'/pw.x')
-
-# Simulation 1: Initial SCF (no dependencies)
-scf1 = generate_pwscf(
-    identifier   = 'scf1',
-    path         = 'diamond/scf1',
-    job          = qe_job,
+scf_inputs = dict(
+    job          = job(cores=4,app='pw.x'),
     input_type   = 'generic',
     calculation  = 'scf',
     input_dft    = 'lda', 
@@ -73,48 +53,37 @@ scf1 = generate_pwscf(
     conv_thr     = 1e-8, 
     system       = system,
     pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
+    kgrid        = (2,2,1),
     kshift       = (0,0,0),
+    )
+
+# Simulation 1: Initial SCF (no dependencies)
+scf1 = generate_pwscf(
+    identifier   = 'scf1',
+    path         = 'diamond/scf1',
+    **scf_inputs
     )
 
 # Simulation 2: Only runs on 'baseline' machine (machine_conditional)
 scf2_base = generate_pwscf(
     identifier   = 'scf2',
     path         = 'diamond/scf2',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf1, 'charge_density'),
+    **scf_inputs
     )
 
-# Use machine_conditional to only run on baseline
+# Use machine_conditional to only run on 8 core workstation
 scf2 = make_enhanced(
     scf2_base,
-    condition=machine_conditional('baseline', required=True),
+    condition=machine_conditional('ws8', required=True),
     )
 
 # Simulation 3: Checks scf2's energy result
 scf3_base = generate_pwscf(
     identifier   = 'scf3',
     path         = 'diamond/scf3',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf2, 'charge_density'),
+    **scf_inputs
     )
 
 # Use a custom conditional to check if scf2's energy is below threshold
