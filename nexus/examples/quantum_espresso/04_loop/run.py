@@ -8,22 +8,15 @@ condition is met or the maximum number of iterations is reached.
 
 """
 
-from nexus import settings, Job, run_project
+from nexus import settings, job, run_project
 from nexus import generate_physical_system
 from nexus import generate_pwscf
 
 from enhanced_simulation import make_enhanced
 
 # Computer configuration
-computer = 'baseline'
+computer = 'ws8'
 
-if computer == 'baseline':
-    qe_modules = 'module purge; module load Core/25.05   gcc/12.4.0   openmpi/5.0.5   DefApps hdf5'
-    qe_bin = '/ccsopen/home/ksu/SOFTWARE/qe/q-e-qe-7.4.1/build/bin'
-    account = 'phy191'
-else:
-    print('Undefined computer')
-    exit()
 
 # Loop behavior notes:
 # - Loops reuse the same directory and identifier (unlike error handlers which create
@@ -45,7 +38,6 @@ settings(
     results    = '',
     sleep      = 1,
     machine    = computer,
-    account    = account,
     )
 
 
@@ -63,16 +55,9 @@ system = generate_physical_system(
 
 
 # Seed calculation (plain DAG simulation)
-qe_job = Job(nodes=1,
-             queue='batch',
-             hours=1,
-             presub=qe_modules,
-             app=qe_bin+'/pw.x')
 
-scf_seed = generate_pwscf(
-    identifier   = 'scf_seed',
-    path         = 'diamond/scf_seed',
-    job          = qe_job,
+scf_inputs = dict(
+    job          = job(cores=4,app='pw.x'),
     input_type   = 'generic',
     calculation  = 'scf',
     input_dft    = 'lda',
@@ -80,8 +65,14 @@ scf_seed = generate_pwscf(
     conv_thr     = 1e-8,
     system       = system,
     pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
+    kgrid        = (2,2,1),
     kshift       = (0,0,0),
+    )
+
+scf_seed = generate_pwscf(
+    identifier   = 'scf_seed',
+    path         = 'diamond/scf_seed',
+    **scf_inputs
     )
 
 
@@ -114,8 +105,8 @@ def modify_loop_input(sim):
     sim.input.electrons.conv_thr = base_threshold * iteration_factor
     
     # Example: Store iteration-specific values in loop_variables
-    if hasattr(sim.loop_variables, 'modified_conv_thr'):
-        sim.loop_variables['modified_conv_thr'] = sim.input.electrons.conv_thr
+    if not hasattr(sim.loop_variables, 'modified_conv_thr'):
+        sim.loop_variables['modified_conv_thr'] = [sim.input.electrons.conv_thr]
     else:
         sim.loop_variables['modified_conv_thr'].append(sim.input.electrons.conv_thr)
 
@@ -124,25 +115,16 @@ def modify_loop_input(sim):
 loop_base = generate_pwscf(
     identifier   = 'scf_loop',
     path         = 'diamond/scf_loop',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda',
-    ecutwfc      = 200,
-    conv_thr     = 1e-8,
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf_seed, 'charge_density'),
+    **scf_inputs
     )
 
 scf_loop = make_enhanced(
     loop_base,
-    loop_enabled=True,
-    loop_condition=continue_loop,
-    loop_max_iterations=LOOP_TARGET,
-    loop_modifier=modify_loop_input,  # Modify simulation at each iteration
+    loop_enabled        = True,
+    loop_condition      = continue_loop,
+    loop_max_iterations = LOOP_TARGET,
+    loop_modifier       = modify_loop_input,  # Modify sim at each iteration
     )
 
 run_project()
