@@ -17,7 +17,7 @@ The workflow:
 - All simulations have error handlers that retry on failure
 """
 
-from nexus import settings, Job, run_project
+from nexus import settings, job, run_project
 from nexus import generate_physical_system
 from nexus import generate_pwscf
 
@@ -26,22 +26,13 @@ from enhanced_simulation import make_enhanced
 from error_handler import RetryErrorHandler
 
 # Computer configuration
-computer = 'baseline'
-
-if computer == 'baseline':
-    qe_modules = 'module purge; module load Core/25.05   gcc/12.4.0   openmpi/5.0.5   DefApps hdf5'
-    qe_bin = '/ccsopen/home/ksu/SOFTWARE/qe/q-e-qe-7.4.1/build/bin'
-    account = 'phy191'
-else:
-    print('Undefined computer')
-    exit()
+computer = 'ws8'
 
 settings(
     pseudo_dir = '../pseudopotentials',
     results    = '',
     sleep      = 3,
     machine    = computer,
-    account    = account,
     )
 
 # Define physical system (diamond)
@@ -62,14 +53,10 @@ system = generate_physical_system(
 
 # Simulation 1: Initial SCF calculation (no dependencies)
 # Testing without make_enhanced wrapper - this will work but without error handlers
-qe_job = Job(nodes=1,
-            queue='batch',
-            hours=1,
-            presub=qe_modules,
-            app=qe_bin+'/pw.x')
-scf1 = generate_pwscf(
-    identifier   = 'scf',
-    path         = 'diamond/scf',
+qe_job = job(cores=4,app='pw.x')
+
+
+scf_inputs = dict(
     job          = qe_job,
     input_type   = 'generic',
     calculation  = 'scf',
@@ -78,9 +65,15 @@ scf1 = generate_pwscf(
     conv_thr     = 1e-8, 
     system       = system,
     pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
+    kgrid        = (2,2,1),
     kshift       = (0,0,0),
     )
+
+
+scf1 = generate_pwscf(
+    identifier   = 'scf',
+    path         = 'diamond/scf',
+    **scf_inputs)
 
 # Uncomment to add error handlers:
 # scf1 = make_enhanced(
@@ -93,24 +86,15 @@ scf1 = generate_pwscf(
 scf2_base = generate_pwscf(
     identifier   = 'scf_dependent',
     path         = 'diamond/scf_dependent',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf1, 'charge_density'),
+    **scf_inputs
     )
 
 # Convert to enhanced simulation with error handler
 scf2 = make_enhanced(
     scf2_base,
     error_handlers=[RetryErrorHandler(max_retries=2)],
-    required_machine='andes',
+    required_machine='ws8', # only run on ws8
     )
 
 # Define energy threshold (in Ry, typical for Quantum ESPRESSO)
@@ -171,17 +155,8 @@ def energy_above_threshold(sim):
 scf3_base = generate_pwscf(
     identifier   = 'scf_low_energy',
     path         = 'diamond/scf_low_energy',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf2, 'charge_density'),
+    **scf_inputs
     )
 
 scf3 = make_enhanced(
@@ -194,17 +169,8 @@ scf3 = make_enhanced(
 scf4_base = generate_pwscf(
     identifier   = 'scf_high_energy',
     path         = 'diamond/scf_high_energy',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf2, 'charge_density'),
+    **scf_inputs
     )
 
 scf4 = make_enhanced(
