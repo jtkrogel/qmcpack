@@ -26,7 +26,7 @@ from enhanced_simulation import make_enhanced
 from error_handler import RetryErrorHandler
 
 # Computer configuration
-computer = 'ws8'
+computer = 'ws4'
 
 settings(
     pseudo_dir = '../pseudopotentials',
