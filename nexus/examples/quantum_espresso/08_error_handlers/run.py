@@ -18,21 +18,16 @@ The workflow:
 - scf4: Custom modification strategies (user-defined input modifications)
 """
 
-from nexus import settings, Job, run_project
-from nexus import generate_physical_system
-from nexus import generate_pwscf
-
 import os
 import sys
 
-nexus_lib = os.path.join(os.path.dirname(__file__), '../../lib')
-if nexus_lib not in sys.path:
-    sys.path.insert(0, nexus_lib)
+from nexus import settings, job, run_project
+from nexus import generate_physical_system
+from nexus import generate_pwscf
 
 from enhanced_simulation import make_enhanced
-from error_handler import (
-    RetryErrorHandler,
-)
+from error_handler import RetryErrorHandler
+
 from pwscf_error_handler import (
     PwscfErrorHandler,
     RelaxConvergenceThreshold,
@@ -40,19 +35,27 @@ from pwscf_error_handler import (
     AdjustMixingBeta,
     UseConjugateGradient,
     CombinedSimulationModifier,
-)
+    )
+
 
 # Computer configuration
-computer = 'baseline'
+#computer = 'baseline'
+computer = 'ws4'
 
+
+machine_options = {}
 if computer == 'baseline':
+    machine_options.update(account='phy191')
     qe_modules = 'module purge; module load Core/25.05   gcc/12.4.0   openmpi/5.0.5   DefApps hdf5'
     qe_bin = '/ccsopen/home/ksu/SOFTWARE/qe/q-e-qe-7.4.1/build/bin'
-    account = 'phy191'
+    job_options = dict(
+        nodes=1,
+        queue='batch',
+        hours=0.25,
+        presub=qe_modules,
+        app=qe_bin+'/pw.x')
 elif computer == 'ws4':
-    qe_modules = 'module purge; module load Core/25.05   gcc/12.4.0   openmpi/5.0.5   DefApps hdf5'
-    qe_bin = '/ccsopen/home/ksu/SOFTWARE/qe/q-e-qe-7.4.1/build/bin'
-    account = 'phy191'
+    job_options = dict(cores=4,app='pw.x')
 else:
     print('Undefined computer')
     exit()
@@ -62,7 +65,7 @@ settings(
     results    = '',
     sleep      = 1,
     machine    = computer,
-    account    = account,
+    **machine_options
     )
 
 # Define physical system (diamond)
@@ -78,11 +81,22 @@ system = generate_physical_system(
     C        = 4,
     )
 
-qe_job = Job(nodes=1,
-             queue='batch',
-             hours=0.25,
-             presub=qe_modules,
-             app=qe_bin+'/pw.x')
+qe_job = job(**job_options)
+
+scf_inputs = dict(
+    job          = qe_job,
+    input_type   = 'generic',
+    calculation  = 'scf',
+    input_dft    = 'lda', 
+    ecutwfc      = 200,   
+    conv_thr     = 1e-8,
+    electron_maxstep = 100,
+    system       = system,
+    pseudos      = ['C.BFD.upf'],
+    kgrid        = (2,2,1),
+    kshift       = (0,0,0),
+    )
+
 
 # Simulation 1: PwscfErrorHandler (default configuration)
 # This handler uses error strategies to diagnose QE errors and automatically
@@ -94,17 +108,7 @@ qe_job = Job(nodes=1,
 scf1_base = generate_pwscf(
     identifier   = 'scf1',
     path         = 'diamond/error_handlers/scf1',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8,
-    electron_maxstep = 100,
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
+    **scf_inputs
     )
 
 # Use PwscfErrorHandler with default modification strategies
@@ -124,17 +128,8 @@ scf1 = make_enhanced(
 scf2_base = generate_pwscf(
     identifier   = 'scf2',
     path         = 'diamond/error_handlers/scf2',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf1, 'charge_density'),
+    **scf_inputs
     )
 
 scf2 = make_enhanced(
@@ -150,17 +145,8 @@ scf2 = make_enhanced(
 scf3_base = generate_pwscf(
     identifier   = 'scf3',
     path         = 'diamond/error_handlers/scf3',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8, 
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf2, 'charge_density'),
+    **scf_inputs
     )
 
 # Multiple handlers - compatibility is checked automatically
@@ -177,18 +163,8 @@ scf3 = make_enhanced(
 scf4_base = generate_pwscf(
     identifier   = 'scf4',
     path         = 'diamond/error_handlers/scf4',
-    job          = qe_job,
-    input_type   = 'generic',
-    calculation  = 'scf',
-    input_dft    = 'lda', 
-    ecutwfc      = 200,   
-    conv_thr     = 1e-8,  # Tight convergence - might fail
-    electron_maxstep = 100,  # Limited steps - might need more
-    system       = system,
-    pseudos      = ['C.BFD.upf'],
-    kgrid        = (4,4,4),
-    kshift       = (0,0,0),
     dependencies = (scf3, 'charge_density'),
+    **scf_inputs
     )
 
 # Use PwscfErrorHandler with custom modification strategies
