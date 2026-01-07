@@ -19,6 +19,9 @@
 
 namespace qmcplusplus
 {
+using WP = WalkerProperties::Indexes;
+
+
 SelfHealingOverlap::SelfHealingOverlap(SelfHealingOverlapInput&& inp_, const TrialWaveFunction& wfn, DataLocality dl)
     : OperatorEstBase(dl, inp_.get_name(), inp_.get_type()),
       input_(std::move(inp_)),
@@ -57,7 +60,7 @@ SelfHealingOverlap::SelfHealingOverlap(SelfHealingOverlapInput&& inp_, const Tri
   }
 
 #ifndef QMC_COMPLEX
-  const size_t data_size = nparams;
+  const size_t data_size = 1 + 2 * nparams;
 #else
   const size_t data_size = 2 * nparams;
 #endif
@@ -140,16 +143,26 @@ void SelfHealingOverlap::accumulate(const RefVector<MCPWalker>& walkers,
       Jval += wc->get_log_value();
     RealType Jprefactor = std::exp(std::real(-2. * Jval));
 
+    // collect local energy
+    auto Elocal = pset.Properties(WP::LOCALENERGY);
+
     // accumulate weight (required by all estimators, otherwise inf results)
     walkers_weight_ += weight;
 
     // accumulate data
-    assert(det_ratios.size() == data_.size());
-    for (int ic = 0; ic < det_ratios.size(); ++ic)
+    //assert(det_ratios.size() == data_.size());
+    auto nparams = det_ratios.size();
+    assert(1+2*nparams == data_.size());
+
+    // wavefunction norm
+    data_[0] = weight * Jprefactor;
+    for (int ic = 1; ic < 1+det_ratios.size(); ++ic)
     {
 #ifndef QMC_COMPLEX
-      data_[ic] += weight * Jprefactor * det_ratios[ic];
+      data_[2*ic-1] += weight * Jprefactor * det_ratios[ic];
+      data_[2*ic]   += weight * Jprefactor * det_ratios[ic] * Elocal;
 #else
+      // this wrong/outdated. also the original assertion above will always fail for complex
       auto value = weight * Jprefactor * std::conj(det_ratios[ic]);
       data_[2 * ic] += std::real(value);
       data_[2 * ic + 1] += std::imag(value);
