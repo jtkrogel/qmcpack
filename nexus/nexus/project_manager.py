@@ -428,6 +428,7 @@ class DynamicWorkflowManager(NexusCore):
     #end def add_new_dyn_procs
 
 
+    # user-facing API
     def poll(self,sleep=None):
         if sleep is None:
             sleep = nexus_core.sleep
@@ -493,6 +494,59 @@ class DynamicWorkflowManager(NexusCore):
         # wait until next poll
         time.sleep(sleep)
     #end def poll
+
+    # sleep for a given number of seconds
+    def sleep(self,sleep_time):
+        time.sleep(sleep_time)
+
+    # load/reactivate dynamic processes from disk
+    @classmethod
+    def wake(cls,*dp_paths):
+        cls.not_implemented()
+
+    # select out a subset of dynamic processes satisfying a criterion
+    # return a list of these properties (can be empty)
+    @classmethod
+    def select(cls,selector,*dps):
+        cls.not_implemented()
+
+    # return any dynamic processes meeting a criterion
+    @classmethod
+    def any(cls,selector,*dps):
+        return cls.select(selector,*dps)
+
+    # return the full list of dynamic processes only if all meet a criterion
+    @classmethod
+    def all(cls,selector,*dps):
+        cls.not_implemented()
+
+    # return the first (in time) dynamic process to meet a criterion
+    @classmethod
+    def first(cls,selector,*dps):
+        cls.not_implemented()
+
+    # combined job methods
+    #   perhaps create a single combined job and set sim.job to it for all sims?
+    #   at combination time, need to verify that no jobs have been submitted
+    #   bundle/pack are no-ops on a workstation
+
+    # collect jobs in a single submission file executing sequentially
+    #   node count is same count as a single job
+    @classmethod
+    def seq_jobs(self,*dps):
+        cls.not_implemented()
+
+    # collect jobs in a single submission file executing simultaneously
+    #  node count is the sum of node counts across jobs
+    @classmethod
+    def bundle_jobs(self,*dps):
+        cls.not_implemented()
+
+    # pack jobs in a greedy fashion within given node and walltime limits
+    #   sequential execution of simultaneous subsets
+    @classmethod
+    def pack_jobs(self,nodes=None,walltime=None,*dps):
+        cls.not_implemented()
 
 #end class DynamicWorkflowManager
 

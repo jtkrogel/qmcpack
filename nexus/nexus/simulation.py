@@ -1898,6 +1898,7 @@ class DynamicProcess(DevBase):
         'pwscf_orbitals', # explicit QE
         ])
 
+
     @classmethod
     def check_first_gen(cls,kw):
         nc_loc     = nexus_core.local_directory
@@ -2214,7 +2215,7 @@ class DynamicProcess(DevBase):
         return self.sim.block
 
 
-    # try on new user-facing status properties
+    # user-facing API
     @property
     def done(self):
         return self.sim.finished
@@ -2226,5 +2227,68 @@ class DynamicProcess(DevBase):
     @property
     def fail(self):
         return self.sim.failed
-        #return self.sim.finished and self.sim.failed
+
+    # status bools below maybe better as member values
+    @property
+    def shutdown_cleanly(self): # status bool
+        self.not_implemented()
+
+    @property
+    def timeout(self): # status bool
+        self.not_implemented()
+
+    @property
+    def crash(self): # status bool
+        self.not_implemented()
+
+    @property
+    def oom(self):
+        self.not_implemented()
+        
+    @property
+    def killed(self):
+        self.not_implemented()
+
+    @property
+    def restartable(self): # status bool
+        self.not_implemented()
+
+    # change/modify simulation input in-place
+    #   places process/sim in a rerun state
+    def adjust(self):
+        self.not_implemented()
+
+    # duplicate w/ optional adjustment
+    def clone(self):
+        self.not_implemented()
+
+    # rerun w/ optional adjustment
+    def rerun(self):
+        self.not_implemented()
+
+    # continue existing run
+    def restart(self):
+        self.not_implemented()
+
+    # kill active process or remove from queue
+    def cancel(self):
+        self.not_implemented()
+
+    # remove a sim-defined selection of files (e.g. large ones)
+    def cleanup(self):
+        self.not_implemented()
+
+    # remove from queue, kill active process, remove all files
+    # perhaps also place dp object in a null/invalid state
+    def delete(self):
+        self.not_implemented()
+
+    # initiate recovery process following a specified protocol
+    def recover(self,protocol='default'):
+        self.not_implemented()
+
+    # copy just results (product files) to a specified location
+    def cache_results(self,path,move=False):
+        self.not_implemented()
+
 #end class DynamicProcess
