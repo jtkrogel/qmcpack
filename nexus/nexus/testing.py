@@ -96,7 +96,7 @@ def dict_serialize(d,serial=None,path=None,dict_type=None):
         path = ''
     for k,v in d.items():
         p = path+str(k)
-        if hasattr(v,'items'):
+        if hasattr(v,'items') and callable(getattr(v,'items')) and not isinstance(v,type):
             if len(v)==0:
                 serial[p]=dict_type()
             else:
