@@ -81,7 +81,10 @@ Module contents
 """
 
 import os
-from .developer import DevBase, obj, error, unavailable
+#from .developer import DevBase, obj, error, unavailable
+from .developer import error, unavailable
+from .developer import obj2 as obj
+from .developer import DevBase2 as DevBase
 from .fileio import StandardFile,XsfFile
 
 try:

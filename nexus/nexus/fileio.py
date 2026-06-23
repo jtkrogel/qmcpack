@@ -24,7 +24,10 @@ import os
 import mmap
 import numpy as np
 from numpy.linalg import det, norm
-from .developer import DevBase, obj, error, to_str
+#from .developer import DevBase, obj, error, to_str
+from .developer import error, to_str
+from .developer import obj2 as obj
+from .developer import DevBase2 as DevBase
 from .periodic_table import is_element, pt as ptable
 from .unit_converter import convert
 
@@ -873,7 +876,9 @@ class XsfFile(StandardFile):
 
 
     def get_density(self):
-        return self.data.first().first().first()
+        def first(d):
+            return d[min(d.keys())]
+        return first(first(first(self.data)))
     #end def get_density
 
 
@@ -1573,7 +1578,7 @@ def read_poscar_chgcar(host,text):
         poscar = PoscarFile()
     #end if
 
-    poscar.set(
+    poscar.update(
         description = description,
         scale       = scale,
         axes        = axes,
@@ -1587,7 +1592,7 @@ def read_poscar_chgcar(host,text):
         )
 
     if is_chgcar:
-        host.set(
+        host.update(
             poscar         = poscar,
             grid           = grid,
             charge_density = charge_density,

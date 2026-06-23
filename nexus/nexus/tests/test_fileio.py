@@ -82,7 +82,7 @@ def test_xsffile():
 
     # populate reference object
     ref = XsfFile()
-    ref.set(
+    ref.update(
         elem = np.array([8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
                          8,8,8,8,8,8,8,8,8,8,8,8,23,23,23,23,23,
                          23,23,23,23,23,23,23,23,23,23,23],dtype=int),
@@ -212,7 +212,7 @@ def test_poscar_file():
 
     # populate reference object
     ref = PoscarFile()
-    ref.set(
+    ref.update(
         axes        = np.array([
                 [  4.5546,  -4.5546,   0.    ],
                 [  4.5546,   4.5546,   0.    ],
