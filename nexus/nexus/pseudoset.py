@@ -308,7 +308,7 @@ def read_potcar_z_valence(file: Path) -> int | float:
 #end def read_potcar_z_valence
 
 
-
+#mth
 @nxs_deprecate(since="2.4.0", replacement="generate_pseudoset")
 def ppset(label, **codes_pps) -> None:
     """Register pseudopotentials for codes with a label.
@@ -443,10 +443,10 @@ class PseudoSet(DevBase):
 
     pseudo_files      : ClassVar[dict[str, str]] = {}
     labeled_pseudosets: ClassVar[dict[str, dict[str, PseudoSet]]] = {}
-
+    #mth
     def __init__(
         self,
-        pseudos,
+        pseudos,  #th
         codes        : str | set[str | Path] = "detect",
         Zeff_map     : dict[str, int] | None = None,
         *,
@@ -547,10 +547,10 @@ class PseudoSet(DevBase):
                 self.pseudo_dirs.add(pseudo.parent)
     #end def __init__
 
-
+    #mth
     @staticmethod
     def _detect_pseudo_code(
-        pseudos,
+        pseudos,  #th
         ) -> set[str | Path] | None:
         """Detect the code based on the suffix of the pseudos."""
         codes = set()
@@ -586,7 +586,7 @@ class PseudoSet(DevBase):
         return codes
     #end def _detect_pseudo_code
 
-
+    #mth
     @staticmethod
     def _check_code_str(code) -> str | None:
         """Check to make sure a code string is in the set of known codes.
@@ -614,7 +614,7 @@ class PseudoSet(DevBase):
             return clow
     #end def _check_code_str
 
-
+    #mth
     @staticmethod
     def _normalize_code_map_keys(mapping) -> NormalizeCRet:
         """Take a dict with any code keys and normalize them.
@@ -636,16 +636,16 @@ class PseudoSet(DevBase):
         return normalized_mapping
     #end def _normalize_code_map_keys
 
-
+    #mth
     @classmethod
     def from_dir(
         cls,
-        pseudo_dir,
+        pseudo_dir,  #th
         code         : str  = "detect",
-        extension           = None,
-        include             = None,
-        exclude             = None,
-        Zeff_map            = None,
+        extension           = None,  #th
+        include             = None,  #th
+        exclude             = None,  #th
+        Zeff_map            = None,  #th
         *,
         skip_invalid : bool = False,
         ) -> PseudoSet | None:
@@ -840,16 +840,16 @@ class PseudoSet(DevBase):
             )
     #end def from_dir
 
-
+    #mth
     @classmethod
     def from_mixed_dir(
         cls,
-        pseudo_dir,
-        codes                = None,
-        extensions           = None,
-        include              = None,
-        exclude              = None,
-        code_Zeff_map        = None,
+        pseudo_dir,  #th
+        codes                = None,  #th
+        extensions           = None,  #th
+        include              = None,  #th
+        exclude              = None,  #th
+        code_Zeff_map        = None,  #th
         *,
         skip_invalid  : bool = False,
         ) -> dict[str, str | PseudoSet] | None:
@@ -1143,12 +1143,12 @@ class PseudoSet(DevBase):
             }
     #end def _get_pseudos
 
-
+    #mth
     @staticmethod
     def get_pseudos(
-        pseudos,
-        system,
-        code,
+        pseudos,  #th
+        system,  #th
+        code,  #th
         ) -> PseudosRet:
         """Get the pseudopotential files for the elements in a physical system.
 
@@ -1428,15 +1428,15 @@ class PseudoSet(DevBase):
     #end def __repr__
 #end class PseudoSet
 
-
+#mth
 def generate_pseudoset(
     pseudo_dir   : str | Path | None     = None,
     *,
     code         : str | set[str] | None = None,
     extension    : dict[str, str] | None = None,
-    include                              = None,
-    exclude                              = None,
-    Zeff_map                             = None,
+    include                              = None,  #th
+    exclude                              = None,  #th
+    Zeff_map                             = None,  #th
     **codes_psps : PspArg,
     ) -> dict[str, PseudoSet] | None:
     """Generate a dictionary of :class:`PseudoSet`.

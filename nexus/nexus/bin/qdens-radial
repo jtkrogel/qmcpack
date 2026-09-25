@@ -96,13 +96,13 @@ class QDRBase(DevBase):
     verbose = None
     options = obj()
     parser  = None
-
+    #mth
     def vlog(self, *args: str | dict, **kwargs) -> None:
         if self.verbose:
             DevBase.nxs_print(self,*args,**kwargs)
         #end if
     #end def vlog
-
+    #mth
     def vmlog(self, *args, **kwargs) -> None:
         args = list(args)+[' (memory %3.2f MB)'%(memory.resident(children=True)/1e6)]
         self.vlog(*args,**kwargs)

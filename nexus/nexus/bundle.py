@@ -267,7 +267,7 @@ class SimulationBundle(Simulation):
         return Simulation.completed(self) & bsims_comp
     #end def completed
 
-
+    #mth
     def check_allowed(self, indicator) -> bool:
         allowed = True
         for sim in self.sims:
@@ -276,7 +276,7 @@ class SimulationBundle(Simulation):
         return allowed
     #end def check_allowed
 
-
+    #mth
     def progress(self, dependency_id = None) -> None:
         if dependency_id is not None and dependency_id in self.wait_ids:
             self.wait_ids.remove(dependency_id)
@@ -318,31 +318,31 @@ class SimulationBundle(Simulation):
         #end if
     #end def progress
 
-
+    #mth
     def create_directories(self, *args, **kwargs) -> None:
         if self.allow_create_directories:
             Simulation.create_directories(self,*args,**kwargs)
         #end if
     #end def create_directories
-
+    #mth
     def get_dependencies(self, *args, **kwargs) -> None:
         if self.allow_get_dependencies:
             Simulation.get_dependencies(self,*args,**kwargs)
         #end if
     #end def get_dependencies
-
+    #mth
     def write_inputs(self, *args, **kwargs) -> None:
         if self.allow_write_inputs:
             Simulation.write_inputs(self,*args,**kwargs)
         #end if
     #end def write_inputs
-
+    #mth
     def send_files(self, *args, **kwargs) -> None:
         if self.allow_send_files:
             Simulation.send_files(self,*args,**kwargs)
         #end if
     #end def send_files
-
+    #mth
     def submit(self, *args, **kwargs) -> None:
         if self.allow_submit:
             Simulation.submit(self,*args,**kwargs)
@@ -361,13 +361,13 @@ class SimulationBundle(Simulation):
         #end for
         self.finished = finished
     #end def check_sim_status
-
+    #mth
     def get_output(self, *args, **kwargs) -> None:
         if self.allow_get_output:
             Simulation.get_output(self,*args,**kwargs)
         #end if
     #end def get_output
-
+    #mth
     def analyze(self, *args, **kwargs) -> None:
         if self.allow_analyze:
             Simulation.analyze(self,*args,**kwargs)

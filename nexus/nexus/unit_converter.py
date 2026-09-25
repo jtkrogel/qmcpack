@@ -178,7 +178,7 @@ class UnitConverter(DevBase):
         msg = 'UnitConverter should not be instantiated'
         raise RuntimeError(msg)
     #def __init__
-
+    #mth
     @staticmethod
     def convert(value, source_unit, target_unit):
         ui = UnitConverter.unit_dict[source_unit]
@@ -196,7 +196,7 @@ class UnitConverter(DevBase):
 
         return (value_out,target_unit)
     #end def convert
-
+    #mth
     @staticmethod
     def convert_scalar_to_all(units: str, value_orig) -> dict[str, float]:
         unit_type = UnitConverter.unit_dict[units].type
@@ -214,7 +214,7 @@ class UnitConverter(DevBase):
     #end def convert_scalar_to_all
 #end class UnitConverter
 
-
+#mth
 def convert(value, source_unit: str, target_unit: str):
     return UnitConverter.convert(value,source_unit,target_unit)[0]
 #end def convert

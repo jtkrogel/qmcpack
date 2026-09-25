@@ -146,7 +146,7 @@ class Pyscf(Simulation):
 #end class Pyscf
 
 
-
+#mth
 def generate_pyscf(**kwargs) -> Pyscf:
     sim_args,inp_args = Pyscf.separate_inputs(kwargs)
 

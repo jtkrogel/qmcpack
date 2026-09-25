@@ -29,11 +29,12 @@ from .qmcpack_quantity_analyzers import HDFAnalyzer
 
 
 class MethodAnalyzer(QAanalyzer):
+    #mth
     def __init__(
         self,
         series  : int | None = None,
-        calc                 = None,
-        input                = None,
+        calc                 = None,  #th
+        input                = None,  #th
         nindent : int        = 0,
         ) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
@@ -42,12 +43,12 @@ class MethodAnalyzer(QAanalyzer):
         #end if
     #end def __init__
 
-
+    #mth
     def init_sub_analyzers(
         self,
         series : int,
-        calc,
-        input,
+        calc,  #th
+        input,  #th
         ) -> None:
         request  = QAanalyzer.request
         run_info = QAanalyzer.run_info
@@ -319,11 +320,12 @@ class MethodAnalyzer(QAanalyzer):
 
 
 class OptAnalyzer(MethodAnalyzer):
+    #mth
     def init_sub_analyzers(
         self,
         series : int,
-        calc,
-        input,
+        calc,  #th
+        input,  #th
         ) -> None:
         MethodAnalyzer.init_sub_analyzers(self,series,calc,input)
 

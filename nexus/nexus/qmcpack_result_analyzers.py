@@ -41,12 +41,13 @@ class ResultAnalyzer(QAanalyzer):
 
 
 class OptimizationAnalyzer(ResultAnalyzer):
+    #mth
     def __init__(
         self,
-        input,
-        opts,
-        energy_weight         = None,
-        variance_weight       = None,
+        input,  #th
+        opts,  #th
+        energy_weight         = None,  #th
+        variance_weight       = None,  #th
         nindent         : int = 0,
         ) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
@@ -418,6 +419,7 @@ class OptimizationAnalyzer(ResultAnalyzer):
 
 
 class TimestepStudyAnalyzer(ResultAnalyzer):
+    #mth
     def __init__(self, dmc, nindent: int = 0) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
         self.update(

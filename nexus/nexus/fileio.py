@@ -63,7 +63,7 @@ class TextFile(DevBase):
         self.f = f
         self.mm = mmap.mmap(fno,0,prot=mmap.PROT_READ)
     #end def open
-
+    #mth
     def __iter__(self):
         for line in self.f:
             yield line
@@ -186,7 +186,7 @@ class TextFile(DevBase):
         #end if
         return to_str(self.mm.readline())
     #end def readline
-
+    #mth
     def read(self, num = None) -> str | None:
         if num is None:
             return to_str(self.mm[:])
@@ -197,6 +197,7 @@ class TextFile(DevBase):
 
 
     # unchanged mmap interface below
+    #mth
     def find(self, *a: str, **kw) -> int:
         args = []
         for v in a:
@@ -208,28 +209,28 @@ class TextFile(DevBase):
         #end for
         return self.mm.find(*args,**kw)
     #end def find
-
+    #mth
     def flush(self, *a, **kw):
         return self.mm(*a,**kw)
     #end def flush
-
+    #mth
     def move(
         self,
-        dest,
-        src,
-        count,
-        ):
+        dest,  #th
+        src,  #th
+        count,  #th
+        ):  #th
         return self.mm.move(dest,src,count)
     #end def move
-
+    #mth
     def read_byte(self):
         return self.mm.read_byte()
     #end def read_byte
-
+    #mth
     def resize(self, newsize):
         return self.mm.resize(newsize)
     #end def resize
-
+    #mth
     def rfind(self, *a, **kw):
         args = []
         for v in a:
@@ -241,7 +242,7 @@ class TextFile(DevBase):
         #end for
         return self.mm.rfind(*args,**kw)
     #end def rfind
-
+    #mth
     def size(self):
         return self.mm.size()
     #end def size
@@ -249,11 +250,11 @@ class TextFile(DevBase):
     def tell(self) -> int:
         return self.mm.tell()
     #end def tell
-
+    #mth
     def write(self, string: str):
         return self.mm.write(string)
     #end def write
-
+    #mth
     def write_byte(self, byte):
         return self.mm.write_byte(byte)
     #end def write_byte
@@ -330,12 +331,12 @@ class StandardFile(DevBase):
         return messages
     #end def validity_checks
 
-
+    #mth
     def read_text(self, text: str):
         raise NotImplementedError
     #end def read_text
 
-
+    #mth
     def write_text(self):
         raise NotImplementedError
     #end def write_text
@@ -377,10 +378,10 @@ class XsfFile(StandardFile):
         StandardFile.__init__(self,filepath)
     #end def __init__
 
-
+    #mth
     def add_to_image(
         self,
-        image,
+        image,  #th
         name  : str,
         value : np.ndarray,
         ) -> None:
@@ -695,7 +696,7 @@ class XsfFile(StandardFile):
         return c
     #end def write_text
 
-
+    #mth
     def write_coord(self, image = None, index: str = '') -> str:
         if image is None:
             s = self
@@ -879,6 +880,7 @@ class XsfFile(StandardFile):
 
 
     # test needed
+    #mth
     def incorporate_structure(self, structure) -> None:
         s = deepcopy(structure)
         s.change_units('A')
@@ -1583,12 +1585,12 @@ def read_poscar_chgcar(host: StandardFile, text: str) -> None:
     else:
         dynamic = None
     #end if
-
+    #mth
     def is_empty(
         lines : list[str],
         start : int | None = None,
         end   : int | None = None,
-        ):
+        ):  #th
         if start is None:
             start = 0
         #end if

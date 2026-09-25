@@ -110,7 +110,7 @@ def _read_gamess_pseudopotential(filepath: str) -> obj:
     return pseudo
 #end def _read_gamess_pseudopotential
 
-
+#mth
 def _read_gamess_pseudopotentials(pseudo_files) -> obj:
     pseudos = obj()
     for filepath in pseudo_files:
@@ -155,11 +155,11 @@ class Group(GIbase):
         #end if
         self.update(**kwargs)
     #end def __init__
-
+    #mth
     def read(self, text: str):
         raise NotImplementedError
     #end def read
-
+    #mth
     def write(self, text: str):
         raise NotImplementedError
     #end def read
@@ -359,7 +359,7 @@ class CardGroup(Group):
         #end for
     #end def append_text
 
-
+    #mth
     def append_list(self, lst) -> None:
         for tokens in lst:
             self[len(self)] = tokens
@@ -1066,7 +1066,7 @@ class GamessInput(SimulationInput,GIbase):
         return contents
     #end def write_text
 
-
+    #mth
     def incorporate_system(self, system):
         raise NotImplementedError
     #end def incorporate_system
@@ -1075,7 +1075,7 @@ class GamessInput(SimulationInput,GIbase):
 
 
 
-
+#mth
 def generate_gamess_input(**kwargs) -> GamessInput:
     if 'input_type' in kwargs:
         input_type = kwargs['input_type']
@@ -1111,7 +1111,7 @@ for var in GamessInput.all_keywords:
     kw_defaults[var]=None
 #end for
 
-
+#mth
 def generate_any_gamess_input(**kwargs) -> GamessInput:
     kwset = set(kwargs.keys())
     pskw = deepcopy(ps_defaults)

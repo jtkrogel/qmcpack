@@ -713,7 +713,7 @@ def _literal_error_pattern(error_key: str) -> str:
         pattern += r'(?!\w)'
     return pattern
 
-
+#mth
 @cache
 def _combined_error_pattern(enabled_sets) -> re.Pattern | None:
     patterns = []

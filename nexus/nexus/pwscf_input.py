@@ -367,18 +367,19 @@ class PwscfInputBase(DevBase):
 
 class Element(PwscfInputBase):
     name = None
+    #mth
     def add(self, **variables) -> None:
         self.update(**variables)
     #end def add
-
+    #mth
     def read(self, lines: NmlLines):
         raise NotImplementedError
     #end def read
-
+    #mth
     def write(self, parent: PwscfInput):
         raise NotImplementedError
     #end def write
-
+    #mth
     def post_process_read(self, parent) -> None:
         pass
     #end def post_process_read
@@ -620,19 +621,19 @@ class Card(Element):
         c += self.write_text()+'\n'
         return c
     #end def write
-
+    #mth
     def read_text(self, lines: CardLines):
         raise NotImplementedError
     #end def read_text
-
+    #mth
     def write_text(self):
         raise NotImplementedError
     #end def write_text
-
+    #mth
     def change_specifier(self, new_specifier: str):
         raise NotImplementedError
     #end def change_specifier
-
+    #mth
     def change_option(self, *args: bool | PwscfInput | Elements, **kwargs) -> None:
         self.change_specifier(*args,**kwargs)
     #end def change_option
@@ -658,6 +659,7 @@ class system(Section):
         )
 
     # specialized read for partial array variables (hubbard U, starting mag, etc)
+    #mth
     def post_process_read(self, parent) -> None:
         if 'atomic_species' in parent:
             keys = self.keys()
@@ -696,6 +698,7 @@ class system(Section):
 
 
     # specialized write for odd handling of hubbard U
+    #mth
     def write_old(self, parent) -> str:
         cls = self.__class__
         c='&'+self.name.upper()+'\n'
@@ -1455,6 +1458,7 @@ class PwscfInput(SimulationInput):
     element_types.update(**card_types)
 
     required_elements = ('control','system','electrons','atomic_species','atomic_positions','k_points')
+    #mth
     def __init__(self, *elements) -> None:
         elements = list(elements)
         if len(elements)==1 and os.path.exists(elements[0]):
@@ -1603,7 +1607,7 @@ class PwscfInput(SimulationInput):
         #end if
         return vals
     #end def get_common_vars
-
+    #mth
     def incorporate_hubbard(self, hubbard_result) -> None:
         hub_obj = hubbard()
         hubbard_result = hubbard_result.split('\n')
@@ -1611,7 +1615,7 @@ class PwscfInput(SimulationInput):
         hub_obj.read_text(hubbard_result[2:])
         self.hubbard = hub_obj
     #end def incorporate_hubbard
-
+    #mth
     def incorporate_system(self, system: PhysicalSystem, elem_order = None) -> None:
         system.check_folded_system()
         system.change_units('B')
@@ -1715,11 +1719,11 @@ class PwscfInput(SimulationInput):
         #end if
     #end def incorporate_system
 
-
+    #mth
     def incorporate_system_old(
         self,
         system         : PhysicalSystem,
-        spin_polarized = None,
+        spin_polarized = None,  #th
         ) -> None:
         system.check_folded_system()
         system.change_units('B')
@@ -1812,11 +1816,12 @@ class PwscfInput(SimulationInput):
 
 
     # test needed
+    #mth
     def return_system(
         self,
         *,
         structure_only : bool = False,
-        **valency,
+        **valency,  #th
         ) -> PhysicalSystem | Structure:
         ibrav = self.system.ibrav
         if ibrav!=0:
@@ -1928,7 +1933,7 @@ class PwscfInput(SimulationInput):
 #end class PwscfInput
 
 
-
+#mth
 def generate_pwscf_input(selector: str, **kwargs) -> PwscfInput | None:
     if selector=='generic':
         return generate_any_pwscf_input(**kwargs)
@@ -2011,7 +2016,7 @@ generate_any_defaults = obj(
         use_folded        = False,
         ),
     )
-
+#mth
 def generate_any_pwscf_input(**kwargs) -> PwscfInput | None:
     #move values into a more convenient representation
     #kwargs = obj(**kwargs)
@@ -2660,16 +2665,16 @@ def generate_nscf_input(**kwargs: KwargsT) -> PwscfInput:
 
 
 
-
+#mth
 def generate_relax_input(
     *,
     prefix            : str                         = 'pwscf',
     outdir            : str                         = 'pwscf_output',
     input_dft         : str | None                  = None,
-    exx_fraction                                    = None,
+    exx_fraction                                    = None,  #th
     ecut              : int | float                 = 50.,
-    ecutrho                                         = None,
-    ecutfock                                        = None,
+    ecutrho                                         = None,  #th
+    ecutfock                                        = None,  #th
     conv_thr          : float                       = 1e-6,
     mixing_mode       : str                         = 'plain',
     mixing_beta       : float                       = .7,
@@ -2678,13 +2683,13 @@ def generate_relax_input(
     smearing          : str                         = 'fermi-dirac',
     degauss           : float                       = 0.0001,
     nosym             : bool                        = True,
-    spin_polarized                                  = None,
-    assume_isolated                                 = None,
+    spin_polarized                                  = None,  #th
+    assume_isolated                                 = None,  #th
     upscale           : int                         = 100,
     pot_extrapolation : str                         = 'second_order',
     wfc_extrapolation : str                         = 'second_order',
-    hubbard_u                                       = None,
-    start_mag                                       = None,
+    hubbard_u                                       = None,  #th
+    start_mag                                       = None,  #th
     restart_mode      : str                         = 'from_scratch',
     kgrid             : tuple[int, int, int] | None = None,
     kshift            : tuple[int, int, int] | None = None,
@@ -2692,7 +2697,7 @@ def generate_relax_input(
     system            : PhysicalSystem | None       = None,
     use_folded        : bool                        = False,
     group_atoms       : bool                        = False,
-    forc_conv_thr                                   = None,
+    forc_conv_thr                                   = None,  #th
     disk_io           : str                         = 'low',
     wf_collect        : bool                        = False,
     verbosity         : str                         = 'high',
@@ -2860,15 +2865,15 @@ def generate_relax_input(
     return pw
 #end def generate_relax_input
 
-
+#mth
 def generate_vcrelax_input(
-    press          = None,  # None = use pw.x default
-    cell_factor    = None,
-    cell_dofree    = None,
-    forc_conv_thr  = None,
-    ion_dynamics   = None,
-    press_conv_thr = None,
-    **kwargs,
+    press          = None,  # None = use pw.x default  #th
+    cell_factor    = None,  #th
+    cell_dofree    = None,  #th
+    forc_conv_thr  = None,  #th
+    ion_dynamics   = None,  #th
+    press_conv_thr = None,  #th
+    **kwargs,  #th
     ) -> PwscfInput:
 
     pw = generate_scf_input(**kwargs)

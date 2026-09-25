@@ -114,23 +114,26 @@ type JackArgs = list[np.ndarray | None] | None
 
 
 # cost functions
+#mth
 def least_squares(
     p : np.ndarray,
     x : np.ndarray,
     y : np.ndarray,
-    f,
+    f,  #th
     ) -> np.float64:  return ((f(p,x)-y)**2).sum()
+#mth
 def absmin(
-    p,
-    x,
-    y,
-    f,
+    p,  #th
+    x,  #th
+    y,  #th
+    f,  #th
     ) -> np.float64:   return np.abs(f(p,x)-y).sum()
+#mth
 def madmin(
-    p,
-    x,
-    y,
-    f,
+    p,  #th
+    x,  #th
+    y,  #th
+    f,  #th
     ) -> np.float64:   return np.abs(f(p,x)-y).max()
 
 cost_functions = obj(
@@ -140,10 +143,11 @@ cost_functions = obj(
     )
 
 # curve fit based on fmin from scipy
+#mth
 def curve_fit(
     x         : np.ndarray,
     y         : np.ndarray,
-    f,
+    f,  #th
     p0        : CurveFitArg,
     cost      : str = 'least_squares',
     optimizer : str = 'fmin',
@@ -228,6 +232,7 @@ def morse_w(
 #end def morse_w
 
 # wX = \omega_e\Chi_e spectroscopic constant in 1/cm
+#mth
 def morse_wX(p, m1, m2 = None) -> float:
     ocm   = 1./(convert(1.0,'B','m')*100) # 1/Bohr to 1/cm
     alpha = 7.2973525698e-3               # fine structure constant
@@ -281,6 +286,7 @@ def morse_harmfreq(
 #end def morse_harmfreq
 
 # morse_harmonic evaluates the harmonic oscillator fit to the morse potential
+#mth
 def morse_harmonic_potential(p, r) -> float:
     return .5*morse_k(p)*(r-morse_re(p))**2 - morse_De(p)
 #end def morse_harmonic_potential
@@ -290,12 +296,13 @@ def morse_harmonic_potential(p, r) -> float:
 #   input units are Angstrom for re and 1/cm for w and wX
 #   m1 and m2 are masses in Hartree units, only one need be provided
 #   outputted fit is in Hartree units
+#mth
 def morse_spect_fit(
-    re,
-    w,
-    wX,
-    m1,
-    m2           = None,
+    re,  #th
+    w,  #th
+    wX,  #th
+    m1,  #th
+    m2           = None,  #th
     Einf : float = 0.0,
     ) -> tuple:
     alpha = 7.2973525698e-3            # fine structure constant
@@ -338,16 +345,17 @@ def morse_rDw_fit(
 #    pf    = morse_fit(r,E)                           returns fitted parameters
 #  jackknife statistical fits, E is two dimensional with blocks as first dimension
 #    pf,pmean,perror = morse_fit(r,E,jackknife=True)  returns jackknife estimates of parameters
+#mth
 def morse_fit(
     r         : np.ndarray,
     E         : np.ndarray,
     p0        : MorseFitArg = None,
     *,
     jackknife : bool        = False,
-    cost                    = least_squares,
+    cost                    = least_squares,  #th
     auxfuncs  : obj | None  = None,
     auxres    : obj | None  = None,
-    capture                 = None,
+    capture                 = None,  #th
     ) -> np.ndarray | tuple[np.ndarray, None, None]:
     if isinstance(E,(list,tuple)):
         E = np.array(E,dtype=float)
@@ -440,6 +448,7 @@ def morse_fit(
 # morse_fit_fine: fit data to a morse potential and interpolate on a fine grid
 #   compute direct jackknife variations in the fitted curves
 #   by using morse as an auxiliary jackknife function
+#mth
 def morse_fit_fine(
     r         : np.ndarray,
     E         : np.ndarray,
@@ -448,8 +457,8 @@ def morse_fit_fine(
     *,
     both      : bool              = False,
     jackknife : bool              = False,
-    cost                          = least_squares,
-    capture                       = None,
+    cost                          = least_squares,  #th
+    capture                       = None,  #th
     ) -> np.ndarray | tuple:
     if rfine is None:
         rfine = np.linspace(r.min(),r.max(),400)
@@ -496,9 +505,10 @@ def morse_fit_fine(
 
 
 # equation of state
+#mth
 def murnaghan(p, V) -> float:
     return p[0] + p[2] / p[3] * V * ((p[1] / V) ** p[3] / (p[3] - 1) + 1) - p[1] * p[2] / (p[3] - 1)
-
+#mth
 def birch(p, V) -> float:
     return p[0] + 9 * p[1] * p[2] / 16 * ((p[1] / V) ** (2.0 / 3) - 1) ** 2 * (
         2 + (p[3] - 4) * ((p[1] / V) ** (2.0 / 3) - 1)
@@ -510,10 +520,10 @@ def vinet(p: VinetArg, V: np.ndarray) -> np.ndarray:
         - (2 + 3 * (p[3] - 1) * ((V / p[1]) ** (1.0 / 3) - 1))
         * exp(-1.5 * (p[3] - 1) * ((V / p[1]) ** (1.0 / 3) - 1))
         )
-
+#mth
 def murnaghan_pressure(p, V) -> float:
     return p[1] / p[2] * ((p[0] / V) ** p[2] - 1)
-
+#mth
 def birch_pressure(p, V) -> float:
     return (
         1.5
@@ -522,7 +532,7 @@ def birch_pressure(p, V) -> float:
         * ((p[0] / V) ** (2.0 / 3) - 1)
         * (1.0 + 0.75 * (p[2] - 1) * ((p[0] / V) ** (2.0 / 3) - 1))
         )
-
+#mth
 def vinet_pressure(p, V) -> float:
     return (
         3.0
@@ -587,18 +597,18 @@ def eos_param(p: EosEinfArg, param: str, type: str = 'vinet') -> float:
     return eos_pfuncs[param](p)
 #end def eos_param
 
-
+#mth
 def eos_fit(
     V         : np.ndarray,
     E         : np.ndarray,
     type      : str  = 'vinet',
-    p0               = None,
+    p0               = None,  #th
     cost      : str  = 'least_squares',
     *,
     jackknife : bool = False,
-    auxfuncs         = None,
-    auxres           = None,
-    capture          = None,
+    auxfuncs         = None,  #th
+    auxres           = None,  #th
+    capture          = None,  #th
     ) -> np.ndarray | tuple[np.ndarray, None, None]:
     if isinstance(V,(list,tuple)):
         V = np.array(V,dtype=float)
@@ -683,6 +693,7 @@ def eos_fit(
                 num_variables = len(inspect.getargspec(auxfunc).args)
                 if num_variables > 1:
                     # Assume that the second variable is volume for the pressure fits
+                    #mth
                     def auxfunc_p(p): return auxfunc(p, eq_vol)
                 else:
                     auxfunc_p = auxfunc
@@ -730,11 +741,12 @@ def eos_fit(
 #             if integer, will be placed in args:   args[position] = input_array
 #             if string , will be placed in kwargs: kwargs[position] = input_array
 #   capture: an object that will contain most jackknife info upon exit
+#mth
 def jackknife(
     data     : np.ndarray,
-    function,
+    function,  #th
     args     : JackArgs   = None,
-    kwargs                = None,
+    kwargs                = None,  #th
     position : int | None = None,
     capture  : obj | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -831,13 +843,14 @@ numerics_jackknife = jackknife
 # get jackknife estimate of auxiliary quantities
 #   jsamples is a subset of jsamples data computed by jackknife above
 #   auxfunc is an additional function to get a jackknife sample of a derived quantity
+#mth
 def jackknife_aux(
     jsamples : list[np.ndarray],
-    auxfunc,
-    args     = None,
-    kwargs   = None,
-    position = None,
-    capture  = None,
+    auxfunc,  #th
+    args     = None,  #th
+    kwargs   = None,  #th
+    position = None,  #th
+    capture  = None,  #th
     ) -> tuple[np.float64, np.float64]:
     # unpack the argument list if compressed
     if not inspect.isfunction(auxfunc):
@@ -904,10 +917,10 @@ def jackknife_aux(
     return jmean,jerror
 #end def jackknife_aux
 
-
+#mth
 def check_jackknife_inputs(
     args     : JackArgs,
-    kwargs,
+    kwargs,  #th
     position : int | None,
     ) -> CheckJackkRet:
     argpos   = False
@@ -965,7 +978,7 @@ def check_jackknife_inputs(
 #
 #See ?ndgrid for details.
 #"""
-
+#mth
 def ndgrid(*args: list[int | float], **kwargs) -> list[np.ndarray] | np.ndarray:
     """n-dimensional gridding like Matlab's NDGRID
 
@@ -1063,7 +1076,7 @@ def ndgrid(*args: list[int | float], **kwargs) -> list[np.ndarray] | np.ndarray:
 ############   End ndgrid
 ########################################################################
 
-
+#mth
 def simstats(x: np.ndarray, dim = None):
     shape = x.shape
     ndim  = len(shape)
@@ -1170,13 +1183,13 @@ def simstats(x: np.ndarray, dim = None):
 #end def simstats
 
 
-
+#mth
 def simplestats(
     x    : np.ndarray,
     dim  : int | None = None,
     *,
     full : bool       = False,
-    ):
+    ):  #th
     if dim is None:
         dim=len(x.shape)-1
     #end if
@@ -1191,13 +1204,13 @@ def simplestats(
     #end if
 #end def simplestats
 
-
+#mth
 def equilibration_length(
     x              : np.ndarray,
     tail           : float = .5,
     *,
     plot           : bool  = False,
-    xlim                   = None,
+    xlim                   = None,  #th
     bounces        : int   = 2,
     random         : bool  = True,
     seed_from_hash : bool  = True,
@@ -1296,6 +1309,7 @@ def ttest(
 
 
 # test needed
+#mth
 def surface_normals(x, y, z) -> np.ndarray:
     nu,nv = x.shape
     normals = np.empty((nu,nv,3))
@@ -1367,6 +1381,7 @@ def surface_normals(x, y, z) -> np.ndarray:
 # test needed
 simple_surface_coords = [{'x','y','z'},{'r','phi','z'},{'r','phi','theta'}]
 simple_surface_min = {'x':-1.00000000001,'y':-1.00000000001,'z':-1.00000000001,'r':-0.00000000001,'phi':-0.00000000001,'theta':-0.00000000001}
+#mth
 def simple_surface(origin, axes, grid: dict) -> tuple:
     matched=False
     gk = set(grid.keys())
@@ -1495,13 +1510,14 @@ def simple_surface(origin, axes, grid: dict) -> tuple:
 
 # test needed
 #def least_squares(p, x, y, f): return ((f(p,x)-y)**2).sum()
+#mth
 def func_fit(
-    x,
-    y,
-    fitting_function,
-    p0,
-    cost = least_squares,
-    ):
+    x,  #th
+    y,  #th
+    fitting_function,  #th
+    p0,  #th
+    cost = least_squares,  #th
+    ):  #th
     from scipy.optimize import fmin
     f = fitting_function
     p = fmin(cost,p0,args=(x,y,f),maxiter=10000,maxfun=10000)
@@ -1667,12 +1683,12 @@ def convex_hull(
 
 
 
-
+#mth
 def layers_1d(
-    xpoints,
-    tol,
-    xmin               = None,
-    xmax               = None,
+    xpoints,  #th
+    tol,  #th
+    xmin               = None,  #th
+    xmax               = None,  #th
     *,
     merge       : bool = True,
     periodic    : bool = False,
@@ -1761,13 +1777,13 @@ def layers_1d(
 #end def layers_1d
 
 
-
+#mth
 def layer_means_1d(
-    xpoints,
-    tol,
+    xpoints,  #th
+    tol,  #th
     *,
     full_return : bool = False,
-    ):
+    ):  #th
     # Get layer data
     layers,xmin,xmax = layers_1d(xpoints,tol,full_return=True)
 
@@ -1789,15 +1805,15 @@ def layer_means_1d(
 #end def layer_means_1d
 
 
-
+#mth
 def index_by_layer_1d(
-    xpoints,
-    tol,
+    xpoints,  #th
+    tol,  #th
     *,
     uniform     : bool = True,
     check       : bool = True,
     full_return : bool = False,
-    ):
+    ):  #th
     # Get layer means
     xlayer,xmin,xmax = layer_means_1d(xpoints,tol,full_return=True)
 

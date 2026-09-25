@@ -92,7 +92,7 @@ except (ImportError,RuntimeError):
 def first(d: obj) -> np.ndarray:
     return d[min(d.keys())]
 
-
+#mth
 def sigfig_round(some_float, nsigfig: int):
     if nsigfig >= 1 and nsigfig == int(nsigfig):
         return round(some_float, nsigfig - int(np.floor(np.log10(abs(some_float))))-1)
@@ -203,7 +203,7 @@ class QBase(DevBase):
         # AFQMC
         el = 'EnergyEstim__nume_real'
         )
-
+    #mth
     def log(self, *texts: str, **kwargs) -> None:
         if len(kwargs)>0:
             n = kwargs['n']
@@ -503,7 +503,7 @@ class DatAnalyzer(QBase):
         #end for
     #end def zero
 
-
+    #mth
     def accumulate(self, other, weight) -> None:
         self.info.weight += weight
         for q,v in other.data.items():
@@ -521,7 +521,7 @@ class DatAnalyzer(QBase):
         #end for
     #end def normalize
 
-
+    #mth
     def join(self, others) -> None:
         eq = self.options.equilibration
         quantities = self.data.keys()
@@ -701,7 +701,7 @@ class DatAnalyzer(QBase):
         return line
     #end def stat_line
 
-
+    #mth
     def EV_line(self, quants) -> str:
         line = ''
         for qname in quants:
@@ -714,11 +714,11 @@ class DatAnalyzer(QBase):
         return line
     #end def EV_line
 
-
+    #mth
     def plot_series(
         self,
         quantity : str,
-        style,
+        style,  #th
         prefix   : str,
         ) -> tuple:
         if not quantity in self.stats:
@@ -731,14 +731,14 @@ class DatAnalyzer(QBase):
         return (s,s),(q.mean,q.mean),s,q.mean,q.error
     #end def plot_series
 
-
+    #mth
     def plot_trace(
         self,
         quantity : str,
         style    : str,
         prefix   : str,
         shift    : int,
-        ):
+        ):  #th
         self.check_matplotlib_import()
         if not quantity in self.data:
             msg = 'quantity '+quantity+f' is not present in the data for {self.info.filepath}'
@@ -764,13 +764,13 @@ class DatAnalyzer(QBase):
         return xlims,ylims,s,q
     #end def plot_trace
 
-
+    #mth
     def plot_histogram(
         self,
         quantity : str,
-        style,
+        style,  #th
         prefix   : str,
-        ):
+        ):  #th
         raise NotImplementedError
         #if not quantity in self.data:
         #    self.error('quantity '+quantity+' is not present in the data for {0}'.format(self.info.filepath),'QMCA')
@@ -1738,7 +1738,6 @@ QMCA examples:
 if __name__=='__main__':
     QMCA()
 #end if
-
 
 
 

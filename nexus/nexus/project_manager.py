@@ -29,7 +29,7 @@ from .nexus_base import NexusCore, ShowStatusMode, nexus_config, dynamic_storage
 from .simulation import Simulation, sim_err_handler
 from .machines import Machine,Job
 
-
+#mth
 def color_status_result(result: str, logfile) -> str:
     """Apply a green or red background to terminal status results."""
     if result not in {'SUCCESS','FAILURE'}:
@@ -49,7 +49,7 @@ def color_status_result(result: str, logfile) -> str:
     return background+result+'\033[0m'
 #end def color_status_result
 
-
+#mth
 def trivial(sim, *args, **kwargs) -> None:
     pass
 #end def trivial
@@ -70,7 +70,7 @@ class ProjectManager(NexusCore):
         self.progressing_cascades = obj()
     #end def __init__
 
-
+    #mth
     def add_simulations(self, *simulations) -> None:
         if len(simulations)==0:
             self.add_simulations(Simulation.all_sims)
@@ -285,12 +285,12 @@ class ProjectManager(NexusCore):
         #end if
     #end def check_dependencies
 
-
+    #mth
     def traverse_cascades(
         self,
-        operation = trivial,
-        *args,
-        **kwargs,
+        operation = trivial,  #th
+        *args,  #th
+        **kwargs,  #th
         ) -> None:
         for cascade in self.cascades.values():
             cascade.reset_wait_ids()
@@ -352,7 +352,7 @@ class ProjectManager(NexusCore):
         self.nxs_print('setup, sent_files, submitted, finished, got_output, analyzed, failed',n=2)
     #end def write_simulation_status
 
-
+    #mth
     def status_line(self, sim, extra: str = '') -> None:
         indicators = ('setup','sent_files','submitted','finished','got_output','analyzed')
         stats = tuple([sim[k] for k in indicators])
@@ -407,6 +407,7 @@ class ProjectManager(NexusCore):
 
 
     # test needed
+    #mth
     def write_sim_dependencies(self, idkey = None) -> None:
         for simid in sorted(self.simulations.keys()):
             sim = self.simulations[simid]
@@ -565,7 +566,7 @@ class DynamicWorkflowManager(NexusCore):
 
 
 
-
+#mth
 def workflow_manager(**kw) -> DynamicWorkflowManager:
     if not hasattr(workflow_manager,'first'):
         workflow_manager.first = True

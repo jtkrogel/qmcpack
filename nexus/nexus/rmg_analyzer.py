@@ -172,7 +172,7 @@ class RmgOutData(DevBase):
     # Example: -1.2345D+02
     number_pattern = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?'
 
-
+    #mth
     def __init__(self, filepath: str | Path, input = None) -> None:
         """Initialize the parsed data by reading an RMG output file."""
         if isinstance(filepath,os.PathLike):
@@ -1122,6 +1122,7 @@ class RmgOutData(DevBase):
         lines : list of str
             Complete RMG log split into lines.
         """
+        #mth
         def assigned_value(text: str, lower: str, *labels) -> float | None:
             """Return a numeric value following a labeled assignment."""
             for label in labels:
@@ -2000,10 +2001,11 @@ class RmgOutData(DevBase):
         if len(produced_files)>0:
             self.produced_files = produced_files
     #end def read_produced_files
+    #mth
     def read_cell_events(
         self,
         lines             : list[str],
-        initial_structure = None,
+        initial_structure = None,  #th
         ) -> CellEvents:
         """Return line-indexed lattice cells reported in an RMG output."""
         events        = []
@@ -2089,11 +2091,11 @@ class RmgOutData(DevBase):
         return events
     #end def read_cell_events
 
-
+    #mth
     def read_ion_records(
         self,
         lines             : list[str],
-        initial_structure = None,
+        initial_structure = None,  #th
         ) -> IonRecords:
         """Return ionic records and structures without binding analyzer data."""
         records     = []
@@ -2355,7 +2357,7 @@ class RmgAnalyzer(SimulationAnalyzer):
             raise RuntimeError(msg)
     #end def _unavailable
 
-
+    #mth
     def _query_value(self, quantity: str, *args: int | str):
         """Return a query value without applying public missing-data policy."""
         self._query_depth += 1
@@ -2438,7 +2440,7 @@ class RmgAnalyzer(SimulationAnalyzer):
         return all(self._query_value(name) is not None for name in names)
     #end def available
 
-
+    #mth
     def initial_structure(self, units: str = 'A'):
         """Return the initial structure.
 
@@ -2729,7 +2731,7 @@ class RmgAnalyzer(SimulationAnalyzer):
         return bool(np.any(~(empty|full)))
     #end def fractional_occs
 
-
+    #mth
     def relaxed_structure(self, units: str = 'A'):
         """Return the final ionic structure.
 

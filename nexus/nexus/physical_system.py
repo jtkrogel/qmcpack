@@ -219,7 +219,7 @@ class PhysicalSystem(DevBase):
         #end if
     #end def rename
 
-
+    #mth
     def copy(self):
         cp = deepcopy(self)
         if self.folded_system is not None and self.structure.folded_structure is not None:
@@ -238,7 +238,7 @@ class PhysicalSystem(DevBase):
         #end if
     #end def load
 
-
+    #mth
     def tile(self, *td: list[list[int]], **kwargs) -> PhysicalSystem:
         extensive = True
         net_spin  = None
@@ -311,6 +311,7 @@ class PhysicalSystem(DevBase):
 
 
     # test needed
+    #mth
     def large_Zeff_elem(self, Zmin) -> list:
         elem = []
         for atom,Zeff in self.valency.items():
@@ -381,7 +382,7 @@ class PhysicalSystem(DevBase):
     @property
     def ion_labels(self) -> set[str | tuple[np.uint64, np.uint64, np.uint64]]:
         return set(self.structure.elem)
-
+    #mth
     @property
     def Zeff(self):
         if self.valency is not None:
@@ -406,6 +407,7 @@ ps_defaults = dict(
     tiled_spin=None,
     extensive=True
     )
+#mth
 def generate_physical_system(**kwargs) -> PhysicalSystem:
     for var,val in ps_defaults.items():
         if var not in kwargs:
@@ -561,6 +563,7 @@ def generate_physical_system(**kwargs) -> PhysicalSystem:
 
 
 # test needed
+#mth
 def ghost_atoms(*particles) -> None:
     for particle in particles:
         PhysicalSystem.ghost_aliases.append(particle)

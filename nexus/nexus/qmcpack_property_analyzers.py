@@ -59,12 +59,12 @@ class Bspline(QAobject):
     npe.reshape_inplace(A, (4, 4))
     npe.reshape_inplace(dA, (4, 4))
     npe.reshape_inplace(d2A, (4, 4))
-
+    #mth
     def __init__(
         self,
         params : np.ndarray,
-        cusp,
-        rcut,
+        cusp,  #th
+        rcut,  #th
         ) -> None:
         p = np.array(params)
         cusp = float(cusp)
@@ -90,7 +90,7 @@ class Bspline(QAobject):
         self.odr    = odr
         self.default_range = 0.,rcut
     #end def __init__
-
+    #mth
     def evaluate(self, r) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         tp=np.zeros((4,1))
         ni  = self.nintervals
@@ -128,12 +128,13 @@ class Bspline(QAobject):
 
 
 class RadialJastrow(QAobject):
+    #mth
     def __init__(
         self,
         ftype : str,
-        coeff,
+        coeff,  #th
         cusp  : float,
-        rcut,
+        rcut,  #th
         ) -> None:
         self.coeff = coeff
         self.cusp  = cusp
@@ -142,17 +143,17 @@ class RadialJastrow(QAobject):
             self.rcut = rcut
         #end if
     #end def __init__
-
+    #mth
     def evaluate(self, r) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return self.function.evaluate(r)
     #end def evaluate
-
+    #mth
     def interpolate(
         self,
-        r1         = None,
-        r2         = None,
+        r1         = None,  #th
+        r2         = None,  #th
         n    : int = 200,
-        ):
+        ):  #th
         if r1 is None:
             r1,r2 = self.function.default_range
         #end if
@@ -160,14 +161,14 @@ class RadialJastrow(QAobject):
         d0,d1,d2 = self.function.evaluate(r)
         return r,d0,d1,d2
     #end def interpolate
-
+    #mth
     def plot(
         self,
-        r1          = None,
-        r2          = None,
+        r1          = None,  #th
+        r2          = None,  #th
         color : str = 'b',
-        ptype       = None,
-        ):
+        ptype       = None,  #th
+        ):  #th
         import matplotlib.pyplot as plt
         if ptype is None:
             ptype = plt.plot
@@ -181,11 +182,12 @@ class RadialJastrow(QAobject):
 #end class RadialJastrow
 
 class Jastrow1B(RadialJastrow):
+    #mth
     def __init__(
         self,
-        ftype,
-        coeff,
-        rcut,
+        ftype,  #th
+        coeff,  #th
+        rcut,  #th
         ) -> None:
         cusp = 0.0
         RadialJastrow.__init__(self,ftype,coeff,cusp,rcut)
@@ -219,10 +221,10 @@ class PropertyAnalyzer(QAanalyzer):
 class WavefunctionAnalyzer(PropertyAnalyzer):
 
     jastrow_types = ('J1','J2','J3')
-
+    #mth
     def __init__(
         self,
-        arg0                = None,
+        arg0                = None,  #th
         *,
         load_jastrow : bool = False,
         nindent      : int  = 0,
@@ -360,7 +362,7 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
         plt.show()
     #end def plot_jastrow_data
 
-
+    #mth
     def plot_jastrows(self, ptype = None) -> None:
         import matplotlib.pyplot as plt
         if ptype is None:
@@ -382,7 +384,6 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def plot_jastrows
 
 #end class WavefunctionAnalyzer
-
 
 
 

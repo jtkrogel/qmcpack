@@ -26,7 +26,7 @@ class Rmg(Simulation):
         return calculating_result
     #end def check_result
 
-
+    #mth
     def get_result(self, result_name: str, sim: Simulation):
         result = None
         msg = 'Ability to get result '+result_name+' has not been implemented.'
@@ -34,11 +34,11 @@ class Rmg(Simulation):
         return result
     #end def get_result
 
-
+    #mth
     def incorporate_result(
         self,
         result_name : str,
-        result,
+        result,  #th
         sim         : Simulation,
         ) -> None:
         msg = 'ability to incorporate result '+result_name+' has not been implemented'
@@ -66,7 +66,7 @@ class Rmg(Simulation):
 
 
 
-
+#mth
 def generate_rmg(**kwargs) -> Rmg:
     pseudos = kwargs.get('pseudos',None)
     if pseudos is not None:

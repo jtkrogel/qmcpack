@@ -171,7 +171,7 @@ class Namelist(DevBase):
         cls.name_set = set(cls.names)
     #end def class_init
 
-
+    #mth
     def __init__(self, text: list[str] | None = None, **vals) -> None:
         if text is not None:
             self.read_text(text)
@@ -181,7 +181,7 @@ class Namelist(DevBase):
         #end if
     #end def __init__
 
-
+    #mth
     def check_names(self, label: str, names) -> None:
         cls = self.__class__
         if len(cls.name_set)>0:
@@ -308,7 +308,7 @@ class NamelistInput(SimulationInput):
         #end for
     #end def class_init
 
-
+    #mth
     def __init__(self, filepath: Path | None = None, **vals) -> None:
         if filepath is not None:
             self.read(filepath)
@@ -426,11 +426,11 @@ class PostProcessSimulation(Simulation):
 #end class PostProcessSimulation
 
 
-
+#mth
 def generate_ppsim(
     gen_input : type[NamelistInput] | None         = None,
     Sim       : type[PostProcessSimulation] | None = None,
-    **kwargs,
+    **kwargs,  #th
     ) -> PostProcessSimulation:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
     if 'input' not in sim_args:
@@ -477,7 +477,7 @@ class PP(PostProcessSimulation):
 
 
 generate_pp_input = PPInput
-
+#mth
 def generate_pp(**kwargs) -> PP:
     return generate_ppsim(PPInput,PP,**kwargs)
 #end def generate_pp
@@ -511,7 +511,7 @@ class Dos(PostProcessSimulation):
 
 
 generate_dos_input = DosInput
-
+#mth
 def generate_dos(**kwargs) -> Dos:
     return generate_ppsim(DosInput,Dos,**kwargs)
 #end def generate_dos
@@ -546,7 +546,7 @@ class Bands(PostProcessSimulation):
 
 
 generate_bands_input = BandsInput
-
+#mth
 def generate_bands(**kwargs) -> Bands:
     return generate_ppsim(BandsInput,Bands,**kwargs)
 #end def generate_bands
@@ -732,15 +732,15 @@ class ProjwfcAnalyzer(SimulationAnalyzer):
         #end if
         self.lowdin = lowdin
     #end def read_lowdin
-
+    #mth
     def write_lowdin(
         self,
         filepath : Path | None = None,
-        sum                    = None,
-        tot                    = None,
-        pol                    = None,
-        up                     = None,
-        down                   = None,
+        sum                    = None,  #th
+        tot                    = None,  #th
+        pol                    = None,  #th
+        up                     = None,  #th
+        down                   = None,  #th
         *,
         all      : bool        = True,
         long     : bool        = False,
@@ -846,7 +846,7 @@ class Projwfc(PostProcessSimulation):
     analyzer_type      = ProjwfcAnalyzer
     generic_identifier = 'projwfc'
     application        = 'projwfc.x'
-
+    #mth
     def post_analyze(self, analyzer) -> None:
         # try to write lowdin output data file
         try:
@@ -874,7 +874,7 @@ def generate_projwfc_input(
     return pp
 #end def generate_projwfc_input
 
-
+#mth
 def generate_projwfc(**kwargs) -> Projwfc:
     return generate_ppsim(generate_projwfc_input,Projwfc,**kwargs)
 #end def generate_projwfc
@@ -910,7 +910,7 @@ class Cppp(PostProcessSimulation):
 
 
 generate_cppp_input = CpppInput
-
+#mth
 def generate_cppp(**kwargs) -> Cppp:
     return generate_ppsim(CpppInput,Cppp,**kwargs)
 #end def generate_cppp
@@ -944,7 +944,7 @@ class Pwexport(PostProcessSimulation):
 
 
 generate_pwexport_input = PwexportInput
-
+#mth
 def generate_pwexport(**kwargs) -> Pwexport:
     return generate_ppsim(PwexportInput,Pwexport,**kwargs)
 #end def generate_pwexport
@@ -1105,11 +1105,11 @@ class Hp(PostProcessSimulation):
 
 #end class Projwfc
 
-
+#mth
 def generate_hp_input(
     prefix : str = 'pwscf',
     outdir : str = 'pwscf_output',
-    **vals,
+    **vals,  #th
     ) -> HpInput:
     pp = HpInput(
         prefix = prefix,
@@ -1119,7 +1119,7 @@ def generate_hp_input(
     return pp
 #end def generate_projwfc_input
 
-
+#mth
 def generate_hp(**kwargs):
     return generate_ppsim(generate_hp_input,Hp,**kwargs)
 #end def generate_projwfc

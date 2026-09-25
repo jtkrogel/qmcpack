@@ -111,30 +111,30 @@ class Pseudopotential(DevBase):
         return text
     #end def write
 
-
+    #mth
     def read_text(
         self,
         text     : str,
         format   : str | None        = None,
         filepath : str | Path | None = None,
-        ):
+        ):  #th
         raise NotImplementedError
     #end def read_text
-
+    #mth
     def write_text(self, format: str | None = None):
         raise NotImplementedError
     #end def write_text
-
+    #mth
     def convert(self, format: str):
         raise NotImplementedError
     #end def convert
-
+    #mth
     def plot(
         self,
         r    : np.ndarray | None = None,
         *,
         show : bool              = True,
-        ):
+        ):  #th
         raise NotImplementedError
     #end def plot
 #end class Pseudopotential
@@ -538,12 +538,13 @@ class SemilocalPP(Pseudopotential):
 
     # evaluate r*potential based on a potential component object
     #  component representation is specific to each derived class
+    #mth
     def evaluate_comp_rV(
         self,
         r     : np.ndarray | None,
         l     : str,
         vcomp : obj | np.ndarray,
-        ):
+        ):  #th
         raise NotImplementedError
     #end def evaluate_comp_rV
 
@@ -1305,17 +1306,19 @@ class SemilocalPP(Pseudopotential):
         # set the colormap and centre the colorbar
         import matplotlib.colors as colors
         class MidNorm(colors.Normalize):
+            #mth
             def __init__(
                 self,
-                vmin            = None,
-                vmax            = None,
-                midpoint        = None,
+                vmin            = None,  #th
+                vmax            = None,  #th
+                midpoint        = None,  #th
                 *,
                 clip     : bool = False,
                 ) -> None:
                 self.midpoint = midpoint
                 colors.Normalize.__init__(self, vmin, vmax, clip)
             #end def __init__
+            #mth
             def __call__(self, value, clip = None):
                 x, y = [self.vmin, self.midpoint, self.vmax], [0, 0.5, 1]
                 return np.ma.masked_array(np.interp(value, x, y), np.isnan(value))
@@ -1366,6 +1369,7 @@ class SemilocalPP(Pseudopotential):
         plt.legend()
 
         # function for a single polar plot
+        #mth
         def plot_V(V, label) -> None:
             vmin = V.min()
             vmax = V.max()
@@ -1824,6 +1828,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed for crystal
+    #mth
     def write_text(self, format: str | None = None, occ = None) -> str:
         text = ''
         format = format.lower()
@@ -2042,11 +2047,12 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
+    #mth
     def ppconvert(
         self,
         outfile : str,
-        ref,
-        extra = None,
+        ref,  #th
+        extra = None,  #th
         ) -> None:
         of = outfile.lower()
         if of.endswith('.xml'):
@@ -2237,6 +2243,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
+    #mth
     def is_truncated_L2(self):
         '''
         Determine if the Gaussian ECP's channels follow an L2 relationship.
@@ -2253,6 +2260,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
+    #mth
     def get_unboundedness(self, db, dbs) -> int | float:
         '''
         This function quantifies how unbounded a truncated L2 potential is.
@@ -2264,19 +2272,20 @@ class GaussianPP(SemilocalPP):
             raise RuntimeError(msg)
         #end if
         import math
+        #mth
         def poly(x, c):
             val=0
             for ci,cv in enumerate(c):
                 val+=cv*x**ci
             return val
         #end def
-
+        #mth
         def Rs(
-            x,
-            dx,
-            s,
-            c,
-            ):
+            x,  #th
+            dx,  #th
+            s,  #th
+            c,  #th
+            ):  #th
             if x+1-s<-dx:
                 return 0-(1-s)
             elif x+1-s>dx:
@@ -2355,11 +2364,12 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
+    #mth
     def make_L2_bounded(
         self,
-        db,
-        dbs,
-        exps0        = None,
+        db,  #th
+        dbs,  #th
+        exps0        = None,  #th
         *,
         plot  : bool = False,
         ) -> None:
@@ -2376,19 +2386,20 @@ class GaussianPP(SemilocalPP):
             msg = 'Please provide a set of exponents to be used for correction.'
             raise ValueError(msg)
         import math
+        #mth
         def poly(x, c):
             val=0
             for ci,cv in enumerate(c):
                 val+=cv*x**ci
             return val
         #end def
-
+        #mth
         def Rs(
-            x,
-            dx,
-            s,
-            c,
-            ):
+            x,  #th
+            dx,  #th
+            s,  #th
+            c,  #th
+            ):  #th
             if x+1-s<-dx:
                 return 0-(1-s)
             elif x+1-s>dx:
@@ -2400,34 +2411,34 @@ class GaussianPP(SemilocalPP):
 
             def __init__(self) -> None:
                 pass
-
+            #mth
             def gauss_correction(
                 self,
-                x,
-                c1,
-                c2,
-                c3,
-                ):
+                x,  #th
+                c1,  #th
+                c2,  #th
+                c3,  #th
+                ):  #th
                 val = 0
                 for ci,c in enumerate([c1,c2,c3]):
                     val+=x**2.*c*np.exp(-self.exps[ci]*x**2.)
                 #end for
                 return val
             #end def
-
+            #mth
             def gauss_correction_2_param(
                 self,
-                x,
-                c1,
-                c2,
-                ):
+                x,  #th
+                c1,  #th
+                c2,  #th
+                ):  #th
                 val = 0
                 for ci,c in enumerate([c1,c2]):
                     val+=x**2.*c*np.exp(-self.exps[ci]*x**2.)
                 #end for
                 return val
             #end def
-
+            #mth
             def gauss_correction_1_param(self, x, c1):
                 val = 0
                 for ci,c in enumerate([c1]):

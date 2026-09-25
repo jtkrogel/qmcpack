@@ -32,9 +32,10 @@ def float_diff(
 
 
 # determine if two values differ
+#mth
 def value_diff(
-    v1,
-    v2,
+    v1,  #th
+    v2,  #th
     atol         : float = def_atol,
     rtol         : float = def_rtol,
     *,
@@ -105,13 +106,13 @@ def value_diff(
 
 
 
-
+#mth
 def dict_serialize(
-    d,
-    serial                 = None,
+    d,  #th
+    serial                 = None,  #th
     path      : str | None = None,
-    dict_type              = None,
-    ):
+    dict_type              = None,  #th
+    ):  #th
     # serialize a dict-like object (flat string_path-value mapping)
     if dict_type is None:
         dict_type = d.__class__
@@ -135,9 +136,10 @@ def dict_serialize(
 
 
 # determine if two objects differ
+#mth
 def object_diff(
-    o1,
-    o2,
+    o1,  #th
+    o2,  #th
     atol         : float = def_atol,
     rtol         : float = def_rtol,
     *,
@@ -272,9 +274,10 @@ def text_diff(
 
 
 # print the difference between two objects
+#mth
 def print_diff(
-    o1,
-    o2,
+    o1,  #th
+    o2,  #th
     atol         : float = def_atol,
     rtol         : float = def_rtol,
     *,
@@ -305,6 +308,7 @@ def print_diff(
 
 
 # check for value equality and if different, print the difference
+#mth
 def check_value_eq(v1: set[Path], v2: set[Path], **kwargs) -> bool:
     verbose = kwargs.pop('verbose',False)
     same = value_eq(v1,v2,**kwargs)
@@ -324,6 +328,7 @@ def check_value_eq(v1: set[Path], v2: set[Path], **kwargs) -> bool:
 
 
 # check for object equality and if different, print the difference
+#mth
 def check_object_eq(o1, o2, **kwargs) -> bool:
     verbose = kwargs.pop('verbose',False)
     same = object_eq(o1,o2,**kwargs)
@@ -338,9 +343,10 @@ def check_object_eq(o1, o2, **kwargs) -> bool:
 
 # additional convenience functions to use value_diff and object_diff
 value_neq = value_diff
+#mth
 def value_eq(
-    v1,
-    v2,
+    v1,  #th
+    v2,  #th
     atol         : float = def_atol,
     rtol         : float = def_rtol,
     *,
@@ -350,6 +356,7 @@ def value_eq(
 #end def value_eq
 
 object_neq = object_diff
+#mth
 def object_eq(*args, **kwargs) -> bool:
     return not object_neq(*args,**kwargs)
 #end def object_eq

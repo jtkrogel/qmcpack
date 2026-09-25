@@ -26,12 +26,14 @@ unset = Unset()
 #===========================
 
 # decorator for type to function mapping special cases
+#mth
 def per_type_cmp(type_: type[dict]):
     try:
         mapping = per_type_cmp.mapping
     except AttributeError:
         mapping = per_type_cmp.mapping = {}
     #end try
+    #mth
     def decorator(cmpfunc):
         mapping[type_] = cmpfunc
         return cmpfunc
@@ -100,7 +102,7 @@ class python2_sort_key(object):
         return id(type(self)) < id(type(other))
     #end def __lt__
 #end class python2_sort_key
-
+#mth
 @per_type_cmp(dict)
 def dict_cmp(a: dict, b: dict, _s = object()) -> bool:
     if len(a) != len(b):
@@ -117,19 +119,19 @@ def dict_cmp(a: dict, b: dict, _s = object()) -> bool:
     #end if
     return python2_sort_key(a[adiff]) < python2_sort_key(b[bdiff])
 #end def dict_cmp
-
+#mth
 def sorted_py2(iterable) -> list[int | str | tuple[int, int, int]]:
     return sorted(iterable,key=python2_sort_key)
 #end def sorted_py2
 #===========================
 
 
-
+#mth
 def save(o, filepath: str | Path) -> None:
     with open(filepath,'wb') as f:
         binary = pickle.HIGHEST_PROTOCOL
         pickle.dump(o,f,binary)
-
+#mth
 def load(filepath: str | Path):
     with open(filepath,'rb') as f:
         dl = pickle.load(f)
@@ -222,6 +224,7 @@ class dotdict(dict):
     >>> data.extra
     1
     """
+    #mth
     def __getattr__(self, item: str):
         return self[item]
     __setattr__ = dict.__setitem__
@@ -302,29 +305,44 @@ class obj:
       end o2
     """
     # dict interface
+    #mth
     @classmethod
     def fromkeys(cls, keys, value = None) -> obj:
         return cls(dict.fromkeys(keys, value))
-
+    #mth
     def __init__(self, *args, **kwargs) -> None:   self.__dict__.update(dict(*args,**kwargs))
+    #mth
     def items(self):              return self.__dict__.items()
     def clear(self) -> None:              return self.__dict__.clear()
+    #mth
     def copy(self):               return self.__class__(self.__dict__)
+    #mth
     def get(self, *a, **kw):        return self.__dict__.get(*a,**kw)
+    #mth
     def keys(self):               return self.__dict__.keys()
+    #mth
     def pop(self, *a, **kw):        return self.__dict__.pop(*a,**kw)
+    #mth
     def values(self):             return self.__dict__.values()
+    #mth
     def popitem(self, *a, **kw) -> tuple[str, int] | None:    return self.__dict__.popitem(*a,**kw)
+    #mth
     def setdefault(self, *a, **kw) -> int: return self.__dict__.setdefault(*a,**kw)
+    #mth
     def update(self, *a, **kw) -> None:     return self.__dict__.update(*a,**kw)
 
     # basic functions, including dot access
     def __len__(self) -> int:               return len(self.__dict__)
+    #mth
     def __contains__(self, key) -> bool:      return key in self.__dict__
+    #mth
     def __getitem__(self, key):       return self.__dict__[key]
+    #mth
     def __setitem__(self, key, value) -> None: self.__dict__[key]=value
     def __delitem__(self, key: int | str | tuple[str, str, str]) -> None:       del self.__dict__[key]
+    #mth
     def __eq__(self, other) -> bool:          return self.__dict__==other
+    #mth
     def __iter__(self):              return iter(self.__dict__)
 
     # pretty print
@@ -337,17 +355,27 @@ class obj:
 class DevBase:
     # similar to/same as dict
     def __len__(self) -> int:               return len(self.__dict__)
+    #mth
     def __contains__(self, key) -> bool:      return key in self.__dict__
+    #mth
     def __getitem__(self, key):       return self.__dict__[key]
+    #mth
     def __setitem__(self, key, value) -> None: self.__dict__[key]=value
+    #mth
     def __delitem__(self, key) -> None:       del self.__dict__[key]
+    #mth
     def keys(self):                  return self.__dict__.keys()
+    #mth
     def values(self):                return self.__dict__.values()
+    #mth
     def items(self):                 return self.__dict__.items()
+    #mth
     def update(self, *a, **kw):        return self.__dict__.update(*a,**kw)
+    #mth
     def clear(self):                 return self.__dict__.clear()
 
     # protect against bare iteration
+    #mth
     def __iter__(self):
         raise RuntimeError('DevBase does not support bare iteration')
 
@@ -356,9 +384,13 @@ class DevBase:
     __str__  = _pp_str
 
     # protected dict interface
+    #mth
     def _keys(self):               return self.__dict__.keys()
+    #mth
     def _values(self):             return self.__dict__.values()
+    #mth
     def _items(self):              return self.__dict__.items()
+    #mth
     def _update(self, *a, **kw: int) -> None:     return self.__dict__.update(*a,**kw)
     def _clear(self) -> None:              return self.__dict__.clear()
 

@@ -85,20 +85,20 @@ import numpy as np
 
 type DensityArg = list[float] | np.ndarray | None
 
-
+#mth
 def h5_int(val) -> int:
     return int(np.array(val))
 #end def h5_int
-
+#mth
 def h5_float(val) -> float:
     return float(np.array(val))
 #end def h5_float
-
+#mth
 def h5_array(val) -> np.ndarray:
     return np.array(val)
 #end def h5_array
 
-
+#mth
 def first(d):
     return d[min(d.keys())]
 
@@ -135,7 +135,7 @@ def input_list(s: str) -> list[str]:
 #end def input_list
 
 
-
+#mth
 def qmcpack_filepath(basepath: str | Path, tokens, g: str | None = None) -> str:
     file = ''
     for t in tokens:
@@ -206,13 +206,13 @@ class QDBase(DevBase):
     verbose = None
     options = obj()
     parser  = None
-
+    #mth
     def vlog(self, *args, **kwargs) -> None:
         if self.verbose:
             DevBase.nxs_print(self,*args,**kwargs)
         #end if
     #end def vlog
-
+    #mth
     def vmlog(self, *args, **kwargs) -> None:
         args = list(args)+[' (memory %3.2f MB)'%(memory.resident(children=True)/1e6)]
         self.vlog(*args,**kwargs)
@@ -223,6 +223,7 @@ class QDBase(DevBase):
     #end def help
 
     # options accessor functions
+    #mth
     def get_cell(self):
         if opt.structure is not None:
             cell = opt.structure.axes
@@ -311,13 +312,13 @@ class SingleDensity(QDBase):
         #end if
     #end def __init__
 
-
+    #mth
     def check_type(
         self,
         name       : str,
         value      : str | np.ndarray | Structure | None,
         stypes     : str,
-        types,
+        types,  #th
         allow_none : bool = True,
         ) -> None:
         if allow_none and value is None:
@@ -601,7 +602,7 @@ class StatFile(QDBase):
         h5.close()
     #end def write
 
-
+    #mth
     def accumulate(self, stat, weight: float = 1.0) -> None:
         if 'total_weight' not in self:
             self.total_weight = 0.0
@@ -726,7 +727,7 @@ class StatFile(QDBase):
         #end if
     #end def check_grid
 
-
+    #mth
     def analyze(self, equilibration: int = 0, reblock_factor = None) -> None:
         if not self.has_data():
             msg = 'cannot analyze results, data is not present'
@@ -950,7 +951,7 @@ class QMCDensityProcessor(QDBase):
         self.stat_files = obj()
     #end def __init__
 
-
+    #mth
     def estimator_children(self, estimators):
         """Return estimator-name/XML pairs from a pluralized container.
 
@@ -980,10 +981,10 @@ class QMCDensityProcessor(QDBase):
         return tuple(bconds)
     #end def get_input_bconds
 
-
+    #mth
     def add_density_metadata(
         self,
-        estimators,
+        estimators,  #th
         metadata       : obj,
         structure      : Structure,
         bconds         : tuple[str, str, str],

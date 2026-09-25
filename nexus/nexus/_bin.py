@@ -6,7 +6,7 @@ from os import PathLike
 from pathlib import Path
 
 bin_dir = Path(__file__).parent/"bin"
-
+#mth
 def run(script_name) -> None:
     script_path = bin_dir/script_name
     result = subprocess.run([script_path] + sys.argv[1:])

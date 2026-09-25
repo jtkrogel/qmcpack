@@ -65,13 +65,14 @@ class NexusUserWarning(NexusDevWarning):
 
 
 # Hook for replacing `warnings.showwarning`
+#mth
 def __nexus_showwarning(
-    message,
-    category,
+    message,  #th
+    category,  #th
     filename : str,
     lineno   : int,
-    file = None,
-    line = None,
+    file = None,  #th
+    line = None,  #th
     ) -> None:  # noqa: ARG001
     if file is None:
         file = sys.stdout
@@ -112,16 +113,16 @@ warnings.showwarning = __nexus_showwarning
 
 exit_call = sys.exit
 
-
+#mth
 def nocopy(value):
     return value
 #end def nocopy
 
-
+#mth
 def nxs_print(
-    *items,
+    *items,  #th
     indent  : str | None = None,
-    logfile              = None,
+    logfile              = None,  #th
     n       : int        = 0,
     ) -> None:
     logfile = logfile if logfile is not None else sys.stdout
@@ -148,13 +149,13 @@ def nxs_print(
     logfile.write(s)
 #end def log
 
-
+#mth
 def message(
     msg         : str,
     header      : str | None = None,
     post_header : str        = ' message:',
     indent      : str        = '    ',
-    logfile                  = None,
+    logfile                  = None,  #th
     ) -> None:
     if logfile is None:
         logfile = sys.stdout
@@ -231,12 +232,12 @@ def warn(
             warnings.warn(msg, stacklevel=3)
 #end def warn
 
-
+#mth
 def nxs_deprecate(
     since       : str,
     replacement : str,
     indent      : str = "    ",
-    ):
+    ):  #th
     """Decorator for signaling the deprecation of a Nexus function.
 
     This should itself be deprecated when the minimum Python version is
@@ -251,7 +252,9 @@ def nxs_deprecate(
     indent : str, default = "    "
         Indentation to go before the warning.
     """
+    #mth
     def inner(f):
+        #mth
         @functools.wraps(f)
         def wrapper(*args, **kwargs):
             warn_msg = f"{f.__qualname__} is deprecated as of Nexus version {since}, and will be removed in a future update."

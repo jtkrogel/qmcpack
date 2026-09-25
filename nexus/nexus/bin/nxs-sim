@@ -80,7 +80,7 @@ class SimTool(obj):
         self.sims  = []
     #end def __init__
 
-
+    #mth
     def load(self, paths) -> None:
         for path in paths:
             sim = load(path)
@@ -151,7 +151,7 @@ class SimTool(obj):
         #end for
     #end def restore
 
-
+    #mth
     def set_indicators(self, inds, val: int = 1) -> None:
         if len(inds)==0:
             msg = (

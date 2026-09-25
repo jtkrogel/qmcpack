@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-
+#mth
 def reshape_inplace(arr: np.ndarray, *new_shape) -> None:
     if len(new_shape) == 1 and hasattr(new_shape[0], "__iter__"):
         new_shape = new_shape[0]

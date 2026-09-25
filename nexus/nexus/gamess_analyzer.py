@@ -30,11 +30,11 @@ from pathlib import Path
 type AnalyzerArg = str | Path | Simulation | None
 
 
-
+#mth
 def assign_value(
-    host,
-    dest,
-    file,
+    host,  #th
+    dest,  #th
+    file,  #th
     string : str,
     ) -> None:
     if file.seek(string)!=-1:
@@ -69,7 +69,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end for
 
 
-
+    #mth
     def __init__(
         self,
         arg0           : AnalyzerArg = None,
@@ -77,7 +77,7 @@ class GamessAnalyzer(SimulationAnalyzer):
         *,
         analyze        : bool        = False,
         exit           : bool        = False,
-        **outfilenames,
+        **outfilenames,  #th
         ) -> None:
         self.info = obj(
             exit   = exit,

@@ -29,7 +29,7 @@ from .debug import ci
 type VecArg = list[float] | tuple[float, ...] | np.ndarray | None
 
 
-
+#mth
 def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
@@ -126,13 +126,14 @@ class VLog(DevBase):
 vlog = VLog()
 
 
-
+#mth
 def set_verbosity(level) -> None:
     vlog.set_verbosity(level)
 #end def set_verbosity
 
 
 class Missing:
+    #mth
     def __call__(self, value) -> bool:
         return isinstance(value,Missing)
     #end def __call__
@@ -142,6 +143,7 @@ missing = Missing()
 
 
 class AttributeProperties(DevBase):
+    #mth
     def __init__(self, **kwargs) -> None:
         self.assigned   = set(kwargs.keys())
         self.name       = kwargs.pop('name'      , None )
@@ -166,12 +168,12 @@ class AttributeProperties(DevBase):
 
 
 class DefinedAttributeBase(DevBase):
-
+    #mth
     @classmethod
     def set_unassigned_default(cls, default) -> None:
         cls.unassigned_default = default
     #end def set_unassigned_default
-
+    #mth
     @classmethod
     def define_attributes(cls, *other_cls, **attribute_properties: dict) -> None:
         if len(other_cls)==1 and issubclass(other_cls[0],DefinedAttributeBase):
@@ -234,7 +236,7 @@ class DefinedAttributeBase(DevBase):
             setattr(cls,k,v)
     #end def define_attributes
 
-
+    #mth
     @classmethod
     def obtain_attributes(cls, super_cls) -> None:
         setattr(cls,'attribute_definitions',deepcopy(super_cls.attribute_definitions))
@@ -248,7 +250,7 @@ class DefinedAttributeBase(DevBase):
         #end if
     #end def __init__
 
-
+    #mth
     def initialize(self, **values) -> None:
         self.set_default_attributes()
         if len(values)>0:
@@ -366,14 +368,14 @@ class DefinedAttributeBase(DevBase):
         return valid
     #end def check_attributes
 
-
+    #mth
     def check_unassigned(self, value) -> bool:
         cls = self.__class__
         unassigned = hasattr(cls,'unassigned_default') and value is cls.unassigned_default
         return unassigned
     #end def check_unassigned
 
-
+    #mth
     def set_attribute(self, name: str, value) -> None:
         cls = self.__class__
         props = cls.attribute_definitions
@@ -409,14 +411,14 @@ class DefinedAttributeBase(DevBase):
         #end if
     #end def set_attribute
 
-
+    #mth
     def get_attribute(
         self,
         name     : str,
         value    : int | Missing = missing,
         *,
         assigned : bool          = True,
-        ):
+        ):  #th
         default_value    = value
         default_provided = not missing(default_value)
         require_assigned = assigned and not default_provided
@@ -524,10 +526,11 @@ class DefinedAttributeBase(DevBase):
 
 
 class Observable(DefinedAttributeBase):
+    #mth
     def __init__(self, **values) -> None:
         self.initialize(**values)
     #end def __init__
-
+    #mth
     def initialize(self, **values) -> None:
         DefinedAttributeBase.initialize(self,**values)
         if len(values)>0:
@@ -563,7 +566,7 @@ class ObservableWithComponents(Observable):
     component_names        = None
     default_component_name = None
 
-
+    #mth
     def process_component_name(self, name) -> str | None:
         if name is None:
             name = self.default_component_name
@@ -577,12 +580,12 @@ class ObservableWithComponents(Observable):
         return name
     #end def process_component_name
 
-
+    #mth
     def default_component(self):
         return self.component(self.default_component_name)
     #end def default_component
 
-
+    #mth
     def component(self, name):
         if name is None:
             return self.default_component()
@@ -639,9 +642,9 @@ class ObservableWithComponents(Observable):
 
 
 
-
+#mth
 def read_eshdf_nofk_data(filename: str, Ef) -> obj:
-
+    #mth
     def h5int(i):
         return np.array(i,dtype=int)[0]
     #end def h5int
@@ -738,7 +741,7 @@ class MomentumDistribution(ObservableWithComponents):
     component_names = ('tot','pol','u','d')
 
     default_component_name = 'tot'
-
+    #mth
     def get_raw_data(self):
         data = self.get_attribute('raw')
         if len(data)==0:
@@ -887,11 +890,11 @@ class MomentumDistribution(ObservableWithComponents):
         sys.exit()
     #end def backfold
 
-
+    #mth
     def plot_plane_contours(
         self,
         quantity     : str | None      = None,
-        origin                         = None,
+        origin                         = None,  #th
         a1           : VecArg          = None,
         a2           : VecArg          = None,
         a1_range     : tuple[int, int] = (0,1),
@@ -933,11 +936,11 @@ class MomentumDistribution(ObservableWithComponents):
         gf.plot_contours(boundary=boundary)
     #end def plot_plane_contours
 
-
+    #mth
     def plot_radial_raw(
         self,
         quants : str  = 'all',
-        kmax          = None,
+        kmax          = None,  #th
         fmt    : str  = 'b.',
         *,
         fig    : bool = True,
@@ -980,12 +983,12 @@ class MomentumDistribution(ObservableWithComponents):
         #end if
     #end def plot_radial_raw
 
-
+    #mth
     def plot_directional_raw(
         self,
-        kdir,
+        kdir,  #th
         quants  : str  = 'all',
-        kmax           = None,
+        kmax           = None,  #th
         fmt     : str  = 'b.',
         *,
         fig     : bool = True,
@@ -1081,11 +1084,11 @@ MomentumDistribution.define_attributes(
 
 
 class MomentumDistributionDFT(MomentumDistribution):
-
+    #mth
     def read_eshdf(
         self,
         filepath : str | Path,
-        E_fermi                      = None,
+        E_fermi                      = None,  #th
         savefile : str | Path | None = None,
         *,
         unfold   : bool              = False,
@@ -1177,9 +1180,10 @@ MomentumDistributionDFT.define_attributes(
 
 
 class MomentumDistributionQMC(MomentumDistribution):
+    #mth
     def read_stat_h5(
         self,
-        *files,
+        *files,  #th
         equil    : int               = 0,
         savefile : str | Path | None = None,
         ) -> None:
@@ -1249,7 +1253,7 @@ class Density(ObservableWithComponents):
 
     default_component_name = 'tot'
 
-
+    #mth
     def read_xsf(self, filepath: XsfFile, component = None) -> None:
         component = self.process_component_name(component)
 
@@ -1353,7 +1357,7 @@ class Density(ObservableWithComponents):
         self.set_attribute('density_units',units) # Update the object info to reflect the conversion
     #end def change_density_units
 
-
+    #mth
     def radial_density(
         self,
         component     : str | None                       = None,
@@ -1362,7 +1366,7 @@ class Density(ObservableWithComponents):
         rmax          : list[str | np.float64] | None    = None,
         *,
         single        : bool                             = False,
-        interp_kwargs                                    = None,
+        interp_kwargs                                    = None,  #th
         comps_return  : bool                             = False,
         species       : list[int | str | np.str_] | None = None,
         ) -> obj:
@@ -1464,10 +1468,10 @@ class Density(ObservableWithComponents):
         #end if
     #end def radial_density
 
-
+    #mth
     def cumulative_radial_density(
         self,
-        rdfs                = None,
+        rdfs                = None,  #th
         *,
         comps_return : bool = False,
         **kwargs     : list[np.float64 | np.str_],
@@ -1492,14 +1496,14 @@ class Density(ObservableWithComponents):
         #end if
     #end def cumulative_radial_density
 
-
+    #mth
     def plot_radial_density(
         self,
-        component         = None,
+        component         = None,  #th
         *,
         show       : bool = True,
         cumulative : bool = False,
-        **kwargs,
+        **kwargs,  #th
         ) -> None:
         import matplotlib.pyplot as plt
         vlog('Plotting radial density')
@@ -1545,12 +1549,12 @@ class Density(ObservableWithComponents):
         #end if
     #end def plot_radial_density
 
-
+    #mth
     def save_radial_density(
         self,
         prefix   : str,
-        rdfs = None,
-        **kwargs,
+        rdfs = None,  #th
+        **kwargs,  #th
         ) -> None:
         path = ''
         if '/' in prefix:
@@ -1662,7 +1666,7 @@ class StatFile(DevBase):
         observable_class_to_stat_group[cls.__name__] = name
     #end for
 
-
+    #mth
     def __init__(self, filepath: str | Path | None = None, **read_kwargs) -> None:
         self.filepath = None
 
@@ -1719,13 +1723,13 @@ class StatFile(DevBase):
         return name.lower().replace('_','')
     #end def condenst_name
 
-
+    #mth
     def observable_groups(
         self,
         observable : Observable,
         *,
         single     : bool = False,
-        ):
+        ):  #th
         if inspect.isclass(observable):
             observable = observable.__name__
         elif isinstance(observable,Observable):

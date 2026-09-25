@@ -92,6 +92,7 @@ type FilesRet = tuple[str | None, str | None, str | None]
 
 
 class SimulationInput(NexusCore):
+    #mth
     def is_valid(self):
         raise NotImplementedError
     #end def is_valid
@@ -137,25 +138,25 @@ class SimulationInput(NexusCore):
     def return_structure(self) -> Structure | None:
         return self.return_system(structure_only=True)
     #end def return_structure
-
+    #mth
     def read_text(self, text: str, filepath: str | None = None):
         raise NotImplementedError
     #end def read_text
-
+    #mth
     def write_text(self, filepath: str | Path | None = None):
         raise NotImplementedError
     #end def write_text
-
+    #mth
     def incorporate_system(self, system: PhysicalSystem):
         #take information from a physical system object and fill in input file
         raise NotImplementedError
     #end def incorporate_system
-
+    #mth
     def return_system(
         self,
         *,
         structure_only : bool = False,
-        ):
+        ):  #th
         #create a physical system object from input file information
         raise NotImplementedError
     #end def return_system
@@ -165,10 +166,11 @@ class SimulationInput(NexusCore):
 
 
 class SimulationAnalyzer(NexusCore):
+    #mth
     def __init__(self, sim: Simulation):
         raise NotImplementedError
     #end def __init__
-
+    #mth
     def analyze(self):
         raise NotImplementedError
     #end def analyze
@@ -178,6 +180,7 @@ class SimulationAnalyzer(NexusCore):
 
 
 class SimulationEmulator(NexusCore):
+    #mth
     def run(self):
         raise NotImplementedError
     #end def run
@@ -319,13 +322,14 @@ class Simulation(NexusCore):
     #end def code_name
 
     # test needed
+    #mth
     @classmethod
     def separate_inputs(
         cls,
-        kwargs,
+        kwargs,  #th
         overlapping_kw : int = -1,
-        sim_kw               = None,
-        ):
+        sim_kw               = None,  #th
+        ):  #th
         if overlapping_kw==-1:
             overlapping_kw = {'system'}
         elif overlapping_kw is None:
@@ -364,7 +368,7 @@ class Simulation(NexusCore):
         return sim_args,inp_args
     #end def separate_inputs
 
-
+    #mth
     def __init__(self, **kwargs) -> None:
         #user specified variables
         self.path          = ''     #directory where sim will be run
@@ -483,7 +487,7 @@ class Simulation(NexusCore):
         self.app_name = app_name
     #end def set_app_name
 
-
+    #mth
     def set(self, **kw) -> None:
         cls = self.__class__
         if 'dependencies' in kw:
@@ -668,32 +672,32 @@ class Simulation(NexusCore):
         return ready
     #end def ready
 
-
+    #mth
     def check_result(self, result_name: str, sim: Simulation):
         raise NotImplementedError
     #end def check_result
-
+    #mth
     def get_result(self, result_name: str, sim: Simulation):
         raise NotImplementedError
     #end def get_result
-
+    #mth
     def incorporate_result(
         self,
         result_name : str,
         result      : obj,
         sim         : Simulation,
-        ):
+        ):  #th
         raise NotImplementedError
     #end def incorporate_result
-
+    #mth
     def app_command(self):
         raise NotImplementedError
     #end def app_command
-
+    #mth
     def check_sim_status(self):
         raise NotImplementedError
     #end def check_sim_status
-
+    #mth
     def get_output_files(self): # returns list of output files to save
         raise NotImplementedError
     #end def get_output_files
@@ -734,7 +738,7 @@ class Simulation(NexusCore):
     def pre_check_status(self) -> None:
         pass
     #end def pre_check_status
-
+    #mth
     def post_analyze(self, analyzer) -> None:
         pass
     #end def post_analyze
@@ -785,7 +789,7 @@ class Simulation(NexusCore):
         self.created_directories = True
     #end def create_directories
 
-
+    #mth
     def depends(self, *dependencies) -> None:
         if nexus_config.dynamic:
             msg = 'dynamic workflows do not allow explicit dependencies between simulations'
@@ -1044,7 +1048,7 @@ class Simulation(NexusCore):
         #end if
     #end def load_image
 
-
+    #mth
     def load_analyzer_image(self, imagepath = None) -> SimulationAnalyzer | None:
         if imagepath is None:
             imagepath = os.path.join(self.imresdir,self.analyzer_image)
@@ -1054,7 +1058,7 @@ class Simulation(NexusCore):
         return analyzer
     #end def load_analyzer_image
 
-
+    #mth
     def save_analyzer_image(self, analyzer) -> None:
         analyzer.save(os.path.join(self.imresdir,self.analyzer_image))
     #end def save_analyzer_image
@@ -1480,11 +1484,11 @@ class Simulation(NexusCore):
         return self
     #end def reconstruct_cascade
 
-
+    #mth
     def traverse_cascade(
         self,
-        operation,
-        *args,
+        operation,  #th
+        *args,  #th
         **kwargs  : int | str,
         ) -> None:
         if 'dependency_id' in kwargs:
@@ -1502,11 +1506,12 @@ class Simulation(NexusCore):
 
 
     # used only in tests
+    #mth
     def traverse_full_cascade(
         self,
-        operation,
-        *args,
-        **kwargs,
+        operation,  #th
+        *args,  #th
+        **kwargs,  #th
         ) -> None:
         operation(self,*args,**kwargs)
         for sim in self.dependents.values():
@@ -1541,7 +1546,7 @@ class Simulation(NexusCore):
         #end for
     #end def write_dependents
 
-
+    #mth
     def execute(self, run_command = None) -> None:
         pad = self.enter(self.locdir)
         if run_command is None:
@@ -1598,11 +1603,11 @@ class Simulation(NexusCore):
 
 
     # dynamic workflow support
-
+    #mth
     def fill_produces(self):
         raise NotImplementedError('fill_produces')
     #end def fill_produces
-
+    #mth
     def fill_products(self):
         raise NotImplementedError('fill_products')
     #end def fill_products
@@ -1626,15 +1631,15 @@ class NullSimulationInput(SimulationInput):
     def read(self, filepath: str | Path | None) -> None:
         pass
     #end def read
-
+    #mth
     def write(self, filepath = None) -> None:
         pass
     #end def write
-
+    #mth
     def read_text(self, text: str | list[str], filepath = None) -> None:
         pass
     #end def read_text
-
+    #mth
     def write_text(self, filepath = None) -> None:
         pass
     #end def write_text
@@ -1642,7 +1647,7 @@ class NullSimulationInput(SimulationInput):
     def incorporate_system(self, system: PhysicalSystem) -> None:
         pass
     #end def incorporate_system
-
+    #mth
     def return_system(self):
         raise NotImplementedError
     #end def return_system
@@ -1652,6 +1657,7 @@ class NullSimulationInput(SimulationInput):
 
 
 class NullSimulationAnalyzer(SimulationAnalyzer):
+    #mth
     def __init__(self, sim) -> None:
         pass
     #end def __init__
@@ -1669,7 +1675,7 @@ class GenericSimulationInput: # marker class for generic user input
 
 class GenericSimulation(Simulation):
     allowed_inputs = Simulation.allowed_inputs | {'outfiles'}
-
+    #mth
     def __init__(self, **kwargs) -> None:
         import os
         self.outfiles = kwargs.pop('outfiles',[])
@@ -1777,7 +1783,7 @@ class SimulationInputTemplateDev(SimulationInput):
         #end if
         self.values.update(**values)
     #end def assign
-
+    #mth
     def read_text(self, text: str | list[str], filepath = None) -> None:
         text = self.preprocess(text,filepath) # for derived class intervention
         try:
@@ -1800,7 +1806,7 @@ class SimulationInputTemplateDev(SimulationInput):
         #end for
         self.template = template
     #end def read_text
-
+    #mth
     def write_text(self, filepath = None) -> str:
         kw_rem = self.keywords-set(self.values.keys())
         if len(kw_rem)>0:
@@ -1878,7 +1884,7 @@ class SimulationInputMultiTemplateDev(SimulationInput):
         self.set_templates(**templates)
     #end def read
 
-
+    #mth
     def write(self, filepath = None) -> obj:
         if filepath is None:
             contents = obj()
@@ -1909,15 +1915,15 @@ class SimulationInputMultiTemplate(SimulationInputMultiTemplateDev,GenericSimula
 
 
 # developer functions
-
+#mth
 def input_template_dev(*args, **kwargs) -> SimulationInputTemplateDev:
     return SimulationInputTemplateDev(*args,**kwargs)
 #end def input_template_dev
 
-
+#mth
 def multi_input_template_dev(
-    *args,
-    **kwargs,
+    *args,  #th
+    **kwargs,  #th
     ) -> SimulationInputMultiTemplateDev:
     return SimulationInputMultiTemplateDev(*args,**kwargs)
 #end def multi_input_template_dev
@@ -1933,23 +1939,23 @@ def input_template(*args: Path, **kwargs: str) -> SimulationInputTemplate:
     return SimulationInputTemplate(*args,**kwargs)
 #end def input_template
 
-
+#mth
 def multi_input_template(
-    *args,
+    *args,  #th
     **kwargs : str | tuple[str, Path],
     ) -> SimulationInputMultiTemplate:
     return SimulationInputMultiTemplate(*args,**kwargs)
 #end def multi_input_template
 
-
+#mth
 def generate_template_input(*args, **kwargs) -> SimulationInputTemplate:
     return SimulationInputTemplate(*args,**kwargs)
 #end def generate_template_input
 
-
+#mth
 def generate_multi_template_input(
-    *args,
-    **kwargs,
+    *args,  #th
+    **kwargs,  #th
     ) -> SimulationInputMultiTemplate:
     return SimulationInputMultiTemplate(*args,**kwargs)
 #end def generate_multi_template_input
@@ -1973,9 +1979,10 @@ def generate_simulation(**kwargs: KwargsT) -> GenericSimulation | None:
 
 # ability to graph simulation workflows
 exit_call = sys.exit
+#mth
 def graph_sims(
     sims     : list | None = None,
-    savefile               = None,
+    savefile               = None,  #th
     *,
     useid    : bool        = False,
     exit     : bool        = True,
@@ -2080,7 +2087,7 @@ class DynamicProcess(DevBase):
         'wavefunction',
         'pwscf_orbitals', # explicit QE
         })
-
+    #mth
     @classmethod
     def check_first_gen(cls, kw) -> tuple[None, obj | None]:
         nc_loc     = nexus_config.local_directory
@@ -2110,11 +2117,11 @@ class DynamicProcess(DevBase):
         return dp,dyn_args
     #end def check_first_gen
 
-
+    #mth
     def __init__(
         self,
         dpid     : tuple[str, str, str],
-        sim,
+        sim,  #th
         requires : str | tuple[str, str],
         ) -> None:
         # check dynamic id
@@ -2203,7 +2210,7 @@ class DynamicProcess(DevBase):
             self.reqs_met = reqs_met
         return reqs_met
     #end def requirements_met
-
+    #mth
     def _check_get_product(self, prod_name):
         '''Support product getter functions
 
@@ -2234,11 +2241,11 @@ class DynamicProcess(DevBase):
         return sim.products[prod_name]
     #end def _check_get_product
 
-
+    #mth
     def _check_set_requirement(
         self,
-        req_name,
-        req_value         = None,
+        req_name,  #th
+        req_value         = None,  #th
         req_type  : tuple = str,
         *,
         is_path   : bool  = False,
@@ -2301,32 +2308,33 @@ class DynamicProcess(DevBase):
     #@property
     #def produces(self):
     #    return self.sim.produces
-
+    #mth
     @property
     def products(self):
         return self.sim.products
 
     # getters for all possible requirements (subset of products)
+    #mth
     @property
     def structure(self):
         return self._check_get_product('structure')
-
+    #mth
     @property
     def charge_density(self):
         return self._check_get_product('charge_density')
-
+    #mth
     @property
     def orbitals(self):
         return self._check_get_product('orbitals')
-
+    #mth
     @property
     def jastrow(self):
         return self._check_get_product('jastrow')
-
+    #mth
     @property
     def wavefunction(self):
         return self._check_get_product('wavefunction')
-
+    #mth
     @property
     def pwscf_orbitals(self):
         return self._check_get_product('pwscf_orbitals')
@@ -2345,7 +2353,7 @@ class DynamicProcess(DevBase):
             struct = deepcopy(struct)
         self.sim.receive_structure(struct)
     #end def structure
-
+    #mth
     @charge_density.setter
     def charge_density(self, charge_density) -> None:
         already_set = self._check_set_requirement(
@@ -2354,7 +2362,7 @@ class DynamicProcess(DevBase):
             return
         self.sim.receive_charge_density(charge_density)
     #end def charge_density
-
+    #mth
     @orbitals.setter
     def orbitals(self, orbitals) -> None:
         already_set = self._check_set_requirement(
@@ -2363,7 +2371,7 @@ class DynamicProcess(DevBase):
             return
         self.sim.receive_orbitals(orbitals)
     #end def orbitals
-
+    #mth
     @jastrow.setter
     def jastrow(self, jastrow) -> None:
         already_set = self._check_set_requirement(
@@ -2372,7 +2380,7 @@ class DynamicProcess(DevBase):
             return
         self.sim.receive_jastrow(jastrow)
     #end def jastrow
-
+    #mth
     @wavefunction.setter
     def wavefunction(self, wavefunction) -> None:
         already_set = self._check_set_requirement(
@@ -2381,7 +2389,7 @@ class DynamicProcess(DevBase):
             return
         self.sim.receive_wavefunction(wavefunction)
     #end def wavefunction
-
+    #mth
     @pwscf_orbitals.setter
     def pwscf_orbitals(self, pwscf_orbitals) -> None:
         already_set = self._check_set_requirement(
@@ -2394,14 +2402,15 @@ class DynamicProcess(DevBase):
 
     # preserve Simulation UI
     #   data fields and functions
+    #mth
     @property
     def simid(self):
         return self.sim.simid
-
+    #mth
     @property
     def identifier(self):
         return self.sim.identifier
-
+    #mth
     @property
     def job(self):
         return self.sim.job
@@ -2409,56 +2418,58 @@ class DynamicProcess(DevBase):
     @property
     def input(self) -> SimulationInput:
         return self.sim.input
-
+    #mth
     @input.setter
     def input(self, input) -> None:
         self.sim.input = input
 
     def show_input(self) -> None:
         self.sim.show_input()
-
+    #mth
     @property
     def system(self):
         return self.sim.system
-
+    #mth
     @property
     def analyzer_image(self):
         return self.sim.analyzer_image
 
     #   status_flags
+    #mth
     @property
     def setup(self):
         return self.sim.setup
-
+    #mth
     @property
     def sent_files(self):
         return self.sim.sent_files
-
+    #mth
     @property
     def submitted(self):
         return self.sim.submitted
-
+    #mth
     @property
     def finished(self):
         return self.sim.finished
-
+    #mth
     @property
     def got_output(self):
         return self.sim.got_output
-
+    #mth
     @property
     def analyzed(self):
         return self.sim.analyzed
-
+    #mth
     @property
     def failed(self):
         return self.sim.failed
 
     # execution modification
+    #mth
     @property
     def skip_submit(self):
         return self.sim.skip_submit
-
+    #mth
     @property
     def block(self):
         return self.sim.block
@@ -2482,18 +2493,19 @@ class DynamicProcess(DevBase):
 
 class sim_err_handler:
     """Context manager for simulation-specific error handling/logging."""
+    #mth
     def __init__(self, sim) -> None:
         self.sim = sim
         self.logfile = Path(sim.remdir).resolve() / sim.nexus_logfile
 
     def __enter__(self) -> None:
         pass
-
+    #mth
     def __exit__(
         self,
-        exc_type,
-        exc_value,
-        exc_tb,
+        exc_type,  #th
+        exc_value,  #th
+        exc_tb,  #th
         ) -> bool:
         if exc_type is None:
             return True

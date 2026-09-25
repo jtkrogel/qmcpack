@@ -123,10 +123,11 @@ def get_cpu_cores() -> int:
 
 
 class Options(DevBase):
+    #mth
     def __init__(self, **kwargs) -> None:
         self.add(**kwargs)
     #end def __init__
-
+    #mth
     def add(self, **kwargs) -> None:
         for k,v in kwargs.items():
             self[k] = v
@@ -455,7 +456,7 @@ class Job(NexusCore):
         return time
     #end def zero_time
 
-
+    #mth
     def __init__(self, **kwargs) -> None:
         # guard against invalid keys
         invalid = set(kwargs.keys())-set(job_defaults.keys())
@@ -595,12 +596,12 @@ class Job(NexusCore):
 
     #end def __init__
 
-
+    #mth
     def get_machine(self):
         return Machine.get(self.machine)
     #end def get_machine
 
-
+    #mth
     def process(self, machine = None) -> None:
         if self.template is not None:
             return
@@ -613,6 +614,7 @@ class Job(NexusCore):
 
 
     # test needed
+    #mth
     def process_options(self, machine = None) -> None:
         if self.template is not None:
             return
@@ -625,6 +627,7 @@ class Job(NexusCore):
 
 
     # test needed
+    #mth
     def initialize(self, sim) -> None:
         self.set_id()
         self.identifier = sim.identifier
@@ -685,6 +688,7 @@ class Job(NexusCore):
 
 
     # test needed
+    #mth
     def renew_app_command(self, sim) -> None:
         if not self.user_app_command:
             self.app_command = sim.app_command()
@@ -1034,7 +1038,7 @@ class Machine(NexusCore):
         return machine_name in Machine.machines
     #end def exists
 
-
+    #mth
     @staticmethod
     def is_unique(machine) -> bool:
         return id(machine)==id(Machine.machines[machine.name])
@@ -1060,7 +1064,7 @@ class Machine(NexusCore):
         #end if
     #end def add
 
-
+    #mth
     @staticmethod
     def get(machine_name: str):
         if isinstance(machine_name,str):
@@ -1082,7 +1086,7 @@ class Machine(NexusCore):
         return machine
     #end def get
 
-
+    #mth
     def warn(self, *args: str, **kwargs) -> None:
         if Machine.allow_warnings:
             NexusCore.warn(self,*args,**kwargs)
@@ -1110,43 +1114,44 @@ class Machine(NexusCore):
         return self.mode==self.modes.batch
     #end def in_batch_mode
 
-
+    #mth
     def query_queue(self):
         raise NotImplementedError
     #end def query_queue
-
+    #mth
     def submit_jobs(self):
         raise NotImplementedError
     #end def submit_jobs
 
     # update all job information, must be idempotent
+    #mth
     def process_job(self, job: Job):
         raise NotImplementedError
     #end def process_job
-
+    #mth
     def process_job_options(self, job: Job):
         raise NotImplementedError
     #end def process_job_options
-
+    #mth
     def write_job(
         self,
         job  : Job,
         *,
         file : bool = False,
-        ):
+        ):  #th
         raise NotImplementedError
     #end def write_job
-
+    #mth
     def submit_job(self, job: Job):
         raise NotImplementedError
     #end def submit_job
-
+    #mth
     def specialized_bundle_commands(
         self,
-        job,
+        job,  #th
         launcher : str,
-        serial,
-        ):
+        serial,  #th
+        ):  #th
         raise NotImplementedError
     #end def specialized_bundle_commands
 
@@ -1215,6 +1220,7 @@ class Machine(NexusCore):
 
 
     allowed_user_info = frozenset({'account','local_directory','app_directory','app_directories'})
+    #mth
     def incorporate_user_info(self, infoin) -> None:
         info = obj(**infoin)
         vars = set(info.keys())
@@ -1507,7 +1513,7 @@ class Workstation(Machine):
 
 # test needed
 class InteractiveCluster(Workstation):
-
+    #mth
     def __init__(self, *args, **kwargs) -> None:
         if len(args)==0 or not isinstance(args[0],Supercomputer):
             self.init_from_args(*args,**kwargs)
@@ -1519,15 +1525,15 @@ class InteractiveCluster(Workstation):
         Machine.__init__(self,self.name,self.queue_size)
     #end def __init__
 
-
+    #mth
     def init_from_args(
         self,
         name                : str        = 'icluster',
-        nodes                            = None,
-        procs_per_node                   = None,
-        cores_per_proc                   = None,
-        process_granularity              = None,
-        ram_per_node                     = None,
+        nodes                            = None,  #th
+        procs_per_node                   = None,  #th
+        cores_per_proc                   = None,  #th
+        process_granularity              = None,  #th
+        ram_per_node                     = None,  #th
         app_launcher        : str | None = None,
         ) -> None:
         self.name           = name
@@ -1550,7 +1556,7 @@ class InteractiveCluster(Workstation):
         self.queue_size = self.cores
     #end def init_from_args
 
-
+    #mth
     def init_from_supercomputer(self, super, cores) -> None:
         nodes = cores//super.cores_per_node
         if cores-nodes*super.cores_per_node!=0:
@@ -1611,7 +1617,7 @@ class Supercomputer(Machine):
         'queue_querier',
         'job_remover'
         )
-
+    #mth
     def __init__(
         self,
         nodes          : int | None = None,
@@ -1623,7 +1629,7 @@ class Supercomputer(Machine):
         sub_launcher   : str | None = None,
         queue_querier  : str | None = None,
         job_remover    : str | None = None,
-        name                        = None,
+        name                        = None,  #th
         ) -> None:
         if name is None:
             if self.name is not None:
@@ -1769,6 +1775,7 @@ class Supercomputer(Machine):
 
 
     # test needed
+    #mth
     def interactive_representation(self, cores) -> InteractiveCluster:
         return InteractiveCluster(self,cores)
     #end def interactive_representation
@@ -2211,7 +2218,7 @@ class Supercomputer(Machine):
         return self.sub_launcher+job.sub_options.write()+' '+job.subfile
     #end def sub_command
 
-
+    #mth
     def remove_job(self, job) -> None:
         if self.job_remover=='qdel':
             command = 'qdel '+str(job.system_id)
@@ -2271,7 +2278,7 @@ class Supercomputer(Machine):
         return c
     #end def write_job
 
-
+    #mth
     def write_job_header(self, job: Job):
         raise NotImplementedError
     #end def write_job_header
@@ -2306,6 +2313,7 @@ class Supercomputer(Machine):
             raise ValueError(f"Failed to parse walltime '{walltime_str}': {str(e)}")
         #end try
     #end def walltime_to_seconds
+    #mth
     @ staticmethod
     def seconds_to_walltime(seconds) -> str:
         """
@@ -4684,12 +4692,12 @@ class Polaris(Supercomputer):
 
         return c
     #end def write_job_header
-
+    #mth
     def specialized_bundle_commands(
         self,
-        job,
+        job,  #th
         launcher : str,
-        serial,
+        serial,  #th
         ) -> str:
         c = ''
         j0 = job.bundled_jobs[0]
@@ -4795,12 +4803,12 @@ class Aurora(Supercomputer):
             c+='export MPICH_GPU_SUPPORT_ENABLED=1\n'
         return c
     #end def write_job_header
-
+    #mth
     def specialized_bundle_commands(
         self,
-        job,
+        job,  #th
         launcher : str,
-        serial,
+        serial,  #th
         ) -> str:
         c = ''
         j0 = job.bundled_jobs[0]

@@ -34,7 +34,7 @@ type KwargsT = bool | int | str | PhysicalSystem | tuple[int, int, int] | None
 
 bool_values = dict(T=True,F=False)
 bool_values_inv = {True:'T',False:'F'}
-
+#mth
 def read_qp_value_type(value_filepath) -> str:
     with open(value_filepath,'r') as f:
         svalue = f.read().strip()
@@ -77,7 +77,7 @@ def read_qp_value(value_filepath: str) -> bool | int | float | str:
     return v
 #end def read_qp_value
 
-
+#mth
 def write_qp_value(value_filepath, value: bool | int | float | str) -> None:
     if isinstance(value,bool):
         svalue = bool_values_inv[value]
@@ -236,6 +236,7 @@ for varname in variable_section.keys():
 
 
 # function to extract and print an updated input_specification based on a list of ezfio directories
+#mth
 def extract_input_specification(*ezfio_paths) -> None:
     if len(ezfio_paths)==1 and isinstance(ezfio_paths[0],(list,tuple)):
         ezfio_paths = ezfio_paths[0]
@@ -334,7 +335,7 @@ class QuantumPackageInput(SimulationInput):
         #end if
     #end def __init__
 
-
+    #mth
     def present(self, name) -> bool:
         if name not in known_variables:
             msg = (
@@ -465,7 +466,7 @@ class QuantumPackageInput(SimulationInput):
         #end for
     #end def read
 
-
+    #mth
     def write(self, filepath = None) -> str:
         if filepath is None:
             return str(self)
@@ -575,17 +576,17 @@ class QuantumPackageInput(SimulationInput):
         return ''
     #end def write
 
-
+    #mth
     def read_text(self, text: str | list[str], filepath = None):
         raise NotImplementedError
     #end def read_text
 
-
+    #mth
     def write_text(self, filepath = None):
         raise NotImplementedError
     #end def write_text
 
-
+    #mth
     def incorporate_system(self, system: PhysicalSystem):
         raise NotImplementedError
     #end def incorporate_system

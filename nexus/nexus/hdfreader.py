@@ -41,11 +41,11 @@ class HDFgroup(DevBase):
         #end if
         return name
     #end def escape_name
-
+    #mth
     def _set_parent(self, parent) -> None:
         self._parent=parent
     #end def set_parent
-
+    #mth
     def _add_dataset(self, name: str, dataset) -> None:
         self._datasets[name]=dataset
     #end def add_dataset
@@ -54,11 +54,11 @@ class HDFgroup(DevBase):
         group._name=name
         self._groups[name]=group
     #end def add_group
-
+    #mth
     def _contains_group(self, name) -> bool:
         return name in self._groups.keys()
     #end def _contains_group
-
+    #mth
     def _contains_dataset(self, name) -> bool:
         return name in self._datasets.keys()
     #end def _contains_dataset
@@ -250,7 +250,7 @@ class HDFgroup(DevBase):
         #self.sum(*names)
     #end def normalize
 
-
+    #mth
     def sum(self, *names) -> None:
         for name in names:
             if name in self and isinstance(self[name],np.ndarray) and name=='value':
@@ -347,12 +347,12 @@ class HDFreader(DevBase):
         self.ilevel-=1
         self.pad = self.ilevel*'  '
     #end def decrement_level
-
+    #mth
     def add_dataset(
         self,
         cur  : HDFgroup,
         k    : str,
-        v,
+        v,  #th
         ) -> None:
         if not HDFglobals.view:
             cur[k]=np.array(v)
@@ -361,13 +361,13 @@ class HDFreader(DevBase):
         #end if
         cur._add_dataset(k,cur[k])
     #end def add_dataset
-
+    #mth
     def add_group(
         self,
-        hcur,
+        hcur,  #th
         cur  : HDFgroup,
         k    : str,
-        v,
+        v,  #th
         ) -> None:
         import h5py
         cur[k] = HDFgroup()

@@ -40,12 +40,13 @@ class NamelistEnumBase(NamelistParamDefinition, Enum):
 
     Provides the ``__new__`` method for the enums.
     """
+    #mth
     def __new__(
         cls,
         input_name      : str,
         datatype        : type[bool | int | float | str],
         required        : bool,  # noqa: FBT001
-        shape                          = None,
+        shape                          = None,  #th
         allowed_values  : tuple | None = None,
         version_added   : str | None   = None,
         version_removed : str | None   = None,
@@ -62,7 +63,7 @@ class NamelistEnumBase(NamelistParamDefinition, Enum):
         )
         return definition
     #end def __new__
-
+    #mth
     @classmethod
     def _missing_(cls, value: str):
         """Strip leading/trailing whitespace, and make lowercase."""

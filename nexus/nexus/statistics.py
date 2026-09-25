@@ -1208,10 +1208,10 @@ def interval_dist_peak(
 #end def interval_dist_peak
 
 
-
+#mth
 def rolling_interval_dist_peak(
     x1             : np.ndarray,
-    x2                     = None,
+    x2                     = None,  #th
     window         : int   = 10,
     step           : int   = 5,
     method         : str   = 'interval_mid',
@@ -1355,13 +1355,13 @@ def _perturb_constant_series(
 #end def _perturb_constant_series
 
 
-
+#mth
 def line_crossing_distribution(
     x     : list[float] | np.ndarray,
     nperm : bool | int = 0,
     *,
     ret_x : bool       = False,
-    ):
+    ):  #th
     """Return the line-crossing distribution of a series or its permutations.
 
     Parameters

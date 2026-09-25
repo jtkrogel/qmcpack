@@ -70,7 +70,7 @@ type AfqmcArg = bool | float | str | tuple[int, int]
 def read_str(sv: str) -> str:
     return sv.strip('"').strip("'")
 #end def read_str
-
+#mth
 def read_int(sv) -> int:
     return int(sv)
 #end def read_int
@@ -87,11 +87,11 @@ def read_bool(sv: str) -> bool:
 def write_str(val: str) -> str:
     return "'"+val+"'"
 #end def write_str
-
+#mth
 def write_int(val) -> str:
     return str(val)
 #end def write_int
-
+#mth
 def write_float(val) -> str:
     return str(val)
 #end def write_float
@@ -103,7 +103,7 @@ def write_bool(val: bool) -> str:
 readval={str:read_str,int:read_int,float:read_float,bool:read_bool}
 writeval={str:write_str,int:write_int,float:write_float,bool:write_bool}
 
-
+#mth
 def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
@@ -222,6 +222,7 @@ def read_eshdf_eig_data(
     filename : str | Path,
     Ef_list  : Energies,
     ) -> obj:
+    #mth
     def h5int(i):
         return np.array(i,dtype=int)[0]
     #end def h5int
@@ -271,7 +272,7 @@ def read_eshdf_eig_data(
     return res
 #end def read_eshdf_eig_data
 
-
+#mth
 def gcta_occupation(wfh5, ntwist) -> list:
   nspin = wfh5.nspins
   nk = wfh5.nkpoints
@@ -306,13 +307,13 @@ class Pw2qmcpackAnalyzer(SimulationAnalyzer):
             self.infile = arg0
         #end if
     #end def __init__
-
+    #mth
     def analyze(self, Ef_list = None) -> None:
       if Ef_list is not None:
         self.wfh5 = read_eshdf_eig_data(self.h5file, Ef_list)
       #end if
     #end def analyze
-
+    #mth
     def get_result(self, result_name: str):
         raise NotImplementedError
     #end def get_result
@@ -559,7 +560,7 @@ class Pw2qmcpack(Simulation):
 
 
 
-
+#mth
 def generate_pw2qmcpack(**kwargs) -> Pw2qmcpack:
 
     if nexus_config.dynamic:
@@ -729,7 +730,7 @@ class Convert4qmcInput(SimulationInput):
         add_3body_J        = False,# deprecated
         )
 
-
+    #mth
     def __init__(self, **kwargs) -> None:
         # check that only allowed keyword inputs are provided
         invalid = set(kwargs.keys())-set(self.input_types.keys())
@@ -879,7 +880,7 @@ class Convert4qmc(Simulation):
     application_properties = frozenset({'serial'})
     application_results    = frozenset({'orbitals','particles','determinantset'})
     renew_app_command      = True
-
+    #mth
     def __init__(self, *args, **kwargs) -> None:
         Simulation.__init__(self,*args,**kwargs)
         self.input_code = None
@@ -1052,7 +1053,7 @@ class Convert4qmc(Simulation):
 #end class Convert4qmc
 
 
-
+#mth
 def generate_convert4qmc(**kwargs) -> Convert4qmc:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
     if 'identifier' in sim_args and 'prefix' not in inp_args:
@@ -1071,6 +1072,7 @@ def generate_convert4qmc(**kwargs) -> Convert4qmc:
 
 
 class Convertpw4qmcInput(SimulationInput):
+    #mth
     def __init__(self, data_file = None) -> None:
         self.data_file=data_file
     #end def __init__
@@ -1083,7 +1085,7 @@ class Convertpw4qmcInput(SimulationInput):
         pass
 
 #end class Convertpw4qmcInput
-
+#mth
 def generate_convertpw4qmc_input(**kwargs) -> Convertpw4qmcInput:
     return Convertpw4qmcInput(**kwargs)
 #end def genreate_convertpw4qmc_input
@@ -1234,7 +1236,7 @@ class Convertpw4qmc(Simulation):
 #end class Convertpw4qmc
 
 
-
+#mth
 def generate_convertpw4qmc(**kwargs) -> Convertpw4qmc:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
 
@@ -1320,7 +1322,7 @@ class PyscfToAfqmcInput(SimulationInput):
         verbose            = False,
         )
 
-
+    #mth
     def __init__(self, **kwargs) -> None:
         # reassign inputs provided via short flag names
         for k,v in PyscfToAfqmcInput.input_flags.items():
@@ -1569,7 +1571,7 @@ class PyscfToAfqmc(Simulation):
 #end class PyscfToAfqmc
 
 
-
+#mth
 def generate_pyscf_to_afqmc(**kwargs) -> PyscfToAfqmc:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
     if 'identifier' in sim_args:

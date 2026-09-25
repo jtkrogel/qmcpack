@@ -71,7 +71,7 @@ class SimStage(Flag):
     get_output  = auto()
     analyze     = auto()
     all         = setup | submit | get_output | analyze
-
+    #mth
     @classmethod
     def from_list(cls, items) -> SimStage:
         """Join a collection of strings into a union of :class:`SimStage`."""
@@ -299,6 +299,7 @@ class NexusUnpickler(pickle.Unpickler):
     before Nexus was packaged (PR #5700, December 20, 2025).
     It shouldn't touch anything but old Nexus pickles.
     """
+    #mth
     def find_class(self, module: str, name: str):
         if module in nexus_modules and "nexus." not in module:
             module = "nexus." + module
@@ -341,10 +342,10 @@ class NexusCore(DevBase):
     def mem_usage(self) -> int:
         return int(resident()/1e6)
     #end def mem_usage
-
+    #mth
     def nxs_print(
         self,
-        *texts,
+        *texts,  #th
         n        : int  = 0,
         progress : bool = False,
         ) -> None:

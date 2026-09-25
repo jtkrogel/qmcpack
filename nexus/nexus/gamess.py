@@ -52,7 +52,7 @@ class Gamess(Simulation):
 
     ericfmt = None
     mcppath = None
-
+    #mth
     @staticmethod
     def settings(ericfmt = None, mcppath = None) -> None:
         Gamess.ericfmt = ericfmt
@@ -65,7 +65,7 @@ class Gamess(Simulation):
         Gamess.mcppath = None
     #end def restore_default_settings
 
-
+    #mth
     def __init__(self, **kwargs) -> None:
         self.mo_reorder = None
         mo_reorder = kwargs.pop('mo_reorder',None)
@@ -287,7 +287,7 @@ class Gamess(Simulation):
         return filename
     #end def output_filename
 
-
+    #mth
     def output_filepath(self, name) -> str:
         filename = self.output_filename(name)
         filepath = os.path.join(self.locdir,filename)
@@ -296,7 +296,7 @@ class Gamess(Simulation):
     #end def
 #end class Gamess
 
-
+#mth
 def generate_gamess(**kwargs) -> Gamess:
     sim_args,inp_args = Gamess.separate_inputs(kwargs,sim_kw=['mo_reorder'])
 
@@ -307,7 +307,6 @@ def generate_gamess(**kwargs) -> Gamess:
 
     return gamess
 #end def generate_gamess
-
 
 
 

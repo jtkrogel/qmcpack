@@ -3173,7 +3173,7 @@ class RmgKeyword(DevBase):
         return write_functions[self.key_type](value)
     #end def write
 
-
+    #mth
     def assign(self, value):
         if not isinstance(value,self.value_type):
             msg = (
@@ -3229,14 +3229,15 @@ class RmgKeyword(DevBase):
 
 
 class FormattedRmgKeyword(RmgKeyword):
+    #mth
     def read(self, value: str):
         raise NotImplementedError
     #end def read
-
+    #mth
     def write(self, value: ValT):
         raise NotImplementedError
     #end def write
-
+    #mth
     def assign(self, value):
         raise NotImplementedError
     #end def assign
@@ -3254,7 +3255,7 @@ class FormattedRmgKeyword(RmgKeyword):
             return valid,f'Data for keyword "{self.key_name}" is invalid.\nInvalid value: {value}'
         #end if
     #end def valid
-
+    #mth
     def valid_no_msg(self, value: obj):
         raise NotImplementedError
     #end def valid_no_msg
@@ -3266,7 +3267,7 @@ class FormattedTableRmgKeyword(FormattedRmgKeyword):
     array_options  = None
     array_types    = None
     exclude_fields = frozenset()
-
+    #mth
     def assign(self, value):
         if isinstance(value,str):
             return value
@@ -3641,7 +3642,7 @@ class HubbardUKeyword(RmgKeyword):
             return write_string(' '.join(lines))
         #end if
     #end def write
-
+    #mth
     def assign(self, value) -> obj:
         if isinstance(value,str):
             return self.read(value)
@@ -3801,11 +3802,11 @@ class RmgCalcModes(DevBase):
         self.full_calc_modes  = set(self.full_calc.values())
         self.short_calc_modes = set(self.short_calc.values())
     #end def __init__
-
+    #mth
     def is_full_mode(self, mode) -> bool:
         return mode in self.full_calc_modes
     #end def is_full_mode
-
+    #mth
     def is_short_mode(self, mode) -> bool:
         return mode in self.short_calc_modes
     #end def is_short_mode
@@ -3825,10 +3826,10 @@ class RmgCalcModes(DevBase):
         #end if
         return mode
     #end def short_mode
-
+    #mth
     def mode_match(
         self,
-        text,
+        text,  #th
         *,
         short : bool = False,
         ) -> str | None:
@@ -3875,7 +3876,7 @@ class RmgInput(SimulationInput):
         return mode
     #end def run_mode
 
-
+    #mth
     def assign(self, **values) -> None:
         unrecognized = []
         for k,v in values.items():
@@ -4006,7 +4007,7 @@ class RmgInput(SimulationInput):
         return self.check_valid(exit=False)
     #end def is_valid
 
-
+    #mth
     def return_structure(self, units: str = 'B'):
         axes       = self.lattice_vector        if 'lattice_vector'        in self else None
         axes_unit  = self.lattice_units         if 'lattice_units'         in self else 'bohr'
@@ -4087,7 +4088,7 @@ class RmgInput(SimulationInput):
 
 
 
-
+#mth
 def generate_rmg_input(**kwargs) -> RmgInput:
     selector = kwargs.pop('input_type','generic')
     if selector=='generic':
@@ -4110,7 +4111,7 @@ generate_any_defaults = obj(
     #    use_folded             = True,
     #    ),
     )
-
+#mth
 def generate_any_rmg_input(**kwargs) -> RmgInput:
 
     # set default values

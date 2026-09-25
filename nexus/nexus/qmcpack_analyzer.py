@@ -103,23 +103,24 @@ QAanalyzer.capabilities = QmcpackAnalyzerCapabilities()
 
 
 class QmcpackAnalysisRequest(QAobject):
+    #mth
     def __init__(
         self,
         source              : str | Path | None = None,
         destination         : str | None        = None,
         savefile            : str               = '',
-        methods                                 = None,
-        calculations                            = None,
-        data_sources                            = None,
-        quantities                              = None,
-        warmup_calculations                     = None,
+        methods                                 = None,  #th
+        calculations                            = None,  #th
+        data_sources                            = None,  #th
+        quantities                              = None,  #th
+        warmup_calculations                     = None,  #th
         output              : tuple[str, str]   = ('averages','samples'),
         ndmc_blocks         : int               = 1000,
         equilibration       : int | None        = None,
-        group_num                               = None,
+        group_num                               = None,  #th
         *,
         traces              : bool              = False,
-        dm_settings                             = None,
+        dm_settings                             = None,  #th
         ) -> None:
         self.source          = source if not isinstance(source, Path) else str(source.resolve())
         self.destination     = destination
@@ -196,10 +197,11 @@ class QmcpackAnalyzer
        |  Each observable is calculated by an object contained in results
 """
 class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
+    #mth
     def __init__(
         self,
         arg0     : AnalyzerArg = None,
-        **kwargs,
+        **kwargs,  #th
         ) -> None:
 
         verbose = False

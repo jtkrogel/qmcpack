@@ -73,12 +73,12 @@ def parse_string(
     #end try
 #end def parse_string
 
-
+#mth
 def find_pair(
     s     : str,
     pairs : list[str] | tuple[str, str],
     start : int = 0,
-    end         = None,
+    end         = None,  #th
     ) -> tuple:
     if end is None:
         end = len(s)
@@ -128,7 +128,7 @@ class XMLelement(DevBase):
         #end if
         return name
     #end def escape_name
-
+    #mth
     def _set_parent(self, parent) -> None:
         self._parent=parent
     #end def set_parent
@@ -291,14 +291,15 @@ class XMLelement(DevBase):
     reads an xml file and creates a dynamic object out of its contents
 '''
 class XMLreader(DevBase):
+    #mth
     def __init__(
         self,
         fpath           : str | Path | None     = None,
         *,
         element_joins   : list[str] | None      = None,
         element_aliases : dict[str, str] | None = None,
-        strip_prefix                            = None,
-        xml                                     = None,
+        strip_prefix                            = None,  #th
+        xml                                     = None,  #th
         contract_names  : bool                  = False,
         warn            : bool                  = True,
         ) -> None:
@@ -525,30 +526,30 @@ class XMLreader(DevBase):
             #end if
         #end if
     #end def found_text
-
+    #mth
     def found_attribute(
         self,
-        ename,
-        aname,
-        atype,
-        default,
-        required,
+        ename,  #th
+        aname,  #th
+        atype,  #th
+        default,  #th
+        required,  #th
         ) -> None:
         pass
     #end def found_attribute
 #end class XMLreader
 
 
-
+#mth
 def readxml(
     fpath           : Path | None = None,
     *,
-    element_joins                 = None,
-    element_aliases               = None,
+    element_joins                 = None,  #th
+    element_aliases               = None,  #th
     contract_names  : bool        = False,
-    strip_prefix                  = None,
+    strip_prefix                  = None,  #th
     warn            : bool        = True,
-    xml                           = None,
+    xml                           = None,  #th
     ) -> XMLelement:
     xr = XMLreader(
         fpath           = fpath,

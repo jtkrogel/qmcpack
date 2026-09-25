@@ -191,7 +191,7 @@ class Vasp(Simulation):
 #end class Vasp
 
 
-
+#mth
 def generate_vasp(**kwargs) -> Vasp:
     pseudos = kwargs.get('pseudos',None)
     if pseudos is not None:

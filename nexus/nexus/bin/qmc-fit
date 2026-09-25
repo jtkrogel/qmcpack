@@ -201,12 +201,12 @@ all_fit_functions = obj(
 fit_functions = obj()
 
 
-
+#mth
 def qmcfit(
     q         : np.ndarray,
     E         : np.ndarray,
     fname     : str = 'linear',
-    minimizer       = least_squares,
+    minimizer       = least_squares,  #th
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, obj]:
     # ensure data is in proper array format
     if isinstance(E,(list,tuple)):
@@ -266,12 +266,13 @@ def qmcfit(
 
 
 # Reads scalar.dat files and extracts energy series
+#mth
 def process_scalar_files(
     scalar_files    : list[str],
     equils          : np.int64 | None      = None,
     reblock_factors : int | np.int_ | None = None,
     series_start    : int | None           = None,
-    ):
+    ):  #th
     if len(scalar_files)==0:
         msg = 'must provide at least one scalar file'
         raise ValueError(msg)
@@ -516,7 +517,7 @@ def timestep_fit(args: argparse.Namespace) -> None:
         plt.show()
     #end if
 #end def timestep_fit
-
+#mth
 def hubbard_u_fit(args) -> None:
     opt = obj(**args.__dict__)
     scalar_files = sorted(opt.scalar_files)
@@ -631,7 +632,7 @@ def hubbard_u_fit(args) -> None:
         plt.show()
     #end if
 #end def hubbard_u_fit
-
+#mth
 def eos_fit(args) -> None:
     opt = obj(**args.__dict__)
     scalar_files = sorted(opt.scalar_files)

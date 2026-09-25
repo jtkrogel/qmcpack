@@ -67,13 +67,13 @@ class Plotter(DevBase):
             self.initialized = True
         #end if
     #end def ensure_init
-
+    #mth
     def isosurface(
         self,
-        points,
-        scalars,
+        points,  #th
+        scalars,  #th
         contours   : int | list,
-        dimensions,
+        dimensions,  #th
         name       : str = 'val',
         ) -> None:
         self.ensure_init()
@@ -97,14 +97,14 @@ class Plotter(DevBase):
             raise TypeError(msg)
         #end if
     #end def isosurface
-
+    #mth
     def surface_slice(
         self,
-        x,
-        y,
-        z,
-        scalars,
-        options = None,
+        x,  #th
+        y,  #th
+        z,  #th
+        scalars,  #th
+        options = None,  #th
         ) -> None:
         scale = 1.0
         opacity= 1.0
@@ -181,7 +181,7 @@ class QAobject(QAobj_base):
         )
     for k,v in _default_settings.items():
         setattr(QAobj_base,k,v)
-
+    #mth
     @classmethod
     def settings(cls, **kwargs) -> None:
         vars = set(kwargs.keys())
@@ -210,7 +210,7 @@ class Checks(DevBase):
         self._label = label
         self._exclusions = set()
     #end def __init__
-
+    #mth
     def exclude(self, value) -> None:
         self._exclusions.add(value)
     #end def exclude
@@ -394,10 +394,10 @@ class QAanalyzer(QAobject):
             self.nxs_print(msg,n=self.info.nindent+n)
         #end if
     #end def vlog
-
+    #mth
     def reset_indicators(
         self,
-        initialized               = None,
+        initialized               = None,  #th
         data_loaded : bool | None = None,
         analyzed    : bool | None = None,
         ) -> None:
@@ -411,7 +411,7 @@ class QAanalyzer(QAobject):
             self.info.analyzed = analyzed
         #end if
     #end def reset_indicators
-
+    #mth
     def init_sub_analyzers(self):
         raise NotImplementedError
     #end def init_sub_analyzers
@@ -462,7 +462,7 @@ class QAanalyzer(QAobject):
     #        cls.__dict__[func_name](self,**kwargs)
     #    #end if
     ##end def traverse
-
+    #mth
     def propagate_indicators(self, **kwargs) -> None:
         self.reset_indicators(**kwargs)
         for value in self.values():

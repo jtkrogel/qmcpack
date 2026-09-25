@@ -122,14 +122,14 @@ class PyscfInput(SimulationInputTemplateDev):
     mole_allowed = frozenset(mole_order)
     cell_allowed = frozenset(cell_order)
 
-
+    #mth
     def __init__(
         self,
         template    : str | Path | None = None,  # path to template input file
         prefix      : str | None        = None,  # $prefix var for file prefixes
         # obj w/ $ prefixed vars in template
-        custom                          = None,
-        system                          = None,  # physical system object
+        custom                          = None,  #th
+        system                          = None,  # physical system object  #th
         units       : str | None        = None,  # input units desired
         *,
         use_folded  : bool              = True,  # use folded system/primitive cell
@@ -151,7 +151,7 @@ class PyscfInput(SimulationInputTemplateDev):
         text        : str | None        = None,
         calculation : obj | None        = None,  # obj w/ Calculation variables
         chkfile     : str | None        = None,  # obj w/ Calculation variables
-        twist_num                       = None,  # Twist index
+        twist_num                       = None,  # Twist index  #th
         python_exe  : str               = 'python3',  # Python executable
         ) -> None:
         if filepath is None and template is not None:
@@ -569,7 +569,7 @@ $calculation
 #end class PyscfInput
 
 
-
+#mth
 def generate_pyscf_input(*args, **kwargs) -> PyscfInput:
     return PyscfInput(*args,**kwargs)
 #end def generate_pyscf_input

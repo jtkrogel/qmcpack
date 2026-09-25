@@ -178,7 +178,7 @@ class TemplateSimulationInput(SimulationInput):
         return text
     #end def write_text
 
-
+    #mth
     def incorporate_system(self, system):
         # optional
         #  only necessary if you want to populate atomic positions, etc
@@ -300,13 +300,13 @@ class TemplateSimulation(Simulation):
         return result
     #end def get_result
 
-
+    #mth
     def incorporate_result(
         self,
         result_name : str,
         result      : obj,
         sim         : Simulation,
-        ):
+        ):  #th
         # optional
         #  only necessary if this template_simulation sim depends on another sim
         #  e.g.
@@ -354,7 +354,7 @@ class TemplateSimulation(Simulation):
 #end class TemplateSimulation
 
 
-
+#mth
 def generate_template_simulation(**kwargs) -> TemplateSimulation:
     # optional
     #  the following code should work provided

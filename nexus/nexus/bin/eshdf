@@ -86,14 +86,14 @@ except ImportError as err:
 opt = obj(
     verbose = False,
     )
-
+#mth
 def vlog(*args, **kwargs) -> None:
     if opt.verbose:
         nxs_print(*args,**kwargs)
     #end if
 #end def vlog
 
-
+#mth
 def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
@@ -116,7 +116,7 @@ def read_eshdf_nofk_data(
     from numpy import array,pi,dot,sqrt,zeros
     from numpy.linalg import inv
     from nexus.unit_converter import convert
-
+    #mth
     def h5int(i) -> np.int64:
         return array(i,dtype=int)[0]
     #end def h5int

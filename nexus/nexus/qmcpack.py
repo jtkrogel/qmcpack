@@ -67,7 +67,7 @@ from .pwscf import Pwscf
 from .xmlreader import XMLreader
 from . import numpy_extensions as npe
 
-
+#mth
 def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
@@ -84,17 +84,18 @@ class GCTA(DevBase):
     Throughout the class, the handling of k-points uses unit (crystal) coordinates, which ranges in [0, 1).
     Note that QMCPACK interally uses the range (-0.5, 0.5) for k-points.
     '''
+    #mth
     def __init__(
         self,
-        input,
-        system,
-        flavor,
+        input,  #th
+        system,  #th
+        flavor,  #th
         ) -> None:
         self.flavor = flavor
         self.input = input
         self.system = system
     #end def __init__
-
+    #mth
     def check_implementation(self, gcta_possible, dependency: Pw2qmcpack) -> None:
         gcta_flavors = {'safl', 'afl', 'nscf', 'scf'}
         if self.flavor.lower() not in gcta_flavors:
@@ -138,7 +139,7 @@ class GCTA(DevBase):
             raise NotImplementedError(msg)
         #end if
     #end def check_implementation
-
+    #mth
     @staticmethod
     def int_kpoint_weight(float_value, atol: float = 1e-8):
         '''
@@ -157,6 +158,7 @@ class GCTA(DevBase):
         '''
         Read the ESHDF eigenvalues, k-point info and store the data in the GCTA instance as an attribute
         '''
+        #mth
         def h5_scalar(i):
             value = np.array(i)
             if value.ndim == 0:
@@ -202,7 +204,7 @@ class GCTA(DevBase):
             )
         self.eig_data = res
     #end def read_eshdf_data
-
+    #mth
     def unfolded_nelecs(self):
         '''
         Returns the number of electrons in the primitive cell
@@ -217,7 +219,7 @@ class GCTA(DevBase):
         nelecs = n_up + n_dn
         return nelecs
     #end def unfolded_nelecs
-
+    #mth
     def unfolded_nkpoints(self):
         '''
         Returns the number of unsymmetrized k-points when a supercell is unfolded back to the primitive cell
@@ -233,7 +235,7 @@ class GCTA(DevBase):
         nkpoints = round(nkgrid * ntile)
         return nkpoints
     #end def unfolded_nkpoints
-
+    #mth
     def prim_kpoints(self):
         '''
         Returns the k-points used to build the supercell in unit coordinates
@@ -307,7 +309,7 @@ class GCTA(DevBase):
         #end for
         self.gcta2conv = gcta2conv
     #end def gcta_converter_kmapping
-
+    #mth
     @staticmethod
     def traceback_dependency(dependency, cls, levels: int = 1):
         '''
@@ -357,7 +359,7 @@ class GCTA(DevBase):
         #end if
         return scf_magnet
     #end if
-
+    #mth
     @staticmethod
     def pwscf_fermi(filepath: str | Path, scf_type) -> float | np.ndarray | None:
         file = f'{filepath}/pwscf_output/pwscf.xml'
@@ -406,7 +408,7 @@ class GCTA(DevBase):
         fermi_level = float(combined_eigens[lamda_index-1] + combined_eigens[lamda_index]) / 2
         return fermi_level
     #end def adapted_fermi_level
-
+    #mth
     def spin_adapted_fermi_level(self, scf_magnet) -> np.ndarray:
         if scf_magnet is None:
             msg = 'The reference magnetization in safl can not be None. Please check that the SCF is appropriate.'
@@ -443,7 +445,7 @@ class GCTA(DevBase):
         fermi_level = np.array([up_fermi, dn_fermi])
         return fermi_level
     #end def adapted_fermi_level
-
+    #mth
     def set_gcta_occupations(self, fermi_level) -> None:
         if fermi_level is None:
             msg = f'The Fermi level can not be None. This indicates a bug in {self.flavor}'
@@ -536,7 +538,7 @@ class GCTA(DevBase):
             raise NexusError(msg)
         #end if
     #end def check_charge_neutrality
-
+    #mth
     def check_magnetization_accuracy(self, scf_magnet) -> None:
         '''
         Check that the net magnetization is close to the reference SCF value
@@ -557,12 +559,12 @@ class GCTA(DevBase):
             #end if
         #end if
     #end def check_magnetization_accuracy
-
+    #mth
     def write_gcta_report(
         self,
-        locdir,
-        fermi_level,
-        scf_magnet = None,
+        locdir,  #th
+        fermi_level,  #th
+        scf_magnet = None,  #th
         ) -> None:
         spinor_run = self.input.get('spinor')
         nosym_kpoints = self.unfolded_nkpoints()
@@ -1197,6 +1199,7 @@ class Qmcpack(Simulation):
                             #end for
                     #end if
                 #end if
+                #mth
                 def process_jastrow(wf):
                     if 'jastrow' in wf:
                         js = [wf.jastrow]
@@ -1460,7 +1463,7 @@ class Qmcpack(Simulation):
         return output_files
     #end def get_output_files
 
-
+    #mth
     def post_analyze(self, analyzer) -> None:
         if not self.has_generic_input():
             calctypes = self.input.get_output_info('calctypes')
@@ -1894,7 +1897,7 @@ class Qmcpack(Simulation):
                 self.products.wavefunction = opt_file
     #end def fill_products
 
-
+    #mth
     def receive_structure(self, struct) -> None:
         struct.change_units('B')
         self.system.structure = struct
@@ -1964,7 +1967,7 @@ class Qmcpack(Simulation):
 
     #end def receive_pwscf_orbitals
 
-
+    #mth
     def receive_jastrow(self, jastrow_file) -> None:
         opt_file     = jastrow_file
         opt          = QmcpackInput(opt_file)
@@ -1998,6 +2001,7 @@ class Qmcpack(Simulation):
                     for j3_id in j3_ids:
                         if 'ud' in j3_id:
                             delattr(corr, j3_id)
+        #mth
         def process_jastrow(wf):
             if 'jastrow' in wf:
                 js = [wf.jastrow]
@@ -2034,7 +2038,7 @@ class Qmcpack(Simulation):
                 wavefunction.jastrows = collection(jnew)
     #end def receive_jastrow
 
-
+    #mth
     def receive_wavefunction(self, wf_file) -> None:
         opt = QmcpackInput(wf_file)
         qs  = input.get('qmcsystem')
@@ -2048,7 +2052,7 @@ class Qmcpack(Simulation):
 #end class Qmcpack
 
 
-
+#mth
 def generate_qmcpack(**kwargs) -> Qmcpack:
     pseudos = kwargs.get('pseudos',None)
     if pseudos is not None:
@@ -2104,7 +2108,7 @@ def generate_qmcpack(**kwargs) -> Qmcpack:
     return qmcpack
 #end def generate_qmcpack
 
-
+#mth
 def generate_cusp_correction(**kwargs) -> Qmcpack:
     kwargs['input_type']   = 'basic'
     kwargs['bconds']       = 'nnn'

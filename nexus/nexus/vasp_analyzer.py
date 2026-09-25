@@ -457,6 +457,7 @@ def read_vxml(filepath: str) -> VXML:
 # vasp outcar functions
 
 class VaspLines(DevBase):
+    #mth
     def __init__(self, lines) -> None:
         self.pointer = 0
         self.lines   = lines
@@ -490,14 +491,14 @@ class VaspLines(DevBase):
     def rewind(self, point: int = 0) -> None:
         self.pointer = point
     #end def rewind
-
+    #mth
     def get_line(self, point = None) -> str:
         if point is None:
             point = self.pointer
         #end if
         return self.lines[point]
     #end def get_line
-
+    #mth
     def get_line_ahead(self, nahead) -> str:
         return self.lines[self.pointer+nahead]
     #end def get_line_ahead

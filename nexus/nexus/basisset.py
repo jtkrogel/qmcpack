@@ -92,6 +92,7 @@ class BasisSets(DevBase):
 
 
     # test needed
+    #mth
     def bases_by_atom(self, *bsfiles) -> obj:
         bss = obj()
         for bsfile in bsfiles:
@@ -135,7 +136,7 @@ class BasisFile(DevBase):
             self.element_label = elem_label
         #end if
     #end def __init__
-
+    #mth
     def cleaned_text(self):
         raise NotImplementedError
     #end def cleaned_text
@@ -144,7 +145,7 @@ class BasisFile(DevBase):
 
 class gaussBasisFile(BasisFile):
     angular_terms = 'spdfghiklmn'
-
+    #mth
     def __init__(self, filepath = None) -> None:
         BasisFile.__init__(self,filepath)
         self.text = None
@@ -176,7 +177,7 @@ class gaussBasisFile(BasisFile):
         self.read_file(file)
         file.close()
     #end def read
-
+    #mth
     def read_file(self, file: TextFile):
         raise NotImplementedError
     #end def read_file
@@ -322,13 +323,13 @@ class GaussianBasisSet(DevBase):
 
     crystal_lmap = MappingProxyType({0:'s',1:'sp',2:'p',3:'d',4:'f'})
     crystal_lmap_reverse = MappingProxyType(dict(s=0,sp=1,p=2,d=3,f=4))
-
+    #mth
     @staticmethod
     def process_float(s) -> float:
         return float(s.replace('D','e').replace('d','e'))
     #end def process_float
 
-
+    #mth
     def __init__(self, filepath = None, format: str | None = None) -> None:
         self.name  = None
         self.basis = obj()
@@ -337,7 +338,7 @@ class GaussianBasisSet(DevBase):
         #end if
     #end def __init__
 
-
+    #mth
     def read(self, filepath, format: str | None = None) -> None:
         if format is None:
             msg = (
@@ -363,7 +364,7 @@ class GaussianBasisSet(DevBase):
         self.read_text(text,format)
     #end def read
 
-
+    #mth
     def write(self, filepath = None, format: str | None = None) -> str:
         if format is None:
             msg = (
@@ -475,7 +476,7 @@ class GaussianBasisSet(DevBase):
         self.lsort()
     #end def read_lines
 
-
+    #mth
     def write_text(self, format: str | None = None, occ = None) -> str:
         text = ''
         format = format.lower()
@@ -718,11 +719,12 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def remove_prims(
         self,
-        comp = None,
-        keep = None,
-        **lselectors,
+        comp = None,  #th
+        keep = None,  #th
+        **lselectors,  #th
         ) -> None:
         lbasis = self.lbasis()
         if comp is not None:
@@ -808,6 +810,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def remove_small_prims(self, **keep) -> None:
         lsel = obj()
         for l,lbas in self.lbasis().items():
@@ -820,6 +823,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def remove_large_prims(self, **keep) -> None:
         lsel = obj()
         for l,lbas in self.lbasis().items():
@@ -832,6 +836,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def remove_small_prims_rel(self, other, **keep) -> None:
         gwidths = other.prim_widths()
         lsel = obj()
@@ -843,6 +848,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def remove_large_prims_rel(self, other, **keep) -> None:
         gwidths = other.prim_widths()
         lsel = obj()
@@ -854,6 +860,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def remove_channels(self, llist) -> None:
         lbasis = self.lbasis()
         for l in llist:
@@ -875,9 +882,10 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
+    #mth
     def incorporate(
         self,
-        other,
+        other,  #th
         tol    : float = 1e-3,
         *,
         unique : bool  = False,
@@ -936,10 +944,10 @@ class GaussianBasisSet(DevBase):
         #end if
     #end def incorporate
 
-
+    #mth
     def plot(
         self,
-        r             = None,
+        r             = None,  #th
         rmin  : float = 0.01,
         rmax  : float = 8.0,
         *,
@@ -947,9 +955,9 @@ class GaussianBasisSet(DevBase):
         fig   : bool  = True,
         sep   : bool  = False,
         prim  : bool  = False,
-        style         = None,
-        fmt           = None,
-        nsub          = None,
+        style         = None,  #th
+        fmt           = None,  #th
+        nsub          = None,  #th
         ) -> None:
         import matplotlib.pyplot as plt
         if r is None:
@@ -1028,7 +1036,7 @@ class GaussianBasisSet(DevBase):
         pass
     #end def plot_primitives
 
-
+    #mth
     def plot_prim_widths(
         self,
         *,
@@ -1036,8 +1044,8 @@ class GaussianBasisSet(DevBase):
         fig     : bool = True,
         sep     : bool = False,
         style   : str  = 'o',
-        fmt            = None,
-        nsub           = None,
+        fmt            = None,  #th
+        nsub           = None,  #th
         semilog : bool = True,
         label   : bool = True,
         ) -> None:

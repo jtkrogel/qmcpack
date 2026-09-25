@@ -87,6 +87,7 @@ if Machine.exists(hostmachine):
 
 
 # test needed
+#mth
 def run_project(*args, **kwargs) -> ProjectManager:
     if nexus_config.graph_sims:
         graph_sims()
@@ -101,9 +102,10 @@ def run_project(*args, **kwargs) -> ProjectManager:
 # test needed
 # read input function
 #   place here for now as it depends on all other input functions
+#mth
 def read_input(
     filepath : str,
-    format = None,
+    format = None,  #th
     ) -> QmcpackInput | PwscfInput | GamessInput:
     if not os.path.exists(filepath):
         msg = f'cannot read input file\nfile does not exist: {filepath}'
@@ -132,7 +134,7 @@ def read_input(
 #end def read_input
 
 
-
+#mth
 def analyze_output(
     code    : str | Pwscf | None = None,
     input   : str | Pwscf | None = None,
@@ -141,7 +143,7 @@ def analyze_output(
     analyze : bool               = True,
     path    : Path | None        = None,
     **kw    : bool,
-    ):
+    ):  #th
     """Construct or load an analyzer for output from a supported code.
 
     Parameters
@@ -554,7 +556,7 @@ class Settings(NexusCore):
         | qm_package_vars
         )
 
-
+    #mth
     @staticmethod
     def kw_set(vars, source = None) -> obj:
         kw = obj()
