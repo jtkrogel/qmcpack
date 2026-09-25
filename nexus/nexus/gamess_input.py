@@ -122,7 +122,7 @@ def _read_gamess_pseudopotentials(pseudo_files) -> obj:
 
 
 class GIarray(GIbase):
-    def __init__(self, d) -> None:
+    def __init__(self, d: dict) -> None:
         for n,v in d.items():
             if not isinstance(n,int):
                 msg = (
@@ -160,7 +160,7 @@ class Group(GIbase):
         raise NotImplementedError
     #end def read
 
-    def write(self, text):
+    def write(self, text: str):
         raise NotImplementedError
     #end def read
 #end class Group
@@ -335,7 +335,7 @@ class CardGroup(Group):
     #end def readval
 
 
-    def read_tokens(self, line) -> list:
+    def read_tokens(self, line: str) -> list:
         tokens = []
         for token in line.split():
             tokens.append(self.readval(token))
@@ -344,7 +344,7 @@ class CardGroup(Group):
     #end def read_tokens
 
 
-    def read_line_tokens(self, text) -> list:
+    def read_line_tokens(self, text: str) -> list:
         line_tokens = []
         for line in text.splitlines():
             line_tokens.append(self.read_tokens(line))
@@ -353,7 +353,7 @@ class CardGroup(Group):
     #end def read_line_tokens
 
 
-    def append_text(self, text) -> None:
+    def append_text(self, text: str) -> None:
         for tokens in self.read_line_tokens(text):
             self[len(self)] = tokens
         #end for

@@ -125,7 +125,7 @@ def sorted_py2(iterable) -> list[int | str | tuple[int, int, int]]:
 
 
 
-def save(o, filepath) -> None:
+def save(o, filepath: str | Path) -> None:
     with open(filepath,'wb') as f:
         binary = pickle.HIGHEST_PROTOCOL
         pickle.dump(o,f,binary)
@@ -369,7 +369,7 @@ class DevBase:
             filepath='./'+self.__class__.__name__+'.p'
         save(self,filepath)
 
-    def load(self, filepath = None) -> None:
+    def load(self, filepath: str | Path | None = None) -> None:
         if filepath is None:
             filepath='./'+self.__class__.__name__+'.p'
         tmp = load(filepath)
@@ -382,7 +382,7 @@ class DevBase:
 
 
 
-def to_obj(d) -> obj:
+def to_obj(d: dict) -> obj:
     o = obj()
     for k,v in d.items():
         if hasattr(v,'__dict__'):

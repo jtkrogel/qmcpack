@@ -75,7 +75,7 @@ class DevBaseNexus(DevBase):
         self,
         msg    : str,
         *,
-        header = None,
+        header : str | None = None,
         ) -> None:
         if header is None:
             header = type(self).__name__
@@ -85,7 +85,7 @@ class DevBaseNexus(DevBase):
 
 
 
-def to_obj(d) -> obj:
+def to_obj(d: dict) -> obj:
     o = obj()
     for k,v in d.items():
         if hasattr(v,'__dict__'):

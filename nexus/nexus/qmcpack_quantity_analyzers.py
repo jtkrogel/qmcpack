@@ -68,6 +68,7 @@
 
 
 from __future__ import annotations
+from pathlib import Path
 
 import os
 import sys
@@ -101,7 +102,7 @@ class QuantityAnalyzer(QAanalyzer):
 
     def plot_trace(
         self,
-        quantity,
+        quantity : str,
         *args,
         **kwargs,
         ) -> None:
@@ -939,7 +940,7 @@ class EnergyDensityAnalyzer(HDFAnalyzer):
 
 
 class TracesFileHDF(QAobject):
-    def __init__(self, filepath = None, blocks = None) -> None:
+    def __init__(self, filepath: str | None = None, blocks = None) -> None:
         self.info = obj(
             filepath    = filepath,
             loaded      = False,
@@ -967,9 +968,9 @@ class TracesFileHDF(QAobject):
 
     def load(
         self,
-        filepath        = None,
+        filepath : str | None = None,
         *,
-        force    : bool = False,
+        force    : bool       = False,
         ) -> None:
         if not self.loaded() or force:
             if filepath is None:
@@ -1176,7 +1177,7 @@ class TracesFileHDF(QAobject):
 class TracesAnalyzer(QAanalyzer):
     def __init__(
         self,
-        path,
+        path    : str | Path,
         files,
         nindent : int = 0,
         ) -> None:
@@ -2515,7 +2516,7 @@ class SpaceGridBase(QAobject):
     #end if
 
 
-    def integrate(self, quantity, domain = None) -> tuple:
+    def integrate(self, quantity: str, domain = None) -> tuple:
         if quantity not in SpaceGridBase.quantities:
             msg = (
                 'requested integration of quantity '+quantity+'\n'
@@ -2538,7 +2539,7 @@ class SpaceGridBase(QAobject):
 
     def integrate_data(
         self,
-        quantity,
+        quantity : str,
         *domains,
         **kwargs,
         ) -> tuple:
@@ -3424,7 +3425,7 @@ class RectilinearGrid(SpaceGridBase):
 
     def isosurface(
         self,
-        quantity,
+        quantity : str,
         contours : int = 5,
         origin         = None,
         ) -> None:
@@ -3449,7 +3450,7 @@ class RectilinearGrid(SpaceGridBase):
 
     def surface_slice(
         self,
-        quantity,
+        quantity : str,
         x,
         y,
         z,
@@ -3471,9 +3472,9 @@ class RectilinearGrid(SpaceGridBase):
 
     def plot_axes(
         self,
-        color          = None,
-        radius : float = .025,
-        origin         = None,
+        color  : tuple[float, float, float] | None                   = None,
+        radius : float                                               = .025,
+        origin : list[float] | tuple[float, ...] | np.ndarray | None = None,
         ) -> None:
         if color is None:
             color = (0.,0,0)
@@ -3493,9 +3494,9 @@ class RectilinearGrid(SpaceGridBase):
 
     def plot_box(
         self,
-        color          = None,
-        radius : float = .025,
-        origin         = None,
+        color  : tuple[float, float, float] | None                   = None,
+        radius : float                                               = .025,
+        origin : list[float] | tuple[float, ...] | np.ndarray | None = None,
         ) -> None:
         if color is None:
             color = (0.,0,0)

@@ -204,7 +204,7 @@ class Elements(ElementData, Enum):
         return self.symbol
 
     @classmethod
-    def _missing_(cls, value) -> Elements:
+    def _missing_(cls, value: int | str) -> Elements:
         """Workaround to not having access to ``_add_alias_`` or
         ``_add_value_alias_`` from Python 3.13. This function
         automatically gets called when the traditional lookup fails.
@@ -229,7 +229,7 @@ class Elements(ElementData, Enum):
 
     @staticmethod
     def is_element(
-        value,
+        value          : str | Elements,
         *,
         return_element : bool = False,
         ) -> bool | tuple:

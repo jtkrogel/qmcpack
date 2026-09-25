@@ -49,7 +49,7 @@ class QuantumPackage(Simulation):
         )
 
     @staticmethod
-    def settings(qprc = None) -> None:
+    def settings(qprc: str | Path | None = None) -> None:
         # path to quantum_package.rc file
         if isinstance(qprc, Path):
             QuantumPackage.qprc = str(qprc.resolve())

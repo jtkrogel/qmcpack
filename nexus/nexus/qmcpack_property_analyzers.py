@@ -130,7 +130,7 @@ class Bspline(QAobject):
 class RadialJastrow(QAobject):
     def __init__(
         self,
-        ftype,
+        ftype : str,
         coeff,
         cusp  : float,
         rcut,
@@ -382,7 +382,6 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def plot_jastrows
 
 #end class WavefunctionAnalyzer
-
 
 
 

@@ -717,9 +717,9 @@ class DatAnalyzer(QBase):
 
     def plot_series(
         self,
-        quantity,
+        quantity : str,
         style,
-        prefix,
+        prefix   : str,
         ) -> tuple:
         if not quantity in self.stats:
             msg = 'quantity '+quantity+f' is not present in the data for {self.info.filepath}'
@@ -767,9 +767,9 @@ class DatAnalyzer(QBase):
 
     def plot_histogram(
         self,
-        quantity,
+        quantity : str,
         style,
-        prefix,
+        prefix   : str,
         ):
         raise NotImplementedError
         #if not quantity in self.data:
@@ -1738,7 +1738,6 @@ QMCA examples:
 if __name__=='__main__':
     QMCA()
 #end if
-
 
 
 

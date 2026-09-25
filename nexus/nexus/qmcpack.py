@@ -25,6 +25,7 @@
 
 
 from __future__ import annotations
+from pathlib import Path
 
 import os
 from copy import deepcopy
@@ -67,7 +68,7 @@ from .xmlreader import XMLreader
 from . import numpy_extensions as npe
 
 
-def get_path(o, path, value = None):
+def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -152,7 +153,7 @@ class GCTA(DevBase):
         return int_value
     #end def check_kpoint_weight
 
-    def read_eshdf_data(self, filename) -> None:
+    def read_eshdf_data(self, filename: str | Path) -> None:
         '''
         Read the ESHDF eigenvalues, k-point info and store the data in the GCTA instance as an attribute
         '''
@@ -339,7 +340,7 @@ class GCTA(DevBase):
     #end def
 
     @staticmethod
-    def pwscf_tot_magnet(filepath) -> float | None:
+    def pwscf_tot_magnet(filepath: str | Path) -> float | None:
         file = f'{filepath}/pwscf_output/pwscf.xml'
         xml = XMLreader(file, warn=False).obj
         calculation = xml['qes:espresso']['input']['control_variables']['calculation']['text']
@@ -358,7 +359,7 @@ class GCTA(DevBase):
     #end if
 
     @staticmethod
-    def pwscf_fermi(filepath, scf_type) -> float | np.ndarray | None:
+    def pwscf_fermi(filepath: str | Path, scf_type) -> float | np.ndarray | None:
         file = f'{filepath}/pwscf_output/pwscf.xml'
         xml = XMLreader(file, warn=False).obj
         calculation = xml['qes:espresso']['input']['control_variables']['calculation']['text']
@@ -714,7 +715,7 @@ class Qmcpack(Simulation):
 
 
     @staticmethod
-    def restartable_input(input) -> bool:
+    def restartable_input(input: QmcpackInput | TracedQmcpackInput) -> bool:
         if isinstance(input,TracedQmcpackInput):
             inputs = input.inputs.values()
         else:

@@ -1,5 +1,6 @@
 # Python standard library imports
 from __future__ import annotations
+from pathlib import Path
 
 import os
 import sys
@@ -27,7 +28,7 @@ from .debug import ci
 
 
 
-def get_path(o, path, value = None):
+def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -170,7 +171,7 @@ class DefinedAttributeBase(DevBase):
     #end def set_unassigned_default
 
     @classmethod
-    def define_attributes(cls, *other_cls, **attribute_properties) -> None:
+    def define_attributes(cls, *other_cls, **attribute_properties: dict) -> None:
         if len(other_cls)==1 and issubclass(other_cls[0],DefinedAttributeBase):
             cls.obtain_attributes(other_cls[0])
         #end if
@@ -599,7 +600,7 @@ class ObservableWithComponents(Observable):
     #end def component
 
 
-    def components(self, names = None) -> obj:
+    def components(self, names: str | list[str] | None = None) -> obj:
         comps = obj()
         if names is None:
             for c in self.component_names:
@@ -637,7 +638,7 @@ class ObservableWithComponents(Observable):
 
 
 
-def read_eshdf_nofk_data(filename, Ef) -> obj:
+def read_eshdf_nofk_data(filename: str, Ef) -> obj:
 
     def h5int(i):
         return np.array(i,dtype=int)[0]
@@ -887,17 +888,17 @@ class MomentumDistribution(ObservableWithComponents):
 
     def plot_plane_contours(
         self,
-        quantity                       = None,
-        origin                         = None,
-        a1                             = None,
-        a2                             = None,
-        a1_range     : tuple[int, int] = (0,1),
-        a2_range     : tuple[int, int] = (0,1),
-        grid_spacing : float           = 0.3,
+        quantity     : str | None                                          = None,
+        origin                                                             = None,
+        a1           : list[float] | tuple[float, ...] | np.ndarray | None = None,
+        a2           : list[float] | tuple[float, ...] | np.ndarray | None = None,
+        a1_range     : tuple[int, int]                                     = (0,1),
+        a2_range     : tuple[int, int]                                     = (0,1),
+        grid_spacing : float                                               = 0.3,
         *,
-        unit_in      : bool            = False,
-        unit_out     : bool            = False,
-        boundary     : bool            = True,
+        unit_in      : bool                                                = False,
+        unit_out     : bool                                                = False,
+        boundary     : bool                                                = True,
         ) -> None:
         c  = self.component(quantity)
         o  = np.asarray(origin)
@@ -1081,12 +1082,12 @@ class MomentumDistributionDFT(MomentumDistribution):
 
     def read_eshdf(
         self,
-        filepath,
-        E_fermi         = None,
-        savefile        = None,
+        filepath : str | Path,
+        E_fermi                      = None,
+        savefile : str | Path | None = None,
         *,
-        unfold   : bool = False,
-        grid     : bool = True,
+        unfold   : bool              = False,
+        grid     : bool              = True,
         ) -> None:
 
         save = False
@@ -1177,8 +1178,8 @@ class MomentumDistributionQMC(MomentumDistribution):
     def read_stat_h5(
         self,
         *files,
-        equil    : int = 0,
-        savefile       = None,
+        equil    : int               = 0,
+        savefile : str | Path | None = None,
         ) -> None:
 
         save = False
@@ -1316,7 +1317,7 @@ class Density(ObservableWithComponents):
     #end def volume_normalize
 
 
-    def norm(self, component = None) -> obj:
+    def norm(self, component: str | None = None) -> obj:
         norms = obj()
         comps = self.components(component)
         for name,d in comps.items():
@@ -1332,7 +1333,7 @@ class Density(ObservableWithComponents):
     #end def norm
 
 
-    def change_distance_units(self, units) -> None:
+    def change_distance_units(self, units: str) -> None:
         units_old = self.get_attribute('distance_units')
         rscale    = convert(1.0,units_old,units)
         grid      = self.get_attribute('grid')
@@ -1341,7 +1342,7 @@ class Density(ObservableWithComponents):
     #end def change_distance_units
 
 
-    def change_density_units(self, units) -> None:
+    def change_density_units(self, units: str) -> None:
         units_old = self.get_attribute('density_units')
         dscale    = 1.0/convert(1.0,units_old,units)
         for c in self.components().values():
@@ -1353,7 +1354,7 @@ class Density(ObservableWithComponents):
 
     def radial_density(
         self,
-        component                                        = None,
+        component     : str | None                       = None,
         dr            : float                            = 0.01,
         ntheta        : int                              = 100,
         rmax          : list[str | np.float64] | None    = None,
@@ -1545,7 +1546,7 @@ class Density(ObservableWithComponents):
 
     def save_radial_density(
         self,
-        prefix,
+        prefix   : str,
         rdfs = None,
         **kwargs,
         ) -> None:
@@ -1660,7 +1661,7 @@ class StatFile(DevBase):
     #end for
 
 
-    def __init__(self, filepath = None, **read_kwargs) -> None:
+    def __init__(self, filepath: str | Path | None = None, **read_kwargs) -> None:
         self.filepath = None
 
         if filepath is not None:
@@ -1670,7 +1671,7 @@ class StatFile(DevBase):
     #end def __init__
 
 
-    def read(self, filepath, observables: str = 'all') -> None:
+    def read(self, filepath: str | Path, observables: str = 'all') -> None:
         import h5py
         if not os.path.exists(filepath):
             msg = (

@@ -134,9 +134,9 @@ class TextFile(DevBase):
     def seek(
         self,
         pos    : int | str,
-        whence : int = 0,
-        start        = None,
-        end          = None,
+        whence : int        = 0,
+        start  : int | None = None,
+        end    : int | None = None,
         ) -> int | None:
         if isinstance(pos,str):
             pos = pos.encode('ASCII')
@@ -246,7 +246,7 @@ class TextFile(DevBase):
         return self.mm.tell()
     #end def tell
 
-    def write(self, string):
+    def write(self, string: str):
         return self.mm.write(string)
     #end def write
 
@@ -261,7 +261,7 @@ class StandardFile(DevBase):
 
     sftype = ''
 
-    def __init__(self, filepath = None) -> None:
+    def __init__(self, filepath: str | bytes | Path | None = None) -> None:
         if filepath is None:
             pass
         elif isinstance(filepath, str | bytes | Path):
@@ -352,7 +352,11 @@ class XsfFile(StandardFile):
     # forces are in units of Hatree/Angstrom
     # each section should be followed by a blank line
 
-    def __init__(self, filepath = None, order = None) -> None:
+    def __init__(
+        self,
+        filepath : str | Path | None = None,
+        order    : str | None        = None,
+        ) -> None:
         self.filetype    = None
         self.periodicity = None
         self.order       = None
@@ -391,7 +395,7 @@ class XsfFile(StandardFile):
 
 
     # test needed for axsf and bxsf
-    def read_text(self, text: str, order = None) -> None:
+    def read_text(self, text: str, order: str | None = None) -> None:
         if order is not None:
             if order!='F' and order!='C':
                 msg = (
@@ -896,12 +900,12 @@ class XsfFile(StandardFile):
         self,
         cell      : np.ndarray,
         density   : np.ndarray,
-        name      : str               = 'density',
-        corner    : np.ndarray | None = None,
-        grid                          = None,
+        name      : str                                             = 'density',
+        corner    : np.ndarray | None                               = None,
+        grid      : list[int] | tuple[int, ...] | np.ndarray | None = None,
         *,
-        centered  : bool | int        = False,
-        add_ghost : bool | int        = False,
+        centered  : bool | int                                      = False,
+        add_ghost : bool | int                                      = False,
         ) -> None:
         if corner is None:
             corner = np.zeros((3,),dtype=float)
@@ -957,7 +961,7 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def change_units(self, in_unit, out_unit) -> None:
+    def change_units(self, in_unit: str, out_unit: str) -> None:
         fac = 1.0/convert(1.0,in_unit,out_unit)**3
         density = self.get_density()
         density.values *= fac
@@ -968,7 +972,7 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def remove_ghost(self, density = None) -> np.ndarray:
+    def remove_ghost(self, density: obj | None = None) -> np.ndarray:
         if density is None:
             density = self.get_density()
         #end if
@@ -990,9 +994,9 @@ class XsfFile(StandardFile):
     # test needed
     def norm(
         self,
-        density        = None,
+        density : obj | None = None,
         *,
-        vnorm   : bool = True,
+        vnorm   : bool       = True,
         ) -> float:
         if density is None:
             density = self.get_density()
@@ -1011,7 +1015,11 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def line_data(self, dim, density = None) -> tuple[float, float]:
+    def line_data(
+        self,
+        dim     : int,
+        density : obj | None = None,
+        ) -> tuple[float, float]:
         if density is None:
             density = self.get_density()
         #end if
@@ -1037,7 +1045,7 @@ class XsfFile(StandardFile):
     #end def line_data
 
 
-    def line_plot(self, dim, filepath) -> None:
+    def line_plot(self, dim: int, filepath: str | Path) -> None:
         r,d = self.line_data(dim)
         np.savetxt(filepath,np.array(list(zip(r,d))))
     #end def line_plot
@@ -1045,12 +1053,12 @@ class XsfFile(StandardFile):
     # test needed
     def interpolate_plane(
         self,
-        r1,
-        r2,
-        r3,
-        density          = None,
-        meshsize   : int = 50,
-        fill_value : int = 0,
+        r1         : list[float] | tuple[float, ...] | np.ndarray,
+        r2         : list[float] | tuple[float, ...] | np.ndarray,
+        r3         : list[float] | tuple[float, ...] | np.ndarray,
+        density    : obj | None = None,
+        meshsize   : int        = 50,
+        fill_value : int        = 0,
         ) -> tuple:
         if density is None:
             density = self.get_density()
@@ -1134,7 +1142,7 @@ class PoscarFile(StandardFile):
 
     sftype = 'POSCAR'
 
-    def __init__(self, filepath = None) -> None:
+    def __init__(self, filepath: str | Path | None = None) -> None:
         self.description = None
         self.scale       = None
         self.axes        = None
@@ -1366,7 +1374,7 @@ class ChgcarFile(StandardFile):
 
     sftype = 'CHGCAR'
 
-    def __init__(self, filepath = None) -> None:
+    def __init__(self, filepath: str | Path | None = None) -> None:
         self.poscar         = None
         self.grid           = None
         self.charge_density = None
@@ -1572,7 +1580,11 @@ def read_poscar_chgcar(host: StandardFile, text: str) -> None:
         dynamic = None
     #end if
 
-    def is_empty(lines, start = None, end = None):
+    def is_empty(
+        lines : list[str],
+        start : int | None = None,
+        end   : int | None = None,
+        ):
         if start is None:
             start = 0
         #end if

@@ -291,14 +291,14 @@ class XMLelement(DevBase):
 class XMLreader(DevBase):
     def __init__(
         self,
-        fpath           : str | Path | None = None,
+        fpath           : str | Path | None     = None,
         *,
-        element_joins                       = None,
-        element_aliases                     = None,
-        strip_prefix                        = None,
-        xml                                 = None,
-        contract_names  : bool              = False,
-        warn            : bool              = True,
+        element_joins   : list[str] | None      = None,
+        element_aliases : dict[str, str] | None = None,
+        strip_prefix                            = None,
+        xml                                     = None,
+        contract_names  : bool                  = False,
+        warn            : bool                  = True,
         ) -> None:
         if element_joins is None:
             element_joins = []
@@ -394,7 +394,7 @@ class XMLreader(DevBase):
         self.pad = self.ilevel*'  '
     #end def decrement_level
 
-    def found_element_start(self, ename: str, attributes) -> None:
+    def found_element_start(self, ename: str, attributes: dict[str, str]) -> None:
         cur = self.cur[self.ilevel]
         if ename in self.element_aliases.keys():
             if self.element_aliases[ename].find('attributes')!=-1:

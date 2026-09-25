@@ -150,11 +150,11 @@ def nxs_print(
 
 
 def message(
-    msg,
-    header            = None,
-    post_header : str = ' message:',
-    indent      : str = '    ',
-    logfile           = None,
+    msg         : str,
+    header      : str | None = None,
+    post_header : str        = ' message:',
+    indent      : str        = '    ',
+    logfile                  = None,
     ) -> None:
     if logfile is None:
         logfile = sys.stdout

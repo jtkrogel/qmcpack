@@ -730,7 +730,11 @@ class OutcarData(DevBase):
 
     read_outcar_functions = any_functions + elast_functions + ilast_functions
 
-    def __init__(self, filepath = None, lines: list | None = None) -> None:
+    def __init__(
+        self,
+        filepath : str | Path | None = None,
+        lines    : list | None       = None,
+        ) -> None:
         if filepath is not None:
             if not os.path.exists(filepath):
                 msg = f'file {filepath} does not exist'
@@ -849,7 +853,7 @@ class VaspAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self, outcar = None) -> None:
+    def analyze(self, outcar: str | None = None) -> None:
         if self.info.neb:
             self.neb_analyzers = obj()
             for i in range(self.info.incar.images):

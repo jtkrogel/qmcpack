@@ -268,9 +268,9 @@ def qmcfit(
 # Reads scalar.dat files and extracts energy series
 def process_scalar_files(
     scalar_files    : list[str],
-    equils          : np.int64 | None = None,
-    reblock_factors                   = None,
-    series_start    : int | None      = None,
+    equils          : np.int64 | None      = None,
+    reblock_factors : int | np.int_ | None = None,
+    series_start    : int | None           = None,
     ):
     if len(scalar_files)==0:
         msg = 'must provide at least one scalar file'

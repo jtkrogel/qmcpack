@@ -29,6 +29,7 @@
 
 
 from __future__ import annotations
+from pathlib import Path
 
 import os
 from .developer import obj
@@ -103,7 +104,7 @@ from .simulation import Simulation,SimulationInput,SimulationAnalyzer
 
 
 class TemplateSimulationInput(SimulationInput):
-    def __init__(self, filepath = None) -> None:
+    def __init__(self, filepath: str | Path | None = None) -> None:
         # optional
         #  below is a convenient default
         #  but it can be changed to anything desired
@@ -113,7 +114,11 @@ class TemplateSimulationInput(SimulationInput):
     #end def __init__
 
 
-    def read_text(self, text: str | list[str], filepath = None) -> None:
+    def read_text(
+        self,
+        text     : str | list[str],
+        filepath : str | Path | None = None,
+        ) -> None:
         # required
         #  the string 'text' contains the text of an input file
         #  translate text into an internal representation of the input
@@ -158,7 +163,7 @@ class TemplateSimulationInput(SimulationInput):
     #end def read_text
 
 
-    def write_text(self, filepath = None) -> str:
+    def write_text(self, filepath: str | Path | None = None) -> str:
         # required
         #  translate the internal representation of input into a string
         # for the above example, this might look like:

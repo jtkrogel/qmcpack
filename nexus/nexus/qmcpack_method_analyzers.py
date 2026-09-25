@@ -264,7 +264,7 @@ class MethodAnalyzer(QAanalyzer):
     #end def unset_global_info
 
 
-    def check_traces(self, pad = None) -> bool | None:
+    def check_traces(self, pad: str | None = None) -> bool | None:
         verbose = pad is not None
         method = self.info.method
         series = self.info.series

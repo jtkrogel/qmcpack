@@ -134,7 +134,7 @@ def input_list(s: str) -> list[str]:
 
 
 
-def qmcpack_filepath(basepath, tokens, g: str | None = None) -> str:
+def qmcpack_filepath(basepath: str | Path, tokens, g: str | None = None) -> str:
     file = ''
     for t in tokens:
         if g is not None and t.startswith('g') and t[1:].isdigit():
@@ -165,7 +165,7 @@ def _has_orthorhombic_axes(structure: Structure) -> bool:
 def reblock(
     data     : np.ndarray,
     eq       : int,
-    rb                    = None,
+    rb       : int | None = None,
     filepath : str | None = None,
     ) -> np.ndarray:
     # return equilibration adjusted data if not reblocking
@@ -236,19 +236,19 @@ class QDBase(DevBase):
 class SingleDensity(QDBase):
     def __init__(
         self,
-        filepath                           = None,
-        format                             = None,
-        mean                               = None,
-        error                              = None,
-        data           : np.ndarray | None = None,
-        grid           : np.ndarray | None = None,
-        structure      : Structure | None  = None,
-        extension      : str | None        = None,
+        filepath       : str | Path | None               = None,
+        format         : str | None                      = None,
+        mean           : list[float] | np.ndarray | None = None,
+        error          : list[float] | np.ndarray | None = None,
+        data           : np.ndarray | None               = None,
+        grid           : np.ndarray | None               = None,
+        structure      : Structure | None                = None,
+        extension      : str | None                      = None,
         # This is the cell region where the density was sampled. It can be different
         # from the whole cell structure.
-        density_cell   : np.ndarray | None = None,
+        density_cell   : np.ndarray | None               = None,
         # This is the reference corner for density_cell.
-        density_corner : np.ndarray | None = None,
+        density_corner : np.ndarray | None               = None,
         ) -> None:
         # initialize class variables
         self.mean      = None
@@ -328,12 +328,12 @@ class SingleDensity(QDBase):
     #end def check_type
 
 
-    def has(self, name) -> bool:
+    def has(self, name: str) -> bool:
         return self[name] is not None
     #end def has
 
 
-    def require(self, name, action) -> None:
+    def require(self, name: str, action: str) -> None:
         if self[name] is None:
             msg = f'cannot {action}, {name} is not present'
             raise RuntimeError(msg)
@@ -366,7 +366,7 @@ class SingleDensity(QDBase):
     #end def write
 
 
-    def write_dat(self, prefix) -> None:
+    def write_dat(self, prefix: str) -> None:
         extension   = self.extension
         density     = self.mean
         density_err = self.error
@@ -579,7 +579,7 @@ class StatFile(QDBase):
     #end def read
 
 
-    def write(self, filepath) -> None:
+    def write(self, filepath: str | Path) -> None:
         h5 = h5py.File(filepath,'w')
         if not self.use_dens:
             for name,spin_density in self.spin_density_data.items():
@@ -859,7 +859,7 @@ class StatFile(QDBase):
     #end def write_output_files
 
 
-    def line_plot(self, dim) -> None:
+    def line_plot(self, dim: int) -> None:
         import matplotlib.pyplot as plt
         params = {
             'legend.fontsize'      : 14,

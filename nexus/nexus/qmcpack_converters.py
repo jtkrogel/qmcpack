@@ -101,7 +101,7 @@ readval={str:read_str,int:read_int,float:read_float,bool:read_bool}
 writeval={str:write_str,int:write_int,float:write_float,bool:write_bool}
 
 
-def get_path(o, path, value = None):
+def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -215,7 +215,10 @@ def generate_pw2qmcpack_input(
 #end def generate_pw2qmcpack_input
 
 
-def read_eshdf_eig_data(filename, Ef_list) -> obj:
+def read_eshdf_eig_data(
+    filename : str | Path,
+    Ef_list  : list[int | float] | np.ndarray,
+    ) -> obj:
     def h5int(i):
         return np.array(i,dtype=int)[0]
     #end def h5int
@@ -288,7 +291,7 @@ def gcta_occupation(wfh5, ntwist) -> list:
 
 
 class Pw2qmcpackAnalyzer(SimulationAnalyzer):
-    def __init__(self, arg0) -> None:
+    def __init__(self, arg0: str | Path | Simulation) -> None:
         if isinstance(arg0,Simulation):
             sim = arg0
             self.infile = sim.infile
@@ -509,7 +512,7 @@ class Pw2qmcpack(Simulation):
     #end def fill_products
 
 
-    def receive_orbitals(self, orb_path) -> None:
+    def receive_orbitals(self, orb_path: str | Path) -> None:
         # This just checks if output paths match.
         # Otherwise running pw2qmcpack will fail.
         orbdir = os.path.realpath(orb_path)
@@ -825,7 +828,7 @@ class Convert4qmcInput(SimulationInput):
     #end def read
 
 
-    def write_text(self, filepath = None) -> str | None:
+    def write_text(self, filepath: str | Path | None = None) -> str | None:
         return self.app_command()
     #end def write_text
 
@@ -850,7 +853,7 @@ def generate_convert4qmc_input(**kwargs: bool | int | str) -> Convert4qmcInput:
 
 
 class Convert4qmcAnalyzer(SimulationAnalyzer):
-    def __init__(self, arg0) -> None:
+    def __init__(self, arg0: str | Path | Simulation) -> None:
         if isinstance(arg0,Simulation):
             self.infile = arg0.infile
         else:
@@ -1083,7 +1086,7 @@ def generate_convertpw4qmc_input(**kwargs) -> Convertpw4qmcInput:
 #end def genreate_convertpw4qmc_input
 
 class Convertpw4qmcAnalyzer(SimulationAnalyzer):
-    def __init__(self, arg0) -> None:
+    def __init__(self, arg0: str | Path | Simulation) -> None:
         if isinstance(arg0,Simulation):
             self.infile = arg0.infile
         else:
@@ -1440,7 +1443,7 @@ class PyscfToAfqmcInput(SimulationInput):
     #end def read
 
 
-    def write_text(self, filepath = None) -> str | None:
+    def write_text(self, filepath: str | Path | None = None) -> str | None:
         return self.app_command()
     #end def write_text
 #end class PyscfToAfqmcInput
@@ -1456,7 +1459,7 @@ def generate_pyscf_to_afqmc_input(
 
 
 class PyscfToAfqmcAnalyzer(SimulationAnalyzer):
-    def __init__(self, arg0) -> None:
+    def __init__(self, arg0: str | Path | Simulation) -> None:
         if isinstance(arg0,Simulation):
             self.infile = arg0.infile
         else:

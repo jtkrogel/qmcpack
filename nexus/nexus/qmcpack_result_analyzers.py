@@ -299,9 +299,9 @@ class OptimizationAnalyzer(ResultAnalyzer):
 
     def plot_opt_convergence(
         self,
-        title           = None,
+        title    : str | None = None,
         *,
-        saveonly : bool = False,
+        saveonly : bool       = False,
         ) -> None:
         if title is None:
             ts = 'Optimization: Energy/Variance Convergence'
@@ -346,10 +346,10 @@ class OptimizationAnalyzer(ResultAnalyzer):
 
     def plot_jastrow_convergence(
         self,
-        title           = None,
+        title    : str | None = None,
         *,
-        saveonly : bool = False,
-        optconv  : bool = True,
+        saveonly : bool       = False,
+        optconv  : bool       = True,
         ) -> None:
         if title is None:
             tsin = None

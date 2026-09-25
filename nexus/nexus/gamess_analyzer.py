@@ -33,7 +33,7 @@ def assign_value(
     host,
     dest,
     file,
-    string,
+    string : str,
     ) -> None:
     if file.seek(string)!=-1:
         host[dest] = float(file.readtokens()[-1])
@@ -70,11 +70,11 @@ class GamessAnalyzer(SimulationAnalyzer):
 
     def __init__(
         self,
-        arg0                  = None,
-        prefix                = None,
+        arg0           : str | Path | Simulation | None = None,
+        prefix         : str | None                     = None,
         *,
-        analyze        : bool = False,
-        exit           : bool = False,
+        analyze        : bool                           = False,
+        exit           : bool                           = False,
         **outfilenames,
         ) -> None:
         self.info = obj(

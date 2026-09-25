@@ -272,12 +272,12 @@ def text_diff(
 def print_diff(
     o1,
     o2,
-    atol                = def_atol,
-    rtol                = def_rtol,
+    atol         : float = def_atol,
+    rtol         : float = def_rtol,
     *,
-    int_as_float : bool = False,
-    text         : bool = False,
-    by_line      : bool = False,
+    int_as_float : bool  = False,
+    text         : bool  = False,
+    by_line      : bool  = False,
     ) -> None: # used in debugging, not actual tests
     from .developer import obj
     hline = '========== {} =========='

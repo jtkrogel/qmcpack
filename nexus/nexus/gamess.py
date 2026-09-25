@@ -276,7 +276,7 @@ class Gamess(Simulation):
     #end def get_output_files
 
 
-    def output_filename(self, name) -> str:
+    def output_filename(self, name: str) -> str:
         name = name.upper()
         if name not in GamessInput.file_units:
             msg = f'gamess does not produce a file matching the requested description: {name}'
@@ -307,7 +307,6 @@ def generate_gamess(**kwargs) -> Gamess:
 
     return gamess
 #end def generate_gamess
-
 
 
 

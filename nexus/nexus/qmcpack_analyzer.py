@@ -194,7 +194,11 @@ class QmcpackAnalyzer
        |  Each observable is calculated by an object contained in results
 """
 class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
-    def __init__(self, arg0 = None, **kwargs) -> None:
+    def __init__(
+        self,
+        arg0     : str | Path | QmcpackAnalysisRequest | Simulation | None = None,
+        **kwargs,
+        ) -> None:
 
         verbose = False
         if 'verbose' in kwargs:
@@ -717,9 +721,9 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     def check_traces(
         self,
         *,
-        verbose : bool = False,
-        pad            = None,
-        header         = None,
+        verbose : bool       = False,
+        pad     : str | None = None,
+        header  : str | None = None,
         ) -> None:
         if pad is None:
             pad = ''
@@ -745,7 +749,7 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
 
     def plot_trace(
         self,
-        quantity,
+        quantity : str,
         style    : str  = 'b-',
         offset   : int  = 0,
         source   : str  = 'scalar',

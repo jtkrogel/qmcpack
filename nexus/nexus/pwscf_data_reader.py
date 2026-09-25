@@ -87,7 +87,7 @@ class QEXML(DevBase):
 
 
 bools = obj(F=False,T=True)
-def readval(s) -> int | float | str | list[str] | None:
+def readval(s: str) -> int | float | str | list[str] | None:
     s = s.strip()
     v = None
     if s in bools:

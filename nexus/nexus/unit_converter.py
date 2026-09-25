@@ -198,7 +198,7 @@ class UnitConverter(DevBase):
     #end def convert
 
     @staticmethod
-    def convert_scalar_to_all(units, value_orig) -> dict[str, float]:
+    def convert_scalar_to_all(units: str, value_orig) -> dict[str, float]:
         unit_type = UnitConverter.unit_dict[units].type
 
         value = dict()

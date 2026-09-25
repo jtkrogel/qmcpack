@@ -18,6 +18,7 @@
 
 
 from __future__ import annotations
+from pathlib import Path
 
 import os
 from copy import deepcopy
@@ -471,7 +472,7 @@ class Pwscf(Simulation):
     #end def fill_products
 
 
-    def receive_charge_density(self, charge_density_path) -> None:
+    def receive_charge_density(self, charge_density_path: str | Path) -> None:
         if not os.path.isdir(charge_density_path):
             msg = (
                 'charge density path is not a directory.\n'

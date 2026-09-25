@@ -205,7 +205,7 @@ class Namelist(DevBase):
     #end def assign_values
 
 
-    def read_text(self, text) -> None:
+    def read_text(self, text: str | list[str]) -> None:
         cls = self.__class__
         if isinstance(text,str):
             lines = text.split()
@@ -571,12 +571,12 @@ class ProjwfcInput(NamelistInput):
 class ProjwfcAnalyzer(SimulationAnalyzer):
     def __init__(
         self,
-        arg0    : Path | None = None,
-        outfile               = None,
+        arg0    : Path | None       = None,
+        outfile : str | Path | None = None,
         *,
-        analyze : bool        = False,
-        warn    : bool        = False,
-        strict  : bool        = False,
+        analyze : bool              = False,
+        warn    : bool              = False,
+        strict  : bool              = False,
         ) -> None:
         self.info = obj(
             outfile     = outfile,
@@ -971,12 +971,12 @@ class HpInput(NamelistInput):
 class HpAnalyzer(SimulationAnalyzer):
     def __init__(
         self,
-        arg0           = None,
-        outfile        = None,
+        arg0    : str | Path | Simulation | None = None,
+        outfile : str | Path | None              = None,
         *,
-        analyze : bool = False,
-        warn    : bool = False,
-        strict  : bool = False,
+        analyze : bool                           = False,
+        warn    : bool                           = False,
+        strict  : bool                           = False,
         ) -> None:
         self.info = obj(
             outfile     = outfile,

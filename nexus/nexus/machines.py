@@ -1028,7 +1028,7 @@ class Machine(NexusCore):
 
 
     @staticmethod
-    def exists(machine_name) -> bool:
+    def exists(machine_name: str) -> bool:
         return machine_name in Machine.machines
     #end def exists
 
@@ -1040,7 +1040,7 @@ class Machine(NexusCore):
 
 
     @staticmethod
-    def add(machine) -> None:
+    def add(machine: Machine) -> None:
         if not isinstance(machine,Machine):
             msg = 'attempted to add non-machine instance'
             raise TypeError(msg)
@@ -1060,7 +1060,7 @@ class Machine(NexusCore):
 
 
     @staticmethod
-    def get(machine_name):
+    def get(machine_name: str):
         if isinstance(machine_name,str):
             machine_name = machine_name.lower()
         else:
@@ -1142,13 +1142,13 @@ class Machine(NexusCore):
     def specialized_bundle_commands(
         self,
         job,
-        launcher,
+        launcher : str,
         serial,
         ):
         raise NotImplementedError
     #end def specialized_bundle_commands
 
-    def __init__(self, name, queue_size: int = 0) -> None:
+    def __init__(self, name: str, queue_size: int = 0) -> None:
         # deferred type change for Machine.machines (protects testing)
         if isinstance(Machine.machines,dict):
             Machine.machines = obj(**Machine.machines)
@@ -1520,13 +1520,13 @@ class InteractiveCluster(Workstation):
 
     def init_from_args(
         self,
-        name                : str = 'icluster',
-        nodes                     = None,
-        procs_per_node            = None,
-        cores_per_proc            = None,
-        process_granularity       = None,
-        ram_per_node              = None,
-        app_launcher              = None,
+        name                : str        = 'icluster',
+        nodes                            = None,
+        procs_per_node                   = None,
+        cores_per_proc                   = None,
+        process_granularity              = None,
+        ram_per_node                     = None,
+        app_launcher        : str | None = None,
         ) -> None:
         self.name           = name
         self.nodes          = nodes
@@ -1617,7 +1617,7 @@ class Supercomputer(Machine):
         cores_per_proc : int | None = None,
         ram_per_node   : int | None = None,
         queue_size     : int        = 0,
-        app_launcher                = None,
+        app_launcher   : str | None = None,
         sub_launcher   : str | None = None,
         queue_querier  : str | None = None,
         job_remover    : str | None = None,
@@ -1935,7 +1935,7 @@ class Supercomputer(Machine):
     #end def post_process_job
 
 
-    def query_queue(self, out = None) -> obj:
+    def query_queue(self, out: str | None = None) -> obj:
         self.system_queue.clear()
         if self.query_with_username and self.user is None:
             msg = (
@@ -2275,7 +2275,7 @@ class Supercomputer(Machine):
     #end def write_job_header
 
     @staticmethod
-    def walltime_to_seconds(walltime_str) -> int:
+    def walltime_to_seconds(walltime_str: str) -> int:
         """
         Convert walltime string to total seconds
         Handles formats: 'dd:hh:mm:ss', 'hh:mm:ss', 'mm:ss', 'seconds'
@@ -4686,7 +4686,7 @@ class Polaris(Supercomputer):
     def specialized_bundle_commands(
         self,
         job,
-        launcher,
+        launcher : str,
         serial,
         ) -> str:
         c = ''
@@ -4797,7 +4797,7 @@ class Aurora(Supercomputer):
     def specialized_bundle_commands(
         self,
         job,
-        launcher,
+        launcher : str,
         serial,
         ) -> str:
         c = ''

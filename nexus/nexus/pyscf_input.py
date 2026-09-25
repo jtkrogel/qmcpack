@@ -130,12 +130,12 @@ class PyscfInput(SimulationInputTemplateDev):
         # obj w/ $ prefixed vars in template
         custom                          = None,
         system                          = None,  # physical system object
-        units                           = None,  # input units desired
+        units       : str | None        = None,  # input units desired
         *,
         use_folded  : bool              = True,  # use folded system/primitive cell
         mole        : obj | None        = None,  # obj w/ Mole variables
         cell        : obj | None        = None,  # obj w/ Cell variables
-        sys_var                         = None,  # local var name for Mole/Cell
+        sys_var     : str | None        = None,  # local var name for Mole/Cell
         # local var name for Mole in written input
         mole_var    : str               = 'mol',
         # local var name for Cell in written input
@@ -146,11 +146,11 @@ class PyscfInput(SimulationInputTemplateDev):
         mf_var      : str               = 'mf',
         # local var name for kpts, used for convert
         kpts_var    : str               = 'kpts',
-        filepath                        = None,  # alias for template
+        filepath    : str | Path | None = None,  # alias for template
         # full text of (and alternate to) template
-        text                            = None,
+        text        : str | None        = None,
         calculation : obj | None        = None,  # obj w/ Calculation variables
-        chkfile                         = None,  # obj w/ Calculation variables
+        chkfile     : str | None        = None,  # obj w/ Calculation variables
         twist_num                       = None,  # Twist index
         python_exe  : str               = 'python3',  # Python executable
         ) -> None:
