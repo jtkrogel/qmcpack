@@ -9,6 +9,8 @@ Developers should NOT use this script to run the test suite as it will
 suppress all warnings and fail fast, which is generally not desirable
 for development.
 """
+from __future__ import annotations
+
 
 import sys
 from pathlib import Path

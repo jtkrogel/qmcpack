@@ -22,10 +22,12 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import code
 import inspect
 
-def ci(locs=None,globs=None):
+def ci(locs = None, globs = None) -> None:
     if locs is None or globs is None:
         cur_frame = inspect.currentframe()
         caller_frame = cur_frame.f_back
@@ -38,6 +40,5 @@ def ci(locs=None,globs=None):
 ls = locals
 gs = globals
 interact = ci
-
 
 

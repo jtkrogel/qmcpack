@@ -19,6 +19,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import functools
 import os
 import sys
@@ -45,7 +47,12 @@ class NotAnElementError(ValueError):
 
 
 class NexusDevWarning(Warning):
-    def __init__(self, msg: str, indent: str = "    ", cls: str | None = None):
+    def __init__(
+        self,
+        msg    : str,
+        indent : str = "    ",
+        cls          = None,
+        ) -> None:
         self.message = msg
         self.indent  = indent
         self.cls     = cls
@@ -58,7 +65,14 @@ class NexusUserWarning(NexusDevWarning):
 
 
 # Hook for replacing `warnings.showwarning`
-def __nexus_showwarning(message, category, filename, lineno, file=None, line=None):  # noqa: ARG001
+def __nexus_showwarning(
+    message,
+    category,
+    filename : str,
+    lineno   : int,
+    file = None,
+    line = None,
+    ) -> None:  # noqa: ARG001
     if file is None:
         file = sys.stdout
 
@@ -106,9 +120,9 @@ def nocopy(value):
 
 def nxs_print(
     *items,
-    indent: str | None = None,
-    logfile: TextIO | None = None,
-    n: int = 0
+    indent  : str | None = None,
+    logfile              = None,
+    n       : int        = 0,
     ) -> None:
     logfile = logfile if logfile is not None else sys.stdout
     if n!=0:
@@ -135,7 +149,13 @@ def nxs_print(
 #end def log
 
 
-def message(msg,header=None,post_header=' message:',indent='    ',logfile=None):
+def message(
+    msg,
+    header            = None,
+    post_header : str = ' message:',
+    indent      : str = '    ',
+    logfile           = None,
+    ) -> None:
     if logfile is None:
         logfile = sys.stdout
     #end if
@@ -150,10 +170,10 @@ def message(msg,header=None,post_header=' message:',indent='    ',logfile=None):
 
 
 def warn(
-    msg      : str,
-    indent   : str        = "    ",
-    warn_type: str        = "user",
-    cls      : str | None = None,
+    msg       : str,
+    indent    : str = "    ",
+    warn_type : str = "user",
+    cls             = None,
     ) -> None:
     """Report a warning.
 
@@ -213,9 +233,9 @@ def warn(
 
 
 def nxs_deprecate(
-    since: VersionStr,
-    replacement: str,
-    indent: str = "    "
+    since       : str,
+    replacement : str,
+    indent      : str = "    ",
     ):
     """Decorator for signaling the deprecation of a Nexus function.
 
@@ -245,7 +265,7 @@ def nxs_deprecate(
 #end def nxs_deprecate
 
 
-def error(msg: str, header: str | None = None) -> NoReturn:
+def error(msg: str, header: str | None = None) -> None:
     """Raise a ``NexusError``
 
     Parameters

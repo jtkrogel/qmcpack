@@ -20,6 +20,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 import mmap
@@ -36,7 +38,7 @@ class TextFile(DevBase):
     # interface to mmap files
     # see Python 2 documentation for mmap
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath: str | Path | None = None) -> None:
         self.mm = None
         self.f  = None
         if filepath is not None:
@@ -45,7 +47,7 @@ class TextFile(DevBase):
         #end if
     #end def __init__
 
-    def open(self,filepath):
+    def open(self, filepath: str) -> None:
         filepath = path_string(filepath)
         if not os.path.exists(filepath):
             msg = f'cannot open non-existent file: {filepath}'
@@ -64,23 +66,27 @@ class TextFile(DevBase):
         #end for
     #end def __iter__
 
-    def __getitem__(self,slc):
+    def __getitem__(self, slc: slice) -> bytes:
         return self.mm[slc]
     #end def __getitem__
 
-    def lines(self):
+    def lines(self) -> list[str]:
         return self.read().splitlines()
     #end def lines
 
-    def tokens(self):
+    def tokens(self) -> list[str]:
         return self.read().split()
     #end def tokens
 
-    def readtokens(self,s=None):
+    def readtokens(self, s: str | None = None) -> list[str]:
         return self.readline(s).split()
     #end def readtokens
 
-    def readtokensf(self,s=None,*formats):
+    def readtokensf(
+        self,
+        s        : str | None = None,
+        *formats : type[int | float | str],
+        ) -> int | float | str | list[int | float | str]:
         if s is not None:
             self.seek(s)
         #end if
@@ -119,13 +125,19 @@ class TextFile(DevBase):
     #end def readtokensf
 
     # extended mmap interface below
-    def close(self):
+    def close(self) -> None:
         r = self.mm.close()
         self.f.close()
         return r
     #end def close
 
-    def seek(self,pos,whence=0,start=None,end=None):
+    def seek(
+        self,
+        pos    : int | str,
+        whence : int = 0,
+        start        = None,
+        end          = None,
+        ) -> int | None:
         if isinstance(pos,str):
             pos = pos.encode('ASCII')
             if whence!=2 and start is None:
@@ -164,14 +176,14 @@ class TextFile(DevBase):
         #end if
     #end def seek
 
-    def readline(self,s=None):
+    def readline(self, s: str | None = None) -> str:
         if s is not None:
             self.seek(s)
         #end if
         return to_str(self.mm.readline())
     #end def readline
 
-    def read(self,num=None):
+    def read(self, num = None) -> str | None:
         if num is None:
             return to_str(self.mm[:])
         else:
@@ -181,7 +193,7 @@ class TextFile(DevBase):
 
 
     # unchanged mmap interface below
-    def find(self,*a,**kw):
+    def find(self, *a: str, **kw) -> int:
         args = []
         for v in a:
             if isinstance(v,str):
@@ -193,11 +205,16 @@ class TextFile(DevBase):
         return self.mm.find(*args,**kw)
     #end def find
 
-    def flush(self,*a,**kw):
+    def flush(self, *a, **kw):
         return self.mm(*a,**kw)
     #end def flush
 
-    def move(self,dest,src,count):
+    def move(
+        self,
+        dest,
+        src,
+        count,
+        ):
         return self.mm.move(dest,src,count)
     #end def move
 
@@ -205,11 +222,11 @@ class TextFile(DevBase):
         return self.mm.read_byte()
     #end def read_byte
 
-    def resize(self,newsize):
+    def resize(self, newsize):
         return self.mm.resize(newsize)
     #end def resize
 
-    def rfind(self,*a,**kw):
+    def rfind(self, *a, **kw):
         args = []
         for v in a:
             if isinstance(v,str):
@@ -225,15 +242,15 @@ class TextFile(DevBase):
         return self.mm.size()
     #end def size
 
-    def tell(self):
+    def tell(self) -> int:
         return self.mm.tell()
     #end def tell
 
-    def write(self,string):
+    def write(self, string):
         return self.mm.write(string)
     #end def write
 
-    def write_byte(self,byte):
+    def write_byte(self, byte):
         return self.mm.write_byte(byte)
     #end def write_byte
 #end class TextFile
@@ -244,7 +261,7 @@ class StandardFile(DevBase):
 
     sftype = ''
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         if filepath is None:
             pass
         elif isinstance(filepath, str | bytes | Path):
@@ -257,7 +274,7 @@ class StandardFile(DevBase):
     #end def __init__
 
 
-    def read(self,filepath):
+    def read(self, filepath: str) -> None:
         if not os.path.exists(filepath):
             msg = (
                 'read failed\n'
@@ -272,7 +289,7 @@ class StandardFile(DevBase):
     #end def read
 
 
-    def write(self,filepath=None):
+    def write(self, filepath: str | Path | None = None) -> str:
         self.check_valid('write failed')
         text = self.write_text()
         if filepath is not None:
@@ -283,12 +300,12 @@ class StandardFile(DevBase):
     #end def write
 
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return len(self.validity_checks())==0
     #end def is_valid
 
 
-    def check_valid(self,header=None):
+    def check_valid(self, header: str | None = None) -> None:
         messages = self.validity_checks()
         if len(messages)>0:
             msg = ''
@@ -304,13 +321,13 @@ class StandardFile(DevBase):
     #end def check_valid
 
 
-    def validity_checks(self):
+    def validity_checks(self) -> list:
         messages = []
         return messages
     #end def validity_checks
 
 
-    def read_text(self,text):
+    def read_text(self, text: str):
         raise NotImplementedError
     #end def read_text
 
@@ -335,7 +352,7 @@ class XsfFile(StandardFile):
     # forces are in units of Hatree/Angstrom
     # each section should be followed by a blank line
 
-    def __init__(self,filepath=None,order=None):
+    def __init__(self, filepath = None, order = None) -> None:
         self.filetype    = None
         self.periodicity = None
         self.order       = None
@@ -353,7 +370,12 @@ class XsfFile(StandardFile):
     #end def __init__
 
 
-    def add_to_image(self,image,name,value):
+    def add_to_image(
+        self,
+        image,
+        name  : str,
+        value : np.ndarray,
+        ) -> None:
         if image is None:
             self[name] = value
         else:
@@ -369,7 +391,7 @@ class XsfFile(StandardFile):
 
 
     # test needed for axsf and bxsf
-    def read_text(self,text,order=None):
+    def read_text(self, text: str, order = None) -> None:
         if order is not None:
             if order!='F' and order!='C':
                 msg = (
@@ -620,7 +642,7 @@ class XsfFile(StandardFile):
 
 
     # test needed for axsf and bxsf
-    def write_text(self):
+    def write_text(self) -> str:
         c=''
         if self.filetype=='xsf':    # only write structure/datagrid if present
             if self.periodicity=='molecule' and 'elem' in self:
@@ -666,7 +688,7 @@ class XsfFile(StandardFile):
     #end def write_text
 
 
-    def write_coord(self,image=None,index=''):
+    def write_coord(self, image = None, index: str = '') -> str:
         if image is None:
             s = self
         else:
@@ -694,7 +716,12 @@ class XsfFile(StandardFile):
     #end def write_coord
 
 
-    def write_vec(self,name,vec,index=''):
+    def write_vec(
+        self,
+        name  : str,
+        vec   : np.ndarray,
+        index : str = '',
+        ) -> str:
         c = f' {name.upper()} {index}\n'
         for v in vec:
             c += f'   {v[0]:12.8f} {v[1]:12.8f} {v[2]:12.8f}\n'
@@ -703,7 +730,7 @@ class XsfFile(StandardFile):
     #end def write_vec
 
 
-    def write_data(self):
+    def write_data(self) -> str:
         c = ''
         ncols = 4
         data = self.data
@@ -743,7 +770,7 @@ class XsfFile(StandardFile):
     #end def write_data
 
 
-    def write_band(self):
+    def write_band(self) -> str:
         c = ''
         ncols = 4
         band = self.band
@@ -786,7 +813,7 @@ class XsfFile(StandardFile):
     #end def write_band
 
 
-    def dimension(self):
+    def dimension(self) -> int | None:
         if self.periodicity in self.dimensions:
             return self.dimensions[self.periodicity]
         else:
@@ -795,22 +822,22 @@ class XsfFile(StandardFile):
     #end def dimension
 
 
-    def initialized(self):
+    def initialized(self) -> bool:
         return self.filetype is not None
     #end def initialized
 
 
-    def has_animation(self):
+    def has_animation(self) -> bool:
         return self.filetype=='axsf' and 'animsteps' in self
     #end def has_animation
 
 
-    def has_bands(self):
+    def has_bands(self) -> bool:
         return self.filetype=='bxsf' and 'band' in self and 'info' in self
     #end def has_bands
 
 
-    def has_structure(self):
+    def has_structure(self) -> bool:
         hs = self.filetype=='xsf'
         hs &= 'elem' in self and 'pos' in self
         d = self.dimension()
@@ -821,12 +848,12 @@ class XsfFile(StandardFile):
     #end def has_structure
 
 
-    def has_data(self):
+    def has_data(self) -> bool:
         return self.filetype=='xsf' and 'data' in self
     #end def has_data
 
 
-    def validity_checks(self):
+    def validity_checks(self) -> list[str]:
         ha = self.has_animation()
         hb = self.has_bands()
         hs = self.has_structure()
@@ -844,7 +871,7 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def incorporate_structure(self,structure):
+    def incorporate_structure(self, structure) -> None:
         s = deepcopy(structure)
         s.change_units('A')
         s.recenter()
@@ -865,7 +892,17 @@ class XsfFile(StandardFile):
     #end def incorporate_structure
 
 
-    def add_density(self,cell,density,name='density',corner=None,grid=None,*,centered=False,add_ghost=False):
+    def add_density(
+        self,
+        cell      : np.ndarray,
+        density   : np.ndarray,
+        name      : str               = 'density',
+        corner    : np.ndarray | None = None,
+        grid                          = None,
+        *,
+        centered  : bool | int        = False,
+        add_ghost : bool | int        = False,
+        ) -> None:
         if corner is None:
             corner = np.zeros((3,),dtype=float)
         #end if
@@ -912,15 +949,15 @@ class XsfFile(StandardFile):
     #end def add_density
 
 
-    def get_density(self):
-        def first(d):
+    def get_density(self) -> obj:
+        def first(d: obj) -> obj:
             return d[min(d.keys())]
         return first(first(first(self.data)))
     #end def get_density
 
 
     # test needed
-    def change_units(self,in_unit,out_unit):
+    def change_units(self, in_unit, out_unit) -> None:
         fac = 1.0/convert(1.0,in_unit,out_unit)**3
         density = self.get_density()
         density.values *= fac
@@ -931,7 +968,7 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def remove_ghost(self,density=None):
+    def remove_ghost(self, density = None) -> np.ndarray:
         if density is None:
             density = self.get_density()
         #end if
@@ -951,7 +988,12 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def norm(self,density=None,*,vnorm=True):
+    def norm(
+        self,
+        density        = None,
+        *,
+        vnorm   : bool = True,
+        ) -> float:
         if density is None:
             density = self.get_density()
         #end if
@@ -969,7 +1011,7 @@ class XsfFile(StandardFile):
 
 
     # test needed
-    def line_data(self,dim,density=None):
+    def line_data(self, dim, density = None) -> tuple[float, float]:
         if density is None:
             density = self.get_density()
         #end if
@@ -995,13 +1037,21 @@ class XsfFile(StandardFile):
     #end def line_data
 
 
-    def line_plot(self,dim,filepath):
+    def line_plot(self, dim, filepath) -> None:
         r,d = self.line_data(dim)
         np.savetxt(filepath,np.array(list(zip(r,d))))
     #end def line_plot
 
     # test needed
-    def interpolate_plane(self,r1,r2,r3,density=None,meshsize=50,fill_value=0):
+    def interpolate_plane(
+        self,
+        r1,
+        r2,
+        r3,
+        density          = None,
+        meshsize   : int = 50,
+        fill_value : int = 0,
+        ) -> tuple:
         if density is None:
             density = self.get_density()
         #end if
@@ -1084,7 +1134,7 @@ class PoscarFile(StandardFile):
 
     sftype = 'POSCAR'
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.description = None
         self.scale       = None
         self.axes        = None
@@ -1099,14 +1149,14 @@ class PoscarFile(StandardFile):
     #end def __init__
 
 
-    def assign_defaults(self):
+    def assign_defaults(self) -> None:
         if self.description is None:
             self.description = 'System cell and coordinates'
         #end if
     #end def assign_defaults
 
 
-    def validity_checks(self):
+    def validity_checks(self) -> list[str]:
         msgs = []
         if self.description is None:
             msgs.append('description is missing')
@@ -1201,12 +1251,12 @@ class PoscarFile(StandardFile):
     #end def validity_checks
 
 
-    def read_text(self,text):
+    def read_text(self, text: str) -> None:
         read_poscar_chgcar(self,text)
     #end def read_text
 
 
-    def write_text(self):
+    def write_text(self) -> str:
         text = ''
         if self.description is None:
             text += 'System cell and coordinates\n'
@@ -1258,7 +1308,7 @@ class PoscarFile(StandardFile):
     #end def write_text
 
 
-    def incorporate_xsf(self,xsf):
+    def incorporate_xsf(self, xsf: XsfFile) -> None:
         if 'primvec' in xsf:
             axes = xsf.primvec.copy()
         #end if
@@ -1316,7 +1366,7 @@ class ChgcarFile(StandardFile):
 
     sftype = 'CHGCAR'
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.poscar         = None
         self.grid           = None
         self.charge_density = None
@@ -1325,7 +1375,7 @@ class ChgcarFile(StandardFile):
     #end def __init__
 
 
-    def validity_checks(self):
+    def validity_checks(self) -> list[str]:
         msgs = []
         if self.poscar is None:
             msgs.append('poscar elements are missing')
@@ -1374,12 +1424,12 @@ class ChgcarFile(StandardFile):
     #end def validity_checks
 
 
-    def read_text(self,text):
+    def read_text(self, text: str) -> None:
         read_poscar_chgcar(self,text)
     #end def read_text
 
 
-    def write_text(self):
+    def write_text(self) -> str:
         text = self.poscar.write_text()
         text+= '\n {0} {1} {2}\n'.format(*self.grid)
         densities = [self.charge_density]
@@ -1406,7 +1456,7 @@ class ChgcarFile(StandardFile):
     #end def write_text
 
 
-    def incorporate_xsf(self,xsf):
+    def incorporate_xsf(self, xsf: XsfFile) -> None:
         poscar = PoscarFile()
         poscar.incorporate_xsf(xsf)
         density = deepcopy(xsf.remove_ghost())
@@ -1419,7 +1469,7 @@ class ChgcarFile(StandardFile):
 
 
 
-def read_poscar_chgcar(host,text):
+def read_poscar_chgcar(host: StandardFile, text: str) -> None:
     is_poscar = isinstance(host,PoscarFile)
     is_chgcar = isinstance(host,ChgcarFile)
     if not is_poscar and not is_chgcar:
@@ -1522,7 +1572,7 @@ def read_poscar_chgcar(host,text):
         dynamic = None
     #end if
 
-    def is_empty(lines,start=None,end=None):
+    def is_empty(lines, start = None, end = None):
         if start is None:
             start = 0
         #end if
@@ -1579,7 +1629,7 @@ def read_poscar_chgcar(host,text):
                 density.extend(line.split())
             #end for
             if len(density)>0:
-                def is_float(val):
+                def is_float(val: str) -> bool:
                     try:
                         _ = float(val)
                         return True

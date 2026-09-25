@@ -1,6 +1,8 @@
 #! /usr/bin/env python3
 
 # Python standard library imports
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -23,7 +25,7 @@ import numpy as np
 # Locate and import the closely coupled Nexus module
 search_basepath = Path(__file__).resolve().parent.parent
 nexus_library_search_path = search_basepath.parent
-def find_nexus_modules():
+def find_nexus_modules() -> None:
     import sys
 
     # "import nexus" will succeed if nexus directory exists without __init__.py in it.
@@ -85,14 +87,14 @@ opt = obj(
     verbose = False,
     )
 
-def vlog(*args,**kwargs):
+def vlog(*args, **kwargs) -> None:
     if opt.verbose:
         nxs_print(*args,**kwargs)
     #end if
 #end def vlog
 
 
-def get_path(o,path,value=None):
+def get_path(o, path: str, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -105,12 +107,17 @@ def get_path(o,path,value=None):
 
 
 
-def read_eshdf_nofk_data(filename,Ef,ncore=0,nval=-1):
+def read_eshdf_nofk_data(
+    filename : str,
+    Ef       : float,
+    ncore    : int = 0,
+    nval     : int = -1,
+    ) -> obj:
     from numpy import array,pi,dot,sqrt,zeros
     from numpy.linalg import inv
     from nexus.unit_converter import convert
 
-    def h5int(i):
+    def h5int(i) -> np.int64:
         return array(i,dtype=int)[0]
     #end def h5int
 
@@ -190,7 +197,7 @@ def read_eshdf_nofk_data(filename,Ef,ncore=0,nval=-1):
 #end def read_eshdf_nofk_data
 
 
-def first_eshdf_file(args):
+def first_eshdf_file(args: list[str]) -> str:
     # check files provided
     eshdf_files = sorted(args[1:])
     if len(eshdf_files)!=1:
@@ -221,7 +228,7 @@ def first_eshdf_file(args):
 #end def first_eshdf_file
 
 
-def interpret_nk_options(parser):
+def interpret_nk_options(parser: OptionParser) -> tuple:
     options,args = parser.parse_args()
     opt.update(**options.__dict__)
     for k,v in opt.items():
@@ -256,7 +263,7 @@ def interpret_nk_options(parser):
 #end def interpret_nk_options
 
 
-def kinetic():
+def kinetic() -> None:
     # read command line inputs
     usage = '''usage: %prog kinetic [options] [eshdf_file]'''
     parser = OptionParser(usage=usage,add_help_option=False,version='%prog {}.{}.{}'.format(*nexus_version))
@@ -340,7 +347,7 @@ def kinetic():
         kpidx.append(kpsidx)
     #end for
 
-    def arr2str(a):
+    def arr2str(a: np.ndarray) -> str:
         return f'{a}'.strip().strip('[]')
     #end def arr2str
 
@@ -370,7 +377,7 @@ def kinetic():
 #end def kinetic
 
 
-def write_nk():
+def write_nk() -> None:
     # read command line inputs
     usage = '''usage: %prog write_nk [options] [eshdf_file]'''
     parser = OptionParser(usage=usage,add_help_option=False,version='%prog {}.{}.{}'.format(*nexus_version))

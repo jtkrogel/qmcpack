@@ -26,6 +26,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import numpy as np
 from copy import deepcopy
 from .developer import obj
@@ -39,7 +41,14 @@ class ResultAnalyzer(QAanalyzer):
 
 
 class OptimizationAnalyzer(ResultAnalyzer):
-    def __init__(self,input,opts,energy_weight=None,variance_weight=None,nindent=0):
+    def __init__(
+        self,
+        input,
+        opts,
+        energy_weight         = None,
+        variance_weight       = None,
+        nindent         : int = 0,
+        ) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
 
         self.opts  = opts
@@ -90,11 +99,11 @@ class OptimizationAnalyzer(ResultAnalyzer):
     #end def __init__
 
 
-    def init_sub_analyzers(self):
+    def init_sub_analyzers(self) -> None:
         pass
     #end def init_sub_analyzers
 
-    def analyze_local(self):
+    def analyze_local(self) -> None:
         input = QAanalyzer.run_info.input
         self.info.system = QAanalyzer.run_info.system
         opts  = obj(self.opts)
@@ -236,7 +245,15 @@ class OptimizationAnalyzer(ResultAnalyzer):
     #end def analyze_local
 
 
-    def summarize(self,units='eV',norm=1.,*,energy=True,variance=True,header=True):
+    def summarize(
+        self,
+        units    : str         = 'eV',
+        norm     : float | str = 1.,
+        *,
+        energy   : bool        = True,
+        variance : bool        = True,
+        header   : bool        = True,
+        ) -> None:
         if isinstance(norm,str):
             norm = norm.replace('_',' ').replace('-',' ')
             if norm=='per atom':
@@ -280,7 +297,12 @@ class OptimizationAnalyzer(ResultAnalyzer):
     #end def summarize
 
 
-    def plot_opt_convergence(self,title=None,*,saveonly=False):
+    def plot_opt_convergence(
+        self,
+        title           = None,
+        *,
+        saveonly : bool = False,
+        ) -> None:
         if title is None:
             ts = 'Optimization: Energy/Variance Convergence'
         else:
@@ -322,7 +344,13 @@ class OptimizationAnalyzer(ResultAnalyzer):
     #end def plot_opt_convergence
 
 
-    def plot_jastrow_convergence(self,title=None,*,saveonly=False,optconv=True):
+    def plot_jastrow_convergence(
+        self,
+        title           = None,
+        *,
+        saveonly : bool = False,
+        optconv  : bool = True,
+        ) -> None:
         if title is None:
             tsin = None
         else:
@@ -390,7 +418,7 @@ class OptimizationAnalyzer(ResultAnalyzer):
 
 
 class TimestepStudyAnalyzer(ResultAnalyzer):
-    def __init__(self,dmc,nindent=0):
+    def __init__(self, dmc, nindent: int = 0) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
         self.update(
             dmc = dmc,
@@ -400,11 +428,11 @@ class TimestepStudyAnalyzer(ResultAnalyzer):
             )
     #end def __init__
 
-    def init_sub_analyzers(self):
+    def init_sub_analyzers(self) -> None:
         pass
     #end def init_sub_analyzers
 
-    def analyze_local(self):
+    def analyze_local(self) -> None:
         timesteps = []
         energies  = []
         errors    = []
@@ -422,7 +450,12 @@ class TimestepStudyAnalyzer(ResultAnalyzer):
         self.errors    = errors[order]
     #end def analyze_local
 
-    def summarize(self,units='eV',*,header=True):
+    def summarize(
+        self,
+        units  : str  = 'eV',
+        *,
+        header : bool = True,
+        ) -> None:
         timesteps = self.timesteps
         energies  = convert(self.energies.copy(),'Ha',units)
         errors    = convert(self.errors.copy(),'Ha',units)
@@ -437,7 +470,7 @@ class TimestepStudyAnalyzer(ResultAnalyzer):
         #end for
     #end def summarize
 
-    def plot_timestep_convergence(self):
+    def plot_timestep_convergence(self) -> None:
         from matplotlib.pyplot import figure,xlabel,ylabel,plot,errorbar,title,text,xticks,rcParams,savefig,xlim
 
         params = {'legend.fontsize':14,'figure.facecolor':'white','figure.subplot.hspace':0.,

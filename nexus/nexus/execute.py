@@ -15,10 +15,17 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 from subprocess import Popen, PIPE
 from .utilities import to_str
 
-def execute(command,*,verbose=False,skip=False):
+def execute(
+    command : str,
+    *,
+    verbose : bool = False,
+    skip    : bool = False,
+    ) -> tuple:
     out,err = '',''
     returncode = 0
     if skip:

@@ -20,6 +20,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -37,8 +39,33 @@ from .structure import Structure, get_kpath
 from .unit_converter import UnitConverter, convert
 from .utilities import path_string
 
+from pathlib import Path
 
-def parse_float(text):
+type NamesT        = (
+    int
+    | float
+    | str
+    | list[float]
+    | np.float64
+    | np.ndarray
+    | None
+    )
+type QuantitiesT   = (
+    tuple[float | str, str]
+    | tuple[str | None]
+    | tuple[str, str, str]
+    )
+type ValidateQuRet = (
+    tuple[float | str, str]
+    | tuple[str | None]
+    | tuple[str, str, str]
+    | None
+    )
+type RequiredT     = str | list[str | None] | tuple[str, str] | None
+
+
+
+def parse_float(text: str) -> float | None:
     """Return a finite floating-point value from a complete numeric token."""
     if '_' in text:
         return None
@@ -119,7 +146,13 @@ class PwscfOutData(DevBase):
     ``None`` when its reader is not selected or its record cannot be parsed.
     """
 
-    def __init__(self,filepath,calculation=None,*,md_only=False):
+    def __init__(
+        self,
+        filepath,
+        calculation : str | None = None,
+        *,
+        md_only     : bool       = False,
+        ) -> None:
         """Read a PWSCF log and initialize its accessible physical data."""
         if isinstance(filepath,os.PathLike):
             filepath = path_string(filepath)
@@ -199,7 +232,11 @@ class PwscfOutData(DevBase):
     #end def __init__
 
 
-    def read_calculation(self,lines,calculation=None):
+    def read_calculation(
+        self,
+        lines       : list[str],
+        calculation : str | None = None,
+        ) -> None:
         """Infer and bind the PWSCF calculation type from log records."""
         if calculation is not None:
             calculation = calculation.lower()
@@ -258,7 +295,7 @@ class PwscfOutData(DevBase):
     #end def read_calculation
 
 
-    def read_md(self,lines):
+    def read_md(self, lines: list[str]) -> None:
         """Read complete molecular-dynamics records from text output."""
         records = []
         record = None
@@ -314,7 +351,7 @@ class PwscfOutData(DevBase):
     #end def read_md
 
 
-    def md_statistics(self,equil=None):
+    def md_statistics(self, equil = None) -> obj | None:
         """Return mean and standard error for each MD history."""
         if self.md_data is None:
             return None
@@ -327,7 +364,7 @@ class PwscfOutData(DevBase):
     #end def md_statistics
 
 
-    def read_fermi_energies(self,lines):
+    def read_fermi_energies(self, lines: list[str]) -> None:
         """Read and bind the sequence of reported Fermi energies.
 
         ``fermi_energies`` is a one-dimensional NumPy array containing every
@@ -360,7 +397,7 @@ class PwscfOutData(DevBase):
     #end def read_fermi_energies
 
 
-    def read_energies(self,lines):
+    def read_energies(self, lines: list[str]) -> None:
         """Read and bind completed SCF total energies.
 
         ``E`` is the final completed total energy marked with ``!`` in the
@@ -383,7 +420,7 @@ class PwscfOutData(DevBase):
     #end def read_energies
 
 
-    def read_scf_convergence(self,lines):
+    def read_scf_convergence(self, lines: list[str]) -> None:
         """Read electronic SCF iteration energies and accuracy estimates."""
         energies   = []
         accuracies = []
@@ -416,7 +453,7 @@ class PwscfOutData(DevBase):
     #end def read_scf_convergence
 
 
-    def read_bands(self,lines):
+    def read_bands(self, lines: list[str]) -> None:
         """Read and bind band data for each reported k-point.
 
         ``bands`` is an ``obj`` with ``up`` and ``down`` members.  Each member
@@ -436,7 +473,7 @@ class PwscfOutData(DevBase):
             rf'^\s*(?P<values>{number_pattern}'
             rf'(?:(?:\s+|(?=[+-])){number_pattern})*)'
             )
-        def read_values(start,markers=()):
+        def read_values(start: int, markers: tuple[str, str] = ()):
             """Read a contiguous block of numeric values."""
             values = []
             i      = start
@@ -530,7 +567,7 @@ class PwscfOutData(DevBase):
             return
         self.bands = bands
 
-        def read_band_edges():
+        def read_band_edges() -> None:
             """Add band edges, gaps, and electronic classification to bands."""
             bands      = self.bands
             vbm        = None
@@ -580,7 +617,7 @@ class PwscfOutData(DevBase):
                 )
         #end def read_band_edges
 
-        def edge_data(band,energy,band_number):
+        def edge_data(band: obj, energy: np.float64, band_number: int) -> obj:
             """Return identifying data for a valence or conduction band edge."""
             return obj(
                 energy          = energy,
@@ -596,7 +633,7 @@ class PwscfOutData(DevBase):
     #end def read_bands
 
 
-    def read_initial_structure(self,lines):
+    def read_initial_structure(self, lines: list[str]) -> None:
         """Read QE-generated initial axes and ion positions in bohr.
 
         This is the authoritative geometry fallback for Bravais lattices
@@ -604,7 +641,7 @@ class PwscfOutData(DevBase):
         """
         number_pattern = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?'
 
-        def numbers(text):
+        def numbers(text: str):
             return [
                 parse_float(value)
                 for value in re.findall(number_pattern,text.lower().replace('d','e'))
@@ -683,7 +720,7 @@ class PwscfOutData(DevBase):
     #end def read_initial_structure
 
 
-    def read_structures(self,lines):
+    def read_structures(self, lines: list[str]) -> None:
         """Read and bind structures from ionic-step output blocks.
 
         ``relax_structures`` is a list of configuration objects.  Each
@@ -696,7 +733,7 @@ class PwscfOutData(DevBase):
         Fixed-cell output can omit cell blocks, while variable-cell output
         normally supplies new axes with each structure.
         """
-        def card_option(line,name):
+        def card_option(line: str, name: str) -> str | None:
             """Return the lower-case unit option from a QE card header."""
             text = line.strip()
             if not text.startswith(name):
@@ -710,7 +747,7 @@ class PwscfOutData(DevBase):
             return text.split()[0] if len(text)>0 else None
         #end def card_option
 
-        def alat_from_header(line):
+        def alat_from_header(line: str) -> float | None:
             """Return the bohr lattice parameter given in a card header."""
             tokens = line.replace('(',' ').replace(')',' ').replace('=',' = ').split()
             lower  = [token.lower() for token in tokens]
@@ -828,7 +865,7 @@ class PwscfOutData(DevBase):
     #end def read_structures
 
 
-    def read_pressure(self,lines):
+    def read_pressure(self, lines: list[str]) -> None:
         """Read the final reported pressure."""
         pressure = None
         for line in lines:
@@ -844,7 +881,7 @@ class PwscfOutData(DevBase):
     #end def read_pressure
 
 
-    def read_volume(self,lines):
+    def read_volume(self, lines: list[str]) -> None:
         """Read the final reported unit-cell volume in bohr cubed."""
         volume = None
         for line in lines:
@@ -858,7 +895,7 @@ class PwscfOutData(DevBase):
     #end def read_volume
 
 
-    def read_stress(self,lines):
+    def read_stress(self, lines: list[str]) -> None:
         """Read and bind the sequence of reported stress tensors.
 
         ``stress`` is a NumPy array containing complete stress tensors in
@@ -883,7 +920,7 @@ class PwscfOutData(DevBase):
     #end def read_stress
 
 
-    def read_forces(self,lines):
+    def read_forces(self, lines: list[str]) -> None:
         """Read and bind atomic-force histories.
         ``forces`` is a NumPy array with shape ``(nsteps, natoms, 3)`` in
         Ry/bohr. Atomic-force blocks with a known atom count are retained only
@@ -961,13 +998,13 @@ class PwscfOutData(DevBase):
     #end def read_forces
 
 
-    def read_timing(self,lines):
+    def read_timing(self, lines: list[str]) -> None:
         """Read total PWSCF CPU and wall-clock time in hours."""
         number_pattern = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?'
         timing_value_pattern = (
             rf'(?P<value>{number_pattern})\s*(?P<unit>[hms])(?=\s|[-+.\d]|$)'
             )
-        def pwscf_time(text):
+        def pwscf_time(text: str) -> float | None:
             scales = {'h':1.0,'m':60.0,'s':3600.0}
             values = []
             for match in re.finditer(timing_value_pattern,text):
@@ -1000,7 +1037,7 @@ class PwscfOutData(DevBase):
     #end def read_timing
 
 
-    def read_kpoints(self,lines):
+    def read_kpoints(self, lines: list[str]) -> None:
         """Read and bind paired k-point tables and their weights.
 
         A complete Cartesian table and its following crystal-coordinate table
@@ -1010,7 +1047,7 @@ class PwscfOutData(DevBase):
         one-dimensional weight array.  No member is updated when either table
         is incomplete.
         """
-        def read_kpoint(line):
+        def read_kpoint(line: str):
             """Parse a complete QE k-point table row."""
             tokens = line.translate(str.maketrans('(),=','    ')).split()
             if (
@@ -1091,7 +1128,7 @@ class PwscfOutData(DevBase):
 class PwscfXmlData(DevBase):
     """Read primary physical results from QE schema XML output."""
 
-    def __init__(self,filepath):
+    def __init__(self, filepath: str | Path) -> None:
         if isinstance(filepath,os.PathLike):
             filepath = path_string(filepath)
         self.data = None
@@ -1112,15 +1149,15 @@ class PwscfXmlData(DevBase):
     #end def __init__
 
 
-    def extract_results(self,root):
+    def extract_results(self, root) -> None:
         """Extract structures, energies, forces, and electronic arrays."""
         # Navigate XML elements and normalize their textual data.
-        def tag(element):
+        def tag(element) -> str:
             """Return an XML tag without its optional namespace."""
             return element.tag.rsplit('}',1)[-1]
         #end def tag
 
-        def child(element,name):
+        def child(element, name: str):
             """Return a named child element, or ``None`` when absent."""
             if element is None:
                 return None
@@ -1130,21 +1167,25 @@ class PwscfXmlData(DevBase):
                 )
         #end def child
 
-        def children(element,name):
+        def children(element, name: str):
             """Return all child elements with a given name."""
             if element is None:
                 return []
             return [item for item in element if tag(item)==name]
         #end def children
 
-        def element_path(element,*names):
+        def element_path(element, *names: NamesT):
             """Follow a sequence of named children from an XML element."""
             for name in names:
                 element = child(element,name)
             return element
         #end def element_path
 
-        def scalar(element,*,allow_text=False):
+        def scalar(
+            element,
+            *,
+            allow_text : bool = False,
+            ):
             """Return scalar text as a bool, float, array, or optional string."""
             text = '' if element is None else (element.text or '').strip()
             if len(text)==0:
@@ -1159,13 +1200,13 @@ class PwscfXmlData(DevBase):
             return np.array(values)
         #end def scalar
 
-        def number(element):
+        def number(element) -> float | None:
             """Return a numeric XML scalar, excluding booleans and arrays."""
             value = scalar(element)
             return value if isinstance(value,(float,np.floating)) else None
         #end def number
 
-        def vector(element):
+        def vector(element) -> np.ndarray | None:
             """Return numeric element text as a one-dimensional float array."""
             value = scalar(element)
             if value is None or isinstance(value,(str,bool)):
@@ -1197,7 +1238,7 @@ class PwscfXmlData(DevBase):
             return atoms,positions,axes
         #end def structure
 
-        def stack(values):
+        def stack(values: list[str | obj | np.ndarray]) -> np.ndarray | None:
             """Stack finite arrays with a common shape, or return ``None``."""
             if len(values)==0 or any(value is None for value in values):
                 return None
@@ -1344,7 +1385,7 @@ class Pw2CasinoAnalyzer(DevBase):
         record.  It remains ``None`` when no valid record is present.
     """
 
-    def __init__(self,filepath):
+    def __init__(self, filepath) -> None:
         if isinstance(filepath,os.PathLike):
             filepath = path_string(filepath)
         self.K = None
@@ -1540,7 +1581,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
         })
 
 
-    def initial_structure(self,units='A'):
+    def initial_structure(self, units: str = 'A') -> Structure:
         """Return the initial structure.
 
         Parameters
@@ -1615,7 +1656,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def initial_structure
 
 
-    def energy(self,units='Ha'):
+    def energy(self, units: str = 'Ha') -> float | None:
         """Return the final total energy.
 
         Parameters
@@ -1641,7 +1682,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def energy
 
 
-    def kpoints(self,units='B'):
+    def kpoints(self, units: str = 'B') -> np.ndarray | None:
         """Return Cartesian k-points.
 
         Parameters
@@ -1688,7 +1729,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def kpoints
 
 
-    def kweights(self):
+    def kweights(self) -> np.ndarray | None:
         """Return k-point integration weights.
 
         Returns
@@ -1707,7 +1748,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def kweights
 
 
-    def eigenvalues(self,units='eV'):
+    def eigenvalues(self, units: str = 'eV') -> np.ndarray | None:
         """Return Kohn--Sham eigenvalues.
 
         Parameters
@@ -1736,7 +1777,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def eigenvalues
 
 
-    def occupations(self):
+    def occupations(self) -> np.ndarray | None:
         """Return Kohn--Sham occupations.
 
         Returns
@@ -1756,7 +1797,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def occupations
 
 
-    def Ef(self,units='eV'):
+    def Ef(self, units: str = 'eV') -> float | None:
         """Return the final Fermi energy.
 
         Parameters
@@ -1782,7 +1823,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def Ef
 
 
-    def Evbm(self,units='eV'):
+    def Evbm(self, units: str = 'eV') -> float:
         """Return the valence-band maximum.
 
         Parameters
@@ -1809,7 +1850,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def Evbm
 
 
-    def Ecbm(self,units='eV'):
+    def Ecbm(self, units: str = 'eV') -> float:
         """Return the conduction-band minimum.
 
         Parameters
@@ -1836,7 +1877,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def Ecbm
 
 
-    def band_gap(self,units='eV'):
+    def band_gap(self, units: str = 'eV') -> float:
         """Return the fundamental band gap.
 
         Parameters
@@ -1864,7 +1905,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def band_gap
 
 
-    def fractional_occs(self,tol=1e-3):
+    def fractional_occs(self, tol: float = 1e-3) -> bool | None:
         """Determine whether any occupation is fractional.
 
         Parameters
@@ -1888,7 +1929,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def fractional_occs
 
 
-    def relaxed_structure(self,units='A'):
+    def relaxed_structure(self, units: str = 'A') -> Structure | None:
         """Return the final ionic structure.
 
         Parameters
@@ -1952,7 +1993,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def relaxed_structure
 
 
-    def forces(self,units='eV/A'):
+    def forces(self, units: str = 'eV/A') -> np.ndarray | None:
         """Return final ionic forces.
 
         Parameters
@@ -1992,7 +2033,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def forces
 
 
-    def stress(self,units='GPa'):
+    def stress(self, units: str = 'GPa') -> np.ndarray | None:
         """Return the final stress tensor.
 
         Parameters
@@ -2029,7 +2070,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def stress
 
 
-    def pressure(self,units='GPa'):
+    def pressure(self, units: str = 'GPa') -> float:
         """Return final hydrostatic pressure.
 
         Parameters
@@ -2056,7 +2097,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def pressure
 
 
-    def _require_analyzed(self,quantity):
+    def _require_analyzed(self, quantity: str) -> None:
         """Require completed analysis unless a private query is in progress."""
         if self._query_depth>0:
             return
@@ -2066,7 +2107,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _require_analyzed
 
 
-    def _unavailable(self,quantity,modes):
+    def _unavailable(self, quantity: str, modes: frozenset[str]) -> None:
         """Apply unsupported and required-quantity policy to absent data."""
         if self._query_depth>0:
             return
@@ -2080,7 +2121,11 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _unavailable
 
 
-    def _query_value(self,quantity,*args):
+    def _query_value(
+        self,
+        quantity : str,
+        *args    : int | str,
+        ) -> bool | float | np.ndarray | Structure | None:
         """Return a query value without applying public missing-data policy."""
         self._query_depth += 1
         try:
@@ -2090,7 +2135,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _query_value
 
 
-    def _validate_quantities(self,quantities):
+    def _validate_quantities(self, quantities: QuantitiesT) -> ValidateQuRet:
         """Validate quantity names atomically and return them as a tuple."""
         names = tuple(quantities)
         unknown = [
@@ -2105,7 +2150,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _validate_quantities
 
 
-    def require(self,*quantities):
+    def require(self, *quantities: float | str | None) -> None:
         """Add query quantities to the required-data policy.
 
         Parameters
@@ -2127,7 +2172,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def require
 
 
-    def available(self,*quantities):
+    def available(self, *quantities: str) -> bool | None:
         """Return whether all named query quantities are available.
 
         Parameters
@@ -2160,7 +2205,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def available
 
 
-    def _schema_results(self):
+    def _schema_results(self) -> PwscfXmlData | obj | None:
         """Return modern XML results, excluding browse-only legacy XML."""
         if 'results_xml' in self and isinstance(self.results_xml,PwscfXmlData):
             return self.results_xml
@@ -2168,7 +2213,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _schema_results
 
 
-    def _log_band_values(self,name):
+    def _log_band_values(self, name: str) -> float | np.ndarray | None:
         """Return complete k-point-major band values from text output."""
         if self.results_out is None:
             return None
@@ -2199,7 +2244,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _log_band_values
 
 
-    def _schema_band_edges(self):
+    def _schema_band_edges(self) -> tuple:
         """Return schema-XML valence and conduction edges in Hartree."""
         xml = self._schema_results()
         if xml is None or xml.eigenvalues is None or xml.occupations is None:
@@ -2216,7 +2261,9 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _schema_band_edges
 
 
-    def _schema_file(self):
+    def _schema_file(
+        self,
+        ) -> tuple[float | str | list[float | str] | None, int | float | str]:
         """Resolve the modern schema file and report discovery status."""
         if self.xmlfile is not None:
             filepath = path_string(self.xmlfile)
@@ -2248,7 +2295,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _schema_file
 
 
-    def _input_file(self):
+    def _input_file(self) -> tuple:
         """Resolve the PWSCF input file and report discovery status."""
         if isinstance(self.input,PwscfInput):
             return None,'parsed'
@@ -2267,7 +2314,9 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _input_file
 
 
-    def _output_file(self):
+    def _output_file(
+        self,
+        ) -> tuple[float | str | list[float | str] | None, int | float | str]:
         """Resolve the text-output file and report discovery status."""
         if self.outfile_name is not None:
             filepath = os.path.join(self.path,self.outfile_name)
@@ -2290,9 +2339,9 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def _output_file
 
 
-    def _set_calculation(self):
+    def _set_calculation(self) -> None:
         """Reconcile calculation types from the input, XML, and output."""
-        def normalized(value):
+        def normalized(value: str | None) -> str | None:
             if value is None:
                 return None
             return str(value).strip().lower().replace('_','-')
@@ -2325,18 +2374,18 @@ class PwscfAnalyzer(SimulationAnalyzer):
 
     def __init__(
         self,
-        input             = None,
-        outfile           = None,
+        input                            = None,
+        outfile      : str | Path | None = None,
         *,
-        analyze           = False,
-        path              = None,
-        xmlfile           = None,
-        pw2c_outfile      = None,
-        read_all          = True,
-        strict            = True,
-        required          = None,
-        md_only           = False,
-        ):
+        analyze      : bool              = False,
+        path         : str | Path | None = None,
+        xmlfile      : str | Path | None = None,
+        pw2c_outfile : str | Path | None = None,
+        read_all     : bool | int | str  = True,
+        strict       : bool | int        = True,
+        required     : RequiredT         = None,
+        md_only      : bool              = False,
+        ) -> None:
         """Initialize a PWSCF output analyzer.
 
         Parameters
@@ -2485,7 +2534,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         """Analyze available PWSCF text, legacy XML, and PW2CASINO output."""
         self.results_out = None
         self.results_xml = None
@@ -2617,7 +2666,12 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def analyze
 
 
-    def analyze_xml(self,schema_file=None,*,discover=True):
+    def analyze_xml(
+        self,
+        schema_file : str | None = None,
+        *,
+        discover    : bool       = True,
+        ) -> None:
         """Locate schema XML first, falling back to legacy PWscf XML."""
         self.results_xml = None
 
@@ -2686,9 +2740,9 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def analyze_xml
 
 
-    def analyze_legacy_xml(self,data,datadir):
+    def analyze_legacy_xml(self, data, datadir: str) -> None:
         """Extract k-point and orbital data from legacy PWscf XML."""
-        def object_path(value,*names):
+        def object_path(value, *names: str):
             """Return a nested value, or None when its path is incomplete."""
             for name in names:
                 if value is None or name not in value:
@@ -2735,7 +2789,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def analyze_legacy_xml
 
 
-    def md_statistics(self,equil=None):
+    def md_statistics(self, equil = None) -> obj | None:
         """Return summary statistics for parsed molecular-dynamics histories."""
         if self.results_out is None or 'md_data' not in self.results_out:
             return None
@@ -2743,7 +2797,11 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def md_statistics
 
 
-    def md_plots(self,*,show=True):
+    def md_plots(
+        self,
+        *,
+        show : bool = True,
+        ):
         """Plot molecular-dynamics energy, temperature, and pressure histories."""
         if self.results_out is None or 'md_data' not in self.results_out or self.results_out.md_data is None:
             return None
@@ -2761,7 +2819,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
     #end def md_plots
 
 
-    def make_movie(self,filename,filepath=None):
+    def make_movie(self, filename: str, filepath = None) -> None:
         """Write the parsed relaxation trajectory as a tiled XYZ movie."""
         if 'results_out' not in self or self.results_out is None:
             msg = 'PWSCF output has not been analyzed'
@@ -2804,15 +2862,15 @@ class PwscfAnalyzer(SimulationAnalyzer):
 
     def plot_bandstructure(
         self,
-        filename     = None,
-        filepath     = None,
-        max_min_e    = None,
+        filename            = None,
+        filepath            = None,
+        max_min_e           = None,
         *,
-        show         = False,
-        save         = True,
-        show_vbm_cbm = True,
-        k_labels     = None,
-        ):
+        show         : bool = False,
+        save         : bool = True,
+        show_vbm_cbm : bool = True,
+        k_labels            = None,
+        ) -> None:
         """Plot the analyzed band structure along a reciprocal-space path."""
         import matplotlib.pyplot as plt
 

@@ -31,6 +31,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 from types import MappingProxyType
@@ -42,13 +44,16 @@ from .pseudoset import pp_elem_label, PseudoSet
 from .simulation import SimulationInput
 from .utilities import path_string
 
+from pathlib import Path
+
+
 
 class GIbase(DevBase):
     pass
 #end class GIbase
 
 
-def _read_gamess_pseudopotential(filepath):
+def _read_gamess_pseudopotential(filepath: str) -> obj:
     filename = os.path.basename(filepath)
     element_label,element = pp_elem_label(filename,guard=True)
     pseudo = obj(
@@ -106,7 +111,7 @@ def _read_gamess_pseudopotential(filepath):
 #end def _read_gamess_pseudopotential
 
 
-def _read_gamess_pseudopotentials(pseudo_files):
+def _read_gamess_pseudopotentials(pseudo_files) -> obj:
     pseudos = obj()
     for filepath in pseudo_files:
         pseudo = _read_gamess_pseudopotential(filepath)
@@ -117,7 +122,7 @@ def _read_gamess_pseudopotentials(pseudo_files):
 
 
 class GIarray(GIbase):
-    def __init__(self,d):
+    def __init__(self, d) -> None:
         for n,v in d.items():
             if not isinstance(n,int):
                 msg = (
@@ -140,18 +145,22 @@ class GIarray(GIbase):
 
 
 class Group(GIbase):
-    def __init__(self,text=None,**kwargs):
+    def __init__(
+        self,
+        text     : str | None = None,
+        **kwargs : bool | int | float | str,
+        ) -> None:
         if text is not None:
             self.read(text)
         #end if
         self.update(**kwargs)
     #end def __init__
 
-    def read(self,text):
+    def read(self, text: str):
         raise NotImplementedError
     #end def read
 
-    def write(self,text):
+    def write(self, text):
         raise NotImplementedError
     #end def read
 #end class Group
@@ -169,7 +178,7 @@ class KeywordGroup(Group):
         '.false.':False,'.FALSE.':False,'.f.':False,'.F.':False
         })
 
-    def readval(self,val):
+    def readval(self, val: str) -> bool | int | float | str:
         fail = False
         if val in self.booldict:
             v = self.booldict[val]
@@ -210,7 +219,7 @@ class KeywordGroup(Group):
     #end def readval
 
 
-    def read(self,text):
+    def read(self, text: str) -> None:
         tokens = text.replace(',',' ').split()
         for token in tokens:
             if '=' in token:
@@ -242,7 +251,7 @@ class KeywordGroup(Group):
     #end def read
 
 
-    def writeval(self,val):
+    def writeval(self, val: bool | int | float | str) -> str:
         if isinstance(val,bool):
             if val:
                 sval = '.true.'
@@ -274,7 +283,7 @@ class KeywordGroup(Group):
     #end def writeval
 
 
-    def write(self,name):
+    def write(self, name: str) -> str:
         text = ''
         line = f' ${name:<6} '
         for var in sorted(self.keys()):
@@ -312,7 +321,7 @@ class CardGroup(Group):
     # ecp 287
     # data 37
 
-    def readval(self,val):
+    def readval(self, val: str) -> bool | int | float | str:
         try:
             v = int(val)
         except:
@@ -326,7 +335,7 @@ class CardGroup(Group):
     #end def readval
 
 
-    def read_tokens(self,line):
+    def read_tokens(self, line) -> list:
         tokens = []
         for token in line.split():
             tokens.append(self.readval(token))
@@ -335,7 +344,7 @@ class CardGroup(Group):
     #end def read_tokens
 
 
-    def read_line_tokens(self,text):
+    def read_line_tokens(self, text) -> list:
         line_tokens = []
         for line in text.splitlines():
             line_tokens.append(self.read_tokens(line))
@@ -344,21 +353,21 @@ class CardGroup(Group):
     #end def read_line_tokens
 
 
-    def append_text(self,text):
+    def append_text(self, text) -> None:
         for tokens in self.read_line_tokens(text):
             self[len(self)] = tokens
         #end for
     #end def append_text
 
 
-    def append_list(self,lst):
+    def append_list(self, lst) -> None:
         for tokens in lst:
             self[len(self)] = tokens
         #end for
     #end def append_list
 
 
-    def read(self,inp):
+    def read(self, inp: str | list) -> None:
         self.clear()
         if isinstance(inp,str):
             self.append_text(inp)
@@ -368,7 +377,7 @@ class CardGroup(Group):
     #end def read
 
 
-    def writeval(self,val):
+    def writeval(self, val: bool | int | float | str) -> str:
         if isinstance(val,float):
             sval = str(val).replace('e','d')
             if len(sval)>8 and np.abs(val)>=10.0:
@@ -381,7 +390,7 @@ class CardGroup(Group):
     #end def writeval
 
 
-    def write(self,name):
+    def write(self, name: str | None) -> str:
         text = f' ${name}\n'
         contents = ''
         for n in range(len(self)):
@@ -396,7 +405,7 @@ class CardGroup(Group):
     #end def write
 
 
-    def list(self):
+    def list(self) -> list:
         lst = []
         for n in range(len(self)):
             lst.append(self[n])
@@ -408,11 +417,11 @@ class CardGroup(Group):
 
 
 class FormattedGroup(Group):
-    def read(self,text):
+    def read(self, text: str) -> None:
         self.text = str(text)
     #end def read
 
-    def write(self,name):
+    def write(self, name: str | None) -> str:
         #return ' ${0}\n{1} $END\n'.format(name.upper(),self.text.lstrip())
         return f' ${name.upper()}\n{self.text} $END\n'
     #end def write
@@ -433,11 +442,11 @@ class KeywordSpecGroup(KeywordGroup):
     arrays   = frozenset()
     allowed_values = obj()
 
-    def is_consistent(self):
+    def is_consistent(self) -> bool:
         return len(set(self.keys())-self.keywords)==0
     #end def is_consistent
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         valid = self.is_consistent()
         for name,val in self.items():
             if name in self.allowed_values:
@@ -883,7 +892,7 @@ class GamessInput(SimulationInput,GIbase):
         EFMOF   = 103
         )
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath: str | Path | None = None) -> None:
         if filepath is not None:
             filepath = path_string(filepath)
             self.read(filepath)
@@ -891,7 +900,7 @@ class GamessInput(SimulationInput,GIbase):
     #end def __init__
 
 
-    def read_text(self,contents,filepath=None):
+    def read_text(self, contents: str, filepath: str | None = None) -> None:
         groups = obj()
         lines = contents.splitlines()
         ingroup = False
@@ -1015,7 +1024,7 @@ class GamessInput(SimulationInput,GIbase):
     #end def read_text
 
 
-    def process_line(self,ls):
+    def process_line(self, ls: str) -> tuple[str, bool | str]:
         ended = True
         if ls.endswith('$END'):
             text = ls.replace('$END','')
@@ -1034,7 +1043,7 @@ class GamessInput(SimulationInput,GIbase):
     #end def process_line
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         contents = ''
         extra_groups = set(self.keys())-set(self.group_order)
         if len(extra_groups)>0:
@@ -1058,7 +1067,7 @@ class GamessInput(SimulationInput,GIbase):
     #end def write_text
 
 
-    def incorporate_system(self,system):
+    def incorporate_system(self, system):
         raise NotImplementedError
     #end def incorporate_system
 #end class GamessInput
@@ -1067,7 +1076,7 @@ class GamessInput(SimulationInput,GIbase):
 
 
 
-def generate_gamess_input(**kwargs):
+def generate_gamess_input(**kwargs) -> GamessInput:
     if 'input_type' in kwargs:
         input_type = kwargs['input_type']
         del kwargs['input_type']
@@ -1103,7 +1112,7 @@ for var in GamessInput.all_keywords:
 #end for
 
 
-def generate_any_gamess_input(**kwargs):
+def generate_any_gamess_input(**kwargs) -> GamessInput:
     kwset = set(kwargs.keys())
     pskw = deepcopy(ps_defaults)
     ps_overlap = ps_inputs & kwset
@@ -1315,7 +1324,7 @@ def generate_any_gamess_input(**kwargs):
 
 
 
-def check_keyspec_groups():
+def check_keyspec_groups() -> None:
 
     groups      = GamessInput.keyspec_groups
     group_order = GamessInput.group_order

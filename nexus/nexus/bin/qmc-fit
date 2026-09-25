@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+from __future__ import annotations
+
 import os
 import sys
 import argparse
@@ -41,7 +43,7 @@ except (ImportError,RuntimeError):
 # Locate and import the closely coupled Nexus module
 search_basepath = Path(__file__).resolve().parent.parent
 nexus_library_search_path = search_basepath.parent
-def find_nexus_modules():
+def find_nexus_modules() -> None:
     import sys
 
     # "import nexus" will succeed if nexus directory exists without __init__.py in it.
@@ -200,7 +202,12 @@ fit_functions = obj()
 
 
 
-def qmcfit(q,E,fname='linear',minimizer=least_squares):
+def qmcfit(
+    q         : np.ndarray,
+    E         : np.ndarray,
+    fname     : str = 'linear',
+    minimizer       = least_squares,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, obj]:
     # ensure data is in proper array format
     if isinstance(E,(list,tuple)):
         E = np.array(E,dtype=float)
@@ -259,7 +266,12 @@ def qmcfit(q,E,fname='linear',minimizer=least_squares):
 
 
 # Reads scalar.dat files and extracts energy series
-def process_scalar_files(scalar_files,equils=None,reblock_factors=None,series_start=None):
+def process_scalar_files(
+    scalar_files    : list[str],
+    equils          : np.int64 | None = None,
+    reblock_factors                   = None,
+    series_start    : int | None      = None,
+    ):
     if len(scalar_files)==0:
         msg = 'must provide at least one scalar file'
         raise ValueError(msg)
@@ -395,7 +407,7 @@ def process_scalar_files(scalar_files,equils=None,reblock_factors=None,series_st
 
 
 
-def stat_strings(mean,error):
+def stat_strings(mean: np.float64, error: np.float64) -> tuple[str, str]:
     d = int(max(2,1-np.floor(np.log(error)/np.log(10.))))
     fmt = '{0:16.'+str(d)+'f}'
     mstr = fmt.format(mean).strip()
@@ -404,7 +416,12 @@ def stat_strings(mean,error):
 #end def stat_strings
 
 
-def parse_list(opt,name,dtype,len1=False):
+def parse_list(
+    opt   : obj,
+    name  : str,
+    dtype : type[int | float],
+    len1  : bool = False,
+    ) -> None:
     try:
         if opt[name]!=None:
             opt[name] = np.array(opt[name].split(),dtype=dtype)
@@ -419,7 +436,7 @@ def parse_list(opt,name,dtype,len1=False):
 #end def parse_list
 
 
-def timestep_fit(args):
+def timestep_fit(args: argparse.Namespace) -> None:
     opt = obj(**args.__dict__)
     scalar_files = sorted(opt.scalar_files)
 
@@ -500,7 +517,7 @@ def timestep_fit(args):
     #end if
 #end def timestep_fit
 
-def hubbard_u_fit(args):
+def hubbard_u_fit(args) -> None:
     opt = obj(**args.__dict__)
     scalar_files = sorted(opt.scalar_files)
     if opt.fit_function not in fit_functions:
@@ -615,7 +632,7 @@ def hubbard_u_fit(args):
     #end if
 #end def hubbard_u_fit
 
-def eos_fit(args):
+def eos_fit(args) -> None:
     opt = obj(**args.__dict__)
     scalar_files = sorted(opt.scalar_files)
     if opt.fit_function not in fit_functions:
@@ -697,7 +714,7 @@ def eos_fit(args):
     #end if
 #end def eos_fit
 
-def parse_args():
+def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     """This utility provides a fit to the one-dimensional parameter scans of QMC
     observables. Currently, the functionality in place is to fit linear/quadratic polynomial
     fits to the timestep VMC/DMC studies and single parameter optimization of trial wavefunctions

@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import string
 from pathlib import Path
 
 
 
-def to_str(s):
+def to_str(s: str | bytes) -> str:
     '''Convert a value to a string'''
     if isinstance(s,bytes):
         return str(s,encoding='utf-8')
@@ -13,7 +15,7 @@ def to_str(s):
 #end def to_str
 
 
-def valid_variable_name(s):
+def valid_variable_name(s: str) -> bool:
     """Check if a variable name contains invalid characters."""
     if not any(i in ('!"#$%&\'()*+,-./:;<=>?@[\\]^`{|}-\n\t ') for i in s):
         return True
@@ -23,7 +25,7 @@ def valid_variable_name(s):
 #end def valid_variable_name
 
 
-def _path_to_str(path: str | bytes | Path) -> str:
+def _path_to_str(path: str | bytes | Path) -> str | bytes | Path:
     '''Simple conversion from bytes/Path types to str.'''
     if isinstance(path, str):
         pass
@@ -40,7 +42,7 @@ def _path_to_str(path: str | bytes | Path) -> str:
 #end def _path_to_str
 
 
-def is_valid_path(path: str | bytes | Path) -> bool:
+def is_valid_path(path: str) -> bool:
     '''Screen out paths with invalid characters.'''
     path = _path_to_str(path)
     if not hasattr(is_valid_path,'invalid_chars'):
@@ -55,7 +57,7 @@ def is_valid_path(path: str | bytes | Path) -> bool:
 #end def is_valid_path
 
 
-def is_valid_filename(filename: str | bytes | Path) -> bool:
+def is_valid_filename(filename: str) -> bool:
     '''Screen out filenames with invalid characters.'''
     filename = _path_to_str(filename)
     is_valid = True
@@ -74,7 +76,7 @@ def is_valid_filename(filename: str | bytes | Path) -> bool:
 #end def is_valid_filename
 
 
-def is_relative_path(path: str | bytes | Path):
+def is_relative_path(path: str | Path) -> bool:
     '''Determine if a path is relative to some current working directory.'''
     path     = _path_to_str(path)
     absolute = len(path) > 0 and (path[0] == '/' or path[0] == '~')
@@ -84,12 +86,12 @@ def is_relative_path(path: str | bytes | Path):
 
 
 def path_string(
-    path:     str | bytes | Path,
+    path     : str | bytes | Path,
     *,
-    strict:   bool = False,
-    relative: bool = False,
-    check:    bool = False,
-    ) -> str:
+    strict   : bool = False,
+    relative : bool = False,
+    check    : bool = False,
+    ) -> str | None:
     """Convert a path to a string.
 
     Parameters

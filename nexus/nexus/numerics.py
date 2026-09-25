@@ -81,6 +81,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import sys
 import importlib
 import inspect
@@ -91,11 +93,43 @@ from .developer import obj
 from .unit_converter import convert
 from .periodic_table import Elements
 
+type CurveFitArg   = (
+    np.ndarray
+    | tuple[float | np.float64, np.float64, float | np.float64, float]
+    | tuple[np.float64, np.float64]
+    )
+type MorseArg      = np.ndarray | tuple[float, np.float64, float, float]
+type MorseFitArg   = tuple[float, np.float64, float, float] | None
+type VinetArg      = (
+    np.ndarray
+    | tuple[np.float64, np.float64, np.float64, np.float64]
+    )
+type EosEinfArg    = tuple[np.float64, np.float64, np.float64, np.float64]
+type CheckJackkRet = (
+    tuple[bool, bool, list[np.ndarray | None] | None, dict | None, int | None]
+    )
+
+
 
 # cost functions
-def least_squares(p, x, y, f):  return ((f(p,x)-y)**2).sum()
-def absmin(p, x, y, f):         return np.abs(f(p,x)-y).sum()
-def madmin(p, x, y, f):         return np.abs(f(p,x)-y).max()
+def least_squares(
+    p : np.ndarray,
+    x : np.ndarray,
+    y : np.ndarray,
+    f,
+    ) -> np.float64:  return ((f(p,x)-y)**2).sum()
+def absmin(
+    p,
+    x,
+    y,
+    f,
+    ) -> np.float64:   return np.abs(f(p,x)-y).sum()
+def madmin(
+    p,
+    x,
+    y,
+    f,
+    ) -> np.float64:   return np.abs(f(p,x)-y).max()
 
 cost_functions = obj(
     least_squares = least_squares,
@@ -104,7 +138,14 @@ cost_functions = obj(
     )
 
 # curve fit based on fmin from scipy
-def curve_fit(x,y,f,p0,cost='least_squares',optimizer='fmin'):
+def curve_fit(
+    x         : np.ndarray,
+    y         : np.ndarray,
+    f,
+    p0        : CurveFitArg,
+    cost      : str = 'least_squares',
+    optimizer : str = 'fmin',
+    ) -> np.ndarray:
     if isinstance(cost,str):
         if cost not in cost_functions:
             msg = (
@@ -127,20 +168,27 @@ def curve_fit(x,y,f,p0,cost='least_squares',optimizer='fmin'):
 
 
 # morse potential
-def morse(p, r):                    return p[2]*((1-exp(-(r-p[0])/p[1]))**2-1)+p[3] # V(r) =  De ( (1-e^-a(r-re))^2 - 1 ) + E_infinity
-def morse_re(p):                    return p[0]                                     # equilibrium separation
-def morse_a(p):                     return 1./p[1]                                  # 'a' parameter, related to well width
-def morse_De(p):                    return p[2]                                     # 'De' parameter, related to well depth
-def morse_Einf(p):                  return p[3]                                     # potential energy at infinite separation
-def morse_width(p):                 return p[1]                                     # well width
-def morse_depth(p):                 return morse_De(p)                              # well depth
-def morse_Ee(p):                    return morse_Einf(p)-morse_De(p)                # potential energy at equilibrium
-def morse_k(p):                     return 2*morse_De(p)*morse_a(p)**2              # force constant k = d2V/dr2(r=re), Vh=1/2 k r^2
-def morse_params(re, a, De, E_inf): return re, 1./a, De, E_inf                      # return p given standard inputs
+def morse(p: MorseArg, r: float | np.ndarray) -> np.float64 | np.ndarray:                    return p[2]*((1-exp(-(r-p[0])/p[1]))**2-1)+p[3] # V(r) =  De ( (1-e^-a(r-re))^2 - 1 ) + E_infinity
+def morse_re(p: tuple[float, np.float64, float, float]) -> float | np.float64:                    return p[0]                                     # equilibrium separation
+def morse_a(p: tuple[float, np.float64, float, float]) -> np.float64:                     return 1./p[1]                                  # 'a' parameter, related to well width
+def morse_De(p: tuple[float, np.float64, float, float]) -> float | np.float64:                    return p[2]                                     # 'De' parameter, related to well depth
+def morse_Einf(p: tuple[float, np.float64, float, float]) -> float | np.float64:                  return p[3]                                     # potential energy at infinite separation
+def morse_width(
+    p : tuple[float, np.float64, float, float],
+    ) -> float | np.float64:                 return p[1]                                     # well width
+def morse_depth(p: tuple[float, np.float64, float, float]) -> float:                 return morse_De(p)                              # well depth
+def morse_Ee(p: tuple[float, np.float64, float, float]) -> float:                    return morse_Einf(p)-morse_De(p)                # potential energy at equilibrium
+def morse_k(p: tuple[float, np.float64, float, float]) -> np.float64:                     return 2*morse_De(p)*morse_a(p)**2              # force constant k = d2V/dr2(r=re), Vh=1/2 k r^2
+def morse_params(
+    re    : float,
+    a     : np.float64,
+    De    : float,
+    E_inf : float,
+    ) -> tuple: return re, 1./a, De, E_inf                      # return p given standard inputs
 
 # morse_reduced_mass gives the reduced mass in Hartree units
 #   m1 and m2 are masses or atomic symbols
-def morse_reduced_mass(m1,m2=None):
+def morse_reduced_mass(m1: str, m2: str | None = None) -> float:
     amu_me = convert(1., "amu", "me")
     if isinstance(m1,str):
         m1 = Elements(m1).atomic_weight * amu_me
@@ -155,7 +203,11 @@ def morse_reduced_mass(m1,m2=None):
 #end def morse_reduced_mass
 
 # morse_freq returns anharmonic frequency in 1/cm if curve is in Hartree units
-def morse_freq(p,m1,m2=None):
+def morse_freq(
+    p  : tuple[float, np.float64, float, float],
+    m1 : str,
+    m2 : str | None = None,
+    ) -> np.float64:
     alpha = 7.2973525698e-3           # fine structure constant
     c     = 1./alpha                  # speed of light, hartree units
     m     = morse_reduced_mass(m1,m2) # reduced mass
@@ -165,12 +217,16 @@ def morse_freq(p,m1,m2=None):
 #end def morse_freq
 
 # w = \omega_e or frequency in 1/cm
-def morse_w(p,m1,m2=None):
+def morse_w(
+    p  : tuple[float, np.float64, float, float],
+    m1 : str,
+    m2 : str | None = None,
+    ) -> np.float64:
     return morse_freq(p,m1,m2)
 #end def morse_w
 
 # wX = \omega_e\Chi_e spectroscopic constant in 1/cm
-def morse_wX(p,m1,m2=None):
+def morse_wX(p, m1, m2 = None) -> float:
     ocm   = 1./(convert(1.0,'B','m')*100) # 1/Bohr to 1/cm
     alpha = 7.2973525698e-3               # fine structure constant
     m     = morse_reduced_mass(m1,m2)     # reduced mass
@@ -180,33 +236,50 @@ def morse_wX(p,m1,m2=None):
 
 # ground state energy (Hartree units in and out, neglects E_infinity)
 #   true ground state (or binding) energy is E0-E_infinity
-def morse_E0(p,m1,m2=None):
+def morse_E0(
+    p  : tuple[float, np.float64, float, float],
+    m1 : str,
+    m2 : str | None = None,
+    ) -> np.float64:
     m  = morse_reduced_mass(m1,m2)
     E0 = .5*sqrt(morse_k(p)/m) - morse_a(p)**2/(8*m) + morse_Ee(p)
     return E0
 #end def morse_E0
 
 # energy of nth vibrational level (Hartree units in and out, neglects E_infinity)
-def morse_En(p,n,m1,m2=None):
+def morse_En(
+    p  : tuple[float, np.float64, float, float],
+    n  : int,
+    m1 : str,
+    m2 : str | None = None,
+    ) -> np.float64:
     m  = morse_reduced_mass(m1,m2)
     En = sqrt(morse_k(p)/m)*(n+.5) - morse_a(p)**2/(2*m)*(n+.5)**2 + morse_Ee(p)
     return En
 #end def morse_En
 
 # morse_zero_point gives the zero point energy (always positive)
-def morse_zero_point(p,m1,m2=None):
+def morse_zero_point(
+    p  : tuple[float, np.float64, float, float],
+    m1 : str,
+    m2 : str | None = None,
+    ) -> np.float64:
     return morse_E0(p,m1,m2)-morse_Ee(p)
 #end def morse_zero_point
 
 # morse_harmfreq returns the harmonic frequency (Hartree units in and out)
-def morse_harmfreq(p,m1,m2=None):
+def morse_harmfreq(
+    p  : tuple[float, np.float64, float, float],
+    m1 : str,
+    m2 : str | None = None,
+    ) -> np.float64:
     m     = morse_reduced_mass(m1,m2)
     hfreq = sqrt(morse_k(p)/m)
     return hfreq
 #end def morse_harmfreq
 
 # morse_harmonic evaluates the harmonic oscillator fit to the morse potential
-def morse_harmonic_potential(p,r):
+def morse_harmonic_potential(p, r) -> float:
     return .5*morse_k(p)*(r-morse_re(p))**2 - morse_De(p)
 #end def morse_harmonic_potential
 
@@ -215,7 +288,14 @@ def morse_harmonic_potential(p,r):
 #   input units are Angstrom for re and 1/cm for w and wX
 #   m1 and m2 are masses in Hartree units, only one need be provided
 #   outputted fit is in Hartree units
-def morse_spect_fit(re,w,wX,m1,m2=None,Einf=0.0):
+def morse_spect_fit(
+    re,
+    w,
+    wX,
+    m1,
+    m2           = None,
+    Einf : float = 0.0,
+    ) -> tuple:
     alpha = 7.2973525698e-3            # fine structure constant
     m     = morse_reduced_mass(m1,m2)  # reduced mass
     ocm_to_oB = 1./convert(.01,'m','B')# conversion from 1/cm to 1/Bohr
@@ -229,7 +309,15 @@ def morse_spect_fit(re,w,wX,m1,m2=None,Einf=0.0):
 #end def morse_spect_fit
 
 
-def morse_rDw_fit(re,De,w,m1,m2=None,Einf=0.0,Dunit='eV'):
+def morse_rDw_fit(
+    re    : float,
+    De    : float,
+    w     : float,
+    m1    : str,
+    m2    : str | None = None,
+    Einf  : float      = 0.0,
+    Dunit : str        = 'eV',
+    ) -> tuple[float, np.float64, float, float]:
     alpha = 7.2973525698e-3            # fine structure constant
     m     = morse_reduced_mass(m1,m2)  # reduced mass
     ocm_to_oB = 1./convert(.01,'m','B')# conversion from 1/cm to 1/Bohr
@@ -248,7 +336,17 @@ def morse_rDw_fit(re,De,w,m1,m2=None,Einf=0.0,Dunit='eV'):
 #    pf    = morse_fit(r,E)                           returns fitted parameters
 #  jackknife statistical fits, E is two dimensional with blocks as first dimension
 #    pf,pmean,perror = morse_fit(r,E,jackknife=True)  returns jackknife estimates of parameters
-def morse_fit(r,E,p0=None,*,jackknife=False,cost=least_squares,auxfuncs=None,auxres=None,capture=None):
+def morse_fit(
+    r         : np.ndarray,
+    E         : np.ndarray,
+    p0        : MorseFitArg = None,
+    *,
+    jackknife : bool        = False,
+    cost                    = least_squares,
+    auxfuncs  : obj | None  = None,
+    auxres    : obj | None  = None,
+    capture                 = None,
+    ) -> np.ndarray | tuple[np.ndarray, None, None]:
     if isinstance(E,(list,tuple)):
         E = np.array(E,dtype=float)
     #end if
@@ -340,7 +438,17 @@ def morse_fit(r,E,p0=None,*,jackknife=False,cost=least_squares,auxfuncs=None,aux
 # morse_fit_fine: fit data to a morse potential and interpolate on a fine grid
 #   compute direct jackknife variations in the fitted curves
 #   by using morse as an auxiliary jackknife function
-def morse_fit_fine(r,E,p0=None,rfine=None,*,both=False,jackknife=False,cost=least_squares,capture=None):
+def morse_fit_fine(
+    r         : np.ndarray,
+    E         : np.ndarray,
+    p0        : MorseFitArg       = None,
+    rfine     : np.ndarray | None = None,
+    *,
+    both      : bool              = False,
+    jackknife : bool              = False,
+    cost                          = least_squares,
+    capture                       = None,
+    ) -> np.ndarray | tuple:
     if rfine is None:
         rfine = np.linspace(r.min(),r.max(),400)
     #end if
@@ -386,25 +494,25 @@ def morse_fit_fine(r,E,p0=None,rfine=None,*,both=False,jackknife=False,cost=leas
 
 
 # equation of state
-def murnaghan(p, V):
+def murnaghan(p, V) -> float:
     return p[0] + p[2] / p[3] * V * ((p[1] / V) ** p[3] / (p[3] - 1) + 1) - p[1] * p[2] / (p[3] - 1)
 
-def birch(p, V):
+def birch(p, V) -> float:
     return p[0] + 9 * p[1] * p[2] / 16 * ((p[1] / V) ** (2.0 / 3) - 1) ** 2 * (
         2 + (p[3] - 4) * ((p[1] / V) ** (2.0 / 3) - 1)
         )
 
-def vinet(p, V):
+def vinet(p: VinetArg, V: np.ndarray) -> np.ndarray:
     return p[0] + 2 * p[1] * p[2] / (p[3] - 1) ** 2 * (
         2
         - (2 + 3 * (p[3] - 1) * ((V / p[1]) ** (1.0 / 3) - 1))
         * exp(-1.5 * (p[3] - 1) * ((V / p[1]) ** (1.0 / 3) - 1))
         )
 
-def murnaghan_pressure(p, V):
+def murnaghan_pressure(p, V) -> float:
     return p[1] / p[2] * ((p[0] / V) ** p[2] - 1)
 
-def birch_pressure(p, V):
+def birch_pressure(p, V) -> float:
     return (
         1.5
         * p[1]
@@ -413,7 +521,7 @@ def birch_pressure(p, V):
         * (1.0 + 0.75 * (p[2] - 1) * ((p[0] / V) ** (2.0 / 3) - 1))
         )
 
-def vinet_pressure(p, V):
+def vinet_pressure(p, V) -> float:
     return (
         3.0
         * p[1]
@@ -429,10 +537,10 @@ eos_funcs = obj(
     vinet     = vinet,
     )
 
-def eos_Einf(p):    return p[0] # energy at infinite separation
-def eos_V(p):       return p[1] # equilibrium volume
-def eos_B(p):       return p[2] # bulk modulus
-def eos_Bp(p):      return p[3] # B prime
+def eos_Einf(p: EosEinfArg) -> float | np.float64:    return p[0] # energy at infinite separation
+def eos_V(p: EosEinfArg) -> float | np.float64:       return p[1] # equilibrium volume
+def eos_B(p: EosEinfArg) -> float | np.float64:       return p[2] # bulk modulus
+def eos_Bp(p: EosEinfArg) -> float | np.float64:      return p[3] # B prime
 
 eos_param_tmp = obj(
     Einf = eos_Einf,
@@ -446,7 +554,7 @@ eos_param_funcs = obj(
     vinet     = eos_param_tmp,
     )
 
-def eos_eval(p,V,type='vinet'):
+def eos_eval(p: EosEinfArg, V: np.ndarray, type: str = 'vinet') -> np.ndarray:
     if type not in eos_funcs:
         msg = (
             '"{0}" is not a valid EOS type\n'
@@ -458,7 +566,7 @@ def eos_eval(p,V,type='vinet'):
 #end def eos_eval
 
 
-def eos_param(p,param,type='vinet'):
+def eos_param(p: EosEinfArg, param: str, type: str = 'vinet') -> float:
     if type not in eos_param_funcs:
         msg = (
             '"{0}" is not a valid EOS type\n'
@@ -478,7 +586,18 @@ def eos_param(p,param,type='vinet'):
 #end def eos_param
 
 
-def eos_fit(V,E,type='vinet',p0=None,cost='least_squares',*,jackknife=False,auxfuncs=None,auxres=None,capture=None):
+def eos_fit(
+    V         : np.ndarray,
+    E         : np.ndarray,
+    type      : str  = 'vinet',
+    p0               = None,
+    cost      : str  = 'least_squares',
+    *,
+    jackknife : bool = False,
+    auxfuncs         = None,
+    auxres           = None,
+    capture          = None,
+    ) -> np.ndarray | tuple[np.ndarray, None, None]:
     if isinstance(V,(list,tuple)):
         V = np.array(V,dtype=float)
     #end if
@@ -609,7 +728,14 @@ def eos_fit(V,E,type='vinet',p0=None,cost='least_squares',*,jackknife=False,auxf
 #             if integer, will be placed in args:   args[position] = input_array
 #             if string , will be placed in kwargs: kwargs[position] = input_array
 #   capture: an object that will contain most jackknife info upon exit
-def jackknife(data,function,args=None,kwargs=None,position=None,capture=None):
+def jackknife(
+    data     : np.ndarray,
+    function,
+    args     : list[np.ndarray | None] | None = None,
+    kwargs                                    = None,
+    position : int | None                     = None,
+    capture  : obj | None                     = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
     capture_results = capture is not None
     if capture_results:
         capture.data         = data
@@ -703,7 +829,14 @@ numerics_jackknife = jackknife
 # get jackknife estimate of auxiliary quantities
 #   jsamples is a subset of jsamples data computed by jackknife above
 #   auxfunc is an additional function to get a jackknife sample of a derived quantity
-def jackknife_aux(jsamples,auxfunc,args=None,kwargs=None,position=None,capture=None):
+def jackknife_aux(
+    jsamples : list[np.ndarray],
+    auxfunc,
+    args     = None,
+    kwargs   = None,
+    position = None,
+    capture  = None,
+    ) -> tuple[np.float64, np.float64]:
     # unpack the argument list if compressed
     if not inspect.isfunction(auxfunc):
         if len(auxfunc)==1:
@@ -770,7 +903,11 @@ def jackknife_aux(jsamples,auxfunc,args=None,kwargs=None,position=None,capture=N
 #end def jackknife_aux
 
 
-def check_jackknife_inputs(args,kwargs,position):
+def check_jackknife_inputs(
+    args     : list[np.ndarray | None] | None,
+    kwargs,
+    position : int | None,
+    ) -> CheckJackkRet:
     argpos   = False
     kwargpos = False
     if position is not None:
@@ -827,7 +964,7 @@ def check_jackknife_inputs(args,kwargs,position):
 #See ?ndgrid for details.
 #"""
 
-def ndgrid(*args, **kwargs):
+def ndgrid(*args: list[int | float], **kwargs) -> list[np.ndarray] | np.ndarray:
     """n-dimensional gridding like Matlab's NDGRID
 
     Parameters
@@ -925,7 +1062,7 @@ def ndgrid(*args, **kwargs):
 ########################################################################
 
 
-def simstats(x,dim=None):
+def simstats(x: np.ndarray, dim = None):
     shape = x.shape
     ndim  = len(shape)
     if dim is None:
@@ -1032,7 +1169,12 @@ def simstats(x,dim=None):
 
 
 
-def simplestats(x,dim=None,*,full=False):
+def simplestats(
+    x    : np.ndarray,
+    dim  : int | None = None,
+    *,
+    full : bool       = False,
+    ):
     if dim is None:
         dim=len(x.shape)-1
     #end if
@@ -1048,7 +1190,16 @@ def simplestats(x,dim=None,*,full=False):
 #end def simplestats
 
 
-def equilibration_length(x,tail=.5,*,plot=False,xlim=None,bounces=2,random=True,seed_from_hash=True):
+def equilibration_length(
+    x              : np.ndarray,
+    tail           : float = .5,
+    *,
+    plot           : bool  = False,
+    xlim                   = None,
+    bounces        : int   = 2,
+    random         : bool  = True,
+    seed_from_hash : bool  = True,
+    ) -> int:
     if seed_from_hash:
         np.random.seed(hash(tuple(x))%(2**32))
     #end if
@@ -1118,7 +1269,14 @@ def equilibration_length(x,tail=.5,*,plot=False,xlim=None,bounces=2,random=True,
 
 
 # probability that two means are from the same distribution
-def ttest(m1,e1,n1,m2,e2,n2):
+def ttest(
+    m1 : float,
+    e1 : float,
+    n1 : int,
+    m2 : float,
+    e2 : float,
+    n2 : int,
+    ) -> np.float64:
     from scipy.special import betainc
     m1 = float(m1)
     e1 = float(e1)
@@ -1136,7 +1294,7 @@ def ttest(m1,e1,n1,m2,e2,n2):
 
 
 # test needed
-def surface_normals(x,y,z):
+def surface_normals(x, y, z) -> np.ndarray:
     nu,nv = x.shape
     normals = np.empty((nu,nv,3))
     mi=nu-1
@@ -1207,7 +1365,7 @@ def surface_normals(x,y,z):
 # test needed
 simple_surface_coords = [{'x','y','z'},{'r','phi','z'},{'r','phi','theta'}]
 simple_surface_min = {'x':-1.00000000001,'y':-1.00000000001,'z':-1.00000000001,'r':-0.00000000001,'phi':-0.00000000001,'theta':-0.00000000001}
-def simple_surface(origin,axes,grid):
+def simple_surface(origin, axes, grid: dict) -> tuple:
     matched=False
     gk = set(grid.keys())
     for c in range(3):
@@ -1335,7 +1493,13 @@ def simple_surface(origin,axes,grid):
 
 # test needed
 #def least_squares(p, x, y, f): return ((f(p,x)-y)**2).sum()
-def func_fit(x,y,fitting_function,p0,cost=least_squares):
+def func_fit(
+    x,
+    y,
+    fitting_function,
+    p0,
+    cost = least_squares,
+    ):
     from scipy.optimize import fmin
     f = fitting_function
     p = fmin(cost,p0,args=(x,y,f),maxiter=10000,maxfun=10000)
@@ -1343,7 +1507,11 @@ def func_fit(x,y,fitting_function,p0,cost=least_squares):
 #end def func_fit
 
 
-def distance_table(p1,p2,ordering=0):
+def distance_table(
+    p1       : np.ndarray,
+    p2       : np.ndarray,
+    ordering : int = 0,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     n1 = len(p1)
     n2 = len(p2)
     same = id(p1)==id(p2)
@@ -1388,7 +1556,14 @@ def distance_table(p1,p2,ordering=0):
 
 
 
-def nearest_neighbors(n,points,qpoints=None,*,return_distances=False,slow=False):
+def nearest_neighbors(
+    n                : int,
+    points           : np.ndarray,
+    qpoints          : np.ndarray | None = None,
+    *,
+    return_distances : bool              = False,
+    slow             : bool              = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     extra = 0
     if qpoints is None:
         qpoints=points
@@ -1433,7 +1608,7 @@ def nearest_neighbors(n,points,qpoints=None,*,return_distances=False,slow=False)
 
 
 
-def voronoi_neighbors(points):
+def voronoi_neighbors(points: np.ndarray) -> np.ndarray:
     from scipy.spatial import Voronoi
     vor = Voronoi(points)
     neighbor_pairs = vor.ridge_points
@@ -1442,7 +1617,11 @@ def voronoi_neighbors(points):
 
 
 
-def convex_hull(points,dimension=None,tol=None):
+def convex_hull(
+    points    : np.ndarray,
+    dimension : int | None   = None,
+    tol       : float | None = None,
+    ) -> list[np.int32]:
     from scipy.spatial import Delaunay
     if dimension is None:
         npts,dimension = points.shape
@@ -1487,7 +1666,16 @@ def convex_hull(points,dimension=None,tol=None):
 
 
 
-def layers_1d(xpoints,tol,xmin=None,xmax=None,*,merge=True,periodic=False,full_return=False):
+def layers_1d(
+    xpoints,
+    tol,
+    xmin               = None,
+    xmax               = None,
+    *,
+    merge       : bool = True,
+    periodic    : bool = False,
+    full_return : bool = False,
+    ) -> obj | tuple[obj, float | None, None]:
 
     # Update inputs to be consistent with periodic merge, if requested
     if merge and periodic:
@@ -1572,7 +1760,12 @@ def layers_1d(xpoints,tol,xmin=None,xmax=None,*,merge=True,periodic=False,full_r
 
 
 
-def layer_means_1d(xpoints,tol,*,full_return=False):
+def layer_means_1d(
+    xpoints,
+    tol,
+    *,
+    full_return : bool = False,
+    ):
     # Get layer data
     layers,xmin,xmax = layers_1d(xpoints,tol,full_return=True)
 
@@ -1595,7 +1788,14 @@ def layer_means_1d(xpoints,tol,*,full_return=False):
 
 
 
-def index_by_layer_1d(xpoints,tol,*,uniform=True,check=True,full_return=False):
+def index_by_layer_1d(
+    xpoints,
+    tol,
+    *,
+    uniform     : bool = True,
+    check       : bool = True,
+    full_return : bool = False,
+    ):
     # Get layer means
     xlayer,xmin,xmax = layer_means_1d(xpoints,tol,full_return=True)
 

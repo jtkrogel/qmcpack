@@ -24,6 +24,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 import numpy as np
@@ -65,7 +67,7 @@ from .xmlreader import XMLreader
 from . import numpy_extensions as npe
 
 
-def get_path(o, path, value=None):
+def get_path(o, path, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -81,13 +83,18 @@ class GCTA(DevBase):
     Throughout the class, the handling of k-points uses unit (crystal) coordinates, which ranges in [0, 1).
     Note that QMCPACK interally uses the range (-0.5, 0.5) for k-points.
     '''
-    def __init__(self, input, system, flavor):
+    def __init__(
+        self,
+        input,
+        system,
+        flavor,
+        ) -> None:
         self.flavor = flavor
         self.input = input
         self.system = system
     #end def __init__
 
-    def check_implementation(self, gcta_possible, dependency):
+    def check_implementation(self, gcta_possible, dependency: Pw2qmcpack) -> None:
         gcta_flavors = {'safl', 'afl', 'nscf', 'scf'}
         if self.flavor.lower() not in gcta_flavors:
             msg = f'GCTA type {self.flavor} is not recognized. Valid options are {gcta_flavors}.'
@@ -132,7 +139,7 @@ class GCTA(DevBase):
     #end def check_implementation
 
     @staticmethod
-    def int_kpoint_weight(float_value, atol=1e-8):
+    def int_kpoint_weight(float_value, atol: float = 1e-8):
         '''
         This function checks if the float k-point weight/norm is close to its integer value. If so, returns the integer value.
         '''
@@ -145,7 +152,7 @@ class GCTA(DevBase):
         return int_value
     #end def check_kpoint_weight
 
-    def read_eshdf_data(self, filename):
+    def read_eshdf_data(self, filename) -> None:
         '''
         Read the ESHDF eigenvalues, k-point info and store the data in the GCTA instance as an attribute
         '''
@@ -238,7 +245,7 @@ class GCTA(DevBase):
         return qmc_kpoints
     #end def unfolded_nkpoints
 
-    def check_kmesh_size(self):
+    def check_kmesh_size(self) -> None:
         '''
         Make sure that NSCF k-points and QMC twists are commensurate for GCTA
         '''
@@ -251,7 +258,7 @@ class GCTA(DevBase):
             '''
     #end def check_kmesh_size
 
-    def check_kpoint_consistency(self, tol=1e-8):
+    def check_kpoint_consistency(self, tol: float = 1e-8) -> None:
         '''
         The kpoints expected by the GCTA object and what is found in the self.eig_data.data should be consistent.
         The kpoints in self.eig_data.data are expected to be in unit coordinates. (Conversion: dot(kpoints, inv(kaxes))).
@@ -276,7 +283,7 @@ class GCTA(DevBase):
         #end for
     #end def check_kpoint_consistency
 
-    def gcta_converter_kmapping(self, tol=1e-8):
+    def gcta_converter_kmapping(self, tol: float = 1e-8) -> None:
         '''
         The k-points defined by the GCTA object and the k-points written by a converter may have different ordering.
         We need to figure out the mapping between these two so that the k-points fold into correct twists.
@@ -301,7 +308,7 @@ class GCTA(DevBase):
     #end def gcta_converter_kmapping
 
     @staticmethod
-    def traceback_dependency(dependency, cls, levels = 1):
+    def traceback_dependency(dependency, cls, levels: int = 1):
         '''
         This function provides limited functionality to go back in dependency by a certain level
         '''
@@ -332,7 +339,7 @@ class GCTA(DevBase):
     #end def
 
     @staticmethod
-    def pwscf_tot_magnet(filepath):
+    def pwscf_tot_magnet(filepath) -> float | None:
         file = f'{filepath}/pwscf_output/pwscf.xml'
         xml = XMLreader(file, warn=False).obj
         calculation = xml['qes:espresso']['input']['control_variables']['calculation']['text']
@@ -351,7 +358,7 @@ class GCTA(DevBase):
     #end if
 
     @staticmethod
-    def pwscf_fermi(filepath, scf_type):
+    def pwscf_fermi(filepath, scf_type) -> float | np.ndarray | None:
         file = f'{filepath}/pwscf_output/pwscf.xml'
         xml = XMLreader(file, warn=False).obj
         calculation = xml['qes:espresso']['input']['control_variables']['calculation']['text']
@@ -371,7 +378,7 @@ class GCTA(DevBase):
         return fermi_level
     #end if
 
-    def adapted_fermi_level(self):
+    def adapted_fermi_level(self) -> float:
         combined_eigens = []
         data = self.eig_data.data
         norm_factor = self.eig_data.norm_factor # normalization factor to get integer k-weights
@@ -399,7 +406,7 @@ class GCTA(DevBase):
         return fermi_level
     #end def adapted_fermi_level
 
-    def spin_adapted_fermi_level(self, scf_magnet):
+    def spin_adapted_fermi_level(self, scf_magnet) -> np.ndarray:
         if scf_magnet is None:
             msg = 'The reference magnetization in safl can not be None. Please check that the SCF is appropriate.'
             raise ValueError(msg)
@@ -436,7 +443,7 @@ class GCTA(DevBase):
         return fermi_level
     #end def adapted_fermi_level
 
-    def set_gcta_occupations(self, fermi_level):
+    def set_gcta_occupations(self, fermi_level) -> None:
         if fermi_level is None:
             msg = f'The Fermi level can not be None. This indicates a bug in {self.flavor}'
             raise NexusError(msg)
@@ -479,7 +486,7 @@ class GCTA(DevBase):
         self.nelecs_at_twist = nelecs_at_twist
     #end set_gcta_occupation
 
-    def sum_charge_twists(self):
+    def sum_charge_twists(self) -> int | None:
         '''
         Returns the net charge of a system with multiple twists (not averaged)
         '''
@@ -498,7 +505,7 @@ class GCTA(DevBase):
         return q_sum_twists
     #end def sum_charge_twists
 
-    def sum_spin_twists(self):
+    def sum_spin_twists(self) -> int:
         '''
         Returns the net spin of a system with multiple twists (not averaged)
         '''
@@ -513,7 +520,7 @@ class GCTA(DevBase):
         return spin_sum_twists
     #end def sum_spin_twists
 
-    def check_charge_neutrality(self):
+    def check_charge_neutrality(self) -> None:
         '''
         Check the net charge of the twist averaged system
         '''
@@ -529,7 +536,7 @@ class GCTA(DevBase):
         #end if
     #end def check_charge_neutrality
 
-    def check_magnetization_accuracy(self, scf_magnet):
+    def check_magnetization_accuracy(self, scf_magnet) -> None:
         '''
         Check that the net magnetization is close to the reference SCF value
         '''
@@ -550,7 +557,12 @@ class GCTA(DevBase):
         #end if
     #end def check_magnetization_accuracy
 
-    def write_gcta_report(self, locdir, fermi_level, scf_magnet = None):
+    def write_gcta_report(
+        self,
+        locdir,
+        fermi_level,
+        scf_magnet = None,
+        ) -> None:
         spinor_run = self.input.get('spinor')
         nosym_kpoints = self.unfolded_nkpoints()
         q_sum_twists = self.sum_charge_twists()
@@ -628,7 +640,7 @@ class Qmcpack(Simulation):
     # dynamic workflow support
     allowed_requirements = ('none','pwscf_orbitals','jastrow','wavefunction')
 
-    def has_afqmc_input(self):
+    def has_afqmc_input(self) -> bool:
         afqmc_input = False
         if not self.has_generic_input():
             afqmc_input = self.input.is_afqmc_input()
@@ -637,7 +649,7 @@ class Qmcpack(Simulation):
     #end def has_afqmc_input
 
 
-    def post_init(self):
+    def post_init(self) -> None:
         generic_input = self.has_generic_input()
 
         if self.has_afqmc_input():
@@ -681,14 +693,14 @@ class Qmcpack(Simulation):
     #end def post_init
 
 
-    def propagate_identifier(self):
+    def propagate_identifier(self) -> None:
         if not self.has_generic_input():
             self.input.simulation.project.id = self.identifier
         #end if
     #end def propagate_identifier
 
 
-    def pre_write_inputs(self,save_image):
+    def pre_write_inputs(self, save_image: bool) -> None:
         # fix to make twist averaged input file under generate_only
         if self.system is None:
             self.should_twist_average = False
@@ -702,7 +714,7 @@ class Qmcpack(Simulation):
 
 
     @staticmethod
-    def restartable_input(input):
+    def restartable_input(input) -> bool:
         if isinstance(input,TracedQmcpackInput):
             inputs = input.inputs.values()
         else:
@@ -722,7 +734,12 @@ class Qmcpack(Simulation):
     #end def restartable_input
 
 
-    def get_restart_entry(self,input,group=None,twistnum=None):
+    def get_restart_entry(
+        self,
+        input    : QmcpackInput,
+        group    : int | None = None,
+        twistnum : int | None = None,
+        ) -> obj | None:
         qmc = input.get_output_info('qmc')
         if len(qmc)==0:
             msg = 'cannot obtain a restart from a QMCPACK input without QMC calculation sections'
@@ -782,14 +799,14 @@ class Qmcpack(Simulation):
     #end def get_restart_entry
 
 
-    def incorporate_restart_entry(self,input,restart):
+    def incorporate_restart_entry(self, input: QmcpackInput, restart: obj) -> None:
         walkers = deepcopy(restart.mcwalkerset)
         walkers.fileroot = os.path.relpath(restart.fileroot,self.locdir)
         input.simulation.mcwalkerset = walkers
     #end def incorporate_restart_entry
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         calculating_result = False
         if result_name=='jastrow' or result_name=='wavefunction':
             calctypes = self.input.get_output_info('calctypes')
@@ -803,7 +820,7 @@ class Qmcpack(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj | None:
         result = obj()
         if result_name=='jastrow' or result_name=='wavefunction':
             analyzer = self.load_analyzer_image()
@@ -850,7 +867,12 @@ class Qmcpack(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         input = self.input
         system = self.system
         if result_name=='restart':
@@ -1366,7 +1388,7 @@ class Qmcpack(Simulation):
     #end def incorporate_result
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         output = self.outfile_text()
         errors = self.errfile_text()
 
@@ -1421,7 +1443,7 @@ class Qmcpack(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         if self.has_generic_input():
             output_files = []
         else:
@@ -1438,7 +1460,7 @@ class Qmcpack(Simulation):
     #end def get_output_files
 
 
-    def post_analyze(self,analyzer):
+    def post_analyze(self, analyzer) -> None:
         if not self.has_generic_input():
             calctypes = self.input.get_output_info('calctypes')
             opt_run = calctypes is not None and 'opt' in calctypes
@@ -1691,12 +1713,12 @@ class Qmcpack(Simulation):
     #end def post_analyze
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         return self.app_name+' '+self.infile
     #end def app_command
 
 
-    def twist_average(self,twistnums):
+    def twist_average(self, twistnums: list[int]) -> None:
         br = obj()
         br.quantity = 'twistnum'
         br.values   = list(twistnums)
@@ -1704,7 +1726,7 @@ class Qmcpack(Simulation):
     #end def twist_average
 
 
-    def write_prep(self):
+    def write_prep(self) -> None:
         if self.got_dependencies:
             traced_input  = isinstance(self.input,TracedQmcpackInput)
             generic_input = self.has_generic_input()
@@ -1815,7 +1837,7 @@ class Qmcpack(Simulation):
         #end if
     #end def write_prep
 
-    def read_bandinfo_dat(self):
+    def read_bandinfo_dat(self) -> obj:
         edata = obj()
         import glob
         for einpath in glob.glob(self.locdir+'/*.bandinfo.dat'):
@@ -1846,7 +1868,7 @@ class Qmcpack(Simulation):
 
     # dynamic worfklow support
 
-    def fill_produces(self):
+    def fill_produces(self) -> None:
         calctypes = self.input.get_output_info('calctypes')
         if 'opt' in calctypes:
             if self.input.has_jastrows():
@@ -1855,7 +1877,7 @@ class Qmcpack(Simulation):
     #end def fill_produces
 
 
-    def fill_products(self):
+    def fill_products(self) -> None:
         if len(self.produces)==0:
             return
         if 'jastrow' in self.produces or 'wavefunction' in self.produces:
@@ -1872,7 +1894,7 @@ class Qmcpack(Simulation):
     #end def fill_products
 
 
-    def receive_structure(self,struct):
+    def receive_structure(self, struct) -> None:
         struct.change_units('B')
         self.system.structure = struct
         self.system.remove_folded()
@@ -1880,7 +1902,7 @@ class Qmcpack(Simulation):
     #end def receive_structure
 
 
-    def receive_pwscf_orbitals(self,orb_file):
+    def receive_pwscf_orbitals(self, orb_file: str) -> None:
         if not orb_file.endswith('.h5'):
             msg = (
                 'pwscf orbitals must be in hdf5 (.h5) file.\n'
@@ -1942,7 +1964,7 @@ class Qmcpack(Simulation):
     #end def receive_pwscf_orbitals
 
 
-    def receive_jastrow(self,jastrow_file):
+    def receive_jastrow(self, jastrow_file) -> None:
         opt_file     = jastrow_file
         opt          = QmcpackInput(opt_file)
         wavefunction = input.get('wavefunction')
@@ -2012,7 +2034,7 @@ class Qmcpack(Simulation):
     #end def receive_jastrow
 
 
-    def receive_wavefunction(self,wf_file):
+    def receive_wavefunction(self, wf_file) -> None:
         opt = QmcpackInput(wf_file)
         qs  = input.get('qmcsystem')
         wfn = deepcopy(opt.qmcsystem.wavefunction)
@@ -2026,7 +2048,7 @@ class Qmcpack(Simulation):
 
 
 
-def generate_qmcpack(**kwargs):
+def generate_qmcpack(**kwargs) -> Qmcpack:
     pseudos = kwargs.get('pseudos',None)
     if pseudos is not None:
         system = kwargs.get('system',None)
@@ -2082,7 +2104,7 @@ def generate_qmcpack(**kwargs):
 #end def generate_qmcpack
 
 
-def generate_cusp_correction(**kwargs):
+def generate_cusp_correction(**kwargs) -> Qmcpack:
     kwargs['input_type']   = 'basic'
     kwargs['bconds']       = 'nnn'
     kwargs['jastrows']     = []

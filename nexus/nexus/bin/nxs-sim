@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -19,7 +21,7 @@ if sys.version_info[0:3] < (3, 10, 0):
 # Locate and import the closely coupled Nexus module
 search_basepath = Path(__file__).resolve().parent.parent
 nexus_library_search_path = search_basepath.parent
-def find_nexus_modules():
+def find_nexus_modules() -> None:
     import sys
 
     # "import nexus" will succeed if nexus directory exists without __init__.py in it.
@@ -73,13 +75,13 @@ class SimTool(obj):
     fields = frozenset(indicators)
 
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.paths = []
         self.sims  = []
     #end def __init__
 
 
-    def load(self,paths):
+    def load(self, paths) -> None:
         for path in paths:
             sim = load(path)
             self.sims.append(sim)
@@ -88,7 +90,7 @@ class SimTool(obj):
     #end def load
 
 
-    def write_state(self,fields=()):
+    def write_state(self, fields: tuple[()] = ()) -> None:
         if len(fields)==0:
             fields = self.indicators
         #end if
@@ -111,7 +113,7 @@ class SimTool(obj):
     #end def write_state
 
 
-    def write_state_all(self,fields=()):
+    def write_state_all(self, fields: tuple[()] = ()) -> None:
         if len(fields)==0:
             fields = self.indicators
         #end if
@@ -132,7 +134,7 @@ class SimTool(obj):
     #end def write_state_all
 
 
-    def backup(self):
+    def backup(self) -> None:
         for path in self.paths:
             base,file = os.path.split(path)
             bufile = os.path.join(base,'backup_'+file)
@@ -141,7 +143,7 @@ class SimTool(obj):
     #end def backup
 
 
-    def restore(self):
+    def restore(self) -> None:
         for path in self.paths:
             base,file = os.path.split(path)
             bufile = os.path.join(base,'backup_'+file)
@@ -150,7 +152,7 @@ class SimTool(obj):
     #end def restore
 
 
-    def set_indicators(self,inds,val=1):
+    def set_indicators(self, inds, val: int = 1) -> None:
         if len(inds)==0:
             msg = (
                 'no indicators specified\n'

@@ -16,12 +16,17 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import textwrap
 from .developer import obj
 from .simulation import Simulation
 from .pyscf_input import PyscfInput, generate_pyscf_input
 from .pyscf_analyzer import PyscfAnalyzer
+
+from pathlib import Path
+
 
 
 class Pyscf(Simulation):
@@ -34,7 +39,7 @@ class Pyscf(Simulation):
     application_results    = frozenset({'orbitals','wavefunction'})
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool | None:
         calculating_result = False
         if result_name=='orbitals':
             conv_requested  = self.input.save_qmc
@@ -47,7 +52,7 @@ class Pyscf(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj | None:
         result = obj()
         if result_name=='orbitals':
             inp = self.input
@@ -75,7 +80,12 @@ class Pyscf(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         not_implemented = False
         if not_implemented:
             msg = 'ability to incorporate result '+result_name+' has not been implemented'
@@ -84,7 +94,7 @@ class Pyscf(Simulation):
     #end def incorporate_result
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         self.failed = False
         errors = self.errfile_text()
         pyscf_errors = [
@@ -122,13 +132,13 @@ class Pyscf(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         app_command = self.app_name+' '+self.infile
         return app_command
     #end def app_command
@@ -137,7 +147,7 @@ class Pyscf(Simulation):
 
 
 
-def generate_pyscf(**kwargs):
+def generate_pyscf(**kwargs) -> Pyscf:
     sim_args,inp_args = Pyscf.separate_inputs(kwargs)
 
     if 'input' not in sim_args:
@@ -154,4 +164,3 @@ def generate_pyscf(**kwargs):
 
     return py
 #end def generate_pyscf
-

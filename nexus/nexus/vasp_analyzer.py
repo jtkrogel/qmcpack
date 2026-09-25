@@ -29,12 +29,17 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import numpy as np
 from . import numpy_extensions as npe
 from .developer import DevBase, obj, FileFormatError, sorted_generic
 from .simulation import Simulation,SimulationAnalyzer
 from .vasp_input import Incar
+
+from pathlib import Path
+
 
 # vasp xml reader classes/functions
 
@@ -43,7 +48,7 @@ class VXML(DevBase):
 
     data_types = obj(int=int,string=str,float=float)
 
-    def __init__(self,tag,attr=None):
+    def __init__(self, tag: str, attr: str | None = None) -> None:
         self._tag   = tag
         self._lines = []
         self._attr  = None
@@ -62,11 +67,11 @@ class VXML(DevBase):
         #end if
     #end def __init__
 
-    def _is_empty(self):
+    def _is_empty(self) -> bool:
         return len(self)-4==0
     #end def _is_empty
 
-    def _add(self,new):
+    def _add(self, new: VXML) -> None:
         tag = new._tag
         if tag not in self:
             self[tag] = new
@@ -83,7 +88,7 @@ class VXML(DevBase):
         #end if
     #end def _add
 
-    def _parse(self):
+    def _parse(self) -> None:
         # rename sub objects if name is present
         for name in list(self.keys()):
             value = self[name]
@@ -161,7 +166,7 @@ class VXML(DevBase):
     #end def _parse
 
 
-    def _parse_values(self,lines):
+    def _parse_values(self, lines: list[str]) -> None:
         if len(lines)==1 and '<' not in lines[0]:
             self._value = readval(lines[0])
         else:
@@ -195,7 +200,7 @@ class VXML(DevBase):
     #end def parse_values
 
 
-    def _parse_array(self,lines):
+    def _parse_array(self, lines: list[str]) -> None:
         #print 'parsing array'
         dims       = obj()
         fields     = obj()
@@ -272,7 +277,7 @@ class VXML(DevBase):
     #end def _parse_array
 
 
-    def _remove_empty(self):
+    def _remove_empty(self) -> None:
         for n in list(self.keys()):
             v = self[n]
             if isinstance(v,VXML):
@@ -285,7 +290,7 @@ class VXML(DevBase):
     #end def _remove_empty
 
 
-    def _remove_hidden(self):
+    def _remove_hidden(self) -> None:
         del self._tag
         del self._attr
         del self._lines
@@ -300,12 +305,12 @@ class VXML(DevBase):
 
 
 class VXMLcoll(VXML):
-    def _append(self,new):
+    def _append(self, new: VXML) -> None:
         index = len(self)-4
         self[index]=new
     #end def _append
 
-    def _reorder(self):
+    def _reorder(self) -> None:
         n=0
         for key in sorted_generic(self.keys()):
             value = self[key]
@@ -321,7 +326,7 @@ class VXMLcoll(VXML):
 
 booldict = dict(T=True,F=False)
 
-def readval(val):
+def readval(val: str) -> bool | int | float | str | np.ndarray:
     fail = False
     split = False
     if isinstance(val,str):
@@ -366,7 +371,7 @@ def readval(val):
 
 
 
-def read_vxml(filepath):
+def read_vxml(filepath: str) -> VXML:
     if not os.path.exists(filepath):
         msg = f'file {filepath} does not exist'
         raise FileNotFoundError(msg)
@@ -450,17 +455,17 @@ def read_vxml(filepath):
 # vasp outcar functions
 
 class VaspLines(DevBase):
-    def __init__(self,lines):
+    def __init__(self, lines) -> None:
         self.pointer = 0
         self.lines   = lines
     #end def __init__
 
-    def advance_line(self,amount):
+    def advance_line(self, amount: int) -> str:
         self.pointer += amount
         return self.lines[self.pointer]
     #end def advance_line
 
-    def advance_token(self,token):
+    def advance_token(self, token: str) -> str | None:
         psave = self.pointer
         for line in self.lines[self.pointer:]:
             if token in line:
@@ -472,39 +477,39 @@ class VaspLines(DevBase):
         return None
     #end def advance
 
-    def advance(self,amount):
+    def advance(self, amount: int) -> None:
         self.pointer += amount
     #end def advance
 
-    def remainder(self):
+    def remainder(self) -> str | list[str]:
         return self.lines[self.pointer:]
     #end def remainder
 
-    def rewind(self,point=0):
+    def rewind(self, point: int = 0) -> None:
         self.pointer = point
     #end def rewind
 
-    def get_line(self,point=None):
+    def get_line(self, point = None) -> str:
         if point is None:
             point = self.pointer
         #end if
         return self.lines[point]
     #end def get_line
 
-    def get_line_ahead(self,nahead):
+    def get_line_ahead(self, nahead) -> str:
         return self.lines[self.pointer+nahead]
     #end def get_line_ahead
 #end class VaspLines
 
 
-def read_outcar_header_values(vlines,odata):
+def read_outcar_header_values(vlines: VaspLines, odata: OutcarData) -> None:
     line = vlines.advance_token('TOTEN')
     odata.total_energy = float(line.split()[4])
     vlines.advance_token('energy without entropy')
 #end def read_outcar_header_values
 
 
-def read_outcar_core_potentials(vlines,odata):
+def read_outcar_core_potentials(vlines: VaspLines, odata: OutcarData) -> None:
     line = vlines.advance_token('the test charge radii are')
     odata.core_potential_radii = np.array(line.split()[5:],dtype=float)
     vlines.advance(2)
@@ -524,13 +529,13 @@ def read_outcar_core_potentials(vlines,odata):
 #end def read_outcar_core_potentials
 
 
-def read_outcar_fermi_energy(vlines,odata):
+def read_outcar_fermi_energy(vlines: VaspLines, odata: OutcarData) -> None:
     line = vlines.advance_token('E-fermi')
     odata.Efermi = float(line.split()[2])
 #end def read_outcar_fermi_energy
 
 
-def read_outcar_bands(vlines,odata):
+def read_outcar_bands(vlines: VaspLines, odata: OutcarData) -> None:
     bands = obj()
     line = vlines.advance_token('spin component')
     if line is not None:
@@ -576,7 +581,11 @@ def read_outcar_bands(vlines,odata):
 #end def read_outcar_bands
 
 
-def read_outcar_charge_mag(vlines,odata,token):
+def read_outcar_charge_mag(
+    vlines : VaspLines,
+    odata  : OutcarData,
+    token  : str,
+    ) -> tuple[obj, obj] | None:
     ion   = obj(s=[],p=[],d=[],tot=[])
     total = obj()
     vlines.advance_token(token)
@@ -611,21 +620,21 @@ def read_outcar_charge_mag(vlines,odata,token):
 #end def read_outcar_charge_mag
 
 
-def read_outcar_total_charge(vlines,odata):
+def read_outcar_total_charge(vlines: VaspLines, odata: OutcarData) -> None:
     ion,total = read_outcar_charge_mag(vlines,odata,'total charge ') # trailing space is important
     odata.ion_charge   = ion
     odata.total_charge = total
 #end def read_outcar_total_charge
 
 
-def read_outcar_magnetization(vlines,odata):
+def read_outcar_magnetization(vlines: VaspLines, odata: OutcarData) -> None:
     ion,total = read_outcar_charge_mag(vlines,odata,'magnetization')
     odata.ion_magnetization   = ion
     odata.total_magnetization = total
 #end def read_outcar_magnetization
 
 
-def read_outcar_stress(vlines,odata):
+def read_outcar_stress(vlines: VaspLines, odata: OutcarData) -> None:
     vlines.advance_token('FORCE on cell')
     line = vlines.advance_line(1)
     dirs = line.split()[1:]
@@ -645,7 +654,7 @@ def read_outcar_stress(vlines,odata):
 #end def read_outcar_stress
 
 
-def read_outcar_cell(vlines,odata):
+def read_outcar_cell(vlines: VaspLines, odata: OutcarData) -> None:
     vlines.advance_token('VOLUME and BASIS')
     volume = float(vlines.advance_line(3).split()[-1])
     a1 = vlines.advance_line(2).split()[0:3]
@@ -657,7 +666,7 @@ def read_outcar_cell(vlines,odata):
 #end def read_outcar_cell
 
 
-def read_outcar_position_force(vlines,odata):
+def read_outcar_position_force(vlines: VaspLines, odata: OutcarData) -> None:
     position    = []
     force       = []
     vlines.advance_token('POSITION')
@@ -682,7 +691,7 @@ def read_outcar_position_force(vlines,odata):
 #end def read_outcar_position_force
 
 
-def read_outcar_accounting(vlines,odata):
+def read_outcar_accounting(vlines: VaspLines, odata: OutcarData) -> None:
     time = obj()
     memory = obj()
     vlines.advance_token('General timing and accounting')
@@ -721,7 +730,7 @@ class OutcarData(DevBase):
 
     read_outcar_functions = any_functions + elast_functions + ilast_functions
 
-    def __init__(self,filepath=None,lines=None):
+    def __init__(self, filepath = None, lines: list | None = None) -> None:
         if filepath is not None:
             if not os.path.exists(filepath):
                 msg = f'file {filepath} does not exist'
@@ -735,7 +744,13 @@ class OutcarData(DevBase):
     #end def __init__
 
 
-    def read(self,*,ilast=False,elast=False,all=True):
+    def read(
+        self,
+        *,
+        ilast : bool | np.bool_ = False,
+        elast : bool | np.bool_ = False,
+        all   : bool            = True,
+        ) -> None:
         ilast |= all
         elast |= all
         vlines = self.vlines
@@ -764,7 +779,13 @@ class OutcarData(DevBase):
 # main analyzer class
 
 class VaspAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0=None,*,xml=False,analyze=False):
+    def __init__(
+        self,
+        arg0    : Path | None = None,
+        *,
+        xml     : bool        = False,
+        analyze : bool        = False,
+        ) -> None:
         path     = None
         prefix   = None
         incar    = None
@@ -828,7 +849,7 @@ class VaspAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self,outcar=None):
+    def analyze(self, outcar = None) -> None:
         if self.info.neb:
             self.neb_analyzers = obj()
             for i in range(self.info.incar.images):
@@ -854,7 +875,7 @@ class VaspAnalyzer(SimulationAnalyzer):
     #end def analyze
 
 
-    def analyze_outcar(self,outcar):
+    def analyze_outcar(self, outcar: str) -> None:
         if not os.path.exists(outcar):
             msg = f'outcar file {outcar} does not exist'
             raise FileNotFoundError(msg)

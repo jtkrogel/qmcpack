@@ -18,11 +18,16 @@
 #                                                                    #
 #====================================================================#
 
+from __future__ import annotations
+
 import numpy as np
 import keyword
 from inspect import getmembers
 from .developer import DevBase, obj
 from .utilities import path_string, valid_variable_name
+
+from pathlib import Path
+
 
 class HDFglobals(DevBase):
     view = False
@@ -30,35 +35,35 @@ class HDFglobals(DevBase):
 
 
 class HDFgroup(DevBase):
-    def _escape_name(self,name):
+    def _escape_name(self, name: str) -> str:
         if name in self._escape_names:
             name=name+'_'
         #end if
         return name
     #end def escape_name
 
-    def _set_parent(self,parent):
+    def _set_parent(self, parent) -> None:
         self._parent=parent
     #end def set_parent
 
-    def _add_dataset(self,name,dataset):
+    def _add_dataset(self, name: str, dataset) -> None:
         self._datasets[name]=dataset
     #end def add_dataset
 
-    def _add_group(self,name,group):
+    def _add_group(self, name: str, group: HDFgroup) -> None:
         group._name=name
         self._groups[name]=group
     #end def add_group
 
-    def _contains_group(self,name):
+    def _contains_group(self, name) -> bool:
         return name in self._groups.keys()
     #end def _contains_group
 
-    def _contains_dataset(self,name):
+    def _contains_dataset(self, name) -> bool:
         return name in self._datasets.keys()
     #end def _contains_dataset
 
-    def _to_string(self):
+    def _to_string(self) -> str:
         s=''
         if len(self._datasets)>0:
             s+='  datasets:\n'
@@ -83,7 +88,7 @@ class HDFgroup(DevBase):
 #        return self._to_string()
 #    #end def __repr__
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._name=''
         self._parent=None
         self._groups={}
@@ -95,7 +100,11 @@ class HDFgroup(DevBase):
     #end def __init__
 
 
-    def _remove_hidden(self,*,deep=True):
+    def _remove_hidden(
+        self,
+        *,
+        deep : bool = True,
+        ) -> None:
         if '_parent' in self:
             del self._parent
         #end if
@@ -116,7 +125,7 @@ class HDFgroup(DevBase):
 
     # read in all data views (h5py datasets) into arrays
     #   useful for converting a single group read in view form to full arrays
-    def read_arrays(self):
+    def read_arrays(self) -> None:
         self._remove_hidden()
         for k,v in self.items():
             if isinstance(v,HDFgroup):
@@ -128,7 +137,7 @@ class HDFgroup(DevBase):
     #end def read_arrays
 
 
-    def get_keys(self):
+    def get_keys(self) -> list:
         if '_groups' in self:
             keys = list(self._groups.keys())
         else:
@@ -139,7 +148,7 @@ class HDFgroup(DevBase):
 
     #project interface methods
 
-    def zero(self,*names):
+    def zero(self, *names: str) -> None:
         for name in names:
             if name in self and isinstance(self[name],np.ndarray):
                 self[name][:] = 0
@@ -155,7 +164,7 @@ class HDFgroup(DevBase):
     #end def zero
 
 
-    def minsize(self,other,*names):
+    def minsize(self, other: HDFgroup, *names: str) -> None:
         name_set = set(names)
         snames = set(self.keys()) & name_set
         onames = set(other.keys()) & name_set
@@ -186,7 +195,7 @@ class HDFgroup(DevBase):
     #end def minsize
 
 
-    def accumulate(self,other,*names):
+    def accumulate(self, other: HDFgroup, *names: str) -> None:
         name_set = set(names)
         snames = set(self.keys()) & name_set
         onames = set(other.keys()) & name_set
@@ -226,7 +235,7 @@ class HDFgroup(DevBase):
     #end def accumulate
 
 
-    def normalize(self,normalization,*names):
+    def normalize(self, normalization: int, *names: str) -> None:
         for name in names:
             if name in self and isinstance(self[name],np.ndarray):
                 self[name] /= normalization
@@ -242,7 +251,7 @@ class HDFgroup(DevBase):
     #end def normalize
 
 
-    def sum(self,*names):
+    def sum(self, *names) -> None:
         for name in names:
             if name in self and isinstance(self[name],np.ndarray) and name=='value':
                 s = self[name].mean(0).sum()
@@ -257,7 +266,13 @@ class HDFgroup(DevBase):
 
 class HDFreader(DevBase):
 
-    def __init__(self,fpath,*,verbose=False,view=False):
+    def __init__(
+        self,
+        fpath   : str | Path,
+        *,
+        verbose : bool = False,
+        view    : bool = False,
+        ) -> None:
         import h5py
         fpath = path_string(fpath)
         HDFglobals.view = view
@@ -318,7 +333,7 @@ class HDFreader(DevBase):
     #end def __init__
 
 
-    def increment_level(self):
+    def increment_level(self) -> None:
         self.ilevel+=1
         self.nlevels = max(self.ilevel+1,self.nlevels)
         if self.ilevel+1==self.nlevels:
@@ -328,12 +343,17 @@ class HDFreader(DevBase):
         self.pad = self.ilevel*'  '
     #end def increment_level
 
-    def decrement_level(self):
+    def decrement_level(self) -> None:
         self.ilevel-=1
         self.pad = self.ilevel*'  '
     #end def decrement_level
 
-    def add_dataset(self,cur,k,v):
+    def add_dataset(
+        self,
+        cur  : HDFgroup,
+        k    : str,
+        v,
+        ) -> None:
         if not HDFglobals.view:
             cur[k]=np.array(v)
         else:
@@ -342,7 +362,13 @@ class HDFreader(DevBase):
         cur._add_dataset(k,cur[k])
     #end def add_dataset
 
-    def add_group(self,hcur,cur,k,v):
+    def add_group(
+        self,
+        hcur,
+        cur  : HDFgroup,
+        k    : str,
+        v,
+        ) -> None:
         import h5py
         cur[k] = HDFgroup()
         cur._add_group(k,cur[k])
@@ -371,6 +397,11 @@ class HDFreader(DevBase):
 
 
 
-def read_hdf(fpath,*,verbose=False,view=False):
+def read_hdf(
+    fpath   : str | Path,
+    *,
+    verbose : bool = False,
+    view    : bool = False,
+    ) -> HDFgroup:
     return HDFreader(fpath=fpath,verbose=verbose,view=view).obj
 #end def read_hdf

@@ -22,6 +22,8 @@
 
 
 #python standard library imports
+from __future__ import annotations
+
 import os
 import sys
 import traceback
@@ -54,7 +56,7 @@ from .qmcpack_input import QmcpackInput
 
 class QmcpackAnalyzerCapabilities(QAobject):
 
-    def __init__(self):
+    def __init__(self) -> None:
 
         self.methods={'opt','vmc','dmc','rmc'}
         self.data_sources = {'scalar','stat','dmc','storeconfig','opt','traces'}
@@ -99,12 +101,24 @@ QAanalyzer.capabilities = QmcpackAnalyzerCapabilities()
 
 
 class QmcpackAnalysisRequest(QAobject):
-    def __init__(self,source=None,destination=None,savefile='',
-                 methods=None,calculations=None,data_sources=None,quantities=None,
-                 warmup_calculations=None,
-                 output=('averages','samples'),
-                 ndmc_blocks=1000,equilibration=None,group_num=None,
-                 *,traces=False,dm_settings=None):
+    def __init__(
+        self,
+        source              : str | Path | None = None,
+        destination         : str | None        = None,
+        savefile            : str               = '',
+        methods                                 = None,
+        calculations                            = None,
+        data_sources                            = None,
+        quantities                              = None,
+        warmup_calculations                     = None,
+        output              : tuple[str, str]   = ('averages','samples'),
+        ndmc_blocks         : int               = 1000,
+        equilibration       : int | None        = None,
+        group_num                               = None,
+        *,
+        traces              : bool              = False,
+        dm_settings                             = None,
+        ) -> None:
         self.source          = source if not isinstance(source, Path) else str(source.resolve())
         self.destination     = destination
         self.savefile        = str(savefile)
@@ -156,7 +170,7 @@ class QmcpackAnalysisRequest(QAobject):
 
     #end def __init__
 
-    def complete(self):
+    def complete(self) -> bool:
         spath,sfile = os.path.split(self.source)
         if spath=='':
             self.source = os.path.join('./',self.source)
@@ -180,7 +194,7 @@ class QmcpackAnalyzer
        |  Each observable is calculated by an object contained in results
 """
 class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
-    def __init__(self,arg0=None,**kwargs):
+    def __init__(self, arg0 = None, **kwargs) -> None:
 
         verbose = False
         if 'verbose' in kwargs:
@@ -258,7 +272,7 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     #end def __init__
 
 
-    def change_request(self,request):
+    def change_request(self, request: QmcpackAnalysisRequest) -> None:
         if not isinstance(request,QmcpackAnalysisRequest):
             msg = (
                 'input request must be a QmcpackAnalysisRequest\n'
@@ -272,7 +286,10 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
 
 
 
-    def init_sub_analyzers(self,request=None):
+    def init_sub_analyzers(
+        self,
+        request : QmcpackAnalysisRequest | None = None,
+        ) -> None:
         own_request = request is None
         if request is None:
             request = self.info.request
@@ -431,18 +448,18 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     #end def init_sub_analyzers
 
 
-    def set_global_info(self):
+    def set_global_info(self) -> None:
         QAanalyzer.request  = self.info.request
         QAanalyzer.run_info = self.info
     #end def set_global_info
 
-    def unset_global_info(self):
+    def unset_global_info(self) -> None:
         QAanalyzer.request  = None
         QAanalyzer.run_info = None
     #end def unset_global_info
 
 
-    def load_data(self):
+    def load_data(self) -> None:
         request = self.info.request
         if not os.path.exists(request.source):
             msg = (
@@ -466,7 +483,11 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     #end def load_data
 
 
-    def analyze(self,*,force=False):
+    def analyze(
+        self,
+        *,
+        force : bool = False,
+        ) -> None:
         if not self.info.analyzed or force:
             if not self.info.data_loaded:
                 self.load_data()
@@ -503,7 +524,7 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
 
 
 
-    def bundle(self,source):
+    def bundle(self, source: str) -> None:
         self.vlog('bundled run detected',n=1)
         if os.path.exists(source):
             with open(source,'r') as fobj:
@@ -580,7 +601,7 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     #end def bundle
 
 
-    def prevent_average_load(self):
+    def prevent_average_load(self) -> None:
         for method_type in self.capabilities.methods:
             if method_type in self:
                 self[method_type].propagate_indicators(data_loaded=True)
@@ -589,7 +610,7 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     #end def prevent_average_load
 
 
-    def average_bundle_data(self):
+    def average_bundle_data(self) -> None:
         analyzers = self.bundled_analyzers
         if len(analyzers)>0:
             self.vlog('performing bundle (e.g. twist) averaging',n=1)
@@ -659,7 +680,12 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
 
 
 
-    def save(self,filepath=None,*,overwrite=True):
+    def save(
+        self,
+        filepath  : Path | None = None,
+        *,
+        overwrite : bool        = True,
+        ) -> None:
         if filepath is None:
             filepath = self.info.savefilepath
         #end if
@@ -674,7 +700,7 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
         return
     #end def save
 
-    def load(self,filepath=None):
+    def load(self, filepath: str | None = None) -> None:
         if filepath is None:
             filepath = self.info.savefilepath
         #end if
@@ -688,7 +714,13 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
 
 
 
-    def check_traces(self,*,verbose=False,pad=None,header=None):
+    def check_traces(
+        self,
+        *,
+        verbose : bool = False,
+        pad            = None,
+        header         = None,
+        ) -> None:
         if pad is None:
             pad = ''
         #end if
@@ -711,8 +743,18 @@ class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     #end def check_traces
 
 
-    def plot_trace(self,quantity,style='b-',offset=0,source='scalar',*,mlabels=True,
-                   mlines=True,show=True,alloff=False):
+    def plot_trace(
+        self,
+        quantity,
+        style    : str  = 'b-',
+        offset   : int  = 0,
+        source   : str  = 'scalar',
+        *,
+        mlabels  : bool = True,
+        mlines   : bool = True,
+        show     : bool = True,
+        alloff   : bool = False,
+        ) -> None:
         import matplotlib.pyplot as plt
         mlabels &= not alloff
         mlines  &= not alloff

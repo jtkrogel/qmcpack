@@ -1,8 +1,43 @@
 """Robust statistics and autocorrelation analysis for simulation data."""
+from __future__ import annotations
+
 
 import numpy as np
 
 from .developer_tools import DevBase, dotdict, obj
+
+type TheilSenStRet = (
+    tuple[float | np.float64 | np.ndarray, float | np.float64 | np.ndarray]
+    )
+type AcfAutocorRet = (
+    float
+    | np.float64
+    | tuple[float | np.float64 | np.ndarray, bool | np.ndarray]
+    | None
+    )
+type GeyerImsAuRet = (
+    float
+    | tuple[float | np.float64 | np.ndarray, bool | np.ndarray]
+    | None
+    )
+type SeriesStatRet = (
+    tuple[np.float64 | np.ndarray, np.float64, int | float | str | None]
+    | None
+    )
+type TimeSeriesRet = (
+    tuple[int | np.float64 | np.ndarray, int | np.float64 | np.ndarray | None]
+    | None
+    )
+type IntDistInpRet = (
+    tuple[int | float | np.ndarray, bool | int | np.ndarray | None]
+    | None
+    )
+type IntervalDiRet = (
+    np.float64
+    | tuple[np.float64 | np.ndarray, np.float64 | np.ndarray]
+    | None
+    )
+
 
 ############################################################################
 #                                                                          #
@@ -45,7 +80,10 @@ from .developer_tools import DevBase, dotdict, obj
 ############################################################################
 
 
-def _paired_real_arrays(x,y):
+def _paired_real_arrays(
+    x : float | np.ndarray,
+    y : float | np.ndarray,
+    ) -> tuple[float | np.ndarray, float | np.ndarray] | None:
     """Validate and flatten paired real-valued sample arrays."""
     x = np.asarray(x)
     y = np.asarray(y)
@@ -75,7 +113,10 @@ def _paired_real_arrays(x,y):
 #end def _paired_real_arrays
 
 
-def _real_vector(x,name):
+def _real_vector(
+    x    : list[float | complex] | np.ndarray,
+    name : str,
+    ) -> list[float | complex] | np.ndarray | None:
     """Return a real vector, flattening vector-shaped arrays."""
     x = np.asarray(x)
     if np.iscomplexobj(x):
@@ -95,7 +136,10 @@ def _real_vector(x,name):
 #end def _real_vector
 
 
-def theil_sen(x,y):
+def theil_sen(
+    x : float | np.ndarray,
+    y : float | np.ndarray,
+    ) -> tuple[np.float64 | np.ndarray, np.float64 | np.ndarray] | None:
     """Return the Theil--Sen slope and intercept for paired observations.
 
     Parameters
@@ -141,7 +185,7 @@ def theil_sen(x,y):
 #end def theil_sen
 
 
-def theil_sen_stoch(x,y):
+def theil_sen_stoch(x: np.ndarray, y: np.ndarray) -> TheilSenStRet:
     """Estimate a Theil-Sen fit with stochastic pair sampling for large data.
 
     The number of sampled pairwise slopes is ``ceil(16000*sqrt(n))``.  This
@@ -196,7 +240,7 @@ def theil_sen_stoch(x,y):
 #end def theil_sen_stoch
 
 
-def theil_sen_stoch_reblock(x,y):
+def theil_sen_stoch_reblock(x: np.ndarray, y: np.ndarray) -> TheilSenStRet:
     """Estimate a Theil-Sen fit using a reblocking-specific sample schedule.
 
     The number of sampled pairwise slopes is ``ceil(24*sqrt(n))``.  This
@@ -251,12 +295,12 @@ def theil_sen_stoch_reblock(x,y):
 
 
 def reblocked_autocorr_time(
-        x,
-        min_blocks = 10,
-        *,
-        plot       = False,
-        show       = False,
-        ):
+    x          : list[float] | np.ndarray,
+    min_blocks : int | float = 10,
+    *,
+    plot       : bool        = False,
+    show       : bool        = False,
+    ) -> float | None:
     """Estimate autocorrelation time from the growth of blocked errors.
 
     This estimator currently overestimates the autocorrelation times in a
@@ -401,7 +445,11 @@ def reblocked_autocorr_time(
 
 
 
-def acf_autocorr_time(x,*,reliability=False):
+def acf_autocorr_time(
+    x           : np.ndarray,
+    *,
+    reliability : bool = False,
+    ) -> AcfAutocorRet:
     """Estimate autocorrelation time from a windowed sample ACF.
 
     Best for long chains.  Generally prefer the Geyer method.
@@ -514,12 +562,12 @@ def acf_autocorr_time(x,*,reliability=False):
 
 
 def geyer_ims_autocorr_time(
-        x,
-        c            = 5.0,
-        *,
-        reliability  = False,
-        acf_fallback = True,
-        ):
+    x            : np.ndarray,
+    c            : float | str = 5.0,
+    *,
+    reliability  : bool        = False,
+    acf_fallback : bool        = True,
+    ) -> GeyerImsAuRet:
     """Estimate integrated autocorrelation time with Geyer's IMS method.
 
     This is the single best autocorrelation estimator.
@@ -651,7 +699,11 @@ def geyer_ims_autocorr_time(
 
 
 
-def autocorr_time(x,*,reliability=False):
+def autocorr_time(
+    x           : list[float] | np.ndarray,
+    *,
+    reliability : bool = False,
+    ) -> float | tuple[float, bool]:
     """Conservatively combine autocorrelation-time estimates.
 
     The ACF and Geyer initial-monotone-sequence probe the correlation
@@ -691,7 +743,10 @@ def autocorr_time(x,*,reliability=False):
 #end def autocorr_time
 
 
-def series_stats(x,t_auto=None):
+def series_stats(
+    x      : np.ndarray,
+    t_auto : float | str | None = None,
+    ) -> SeriesStatRet:
     """Return the mean, autocorrelation-adjusted error, and correlation time.
 
     If ``t_auto`` is not supplied, it is estimated with
@@ -780,7 +835,10 @@ def series_stats(x,t_auto=None):
 ############################################################################
 
 
-def time_series_intervals(x,t=None):
+def time_series_intervals(
+    x : list[float] | np.ndarray,
+    t : list[float | complex] | np.ndarray | None = None,
+    ) -> TimeSeriesRet:
     """Return ordered intervals between adjacent time-series values.
 
     Parameters
@@ -823,7 +881,10 @@ def time_series_intervals(x,t=None):
 
 
 
-def _int_dist_input(x1,x2=None):
+def _int_dist_input(
+    x1 : np.ndarray,
+    x2 : np.ndarray | None = None,
+    ) -> IntDistInpRet:
     """Normalize one interval matrix or paired lower and upper endpoints.
 
     Returns ordered endpoint pairs and corresponding ``+1/-1`` edge signs.
@@ -864,7 +925,10 @@ def _int_dist_input(x1,x2=None):
 
 
 
-def _perturb_constant_intervals(xi,perturb_const):
+def _perturb_constant_intervals(
+    xi            : np.ndarray,
+    perturb_const : bool | int | float,
+    ) -> np.ndarray | None:
     """Expand constant intervals by a fixed number of floating-point steps."""
     if isinstance(perturb_const,(bool,np.bool_)) or not isinstance(
         perturb_const,(int,np.integer)
@@ -890,11 +954,11 @@ def _perturb_constant_intervals(xi,perturb_const):
 
 
 def interval_distribution(
-        x1,
-        x2             = None,
-        *,
-        perturb_const  = 1,
-        ):
+    x1            : np.ndarray,
+    x2            : np.ndarray | None  = None,
+    *,
+    perturb_const : bool | int | float = 1,
+    ) -> tuple[int | float | np.ndarray, bool | int | np.ndarray] | None:
     """Return spans between interval edges and their overlap counts.
 
     Parameters
@@ -953,10 +1017,10 @@ def interval_distribution(
 
 
 def plot_interval_dist(
-        xi,
-        ci,
-        style = 'b.-',
-        ):
+    xi    : np.ndarray,
+    ci    : np.ndarray,
+    style : str = 'b.-',
+    ) -> None:
     """Plot an interval distribution as a piecewise-constant curve.
 
     Parameters
@@ -987,15 +1051,15 @@ def plot_interval_dist(
 
 
 def interval_dist_peak(
-        xi,
-        ci,
-        method         = 'interval_mid',
-        peak_frac      = 0.5,
-        *,
-        height         = False,
-        quad_weighting = 'endpoint',
-        perturb_const  = 1,
-        ):
+    xi             : np.ndarray,
+    ci             : list[float] | np.ndarray,
+    method         : int | str          = 'interval_mid',
+    peak_frac      : float              = 0.5,
+    *,
+    height         : bool               = False,
+    quad_weighting : str                = 'endpoint',
+    perturb_const  : bool | int | float = 1,
+    ) -> IntervalDiRet:
     """Return a representative location at the peak of an interval distribution.
 
     Parameters
@@ -1125,17 +1189,17 @@ def interval_dist_peak(
 
 
 def rolling_interval_dist_peak(
-        x1,
-        x2             = None,
-        window         = 10,
-        step           = 5,
-        method         = 'interval_mid',
-        peak_frac      = 0.5,
-        *,
-        quad_weighting = 'endpoint',
-        ret_height     = False,
-        ret_windows    = False,
-        ):
+    x1             : np.ndarray,
+    x2                     = None,
+    window         : int   = 10,
+    step           : int   = 5,
+    method         : str   = 'interval_mid',
+    peak_frac      : float = 0.5,
+    *,
+    quad_weighting : str   = 'endpoint',
+    ret_height     : bool  = False,
+    ret_windows    : bool  = False,
+    ) -> list[tuple[int, int]] | np.float64 | np.ndarray | tuple | None:
     """Return interval-distribution peaks for overlapping input windows.
 
     Parameters
@@ -1237,7 +1301,10 @@ def rolling_interval_dist_peak(
 
 
 
-def _perturb_constant_series(x,perturb_const=1):
+def _perturb_constant_series(
+    x             : np.ndarray,
+    perturb_const : int = 1,
+    ) -> np.ndarray:
     """Alternately displace each repeated-value run by floating-point steps."""
     if isinstance(perturb_const,(bool,np.bool_)) or not isinstance(
         perturb_const,(int,np.integer)
@@ -1268,7 +1335,12 @@ def _perturb_constant_series(x,perturb_const=1):
 
 
 
-def line_crossing_distribution(x,nperm=0, *, ret_x=False):
+def line_crossing_distribution(
+    x     : list[float] | np.ndarray,
+    nperm : bool | int = 0,
+    *,
+    ret_x : bool       = False,
+    ):
     """Return the line-crossing distribution of a series or its permutations.
 
     Parameters
@@ -1363,12 +1435,12 @@ def line_crossing_distribution(x,nperm=0, *, ret_x=False):
 
 
 def lcd_peak(
-        x,
-        method         = 'interval_mid',
-        peak_frac      = 0.5,
-        nperm          = 0,
-        quad_weighting = 'endpoint',
-        ):
+    x              : np.ndarray,
+    method         : str   = 'interval_mid',
+    peak_frac      : float = 0.5,
+    nperm          : int   = 0,
+    quad_weighting : str   = 'endpoint',
+    ) -> np.float64:
     """Return a peak of a series line-crossing distribution.
 
     Parameters
@@ -1400,14 +1472,14 @@ def lcd_peak(
 
 
 def lcd_smooth(
-        x,
-        t              = None,
-        window         = 10,
-        step           = 5,
-        method         = 'interval_rand',
-        peak_frac      = 0.5,
-        quad_weighting = 'endpoint',
-        ):
+    x              : list[float] | np.ndarray,
+    t              : np.ndarray | None = None,
+    window         : int               = 10,
+    step           : int               = 5,
+    method         : str               = 'interval_rand',
+    peak_frac      : float             = 0.5,
+    quad_weighting : str               = 'endpoint',
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray] | None:
     """Return rolling line-crossing-distribution peaks for a time series.
 
     Parameters
@@ -1446,10 +1518,10 @@ def lcd_smooth(
 
 
 def pair_expand_ts_intervals(
-        x,
-        t      = None,
-        expand = 10,
-        ):
+    x      : np.ndarray,
+    t      : list[float] | np.ndarray | None = None,
+    expand : bool | int                      = 10,
+    ) -> tuple[np.ndarray, np.ndarray | None] | None:
     """Return sorted pairs between samples in a bounded local neighborhood.
 
     Each sample is paired with up to ``expand/2`` earlier and later samples.
@@ -1535,10 +1607,10 @@ def pair_expand_ts_intervals(
 
 
 def _find_segments(
-        x,
-        mask,
-        seg_min = 1,
-        ):
+    x       : np.ndarray,
+    mask    : list[bool] | np.ndarray,
+    seg_min : int = 1,
+    ) -> list[tuple[int, int]] | None:
     """Return contiguous true-mask index spans meeting a minimum length."""
     if isinstance(seg_min,(bool,np.bool_)) or not isinstance(
         seg_min,(int,np.integer)
@@ -1564,7 +1636,10 @@ def _find_segments(
 
 
 
-def _lcd_trim_input(x,niter):
+def _lcd_trim_input(
+    x     : np.ndarray,
+    niter : bool | int | float,
+    ) -> tuple[np.ndarray, np.float64 | np.ndarray, int | np.ndarray] | None:
     """Validate trimming inputs and obtain its LCD peak and perturbed series."""
     x = _real_vector(x,'data array')
     if len(x)<2:
@@ -1582,7 +1657,7 @@ def _lcd_trim_input(x,niter):
 
 
 
-def _lcd_trim_options(ret_seg,ret_mask):
+def _lcd_trim_options(ret_seg: bool, ret_mask: bool) -> None:
     """Validate trim return selections."""
     for value,name in ((ret_seg,'ret_seg'),(ret_mask,'ret_mask')):
         if not isinstance(value,(bool,np.bool_)):
@@ -1593,11 +1668,11 @@ def _lcd_trim_options(ret_seg,ret_mask):
 
 
 def _trim_run(
-        x,
-        x_lcd,
-        start,
-        stop,
-        ):
+    x     : np.ndarray,
+    x_lcd : np.float64,
+    start : int,
+    stop  : int,
+    ) -> int:
     """Return the leading count before a crossing, retaining one endpoint."""
     if start>=stop:
         return 0
@@ -1613,12 +1688,12 @@ def _trim_run(
 
 
 def lcd_trim_l(
-        x,
-        niter    = 3,
-        *,
-        ret_seg  = True,
-        ret_mask = False,
-        ):
+    x        : np.ndarray,
+    niter    : bool | int | float = 3,
+    *,
+    ret_seg  : bool               = True,
+    ret_mask : bool               = False,
+    ) -> tuple | None:
     """Trim initial runs separated from the LCD peak by sign crossings.
 
     The LCD peak is calculated once from the full series.  Starting at the
@@ -1670,12 +1745,12 @@ def lcd_trim_l(
 
 
 def lcd_trim_r(
-        x,
-        niter    = 3,
-        *,
-        ret_seg  = True,
-        ret_mask = False,
-        ):
+    x        : np.ndarray,
+    niter    : bool | int | float = 3,
+    *,
+    ret_seg  : bool               = True,
+    ret_mask : bool               = False,
+    ) -> tuple | None:
     """Trim terminal runs separated from the LCD peak by sign crossings.
 
     This is the right-to-left counterpart of :func:`lcd_trim_l`: it starts at
@@ -1726,12 +1801,12 @@ def lcd_trim_r(
 
 
 def lcd_trim_lr(
-        x,
-        niter    = 3,
-        *,
-        ret_seg  = True,
-        ret_mask = False,
-        ):
+    x        : np.ndarray,
+    niter    : bool | int | float = 3,
+    *,
+    ret_seg  : bool               = True,
+    ret_mask : bool               = False,
+    ) -> tuple | None:
     """Trim leading and trailing runs according to the full-series LCD peak.
 
     Left and right runs are removed independently on every iteration.  Each
@@ -1788,14 +1863,14 @@ def lcd_trim_lr(
 
 
 def lcd_trim_lrm(
-        x,
-        niter    = 3,
-        low_scale = 2.,
-        nseg_min = 4,
-        *,
-        ret_seg  = True,
-        ret_mask = False,
-        ):
+    x         : np.ndarray,
+    niter     : bool | int | float = 3,
+    low_scale : float              = 2.,
+    nseg_min  : int                = 4,
+    *,
+    ret_seg   : bool               = True,
+    ret_mask  : bool               = False,
+    ) -> tuple | None:
     """Trim endpoint runs and sustained low-valued interior excursions.
 
     Endpoint removal follows :func:`lcd_trim_lr`.  Among the remaining
@@ -1934,7 +2009,11 @@ def lcd_trim_lrm(
 ############################################################################
 
 
-def _smoothing_window_length(n,m,maximum=None):
+def _smoothing_window_length(
+    n       : int,
+    m       : bool | int | float | np.int64 | None,
+    maximum : int | None = None,
+    ) -> bool | int | float | np.int64 | None:
     """Validate or select an odd smoothing-window length."""
     if m is None:
         if n==0:
@@ -1963,7 +2042,10 @@ def _smoothing_window_length(n,m,maximum=None):
 #end def _smoothing_window_length
 
 
-def mean_smooth(x,m=None):
+def mean_smooth(
+    x : np.ndarray,
+    m : bool | int | float | np.int64 | None = None,
+    ) -> np.ndarray | None:
     """Smooth a sequence with tapered-endpoint moving averages.
 
     Each interior value is replaced by the mean in a centered, odd-length
@@ -2010,7 +2092,12 @@ def mean_smooth(x,m=None):
 #end def mean_smooth
 
 
-def median_smooth(x,m=None,*,post_mean=False):
+def median_smooth(
+    x         : np.ndarray,
+    m         : bool | int | float | np.int64 | None = None,
+    *,
+    post_mean : bool | int | np.bool_                = False,
+    ) -> np.ndarray | None:
     """Smooth a sequence with local medians, optionally followed by means.
 
     Local windows and endpoint treatment are the same as :func:`mean_smooth`,
@@ -2065,7 +2152,12 @@ def median_smooth(x,m=None,*,post_mean=False):
 #end def median_smooth
 
 
-def poly_smooth(x,m=None,*,post_mean=False):
+def poly_smooth(
+    x         : np.ndarray,
+    m         : bool | int | float | np.int64 | None = None,
+    *,
+    post_mean : bool | str                           = False,
+    ) -> np.ndarray | None:
     """Smooth a sequence by evaluating local polynomial fits.
 
     A polynomial is fitted in each centered window and evaluated at the
@@ -2132,7 +2224,13 @@ def poly_smooth(x,m=None,*,post_mean=False):
 poly_smooth_ = poly_smooth
 
 
-def local_median_smooth(x_list,m=None,*,poly_smooth=True,post_mean=False):
+def local_median_smooth(
+    x_list      : list[np.ndarray],
+    m           : bool | int | float | np.int64 | None = None,
+    *,
+    poly_smooth : bool | int | np.bool_                = True,
+    post_mean   : bool | np.bool_                      = False,
+    ) -> np.ndarray | None:
     """Smooth a sequence of sample sets through leave-one-out local medians.
 
     For each position, all neighboring sample sets in a centered window are
@@ -2252,13 +2350,13 @@ class TimeSeriesAnalyzer(DevBase):
         time for the current clean series.
     """
     def __init__(
-            self,
-            arg0      = None,
-            clean_inp = 'lcd_trim_l',
-            label     = '',
-            *,
-            analyze   = True,
-            ):
+        self,
+        arg0      : str | list[float] | np.ndarray | None = None,
+        clean_inp : str | obj                             = 'lcd_trim_l',
+        label     : str                                   = '',
+        *,
+        analyze   : bool                                  = True,
+        ) -> None:
         if not isinstance(analyze,(bool,np.bool_)):
             msg = 'analyze must be a Boolean value'
             raise TypeError(msg)
@@ -2283,7 +2381,7 @@ class TimeSeriesAnalyzer(DevBase):
         self._check()
     #end def __init_
 
-    def _reset(self):
+    def _reset(self) -> None:
         """Clear all derived partition and statistical results."""
         #   results/outputs from analysis
         self.xc        = None # clean data
@@ -2299,9 +2397,9 @@ class TimeSeriesAnalyzer(DevBase):
         self.t_auto    = None # autocorr time of clean data
     #end def _reset
 
-    def _check(self):
+    def _check(self) -> None:
         """Validate internal series, partition, and statistic consistency."""
-        def check_x_ind(xk,indk):
+        def check_x_ind(xk: str, indk: str) -> None:
             if self[indk] is None:
                 if self[xk] is not None:
                     msg = f'{xk} requires matching {indk}'
@@ -2338,7 +2436,7 @@ class TimeSeriesAnalyzer(DevBase):
             raise RuntimeError(msg)
     #end def _check
 
-    def read(self,filepath=None):
+    def read(self, filepath: str | None = None) -> np.ndarray:
         """Load a one-dimensional uniformly sampled series from a text file.
 
         Parameters
@@ -2367,7 +2465,7 @@ class TimeSeriesAnalyzer(DevBase):
         return x
     #end def read
 
-    def partition_from_timeseries(self,other):
+    def partition_from_timeseries(self, other: TimeSeriesAnalyzer) -> None:
         """Copy another analyzer's clean/removal index partition.
 
         Parameters
@@ -2400,7 +2498,10 @@ class TimeSeriesAnalyzer(DevBase):
         other._check()
     #end def partition_from_timeseries
 
-    def clean_intersect(self,other):
+    def clean_intersect(
+        self,
+        other : TimeSeriesAnalyzer,
+        ) -> tuple[np.ndarray, np.float64 | np.ndarray, int | np.ndarray]:
         """Return values retained by both same-length analyzers.
 
         Parameters
@@ -2435,7 +2536,7 @@ class TimeSeriesAnalyzer(DevBase):
         return xc1,xc2,ind
     #end def clean_intersect
 
-    def analyze(self,clean_inp=None):
+    def analyze(self, clean_inp: str | None = None) -> None:
         """Apply a cleaning method and calculate clean-series statistics.
 
         Parameters
@@ -2479,7 +2580,7 @@ class TimeSeriesAnalyzer(DevBase):
         x   = self.x
         ind = self.ind
 
-        def calculate_stats():
+        def calculate_stats() -> None:
             x_mean,x_stderr,t_auto = series_stats(self.xc)
             self.x_mean   = x_mean
             self.x_stderr = x_stderr
@@ -2589,13 +2690,13 @@ class TimeSeriesAnalyzer(DevBase):
     #end def analyze
 
     def plot(
-            self,
-            *,
-            fig    = False,
-            show   = False,
-            ishift = 0,
-            legend = True,
-            ):
+        self,
+        *,
+        fig    : bool = False,
+        show   : bool = False,
+        ishift : int  = 0,
+        legend : bool = True,
+        ) -> None:
         """Plot the trace, cleaning partition, and clean-data reference lines.
 
         The full series is gray, clean segments are black, left and right

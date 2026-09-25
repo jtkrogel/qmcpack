@@ -73,7 +73,7 @@ class SimStage(Flag):
     all         = setup | submit | get_output | analyze
 
     @classmethod
-    def from_list(cls, items: Collection[str]) -> SimStage:
+    def from_list(cls, items) -> SimStage:
         """Join a collection of strings into a union of :class:`SimStage`."""
         if not all(isinstance(item, str) for item in items):
             msg = f"Expected a collection of strs, but got {items}"
@@ -258,7 +258,7 @@ class NexusConfig:
     generate_only: bool
     """(LEGACY) Toggle only generating inputs and sending files."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.restore_defaults()
 
     def restore_defaults(self) -> None:
@@ -299,7 +299,7 @@ class NexusUnpickler(pickle.Unpickler):
     before Nexus was packaged (PR #5700, December 20, 2025).
     It shouldn't touch anything but old Nexus pickles.
     """
-    def find_class(self, module, name):
+    def find_class(self, module: str, name: str):
         if module in nexus_modules and "nexus." not in module:
             module = "nexus." + module
         if module == "nexus.generic":
@@ -311,7 +311,7 @@ class NexusUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
-def write_splash():
+def write_splash() -> None:
     if not hasattr(write_splash, "wrote_splash"):
         splash_text = '''
 _____________________________________________________
@@ -338,11 +338,16 @@ class NexusCore(DevBase):
     wrote_something   = False # for pretty printing
     working_directory = None
 
-    def mem_usage(self):
+    def mem_usage(self) -> int:
         return int(resident()/1e6)
     #end def mem_usage
 
-    def nxs_print(self, *texts: str, n: int = 0, progress: bool = False):
+    def nxs_print(
+        self,
+        *texts,
+        n        : int  = 0,
+        progress : bool = False,
+        ) -> None:
         """Write text to standard output.
 
         Parameters
@@ -372,11 +377,11 @@ class NexusCore(DevBase):
 
     def enter(
         self,
-        directory: PathLike,
+        directory : str | Path,
         *,
-        changedir: bool = True,
-        msg: str = '',
-        ) -> Literal['      ']:
+        changedir : bool      = True,
+        msg       : int | str = '',
+        ) -> str:
         """Have Nexus enter a directory and change its current working directory.
 
         Parameters
@@ -401,11 +406,11 @@ class NexusCore(DevBase):
         return pad
     #end def enter
 
-    def leave(self):
+    def leave(self) -> None:
         os.chdir(NexusCore.working_directory)
     #end def leave
 
-    def load(self, fpath: PathLike | None = None):
+    def load(self, fpath: str | Path | None = None) -> None:
         if fpath is None:
             fpath = f'./{type(self).__name__}.p'
 

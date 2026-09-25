@@ -133,6 +133,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -153,12 +155,24 @@ from .utilities import path_string
 from .unit_converter import convert
 from . import numpy_extensions as npe
 
+type ArgsT       = int | float | str | group | tuple[str, str]
+type KwargsT     = bool | int | float | str | Path | list[str]
+type ValT        = int | float | str | np.float64 | np.int64 | np.str_
+type RequestsT   = float | str | correlation | dmc | simulation | XMLelement
+type PseudosT    = dict[str, str] | list[str | correlation] | None
+type DescriptorT = (
+    str
+    | tuple[str, str, int | float, int | float]
+    | tuple[str, str, int]
+    )
+
+
 yesno_dict     = {True:'yes' ,False:'no'}
 truefalse_dict = {True:'true',False:'false'}
 onezero_dict   = {True:'1'   ,False:'0'}
 boolmap={'yes':True,'no':False,'true':True,'false':False,'1':True,'0':False}
 
-def is_int(var):
+def is_int(var: str) -> bool:
     try:
         int(var)
         return True
@@ -167,7 +181,7 @@ def is_int(var):
     #end try
 #end def is_int
 
-def is_float(var):
+def is_float(var: str) -> bool:
     try:
         float(var)
         return True
@@ -176,7 +190,7 @@ def is_float(var):
     #end try
 #end def is_float
 
-def is_array(var,type):
+def is_array(var: str, type: type[int | float]) -> bool:
     try:
         if isinstance(var,str):
             np.array(var.split(),type)
@@ -190,7 +204,7 @@ def is_array(var,type):
 #end def is_float_array
 
 
-def attribute_to_value(attr):
+def attribute_to_value(attr: str) -> int | float | str | np.ndarray:
     if is_int(attr):
         val = int(attr)
     elif is_float(attr):
@@ -211,11 +225,11 @@ def attribute_to_value(attr):
 
 
 #local write types
-def yesno(var):
+def yesno(var: bool | str) -> str:
     return render_bool(var,'yes','no')
 #end def yesno
 
-def yesnostr(var):
+def yesnostr(var: bool | str) -> bool | str:
     if isinstance(var,str):
         return var
     else:
@@ -231,7 +245,7 @@ def truefalse(var):
     return render_bool(var,'true','false')
 #end def onezero
 
-def render_bool(var,T,F):
+def render_bool(var: bool | str, T: str, F: str) -> bool | str:
     if isinstance(var,bool) or var in {1,0}:
         if var:
             return T
@@ -261,7 +275,7 @@ bool_write_types = {yesno,onezero,truefalse}
 
 
 class hobj(obj):
-    def __init__(self,*args,**kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         # Route initialization through the public mapping.  Calling
         # obj.__init__ directly would place values beside hidden's internal
         # _public_ and _hidden_ objects instead of in _public_.
@@ -278,23 +292,23 @@ class hobj(obj):
         return self.__dict__
     #end def _alt
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._dict)
     #end def __len__
 
-    def __contains__(self,name):
+    def __contains__(self, name: str) -> bool:
         return name in self._dict
     #end def __contains__
 
-    def __getitem__(self,name):
+    def __getitem__(self, name: int | str):
         return self._dict[name]
     #end def __getitem__
 
-    def __setitem__(self,name,value):
+    def __setitem__(self, name: int | str, value) -> None:
         self._dict[name] = value
     #end def __setitem__
 
-    def __delitem__(self,name):
+    def __delitem__(self, name: str) -> None:
         del self._dict[name]
     #end def __delitem__
 
@@ -316,18 +330,18 @@ class hobj(obj):
         return self._dict.items()
     #end def items
 
-    def clear(self):
+    def clear(self) -> None:
         self._dict.clear()
     #end def clear
 
     # The new obj implements these directly in terms of __dict__.  hobj must
     # instead preserve its storage indirection so that hidden exposes only its
     # public mapping.
-    def get(self,*args,**kwargs):
+    def get(self, *args, **kwargs):
         return self._dict.get(*args,**kwargs)
     #end def get
 
-    def pop(self,*args,**kwargs):
+    def pop(self, *args, **kwargs):
         return self._dict.pop(*args,**kwargs)
     #end def pop
 
@@ -335,20 +349,20 @@ class hobj(obj):
         return self._dict.popitem()
     #end def popitem
 
-    def setdefault(self,*args,**kwargs):
+    def setdefault(self, *args, **kwargs):
         return self._dict.setdefault(*args,**kwargs)
     #end def setdefault
 
-    def update(self,*args,**kwargs):
+    def update(self, *args, **kwargs) -> None:
         self._dict.update(*args,**kwargs)
     #end def update
 
     @classmethod
-    def fromkeys(cls,keys,value=None):
+    def fromkeys(cls, keys, value = None):
         return cls(dict.fromkeys(keys,value))
     #end def fromkeys
 
-    def __eq__(self,other):
+    def __eq__(self, other: dict) -> bool:
         if not hasattr(other,'items'):
             return False
         try:
@@ -376,7 +390,7 @@ class hobj(obj):
         return True
     #end def __eq__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         s = ''
         for name in sorted_generic(self._dict.keys()):
             if not isinstance(name,str) or not name.startswith('_'):
@@ -392,7 +406,7 @@ class hobj(obj):
         return s
     #end def __repr__
 
-    def __str__(self,nindent=1):
+    def __str__(self, nindent: int = 1) -> int | str:
         pad = '  '
         npad = nindent*pad
         normal = []
@@ -429,25 +443,25 @@ class hobj(obj):
     #end def copy
 
     # logging and error reporting formerly inherited from generic.obj
-    def open_log(self,filepath):
+    def open_log(self, filepath) -> None:
         self._logfile = open(filepath,'w')
     #end def open_log
 
-    def close_log(self):
+    def close_log(self) -> None:
         self._logfile.close()
     #end def close_log
 
-    def write(self,s):
+    def write(self, s) -> None:
         self._logfile.write(s)
     #end def write
 
-    def log(self,*items,**kwargs):
+    def log(self, *items, **kwargs) -> None:
         if 'logfile' not in kwargs and '_logfile' in self.__dict__:
             kwargs['logfile'] = self._logfile
         nxs_print(*items,**kwargs)
     #end def log
 
-    def warn(self,message,header=None):
+    def warn(self, message, header = None) -> None:
         if header is None:
             header = self.__class__.__name__
         logfile = self.__dict__.get('_logfile',None)
@@ -456,30 +470,30 @@ class hobj(obj):
 
     # access preserving functions
     #  dict interface
-    def _keys(self,*args,**kwargs):
+    def _keys(self, *args, **kwargs):
         return hobj.keys(self,*args,**kwargs)
-    def _values(self,*args,**kwargs):
+    def _values(self, *args, **kwargs):
         return hobj.values(self,*args,**kwargs)
-    def _items(self,*args,**kwargs):
+    def _items(self, *args, **kwargs):
         return hobj.items(self,*args,**kwargs)
-    def _clear(self,*args,**kwargs):
+    def _clear(self, *args, **kwargs) -> None:
         hobj.clear(self,*args,**kwargs)
     def _sorted_keys(self):
         return sorted_generic(self._dict.keys())
-    def _open_log(self,*args,**kwargs):
+    def _open_log(self, *args, **kwargs) -> None:
         hobj.open_log(self,*args,**kwargs)
-    def _close_log(self,*args,**kwargs):
+    def _close_log(self, *args, **kwargs) -> None:
         hobj.close_log(self,*args,**kwargs)
-    def _write(self,*args,**kwargs):
+    def _write(self, *args, **kwargs) -> None:
         hobj.write(self,*args,**kwargs)
-    def _log(self,*args,**kwargs):
+    def _log(self, *args, **kwargs) -> None:
         hobj.log(self,*args,**kwargs)
 #end class hobj
 
 
 
 class hidden(hobj):
-    def __init__(self,*vals,**kwargs):
+    def __init__(self, *vals, **kwargs) -> None:
         d = object.__getattribute__(self,'__dict__')
         d['_hidden_'] = hobj()
         d['_public_'] = hobj()
@@ -496,7 +510,7 @@ class hidden(hobj):
         return self.__dict__['_hidden_']
     #end def __alt
 
-    def __getattribute__(self,name):
+    def __getattribute__(self, name: str):
         d = object.__getattribute__(self,'__dict__')
         if '_public_' in d:
             p = d['_public_']
@@ -510,11 +524,11 @@ class hidden(hobj):
         #end if
     #end def __getattribute__
 
-    def __setattr__(self,name,value):
+    def __setattr__(self, name, value) -> None:
         self._dict[name] = value
     #end def __setattr__
 
-    def __delattr__(self,name):
+    def __delattr__(self, name: str) -> None:
         del self._dict[name]
     #end def __delattr__
 
@@ -522,11 +536,11 @@ class hidden(hobj):
         return self.__dict__['_hidden_']
     #end def hidden
 
-    def public(self):
+    def public(self) -> hobj:
         return self.__dict__['_public_']
     #end def public
 
-    def _hidden(self):
+    def _hidden(self) -> hidden:
         return hidden.hidden(self)
     #end def _hidden
 
@@ -534,23 +548,23 @@ class hidden(hobj):
         return hidden.public(self)
     #end def _public
 
-    def open_log(self,filepath):
+    def open_log(self, filepath) -> None:
         self._alt._open_log(filepath)
     #end def open_log
 
-    def close_log(self):
+    def close_log(self) -> None:
         self._alt._close_log()
     #end def close_log
 
-    def write(self,s):
+    def write(self, s) -> None:
         self._alt._write(s)
     #end def write
 
-    def log(self,*items,**kwargs):
+    def log(self, *items, **kwargs) -> None:
         self._alt._log(*items,**kwargs)
     #end def log
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         s=''
         for k in sorted_generic(self._dict.keys()):
             if not isinstance(k,str) or k[0]!='_':
@@ -566,13 +580,13 @@ class hidden(hobj):
     #end def __repr__
 
     #  log, warning, and error messages
-    def _open_log(self,*args,**kwargs):
+    def _open_log(self, *args, **kwargs) -> None:
         hidden.open_log(self,*args,**kwargs)
-    def _close_log(self,*args,**kwargs):
+    def _close_log(self, *args, **kwargs) -> None:
         hidden.close_log(self,*args,**kwargs)
-    def _write(self,*args,**kwargs):
+    def _write(self, *args, **kwargs) -> None:
         hidden.write(self,*args,**kwargs)
-    def _log(self,*args,**kwargs):
+    def _log(self, *args, **kwargs) -> None:
         hidden.log(self,*args,**kwargs)
 
 #end class hidden
@@ -592,10 +606,10 @@ class QIobj(DevBase):
     @staticmethod
     def settings(
         *,
-        permissive_read  = False,
-        permissive_write = False,
-        permissive_init  = False,
-        ):
+        permissive_read  : bool = False,
+        permissive_write : bool = False,
+        permissive_init  : bool = False,
+        ) -> None:
         QIobj.permissive_read  = permissive_read
         QIobj.permissive_write = permissive_write
         QIobj.permissive_init  = permissive_init
@@ -609,7 +623,7 @@ class meta(obj):
 
 
 class section(QIobj):
-    def __init__(self,*args,**kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         self.args   = args
         self.kwargs = kwargs
     #end def __init__
@@ -617,7 +631,7 @@ class section(QIobj):
 
 
 class collection(hidden):
-    def __init__(self,*elements):
+    def __init__(self, *elements) -> None:
         hidden.__init__(self)
         if len(elements)==1 and isinstance(elements[0],list):
             elements = elements[0]
@@ -630,27 +644,33 @@ class collection(hidden):
         #end for
     #end def __init__
 
-    def __setitem__(self,name,value):
+    def __setitem__(self, name: int | str, value) -> None:
         #self.error('elements can only be set via the add function')
         self.add(value,key=name)
     #end def __setitem__
 
-    def __delitem__(self,name):
+    def __delitem__(self, name: str) -> None:
         #self.error('elements can only be deleted via the remove function')
         self.remove(name)
     #end def __delitem__
 
-    def __setattr__(self,name,value):
+    def __setattr__(self, name, value) -> None:
         #self.error('elements can only be set via the add function')
         self.add(value,key=name)
     #end def __setattr__
 
-    def __delattr__(self,name):
+    def __delattr__(self, name: str) -> None:
         #self.error('elements can only be deleted via the remove function')
         self.remove(name)
     #end def __delattr__
 
-    def add(self,element,*,strict=True,key=None):
+    def add(
+        self,
+        element,
+        *,
+        strict  : bool = True,
+        key            = None,
+        ) -> bool | None:
         if not isinstance(element,QIxml):
             msg = (
                 'collection cannot be formed\n'
@@ -709,7 +729,7 @@ class collection(hidden):
         return True
     #end def add
 
-    def remove(self,key):
+    def remove(self, key: str) -> None:
         public = self.public()
         if key in public:
             del public[key]
@@ -719,7 +739,7 @@ class collection(hidden):
         #end if
     #end def remove
 
-    def get_single(self,preference=None):
+    def get_single(self, preference: str | None = None) -> QIxml | None:
         if len(self)>0:
             if preference is not None and preference in self:
                 return self[preference]
@@ -740,7 +760,7 @@ class collection(hidden):
         return lst
     #end def list
 
-    def pairlist(self):
+    def pairlist(self) -> list:
         pairs = []
         for key in self.hidden().order:
             pairs.append((key,self[key]))
@@ -750,13 +770,13 @@ class collection(hidden):
 #end class collection
 
 
-def make_collection(elements):
+def make_collection(elements) -> collection:
     return collection(*elements)
 #end def make_collection
 
 
 class classcollection(QIobj):
-    def __init__(self,*classes):
+    def __init__(self, *classes) -> None:
         if len(classes)==1 and isinstance(classes[0],list):
             classes = classes[0]
         #end if
@@ -766,7 +786,7 @@ class classcollection(QIobj):
 
 
 class QmcpackInputCollections(QIobj):
-    def add(self,element):
+    def add(self, element) -> None:
         if element.tag in plurals_inv:
             cname = plurals_inv[element.tag]
             if cname not in self:
@@ -781,7 +801,7 @@ class QmcpackInputCollections(QIobj):
         #end if
     #end def add
 
-    def get(self,cname,label=None):
+    def get(self, cname, label = None):
         v = None
         if cname in self:
             if label is None:
@@ -812,28 +832,28 @@ class Names(QIobj):
     escaped_names = frozenset(escaped_names)
 
     @staticmethod
-    def set_expanded_names(**kwargs):
+    def set_expanded_names(**kwargs) -> None:
         exnames = obj(**kwargs)
         Names.expanded_names = exnames
         Names.rsqmc_expanded_names = exnames
     #end def set_expanded_names
 
     @staticmethod
-    def set_afqmc_expanded_names(**kwargs):
+    def set_afqmc_expanded_names(**kwargs) -> None:
         Names.afqmc_expanded_names = obj(**kwargs)
     #end def set_afqmc_expanded_names
 
     @staticmethod
-    def use_rsqmc_expanded_names():
+    def use_rsqmc_expanded_names() -> None:
         Names.expanded_names = Names.rsqmc_expanded_names
     #end def use_rsqmc_expanded_names
 
     @staticmethod
-    def use_afqmc_expanded_names():
+    def use_afqmc_expanded_names() -> None:
         Names.expanded_names = Names.afqmc_expanded_names
     #end def use_afqmc_expanded_names
 
-    def expand_name(self,condensed):
+    def expand_name(self, condensed: str) -> str:
         expanded = condensed
         cname = self.condense_name(condensed)
         if cname in self.escaped_names:
@@ -846,7 +866,7 @@ class Names(QIobj):
         return expanded
     #end def expand_name
 
-    def condense_name(self,expanded):
+    def condense_name(self, expanded: str) -> str:
         condensed = expanded
         condensed = condensed.replace('___','_').replace('__','_')
         condensed = condensed.replace('-','_').replace(' ','_')
@@ -858,7 +878,7 @@ class Names(QIobj):
         return condensed
     #end def condense_name
 
-    def condense_names(self,*namelists):
+    def condense_names(self, *namelists):
         out = []
         for namelist in namelists:
             exp = obj()
@@ -871,7 +891,7 @@ class Names(QIobj):
         return out
     #end def condense_names
 
-    def condensed_name_report(self):
+    def condensed_name_report(self) -> None:
         print()
         print('Condensed Name Report:')
         print('----------------------')
@@ -894,7 +914,7 @@ class Names(QIobj):
 
 class QIxml(Names):
 
-    def init_from_args(self,args):
+    def init_from_args(self, args) -> None:
         print()
         print('In init from args (not implemented).')
         print('Possible reasons for incorrect entry:  ')
@@ -910,7 +930,7 @@ class QIxml(Names):
 
 
     @classmethod
-    def init_class(cls):
+    def init_class(cls) -> None:
         fields = dict(
             tag         = cls.__name__,
             identifier  = None,
@@ -957,7 +977,13 @@ class QIxml(Names):
     #end def init_class
 
 
-    def write(self,indent_level=0,pad='   ',*,first=False):
+    def write(
+        self,
+        indent_level : int  = 0,
+        pad          : str  = '   ',
+        *,
+        first        : bool = False,
+        ) -> str:
         param.set_precision(self.get_precision())
         if not QIobj.permissive_write:
             self.check_junk(exit=True)
@@ -1074,7 +1100,7 @@ class QIxml(Names):
     #end def write
 
 
-    def __init__(self,*args,**kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         if Param.metadata is None:
             Param.metadata = meta()
         #end if
@@ -1096,7 +1122,7 @@ class QIxml(Names):
     #end def __init__
 
 
-    def init_from_xml(self,xml):
+    def init_from_xml(self, xml: XMLelement) -> None:
         al,el = self.condense_names(xml._attributes.keys(),xml._elements.keys())
         xa,sa = set(al.keys()) , set(self.attributes)
         attr = xa & sa
@@ -1173,7 +1199,7 @@ class QIxml(Names):
     #end def init_from_xml
 
 
-    def init_from_inputs(self,args,kwargs):
+    def init_from_inputs(self, args: tuple[()], kwargs) -> None:
         if len(args)>0:
             if len(args)==1 and isinstance(args[0],self.__class__):
                 a0 = args[0]
@@ -1189,7 +1215,7 @@ class QIxml(Names):
     #end def init_from_inputs
 
 
-    def init_from_kwargs(self,kwargs):
+    def init_from_kwargs(self, kwargs) -> None:
         ks=[]
         kmap = dict()
         for key,val in kwargs.items():
@@ -1260,7 +1286,13 @@ class QIxml(Names):
     #end def init_from_kwargs
 
 
-    def incorporate_defaults(self,*,elements=False,overwrite=False,propagate=True):
+    def incorporate_defaults(
+        self,
+        *,
+        elements  : bool = False,
+        overwrite : bool = False,
+        propagate : bool = True,
+        ) -> None:
         for name,value in self.defaults.items():
             defval=None
             if isinstance(value,classcollection):
@@ -1304,7 +1336,12 @@ class QIxml(Names):
     #end def incorporate_defaults
 
 
-    def check_junk(self,junk=None,*,exit=False):
+    def check_junk(
+        self,
+        junk : set | None = None,
+        *,
+        exit : bool       = False,
+        ) -> None:
         if junk is None:
             ks = set(self.keys())
             h5tags     = ks & set(self.h5tags)
@@ -1343,7 +1380,13 @@ class QIxml(Names):
     #end def check_junk
 
 
-    def collect_profile(self,xml,al,el,junk):
+    def collect_profile(
+        self,
+        xml,
+        al,
+        el,
+        junk,
+        ) -> None:
         attributes = obj(**al)
         parameters = obj()
         elements   = obj()
@@ -1420,12 +1463,19 @@ class QIxml(Names):
 
 
 
-    def get_single(self,preference):
+    def get_single(self, preference):
         return self
     #end def get_single
 
 
-    def get(self,names,namedict=None,*,host=False,root=True):
+    def get(
+        self,
+        names,
+        namedict        = None,
+        *,
+        host     : bool = False,
+        root     : bool = True,
+        ):
         if namedict is None:
             namedict = {}
         #end if
@@ -1510,7 +1560,7 @@ class QIxml(Names):
         #end if
     #end def get
 
-    def remove(self,*names):
+    def remove(self, *names: str | XMLelement) -> None:
         if len(names)==1 and not isinstance(names[0],str):
             names = names[0]
         #end if
@@ -1548,7 +1598,7 @@ class QIxml(Names):
     #end def remove
 
 
-    def assign(self,**kwargs):
+    def assign(self, **kwargs) -> None:
         for var,vnew in kwargs.items():
             if var in self:
                 val = self[var]
@@ -1574,7 +1624,7 @@ class QIxml(Names):
     #end def assign
 
 
-    def replace(self,*args,**kwargs):
+    def replace(self, *args: ArgsT, **kwargs) -> None:
         if len(args)==2 and isinstance(args[0],str) and isinstance(args[1],str):
             vold,vnew = args
             args = [(vold,vnew)]
@@ -1620,7 +1670,7 @@ class QIxml(Names):
     #end def replace
 
 
-    def combine(self,other):
+    def combine(self, other) -> None:
         #elemental combine only
         for name,element in other.items():
             plural = isinstance(element,collection)
@@ -1660,7 +1710,7 @@ class QIxml(Names):
     #end def combine
 
 
-    def move(self,**elemdests):
+    def move(self, **elemdests) -> None:
         names = list(elemdests.keys())
         hosts = self.get_host(names)
         dests = self.get(list(elemdests.values()))
@@ -1684,7 +1734,7 @@ class QIxml(Names):
 
 
 
-    def pluralize(self):
+    def pluralize(self) -> None:
         make_plural = []
         for name,value in self.items():
             if isinstance(value,QIxml):
@@ -1712,7 +1762,12 @@ class QIxml(Names):
     #end def pluralize
 
 
-    def difference(self,other,*,root=True):
+    def difference(
+        self,
+        other,
+        *,
+        root  : bool = True,
+        ) -> tuple:
         if root:
             q1 = deepcopy(self)
             q2 = deepcopy(other)
@@ -1839,7 +1894,7 @@ class QIxml(Names):
         return different,diff,d1,d2
     #end def difference
 
-    def remove_empty(self):
+    def remove_empty(self) -> None:
         names = list(self.keys())
         for name in names:
             value = self[name]
@@ -1866,11 +1921,11 @@ class QIxml(Names):
         #end for
     #end def remove_empty
 
-    def get_host(self,names):
+    def get_host(self, names: str) -> QIxml | None:
         return self.get(names,host=True)
     #end def get_host
 
-    def get_precision(self):
+    def get_precision(self) -> str | None:
         return getattr(self.__class__,'precision')
     #end def get_precision
 #end class QIxml
@@ -1878,7 +1933,15 @@ class QIxml(Names):
 
 
 class QIxmlFactory(Names):
-    def __init__(self,name,types,typekey='',typeindex=-1,typekey2='',default=None):
+    def __init__(
+        self,
+        name      : str,
+        types,
+        typekey   : str        = '',
+        typeindex : int        = -1,
+        typekey2  : str        = '',
+        default   : str | None = None,
+        ) -> None:
         self.name = name
         self.types = types
         self.typekey = typekey
@@ -1887,7 +1950,7 @@ class QIxmlFactory(Names):
         self.default = default
     #end def __init__
 
-    def __call__(self,*args,**kwargs):
+    def __call__(self, *args, **kwargs: KwargsT) -> QIxml | None:
         #emulate QIxml.__init__
         #get the value of the typekey
         a  = args
@@ -1936,7 +1999,7 @@ class QIxmlFactory(Names):
         #end if
     #end def __call__
 
-    def init_class(self):
+    def init_class(self) -> None:
         pass # this is for compatibility with QIxml only (do not overwrite)
     #end def init_class
 #end class QIxmlFactory
@@ -1946,16 +2009,16 @@ class QIxmlFactory(Names):
 class Param(Names):
     metadata = None
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.reset_precision()
     #end def __init__
 
-    def reset_precision(self):
+    def reset_precision(self) -> None:
         self.precision   = None
         self.prec_format = None
     #end def reset_precision
 
-    def set_precision(self,precision):
+    def set_precision(self, precision) -> None:
         if precision is None:
             self.reset_precision()
         elif not isinstance(precision,str):
@@ -1967,7 +2030,7 @@ class Param(Names):
         #end if
     #end def set_precision
 
-    def __call__(self,*args,**kwargs):
+    def __call__(self, *args, **kwargs: KwargsT):
         if len(args)==0:
             msg = 'no arguments provided, should have received one XMLelement'
             raise ValueError(msg)
@@ -1978,7 +2041,10 @@ class Param(Names):
         return self.read(args[0])
     #end def __call__
 
-    def read(self,xml):
+    def read(
+        self,
+        xml  : XMLelement | None,
+        ) -> int | float | str | QmcpackInput | np.ndarray:
         val = None
         attr = set(xml._attributes.keys())
         other_attr = attr-{'name'}
@@ -2032,7 +2098,17 @@ class Param(Names):
     #end def read
 
 
-    def write(self,value,mode='attr',tag='parameter',name=None,pad='   ',write_type=None,*,normal_elem=False):
+    def write(
+        self,
+        value,
+        mode        : str        = 'attr',
+        tag         : str | None = 'parameter',
+        name        : str | None = None,
+        pad         : str        = '   ',
+        write_type               = None,
+        *,
+        normal_elem : bool       = False,
+        ) -> str | None:
         c = ''
         attr_mode = mode=='attr'
         elem_mode = mode=='elem'
@@ -2144,7 +2220,7 @@ class Param(Names):
     #end def write
 
 
-    def write_val(self,val):
+    def write_val(self, val: ValT) -> str:
         if self.precision is not None and isinstance(val,float):
             return self.prec_format.format(val)
         else:
@@ -2152,7 +2228,7 @@ class Param(Names):
         #end if
     #end def write_val
 
-    def init_class(self):
+    def init_class(self) -> None:
         pass
     #end def init_class
 #end class Param
@@ -2866,7 +2942,7 @@ class loop(QIxml):
     collection_id = 'qmc'
     attributes = ('max',)
     elements = ('qmc','init')
-    def unroll(self):
+    def unroll(self) -> collection:
         calculations=[]
         calcs = []
         if 'qmc' in self:
@@ -3525,12 +3601,12 @@ back_propagation.defaults.update(
 
 
 
-def set_rsqmc_mode():
+def set_rsqmc_mode() -> None:
     QIobj.afqmc_mode = False
     Names.use_rsqmc_expanded_names()
 #end def set_rsqmc_mode
 
-def set_afqmc_mode():
+def set_afqmc_mode() -> None:
     QIobj.afqmc_mode = True
     Names.use_afqmc_expanded_names()
 #end def set_afqmc_mode
@@ -3554,11 +3630,15 @@ class QmcpackInput(SimulationInput,Names):
         )
 
     @staticmethod
-    def settings(**kwargs):
+    def settings(**kwargs) -> None:
         QIobj.settings(**kwargs)
     #end def settings
 
-    def __init__(self,arg0=None,arg1=None):
+    def __init__(
+        self,
+        arg0 : str | Path | meta | simulation | None = None,
+        arg1 : simulation | None                     = None,
+        ) -> None:
         Param.metadata = None
         filepath = None
         metadata = None
@@ -3604,7 +3684,7 @@ class QmcpackInput(SimulationInput,Names):
         QIcollections.clear()
     #end def __init__
 
-    def is_afqmc_input(self):
+    def is_afqmc_input(self) -> bool:
         is_afqmc = False
         if 'simulation' in self:
             sim = self.simulation
@@ -3613,7 +3693,7 @@ class QmcpackInput(SimulationInput,Names):
         return is_afqmc
     #end def is_afqmc_input
 
-    def get_base(self):
+    def get_base(self) -> QIxml:
         elem_names = list(self.keys())
         elem_names.remove('_metadata')
         if len(elem_names)>1:
@@ -3639,7 +3719,11 @@ class QmcpackInput(SimulationInput,Names):
         return elem_names[0]
     #end def get_basename
 
-    def read(self,filepath=None,xml=None):
+    def read(
+        self,
+        filepath : str | None        = None,
+        xml      : XMLelement | None = None,
+        ) -> int | float | str | QmcpackInput | np.ndarray | None:
         if xml is not None or os.path.exists(filepath):
             element_joins=['qmcsystem']
             element_aliases=dict(loop='qmc')
@@ -3708,7 +3792,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def read
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         set_rsqmc_mode()
         if self.is_afqmc_input():
             set_afqmc_mode()
@@ -3730,7 +3814,11 @@ class QmcpackInput(SimulationInput,Names):
     #end def write_text
 
 
-    def unroll_calculations(self,*,modify=True):
+    def unroll_calculations(
+        self,
+        *,
+        modify : bool = True,
+        ) -> collection:
         qmc = []
         sim = self.simulation
         if 'calculations' in sim:
@@ -3755,7 +3843,7 @@ class QmcpackInput(SimulationInput,Names):
         return qmc
     #end def unroll_calculations
 
-    def get_qmc_estimator_inputs(self):
+    def get_qmc_estimator_inputs(self) -> obj:
         """Return global and section-local estimator containers by output series.
 
         QMCPACK permits at most one global ``<estimators>`` container, either
@@ -3803,52 +3891,58 @@ class QmcpackInput(SimulationInput,Names):
         return obj(global_estimators=global_estimators,qmc=qmc_inputs)
     #end def get_qmc_estimator_inputs
 
-    def get(self,*names):
+    def get(self, *names):
         base = self.get_base()
         return base.get(names)
     #end def get
 
-    def remove(self,*names):
+    def remove(self, *names: str | XMLelement) -> None:
         base = self.get_base()
         base.remove(*names)
     #end def remove
 
-    def assign(self,**kwargs):
+    def assign(self, **kwargs) -> None:
         base = self.get_base()
         base.assign(**kwargs)
     #end def assign
 
-    def replace(self,*args,**kwargs):# input is list of keyword=(oldval,newval)
+    def replace(self, *args: ArgsT, **kwargs) -> None:# input is list of keyword=(oldval,newval)
         base = self.get_base()
         base.replace(*args,**kwargs)
     #end def replace
 
-    def move(self,**elemdests):
+    def move(self, **elemdests) -> None:
         base = self.get_base()
         base.move(**elemdests)
     #end def move
 
 
-    def get_host(self,names):
+    def get_host(self, names: str) -> QIxml | None:
         base = self.get_base()
         return base.get_host(names)
     #end def get_host
 
-    def incorporate_defaults(self,*,elements=False,overwrite=False,propagate=False):
+    def incorporate_defaults(
+        self,
+        *,
+        elements  : bool = False,
+        overwrite : bool = False,
+        propagate : bool = False,
+        ) -> None:
         base = self.get_base()
         base.incorporate_defaults(elements=elements,overwrite=overwrite,propagate=propagate)
     #end def incorporate_defaults
 
-    def pluralize(self):
+    def pluralize(self) -> None:
         base = self.get_base()
         base.pluralize()
     #end def pluralize
 
-    def standard_placements(self):
+    def standard_placements(self) -> None:
         self.move(particleset='qmcsystem',wavefunction='qmcsystem',hamiltonian='qmcsystem')
     #end def standard_placements
 
-    def difference(self,other):
+    def difference(self, other) -> tuple[bool | tuple, tuple | None, tuple, tuple]:
         s1 = deepcopy(self)
         s2 = deepcopy(other)
         b1 = s1.get_basename()
@@ -3875,12 +3969,16 @@ class QmcpackInput(SimulationInput,Names):
         return different,diff,d1,d2
     #end def difference
 
-    def remove_empty(self):
+    def remove_empty(self) -> None:
         base = self.get_base()
         base.remove_empty()
     #end def remove_empty
 
-    def read_xml(self,filepath=None,xml=None):
+    def read_xml(
+        self,
+        filepath : str | None = None,
+        xml                   = None,
+        ) -> XMLelement | None:
         if os.path.exists(filepath):
             element_joins=['qmcsystem']
             element_aliases=dict(loop='qmc')
@@ -3911,7 +4009,13 @@ class QmcpackInput(SimulationInput,Names):
         return xml
     #end def read_xml
 
-    def include_xml(self,xmlfile,*,replace=True,exists=True):
+    def include_xml(
+        self,
+        xmlfile,
+        *,
+        replace : bool = True,
+        exists  : bool = True,
+        ) -> None:
         xml = self.read_xml(xmlfile)
         Param.metadata = self._metadata
         for name,exml in xml.items():
@@ -3976,7 +4080,12 @@ class QmcpackInput(SimulationInput,Names):
     #    wavefunctions, e.g. multideterminants.
     #    Until that time, wavefunctions will be explicitly read into the full
     #    input file.
-    def add_include(self,element_type,href,placement='on'):
+    def add_include(
+        self,
+        element_type,
+        href,
+        placement    : str = 'on',
+        ) -> None:
         # check the element type
         elems = ['cell','ptcl','wfs','ham']
         emap  = obj(
@@ -4116,7 +4225,10 @@ class QmcpackInput(SimulationInput,Names):
     #end def add_include
 
 
-    def get_output_info(self,*requests):
+    def get_output_info(
+        self,
+        *requests : RequestsT,
+        ) -> list[str | obj | list[str | obj] | set[str]] | set[int | str]:
         project = self.simulation.project
         prefix = project.id
         series = project.series
@@ -4190,7 +4302,14 @@ class QmcpackInput(SimulationInput,Names):
     #end def get_output_info
 
 
-    def generate_jastrows(self,size=None,j1func='bspline',j1size=8,j2func='bspline',j2size=8):
+    def generate_jastrows(
+        self,
+        size         = None,
+        j1func : str = 'bspline',
+        j1size : int = 8,
+        j2func : str = 'bspline',
+        j2size : int = 8,
+        ) -> None:
         if size is not None:
             j1size = size
             j2size = size
@@ -4332,7 +4451,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def generate_jastrows
 
 
-    def incorporate_system(self,system):
+    def incorporate_system(self, system) -> None:
         self.warn('incorporate_system may or may not work\n  please check the qmcpack input produced\n  if it is wrong, please contact the developer')
         system = deepcopy(system)
         system.check_folded_system()
@@ -4500,14 +4619,18 @@ class QmcpackInput(SimulationInput,Names):
     #end def incorporate_system
 
 
-    def get_electron_particle_set(self):
+    def get_electron_particle_set(self) -> float:
         input = deepcopy(self)
         input.pluralize()
         return input.get('particlesets').e
     #end def get_electron_particle_set
 
 
-    def return_system(self,*,structure_only=False):
+    def return_system(
+        self,
+        *,
+        structure_only : bool = False,
+        ):
         input = deepcopy(self)
         input.pluralize()
         axes,ps,H = input.get('lattice','particlesets','hamiltonian')
@@ -4673,7 +4796,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def return_system
 
 
-    def get_ion_particlesets(self):
+    def get_ion_particlesets(self) -> obj:
         ions = obj()
         ps = self.get('particlesets')
         #try to identify ions by positive charged groups
@@ -4693,7 +4816,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def get_ion_particlesets
 
 
-    def get_pp_files(self):
+    def get_pp_files(self) -> list:
         pp_files = []
         h = self.get('hamiltonian')
         if h is not None:
@@ -4723,7 +4846,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def get_pp_files
 
 
-    def remove_physical_system(self):
+    def remove_physical_system(self) -> None:
         qs = self.simulation.qmcsystem
         if 'simulationcell' in qs:
             del qs.simulationcell
@@ -4740,7 +4863,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def remove_physical_system
 
 
-    def cusp_correction(self):
+    def cusp_correction(self) -> bool:
         cc = False
         if not self.is_afqmc_input():
             ds = self.get('determinantset')
@@ -4752,7 +4875,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def cusp_correction
 
 
-    def get_driver(self):
+    def get_driver(self) -> str | list | None:
         driver = self.get('driver_version')
         if driver is None or driver.startswith('batch'):
             driver = 'batched'
@@ -4760,7 +4883,7 @@ class QmcpackInput(SimulationInput,Names):
         return driver
     #end def get_driver()
 
-    def set_driver(self,driver):
+    def set_driver(self, driver: str) -> None:
         if driver.startswith('batch'):
             driver = 'batched'
         assert driver in {'batched','legacy'}
@@ -4769,19 +4892,19 @@ class QmcpackInput(SimulationInput,Names):
     #end set_driver
 
 
-    def has_jastrows(self):
+    def has_jastrows(self) -> bool:
         return self.get_jastrows() is not None
     #end def has_jastrows
 
-    def get_jastrows(self):
+    def get_jastrows(self) -> list | None:
         return self.get('jastrow')
     #end def get_jastrows
 
-    def remove_jastrows(self):
+    def remove_jastrows(self) -> None:
         self.remove('jastrow')
     #end def remove_jastrows
 
-    def remove_J1(self):
+    def remove_J1(self) -> None:
         J = self.get('jastrow')
         if J is not None:
             Jrem = []
@@ -4792,7 +4915,7 @@ class QmcpackInput(SimulationInput,Names):
                 del J[name]
     #end def remove_J1
 
-    def remove_J2(self):
+    def remove_J2(self) -> None:
         J = self.get('jastrow')
         if J is not None:
             Jrem = []
@@ -4803,7 +4926,7 @@ class QmcpackInput(SimulationInput,Names):
                 del J[name]
     #end def remove_J2
 
-    def remove_J3(self):
+    def remove_J3(self) -> None:
         J = self.get('jastrow')
         if J is not None:
             Jrem = []
@@ -4814,7 +4937,7 @@ class QmcpackInput(SimulationInput,Names):
                 del J[name]
     #end def remove_J3
 
-    def gen_jastrows(self,**kwargs):
+    def gen_jastrows(self, **kwargs) -> None:
         self.remove_jastrows()
         system = kwargs.pop('system',None)
         if system is None:
@@ -4832,7 +4955,11 @@ class QmcpackInput(SimulationInput,Names):
         wfn.jastrows = make_collection(jastrows)
     #end def gen_jastrows
 
-    def optimize_jastrows(self,*,opt=True):
+    def optimize_jastrows(
+        self,
+        *,
+        opt  : bool = True,
+        ) -> None:
         opt = bool(opt)
         jastrows = self.get_jastrows()
         if jastrows is not None:
@@ -4846,7 +4973,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def optimize_jastrows
 
 
-    def set_orbitals_h5(self,orbitals_h5):
+    def set_orbitals_h5(self, orbitals_h5: str) -> None:
         assert isinstance(orbitals_h5,str)
         assert ' ' not in orbitals_h5
         assert orbitals_h5.endswith('.h5')
@@ -4866,14 +4993,14 @@ class QmcpackInput(SimulationInput,Names):
             raise ValueError(msg)
     #end def set_orbitals_h5
 
-    def has_lcao_orbitals(self):
+    def has_lcao_orbitals(self) -> bool:
         dset = self.get('determinantset')
         assert dset is not None
         lcao = 'type' in dset and dset.type=='MolecularOrbital'
         return lcao
     #end def has_lcao_orbitals
 
-    def set_lcao_orbital_file(self,filepath):
+    def set_lcao_orbital_file(self, filepath: str) -> None:
         assert filepath.endswith('.h5')
         if not self.has_lcao_orbitals():
             msg = 'calculation type is not LCAO. Cannot assign LCAO orbital file.'
@@ -4884,15 +5011,19 @@ class QmcpackInput(SimulationInput,Names):
     #end def set_lcao_orbital_file
 
 
-    def has_multidet(self):
+    def has_multidet(self) -> bool:
         return self.get_multidet() is not None
     #end def has_multidet
 
-    def get_multidet(self):
+    def get_multidet(self) -> list | None:
         return self.get('multideterminant')
     #end def get_multidet
 
-    def optimize_multidet(self,*,opt=True):
+    def optimize_multidet(
+        self,
+        *,
+        opt  : bool = True,
+        ) -> None:
         opt = bool(opt)
         md  = self.get_multidet()
         if md is None:
@@ -4903,7 +5034,7 @@ class QmcpackInput(SimulationInput,Names):
         md.detlist.optimize = opt
     #end def optimize_multidet
 
-    def set_multidet_params(self,**kwargs):
+    def set_multidet_params(self, **kwargs) -> None:
         md = self.get_multidet()
         if md is None:
             msg = 'input file has no multideterminant'
@@ -4930,7 +5061,7 @@ class QmcpackInput(SimulationInput,Names):
                 dl[name] = kwargs[name]
     #end def set_mutidet_params
 
-    def set_multidet_h5(self,filepath):
+    def set_multidet_h5(self, filepath: str) -> None:
         assert isinstance(filepath,str)
         assert ' ' not in filepath
         assert filepath.endswith('.h5')
@@ -4938,7 +5069,7 @@ class QmcpackInput(SimulationInput,Names):
     #end def set_multidet_h5
 
 
-    def set_pseudo_files(self,**pseudo_files):
+    def set_pseudo_files(self, **pseudo_files) -> None:
         pps = self.get('pseudo')
         assert pps is not None
         species = list(pps.keys())
@@ -4951,11 +5082,11 @@ class QmcpackInput(SimulationInput,Names):
                     pps[spec1] = pp
     #end def set_pseudo_files
 
-    def has_qmc(self,series):
+    def has_qmc(self, series) -> bool:
         return self.get_qmc(series) is not None
     #end def has_qmc
 
-    def get_qmc(self,series):
+    def get_qmc(self, series) -> QIxml | None:
         series = int(series)
         qmc          = None
         calcs        = self.get('calculations')
@@ -4968,7 +5099,7 @@ class QmcpackInput(SimulationInput,Names):
         return qmc
     #end def get_qmc
 
-    def remove_qmc(self,series):
+    def remove_qmc(self, series) -> None:
         series = int(series)
         qmc          = None
         calcs        = self.get('calculations')
@@ -4990,19 +5121,19 @@ class QmcpackInput(SimulationInput,Names):
     #end def remove_qmc
 
 
-    def has_calculations(self):
+    def has_calculations(self) -> bool:
         return self.get_calculations() is not None
     #end def has_calculations
 
-    def get_calculations(self):
+    def get_calculations(self) -> list | None:
         return self.get('calculations')
     #end def get_calculations
 
-    def remove_calculations(self):
+    def remove_calculations(self) -> None:
         self.remove('calculations')
     #end def remove_calculations
 
-    def gen_calculations(self,qmc,**kw):
+    def gen_calculations(self, qmc, **kw) -> None:
         allowed_qmc = ('opt','vmc','vmc_test','vmc_noJ',
                        'dmc','dmc_test','dmc_noJ')
         if qmc not in allowed_qmc:
@@ -5030,63 +5161,64 @@ class QmcpackInput(SimulationInput,Names):
     #end def gen_calculations
 
 
-    def modify(self,
-               *,
-               driver              = None,
-               remove_system       = False,
-               change_system       = False,
-               remove_jastrows     = False,
-               remove_J1           = False,
-               remove_J2           = False,
-               remove_J3           = False,
-               remove_determinants = False,
-               remove_multidet     = False,
-               remove_calculations = False,
-               # generate_jastrow_alt inputs
-               J1                  = False,
-               J2                  = False,
-               J3                  = False,
-               J1_size             = None,
-               J1_rcut             = None,
-               J1_dr               = 0.5,
-               J1_opt              = True,
-               J2_size             = None,
-               J2_rcut             = None,
-               J2_dr               = 0.5,
-               J2_init             = 'zero',
-               J2_opt              = True,
-               J3_isize            = 3,
-               J3_esize            = 3,
-               J3_rcut             = 5.0,
-               J3_opt              = None,
-               J1_rcut_open        = 5.0,
-               J2_rcut_open        = 10.0,
-               J1k                 = False,
-               J1k_kcut            = 5.0,
-               J1k_symm            = 'crystal',
-               J1k_opt             = None,
-               J2k                 = False,
-               J2k_kcut            = 5.0,
-               J2k_symm            = 'crystal',
-               J2k_opt             = None,
-               system              = None,
-               # other jastrow
-               jastrow_opt         = None,
-               # determinant inputs
-               orbitals_h5         = None,
-               # multidet inputs
-               multidet_h5         = None,
-               multidet_cutoff     = None,
-               multidet_opt        = None,
-               # other wavefunction
-               optimize            = None,
-               # hamiltonian
-               pseudo_files        = None,
-               # calculations input
-               calculations        = None,
-               qmc                 = None,
-               **gen_calcs
-               ):
+    def modify(
+        self,
+        *,
+        driver                                  = None,
+        remove_system       : bool              = False,
+        change_system       : bool              = False,
+        remove_jastrows     : bool              = False,
+        remove_J1           : bool              = False,
+        remove_J2           : bool              = False,
+        remove_J3           : bool              = False,
+        remove_determinants : bool              = False,
+        remove_multidet     : bool              = False,
+        remove_calculations : bool              = False,
+        # generate_jastrow_alt inputs
+        J1                  : bool              = False,
+        J2                  : bool              = False,
+        J3                  : bool              = False,
+        J1_size                                 = None,
+        J1_rcut                                 = None,
+        J1_dr               : float             = 0.5,
+        J1_opt              : bool              = True,
+        J2_size                                 = None,
+        J2_rcut                                 = None,
+        J2_dr               : float             = 0.5,
+        J2_init             : str               = 'zero',
+        J2_opt              : bool              = True,
+        J3_isize            : int               = 3,
+        J3_esize            : int               = 3,
+        J3_rcut             : float             = 5.0,
+        J3_opt                                  = None,
+        J1_rcut_open        : float             = 5.0,
+        J2_rcut_open        : float             = 10.0,
+        J1k                 : bool              = False,
+        J1k_kcut            : float             = 5.0,
+        J1k_symm            : str               = 'crystal',
+        J1k_opt                                 = None,
+        J2k                 : bool              = False,
+        J2k_kcut            : float             = 5.0,
+        J2k_symm            : str               = 'crystal',
+        J2k_opt                                 = None,
+        system                                  = None,
+        # other jastrow
+        jastrow_opt                             = None,
+        # determinant inputs
+        orbitals_h5                             = None,
+        # multidet inputs
+        multidet_h5                             = None,
+        multidet_cutoff                         = None,
+        multidet_opt                            = None,
+        # other wavefunction
+        optimize                                = None,
+        # hamiltonian
+        pseudo_files        : dict | obj | None = None,
+        # calculations input
+        calculations                            = None,
+        qmc                                     = None,
+        **gen_calcs,
+        ) -> None:
         """Modify the parameters and xml elements of a QMCPACK input file.
 
         Parameters
@@ -5711,17 +5843,17 @@ class QmcpackInput(SimulationInput,Names):
     #end def modify
 
 
-    def bundle(self,inputs,filenames):
+    def bundle(self, inputs, filenames) -> BundledQmcpackInput:
         return BundledQmcpackInput(inputs,filenames)
     #end def bundle
 
 
-    def trace(self,quantity,values):
+    def trace(self, quantity: str, values: list[int]) -> TracedQmcpackInput:
         return TracedQmcpackInput(quantity,values,self)
     #end def trace
 
 
-    def twist_average(self,twistnums):
+    def twist_average(self, twistnums: list[int]) -> TracedQmcpackInput:
         return self.trace('twistnum',twistnums)
     #end def twist_average
 #end class QmcpackInput
@@ -5732,7 +5864,7 @@ class QmcpackInput(SimulationInput,Names):
 #  not used on its own
 class BundledQmcpackInput(SimulationInput):
 
-    def __init__(self,inputs,filenames):
+    def __init__(self, inputs, filenames) -> None:
         self.inputs = obj()
         for inp in inputs:
             self.inputs[len(self.inputs)] = inp
@@ -5741,7 +5873,10 @@ class BundledQmcpackInput(SimulationInput):
     #end def __init__
 
 
-    def get_output_info(self,*requests):
+    def get_output_info(
+        self,
+        *requests : RequestsT,
+        ) -> list[str | obj | list[str | obj] | set[str]] | set[str]:
         outfiles = []
 
         for index,inp in self.inputs.items():
@@ -5774,12 +5909,12 @@ class BundledQmcpackInput(SimulationInput):
     #end def get_output_info
 
 
-    def generate_filenames(self,infile):
+    def generate_filenames(self, infile: str):
         raise NotImplementedError
     #end def generate_filenames
 
 
-    def write(self,filepath=None):
+    def write(self, filepath: str | None = None) -> str:
         if filepath is not None and 'filenames' not in self:
             infile = os.path.split(filepath)[1]
             if not infile.endswith('.xml'):
@@ -5815,7 +5950,12 @@ class BundledQmcpackInput(SimulationInput):
 
 
 class TracedQmcpackInput(BundledQmcpackInput):
-    def __init__(self,quantity=None,values=None,input=None):
+    def __init__(
+        self,
+        quantity : str | None          = None,
+        values   : list[int] | None    = None,
+        input    : QmcpackInput | None = None,
+        ) -> None:
         self.quantities = obj()
         self.variables = obj()
         self.inputs = obj()
@@ -5825,7 +5965,12 @@ class TracedQmcpackInput(BundledQmcpackInput):
         #end if
     #end def __init__
 
-    def bundle_inputs(self,quantity,values,input):
+    def bundle_inputs(
+        self,
+        quantity : str,
+        values   : list[int],
+        input    : QmcpackInput,
+        ) -> None:
         range = len(self.inputs),len(self.inputs)+len(values)
         self.quantities[len(self.quantities)] = obj(quantity=quantity,range=range)
         for value in values:
@@ -5850,7 +5995,7 @@ class TracedQmcpackInput(BundledQmcpackInput):
     #end def bundle_inputs
 
 
-    def generate_filenames(self,infile):
+    def generate_filenames(self, infile: str) -> None:
         prefix,ext = infile.split('.',1)
         if not ext.endswith('xml'):
             ext+='.xml'
@@ -5874,7 +6019,7 @@ class TracedQmcpackInput(BundledQmcpackInput):
 
 
 class QmcpackInputTemplate(SimulationInputTemplate):
-    def preprocess(self,contents,filepath=None):
+    def preprocess(self, contents, filepath = None) -> str:
         if filepath is not None:
             basepath,filename = os.path.split(filepath)
             c = contents
@@ -5906,7 +6051,7 @@ class QmcpackInputTemplate(SimulationInputTemplate):
     #end def preprocess
 
 
-    def get_output_info(self,*args,**kwargs):
+    def get_output_info(self, *args, **kwargs) -> list:
         # just pretend
         return []
     #end def get_output_info
@@ -5915,7 +6060,13 @@ class QmcpackInputTemplate(SimulationInputTemplate):
 
 
 
-def generate_simulationcell(bconds='ppp',lr_dim_cutoff=15,lr_tol=None,lr_handler=None,system=None):
+def generate_simulationcell(
+    bconds        : str | np.ndarray = 'ppp',
+    lr_dim_cutoff : int              = 15,
+    lr_tol                           = None,
+    lr_handler                       = None,
+    system                           = None,
+    ) -> simulationcell:
     bconds = tuple(bconds)
     sc = simulationcell(bconds=bconds)
     periodic = 'p' in bconds
@@ -5980,17 +6131,18 @@ def generate_simulationcell(bconds='ppp',lr_dim_cutoff=15,lr_tol=None,lr_handler
 #end def generate_simulationcell
 
 
-def generate_particlesets(*,
-                          electrons   = 'e',
-                          ions        = 'ion0',
-                          up          = 'u',
-                          down        = 'd',
-                          spinor      = None,
-                          system      = None,
-                          randomsrc   = True,
-                          hybrid_rcut = None,
-                          hybrid_lmax = None,
-                          ):
+def generate_particlesets(
+    *,
+    electrons   : str  = 'e',
+    ions        : str  = 'ion0',
+    up          : str  = 'u',
+    down        : str  = 'd',
+    spinor             = None,
+    system             = None,
+    randomsrc   : bool = True,
+    hybrid_rcut        = None,
+    hybrid_lmax        = None,
+    ) -> collection:
     if system is None:
         msg = 'generate_particlesets argument system must not be None'
         raise ValueError(msg)
@@ -6105,20 +6257,21 @@ def generate_particlesets(*,
 #end def generate_particlesets
 
 
-def generate_sposets(type           = None,
-                     *,
-                     occupation     = None,
-                     spin_polarized = False,
-                     nup            = None,
-                     ndown          = None,
-                     spo_up         = 'spo_u',
-                     spo_down       = 'spo_d',
-                     system         = None,
-                     sposets        = None,
-                     spindatasets   = False,
-                     spinor         = None,
-                     rotate         = False,
-                     ):
+def generate_sposets(
+    type           : str | None = None,
+    *,
+    occupation     : str | None = None,
+    spin_polarized : bool       = False,
+    nup                         = None,
+    ndown                       = None,
+    spo_up         : str        = 'spo_u',
+    spo_down       : str        = 'spo_d',
+    system                      = None,
+    sposets                     = None,
+    spindatasets   : bool       = False,
+    spinor                      = None,
+    rotate         : bool       = False,
+    ) -> collection:
     ndn = ndown
     if type is None:
         msg = (
@@ -6192,7 +6345,7 @@ def generate_sposets(type           = None,
 #end def generate_sposets
 
 
-def generate_sposet_builder(type,*args,**kwargs):
+def generate_sposet_builder(type: str, *args, **kwargs) -> bspline_builder:
     if type=='bspline' or type=='einspline':
         return generate_bspline_builder(type,*args,**kwargs)
     elif type=='heg':
@@ -6207,29 +6360,30 @@ def generate_sposet_builder(type,*args,**kwargs):
 #end def generate_sposet_builder
 
 
-def generate_bspline_builder(type           = 'bspline',
-                             *,
-                             meshfactor     = 1.0,
-                             precision      = 'float',
-                             twistnum       = None,
-                             twist          = None,
-                             sort           = None,
-                             version        = '0.10',
-                             truncate       = False,
-                             buffer         = None,
-                             spin_polarized = False,
-                             hybridrep      = None,
-                             href           = 'MISSING.h5',
-                             rotate         = False,
-                             ions           = 'ion0',
-                             spo_up         = 'spo_u',
-                             spo_down       = 'spo_d',
-                             sposets        = None,
-                             system         = None,
-                             orbitals_cpu   = None,
-                             gpusharing     = None,
-                             spinor         = None,
-                             ):
+def generate_bspline_builder(
+    type           : str        = 'bspline',
+    *,
+    meshfactor     : float      = 1.0,
+    precision      : str        = 'float',
+    twistnum       : int | None = None,
+    twist                       = None,
+    sort                        = None,
+    version        : str        = '0.10',
+    truncate       : bool       = False,
+    buffer                      = None,
+    spin_polarized : bool       = False,
+    hybridrep                   = None,
+    href           : str        = 'MISSING.h5',
+    rotate         : bool       = False,
+    ions           : str        = 'ion0',
+    spo_up         : str        = 'spo_u',
+    spo_down       : str        = 'spo_d',
+    sposets                     = None,
+    system                      = None,
+    orbitals_cpu                = None,
+    gpusharing                  = None,
+    spinor                      = None,
+    ) -> bspline_builder:
     tilematrix = np.identity(3,dtype=int)
     if system is not None:
         tilematrix = system.structure.tilematrix()
@@ -6287,14 +6441,15 @@ def generate_bspline_builder(type           = 'bspline',
 #end def generate_bspline_builder
 
 
-def generate_heg_builder(*,
-                         twist          = None,
-                         spin_polarized = False,
-                         spo_up         = 'spo_u',
-                         spo_down       = 'spo_d',
-                         sposets        = None,
-                         system         = None
-                         ):
+def generate_heg_builder(
+    *,
+    twist                 = None,
+    spin_polarized : bool = False,
+    spo_up         : str  = 'spo_u',
+    spo_down       : str  = 'spo_d',
+    sposets               = None,
+    system                = None,
+    ) -> heg_builder:
     type = 'heg'
     hb = heg_builder(
         type    = type,
@@ -6313,7 +6468,11 @@ def generate_heg_builder(*,
 #end def generate_heg_builder
 
 
-def partition_sposets(sposet_builder,partition,partition_meshfactors=None):
+def partition_sposets(
+    sposet_builder,
+    partition             : dict | obj,
+    partition_meshfactors = None,
+    ) -> list[composite_builder]:
     ssb = sposet_builder
     spos_in =ssb.sposets
     del ssb.sposets
@@ -6384,19 +6543,20 @@ def partition_sposets(sposet_builder,partition,partition_meshfactors=None):
 #end def partition_sposets
 
 
-def generate_determinantset(*,
-                            up             = 'u',
-                            down           = 'd',
-                            spo_up         = 'spo_u',
-                            spo_down       = 'spo_d',
-                            spin_polarized = False,
-                            delay_rank     = None,
-                            det_batch      = None,
-                            matrix_inv_cpu = None,
-                            system         = None,
-                            spinor         = None,
-                            rotate         = False,
-                            ):
+def generate_determinantset(
+    *,
+    up             : str  = 'u',
+    down           : str  = 'd',
+    spo_up         : str  = 'spo_u',
+    spo_down       : str  = 'spo_d',
+    spin_polarized : bool = False,
+    delay_rank            = None,
+    det_batch             = None,
+    matrix_inv_cpu        = None,
+    system                = None,
+    spinor                = None,
+    rotate         : bool = False,
+    ) -> determinantset:
     if system is None:
         msg = 'generate_determinantset argument system must not be None'
         raise ValueError(msg)
@@ -6467,7 +6627,9 @@ def generate_determinantset(*,
 #end def generate_determinantset
 
 
-def check_excitation_type(excitation):
+def check_excitation_type(
+    excitation : list[str],
+    ) -> tuple[int, int, obj, obj, str, str]:
 
     # Possible spin channels or spin states
     exc_spins = obj(
@@ -6561,22 +6723,23 @@ def check_excitation_type(excitation):
 #end def check_excitation_type
 
 
-def generate_determinantset_old(type           = 'bspline',
-                                *,
-                                meshfactor     = 1.0,
-                                precision      = 'float',
-                                twistnum       = None,
-                                twist          = None,
-                                spin_polarized = False,
-                                hybridrep      = None,
-                                source         = 'ion0',
-                                href           = 'MISSING.h5',
-                                excitation     = None,
-                                delay_rank     = None,
-                                gpusharing     = None,
-                                system         = None,
-                                spinor         = None,
-                                ):
+def generate_determinantset_old(
+    type           : str              = 'bspline',
+    *,
+    meshfactor     : float            = 1.0,
+    precision      : str              = 'float',
+    twistnum                          = None,
+    twist                             = None,
+    spin_polarized : bool             = False,
+    hybridrep                         = None,
+    source         : str              = 'ion0',
+    href           : str              = 'MISSING.h5',
+    excitation     : list[str] | None = None,
+    delay_rank                        = None,
+    gpusharing                        = None,
+    system                            = None,
+    spinor                            = None,
+    ) -> determinantset:
     if system is None:
         msg = 'generate_determinantset argument system must not be None'
         raise ValueError(msg)
@@ -6906,21 +7069,22 @@ def generate_determinantset_old(type           = 'bspline',
 #end def generate_determinantset_old
 
 
-def generate_hamiltonian(name         = 'h0',
-                         type         = 'generic',
-                         electrons    = 'e',
-                         ions         = 'ion0',
-                         wavefunction = 'psi0',
-                         pseudos      = None,
-                         algorithm    = None,
-                         dla          = None,
-                         format       = 'xml',
-                         estimators   = None,
-                         system       = None,
-                         wf_elem      = None,
-                         interactions = 'default',
-                         nrule        = None,
-                         ):
+def generate_hamiltonian(
+    name         : str                      = 'h0',
+    type         : str                      = 'generic',
+    electrons    : str                      = 'e',
+    ions         : str                      = 'ion0',
+    wavefunction : str                      = 'psi0',
+    pseudos      : PseudosT                 = None,
+    algorithm                               = None,
+    dla                                     = None,
+    format       : str                      = 'xml',
+    estimators   : list[str | QIxml] | None = None,
+    system                                  = None,
+    wf_elem      : wavefunction | None      = None,
+    interactions : str                      = 'default',
+    nrule                                   = None,
+    ) -> hamiltonian | None:
     if system is None:
         msg = 'generate_hamiltonian argument system must not be None'
         raise ValueError(msg)
@@ -7139,12 +7303,13 @@ def generate_hamiltonian(name         = 'h0',
 #end def generate_hamiltonian
 
 
-def generate_estimators_batched(estimators,
-                                electrons    = 'e',
-                                ions         = 'ion0',
-                                wavefunction = 'psi0',
-                                wf_elem      = None,
-                                ):
+def generate_estimators_batched(
+    estimators   : list[QIxml],
+    electrons    : str                 = 'e',
+    ions         : str                 = 'ion0',
+    wavefunction : str                 = 'psi0',
+    wf_elem      : wavefunction | None = None,
+    ) -> collection | list[QIxml]:
     assert len(estimators)>0
     ename  = electrons
     iname  = ions
@@ -7188,7 +7353,11 @@ def generate_estimators_batched(estimators,
 #end def generate_estimators_batched
 
 
-def process_dm1b_estimator(dm,wfname,wf_elem):
+def process_dm1b_estimator(
+    dm      : QIxml,
+    wfname  : str,
+    wf_elem : wavefunction,
+    ) -> QIxml:
     reuse = False
     if 'reuse' in dm:
         reuse = bool(dm.reuse)
@@ -7295,7 +7464,13 @@ def process_dm1b_estimator(dm,wfname,wf_elem):
 
 
 
-def generate_jastrows(jastrows,system=None,*,return_list=False,check_ions=False):
+def generate_jastrows(
+    jastrows,
+    system             = None,
+    *,
+    return_list : bool = False,
+    check_ions  : bool = False,
+    ) -> collection | list[str | QIxml]:
     jin = []
     have_ions = True
     if check_ions and system is not None:
@@ -7382,35 +7557,35 @@ def generate_jastrows(jastrows,system=None,*,return_list=False,check_ions=False)
 
 
 def generate_jastrows_alt(
-        *,
-        J1           = False,
-        J2           = False,
-        J3           = False,
-        J1_size      = None,
-        J1_rcut      = None,
-        J1_dr        = 0.5,
-        J1_opt       = None,
-        J2_size      = None,
-        J2_rcut      = None,
-        J2_dr        = 0.5,
-        J2_init      = 'zero',
-        J2_opt       = True,
-        J3_isize     = 3,
-        J3_esize     = 3,
-        J3_rcut      = 5.0,
-        J3_opt       = None,
-        J1_rcut_open = 5.0,
-        J2_rcut_open = 10.0,
-        J1k          = False,
-        J1k_kcut     = 5.0,
-        J1k_symm     = 'crystal',
-        J1k_opt      = None,
-        J2k          = False,
-        J2k_kcut     = 5.0,
-        J2k_symm     = 'crystal',
-        J2k_opt      = None,
-        system       = None,
-        ):
+    *,
+    J1           : bool               = False,
+    J2           : bool               = False,
+    J3           : bool               = False,
+    J1_size                           = None,
+    J1_rcut      : float | None       = None,
+    J1_dr        : float              = 0.5,
+    J1_opt                            = None,
+    J2_size                           = None,
+    J2_rcut      : float | None       = None,
+    J2_dr        : float              = 0.5,
+    J2_init      : str                = 'zero',
+    J2_opt       : bool | None        = True,
+    J3_isize     : int                = 3,
+    J3_esize     : int                = 3,
+    J3_rcut      : float | np.float64 = 5.0,
+    J3_opt                            = None,
+    J1_rcut_open : float              = 5.0,
+    J2_rcut_open : float              = 10.0,
+    J1k          : bool               = False,
+    J1k_kcut     : float              = 5.0,
+    J1k_symm     : str                = 'crystal',
+    J1k_opt                           = None,
+    J2k          : bool               = False,
+    J2k_kcut     : float              = 5.0,
+    J2k_symm     : str                = 'crystal',
+    J2k_opt                           = None,
+    system                            = None,
+    ) -> list[QIxml]:
     if system is None:
         msg = 'input variable "system" is required to generate jastrows'
         raise ValueError(msg)
@@ -7528,7 +7703,11 @@ def generate_jastrows_alt(
 #end def generate_jastrows_alt
 
 
-def generate_jastrow(descriptor,*args,**kwargs):
+def generate_jastrow(
+    descriptor : DescriptorT,
+    *args      : int | float | str | np.float64,
+    **kwargs,
+    ) -> QIxml:
     keywords = {'function','size','rcut','elements','coeff','cusp','ename',
                 'iname','spins','density','Buu','Bud','opt','system','isize','esize','init'}
     if not 'system' in kwargs:
@@ -7584,7 +7763,19 @@ def generate_jastrow(descriptor,*args,**kwargs):
 
 
 
-def generate_jastrow1(function='bspline',size=8,rcut=None,coeff=None,cusp=0.,ename='e',iname='ion0',elements=None,system=None,opt=None,**elemargs):
+def generate_jastrow1(
+    function   : str                             = 'bspline',
+    size       : int                             = 8,
+    rcut       : int | float | np.float64 | None = None,
+    coeff                                        = None,
+    cusp       : float                           = 0.,
+    ename      : str                             = 'e',
+    iname      : str                             = 'ion0',
+    elements                                     = None,
+    system                                       = None,
+    opt                                          = None,
+    **elemargs,
+    ) -> jastrow1:
     noelements = elements is None
     nosystem   = system is None
     noelemargs = len(elemargs)==0
@@ -7688,7 +7879,16 @@ def generate_jastrow1(function='bspline',size=8,rcut=None,coeff=None,cusp=0.,ena
 
 
 
-def generate_bspline_jastrow2(size=8,rcut=None,coeff=None,spins=('u','d'),density=None,system=None,init='rpa',opt=None):
+def generate_bspline_jastrow2(
+    size    : int                             = 8,
+    rcut    : int | float | np.float64 | None = None,
+    coeff                                     = None,
+    spins   : tuple[str, str]                 = ('u','d'),
+    density                                   = None,
+    system                                    = None,
+    init    : str                             = 'rpa',
+    opt                                       = None,
+        ) -> jastrow2:
     if coeff is None and system is None and (init=='rpa' and density is None or rcut is None):
         msg = 'rcut and density or system must be specified'
         raise ValueError(msg)
@@ -7782,7 +7982,12 @@ def generate_bspline_jastrow2(size=8,rcut=None,coeff=None,spins=('u','d'),densit
 #end def generate_bspline_jastrow2
 
 
-def generate_pade_jastrow2(Buu=None,Bud=None,spins=('u','d'),system=None):
+def generate_pade_jastrow2(
+    Buu    : float | None    = None,
+    Bud    : float | None    = None,
+    spins  : tuple[str, str] = ('u','d'),
+    system                   = None,
+    ) -> jastrow2:
     if Buu is None:
         Buu = 2.0
     #end if
@@ -7809,7 +8014,11 @@ def generate_pade_jastrow2(Buu=None,Bud=None,spins=('u','d'),system=None):
 
 
 
-def generate_jastrow2(function='bspline',*args,**kwargs):
+def generate_jastrow2(
+    function : str = 'bspline',
+    *args    : int | float | str | QIobj | np.float64,
+    **kwargs,
+    ) -> jastrow2 | None:
     if 'spins' not in kwargs:
         kwargs['spins'] = ('u','d')
     #end if
@@ -7865,7 +8074,18 @@ def generate_jastrow2(function='bspline',*args,**kwargs):
 
 
 
-def generate_jastrow3(function='polynomial',esize=3,isize=3,rcut=4.,coeff=None,iname='ion0',spins=('u','d'),elements=None,system=None,opt=None):
+def generate_jastrow3(
+    function : str                = 'polynomial',
+    esize    : int                = 3,
+    isize    : int                = 3,
+    rcut     : float | np.float64 = 4.,
+    coeff                         = None,
+    iname    : str                = 'ion0',
+    spins    : tuple[str, str]    = ('u','d'),
+    elements                      = None,
+    system                        = None,
+    opt                           = None,
+    ) -> jastrow3:
     if elements is None and system is None:
         msg = 'must specify elements or system'
         raise ValueError(msg)
@@ -7928,18 +8148,18 @@ def generate_jastrow3(function='polynomial',esize=3,isize=3,rcut=4.,coeff=None,i
 
 
 def generate_kspace_jastrow(
-        kc1:    float | None = None,
-        kc2:    float | None = None,
-        nk1:    int          = 0,
-        nk2:    int          = 0,
-        *,
-        symm1:  str          = 'isotropic',
-        symm2:  str          = 'isotropic',
-        coeff1: list         = None,
-        coeff2: list         = None,
-        opt1:   bool | None  = None,
-        opt2:   bool | None  = None,
-        ):
+    kc1    : float | None = None,
+    kc2    : float | None = None,
+    nk1    : int          = 0,
+    nk2    : int          = 0,
+    *,
+    symm1  : str          = 'isotropic',
+    symm2  : str          = 'isotropic',
+    coeff1                = None,
+    coeff2                = None,
+    opt1                  = None,
+    opt2                  = None,
+    ) -> kspace_jastrow:
     """Generate ``<jastrow type="kSpace">``
 
     Parameters
@@ -8048,7 +8268,7 @@ def generate_kspace_jastrow(
 # end def generate_kspace_jastrow
 
 
-def count_jastrow_params(jastrows):
+def count_jastrow_params(jastrows: QIxml) -> int:
     if isinstance(jastrows,QIxml):
         jastrows = [jastrows]
     #end if
@@ -8081,15 +8301,15 @@ def count_jastrow_params(jastrows):
 
 
 def generate_energydensity(
-    name      = None,
-    dynamic   = None,
-    static    = None,
-    coord     = None,
-    grid      = None,
-    scale     = None,
-    ion_grids = None,
-    system    = None,
-    ):
+    name                                    = None,
+    dynamic                                 = None,
+    static                                  = None,
+    coord     : str | None                  = None,
+    grid      : tuple[int, int, int] | None = None,
+    scale                                   = None,
+    ion_grids                               = None,
+    system                                  = None,
+    ) -> energydensity:
     if dynamic is None:
         dynamic = 'e'
     #end if
@@ -8211,24 +8431,26 @@ def generate_energydensity(
 
 
 opt_map = dict(linear=linear,cslinear=cslinear,linear_batch=linear_batch)
-def generate_opt(method,
-                 *,
-                 repeat           = 1,
-                 energy           = None,
-                 rw_variance      = None,
-                 urw_variance     = None,
-                 params           = None,
-                 jastrows         = None,
-                 processes        = None,
-                 walkers_per_proc = None,
-                 threads          = None,
-                 blocks           = 2000,
-                 #steps            = 5,
-                 decorr           = 10,
-                 min_walkers      = None, #use e.g. 128 for gpu's
-                 timestep         = .5,
-                 nonlocalpp       = False,
-                 sample_factor    = 1.0):
+def generate_opt(
+    method,
+    *,
+    repeat           : int   = 1,
+    energy                   = None,
+    rw_variance              = None,
+    urw_variance             = None,
+    params                   = None,
+    jastrows                 = None,
+    processes                = None,
+    walkers_per_proc         = None,
+    threads                  = None,
+    blocks           : int   = 2000,
+    # steps            = 5,
+    decorr           : int   = 10,
+    min_walkers              = None,  #use e.g. 128 for gpu's
+    timestep         : float = .5,
+    nonlocalpp       : bool  = False,
+    sample_factor    : float = 1.0,
+    ) -> loop:
     if method not in opt_map:
         msg = 'section cannot be generated for optimization method '+method
         raise ValueError(msg)
@@ -8308,7 +8530,7 @@ def generate_opt(method,
 #end def generate_opt
 
 
-def generate_opts(opt_reqs,**kwargs):
+def generate_opts(opt_reqs, **kwargs) -> list:
     opts = []
     for opt_req in opt_reqs:
         opts.append(generate_opt(*opt_req,**kwargs))
@@ -8320,7 +8542,7 @@ def generate_opts(opt_reqs,**kwargs):
 
 
 # legacy driver defaults
-def set_optional(d,d2):
+def set_optional(d: obj, d2: obj) -> None:
     for k,v in d2.items():
         if k not in d:
             d[k] = v
@@ -8694,7 +8916,10 @@ del dmc_noJ_batched_defaults
 
 
 
-def generate_opt_calculations(driver,**kwargs):
+def generate_opt_calculations(
+    driver   : str,
+    **kwargs : bool | int | float | str | None,
+    ) -> list[loop]:
     if driver=='legacy':
         calcs = generate_legacy_opt_calculations(**kwargs)
     elif driver=='batched':
@@ -8710,7 +8935,10 @@ def generate_opt_calculations(driver,**kwargs):
 #end def generate_opt_calculations
 
 
-def generate_vmc_calculations(driver,**kwargs):
+def generate_vmc_calculations(
+    driver   : str,
+    **kwargs : bool | int | float | None,
+    ) -> list[vmc]:
     if driver=='legacy':
         calcs = generate_legacy_vmc_calculations(**kwargs)
     elif driver=='batched':
@@ -8726,7 +8954,10 @@ def generate_vmc_calculations(driver,**kwargs):
 #end def generate_vmc_calculations
 
 
-def generate_dmc_calculations(driver,**kwargs):
+def generate_dmc_calculations(
+    driver   : str,
+    **kwargs : bool | int | float | str | None,
+    ) -> list[QIxml]:
     if driver=='legacy':
         calcs = generate_legacy_dmc_calculations(**kwargs)
     elif driver=='batched':
@@ -8744,16 +8975,16 @@ def generate_dmc_calculations(driver,**kwargs):
 
 
 def generate_legacy_opt_calculations(
-    method     ,
-    cost       ,
-    cycles     ,
-    var_cycles ,
+    method          : str,
+    cost            : str,
+    cycles          : int,
+    var_cycles      : int,
     var_samples,
-    init_cycles,
+    init_cycles     : int,
     init_samples,
-    init_minwalkers,
-    **opt_inputs
-    ):
+    init_minwalkers : float,
+    **opt_inputs    : bool | int | float | str | None,
+    ) -> list[loop]:
 
     methods = obj(linear=linear,cslinear=cslinear)
     if method not in methods:
@@ -8844,18 +9075,18 @@ def generate_legacy_opt_calculations(
 
 
 def generate_legacy_vmc_calculations(
-        walkers    ,
-        warmupsteps,
-        blocks     ,
-        steps      ,
-        substeps   ,
-        timestep   ,
-        checkpoint ,
-        usedrift   ,
-        max_seconds,
-        spin_mass,
-        loc        = 'generate_vmc_calculations',
-        ):
+    walkers     : int,
+    warmupsteps : int,
+    blocks      : int,
+    steps       : int,
+    substeps    : int,
+    timestep    : float,
+    checkpoint  : int,
+    usedrift,
+    max_seconds,
+    spin_mass,
+    loc         : str = 'generate_vmc_calculations',
+    ) -> list[vmc]:
 
     vmc_calc = vmc(
         walkers     = walkers,
@@ -8885,38 +9116,38 @@ def generate_legacy_vmc_calculations(
 
 
 def generate_legacy_dmc_calculations(
-        warmupsteps            ,
-        blocks                 ,
-        steps                  ,
-        timestep               ,
-        checkpoint             ,
-        vmc_samples            ,
-        vmc_samplesperthread   ,
-        vmc_walkers            ,
-        vmc_warmupsteps        ,
-        vmc_blocks             ,
-        vmc_steps              ,
-        vmc_substeps           ,
-        vmc_timestep           ,
-        vmc_usedrift           ,
-        vmc_checkpoint         ,
-        vmc_spin_mass          ,
-        eq_dmc                 ,
-        eq_warmupsteps         ,
-        eq_blocks              ,
-        eq_steps               ,
-        eq_timestep            ,
-        eq_checkpoint          ,
-        ntimesteps             ,
-        timestep_factor        ,
-        nonlocalmoves          ,
-        branching_cutoff_scheme,
-        maxage                 ,
-        feedback               ,
-        sigmabound             ,
-        max_seconds            ,
-        spin_mass              ,
-        ):
+    warmupsteps             : int,
+    blocks                  : int,
+    steps                   : int,
+    timestep                : float,
+    checkpoint              : int,
+    vmc_samples             : int,
+    vmc_samplesperthread    : int | None,
+    vmc_walkers             : int | None,
+    vmc_warmupsteps         : int,
+    vmc_blocks              : int,
+    vmc_steps               : int,
+    vmc_substeps            : int,
+    vmc_timestep            : float,
+    vmc_usedrift,
+    vmc_checkpoint          : int,
+    vmc_spin_mass,
+    eq_dmc                  : bool,
+    eq_warmupsteps          : int,
+    eq_blocks               : int,
+    eq_steps                : int,
+    eq_timestep             : float,
+    eq_checkpoint           : int,
+    ntimesteps              : int,
+    timestep_factor         : float,
+    nonlocalmoves           : str,
+    branching_cutoff_scheme,
+    maxage,
+    feedback,
+    sigmabound,
+    max_seconds,
+    spin_mass,
+    ) -> list[QIxml]:
 
     if vmc_samples is None and vmc_samplesperthread is None and vmc_walkers is None:
         msg = (
@@ -9005,19 +9236,19 @@ def generate_legacy_dmc_calculations(
 
 
 def generate_batched_opt_calculations(
-        method     ,
-        cost       ,
-        cycles     ,
-        var_cycles ,
-        var_samples,
-        init_cycles,
-        init_samples,
-        init_steps,
-        init_minwalkers,
-        init_line_search,
-        init_sr_tau,
-        **opt_inputs
-        ):
+    method           : str,
+    cost,
+    cycles           : int,
+    var_cycles       : int,
+    var_samples,
+    init_cycles      : int,
+    init_samples,
+    init_steps,
+    init_minwalkers  : float,
+    init_line_search : bool,
+    init_sr_tau      : float,
+    **opt_inputs     : bool | int | float | str | None,
+    ) -> list[loop]:
 
     opt_inputs = obj(opt_inputs)
     has = obj(
@@ -9158,19 +9389,19 @@ def generate_batched_opt_calculations(
 
 
 def generate_batched_vmc_calculations(
-        total_walkers    ,
-        walkers_per_rank ,
-        warmupsteps      ,
-        blocks           ,
-        steps            ,
-        substeps         ,
-        timestep         ,
-        usedrift         ,
-        checkpoint       ,
-        maxcpusecs       ,
-        crowds           ,
-        spin_mass        ,
-        ):
+    total_walkers,
+    walkers_per_rank : int | None,
+    warmupsteps      : int,
+    blocks           : int,
+    steps            : int,
+    substeps         : int,
+    timestep         : float,
+    usedrift         : bool,
+    checkpoint,
+    maxcpusecs,
+    crowds,
+    spin_mass,
+    ) -> list[vmc]:
 
     if total_walkers is not None and walkers_per_rank is not None:
         msg = 'Only one of "total_walkers" and "walkers_per_rank" may be provided.'
@@ -9207,40 +9438,40 @@ def generate_batched_vmc_calculations(
 
 
 def generate_batched_dmc_calculations(
-        total_walkers          ,
-        walkers_per_rank       ,
-        warmupsteps            ,
-        blocks                 ,
-        steps                  ,
-        substeps               ,
-        timestep               ,
-        checkpoint             ,
-        vmc_warmupsteps        ,
-        vmc_blocks             ,
-        vmc_steps              ,
-        vmc_substeps           ,
-        vmc_timestep           ,
-        vmc_usedrift           ,
-        vmc_checkpoint         ,
-        vmc_spin_mass          ,
-        eq_dmc                 ,
-        eq_warmupsteps         ,
-        eq_blocks              ,
-        eq_steps               ,
-        eq_timestep            ,
-        eq_checkpoint          ,
-        ntimesteps             ,
-        timestep_factor        ,
-        nonlocalmoves          ,
-        branching_cutoff_scheme,
-        crowd_serialize_walkers,
-        crowds                 ,
-        reconfiguration        ,
-        maxage                 ,
-        feedback               ,
-        sigmabound             ,
-        spin_mass              ,
-        ):
+    total_walkers,
+    walkers_per_rank        : int,
+    warmupsteps             : int,
+    blocks                  : int,
+    steps                   : int,
+    substeps,
+    timestep                : float,
+    checkpoint,
+    vmc_warmupsteps         : int,
+    vmc_blocks              : int,
+    vmc_steps               : int,
+    vmc_substeps            : int,
+    vmc_timestep            : float,
+    vmc_usedrift            : bool,
+    vmc_checkpoint,
+    vmc_spin_mass,
+    eq_dmc                  : bool,
+    eq_warmupsteps          : int,
+    eq_blocks               : int,
+    eq_steps                : int,
+    eq_timestep             : float,
+    eq_checkpoint,
+    ntimesteps              : int,
+    timestep_factor         : float,
+    nonlocalmoves           : str,
+    branching_cutoff_scheme,
+    crowd_serialize_walkers,
+    crowds,
+    reconfiguration,
+    maxage,
+    feedback,
+    sigmabound,
+    spin_mass,
+    ) -> list[QIxml]:
 
     if total_walkers is None and walkers_per_rank is None:
         total_walkers = 2048
@@ -9328,7 +9559,7 @@ def generate_batched_dmc_calculations(
 
 
 
-def generate_qmcpack_input(**kwargs):
+def generate_qmcpack_input(**kwargs) -> QmcpackInput | None:
     QIcollections.clear()
     selector = kwargs.pop('input_type','basic')
     if selector=='basic':
@@ -9346,7 +9577,7 @@ def generate_qmcpack_input(**kwargs):
 
 
 
-def read_jastrows(filepath):
+def read_jastrows(filepath) -> list | None:
     qi = QmcpackInput(filepath)
     qi.pluralize()
     jastrows = qi.get('jastrows')
@@ -9441,7 +9672,7 @@ gen_basic_input_defaults = obj(
     qmc              = None,     # opt,vmc,vmc_test,dmc,dmc_test
     )
 
-def generate_basic_input(**kwargs):
+def generate_basic_input(**kwargs) -> QmcpackInput | None:
     # capture inputs
     kw = obj(kwargs)
     # apply general defaults
@@ -9935,7 +10166,7 @@ gen_basic_afqmc_input_defaults = obj(
     run_path    = None,
     )
 
-def generate_basic_afqmc_input(**kwargs):
+def generate_basic_afqmc_input(**kwargs) -> QmcpackInput:
     # capture inputs
     kw = obj(kwargs)
     gen_info = obj()
@@ -9997,7 +10228,7 @@ def generate_basic_afqmc_input(**kwargs):
         kw.ham_file = 'MISSING.h5'
         kw.wfn_file = 'MISSING.h5'
     #end if
-    def get_filetype(filename,loc):
+    def get_filetype(filename: str, loc: str) -> str:
         if filename.endswith('.h5'):
             filetype = 'hdf5'
         else:
@@ -10101,35 +10332,37 @@ def generate_basic_afqmc_input(**kwargs):
 
 
 
-def generate_opt_jastrow_input(id  = 'qmc',
-                               *,
-                               series           = 0,
-                               purpose          = '',
-                               seed             = None,
-                               bconds           = None,
-                               remove_cell      = False,
-                               meshfactor       = 1.0,
-                               precision        = 'float',
-                               twistnum         = None,
-                               twist            = None,
-                               spin_polarized   = False,
-                               orbitals_h5      = 'MISSING.h5',
-                               system           = None,
-                               pseudos          = None,
-                               jastrows         = 'generateJ12',
-                               corrections      = None,
-                               observables      = None,
-                               processes        = None,
-                               walkers_per_proc = None,
-                               threads          = None,
-                               decorr           = 10,
-                               min_walkers      = None, #use e.g. 128 for gpu's
-                               timestep         = 0.5,
-                               nonlocalpp       = False,
-                               sample_factor    = 1.0,
-                               opt_calcs        = None,
-                               det_format       = 'new',
-                               nrule            = None):
+def generate_opt_jastrow_input(
+    id               : str   = 'qmc',
+    *,
+    series           : int   = 0,
+    purpose          : str   = '',
+    seed                     = None,
+    bconds                   = None,
+    remove_cell      : bool  = False,
+    meshfactor       : float = 1.0,
+    precision        : str   = 'float',
+    twistnum                 = None,
+    twist                    = None,
+    spin_polarized   : bool  = False,
+    orbitals_h5      : str   = 'MISSING.h5',
+    system                   = None,
+    pseudos                  = None,
+    jastrows         : str   = 'generateJ12',
+    corrections              = None,
+    observables              = None,
+    processes                = None,
+    walkers_per_proc         = None,
+    threads                  = None,
+    decorr           : int   = 10,
+    min_walkers              = None,  #use e.g. 128 for gpu's
+    timestep         : float = 0.5,
+    nonlocalpp       : bool  = False,
+    sample_factor    : float = 1.0,
+    opt_calcs                = None,
+    det_format       : str   = 'new',
+    nrule                    = None,
+    ) -> QmcpackInput:
     jastrows = generate_jastrows(jastrows,system)
 
     if opt_calcs is None:

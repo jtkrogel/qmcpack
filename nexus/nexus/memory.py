@@ -25,12 +25,14 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 
 _scale = {'kB': 1024.0, 'mB': 1024.0*1024.0,
           'KB': 1024.0, 'MB': 1024.0*1024.0}
 
-def _VmB(VmKey, pid=None):
+def _VmB(VmKey: str, pid: int | None = None) -> float:
     '''Private.
     '''
     global _scale
@@ -56,7 +58,7 @@ def _VmB(VmKey, pid=None):
      # convert Vm value to bytes
     return float(v[1]) * _scale[v[2]]
 
-def get_children(pid):
+def get_children(pid: int) -> list[int]:
     proc_children = '/proc/%d/task/%d/children'%(pid,pid)
     try:
         with open(proc_children,'r') as t:
@@ -68,7 +70,7 @@ def get_children(pid):
     return children
 
 
-def all_children(pid=None):
+def all_children(pid: int | None = None) -> list[int]:
     if not pid:
         pid = os.getpid()
 
@@ -80,7 +82,11 @@ def all_children(pid=None):
     return all_list
 
 
-def memory(since=0.0, *, children=False):
+def memory(
+    since    : float = 0.0,
+    *,
+    children : bool  = False,
+    ) -> float:
     '''Return memory usage in bytes.
     '''
     mem = 0.0
@@ -91,7 +97,11 @@ def memory(since=0.0, *, children=False):
     return mem
 
 
-def resident(since=0.0, *, children=False):
+def resident(
+    since    : float = 0.0,
+    *,
+    children : bool  = False,
+    ) -> float:
     '''Return resident memory usage in bytes.
     '''
     mem = 0.0
@@ -104,7 +114,11 @@ def resident(since=0.0, *, children=False):
     #return _VmB('VmRSS:') - since
 
 
-def stacksize(since=0.0, *, children=False):
+def stacksize(
+    since    : float = 0.0,
+    *,
+    children : bool  = False,
+    ) -> float:
     '''Return stack size in bytes.
     '''
     mem = 0.0

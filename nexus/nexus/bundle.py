@@ -26,6 +26,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 from .machines import Workstation,Job
 from .simulation import Simulation,NullSimulationInput,NullSimulationAnalyzer
 
@@ -48,7 +50,7 @@ class SimulationBundle(Simulation):
 
     is_bundle = True
 
-    def __init__(self,*sims,**kwargs):
+    def __init__(self, *sims: list[int], **kwargs: str) -> None:
         if len(sims)==1 and isinstance(sims[0],list):
             sims = sims[0]
         #end if
@@ -126,7 +128,7 @@ class SimulationBundle(Simulation):
     ##end def init_job
 
 
-    def bundle_dependencies(self):
+    def bundle_dependencies(self) -> None:
         deps = []
         sim_ids = set()
         depsim_ids = set()
@@ -170,7 +172,12 @@ class SimulationBundle(Simulation):
     #end def bundle_dependencies
 
 
-    def bundle_jobs(self,*,relative=False,serial=False):
+    def bundle_jobs(
+        self,
+        *,
+        relative : bool = False,
+        serial   : bool = False,
+        ) -> None:
         jobs        = []
         job0        = self.sims[0].job
         time        = Job.zero_time()
@@ -252,7 +259,7 @@ class SimulationBundle(Simulation):
     #end def bundle_jobs
 
 
-    def completed(self):
+    def completed(self) -> bool:
         bsims_comp = True
         for sim in self.sims:
             bsims_comp &= sim.completed()
@@ -261,7 +268,7 @@ class SimulationBundle(Simulation):
     #end def completed
 
 
-    def check_allowed(self,indicator):
+    def check_allowed(self, indicator) -> bool:
         allowed = True
         for sim in self.sims:
             allowed &= sim[indicator]
@@ -270,7 +277,7 @@ class SimulationBundle(Simulation):
     #end def check_allowed
 
 
-    def progress(self,dependency_id=None):
+    def progress(self, dependency_id = None) -> None:
         if dependency_id is not None and dependency_id in self.wait_ids:
             self.wait_ids.remove(dependency_id)
         #end if
@@ -312,31 +319,31 @@ class SimulationBundle(Simulation):
     #end def progress
 
 
-    def create_directories(self,*args,**kwargs):
+    def create_directories(self, *args, **kwargs) -> None:
         if self.allow_create_directories:
             Simulation.create_directories(self,*args,**kwargs)
         #end if
     #end def create_directories
 
-    def get_dependencies(self,*args,**kwargs):
+    def get_dependencies(self, *args, **kwargs) -> None:
         if self.allow_get_dependencies:
             Simulation.get_dependencies(self,*args,**kwargs)
         #end if
     #end def get_dependencies
 
-    def write_inputs(self,*args,**kwargs):
+    def write_inputs(self, *args, **kwargs) -> None:
         if self.allow_write_inputs:
             Simulation.write_inputs(self,*args,**kwargs)
         #end if
     #end def write_inputs
 
-    def send_files(self,*args,**kwargs):
+    def send_files(self, *args, **kwargs) -> None:
         if self.allow_send_files:
             Simulation.send_files(self,*args,**kwargs)
         #end if
     #end def send_files
 
-    def submit(self,*args,**kwargs):
+    def submit(self, *args, **kwargs) -> None:
         if self.allow_submit:
             Simulation.submit(self,*args,**kwargs)
             if self.job.finished:
@@ -347,7 +354,7 @@ class SimulationBundle(Simulation):
         #end if
     #end def submit
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         finished = True
         for sim in self.sims:
             finished = finished and sim.finished
@@ -355,31 +362,31 @@ class SimulationBundle(Simulation):
         self.finished = finished
     #end def check_sim_status
 
-    def get_output(self,*args,**kwargs):
+    def get_output(self, *args, **kwargs) -> None:
         if self.allow_get_output:
             Simulation.get_output(self,*args,**kwargs)
         #end if
     #end def get_output
 
-    def analyze(self,*args,**kwargs):
+    def analyze(self, *args, **kwargs) -> None:
         if self.allow_analyze:
             Simulation.analyze(self,*args,**kwargs)
         #end if
     #end def analyze
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         return list()
     #end def get_output_files
 
 
-    def app_command(self):
+    def app_command(self) -> None:
         return None
     #end def app_command
 #end class SimulationBundle
 
 
 
-def bundle(*sims,**kwargs):
+def bundle(*sims: list[int], **kwargs: str) -> SimulationBundle | None:
     return SimulationBundle(*sims,**kwargs)
 #end def bundle

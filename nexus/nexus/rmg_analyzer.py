@@ -3,6 +3,8 @@
 ##################################################################
 
 
+from __future__ import annotations
+
 import os
 import re
 from copy import deepcopy
@@ -21,8 +23,11 @@ from .structure import generate_structure
 from .unit_converter import UnitConverter, convert
 from .utilities import path_string
 
+from pathlib import Path
 
-def as_float(text):
+
+
+def as_float(text: str) -> float | None:
     """Convert a finite RMG-formatted number to a float when possible."""
     try:
         value = float(text.lower().replace('d','e'))
@@ -32,13 +37,13 @@ def as_float(text):
 #end def as_float
 
 
-def normalize_line(line):
+def normalize_line(line: str) -> str:
     """Collapse whitespace in an output line."""
     return ' '.join(line.split())
 #end def normalize_line
 
 
-def line_numbers(line):
+def line_numbers(line: str) -> np.ndarray:
     """Return all finite, whitespace-delimited RMG numbers in a line."""
     values = []
     for token in line.replace(',',' ').split():
@@ -161,7 +166,7 @@ class RmgOutData(DevBase):
     number_pattern = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?'
 
 
-    def __init__(self,filepath,input=None):
+    def __init__(self, filepath: str | Path, input = None) -> None:
         """Initialize the parsed data by reading an RMG output file."""
         if isinstance(filepath,os.PathLike):
             filepath = path_string(filepath)
@@ -264,7 +269,7 @@ class RmgOutData(DevBase):
     #end def __init__
 
 
-    def read_setup_info(self,lines):
+    def read_setup_info(self, lines: list[str]) -> None:
         """Read setup sections, the run mode, and the initial structure.
 
         Binds ``setup_info`` to an ``obj`` containing normalized setup blocks
@@ -286,7 +291,7 @@ class RmgOutData(DevBase):
         self.setup_info = setup_info
         position_heading = 'initial ionic positions and displacements'
 
-        def process_name(text):
+        def process_name(text: str) -> str:
             """Convert an RMG setup label to a normalized member name."""
             # Parenthetical annotations can occur inside a label with meaningful
             # text on either side. Delimiter splitting would discard one side,
@@ -704,7 +709,7 @@ class RmgOutData(DevBase):
         self.setup_info = setup_info
     #end def read_setup_info
 
-    def read_convergence(self,lines):
+    def read_convergence(self, lines: list[str]) -> None:
         """Read electronic and ionic convergence messages.
 
         Binds ``convergence`` to an ``obj`` containing nullable status values
@@ -764,7 +769,7 @@ class RmgOutData(DevBase):
     #end def read_convergence
 
 
-    def read_timing(self,lines):
+    def read_timing(self, lines: list[str]) -> None:
         """Read total, per-step, and section-resolved timing information.
 
         Binds ``timing`` to an ``obj`` measured in seconds, with individual
@@ -816,7 +821,7 @@ class RmgOutData(DevBase):
     #end def read_timing
 
 
-    def read_energies(self,lines):
+    def read_energies(self, lines: list[str]) -> None:
         """Read eigenvalue-sum and direct total-energy histories.
 
         Binds ``energies`` to an ``obj`` containing the history arrays and
@@ -881,7 +886,7 @@ class RmgOutData(DevBase):
     #end def read_energies
 
 
-    def read_scf(self,lines):
+    def read_scf(self, lines: list[str]) -> None:
         """Read SCF energy components, iteration indices, residuals, and times.
 
         Binds ``scf`` to an ``obj`` containing NumPy histories. Energies are
@@ -989,7 +994,7 @@ class RmgOutData(DevBase):
     #end def read_scf
 
 
-    def read_ions(self,lines):
+    def read_ions(self, lines: list[str]) -> None:
         """Read ionic records, cells, and trajectory-level structures."""
         records,structures = self.read_ion_records(
             lines,
@@ -1044,7 +1049,7 @@ class RmgOutData(DevBase):
     #end def read_ions
 
 
-    def read_stress(self,lines):
+    def read_stress(self, lines: list[str]) -> None:
         """Parse stress tensors and derive hydrostatic pressures.
 
         Binds ``stress`` to an ``obj`` containing tensor and pressure histories,
@@ -1097,7 +1102,7 @@ class RmgOutData(DevBase):
     #end def read_stress
 
 
-    def read_electronic(self,lines):
+    def read_electronic(self, lines: list[str]) -> None:
         """Parse electronic quantities exposed by ``RmgAnalyzer``.
 
         Binds ``electronic`` to an ``obj`` containing Fermi energies, band
@@ -1110,7 +1115,7 @@ class RmgOutData(DevBase):
         lines : list of str
             Complete RMG log split into lines.
         """
-        def assigned_value(text,lower,*labels):
+        def assigned_value(text: str, lower: str, *labels) -> float | None:
             """Return a numeric value following a labeled assignment."""
             for label in labels:
                 index = lower.find(label)
@@ -1332,7 +1337,7 @@ class RmgOutData(DevBase):
     #end def read_electronic
 
 
-    def read_md(self,lines):
+    def read_md(self, lines: list[str]) -> None:
         """Read molecular-dynamics records and compute summary statistics."""
         records = []
         for line in lines:
@@ -1372,7 +1377,7 @@ class RmgOutData(DevBase):
     #end def read_md
 
 
-    def read_band(self):
+    def read_band(self) -> None:
         """Read spin-resolved band structures from companion data files."""
         prefix  = self.outfile_name.removesuffix('.log')
         pattern = os.path.join(
@@ -1424,7 +1429,7 @@ class RmgOutData(DevBase):
     #end def read_band
 
 
-    def read_tddft(self):
+    def read_tddft(self) -> None:
         """Read TDDFT energy and spin-resolved dipole time series."""
         prefix       = self.outfile_name.removesuffix('.log')
         energy_file  = os.path.join(self.path,prefix+'_totalE')
@@ -1510,14 +1515,14 @@ class RmgOutData(DevBase):
     #end def read_tddft
 
 
-    def read_neb(self,lines):
+    def read_neb(self, lines: list[str]) -> None:
         """Read NEB controller, path, energy, and final-image data.
 
         Final reported image geometries are collected in ``final_images`` in
         path order. Its position and cell arrays are in bohr and remain ``None``
         unless every image supplies compatible data.
         """
-        def read_assignments(filepath):
+        def read_assignments(filepath: str) -> dict[str, str]:
             """Read quoted, possibly multiline controller assignments."""
             values = {}
             with open(filepath,'r') as control_file:
@@ -1553,7 +1558,7 @@ class RmgOutData(DevBase):
             return values
         #end def read_assignments
 
-        def as_int(value):
+        def as_int(value: str) -> int | None:
             """Convert a controller value to an integer when possible."""
             try:
                 return int(value)
@@ -1561,7 +1566,7 @@ class RmgOutData(DevBase):
                 return None
         #end def as_int
 
-        def final_energy(filepath):
+        def final_energy(filepath: str) -> float | None:
             """Return the last final eigenvalue-sum energy in Hartree."""
             value = None
             units = None
@@ -1949,7 +1954,7 @@ class RmgOutData(DevBase):
     #end def read_neb
 
 
-    def read_produced_files(self):
+    def read_produced_files(self) -> None:
         """Locate recognized files produced by EXX, STM, and SCF runs.
 
         Binds ``produced_files`` to an ``obj`` containing the QMCPACK restart
@@ -1988,14 +1993,18 @@ class RmgOutData(DevBase):
         if len(produced_files)>0:
             self.produced_files = produced_files
     #end def read_produced_files
-    def read_cell_events(self,lines,initial_structure=None):
+    def read_cell_events(
+        self,
+        lines             : list[str],
+        initial_structure = None,
+        ) -> list[int | float | str | tuple[int, np.ndarray]]:
         """Return line-indexed lattice cells reported in an RMG output."""
         events        = []
         pending       = {}
         pending_units = 'B'
         row_mode      = False
 
-        def set_units(text):
+        def set_units(text: str) -> str | None:
             """Return cell units identified in a heading or row."""
             lower = text.lower()
             if 'angstrom' in lower:
@@ -2005,7 +2014,7 @@ class RmgOutData(DevBase):
             return None
         #end def set_units
 
-        def add_cell(index):
+        def add_cell(index: int) -> None:
             """Add a complete pending cell in bohr."""
             nonlocal pending
             if set(pending)!={0,1,2}:
@@ -2074,7 +2083,11 @@ class RmgOutData(DevBase):
     #end def read_cell_events
 
 
-    def read_ion_records(self,lines,initial_structure=None):
+    def read_ion_records(
+        self,
+        lines             : list[str],
+        initial_structure = None,
+        ) -> tuple[str | list[obj | np.float64] | np.ndarray, str | obj]:
         """Return ionic records and structures without binding analyzer data."""
         records     = []
         structures  = obj()
@@ -2313,7 +2326,7 @@ class RmgAnalyzer(SimulationAnalyzer):
         })
 
 
-    def _require_analyzed(self,quantity):
+    def _require_analyzed(self, quantity: str) -> None:
         """Require completed analysis unless a private query is in progress."""
         if self._query_depth>0:
             return
@@ -2323,7 +2336,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def _require_analyzed
 
 
-    def _unavailable(self,quantity,modes):
+    def _unavailable(self, quantity: str, modes: frozenset[str]) -> None:
         """Apply unsupported and required-quantity policy to absent data."""
         if self._query_depth>0:
             return
@@ -2336,7 +2349,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def _unavailable
 
 
-    def _query_value(self,quantity,*args):
+    def _query_value(self, quantity: str, *args: int | str):
         """Return a query value without applying public missing-data policy."""
         self._query_depth += 1
         try:
@@ -2346,7 +2359,10 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def _query_value
 
 
-    def _validate_quantities(self,quantities):
+    def _validate_quantities(
+        self,
+        quantities : tuple[str | None] | tuple[str, str],
+        ) -> tuple[str | None] | tuple[str, str] | None:
         """Validate quantity names atomically and return them as a tuple."""
         names = tuple(quantities)
         unknown = [
@@ -2361,7 +2377,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def _validate_quantities
 
 
-    def require(self,*quantities):
+    def require(self, *quantities: str) -> None:
         """Add query quantities to the required-data policy.
 
         Parameters
@@ -2383,7 +2399,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def require
 
 
-    def available(self,*quantities):
+    def available(self, *quantities: str | None) -> bool | None:
         """Return whether all named query quantities are available.
 
         Parameters
@@ -2416,7 +2432,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def available
 
 
-    def initial_structure(self,units='A'):
+    def initial_structure(self, units: str = 'A'):
         """Return the initial structure.
 
         Parameters
@@ -2441,7 +2457,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def initial_structure
 
 
-    def energy(self,units='Ha'):
+    def energy(self, units: str = 'Ha') -> float | None:
         """Return the final total energy.
 
         Parameters
@@ -2472,7 +2488,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def energy
 
 
-    def kpoints(self,units='B'):
+    def kpoints(self, units: str = 'B') -> np.ndarray | None:
         """Return Cartesian k-points.
 
         Parameters
@@ -2501,7 +2517,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def kpoints
 
 
-    def kweights(self):
+    def kweights(self) -> np.ndarray | None:
         """Return k-point integration weights.
 
         Returns
@@ -2517,7 +2533,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def kweights
 
 
-    def eigenvalues(self,units='eV'):
+    def eigenvalues(self, units: str = 'eV') -> np.ndarray | None:
         """Return Kohn--Sham eigenvalues.
 
         Parameters
@@ -2560,7 +2576,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def eigenvalues
 
 
-    def occupations(self):
+    def occupations(self) -> np.ndarray | None:
         """Return Kohn--Sham occupations.
 
         Returns
@@ -2577,7 +2593,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def occupations
 
 
-    def Ef(self,units='eV'):
+    def Ef(self, units: str = 'eV') -> float | None:
         """Return the final Fermi energy.
 
         Parameters
@@ -2601,7 +2617,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def Ef
 
 
-    def Evbm(self,units='eV'):
+    def Evbm(self, units: str = 'eV') -> float | None:
         """Return the valence-band maximum.
 
         Parameters
@@ -2625,7 +2641,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def Evbm
 
 
-    def Ecbm(self,units='eV'):
+    def Ecbm(self, units: str = 'eV') -> float | None:
         """Return the conduction-band minimum.
 
         Parameters
@@ -2649,7 +2665,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def Ecbm
 
 
-    def band_gap(self,units='eV'):
+    def band_gap(self, units: str = 'eV') -> float | None:
         """Return the final band gap.
 
         Parameters
@@ -2673,7 +2689,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def band_gap
 
 
-    def fractional_occs(self,tol=1e-3):
+    def fractional_occs(self, tol: float = 1e-3) -> bool | None:
         """Determine whether any occupation is fractional.
 
         Parameters
@@ -2707,7 +2723,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def fractional_occs
 
 
-    def relaxed_structure(self,units='A'):
+    def relaxed_structure(self, units: str = 'A'):
         """Return the final ionic structure.
 
         Parameters
@@ -2737,7 +2753,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def relaxed_structure
 
 
-    def forces(self,units='eV/A'):
+    def forces(self, units: str = 'eV/A') -> np.ndarray | None:
         """Return final ionic forces.
 
         Parameters
@@ -2770,7 +2786,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def forces
 
 
-    def stress(self,units='GPa'):
+    def stress(self, units: str = 'GPa') -> np.ndarray | None:
         """Return the final stress tensor.
 
         Parameters
@@ -2798,7 +2814,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def stress
 
 
-    def pressure(self,units='GPa'):
+    def pressure(self, units: str = 'GPa') -> float | None:
         """Return final hydrostatic pressure.
 
         Parameters
@@ -2823,7 +2839,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def pressure
 
 
-    def _empty_results(self):
+    def _empty_results(self) -> obj:
         """Return an empty result container for permissive file handling."""
         return obj(
             setup_info = obj(
@@ -2850,7 +2866,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def _empty_results
 
 
-    def _input_file(self):
+    def _input_file(self) -> tuple:
         """Resolve an explicitly requested RMG input file."""
         if isinstance(self.input,RmgInput):
             return None,'parsed'
@@ -2874,7 +2890,9 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def _input_file
 
 
-    def _output_file(self):
+    def _output_file(
+        self,
+        ) -> tuple[float | str | list[str] | np.float64 | np.ndarray | None, str]:
         """Resolve the RMG log-output file."""
         if self.path is None:
             return None,'missing'
@@ -2898,14 +2916,14 @@ class RmgAnalyzer(SimulationAnalyzer):
 
     def __init__(
         self,
-        input        = None,
-        outfile      = None,
+        input    : str | RmgInput | None = None,
+        outfile  : str | Path | None     = None,
         *,
-        analyze      = False,
-        path         = None,
-        strict       = True,
-        required     = None,
-        ):
+        analyze  : bool                  = False,
+        path     : str | Path | None     = None,
+        strict   : bool | int            = True,
+        required : int | str | None      = None,
+        ) -> None:
         """Initialize an RMG output analyzer.
 
         Parameters
@@ -3013,7 +3031,7 @@ class RmgAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         """Parse the configured RMG output into an ``RmgOutData`` instance."""
         self.results        = None
         self.run_mode       = None

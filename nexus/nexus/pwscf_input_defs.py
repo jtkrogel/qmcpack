@@ -42,14 +42,14 @@ class NamelistEnumBase(NamelistParamDefinition, Enum):
     """
     def __new__(
         cls,
-        input_name:      str,
-        datatype:        type[PwscfInputType],
-        required:        bool,  # noqa: FBT001
-        shape:           tuple | None = None,
-        allowed_values:  tuple[PwscfInputType] | None = None,
-        version_added:   str | None = None,
-        version_removed: str | None = None,
-    ):
+        input_name      : str,
+        datatype        : type[bool | int | float | str],
+        required        : bool,  # noqa: FBT001
+        shape                          = None,
+        allowed_values  : tuple | None = None,
+        version_added   : str | None   = None,
+        version_removed : str | None   = None,
+        ) -> NamelistEnumBase:
         definition = NamelistParamDefinition.__new__(cls)
         definition._value_ = NamelistParamDefinition(
             input_name,
@@ -64,7 +64,7 @@ class NamelistEnumBase(NamelistParamDefinition, Enum):
     #end def __new__
 
     @classmethod
-    def _missing_(cls, value):
+    def _missing_(cls, value: str):
         """Strip leading/trailing whitespace, and make lowercase."""
         val = value.strip().lower()
         if val == "lambda":

@@ -17,6 +17,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from .developer import obj, NexusError
@@ -47,7 +49,7 @@ class QuantumPackage(Simulation):
         )
 
     @staticmethod
-    def settings(qprc=None):
+    def settings(qprc = None) -> None:
         # path to quantum_package.rc file
         if isinstance(qprc, Path):
             QuantumPackage.qprc = str(qprc.resolve())
@@ -74,17 +76,17 @@ class QuantumPackage(Simulation):
     #end def settings
 
     @staticmethod
-    def restore_default_settings():
+    def restore_default_settings() -> None:
         QuantumPackage.qprc = None
     #end def restore_default_settings
 
-    def pre_init(self):
+    def pre_init(self) -> None:
         prefix = self.input.run_control.prefix
         self.infile = prefix + self.infile_extension
     #end def pre_init
 
 
-    def post_init(self):
+    def post_init(self) -> None:
         qprc = QuantumPackage.qprc
         if qprc is None:
             msg = (
@@ -97,7 +99,7 @@ class QuantumPackage(Simulation):
     #end def post_init
 
 
-    def write_prep(self):
+    def write_prep(self) -> None:
         # write an ascii representation of the input changes
         infile = self.identifier+'.in'
         infile = os.path.join(self.locdir,infile)
@@ -160,7 +162,7 @@ class QuantumPackage(Simulation):
     #end def write_prep
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         calculating_result = False
         rc = self.input.run_control
         if result_name=='orbitals':
@@ -171,7 +173,7 @@ class QuantumPackage(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj | None:
         result = obj()
         rc = self.input.run_control
         if result_name=='orbitals':
@@ -195,7 +197,12 @@ class QuantumPackage(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         not_implemented = False
         if isinstance(sim,Gamess):
             if result_name=='orbitals':
@@ -233,12 +240,12 @@ class QuantumPackage(Simulation):
     #end def incorporate_result
 
 
-    def attempt_files(self):
+    def attempt_files(self) -> tuple:
         return (self.outfile,self.errfile)
     #end def attempt_files
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         # get the run type
         input = self.input
         rc = self.input.run_control
@@ -278,13 +285,13 @@ class QuantumPackage(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
 
-    def get_slave(self):
+    def get_slave(self) -> str | None:
         rc = self.input.run_control
         sp = QuantumPackage.slave_partners
         slave = None
@@ -297,7 +304,7 @@ class QuantumPackage(Simulation):
     #end def get_slave
 
 
-    def app_command(self):
+    def app_command(self) -> str:
 
         # get run controls
         input = self.input
@@ -429,7 +436,7 @@ class QuantumPackage(Simulation):
 
 
 
-def generate_quantum_package(**kwargs):
+def generate_quantum_package(**kwargs) -> QuantumPackage:
     sim_args,inp_args = QuantumPackage.separate_inputs(kwargs)
 
     if 'input' not in sim_args:
@@ -446,4 +453,3 @@ def generate_quantum_package(**kwargs):
 
     return qp
 #end def generate_quantum_package
-

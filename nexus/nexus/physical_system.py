@@ -17,6 +17,8 @@
 #                                                                    #
 #====================================================================#
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from copy import deepcopy
@@ -30,7 +32,13 @@ class PhysicalSystem(DevBase):
 
     ghost_aliases = ("Xx",)
 
-    def __init__(self,structure=None,net_charge=0,net_spin=0,**valency):
+    def __init__(
+        self,
+        structure  : Structure | None  = None,
+        net_charge : int | float       = 0,
+        net_spin   : int | float | str = 0,
+        **valency  : bool | int | float | str,
+        ) -> None:
         self.pseudized = False
         if structure is None:
             self.structure = Structure()
@@ -92,7 +100,7 @@ class PhysicalSystem(DevBase):
     #end def __init__
 
 
-    def pseudize(self,**valency):
+    def pseudize(self, **valency: bool | int | float | str) -> None:
         for ion in valency.keys():
             if ion not in self.ion_labels:
                 msg = ion+' is not in the physical system'
@@ -103,7 +111,12 @@ class PhysicalSystem(DevBase):
     #end def pseudize
 
 
-    def check_folded_system(self,*,exit=True,message=False):
+    def check_folded_system(
+        self,
+        *,
+        exit    : bool = True,
+        message : bool = False,
+        ) -> bool | tuple[bool | str, str | Elements]:
         msg = ''
         sys_folded    = self.folded_system is not None
         struct_folded = self.structure.folded_structure is not None
@@ -132,7 +145,13 @@ class PhysicalSystem(DevBase):
     #end def check_folded_system
 
 
-    def check_consistent(self,tol=1e-8,*,exit=True,message=False):
+    def check_consistent(
+        self,
+        tol     : float = 1e-8,
+        *,
+        exit    : bool  = True,
+        message : bool  = False,
+        ) -> bool | tuple[bool | int | str, bool | int | str | Elements]:
         fs,fm = self.check_folded_system(exit=False,message=True)
         cs,cm = self.structure.check_consistent(tol,exit=False,message=True)
         msg = ''
@@ -154,12 +173,12 @@ class PhysicalSystem(DevBase):
     #end def check_consistent
 
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return self.check_consistent(exit=False)
     #end def is_valid
 
 
-    def change_units(self,units):
+    def change_units(self, units: str) -> None:
         self.structure.change_units(units,folded=False)
         if self.folded_system is not None:
             self.folded_system.change_units(units)
@@ -167,7 +186,7 @@ class PhysicalSystem(DevBase):
     #end def change_units
 
 
-    def group_atoms(self):
+    def group_atoms(self) -> None:
         self.structure.group_atoms(folded=False)
         if self.folded_system is not None:
             self.folded_system.group_atoms()
@@ -175,7 +194,12 @@ class PhysicalSystem(DevBase):
     #end def group_atoms
 
 
-    def rename(self,*,folded=True,**name_pairs):
+    def rename(
+        self,
+        *,
+        folded       : bool = True,
+        **name_pairs : int | str,
+        ) -> None:
         self.structure.rename(folded=False,**name_pairs)
         if self.pseudized:
             for old,new in name_pairs.items():
@@ -203,7 +227,7 @@ class PhysicalSystem(DevBase):
     #end def copy
 
 
-    def load(self,filepath):
+    def load(self, filepath: Path) -> None:
         DevBase.load(self,filepath)
         if self.folded_system is not None and self.structure.folded_structure is not None:
             del self.folded_system.structure
@@ -212,7 +236,7 @@ class PhysicalSystem(DevBase):
     #end def load
 
 
-    def tile(self,*td,**kwargs):
+    def tile(self, *td: list[list[int]], **kwargs) -> PhysicalSystem:
         extensive = True
         net_spin  = None
         if 'extensive' in kwargs:
@@ -248,23 +272,23 @@ class PhysicalSystem(DevBase):
     #end def tile
 
 
-    def has_folded(self):
+    def has_folded(self) -> bool:
         return self.folded_system is not None
     #end def has_folded
 
 
-    def remove_folded_system(self):
+    def remove_folded_system(self) -> None:
         self.folded_system = None
         self.structure.remove_folded_structure()
     #end def remove_folded_system
 
 
-    def remove_folded(self):
+    def remove_folded(self) -> None:
         self.remove_folded_system()
     #end def remove_folded
 
 
-    def get_smallest(self):
+    def get_smallest(self) -> PhysicalSystem | None:
         if self.has_folded():
             return self.folded_system
         else:
@@ -273,18 +297,18 @@ class PhysicalSystem(DevBase):
     #end def get_smallest
 
 
-    def is_magnetic(self):
+    def is_magnetic(self) -> bool:
         return self.net_spin!=0 or self.structure.is_magnetic()
     #end def is_magnetic
 
 
-    def spin_polarized_orbitals(self):
+    def spin_polarized_orbitals(self) -> bool:
         return self.is_magnetic()
     #end def spin_polarized_orbitals
 
 
     # test needed
-    def large_Zeff_elem(self,Zmin):
+    def large_Zeff_elem(self, Zmin) -> list:
         elem = []
         for atom,Zeff in self.valency.items():
             if Zeff>Zmin:
@@ -296,7 +320,7 @@ class PhysicalSystem(DevBase):
 
 
     # test needed
-    def ae_pp_species(self):
+    def ae_pp_species(self) -> tuple[set, set]:
         species = set(self.structure.elem)
         if self.pseudized:
             pp_species = set(self.valency.keys())
@@ -309,7 +333,7 @@ class PhysicalSystem(DevBase):
     #end def ae_pp_species
 
 
-    def kf_rpa(self):
+    def kf_rpa(self) -> np.ndarray:
       nelecs = (self.n_up, self.n_down)
       volume = self.structure.volume()
       kvol1 = (2*np.pi)**3/volume  # k-space volume per particle
@@ -319,7 +343,7 @@ class PhysicalSystem(DevBase):
 
 
     @property
-    def n_elec(self):
+    def n_elec(self) -> int:
         ions = self.structure.elem.tolist()
         tot_charge = 0
         for ion in ions:
@@ -336,23 +360,23 @@ class PhysicalSystem(DevBase):
         return tot_charge - self.net_charge
 
     @property
-    def n_up(self):
+    def n_up(self) -> int:
         return (self.n_elec + self.net_spin) // 2
 
     @property
-    def n_down(self):
+    def n_down(self) -> int:
         return (self.n_elec - self.net_spin) // 2
 
     @property
-    def n_species(self):
+    def n_species(self) -> int:
         return len(set(self.structure.elem))
 
     @property
-    def n_ions(self):
+    def n_ions(self) -> int:
         return len(self.structure.elem)
 
     @property
-    def ion_labels(self):
+    def ion_labels(self) -> set[str | tuple[np.uint64, np.uint64, np.uint64]]:
         return set(self.structure.elem)
 
     @property
@@ -379,7 +403,7 @@ ps_defaults = dict(
     tiled_spin=None,
     extensive=True
     )
-def generate_physical_system(**kwargs):
+def generate_physical_system(**kwargs) -> PhysicalSystem:
     for var,val in ps_defaults.items():
         if var not in kwargs:
             kwargs[var] = val
@@ -534,7 +558,7 @@ def generate_physical_system(**kwargs):
 
 
 # test needed
-def ghost_atoms(*particles):
+def ghost_atoms(*particles) -> None:
     for particle in particles:
         PhysicalSystem.ghost_aliases.append(particle)
 #end def ghost_atoms

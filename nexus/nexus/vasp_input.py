@@ -9,6 +9,8 @@
 generation. Keyword files share parsing and writing through ``VKeywordFile``;
 strictly formatted files derive from ``VFormattedFile``.
 """
+from __future__ import annotations
+
 
 
 import os
@@ -28,9 +30,16 @@ from .developer import DevBase, obj, error
 from .utilities import path_string
 from . import numpy_extensions as npe
 
+from pathlib import Path
+
+type AssignIntArg  = bool | int | float | str | np.int32 | np.int64
+type AssignIntArg2 = list[bool | int | float | str | list[int] | np.int32]
+type ValT          = obj | dict[str, bool | int | float | str] | list
+
+
 # support functions for keyword files
 
-def remove_comment(sval):
+def remove_comment(sval: str) -> str:
     if ' ' in sval:
         sval = sval.split(' ',1)[0]
     #end if
@@ -38,7 +47,7 @@ def remove_comment(sval):
 #end def remove_comment
 
 
-def expand_array(sval):
+def expand_array(sval: str) -> list[str] | None:
     sarr = []
     for v in sval.split():
         if '*' in v:
@@ -57,43 +66,43 @@ def expand_array(sval):
 #end def expand_array
 
 
-def read_int(sval):
+def read_int(sval: str) -> int | None:
     sval = remove_comment(sval)
     return int(sval)
 #end def read_int
 
 
-def read_real(sval):
+def read_real(sval: str) -> float | None:
     sval = remove_comment(sval)
     return float(sval.lower().replace('d','e'))
 #end def read_real
 
 
 bool_dict = dict(true=True,false=False,t=True,f=False)
-def read_bool(sval):
+def read_bool(sval: str) -> bool | None:
     sval = remove_comment(sval)
     return bool_dict[sval.lower().strip('.')]
 #end def read_bool
 
 
-def read_string(sval):
+def read_string(sval: str) -> str:
     return sval
 #end def read_string
 
 
-def read_int_array(sval):
+def read_int_array(sval: str) -> np.ndarray:
     return np.array(expand_array(sval),dtype=int)
 #end def read_int_array
 
 
-def read_real_array(sval):
+def read_real_array(sval: str) -> np.ndarray | None:
     values = [v.lower().replace('d','e') for v in expand_array(sval)]
     return np.array(values,dtype=float)
 #end def read_real_array
 
 
 bool_array_dict = dict(T=True,F=False,TRUE=True,FALSE=False)
-def read_bool_array(sval):
+def read_bool_array(sval: str) -> np.ndarray:
     barr = []
     for v in expand_array(sval):
         barr.append(bool_array_dict[v.upper().strip('.')])
@@ -102,17 +111,17 @@ def read_bool_array(sval):
 #end def read_bool_array
 
 
-def write_int(v):
+def write_int(v: int) -> str:
     return str(v)
 #end def write_int
 
 
-def write_real(v):
+def write_real(v: float) -> str:
     return str(v)
 #end def write_real
 
 
-def write_bool(v):
+def write_bool(v: bool) -> str:
     if v:
         return '.TRUE.'
     else:
@@ -121,7 +130,7 @@ def write_bool(v):
 #end def write_bool
 
 
-def write_string(v):
+def write_string(v: str) -> str:
     quote = (
         not set(v).isdisjoint(set('\n;#!'))
         or v.endswith('\\')
@@ -135,12 +144,15 @@ def write_string(v):
 #end def write_string
 
 
-def equality(a,b):
+def equality(
+    a : np.bool_ | np.float64 | np.int64,
+    b : np.bool_ | np.float64 | np.int64,
+    ) -> bool | np.bool_:
     return a==b
 #end def equality
 
 
-def render_bool(v):
+def render_bool(v: np.bool_) -> str:
     if v:
         return 'T'
     else:
@@ -149,7 +161,12 @@ def render_bool(v):
 #end def render_bool
 
 
-def write_array(arr,same=equality,render=str,max_repeat=3):
+def write_array(
+    arr        : np.ndarray,
+    same                   = equality,
+    render     : type[str] = str,
+    max_repeat : int       = 3,
+    ) -> str:
     if len(arr)==0:
         return ''
     #end if
@@ -184,22 +201,22 @@ def write_array(arr,same=equality,render=str,max_repeat=3):
 #end def write_array
 
 
-def write_int_array(a):
+def write_int_array(a: np.ndarray) -> str:
     return write_array(a)
 #end def write_int_array
 
 
-def write_real_array(a):
+def write_real_array(a: np.ndarray) -> str:
     return write_array(a)
 #end def write_real_array
 
 
-def write_bool_array(a):
+def write_bool_array(a: np.ndarray) -> str:
     return write_array(a,render=render_bool)
 #end def write_bool_array
 
 
-def assign_bool(v):
+def assign_bool(v: bool | int) -> bool | None:
     if v in {True, False}: # 1 and 0 hash to the same value as True and False
         return bool(v)
     else:
@@ -210,7 +227,7 @@ def assign_bool(v):
 
 integer_tolerance = 1e-8
 max_exact_float_integer = 2**53
-def assign_int(v):
+def assign_int(v: AssignIntArg) -> int | None:
     if isinstance(v,(bool,np.bool_)):
         msg = 'value must be an integer, not a boolean'
         raise TypeError(msg)
@@ -238,7 +255,7 @@ def assign_int(v):
 #end def assign_int
 
 
-def assign_string(v):
+def assign_string(v: str) -> str:
     if isinstance(v,str):
         return v
     else:
@@ -248,7 +265,7 @@ def assign_string(v):
 #end def assign_string
 
 
-def assign_int_array(a):
+def assign_int_array(a: AssignIntArg2) -> np.ndarray | None:
     if isinstance(a,(tuple,list,np.ndarray)):
         array = np.asarray(a,dtype=object)
         if array.ndim!=1:
@@ -272,7 +289,9 @@ def assign_int_array(a):
 #end def assign_int_array
 
 
-def assign_real_array(a):
+def assign_real_array(
+    a : float | list[float | str] | np.ndarray,
+    ) -> np.ndarray | None:
     if isinstance(a,(tuple,list,np.ndarray)):
         return np.array(a,dtype=float)
     else:
@@ -282,7 +301,7 @@ def assign_real_array(a):
 #end def assign_real_array
 
 
-def assign_bool_array(a):
+def assign_bool_array(a: list[bool]) -> np.ndarray:
     if isinstance(a,(tuple,list,np.ndarray)):
         return np.array(a,dtype=bool)
     else:
@@ -294,7 +313,7 @@ def assign_bool_array(a):
 
 #utility functions to convert from VASP internal objects to
 #nexus objects:
-def vasp_to_nexus_elem(elem,elem_count):
+def vasp_to_nexus_elem(elem: np.ndarray, elem_count: np.ndarray) -> np.ndarray:
     syselem=[]
     for x,count in zip(elem, elem_count, strict=True):
         syselem+=[x for i in range(0,count)]
@@ -345,7 +364,10 @@ block_type_names = MappingProxyType({
     })
 
 
-def mixed_type_matches(value,value_type):
+def mixed_type_matches(
+    value      : bool | int | float | str,
+    value_type : str,
+    ) -> bool | None:
     if value_type=='strings':
         return isinstance(value,str)
     elif value_type=='bools':
@@ -367,7 +389,11 @@ def mixed_type_matches(value,value_type):
 #end def mixed_type_matches
 
 
-def assign_mixed(value,*,types):
+def assign_mixed(
+    value : bool | int | float | str,
+    *,
+    types : tuple[str, str] | tuple[str],
+    ) -> bool | int | float | str | None:
     errors = []
     for value_type in types:
         if mixed_type_matches(value,value_type):
@@ -388,7 +414,11 @@ def assign_mixed(value,*,types):
 #end def assign_mixed
 
 
-def read_mixed(sval,*,types):
+def read_mixed(
+    sval  : str,
+    *,
+    types : tuple[str, str],
+    ) -> bool | int | float | str | np.ndarray | None:
     scalar_types = {'ints','reals','bools'}
     array_types = {'int_arrays','real_arrays','bool_arrays'}
     try:
@@ -423,7 +453,11 @@ def read_mixed(sval,*,types):
 #end def read_mixed
 
 
-def write_mixed(value,*,types):
+def write_mixed(
+    value : bool | int | float | str,
+    *,
+    types : tuple[str, str],
+    ) -> str:
     converted = assign_mixed(value,types=types)
     for value_type in types:
         if mixed_type_matches(converted,value_type):
@@ -441,7 +475,7 @@ def write_mixed(value,*,types):
 class Vobj(DevBase):
     """Base class for VASP input objects."""
 
-    def get_path(self,filepath):
+    def get_path(self, filepath: str | Path) -> str:
         filepath = path_string(filepath)
         if os.path.exists(filepath) and os.path.isdir(filepath):
             path = filepath
@@ -460,7 +494,7 @@ class Vobj(DevBase):
 class VFile(Vobj):
     """Base class for VASP input files."""
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath: str | Path | None = None) -> None:
         if filepath is not None:
             filepath = path_string(filepath)
             self.read(filepath)
@@ -468,7 +502,7 @@ class VFile(Vobj):
     #end def __init__
 
 
-    def read(self,filepath):
+    def read(self, filepath: str | Path) -> str | None:
         if not os.path.exists(filepath):
             self.error(f'file {filepath} does not exist')
         #end if
@@ -479,7 +513,7 @@ class VFile(Vobj):
     #end def read
 
 
-    def write(self,filepath=None):
+    def write(self, filepath = None) -> str | None:
         text = self.write_text(filepath)
         if filepath is not None:
             with open(filepath, "w") as f:
@@ -489,17 +523,17 @@ class VFile(Vobj):
     #end def write
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = ''):
         raise NotImplementedError
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = ''):
         raise NotImplementedError
     #end def write_text
 
 
-    def remove_comment(self,line):
+    def remove_comment(self, line: str) -> str:
         cloc1 = line.find('!')
         cloc2 = line.find('#')
         has1  = cloc1!=-1
@@ -517,7 +551,10 @@ class VFile(Vobj):
         return line
     #end def remove_comment
 
-    def preprocess_multiline_strings(self,text):
+    def preprocess_multiline_strings(
+        self,
+        text : str,
+        ) -> tuple[str | set[str], obj | set[str]] | None:
         mvals = obj()
         if '"' in text:
             text_in = text
@@ -580,7 +617,7 @@ class VKeywordFile(VFile):
     block_constructs = MappingProxyType({})
 
     @classmethod
-    def class_init(cls):
+    def class_init(cls) -> None:
         cls.kw_scalars = VKeywordFile.kw_scalars
         cls.kw_arrays  = VKeywordFile.kw_arrays
         cls.kw_fields  = VKeywordFile.kw_fields
@@ -660,7 +697,7 @@ class VKeywordFile(VFile):
 
 
     @classmethod
-    def block_schema(cls,name):
+    def block_schema(cls, name):
         if name in cls.block_constructs:
             return cls.block_constructs[name]
         elif re.fullmatch(r'image_[1-9][0-9]*',name):
@@ -672,12 +709,12 @@ class VKeywordFile(VFile):
 
 
     @classmethod
-    def is_block_name(cls,name):
+    def is_block_name(cls, name) -> bool:
         return cls.block_schema(name) is not None
     #end def is_block_name
 
 
-    def extract_block_constructs(self,text):
+    def extract_block_constructs(self, text: str) -> tuple | None:
         block_names = [
             re.escape(name) for name in self.block_constructs
             if name!='image_*'
@@ -725,7 +762,12 @@ class VKeywordFile(VFile):
     #end def extract_block_constructs
 
 
-    def block_field_type(self,block_name,field,schema):
+    def block_field_type(
+        self,
+        block_name : str,
+        field      : str,
+        schema,
+        ) -> str | tuple[str, str] | None:
         if schema=='keywords':
             if field not in self.keywords:
                 msg = f'{field.upper()} is not an INCAR keyword'
@@ -741,7 +783,12 @@ class VKeywordFile(VFile):
     #end def block_field_type
 
 
-    def read_block_construct(self,name,text,multiline_values):
+    def read_block_construct(
+        self,
+        name             : str,
+        text             : str,
+        multiline_values : obj,
+        ) -> obj | None:
         schema = self.block_schema(name)
         value = obj()
         expression = ''
@@ -785,7 +832,7 @@ class VKeywordFile(VFile):
     #end def read_block_construct
 
 
-    def assign_block_construct(self,name,value):
+    def assign_block_construct(self, name: str, value: ValT) -> obj | None:
         if not isinstance(value,Mapping):
             msg = (
                 f'block construct value should be a mapping, but is {type(value).__name__}'
@@ -812,7 +859,7 @@ class VKeywordFile(VFile):
     #end def assign_block_construct
 
 
-    def write_block_construct(self,name,value):
+    def write_block_construct(self, name: str, value: obj) -> str:
         value = self.assign_block_construct(name,value)
         schema = self.block_schema(name)
         fields = value.keys()
@@ -833,7 +880,7 @@ class VKeywordFile(VFile):
     #end def write_block_construct
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str, filepath: str = '') -> None:
         text,multiline_values = self.preprocess_multiline_strings(text)
         text = '\n'.join(
             self.remove_comment(line) for line in text.splitlines()
@@ -941,7 +988,7 @@ class VKeywordFile(VFile):
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         text = ''
         maxlen=0
         for name in self.keys():
@@ -972,7 +1019,7 @@ class VKeywordFile(VFile):
     #end def write_text
 
 
-    def assign(self,**values):
+    def assign(self, **values) -> None:
         for name,value in values.items():
             if self.is_block_name(name):
                 self[name] = self.assign_block_construct(name,value)
@@ -1003,7 +1050,12 @@ class VKeywordFile(VFile):
 class VFormattedFile(VFile):
     """Base class for structured VASP files."""
 
-    def read_lines(self,text,*,remove_empty=False):
+    def read_lines(
+        self,
+        text         : str,
+        *,
+        remove_empty : bool = False,
+        ) -> list[str]:
         raw_lines = text.splitlines()
         lines = []
         for line in raw_lines:
@@ -1016,7 +1068,12 @@ class VFormattedFile(VFile):
     #end def read_lines
 
 
-    def join(self,lines,first_line,last_line):
+    def join(
+        self,
+        lines,
+        first_line,
+        last_line,
+        ) -> str:
         joined = ''
         for iline in range(first_line,last_line):
             joined += lines[iline]+' '
@@ -1026,7 +1083,12 @@ class VFormattedFile(VFile):
     #end def join
 
 
-    def is_empty(self,lines,start=None,end=None):
+    def is_empty(
+        self,
+        lines : list[str],
+        start : np.int64 | None = None,
+        end                     = None,
+        ) -> bool:
         if start is None:
             start = 0
         #end if
@@ -1291,13 +1353,13 @@ for cls in Incar,Stopcar:
 class Iconst(VFormattedFile):  # metadynamics -> 6.62.4
     """Represent geometric constraints in an ICONST file."""
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.coordinates = obj()
         VFile.__init__(self,filepath)
     #end def __init__
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         self.coordinates.clear()
         lines = self.read_lines(text,remove_empty=True)
         for line in lines:
@@ -1323,7 +1385,7 @@ class Iconst(VFormattedFile):  # metadynamics -> 6.62.4
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         text = ''
         for index in sorted(self.coordinates.keys()):
             coordinate = self.coordinates[index]
@@ -1364,7 +1426,7 @@ class Kpoints(VFormattedFile):
 
     centering_options = obj(a='auto',g='gamma',m='monkhorst-pack')
 
-    def coord_options(self,cselect):
+    def coord_options(self, cselect: str) -> str:
         if cselect=='c' or cselect=='k':
             return 'cartesian'
         else:
@@ -1373,13 +1435,13 @@ class Kpoints(VFormattedFile):
     #end def coord_options
 
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.mode = None  # explicit, line, auto, basis
         VFile.__init__(self,filepath)
     #end def __init__
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         lines_in = self.read_lines(text,remove_empty=False)
         if len(lines_in)>0:
             lines = [lines_in[0]] + [
@@ -1468,7 +1530,7 @@ class Kpoints(VFormattedFile):
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         text = ''
         if self.mode=='auto':
             text+=f'{self.centering} mesh\n 0\n'
@@ -1577,13 +1639,13 @@ class Qpoints(Kpoints):
 class Penaltypot(VFormattedFile):  # metadynamics -> 6.62.4 (2nd one)
     """Represent bias potentials in a PENALTYPOT file."""
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.hills = np.empty((0,0),dtype=float)
         VFile.__init__(self,filepath)
     #end def __init__
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         lines = self.read_lines(text,remove_empty=True)
         rows = [line.split() for line in lines]
         if len(rows)==0:
@@ -1596,7 +1658,7 @@ class Penaltypot(VFormattedFile):  # metadynamics -> 6.62.4 (2nd one)
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         text = ''
         hills = np.asarray(self.hills,dtype=float)
         if hills.ndim!=2:
@@ -1613,13 +1675,13 @@ class Penaltypot(VFormattedFile):  # metadynamics -> 6.62.4 (2nd one)
 class Irccar(VFormattedFile):
     """Represent a discretized path in an IRCCAR file."""
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.points = np.empty((0,0),dtype=float)
         VFile.__init__(self,filepath)
     #end def __init__
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         lines = self.read_lines(text,remove_empty=True)
         if len(lines)==0:
             self.error('IRCCAR is empty')
@@ -1639,7 +1701,7 @@ class Irccar(VFormattedFile):
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         points = np.asarray(self.points,dtype=float)
         if points.ndim!=2:
             self.error('IRCCAR points must be a two-dimensional array')
@@ -1660,18 +1722,18 @@ Ircar = Irccar
 class VRawFile(VFormattedFile):
     """Preserve a VASP text file without interpreting it."""
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.text = ''
         VFile.__init__(self,filepath)
     #end def __init__
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         self.text = text
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         return self.text
     #end def write_text
 #end class VRawFile
@@ -1723,7 +1785,7 @@ class Poscar(VFormattedFile):
 
     bool_map = MappingProxyType({True:'T',False:'F'})
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         self.description = None
         self.scale       = None
         self.axes        = None
@@ -1738,7 +1800,7 @@ class Poscar(VFormattedFile):
     #end def __init__
 
 
-    def change_specifier(self,specifier,vasp_input_class):
+    def change_specifier(self, specifier: str, vasp_input_class: VaspInput) -> None:
         axes=vasp_input_class.poscar.axes
 
         pos=self.pos
@@ -1775,7 +1837,7 @@ class Poscar(VFormattedFile):
     #end def change_specifier
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         lines = self.read_lines(text,remove_empty=False)
         nlines = len(lines)
         min_lines = 8
@@ -1956,7 +2018,7 @@ class Poscar(VFormattedFile):
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         msg = self.check_complete(exit=False)
         if msg!='':
             self.error(
@@ -2060,7 +2122,11 @@ class Poscar(VFormattedFile):
     #end def write_text
 
 
-    def check_complete(self,*,exit=True):
+    def check_complete(
+        self,
+        *,
+        exit : bool = True,
+        ) -> str:
         msg = ''
         if self.scale is None:
             msg += 'scale is missing\n'
@@ -2099,7 +2165,7 @@ class Poscar(VFormattedFile):
 class NebPoscars(Vobj):
     """Manage POSCAR files for a chain of NEB images."""
 
-    def read(self,filepath):
+    def read(self, filepath: str | Path | None) -> None:
         path = self.get_path(filepath)
         dirs = os.listdir(path)
         for d in dirs:
@@ -2114,7 +2180,7 @@ class NebPoscars(Vobj):
     #end def read
 
 
-    def write(self,filepath):
+    def write(self, filepath: str | Path | None) -> None:
         path = self.get_path(filepath)
         for n in range(len(self)):
             neb_path = os.path.join(path,str(n).zfill(2))
@@ -2132,7 +2198,7 @@ class NebPoscars(Vobj):
 class Potcar(VFormattedFile):
     """Represent concatenated datasets in a POTCAR file."""
 
-    def __init__(self,filepath=None,files=None):
+    def __init__(self, filepath = None, files: list[str] | None = None) -> None:
         self.files    = files
         self.filepath = filepath
         self.pseudos  = obj()
@@ -2144,7 +2210,7 @@ class Potcar(VFormattedFile):
     #end def __init__
 
 
-    def read_text(self,text,filepath=''):
+    def read_text(self, text: str | list[str], filepath: str = '') -> None:
         marker = 'End of Dataset'
         pstart = 0
         end = len(text)
@@ -2161,7 +2227,7 @@ class Potcar(VFormattedFile):
     #end def read_text
 
 
-    def write_text(self,filepath=''):
+    def write_text(self, filepath: str = '') -> str:
         text = ''
         if len(self.pseudos)>0:
             for i in range(len(self.pseudos)):
@@ -2177,7 +2243,7 @@ class Potcar(VFormattedFile):
     #end def write_text
 
 
-    def pot_info(self):
+    def pot_info(self) -> obj:
         pot_info = obj()
         if len(self.pseudos)>0:
             pots = self.pseudos
@@ -2212,7 +2278,7 @@ class Potcar(VFormattedFile):
     #end def pot_info
 
 
-    def label_to_potcar_name(self,label):
+    def label_to_potcar_name(self, label: str) -> str:
         func,elem = label.split()[0:2]
         tag = ''
         if '_' in elem:
@@ -2223,7 +2289,7 @@ class Potcar(VFormattedFile):
     #end def label_to_potcar_name
 
 
-    def load(self):
+    def load(self) -> None:
         self.pseudos.clear()
         if self.filepath is not None and self.files is not None:
             for file in self.files:
@@ -2282,14 +2348,24 @@ class VaspInput(SimulationInput,Vobj):
 
     vasp_save_files = all_inputs + all_outputs
 
-    def __init__(self,filepath=None,prefix='',postfix=''):
+    def __init__(
+        self,
+        filepath       = None,
+        prefix   : str = '',
+        postfix  : str = '',
+        ) -> None:
         if filepath is not None:
             self.read(filepath,prefix,postfix)
         #end if
     #end def __init__
 
 
-    def read(self,filepath,prefix='',postfix=''):
+    def read(
+        self,
+        filepath : str | Path | None,
+        prefix   : str = '',
+        postfix  : str = '',
+        ) -> None:
         filepath = path_string(filepath)
         path = self.get_path(filepath)
         for file in os.listdir(path):
@@ -2327,7 +2403,12 @@ class VaspInput(SimulationInput,Vobj):
     #end def read
 
 
-    def write(self,filepath,prefix='',postfix=''):
+    def write(
+        self,
+        filepath : str | Path,
+        prefix   : str = '',
+        postfix  : str = '',
+        ) -> None:
         path = self.get_path(filepath)
         for name,vfile in self.items():
             filepath = os.path.join(path,prefix+name.upper()+postfix)
@@ -2336,7 +2417,14 @@ class VaspInput(SimulationInput,Vobj):
     #end def write
 
 
-    def incorporate_system(self,system,coord='cartesian',*,incorp_kpoints=True,set_nelect=True):
+    def incorporate_system(
+        self,
+        system         : PhysicalSystem,
+        coord          : str  = 'cartesian',
+        *,
+        incorp_kpoints : bool = True,
+        set_nelect     : bool = True,
+        ) -> list[str]:
         structure = system.structure
 
         # assign kpoints
@@ -2394,7 +2482,12 @@ class VaspInput(SimulationInput,Vobj):
     #end def incorporate_system
 
 
-    def return_system(self,*,structure_only=False,**valency):
+    def return_system(
+        self,
+        *,
+        structure_only : bool = False,
+        **valency,
+        ) -> PhysicalSystem | Structure:
         if 'poscar' not in self:
             self.error('POSCAR is required to generate a physical system')
         elif isinstance(self.poscar,NebPoscars):
@@ -2602,7 +2695,11 @@ class VaspInput(SimulationInput,Vobj):
     #end def return_system
 
 
-    def set_potcar(self,pseudos,species=None):
+    def set_potcar(
+        self,
+        pseudos : dict[str, str],
+        species : list[str] | None = None,
+        ) -> None:
         if species is None:
             ordered_pseudos = pseudos
         else:
@@ -2631,7 +2728,7 @@ class VaspInput(SimulationInput,Vobj):
     #end def set_potcar
 
 
-    def setup_neb(self,*structures,**interp_args):
+    def setup_neb(self, *structures, **interp_args) -> None:
         # check input types
         if len(structures)==1 and isinstance(structures[0],(list,tuple)):
             structures = structures[0]
@@ -2701,7 +2798,7 @@ class VaspInput(SimulationInput,Vobj):
     #end def setup_neb
 
 
-    def run_type(self):
+    def run_type(self) -> str:
         if 'incar' not in self:
             return 'unknown'
         #end if
@@ -2726,7 +2823,12 @@ class VaspInput(SimulationInput,Vobj):
     #end def run_type
 
 
-    def validate(self,*,runnable=True,exit=True):
+    def validate(
+        self,
+        *,
+        runnable : bool = True,
+        exit     : bool = True,
+        ) -> bool | None:
         """Check VASP input completeness and cross-file consistency."""
         messages = []
         required = ('incar','poscar','potcar') if runnable else ()
@@ -2964,24 +3066,24 @@ class VaspInput(SimulationInput,Vobj):
     #end def validate
 
 
-    def producing_structure(self):
+    def producing_structure(self) -> bool:
         return self.run_type()=='relax'
     #end def producing_structure
 
 
-    def performing_relax(self):
+    def performing_relax(self) -> bool:
         return self.run_type()=='relax'
     #end def preforming_relax
 
 
-    def performing_neb(self):
+    def performing_neb(self) -> bool:
         return self.run_type()=='neb'
     #end def performing_neb
 #end class VaspInput
 
 
 
-def generate_vasp_input(**kwargs):
+def generate_vasp_input(**kwargs) -> VaspInput | None:
     if 'input_type' in kwargs:
         input_type = kwargs['input_type']
         del kwargs['input_type']
@@ -3020,7 +3122,7 @@ generate_any_defaults = obj(
     set_nelect = True,
     )
 
-def generate_any_vasp_input(**kwargs):
+def generate_any_vasp_input(**kwargs) -> VaspInput | None:
     # handle 'system' name collision
     system_str = kwargs.pop('title',None)
 
@@ -3141,7 +3243,11 @@ def generate_any_vasp_input(**kwargs):
 
 
 
-def generate_poscar(structure,*,coord='cartesian'):
+def generate_poscar(
+    structure : PhysicalSystem | Structure,
+    *,
+    coord     : str = 'cartesian',
+    ) -> Poscar:
     if isinstance(structure,PhysicalSystem):
         structure = structure.structure
     #end if

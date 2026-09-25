@@ -43,6 +43,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from types import MappingProxyType
 import numpy as np
@@ -57,38 +59,41 @@ from .quantum_package import QuantumPackage
 from .unit_converter import convert
 from .hdfreader import read_hdf
 
+from pathlib import Path
+
+
 
 # read/write functions associated with pw2qmcpack only
-def read_str(sv):
+def read_str(sv: str) -> str:
     return sv.strip('"').strip("'")
 #end def read_str
 
-def read_int(sv):
+def read_int(sv) -> int:
     return int(sv)
 #end def read_int
 
-def read_float(sv):
+def read_float(sv: str) -> float:
     return float(sv.replace('d','e').replace('D','e'))
 #end def read_float
 
 bconv = {'.true.':True,'.false.':False}
-def read_bool(sv):
+def read_bool(sv: str) -> bool:
     return bconv[sv]
 #end def read_bool
 
-def write_str(val):
+def write_str(val: str) -> str:
     return "'"+val+"'"
 #end def write_str
 
-def write_int(val):
+def write_int(val) -> str:
     return str(val)
 #end def write_int
 
-def write_float(val):
+def write_float(val) -> str:
     return str(val)
 #end def write_float
 
-def write_bool(val):
+def write_bool(val: bool) -> str:
     return '.'+str(val).lower()+'.'
 #end def write_bool
 
@@ -96,7 +101,7 @@ readval={str:read_str,int:read_int,float:read_float,bool:read_bool}
 writeval={str:write_str,int:write_int,float:write_float,bool:write_bool}
 
 
-def get_path(o, path, value=None):
+def get_path(o, path, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -128,7 +133,7 @@ class Pw2qmcpackInput(SimulationInput):
     var_types: MappingProxyType[str, type] = MappingProxyType(var_types)
     allowed = frozenset(ints+floats+strs+bools)
 
-    def read_text(self,contents,filepath=None):
+    def read_text(self, contents: str, filepath: str | None = None) -> None:
         lines = contents.split('\n')
         inside = False
         for l in lines:
@@ -163,7 +168,7 @@ class Pw2qmcpackInput(SimulationInput):
     #end def read_text
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         contents = ''
         for sname,section in self.items():
             contents+='&'+sname+'\n'
@@ -177,7 +182,11 @@ class Pw2qmcpackInput(SimulationInput):
     #end def write_text
 
 
-    def __init__(self,filepath=None,**vars):
+    def __init__(
+        self,
+        filepath : str | Path | None = None,
+        **vars   : bool | str,
+        ) -> None:
         if filepath is not None:
             self.read(filepath)
         else:
@@ -191,7 +200,12 @@ class Pw2qmcpackInput(SimulationInput):
 #end class Pw2qmcpackInput
 
 
-def generate_pw2qmcpack_input(prefix='pwscf',outdir='pwscf_output',*,write_psir=False):
+def generate_pw2qmcpack_input(
+    prefix     : str  = 'pwscf',
+    outdir     : str  = 'pwscf_output',
+    *,
+    write_psir : bool = False,
+    ) -> Pw2qmcpackInput:
     pw = Pw2qmcpackInput(
         prefix     = prefix,
         outdir     = outdir,
@@ -201,7 +215,7 @@ def generate_pw2qmcpack_input(prefix='pwscf',outdir='pwscf_output',*,write_psir=
 #end def generate_pw2qmcpack_input
 
 
-def read_eshdf_eig_data(filename, Ef_list):
+def read_eshdf_eig_data(filename, Ef_list) -> obj:
     def h5int(i):
         return np.array(i,dtype=int)[0]
     #end def h5int
@@ -252,7 +266,7 @@ def read_eshdf_eig_data(filename, Ef_list):
 #end def read_eshdf_eig_data
 
 
-def gcta_occupation(wfh5, ntwist):
+def gcta_occupation(wfh5, ntwist) -> list:
   nspin = wfh5.nspins
   nk = wfh5.nkpoints
   nprim = nk//ntwist
@@ -274,7 +288,7 @@ def gcta_occupation(wfh5, ntwist):
 
 
 class Pw2qmcpackAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0):
+    def __init__(self, arg0) -> None:
         if isinstance(arg0,Simulation):
             sim = arg0
             self.infile = sim.infile
@@ -287,13 +301,13 @@ class Pw2qmcpackAnalyzer(SimulationAnalyzer):
         #end if
     #end def __init__
 
-    def analyze(self, Ef_list=None):
+    def analyze(self, Ef_list = None) -> None:
       if Ef_list is not None:
         self.wfh5 = read_eshdf_eig_data(self.h5file, Ef_list)
       #end if
     #end def analyze
 
-    def get_result(self,result_name):
+    def get_result(self, result_name: str):
         raise NotImplementedError
     #end def get_result
 #end class Pw2qmcpackAnalyzer
@@ -310,7 +324,7 @@ class Pw2qmcpack(Simulation):
     # dynamic workflow support
     allowed_requirements = ('orbitals',)
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         calculating_result = False
         if result_name=='orbitals':
             calculating_result = True
@@ -321,7 +335,7 @@ class Pw2qmcpack(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj | None:
         result = obj()
         inputpp = self.input.inputpp
         prefix = 'pwscf'
@@ -349,7 +363,12 @@ class Pw2qmcpack(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         implemented = True
         if result_name=='orbitals':
             if isinstance(sim,Pwscf):
@@ -414,7 +433,7 @@ class Pw2qmcpack(Simulation):
     #end def incorporate_result
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         outfile = os.path.join(self.locdir,self.outfile)
         with open(outfile, "r") as fobj:
             output = fobj.read()
@@ -457,25 +476,25 @@ class Pw2qmcpack(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         return self.app_name+'<'+self.infile
     #end def app_command
 
 
     # dynamic workflow support
 
-    def fill_produces(self):
+    def fill_produces(self) -> None:
         self.produces.add('orbitals')
     #end def fill_produces
 
 
-    def fill_products(self):
+    def fill_products(self) -> None:
         inputpp = self.input.inputpp
         prefix = 'pwscf'
         outdir = './'
@@ -490,7 +509,7 @@ class Pw2qmcpack(Simulation):
     #end def fill_products
 
 
-    def receive_orbitals(self,orb_path):
+    def receive_orbitals(self, orb_path) -> None:
         # This just checks if output paths match.
         # Otherwise running pw2qmcpack will fail.
         orbdir = os.path.realpath(orb_path)
@@ -535,7 +554,7 @@ class Pw2qmcpack(Simulation):
 
 
 
-def generate_pw2qmcpack(**kwargs):
+def generate_pw2qmcpack(**kwargs) -> Pw2qmcpack:
 
     if nexus_config.dynamic:
         dp,dyn_args = DynamicProcess.check_first_gen(kwargs)
@@ -705,7 +724,7 @@ class Convert4qmcInput(SimulationInput):
         )
 
 
-    def __init__(self,**kwargs):
+    def __init__(self, **kwargs) -> None:
         # check that only allowed keyword inputs are provided
         invalid = set(kwargs.keys())-set(self.input_types.keys())
         if len(invalid)>0:
@@ -730,7 +749,11 @@ class Convert4qmcInput(SimulationInput):
     #end def __init__
 
 
-    def check_valid(self,*,exit=True):
+    def check_valid(
+        self,
+        *,
+        exit : bool = True,
+        ) -> bool:
         valid = True
         # check that all inputs have valid types and assign them
         for k,v in self.items():
@@ -751,12 +774,12 @@ class Convert4qmcInput(SimulationInput):
     #end def check_valid
 
 
-    def set_app_name(self,app_name):
+    def set_app_name(self, app_name: str) -> None:
         self.app_name = app_name
     #end def set_app_name
 
 
-    def input_code(self):
+    def input_code(self) -> str | None:
         input_code = None
         for k in self.input_codes:
             if k in self and self[k] is not None:
@@ -772,12 +795,12 @@ class Convert4qmcInput(SimulationInput):
     #end def input_code
 
 
-    def has_input_code(self):
+    def has_input_code(self) -> bool:
         return self.input_code() is not None
     #end def has_input_code
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         self.check_valid()
         c = self.app_name
         for k in self.input_order:
@@ -797,17 +820,17 @@ class Convert4qmcInput(SimulationInput):
     #end def app_command
 
 
-    def read(self,filepath):
+    def read(self, filepath: str | Path | None) -> None:
         pass
     #end def read
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath = None) -> str | None:
         return self.app_command()
     #end def write_text
 
 
-    def output_files(self):
+    def output_files(self) -> tuple[str, str]:
         prefix = 'sample'
         if self.prefix is not None:
             prefix = self.prefix
@@ -820,14 +843,14 @@ class Convert4qmcInput(SimulationInput):
 
 
 
-def generate_convert4qmc_input(**kwargs):
+def generate_convert4qmc_input(**kwargs: bool | int | str) -> Convert4qmcInput:
     return Convert4qmcInput(**kwargs)
 #end def generate_convert4qmc_input
 
 
 
 class Convert4qmcAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0):
+    def __init__(self, arg0) -> None:
         if isinstance(arg0,Simulation):
             self.infile = arg0.infile
         else:
@@ -835,7 +858,7 @@ class Convert4qmcAnalyzer(SimulationAnalyzer):
         #end if
     #end def __init__
 
-    def analyze(self):
+    def analyze(self) -> None:
         pass
     #end def analyze
 #end class Convert4qmcAnalyzer
@@ -851,24 +874,24 @@ class Convert4qmc(Simulation):
     application_results    = frozenset({'orbitals','particles','determinantset'})
     renew_app_command      = True
 
-    def __init__(self,*args,**kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         Simulation.__init__(self,*args,**kwargs)
         self.input_code = None
     #end def __init__
 
-    def set_app_name(self,app_name):
+    def set_app_name(self, app_name: str) -> None:
         self.app_name = app_name
         self.input.set_app_name(app_name)
     #end def set_app_name
 
 
-    def propagate_identifier(self):
+    def propagate_identifier(self) -> None:
         pass
         #self.input.prefix = self.identifier
     #end def propagate_identifier
 
 
-    def get_prefix(self):
+    def get_prefix(self) -> str:
         input = self.input
         prefix = 'sample'
         if input.prefix is not None:
@@ -878,7 +901,7 @@ class Convert4qmc(Simulation):
     #end def get_prefix
 
 
-    def list_output_files(self):
+    def list_output_files(self) -> tuple[str, str]:
         # try to support both pre and post v3.3.0 convert4qmc
         prefix = self.get_prefix()
         wfn_file  = prefix+'.Gaussian-G2.xml'
@@ -895,13 +918,13 @@ class Convert4qmc(Simulation):
     #end def list_output_files
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         calculating_result = result_name in self.application_results
         return calculating_result
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj:
         result = obj()
         input = self.input
         wfn_file,ptcl_file = self.list_output_files()
@@ -921,7 +944,12 @@ class Convert4qmc(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         implemented = True
         input = self.input
         if isinstance(sim,Gamess):
@@ -972,7 +1000,7 @@ class Convert4qmc(Simulation):
     #end def incorporate_result
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         with open(os.path.join(self.locdir,self.outfile), "r") as out:
             output = out.read()
         #errors = open(os.path.join(self.locdir,self.errfile),'r').read()
@@ -1006,20 +1034,20 @@ class Convert4qmc(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
 
-    def app_command(self):
+    def app_command(self) -> str | None:
         return self.input.app_command()
     #end def app_command
 #end class Convert4qmc
 
 
 
-def generate_convert4qmc(**kwargs):
+def generate_convert4qmc(**kwargs) -> Convert4qmc:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
     if 'identifier' in sim_args and 'prefix' not in inp_args:
         inp_args.prefix = sim_args.identifier
@@ -1037,25 +1065,25 @@ def generate_convert4qmc(**kwargs):
 
 
 class Convertpw4qmcInput(SimulationInput):
-    def __init__(self,data_file=None):
+    def __init__(self, data_file = None) -> None:
         self.data_file=data_file
     #end def __init__
 
-    def read(self, filepath):
+    def read(self, filepath: str | Path | None) -> None:
         pass
     #end def read
 
-    def write(self, filepath):
+    def write(self, filepath: str | Path | None) -> None:
         pass
 
 #end class Convertpw4qmcInput
 
-def generate_convertpw4qmc_input(**kwargs):
+def generate_convertpw4qmc_input(**kwargs) -> Convertpw4qmcInput:
     return Convertpw4qmcInput(**kwargs)
 #end def genreate_convertpw4qmc_input
 
 class Convertpw4qmcAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0):
+    def __init__(self, arg0) -> None:
         if isinstance(arg0,Simulation):
             self.infile = arg0.infile
         else:
@@ -1063,7 +1091,7 @@ class Convertpw4qmcAnalyzer(SimulationAnalyzer):
         #end if
     #end def __init__
 
-    def analyze(self):
+    def analyze(self) -> None:
         pass
     #end def analyze
 #end class Convertpw4qmcAnalyzer
@@ -1078,15 +1106,15 @@ class Convertpw4qmc(Simulation):
     application_results    = frozenset({'orbitals'})
     renew_app_command      = True
 
-    def set_app_name(self,app_name):
+    def set_app_name(self, app_name: str) -> None:
         self.app_name = app_name
     #end def set_app_name
 
-    def propagate_identifier(self):
+    def propagate_identifier(self) -> None:
         pass
     #end def propagate_identifier
 
-    def set_files(self):
+    def set_files(self) -> None:
         # no input file
         self.infile = None
         if self.outfile is None:
@@ -1097,11 +1125,11 @@ class Convertpw4qmc(Simulation):
         #end if
     #end def set_files
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         return result_name=='orbitals'
     #end def check_result
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj:
         result = obj()
         input = self.input
         if result_name=='orbitals':
@@ -1116,19 +1144,24 @@ class Convertpw4qmc(Simulation):
         return result
     #end def get_result
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
-    def app_command(self):
+    def app_command(self) -> str:
         app_name  = self.app_name
         data_file = self.input.data_file
         command = f'{app_name} {data_file}'
         return command
     #end def app_command
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         implemented = True
         if result_name=='orbitals':
             if isinstance(sim,Pwscf):
@@ -1180,7 +1213,7 @@ class Convertpw4qmc(Simulation):
         #end if
     #end def incorporate_result
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         h5file   = os.path.join(self.locdir,'eshdf.h5')
         must_exist = [h5file]
 
@@ -1196,7 +1229,7 @@ class Convertpw4qmc(Simulation):
 
 
 
-def generate_convertpw4qmc(**kwargs):
+def generate_convertpw4qmc(**kwargs) -> Convertpw4qmc:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
 
     if 'input' not in sim_args:
@@ -1282,7 +1315,7 @@ class PyscfToAfqmcInput(SimulationInput):
         )
 
 
-    def __init__(self,**kwargs):
+    def __init__(self, **kwargs) -> None:
         # reassign inputs provided via short flag names
         for k,v in PyscfToAfqmcInput.input_flags.items():
             if v in kwargs:
@@ -1314,7 +1347,11 @@ class PyscfToAfqmcInput(SimulationInput):
     #end def __init__
 
 
-    def check_valid(self,*,exit=True):
+    def check_valid(
+        self,
+        *,
+        exit : bool = True,
+        ) -> bool:
         valid = True
         # check that all inputs have valid types and assign them
         for k,v in self.items():
@@ -1362,17 +1399,17 @@ class PyscfToAfqmcInput(SimulationInput):
     #end def check_valid
 
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return self.check_valid(exit=False)
     #end def is_valid
 
 
-    def set_app_name(self,app_name):
+    def set_app_name(self, app_name: str) -> None:
         self.app_name = app_name
     #end def set_app_name
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         self.check_valid()
         c = self.app_name
         for k in self.input_order:
@@ -1398,26 +1435,28 @@ class PyscfToAfqmcInput(SimulationInput):
     #end def app_command
 
 
-    def read(self,filepath):
+    def read(self, filepath: str | Path | None) -> None:
         pass
     #end def read
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath = None) -> str | None:
         return self.app_command()
     #end def write_text
 #end class PyscfToAfqmcInput
 
 
 
-def generate_pyscf_to_afqmc_input(**kwargs):
+def generate_pyscf_to_afqmc_input(
+    **kwargs : bool | float | str | tuple[int, int],
+    ) -> PyscfToAfqmcInput:
     return PyscfToAfqmcInput(**kwargs)
 #end def generate_pyscf_to_afqmc_input
 
 
 
 class PyscfToAfqmcAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0):
+    def __init__(self, arg0) -> None:
         if isinstance(arg0,Simulation):
             self.infile = arg0.infile
         else:
@@ -1425,7 +1464,7 @@ class PyscfToAfqmcAnalyzer(SimulationAnalyzer):
         #end if
     #end def __init__
 
-    def analyze(self):
+    def analyze(self) -> None:
         pass
     #end def analyze
 #end class PyscfToAfqmcAnalyzer
@@ -1442,13 +1481,13 @@ class PyscfToAfqmc(Simulation):
     renew_app_command      = True
 
 
-    def set_app_name(self,app_name):
+    def set_app_name(self, app_name: str) -> None:
         self.app_name = app_name
         self.input.set_app_name(app_name)
     #end def set_app_name
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         calculating_result = False
         if result_name=='wavefunction':
             calculating_result = self.input.output is not None
@@ -1459,7 +1498,7 @@ class PyscfToAfqmc(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj:
         result = obj()
         input = self.input
         if result_name in {'wavefunction','hamiltonian'}:
@@ -1475,7 +1514,12 @@ class PyscfToAfqmc(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         implemented = True
         input = self.input
         if isinstance(sim,Pyscf):
@@ -1495,7 +1539,7 @@ class PyscfToAfqmc(Simulation):
     #end def incorporate_result
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         with open(os.path.join(self.locdir,self.outfile), "r") as out:
             output = out.read()
 
@@ -1507,20 +1551,20 @@ class PyscfToAfqmc(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
 
-    def app_command(self):
+    def app_command(self) -> str | None:
         return self.input.app_command()
     #end def app_command
 #end class PyscfToAfqmc
 
 
 
-def generate_pyscf_to_afqmc(**kwargs):
+def generate_pyscf_to_afqmc(**kwargs) -> PyscfToAfqmc:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
     if 'identifier' in sim_args:
         if 'output' not in inp_args:

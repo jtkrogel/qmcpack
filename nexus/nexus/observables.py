@@ -1,4 +1,6 @@
 # Python standard library imports
+from __future__ import annotations
+
 import os
 import sys
 import inspect
@@ -25,7 +27,7 @@ from .debug import ci
 
 
 
-def get_path(o, path, value=None):
+def get_path(o, path, value = None):
     """Retrieve a value from a nested dict-like object by slash-delimited path."""
     for key in path.split('/'):
         if key not in o:
@@ -42,7 +44,7 @@ class VLog(DevBase):
         high = 2,
         )
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.tstart    = process_time()
         self.tlast     = self.tstart
         self.mstart    = memory.resident(children=True)
@@ -52,7 +54,16 @@ class VLog(DevBase):
     #end def __init__
 
 
-    def __call__(self,msg,level='low',n=0,*,time=False,mem=False,width=75):
+    def __call__(
+        self,
+        msg   : str,
+        level : str  = 'low',
+        n     : int  = 0,
+        *,
+        time  : bool = False,
+        mem   : bool = False,
+        width : int  = 75,
+        ) -> bool | None:
         if self.verbosity==self.verbosity_levels.none:
             return
         elif self.verbosity >= self.verbosity_levels[level]:
@@ -77,27 +88,27 @@ class VLog(DevBase):
         #end if
     #end def __init__
 
-    def increment(self,n=1):
+    def increment(self, n: int = 1) -> None:
         self.indent += n
     #end def increment
 
-    def decrement(self,n=1):
+    def decrement(self, n: int = 1) -> None:
         self.indent -= n
     #end def decrement
 
-    def set_none(self):
+    def set_none(self) -> None:
         self.verbosity = self.verbosity_levels.none
     #end def set_none
 
-    def set_low(self):
+    def set_low(self) -> None:
         self.verbosity = self.verbosity_levels.low
     #end def set_low
 
-    def set_high(self):
+    def set_high(self) -> None:
         self.verbosity = self.verbosity_levels.high
     #end def set_high
 
-    def set_verbosity(self,level):
+    def set_verbosity(self, level: str) -> None:
         if level not in self.verbosity_levels:
             vlinv = {v:k for k,v in self.verbosity_levels.items()}
             msg = (
@@ -113,13 +124,13 @@ vlog = VLog()
 
 
 
-def set_verbosity(level):
+def set_verbosity(level) -> None:
     vlog.set_verbosity(level)
 #end def set_verbosity
 
 
 class Missing:
-    def __call__(self,value):
+    def __call__(self, value) -> bool:
         return isinstance(value,Missing)
     #end def __call__
 #end class Missing
@@ -128,7 +139,7 @@ missing = Missing()
 
 
 class AttributeProperties(DevBase):
-    def __init__(self,**kwargs):
+    def __init__(self, **kwargs) -> None:
         self.assigned   = set(kwargs.keys())
         self.name       = kwargs.pop('name'      , None )
         self.dest       = kwargs.pop('dest'      , None )
@@ -154,12 +165,12 @@ class AttributeProperties(DevBase):
 class DefinedAttributeBase(DevBase):
 
     @classmethod
-    def set_unassigned_default(cls,default):
+    def set_unassigned_default(cls, default) -> None:
         cls.unassigned_default = default
     #end def set_unassigned_default
 
     @classmethod
-    def define_attributes(cls,*other_cls,**attribute_properties):
+    def define_attributes(cls, *other_cls, **attribute_properties) -> None:
         if len(other_cls)==1 and issubclass(other_cls[0],DefinedAttributeBase):
             cls.obtain_attributes(other_cls[0])
         #end if
@@ -222,12 +233,12 @@ class DefinedAttributeBase(DevBase):
 
 
     @classmethod
-    def obtain_attributes(cls,super_cls):
+    def obtain_attributes(cls, super_cls) -> None:
         setattr(cls,'attribute_definitions',deepcopy(super_cls.attribute_definitions))
     #end def obtain_attributes
 
 
-    def __init__(self,**values):
+    def __init__(self, **values: int | str | dict[str, int]) -> None:
         if len(values)>0:
             self.set_default_attributes()
             self.set_attributes(**values)
@@ -235,7 +246,7 @@ class DefinedAttributeBase(DevBase):
     #end def __init__
 
 
-    def initialize(self,**values):
+    def initialize(self, **values) -> None:
         self.set_default_attributes()
         if len(values)>0:
             self.set_attributes(**values)
@@ -243,7 +254,7 @@ class DefinedAttributeBase(DevBase):
     #end def initialize
 
 
-    def set_default_attributes(self):
+    def set_default_attributes(self) -> None:
         cls = self.__class__
         props = cls.attribute_definitions
         for name in cls.toplevel_attributes:
@@ -255,7 +266,7 @@ class DefinedAttributeBase(DevBase):
     #end def set_default_attributes
 
 
-    def set_attributes(self,**values):
+    def set_attributes(self, **values: int | str | dict[str, int]) -> None:
         cls = self.__class__
         value_names = set(values.keys())
         attr_names  = set(cls.attribute_definitions.keys())
@@ -304,7 +315,11 @@ class DefinedAttributeBase(DevBase):
     #end def set_attributes
 
 
-    def check_attributes(self,*,exit=False):
+    def check_attributes(
+        self,
+        *,
+        exit : bool = False,
+        ) -> bool:
         msg = ''
         cls = self.__class__
         a = obj()
@@ -349,14 +364,14 @@ class DefinedAttributeBase(DevBase):
     #end def check_attributes
 
 
-    def check_unassigned(self,value):
+    def check_unassigned(self, value) -> bool:
         cls = self.__class__
         unassigned = hasattr(cls,'unassigned_default') and value is cls.unassigned_default
         return unassigned
     #end def check_unassigned
 
 
-    def set_attribute(self,name,value):
+    def set_attribute(self, name: str, value) -> None:
         cls = self.__class__
         props = cls.attribute_definitions
         if name not in props:
@@ -392,7 +407,13 @@ class DefinedAttributeBase(DevBase):
     #end def set_attribute
 
 
-    def get_attribute(self,name,value=missing,*,assigned=True):
+    def get_attribute(
+        self,
+        name     : str,
+        value    : int | Missing = missing,
+        *,
+        assigned : bool          = True,
+        ):
         default_value    = value
         default_provided = not missing(default_value)
         require_assigned = assigned and not default_provided
@@ -445,12 +466,12 @@ class DefinedAttributeBase(DevBase):
     #end def get_attribute
 
 
-    def has_attribute(self,name):
+    def has_attribute(self, name: str) -> bool:
         return not (name not in self or self.check_unassigned(self[name]))
     #end def has_attribute
 
 
-    def _set_default_attribute(self,name,props):
+    def _set_default_attribute(self, name: str, props: AttributeProperties) -> None:
         p = props
         if p.no_default:
             return
@@ -473,7 +494,13 @@ class DefinedAttributeBase(DevBase):
     #end def _set_default_attribute
 
 
-    def _set_attribute(self,container,name,value,props):
+    def _set_attribute(
+        self,
+        container : obj,
+        name      : str,
+        value     : int | str | dict[str, int],
+        props     : AttributeProperties,
+        ) -> None:
         p = props
         if p.type is not None and not isinstance(value,p.type):
             msg = (
@@ -494,11 +521,11 @@ class DefinedAttributeBase(DevBase):
 
 
 class Observable(DefinedAttributeBase):
-    def __init__(self,**values):
+    def __init__(self, **values) -> None:
         self.initialize(**values)
     #end def __init__
 
-    def initialize(self,**values):
+    def initialize(self, **values) -> None:
         DefinedAttributeBase.initialize(self,**values)
         if len(values)>0:
             self.info.initialized = True
@@ -534,7 +561,7 @@ class ObservableWithComponents(Observable):
     default_component_name = None
 
 
-    def process_component_name(self,name):
+    def process_component_name(self, name) -> str | None:
         if name is None:
             name = self.default_component_name
         elif name not in self.components:
@@ -553,7 +580,7 @@ class ObservableWithComponents(Observable):
     #end def default_component
 
 
-    def component(self,name):
+    def component(self, name):
         if name is None:
             return self.default_component()
         #end if
@@ -572,7 +599,7 @@ class ObservableWithComponents(Observable):
     #end def component
 
 
-    def components(self,names=None):
+    def components(self, names = None) -> obj:
         comps = obj()
         if names is None:
             for c in self.component_names:
@@ -610,7 +637,7 @@ class ObservableWithComponents(Observable):
 
 
 
-def read_eshdf_nofk_data(filename,Ef):
+def read_eshdf_nofk_data(filename, Ef) -> obj:
 
     def h5int(i):
         return np.array(i,dtype=int)[0]
@@ -719,7 +746,12 @@ class MomentumDistribution(ObservableWithComponents):
     #end def get_raw_data
 
 
-    def filter_raw_data(self,filter_tol=1e-5,*,store=True):
+    def filter_raw_data(
+        self,
+        filter_tol : float = 1e-5,
+        *,
+        store      : bool  = True,
+        ) -> obj:
         vlog(f'Filtering raw n(k) data with tolerance {filter_tol:6.4e}')
         prior_tol = self.get_attribute('raw_filter_tol',assigned=False)
         data  = self.get_raw_data()
@@ -771,7 +803,12 @@ class MomentumDistribution(ObservableWithComponents):
     #end def filter_raw_data
 
 
-    def map_raw_data_onto_grid(self,*,unfold=False,filter_tol=1e-5):
+    def map_raw_data_onto_grid(
+        self,
+        *,
+        unfold     : bool  = False,
+        filter_tol : float = 1e-5,
+        ) -> None:
         vlog('\nMapping raw n(k) data onto regular grid')
         data = self.get_raw_data()
         structure = self.get_attribute('structure',assigned=unfold)
@@ -833,7 +870,7 @@ class MomentumDistribution(ObservableWithComponents):
     #end def map_raw_data_onto_grid
 
 
-    def backfold(self):
+    def backfold(self) -> None:
         structure = self.get_attribute('structure',assigned=True)
         kaxes     = structure.kaxes
         c         = self.default_component()
@@ -848,19 +885,20 @@ class MomentumDistribution(ObservableWithComponents):
     #end def backfold
 
 
-    def plot_plane_contours(self,
-                            quantity     = None,
-                            origin       = None,
-                            a1           = None,
-                            a2           = None,
-                            a1_range     = (0,1),
-                            a2_range     = (0,1),
-                            grid_spacing = 0.3,
-                            *,
-                            unit_in      = False,
-                            unit_out     = False,
-                            boundary     = True,
-                            ):
+    def plot_plane_contours(
+        self,
+        quantity                       = None,
+        origin                         = None,
+        a1                             = None,
+        a2                             = None,
+        a1_range     : tuple[int, int] = (0,1),
+        a2_range     : tuple[int, int] = (0,1),
+        grid_spacing : float           = 0.3,
+        *,
+        unit_in      : bool            = False,
+        unit_out     : bool            = False,
+        boundary     : bool            = True,
+        ) -> None:
         c  = self.component(quantity)
         o  = np.asarray(origin)
         a1 = np.asarray(a1)
@@ -893,7 +931,15 @@ class MomentumDistribution(ObservableWithComponents):
     #end def plot_plane_contours
 
 
-    def plot_radial_raw(self,quants='all',kmax=None,fmt='b.',*,fig=True,show=True):
+    def plot_radial_raw(
+        self,
+        quants : str  = 'all',
+        kmax          = None,
+        fmt    : str  = 'b.',
+        *,
+        fig    : bool = True,
+        show   : bool = True,
+        ) -> None:
         import matplotlib.pyplot as plt
         data = self.get_raw_data()
         if quants=='all':
@@ -932,7 +978,17 @@ class MomentumDistribution(ObservableWithComponents):
     #end def plot_radial_raw
 
 
-    def plot_directional_raw(self,kdir,quants='all',kmax=None,fmt='b.',*,fig=True,show=True,reflect=False):
+    def plot_directional_raw(
+        self,
+        kdir,
+        quants  : str  = 'all',
+        kmax           = None,
+        fmt     : str  = 'b.',
+        *,
+        fig     : bool = True,
+        show    : bool = True,
+        reflect : bool = False,
+        ) -> None:
         import matplotlib.pyplot as plt
         data = self.get_raw_data()
         kdir = np.array(kdir,dtype=float)
@@ -1023,7 +1079,15 @@ MomentumDistribution.define_attributes(
 
 class MomentumDistributionDFT(MomentumDistribution):
 
-    def read_eshdf(self,filepath,E_fermi=None,savefile=None,*,unfold=False,grid=True):
+    def read_eshdf(
+        self,
+        filepath,
+        E_fermi         = None,
+        savefile        = None,
+        *,
+        unfold   : bool = False,
+        grid     : bool = True,
+        ) -> None:
 
         save = False
         if savefile is not None:
@@ -1110,7 +1174,12 @@ MomentumDistributionDFT.define_attributes(
 
 
 class MomentumDistributionQMC(MomentumDistribution):
-    def read_stat_h5(self,*files,equil=0,savefile=None):
+    def read_stat_h5(
+        self,
+        *files,
+        equil    : int = 0,
+        savefile       = None,
+        ) -> None:
 
         save = False
         if savefile is not None:
@@ -1178,7 +1247,7 @@ class Density(ObservableWithComponents):
     default_component_name = 'tot'
 
 
-    def read_xsf(self,filepath,component=None):
+    def read_xsf(self, filepath: XsfFile, component = None) -> None:
         component = self.process_component_name(component)
 
         vlog(f'Reading density data from XSF file for component "{component}"',time=True)
@@ -1238,7 +1307,7 @@ class Density(ObservableWithComponents):
     #end def read_xsf
 
 
-    def volume_normalize(self):
+    def volume_normalize(self) -> None:
         g = self.get_attribute('grid')
         dV = g.volume()/g.ncells
         for c in self.components().values():
@@ -1247,7 +1316,7 @@ class Density(ObservableWithComponents):
     #end def volume_normalize
 
 
-    def norm(self,component=None):
+    def norm(self, component = None) -> obj:
         norms = obj()
         comps = self.components(component)
         for name,d in comps.items():
@@ -1263,7 +1332,7 @@ class Density(ObservableWithComponents):
     #end def norm
 
 
-    def change_distance_units(self,units):
+    def change_distance_units(self, units) -> None:
         units_old = self.get_attribute('distance_units')
         rscale    = convert(1.0,units_old,units)
         grid      = self.get_attribute('grid')
@@ -1272,7 +1341,7 @@ class Density(ObservableWithComponents):
     #end def change_distance_units
 
 
-    def change_density_units(self,units):
+    def change_density_units(self, units) -> None:
         units_old = self.get_attribute('density_units')
         dscale    = 1.0/convert(1.0,units_old,units)
         for c in self.components().values():
@@ -1282,7 +1351,18 @@ class Density(ObservableWithComponents):
     #end def change_density_units
 
 
-    def radial_density(self,component=None,dr=0.01,ntheta=100,rmax=None,*,single=False,interp_kwargs=None,comps_return=False,species=None):
+    def radial_density(
+        self,
+        component                                        = None,
+        dr            : float                            = 0.01,
+        ntheta        : int                              = 100,
+        rmax          : list[str | np.float64] | None    = None,
+        *,
+        single        : bool                             = False,
+        interp_kwargs                                    = None,
+        comps_return  : bool                             = False,
+        species       : list[int | str | np.str_] | None = None,
+        ) -> obj:
 
         vlog('Computing radial density',time=True)
         vlog('Current memory:',n=1,mem=True)
@@ -1382,7 +1462,13 @@ class Density(ObservableWithComponents):
     #end def radial_density
 
 
-    def cumulative_radial_density(self,rdfs=None,*,comps_return=False,**kwargs):
+    def cumulative_radial_density(
+        self,
+        rdfs                = None,
+        *,
+        comps_return : bool = False,
+        **kwargs     : list[np.float64 | np.str_],
+        ) -> obj:
         component = kwargs.get('component',None)
         if rdfs is None:
             kwargs['comps_return'] = True
@@ -1404,7 +1490,14 @@ class Density(ObservableWithComponents):
     #end def cumulative_radial_density
 
 
-    def plot_radial_density(self,component=None,*,show=True,cumulative=False,**kwargs):
+    def plot_radial_density(
+        self,
+        component         = None,
+        *,
+        show       : bool = True,
+        cumulative : bool = False,
+        **kwargs,
+        ) -> None:
         import matplotlib.pyplot as plt
         vlog('Plotting radial density')
         kwargs['comps_return'] = True
@@ -1450,7 +1543,12 @@ class Density(ObservableWithComponents):
     #end def plot_radial_density
 
 
-    def save_radial_density(self,prefix,rdfs=None,**kwargs):
+    def save_radial_density(
+        self,
+        prefix,
+        rdfs = None,
+        **kwargs,
+        ) -> None:
         path = ''
         if '/' in prefix:
             path,prefix = os.path.split(prefix)
@@ -1562,7 +1660,7 @@ class StatFile(DevBase):
     #end for
 
 
-    def __init__(self,filepath=None,**read_kwargs):
+    def __init__(self, filepath = None, **read_kwargs) -> None:
         self.filepath = None
 
         if filepath is not None:
@@ -1572,7 +1670,7 @@ class StatFile(DevBase):
     #end def __init__
 
 
-    def read(self,filepath,observables='all'):
+    def read(self, filepath, observables: str = 'all') -> None:
         import h5py
         if not os.path.exists(filepath):
             msg = (
@@ -1614,12 +1712,17 @@ class StatFile(DevBase):
     #end def read
 
 
-    def condense_name(self,name):
+    def condense_name(self, name: str) -> str:
         return name.lower().replace('_','')
     #end def condenst_name
 
 
-    def observable_groups(self,observable,*,single=False):
+    def observable_groups(
+        self,
+        observable : Observable,
+        *,
+        single     : bool = False,
+        ):
         if inspect.isclass(observable):
             observable = observable.__name__
         elif isinstance(observable,Observable):

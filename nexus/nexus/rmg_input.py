@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 from copy import deepcopy
 
@@ -7,6 +9,11 @@ from .pseudoset import pp_elem_label, PseudoSet
 from .structure import generate_structure
 from .simulation import SimulationInput
 from . import numpy_extensions as npe
+
+from pathlib import Path
+
+type ValT = bool | int | float | str | obj | np.ndarray
+
 
 class RmgInputSettings(DevBase):
     enforce_min_value = True
@@ -2891,48 +2898,48 @@ raw_input_spec += deprecated_options
 
 
 
-def read_string(v):
+def read_string(v: str) -> str:
     return v.strip().strip('"')
 #end def read_string
 
 truefalse_read = {'"true"':True,'"false"':False,'true':True,'false':False}
-def read_boolean(v):
+def read_boolean(v: str) -> bool:
     return truefalse_read[v.lower()]
 #end def read_boolean
 
-def read_integer(v):
+def read_integer(v: str) -> int:
     return int(v.strip().strip('"'))
 #end def read_integer
 
-def read_double(v):
+def read_double(v: str) -> float:
     return float(v.strip().strip('"'))
 #end def read_double
 
-def read_integer_array(v):
+def read_integer_array(v: str) -> np.ndarray:
     return np.array(v.strip().strip('"').split(),dtype=int)
 #end def read_integer_array
 
-def read_double_array(v):
+def read_double_array(v: str) -> np.ndarray:
     return np.array(v.strip().strip('"').split(),dtype=float)
 #end def read_double_array
 
 
-def write_string(v):
+def write_string(v: str) -> str:
     return '"'+v.strip()+'"'
 #end def write_string
 
 truefalse_write = {True:'"true"',False:'"false"'}
-def write_boolean(v):
+def write_boolean(v: bool) -> str:
     return truefalse_write[v]
 #end def write_boolean
 
-def write_integer(v):
+def write_integer(v: int) -> str:
     return f'"{v}"'
 #end def write_integer
 
 double_fmt = '{: 16.8f}'
 double_fmt_exp = '{: 16.8e}'
-def write_double(v):
+def write_double(v: float) -> str:
     vs = double_fmt.format(v).strip()
     if abs((float(vs)-v))>1e-6*abs(v):
         vs = double_fmt_exp.format(v).strip()
@@ -2940,7 +2947,7 @@ def write_double(v):
     return '"'+vs+'"'
 #end def write_double
 
-def write_integer_array(v):
+def write_integer_array(v: np.ndarray) -> str:
     s = '"'
     if isinstance(v,np.ndarray):
         v = v.flatten()
@@ -2951,7 +2958,7 @@ def write_integer_array(v):
     return s[:-1]+'"'
 #end def write_integer_array
 
-def write_double_array(v):
+def write_double_array(v: np.ndarray) -> str:
     s = '"'
     if isinstance(v,np.ndarray):
         v = v.flatten()
@@ -2997,7 +3004,7 @@ rmg_array_dtypes = obj({
 
 
 class RmgKeyword(DevBase):
-    def __init__(self,key_spec,section_name):
+    def __init__(self, key_spec: str, section_name: str) -> None:
         self.key_name     = None
         self.key_type     = None
         self.default      = None
@@ -3156,17 +3163,17 @@ class RmgKeyword(DevBase):
     #end def __init__
 
 
-    def read(self,value):
+    def read(self, value: str) -> bool | int | float | str | obj | np.ndarray:
         return read_functions[self.key_type](value)
     #end def read
 
 
-    def write(self,value):
+    def write(self, value: ValT) -> str:
         return write_functions[self.key_type](value)
     #end def write
 
 
-    def assign(self,value):
+    def assign(self, value):
         if not isinstance(value,self.value_type):
             msg = (
                 f'cannot assign RMG keyword "{self.key_name}".\n'
@@ -3184,7 +3191,12 @@ class RmgKeyword(DevBase):
     #end def assign
 
 
-    def valid(self,value,*,message=False):
+    def valid(
+        self,
+        value   : ValT,
+        *,
+        message : bool = False,
+        ) -> bool | tuple[bool | RmgInput, str | RmgInput]:
         msg   = ''
         if not isinstance(value,self.value_type):
             msg += f'Keyword "{self.key_name}" has the wrong type.\n  Type expected: {self.key_type}\n  Type provided: {value.__class__.__name__}\n'
@@ -3216,19 +3228,24 @@ class RmgKeyword(DevBase):
 
 
 class FormattedRmgKeyword(RmgKeyword):
-    def read(self,value):
+    def read(self, value: str):
         raise NotImplementedError
     #end def read
 
-    def write(self,value):
+    def write(self, value: ValT):
         raise NotImplementedError
     #end def write
 
-    def assign(self,value):
+    def assign(self, value):
         raise NotImplementedError
     #end def assign
 
-    def valid(self,value,*,message=False):
+    def valid(
+        self,
+        value   : ValT,
+        *,
+        message : bool = False,
+        ) -> bool | tuple[bool, str]:
         valid = self.valid_no_msg(value)
         if not message:
             return valid
@@ -3237,7 +3254,7 @@ class FormattedRmgKeyword(RmgKeyword):
         #end if
     #end def valid
 
-    def valid_no_msg(self,value):
+    def valid_no_msg(self, value: obj):
         raise NotImplementedError
     #end def valid_no_msg
 #end class FormattedRmgKeyword
@@ -3249,7 +3266,7 @@ class FormattedTableRmgKeyword(FormattedRmgKeyword):
     array_types    = None
     exclude_fields = frozenset()
 
-    def assign(self,value):
+    def assign(self, value):
         if isinstance(value,str):
             return value
         elif isinstance(value,(dict,obj)):
@@ -3270,7 +3287,7 @@ class FormattedTableRmgKeyword(FormattedRmgKeyword):
         #end if
     #end def assign
 
-    def valid_no_msg(self,value):
+    def valid_no_msg(self, value: obj) -> bool:
         cls = self.__class__
         if not isinstance(value,obj):
             return False
@@ -3316,7 +3333,10 @@ class PseudopotentialKeyword(FormattedTableRmgKeyword):
         pseudos = rmg_value_types.string,
         )
 
-    def read(self,value):
+    def read(
+        self,
+        value : str,
+        ) -> bool | int | float | str | obj | np.ndarray | None:
         d = np.array(value.split(),dtype=str)
         npe.reshape_inplace(d, (len(d)//2, 2))
         species = d[:,0].flatten()
@@ -3324,7 +3344,7 @@ class PseudopotentialKeyword(FormattedTableRmgKeyword):
         return obj(species=species,pseudos=pseudos)
     #end def read
 
-    def write(self,value):
+    def write(self, value: ValT) -> str:
         v = value
         s = '"\n'
         for (sp,p) in zip(v.species,v.pseudos):
@@ -3346,7 +3366,10 @@ class KpointsKeyword(FormattedTableRmgKeyword):
         weights = rmg_value_types.double,
         )
 
-    def read(self,value):
+    def read(
+        self,
+        value : str,
+        ) -> bool | int | float | str | obj | np.ndarray | None:
         d = np.array(value.split(),dtype=float)
         npe.reshape_inplace(d, (len(d)//4, 4))
         kpoints = d[:,:3]
@@ -3354,7 +3377,7 @@ class KpointsKeyword(FormattedTableRmgKeyword):
         return obj(kpoints=kpoints,weights=weights)
     #end def read
 
-    def write(self,value):
+    def write(self, value: ValT) -> str:
         v = value
         s = '"\n'
         for (kp,w) in zip(v.kpoints,v.weights):
@@ -3377,7 +3400,10 @@ class KpointsBandstructureKeyword(FormattedTableRmgKeyword):
         labels  = rmg_value_types.string,
         )
 
-    def read(self,value):
+    def read(
+        self,
+        value : str,
+        ) -> bool | int | float | str | obj | np.ndarray | None:
         d = np.array(value.split(),dtype=str)
         npe.reshape_inplace(d, (len(d)//5, 5))
         kpoints = np.array(d[:,:3],dtype=float)
@@ -3386,7 +3412,7 @@ class KpointsBandstructureKeyword(FormattedTableRmgKeyword):
         return obj(kpoints=kpoints,counts=counts,labels=labels)
     #end def read
 
-    def write(self,value):
+    def write(self, value: ValT) -> str:
         v = value
         s = '"\n'
         for (kp,c,l) in zip(v.kpoints,v.counts,v.labels):
@@ -3423,7 +3449,7 @@ class AtomsKeyword(FormattedTableRmgKeyword):
     exclude_fields = frozenset({'format'})
 
 
-    def read(self,value):
+    def read(self, value: str) -> obj:
         # check if input data is empty
         value = value.strip()
         if len(value)==0:
@@ -3520,7 +3546,7 @@ class AtomsKeyword(FormattedTableRmgKeyword):
         return v
     #end def read
 
-    def write(self,value):
+    def write(self, value: ValT) -> str:
         v = value
         s = '"\n'
         if v.format=='basic':
@@ -3563,7 +3589,7 @@ class AtomsKeyword(FormattedTableRmgKeyword):
 
 
 class HubbardUKeyword(RmgKeyword):
-    def read(self,value):
+    def read(self, value: str) -> obj:
         v = obj()
         text = read_string(value).strip()
         if len(text)==0:
@@ -3594,7 +3620,7 @@ class HubbardUKeyword(RmgKeyword):
         return v
     #end def read
 
-    def write(self,value):
+    def write(self, value: ValT) -> str | None:
         lines = []
         for a in sorted(value.keys()):
             v = value[a]
@@ -3615,7 +3641,7 @@ class HubbardUKeyword(RmgKeyword):
         #end if
     #end def write
 
-    def assign(self,value):
+    def assign(self, value) -> obj:
         if isinstance(value,str):
             return self.read(value)
         elif isinstance(value,(dict,obj)):
@@ -3661,7 +3687,12 @@ class HubbardUKeyword(RmgKeyword):
         #end if
     #end def assign
 
-    def valid(self,value,*,message=False):
+    def valid(
+        self,
+        value   : ValT,
+        *,
+        message : bool = False,
+        ) -> bool | tuple[bool, str]:
         valid = True
         for k,v in value.items():
             if not isinstance(k,rmg_value_types.string):
@@ -3702,7 +3733,7 @@ formatted_keywords = obj(
 
 
 class RmgInputSpec(DevBase):
-    def __init__(self):
+    def __init__(self) -> None:
         spec = raw_input_spec.strip()
 
         blocks = spec.split('\n\n')
@@ -3744,7 +3775,7 @@ input_spec = RmgInputSpec()
 
 
 class RmgCalcModes(DevBase):
-    def __init__(self):
+    def __init__(self) -> None:
         self.full_calc = obj(
             scf         = 'Quench Electrons',
             nscf        = 'NSCF',
@@ -3770,15 +3801,15 @@ class RmgCalcModes(DevBase):
         self.short_calc_modes = set(self.short_calc.values())
     #end def __init__
 
-    def is_full_mode(self,mode):
+    def is_full_mode(self, mode) -> bool:
         return mode in self.full_calc_modes
     #end def is_full_mode
 
-    def is_short_mode(self,mode):
+    def is_short_mode(self, mode) -> bool:
         return mode in self.short_calc_modes
     #end def is_short_mode
 
-    def full_mode(self,short_mode):
+    def full_mode(self, short_mode: str) -> str | None:
         mode = None
         if short_mode in self.full_calc:
             mode = self.full_calc[short_mode]
@@ -3786,7 +3817,7 @@ class RmgCalcModes(DevBase):
         return mode
     #end def full_mode
 
-    def short_mode(self,full_mode):
+    def short_mode(self, full_mode: str) -> str | None:
         mode = None
         if full_mode in self.short_calc:
             mode = self.short_calc[full_mode]
@@ -3794,7 +3825,12 @@ class RmgCalcModes(DevBase):
         return mode
     #end def short_mode
 
-    def mode_match(self,text,*,short=False):
+    def mode_match(
+        self,
+        text,
+        *,
+        short : bool = False,
+        ) -> str | None:
         mode = None
         text = text.lower()
         for full_mode in self.full_calc_modes:
@@ -3821,7 +3857,7 @@ rmg_modes = RmgCalcModes()
 
 
 class RmgInput(SimulationInput):
-    def __init__(self,filepath=None):
+    def __init__(self, filepath: str | Path | None = None) -> None:
         if filepath is not None:
             self.read(filepath)
         #end if
@@ -3829,7 +3865,7 @@ class RmgInput(SimulationInput):
 
 
     @property
-    def run_mode(self):
+    def run_mode(self) -> str | None:
         """Return the short run mode corresponding to ``calculation_mode``."""
         mode = None
         if 'calculation_mode' in self:
@@ -3839,7 +3875,7 @@ class RmgInput(SimulationInput):
     #end def run_mode
 
 
-    def assign(self,**values):
+    def assign(self, **values) -> None:
         unrecognized = []
         for k,v in values.items():
             if k in input_spec.keywords:
@@ -3865,7 +3901,7 @@ class RmgInput(SimulationInput):
     #end def assign
 
 
-    def read_text(self,contents,filepath=None):
+    def read_text(self, contents: str, filepath: str | None = None) -> None:
         # remove comments and whitespace
         text = ''
         for line in contents.splitlines():
@@ -3907,7 +3943,7 @@ class RmgInput(SimulationInput):
     #end def read_text
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         if RmgInputSettings.check_on_write:
             self.check_valid()
         #end if
@@ -3929,7 +3965,11 @@ class RmgInput(SimulationInput):
     #end def write_text
 
 
-    def check_valid(self,*,exit=True):
+    def check_valid(
+        self,
+        *,
+        exit : bool = True,
+        ) -> bool:
         msg = ''
         allowed = set(input_spec.keywords.keys())
         present = set(self.keys())
@@ -3961,12 +4001,12 @@ class RmgInput(SimulationInput):
     #end def check_valid
 
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return self.check_valid(exit=False)
     #end def is_valid
 
 
-    def return_structure(self,units='B'):
+    def return_structure(self, units: str = 'B'):
         axes       = self.lattice_vector        if 'lattice_vector'        in self else None
         axes_unit  = self.lattice_units         if 'lattice_units'         in self else 'bohr'
         lattice    = self.bravais_lattice_type  if 'bravais_lattice_type' in self else 'orthorhombic primitive'
@@ -4047,7 +4087,7 @@ class RmgInput(SimulationInput):
 
 
 
-def generate_rmg_input(**kwargs):
+def generate_rmg_input(**kwargs) -> RmgInput:
     selector = kwargs.pop('input_type','generic')
     if selector=='generic':
         return generate_any_rmg_input(**kwargs)
@@ -4070,7 +4110,7 @@ generate_any_defaults = obj(
     #    ),
     )
 
-def generate_any_rmg_input(**kwargs):
+def generate_any_rmg_input(**kwargs) -> RmgInput:
 
     # set default values
     defaults = kwargs.pop('defaults','basic')

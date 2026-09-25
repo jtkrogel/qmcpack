@@ -19,7 +19,7 @@ class ElementData:
     group: int
     isotopes: dict[int, float]
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash((
             self.symbol,
             self.atomic_number,
@@ -48,11 +48,11 @@ class ElementData:
         mass_number = list(self.isotopes.keys())[0]
         return mass_number, self.isotopes[mass_number]
 
-    def protons(self) -> int:
+    def protons(self) -> int | None:
         """Alias for ``self.atomic_number``."""
         return self.atomic_number
 
-    def neutrons(self, mass_number: int | None = None) -> int:
+    def neutrons(self, mass_number: int | None = None) -> int | None:
         """Get the number of neutrons for the isotope with the given mass number.
 
         If no mass number is provided, this defaults to the most common isotope.
@@ -176,19 +176,19 @@ class Elements(ElementData, Enum):
 
     def __new__(
         cls,
-        symbol: str,
-        atomic_number: int,
-        atomic_weight: float,
-        group: int,
-        isotopes: dict[int, float]
-        ):
+        symbol        : str,
+        atomic_number : int,
+        atomic_weight : float,
+        group         : int,
+        isotopes      : dict[int, float],
+        ) -> Elements:
         element = ElementData.__new__(cls)
         element._value_ = atomic_number
         return element
 
 
     # Override to not print isotopes
-    def __repr__(self):
+    def __repr__(self) -> str:
         # This prints on one line, but since it's nearly impossible to
         # grep for this regardless of if it's on one line in the code
         # it is split here for readability.
@@ -200,11 +200,11 @@ class Elements(ElementData, Enum):
             f"group={self.group}>"
             )
 
-    def __str__(self) -> str:
+    def __str__(self) -> str | None:
         return self.symbol
 
     @classmethod
-    def _missing_(cls, value):
+    def _missing_(cls, value) -> Elements:
         """Workaround to not having access to ``_add_alias_`` or
         ``_add_value_alias_`` from Python 3.13. This function
         automatically gets called when the traditional lookup fails.
@@ -229,10 +229,10 @@ class Elements(ElementData, Enum):
 
     @staticmethod
     def is_element(
-        value: str,
+        value,
         *,
-        return_element: bool = False,
-        ) -> bool | tuple[bool, Elements]:
+        return_element : bool = False,
+        ) -> bool | tuple:
         """Robust method that will try to match a wide array of element
         identifier formats, including all that are handled by the parent
         call signature ``Elements(value)``.

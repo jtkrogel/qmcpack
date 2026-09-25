@@ -34,6 +34,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import numpy as np
 from .qmcpack_input import QmcpackInput
@@ -58,7 +60,12 @@ class Bspline(QAobject):
     npe.reshape_inplace(dA, (4, 4))
     npe.reshape_inplace(d2A, (4, 4))
 
-    def __init__(self,params,cusp,rcut):
+    def __init__(
+        self,
+        params : np.ndarray,
+        cusp,
+        rcut,
+        ) -> None:
         p = np.array(params)
         cusp = float(cusp)
         rcut = float(rcut)
@@ -84,7 +91,7 @@ class Bspline(QAobject):
         self.default_range = 0.,rcut
     #end def __init__
 
-    def evaluate(self,r):
+    def evaluate(self, r) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         tp=np.zeros((4,1))
         ni  = self.nintervals
         odr = self.odr
@@ -121,7 +128,13 @@ class Bspline(QAobject):
 
 
 class RadialJastrow(QAobject):
-    def __init__(self,ftype,coeff,cusp,rcut):
+    def __init__(
+        self,
+        ftype,
+        coeff,
+        cusp  : float,
+        rcut,
+        ) -> None:
         self.coeff = coeff
         self.cusp  = cusp
         if ftype.lower()=='bspline':
@@ -130,11 +143,16 @@ class RadialJastrow(QAobject):
         #end if
     #end def __init__
 
-    def evaluate(self,r):
+    def evaluate(self, r) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return self.function.evaluate(r)
     #end def evaluate
 
-    def interpolate(self,r1=None,r2=None,n=200):
+    def interpolate(
+        self,
+        r1         = None,
+        r2         = None,
+        n    : int = 200,
+        ):
         if r1 is None:
             r1,r2 = self.function.default_range
         #end if
@@ -143,7 +161,13 @@ class RadialJastrow(QAobject):
         return r,d0,d1,d2
     #end def interpolate
 
-    def plot(self,r1=None,r2=None,color='b',ptype=None):
+    def plot(
+        self,
+        r1          = None,
+        r2          = None,
+        color : str = 'b',
+        ptype       = None,
+        ):
         import matplotlib.pyplot as plt
         if ptype is None:
             ptype = plt.plot
@@ -157,14 +181,26 @@ class RadialJastrow(QAobject):
 #end class RadialJastrow
 
 class Jastrow1B(RadialJastrow):
-    def __init__(self,ftype,coeff,rcut):
+    def __init__(
+        self,
+        ftype,
+        coeff,
+        rcut,
+        ) -> None:
         cusp = 0.0
         RadialJastrow.__init__(self,ftype,coeff,cusp,rcut)
     #end def __init__
 #end class Jastrow1B
 
 class Jastrow2B(RadialJastrow):
-    def __init__(self,ftype,coeff,species1,species2,rcut):
+    def __init__(
+        self,
+        ftype    : str,
+        coeff    : np.ndarray,
+        species1 : str,
+        species2 : str,
+        rcut     : float,
+        ) -> None:
         if species1==species2:
             cusp = -1./4
         else:
@@ -184,7 +220,13 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
 
     jastrow_types = ('J1','J2','J3')
 
-    def __init__(self,arg0=None,*,load_jastrow=False,nindent=0):
+    def __init__(
+        self,
+        arg0                = None,
+        *,
+        load_jastrow : bool = False,
+        nindent      : int  = 0,
+        ) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
         self.info.load_jastrow = load_jastrow
 
@@ -198,7 +240,7 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def __init__
 
 
-    def load_data_local(self):
+    def load_data_local(self) -> None:
         info = self.info
         if info.load_jastrow:
             self.load_jastrow_data()
@@ -219,7 +261,7 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def load_data_local
 
 
-    def analyze_local(self):
+    def analyze_local(self) -> None:
         structure = QAanalyzer.run_info.system.structure
 
         jnames = {'One-Body':'J1','Two-Body':'J2','Three-Body':'J3'}
@@ -277,7 +319,7 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def analyze_local
 
 
-    def load_jastrow_data(self):
+    def load_jastrow_data(self) -> None:
         ext = '.g'+str(self.batch_index).zfill(3)+'.dat'
         for jt in self.jastrow_types:
             for jn in self[jt].keys():
@@ -292,7 +334,7 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def load_jastrow_data
 
 
-    def plot_jastrow_data(self):
+    def plot_jastrow_data(self) -> None:
         import matplotlib.pyplot as plt
         for jt in self.jastrow_types:
             if len(self[jt])!=0:
@@ -319,7 +361,7 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def plot_jastrow_data
 
 
-    def plot_jastrows(self,ptype=None):
+    def plot_jastrows(self, ptype = None) -> None:
         import matplotlib.pyplot as plt
         if ptype is None:
             ptype = plt.plot
@@ -340,7 +382,6 @@ class WavefunctionAnalyzer(PropertyAnalyzer):
     #end def plot_jastrows
 
 #end class WavefunctionAnalyzer
-
 
 
 

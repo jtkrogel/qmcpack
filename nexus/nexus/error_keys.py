@@ -4,10 +4,16 @@ The tuples ending in ``_errors`` contain readable examples of diagnostics.
 The tuples ending in ``_error_patterns`` contain regular expressions used to
 match variable portions or to add context that reduces false positives.
 """
+from __future__ import annotations
+
 
 import os
 import re
 from functools import cache
+
+from io import StringIO
+from pathlib import Path
+
 
 
 # Operating-system errors
@@ -698,7 +704,7 @@ _error_patterns = {
 _error_set_names = tuple(_error_keys)
 
 
-def _literal_error_pattern(error_key):
+def _literal_error_pattern(error_key: str) -> str:
     """Escape a readable key while allowing flexible whitespace."""
     pattern = r'\s+'.join(re.escape(part) for part in error_key.split())
     if error_key and (error_key[0].isalnum() or error_key[0] == '_'):
@@ -709,7 +715,7 @@ def _literal_error_pattern(error_key):
 
 
 @cache
-def _combined_error_pattern(enabled_sets):
+def _combined_error_pattern(enabled_sets) -> re.Pattern | None:
     patterns = []
     seen = set()
     for set_name in enabled_sets:
@@ -730,7 +736,7 @@ def _combined_error_pattern(enabled_sets):
         )
 
 
-def _read_error_text(source):
+def _read_error_text(source: str | Path | StringIO) -> str | bytes | None:
     if hasattr(source, 'read'):
         text = source.read()
     elif isinstance(source, os.PathLike):
@@ -756,56 +762,56 @@ def _read_error_text(source):
 
 
 def find_error_keys(
-        source,
-        # select error batches
-        *,
-        all_errors         = False,
-        operating_system   = False,
-        hpc                = False,
-        code               = False,
-        code_library       = False,
-        python_module      = False,
-        # operating system errors
-        shell              = False,
-        linux_signals      = False,
-        posix              = False,
-        # hpc errors
-        infiniband         = False,
-        lustre             = False,
-        gpfs               = False,
-        slurm              = False,
-        pbs                = False,
-        mpi                = False,
-        openmp             = False,
-        # code errors
-        linking            = False,
-        fortran            = False,
-        cpp                = False,
-        cuda               = False,
-        hip                = False,
-        # python code errors
-        python             = False,
-        # code library errors
-        blas               = False,
-        lapack             = False,
-        fftw               = False,
-        hdf5               = False,
-        libxml2            = False,
-        # python module errors
-        numpy              = False,
-        scipy              = False,
-        h5py               = False,
-        # simulation code errors
-        pwscf              = False,
-        pyscf              = False,
-        quantum_package    = False,
-        rmg                = False,
-        qmcpack            = False,
-        vasp               = False,
-        gamess             = False,
-        # return lines found or not
-        return_lines       = False,
-        ):
+    source           : str | Path | StringIO,
+    # select error batches
+    *,
+    all_errors       : bool = False,
+    operating_system : bool = False,
+    hpc              : bool = False,
+    code             : bool = False,
+    code_library     : bool = False,
+    python_module    : bool = False,
+    # operating system errors
+    shell            : bool = False,
+    linux_signals    : bool = False,
+    posix            : bool = False,
+    # hpc errors
+    infiniband       : bool = False,
+    lustre           : bool = False,
+    gpfs             : bool = False,
+    slurm            : bool = False,
+    pbs              : bool = False,
+    mpi              : bool = False,
+    openmp           : bool = False,
+    # code errors
+    linking          : bool = False,
+    fortran          : bool = False,
+    cpp              : bool = False,
+    cuda             : bool = False,
+    hip              : bool = False,
+    # python code errors
+    python           : bool = False,
+    # code library errors
+    blas             : bool = False,
+    lapack           : bool = False,
+    fftw             : bool = False,
+    hdf5             : bool = False,
+    libxml2          : bool = False,
+    # python module errors
+    numpy            : bool = False,
+    scipy            : bool = False,
+    h5py             : bool = False,
+    # simulation code errors
+    pwscf            : bool = False,
+    pyscf            : bool = False,
+    quantum_package  : bool = False,
+    rmg              : bool = False,
+    qmcpack          : bool = False,
+    vasp             : bool = False,
+    gamess           : bool = False,
+    # return lines found or not
+    return_lines     : bool = False,
+    ) -> bool | tuple[bool, list[str]]:
     """Find likely failure diagnostics in scientific-application output.
 
     Parameters

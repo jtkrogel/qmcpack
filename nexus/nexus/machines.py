@@ -43,9 +43,11 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import ClassVar
 from copy import deepcopy
 import platform
@@ -61,7 +63,7 @@ import importlib.util
 import importlib.machinery
 
 
-def our_load_source(modname, filename):
+def our_load_source(modname: str, filename: str) -> ModuleType:
     """" Replacement for the deprecated imp.load_source function"""
     loader = importlib.machinery.SourceFileLoader(modname, filename)
     spec = importlib.util.spec_from_file_location(modname, filename, loader=loader)
@@ -119,16 +121,16 @@ def get_cpu_cores() -> int:
 
 
 class Options(DevBase):
-    def __init__(self,**kwargs):
+    def __init__(self, **kwargs) -> None:
         self.add(**kwargs)
     #end def __init__
 
-    def add(self,**kwargs):
+    def add(self, **kwargs) -> None:
         for k,v in kwargs.items():
             self[k] = v
     #end def add
 
-    def read(self,options):
+    def read(self, options: str) -> None:
         if isinstance(options,(dict,obj)):
             self.add(**options)
         elif isinstance(options,list):
@@ -147,7 +149,7 @@ class Options(DevBase):
         #end if
     #end def read
 
-    def write(self):
+    def write(self) -> str:
         s = ''
         for k in sorted(self.keys()):
             s += ' '+str(self[k])
@@ -433,26 +435,26 @@ class Job(NexusCore):
 
 
     @staticmethod
-    def restore_default_settings():
+    def restore_default_settings() -> None:
         Job.machine = None
     #end def restore_default_settings
 
 
     @staticmethod
-    def generate_jobid():
+    def generate_jobid() -> int:
         Job.job_count += 1
         return Job.job_count
     #end def generate_jobid
 
 
     @classmethod
-    def zero_time(cls):
+    def zero_time(cls) -> obj:
         time = obj(days=0,hours=0,minutes=0,seconds=0)
         return time
     #end def zero_time
 
 
-    def __init__(self,**kwargs):
+    def __init__(self, **kwargs) -> None:
         # guard against invalid keys
         invalid = set(kwargs.keys())-set(job_defaults.keys())
         if len(invalid)>0:
@@ -597,7 +599,7 @@ class Job(NexusCore):
     #end def get_machine
 
 
-    def process(self,machine=None):
+    def process(self, machine = None) -> None:
         if self.template is not None:
             return
         #end if
@@ -609,7 +611,7 @@ class Job(NexusCore):
 
 
     # test needed
-    def process_options(self,machine=None):
+    def process_options(self, machine = None) -> None:
         if self.template is not None:
             return
         #end if
@@ -621,7 +623,7 @@ class Job(NexusCore):
 
 
     # test needed
-    def initialize(self,sim):
+    def initialize(self, sim) -> None:
         self.set_id()
         self.identifier = sim.identifier
         machine = self.get_machine()
@@ -681,20 +683,20 @@ class Job(NexusCore):
 
 
     # test needed
-    def renew_app_command(self,sim):
+    def renew_app_command(self, sim) -> None:
         if not self.user_app_command:
             self.app_command = sim.app_command()
         #end if
     #end def renew_app_command
 
 
-    def set_id(self):
+    def set_id(self) -> None:
         self.internal_id = Job.generate_jobid()
     #end def set_id
 
 
     # remove?
-    def set_processes(self):
+    def set_processes(self) -> None:
         if self.processes is None:
             msg = 'processes should have been set before now\ncontact the developers and have them fix this'
             raise NexusError(msg)
@@ -703,7 +705,13 @@ class Job(NexusCore):
     #end def set_processes
 
 
-    def set_environment(self,*,limited_env=False,clear_env=False,**env):
+    def set_environment(
+        self,
+        *,
+        limited_env : bool = False,
+        clear_env   : bool = False,
+        **env       : int | str | None,
+        ) -> None:
         machine = self.get_machine()
         if isinstance(machine,Supercomputer):
             limited_env = True
@@ -723,12 +731,12 @@ class Job(NexusCore):
     #end def set_environment
 
 
-    def divert_out_err(self):
+    def divert_out_err(self) -> None:
         self.identifier += '_divert'
     #end def divert_out_err
 
 
-    def get_time(self):
+    def get_time(self) -> obj:
         time = obj(
             days = self.days,
             hours = self.hours,
@@ -739,7 +747,7 @@ class Job(NexusCore):
     #end def get_time
 
 
-    def max_time(self,time):
+    def max_time(self, time: obj) -> obj:
         t  = time.seconds + 60*(time.minutes+60*(time.hours+24*time.days))
         ts = self.seconds + 60*(self.minutes+60*(self.hours+24*self.days))
         if ts>t:
@@ -752,13 +760,13 @@ class Job(NexusCore):
     #end def max_time
 
 
-    def serial_only(self):
+    def serial_only(self) -> bool:
         return 'serial' in self.app_props and len(self.app_props)==1
     #end if
 
 
     # remove?
-    def determine_end_status(self,status):
+    def determine_end_status(self, status: int) -> None:
         if not nexus_config.generate_only:
             self.successful = False # not really implemented yet
         #end if
@@ -766,14 +774,18 @@ class Job(NexusCore):
 
 
     # test needed
-    def write(self,*,file=False):
+    def write(
+        self,
+        *,
+        file : bool = False,
+        ) -> str | obj | None:
         machine = self.get_machine()
         return machine.write_job(self,file=file)
     #end def write
 
 
     # test needed
-    def submit(self):
+    def submit(self) -> None:
         machine = self.get_machine()
         machine.add_job(self)
         self.submitted = True
@@ -781,13 +793,19 @@ class Job(NexusCore):
 
 
     # test needed
-    def reenter_queue(self):
+    def reenter_queue(self) -> None:
         machine = self.get_machine()
         machine.requeue_job(self)
     #end def reenter_queue
 
 
-    def run_command(self,launcher=None,*,redirect=False,serial=False):
+    def run_command(
+        self,
+        launcher : str | None = None,
+        *,
+        redirect : bool       = False,
+        serial   : bool       = False,
+        ) -> str:
         if self.template is not None:
             return ''
         #end if
@@ -848,7 +866,7 @@ class Job(NexusCore):
     #end def run_command
 
 
-    def pbs_walltime(self):
+    def pbs_walltime(self) -> str:
         walltime=\
             str(int(self.hours   )).zfill(2)+':'\
             +str(int(self.minutes)).zfill(2)+':'\
@@ -860,7 +878,7 @@ class Job(NexusCore):
     #end def pbs_walltime
 
 
-    def sbatch_walltime(self):
+    def sbatch_walltime(self) -> str:
         walltime=\
             str(int(24*self.days+self.hours)).zfill(2)+':'\
             +str(int(self.minutes)).zfill(2)+':'\
@@ -869,7 +887,7 @@ class Job(NexusCore):
     #end def sbatch_walltime
 
 
-    def ll_walltime(self):
+    def ll_walltime(self) -> str:
         walltime=\
             str(int(24*self.days+self.hours)).zfill(2)+':'\
             +str(int(self.minutes)).zfill(2)+':'\
@@ -878,7 +896,7 @@ class Job(NexusCore):
     #end def ll_walltime
 
 
-    def lsf_walltime(self):
+    def lsf_walltime(self) -> str:
         walltime=\
             str(int(24*self.days+self.hours)).zfill(2)+':'\
             +str(int(self.minutes)).zfill(2)
@@ -886,7 +904,7 @@ class Job(NexusCore):
     #end def lsf_walltime
 
 
-    def normalize_time(self):
+    def normalize_time(self) -> None:
         t = self.total_seconds()
         d = int(t/(24*3600))
         t -= d*24*3600
@@ -902,41 +920,41 @@ class Job(NexusCore):
     #end def normalize_time
 
 
-    def total_seconds(self):
+    def total_seconds(self) -> int:
         return self.seconds+60*(self.minutes+60*(self.hours+24*self.days))
     #end def total_seconds
 
 
-    def total_minutes(self):
+    def total_minutes(self) -> int:
         return int(self.total_seconds()/60)
     #end def total_minutes
 
 
-    def total_hours(self):
+    def total_hours(self) -> int:
         return int(self.total_seconds()/3600)
     #end def total_hours
 
 
-    def total_days(self):
+    def total_days(self) -> int:
         return int(self.total_seconds()/(24*3600))
     #end def total_days
 
 
-    def clone(self):
+    def clone(self) -> Job:
         job = deepcopy(self)
         job.set_id()
         return job
     #end def clone
 
 
-    def serial_clone(self):
+    def serial_clone(self) -> Job:
         kw = deepcopy(self.init_info)
         kw.serial=True
         return Job(**kw)
     #end def serial_clone
 
 
-    def split_nodes(self,n):
+    def split_nodes(self, n: int) -> tuple[str | Job | obj, str | Job | obj]:
         run_options = self.run_options
         if not isinstance(n,int):
             msg = (
@@ -998,7 +1016,7 @@ class Machine(NexusCore):
     queue_configs = None
 
     @staticmethod
-    def get_hostname():
+    def get_hostname() -> str:
         hostname = gethostname()
         if '.' in hostname:
             machine_name = hostname.split('.')[0]
@@ -1010,19 +1028,19 @@ class Machine(NexusCore):
 
 
     @staticmethod
-    def exists(machine_name):
+    def exists(machine_name) -> bool:
         return machine_name in Machine.machines
     #end def exists
 
 
     @staticmethod
-    def is_unique(machine):
+    def is_unique(machine) -> bool:
         return id(machine)==id(Machine.machines[machine.name])
     #end def is_unique
 
 
     @staticmethod
-    def add(machine):
+    def add(machine) -> None:
         if not isinstance(machine,Machine):
             msg = 'attempted to add non-machine instance'
             raise TypeError(msg)
@@ -1063,14 +1081,14 @@ class Machine(NexusCore):
     #end def get
 
 
-    def warn(self,*args,**kwargs):
+    def warn(self, *args: str, **kwargs) -> None:
         if Machine.allow_warnings:
             NexusCore.warn(self,*args,**kwargs)
         #end if
     #end def warn
 
 
-    def validate(self):
+    def validate(self) -> None:
         if Machine.exists(self.name):
             if not Machine.is_unique(self):
                 msg = (
@@ -1086,7 +1104,7 @@ class Machine(NexusCore):
     #end def validate
 
 
-    def in_batch_mode(self):
+    def in_batch_mode(self) -> bool:
         return self.mode==self.modes.batch
     #end def in_batch_mode
 
@@ -1100,27 +1118,37 @@ class Machine(NexusCore):
     #end def submit_jobs
 
     # update all job information, must be idempotent
-    def process_job(self,job):
+    def process_job(self, job: Job):
         raise NotImplementedError
     #end def process_job
 
-    def process_job_options(self,job):
+    def process_job_options(self, job: Job):
         raise NotImplementedError
     #end def process_job_options
 
-    def write_job(self,job,*,file=False):
+    def write_job(
+        self,
+        job  : Job,
+        *,
+        file : bool = False,
+        ):
         raise NotImplementedError
     #end def write_job
 
-    def submit_job(self,job):
+    def submit_job(self, job: Job):
         raise NotImplementedError
     #end def submit_job
 
-    def specialized_bundle_commands(self,job,launcher,serial):
+    def specialized_bundle_commands(
+        self,
+        job,
+        launcher,
+        serial,
+        ):
         raise NotImplementedError
     #end def specialized_bundle_commands
 
-    def __init__(self,name,queue_size=0):
+    def __init__(self, name, queue_size: int = 0) -> None:
         # deferred type change for Machine.machines (protects testing)
         if isinstance(Machine.machines,dict):
             Machine.machines = obj(**Machine.machines)
@@ -1152,7 +1180,7 @@ class Machine(NexusCore):
     #end def __init__
 
 
-    def restore_default_settings(self):
+    def restore_default_settings(self) -> None:
         self.account         = None
         self.user            = None
         self.local_directory = None
@@ -1161,7 +1189,7 @@ class Machine(NexusCore):
     #end def restore_default_settings
 
 
-    def add_job(self,job):
+    def add_job(self, job: Job) -> None:
         if isinstance(job,Job):
             if job.template is None:
                 self.process_job(job)
@@ -1179,13 +1207,13 @@ class Machine(NexusCore):
     #end def add_job
 
 
-    def requeue_job(self,job):
+    def requeue_job(self, job: Job) -> None:
         pass
     #end def requeue_job
 
 
     allowed_user_info = frozenset({'account','local_directory','app_directory','app_directories'})
-    def incorporate_user_info(self,infoin):
+    def incorporate_user_info(self, infoin) -> None:
         info = obj(**infoin)
         vars = set(info.keys())
         invalid = vars-self.allowed_user_info
@@ -1221,12 +1249,13 @@ class Workstation(Machine):
 
     batch_capable = False
 
-    def __init__(self,
-                 name                = 'workstation',
-                 cores               = None,
-                 app_launcher        = 'mpirun',
-                 process_granularity = 1
-                 ):
+    def __init__(
+        self,
+        name                : int | str  = 'workstation',
+        cores               : int | None = None,
+        app_launcher        : str        = 'mpirun',
+        process_granularity : int        = 1,
+        ) -> None:
         Machine.__init__(self,name)
         self.app_launcher = app_launcher
         if cores is None:
@@ -1239,7 +1268,7 @@ class Workstation(Machine):
     #end def __init__
 
 
-    def process_job(self,job):
+    def process_job(self, job: Job) -> None:
         if job.serial_only():
             job.cores=1
         elif job.cores is None:
@@ -1261,12 +1290,12 @@ class Workstation(Machine):
     #end def process_job
 
 
-    def process_job_options(self,job):
+    def process_job_options(self, job: Job) -> None:
         job.run_options.add(np='-np '+str(job.processes))
     #end def process_job_options
 
 
-    def write_job_states(self,title=''):
+    def write_job_states(self, title: str = '') -> None:
         self.nxs_print(title,n=2)
         n=3
         self.nxs_print(f'{self.__class__.__name__} {self.name} {id(self)} job states',n=n )
@@ -1307,7 +1336,7 @@ class Workstation(Machine):
     #end def write_job_states
 
 
-    def query_queue(self):
+    def query_queue(self) -> None:
         #self.write_job_states('query queue')
         self.validate()
         done = []
@@ -1338,7 +1367,7 @@ class Workstation(Machine):
     #end def query_queue
 
 
-    def submit_jobs(self):
+    def submit_jobs(self) -> None:
         cores_used = 0
         for process in self.processes.values():
             cores_used += process.job.cores
@@ -1397,7 +1426,7 @@ class Workstation(Machine):
     #end def submit_jobs
 
 
-    def job_command(self,job,pad=None):
+    def job_command(self, job: Job, pad: str | None = None) -> str:
         command = 'export OMP_NUM_THREADS='+str(job.threads)+'\n'
         if len(job.presub)>0:
             command += job.presub+'\n'
@@ -1417,13 +1446,18 @@ class Workstation(Machine):
     #end def job_command
 
 
-    def write_job(self,job,*,file=False):
+    def write_job(
+        self,
+        job  : Job,
+        *,
+        file : bool = False,
+        ) -> str:
         c = self.job_command(job)
         return c
     #end def write_job
 
 
-    def requeue_job(self,job):
+    def requeue_job(self, job: Job) -> None:
         if isinstance(job,Job):
             jid = job.internal_id
             self.process_job(job)
@@ -1437,7 +1471,7 @@ class Workstation(Machine):
     #end def requeue_job
 
 
-    def submit_job(self,job):
+    def submit_job(self, job: Job) -> None:
         pad = self.enter(job.directory,msg=job.simid)
         command = self.job_command(job,pad=pad)
         job.status = job.states.running
@@ -1472,7 +1506,7 @@ class Workstation(Machine):
 # test needed
 class InteractiveCluster(Workstation):
 
-    def __init__(self,*args,**kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         if len(args)==0 or not isinstance(args[0],Supercomputer):
             self.init_from_args(*args,**kwargs)
         else:
@@ -1484,15 +1518,16 @@ class InteractiveCluster(Workstation):
     #end def __init__
 
 
-    def init_from_args(self,
-                       name                = 'icluster',
-                       nodes               = None,
-                       procs_per_node      = None,
-                       cores_per_proc      = None,
-                       process_granularity = None,
-                       ram_per_node        = None,
-                       app_launcher        = None
-                       ):
+    def init_from_args(
+        self,
+        name                : str = 'icluster',
+        nodes                     = None,
+        procs_per_node            = None,
+        cores_per_proc            = None,
+        process_granularity       = None,
+        ram_per_node              = None,
+        app_launcher              = None,
+        ) -> None:
         self.name           = name
         self.nodes          = nodes
         self.procs_per_node = procs_per_node
@@ -1514,7 +1549,7 @@ class InteractiveCluster(Workstation):
     #end def init_from_args
 
 
-    def init_from_supercomputer(self,super,cores):
+    def init_from_supercomputer(self, super, cores) -> None:
         nodes = cores//super.cores_per_node
         if cores-nodes*super.cores_per_node!=0:
             msg = (
@@ -1530,7 +1565,7 @@ class InteractiveCluster(Workstation):
     #end def init_from_supercomputer
 
 
-    def process_job(self,job):
+    def process_job(self, job: Job) -> None:
         job.cores = min(job.cores,self.cores)
 
         Workstation.process_job(self,job)
@@ -1575,18 +1610,19 @@ class Supercomputer(Machine):
         'job_remover'
         )
 
-    def __init__(self,
-                 nodes          = None,
-                 procs_per_node = None,
-                 cores_per_proc = None,
-                 ram_per_node   = None,
-                 queue_size     = 0,
-                 app_launcher   = None,
-                 sub_launcher   = None,
-                 queue_querier  = None,
-                 job_remover    = None,
-                 name           = None,
-                 ):
+    def __init__(
+        self,
+        nodes          : int | None = None,
+        procs_per_node : int | None = None,
+        cores_per_proc : int | None = None,
+        ram_per_node   : int | None = None,
+        queue_size     : int        = 0,
+        app_launcher                = None,
+        sub_launcher   : str | None = None,
+        queue_querier  : str | None = None,
+        job_remover    : str | None = None,
+        name                        = None,
+        ) -> None:
         if name is None:
             if self.name is not None:
                 name = self.name
@@ -1731,13 +1767,13 @@ class Supercomputer(Machine):
 
 
     # test needed
-    def interactive_representation(self,cores):
+    def interactive_representation(self, cores) -> InteractiveCluster:
         return InteractiveCluster(self,cores)
     #end def interactive_representation
 
 
     # test needed
-    def requeue_job(self,job):
+    def requeue_job(self, job: Job) -> None:
         if isinstance(job,Job):
             jid = job.internal_id
             pid = job.system_id
@@ -1765,7 +1801,7 @@ class Supercomputer(Machine):
     #end def requeue_job
 
 
-    def process_job(self,job):
+    def process_job(self, job: Job) -> None:
         if job.fake_job:
             return
         #end if
@@ -1831,7 +1867,7 @@ class Supercomputer(Machine):
     #end def process_job
 
 
-    def process_job_options(self,job):
+    def process_job_options(self, job: Job) -> None:
         launcher = self.app_launcher
         if launcher=='mpirun':
             job.run_options.add(np='-np '+str(job.processes))
@@ -1889,17 +1925,17 @@ class Supercomputer(Machine):
     #end def process_job_options
 
 
-    def pre_process_job(self,job):
+    def pre_process_job(self, job: Job) -> None:
         pass
     #end def pre_process_job
 
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         pass
     #end def post_process_job
 
 
-    def query_queue(self,out=None):
+    def query_queue(self, out = None) -> obj:
         self.system_queue.clear()
         if self.query_with_username and self.user is None:
             msg = (
@@ -2104,7 +2140,7 @@ class Supercomputer(Machine):
     #end def query_queue
 
 
-    def submit_jobs(self):
+    def submit_jobs(self) -> None:
         nprocesses_running = len(self.processes)
         queue_slots_available = self.queue_size-nprocesses_running
         remove = []
@@ -2125,7 +2161,7 @@ class Supercomputer(Machine):
     #end def submit_jobs
 
 
-    def submit_job(self,job):
+    def submit_job(self, job: Job) -> None:
         pad = self.enter(job.directory,msg=job.internal_id)
         if job.subfile is None:
             msg = 'submission file not specified for job'
@@ -2169,12 +2205,12 @@ class Supercomputer(Machine):
     #end def submit_job
 
 
-    def sub_command(self,job):
+    def sub_command(self, job: Job) -> str:
         return self.sub_launcher+job.sub_options.write()+' '+job.subfile
     #end def sub_command
 
 
-    def remove_job(self,job):
+    def remove_job(self, job) -> None:
         if self.job_remover=='qdel':
             command = 'qdel '+str(job.system_id)
         elif self.job_remover=='scancel':
@@ -2187,7 +2223,7 @@ class Supercomputer(Machine):
     #end def remove_job
 
 
-    def setup_environment(self,job):
+    def setup_environment(self, job: Job) -> str:
         env = ''
         if job.env is not None:
             for name,val in job.env.items():
@@ -2198,7 +2234,12 @@ class Supercomputer(Machine):
     #end def setup_environment
 
 
-    def write_job(self,job,*,file=False):
+    def write_job(
+        self,
+        job  : Job,
+        *,
+        file : bool = False,
+        ) -> str:
         job.subfile = job.name+'.'+self.sub_launcher+'.in'
         if job.template is None:
             env = self.setup_environment(job)
@@ -2229,12 +2270,12 @@ class Supercomputer(Machine):
     #end def write_job
 
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job):
         raise NotImplementedError
     #end def write_job_header
 
     @staticmethod
-    def walltime_to_seconds(walltime_str):
+    def walltime_to_seconds(walltime_str) -> int:
         """
         Convert walltime string to total seconds
         Handles formats: 'dd:hh:mm:ss', 'hh:mm:ss', 'mm:ss', 'seconds'
@@ -2264,7 +2305,7 @@ class Supercomputer(Machine):
         #end try
     #end def walltime_to_seconds
     @ staticmethod
-    def seconds_to_walltime(seconds):
+    def seconds_to_walltime(seconds) -> str:
         """
         Convert total seconds to walltime string
         Handles formats: 'dd:hh:mm:ss', 'hh:mm:ss', 'mm:ss', 'seconds'
@@ -2276,7 +2317,7 @@ class Supercomputer(Machine):
         return f"{days}:{hours:02d}:{minutes:02d}:{seconds:02d}"
     #end def seconds_to_walltime
 
-    def validate_queue_config(self, job):
+    def validate_queue_config(self, job: Job) -> bool:
         """Validate job against queue configuration constraints
 
         Returns
@@ -2411,7 +2452,7 @@ class Supercomputer(Machine):
         return True
     #end def validate_queue_config
 
-    def read_process_id(self,output):
+    def read_process_id(self, output: str) -> int | None:
         pid = None
         lines = output.splitlines()
         if self.sub_launcher=='llsubmit': # specialization for load leveler (SuperMUC)
@@ -2494,7 +2535,7 @@ class Kraken(Supercomputer):
 
     requires_account = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         c='#!/bin/bash\n'
         c+='#PBS -A '+str(job.account)+'\n'
         c+='#PBS -N '+str(job.name)+'\n'
@@ -2524,7 +2565,7 @@ class Jaguar(Supercomputer):
 
     requires_account = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue='batch'
         #end if
@@ -2558,7 +2599,7 @@ export MPI_MSGS_PER_PROC=32768
 #Unknown
 class Golub(Supercomputer):
     name = 'golub'
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue='secondary'
         #end if
@@ -2588,7 +2629,7 @@ class OIC5(Supercomputer):
     name = 'oic5'
     batch_capable = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'mstqmc13q'
         #end if
@@ -2618,7 +2659,7 @@ cd $PBS_O_WORKDIR
     #end def write_job_header
 
 
-    def read_process_id(self,output):
+    def read_process_id(self, output: str) -> int | None:
         pid = None
         lines = output.splitlines()
         for line in lines:
@@ -2639,7 +2680,7 @@ cd $PBS_O_WORKDIR
 class NerscMachine(Supercomputer):
     batch_capable = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'regular'
         #end if
@@ -2669,7 +2710,7 @@ cd $SLURM_SUBMIT_DIR
 class Cori(NerscMachine):
     name = 'cori'
 
-    def pre_process_job(self,job):
+    def pre_process_job(self, job: Job) -> None:
         if job.queue is None:
             job.queue = 'regular'
         #end if
@@ -2704,7 +2745,7 @@ class Cori(NerscMachine):
         #end if
     #end def pre_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         self.pre_process_job(job) # sync machine view with job
         if 'knl' in job.constraint:
             hyperthreads   = 4
@@ -2758,7 +2799,7 @@ export OMP_PLACES=threads
 class Perlmutter(NerscMachine):
     name = 'perlmutter'
 
-    def pre_process_job(self,job):
+    def pre_process_job(self, job: Job) -> None:
         # Set default queue and node type
         if job.queue is None:
             job.queue = 'regular'
@@ -2787,7 +2828,7 @@ class Perlmutter(NerscMachine):
         #end if
     #end def pre_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         self.pre_process_job(job) # sync machine view with job
 
         # Check if the user gave reasonable processes_per_node
@@ -2921,7 +2962,7 @@ class BlueWatersXK(Supercomputer):
     requires_account = False
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         c='#!/bin/bash\n'
         c+='#PBS -N '+str(job.name)+'\n'
         c+='#PBS -l walltime='+job.pbs_walltime()+'\n'
@@ -2948,7 +2989,7 @@ class BlueWatersXE(Supercomputer):
     requires_account = False
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         c='#!/bin/bash\n'
         c+='#PBS -N '+str(job.name)+'\n'
         c+='#PBS -l walltime='+job.pbs_walltime()+'\n'
@@ -2975,7 +3016,7 @@ class Titan(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'batch'
         #end if
@@ -3008,7 +3049,7 @@ class EOS(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         if job.threads>1:
             if job.threads<=8:
                 job.run_options.add(ss='-ss')
@@ -3018,7 +3059,7 @@ class EOS(Supercomputer):
     #end def post_process_job
 
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'batch'
         #end if
@@ -3055,7 +3096,7 @@ class ALCF_Machine(Supercomputer):
 
     base_partition = None
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         job.sub_options.add(
             env  = '--env BG_SHAREDMEMSIZE=32',
             mode = '--mode script'
@@ -3079,7 +3120,7 @@ class ALCF_Machine(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'default'
         #end if
@@ -3125,7 +3166,7 @@ class Cooley(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         #if job.processes_per_node is None and job.threads!=1:
         #    self.error('threads must be 1,2,3,4,6, or 12 on Cooley\nyou provided: {0}'.format(job.threads))
         ##end if
@@ -3137,7 +3178,7 @@ class Cooley(Supercomputer):
         return
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'default'
         #end if
@@ -3162,7 +3203,7 @@ class Theta(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         if job.hyperthreads is None:
             job.hyperthreads = 1
         #end if
@@ -3175,7 +3216,7 @@ class Theta(Supercomputer):
             )
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'default'
         #end if
@@ -3198,7 +3239,7 @@ class Lonestar(Supercomputer):  # Lonestar contribution from Paul Young
     requires_account = False
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'batch'
         #end if
@@ -3218,7 +3259,7 @@ class Lonestar(Supercomputer):  # Lonestar contribution from Paul Young
     #end def write_job_header
 
 
-    def read_process_id(self,output):
+    def read_process_id(self, output: str) -> int | None:
         pid = None
         lines = output.splitlines()
 
@@ -3244,7 +3285,7 @@ class ICMP_Machine(Supercomputer): # ICMP and Amos contributions from Ryan McAvo
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'defq'
         #end if
@@ -3284,7 +3325,7 @@ class Amos(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'debug'
         #end if
@@ -3359,7 +3400,7 @@ class SnlMachine(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue='batch'
         #end if
@@ -3463,7 +3504,7 @@ class SuperMUC(Supercomputer):
     batch_capable       = True
     query_with_username = False
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'general'
         #end if
@@ -3543,7 +3584,7 @@ class SuperMUC_NG(Supercomputer):
     batch_capable       = True
     query_with_username = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'general'
         #end if
@@ -3610,7 +3651,7 @@ class Stampede2(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue='normal'
         #end if
@@ -3687,7 +3728,7 @@ class CadesMoab(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         ppn = job.processes_per_node
         if job.threads>1 and ppn is not None and ppn>1:
             processes_per_socket = int(np.floor(job.processes_per_node/2))
@@ -3695,7 +3736,7 @@ class CadesMoab(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'skylake'
         #end if
@@ -3730,7 +3771,7 @@ class CadesSlurm(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'skylake'
         #end if
@@ -3765,7 +3806,7 @@ class Inti(Supercomputer):
     requires_account = False
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'QMCREGULAR'
         #end if
@@ -3827,7 +3868,7 @@ class Baseline(Supercomputer):
             }
         })
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         self.validate_queue_config(job)
 
         c  = '#!/bin/bash\n'
@@ -3871,7 +3912,7 @@ class Frontier(Supercomputer):
             }
         })
 
-    def pre_process_job(self,job):
+    def pre_process_job(self, job: Job) -> None:
         # Set default queue and node type
         if job.queue is None:
             job.queue = 'batch'
@@ -3895,7 +3936,7 @@ class Frontier(Supercomputer):
     #end def pre_process_job
 
 
-    def post_process_job(self, job):
+    def post_process_job(self, job: Job) -> None:
         if 'cpu' in job.constraint:
             job.run_options.add(
                 cpu_bind='--cpu-bind=threads',
@@ -3915,7 +3956,7 @@ class Frontier(Supercomputer):
 
             )
 
-    def write_job_header(self, job):
+    def write_job_header(self, job: Job) -> str:
         self.validate_queue_config(job)
         if job.queue is None:
             job.queue = 'batch'
@@ -3961,7 +4002,7 @@ class Besms(Supercomputer):
             'max_walltime': '48:00:00',
         },
     })
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         self.validate_queue_config(job)
 
         c  = '#!/bin/bash\n'
@@ -3995,7 +4036,7 @@ class Summit(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         # add the options only if the user has not supplied options
         if len(job.run_options)==0:
             opt = obj(
@@ -4045,7 +4086,7 @@ class Summit(Supercomputer):
     #end def post_process_job
 
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         c ='#!/bin/bash\n'
         c+=f'#BSUB -P {job.account}\n'
         if job.queue is not None:
@@ -4063,7 +4104,7 @@ class Summit(Supercomputer):
     #end def write_job_header
 
 
-    def read_process_id(self,output):
+    def read_process_id(self, output: str) -> int | None:
         pid = None
         tokens = output.split()
         for t in tokens:
@@ -4091,7 +4132,7 @@ class Rhea(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         job.run_options.add(
             N=f'-N {job.nodes}',
             n=f'-n {job.processes}',
@@ -4113,7 +4154,7 @@ class Rhea(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue='batch'
         #end if
@@ -4200,7 +4241,7 @@ class Leonardo(Supercomputer):
     serial_max_cores  = 4      # 4 core max
     serial_max_hours  = 4.0    # 4 ore
 
-    def post_process_job(self, job):
+    def post_process_job(self, job: Job) -> None:
         """
         Adjust srun options based on job properties (nodes, processes, threads).
         This is called after the Job object is created and before writing the script.
@@ -4232,7 +4273,7 @@ class Leonardo(Supercomputer):
         # end if
     # end def post_process_job
 
-    def write_job_header(self, job):
+    def write_job_header(self, job: Job) -> str:
         """
         Write the SLURM job script header according to:
           - Booster partition (boost_usr_prod) and its QoS table
@@ -4412,7 +4453,7 @@ class Andes(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         if job.threads>1:
             job.run_options.add(
                 c = f'-c {job.threads}',
@@ -4434,7 +4475,7 @@ class Andes(Supercomputer):
             )
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue='batch'
         #end if
@@ -4490,7 +4531,7 @@ class Archer2(Supercomputer):
     outfile_extension  = '.output'
     errfile_extension  = '.error'
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         job.run_options.add(
             distribution='--distribution=block:block',
             hint='--hint=nomultithread',
@@ -4514,7 +4555,7 @@ class Archer2(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.qos is None:
             job.qos='standard'
         #end if
@@ -4575,7 +4616,7 @@ class Tomcat3(Supercomputer):
     batch_capable    = True
     redirect_output  = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'tomcat'
         #end if
@@ -4606,7 +4647,7 @@ class Polaris(Supercomputer):
     batch_capable    = True
     special_bundling = True
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         if len(job.run_options)==0:
             opt = obj(
                 ppn     = f'--ppn {job.processes_per_node}',
@@ -4618,7 +4659,7 @@ class Polaris(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'prod'
         #end if
@@ -4642,7 +4683,12 @@ class Polaris(Supercomputer):
         return c
     #end def write_job_header
 
-    def specialized_bundle_commands(self,job,launcher,serial):
+    def specialized_bundle_commands(
+        self,
+        job,
+        launcher,
+        serial,
+        ) -> str:
         c = ''
         j0 = job.bundled_jobs[0]
         c+=f'split --lines={j0.nodes} --numeric-suffixes=1 --suffix-length=3 $PBS_NODEFILE local_hostfile.\n'
@@ -4669,7 +4715,7 @@ class Aurora(Supercomputer):
     batch_capable    = True
     special_bundling = True
 
-    def pre_process_job(self,job):
+    def pre_process_job(self, job: Job) -> None:
         # Set default queue and node type
         if job.queue is None:
             job.queue = 'prod'
@@ -4696,7 +4742,7 @@ class Aurora(Supercomputer):
         #end if
     #end def pre_process_job
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         if len(job.run_options)==0:
             if 'cpu' in job.constraint:
                 threads = f'--env OMP_NUM_THREADS={job.threads} --env OMP_PLACES=cores'
@@ -4729,7 +4775,7 @@ class Aurora(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         c= '#!/bin/sh\n'
         c+=f'#PBS -l select={job.nodes}\n'
         c+='#PBS -l place=scatter\n'
@@ -4748,7 +4794,12 @@ class Aurora(Supercomputer):
         return c
     #end def write_job_header
 
-    def specialized_bundle_commands(self,job,launcher,serial):
+    def specialized_bundle_commands(
+        self,
+        job,
+        launcher,
+        serial,
+        ) -> str:
         c = ''
         j0 = job.bundled_jobs[0]
         c+=f'split --lines={j0.nodes} --numeric-suffixes=1 --suffix-length=3 $PBS_NODEFILE local_hostfile.\n'
@@ -4774,7 +4825,7 @@ class Improv(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         if len(job.run_options)==0:
             opt = obj(
                 mapby   = f'--map-by ppr:{job.processes_per_proc}:package',
@@ -4791,7 +4842,7 @@ class Improv(Supercomputer):
 
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'compute'
         #end if
@@ -4824,7 +4875,7 @@ class Kagayaki(Supercomputer):
     batch_capable    = True
     special_bundling = False
 
-    def process_job_options(self,job):
+    def process_job_options(self, job: Job) -> None:
         # job.run_options.add(nodefile='-machinefile $PBS_NODEFILE', np='-np '+str(job.processes))
         opt = obj(
             nodefile='-machinefile $PBS_NODEFILE',
@@ -4833,7 +4884,7 @@ class Kagayaki(Supercomputer):
             )
         job.run_options.add(**opt)
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         ppn = 16 if job.queue in {'Default', 'SINGLE', 'LONG', 'DEFAULT'} else 128
         c=''
         c+='#!/bin/bash\n'
@@ -4857,7 +4908,7 @@ class Kestrel(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'regular'
         #end if
@@ -4893,7 +4944,7 @@ class Lassen(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def post_process_job(self,job):
+    def post_process_job(self, job: Job) -> None:
         # add the options only if the user has not supplied options
         if len(job.run_options)==0:
             opt = obj(
@@ -4918,7 +4969,7 @@ class Lassen(Supercomputer):
         #end if
     #end def post_process_job
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         c ='#!/bin/bash\n'
         c+=f'#BSUB -G {job.account}\n'
         if job.queue is not None:
@@ -4935,7 +4986,7 @@ class Lassen(Supercomputer):
         return c
     #end def write_job_header
 
-    def read_process_id(self,output):
+    def read_process_id(self, output: str) -> int | None:
         pid = None
         tokens = output.split()
         for t in tokens:
@@ -4958,7 +5009,7 @@ class Ruby(Supercomputer):
     requires_account = True
     batch_capable    = True
 
-    def write_job_header(self,job):
+    def write_job_header(self, job: Job) -> str:
         if job.queue is None:
             job.queue = 'regular'
         #end if

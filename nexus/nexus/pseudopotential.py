@@ -22,13 +22,16 @@ from .testing import object_eq
 from .pseudoset import pp_elem_label
 from .utilities import path_string
 
+from pathlib import Path
+
+
 
 class Pseudopotential(DevBase):
 
     requires_format = False
     formats = None
 
-    def __init__(self,filepath=None,format=None):
+    def __init__(self, filepath = None, format = None) -> None:
         self.element = None
         self.core    = None
         self.Zval    = None
@@ -39,7 +42,7 @@ class Pseudopotential(DevBase):
     #end def __init__
 
 
-    def transfer_core_from(self,other):
+    def transfer_core_from(self, other) -> None:
         self.element = other.element
         self.core    = other.core
         self.Zval    = other.Zval
@@ -47,7 +50,7 @@ class Pseudopotential(DevBase):
     #end def transfer_core_from
 
 
-    def read(self,filepath,format=None):
+    def read(self, filepath: Path, format = None) -> None:
         filepath = path_string(filepath)
         if self.requires_format:
             if format is None:
@@ -75,7 +78,7 @@ class Pseudopotential(DevBase):
     #end def read
 
 
-    def write(self,filepath=None,format=None):
+    def write(self, filepath: Path | None = None, format: str | None = None) -> str:
         if self.requires_format:
             if format is None:
                 msg = (
@@ -100,19 +103,29 @@ class Pseudopotential(DevBase):
     #end def write
 
 
-    def read_text(self,text,format=None,filepath=None):
+    def read_text(
+        self,
+        text     : str,
+        format   = None,
+        filepath = None,
+        ):
         raise NotImplementedError
     #end def read_text
 
-    def write_text(self,format=None):
+    def write_text(self, format = None):
         raise NotImplementedError
     #end def write_text
 
-    def convert(self,format):
+    def convert(self, format):
         raise NotImplementedError
     #end def convert
 
-    def plot(self,r=None,*,show=True):
+    def plot(
+        self,
+        r           = None,
+        *,
+        show : bool = True,
+        ):
         raise NotImplementedError
     #end def plot
 #end class Pseudopotential
@@ -139,7 +152,13 @@ class SemilocalPP(Pseudopotential):
     #end for
     channel_indices.L2 = -1
 
-    def __init__(self,filepath=None,format=None,name=None,src=None):
+    def __init__(
+        self,
+        filepath : Path | None = None,
+        format   : str | None  = None,
+        name                   = None,
+        src                    = None,
+        ) -> None:
         self.name = name
         self.rcut = None
         self.lmax = None
@@ -157,7 +176,7 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def transfer_core_from(self,other):
+    def transfer_core_from(self, other) -> None:
         self.name  = other.name
         self.rcut  = other.rcut
         self.lmax  = other.lmax
@@ -169,7 +188,7 @@ class SemilocalPP(Pseudopotential):
     #end def transfer_core_from
 
 
-    def read(self,filepath,format=None):
+    def read(self, filepath: Path, format = None) -> None:
         Pseudopotential.read(self,filepath,format)
         if self.rcut is None:
             self.update_rcut()
@@ -177,13 +196,19 @@ class SemilocalPP(Pseudopotential):
     #end def read
 
 
-    def has_component(self,l):
+    def has_component(self, l: str) -> bool:
         return l in self.components
     #end def has_component
 
 
     # test needed
-    def set_component(self,l,v,*,guard=False):
+    def set_component(
+        self,
+        l,
+        v,
+        *,
+        guard : bool = False,
+        ) -> None:
         if guard and l in self.components:
             msg = (
                 'cannot set requested component potential\n'
@@ -196,7 +221,12 @@ class SemilocalPP(Pseudopotential):
     #end def set_component
 
 
-    def get_component(self,l,*,guard=False):
+    def get_component(
+        self,
+        l     : str,
+        *,
+        guard : bool = False,
+        ) -> obj | np.ndarray | None:
         v = None
         if l in self.components:
             v = self.components[l]
@@ -214,7 +244,12 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def remove_component(self,l,*,guard=False):
+    def remove_component(
+        self,
+        l,
+        *,
+        guard : bool = False,
+        ) -> None:
         if l in self.components:
             del self.components[l]
         elif guard:
@@ -229,12 +264,12 @@ class SemilocalPP(Pseudopotential):
     #end def remove_component
 
 
-    def has_local(self):
+    def has_local(self) -> bool:
         return self.local in self.components
     #end def has_local
 
 
-    def has_nonlocal(self,l=None):
+    def has_nonlocal(self, l = None) -> bool:
         vnl = self.get_nonlocal()
         if l is None:
             return len(vnl)>0
@@ -244,17 +279,17 @@ class SemilocalPP(Pseudopotential):
     #end def has_nonlocal
 
 
-    def has_L2(self):
+    def has_L2(self) -> bool:
         return 'L2' in self.components
     #end def has_L2
 
 
-    def get_local(self):
+    def get_local(self) -> obj | np.ndarray:
         return self.get_component(self.local,guard=True)
     #end def get_local
 
 
-    def get_nonlocal(self,l=None):
+    def get_nonlocal(self, l = None) -> obj | np.ndarray:
         vnl = obj()
         for lc,vc in self.components.items():
             if lc!=self.local and lc!='L2':
@@ -278,20 +313,20 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def get_L2(self):
+    def get_L2(self) -> obj | np.ndarray:
         return self.get_component('L2',guard=True)
     #end def get_L2
 
 
     # test needed
-    def add_local(self,l,v):
+    def add_local(self, l, v) -> None:
         self.set_component(l,v,guard=True)
         self.local = l
     #end def add_local
 
 
     # test needed
-    def add_nonlocal(self,l,v):
+    def add_nonlocal(self, l, v) -> None:
         if l==self.local:
             self.promote_local()
         #end if
@@ -300,20 +335,20 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def add_L2(self,v):
+    def add_L2(self, v) -> None:
         self.set_component('L2',v,guard=True)
     #end def add_L2
 
 
     # test needed
-    def remove_local(self):
+    def remove_local(self) -> None:
         self.remove_component(self.local,guard=True)
         self.local = None
     #end def remove_local
 
 
     # test needed
-    def remove_nonlocal(self,l=None):
+    def remove_nonlocal(self, l = None) -> None:
         vnl = self.get_nonlocal()
         if l is None:
             for l in vnl.keys():
@@ -334,12 +369,12 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def remove_L2(self):
+    def remove_L2(self) -> None:
         self.remove_component('L2',guard=True)
     #end def remove_L2
 
 
-    def assert_numeric(self,loc):
+    def assert_numeric(self, loc: str) -> None:
         if not self.numeric:
             msg = (
                 f'failing at {loc}\n'
@@ -351,7 +386,7 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def change_local(self,local):
+    def change_local(self, local) -> None:
         self.assert_numeric('change_local')
         if local==self.local:
             return
@@ -405,7 +440,7 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def promote_local(self):
+    def promote_local(self) -> None:
         found = False
         for l in self.l_channels:
             if l not in self.components:
@@ -426,7 +461,7 @@ class SemilocalPP(Pseudopotential):
 
     # test needed
     # ensure that v_l=<l|vpp|l>==v, while v_l' remains unchanged
-    def set_channel(self,l,v):
+    def set_channel(self, l, v) -> None:
         self.assert_numeric('set_channel')
         if not self.has_local():
             msg = (
@@ -453,7 +488,7 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def expand_L2(self,lmax):
+    def expand_L2(self, lmax) -> None:
         self.assert_numeric('expand_L2')
         if lmax not in self.channel_indices:
             msg = (
@@ -481,7 +516,7 @@ class SemilocalPP(Pseudopotential):
 
 
     # test needed
-    def angular_channels(self):
+    def angular_channels(self) -> list[str]:
         channels = []
         for l in self.l_channels:
             if l in self.components:
@@ -494,12 +529,21 @@ class SemilocalPP(Pseudopotential):
 
     # evaluate r*potential based on a potential component object
     #  component representation is specific to each derived class
-    def evaluate_comp_rV(self,r,l,vcomp):
+    def evaluate_comp_rV(
+        self,
+        r     : np.ndarray | None,
+        l     : str,
+        vcomp : obj | np.ndarray,
+        ):
         raise NotImplementedError
     #end def evaluate_comp_rV
 
 
-    def find_r_rng(self,r,rmin):
+    def find_r_rng(
+        self,
+        r    : np.ndarray | None,
+        rmin : int | float,
+        ) -> tuple[np.ndarray | None, np.ndarray | None]:
         if r is None and self.numeric and not self.interpolatable:
             r = self.r
         #end if
@@ -514,7 +558,16 @@ class SemilocalPP(Pseudopotential):
 
     # evaluate potential based on a potential component object
     #  local, nonlocal, and L2 are all represented by separate component objects
-    def evaluate_comp(self,r,l,vcomp,rpow=0,rmin=0,*,rret=True):
+    def evaluate_comp(
+        self,
+        r     : np.ndarray,
+        l     : str,
+        vcomp : obj | np.ndarray,
+        rpow  : int         = 0,
+        rmin  : int | float = 0,
+        *,
+        rret  : bool        = True,
+        ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         v = self.evaluate_comp_rV(r,l,vcomp)
         r,rng = self.find_r_rng(r,rmin)
         if rng is not None:
@@ -532,7 +585,14 @@ class SemilocalPP(Pseudopotential):
 
 
     # evaluate the local component potential only
-    def evaluate_local(self,r=None,rpow=0,rmin=0,*,rret=False):
+    def evaluate_local(
+        self,
+        r    : np.ndarray | None = None,
+        rpow : int               = 0,
+        rmin : int | float       = 0,
+        *,
+        rret : bool              = False,
+        ) -> np.ndarray:
         l = self.local
         if not self.has_component(l):
             msg = (
@@ -556,7 +616,15 @@ class SemilocalPP(Pseudopotential):
 
 
     # evaluate a nonlocal component potential
-    def evaluate_nonlocal(self,r=None,l=None,rpow=0,rmin=0,*,rret=False):
+    def evaluate_nonlocal(
+        self,
+        r    : np.ndarray | None = None,
+        l    : str | None        = None,
+        rpow : int               = 0,
+        rmin : int | float       = 0,
+        *,
+        rret : bool              = False,
+        ) -> np.ndarray:
         if l==self.local:
             msg = (
                 'called evaluate_nonlocal requesting local potential\n'
@@ -592,7 +660,14 @@ class SemilocalPP(Pseudopotential):
 
     # test needed
     # evaluate the L2 component potential
-    def evaluate_L2(self,r=None,rpow=0,rmin=0,*,rret=False):
+    def evaluate_L2(
+        self,
+        r           = None,
+        rpow : int  = 0,
+        rmin : int  = 0,
+        *,
+        rret : bool = False,
+        ) -> int | tuple[tuple, int | None] | None:
         l = 'L2'
         if not self.has_component(l):
             msg = (
@@ -608,7 +683,16 @@ class SemilocalPP(Pseudopotential):
 
 
     # evaluate semilocal potential components in isolation
-    def evaluate_component(self,r=None,l=None,rpow=0,rmin=0,*,rret=False,optional=False):
+    def evaluate_component(
+        self,
+        r               = None,
+        l               = None,
+        rpow     : int  = 0,
+        rmin     : int  = 0,
+        *,
+        rret     : bool = False,
+        optional : bool = False,
+        ) -> int | tuple[int | tuple, int | None] | None:
         vcomp = self.get_component(l)
         if vcomp is not None:
             return self.evaluate_comp(r,l,vcomp,rpow,rmin,rret)
@@ -630,7 +714,17 @@ class SemilocalPP(Pseudopotential):
 
 
     # evaluate angular momentum channel of full potential
-    def evaluate_channel(self,r=None,l=None,rpow=0,rmin=0,*,rret=False,with_local=True,with_L2=True):
+    def evaluate_channel(
+        self,
+        r          : np.ndarray | None = None,
+        l          : str | None        = None,
+        rpow       : int               = 0,
+        rmin       : int | float       = 0,
+        *,
+        rret       : bool              = False,
+        with_local : bool              = True,
+        with_L2    : bool              = True,
+        ) -> np.ndarray | tuple[np.ndarray | None, np.ndarray | None]:
         if l not in self.l_channels:
             msg = (
                 'evaluate_channel must be called with a valid angular momentum label\n'
@@ -679,7 +773,17 @@ class SemilocalPP(Pseudopotential):
 
 
     # similar to evaluate_channel but with defaults appropriate for QMCPACK
-    def numeric_channel(self,l=None,rmin=0.,rmax=10.,npts=10001,rpow=0,*,with_local=True,with_L2=True):
+    def numeric_channel(
+        self,
+        l          : str | None = None,
+        rmin       : float      = 0.,
+        rmax       : float      = 10.,
+        npts       : int        = 10001,
+        rpow       : int        = 0,
+        *,
+        with_local : bool       = True,
+        with_L2    : bool       = True,
+        ) -> tuple[np.ndarray, np.ndarray | None]:
         if self.numeric and not self.interpolatable:
             r = None
         else:
@@ -694,7 +798,12 @@ class SemilocalPP(Pseudopotential):
     #end def numeric_channel
 
 
-    def update_rcut(self,tol=1e-5,*,optional=False):
+    def update_rcut(
+        self,
+        tol      : float = 1e-5,
+        *,
+        optional : bool  = False,
+        ) -> np.float64 | None:
         if not optional or self.rcut is None:
             self.rcut = self.find_rcut(tol=tol,with_L2=False)
         #end if
@@ -706,7 +815,12 @@ class SemilocalPP(Pseudopotential):
     #end def update_rcut
 
 
-    def find_rcut(self,tol=1e-5,*,with_L2=False):
+    def find_rcut(
+        self,
+        tol     : float = 1e-5,
+        *,
+        with_L2 : bool  = False,
+        ) -> float | np.float64:
         vnl = self.get_nonlocal()
         if with_L2 and self.has_L2():
             vnl.L2 = self.get_L2()
@@ -762,7 +876,21 @@ class SemilocalPP(Pseudopotential):
     #end def find_rcut
 
 
-    def plot(self,r=None,*,show=True,fig=True,linestyle='-',channels=None,with_local=False,rmin=0.01,rmax=5.0,title=None,metric=None,color=None):
+    def plot(
+        self,
+        r                  = None,
+        *,
+        show       : bool  = True,
+        fig        : bool  = True,
+        linestyle  : str   = '-',
+        channels           = None,
+        with_local : bool  = False,
+        rmin       : float = 0.01,
+        rmax       : float = 5.0,
+        title              = None,
+        metric             = None,
+        color              = None,
+        ) -> None:
         import matplotlib.pyplot as plt
         if channels is None:
             channels = self.l_channels
@@ -824,7 +952,20 @@ class SemilocalPP(Pseudopotential):
     #end def plot
 
 
-    def plot_components(self,r=None,*,show=True,fig=True,linestyle='-',rmin=0.01,rmax=5.0,title=None,metric=None,color=None,rpow=0):
+    def plot_components(
+        self,
+        r                 = None,
+        *,
+        show      : bool  = True,
+        fig       : bool  = True,
+        linestyle : str   = '-',
+        rmin      : float = 0.01,
+        rmax      : float = 5.0,
+        title             = None,
+        metric            = None,
+        color             = None,
+        rpow      : int   = 0,
+        ) -> None:
         import matplotlib.pyplot as plt
         channels = list(self.l_channels)+['L2']
         if fig:
@@ -888,7 +1029,23 @@ class SemilocalPP(Pseudopotential):
     #end def plot_components
 
 
-    def plot_channels(self,r=None,channels=None,*,show=True,fig=True,linestyle='-',rmin=0.01,rmax=5.0,title=None,metric=None,color=None,rpow=0,with_local=True,with_L2=True):
+    def plot_channels(
+        self,
+        r                  = None,
+        channels           = None,
+        *,
+        show       : bool  = True,
+        fig        : bool  = True,
+        linestyle  : str   = '-',
+        rmin       : float = 0.01,
+        rmax       : float = 5.0,
+        title              = None,
+        metric             = None,
+        color              = None,
+        rpow       : int   = 0,
+        with_local : bool  = True,
+        with_L2    : bool  = True,
+        ) -> None:
         import matplotlib.pyplot as plt
         if channels is None:
             channels = list(self.l_channels)
@@ -997,7 +1154,18 @@ class SemilocalPP(Pseudopotential):
     #end def plot_channels
 
 
-    def plot_positive_definite(self,r=None,*,show=True,fig=True,linestyle='-',rmin=0.01,rmax=5.0,title=None,color='k'):
+    def plot_positive_definite(
+        self,
+        r                 = None,
+        *,
+        show      : bool  = True,
+        fig       : bool  = True,
+        linestyle : str   = '-',
+        rmin      : float = 0.01,
+        rmax      : float = 5.0,
+        title             = None,
+        color     : str   = 'k',
+        ) -> None:
         import matplotlib.pyplot as plt
         if not self.has_L2():
             msg = 'positive definite condition only applies to L2 potentials'
@@ -1032,7 +1200,18 @@ class SemilocalPP(Pseudopotential):
     #end def plot_positive_definite
 
 
-    def plot_L2(self,*,show=True,fig=True,r=None,rmin=0.01,rmax=5.0,linestyle='-',title=None,color=None):
+    def plot_L2(
+        self,
+        *,
+        show      : bool  = True,
+        fig       : bool  = True,
+        r                 = None,
+        rmin      : float = 0.01,
+        rmax      : float = 5.0,
+        linestyle : str   = '-',
+        title             = None,
+        color             = None,
+        ) -> None:
         import matplotlib.pyplot as plt
         color_in = color
         if fig:
@@ -1075,7 +1254,18 @@ class SemilocalPP(Pseudopotential):
     #end def plot_L2
 
 
-    def plot_nonlocal_polar(self,*,show=True,lmax=10,rmin=0.01,rmax=2.0,nr=100,nt=100,levels=100,label=''):
+    def plot_nonlocal_polar(
+        self,
+        *,
+        show   : bool  = True,
+        lmax   : int   = 10,
+        rmin   : float = 0.01,
+        rmax   : float = 2.0,
+        nr     : int   = 100,
+        nt     : int   = 100,
+        levels : int   = 100,
+        label  : str   = '',
+        ) -> None:
         import matplotlib.pyplot as plt
         from scipy.special import eval_legendre as legendre
 
@@ -1106,11 +1296,18 @@ class SemilocalPP(Pseudopotential):
         # set the colormap and centre the colorbar
         import matplotlib.colors as colors
         class MidNorm(colors.Normalize):
-            def __init__(self, vmin=None, vmax=None, midpoint=None, *, clip=False):
+            def __init__(
+                self,
+                vmin            = None,
+                vmax            = None,
+                midpoint        = None,
+                *,
+                clip     : bool = False,
+                ) -> None:
                 self.midpoint = midpoint
                 colors.Normalize.__init__(self, vmin, vmax, clip)
             #end def __init__
-            def __call__(self, value, clip=None):
+            def __call__(self, value, clip = None):
                 x, y = [self.vmin, self.midpoint, self.vmax], [0, 0.5, 1]
                 return np.ma.masked_array(np.interp(value, x, y), np.isnan(value))
             #end def __call__
@@ -1160,7 +1357,7 @@ class SemilocalPP(Pseudopotential):
         plt.legend()
 
         # function for a single polar plot
-        def plot_V(V,label):
+        def plot_V(V, label) -> None:
             vmin = V.min()
             vmax = V.max()
             vm = max(np.abs(vmin),np.abs(vmax))
@@ -1244,7 +1441,7 @@ class SemilocalPP(Pseudopotential):
     #end def plot_nonlocal_polar
 
 
-    def write_qmcpack(self,filepath=None):
+    def write_qmcpack(self, filepath: Path | None = None) -> str:
         self.update_rcut(tol=1e-5,optional=True)
 
         channels = self.angular_channels()
@@ -1339,7 +1536,7 @@ class SemilocalPP(Pseudopotential):
     #end def write_qmcpack
 
 
-    def write_casino(self,filepath=None):
+    def write_casino(self, filepath = None) -> str:
         if self.has_component('L2'):
             msg = (
                 'cannot write potential in CASINO format\n'
@@ -1420,18 +1617,29 @@ class GaussianPP(SemilocalPP):
     formats = SemilocalPP.formats + ('gaussian','gamess','crystal','numhf')
 
     @staticmethod
-    def process_float(s):
+    def process_float(s: str) -> float:
         return float(s.replace('D','e').replace('d','e'))
     #end def process_float
 
-    def __init__(self,filepath=None,format=None,name=None,src=None):
+    def __init__(
+        self,
+        filepath = None,
+        format   = None,
+        name     = None,
+        src      = None,
+        ) -> None:
         self.basis = None
         SemilocalPP.__init__(self,filepath,format,name,src)
     #end def __init__
 
 
     # test needed for gaussian and crystal
-    def read_text(self,text,format=None,filepath=None):
+    def read_text(
+        self,
+        text     : str,
+        format   : str | None = None,
+        filepath : str | None = None,
+        ) -> None:
         lines,basis_lines = process_gaussian_text(text,format)
 
         format=format.lower()
@@ -1607,7 +1815,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed for crystal
-    def write_text(self,format=None,occ=None):
+    def write_text(self, format: str | None = None, occ = None) -> str:
         text = ''
         format = format.lower()
         if format=='qmcpack':
@@ -1746,7 +1954,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def get_basis(self):
+    def get_basis(self) -> GaussianBasisSet | None:
         bs = None
         if self.basis is not None:
             bs = GaussianBasisSet()
@@ -1756,13 +1964,13 @@ class GaussianPP(SemilocalPP):
     #end def get_basis
 
 
-    def set_basis(self,bs):
+    def set_basis(self, bs) -> None:
         self.basis = bs.basis
     #end def set_basis
 
 
     # test needed
-    def uncontract(self):
+    def uncontract(self) -> None:
         if self.basis is not None:
             bs = GaussianBasisSet()
             bs.basis = deepcopy(self.basis)
@@ -1773,7 +1981,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def write_basis(self,filepath=None,format=None):
+    def write_basis(self, filepath = None, format = None) -> str | None:
         basis = self.get_basis()
         text = ''
         if basis is not None:
@@ -1798,7 +2006,12 @@ class GaussianPP(SemilocalPP):
     #end def write_basis
 
 
-    def evaluate_comp_rV(self,r,l,vcomp):
+    def evaluate_comp_rV(
+        self,
+        r     : np.ndarray | None,
+        l     : str,
+        vcomp : obj | np.ndarray,
+        ) -> np.ndarray:
         r = np.array(r)
         v = np.zeros(r.shape)
         if l==self.local or l is None:
@@ -1816,7 +2029,12 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def ppconvert(self,outfile,ref,extra=None):
+    def ppconvert(
+        self,
+        outfile,
+        ref,
+        extra = None,
+        ) -> None:
         of = outfile.lower()
         if of.endswith('.xml'):
             opts = '--xml'
@@ -1841,7 +2059,13 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def append_to_component(self,l,coeff,expon,rpow):
+    def append_to_component(
+        self,
+        l,
+        coeff,
+        expon,
+        rpow,
+        ) -> None:
         '''
         This function is used to append a term to a Gaussian ECP component.
         l: the angular ccomponent that the Gaussian term will be appended to
@@ -1858,7 +2082,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def scale_component(self,l,scale):
+    def scale_component(self, l, scale) -> None:
         '''
         This function is used to scale a Gaussian ECP component by a factor.
         l: the angular component that is scaled.
@@ -1876,7 +2100,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def simplify(self):
+    def simplify(self) -> None:
         '''This function simplifies the Gaussian ECP.
 
         The simplificactions are as follows:
@@ -2016,7 +2240,7 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def get_unboundedness(self,db,dbs):
+    def get_unboundedness(self, db, dbs) -> int | float:
         '''
         This function quantifies how unbounded a truncated L2 potential is.
         This is done by constructing a function that corrects VL2 in the unbounded region.
@@ -2027,14 +2251,19 @@ class GaussianPP(SemilocalPP):
             raise RuntimeError(msg)
         #end if
         import math
-        def poly(x,c):
+        def poly(x, c):
             val=0
             for ci,cv in enumerate(c):
                 val+=cv*x**ci
             return val
         #end def
 
-        def Rs(x,dx,s,c):
+        def Rs(
+            x,
+            dx,
+            s,
+            c,
+            ):
             if x+1-s<-dx:
                 return 0-(1-s)
             elif x+1-s>dx:
@@ -2113,7 +2342,14 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def make_L2_bounded(self,db,dbs,exps0=None,*,plot=False):
+    def make_L2_bounded(
+        self,
+        db,
+        dbs,
+        exps0        = None,
+        *,
+        plot  : bool = False,
+        ) -> None:
         '''
         For a truncated L2 potential, this function constructs a correction to VL2 in the unbounded region.
         Then the correction is fit to a set of Gaussian primitives that are provided in the array 'exps0'.
@@ -2127,14 +2363,19 @@ class GaussianPP(SemilocalPP):
             msg = 'Please provide a set of exponents to be used for correction.'
             raise ValueError(msg)
         import math
-        def poly(x,c):
+        def poly(x, c):
             val=0
             for ci,cv in enumerate(c):
                 val+=cv*x**ci
             return val
         #end def
 
-        def Rs(x,dx,s,c):
+        def Rs(
+            x,
+            dx,
+            s,
+            c,
+            ):
             if x+1-s<-dx:
                 return 0-(1-s)
             elif x+1-s>dx:
@@ -2144,10 +2385,16 @@ class GaussianPP(SemilocalPP):
         #end def
         class fitClass:
 
-            def __init__(self):
+            def __init__(self) -> None:
                 pass
 
-            def gauss_correction(self,x,c1,c2,c3):
+            def gauss_correction(
+                self,
+                x,
+                c1,
+                c2,
+                c3,
+                ):
                 val = 0
                 for ci,c in enumerate([c1,c2,c3]):
                     val+=x**2.*c*np.exp(-self.exps[ci]*x**2.)
@@ -2155,7 +2402,12 @@ class GaussianPP(SemilocalPP):
                 return val
             #end def
 
-            def gauss_correction_2_param(self,x,c1,c2):
+            def gauss_correction_2_param(
+                self,
+                x,
+                c1,
+                c2,
+                ):
                 val = 0
                 for ci,c in enumerate([c1,c2]):
                     val+=x**2.*c*np.exp(-self.exps[ci]*x**2.)
@@ -2163,7 +2415,7 @@ class GaussianPP(SemilocalPP):
                 return val
             #end def
 
-            def gauss_correction_1_param(self,x,c1):
+            def gauss_correction_1_param(self, x, c1):
                 val = 0
                 for ci,c in enumerate([c1]):
                     val+=x**2.*c*np.exp(-self.exps[ci]*x**2.)
@@ -2286,7 +2538,14 @@ class GaussianPP(SemilocalPP):
 
 
     # test needed
-    def transform_to_truncated_L2(self,keep=None,lmax=None,outfile=None,*,inplace=True):
+    def transform_to_truncated_L2(
+        self,
+        keep           = None,
+        lmax           = None,
+        outfile        = None,
+        *,
+        inplace : bool = True,
+        ) -> None:
         '''
         This function transforms a Gaussian ECP into a truncated L2 form, i.e., a form
         for which all channels follow an L2 relationship. For a semi-local ECP, this
@@ -2403,7 +2662,7 @@ class QmcpackPP(SemilocalPP):
     numeric         = True
     interpolatable  = False
 
-    def read(self,filepath,format=None):
+    def read(self, filepath: Path, format: str | None = None) -> None:
         if not os.path.exists(filepath):
             msg = f'cannot read {filepath}, file does not exist'
             raise FileNotFoundError(msg)
@@ -2476,7 +2735,12 @@ class QmcpackPP(SemilocalPP):
     #end def read
 
 
-    def evaluate_comp_rV(self,r,l,vcomp):
+    def evaluate_comp_rV(
+        self,
+        r     : np.ndarray | None,
+        l     : str,
+        vcomp : obj | np.ndarray,
+        ) -> np.ndarray:
         if r is not None:
             if len(r)==len(self.r) and abs( (r[1:]-self.r[1:])/self.r[1:] ).max()<1e-6:
                 r = self.r
@@ -2495,7 +2759,7 @@ class QmcpackPP(SemilocalPP):
     #end def evaluate_comp_rV
 
 
-    def v_at_zero(self,l):
+    def v_at_zero(self, l: str) -> np.float64:
         #r = self.r
         #v = self.get_component(l)/r
         #vz = (v[1]*r[2]**2-v[2]*r[1]**2)/(r[2]**2-r[1]**2)
@@ -2516,7 +2780,7 @@ class CasinoPP(SemilocalPP):
 
     unitmap = MappingProxyType(dict(rydberg='Ry',hartree='Ha',ev='eV'))
 
-    def read(self,filepath,format=None):
+    def read(self, filepath: Path, format = None) -> None:
         filepath = path_string(filepath)
         if not os.path.exists(filepath):
             msg = f'cannot read {filepath}, file does not exist'
@@ -2590,7 +2854,12 @@ class CasinoPP(SemilocalPP):
     #end def read_file
 
 
-    def evaluate_comp_rV(self,r,l,vcomp):
+    def evaluate_comp_rV(
+        self,
+        r     : np.ndarray | None,
+        l     : str,
+        vcomp : obj | np.ndarray,
+        ) -> np.ndarray:
         if r is not None:
             if len(r)==len(self.r) and abs( (r[1:]-self.r[1:])/self.r[1:] ).max()<1e-6:
                 r = self.r

@@ -1,13 +1,18 @@
+from __future__ import annotations
+
 import copy
 import pickle
 from collections.abc import MutableMapping
 from numbers import Number
 
+from pathlib import Path
+
+
 
 class Unset:
     """Sentinel type for distinguishing an omitted argument from ``None``."""
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "unset"
     #end def __repr__
 #end class Unset
@@ -21,7 +26,7 @@ unset = Unset()
 #===========================
 
 # decorator for type to function mapping special cases
-def per_type_cmp(type_):
+def per_type_cmp(type_: type[dict]):
     try:
         mapping = per_type_cmp.mapping
     except AttributeError:
@@ -37,11 +42,11 @@ def per_type_cmp(type_):
 class python2_sort_key(object):
     _unhandled_types = frozenset({complex})
 
-    def __init__(self, ob):
+    def __init__(self, ob: int | str | tuple[int, int, int]) -> None:
        self._ob = ob
     #end def __init__
 
-    def __lt__(self, other):
+    def __lt__(self, other: python2_sort_key) -> bool:
         _unhandled_types = self._unhandled_types
         self, other = self._ob, other._ob  # we don't care about the wrapper
 
@@ -97,7 +102,7 @@ class python2_sort_key(object):
 #end class python2_sort_key
 
 @per_type_cmp(dict)
-def dict_cmp(a, b, _s=object()):
+def dict_cmp(a: dict, b: dict, _s = object()) -> bool:
     if len(a) != len(b):
         return len(a) < len(b)
     #end if
@@ -113,26 +118,26 @@ def dict_cmp(a, b, _s=object()):
     return python2_sort_key(a[adiff]) < python2_sort_key(b[bdiff])
 #end def dict_cmp
 
-def sorted_py2(iterable):
+def sorted_py2(iterable) -> list[int | str | tuple[int, int, int]]:
     return sorted(iterable,key=python2_sort_key)
 #end def sorted_py2
 #===========================
 
 
 
-def save(o,filepath):
+def save(o, filepath) -> None:
     with open(filepath,'wb') as f:
         binary = pickle.HIGHEST_PROTOCOL
         pickle.dump(o,f,binary)
 
-def load(filepath):
+def load(filepath: str | Path):
     with open(filepath,'rb') as f:
         dl = pickle.load(f)
     return dl
 
 
 
-def _pp_repr(self):
+def _pp_repr(self) -> str:
     s=''
     for k in sorted_py2(self.keys()):
         v = self.__dict__[k]
@@ -143,7 +148,7 @@ def _pp_repr(self):
     return s
 
 
-def _pp_str(self,nindent=1):
+def _pp_str(self, nindent: int = 1) -> str:
     pad = '  '
     npad = nindent*pad
     s=''
@@ -217,12 +222,12 @@ class dotdict(dict):
     >>> data.extra
     1
     """
-    def __getattr__(self, item):
+    def __getattr__(self, item: str):
         return self[item]
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-    def copy(self): return self.__class__(self)
-    def __deepcopy__(self, memo):
+    def copy(self) -> dotdict | obj: return self.__class__(self)
+    def __deepcopy__(self, memo: dict) -> dotdict:
         result = self.__class__.__new__(self.__class__)
         memo[id(self)] = result
         for key, value in self.items():
@@ -298,28 +303,28 @@ class obj:
     """
     # dict interface
     @classmethod
-    def fromkeys(cls, keys, value=None):
+    def fromkeys(cls, keys, value = None) -> obj:
         return cls(dict.fromkeys(keys, value))
 
-    def __init__(self,*args,**kwargs):   self.__dict__.update(dict(*args,**kwargs))
+    def __init__(self, *args, **kwargs) -> None:   self.__dict__.update(dict(*args,**kwargs))
     def items(self):              return self.__dict__.items()
-    def clear(self):              return self.__dict__.clear()
+    def clear(self) -> None:              return self.__dict__.clear()
     def copy(self):               return self.__class__(self.__dict__)
-    def get(self,*a,**kw):        return self.__dict__.get(*a,**kw)
+    def get(self, *a, **kw):        return self.__dict__.get(*a,**kw)
     def keys(self):               return self.__dict__.keys()
-    def pop(self,*a,**kw):        return self.__dict__.pop(*a,**kw)
+    def pop(self, *a, **kw):        return self.__dict__.pop(*a,**kw)
     def values(self):             return self.__dict__.values()
-    def popitem(self,*a,**kw):    return self.__dict__.popitem(*a,**kw)
-    def setdefault(self,*a,**kw): return self.__dict__.setdefault(*a,**kw)
-    def update(self,*a,**kw):     return self.__dict__.update(*a,**kw)
+    def popitem(self, *a, **kw) -> tuple[str, int] | None:    return self.__dict__.popitem(*a,**kw)
+    def setdefault(self, *a, **kw) -> int: return self.__dict__.setdefault(*a,**kw)
+    def update(self, *a, **kw) -> None:     return self.__dict__.update(*a,**kw)
 
     # basic functions, including dot access
-    def __len__(self):               return len(self.__dict__)
-    def __contains__(self,key):      return key in self.__dict__
-    def __getitem__(self,key):       return self.__dict__[key]
-    def __setitem__(self,key,value): self.__dict__[key]=value
-    def __delitem__(self,key):       del self.__dict__[key]
-    def __eq__(self,other):          return self.__dict__==other
+    def __len__(self) -> int:               return len(self.__dict__)
+    def __contains__(self, key) -> bool:      return key in self.__dict__
+    def __getitem__(self, key):       return self.__dict__[key]
+    def __setitem__(self, key, value) -> None: self.__dict__[key]=value
+    def __delitem__(self, key: int | str | tuple[str, str, str]) -> None:       del self.__dict__[key]
+    def __eq__(self, other) -> bool:          return self.__dict__==other
     def __iter__(self):              return iter(self.__dict__)
 
     # pretty print
@@ -331,15 +336,15 @@ class obj:
 
 class DevBase:
     # similar to/same as dict
-    def __len__(self):               return len(self.__dict__)
-    def __contains__(self,key):      return key in self.__dict__
-    def __getitem__(self,key):       return self.__dict__[key]
-    def __setitem__(self,key,value): self.__dict__[key]=value
-    def __delitem__(self,key):       del self.__dict__[key]
+    def __len__(self) -> int:               return len(self.__dict__)
+    def __contains__(self, key) -> bool:      return key in self.__dict__
+    def __getitem__(self, key):       return self.__dict__[key]
+    def __setitem__(self, key, value) -> None: self.__dict__[key]=value
+    def __delitem__(self, key) -> None:       del self.__dict__[key]
     def keys(self):                  return self.__dict__.keys()
     def values(self):                return self.__dict__.values()
     def items(self):                 return self.__dict__.items()
-    def update(self,*a,**kw):        return self.__dict__.update(*a,**kw)
+    def update(self, *a, **kw):        return self.__dict__.update(*a,**kw)
     def clear(self):                 return self.__dict__.clear()
 
     # protect against bare iteration
@@ -354,17 +359,17 @@ class DevBase:
     def _keys(self):               return self.__dict__.keys()
     def _values(self):             return self.__dict__.values()
     def _items(self):              return self.__dict__.items()
-    def _update(self,*a,**kw):     return self.__dict__.update(*a,**kw)
-    def _clear(self):              return self.__dict__.clear()
+    def _update(self, *a, **kw: int) -> None:     return self.__dict__.update(*a,**kw)
+    def _clear(self) -> None:              return self.__dict__.clear()
 
 
     # save and load
-    def save(self,filepath=None):
+    def save(self, filepath: str | Path | None = None) -> None:
         if filepath is None:
             filepath='./'+self.__class__.__name__+'.p'
         save(self,filepath)
 
-    def load(self,filepath=None):
+    def load(self, filepath = None) -> None:
         if filepath is None:
             filepath='./'+self.__class__.__name__+'.p'
         tmp = load(filepath)
@@ -377,7 +382,7 @@ class DevBase:
 
 
 
-def to_obj(d):
+def to_obj(d) -> obj:
     o = obj()
     for k,v in d.items():
         if hasattr(v,'__dict__'):

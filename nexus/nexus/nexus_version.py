@@ -9,6 +9,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 nexus_version = 2,4,9
 """
 Current Nexus version.

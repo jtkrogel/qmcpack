@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -20,7 +22,7 @@ if sys.version_info[0:3] < (3, 10, 0):
 # Locate and import the closely coupled Nexus module
 search_basepath = Path(__file__).resolve().parent.parent
 nexus_library_search_path = search_basepath.parent
-def find_nexus_modules():
+def find_nexus_modules() -> None:
     import sys
 
     # "import nexus" will succeed if nexus directory exists without __init__.py in it.
@@ -87,11 +89,11 @@ except (ImportError,RuntimeError):
 #end try
 
 
-def first(d):
+def first(d: obj) -> np.ndarray:
     return d[min(d.keys())]
 
 
-def sigfig_round(some_float, nsigfig):
+def sigfig_round(some_float, nsigfig: int):
     if nsigfig >= 1 and nsigfig == int(nsigfig):
         return round(some_float, nsigfig - int(np.floor(np.log10(abs(some_float))))-1)
     else:
@@ -106,7 +108,7 @@ def sigfig_round(some_float, nsigfig):
 
 
 class ColorWheel(DevBase):
-    def __init__(self):
+    def __init__(self) -> None:
         colors  = 'Black Maroon DarkOrange Green DarkBlue Purple Gray Firebrick Orange MediumSeaGreen DodgerBlue MediumOrchid'.split()
         lines  = '- -- -. :'.split()
         markers = '. v s o ^ d p'.split()
@@ -134,36 +136,36 @@ class ColorWheel(DevBase):
         self.reset()
     #end def __init__
 
-    def next_line(self):
+    def next_line(self) -> tuple[str, str]:
         self.iline = (self.iline+1)%len(self.line_styles)
         return self.line_styles[self.iline]
     #end def next_line
 
-    def next_marker(self):
+    def next_marker(self) -> tuple[str, str]:
         self.imarker = (self.imarker+1)%len(self.marker_styles)
         return self.marker_styles[self.imarker]
     #end def next_marker
 
-    def next_marker_line(self):
+    def next_marker_line(self) -> tuple[str, str]:
         self.imarker_line = (self.imarker_line+1)%len(self.marker_line_styles)
         return self.marker_line_styles[self.imarker_line]
     #end def next_marker_line
 
-    def reset(self):
+    def reset(self) -> None:
         self.iline        = -1
         self.imarker      = -1
         self.imarker_line = -1
     #end def reset
 
-    def reset_line(self):
+    def reset_line(self) -> None:
         self.iline        = -1
     #end def reset_line
 
-    def reset_marker(self):
+    def reset_marker(self) -> None:
         self.imarker      = -1
     #end def reset_marker
 
-    def reset_marker_line(self):
+    def reset_marker_line(self) -> None:
         self.imarker_line = -1
     #end def reset_marker_line
 #end class ColorWheel
@@ -202,7 +204,7 @@ class QBase(DevBase):
         el = 'EnergyEstim__nume_real'
         )
 
-    def log(self,*texts,**kwargs):
+    def log(self, *texts: str, **kwargs) -> None:
         if len(kwargs)>0:
             n = kwargs['n']
         else:
@@ -217,7 +219,7 @@ class QBase(DevBase):
     #end def log
 
 
-    def check_matplotlib_import(self):
+    def check_matplotlib_import(self) -> None:
         if not self.options.nowarn and not matplotlib_import_success:
             self.warn('Python library matplotlib raised uncaught exceptions during import.  Plots may or may not work.')
         #end if
@@ -240,7 +242,13 @@ class DatAnalyzer(QBase):
     non_ee_potentials = ('IonIon','LocalECP','NonLocalECP','ElecIon','IonElec')
 
 
-    def __init__(self,filepath,index,type='unknown',units='Ha'):
+    def __init__(
+        self,
+        filepath : np.str_,
+        index    : int,
+        type     : str = 'unknown',
+        units    : str = 'Ha',
+        ) -> None:
         self.info  = obj(
             index       = index,
             type        = type,
@@ -259,7 +267,7 @@ class DatAnalyzer(QBase):
     #end def __init__
 
 
-    def extract_info(self,filepath):
+    def extract_info(self, filepath: np.str_) -> None:
         series = None
         path,filename = os.path.split(filepath)
         tokens = filename.split('.')
@@ -283,7 +291,7 @@ class DatAnalyzer(QBase):
     #end def extract_info
 
 
-    def get_equilibration(self):
+    def get_equilibration(self) -> np.int64:
         eq = self.options.equilibration
         if eq=='auto':
             if 'LocalEnergy' in self.data:
@@ -313,7 +321,7 @@ class DatAnalyzer(QBase):
     #end def get_equilibration
 
 
-    def load_data(self,filepath):
+    def load_data(self, filepath: np.str_) -> None:
         self.data.clear()
         self.extract_info(filepath)
         lt = np.loadtxt(filepath)
@@ -344,7 +352,7 @@ class DatAnalyzer(QBase):
     #end def load_data
 
 
-    def stat_value(self,v):
+    def stat_value(self, v: np.ndarray) -> obj:
         if self.autocorr:
             (mean,var,error,kappa)=simstats(v)
         else:
@@ -360,7 +368,7 @@ class DatAnalyzer(QBase):
     #end def stat_value
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         self.stats.clear()
         nbe = self.get_equilibration()
         data  = self.data
@@ -480,7 +488,7 @@ class DatAnalyzer(QBase):
     #end def analyze
 
 
-    def zero(self):
+    def zero(self) -> None:
         self.info.weight = 0.0
         for d in self.data.values():
             d[:] = 0.0
@@ -496,7 +504,7 @@ class DatAnalyzer(QBase):
     #end def zero
 
 
-    def accumulate(self,other,weight):
+    def accumulate(self, other, weight) -> None:
         self.info.weight += weight
         for q,v in other.data.items():
             d = self.data[q]
@@ -506,7 +514,7 @@ class DatAnalyzer(QBase):
     #end def accumulate
 
 
-    def normalize(self):
+    def normalize(self) -> None:
         w = self.info.weight
         for d in self.data.values():
             d[:] /= w
@@ -514,7 +522,7 @@ class DatAnalyzer(QBase):
     #end def normalize
 
 
-    def join(self,others):
+    def join(self, others) -> None:
         eq = self.options.equilibration
         quantities = self.data.keys()
         for q in quantities:
@@ -532,7 +540,13 @@ class DatAnalyzer(QBase):
     #end def join
 
 
-    def write_stats(self,quantities,first_prefix=False,first_series=False,only_series=False):
+    def write_stats(
+        self,
+        quantities   : list[str],
+        first_prefix : bool = False,
+        first_series : bool = False,
+        only_series  : bool = False,
+        ) -> None:
         opt   = self.options
         stats = self.stats
         prefix = self.info.prefix
@@ -644,7 +658,12 @@ class DatAnalyzer(QBase):
     #end def write_stats
 
 
-    def stat_line(self,qname,compress=False,prec='auto'):
+    def stat_line(
+        self,
+        qname    : str,
+        compress : bool = False,
+        prec     : str  = 'auto',
+        ) -> str:
         opt = self.options
         q = self.stats[qname]
         if opt.precision is not None:
@@ -683,7 +702,7 @@ class DatAnalyzer(QBase):
     #end def stat_line
 
 
-    def EV_line(self,quants):
+    def EV_line(self, quants) -> str:
         line = ''
         for qname in quants:
             qline = self.stat_line(qname,prec='8.6f')
@@ -696,7 +715,12 @@ class DatAnalyzer(QBase):
     #end def EV_line
 
 
-    def plot_series(self,quantity,style,prefix):
+    def plot_series(
+        self,
+        quantity,
+        style,
+        prefix,
+        ) -> tuple:
         if not quantity in self.stats:
             msg = 'quantity '+quantity+f' is not present in the data for {self.info.filepath}'
             raise KeyError(msg)
@@ -708,7 +732,13 @@ class DatAnalyzer(QBase):
     #end def plot_series
 
 
-    def plot_trace(self,quantity,style,prefix,shift):
+    def plot_trace(
+        self,
+        quantity : str,
+        style    : str,
+        prefix   : str,
+        shift    : int,
+        ):
         self.check_matplotlib_import()
         if not quantity in self.data:
             msg = 'quantity '+quantity+f' is not present in the data for {self.info.filepath}'
@@ -735,7 +765,12 @@ class DatAnalyzer(QBase):
     #end def plot_trace
 
 
-    def plot_histogram(self,quantity,style,prefix):
+    def plot_histogram(
+        self,
+        quantity,
+        style,
+        prefix,
+        ):
         raise NotImplementedError
         #if not quantity in self.data:
         #    self.error('quantity '+quantity+' is not present in the data for {0}'.format(self.info.filepath),'QMCA')
@@ -762,7 +797,7 @@ class DatAnalyzer(QBase):
 #end class DatAnalyzer
 
 
-def comma_list(s):
+def comma_list(s: str) -> list[str]:
     if ',' in s:
         s = s.replace(',',' ')
     #end if
@@ -771,7 +806,7 @@ def comma_list(s):
 
 
 class QMCA(QBase):
-    def __init__(self):
+    def __init__(self) -> None:
         self.parser      = None
         self.file_list   = []
         self.file_map    = obj()
@@ -786,14 +821,14 @@ class QMCA(QBase):
     #end def __init__
 
 
-    def help(self):
+    def help(self) -> None:
         self.log('\n'+self.parser.format_help().strip(),n=1)
         self.log('\nAbbreviations and full names for quantities:\n'+str(self.quantity_abbreviations),n=1)
         self.exit()
     #end def help
 
 
-    def examples(self):
+    def examples(self) -> None:
         examples = '''
 QMCA examples:
 =============
@@ -861,7 +896,7 @@ QMCA examples:
     #end def examples
 
 
-    def exit(self):
+    def exit(self) -> None:
         if self.verbose:
             self.log('\nQMCA finished\n')
         #end if
@@ -869,7 +904,7 @@ QMCA examples:
     #end def exit
 
 
-    def read_command_line(self):
+    def read_command_line(self) -> None:
         usage = '''usage: %prog [options] [file(s)]'''
         parser = OptionParser(usage=usage,add_help_option=False,version='%prog {}.{}.{}'.format(*nexus_version))
         self.parser = parser
@@ -1204,7 +1239,7 @@ QMCA examples:
     #end def read_command_line
 
 
-    def load_data(self):
+    def load_data(self) -> None:
         allowed_extensions = obj(scalar='scalar.dat',dmc='dmc.dat')
         opt  = self.options
         data = self.data
@@ -1495,7 +1530,7 @@ QMCA examples:
     #end def load_data
 
 
-    def analyze_data(self):
+    def analyze_data(self) -> None:
         for prefix in sorted(self.data.keys()):
             pdata = self.data[prefix]
             for series in sorted(pdata.keys()):
@@ -1703,7 +1738,6 @@ QMCA examples:
 if __name__=='__main__':
     QMCA()
 #end if
-
 
 
 

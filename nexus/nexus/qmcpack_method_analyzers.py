@@ -17,6 +17,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 from .developer import obj, NexusError
@@ -27,7 +29,13 @@ from .qmcpack_quantity_analyzers import HDFAnalyzer
 
 
 class MethodAnalyzer(QAanalyzer):
-    def __init__(self,series=None,calc=None,input=None,nindent=0):
+    def __init__(
+        self,
+        series  : int | None = None,
+        calc                 = None,
+        input                = None,
+        nindent : int        = 0,
+        ) -> None:
         QAanalyzer.__init__(self,nindent=nindent)
         if series is not None and calc is not None and input is not None:
             self.init_sub_analyzers(series,calc,input)
@@ -35,7 +43,12 @@ class MethodAnalyzer(QAanalyzer):
     #end def __init__
 
 
-    def init_sub_analyzers(self,series,calc,input):
+    def init_sub_analyzers(
+        self,
+        series : int,
+        calc,
+        input,
+        ) -> None:
         request  = QAanalyzer.request
         run_info = QAanalyzer.run_info
 
@@ -211,7 +224,7 @@ class MethodAnalyzer(QAanalyzer):
     #end def init_sub_analyzers
 
 
-    def load_data_local(self):
+    def load_data_local(self) -> None:
         source_path = QAanalyzer.run_info.source_path
         data_sources = self.info.data_sources
         files  = self.info.files
@@ -242,16 +255,16 @@ class MethodAnalyzer(QAanalyzer):
 
 
 
-    def set_global_info(self):
+    def set_global_info(self) -> None:
         QAanalyzer.method_info = self.info
     #end def set_global_info
 
-    def unset_global_info(self):
+    def unset_global_info(self) -> None:
         QAanalyzer.method_info = None
     #end def unset_global_info
 
 
-    def check_traces(self,pad=None):
+    def check_traces(self, pad = None) -> bool | None:
         verbose = pad is not None
         method = self.info.method
         series = self.info.series
@@ -306,7 +319,12 @@ class MethodAnalyzer(QAanalyzer):
 
 
 class OptAnalyzer(MethodAnalyzer):
-    def init_sub_analyzers(self,series,calc,input):
+    def init_sub_analyzers(
+        self,
+        series : int,
+        calc,
+        input,
+        ) -> None:
         MethodAnalyzer.init_sub_analyzers(self,series,calc,input)
 
         source_path = QAanalyzer.run_info.source_path

@@ -24,6 +24,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 from .developer import obj
@@ -32,6 +34,9 @@ from .simulation import Simulation
 from .vasp_input import VaspInput,generate_vasp_input,generate_poscar,Poscar
 from .vasp_analyzer import VaspAnalyzer
 from .structure import Structure
+
+from pathlib import Path
+
 
 
 class Vasp(Simulation):
@@ -50,14 +55,14 @@ class Vasp(Simulation):
         )
 
 
-    def set_files(self):
+    def set_files(self) -> None:
         self.infile  = 'INCAR'
         self.outfile = self.identifier + self.outfile_extension
         self.errfile = self.identifier + self.errfile_extension
     #end def set_files
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         input = self.input
         if result_name=='structure':
             calculating_result = input.producing_structure()
@@ -68,7 +73,7 @@ class Vasp(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj | None:
         result = obj()
         input = self.input
         if result_name=='structure':
@@ -101,7 +106,12 @@ class Vasp(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         input = self.input
         if result_name=='structure':
             if input.performing_neb():
@@ -130,12 +140,12 @@ class Vasp(Simulation):
     #end def incorporate_result
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         return self.app_name
     #end def app_command
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         outpaths = []
         if not self.input.performing_neb():
             outpath = os.path.join(self.locdir,self.identifier+'.OUTCAR')
@@ -166,7 +176,7 @@ class Vasp(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list[str]:
         output_files = []
         for file in self.vasp_save_files:
             native_file = os.path.join(self.locdir,file)
@@ -182,7 +192,7 @@ class Vasp(Simulation):
 
 
 
-def generate_vasp(**kwargs):
+def generate_vasp(**kwargs) -> Vasp:
     pseudos = kwargs.get('pseudos',None)
     if pseudos is not None:
         system = kwargs.get('system',None)

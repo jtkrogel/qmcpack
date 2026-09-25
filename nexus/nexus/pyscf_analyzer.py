@@ -15,10 +15,11 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 from .simulation import NullSimulationAnalyzer
 
 
 class PyscfAnalyzer(NullSimulationAnalyzer):
     pass
 #end class PyscfAnalyzer
-

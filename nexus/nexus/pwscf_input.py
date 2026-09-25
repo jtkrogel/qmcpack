@@ -44,6 +44,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import inspect
 import os
 import sys
@@ -73,6 +75,31 @@ from .simulation import SimulationInput
 from .structure import Structure, kmesh
 from .unit_converter import convert
 
+from pathlib import Path
+
+type Num        = int | float
+type Vec3i      = tuple[int, int, int]
+type AtomVals   = dict[str, Num] | obj
+type PseudoArg  = list[str] | tuple[str, ...] | dict[str, str]
+type VariablesT = (
+    bool
+    | int
+    | float
+    | str
+    | obj
+    | dict[int | tuple[int, int, int], int | float]
+    )
+type KwargsT    = (
+    bool
+    | int
+    | float
+    | str
+    | dict[str, str]
+    | PhysicalSystem
+    | tuple[int, int, int]
+    )
+
+
 """Union of the namelist definition enums."""
 NamelistType: TypeAlias = (
     type[CellDefinitions]
@@ -95,44 +122,44 @@ NAMELIST_DEFINITIONS = (
     RismDefinitions,
     )
 
-def read_str(sv):
+def read_str(sv: str) -> str:
     return sv.strip('"').strip("'")
 #end def read_str
 
 
-def read_int(sv):
+def read_int(sv: str) -> int:
     return int(sv)
 #end def read_int
 
 
-def read_float(sv):
+def read_float(sv: str) -> float:
     return float(sv.replace('d','e').replace('D','e'))
 #end def read_float
 
 
 bconv = {'.true.':True,'.false.':False}
-def read_bool(sv):
+def read_bool(sv: str) -> bool:
     return bconv[sv.lower()]
 #end def read_bool
 
 
-def write_str(val):
+def write_str(val: str) -> str:
     return "'"+val+"'"
 #end def write_str
 
 
-def write_int(val):
+def write_int(val: int) -> str:
     return str(val)
 #end def write_int
 
 
-def write_float(val):
+def write_float(val: float) -> str:
     return str(val)
     #return '{0:20.18e}'.format(val)
 #end def write_float
 
 
-def write_bool(val):
+def write_bool(val: bool) -> str:
     if val:
         return '.true.'
     else:
@@ -145,7 +172,7 @@ readval={str:read_str,int:read_int,float:read_float,bool:read_bool}
 writeval={str:write_str,int:write_int,float:write_float,bool:write_bool}
 
 
-def write_scalar(var,val):
+def write_scalar(var: str, val: bool | int | float | str) -> str:
     if isinstance(val,str):
         vtype = str
     elif isinstance(val,float):
@@ -167,12 +194,12 @@ def write_scalar(var,val):
 #end def write_scalar
 
 
-def noconv(v):
+def noconv(v: np.float64 | np.int64) -> np.float64 | np.int64:
     return v
 #end def noconv
 
 
-def array_from_lines(lines):
+def array_from_lines(lines: list[str]) -> np.ndarray:
     s=''
     for l in lines:
         s+=l+' '
@@ -188,7 +215,13 @@ def array_from_lines(lines):
 
 pwscf_precision = '16.8f'
 pwscf_array_format = '{0:'+pwscf_precision+'}'
-def array_to_string(a,pad='   ',format=pwscf_array_format,converter=noconv,rowsep='\n'):
+def array_to_string(
+    a         : np.ndarray,
+    pad       : str       = '   ',
+    format    : str       = pwscf_array_format,
+    converter : type[int] = noconv,
+    rowsep    : str       = '\n',
+    ) -> str:
     s=''
     if len(a.shape)==1:
         s+=pad
@@ -209,17 +242,15 @@ def array_to_string(a,pad='   ',format=pwscf_array_format,converter=noconv,rowse
 #end def array_to_string
 
 
-def _get_var_types() -> (
-    tuple[
-        frozenset[str], # ints
-        frozenset[str], # floats
-        frozenset[str], # strs
-        frozenset[str], # bools
-        frozenset[str], # real_arrays
-        frozenset[str], # species_arrays
-        frozenset[str], # multidimensional_arrays
-        ]
-    ):
+def _get_var_types(
+    # ints
+    # floats
+    # strs
+    # bools
+    # real_arrays
+    # species_arrays
+    # multidimensional_arrays
+    ) -> tuple:
     """Get all variable types from the namelist definitions.
 
     Returns
@@ -333,19 +364,19 @@ class PwscfInputBase(DevBase):
 
 class Element(PwscfInputBase):
     name = None
-    def add(self,**variables):
+    def add(self, **variables) -> None:
         self.update(**variables)
     #end def add
 
-    def read(self,lines):
+    def read(self, lines: list[float | str | obj | list[float]]):
         raise NotImplementedError
     #end def read
 
-    def write(self,parent):
+    def write(self, parent: PwscfInput):
         raise NotImplementedError
     #end def write
 
-    def post_process_read(self,parent):
+    def post_process_read(self, parent) -> None:
         pass
     #end def post_process_read
 #end class Element
@@ -354,17 +385,17 @@ class Element(PwscfInputBase):
 class Section(Element):
     defs: ClassVar[NamelistType]
     @classmethod
-    def class_init(cls):
+    def class_init(cls) -> None:
         cls.variables = frozenset(cls.defs.__members__.keys())
         cls.case_map  = {name: val.input_name for name, val in cls.defs.__members__.items()}
     #end def class_init
 
-    def assign(self,**variables):
+    def assign(self, **variables: VariablesT) -> None:
         self.update(**variables)
     #end def assign
 
 
-    def read(self,lines):
+    def read(self, lines: list[float | str | obj | list[float]]) -> None:
         for l in lines:
             # exclude comments
             cloc = l.find('!')
@@ -453,7 +484,7 @@ class Section(Element):
     #end def read
 
 
-    def write(self,parent):
+    def write(self, parent: PwscfInput) -> str:
         atom_index = obj()
         if 'atomic_species' in parent and 'atoms' in parent.atomic_species:
             for i,a in enumerate(parent.atomic_species.atoms):
@@ -565,29 +596,29 @@ class Section(Element):
 
 
 class Card(Element):
-    def __init__(self):
+    def __init__(self) -> None:
         self.specifier = ''
     #end def __init__
 
-    def get_specifier(self,line):
+    def get_specifier(self, line: str) -> None:
         tokens = line.split()
         if len(tokens)>1:
             self.specifier = tokens[1].strip('{}()').lower()
         #end if
     #end def get_specifier
 
-    def read(self,lines):
+    def read(self, lines: list[float | str | obj | list[float]]) -> None:
         self.get_specifier(lines[0])
         self.read_text(lines[1:])
     #end def read
 
-    def write(self,parent):
+    def write(self, parent: PwscfInput) -> str:
         c = self.name.upper()+' '+self.specifier+'\n'
         c += self.write_text()+'\n'
         return c
     #end def write
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]):
         raise NotImplementedError
     #end def read_text
 
@@ -595,11 +626,11 @@ class Card(Element):
         raise NotImplementedError
     #end def write_text
 
-    def change_specifier(self,new_specifier):
+    def change_specifier(self, new_specifier: str):
         raise NotImplementedError
     #end def change_specifier
 
-    def change_option(self,*args,**kwargs):
+    def change_option(self, *args: bool | PwscfInput | Elements, **kwargs) -> None:
         self.change_specifier(*args,**kwargs)
     #end def change_option
 #end class Card
@@ -624,7 +655,7 @@ class system(Section):
         )
 
     # specialized read for partial array variables (hubbard U, starting mag, etc)
-    def post_process_read(self,parent):
+    def post_process_read(self, parent) -> None:
         if 'atomic_species' in parent:
             keys = self.keys()
             for alias,name in self.atomic_variables.items():
@@ -662,7 +693,7 @@ class system(Section):
 
 
     # specialized write for odd handling of hubbard U
-    def write_old(self,parent):
+    def write_old(self, parent) -> str:
         cls = self.__class__
         c='&'+self.name.upper()+'\n'
         vars = list(self.keys())
@@ -769,7 +800,10 @@ for sec in section_classes:
     sec.class_init()
 
 
-def check_section_classes(*,exit=True):
+def check_section_classes(
+    *,
+    exit : bool = True,
+    ) -> None:
     sections = section_classes
     all_variables = PwscfInputBase.all_variables
     global_missing = set(all_variables)
@@ -825,7 +859,7 @@ def check_section_classes(*,exit=True):
 class atomic_species(Card):
     name = 'atomic_species'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         atoms = []
         masses   = obj()
         pseudopotentials = obj()
@@ -839,7 +873,7 @@ class atomic_species(Card):
         self.add(atoms=atoms,masses=masses,pseudopotentials=pseudopotentials)
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str:
         c = ''
         for at in self.atoms:
             c += '   '+f'{at:2}'+' '+str(self.masses[at])+' '+self.pseudopotentials[at]+'\n'
@@ -853,7 +887,7 @@ class atomic_species(Card):
 class atomic_positions(Card):
     name = 'atomic_positions'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         npos = len(lines)
         dim = 3
         atoms = []
@@ -878,7 +912,7 @@ class atomic_positions(Card):
     #end def read_text
 
 
-    def write_text(self):
+    def write_text(self) -> str:
         c = ''
         has_relax_directions = 'relax_directions' in self
         if has_relax_directions:
@@ -897,7 +931,7 @@ class atomic_positions(Card):
     #end def write_text
 
 
-    def change_specifier(self,new_specifier,pwi):
+    def change_specifier(self, new_specifier: str, pwi: PwscfInput) -> None:
         scale = pwi.get_common_vars('scale')
 
         pos = self.positions
@@ -951,7 +985,7 @@ class atomic_positions(Card):
 class atomic_forces(Card):
     name = 'atomic_forces'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         npos = len(lines)
         dim = 3
         atoms = []
@@ -967,7 +1001,7 @@ class atomic_forces(Card):
     #end def read_text
 
 
-    def write_text(self):
+    def write_text(self) -> str:
         c = ''
         rowsep = '\n'
         for i in range(len(self.atoms)):
@@ -983,7 +1017,7 @@ class atomic_forces(Card):
 class k_points(Card):
     name = 'k_points'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         if self.specifier in {'tpiba','crystal','tpiba_b','crystal_b',''}:
             self.nkpoints = int(lines[0])
             a = array_from_lines(lines[1:])
@@ -1003,7 +1037,7 @@ class k_points(Card):
     #end def read_text
 
 
-    def write_text(self):
+    def write_text(self) -> str:
         c = ''
         if self.specifier in {'tpiba','crystal','tpiba_b','crystal_b',''}:
             self.nkpoints = len(self.kpoints)
@@ -1026,7 +1060,7 @@ class k_points(Card):
     #end def write_text
 
 
-    def change_specifier(self,new_specifier,pwi):
+    def change_specifier(self, new_specifier: str, pwi: PwscfInput) -> None:
         scale,kaxes = pwi.get_common_vars('scale','kaxes')
 
         spec = self.specifier
@@ -1087,15 +1121,15 @@ class k_points(Card):
 class cell_parameters(Card):
     name = 'cell_parameters'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         self.vectors = array_from_lines(lines)
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str | None:
         return array_to_string(self.vectors)
     #end def write_text
 
-    def change_specifier(self,new_specifier,pwi):
+    def change_specifier(self, new_specifier: str, pwi: PwscfInput) -> None:
         scale = pwi.get_common_vars('scale')
 
         vec = self.vectors
@@ -1143,11 +1177,11 @@ class cell_parameters(Card):
 class climbing_images(Card):
     name = 'climbing_images'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         self.images = array_from_lines(lines)
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str:
         c='   '
         for n in self.images:
             c+=str(int(n))+' '
@@ -1162,7 +1196,7 @@ class climbing_images(Card):
 class constraints(Card):
     name = 'constraints'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         tokens = lines[0].split()
         self.ncontraints = int(tokens[0])
         if len(tokens)>1:
@@ -1178,7 +1212,7 @@ class constraints(Card):
         #end for
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str:
         c = '   '+str(self.nconstraints)
         if 'tolerance' in self:
             c+=' '+str(self.tolerance)
@@ -1196,7 +1230,7 @@ class constraints(Card):
 class collective_vars(Card):
     name = 'collective_vars'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         tokens = lines[0].split()
         self.ncontraints = int(tokens[0])
         if len(tokens)>1:
@@ -1212,7 +1246,7 @@ class collective_vars(Card):
         #end for
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str:
         c= '   '+str(self.ncollective_vars)
         if 'tolerance' in self:
             c+=' '+str(self.tolerance)
@@ -1230,11 +1264,11 @@ class collective_vars(Card):
 class occupations(Card):
     name = 'occupations'
 
-    def read_text(self,lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         self.occupations = array_from_lines(lines)
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str | None:
         return array_to_string(self.occupations)
     #end def write_text
 #end class occupations
@@ -1245,7 +1279,7 @@ class hubbard(Card):
     available_specifiers = ('atomic', 'ortho-atomic', 'norm-atomic', 'wf', 'pseudo')
     default_specifier = 'atomic'
     system = None
-    def read_text(self, lines):
+    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
         contents = ''
         self.hubbard = {}
         for line in lines:
@@ -1278,7 +1312,7 @@ class hubbard(Card):
         #end for
     #end def read_text
 
-    def write_text(self):
+    def write_text(self) -> str:
         manifold_dict = {}
         contents = ''
         for param, interaction in self.hubbard.items():
@@ -1418,7 +1452,7 @@ class PwscfInput(SimulationInput):
     element_types.update(**card_types)
 
     required_elements = ('control','system','electrons','atomic_species','atomic_positions','k_points')
-    def __init__(self,*elements):
+    def __init__(self, *elements) -> None:
         elements = list(elements)
         if len(elements)==1 and os.path.exists(elements[0]):
             self.read(elements[0])
@@ -1446,7 +1480,7 @@ class PwscfInput(SimulationInput):
     #end def __init__
 
 
-    def read_text(self,contents,filepath=None):
+    def read_text(self, contents: str, filepath: str | None = None) -> None:
         lines = contents.splitlines()
         in_element = False
         elem_type = None
@@ -1511,7 +1545,7 @@ class PwscfInput(SimulationInput):
     #end def read_text
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         contents = ''
         for s in self.sections:
             if s in self:
@@ -1529,7 +1563,7 @@ class PwscfInput(SimulationInput):
     #end def write_text
 
 
-    def get_common_vars(self,*vars):
+    def get_common_vars(self, *vars: str | Path) -> list[float | str | np.ndarray]:
         scale = 1.0
         axes  = None
         kaxes = None
@@ -1567,7 +1601,7 @@ class PwscfInput(SimulationInput):
         return vals
     #end def get_common_vars
 
-    def incorporate_hubbard(self, hubbard_result):
+    def incorporate_hubbard(self, hubbard_result) -> None:
         hub_obj = hubbard()
         hubbard_result = hubbard_result.split('\n')
         hub_obj.specifier = hubbard_result[1].split()[-1]
@@ -1575,7 +1609,7 @@ class PwscfInput(SimulationInput):
         self.hubbard = hub_obj
     #end def incorporate_hubbard
 
-    def incorporate_system(self,system,elem_order=None):
+    def incorporate_system(self, system: PhysicalSystem, elem_order = None) -> None:
         system.check_folded_system()
         system.change_units('B')
         s  = system.structure
@@ -1679,7 +1713,11 @@ class PwscfInput(SimulationInput):
     #end def incorporate_system
 
 
-    def incorporate_system_old(self,system,spin_polarized=None):
+    def incorporate_system_old(
+        self,
+        system         : PhysicalSystem,
+        spin_polarized = None,
+        ) -> None:
         system.check_folded_system()
         system.change_units('B')
         s  = system.structure
@@ -1771,7 +1809,12 @@ class PwscfInput(SimulationInput):
 
 
     # test needed
-    def return_system(self,*,structure_only=False,**valency):
+    def return_system(
+        self,
+        *,
+        structure_only : bool = False,
+        **valency,
+        ) -> PhysicalSystem | Structure:
         ibrav = self.system.ibrav
         if ibrav!=0:
             msg = 'ability to handle non-zero ibrav not yet implemented'
@@ -1847,7 +1890,7 @@ class PwscfInput(SimulationInput):
     #end def return_system
 
 
-    def standardize_types(self):
+    def standardize_types(self) -> None:
         for s in self.values():
             if isinstance(s,Section):
                 array_keys = []
@@ -1883,7 +1926,7 @@ class PwscfInput(SimulationInput):
 
 
 
-def generate_pwscf_input(selector,**kwargs):
+def generate_pwscf_input(selector: str, **kwargs) -> PwscfInput | None:
     if selector=='generic':
         return generate_any_pwscf_input(**kwargs)
     if selector=='scf':
@@ -1966,7 +2009,7 @@ generate_any_defaults = obj(
         ),
     )
 
-def generate_any_pwscf_input(**kwargs):
+def generate_any_pwscf_input(**kwargs) -> PwscfInput | None:
     #move values into a more convenient representation
     #kwargs = obj(**kwargs)
     # enforce lowercase internally, but remain case insensitive to user input
@@ -2355,46 +2398,47 @@ def generate_any_pwscf_input(**kwargs):
 
 
 
-def generate_scf_input(*,
-                       prefix       = 'pwscf',
-                       outdir       = 'pwscf_output',
-                       input_dft    = None,
-                       exx_fraction = None,
-                       exxdiv_treatment = None,
-                       ecut         = 200.,
-                       ecutrho      = None,
-                       ecutfock     = None,
-                       occupations  = 'smearing',
-                       smearing     = 'fermi-dirac',
-                       degauss      = 0.0001,
-                       nosym        = False,
-                       spin_polarized = None,
-                       assume_isolated = None,
-                       wf_collect   = True,
-                       hubbard_u    = None,
-                       start_mag    = None,
-                       restart_mode = 'from_scratch',
-                       tstress      = True,
-                       tprnfor      = True,
-                       disk_io      = 'low',
-                       verbosity    = 'high',
-                       ibrav        = 0,
-                       conv_thr     = 1e-10,
-                       electron_maxstep = 1000,
-                       mixing_mode  = 'plain',
-                       mixing_beta  = .7,
-                       diagonalization = 'david',
-                       kgrid        = None,
-                       kshift       = None,
-                       pseudos      = None,
-                       system       = None,
-                       use_folded   = True,
-                       group_atoms  = False,
-                       la2F         = None,
-                       nbnd         = None,
-                       lspinorb     = False,
-                       noncolin     = False,
-                       ):
+def generate_scf_input(
+    *,
+    prefix           : str                         = 'pwscf',
+    outdir           : str                         = 'pwscf_output',
+    input_dft        : str | None                  = None,
+    exx_fraction     : float | None                = None,
+    exxdiv_treatment : str | None                  = None,
+    ecut             : Num                         = 200.,
+    ecutrho          : Num | None                  = None,
+    ecutfock         : Num | None                  = None,
+    occupations      : str                         = 'smearing',
+    smearing         : str                         = 'fermi-dirac',
+    degauss          : float                       = 0.0001,
+    nosym            : bool                        = False,
+    spin_polarized   : bool | None                 = None,
+    assume_isolated  : str | None                  = None,
+    wf_collect       : bool                        = True,
+    hubbard_u        : AtomVals | None             = None,
+    start_mag        : AtomVals | None             = None,
+    restart_mode     : str                         = 'from_scratch',
+    tstress          : bool                        = True,
+    tprnfor          : bool                        = True,
+    disk_io          : str                         = 'low',
+    verbosity        : str                         = 'high',
+    ibrav            : int                         = 0,
+    conv_thr         : float                       = 1e-10,
+    electron_maxstep : int                         = 1000,
+    mixing_mode      : str                         = 'plain',
+    mixing_beta      : float                       = .7,
+    diagonalization  : str                         = 'david',
+    kgrid            : Vec3i | None                = None,
+    kshift           : Vec3i | None                = None,
+    pseudos          : PseudoArg | None            = None,
+    system           : PhysicalSystem | None       = None,
+    use_folded       : bool                        = True,
+    group_atoms      : bool                        = False,
+    la2F             : bool | None                 = None,
+    nbnd             : int | None                  = None,
+    lspinorb         : bool                        = False,
+    noncolin         : bool                        = False,
+    ) -> PwscfInput:
     if pseudos is None:
         pseudos = []
     #end if
@@ -2603,7 +2647,7 @@ def generate_scf_input(*,
 
 
 
-def generate_nscf_input(**kwargs):
+def generate_nscf_input(**kwargs: KwargsT) -> PwscfInput:
     pw = generate_scf_input(**kwargs)
     pw.control.update(
         calculation = 'nscf'
@@ -2614,41 +2658,42 @@ def generate_nscf_input(**kwargs):
 
 
 
-def generate_relax_input(*,
-                         prefix       = 'pwscf',
-                         outdir       = 'pwscf_output',
-                         input_dft    = None,
-                         exx_fraction = None,
-                         ecut         = 50.,
-                         ecutrho      = None,
-                         ecutfock     = None,
-                         conv_thr     = 1e-6,
-                         mixing_mode  = 'plain',
-                         mixing_beta  = .7,
-                         diagonalization = 'david',
-                         occupations  = 'smearing',
-                         smearing     = 'fermi-dirac',
-                         degauss      = 0.0001,
-                         nosym        = True,
-                         spin_polarized = None,
-                         assume_isolated = None,
-                         upscale      = 100,
-                         pot_extrapolation = 'second_order',
-                         wfc_extrapolation = 'second_order',
-                         hubbard_u    = None,
-                         start_mag    = None,
-                         restart_mode = 'from_scratch',
-                         kgrid        = None,
-                         kshift       = None,
-                         pseudos      = None,
-                         system       = None,
-                         use_folded   = False,
-                         group_atoms  = False,
-                         forc_conv_thr= None,
-                         disk_io      = 'low',
-                         wf_collect   = False,
-                         verbosity    = 'high',
-                         ):
+def generate_relax_input(
+    *,
+    prefix            : str                         = 'pwscf',
+    outdir            : str                         = 'pwscf_output',
+    input_dft         : str | None                  = None,
+    exx_fraction                                    = None,
+    ecut              : int | float                 = 50.,
+    ecutrho                                         = None,
+    ecutfock                                        = None,
+    conv_thr          : float                       = 1e-6,
+    mixing_mode       : str                         = 'plain',
+    mixing_beta       : float                       = .7,
+    diagonalization   : str                         = 'david',
+    occupations       : str                         = 'smearing',
+    smearing          : str                         = 'fermi-dirac',
+    degauss           : float                       = 0.0001,
+    nosym             : bool                        = True,
+    spin_polarized                                  = None,
+    assume_isolated                                 = None,
+    upscale           : int                         = 100,
+    pot_extrapolation : str                         = 'second_order',
+    wfc_extrapolation : str                         = 'second_order',
+    hubbard_u                                       = None,
+    start_mag                                       = None,
+    restart_mode      : str                         = 'from_scratch',
+    kgrid             : tuple[int, int, int] | None = None,
+    kshift            : tuple[int, int, int] | None = None,
+    pseudos           : dict[str, int | str] | None = None,
+    system            : PhysicalSystem | None       = None,
+    use_folded        : bool                        = False,
+    group_atoms       : bool                        = False,
+    forc_conv_thr                                   = None,
+    disk_io           : str                         = 'low',
+    wf_collect        : bool                        = False,
+    verbosity         : str                         = 'high',
+    ) -> PwscfInput:
     if pseudos is None:
         pseudos = []
     #end if
@@ -2814,13 +2859,14 @@ def generate_relax_input(*,
 
 
 def generate_vcrelax_input(
-    press          = None, # None = use pw.x default
+    press          = None,  # None = use pw.x default
     cell_factor    = None,
     cell_dofree    = None,
     forc_conv_thr  = None,
     ion_dynamics   = None,
     press_conv_thr = None,
-    **kwargs):
+    **kwargs,
+    ) -> PwscfInput:
 
     pw = generate_scf_input(**kwargs)
     pw.control.update(

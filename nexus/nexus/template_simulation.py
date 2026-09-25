@@ -28,6 +28,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from .developer import obj
 from .simulation import Simulation,SimulationInput,SimulationAnalyzer
@@ -101,7 +103,7 @@ from .simulation import Simulation,SimulationInput,SimulationAnalyzer
 
 
 class TemplateSimulationInput(SimulationInput):
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         # optional
         #  below is a convenient default
         #  but it can be changed to anything desired
@@ -111,7 +113,7 @@ class TemplateSimulationInput(SimulationInput):
     #end def __init__
 
 
-    def read_text(self,text,filepath=None):
+    def read_text(self, text: str | list[str], filepath = None) -> None:
         # required
         #  the string 'text' contains the text of an input file
         #  translate text into an internal representation of the input
@@ -156,7 +158,7 @@ class TemplateSimulationInput(SimulationInput):
     #end def read_text
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath = None) -> str:
         # required
         #  translate the internal representation of input into a string
         # for the above example, this might look like:
@@ -172,7 +174,7 @@ class TemplateSimulationInput(SimulationInput):
     #end def write_text
 
 
-    def incorporate_system(self,system):
+    def incorporate_system(self, system):
         # optional
         #  only necessary if you want to populate atomic positions, etc
         #  from a PhysicalSystem object
@@ -189,7 +191,7 @@ def generate_template_simulation_input(
     # kw2    = default_val2,
     # system = None,
     # ...
-    ):
+    ) -> TemplateSimulationInput:
     # optional
     #  only necessary if you want to make template_simulation input files
     #  with the fewest relevant variables
@@ -212,7 +214,7 @@ def generate_template_simulation_input(
 
 
 class TemplateSimulationAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0=None):
+    def __init__(self, arg0: Simulation | None = None) -> None:
         # optional
         #  only necessary if you want to use results from output files
         #   to inform the inputs of subsequent simulations
@@ -238,7 +240,7 @@ class TemplateSimulationAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         # optional
         #  only necessary if you want to use results from output files
         #   to inform the inputs of subsequent simulations
@@ -259,7 +261,7 @@ class TemplateSimulation(Simulation):
     application_properties = frozenset({'serial','mpi'})
     application_results    = frozenset({'orbitals'}) #what template_simulation produces that other simulations can use
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         # optional
         #  only necessary if another simulation depends on this one
         #  e.g.
@@ -274,7 +276,7 @@ class TemplateSimulation(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj:
         # optional
         #  only necessary if another simulation depends on this one
         #  e.g.
@@ -294,7 +296,12 @@ class TemplateSimulation(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ):
         # optional
         #  only necessary if this template_simulation sim depends on another sim
         #  e.g.
@@ -304,7 +311,7 @@ class TemplateSimulation(Simulation):
     #end def incorporate_result
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         # required
         #  specify command line arguments to the executable, such as the input file
         #    e.g. command_line_args = ' '+self.infile
@@ -313,7 +320,7 @@ class TemplateSimulation(Simulation):
     #end def app_command
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         # required
         #  read output/error files to check whether simulation has
         #    completed successfully
@@ -332,7 +339,7 @@ class TemplateSimulation(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         # optional
         #  if provided, the listed output files will be copied to the results directory
         # if you don't want to implement it, no action is required
@@ -343,7 +350,7 @@ class TemplateSimulation(Simulation):
 
 
 
-def generate_template_simulation(**kwargs):
+def generate_template_simulation(**kwargs) -> TemplateSimulation:
     # optional
     #  the following code should work provided
     #  generate_template_simulation_input is suitably defined

@@ -104,14 +104,19 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from .fileio import TextFile
 from .simulation import Simulation,SimulationInput,SimulationAnalyzer,NullSimulationAnalyzer
 from .developer import DevBase, obj, FileFormatError, NexusError
 
+from pathlib import Path
+
+
 
 booldict = {'.true.':True,'.false.':False}
-def readval(val):
+def readval(val: str) -> bool | int | float | str | None:
     if val in booldict:
         v = booldict[val]
     else:
@@ -133,7 +138,7 @@ def readval(val):
 #end def readval
 
 
-def writeval(val):
+def writeval(val: bool | int | float | str) -> str | None:
     if isinstance(val,bool):
         if val:
             sval = '.true.'
@@ -156,7 +161,7 @@ def writeval(val):
 
 class Namelist(DevBase):
     @classmethod
-    def class_init(cls):
+    def class_init(cls) -> None:
         if not hasattr(cls,'namelist'):
             cls.namelist = 'unknown'
         if not hasattr(cls,'names'):
@@ -165,7 +170,7 @@ class Namelist(DevBase):
     #end def class_init
 
 
-    def __init__(self,text=None,**vals):
+    def __init__(self, text: list[str] | None = None, **vals) -> None:
         if text is not None:
             self.read_text(text)
         #end if
@@ -175,7 +180,7 @@ class Namelist(DevBase):
     #end def __init__
 
 
-    def check_names(self,label,names):
+    def check_names(self, label: str, names) -> None:
         cls = self.__class__
         if len(cls.name_set)>0:
             invalid = set(names)-cls.name_set
@@ -192,7 +197,7 @@ class Namelist(DevBase):
     #end def check_names
 
 
-    def assign_values(self,label,**vals):
+    def assign_values(self, label: str, **vals: bool | str) -> None:
         self.check_names(label,vals.keys())
         for name,value in vals.items():
             self[name] = value
@@ -200,7 +205,7 @@ class Namelist(DevBase):
     #end def assign_values
 
 
-    def read_text(self,text):
+    def read_text(self, text) -> None:
         cls = self.__class__
         if isinstance(text,str):
             lines = text.split()
@@ -250,7 +255,7 @@ class Namelist(DevBase):
     #end def read_text
 
 
-    def write_text(self):
+    def write_text(self) -> str:
         cls = self.__class__
         has_namelist = 'namelist' in self
         if has_namelist:
@@ -287,7 +292,7 @@ class Namelist(DevBase):
 
 class NamelistInput(SimulationInput):
     @classmethod
-    def class_init(cls):
+    def class_init(cls) -> None:
         if not hasattr(cls,'namelists'):
             cls.namelists = []
         if not hasattr(cls,'namelist_classes'):
@@ -302,7 +307,7 @@ class NamelistInput(SimulationInput):
     #end def class_init
 
 
-    def __init__(self,filepath=None,**vals):
+    def __init__(self, filepath: Path | None = None, **vals) -> None:
         if filepath is not None:
             self.read(filepath)
             return
@@ -334,7 +339,7 @@ class NamelistInput(SimulationInput):
     #end def __init__
 
 
-    def read_text(self,text,filepath=None):
+    def read_text(self, text: str | list[str], filepath: str | None = None) -> None:
         cls      = self.__class__
         lines    = text.split('\n')
         inside   = False
@@ -370,7 +375,7 @@ class NamelistInput(SimulationInput):
     #end def read_text
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         cls = self.__class__
         text = ''
         for name in self.keys():
@@ -401,26 +406,30 @@ class NamelistInput(SimulationInput):
 class PostProcessSimulation(Simulation):
     analyzer_type = NullSimulationAnalyzer
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         return False
     #end def check_result
 
-    def app_command(self):
+    def app_command(self) -> str:
         return self.app_name+'<'+self.infile
     #end def app_command
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         self.finished = True
     #end def check_sim_status
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         return []
     #end def get_output_files
 #end class PostProcessSimulation
 
 
 
-def generate_ppsim(gen_input=None,Sim=None,**kwargs):
+def generate_ppsim(
+    gen_input : type[NamelistInput] | None         = None,
+    Sim       : type[PostProcessSimulation] | None = None,
+    **kwargs,
+    ) -> PostProcessSimulation:
     sim_args,inp_args = Simulation.separate_inputs(kwargs)
     if 'input' not in sim_args:
         sim_args.input = gen_input(**inp_args)
@@ -467,7 +476,7 @@ class PP(PostProcessSimulation):
 
 generate_pp_input = PPInput
 
-def generate_pp(**kwargs):
+def generate_pp(**kwargs) -> PP:
     return generate_ppsim(PPInput,PP,**kwargs)
 #end def generate_pp
 
@@ -501,7 +510,7 @@ class Dos(PostProcessSimulation):
 
 generate_dos_input = DosInput
 
-def generate_dos(**kwargs):
+def generate_dos(**kwargs) -> Dos:
     return generate_ppsim(DosInput,Dos,**kwargs)
 #end def generate_dos
 
@@ -536,7 +545,7 @@ class Bands(PostProcessSimulation):
 
 generate_bands_input = BandsInput
 
-def generate_bands(**kwargs):
+def generate_bands(**kwargs) -> Bands:
     return generate_ppsim(BandsInput,Bands,**kwargs)
 #end def generate_bands
 
@@ -560,7 +569,15 @@ class ProjwfcInput(NamelistInput):
 
 
 class ProjwfcAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0=None,outfile=None,*,analyze=False,warn=False,strict=False):
+    def __init__(
+        self,
+        arg0    : Path | None = None,
+        outfile               = None,
+        *,
+        analyze : bool        = False,
+        warn    : bool        = False,
+        strict  : bool        = False,
+        ) -> None:
         self.info = obj(
             outfile     = outfile,
             warn        = warn,
@@ -599,7 +616,7 @@ class ProjwfcAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         operations = [
             ('open_log'   ,ProjwfcAnalyzer.open_log),
             ('read_states',ProjwfcAnalyzer.read_states),
@@ -626,12 +643,12 @@ class ProjwfcAnalyzer(SimulationAnalyzer):
     #end def analyze
 
 
-    def open_log(self):
+    def open_log(self) -> None:
         logfile = os.path.join(self.info.path,self.info.outfile)
         self.log = TextFile(logfile)
     #end def open_log
 
-    def read_states(self):
+    def read_states(self) -> None:
         log = self.log
         log.seek('state #')
         nstates  = 0
@@ -653,7 +670,7 @@ class ProjwfcAnalyzer(SimulationAnalyzer):
         self.states = obj(nstates=nstates,elem=elem)
     #end def read_states
 
-    def read_lowdin(self):
+    def read_lowdin(self) -> None:
         log = self.log
         log.seek('Lowdin Charges')
         lowdin = obj()
@@ -714,7 +731,18 @@ class ProjwfcAnalyzer(SimulationAnalyzer):
         self.lowdin = lowdin
     #end def read_lowdin
 
-    def write_lowdin(self,filepath=None,sum=None,tot=None,pol=None,up=None,down=None,*,all=True,long=False):
+    def write_lowdin(
+        self,
+        filepath : Path | None = None,
+        sum                    = None,
+        tot                    = None,
+        pol                    = None,
+        up                     = None,
+        down                   = None,
+        *,
+        all      : bool        = True,
+        long     : bool        = False,
+        ) -> str:
         if tot is None:
             tot = all
         #end if
@@ -802,7 +830,7 @@ class ProjwfcAnalyzer(SimulationAnalyzer):
         return text
     #end def write_lowdin
 
-    def close_log(self):
+    def close_log(self) -> None:
         if 'log' in self:
             del self.log
         #end if
@@ -817,7 +845,7 @@ class Projwfc(PostProcessSimulation):
     generic_identifier = 'projwfc'
     application        = 'projwfc.x'
 
-    def post_analyze(self,analyzer):
+    def post_analyze(self, analyzer) -> None:
         # try to write lowdin output data file
         try:
             lowdin_file = self.identifier+'.lowdin'
@@ -831,7 +859,11 @@ class Projwfc(PostProcessSimulation):
 #end class Projwfc
 
 
-def generate_projwfc_input(prefix='pwscf',outdir='pwscf_output',**vals):
+def generate_projwfc_input(
+    prefix : str = 'pwscf',
+    outdir : str = 'pwscf_output',
+    **vals : bool,
+    ) -> ProjwfcInput:
     pp = ProjwfcInput(
         prefix = prefix,
         outdir = outdir,
@@ -841,7 +873,7 @@ def generate_projwfc_input(prefix='pwscf',outdir='pwscf_output',**vals):
 #end def generate_projwfc_input
 
 
-def generate_projwfc(**kwargs):
+def generate_projwfc(**kwargs) -> Projwfc:
     return generate_ppsim(generate_projwfc_input,Projwfc,**kwargs)
 #end def generate_projwfc
 
@@ -877,7 +909,7 @@ class Cppp(PostProcessSimulation):
 
 generate_cppp_input = CpppInput
 
-def generate_cppp(**kwargs):
+def generate_cppp(**kwargs) -> Cppp:
     return generate_ppsim(CpppInput,Cppp,**kwargs)
 #end def generate_cppp
 
@@ -911,7 +943,7 @@ class Pwexport(PostProcessSimulation):
 
 generate_pwexport_input = PwexportInput
 
-def generate_pwexport(**kwargs):
+def generate_pwexport(**kwargs) -> Pwexport:
     return generate_ppsim(PwexportInput,Pwexport,**kwargs)
 #end def generate_pwexport
 
@@ -937,7 +969,15 @@ class HpInput(NamelistInput):
 
 
 class HpAnalyzer(SimulationAnalyzer):
-    def __init__(self,arg0=None,outfile=None,*,analyze=False,warn=False,strict=False):
+    def __init__(
+        self,
+        arg0           = None,
+        outfile        = None,
+        *,
+        analyze : bool = False,
+        warn    : bool = False,
+        strict  : bool = False,
+        ) -> None:
         self.info = obj(
             outfile     = outfile,
             warn        = warn,
@@ -976,7 +1016,7 @@ class HpAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         operations = [
             ('open_hubbard_dat'   ,HpAnalyzer.open_hubbard_dat),
             ('read_hubbard_dat'   ,HpAnalyzer.read_hubbard_dat),
@@ -1002,12 +1042,12 @@ class HpAnalyzer(SimulationAnalyzer):
     #end def analyze
 
 
-    def open_hubbard_dat(self):
+    def open_hubbard_dat(self) -> None:
         logfile = os.path.join(self.info.path,"HUBBARD.dat")
         self.hubbard_dat = TextFile(logfile)
     #end def open_hubbard_dat
 
-    def read_hubbard_dat(self):
+    def read_hubbard_dat(self) -> None:
         log = self.hubbard_dat
         log.seek('# Copy this data in the pw.x input file for DFT+Hubbard calculations')
         result = ''
@@ -1021,7 +1061,7 @@ class HpAnalyzer(SimulationAnalyzer):
         self.hubbard_parameters = result
     #end def read_hubbard_dat
 
-    def close_hubbard_dat(self):
+    def close_hubbard_dat(self) -> None:
         if 'hubbard_dat' in self:
             del self.hubbard_dat
         #end if
@@ -1037,7 +1077,7 @@ class Hp(PostProcessSimulation):
     application        = 'hp.x'
     application_results = frozenset({'hubbard_parameters'})
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         calculating_result = False
         if result_name=='hubbard_parameters':
             calculating_result = True
@@ -1045,7 +1085,7 @@ class Hp(PostProcessSimulation):
         return calculating_result
     #end def check_result
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj:
         result = obj()
         prefix = 'pwscf'
         outdir = './'
@@ -1064,7 +1104,11 @@ class Hp(PostProcessSimulation):
 #end class Projwfc
 
 
-def generate_hp_input(prefix='pwscf',outdir='pwscf_output',**vals):
+def generate_hp_input(
+    prefix : str = 'pwscf',
+    outdir : str = 'pwscf_output',
+    **vals,
+    ) -> HpInput:
     pp = HpInput(
         prefix = prefix,
         outdir = outdir,

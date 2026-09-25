@@ -20,6 +20,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 from .developer import obj
 from .developer import DevBase
 
@@ -28,7 +30,14 @@ class Unit(DevBase):
 
     unit_dicts = obj(all=obj())
 
-    def __init__(self,type,name,symbol,value,shift=0):
+    def __init__(
+        self,
+        type   : str,
+        name   : str,
+        symbol : str,
+        value  : float,
+        shift  : int | float = 0,
+        ) -> None:
         self.type   = type
         self.name   = name
         self.symbol = symbol
@@ -165,13 +174,13 @@ class UnitConverter(DevBase):
     unit_dict = Unit.unit_dicts.all
 
 
-    def __init__(self):
+    def __init__(self) -> None:
         msg = 'UnitConverter should not be instantiated'
         raise RuntimeError(msg)
     #def __init__
 
     @staticmethod
-    def convert(value,source_unit,target_unit):
+    def convert(value, source_unit, target_unit):
         ui = UnitConverter.unit_dict[source_unit]
         uo = UnitConverter.unit_dict[target_unit]
 
@@ -189,7 +198,7 @@ class UnitConverter(DevBase):
     #end def convert
 
     @staticmethod
-    def convert_scalar_to_all(units,value_orig):
+    def convert_scalar_to_all(units, value_orig) -> dict[str, float]:
         unit_type = UnitConverter.unit_dict[units].type
 
         value = dict()
@@ -206,6 +215,6 @@ class UnitConverter(DevBase):
 #end class UnitConverter
 
 
-def convert(value,source_unit,target_unit):
+def convert(value, source_unit: str, target_unit: str):
     return UnitConverter.convert(value,source_unit,target_unit)[0]
 #end def convert

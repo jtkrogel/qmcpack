@@ -16,13 +16,18 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 from copy import deepcopy
 import numpy as np
 from .developer import obj
 from .simulation import SimulationInputTemplateDev
 
+from pathlib import Path
 
-def render_string(s_in,n):
+
+
+def render_string(s_in: str, n: int) -> str:
     indent = n*' '
     s = ''
     lines = s_in.splitlines()
@@ -35,7 +40,7 @@ def render_string(s_in,n):
 #end def render_string
 
 
-def render_array(a,n):
+def render_array(a: np.ndarray, n: int) -> str:
     indent = n*' '
     s = ''
     if len(a.shape)==1:
@@ -118,30 +123,37 @@ class PyscfInput(SimulationInputTemplateDev):
     cell_allowed = frozenset(cell_order)
 
 
-    def __init__(self,
-                 template    = None,     # path to template input file
-                 prefix      = None,     # $prefix var for file prefixes
-                 custom      = None,     # obj w/ $ prefixed vars in template
-                 system      = None,     # physical system object
-                 units       = None,     # input units desired
-                 *,
-                 use_folded  = True,     # use folded system/primitive cell
-                 mole        = None,     # obj w/ Mole variables
-                 cell        = None,     # obj w/ Cell variables
-                 sys_var     = None,     # local var name for Mole/Cell
-                 mole_var    = 'mol',    # local var name for Mole in written input
-                 cell_var    = 'cell',   # local var name for Cell in written input
-                 save_qmc    = False,    # convert to QMCPACK format
-                 checkpoint  = False,    # set $chkfile variable
-                 mf_var      = 'mf',     # local var name for mf, used for convert
-                 kpts_var    = 'kpts',   # local var name for kpts, used for convert
-                 filepath    = None,     # alias for template
-                 text        = None,     # full text of (and alternate to) template
-                 calculation = None,     # obj w/ Calculation variables
-                 chkfile     = None,     # obj w/ Calculation variables
-                 twist_num   = None,     # Twist index
-                 python_exe  = 'python3', # Python executable
-                 ):
+    def __init__(
+        self,
+        template    : str | Path | None = None,  # path to template input file
+        prefix      : str | None        = None,  # $prefix var for file prefixes
+        # obj w/ $ prefixed vars in template
+        custom                          = None,
+        system                          = None,  # physical system object
+        units                           = None,  # input units desired
+        *,
+        use_folded  : bool              = True,  # use folded system/primitive cell
+        mole        : obj | None        = None,  # obj w/ Mole variables
+        cell        : obj | None        = None,  # obj w/ Cell variables
+        sys_var                         = None,  # local var name for Mole/Cell
+        # local var name for Mole in written input
+        mole_var    : str               = 'mol',
+        # local var name for Cell in written input
+        cell_var    : str               = 'cell',
+        save_qmc    : bool              = False,  # convert to QMCPACK format
+        checkpoint  : bool | str        = False,  # set $chkfile variable
+        # local var name for mf, used for convert
+        mf_var      : str               = 'mf',
+        # local var name for kpts, used for convert
+        kpts_var    : str               = 'kpts',
+        filepath                        = None,  # alias for template
+        # full text of (and alternate to) template
+        text                            = None,
+        calculation : obj | None        = None,  # obj w/ Calculation variables
+        chkfile                         = None,  # obj w/ Calculation variables
+        twist_num                       = None,  # Twist index
+        python_exe  : str               = 'python3',  # Python executable
+        ) -> None:
         if filepath is None and template is not None:
             filepath = template
         elif calculation is not None:
@@ -547,7 +559,7 @@ $calculation
     #end def __init__
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath: str | Path | None = None) -> str:
         text = SimulationInputTemplateDev.write_text(self,filepath)
         if self.addendum is not None:
             text += self.addendum
@@ -558,6 +570,6 @@ $calculation
 
 
 
-def generate_pyscf_input(*args,**kwargs):
+def generate_pyscf_input(*args, **kwargs) -> PyscfInput:
     return PyscfInput(*args,**kwargs)
 #end def generate_pyscf_input

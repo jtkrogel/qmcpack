@@ -40,6 +40,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import numpy as np
 from .developer import DevBase, obj
 from .hdfreader import HDFgroup
@@ -47,11 +49,11 @@ from .numerics import surface_normals
 
 
 class Plotter(DevBase):
-    def __init__(self):
+    def __init__(self) -> None:
         self.initialized = False
     #end def __init__
 
-    def ensure_init(self):
+    def ensure_init(self) -> None:
         if not self.initialized:
             from enthought.mayavi import mlab
             from enthought.tvtk.api import tvtk
@@ -66,7 +68,14 @@ class Plotter(DevBase):
         #end if
     #end def ensure_init
 
-    def isosurface(self,points,scalars,contours,dimensions,name='val'):
+    def isosurface(
+        self,
+        points,
+        scalars,
+        contours   : int | list,
+        dimensions,
+        name       : str = 'val',
+        ) -> None:
         self.ensure_init()
         mlab = self.mlab
         tvtk = self.tvtk
@@ -89,7 +98,14 @@ class Plotter(DevBase):
         #end if
     #end def isosurface
 
-    def surface_slice(self,x,y,z,scalars,options=None):
+    def surface_slice(
+        self,
+        x,
+        y,
+        z,
+        scalars,
+        options = None,
+        ) -> None:
         scale = 1.0
         opacity= 1.0
         if options is not None:
@@ -130,27 +146,27 @@ class QAobject(QAobj_base):
 
     opt_methods = frozenset({'opt','linear','cslinear'})
 
-    def __init__(self):
+    def __init__(self) -> None:
         return
     #end def __init__
 
     @staticmethod
-    def condense_name(name):
+    def condense_name(name: str) -> str:
         return name.strip().lower().replace(' ','_').replace('-','_').replace('__','_')
     #end def condense_name
 
 
-    def _register_dynamic_methods(self):
+    def _register_dynamic_methods(self) -> None:
         QAobject._global.dynamic_methods_objects.append(self)
     #end def _register_dynamic_methods
 
-    def _unlink_dynamic_methods(self):
+    def _unlink_dynamic_methods(self) -> None:
         for o in QAobject._global.dynamic_methods_objects:
             o._unset_dynamic_methods()
         #end for
     #end def _unlink_dynamic_methods
 
-    def _relink_dynamic_methods(self):
+    def _relink_dynamic_methods(self) -> None:
         for o in QAobject._global.dynamic_methods_objects:
             o._reset_dynamic_methods()
         #end for
@@ -167,7 +183,7 @@ class QAobject(QAobj_base):
         setattr(QAobj_base,k,v)
 
     @classmethod
-    def settings(cls,**kwargs):
+    def settings(cls, **kwargs) -> None:
         vars = set(kwargs.keys())
         invalid = vars-cls._allowed_settings
         if len(invalid)>0:
@@ -190,16 +206,16 @@ class QAobject(QAobj_base):
 
 
 class Checks(DevBase):
-    def __init__(self,label=''):
+    def __init__(self, label: str = '') -> None:
         self._label = label
         self._exclusions = set()
     #end def __init__
 
-    def exclude(self,value):
+    def exclude(self, value) -> None:
         self._exclusions.add(value)
     #end def exclude
 
-    def valid(self):
+    def valid(self) -> bool:
         valid = True
         for name,value in self.items():
             if not (isinstance(name,str) and name.startswith('_')):
@@ -212,7 +228,7 @@ class Checks(DevBase):
         return valid
     #end def valid
 
-    def write(self,pad=''):
+    def write(self, pad: str = '') -> None:
         pad2 = pad+'  '
         if '_valid' not in self:
             self.valid()
@@ -247,14 +263,14 @@ class QAinformation(obj):
 
 
 class QAdata(QAobject):
-    def zero(self):
+    def zero(self) -> None:
         for value in self.values():
             value[:] = 0
         #end for
         #self.sum()
     #end def zero
 
-    def minsize(self,other):
+    def minsize(self, other: QAdata) -> None:
         for name,value in self.items():
             if name in other:
                 self[name] = np.resize(value,np.minimum(value.shape,other[name].shape))
@@ -266,7 +282,7 @@ class QAdata(QAobject):
         #self.sum()
     #end def minsize
 
-    def accumulate(self,other):
+    def accumulate(self, other: QAdata) -> None:
         for name,value in self.items():
             if name in other:
                 value += other[name][0:len(value)]
@@ -278,7 +294,7 @@ class QAdata(QAobject):
         #self.sum()
     #end def accumulate
 
-    def normalize(self,normalization):
+    def normalize(self, normalization: int) -> None:
         for value in self.values():
             value/=normalization
         #end for
@@ -286,7 +302,7 @@ class QAdata(QAobject):
     #end def normalize
 
 
-    def sum(self):
+    def sum(self) -> None:
         s = 0
         for value in self.values():
             s+=value.sum()
@@ -298,7 +314,7 @@ class QAdata(QAobject):
 
 
 class QAHDFdata(QAdata):
-    def zero(self):
+    def zero(self) -> None:
         for value in self.values():
             if isinstance(value,HDFgroup):
                 value.zero('value','value_squared')
@@ -306,7 +322,7 @@ class QAHDFdata(QAdata):
         #end for
     #end def zero
 
-    def minsize(self,other):
+    def minsize(self, other: QAdata) -> None:
         for name,value in self.items():
             if isinstance(value,HDFgroup):
                 if name in other and isinstance(other[name],HDFgroup):
@@ -319,7 +335,7 @@ class QAHDFdata(QAdata):
         #end for
     #end def minsize
 
-    def accumulate(self,other):
+    def accumulate(self, other: QAdata) -> None:
         for name,value in self.items():
             if isinstance(value,HDFgroup):
                 if name in other and isinstance(other[name],HDFgroup):
@@ -332,7 +348,7 @@ class QAHDFdata(QAdata):
         #end for
     #end def accumulate
 
-    def normalize(self,normalization):
+    def normalize(self, normalization: int) -> None:
         for value in self.values():
             if isinstance(value,HDFgroup):
                 value.normalize(normalization,'value','value_squared')
@@ -358,7 +374,7 @@ class QAanalyzer(QAobject):
     dmc_methods = frozenset({'dmc','dmc_batch'})
 
 
-    def __init__(self,nindent=0):
+    def __init__(self, nindent: int = 0) -> None:
         self.info = QAinformation(
             initialized = False,
             data_loaded = False,
@@ -369,17 +385,22 @@ class QAanalyzer(QAobject):
         self.vlog('building '+self.__class__.__name__)
     #end def __init__
 
-    def subindent(self):
+    def subindent(self) -> int:
         return self.info.nindent+1
     #end def indent
 
-    def vlog(self,msg,n=0):
+    def vlog(self, msg: str, n: int = 0) -> None:
         if QAanalyzer.verbose_vlog:
             self.nxs_print(msg,n=self.info.nindent+n)
         #end if
     #end def vlog
 
-    def reset_indicators(self,initialized=None,data_loaded=None,analyzed=None):
+    def reset_indicators(
+        self,
+        initialized               = None,
+        data_loaded : bool | None = None,
+        analyzed    : bool | None = None,
+        ) -> None:
         if initialized is not None:
             self.info.initialized = initialized
         #end if
@@ -395,25 +416,25 @@ class QAanalyzer(QAobject):
         raise NotImplementedError
     #end def init_sub_analyzers
 
-    def load_data_local(self):
+    def load_data_local(self) -> None:
         pass
     #end def load_data_local
 
-    def remove_data_local(self):
+    def remove_data_local(self) -> None:
         if 'data' in self:
             del self.data
         #end if
     #end def remove_data_local
 
-    def analyze_local(self):
+    def analyze_local(self) -> None:
         pass
     #end def analyze_local
 
-    def set_global_info(self):
+    def set_global_info(self) -> None:
         pass
     #end def set_global_info
 
-    def unset_global_info(self):
+    def unset_global_info(self) -> None:
         pass
     #end def unset_global_info
 
@@ -442,7 +463,7 @@ class QAanalyzer(QAobject):
     #    #end if
     ##end def traverse
 
-    def propagate_indicators(self,**kwargs):
+    def propagate_indicators(self, **kwargs) -> None:
         self.reset_indicators(**kwargs)
         for value in self.values():
             if isinstance(value,QAanalyzer):
@@ -457,7 +478,7 @@ class QAanalyzer(QAobject):
         #end for
     #end def propagate_indicators
 
-    def load_data(self):
+    def load_data(self) -> None:
         if not self.info.data_loaded:
             self.vlog('loading '+self.__class__.__name__+' data',n=1)
             self.load_data_local()
@@ -476,7 +497,11 @@ class QAanalyzer(QAobject):
         #end for
     #end def load_data
 
-    def analyze(self,*,force=False):
+    def analyze(
+        self,
+        *,
+        force : bool = False,
+        ) -> None:
         self.set_global_info()
         if not self.info.data_loaded:
             self.load_data_local()
@@ -502,7 +527,7 @@ class QAanalyzer(QAobject):
     #end def analyze
 
 
-    def remove_data(self):
+    def remove_data(self) -> None:
         self.vlog('removing '+self.__class__.__name__+' data',n=1)
         names = list(self.keys())
         for name in names:
@@ -524,7 +549,7 @@ class QAanalyzer(QAobject):
     #end def remove_data
 
 
-    def zero_data(self):
+    def zero_data(self) -> None:
         self.vlog('zeroing '+self.__class__.__name__+' data',n=1)
         for value in self.values():
             if isinstance(value,QAdata):
@@ -545,7 +570,7 @@ class QAanalyzer(QAobject):
     #end def zero_data
 
 
-    def minsize_data(self,other):
+    def minsize_data(self, other: QAanalyzer) -> None:
         self.vlog('minsizing '+self.__class__.__name__+' data',n=1)
         for name,value in self.items():
             if isinstance(value,QAdata):
@@ -589,7 +614,7 @@ class QAanalyzer(QAobject):
     #end def minsize_data
 
 
-    def accumulate_data(self,other):
+    def accumulate_data(self, other: QAanalyzer) -> None:
         self.vlog('accumulating '+self.__class__.__name__+' data',n=1)
         for name,value in self.items():
             if isinstance(value,QAdata):
@@ -633,7 +658,7 @@ class QAanalyzer(QAobject):
     #end def accumulate_data
 
 
-    def normalize_data(self,normalization):
+    def normalize_data(self, normalization: int) -> None:
         self.vlog('normalizing '+self.__class__.__name__+' data',n=1)
         for value in self.values():
             if isinstance(value,QAdata):

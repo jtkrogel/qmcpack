@@ -31,6 +31,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import numpy as np
 from .developer import obj
@@ -52,19 +54,19 @@ class Gamess(Simulation):
     mcppath = None
 
     @staticmethod
-    def settings(ericfmt=None,mcppath=None):
+    def settings(ericfmt = None, mcppath = None) -> None:
         Gamess.ericfmt = ericfmt
         Gamess.mcppath = mcppath
     #end def settings
 
     @staticmethod
-    def restore_default_settings():
+    def restore_default_settings() -> None:
         Gamess.ericfmt = None
         Gamess.mcppath = None
     #end def restore_default_settings
 
 
-    def __init__(self,**kwargs):
+    def __init__(self, **kwargs) -> None:
         self.mo_reorder = None
         mo_reorder = kwargs.pop('mo_reorder',None)
         if mo_reorder is not None:
@@ -74,7 +76,7 @@ class Gamess(Simulation):
     #end def __init__
 
 
-    def init_job_extra(self):
+    def init_job_extra(self) -> None:
         # gamess seems to need lots of environment variables to run properly
         # nearly all of these are names of output/work files
         # setup the environment to run gamess
@@ -93,7 +95,7 @@ class Gamess(Simulation):
     #end def init_job_extra
 
 
-    def check_result(self,result_name,sim):
+    def check_result(self, result_name: str, sim: Simulation) -> bool:
         input = self.input
         if result_name=='orbitals':
             calculating_result = 'contrl' in input and 'scftyp' in input.contrl and input.contrl.scftyp.lower() in {'rhf','rohf','uhf','mcscf','none'}
@@ -104,7 +106,7 @@ class Gamess(Simulation):
     #end def check_result
 
 
-    def get_result(self,result_name,sim):
+    def get_result(self, result_name: str, sim: Simulation) -> obj | None:
         result = obj()
         input    = self.input
         analyzer = self.load_analyzer_image()
@@ -133,7 +135,12 @@ class Gamess(Simulation):
     #end def get_result
 
 
-    def incorporate_result(self,result_name,result,sim):
+    def incorporate_result(
+        self,
+        result_name : str,
+        result      : obj,
+        sim         : Simulation,
+        ) -> None:
         input = self.input
         if result_name=='orbitals':
             if result.vec is None or result.norbitals<1:
@@ -244,7 +251,7 @@ class Gamess(Simulation):
     #end def incorporate_result
 
 
-    def app_command(self):
+    def app_command(self) -> str:
         if self.app_name == 'rungms':
             return 'rungms '+self.infile
         else:
@@ -253,7 +260,7 @@ class Gamess(Simulation):
     #end def app_command
 
 
-    def check_sim_status(self):
+    def check_sim_status(self) -> None:
         with open(os.path.join(self.locdir,self.outfile), "r") as out:
             output = out.read()
         #errors = open(os.path.join(self.locdir,self.errfile),'r').read()
@@ -263,13 +270,13 @@ class Gamess(Simulation):
     #end def check_sim_status
 
 
-    def get_output_files(self):
+    def get_output_files(self) -> list:
         output_files = []
         return output_files
     #end def get_output_files
 
 
-    def output_filename(self,name):
+    def output_filename(self, name) -> str:
         name = name.upper()
         if name not in GamessInput.file_units:
             msg = f'gamess does not produce a file matching the requested description: {name}'
@@ -281,7 +288,7 @@ class Gamess(Simulation):
     #end def output_filename
 
 
-    def output_filepath(self,name):
+    def output_filepath(self, name) -> str:
         filename = self.output_filename(name)
         filepath = os.path.join(self.locdir,filename)
         filepath = os.path.abspath(filepath)
@@ -290,7 +297,7 @@ class Gamess(Simulation):
 #end class Gamess
 
 
-def generate_gamess(**kwargs):
+def generate_gamess(**kwargs) -> Gamess:
     sim_args,inp_args = Gamess.separate_inputs(kwargs,sim_kw=['mo_reorder'])
 
     if 'input' not in sim_args:
@@ -300,7 +307,6 @@ def generate_gamess(**kwargs):
 
     return gamess
 #end def generate_gamess
-
 
 
 

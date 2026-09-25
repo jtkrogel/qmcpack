@@ -16,6 +16,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 from .developer import DevBase, obj, nxs_print
@@ -24,11 +26,16 @@ from .physical_system import PhysicalSystem
 from .simulation import SimulationInput
 from .execute import execute
 
+from pathlib import Path
+
+type KwargsT = bool | int | str | PhysicalSystem | tuple[int, int, int] | None
+
+
 
 bool_values = dict(T=True,F=False)
 bool_values_inv = {True:'T',False:'F'}
 
-def read_qp_value_type(value_filepath):
+def read_qp_value_type(value_filepath) -> str:
     with open(value_filepath,'r') as f:
         svalue = f.read().strip()
 
@@ -50,7 +57,7 @@ def read_qp_value_type(value_filepath):
 #end def read_qp_value_type
 
 
-def read_qp_value(value_filepath):
+def read_qp_value(value_filepath: str) -> bool | int | float | str:
     with open(value_filepath,'r') as f:
         svalue = f.read().strip()
 
@@ -71,7 +78,7 @@ def read_qp_value(value_filepath):
 #end def read_qp_value
 
 
-def write_qp_value(value_filepath,value):
+def write_qp_value(value_filepath, value: bool | int | float | str) -> None:
     if isinstance(value,bool):
         svalue = bool_values_inv[value]
     elif isinstance(value,int):
@@ -229,7 +236,7 @@ for varname in variable_section.keys():
 
 
 # function to extract and print an updated input_specification based on a list of ezfio directories
-def extract_input_specification(*ezfio_paths):
+def extract_input_specification(*ezfio_paths) -> None:
     if len(ezfio_paths)==1 and isinstance(ezfio_paths[0],(list,tuple)):
         ezfio_paths = ezfio_paths[0]
     #end if
@@ -319,7 +326,7 @@ class QuantumPackageInput(SimulationInput):
         })
 
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath: Path | None = None) -> None:
         self.structure   = None
         self.run_control = obj()
         if filepath is not None:
@@ -328,7 +335,7 @@ class QuantumPackageInput(SimulationInput):
     #end def __init__
 
 
-    def present(self,name):
+    def present(self, name) -> bool:
         if name not in known_variables:
             msg = (
                 f'attempted to check presence of unknown variable "{name}"\n'
@@ -341,7 +348,7 @@ class QuantumPackageInput(SimulationInput):
     #end def present
 
 
-    def set(self,**kwargs):
+    def set(self, **kwargs: int) -> None:
         for name,value in kwargs.items():
             if name not in known_variables:
                 msg = (
@@ -361,7 +368,7 @@ class QuantumPackageInput(SimulationInput):
     #end def set
 
 
-    def get(self,name):
+    def get(self, name: str) -> int | None:
         if name not in known_variables:
             msg = (
                 'cannot get variable\n'
@@ -379,7 +386,7 @@ class QuantumPackageInput(SimulationInput):
     #end def get
 
 
-    def delete(self,name):
+    def delete(self, name: str) -> int | None:
         if name not in known_variables:
             msg = (
                 'cannot get variable\n'
@@ -398,7 +405,7 @@ class QuantumPackageInput(SimulationInput):
     #end def delete
 
 
-    def extract_added_keys(self):
+    def extract_added_keys(self) -> obj:
         extra = obj()
         added_keys = QuantumPackageInput.added_keys
         for k in added_keys:
@@ -408,14 +415,14 @@ class QuantumPackageInput(SimulationInput):
     #end def extract_added_keys
 
 
-    def restore_added_keys(self,extra):
+    def restore_added_keys(self, extra: obj) -> None:
         for k in QuantumPackageInput.added_keys:
             self[k] = extra[k]
             del extra[k]
     #end def restore_added_keys
 
 
-    def read(self,filepath):
+    def read(self, filepath: Path) -> None:
         epath = str(filepath).rstrip('/')
         if not os.path.exists(epath):
             msg = (
@@ -459,7 +466,7 @@ class QuantumPackageInput(SimulationInput):
     #end def read
 
 
-    def write(self,filepath=None):
+    def write(self, filepath = None) -> str:
         if filepath is None:
             return str(self)
         #end if
@@ -569,22 +576,30 @@ class QuantumPackageInput(SimulationInput):
     #end def write
 
 
-    def read_text(self,text,filepath=None):
+    def read_text(self, text: str | list[str], filepath = None):
         raise NotImplementedError
     #end def read_text
 
 
-    def write_text(self,filepath=None):
+    def write_text(self, filepath = None):
         raise NotImplementedError
     #end def write_text
 
 
-    def incorporate_system(self,system):
+    def incorporate_system(self, system: PhysicalSystem):
         raise NotImplementedError
     #end def incorporate_system
 
 
-    def check_valid(self,*,sections=True,variables=True,types=True,run_type=True,exit=True):
+    def check_valid(
+        self,
+        *,
+        sections  : bool = True,
+        variables : bool = True,
+        types     : bool = True,
+        run_type  : bool = True,
+        exit      : bool = True,
+        ) -> bool:
         msg = ''
 
         extra = self.extract_added_keys()
@@ -689,7 +704,7 @@ class QuantumPackageInput(SimulationInput):
     #end check_valid
 
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return self.check_valid(exit=False)
     #end def is_valid
 
@@ -746,7 +761,7 @@ qp_defaults = obj(
         ),
     )
 
-def generate_quantum_package_input(**kwargs):
+def generate_quantum_package_input(**kwargs: KwargsT) -> QuantumPackageInput:
 
     # make empty input
     qpi = QuantumPackageInput()

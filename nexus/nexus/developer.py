@@ -19,6 +19,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 from typing import NoReturn
 
 from .developer_tools import save,load,_pp_repr,_pp_str,dotdict,obj,DevBase  # noqa: F401
@@ -33,7 +35,7 @@ from .generic import error, nxs_print, warn, message  # noqa: F401
 import traceback
 
 
-def deprecation_error():
+def deprecation_error() -> None:
     msg = (
         'A now-deprecated member function of obj has been called.\n'
         'Please report this issue to the Nexus developers immediately.\n'
@@ -52,16 +54,16 @@ def deprecation_error():
 class DevBaseNexus(DevBase):
 
     # change from default iteration over values to keys, blow up
-    def __iter__(self): deprecation_error()
+    def __iter__(self) -> None: deprecation_error()
 
     # change from deepcopy to shallow copy, blow up
-    def copy(self): deprecation_error()
+    def copy(self) -> None: deprecation_error()
 
 
-    def nxs_print(self,*a,**kw):
+    def nxs_print(self, *a, **kw) -> None:
         nxs_print(*a,**kw)
 
-    def warn(self,msg,indent='    '):
+    def warn(self, msg: str, indent: str = '    ') -> None:
         warn(
             msg,
             indent,
@@ -69,7 +71,12 @@ class DevBaseNexus(DevBase):
             cls       = type(self).__qualname__,
             )
 
-    def error(self, msg: str, *, header: str | None = None) -> NoReturn:
+    def error(
+        self,
+        msg    : str,
+        *,
+        header = None,
+        ) -> None:
         if header is None:
             header = type(self).__name__
         error(msg, header)
@@ -78,7 +85,7 @@ class DevBaseNexus(DevBase):
 
 
 
-def to_obj(d):
+def to_obj(d) -> obj:
     o = obj()
     for k,v in d.items():
         if hasattr(v,'__dict__'):

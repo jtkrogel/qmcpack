@@ -20,17 +20,19 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import numpy as np
 from .developer import DevBase, obj
 from . import numpy_extensions as npe
 
 class QEXML(DevBase):
-    def __init__(self):
+    def __init__(self) -> None:
         self._value = []
     #end def __init__
 
     array_keys = frozenset({'size', 'type', 'columns', '_value', 'len'})
-    def finalize(self):
+    def finalize(self) -> None:
         keys = list(self.keys())
         enums = obj()
         for k in keys:
@@ -85,7 +87,7 @@ class QEXML(DevBase):
 
 
 bools = obj(F=False,T=True)
-def readval(s):
+def readval(s) -> int | float | str | list[str] | None:
     s = s.strip()
     v = None
     if s in bools:
@@ -120,7 +122,7 @@ def readval(s):
 
 
 
-def read_qexml(inp):
+def read_qexml(inp: str) -> QEXML | None:
     if isinstance(inp,list):
         rawlines = inp
     elif isinstance(inp,str):# and os.path.exists(inp):

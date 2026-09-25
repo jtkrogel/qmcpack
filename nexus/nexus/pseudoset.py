@@ -19,10 +19,18 @@ from .physical_system import PhysicalSystem
 from .utilities import is_valid_filename
 from .nexus_base import nexus_config
 
+type NormalizeCRet = (
+    dict[str, str | Path | dict[str, int] | list[str] | set[str] | tuple[str]]
+    | None
+    )
+
+
 
 def pp_elem_label(
-    filename: PathLike, *, guard=False,
-    ) -> tuple[str, str] | tuple[str, str, bool]:
+    filename : str | Path,
+    *,
+    guard    : bool = False,
+    ) -> tuple | None:
     """Get the label and atomic symbol of an element from a pseudopotential file name.
 
     Parameters
@@ -108,7 +116,7 @@ def pp_elem_label(
 #end def pp_elem_label
 
 
-def read_upf_z_valence(file: PathLike) -> int | float:
+def read_upf_z_valence(file: Path) -> int | float:
     """Read Z-valence from a UPF-compliant pseudopotential file."""
     # Bind these to the function so we only compile them once.
     if not (
@@ -193,7 +201,7 @@ def read_upf_z_valence(file: PathLike) -> int | float:
 
 
 
-def read_qmcpack_xml_z_valence(file: PathLike) -> int | float:
+def read_qmcpack_xml_z_valence(file: Path) -> int | float:
     """Read the Z-valence from a QMCPACK-compatible XML pseudopotential file."""
         # Bind these to the function so we only compile them once.
     if not hasattr(read_qmcpack_xml_z_valence, "zval_pattern"):
@@ -244,7 +252,7 @@ def read_qmcpack_xml_z_valence(file: PathLike) -> int | float:
 
 
 
-def read_potcar_z_valence(file: PathLike) -> int | float:
+def read_potcar_z_valence(file: Path) -> int | float:
     """Read the Z-valence from a POTCAR file.
 
     This function uses the format specifications from the VASP wiki, and
@@ -299,7 +307,7 @@ def read_potcar_z_valence(file: PathLike) -> int | float:
 
 
 @nxs_deprecate(since="2.4.0", replacement="generate_pseudoset")
-def ppset(label: str, **codes_pps: Collection[str]):
+def ppset(label, **codes_pps) -> None:
     """Register pseudopotentials for codes with a label.
 
     This is intended as a backwards-compatible interface to not break existing
@@ -435,12 +443,12 @@ class PseudoSet(DevBase):
 
     def __init__(
         self,
-        pseudos : Collection[PathLike] | Mapping[Elements | str, PathLike],
-        codes   : str | Collection[str] = "detect",
-        Zeff_map: Mapping[PathLike, int] | None = None,
+        pseudos,
+        codes        : str | set[str | Path] = "detect",
+        Zeff_map     : dict[str, int] | None = None,
         *,
-        skip_invalid: bool = False,
-        ):
+        skip_invalid : bool                  = False,
+        ) -> None:
         self.pseudos: dict[str, Path] = {}
         if isinstance(pseudos, Mapping):
             for label, psp in pseudos.items():
@@ -539,8 +547,8 @@ class PseudoSet(DevBase):
 
     @staticmethod
     def _detect_pseudo_code(
-        pseudos: Mapping[str, PathLike] | Collection[PathLike]
-        ) -> set[Literal["espresso", "gamess", "vasp", "qmcpack", "rmg", "pyscf"]]:
+        pseudos,
+        ) -> set[str | Path] | None:
         """Detect the code based on the suffix of the pseudos."""
         codes = set()
         suffixes = set()
@@ -577,7 +585,7 @@ class PseudoSet(DevBase):
 
 
     @staticmethod
-    def _check_code_str(code: str) -> Literal["espresso", "gamess", "vasp", "qmcpack", "rmg", "pyscf"]:
+    def _check_code_str(code) -> str | None:
         """Check to make sure a code string is in the set of known codes.
 
         Returns
@@ -605,7 +613,7 @@ class PseudoSet(DevBase):
 
 
     @staticmethod
-    def _normalize_code_map_keys(mapping: Mapping) -> dict:
+    def _normalize_code_map_keys(mapping) -> NormalizeCRet:
         """Take a dict with any code keys and normalize them.
 
         Normalizing in this case means checking the keys and making sure they
@@ -629,15 +637,15 @@ class PseudoSet(DevBase):
     @classmethod
     def from_dir(
         cls,
-        pseudo_dir: PathLike,
-        code      : str = "detect",
-        extension : str | Collection[str] | None = None,
-        include   : str | None = None,
-        exclude   : str | None = None,
-        Zeff_map  : Mapping[PathLike, int] | None = None,
+        pseudo_dir,
+        code         : str  = "detect",
+        extension           = None,
+        include             = None,
+        exclude             = None,
+        Zeff_map            = None,
         *,
-        skip_invalid: bool = False,
-        ) -> PseudoSet:
+        skip_invalid : bool = False,
+        ) -> PseudoSet | None:
         """Read in pseudopotentials from a directory.
 
         Parameters
@@ -833,15 +841,15 @@ class PseudoSet(DevBase):
     @classmethod
     def from_mixed_dir(
         cls,
-        pseudo_dir   : PathLike,
-        codes        : str | Collection[str] | None = None,
-        extensions   : Mapping[str, set[str]] | str | None = None,
-        include      : Mapping[str, str] | str | None = None,
-        exclude      : Mapping[str, str] | str | None = None,
-        code_Zeff_map: Mapping[str, Mapping[str, int]] | Mapping[str, int] | None = None,
+        pseudo_dir,
+        codes                = None,
+        extensions           = None,
+        include              = None,
+        exclude              = None,
+        code_Zeff_map        = None,
         *,
-        skip_invalid: bool = False,
-        ) -> dict[Literal["espresso", "gamess", "vasp", "qmcpack", "rmg", "pyscf"], PseudoSet]:
+        skip_invalid  : bool = False,
+        ) -> dict[str, str | PseudoSet] | None:
         """Read in pseudos from a directory with pseudos for more than one code.
 
         Parameters
@@ -1094,9 +1102,9 @@ class PseudoSet(DevBase):
 
     def _get_pseudos(
         self,
-        system: PhysicalSystem | Collection[str],
-        code: Literal["espresso", "gamess", "vasp", "qmcpack", "rmg", "pyscf"],
-        ) -> dict[str, str]:
+        system : list[str] | PhysicalSystem | None,
+        code   : str,
+        ) -> dict[str, int | float | str | Path] | None:
         """Private helper function for getting the pseudo files for a given system."""
         code = PseudoSet._check_code_str(code)
         if code not in self.codes:
@@ -1135,10 +1143,10 @@ class PseudoSet(DevBase):
 
     @staticmethod
     def get_pseudos(
-        pseudos: PseudoSet | str | Collection[str] | dict[str, Path] | None,
-        system: PhysicalSystem | Collection[str],
-        code: Literal["espresso", "gamess", "vasp", "qmcpack", "rmg", "pyscf"],
-        ) -> dict[str, str]:
+        pseudos,
+        system,
+        code,
+        ) -> dict[str, int | float | str | Path] | None:
         """Get the pseudopotential files for the elements in a physical system.
 
         Parameters
@@ -1317,10 +1325,10 @@ class PseudoSet(DevBase):
 
     def get_Zeff(
         self,
-        elem_labels: Collection[Elements | str] | PhysicalSystem,
+        elem_labels   : list[str],
         *,
-        missing_as_ae: bool = False,
-        ) -> dict[str, int]:
+        missing_as_ae : bool = False,
+        ) -> dict[str, int] | None:
         """Get the Z-valences for each element in the list of elements.
 
         Parameters
@@ -1419,15 +1427,15 @@ class PseudoSet(DevBase):
 
 
 def generate_pseudoset(
-    pseudo_dir: PathLike | None = None,
+    pseudo_dir   : str | Path | None     = None,
     *,
-    code     : str | Collection[str] | None = None,
-    extension: Mapping[str, str | Collection[str]] | None = None,
-    include  : Mapping[str, str] | str | None = None,
-    exclude  : Mapping[str, str] | str | None = None,
-    Zeff_map : Mapping[str, Mapping[str, int]] | Mapping[str, int] | None = None,
-    **codes_psps: Collection[PathLike] | PathLike,
-    ) -> dict[str, PseudoSet]:
+    code         : str | set[str] | None = None,
+    extension    : dict[str, str] | None = None,
+    include                              = None,
+    exclude                              = None,
+    Zeff_map                             = None,
+    **codes_psps : int | str | Path | list[str | Path],
+    ) -> dict[str, PseudoSet] | None:
     """Generate a dictionary of :class:`PseudoSet`.
 
     The ideal use of this function is to create a single collection of

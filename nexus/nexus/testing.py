@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+
+from pathlib import Path
+
 try:
     import numpy as np
     if np.lib.NumpyVersion(np.__version__) >= '2.0.0b1':
@@ -13,13 +18,25 @@ def_rtol = 1e-6
 
 
 # determine if two floats differ
-def float_diff(v1,v2,atol=def_atol,rtol=def_rtol):
+def float_diff(
+    v1   : int | float | np.float64 | np.int64,
+    v2   : int | float | np.float64 | np.int64,
+    atol : float = def_atol,
+    rtol : float = def_rtol,
+    ) -> bool | np.bool_:
     return np.abs(v1-v2)>atol+rtol*np.abs(v2)
 #end def float_diff
 
 
 # determine if two values differ
-def value_diff(v1,v2,atol=def_atol,rtol=def_rtol,*,int_as_float=False):
+def value_diff(
+    v1,
+    v2,
+    atol         : float = def_atol,
+    rtol         : float = def_rtol,
+    *,
+    int_as_float : bool  = False,
+    ) -> bool | np.bool_:
     diff = False
     v1_bool  = isinstance(v1,(bool,np.bool_))
     v2_bool  = isinstance(v2,(bool,np.bool_))
@@ -86,7 +103,12 @@ def value_diff(v1,v2,atol=def_atol,rtol=def_rtol,*,int_as_float=False):
 
 
 
-def dict_serialize(d,serial=None,path=None,dict_type=None):
+def dict_serialize(
+    d,
+    serial                 = None,
+    path      : str | None = None,
+    dict_type              = None,
+    ):
     # serialize a dict-like object (flat string_path-value mapping)
     if dict_type is None:
         dict_type = d.__class__
@@ -110,7 +132,16 @@ def dict_serialize(d,serial=None,path=None,dict_type=None):
 
 
 # determine if two objects differ
-def object_diff(o1,o2,atol=def_atol,rtol=def_rtol,*,int_as_float=False,full=False,bypass=False):
+def object_diff(
+    o1,
+    o2,
+    atol         : float = def_atol,
+    rtol         : float = def_rtol,
+    *,
+    int_as_float : bool  = False,
+    full         : bool  = False,
+    bypass       : bool  = False,
+    ) -> bool | tuple[bool, dict[str, np.ndarray], dict[str, np.ndarray]]:
     diff1 = dict()
     diff2 = dict()
     if not bypass:
@@ -146,7 +177,7 @@ def object_diff(o1,o2,atol=def_atol,rtol=def_rtol,*,int_as_float=False,full=Fals
 
 
 # determine if two text blocks differ
-def read_text_value(s):
+def read_text_value(s: str) -> float | str:
     v = s
     try:
         vi = int(s)
@@ -160,7 +191,7 @@ def read_text_value(s):
     return v
 #end def read_text_value
 
-def read_text_tokens(t):
+def read_text_tokens(t: str) -> list[float | str]:
     tokens = []
     for v in t.split():
         tokens.append(read_text_value(v))
@@ -168,7 +199,16 @@ def read_text_tokens(t):
     return tokens
 #end def read_text_tokens
 
-def text_diff(t1,t2,atol=def_atol,rtol=def_rtol,*,int_as_float=False,full=False,by_line=False):
+def text_diff(
+    t1           : str,
+    t2           : str,
+    atol         : float = def_atol,
+    rtol         : float = def_rtol,
+    *,
+    int_as_float : bool  = False,
+    full         : bool  = False,
+    by_line      : bool  = False,
+    ) -> bool | np.bool_ | tuple[bool | np.bool_, dict, dict]:
     t1 = t1.replace(',',' , ')
     t2 = t2.replace(',',' , ')
     tokens1 = read_text_tokens(t1)
@@ -229,7 +269,16 @@ def text_diff(t1,t2,atol=def_atol,rtol=def_rtol,*,int_as_float=False,full=False,
 
 
 # print the difference between two objects
-def print_diff(o1,o2,atol=def_atol,rtol=def_rtol,*,int_as_float=False,text=False,by_line=False): # used in debugging, not actual tests
+def print_diff(
+    o1,
+    o2,
+    atol                = def_atol,
+    rtol                = def_rtol,
+    *,
+    int_as_float : bool = False,
+    text         : bool = False,
+    by_line      : bool = False,
+    ) -> None: # used in debugging, not actual tests
     from .developer import obj
     hline = '========== {} =========='
     print(hline.format('left object'))
@@ -253,7 +302,7 @@ def print_diff(o1,o2,atol=def_atol,rtol=def_rtol,*,int_as_float=False,text=False
 
 
 # check for value equality and if different, print the difference
-def check_value_eq(v1,v2,**kwargs):
+def check_value_eq(v1: set[Path], v2: set[Path], **kwargs) -> bool:
     verbose = kwargs.pop('verbose',False)
     same = value_eq(v1,v2,**kwargs)
     if not same and (verbose or global_data['verbose']):
@@ -272,7 +321,7 @@ def check_value_eq(v1,v2,**kwargs):
 
 
 # check for object equality and if different, print the difference
-def check_object_eq(o1,o2,**kwargs):
+def check_object_eq(o1, o2, **kwargs) -> bool:
     verbose = kwargs.pop('verbose',False)
     same = object_eq(o1,o2,**kwargs)
     if not same and (verbose or global_data['verbose']):
@@ -286,24 +335,31 @@ def check_object_eq(o1,o2,**kwargs):
 
 # additional convenience functions to use value_diff and object_diff
 value_neq = value_diff
-def value_eq(v1,v2,atol=def_atol,rtol=def_rtol,*,int_as_float=False):
+def value_eq(
+    v1,
+    v2,
+    atol         : float = def_atol,
+    rtol         : float = def_rtol,
+    *,
+    int_as_float : bool  = False,
+    ) -> bool:
     return not value_neq(v1,v2,atol,rtol,int_as_float=int_as_float)
 #end def value_eq
 
 object_neq = object_diff
-def object_eq(*args,**kwargs):
+def object_eq(*args, **kwargs) -> bool:
     return not object_neq(*args,**kwargs)
 #end def object_eq
 
 text_neq = text_diff
-def text_eq(*args,**kwargs):
+def text_eq(*args: str, **kwargs: float) -> bool:
     return not text_neq(*args,**kwargs)
 #end def text_eq
 
 
 # declare test failure
 #   useful inside try/except blocks
-def failed(msg='Test failed.'):
+def failed(msg: str = 'Test failed.') -> None:
     assert False,msg
 #end def failed
 
@@ -319,14 +375,14 @@ global_data = dict(
     )
 
 
-def clear_all_sims():
+def clear_all_sims() -> None:
     from .simulation import Simulation
     Simulation.clear_all_sims()
 #end def clear_all_sims
 
 
 
-def check_final_state():
+def check_final_state() -> None:
     from .simulation import Simulation
 
     assert(Simulation.sim_count==0)
@@ -336,7 +392,7 @@ def check_final_state():
 
 
 
-def execute(command):
+def execute(command: str) -> tuple[str, str, int] | None:
     from .execute import execute as nexus_execute
     import os
     # for python exe's, restrict pythonpath to this nexus repo

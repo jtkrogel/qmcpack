@@ -21,6 +21,8 @@
 #                                                                    #
 #====================================================================#
 
+from __future__ import annotations
+
 import os
 import sys
 from copy import deepcopy
@@ -72,6 +74,9 @@ from .qmcpack import loop,linear,cslinear,vmc,dmc
 from .qmcpack import generate_jastrows,generate_jastrow,generate_jastrow1,generate_jastrow2,generate_jastrow3,generate_opt,generate_opts
 from .qmcpack import generate_cusp_correction
 
+type KwargsT = bool | int | float | str | Path | list[str]
+
+
 
 #set the machine if known, otherwise user will provide
 hostmachine = Machine.get_hostname()
@@ -82,7 +87,7 @@ if Machine.exists(hostmachine):
 
 
 # test needed
-def run_project(*args,**kwargs):
+def run_project(*args, **kwargs) -> ProjectManager:
     if nexus_config.graph_sims:
         graph_sims()
     #end if
@@ -96,7 +101,10 @@ def run_project(*args,**kwargs):
 # test needed
 # read input function
 #   place here for now as it depends on all other input functions
-def read_input(filepath,format=None):
+def read_input(
+    filepath : str,
+    format = None,
+    ) -> QmcpackInput | PwscfInput | GamessInput:
     if not os.path.exists(filepath):
         msg = f'cannot read input file\nfile does not exist: {filepath}'
         raise FileNotFoundError(msg)
@@ -125,7 +133,15 @@ def read_input(filepath,format=None):
 
 
 
-def analyze_output(code=None,input=None,outfile=None,*,analyze=True,path=None,**kw):
+def analyze_output(
+    code    : str | Pwscf | None = None,
+    input   : str | Pwscf | None = None,
+    outfile : str | Path | None  = None,
+    *,
+    analyze : bool               = True,
+    path    : Path | None        = None,
+    **kw    : bool,
+    ):
     """Construct or load an analyzer for output from a supported code.
 
     Parameters
@@ -540,7 +556,7 @@ class Settings(NexusCore):
 
 
     @staticmethod
-    def kw_set(vars,source=None):
+    def kw_set(vars, source = None) -> obj:
         kw = obj()
         if source is not None:
             for n in vars:
@@ -554,7 +570,7 @@ class Settings(NexusCore):
     #end def null_kw_set
 
 
-    def __init__(self):
+    def __init__(self) -> None:
         if Settings.singleton is None:
             Settings.singleton = self
         else:
@@ -565,7 +581,7 @@ class Settings(NexusCore):
 
 
     # sets up Nexus core class behavior and passes information to broader class structure
-    def __call__(self,**kwargs):
+    def __call__(self, **kwargs: KwargsT) -> None:
         kwargs = obj(**kwargs)
         # Ensure no pathlib.Path objects are stored
         core_path_vars = (
@@ -721,7 +737,7 @@ class Settings(NexusCore):
     #end def __call__
 
 
-    def process_command_line_settings(self, script_settings: obj):
+    def process_command_line_settings(self, script_settings: obj) -> None:
         import argparse
         from argparse import ArgumentParser
 
@@ -915,7 +931,7 @@ class Settings(NexusCore):
     #end def process_command_line_settings
 
 
-    def process_machine_settings(self,mset):
+    def process_machine_settings(self, mset: obj) -> None:
         Job.restore_default_settings()
         ProjectManager.restore_default_settings()
         mid_set = set()
@@ -1016,7 +1032,7 @@ class Settings(NexusCore):
     #end def process_machine_settings
 
 
-    def process_config_settings(self, kw: dict):
+    def process_config_settings(self, kw: obj) -> None:
         # Preserve the runtime meaning of legacy settings while warning users
         # about their replacement API.  These are deliberately translated
         # before their keys are discarded.

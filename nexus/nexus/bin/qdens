@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+from __future__ import annotations
+
 import gc
 import os
 import sys
@@ -21,7 +23,7 @@ if sys.version_info[0:3] < (3, 10, 0):
 # Locate and import the closely coupled Nexus module
 search_basepath = Path(__file__).resolve().parent.parent
 nexus_library_search_path = search_basepath.parent
-def find_nexus_modules():
+def find_nexus_modules() -> None:
     import sys
 
     # "import nexus" will succeed if nexus directory exists without __init__.py in it.
@@ -82,15 +84,15 @@ import h5py
 import numpy as np
 
 
-def h5_int(val):
+def h5_int(val) -> int:
     return int(np.array(val))
 #end def h5_int
 
-def h5_float(val):
+def h5_float(val) -> float:
     return float(np.array(val))
 #end def h5_float
 
-def h5_array(val):
+def h5_array(val) -> np.ndarray:
     return np.array(val)
 #end def h5_array
 
@@ -100,7 +102,7 @@ def first(d):
 
 
 
-def comma_list(s):
+def comma_list(s: str) -> str:
     if ',' in s:
         s = s.replace(',',' ')
     #end if
@@ -117,7 +119,7 @@ def comma_list(s):
 #end def comma_list
 
 
-def input_list(s):
+def input_list(s: str) -> list[str]:
     if ',' in s:
         s = s.replace(',',' ')
     #end if
@@ -132,7 +134,7 @@ def input_list(s):
 
 
 
-def qmcpack_filepath(basepath,tokens,g=None):
+def qmcpack_filepath(basepath, tokens, g: str | None = None) -> str:
     file = ''
     for t in tokens:
         if g is not None and t.startswith('g') and t[1:].isdigit():
@@ -145,12 +147,12 @@ def qmcpack_filepath(basepath,tokens,g=None):
 #end def qmcpack_filepath
 
 
-def _has_valid_axes(structure):
+def _has_valid_axes(structure: Structure) -> bool:
     return structure is not None and np.array(structure.axes).shape==(3,3)
 #end def _has_valid_axes
 
 
-def _has_orthorhombic_axes(structure):
+def _has_orthorhombic_axes(structure: Structure) -> bool:
     if not _has_valid_axes(structure):
         return False
     #end if
@@ -160,7 +162,12 @@ def _has_orthorhombic_axes(structure):
 #end def _has_orthorhombic_axes
 
 
-def reblock(data,eq,rb=None,filepath=None):
+def reblock(
+    data     : np.ndarray,
+    eq       : int,
+    rb                    = None,
+    filepath : str | None = None,
+    ) -> np.ndarray:
     # return equilibration adjusted data if not reblocking
     if rb is None or rb<2:
         return data[eq:,...]
@@ -198,18 +205,18 @@ class QDBase(DevBase):
     options = obj()
     parser  = None
 
-    def vlog(self,*args,**kwargs):
+    def vlog(self, *args, **kwargs) -> None:
         if self.verbose:
             DevBase.nxs_print(self,*args,**kwargs)
         #end if
     #end def vlog
 
-    def vmlog(self,*args,**kwargs):
+    def vmlog(self, *args, **kwargs) -> None:
         args = list(args)+[' (memory %3.2f MB)'%(memory.resident(children=True)/1e6)]
         self.vlog(*args,**kwargs)
     #end def vmlog
 
-    def help(self):
+    def help(self) -> None:
         self.nxs_print('\n'+self.parser.format_help().strip()+'\n')
     #end def help
 
@@ -227,18 +234,22 @@ class QDBase(DevBase):
 
 
 class SingleDensity(QDBase):
-    def __init__(self,
-                 filepath  = None,
-                 format    = None,
-                 mean      = None,
-                 error     = None,
-                 data      = None,
-                 grid      = None,
-                 structure = None,
-                 extension = None,
-                 density_cell   = None, # This is the cell region where the density was sampled. It can be different from the whole cell structure.
-                 density_corner = None, # This is the reference corner for density_cell.
-                 ):
+    def __init__(
+        self,
+        filepath                           = None,
+        format                             = None,
+        mean                               = None,
+        error                              = None,
+        data           : np.ndarray | None = None,
+        grid           : np.ndarray | None = None,
+        structure      : Structure | None  = None,
+        extension      : str | None        = None,
+        # This is the cell region where the density was sampled. It can be different
+        # from the whole cell structure.
+        density_cell   : np.ndarray | None = None,
+        # This is the reference corner for density_cell.
+        density_corner : np.ndarray | None = None,
+        ) -> None:
         # initialize class variables
         self.mean      = None
         self.error     = None
@@ -299,7 +310,14 @@ class SingleDensity(QDBase):
     #end def __init__
 
 
-    def check_type(self,name,value,stypes,types,allow_none=True):
+    def check_type(
+        self,
+        name       : str,
+        value      : str | np.ndarray | Structure | None,
+        stypes     : str,
+        types,
+        allow_none : bool = True,
+        ) -> None:
         if allow_none and value is None:
             return
         #end if
@@ -310,12 +328,12 @@ class SingleDensity(QDBase):
     #end def check_type
 
 
-    def has(self,name):
+    def has(self, name) -> bool:
         return self[name] is not None
     #end def has
 
 
-    def require(self,name,action):
+    def require(self, name, action) -> None:
         if self[name] is None:
             msg = f'cannot {action}, {name} is not present'
             raise RuntimeError(msg)
@@ -323,13 +341,13 @@ class SingleDensity(QDBase):
     #end def require
 
 
-    def analyze(self,data):
+    def analyze(self, data: np.ndarray) -> None:
         self.check_type('data',data,'list/ndarray',(list,np.ndarray),False)
         self.mean,self.error = simplestats(data,dim=0)
     #end def analyze
 
 
-    def write(self,prefix,format):
+    def write(self, prefix: str, format: str) -> None:
         self.vlog(f'      writing files for {prefix}{self.extension} (format={format})')
         if format=='xsf':
             self.write_xsf(prefix)
@@ -348,7 +366,7 @@ class SingleDensity(QDBase):
     #end def write
 
 
-    def write_dat(self,prefix):
+    def write_dat(self, prefix) -> None:
         extension   = self.extension
         density     = self.mean
         density_err = self.error
@@ -359,7 +377,7 @@ class SingleDensity(QDBase):
     #end def write_dat
 
 
-    def write_xsf(self,prefix):
+    def write_xsf(self, prefix: str) -> None:
         extension   = self.extension
         density     = self.mean
         density_err = self.error
@@ -415,7 +433,7 @@ class SingleDensity(QDBase):
     #end def write_xsf
 
 
-    def write_chgcar(self,prefix):
+    def write_chgcar(self, prefix: str) -> None:
         extension   = self.extension
         density     = self.mean
         density_err = self.error
@@ -479,7 +497,11 @@ class SingleDensity(QDBase):
 
 
 class StatFile(QDBase):
-    def __init__(self,filepath=None,series=None):
+    def __init__(
+        self,
+        filepath : str | None = None,
+        series   : int | None = None,
+        ) -> None:
         self.filepath = filepath
         self.series   = series
         if filepath is None:
@@ -497,24 +519,24 @@ class StatFile(QDBase):
         #end if
     #end def __init__
 
-    def has_density_data(self):
+    def has_density_data(self) -> bool:
         return self.density_data is not None
     #end def has_data
 
-    def has_density_results(self):
+    def has_density_results(self) -> bool:
         return self.density_results is not None
     #end def has_results
 
-    def has_data(self):
+    def has_data(self) -> bool:
         return self.spin_density_data is not None
     #end def has_data
 
-    def has_results(self):
+    def has_results(self) -> bool:
         return self.spin_density_results is not None
     #end def has_results
 
 
-    def read(self,filepath):
+    def read(self, filepath: str) -> None:
         opt = self.options
         if not os.path.exists(filepath):
             msg = (
@@ -557,7 +579,7 @@ class StatFile(QDBase):
     #end def read
 
 
-    def write(self,filepath):
+    def write(self, filepath) -> None:
         h5 = h5py.File(filepath,'w')
         if not self.use_dens:
             for name,spin_density in self.spin_density_data.items():
@@ -578,7 +600,7 @@ class StatFile(QDBase):
     #end def write
 
 
-    def accumulate(self,stat,weight=1.0):
+    def accumulate(self, stat, weight: float = 1.0) -> None:
         if 'total_weight' not in self:
             self.total_weight = 0.0
         #end if
@@ -617,7 +639,7 @@ class StatFile(QDBase):
     #end def accumulate
 
 
-    def normalize(self):
+    def normalize(self) -> None:
         if not self.use_dens:
             for spin_density in self.spin_density_data.values():
                 for spin in spin_density.values():
@@ -634,7 +656,7 @@ class StatFile(QDBase):
     #end def normalize
 
 
-    def get_density_metadata(self,name):
+    def get_density_metadata(self, name: str) -> obj | None:
         opt = self.options
         metadata = None
         if opt.input_metadata is not None:
@@ -681,7 +703,12 @@ class StatFile(QDBase):
     #end def get_density_metadata
 
 
-    def check_grid(self,name,grid,data_cells):
+    def check_grid(
+        self,
+        name       : str,
+        grid       : np.ndarray,
+        data_cells : int,
+        ) -> None:
         ncells = int(grid[0]*grid[1]*grid[2])
         if ncells!=data_cells:
             msg = (
@@ -698,7 +725,7 @@ class StatFile(QDBase):
     #end def check_grid
 
 
-    def analyze(self,equilibration=0,reblock_factor=None):
+    def analyze(self, equilibration: int = 0, reblock_factor = None) -> None:
         if not self.has_data():
             msg = 'cannot analyze results, data is not present'
             raise ValueError(msg)
@@ -809,7 +836,7 @@ class StatFile(QDBase):
 
 
 
-    def write_output_files(self,formats):
+    def write_output_files(self, formats: list[str]) -> None:
         if not self.use_dens:
             for name,spin_density in self.spin_density_results.items():
                 prefix = f'{self.file_prefix}.{name}'
@@ -832,7 +859,7 @@ class StatFile(QDBase):
     #end def write_output_files
 
 
-    def line_plot(self,dim):
+    def line_plot(self, dim) -> None:
         import matplotlib.pyplot as plt
         params = {
             'legend.fontsize'      : 14,
@@ -916,13 +943,13 @@ class StatFile(QDBase):
 
 
 class QMCDensityProcessor(QDBase):
-    def __init__(self):
+    def __init__(self) -> None:
         self.file_list = []
         self.stat_files = obj()
     #end def __init__
 
 
-    def estimator_children(self,estimators):
+    def estimator_children(self, estimators):
         """Return estimator-name/XML pairs from a pluralized container.
 
         A pluralized ``<estimators>`` element retains its ``estimators``
@@ -939,7 +966,7 @@ class QMCDensityProcessor(QDBase):
     #end def estimator_children
 
 
-    def get_input_bconds(self,qi):
+    def get_input_bconds(self, qi: QmcpackInput) -> tuple | None:
         simulation_cell = qi.get('simulationcell')
         if simulation_cell is None or 'bconds' not in simulation_cell:
             return None
@@ -952,7 +979,14 @@ class QMCDensityProcessor(QDBase):
     #end def get_input_bconds
 
 
-    def add_density_metadata(self,estimators,metadata,structure,bconds,metadata_scope):
+    def add_density_metadata(
+        self,
+        estimators,
+        metadata       : obj,
+        structure      : Structure,
+        bconds         : tuple[str, str, str],
+        metadata_scope : str,
+        ) -> None:
         for name,xml in self.estimator_children(estimators):
             if isinstance(xml,spindensity_xml):
                 if name in metadata:
@@ -1079,7 +1113,11 @@ class QMCDensityProcessor(QDBase):
     #end def add_density_metadata
 
 
-    def read_input_metadata(self,qi,structure):
+    def read_input_metadata(
+        self,
+        qi        : QmcpackInput,
+        structure : Structure,
+        ) -> obj | None:
         qi.pluralize()
         metadata = obj(static=obj(),series=obj())
         bconds = self.get_input_bconds(qi)
@@ -1120,7 +1158,7 @@ class QMCDensityProcessor(QDBase):
     #end def read_input_metadata
 
 
-    def read_command_line(self):
+    def read_command_line(self) -> None:
         usage = '''usage: %prog [options] [file(s)]'''
         parser = OptionParser(usage=usage,add_help_option=False,version='%prog {}.{}.{}'.format(*nexus_version))
         parser.add_option('-h','--help',dest='help',
@@ -1518,7 +1556,7 @@ class QMCDensityProcessor(QDBase):
     #end def read_command_line
 
 
-    def process(self):
+    def process(self) -> None:
         opt = self.options
         self.vmlog('\nprocessing stat.h5 files')
         # separate stat.h5 files into series and groups

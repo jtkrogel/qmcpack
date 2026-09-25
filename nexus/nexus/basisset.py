@@ -3,6 +3,8 @@
 ##################################################################
 
 
+from __future__ import annotations
+
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -13,10 +15,17 @@ from .developer import DevBase, obj, nxs_print, NexusError
 from .fileio import TextFile
 from .utilities import path_string, to_str
 
+type ProcessGauRet = (
+    list[str]
+    | tuple[bool | list[str] | np.ndarray | None, list[str] | Elements | None]
+    | None
+    )
+
+
 
 # container class for available basis set files
 class BasisSets(DevBase):
-    def __init__(self,*basissets):
+    def __init__(self, *basissets: list[BasisFile | Path]) -> None:
         if len(basissets)==1 and isinstance(basissets[0],list):
             basissets = basissets[0]
         #end if
@@ -49,7 +58,7 @@ class BasisSets(DevBase):
     #end def __init__
 
 
-    def addbs(self,*basissets):
+    def addbs(self, *basissets: list[BasisFile | Path]) -> None:
         if len(basissets)==1 and isinstance(basissets[0],list):
             basissets = basissets[0]
         #end if
@@ -59,7 +68,7 @@ class BasisSets(DevBase):
     #end def addbs
 
 
-    def readbs(self,*bsfiles):
+    def readbs(self, *bsfiles: list[BasisFile | Path]) -> None:
         if len(bsfiles)==1 and isinstance(bsfiles[0],list):
             bsfiles = bsfiles[0]
         #end if
@@ -83,7 +92,7 @@ class BasisSets(DevBase):
 
 
     # test needed
-    def bases_by_atom(self,*bsfiles):
+    def bases_by_atom(self, *bsfiles) -> obj:
         bss = obj()
         for bsfile in bsfiles:
             if bsfile in self:
@@ -103,7 +112,7 @@ class BasisSets(DevBase):
 
 
 class BasisFile(DevBase):
-    def __init__(self,filepath=None):
+    def __init__(self, filepath: str | Path | None = None) -> None:
         self.element       = None
         self.element_label = None
         self.filename      = None
@@ -136,7 +145,7 @@ class BasisFile(DevBase):
 class gaussBasisFile(BasisFile):
     angular_terms = 'spdfghiklmn'
 
-    def __init__(self,filepath=None):
+    def __init__(self, filepath = None) -> None:
         BasisFile.__init__(self,filepath)
         self.text = None
         if filepath is not None:
@@ -144,7 +153,7 @@ class gaussBasisFile(BasisFile):
         #end if
     #end def __init__
 
-    def cleaned_text(self):
+    def cleaned_text(self) -> str | None:
         if self.text is None:
             msg = (
                 'text requested prior to read\n'
@@ -155,7 +164,7 @@ class gaussBasisFile(BasisFile):
         return self.text
     #end def cleaned_text
 
-    def read(self,filepath=None):
+    def read(self, filepath: str | Path | None = None) -> None:
         if filepath is None:
             filepath = self.location
         #end if
@@ -168,14 +177,14 @@ class gaussBasisFile(BasisFile):
         file.close()
     #end def read
 
-    def read_file(self,file):
+    def read_file(self, file: TextFile):
         raise NotImplementedError
     #end def read_file
 #end class gaussBasisFile
 
 
 class gamessBasisFile(gaussBasisFile):
-    def read_file(self,file):
+    def read_file(self, file: TextFile) -> None:
         dstart = file.find('$DATA')
         estart = file.find('$END')
         if dstart!=-1:
@@ -215,7 +224,14 @@ class gamessBasisFile(gaussBasisFile):
 #end class gamessBasisFile
 
 
-def process_gaussian_text(text,format,*,pp=True,basis=True,preserve_spacing=False):
+def process_gaussian_text(
+    text             : str,
+    format           : str,
+    *,
+    pp               : bool = True,
+    basis            : bool = True,
+    preserve_spacing : bool = False,
+    ) -> ProcessGauRet:
     if format=='gamess' or format=='gaussian' or format=='atomscf':
         rawlines = text.splitlines()
         sections = []
@@ -308,12 +324,12 @@ class GaussianBasisSet(DevBase):
     crystal_lmap_reverse = MappingProxyType(dict(s=0,sp=1,p=2,d=3,f=4))
 
     @staticmethod
-    def process_float(s):
+    def process_float(s) -> float:
         return float(s.replace('D','e').replace('d','e'))
     #end def process_float
 
 
-    def __init__(self,filepath=None,format=None):
+    def __init__(self, filepath = None, format: str | None = None) -> None:
         self.name  = None
         self.basis = obj()
         if filepath is not None:
@@ -322,7 +338,7 @@ class GaussianBasisSet(DevBase):
     #end def __init__
 
 
-    def read(self,filepath,format=None):
+    def read(self, filepath, format: str | None = None) -> None:
         if format is None:
             msg = (
                 f'format keyword must be specified to read file {filepath}\n'
@@ -348,7 +364,7 @@ class GaussianBasisSet(DevBase):
     #end def read
 
 
-    def write(self,filepath=None,format=None):
+    def write(self, filepath = None, format: str | None = None) -> str:
         if format is None:
             msg = (
                 f'format keyword must be specified to write file {filepath}\n'
@@ -371,13 +387,13 @@ class GaussianBasisSet(DevBase):
     #end def write
 
 
-    def read_text(self,text,format=None):
+    def read_text(self, text: str, format: str | None = None) -> None:
         basis_lines = process_gaussian_text(text,format,pp=False)
         self.read_lines(basis_lines,format)
     #end def read_text
 
 
-    def read_lines(self,basis_lines,format=None):
+    def read_lines(self, basis_lines: list[str], format: str | None = None) -> None:
         basis = self.basis
         basis.clear()
         if format=='gamess':
@@ -460,7 +476,7 @@ class GaussianBasisSet(DevBase):
     #end def read_lines
 
 
-    def write_text(self,format=None,occ=None):
+    def write_text(self, format: str | None = None, occ = None) -> str:
         text = ''
         format = format.lower()
         if format=='gamess':
@@ -523,13 +539,13 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def size(self):
+    def size(self) -> int:
         return len(self.basis)
     #end def size
 
 
     # test needed
-    def lset(self):
+    def lset(self) -> set:
         lset = set()
         for bf in self.basis:
             lset.add(bf.l)
@@ -539,13 +555,13 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def lcount(self):
+    def lcount(self) -> int:
         return len(self.lset())
     #end def lcount
 
 
     # test needed
-    def lbasis(self):
+    def lbasis(self) -> obj:
         lbasis = obj()
         for n in range(len(self.basis)):
             bf = self.basis[n]
@@ -560,7 +576,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def lsort(self):
+    def lsort(self) -> None:
         lbasis = self.lbasis()
         self.basis.clear()
         for l in self.lset_full:
@@ -576,7 +592,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def uncontracted(self):
+    def uncontracted(self) -> bool:
         all_uncon = True
         for bf in self.basis:
             all_uncon &= len(bf.terms)==1
@@ -586,13 +602,13 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def contracted(self):
+    def contracted(self) -> bool:
         return not self.uncontracted()
     #end def contracted
 
 
     # test needed
-    def uncontract(self,tol=1e-3):
+    def uncontract(self, tol: float = 1e-3) -> None:
         if self.uncontracted():
             return
         #end if
@@ -625,7 +641,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def contracted_basis_size(self):
+    def contracted_basis_size(self) -> str:
         bcount = obj()
         for bf in self.basis:
             l = bf.l
@@ -645,7 +661,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def uncontracted_basis_size(self):
+    def uncontracted_basis_size(self) -> str:
         if self.uncontracted():
             return self.contracted_basis_size()
         #end if
@@ -656,7 +672,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def basis_size(self):
+    def basis_size(self) -> str:
         us = self.uncontracted_basis_size()
         cs = self.contracted_basis_size()
         return f'({us})/[{cs}]'
@@ -664,7 +680,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def prim_expons(self):
+    def prim_expons(self) -> obj:
         if self.contracted():
             msg = 'cannot find primitive gaussian expons because basis is contracted'
             raise NexusError(msg)
@@ -683,7 +699,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def prim_widths(self):
+    def prim_widths(self) -> obj:
         if self.contracted():
             msg = 'cannot find primitive gaussian widths because basis is contracted'
             raise NexusError(msg)
@@ -702,7 +718,12 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def remove_prims(self,comp=None,keep=None,**lselectors):
+    def remove_prims(
+        self,
+        comp = None,
+        keep = None,
+        **lselectors,
+        ) -> None:
         lbasis = self.lbasis()
         if comp is not None:
             gwidths = self.prim_widths()
@@ -787,7 +808,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def remove_small_prims(self,**keep):
+    def remove_small_prims(self, **keep) -> None:
         lsel = obj()
         for l,lbas in self.lbasis().items():
             if l in keep:
@@ -799,7 +820,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def remove_large_prims(self,**keep):
+    def remove_large_prims(self, **keep) -> None:
         lsel = obj()
         for l,lbas in self.lbasis().items():
             if l in keep:
@@ -811,7 +832,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def remove_small_prims_rel(self,other,**keep):
+    def remove_small_prims_rel(self, other, **keep) -> None:
         gwidths = other.prim_widths()
         lsel = obj()
         for l,gw in gwidths.items():
@@ -822,7 +843,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def remove_large_prims_rel(self,other,**keep):
+    def remove_large_prims_rel(self, other, **keep) -> None:
         gwidths = other.prim_widths()
         lsel = obj()
         for l,gw in gwidths.items():
@@ -833,7 +854,7 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def remove_channels(self,llist):
+    def remove_channels(self, llist) -> None:
         lbasis = self.lbasis()
         for l in llist:
             if l in lbasis:
@@ -854,7 +875,13 @@ class GaussianBasisSet(DevBase):
 
 
     # test needed
-    def incorporate(self,other,tol=1e-3,*,unique=False):
+    def incorporate(
+        self,
+        other,
+        tol    : float = 1e-3,
+        *,
+        unique : bool  = False,
+        ) -> None:
         uncontracted = self.uncontracted() and other.uncontracted()
         lbasis       = self.lbasis()
         lbasis_other = other.lbasis()
@@ -910,7 +937,20 @@ class GaussianBasisSet(DevBase):
     #end def incorporate
 
 
-    def plot(self,r=None,rmin=0.01,rmax=8.0,*,show=True,fig=True,sep=False,prim=False,style=None,fmt=None,nsub=None):
+    def plot(
+        self,
+        r             = None,
+        rmin  : float = 0.01,
+        rmax  : float = 8.0,
+        *,
+        show  : bool  = True,
+        fig   : bool  = True,
+        sep   : bool  = False,
+        prim  : bool  = False,
+        style         = None,
+        fmt           = None,
+        nsub          = None,
+        ) -> None:
         import matplotlib.pyplot as plt
         if r is None:
             r = np.linspace(rmin,rmax,1000)
@@ -984,12 +1024,23 @@ class GaussianBasisSet(DevBase):
     #end def plot
 
 
-    def plot_primitives(self):
+    def plot_primitives(self) -> None:
         pass
     #end def plot_primitives
 
 
-    def plot_prim_widths(self,*,show=True,fig=True,sep=False,style='o',fmt=None,nsub=None,semilog=True,label=True):
+    def plot_prim_widths(
+        self,
+        *,
+        show    : bool = True,
+        fig     : bool = True,
+        sep     : bool = False,
+        style   : str  = 'o',
+        fmt            = None,
+        nsub           = None,
+        semilog : bool = True,
+        label   : bool = True,
+        ) -> None:
         import matplotlib.pyplot as plt
         if self.contracted():
             msg = 'cannot plot primitive gaussian widths because basis is contracted'

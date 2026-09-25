@@ -15,6 +15,8 @@
 #====================================================================#
 
 
+from __future__ import annotations
+
 import os
 import numpy as np
 from .developer import obj, NexusError, FileFormatError
@@ -23,8 +25,16 @@ from .simulation import SimulationAnalyzer,Simulation
 from .gamess_input import GamessInput
 from .utilities import path_string
 
+from pathlib import Path
 
-def assign_value(host,dest,file,string):
+
+
+def assign_value(
+    host,
+    dest,
+    file,
+    string,
+    ) -> None:
     if file.seek(string)!=-1:
         host[dest] = float(file.readtokens()[-1])
     #end if
@@ -58,7 +68,15 @@ class GamessAnalyzer(SimulationAnalyzer):
 
 
 
-    def __init__(self,arg0=None,prefix=None,*,analyze=False,exit=False,**outfilenames):
+    def __init__(
+        self,
+        arg0                  = None,
+        prefix                = None,
+        *,
+        analyze        : bool = False,
+        exit           : bool = False,
+        **outfilenames,
+        ) -> None:
         self.info = obj(
             exit   = exit,
             path   = None,
@@ -106,7 +124,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def __init__
 
 
-    def analyze(self):
+    def analyze(self) -> None:
         if not self.info.initialized:
             msg = (
                 'cannot perform analysis\n'
@@ -119,7 +137,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def analyze
 
 
-    def get_output(self,filetag):
+    def get_output(self, filetag: str) -> TextFile | None:
         filename = self.info.files[filetag]
         outfile = os.path.join(self.info.path,filename)
         if os.path.exists(outfile):
@@ -144,7 +162,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def get_output
 
 
-    def analyze_log(self):
+    def analyze_log(self) -> None:
         # read the log file
         log = self.get_output('output')
 
@@ -221,7 +239,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def analyze_log
 
 
-    def read_energy_components(self,log,energy):
+    def read_energy_components(self, log: TextFile, energy: obj) -> None:
         if log is not None and log.seek('ENERGY COMPONENTS',0)!=-1:
             for n in range(18):  # noqa: B007
                 line = log.readline()
@@ -248,7 +266,13 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def read_energy_components
 
 
-    def read_orbitals(self,log,orbs,spec,header):
+    def read_orbitals(
+        self,
+        log    : TextFile,
+        orbs   : obj,
+        spec   : str,
+        header : str,
+        ) -> bool:
         success = True
         cao_tot   = self.counts.cao
         mos_tot   = self.counts.mos
@@ -362,7 +386,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def read_orbitals
 
 
-    def read_ao_populations(self,log,ao_populations):
+    def read_ao_populations(self, log: TextFile, ao_populations: obj) -> None:
         cao_tot   = self.counts.cao
         if log.seek('-- POPULATIONS IN EACH AO --',0)!=-1:
             log.readline()
@@ -456,7 +480,7 @@ class GamessAnalyzer(SimulationAnalyzer):
     #end def read_ao_populations
 
 
-    def analyze_punch(self):
+    def analyze_punch(self) -> None:
         # read the punch file
         try:
             text = self.get_output('punch')
