@@ -83,6 +83,8 @@ from nexus.unit_converter import convert
 import h5py
 import numpy as np
 
+type DensityArg = list[float] | np.ndarray | None
+
 
 def h5_int(val) -> int:
     return int(np.array(val))
@@ -236,19 +238,19 @@ class QDBase(DevBase):
 class SingleDensity(QDBase):
     def __init__(
         self,
-        filepath       : str | Path | None               = None,
-        format         : str | None                      = None,
-        mean           : list[float] | np.ndarray | None = None,
-        error          : list[float] | np.ndarray | None = None,
-        data           : np.ndarray | None               = None,
-        grid           : np.ndarray | None               = None,
-        structure      : Structure | None                = None,
-        extension      : str | None                      = None,
+        filepath       : str | Path | None = None,
+        format         : str | None        = None,
+        mean           : DensityArg        = None,
+        error          : DensityArg        = None,
+        data           : np.ndarray | None = None,
+        grid           : np.ndarray | None = None,
+        structure      : Structure | None  = None,
+        extension      : str | None        = None,
         # This is the cell region where the density was sampled. It can be different
         # from the whole cell structure.
-        density_cell   : np.ndarray | None               = None,
+        density_cell   : np.ndarray | None = None,
         # This is the reference corner for density_cell.
-        density_corner : np.ndarray | None               = None,
+        density_corner : np.ndarray | None = None,
         ) -> None:
         # initialize class variables
         self.mean      = None

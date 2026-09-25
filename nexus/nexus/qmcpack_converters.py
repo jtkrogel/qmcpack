@@ -61,6 +61,9 @@ from .hdfreader import read_hdf
 
 from pathlib import Path
 
+type Energies = list[int | float] | np.ndarray
+type AfqmcArg = bool | float | str | tuple[int, int]
+
 
 
 # read/write functions associated with pw2qmcpack only
@@ -217,7 +220,7 @@ def generate_pw2qmcpack_input(
 
 def read_eshdf_eig_data(
     filename : str | Path,
-    Ef_list  : list[int | float] | np.ndarray,
+    Ef_list  : Energies,
     ) -> obj:
     def h5int(i):
         return np.array(i,dtype=int)[0]
@@ -1451,7 +1454,7 @@ class PyscfToAfqmcInput(SimulationInput):
 
 
 def generate_pyscf_to_afqmc_input(
-    **kwargs : bool | float | str | tuple[int, int],
+    **kwargs : AfqmcArg,
     ) -> PyscfToAfqmcInput:
     return PyscfToAfqmcInput(**kwargs)
 #end def generate_pyscf_to_afqmc_input

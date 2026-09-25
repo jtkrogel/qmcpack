@@ -53,6 +53,8 @@ from .qmcpack_result_analyzers import OptimizationAnalyzer, TimestepStudyAnalyze
 from .simulation import SimulationAnalyzer,Simulation
 from .qmcpack_input import QmcpackInput
 
+type AnalyzerArg = str | Path | QmcpackAnalysisRequest | Simulation | None
+
 
 class QmcpackAnalyzerCapabilities(QAobject):
 
@@ -196,7 +198,7 @@ class QmcpackAnalyzer
 class QmcpackAnalyzer(SimulationAnalyzer,QAanalyzer):
     def __init__(
         self,
-        arg0     : str | Path | QmcpackAnalysisRequest | Simulation | None = None,
+        arg0     : AnalyzerArg = None,
         **kwargs,
         ) -> None:
 

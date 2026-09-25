@@ -63,6 +63,11 @@ type ValidateQuRet = (
     )
 type RequiredT     = str | list[str | None] | tuple[str, str] | None
 
+type QueryRet     = bool | float | np.ndarray | Structure | None
+type FileQueryRet = (
+    tuple[float | str | list[float | str] | None, int | float | str]
+    )
+
 
 
 def parse_float(text: str) -> float | None:
@@ -2125,7 +2130,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
         self,
         quantity : str,
         *args    : int | str,
-        ) -> bool | float | np.ndarray | Structure | None:
+        ) -> QueryRet:
         """Return a query value without applying public missing-data policy."""
         self._query_depth += 1
         try:
@@ -2263,7 +2268,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
 
     def _schema_file(
         self,
-        ) -> tuple[float | str | list[float | str] | None, int | float | str]:
+        ) -> FileQueryRet:
         """Resolve the modern schema file and report discovery status."""
         if self.xmlfile is not None:
             filepath = path_string(self.xmlfile)
@@ -2316,7 +2321,7 @@ class PwscfAnalyzer(SimulationAnalyzer):
 
     def _output_file(
         self,
-        ) -> tuple[float | str | list[float | str] | None, int | float | str]:
+        ) -> FileQueryRet:
         """Resolve the text-output file and report discovery status."""
         if self.outfile_name is not None:
             filepath = os.path.join(self.path,self.outfile_name)

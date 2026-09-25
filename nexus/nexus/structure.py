@@ -190,6 +190,26 @@ type KshiftT       = tuple[int | float, int | float, int | float]
 type ElemT3        = list[int | str] | np.ndarray | tuple[str, str] | None
 type PosT3         = list[list[int | float]] | np.ndarray | None
 
+type DimerArg      = list[str] | tuple[str, str] | None
+type ConstantsT    = float | tuple[float, float] | None
+type BasisT        = list[list[int | float]] | None
+type VelT          = list[list[int]] | np.ndarray | None
+type KgridT        = list[int] | tuple[int, int, int] | None
+type PointT        = np.ndarray | tuple[int, int, int] | None
+type AxesT2        = list[list[float]] | np.ndarray | None
+type SelectorT     = str | list | np.ndarray | tuple
+type ReadCifRet    = (
+    Structure
+    | tuple[np.ndarray, list[str], np.ndarray, str]
+    | None
+    )
+type ReduceTileRet = (
+    tuple[bool | float | np.ndarray, str | np.ndarray | Elements]
+    )
+type ConsistentRet = bool | tuple[bool | int | str, bool | int | str | Elements]
+type SpeciesRet    = set | tuple[bool | set[str], Elements | set[str]]
+type NeighborsRet  = obj | list | tuple[obj | list, list]
+
 
 
 IdType: TypeAlias = "Structure | npt.NDArray[np.bool_] | int | str | Elements | list[str | Elements | int | float]"
@@ -292,7 +312,7 @@ def read_cif(
     grammar   : str  = '1.1',
     cell      : str  = 'prim',
     args_only : bool = False,
-    ) -> Structure | tuple[np.ndarray, list[str], np.ndarray, str] | None:
+    ) -> ReadCifRet:
     if isinstance(filepath,str):
         cell = read_cif_cell(filepath,block=block,grammar=grammar,cell=cell)
     else:
@@ -379,7 +399,7 @@ def kmesh(
 
 def reduce_tilematrix(
     tiling : np.ndarray | tuple[int, int, int],
-    ) -> tuple[bool | float | np.ndarray, str | np.ndarray | Elements]:
+    ) -> ReduceTileRet:
     tiling = np.array(tiling)
     t = np.array(tiling,dtype=int)
     if np.abs(tiling-t).sum()>1e-6:
@@ -1012,31 +1032,31 @@ class Structure(Sobj):
     def __init__(
         self,
         *,
-        axes              : AxesT                                   = None,
-        scale             : float | np.float64                      = 1.,
-        elem              : ElemT                                   = None,
-        pos               : PosT                                    = None,
-        elem_pos          : str | None                              = None,
-        mag               : list[int | float] | None                = None,
-        vel               : list[list[int]] | np.ndarray | None     = None,
-        center            : np.ndarray | None                       = None,
-        kpoints                                                     = None,
-        kweights                                                    = None,
-        kgrid             : list[int] | tuple[int, int, int] | None = None,
-        kshift            : ShiftT                                  = None,
-        permute                                                     = None,
-        units             : str | None                              = None,
-        tiling            : TilingT                                 = None,
-        rescale           : bool                                    = True,
-        dim               : int                                     = 3,
-        operations                                                  = None,
-        background_charge : int | np.float64                        = 0,
-        frozen            : list[list[bool]] | None                 = None,
-        bconds            : BcondT                                  = None,
-        posu              : list[list[float]] | None                = None,
-        use_prim          : bool | None                             = None,
-        add_kpath         : bool                                    = False,
-        symm_kgrid        : bool                                    = False,
+        axes              : AxesT                    = None,
+        scale             : float | np.float64       = 1.,
+        elem              : ElemT                    = None,
+        pos               : PosT                     = None,
+        elem_pos          : str | None               = None,
+        mag               : list[int | float] | None = None,
+        vel               : VelT                     = None,
+        center            : np.ndarray | None        = None,
+        kpoints                                      = None,
+        kweights                                     = None,
+        kgrid             : KgridT                   = None,
+        kshift            : ShiftT                   = None,
+        permute                                      = None,
+        units             : str | None               = None,
+        tiling            : TilingT                  = None,
+        rescale           : bool                     = True,
+        dim               : int                      = 3,
+        operations                                   = None,
+        background_charge : int | np.float64         = 0,
+        frozen            : list[list[bool]] | None  = None,
+        bconds            : BcondT                   = None,
+        posu              : list[list[float]] | None = None,
+        use_prim          : bool | None              = None,
+        add_kpath         : bool                     = False,
+        symm_kgrid        : bool                     = False,
         ) -> None:
 
         if isinstance(axes,str):
@@ -1134,7 +1154,7 @@ class Structure(Sobj):
         *,
         exit    : bool  = True,
         message : bool  = False,
-        ) -> bool | tuple[bool | int | str, bool | int | str | Elements]:
+        ) -> ConsistentRet:
         msg = ''
         if self.has_axes():
             kaxes = 2*pi*inv(self.axes).T
@@ -1240,7 +1260,7 @@ class Structure(Sobj):
     #end def set_mag
 
 
-    def set_vel(self, vel: list[list[int]] | np.ndarray | None = None) -> None:
+    def set_vel(self, vel: VelT = None) -> None:
         if vel is None:
             self.vel = None
         else:
@@ -1449,7 +1469,7 @@ class Structure(Sobj):
 
     def reset_axes(
         self,
-        axes : list[list[float]] | np.ndarray | None = None,
+        axes : AxesT2 = None,
         ) -> None:
         """Reset the structure's axes, k-space axes, and center.
 
@@ -3091,7 +3111,7 @@ class Structure(Sobj):
         self,
         *,
         symbol : bool = False,
-        ) -> set | tuple[bool | set[str], Elements | set[str]]:
+        ) -> SpeciesRet:
         if not symbol:
             return set(self.elem)
         else:
@@ -3787,11 +3807,11 @@ class Structure(Sobj):
 
     def min_image_vectors(
         self,
-        points  : np.ndarray | tuple[int, int, int] | None = None,
-        points2 : np.ndarray | None                        = None,
-        axes    : np.ndarray | None                        = None,
+        points  : PointT            = None,
+        points2 : np.ndarray | None = None,
+        axes    : np.ndarray | None = None,
         *,
-        pairs   : bool                                     = True,
+        pairs   : bool              = True,
         ) -> np.ndarray:
         if points is None:
             points = self.pos
@@ -4075,7 +4095,7 @@ class Structure(Sobj):
         voronoi    : bool = False,
         distances  : bool = False,
         **spec_max,
-        ) -> obj | list | tuple[obj | list, list]:
+        ) -> NeighborsRet:
         if indices is None:
             indices = np.arange(len(self.pos))
         #end if
@@ -4250,7 +4270,7 @@ class Structure(Sobj):
     # test needed
     def recenter(
         self,
-        center : np.ndarray | tuple[int, int, int] | None = None,
+        center : PointT = None,
         ) -> None:
         """Center atoms around a new provided center of the unit cell, or if a new
         center is not provided then use the (0.5 0.5 0.5) point of the unit cell.
@@ -4990,11 +5010,11 @@ class Structure(Sobj):
 
     def add_kmesh(
         self,
-        kgrid    : list[int] | tuple[int, int, int] | None = None,
-        kshift   : ShiftT                                  = None,
-        kspacing : float | None                            = None,
+        kgrid    : KgridT       = None,
+        kshift   : ShiftT       = None,
+        kspacing : float | None = None,
         *,
-        unique   : bool                                    = False,
+        unique   : bool         = False,
         ) -> None:
         if kspacing is not None:
             kgrid = self.kgrid_from_kspacing(kspacing)
@@ -5309,8 +5329,8 @@ class Structure(Sobj):
     # test needed
     def select_twist(
         self,
-        selector : str | list | np.ndarray | tuple = 'smallest',
-        tol      : float                           = 1e-6,
+        selector : SelectorT = 'smallest',
+        tol      : float     = 1e-6,
         ) -> int | None:
         index = None
         invalid_selector = False
@@ -8121,30 +8141,30 @@ class Crystal(Structure):
     def __init__(
         self,
         *,
-        lattice       : str | None                         = None,
-        cell          : str | None                         = None,
-        centering     : str | None                         = None,
-        constants     : float | tuple[float, float] | None = None,
-        atoms         : str | tuple[str, str] | None       = None,
-        basis         : list[list[int | float]] | None     = None,
-        basis_vectors : str | None                         = None,
-        tiling                                             = None,
-        cscale                                             = None,
-        axes                                               = None,
-        units                                              = None,
-        angular_units : str                                = 'degrees',
-        kpoints                                            = None,
-        kgrid                                              = None,
-        mag                                                = None,
-        frozen                                             = None,
-        kshift        : tuple[int, int, int]               = (0,0,0),
-        permute                                            = None,
-        operations                                         = None,
-        elem                                               = None,
-        pos                                                = None,
-        use_prim                                           = None,
-        add_kpath     : bool                               = False,
-        symm_kgrid    : bool                               = False,
+        lattice       : str | None                   = None,
+        cell          : str | None                   = None,
+        centering     : str | None                   = None,
+        constants     : ConstantsT                   = None,
+        atoms         : str | tuple[str, str] | None = None,
+        basis         : BasisT                       = None,
+        basis_vectors : str | None                   = None,
+        tiling                                       = None,
+        cscale                                       = None,
+        axes                                         = None,
+        units                                        = None,
+        angular_units : str                          = 'degrees',
+        kpoints                                      = None,
+        kgrid                                        = None,
+        mag                                          = None,
+        frozen                                       = None,
+        kshift        : tuple[int, int, int]         = (0,0,0),
+        permute                                      = None,
+        operations                                   = None,
+        elem                                         = None,
+        pos                                          = None,
+        use_prim                                     = None,
+        add_kpath     : bool                         = False,
+        symm_kgrid    : bool                         = False,
         ) -> None:
 
         if lattice is None and cell is None and atoms is None and units is None:
@@ -8692,17 +8712,17 @@ def generate_atom_structure(
 
 def generate_dimer_structure(
     *,
-    dimer       : list[str] | tuple[str, str] | None = None,
-    units       : str                                = 'A',
-    separation  : float | None                       = None,
-    Lbox        : float | None                       = None,
-    skew        : int                                = 0,
-    axes                                             = None,
-    kgrid       : list[int] | tuple[int, int, int]   = (1,1,1),
-    kshift      : tuple[int, int, int]               = (0,0,0),
-    bconds      : list[str] | tuple[str, str, str]   = tuple('nnn'),
-    struct_type : type[Structure]                    = Structure,
-    axis        : str                                = 'x',
+    dimer       : DimerArg                         = None,
+    units       : str                              = 'A',
+    separation  : float | None                     = None,
+    Lbox        : float | None                     = None,
+    skew        : int                              = 0,
+    axes                                           = None,
+    kgrid       : list[int] | tuple[int, int, int] = (1,1,1),
+    kshift      : tuple[int, int, int]             = (0,0,0),
+    bconds      : list[str] | tuple[str, str, str] = tuple('nnn'),
+    struct_type : type[Structure]                  = Structure,
+    axis        : str                              = 'x',
     ) -> Structure:
     """Create a structure with a dimer in the center of a unit cell.
 
@@ -8911,42 +8931,42 @@ def generate_jellium_structure(*args, **kwargs) -> Jellium:
 
 def generate_crystal_structure(
     *,
-    lattice       : str | None                         = None,
-    cell          : str | None                         = None,
-    centering     : str | None                         = None,
-    constants     : float | tuple[float, float] | None = None,
-    atoms         : str | tuple[str, str] | None       = None,
-    basis         : list[list[int | float]] | None     = None,
-    basis_vectors : str | None                         = None,
-    tiling        : TilingT2                           = None,
-    cscale                                             = None,
-    axes          : AxesT                              = None,
-    units         : str | None                         = None,
-    angular_units : str                                = 'degrees',
-    mag           : list[int | float] | None           = None,
-    kpoints       : np.ndarray | None                  = None,
-    kweights                                           = None,
-    kgrid         : tuple[int, int, int] | None        = None,
-    kshift        : KshiftT                            = (0,0,0),
-    permute                                            = None,
-    operations                                         = None,
-    struct_type   : type[Crystal]                      = Crystal,
-    elem          : ElemT3                             = None,
-    pos           : PosT3                              = None,
-    frozen                                             = None,
-    posu          : list[list[float]] | None           = None,
-    elem_pos      : str | None                         = None,
-    folded_elem   : list[str] | None                   = None,
-    folded_pos    : list[list[float]] | None           = None,
-    folded_units                                       = None,
-    use_prim      : bool | None                        = None,
-    add_kpath     : bool                               = False,
-    symm_kgrid    : bool                               = False,
+    lattice       : str | None                   = None,
+    cell          : str | None                   = None,
+    centering     : str | None                   = None,
+    constants     : ConstantsT                   = None,
+    atoms         : str | tuple[str, str] | None = None,
+    basis         : BasisT                       = None,
+    basis_vectors : str | None                   = None,
+    tiling        : TilingT2                     = None,
+    cscale                                       = None,
+    axes          : AxesT                        = None,
+    units         : str | None                   = None,
+    angular_units : str                          = 'degrees',
+    mag           : list[int | float] | None     = None,
+    kpoints       : np.ndarray | None            = None,
+    kweights                                     = None,
+    kgrid         : tuple[int, int, int] | None  = None,
+    kshift        : KshiftT                      = (0,0,0),
+    permute                                      = None,
+    operations                                   = None,
+    struct_type   : type[Crystal]                = Crystal,
+    elem          : ElemT3                       = None,
+    pos           : PosT3                        = None,
+    frozen                                       = None,
+    posu          : list[list[float]] | None     = None,
+    elem_pos      : str | None                   = None,
+    folded_elem   : list[str] | None             = None,
+    folded_pos    : list[list[float]] | None     = None,
+    folded_units                                 = None,
+    use_prim      : bool | None                  = None,
+    add_kpath     : bool                         = False,
+    symm_kgrid    : bool                         = False,
     # legacy inputs
-    structure     : str | Structure | None             = None,
-    shape                                              = None,
-    element                                            = None,
-    scale                                              = None,
+    structure     : str | Structure | None       = None,
+    shape                                        = None,
+    element                                      = None,
+    scale                                        = None,
     ) -> Structure:
     """Generate a crystal structure.
 

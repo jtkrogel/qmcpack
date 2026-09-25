@@ -27,6 +27,9 @@ from .developer import DevBase, obj, warn, NexusError
 from .periodic_table import Elements
 from .structure import Structure, generate_structure, read_structure
 
+type FoldCheck     = bool | tuple[bool | str, str | Elements]
+type ConsistentRet = bool | tuple[bool | int | str, bool | int | str | Elements]
+
 
 class PhysicalSystem(DevBase):
 
@@ -116,7 +119,7 @@ class PhysicalSystem(DevBase):
         *,
         exit    : bool = True,
         message : bool = False,
-        ) -> bool | tuple[bool | str, str | Elements]:
+        ) -> FoldCheck:
         msg = ''
         sys_folded    = self.folded_system is not None
         struct_folded = self.structure.folded_structure is not None
@@ -151,7 +154,7 @@ class PhysicalSystem(DevBase):
         *,
         exit    : bool  = True,
         message : bool  = False,
-        ) -> bool | tuple[bool | int | str, bool | int | str | Elements]:
+        ) -> ConsistentRet:
         fs,fm = self.check_folded_system(exit=False,message=True)
         cs,cm = self.structure.check_consistent(tol,exit=False,message=True)
         msg = ''

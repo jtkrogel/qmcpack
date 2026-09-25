@@ -166,6 +166,17 @@ type DescriptorT = (
     | tuple[str, str, int]
     )
 
+type Num            = int | float | np.float64
+type OptVal         = bool | int | float | str | None
+type InputArg       = str | Path | meta | simulation | None
+type ReadRet        = int | float | str | QmcpackInput | np.ndarray
+type DiffRet        = tuple[bool | tuple, tuple | None, tuple, tuple]
+type OutputInfoRet  = (
+    list[str | obj | list[str | obj] | set[str]]
+    | set[int | str]
+    )
+type OutputInfoRet2 = list[str | obj | list[str | obj] | set[str]] | set[str]
+
 
 yesno_dict     = {True:'yes' ,False:'no'}
 truefalse_dict = {True:'true',False:'false'}
@@ -2044,7 +2055,7 @@ class Param(Names):
     def read(
         self,
         xml  : XMLelement | None,
-        ) -> int | float | str | QmcpackInput | np.ndarray:
+        ) -> ReadRet:
         val = None
         attr = set(xml._attributes.keys())
         other_attr = attr-{'name'}
@@ -3636,8 +3647,8 @@ class QmcpackInput(SimulationInput,Names):
 
     def __init__(
         self,
-        arg0 : str | Path | meta | simulation | None = None,
-        arg1 : simulation | None                     = None,
+        arg0 : InputArg          = None,
+        arg1 : simulation | None = None,
         ) -> None:
         Param.metadata = None
         filepath = None
@@ -3723,7 +3734,7 @@ class QmcpackInput(SimulationInput,Names):
         self,
         filepath : str | None        = None,
         xml      : XMLelement | None = None,
-        ) -> int | float | str | QmcpackInput | np.ndarray | None:
+        ) -> ReadRet | None:
         if xml is not None or os.path.exists(filepath):
             element_joins=['qmcsystem']
             element_aliases=dict(loop='qmc')
@@ -3942,7 +3953,7 @@ class QmcpackInput(SimulationInput,Names):
         self.move(particleset='qmcsystem',wavefunction='qmcsystem',hamiltonian='qmcsystem')
     #end def standard_placements
 
-    def difference(self, other) -> tuple[bool | tuple, tuple | None, tuple, tuple]:
+    def difference(self, other) -> DiffRet:
         s1 = deepcopy(self)
         s2 = deepcopy(other)
         b1 = s1.get_basename()
@@ -4228,7 +4239,7 @@ class QmcpackInput(SimulationInput,Names):
     def get_output_info(
         self,
         *requests : RequestsT,
-        ) -> list[str | obj | list[str | obj] | set[str]] | set[int | str]:
+        ) -> OutputInfoRet:
         project = self.simulation.project
         prefix = project.id
         series = project.series
@@ -5876,7 +5887,7 @@ class BundledQmcpackInput(SimulationInput):
     def get_output_info(
         self,
         *requests : RequestsT,
-        ) -> list[str | obj | list[str | obj] | set[str]] | set[str]:
+        ) -> OutputInfoRet2:
         outfiles = []
 
         for index,inp in self.inputs.items():
@@ -7705,7 +7716,7 @@ def generate_jastrows_alt(
 
 def generate_jastrow(
     descriptor : DescriptorT,
-    *args      : int | float | str | np.float64,
+    *args      : Num | str,
     **kwargs,
     ) -> QIxml:
     keywords = {'function','size','rcut','elements','coeff','cusp','ename',
@@ -7764,16 +7775,16 @@ def generate_jastrow(
 
 
 def generate_jastrow1(
-    function   : str                             = 'bspline',
-    size       : int                             = 8,
-    rcut       : int | float | np.float64 | None = None,
-    coeff                                        = None,
-    cusp       : float                           = 0.,
-    ename      : str                             = 'e',
-    iname      : str                             = 'ion0',
-    elements                                     = None,
-    system                                       = None,
-    opt                                          = None,
+    function   : str        = 'bspline',
+    size       : int        = 8,
+    rcut       : Num | None = None,
+    coeff                   = None,
+    cusp       : float      = 0.,
+    ename      : str        = 'e',
+    iname      : str        = 'ion0',
+    elements                = None,
+    system                  = None,
+    opt                     = None,
     **elemargs,
     ) -> jastrow1:
     noelements = elements is None
@@ -7880,15 +7891,15 @@ def generate_jastrow1(
 
 
 def generate_bspline_jastrow2(
-    size    : int                             = 8,
-    rcut    : int | float | np.float64 | None = None,
-    coeff                                     = None,
-    spins   : tuple[str, str]                 = ('u','d'),
-    density                                   = None,
-    system                                    = None,
-    init    : str                             = 'rpa',
-    opt                                       = None,
-        ) -> jastrow2:
+    size    : int             = 8,
+    rcut    : Num | None      = None,
+    coeff                     = None,
+    spins   : tuple[str, str] = ('u','d'),
+    density                   = None,
+    system                    = None,
+    init    : str             = 'rpa',
+    opt                       = None,
+    ) -> jastrow2:
     if coeff is None and system is None and (init=='rpa' and density is None or rcut is None):
         msg = 'rcut and density or system must be specified'
         raise ValueError(msg)
@@ -8016,7 +8027,7 @@ def generate_pade_jastrow2(
 
 def generate_jastrow2(
     function : str = 'bspline',
-    *args    : int | float | str | QIobj | np.float64,
+    *args    : Num | str | QIobj,
     **kwargs,
     ) -> jastrow2 | None:
     if 'spins' not in kwargs:
@@ -8918,7 +8929,7 @@ del dmc_noJ_batched_defaults
 
 def generate_opt_calculations(
     driver   : str,
-    **kwargs : bool | int | float | str | None,
+    **kwargs : OptVal,
     ) -> list[loop]:
     if driver=='legacy':
         calcs = generate_legacy_opt_calculations(**kwargs)
@@ -8956,7 +8967,7 @@ def generate_vmc_calculations(
 
 def generate_dmc_calculations(
     driver   : str,
-    **kwargs : bool | int | float | str | None,
+    **kwargs : OptVal,
     ) -> list[QIxml]:
     if driver=='legacy':
         calcs = generate_legacy_dmc_calculations(**kwargs)
@@ -8983,7 +8994,7 @@ def generate_legacy_opt_calculations(
     init_cycles     : int,
     init_samples,
     init_minwalkers : float,
-    **opt_inputs    : bool | int | float | str | None,
+    **opt_inputs    : OptVal,
     ) -> list[loop]:
 
     methods = obj(linear=linear,cslinear=cslinear)
@@ -9247,7 +9258,7 @@ def generate_batched_opt_calculations(
     init_minwalkers  : float,
     init_line_search : bool,
     init_sr_tau      : float,
-    **opt_inputs     : bool | int | float | str | None,
+    **opt_inputs     : OptVal,
     ) -> list[loop]:
 
     opt_inputs = obj(opt_inputs)

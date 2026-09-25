@@ -38,6 +38,27 @@ type IntervalDiRet = (
     | None
     )
 
+type RealVec       = list[float | complex] | np.ndarray
+type FloatVec      = list[float] | np.ndarray
+type SmoothArg     = bool | int | float | np.int64 | None
+type PairRealRet   = tuple[float | np.ndarray, float | np.ndarray] | None
+type RollingRet    = (
+    list[tuple[int, int]]
+    | np.float64
+    | np.ndarray
+    | tuple
+    | None
+    )
+type LcdRet        = np.ndarray | tuple[np.ndarray, np.ndarray] | None
+type PairExpandRet = tuple[np.ndarray, np.ndarray | None] | None
+type TrimRet       = (
+    tuple[np.ndarray, np.float64 | np.ndarray, int | np.ndarray]
+    | None
+    )
+type TrimData      = (
+    tuple[np.ndarray, np.float64 | np.ndarray, int | np.ndarray]
+    )
+
 
 ############################################################################
 #                                                                          #
@@ -83,7 +104,7 @@ type IntervalDiRet = (
 def _paired_real_arrays(
     x : float | np.ndarray,
     y : float | np.ndarray,
-    ) -> tuple[float | np.ndarray, float | np.ndarray] | None:
+    ) -> PairRealRet:
     """Validate and flatten paired real-valued sample arrays."""
     x = np.asarray(x)
     y = np.asarray(y)
@@ -114,9 +135,9 @@ def _paired_real_arrays(
 
 
 def _real_vector(
-    x    : list[float | complex] | np.ndarray,
+    x    : RealVec,
     name : str,
-    ) -> list[float | complex] | np.ndarray | None:
+    ) -> RealVec | None:
     """Return a real vector, flattening vector-shaped arrays."""
     x = np.asarray(x)
     if np.iscomplexobj(x):
@@ -139,7 +160,7 @@ def _real_vector(
 def theil_sen(
     x : float | np.ndarray,
     y : float | np.ndarray,
-    ) -> tuple[np.float64 | np.ndarray, np.float64 | np.ndarray] | None:
+    ) -> TheilSenStRet | None:
     """Return the Theil--Sen slope and intercept for paired observations.
 
     Parameters
@@ -837,7 +858,7 @@ def series_stats(
 
 def time_series_intervals(
     x : list[float] | np.ndarray,
-    t : list[float | complex] | np.ndarray | None = None,
+    t : RealVec | None = None,
     ) -> TimeSeriesRet:
     """Return ordered intervals between adjacent time-series values.
 
@@ -958,7 +979,7 @@ def interval_distribution(
     x2            : np.ndarray | None  = None,
     *,
     perturb_const : bool | int | float = 1,
-    ) -> tuple[int | float | np.ndarray, bool | int | np.ndarray] | None:
+    ) -> IntDistInpRet:
     """Return spans between interval edges and their overlap counts.
 
     Parameters
@@ -1199,7 +1220,7 @@ def rolling_interval_dist_peak(
     quad_weighting : str   = 'endpoint',
     ret_height     : bool  = False,
     ret_windows    : bool  = False,
-    ) -> list[tuple[int, int]] | np.float64 | np.ndarray | tuple | None:
+    ) -> RollingRet:
     """Return interval-distribution peaks for overlapping input windows.
 
     Parameters
@@ -1479,7 +1500,7 @@ def lcd_smooth(
     method         : str               = 'interval_rand',
     peak_frac      : float             = 0.5,
     quad_weighting : str               = 'endpoint',
-    ) -> np.ndarray | tuple[np.ndarray, np.ndarray] | None:
+    ) -> LcdRet:
     """Return rolling line-crossing-distribution peaks for a time series.
 
     Parameters
@@ -1519,9 +1540,9 @@ def lcd_smooth(
 
 def pair_expand_ts_intervals(
     x      : np.ndarray,
-    t      : list[float] | np.ndarray | None = None,
-    expand : bool | int                      = 10,
-    ) -> tuple[np.ndarray, np.ndarray | None] | None:
+    t      : FloatVec | None = None,
+    expand : bool | int      = 10,
+    ) -> PairExpandRet:
     """Return sorted pairs between samples in a bounded local neighborhood.
 
     Each sample is paired with up to ``expand/2`` earlier and later samples.
@@ -1639,7 +1660,7 @@ def _find_segments(
 def _lcd_trim_input(
     x     : np.ndarray,
     niter : bool | int | float,
-    ) -> tuple[np.ndarray, np.float64 | np.ndarray, int | np.ndarray] | None:
+    ) -> TrimRet:
     """Validate trimming inputs and obtain its LCD peak and perturbed series."""
     x = _real_vector(x,'data array')
     if len(x)<2:
@@ -2011,9 +2032,9 @@ def lcd_trim_lrm(
 
 def _smoothing_window_length(
     n       : int,
-    m       : bool | int | float | np.int64 | None,
+    m       : SmoothArg,
     maximum : int | None = None,
-    ) -> bool | int | float | np.int64 | None:
+    ) -> SmoothArg:
     """Validate or select an odd smoothing-window length."""
     if m is None:
         if n==0:
@@ -2044,7 +2065,7 @@ def _smoothing_window_length(
 
 def mean_smooth(
     x : np.ndarray,
-    m : bool | int | float | np.int64 | None = None,
+    m : SmoothArg = None,
     ) -> np.ndarray | None:
     """Smooth a sequence with tapered-endpoint moving averages.
 
@@ -2094,9 +2115,9 @@ def mean_smooth(
 
 def median_smooth(
     x         : np.ndarray,
-    m         : bool | int | float | np.int64 | None = None,
+    m         : SmoothArg             = None,
     *,
-    post_mean : bool | int | np.bool_                = False,
+    post_mean : bool | int | np.bool_ = False,
     ) -> np.ndarray | None:
     """Smooth a sequence with local medians, optionally followed by means.
 
@@ -2154,9 +2175,9 @@ def median_smooth(
 
 def poly_smooth(
     x         : np.ndarray,
-    m         : bool | int | float | np.int64 | None = None,
+    m         : SmoothArg  = None,
     *,
-    post_mean : bool | str                           = False,
+    post_mean : bool | str = False,
     ) -> np.ndarray | None:
     """Smooth a sequence by evaluating local polynomial fits.
 
@@ -2226,10 +2247,10 @@ poly_smooth_ = poly_smooth
 
 def local_median_smooth(
     x_list      : list[np.ndarray],
-    m           : bool | int | float | np.int64 | None = None,
+    m           : SmoothArg             = None,
     *,
-    poly_smooth : bool | int | np.bool_                = True,
-    post_mean   : bool | np.bool_                      = False,
+    poly_smooth : bool | int | np.bool_ = True,
+    post_mean   : bool | np.bool_       = False,
     ) -> np.ndarray | None:
     """Smooth a sequence of sample sets through leave-one-out local medians.
 
@@ -2351,11 +2372,11 @@ class TimeSeriesAnalyzer(DevBase):
     """
     def __init__(
         self,
-        arg0      : str | list[float] | np.ndarray | None = None,
-        clean_inp : str | obj                             = 'lcd_trim_l',
-        label     : str                                   = '',
+        arg0      : str | FloatVec | None = None,
+        clean_inp : str | obj             = 'lcd_trim_l',
+        label     : str                   = '',
         *,
-        analyze   : bool                                  = True,
+        analyze   : bool                  = True,
         ) -> None:
         if not isinstance(analyze,(bool,np.bool_)):
             msg = 'analyze must be a Boolean value'
@@ -2501,7 +2522,7 @@ class TimeSeriesAnalyzer(DevBase):
     def clean_intersect(
         self,
         other : TimeSeriesAnalyzer,
-        ) -> tuple[np.ndarray, np.float64 | np.ndarray, int | np.ndarray]:
+        ) -> TrimData:
         """Return values retained by both same-length analyzers.
 
         Parameters

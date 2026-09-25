@@ -99,6 +99,9 @@ type KwargsT    = (
     | tuple[int, int, int]
     )
 
+type NmlLines  = list[float | str | obj | list[float]]
+type CardLines = list[float | str | list[list[float]]]
+
 
 """Union of the namelist definition enums."""
 NamelistType: TypeAlias = (
@@ -368,7 +371,7 @@ class Element(PwscfInputBase):
         self.update(**variables)
     #end def add
 
-    def read(self, lines: list[float | str | obj | list[float]]):
+    def read(self, lines: NmlLines):
         raise NotImplementedError
     #end def read
 
@@ -395,7 +398,7 @@ class Section(Element):
     #end def assign
 
 
-    def read(self, lines: list[float | str | obj | list[float]]) -> None:
+    def read(self, lines: NmlLines) -> None:
         for l in lines:
             # exclude comments
             cloc = l.find('!')
@@ -607,7 +610,7 @@ class Card(Element):
         #end if
     #end def get_specifier
 
-    def read(self, lines: list[float | str | obj | list[float]]) -> None:
+    def read(self, lines: NmlLines) -> None:
         self.get_specifier(lines[0])
         self.read_text(lines[1:])
     #end def read
@@ -618,7 +621,7 @@ class Card(Element):
         return c
     #end def write
 
-    def read_text(self, lines: list[float | str | list[list[float]]]):
+    def read_text(self, lines: CardLines):
         raise NotImplementedError
     #end def read_text
 
@@ -859,7 +862,7 @@ def check_section_classes(
 class atomic_species(Card):
     name = 'atomic_species'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         atoms = []
         masses   = obj()
         pseudopotentials = obj()
@@ -887,7 +890,7 @@ class atomic_species(Card):
 class atomic_positions(Card):
     name = 'atomic_positions'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         npos = len(lines)
         dim = 3
         atoms = []
@@ -985,7 +988,7 @@ class atomic_positions(Card):
 class atomic_forces(Card):
     name = 'atomic_forces'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         npos = len(lines)
         dim = 3
         atoms = []
@@ -1017,7 +1020,7 @@ class atomic_forces(Card):
 class k_points(Card):
     name = 'k_points'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         if self.specifier in {'tpiba','crystal','tpiba_b','crystal_b',''}:
             self.nkpoints = int(lines[0])
             a = array_from_lines(lines[1:])
@@ -1121,7 +1124,7 @@ class k_points(Card):
 class cell_parameters(Card):
     name = 'cell_parameters'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         self.vectors = array_from_lines(lines)
     #end def read_text
 
@@ -1177,7 +1180,7 @@ class cell_parameters(Card):
 class climbing_images(Card):
     name = 'climbing_images'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         self.images = array_from_lines(lines)
     #end def read_text
 
@@ -1196,7 +1199,7 @@ class climbing_images(Card):
 class constraints(Card):
     name = 'constraints'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         tokens = lines[0].split()
         self.ncontraints = int(tokens[0])
         if len(tokens)>1:
@@ -1230,7 +1233,7 @@ class constraints(Card):
 class collective_vars(Card):
     name = 'collective_vars'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         tokens = lines[0].split()
         self.ncontraints = int(tokens[0])
         if len(tokens)>1:
@@ -1264,7 +1267,7 @@ class collective_vars(Card):
 class occupations(Card):
     name = 'occupations'
 
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         self.occupations = array_from_lines(lines)
     #end def read_text
 
@@ -1279,7 +1282,7 @@ class hubbard(Card):
     available_specifiers = ('atomic', 'ortho-atomic', 'norm-atomic', 'wf', 'pseudo')
     default_specifier = 'atomic'
     system = None
-    def read_text(self, lines: list[float | str | list[list[float]]]) -> None:
+    def read_text(self, lines: CardLines) -> None:
         contents = ''
         self.hubbard = {}
         for line in lines:

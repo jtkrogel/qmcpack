@@ -27,6 +27,8 @@ from .utilities import path_string
 
 from pathlib import Path
 
+type AnalyzerArg = str | Path | Simulation | None
+
 
 
 def assign_value(
@@ -70,11 +72,11 @@ class GamessAnalyzer(SimulationAnalyzer):
 
     def __init__(
         self,
-        arg0           : str | Path | Simulation | None = None,
-        prefix         : str | None                     = None,
+        arg0           : AnalyzerArg = None,
+        prefix         : str | None  = None,
         *,
-        analyze        : bool                           = False,
-        exit           : bool                           = False,
+        analyze        : bool        = False,
+        exit           : bool        = False,
         **outfilenames,
         ) -> None:
         self.info = obj(

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+type Num         = int | float | np.float64 | np.int64
+type TextDiffRet = bool | np.bool_ | tuple[bool | np.bool_, dict, dict]
+
 try:
     import numpy as np
     if np.lib.NumpyVersion(np.__version__) >= '2.0.0b1':
@@ -19,8 +22,8 @@ def_rtol = 1e-6
 
 # determine if two floats differ
 def float_diff(
-    v1   : int | float | np.float64 | np.int64,
-    v2   : int | float | np.float64 | np.int64,
+    v1   : Num,
+    v2   : Num,
     atol : float = def_atol,
     rtol : float = def_rtol,
     ) -> bool | np.bool_:
@@ -208,7 +211,7 @@ def text_diff(
     int_as_float : bool  = False,
     full         : bool  = False,
     by_line      : bool  = False,
-    ) -> bool | np.bool_ | tuple[bool | np.bool_, dict, dict]:
+    ) -> TextDiffRet:
     t1 = t1.replace(',',' , ')
     t2 = t2.replace(',',' , ')
     tokens1 = read_text_tokens(t1)

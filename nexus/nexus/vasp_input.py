@@ -36,6 +36,11 @@ type AssignIntArg  = bool | int | float | str | np.int32 | np.int64
 type AssignIntArg2 = list[bool | int | float | str | list[int] | np.int32]
 type ValT          = obj | dict[str, bool | int | float | str] | list
 
+type NpScalar      = np.bool_ | np.float64 | np.int64
+type RealArray     = float | list[float | str] | np.ndarray
+type ReadVal       = bool | int | float | str | np.ndarray
+type PreprocessRet = tuple[str | set[str], obj | set[str]] | None
+
 
 # support functions for keyword files
 
@@ -145,8 +150,8 @@ def write_string(v: str) -> str:
 
 
 def equality(
-    a : np.bool_ | np.float64 | np.int64,
-    b : np.bool_ | np.float64 | np.int64,
+    a : NpScalar,
+    b : NpScalar,
     ) -> bool | np.bool_:
     return a==b
 #end def equality
@@ -290,7 +295,7 @@ def assign_int_array(a: AssignIntArg2) -> np.ndarray | None:
 
 
 def assign_real_array(
-    a : float | list[float | str] | np.ndarray,
+    a : RealArray,
     ) -> np.ndarray | None:
     if isinstance(a,(tuple,list,np.ndarray)):
         return np.array(a,dtype=float)
@@ -418,7 +423,7 @@ def read_mixed(
     sval  : str,
     *,
     types : tuple[str, str],
-    ) -> bool | int | float | str | np.ndarray | None:
+    ) -> ReadVal | None:
     scalar_types = {'ints','reals','bools'}
     array_types = {'int_arrays','real_arrays','bool_arrays'}
     try:
@@ -554,7 +559,7 @@ class VFile(Vobj):
     def preprocess_multiline_strings(
         self,
         text : str,
-        ) -> tuple[str | set[str], obj | set[str]] | None:
+        ) -> PreprocessRet:
         mvals = obj()
         if '"' in text:
             text_in = text

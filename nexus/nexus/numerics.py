@@ -109,6 +109,8 @@ type CheckJackkRet = (
     tuple[bool, bool, list[np.ndarray | None] | None, dict | None, int | None]
     )
 
+type JackArgs = list[np.ndarray | None] | None
+
 
 
 # cost functions
@@ -731,10 +733,10 @@ def eos_fit(
 def jackknife(
     data     : np.ndarray,
     function,
-    args     : list[np.ndarray | None] | None = None,
-    kwargs                                    = None,
-    position : int | None                     = None,
-    capture  : obj | None                     = None,
+    args     : JackArgs   = None,
+    kwargs                = None,
+    position : int | None = None,
+    capture  : obj | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
     capture_results = capture is not None
     if capture_results:
@@ -904,7 +906,7 @@ def jackknife_aux(
 
 
 def check_jackknife_inputs(
-    args     : list[np.ndarray | None] | None,
+    args     : JackArgs,
     kwargs,
     position : int | None,
     ) -> CheckJackkRet:

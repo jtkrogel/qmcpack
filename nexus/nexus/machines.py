@@ -62,6 +62,8 @@ from .utilities import path_string
 import importlib.util
 import importlib.machinery
 
+type SplitNodesRet = tuple[str | Job | obj, str | Job | obj]
+
 
 def our_load_source(modname: str, filename: str) -> ModuleType:
     """" Replacement for the deprecated imp.load_source function"""
@@ -954,7 +956,7 @@ class Job(NexusCore):
     #end def serial_clone
 
 
-    def split_nodes(self, n: int) -> tuple[str | Job | obj, str | Job | obj]:
+    def split_nodes(self, n: int) -> SplitNodesRet:
         run_options = self.run_options
         if not isinstance(n,int):
             msg = (

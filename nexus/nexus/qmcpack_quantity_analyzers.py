@@ -86,6 +86,9 @@ from .numerics import ndgrid, simstats, simplestats, equilibration_length
 from .qmcpack_analyzer_base import QAobject, QAanalyzer, QAdata, QAHDFdata
 from . import numpy_extensions as npe
 
+type VecArg      = list[float] | tuple[float, ...] | np.ndarray | None
+type ScalarCheck = tuple[bool | None, bool | None]
+
 
 def first(o: dict):
     return o[min(o.keys())]
@@ -1241,7 +1244,7 @@ class TracesAnalyzer(QAanalyzer):
         scalars     : dict | None = None,
         scalars_hdf : dict | None = None,
         tol         : float       = 1e-8,
-        ) -> tuple[bool | None, bool | None]:
+        ) -> ScalarCheck:
         scalars_valid     = True
         scalars_hdf_valid = True
         if scalars is None:
@@ -1346,7 +1349,7 @@ class TracesAnalyzer(QAanalyzer):
         scalars     : dict | None = None,
         scalars_hdf : dict | None = None,
         tol         : float       = 1e-8,
-        ) -> tuple[bool | None, bool | None]:
+        ) -> ScalarCheck:
         blocks = None
         steps_per_block = None
         steps = None
@@ -3472,9 +3475,9 @@ class RectilinearGrid(SpaceGridBase):
 
     def plot_axes(
         self,
-        color  : tuple[float, float, float] | None                   = None,
-        radius : float                                               = .025,
-        origin : list[float] | tuple[float, ...] | np.ndarray | None = None,
+        color  : tuple[float, float, float] | None = None,
+        radius : float                             = .025,
+        origin : VecArg                            = None,
         ) -> None:
         if color is None:
             color = (0.,0,0)
@@ -3494,9 +3497,9 @@ class RectilinearGrid(SpaceGridBase):
 
     def plot_box(
         self,
-        color  : tuple[float, float, float] | None                   = None,
-        radius : float                                               = .025,
-        origin : list[float] | tuple[float, ...] | np.ndarray | None = None,
+        color  : tuple[float, float, float] | None = None,
+        radius : float                             = .025,
+        origin : VecArg                            = None,
         ) -> None:
         if color is None:
             color = (0.,0,0)

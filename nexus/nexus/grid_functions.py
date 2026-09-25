@@ -128,6 +128,12 @@ type OriginT       = (
     | tuple[int]
     )
 
+type EndpointArg = list[bool] | np.ndarray | None
+type AxesArg     = list[int | list[int]] | np.ndarray
+type GridFuncArg = bool | ParallelotopeGrid | np.ndarray
+type GridPoints  = list[np.ndarray | tuple[int]] | np.ndarray
+type FlatShape   = tuple[int | np.int64, int | np.int64]
+
 
 
 
@@ -327,8 +333,8 @@ def cartesian_to_spherical(
 
 def unit_grid_points(
     shape    : ShapeT,
-    centered : bool                           = False,
-    endpoint : list[bool] | np.ndarray | None = None,
+    centered : bool        = False,
+    endpoint : EndpointArg = None,
     ) -> np.ndarray:
     """
     Generation of uniform grids in N dimensions.
@@ -382,10 +388,10 @@ def parallelotope_grid_points(
     cells        : CellsT                           = None,
     dr           : np.ndarray | tuple[float] | None = None,
     centered     : bool                             = False,
-    endpoint     : list[bool] | np.ndarray | None   = None,
+    endpoint     : EndpointArg                      = None,
     return_shape : bool                             = False,
     return_axes  : bool                             = False,
-    ) -> list[np.ndarray | tuple[int]] | np.ndarray:
+    ) -> GridPoints:
     """
     Generation of uniform grids within parallelotope volumes.
 
@@ -558,7 +564,7 @@ def spheroid_grid_points(
 
 
 def spheroid_surface_grid_points(
-    axes         : list[int | list[int]] | np.ndarray,
+    axes         : AxesArg,
     shape                            = None,
     cells        : CellsT3           = None,
     centered     : bool              = False,
@@ -1418,7 +1424,7 @@ class StructuredGrid(Grid):
     #end def npoints
 
     @property
-    def flat_points_shape(self) -> tuple[int | np.int64, int | np.int64]:
+    def flat_points_shape(self) -> FlatShape:
         space_dim = self.r.shape[-1]
         npoints = np.prod(self.shape)
         return (npoints,space_dim)
@@ -2069,7 +2075,7 @@ class StructuredGridWithAxes(StructuredGrid):
     #end def initialize_local
 
 
-    def set_axes(self, axes: list[int | list[int]] | np.ndarray) -> None:
+    def set_axes(self, axes: AxesArg) -> None:
         """
         (`Internal API`) Sets the `axes` attribute in a protected way.
         """
@@ -2335,13 +2341,13 @@ class ParallelotopeGrid(StructuredGridWithAxes):
 
     def initialize_local(
         self,
-        axes     : list[int | list[int]] | np.ndarray | None = None,
-        shape    : tuple[int] | None                         = None,
-        cells    : CellsT                                    = None,
-        dr       : tuple[float] | None                       = None,
-        corner                                               = None,
-        center                                               = None,
-        centered : bool                                      = False,
+        axes     : AxesArg | None      = None,
+        shape    : tuple[int] | None   = None,
+        cells    : CellsT              = None,
+        dr       : tuple[float] | None = None,
+        corner                         = None,
+        center                         = None,
+        centered : bool                = False,
         **kwargs,
         ) -> None:
         """
@@ -2683,7 +2689,7 @@ class SpheroidGrid(StructuredGridWithAxes):
     #end def initialize_local
 
 
-    def set_axes(self, axes: list[int | list[int]] | np.ndarray) -> None:
+    def set_axes(self, axes: AxesArg) -> None:
         """
         (`Internal API`) Sets the `axes` attribute in a protected way.
         """
@@ -3054,7 +3060,7 @@ class SpheroidSurfaceGrid(StructuredGridWithAxes):
     #end def initialize_local
 
 
-    def set_axes(self, axes: list[int | list[int]] | np.ndarray) -> None:
+    def set_axes(self, axes: AxesArg) -> None:
         """
         (`Internal API`) Sets the `axes` attribute in a protected way.
         """
@@ -3580,7 +3586,7 @@ class StructuredGridFunction(GridFunction):
     #end def ncells
 
     @property
-    def flat_points_shape(self) -> tuple[int | np.int64, int | np.int64]:
+    def flat_points_shape(self) -> FlatShape:
         return self.grid.flat_points_shape
     #end def flat_points_shape
 
@@ -4480,7 +4486,7 @@ class SpheroidSurfaceGridFunction(StructuredGridFunctionWithAxes):
 # test needed
 def parallelotope_grid_function(
     loc      : str = 'parallelotope_grid_function',
-    **kwargs : bool | ParallelotopeGrid | np.ndarray,
+    **kwargs : GridFuncArg,
     ) -> ParallelotopeGridFunction:
     if 'points' not in kwargs:
         gf = ParallelotopeGridFunction(**kwargs)
@@ -4505,7 +4511,7 @@ def parallelotope_grid_function(
 def grid_function(
     type     : str = 'parallelotope',
     loc      : str = 'grid_function',
-    **kwargs : bool | ParallelotopeGrid | np.ndarray,
+    **kwargs : GridFuncArg,
     ) -> ParallelotopeGridFunction:
     filepath = kwargs.pop('filepath',None)
     if filepath is not None:

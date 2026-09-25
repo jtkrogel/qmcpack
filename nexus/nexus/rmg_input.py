@@ -12,7 +12,8 @@ from . import numpy_extensions as npe
 
 from pathlib import Path
 
-type ValT = bool | int | float | str | obj | np.ndarray
+type ValT     = bool | int | float | str | obj | np.ndarray
+type ValidRet = bool | tuple[bool | RmgInput, str | RmgInput]
 
 
 class RmgInputSettings(DevBase):
@@ -3163,7 +3164,7 @@ class RmgKeyword(DevBase):
     #end def __init__
 
 
-    def read(self, value: str) -> bool | int | float | str | obj | np.ndarray:
+    def read(self, value: str) -> ValT:
         return read_functions[self.key_type](value)
     #end def read
 
@@ -3196,7 +3197,7 @@ class RmgKeyword(DevBase):
         value   : ValT,
         *,
         message : bool = False,
-        ) -> bool | tuple[bool | RmgInput, str | RmgInput]:
+        ) -> ValidRet:
         msg   = ''
         if not isinstance(value,self.value_type):
             msg += f'Keyword "{self.key_name}" has the wrong type.\n  Type expected: {self.key_type}\n  Type provided: {value.__class__.__name__}\n'
@@ -3336,7 +3337,7 @@ class PseudopotentialKeyword(FormattedTableRmgKeyword):
     def read(
         self,
         value : str,
-        ) -> bool | int | float | str | obj | np.ndarray | None:
+        ) -> ValT | None:
         d = np.array(value.split(),dtype=str)
         npe.reshape_inplace(d, (len(d)//2, 2))
         species = d[:,0].flatten()
@@ -3369,7 +3370,7 @@ class KpointsKeyword(FormattedTableRmgKeyword):
     def read(
         self,
         value : str,
-        ) -> bool | int | float | str | obj | np.ndarray | None:
+        ) -> ValT | None:
         d = np.array(value.split(),dtype=float)
         npe.reshape_inplace(d, (len(d)//4, 4))
         kpoints = d[:,:3]
@@ -3403,7 +3404,7 @@ class KpointsBandstructureKeyword(FormattedTableRmgKeyword):
     def read(
         self,
         value : str,
-        ) -> bool | int | float | str | obj | np.ndarray | None:
+        ) -> ValT | None:
         d = np.array(value.split(),dtype=str)
         npe.reshape_inplace(d, (len(d)//5, 5))
         kpoints = np.array(d[:,:3],dtype=float)

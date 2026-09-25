@@ -113,6 +113,8 @@ from .developer import DevBase, obj, FileFormatError, NexusError
 
 from pathlib import Path
 
+type AnalyzerArg = str | Path | Simulation | None
+
 
 
 booldict = {'.true.':True,'.false.':False}
@@ -971,12 +973,12 @@ class HpInput(NamelistInput):
 class HpAnalyzer(SimulationAnalyzer):
     def __init__(
         self,
-        arg0    : str | Path | Simulation | None = None,
-        outfile : str | Path | None              = None,
+        arg0    : AnalyzerArg       = None,
+        outfile : str | Path | None = None,
         *,
-        analyze : bool                           = False,
-        warn    : bool                           = False,
-        strict  : bool                           = False,
+        analyze : bool              = False,
+        warn    : bool              = False,
+        strict  : bool              = False,
         ) -> None:
         self.info = obj(
             outfile     = outfile,

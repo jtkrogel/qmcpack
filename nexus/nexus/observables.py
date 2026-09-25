@@ -26,6 +26,8 @@ from . import numpy_extensions as npe
 # Referenced in MomentumDistribution.backfold()
 from .debug import ci
 
+type VecArg = list[float] | tuple[float, ...] | np.ndarray | None
+
 
 
 def get_path(o, path: str, value = None):
@@ -888,17 +890,17 @@ class MomentumDistribution(ObservableWithComponents):
 
     def plot_plane_contours(
         self,
-        quantity     : str | None                                          = None,
-        origin                                                             = None,
-        a1           : list[float] | tuple[float, ...] | np.ndarray | None = None,
-        a2           : list[float] | tuple[float, ...] | np.ndarray | None = None,
-        a1_range     : tuple[int, int]                                     = (0,1),
-        a2_range     : tuple[int, int]                                     = (0,1),
-        grid_spacing : float                                               = 0.3,
+        quantity     : str | None      = None,
+        origin                         = None,
+        a1           : VecArg          = None,
+        a2           : VecArg          = None,
+        a1_range     : tuple[int, int] = (0,1),
+        a2_range     : tuple[int, int] = (0,1),
+        grid_spacing : float           = 0.3,
         *,
-        unit_in      : bool                                                = False,
-        unit_out     : bool                                                = False,
-        boundary     : bool                                                = True,
+        unit_in      : bool            = False,
+        unit_out     : bool            = False,
+        boundary     : bool            = True,
         ) -> None:
         c  = self.component(quantity)
         o  = np.asarray(origin)

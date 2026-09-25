@@ -25,6 +25,13 @@ from .utilities import path_string
 
 from pathlib import Path
 
+type CellEvents    = list[int | float | str | tuple[int, np.ndarray]]
+type IonRecords    = tuple[str | list[obj | np.float64] | np.ndarray, str | obj]
+type QuantitiesArg = tuple[str | None] | tuple[str, str]
+type OutputFileRet = (
+    tuple[float | str | list[str] | np.float64 | np.ndarray | None, str]
+    )
+
 
 
 def as_float(text: str) -> float | None:
@@ -1997,7 +2004,7 @@ class RmgOutData(DevBase):
         self,
         lines             : list[str],
         initial_structure = None,
-        ) -> list[int | float | str | tuple[int, np.ndarray]]:
+        ) -> CellEvents:
         """Return line-indexed lattice cells reported in an RMG output."""
         events        = []
         pending       = {}
@@ -2087,7 +2094,7 @@ class RmgOutData(DevBase):
         self,
         lines             : list[str],
         initial_structure = None,
-        ) -> tuple[str | list[obj | np.float64] | np.ndarray, str | obj]:
+        ) -> IonRecords:
         """Return ionic records and structures without binding analyzer data."""
         records     = []
         structures  = obj()
@@ -2361,8 +2368,8 @@ class RmgAnalyzer(SimulationAnalyzer):
 
     def _validate_quantities(
         self,
-        quantities : tuple[str | None] | tuple[str, str],
-        ) -> tuple[str | None] | tuple[str, str] | None:
+        quantities : QuantitiesArg,
+        ) -> QuantitiesArg | None:
         """Validate quantity names atomically and return them as a tuple."""
         names = tuple(quantities)
         unknown = [
@@ -2892,7 +2899,7 @@ class RmgAnalyzer(SimulationAnalyzer):
 
     def _output_file(
         self,
-        ) -> tuple[float | str | list[str] | np.float64 | np.ndarray | None, str]:
+        ) -> OutputFileRet:
         """Resolve the RMG log-output file."""
         if self.path is None:
             return None,'missing'

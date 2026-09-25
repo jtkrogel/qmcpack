@@ -35,12 +35,14 @@ from .utilities import path_string, valid_variable_name
 
 from pathlib import Path
 
+type ValT = bool | int | float | str | np.ndarray
+
 
 
 def parse_string(
     s     : str,
     delim : str | None = None,
-    ) -> bool | int | float | str | np.ndarray:
+    ) -> ValT:
     if not isinstance(s, str):
         msg = f"This function only parses strings, but was passed {type(s).__name__}!"
         raise TypeError(msg)

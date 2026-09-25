@@ -87,6 +87,8 @@ from .utilities import path_string
 
 type KwargsT = str | NexusCore | list[str | tuple[GenericSimulation, str]]
 
+type FilesRet = tuple[str | None, str | None, str | None]
+
 
 
 class SimulationInput(NexusCore):
@@ -1058,7 +1060,7 @@ class Simulation(NexusCore):
     #end def save_analyzer_image
 
 
-    def attempt_files(self) -> tuple[str | None, str | None, str | None]:
+    def attempt_files(self) -> FilesRet:
         return (self.infile,self.outfile,self.errfile)
     #end def attempt_files
 

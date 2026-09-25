@@ -24,6 +24,11 @@ from .utilities import path_string
 
 from pathlib import Path
 
+type RangeRet    = tuple[np.ndarray | None, np.ndarray | None]
+type EvalL2Ret   = int | tuple[tuple, int | None] | None
+type EvalCompRet = int | tuple[int | tuple, int | None] | None
+type ChannelRet  = np.ndarray | tuple[np.ndarray | None, np.ndarray | None]
+
 
 
 class Pseudopotential(DevBase):
@@ -547,7 +552,7 @@ class SemilocalPP(Pseudopotential):
         self,
         r    : np.ndarray | None,
         rmin : int | float,
-        ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        ) -> RangeRet:
         if r is None and self.numeric and not self.interpolatable:
             r = self.r
         #end if
@@ -671,7 +676,7 @@ class SemilocalPP(Pseudopotential):
         rmin : int               = 0,
         *,
         rret : bool              = False,
-        ) -> int | tuple[tuple, int | None] | None:
+        ) -> EvalL2Ret:
         l = 'L2'
         if not self.has_component(l):
             msg = (
@@ -696,7 +701,7 @@ class SemilocalPP(Pseudopotential):
         *,
         rret     : bool              = False,
         optional : bool              = False,
-        ) -> int | tuple[int | tuple, int | None] | None:
+        ) -> EvalCompRet:
         vcomp = self.get_component(l)
         if vcomp is not None:
             return self.evaluate_comp(r,l,vcomp,rpow,rmin,rret)
@@ -728,7 +733,7 @@ class SemilocalPP(Pseudopotential):
         rret       : bool              = False,
         with_local : bool              = True,
         with_L2    : bool              = True,
-        ) -> np.ndarray | tuple[np.ndarray | None, np.ndarray | None]:
+        ) -> ChannelRet:
         if l not in self.l_channels:
             msg = (
                 'evaluate_channel must be called with a valid angular momentum label\n'

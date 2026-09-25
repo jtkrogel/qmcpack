@@ -40,6 +40,8 @@ from .vasp_input import Incar
 
 from pathlib import Path
 
+type ValT = bool | int | float | str | np.ndarray
+
 
 # vasp xml reader classes/functions
 
@@ -326,7 +328,7 @@ class VXMLcoll(VXML):
 
 booldict = dict(T=True,F=False)
 
-def readval(val: str) -> bool | int | float | str | np.ndarray:
+def readval(val: str) -> ValT:
     fail = False
     split = False
     if isinstance(val,str):

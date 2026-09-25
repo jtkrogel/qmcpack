@@ -34,6 +34,10 @@ from .unit_converter import convert
 from . import numpy_extensions as npe
 from .utilities import path_string, to_str
 
+type GridArg  = list[int] | tuple[int, ...] | np.ndarray | None
+type VecArg   = list[float] | tuple[float, ...] | np.ndarray
+type TokenRet = int | float | str | list[int | float | str]
+
 class TextFile(DevBase):
     # interface to mmap files
     # see Python 2 documentation for mmap
@@ -86,7 +90,7 @@ class TextFile(DevBase):
         self,
         s        : str | None = None,
         *formats : type[int | float | str],
-        ) -> int | float | str | list[int | float | str]:
+        ) -> TokenRet:
         if s is not None:
             self.seek(s)
         #end if
@@ -900,12 +904,12 @@ class XsfFile(StandardFile):
         self,
         cell      : np.ndarray,
         density   : np.ndarray,
-        name      : str                                             = 'density',
-        corner    : np.ndarray | None                               = None,
-        grid      : list[int] | tuple[int, ...] | np.ndarray | None = None,
+        name      : str               = 'density',
+        corner    : np.ndarray | None = None,
+        grid      : GridArg           = None,
         *,
-        centered  : bool | int                                      = False,
-        add_ghost : bool | int                                      = False,
+        centered  : bool | int        = False,
+        add_ghost : bool | int        = False,
         ) -> None:
         if corner is None:
             corner = np.zeros((3,),dtype=float)
@@ -1053,9 +1057,9 @@ class XsfFile(StandardFile):
     # test needed
     def interpolate_plane(
         self,
-        r1         : list[float] | tuple[float, ...] | np.ndarray,
-        r2         : list[float] | tuple[float, ...] | np.ndarray,
-        r3         : list[float] | tuple[float, ...] | np.ndarray,
+        r1         : VecArg,
+        r2         : VecArg,
+        r3         : VecArg,
         density    : obj | None = None,
         meshsize   : int        = 50,
         fill_value : int        = 0,

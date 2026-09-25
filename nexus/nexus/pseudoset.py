@@ -24,6 +24,9 @@ type NormalizeCRet = (
     | None
     )
 
+type PspArg     = int | str | Path | list[str | Path]
+type PseudosRet = dict[str, int | float | str | Path] | None
+
 
 
 def pp_elem_label(
@@ -1104,7 +1107,7 @@ class PseudoSet(DevBase):
         self,
         system : list[str] | PhysicalSystem | None,
         code   : str,
-        ) -> dict[str, int | float | str | Path] | None:
+        ) -> PseudosRet:
         """Private helper function for getting the pseudo files for a given system."""
         code = PseudoSet._check_code_str(code)
         if code not in self.codes:
@@ -1146,7 +1149,7 @@ class PseudoSet(DevBase):
         pseudos,
         system,
         code,
-        ) -> dict[str, int | float | str | Path] | None:
+        ) -> PseudosRet:
         """Get the pseudopotential files for the elements in a physical system.
 
         Parameters
@@ -1434,7 +1437,7 @@ def generate_pseudoset(
     include                              = None,
     exclude                              = None,
     Zeff_map                             = None,
-    **codes_psps : int | str | Path | list[str | Path],
+    **codes_psps : PspArg,
     ) -> dict[str, PseudoSet] | None:
     """Generate a dictionary of :class:`PseudoSet`.
 
