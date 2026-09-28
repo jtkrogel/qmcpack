@@ -29,6 +29,21 @@ namespace qmcplusplus
 using MCPWalker = Walker<QMCTraits, PtclOnLatticeTraits>;
 using RealType  = double;
 
+TEST_CASE("SFNBranch active timestep", "[drivers]")
+{
+  SFNBranch branch(0.04, 1.0, DMCRefEnergyScheme::LIMITED_HISTORY);
+  CHECK(branch.getTau() == Approx(0.04));
+  branch.setTau(0.01);
+  CHECK(branch.getTau() == Approx(0.01));
+  CHECK(branch.getTauEff() == Approx(0.01));
+
+  branch.setMTSTimestepCount(2);
+  branch.setTau(0.02, 1);
+  CHECK(branch.getTau() == Approx(0.02));
+  CHECK(branch.getTauEff() == Approx(0.02));
+  CHECK_THROWS(branch.setTau(0.02, 2));
+}
+
 namespace testing
 {
 class SetupSFNBranch

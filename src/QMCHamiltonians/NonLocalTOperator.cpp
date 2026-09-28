@@ -85,6 +85,13 @@ NonLocalTOperator::NonLocalTOperator(const TmoveKind non_local_move_option,
   minusFactor = -tau_ * (1.0 - alpha_ * (1.0 + gamma_));
 }
 
+void NonLocalTOperator::setTau(RealType tau)
+{
+  tau_        = tau;
+  plusFactor  = tau_ * gamma_;
+  minusFactor = -tau_ * (1.0 - alpha_ * (1.0 + gamma_));
+}
+
 const NonLocalData* NonLocalTOperator::selectMove(RealType prob, const std::vector<NonLocalData>& txy)
 {
   // Although prob is required to be [0, 1), the received value can still be 1 when there is precision conversion.

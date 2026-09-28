@@ -82,6 +82,16 @@ public:
                   const RefVector<QMCHamiltonian>& hams,
                   RandomBase<FullPrecRealType>& rng);
 
+  /** Accumulate the main and additional scalar estimators over all walkers. */
+  void accumulateScalarEstimators(const RefVector<MCPWalker>& walkers);
+
+  /** Accumulate the potentially expensive operator estimators over all walkers. */
+  void accumulateOperatorEstimators(const RefVector<MCPWalker>& walkers,
+                                    const RefVector<ParticleSet>& psets,
+                                    const RefVector<TrialWaveFunction>& wfns,
+                                    const RefVector<QMCHamiltonian>& hams,
+                                    RandomBase<FullPrecRealType>& rng);
+
   ScalarEstimatorBase& get_main_estimator() { return *main_estimator_; }
   RefVector<ScalarEstimatorBase> get_scalar_estimators() { return convertUPtrToRefVector(scalar_estimators_); }
   RefVector<qmcplusplus::OperatorEstBase> get_operator_estimators() { return convertUPtrToRefVector(operator_ests_); }

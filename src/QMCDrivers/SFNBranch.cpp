@@ -132,8 +132,18 @@ void SFNBranch::updateParamAfterPopControl(const MCDataType<FullPrecRealType>& w
 
   R2Accepted(wc_ensemble_prop.R2Accepted);
   R2Proposed(wc_ensemble_prop.R2Proposed);
+  if (!mts_R2Accepted_.empty())
+  {
+    mts_R2Accepted_[active_time_step_index_](wc_ensemble_prop.R2Accepted);
+    mts_R2Proposed_[active_time_step_index_](wc_ensemble_prop.R2Proposed);
+  }
   if (BranchMode[B_USETAUEFF])
-    vParam[SBVP::TAUEFF] = vParam[SBVP::TAU] * R2Accepted.result() / R2Proposed.result();
+  {
+    const RealType acceptance_ratio = mts_R2Accepted_.empty()
+        ? R2Accepted.result() / R2Proposed.result()
+        : mts_R2Accepted_[active_time_step_index_].result() / mts_R2Proposed_[active_time_step_index_].result();
+    vParam[SBVP::TAUEFF] = vParam[SBVP::TAU] * acceptance_ratio;
+  }
 
   if (BranchMode[B_DMCSTAGE]) // main stage after warmup
   {
@@ -219,6 +229,43 @@ void SFNBranch::updateParamAfterPopControl(const MCDataType<FullPrecRealType>& w
   }
 }
 
+void SFNBranch::setMTSTimestepCount(size_t count)
+{
+  mts_R2Accepted_.clear();
+  mts_R2Proposed_.clear();
+  active_time_step_index_ = 0;
+
+  if (count < 2)
+    return;
+
+  mts_R2Accepted_.resize(count);
+  mts_R2Proposed_.resize(count);
+  for (size_t index = 0; index < count; ++index)
+  {
+    mts_R2Accepted_[index](1.0e-10);
+    mts_R2Proposed_[index](1.0e-10);
+  }
+}
+
+void SFNBranch::setTau(RealType tau, size_t time_step_index)
+{
+  if (!(tau > 0.0) || !std::isfinite(tau))
+    throw UniformCommunicateError("SFNBranch::setTau requires a finite positive timestep.");
+  if (!mts_R2Accepted_.empty() && time_step_index >= mts_R2Accepted_.size())
+    throw UniformCommunicateError("SFNBranch::setTau received an invalid multi-timestep schedule index.");
+
+  active_time_step_index_ = time_step_index;
+  vParam[SBVP::TAU]       = tau;
+  const RealType acceptance_ratio = mts_R2Accepted_.empty()
+      ? R2Accepted.result() / R2Proposed.result()
+      : mts_R2Accepted_[active_time_step_index_].result() / mts_R2Proposed_[active_time_step_index_].result();
+  vParam[SBVP::TAUEFF] = BranchMode[B_USETAUEFF] ? tau * acceptance_ratio : static_cast<FullPrecRealType>(tau);
+
+  if (branch_cutoff_initialized_)
+    setBranchCutoff(branch_cutoff_variance_, branch_cutoff_target_sigma_, branch_cutoff_max_sigma_,
+                    branch_cutoff_nelec_);
+}
+
 void SFNBranch::printStatus() const
 {
   std::ostringstream o;
@@ -280,6 +327,12 @@ void SFNBranch::setBranchCutoff(FullPrecRealType variance,
                                 FullPrecRealType maxSigma,
                                 int Nelec)
 {
+  branch_cutoff_initialized_  = true;
+  branch_cutoff_variance_     = variance;
+  branch_cutoff_target_sigma_ = targetSigma;
+  branch_cutoff_max_sigma_    = maxSigma;
+  branch_cutoff_nelec_        = Nelec;
+
   if (branching_cutoff_scheme == "DRV")
   {
     // eq.(3), J. Chem. Phys. 89, 3629 (1988).

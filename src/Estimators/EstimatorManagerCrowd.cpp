@@ -28,6 +28,12 @@ void EstimatorManagerCrowd::accumulate(const RefVector<MCPWalker>& walkers,
                                        const RefVector<QMCHamiltonian>& hams,
                                        RandomBase<FullPrecRealType>& rng)
 {
+  accumulateScalarEstimators(walkers);
+  accumulateOperatorEstimators(walkers, psets, wfns, hams, rng);
+}
+
+void EstimatorManagerCrowd::accumulateScalarEstimators(const RefVector<MCPWalker>& walkers)
+{
   block_num_samples_ += walkers.size();
   for (MCPWalker& awalker : walkers)
     block_weight_ += awalker.Weight;
@@ -35,6 +41,14 @@ void EstimatorManagerCrowd::accumulate(const RefVector<MCPWalker>& walkers,
   int num_scalar_estimators = scalar_estimators_.size();
   for (int i = 0; i < num_scalar_estimators; ++i)
     scalar_estimators_[i]->accumulate(walkers);
+}
+
+void EstimatorManagerCrowd::accumulateOperatorEstimators(const RefVector<MCPWalker>& walkers,
+                                                         const RefVector<ParticleSet>& psets,
+                                                         const RefVector<TrialWaveFunction>& wfns,
+                                                         const RefVector<QMCHamiltonian>& hams,
+                                                         RandomBase<FullPrecRealType>& rng)
+{
   for (int i = 0; i < operator_ests_.size(); ++i)
     operator_ests_[i]->accumulate(walkers, psets, wfns, hams, rng);
 }

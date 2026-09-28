@@ -12,6 +12,10 @@
 #include <functional>
 #include <cassert>
 #include <cmath>
+#include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <numeric>
 
 #include "DMCBatched.h"
 #include "QMCDrivers/GreenFunctionModifiers/DriftModifierBase.h"
@@ -75,7 +79,8 @@ void DMCBatched::advanceWalkers(const StateForThread& sft,
                                 DMCTimers& dmc_timers,
                                 DMCContextForSteps& step_context,
                                 bool recompute,
-                                bool accumulate_this_step)
+                                bool accumulate_scalars,
+                                bool accumulate_operators)
 {
   const PSdispatcher ps_dispatcher(!sft.serializing_crowd_walkers);
   const TWFdispatcher twf_dispatcher(!sft.serializing_crowd_walkers);
@@ -142,7 +147,7 @@ void DMCBatched::advanceWalkers(const StateForThread& sft,
     ScopedTimer pbyp_local_timer(timers.movepbyp_timer);
     for (int ig = 0; ig < pset_leader.groups(); ++ig)
     {
-      TauParams<RealType, CT> taus(sft.qmcdrv_input.get_tau(), 1.0 / pset_leader.get_mass_by_group()[ig],
+      TauParams<RealType, CT> taus(sft.tau, 1.0 / pset_leader.get_mass_by_group()[ig],
                                    sft.qmcdrv_input.get_spin_mass());
 
       twf_dispatcher.flex_prepareGroup(walker_twfs, walker_elecs, ig);
@@ -280,17 +285,21 @@ void DMCBatched::advanceWalkers(const StateForThread& sft,
 
     // evaluate non-physical hamiltonian elements
     for (int iw = 0; iw < walkers.size(); ++iw)
-      walker_hamiltonians[iw].auxHevaluate(walker_twfs[iw], walker_elecs[iw], walkers[iw]);
+      walker_hamiltonians[iw].auxHevaluate(walker_twfs[iw], walker_elecs[iw], walkers[iw], true,
+                                           sft.qmcdrv_input.get_time_steps().size() == 1 || accumulate_operators);
 
     // save properties into walker
     for (int iw = 0; iw < walkers.size(); ++iw)
       walker_hamiltonians[iw].saveProperty(walkers[iw].get().getPropertyBase());
   }
 
-  if (accumulate_this_step)
+  if (accumulate_scalars || accumulate_operators)
   {
     ScopedTimer est_timer(timers.estimators_timer);
-    crowd.accumulate(step_context.get_random_gen());
+    if (accumulate_scalars)
+      crowd.accumulateScalarEstimators();
+    if (accumulate_operators)
+      crowd.accumulateOperatorEstimators(step_context.get_random_gen());
   }
 
   // collect walker logs
@@ -336,7 +345,8 @@ template void DMCBatched::advanceWalkers<CoordsType::POS>(const StateForThread& 
                                                           DMCTimers& dmc_timers,
                                                           DMCContextForSteps& step_context,
                                                           bool recompute,
-                                                          bool accumulate_this_step);
+                                                          bool accumulate_scalars,
+                                                          bool accumulate_operators);
 
 template void DMCBatched::advanceWalkers<CoordsType::POS_SPIN>(const StateForThread& sft,
                                                                Crowd& crowd,
@@ -344,7 +354,8 @@ template void DMCBatched::advanceWalkers<CoordsType::POS_SPIN>(const StateForThr
                                                                DMCTimers& dmc_timers,
                                                                DMCContextForSteps& step_context,
                                                                bool recompute,
-                                                               bool accumulate_this_step);
+                                                               bool accumulate_scalars,
+                                                               bool accumulate_operators);
 
 void DMCBatched::runDMCStep(int crowd_id,
                             const StateForThread& sft,
@@ -362,16 +373,22 @@ void DMCBatched::runDMCStep(int crowd_id,
   crowd.setRNGForHamiltonian(rng);
 
   const IndexType step = sft.step;
+  const bool using_mts = sft.qmcdrv_input.get_time_steps().size() > 1;
   // Are we entering the the last step of a block to recompute at?
-  const bool recompute_this_step  = (sft.is_recomputing_block && (step + 1) == sft.steps_per_block);
-  const bool accumulate_this_step = (step % sft.qmcdrv_input.get_estimator_measurement_period() == 0);
-  const bool spin_move            = sft.population.get_golden_electrons().isSpinor();
+  const bool recompute_this_step = (sft.is_recomputing_block && (step + 1) == sft.steps_per_block);
+  const bool accumulate_scalars =
+      using_mts || (step % sft.qmcdrv_input.get_estimator_measurement_period() == 0);
+  const bool accumulate_operators =
+      using_mts ? sft.time_step_index + 1 == sft.qmcdrv_input.get_time_steps().size() : accumulate_scalars;
+  const bool spin_move = sft.population.get_golden_electrons().isSpinor();
+
+  context_for_steps[crowd_id]->non_local_ops.setTau(sft.tau);
   if (spin_move)
     advanceWalkers<CoordsType::POS_SPIN>(sft, crowd, timers, dmc_timers, *context_for_steps[crowd_id],
-                                         recompute_this_step, accumulate_this_step);
+                                         recompute_this_step, accumulate_scalars, accumulate_operators);
   else
     advanceWalkers<CoordsType::POS>(sft, crowd, timers, dmc_timers, *context_for_steps[crowd_id], recompute_this_step,
-                                    accumulate_this_step);
+                                    accumulate_scalars, accumulate_operators);
 }
 
 void DMCBatched::process(xmlNodePtr node)
@@ -381,14 +398,39 @@ void DMCBatched::process(xmlNodePtr node)
 
   try
   {
+    const auto& time_steps = qmcdriver_input_.get_time_steps();
+    for (const RealType tau : time_steps)
+      if (!(tau > 0.0) || !std::isfinite(tau))
+        throw UniformCommunicateError("DMCBatched: every timestep must be finite and positive.");
+
+    const bool using_mts = time_steps.size() > 1;
+    if (using_mts && qmcdriver_input_.has_steps_input())
+      throw UniformCommunicateError("DMCBatched: steps is not allowed when multiple timesteps are specified; use "
+                                    "mts_cycles instead.");
+    if (using_mts && qmcdriver_input_.get_mts_cycles() <= 0)
+      throw UniformCommunicateError("DMCBatched: mts_cycles must be positive when multiple timesteps are specified.");
+    if (!using_mts && qmcdriver_input_.get_mts_cycles() != 0)
+      throw UniformCommunicateError("DMCBatched: mts_cycles requires multiple timesteps.");
+    if (using_mts &&
+        static_cast<size_t>(qmcdriver_input_.get_mts_cycles()) >
+            static_cast<size_t>(std::numeric_limits<IndexType>::max()) / time_steps.size())
+      throw UniformCommunicateError("DMCBatched: mts_cycles and the timestep count overflow the block step count.");
+
     QMCDriverNew::AdjustedWalkerCounts awc =
         adjustGlobalWalkerCount(*myComm, walker_configs_ref_.getActiveWalkers(), qmcdriver_input_.get_total_walkers(),
                                 qmcdriver_input_.get_walkers_per_rank(), dmcdriver_input_.get_reserve(),
                                 determineNumCrowds(qmcdriver_input_.get_num_crowds(), rngs_.size()));
 
-    steps_per_block_ =
-        determineStepsPerBlock(awc.global_walkers, qmcdriver_input_.get_requested_samples(),
-                               qmcdriver_input_.get_requested_steps(), qmcdriver_input_.get_max_blocks());
+    if (using_mts)
+    {
+      steps_per_block_ = static_cast<size_t>(qmcdriver_input_.get_mts_cycles()) * time_steps.size();
+      determineStepsPerBlock(awc.global_walkers, qmcdriver_input_.get_requested_samples(), steps_per_block_,
+                             qmcdriver_input_.get_max_blocks());
+    }
+    else
+      steps_per_block_ =
+          determineStepsPerBlock(awc.global_walkers, qmcdriver_input_.get_requested_samples(),
+                                 qmcdriver_input_.get_requested_steps(), qmcdriver_input_.get_max_blocks());
 
     initPopulationAndCrowds(awc);
     createStepContexts(crowds_.size());
@@ -409,13 +451,17 @@ void DMCBatched::process(xmlNodePtr node)
     app_log() << "    Reference energy is updated using the "
               << (refE_update_scheme == DMCRefEnergyScheme::UNLIMITED_HISTORY ? "unlimited_history" : "limited_history")
               << " scheme" << std::endl;
-    branch_engine_ =
-        std::make_unique<SFNBranch>(qmcdriver_input_.get_tau(), dmcdriver_input_.get_feedback(), refE_update_scheme);
+    const auto& time_steps = qmcdriver_input_.get_time_steps();
+    const RealType history_tau =
+        std::accumulate(time_steps.begin(), time_steps.end(), RealType{0}) / time_steps.size();
+    branch_engine_ = std::make_unique<SFNBranch>(history_tau, dmcdriver_input_.get_feedback(), refE_update_scheme);
     branch_engine_->put(node);
+    branch_engine_->setMTSTimestepCount(time_steps.size());
 
     walker_controller_ = std::make_unique<WalkerControl>(myComm, Random, dmcdriver_input_.get_reconfiguration());
     walker_controller_->start();
     walker_controller_->put(node);
+    startMTSOutput();
 
     std::ostringstream o;
     if (dmcdriver_input_.get_reconfiguration())
@@ -424,6 +470,18 @@ void DMCBatched::process(xmlNodePtr node)
       o << "  Fluctuating population\n";
 
     o << "  Steps per block = " << steps_per_block_ << "\n";
+    if (qmcdriver_input_.get_time_steps().size() > 1)
+    {
+      o << "  MTS cycles per block = " << qmcdriver_input_.get_mts_cycles() << "\n";
+      o << "  MTS timestep sequence =";
+      for (const RealType tau : qmcdriver_input_.get_time_steps())
+        o << ' ' << tau;
+      o << "\n";
+      if (qmcdriver_input_.get_estimator_measurement_period() != 1)
+        app_warning() << "DMCBatched: estimator_period is ignored for multi-timestep DMC; scalar estimators are "
+                         "sampled every step and operator estimators once per cycle."
+                      << std::endl;
+    }
     o << "  Number of blocks = " << qmcdriver_input_.get_max_blocks() << "\n";
     app_log() << o.str() << std::endl;
 
@@ -478,11 +536,15 @@ void DMCBatched::run()
   ParallelExecutor<> crowd_task;
 
   int global_step = 0;
+  const auto& time_steps = qmcdriver_input_.get_time_steps();
+  const bool using_mts   = time_steps.size() > 1;
   for (int block = 0; block < num_blocks; ++block)
   {
     {
       ScopeGuard<LoopTimer<>> dmc_local_timer(dmc_loop);
-      estimator_manager_->startBlock(steps_per_block_);
+      const int estimator_steps =
+          using_mts ? qmcdriver_input_.get_mts_cycles() : static_cast<int>(steps_per_block_);
+      estimator_manager_->startBlock(estimator_steps);
 
       dmc_state.recalculate_properties_period = (qmc_driver_mode_[QMC_UPDATE_MODE])
           ? qmcdriver_input_.get_recalculate_properties_period()
@@ -492,19 +554,28 @@ void DMCBatched::run()
           : false;
 
       for (UPtr<Crowd>& crowd : crowds_)
-        crowd->startBlock(steps_per_block_);
+        crowd->startBlock(estimator_steps);
 
       for (int step = 0; step < steps_per_block_; ++step, ++global_step)
       {
         ScopedTimer local_timer(timers_.run_steps_timer);
 
-        dmc_state.step        = step;
-        dmc_state.global_step = global_step;
+        dmc_state.step            = step;
+        dmc_state.global_step     = global_step;
+        dmc_state.time_step_index = step % time_steps.size();
+        dmc_state.tau             = time_steps[dmc_state.time_step_index];
+        branch_engine_->setTau(dmc_state.tau, dmc_state.time_step_index);
         crowd_task(crowds_.size(), runDMCStep, dmc_state, timers_, dmc_timers_, step_contexts_, crowds_);
 
         {
           const int iter = block * steps_per_block_ + step;
           walker_controller_->branch(iter, population_, iter == 0);
+          if (using_mts)
+          {
+            const IndexType cycle = block * qmcdriver_input_.get_mts_cycles() + step / time_steps.size();
+            recordMTSEnergy(cycle, dmc_state.time_step_index,
+                            walker_controller_->get_ensemble_property().Energy);
+          }
           branch_engine_->updateParamAfterPopControl(walker_controller_->get_ensemble_property(),
                                                      population_.get_golden_electrons().getTotalNum());
           walker_controller_->setTrialEnergy(branch_engine_->getEtrial());
@@ -568,6 +639,52 @@ void DMCBatched::createStepContexts(int num_crowds)
                                                                    : TmoveKind::OFF,
                                                                qmcdriver_input_.get_tau(), dmcdriver_input_.get_alpha(),
                                                                dmcdriver_input_.get_gamma()));
+}
+
+void DMCBatched::startMTSOutput()
+{
+  const auto& time_steps = qmcdriver_input_.get_time_steps();
+  if (time_steps.size() <= 1 || myComm->rank() != 0)
+    return;
+
+  std::filesystem::path file_name(get_root_name());
+  file_name.concat(".mts.dat");
+  mts_stream_ = std::make_unique<std::ofstream>(file_name);
+  if (!*mts_stream_)
+    throw UniformCommunicateError("DMCBatched: failed to open " + file_name.string());
+
+  mts_stream_->setf(std::ios::scientific, std::ios::floatfield);
+  mts_stream_->precision(10);
+  *mts_stream_ << "# Cycle";
+  for (size_t index = 0; index < time_steps.size(); ++index)
+  {
+    std::ostringstream label;
+    label << "LocalEnergy_" << index << "_tau_" << std::setprecision(10) << time_steps[index];
+    *mts_stream_ << std::setw(30) << label.str();
+  }
+  *mts_stream_ << std::endl;
+  mts_local_energies_.resize(time_steps.size());
+  mts_next_index_ = 0;
+}
+
+void DMCBatched::recordMTSEnergy(IndexType cycle, size_t time_step_index, FullPrecRealType local_energy)
+{
+  if (!mts_stream_)
+    return;
+  if (time_step_index != mts_next_index_)
+    throw UniformCommunicateError("DMCBatched: internal MTS output sequence is inconsistent.");
+
+  mts_local_energies_[time_step_index] = local_energy;
+  if (time_step_index + 1 == mts_local_energies_.size())
+  {
+    *mts_stream_ << std::setw(7) << cycle;
+    for (const FullPrecRealType energy : mts_local_energies_)
+      *mts_stream_ << std::setw(30) << energy;
+    *mts_stream_ << std::endl;
+    mts_next_index_ = 0;
+  }
+  else
+    ++mts_next_index_;
 }
 
 } // namespace qmcplusplus

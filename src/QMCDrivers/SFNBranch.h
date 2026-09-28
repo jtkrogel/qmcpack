@@ -271,6 +271,16 @@ public:
   inline RealType getTau() const { return vParam[SBVP::TAU]; }
   inline RealType getTauEff() const { return vParam[SBVP::TAUEFF]; }
 
+  /** Set up independent acceptance histories for a multi-timestep schedule. */
+  void setMTSTimestepCount(size_t count);
+
+  /** Set the timestep used by the next propagation step.
+   *
+   * This updates the effective timestep and all cached timestep-dependent
+   * branching cutoff values.
+   */
+  void setTau(RealType tau, size_t time_step_index = 0);
+
   int getWarmupToDoSteps() const { return WarmUpToDoSteps; }
   /** perform branching
    * @param iter current step
@@ -312,12 +322,21 @@ private:
   accumulator_set<RealType> R2Accepted;
   ///a simple accumulator for energy
   accumulator_set<RealType> R2Proposed;
+  ///separate acceptance histories for each position in a multi-timestep schedule
+  std::vector<accumulator_set<RealType>> mts_R2Accepted_;
+  std::vector<accumulator_set<RealType>> mts_R2Proposed_;
+  size_t active_time_step_index_ = 0;
   ///a simple accumulator for reptation's center slice
   accumulator_set<RealType> R2Center;
   /////histogram of populations
   //BlockHistogram<RealType> DMCEnergyHist;
   ///scheme of branching cutoff
   std::string branching_cutoff_scheme;
+  bool branch_cutoff_initialized_              = false;
+  FullPrecRealType branch_cutoff_variance_     = 0.0;
+  FullPrecRealType branch_cutoff_target_sigma_ = 0.0;
+  FullPrecRealType branch_cutoff_max_sigma_    = 0.0;
+  int branch_cutoff_nelec_                     = 0;
   ///set of parameters
   ParameterSet m_param;
   ///string parameters

@@ -324,7 +324,10 @@ void QMCDriverNew::putWalkerLogs(xmlNodePtr wlxml)
 
 std::ostream& operator<<(std::ostream& o_stream, const QMCDriverNew& qmcd)
 {
-  o_stream << "  time step      = " << qmcd.qmcdriver_input_.get_tau() << '\n';
+  o_stream << "  time step(s)   =";
+  for (const auto tau : qmcd.qmcdriver_input_.get_time_steps())
+    o_stream << ' ' << tau;
+  o_stream << '\n';
   o_stream << "  blocks         = " << qmcd.qmcdriver_input_.get_max_blocks() << '\n';
   o_stream << "  steps          = " << qmcd.steps_per_block_ << '\n';
   o_stream << "  substeps       = " << qmcd.qmcdriver_input_.get_sub_steps() << '\n';

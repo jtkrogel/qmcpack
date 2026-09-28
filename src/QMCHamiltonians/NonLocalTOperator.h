@@ -39,6 +39,10 @@ public:
   NonLocalTOperator(const TmoveKind non_local_move_option, const double tau, const double alpha, const double gamma);
 
   TmoveKind getMoveKind() const { return move_kind_; }
+  RealType getTau() const { return tau_; }
+
+  /** Update the timestep and the cached transition-probability factors. */
+  void setTau(RealType tau);
 
   /** initialize the parameters */
   void put(xmlNodePtr cur);

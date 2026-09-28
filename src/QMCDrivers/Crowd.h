@@ -83,6 +83,21 @@ public:
     estimator_manager_crowd_.accumulate(mcp_walkers_, walker_elecs_, walker_twfs_, walker_hamiltonians_, rng);
   }
 
+  void accumulateScalarEstimators()
+  {
+    if (this->size() == 0)
+      return;
+    estimator_manager_crowd_.accumulateScalarEstimators(mcp_walkers_);
+  }
+
+  void accumulateOperatorEstimators(RandomBase<FullPrecRealType>& rng)
+  {
+    if (this->size() == 0)
+      return;
+    estimator_manager_crowd_.accumulateOperatorEstimators(mcp_walkers_, walker_elecs_, walker_twfs_,
+                                                          walker_hamiltonians_, rng);
+  }
+
   /// activate the collector
   void setWalkerLogCollector(std::unique_ptr<WalkerLogCollector>&&);
   /// Collect walker log data

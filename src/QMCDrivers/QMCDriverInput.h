@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_QMCDRIVERINPUT_H
 
 #include <optional>
+#include <vector>
 
 #include "Configuration.h"
 #include "OhmmsData/ParameterSet.h"
@@ -71,6 +72,9 @@ protected:
   IndexType requested_steps_ = 0;
   IndexType warmup_steps_    = 0;
   RealType tau_              = 0.1;
+  std::vector<RealType> time_steps_{0.1};
+  IndexType mts_cycles_ = 0;
+  bool steps_input_     = false;
   RealType spin_mass_        = 1.0;
   // call recompute at the end of each block in the full/mixed precision case.
   IndexType blocks_between_recompute_ = std::is_same<RealType, FullPrecisionRealType>::value ? 10 : 1;
@@ -108,6 +112,9 @@ public:
   IndexType get_requested_steps() const { return requested_steps_; }
   IndexType get_warmup_steps() const { return warmup_steps_; }
   RealType get_tau() const { return tau_; }
+  const std::vector<RealType>& get_time_steps() const { return time_steps_; }
+  IndexType get_mts_cycles() const { return mts_cycles_; }
+  bool has_steps_input() const { return steps_input_; }
   RealType get_spin_mass() const { return spin_mass_; }
   IndexType get_blocks_between_recompute() const { return blocks_between_recompute_; }
   bool get_append_run() const { return append_run_; }

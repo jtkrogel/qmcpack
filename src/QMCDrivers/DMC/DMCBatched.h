@@ -20,6 +20,8 @@
 #include "WalkerLogManager.h"
 #include "RunTimeManager.h"
 
+#include <fstream>
+
 namespace qmcplusplus
 {
 class DriverModifierBase;
@@ -54,6 +56,8 @@ public:
     const size_t steps_per_block;
     IndexType step            = -1;
     IndexType global_step     = -1;
+    RealType tau              = 0.0;
+    size_t time_step_index    = 0;
     bool is_recomputing_block = false;
     /// if true, calculating walker one-by-one within a crowd
     const bool serializing_crowd_walkers;
@@ -69,6 +73,7 @@ public:
           population(pop),
           branch_engine(branch_eng),
           steps_per_block(steps_per_block),
+          tau(qmci.get_tau()),
           serializing_crowd_walkers(serializing_crowd_walkers)
     {}
   };
@@ -139,9 +144,14 @@ private:
   std::unique_ptr<SFNBranch> branch_engine_;
   ///walker controller for load-balance
   std::unique_ptr<WalkerControl> walker_controller_;
+  std::unique_ptr<std::ofstream> mts_stream_;
+  std::vector<FullPrecRealType> mts_local_energies_;
+  size_t mts_next_index_ = 0;
 
   // create Rngs and StepContests
   void createStepContexts(int num_crowds);
+  void startMTSOutput();
+  void recordMTSEnergy(IndexType cycle, size_t time_step_index, FullPrecRealType local_energy);
 
   // This is the task body executed at crowd scope
   // it does not have access to object members by design
@@ -159,7 +169,8 @@ private:
                              DMCTimers& dmc_timers,
                              DMCContextForSteps& move_context,
                              bool recompute,
-                             bool accumulate_this_step);
+                             bool accumulate_scalars,
+                             bool accumulate_operators);
 
   friend class qmcplusplus::testing::DMCBatchedTest;
 };

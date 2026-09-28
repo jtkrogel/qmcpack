@@ -70,5 +70,11 @@ TEST_CASE("NonLocalTOperator", "[hamiltonian]")
   auto select9 = t_op.selectMove(0.8, 2);
   REQUIRE(select9 != nullptr);
   CHECK(select9->Weight == Approx(-0.2));
+
+  t_op.setTau(0.25);
+  CHECK(t_op.getTau() == Approx(0.25));
+  auto select_after_tau_change = t_op.selectMove(0.9, Txy);
+  REQUIRE(select_after_tau_change != nullptr);
+  CHECK(select_after_tau_change->PID == 1);
 }
 } // namespace qmcplusplus

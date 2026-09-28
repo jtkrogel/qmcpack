@@ -14,6 +14,7 @@
  */
 
 #include "OhmmsData/AttributeSet.h"
+#include "OhmmsData/libxmldefs.h"
 #include "QMCDriverInput.h"
 #include "EstimatorInputDelegates.h"
 #include "Concurrency/Info.hpp"
@@ -47,6 +48,7 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
   parameter_set.add(recalculate_properties_period_, "check_properties");
   parameter_set.add(max_blocks_, "blocks");
   parameter_set.add(requested_steps_, "steps");
+  parameter_set.add(mts_cycles_, "mts_cycles");
   parameter_set.add(sub_steps_, "substeps");
   parameter_set.add(sub_steps_, "sub_steps");
   parameter_set.add(warmup_steps_, "warmupsteps");
@@ -93,6 +95,20 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
     while (tcur != NULL)
     {
       std::string cname{lowerCase(castXMLCharToChar(tcur->name))};
+      const std::string parameter_name =
+          cname == "parameter" ? lowerCase(getXMLAttributeValue(tcur, "name")) : cname;
+
+      if (parameter_name == "steps")
+        steps_input_ = true;
+      else if (parameter_name == "timestep" || parameter_name == "time_step" || parameter_name == "tau")
+      {
+        std::vector<RealType> parsed_time_steps;
+        if (!putContent(parsed_time_steps, tcur) || parsed_time_steps.empty())
+          throw UniformCommunicateError("QMCDriverInput: timestep must contain at least one value.");
+        time_steps_ = std::move(parsed_time_steps);
+        tau_        = time_steps_.front();
+      }
+
       if (cname == "checkpoint")
       {
         OhmmsAttributeSet rAttrib;
@@ -110,6 +126,14 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
       tcur = tcur->next;
     }
   }
+
+  if (time_steps_.empty())
+    time_steps_.push_back(tau_);
+
+  if (time_steps_.size() > 1 && qmc_method_.find("dmc") == std::string::npos)
+    throw UniformCommunicateError("QMCDriverInput: multiple timesteps are supported only by DMC.");
+  if (mts_cycles_ != 0 && qmc_method_.find("dmc") == std::string::npos)
+    throw UniformCommunicateError("QMCDriverInput: mts_cycles is supported only by DMC.");
 
   if (crowd_serialize_walkers_)
     app_summary() << "  Batched operations are serialized over walkers." << std::endl;
