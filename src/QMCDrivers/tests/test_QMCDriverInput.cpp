@@ -20,6 +20,23 @@ namespace qmcplusplus
 {
 TEST_CASE("QMCDriverInput Instantiation", "[drivers]") { QMCDriverInput driver_input; }
 
+TEST_CASE("QMCDriverInput MFR mode", "[drivers]")
+{
+  const auto read_mode = [](const char* xml) {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(xml));
+    QMCDriverInput input;
+    input.readXML(doc.getRoot());
+    return input.get_mfr_qmc_mode();
+  };
+
+  CHECK(read_mode("<qmc method=\"vmc_batch\"/>") == MFRQMCModeRequest::AUTO);
+  CHECK(read_mode("<qmc method=\"vmc_batch\"><parameter name=\"mfr_qmc\">yes</parameter></qmc>") ==
+        MFRQMCModeRequest::YES);
+  CHECK(read_mode("<qmc method=\"vmc_batch\"><parameter name=\"mfr_qmc\">no</parameter></qmc>") ==
+        MFRQMCModeRequest::NO);
+}
+
 TEST_CASE("QMCDriverInput readXML", "[drivers]")
 {
   auto xml_test = [](const char* driver_xml) {

@@ -25,6 +25,7 @@ public:
   bool put(xmlNodePtr cur) override;
   bool get(std::ostream& os) const override;
   Return_t evaluate(ParticleSet& pset) override;
+  RealType getTotalEnergyMF() const { return total_energy_mf_; }
   void addObservables(PropertySetType& plist, BufferType& collectables) override;
   void registerObservables(std::vector<ObservableHelper>& h5desc, hdf_archive& file) const override;
   void setObservables(PropertySetType& plist) override;

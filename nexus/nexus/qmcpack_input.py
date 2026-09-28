@@ -2995,11 +2995,11 @@ class vmc(QIxml):
                   'blocks','steps','substeps','timestep','maxcpusecs','rewind',
                   'storeconfigs','checkproperties','recordconfigs','current',
                   'stepsbetweensamples','samplesperthread','samples','usedrift',
-                  'spin_mass','estimator_period',
+                  'spin_mass','estimator_period','mfr_qmc',
                   'walkers','nonlocalpp','tau','walkersperthread','reconfiguration', # legacy - batched
                   'dmcwalkersperthread','current','ratio','firststep',
                   'minimumtargetwalkers','max_seconds')
-    write_types = obj(usedrift=yesno,profiling=yesno,                   # batched
+    write_types = obj(usedrift=yesno,profiling=yesno,mfr_qmc=yesno,     # batched
                       gpu=yesno,nonlocalpp=yesno,reconfiguration=yesno, # legacy - batched
                       ratio=yesno,completed=yesno)
 #end class vmc
@@ -3018,14 +3018,14 @@ class dmc(QIxml):
                   'stepsbetweensamples','samplesperthread','samples','reconfiguration',
                   'nonlocalmoves','maxage','alpha','gamma','reserve','use_nonblocking',
                   'branching_cutoff_scheme','feedback','sigmabound',
-                  'spin_mass','estimator_period',
+                  'spin_mass','estimator_period','mfr_qmc',
                   'walkers','nonlocalmove','pop_control','targetwalkers',               # legacy - batched
                   'minimumtargetwalkers','energybound','feedback','recordwalkers',
                   'fastgrad','popcontrol','branchinterval','usedrift','storeconfigs',
                   'en_ref','tau','alpha','gamma','max_branch','killnode','swap_walkers',
                   'swap_trigger','branching_cutoff_scheme','l2_diffusion','maxage',
                   'max_seconds')
-    write_types = obj(usedrift=yesno,profiling=yesno,reconfiguration=yesno,
+    write_types = obj(usedrift=yesno,profiling=yesno,reconfiguration=yesno,mfr_qmc=yesno,
                       crowd_serialize_walkers=yesno,    # batched
                       nonlocalmoves=yesnostr,use_nonblocking=yesno,
                       gpu=yesno,fastgrad=yesno,completed=yesno,killnode=yesno, # legacy - batched
@@ -3049,8 +3049,8 @@ class vmc_batch(QIxml):
     tag = 'qmc'
     attributes = ('method','move','profiling','kdelay','checkpoint')
     elements   = ('estimator','estimators')
-    parameters = ('total_walkers','walkers_per_rank','crowds','warmupsteps','blocks','steps','substeps','timestep','maxcpusecs','rewind','storeconfigs','checkproperties','recordconfigs','current','stepsbetweensamples','samplesperthread','samples','usedrift')
-    write_types = obj(usedrift=yesno,profiling=yesno)
+    parameters = ('total_walkers','walkers_per_rank','crowds','warmupsteps','blocks','steps','substeps','timestep','maxcpusecs','rewind','storeconfigs','checkproperties','recordconfigs','current','stepsbetweensamples','samplesperthread','samples','usedrift','mfr_qmc')
+    write_types = obj(usedrift=yesno,profiling=yesno,mfr_qmc=yesno)
 #end class vmc_batch
 
 class dmc_batch(QIxml):
@@ -3061,8 +3061,8 @@ class dmc_batch(QIxml):
     tag = 'qmc'
     attributes = ('method','move','profiling','kdelay','checkpoint')
     elements   = ('estimator','estimators')
-    parameters = ('total_walkers','walkers_per_rank','crowd_serialize_walkers','crowds','warmupsteps','blocks','steps','substeps','timestep','maxcpusecs','rewind','storeconfigs','checkproperties','recordconfigs','current','stepsbetweensamples','samplesperthread','samples','reconfiguration','nonlocalmoves','maxage','alpha','gamma','reserve','use_nonblocking','branching_cutoff_scheme','feedback','sigmabound')
-    write_types = obj(usedrift=yesno,profiling=yesno,reconfiguration=yesno,nonlocalmoves=yesnostr,use_nonblocking=yesno, crowd_serialize_walkers=yesno)
+    parameters = ('total_walkers','walkers_per_rank','crowd_serialize_walkers','crowds','warmupsteps','blocks','steps','substeps','timestep','maxcpusecs','rewind','storeconfigs','checkproperties','recordconfigs','current','stepsbetweensamples','samplesperthread','samples','reconfiguration','nonlocalmoves','maxage','alpha','gamma','reserve','use_nonblocking','branching_cutoff_scheme','feedback','sigmabound','mfr_qmc')
+    write_types = obj(usedrift=yesno,profiling=yesno,reconfiguration=yesno,mfr_qmc=yesno,nonlocalmoves=yesnostr,use_nonblocking=yesno, crowd_serialize_walkers=yesno)
 #end class dmc_batch
 
 class linear_batch(QIxml):
@@ -6935,6 +6935,7 @@ def generate_hamiltonian(name         = 'h0',
                          interactions = 'default',
                          nrule        = None,
                          mfr_potential = None,
+                         mfr_qmc       = False,
                          ):
     if system is None:
         msg = 'generate_hamiltonian argument system must not be None'
@@ -7017,7 +7018,7 @@ def generate_hamiltonian(name         = 'h0',
     pairpots = []
     if interactions is not None:
         pairpots.append(coulomb(name='ElecElec',type='coulomb',source=ename,target=ename))
-        if system.n_ions>0:
+        if system.n_ions>0 and not mfr_qmc:
             pairpots.append(coulomb(name='IonIon',type='coulomb',source=iname,target=iname))
             ions = system.ion_labels
             if not system.pseudized:
@@ -9409,6 +9410,7 @@ gen_basic_input_defaults = obj(
     hybrid_lmax      = None,
     orbitals_h5      = 'MISSING.h5',
     mfr_potential    = None,
+    mfr_qmc          = None,
     rotated_orbitals = False,
     run_path         = None,
     check_paths      = True,
@@ -9831,6 +9833,18 @@ def generate_basic_input(**kwargs):
     #end if
 
 
+    if kw.mfr_qmc is not None and not isinstance(kw.mfr_qmc,bool):
+        raise TypeError('mfr_qmc must be a bool or None')
+    #end if
+    if kw.mfr_qmc is True and kw.mfr_potential is None:
+        raise ValueError('mfr_qmc=True requires mfr_potential')
+    #end if
+    standalone_mfr = kw.mfr_potential is not None and kw.mfr_qmc is not False
+    if standalone_mfr:
+        kw.corrections = []
+        kw.estimators = [est for est in kw.estimators if not (isinstance(est,str) and est.lower() == 'mpc')]
+    #end if
+
     if kw.mfr_potential is not None:
         if not isinstance(kw.mfr_potential,str):
             raise TypeError('mfr_potential must be a file path')
@@ -9874,6 +9888,7 @@ def generate_basic_input(**kwargs):
         estimators   = h_estimators,
         wf_elem      = wfn,
         mfr_potential = kw.mfr_potential,
+        mfr_qmc       = standalone_mfr,
         )
 
     qmcsys = qmcsystem(
@@ -9916,6 +9931,16 @@ def generate_basic_input(**kwargs):
         ests_elem = estimators()
         ests_elem.estimators = ests
         sim.qmcsystem.estimators = ests_elem
+    #end if
+    if kw.mfr_qmc is not None:
+        for c in kw.calculations:
+            if isinstance(c,loop):
+                c = c.qmc
+            #end if
+            if isinstance(c,(vmc,dmc,vmc_batch,dmc_batch)):
+                c.mfr_qmc = kw.mfr_qmc
+            #end if
+        #end for
     #end if
     if kw.estimator_period is not None:
         for c in kw.calculations:

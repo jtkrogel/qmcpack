@@ -46,10 +46,36 @@
 #include "Estimators/EstimatorInputDelegates.h"
 #include "Estimators/EstimatorManagerNew.h"
 #include "Message/UniformCommunicateError.h"
+#include "ModernStringUtils.hpp"
 #include "RandomNumberControl.h"
 
 namespace qmcplusplus
 {
+namespace
+{
+MFRQMCModeRequest readMFRQMCModeRequest(xmlNodePtr node)
+{
+  for (xmlNodePtr child = node->children; child != nullptr; child = child->next)
+  {
+    if (child->type != XML_ELEMENT_NODE || lowerCase(castXMLCharToChar(child->name)) != "parameter" ||
+        lowerCase(getXMLAttributeValue(child, "name")) != "mfr_qmc")
+      continue;
+
+    std::string value;
+    putContent(value, child);
+    value = lowerCase(value);
+    if (value == "auto")
+      return MFRQMCModeRequest::AUTO;
+    if (value == "yes")
+      return MFRQMCModeRequest::YES;
+    if (value == "no")
+      return MFRQMCModeRequest::NO;
+    throw UniformCommunicateError("mfr_qmc must be auto, yes, or no.");
+  }
+  return MFRQMCModeRequest::AUTO;
+}
+} // namespace
+
 QMCDriverFactory::QMCDriverFactory(const ProjectData& project_data) : project_data_(project_data) {}
 
 /** Read the xml defining the driver for this QMC section
@@ -140,6 +166,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
                                                                       Communicate* comm) const
 {
   std::unique_ptr<QMCDriverInterface> new_driver;
+  bool standalone_mfr_qmc = false;
 
   auto getPsi = [&wavefunction_pool](const std::string& name) -> TrialWaveFunction& {
     if (auto psi_optional = wavefunction_pool.getWaveFunction(name); psi_optional)
@@ -180,6 +207,22 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryPsi = getPsi(one_pair ? one_pair->first : "");
     // get primaryH
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
+
+    try
+    {
+      primaryH.configureMFRQMCMode(readMFRQMCModeRequest(cur));
+      standalone_mfr_qmc = primaryH.getMFRQMCMode() == QMCHamiltonian::MFRQMCMode::MFR;
+      if (standalone_mfr_qmc && das.traces_tag == "yes")
+        throw UniformCommunicateError("Standalone MFR-QMC does not support energy traces; use trace=\"no\".");
+    }
+    catch (const std::exception& e)
+    {
+      throw UniformCommunicateError(e.what());
+    }
+    if (primaryH.getMFRQMCMode() == QMCHamiltonian::MFRQMCMode::MFR &&
+        das.new_run_type != QMCRunType::VMC && das.new_run_type != QMCRunType::VMC_BATCH &&
+        das.new_run_type != QMCRunType::DMC && das.new_run_type != QMCRunType::DMC_BATCH)
+      throw UniformCommunicateError("Standalone MFR-QMC is currently supported only by VMC and DMC drivers.");
 
     auto makeEstimatorManager =
         [&](const std::optional<EstimatorManagerInput>& global_emi,
@@ -347,6 +390,11 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
   //add trace information
   bool allow_traces = das.traces_tag == "yes" ||
       (das.traces_tag == "none" && (das.new_run_type == QMCRunType::VMC || das.new_run_type == QMCRunType::DMC));
+  if (standalone_mfr_qmc && allow_traces)
+  {
+    app_summary() << "  Energy traces disabled for standalone MFR-QMC." << std::endl;
+    allow_traces = false;
+  }
   new_driver->requestTraces(allow_traces);
 
   //add trace information

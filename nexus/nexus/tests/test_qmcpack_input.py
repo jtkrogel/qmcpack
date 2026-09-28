@@ -2373,8 +2373,36 @@ def test_generate_mfr_potential(tmp_path):
     assert(f'href="{expected_href}"' in text)
     assert('scale="1.0"' in text)
     assert('name="ElecElec"' in text)
-    assert('name="IonIon"' in text)
+    assert('name="IonIon"' not in text)
+    assert('name="ElecIon"' not in text)
+    assert('type="pseudo"' not in text)
     assert('name="MPC"' not in text)
+
+    qi_comparison = generate_qmcpack_input(
+        input_type = 'basic',
+        system = system,
+        orbitals_h5 = 'MISSING.h5',
+        mfr_potential = str(mfr_file),
+        mfr_qmc = False,
+        run_path = str(run_path),
+        corrections = [],
+        jastrows = [],
+        calculations = [],
+        )
+    comparison_text = qi_comparison.write()
+    assert('name="IonIon"' in comparison_text)
+    assert('name="ElecIon"' in comparison_text)
+
+    with pytest.raises(ValueError,match='requires mfr_potential'):
+        generate_qmcpack_input(
+            input_type = 'basic',
+            system = system,
+            orbitals_h5 = 'MISSING.h5',
+            mfr_qmc = True,
+            corrections = [],
+            jastrows = [],
+            calculations = [],
+            )
 
     with pytest.raises(FileNotFoundError,match='mfr_potential'):
         generate_qmcpack_input(

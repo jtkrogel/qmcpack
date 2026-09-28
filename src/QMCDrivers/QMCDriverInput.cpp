@@ -38,6 +38,7 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
 
   std::string debug_checks_str;
   std::string measure_imbalance_str;
+  std::string mfr_qmc_str{"auto"};
   int Period4CheckPoint{0};
   int dummy_int = 0;
 
@@ -70,6 +71,7 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
   parameter_set.add(debug_checks_str, "debug_checks",
                     {"no", "all", "checkGL_after_load", "checkGL_after_moves", "checkGL_after_tmove"});
   parameter_set.add(measure_imbalance_, "measure_imbalance", {false});
+  parameter_set.add(mfr_qmc_str, "mfr_qmc", {"auto", "yes", "no"});
 
   OhmmsAttributeSet aAttrib;
   // first stage in from QMCDriverFactory
@@ -131,6 +133,13 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
   if (check_point_period_ < 1)
     check_point_period_ = max_blocks_;
 
+  if (mfr_qmc_str == "yes")
+    mfr_qmc_mode_ = MFRQMCModeRequest::YES;
+  else if (mfr_qmc_str == "no")
+    mfr_qmc_mode_ = MFRQMCModeRequest::NO;
+  else
+    mfr_qmc_mode_ = MFRQMCModeRequest::AUTO;
+
   // \todo this should be moved to a checkParticularValidity override
   // when QMCDriverInput is modernized.
   const std::string error_tag{"QMCDriverInput: "};
@@ -140,6 +149,11 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
   }
 
   dump_config_ = (Period4CheckPoint >= 0);
+
+  if (mfr_qmc_mode_ == MFRQMCModeRequest::YES)
+    app_summary() << "  mfr_qmc requested: yes" << std::endl;
+  else if (mfr_qmc_mode_ == MFRQMCModeRequest::NO)
+    app_summary() << "  mfr_qmc requested: no" << std::endl;
 }
 
 } // namespace qmcplusplus

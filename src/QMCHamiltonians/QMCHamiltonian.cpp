@@ -25,6 +25,9 @@
 #include "Utilities/TimerManager.h"
 #include "BareKineticEnergy.h"
 #include "NonLocalECPotential.h"
+#include "MFRPotential.h"
+#include "KineticJastrowResidual.h"
+#include "Message/UniformCommunicateError.h"
 #include "Containers/MinimalContainers/RecordArray.hpp"
 #include "type_traits/ConvertToReal.h"
 #include "CPU/math.hpp"
@@ -170,6 +173,98 @@ const std::string& QMCHamiltonian::getOperatorType(const std::string& name)
   return type->second;
 }
 
+void QMCHamiltonian::configureMFRQMCMode(MFRQMCModeRequest requested_mode)
+{
+  const auto find_aux = [this](const std::string& name) -> OperatorBase* {
+    for (const auto& op : auxH)
+      if (op->getName() == name)
+        return op.get();
+    return nullptr;
+  };
+
+  const bool has_mfr = find_aux("MFRPotential") != nullptr;
+  if (requested_mode == MFRQMCModeRequest::YES && !has_mfr)
+    throw UniformCommunicateError("mfr_qmc=yes requires an MFRPotential in the Hamiltonian.");
+
+  if (!has_mfr)
+    mfr_qmc_mode_ = MFRQMCMode::STANDARD;
+  else if (requested_mode == MFRQMCModeRequest::NO)
+    mfr_qmc_mode_ = MFRQMCMode::STANDARD_WITH_MFR;
+  else
+    mfr_qmc_mode_ = MFRQMCMode::MFR;
+
+  if (mfr_qmc_mode_ == MFRQMCMode::MFR)
+  {
+    if (find_aux("KineticJastrowResidual") == nullptr)
+      throw UniformCommunicateError("Standalone MFR-QMC requires KineticJastrowResidual.");
+
+    bool has_electron_electron = false;
+    std::vector<std::string> incompatible;
+    for (const auto& op : H)
+    {
+      if (op->getName() == "Kinetic")
+        continue;
+      if (op->getName() == "ElecElec" &&
+          (op->getClassName() == "CoulombPBCAA" || op->getClassName() == "CoulombPotential"))
+      {
+        has_electron_electron = true;
+        continue;
+      }
+      incompatible.push_back(op->getName() + " (" + op->getClassName() + ")");
+    }
+    if (!has_electron_electron)
+      incompatible.push_back("missing electronic Coulomb operator named ElecElec");
+    if (!incompatible.empty())
+    {
+      std::ostringstream message;
+      message << "Standalone MFR-QMC permits only Kinetic and the electronic Coulomb ElecElec operators. "
+                 "Remove pseudopotential, electron-ion, ion-ion, MPC, and other physical potential elements. "
+                 "Incompatible Hamiltonian content:";
+      for (const std::string& entry : incompatible)
+        message << " " << entry << ";";
+      throw UniformCommunicateError(message.str());
+    }
+  }
+
+  app_summary() << "  QMC energy mode: "
+                << (mfr_qmc_mode_ == MFRQMCMode::MFR
+                        ? "standalone MFR-QMC"
+                        : (mfr_qmc_mode_ == MFRQMCMode::STANDARD_WITH_MFR ? "standard with MFR observables"
+                                                                          : "standard"))
+                << std::endl;
+}
+
+void QMCHamiltonian::applyMFREnergy(TrialWaveFunction& psi, ParticleSet& pset)
+{
+  if (mfr_qmc_mode_ != MFRQMCMode::MFR)
+    return;
+
+  MFRPotential* mfr = nullptr;
+  KineticJastrowResidual* kinetic_residual = nullptr;
+  FullPrecRealType electron_electron = 0.0;
+  for (const auto& op : auxH)
+  {
+    if (op->getName() == "MFRPotential")
+      mfr = dynamic_cast<MFRPotential*>(op.get());
+    else if (op->getName() == "KineticJastrowResidual")
+      kinetic_residual = dynamic_cast<KineticJastrowResidual*>(op.get());
+  }
+  for (const auto& op : H)
+    if (op->getName() == "ElecElec")
+      electron_electron = op->getValue();
+
+  if (mfr == nullptr || kinetic_residual == nullptr)
+    throw std::runtime_error("MFR-QMC Hamiltonian components are unavailable during evaluation.");
+
+  mfr->evaluate(pset);
+  kinetic_residual->evaluate(psi, pset);
+  mfr->setObservables(Observables);
+  kinetic_residual->setObservables(Observables);
+  mfr->setParticlePropertyList(pset.PropertyList, myIndex);
+  kinetic_residual->setParticlePropertyList(pset.PropertyList, myIndex);
+  LocalEnergy = mfr->getTotalEnergyMF() + kinetic_residual->getValue() + electron_electron - mfr->getValue();
+}
+
 ///** remove a named Hamiltonian from the list
 // *@param aname the name of the Hamiltonian
 // *@return true, if the request hamiltonian exists and is removed.
@@ -273,6 +368,8 @@ void QMCHamiltonian::mw_registerKineticListener(QMCHamiltonian& ham_leader, List
 
 void QMCHamiltonian::mw_registerLocalEnergyListener(QMCHamiltonian& ham_leader, ListenerVector<RealType> listener)
 {
+  if (ham_leader.mfr_qmc_mode_ == MFRQMCMode::MFR)
+    throw std::runtime_error("Per-particle LocalEnergy listeners are not supported in standalone MFR-QMC.");
   // This creates a state replication burder of unknown scope when operators are cloned.
   // A local energy listener listens to both the kinetic operator and all involved in the potential.
   ham_leader.mw_res_handle_.getResource().kinetic_listeners_.push_back(listener);
@@ -541,6 +638,7 @@ QMCHamiltonian::FullPrecRealType QMCHamiltonian::evaluate(TrialWaveFunction& psi
     H[i]->collectScalarTraces();
 #endif
   }
+  applyMFREnergy(psi, P);
   updateKinetic(*this, P);
   return LocalEnergy;
 }
@@ -558,6 +656,7 @@ QMCHamiltonian::FullPrecRealType QMCHamiltonian::evaluateDeterministic(TrialWave
     H[i]->collectScalarTraces();
 #endif
   }
+  applyMFREnergy(psi, P);
   updateKinetic(*this, P);
   return LocalEnergy;
 }
@@ -628,8 +727,10 @@ std::vector<QMCHamiltonian::FullPrecRealType> QMCHamiltonian::mw_evaluate(
   }
 
   for (int iw = 0; iw < ham_list.size(); iw++)
+  {
+    ham_list[iw].applyMFREnergy(wf_list[iw], p_list[iw]);
     updateKinetic(ham_list[iw], p_list[iw]);
-
+  }
   std::vector<FullPrecRealType> local_energies(ham_list.size(), 0.0);
   for (int iw = 0; iw < ham_list.size(); ++iw)
     local_energies[iw] = ham_list[iw].getLocalEnergy();
@@ -805,6 +906,7 @@ QMCHamiltonian::FullPrecRealType QMCHamiltonian::evaluateWithToperator(TrialWave
     H[i]->collectScalarTraces();
 #endif
   }
+  applyMFREnergy(psi, P);
   updateKinetic(*this, P);
   return LocalEnergy;
 }
@@ -851,8 +953,10 @@ std::vector<QMCHamiltonian::FullPrecRealType> QMCHamiltonian::mw_evaluateWithTop
   }
 
   for (int iw = 0; iw < ham_list.size(); iw++)
+  {
+    ham_list[iw].applyMFREnergy(wf_list[iw], p_list[iw]);
     updateKinetic(ham_list[iw], p_list[iw]);
-
+  }
   std::vector<FullPrecRealType> local_energies(ham_list.size());
   for (int iw = 0; iw < ham_list.size(); ++iw)
     local_energies[iw] = ham_list[iw].getLocalEnergy();
@@ -1017,6 +1121,7 @@ void QMCHamiltonian::releaseResource(ResourceCollection& collection,
 std::unique_ptr<QMCHamiltonian> QMCHamiltonian::makeClone(ParticleSet& qp, TrialWaveFunction& psi) const
 {
   auto myclone = std::make_unique<QMCHamiltonian>(myName);
+  myclone->mfr_qmc_mode_ = mfr_qmc_mode_;
   for (int i = 0; i < H.size(); ++i)
     H[i]->add2Hamiltonian(qp, psi, *myclone);
   for (int i = 0; i < auxH.size(); ++i)

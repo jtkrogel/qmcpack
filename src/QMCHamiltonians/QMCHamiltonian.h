@@ -29,6 +29,7 @@
 #include "Configuration.h"
 #include "QMCDrivers/WalkerProperties.h"
 #include "QMCHamiltonians/OperatorBase.h"
+#include "QMCDrivers/MFRQMCMode.h"
 #include "QMCWaveFunctions/TWFFastDerivWrapper.h"
 #include "Utilities/Resource.h"
 #if !defined(REMOVE_TRACEMANAGER)
@@ -50,6 +51,13 @@ class QMCHamiltonian
   friend class HamiltonianFactory;
 
 public:
+  enum class MFRQMCMode
+  {
+    STANDARD,
+    STANDARD_WITH_MFR,
+    MFR
+  };
+
   using Return_t         = OperatorBase::Return_t;
   using PosType          = OperatorBase::PosType;
   using TensorType       = OperatorBase::TensorType;
@@ -77,6 +85,10 @@ public:
 
   ///record the name-type pair of an operator
   void addOperatorType(const std::string& name, const std::string& type);
+
+  /** Resolve and validate the requested MFR-QMC mode for a driver section. */
+  void configureMFRQMCMode(MFRQMCModeRequest requested_mode);
+  MFRQMCMode getMFRQMCMode() const { return mfr_qmc_mode_; }
 
   ///return type of named H element or fail
   const std::string& getOperatorType(const std::string& name);
@@ -425,6 +437,7 @@ private:
   L2Potential* l2_ptr;
   ///vector of Hamiltonians
   std::vector<std::unique_ptr<OperatorBase>> auxH;
+  MFRQMCMode mfr_qmc_mode_ = MFRQMCMode::STANDARD;
   /// Total timer for H evaluation
   NewTimer& ham_timer_;
   /// Total timer for H evaluation
@@ -446,6 +459,7 @@ private:
   void reportToListeners();
   // helper function for extracting a list of Hamiltonian components from a list of QMCHamiltonian::H.
   static RefVectorWithLeader<OperatorBase> extract_HC_list(const RefVectorWithLeader<QMCHamiltonian>& ham_list, int id);
+  void applyMFREnergy(TrialWaveFunction& psi, ParticleSet& pset);
 
 #if !defined(REMOVE_TRACEMANAGER)
   ///traces variables

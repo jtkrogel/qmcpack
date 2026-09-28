@@ -17,6 +17,7 @@
 #include "Configuration.h"
 #include "OhmmsData/ParameterSet.h"
 #include "DriverDebugChecks.h"
+#include "QMCDrivers/MFRQMCMode.h"
 #include "EstimatorManagerInput.h"
 #include "type_traits/template_types.hpp"
 
@@ -121,11 +122,15 @@ public:
   bool get_scoped_profiling() const { return scoped_profiling_; }
   bool areWalkersSerialized() const { return crowd_serialize_walkers_; }
   bool get_measure_imbalance() const { return measure_imbalance_; }
+  MFRQMCModeRequest get_mfr_qmc_mode() const { return mfr_qmc_mode_; }
 
   const std::string get_drift_modifier() const { return drift_modifier_; }
   RealType get_drift_modifier_unr_a() const { return drift_modifier_unr_a_; }
 
   const std::optional<EstimatorManagerInput>& get_estimator_manager_input() const { return estimator_manager_input_; }
+
+private:
+  MFRQMCModeRequest mfr_qmc_mode_ = MFRQMCModeRequest::AUTO;
 };
 
 // These will cause a compiler error if the implicit move constructor has been broken
