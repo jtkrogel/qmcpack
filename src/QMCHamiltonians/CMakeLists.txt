@@ -41,6 +41,8 @@ set(HAMSRCS
     CoulombPotentialFactory.cpp
     HarmonicExternalPotential.cpp
     GridExternalPotential.cpp
+    MFRPotential.cpp
+    KineticJastrowResidual.cpp
     StaticStructureFactor.cpp
     OrbitalImages.cpp
     SpinDensity.cpp

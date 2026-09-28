@@ -178,7 +178,9 @@ class QBase(DevBase):
     autocorr = True
 
     quantity_abbreviations = obj(
-        e   = 'LocalEnergy',    v  = 'Variance',       k    = 'Kinetic',
+        e   = 'LocalEnergy',    emfr = 'LocalEnergyMFR', mfr  = 'MFRPotential',
+        emf = 'TotalEnergyMF',  tj   = 'KineticJastrowResidual',
+        v   = 'Variance',       k    = 'Kinetic',
         p   = 'LocalPotential', ee = 'ElecElec',       ii   = 'IonIon',
         l   = 'LocalECP',       n  = 'NonLocalECP',    ce   = 'CorrectedEnergy',
         mpc = 'MPC',            kc = 'KEcorr',         bw   = 'BlockWeight',
@@ -229,7 +231,7 @@ class QBase(DevBase):
 
 
 class DatAnalyzer(QBase):
-    first = ('LocalEnergy', 'Variance', 'Kinetic', 'LocalPotential', 'ElecElec', 'LocalECP', 'NonLocalECP', 'IonIon')
+    first = ('LocalEnergy', 'LocalEnergyMFR', 'Variance', 'Kinetic', 'LocalPotential', 'ElecElec', 'MFRPotential', 'KineticJastrowResidual', 'TotalEnergyMF', 'LocalECP', 'NonLocalECP', 'IonIon')
     last = ('MPC', 'KEcorr', 'BlockWeight', 'BlockCPU', 'AcceptRatio', 'Efficiency', 'TotalTime', 'TotalSamples', 'TrialEnergy', 'DiffEff', 'Weight', 'NumOfWalkers', 'LivingFraction', 'AvgSentWalkers', 'CorrectedEnergy')
 
     nonenergy = frozenset({'AcceptRatio', 'TotalSamples', 'Weight', 'NumOfWalkers', 'AvgSentWalkers', 'BlockWeight', 'LivingFraction', 'Efficiency', 'TotalTime', 'DiffEff', 'BlockCPU'})
@@ -379,6 +381,14 @@ class DatAnalyzer(QBase):
             v = data.LocalEnergy_sq - data.LocalEnergy**2
             data.Variance  = v
             stats.Variance = self.stat_value(v[nbe:])
+        #end if
+
+        mfr_inputs = ("TotalEnergyMF", "KineticJastrowResidual", "ElecElec", "MFRPotential")
+        if all(quantity in data for quantity in mfr_inputs):
+            emfr = (data.TotalEnergyMF + data.KineticJastrowResidual +
+                    data.ElecElec - data.MFRPotential)
+            data.LocalEnergyMFR = emfr
+            stats.LocalEnergyMFR = self.stat_value(emfr[nbe:])
         #end if
 
         # Find finite size corrected energy

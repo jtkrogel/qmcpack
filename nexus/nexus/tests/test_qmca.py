@@ -320,3 +320,26 @@ def test_save_plot_png_default():
     os.chdir(cwd)
 #end def test_save_plot_png_default
 
+
+
+def test_mfr_local_energy(tmp_path):
+    scalar_file = tmp_path / 'mfr.s000.scalar.dat'
+    scalar_file.write_text(
+        '# index LocalEnergy TotalEnergyMF KineticJastrowResidual ElecElec MFRPotential BlockWeight\n'
+        '0 -7.0 -10.0 1.0 5.0 2.0 1.0\n'
+        '1 -7.0 -10.0 2.0 6.0 4.0 1.0\n'
+        '2 -7.0 -10.0 3.0 7.0 6.0 1.0\n'
+        '3 -7.0 -10.0 4.0 8.0 8.0 1.0\n'
+        )
+
+    command = f"{sys.executable} {QMCA_EXE} -e 0 -q 'e mfr emfr' --fp=16.8f {scalar_file}"
+    out,err,rc = execute(command)
+
+    assert(rc==0)
+    assert('LocalEnergy        ' in out)
+    assert('-7.00000000' in out)
+    assert('MFRPotential' in out)
+    assert('5.00000000' in out)
+    assert('LocalEnergyMFR' in out)
+    assert('-6.00000000' in out)
+#end def test_mfr_local_energy

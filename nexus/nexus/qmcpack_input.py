@@ -2519,9 +2519,21 @@ class hamiltonian(QIxml):
     attributes = ('name','type','target','default', # rsqmc
                   'info') # afqmc
     parameters = ('filetype','filename') # afqmc
-    elements   = ('pairpot','constant','estimator')
+    elements   = ('pairpot','constant','extpot','estimator')
     identifier = 'name'
 #end class hamiltonian
+
+class mfrpotential(QIxml):
+    tag = 'extpot'
+    attributes = ('type','name','href','scale')
+    identifier = 'name'
+#end class mfrpotential
+
+extpot = QIxmlFactory(
+    name = 'extpot',
+    types = dict(mfr=mfrpotential),
+    typekey = 'type'
+    )
 
 class coulomb(QIxml):
     tag = 'pairpot'
@@ -3150,7 +3162,7 @@ class gen(QIxml):
 
 classes = [   #standard classes
     simulation,project,application,random,qmcsystem,simulationcell,particleset,
-    group,hamiltonian,constant,pseudopotential,coulomb,pseudo,mpc,chiesa,density,
+    group,hamiltonian,constant,mfrpotential,pseudopotential,coulomb,pseudo,mpc,chiesa,density,
     localenergy,energydensity,spacegrid,origin,axis,wavefunction,
     determinantset,slaterdeterminant,basisset,grid,determinant,occupation,
     jastrow1,jastrow2,jastrow3,
@@ -3174,6 +3186,7 @@ types = dict( #simple types and factories
     #date              = param,
     #user              = param,
     pairpot           = pairpot,
+    extpot            = extpot,
     estimator         = estimator,
     sposet_builder    = sposet_builder,
     sposet_collection = sposet_collection,
@@ -3186,6 +3199,7 @@ plurals = obj(
     groups          = 'group',
     hamiltonians    = 'hamiltonian',
     pairpots        = 'pairpot',
+    extpots         = 'extpot',
     pseudos         = 'pseudo',
     estimators      = 'estimator',
     spacegrids      = 'spacegrid',
@@ -6920,6 +6934,7 @@ def generate_hamiltonian(name         = 'h0',
                          wf_elem      = None,
                          interactions = 'default',
                          nrule        = None,
+                         mfr_potential = None,
                          ):
     if system is None:
         msg = 'generate_hamiltonian argument system must not be None'
@@ -7129,6 +7144,15 @@ def generate_hamiltonian(name         = 'h0',
 
     if len(pairpots)>0:
         hmltn.pairpots = make_collection(pairpots)
+    #end if
+
+    if mfr_potential is not None:
+        hmltn.extpots = make_collection([mfrpotential(
+            type  = 'mfr',
+            name  = 'MFRPotential',
+            href  = mfr_potential,
+            scale = 1.0,
+            )])
     #end if
 
     if len(estimators)>0:
@@ -9384,6 +9408,7 @@ gen_basic_input_defaults = obj(
     hybrid_rcut      = None,
     hybrid_lmax      = None,
     orbitals_h5      = 'MISSING.h5',
+    mfr_potential    = None,
     rotated_orbitals = False,
     run_path         = None,
     check_paths      = True,
@@ -9806,6 +9831,23 @@ def generate_basic_input(**kwargs):
     #end if
 
 
+    if kw.mfr_potential is not None:
+        if not isinstance(kw.mfr_potential,str):
+            raise TypeError('mfr_potential must be a file path')
+        #end if
+        if kw.check_paths and not os.path.exists(kw.mfr_potential):
+            msg = (
+                'user provided "mfr_potential" path does not exist\n'
+                f'Path provided: {kw.mfr_potential}\n'
+                'To disable this check, set check_paths=False'
+                )
+            raise FileNotFoundError(msg)
+        #end if
+        if kw.run_path is not None:
+            kw.mfr_potential = os.path.relpath(kw.mfr_potential,kw.run_path)
+        #end if
+    #end if
+
     h_estimators = kw.estimators
     d_estimators = None
     if batched:
@@ -9831,6 +9873,7 @@ def generate_basic_input(**kwargs):
         interactions = kw.interactions,
         estimators   = h_estimators,
         wf_elem      = wfn,
+        mfr_potential = kw.mfr_potential,
         )
 
     qmcsys = qmcsystem(

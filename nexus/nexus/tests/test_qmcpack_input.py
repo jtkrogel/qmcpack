@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pytest
 from copy import deepcopy
@@ -2337,3 +2338,52 @@ def test_symbolic_excited_state():
     assert(text==expect)
 
 #end def test_symbolic_excited_state
+
+
+@isolate_nexus_core
+def test_generate_mfr_potential(tmp_path):
+    from ..physical_system import generate_physical_system
+    from ..qmcpack_input import generate_qmcpack_input
+
+    system = generate_physical_system(
+        units = 'B',
+        axes = [[3.0,0.0,0.0],[0.0,3.0,0.0],[0.0,0.0,3.0]],
+        elem_pos = 'H 0.0 0.0 0.0',
+        )
+    mfr_file = tmp_path/'field.mfr.h5'
+    mfr_file.touch()
+    run_path = tmp_path/'run'
+    run_path.mkdir()
+
+    qi = generate_qmcpack_input(
+        input_type = 'basic',
+        system = system,
+        orbitals_h5 = 'MISSING.h5',
+        mfr_potential = str(mfr_file),
+        run_path = str(run_path),
+        corrections = [],
+        jastrows = [],
+        calculations = [],
+        )
+    text = qi.write()
+    expected_href = os.path.relpath(mfr_file,run_path)
+    assert('<extpot' in text)
+    assert('type="mfr"' in text)
+    assert('name="MFRPotential"' in text)
+    assert(f'href="{expected_href}"' in text)
+    assert('scale="1.0"' in text)
+    assert('name="ElecElec"' in text)
+    assert('name="IonIon"' in text)
+    assert('name="MPC"' not in text)
+
+    with pytest.raises(FileNotFoundError,match='mfr_potential'):
+        generate_qmcpack_input(
+            input_type = 'basic',
+            system = system,
+            orbitals_h5 = 'MISSING.h5',
+            mfr_potential = str(tmp_path/'missing.mfr.h5'),
+            corrections = [],
+            jastrows = [],
+            calculations = [],
+            )
+#end def test_generate_mfr_potential

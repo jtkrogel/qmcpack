@@ -36,6 +36,8 @@
 #include "QMCHamiltonians/SkEstimator.h"
 #include "QMCHamiltonians/HarmonicExternalPotential.h"
 #include "QMCHamiltonians/GridExternalPotential.h"
+#include "QMCHamiltonians/MFRPotential.h"
+#include "QMCHamiltonians/KineticJastrowResidual.h"
 #include "QMCHamiltonians/StaticStructureFactor.h"
 #include "QMCHamiltonians/SpinDensity.h"
 #include "QMCHamiltonians/SelfHealingOverlapLegacy.h"
@@ -149,11 +151,19 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
         hs->put(element);
         targetH->addOperator(std::move(hs), "HarmonicExt", true);
       }
-      if (potType == "grid")
+      else if (potType == "grid")
       {
         std::unique_ptr<GridExternalPotential> hs = std::make_unique<GridExternalPotential>(targetPtcl);
         hs->put(element);
         targetH->addOperator(std::move(hs), "Grid", true);
+      }
+      else if (potType == "mfr" || potType == "MFR")
+      {
+        std::unique_ptr<MFRPotential> mfr = std::make_unique<MFRPotential>(targetPtcl);
+        mfr->put(element);
+        targetH->addOperator(std::move(mfr), "MFRPotential", false);
+        targetH->addOperator(std::make_unique<KineticJastrowResidual>(targetPtcl),
+                             "KineticJastrowResidual", false);
       }
     }
     else if (cname == "estimator")
