@@ -24,6 +24,7 @@
 #include "QMCWaveFunctions/Fermion/SlaterDetBuilder.h"
 #include "QMCWaveFunctions/LatticeGaussianProductBuilder.h"
 #include "QMCWaveFunctions/ExampleHeBuilder.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #ifdef ENABLE_DEEPQMC_INFERENCE
 #include "QMCWaveFunctions/DeepQMC/DeepQMCWaveFunctionBuilder.h"
 #endif
@@ -109,6 +110,11 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
 #else
       APP_ABORT("DeepQMC wavefunction input requires ENABLE_DEEPQMC_INFERENCE=ON");
 #endif
+    }
+    else if (cname == "psiformer")
+    {
+      auto builder = std::make_unique<PsiFormerWaveFunctionBuilder>(myComm, targetPtcl, ptclPool);
+      targetPsi->addComponent(builder->buildComponent(cur));
     }
     else if (cname == "override_variational_parameters")
     {

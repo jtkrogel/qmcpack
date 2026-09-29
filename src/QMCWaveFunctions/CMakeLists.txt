@@ -38,6 +38,8 @@ set(WFBASE_SRCS
     HarmonicOscillator/SHOSetBuilder.cpp
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
+    PsiFormer/PsiFormerWF.cpp
+    PsiFormer/PsiFormerWaveFunctionBuilder.cpp
     RotatedSPOs.cpp)
 
 if(QMC_COMPLEX)
@@ -160,6 +162,7 @@ if(ENABLE_DEEPQMC_INFERENCE)
   target_link_libraries(qmcwfs PRIVATE Python3::Python)
 endif()
 target_link_libraries(qmcwfs PRIVATE einspline Math::FFTW3)
+target_link_libraries(qmcwfs PRIVATE IO::HDF5)
 
 add_library(qmcwfs_omptarget OBJECT ${JASTROW_OMPTARGET_SRCS} ${FERMION_OMPTARGET_SRCS})
 
