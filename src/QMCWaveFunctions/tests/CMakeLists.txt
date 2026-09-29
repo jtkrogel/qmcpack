@@ -256,5 +256,11 @@ if((ENABLE_CUDA OR ENABLE_SYCL) AND BUILD_MICRO_BENCHMARKS)
   add_unit_test(${UTEST_NAME} 1 1 $<TARGET_FILE:${UTEST_EXE}>)
 endif()
 
+add_executable(test_psiformer_native test_psiformer_native.cpp)
+target_link_libraries(test_psiformer_native catch_main IO::HDF5)
+target_include_directories(test_psiformer_native PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_native 1 1 $<TARGET_FILE:test_psiformer_native>)
+set_tests_properties(deterministic-unit_test_psiformer_native PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")
