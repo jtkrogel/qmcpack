@@ -46,7 +46,11 @@ namespace pf
 // imported model independent of a third-party tensor or
 // automatic-differentiation library.
 using Shape = std::vector<size_t>;
-size_t product(const Shape& s) { return std::accumulate(s.begin(), s.end(), size_t{1}, std::multiplies<>()); }
+
+size_t product(const Shape& shape)
+{
+  return std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<>());
+}
 
 /** Lightweight, owning, row-major tensor used throughout the native evaluator.
  */
@@ -54,96 +58,116 @@ struct Tensor
 {
   Shape shape;
   std::vector<double> x;
+
   Tensor() = default;
-  explicit Tensor(Shape s, double v = 0) : shape(std::move(s)), x(product(shape), v) {}
-  Tensor(Shape s, std::vector<double> v) : shape(std::move(s)), x(std::move(v))
+
+  explicit Tensor(Shape tensor_shape, double initial_value = 0)
+      : shape(std::move(tensor_shape)), x(product(shape), initial_value)
+  {}
+
+  Tensor(Shape tensor_shape, std::vector<double> values) : shape(std::move(tensor_shape)), x(std::move(values))
   {
     if (x.size() != product(shape))
       throw std::runtime_error("Tensor size mismatch");
   }
+
   bool empty() const { return shape.empty() && x.empty(); }
+
   size_t size() const { return x.size(); }
 };
 
-Shape strides(const Shape& s)
+Shape strides(const Shape& shape)
 {
-  Shape z(s.size(), 1);
-  for (int i = int(s.size()) - 2; i >= 0; --i)
-    z[i] = z[i + 1] * s[i + 1];
-  return z;
+  Shape row_major_strides(shape.size(), 1);
+  for (int axis = int(shape.size()) - 2; axis >= 0; --axis)
+    row_major_strides[axis] = row_major_strides[axis + 1] * shape[axis + 1];
+  return row_major_strides;
 }
-Shape unravel(size_t flat, const Shape& s)
+
+Shape unravel(size_t flat_index, const Shape& shape)
 {
-  Shape idx(s.size());
-  auto st = strides(s);
-  for (size_t i = 0; i < s.size(); ++i)
+  Shape multi_index(shape.size());
+  const Shape row_major_strides = strides(shape);
+  for (size_t axis = 0; axis < shape.size(); ++axis)
   {
-    idx[i] = flat / st[i];
-    flat %= st[i];
+    multi_index[axis] = flat_index / row_major_strides[axis];
+    flat_index %= row_major_strides[axis];
   }
-  return idx;
+  return multi_index;
 }
-size_t ravel(const Shape& idx, const Shape& s)
+
+size_t ravel(const Shape& multi_index, const Shape& shape)
 {
-  auto st  = strides(s);
-  size_t z = 0;
-  for (size_t i = 0; i < s.size(); ++i)
-    z += idx[i] * st[i];
-  return z;
+  const Shape row_major_strides = strides(shape);
+  size_t flat_index             = 0;
+  for (size_t axis = 0; axis < shape.size(); ++axis)
+    flat_index += multi_index[axis] * row_major_strides[axis];
+  return flat_index;
 }
-Shape broadcast_shape(const Shape& a, const Shape& b)
+
+Shape broadcast_shape(const Shape& left_shape, const Shape& right_shape)
 {
-  size_t n = std::max(a.size(), b.size());
-  Shape o(n, 1);
-  for (size_t k = 0; k < n; ++k)
+  const size_t output_rank = std::max(left_shape.size(), right_shape.size());
+  Shape output_shape(output_rank, 1);
+
+  // Align trailing axes, following NumPy broadcasting rules. Each aligned pair
+  // must match or contain a singleton dimension.
+  for (size_t output_axis = 0; output_axis < output_rank; ++output_axis)
   {
-    size_t ai = k < n - a.size() ? 1 : a[k - (n - a.size())];
-    size_t bi = k < n - b.size() ? 1 : b[k - (n - b.size())];
-    if (ai != bi && ai != 1 && bi != 1)
-    {
+    const size_t left_extent =
+        output_axis < output_rank - left_shape.size() ? 1 : left_shape[output_axis - (output_rank - left_shape.size())];
+    const size_t right_extent = output_axis < output_rank - right_shape.size()
+        ? 1
+        : right_shape[output_axis - (output_rank - right_shape.size())];
+    if (left_extent != right_extent && left_extent != 1 && right_extent != 1)
       throw std::runtime_error("incompatible broadcast");
-    }
-    o[k] = std::max(ai, bi);
+    output_shape[output_axis] = std::max(left_extent, right_extent);
   }
-  return o;
+  return output_shape;
 }
-size_t broadcast_offset(const Shape& out_idx, const Shape& in_shape)
+
+size_t broadcast_offset(const Shape& output_index, const Shape& input_shape)
 {
-  size_t lead = out_idx.size() - in_shape.size();
-  Shape idx(in_shape.size());
-  for (size_t i = 0; i < in_shape.size(); ++i)
+  const size_t leading_output_axes = output_index.size() - input_shape.size();
+  Shape input_index(input_shape.size());
+  for (size_t input_axis = 0; input_axis < input_shape.size(); ++input_axis)
+    input_index[input_axis] = input_shape[input_axis] == 1 ? 0 : output_index[leading_output_axes + input_axis];
+  return ravel(input_index, input_shape);
+}
+
+Tensor unbroadcast(const Tensor& broadcast_gradient, const Shape& target_shape)
+{
+  // Several broadcast output elements may map to one singleton input element;
+  // sum all of those contributions into the original input shape.
+  Tensor target_gradient(target_shape);
+  for (size_t output_flat_index = 0; output_flat_index < broadcast_gradient.size(); ++output_flat_index)
   {
-    idx[i] = in_shape[i] == 1 ? 0 : out_idx[lead + i];
+    const Shape output_index = unravel(output_flat_index, broadcast_gradient.shape);
+    target_gradient.x[broadcast_offset(output_index, target_shape)] += broadcast_gradient.x[output_flat_index];
   }
-  return ravel(idx, in_shape);
+  return target_gradient;
 }
-Tensor unbroadcast(const Tensor& g, const Shape& target)
+
+Tensor elem_binary(const Tensor& left, const Tensor& right, const std::function<double(double, double)>& operation)
 {
-  Tensor z(target);
-  for (size_t i = 0; i < g.size(); ++i)
+  const Shape output_shape = broadcast_shape(left.shape, right.shape);
+  Tensor output(output_shape);
+  for (size_t output_flat_index = 0; output_flat_index < output.size(); ++output_flat_index)
   {
-    auto oi = unravel(i, g.shape);
-    z.x[broadcast_offset(oi, target)] += g.x[i];
+    const Shape output_index    = unravel(output_flat_index, output_shape);
+    const double left_value     = left.x[broadcast_offset(output_index, left.shape)];
+    const double right_value    = right.x[broadcast_offset(output_index, right.shape)];
+    output.x[output_flat_index] = operation(left_value, right_value);
   }
-  return z;
+  return output;
 }
-Tensor elem_binary(const Tensor& a, const Tensor& b, const std::function<double(double, double)>& f)
+
+Tensor elem_unary(const Tensor& input, const std::function<double(double)>& operation)
 {
-  Shape os = broadcast_shape(a.shape, b.shape);
-  Tensor o(os);
-  for (size_t i = 0; i < o.size(); ++i)
-  {
-    auto idx = unravel(i, os);
-    o.x[i]   = f(a.x[broadcast_offset(idx, a.shape)], b.x[broadcast_offset(idx, b.shape)]);
-  }
-  return o;
-}
-Tensor elem_unary(const Tensor& a, const std::function<double(double)>& f)
-{
-  Tensor o(a.shape);
-  for (size_t i = 0; i < a.size(); ++i)
-    o.x[i] = f(a.x[i]);
-  return o;
+  Tensor output(input.shape);
+  for (size_t element = 0; element < input.size(); ++element)
+    output.x[element] = operation(input.x[element]);
+  return output;
 }
 
 // Differentiation graph and coordinate jets.
@@ -153,885 +177,1302 @@ Tensor elem_unary(const Tensor& a, const std::function<double(double)>& f)
 // the electronic Laplacian. Each parent edge stores a VJP for reverse parameter
 // derivatives.
 struct Node;
-using NP = std::shared_ptr<Node>;
+using NodePtr = std::shared_ptr<Node>;
+
 struct Edge
 {
-  NP parent;
+  NodePtr parent;
   std::function<Tensor(const Tensor&)> vjp;
 };
+
 /** A tensor value together with spatial jets and reverse-mode graph edges. */
 struct Node
 {
-  Tensor value, d1, d2;
+  Tensor value;
+  Tensor d1; // First Cartesian-coordinate derivatives: [coordinate, value...].
+  Tensor d2; // Diagonal second derivatives with the same jet shape.
   std::vector<Edge> parents;
   std::string parameter_key;
 };
-NP node(Tensor v, Tensor d1 = {}, Tensor d2 = {}, std::vector<Edge> p = {})
+
+NodePtr node(Tensor value,
+             Tensor first_coordinate_derivative  = {},
+             Tensor second_coordinate_derivative = {},
+             std::vector<Edge> parent_edges      = {})
 {
-  auto n     = std::make_shared<Node>();
-  n->value   = std::move(v);
-  n->d1      = std::move(d1);
-  n->d2      = std::move(d2);
-  n->parents = std::move(p);
-  return n;
-}
-NP constant(Tensor v) { return node(std::move(v)); }
-NP scalar(double v) { return constant(Tensor({}, std::vector<double>{v})); }
-/** Create the coordinate leaf and seed its first derivative with the identity
- * matrix. */
-NP coordinates(const Tensor& v)
-{
-  Tensor d1(Shape{v.size()});
-  d1.shape.insert(d1.shape.end(), v.shape.begin(), v.shape.end());
-  d1.x.assign(v.size() * v.size(), 0);
-  for (size_t i = 0; i < v.size(); ++i)
-    d1.x[i * v.size() + i] = 1;
-  Tensor d2(d1.shape);
-  return node(v, d1, d2);
+  auto result     = std::make_shared<Node>();
+  result->value   = std::move(value);
+  result->d1      = std::move(first_coordinate_derivative);
+  result->d2      = std::move(second_coordinate_derivative);
+  result->parents = std::move(parent_edges);
+  return result;
 }
 
-Tensor broadcast_jet(const Tensor& j, const Shape& source, const Shape& out, size_t C)
+NodePtr constant(Tensor value) { return node(std::move(value)); }
+
+NodePtr scalar(double value) { return constant(Tensor({}, std::vector<double>{value})); }
+
+/** Create the coordinate leaf and seed its first derivative with the identity
+ * matrix. */
+NodePtr coordinates(const Tensor& value)
 {
-  Shape os{C};
-  os.insert(os.end(), out.begin(), out.end());
-  Tensor z(os);
-  if (j.empty())
-    return z;
-  for (size_t c = 0; c < C; ++c)
-  {
-    for (size_t i = 0; i < product(out); ++i)
-    {
-      auto oi                   = unravel(i, out);
-      z.x[c * product(out) + i] = j.x[c * product(source) + broadcast_offset(oi, source)];
-    }
-  }
-  return z;
+  // Flattened Cartesian coordinates form the leading jet axis. Seeding an
+  // identity matrix makes dR_i/dR_j = delta_ij; all second derivatives vanish.
+  Tensor first_coordinate_derivative(Shape{value.size()});
+  first_coordinate_derivative.shape.insert(first_coordinate_derivative.shape.end(), value.shape.begin(),
+                                           value.shape.end());
+  first_coordinate_derivative.x.assign(value.size() * value.size(), 0);
+  for (size_t coordinate = 0; coordinate < value.size(); ++coordinate)
+    first_coordinate_derivative.x[coordinate * value.size() + coordinate] = 1;
+  Tensor second_coordinate_derivative(first_coordinate_derivative.shape);
+  return node(value, std::move(first_coordinate_derivative), std::move(second_coordinate_derivative));
 }
+
+Tensor broadcast_jet(const Tensor& jet, const Shape& source_shape, const Shape& output_shape, size_t coordinate_count)
+{
+  Shape output_jet_shape{coordinate_count};
+  output_jet_shape.insert(output_jet_shape.end(), output_shape.begin(), output_shape.end());
+  Tensor output_jet(output_jet_shape);
+  if (jet.empty())
+    return output_jet;
+
+  const size_t source_size = product(source_shape);
+  const size_t output_size = product(output_shape);
+  for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+    for (size_t output_flat_index = 0; output_flat_index < output_size; ++output_flat_index)
+    {
+      const Shape output_index = unravel(output_flat_index, output_shape);
+      output_jet.x[coordinate * output_size + output_flat_index] =
+          jet.x[coordinate * source_size + broadcast_offset(output_index, source_shape)];
+    }
+  return output_jet;
+}
+
 // Primitive differentiable operations. Each operation propagates the coordinate
 // jets and records the VJP needed to send a parameter adjoint back to its
 // parents.
-NP unary(const NP& a,
-         const std::function<double(double)>& f,
-         const std::function<double(double)>& fp,
-         const std::function<double(double)>& fpp)
+NodePtr unary(const NodePtr& input,
+              const std::function<double(double)>& function,
+              const std::function<double(double)>& function_first_derivative,
+              const std::function<double(double)>& function_second_derivative)
 {
-  Tensor v = elem_unary(a->value, f), q1, q2, first = elem_unary(a->value, fp), second = elem_unary(a->value, fpp);
-  if (!a->d1.empty())
+  // Evaluate the scalar function and the two derivatives required by the
+  // coordinate-jet chain rule.
+  Tensor value                   = elem_unary(input->value, function);
+  const Tensor first_derivative  = elem_unary(input->value, function_first_derivative);
+  const Tensor second_derivative = elem_unary(input->value, function_second_derivative);
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+
+  if (!input->d1.empty())
   {
-    q1       = Tensor(a->d1.shape);
-    q2       = Tensor(a->d2.shape);
-    size_t n = a->value.size(), C = a->d1.size() / n;
-    for (size_t c = 0; c < C; ++c)
-      for (size_t i = 0; i < n; ++i)
+    first_coordinate_derivative  = Tensor(input->d1.shape);
+    second_coordinate_derivative = Tensor(input->d2.shape);
+
+    const size_t value_size       = input->value.size();
+    const size_t coordinate_count = input->d1.size() / value_size;
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t element = 0; element < value_size; ++element)
       {
-        size_t k = c * n + i;
-        q1.x[k]  = first.x[i] * a->d1.x[k];
-        q2.x[k]  = first.x[i] * a->d2.x[k] + second.x[i] * a->d1.x[k] * a->d1.x[k];
+        const size_t jet_index = coordinate * value_size + element;
+        const double input_d1  = input->d1.x[jet_index];
+
+        first_coordinate_derivative.x[jet_index] = first_derivative.x[element] * input_d1;
+        second_coordinate_derivative.x[jet_index] =
+            first_derivative.x[element] * input->d2.x[jet_index] + second_derivative.x[element] * input_d1 * input_d1;
       }
   }
-  return node(v, q1, q2, {{a, [first, sh = a->value.shape](const Tensor& g) {
-                             return unbroadcast(elem_binary(g, first, [](double x, double y) { return x * y; }), sh);
-                           }}});
+
+  // Reverse mode needs only the local Jacobian: d f(input) / d input.
+  const Shape input_shape = input->value.shape;
+  auto input_vjp          = [first_derivative, input_shape](const Tensor& upstream_gradient) {
+    Tensor scaled_gradient = elem_binary(upstream_gradient, first_derivative,
+                                                  [](double gradient, double derivative) { return gradient * derivative; });
+    return unbroadcast(scaled_gradient, input_shape);
+  };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
-NP add(const NP& a, const NP& b)
+
+NodePtr add(const NodePtr& left, const NodePtr& right)
 {
-  Tensor v = elem_binary(a->value, b->value, [](double x, double y) { return x + y; }), d1, d2;
-  size_t C = 0;
-  if (!a->d1.empty())
-    C = a->d1.shape[0];
-  else if (!b->d1.empty())
-    C = b->d1.shape[0];
-  if (C)
+  Tensor value = elem_binary(left->value, right->value,
+                             [](double left_value, double right_value) { return left_value + right_value; });
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+
+  // Broadcast both coordinate jets to the result shape before adding them.
+  size_t coordinate_count = 0;
+  if (!left->d1.empty())
+    coordinate_count = left->d1.shape[0];
+  else if (!right->d1.empty())
+    coordinate_count = right->d1.shape[0];
+
+  if (coordinate_count)
   {
-    auto aa = broadcast_jet(a->d1, a->value.shape, v.shape, C), bb = broadcast_jet(b->d1, b->value.shape, v.shape, C);
-    auto aaa = broadcast_jet(a->d2, a->value.shape, v.shape, C), bbb = broadcast_jet(b->d2, b->value.shape, v.shape, C);
-    d1 = elem_binary(aa, bb, [](double x, double y) { return x + y; });
-    d2 = elem_binary(aaa, bbb, [](double x, double y) { return x + y; });
+    const Tensor left_d1  = broadcast_jet(left->d1, left->value.shape, value.shape, coordinate_count);
+    const Tensor right_d1 = broadcast_jet(right->d1, right->value.shape, value.shape, coordinate_count);
+    const Tensor left_d2  = broadcast_jet(left->d2, left->value.shape, value.shape, coordinate_count);
+    const Tensor right_d2 = broadcast_jet(right->d2, right->value.shape, value.shape, coordinate_count);
+
+    first_coordinate_derivative =
+        elem_binary(left_d1, right_d1, [](double left_value, double right_value) { return left_value + right_value; });
+    second_coordinate_derivative =
+        elem_binary(left_d2, right_d2, [](double left_value, double right_value) { return left_value + right_value; });
   }
-  return node(v, d1, d2,
-              {{a, [sh = a->value.shape](const Tensor& g) { return unbroadcast(g, sh); }},
-               {b, [sh = b->value.shape](const Tensor& g) { return unbroadcast(g, sh); }}});
+
+  // Addition passes the upstream gradient unchanged, except for reducing axes
+  // that were introduced by broadcasting.
+  const Shape left_shape  = left->value.shape;
+  const Shape right_shape = right->value.shape;
+  auto left_vjp  = [left_shape](const Tensor& upstream_gradient) { return unbroadcast(upstream_gradient, left_shape); };
+
+  auto right_vjp = [right_shape](const Tensor& upstream_gradient) {
+    return unbroadcast(upstream_gradient, right_shape);
+  };
+
+  std::vector<Edge> parent_edges{{left, std::move(left_vjp)}, {right, std::move(right_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
-NP neg(const NP& a)
+
+NodePtr neg(const NodePtr& input)
 {
-  return unary(a, [](double x) { return -x; }, [](double) { return -1.; }, [](double) { return 0.; });
+  return unary(input, [](double value) { return -value; }, [](double) { return -1.; }, [](double) { return 0.; });
 }
-NP mul(const NP& a, const NP& b)
+
+NodePtr mul(const NodePtr& left, const NodePtr& right)
 {
-  Tensor v = elem_binary(a->value, b->value, [](double x, double y) { return x * y; }), d1, d2;
-  size_t C = 0;
-  if (!a->d1.empty())
-    C = a->d1.shape[0];
-  else if (!b->d1.empty())
-    C = b->d1.shape[0];
-  if (C)
+  Tensor value = elem_binary(left->value, right->value,
+                             [](double left_value, double right_value) { return left_value * right_value; });
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+
+  size_t coordinate_count = 0;
+  if (!left->d1.empty())
+    coordinate_count = left->d1.shape[0];
+  else if (!right->d1.empty())
+    coordinate_count = right->d1.shape[0];
+
+  if (coordinate_count)
   {
-    auto ad1 = broadcast_jet(a->d1, a->value.shape, v.shape, C), bd1 = broadcast_jet(b->d1, b->value.shape, v.shape, C),
-         ad2 = broadcast_jet(a->d2, a->value.shape, v.shape, C), bd2 = broadcast_jet(b->d2, b->value.shape, v.shape, C);
-    Shape js{C};
-    js.insert(js.end(), v.shape.begin(), v.shape.end());
-    d1 = Tensor(js);
-    d2 = Tensor(js);
-    for (size_t c = 0; c < C; ++c)
-      for (size_t i = 0; i < v.size(); ++i)
+    // Put each input jet in the output broadcast shape, then apply the first-
+    // and second-order product rules element by element.
+    const Tensor left_d1  = broadcast_jet(left->d1, left->value.shape, value.shape, coordinate_count);
+    const Tensor right_d1 = broadcast_jet(right->d1, right->value.shape, value.shape, coordinate_count);
+    const Tensor left_d2  = broadcast_jet(left->d2, left->value.shape, value.shape, coordinate_count);
+    const Tensor right_d2 = broadcast_jet(right->d2, right->value.shape, value.shape, coordinate_count);
+
+    Shape jet_shape{coordinate_count};
+    jet_shape.insert(jet_shape.end(), value.shape.begin(), value.shape.end());
+    first_coordinate_derivative  = Tensor(jet_shape);
+    second_coordinate_derivative = Tensor(jet_shape);
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t element = 0; element < value.size(); ++element)
       {
-        auto oi   = unravel(i, v.shape);
-        double av = a->value.x[broadcast_offset(oi, a->value.shape)],
-               bv = b->value.x[broadcast_offset(oi, b->value.shape)];
-        size_t k  = c * v.size() + i;
-        d1.x[k]   = ad1.x[k] * bv + av * bd1.x[k];
-        d2.x[k]   = ad2.x[k] * bv + 2 * ad1.x[k] * bd1.x[k] + av * bd2.x[k];
+        const Shape output_index = unravel(element, value.shape);
+        const double left_value  = left->value.x[broadcast_offset(output_index, left->value.shape)];
+        const double right_value = right->value.x[broadcast_offset(output_index, right->value.shape)];
+        const size_t jet_index   = coordinate * value.size() + element;
+
+        first_coordinate_derivative.x[jet_index] =
+            left_d1.x[jet_index] * right_value + left_value * right_d1.x[jet_index];
+        second_coordinate_derivative.x[jet_index] = left_d2.x[jet_index] * right_value +
+            2 * left_d1.x[jet_index] * right_d1.x[jet_index] + left_value * right_d2.x[jet_index];
       }
   }
-  return node(v, d1, d2,
-              {{a,
-                [bv = b->value, sh = a->value.shape](const Tensor& g) {
-                  return unbroadcast(elem_binary(g, bv, [](double x, double y) { return x * y; }), sh);
-                }},
-               {b, [av = a->value, sh = b->value.shape](const Tensor& g) {
-                  return unbroadcast(elem_binary(g, av, [](double x, double y) { return x * y; }), sh);
-                }}});
+
+  // For value = left * right, the two reverse-mode contributions are
+  // upstream * right and upstream * left. Unbroadcast restores each parent
+  // tensor's original shape.
+  const Tensor right_value = right->value;
+  const Shape left_shape   = left->value.shape;
+  auto left_vjp            = [right_value, left_shape](const Tensor& upstream_gradient) {
+    Tensor gradient_times_right =
+        elem_binary(upstream_gradient, right_value,
+                               [](double gradient, double right_element) { return gradient * right_element; });
+    return unbroadcast(gradient_times_right, left_shape);
+  };
+
+  const Tensor left_value = left->value;
+  const Shape right_shape = right->value.shape;
+  auto right_vjp          = [left_value, right_shape](const Tensor& upstream_gradient) {
+    Tensor gradient_times_left = elem_binary(upstream_gradient, left_value, [](double gradient, double left_element) {
+      return gradient * left_element;
+    });
+    return unbroadcast(gradient_times_left, right_shape);
+  };
+
+  std::vector<Edge> parent_edges{{left, std::move(left_vjp)}, {right, std::move(right_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
-NP recip(const NP& a)
+
+NodePtr recip(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return 1 / x; }, [](double x) { return -1 / (x * x); },
-      [](double x) { return 2 / (x * x * x); });
+      input, [](double value) { return 1 / value; }, [](double value) { return -1 / (value * value); },
+      [](double value) { return 2 / (value * value * value); });
 }
-NP divn(const NP& a, const NP& b) { return mul(a, recip(b)); }
-NP ex(const NP& a)
+
+NodePtr divide(const NodePtr& numerator, const NodePtr& denominator) { return mul(numerator, recip(denominator)); }
+
+NodePtr exp_node(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return std::exp(x); }, [](double x) { return std::exp(x); },
-      [](double x) { return std::exp(x); });
+      input, [](double value) { return std::exp(value); }, [](double value) { return std::exp(value); },
+      [](double value) { return std::exp(value); });
 }
-NP lg(const NP& a)
+
+NodePtr log_node(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return std::log(x); }, [](double x) { return 1 / x; }, [](double x) { return -1 / (x * x); });
+      input, [](double value) { return std::log(value); }, [](double value) { return 1 / value; },
+      [](double value) { return -1 / (value * value); });
 }
-NP log1p_n(const NP& a)
+
+NodePtr log1p_node(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return std::log1p(x); }, [](double x) { return 1 / (1 + x); },
-      [](double x) { return -1 / ((1 + x) * (1 + x)); });
+      input, [](double value) { return std::log1p(value); }, [](double value) { return 1 / (1 + value); },
+      [](double value) { return -1 / ((1 + value) * (1 + value)); });
 }
-NP sqrtn(const NP& a)
+
+NodePtr sqrt_node(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return std::sqrt(x); }, [](double x) { return .5 / std::sqrt(x); },
-      [](double x) { return -.25 / std::pow(x, 1.5); });
+      input, [](double value) { return std::sqrt(value); }, [](double value) { return .5 / std::sqrt(value); },
+      [](double value) { return -.25 / std::pow(value, 1.5); });
 }
-NP tanhn(const NP& a)
+
+NodePtr tanh_node(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return std::tanh(x); },
-      [](double x) {
-        double t = std::tanh(x);
-        return 1 - t * t;
+      input, [](double value) { return std::tanh(value); },
+      [](double value) {
+        const double tanh_value = std::tanh(value);
+        return 1 - tanh_value * tanh_value;
       },
-      [](double x) {
-        double t = std::tanh(x);
-        return -2 * t * (1 - t * t);
+      [](double value) {
+        const double tanh_value = std::tanh(value);
+        return -2 * tanh_value * (1 - tanh_value * tanh_value);
       });
 }
-NP absn(const NP& a)
+
+NodePtr abs_node(const NodePtr& input)
 {
   return unary(
-      a, [](double x) { return std::abs(x); }, [](double x) { return x > 0 ? 1. : (x < 0 ? -1. : 0.); },
-      [](double) { return 0.; });
+      input, [](double value) { return std::abs(value); },
+      [](double value) { return value > 0 ? 1. : (value < 0 ? -1. : 0.); }, [](double) { return 0.; });
 }
 
 // Tensor transformations and reductions.
-NP reshape(const NP& a, Shape sh)
+NodePtr reshape(const NodePtr& input, Shape output_shape)
 {
-  if (product(sh) != a->value.size())
-    throw std::runtime_error("reshape");
-  Tensor v(sh, a->value.x), d1, d2;
-  if (!a->d1.empty())
+  if (product(output_shape) != input->value.size())
+    throw std::runtime_error("reshape changes the number of tensor elements");
+
+  Tensor value(output_shape, input->value.x);
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+
+  // The coordinate axis is stored before all value axes and is not reshaped.
+  if (!input->d1.empty())
   {
-    Shape js{a->d1.shape[0]};
-    js.insert(js.end(), sh.begin(), sh.end());
-    d1 = Tensor(js, a->d1.x);
-    d2 = Tensor(js, a->d2.x);
+    Shape jet_shape{input->d1.shape[0]};
+    jet_shape.insert(jet_shape.end(), output_shape.begin(), output_shape.end());
+    first_coordinate_derivative  = Tensor(jet_shape, input->d1.x);
+    second_coordinate_derivative = Tensor(jet_shape, input->d2.x);
   }
-  return node(v, d1, d2, {{a, [sh0 = a->value.shape](const Tensor& g) { return Tensor(sh0, g.x); }}});
+
+  const Shape input_shape = input->value.shape;
+  auto input_vjp = [input_shape](const Tensor& upstream_gradient) { return Tensor(input_shape, upstream_gradient.x); };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
-Tensor transpose_t(const Tensor& t, const std::vector<size_t>& axes)
+
+Tensor transpose_t(const Tensor& input, const std::vector<size_t>& axes)
 {
-  Shape sh;
-  for (auto a : axes)
-    sh.push_back(t.shape[a]);
-  Tensor o(sh);
-  for (size_t i = 0; i < o.size(); ++i)
+  Shape output_shape;
+  for (size_t input_axis : axes)
+    output_shape.push_back(input.shape[input_axis]);
+
+  Tensor output(output_shape);
+  for (size_t output_flat_index = 0; output_flat_index < output.size(); ++output_flat_index)
   {
-    auto ni = unravel(i, sh);
-    Shape oi(t.shape.size());
-    for (size_t k = 0; k < axes.size(); ++k)
-      oi[axes[k]] = ni[k];
-    o.x[i] = t.x[ravel(oi, t.shape)];
+    const Shape output_index = unravel(output_flat_index, output_shape);
+    Shape input_index(input.shape.size());
+    for (size_t output_axis = 0; output_axis < axes.size(); ++output_axis)
+      input_index[axes[output_axis]] = output_index[output_axis];
+    output.x[output_flat_index] = input.x[ravel(input_index, input.shape)];
   }
-  return o;
+  return output;
 }
-NP transpose(const NP& a, const std::vector<size_t>& axes)
+
+NodePtr transpose(const NodePtr& input, const std::vector<size_t>& axes)
 {
-  Tensor v = transpose_t(a->value, axes), d1, d2;
-  if (!a->d1.empty())
+  Tensor value = transpose_t(input->value, axes);
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+
+  if (!input->d1.empty())
   {
-    std::vector<size_t> ja{0};
-    for (auto x : axes)
-      ja.push_back(x + 1);
-    d1 = transpose_t(a->d1, ja);
-    d2 = transpose_t(a->d2, ja);
+    // Coordinate jets have a leading coordinate axis. Preserve it and shift all
+    // value-axis indices by one when applying the requested transpose.
+    std::vector<size_t> jet_axes{0};
+    for (size_t value_axis : axes)
+      jet_axes.push_back(value_axis + 1);
+    first_coordinate_derivative  = transpose_t(input->d1, jet_axes);
+    second_coordinate_derivative = transpose_t(input->d2, jet_axes);
   }
-  std::vector<size_t> inv(axes.size());
-  for (size_t i = 0; i < axes.size(); ++i)
-    inv[axes[i]] = i;
-  return node(v, d1, d2, {{a, [inv](const Tensor& g) { return transpose_t(g, inv); }}});
+
+  // The VJP of a transpose applies the inverse permutation.
+  std::vector<size_t> inverse_axes(axes.size());
+  for (size_t output_axis = 0; output_axis < axes.size(); ++output_axis)
+    inverse_axes[axes[output_axis]] = output_axis;
+  auto input_vjp = [inverse_axes](const Tensor& upstream_gradient) {
+    return transpose_t(upstream_gradient, inverse_axes);
+  };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
-Tensor reduce_sum_t(const Tensor& t, const std::vector<size_t>& axes)
+
+Tensor reduce_sum_t(const Tensor& input, const std::vector<size_t>& axes)
 {
-  std::vector<bool> red(t.shape.size());
-  for (auto a : axes)
-    red[a] = true;
-  Shape sh;
-  for (size_t i = 0; i < t.shape.size(); ++i)
-    if (!red[i])
-      sh.push_back(t.shape[i]);
-  Tensor o(sh);
-  for (size_t i = 0; i < t.size(); ++i)
+  std::vector<bool> is_reduced_axis(input.shape.size(), false);
+  for (size_t axis : axes)
+    is_reduced_axis[axis] = true;
+
+  Shape output_shape;
+  for (size_t axis = 0; axis < input.shape.size(); ++axis)
+    if (!is_reduced_axis[axis])
+      output_shape.push_back(input.shape[axis]);
+
+  Tensor output(output_shape);
+  for (size_t input_flat_index = 0; input_flat_index < input.size(); ++input_flat_index)
   {
-    auto ix = unravel(i, t.shape);
-    Shape ox;
-    for (size_t k = 0; k < ix.size(); ++k)
-      if (!red[k])
-        ox.push_back(ix[k]);
-    o.x[ravel(ox, sh)] += t.x[i];
+    const Shape input_index = unravel(input_flat_index, input.shape);
+    Shape output_index;
+    for (size_t axis = 0; axis < input_index.size(); ++axis)
+      if (!is_reduced_axis[axis])
+        output_index.push_back(input_index[axis]);
+    output.x[ravel(output_index, output_shape)] += input.x[input_flat_index];
   }
-  return o;
+  return output;
 }
-NP sum_axes(const NP& a, std::vector<size_t> axes)
+
+NodePtr sum_axes(const NodePtr& input, std::vector<size_t> axes)
 {
-  Tensor v = reduce_sum_t(a->value, axes), d1, d2;
-  if (!a->d1.empty())
+  Tensor value = reduce_sum_t(input->value, axes);
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+
+  if (!input->d1.empty())
   {
-    std::vector<size_t> ja;
-    for (auto x : axes)
-      ja.push_back(x + 1);
-    d1 = reduce_sum_t(a->d1, ja);
-    d2 = reduce_sum_t(a->d2, ja);
+    // Account for the leading coordinate axis in the jet tensors.
+    std::vector<size_t> jet_axes;
+    for (size_t value_axis : axes)
+      jet_axes.push_back(value_axis + 1);
+    first_coordinate_derivative  = reduce_sum_t(input->d1, jet_axes);
+    second_coordinate_derivative = reduce_sum_t(input->d2, jet_axes);
   }
-  return node(v, d1, d2, {{a, [axes, sh = a->value.shape](const Tensor& g) {
-                             Tensor z(sh);
-                             std::vector<bool> red(sh.size());
-                             for (auto x : axes)
-                               red[x] = true;
-                             for (size_t i = 0; i < z.size(); ++i)
-                             {
-                               auto ix = unravel(i, sh);
-                               Shape gi;
-                               for (size_t k = 0; k < ix.size(); ++k)
-                                 if (!red[k])
-                                   gi.push_back(ix[k]);
-                               z.x[i] = g.x[ravel(gi, g.shape)];
-                             }
-                             return z;
-                           }}});
-}
-NP sum_all(const NP& a)
-{
-  std::vector<size_t> ax(a->value.shape.size());
-  std::iota(ax.begin(), ax.end(), 0);
-  return sum_axes(a, ax);
-}
-NP slice0(const NP& a, size_t begin, size_t end)
-{
-  Shape sh     = a->value.shape;
-  size_t block = product(Shape(sh.begin() + 1, sh.end()));
-  sh[0]        = end - begin;
-  Tensor v(sh);
-  std::copy(a->value.x.begin() + begin * block, a->value.x.begin() + end * block, v.x.begin());
-  Tensor d1, d2;
-  if (!a->d1.empty())
-  {
-    Shape js = a->d1.shape;
-    js[1]    = end - begin;
-    d1       = Tensor(js);
-    d2       = Tensor(js);
-    for (size_t c = 0; c < js[0]; ++c)
+
+  // The VJP broadcasts each reduced output element back over every input
+  // element that contributed to it.
+  const Shape input_shape = input->value.shape;
+  auto input_vjp          = [axes, input_shape](const Tensor& upstream_gradient) {
+    Tensor input_gradient(input_shape);
+    std::vector<bool> is_reduced_axis(input_shape.size(), false);
+    for (size_t axis : axes)
+      is_reduced_axis[axis] = true;
+
+    for (size_t input_flat_index = 0; input_flat_index < input_gradient.size(); ++input_flat_index)
     {
-      size_t oldn = a->value.size(), newn = v.size();
-      std::copy(a->d1.x.begin() + c * oldn + begin * block, a->d1.x.begin() + c * oldn + end * block,
-                d1.x.begin() + c * newn);
-      std::copy(a->d2.x.begin() + c * oldn + begin * block, a->d2.x.begin() + c * oldn + end * block,
-                d2.x.begin() + c * newn);
+      const Shape input_index = unravel(input_flat_index, input_shape);
+      Shape output_index;
+      for (size_t axis = 0; axis < input_index.size(); ++axis)
+        if (!is_reduced_axis[axis])
+          output_index.push_back(input_index[axis]);
+      input_gradient.x[input_flat_index] = upstream_gradient.x[ravel(output_index, upstream_gradient.shape)];
+    }
+    return input_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
+}
+
+NodePtr sum_all(const NodePtr& input)
+{
+  std::vector<size_t> axes(input->value.shape.size());
+  std::iota(axes.begin(), axes.end(), 0);
+  return sum_axes(input, axes);
+}
+
+NodePtr slice0(const NodePtr& input, size_t begin, size_t end)
+{
+  Shape output_shape             = input->value.shape;
+  const size_t trailing_elements = product(Shape(output_shape.begin() + 1, output_shape.end()));
+  output_shape[0]                = end - begin;
+
+  Tensor value(output_shape);
+  std::copy(input->value.x.begin() + begin * trailing_elements, input->value.x.begin() + end * trailing_elements,
+            value.x.begin());
+
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  if (!input->d1.empty())
+  {
+    Shape jet_shape              = input->d1.shape;
+    jet_shape[1]                 = end - begin;
+    first_coordinate_derivative  = Tensor(jet_shape);
+    second_coordinate_derivative = Tensor(jet_shape);
+
+    for (size_t coordinate = 0; coordinate < jet_shape[0]; ++coordinate)
+    {
+      const size_t input_value_size  = input->value.size();
+      const size_t output_value_size = value.size();
+      std::copy(input->d1.x.begin() + coordinate * input_value_size + begin * trailing_elements,
+                input->d1.x.begin() + coordinate * input_value_size + end * trailing_elements,
+                first_coordinate_derivative.x.begin() + coordinate * output_value_size);
+      std::copy(input->d2.x.begin() + coordinate * input_value_size + begin * trailing_elements,
+                input->d2.x.begin() + coordinate * input_value_size + end * trailing_elements,
+                second_coordinate_derivative.x.begin() + coordinate * output_value_size);
     }
   }
-  return node(v, d1, d2, {{a, [begin, end, sh0 = a->value.shape](const Tensor& g) {
-                             Tensor z(sh0);
-                             size_t block = product(Shape(sh0.begin() + 1, sh0.end()));
-                             std::copy(g.x.begin(), g.x.end(), z.x.begin() + begin * block);
-                             return z;
-                           }}});
+
+  // Scatter the sliced upstream gradient back into its original first-axis
+  // interval; elements outside the slice receive zero.
+  const Shape input_shape = input->value.shape;
+  auto input_vjp          = [begin, input_shape](const Tensor& upstream_gradient) {
+    Tensor input_gradient(input_shape);
+    const size_t trailing_elements = product(Shape(input_shape.begin() + 1, input_shape.end()));
+    std::copy(upstream_gradient.x.begin(), upstream_gradient.x.end(),
+                       input_gradient.x.begin() + begin * trailing_elements);
+    return input_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
-NP concat(const std::vector<NP>& a, size_t axis)
+
+NodePtr concat(const std::vector<NodePtr>& inputs, size_t axis)
 {
-  if (a.empty())
-    throw std::runtime_error("empty concat");
-  if (a[0]->value.shape.empty())
+  if (inputs.empty())
+    throw std::runtime_error("cannot concatenate an empty node list");
+
+  // Promote scalar nodes to one-element vectors so they can share the normal
+  // axis-zero concatenation path.
+  if (inputs[0]->value.shape.empty())
   {
-    std::vector<NP> b;
-    for (auto& n : a)
-      b.push_back(reshape(n, {1}));
-    return concat(b, 0);
+    std::vector<NodePtr> promoted_inputs;
+    for (const NodePtr& input : inputs)
+      promoted_inputs.push_back(reshape(input, {1}));
+    return concat(promoted_inputs, 0);
   }
-  Shape sh     = a[0]->value.shape;
-  size_t total = 0;
-  for (auto& n : a)
-    total += n->value.shape[axis];
-  sh[axis] = total;
-  Tensor v(sh);
-  size_t outer = 1, inner = 1;
-  for (size_t i = 0; i < axis; ++i)
-    outer *= sh[i];
-  for (size_t i = axis + 1; i < sh.size(); ++i)
-    inner *= sh[i];
-  for (size_t o = 0; o < outer; ++o)
+
+  Shape output_shape      = inputs[0]->value.shape;
+  size_t output_axis_size = 0;
+  for (const NodePtr& input : inputs)
+    output_axis_size += input->value.shape[axis];
+  output_shape[axis] = output_axis_size;
+
+  size_t outer_block_count = 1;
+  size_t inner_block_size  = 1;
+  for (size_t dimension = 0; dimension < axis; ++dimension)
+    outer_block_count *= output_shape[dimension];
+  for (size_t dimension = axis + 1; dimension < output_shape.size(); ++dimension)
+    inner_block_size *= output_shape[dimension];
+
+  // Copy contiguous blocks from every input into the output axis interval.
+  Tensor value(output_shape);
+  for (size_t outer = 0; outer < outer_block_count; ++outer)
   {
-    size_t cur = 0;
-    for (auto& n : a)
+    size_t output_element_offset = 0;
+    for (const NodePtr& input : inputs)
     {
-      size_t len = n->value.shape[axis] * inner;
-      std::copy(n->value.x.begin() + o * len, n->value.x.begin() + (o + 1) * len,
-                v.x.begin() + o * total * inner + cur);
-      cur += len;
+      const size_t input_block_size = input->value.shape[axis] * inner_block_size;
+      std::copy(input->value.x.begin() + outer * input_block_size,
+                input->value.x.begin() + (outer + 1) * input_block_size,
+                value.x.begin() + outer * output_axis_size * inner_block_size + output_element_offset);
+      output_element_offset += input_block_size;
     }
   }
-  Tensor d1, d2;
-  size_t C = 0;
-  for (auto& n : a)
-    if (!n->d1.empty())
+
+  // Concatenate coordinate jets with the same block layout as their values.
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  size_t coordinate_count = 0;
+  for (const NodePtr& input : inputs)
+    if (!input->d1.empty())
     {
-      C = n->d1.shape[0];
+      coordinate_count = input->d1.shape[0];
       break;
     }
-  if (C)
+
+  if (coordinate_count)
   {
-    Shape js{C};
-    js.insert(js.end(), sh.begin(), sh.end());
-    d1 = Tensor(js);
-    d2 = Tensor(js);
-    for (size_t c = 0; c < C; ++c)
-    {
-      size_t base = c * v.size();
-      for (size_t o = 0; o < outer; ++o)
+    Shape jet_shape{coordinate_count};
+    jet_shape.insert(jet_shape.end(), output_shape.begin(), output_shape.end());
+    first_coordinate_derivative  = Tensor(jet_shape);
+    second_coordinate_derivative = Tensor(jet_shape);
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t outer = 0; outer < outer_block_count; ++outer)
       {
-        size_t cur = 0;
-        for (auto& n : a)
+        size_t output_element_offset = 0;
+        for (const NodePtr& input : inputs)
         {
-          size_t len = n->value.shape[axis] * inner, nn = n->value.size();
-          if (!n->d1.empty())
+          const size_t input_block_size = input->value.shape[axis] * inner_block_size;
+          const size_t input_value_size = input->value.size();
+          if (!input->d1.empty())
           {
-            std::copy(n->d1.x.begin() + c * nn + o * len, n->d1.x.begin() + c * nn + (o + 1) * len,
-                      d1.x.begin() + base + o * total * inner + cur);
-            std::copy(n->d2.x.begin() + c * nn + o * len, n->d2.x.begin() + c * nn + (o + 1) * len,
-                      d2.x.begin() + base + o * total * inner + cur);
+            const size_t input_begin = coordinate * input_value_size + outer * input_block_size;
+            const size_t output_begin =
+                coordinate * value.size() + outer * output_axis_size * inner_block_size + output_element_offset;
+            std::copy(input->d1.x.begin() + input_begin, input->d1.x.begin() + input_begin + input_block_size,
+                      first_coordinate_derivative.x.begin() + output_begin);
+            std::copy(input->d2.x.begin() + input_begin, input->d2.x.begin() + input_begin + input_block_size,
+                      second_coordinate_derivative.x.begin() + output_begin);
           }
-          cur += len;
+          output_element_offset += input_block_size;
         }
       }
-    }
   }
-  std::vector<Edge> edges;
-  size_t offset = 0;
-  for (auto& n : a)
+
+  // Each parent VJP extracts the axis interval contributed by that parent.
+  std::vector<Edge> parent_edges;
+  size_t axis_offset = 0;
+  for (const NodePtr& input : inputs)
   {
-    size_t begin = offset, lenaxis = n->value.shape[axis];
-    offset += lenaxis;
-    edges.push_back({n, [begin, lenaxis, axis, shn = n->value.shape](const Tensor& g) {
-                       Tensor z(shn);
-                       size_t outer = 1, inner = 1, total = g.shape[axis];
-                       for (size_t i = 0; i < axis; ++i)
-                         outer *= g.shape[i];
-                       for (size_t i = axis + 1; i < g.shape.size(); ++i)
-                         inner *= g.shape[i];
-                       size_t len = lenaxis * inner;
-                       for (size_t o = 0; o < outer; ++o)
-                         std::copy(g.x.begin() + o * total * inner + begin * inner,
-                                   g.x.begin() + o * total * inner + begin * inner + len, z.x.begin() + o * len);
-                       return z;
-                     }});
+    const size_t input_axis_size  = input->value.shape[axis];
+    const size_t input_axis_begin = axis_offset;
+    const Shape input_shape       = input->value.shape;
+    axis_offset += input_axis_size;
+
+    auto input_vjp = [input_axis_begin, input_axis_size, axis, input_shape](const Tensor& upstream_gradient) {
+      Tensor input_gradient(input_shape);
+      size_t outer_block_count      = 1;
+      size_t inner_block_size       = 1;
+      const size_t output_axis_size = upstream_gradient.shape[axis];
+      for (size_t dimension = 0; dimension < axis; ++dimension)
+        outer_block_count *= upstream_gradient.shape[dimension];
+      for (size_t dimension = axis + 1; dimension < upstream_gradient.shape.size(); ++dimension)
+        inner_block_size *= upstream_gradient.shape[dimension];
+
+      const size_t input_block_size = input_axis_size * inner_block_size;
+      for (size_t outer = 0; outer < outer_block_count; ++outer)
+      {
+        const size_t output_begin = outer * output_axis_size * inner_block_size + input_axis_begin * inner_block_size;
+        std::copy(upstream_gradient.x.begin() + output_begin,
+                  upstream_gradient.x.begin() + output_begin + input_block_size,
+                  input_gradient.x.begin() + outer * input_block_size);
+      }
+      return input_gradient;
+    };
+
+    parent_edges.push_back({input, std::move(input_vjp)});
   }
-  return node(v, d1, d2, std::move(edges));
+
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
 
 // Dense and self-attention kernels used by the PsiFormer feature layers.
-NP linear(const NP& a, const NP& w, const NP& b = nullptr)
+NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias = nullptr)
 {
-  size_t I = a->value.shape.back(), O = w->value.shape[1], rows = a->value.size() / I;
-  Shape sh  = a->value.shape;
-  sh.back() = O;
-  Tensor v(sh);
-  for (size_t r = 0; r < rows; ++r)
-    for (size_t o = 0; o < O; ++o)
-      for (size_t i = 0; i < I; ++i)
-        v.x[r * O + o] += a->value.x[r * I + i] * w->value.x[i * O + o];
-  Tensor d1, d2;
-  if (!a->d1.empty())
+  const size_t input_width  = input->value.shape.back();
+  const size_t output_width = weight->value.shape[1];
+  const size_t row_count    = input->value.size() / input_width;
+
+  Shape output_shape  = input->value.shape;
+  output_shape.back() = output_width;
+
+  // Forward dense layer: each leading-index row is multiplied by the shared
+  // [input_width, output_width] weight matrix.
+  Tensor value(output_shape);
+  for (size_t row = 0; row < row_count; ++row)
+    for (size_t output_column = 0; output_column < output_width; ++output_column)
+      for (size_t input_column = 0; input_column < input_width; ++input_column)
+        value.x[row * output_width + output_column] += input->value.x[row * input_width + input_column] *
+            weight->value.x[input_column * output_width + output_column];
+
+  // Model parameters are coordinate-independent, so only the input jets pass
+  // through the weight matrix.
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  if (!input->d1.empty())
   {
-    size_t C = a->d1.shape[0];
-    Shape js{C};
-    js.insert(js.end(), sh.begin(), sh.end());
-    d1 = Tensor(js);
-    d2 = Tensor(js);
-    for (size_t c = 0; c < C; ++c)
-      for (size_t r = 0; r < rows; ++r)
-        for (size_t o = 0; o < O; ++o)
-          for (size_t i = 0; i < I; ++i)
+    const size_t coordinate_count = input->d1.shape[0];
+    Shape jet_shape{coordinate_count};
+    jet_shape.insert(jet_shape.end(), output_shape.begin(), output_shape.end());
+    first_coordinate_derivative  = Tensor(jet_shape);
+    second_coordinate_derivative = Tensor(jet_shape);
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t row = 0; row < row_count; ++row)
+        for (size_t output_column = 0; output_column < output_width; ++output_column)
+          for (size_t input_column = 0; input_column < input_width; ++input_column)
           {
-            d1.x[c * v.size() + r * O + o] += a->d1.x[c * a->value.size() + r * I + i] * w->value.x[i * O + o];
-            d2.x[c * v.size() + r * O + o] += a->d2.x[c * a->value.size() + r * I + i] * w->value.x[i * O + o];
+            const size_t output_index   = coordinate * value.size() + row * output_width + output_column;
+            const size_t input_index    = coordinate * input->value.size() + row * input_width + input_column;
+            const double weight_element = weight->value.x[input_column * output_width + output_column];
+            first_coordinate_derivative.x[output_index] += input->d1.x[input_index] * weight_element;
+            second_coordinate_derivative.x[output_index] += input->d2.x[input_index] * weight_element;
           }
   }
-  auto out = node(v, d1, d2,
-                  {{a,
-                    [wv = w->value, I, O, sha = a->value.shape](const Tensor& g) {
-                      size_t rows = g.size() / O;
-                      Tensor z(sha);
-                      for (size_t r = 0; r < rows; ++r)
-                        for (size_t i = 0; i < I; ++i)
-                          for (size_t o = 0; o < O; ++o)
-                            z.x[r * I + i] += g.x[r * O + o] * wv.x[i * O + o];
-                      return z;
-                    }},
-                   {w, [av = a->value, I, O](const Tensor& g) {
-                      size_t rows = g.size() / O;
-                      Tensor z({I, O});
-                      for (size_t i = 0; i < I; ++i)
-                        for (size_t o = 0; o < O; ++o)
-                          for (size_t r = 0; r < rows; ++r)
-                            z.x[i * O + o] += av.x[r * I + i] * g.x[r * O + o];
-                      return z;
-                    }}});
-  return b ? add(out, b) : out;
+
+  // Reverse-mode contribution to the input is upstream * weight^T.
+  const Tensor weight_value = weight->value;
+  const Shape input_shape   = input->value.shape;
+  auto input_vjp            = [weight_value, input_shape, input_width, output_width](const Tensor& upstream_gradient) {
+    const size_t row_count = upstream_gradient.size() / output_width;
+    Tensor input_gradient(input_shape);
+    for (size_t row = 0; row < row_count; ++row)
+      for (size_t input_column = 0; input_column < input_width; ++input_column)
+        for (size_t output_column = 0; output_column < output_width; ++output_column)
+          input_gradient.x[row * input_width + input_column] +=
+              upstream_gradient.x[row * output_width + output_column] *
+              weight_value.x[input_column * output_width + output_column];
+    return input_gradient;
+  };
+
+  // Reverse-mode contribution to the shared weight sums input^T * upstream
+  // over every leading-index row.
+  const Tensor input_value = input->value;
+  auto weight_vjp          = [input_value, input_width, output_width](const Tensor& upstream_gradient) {
+    const size_t row_count = upstream_gradient.size() / output_width;
+    Tensor weight_gradient({input_width, output_width});
+    for (size_t input_column = 0; input_column < input_width; ++input_column)
+      for (size_t output_column = 0; output_column < output_width; ++output_column)
+        for (size_t row = 0; row < row_count; ++row)
+          weight_gradient.x[input_column * output_width + output_column] +=
+              input_value.x[row * input_width + input_column] * upstream_gradient.x[row * output_width + output_column];
+    return weight_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}, {weight, std::move(weight_vjp)}};
+  NodePtr output = node(std::move(value), std::move(first_coordinate_derivative),
+                        std::move(second_coordinate_derivative), std::move(parent_edges));
+
+  // Bias addition is represented as its own graph operation so broadcasting
+  // and the bias VJP follow the same rules as every other addition.
+  return bias ? add(output, bias) : output;
 }
 
-NP attention_logits(const NP& q, const NP& k)
+NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
 {
-  size_t N = q->value.shape[0], H = q->value.shape[1], D = q->value.shape[2];
-  Tensor v({H, N, N});
-  auto Q = [=](size_t i, size_t h, size_t d) { return (i * H + h) * D + d; };
-  auto V = [=](size_t h, size_t i, size_t j) { return (h * N + i) * N + j; };
-  for (size_t h = 0; h < H; ++h)
-    for (size_t i = 0; i < N; ++i)
-      for (size_t j = 0; j < N; ++j)
-        for (size_t d = 0; d < D; ++d)
-          v.x[V(h, i, j)] += q->value.x[Q(i, h, d)] * k->value.x[Q(j, h, d)];
-  Tensor d1, d2;
-  if (!q->d1.empty())
+  const size_t electron_count = query->value.shape[0];
+  const size_t head_count     = query->value.shape[1];
+  const size_t head_width     = query->value.shape[2];
+
+  auto feature_index = [=](size_t electron, size_t head, size_t feature) {
+    return (electron * head_count + head) * head_width + feature;
+  };
+
+  auto logit_index = [=](size_t head, size_t query_electron, size_t key_electron) {
+    return (head * electron_count + query_electron) * electron_count + key_electron;
+  };
+
+  // For each head, construct Q K^T over all ordered electron pairs.
+  Tensor value({head_count, electron_count, electron_count});
+  for (size_t head = 0; head < head_count; ++head)
+    for (size_t query_electron = 0; query_electron < electron_count; ++query_electron)
+      for (size_t key_electron = 0; key_electron < electron_count; ++key_electron)
+        for (size_t feature = 0; feature < head_width; ++feature)
+          value.x[logit_index(head, query_electron, key_electron)] +=
+              query->value.x[feature_index(query_electron, head, feature)] *
+              key->value.x[feature_index(key_electron, head, feature)];
+
+  // Apply the product rule to the query/key coordinate jets.
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  if (!query->d1.empty())
   {
-    size_t C = q->d1.shape[0];
-    d1       = Tensor({C, H, N, N});
-    d2       = Tensor({C, H, N, N});
-    for (size_t c = 0; c < C; ++c)
-      for (size_t h = 0; h < H; ++h)
-        for (size_t i = 0; i < N; ++i)
-          for (size_t j = 0; j < N; ++j)
-            for (size_t d = 0; d < D; ++d)
+    const size_t coordinate_count = query->d1.shape[0];
+    first_coordinate_derivative   = Tensor({coordinate_count, head_count, electron_count, electron_count});
+    second_coordinate_derivative  = Tensor({coordinate_count, head_count, electron_count, electron_count});
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t head = 0; head < head_count; ++head)
+        for (size_t query_electron = 0; query_electron < electron_count; ++query_electron)
+          for (size_t key_electron = 0; key_electron < electron_count; ++key_electron)
+            for (size_t feature = 0; feature < head_width; ++feature)
             {
-              size_t o = c * v.size() + V(h, i, j), qi = c * q->value.size() + Q(i, h, d),
-                     kj = c * k->value.size() + Q(j, h, d);
-              d1.x[o] += q->d1.x[qi] * k->value.x[Q(j, h, d)] + q->value.x[Q(i, h, d)] * k->d1.x[kj];
-              d2.x[o] += q->d2.x[qi] * k->value.x[Q(j, h, d)] + 2 * q->d1.x[qi] * k->d1.x[kj] +
-                  q->value.x[Q(i, h, d)] * k->d2.x[kj];
+              const size_t output_index = coordinate * value.size() + logit_index(head, query_electron, key_electron);
+              const size_t query_value_index = feature_index(query_electron, head, feature);
+              const size_t key_value_index   = feature_index(key_electron, head, feature);
+              const size_t query_jet_index   = coordinate * query->value.size() + query_value_index;
+              const size_t key_jet_index     = coordinate * key->value.size() + key_value_index;
+
+              first_coordinate_derivative.x[output_index] +=
+                  query->d1.x[query_jet_index] * key->value.x[key_value_index] +
+                  query->value.x[query_value_index] * key->d1.x[key_jet_index];
+              second_coordinate_derivative.x[output_index] +=
+                  query->d2.x[query_jet_index] * key->value.x[key_value_index] +
+                  2 * query->d1.x[query_jet_index] * key->d1.x[key_jet_index] +
+                  query->value.x[query_value_index] * key->d2.x[key_jet_index];
             }
   }
-  return node(v, d1, d2,
-              {{q,
-                [kv = k->value, N, H, D, Q, V](const Tensor& g) {
-                  Tensor z({N, H, D});
-                  for (size_t i = 0; i < N; ++i)
-                    for (size_t h = 0; h < H; ++h)
-                      for (size_t d = 0; d < D; ++d)
-                        for (size_t j = 0; j < N; ++j)
-                          z.x[Q(i, h, d)] += g.x[V(h, i, j)] * kv.x[Q(j, h, d)];
-                  return z;
-                }},
-               {k, [qv = q->value, N, H, D, Q, V](const Tensor& g) {
-                  Tensor z({N, H, D});
-                  for (size_t j = 0; j < N; ++j)
-                    for (size_t h = 0; h < H; ++h)
-                      for (size_t d = 0; d < D; ++d)
-                        for (size_t i = 0; i < N; ++i)
-                          z.x[Q(j, h, d)] += g.x[V(h, i, j)] * qv.x[Q(i, h, d)];
-                  return z;
-                }}});
+
+  const Tensor key_value = key->value;
+  auto query_vjp         = [key_value, electron_count, head_count, head_width, feature_index,
+                    logit_index](const Tensor& upstream_gradient) {
+    Tensor query_gradient({electron_count, head_count, head_width});
+    for (size_t query_electron = 0; query_electron < electron_count; ++query_electron)
+      for (size_t head = 0; head < head_count; ++head)
+        for (size_t feature = 0; feature < head_width; ++feature)
+          for (size_t key_electron = 0; key_electron < electron_count; ++key_electron)
+            query_gradient.x[feature_index(query_electron, head, feature)] +=
+                upstream_gradient.x[logit_index(head, query_electron, key_electron)] *
+                key_value.x[feature_index(key_electron, head, feature)];
+    return query_gradient;
+  };
+
+  const Tensor query_value = query->value;
+  auto key_vjp             = [query_value, electron_count, head_count, head_width, feature_index,
+                  logit_index](const Tensor& upstream_gradient) {
+    Tensor key_gradient({electron_count, head_count, head_width});
+    for (size_t key_electron = 0; key_electron < electron_count; ++key_electron)
+      for (size_t head = 0; head < head_count; ++head)
+        for (size_t feature = 0; feature < head_width; ++feature)
+          for (size_t query_electron = 0; query_electron < electron_count; ++query_electron)
+            key_gradient.x[feature_index(key_electron, head, feature)] +=
+                upstream_gradient.x[logit_index(head, query_electron, key_electron)] *
+                query_value.x[feature_index(query_electron, head, feature)];
+    return key_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{query, std::move(query_vjp)}, {key, std::move(key_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
 
-NP attention_context(const NP& w, const NP& val)
+NodePtr attention_context(const NodePtr& attention_weight, const NodePtr& feature_value)
 {
-  size_t H = w->value.shape[0], N = w->value.shape[1], D = val->value.shape[2];
-  auto W = [=](size_t h, size_t i, size_t j) { return (h * N + i) * N + j; };
-  auto V = [=](size_t i, size_t h, size_t d) { return (i * H + h) * D + d; };
-  Tensor out({N, H, D});
-  for (size_t i = 0; i < N; ++i)
-    for (size_t h = 0; h < H; ++h)
-      for (size_t d = 0; d < D; ++d)
-        for (size_t j = 0; j < N; ++j)
-          out.x[V(i, h, d)] += w->value.x[W(h, i, j)] * val->value.x[V(j, h, d)];
-  Tensor d1, d2;
-  if (!w->d1.empty())
+  const size_t head_count     = attention_weight->value.shape[0];
+  const size_t electron_count = attention_weight->value.shape[1];
+  const size_t head_width     = feature_value->value.shape[2];
+
+  auto weight_index = [=](size_t head, size_t output_electron, size_t source_electron) {
+    return (head * electron_count + output_electron) * electron_count + source_electron;
+  };
+
+  auto feature_index = [=](size_t electron, size_t head, size_t feature) {
+    return (electron * head_count + head) * head_width + feature;
+  };
+
+  // Weighted aggregation over source electrons for every output electron/head.
+  Tensor value({electron_count, head_count, head_width});
+  for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
+    for (size_t head = 0; head < head_count; ++head)
+      for (size_t feature = 0; feature < head_width; ++feature)
+        for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
+          value.x[feature_index(output_electron, head, feature)] +=
+              attention_weight->value.x[weight_index(head, output_electron, source_electron)] *
+              feature_value->value.x[feature_index(source_electron, head, feature)];
+
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  if (!attention_weight->d1.empty())
   {
-    size_t C = w->d1.shape[0];
-    d1       = Tensor({C, N, H, D});
-    d2       = Tensor({C, N, H, D});
-    for (size_t c = 0; c < C; ++c)
-      for (size_t i = 0; i < N; ++i)
-        for (size_t h = 0; h < H; ++h)
-          for (size_t d = 0; d < D; ++d)
-            for (size_t j = 0; j < N; ++j)
+    const size_t coordinate_count = attention_weight->d1.shape[0];
+    first_coordinate_derivative   = Tensor({coordinate_count, electron_count, head_count, head_width});
+    second_coordinate_derivative  = Tensor({coordinate_count, electron_count, head_count, head_width});
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
+        for (size_t head = 0; head < head_count; ++head)
+          for (size_t feature = 0; feature < head_width; ++feature)
+            for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
             {
-              size_t o = c * out.size() + V(i, h, d), wi = c * w->value.size() + W(h, i, j),
-                     vi = c * val->value.size() + V(j, h, d);
-              d1.x[o] += w->d1.x[wi] * val->value.x[V(j, h, d)] + w->value.x[W(h, i, j)] * val->d1.x[vi];
-              d2.x[o] += w->d2.x[wi] * val->value.x[V(j, h, d)] + 2 * w->d1.x[wi] * val->d1.x[vi] +
-                  w->value.x[W(h, i, j)] * val->d2.x[vi];
+              const size_t output_index = coordinate * value.size() + feature_index(output_electron, head, feature);
+              const size_t weight_value_index  = weight_index(head, output_electron, source_electron);
+              const size_t feature_value_index = feature_index(source_electron, head, feature);
+              const size_t weight_jet_index    = coordinate * attention_weight->value.size() + weight_value_index;
+              const size_t feature_jet_index   = coordinate * feature_value->value.size() + feature_value_index;
+
+              first_coordinate_derivative.x[output_index] +=
+                  attention_weight->d1.x[weight_jet_index] * feature_value->value.x[feature_value_index] +
+                  attention_weight->value.x[weight_value_index] * feature_value->d1.x[feature_jet_index];
+              second_coordinate_derivative.x[output_index] +=
+                  attention_weight->d2.x[weight_jet_index] * feature_value->value.x[feature_value_index] +
+                  2 * attention_weight->d1.x[weight_jet_index] * feature_value->d1.x[feature_jet_index] +
+                  attention_weight->value.x[weight_value_index] * feature_value->d2.x[feature_jet_index];
             }
   }
-  return node(out, d1, d2,
-              {{w,
-                [vv = val->value, H, N, D, W, V](const Tensor& g) {
-                  Tensor z({H, N, N});
-                  for (size_t h = 0; h < H; ++h)
-                    for (size_t i = 0; i < N; ++i)
-                      for (size_t j = 0; j < N; ++j)
-                        for (size_t d = 0; d < D; ++d)
-                          z.x[W(h, i, j)] += g.x[V(i, h, d)] * vv.x[V(j, h, d)];
-                  return z;
-                }},
-               {val, [wv = w->value, H, N, D, W, V](const Tensor& g) {
-                  Tensor z({N, H, D});
-                  for (size_t j = 0; j < N; ++j)
-                    for (size_t h = 0; h < H; ++h)
-                      for (size_t d = 0; d < D; ++d)
-                        for (size_t i = 0; i < N; ++i)
-                          z.x[V(j, h, d)] += wv.x[W(h, i, j)] * g.x[V(i, h, d)];
-                  return z;
-                }}});
+
+  const Tensor feature_value_tensor = feature_value->value;
+  auto attention_weight_vjp         = [feature_value_tensor, electron_count, head_count, head_width, weight_index,
+                               feature_index](const Tensor& upstream_gradient) {
+    Tensor weight_gradient({head_count, electron_count, electron_count});
+    for (size_t head = 0; head < head_count; ++head)
+      for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
+        for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
+          for (size_t feature = 0; feature < head_width; ++feature)
+            weight_gradient.x[weight_index(head, output_electron, source_electron)] +=
+                upstream_gradient.x[feature_index(output_electron, head, feature)] *
+                feature_value_tensor.x[feature_index(source_electron, head, feature)];
+    return weight_gradient;
+  };
+
+  const Tensor attention_weight_value = attention_weight->value;
+  auto feature_value_vjp              = [attention_weight_value, electron_count, head_count, head_width, weight_index,
+                            feature_index](const Tensor& upstream_gradient) {
+    Tensor feature_gradient({electron_count, head_count, head_width});
+    for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
+      for (size_t head = 0; head < head_count; ++head)
+        for (size_t feature = 0; feature < head_width; ++feature)
+          for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
+            feature_gradient.x[feature_index(source_electron, head, feature)] +=
+                attention_weight_value.x[weight_index(head, output_electron, source_electron)] *
+                upstream_gradient.x[feature_index(output_electron, head, feature)];
+    return feature_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{attention_weight, std::move(attention_weight_vjp)},
+                                 {feature_value, std::move(feature_value_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
 
-NP softmax(const NP& a)
+NodePtr softmax(const NodePtr& input)
 {
-  // Subtracting the row maximum avoids overflow without changing the normalized
-  // weights.
-  size_t K = a->value.shape.back(), rows = a->value.size() / K;
-  Tensor v(a->value.shape);
-  for (size_t r = 0; r < rows; ++r)
+  const size_t row_width = input->value.shape.back();
+  const size_t row_count = input->value.size() / row_width;
+  Tensor value(input->value.shape);
+
+  // Compute a numerically stable softmax independently along each final-axis
+  // row by subtracting its maximum before exponentiation.
+  for (size_t row = 0; row < row_count; ++row)
   {
-    double m = *std::max_element(a->value.x.begin() + r * K, a->value.x.begin() + (r + 1) * K), s = 0;
-    for (size_t k = 0; k < K; ++k)
-      s += (v.x[r * K + k] = std::exp(a->value.x[r * K + k] - m));
-    for (size_t k = 0; k < K; ++k)
-      v.x[r * K + k] /= s;
+    const auto row_begin     = input->value.x.begin() + row * row_width;
+    const double row_maximum = *std::max_element(row_begin, row_begin + row_width);
+    double normalization     = 0;
+    for (size_t column = 0; column < row_width; ++column)
+    {
+      const size_t index = row * row_width + column;
+      value.x[index]     = std::exp(input->value.x[index] - row_maximum);
+      normalization += value.x[index];
+    }
+    for (size_t column = 0; column < row_width; ++column)
+      value.x[row * row_width + column] /= normalization;
   }
-  Tensor d1, d2;
-  if (!a->d1.empty())
+
+  // Propagate coordinate jets using softmax-weighted first and second moments.
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  if (!input->d1.empty())
   {
-    size_t C = a->d1.shape[0];
-    d1       = Tensor(a->d1.shape);
-    d2       = Tensor(a->d2.shape);
-    for (size_t c = 0; c < C; ++c)
-      for (size_t r = 0; r < rows; ++r)
+    const size_t coordinate_count = input->d1.shape[0];
+    first_coordinate_derivative   = Tensor(input->d1.shape);
+    second_coordinate_derivative  = Tensor(input->d2.shape);
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t row = 0; row < row_count; ++row)
       {
-        double m1 = 0, m2 = 0;
-        for (size_t k = 0; k < K; ++k)
+        double weighted_first_moment  = 0;
+        double weighted_second_moment = 0;
+        for (size_t column = 0; column < row_width; ++column)
         {
-          size_t z = c * a->value.size() + r * K + k;
-          m1 += v.x[r * K + k] * a->d1.x[z];
-          m2 += v.x[r * K + k] * (a->d2.x[z] + a->d1.x[z] * a->d1.x[z]);
+          const size_t value_index = row * row_width + column;
+          const size_t jet_index   = coordinate * input->value.size() + value_index;
+          weighted_first_moment += value.x[value_index] * input->d1.x[jet_index];
+          weighted_second_moment +=
+              value.x[value_index] * (input->d2.x[jet_index] + input->d1.x[jet_index] * input->d1.x[jet_index]);
         }
-        m2 -= m1 * m1;
-        for (size_t k = 0; k < K; ++k)
+        weighted_second_moment -= weighted_first_moment * weighted_first_moment;
+
+        for (size_t column = 0; column < row_width; ++column)
         {
-          size_t z    = c * a->value.size() + r * K + k;
-          double cent = a->d1.x[z] - m1;
-          d1.x[z]     = v.x[r * K + k] * cent;
-          d2.x[z]     = v.x[r * K + k] * (cent * cent + a->d2.x[z] - m2);
+          const size_t value_index                  = row * row_width + column;
+          const size_t jet_index                    = coordinate * input->value.size() + value_index;
+          const double centered_first_derivative    = input->d1.x[jet_index] - weighted_first_moment;
+          first_coordinate_derivative.x[jet_index]  = value.x[value_index] * centered_first_derivative;
+          second_coordinate_derivative.x[jet_index] = value.x[value_index] *
+              (centered_first_derivative * centered_first_derivative + input->d2.x[jet_index] - weighted_second_moment);
         }
       }
   }
-  return node(v, d1, d2, {{a, [v, K, rows](const Tensor& g) {
-                             Tensor z(g.shape);
-                             for (size_t r = 0; r < rows; ++r)
-                             {
-                               double dot = 0;
-                               for (size_t k = 0; k < K; ++k)
-                                 dot += g.x[r * K + k] * v.x[r * K + k];
-                               for (size_t k = 0; k < K; ++k)
-                                 z.x[r * K + k] = v.x[r * K + k] * (g.x[r * K + k] - dot);
-                             }
-                             return z;
-                           }}});
+
+  // Jacobian-vector product for one softmax row:
+  // dL/dx_i = y_i (dL/dy_i - sum_j dL/dy_j y_j).
+  auto input_vjp = [value, row_width, row_count](const Tensor& upstream_gradient) {
+    Tensor input_gradient(upstream_gradient.shape);
+    for (size_t row = 0; row < row_count; ++row)
+    {
+      double weighted_upstream_sum = 0;
+      for (size_t column = 0; column < row_width; ++column)
+      {
+        const size_t index = row * row_width + column;
+        weighted_upstream_sum += upstream_gradient.x[index] * value.x[index];
+      }
+      for (size_t column = 0; column < row_width; ++column)
+      {
+        const size_t index      = row * row_width + column;
+        input_gradient.x[index] = value.x[index] * (upstream_gradient.x[index] - weighted_upstream_sum);
+      }
+    }
+    return input_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{input, std::move(input_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
 
-std::pair<double, std::vector<double>> det_inv(const double* A, size_t n)
+std::pair<double, std::vector<double>> det_inv(const double* matrix, size_t matrix_size)
 {
-  std::vector<double> m(A, A + n * n), inv(n * n);
-  for (size_t i = 0; i < n; ++i)
-    inv[i * n + i] = 1;
-  double det = 1;
-  int sign   = 1;
-  for (size_t c = 0; c < n; ++c)
+  // Gauss-Jordan elimination with partial pivoting produces the determinant
+  // and inverse together. Matrices are small electron-count orbital matrices.
+  std::vector<double> work(matrix, matrix + matrix_size * matrix_size);
+  std::vector<double> inverse(matrix_size * matrix_size);
+  for (size_t row = 0; row < matrix_size; ++row)
+    inverse[row * matrix_size + row] = 1;
+
+  double determinant   = 1;
+  int permutation_sign = 1;
+  for (size_t column = 0; column < matrix_size; ++column)
   {
-    size_t p = c;
-    for (size_t r = c + 1; r < n; ++r)
-      if (std::abs(m[r * n + c]) > std::abs(m[p * n + c]))
-        p = r;
-    if (std::abs(m[p * n + c]) < 1e-14)
+    // Select the largest available pivot in this column for stability.
+    size_t pivot_row = column;
+    for (size_t row = column + 1; row < matrix_size; ++row)
+      if (std::abs(work[row * matrix_size + column]) > std::abs(work[pivot_row * matrix_size + column]))
+        pivot_row = row;
+
+    if (std::abs(work[pivot_row * matrix_size + column]) < 1e-14)
       throw std::runtime_error("singular determinant");
-    if (p != c)
+
+    if (pivot_row != column)
     {
-      for (size_t j = 0; j < n; ++j)
+      for (size_t entry = 0; entry < matrix_size; ++entry)
       {
-        std::swap(m[c * n + j], m[p * n + j]);
-        std::swap(inv[c * n + j], inv[p * n + j]);
+        std::swap(work[column * matrix_size + entry], work[pivot_row * matrix_size + entry]);
+        std::swap(inverse[column * matrix_size + entry], inverse[pivot_row * matrix_size + entry]);
       }
-      sign = -sign;
+      permutation_sign = -permutation_sign;
     }
-    double pivot = m[c * n + c];
-    det *= pivot;
-    for (size_t j = 0; j < n; ++j)
+
+    // Normalize the pivot row, tracking the unnormalized pivot in det(A).
+    const double pivot = work[column * matrix_size + column];
+    determinant *= pivot;
+    for (size_t entry = 0; entry < matrix_size; ++entry)
     {
-      m[c * n + j] /= pivot;
-      inv[c * n + j] /= pivot;
+      work[column * matrix_size + entry] /= pivot;
+      inverse[column * matrix_size + entry] /= pivot;
     }
-    for (size_t r = 0; r < n; ++r)
-      if (r != c)
+
+    // Eliminate this column from all non-pivot rows in both work and inverse.
+    for (size_t row = 0; row < matrix_size; ++row)
+      if (row != column)
       {
-        double f = m[r * n + c];
-        for (size_t j = 0; j < n; ++j)
+        const double elimination_factor = work[row * matrix_size + column];
+        for (size_t entry = 0; entry < matrix_size; ++entry)
         {
-          m[r * n + j] -= f * m[c * n + j];
-          inv[r * n + j] -= f * inv[c * n + j];
+          work[row * matrix_size + entry] -= elimination_factor * work[column * matrix_size + entry];
+          inverse[row * matrix_size + entry] -= elimination_factor * inverse[column * matrix_size + entry];
         }
       }
   }
-  return {det * sign, inv};
+
+  return {determinant * permutation_sign, std::move(inverse)};
 }
-double trace_product(const double* A, const double* B, size_t n)
+
+double trace_product(const double* left, const double* right, size_t matrix_size)
 {
-  double z = 0;
-  for (size_t i = 0; i < n; ++i)
-    for (size_t j = 0; j < n; ++j)
-      z += A[i * n + j] * B[j * n + i];
-  return z;
+  double trace = 0;
+  for (size_t row = 0; row < matrix_size; ++row)
+    for (size_t column = 0; column < matrix_size; ++column)
+      trace += left[row * matrix_size + column] * right[column * matrix_size + row];
+  return trace;
 }
+
 // Determinant primitive used to combine the spin-resolved orbital matrices.
-NP determinants(const NP& a)
+NodePtr determinants(const NodePtr& matrices)
 {
-  size_t M = a->value.shape[0], N = a->value.shape[1], nn = N * N;
-  Tensor v({M});
-  std::vector<std::vector<double>> inv(M);
-  for (size_t m = 0; m < M; ++m)
+  const size_t matrix_count             = matrices->value.shape[0];
+  const size_t matrix_size              = matrices->value.shape[1];
+  const size_t element_count_per_matrix = matrix_size * matrix_size;
+
+  // Cache each inverse because it is reused by coordinate derivatives and by
+  // the reverse-mode parameter derivative.
+  Tensor value({matrix_count});
+  std::vector<std::vector<double>> inverses(matrix_count);
+  for (size_t matrix_index = 0; matrix_index < matrix_count; ++matrix_index)
   {
-    auto di = det_inv(a->value.x.data() + m * nn, N);
-    v.x[m]  = di.first;
-    inv[m]  = std::move(di.second);
+    auto determinant_and_inverse =
+        det_inv(matrices->value.x.data() + matrix_index * element_count_per_matrix, matrix_size);
+    value.x[matrix_index]  = determinant_and_inverse.first;
+    inverses[matrix_index] = std::move(determinant_and_inverse.second);
   }
-  Tensor d1, d2;
-  if (!a->d1.empty())
+
+  Tensor first_coordinate_derivative;
+  Tensor second_coordinate_derivative;
+  if (!matrices->d1.empty())
   {
-    size_t C = a->d1.shape[0];
-    d1       = Tensor({C, M});
-    d2       = Tensor({C, M});
-    std::vector<double> tmp(nn);
-    for (size_t c = 0; c < C; ++c)
-      for (size_t m = 0; m < M; ++m)
+    const size_t coordinate_count = matrices->d1.shape[0];
+    first_coordinate_derivative   = Tensor({coordinate_count, matrix_count});
+    second_coordinate_derivative  = Tensor({coordinate_count, matrix_count});
+    std::vector<double> inverse_times_first_derivative(element_count_per_matrix);
+
+    for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+      for (size_t matrix_index = 0; matrix_index < matrix_count; ++matrix_index)
       {
-        auto A1 = a->d1.x.data() + c * a->value.size() + m * nn, A2 = a->d2.x.data() + c * a->value.size() + m * nn;
-        // Apply d(det A) = det(A) tr(A^-1 dA) and its diagonal
-        // second-derivative counterpart to every coordinate jet.
-        double t1 = trace_product(inv[m].data(), A1, N), t2 = trace_product(inv[m].data(), A2, N);
-        for (size_t i = 0; i < N; ++i)
-          for (size_t j = 0; j < N; ++j)
+        const double* matrix_d1 =
+            matrices->d1.x.data() + coordinate * matrices->value.size() + matrix_index * element_count_per_matrix;
+        const double* matrix_d2 =
+            matrices->d2.x.data() + coordinate * matrices->value.size() + matrix_index * element_count_per_matrix;
+
+        // d(det A) = det(A) tr(A^-1 dA). The diagonal second derivative adds
+        // tr(A^-1 d2A) and subtracts tr((A^-1 dA)^2).
+        const double first_trace  = trace_product(inverses[matrix_index].data(), matrix_d1, matrix_size);
+        const double second_trace = trace_product(inverses[matrix_index].data(), matrix_d2, matrix_size);
+        for (size_t row = 0; row < matrix_size; ++row)
+          for (size_t column = 0; column < matrix_size; ++column)
           {
-            tmp[i * N + j] = 0;
-            for (size_t k = 0; k < N; ++k)
-              tmp[i * N + j] += inv[m][i * N + k] * A1[k * N + j];
+            double& product_element = inverse_times_first_derivative[row * matrix_size + column];
+            product_element         = 0;
+            for (size_t inner = 0; inner < matrix_size; ++inner)
+              product_element +=
+                  inverses[matrix_index][row * matrix_size + inner] * matrix_d1[inner * matrix_size + column];
           }
-        double cur      = trace_product(tmp.data(), tmp.data(), N);
-        d1.x[c * M + m] = v.x[m] * t1;
-        d2.x[c * M + m] = v.x[m] * (t1 * t1 + t2 - cur);
+        const double squared_trace =
+            trace_product(inverse_times_first_derivative.data(), inverse_times_first_derivative.data(), matrix_size);
+
+        const size_t output_index                   = coordinate * matrix_count + matrix_index;
+        first_coordinate_derivative.x[output_index] = value.x[matrix_index] * first_trace;
+        second_coordinate_derivative.x[output_index] =
+            value.x[matrix_index] * (first_trace * first_trace + second_trace - squared_trace);
       }
   }
-  return node(v, d1, d2, {{a, [v, inv, M, N, nn](const Tensor& g) {
-                             Tensor z({M, N, N});
-                             for (size_t m = 0; m < M; ++m)
-                               for (size_t i = 0; i < N; ++i)
-                                 for (size_t j = 0; j < N; ++j)
-                                   z.x[m * nn + i * N + j] = g.x[m] * v.x[m] * inv[m][j * N + i];
-                             return z;
-                           }}});
+
+  // d(det A)/dA = det(A) A^-T for each matrix in the determinant batch.
+  auto matrices_vjp = [value, inverses, matrix_count, matrix_size,
+                       element_count_per_matrix](const Tensor& upstream_gradient) {
+    Tensor matrix_gradient({matrix_count, matrix_size, matrix_size});
+    for (size_t matrix_index = 0; matrix_index < matrix_count; ++matrix_index)
+      for (size_t row = 0; row < matrix_size; ++row)
+        for (size_t column = 0; column < matrix_size; ++column)
+          matrix_gradient.x[matrix_index * element_count_per_matrix + row * matrix_size + column] =
+              upstream_gradient.x[matrix_index] * value.x[matrix_index] *
+              inverses[matrix_index][column * matrix_size + row];
+    return matrix_gradient;
+  };
+
+  std::vector<Edge> parent_edges{{matrices, std::move(matrices_vjp)}};
+  return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
+              std::move(parent_edges));
 }
 
 /** Reverse-accumulate adjoints from a scalar output through the recorded VJP
  * graph. */
-std::unordered_map<const Node*, Tensor> backward(const NP& root)
+std::unordered_map<const Node*, Tensor> backward(const NodePtr& root)
 {
-  std::vector<NP> topo;
-  std::unordered_map<const Node*, bool> seen;
-  std::function<void(const NP&)> visit = [&](const NP& n) {
-    if (seen[n.get()])
+  // Build a topological ordering once so every child contribution is available
+  // before its parents are visited in reverse order.
+  std::vector<NodePtr> topological_order;
+  std::unordered_map<const Node*, bool> visited;
+  std::function<void(const NodePtr&)> visit = [&](const NodePtr& current) {
+    if (visited[current.get()])
       return;
-    seen[n.get()] = true;
-    for (auto& e : n->parents)
-      visit(e.parent);
-    topo.push_back(n);
+    visited[current.get()] = true;
+    for (const Edge& edge : current->parents)
+      visit(edge.parent);
+    topological_order.push_back(current);
   };
   visit(root);
-  std::unordered_map<const Node*, Tensor> adj;
-  adj[root.get()] = Tensor(root->value.shape, 1);
-  for (auto it = topo.rbegin(); it != topo.rend(); ++it)
+
+  // Seed the scalar output with an all-ones adjoint and accumulate every VJP
+  // contribution into the corresponding parent node.
+  std::unordered_map<const Node*, Tensor> adjoints;
+  adjoints[root.get()] = Tensor(root->value.shape, 1);
+  for (auto node_it = topological_order.rbegin(); node_it != topological_order.rend(); ++node_it)
   {
-    auto f = adj.find(it->get());
-    if (f == adj.end())
+    const auto current_adjoint = adjoints.find(node_it->get());
+    if (current_adjoint == adjoints.end())
       continue;
-    for (auto& e : (*it)->parents)
+
+    for (const Edge& edge : (*node_it)->parents)
     {
-      Tensor c = e.vjp(f->second);
-      auto p   = adj.find(e.parent.get());
-      if (p == adj.end())
-        adj[e.parent.get()] = std::move(c);
+      Tensor contribution = edge.vjp(current_adjoint->second);
+      auto parent_adjoint = adjoints.find(edge.parent.get());
+      if (parent_adjoint == adjoints.end())
+        adjoints[edge.parent.get()] = std::move(contribution);
       else
-        for (size_t i = 0; i < c.size(); ++i)
-          p->second.x[i] += c.x[i];
+        for (size_t element = 0; element < contribution.size(); ++element)
+          parent_adjoint->second.x[element] += contribution.x[element];
     }
   }
-  return adj;
+  return adjoints;
 }
 
 // HDF5 import helpers for the flattened DeepQMC parameter export and
 // configuration data.
 std::vector<double> read_double(hid_t file, const std::string& path, Shape* shape = nullptr)
 {
-  hid_t d = H5Dopen2(file, path.c_str(), H5P_DEFAULT), s = H5Dget_space(d);
-  int n = H5Sget_simple_extent_ndims(s);
-  std::vector<hsize_t> dims(n);
-  H5Sget_simple_extent_dims(s, dims.data(), nullptr);
-  Shape sh(dims.begin(), dims.end());
-  std::vector<double> v(product(sh));
-  H5Dread(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, v.data());
-  H5Sclose(s);
-  H5Dclose(d);
+  const hid_t dataset   = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
+  const hid_t dataspace = H5Dget_space(dataset);
+  const int rank        = H5Sget_simple_extent_ndims(dataspace);
+
+  std::vector<hsize_t> dimensions(rank);
+  H5Sget_simple_extent_dims(dataspace, dimensions.data(), nullptr);
+  const Shape dataset_shape(dimensions.begin(), dimensions.end());
+
+  std::vector<double> values(product(dataset_shape));
+  H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+  H5Sclose(dataspace);
+  H5Dclose(dataset);
+
   if (shape)
-    *shape = sh;
-  return v;
+    *shape = dataset_shape;
+  return values;
 }
+
 std::vector<int64_t> read_i64(hid_t file, const std::string& path, Shape* shape = nullptr)
 {
-  hid_t d = H5Dopen2(file, path.c_str(), H5P_DEFAULT), s = H5Dget_space(d);
-  int n = H5Sget_simple_extent_ndims(s);
-  std::vector<hsize_t> dims(n);
-  H5Sget_simple_extent_dims(s, dims.data(), nullptr);
-  Shape sh(dims.begin(), dims.end());
-  std::vector<int64_t> v(product(sh));
-  H5Dread(d, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, v.data());
-  H5Sclose(s);
-  H5Dclose(d);
+  const hid_t dataset   = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
+  const hid_t dataspace = H5Dget_space(dataset);
+  const int rank        = H5Sget_simple_extent_ndims(dataspace);
+
+  std::vector<hsize_t> dimensions(rank);
+  H5Sget_simple_extent_dims(dataspace, dimensions.data(), nullptr);
+  const Shape dataset_shape(dimensions.begin(), dimensions.end());
+
+  std::vector<int64_t> values(product(dataset_shape));
+  H5Dread(dataset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+  H5Sclose(dataspace);
+  H5Dclose(dataset);
+
   if (shape)
-    *shape = sh;
-  return v;
+    *shape = dataset_shape;
+  return values;
 }
+
 std::vector<std::string> read_strings(hid_t file, const std::string& path)
 {
-  hid_t d = H5Dopen2(file, path.c_str(), H5P_DEFAULT), s = H5Dget_space(d);
-  hsize_t n;
-  H5Sget_simple_extent_dims(s, &n, nullptr);
-  hid_t t = H5Dget_type(d);
-  std::vector<char*> p(n);
-  H5Dread(d, t, H5S_ALL, H5S_ALL, H5P_DEFAULT, p.data());
-  std::vector<std::string> v;
-  for (auto x : p)
-    v.emplace_back(x);
-  H5Dvlen_reclaim(t, s, H5P_DEFAULT, p.data());
-  H5Tclose(t);
-  H5Sclose(s);
-  H5Dclose(d);
-  return v;
+  const hid_t dataset   = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
+  const hid_t dataspace = H5Dget_space(dataset);
+  hsize_t string_count;
+  H5Sget_simple_extent_dims(dataspace, &string_count, nullptr);
+
+  const hid_t string_type = H5Dget_type(dataset);
+  std::vector<char*> raw_strings(string_count);
+  H5Dread(dataset, string_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw_strings.data());
+
+  std::vector<std::string> strings;
+  strings.reserve(string_count);
+  for (const char* raw_string : raw_strings)
+    strings.emplace_back(raw_string);
+
+  // Variable-length HDF5 strings are library-owned allocations and must be
+  // reclaimed with the matching datatype and dataspace.
+  H5Dvlen_reclaim(string_type, dataspace, H5P_DEFAULT, raw_strings.data());
+  H5Tclose(string_type);
+  H5Sclose(dataspace);
+  H5Dclose(dataset);
+  return strings;
 }
+
 int64_t read_attr_i64(hid_t file, const std::string& name)
 {
-  hid_t a = H5Aopen(file, name.c_str(), H5P_DEFAULT);
-  int64_t v;
-  H5Aread(a, H5T_NATIVE_LLONG, &v);
-  H5Aclose(a);
-  return v;
+  const hid_t attribute = H5Aopen(file, name.c_str(), H5P_DEFAULT);
+  int64_t value;
+  H5Aread(attribute, H5T_NATIVE_LLONG, &value);
+  H5Aclose(attribute);
+  return value;
 }
 
 struct Layout
 {
-  std::string module, name;
+  std::string module;
+  std::string name;
   Shape shape;
-  size_t begin, end;
+  size_t begin;
+  size_t end;
 };
+
 /** Owns the flat exported parameters and exposes named graph leaves for model
  * assembly. */
 struct Parameters
 {
   std::vector<double> values;
   std::vector<Layout> layouts;
-  std::map<std::pair<std::string, std::string>, NP> nodes;
+  std::map<std::pair<std::string, std::string>, NodePtr> nodes;
+
   explicit Parameters(const std::string& path)
   {
-    hid_t f   = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    values    = read_double(f, "/values");
-    auto mods = read_strings(f, "/layout/modules"), names = read_strings(f, "/layout/names");
-    Shape ss;
-    auto ranks = read_i64(f, "/layout/ranks"), shapes = read_i64(f, "/layout/shapes", &ss),
-         off = read_i64(f, "/layout/offsets");
-    for (size_t i = 0; i < mods.size(); ++i)
+    const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+
+    // Read the single flat parameter array and its parallel layout metadata.
+    values                                 = read_double(file, "/values");
+    const std::vector<std::string> modules = read_strings(file, "/layout/modules");
+    const std::vector<std::string> names   = read_strings(file, "/layout/names");
+    const std::vector<int64_t> ranks       = read_i64(file, "/layout/ranks");
+    Shape shape_table_shape;
+    const std::vector<int64_t> shape_table = read_i64(file, "/layout/shapes", &shape_table_shape);
+    const std::vector<int64_t> offsets     = read_i64(file, "/layout/offsets");
+
+    // Materialize each flattened interval as a named parameter leaf. These
+    // leaves become parents in the reverse-mode graph assembled at evaluation.
+    for (size_t parameter_index = 0; parameter_index < modules.size(); ++parameter_index)
     {
-      Shape sh;
-      for (int r = 0; r < ranks[i]; ++r)
-        sh.push_back(shapes[i * ss[1] + r]);
-      Layout l{mods[i], names[i], sh, size_t(off[i]), size_t(off[i + 1])};
-      std::vector<double> v(values.begin() + l.begin, values.begin() + l.end);
-      auto n           = node(Tensor(sh, std::move(v)));
-      n->parameter_key = mods[i] + "/" + names[i];
-      layouts.push_back(l);
-      nodes[{mods[i], names[i]}] = n;
+      Shape parameter_shape;
+      for (int axis = 0; axis < ranks[parameter_index]; ++axis)
+        parameter_shape.push_back(shape_table[parameter_index * shape_table_shape[1] + axis]);
+
+      Layout layout{modules[parameter_index], names[parameter_index], parameter_shape, size_t(offsets[parameter_index]),
+                    size_t(offsets[parameter_index + 1])};
+      std::vector<double> parameter_values(values.begin() + layout.begin, values.begin() + layout.end);
+      NodePtr parameter_node        = node(Tensor(parameter_shape, std::move(parameter_values)));
+      parameter_node->parameter_key = modules[parameter_index] + "/" + names[parameter_index];
+
+      layouts.push_back(layout);
+      nodes[{modules[parameter_index], names[parameter_index]}] = parameter_node;
     }
-    H5Fclose(f);
+    H5Fclose(file);
   }
-  NP find(const std::string& suffix, const std::string& name)
+
+  NodePtr find(const std::string& suffix, const std::string& name)
   {
     // DeepQMC/Haiku module paths contain generated prefixes. A unique suffix
-    // plus the parameter name identifies the corresponding weight or bias
-    // robustly.
-    NP hit;
-    int count = 0;
-    for (auto& [k, n] : nodes)
-      if (k.second == name && k.first.size() >= suffix.size() &&
-          k.first.compare(k.first.size() - suffix.size(), suffix.size(), suffix) == 0)
+    // plus the parameter name identifies the corresponding weight or bias.
+    NodePtr match;
+    int match_count = 0;
+    for (auto& [key, parameter_node] : nodes)
+      if (key.second == name && key.first.size() >= suffix.size() &&
+          key.first.compare(key.first.size() - suffix.size(), suffix.size(), suffix) == 0)
       {
-        hit = n;
-        ++count;
+        match = parameter_node;
+        ++match_count;
       }
-    if (count != 1)
-      throw std::runtime_error("parameter lookup " + suffix + "/" + name + " count=" + std::to_string(count));
-    return hit;
+
+    if (match_count != 1)
+      throw std::runtime_error("parameter lookup " + suffix + "/" + name + " count=" + std::to_string(match_count));
+    return match;
   }
-  std::vector<double> flat_gradient(const std::unordered_map<const Node*, Tensor>& adj)
+
+  std::vector<double> flat_gradient(const std::unordered_map<const Node*, Tensor>& adjoints)
   {
-    std::vector<double> g(values.size());
-    for (auto& l : layouts)
+    // Reassemble named parameter adjoints in exactly the order of the exported
+    // flat parameter vector.
+    std::vector<double> flat_gradient(values.size());
+    for (const Layout& layout : layouts)
     {
-      auto n  = nodes[{l.module, l.name}];
-      auto it = adj.find(n.get());
-      if (it != adj.end())
-        std::copy(it->second.x.begin(), it->second.x.end(), g.begin() + l.begin);
+      const NodePtr parameter_node = nodes[{layout.module, layout.name}];
+      const auto adjoint           = adjoints.find(parameter_node.get());
+      if (adjoint != adjoints.end())
+        std::copy(adjoint->second.x.begin(), adjoint->second.x.end(), flat_gradient.begin() + layout.begin);
     }
-    return g;
+    return flat_gradient;
   }
 };
 
@@ -1039,297 +1480,445 @@ struct Parameters
  * HDF5 file. */
 struct ConfigData
 {
-  Tensor electrons, nuclei, charges;
-  size_t nup, ndown, nconfig;
+  Tensor electrons;
+  Tensor nuclei;
+  Tensor charges;
+  size_t nup;
+  size_t ndown;
+  size_t nconfig;
+
   explicit ConfigData(const std::string& path)
   {
-    hid_t f = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    Shape s;
-    electrons   = Tensor((read_double(f, "/electron_positions", &s), s));
-    electrons.x = read_double(f, "/electron_positions");
-    nconfig     = s[0];
-    nuclei.x    = read_double(f, "/nuclear_positions", &nuclei.shape);
-    charges.x   = read_double(f, "/nuclear_charges", &charges.shape);
-    nup         = read_attr_i64(f, "n_up");
-    ndown       = read_attr_i64(f, "n_down");
-    H5Fclose(f);
+    const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+
+    // Preserve complete tensor shapes while reading the physical system and
+    // the batch of electron configurations used by the validation driver.
+    electrons.x = read_double(file, "/electron_positions", &electrons.shape);
+    nuclei.x    = read_double(file, "/nuclear_positions", &nuclei.shape);
+    charges.x   = read_double(file, "/nuclear_charges", &charges.shape);
+    nup         = read_attr_i64(file, "n_up");
+    ndown       = read_attr_i64(file, "n_down");
+    nconfig     = electrons.shape[0];
+
+    H5Fclose(file);
   }
-  Tensor configuration(size_t c) const
+
+  Tensor configuration(size_t configuration_index) const
   {
-    size_t n = (nup + ndown) * 3;
-    return Tensor({nup + ndown, 3},
-                  std::vector<double>(electrons.x.begin() + c * n, electrons.x.begin() + (c + 1) * n));
+    const size_t configuration_size = (nup + ndown) * 3;
+    const auto begin                = electrons.x.begin() + configuration_index * configuration_size;
+    const auto end                  = begin + configuration_size;
+    return Tensor({nup + ndown, 3}, std::vector<double>(begin, end));
   }
 };
 
 /** Quantities produced by one all-electron PsiFormer evaluation. */
 struct Result
 {
-  double sign, logabs, value, local_energy;
-  std::vector<double> gradient, lap_log, lap_ratio, potential, param_gradient;
+  double sign;
+  double logabs;
+  double value;
+  double local_energy;
+  std::vector<double> gradient;
+  std::vector<double> lap_log;
+  std::vector<double> lap_ratio;
+  std::vector<double> potential;
+  std::vector<double> param_gradient;
 };
+
 /** Builds and evaluates the four-block PsiFormer wavefunction from imported
  * parameters. */
 struct PsiFormer
 {
-  Parameters p;
-  ConfigData cfg;
-  size_t ne, ndet = 16, dim = 256, heads = 4;
-  PsiFormer(const std::string& pp, const std::string& cp) : p(pp), cfg(cp), ne(cfg.nup + cfg.ndown) {}
-  NP embedding(const NP& pos)
+  // Short member names are retained for compatibility with the native
+  // validation test, while their roles are documented here.
+  Parameters p;   // Exported model parameters.
+  ConfigData cfg; // Physical system and stored validation configurations.
+  size_t ne;      // Total electron count.
+  size_t ndet  = 16;
+  size_t dim   = 256;
+  size_t heads = 4;
+
+  PsiFormer(const std::string& parameter_path, const std::string& configuration_path)
+      : p(parameter_path), cfg(configuration_path), ne(cfg.nup + cfg.ndown)
+  {}
+
+  NodePtr embedding(const NodePtr& positions)
   {
-    // Per electron-nucleus pair, construct the DeepQMC feature tuple
-    // [log(1+r), (r_vec/r) log(1+r)], then append the electron spin indicator.
-    std::vector<NP> feat;
-    for (size_t i = 0; i < ne; ++i)
-      for (size_t a = 0; a < cfg.nuclei.shape[0]; ++a)
+    // Construct four features for every electron-nucleus pair:
+    //   log(1+r), dx*log(1+r)/r, dy*log(1+r)/r, dz*log(1+r)/r.
+    // The softened radial form keeps the feature scale controlled while
+    // retaining directional information.
+    std::vector<NodePtr> electron_nucleus_features;
+    for (size_t electron = 0; electron < ne; ++electron)
+      for (size_t nucleus = 0; nucleus < cfg.nuclei.shape[0]; ++nucleus)
       {
-        std::vector<NP> d;
-        for (size_t k = 0; k < 3; ++k)
-          d.push_back(add(slice_scalar(pos, i, k), scalar(-cfg.nuclei.x[a * 3 + k])));
-        auto r   = sqrtn(sum_all(mul(concat(d, 0), concat(d, 0))));
-        auto rad = log1p_n(r);
-        feat.push_back(rad);
-        for (auto& x : d)
-          feat.push_back(mul(x, divn(rad, r)));
-      }
-    std::vector<NP> rows;
-    size_t per = cfg.nuclei.shape[0] * 4;
-    for (size_t i = 0; i < ne; ++i)
-    {
-      std::vector<NP> f(feat.begin() + i * per, feat.begin() + (i + 1) * per);
-      f.push_back(scalar(i < cfg.nup ? 1 : -1));
-      rows.push_back(reshape(concat(f, 0), {1, per + 1}));
-    }
-    return linear(concat(rows, 0), p.find("electron_embedding/linear", "w"));
-  }
-  NP slice_scalar(const NP& a, size_t i, size_t j)
-  {
-    auto r    = slice0(a, i, i + 1);
-    auto flat = reshape(r, {3});
-    return reshape(slice0(flat, j, j + 1), {});
-  }
-  NP attention_block(const NP& h, int layer)
-  {
-    // Multi-head self-attention is followed by a residual update, a two-layer
-    // tanh MLP, and a second residual update. Parameter suffixes mirror the
-    // exported Haiku names.
-    std::string s = layer == 0 ? "electron_gnn_layer" : "electron_gnn_layer_" + std::to_string(layer);
-    std::string b = s + "/~/node_attention_electron_update_feature";
-    auto q        = reshape(linear(h, p.find(b + "/multi_head_attention/query", "w")), {ne, heads, dim / heads});
-    auto k        = reshape(linear(h, p.find(b + "/multi_head_attention/key", "w")), {ne, heads, dim / heads});
-    auto v        = reshape(linear(h, p.find(b + "/multi_head_attention/value", "w")), {ne, heads, dim / heads});
-    auto logits   = mul(attention_logits(q, k), scalar(1 / std::sqrt(double(dim / heads))));
-    auto att      = reshape(attention_context(softmax(logits), v), {ne, dim});
-    att           = add(h, linear(att, p.find(b + "/multi_head_attention/linear", "w")));
-    auto hid      = tanhn(linear(att, p.find(b + "/mlp/linear_0", "w"), p.find(b + "/mlp/linear_0", "b")));
-    auto upd      = tanhn(linear(hid, p.find(b + "/mlp/linear_1", "w"), p.find(b + "/mlp/linear_1", "b")));
-    return add(att, upd);
-  }
-  NP backflow(const NP& h, bool up)
-  {
-    // Map the final electron features to determinant-specific spin-orbital
-    // matrices.
-    size_t count = up ? cfg.nup : cfg.ndown;
-    auto e       = slice0(h, up ? 0 : cfg.nup, up ? cfg.nup : ne);
-    auto o       = linear(e, p.find(up ? "Backflow/~/mlp/linear_0" : "Backflow_1/~/mlp/linear_0", "w"));
-    return transpose(reshape(o, {count, ndet, ne}), {1, 0, 2});
-  }
-  NP envelope(const NP& pos, bool up)
-  {
-    // Form the learned atom-centred exponential envelope for each spin orbital.
-    size_t begin = up ? 0 : cfg.nup, count = up ? cfg.nup : cfg.ndown;
-    auto pi   = p.find("exponential_envelopes", up ? "pi_up" : "pi_down"),
-         zeta = p.find("exponential_envelopes", up ? "zetas_up" : "zetas_down");
-    std::vector<NP> all;
-    for (size_t i = 0; i < count; ++i)
-      for (size_t d = 0; d < ndet; ++d)
-        for (size_t o = 0; o < ne; ++o)
+        std::vector<NodePtr> displacement_components;
+        for (size_t dimension = 0; dimension < 3; ++dimension)
         {
-          NP z = scalar(0);
-          for (size_t a = 0; a < cfg.nuclei.shape[0]; ++a)
-          {
-            std::vector<NP> dv;
-            for (size_t k = 0; k < 3; ++k)
-              dv.push_back(add(slice_scalar(pos, begin + i, k), scalar(-cfg.nuclei.x[a * 3 + k])));
-            auto r  = sqrtn(sum_all(mul(concat(dv, 0), concat(dv, 0))));
-            auto zz = reshape(slice0(reshape(zeta, {zeta->value.size()}),
-                                     d * ne * cfg.nuclei.shape[0] + o * cfg.nuclei.shape[0] + a,
-                                     d * ne * cfg.nuclei.shape[0] + o * cfg.nuclei.shape[0] + a + 1),
-                              {});
-            auto pp = reshape(slice0(reshape(pi, {pi->value.size()}),
-                                     d * ne * cfg.nuclei.shape[0] + o * cfg.nuclei.shape[0] + a,
-                                     d * ne * cfg.nuclei.shape[0] + o * cfg.nuclei.shape[0] + a + 1),
-                              {});
-            z       = add(z, mul(pp, ex(neg(absn(mul(zz, r))))));
-          }
-          all.push_back(z);
+          const double nucleus_coordinate = cfg.nuclei.x[nucleus * 3 + dimension];
+          displacement_components.push_back(
+              add(slice_scalar(positions, electron, dimension), scalar(-nucleus_coordinate)));
         }
-    auto raw = reshape(concat(all, 0), {count, ndet, ne});
-    return transpose(raw, {1, 0, 2});
+
+        NodePtr displacement   = concat(displacement_components, 0);
+        NodePtr distance       = sqrt_node(sum_all(mul(displacement, displacement)));
+        NodePtr radial_feature = log1p_node(distance);
+        electron_nucleus_features.push_back(radial_feature);
+        for (const NodePtr& displacement_component : displacement_components)
+          electron_nucleus_features.push_back(mul(displacement_component, divide(radial_feature, distance)));
+      }
+
+    // Regroup the flat pair-feature list into one row per electron and append
+    // +1/-1 as the spin label expected by the exported DeepQMC model.
+    const size_t pair_feature_width = cfg.nuclei.shape[0] * 4;
+    std::vector<NodePtr> electron_feature_rows;
+    for (size_t electron = 0; electron < ne; ++electron)
+    {
+      const auto feature_begin = electron_nucleus_features.begin() + electron * pair_feature_width;
+      std::vector<NodePtr> electron_features(feature_begin, feature_begin + pair_feature_width);
+      electron_features.push_back(scalar(electron < cfg.nup ? 1 : -1));
+      electron_feature_rows.push_back(reshape(concat(electron_features, 0), {1, pair_feature_width + 1}));
+    }
+
+    NodePtr raw_features     = concat(electron_feature_rows, 0);
+    NodePtr embedding_weight = p.find("electron_embedding/linear", "w");
+    return linear(raw_features, embedding_weight);
   }
-  NP cusp(const NP& pos)
+
+  NodePtr slice_scalar(const NodePtr& tensor, size_t row, size_t column)
+  {
+    // slice0 operates on the leading axis, so flatten the selected Cartesian
+    // row before selecting its requested scalar component.
+    NodePtr selected_row  = slice0(tensor, row, row + 1);
+    NodePtr flattened_row = reshape(selected_row, {3});
+    return reshape(slice0(flattened_row, column, column + 1), {});
+  }
+
+  NodePtr attention_block(const NodePtr& input_features, int layer)
+  {
+    // Exported Haiku paths number the first block implicitly and suffix later
+    // blocks with their zero-based layer index.
+    const std::string layer_module  = layer == 0 ? "electron_gnn_layer" : "electron_gnn_layer_" + std::to_string(layer);
+    const std::string update_module = layer_module + "/~/node_attention_electron_update_feature";
+    const std::string attention_module = update_module + "/multi_head_attention";
+
+    // Project electron features into query, key, and value heads.
+    const Shape headed_feature_shape{ne, heads, dim / heads};
+    NodePtr query = reshape(linear(input_features, p.find(attention_module + "/query", "w")), headed_feature_shape);
+    NodePtr key   = reshape(linear(input_features, p.find(attention_module + "/key", "w")), headed_feature_shape);
+    NodePtr value = reshape(linear(input_features, p.find(attention_module + "/value", "w")), headed_feature_shape);
+
+    // Scaled dot-product attention mixes information across all electrons.
+    NodePtr unscaled_logits   = attention_logits(query, key);
+    NodePtr scaled_logits     = mul(unscaled_logits, scalar(1 / std::sqrt(double(dim / heads))));
+    NodePtr attention_weights = softmax(scaled_logits);
+    NodePtr attended_heads    = attention_context(attention_weights, value);
+    NodePtr attended_features = reshape(attended_heads, {ne, dim});
+
+    // Project concatenated heads and add the attention residual connection.
+    NodePtr projected_attention = linear(attended_features, p.find(attention_module + "/linear", "w"));
+    NodePtr attention_residual  = add(input_features, projected_attention);
+
+    // A two-layer tanh MLP supplies the second residual update.
+    NodePtr hidden_features = tanh_node(linear(attention_residual, p.find(update_module + "/mlp/linear_0", "w"),
+                                               p.find(update_module + "/mlp/linear_0", "b")));
+    NodePtr feature_update  = tanh_node(linear(hidden_features, p.find(update_module + "/mlp/linear_1", "w"),
+                                               p.find(update_module + "/mlp/linear_1", "b")));
+    return add(attention_residual, feature_update);
+  }
+
+  NodePtr backflow(const NodePtr& electron_features, bool spin_up)
+  {
+    // Select one spin block, project every electron feature into all
+    // determinant/orbital channels, and arrange it as [det, spin electron,
+    // orbital] for determinant assembly.
+    const size_t spin_electron_count   = spin_up ? cfg.nup : cfg.ndown;
+    const size_t spin_begin            = spin_up ? 0 : cfg.nup;
+    const size_t spin_end              = spin_up ? cfg.nup : ne;
+    const std::string parameter_module = spin_up ? "Backflow/~/mlp/linear_0" : "Backflow_1/~/mlp/linear_0";
+
+    NodePtr spin_features           = slice0(electron_features, spin_begin, spin_end);
+    NodePtr projected_orbitals      = linear(spin_features, p.find(parameter_module, "w"));
+    NodePtr electron_major_orbitals = reshape(projected_orbitals, {spin_electron_count, ndet, ne});
+    return transpose(electron_major_orbitals, {1, 0, 2});
+  }
+
+  NodePtr envelope(const NodePtr& positions, bool spin_up)
+  {
+    // Each orbital is multiplied by a learned sum of atom-centred exponential
+    // decays. Separate parameter arrays are exported for the two spin blocks.
+    const size_t spin_begin          = spin_up ? 0 : cfg.nup;
+    const size_t spin_electron_count = spin_up ? cfg.nup : cfg.ndown;
+    NodePtr pi                       = p.find("exponential_envelopes", spin_up ? "pi_up" : "pi_down");
+    NodePtr zeta                     = p.find("exponential_envelopes", spin_up ? "zetas_up" : "zetas_down");
+    NodePtr flattened_pi             = reshape(pi, {pi->value.size()});
+    NodePtr flattened_zeta           = reshape(zeta, {zeta->value.size()});
+
+    std::vector<NodePtr> envelope_elements;
+    for (size_t spin_electron = 0; spin_electron < spin_electron_count; ++spin_electron)
+      for (size_t determinant = 0; determinant < ndet; ++determinant)
+        for (size_t orbital = 0; orbital < ne; ++orbital)
+        {
+          NodePtr atom_sum = scalar(0);
+          for (size_t nucleus = 0; nucleus < cfg.nuclei.shape[0]; ++nucleus)
+          {
+            // Compute the electron-nucleus distance for this spin electron.
+            std::vector<NodePtr> displacement_components;
+            for (size_t dimension = 0; dimension < 3; ++dimension)
+            {
+              const double nucleus_coordinate = cfg.nuclei.x[nucleus * 3 + dimension];
+              displacement_components.push_back(
+                  add(slice_scalar(positions, spin_begin + spin_electron, dimension), scalar(-nucleus_coordinate)));
+            }
+            NodePtr displacement = concat(displacement_components, 0);
+            NodePtr distance     = sqrt_node(sum_all(mul(displacement, displacement)));
+
+            // Parameter layout is [determinant, orbital, nucleus].
+            const size_t parameter_index =
+                determinant * ne * cfg.nuclei.shape[0] + orbital * cfg.nuclei.shape[0] + nucleus;
+            NodePtr zeta_element = reshape(slice0(flattened_zeta, parameter_index, parameter_index + 1), {});
+            NodePtr pi_element   = reshape(slice0(flattened_pi, parameter_index, parameter_index + 1), {});
+
+            NodePtr exponential_decay = exp_node(neg(abs_node(mul(zeta_element, distance))));
+            atom_sum                  = add(atom_sum, mul(pi_element, exponential_decay));
+          }
+          envelope_elements.push_back(atom_sum);
+        }
+
+    NodePtr electron_major_envelope = reshape(concat(envelope_elements, 0), {spin_electron_count, ndet, ne});
+    return transpose(electron_major_envelope, {1, 0, 2});
+  }
+
+  NodePtr cusp(const NodePtr& positions)
   {
     // Same-spin and opposite-spin electron pairs use the physical 1/4 and 1/2
     // cusp factors, respectively, with learned asymptotic length scales.
-    auto sa   = p.find("electronic_cusp_asymptotic", "same_alpha"),
-         aa   = p.find("electronic_cusp_asymptotic", "anti_alpha");
-    NP out    = scalar(0);
-    auto pair = [&](size_t i, size_t j, const NP& alpha, double factor) {
-      std::vector<NP> d;
-      for (size_t k = 0; k < 3; ++k)
-        d.push_back(add(slice_scalar(pos, i, k), neg(slice_scalar(pos, j, k))));
-      auto r = sqrtn(sum_all(mul(concat(d, 0), concat(d, 0))));
-      out    = add(out, neg(divn(mul(scalar(factor), mul(alpha, alpha)), add(alpha, r))));
+    NodePtr same_spin_alpha     = p.find("electronic_cusp_asymptotic", "same_alpha");
+    NodePtr opposite_spin_alpha = p.find("electronic_cusp_asymptotic", "anti_alpha");
+    NodePtr cusp_value          = scalar(0);
+
+    auto add_pair_cusp = [&](size_t first_electron, size_t second_electron, const NodePtr& alpha, double cusp_factor) {
+      std::vector<NodePtr> displacement_components;
+      for (size_t dimension = 0; dimension < 3; ++dimension)
+        displacement_components.push_back(add(slice_scalar(positions, first_electron, dimension),
+                                              neg(slice_scalar(positions, second_electron, dimension))));
+      NodePtr displacement = concat(displacement_components, 0);
+      NodePtr distance     = sqrt_node(sum_all(mul(displacement, displacement)));
+
+      // -factor * alpha^2 / (alpha + r) approaches the desired linear cusp at
+      // coalescence while saturating at large separation.
+      NodePtr numerator   = mul(scalar(cusp_factor), mul(alpha, alpha));
+      NodePtr denominator = add(alpha, distance);
+      cusp_value          = add(cusp_value, neg(divide(numerator, denominator)));
     };
-    for (size_t b = 0; b < 2; ++b)
+
+    // Accumulate up-up and down-down pairs without double counting.
+    for (size_t spin_block = 0; spin_block < 2; ++spin_block)
     {
-      size_t lo = b ? cfg.nup : 0, hi = b ? ne : cfg.nup;
-      for (size_t i = lo; i < hi; ++i)
-        for (size_t j = i + 1; j < hi; ++j)
-          pair(i, j, sa, .25);
+      const size_t spin_begin = spin_block ? cfg.nup : 0;
+      const size_t spin_end   = spin_block ? ne : cfg.nup;
+      for (size_t first_electron = spin_begin; first_electron < spin_end; ++first_electron)
+        for (size_t second_electron = first_electron + 1; second_electron < spin_end; ++second_electron)
+          add_pair_cusp(first_electron, second_electron, same_spin_alpha, .25);
     }
-    for (size_t i = 0; i < cfg.nup; ++i)
-      for (size_t j = cfg.nup; j < ne; ++j)
-        pair(i, j, aa, .5);
-    return out;
+
+    // Accumulate every up-down pair.
+    for (size_t up_electron = 0; up_electron < cfg.nup; ++up_electron)
+      for (size_t down_electron = cfg.nup; down_electron < ne; ++down_electron)
+        add_pair_cusp(up_electron, down_electron, opposite_spin_alpha, .5);
+    return cusp_value;
   }
-  Result evaluate(const Tensor& ep, bool with_param = true)
+
+  Result evaluate(const Tensor& electron_positions, bool with_parameter_gradient = true)
   {
     // Feature layers: electron-nucleus embedding followed by four attention
-    // blocks.
-    auto pos = coordinates(ep);
-    auto h   = embedding(pos);
-    for (int l = 0; l < 4; ++l)
-      h = attention_block(h, l);
-    // Remaining wavefunction layers: spin-resolved backflow orbitals,
-    // exponential envelopes, determinant sum, and the additive
-    // electron-electron cusp correction.
-    auto mats = concat({mul(envelope(pos, true), backflow(h, true)), mul(envelope(pos, false), backflow(h, false))}, 1);
-    auto ds   = sum_all(determinants(mats));
-    auto la   = add(lg(absn(ds)), cusp(pos));
-    Result r;
-    r.sign     = ds->value.x[0] > 0 ? 1 : -1;
-    r.logabs   = la->value.x[0];
-    r.value    = r.sign * std::exp(r.logabs);
-    r.gradient = la->d1.x;
-    r.lap_log.resize(ne);
-    r.lap_ratio.resize(ne);
-    // For psi = sign * exp(logabs), (nabla^2 psi)/psi equals the sum of
-    // nabla^2 logabs and the squared norm of nabla logabs for each electron.
-    for (size_t i = 0; i < ne; ++i)
+    // blocks operating on all electrons.
+    NodePtr positions         = coordinates(electron_positions);
+    NodePtr electron_features = embedding(positions);
+    for (int layer = 0; layer < 4; ++layer)
+      electron_features = attention_block(electron_features, layer);
+
+    // Remaining wavefunction layers: create spin-resolved orbital matrices by
+    // multiplying backflow outputs by their exponential envelopes.
+    NodePtr up_orbitals      = mul(envelope(positions, true), backflow(electron_features, true));
+    NodePtr down_orbitals    = mul(envelope(positions, false), backflow(electron_features, false));
+    NodePtr orbital_matrices = concat({up_orbitals, down_orbitals}, 1);
+
+    // Sum determinant channels, then add the analytic cusp in log space.
+    NodePtr determinant_sum  = sum_all(determinants(orbital_matrices));
+    NodePtr log_wavefunction = add(log_node(abs_node(determinant_sum)), cusp(positions));
+
+    Result result;
+    result.sign     = determinant_sum->value.x[0] > 0 ? 1 : -1;
+    result.logabs   = log_wavefunction->value.x[0];
+    result.value    = result.sign * std::exp(result.logabs);
+    result.gradient = log_wavefunction->d1.x;
+
+    // Convert Cartesian diagonal second derivatives of log|psi| into the
+    // per-electron logarithmic Laplacian and (nabla^2 psi)/psi.
+    result.lap_log.resize(ne);
+    result.lap_ratio.resize(ne);
+    for (size_t electron = 0; electron < ne; ++electron)
     {
-      double g2 = 0;
-      for (size_t k = 0; k < 3; ++k)
+      double squared_gradient_norm = 0;
+      for (size_t dimension = 0; dimension < 3; ++dimension)
       {
-        r.lap_log[i] += la->d2.x[(i * 3 + k)];
-        g2 += r.gradient[i * 3 + k] * r.gradient[i * 3 + k];
+        const size_t coordinate = electron * 3 + dimension;
+        result.lap_log[electron] += log_wavefunction->d2.x[coordinate];
+        squared_gradient_norm += result.gradient[coordinate] * result.gradient[coordinate];
       }
-      r.lap_ratio[i] = r.lap_log[i] + g2;
+      result.lap_ratio[electron] = result.lap_log[electron] + squared_gradient_norm;
     }
+
     // Accumulate electron-electron, electron-nucleus, and nucleus-nucleus
-    // Coulomb terms separately so they remain available to validation callers.
-    double ee = 0, en = 0, nn = 0;
-    auto dist = [](const double* a, const double* b) {
-      double s = 0;
-      for (int k = 0; k < 3; ++k)
-        s += (a[k] - b[k]) * (a[k] - b[k]);
-      return std::sqrt(s);
+    // straight-Coulomb terms separately for validation and local energy.
+    auto distance = [](const double* first, const double* second) {
+      double squared_distance = 0;
+      for (int dimension = 0; dimension < 3; ++dimension)
+      {
+        const double displacement = first[dimension] - second[dimension];
+        squared_distance += displacement * displacement;
+      }
+      return std::sqrt(squared_distance);
     };
-    for (size_t i = 0; i < ne; ++i)
-      for (size_t j = i + 1; j < ne; ++j)
-        ee += 1 / dist(&ep.x[i * 3], &ep.x[j * 3]);
-    for (size_t i = 0; i < ne; ++i)
-      for (size_t a = 0; a < cfg.nuclei.shape[0]; ++a)
-        en -= cfg.charges.x[a] / dist(&ep.x[i * 3], &cfg.nuclei.x[a * 3]);
-    for (size_t a = 0; a < cfg.nuclei.shape[0]; ++a)
-      for (size_t b = a + 1; b < cfg.nuclei.shape[0]; ++b)
-        nn += cfg.charges.x[a] * cfg.charges.x[b] / dist(&cfg.nuclei.x[a * 3], &cfg.nuclei.x[b * 3]);
-    r.potential = {ee, en, nn};
-    // Straight-Coulomb local energy: -1/2 (nabla^2 psi)/psi + V_ee + V_en +
-    // V_nn.
-    r.local_energy = -.5 * std::accumulate(r.lap_ratio.begin(), r.lap_ratio.end(), 0.) + ee + en + nn;
-    if (with_param)
-      r.param_gradient = p.flat_gradient(backward(la));
-    return r;
+
+    double electron_electron_potential = 0;
+    for (size_t first_electron = 0; first_electron < ne; ++first_electron)
+      for (size_t second_electron = first_electron + 1; second_electron < ne; ++second_electron)
+        electron_electron_potential +=
+            1 / distance(&electron_positions.x[first_electron * 3], &electron_positions.x[second_electron * 3]);
+
+    double electron_nucleus_potential = 0;
+    for (size_t electron = 0; electron < ne; ++electron)
+      for (size_t nucleus = 0; nucleus < cfg.nuclei.shape[0]; ++nucleus)
+        electron_nucleus_potential -=
+            cfg.charges.x[nucleus] / distance(&electron_positions.x[electron * 3], &cfg.nuclei.x[nucleus * 3]);
+
+    double nucleus_nucleus_potential = 0;
+    for (size_t first_nucleus = 0; first_nucleus < cfg.nuclei.shape[0]; ++first_nucleus)
+      for (size_t second_nucleus = first_nucleus + 1; second_nucleus < cfg.nuclei.shape[0]; ++second_nucleus)
+        nucleus_nucleus_potential += cfg.charges.x[first_nucleus] * cfg.charges.x[second_nucleus] /
+            distance(&cfg.nuclei.x[first_nucleus * 3], &cfg.nuclei.x[second_nucleus * 3]);
+
+    result.potential = {electron_electron_potential, electron_nucleus_potential, nucleus_nucleus_potential};
+
+    // Local energy is kinetic energy plus the three Coulomb contributions.
+    const double laplacian_ratio = std::accumulate(result.lap_ratio.begin(), result.lap_ratio.end(), 0.);
+    result.local_energy =
+        -.5 * laplacian_ratio + electron_electron_potential + electron_nucleus_potential + nucleus_nucleus_potential;
+
+    // Parameter gradients are expensive and are omitted by the QMCPACK wrapper,
+    // but retained for standalone/native validation.
+    if (with_parameter_gradient)
+      result.param_gradient = p.flat_gradient(backward(log_wavefunction));
+    return result;
   }
 };
 
 // Standalone validation support. This code is excluded when included by
 // QMCPACK.
-std::vector<double> read_reference(hid_t f, const std::string& name, Shape* sh = nullptr)
+std::vector<double> read_reference(hid_t reference_file, const std::string& field_name, Shape* shape = nullptr)
 {
-  return read_double(f, "/" + name, sh);
+  return read_double(reference_file, "/" + field_name, shape);
 }
-void write_dataset(hid_t f, const std::string& name, const Shape& sh, const std::vector<double>& v)
+
+void write_dataset(hid_t output_file,
+                   const std::string& field_name,
+                   const Shape& shape,
+                   const std::vector<double>& values)
 {
-  std::vector<hsize_t> d(sh.begin(), sh.end());
-  hid_t s  = H5Screate_simple(d.size(), d.data(), nullptr),
-        ds = H5Dcreate2(f, name.c_str(), H5T_IEEE_F64LE, s, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-  H5Dwrite(ds, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, v.data());
-  H5Dclose(ds);
-  H5Sclose(s);
+  std::vector<hsize_t> dimensions(shape.begin(), shape.end());
+  const hid_t dataspace = H5Screate_simple(dimensions.size(), dimensions.data(), nullptr);
+  const hid_t dataset =
+      H5Dcreate2(output_file, field_name.c_str(), H5T_IEEE_F64LE, dataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+  H5Dclose(dataset);
+  H5Sclose(dataspace);
 }
-int run(const std::string& param, const std::string& config, const std::string& reference, const std::string& output)
+
+int run(const std::string& parameter_path,
+        const std::string& configuration_path,
+        const std::string& reference_path,
+        const std::string& output_path)
 {
-  PsiFormer model(param, config);
-  std::vector<Result> rs;
-  for (size_t c = 0; c < model.cfg.nconfig; ++c)
+  PsiFormer model(parameter_path, configuration_path);
+
+  // Evaluate every stored configuration once and retain all high-level
+  // observables for comparison and output.
+  std::vector<Result> results;
+  for (size_t configuration_index = 0; configuration_index < model.cfg.nconfig; ++configuration_index)
   {
-    auto r = model.evaluate(model.cfg.configuration(c));
-    std::cout << "config " << c + 1 << " sign=" << r.sign << " logabs=" << std::setprecision(12) << r.logabs
-              << " E_L=" << r.local_energy << "\n";
-    rs.push_back(std::move(r));
+    Result result = model.evaluate(model.cfg.configuration(configuration_index));
+    std::cout << "config " << configuration_index + 1 << " sign=" << result.sign << " logabs=" << std::setprecision(12)
+              << result.logabs << " E_L=" << result.local_energy << "\n";
+    results.push_back(std::move(result));
   }
-  hid_t rf = H5Fopen(reference.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-  struct Field
+
+  const hid_t reference_file = H5Fopen(reference_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+  const hid_t output_file    = H5Fcreate(output_path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+
+  // Describe each observable uniformly by its dataset name, per-configuration
+  // trailing shape, and extraction function.
+  struct ValidationField
   {
     std::string name;
-    Shape tail;
-    std::function<std::vector<double>(const Result&)> get;
+    Shape trailing_shape;
+    std::function<std::vector<double>(const Result&)> extract;
   };
-  std::vector<Field> fields = {{"sign", {}, [](auto& r) { return std::vector<double>{r.sign}; }},
-                               {"logabs", {}, [](auto& r) { return std::vector<double>{r.logabs}; }},
-                               {"value", {}, [](auto& r) { return std::vector<double>{r.value}; }},
-                               {"gradient_logabs", {model.ne, 3}, [](auto& r) { return r.gradient; }},
-                               {"laplacian_logabs_electron", {model.ne}, [](auto& r) { return r.lap_log; }},
-                               {"laplacian_ratio_electron", {model.ne}, [](auto& r) { return r.lap_ratio; }},
-                               {"potential_ee_en_nn", {3}, [](auto& r) { return r.potential; }},
-                               {"local_energy", {}, [](auto& r) { return std::vector<double>{r.local_energy}; }},
-                               {"parameter_gradient_logabs", {model.p.values.size()}, [](auto& r) {
-                                  return r.param_gradient;
-                                }}};
-  hid_t of                  = H5Fcreate(output.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  bool pass                 = true;
-  for (auto& field : fields)
+
+  std::vector<ValidationField> fields =
+      {{"sign", {}, [](const Result& result) { return std::vector<double>{result.sign}; }},
+       {"logabs", {}, [](const Result& result) { return std::vector<double>{result.logabs}; }},
+       {"value", {}, [](const Result& result) { return std::vector<double>{result.value}; }},
+       {"gradient_logabs", {model.ne, 3}, [](const Result& result) { return result.gradient; }},
+       {"laplacian_logabs_electron", {model.ne}, [](const Result& result) { return result.lap_log; }},
+       {"laplacian_ratio_electron", {model.ne}, [](const Result& result) { return result.lap_ratio; }},
+       {"potential_ee_en_nn", {3}, [](const Result& result) { return result.potential; }},
+       {"local_energy", {}, [](const Result& result) { return std::vector<double>{result.local_energy}; }},
+       {"parameter_gradient_logabs", {model.p.values.size()}, [](const Result& result) {
+          return result.param_gradient;
+        }}};
+
+  bool all_fields_pass = true;
+  for (const ValidationField& field : fields)
   {
-    std::vector<double> got;
-    for (auto& r : rs)
+    // Flatten this field across configurations using the same leading batch
+    // dimension as the reference and output datasets.
+    std::vector<double> computed_values;
+    for (const Result& result : results)
     {
-      auto v = field.get(r);
-      got.insert(got.end(), v.begin(), v.end());
+      const std::vector<double> configuration_values = field.extract(result);
+      computed_values.insert(computed_values.end(), configuration_values.begin(), configuration_values.end());
     }
-    Shape refsh;
-    auto ref  = read_reference(rf, field.name, &refsh);
-    double ma = 0, mr = 0;
-    for (size_t i = 0; i < got.size(); ++i)
+
+    const std::vector<double> reference_values = read_reference(reference_file, field.name);
+    double maximum_absolute_error              = 0;
+    double maximum_relative_error              = 0;
+    for (size_t element = 0; element < computed_values.size(); ++element)
     {
-      ma = std::max(ma, std::abs(got[i] - ref[i]));
-      mr = std::max(mr, std::abs(got[i] - ref[i]) / (1e-12 + std::abs(ref[i])));
+      const double absolute_error = std::abs(computed_values[element] - reference_values[element]);
+      const double relative_error = absolute_error / (1e-12 + std::abs(reference_values[element]));
+      maximum_absolute_error      = std::max(maximum_absolute_error, absolute_error);
+      maximum_relative_error      = std::max(maximum_relative_error, relative_error);
     }
-    double tol = field.name == "parameter_gradient_logabs" ? 2e-9 : 2e-9;
-    bool ok    = ma <= tol || mr <= tol;
-    pass &= ok;
-    std::cout << std::setw(32) << field.name << " max_abs=" << std::scientific << ma << " max_rel=" << mr << " "
-              << (ok ? "PASS" : "FAIL") << "\n";
-    Shape sh{rs.size()};
-    sh.insert(sh.end(), field.tail.begin(), field.tail.end());
-    write_dataset(of, field.name, sh, got);
+
+    constexpr double tolerance = 2e-9;
+    const bool field_passes    = maximum_absolute_error <= tolerance || maximum_relative_error <= tolerance;
+    all_fields_pass &= field_passes;
+    std::cout << std::setw(32) << field.name << " max_abs=" << std::scientific << maximum_absolute_error
+              << " max_rel=" << maximum_relative_error << " " << (field_passes ? "PASS" : "FAIL") << "\n";
+
+    Shape output_shape{results.size()};
+    output_shape.insert(output_shape.end(), field.trailing_shape.begin(), field.trailing_shape.end());
+    write_dataset(output_file, field.name, output_shape, computed_values);
   }
-  H5Fclose(of);
-  H5Fclose(rf);
-  return pass ? 0 : 2;
+
+  H5Fclose(output_file);
+  H5Fclose(reference_file);
+  return all_fields_pass ? 0 : 2;
 }
+
 } // namespace pf
 
 #ifndef PSIFORMER_LIBRARY

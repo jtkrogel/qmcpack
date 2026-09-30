@@ -36,21 +36,35 @@ class PsiFormerWF : public WaveFunctionComponent
 {
 public:
   PsiFormerWF(std::string name, std::string parameters, std::string configuration);
+
   PsiFormerWF(const PsiFormerWF&) = default;
+
   std::string getClassName() const override { return "PsiFormerWF"; }
+
   bool isFermionic() const override { return true; }
+
   LogValue evaluateLog(const ParticleSet& particles,
                        ParticleSet::ParticleGradient& gradient,
                        ParticleSet::ParticleLaplacian& laplacian) override;
+
   void acceptMove(ParticleSet& particles, int particle_index, bool safe_to_delay = false) override;
+
   void restore(int particle_index) override;
+
   PsiValue ratio(ParticleSet& particles, int particle_index) override;
+
   GradType evalGrad(ParticleSet& particles, int particle_index) override;
+
   PsiValue ratioGrad(ParticleSet& particles, int particle_index, GradType& gradient) override;
+
   void registerData(ParticleSet&, WFBufferType&) override {}
+
   LogValue updateBuffer(ParticleSet& particles, WFBufferType& buffer, bool from_scratch = false) override;
+
   void copyFromBuffer(ParticleSet&, WFBufferType&) override {}
+
   void evaluateDerivatives(ParticleSet&, const OptVariables&, Vector<ValueType>&, Vector<ValueType>&) override {}
+
   std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet& particles) const override;
 
 private:

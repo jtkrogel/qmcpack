@@ -23,6 +23,7 @@ public:
   PsiFormerWaveFunctionBuilder(Communicate* comm, ParticleSet& target, const PSetMap&)
       : WaveFunctionComponentBuilder(comm, target)
   {}
+
   std::unique_ptr<WaveFunctionComponent> buildComponent(xmlNodePtr current) override;
 };
 

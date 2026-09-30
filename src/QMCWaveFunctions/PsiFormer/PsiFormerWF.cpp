@@ -98,11 +98,14 @@ void PsiFormerWF::acceptMove(ParticleSet&, int, bool)
   }
   has_proposal_ = false;
 }
+
 void PsiFormerWF::restore(int) { has_proposal_ = false; }
+
 PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& p, WFBufferType&, bool)
 {
   return evaluateLog(p, p.G, p.L);
 }
+
 std::unique_ptr<WaveFunctionComponent> PsiFormerWF::makeClone(ParticleSet&) const
 {
   // The copy shares the read-only native model but owns independent proposal
