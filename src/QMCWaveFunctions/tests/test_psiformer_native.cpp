@@ -269,6 +269,11 @@ struct Golden
   std::array<double, 3> parameter_projections;
   std::vector<std::size_t> selected_indices;
   std::vector<double> selected_parameters;
+  double local_energy_parameter_sum;
+  double local_energy_parameter_abs_sum;
+  double local_energy_parameter_square_sum;
+  std::array<double, 3> local_energy_parameter_projections;
+  std::vector<double> selected_local_energy_parameters;
 };
 
 // These compact references were generated independently with the DeepQMC/JAX
@@ -288,7 +293,11 @@ Golden lihGolden()
           {135.75244123129642, 78.48531530433469, 258.6322930689181},
           {0, 1, 127, 128, 2047, 536832, 805249, 1610497},
           {-0.8695799883021037, -0.31347937666221071, -0.13890660257357479, -3.7570630618216381,
-           -1.0659645930567652, -0.40454552610181804, -0.0016287744064348037, 0.066008319151184311}};
+           -1.0659645930567652, -0.40454552610181804, -0.0016287744064348037, 0.066008319151184311},
+          -227.83666730389504, 165018.97787525321, 164383.10827915635,
+          {-275.71812381090683, 32.562659317325455, 253.87739681751484},
+          {-0.027378914765929355, -0.15919463981076282, -3.6318764922253006, -2.3475447308091617,
+           -0.4589721606959287, -0.19439318137311723, -0.02000558539414888, 0.19675543087012382}};
 }
 
 Golden pairGolden()
@@ -310,7 +319,12 @@ Golden pairGolden()
           {0, 1, 127, 128, 2047, 548950, 823425, 1646849},
           {-2.3705368380082334, -0.56221196746345248, 0.014193225492927742, 0.02179686963981798,
            0.00012059685956394148, 0.0020275413443317375, 0.067400036242015071,
-           0.027234831249253858}};
+           0.027234831249253858},
+          63.84149320878478, 17198.9773899136, 1648.8246231637158,
+          {45.21822546194204, -0.5776053862966525, 8.188951223721432},
+          {0.17763836352321852, 0.029026557833640224, -0.0015775310875903378, -0.005649916789854315,
+           1.9426570517442113e-05, 0.03492990236430089, -0.0005105783615902042,
+           -0.011817645765095516}};
 }
 
 double parameterProjection(const std::vector<double>& gradient, int stream)
@@ -351,6 +365,7 @@ void validateCase(const std::string& system, const Golden& golden, bool finite_d
   checkClose(result.local_energy, golden.local_energy, 2e-9, 2e-9);
 
   REQUIRE(result.param_gradient.size() == model.p.values.size());
+  REQUIRE(result.local_energy_param_gradient.size() == model.p.values.size());
   const double parameter_sum = std::accumulate(result.param_gradient.begin(), result.param_gradient.end(), 0.0);
   double parameter_abs_sum = 0, parameter_square_sum = 0;
   for (double value : result.param_gradient)
@@ -365,6 +380,24 @@ void validateCase(const std::string& system, const Golden& golden, bool finite_d
     checkClose(parameterProjection(result.param_gradient, stream), golden.parameter_projections[stream], 2e-8, 2e-8);
   for (std::size_t i = 0; i < golden.selected_indices.size(); ++i)
     checkClose(result.param_gradient[golden.selected_indices[i]], golden.selected_parameters[i], 2e-8, 2e-9);
+
+  const double local_parameter_sum =
+      std::accumulate(result.local_energy_param_gradient.begin(), result.local_energy_param_gradient.end(), 0.0);
+  double local_parameter_abs_sum = 0, local_parameter_square_sum = 0;
+  for (double value : result.local_energy_param_gradient)
+  {
+    local_parameter_abs_sum += std::abs(value);
+    local_parameter_square_sum += value * value;
+  }
+  checkClose(local_parameter_sum, golden.local_energy_parameter_sum, 2e-8, 2e-7);
+  checkClose(local_parameter_abs_sum, golden.local_energy_parameter_abs_sum, 2e-8, 2e-6);
+  checkClose(local_parameter_square_sum, golden.local_energy_parameter_square_sum, 2e-8, 2e-6);
+  for (int stream = 0; stream < 3; ++stream)
+    checkClose(parameterProjection(result.local_energy_param_gradient, stream),
+               golden.local_energy_parameter_projections[stream], 2e-8, 2e-7);
+  for (std::size_t i = 0; i < golden.selected_indices.size(); ++i)
+    checkClose(result.local_energy_param_gradient[golden.selected_indices[i]],
+               golden.selected_local_energy_parameters[i], 2e-8, 2e-8);
 
   if (!finite_differences)
     return;
@@ -405,12 +438,15 @@ void validateCase(const std::string& system, const Golden& golden, bool finite_d
         const std::size_t local_index = flat_index - layout.begin;
         const double original = parameter->value.x[local_index];
         parameter->value.x[local_index] = original + parameter_step;
-        const double plus = model.evaluate(electrons, false).logabs;
+        const pf::Result plus = model.evaluate(electrons, false);
         parameter->value.x[local_index] = original - parameter_step;
-        const double minus = model.evaluate(electrons, false).logabs;
+        const pf::Result minus = model.evaluate(electrons, false);
         parameter->value.x[local_index] = original;
-        const double finite_difference = (plus - minus) / (2 * parameter_step);
-        CHECK(finite_difference == Catch::Approx(result.param_gradient[flat_index]).epsilon(5e-5).margin(5e-5));
+        const double log_finite_difference = (plus.logabs - minus.logabs) / (2 * parameter_step);
+        CHECK(log_finite_difference == Catch::Approx(result.param_gradient[flat_index]).epsilon(5e-5).margin(5e-5));
+        const double energy_finite_difference = (plus.local_energy - minus.local_energy) / (2 * parameter_step);
+        CHECK(energy_finite_difference ==
+              Catch::Approx(result.local_energy_param_gradient[flat_index]).epsilon(2e-4).margin(2e-4));
         break;
       }
   }
