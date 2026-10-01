@@ -311,27 +311,27 @@ NodePtr unary(const NodePtr& input,
 {
   // Cache f and its first three derivatives. Third derivatives enter only when
   // reverse-differentiating the diagonal second-coordinate jet.
-  Tensor value                    = elem_unary(input->value, function);
-  const Tensor first_derivative   = elem_unary(input->value, function_first_derivative);
-  const Tensor second_derivative  = elem_unary(input->value, function_second_derivative);
-  const Tensor third_derivative   = elem_unary(input->value, function_third_derivative);
+  Tensor value                   = elem_unary(input->value, function);
+  const Tensor first_derivative  = elem_unary(input->value, function_first_derivative);
+  const Tensor second_derivative = elem_unary(input->value, function_second_derivative);
+  const Tensor third_derivative  = elem_unary(input->value, function_third_derivative);
   Tensor first_coordinate_derivative;
   Tensor second_coordinate_derivative;
 
   if (!input->d1.empty())
   {
-    first_coordinate_derivative  = Tensor(input->d1.shape);
-    second_coordinate_derivative = Tensor(input->d2.shape);
+    first_coordinate_derivative   = Tensor(input->d1.shape);
+    second_coordinate_derivative  = Tensor(input->d2.shape);
     const size_t value_size       = input->value.size();
     const size_t coordinate_count = input->d1.size() / value_size;
     for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
       for (size_t element = 0; element < value_size; ++element)
       {
-        const size_t jet_index = coordinate * value_size + element;
-        const double input_d1  = input->d1.x[jet_index];
-        first_coordinate_derivative.x[jet_index] = first_derivative.x[element] * input_d1;
-        second_coordinate_derivative.x[jet_index] =
-            first_derivative.x[element] * input->d2.x[jet_index] + second_derivative.x[element] * input_d1 * input_d1;
+        const size_t jet_index                         = coordinate * value_size + element;
+        const double input_first_coordinate_derivative = input->d1.x[jet_index];
+        first_coordinate_derivative.x[jet_index]  = first_derivative.x[element] * input_first_coordinate_derivative;
+        second_coordinate_derivative.x[jet_index] = first_derivative.x[element] * input->d2.x[jet_index] +
+            second_derivative.x[element] * input_first_coordinate_derivative * input_first_coordinate_derivative;
       }
   }
 
@@ -345,34 +345,39 @@ NodePtr unary(const NodePtr& input,
 
   // The lifted VJP differentiates all three outputs (value, d1, and d2)
   // with respect to all three input jet components.
-  const Tensor input_d1 = input->d1;
-  const Tensor input_d2 = input->d2;
-  auto input_jet_vjp    = [first_derivative, second_derivative, third_derivative, input_shape, input_d1,
-                          input_d2](const JetAdjoint& upstream) {
+  const Tensor input_first_coordinate_derivative  = input->d1;
+  const Tensor input_second_coordinate_derivative = input->d2;
+  auto input_jet_vjp                              = [first_derivative, second_derivative, third_derivative, input_shape,
+                                                     input_first_coordinate_derivative,
+                                                     input_second_coordinate_derivative](const JetAdjoint& upstream) {
     JetAdjoint result;
     result.value = Tensor(input_shape);
     for (size_t element = 0; element < result.value.size(); ++element)
       result.value.x[element] = upstream.value.x[element] * first_derivative.x[element];
 
-    if (!input_d1.empty())
+    if (!input_first_coordinate_derivative.empty())
     {
-      result.d1 = Tensor(input_d1.shape);
-      result.d2 = Tensor(input_d2.shape);
+      result.d1                     = Tensor(input_first_coordinate_derivative.shape);
+      result.d2                     = Tensor(input_second_coordinate_derivative.shape);
       const size_t value_size       = result.value.size();
-      const size_t coordinate_count = input_d1.size() / value_size;
+      const size_t coordinate_count = input_first_coordinate_derivative.size() / value_size;
       for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
         for (size_t element = 0; element < value_size; ++element)
         {
-          const size_t jet_index = coordinate * value_size + element;
-          const double x1        = input_d1.x[jet_index];
-          const double x2        = input_d2.x[jet_index];
-          const double f1        = first_derivative.x[element];
-          const double f2        = second_derivative.x[element];
-          const double f3        = third_derivative.x[element];
-          result.value.x[element] += upstream.d1.x[jet_index] * f2 * x1 +
-              upstream.d2.x[jet_index] * (f2 * x2 + f3 * x1 * x1);
-          result.d1.x[jet_index] = upstream.d1.x[jet_index] * f1 + 2 * upstream.d2.x[jet_index] * f2 * x1;
-          result.d2.x[jet_index] = upstream.d2.x[jet_index] * f1;
+          const size_t jet_index                          = coordinate * value_size + element;
+          const double input_first_derivative_element     = input_first_coordinate_derivative.x[jet_index];
+          const double input_second_derivative_element    = input_second_coordinate_derivative.x[jet_index];
+          const double function_first_derivative_element  = first_derivative.x[element];
+          const double function_second_derivative_element = second_derivative.x[element];
+          const double function_third_derivative_element  = third_derivative.x[element];
+          result.value.x[element] +=
+              upstream.d1.x[jet_index] * function_second_derivative_element * input_first_derivative_element +
+              upstream.d2.x[jet_index] *
+                  (function_second_derivative_element * input_second_derivative_element +
+                   function_third_derivative_element * input_first_derivative_element * input_first_derivative_element);
+          result.d1.x[jet_index] = upstream.d1.x[jet_index] * function_first_derivative_element +
+              2 * upstream.d2.x[jet_index] * function_second_derivative_element * input_first_derivative_element;
+          result.d2.x[jet_index] = upstream.d2.x[jet_index] * function_first_derivative_element;
         }
     }
     return result;
@@ -401,26 +406,30 @@ NodePtr add(const NodePtr& left, const NodePtr& right)
 
   if (coordinate_count)
   {
-    const Tensor left_d1  = broadcast_jet(left->d1, left->value.shape, value.shape, coordinate_count);
-    const Tensor right_d1 = broadcast_jet(right->d1, right->value.shape, value.shape, coordinate_count);
-    const Tensor left_d2  = broadcast_jet(left->d2, left->value.shape, value.shape, coordinate_count);
-    const Tensor right_d2 = broadcast_jet(right->d2, right->value.shape, value.shape, coordinate_count);
-    first_coordinate_derivative =
-        elem_binary(left_d1, right_d1, [](double a, double b) { return a + b; });
-    second_coordinate_derivative =
-        elem_binary(left_d2, right_d2, [](double a, double b) { return a + b; });
+    const Tensor left_first_coordinate_derivative =
+        broadcast_jet(left->d1, left->value.shape, value.shape, coordinate_count);
+    const Tensor right_first_coordinate_derivative =
+        broadcast_jet(right->d1, right->value.shape, value.shape, coordinate_count);
+    const Tensor left_second_coordinate_derivative =
+        broadcast_jet(left->d2, left->value.shape, value.shape, coordinate_count);
+    const Tensor right_second_coordinate_derivative =
+        broadcast_jet(right->d2, right->value.shape, value.shape, coordinate_count);
+    first_coordinate_derivative  = elem_binary(left_first_coordinate_derivative, right_first_coordinate_derivative,
+                                               [](double a, double b) { return a + b; });
+    second_coordinate_derivative = elem_binary(left_second_coordinate_derivative, right_second_coordinate_derivative,
+                                               [](double a, double b) { return a + b; });
   }
 
   // Reverse broadcasting by reducing each output adjoint to its parent's
   // original value or jet shape.
   const Shape left_shape  = left->value.shape;
   const Shape right_shape = right->value.shape;
-  auto left_vjp = [left_shape](const Tensor& upstream) { return unbroadcast(upstream, left_shape); };
-  auto right_vjp = [right_shape](const Tensor& upstream) { return unbroadcast(upstream, right_shape); };
+  auto left_vjp           = [left_shape](const Tensor& upstream) { return unbroadcast(upstream, left_shape); };
+  auto right_vjp          = [right_shape](const Tensor& upstream) { return unbroadcast(upstream, right_shape); };
 
   const Shape left_jet_shape  = left->d1.shape;
   const Shape right_jet_shape = right->d1.shape;
-  auto left_jet_vjp = [left_shape, left_jet_shape](const JetAdjoint& upstream) {
+  auto left_jet_vjp           = [left_shape, left_jet_shape](const JetAdjoint& upstream) {
     JetAdjoint result;
     result.value = unbroadcast(upstream.value, left_shape);
     if (!left_jet_shape.empty())
@@ -450,8 +459,9 @@ NodePtr add(const NodePtr& left, const NodePtr& right)
 /// Negate a graph node elementwise.
 NodePtr neg(const NodePtr& input)
 {
-  return unary(input, [](double value) { return -value; }, [](double) { return -1.; }, [](double) { return 0.; },
-               [](double) { return 0.; });
+  return unary(
+      input, [](double value) { return -value; }, [](double) { return -1.; }, [](double) { return 0.; },
+      [](double) { return 0.; });
 }
 
 /// Multiply two broadcast-compatible graph nodes using first- and second-order product rules.
@@ -464,13 +474,16 @@ NodePtr mul(const NodePtr& left, const NodePtr& right)
   // Broadcast both operands once and apply the first- and second-order
   // product rules in the common output shape.
   size_t coordinate_count = !left->d1.empty() ? left->d1.shape[0] : (!right->d1.empty() ? right->d1.shape[0] : 0);
-  Tensor left_d1, right_d1, left_d2, right_d2;
+  Tensor left_first_coordinate_derivative;
+  Tensor right_first_coordinate_derivative;
+  Tensor left_second_coordinate_derivative;
+  Tensor right_second_coordinate_derivative;
   if (coordinate_count)
   {
-    left_d1  = broadcast_jet(left->d1, left->value.shape, value.shape, coordinate_count);
-    right_d1 = broadcast_jet(right->d1, right->value.shape, value.shape, coordinate_count);
-    left_d2  = broadcast_jet(left->d2, left->value.shape, value.shape, coordinate_count);
-    right_d2 = broadcast_jet(right->d2, right->value.shape, value.shape, coordinate_count);
+    left_first_coordinate_derivative   = broadcast_jet(left->d1, left->value.shape, value.shape, coordinate_count);
+    right_first_coordinate_derivative  = broadcast_jet(right->d1, right->value.shape, value.shape, coordinate_count);
+    left_second_coordinate_derivative  = broadcast_jet(left->d2, left->value.shape, value.shape, coordinate_count);
+    right_second_coordinate_derivative = broadcast_jet(right->d2, right->value.shape, value.shape, coordinate_count);
     Shape jet_shape{coordinate_count};
     jet_shape.insert(jet_shape.end(), value.shape.begin(), value.shape.end());
     first_coordinate_derivative  = Tensor(jet_shape);
@@ -478,25 +491,28 @@ NodePtr mul(const NodePtr& left, const NodePtr& right)
     for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
       for (size_t element = 0; element < value.size(); ++element)
       {
-        const Shape output_index = unravel(element, value.shape);
-        const double l0 = left->value.x[broadcast_offset(output_index, left->value.shape)];
-        const double r0 = right->value.x[broadcast_offset(output_index, right->value.shape)];
-        const size_t j  = coordinate * value.size() + element;
-        first_coordinate_derivative.x[j] = left_d1.x[j] * r0 + l0 * right_d1.x[j];
-        second_coordinate_derivative.x[j] =
-            left_d2.x[j] * r0 + 2 * left_d1.x[j] * right_d1.x[j] + l0 * right_d2.x[j];
+        const Shape output_index                 = unravel(element, value.shape);
+        const double left_value_element          = left->value.x[broadcast_offset(output_index, left->value.shape)];
+        const double right_value_element         = right->value.x[broadcast_offset(output_index, right->value.shape)];
+        const size_t jet_index                   = coordinate * value.size() + element;
+        first_coordinate_derivative.x[jet_index] = left_first_coordinate_derivative.x[jet_index] * right_value_element +
+            left_value_element * right_first_coordinate_derivative.x[jet_index];
+        second_coordinate_derivative.x[jet_index] =
+            left_second_coordinate_derivative.x[jet_index] * right_value_element +
+            2 * left_first_coordinate_derivative.x[jet_index] * right_first_coordinate_derivative.x[jet_index] +
+            left_value_element * right_second_coordinate_derivative.x[jet_index];
       }
   }
 
   // Retain the inexpensive value-only VJPs for log-wavefunction gradients.
   const Tensor right_value = right->value;
   const Shape left_shape   = left->value.shape;
-  auto left_vjp = [right_value, left_shape](const Tensor& upstream) {
+  auto left_vjp            = [right_value, left_shape](const Tensor& upstream) {
     return unbroadcast(elem_binary(upstream, right_value, [](double a, double b) { return a * b; }), left_shape);
   };
   const Tensor left_value = left->value;
   const Shape right_shape = right->value.shape;
-  auto right_vjp = [left_value, right_shape](const Tensor& upstream) {
+  auto right_vjp          = [left_value, right_shape](const Tensor& upstream) {
     return unbroadcast(elem_binary(upstream, left_value, [](double a, double b) { return a * b; }), right_shape);
   };
 
@@ -505,45 +521,51 @@ NodePtr mul(const NodePtr& left, const NodePtr& right)
   const Shape output_shape    = value.shape;
   const Shape left_jet_shape  = left->d1.shape;
   const Shape right_jet_shape = right->d1.shape;
-  auto make_jet_vjp = [output_shape, coordinate_count](const Tensor& other_value, const Tensor& other_d1,
-                                                       const Tensor& other_d2, const Shape& operand_shape,
-                                                       const Shape& operand_jet_shape) {
-    return [output_shape, coordinate_count, other_value, other_d1, other_d2, operand_shape,
-            operand_jet_shape](const JetAdjoint& upstream) {
-      Tensor value_gradient(output_shape);
-      Tensor d1_gradient, d2_gradient;
-      if (coordinate_count)
-      {
-        Shape jet_shape{coordinate_count};
-        jet_shape.insert(jet_shape.end(), output_shape.begin(), output_shape.end());
-        d1_gradient = Tensor(jet_shape);
-        d2_gradient = Tensor(jet_shape);
-      }
-      for (size_t element = 0; element < value_gradient.size(); ++element)
-      {
-        const Shape output_index = unravel(element, output_shape);
-        const double other0 = other_value.x[broadcast_offset(output_index, other_value.shape)];
-        value_gradient.x[element] = upstream.value.x[element] * other0;
-        for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
-        {
-          const size_t j = coordinate * value_gradient.size() + element;
-          value_gradient.x[element] += upstream.d1.x[j] * other_d1.x[j] + upstream.d2.x[j] * other_d2.x[j];
-          d1_gradient.x[j] = upstream.d1.x[j] * other0 + 2 * upstream.d2.x[j] * other_d1.x[j];
-          d2_gradient.x[j] = upstream.d2.x[j] * other0;
-        }
-      }
-      JetAdjoint result;
-      result.value = unbroadcast(value_gradient, operand_shape);
-      if (!operand_jet_shape.empty())
-      {
-        result.d1 = unbroadcast(d1_gradient, operand_jet_shape);
-        result.d2 = unbroadcast(d2_gradient, operand_jet_shape);
-      }
-      return result;
-    };
-  };
-  auto left_jet_vjp  = make_jet_vjp(right_value, right_d1, right_d2, left_shape, left_jet_shape);
-  auto right_jet_vjp = make_jet_vjp(left_value, left_d1, left_d2, right_shape, right_jet_shape);
+  auto make_operand_jet_vjp =
+      [output_shape, coordinate_count](const Tensor& other_value, const Tensor& other_first_coordinate_derivative,
+                                       const Tensor& other_second_coordinate_derivative, const Shape& operand_shape,
+                                       const Shape& operand_jet_shape) {
+        return [output_shape, coordinate_count, other_value, other_first_coordinate_derivative,
+                other_second_coordinate_derivative, operand_shape, operand_jet_shape](const JetAdjoint& upstream) {
+          Tensor value_gradient(output_shape);
+          Tensor first_coordinate_gradient;
+          Tensor second_coordinate_gradient;
+          if (coordinate_count)
+          {
+            Shape jet_shape{coordinate_count};
+            jet_shape.insert(jet_shape.end(), output_shape.begin(), output_shape.end());
+            first_coordinate_gradient  = Tensor(jet_shape);
+            second_coordinate_gradient = Tensor(jet_shape);
+          }
+          for (size_t element = 0; element < value_gradient.size(); ++element)
+          {
+            const Shape output_index         = unravel(element, output_shape);
+            const double other_value_element = other_value.x[broadcast_offset(output_index, other_value.shape)];
+            value_gradient.x[element]        = upstream.value.x[element] * other_value_element;
+            for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+            {
+              const size_t jet_index = coordinate * value_gradient.size() + element;
+              value_gradient.x[element] += upstream.d1.x[jet_index] * other_first_coordinate_derivative.x[jet_index] +
+                  upstream.d2.x[jet_index] * other_second_coordinate_derivative.x[jet_index];
+              first_coordinate_gradient.x[jet_index] = upstream.d1.x[jet_index] * other_value_element +
+                  2 * upstream.d2.x[jet_index] * other_first_coordinate_derivative.x[jet_index];
+              second_coordinate_gradient.x[jet_index] = upstream.d2.x[jet_index] * other_value_element;
+            }
+          }
+          JetAdjoint result;
+          result.value = unbroadcast(value_gradient, operand_shape);
+          if (!operand_jet_shape.empty())
+          {
+            result.d1 = unbroadcast(first_coordinate_gradient, operand_jet_shape);
+            result.d2 = unbroadcast(second_coordinate_gradient, operand_jet_shape);
+          }
+          return result;
+        };
+      };
+  auto left_jet_vjp  = make_operand_jet_vjp(right_value, right_first_coordinate_derivative,
+                                            right_second_coordinate_derivative, left_shape, left_jet_shape);
+  auto right_jet_vjp = make_operand_jet_vjp(left_value, left_first_coordinate_derivative,
+                                            left_second_coordinate_derivative, right_shape, right_jet_shape);
 
   std::vector<Edge> parent_edges{{left, std::move(left_vjp), std::move(left_jet_vjp)},
                                  {right, std::move(right_vjp), std::move(right_jet_vjp)}};
@@ -576,8 +598,7 @@ NodePtr log_node(const NodePtr& input)
 {
   return unary(
       input, [](double value) { return std::log(value); }, [](double value) { return 1 / value; },
-      [](double value) { return -1 / (value * value); },
-      [](double value) { return 2 / (value * value * value); });
+      [](double value) { return -1 / (value * value); }, [](double value) { return 2 / (value * value * value); });
 }
 
 /// Compute log(1+x) elementwise with stable standard-library evaluation.
@@ -710,7 +731,7 @@ NodePtr transpose(const NodePtr& input, const std::vector<size_t>& axes)
     return transpose_t(upstream_gradient, inverse_axes);
   };
   const bool has_input_jets = !input->d1.empty();
-  auto input_jet_vjp = [inverse_axes, has_input_jets](const JetAdjoint& upstream) {
+  auto input_jet_vjp        = [inverse_axes, has_input_jets](const JetAdjoint& upstream) {
     JetAdjoint result;
     result.value = transpose_t(upstream.value, inverse_axes);
     if (has_input_jets)
@@ -793,7 +814,7 @@ NodePtr sum_axes(const NodePtr& input, std::vector<size_t> axes)
   };
 
   const Shape input_jet_shape = input->d1.shape;
-  auto input_jet_vjp = [axes, input_shape, input_jet_shape](const JetAdjoint& upstream) {
+  auto input_jet_vjp          = [axes, input_shape, input_jet_shape](const JetAdjoint& upstream) {
     auto expand_sum = [](const Tensor& gradient, const Shape& target_shape, const std::vector<size_t>& reduced_axes) {
       Tensor result(target_shape);
       std::vector<bool> is_reduced_axis(target_shape.size(), false);
@@ -876,21 +897,20 @@ NodePtr slice0(const NodePtr& input, size_t begin, size_t end)
     Tensor input_gradient(input_shape);
     const size_t trailing_elements = product(Shape(input_shape.begin() + 1, input_shape.end()));
     std::copy(upstream_gradient.x.begin(), upstream_gradient.x.end(),
-                       input_gradient.x.begin() + begin * trailing_elements);
+              input_gradient.x.begin() + begin * trailing_elements);
     return input_gradient;
   };
 
   const Shape input_jet_shape = input->d1.shape;
-  auto input_jet_vjp = [begin, input_shape, input_jet_shape](const JetAdjoint& upstream) {
+  auto input_jet_vjp          = [begin, input_shape, input_jet_shape](const JetAdjoint& upstream) {
     JetAdjoint result;
-    result.value = Tensor(input_shape);
+    result.value                   = Tensor(input_shape);
     const size_t trailing_elements = product(Shape(input_shape.begin() + 1, input_shape.end()));
-    std::copy(upstream.value.x.begin(), upstream.value.x.end(),
-              result.value.x.begin() + begin * trailing_elements);
+    std::copy(upstream.value.x.begin(), upstream.value.x.end(), result.value.x.begin() + begin * trailing_elements);
     if (!input_jet_shape.empty())
     {
-      result.d1 = Tensor(input_jet_shape);
-      result.d2 = Tensor(input_jet_shape);
+      result.d1                      = Tensor(input_jet_shape);
+      result.d2                      = Tensor(input_jet_shape);
       const size_t input_value_size  = product(input_shape);
       const size_t output_value_size = upstream.value.size();
       for (size_t coordinate = 0; coordinate < input_jet_shape[0]; ++coordinate)
@@ -1028,13 +1048,13 @@ NodePtr concat(const std::vector<NodePtr>& inputs, size_t axis)
     };
 
     const Shape input_jet_shape = input->d1.shape;
-    auto input_jet_vjp = [input_axis_begin, input_axis_size, axis, input_shape,
-                          input_jet_shape](const JetAdjoint& upstream) {
+    auto input_jet_vjp          = [input_axis_begin, input_axis_size, axis, input_shape,
+                                   input_jet_shape](const JetAdjoint& upstream) {
       auto extract_interval = [input_axis_begin, input_axis_size](const Tensor& gradient, size_t gradient_axis,
                                                                   const Shape& target_shape) {
         Tensor result(target_shape);
-        size_t outer_block_count = 1;
-        size_t inner_block_size  = 1;
+        size_t outer_block_count      = 1;
+        size_t inner_block_size       = 1;
         const size_t output_axis_size = gradient.shape[gradient_axis];
         for (size_t dimension = 0; dimension < gradient_axis; ++dimension)
           outer_block_count *= gradient.shape[dimension];
@@ -1043,8 +1063,7 @@ NodePtr concat(const std::vector<NodePtr>& inputs, size_t axis)
         const size_t input_block_size = input_axis_size * inner_block_size;
         for (size_t outer = 0; outer < outer_block_count; ++outer)
         {
-          const size_t output_begin =
-              outer * output_axis_size * inner_block_size + input_axis_begin * inner_block_size;
+          const size_t output_begin = outer * output_axis_size * inner_block_size + input_axis_begin * inner_block_size;
           std::copy(gradient.x.begin() + output_begin, gradient.x.begin() + output_begin + input_block_size,
                     result.x.begin() + outer * input_block_size);
         }
@@ -1084,8 +1103,8 @@ NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias 
     for (size_t row = 0; row < rows; ++row)
       for (size_t output_column = 0; output_column < output_width; ++output_column)
         for (size_t input_column = 0; input_column < input_width; ++input_column)
-          target.x[row * output_width + output_column] += source.x[row * input_width + input_column] *
-              weights.x[input_column * output_width + output_column];
+          target.x[row * output_width + output_column] +=
+              source.x[row * input_width + input_column] * weights.x[input_column * output_width + output_column];
     return target;
   };
 
@@ -1094,8 +1113,8 @@ NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias 
   Tensor second_coordinate_derivative;
   if (!input->d1.empty())
   {
-    Shape output_jet_shape = input->d1.shape;
-    output_jet_shape.back() = output_width;
+    Shape output_jet_shape       = input->d1.shape;
+    output_jet_shape.back()      = output_width;
     first_coordinate_derivative  = apply_weight(input->d1, weight->value, output_jet_shape);
     second_coordinate_derivative = apply_weight(input->d2, weight->value, output_jet_shape);
   }
@@ -1111,8 +1130,8 @@ NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias 
     for (size_t row = 0; row < rows; ++row)
       for (size_t input_column = 0; input_column < input_width; ++input_column)
         for (size_t output_column = 0; output_column < output_width; ++output_column)
-          target.x[row * input_width + input_column] += source.x[row * output_width + output_column] *
-              weights.x[input_column * output_width + output_column];
+          target.x[row * input_width + input_column] +=
+              source.x[row * output_width + output_column] * weights.x[input_column * output_width + output_column];
     return target;
   };
   auto input_vjp = [weight_value, input_shape, apply_weight_transpose](const Tensor& upstream) {
@@ -1132,9 +1151,9 @@ NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias 
 
   // A shared weight receives contractions from value, d1, and d2 rows; this
   // is where mixed spatial-parameter derivatives reach the parameter leaf.
-  const Tensor input_value = input->value;
-  const Tensor input_d1    = input->d1;
-  const Tensor input_d2    = input->d2;
+  const Tensor input_value        = input->value;
+  const Tensor input_d1           = input->d1;
+  const Tensor input_d2           = input->d2;
   auto accumulate_weight_gradient = [input_width, output_width](Tensor& target, const Tensor& source,
                                                                 const Tensor& upstream) {
     const size_t rows = source.size() / input_width;
@@ -1144,8 +1163,7 @@ NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias 
           target.x[input_column * output_width + output_column] +=
               source.x[row * input_width + input_column] * upstream.x[row * output_width + output_column];
   };
-  auto weight_vjp = [input_value, input_width, output_width,
-                     accumulate_weight_gradient](const Tensor& upstream) {
+  auto weight_vjp = [input_value, input_width, output_width, accumulate_weight_gradient](const Tensor& upstream) {
     Tensor result({input_width, output_width});
     accumulate_weight_gradient(result, input_value, upstream);
     return result;
@@ -1228,7 +1246,7 @@ NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
 
   const Tensor key_value = key->value;
   auto query_vjp         = [key_value, electron_count, head_count, head_width, feature_index,
-                    logit_index](const Tensor& upstream_gradient) {
+                            logit_index](const Tensor& upstream_gradient) {
     Tensor query_gradient({electron_count, head_count, head_width});
     for (size_t query_electron = 0; query_electron < electron_count; ++query_electron)
       for (size_t head = 0; head < head_count; ++head)
@@ -1242,7 +1260,7 @@ NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
 
   const Tensor query_value = query->value;
   auto key_vjp             = [query_value, electron_count, head_count, head_width, feature_index,
-                  logit_index](const Tensor& upstream_gradient) {
+                              logit_index](const Tensor& upstream_gradient) {
     Tensor key_gradient({electron_count, head_count, head_width});
     for (size_t key_electron = 0; key_electron < electron_count; ++key_electron)
       for (size_t head = 0; head < head_count; ++head)
@@ -1257,16 +1275,18 @@ NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
   // Reverse the lifted bilinear Q K^T contraction. Value adjoints collect
   // contributions from all jet orders, while d1/d2 adjoints retain their
   // coordinate-leading shapes.
-  const Tensor query_d1 = query->d1;
-  const Tensor query_d2 = query->d2;
-  const Tensor key_d1   = key->d1;
-  const Tensor key_d2   = key->d2;
-  const size_t coordinate_count = query_d1.empty() ? 0 : query_d1.shape[0];
-  const size_t output_size      = value.size();
-  const size_t feature_size     = query->value.size();
+  const Tensor query_first_coordinate_derivative  = query->d1;
+  const Tensor query_second_coordinate_derivative = query->d2;
+  const Tensor key_first_coordinate_derivative    = key->d1;
+  const Tensor key_second_coordinate_derivative   = key->d2;
+  const size_t coordinate_count =
+      query_first_coordinate_derivative.empty() ? 0 : query_first_coordinate_derivative.shape[0];
+  const size_t output_size  = value.size();
+  const size_t feature_size = query->value.size();
 
-  auto query_jet_vjp = [key_value, key_d1, key_d2, coordinate_count, output_size, feature_size, electron_count,
-                        head_count, head_width, feature_index, logit_index](const JetAdjoint& upstream) {
+  auto query_jet_vjp = [key_value, key_first_coordinate_derivative, key_second_coordinate_derivative, coordinate_count,
+                        output_size, feature_size, electron_count, head_count, head_width, feature_index,
+                        logit_index](const JetAdjoint& upstream) {
     JetAdjoint result;
     result.value = Tensor({electron_count, head_count, head_width});
     if (coordinate_count)
@@ -1279,25 +1299,29 @@ NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
         for (size_t feature = 0; feature < head_width; ++feature)
           for (size_t key_electron = 0; key_electron < electron_count; ++key_electron)
           {
-            const size_t q = feature_index(query_electron, head, feature);
-            const size_t k = feature_index(key_electron, head, feature);
-            const size_t o = logit_index(head, query_electron, key_electron);
-            result.value.x[q] += upstream.value.x[o] * key_value.x[k];
+            const size_t query_value_index = feature_index(query_electron, head, feature);
+            const size_t key_value_index   = feature_index(key_electron, head, feature);
+            const size_t logit_value_index = logit_index(head, query_electron, key_electron);
+            result.value.x[query_value_index] += upstream.value.x[logit_value_index] * key_value.x[key_value_index];
             for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
             {
-              const size_t qj = coordinate * feature_size + q;
-              const size_t kj = coordinate * feature_size + k;
-              const size_t oj = coordinate * output_size + o;
-              result.value.x[q] += upstream.d1.x[oj] * key_d1.x[kj] + upstream.d2.x[oj] * key_d2.x[kj];
-              result.d1.x[qj] += upstream.d1.x[oj] * key_value.x[k] + 2 * upstream.d2.x[oj] * key_d1.x[kj];
-              result.d2.x[qj] += upstream.d2.x[oj] * key_value.x[k];
+              const size_t query_jet_index = coordinate * feature_size + query_value_index;
+              const size_t key_jet_index   = coordinate * feature_size + key_value_index;
+              const size_t logit_jet_index = coordinate * output_size + logit_value_index;
+              result.value.x[query_value_index] +=
+                  upstream.d1.x[logit_jet_index] * key_first_coordinate_derivative.x[key_jet_index] +
+                  upstream.d2.x[logit_jet_index] * key_second_coordinate_derivative.x[key_jet_index];
+              result.d1.x[query_jet_index] += upstream.d1.x[logit_jet_index] * key_value.x[key_value_index] +
+                  2 * upstream.d2.x[logit_jet_index] * key_first_coordinate_derivative.x[key_jet_index];
+              result.d2.x[query_jet_index] += upstream.d2.x[logit_jet_index] * key_value.x[key_value_index];
             }
           }
     return result;
   };
 
-  auto key_jet_vjp = [query_value, query_d1, query_d2, coordinate_count, output_size, feature_size, electron_count,
-                      head_count, head_width, feature_index, logit_index](const JetAdjoint& upstream) {
+  auto key_jet_vjp = [query_value, query_first_coordinate_derivative, query_second_coordinate_derivative,
+                      coordinate_count, output_size, feature_size, electron_count, head_count, head_width,
+                      feature_index, logit_index](const JetAdjoint& upstream) {
     JetAdjoint result;
     result.value = Tensor({electron_count, head_count, head_width});
     if (coordinate_count)
@@ -1310,18 +1334,21 @@ NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
         for (size_t feature = 0; feature < head_width; ++feature)
           for (size_t query_electron = 0; query_electron < electron_count; ++query_electron)
           {
-            const size_t k = feature_index(key_electron, head, feature);
-            const size_t q = feature_index(query_electron, head, feature);
-            const size_t o = logit_index(head, query_electron, key_electron);
-            result.value.x[k] += upstream.value.x[o] * query_value.x[q];
+            const size_t key_value_index   = feature_index(key_electron, head, feature);
+            const size_t query_value_index = feature_index(query_electron, head, feature);
+            const size_t logit_value_index = logit_index(head, query_electron, key_electron);
+            result.value.x[key_value_index] += upstream.value.x[logit_value_index] * query_value.x[query_value_index];
             for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
             {
-              const size_t kj = coordinate * feature_size + k;
-              const size_t qj = coordinate * feature_size + q;
-              const size_t oj = coordinate * output_size + o;
-              result.value.x[k] += upstream.d1.x[oj] * query_d1.x[qj] + upstream.d2.x[oj] * query_d2.x[qj];
-              result.d1.x[kj] += upstream.d1.x[oj] * query_value.x[q] + 2 * upstream.d2.x[oj] * query_d1.x[qj];
-              result.d2.x[kj] += upstream.d2.x[oj] * query_value.x[q];
+              const size_t key_jet_index   = coordinate * feature_size + key_value_index;
+              const size_t query_jet_index = coordinate * feature_size + query_value_index;
+              const size_t logit_jet_index = coordinate * output_size + logit_value_index;
+              result.value.x[key_value_index] +=
+                  upstream.d1.x[logit_jet_index] * query_first_coordinate_derivative.x[query_jet_index] +
+                  upstream.d2.x[logit_jet_index] * query_second_coordinate_derivative.x[query_jet_index];
+              result.d1.x[key_jet_index] += upstream.d1.x[logit_jet_index] * query_value.x[query_value_index] +
+                  2 * upstream.d2.x[logit_jet_index] * query_first_coordinate_derivative.x[query_jet_index];
+              result.d2.x[key_jet_index] += upstream.d2.x[logit_jet_index] * query_value.x[query_value_index];
             }
           }
     return result;
@@ -1390,7 +1417,7 @@ NodePtr attention_context(const NodePtr& attention_weight, const NodePtr& featur
 
   const Tensor feature_value_tensor = feature_value->value;
   auto attention_weight_vjp         = [feature_value_tensor, electron_count, head_count, head_width, weight_index,
-                               feature_index](const Tensor& upstream_gradient) {
+                                       feature_index](const Tensor& upstream_gradient) {
     Tensor weight_gradient({head_count, electron_count, electron_count});
     for (size_t head = 0; head < head_count; ++head)
       for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
@@ -1404,7 +1431,7 @@ NodePtr attention_context(const NodePtr& attention_weight, const NodePtr& featur
 
   const Tensor attention_weight_value = attention_weight->value;
   auto feature_value_vjp              = [attention_weight_value, electron_count, head_count, head_width, weight_index,
-                            feature_index](const Tensor& upstream_gradient) {
+                                         feature_index](const Tensor& upstream_gradient) {
     Tensor feature_gradient({electron_count, head_count, head_width});
     for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
       for (size_t head = 0; head < head_count; ++head)
@@ -1418,86 +1445,98 @@ NodePtr attention_context(const NodePtr& attention_weight, const NodePtr& featur
 
   // Apply the same lifted bilinear reverse rule to attention-weighted feature
   // aggregation over source electrons.
-  const Tensor attention_weight_d1 = attention_weight->d1;
-  const Tensor attention_weight_d2 = attention_weight->d2;
-  const Tensor feature_d1          = feature_value->d1;
-  const Tensor feature_d2          = feature_value->d2;
-  const size_t coordinate_count = attention_weight_d1.empty() ? 0 : attention_weight_d1.shape[0];
-  const size_t output_size      = value.size();
-  const size_t weight_size      = attention_weight->value.size();
-  const size_t feature_size     = feature_value->value.size();
+  const Tensor attention_weight_first_coordinate_derivative  = attention_weight->d1;
+  const Tensor attention_weight_second_coordinate_derivative = attention_weight->d2;
+  const Tensor feature_first_coordinate_derivative           = feature_value->d1;
+  const Tensor feature_second_coordinate_derivative          = feature_value->d2;
+  const size_t coordinate_count =
+      attention_weight_first_coordinate_derivative.empty() ? 0 : attention_weight_first_coordinate_derivative.shape[0];
+  const size_t output_size  = value.size();
+  const size_t weight_size  = attention_weight->value.size();
+  const size_t feature_size = feature_value->value.size();
 
-  auto attention_weight_jet_vjp =
-      [feature_value_tensor, feature_d1, feature_d2, coordinate_count, output_size, weight_size, feature_size,
-       electron_count, head_count, head_width, weight_index, feature_index](const JetAdjoint& upstream) {
-        JetAdjoint result;
-        result.value = Tensor({head_count, electron_count, electron_count});
-        if (coordinate_count)
-        {
-          result.d1 = Tensor({coordinate_count, head_count, electron_count, electron_count});
-          result.d2 = Tensor({coordinate_count, head_count, electron_count, electron_count});
-        }
-        for (size_t head = 0; head < head_count; ++head)
-          for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
-            for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
-              for (size_t feature = 0; feature < head_width; ++feature)
-              {
-                const size_t w = weight_index(head, output_electron, source_electron);
-                const size_t f = feature_index(source_electron, head, feature);
-                const size_t o = feature_index(output_electron, head, feature);
-                result.value.x[w] += upstream.value.x[o] * feature_value_tensor.x[f];
-                for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
-                {
-                  const size_t wj = coordinate * weight_size + w;
-                  const size_t fj = coordinate * feature_size + f;
-                  const size_t oj = coordinate * output_size + o;
-                  result.value.x[w] += upstream.d1.x[oj] * feature_d1.x[fj] +
-                      upstream.d2.x[oj] * feature_d2.x[fj];
-                  result.d1.x[wj] += upstream.d1.x[oj] * feature_value_tensor.x[f] +
-                      2 * upstream.d2.x[oj] * feature_d1.x[fj];
-                  result.d2.x[wj] += upstream.d2.x[oj] * feature_value_tensor.x[f];
-                }
-              }
-        return result;
-      };
-
-  auto feature_value_jet_vjp =
-      [attention_weight_value, attention_weight_d1, attention_weight_d2, coordinate_count, output_size, weight_size,
-       feature_size, electron_count, head_count, head_width, weight_index, feature_index](const JetAdjoint& upstream) {
-        JetAdjoint result;
-        result.value = Tensor({electron_count, head_count, head_width});
-        if (coordinate_count)
-        {
-          result.d1 = Tensor({coordinate_count, electron_count, head_count, head_width});
-          result.d2 = Tensor({coordinate_count, electron_count, head_count, head_width});
-        }
+  auto attention_weight_jet_vjp = [feature_value_tensor, feature_first_coordinate_derivative,
+                                   feature_second_coordinate_derivative, coordinate_count, output_size, weight_size,
+                                   feature_size, electron_count, head_count, head_width, weight_index,
+                                   feature_index](const JetAdjoint& upstream) {
+    JetAdjoint result;
+    result.value = Tensor({head_count, electron_count, electron_count});
+    if (coordinate_count)
+    {
+      result.d1 = Tensor({coordinate_count, head_count, electron_count, electron_count});
+      result.d2 = Tensor({coordinate_count, head_count, electron_count, electron_count});
+    }
+    for (size_t head = 0; head < head_count; ++head)
+      for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
         for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
-          for (size_t head = 0; head < head_count; ++head)
-            for (size_t feature = 0; feature < head_width; ++feature)
-              for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
-              {
-                const size_t f = feature_index(source_electron, head, feature);
-                const size_t w = weight_index(head, output_electron, source_electron);
-                const size_t o = feature_index(output_electron, head, feature);
-                result.value.x[f] += upstream.value.x[o] * attention_weight_value.x[w];
-                for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
-                {
-                  const size_t fj = coordinate * feature_size + f;
-                  const size_t wj = coordinate * weight_size + w;
-                  const size_t oj = coordinate * output_size + o;
-                  result.value.x[f] += upstream.d1.x[oj] * attention_weight_d1.x[wj] +
-                      upstream.d2.x[oj] * attention_weight_d2.x[wj];
-                  result.d1.x[fj] += upstream.d1.x[oj] * attention_weight_value.x[w] +
-                      2 * upstream.d2.x[oj] * attention_weight_d1.x[wj];
-                  result.d2.x[fj] += upstream.d2.x[oj] * attention_weight_value.x[w];
-                }
-              }
-        return result;
-      };
+          for (size_t feature = 0; feature < head_width; ++feature)
+          {
+            const size_t weight_value_index   = weight_index(head, output_electron, source_electron);
+            const size_t source_feature_index = feature_index(source_electron, head, feature);
+            const size_t output_feature_index = feature_index(output_electron, head, feature);
+            result.value.x[weight_value_index] +=
+                upstream.value.x[output_feature_index] * feature_value_tensor.x[source_feature_index];
+            for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+            {
+              const size_t weight_jet_index  = coordinate * weight_size + weight_value_index;
+              const size_t feature_jet_index = coordinate * feature_size + source_feature_index;
+              const size_t output_jet_index  = coordinate * output_size + output_feature_index;
+              result.value.x[weight_value_index] +=
+                  upstream.d1.x[output_jet_index] * feature_first_coordinate_derivative.x[feature_jet_index] +
+                  upstream.d2.x[output_jet_index] * feature_second_coordinate_derivative.x[feature_jet_index];
+              result.d1.x[weight_jet_index] +=
+                  upstream.d1.x[output_jet_index] * feature_value_tensor.x[source_feature_index] +
+                  2 * upstream.d2.x[output_jet_index] * feature_first_coordinate_derivative.x[feature_jet_index];
+              result.d2.x[weight_jet_index] +=
+                  upstream.d2.x[output_jet_index] * feature_value_tensor.x[source_feature_index];
+            }
+          }
+    return result;
+  };
 
-  std::vector<Edge> parent_edges{
-      {attention_weight, std::move(attention_weight_vjp), std::move(attention_weight_jet_vjp)},
-      {feature_value, std::move(feature_value_vjp), std::move(feature_value_jet_vjp)}};
+  auto feature_value_jet_vjp = [attention_weight_value, attention_weight_first_coordinate_derivative,
+                                attention_weight_second_coordinate_derivative, coordinate_count, output_size,
+                                weight_size, feature_size, electron_count, head_count, head_width, weight_index,
+                                feature_index](const JetAdjoint& upstream) {
+    JetAdjoint result;
+    result.value = Tensor({electron_count, head_count, head_width});
+    if (coordinate_count)
+    {
+      result.d1 = Tensor({coordinate_count, electron_count, head_count, head_width});
+      result.d2 = Tensor({coordinate_count, electron_count, head_count, head_width});
+    }
+    for (size_t source_electron = 0; source_electron < electron_count; ++source_electron)
+      for (size_t head = 0; head < head_count; ++head)
+        for (size_t feature = 0; feature < head_width; ++feature)
+          for (size_t output_electron = 0; output_electron < electron_count; ++output_electron)
+          {
+            const size_t source_feature_index = feature_index(source_electron, head, feature);
+            const size_t weight_value_index   = weight_index(head, output_electron, source_electron);
+            const size_t output_feature_index = feature_index(output_electron, head, feature);
+            result.value.x[source_feature_index] +=
+                upstream.value.x[output_feature_index] * attention_weight_value.x[weight_value_index];
+            for (size_t coordinate = 0; coordinate < coordinate_count; ++coordinate)
+            {
+              const size_t feature_jet_index = coordinate * feature_size + source_feature_index;
+              const size_t weight_jet_index  = coordinate * weight_size + weight_value_index;
+              const size_t output_jet_index  = coordinate * output_size + output_feature_index;
+              result.value.x[source_feature_index] +=
+                  upstream.d1.x[output_jet_index] * attention_weight_first_coordinate_derivative.x[weight_jet_index] +
+                  upstream.d2.x[output_jet_index] * attention_weight_second_coordinate_derivative.x[weight_jet_index];
+              result.d1.x[feature_jet_index] +=
+                  upstream.d1.x[output_jet_index] * attention_weight_value.x[weight_value_index] +
+                  2 * upstream.d2.x[output_jet_index] *
+                      attention_weight_first_coordinate_derivative.x[weight_jet_index];
+              result.d2.x[feature_jet_index] +=
+                  upstream.d2.x[output_jet_index] * attention_weight_value.x[weight_value_index];
+            }
+          }
+    return result;
+  };
+
+  std::vector<Edge> parent_edges{{attention_weight, std::move(attention_weight_vjp),
+                                  std::move(attention_weight_jet_vjp)},
+                                 {feature_value, std::move(feature_value_vjp), std::move(feature_value_jet_vjp)}};
   return node(std::move(value), std::move(first_coordinate_derivative), std::move(second_coordinate_derivative),
               std::move(parent_edges));
 }
@@ -1516,12 +1555,12 @@ NodePtr softmax(const NodePtr& input)
   {
     const auto row_begin     = input->value.x.begin() + row * row_width;
     const double row_maximum = *std::max_element(row_begin, row_begin + row_width);
-    std::fill(negative_row_maximum.x.begin() + row * row_width,
-              negative_row_maximum.x.begin() + (row + 1) * row_width, -row_maximum);
+    std::fill(negative_row_maximum.x.begin() + row * row_width, negative_row_maximum.x.begin() + (row + 1) * row_width,
+              -row_maximum);
   }
 
-  NodePtr exponentials  = exp_node(add(input, constant(std::move(negative_row_maximum))));
-  NodePtr normalization = sum_axes(exponentials, {input->value.shape.size() - 1});
+  NodePtr exponentials      = exp_node(add(input, constant(std::move(negative_row_maximum))));
+  NodePtr normalization     = sum_axes(exponentials, {input->value.shape.size() - 1});
   Shape normalization_shape = normalization->value.shape;
   normalization_shape.push_back(1);
   return divide(exponentials, reshape(normalization, std::move(normalization_shape)));
@@ -1597,7 +1636,7 @@ double trace_product(const double* left, const double* right, size_t matrix_size
 
 /** Evaluate determinant values and spatial jets with the optimized matrix kernel.
  * This path is used when parameter derivatives are not requested. */
-NodePtr determinants_fast(const NodePtr& matrices)
+NodePtr determinants(const NodePtr& matrices)
 {
   const size_t matrix_count             = matrices->value.shape[0];
   const size_t matrix_size              = matrices->value.shape[1];
@@ -1674,7 +1713,7 @@ NodePtr determinants_fast(const NodePtr& matrices)
 }
 
 // Differentiable determinant composition used by the mixed-derivative reverse pass.
-NodePtr determinants(const NodePtr& matrices)
+NodePtr differentiable_determinants(const NodePtr& matrices)
 {
   const size_t matrix_count    = matrices->value.shape[0];
   const size_t matrix_size     = matrices->value.shape[1];
@@ -1776,7 +1815,7 @@ std::unordered_map<const Node*, Tensor> backward(const NodePtr& root)
 
 /** Reverse-accumulate through the lifted coordinate-jet program. This computes
  * mixed parameter-coordinate derivatives without finite differences. */
-std::unordered_map<const Node*, JetAdjoint> backward_jets(const NodePtr& root, JetAdjoint root_adjoint)
+std::unordered_map<const Node*, JetAdjoint> backward_coordinate_jets(const NodePtr& root, JetAdjoint root_adjoint)
 {
   // Use the same graph topology as the value reverse pass, but carry an
   // adjoint for each of the three coordinate-jet components.
@@ -1814,7 +1853,7 @@ std::unordered_map<const Node*, JetAdjoint> backward_jets(const NodePtr& root, J
     {
       if (!edge.jet_vjp)
         throw std::runtime_error("missing coordinate-jet VJP");
-      JetAdjoint contribution = edge.jet_vjp(current_adjoint->second);
+      JetAdjoint contribution    = edge.jet_vjp(current_adjoint->second);
       JetAdjoint& parent_adjoint = adjoints[edge.parent.get()];
       accumulate_tensor(parent_adjoint.value, contribution.value);
       accumulate_tensor(parent_adjoint.d1, contribution.d1);
@@ -2287,7 +2326,7 @@ struct PsiFormer
 
     // Sum determinant channels, then add the analytic cusp in log space.
     NodePtr determinant_channels =
-        with_parameter_gradient ? determinants(orbital_matrices) : determinants_fast(orbital_matrices);
+        with_parameter_gradient ? differentiable_determinants(orbital_matrices) : determinants(orbital_matrices);
     NodePtr determinant_sum  = sum_all(determinant_channels);
     NodePtr log_wavefunction = add(log_node(abs_node(determinant_sum)), cusp(positions));
 
@@ -2363,7 +2402,7 @@ struct PsiFormer
       for (size_t coordinate = 0; coordinate < log_wavefunction->d1.size(); ++coordinate)
         local_energy_seed.d1.x[coordinate] = -log_wavefunction->d1.x[coordinate];
       result.local_energy_param_gradient =
-          p.flat_gradient(backward_jets(log_wavefunction, std::move(local_energy_seed)));
+          p.flat_gradient(backward_coordinate_jets(log_wavefunction, std::move(local_energy_seed)));
     }
     return result;
   }
@@ -2373,9 +2412,7 @@ struct PsiFormer
 // QMCPACK.
 /// Read one named validation observable from the reference HDF5 file.
 std::vector<double> read_reference(hid_t reference_file, const std::string& field_name, Shape* shape = nullptr)
-{
-  return read_double(reference_file, "/" + field_name, shape);
-}
+{ return read_double(reference_file, "/" + field_name, shape); }
 
 /// Write one computed validation observable to the output HDF5 file.
 void write_dataset(hid_t output_file,
@@ -2432,9 +2469,9 @@ int run(const std::string& parameter_path,
        {"laplacian_ratio_electron", {model.ne}, [](const Result& result) { return result.lap_ratio; }},
        {"potential_ee_en_nn", {3}, [](const Result& result) { return result.potential; }},
        {"local_energy", {}, [](const Result& result) { return std::vector<double>{result.local_energy}; }},
-       {"parameter_gradient_logabs", {model.p.values.size()}, [](const Result& result) {
-          return result.param_gradient;
-        }},
+       {"parameter_gradient_logabs",
+        {model.p.values.size()},
+        [](const Result& result) { return result.param_gradient; }},
        {"parameter_gradient_local_energy", {model.p.values.size()}, [](const Result& result) {
           return result.local_energy_param_gradient;
         }}};
