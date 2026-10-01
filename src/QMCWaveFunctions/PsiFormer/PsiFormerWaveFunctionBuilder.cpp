@@ -15,11 +15,12 @@
 
 namespace qmcplusplus
 {
+// Validate the required XML paths and instantiate the imported native model.
 std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildComponent(xmlNodePtr cur)
 {
   std::string name = "psiformer", parameters, configuration;
 
-  // Both files use the compact export format consumed by PsiFormerNative.inc.
+  // Both files use the compact export format consumed by PsiFormerNative.h.
   // The configuration file supplies nuclei, charges, spin populations, and
   // electron count.
   OhmmsAttributeSet a;

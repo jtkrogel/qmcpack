@@ -7,7 +7,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #define PSIFORMER_LIBRARY
-#include "QMCWaveFunctions/PsiFormer/PsiFormerNative.inc"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 
 #include <array>
 #include <cstdint>

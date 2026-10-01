@@ -10,7 +10,7 @@
  */
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #define PSIFORMER_LIBRARY
-#include "QMCWaveFunctions/PsiFormer/PsiFormerNative.inc"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 
 #include <cmath>
 #include <complex>
@@ -18,10 +18,12 @@
 
 namespace qmcplusplus
 {
+// Load the exported native model once and retain it behind shared ownership.
 PsiFormerWF::PsiFormerWF(std::string name, std::string parameters, std::string configuration)
     : WaveFunctionComponent(std::move(name)), model_(std::make_shared<pf::PsiFormer>(parameters, configuration))
 {}
 
+// Translate QMCPACK particle coordinates into the native evaluator input tensor.
 pf::Result PsiFormerWF::evaluate(const ParticleSet& p, int active) const
 {
   // For a particle-by-particle proposal, substitute only the active position.
@@ -38,6 +40,7 @@ pf::Result PsiFormerWF::evaluate(const ParticleSet& p, int active) const
   return model_->evaluate(positions, false);
 }
 
+// Evaluate a full accepted configuration and accumulate its spatial derivatives.
 PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
                                                ParticleSet::ParticleGradient& g,
                                                ParticleSet::ParticleLaplacian& l)
@@ -56,6 +59,7 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
   return log_value_;
 }
 
+// Evaluate and cache the wavefunction ratio for one proposed electron position.
 PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
 {
   // Cache proposal state so acceptMove can commit it without reevaluating the
@@ -67,6 +71,7 @@ PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
   return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
 }
 
+// Return one accepted electron logarithmic gradient.
 PsiFormerWF::GradType PsiFormerWF::evalGrad(ParticleSet& p, int iat)
 {
   auto r = evaluate(p);
@@ -76,6 +81,7 @@ PsiFormerWF::GradType PsiFormerWF::evalGrad(ParticleSet& p, int iat)
   return g;
 }
 
+// Evaluate a proposed ratio and gradient in one native-model traversal.
 PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& g)
 {
   // Evaluate the proposal once and return both its ratio and active-electron
@@ -89,6 +95,7 @@ PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& 
   return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
 }
 
+// Promote cached proposal state to accepted state after a successful move.
 void PsiFormerWF::acceptMove(ParticleSet&, int, bool)
 {
   if (has_proposal_)
@@ -99,13 +106,16 @@ void PsiFormerWF::acceptMove(ParticleSet&, int, bool)
   has_proposal_ = false;
 }
 
+// Forget cached proposal state after a rejected move.
 void PsiFormerWF::restore(int) { has_proposal_ = false; }
 
+// Re-evaluate the component because it does not maintain walker-buffer storage.
 PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& p, WFBufferType&, bool)
 {
   return evaluateLog(p, p.G, p.L);
 }
 
+// Copy move state and share the immutable native model with a new walker component.
 std::unique_ptr<WaveFunctionComponent> PsiFormerWF::makeClone(ParticleSet&) const
 {
   // The copy shares the read-only native model but owns independent proposal

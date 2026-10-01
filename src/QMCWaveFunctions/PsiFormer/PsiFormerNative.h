@@ -5,7 +5,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 
-/** @file PsiFormerNative.inc
+/** @file PsiFormerNative.h
  * @brief Native implementation of the DeepQMC PsiFormer architecture.
  *
  * This implementation evaluates a fixed, HDF5-exported PsiFormer model without
@@ -18,6 +18,17 @@
  * comparison driver. The QMCPACK WaveFunctionComponent does this in
  * PsiFormerWF.cpp.
  */
+
+//////////////////////////////////////////////////////////////////////////////////////
+// INCLUSION RESTRICTION
+// This implementation header defines non-inline functions and must be included by
+// exactly one translation unit in each linked target. Define PSIFORMER_LIBRARY before
+// inclusion when embedding it in QMCPACK or a test to suppress the standalone main().
+//////////////////////////////////////////////////////////////////////////////////////
+
+#ifndef QMCPLUSPLUS_PSIFORMER_NATIVE_H
+#define QMCPLUSPLUS_PSIFORMER_NATIVE_H
+
 #include <hdf5.h>
 
 #include <algorithm>
@@ -47,6 +58,7 @@ namespace pf
 // automatic-differentiation library.
 using Shape = std::vector<size_t>;
 
+/// Return the number of scalar elements represented by a tensor shape.
 size_t product(const Shape& shape)
 {
   return std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<>());
@@ -59,23 +71,29 @@ struct Tensor
   Shape shape;
   std::vector<double> x;
 
+  /// Construct an empty sentinel tensor.
   Tensor() = default;
 
+  /// Allocate a shaped tensor and initialize every element to one value.
   explicit Tensor(Shape tensor_shape, double initial_value = 0)
       : shape(std::move(tensor_shape)), x(product(shape), initial_value)
   {}
 
+  /// Construct a shaped tensor from an existing row-major value vector.
   Tensor(Shape tensor_shape, std::vector<double> values) : shape(std::move(tensor_shape)), x(std::move(values))
   {
     if (x.size() != product(shape))
       throw std::runtime_error("Tensor size mismatch");
   }
 
+  /// Report whether this is the empty sentinel rather than a scalar tensor.
   bool empty() const { return shape.empty() && x.empty(); }
 
+  /// Return the number of stored scalar elements.
   size_t size() const { return x.size(); }
 };
 
+/// Compute row-major strides for each tensor axis.
 Shape strides(const Shape& shape)
 {
   Shape row_major_strides(shape.size(), 1);
@@ -84,6 +102,7 @@ Shape strides(const Shape& shape)
   return row_major_strides;
 }
 
+/// Convert a row-major flat offset into a multidimensional index.
 Shape unravel(size_t flat_index, const Shape& shape)
 {
   Shape multi_index(shape.size());
@@ -96,6 +115,7 @@ Shape unravel(size_t flat_index, const Shape& shape)
   return multi_index;
 }
 
+/// Convert a multidimensional index into its row-major flat offset.
 size_t ravel(const Shape& multi_index, const Shape& shape)
 {
   const Shape row_major_strides = strides(shape);
@@ -105,6 +125,7 @@ size_t ravel(const Shape& multi_index, const Shape& shape)
   return flat_index;
 }
 
+/// Determine the NumPy-style broadcast result shape of two tensors.
 Shape broadcast_shape(const Shape& left_shape, const Shape& right_shape)
 {
   const size_t output_rank = std::max(left_shape.size(), right_shape.size());
@@ -126,6 +147,7 @@ Shape broadcast_shape(const Shape& left_shape, const Shape& right_shape)
   return output_shape;
 }
 
+/// Map one broadcast-output index to the corresponding input flat offset.
 size_t broadcast_offset(const Shape& output_index, const Shape& input_shape)
 {
   const size_t leading_output_axes = output_index.size() - input_shape.size();
@@ -135,6 +157,7 @@ size_t broadcast_offset(const Shape& output_index, const Shape& input_shape)
   return ravel(input_index, input_shape);
 }
 
+/// Sum a broadcast gradient back into the original input shape.
 Tensor unbroadcast(const Tensor& broadcast_gradient, const Shape& target_shape)
 {
   // Several broadcast output elements may map to one singleton input element;
@@ -148,6 +171,7 @@ Tensor unbroadcast(const Tensor& broadcast_gradient, const Shape& target_shape)
   return target_gradient;
 }
 
+/// Apply a broadcast-aware binary scalar operation to two plain tensors.
 Tensor elem_binary(const Tensor& left, const Tensor& right, const std::function<double(double, double)>& operation)
 {
   const Shape output_shape = broadcast_shape(left.shape, right.shape);
@@ -162,6 +186,7 @@ Tensor elem_binary(const Tensor& left, const Tensor& right, const std::function<
   return output;
 }
 
+/// Apply a scalar operation independently to every element of a plain tensor.
 Tensor elem_unary(const Tensor& input, const std::function<double(double)>& operation)
 {
   Tensor output(input.shape);
@@ -176,9 +201,11 @@ Tensor elem_unary(const Tensor& input, const std::function<double(double)>& oper
 // d2[c,...] = d^2(value)/dR_c^2. Mixed second derivatives are not needed for
 // the electronic Laplacian. Each parent edge stores a VJP for reverse parameter
 // derivatives.
+// Forward declaration used by graph edge shared pointers.
 struct Node;
 using NodePtr = std::shared_ptr<Node>;
 
+/// Connect a graph node to one parent and define its local reverse-mode VJP.
 struct Edge
 {
   NodePtr parent;
@@ -195,6 +222,7 @@ struct Node
   std::string parameter_key;
 };
 
+/// Construct a graph node from its value, coordinate jets, and parent edges.
 NodePtr node(Tensor value,
              Tensor first_coordinate_derivative  = {},
              Tensor second_coordinate_derivative = {},
@@ -208,8 +236,10 @@ NodePtr node(Tensor value,
   return result;
 }
 
+/// Wrap a coordinate- and parameter-independent tensor in a graph node.
 NodePtr constant(Tensor value) { return node(std::move(value)); }
 
+/// Construct a scalar constant node.
 NodePtr scalar(double value) { return constant(Tensor({}, std::vector<double>{value})); }
 
 /** Create the coordinate leaf and seed its first derivative with the identity
@@ -228,6 +258,7 @@ NodePtr coordinates(const Tensor& value)
   return node(value, std::move(first_coordinate_derivative), std::move(second_coordinate_derivative));
 }
 
+/// Broadcast every coordinate slice of a derivative jet to an output value shape.
 Tensor broadcast_jet(const Tensor& jet, const Shape& source_shape, const Shape& output_shape, size_t coordinate_count)
 {
   Shape output_jet_shape{coordinate_count};
@@ -251,6 +282,7 @@ Tensor broadcast_jet(const Tensor& jet, const Shape& source_shape, const Shape& 
 // Primitive differentiable operations. Each operation propagates the coordinate
 // jets and records the VJP needed to send a parameter adjoint back to its
 // parents.
+/// Apply an elementwise scalar function while constructing spatial jets and its VJP.
 NodePtr unary(const NodePtr& input,
               const std::function<double(double)>& function,
               const std::function<double(double)>& function_first_derivative,
@@ -296,6 +328,7 @@ NodePtr unary(const NodePtr& input,
               std::move(parent_edges));
 }
 
+/// Add two broadcast-compatible graph nodes and propagate both derivative forms.
 NodePtr add(const NodePtr& left, const NodePtr& right)
 {
   Tensor value = elem_binary(left->value, right->value,
@@ -327,7 +360,7 @@ NodePtr add(const NodePtr& left, const NodePtr& right)
   // that were introduced by broadcasting.
   const Shape left_shape  = left->value.shape;
   const Shape right_shape = right->value.shape;
-  auto left_vjp  = [left_shape](const Tensor& upstream_gradient) { return unbroadcast(upstream_gradient, left_shape); };
+  auto left_vjp = [left_shape](const Tensor& upstream_gradient) { return unbroadcast(upstream_gradient, left_shape); };
 
   auto right_vjp = [right_shape](const Tensor& upstream_gradient) {
     return unbroadcast(upstream_gradient, right_shape);
@@ -338,11 +371,13 @@ NodePtr add(const NodePtr& left, const NodePtr& right)
               std::move(parent_edges));
 }
 
+/// Negate a graph node elementwise.
 NodePtr neg(const NodePtr& input)
 {
   return unary(input, [](double value) { return -value; }, [](double) { return -1.; }, [](double) { return 0.; });
 }
 
+/// Multiply two broadcast-compatible graph nodes using first- and second-order product rules.
 NodePtr mul(const NodePtr& left, const NodePtr& right)
 {
   Tensor value = elem_binary(left->value, right->value,
@@ -411,6 +446,7 @@ NodePtr mul(const NodePtr& left, const NodePtr& right)
               std::move(parent_edges));
 }
 
+/// Compute an elementwise reciprocal node and its analytic derivatives.
 NodePtr recip(const NodePtr& input)
 {
   return unary(
@@ -418,8 +454,10 @@ NodePtr recip(const NodePtr& input)
       [](double value) { return 2 / (value * value * value); });
 }
 
+/// Divide two graph nodes by composing multiplication with a reciprocal.
 NodePtr divide(const NodePtr& numerator, const NodePtr& denominator) { return mul(numerator, recip(denominator)); }
 
+/// Compute an elementwise exponential node.
 NodePtr exp_node(const NodePtr& input)
 {
   return unary(
@@ -427,6 +465,7 @@ NodePtr exp_node(const NodePtr& input)
       [](double value) { return std::exp(value); });
 }
 
+/// Compute an elementwise natural-logarithm node.
 NodePtr log_node(const NodePtr& input)
 {
   return unary(
@@ -434,6 +473,7 @@ NodePtr log_node(const NodePtr& input)
       [](double value) { return -1 / (value * value); });
 }
 
+/// Compute log(1+x) elementwise with stable standard-library evaluation.
 NodePtr log1p_node(const NodePtr& input)
 {
   return unary(
@@ -441,6 +481,7 @@ NodePtr log1p_node(const NodePtr& input)
       [](double value) { return -1 / ((1 + value) * (1 + value)); });
 }
 
+/// Compute an elementwise square-root node.
 NodePtr sqrt_node(const NodePtr& input)
 {
   return unary(
@@ -448,6 +489,7 @@ NodePtr sqrt_node(const NodePtr& input)
       [](double value) { return -.25 / std::pow(value, 1.5); });
 }
 
+/// Compute an elementwise hyperbolic-tangent node.
 NodePtr tanh_node(const NodePtr& input)
 {
   return unary(
@@ -462,6 +504,7 @@ NodePtr tanh_node(const NodePtr& input)
       });
 }
 
+/// Compute elementwise absolute values, using zero derivative at the nondifferentiable origin.
 NodePtr abs_node(const NodePtr& input)
 {
   return unary(
@@ -470,6 +513,7 @@ NodePtr abs_node(const NodePtr& input)
 }
 
 // Tensor transformations and reductions.
+/// Change tensor value axes without changing storage order or element count.
 NodePtr reshape(const NodePtr& input, Shape output_shape)
 {
   if (product(output_shape) != input->value.size())
@@ -496,6 +540,7 @@ NodePtr reshape(const NodePtr& input, Shape output_shape)
               std::move(parent_edges));
 }
 
+/// Permute the axes of a plain row-major tensor.
 Tensor transpose_t(const Tensor& input, const std::vector<size_t>& axes)
 {
   Shape output_shape;
@@ -514,6 +559,7 @@ Tensor transpose_t(const Tensor& input, const std::vector<size_t>& axes)
   return output;
 }
 
+/// Permute value axes and apply the corresponding permutation to jets and adjoints.
 NodePtr transpose(const NodePtr& input, const std::vector<size_t>& axes)
 {
   Tensor value = transpose_t(input->value, axes);
@@ -544,6 +590,7 @@ NodePtr transpose(const NodePtr& input, const std::vector<size_t>& axes)
               std::move(parent_edges));
 }
 
+/// Sum a plain tensor over the requested axes.
 Tensor reduce_sum_t(const Tensor& input, const std::vector<size_t>& axes)
 {
   std::vector<bool> is_reduced_axis(input.shape.size(), false);
@@ -568,6 +615,7 @@ Tensor reduce_sum_t(const Tensor& input, const std::vector<size_t>& axes)
   return output;
 }
 
+/// Reduce a graph node over selected axes and broadcast its VJP back to the input.
 NodePtr sum_axes(const NodePtr& input, std::vector<size_t> axes)
 {
   Tensor value = reduce_sum_t(input->value, axes);
@@ -610,6 +658,7 @@ NodePtr sum_axes(const NodePtr& input, std::vector<size_t> axes)
               std::move(parent_edges));
 }
 
+/// Reduce every value axis of a graph node to a scalar.
 NodePtr sum_all(const NodePtr& input)
 {
   std::vector<size_t> axes(input->value.shape.size());
@@ -617,6 +666,7 @@ NodePtr sum_all(const NodePtr& input)
   return sum_axes(input, axes);
 }
 
+/// Extract a half-open interval along the leading value axis.
 NodePtr slice0(const NodePtr& input, size_t begin, size_t end)
 {
   Shape output_shape             = input->value.shape;
@@ -665,6 +715,7 @@ NodePtr slice0(const NodePtr& input, size_t begin, size_t end)
               std::move(parent_edges));
 }
 
+/// Concatenate graph nodes along one value axis and construct interval-extraction VJPs.
 NodePtr concat(const std::vector<NodePtr>& inputs, size_t axis)
 {
   if (inputs.empty())
@@ -788,6 +839,7 @@ NodePtr concat(const std::vector<NodePtr>& inputs, size_t axis)
 }
 
 // Dense and self-attention kernels used by the PsiFormer feature layers.
+/// Apply a shared dense layer to the final input axis, with an optional broadcast bias.
 NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias = nullptr)
 {
   const size_t input_width  = input->value.shape.back();
@@ -869,6 +921,7 @@ NodePtr linear(const NodePtr& input, const NodePtr& weight, const NodePtr& bias 
   return bias ? add(output, bias) : output;
 }
 
+/// Form per-head query-key dot products for every ordered electron pair.
 NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
 {
   const size_t electron_count = query->value.shape[0];
@@ -957,6 +1010,7 @@ NodePtr attention_logits(const NodePtr& query, const NodePtr& key)
               std::move(parent_edges));
 }
 
+/// Aggregate value features over source electrons using per-head attention weights.
 NodePtr attention_context(const NodePtr& attention_weight, const NodePtr& feature_value)
 {
   const size_t head_count     = attention_weight->value.shape[0];
@@ -1045,6 +1099,7 @@ NodePtr attention_context(const NodePtr& attention_weight, const NodePtr& featur
               std::move(parent_edges));
 }
 
+/// Normalize each final-axis row with a numerically stable softmax.
 NodePtr softmax(const NodePtr& input)
 {
   const size_t row_width = input->value.shape.back();
@@ -1130,6 +1185,7 @@ NodePtr softmax(const NodePtr& input)
               std::move(parent_edges));
 }
 
+/// Compute a square matrix determinant and inverse together by pivoted elimination.
 std::pair<double, std::vector<double>> det_inv(const double* matrix, size_t matrix_size)
 {
   // Gauss-Jordan elimination with partial pivoting produces the determinant
@@ -1187,6 +1243,7 @@ std::pair<double, std::vector<double>> det_inv(const double* matrix, size_t matr
   return {determinant * permutation_sign, std::move(inverse)};
 }
 
+/// Return tr(left*right) for two row-major square matrices.
 double trace_product(const double* left, const double* right, size_t matrix_size)
 {
   double trace = 0;
@@ -1317,6 +1374,7 @@ std::unordered_map<const Node*, Tensor> backward(const NodePtr& root)
 
 // HDF5 import helpers for the flattened DeepQMC parameter export and
 // configuration data.
+/// Read a floating-point HDF5 dataset and optionally return its shape.
 std::vector<double> read_double(hid_t file, const std::string& path, Shape* shape = nullptr)
 {
   const hid_t dataset   = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -1337,6 +1395,7 @@ std::vector<double> read_double(hid_t file, const std::string& path, Shape* shap
   return values;
 }
 
+/// Read a signed 64-bit integer HDF5 dataset and optionally return its shape.
 std::vector<int64_t> read_i64(hid_t file, const std::string& path, Shape* shape = nullptr)
 {
   const hid_t dataset   = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -1357,6 +1416,7 @@ std::vector<int64_t> read_i64(hid_t file, const std::string& path, Shape* shape 
   return values;
 }
 
+/// Read and reclaim a variable-length string dataset from HDF5.
 std::vector<std::string> read_strings(hid_t file, const std::string& path)
 {
   const hid_t dataset   = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -1382,6 +1442,7 @@ std::vector<std::string> read_strings(hid_t file, const std::string& path)
   return strings;
 }
 
+/// Read one signed 64-bit integer attribute from an HDF5 object.
 int64_t read_attr_i64(hid_t file, const std::string& name)
 {
   const hid_t attribute = H5Aopen(file, name.c_str(), H5P_DEFAULT);
@@ -1391,6 +1452,7 @@ int64_t read_attr_i64(hid_t file, const std::string& name)
   return value;
 }
 
+/// Describe one named parameter tensor within the flattened export vector.
 struct Layout
 {
   std::string module;
@@ -1408,6 +1470,7 @@ struct Parameters
   std::vector<Layout> layouts;
   std::map<std::pair<std::string, std::string>, NodePtr> nodes;
 
+  /// Load flattened parameters and materialize their named graph leaves.
   explicit Parameters(const std::string& path)
   {
     const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -1441,6 +1504,7 @@ struct Parameters
     H5Fclose(file);
   }
 
+  /// Resolve exactly one exported parameter by Haiku module suffix and leaf name.
   NodePtr find(const std::string& suffix, const std::string& name)
   {
     // DeepQMC/Haiku module paths contain generated prefixes. A unique suffix
@@ -1460,6 +1524,7 @@ struct Parameters
     return match;
   }
 
+  /// Pack named parameter adjoints back into exported flat-vector order.
   std::vector<double> flat_gradient(const std::unordered_map<const Node*, Tensor>& adjoints)
   {
     // Reassemble named parameter adjoints in exactly the order of the exported
@@ -1487,6 +1552,7 @@ struct ConfigData
   size_t ndown;
   size_t nconfig;
 
+  /// Load electron configurations, nuclei, charges, and spin populations.
   explicit ConfigData(const std::string& path)
   {
     const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -1503,6 +1569,7 @@ struct ConfigData
     H5Fclose(file);
   }
 
+  /// Extract one electron configuration as an [electron, Cartesian] tensor.
   Tensor configuration(size_t configuration_index) const
   {
     const size_t configuration_size = (nup + ndown) * 3;
@@ -1539,10 +1606,12 @@ struct PsiFormer
   size_t dim   = 256;
   size_t heads = 4;
 
+  /// Load one fixed exported PsiFormer model and its physical-system metadata.
   PsiFormer(const std::string& parameter_path, const std::string& configuration_path)
       : p(parameter_path), cfg(configuration_path), ne(cfg.nup + cfg.ndown)
   {}
 
+  /// Build learned electron features from electron-nucleus geometry and spin labels.
   NodePtr embedding(const NodePtr& positions)
   {
     // Construct four features for every electron-nucleus pair:
@@ -1586,6 +1655,7 @@ struct PsiFormer
     return linear(raw_features, embedding_weight);
   }
 
+  /// Select one scalar from a rank-two Cartesian tensor while preserving the graph.
   NodePtr slice_scalar(const NodePtr& tensor, size_t row, size_t column)
   {
     // slice0 operates on the leading axis, so flatten the selected Cartesian
@@ -1595,6 +1665,7 @@ struct PsiFormer
     return reshape(slice0(flattened_row, column, column + 1), {});
   }
 
+  /// Apply one self-attention block and its residual two-layer MLP update.
   NodePtr attention_block(const NodePtr& input_features, int layer)
   {
     // Exported Haiku paths number the first block implicitly and suffix later
@@ -1628,6 +1699,7 @@ struct PsiFormer
     return add(attention_residual, feature_update);
   }
 
+  /// Project one spin block into determinant-specific orbital values.
   NodePtr backflow(const NodePtr& electron_features, bool spin_up)
   {
     // Select one spin block, project every electron feature into all
@@ -1644,6 +1716,7 @@ struct PsiFormer
     return transpose(electron_major_orbitals, {1, 0, 2});
   }
 
+  /// Construct learned atom-centred exponential envelopes for one spin block.
   NodePtr envelope(const NodePtr& positions, bool spin_up)
   {
     // Each orbital is multiplied by a learned sum of atom-centred exponential
@@ -1690,6 +1763,7 @@ struct PsiFormer
     return transpose(electron_major_envelope, {1, 0, 2});
   }
 
+  /// Construct the analytic same-spin and opposite-spin electron cusp correction.
   NodePtr cusp(const NodePtr& positions)
   {
     // Same-spin and opposite-spin electron pairs use the physical 1/4 and 1/2
@@ -1730,6 +1804,7 @@ struct PsiFormer
     return cusp_value;
   }
 
+  /// Evaluate wavefunction observables, derivatives, Coulomb terms, and optional parameter gradients.
   Result evaluate(const Tensor& electron_positions, bool with_parameter_gradient = true)
   {
     // Feature layers: electron-nucleus embedding followed by four attention
@@ -1818,11 +1893,13 @@ struct PsiFormer
 
 // Standalone validation support. This code is excluded when included by
 // QMCPACK.
+/// Read one named validation observable from the reference HDF5 file.
 std::vector<double> read_reference(hid_t reference_file, const std::string& field_name, Shape* shape = nullptr)
 {
   return read_double(reference_file, "/" + field_name, shape);
 }
 
+/// Write one computed validation observable to the output HDF5 file.
 void write_dataset(hid_t output_file,
                    const std::string& field_name,
                    const Shape& shape,
@@ -1837,6 +1914,7 @@ void write_dataset(hid_t output_file,
   H5Sclose(dataspace);
 }
 
+/// Run standalone evaluation, reference comparison, and HDF5 output generation.
 int run(const std::string& parameter_path,
         const std::string& configuration_path,
         const std::string& reference_path,
@@ -1922,6 +2000,7 @@ int run(const std::string& parameter_path,
 } // namespace pf
 
 #ifndef PSIFORMER_LIBRARY
+/// Parse standalone-driver paths and report evaluation failures to the shell.
 int main(int argc, char** argv)
 {
   if (argc != 5)
@@ -1940,4 +2019,6 @@ int main(int argc, char** argv)
     return 1;
   }
 }
-#endif
+#endif // PSIFORMER_LIBRARY
+
+#endif // QMCPLUSPLUS_PSIFORMER_NATIVE_H

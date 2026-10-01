@@ -20,10 +20,12 @@ namespace qmcplusplus
 class PsiFormerWaveFunctionBuilder : public WaveFunctionComponentBuilder
 {
 public:
+  /// Bind the builder to the target electron set; no auxiliary particle set is required.
   PsiFormerWaveFunctionBuilder(Communicate* comm, ParticleSet& target, const PSetMap&)
       : WaveFunctionComponentBuilder(comm, target)
   {}
 
+  /// Parse export paths and construct one fixed PsiFormer wavefunction component.
   std::unique_ptr<WaveFunctionComponent> buildComponent(xmlNodePtr current) override;
 };
 
