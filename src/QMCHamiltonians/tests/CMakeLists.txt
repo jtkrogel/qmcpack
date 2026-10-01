@@ -29,6 +29,7 @@ set(HAM_SRCS
     test_ecp.cpp
     test_hamiltonian_pool.cpp
     test_hamiltonian_factory.cpp
+    test_MFRPotential.cpp
     test_PairCorrEstimator.cpp
     test_SkAllEstimator.cpp
     test_QMCHamiltonian.cpp

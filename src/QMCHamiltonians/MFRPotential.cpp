@@ -137,7 +137,7 @@ MFRPotential::MFRPotential(ParticleSet& pset,
                            std::vector<std::shared_ptr<UBspline_3d_d>> splines,
                            int spin_channels,
                            std::string file_name,
-                           RealType total_energy_mf)
+                           FullPrecRealType total_energy_mf)
     : pset_(pset),
       field_lattice_(field_lattice),
       splines_(std::move(splines)),
@@ -314,7 +314,7 @@ void MFRPotential::setParticlePropertyList(PropertySetType& plist, int offset)
   plist[my_index_ + offset + 1] = total_energy_mf_;
 }
 
-MFRPotential::RealType MFRPotential::evaluateOne(const ParticleSet& pset, int particle_index) const
+MFRPotential::FullPrecRealType MFRPotential::evaluateOne(const ParticleSet& pset, int particle_index) const
 {
   const int channel = spin_channels_ == 1 ? 0 : pset.getGroupID(particle_index);
   if (channel < 0 || channel >= spin_channels_)
@@ -330,7 +330,7 @@ MFRPotential::Return_t MFRPotential::evaluate(ParticleSet& pset)
   value_ = 0.0;
   for (int i = 0; i < pset.getTotalNum(); ++i)
   {
-    const RealType particle_value = evaluateOne(pset, i);
+    const FullPrecRealType particle_value = evaluateOne(pset, i);
 #if !defined(REMOVE_TRACEMANAGER)
     if (streaming_particles_)
       (*v_sample_)(i) = particle_value;

@@ -25,7 +25,7 @@ public:
   bool put(xmlNodePtr cur) override;
   bool get(std::ostream& os) const override;
   Return_t evaluate(ParticleSet& pset) override;
-  RealType getTotalEnergyMF() const { return total_energy_mf_; }
+  FullPrecRealType getTotalEnergyMF() const { return total_energy_mf_; }
   void addObservables(PropertySetType& plist, BufferType& collectables) override;
   void registerObservables(std::vector<ObservableHelper>& h5desc, hdf_archive& file) const override;
   void setObservables(PropertySetType& plist) override;
@@ -44,16 +44,16 @@ private:
                std::vector<std::shared_ptr<UBspline_3d_d>> splines,
                int spin_channels,
                std::string file_name,
-               RealType total_energy_mf);
+               FullPrecRealType total_energy_mf);
 
-  RealType evaluateOne(const ParticleSet& pset, int particle_index) const;
+  FullPrecRealType evaluateOne(const ParticleSet& pset, int particle_index) const;
 
   const ParticleSet& pset_;
   Lattice field_lattice_;
   std::vector<std::shared_ptr<UBspline_3d_d>> splines_;
   int spin_channels_ = 0;
   std::string file_name_;
-  RealType total_energy_mf_ = 0.0;
+  FullPrecRealType total_energy_mf_ = 0.0;
 
 #if !defined(REMOVE_TRACEMANAGER)
   Array<TraceReal, 1>* v_sample_ = nullptr;
