@@ -9,10 +9,18 @@
  * @brief Native implementation of the DeepQMC PsiFormer architecture.
  *
  * This implementation evaluates a fixed, HDF5-exported PsiFormer model without
- * a JAX runtime. Spatial derivatives are propagated as analytic first- and
- * diagonal-second- derivative jets. Parameter derivatives, used by the
- * standalone validation driver, are accumulated with explicit vector-Jacobian
- * products (VJPs).
+ * JAX or another external automatic-differentiation framework. It contains a
+ * small, purpose-built differentiation engine: spatial derivatives are
+ * propagated forward as first- and diagonal-second-derivative coordinate jets,
+ * while parameter derivatives are accumulated in reverse through an internal
+ * computation graph. Each primitive operation supplies explicitly coded
+ * analytic propagation rules or vector-Jacobian products (VJPs).
+ *
+ * Consequently, derivatives are assembled automatically by composing these
+ * hand-written primitive rules; they are not finite-difference estimates, but
+ * neither are they fully expanded, hand-derived formulas for each top-level
+ * PsiFormer observable. Parameter derivatives are currently used by the
+ * standalone validation driver.
  *
  * Define PSIFORMER_LIBRARY before including this file to omit the standalone
  * comparison driver. The QMCPACK WaveFunctionComponent does this in
