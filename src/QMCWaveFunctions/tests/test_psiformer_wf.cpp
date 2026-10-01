@@ -18,10 +18,14 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Utilities/RuntimeOptions.h"
+#include "io/hdf/hdf_archive.h"
 #include "psiformer_test_utils.h"
 
 #include <cmath>
 #include <complex>
+#include <filesystem>
+#include <functional>
+#include <future>
 #include <sstream>
 #include <vector>
 
@@ -77,6 +81,139 @@ double kineticEnergy(const ParticleSet& electrons)
   }
   return kinetic;
 }
+
+/// Evaluate the three straight-Coulomb potential terms for the LiH fixture.
+double coulombPotential(const ParticleSet& electrons)
+{
+  const Geometry geometry = makeGeometry("lih");
+  auto electronNucleusDistance = [&electrons, &geometry](int electron, std::size_t nucleus) {
+    double squared_distance = 0.0;
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      const double displacement =
+          electrons.R[electron][dimension] - geometry.nuclei[3 * nucleus + dimension];
+      squared_distance += displacement * displacement;
+    }
+    return std::sqrt(squared_distance);
+  };
+
+  double potential = 0.0;
+  for (int first = 0; first < electrons.getTotalNum(); ++first)
+    for (int second = first + 1; second < electrons.getTotalNum(); ++second)
+    {
+      double squared_distance = 0.0;
+      for (int dimension = 0; dimension < 3; ++dimension)
+      {
+        const double displacement =
+            electrons.R[first][dimension] - electrons.R[second][dimension];
+        squared_distance += displacement * displacement;
+      }
+      potential += 1.0 / std::sqrt(squared_distance);
+    }
+
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    for (std::size_t nucleus = 0; nucleus < geometry.charges.size(); ++nucleus)
+      potential -= geometry.charges[nucleus] / electronNucleusDistance(electron, nucleus);
+
+  for (std::size_t first = 0; first < geometry.charges.size(); ++first)
+    for (std::size_t second = first + 1; second < geometry.charges.size(); ++second)
+    {
+      double squared_distance = 0.0;
+      for (int dimension = 0; dimension < 3; ++dimension)
+      {
+        const double displacement =
+            geometry.nuclei[3 * first + dimension] - geometry.nuclei[3 * second + dimension];
+        squared_distance += displacement * displacement;
+      }
+      potential += geometry.charges[first] * geometry.charges[second] / std::sqrt(squared_distance);
+    }
+  return potential;
+}
+
+/// Capture the high-level observables and selected derivatives of one component.
+struct ComponentSnapshot
+{
+  double log_value;
+  double phase;
+  double wavefunction_value;
+  double local_energy;
+  std::vector<double> gradient;
+  std::vector<double> laplacian;
+  std::vector<double> log_parameter_derivative;
+  std::vector<double> kinetic_parameter_derivative;
+};
+
+/// Register a component's selected parameters through the normal QMCPACK mapping path.
+OptVariables registerSelectedParameters(PsiFormerWF& component)
+{
+  OptVariables active;
+  component.checkInVariablesExclusive(active);
+  active.resetIndex();
+  component.checkOutVariables(active);
+  return active;
+}
+
+/// Evaluate the component from scratch and flatten its public QMCPACK outputs.
+ComponentSnapshot evaluateComponent(PsiFormerWF& component, ParticleSet& electrons, const OptVariables& active)
+{
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue log_value = component.evaluateLog(electrons, electrons.G, electrons.L);
+
+  Vector<ValueType> dlogpsi(active.size());
+  Vector<ValueType> dhpsioverpsi(active.size());
+  dlogpsi      = ValueType(0);
+  dhpsioverpsi = ValueType(0);
+  component.evaluateDerivatives(electrons, active, dlogpsi, dhpsioverpsi);
+
+  ComponentSnapshot snapshot;
+  snapshot.log_value          = std::real(log_value);
+  snapshot.phase              = std::imag(log_value);
+  snapshot.wavefunction_value = std::real(std::exp(log_value));
+  snapshot.local_energy       = kineticEnergy(electrons) + coulombPotential(electrons);
+  snapshot.gradient.reserve(3 * electrons.getTotalNum());
+  snapshot.laplacian.reserve(electrons.getTotalNum());
+  snapshot.log_parameter_derivative.reserve(active.size());
+  snapshot.kinetic_parameter_derivative.reserve(active.size());
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      snapshot.gradient.push_back(std::real(electrons.G[electron][dimension]));
+    snapshot.laplacian.push_back(std::real(electrons.L[electron]));
+  }
+  for (int parameter = 0; parameter < active.size(); ++parameter)
+  {
+    snapshot.log_parameter_derivative.push_back(std::real(dlogpsi[parameter]));
+    snapshot.kinetic_parameter_derivative.push_back(std::real(dhpsioverpsi[parameter]));
+  }
+  return snapshot;
+}
+
+/// Compare complete component snapshots at deterministic native-evaluator tolerance.
+void checkComponentSnapshot(const ComponentSnapshot& actual, const ComponentSnapshot& expected)
+{
+  CHECK(actual.log_value == Catch::Approx(expected.log_value).epsilon(2e-10).margin(2e-10));
+  CHECK(actual.phase == Catch::Approx(expected.phase).epsilon(2e-10).margin(2e-10));
+  CHECK(actual.wavefunction_value ==
+        Catch::Approx(expected.wavefunction_value).epsilon(2e-9).margin(1e-24));
+  CHECK(actual.local_energy == Catch::Approx(expected.local_energy).epsilon(2e-9).margin(2e-9));
+  REQUIRE(actual.gradient.size() == expected.gradient.size());
+  REQUIRE(actual.laplacian.size() == expected.laplacian.size());
+  REQUIRE(actual.log_parameter_derivative.size() == expected.log_parameter_derivative.size());
+  REQUIRE(actual.kinetic_parameter_derivative.size() == expected.kinetic_parameter_derivative.size());
+
+  for (std::size_t index = 0; index < actual.gradient.size(); ++index)
+    CHECK(actual.gradient[index] == Catch::Approx(expected.gradient[index]).epsilon(2e-9).margin(2e-9));
+  for (std::size_t index = 0; index < actual.laplacian.size(); ++index)
+    CHECK(actual.laplacian[index] == Catch::Approx(expected.laplacian[index]).epsilon(2e-8).margin(2e-8));
+  for (std::size_t index = 0; index < actual.log_parameter_derivative.size(); ++index)
+    CHECK(actual.log_parameter_derivative[index] ==
+          Catch::Approx(expected.log_parameter_derivative[index]).epsilon(2e-8).margin(2e-8));
+  for (std::size_t index = 0; index < actual.kinetic_parameter_derivative.size(); ++index)
+    CHECK(actual.kinetic_parameter_derivative[index] ==
+          Catch::Approx(expected.kinetic_parameter_derivative[index]).epsilon(2e-8).margin(2e-8));
+}
+
 } // namespace
 
 TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "[wavefunction][psiformer]")
@@ -188,6 +325,143 @@ TEST_CASE("PsiFormer selected parameters follow QMCPACK registration reset and d
   trial_wavefunction.resetParameters(active);
   const double updated_log = trial_wavefunction.evaluateLog(electrons);
   CHECK(std::abs(updated_log - baseline_log) > 1e-8);
+}
+
+TEST_CASE("PsiFormer clones share versioned parameters and retain local move state", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet leader_electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet clone_electrons  = makeLiHElectrons(simulation_cell);
+
+  PsiFormerWF leader(
+      "pf_clone", files.parameters.string(), files.configuration.string(), true, std::vector<std::size_t>{0, 127});
+  OptVariables active = registerSelectedParameters(leader);
+  std::unique_ptr<WaveFunctionComponent> clone_base = leader.makeClone(clone_electrons);
+  auto* clone = dynamic_cast<PsiFormerWF*>(clone_base.get());
+  REQUIRE(clone != nullptr);
+
+  const ComponentSnapshot initial_leader = evaluateComponent(leader, leader_electrons, active);
+  const ComponentSnapshot initial_clone  = evaluateComponent(*clone, clone_electrons, active);
+  checkComponentSnapshot(initial_clone, initial_leader);
+
+  const std::size_t initial_version = leader.parameterVersion();
+  active[0] += 2e-4;
+  leader.resetParametersExclusive(active);
+  CHECK(leader.parameterVersion() == initial_version + 1);
+  CHECK(clone->parameterVersion() == initial_version + 1);
+  OptVariables clone_active = registerSelectedParameters(*clone);
+  CHECK(std::real(clone_active[0]) == Catch::Approx(std::real(active[0])));
+
+  const ComponentSnapshot updated_leader = evaluateComponent(leader, leader_electrons, active);
+  const ComponentSnapshot updated_clone  = evaluateComponent(*clone, clone_electrons, active);
+  checkComponentSnapshot(updated_clone, updated_leader);
+  CHECK(std::abs(updated_leader.log_value - initial_leader.log_value) > 1e-8);
+
+  // Replaying the same global reset through a clone must not create another
+  // model version or rewrite the shared parameter leaves.
+  clone->resetParametersExclusive(active);
+  CHECK(leader.parameterVersion() == initial_version + 1);
+
+  // Cache a proposal in the clone, update through the leader, and verify that
+  // accepting the now-stale proposal cannot promote its old log value.
+  clone_electrons.makeMove(0, ParticleSet::SingleParticlePos{0.01, -0.02, 0.015});
+  clone->ratio(clone_electrons, 0);
+  active[0] += 1e-4;
+  leader.resetParametersExclusive(active);
+  CHECK(leader.parameterVersion() == initial_version + 2);
+  clone->acceptMove(clone_electrons, 0);
+  CHECK(std::real(clone->get_log_value()) == 0.0);
+  clone_electrons.rejectMove(0);
+
+  // Two clone-local evaluations may read the same immutable parameter version
+  // concurrently. The shared lock excludes optimizer resets during each
+  // native graph traversal.
+  std::promise<void> start_promise;
+  const std::shared_future<void> start = start_promise.get_future().share();
+  auto evaluate_log = [](PsiFormerWF& component, ParticleSet& electrons, std::shared_future<void> gate) {
+    gate.wait();
+    electrons.G = ValueType(0);
+    electrons.L = ValueType(0);
+    return std::real(component.evaluateLog(electrons, electrons.G, electrons.L));
+  };
+  auto leader_future =
+      std::async(std::launch::async, evaluate_log, std::ref(leader), std::ref(leader_electrons), start);
+  auto clone_future =
+      std::async(std::launch::async, evaluate_log, std::ref(*clone), std::ref(clone_electrons), start);
+  start_promise.set_value();
+
+  const double concurrent_leader_log = leader_future.get();
+  const double concurrent_clone_log  = clone_future.get();
+  CHECK(concurrent_clone_log ==
+        Catch::Approx(concurrent_leader_log).epsilon(2e-10).margin(2e-10));
+}
+
+TEST_CASE("PsiFormer complete model persistence and DeepQMC export round trip", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet original_electrons = makeLiHElectrons(simulation_cell);
+
+  const std::vector<std::size_t> selected_indices{0, 127, 2047};
+  PsiFormerWF original(
+      "pf_restart", files.parameters.string(), files.configuration.string(), true, selected_indices);
+  OptVariables original_active = registerSelectedParameters(original);
+  original_active[0] += 1.5e-4;
+  original_active[1] -= 2.0e-4;
+  original_active[2] += 2.5e-4;
+  original.resetParametersExclusive(original_active);
+  const ComponentSnapshot expected = evaluateComponent(original, original_electrons, original_active);
+
+  const std::filesystem::path vp_path = files.directory / "psiformer_restart.vp.h5";
+  hdf_archive output;
+  original_active.writeToHDF(vp_path.string(), output);
+  original.writeVariationalParameters(output);
+  output.close();
+
+  ParticleSet restored_electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF restored(
+      "pf_restart", files.parameters.string(), files.configuration.string(), true, selected_indices);
+  OptVariables restored_active = registerSelectedParameters(restored);
+  hdf_archive input;
+  restored_active.readFromHDF(vp_path.string(), input);
+  restored.readVariationalParameters(input);
+  input.close();
+  restored.resetParametersExclusive(restored_active);
+
+  const ComponentSnapshot restarted = evaluateComponent(restored, restored_electrons, restored_active);
+  checkComponentSnapshot(restarted, expected);
+
+  // The explicit export is intentionally separate from optimizer restart: it
+  // contains only the DeepQMC flat values and immutable tensor layout.
+  const std::filesystem::path export_path = files.directory / "parameters_optimized.h5";
+  restored.exportParameters(export_path.string());
+  ParticleSet exported_electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF exported(
+      "pf_export", export_path.string(), files.configuration.string(), true, selected_indices);
+  OptVariables exported_active = registerSelectedParameters(exported);
+  const ComponentSnapshot exported_snapshot = evaluateComponent(exported, exported_electrons, exported_active);
+  checkComponentSnapshot(exported_snapshot, expected);
+
+  // A restart payload cannot silently bind to a different internal selection.
+  PsiFormerWF mismatched_selection(
+      "pf_restart", files.parameters.string(), files.configuration.string(), true, {0, 128, 2047});
+  hdf_archive mismatch_input;
+  REQUIRE(mismatch_input.open(vp_path.string(), H5F_ACC_RDONLY));
+  CHECK_THROWS_AS(mismatched_selection.readVariationalParameters(mismatch_input), std::runtime_error);
+  mismatch_input.close();
+
+  // The compact generic selected list is duplicated for compatibility. It
+  // must agree with the authoritative complete model payload on restart.
+  PsiFormerWF inconsistent_generic(
+      "pf_restart", files.parameters.string(), files.configuration.string(), true, selected_indices);
+  OptVariables inconsistent_active = registerSelectedParameters(inconsistent_generic);
+  hdf_archive inconsistent_input;
+  inconsistent_active.readFromHDF(vp_path.string(), inconsistent_input);
+  inconsistent_generic.readVariationalParameters(inconsistent_input);
+  inconsistent_input.close();
+  inconsistent_active[0] += 1e-3;
+  CHECK_THROWS_AS(inconsistent_generic.resetParametersExclusive(inconsistent_active), std::runtime_error);
 }
 
 } // namespace qmcplusplus

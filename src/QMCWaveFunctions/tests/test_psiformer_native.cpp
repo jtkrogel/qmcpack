@@ -233,13 +233,14 @@ TEST_CASE("PsiFormer randomized full-shape separated LiH pair high-level observa
   validateCase("lih_pair", pairGolden(), false);
 }
 
-
 TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");
   pf::PsiFormer model(files.parameters, files.configuration);
   const pf::Tensor electrons = model.cfg.configuration(0);
   const std::vector<double> original_values = model.p.flat_values();
+  const std::string original_fingerprint     = model.p.layout_fingerprint();
+  CHECK(original_fingerprint.size() == 16);
 
   REQUIRE(model.p.size() == 1610498);
   CHECK(model.p.version() == 0);
@@ -263,6 +264,7 @@ TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefun
   model.p.set_flat_values(replacement);
   CHECK(model.p.version() == 2);
   CHECK(model.p.flat_values() == replacement);
+  CHECK(model.p.layout_fingerprint() == original_fingerprint);
 
   CHECK_THROWS_AS(model.p.set_flat_values(std::vector<double>{1.0}), std::invalid_argument);
   CHECK_THROWS_AS(model.p.set_flat_values(std::vector<std::size_t>{0, 0}, std::vector<double>{1.0, 2.0}),
@@ -275,6 +277,7 @@ TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefun
   model.p.write(export_path.string());
   pf::PsiFormer reloaded(export_path.string(), files.configuration.string());
   CHECK(reloaded.p.flat_values() == model.p.flat_values());
+  CHECK(reloaded.p.layout_fingerprint() == original_fingerprint);
   const pf::Result reloaded_result = reloaded.evaluate(electrons, false);
   checkClose(reloaded_result.logabs, changed_result.logabs);
   checkClose(reloaded_result.local_energy, changed_result.local_energy, 2e-9, 2e-9);

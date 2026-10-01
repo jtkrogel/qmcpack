@@ -11,24 +11,74 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
+#include "io/hdf/hdf_archive.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <iomanip>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace qmcplusplus
 {
+
+/** Shared native model protected at the optimizer/evaluator synchronization
+ * boundary. Component clones retain only walker-local move state. */
+class PsiFormerSharedState
+{
+public:
+  /// Load the model that all clones of one PsiFormer component will share.
+  PsiFormerSharedState(const std::string& parameters, const std::string& configuration)
+      : model(parameters, configuration)
+  {}
+
+  mutable std::shared_mutex mutex;
+  pf::PsiFormer model;
+};
+
 namespace
 {
+constexpr std::array<int, 3> PERSISTENCE_VERSION{1, 0, 0};
+
 /// Build a stable, compact VariableSet name from a component and canonical flat index.
 std::string makeParameterName(const std::string& component_name, std::size_t flat_index, std::size_t width)
 {
   std::ostringstream name;
   name << component_name << "_pf_" << std::setfill('0') << std::setw(width) << flat_index;
   return name.str();
+}
+
+/// Convert canonical native indices to an explicitly sized HDF5 integer type.
+std::vector<std::uint64_t> persistIndices(const std::vector<std::size_t>& indices)
+{
+  return std::vector<std::uint64_t>(indices.begin(), indices.end());
+}
+
+/// Read a rank-one HDF5 dataset after determining its on-disk extent.
+template<class T>
+std::vector<T> readVector(hdf_archive& input, const std::string& name)
+{
+  std::vector<int> shape;
+  if (!input.getShape<T>(name, shape) || shape.size() != 1 || shape[0] < 0)
+    throw std::runtime_error("PsiFormer VP dataset " + name + " is not a rank-one array");
+
+  std::vector<T> values(shape[0]);
+  input.read(values, name);
+  return values;
+}
+
+/// Require exact immutable metadata equality before accepting a model payload.
+template<class T>
+void requireEqual(const std::vector<T>& actual, const std::vector<T>& expected, const std::string& description)
+{
+  if (actual != expected)
+    throw std::runtime_error("PsiFormer VP " + description + " does not match the configured model");
 }
 } // namespace
 
@@ -40,7 +90,7 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::vector<std::size_t> selected_flat_indices)
     : WaveFunctionComponent(name),
       OptimizableObject(name),
-      model_(std::make_shared<pf::PsiFormer>(parameters, configuration)),
+      model_state_(std::make_shared<PsiFormerSharedState>(parameters, configuration)),
       selected_flat_indices_(std::move(selected_flat_indices)),
       optimization_enabled_(enable_optimization)
 {
@@ -54,13 +104,40 @@ PsiFormerWF::PsiFormerWF(std::string name,
       selected_flat_indices_.end())
     throw std::invalid_argument("PsiFormer optimize_indices contains a duplicate flat index");
 
-  const std::size_t name_width = std::to_string(model_->p.size() - 1).size();
+  pf::Parameters& parameters_ref = model_state_->model.p;
+  if (parameters_ref.size() == 0)
+    throw std::invalid_argument("PsiFormer parameter export contains no scalar values");
+
+  observed_parameter_version_    = parameters_ref.version();
+  const std::size_t name_width   = std::to_string(parameters_ref.size() - 1).size();
   for (std::size_t flat_index : selected_flat_indices_)
   {
-    model_->p.layout_for_flat_index(flat_index);
+    parameters_ref.layout_for_flat_index(flat_index);
     myVars.insert(makeParameterName(WaveFunctionComponent::getName(), flat_index, name_width),
-                  model_->p.flat_values()[flat_index], true, optimize::OTHER_P);
+                  parameters_ref.flat_values()[flat_index], true, optimize::OTHER_P);
   }
+}
+
+// Copy clone-local accepted state while deliberately discarding an in-flight proposal.
+PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
+    : WaveFunctionComponent(other),
+      OptimizableObject(other),
+      model_state_(other.model_state_),
+      selected_flat_indices_(other.selected_flat_indices_),
+      optimization_enabled_(other.optimization_enabled_),
+      observed_parameter_version_(other.observed_parameter_version_),
+      restore_validation_pending_(other.restore_validation_pending_),
+      accepted_value_valid_(other.accepted_value_valid_),
+      current_sign_(other.current_sign_)
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  synchronizeParameterVersion(model_state_->model.p.version());
+  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+    myVars[local_index] = model_state_->model.p.flat_values()[selected_flat_indices_[local_index]];
+
+  proposed_sign_      = 1.0;
+  proposed_log_value_ = LogValue(0);
+  has_proposal_       = false;
 }
 
 // Register this object only when the input explicitly enabled optimization.
@@ -73,8 +150,14 @@ void PsiFormerWF::extractOptimizableObjectRefs(UniqueOptObjRefs& opt_obj_refs)
 // Append selected local values to the optimizer's global variable collection.
 void PsiFormerWF::checkInVariablesExclusive(OptVariables& active)
 {
-  if (optimization_enabled_)
-    active.insertFrom(myVars);
+  if (!optimization_enabled_)
+    return;
+
+  std::shared_lock state_lock(model_state_->mutex);
+  synchronizeParameterVersion(model_state_->model.p.version());
+  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+    myVars[local_index] = model_state_->model.p.flat_values()[selected_flat_indices_[local_index]];
+  active.insertFrom(myVars);
 }
 
 // Cache the global active index corresponding to each selected local parameter.
@@ -84,15 +167,34 @@ void PsiFormerWF::checkOutVariables(const OptVariables& active)
     myVars.getIndex(active);
 }
 
-// Apply one validated selected-parameter update and invalidate old move state.
+// Clear all cached values derived from an older parameter vector.
+void PsiFormerWF::invalidateParameterCaches(std::size_t parameter_version)
+{
+  current_sign_               = 1.0;
+  proposed_sign_              = 1.0;
+  log_value_                  = LogValue(0);
+  proposed_log_value_         = LogValue(0);
+  has_proposal_               = false;
+  accepted_value_valid_       = false;
+  observed_parameter_version_ = parameter_version;
+}
+
+// Lazily invalidate clone-local caches after another clone updates the model.
+void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
+{
+  if (observed_parameter_version_ != parameter_version)
+    invalidateParameterCaches(parameter_version);
+}
+
+// Apply one validated selected-parameter update at an exclusive model barrier.
 void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
 {
   if (!optimization_enabled_)
     return;
 
-  std::vector<std::size_t> changed_local_indices;
-  std::vector<std::size_t> changed_flat_indices;
-  std::vector<double> changed_values;
+  std::vector<std::size_t> active_local_indices;
+  std::vector<std::size_t> active_flat_indices;
+  std::vector<double> active_values;
   for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
   {
     const int global_index = myVars.where(local_index);
@@ -101,34 +203,169 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
     if (global_index >= active.size())
       throw std::out_of_range("PsiFormer global optimization index is out of range");
 
-    changed_local_indices.push_back(local_index);
-    changed_flat_indices.push_back(selected_flat_indices_[local_index]);
-    changed_values.push_back(std::real(active[global_index]));
+    active_local_indices.push_back(local_index);
+    active_flat_indices.push_back(selected_flat_indices_[local_index]);
+    active_values.push_back(std::real(active[global_index]));
   }
 
-  if (changed_values.empty())
+  if (active_values.empty())
     return;
 
-  model_->p.set_flat_values(changed_flat_indices, changed_values);
-  for (std::size_t changed = 0; changed < changed_values.size(); ++changed)
-    myVars[changed_local_indices[changed]] = changed_values[changed];
+  std::size_t parameter_version;
+  bool model_changed = false;
+  {
+    std::unique_lock state_lock(model_state_->mutex);
+    pf::Parameters& parameters = model_state_->model.p;
 
-  // A proposal or cached accepted log value evaluated with the previous
-  // parameter version must not participate in the next move sequence.
-  current_sign_       = 1.0;
-  proposed_sign_      = 1.0;
-  log_value_          = LogValue(0);
-  proposed_log_value_ = LogValue(0);
-  has_proposal_      = false;
+    // The complete object-specific payload is authoritative on restart. The
+    // duplicated generic scalar list must agree before the normal reset path
+    // is allowed to continue.
+    if (restore_validation_pending_)
+    {
+      for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
+        if (active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]])
+          throw std::runtime_error(
+              "PsiFormer generic selected values disagree with the authoritative VP model payload");
+      restore_validation_pending_ = false;
+    }
+
+    for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
+      model_changed =
+          model_changed || active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]];
+
+    if (model_changed)
+      parameters.set_flat_values(active_flat_indices, active_values);
+    parameter_version = parameters.version();
+  }
+
+  for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
+    myVars[active_local_indices[parameter]] = active_values[parameter];
+
+  if (model_changed || observed_parameter_version_ != parameter_version)
+    invalidateParameterCaches(parameter_version);
+}
+
+// Store a complete, self-identifying model payload in the optimizer VP file.
+void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
+{
+  if (!optimization_enabled_)
+    return;
+
+  std::shared_lock state_lock(model_state_->mutex);
+  const pf::PsiFormer& model = model_state_->model;
+
+  output.push("PsiFormer");
+  output.push(OptimizableObject::getName());
+
+  const std::vector<int> format_version(PERSISTENCE_VERSION.begin(), PERSISTENCE_VERSION.end());
+  const std::vector<std::uint64_t> parameter_count{model.p.size()};
+  const std::vector<std::uint64_t> spin_counts{model.cfg.nup, model.cfg.ndown};
+  const std::vector<std::uint64_t> architecture{model.ndet, model.dim, model.heads};
+  const std::vector<std::uint64_t> nuclear_shape(model.cfg.nuclei.shape.begin(), model.cfg.nuclei.shape.end());
+  const std::vector<std::uint64_t> selected_indices = persistIndices(selected_flat_indices_);
+  const std::string layout_fingerprint              = model.p.layout_fingerprint();
+
+  output.write(format_version, "format_version");
+  output.write(parameter_count, "parameter_count");
+  output.write(layout_fingerprint, "layout_fingerprint");
+  output.write(spin_counts, "spin_counts");
+  output.write(architecture, "architecture");
+  output.write(nuclear_shape, "nuclear_shape");
+  output.write(model.cfg.nuclei.x, "nuclear_positions");
+  output.write(model.cfg.charges.x, "nuclear_charges");
+  output.write(selected_indices, "selected_flat_indices");
+  output.write(model.p.flat_values(), "flat_values");
+
+  output.pop();
+  output.pop();
+}
+
+// Restore a complete model only after validating all identifying metadata.
+void PsiFormerWF::readVariationalParameters(hdf_archive& input)
+{
+  if (!optimization_enabled_)
+    return;
+  if (!input.is_group("PsiFormer"))
+    throw std::runtime_error("PsiFormer VP file has no PsiFormer object group");
+
+  input.push("PsiFormer", false);
+  if (!input.is_group(OptimizableObject::getName()))
+    throw std::runtime_error("PsiFormer VP file has no group for component " + OptimizableObject::getName());
+  input.push(OptimizableObject::getName(), false);
+
+  const std::vector<int> format_version             = readVector<int>(input, "format_version");
+  const std::vector<std::uint64_t> parameter_count  = readVector<std::uint64_t>(input, "parameter_count");
+  const std::vector<std::uint64_t> spin_counts      = readVector<std::uint64_t>(input, "spin_counts");
+  const std::vector<std::uint64_t> architecture     = readVector<std::uint64_t>(input, "architecture");
+  const std::vector<std::uint64_t> nuclear_shape    = readVector<std::uint64_t>(input, "nuclear_shape");
+  const std::vector<double> nuclear_positions       = readVector<double>(input, "nuclear_positions");
+  const std::vector<double> nuclear_charges         = readVector<double>(input, "nuclear_charges");
+  const std::vector<std::uint64_t> selected_indices =
+      readVector<std::uint64_t>(input, "selected_flat_indices");
+  const std::vector<double> flat_values = readVector<double>(input, "flat_values");
+  std::string layout_fingerprint;
+  input.read(layout_fingerprint, "layout_fingerprint");
+
+  input.pop();
+  input.pop();
+
+  const std::vector<int> expected_version(PERSISTENCE_VERSION.begin(), PERSISTENCE_VERSION.end());
+  requireEqual(format_version, expected_version, "format version");
+
+  std::size_t parameter_version;
+  {
+    std::unique_lock state_lock(model_state_->mutex);
+    pf::PsiFormer& model = model_state_->model;
+
+    requireEqual(parameter_count, std::vector<std::uint64_t>{model.p.size()}, "parameter count");
+    if (layout_fingerprint != model.p.layout_fingerprint())
+      throw std::runtime_error("PsiFormer VP layout fingerprint does not match the configured model");
+    requireEqual(spin_counts, std::vector<std::uint64_t>{model.cfg.nup, model.cfg.ndown}, "spin populations");
+    requireEqual(architecture, std::vector<std::uint64_t>{model.ndet, model.dim, model.heads}, "architecture");
+    requireEqual(nuclear_shape,
+                 std::vector<std::uint64_t>(model.cfg.nuclei.shape.begin(), model.cfg.nuclei.shape.end()),
+                 "nuclear-position shape");
+    requireEqual(nuclear_positions, model.cfg.nuclei.x, "nuclear positions");
+    requireEqual(nuclear_charges, model.cfg.charges.x, "nuclear charges");
+    requireEqual(selected_indices, persistIndices(selected_flat_indices_), "selected flat indices");
+
+    if (flat_values != model.p.flat_values())
+      model.p.set_flat_values(flat_values);
+    parameter_version = model.p.version();
+
+    for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+      myVars[local_index] = model.p.flat_values()[selected_flat_indices_[local_index]];
+  }
+
+  invalidateParameterCaches(parameter_version);
+  restore_validation_pending_ = true;
+}
+
+// Return the parameter version shared by this component and all of its clones.
+std::size_t PsiFormerWF::parameterVersion() const
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  return model_state_->model.p.version();
+}
+
+// Write a standalone flat parameter file without exposing mutable native storage.
+void PsiFormerWF::exportParameters(const std::string& path) const
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  model_state_->model.p.write(path);
 }
 
 // Translate QMCPACK particle coordinates and derivative context into a native request.
 pf::Result PsiFormerWF::evaluate(const ParticleSet& p,
                                  int active,
                                  bool with_parameter_gradient,
-                                 bool with_kinetic_parameter_gradient) const
+                                 bool with_kinetic_parameter_gradient)
 {
-  if (static_cast<std::size_t>(p.getTotalNum()) != model_->ne)
+  std::shared_lock state_lock(model_state_->mutex);
+  pf::PsiFormer& model = model_state_->model;
+  synchronizeParameterVersion(model.p.version());
+
+  if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
   if (with_kinetic_parameter_gradient && !with_parameter_gradient)
     throw std::logic_error("PsiFormer kinetic parameter derivatives require log parameter derivatives");
@@ -159,7 +396,7 @@ pf::Result PsiFormerWF::evaluate(const ParticleSet& p,
     request.total_log_gradient = &total_log_gradient;
   }
 
-  return model_->evaluate(positions, request);
+  return model.evaluate(positions, request);
 }
 
 // Evaluate a full accepted configuration and accumulate its spatial derivatives.
@@ -178,15 +415,19 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
       g[electron][dimension] += result.gradient[3 * electron + dimension];
     l[electron] += result.lap_log[electron];
   }
+  accepted_value_valid_ = true;
   return log_value_;
 }
 
 // Evaluate and cache the wavefunction ratio for one proposed electron position.
 PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
 {
+  auto result = evaluate(p, iat);
+  if (!accepted_value_valid_)
+    throw std::logic_error("PsiFormer ratio requested before evaluateLog for the current parameter version");
+
   // Cache proposal state so acceptMove can commit it without reevaluating the
   // network.
-  auto result         = evaluate(p, iat);
   proposed_sign_      = result.sign;
   proposed_log_value_ = LogValue(result.logabs, result.sign < 0 ? M_PI : 0.0);
   has_proposal_       = true;
@@ -206,9 +447,12 @@ PsiFormerWF::GradType PsiFormerWF::evalGrad(ParticleSet& p, int iat)
 // Evaluate a proposed ratio and gradient in one native-model traversal.
 PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& gradient)
 {
+  auto result = evaluate(p, iat);
+  if (!accepted_value_valid_)
+    throw std::logic_error("PsiFormer ratioGrad requested before evaluateLog for the current parameter version");
+
   // Evaluate the proposal once and return both its ratio and active-electron
   // gradient.
-  auto result         = evaluate(p, iat);
   proposed_sign_      = result.sign;
   proposed_log_value_ = LogValue(result.logabs, result.sign < 0 ? M_PI : 0.0);
   has_proposal_       = true;
@@ -220,16 +464,24 @@ PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& 
 // Promote cached proposal state to accepted state after a successful move.
 void PsiFormerWF::acceptMove(ParticleSet&, int, bool)
 {
+  std::shared_lock state_lock(model_state_->mutex);
+  synchronizeParameterVersion(model_state_->model.p.version());
   if (has_proposal_)
   {
-    log_value_    = proposed_log_value_;
-    current_sign_ = proposed_sign_;
+    log_value_            = proposed_log_value_;
+    current_sign_         = proposed_sign_;
+    accepted_value_valid_ = true;
   }
   has_proposal_ = false;
 }
 
 // Forget cached proposal state after a rejected move.
-void PsiFormerWF::restore(int) { has_proposal_ = false; }
+void PsiFormerWF::restore(int)
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  synchronizeParameterVersion(model_state_->model.p.version());
+  has_proposal_ = false;
+}
 
 // Re-evaluate the component because it does not maintain walker-buffer storage.
 PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& p, WFBufferType&, bool)
@@ -288,7 +540,7 @@ void PsiFormerWF::evaluateDerivatives(ParticleSet& p,
   addSelectedGradient(result.local_energy_param_gradient, dhpsioverpsi);
 }
 
-// Copy move and optimizer-index state while sharing the synchronized native model.
+// Copy optimizer mapping and accepted state while sharing the synchronized native model.
 std::unique_ptr<WaveFunctionComponent> PsiFormerWF::makeClone(ParticleSet&) const
 {
   return std::make_unique<PsiFormerWF>(*this);

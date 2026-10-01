@@ -29,6 +29,9 @@ struct Result;
 
 namespace qmcplusplus
 {
+/// Shared, versioned native model state used by all clones of one component.
+class PsiFormerSharedState;
+
 /**
  * Wavefunction component for a PsiFormer model exported from DeepQMC.
  *
@@ -36,6 +39,10 @@ namespace qmcplusplus
  * The initial optimization path registers a selected set of canonical flat
  * indices so that native derivatives can be validated end to end before the
  * million-parameter registration and optimizer-storage work is introduced.
+ *
+ * Clones share one versioned native model behind a reader/writer lock, while
+ * accepted and proposed move state remains clone-local. Object-specific VP
+ * records persist the complete model independently of the selected scalar list.
  */
 class PsiFormerWF : public WaveFunctionComponent, public OptimizableObject
 {
@@ -47,8 +54,8 @@ public:
               bool optimize = false,
               std::vector<std::size_t> selected_flat_indices = {});
 
-  /// Copy component-local state while sharing the model used at optimizer synchronization points.
-  PsiFormerWF(const PsiFormerWF&) = default;
+  /// Copy accepted state and optimizer mappings while dropping any in-flight proposal.
+  PsiFormerWF(const PsiFormerWF& other);
 
   /// Return the component name used by QMCPACK diagnostics.
   std::string getClassName() const override { return "PsiFormerWF"; }
@@ -70,6 +77,18 @@ public:
 
   /// Apply active values to the synchronized native flat parameter storage.
   void resetParametersExclusive(const OptVariables& active) override;
+
+  /// Store the complete model state and selection in the object-specific VP group.
+  void writeVariationalParameters(hdf_archive& output) override;
+
+  /// Restore and validate the authoritative complete model state from a VP group.
+  void readVariationalParameters(hdf_archive& input) override;
+
+  /// Return the shared model version for diagnostics and synchronization tests.
+  std::size_t parameterVersion() const;
+
+  /// Export current parameters in the flat DeepQMC-compatible HDF5 format.
+  void exportParameters(const std::string& path) const;
 
   /// Evaluate log(psi), gradients, and logarithmic Laplacians for a full configuration.
   LogValue evaluateLog(const ParticleSet& particles,
@@ -119,7 +138,7 @@ private:
   pf::Result evaluate(const ParticleSet& particles,
                       int active_particle = -1,
                       bool with_parameter_gradient = false,
-                      bool with_kinetic_parameter_gradient = false) const;
+                      bool with_kinetic_parameter_gradient = false);
 
   /// Return true when at least one selected local parameter maps to a global active variable.
   bool hasActiveParameters() const;
@@ -127,12 +146,24 @@ private:
   /// Add selected entries from a native flat gradient to a QMCPACK derivative vector.
   void addSelectedGradient(const std::vector<double>& flat_gradient, Vector<ValueType>& output) const;
 
-  /// Native model and synchronized parameter leaves shared by component clones.
-  std::shared_ptr<pf::PsiFormer> model_;
+  /// Invalidate accepted/proposed caches and record the newly observed shared version.
+  void invalidateParameterCaches(std::size_t parameter_version);
+
+  /// Lazily invalidate this clone when another clone changed the shared parameters.
+  void synchronizeParameterVersion(std::size_t parameter_version);
+
+  /// Versioned native model protected against evaluation/reset overlap.
+  std::shared_ptr<PsiFormerSharedState> model_state_;
   /// Canonically sorted native flat indices represented by this optimization object.
   std::vector<std::size_t> selected_flat_indices_;
   /// Enable registration and derivative work only when requested by input.
   bool optimization_enabled_ = false;
+  /// Last shared parameter version observed by this component clone.
+  std::size_t observed_parameter_version_ = 0;
+  /// Require the generic selected values to agree after an authoritative VP restore.
+  bool restore_validation_pending_ = false;
+  /// Track whether log_value_ belongs to the current shared parameter version.
+  bool accepted_value_valid_ = false;
   /// Accepted and proposed sign/log-value state used by particle-by-particle moves.
   double current_sign_ = 1.0, proposed_sign_ = 1.0;
   LogValue proposed_log_value_ = LogValue(0);

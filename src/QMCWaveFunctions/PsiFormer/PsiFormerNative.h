@@ -2015,6 +2015,45 @@ struct Parameters
   /// Return the version incremented after each successful parameter mutation.
   size_t version() const { return parameter_version; }
 
+  /// Return a stable fingerprint of the immutable exported tensor layout.
+  std::string layout_fingerprint() const
+  {
+    // FNV-1a is used only as a deterministic compatibility fingerprint, not
+    // for adversarial input. Length prefixes keep adjacent strings and shapes
+    // unambiguous.
+    uint64_t hash = 14695981039346656037ULL;
+    auto mix_byte = [&hash](uint8_t byte) {
+      hash ^= byte;
+      hash *= 1099511628211ULL;
+    };
+    auto mix_integer = [&mix_byte](uint64_t value) {
+      for (int byte = 0; byte < 8; ++byte)
+        mix_byte(static_cast<uint8_t>(value >> (8 * byte)));
+    };
+    auto mix_string = [&mix_byte, &mix_integer](const std::string& value) {
+      mix_integer(value.size());
+      for (unsigned char character : value)
+        mix_byte(character);
+    };
+
+    mix_integer(layouts.size());
+    mix_integer(values.size());
+    for (const Layout& layout : layouts)
+    {
+      mix_string(layout.module);
+      mix_string(layout.name);
+      mix_integer(layout.shape.size());
+      for (size_t extent : layout.shape)
+        mix_integer(extent);
+      mix_integer(layout.begin);
+      mix_integer(layout.end);
+    }
+
+    std::ostringstream fingerprint;
+    fingerprint << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return fingerprint.str();
+  }
+
   /// Resolve the parameter tensor containing one canonical flat index.
   const Layout& layout_for_flat_index(size_t flat_index) const
   {
