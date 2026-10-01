@@ -8,6 +8,7 @@
 
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
+#include "psiformer_test_utils.h"
 
 #include <array>
 #include <cstdint>
@@ -18,240 +19,7 @@
 
 namespace
 {
-constexpr std::uint64_t MIX_INCREMENT = 0x9E3779B97F4A7C15ULL;
-
-class SplitMix64
-{
-public:
-  explicit SplitMix64(std::uint64_t seed) : state_(seed) {}
-  std::uint64_t next()
-  {
-    std::uint64_t z = (state_ += MIX_INCREMENT);
-    z               = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z               = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
-  }
-  double uniform() { return static_cast<double>(next() >> 11) * (1.0 / 9007199254740992.0); }
-  double symmetric() { return 2.0 * uniform() - 1.0; }
-
-private:
-  std::uint64_t state_;
-};
-
-std::uint64_t mix64(std::uint64_t z)
-{
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
-}
-
-struct Leaf
-{
-  std::string module;
-  std::string name;
-  pf::Shape shape;
-};
-
-std::vector<Leaf> makeLayout(std::size_t nelec, std::size_t nnuc)
-{
-  const std::string p = "neural_network_wave_function/~/";
-  std::vector<Leaf> leaves{
-      {p + "electronic_cusp_asymptotic", "anti_alpha", {}},
-      {p + "electronic_cusp_asymptotic", "same_alpha", {}},
-      {p + "exponential_envelopes", "pi_down", {16 * nelec, nnuc}},
-      {p + "exponential_envelopes", "pi_up", {16 * nelec, nnuc}},
-      {p + "exponential_envelopes", "zetas_down", {16 * nelec, nnuc}},
-      {p + "exponential_envelopes", "zetas_up", {16 * nelec, nnuc}},
-      {p + "omni_net/~/Backflow/~/mlp/linear_0", "w", {256, 16 * nelec}},
-      {p + "omni_net/~/Backflow_1/~/mlp/linear_0", "w", {256, 16 * nelec}},
-      {p + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w", {4 * nnuc + 1, 256}},
-  };
-  for (int layer = 0; layer < 4; ++layer)
-  {
-    const std::string layer_name = layer == 0 ? "electron_gnn_layer" : "electron_gnn_layer_" + std::to_string(layer);
-    const std::string base = p + "omni_net/~/electron_gnn/~/" + layer_name +
-        "/~/node_attention_electron_update_feature/";
-    leaves.insert(leaves.end(), {{base + "mlp/linear_0", "b", {256}},
-                                 {base + "mlp/linear_0", "w", {256, 256}},
-                                 {base + "mlp/linear_1", "b", {256}},
-                                 {base + "mlp/linear_1", "w", {256, 256}},
-                                 {base + "multi_head_attention/key", "w", {256, 256}},
-                                 {base + "multi_head_attention/linear", "w", {256, 256}},
-                                 {base + "multi_head_attention/query", "w", {256, 256}},
-                                 {base + "multi_head_attention/value", "w", {256, 256}}});
-  }
-  return leaves;
-}
-
-std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
-{
-  const std::size_t nelec = system == "lih" ? 4 : 8;
-  SplitMix64 rng(0xC0FFEE1234000000ULL + nelec);
-  std::vector<double> values;
-  for (const Leaf& leaf : leaves)
-    for (std::size_t i = 0; i < pf::product(leaf.shape); ++i)
-    {
-      double value;
-      if (leaf.name.size() >= 5 && leaf.name.substr(leaf.name.size() - 5) == "alpha")
-        value = 0.8 + 0.4 * rng.uniform();
-      else if (leaf.name.rfind("zetas", 0) == 0)
-        value = 0.6 + 0.8 * rng.uniform();
-      else if (leaf.name.rfind("pi_", 0) == 0)
-        value = 0.15 + 0.2 * rng.symmetric();
-      else if (leaf.name == "b")
-        value = 0.02 * rng.symmetric();
-      else if (leaf.module.find("electron_embedding") != std::string::npos)
-        value = 0.08 * rng.symmetric();
-      else if (leaf.module.find("Backflow") != std::string::npos)
-        value = 0.06 * rng.symmetric();
-      else
-        value = 0.04 * rng.symmetric();
-      values.push_back(value);
-    }
-  return values;
-}
-
-struct Geometry
-{
-  std::vector<double> nuclei;
-  std::vector<double> charges;
-  std::vector<double> electrons;
-  std::size_t nup;
-};
-
-Geometry makeGeometry(const std::string& system)
-{
-  Geometry g;
-  std::vector<std::size_t> centers;
-  if (system == "lih")
-  {
-    g.nuclei = {0, 0, 0, 3.05, 0.08, -0.03};
-    g.charges = {3, 1};
-    centers   = {0, 1, 0, 1};
-    g.nup     = 2;
-  }
-  else
-  {
-    g.nuclei = {0, 0, 0, 3.05, 0.08, -0.03, 0.12, 14.7, 0.06, 3.17, 14.78, 0.03};
-    g.charges = {3, 1, 3, 1};
-    centers   = {0, 1, 2, 3, 0, 1, 2, 3};
-    g.nup     = 4;
-  }
-  SplitMix64 rng(0x1234ABCDEF000000ULL + centers.size());
-  for (double& coordinate : g.nuclei)
-    coordinate += 0.025 * rng.symmetric();
-  g.electrons.resize(3 * centers.size());
-  for (std::size_t i = 0; i < centers.size(); ++i)
-    for (int d = 0; d < 3; ++d)
-    {
-      const double magnitude = 0.35 + 0.9 * rng.uniform();
-      const double sign      = (rng.next() & 1) ? 1.0 : -1.0;
-      g.electrons[3 * i + d] = g.nuclei[3 * centers[i] + d] + sign * magnitude;
-    }
-  return g;
-}
-
-void writeStrings(hid_t file, const char* name, const std::vector<std::string>& strings)
-{
-  const hsize_t size = strings.size();
-  hid_t space        = H5Screate_simple(1, &size, nullptr);
-  hid_t type         = H5Tcopy(H5T_C_S1);
-  H5Tset_size(type, H5T_VARIABLE);
-  hid_t dataset = H5Dcreate2(file, name, type, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-  std::vector<const char*> pointers;
-  for (const std::string& string : strings)
-    pointers.push_back(string.c_str());
-  REQUIRE(H5Dwrite(dataset, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, pointers.data()) >= 0);
-  H5Dclose(dataset);
-  H5Tclose(type);
-  H5Sclose(space);
-}
-
-template<class T>
-void writeNumeric(hid_t file, const char* name, hid_t type, const std::vector<hsize_t>& shape, const std::vector<T>& values)
-{
-  hid_t space   = H5Screate_simple(shape.size(), shape.data(), nullptr);
-  hid_t dataset = H5Dcreate2(file, name, type, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-  REQUIRE(H5Dwrite(dataset, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data()) >= 0);
-  H5Dclose(dataset);
-  H5Sclose(space);
-}
-
-void writeIntAttribute(hid_t file, const char* name, std::int64_t value)
-{
-  hid_t space = H5Screate(H5S_SCALAR);
-  hid_t attr  = H5Acreate2(file, name, H5T_NATIVE_LLONG, space, H5P_DEFAULT, H5P_DEFAULT);
-  REQUIRE(H5Awrite(attr, H5T_NATIVE_LLONG, &value) >= 0);
-  H5Aclose(attr);
-  H5Sclose(space);
-}
-
-struct GeneratedFiles
-{
-  std::filesystem::path directory;
-  std::filesystem::path parameters;
-  std::filesystem::path configuration;
-  GeneratedFiles() = default;
-  GeneratedFiles(const GeneratedFiles&) = delete;
-  GeneratedFiles& operator=(const GeneratedFiles&) = delete;
-  GeneratedFiles(GeneratedFiles&& other) noexcept
-      : directory(std::move(other.directory)), parameters(std::move(other.parameters)),
-        configuration(std::move(other.configuration))
-  {}
-  ~GeneratedFiles()
-  {
-    std::error_code error;
-    if (!directory.empty())
-      std::filesystem::remove_all(directory, error);
-  }
-};
-
-GeneratedFiles generateFiles(const std::string& system)
-{
-  GeneratedFiles files;
-  files.directory = std::filesystem::temp_directory_path() /
-      ("qmcpack_psiformer_random_" + system + "_" + std::to_string(static_cast<long long>(getpid())));
-  std::filesystem::remove_all(files.directory);
-  std::filesystem::create_directories(files.directory);
-  files.parameters  = files.directory / "parameters.h5";
-  files.configuration = files.directory / "configuration.h5";
-
-  const Geometry geometry = makeGeometry(system);
-  const std::size_t nelec  = geometry.electrons.size() / 3;
-  const std::size_t nnuc   = geometry.nuclei.size() / 3;
-  const auto leaves        = makeLayout(nelec, nnuc);
-  const auto values        = makeParameters(system, leaves);
-  std::vector<std::string> modules, names;
-  std::vector<std::int64_t> ranks, shapes(2 * leaves.size(), 1), offsets{0};
-  for (std::size_t i = 0; i < leaves.size(); ++i)
-  {
-    modules.push_back(leaves[i].module);
-    names.push_back(leaves[i].name);
-    ranks.push_back(leaves[i].shape.size());
-    for (std::size_t d = 0; d < leaves[i].shape.size(); ++d)
-      shapes[2 * i + d] = leaves[i].shape[d];
-    offsets.push_back(offsets.back() + pf::product(leaves[i].shape));
-  }
-
-  hid_t file = H5Fcreate(files.parameters.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  writeNumeric(file, "/values", H5T_NATIVE_DOUBLE, {values.size()}, values);
-  H5Gclose(H5Gcreate2(file, "/layout", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
-  writeStrings(file, "/layout/modules", modules);
-  writeStrings(file, "/layout/names", names);
-  writeNumeric(file, "/layout/ranks", H5T_NATIVE_LLONG, {ranks.size()}, ranks);
-  writeNumeric(file, "/layout/shapes", H5T_NATIVE_LLONG, {leaves.size(), 2}, shapes);
-  writeNumeric(file, "/layout/offsets", H5T_NATIVE_LLONG, {offsets.size()}, offsets);
-  H5Fclose(file);
-
-  file = H5Fcreate(files.configuration.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  writeNumeric(file, "/nuclear_positions", H5T_NATIVE_DOUBLE, {nnuc, 3}, geometry.nuclei);
-  writeNumeric(file, "/nuclear_charges", H5T_NATIVE_DOUBLE, {nnuc}, geometry.charges);
-  writeNumeric(file, "/electron_positions", H5T_NATIVE_DOUBLE, {1, nelec, 3}, geometry.electrons);
-  writeIntAttribute(file, "n_up", geometry.nup);
-  writeIntAttribute(file, "n_down", nelec - geometry.nup);
-  H5Fclose(file);
-  return files;
-}
+using namespace qmcplusplus::testing::psiformer;
 
 struct Golden
 {
@@ -453,6 +221,8 @@ void validateCase(const std::string& system, const Golden& golden, bool finite_d
 }
 } // namespace
 
+using namespace qmcplusplus::testing::psiformer;
+
 TEST_CASE("PsiFormer randomized full-shape LiH high-level observables", "[wavefunction][psiformer]")
 {
   validateCase("lih", lihGolden(), true);
@@ -461,4 +231,113 @@ TEST_CASE("PsiFormer randomized full-shape LiH high-level observables", "[wavefu
 TEST_CASE("PsiFormer randomized full-shape separated LiH pair high-level observables", "[wavefunction][psiformer]")
 {
   validateCase("lih_pair", pairGolden(), false);
+}
+
+
+TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  const std::vector<double> original_values = model.p.flat_values();
+
+  REQUIRE(model.p.size() == 1610498);
+  CHECK(model.p.version() == 0);
+  const pf::Layout& first_layout = model.p.layout_for_flat_index(0);
+  CHECK(first_layout.begin == 0);
+  CHECK(first_layout.end == 1);
+  CHECK_THROWS_AS(model.p.layout_for_flat_index(model.p.size()), std::out_of_range);
+
+  const std::size_t scalar_index = 127;
+  const pf::Layout& scalar_layout = model.p.layout_for_flat_index(scalar_index);
+  const double changed_value = original_values[scalar_index] + 0.03125;
+  model.p.set_flat_value(scalar_index, changed_value);
+  CHECK(model.p.version() == 1);
+  CHECK(model.p.flat_values()[scalar_index] == changed_value);
+  CHECK(model.p.nodes.at({scalar_layout.module, scalar_layout.name})
+            ->value.x[scalar_index - scalar_layout.begin] == changed_value);
+
+  std::vector<double> replacement = original_values;
+  replacement[0] += 0.015625;
+  replacement[scalar_index] -= 0.0078125;
+  model.p.set_flat_values(replacement);
+  CHECK(model.p.version() == 2);
+  CHECK(model.p.flat_values() == replacement);
+
+  CHECK_THROWS_AS(model.p.set_flat_values(std::vector<double>{1.0}), std::invalid_argument);
+  CHECK_THROWS_AS(model.p.set_flat_values(std::vector<std::size_t>{0, 0}, std::vector<double>{1.0, 2.0}),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(model.p.set_flat_value(0, std::numeric_limits<double>::infinity()), std::invalid_argument);
+  CHECK(model.p.version() == 2);
+
+  const pf::Result changed_result = model.evaluate(electrons, false);
+  const std::filesystem::path export_path = files.directory / "parameters_exported.h5";
+  model.p.write(export_path.string());
+  pf::PsiFormer reloaded(export_path.string(), files.configuration.string());
+  CHECK(reloaded.p.flat_values() == model.p.flat_values());
+  const pf::Result reloaded_result = reloaded.evaluate(electrons, false);
+  checkClose(reloaded_result.logabs, changed_result.logabs);
+  checkClose(reloaded_result.local_energy, changed_result.local_energy, 2e-9, 2e-9);
+}
+
+TEST_CASE("PsiFormer explicit parameter derivative requests and total-gradient seed", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::Tensor electrons = model.cfg.configuration(0);
+
+  const pf::Result no_derivatives =
+      model.evaluate(electrons, pf::EvaluationRequest{pf::ParameterDerivativeRequest::NONE, nullptr});
+  CHECK(no_derivatives.param_gradient.empty());
+  CHECK(no_derivatives.local_energy_param_gradient.empty());
+
+  const pf::Result log_only =
+      model.evaluate(electrons, pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_ONLY, nullptr});
+  REQUIRE(log_only.param_gradient.size() == model.p.size());
+  CHECK(log_only.local_energy_param_gradient.empty());
+
+  const pf::Result standalone = model.evaluate(
+      electrons, pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_AND_KINETIC, nullptr});
+  CHECK(log_only.param_gradient == standalone.param_gradient);
+  REQUIRE(standalone.local_energy_param_gradient.size() == model.p.size());
+
+  std::vector<double> extra_gradient(standalone.gradient.size());
+  std::vector<double> total_gradient(standalone.gradient.size());
+  for (std::size_t coordinate = 0; coordinate < extra_gradient.size(); ++coordinate)
+  {
+    extra_gradient[coordinate] = 0.01 * (1 + coordinate % 3);
+    total_gradient[coordinate] = standalone.gradient[coordinate] + extra_gradient[coordinate];
+  }
+  const pf::Result composed = model.evaluate(
+      electrons, pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_AND_KINETIC, &total_gradient});
+
+  auto composed_local_energy = [&]() {
+    const pf::Result result = model.evaluate(electrons, false);
+    double cross_term = 0.0;
+    double extra_norm = 0.0;
+    for (std::size_t coordinate = 0; coordinate < extra_gradient.size(); ++coordinate)
+    {
+      cross_term += result.gradient[coordinate] * extra_gradient[coordinate];
+      extra_norm += extra_gradient[coordinate] * extra_gradient[coordinate];
+    }
+    return result.local_energy - cross_term - 0.5 * extra_norm;
+  };
+
+  const std::size_t flat_index = 0;
+  const double original_value = model.p.flat_values()[flat_index];
+  const double parameter_step = 2e-5;
+  model.p.set_flat_value(flat_index, original_value + parameter_step);
+  const double plus_energy = composed_local_energy();
+  model.p.set_flat_value(flat_index, original_value - parameter_step);
+  const double minus_energy = composed_local_energy();
+  model.p.set_flat_value(flat_index, original_value);
+  const double finite_difference = (plus_energy - minus_energy) / (2 * parameter_step);
+  CHECK(finite_difference ==
+        Catch::Approx(composed.local_energy_param_gradient[flat_index]).epsilon(2e-4).margin(2e-4));
+
+  const std::vector<double> wrong_total_gradient(1, 0.0);
+  CHECK_THROWS_AS(model.evaluate(
+                      electrons,
+                      pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_AND_KINETIC, &wrong_total_gradient}),
+                  std::invalid_argument);
 }

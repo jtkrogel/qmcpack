@@ -21,8 +21,8 @@
  * Consequently, derivatives are assembled automatically by composing these
  * hand-written primitive rules; they are not finite-difference estimates, but
  * neither are they fully expanded, hand-derived formulas for each top-level
- * PsiFormer observable. Parameter derivatives are currently used by the
- * standalone validation driver.
+ * PsiFormer observable. Parameter derivatives support the standalone
+ * validation driver and QMCPACK selected-parameter optimization.
  *
  * Define PSIFORMER_LIBRARY before including this file to omit the standalone
  * comparison driver. The QMCPACK WaveFunctionComponent does this in
@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
@@ -1943,6 +1944,15 @@ int64_t read_attr_i64(hid_t file, const std::string& name)
   return value;
 }
 
+/// Test IEEE-754 finiteness without relying on fast-math-sensitive classification builtins.
+bool is_finite_parameter_value(double value)
+{
+  static_assert(sizeof(double) == sizeof(uint64_t));
+  uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return (bits & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
+}
+
 /// Describe one named parameter tensor within the flattened export vector.
 struct Layout
 {
@@ -1960,6 +1970,7 @@ struct Parameters
   std::vector<double> values;
   std::vector<Layout> layouts;
   std::map<std::pair<std::string, std::string>, NodePtr> nodes;
+  size_t parameter_version = 0;
 
   /// Load flattened parameters and materialize their named graph leaves.
   explicit Parameters(const std::string& path)
@@ -1992,6 +2003,148 @@ struct Parameters
       layouts.push_back(layout);
       nodes[{modules[parameter_index], names[parameter_index]}] = parameter_node;
     }
+    H5Fclose(file);
+  }
+
+  /// Return the number of scalar parameters in canonical DeepQMC export order.
+  size_t size() const { return values.size(); }
+
+  /// Expose the current canonical flat values without allowing unsynchronized mutation.
+  const std::vector<double>& flat_values() const { return values; }
+
+  /// Return the version incremented after each successful parameter mutation.
+  size_t version() const { return parameter_version; }
+
+  /// Resolve the parameter tensor containing one canonical flat index.
+  const Layout& layout_for_flat_index(size_t flat_index) const
+  {
+    if (flat_index >= values.size())
+      throw std::out_of_range("PsiFormer flat parameter index out of range");
+
+    const auto layout = std::find_if(layouts.begin(), layouts.end(), [flat_index](const Layout& candidate) {
+      return candidate.begin <= flat_index && flat_index < candidate.end;
+    });
+    if (layout == layouts.end())
+      throw std::runtime_error("PsiFormer parameter layout does not cover flat index " +
+                               std::to_string(flat_index));
+    return *layout;
+  }
+
+  /// Atomically replace every flat value and synchronize all graph parameter leaves.
+  void set_flat_values(const std::vector<double>& new_values)
+  {
+    if (new_values.size() != values.size())
+      throw std::invalid_argument("PsiFormer flat parameter vector has the wrong size");
+    if (std::any_of(new_values.begin(), new_values.end(),
+                    [](double value) { return !is_finite_parameter_value(value); }))
+      throw std::invalid_argument("PsiFormer flat parameter vector contains a non-finite value");
+
+    values = new_values;
+    for (const Layout& layout : layouts)
+    {
+      NodePtr parameter_node = nodes.at({layout.module, layout.name});
+      std::copy(values.begin() + layout.begin, values.begin() + layout.end, parameter_node->value.x.begin());
+    }
+    ++parameter_version;
+  }
+
+  /// Atomically replace a selected set of flat values and synchronize their graph leaves.
+  void set_flat_values(const std::vector<size_t>& flat_indices, const std::vector<double>& new_values)
+  {
+    if (flat_indices.size() != new_values.size())
+      throw std::invalid_argument("PsiFormer selected parameter indices and values differ in size");
+
+    std::vector<size_t> sorted_indices = flat_indices;
+    std::sort(sorted_indices.begin(), sorted_indices.end());
+    if (std::adjacent_find(sorted_indices.begin(), sorted_indices.end()) != sorted_indices.end())
+      throw std::invalid_argument("PsiFormer selected parameter indices contain a duplicate");
+
+    for (size_t parameter = 0; parameter < flat_indices.size(); ++parameter)
+    {
+      layout_for_flat_index(flat_indices[parameter]);
+      if (!is_finite_parameter_value(new_values[parameter]))
+        throw std::invalid_argument("PsiFormer selected parameter value is not finite");
+    }
+
+    for (size_t parameter = 0; parameter < flat_indices.size(); ++parameter)
+    {
+      const size_t flat_index = flat_indices[parameter];
+      const Layout& layout    = layout_for_flat_index(flat_index);
+      values[flat_index]      = new_values[parameter];
+      nodes.at({layout.module, layout.name})->value.x[flat_index - layout.begin] = new_values[parameter];
+    }
+    if (!flat_indices.empty())
+      ++parameter_version;
+  }
+
+  /// Replace one flat value through the same synchronized mutation path.
+  void set_flat_value(size_t flat_index, double new_value)
+  {
+    set_flat_values(std::vector<size_t>{flat_index}, std::vector<double>{new_value});
+  }
+
+  /// Export current values and immutable tensor layout in the DeepQMC HDF5 format.
+  void write(const std::string& path) const
+  {
+    const hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (file < 0)
+      throw std::runtime_error("Unable to create PsiFormer parameter file " + path);
+
+    auto write_numeric = [file](const std::string& dataset_path, hid_t type, const std::vector<hsize_t>& shape,
+                                const void* data) {
+      const hid_t dataspace = H5Screate_simple(shape.size(), shape.data(), nullptr);
+      const hid_t dataset = H5Dcreate2(file, dataset_path.c_str(), type, dataspace, H5P_DEFAULT, H5P_DEFAULT,
+                                       H5P_DEFAULT);
+      if (dataset < 0 || H5Dwrite(dataset, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data) < 0)
+        throw std::runtime_error("Unable to write PsiFormer dataset " + dataset_path);
+      H5Dclose(dataset);
+      H5Sclose(dataspace);
+    };
+
+    write_numeric("/values", H5T_NATIVE_DOUBLE, {values.size()}, values.data());
+    H5Gclose(H5Gcreate2(file, "/layout", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT));
+
+    std::vector<std::string> modules, names;
+    std::vector<int64_t> ranks;
+    std::vector<int64_t> offsets{0};
+    size_t maximum_rank = 1;
+    for (const Layout& layout : layouts)
+      maximum_rank = std::max(maximum_rank, layout.shape.size());
+    std::vector<int64_t> shapes(layouts.size() * maximum_rank, 1);
+    for (size_t parameter = 0; parameter < layouts.size(); ++parameter)
+    {
+      const Layout& layout = layouts[parameter];
+      modules.push_back(layout.module);
+      names.push_back(layout.name);
+      ranks.push_back(layout.shape.size());
+      offsets.push_back(layout.end);
+      for (size_t axis = 0; axis < layout.shape.size(); ++axis)
+        shapes[parameter * maximum_rank + axis] = layout.shape[axis];
+    }
+
+    auto write_strings = [file](const std::string& dataset_path, const std::vector<std::string>& strings) {
+      const hsize_t count = strings.size();
+      const hid_t space   = H5Screate_simple(1, &count, nullptr);
+      const hid_t type    = H5Tcopy(H5T_C_S1);
+      H5Tset_size(type, H5T_VARIABLE);
+      const hid_t dataset =
+          H5Dcreate2(file, dataset_path.c_str(), type, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+      std::vector<const char*> pointers;
+      pointers.reserve(strings.size());
+      for (const std::string& string : strings)
+        pointers.push_back(string.c_str());
+      if (dataset < 0 || H5Dwrite(dataset, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, pointers.data()) < 0)
+        throw std::runtime_error("Unable to write PsiFormer dataset " + dataset_path);
+      H5Dclose(dataset);
+      H5Tclose(type);
+      H5Sclose(space);
+    };
+
+    write_strings("/layout/modules", modules);
+    write_strings("/layout/names", names);
+    write_numeric("/layout/ranks", H5T_NATIVE_LLONG, {ranks.size()}, ranks.data());
+    write_numeric("/layout/shapes", H5T_NATIVE_LLONG, {layouts.size(), maximum_rank}, shapes.data());
+    write_numeric("/layout/offsets", H5T_NATIVE_LLONG, {offsets.size()}, offsets.data());
     H5Fclose(file);
   }
 
@@ -2095,6 +2248,22 @@ struct Result
   std::vector<double> potential;
   std::vector<double> param_gradient;
   std::vector<double> local_energy_param_gradient;
+};
+
+/// Select the parameter reverse products required by one native evaluation.
+enum class ParameterDerivativeRequest
+{
+  NONE,
+  LOG_ONLY,
+  LOG_AND_KINETIC
+};
+
+/** Describe optional parameter derivatives and the total wavefunction gradient
+ * needed by QMCPACK's component kinetic-energy derivative. */
+struct EvaluationRequest
+{
+  ParameterDerivativeRequest parameter_derivatives = ParameterDerivativeRequest::NONE;
+  const std::vector<double>* total_log_gradient     = nullptr;
 };
 
 /** Builds and evaluates the four-block PsiFormer wavefunction from imported
@@ -2308,9 +2477,11 @@ struct PsiFormer
     return cusp_value;
   }
 
-  /// Evaluate wavefunction observables, derivatives, Coulomb terms, and optional parameter gradients.
-  Result evaluate(const Tensor& electron_positions, bool with_parameter_gradient = true)
+  /// Evaluate observables and exactly the parameter reverse products requested by the caller.
+  Result evaluate(const Tensor& electron_positions, const EvaluationRequest& request)
   {
+    const bool with_parameter_gradient = request.parameter_derivatives != ParameterDerivativeRequest::NONE;
+
     // Feature layers: electron-nucleus embedding followed by four attention
     // blocks operating on all electrons.
     NodePtr positions         = coordinates(electron_positions);
@@ -2389,22 +2560,42 @@ struct PsiFormer
     result.local_energy =
         -.5 * laplacian_ratio + electron_electron_potential + electron_nucleus_potential + nucleus_nucleus_potential;
 
-    // Reverse the ordinary value graph for d log|psi| / d theta, then reverse
-    // the lifted coordinate-jet graph for d E_L / d theta. The Coulomb terms
-    // are parameter independent, so only the kinetic-energy seed is needed.
+    // Reverse the ordinary value graph only when the caller needs score
+    // derivatives. SR-style callers intentionally avoid the more expensive
+    // mixed coordinate-jet reverse below.
     if (with_parameter_gradient)
-    {
       result.param_gradient = p.flat_gradient(backward(log_wavefunction));
+
+    // QMCPACK composes wavefunction factors, so the first-derivative seed must
+    // use the total trial-wavefunction gradient rather than necessarily this
+    // component's gradient. For standalone evaluation the component gradient
+    // remains the default and reproduces dE_L/dtheta for the full PsiFormer.
+    if (request.parameter_derivatives == ParameterDerivativeRequest::LOG_AND_KINETIC)
+    {
+      const std::vector<double>& total_gradient =
+          request.total_log_gradient ? *request.total_log_gradient : log_wavefunction->d1.x;
+      if (total_gradient.size() != log_wavefunction->d1.size())
+        throw std::invalid_argument("PsiFormer total log-gradient seed has the wrong size");
+
       JetAdjoint local_energy_seed;
       local_energy_seed.value = Tensor(log_wavefunction->value.shape);
       local_energy_seed.d1    = Tensor(log_wavefunction->d1.shape);
       local_energy_seed.d2    = Tensor(log_wavefunction->d2.shape, -0.5);
       for (size_t coordinate = 0; coordinate < log_wavefunction->d1.size(); ++coordinate)
-        local_energy_seed.d1.x[coordinate] = -log_wavefunction->d1.x[coordinate];
+        local_energy_seed.d1.x[coordinate] = -total_gradient[coordinate];
       result.local_energy_param_gradient =
           p.flat_gradient(backward_coordinate_jets(log_wavefunction, std::move(local_energy_seed)));
     }
     return result;
+  }
+
+  /// Preserve the original standalone boolean API while routing through explicit requests.
+  Result evaluate(const Tensor& electron_positions, bool with_parameter_gradient = true)
+  {
+    const ParameterDerivativeRequest derivative_request = with_parameter_gradient
+        ? ParameterDerivativeRequest::LOG_AND_KINETIC
+        : ParameterDerivativeRequest::NONE;
+    return evaluate(electron_positions, EvaluationRequest{derivative_request, nullptr});
   }
 };
 

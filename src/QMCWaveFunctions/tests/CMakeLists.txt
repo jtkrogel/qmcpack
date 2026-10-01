@@ -109,7 +109,8 @@ set(TRIALWF_SRC
     test_example_he.cpp
     test_lattice_gaussian.cpp
     test_twf_fastderiv_raii.cpp
-    test_TWFGrads.cpp)
+    test_TWFGrads.cpp
+    test_psiformer_wf.cpp)
 if(ENABLE_DEEPQMC_INFERENCE)
   set(TRIALWF_SRC ${TRIALWF_SRC} test_deepqmc_wfc.cpp)
 endif()
@@ -214,6 +215,8 @@ foreach(CATEGORY common trialwf sposet jastrow determinant)
   endif()
 
 endforeach()
+
+target_link_libraries(test_wavefunction_trialwf IO::HDF5)
 
 if(ENABLE_DEEPQMC_INFERENCE AND BUILD_MICRO_BENCHMARKS)
   set(UTEST_EXE benchmark_deepqmc_wfc)
