@@ -234,6 +234,8 @@ protected:
   bool targetExcited;
   ///the shift to use when targeting an excited state
   double omega_shift;
+  ///whether final reports should list every optimizable scalar parameter
+  bool verbose_parameter_output;
 
   ///list of optimizables
   OptVariables opt_vars;

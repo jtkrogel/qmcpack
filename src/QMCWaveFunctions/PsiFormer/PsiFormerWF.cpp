@@ -108,14 +108,17 @@ PsiFormerWF::PsiFormerWF(std::string name,
   if (parameters_ref.size() == 0)
     throw std::invalid_argument("PsiFormer parameter export contains no scalar values");
 
-  observed_parameter_version_    = parameters_ref.version();
-  const std::size_t name_width   = std::to_string(parameters_ref.size() - 1).size();
+  observed_parameter_version_ = parameters_ref.version();
+  const std::size_t name_width = std::to_string(parameters_ref.size() - 1).size();
+  std::vector<OptVariables::pair_type> selected_parameters;
+  selected_parameters.reserve(selected_flat_indices_.size());
   for (std::size_t flat_index : selected_flat_indices_)
   {
     parameters_ref.layout_for_flat_index(flat_index);
-    myVars.insert(makeParameterName(WaveFunctionComponent::getName(), flat_index, name_width),
-                  parameters_ref.flat_values()[flat_index], true, optimize::OTHER_P);
+    selected_parameters.emplace_back(makeParameterName(WaveFunctionComponent::getName(), flat_index, name_width),
+                                     parameters_ref.flat_values()[flat_index]);
   }
+  myVars.insertBulk(std::move(selected_parameters), true, optimize::OTHER_P);
 }
 
 // Copy clone-local accepted state while deliberately discarding an in-flight proposal.

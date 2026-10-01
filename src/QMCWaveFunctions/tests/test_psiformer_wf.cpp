@@ -327,6 +327,53 @@ TEST_CASE("PsiFormer selected parameters follow QMCPACK registration reset and d
   CHECK(std::abs(updated_log - baseline_log) > 1e-8);
 }
 
+TEST_CASE("PsiFormer registration maps through surrounding ordinary parameters",
+          "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component(
+      "pf_block", files.parameters.string(), files.configuration.string(), true, {0, 1, 127});
+
+  OptVariables active;
+  active.insert("ordinary_before", -1.0, true, optimize::LINEAR_P);
+  component.checkInVariablesExclusive(active);
+  active.insert("ordinary_after", 1.0, true, optimize::LOGLINEAR_P);
+  active.resetIndex();
+  component.checkOutVariables(active);
+
+  REQUIRE(active.size() == 5);
+  CHECK(active.name(0) == "ordinary_before");
+  CHECK(active.name(1) == "pf_block_pf_0000000");
+  CHECK(active.name(2) == "pf_block_pf_0000001");
+  CHECK(active.name(3) == "pf_block_pf_0000127");
+  CHECK(active.name(4) == "ordinary_after");
+
+  // PsiFormer must scatter its results only into mapped global entries,
+  // leaving derivative contributions owned by neighboring objects untouched.
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  Vector<ValueType> dlogpsi(active.size());
+  Vector<ValueType> dhpsioverpsi(active.size());
+  dlogpsi      = ValueType(-91.0);
+  dhpsioverpsi = ValueType(37.0);
+  component.evaluateDerivatives(electrons, active, dlogpsi, dhpsioverpsi);
+
+  CHECK(std::real(dlogpsi[0]) == Approx(-91.0));
+  CHECK(std::real(dhpsioverpsi[0]) == Approx(37.0));
+  CHECK(std::real(dlogpsi[4]) == Approx(-91.0));
+  CHECK(std::real(dhpsioverpsi[4]) == Approx(37.0));
+  for (int global_index = 1; global_index <= 3; ++global_index)
+  {
+    CHECK(std::isfinite(std::real(dlogpsi[global_index])));
+    CHECK(std::isfinite(std::real(dhpsioverpsi[global_index])));
+    CHECK(std::real(dlogpsi[global_index]) != Approx(-91.0));
+    CHECK(std::real(dhpsioverpsi[global_index]) != Approx(37.0));
+  }
+}
+
 TEST_CASE("PsiFormer clones share versioned parameters and retain local move state", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");

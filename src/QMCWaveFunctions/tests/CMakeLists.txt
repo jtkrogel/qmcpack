@@ -218,6 +218,26 @@ endforeach()
 
 target_link_libraries(test_wavefunction_trialwf IO::HDF5)
 
+if(BUILD_MICRO_BENCHMARKS)
+  # This executable is intentionally not registered with CTest. It reports
+  # wall time and peak RSS for developer-selected parameter counts without
+  # imposing noisy performance thresholds on correctness CI.
+  add_executable(benchmark_variable_set benchmark_variable_set.cpp)
+  target_link_libraries(
+    benchmark_variable_set
+    qmcwfs
+    qmcdriver
+    platform_runtime)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      benchmark_variable_set
+      qmcutil
+      qmcparticle
+      qmcparticle_omptarget
+      qmcwfs_omptarget)
+  endif()
+endif()
+
 if(ENABLE_DEEPQMC_INFERENCE AND BUILD_MICRO_BENCHMARKS)
   set(UTEST_EXE benchmark_deepqmc_wfc)
   add_executable(${UTEST_EXE} benchmark_deepqmc_wfc.cpp)

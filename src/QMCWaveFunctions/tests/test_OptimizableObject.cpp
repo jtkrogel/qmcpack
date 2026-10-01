@@ -112,4 +112,61 @@ TEST_CASE("OptimizableObject HDF output and input", "[wavefunction]")
   CHECK(std::real(opt_vars3["var2"]) == Approx(2.3));
   CHECK(fake_2a.extra_data == Approx(3.4));
 }
+
+TEST_CASE("OptimizableObject global parameter mapping", "[wavefunction]")
+{
+  FakeOptimizableObject fake_a("functor_a", 1.0, 2.0);
+  FakeOptimizableObject fake_b("functor_b", 3.0, 4.0);
+
+  // Give each object distinct names, matching the normal requirement that
+  // independently optimizable objects register globally unique parameters.
+  fake_a.myVars.clear();
+  fake_a.myVars.insert("a_first", 1.0);
+  fake_a.myVars.insert("a_second", 2.0);
+  fake_b.myVars.clear();
+  fake_b.myVars.insert("b_first", 3.0);
+  fake_b.myVars.insert("b_disabled", 4.0, false);
+
+  OptVariables active;
+  active.insert("leading", -1.0);
+  fake_a.checkInVariablesExclusive(active);
+  fake_b.checkInVariablesExclusive(active);
+  active.insert("trailing", 9.0);
+  active.resetIndex();
+
+  REQUIRE(active.size() == 6);
+  CHECK(active.name(0) == "leading");
+  CHECK(active.name(1) == "a_first");
+  CHECK(active.name(2) == "a_second");
+  CHECK(active.name(3) == "b_first");
+  CHECK(active.name(4) == "b_disabled");
+  CHECK(active.name(5) == "trailing");
+  CHECK(active.where(0) == 0);
+  CHECK(active.where(1) == 1);
+  CHECK(active.where(2) == 2);
+  CHECK(active.where(3) == 3);
+  CHECK(active.where(4) == -1);
+  CHECK(active.where(5) == 4);
+
+  // Build each object's local-to-global index map and verify that unrelated
+  // parameters before, between, and after the objects do not shift mappings.
+  fake_a.myVars.getIndex(active);
+  fake_b.myVars.getIndex(active);
+  CHECK(fake_a.myVars.where(0) == 1);
+  CHECK(fake_a.myVars.where(1) == 2);
+  CHECK(fake_b.myVars.where(0) == 3);
+  CHECK(fake_b.myVars.where(1) == -1);
+
+  // Updating values through the global set must remain compatible with the
+  // indexed local lookup used by wave-function reset paths.
+  active[1] = 10.0;
+  active[2] = 20.0;
+  active[3] = 30.0;
+  fake_a.myVars["a_first"]  = active[fake_a.myVars.where(0)];
+  fake_a.myVars["a_second"] = active[fake_a.myVars.where(1)];
+  fake_b.myVars["b_first"]  = active[fake_b.myVars.where(0)];
+  CHECK(fake_a.myVars[0] == Approx(10.0));
+  CHECK(fake_a.myVars[1] == Approx(20.0));
+  CHECK(fake_b.myVars[0] == Approx(30.0));
+}
 } // namespace qmcplusplus

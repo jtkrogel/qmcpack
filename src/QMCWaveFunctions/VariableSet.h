@@ -12,15 +12,20 @@
 // File created by: Jeongnim Kim, jeongnim.kim@gmail.com, University of Illinois at Urbana-Champaign
 //////////////////////////////////////////////////////////////////////////////////////
 
-
 #ifndef QMCPLUSPLUS_OPTIMIZE_VARIABLESET_H
 #define QMCPLUSPLUS_OPTIMIZE_VARIABLESET_H
+
 #include "config.h"
-#include <map>
-#include <vector>
-#include <iostream>
-#include <complex>
 #include "Configuration.h"
+
+#include <algorithm>
+#include <complex>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace qmcplusplus
 {
@@ -29,216 +34,211 @@ class hdf_archive;
 
 namespace optimize
 {
-/** An enum useful for determining the type of parameter is being optimized.
-*   knowing this in the opt routine can reduce the computational load.
-*/
+/** Identifies parameter categories that optimizers may handle specially. */
 enum
 {
   OTHER_P = 0,
-  LOGLINEAR_P, //B-spline Jastrows
-  LOGLINEAR_K, //K space Jastrows
-  LINEAR_P,    //Multi-determinant coefficients
-  SPO_P,       //SPO set Parameters
-  BACKFLOW_P   //Backflow parameters
+  LOGLINEAR_P, // B-spline Jastrows
+  LOGLINEAR_K, // K-space Jastrows
+  LINEAR_P,    // Multi-determinant coefficients
+  SPO_P,       // SPO-set parameters
+  BACKFLOW_P   // Backflow parameters
 };
 
-/** class to handle a set of variables that can be modified during optimizations
+/** Ordered collection of named variational parameters and global indices.
  *
- * A serialized container of named variables.
+ * NameAndValue remains the canonical iteration and serialization order. An
+ * open-addressed table stores indices into that vector, providing expected
+ * constant-time lookup without duplicating every parameter name. Iterator
+ * clients may update values, but changing a parameter name through a mutable
+ * iterator is unsupported because names are keys in the lookup table.
  */
 struct VariableSet
 {
-  using real_type       = qmcplusplus::QMCTraits::RealType;
-  using pair_type       = std::pair<std::string, real_type>;
+  using real_type = qmcplusplus::QMCTraits::RealType;
+  using pair_type = std::pair<std::string, real_type>;
+  // Retained as a public alias for source compatibility with existing clients.
   using index_pair_type = std::pair<std::string, int>;
   using iterator        = std::vector<pair_type>::iterator;
   using const_iterator  = std::vector<pair_type>::const_iterator;
   using size_type       = std::vector<pair_type>::size_type;
 
 private:
-  ///number of active variables
+  static constexpr size_type missing_index_ = std::numeric_limits<size_type>::max();
+
+  /// Number of entries whose global index is active.
   int num_active_vars;
+
+  /// Canonical ordered parameter names and values.
   std::vector<pair_type> NameAndValue;
-  std::vector<index_pair_type> ParameterType;
+
+  /// Parameter category parallel to NameAndValue; names are not duplicated.
+  std::vector<int> ParameterType;
+
+  /// Open-addressed slots containing indices into NameAndValue.
+  std::vector<size_type> NameIndex;
+
+  /// Return the ordered-storage location for a name, or missing_index_.
+  size_type findLocation(const std::string& vname) const;
+
+  /// Resize and rebuild the lookup table for at least the requested entries.
+  void ensureNameIndexCapacity(size_type entry_count);
+
+  /// Insert one name's ordered-storage location into the lookup table.
+  void indexName(size_type location);
+
+  /// Apply scalar insertion semantics while moving the supplied name/value.
+  void insertEntry(pair_type&& variable, bool enable, int type);
 
 public:
-  /** store locator of the named variable
+  /** Stores the global locator of each named variable.
    *
-   * if(Index[i]  == -1), the named variable is not active
+   * If Index[i] == -1, the named variable is inactive.
    */
   std::vector<int> Index;
-  ///default constructor
-  inline VariableSet() : num_active_vars(0) {}
-  ///viturval destructor for safety
-  virtual ~VariableSet() = default;
-  /** if any of Index value is not zero, return true
-   */
-  inline bool is_optimizable() const { return num_active_vars > 0; }
-  ///return the number of active variables
-  inline int size_of_active() const { return num_active_vars; }
-  ///return the first const_iterator
-  inline const_iterator begin() const { return NameAndValue.begin(); }
-  ///return the last const_iterator
-  inline const_iterator end() const { return NameAndValue.end(); }
-  ///return the first iterator
-  inline iterator begin() { return NameAndValue.begin(); }
-  ///return the last iterator
-  inline iterator end() { return NameAndValue.end(); }
-  ///return the size
-  inline size_type size() const { return NameAndValue.size(); }
-  ///return the locator of the i-th Index
-  inline int where(int i) const { return Index[i]; }
-  /** return the iterator of a named parameter
-   * @param vname name of a parameter
-   * @return the locator of vname
-   *
-   * If vname is not found among the Names, return NameAndValue.end()
-   * so that ::end() member function can be used to validate the iterator.
-   */
-  inline iterator find(const std::string& vname)
-  {
-    return std::find_if(NameAndValue.begin(), NameAndValue.end(),
-                        [&vname](const auto& value) { return value.first == vname; });
-  }
 
-  /** return the Index vaule for the named parameter
-   * @param vname name of the variable
+  /// Construct an empty variable set.
+  VariableSet() : num_active_vars(0) {}
+
+  /// Copy ordered values and the coherent lookup table.
+  VariableSet(const VariableSet&) = default;
+
+  /// Move ordered values and their index together.
+  VariableSet(VariableSet&& other) noexcept;
+
+  /// Copy all variable storage and lookup state.
+  VariableSet& operator=(const VariableSet&) = default;
+
+  /// Move all variable storage and lookup state.
+  VariableSet& operator=(VariableSet&& other) noexcept;
+
+  /// Virtual destructor retained for compatibility with derived containers.
+  virtual ~VariableSet() = default;
+
+  /// Return whether at least one variable is active.
+  bool is_optimizable() const { return num_active_vars > 0; }
+
+  /// Return the number of active variables.
+  int size_of_active() const { return num_active_vars; }
+
+  /// Return the first read-only ordered iterator.
+  const_iterator begin() const { return NameAndValue.begin(); }
+
+  /// Return the past-the-end read-only ordered iterator.
+  const_iterator end() const { return NameAndValue.end(); }
+
+  /// Return the first ordered iterator; parameter names must not be modified.
+  iterator begin() { return NameAndValue.begin(); }
+
+  /// Return the past-the-end ordered iterator.
+  iterator end() { return NameAndValue.end(); }
+
+  /// Return the number of stored variables, active and inactive.
+  size_type size() const { return NameAndValue.size(); }
+
+  /// Return the global locator of the i-th stored variable.
+  int where(int i) const { return Index[i]; }
+
+  /** Find a named parameter in expected constant time.
    *
-   * If vname is not found in this variables, return -1;
+   * Returns end() when the name is absent.
    */
+  iterator find(const std::string& vname);
+
+  /** Find a named parameter in a const variable set.
+   *
+   * Returns end() when the name is absent.
+   */
+  const_iterator find(const std::string& vname) const;
+
+  /** Return the cached global index for a name, or -1 when absent/inactive. */
   int getIndex(const std::string& vname) const;
 
-  /* return the NameAndValue index for the named parameter
-   * @ param vname name of the variable
+  /** Return a name's ordered-storage location independently of active state. */
+  int getLoc(const std::string& vname) const;
+
+  /** Insert one parameter while preserving the established duplicate rules.
    *
-   * Differs from getIndex by not relying on the indices cached in Index
-   * myVars[i] will always return the value of the parameter if it is stored
-   * regardless of whether or not the Index array has been correctly reset
+   * The first insertion establishes value and type. A duplicate leaves both
+   * unchanged, although enable=false still disables the existing entry.
+   */
+  void insert(const std::string& vname, real_type value, bool enable = true, int type = OTHER_P);
+
+  /** Preallocate ordered and indexed storage for the requested total size. */
+  void reserve(size_type count);
+
+  /** Insert a batch with common enabled state and parameter type.
    *
-   * if vname is not found, return -1
+   * The input is passed by value so callers can move a prepared vector. The
+   * operation has the same duplicate semantics as repeated scalar insertions.
+   */
+  void insertBulk(std::vector<pair_type> variables, bool enable = true, int type = OTHER_P);
+
+  /** Insert a batch with per-entry enabled states and parameter types.
    *
+   * enabled and types must have exactly one entry per supplied variable.
    */
-  inline int getLoc(const std::string& vname) const
-  {
-    int loc = 0;
-    while (loc != NameAndValue.size())
-    {
-      if (NameAndValue[loc].first == vname)
-        return loc;
-      ++loc;
-    }
-    return -1;
-  }
+  void insertBulk(std::vector<pair_type> variables,
+                  const std::vector<bool>& enabled,
+                  const std::vector<int>& types);
 
-  inline void insert(const std::string& vname, real_type v, bool enable = true, int type = OTHER_P)
-  {
-    iterator loc = find(vname);
-    int ind_loc  = loc - NameAndValue.begin();
-    if (loc == NameAndValue.end()) //  && enable==true)
-    {
-      Index.push_back(ind_loc);
-      NameAndValue.push_back(pair_type(vname, v));
-      ParameterType.push_back(index_pair_type(vname, type));
-    }
-    //disable it if enable == false
-    if (!enable)
-      Index[ind_loc] = -1;
-  }
+  /// Assign one parameter category to all stored variables.
+  void setParameterType(int type) { std::fill(ParameterType.begin(), ParameterType.end(), type); }
 
-  inline void setParameterType(int type)
-  {
-    std::vector<index_pair_type>::iterator PTit(ParameterType.begin()), PTend(ParameterType.end());
-    while (PTit != PTend)
-    {
-      (*PTit).second = type;
-      PTit++;
-    }
-  }
+  /// Copy all parameter categories in canonical order.
+  void getParameterTypeList(std::vector<int>& types) const { types = ParameterType; }
 
-  inline void getParameterTypeList(std::vector<int>& types) const
-  {
-    auto ptit(ParameterType.begin()), ptend(ParameterType.end());
-    types.resize(ptend - ptit);
-    auto tit(types.begin());
-    while (ptit != ptend)
-      (*tit++) = (*ptit++).second;
-  }
+  /** Return a named value, inserting a disabled zero value if absent. */
+  real_type& operator[](const std::string& vname);
 
-
-  /** equivalent to std::map<std::string,T>[string] operator
-   */
-  inline real_type& operator[](const std::string& vname)
-  {
-    iterator loc = find(vname);
-    if (loc == NameAndValue.end())
-    {
-      Index.push_back(-1);
-      NameAndValue.push_back(pair_type(vname, 0));
-      ParameterType.push_back(index_pair_type(vname, 0));
-      return NameAndValue.back().second;
-    }
-    return (*loc).second;
-  }
-
-
-  /** return the name of i-th variable
-   * @param i index
-   */
+  /// Return the name of the i-th variable.
   const std::string& name(int i) const { return NameAndValue[i].first; }
 
-  /** return the i-th value
-   * @param i index
-   */
-  inline real_type operator[](int i) const { return NameAndValue[i].second; }
+  /// Return the i-th value.
+  real_type operator[](int i) const { return NameAndValue[i].second; }
 
-  /** assign the i-th value
-   * @param i index
-   */
-  inline real_type& operator[](int i) { return NameAndValue[i].second; }
+  /// Return a writable reference to the i-th value.
+  real_type& operator[](int i) { return NameAndValue[i].second; }
 
-  /** get the i-th parameter's type
-  * @param i index
-  */
-  inline int getType(int i) const { return ParameterType[i].second; }
+  /// Return the i-th parameter category.
+  int getType(int i) const { return ParameterType[i]; }
 
-  /** clear the variable set
-   *
-   * Remove all the data.
-   */
+  /// Remove all ordered, index, type, and lookup-table data.
   void clear();
 
-  /** insert a VariableSet to the list
-   * @param input variables
+  /** Merge another VariableSet in its canonical order.
+   *
+   * Existing names receive incoming values while retaining destination
+   * metadata. New names retain the source index and parameter category.
    */
   void insertFrom(const VariableSet& input);
 
-  /** reset Index of active parameters
-   */
+  /// Assign dense global indices to enabled variables in canonical order.
   void resetIndex();
 
-  /** set the index table of this VariableSet
-   * @param selected input variables
-   *
-   * This VariableSet is a subset of selected.
-   */
+  /** Map this local set's names to cached indices in a selected global set. */
   void getIndex(const VariableSet& selected);
 
-  /** find the index of the first parameter of *this set in the selection
-   * return -1 if not found.
-   */
+  /** Return the selected index of this set's first parameter, or -1. */
   int findIndexOfFirstParam(const VariableSet& selected) const;
 
-  /** set default Indices, namely all the variables are active
-   */
+  /// Set every stored variable's index to its ordered location.
   void setIndexDefault();
 
+  /// Print parameters in canonical order using the established table format.
   void print(std::ostream& os, int leftPadSpaces = 0, bool printHeader = false) const;
 
-  // Save variational parameters to an HDF file
+  /** Print bounded diagnostics for a potentially large variable set.
+   *
+   * At most edgeEntries entries from each end are printed, so producing a
+   * routine progress report does not scan or emit the full parameter vector.
+   */
+  void printSummary(std::ostream& os, int leftPadSpaces = 0, size_type edgeEntries = 3) const;
+
+  /// Save variational parameter names and values to an HDF5 file.
   void writeToHDF(const std::string& filename, qmcplusplus::hdf_archive& hout) const;
 
-  /// Read variational parameters from an HDF file.
-  /// This assumes VariableSet is already set up.
+  /** Load values for already-registered names from an HDF5 file. */
   void readFromHDF(const std::string& filename, qmcplusplus::hdf_archive& hin);
 };
 } // namespace optimize

@@ -50,6 +50,7 @@ QMCCostFunctionBase::QMCCostFunctionBase(ParticleSet& w, TrialWaveFunction& psi,
       targetExcitedStr("no"),
       targetExcited(false),
       omega_shift(0.0),
+      verbose_parameter_output(false),
       msg_stream(nullptr),
       m_wfPtr(nullptr),
       m_doc_out(nullptr),
@@ -162,7 +163,15 @@ void QMCCostFunctionBase::reportParameters()
   {
     // Pretty print the wave function parameters.
     *msg_stream << "  Updated wave function parameters:\n";
-    opt_vars.print(*msg_stream, 4 /* left padding spaces */, true);
+    constexpr OptVariables::size_type full_parameter_report_limit = 256;
+    if (verbose_parameter_output || opt_vars.size() <= full_parameter_report_limit)
+      opt_vars.print(*msg_stream, 4 /* left padding spaces */, true);
+    else
+    {
+      opt_vars.printSummary(*msg_stream, 4 /* left padding spaces */);
+      *msg_stream << "    Full listing suppressed; add <parameter name=\"verbose_parameter_output\">yes</parameter> "
+                     "to the optimization input to emit every scalar.\n";
+    }
     *msg_stream << std::endl;
 
     std::string vp_fname(RootName + ".vp.h5");
@@ -264,6 +273,7 @@ bool QMCCostFunctionBase::put(xmlNodePtr q)
   m_param.add(omega_shift, "omega");
   m_param.add(do_override_output, "output_vp_override", {true});
   m_param.add(variational_subset_str, "variational_subset");
+  m_param.add(verbose_parameter_output, "verbose_parameter_output");
   m_param.put(q);
 
   if (!includeNonlocalH.empty())
