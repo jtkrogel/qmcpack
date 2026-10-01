@@ -36,9 +36,9 @@ class PsiFormerSharedState;
  * Wavefunction component for a PsiFormer model exported from DeepQMC.
  *
  * Imported parameters remain fixed unless optimization is explicitly enabled.
- * The initial optimization path registers a selected set of canonical flat
- * indices so that native derivatives can be validated end to end before the
- * million-parameter registration and optimizer-storage work is introduced.
+ * Optimization may register selected canonical flat indices or the complete
+ * network in that same ordering. Full-network resets use the native complete
+ * vector path to avoid sorting and revalidating millions of canonical indices.
  *
  * Clones share one versioned native model behind a reader/writer lock, while
  * accepted and proposed move state remains clone-local. Object-specific VP
@@ -52,7 +52,8 @@ public:
               std::string parameters,
               std::string configuration,
               bool optimize = false,
-              std::vector<std::size_t> selected_flat_indices = {});
+              std::vector<std::size_t> selected_flat_indices = {},
+              bool optimize_all = false);
 
   /// Copy accepted state and optimizer mappings while dropping any in-flight proposal.
   PsiFormerWF(const PsiFormerWF& other);
@@ -158,6 +159,8 @@ private:
   std::vector<std::size_t> selected_flat_indices_;
   /// Enable registration and derivative work only when requested by input.
   bool optimization_enabled_ = false;
+  /// Use the canonical complete flat vector rather than an explicit subset.
+  bool optimize_all_ = false;
   /// Last shared parameter version observed by this component clone.
   std::size_t observed_parameter_version_ = 0;
   /// Require the generic selected values to agree after an authoritative VP restore.

@@ -1934,10 +1934,8 @@ void QMCFixedSampleLinearOptimizeBatched::descent_run()
   //Compute Lagrangian derivatives needed for parameter updates with engine_checkConfigurations, which is called inside engine_start
   engine_start();
 
-  int descent_num = descentEngineObj->getDescentNum();
-
-  if (descent_num == 0)
-    descentEngineObj->setupUpdate(optTarget->getOptVariables());
+  // Initialize on the first step or validate a restored/reused optimizer state.
+  descentEngineObj->setupUpdate(optTarget->getOptVariables());
 
   //Store the derivatives and then compute parameter updates
   descentEngineObj->storeDerivRecord();
@@ -1965,6 +1963,7 @@ void QMCFixedSampleLinearOptimizeBatched::descent_run()
   }
 
   finish();
+  descentEngineObj->writeConfiguredState();
 
 }
 #endif

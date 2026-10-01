@@ -219,6 +219,27 @@ void compute_batch_parameters(int sample_size, int batch_size, int& num_batches,
   }
 }
 
+// Allocate legacy sample records only when the selected optimizer consumes them after sampling.
+void QMCCostFunctionBatched::prepareDerivativeStorage(const EngineHandle::SamplingRequirements& requirements,
+                                                      bool include_energy_derivatives)
+{
+  const std::size_t num_opt_vars = opt_vars.size();
+  const bool persist_log_derivatives =
+      needGrads && requirements.needs_log_derivatives && requirements.persists_log_derivatives;
+  const bool persist_energy_derivatives = needGrads && include_energy_derivatives &&
+      requirements.needs_energy_derivatives && requirements.persists_energy_derivatives;
+
+  if (persist_log_derivatives)
+    DerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
+  else
+    DerivRecords_.free();
+
+  if (persist_energy_derivatives)
+    HDerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
+  else
+    HDerivRecords_.free();
+}
+
 /** evaluate everything before optimization */
 void QMCCostFunctionBatched::checkConfigurations(EngineHandle& handle)
 {
@@ -231,24 +252,19 @@ void QMCCostFunctionBatched::checkConfigurations(EngineHandle& handle)
   assert(rank_local_num_samples_ == samples_.getNumSamples());
 
   const auto num_opt_vars = opt_vars.size();
+  const EngineHandle::SamplingRequirements requirements = handle.getSamplingRequirements();
+  const bool persist_log_derivatives = needGrads && requirements.persists_log_derivatives;
+  const bool persist_energy_derivatives = needGrads && requirements.persists_energy_derivatives;
   if (RecordsOnNode_.size1() == 0)
   {
     RecordsOnNode_.resize(rank_local_num_samples_, SUM_INDEX_SIZE);
-    if (needGrads)
-    {
-      DerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
-      HDerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
-    }
   }
   else if (RecordsOnNode_.size1() != rank_local_num_samples_)
-  {
     RecordsOnNode_.resize(rank_local_num_samples_, SUM_INDEX_SIZE);
-    if (needGrads)
-    {
-      DerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
-      HDerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
-    }
-  }
+
+  // Descent consumes each crowd batch online, so retaining another full
+  // samples-by-parameters copy would defeat scalable neural optimization.
+  prepareDerivativeStorage(requirements, true);
   //    synchronize the random number generator with the node
   (*MoverRng[0]) = (*RngSaved[0]);
   H.setRandomGenerator(MoverRng[0]);
@@ -270,14 +286,15 @@ void QMCCostFunctionBatched::checkConfigurations(EngineHandle& handle)
   std::vector<int> samples_per_crowd_offsets(opt_num_crowds + 1);
   FairDivide(rank_local_num_samples_, opt_num_crowds, samples_per_crowd_offsets);
 
-  handle.prepareSampling(num_opt_vars, rank_local_num_samples_);
+  handle.prepareSampling(num_opt_vars, rank_local_num_samples_, opt_num_crowds);
   // lambda to execute on each crowd
   auto evalOptConfig = [](int crowd_id, UPtrVector<CostFunctionCrowdData>& opt_crowds,
                           const std::vector<int>& samples_per_crowd_offsets, const std::vector<int>& walkers_per_crowd,
                           std::vector<ParticleGradient*>& gradPsi, std::vector<ParticleLaplacian*>& lapPsi,
                           Matrix<Return_rt>& RecordsOnNode, Matrix<Return_t>& DerivRecords,
                           Matrix<Return_rt>& HDerivRecords, const SampleStack& samples, OptVariables& optVars,
-                          bool needGrads, EngineHandle& handle) {
+                          bool needGrads, bool persistLogDerivatives, bool persistEnergyDerivatives,
+                          EngineHandle& handle) {
     CostFunctionCrowdData& opt_data = *opt_crowds[crowd_id];
 
     const int local_samples = samples_per_crowd_offsets[crowd_id + 1] - samples_per_crowd_offsets[crowd_id];
@@ -345,18 +362,19 @@ void QMCCostFunctionBatched::checkConfigurations(EngineHandle& handle)
         energy_list = QMCHamiltonian::mw_evaluateValueAndDerivatives(h_list, wf_list, p_list, optVars, dlogpsi_array,
                                                                      dhpsioverpsi_array);
 
-        handle.takeSample(energy_list, dlogpsi_array, dhpsioverpsi_array, base_sample_index);
+        handle.takeSample(energy_list, dlogpsi_array, dhpsioverpsi_array, base_sample_index, crowd_id);
 
         for (int ib = 0; ib < current_batch_size; ib++)
         {
           const int is = base_sample_index + ib;
-          for (int j = 0; j < nparams; j++)
-          {
-            //dlogpsi is in general complex if psi is complex.
-            DerivRecords[is][j] = dlogpsi_array[ib][j];
-            //but E_L and d E_L/dc are real if c is real.
-            HDerivRecords[is][j] = std::real(dhpsioverpsi_array[ib][j]);
-          }
+          if (persistLogDerivatives)
+            for (int j = 0; j < nparams; j++)
+              // dlogpsi is in general complex if psi is complex.
+              DerivRecords[is][j] = dlogpsi_array[ib][j];
+          if (persistEnergyDerivatives)
+            for (int j = 0; j < nparams; j++)
+              // E_L and d E_L/dc are real if c is real.
+              HDerivRecords[is][j] = std::real(dhpsioverpsi_array[ib][j]);
           RecordsOnNode[is][LOGPSI_FIXED] = opt_data.get_log_psi_fixed()[ib];
           RecordsOnNode[is][LOGPSI_FREE]  = opt_data.get_log_psi_opt()[ib];
         }
@@ -386,7 +404,8 @@ void QMCCostFunctionBatched::checkConfigurations(EngineHandle& handle)
 
   ParallelExecutor<> crowd_tasks;
   crowd_tasks(opt_num_crowds, evalOptConfig, opt_eval, samples_per_crowd_offsets, walkers_per_crowd_, dLogPsi, d2LogPsi,
-              RecordsOnNode_, DerivRecords_, HDerivRecords_, samples_, opt_vars, needGrads, handle);
+              RecordsOnNode_, DerivRecords_, HDerivRecords_, samples_, opt_vars, needGrads, persist_log_derivatives,
+              persist_energy_derivatives, handle);
   // Sum energy values over crowds
   for (int i = 0; i < opt_eval.size(); i++)
   {
@@ -435,18 +454,16 @@ void QMCCostFunctionBatched::checkConfigurationsSR(EngineHandle& handle)
   assert(rank_local_num_samples_ == samples_.getNumSamples());
 
   const auto num_opt_vars = opt_vars.size();
+  const EngineHandle::SamplingRequirements requirements = handle.getSamplingRequirements();
+  const bool persist_log_derivatives = needGrads && requirements.persists_log_derivatives;
   if (RecordsOnNode_.size1() == 0)
   {
     RecordsOnNode_.resize(rank_local_num_samples_, SUM_INDEX_SIZE);
-    if (needGrads)
-      DerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
   }
   else if (RecordsOnNode_.size1() != rank_local_num_samples_)
-  {
     RecordsOnNode_.resize(rank_local_num_samples_, SUM_INDEX_SIZE);
-    if (needGrads)
-      DerivRecords_.resize(rank_local_num_samples_, num_opt_vars);
-  }
+
+  prepareDerivativeStorage(requirements, false);
   //    synchronize the random number generator with the node
   (*MoverRng[0]) = (*RngSaved[0]);
   H.setRandomGenerator(MoverRng[0]);
@@ -468,13 +485,13 @@ void QMCCostFunctionBatched::checkConfigurationsSR(EngineHandle& handle)
   std::vector<int> samples_per_crowd_offsets(opt_num_crowds + 1);
   FairDivide(rank_local_num_samples_, opt_num_crowds, samples_per_crowd_offsets);
 
-  handle.prepareSampling(num_opt_vars, rank_local_num_samples_);
+  handle.prepareSampling(num_opt_vars, rank_local_num_samples_, opt_num_crowds);
   // lambda to execute on each crowd
   auto evalOptConfig = [](int crowd_id, UPtrVector<CostFunctionCrowdData>& opt_crowds,
                           const std::vector<int>& samples_per_crowd_offsets, const std::vector<int>& walkers_per_crowd,
                           std::vector<ParticleGradient*>& gradPsi, std::vector<ParticleLaplacian*>& lapPsi,
                           Matrix<Return_rt>& RecordsOnNode, Matrix<Return_t>& DerivRecords, const SampleStack& samples,
-                          OptVariables& optVars, bool needGrads, EngineHandle& handle) {
+                          OptVariables& optVars, bool needGrads, bool persistLogDerivatives, EngineHandle& handle) {
     CostFunctionCrowdData& opt_data = *opt_crowds[crowd_id];
 
     const int local_samples = samples_per_crowd_offsets[crowd_id + 1] - samples_per_crowd_offsets[crowd_id];
@@ -544,13 +561,14 @@ void QMCCostFunctionBatched::checkConfigurationsSR(EngineHandle& handle)
         // get dlogpsi from TWF
         TrialWaveFunction::mw_evaluateParameterDerivativesWF(wf_list, p_list, optVars, dlogpsi_array);
 
-        handle.takeSample(energy_list, dlogpsi_array, dhpsioverpsi_array, base_sample_index);
+        handle.takeSample(energy_list, dlogpsi_array, dhpsioverpsi_array, base_sample_index, crowd_id);
 
         for (int ib = 0; ib < current_batch_size; ib++)
         {
           const int is = base_sample_index + ib;
-          for (int j = 0; j < nparams; j++)
-            DerivRecords[is][j] = dlogpsi_array[ib][j];
+          if (persistLogDerivatives)
+            for (int j = 0; j < nparams; j++)
+              DerivRecords[is][j] = dlogpsi_array[ib][j];
           RecordsOnNode[is][LOGPSI_FIXED] = opt_data.get_log_psi_fixed()[ib];
           RecordsOnNode[is][LOGPSI_FREE]  = opt_data.get_log_psi_opt()[ib];
         }
@@ -580,7 +598,7 @@ void QMCCostFunctionBatched::checkConfigurationsSR(EngineHandle& handle)
 
   ParallelExecutor<> crowd_tasks;
   crowd_tasks(opt_num_crowds, evalOptConfig, opt_eval, samples_per_crowd_offsets, walkers_per_crowd_, dLogPsi, d2LogPsi,
-              RecordsOnNode_, DerivRecords_, samples_, opt_vars, needGrads, handle);
+              RecordsOnNode_, DerivRecords_, samples_, opt_vars, needGrads, persist_log_derivatives, handle);
   // Sum energy values over crowds
   for (int i = 0; i < opt_eval.size(); i++)
   {

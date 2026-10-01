@@ -66,6 +66,9 @@ public:
   void calcOvlParmVec(const std::vector<Return_rt>& param, std::vector<Return_rt>& ovlParmVec) override;
 
 protected:
+  /// Size or release persistent derivative matrices according to the optimizer contract.
+  void prepareDerivativeStorage(const EngineHandle::SamplingRequirements& requirements,
+                                bool include_energy_derivatives);
 
 
   Matrix<Return_rt> RecordsOnNode_;

@@ -14,7 +14,6 @@
 #define QMCPLUSPLUS_ENGINE_HANDLE_HEADER
 
 #include "Containers/MinimalContainers/RecordArray.hpp"
-#include "Concurrency/OpenMP.h"
 
 #include "QMCDrivers/Optimizers/DescentEngine.h"
 
@@ -33,25 +32,47 @@ public:
   using FullPrecReal  = QMCTraits::FullPrecRealType;
   using FullPrecValue = QMCTraits::FullPrecValueType;
 
+  /** Describe how an optimizer consumes derivatives produced while sampling.
+   *
+   * The batched cost function uses this contract to avoid retaining an
+   * additional samples-by-parameters matrix when an engine consumes every
+   * crowd batch immediately.
+   */
+  struct SamplingRequirements
+  {
+    bool needs_log_derivatives       = true;
+    bool needs_energy_derivatives    = true;
+    bool persists_log_derivatives    = true;
+    bool persists_energy_derivatives = true;
+    bool consumes_batches_online     = false;
+  };
+
   virtual ~EngineHandle() = default;
+
+  /// Return the derivative-computation and retention policy for this engine.
+  virtual SamplingRequirements getSamplingRequirements() const { return {}; }
+
   /** Function for preparing derivative ratio vectors used by optimizer engines
    *
-   *\param[in] num_params           Number of optimizable parameters
+   * \param[in] num_params Number of optimizable parameters
+   * \param[in] num_samples Number of samples local to this MPI rank
+   * \param[in] num_accumulators Number of concurrently executing crowds
    */
-  virtual void prepareSampling(int num_params, int num_samples) = 0;
+  virtual void prepareSampling(int num_params, int num_samples, int num_accumulators) = 0;
   /** Function for passing derivative ratios to optimizer engines
    *
    * \param[in] energy_list         Vector of local energy values
    * \param[in] dlogpsi_array       Parameter derivatives of log psi
    * \param[in] dhpsioverpsi_array  Parameter derivatives of local energy
-   * \param[in] local_index         Crowd local index
-   * \param[in] sample_index        Index of sample on a MPI rank
+   * \param[in] base_sample_index Index of the first sample on this MPI rank
+   * \param[in] accumulator_index Stable crowd/accumulator index
    *
    */
   virtual void takeSample(const std::vector<FullPrecReal>& energy_list,
                           const RecordArray<Value>& dlogpsi_array,
                           const RecordArray<Value>& dhpsioverpsi_array,
-                          int base_sample_index) = 0;
+                          int base_sample_index,
+                          int accumulator_index) = 0;
   /** Function for having optimizer engines execute their sample_finish functions
    */
   virtual void finishSampling() = 0;
@@ -60,11 +81,12 @@ public:
 class NullEngineHandle : public EngineHandle
 {
 public:
-  void prepareSampling(int num_params, int num_samples) override {}
+  void prepareSampling(int num_params, int num_samples, int num_accumulators) override {}
   void takeSample(const std::vector<FullPrecReal>& energy_list,
                   const RecordArray<Value>& dlogpsi_array,
                   const RecordArray<Value>& dhpsioverpsi_array,
-                  int base_sample_index) override
+                  int base_sample_index,
+                  int accumulator_index) override
   {}
   void finishSampling() override {}
 };
@@ -73,29 +95,38 @@ class DescentEngineHandle : public EngineHandle
 {
 private:
   DescentEngine& engine_;
-  std::vector<FullPrecValue> der_rat_samp;
-  std::vector<FullPrecValue> le_der_samp;
+  std::vector<std::vector<FullPrecValue>> der_rat_samp_;
+  std::vector<std::vector<FullPrecValue>> le_der_samp_;
 
 public:
   DescentEngineHandle(DescentEngine& engine) : engine_(engine) {}
 
-  //Retrieve der_rat_samp vector for testing
-  const std::vector<FullPrecValue>& getVector() const { return der_rat_samp; }
-
-  void prepareSampling(int num_params, int num_samples) override
+  /// Retrieve one crowd-local derivative-ratio buffer for testing.
+  const std::vector<FullPrecValue>& getVector(int accumulator_index = 0) const
   {
-    //FIXME it should respect num_samples and avoid relying on threads.
-    engine_.prepareStorage(omp_get_max_threads(), num_params);
+    return der_rat_samp_.at(accumulator_index);
+  }
 
-    der_rat_samp.resize(num_params + 1, 0.0);
-    le_der_samp.resize(num_params + 1, 0.0);
+  SamplingRequirements getSamplingRequirements() const override
+  {
+    return {true, true, false, false, true};
+  }
+
+  void prepareSampling(int num_params, int num_samples, int num_accumulators) override
+  {
+    engine_.prepareStorage(num_accumulators, num_params);
+    der_rat_samp_.assign(num_accumulators, std::vector<FullPrecValue>(num_params + 1, 0.0));
+    le_der_samp_.assign(num_accumulators, std::vector<FullPrecValue>(num_params + 1, 0.0));
   }
 
   void takeSample(const std::vector<FullPrecReal>& energy_list,
                   const RecordArray<Value>& dlogpsi_array,
                   const RecordArray<Value>& dhpsioverpsi_array,
-                  int base_sample_index) override
+                  int base_sample_index,
+                  int accumulator_index) override
   {
+    std::vector<FullPrecValue>& der_rat_samp = der_rat_samp_.at(accumulator_index);
+    std::vector<FullPrecValue>& le_der_samp  = le_der_samp_.at(accumulator_index);
     const int current_batch_size = dlogpsi_array.getNumOfEntries();
     for (int local_index = 0; local_index < current_batch_size; local_index++)
     {
@@ -109,9 +140,7 @@ public:
         le_der_samp[j + 1]  = static_cast<FullPrecValue>(dhpsioverpsi_array[local_index][j]) +
             le_der_samp[0] * static_cast<FullPrecValue>(dlogpsi_array[local_index][j]);
       }
-      //FIXME it should respect base_sample_index and avoid relying on threads.
-      int ip = omp_get_thread_num();
-      engine_.takeSample(ip, der_rat_samp, le_der_samp, le_der_samp, 1.0, 1.0);
+      engine_.takeSample(accumulator_index, der_rat_samp, le_der_samp, le_der_samp, 1.0, 1.0);
     }
   }
 
@@ -123,24 +152,27 @@ class LMYEngineHandle : public EngineHandle
 #ifdef HAVE_LMY_ENGINE
 private:
   cqmc::engine::LMYEngine<Value>& lm_engine_;
-  std::vector<FullPrecValue> der_rat_samp;
-  std::vector<FullPrecValue> le_der_samp;
+  std::vector<std::vector<FullPrecValue>> der_rat_samp_;
+  std::vector<std::vector<FullPrecValue>> le_der_samp_;
 
 public:
   LMYEngineHandle(cqmc::engine::LMYEngine<Value>& lmyEngine) : lm_engine_(lmyEngine){};
 
-  void prepareSampling(int num_params, int num_samples) override
+  void prepareSampling(int num_params, int num_samples, int num_accumulators) override
   {
-    der_rat_samp.resize(num_params + 1, 0.0);
-    le_der_samp.resize(num_params + 1, 0.0);
+    der_rat_samp_.assign(num_accumulators, std::vector<FullPrecValue>(num_params + 1, 0.0));
+    le_der_samp_.assign(num_accumulators, std::vector<FullPrecValue>(num_params + 1, 0.0));
     if (lm_engine_.getStoringSamples())
       lm_engine_.setUpStorage(num_params, num_samples);
   }
   void takeSample(const std::vector<FullPrecReal>& energy_list,
                   const RecordArray<Value>& dlogpsi_array,
                   const RecordArray<Value>& dhpsioverpsi_array,
-                  int base_sample_index) override
+                  int base_sample_index,
+                  int accumulator_index) override
   {
+    std::vector<FullPrecValue>& der_rat_samp = der_rat_samp_.at(accumulator_index);
+    std::vector<FullPrecValue>& le_der_samp  = le_der_samp_.at(accumulator_index);
     int current_batch_size = dlogpsi_array.getNumOfEntries();
     for (int local_index = 0; local_index < current_batch_size; local_index++)
     {

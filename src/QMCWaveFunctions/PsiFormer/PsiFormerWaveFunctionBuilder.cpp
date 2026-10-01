@@ -77,13 +77,18 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::vector<std::size_t> selected_indices = parseFlatIndices(optimize_indices);
   if (!optimization_enabled && !selected_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
-  if (optimization_enabled && optimize_scope != "indices")
-    throw std::invalid_argument("PsiFormer currently supports optimize_scope=indices only");
-  if (optimization_enabled && selected_indices.empty())
+  if (optimize_scope != "indices" && optimize_scope != "all")
+    throw std::invalid_argument("PsiFormer optimize_scope must be indices or all");
+  if (!optimization_enabled && optimize_scope != "indices")
+    throw std::invalid_argument("PsiFormer optimize_scope requires optimize=yes");
+  const bool optimize_all = optimization_enabled && optimize_scope == "all";
+  if (optimize_all && !selected_indices.empty())
+    throw std::invalid_argument("PsiFormer optimize_scope=all cannot be combined with optimize_indices");
+  if (optimization_enabled && !optimize_all && selected_indices.empty())
     throw std::invalid_argument("PsiFormer optimize=yes requires a nonempty optimize_indices list");
 
   return std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
-                                       std::move(selected_indices));
+                                       std::move(selected_indices), optimize_all);
 }
 
 } // namespace qmcplusplus

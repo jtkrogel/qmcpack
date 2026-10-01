@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "QMCDrivers/WFOpt/QMCCostFunctionBatched.h"
+#include "OhmmsData/Libxml2Doc.h"
 #include "FillData.h"
 // Input data and gold data for fillFromText test
 #include "diamond_fill_data.h"
@@ -71,6 +72,11 @@ public:
   Matrix<QMCCostFunctionBase::Return_t>& getDerivRecords() { return costFn.DerivRecords_; }
   Matrix<QMCCostFunctionBase::Return_rt>& getHDerivRecords() { return costFn.HDerivRecords_; }
 
+  void prepareDerivativeStorage(const EngineHandle& handle, bool include_energy_derivatives)
+  {
+    costFn.prepareDerivativeStorage(handle.getSamplingRequirements(), include_energy_derivatives);
+  }
+
   void set_samples_and_param(int nsamples, int nparam)
   {
     numSamples = nsamples;
@@ -91,6 +97,30 @@ public:
 };
 
 } // namespace testing
+
+TEST_CASE("Batched descent releases persistent derivative records", "[drivers][descent]")
+{
+  Communicate* communicator = OHMMS::Controller;
+  testing::LinearMethodTestSupport support({2, 1}, communicator);
+  support.set_samples_and_param(7, 3);
+
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<tmp/>"));
+  DescentEngine engine(communicator, document.getRoot());
+  DescentEngineHandle descent_handle(engine);
+  support.prepareDerivativeStorage(descent_handle, true);
+  CHECK(support.getDerivRecords().rows() == 0);
+  CHECK(support.getDerivRecords().cols() == 0);
+  CHECK(support.getHDerivRecords().rows() == 0);
+  CHECK(support.getHDerivRecords().cols() == 0);
+
+  NullEngineHandle legacy_handle;
+  support.prepareDerivativeStorage(legacy_handle, true);
+  CHECK(support.getDerivRecords().rows() == 7);
+  CHECK(support.getDerivRecords().cols() == 3);
+  CHECK(support.getHDerivRecords().rows() == 7);
+  CHECK(support.getHDerivRecords().cols() == 3);
+}
 
 TEST_CASE("fillOverlapAndHamiltonianMatrices", "[drivers]")
 {

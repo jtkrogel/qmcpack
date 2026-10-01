@@ -17,6 +17,9 @@
 #include "VariableSet.h"
 #include "Message/Communicate.h"
 
+#include <filesystem>
+#include <unistd.h>
+
 namespace qmcplusplus
 {
 
@@ -100,6 +103,61 @@ TEST_CASE("DescentEngine RMSprop update", "[drivers][descent]")
   CHECK(std::real(mean) == Approx(-2.0));
   CHECK(std::real(variance) == Approx(0.0));
   CHECK(std::real(stdErr) == Approx(0.0));
+}
+
+/// Verify bounded history and equivalent continuation from an optimizer checkpoint.
+TEST_CASE("DescentEngine ADAM restart", "[drivers][descent]")
+{
+  Communicate* communicator = OHMMS::Controller;
+  const std::filesystem::path state_path = std::filesystem::temp_directory_path() /
+      ("qmcpack_descent_state_" + std::to_string(static_cast<long long>(getpid())) + ".h5");
+  std::error_code error;
+  std::filesystem::remove(state_path, error);
+
+  Libxml2Document document;
+  const std::string input = "<tmp><parameter name=\"flavor\">ADAM</parameter>"
+      "<parameter name=\"descent_state_file\">" +
+      state_path.string() + "</parameter></tmp>";
+  REQUIRE(document.parseFromString(input));
+
+  optimize::VariableSet variables;
+  variables.insert("pf_pf_0000000", 1.0);
+  variables.insert("pf_pf_0000001", -2.0);
+
+  DescentEngine uninterrupted(communicator, document.getRoot());
+  uninterrupted.setupUpdate(variables);
+  auto take_step = [](DescentEngine& engine, std::vector<ValueType> derivatives) {
+    engine.setDerivs(derivatives);
+    engine.storeDerivRecord();
+    engine.updateParameters();
+  };
+  take_step(uninterrupted, {5.0, 1.0});
+  take_step(uninterrupted, {-2.0, 3.0});
+  CHECK(uninterrupted.getDerivativeHistorySize() == 2);
+
+  uninterrupted.writeConfiguredState();
+  take_step(uninterrupted, {0.25, -0.75});
+  const std::vector<ValueType> expected = uninterrupted.retrieveNewParams();
+
+  DescentEngine restarted(communicator, document.getRoot());
+  optimize::VariableSet restart_variables;
+  const std::vector<ValueType> checkpoint_parameters = restarted.retrieveNewParams();
+  restart_variables.insert("pf_pf_0000000", std::real(checkpoint_parameters[0]));
+  restart_variables.insert("pf_pf_0000001", std::real(checkpoint_parameters[1]));
+  restarted.setupUpdate(restart_variables);
+  take_step(restarted, {0.25, -0.75});
+
+  const std::vector<ValueType> actual = restarted.retrieveNewParams();
+  REQUIRE(actual.size() == expected.size());
+  for (std::size_t parameter = 0; parameter < actual.size(); ++parameter)
+  {
+    CHECK(std::real(actual[parameter]) == Approx(std::real(expected[parameter])).epsilon(1e-14));
+    CHECK(std::imag(actual[parameter]) == Approx(std::imag(expected[parameter])).epsilon(1e-14));
+  }
+  CHECK(restarted.getDescentNum() == uninterrupted.getDescentNum());
+  CHECK(restarted.getDerivativeHistorySize() == 2);
+
+  std::filesystem::remove(state_path, error);
 }
 #endif
 } // namespace qmcplusplus

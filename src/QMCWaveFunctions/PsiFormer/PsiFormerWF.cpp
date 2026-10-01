@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <mutex>
+#include <numeric>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -87,26 +88,40 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::string parameters,
                          std::string configuration,
                          bool enable_optimization,
-                         std::vector<std::size_t> selected_flat_indices)
+                         std::vector<std::size_t> selected_flat_indices,
+                         bool optimize_all)
     : WaveFunctionComponent(name),
       OptimizableObject(name),
       model_state_(std::make_shared<PsiFormerSharedState>(parameters, configuration)),
       selected_flat_indices_(std::move(selected_flat_indices)),
-      optimization_enabled_(enable_optimization)
+      optimization_enabled_(enable_optimization),
+      optimize_all_(optimize_all)
 {
   if (!optimization_enabled_ && !selected_flat_indices_.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
-  if (optimization_enabled_ && selected_flat_indices_.empty())
-    throw std::invalid_argument("PsiFormer selected-parameter optimization requires at least one flat index");
-
-  std::sort(selected_flat_indices_.begin(), selected_flat_indices_.end());
-  if (std::adjacent_find(selected_flat_indices_.begin(), selected_flat_indices_.end()) !=
-      selected_flat_indices_.end())
-    throw std::invalid_argument("PsiFormer optimize_indices contains a duplicate flat index");
+  if (optimize_all_ && !optimization_enabled_)
+    throw std::invalid_argument("PsiFormer optimize_scope=all requires optimize=yes");
+  if (optimize_all_ && !selected_flat_indices_.empty())
+    throw std::invalid_argument("PsiFormer optimize_scope=all cannot be combined with optimize_indices");
 
   pf::Parameters& parameters_ref = model_state_->model.p;
   if (parameters_ref.size() == 0)
     throw std::invalid_argument("PsiFormer parameter export contains no scalar values");
+  if (optimize_all_)
+  {
+    selected_flat_indices_.resize(parameters_ref.size());
+    std::iota(selected_flat_indices_.begin(), selected_flat_indices_.end(), std::size_t{0});
+  }
+  if (optimization_enabled_ && selected_flat_indices_.empty())
+    throw std::invalid_argument("PsiFormer selected-parameter optimization requires at least one flat index");
+
+  if (!optimize_all_)
+  {
+    std::sort(selected_flat_indices_.begin(), selected_flat_indices_.end());
+    if (std::adjacent_find(selected_flat_indices_.begin(), selected_flat_indices_.end()) !=
+        selected_flat_indices_.end())
+      throw std::invalid_argument("PsiFormer optimize_indices contains a duplicate flat index");
+  }
 
   observed_parameter_version_ = parameters_ref.version();
   const std::size_t name_width = std::to_string(parameters_ref.size() - 1).size();
@@ -114,7 +129,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
   selected_parameters.reserve(selected_flat_indices_.size());
   for (std::size_t flat_index : selected_flat_indices_)
   {
-    parameters_ref.layout_for_flat_index(flat_index);
+    if (!optimize_all_)
+      parameters_ref.layout_for_flat_index(flat_index);
     selected_parameters.emplace_back(makeParameterName(WaveFunctionComponent::getName(), flat_index, name_width),
                                      parameters_ref.flat_values()[flat_index]);
   }
@@ -128,6 +144,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       model_state_(other.model_state_),
       selected_flat_indices_(other.selected_flat_indices_),
       optimization_enabled_(other.optimization_enabled_),
+      optimize_all_(other.optimize_all_),
       observed_parameter_version_(other.observed_parameter_version_),
       restore_validation_pending_(other.restore_validation_pending_),
       accepted_value_valid_(other.accepted_value_valid_),
@@ -189,11 +206,49 @@ void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
     invalidateParameterCaches(parameter_version);
 }
 
-// Apply one validated selected-parameter update at an exclusive model barrier.
+// Apply a validated selected-parameter or complete-vector update at an exclusive model barrier.
 void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
 {
   if (!optimization_enabled_)
     return;
+
+  // Full scope is already in canonical flat order. Avoid materializing and
+  // sorting redundant local/flat index vectors for every optimizer step.
+  if (optimize_all_)
+  {
+    std::vector<double> active_values;
+    active_values.reserve(selected_flat_indices_.size());
+    for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+    {
+      const int global_index = myVars.where(local_index);
+      if (global_index < 0)
+        throw std::runtime_error("PsiFormer optimize_scope=all requires every model parameter to remain active");
+      if (global_index >= active.size())
+        throw std::out_of_range("PsiFormer global optimization index is out of range");
+      active_values.push_back(std::real(active[global_index]));
+    }
+
+    std::size_t parameter_version;
+    bool model_changed;
+    {
+      std::unique_lock state_lock(model_state_->mutex);
+      pf::Parameters& parameters = model_state_->model.p;
+      if (restore_validation_pending_ && active_values != parameters.flat_values())
+        throw std::runtime_error(
+            "PsiFormer generic full-network values disagree with the authoritative VP model payload");
+      restore_validation_pending_ = false;
+      model_changed               = active_values != parameters.flat_values();
+      if (model_changed)
+        parameters.set_flat_values(active_values);
+      parameter_version = parameters.version();
+    }
+
+    for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
+      myVars[parameter] = active_values[parameter];
+    if (model_changed || observed_parameter_version_ != parameter_version)
+      invalidateParameterCaches(parameter_version);
+    return;
+  }
 
   std::vector<std::size_t> active_local_indices;
   std::vector<std::size_t> active_flat_indices;

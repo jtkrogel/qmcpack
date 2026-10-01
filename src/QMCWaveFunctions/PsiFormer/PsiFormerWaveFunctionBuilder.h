@@ -15,8 +15,7 @@
 
 namespace qmcplusplus
 {
-/** Parse PsiFormer export paths and optional selected-index optimization
- * controls. */
+/** Parse PsiFormer export paths and selected-index or full-network optimization controls. */
 class PsiFormerWaveFunctionBuilder : public WaveFunctionComponentBuilder
 {
 public:
@@ -25,7 +24,7 @@ public:
       : WaveFunctionComponentBuilder(comm, target)
   {}
 
-  /// Construct a fixed model by default or an explicitly selected optimizable model.
+  /// Construct a fixed model by default or a selected/full-network optimizable model.
   std::unique_ptr<WaveFunctionComponent> buildComponent(xmlNodePtr current) override;
 };
 

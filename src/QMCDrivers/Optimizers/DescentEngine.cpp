@@ -16,13 +16,16 @@
 // Code for a descent engine
 
 #include "DescentEngine.h"
-#include <cmath>
-#include <string>
-#include <vector>
-#include <numeric>
+#include "CPU/math.hpp"
 #include "Message/CommOperators.h"
 #include "OhmmsData/ParameterSet.h"
-#include "CPU/math.hpp"
+#include "io/hdf/hdf_archive.h"
+
+#include <cmath>
+#include <filesystem>
+#include <numeric>
+#include <string>
+#include <vector>
 
 namespace qmcplusplus
 {
@@ -37,6 +40,7 @@ DescentEngine::DescentEngine(Communicate* comm, const xmlNodePtr cur)
       gauss_eta_(.001),
       ci_eta_(.01),
       orb_eta_(.001),
+      neural_eta_(.001),
       ramp_eta_(false),
       ramp_num_(30),
       store_num_(5),
@@ -48,6 +52,8 @@ DescentEngine::DescentEngine(Communicate* comm, const xmlNodePtr cur)
   descent_num_ = 0;
   store_count_ = 0;
   processXML(cur);
+  if (!state_file_.empty() && std::filesystem::exists(state_file_))
+    readState(state_file_);
 }
 
 bool DescentEngine::processXML(const xmlNodePtr cur)
@@ -67,6 +73,7 @@ bool DescentEngine::processXML(const xmlNodePtr cur)
   m_param.add(ci_eta_, "CI_eta");
   m_param.add(gauss_eta_, "Gauss_eta");
   m_param.add(orb_eta_, "Orb_eta");
+  m_param.add(neural_eta_, "Neural_eta");
   // Whether to gradually ramp up step sizes and over how many steps
   m_param.add(ramp_eta_str, "Ramp_eta");
   m_param.add(ramp_num_, "Ramp_num");
@@ -74,6 +81,7 @@ bool DescentEngine::processXML(const xmlNodePtr cur)
   // vectors to store
   m_param.add(store_num_, "Stored_Vectors");
   m_param.add(print_deriv_, "print_derivs");
+  m_param.add(state_file_, "descent_state_file");
 
   // When to start storing samples for a final average and when to start
   // computing it
@@ -543,7 +551,7 @@ void DescentEngine::updateParameters()
 
   app_log() << "Parameter Type step sizes: "
             << " TJF_2Body_eta=" << tjf_2body_eta_ << " TJF_1Body_eta=" << tjf_1body_eta_ << " F_eta=" << f_eta_
-            << " CI_eta=" << ci_eta_ << " Orb_eta=" << orb_eta_ << std::endl;
+            << " CI_eta=" << ci_eta_ << " Orb_eta=" << orb_eta_ << " Neural_eta=" << neural_eta_ << std::endl;
 
   // Get set of derivatives for current (kth) optimization step
   std::vector<ValueType> cur_deriv_set = deriv_records_.at(deriv_records_.size() - 1);
@@ -840,6 +848,18 @@ void DescentEngine::updateParameters()
   }
 }
 
+// Retain only the two gradients required by the accelerated RMSprop recurrence.
+void DescentEngine::storeDerivRecord()
+{
+  if (deriv_records_.size() < 2)
+    deriv_records_.push_back(lderivs_);
+  else
+  {
+    deriv_records_.front() = std::move(deriv_records_.back());
+    deriv_records_.back()  = lderivs_;
+  }
+}
+
 // Helper method for setting step size according parameter type.
 DescentEngine::ValueType DescentEngine::setStepSize(int i)
 {
@@ -875,6 +895,10 @@ DescentEngine::ValueType DescentEngine::setStepSize(int i)
   {
     type_eta = orb_eta_;
   }
+  else if (name.find("_pf_") != std::string::npos)
+  {
+    type_eta = neural_eta_;
+  }
   else if (name.find("g") != std::string::npos)
   {
     // Gaussian parameters are rarely optimized in practice but the descent code
@@ -900,23 +924,139 @@ DescentEngine::ValueType DescentEngine::setStepSize(int i)
 // before the first descent optimization step
 void DescentEngine::setupUpdate(const optimize::VariableSet& my_vars)
 {
-  // omega_ = omega_input;
-
-  num_params_ = my_vars.size();
-  app_log() << "This is num_params_: " << num_params_ << std::endl;
-  for (int i = 0; i < num_params_; i++)
+  std::vector<std::string> active_names;
+  std::vector<int> active_types;
+  std::vector<ValueType> active_values;
+  active_names.reserve(my_vars.size());
+  active_types.reserve(my_vars.size());
+  active_values.reserve(my_vars.size());
+  for (int i = 0; i < my_vars.size(); ++i)
   {
-    // app_log() << "Variable #" << i << ": " << my_vars[i] << " with index val:
-    // " << my_vars.where(i) << std::endl;
     if (my_vars.where(i) != -1)
     {
-      engine_param_names_.push_back(my_vars.name(i));
-      engine_param_types_.push_back(my_vars.getType(i));
-      params_copy_.push_back(my_vars[i]);
-      current_params_.push_back(my_vars[i]);
-      params_for_diff_.push_back(my_vars[i]);
+      active_names.push_back(my_vars.name(i));
+      active_types.push_back(my_vars.getType(i));
+      active_values.push_back(my_vars[i]);
     }
   }
+
+  if (!current_params_.empty())
+  {
+    if (active_names != engine_param_names_ || active_types != engine_param_types_ ||
+        active_values != current_params_)
+      throw std::runtime_error(
+          "Descent optimizer state does not match the active variational parameters; restart from its matching VP file");
+    return;
+  }
+
+  num_params_         = active_values.size();
+  engine_param_names_ = std::move(active_names);
+  engine_param_types_ = std::move(active_types);
+  params_copy_        = active_values;
+  current_params_     = active_values;
+  params_for_diff_    = std::move(active_values);
+  app_log() << "This is num_params_: " << num_params_ << std::endl;
+}
+
+// Persist only optimizer state; wavefunction values remain authoritative in the VP file.
+void DescentEngine::writeState(const std::string& path) const
+{
+  if (my_comm_->rank() == 0)
+  {
+    hdf_archive output;
+    if (!output.create(path))
+      throw std::runtime_error("Unable to create descent optimizer state file: " + path);
+
+    const std::vector<int> version{1, 0, 0};
+    const std::vector<int> metadata{num_params_, descent_num_, final_descent_num_, store_count_,
+                                    static_cast<int>(deriv_records_.size())};
+    output.write(version, "version");
+    output.write(flavor_, "flavor");
+    output.write(metadata, "metadata");
+    output.write(lambda_, "lambda");
+    output.write(engine_param_names_, "parameter_names");
+    output.write(engine_param_types_, "parameter_types");
+    output.write(current_params_, "current_parameters");
+    output.write(params_copy_, "previous_parameters");
+    output.write(params_for_diff_, "parameters_for_difference");
+    output.write(taus_, "step_sizes");
+    output.write(derivs_squared_, "squared_gradient_average");
+    output.write(numer_records_, "first_moment");
+    output.write(denom_records_, "second_moment");
+    output.push("gradient_history");
+    for (std::size_t record = 0; record < deriv_records_.size(); ++record)
+      output.write(deriv_records_[record], "record_" + std::to_string(record));
+    output.pop();
+    output.close();
+  }
+  my_comm_->barrier();
+}
+
+// Restore and validate a versioned optimizer-state checkpoint on every MPI rank.
+void DescentEngine::readState(const std::string& path)
+{
+  hdf_archive input;
+  if (!input.open(path, H5F_ACC_RDONLY))
+    throw std::runtime_error("Unable to open descent optimizer state file: " + path);
+
+  std::vector<int> version;
+  std::vector<int> metadata;
+  std::string stored_flavor;
+  input.read(version, "version");
+  input.read(stored_flavor, "flavor");
+  input.read(metadata, "metadata");
+  if (version != std::vector<int>{1, 0, 0} || metadata.size() != 5)
+    throw std::runtime_error("Unsupported or malformed descent optimizer state file: " + path);
+  if (stored_flavor != flavor_)
+    throw std::runtime_error("Descent optimizer flavor does not match state file: " + path);
+
+  num_params_        = metadata[0];
+  descent_num_       = metadata[1];
+  final_descent_num_ = metadata[2];
+  store_count_       = metadata[3];
+  const int history_size = metadata[4];
+  if (num_params_ < 0 || descent_num_ < 0 || history_size < 0 || history_size > 2)
+    throw std::runtime_error("Invalid dimensions in descent optimizer state file: " + path);
+
+  input.read(lambda_, "lambda");
+  input.read(engine_param_names_, "parameter_names");
+  input.read(engine_param_types_, "parameter_types");
+  input.read(current_params_, "current_parameters");
+  input.read(params_copy_, "previous_parameters");
+  input.read(params_for_diff_, "parameters_for_difference");
+  input.read(taus_, "step_sizes");
+  input.read(derivs_squared_, "squared_gradient_average");
+  input.read(numer_records_, "first_moment");
+  input.read(denom_records_, "second_moment");
+  input.push("gradient_history", false);
+  deriv_records_.resize(history_size);
+  for (int record = 0; record < history_size; ++record)
+    input.read(deriv_records_[record], "record_" + std::to_string(record));
+  input.pop();
+  input.close();
+
+  const auto has_parameter_count = [this](const auto& values) {
+    return values.empty() || values.size() == static_cast<std::size_t>(num_params_);
+  };
+  if (engine_param_names_.size() != static_cast<std::size_t>(num_params_) ||
+      engine_param_types_.size() != static_cast<std::size_t>(num_params_) ||
+      current_params_.size() != static_cast<std::size_t>(num_params_) ||
+      params_copy_.size() != static_cast<std::size_t>(num_params_) || !has_parameter_count(params_for_diff_) ||
+      !has_parameter_count(taus_) || !has_parameter_count(derivs_squared_) || !has_parameter_count(numer_records_) ||
+      !has_parameter_count(denom_records_))
+    throw std::runtime_error("Inconsistent parameter-vector sizes in descent optimizer state file: " + path);
+  for (const auto& record : deriv_records_)
+    if (record.size() != static_cast<std::size_t>(num_params_))
+      throw std::runtime_error("Inconsistent gradient history in descent optimizer state file: " + path);
+
+  app_log() << "Restored descent optimizer state at iteration " << descent_num_ << " from " << path << std::endl;
+}
+
+// Checkpoint to the user-selected state file after a completed descent update.
+void DescentEngine::writeConfiguredState() const
+{
+  if (!state_file_.empty())
+    writeState(state_file_);
 }
 
 // Helper method for storing vectors of parameter differences over the course of

@@ -195,6 +195,8 @@ private:
   ValueType gauss_eta_;
   ValueType ci_eta_;
   ValueType orb_eta_;
+  /// Step size for canonical PsiFormer neural-network parameters.
+  ValueType neural_eta_;
 
   /// Whether to gradually ramp up step sizes in descent
   bool ramp_eta_;
@@ -240,6 +242,9 @@ private:
 
   /// Whether to print out derivative terms for each parameter
   std::string print_deriv_;
+
+  /// Optional HDF5 checkpoint carrying optimizer moments and iteration state.
+  std::string state_file_;
 
 public:
   /// Constructor for engine
@@ -299,13 +304,24 @@ public:
   /// descent optimization
   ValueType setStepSize(int i);
 
-  /// stores derivatives so they can be used in accelerated descent algorithm on
-  /// later iterations
-  void storeDerivRecord() { deriv_records_.push_back(lderivs_); }
+  /// Retain the current and immediately preceding gradients for accelerated descent.
+  void storeDerivRecord();
+
+  /// Return the bounded gradient-history length for tests and diagnostics.
+  std::size_t getDerivativeHistorySize() const { return deriv_records_.size(); }
 
   /// helper method for transferring information on parameter names and types to
   /// the engine
   void setupUpdate(const optimize::VariableSet& my_vars);
+
+  /// Write the exact state needed to continue the configured descent recurrence.
+  void writeState(const std::string& path) const;
+
+  /// Restore optimizer iteration, moments, prior gradients, and current parameters.
+  void readState(const std::string& path);
+
+  /// Write the state when descent_state_file was supplied in the optimizer input.
+  void writeConfiguredState() const;
 
   /// Store a vector of parameter differences to be used by the BLM in a hybrid
   /// optimization

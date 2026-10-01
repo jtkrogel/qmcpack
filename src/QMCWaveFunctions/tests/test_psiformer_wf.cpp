@@ -249,6 +249,23 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   optimized->extractOptimizableObjectRefs(optimized_refs);
   REQUIRE(optimized_refs.size() == 1);
 
+  std::ostringstream all_xml;
+  all_xml << "<psiformer name=\"pf_all\" parameters=\"" << files.parameters.string()
+          << "\" configuration=\"" << files.configuration.string()
+          << "\" optimize=\"yes\" optimize_scope=\"all\"/>";
+  Libxml2Document all_document;
+  REQUIRE(all_document.parseFromString(all_xml.str()));
+  std::unique_ptr<WaveFunctionComponent> all = builder.buildComponent(all_document.getRoot());
+  auto* all_psiformer = dynamic_cast<PsiFormerWF*>(all.get());
+  REQUIRE(all_psiformer != nullptr);
+  OptVariables all_active = registerSelectedParameters(*all_psiformer);
+  const std::vector<Leaf> layout = makeLayout(4, 2);
+  const std::size_t expected_parameter_count = std::accumulate(
+      layout.begin(), layout.end(), std::size_t{0}, [](std::size_t count, const Leaf& leaf) {
+        return count + product(leaf.shape);
+      });
+  CHECK(all_active.size() == expected_parameter_count);
+
   std::ostringstream unsupported_xml;
   unsupported_xml << "<psiformer parameters=\"" << files.parameters.string() << "\" configuration=\""
                   << files.configuration.string()
@@ -256,6 +273,96 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   Libxml2Document unsupported_document;
   REQUIRE(unsupported_document.parseFromString(unsupported_xml.str()));
   CHECK_THROWS_AS(builder.buildComponent(unsupported_document.getRoot()), std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer full-network derivatives update and restart", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet full_electrons     = makeLiHElectrons(simulation_cell);
+  ParticleSet selected_electrons = makeLiHElectrons(simulation_cell);
+
+  PsiFormerWF full("pf_full", files.parameters.string(), files.configuration.string(), true, {}, true);
+  OptVariables full_active = registerSelectedParameters(full);
+  REQUIRE(full_active.size() > 2048);
+  const std::vector<std::size_t> probes{0, 127, 2047, full_active.size() - 1};
+
+  full_electrons.G = ValueType(0);
+  full_electrons.L = ValueType(0);
+  const double baseline_log = std::real(full.evaluateLog(full_electrons, full_electrons.G, full_electrons.L));
+  Vector<ValueType> full_dlog(full_active.size());
+  Vector<ValueType> full_denergy(full_active.size());
+  full_dlog    = ValueType(0);
+  full_denergy = ValueType(0);
+  full.evaluateDerivatives(full_electrons, full_active, full_dlog, full_denergy);
+
+  PsiFormerWF selected(
+      "pf_selected_full_check", files.parameters.string(), files.configuration.string(), true, probes);
+  OptVariables selected_active = registerSelectedParameters(selected);
+  const ComponentSnapshot selected_snapshot = evaluateComponent(selected, selected_electrons, selected_active);
+  for (std::size_t probe = 0; probe < probes.size(); ++probe)
+  {
+    CHECK(std::real(full_dlog[probes[probe]]) ==
+          Catch::Approx(selected_snapshot.log_parameter_derivative[probe]).epsilon(2e-10).margin(2e-10));
+    CHECK(std::real(full_denergy[probes[probe]]) ==
+          Catch::Approx(selected_snapshot.kinetic_parameter_derivative[probe]).epsilon(2e-9).margin(2e-9));
+  }
+
+  // Exercise the full-vector reset while perturbing only two entries. The
+  // optimizer still supplies the complete active vector on every update.
+  full_active[0] -= 1e-5 * std::real(full_dlog[0]);
+  full_active[127] -= 1e-5 * std::real(full_dlog[127]);
+  full.resetParametersExclusive(full_active);
+  full_electrons.G = ValueType(0);
+  full_electrons.L = ValueType(0);
+  const double updated_log = std::real(full.evaluateLog(full_electrons, full_electrons.G, full_electrons.L));
+  CHECK(std::abs(updated_log - baseline_log) > 1e-10);
+
+  const std::filesystem::path state_path = files.directory / "psiformer_full_restart.vp.h5";
+  hdf_archive output;
+  REQUIRE(output.create(state_path));
+  full.writeVariationalParameters(output);
+  output.close();
+
+  ParticleSet restored_electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF restored("pf_full", files.parameters.string(), files.configuration.string(), true, {}, true);
+  hdf_archive input;
+  REQUIRE(input.open(state_path, H5F_ACC_RDONLY));
+  restored.readVariationalParameters(input);
+  input.close();
+  OptVariables restored_active = registerSelectedParameters(restored);
+  restored.resetParametersExclusive(restored_active);
+  restored_electrons.G = ValueType(0);
+  restored_electrons.L = ValueType(0);
+  const double restored_log =
+      std::real(restored.evaluateLog(restored_electrons, restored_electrons.G, restored_electrons.L));
+  CHECK(restored_log == Catch::Approx(updated_log).epsilon(2e-10).margin(2e-10));
+}
+
+TEST_CASE("PsiFormer LiH pair full-network update", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih_pair");
+  const Geometry geometry = makeGeometry("lih_pair");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons(simulation_cell);
+  electrons.setName("e");
+  electrons.create({4, 4});
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      electrons.R[electron][dimension] = geometry.electrons[3 * electron + dimension];
+  electrons.update();
+
+  PsiFormerWF full("pf_pair_full", files.parameters.string(), files.configuration.string(), true, {}, true);
+  OptVariables active = registerSelectedParameters(full);
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  const double initial_log = std::real(full.evaluateLog(electrons, electrons.G, electrons.L));
+  active[0] += 1e-4;
+  full.resetParametersExclusive(active);
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  const double updated_log = std::real(full.evaluateLog(electrons, electrons.G, electrons.L));
+  CHECK(std::abs(updated_log - initial_log) > 1e-10);
 }
 
 TEST_CASE("PsiFormer selected parameters follow QMCPACK registration reset and derivative paths",
