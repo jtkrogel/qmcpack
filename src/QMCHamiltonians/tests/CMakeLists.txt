@@ -83,5 +83,7 @@ foreach(CATEGORY coulomb force ham ewald2d)
   set_tests_properties(${UTEST_NAME} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 endforeach()
 
+target_link_libraries(test_hamiltonian_ham IO::HDF5)
+
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")

@@ -53,7 +53,8 @@ public:
               std::string configuration,
               bool optimize = false,
               std::vector<std::size_t> selected_flat_indices = {},
-              bool optimize_all = false);
+              bool optimize_all = false,
+              std::string optimized_parameter_export = {});
 
   /// Copy accepted state and optimizer mappings while dropping any in-flight proposal.
   PsiFormerWF(const PsiFormerWF& other);
@@ -91,6 +92,9 @@ public:
   /// Export current parameters in the flat DeepQMC-compatible HDF5 format.
   void exportParameters(const std::string& path) const;
 
+  /// Validate electron spins and ionic geometry/effective charges against the export.
+  void validateSystem(const ParticleSet& electrons, const ParticleSet& ions, const std::string& system_kind);
+
   /// Evaluate log(psi), gradients, and logarithmic Laplacians for a full configuration.
   LogValue evaluateLog(const ParticleSet& particles,
                        ParticleSet::ParticleGradient& gradient,
@@ -110,6 +114,27 @@ public:
 
   /// Evaluate a proposed ratio and active-electron logarithmic gradient together.
   PsiValue ratioGrad(ParticleSet& particles, int particle_index, GradType& gradient) override;
+
+  /// Evaluate every nonlocal-pseudopotential virtual-move ratio by full model reevaluation.
+  void evaluateRatios(const VirtualParticleSet& virtual_particles, std::vector<ValueType>& ratios) override;
+
+  /// Add virtual-move changes in logarithmic parameter derivatives for the nonlocal ECP operator.
+  void evaluateDerivRatios(const VirtualParticleSet& virtual_particles,
+                           const OptVariables& optvars,
+                           std::vector<ValueType>& ratios,
+                           Matrix<ValueType>& derivative_ratios) override;
+
+  /// Reject spin-orbit virtual moves because the imported ansatz has fixed discrete spin labels.
+  void evaluateSpinorRatios(const VirtualParticleSet& virtual_particles,
+                            const std::pair<ValueVector, ValueVector>& spinor_multiplier,
+                            std::vector<ValueType>& ratios) override;
+
+  /// Reject spin-orbit derivative ratios at the component interface.
+  void evaluateSpinorDerivRatios(const VirtualParticleSet& virtual_particles,
+                                 const std::pair<ValueVector, ValueVector>& spinor_multiplier,
+                                 const OptVariables& optvars,
+                                 std::vector<ValueType>& ratios,
+                                 Matrix<ValueType>& derivative_ratios) override;
 
   /// Register no walker-buffer data because the native component stores no such cache.
   void registerData(ParticleSet&, WFBufferType&) override {}
@@ -141,11 +166,24 @@ private:
                       bool with_parameter_gradient = false,
                       bool with_kinetic_parameter_gradient = false);
 
+  /// Evaluate a configuration with an optional explicit replacement for one electron position.
+  pf::Result evaluatePositions(const ParticleSet& particles,
+                               int replaced_particle,
+                               const PosType* replacement_position,
+                               bool with_parameter_gradient,
+                               bool with_kinetic_parameter_gradient);
+
   /// Return true when at least one selected local parameter maps to a global active variable.
   bool hasActiveParameters() const;
 
   /// Add selected entries from a native flat gradient to a QMCPACK derivative vector.
   void addSelectedGradient(const std::vector<double>& flat_gradient, Vector<ValueType>& output) const;
+
+  /// Add selected differences between virtual and reference score vectors to one matrix row.
+  void addSelectedGradientDifference(const std::vector<double>& reference_gradient,
+                                     const std::vector<double>& virtual_gradient,
+                                     Matrix<ValueType>& output,
+                                     std::size_t row) const;
 
   /// Invalidate accepted/proposed caches and record the newly observed shared version.
   void invalidateParameterCaches(std::size_t parameter_version);
@@ -161,6 +199,10 @@ private:
   bool optimization_enabled_ = false;
   /// Use the canonical complete flat vector rather than an explicit subset.
   bool optimize_all_ = false;
+  /// Runtime system declaration validated against the export and QMCPACK particle sets.
+  std::string system_kind_ = "unvalidated";
+  /// Optional DeepQMC-format destination written with the final QMCPACK VP report.
+  std::string optimized_parameter_export_;
   /// Last shared parameter version observed by this component clone.
   std::size_t observed_parameter_version_ = 0;
   /// Require the generic selected values to agree after an authoritative VP restore.

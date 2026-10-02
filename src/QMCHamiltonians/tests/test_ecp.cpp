@@ -10,6 +10,7 @@
 // File created by: Mark Dewing, markdewing@gmail.com, University of Illinois at Urbana-Champaign
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include <cmath>
@@ -29,6 +30,8 @@
 #include "QMCWaveFunctions/Jastrow/RadialJastrowBuilder.h"
 #include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
 #include "QMCWaveFunctions/SpinorSet.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/tests/psiformer_test_utils.h"
 
 
 //for Hamiltonian manipulations.
@@ -256,6 +259,155 @@ TEST_CASE("ReadFileBuffer_reopen", "[hamiltonian]")
 
 void copyGridUnrotatedForTest(NonLocalECPComponent& nlpp) { nlpp.rrotsgrid_m = nlpp.sgridxyz_m; }
 void copyGridUnrotatedForTest(SOECPComponent& sopp) { sopp.rrotsgrid_m_ = sopp.sgridxyz_m_; }
+
+TEST_CASE("PsiFormer nonlocal ECP energy derivatives", "[hamiltonian][psiformer][ecp]")
+{
+  using namespace testing::psiformer;
+  using ValueType = QMCTraits::ValueType;
+
+  GeneratedFiles files = generateFiles("lih_pp");
+  const Geometry geometry = makeGeometry("lih_pp");
+  const SimulationCell simulation_cell;
+  ParticleSet ions(simulation_cell);
+  ParticleSet electrons(simulation_cell);
+
+  // The Li core is represented by the same +1 effective charge carried by
+  // the pseudo-H fixture. The native export and runtime particle set must
+  // therefore agree on two nuclei and two explicitly represented electrons.
+  ions.setName("ion0");
+  ions.create({2});
+  SpeciesSet& ion_species       = ions.getSpeciesSet();
+  const int sodium              = ion_species.addSpecies("Na");
+  const int ion_charge          = ion_species.addAttribute("charge");
+  const int atomic_number       = ion_species.addAttribute("atomic_number");
+  ion_species(ion_charge, sodium)    = 1.0;
+  ion_species(atomic_number, sodium) = 11.0;
+  for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      ions.R[nucleus][dimension] = geometry.nuclei[3 * nucleus + dimension];
+  ions.resetGroups();
+  ions.update();
+
+  electrons.setName("e");
+  electrons.create({1, 1});
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      electrons.R[electron][dimension] = geometry.electrons[3 * electron + dimension];
+  SpeciesSet& electron_species       = electrons.getSpeciesSet();
+  const int up                       = electron_species.addSpecies("u");
+  const int down                     = electron_species.addSpecies("d");
+  const int electron_charge          = electron_species.addAttribute("charge");
+  const int electron_mass            = electron_species.addAttribute("mass");
+  electron_species(electron_charge, up)   = -1.0;
+  electron_species(electron_charge, down) = -1.0;
+  electron_species(electron_mass, up)     = 1.0;
+  electron_species(electron_mass, down)   = 1.0;
+  electrons.resetGroups();
+  const int distance_table = electrons.addTable(ions);
+  electrons.update();
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "psiformer_pseudo_test");
+  auto psiformer = std::make_unique<PsiFormerWF>(
+      "pf_pseudo", files.parameters.string(), files.configuration.string(), true, std::vector<std::size_t>{0, 127});
+  psiformer->validateSystem(electrons, ions, "pseudopotential");
+  wavefunction.addComponent(std::move(psiformer));
+
+  OptVariables active;
+  wavefunction.checkInVariables(active);
+  active.resetIndex();
+  wavefunction.checkOutVariables(active);
+  REQUIRE(active.size() == 2);
+
+  ECPComponentBuilder ecp("psiformer_generated_ecp", OHMMS::Controller);
+  REQUIRE(ecp.read_pp_file("Na.BFD.xml"));
+  NonLocalECPComponent* nonlocal_ecp = ecp.pp_nonloc.get();
+  REQUIRE(nonlocal_ecp != nullptr);
+  copyGridUnrotatedForTest(*nonlocal_ecp);
+  const auto& ion_distances = electrons.getDistTableAB(distance_table);
+
+  auto evaluate_nonlocal_energy = [&]() {
+    VirtualParticleSet virtual_particles(electrons);
+    double energy = 0.0;
+    for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    {
+      const auto& distances     = ion_distances.getDistRow(electron);
+      const auto& displacements = ion_distances.getDisplRow(electron);
+      for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+        if (distances[nucleus] < nonlocal_ecp->getRmax())
+          energy += nonlocal_ecp->evaluateOne(electrons, makeOptionalRef(virtual_particles), nucleus, wavefunction,
+                                              electron, distances[nucleus], -displacements[nucleus], std::nullopt,
+                                              false);
+    }
+    return energy;
+  };
+
+  auto evaluate_nonlocal_derivative = [&](Vector<ValueType>& derivative) {
+    Vector<ValueType> score(active.size());
+    score      = ValueType(0);
+    derivative = ValueType(0);
+    wavefunction.evaluateDerivativesWF(electrons, active, score);
+    VirtualParticleSet virtual_particles(electrons);
+    double energy = 0.0;
+    for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    {
+      const auto& distances     = ion_distances.getDistRow(electron);
+      const auto& displacements = ion_distances.getDisplRow(electron);
+      for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+        if (distances[nucleus] < nonlocal_ecp->getRmax())
+          energy += nonlocal_ecp->evaluateValueAndDerivatives(
+              electrons, makeOptionalRef(virtual_particles), nucleus, wavefunction, electron, distances[nucleus],
+              -displacements[nucleus], active, score, derivative);
+    }
+    return energy;
+  };
+
+  const double reference_log = wavefunction.evaluateLog(electrons);
+  PsiFormerWF fixed_pseudo("pf_pseudo_fixed", files.parameters.string(), files.configuration.string());
+  fixed_pseudo.validateSystem(electrons, ions, "pseudopotential");
+  ParticleSet fixed_electrons(electrons);
+  fixed_electrons.G = ValueType(0);
+  fixed_electrons.L = ValueType(0);
+  const double fixed_log =
+      std::real(fixed_pseudo.evaluateLog(fixed_electrons, fixed_electrons.G, fixed_electrons.L));
+  CHECK(fixed_log == Catch::Approx(reference_log).epsilon(2e-10).margin(2e-10));
+  Vector<ValueType> analytic_derivative(active.size());
+  const double reference_energy = evaluate_nonlocal_derivative(analytic_derivative);
+  CHECK(std::isfinite(reference_log));
+  CHECK(std::isfinite(reference_energy));
+
+  const double original_parameter = std::real(active[0]);
+  const double parameter_step      = 2e-5;
+  active[0] = original_parameter + parameter_step;
+  wavefunction.resetParameters(active);
+  wavefunction.evaluateLog(electrons);
+  const double plus_energy = evaluate_nonlocal_energy();
+  active[0] = original_parameter - parameter_step;
+  wavefunction.resetParameters(active);
+  wavefunction.evaluateLog(electrons);
+  const double minus_energy = evaluate_nonlocal_energy();
+  const double finite_difference = (plus_energy - minus_energy) / (2 * parameter_step);
+  CHECK(std::real(analytic_derivative[0]) ==
+        Catch::Approx(finite_difference).epsilon(3e-4).margin(3e-4));
+
+  // A one-step selected update must flow through the normal QMCPACK reset
+  // path and change the same nonlocal observable used by the derivative.
+  active[0] = original_parameter - 1e-3 * std::real(analytic_derivative[0]);
+  wavefunction.resetParameters(active);
+  wavefunction.evaluateLog(electrons);
+  const double updated_energy = evaluate_nonlocal_energy();
+  CHECK(std::abs(updated_energy - reference_energy) > 1e-12);
+
+  // A mismatched effective charge is rejected before any quadrature or
+  // derivative allocation, protecting against accidental all-electron reuse.
+  ParticleSet mismatched_ions(ions);
+  SpeciesSet& mismatched_species = mismatched_ions.getSpeciesSet();
+  mismatched_species(mismatched_species.getAttribute("charge"), 0) = 3.0;
+  PsiFormerWF mismatched(
+      "pf_pseudo_mismatch", files.parameters.string(), files.configuration.string(), true, {0});
+  CHECK_THROWS_WITH(mismatched.validateSystem(electrons, mismatched_ions, "pseudopotential"),
+                    Catch::Matchers::ContainsSubstring("effective charges"));
+}
 
 TEST_CASE("Evaluate_ecp", "[hamiltonian]")
 {

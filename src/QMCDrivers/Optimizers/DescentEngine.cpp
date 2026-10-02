@@ -52,6 +52,8 @@ DescentEngine::DescentEngine(Communicate* comm, const xmlNodePtr cur)
   descent_num_ = 0;
   store_count_ = 0;
   processXML(cur);
+  app_log() << "Descent optimizer checkpoint destination: "
+            << (state_file_.empty() ? std::string("disabled") : state_file_) << std::endl;
   if (!state_file_.empty() && std::filesystem::exists(state_file_))
     readState(state_file_);
 }
@@ -1048,6 +1050,17 @@ void DescentEngine::readState(const std::string& path)
   for (const auto& record : deriv_records_)
     if (record.size() != static_cast<std::size_t>(num_params_))
       throw std::runtime_error("Inconsistent gradient history in descent optimizer state file: " + path);
+
+  auto contains_nonfinite = [](const auto& values) {
+    return std::any_of(values.begin(), values.end(), [](const auto& value) {
+      return !std::isfinite(std::real(value)) || !std::isfinite(std::imag(value));
+    });
+  };
+  if (contains_nonfinite(current_params_) || contains_nonfinite(params_copy_) ||
+      contains_nonfinite(params_for_diff_) || contains_nonfinite(taus_) || contains_nonfinite(derivs_squared_) ||
+      contains_nonfinite(numer_records_) || contains_nonfinite(denom_records_) ||
+      std::any_of(deriv_records_.begin(), deriv_records_.end(), contains_nonfinite))
+    throw std::runtime_error("Descent optimizer state file contains a non-finite value: " + path);
 
   app_log() << "Restored descent optimizer state at iteration " << descent_num_ << " from " << path << std::endl;
 }

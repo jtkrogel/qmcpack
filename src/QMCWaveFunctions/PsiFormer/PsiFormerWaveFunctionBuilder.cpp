@@ -56,7 +56,8 @@ std::vector<std::size_t> parseFlatIndices(std::string values)
 // Validate export paths and the initial selected-index optimization input.
 std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildComponent(xmlNodePtr cur)
 {
-  std::string name = "psiformer", parameters, configuration;
+  std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
+  std::string export_parameters;
   std::string optimize = "no", optimize_scope = "indices", optimize_indices;
 
   // Both files use the compact export format consumed by PsiFormerNative.h.
@@ -66,6 +67,9 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(name, "name");
   attributes.add(parameters, "parameters");
   attributes.add(configuration, "configuration");
+  attributes.add(source, "source");
+  attributes.add(system, "system");
+  attributes.add(export_parameters, "export_parameters");
   attributes.add(optimize, "optimize");
   attributes.add(optimize_scope, "optimize_scope");
   attributes.add(optimize_indices, "optimize_indices");
@@ -74,6 +78,13 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     throw std::runtime_error("psiformer requires parameters and configuration HDF5 paths");
 
   const bool optimization_enabled = parseOptimizationFlag(optimize);
+  if (targetPtcl.isSpinor())
+    throw std::invalid_argument("PsiFormer does not support spinor electron particle sets");
+  if (system != "auto" && system != "all_electron" && system != "pseudopotential")
+    throw std::invalid_argument("PsiFormer system must be auto, all_electron, or pseudopotential");
+  if (optimization_enabled && system == "auto")
+    throw std::invalid_argument(
+        "PsiFormer optimization requires system=all_electron or system=pseudopotential for metadata validation");
   std::vector<std::size_t> selected_indices = parseFlatIndices(optimize_indices);
   if (!optimization_enabled && !selected_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
@@ -87,8 +98,16 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (optimization_enabled && !optimize_all && selected_indices.empty())
     throw std::invalid_argument("PsiFormer optimize=yes requires a nonempty optimize_indices list");
 
-  return std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
-                                       std::move(selected_indices), optimize_all);
+  auto component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
+                                                 std::move(selected_indices), optimize_all, export_parameters);
+  if (system != "auto")
+  {
+    const auto source_particle_set = particle_sets_.find(source);
+    if (source_particle_set == particle_sets_.end())
+      throw std::invalid_argument("PsiFormer source particle set not found: " + source);
+    component->validateSystem(targetPtcl, *source_particle_set->second, system);
+  }
+  return component;
 }
 
 } // namespace qmcplusplus

@@ -111,6 +111,8 @@ public:
         std::find_if(begin(), end(), [&](OptimizableObject& element) { return element.getName() == obj.getName(); });
     if (result == end())
       RefVector<OptimizableObject>::push_back(obj);
+    else if (&result->get() != &obj)
+      throw std::invalid_argument("Distinct optimizable objects have the duplicate name " + obj.getName());
   }
 };
 

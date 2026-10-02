@@ -26,6 +26,7 @@ User's Guide and Developer's Manual
    input_overview
    simulationcell
    intro_wavefunction
+   psiformer
    hamiltonianobservable
    methods
    output_overview

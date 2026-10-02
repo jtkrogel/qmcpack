@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <functional>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -109,7 +110,7 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count, std::size_t nucl
 /// Fill every parameter region with deterministic values appropriate to its role.
 inline std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
 {
-  const std::size_t electron_count = system == "lih" ? 4 : 8;
+  const std::size_t electron_count = system == "lih" ? 4 : (system == "lih_pair" ? 8 : 2);
   SplitMix64 random(0xC0FFEE1234000000ULL + electron_count);
   std::vector<double> values;
   for (const Leaf& leaf : leaves)
@@ -144,7 +145,7 @@ struct Geometry
   std::size_t nup;
 };
 
-/// Construct either the LiH or well-separated LiH-pair test geometry.
+/// Construct all-electron LiH, a separated LiH pair, or two-electron pseudo-LiH geometry.
 inline Geometry makeGeometry(const std::string& system)
 {
   Geometry geometry;
@@ -156,13 +157,22 @@ inline Geometry makeGeometry(const std::string& system)
     centers          = {0, 1, 0, 1};
     geometry.nup     = 2;
   }
-  else
+  else if (system == "lih_pair")
   {
     geometry.nuclei = {0, 0, 0, 3.05, 0.08, -0.03, 0.12, 14.7, 0.06, 3.17, 14.78, 0.03};
     geometry.charges = {3, 1, 3, 1};
     centers          = {0, 1, 2, 3, 0, 1, 2, 3};
     geometry.nup     = 4;
   }
+  else if (system == "lih_pp")
+  {
+    geometry.nuclei = {0, 0, 0, 3.05, 0.08, -0.03};
+    geometry.charges = {1, 1};
+    centers          = {0, 1};
+    geometry.nup     = 1;
+  }
+  else
+    throw std::invalid_argument("Unknown generated PsiFormer test system: " + system);
 
   SplitMix64 random(0x1234ABCDEF000000ULL + centers.size());
   for (double& coordinate : geometry.nuclei)

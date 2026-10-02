@@ -19,13 +19,17 @@ namespace qmcplusplus
 class PsiFormerWaveFunctionBuilder : public WaveFunctionComponentBuilder
 {
 public:
-  /// Bind the builder to the target electron set; no auxiliary particle set is required.
-  PsiFormerWaveFunctionBuilder(Communicate* comm, ParticleSet& target, const PSetMap&)
-      : WaveFunctionComponentBuilder(comm, target)
+  /// Bind the builder to target electrons and the pool containing the declared source ions.
+  PsiFormerWaveFunctionBuilder(Communicate* comm, ParticleSet& target, const PSetMap& particle_sets)
+      : WaveFunctionComponentBuilder(comm, target), particle_sets_(particle_sets)
   {}
 
   /// Construct a fixed model by default or a selected/full-network optimizable model.
   std::unique_ptr<WaveFunctionComponent> buildComponent(xmlNodePtr current) override;
+
+private:
+  /// Particle sets used to validate imported nuclei and effective pseudopotential charges.
+  const PSetMap& particle_sets_;
 };
 
 } // namespace qmcplusplus

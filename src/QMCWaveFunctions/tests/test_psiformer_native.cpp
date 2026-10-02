@@ -4,6 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #define PSIFORMER_LIBRARY
@@ -13,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <unistd.h>
@@ -343,4 +345,44 @@ TEST_CASE("PsiFormer explicit parameter derivative requests and total-gradient s
                       electrons,
                       pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_AND_KINETIC, &wrong_total_gradient}),
                   std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer rejects malformed or non-finite HDF5 exports", "[wavefunction][psiformer]")
+{
+  auto overwrite_scalar = [](const std::filesystem::path& path,
+                             const char* dataset_name,
+                             hsize_t index,
+                             hid_t type,
+                             const void* value) {
+    const hid_t file    = H5Fopen(path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    const hid_t dataset = H5Dopen2(file, dataset_name, H5P_DEFAULT);
+    const hid_t space   = H5Dget_space(dataset);
+    const hsize_t count = 1;
+    REQUIRE(H5Sselect_hyperslab(space, H5S_SELECT_SET, &index, nullptr, &count, nullptr) >= 0);
+    const hid_t memory_space = H5Screate_simple(1, &count, nullptr);
+    REQUIRE(H5Dwrite(dataset, type, memory_space, space, H5P_DEFAULT, value) >= 0);
+    H5Sclose(memory_space);
+    H5Sclose(space);
+    H5Dclose(dataset);
+    H5Fclose(file);
+  };
+
+  SECTION("non-finite parameter")
+  {
+    GeneratedFiles files = generateFiles("lih");
+    const double nonfinite = std::numeric_limits<double>::quiet_NaN();
+    overwrite_scalar(files.parameters, "/values", 0, H5T_NATIVE_DOUBLE, &nonfinite);
+    CHECK_THROWS_WITH(pf::PsiFormer(files.parameters, files.configuration),
+                      Catch::Matchers::ContainsSubstring("non-finite"));
+  }
+
+  SECTION("inconsistent final layout offset")
+  {
+    GeneratedFiles files = generateFiles("lih");
+    const hsize_t final_offset_index = makeLayout(4, 2).size();
+    const std::int64_t invalid_offset = 7;
+    overwrite_scalar(files.parameters, "/layout/offsets", final_offset_index, H5T_NATIVE_LLONG, &invalid_offset);
+    CHECK_THROWS_WITH(pf::PsiFormer(files.parameters, files.configuration),
+                      Catch::Matchers::ContainsSubstring("layout metadata"));
+  }
 }

@@ -11,6 +11,8 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
+#include "Message/Communicate.h"
+#include "Particle/VirtualParticleSet.h"
 #include "io/hdf/hdf_archive.h"
 
 #include <algorithm>
@@ -18,9 +20,12 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -45,7 +50,44 @@ public:
 
 namespace
 {
-constexpr std::array<int, 3> PERSISTENCE_VERSION{1, 0, 0};
+constexpr std::array<int, 3> PERSISTENCE_VERSION{1, 1, 0};
+
+/// Hash immutable layout and physical-system metadata into one compact diagnostic identity.
+std::string modelFingerprint(const pf::PsiFormer& model)
+{
+  std::uint64_t hash = 14695981039346656037ULL;
+  auto mix_byte      = [&hash](std::uint8_t byte) {
+    hash ^= byte;
+    hash *= 1099511628211ULL;
+  };
+  auto mix_integer = [&mix_byte](std::uint64_t value) {
+    for (int byte = 0; byte < 8; ++byte)
+      mix_byte(static_cast<std::uint8_t>(value >> (8 * byte)));
+  };
+  auto mix_string = [&mix_byte, &mix_integer](const std::string& value) {
+    mix_integer(value.size());
+    for (unsigned char character : value)
+      mix_byte(character);
+  };
+  auto mix_double = [&mix_integer](double value) {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    mix_integer(bits);
+  };
+
+  mix_string(model.p.layout_fingerprint());
+  mix_integer(model.cfg.nup);
+  mix_integer(model.cfg.ndown);
+  for (double coordinate : model.cfg.nuclei.x)
+    mix_double(coordinate);
+  for (double charge : model.cfg.charges.x)
+    mix_double(charge);
+
+  std::ostringstream fingerprint;
+  fingerprint << std::hex << std::setfill('0') << std::setw(16) << hash;
+  return fingerprint.str();
+}
 
 /// Build a stable, compact VariableSet name from a component and canonical flat index.
 std::string makeParameterName(const std::string& component_name, std::size_t flat_index, std::size_t width)
@@ -89,13 +131,15 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::string configuration,
                          bool enable_optimization,
                          std::vector<std::size_t> selected_flat_indices,
-                         bool optimize_all)
+                         bool optimize_all,
+                         std::string optimized_parameter_export)
     : WaveFunctionComponent(name),
       OptimizableObject(name),
       model_state_(std::make_shared<PsiFormerSharedState>(parameters, configuration)),
       selected_flat_indices_(std::move(selected_flat_indices)),
       optimization_enabled_(enable_optimization),
-      optimize_all_(optimize_all)
+      optimize_all_(optimize_all),
+      optimized_parameter_export_(std::move(optimized_parameter_export))
 {
   if (!optimization_enabled_ && !selected_flat_indices_.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
@@ -114,6 +158,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
   }
   if (optimization_enabled_ && selected_flat_indices_.empty())
     throw std::invalid_argument("PsiFormer selected-parameter optimization requires at least one flat index");
+  if (!optimized_parameter_export_.empty() && !optimization_enabled_)
+    throw std::invalid_argument("PsiFormer export_parameters requires optimize=yes");
 
   if (!optimize_all_)
   {
@@ -135,6 +181,35 @@ PsiFormerWF::PsiFormerWF(std::string name,
                                      parameters_ref.flat_values()[flat_index]);
   }
   myVars.insertBulk(std::move(selected_parameters), true, optimize::OTHER_P);
+
+  std::set<std::string> selected_tensors;
+  for (std::size_t flat_index : selected_flat_indices_)
+  {
+    const pf::Layout& layout = parameters_ref.layout_for_flat_index(flat_index);
+    selected_tensors.insert(layout.module + "/" + layout.name);
+  }
+  app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": model="
+            << modelFingerprint(model_state_->model) << ", parameters=" << parameters_ref.size()
+            << ", active=" << selected_flat_indices_.size() << ", tensors=" << selected_tensors.size()
+            << ", parameter_version=" << parameters_ref.version() << ", derivative_mode="
+            << (optimization_enabled_ ? "score+kinetic+nonlocal-ratio" : "fixed") << std::endl;
+  if (!selected_tensors.empty())
+  {
+    app_log() << "    selected tensors:";
+    std::size_t reported = 0;
+    for (const std::string& tensor : selected_tensors)
+    {
+      if (reported++ == 6)
+      {
+        app_log() << " ...";
+        break;
+      }
+      app_log() << " " << tensor;
+    }
+    app_log() << std::endl;
+  }
+  if (!optimized_parameter_export_.empty())
+    app_log() << "    DeepQMC parameter export destination: " << optimized_parameter_export_ << std::endl;
 }
 
 // Copy clone-local accepted state while deliberately discarding an in-flight proposal.
@@ -145,6 +220,8 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       selected_flat_indices_(other.selected_flat_indices_),
       optimization_enabled_(other.optimization_enabled_),
       optimize_all_(other.optimize_all_),
+      system_kind_(other.system_kind_),
+      optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
       restore_validation_pending_(other.restore_validation_pending_),
       accepted_value_valid_(other.accepted_value_valid_),
@@ -322,10 +399,13 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   const std::vector<std::uint64_t> nuclear_shape(model.cfg.nuclei.shape.begin(), model.cfg.nuclei.shape.end());
   const std::vector<std::uint64_t> selected_indices = persistIndices(selected_flat_indices_);
   const std::string layout_fingerprint              = model.p.layout_fingerprint();
+  const std::string model_fingerprint               = modelFingerprint(model);
 
   output.write(format_version, "format_version");
   output.write(parameter_count, "parameter_count");
   output.write(layout_fingerprint, "layout_fingerprint");
+  output.write(model_fingerprint, "model_fingerprint");
+  output.write(system_kind_, "system_kind");
   output.write(spin_counts, "spin_counts");
   output.write(architecture, "architecture");
   output.write(nuclear_shape, "nuclear_shape");
@@ -336,6 +416,24 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
 
   output.pop();
   output.pop();
+
+  // reportParameters() invokes this hook on rank zero after the final reset.
+  // Use a sibling temporary file so readers never observe a partial HDF5 export.
+  if (!optimized_parameter_export_.empty())
+  {
+    const std::filesystem::path destination(optimized_parameter_export_);
+    const std::filesystem::path temporary = destination.string() + ".tmp";
+    model.p.write(temporary.string());
+    std::error_code error;
+    std::filesystem::rename(temporary, destination, error);
+    if (error)
+    {
+      std::filesystem::remove(temporary);
+      throw std::runtime_error("Unable to publish PsiFormer DeepQMC parameter export " + destination.string() +
+                               ": " + error.message());
+    }
+    app_log() << "  Wrote optimized PsiFormer parameters to " << destination.string() << std::endl;
+  }
 }
 
 // Restore a complete model only after validating all identifying metadata.
@@ -362,7 +460,11 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
       readVector<std::uint64_t>(input, "selected_flat_indices");
   const std::vector<double> flat_values = readVector<double>(input, "flat_values");
   std::string layout_fingerprint;
+  std::string model_fingerprint;
+  std::string system_kind;
   input.read(layout_fingerprint, "layout_fingerprint");
+  input.read(model_fingerprint, "model_fingerprint");
+  input.read(system_kind, "system_kind");
 
   input.pop();
   input.pop();
@@ -378,6 +480,10 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
     requireEqual(parameter_count, std::vector<std::uint64_t>{model.p.size()}, "parameter count");
     if (layout_fingerprint != model.p.layout_fingerprint())
       throw std::runtime_error("PsiFormer VP layout fingerprint does not match the configured model");
+    if (model_fingerprint != modelFingerprint(model))
+      throw std::runtime_error("PsiFormer VP model fingerprint does not match the configured model");
+    if (system_kind != system_kind_)
+      throw std::runtime_error("PsiFormer VP system declaration does not match the configured model");
     requireEqual(spin_counts, std::vector<std::uint64_t>{model.cfg.nup, model.cfg.ndown}, "spin populations");
     requireEqual(architecture, std::vector<std::uint64_t>{model.ndet, model.dim, model.heads}, "architecture");
     requireEqual(nuclear_shape,
@@ -413,11 +519,62 @@ void PsiFormerWF::exportParameters(const std::string& path) const
   model_state_->model.p.write(path);
 }
 
+// Check that the runtime particle sets describe exactly the exported physical system.
+void PsiFormerWF::validateSystem(const ParticleSet& electrons,
+                                const ParticleSet& ions,
+                                const std::string& system_kind)
+{
+  if (system_kind != "all_electron" && system_kind != "pseudopotential")
+    throw std::invalid_argument("PsiFormer system must be all_electron or pseudopotential");
+  if (electrons.isSpinor())
+    throw std::invalid_argument("PsiFormer does not support spinor electrons or spin-orbit pseudopotentials");
+
+  std::shared_lock state_lock(model_state_->mutex);
+  const pf::PsiFormer& model = model_state_->model;
+  if (electrons.getTotalNum() != static_cast<int>(model.ne))
+    throw std::invalid_argument("PsiFormer runtime electron count does not match the exported model");
+  if (electrons.groups() != 2 || electrons.groupsize(0) != static_cast<int>(model.cfg.nup) ||
+      electrons.groupsize(1) != static_cast<int>(model.cfg.ndown))
+    throw std::invalid_argument("PsiFormer runtime spin populations do not match the exported model");
+  if (ions.getTotalNum() != static_cast<int>(model.cfg.nuclei.shape[0]))
+    throw std::invalid_argument("PsiFormer runtime nucleus count does not match the exported model");
+
+  const SpeciesSet& species = ions.getSpeciesSet();
+  const int charge_index     = species.findAttribute("charge");
+  if (charge_index < 0)
+    throw std::invalid_argument("PsiFormer source particle set has no charge attribute");
+  constexpr double tolerance = 1e-10;
+  for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      if (std::abs(ions.R[nucleus][dimension] - model.cfg.nuclei.x[3 * nucleus + dimension]) > tolerance)
+        throw std::invalid_argument("PsiFormer runtime nuclear positions do not match the exported model");
+    const double runtime_charge = species(charge_index, ions.GroupID[nucleus]);
+    if (std::abs(runtime_charge - model.cfg.charges.x[nucleus]) > tolerance)
+      throw std::invalid_argument(
+          "PsiFormer runtime ionic/effective charges do not match the exported model; use an export trained for this pseudopotential system");
+  }
+
+  system_kind_ = system_kind;
+  app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": validated " << system_kind_
+            << " system metadata against electron and ion particle sets" << std::endl;
+}
+
 // Translate QMCPACK particle coordinates and derivative context into a native request.
 pf::Result PsiFormerWF::evaluate(const ParticleSet& p,
                                  int active,
                                  bool with_parameter_gradient,
                                  bool with_kinetic_parameter_gradient)
+{
+  return evaluatePositions(p, active, nullptr, with_parameter_gradient, with_kinetic_parameter_gradient);
+}
+
+// Translate a full or one-electron-replaced configuration into a native request.
+pf::Result PsiFormerWF::evaluatePositions(const ParticleSet& p,
+                                          int replaced_particle,
+                                          const PosType* replacement_position,
+                                          bool with_parameter_gradient,
+                                          bool with_kinetic_parameter_gradient)
 {
   std::shared_lock state_lock(model_state_->mutex);
   pf::PsiFormer& model = model_state_->model;
@@ -433,7 +590,9 @@ pf::Result PsiFormerWF::evaluate(const ParticleSet& p,
   pf::Tensor positions({static_cast<std::size_t>(p.getTotalNum()), 3});
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
   {
-    const auto& position = electron == active ? p.activeR(electron) : p.R[electron];
+    const auto& position = electron == replaced_particle
+        ? (replacement_position ? *replacement_position : p.activeR(electron))
+        : p.R[electron];
     for (int dimension = 0; dimension < 3; ++dimension)
       positions.x[3 * electron + dimension] = position[dimension];
   }
@@ -570,8 +729,117 @@ void PsiFormerWF::addSelectedGradient(const std::vector<double>& flat_gradient, 
     const std::size_t flat_index = selected_flat_indices_[local_index];
     if (flat_index >= flat_gradient.size())
       throw std::out_of_range("PsiFormer native derivative is missing a selected flat index");
+    if (!std::isfinite(flat_gradient[flat_index]))
+      throw std::runtime_error("PsiFormer native parameter derivative is non-finite");
     output[global_index] += ValueType(flat_gradient[flat_index]);
   }
+}
+
+// Scatter O_theta(virtual)-O_theta(reference), the contract consumed by NonLocalECPComponent.
+void PsiFormerWF::addSelectedGradientDifference(const std::vector<double>& reference_gradient,
+                                                const std::vector<double>& virtual_gradient,
+                                                Matrix<ValueType>& output,
+                                                std::size_t row) const
+{
+  if (row >= output.rows())
+    throw std::out_of_range("PsiFormer derivative-ratio row is out of range");
+  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+  {
+    const int global_index = myVars.where(local_index);
+    if (global_index < 0)
+      continue;
+    if (global_index >= output.cols())
+      throw std::out_of_range("PsiFormer derivative-ratio column is out of range");
+
+    const std::size_t flat_index = selected_flat_indices_[local_index];
+    if (flat_index >= reference_gradient.size() || flat_index >= virtual_gradient.size())
+      throw std::out_of_range("PsiFormer native derivative-ratio input is incomplete");
+    const double difference = virtual_gradient[flat_index] - reference_gradient[flat_index];
+    if (!std::isfinite(difference))
+      throw std::runtime_error("PsiFormer native derivative ratio is non-finite");
+    output(row, global_index) += ValueType(difference);
+  }
+}
+
+// Evaluate independent full-network ratios for all quadrature positions without mutating walker state.
+void PsiFormerWF::evaluateRatios(const VirtualParticleSet& virtual_particles, std::vector<ValueType>& ratios)
+{
+  if (virtual_particles.getRefPS().isSpinor())
+    throw std::invalid_argument("PsiFormer nonlocal ratios do not support spinor virtual moves");
+  if (ratios.size() != static_cast<std::size_t>(virtual_particles.getTotalNum()))
+    throw std::invalid_argument("PsiFormer virtual-particle ratio output has the wrong size");
+
+  const ParticleSet& reference = virtual_particles.getRefPS();
+  const int electron           = virtual_particles.refPtcl;
+  if (electron < 0 || electron >= reference.getTotalNum())
+    throw std::out_of_range("PsiFormer virtual-particle reference electron is invalid");
+
+  const pf::Result reference_result = evaluatePositions(reference, -1, nullptr, false, false);
+  for (std::size_t move = 0; move < ratios.size(); ++move)
+  {
+    const pf::Result virtual_result =
+        evaluatePositions(reference, electron, &virtual_particles.R[move], false, false);
+    const double ratio = (virtual_result.sign / reference_result.sign) *
+        std::exp(virtual_result.logabs - reference_result.logabs);
+    if (!std::isfinite(ratio))
+      throw std::runtime_error("PsiFormer virtual-particle ratio is non-finite");
+    ratios[move] = ValueType(ratio);
+  }
+}
+
+// Evaluate ratios and their logarithmic parameter-derivative changes for nonlocal ECP optimization.
+void PsiFormerWF::evaluateDerivRatios(const VirtualParticleSet& virtual_particles,
+                                      const OptVariables&,
+                                      std::vector<ValueType>& ratios,
+                                      Matrix<ValueType>& derivative_ratios)
+{
+  if (!optimization_enabled_ || !hasActiveParameters())
+  {
+    evaluateRatios(virtual_particles, ratios);
+    return;
+  }
+  if (virtual_particles.getRefPS().isSpinor())
+    throw std::invalid_argument("PsiFormer nonlocal derivative ratios do not support spinor virtual moves");
+  if (ratios.size() != static_cast<std::size_t>(virtual_particles.getTotalNum()) ||
+      derivative_ratios.rows() != ratios.size())
+    throw std::invalid_argument("PsiFormer virtual derivative-ratio output has the wrong shape");
+
+  const ParticleSet& reference = virtual_particles.getRefPS();
+  const int electron           = virtual_particles.refPtcl;
+  if (electron < 0 || electron >= reference.getTotalNum())
+    throw std::out_of_range("PsiFormer virtual-particle reference electron is invalid");
+
+  const pf::Result reference_result = evaluatePositions(reference, -1, nullptr, true, false);
+  for (std::size_t move = 0; move < ratios.size(); ++move)
+  {
+    const pf::Result virtual_result =
+        evaluatePositions(reference, electron, &virtual_particles.R[move], true, false);
+    const double ratio = (virtual_result.sign / reference_result.sign) *
+        std::exp(virtual_result.logabs - reference_result.logabs);
+    if (!std::isfinite(ratio))
+      throw std::runtime_error("PsiFormer virtual-particle ratio is non-finite");
+    ratios[move] = ValueType(ratio);
+    addSelectedGradientDifference(reference_result.param_gradient, virtual_result.param_gradient,
+                                  derivative_ratios, move);
+  }
+}
+
+// Fail before a spin-orbit ECP can silently discard its spin quadrature multipliers.
+void PsiFormerWF::evaluateSpinorRatios(const VirtualParticleSet&,
+                                       const std::pair<ValueVector, ValueVector>&,
+                                       std::vector<ValueType>&)
+{
+  throw std::invalid_argument("PsiFormer does not implement spinor or spin-orbit ECP ratios");
+}
+
+// Fail before unsupported spin-orbit parameter derivatives reach the nonlocal operator.
+void PsiFormerWF::evaluateSpinorDerivRatios(const VirtualParticleSet&,
+                                            const std::pair<ValueVector, ValueVector>&,
+                                            const OptVariables&,
+                                            std::vector<ValueType>&,
+                                            Matrix<ValueType>&)
+{
+  throw std::invalid_argument("PsiFormer does not implement spinor or spin-orbit ECP derivative ratios");
 }
 
 // Add only score derivatives, avoiding the mixed coordinate-jet reverse used for kinetic derivatives.

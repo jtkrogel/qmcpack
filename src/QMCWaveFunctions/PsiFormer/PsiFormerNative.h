@@ -1976,6 +1976,8 @@ struct Parameters
   explicit Parameters(const std::string& path)
   {
     const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file < 0)
+      throw std::runtime_error("Unable to open PsiFormer parameter file " + path);
 
     // Read the single flat parameter array and its parallel layout metadata.
     values                                 = read_double(file, "/values");
@@ -1986,16 +1988,38 @@ struct Parameters
     const std::vector<int64_t> shape_table = read_i64(file, "/layout/shapes", &shape_table_shape);
     const std::vector<int64_t> offsets     = read_i64(file, "/layout/offsets");
 
+    const size_t parameter_count = modules.size();
+    if (names.size() != parameter_count || ranks.size() != parameter_count || offsets.size() != parameter_count + 1 ||
+        shape_table_shape.size() != 2 || shape_table_shape[0] != parameter_count || offsets.empty() ||
+        offsets.front() != 0 || offsets.back() != static_cast<int64_t>(values.size()))
+      throw std::runtime_error("PsiFormer parameter file has inconsistent layout metadata");
+    if (std::any_of(values.begin(), values.end(), [](double value) { return !is_finite_parameter_value(value); }))
+      throw std::runtime_error("PsiFormer parameter file contains a non-finite value");
+
     // Materialize each flattened interval as a named parameter leaf. These
     // leaves become parents in the reverse-mode graph assembled at evaluation.
     for (size_t parameter_index = 0; parameter_index < modules.size(); ++parameter_index)
     {
+      if (ranks[parameter_index] < 0 ||
+          ranks[parameter_index] > static_cast<int64_t>(shape_table_shape[1]) ||
+          offsets[parameter_index] < 0 || offsets[parameter_index + 1] < offsets[parameter_index])
+        throw std::runtime_error("PsiFormer parameter file has an invalid layout extent");
       Shape parameter_shape;
       for (int axis = 0; axis < ranks[parameter_index]; ++axis)
+      {
+        if (shape_table[parameter_index * shape_table_shape[1] + axis] < 0)
+          throw std::runtime_error("PsiFormer parameter file has a negative tensor extent");
         parameter_shape.push_back(shape_table[parameter_index * shape_table_shape[1] + axis]);
+      }
 
       Layout layout{modules[parameter_index], names[parameter_index], parameter_shape, size_t(offsets[parameter_index]),
                     size_t(offsets[parameter_index + 1])};
+      const size_t tensor_size = std::accumulate(parameter_shape.begin(), parameter_shape.end(), size_t{1},
+                                                 std::multiplies<size_t>());
+      if (layout.end - layout.begin != tensor_size)
+        throw std::runtime_error("PsiFormer parameter tensor shape does not match its flat interval");
+      if (nodes.count({layout.module, layout.name}) != 0)
+        throw std::runtime_error("PsiFormer parameter file contains a duplicate tensor name");
       std::vector<double> parameter_values(values.begin() + layout.begin, values.begin() + layout.end);
       NodePtr parameter_node        = node(Tensor(parameter_shape, std::move(parameter_values)));
       parameter_node->parameter_key = modules[parameter_index] + "/" + names[parameter_index];
@@ -2251,17 +2275,33 @@ struct ConfigData
   explicit ConfigData(const std::string& path)
   {
     const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file < 0)
+      throw std::runtime_error("Unable to open PsiFormer configuration file " + path);
 
     // Preserve complete tensor shapes while reading the physical system and
     // the batch of electron configurations used by the validation driver.
     electrons.x = read_double(file, "/electron_positions", &electrons.shape);
     nuclei.x    = read_double(file, "/nuclear_positions", &nuclei.shape);
     charges.x   = read_double(file, "/nuclear_charges", &charges.shape);
-    nup         = read_attr_i64(file, "n_up");
-    ndown       = read_attr_i64(file, "n_down");
-    nconfig     = electrons.shape[0];
+    const int64_t nup_input   = read_attr_i64(file, "n_up");
+    const int64_t ndown_input = read_attr_i64(file, "n_down");
+    if (nup_input <= 0 || ndown_input <= 0)
+      throw std::runtime_error("PsiFormer configuration requires positive up- and down-spin populations");
+    nup     = nup_input;
+    ndown   = ndown_input;
+    nconfig = electrons.shape.empty() ? 0 : electrons.shape[0];
 
     H5Fclose(file);
+
+    const size_t electron_count = nup + ndown;
+    if (electrons.shape != Shape{nconfig, electron_count, 3} || nuclei.shape.size() != 2 ||
+        nuclei.shape[1] != 3 || charges.shape != Shape{nuclei.shape[0]} || nconfig == 0)
+      throw std::runtime_error("PsiFormer configuration file has inconsistent physical-system tensor shapes");
+    auto contains_nonfinite = [](const std::vector<double>& values) {
+      return std::any_of(values.begin(), values.end(), [](double value) { return !is_finite_parameter_value(value); });
+    };
+    if (contains_nonfinite(electrons.x) || contains_nonfinite(nuclei.x) || contains_nonfinite(charges.x))
+      throw std::runtime_error("PsiFormer configuration file contains a non-finite value");
   }
 
   /// Extract one electron configuration as an [electron, Cartesian] tensor.
@@ -2625,6 +2665,18 @@ struct PsiFormer
       result.local_energy_param_gradient =
           p.flat_gradient(backward_coordinate_jets(log_wavefunction, std::move(local_energy_seed)));
     }
+
+    auto require_finite = [](const std::vector<double>& values, const std::string& description) {
+      if (std::any_of(values.begin(), values.end(), [](double value) { return !is_finite_parameter_value(value); }))
+        throw std::runtime_error("PsiFormer produced a non-finite " + description);
+    };
+    if (!is_finite_parameter_value(result.sign) || !is_finite_parameter_value(result.logabs) ||
+        !is_finite_parameter_value(result.local_energy))
+      throw std::runtime_error("PsiFormer produced a non-finite high-level observable");
+    require_finite(result.gradient, "spatial gradient");
+    require_finite(result.lap_log, "spatial Laplacian");
+    require_finite(result.param_gradient, "parameter gradient");
+    require_finite(result.local_energy_param_gradient, "local-energy parameter gradient");
     return result;
   }
 

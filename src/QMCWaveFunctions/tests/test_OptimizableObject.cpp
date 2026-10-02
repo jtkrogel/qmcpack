@@ -76,11 +76,13 @@ TEST_CASE("Test OptimizableObject", "[wavefunction]")
 
   CHECK(opt_obj_refs.size() == 2);
 
-  FakeOptimizableObject fake_c("functor_b");
-  opt_obj_refs.push_back(fake_c);
+  opt_obj_refs.push_back(fake_b);
   CHECK(opt_obj_refs.size() == 2);
   CHECK(opt_obj_refs[0].getName() == "functor_a");
   CHECK(opt_obj_refs[1].getName() == "functor_b");
+
+  FakeOptimizableObject duplicate_name("functor_b");
+  CHECK_THROWS_AS(opt_obj_refs.push_back(duplicate_name), std::invalid_argument);
 }
 
 TEST_CASE("OptimizableObject HDF output and input", "[wavefunction]")

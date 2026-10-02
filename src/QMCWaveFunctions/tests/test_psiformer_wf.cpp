@@ -9,11 +9,13 @@
  * @brief Selected-parameter QMCPACK integration tests for PsiFormerWF.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Message/Communicate.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
@@ -48,6 +50,27 @@ ParticleSet makeLiHElectrons(const SimulationCell& simulation_cell)
       electrons.R[electron][dimension] = geometry.electrons[3 * electron + dimension];
   electrons.update();
   return electrons;
+}
+
+/// Construct source ions whose positions and charges exactly match the generated export.
+std::unique_ptr<ParticleSet> makeLiHIons(const SimulationCell& simulation_cell, const std::string& system = "lih")
+{
+  const Geometry geometry = makeGeometry(system);
+  auto ions              = std::make_unique<ParticleSet>(simulation_cell);
+  ions->setName("ion0");
+  ions->create(std::vector<int>(geometry.charges.size(), 1));
+  SpeciesSet& species = ions->getSpeciesSet();
+  const int charge     = species.addAttribute("charge");
+  for (std::size_t nucleus = 0; nucleus < geometry.charges.size(); ++nucleus)
+  {
+    species.addSpecies("ion_" + std::to_string(nucleus));
+    species(charge, nucleus) = geometry.charges[nucleus];
+    for (int dimension = 0; dimension < 3; ++dimension)
+      ions->R[nucleus][dimension] = geometry.nuclei[3 * nucleus + dimension];
+  }
+  ions->resetGroups();
+  ions->update();
+  return ions;
 }
 
 /// Add the gradient of a fixed linear log factor to emulate composition with another component.
@@ -222,6 +245,8 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   const SimulationCell simulation_cell;
   ParticleSet electrons = makeLiHElectrons(simulation_cell);
   WaveFunctionComponentBuilder::PSetMap particle_sets;
+  auto ions = makeLiHIons(simulation_cell);
+  particle_sets.emplace(ions->getName(), std::move(ions));
   PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
 
   std::ostringstream fixed_xml;
@@ -239,7 +264,8 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   std::ostringstream optimized_xml;
   optimized_xml << "<psiformer name=\"pf_selected\" parameters=\"" << files.parameters.string()
                 << "\" configuration=\"" << files.configuration.string()
-                << "\" optimize=\"yes\" optimize_scope=\"indices\" optimize_indices=\"127, 0 1\"/>";
+                << "\" system=\"all_electron\" optimize=\"yes\" optimize_scope=\"indices\" "
+                   "optimize_indices=\"127, 0 1\"/>";
   Libxml2Document optimized_document;
   REQUIRE(optimized_document.parseFromString(optimized_xml.str()));
   std::unique_ptr<WaveFunctionComponent> optimized = builder.buildComponent(optimized_document.getRoot());
@@ -252,7 +278,7 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   std::ostringstream all_xml;
   all_xml << "<psiformer name=\"pf_all\" parameters=\"" << files.parameters.string()
           << "\" configuration=\"" << files.configuration.string()
-          << "\" optimize=\"yes\" optimize_scope=\"all\"/>";
+          << "\" system=\"all_electron\" optimize=\"yes\" optimize_scope=\"all\"/>";
   Libxml2Document all_document;
   REQUIRE(all_document.parseFromString(all_xml.str()));
   std::unique_ptr<WaveFunctionComponent> all = builder.buildComponent(all_document.getRoot());
@@ -269,10 +295,103 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   std::ostringstream unsupported_xml;
   unsupported_xml << "<psiformer parameters=\"" << files.parameters.string() << "\" configuration=\""
                   << files.configuration.string()
-                  << "\" optimize=\"yes\" optimize_scope=\"all\" optimize_indices=\"0\"/>";
+                  << "\" system=\"all_electron\" optimize=\"yes\" optimize_scope=\"all\" "
+                     "optimize_indices=\"0\"/>";
   Libxml2Document unsupported_document;
   REQUIRE(unsupported_document.parseFromString(unsupported_xml.str()));
   CHECK_THROWS_AS(builder.buildComponent(unsupported_document.getRoot()), std::invalid_argument);
+
+  std::ostringstream undeclared_system_xml;
+  undeclared_system_xml << "<psiformer parameters=\"" << files.parameters.string() << "\" configuration=\""
+                        << files.configuration.string()
+                        << "\" optimize=\"yes\" optimize_indices=\"0\"/>";
+  Libxml2Document undeclared_system_document;
+  REQUIRE(undeclared_system_document.parseFromString(undeclared_system_xml.str()));
+  CHECK_THROWS_WITH(builder.buildComponent(undeclared_system_document.getRoot()),
+                    Catch::Matchers::ContainsSubstring("requires system="));
+
+  ParticleSet spinor_electrons = makeLiHElectrons(simulation_cell);
+  spinor_electrons.setSpinor(true);
+  PsiFormerWaveFunctionBuilder spinor_builder(OHMMS::Controller, spinor_electrons, particle_sets);
+  CHECK_THROWS_WITH(spinor_builder.buildComponent(fixed_document.getRoot()),
+                    Catch::Matchers::ContainsSubstring("spinor"));
+}
+
+TEST_CASE("PsiFormer nonlocal virtual ratios and parameter derivatives", "[wavefunction][psiformer][ecp]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component("pf_virtual", files.parameters.string(), files.configuration.string(), true, {0, 127});
+  OptVariables active = registerSelectedParameters(component);
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue reference_log = component.evaluateLog(electrons, electrons.G, electrons.L);
+  const std::vector<ParticleSet::SingleParticlePos> displacements{{0.08, -0.03, 0.02},
+                                                                   {-0.04, 0.06, -0.05},
+                                                                   {0.03, 0.01, 0.07}};
+  VirtualParticleSet virtual_particles(electrons);
+  virtual_particles.makeMoves(electrons, 1, displacements);
+
+  std::vector<ValueType> ratios(displacements.size());
+  Matrix<ValueType> derivative_ratios(displacements.size(), active.size());
+  derivative_ratios = ValueType(0);
+  component.evaluateDerivRatios(virtual_particles, active, ratios, derivative_ratios);
+
+  // Full reevaluation supplies an independent high-level ratio check at each
+  // quadrature point; no particle-by-particle proposal cache is involved.
+  for (std::size_t move = 0; move < displacements.size(); ++move)
+  {
+    ParticleSet moved = makeLiHElectrons(simulation_cell);
+    moved.R[1] += displacements[move];
+    moved.update();
+    PsiFormerWF fixed("pf_virtual_fixed", files.parameters.string(), files.configuration.string());
+    moved.G = ValueType(0);
+    moved.L = ValueType(0);
+    const PsiFormerWF::LogValue moved_log = fixed.evaluateLog(moved, moved.G, moved.L);
+    const auto expected_ratio             = std::exp(moved_log - reference_log);
+    CHECK(std::real(ratios[move]) ==
+          Catch::Approx(std::real(expected_ratio)).epsilon(2e-9).margin(2e-12));
+    CHECK(std::imag(ratios[move]) ==
+          Catch::Approx(std::imag(expected_ratio)).epsilon(2e-9).margin(2e-12));
+  }
+
+  // The ECP contract is d log(Psi_virtual/Psi_reference)/d theta. Verify
+  // both selected columns by centered finite differences of full log values.
+  const double parameter_step = 2e-5;
+  for (int parameter = 0; parameter < active.size(); ++parameter)
+  {
+    const double original = active[parameter];
+    std::vector<double> log_ratio_plus(displacements.size());
+    std::vector<double> log_ratio_minus(displacements.size());
+    for (int direction : {-1, 1})
+    {
+      active[parameter] = original + direction * parameter_step;
+      component.resetParametersExclusive(active);
+      electrons.G = ValueType(0);
+      electrons.L = ValueType(0);
+      const double base_log = std::real(component.evaluateLog(electrons, electrons.G, electrons.L));
+      for (std::size_t move = 0; move < displacements.size(); ++move)
+      {
+        ParticleSet moved = makeLiHElectrons(simulation_cell);
+        moved.R[1] += displacements[move];
+        moved.update();
+        moved.G = ValueType(0);
+        moved.L = ValueType(0);
+        const double moved_log = std::real(component.evaluateLog(moved, moved.G, moved.L));
+        (direction > 0 ? log_ratio_plus : log_ratio_minus)[move] = moved_log - base_log;
+      }
+    }
+    active[parameter] = original;
+    component.resetParametersExclusive(active);
+    for (std::size_t move = 0; move < displacements.size(); ++move)
+    {
+      const double finite_difference = (log_ratio_plus[move] - log_ratio_minus[move]) / (2 * parameter_step);
+      CHECK(std::real(derivative_ratios(move, parameter)) ==
+            Catch::Approx(finite_difference).epsilon(8e-5).margin(8e-5));
+    }
+  }
 }
 
 TEST_CASE("PsiFormer full-network derivatives update and restart", "[wavefunction][psiformer]")
@@ -558,8 +677,10 @@ TEST_CASE("PsiFormer complete model persistence and DeepQMC export round trip", 
   ParticleSet original_electrons = makeLiHElectrons(simulation_cell);
 
   const std::vector<std::size_t> selected_indices{0, 127, 2047};
+  const std::filesystem::path export_path = files.directory / "parameters_optimized.h5";
   PsiFormerWF original(
-      "pf_restart", files.parameters.string(), files.configuration.string(), true, selected_indices);
+      "pf_restart", files.parameters.string(), files.configuration.string(), true, selected_indices, false,
+      export_path.string());
   OptVariables original_active = registerSelectedParameters(original);
   original_active[0] += 1.5e-4;
   original_active[1] -= 2.0e-4;
@@ -572,6 +693,7 @@ TEST_CASE("PsiFormer complete model persistence and DeepQMC export round trip", 
   original_active.writeToHDF(vp_path.string(), output);
   original.writeVariationalParameters(output);
   output.close();
+  CHECK(std::filesystem::exists(export_path));
 
   ParticleSet restored_electrons = makeLiHElectrons(simulation_cell);
   PsiFormerWF restored(
@@ -588,8 +710,6 @@ TEST_CASE("PsiFormer complete model persistence and DeepQMC export round trip", 
 
   // The explicit export is intentionally separate from optimizer restart: it
   // contains only the DeepQMC flat values and immutable tensor layout.
-  const std::filesystem::path export_path = files.directory / "parameters_optimized.h5";
-  restored.exportParameters(export_path.string());
   ParticleSet exported_electrons = makeLiHElectrons(simulation_cell);
   PsiFormerWF exported(
       "pf_export", export_path.string(), files.configuration.string(), true, selected_indices);

@@ -9,6 +9,7 @@
 // File created by: Mark Dewing, mdewing@anl.gov, Argonne National Laboratory
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "QMCDrivers/WFOpt/QMCCostFunctionBatched.h"
 #include "OhmmsData/Libxml2Doc.h"
@@ -77,6 +78,13 @@ public:
     costFn.prepareDerivativeStorage(handle.getSamplingRequirements(), include_energy_derivatives);
   }
 
+  void validateDerivativeStorage(const EngineHandle& handle,
+                                 bool include_energy_derivatives,
+                                 std::size_t safe_byte_limit)
+  {
+    costFn.validateDerivativeStorage(handle.getSamplingRequirements(), include_energy_derivatives, safe_byte_limit);
+  }
+
   void set_samples_and_param(int nsamples, int nparam)
   {
     numSamples = nsamples;
@@ -93,6 +101,14 @@ public:
     getRecordsOnNode().resize(numSamples, QMCCostFunctionBase::SUM_INDEX_SIZE);
     getDerivRecords().resize(numSamples, numParam);
     getHDerivRecords().resize(numSamples, numParam);
+  }
+
+  void set_psiformer_samples_and_param(int nsamples)
+  {
+    costFn.rank_local_num_samples_ = nsamples;
+    costFn.opt_vars.insert("pf_pf_0000000", 1.0);
+    costFn.opt_vars.insert("pf_pf_0000001", 2.0);
+    costFn.opt_vars.resetIndex();
   }
 };
 
@@ -120,6 +136,23 @@ TEST_CASE("Batched descent releases persistent derivative records", "[drivers][d
   CHECK(support.getDerivRecords().cols() == 3);
   CHECK(support.getHDerivRecords().rows() == 7);
   CHECK(support.getHDerivRecords().cols() == 3);
+}
+
+TEST_CASE("PsiFormer persistent derivative storage is rejected before allocation", "[drivers][psiformer]")
+{
+  Communicate* communicator = OHMMS::Controller;
+  testing::LinearMethodTestSupport support({1}, communicator);
+  support.set_psiformer_samples_and_param(8);
+
+  NullEngineHandle stored_handle;
+  CHECK_THROWS_WITH(support.validateDerivativeStorage(stored_handle, true, 1),
+                    Catch::Matchers::ContainsSubstring("Use method=descent"));
+
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<tmp/>"));
+  DescentEngine engine(communicator, document.getRoot());
+  DescentEngineHandle streaming_handle(engine);
+  CHECK_NOTHROW(support.validateDerivativeStorage(streaming_handle, true, 1));
 }
 
 TEST_CASE("fillOverlapAndHamiltonianMatrices", "[drivers]")
