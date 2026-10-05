@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerWaveFunctionBuilder.h
- * @brief Builder for a PsiFormer wavefunction component imported from HDF5.
+ * @brief Builder for imported or deterministically initialized PsiFormer components.
  */
 #ifndef QMCPLUSPLUS_PSIFORMERWAVEFUNCTIONBUILDER_H
 #define QMCPLUSPLUS_PSIFORMERWAVEFUNCTIONBUILDER_H
@@ -15,7 +15,7 @@
 
 namespace qmcplusplus
 {
-/** Parse PsiFormer export paths and selected-index or full-network optimization controls. */
+/** Parse model-construction and selected-index or full-network optimization controls. */
 class PsiFormerWaveFunctionBuilder : public WaveFunctionComponentBuilder
 {
 public:
@@ -28,7 +28,7 @@ public:
   std::unique_ptr<WaveFunctionComponent> buildComponent(xmlNodePtr current) override;
 
 private:
-  /// Particle sets used to validate imported nuclei and effective pseudopotential charges.
+  /// Particle sets supplying or validating nuclei and effective pseudopotential charges.
   const PSetMap& particle_sets_;
 };
 

@@ -17,6 +17,7 @@
 #include "Particle/ParticleSet.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
@@ -26,6 +27,7 @@
 #include "psiformer_test_utils.h"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <filesystem>
@@ -69,13 +71,37 @@ namespace
 using namespace testing::psiformer;
 using ValueType = QMCTraits::ValueType;
 
-/// Construct the four-electron ParticleSet matching the generated LiH fixture.
-ParticleSet makeLiHElectrons(const SimulationCell& simulation_cell)
+/// Own a unique scratch directory used only for object-specific VP round trips.
+struct ScopedTestDirectory
 {
-  const Geometry geometry = makeGeometry("lih");
+  std::filesystem::path path;
+
+  explicit ScopedTestDirectory(const std::string& label)
+  {
+    static std::atomic<std::uint64_t> sequence{0};
+    path = std::filesystem::temp_directory_path() /
+        ("qmcpack_psiformer_" + label + "_" +
+         std::to_string(static_cast<long long>(getpid())) + "_" +
+         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+    std::filesystem::create_directories(path);
+  }
+
+  ~ScopedTestDirectory()
+  {
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+  }
+};
+
+/// Construct the electron ParticleSet matching one generated LiH fixture.
+ParticleSet makeLiHElectrons(const SimulationCell& simulation_cell,
+                             const std::string& system = "lih")
+{
+  const Geometry geometry = makeGeometry(system);
   ParticleSet electrons(simulation_cell);
   electrons.setName("e");
-  electrons.create({2, 2});
+  electrons.create({static_cast<int>(geometry.nup),
+                    static_cast<int>(geometry.electrons.size() / 3 - geometry.nup)});
   SpeciesSet& species = electrons.getSpeciesSet();
   species.addSpecies("u");
   species.addSpecies("d");
@@ -212,6 +238,31 @@ OptVariables registerSelectedParameters(PsiFormerWF& component)
   active.resetIndex();
   component.checkOutVariables(active);
   return active;
+}
+
+/// Build a production-shape PsiFormer directly from XML and QMCPACK ParticleSets.
+std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder& builder,
+                                                   const std::string& name,
+                                                   std::uint64_t seed,
+                                                   const std::string& system = "all_electron",
+                                                   const std::string& selected_indices = "0 514")
+{
+  std::ostringstream xml;
+  xml << "<psiformer name=\"" << name
+      << "\" initialization=\"" << psiformer::DEEPQMC_PSIFORMER_V1
+      << "\" initialization_seed=\"" << seed
+      << "\" source=\"ion0\" system=\"" << system << "\" optimize=\"yes\" "
+         "optimize_scope=\"indices\" optimize_indices=\"" << selected_indices << "\"/>";
+
+  Libxml2Document document;
+  if (!document.parseFromString(xml.str()))
+    throw std::runtime_error("Unable to parse internally initialized PsiFormer test XML");
+  std::unique_ptr<WaveFunctionComponent> component = builder.buildComponent(document.getRoot());
+  auto* psiformer_component = dynamic_cast<PsiFormerWF*>(component.get());
+  if (psiformer_component == nullptr)
+    throw std::runtime_error("PsiFormer builder returned the wrong component type");
+  component.release();
+  return std::unique_ptr<PsiFormerWF>(psiformer_component);
 }
 
 /// Evaluate the component from scratch and flatten its public QMCPACK outputs.
@@ -370,6 +421,174 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   PsiFormerWaveFunctionBuilder spinor_builder(OHMMS::Controller, spinor_electrons, particle_sets);
   CHECK_THROWS_WITH(spinor_builder.buildComponent(fixed_document.getRoot()),
                     Catch::Matchers::ContainsSubstring("spinor"));
+}
+
+TEST_CASE("PsiFormer builder validates internal initialization XML", "[wavefunction][psiformer][initialization]")
+{
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap particle_sets;
+  auto ions = makeLiHIons(simulation_cell);
+  particle_sets.emplace(ions->getName(), std::move(ions));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
+
+  auto check_invalid = [&builder](const std::string& xml, const std::string& message) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(xml));
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring(message));
+  };
+
+  check_invalid(
+      "<psiformer initialization=\"deepqmc_psiformer_v1\" initialization_seed=\"7\" "
+      "parameters=\"parameters.h5\" source=\"ion0\" system=\"all_electron\"/>",
+      "cannot be combined");
+  check_invalid(
+      "<psiformer parameters=\"parameters.h5\" configuration=\"configuration.h5\" "
+      "initialization_seed=\"7\"/>",
+      "requires internal initialization");
+  check_invalid(
+      "<psiformer initialization=\"deepqmc_psiformer_v1\" initialization_seed=\"7\" "
+      "source=\"ion0\"/>",
+      "requires explicit system");
+  check_invalid(
+      "<psiformer initialization=\"deepqmc_psiformer_v1\" initialization_seed=\"7\" "
+      "system=\"all_electron\"/>",
+      "requires an explicit source");
+  check_invalid(
+      "<psiformer initialization=\"unversioned\" initialization_seed=\"7\" "
+      "source=\"ion0\" system=\"all_electron\"/>",
+      "Unsupported PsiFormer initialization profile");
+  check_invalid(
+      "<psiformer initialization=\"deepqmc_psiformer_v1\" initialization_seed=\"-1\" "
+      "source=\"ion0\" system=\"all_electron\"/>",
+      "must be an unsigned integer");
+}
+
+TEST_CASE("PsiFormer internal initialization evaluates and restores without model files",
+          "[wavefunction][psiformer][initialization]")
+{
+  constexpr std::uint64_t initialization_seed = 17;
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap particle_sets;
+  auto ions = makeLiHIons(simulation_cell);
+  particle_sets.emplace(ions->getName(), std::move(ions));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
+
+  std::unique_ptr<PsiFormerWF> original =
+      buildInternalPsiFormer(builder, "pf_internal", initialization_seed);
+  OptVariables active = registerSelectedParameters(*original);
+  REQUIRE(active.size() == 2);
+
+  // Identical seeds reproduce all public values, while changing the seed
+  // changes a selected parameter in the first random tensor. Index zero is an
+  // analytic cusp constant and remains seed independent.
+  ParticleSet repeated_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<PsiFormerWF> repeated =
+      buildInternalPsiFormer(builder, "pf_internal_repeated", initialization_seed);
+  OptVariables repeated_active = registerSelectedParameters(*repeated);
+  REQUIRE(repeated_active.size() == active.size());
+  for (int parameter = 0; parameter < active.size(); ++parameter)
+    CHECK(std::real(repeated_active[parameter]) == std::real(active[parameter]));
+
+  std::unique_ptr<PsiFormerWF> changed_seed =
+      buildInternalPsiFormer(builder, "pf_internal_changed", initialization_seed + 1);
+  OptVariables changed_active = registerSelectedParameters(*changed_seed);
+  REQUIRE(changed_active.size() == active.size());
+  CHECK(std::real(changed_active[0]) == std::real(active[0]));
+  CHECK(std::real(changed_active[1]) != std::real(active[1]));
+  changed_seed.reset();
+
+  const ComponentSnapshot baseline = evaluateComponent(*original, electrons, active);
+  const ComponentSnapshot repeated_snapshot =
+      evaluateComponent(*repeated, repeated_electrons, repeated_active);
+  checkComponentSnapshot(repeated_snapshot, baseline);
+  repeated.reset();
+
+  CHECK(std::isfinite(baseline.log_value));
+  CHECK(std::isfinite(baseline.phase));
+  CHECK(std::isfinite(baseline.wavefunction_value));
+  CHECK(std::isfinite(baseline.local_energy));
+  for (double value : baseline.gradient)
+    CHECK(std::isfinite(value));
+  for (double value : baseline.laplacian)
+    CHECK(std::isfinite(value));
+  for (double value : baseline.log_parameter_derivative)
+    CHECK(std::isfinite(value));
+  for (double value : baseline.kinetic_parameter_derivative)
+    CHECK(std::isfinite(value));
+
+  // Update through normal optimizer registration, then persist both the
+  // generic selected list and the complete object-specific model payload.
+  active[0] += 1.5e-4;
+  active[1] -= 2.5e-4;
+  original->resetParametersExclusive(active);
+  const ComponentSnapshot expected = evaluateComponent(*original, electrons, active);
+
+  ScopedTestDirectory files("internal_restart");
+  const std::filesystem::path state_path = files.path / "psiformer_internal.vp.h5";
+  hdf_archive output;
+  active.writeToHDF(state_path.string(), output);
+  original->writeVariationalParameters(output);
+  output.close();
+
+  ParticleSet restored_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<PsiFormerWF> restored =
+      buildInternalPsiFormer(builder, "pf_internal", initialization_seed);
+  OptVariables restored_active = registerSelectedParameters(*restored);
+  hdf_archive input;
+  restored_active.readFromHDF(state_path.string(), input);
+  restored->readVariationalParameters(input);
+  input.close();
+  restored->resetParametersExclusive(restored_active);
+  const ComponentSnapshot restarted =
+      evaluateComponent(*restored, restored_electrons, restored_active);
+  checkComponentSnapshot(restarted, expected);
+
+  // The seed is part of restart identity, so an otherwise compatible model
+  // cannot silently accept a payload produced from another initial state.
+  std::unique_ptr<PsiFormerWF> mismatched_seed =
+      buildInternalPsiFormer(builder, "pf_internal", initialization_seed + 1);
+  hdf_archive mismatch_input;
+  REQUIRE(mismatch_input.open(state_path, H5F_ACC_RDONLY));
+  CHECK_THROWS_WITH(mismatched_seed->readVariationalParameters(mismatch_input),
+                    Catch::Matchers::ContainsSubstring("initialization seed"));
+  mismatch_input.close();
+}
+
+TEST_CASE("PsiFormer internal initialization uses the canonical pseudo-LiH layout",
+          "[wavefunction][psiformer][initialization][ecp]")
+{
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell, "lih_pp");
+  WaveFunctionComponentBuilder::PSetMap particle_sets;
+  auto ions = makeLiHIons(simulation_cell, "lih_pp");
+  particle_sets.emplace(ions->getName(), std::move(ions));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
+
+  std::unique_ptr<PsiFormerWF> component = buildInternalPsiFormer(
+      builder, "pf_internal_pseudo", 23, "pseudopotential", "0 257");
+  OptVariables active = registerSelectedParameters(*component);
+  REQUIRE(active.size() == 2);
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue log_value =
+      component->evaluateLog(electrons, electrons.G, electrons.L);
+  CHECK(std::isfinite(std::real(log_value)));
+  CHECK(std::isfinite(std::imag(log_value)));
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      CHECK(std::isfinite(std::real(electrons.G[electron][dimension])));
+    CHECK(std::isfinite(std::real(electrons.L[electron])));
+  }
+
+  Vector<ValueType> dlogpsi(active.size(), ValueType(0));
+  component->evaluateDerivativesWF(electrons, active, dlogpsi);
+  for (const ValueType derivative : dlogpsi)
+    CHECK(std::isfinite(std::real(derivative)));
 }
 
 TEST_CASE("PsiFormer specialized public evaluation paths preserve high-level results", "[wavefunction][psiformer]")

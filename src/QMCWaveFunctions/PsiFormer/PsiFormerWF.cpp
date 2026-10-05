@@ -12,6 +12,7 @@
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
@@ -134,9 +135,15 @@ void mixPersistentDouble(std::uint64_t& hash, double value) noexcept
  * parameter-version counters happen to agree.  Later optimizer changes are tracked
  * separately by the synchronized parameter version.
  */
-std::uint64_t persistentModelIdentity(const pf::PsiFormer& model)
+std::uint64_t persistentModelIdentity(const pf::PsiFormer& model,
+                                      const std::string& model_origin,
+                                      const std::string& initialization_profile,
+                                      std::uint64_t initialization_seed)
 {
   std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  mixPersistentString(hash, model_origin);
+  mixPersistentString(hash, initialization_profile);
+  mixPersistentInteger(hash, initialization_seed);
   mixPersistentString(hash, model.p.layout_fingerprint());
   mixPersistentInteger(hash, model.ne);
   mixPersistentInteger(hash, model.cfg.nup);
@@ -144,6 +151,7 @@ std::uint64_t persistentModelIdentity(const pf::PsiFormer& model)
   mixPersistentInteger(hash, model.ndet);
   mixPersistentInteger(hash, model.dim);
   mixPersistentInteger(hash, model.heads);
+  mixPersistentInteger(hash, model.blocks);
   for (std::size_t extent : model.cfg.nuclei.shape)
     mixPersistentInteger(hash, extent);
   for (double coordinate : model.cfg.nuclei.x)
@@ -218,6 +226,71 @@ bool isNegativeInfinity(double value) noexcept
   return bits == UINT64_C(0xfff0000000000000);
 }
 
+/// Couple an in-memory native model to the provenance needed by persistence and diagnostics.
+struct InitializedNativeModel
+{
+  pf::PsiFormer model;
+  std::string profile;
+  std::uint64_t seed;
+};
+
+/** Convert dependency-light initialized parameters and QMCPACK particle metadata
+ * into the native evaluator's owning representation. */
+InitializedNativeModel makeInitializedNativeModel(
+    psiformer::InitializedPsiFormerParameters initialized,
+    const ParticleSet& electrons,
+    const ParticleSet& ions)
+{
+  const psiformer::ModelShape& shape = initialized.model_shape;
+  if (electrons.groups() != 2 || electrons.groupsize(0) <= 0 || electrons.groupsize(1) <= 0)
+    throw std::invalid_argument(
+        "Internally initialized PsiFormer requires two nonempty electron spin groups");
+  if (shape.spin_up_electrons != static_cast<std::size_t>(electrons.groupsize(0)) ||
+      shape.spin_down_electrons != static_cast<std::size_t>(electrons.groupsize(1)) ||
+      shape.nuclei != static_cast<std::size_t>(ions.getTotalNum()))
+    throw std::invalid_argument(
+        "Internally initialized PsiFormer dimensions do not match the QMCPACK particle sets");
+
+  const SpeciesSet& ion_species = ions.getSpeciesSet();
+  const int charge_index        = ion_species.findAttribute("charge");
+  if (charge_index < 0)
+    throw std::invalid_argument(
+        "Internally initialized PsiFormer source particle set has no charge attribute");
+
+  std::vector<double> electron_positions;
+  electron_positions.reserve(3 * electrons.getTotalNum());
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      electron_positions.push_back(static_cast<double>(electrons.R[electron][dimension]));
+
+  std::vector<double> nuclear_positions;
+  std::vector<double> nuclear_charges;
+  nuclear_positions.reserve(3 * ions.getTotalNum());
+  nuclear_charges.reserve(ions.getTotalNum());
+  for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      nuclear_positions.push_back(static_cast<double>(ions.R[nucleus][dimension]));
+    nuclear_charges.push_back(ion_species(charge_index, ions.GroupID[nucleus]));
+  }
+
+  std::vector<pf::Layout> native_layouts;
+  native_layouts.reserve(initialized.layouts.size());
+  for (psiformer::ParameterLayoutInput& layout : initialized.layouts)
+    native_layouts.push_back({std::move(layout.module), std::move(layout.name),
+                              std::move(layout.shape), layout.begin, layout.end});
+
+  pf::Parameters parameters(std::move(initialized.values), std::move(native_layouts));
+  pf::ConfigData configuration(
+      pf::Tensor({1, shape.electrons(), 3}, std::move(electron_positions)),
+      pf::Tensor({shape.nuclei, 3}, std::move(nuclear_positions)),
+      pf::Tensor({shape.nuclei}, std::move(nuclear_charges)), shape.spin_up_electrons,
+      shape.spin_down_electrons);
+  pf::PsiFormer model(std::move(parameters), std::move(configuration), shape.determinants,
+                      shape.feature_dimension, shape.attention_heads, shape.attention_blocks);
+  return {std::move(model), std::move(initialized.profile), initialized.seed};
+}
+
 } // namespace
 
 /** Shared native model protected at the optimizer/evaluator synchronization
@@ -227,8 +300,33 @@ class PsiFormerSharedState
 public:
   /// Load the model that all clones of one PsiFormer component will share.
   PsiFormerSharedState(const std::string& parameters, const std::string& configuration)
-      : model(parameters, configuration),
-        persistent_model_identity(persistentModelIdentity(model)),
+      : PsiFormerSharedState(pf::PsiFormer(parameters, configuration), "hdf5", "external_hdf5", 0)
+  {}
+
+  /// Materialize a fresh in-memory model and retain its reproducibility provenance.
+  PsiFormerSharedState(psiformer::InitializedPsiFormerParameters initialized,
+                       const ParticleSet& electrons,
+                       const ParticleSet& ions)
+      : PsiFormerSharedState(makeInitializedNativeModel(std::move(initialized), electrons, ions))
+  {}
+
+  /// Take ownership of a converted initialized model without copying its flat parameters.
+  explicit PsiFormerSharedState(InitializedNativeModel initialized)
+      : PsiFormerSharedState(std::move(initialized.model), "internal",
+                             std::move(initialized.profile), initialized.seed)
+  {}
+
+  /// Complete shared executor construction for imported and internally initialized models.
+  PsiFormerSharedState(pf::PsiFormer model_input,
+                       std::string origin,
+                       std::string profile,
+                       std::uint64_t seed)
+      : model(std::move(model_input)),
+        model_origin(std::move(origin)),
+        initialization_profile(std::move(profile)),
+        initialization_seed(seed),
+        persistent_model_identity(
+            persistentModelIdentity(model, model_origin, initialization_profile, initialization_seed)),
         execution_plan(psiformer::PsiFormerExecutionPlan::fromParameters(
             model.p,
             {/*spin_up_electrons=*/model.cfg.nup,
@@ -237,7 +335,7 @@ public:
              /*determinants=*/model.ndet,
              /*feature_dimension=*/model.dim,
              /*attention_heads=*/model.heads,
-             /*attention_blocks=*/4})),
+             /*attention_blocks=*/model.blocks})),
         direct_value_executor(model, execution_plan),
         direct_spatial_executor(model, direct_value_executor, execution_plan),
         direct_batch_executor(direct_value_executor, direct_spatial_executor),
@@ -251,6 +349,12 @@ public:
 
   mutable std::shared_mutex mutex;
   pf::PsiFormer model;
+  /// Whether the initial model came from the legacy HDF5 import or an internal initializer.
+  const std::string model_origin;
+  /// Versioned initializer name or stable external-HDF5 profile sentinel.
+  const std::string initialization_profile;
+  /// Explicit component-local initialization seed, zero for imported models.
+  const std::uint64_t initialization_seed;
   /// Stable content identity used to reject buffers from another physical model.
   const std::uint64_t persistent_model_identity;
   /// Immutable typed tensor descriptors shared by every component clone.
@@ -369,10 +473,13 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
 
 namespace
 {
-constexpr std::array<int, 3> PERSISTENCE_VERSION{1, 1, 0};
+constexpr std::array<int, 3> PERSISTENCE_VERSION{1, 2, 0};
 
-/// Hash immutable layout and physical-system metadata into one compact diagnostic identity.
-std::string modelFingerprint(const pf::PsiFormer& model)
+/// Hash construction provenance, architecture, layout, and physical-system metadata.
+std::string modelFingerprint(const pf::PsiFormer& model,
+                             const std::string& model_origin,
+                             const std::string& initialization_profile,
+                             std::uint64_t initialization_seed)
 {
   std::uint64_t hash = 14695981039346656037ULL;
   auto mix_byte      = [&hash](std::uint8_t byte) {
@@ -395,9 +502,16 @@ std::string modelFingerprint(const pf::PsiFormer& model)
     mix_integer(bits);
   };
 
+  mix_string(model_origin);
+  mix_string(initialization_profile);
+  mix_integer(initialization_seed);
   mix_string(model.p.layout_fingerprint());
   mix_integer(model.cfg.nup);
   mix_integer(model.cfg.ndown);
+  mix_integer(model.ndet);
+  mix_integer(model.dim);
+  mix_integer(model.heads);
+  mix_integer(model.blocks);
   for (double coordinate : model.cfg.nuclei.x)
     mix_double(coordinate);
   for (double charge : model.cfg.charges.x)
@@ -521,7 +635,7 @@ void requireRealTotalWavefunctionDrift(const ParticleSet& particles)
 }
 } // namespace
 
-// Load the exported model and create the selected local-to-flat parameter map.
+// Load an exported model before entering the common optimizer-registration path.
 PsiFormerWF::PsiFormerWF(std::string name,
                          std::string parameters,
                          std::string configuration,
@@ -529,9 +643,37 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
                          std::string optimized_parameter_export)
+    : PsiFormerWF(std::move(name),
+                  std::make_shared<PsiFormerSharedState>(parameters, configuration),
+                  enable_optimization, std::move(selected_flat_indices), optimize_all,
+                  std::move(optimized_parameter_export))
+{}
+
+// Construct a native model directly from initialized parameters and QMCPACK system metadata.
+PsiFormerWF::PsiFormerWF(std::string name,
+                         psiformer::InitializedPsiFormerParameters initialized_parameters,
+                         const ParticleSet& electrons,
+                         const ParticleSet& ions,
+                         bool enable_optimization,
+                         std::vector<std::size_t> selected_flat_indices,
+                         bool optimize_all,
+                         std::string optimized_parameter_export)
+    : PsiFormerWF(std::move(name),
+                  std::make_shared<PsiFormerSharedState>(std::move(initialized_parameters), electrons, ions),
+                  enable_optimization, std::move(selected_flat_indices), optimize_all,
+                  std::move(optimized_parameter_export))
+{}
+
+// Register selected or complete parameters after either model-construction route.
+PsiFormerWF::PsiFormerWF(std::string name,
+                         std::shared_ptr<PsiFormerSharedState> model_state,
+                         bool enable_optimization,
+                         std::vector<std::size_t> selected_flat_indices,
+                         bool optimize_all,
+                         std::string optimized_parameter_export)
     : WaveFunctionComponent(name),
       OptimizableObject(name),
-      model_state_(std::make_shared<PsiFormerSharedState>(parameters, configuration)),
+      model_state_(std::move(model_state)),
       optimized_parameter_export_(std::move(optimized_parameter_export))
 {
   if (!enable_optimization && !selected_flat_indices.empty())
@@ -587,7 +729,14 @@ PsiFormerWF::PsiFormerWF(std::string name,
     selected_tensors.insert(layout.module + "/" + layout.name);
   }
   app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": model="
-            << modelFingerprint(model_state_->model) << ", parameters=" << parameters_ref.size()
+            << modelFingerprint(model_state_->model, model_state_->model_origin,
+                                model_state_->initialization_profile,
+                                model_state_->initialization_seed)
+            << ", origin=" << model_state_->model_origin;
+  if (!model_state_->initialization_profile.empty())
+    app_log() << ", initialization=" << model_state_->initialization_profile
+              << ", initialization_seed=" << model_state_->initialization_seed;
+  app_log() << ", parameters=" << parameters_ref.size()
             << ", active=" << optimization_metadata_->selected_flat_indices.size()
             << ", tensors=" << selected_tensors.size()
             << ", parameter_version=" << parameters_ref.version() << ", derivative_mode="
@@ -1094,17 +1243,23 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   const std::vector<int> format_version(PERSISTENCE_VERSION.begin(), PERSISTENCE_VERSION.end());
   const std::vector<std::uint64_t> parameter_count{model.p.size()};
   const std::vector<std::uint64_t> spin_counts{model.cfg.nup, model.cfg.ndown};
-  const std::vector<std::uint64_t> architecture{model.ndet, model.dim, model.heads};
+  const std::vector<std::uint64_t> architecture{model.ndet, model.dim, model.heads, model.blocks};
+  const std::vector<std::uint64_t> initialization_seed{model_state_->initialization_seed};
   const std::vector<std::uint64_t> nuclear_shape(model.cfg.nuclei.shape.begin(), model.cfg.nuclei.shape.end());
   const std::vector<std::uint64_t> selected_indices =
       persistIndices(optimization_metadata_->selected_flat_indices);
   const std::string layout_fingerprint              = model.p.layout_fingerprint();
-  const std::string model_fingerprint               = modelFingerprint(model);
+  const std::string model_fingerprint =
+      modelFingerprint(model, model_state_->model_origin, model_state_->initialization_profile,
+                       model_state_->initialization_seed);
 
   output.write(format_version, "format_version");
   output.write(parameter_count, "parameter_count");
   output.write(layout_fingerprint, "layout_fingerprint");
   output.write(model_fingerprint, "model_fingerprint");
+  output.write(model_state_->model_origin, "model_origin");
+  output.write(model_state_->initialization_profile, "initialization_profile");
+  output.write(initialization_seed, "initialization_seed");
   output.write(system_kind_, "system_kind");
   output.write(spin_counts, "spin_counts");
   output.write(architecture, "architecture");
@@ -1150,9 +1305,19 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   input.push(OptimizableObject::getName(), false);
 
   const std::vector<int> format_version             = readVector<int>(input, "format_version");
+  const std::vector<int> expected_version(PERSISTENCE_VERSION.begin(), PERSISTENCE_VERSION.end());
+  if (format_version != expected_version)
+  {
+    input.pop();
+    input.pop();
+    throw std::runtime_error(
+        "PsiFormer VP format version is incompatible; this build requires version 1.2.0");
+  }
   const std::vector<std::uint64_t> parameter_count  = readVector<std::uint64_t>(input, "parameter_count");
   const std::vector<std::uint64_t> spin_counts      = readVector<std::uint64_t>(input, "spin_counts");
   const std::vector<std::uint64_t> architecture     = readVector<std::uint64_t>(input, "architecture");
+  const std::vector<std::uint64_t> initialization_seed =
+      readVector<std::uint64_t>(input, "initialization_seed");
   const std::vector<std::uint64_t> nuclear_shape    = readVector<std::uint64_t>(input, "nuclear_shape");
   const std::vector<double> nuclear_positions       = readVector<double>(input, "nuclear_positions");
   const std::vector<double> nuclear_charges         = readVector<double>(input, "nuclear_charges");
@@ -1161,16 +1326,17 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   const std::vector<double> flat_values = readVector<double>(input, "flat_values");
   std::string layout_fingerprint;
   std::string model_fingerprint;
+  std::string model_origin;
+  std::string initialization_profile;
   std::string system_kind;
   input.read(layout_fingerprint, "layout_fingerprint");
   input.read(model_fingerprint, "model_fingerprint");
+  input.read(model_origin, "model_origin");
+  input.read(initialization_profile, "initialization_profile");
   input.read(system_kind, "system_kind");
 
   input.pop();
   input.pop();
-
-  const std::vector<int> expected_version(PERSISTENCE_VERSION.begin(), PERSISTENCE_VERSION.end());
-  requireEqual(format_version, expected_version, "format version");
 
   std::size_t parameter_version;
   {
@@ -1181,12 +1347,23 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
     requireEqual(parameter_count, std::vector<std::uint64_t>{model.p.size()}, "parameter count");
     if (layout_fingerprint != model.p.layout_fingerprint())
       throw std::runtime_error("PsiFormer VP layout fingerprint does not match the configured model");
-    if (model_fingerprint != modelFingerprint(model))
+    if (model_origin != model_state_->model_origin)
+      throw std::runtime_error("PsiFormer VP construction origin does not match the configured model");
+    if (initialization_profile != model_state_->initialization_profile)
+      throw std::runtime_error("PsiFormer VP initialization profile does not match the configured model");
+    requireEqual(initialization_seed,
+                 std::vector<std::uint64_t>{model_state_->initialization_seed},
+                 "initialization seed");
+    if (model_fingerprint !=
+        modelFingerprint(model, model_state_->model_origin, model_state_->initialization_profile,
+                         model_state_->initialization_seed))
       throw std::runtime_error("PsiFormer VP model fingerprint does not match the configured model");
     if (system_kind != system_kind_)
       throw std::runtime_error("PsiFormer VP system declaration does not match the configured model");
     requireEqual(spin_counts, std::vector<std::uint64_t>{model.cfg.nup, model.cfg.ndown}, "spin populations");
-    requireEqual(architecture, std::vector<std::uint64_t>{model.ndet, model.dim, model.heads}, "architecture");
+    requireEqual(architecture,
+                 std::vector<std::uint64_t>{model.ndet, model.dim, model.heads, model.blocks},
+                 "architecture");
     requireEqual(nuclear_shape,
                  std::vector<std::uint64_t>(model.cfg.nuclei.shape.begin(), model.cfg.nuclei.shape.end()),
                  "nuclear-position shape");

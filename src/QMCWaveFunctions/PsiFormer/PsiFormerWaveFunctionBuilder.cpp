@@ -9,10 +9,14 @@
  * @brief XML construction of the PsiFormer wavefunction component.
  */
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
+#include "Message/CommOperators.h"
 #include "OhmmsData/AttributeSet.h"
+#include "OhmmsData/XMLParsingString.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cmath>
 #include <limits>
@@ -53,13 +57,25 @@ std::vector<std::size_t> parseFlatIndices(std::string values)
     throw std::invalid_argument("PsiFormer optimize_indices contains a malformed index");
   return indices;
 }
+
+/// Parse the full unsigned seed domain without accepting signs or trailing text.
+std::uint64_t parseInitializationSeed(const std::string& value)
+{
+  std::uint64_t seed = 0;
+  if (value.empty())
+    throw std::invalid_argument("PsiFormer initialization_seed cannot be empty");
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), seed);
+  if (error != std::errc{} || end != value.data() + value.size())
+    throw std::invalid_argument("PsiFormer initialization_seed must be an unsigned integer");
+  return seed;
+}
 } // namespace
 
-// Validate export paths and the initial selected-index optimization input.
+// Select HDF5 import or deterministic internal construction and validate optimizer controls.
 std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildComponent(xmlNodePtr cur)
 {
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
-  std::string export_parameters;
+  std::string export_parameters, initialization, initialization_seed_text = "0";
   std::string optimize = "no", optimize_scope = "indices", optimize_indices;
 
   // Both files use the compact export format consumed by PsiFormerNative.h.
@@ -69,6 +85,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(name, "name");
   attributes.add(parameters, "parameters");
   attributes.add(configuration, "configuration");
+  attributes.add(initialization, "initialization");
+  attributes.add(initialization_seed_text, "initialization_seed");
   attributes.add(source, "source");
   attributes.add(system, "system");
   attributes.add(export_parameters, "export_parameters");
@@ -76,8 +94,29 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(optimize_scope, "optimize_scope");
   attributes.add(optimize_indices, "optimize_indices");
   attributes.put(cur);
-  if (parameters.empty() || configuration.empty())
-    throw std::runtime_error("psiformer requires parameters and configuration HDF5 paths");
+
+  // OhmmsAttributeSet tokenizes std::string values at whitespace. Read this
+  // list directly so both documented separators survive XML parsing.
+  if (xmlHasProp(cur, BAD_CAST "optimize_indices") != nullptr)
+    optimize_indices = getXMLAttributeValue(cur, "optimize_indices");
+
+  const bool internal_initialization = !initialization.empty();
+  const bool has_parameter_path      = !parameters.empty();
+  const bool has_configuration_path  = !configuration.empty();
+  const bool has_initialization_seed = xmlHasProp(cur, BAD_CAST "initialization_seed") != nullptr;
+  const bool has_explicit_source     = xmlHasProp(cur, BAD_CAST "source") != nullptr;
+  if (internal_initialization && (has_parameter_path || has_configuration_path))
+    throw std::invalid_argument(
+        "PsiFormer internal initialization cannot be combined with parameters or configuration paths");
+  if (!internal_initialization && (!has_parameter_path || !has_configuration_path))
+    throw std::runtime_error(
+        "psiformer requires parameters and configuration HDF5 paths, or initialization");
+  if (!internal_initialization && has_initialization_seed)
+    throw std::invalid_argument(
+        "PsiFormer initialization_seed requires internal initialization");
+  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1)
+    throw std::invalid_argument("Unsupported PsiFormer initialization profile: " + initialization);
+  const std::uint64_t initialization_seed = parseInitializationSeed(initialization_seed_text);
 
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   if (targetPtcl.isSpinor())
@@ -98,6 +137,11 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   if (system != "auto" && system != "all_electron" && system != "pseudopotential")
     throw std::invalid_argument("PsiFormer system must be auto, all_electron, or pseudopotential");
+  if (internal_initialization && system == "auto")
+    throw std::invalid_argument(
+        "Internally initialized PsiFormer requires explicit system=all_electron or system=pseudopotential");
+  if (internal_initialization && !has_explicit_source)
+    throw std::invalid_argument("Internally initialized PsiFormer requires an explicit source particle set");
   if (optimization_enabled && system == "auto")
     throw std::invalid_argument(
         "PsiFormer optimization requires system=all_electron or system=pseudopotential for metadata validation");
@@ -114,15 +158,57 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (optimization_enabled && !optimize_all && selected_indices.empty())
     throw std::invalid_argument("PsiFormer optimize=yes requires a nonempty optimize_indices list");
 
-  auto component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
-                                                 std::move(selected_indices), optimize_all, export_parameters);
-  if (system != "auto")
+  const ParticleSet* source_particles = nullptr;
+  if (system != "auto" || internal_initialization)
   {
     const auto source_particle_set = particle_sets_.find(source);
     if (source_particle_set == particle_sets_.end())
       throw std::invalid_argument("PsiFormer source particle set not found: " + source);
-    component->validateSystem(targetPtcl, *source_particle_set->second, system);
+    source_particles = source_particle_set->second.get();
   }
+
+  std::unique_ptr<PsiFormerWF> component;
+  if (internal_initialization)
+  {
+    if (targetPtcl.groups() != 2 || targetPtcl.groupsize(0) <= 0 || targetPtcl.groupsize(1) <= 0)
+      throw std::invalid_argument(
+          "Internally initialized PsiFormer requires two nonempty electron spin groups");
+
+    const psiformer::ModelShape shape{
+        static_cast<std::size_t>(targetPtcl.groupsize(0)),
+        static_cast<std::size_t>(targetPtcl.groupsize(1)),
+        static_cast<std::size_t>(source_particles->getTotalNum()),
+        /*determinants=*/16,
+        /*feature_dimension=*/256,
+        /*attention_heads=*/4,
+        /*attention_blocks=*/4};
+    psiformer::InitializedPsiFormerParameters initialized =
+        psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization);
+
+    // All ranks must evaluate exactly the same model even when platform math
+    // libraries round the Gaussian transform differently.  Communicate's
+    // pointer interface accepts an int count, so keep each collective bounded
+    // instead of narrowing the complete parameter count.
+    std::size_t broadcast_offset = 0;
+    while (broadcast_offset < initialized.values.size())
+    {
+      const std::size_t remaining = initialized.values.size() - broadcast_offset;
+      const int count = static_cast<int>(std::min(
+          remaining, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+      myComm->bcast(initialized.values.data() + broadcast_offset, count);
+      broadcast_offset += static_cast<std::size_t>(count);
+    }
+    component = std::make_unique<PsiFormerWF>(
+        name, std::move(initialized), targetPtcl, *source_particles, optimization_enabled,
+        std::move(selected_indices), optimize_all, export_parameters);
+  }
+  else
+    component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
+                                              std::move(selected_indices), optimize_all,
+                                              export_parameters);
+
+  if (system != "auto")
+    component->validateSystem(targetPtcl, *source_particles, system);
   return component;
 }
 

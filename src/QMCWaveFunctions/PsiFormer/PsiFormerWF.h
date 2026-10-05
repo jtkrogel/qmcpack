@@ -56,6 +56,12 @@ struct DirectScoreResult;
 
 namespace qmcplusplus
 {
+namespace psiformer
+{
+/// Dependency-light result of deterministic native PsiFormer initialization.
+struct InitializedPsiFormerParameters;
+}
+
 /// Shared, versioned native model state used by all clones of one component.
 class PsiFormerSharedState;
 
@@ -119,9 +125,9 @@ class TestPsiFormerWF;
 }
 
 /**
- * Wavefunction component for a PsiFormer model exported from DeepQMC.
+ * Wavefunction component for an imported or internally initialized PsiFormer model.
  *
- * Imported parameters remain fixed unless optimization is explicitly enabled.
+ * Parameters remain fixed unless optimization is explicitly enabled.
  * Optimization may register selected canonical flat indices or the complete
  * network in that same ordering. Full-network resets use the native complete
  * vector path to avoid sorting and revalidating millions of canonical indices.
@@ -137,6 +143,17 @@ public:
   PsiFormerWF(std::string name,
               std::string parameters,
               std::string configuration,
+              bool optimize = false,
+              std::vector<std::size_t> selected_flat_indices = {},
+              bool optimize_all = false,
+              std::string optimized_parameter_export = {});
+
+  /** Construct a self-contained model from initialized parameters and QMCPACK
+   * electron/ion particle sets, without reading a model or configuration file. */
+  PsiFormerWF(std::string name,
+              psiformer::InitializedPsiFormerParameters initialized_parameters,
+              const ParticleSet& electrons,
+              const ParticleSet& ions,
               bool optimize = false,
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
@@ -359,6 +376,14 @@ public:
 
 private:
   struct PsiFormerMultiWalkerResource;
+
+  /// Complete common construction once either HDF5 import or internal initialization creates shared state.
+  PsiFormerWF(std::string name,
+              std::shared_ptr<PsiFormerSharedState> model_state,
+              bool optimize,
+              std::vector<std::size_t> selected_flat_indices,
+              bool optimize_all,
+              std::string optimized_parameter_export);
 
   /// Identify the minimum native products required by one QMCPACK entry point.
   enum class EvaluationPurpose
