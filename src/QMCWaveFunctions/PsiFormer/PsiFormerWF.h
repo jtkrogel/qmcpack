@@ -59,6 +59,9 @@ namespace qmcplusplus
 /// Shared, versioned native model state used by all clones of one component.
 class PsiFormerSharedState;
 
+/// Shared optimizer registration and flat-index mapping for one clone family.
+class PsiFormerOptimizationMetadata;
+
 namespace testing
 {
 /** Describe clone-local native evaluator scratch without exposing implementation
@@ -97,6 +100,18 @@ struct PsiFormerWorkspaceDiagnostics
         static_cast<std::size_t>(owns_score_workspace) +
         static_cast<std::size_t>(owns_kinetic_workspace);
   }
+};
+
+/** Describe optimizer metadata ownership without exposing the shared metadata
+ * implementation through the public wavefunction interface. */
+struct PsiFormerOptimizationMetadataDiagnostics
+{
+  const void* identity                    = nullptr;
+  std::size_t shared_owner_count          = 0;
+  std::size_t selected_index_count        = 0;
+  std::size_t shared_variable_count       = 0;
+  std::size_t mapped_variable_count       = 0;
+  std::size_t inherited_variable_count    = 0;
 };
 
 /// Test-only accessor for bounded crowd-workspace ownership diagnostics.
@@ -140,7 +155,7 @@ public:
   bool isFermionic() const override { return true; }
 
   /// Report whether this component explicitly exposes selected parameters.
-  bool isOptimizable() const override { return optimization_enabled_; }
+  bool isOptimizable() const override;
 
   /// Add this component's optimization object when selected-parameter optimization is enabled.
   void extractOptimizableObjectRefs(UniqueOptObjRefs& opt_obj_refs) override;
@@ -444,6 +459,9 @@ private:
   /// Report clone-local evaluator ownership and explicitly reserved numeric bytes.
   testing::PsiFormerWorkspaceDiagnostics directWorkspaceDiagnosticsForTesting() const;
 
+  /// Report shared optimizer metadata ownership and the empty inherited variable set.
+  testing::PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnosticsForTesting() const;
+
   /// Return true when at least one selected local parameter maps to a global active variable.
   bool hasActiveParameters() const;
 
@@ -502,6 +520,8 @@ private:
 
   /// Versioned native model protected against evaluation/reset overlap.
   std::shared_ptr<PsiFormerSharedState> model_state_;
+  /// Clone-family optimizer names, global indices, and canonical flat-index mapping.
+  std::shared_ptr<PsiFormerOptimizationMetadata> optimization_metadata_;
   /// Lazily present fixed-size value buffers owned independently by this clone.
   std::unique_ptr<pf::DirectValueWorkspace> direct_value_workspace_;
   /// Lazily present fixed-size score tape owned independently by an optimizable clone.
@@ -518,12 +538,6 @@ private:
   std::unique_ptr<pf::DirectBatchWorkspace> direct_batch_workspace_;
   /// ResourceCollection-owned workspace handle populated only on the crowd leader.
   ResourceHandle<PsiFormerMultiWalkerResource> mw_resource_handle_;
-  /// Canonically sorted native flat indices represented by this optimization object.
-  std::vector<std::size_t> selected_flat_indices_;
-  /// Enable registration and derivative work only when requested by input.
-  bool optimization_enabled_ = false;
-  /// Use the canonical complete flat vector rather than an explicit subset.
-  bool optimize_all_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
   std::string system_kind_ = "unvalidated";
   /// Optional DeepQMC-format destination written with the final QMCPACK VP report.

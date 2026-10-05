@@ -275,6 +275,34 @@ public:
   const DirectBackendMode direct_kinetic_mode;
 };
 
+/** Optimizer metadata shared by every clone of one PsiFormer component.
+ *
+ * VariableSet is retained as the compatibility boundary with the existing
+ * QMCPACK optimizer, but it lives here instead of in OptimizableObject::myVars.
+ * Its values and local-to-global indices change only at optimizer barriers.
+ */
+class PsiFormerOptimizationMetadata
+{
+public:
+  /// Take ownership of the canonical selection and its legacy optimizer view.
+  PsiFormerOptimizationMetadata(bool enabled,
+                                bool optimize_all,
+                                std::vector<std::size_t> selected_flat_indices,
+                                OptVariables variables)
+      : enabled(enabled),
+        optimize_all(optimize_all),
+        selected_flat_indices(std::move(selected_flat_indices)),
+        variables(std::move(variables))
+  {}
+
+  /// Serialize mutations of values and global indices at optimizer barriers.
+  mutable std::shared_mutex mutex;
+  const bool enabled;
+  const bool optimize_all;
+  const std::vector<std::size_t> selected_flat_indices;
+  OptVariables variables;
+};
+
 /** Crowd-owned mutable storage.  ResourceCollection cloning recreates scratch
  * against the same immutable/versioned model state without copying buffers. */
 struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
@@ -504,36 +532,33 @@ PsiFormerWF::PsiFormerWF(std::string name,
     : WaveFunctionComponent(name),
       OptimizableObject(name),
       model_state_(std::make_shared<PsiFormerSharedState>(parameters, configuration)),
-      selected_flat_indices_(std::move(selected_flat_indices)),
-      optimization_enabled_(enable_optimization),
-      optimize_all_(optimize_all),
       optimized_parameter_export_(std::move(optimized_parameter_export))
 {
-  if (!optimization_enabled_ && !selected_flat_indices_.empty())
+  if (!enable_optimization && !selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
-  if (optimize_all_ && !optimization_enabled_)
+  if (optimize_all && !enable_optimization)
     throw std::invalid_argument("PsiFormer optimize_scope=all requires optimize=yes");
-  if (optimize_all_ && !selected_flat_indices_.empty())
+  if (optimize_all && !selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_scope=all cannot be combined with optimize_indices");
 
   pf::Parameters& parameters_ref = model_state_->model.p;
   if (parameters_ref.size() == 0)
     throw std::invalid_argument("PsiFormer parameter export contains no scalar values");
-  if (optimize_all_)
+  if (optimize_all)
   {
-    selected_flat_indices_.resize(parameters_ref.size());
-    std::iota(selected_flat_indices_.begin(), selected_flat_indices_.end(), std::size_t{0});
+    selected_flat_indices.resize(parameters_ref.size());
+    std::iota(selected_flat_indices.begin(), selected_flat_indices.end(), std::size_t{0});
   }
-  if (optimization_enabled_ && selected_flat_indices_.empty())
+  if (enable_optimization && selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer selected-parameter optimization requires at least one flat index");
-  if (!optimized_parameter_export_.empty() && !optimization_enabled_)
+  if (!optimized_parameter_export_.empty() && !enable_optimization)
     throw std::invalid_argument("PsiFormer export_parameters requires optimize=yes");
 
-  if (!optimize_all_)
+  if (!optimize_all)
   {
-    std::sort(selected_flat_indices_.begin(), selected_flat_indices_.end());
-    if (std::adjacent_find(selected_flat_indices_.begin(), selected_flat_indices_.end()) !=
-        selected_flat_indices_.end())
+    std::sort(selected_flat_indices.begin(), selected_flat_indices.end());
+    if (std::adjacent_find(selected_flat_indices.begin(), selected_flat_indices.end()) !=
+        selected_flat_indices.end())
       throw std::invalid_argument("PsiFormer optimize_indices contains a duplicate flat index");
   }
 
@@ -542,27 +567,31 @@ PsiFormerWF::PsiFormerWF(std::string name,
   resizeAcceptedSpatialStorage(model_state_->model.ne);
   const std::size_t name_width = std::to_string(parameters_ref.size() - 1).size();
   std::vector<OptVariables::pair_type> selected_parameters;
-  selected_parameters.reserve(selected_flat_indices_.size());
-  for (std::size_t flat_index : selected_flat_indices_)
+  selected_parameters.reserve(selected_flat_indices.size());
+  for (std::size_t flat_index : selected_flat_indices)
   {
-    if (!optimize_all_)
+    if (!optimize_all)
       parameters_ref.layout_for_flat_index(flat_index);
     selected_parameters.emplace_back(makeParameterName(WaveFunctionComponent::getName(), flat_index, name_width),
                                      parameters_ref.flat_values()[flat_index]);
   }
-  myVars.insertBulk(std::move(selected_parameters), true, optimize::OTHER_P);
+  OptVariables variables;
+  variables.insertBulk(std::move(selected_parameters), true, optimize::OTHER_P);
+  optimization_metadata_ = std::make_shared<PsiFormerOptimizationMetadata>(
+      enable_optimization, optimize_all, std::move(selected_flat_indices), std::move(variables));
 
   std::set<std::string> selected_tensors;
-  for (std::size_t flat_index : selected_flat_indices_)
+  for (std::size_t flat_index : optimization_metadata_->selected_flat_indices)
   {
     const pf::Layout& layout = parameters_ref.layout_for_flat_index(flat_index);
     selected_tensors.insert(layout.module + "/" + layout.name);
   }
   app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": model="
             << modelFingerprint(model_state_->model) << ", parameters=" << parameters_ref.size()
-            << ", active=" << selected_flat_indices_.size() << ", tensors=" << selected_tensors.size()
+            << ", active=" << optimization_metadata_->selected_flat_indices.size()
+            << ", tensors=" << selected_tensors.size()
             << ", parameter_version=" << parameters_ref.version() << ", derivative_mode="
-            << (optimization_enabled_ ? "score+kinetic+nonlocal-ratio" : "fixed")
+            << (enable_optimization ? "score+kinetic+nonlocal-ratio" : "fixed")
             << ", value_backend=" << directBackendModeName(model_state_->direct_value_mode)
             << ", spatial_backend=" << directBackendModeName(model_state_->direct_spatial_mode)
             << ", score_backend=" << directBackendModeName(model_state_->direct_score_mode)
@@ -592,9 +621,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
     : WaveFunctionComponent(other),
       OptimizableObject(other),
       model_state_(other.model_state_),
-      selected_flat_indices_(other.selected_flat_indices_),
-      optimization_enabled_(other.optimization_enabled_),
-      optimize_all_(other.optimize_all_),
+      optimization_metadata_(other.optimization_metadata_),
       system_kind_(other.system_kind_),
       optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
@@ -609,8 +636,6 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
 {
   std::shared_lock state_lock(model_state_->mutex);
   synchronizeParameterVersion(model_state_->model.p.version());
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
-    myVars[local_index] = model_state_->model.p.flat_values()[selected_flat_indices_[local_index]];
 
   proposed_sign_      = 1.0;
   proposed_log_value_ = LogValue(0);
@@ -620,6 +645,12 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
 }
 
 PsiFormerWF::~PsiFormerWF() = default;
+
+// Report the immutable optimization mode shared by the complete clone family.
+bool PsiFormerWF::isOptimizable() const
+{
+  return optimization_metadata_->enabled;
+}
 
 // Add one cloneable workspace.  A copied ResourceCollection reconstructs empty
 // batch scratch while retaining the same shared model/plan identity.
@@ -720,31 +751,54 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
   return diagnostics;
 }
 
+// Expose metadata identity and cardinalities without copying the shared vectors.
+testing::PsiFormerOptimizationMetadataDiagnostics
+PsiFormerWF::optimizationMetadataDiagnosticsForTesting() const
+{
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
+  testing::PsiFormerOptimizationMetadataDiagnostics diagnostics;
+  diagnostics.identity                 = optimization_metadata_.get();
+  diagnostics.shared_owner_count       = optimization_metadata_.use_count();
+  diagnostics.selected_index_count     = optimization_metadata_->selected_flat_indices.size();
+  diagnostics.shared_variable_count    = optimization_metadata_->variables.size();
+  diagnostics.inherited_variable_count = myVars.size();
+  for (std::size_t local_index = 0; local_index < optimization_metadata_->variables.size(); ++local_index)
+    if (optimization_metadata_->variables.where(local_index) >= 0)
+      ++diagnostics.mapped_variable_count;
+  return diagnostics;
+}
+
 // Register this object only when the input explicitly enabled optimization.
 void PsiFormerWF::extractOptimizableObjectRefs(UniqueOptObjRefs& opt_obj_refs)
 {
-  if (optimization_enabled_)
+  if (optimization_metadata_->enabled)
     opt_obj_refs.push_back(*this);
 }
 
 // Append selected local values to the optimizer's global variable collection.
 void PsiFormerWF::checkInVariablesExclusive(OptVariables& active)
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     return;
 
   std::shared_lock state_lock(model_state_->mutex);
+  std::unique_lock metadata_lock(optimization_metadata_->mutex);
   synchronizeParameterVersion(model_state_->model.p.version());
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
-    myVars[local_index] = model_state_->model.p.flat_values()[selected_flat_indices_[local_index]];
-  active.insertFrom(myVars);
+  for (std::size_t local_index = 0;
+       local_index < optimization_metadata_->selected_flat_indices.size(); ++local_index)
+    optimization_metadata_->variables[local_index] =
+        model_state_->model.p.flat_values()[optimization_metadata_->selected_flat_indices[local_index]];
+  active.insertFrom(optimization_metadata_->variables);
 }
 
 // Cache the global active index corresponding to each selected local parameter.
 void PsiFormerWF::checkOutVariables(const OptVariables& active)
 {
-  if (optimization_enabled_)
-    myVars.getIndex(active);
+  if (optimization_metadata_->enabled)
+  {
+    std::unique_lock metadata_lock(optimization_metadata_->mutex);
+    optimization_metadata_->variables.getIndex(active);
+  }
 }
 
 // Clear all cached values derived from an older parameter vector.
@@ -936,18 +990,24 @@ void PsiFormerWF::getAcceptedState(const ParticleSet& particles,
 // Apply a validated selected-parameter or complete-vector update at an exclusive model barrier.
 void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     return;
+
+  std::unique_lock state_lock(model_state_->mutex);
+  std::unique_lock metadata_lock(optimization_metadata_->mutex);
+  pf::Parameters& parameters = model_state_->model.p;
+  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
+  OptVariables& variables           = optimization_metadata_->variables;
 
   // Full scope is already in canonical flat order. Avoid materializing and
   // sorting redundant local/flat index vectors for every optimizer step.
-  if (optimize_all_)
+  if (optimization_metadata_->optimize_all)
   {
     std::vector<double> active_values;
-    active_values.reserve(selected_flat_indices_.size());
-    for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+    active_values.reserve(selected_flat_indices.size());
+    for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
     {
-      const int global_index = myVars.where(local_index);
+      const int global_index = variables.where(local_index);
       if (global_index < 0)
         throw std::runtime_error("PsiFormer optimize_scope=all requires every model parameter to remain active");
       if (global_index >= active.size())
@@ -955,23 +1015,17 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
       active_values.push_back(std::real(active[global_index]));
     }
 
-    std::size_t parameter_version;
-    bool model_changed;
-    {
-      std::unique_lock state_lock(model_state_->mutex);
-      pf::Parameters& parameters = model_state_->model.p;
-      if (restore_validation_pending_ && active_values != parameters.flat_values())
-        throw std::runtime_error(
-            "PsiFormer generic full-network values disagree with the authoritative VP model payload");
-      restore_validation_pending_ = false;
-      model_changed               = active_values != parameters.flat_values();
-      if (model_changed)
-        parameters.set_flat_values(active_values);
-      parameter_version = parameters.version();
-    }
+    if (restore_validation_pending_ && active_values != parameters.flat_values())
+      throw std::runtime_error(
+          "PsiFormer generic full-network values disagree with the authoritative VP model payload");
+    restore_validation_pending_ = false;
+    const bool model_changed    = active_values != parameters.flat_values();
+    if (model_changed)
+      parameters.set_flat_values(active_values);
+    const std::size_t parameter_version = parameters.version();
 
     for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
-      myVars[parameter] = active_values[parameter];
+      variables[parameter] = active_values[parameter];
     if (model_changed || observed_parameter_version_ != parameter_version)
       invalidateParameterCaches(parameter_version);
     return;
@@ -980,51 +1034,45 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
   std::vector<std::size_t> active_local_indices;
   std::vector<std::size_t> active_flat_indices;
   std::vector<double> active_values;
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
-    const int global_index = myVars.where(local_index);
+    const int global_index = variables.where(local_index);
     if (global_index < 0)
       continue;
     if (global_index >= active.size())
       throw std::out_of_range("PsiFormer global optimization index is out of range");
 
     active_local_indices.push_back(local_index);
-    active_flat_indices.push_back(selected_flat_indices_[local_index]);
+    active_flat_indices.push_back(selected_flat_indices[local_index]);
     active_values.push_back(std::real(active[global_index]));
   }
 
   if (active_values.empty())
     return;
 
-  std::size_t parameter_version;
   bool model_changed = false;
+  // The complete object-specific payload is authoritative on restart. The
+  // duplicated generic scalar list must agree before the normal reset path
+  // is allowed to continue.
+  if (restore_validation_pending_)
   {
-    std::unique_lock state_lock(model_state_->mutex);
-    pf::Parameters& parameters = model_state_->model.p;
-
-    // The complete object-specific payload is authoritative on restart. The
-    // duplicated generic scalar list must agree before the normal reset path
-    // is allowed to continue.
-    if (restore_validation_pending_)
-    {
-      for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
-        if (active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]])
-          throw std::runtime_error(
-              "PsiFormer generic selected values disagree with the authoritative VP model payload");
-      restore_validation_pending_ = false;
-    }
-
     for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
-      model_changed =
-          model_changed || active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]];
-
-    if (model_changed)
-      parameters.set_flat_values(active_flat_indices, active_values);
-    parameter_version = parameters.version();
+      if (active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]])
+        throw std::runtime_error(
+            "PsiFormer generic selected values disagree with the authoritative VP model payload");
+    restore_validation_pending_ = false;
   }
 
   for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
-    myVars[active_local_indices[parameter]] = active_values[parameter];
+    model_changed =
+        model_changed || active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]];
+
+  if (model_changed)
+    parameters.set_flat_values(active_flat_indices, active_values);
+  const std::size_t parameter_version = parameters.version();
+
+  for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
+    variables[active_local_indices[parameter]] = active_values[parameter];
 
   if (model_changed || observed_parameter_version_ != parameter_version)
     invalidateParameterCaches(parameter_version);
@@ -1033,10 +1081,11 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
 // Store a complete, self-identifying model payload in the optimizer VP file.
 void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     return;
 
   std::shared_lock state_lock(model_state_->mutex);
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
   const pf::PsiFormer& model = model_state_->model;
 
   output.push("PsiFormer");
@@ -1047,7 +1096,8 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   const std::vector<std::uint64_t> spin_counts{model.cfg.nup, model.cfg.ndown};
   const std::vector<std::uint64_t> architecture{model.ndet, model.dim, model.heads};
   const std::vector<std::uint64_t> nuclear_shape(model.cfg.nuclei.shape.begin(), model.cfg.nuclei.shape.end());
-  const std::vector<std::uint64_t> selected_indices = persistIndices(selected_flat_indices_);
+  const std::vector<std::uint64_t> selected_indices =
+      persistIndices(optimization_metadata_->selected_flat_indices);
   const std::string layout_fingerprint              = model.p.layout_fingerprint();
   const std::string model_fingerprint               = modelFingerprint(model);
 
@@ -1089,7 +1139,7 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
 // Restore a complete model only after validating all identifying metadata.
 void PsiFormerWF::readVariationalParameters(hdf_archive& input)
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     return;
   if (!input.is_group("PsiFormer"))
     throw std::runtime_error("PsiFormer VP file has no PsiFormer object group");
@@ -1125,6 +1175,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   std::size_t parameter_version;
   {
     std::unique_lock state_lock(model_state_->mutex);
+    std::unique_lock metadata_lock(optimization_metadata_->mutex);
     pf::PsiFormer& model = model_state_->model;
 
     requireEqual(parameter_count, std::vector<std::uint64_t>{model.p.size()}, "parameter count");
@@ -1141,14 +1192,17 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
                  "nuclear-position shape");
     requireEqual(nuclear_positions, model.cfg.nuclei.x, "nuclear positions");
     requireEqual(nuclear_charges, model.cfg.charges.x, "nuclear charges");
-    requireEqual(selected_indices, persistIndices(selected_flat_indices_), "selected flat indices");
+    requireEqual(selected_indices, persistIndices(optimization_metadata_->selected_flat_indices),
+                 "selected flat indices");
 
     if (flat_values != model.p.flat_values())
       model.p.set_flat_values(flat_values);
     parameter_version = model.p.version();
 
-    for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
-      myVars[local_index] = model.p.flat_values()[selected_flat_indices_[local_index]];
+    for (std::size_t local_index = 0;
+         local_index < optimization_metadata_->selected_flat_indices.size(); ++local_index)
+      optimization_metadata_->variables[local_index] =
+          model.p.flat_values()[optimization_metadata_->selected_flat_indices[local_index]];
   }
 
   invalidateParameterCaches(parameter_version);
@@ -1533,7 +1587,7 @@ pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
 // Lazily allocate score scratch for scalar calls, keeping inference-only clones lightweight.
 pf::DirectScoreWorkspace& PsiFormerWF::requireDirectScoreWorkspace()
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     throw std::logic_error("PsiFormer direct score workspace requires an optimizable component");
   if (!direct_score_workspace_)
     direct_score_workspace_ = model_state_->direct_score_executor.makeWorkspace();
@@ -1543,7 +1597,7 @@ pf::DirectScoreWorkspace& PsiFormerWF::requireDirectScoreWorkspace()
 // Lazily allocate the much larger kinetic tape only for an actual scalar reverse call.
 pf::DirectKineticWorkspace& PsiFormerWF::requireDirectKineticWorkspace()
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     throw std::logic_error("PsiFormer direct kinetic workspace requires an optimizable component");
   if (!direct_kinetic_workspace_)
     direct_kinetic_workspace_ = model_state_->direct_kinetic_executor.makeWorkspace();
@@ -1553,7 +1607,7 @@ pf::DirectKineticWorkspace& PsiFormerWF::requireDirectKineticWorkspace()
 // Lazily allocate the scalar adapter's complete TrialWaveFunction drift buffer.
 std::vector<double>& PsiFormerWF::requireDirectTotalLogGradient()
 {
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     throw std::logic_error("PsiFormer total-drift storage requires an optimizable component");
   const std::size_t required_size =
       3 * model_state_->execution_plan.modelShape().electrons();
@@ -1584,7 +1638,7 @@ pf::DirectScoreResult PsiFormerWF::evaluateDirectScorePositions(
   std::shared_lock state_lock(model_state_->mutex);
   pf::PsiFormer& model = model_state_->model;
   synchronizeParameterVersion(model.p.version());
-  if (!optimization_enabled_)
+  if (!optimization_metadata_->enabled)
     throw std::logic_error("PsiFormer direct score evaluation requires an optimizable component");
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
@@ -2213,8 +2267,10 @@ void PsiFormerWF::copyFromBuffer(ParticleSet& particles, WFBufferType& buffer)
 // Return whether a selected local parameter is present in the global active set.
 bool PsiFormerWF::hasActiveParameters() const
 {
-  for (std::size_t local_index = 0; local_index < myVars.size(); ++local_index)
-    if (myVars.where(local_index) >= 0)
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
+  const OptVariables& variables = optimization_metadata_->variables;
+  for (std::size_t local_index = 0; local_index < variables.size(); ++local_index)
+    if (variables.where(local_index) >= 0)
       return true;
   return false;
 }
@@ -2230,15 +2286,18 @@ void PsiFormerWF::addSelectedGradient(const double* flat_gradient,
                                       std::size_t gradient_size,
                                       Vector<ValueType>& output) const
 {
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
+  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
+  const OptVariables& variables     = optimization_metadata_->variables;
+  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
-    const int global_index = myVars.where(local_index);
+    const int global_index = variables.where(local_index);
     if (global_index < 0)
       continue;
     if (global_index >= output.size())
       throw std::out_of_range("PsiFormer derivative output index is out of range");
 
-    const std::size_t flat_index = selected_flat_indices_[local_index];
+    const std::size_t flat_index = selected_flat_indices[local_index];
     if (flat_index >= gradient_size)
       throw std::out_of_range("PsiFormer native derivative is missing a selected flat index");
     if (!psiformer::determinant::isFiniteReal(flat_gradient[flat_index]))
@@ -2253,15 +2312,18 @@ void PsiFormerWF::addSelectedGradientScaled(const double* flat_gradient,
                                             ValueType scale,
                                             ParameterDerivativeView output) const
 {
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
+  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
+  const OptVariables& variables     = optimization_metadata_->variables;
+  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
-    const int global_index = myVars.where(local_index);
+    const int global_index = variables.where(local_index);
     if (global_index < 0)
       continue;
     if (static_cast<std::size_t>(global_index) >= output.size)
       throw std::out_of_range("PsiFormer weighted derivative destination is out of range");
 
-    const std::size_t flat_index = selected_flat_indices_[local_index];
+    const std::size_t flat_index = selected_flat_indices[local_index];
     if (flat_index >= gradient_size)
       throw std::out_of_range("PsiFormer weighted native score is incomplete");
     if (!psiformer::determinant::isFiniteReal(flat_gradient[flat_index]))
@@ -2279,15 +2341,18 @@ void PsiFormerWF::addSelectedGradientScaled(const double* flat_gradient,
 {
   if (row >= output.rows())
     throw std::out_of_range("PsiFormer derivative-ratio row is out of range");
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
+  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
+  const OptVariables& variables     = optimization_metadata_->variables;
+  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
-    const int global_index = myVars.where(local_index);
+    const int global_index = variables.where(local_index);
     if (global_index < 0)
       continue;
     if (global_index >= output.cols())
       throw std::out_of_range("PsiFormer derivative-ratio column is out of range");
 
-    const std::size_t flat_index = selected_flat_indices_[local_index];
+    const std::size_t flat_index = selected_flat_indices[local_index];
     if (flat_index >= gradient_size)
       throw std::out_of_range("PsiFormer native derivative-ratio input is incomplete");
     if (!psiformer::determinant::isFiniteReal(flat_gradient[flat_index]))
@@ -2304,15 +2369,18 @@ void PsiFormerWF::addSelectedGradientDifference(const std::vector<double>& refer
 {
   if (row >= output.rows())
     throw std::out_of_range("PsiFormer derivative-ratio row is out of range");
-  for (std::size_t local_index = 0; local_index < selected_flat_indices_.size(); ++local_index)
+  std::shared_lock metadata_lock(optimization_metadata_->mutex);
+  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
+  const OptVariables& variables     = optimization_metadata_->variables;
+  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
-    const int global_index = myVars.where(local_index);
+    const int global_index = variables.where(local_index);
     if (global_index < 0)
       continue;
     if (global_index >= output.cols())
       throw std::out_of_range("PsiFormer derivative-ratio column is out of range");
 
-    const std::size_t flat_index = selected_flat_indices_[local_index];
+    const std::size_t flat_index = selected_flat_indices[local_index];
     if (flat_index >= reference_gradient.size() || flat_index >= virtual_gradient.size())
       throw std::out_of_range("PsiFormer native derivative-ratio input is incomplete");
     const double difference = virtual_gradient[flat_index] - reference_gradient[flat_index];
@@ -2505,7 +2573,7 @@ void PsiFormerWF::evaluateDerivRatios(const VirtualParticleSet& virtual_particle
                                       std::vector<ValueType>& ratios,
                                       Matrix<ValueType>& derivative_ratios)
 {
-  if (!optimization_enabled_ || !hasActiveParameters())
+  if (!optimization_metadata_->enabled || !hasActiveParameters())
   {
     evaluateRatios(virtual_particles, ratios);
     return;
@@ -2589,7 +2657,7 @@ void PsiFormerWF::evaluateDerivRatiosWeightedImpl(
   if (total_weights.size() != virtual_count || weighted_derivatives.size < optvars.size_of_active() ||
       (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr))
     throw std::invalid_argument("PsiFormer weighted derivative-ratio outputs have the wrong shape");
-  if (!optimization_enabled_ || !hasActiveParameters())
+  if (!optimization_metadata_->enabled || !hasActiveParameters())
     return;
   if (virtual_particles.getRefPS().isSpinor())
     throw std::invalid_argument("PsiFormer weighted nonlocal derivatives do not support spinor virtual moves");
@@ -2694,7 +2762,7 @@ void PsiFormerWF::evaluateSpinorDerivRatios(const VirtualParticleSet&,
 // Add only score derivatives, avoiding the mixed coordinate-jet reverse used for kinetic derivatives.
 void PsiFormerWF::evaluateDerivativesWF(ParticleSet& p, const OptVariables&, Vector<ValueType>& dlogpsi)
 {
-  if (!optimization_enabled_ || !hasActiveParameters())
+  if (!optimization_metadata_->enabled || !hasActiveParameters())
     return;
 
   if (model_state_->direct_score_mode == DirectBackendMode::DIRECT)
@@ -2728,7 +2796,7 @@ void PsiFormerWF::mw_evaluateParameterDerivativesWF(
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       auto& component = dynamic_cast<PsiFormerWF&>(wfc_list[walker]);
-      if (!component.optimization_enabled_ || !component.hasActiveParameters())
+      if (!component.optimization_metadata_->enabled || !component.hasActiveParameters())
         continue;
       Vector<ValueType> score(dlogpsi[walker], parameter_count);
       const pf::DirectScoreResult result =
@@ -2751,7 +2819,7 @@ void PsiFormerWF::evaluateDerivatives(ParticleSet& p,
                                       Vector<ValueType>& dlogpsi,
                                       Vector<ValueType>& dhpsioverpsi)
 {
-  if (optimization_enabled_ && hasActiveParameters())
+  if (optimization_metadata_->enabled && hasActiveParameters())
   {
     requireUnitElectronMasses(p);
     requireRealTotalWavefunctionDrift(p);
@@ -2768,7 +2836,7 @@ void PsiFormerWF::evaluateDerivativesImpl(
     pf::DirectKineticWorkspace* crowd_workspace,
     std::vector<double>* crowd_total_log_gradient)
 {
-  if (!optimization_enabled_ || !hasActiveParameters())
+  if (!optimization_metadata_->enabled || !hasActiveParameters())
     return;
   if ((crowd_workspace == nullptr) != (crowd_total_log_gradient == nullptr))
     throw std::invalid_argument("PsiFormer kinetic scratch requires both tape and total-drift storage");
@@ -2853,7 +2921,7 @@ void PsiFormerWF::mw_evaluateParameterDerivatives(
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
     const auto& component = dynamic_cast<const PsiFormerWF&>(wfc_list[walker]);
-    if (component.optimization_enabled_ && component.hasActiveParameters())
+    if (component.optimization_metadata_->enabled && component.hasActiveParameters())
     {
       requireUnitElectronMasses(p_list[walker]);
       requireRealTotalWavefunctionDrift(p_list[walker]);

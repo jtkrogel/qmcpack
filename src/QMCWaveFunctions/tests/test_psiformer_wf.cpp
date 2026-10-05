@@ -54,6 +54,13 @@ public:
   {
     return leader.directKineticWorkspaceOwnershipForTesting(wfc_list);
   }
+
+  /// Report optimizer metadata sharing without exposing the implementation type.
+  static PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnostics(
+      const PsiFormerWF& component)
+  {
+    return component.optimizationMetadataDiagnosticsForTesting();
+  }
 };
 } // namespace testing
 
@@ -322,6 +329,23 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
         return count + product(leaf.shape);
       });
   CHECK(all_active.size() == expected_parameter_count);
+
+  // Full-network clones share the O(P) selection, names, values, and global
+  // indices. The inherited per-object VariableSet remains empty, preventing a
+  // second O(P) copy from being created by OptimizableObject's copy constructor.
+  std::unique_ptr<WaveFunctionComponent> all_clone_storage = all_psiformer->makeClone(electrons);
+  auto* all_clone = dynamic_cast<PsiFormerWF*>(all_clone_storage.get());
+  REQUIRE(all_clone != nullptr);
+  const auto all_diagnostics = testing::TestPsiFormerWF::optimizationMetadataDiagnostics(*all_psiformer);
+  const auto clone_diagnostics = testing::TestPsiFormerWF::optimizationMetadataDiagnostics(*all_clone);
+  CHECK(all_diagnostics.identity == clone_diagnostics.identity);
+  CHECK(all_diagnostics.shared_owner_count == 2);
+  CHECK(clone_diagnostics.shared_owner_count == 2);
+  CHECK(all_diagnostics.selected_index_count == expected_parameter_count);
+  CHECK(all_diagnostics.shared_variable_count == expected_parameter_count);
+  CHECK(all_diagnostics.mapped_variable_count == expected_parameter_count);
+  CHECK(all_diagnostics.inherited_variable_count == 0);
+  CHECK(clone_diagnostics.inherited_variable_count == 0);
 
   std::ostringstream unsupported_xml;
   unsupported_xml << "<psiformer parameters=\"" << files.parameters.string() << "\" configuration=\""
