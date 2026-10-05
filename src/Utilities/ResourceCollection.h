@@ -38,11 +38,25 @@ public:
 
   template<class RS>
   ResourceHandle<RS> lendResource()
-  { return dynamic_cast<RS&>(lendResourceImpl()); }
+  {
+    const size_t cursor_begin = cursor_index_;
+    try
+    {
+      return dynamic_cast<RS&>(lendResourceImpl());
+    }
+    catch (...)
+    {
+      cursor_index_ = cursor_begin;
+      throw;
+    }
+  }
 
   template<class RS>
   void takebackResource(ResourceHandle<RS>& res_handle)
   { takebackResourceImpl(res_handle.release()); }
+
+  /// Return the next collection slot, for transactional acquisition rollback.
+  size_t getCursor() const noexcept { return cursor_index_; }
 
   void rewind(size_t cursor = 0) { cursor_index_ = cursor; }
 
@@ -56,6 +70,8 @@ private:
 };
 
 /** handles acquire/release resource by the consumer (RefVectorWithLeader type).
+ *  A failed construction restores the collection cursor. The consumer remains
+ *  responsible for any handles it published before throwing.
  */
 template<class CONSUMER>
 class ResourceCollectionTeamLock
@@ -69,7 +85,17 @@ public:
     if (active)
     {
       resource.rewind(cursor_begin_);
-      consumer.getLeader().acquireResource(resource, consumer);
+      try
+      {
+        consumer.getLeader().acquireResource(resource, consumer);
+      }
+      catch (...)
+      {
+        // A consumer owns unwinding any handles it published before throwing.
+        // Restore the shared cursor as a final construction-failure guarantee.
+        resource.rewind(cursor_begin_);
+        throw;
+      }
     }
   }
 

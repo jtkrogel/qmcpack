@@ -66,6 +66,25 @@ private:
   ResourceHandle<MemoryResource> external_memory_handle;
 };
 
+class ConstructorThrowingResourceConsumer
+{
+public:
+  void acquireResource(ResourceCollection& collection,
+                       const RefVectorWithLeader<ConstructorThrowingResourceConsumer>& consumer_list)
+  {
+    auto transient_handle = collection.lendResource<MemoryResource>();
+    throw std::runtime_error("deliberate resource acquisition failure");
+  }
+
+  void releaseResource(ResourceCollection& collection,
+                       const RefVectorWithLeader<ConstructorThrowingResourceConsumer>& consumer_list)
+  {
+    release_called = true;
+  }
+
+  bool release_called = false;
+};
+
 TEST_CASE("ResourceCollection", "[utilities]")
 {
   ResourceCollection res_collection("abc");
@@ -105,6 +124,44 @@ TEST_CASE("ResourceCollection::printResources", "[utilities]")
   REQUIRE(output.find("list resources in test_collection") != std::string::npos);
   REQUIRE(output.find("resource 0    name: dummy1") != std::string::npos);
   REQUIRE(output.find("resource 1    name: dummy2") != std::string::npos);
+}
+
+TEST_CASE("ResourceCollection typed lend failure preserves cursor", "[utilities]")
+{
+  ResourceCollection collection("typed_lend_failure");
+  collection.addResource(std::make_unique<MemoryResource>("memory"));
+  collection.addResource(std::make_unique<DummyResource>("dummy"));
+
+  auto memory_handle = collection.lendResource<MemoryResource>();
+  REQUIRE(collection.getCursor() == 1);
+  CHECK_THROWS_AS(collection.lendResource<MemoryResource>(), std::bad_cast);
+  CHECK(collection.getCursor() == 1);
+
+  auto dummy_handle = collection.lendResource<DummyResource>();
+  CHECK(collection.getCursor() == 2);
+
+  collection.rewind();
+  collection.takebackResource(memory_handle);
+  collection.takebackResource(dummy_handle);
+  CHECK_FALSE(memory_handle.hasResource());
+  CHECK_FALSE(dummy_handle.hasResource());
+}
+
+TEST_CASE("ResourceCollectionTeamLock construction failure preserves cursor", "[utilities]")
+{
+  ResourceCollection collection("team_lock_construction_failure");
+  collection.addResource(std::make_unique<MemoryResource>("memory"));
+  ConstructorThrowingResourceConsumer consumer;
+  RefVectorWithLeader consumer_list(consumer, {consumer});
+
+  CHECK_THROWS_AS(ResourceCollectionTeamLock(collection, consumer_list), std::runtime_error);
+  CHECK(collection.getCursor() == 0);
+  CHECK_FALSE(consumer.release_called);
+
+  auto recovered_handle = collection.lendResource<MemoryResource>();
+  REQUIRE(recovered_handle.hasResource());
+  collection.rewind();
+  collection.takebackResource(recovered_handle);
 }
 
 } // namespace qmcplusplus

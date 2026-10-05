@@ -18,6 +18,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include <algorithm>
+#include <exception>
 #include <set>
 #include <stdexcept>
 
@@ -1545,21 +1546,49 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
                                         const RefVectorWithLeader<TrialWaveFunction>& wf_list)
 {
   auto& wf_leader = wf_list.getLeader();
+  const size_t cursor_begin = collection.getCursor();
+  int acquired_components   = 0;
 
-  // First handle WFC resources
-  for (int i = 0; i < wf_leader.Z.size(); ++i)
+  try
   {
-    const auto wfc_list(extractWFCRefList(wf_list, i));
-    wf_leader.Z[i]->acquireResource(collection, wfc_list);
+    // First handle WFC resources
+    for (int i = 0; i < wf_leader.Z.size(); ++i)
+    {
+      const auto wfc_list(extractWFCRefList(wf_list, i));
+      wf_leader.Z[i]->acquireResource(collection, wfc_list);
+      ++acquired_components;
+    }
+
+    // Handle wrapper resources if they exist
+    if (wf_leader.twf_fastderiv_)
+    {
+      RefVectorWithLeader<TWFFastDerivWrapper> wrapper_list(*wf_leader.twf_fastderiv_);
+      for (int iw = 0; iw < wf_list.size(); ++iw)
+        wrapper_list.push_back(*wf_list[iw].twf_fastderiv_);
+      wf_leader.twf_fastderiv_->acquireResource(collection, wrapper_list);
+    }
   }
-
-  // Handle wrapper resources if they exist
-  if (wf_leader.twf_fastderiv_)
+  catch (...)
   {
-    RefVectorWithLeader<TWFFastDerivWrapper> wrapper_list(*wf_leader.twf_fastderiv_);
-    for (int iw = 0; iw < wf_list.size(); ++iw)
-      wrapper_list.push_back(*wf_list[iw].twf_fastderiv_);
-    wf_leader.twf_fastderiv_->acquireResource(collection, wrapper_list);
+    const std::exception_ptr acquisition_failure = std::current_exception();
+    collection.rewind(cursor_begin);
+    try
+    {
+      // ResourceCollection takeback traverses from the rewound cursor in the
+      // same order as acquisition, rather than in stack order.
+      for (int i = 0; i < acquired_components; ++i)
+      {
+        const auto wfc_list(extractWFCRefList(wf_list, i));
+        wf_leader.Z[i]->releaseResource(collection, wfc_list);
+      }
+    }
+    catch (...)
+    {
+      collection.rewind(cursor_begin);
+      throw;
+    }
+    collection.rewind(cursor_begin);
+    std::rethrow_exception(acquisition_failure);
   }
 }
 

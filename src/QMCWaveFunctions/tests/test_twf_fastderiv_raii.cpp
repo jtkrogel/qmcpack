@@ -123,6 +123,7 @@
 
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/TWFFastDerivWrapper.h"
+#include "QMCWaveFunctions/ConstantOrbital.h"
 #include "Particle/ParticleSet.h"
 #include "SimulationCell.h"
 #include "Utilities/ResourceCollection.h"
@@ -145,7 +146,120 @@ ParticleSet createMinimalElectrons(SimulationCell& sim_cell, int num_elec = 2)
   return elec;
 }
 
+class TrackedWaveFunctionResource : public Resource
+{
+public:
+  explicit TrackedWaveFunctionResource(int id) : Resource("TrackedWaveFunctionResource"), id_(id) {}
+
+  std::unique_ptr<Resource> makeClone() const override
+  { return std::make_unique<TrackedWaveFunctionResource>(*this); }
+
+  int id() const noexcept { return id_; }
+
+private:
+  int id_;
+};
+
+class ResourceTrackingOrbital : public ConstantOrbital
+{
+public:
+  ResourceTrackingOrbital(int id, bool throw_on_acquire, std::vector<int>& release_order)
+      : id_(id), throw_on_acquire_(throw_on_acquire), release_order_(&release_order)
+  {}
+
+  std::string getClassName() const override { return "ResourceTrackingOrbital"; }
+
+  void createResource(ResourceCollection& collection) const override
+  { collection.addResource(std::make_unique<TrackedWaveFunctionResource>(id_)); }
+
+  void acquireResource(ResourceCollection& collection,
+                       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override
+  {
+    auto& leader = wfc_list.getCastedLeader<ResourceTrackingOrbital>();
+    if (leader.throw_on_acquire_)
+      throw std::runtime_error("deliberate WaveFunctionComponent acquisition failure");
+    leader.resource_handle_ = collection.lendResource<TrackedWaveFunctionResource>();
+  }
+
+  void releaseResource(ResourceCollection& collection,
+                       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override
+  {
+    auto& leader          = wfc_list.getCastedLeader<ResourceTrackingOrbital>();
+    const int resource_id = leader.resource_handle_.getResource().id();
+    collection.takebackResource(leader.resource_handle_);
+    leader.release_order_->push_back(resource_id);
+  }
+
+  std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet&) const override
+  { return std::make_unique<ResourceTrackingOrbital>(id_, throw_on_acquire_, *release_order_); }
+
+  void setThrowOnAcquire(bool should_throw) noexcept { throw_on_acquire_ = should_throw; }
+  bool hasResource() const noexcept { return resource_handle_.hasResource(); }
+  int acquiredResourceId() const { return resource_handle_.getResource().id(); }
+
+private:
+  int id_;
+  bool throw_on_acquire_;
+  std::vector<int>* release_order_;
+  ResourceHandle<TrackedWaveFunctionResource> resource_handle_;
+};
+
 } // namespace
+
+TEST_CASE("TrialWaveFunction resource acquisition unwinds completed components", "[wavefunction][resources]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction twf(runtime_options, "resource_unwind", false);
+  std::vector<int> release_order;
+  release_order.reserve(8);
+
+  auto first_component = std::make_unique<ResourceTrackingOrbital>(1, false, release_order);
+  auto* first          = first_component.get();
+  twf.addComponent(std::move(first_component));
+  auto second_component = std::make_unique<ResourceTrackingOrbital>(2, false, release_order);
+  auto* second           = second_component.get();
+  twf.addComponent(std::move(second_component));
+  auto failing_component = std::make_unique<ResourceTrackingOrbital>(3, true, release_order);
+  auto* failing           = failing_component.get();
+  twf.addComponent(std::move(failing_component));
+
+  RefVectorWithLeader<TrialWaveFunction> twf_refs(twf, {twf});
+  ResourceCollection resources("trial_wavefunction_acquisition_unwind");
+  resources.addResource(std::make_unique<DummyResource>("prefix"));
+  twf.createResource(resources);
+  REQUIRE(resources.size() == 4);
+
+  CHECK_THROWS_AS(ResourceCollectionTeamLock(resources, twf_refs, 1), std::runtime_error);
+  CHECK(resources.getCursor() == 1);
+  CHECK_FALSE(first->hasResource());
+  CHECK_FALSE(second->hasResource());
+  CHECK_FALSE(failing->hasResource());
+  CHECK(release_order == (std::vector<int>{1, 2}));
+
+  failing->setThrowOnAcquire(false);
+  release_order.clear();
+  {
+    ResourceCollectionTeamLock lock(resources, twf_refs, 1);
+    CHECK(resources.getCursor() == 4);
+    REQUIRE(first->hasResource());
+    REQUIRE(second->hasResource());
+    REQUIRE(failing->hasResource());
+    CHECK(first->acquiredResourceId() == 1);
+    CHECK(second->acquiredResourceId() == 2);
+    CHECK(failing->acquiredResourceId() == 3);
+  }
+  CHECK_FALSE(first->hasResource());
+  CHECK_FALSE(second->hasResource());
+  CHECK_FALSE(failing->hasResource());
+  CHECK(release_order == (std::vector<int>{1, 2, 3}));
+
+  release_order.clear();
+  {
+    ResourceCollectionTeamLock lock(resources, twf_refs, 1);
+  }
+  CHECK(release_order == (std::vector<int>{1, 2, 3}));
+}
+
 TEST_CASE("TWFFastDerivWrapper RAII resource management", "[wavefunction][resources]")
 {
   SimulationCell sim_cell;
