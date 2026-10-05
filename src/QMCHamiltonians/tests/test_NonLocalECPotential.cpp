@@ -259,10 +259,12 @@ public:
   /** Compute the per-particle listener rows through the established scalar pair path. */
   static ListenerRows evaluateScalarListenerRows(NonLocalECPotential& nl_ecp,
                                                   TrialWaveFunction& psi,
-                                                  ParticleSet& particles)
+                                                  ParticleSet& particles,
+                                                  bool compute_tmove_data = false)
   {
     ListenerRows rows{std::vector<Real>(particles.getTotalNum(), 0),
                       std::vector<Real>(nl_ecp.IonConfig.getTotalNum(), 0)};
+    std::vector<NonLocalData> candidates;
     const auto& distance_table = particles.getDistTableAB(nl_ecp.myTableIndex);
     for (int group = 0; group < particles.groups(); ++group)
     {
@@ -276,7 +278,9 @@ public:
           {
             const Real pair_potential = nl_ecp.PP[ion]->evaluateOne(
                 particles, nl_ecp.vp_ ? makeOptionalRef<VirtualParticleSet>(*nl_ecp.vp_) : std::nullopt, ion, psi,
-                electron, distances[ion], -displacements[ion], std::nullopt, nl_ecp.use_DLA);
+                electron, distances[ion], -displacements[ion],
+                compute_tmove_data ? makeOptionalRef<std::vector<NonLocalData>>(candidates) : std::nullopt,
+                nl_ecp.use_DLA);
             rows.electron[electron] += Real(0.5) * pair_potential;
             rows.ion[ion] += Real(0.5) * pair_potential;
           }
@@ -544,7 +548,19 @@ struct StampedRatioControl
   int change_version_at_call = 0;
   int throw_after_call       = 0;
   std::uint64_t version      = 7;
+  QMCTraits::ValueType ratio = QMCTraits::ValueType(1);
 };
+
+QMCTraits::ValueType makeStampedRatio(QMCTraits::RealType real_part,
+                                      QMCTraits::RealType imaginary_part)
+{
+#if defined(QMC_COMPLEX)
+  return QMCTraits::ValueType(real_part, imaginary_part);
+#else
+  static_cast<void>(imaginary_part);
+  return QMCTraits::ValueType(real_part);
+#endif
+}
 
 /** Exercise the generic WaveFunctionComponent VP fallback while returning a test stamp. */
 class StampedRatioOrbital : public ConstantOrbital
@@ -562,7 +578,7 @@ public:
   {
     if (ratios.size() != static_cast<std::size_t>(virtual_particles.getTotalNum()))
       throw std::invalid_argument("StampedRatioOrbital received a mismatched ratio extent.");
-    std::fill(ratios.begin(), ratios.end(), ValueType(1));
+    std::fill(ratios.begin(), ratios.end(), control_->ratio);
   }
 
   EvaluationStamp mw_evaluateVirtualRatios(
@@ -953,6 +969,219 @@ TEST_CASE("NonLocalECPotential flattened DLA selects only fermionic components",
   CHECK(sameRealBits(potential.getValue(), scalar_energy));
   CHECK(fermionic_control->flattened_calls > 1);
   CHECK(nonfermionic_control->flattened_calls == 0);
+}
+
+TEST_CASE("NonLocalECPotential flattened TMDLA preserves dual-ratio outputs",
+          "[hamiltonian][ecp][nlpp_flattened][tmdla]")
+{
+  using Real  = QMCTraits::RealType;
+  using Value = QMCTraits::ValueType;
+  using testing::getParticularListener;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  auto fermionic_control          = std::make_shared<StampedRatioControl>();
+  auto nonfermionic_control       = std::make_shared<StampedRatioControl>();
+  fermionic_control->ratio        = makeStampedRatio(Real(-0.75), Real(0.5));
+  nonfermionic_control->ratio     = makeStampedRatio(Real(-1.25), Real(0.75));
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(fermionic_control, true));
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(nonfermionic_control, false));
+
+  NonLocalECPotential potential(ions, electrons, true, true);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 3);
+  potential.addComponent(0, readTmoveV1PPComponent());
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(potential);
+
+  // An ordinary-locality reference exposes the sign of bare*real(full ratio),
+  // which is exactly the strict branch predicate used by TMDLA.
+  NonLocalECPotential ordinary_potential(ions, electrons, false, true);
+  ordinary_potential.addComponent(0, readTmoveV1PPComponent());
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(ordinary_potential);
+  testing::TestNonLocalECPotential::evaluateImpl(
+      ordinary_potential, wavefunction, electrons, true, true);
+  const auto ordinary_candidates =
+      testing::TestNonLocalECPotential::tmoveCandidates(ordinary_potential);
+
+  testing::TestNonLocalECPotential::evaluateImpl(potential, wavefunction, electrons, true, true);
+  const auto expected_listener = testing::TestNonLocalECPotential::evaluateScalarListenerRows(
+      potential, wavefunction, electrons, true);
+  const NLPPPublicSnapshot expected = snapshotNLPPPublicState(
+      potential, electrons.getTotalNum(), ions.getTotalNum());
+
+  REQUIRE(ordinary_candidates.size() == expected.candidates.size());
+  const Value full_ratio = nonfermionic_control->ratio * fermionic_control->ratio;
+  REQUIRE(std::real(full_ratio) != Real(0));
+  int positive_full_knots    = 0;
+  int nonpositive_full_knots = 0;
+  int transformed_knots      = 0;
+  for (std::size_t knot = 0; knot < ordinary_candidates.size(); ++knot)
+  {
+    CHECK(ordinary_candidates[knot].PID == expected.candidates[knot].PID);
+    CHECK(samePositionBits(ordinary_candidates[knot].Delta, expected.candidates[knot].Delta));
+    if (ordinary_candidates[knot].Weight > Real(0))
+    {
+      ++positive_full_knots;
+      const Real bare_weight = ordinary_candidates[knot].Weight / std::real(full_ratio);
+      CHECK(expected.candidates[knot].Weight ==
+            Approx(bare_weight * std::real(fermionic_control->ratio)).epsilon(1e-12));
+      transformed_knots += !sameRealBits(expected.candidates[knot].Weight,
+                                         ordinary_candidates[knot].Weight);
+    }
+    else
+    {
+      ++nonpositive_full_knots;
+      CHECK(sameRealBits(expected.candidates[knot].Weight,
+                         ordinary_candidates[knot].Weight));
+    }
+  }
+  REQUIRE(positive_full_knots > 0);
+  REQUIRE(nonpositive_full_knots > 0);
+  REQUIRE(transformed_knots > 0);
+
+  Matrix<Real> electron_rows(1, electrons.getTotalNum());
+  Matrix<Real> ion_rows(1, ions.getTotalNum());
+  electron_rows = Real(-31);
+  ion_rows      = Real(-32);
+  std::vector<ListenerVector<Real>> electron_listeners;
+  std::vector<ListenerVector<Real>> ion_listeners;
+  electron_listeners.emplace_back("tmdla_electrons", getParticularListener(electron_rows));
+  ion_listeners.emplace_back("tmdla_ions", getParticularListener(ion_rows));
+  const ListenerOption<Real> listener_option{electron_listeners, ion_listeners};
+
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential});
+  ResourceCollection particle_resources("flattened_tmdla_particles");
+  ResourceCollection potential_resources("flattened_tmdla_potential");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  fermionic_control->flattened_calls    = 0;
+  nonfermionic_control->flattened_calls = 0;
+  testing::TestNonLocalECPotential::mw_evaluateImpl(
+      potential, potentials, wavefunctions, particles, true, listener_option, true);
+
+  REQUIRE(fermionic_control->flattened_calls > 1);
+  CHECK(nonfermionic_control->flattened_calls == fermionic_control->flattened_calls);
+  CHECK(sameRealBits(potential.getValue(), expected.value));
+  CHECK(sameCandidates(testing::TestNonLocalECPotential::tmoveCandidates(potential),
+                       expected.candidates));
+  for (const auto& group_jobs : testing::TestNonLocalECPotential::jobs(potential))
+    CHECK_FALSE(group_jobs.empty());
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    CHECK(testing::TestNonLocalECPotential::neighboringIons(potential, electron) ==
+          expected.electron_neighbors[electron]);
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+    CHECK(testing::TestNonLocalECPotential::neighboringElectrons(potential, ion) ==
+          expected.ion_neighbors[ion]);
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    CHECK(sameRealBits(electron_rows(0, electron), expected_listener.electron[electron]));
+  for (int ion = 0; ion < ions.getTotalNum(); ++ion)
+    CHECK(sameRealBits(ion_rows(0, ion), expected_listener.ion[ion]));
+}
+
+TEST_CASE("NonLocalECPotential flattened TMDLA stamp streams publish atomically",
+          "[hamiltonian][ecp][nlpp_flattened][tmdla][atomic]")
+{
+  using Real = QMCTraits::RealType;
+  using testing::getParticularListener;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  auto fermionic_control      = std::make_shared<StampedRatioControl>();
+  auto nonfermionic_control   = std::make_shared<StampedRatioControl>();
+  fermionic_control->ratio    = makeStampedRatio(Real(-0.75), Real(0.5));
+  nonfermionic_control->ratio = makeStampedRatio(Real(-1.25), Real(0.75));
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(fermionic_control, true));
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(nonfermionic_control, false));
+
+  NonLocalECPotential potential(ions, electrons, true, true);
+  // A capacity larger than either group's complete knot extent produces one
+  // tile per group.  A version change on call two therefore pins that stamp
+  // baselines span the entire request rather than resetting at prepareGroup.
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 256);
+  potential.addComponent(0, readTmoveV1PPComponent());
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(potential);
+
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential});
+  ResourceCollection particle_resources("flattened_tmdla_atomic_particles");
+  ResourceCollection potential_resources("flattened_tmdla_atomic_potential");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  testing::TestNonLocalECPotential::mw_evaluateImpl(
+      potential, potentials, wavefunctions, particles, true, std::nullopt, true);
+  REQUIRE(fermionic_control->flattened_calls == 2);
+  REQUIRE(nonfermionic_control->flattened_calls == 2);
+  const NLPPPublicSnapshot initial = snapshotNLPPPublicState(
+      potential, electrons.getTotalNum(), ions.getTotalNum());
+
+  Matrix<Real> electron_rows(1, electrons.getTotalNum());
+  Matrix<Real> ion_rows(1, ions.getTotalNum());
+  std::vector<ListenerVector<Real>> electron_listeners;
+  std::vector<ListenerVector<Real>> ion_listeners;
+  electron_listeners.emplace_back("tmdla_atomic_electrons", getParticularListener(electron_rows));
+  ion_listeners.emplace_back("tmdla_atomic_ions", getParticularListener(ion_rows));
+  const ListenerOption<Real> listener_option{electron_listeners, ion_listeners};
+
+  fermionic_control->flattened_calls    = 0;
+  nonfermionic_control->flattened_calls = 0;
+  electron_rows                         = Real(-41);
+  ion_rows                              = Real(-42);
+
+  SECTION("fermionic version changes at the next group")
+  {
+    fermionic_control->change_version_at_call = 2;
+  }
+  SECTION("nonfermionic version changes at the next group")
+  {
+    nonfermionic_control->change_version_at_call = 2;
+  }
+  SECTION("nonfermionic evaluation throws at the next group")
+  {
+    nonfermionic_control->throw_after_call = 2;
+  }
+
+  CHECK_THROWS_AS(testing::TestNonLocalECPotential::mw_evaluateImpl(
+                      potential, potentials, wavefunctions, particles, true,
+                      listener_option, true),
+                  std::runtime_error);
+  CHECK(fermionic_control->flattened_calls == 2);
+  if (fermionic_control->change_version_at_call != 0)
+    CHECK(nonfermionic_control->flattened_calls == 1);
+  else
+    CHECK(nonfermionic_control->flattened_calls == 2);
+  CHECK(sameNLPPPublicState(potential, initial, electrons.getTotalNum(), ions.getTotalNum()));
+  for (const Real value : electron_rows)
+    CHECK(sameRealBits(value, Real(-41)));
+  for (const Real value : ion_rows)
+    CHECK(sameRealBits(value, Real(-42)));
+
+  fermionic_control->flattened_calls         = 0;
+  fermionic_control->change_version_at_call  = 0;
+  fermionic_control->throw_after_call        = 0;
+  nonfermionic_control->flattened_calls      = 0;
+  nonfermionic_control->change_version_at_call = 0;
+  nonfermionic_control->throw_after_call       = 0;
+  CHECK_NOTHROW(testing::TestNonLocalECPotential::mw_evaluateImpl(
+      potential, potentials, wavefunctions, particles, true, std::nullopt, true));
+  CHECK(sameNLPPPublicState(potential, initial, electrons.getTotalNum(), ions.getTotalNum()));
 }
 
 TEST_CASE("NonLocalECPotential clone owns neighbor-list binding and staged publication",

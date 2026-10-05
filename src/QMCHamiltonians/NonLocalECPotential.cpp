@@ -73,6 +73,9 @@ struct NonLocalECPotential::NonLocalECPotentialMultiWalkerResource : public Reso
   /// First-tile and current-tile optimistic model-version stamps.
   std::vector<TrialWaveFunction::EvaluationStamp> reference_stamps;
   std::vector<TrialWaveFunction::EvaluationStamp> tile_stamps;
+  /// Independent TMDLA nonfermionic first-tile and current-tile stamps.
+  std::vector<TrialWaveFunction::EvaluationStamp> nonfermionic_reference_stamps;
+  std::vector<TrialWaveFunction::EvaluationStamp> nonfermionic_tile_stamps;
   /// a crowds worth of per particle nonlocal ecp potential values
   Matrix<Real> ve_samples;
   Matrix<Real> vi_samples;
@@ -395,7 +398,7 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
 
   if (wf_list.size() != walker_count || p_list.size() != walker_count)
     throw std::invalid_argument("NonLocalECPotential flattened crowd lists have inconsistent sizes.");
-  if (!leader.vp_ || (leader.use_DLA && compute_txy_all))
+  if (!leader.vp_)
     throw std::logic_error("NonLocalECPotential flattened evaluator received an unsupported localization mode.");
   if (!leader.mw_res_handle_)
     throw std::logic_error("NonLocalECPotential flattened evaluation requires an acquired crowd resource.");
@@ -452,6 +455,8 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
   resource.staged_values.assign(walker_count, Real(0));
   resource.reference_stamps.clear();
   resource.tile_stamps.clear();
+  resource.nonfermionic_reference_stamps.clear();
+  resource.nonfermionic_tile_stamps.clear();
   resource.virtual_batch->reset(walker_count, compute_txy_all);
 
   std::size_t maximum_channels = 0;
@@ -539,8 +544,9 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
     // and consumed. Release them before public-state commit and callbacks.
     ResourceCollectionTeamLock<VirtualParticleSet> vp_resource_lock(resource.collection, vp_scratch_list);
 
-    bool have_reference_stamps = false;
-    bool tile_available        = resource.virtual_batch->packNextTile();
+    bool have_reference_stamps              = false;
+    bool have_nonfermionic_reference_stamps = false;
+    bool tile_available                     = resource.virtual_batch->packNextTile();
     for (int group = 0; group < pset_leader.groups(); ++group)
     {
       // Keep this boundary even for an empty group, matching the reference path.
@@ -580,21 +586,60 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
         const VirtualParticleBatch descriptor = resource.virtual_batch->makeVirtualParticleBatch();
         descriptor.validateFor(p_list, static_cast<std::size_t>(leader.IonConfig.getTotalNum()));
 
-        auto& ratios = resource.virtual_batch->mutableTileRatios();
-        resource.tile_stamps.clear();
-        TrialWaveFunction::mw_evaluateVirtualRatios(
-            wf_list, p_list, vp_scratch_list, descriptor, ratios, resource.tile_stamps,
-            leader.use_DLA ? TrialWaveFunction::ComputeType::FERMIONIC
-                           : TrialWaveFunction::ComputeType::ALL);
+        auto& ratios         = resource.virtual_batch->mutableTileRatios();
+        const bool use_tmdla = leader.use_DLA && compute_txy_all;
+        auto evaluate_and_validate_stamps =
+            [&](std::vector<ValueType>& selected_ratios,
+                TrialWaveFunction::ComputeType compute_type,
+                std::vector<TrialWaveFunction::EvaluationStamp>& tile_stamps,
+                std::vector<TrialWaveFunction::EvaluationStamp>& reference_stamps,
+                bool& have_reference,
+                const char* stream_name) {
+              tile_stamps.clear();
+              TrialWaveFunction::mw_evaluateVirtualRatios(
+                  wf_list, p_list, vp_scratch_list, descriptor, selected_ratios, tile_stamps,
+                  compute_type);
 
-        if (!have_reference_stamps)
+              if (!have_reference)
+              {
+                reference_stamps = tile_stamps;
+                have_reference   = true;
+              }
+              else if (tile_stamps != reference_stamps)
+                throw std::runtime_error(
+                    std::string("NonLocalECPotential observed different wavefunction parameter versions across ") +
+                    stream_name + " outer tiles.");
+            };
+
+        std::vector<ValueType>* fermionic_ratios = nullptr;
+        if (use_tmdla)
         {
-          resource.reference_stamps = resource.tile_stamps;
-          have_reference_stamps     = true;
+          auto& selected_fermionic_ratios = resource.virtual_batch->mutableTileFermionicRatios();
+          evaluate_and_validate_stamps(
+              selected_fermionic_ratios, TrialWaveFunction::ComputeType::FERMIONIC,
+              resource.tile_stamps, resource.reference_stamps, have_reference_stamps, "fermionic");
+
+          auto& nonfermionic_ratios = resource.virtual_batch->mutableTileNonfermionicRatios();
+          evaluate_and_validate_stamps(
+              nonfermionic_ratios, TrialWaveFunction::ComputeType::NONFERMIONIC,
+              resource.nonfermionic_tile_stamps, resource.nonfermionic_reference_stamps,
+              have_nonfermionic_reference_stamps, "nonfermionic");
+
+          if (ratios.size() != selected_fermionic_ratios.size() || ratios.size() != nonfermionic_ratios.size())
+            throw std::logic_error("NonLocalECPotential TMDLA ratio buffers have inconsistent sizes.");
+          for (std::size_t ratio = 0; ratio < ratios.size(); ++ratio)
+          {
+            ratios[ratio] = nonfermionic_ratios[ratio];
+            ratios[ratio] *= selected_fermionic_ratios[ratio];
+          }
+          fermionic_ratios = &selected_fermionic_ratios;
         }
-        else if (resource.tile_stamps != resource.reference_stamps)
-          throw std::runtime_error(
-              "NonLocalECPotential observed different wavefunction parameter versions across outer tiles.");
+        else
+          evaluate_and_validate_stamps(
+              ratios,
+              leader.use_DLA ? TrialWaveFunction::ComputeType::FERMIONIC
+                             : TrialWaveFunction::ComputeType::ALL,
+              resource.tile_stamps, resource.reference_stamps, have_reference_stamps, "selected");
 
         auto& transformed_weights = resource.virtual_batch->mutableTileTransformedWeights();
         for (const auto& segment : segments)
@@ -606,7 +651,7 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
           NonLocalECPComponent::reduceQuadraturePointRange(
               segment.electronId(), segment.tileOffset(), segment.knotCount(),
               resource.virtual_batch->tileDeltas(), resource.virtual_batch->tileBareWeights(), ratios,
-              nullptr, segment.tileOffset(), transformed_weights, segment.walkerKnotOffset(), candidates,
+              fermionic_ratios, segment.tileOffset(), transformed_weights, segment.walkerKnotOffset(), candidates,
               pair_potential);
 
           if (segment.endsJob())
@@ -762,10 +807,8 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
   ParticleSet& pset_leader = p_list.getLeader();
   const size_t nw          = o_list.size();
 
-  // TMDLA needs independent fermionic/nonfermionic streams and remains on the
-  // established wavefront until the next boundary. The non-VP path is also an
-  // unchanged compatibility reference.
-  if (O_leader.vp_ && !(O_leader.use_DLA && compute_txy_all))
+  // The non-VP path remains an unchanged compatibility reference.
+  if (O_leader.vp_)
   {
     mw_evaluateImplFlattenedVP(o_list, wf_list, p_list, compute_txy_all, listeners, keep_grid);
     return;
