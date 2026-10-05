@@ -327,14 +327,64 @@ Validation coverage
 -------------------
 
 Deterministic tests generate their HDF5 fixtures at runtime and require no
-external trained parameter file. They cover JAX and finite-difference native
-observables; selected/full registration, reset, clone sharing and restart;
-virtual ratios and score differences; a generated pseudo-LiH nonlocal energy
-derivative and selected update; system mismatch rejection; streaming/stored
-allocation behavior; and duplicate names or stale/inconsistent state. The same
-public real/open component tests compile and run in real and complex QMCPACK
-builds. Additional guards cover periodic targets, nonunit/unequal optimization
-masses, both source-gradient force interfaces, exact-node ratios, complex total
-drift, spinors, and spin-orbit calls. Crowd tests run with one- and two-thread
-outer layouts while forcing single-threaded BLAS, and low-level executor tests
-check warmed storage stability without imposing wall-clock pass/fail limits.
+external trained parameter file.  Fixture recipe version 1 uses fixed SplitMix64
+parameter and geometry seeds; temporary file names are unique per process and
+fixture instance.  Changing that recipe requires deliberately regenerating and
+reviewing the independent JAX references rather than silently changing the
+meaning of an existing test.
+
+The permanent test matrix has the following tiers:
+
+.. list-table:: PsiFormer validation tiers
+   :header-rows: 1
+   :widths: 22 48 30
+
+   * - Tier
+     - Required coverage
+     - Data and gating policy
+   * - Primitive and execution-plan
+     - Geometry, determinant signed-log arithmetic, typed parameter layouts,
+       workspace bounds, malformed input, and node behavior.
+     - Generated values; ordinary deterministic CI.
+   * - Evaluator contracts
+     - Value, full VGL, active-electron gradient, score, and kinetic/local-energy
+       parameter response against native, JAX, and finite-difference references.
+     - Generated LiH and separated LiH pair; ordinary deterministic CI.
+   * - Public component lifecycle
+     - Builder, registration, reset, moves, buffers, cloning, persistence,
+       allocation stability, crowd equivalence, and concurrent resources.
+     - Generated models; ordinary deterministic CI in real and complex-adapter
+       builds.
+   * - Hamiltonian
+     - Assembled all-electron kinetic and Coulomb local energy plus selected
+       derivatives; pseudo-LiH local/nonlocal ECP values and weighted derivative
+       reductions through scalar and multiwalker operators.
+     - Generated models plus the small repository pseudopotential test asset;
+       ordinary deterministic CI.
+   * - Performance
+     - Value, spatial, score, kinetic response, crowd batches, workspace bytes,
+       allocation behavior, affinity, and raw warmed timings.
+     - Non-gating developer/nightly runs; trained exports are optional timing
+       inputs and are never required by correctness CI.
+
+The named matrix can be selected without knowing which broad executable owns a
+case:
+
+.. code-block:: bash
+
+  ctest --test-dir build -R psiformer --output-on-failure
+
+For a source-build validation, build at least ``test_wavefunction_trialwf``,
+``test_psiformer_native``, all direct-executor test targets,
+``test_psiformer_determinant``, ``test_psiformer_adapter_sinks``,
+``test_hamiltonian_ham``, and ``test_hamiltonian_coulomb``.  Repeat the focused
+matrix in real and complex builds.  The complex build currently validates only
+the documented real/open embedding and must not be reported as native complex
+PsiFormer support.
+
+Numerical, shape, version, allocation, and workspace invariants may gate CI.
+Absolute wall-clock thresholds may not: performance manifests must preserve
+warmup policy, every raw sample, build/compiler revision, precision, affinity,
+thread environment, workload dimensions, workspace bytes, and peak resident
+memory.  Performance comparisons are valid only between otherwise matched
+runs on idle resources.

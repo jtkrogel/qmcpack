@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <hdf5.h>
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -30,6 +31,9 @@ namespace qmcplusplus::testing::psiformer
 using Shape = std::vector<std::size_t>;
 
 inline constexpr std::uint64_t MIX_INCREMENT = 0x9E3779B97F4A7C15ULL;
+inline constexpr std::uint64_t PARAMETER_RECIPE_SEED = 0xC0FFEE1234000000ULL;
+inline constexpr std::uint64_t GEOMETRY_RECIPE_SEED  = 0x1234ABCDEF000000ULL;
+inline constexpr std::uint32_t FIXTURE_RECIPE_VERSION = 1;
 
 /// Provide deterministic uniform values without relying on library PRNG details.
 class SplitMix64
@@ -111,7 +115,7 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count, std::size_t nucl
 inline std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
 {
   const std::size_t electron_count = system == "lih" ? 4 : (system == "lih_pair" ? 8 : 2);
-  SplitMix64 random(0xC0FFEE1234000000ULL + electron_count);
+  SplitMix64 random(PARAMETER_RECIPE_SEED + electron_count);
   std::vector<double> values;
   for (const Leaf& leaf : leaves)
     for (std::size_t element = 0; element < product(leaf.shape); ++element)
@@ -174,7 +178,7 @@ inline Geometry makeGeometry(const std::string& system)
   else
     throw std::invalid_argument("Unknown generated PsiFormer test system: " + system);
 
-  SplitMix64 random(0x1234ABCDEF000000ULL + centers.size());
+  SplitMix64 random(GEOMETRY_RECIPE_SEED + centers.size());
   for (double& coordinate : geometry.nuclei)
     coordinate += 0.025 * random.symmetric();
   geometry.electrons.resize(3 * centers.size());
@@ -258,10 +262,13 @@ struct GeneratedFiles
 /// Generate a full-shape parameter file and matching physical-system configuration.
 inline GeneratedFiles generateFiles(const std::string& system)
 {
+  static std::atomic<std::uint64_t> fixture_sequence{0};
+
   GeneratedFiles files;
   files.directory = std::filesystem::temp_directory_path() /
-      ("qmcpack_psiformer_random_" + system + "_" + std::to_string(static_cast<long long>(getpid())));
-  std::filesystem::remove_all(files.directory);
+      ("qmcpack_psiformer_random_v" + std::to_string(FIXTURE_RECIPE_VERSION) + "_" + system + "_" +
+       std::to_string(static_cast<long long>(getpid())) + "_" +
+       std::to_string(fixture_sequence.fetch_add(1, std::memory_order_relaxed)));
   std::filesystem::create_directories(files.directory);
   files.parameters    = files.directory / "parameters.h5";
   files.configuration = files.directory / "configuration.h5";

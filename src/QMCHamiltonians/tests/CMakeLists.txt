@@ -28,6 +28,7 @@ set(HAM_SRCS
     test_L2Potential.cpp
     test_NonLocalTOperator.cpp
     test_ecp.cpp
+    test_psiformer_hamiltonian.cpp
     test_hamiltonian_pool.cpp
     test_hamiltonian_factory.cpp
     test_PairCorrEstimator.cpp
@@ -84,6 +85,30 @@ foreach(CATEGORY coulomb force ham ewald2d)
 endforeach()
 
 target_link_libraries(test_hamiltonian_ham IO::HDF5)
+
+# PsiFormer Hamiltonian cases live in the ordinary Hamiltonian executables so
+# they exercise the same public operators as production.  Filtered aliases keep
+# them selectable with ``ctest -R psiformer`` without building duplicate tests.
+add_unit_test(deterministic-unit_test_psiformer_all_electron
+              1 1
+              $<TARGET_FILE:test_hamiltonian_ham>
+              "[psiformer][all-electron]")
+set_tests_properties(deterministic-unit_test_psiformer_all_electron
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_unit_test(deterministic-unit_test_psiformer_ecp
+              1 1
+              $<TARGET_FILE:test_hamiltonian_ham>
+              "[psiformer][ecp]")
+set_tests_properties(deterministic-unit_test_psiformer_ecp
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_unit_test(deterministic-unit_test_psiformer_nonlocal_ecp
+              1 1
+              $<TARGET_FILE:test_hamiltonian_coulomb>
+              "[psiformer][ecp]")
+set_tests_properties(deterministic-unit_test_psiformer_nonlocal_ecp
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")

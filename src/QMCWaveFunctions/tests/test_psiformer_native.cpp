@@ -11,7 +11,9 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "psiformer_test_utils.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -116,8 +118,31 @@ void checkVectorClose(const std::vector<double>& actual,
                       double absolute)
 {
   REQUIRE(actual.size() == expected.size());
+  if (actual.empty())
+    return;
+
+  double worst_normalized_error = 0.0;
+  std::size_t worst_index        = 0;
   for (std::size_t index = 0; index < actual.size(); ++index)
-    checkClose(actual[index], expected[index], relative, absolute);
+  {
+    const double error = std::abs(actual[index] - expected[index]);
+    const double scale = std::max(absolute,
+                                  relative * std::max(std::abs(actual[index]),
+                                                      std::abs(expected[index])));
+    const double normalized_error = scale == 0.0
+        ? (error == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
+        : error / scale;
+    if (normalized_error > worst_normalized_error)
+    {
+      worst_normalized_error = normalized_error;
+      worst_index            = index;
+    }
+  }
+
+  INFO("worst index=" << worst_index << " actual=" << actual[worst_index]
+                       << " expected=" << expected[worst_index]
+                       << " normalized error=" << worst_normalized_error);
+  CHECK(worst_normalized_error <= 1.0);
 }
 
 void validateCase(const std::string& system, const Golden& golden, bool finite_differences)

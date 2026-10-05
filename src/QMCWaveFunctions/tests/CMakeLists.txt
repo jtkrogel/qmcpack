@@ -245,6 +245,16 @@ set_property(
            "OMP_PROC_BIND=spread"
            "OMP_PLACES=cores")
 
+# Make the PsiFormer component cases embedded in the broad TrialWaveFunction
+# executable discoverable through ``ctest -R psiformer``.  This alias applies a
+# Catch2 tag filter and does not duplicate source compilation.
+set(PSIFORMER_PUBLIC_TEST deterministic-unit_test_psiformer_public)
+add_unit_test(${PSIFORMER_PUBLIC_TEST}
+              1 1
+              $<TARGET_FILE:test_wavefunction_trialwf>
+              "[psiformer]")
+set_tests_properties(${PSIFORMER_PUBLIC_TEST} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 if(BUILD_MICRO_BENCHMARKS)
   # This executable is intentionally not registered with CTest. It reports
   # wall time and peak RSS for developer-selected parameter counts without
