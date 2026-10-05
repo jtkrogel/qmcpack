@@ -116,7 +116,6 @@ set(TRIALWF_SRC
     test_psiformer_buffer.cpp
     test_psiformer_guards.cpp
     test_psiformer_multiwalker.cpp
-    test_psiformer_threading.cpp
     test_psiformer_training_provider.cpp
     test_psiformer_wf.cpp
     test_structured_parameter_provider.cpp)
@@ -227,23 +226,50 @@ endforeach()
 
 target_link_libraries(test_wavefunction_trialwf IO::HDF5)
 
-# The ordinary deterministic suite covers the one-thread layout. Exercise the
-# same crowd API once with two outer threads while keeping BLAS single-threaded;
-# this is an oversubscription/lifetime guard, not a performance threshold.
-set(PSIFORMER_THREAD_TEST deterministic-unit_test_psiformer_crowd-t2)
-add_unit_test(${PSIFORMER_THREAD_TEST}
-              1 2
-              $<TARGET_FILE:test_wavefunction_trialwf>
-              "[psiformer][multiwalker]")
+# Keep the actual OpenMP shared-model regressions in a small dedicated binary.
+# Besides making the required two-thread execution unambiguous, this target is
+# suitable for focused -DENABLE_SANITIZER=tsan builds without running the broad
+# TrialWaveFunction suite.
+add_executable(test_psiformer_threading test_psiformer_threading.cpp)
+target_link_libraries(
+  test_psiformer_threading
+  catch_main
+  qmcwfs
+  platform_LA
+  platform_runtime
+  sposets_for_testing
+  utilities_for_test
+  container_testing
+  minimal_particle_pool
+  minimal_wavefunction_pool
+  IO::HDF5)
+if(USE_OBJECT_TARGET)
+  target_link_libraries(
+    test_psiformer_threading
+    qmcparticle
+    qmcparticle_omptarget
+    qmcwfs_omptarget
+    spline2
+    spline2_omptarget
+    qmcutil
+    platform_omptarget_LA)
+endif()
+
+set(PSIFORMER_THREAD_TEST deterministic-unit_test_psiformer_threading-t2)
+add_unit_test(${PSIFORMER_THREAD_TEST} 1 2 $<TARGET_FILE:test_psiformer_threading>)
 set_tests_properties(${PSIFORMER_THREAD_TEST} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 set_property(
   TEST ${PSIFORMER_THREAD_TEST}
   APPEND
   PROPERTY ENVIRONMENT
            "OPENBLAS_NUM_THREADS=1"
+           "GOTO_NUM_THREADS=1"
            "MKL_NUM_THREADS=1"
+           "MKL_DYNAMIC=FALSE"
            "BLIS_NUM_THREADS=1"
            "VECLIB_MAXIMUM_THREADS=1"
+           "ARMPL_NUM_THREADS=1"
+           "OMP_DYNAMIC=FALSE"
            "OMP_MAX_ACTIVE_LEVELS=1"
            "OMP_PROC_BIND=spread"
            "OMP_PLACES=cores")
