@@ -1053,6 +1053,42 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
   return diagnostics;
 }
 
+// Expose only opaque identities and numeric capacities needed by the
+// non-gating production-thread benchmark.  The read transaction binds every
+// model field in this snapshot to one published parameter version.
+testing::PsiFormerCrowdWorkspaceDiagnostics
+PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  const PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+
+  testing::PsiFormerCrowdWorkspaceDiagnostics diagnostics;
+  diagnostics.shared_model_identity      = &transaction.state();
+  diagnostics.resource_identity          = &resource;
+  diagnostics.batch_workspace_identity   = resource.batch_workspace.get();
+  diagnostics.score_workspace_identity   = resource.score_workspace.get();
+  diagnostics.kinetic_workspace_identity = resource.kinetic_workspace.get();
+  diagnostics.persistent_model_identity  = transaction.state().persistent_model_identity;
+  diagnostics.parameter_version          = transaction.parameterVersion();
+  diagnostics.batch_bytes                = resource.batch_workspace->vectorStorageBytes();
+  if (resource.score_workspace)
+    diagnostics.score_bytes = resource.score_workspace->vectorStorageBytes();
+  if (resource.kinetic_workspace)
+    diagnostics.kinetic_bytes = resource.kinetic_workspace->vectorStorageBytes();
+  diagnostics.transient_bytes =
+      resource.total_log_gradient.capacity() * sizeof(double) +
+      resource.active_electrons.capacity() * sizeof(std::size_t) +
+      resource.virtual_offsets.capacity() * sizeof(std::size_t) +
+      resource.walker_indices.capacity() * sizeof(std::size_t);
+  diagnostics.backend_modes = {
+      directBackendModeName(transaction.state().direct_value_mode),
+      directBackendModeName(transaction.state().direct_spatial_mode),
+      directBackendModeName(transaction.state().direct_score_mode),
+      directBackendModeName(transaction.state().direct_kinetic_mode)};
+  return diagnostics;
+}
+
 // Expose metadata identity and cardinalities without copying the shared vectors.
 testing::PsiFormerOptimizationMetadataDiagnostics
 PsiFormerWF::optimizationMetadataDiagnosticsForTesting() const

@@ -345,6 +345,35 @@ if(BUILD_MICRO_BENCHMARKS)
   endif()
   target_include_directories(benchmark_psiformer_memory PRIVATE "${qmcpack_SOURCE_DIR}/src")
 
+  # Production-shaped serial/outer-OpenMP crowd comparison.  It emits a
+  # self-describing manifest and is intentionally not registered with CTest:
+  # timing and RSS remain host diagnostics rather than regression thresholds.
+  add_executable(benchmark_psiformer_threading benchmark_psiformer_threading.cpp)
+  string(REPLACE ";" "|" PSIFORMER_BLAS_LIBRARIES_MANIFEST "${BLAS_LIBRARIES}")
+  target_compile_definitions(
+    benchmark_psiformer_threading
+    PRIVATE
+      PSIFORMER_VPL_ID_MANIFEST="${VPL_ID}"
+      PSIFORMER_BLA_VENDOR_MANIFEST="${BLA_VENDOR}"
+      PSIFORMER_BLAS_LIBRARIES_MANIFEST="${PSIFORMER_BLAS_LIBRARIES_MANIFEST}"
+      PSIFORMER_VPL_OMP_MANIFEST=$<BOOL:${VPL_OMP}>)
+  target_link_libraries(
+    benchmark_psiformer_threading
+    qmcwfs
+    IO::HDF5
+    platform_LA
+    platform_runtime
+    qmc_external_catch2)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      benchmark_psiformer_threading
+      qmcutil
+      qmcparticle
+      qmcparticle_omptarget
+      qmcwfs_omptarget)
+  endif()
+  target_include_directories(benchmark_psiformer_threading PRIVATE "${qmcpack_SOURCE_DIR}/src")
+
   # Native executor workspaces cannot share a target with qmcwfs because the
   # restricted PsiFormerNative implementation header is instantiated inside
   # PsiFormerWF.cpp.  Build the scalar scenarios separately and let the launcher

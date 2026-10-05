@@ -127,6 +127,28 @@ struct PsiFormerOptimizationMetadataDiagnostics
   std::size_t inherited_variable_count    = 0;
 };
 
+/** Describe one acquired crowd resource without exposing mutable workspace
+ * storage or implementation types. */
+struct PsiFormerCrowdWorkspaceDiagnostics
+{
+  const void* shared_model_identity      = nullptr;
+  const void* resource_identity          = nullptr;
+  const void* batch_workspace_identity   = nullptr;
+  const void* score_workspace_identity   = nullptr;
+  const void* kinetic_workspace_identity = nullptr;
+  std::uint64_t persistent_model_identity = 0;
+  std::size_t parameter_version           = 0;
+  std::size_t batch_bytes                 = 0;
+  std::size_t score_bytes                 = 0;
+  std::size_t kinetic_bytes               = 0;
+  std::size_t transient_bytes             = 0;
+  std::array<std::string, 4> backend_modes;
+
+  /// Return all explicitly accounted numeric storage owned by the resource.
+  std::size_t accountedBytes() const noexcept
+  { return batch_bytes + score_bytes + kinetic_bytes + transient_bytes; }
+};
+
 /// Test-only accessor for bounded crowd-workspace ownership diagnostics.
 class TestPsiFormerWF;
 }
@@ -554,6 +576,10 @@ private:
 
   /// Report clone-local evaluator ownership and explicitly reserved numeric bytes.
   testing::PsiFormerWorkspaceDiagnostics directWorkspaceDiagnosticsForTesting() const;
+
+  /// Report opaque identity and numeric capacity for one acquired crowd resource.
+  testing::PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnosticsForTesting(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
 
   /// Report shared optimizer metadata ownership and the empty inherited variable set.
   testing::PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnosticsForTesting() const;
