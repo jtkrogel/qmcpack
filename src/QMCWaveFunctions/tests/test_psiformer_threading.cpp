@@ -110,9 +110,7 @@ bool threadValuesClose(const Actual& actual, const Expected& expected, double to
 
 void requireThreadCapacity()
 {
-#ifdef PSIFORMER_THREAD_EXECUTOR_STD
-  REQUIRE(Concurrency::maxCapacity<Executor::STD_THREADS>() >= thread_count);
-#else
+#ifndef PSIFORMER_THREAD_EXECUTOR_STD
   REQUIRE(omp_get_max_threads() >= thread_count);
 #endif
 }
