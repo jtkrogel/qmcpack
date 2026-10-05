@@ -19,6 +19,7 @@
 
 #include "Configuration.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/VirtualParticleBatch.h"
 #include <ResourceHandle.h>
 #include "OMPTarget/OffloadAlignedAllocators.hpp"
 
@@ -97,6 +98,20 @@ public:
                  const std::vector<PosType>& deltaV,
                  bool sphere = false,
                  int iat     = -1);
+
+  /** Install exact absolute virtual positions and update distance tables.
+   *
+   * Unlike makeMoves(), this operation performs no displacement round trip.
+   * All arguments are validated before any VirtualParticleSet state changes.
+   * The position view must not alias this VirtualParticleSet's mutable storage;
+   * descriptor-owned caller storage is the intended source.  The reference
+   * ParticleSet must be distinct from this object and have the same spinor mode.
+   */
+  void makeMovesAbsolute(const ParticleSet& refp,
+                         int jel,
+                         VirtualParticleBatch::PositionView absolute_positions,
+                         bool sphere = false,
+                         int iat     = VirtualParticleBatch::NO_SOURCE);
 
   inline size_t getTotalNum() const { return TotalNum; }
   /**Extract list of Distance Tables

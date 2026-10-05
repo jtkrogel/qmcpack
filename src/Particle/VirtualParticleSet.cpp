@@ -16,6 +16,7 @@
  */
 
 #include "VirtualParticleSet.h"
+#include <memory>
 #include <numeric>
 #include "Configuration.h"
 #include "Particle/DistanceTable.h"
@@ -156,6 +157,46 @@ void VirtualParticleSet::makeMoves(const ParticleSet& refp,
   if (refp.isSpinor())
     for (size_t ivp = 0; ivp < R.size(); ivp++)
       spins[ivp] = refp.spins[jel]; //no spin deltas in this API
+  update();
+}
+
+void VirtualParticleSet::makeMovesAbsolute(const ParticleSet& refp,
+                                           int jel,
+                                           VirtualParticleBatch::PositionView absolute_positions,
+                                           bool sphere,
+                                           int iat)
+{
+  if (std::addressof(refp) == static_cast<const ParticleSet*>(this))
+    throw std::invalid_argument("VirtualParticleSet::makeMovesAbsolute cannot use itself as the reference set.");
+  if (absolute_positions.empty())
+    throw std::invalid_argument("VirtualParticleSet::makeMovesAbsolute requires at least one position.");
+  if (jel < 0 || static_cast<std::size_t>(jel) >= refp.getTotalNum())
+    throw std::invalid_argument("VirtualParticleSet::makeMovesAbsolute reference electron is out of range.");
+  if (isSpinor() != refp.isSpinor())
+    throw std::invalid_argument(
+        "VirtualParticleSet::makeMovesAbsolute reference and scratch spinor modes do not match.");
+  if (sphere && iat < 0)
+    throw std::invalid_argument(
+        "VirtualParticleSet::makeMovesAbsolute on-sphere positions require a source center.");
+  if (!sphere && iat != VirtualParticleBatch::NO_SOURCE)
+    throw std::invalid_argument(
+        "VirtualParticleSet::makeMovesAbsolute off-sphere positions must not specify a source center.");
+  for (const PosType& position : absolute_positions)
+    for (int idim = 0; idim < OHMMS_DIM; ++idim)
+      if (!virtual_particle_batch_detail::isFiniteReal(position[idim]))
+        throw std::invalid_argument("VirtualParticleSet::makeMovesAbsolute positions must be finite.");
+
+  resize(absolute_positions.size());
+  for (std::size_t ivp = 0; ivp < absolute_positions.size(); ++ivp)
+    R[ivp] = absolute_positions[ivp];
+  if (refp.isSpinor())
+    for (std::size_t ivp = 0; ivp < absolute_positions.size(); ++ivp)
+      spins[ivp] = refp.spins[jel];
+
+  onSphere      = sphere;
+  refPS         = refp;
+  refPtcl       = jel;
+  refSourcePtcl = iat;
   update();
 }
 

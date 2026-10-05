@@ -19,6 +19,7 @@ set(PARTICLE
     ParticleSet.cpp
     PSdispatcher.cpp
     VirtualParticleSet.cpp
+    VirtualParticleBatch.cpp
     ParticleSet.BC.cpp
     DynamicCoordinatesBuilder.cpp
     MCCoords.cpp
