@@ -292,6 +292,44 @@ if(BUILD_MICRO_BENCHMARKS)
                  ../PsiFormer/PsiFormerGeometry.cpp)
   target_link_libraries(benchmark_psiformer_modes IO::HDF5 platform_LA)
   target_include_directories(benchmark_psiformer_modes PRIVATE "${qmcpack_SOURCE_DIR}/src")
+
+  # Fresh-process memory attribution for the production component and native
+  # evaluator paths.  The companion launcher deliberately runs one scenario per
+  # process, and this target is not registered with CTest because RSS is a
+  # host/allocator-dependent diagnostic rather than a correctness threshold.
+  add_executable(benchmark_psiformer_memory benchmark_psiformer_memory.cpp)
+  target_compile_definitions(benchmark_psiformer_memory PRIVATE PSIFORMER_MEMORY_COMPONENT)
+  target_link_libraries(
+    benchmark_psiformer_memory
+    qmcwfs
+    IO::HDF5
+    platform_LA
+    platform_runtime
+    qmc_external_catch2)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      benchmark_psiformer_memory
+      qmcutil
+      qmcparticle
+      qmcparticle_omptarget
+      qmcwfs_omptarget)
+  endif()
+  target_include_directories(benchmark_psiformer_memory PRIVATE "${qmcpack_SOURCE_DIR}/src")
+
+  # Native executor workspaces cannot share a target with qmcwfs because the
+  # restricted PsiFormerNative implementation header is instantiated inside
+  # PsiFormerWF.cpp.  Build the scalar scenarios separately and let the launcher
+  # route each fresh process to its appropriate executable.
+  add_executable(benchmark_psiformer_native_memory
+                 benchmark_psiformer_memory.cpp
+                 ../PsiFormer/PsiFormerExecutionPlan.cpp
+                 ../PsiFormer/PsiFormerGeometry.cpp)
+  target_link_libraries(
+    benchmark_psiformer_native_memory
+    IO::HDF5
+    platform_LA
+    qmc_external_catch2)
+  target_include_directories(benchmark_psiformer_native_memory PRIVATE "${qmcpack_SOURCE_DIR}/src")
 endif()
 
 if(ENABLE_DEEPQMC_INFERENCE AND BUILD_MICRO_BENCHMARKS)
