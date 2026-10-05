@@ -12,12 +12,14 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "QMCDrivers/WFOpt/QMCCostFunctionBatched.h"
+#include "QMCDrivers/WFOpt/LegacyOptimizerMemory.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "FillData.h"
 // Input data and gold data for fillFromText test
 #include "diamond_fill_data.h"
 #include "Utilities/RuntimeOptions.h"
 
+#include <limits>
 
 namespace qmcplusplus
 {
@@ -103,13 +105,18 @@ public:
     getHDerivRecords().resize(numSamples, numParam);
   }
 
-  void set_psiformer_samples_and_param(int nsamples)
+  void set_samples_and_parameter_activity(int nsamples, int active_parameters, int inactive_parameters)
   {
     costFn.rank_local_num_samples_ = nsamples;
-    costFn.opt_vars.insert("pf_pf_0000000", 1.0);
-    costFn.opt_vars.insert("pf_pf_0000001", 2.0);
+    for (int parameter = 0; parameter < active_parameters; ++parameter)
+      costFn.opt_vars.insert("active_" + std::to_string(parameter), 1.0, true);
+    for (int parameter = 0; parameter < inactive_parameters; ++parameter)
+      costFn.opt_vars.insert("inactive_" + std::to_string(parameter), 1.0, false);
     costFn.opt_vars.resetIndex();
   }
+
+  std::size_t getStoredParameterCount() const { return costFn.opt_vars.size(); }
+  int getActiveParameterCount() const { return costFn.opt_vars.size_of_active(); }
 };
 
 } // namespace testing
@@ -138,11 +145,11 @@ TEST_CASE("Batched descent releases persistent derivative records", "[drivers][d
   CHECK(support.getHDerivRecords().cols() == 3);
 }
 
-TEST_CASE("PsiFormer persistent derivative storage is rejected before allocation", "[drivers][psiformer]")
+TEST_CASE("Legacy persistent derivative storage is rejected before allocation", "[drivers][optimization]")
 {
   Communicate* communicator = OHMMS::Controller;
   testing::LinearMethodTestSupport support({1}, communicator);
-  support.set_psiformer_samples_and_param(8);
+  support.set_samples_and_parameter_activity(8, 2, 0);
 
   NullEngineHandle stored_handle;
   CHECK_THROWS_WITH(support.validateDerivativeStorage(stored_handle, true, 1),
@@ -153,6 +160,54 @@ TEST_CASE("PsiFormer persistent derivative storage is rejected before allocation
   DescentEngine engine(communicator, document.getRoot());
   DescentEngineHandle streaming_handle(engine);
   CHECK_NOTHROW(support.validateDerivativeStorage(streaming_handle, true, 1));
+}
+
+TEST_CASE("Legacy derivative storage counts inactive stored variables", "[drivers][optimization]")
+{
+  Communicate* communicator = OHMMS::Controller;
+  testing::LinearMethodTestSupport support({1}, communicator);
+  support.set_samples_and_parameter_activity(1, 1, 2);
+
+  REQUIRE(support.getActiveParameterCount() == 1);
+  REQUIRE(support.getStoredParameterCount() == 3);
+
+  // A limit for two columns would pass if the estimate incorrectly used only
+  // the active count.  The actual matrices retain all three stored columns.
+  constexpr std::size_t bytes_per_column = sizeof(QMCTraits::ValueType) + sizeof(QMCTraits::RealType);
+  NullEngineHandle stored_handle;
+  CHECK_THROWS_WITH(support.validateDerivativeStorage(stored_handle, true, 2 * bytes_per_column),
+                    Catch::Matchers::ContainsSubstring("persistent samples-by-parameters"));
+}
+
+TEST_CASE("Legacy optimizer estimates reject small-sample high-parameter dense storage",
+          "[drivers][optimization]")
+{
+  constexpr std::size_t samples         = 1;
+  constexpr std::size_t stored_params   = 20'000;
+  constexpr std::size_t dense_matrices  = 4;
+  constexpr std::size_t value_size      = sizeof(QMCTraits::ValueType);
+  constexpr std::size_t real_value_size = sizeof(QMCTraits::RealType);
+
+  const std::size_t derivative_bytes = optimizer_memory::estimateDerivativeStorageBytes(
+      samples, stored_params, true, true, value_size, real_value_size);
+  const std::size_t dense_bytes =
+      optimizer_memory::estimateDenseMatrixStorageBytes(stored_params, dense_matrices, value_size);
+
+  CHECK(derivative_bytes == stored_params * (value_size + real_value_size));
+  CHECK(dense_bytes > optimizer_memory::default_safe_byte_limit);
+  CHECK_THROWS_WITH(
+      optimizer_memory::validateDenseMatrixStorage(stored_params, dense_matrices, value_size),
+      Catch::Matchers::ContainsSubstring("parameter-quadratic matrices"));
+
+  CHECK_THROWS_AS(optimizer_memory::estimateDerivativeStorageBytes(
+                      std::numeric_limits<std::size_t>::max(), 2, true, false, value_size, real_value_size),
+                  std::overflow_error);
+  CHECK_THROWS_AS(optimizer_memory::estimateDenseMatrixStorageBytes(
+                      std::numeric_limits<std::size_t>::max(), dense_matrices, value_size),
+                  std::overflow_error);
+  CHECK(optimizer_memory::estimateDerivativeStorageBytes(std::numeric_limits<std::size_t>::max(),
+                                                         std::numeric_limits<std::size_t>::max(), false, false,
+                                                         value_size, real_value_size) == 0);
 }
 
 TEST_CASE("fillOverlapAndHamiltonianMatrices", "[drivers]")

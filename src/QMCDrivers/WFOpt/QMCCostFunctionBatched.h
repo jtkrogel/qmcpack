@@ -70,10 +70,10 @@ protected:
   void prepareDerivativeStorage(const EngineHandle::SamplingRequirements& requirements,
                                 bool include_energy_derivatives);
 
-  /// Reject unsafe persistent PsiFormer score matrices before allocating them.
+  /// Reject unsafe persistent legacy derivative matrices before allocating them.
   void validateDerivativeStorage(const EngineHandle::SamplingRequirements& requirements,
                                  bool include_energy_derivatives,
-                                 std::size_t safe_byte_limit = std::size_t{2} * 1024 * 1024 * 1024) const;
+                                 std::size_t safe_byte_limit) const;
 
 
   Matrix<Return_rt> RecordsOnNode_;

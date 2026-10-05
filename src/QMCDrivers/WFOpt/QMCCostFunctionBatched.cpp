@@ -18,13 +18,13 @@
 
 #include "QMCCostFunctionBatched.h"
 #include "QMCDrivers/WFOpt/CostFunctionCrowdData.h"
+#include "QMCDrivers/WFOpt/LegacyOptimizerMemory.h"
 #include "Particle/MCWalkerConfiguration.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Message/CommOperators.h"
 #include "QMCDrivers/Optimizers/DescentEngine.h"
 #include "Concurrency/ParallelExecutor.hpp"
 
-#include <limits>
 //#define QMCCOSTFUNCTION_DEBUG
 
 namespace qmcplusplus
@@ -225,7 +225,8 @@ void compute_batch_parameters(int sample_size, int batch_size, int& num_batches,
 void QMCCostFunctionBatched::prepareDerivativeStorage(const EngineHandle::SamplingRequirements& requirements,
                                                       bool include_energy_derivatives)
 {
-  validateDerivativeStorage(requirements, include_energy_derivatives);
+  validateDerivativeStorage(requirements, include_energy_derivatives,
+                            optimizer_memory::default_safe_byte_limit);
   const std::size_t num_opt_vars = opt_vars.size();
   const bool persist_log_derivatives =
       needGrads && requirements.needs_log_derivatives && requirements.persists_log_derivatives;
@@ -243,41 +244,34 @@ void QMCCostFunctionBatched::prepareDerivativeStorage(const EngineHandle::Sampli
     HDerivRecords_.free();
 }
 
-// Estimate and bound legacy samples-by-parameters storage for neural-network optimization.
+// Estimate and bound legacy samples-by-parameters storage before allocating it.
 void QMCCostFunctionBatched::validateDerivativeStorage(const EngineHandle::SamplingRequirements& requirements,
                                                        bool include_energy_derivatives,
                                                        std::size_t safe_byte_limit) const
 {
-  std::size_t psiformer_parameters = 0;
-  for (int parameter = 0; parameter < opt_vars.size(); ++parameter)
-    if (opt_vars.where(parameter) >= 0 && opt_vars.name(parameter).find("_pf_") != std::string::npos)
-      ++psiformer_parameters;
-  if (psiformer_parameters == 0 || !needGrads)
+  if (!needGrads)
     return;
 
   const bool stores_log = requirements.needs_log_derivatives && requirements.persists_log_derivatives;
   const bool stores_energy = include_energy_derivatives && requirements.needs_energy_derivatives &&
       requirements.persists_energy_derivatives;
-  const std::size_t bytes_per_element =
-      (stores_log ? sizeof(Return_t) : 0) + (stores_energy ? sizeof(Return_rt) : 0);
   const std::size_t samples = static_cast<std::size_t>(std::max(rank_local_num_samples_, 0));
-  const std::size_t variables = static_cast<std::size_t>(opt_vars.size_of_active());
-  if (bytes_per_element != 0 &&
-      (variables > std::numeric_limits<std::size_t>::max() / bytes_per_element ||
-       samples > std::numeric_limits<std::size_t>::max() / (variables * bytes_per_element)))
-    throw std::runtime_error("PsiFormer persistent derivative-storage estimate overflowed size_t");
-  const std::size_t estimated_bytes = samples * variables * bytes_per_element;
+  // DerivRecords_ and HDerivRecords_ use opt_vars.size() as their column
+  // dimension.  Inactive stored variables therefore still consume columns.
+  const std::size_t stored_parameters = opt_vars.size();
+  const std::size_t estimated_bytes = optimizer_memory::estimateDerivativeStorageBytes(
+      samples, stored_parameters, stores_log, stores_energy, sizeof(Return_t), sizeof(Return_rt));
 
-  app_log() << "  PsiFormer optimizer derivative buffers: active_parameters=" << variables
+  app_log() << "  Legacy optimizer derivative buffers: stored_parameters=" << stored_parameters
             << ", rank_local_samples=" << samples << ", persistent_bytes=" << estimated_bytes
             << (requirements.consumes_batches_online ? ", mode=streaming" : ", mode=stored") << std::endl;
   if (estimated_bytes > safe_byte_limit)
   {
     std::ostringstream message;
-    message << "PsiFormer optimizer would allocate approximately " << estimated_bytes / (1024.0 * 1024.0 * 1024.0)
+    message << "Legacy optimizer would allocate approximately " << estimated_bytes / (1024.0 * 1024.0 * 1024.0)
             << " GiB per rank in persistent samples-by-parameters derivative storage, exceeding the "
             << safe_byte_limit / (1024.0 * 1024.0 * 1024.0)
-            << " GiB safety limit. Use method=descent with its streaming EngineHandle, reduce the active parameter "
+            << " GiB safety limit. Use method=descent with its streaming EngineHandle, reduce the stored parameter "
                "selection/sample count, or explicitly redesign the optimizer storage path.";
     throw std::runtime_error(message.str());
   }

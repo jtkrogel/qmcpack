@@ -23,6 +23,7 @@
 #include "QMCDrivers/WFOpt/QMCCostFunctionBase.h"
 #include "QMCDrivers/WFOpt/QMCCostFunctionBatched.h"
 #include "QMCDrivers/WFOpt/GradientTest.h"
+#include "QMCDrivers/WFOpt/LegacyOptimizerMemory.h"
 #include "QMCDrivers/VMC/VMCBatched.h"
 #include "QMCDrivers/WFOpt/QMCCostFunction.h"
 #include "QMCDrivers/WFOpt/ConjugateGradient.h"
@@ -47,6 +48,37 @@
 namespace qmcplusplus
 {
 using MatrixOperators::product;
+
+namespace
+{
+/// Return the peak number of full square matrices constructed by each legacy method.
+std::size_t getDenseMatrixCount(OptimizerType optimizer_type)
+{
+  switch (optimizer_type)
+  {
+  case OptimizerType::ADAPTIVE:
+  case OptimizerType::HYBRID:
+    return 5;
+  case OptimizerType::NONE:
+  case OptimizerType::QUARTIC:
+  case OptimizerType::RESCALE:
+  case OptimizerType::LINEMIN:
+  case OptimizerType::ONESHIFTONLY:
+    return 4;
+  case OptimizerType::GRADIENT_TEST:
+  case OptimizerType::STOCHASTIC_RECONFIGURATION_CG:
+    return 0;
+  case OptimizerType::DESCENT:
+#ifdef HAVE_LMY_ENGINE
+    return 0;
+#else
+    // Without the external engine this value follows the legacy fallback.
+    return 4;
+#endif
+  }
+  throw std::logic_error("Unknown optimizer type in dense-memory preflight");
+}
+} // namespace
 
 
 QMCFixedSampleLinearOptimizeBatched::QMCFixedSampleLinearOptimizeBatched(
@@ -236,6 +268,16 @@ void QMCFixedSampleLinearOptimizeBatched::generateSamples()
 
 void QMCFixedSampleLinearOptimizeBatched::run()
 {
+  // Reject an impossible parameter-quadratic request before sampling or any
+  // dense matrix constructor can consume the rank's memory.
+  if (!doGradientTest)
+  {
+    const std::size_t matrix_count = getDenseMatrixCount(options_LMY_.current_optimizer_type);
+    if (matrix_count != 0)
+      optimizer_memory::validateDenseMatrixStorage(optTarget->getNumParams(), matrix_count,
+                                                   sizeof(QMCTraits::ValueType));
+  }
+
   if (do_output_matrices_csv_ && !output_matrices_initialized_)
   {
     const int numParams = optTarget->getNumParams();
