@@ -62,6 +62,23 @@ void PSdispatcher::flex_accept_rejectMoveAllParticles(const RefVectorWithLeader<
   ParticleSet::mw_accept_rejectMoveAllParticles(p_list, accepted);
 }
 
+void PSdispatcher::flex_makeMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                                  const MCMultiParticleMoves<CoordsType::POS>& moves,
+                                                  std::vector<bool>& are_valid) const
+{
+  if (!use_batch_)
+    throw std::runtime_error("Selected-particle ParticleSet transactions require batched execution.");
+  ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, are_valid);
+}
+
+void PSdispatcher::flex_accept_rejectMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                                           const std::vector<bool>& accepted) const
+{
+  if (!use_batch_)
+    throw std::runtime_error("Selected-particle ParticleSet transactions require batched execution.");
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, accepted);
+}
+
 template<CoordsType CT>
 void PSdispatcher::flex_makeMove(const RefVectorWithLeader<ParticleSet>& p_list,
                                  int iat,

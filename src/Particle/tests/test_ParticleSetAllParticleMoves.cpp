@@ -4,6 +4,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -213,6 +214,10 @@ TEST_CASE("ParticleSet all-particle dispatcher rejects unbatched execution", "[p
 
   REQUIRE_THROWS_AS(dispatcher.flex_makeMoveAllParticles(p_list, displacements, valid), std::runtime_error);
   REQUIRE_THROWS_AS(dispatcher.flex_accept_rejectMoveAllParticles(p_list, {true}), std::runtime_error);
+
+  MCMultiParticleMoves<CoordsType::POS> selected_moves({0, 1}, {0}, {{0.6, 0.5, 0.5}});
+  REQUIRE_THROWS_AS(dispatcher.flex_makeMoveSelectedParticles(p_list, selected_moves, valid), std::runtime_error);
+  REQUIRE_THROWS_AS(dispatcher.flex_accept_rejectMoveSelectedParticles(p_list, {true}), std::runtime_error);
 }
 
 TEST_CASE("ParticleSet all-particle POS_SPIN rejection restores the pre-proposal state", "[particle]")
@@ -386,7 +391,6 @@ TEST_CASE("ParticleSet all-particle moves filter boundary-invalid particles inde
   checkPosition(pset, 1, walker.R[1]);
 }
 
-#ifndef NDEBUG
 TEST_CASE("ParticleSet all-particle moves reject malformed and active transactions", "[particle]")
 {
   const SimulationCell cell = makeOpenCell();
@@ -444,6 +448,209 @@ TEST_CASE("ParticleSet batched all-particle move rejects mismatched crowd topolo
   checkPosition(p1, 0, w1.R[0]);
   checkPosition(p1, 1, w1.R[1]);
 }
-#endif
+
+TEST_CASE("MCMultiParticleMoves validates CSR structure and fingerprints exact content", "[particle]")
+{
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  const std::vector<std::size_t> offsets{0, 2, 3};
+  const std::vector<ParticleSet::Index_t> indices{0, 2, 1};
+  const std::vector<ParticleSet::PosType> positions{{0.6, 0.5, 0.5}, {1.7, 0.5, 0.5}, {0.5, 0.8, 0.5}};
+  const Moves moves(offsets, indices, positions);
+  const Moves equivalent(offsets, indices, positions);
+
+  CHECK(moves.walkerCount() == 2);
+  CHECK(moves.size() == 3);
+  CHECK(moves.walkerOffsets() == offsets);
+  CHECK(moves.particleIndices() == indices);
+  CHECK(moves.proposedPositions() == positions);
+  CHECK(moves.fingerprint() == equivalent.fingerprint());
+  CHECK(moves.slice(0).size() == 2);
+  CHECK(moves.slice(0).flatOffset() == 0);
+  CHECK(moves.slice(0).particleIndex(1) == 2);
+  CHECK(moves.slice(1).proposedPosition(0) == positions[2]);
+  REQUIRE_THROWS_AS(moves.slice(2), std::out_of_range);
+  REQUIRE_THROWS_AS(moves.slice(0).particleIndex(2), std::out_of_range);
+
+  auto changed_positions = positions;
+  changed_positions[0][0] += 0.125;
+  CHECK(Moves(offsets, indices, changed_positions).fingerprint() != moves.fingerprint());
+
+  REQUIRE_THROWS_AS(Moves({}, {}, {}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({1, 2}, {0, 1}, {positions[0], positions[1]}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({0, 2, 1}, {0}, {positions[0]}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({0, 1}, {0, 1}, {positions[0], positions[1]}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({0, 0}, {}, {}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({0, 2}, {0, 0}, {positions[0], positions[1]}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({0, 2}, {1, 0}, {positions[0], positions[1]}), std::invalid_argument);
+  REQUIRE_THROWS_AS(Moves({0, 1}, {-1}, {positions[0]}), std::invalid_argument);
+
+  auto nonfinite_positions = std::vector<ParticleSet::PosType>{positions[0]};
+  nonfinite_positions[0][1] = std::numeric_limits<ParticleSet::RealType>::infinity();
+  REQUIRE_THROWS_AS(Moves({0, 1}, {0}, nonfinite_positions), std::invalid_argument);
+}
+
+TEST_CASE("MCMultiParticleMoves validates crowd-dependent shape and bounds", "[particle]")
+{
+  const SimulationCell cell = makeOpenCell();
+  ParticleSet p0(cell);
+  p0.create({3});
+  ParticleSet p1(p0);
+  RefVectorWithLeader<ParticleSet> p_list(p0, {p0, p1});
+
+  MCMultiParticleMoves<CoordsType::POS> valid({0, 2, 3}, {0, 2, 1},
+                                              {{0.6, 0.5, 0.5}, {1.7, 0.5, 0.5}, {0.5, 0.8, 0.5}});
+  CHECK_NOTHROW(valid.validateFor(p_list));
+
+  RefVectorWithLeader<ParticleSet> one_walker(p0, {p0});
+  REQUIRE_THROWS_AS(valid.validateFor(one_walker), std::invalid_argument);
+  MCMultiParticleMoves<CoordsType::POS> out_of_range({0, 1, 2}, {0, 3},
+                                                     {{0.6, 0.5, 0.5}, {0.5, 0.8, 0.5}});
+  REQUIRE_THROWS_AS(out_of_range.validateFor(p_list), std::invalid_argument);
+
+  ParticleSet p_short(cell);
+  p_short.create({2});
+  RefVectorWithLeader<ParticleSet> mismatched_particles(p0, {p0, p_short});
+  REQUIRE_THROWS_AS(valid.validateFor(mismatched_particles), std::invalid_argument);
+
+  RefVectorWithLeader<ParticleSet> empty_crowd(p0);
+  MCMultiParticleMoves<CoordsType::POS> empty_moves({0}, {}, {});
+  REQUIRE_THROWS_AS(empty_moves.validateFor(empty_crowd), std::invalid_argument);
+}
+
+TEST_CASE("ParticleSet selected-particle moves support ragged atomic crowd transactions", "[particle]")
+{
+  for (const DynamicCoordinateKind kind : {DynamicCoordinateKind::DC_POS, DynamicCoordinateKind::DC_POS_OFFLOAD})
+  {
+    const SimulationCell cell = makeOpenCell();
+    ParticleSet ions(cell);
+    ions.setName("ion");
+    ions.create({2});
+    ions.R[0] = {1.0, 1.0, 1.0};
+    ions.R[1] = {3.0, 3.0, 3.0};
+    ions.update();
+
+    ParticleSet p0(cell, kind);
+    p0.setName("e");
+    p0.create({3});
+    p0.R[0]         = {0.5, 0.5, 0.5};
+    p0.R[1]         = {1.0, 0.8, 0.5};
+    p0.R[2]         = {1.5, 1.0, 0.5};
+    const int ab_id = p0.addTable(ions);
+    const int aa_id = p0.addTable(p0);
+    p0.update();
+    ParticleSet p1(p0);
+
+    ParticleSet::Walker_t w0(3);
+    ParticleSet::Walker_t w1(3);
+    p0.saveWalker(w0);
+    p1.saveWalker(w1);
+    RefVectorWithLeader<ParticleSet> p_list(p0, {p0, p1});
+    ResourceCollection resources("selected_particle_move_resources");
+    p0.createResource(resources);
+    ResourceCollectionTeamLock<ParticleSet> lock(resources, p_list);
+    PSdispatcher dispatcher(/*use_batch=*/true);
+
+    // Walker 0 selects particles 0 and 2; walker 1 independently selects particle 1.
+    MCMultiParticleMoves<CoordsType::POS> moves(
+        {0, 2, 3}, {0, 2, 1}, {{0.7, 0.5, 0.5}, {1.5, -0.2, 0.5}, {1.0, 1.1, 0.5}});
+    std::vector<bool> valid(3);
+    dispatcher.flex_makeMoveSelectedParticles(p_list, moves, valid);
+
+    CHECK(valid == std::vector<bool>{true, false, true});
+    checkPosition(p0, 0, {0.7, 0.5, 0.5});
+    checkPosition(p0, 1, w0.R[1]);
+    checkPosition(p0, 2, w0.R[2]);
+    checkPosition(p1, 0, w1.R[0]);
+    checkPosition(p1, 1, {1.0, 1.1, 0.5});
+    checkPosition(p1, 2, w1.R[2]);
+    checkDistances(p0, aa_id, ab_id, ions);
+    checkDistances(p1, aa_id, ab_id, ions);
+
+    dispatcher.flex_accept_rejectMoveSelectedParticles(p_list, {true, false});
+    checkPosition(p0, 0, {0.7, 0.5, 0.5});
+    checkPosition(p0, 1, w0.R[1]);
+    checkPosition(p0, 2, w0.R[2]);
+    for (int ip = 0; ip < 3; ++ip)
+      checkPosition(p1, ip, w1.R[ip]);
+    checkDistances(p0, aa_id, ab_id, ions);
+    checkDistances(p1, aa_id, ab_id, ions);
+  }
+}
+
+TEST_CASE("ParticleSet selected-particle transactions enforce masks nesting and crowd identity", "[particle]")
+{
+  const SimulationCell cell = makeOpenCell();
+  ParticleSet p0(cell);
+  p0.create({2});
+  p0.R[0] = {0.5, 0.5, 0.5};
+  p0.R[1] = {1.5, 0.5, 0.5};
+  p0.update();
+  ParticleSet p1(p0);
+  RefVectorWithLeader<ParticleSet> p_list(p0, {p0, p1});
+  ResourceCollection resources("selected_particle_guard_resources");
+  p0.createResource(resources);
+  ResourceCollectionTeamLock<ParticleSet> lock(resources, p_list);
+
+  MCMultiParticleMoves<CoordsType::POS> moves({0, 1, 2}, {0, 1},
+                                              {{0.6, 0.5, 0.5}, {1.5, 0.7, 0.5}});
+  std::vector<bool> wrong_validity(1);
+  ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, wrong_validity);
+  CHECK(wrong_validity.size() == moves.size());
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {false, false});
+  REQUIRE_THROWS_AS(ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {true, true}), std::runtime_error);
+
+  std::vector<bool> validity(2);
+  ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, validity);
+  CHECK_THROWS_AS(ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, validity), std::runtime_error);
+  CHECK_THROWS_AS(ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {true}), std::runtime_error);
+  CHECK_THROWS_AS(ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {true, true, true}),
+                  std::runtime_error);
+
+  RefVectorWithLeader<ParticleSet> reordered(p0, {p1, p0});
+  CHECK_THROWS_AS(ParticleSet::mw_accept_rejectMoveSelectedParticles(reordered, {true, true}), std::runtime_error);
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {false, false});
+
+  p0.makeMove(0, {0.1, 0.0, 0.0});
+  REQUIRE_THROWS_AS(ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, validity), std::runtime_error);
+  p0.rejectMove(0);
+}
+
+TEST_CASE("ParticleSet selected-particle transaction blocks premature resource release", "[particle]")
+{
+  const SimulationCell cell = makeOpenCell();
+  ParticleSet pset(cell);
+  pset.create({1});
+  pset.R[0] = {0.5, 0.5, 0.5};
+  pset.update();
+  RefVectorWithLeader<ParticleSet> p_list(pset, {pset});
+  ResourceCollection resources("selected_particle_release_resources");
+  pset.createResource(resources);
+  ParticleSet::acquireResource(resources, p_list);
+
+  MCMultiParticleMoves<CoordsType::POS> moves({0, 1}, {0}, {{0.7, 0.5, 0.5}});
+  std::vector<bool> valid(1);
+  ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, valid);
+  resources.rewind();
+  REQUIRE_THROWS_AS(ParticleSet::releaseResource(resources, p_list), std::runtime_error);
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {false});
+  resources.rewind();
+  CHECK_NOTHROW(ParticleSet::releaseResource(resources, p_list));
+  REQUIRE_THROWS_AS(ParticleSet::releaseResource(resources, p_list), std::runtime_error);
+}
+
+TEST_CASE("ParticleSet selected-particle moves require acquired resources", "[particle]")
+{
+  const SimulationCell cell = makeOpenCell();
+  ParticleSet pset(cell);
+  pset.create({1});
+  pset.R[0] = {0.5, 0.5, 0.5};
+  pset.update();
+  RefVectorWithLeader<ParticleSet> p_list(pset, {pset});
+  MCMultiParticleMoves<CoordsType::POS> moves({0, 1}, {0}, {{0.7, 0.5, 0.5}});
+  std::vector<bool> valid(1);
+
+  REQUIRE_THROWS_AS(ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, valid), std::runtime_error);
+  REQUIRE_THROWS_AS(ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {true}), std::runtime_error);
+}
 
 } // namespace qmcplusplus

@@ -59,6 +59,15 @@ public:
   void flex_accept_rejectMoveAllParticles(const RefVectorWithLeader<ParticleSet>& p_list,
                                           const std::vector<bool>& accepted) const;
 
+  /** Pass an atomic selected-particle proposal directly to the multiwalker implementation. */
+  void flex_makeMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                      const MCMultiParticleMoves<CoordsType::POS>& moves,
+                                      std::vector<bool>& are_valid) const;
+
+  /** Resolve one pending selected-particle proposal per walker. */
+  void flex_accept_rejectMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                               const std::vector<bool>& accepted) const;
+
   template<CoordsType CT>
   void flex_makeMove(const RefVectorWithLeader<ParticleSet>& p_list,
                      int iat,

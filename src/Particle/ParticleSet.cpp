@@ -20,9 +20,7 @@
 #include <numeric>
 #include <iomanip>
 #include <stdexcept>
-#ifndef NDEBUG
 #include <typeinfo>
-#endif
 #include "ParticleSet.h"
 #include "Particle/DynamicCoordinatesBuilder.h"
 #include "Particle/DistanceTable.h"
@@ -46,10 +44,7 @@ enum PSetTimers
   PS_update
 };
 
-/** Reusable crowd scratch for ParticleSet multiwalker operations.
- *
- * Proposal and rollback storage use the same particle-major layout as all-particle displacements.
- */
+/** Reusable crowd scratch for ParticleSet multiwalker operations. */
 struct ParticleSetMultiWalkerMem : public Resource
 {
   /// Proposed positions, flattened in particle-major order as particle * number of walkers + walker.
@@ -60,10 +55,14 @@ struct ParticleSetMultiWalkerMem : public Resource
   ParticleSet::ParticlePos saved_positions;
   /// Spins to restore for rejected walkers, flattened in the same particle-major order.
   ParticleSet::ParticleScalar saved_spins;
-  /// Per-walker mask identifying walkers whose all-particle proposals were rejected.
+  /// Per-walker mask identifying walkers whose atomic multi-particle proposals were rejected.
   std::vector<bool> rejected;
-  /// Whether an all-particle proposal is pending acceptance or rejection.
-  bool all_particle_move_active = false;
+  /// ParticleSet identity and ordering used by the currently acquired resource.
+  std::vector<const ParticleSet*> resource_particles;
+  /// ParticleSet identity and ordering captured by the pending transaction.
+  std::vector<const ParticleSet*> transaction_particles;
+  /// Whether a selected- or all-particle proposal is pending acceptance or rejection.
+  bool multi_particle_move_active = false;
 
   ParticleSetMultiWalkerMem() : Resource("ParticleSetMultiWalkerMem") {}
 
@@ -467,9 +466,11 @@ void ParticleSet::mw_makeSpinMove(const RefVectorWithLeader<ParticleSet>& p_list
 
 namespace
 {
-#ifndef NDEBUG
-void validateAllParticleCrowdTopology(const RefVectorWithLeader<ParticleSet>& p_list)
+void validateMultiParticleCrowdTopology(const RefVectorWithLeader<ParticleSet>& p_list)
 {
+  if (p_list.empty())
+    throw std::runtime_error("Multi-particle transaction crowd must not be empty.");
+
   const ParticleSet& leader        = p_list.getLeader();
   const size_t num_particles       = leader.getTotalNum();
   const size_t num_distance_tables = leader.getNumDistTables();
@@ -479,21 +480,53 @@ void validateAllParticleCrowdTopology(const RefVectorWithLeader<ParticleSet>& p_
   {
     if (pset.getCoordinates().getKind() != coordinate_kind || pset.hasSK() != has_structure_factor ||
         pset.getNumDistTables() != num_distance_tables || pset.getTotalNum() != num_particles)
-      throw std::runtime_error("All-particle transaction crowd topology does not match the resource leader.");
+      throw std::runtime_error("Multi-particle transaction crowd topology does not match the resource leader.");
     for (size_t idt = 0; idt < num_distance_tables; ++idt)
     {
       const DistanceTable& leader_dt = leader.getDistTable(idt);
       const DistanceTable& walker_dt = pset.getDistTable(idt);
       if (typeid(walker_dt) != typeid(leader_dt))
-        throw std::runtime_error("All-particle transaction distance-table types do not match.");
+        throw std::runtime_error("Multi-particle transaction distance-table types do not match.");
       if (walker_dt.sources() != leader_dt.sources())
-        throw std::runtime_error("All-particle transaction distance-table source dimensions do not match.");
+        throw std::runtime_error("Multi-particle transaction distance-table source dimensions do not match.");
       if (walker_dt.getModes() != leader_dt.getModes())
-        throw std::runtime_error("All-particle transaction distance-table modes do not match.");
+        throw std::runtime_error("Multi-particle transaction distance-table modes do not match.");
     }
   }
 }
-#endif
+
+void validateMultiParticleCrowdState(const RefVectorWithLeader<ParticleSet>& p_list)
+{
+  const std::size_t num_particles = p_list.getLeader().getTotalNum();
+  for (const ParticleSet& pset : p_list)
+  {
+    if (pset.getActivePtcl() != -1)
+      throw std::runtime_error("Cannot operate on a multi-particle transaction with an active particle.");
+    if (pset.spins.size() != num_particles)
+      throw std::runtime_error("Multi-particle transaction spin counts do not match.");
+  }
+}
+
+void recordParticleSetIdentities(const RefVectorWithLeader<ParticleSet>& p_list,
+                                 std::vector<const ParticleSet*>& identities)
+{
+  identities.clear();
+  identities.reserve(p_list.size());
+  for (const ParticleSet& pset : p_list)
+    identities.push_back(&pset);
+}
+
+void validateParticleSetIdentities(const RefVectorWithLeader<ParticleSet>& p_list,
+                                   const std::vector<const ParticleSet*>& identities,
+                                   const char* operation)
+{
+  if (identities.size() != p_list.size())
+    throw std::runtime_error(std::string("Multi-particle transaction crowd changed before ") + operation + '.');
+  for (std::size_t iw = 0; iw < p_list.size(); ++iw)
+    if (identities[iw] != &p_list[iw])
+      throw std::runtime_error(std::string("Multi-particle transaction crowd ordering changed before ") + operation +
+                               '.');
+}
 } // namespace
 
 template<CoordsType CT>
@@ -502,11 +535,12 @@ void ParticleSet::mw_makeMoveAllParticles(const RefVectorWithLeader<ParticleSet>
                                           std::vector<bool>& are_valid)
 {
   const size_t num_walkers = p_list.size();
-  assert(num_walkers > 0 && "All-particle transaction crowd must not be empty.");
+  if (num_walkers == 0)
+    throw std::runtime_error("All-particle transaction crowd must not be empty.");
   ParticleSet& p_leader      = p_list.getLeader();
   const size_t num_particles = p_leader.getTotalNum();
-#ifndef NDEBUG
-  validateAllParticleCrowdTopology(p_list);
+  validateMultiParticleCrowdTopology(p_list);
+  validateMultiParticleCrowdState(p_list);
 
   if (displacements.positions.size() != num_particles * num_walkers)
     throw std::runtime_error("Flattened all-particle displacement count does not match the crowd.");
@@ -516,18 +550,39 @@ void ParticleSet::mw_makeMoveAllParticles(const RefVectorWithLeader<ParticleSet>
     if (displacements.spins.size() != num_particles * num_walkers)
       throw std::runtime_error("Flattened all-particle spin displacement count does not match the crowd.");
 
-  for (size_t iw = 0; iw < num_walkers; ++iw)
+  if (!p_leader.mw_mem_handle_)
+    throw std::runtime_error("All-particle transaction requires an acquired ParticleSet crowd resource.");
+
+  if constexpr (CT == CoordsType::POS)
   {
-    if (p_list[iw].getActivePtcl() != -1)
-      throw std::runtime_error("Cannot start an all-particle transaction with an active particle.");
-    if constexpr (CT == CoordsType::POS_SPIN)
-      if (p_list[iw].spins.size() != num_particles)
-        throw std::runtime_error("All-particle transaction spin counts do not match.");
+    std::vector<std::size_t> walker_offsets(num_walkers + 1);
+    std::vector<IndexType> particle_indices(num_particles * num_walkers);
+    std::vector<PosType> proposed_positions(num_particles * num_walkers);
+    for (std::size_t iw = 0; iw < num_walkers; ++iw)
+    {
+      walker_offsets[iw] = iw * num_particles;
+      for (std::size_t ip = 0; ip < num_particles; ++ip)
+      {
+        const std::size_t selected_index = iw * num_particles + ip;
+        const std::size_t all_index      = ip * num_walkers + iw;
+        particle_indices[selected_index] = static_cast<IndexType>(ip);
+        proposed_positions[selected_index] = p_list[iw].R[ip] + displacements.positions[all_index];
+      }
+    }
+    walker_offsets[num_walkers] = num_particles * num_walkers;
+
+    MCMultiParticleMoves<CoordsType::POS> moves(std::move(walker_offsets), std::move(particle_indices),
+                                                std::move(proposed_positions));
+    std::vector<bool> selected_validity(moves.size());
+    mw_makeMoveSelectedParticles(p_list, moves, selected_validity);
+    for (std::size_t iw = 0; iw < num_walkers; ++iw)
+      for (std::size_t ip = 0; ip < num_particles; ++ip)
+        are_valid[ip * num_walkers + iw] = selected_validity[iw * num_particles + ip];
+    return;
   }
-#endif
 
   ParticleSetMultiWalkerMem& mw_mem = p_leader.mw_mem_handle_.getResource();
-  if (mw_mem.all_particle_move_active)
+  if (mw_mem.multi_particle_move_active)
     throw std::runtime_error("Cannot start an all-particle transaction before resolving the previous one.");
 
   ParticlePos& proposed_positions = mw_mem.proposed_positions;
@@ -556,6 +611,9 @@ void ParticleSet::mw_makeMoveAllParticles(const RefVectorWithLeader<ParticleSet>
     }
   }
 
+  recordParticleSetIdentities(p_list, mw_mem.transaction_particles);
+  mw_mem.multi_particle_move_active = true;
+
   for (size_t iw = 0; iw < num_walkers; ++iw)
     for (size_t ip = 0; ip < num_particles; ++ip)
     {
@@ -578,7 +636,72 @@ void ParticleSet::mw_makeMoveAllParticles(const RefVectorWithLeader<ParticleSet>
   }
   for (ParticleSet& pset : p_list)
     pset.active_ptcl_ = -1;
-  mw_mem.all_particle_move_active = true;
+}
+
+void ParticleSet::mw_makeMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                               const MCMultiParticleMoves<CoordsType::POS>& moves,
+                                               std::vector<bool>& are_valid)
+{
+  validateMultiParticleCrowdTopology(p_list);
+  validateMultiParticleCrowdState(p_list);
+  moves.validateFor(p_list);
+
+  ParticleSet& p_leader = p_list.getLeader();
+  if (!p_leader.mw_mem_handle_)
+    throw std::runtime_error("Selected-particle transaction requires an acquired ParticleSet crowd resource.");
+  ParticleSetMultiWalkerMem& mw_mem = p_leader.mw_mem_handle_.getResource();
+  if (mw_mem.multi_particle_move_active)
+    throw std::runtime_error("Cannot start a selected-particle transaction before resolving the previous one.");
+
+  are_valid.resize(moves.size());
+  const std::size_t num_walkers   = p_list.size();
+  const std::size_t num_particles = p_leader.getTotalNum();
+  for (std::size_t iw = 0; iw < num_walkers; ++iw)
+  {
+    const auto& lattice = p_list[iw].simulation_cell_.getLattice();
+    const auto walker_moves = moves.slice(iw);
+    for (std::size_t entry = 0; entry < walker_moves.size(); ++entry)
+    {
+      const std::size_t flat_index = walker_moves.flatOffset() + entry;
+      const PosType& proposed_position = walker_moves.proposedPosition(entry);
+      are_valid[flat_index] =
+          !lattice.explicitly_defined || lattice.isValid(lattice.toUnit(proposed_position));
+    }
+  }
+
+  mw_mem.saved_positions.resize(num_particles * num_walkers);
+  mw_mem.saved_spins.resize(num_particles * num_walkers);
+  mw_mem.proposed_positions.clear();
+  mw_mem.proposed_spins.clear();
+  for (std::size_t iw = 0; iw < num_walkers; ++iw)
+    for (std::size_t ip = 0; ip < num_particles; ++ip)
+    {
+      const std::size_t snapshot_index   = ip * num_walkers + iw;
+      mw_mem.saved_positions[snapshot_index] = p_list[iw].R[ip];
+      mw_mem.saved_spins[snapshot_index] = p_list[iw].spins[ip];
+    }
+
+  recordParticleSetIdentities(p_list, mw_mem.transaction_particles);
+  mw_mem.multi_particle_move_active = true;
+  for (std::size_t iw = 0; iw < num_walkers; ++iw)
+  {
+    const auto walker_moves = moves.slice(iw);
+    for (std::size_t entry = 0; entry < walker_moves.size(); ++entry)
+    {
+      const std::size_t flat_index = walker_moves.flatOffset() + entry;
+      if (are_valid[flat_index])
+        p_list[iw].R[walker_moves.particleIndex(entry)] = walker_moves.proposedPosition(entry);
+    }
+  }
+
+  mw_update(p_list, true);
+  if (p_leader.structure_factor_)
+  {
+    auto sk_list = extractSKRefList(p_list);
+    StructFact::mw_updateAllPart(sk_list, p_list, p_leader.mw_structure_factor_data_handle_);
+  }
+  for (ParticleSet& pset : p_list)
+    pset.active_ptcl_ = -1;
 }
 
 bool ParticleSet::makeMoveAndCheck(Index_t iat, const SingleParticlePos& displ)
@@ -919,24 +1042,32 @@ void ParticleSet::mw_accept_rejectSpinMove(const RefVectorWithLeader<ParticleSet
 void ParticleSet::mw_accept_rejectMoveAllParticles(const RefVectorWithLeader<ParticleSet>& p_list,
                                                    const std::vector<bool>& accepted)
 {
+  mw_accept_rejectMoveSelectedParticles(p_list, accepted);
+}
+
+void ParticleSet::mw_accept_rejectMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                                        const std::vector<bool>& accepted)
+{
   const size_t num_walkers = p_list.size();
-  assert(num_walkers > 0 && "All-particle transaction crowd must not be empty.");
+  if (num_walkers == 0)
+    throw std::runtime_error("Multi-particle transaction crowd must not be empty.");
   const ParticleSet& p_leader = p_list.getLeader();
   const size_t num_particles  = p_leader.getTotalNum();
-#ifndef NDEBUG
-  validateAllParticleCrowdTopology(p_list);
-  for (size_t iw = 0; iw < num_walkers; ++iw)
-  {
-    if (p_list[iw].active_ptcl_ != -1)
-      throw std::runtime_error("Cannot resolve an all-particle transaction with an active particle.");
-    if (p_list[iw].spins.size() != num_particles)
-      throw std::runtime_error("All-particle transaction particle counts do not match.");
-  }
-#endif
+  validateMultiParticleCrowdTopology(p_list);
+  validateMultiParticleCrowdState(p_list);
+  if (accepted.size() != num_walkers)
+    throw std::runtime_error("Multi-particle acceptance mask size does not match the crowd.");
+  if (!p_leader.mw_mem_handle_)
+    throw std::runtime_error("Multi-particle transaction resolution requires an acquired ParticleSet crowd resource.");
 
   ParticleSetMultiWalkerMem& mw_mem = p_list.getLeader().mw_mem_handle_.getResource();
-  if (!mw_mem.all_particle_move_active)
-    throw std::runtime_error("Cannot resolve an all-particle transaction before making a proposal.");
+  if (!mw_mem.multi_particle_move_active)
+    throw std::runtime_error("Cannot resolve a multi-particle transaction before making a proposal.");
+  validateParticleSetIdentities(p_list, mw_mem.transaction_particles, "resolution");
+  if (mw_mem.saved_positions.size() != num_particles * num_walkers ||
+      mw_mem.saved_spins.size() != num_particles * num_walkers)
+    throw std::runtime_error("Multi-particle transaction rollback snapshot has an invalid shape.");
+
   std::vector<bool>& rejected = mw_mem.rejected;
   rejected.resize(num_walkers);
   bool any_rejected = false;
@@ -959,7 +1090,8 @@ void ParticleSet::mw_accept_rejectMoveAllParticles(const RefVectorWithLeader<Par
 
   if (!any_rejected)
   {
-    mw_mem.all_particle_move_active = false;
+    mw_mem.multi_particle_move_active = false;
+    mw_mem.transaction_particles.clear();
     return;
   }
 
@@ -979,7 +1111,8 @@ void ParticleSet::mw_accept_rejectMoveAllParticles(const RefVectorWithLeader<Par
     auto sk_list = extractSKRefList(p_list);
     StructFact::mw_updateAllPart(sk_list, p_list, p_list.getLeader().mw_structure_factor_data_handle_);
   }
-  mw_mem.all_particle_move_active = false;
+  mw_mem.multi_particle_move_active = false;
+  mw_mem.transaction_particles.clear();
 }
 
 void ParticleSet::donePbyP(bool skipSK)
@@ -1127,8 +1260,13 @@ void ParticleSet::createResource(ResourceCollection& collection) const
 
 void ParticleSet::acquireResource(ResourceCollection& collection, const RefVectorWithLeader<ParticleSet>& p_list)
 {
+  if (p_list.empty())
+    throw std::runtime_error("Cannot acquire a ParticleSet crowd resource for an empty crowd.");
   auto& ps_leader          = p_list.getLeader();
+  if (ps_leader.mw_mem_handle_)
+    throw std::runtime_error("Cannot acquire a ParticleSet crowd resource that is already acquired.");
   ps_leader.mw_mem_handle_ = collection.lendResource<ParticleSetMultiWalkerMem>();
+  recordParticleSetIdentities(p_list, ps_leader.mw_mem_handle_.getResource().resource_particles);
   ps_leader.coordinates_->acquireResource(collection, extractCoordsRefList(p_list));
   for (int i = 0; i < ps_leader.DistTables.size(); i++)
     ps_leader.DistTables[i]->acquireResource(collection, extractDTRefList(p_list, i));
@@ -1139,7 +1277,16 @@ void ParticleSet::acquireResource(ResourceCollection& collection, const RefVecto
 
 void ParticleSet::releaseResource(ResourceCollection& collection, const RefVectorWithLeader<ParticleSet>& p_list)
 {
+  if (p_list.empty())
+    throw std::runtime_error("Cannot release a ParticleSet crowd resource for an empty crowd.");
   auto& ps_leader = p_list.getLeader();
+  if (!ps_leader.mw_mem_handle_)
+    throw std::runtime_error("Cannot release a ParticleSet crowd resource that is not acquired.");
+  ParticleSetMultiWalkerMem& mw_mem = ps_leader.mw_mem_handle_.getResource();
+  validateParticleSetIdentities(p_list, mw_mem.resource_particles, "resource release");
+  if (mw_mem.multi_particle_move_active)
+    throw std::runtime_error("Cannot release a ParticleSet crowd resource with an unresolved multi-particle transaction.");
+  mw_mem.resource_particles.clear();
   collection.takebackResource(ps_leader.mw_mem_handle_);
   ps_leader.coordinates_->releaseResource(collection, extractCoordsRefList(p_list));
   for (int i = 0; i < ps_leader.DistTables.size(); i++)

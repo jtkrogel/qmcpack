@@ -22,6 +22,7 @@ set(PARTICLE
     ParticleSet.BC.cpp
     DynamicCoordinatesBuilder.cpp
     MCCoords.cpp
+    MCMultiParticleMoves.cpp
     MCWalkerConfiguration.cpp
     WalkerConfigurations.cpp
     SpeciesSet.cpp

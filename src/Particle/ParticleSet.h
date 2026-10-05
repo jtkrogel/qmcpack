@@ -33,6 +33,7 @@
 #include "type_traits/template_types.hpp"
 #include "SimulationCell.h"
 #include "MCCoords.hpp"
+#include "MCMultiParticleMoves.h"
 #include "DTModes.h"
 
 namespace qmcplusplus
@@ -315,8 +316,8 @@ public:
    * Displacements and are_valid use particle-major flattened storage:
    * ip * number_of_walkers + iw. The caller must supply a nonempty, resource-acquired
    * crowd with matching topology and particle counts, exact input and output sizes,
-   * and no active particles. These caller invariants are checked in Debug and assumed in
-   * Release. Each move proposal receives the same lattice-validity check as mw_makeMove.
+   * and no active particles. These caller invariants are checked in every build.
+   * Each move proposal receives the same lattice-validity check as mw_makeMove.
    * Individual invalid particle proposals leave that particle unchanged; they do not reject the full
    * configuration. Distance tables and structure factors are fully updated. No particle is left active.
    */
@@ -324,6 +325,20 @@ public:
   static void mw_makeMoveAllParticles(const RefVectorWithLeader<ParticleSet>& p_list,
                                       const MCCoords<CT>& displacements,
                                       std::vector<bool>& are_valid);
+
+  /** Attempt one atomic selected-particle proposal on every walker in a crowd.
+   *
+   * @param[in,out] p_list ParticleSets to update in place
+   * @param[in] moves walker-major CSR selections and absolute proposed positions
+   * @param[out] are_valid resized to the flattened CSR entry count and populated with lattice-validity results
+   *
+   * Unselected particles and lattice-invalid selected particles remain unchanged.  A matching
+   * mw_accept_rejectMoveSelectedParticles call is mandatory before another transaction or
+   * before releasing the crowd resource.
+   */
+  static void mw_makeMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                           const MCMultiParticleMoves<CoordsType::POS>& moves,
+                                           std::vector<bool>& are_valid);
 
   /** move the iat-th particle to active_pos_
    * @param iat the index of the particle to be moved
@@ -440,12 +455,15 @@ public:
    * the distance tables and structure factors. Walker_t state is not part of this transaction.
    * The caller must provide a nonempty, resource-acquired crowd with the same number of
    * ParticleSets and decisions, matching particle counts,
-   * and no active particles. These requirements are checked in Debug
-   * and assumed in Release. In simulation context this necessarily
-   * follows a mw_makeMoveAllParticles* call.
+   * and no active particles. These requirements are checked in every build. In simulation
+   * context this necessarily follows a mw_makeMoveAllParticles* call.
    */
   static void mw_accept_rejectMoveAllParticles(const RefVectorWithLeader<ParticleSet>& p_list,
                                                const std::vector<bool>& accepted);
+
+  /** Resolve one pending selected- or all-particle transaction per walker atomically. */
+  static void mw_accept_rejectMoveSelectedParticles(const RefVectorWithLeader<ParticleSet>& p_list,
+                                                    const std::vector<bool>& accepted);
 
   void initPropertyList();
   inline int addProperty(const std::string& pname) { return PropertyList.add(pname.c_str()); }
