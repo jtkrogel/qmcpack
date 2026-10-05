@@ -33,6 +33,8 @@
 #include "TWFGrads.hpp"
 #include "Utilities/RuntimeOptions.h"
 
+#include <cstdint>
+
 /**@defgroup MBWfs Many-body wave function group
  * @brief Classes to handle many-body trial wave functions
  */
@@ -42,6 +44,8 @@ namespace qmcplusplus
 class SlaterDet;
 class MultiSlaterDetTableMethod;
 class TWFFastDerivWrapper;
+template<CoordsType CT>
+class MCMultiParticleMoves;
 namespace wftrain
 {
 class StructuredParameterProvider;
@@ -478,6 +482,29 @@ public:
                                    const std::vector<bool>& isAccepted,
                                    bool safe_to_delay = false);
 
+  /// Return true only when every component supports selected-electron transactions.
+  bool supportsMultiParticleMoves() const noexcept;
+
+  /// Evaluate complete proposed value/G/L state without modifying accepted state.
+  static void mw_evaluateMultiParticleMove(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios);
+
+  /// Promote or discard each walker's complete proposed wavefunction state.
+  static void mw_accept_rejectMultiParticleMove(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      const std::vector<bool>& accepted);
+
+  /// Return the proposed full gradient needed for a reverse Green-function factor.
+  const ParticleSet::ParticleGradient& multiParticleProposalGradient() const;
+
+  /// Report whether a selected-electron proposal awaits resolution.
+  bool hasMultiParticleProposal() const noexcept { return multi_particle_proposal_pending_; }
+
   /** complete all the delayed or asynchronous operations before leaving the p-by-p move region.
    *  See WaveFunctionComponent::completeUpdates for more detail */
   void completeUpdates();
@@ -615,6 +642,13 @@ private:
 
   ///real part of trial wave function log
   RealType log_real_;
+
+  /// Complete proposed derivatives retained until one walker-level decision.
+  ParticleSet::ParticleGradient multi_particle_proposed_gradient_;
+  ParticleSet::ParticleLaplacian multi_particle_proposed_laplacian_;
+  LogValue multi_particle_proposed_log_ratio_ = LogValue(0);
+  std::uint64_t multi_particle_proposal_fingerprint_ = 0;
+  bool multi_particle_proposal_pending_ = false;
 
   /// if true, using internal tasking implementation
   const bool use_tasking_;

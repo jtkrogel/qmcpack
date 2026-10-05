@@ -17,10 +17,12 @@
 // File created by: Jeongnim Kim, jeongnim.kim@gmail.com, University of Illinois at Urbana-Champaign
 //////////////////////////////////////////////////////////////////////////////////////
 
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 
 #include "TrialWaveFunction.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "ResourceCollection.h"
 #include "Utilities/IteratorUtility.h"
@@ -822,6 +824,155 @@ void TrialWaveFunction::mw_accept_rejectMove(const RefVectorWithLeader<TrialWave
   }
 }
 
+bool TrialWaveFunction::supportsMultiParticleMoves() const noexcept
+{
+  return std::all_of(Z.begin(), Z.end(),
+                     [](const auto& component) { return component->supportsMultiParticleMoves(); });
+}
+
+void TrialWaveFunction::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::vector<LogValue>& log_ratios)
+{
+  if (wf_list.size() != p_list.size() || moves.walkerCount() != wf_list.size())
+    throw std::invalid_argument(
+        "Selected-electron wavefunction proposal has inconsistent walker counts");
+  if (log_ratios.size() != wf_list.size())
+    throw std::invalid_argument(
+        "Selected-electron wavefunction proposal has the wrong log-ratio count");
+  moves.validateFor(p_list);
+
+  const std::uint64_t proposal_fingerprint = moves.fingerprint();
+  for (std::size_t walker = 0; walker < wf_list.size(); ++walker)
+  {
+    TrialWaveFunction& wavefunction = wf_list[walker];
+    if (wavefunction.multi_particle_proposal_pending_)
+      throw std::logic_error(
+          "Cannot start a selected-electron wavefunction proposal before resolving the previous one");
+    if (!wavefunction.supportsMultiParticleMoves())
+      throw std::invalid_argument(
+          "TrialWaveFunction contains a component without selected-electron move support");
+
+    const std::size_t electron_count = p_list[walker].getTotalNum();
+    wavefunction.multi_particle_proposed_gradient_.resize(electron_count);
+    wavefunction.multi_particle_proposed_laplacian_.resize(electron_count);
+    wavefunction.multi_particle_proposed_gradient_  = ValueType(0);
+    wavefunction.multi_particle_proposed_laplacian_ = ValueType(0);
+    wavefunction.multi_particle_proposed_log_ratio_ = LogValue(0);
+    wavefunction.multi_particle_proposal_fingerprint_ = proposal_fingerprint;
+    log_ratios[walker] = LogValue(0);
+  }
+
+  RefVector<ParticleSet::ParticleGradient> proposed_gradient_list;
+  RefVector<ParticleSet::ParticleLaplacian> proposed_laplacian_list;
+  proposed_gradient_list.reserve(wf_list.size());
+  proposed_laplacian_list.reserve(wf_list.size());
+  for (TrialWaveFunction& wavefunction : wf_list)
+  {
+    proposed_gradient_list.push_back(wavefunction.multi_particle_proposed_gradient_);
+    proposed_laplacian_list.push_back(wavefunction.multi_particle_proposed_laplacian_);
+  }
+
+  auto& leader = wf_list.getLeader();
+  std::size_t completed_components = 0;
+  try
+  {
+    for (std::size_t component_index = 0; component_index < leader.Z.size(); ++component_index)
+    {
+      const auto component_list = extractWFCRefList(wf_list, component_index);
+      std::vector<LogValue> component_log_ratios(wf_list.size(), LogValue(0));
+      leader.Z[component_index]->mw_evaluateMultiParticleMove(
+          component_list, p_list, moves, component_log_ratios,
+          proposed_gradient_list, proposed_laplacian_list);
+      for (std::size_t walker = 0; walker < wf_list.size(); ++walker)
+        log_ratios[walker] += component_log_ratios[walker];
+      ++completed_components;
+    }
+  }
+  catch (...)
+  {
+    const std::vector<bool> reject_all(wf_list.size(), false);
+    for (std::size_t component_index = 0; component_index < completed_components;
+         ++component_index)
+    {
+      const auto component_list = extractWFCRefList(wf_list, component_index);
+      leader.Z[component_index]->mw_accept_rejectMultiParticleMove(
+          component_list, p_list, moves, reject_all);
+    }
+    for (TrialWaveFunction& wavefunction : wf_list)
+    {
+      wavefunction.multi_particle_proposal_fingerprint_ = 0;
+      wavefunction.multi_particle_proposed_log_ratio_    = LogValue(0);
+    }
+    throw;
+  }
+
+  for (std::size_t walker = 0; walker < wf_list.size(); ++walker)
+  {
+    wf_list[walker].multi_particle_proposed_log_ratio_ = log_ratios[walker];
+    wf_list[walker].multi_particle_proposal_pending_   = true;
+  }
+}
+
+void TrialWaveFunction::mw_accept_rejectMultiParticleMove(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    const std::vector<bool>& accepted)
+{
+  if (wf_list.size() != p_list.size() || moves.walkerCount() != wf_list.size() ||
+      accepted.size() != wf_list.size())
+    throw std::invalid_argument(
+        "Selected-electron wavefunction resolution has inconsistent walker counts");
+  moves.validateFor(p_list);
+  const std::uint64_t proposal_fingerprint = moves.fingerprint();
+  for (const TrialWaveFunction& wavefunction : wf_list)
+    if (!wavefunction.multi_particle_proposal_pending_ ||
+        wavefunction.multi_particle_proposal_fingerprint_ != proposal_fingerprint)
+      throw std::logic_error(
+          "Selected-electron wavefunction resolution does not match the pending proposal");
+
+  auto& leader = wf_list.getLeader();
+  for (std::size_t component_index = 0; component_index < leader.Z.size(); ++component_index)
+  {
+    const auto component_list = extractWFCRefList(wf_list, component_index);
+    leader.Z[component_index]->mw_accept_rejectMultiParticleMove(
+        component_list, p_list, moves, accepted);
+  }
+
+  for (std::size_t walker = 0; walker < wf_list.size(); ++walker)
+  {
+    TrialWaveFunction& wavefunction = wf_list[walker];
+    if (accepted[walker])
+    {
+      wavefunction.G = wavefunction.multi_particle_proposed_gradient_;
+      wavefunction.L = wavefunction.multi_particle_proposed_laplacian_;
+      p_list[walker].G = wavefunction.G;
+      p_list[walker].L = wavefunction.L;
+      wavefunction.log_real_  = 0;
+      wavefunction.PhaseValue = 0;
+      for (const auto& component : wavefunction.Z)
+      {
+        wavefunction.log_real_ += std::real(component->get_log_value());
+        wavefunction.PhaseValue += std::imag(component->get_log_value());
+      }
+    }
+    wavefunction.PhaseDiff = 0;
+    wavefunction.multi_particle_proposal_pending_ = false;
+    wavefunction.multi_particle_proposal_fingerprint_ = 0;
+    wavefunction.multi_particle_proposed_log_ratio_ = LogValue(0);
+  }
+}
+
+const ParticleSet::ParticleGradient& TrialWaveFunction::multiParticleProposalGradient() const
+{
+  if (!multi_particle_proposal_pending_)
+    throw std::logic_error("TrialWaveFunction has no pending selected-electron proposal");
+  return multi_particle_proposed_gradient_;
+}
+
 void TrialWaveFunction::completeUpdates()
 {
   ScopedTimer local_timer(TWF_timers_[ACCEPT_TIMER]);
@@ -1416,6 +1567,11 @@ void TrialWaveFunction::releaseResource(ResourceCollection& collection,
                                         const RefVectorWithLeader<TrialWaveFunction>& wf_list)
 {
   auto& wf_leader = wf_list.getLeader();
+
+  for (const TrialWaveFunction& wavefunction : wf_list)
+    if (wavefunction.multi_particle_proposal_pending_)
+      throw std::logic_error(
+          "Cannot release TrialWaveFunction resources with a pending selected-electron proposal");
 
   // Release WFC resources
   for (int i = 0; i < wf_leader.Z.size(); ++i)

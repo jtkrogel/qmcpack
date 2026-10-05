@@ -40,6 +40,8 @@ namespace qmcplusplus
 class WaveFunctionComponent;
 class ResourceCollection;
 class TWFFastDerivWrapper;
+template<CoordsType CT>
+class MCMultiParticleMoves;
 namespace wftrain
 {
 class StructuredParameterProvider;
@@ -348,6 +350,29 @@ public:
                                     int iat,
                                     const std::vector<bool>& isAccepted,
                                     bool safe_to_delay = false) const;
+
+  /// Report support for atomic selected-electron proposals.
+  virtual bool supportsMultiParticleMoves() const noexcept { return false; }
+
+  /** Evaluate one selected-electron proposal per walker without changing accepted state.
+   *
+   * Implementations add their complete proposed G/L contributions and return
+   * component log-ratios.  The matching accept/reject call is mandatory.
+   */
+  virtual void mw_evaluateMultiParticleMove(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios,
+      const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const;
+
+  /// Resolve the complete selected-electron proposal for every walker.
+  virtual void mw_accept_rejectMultiParticleMove(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      const std::vector<bool>& accepted) const;
 
   /** complete all the delayed or asynchronous operations before leaving the p-by-p move region.
    * Must be called at the end of each substep if p-by-p move is used.

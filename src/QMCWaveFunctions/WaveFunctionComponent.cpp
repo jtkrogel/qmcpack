@@ -227,6 +227,28 @@ void WaveFunctionComponent::checkOutVariables(const OptVariables& active)
                            "must be overloaded when the WFC is optimizable.");
 }
 
+void WaveFunctionComponent::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>&,
+    const RefVectorWithLeader<ParticleSet>&,
+    const MCMultiParticleMoves<CoordsType::POS>&,
+    std::vector<LogValue>&,
+    const RefVector<ParticleSet::ParticleGradient>&,
+    const RefVector<ParticleSet::ParticleLaplacian>&) const
+{
+  throw std::runtime_error(getClassName() +
+                           " does not support atomic selected-electron proposals");
+}
+
+void WaveFunctionComponent::mw_accept_rejectMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>&,
+    const RefVectorWithLeader<ParticleSet>&,
+    const MCMultiParticleMoves<CoordsType::POS>&,
+    const std::vector<bool>&) const
+{
+  throw std::runtime_error(getClassName() +
+                           " does not support atomic selected-electron proposals");
+}
+
 void WaveFunctionComponent::evaluateDerivativesWF(ParticleSet& P,
                                                   const OptVariables& active,
                                                   Vector<ValueType>& dlogpsi)
