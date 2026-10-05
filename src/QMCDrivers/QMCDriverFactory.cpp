@@ -211,9 +211,6 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     }
     else if (das.new_run_type == QMCRunType::VMC_BATCH)
     {
-      if (!das.what_to_do[UPDATE_MODE])
-        throw UniformCommunicateError("Batched driver only supports particle-by-particle moves.");
-
       app_summary() << "\n========================================"
                        "\n  Reading VMC driver XML input section"
                        "\n========================================"
@@ -231,6 +228,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
         throw UniformCommunicateError(e.what());
       }
 
+      const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
+
       // I don't like that QMCDriverFactory is unpacking the driver input here, ideally only the driver should need to
       // depend on the content and implementation of the input.  This seems to be to be a bigger deal that passing the
       // known at this level PSPool down.
@@ -241,7 +240,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
                                        MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
                                        RandomNumberControl::getChildrenRefs(), qmc_system.getSampleStack(), comm);
 
-      new_driver->setUpdateMode(1);
+      new_driver->setUpdateMode(is_pbyp_move);
     }
     else if (das.new_run_type == QMCRunType::DMC)
     {

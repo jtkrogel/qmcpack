@@ -130,6 +130,29 @@ TEST_CASE("QMCDriverFactory create VMCBatched driver", "[qmcapp]")
     REQUIRE_THROWS(dynamic_cast<VMC&>(*qmc_driver));
     CHECK(qmc_driver->getEngineName() == "VMCBatched");
   }
+  SECTION("n-electron move configuration reaches the batched driver")
+  {
+    ProjectData test_project("test", ProjectData::DriverVersion::BATCH);
+    QMCDriverFactory driver_factory(test_project);
+
+    std::string input(valid_vmc_input_sections[valid_vmc_input_vmc_batch_index]);
+    const std::string pbyp_move{"move=\"pbyp\""};
+    input.replace(input.find(pbyp_move), pbyp_move.size(), "move=\"n_electron\"");
+    input.insert(input.find("</qmc>"),
+                 "<parameter name=\"electrons_per_move\">2</parameter>"
+                 "<parameter name=\"electron_selection\">cyclic</parameter>");
+
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(input));
+    xmlNodePtr node                           = doc.getRoot();
+    QMCDriverFactory::DriverAssemblyState das = driver_factory.readSection(node);
+    REQUIRE(das.new_run_type == QMCRunType::VMC_BATCH);
+
+    auto qmc_driver = testing::createDriver(test_project.getRuntimeOptions(), comm, driver_factory, node, das);
+    REQUIRE(qmc_driver != nullptr);
+    REQUIRE_NOTHROW(dynamic_cast<VMCBatched&>(*qmc_driver));
+    CHECK((qmc_driver->getDriverMode() & (1UL << QMCDriverNew::QMC_UPDATE_MODE)) == 0);
+  }
 }
 
 TEST_CASE("QMCDriverFactory create DMC driver", "[qmcapp]")

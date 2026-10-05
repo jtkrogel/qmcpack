@@ -60,6 +60,7 @@ set(QMCDRIVERS
     VMC/VMCUpdatePbyP.cpp
     VMC/VMCUpdateAll.cpp
     VMC/VMCDriverInput.cpp
+    VMC/ElectronSubsetSelector.cpp
     VMC/SOVMCUpdatePbyP.cpp
     VMC/SOVMCUpdateAll.cpp
     DMC/DMC.cpp
