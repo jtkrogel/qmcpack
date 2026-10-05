@@ -89,6 +89,7 @@ set(DRIVER_TEST_SRC
     test_ConjugateGradient.cpp
     test_Eigensolver.cpp
     test_WFOptDriverInput.cpp)
+list(APPEND DRIVER_TEST_SRC test_HighParameterTraining.cpp)
 add_executable(${UTEST_EXE} ${DRIVER_TEST_SRC})
 target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)
 if(USE_OBJECT_TARGET)
