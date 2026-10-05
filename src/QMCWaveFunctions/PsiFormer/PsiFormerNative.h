@@ -263,18 +263,26 @@ NodePtr constant(Tensor value) { return node(std::move(value)); }
 /// Construct a scalar constant node.
 NodePtr scalar(double value) { return constant(Tensor({}, std::vector<double>{value})); }
 
-/** Create the coordinate leaf and seed its first derivative with the identity
- * matrix. */
-NodePtr coordinates(const Tensor& value)
+/** Create a coordinate leaf and seed only the requested flattened Cartesian
+ * coordinates. An empty selection creates an ordinary value-only leaf. */
+NodePtr coordinates(const Tensor& value, const std::vector<size_t>& seeded_coordinates)
 {
-  // Flattened Cartesian coordinates form the leading jet axis. Seeding an
-  // identity matrix makes dR_i/dR_j = delta_ij; all second derivatives vanish.
-  Tensor first_coordinate_derivative(Shape{value.size()});
+  if (seeded_coordinates.empty())
+    return constant(value);
+
+  // Each requested Cartesian coordinate forms one leading jet lane. This
+  // supports both the complete VGL and the three-lane active-electron path.
+  Tensor first_coordinate_derivative(Shape{seeded_coordinates.size()});
   first_coordinate_derivative.shape.insert(first_coordinate_derivative.shape.end(), value.shape.begin(),
                                            value.shape.end());
-  first_coordinate_derivative.x.assign(value.size() * value.size(), 0);
-  for (size_t coordinate = 0; coordinate < value.size(); ++coordinate)
-    first_coordinate_derivative.x[coordinate * value.size() + coordinate] = 1;
+  first_coordinate_derivative.x.assign(seeded_coordinates.size() * value.size(), 0);
+  for (size_t lane = 0; lane < seeded_coordinates.size(); ++lane)
+  {
+    const size_t coordinate = seeded_coordinates[lane];
+    if (coordinate >= value.size())
+      throw std::out_of_range("PsiFormer coordinate seed is out of range");
+    first_coordinate_derivative.x[lane * value.size() + coordinate] = 1;
+  }
   Tensor second_coordinate_derivative(first_coordinate_derivative.shape);
   return node(value, std::move(first_coordinate_derivative), std::move(second_coordinate_derivative));
 }
@@ -2317,11 +2325,13 @@ struct ConfigData
 /** Quantities produced by one all-electron PsiFormer evaluation. */
 struct Result
 {
-  double sign;
-  double logabs;
-  double value;
-  double local_energy;
+  double sign           = 1;
+  double logabs         = 0;
+  double value          = 0;
+  double local_energy   = 0;
+  bool has_local_energy = false;
   std::vector<double> gradient;
+  std::vector<double> active_gradient;
   std::vector<double> lap_log;
   std::vector<double> lap_ratio;
   std::vector<double> potential;
@@ -2337,12 +2347,30 @@ enum class ParameterDerivativeRequest
   LOG_AND_KINETIC
 };
 
+/// Select which real-space derivative lanes are propagated and returned.
+enum class SpatialDerivativeRequest
+{
+  NONE,
+  FULL_VGL,
+  ACTIVE_ELECTRON_GRADIENT
+};
+
+/// Select optional Hamiltonian quantities used only by the standalone oracle.
+enum class ValidationHamiltonianRequest
+{
+  NONE,
+  STRAIGHT_COULOMB
+};
+
 /** Describe optional parameter derivatives and the total wavefunction gradient
  * needed by QMCPACK's component kinetic-energy derivative. */
 struct EvaluationRequest
 {
-  ParameterDerivativeRequest parameter_derivatives = ParameterDerivativeRequest::NONE;
-  const std::vector<double>* total_log_gradient     = nullptr;
+  ParameterDerivativeRequest parameter_derivatives          = ParameterDerivativeRequest::NONE;
+  const std::vector<double>* total_log_gradient              = nullptr;
+  SpatialDerivativeRequest spatial_derivatives              = SpatialDerivativeRequest::FULL_VGL;
+  int active_electron                                       = -1;
+  ValidationHamiltonianRequest validation_hamiltonian = ValidationHamiltonianRequest::STRAIGHT_COULOMB;
 };
 
 /** Builds and evaluates the four-block PsiFormer wavefunction from imported
@@ -2560,10 +2588,35 @@ struct PsiFormer
   Result evaluate(const Tensor& electron_positions, const EvaluationRequest& request)
   {
     const bool with_parameter_gradient = request.parameter_derivatives != ParameterDerivativeRequest::NONE;
+    const bool with_kinetic_parameter_gradient =
+        request.parameter_derivatives == ParameterDerivativeRequest::LOG_AND_KINETIC;
+
+    if (request.spatial_derivatives == SpatialDerivativeRequest::ACTIVE_ELECTRON_GRADIENT &&
+        (request.active_electron < 0 || static_cast<size_t>(request.active_electron) >= ne))
+      throw std::out_of_range("PsiFormer active-electron derivative request is out of range");
+    if (with_kinetic_parameter_gradient && request.spatial_derivatives != SpatialDerivativeRequest::FULL_VGL)
+      throw std::invalid_argument("PsiFormer kinetic parameter derivatives require full spatial derivatives");
+    if (request.validation_hamiltonian == ValidationHamiltonianRequest::STRAIGHT_COULOMB &&
+        request.spatial_derivatives != SpatialDerivativeRequest::FULL_VGL)
+      throw std::invalid_argument("PsiFormer standalone Hamiltonian validation requires full spatial derivatives");
+    if (request.total_log_gradient && !with_kinetic_parameter_gradient)
+      throw std::invalid_argument("PsiFormer total log-gradient seed requires a kinetic parameter derivative");
+
+    std::vector<size_t> seeded_coordinates;
+    if (request.spatial_derivatives == SpatialDerivativeRequest::FULL_VGL)
+    {
+      seeded_coordinates.resize(3 * ne);
+      std::iota(seeded_coordinates.begin(), seeded_coordinates.end(), size_t{0});
+    }
+    else if (request.spatial_derivatives == SpatialDerivativeRequest::ACTIVE_ELECTRON_GRADIENT)
+    {
+      const size_t first_coordinate = 3 * static_cast<size_t>(request.active_electron);
+      seeded_coordinates = {first_coordinate, first_coordinate + 1, first_coordinate + 2};
+    }
 
     // Feature layers: electron-nucleus embedding followed by four attention
     // blocks operating on all electrons.
-    NodePtr positions         = coordinates(electron_positions);
+    NodePtr positions         = coordinates(electron_positions, seeded_coordinates);
     NodePtr electron_features = embedding(positions);
     for (int layer = 0; layer < 4; ++layer)
       electron_features = attention_block(electron_features, layer);
@@ -2575,8 +2628,8 @@ struct PsiFormer
     NodePtr orbital_matrices = concat({up_orbitals, down_orbitals}, 1);
 
     // Sum determinant channels, then add the analytic cusp in log space.
-    NodePtr determinant_channels =
-        with_parameter_gradient ? differentiable_determinants(orbital_matrices) : determinants(orbital_matrices);
+    NodePtr determinant_channels = with_kinetic_parameter_gradient ? differentiable_determinants(orbital_matrices)
+                                                                   : determinants(orbital_matrices);
     NodePtr determinant_sum  = sum_all(determinant_channels);
     NodePtr log_wavefunction = add(log_node(abs_node(determinant_sum)), cusp(positions));
 
@@ -2584,60 +2637,70 @@ struct PsiFormer
     result.sign     = determinant_sum->value.x[0] > 0 ? 1 : -1;
     result.logabs   = log_wavefunction->value.x[0];
     result.value    = result.sign * std::exp(result.logabs);
-    result.gradient = log_wavefunction->d1.x;
 
-    // Convert Cartesian diagonal second derivatives of log|psi| into the
-    // per-electron logarithmic Laplacian and (nabla^2 psi)/psi.
-    result.lap_log.resize(ne);
-    result.lap_ratio.resize(ne);
-    for (size_t electron = 0; electron < ne; ++electron)
+    if (request.spatial_derivatives == SpatialDerivativeRequest::FULL_VGL)
     {
-      double squared_gradient_norm = 0;
-      for (size_t dimension = 0; dimension < 3; ++dimension)
+      result.gradient = log_wavefunction->d1.x;
+
+      // Convert Cartesian diagonal second derivatives of log|psi| into the
+      // per-electron logarithmic Laplacian and (nabla^2 psi)/psi.
+      result.lap_log.resize(ne);
+      result.lap_ratio.resize(ne);
+      for (size_t electron = 0; electron < ne; ++electron)
       {
-        const size_t coordinate = electron * 3 + dimension;
-        result.lap_log[electron] += log_wavefunction->d2.x[coordinate];
-        squared_gradient_norm += result.gradient[coordinate] * result.gradient[coordinate];
+        double squared_gradient_norm = 0;
+        for (size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const size_t coordinate = electron * 3 + dimension;
+          result.lap_log[electron] += log_wavefunction->d2.x[coordinate];
+          squared_gradient_norm += result.gradient[coordinate] * result.gradient[coordinate];
+        }
+        result.lap_ratio[electron] = result.lap_log[electron] + squared_gradient_norm;
       }
-      result.lap_ratio[electron] = result.lap_log[electron] + squared_gradient_norm;
     }
+    else if (request.spatial_derivatives == SpatialDerivativeRequest::ACTIVE_ELECTRON_GRADIENT)
+      result.active_gradient = log_wavefunction->d1.x;
 
-    // Accumulate electron-electron, electron-nucleus, and nucleus-nucleus
-    // straight-Coulomb terms separately for validation and local energy.
-    auto distance = [](const double* first, const double* second) {
-      double squared_distance = 0;
-      for (int dimension = 0; dimension < 3; ++dimension)
-      {
-        const double displacement = first[dimension] - second[dimension];
-        squared_distance += displacement * displacement;
-      }
-      return std::sqrt(squared_distance);
-    };
+    if (request.validation_hamiltonian == ValidationHamiltonianRequest::STRAIGHT_COULOMB)
+    {
+      // Accumulate electron-electron, electron-nucleus, and nucleus-nucleus
+      // straight-Coulomb terms separately for validation and local energy.
+      auto distance = [](const double* first, const double* second) {
+        double squared_distance = 0;
+        for (int dimension = 0; dimension < 3; ++dimension)
+        {
+          const double displacement = first[dimension] - second[dimension];
+          squared_distance += displacement * displacement;
+        }
+        return std::sqrt(squared_distance);
+      };
 
-    double electron_electron_potential = 0;
-    for (size_t first_electron = 0; first_electron < ne; ++first_electron)
-      for (size_t second_electron = first_electron + 1; second_electron < ne; ++second_electron)
-        electron_electron_potential +=
-            1 / distance(&electron_positions.x[first_electron * 3], &electron_positions.x[second_electron * 3]);
+      double electron_electron_potential = 0;
+      for (size_t first_electron = 0; first_electron < ne; ++first_electron)
+        for (size_t second_electron = first_electron + 1; second_electron < ne; ++second_electron)
+          electron_electron_potential +=
+              1 / distance(&electron_positions.x[first_electron * 3], &electron_positions.x[second_electron * 3]);
 
-    double electron_nucleus_potential = 0;
-    for (size_t electron = 0; electron < ne; ++electron)
-      for (size_t nucleus = 0; nucleus < cfg.nuclei.shape[0]; ++nucleus)
-        electron_nucleus_potential -=
-            cfg.charges.x[nucleus] / distance(&electron_positions.x[electron * 3], &cfg.nuclei.x[nucleus * 3]);
+      double electron_nucleus_potential = 0;
+      for (size_t electron = 0; electron < ne; ++electron)
+        for (size_t nucleus = 0; nucleus < cfg.nuclei.shape[0]; ++nucleus)
+          electron_nucleus_potential -=
+              cfg.charges.x[nucleus] / distance(&electron_positions.x[electron * 3], &cfg.nuclei.x[nucleus * 3]);
 
-    double nucleus_nucleus_potential = 0;
-    for (size_t first_nucleus = 0; first_nucleus < cfg.nuclei.shape[0]; ++first_nucleus)
-      for (size_t second_nucleus = first_nucleus + 1; second_nucleus < cfg.nuclei.shape[0]; ++second_nucleus)
-        nucleus_nucleus_potential += cfg.charges.x[first_nucleus] * cfg.charges.x[second_nucleus] /
-            distance(&cfg.nuclei.x[first_nucleus * 3], &cfg.nuclei.x[second_nucleus * 3]);
+      double nucleus_nucleus_potential = 0;
+      for (size_t first_nucleus = 0; first_nucleus < cfg.nuclei.shape[0]; ++first_nucleus)
+        for (size_t second_nucleus = first_nucleus + 1; second_nucleus < cfg.nuclei.shape[0]; ++second_nucleus)
+          nucleus_nucleus_potential += cfg.charges.x[first_nucleus] * cfg.charges.x[second_nucleus] /
+              distance(&cfg.nuclei.x[first_nucleus * 3], &cfg.nuclei.x[second_nucleus * 3]);
 
-    result.potential = {electron_electron_potential, electron_nucleus_potential, nucleus_nucleus_potential};
+      result.potential = {electron_electron_potential, electron_nucleus_potential, nucleus_nucleus_potential};
 
-    // Local energy is kinetic energy plus the three Coulomb contributions.
-    const double laplacian_ratio = std::accumulate(result.lap_ratio.begin(), result.lap_ratio.end(), 0.);
-    result.local_energy =
-        -.5 * laplacian_ratio + electron_electron_potential + electron_nucleus_potential + nucleus_nucleus_potential;
+      // Local energy is kinetic energy plus the three Coulomb contributions.
+      const double laplacian_ratio = std::accumulate(result.lap_ratio.begin(), result.lap_ratio.end(), 0.);
+      result.local_energy =
+          -.5 * laplacian_ratio + electron_electron_potential + electron_nucleus_potential + nucleus_nucleus_potential;
+      result.has_local_energy = true;
+    }
 
     // Reverse the ordinary value graph only when the caller needs score
     // derivatives. SR-style callers intentionally avoid the more expensive
@@ -2649,7 +2712,7 @@ struct PsiFormer
     // use the total trial-wavefunction gradient rather than necessarily this
     // component's gradient. For standalone evaluation the component gradient
     // remains the default and reproduces dE_L/dtheta for the full PsiFormer.
-    if (request.parameter_derivatives == ParameterDerivativeRequest::LOG_AND_KINETIC)
+    if (with_kinetic_parameter_gradient)
     {
       const std::vector<double>& total_gradient =
           request.total_log_gradient ? *request.total_log_gradient : log_wavefunction->d1.x;
@@ -2671,10 +2734,12 @@ struct PsiFormer
         throw std::runtime_error("PsiFormer produced a non-finite " + description);
     };
     if (!is_finite_parameter_value(result.sign) || !is_finite_parameter_value(result.logabs) ||
-        !is_finite_parameter_value(result.local_energy))
+        (result.has_local_energy && !is_finite_parameter_value(result.local_energy)))
       throw std::runtime_error("PsiFormer produced a non-finite high-level observable");
     require_finite(result.gradient, "spatial gradient");
+    require_finite(result.active_gradient, "active-electron gradient");
     require_finite(result.lap_log, "spatial Laplacian");
+    require_finite(result.potential, "potential energy");
     require_finite(result.param_gradient, "parameter gradient");
     require_finite(result.local_energy_param_gradient, "local-energy parameter gradient");
     return result;
@@ -2686,7 +2751,11 @@ struct PsiFormer
     const ParameterDerivativeRequest derivative_request = with_parameter_gradient
         ? ParameterDerivativeRequest::LOG_AND_KINETIC
         : ParameterDerivativeRequest::NONE;
-    return evaluate(electron_positions, EvaluationRequest{derivative_request, nullptr});
+    EvaluationRequest request;
+    request.parameter_derivatives  = derivative_request;
+    request.spatial_derivatives    = SpatialDerivativeRequest::FULL_VGL;
+    request.validation_hamiltonian = ValidationHamiltonianRequest::STRAIGHT_COULOMB;
+    return evaluate(electron_positions, request);
   }
 };
 

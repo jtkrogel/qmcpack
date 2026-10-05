@@ -38,6 +38,9 @@ set(WFBASE_SRCS
     HarmonicOscillator/SHOSetBuilder.cpp
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
+    PsiFormer/PsiFormerExecutionPlan.cpp
+    PsiFormer/PsiFormerGeometry.cpp
+    PsiFormer/PsiFormerWorkspace.cpp
     PsiFormer/PsiFormerWF.cpp
     PsiFormer/PsiFormerWaveFunctionBuilder.cpp
     RotatedSPOs.cpp)

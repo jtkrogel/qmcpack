@@ -232,6 +232,45 @@ void WaveFunctionComponent::evaluateDerivativesWF(ParticleSet& P,
                                                   Vector<ValueType>& dlogpsi)
 { throw std::runtime_error("WaveFunctionComponent::evaluateDerivativesWF is not implemented by " + getClassName()); }
 
+void WaveFunctionComponent::mw_evaluateParameterDerivatives(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const OptVariables& optvars,
+    RecordArray<ValueType>& dlogpsi,
+    RecordArray<ValueType>& dhpsioverpsi) const
+{
+  assert(this == &wfc_list.getLeader());
+  if (wfc_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wfc_list.size() ||
+      dhpsioverpsi.getNumOfEntries() != wfc_list.size() ||
+      dlogpsi.getNumOfParams() != dhpsioverpsi.getNumOfParams())
+    throw std::invalid_argument("WaveFunctionComponent batched derivative inputs have inconsistent shapes");
+
+  const int parameter_count = dlogpsi.getNumOfParams();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    Vector<ValueType> score(dlogpsi[walker], parameter_count);
+    Vector<ValueType> kinetic_response(dhpsioverpsi[walker], parameter_count);
+    wfc_list[walker].evaluateDerivatives(p_list[walker], optvars, score, kinetic_response);
+  }
+}
+
+void WaveFunctionComponent::mw_evaluateParameterDerivativesWF(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const OptVariables& optvars,
+    RecordArray<ValueType>& dlogpsi) const
+{
+  assert(this == &wfc_list.getLeader());
+  if (wfc_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wfc_list.size())
+    throw std::invalid_argument("WaveFunctionComponent batched score inputs have inconsistent shapes");
+
+  const int parameter_count = dlogpsi.getNumOfParams();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    Vector<ValueType> score(dlogpsi[walker], parameter_count);
+    wfc_list[walker].evaluateDerivativesWF(p_list[walker], optvars, score);
+  }
+}
 
 /*@todo makeClone should be a pure virtual function
  */
@@ -296,6 +335,46 @@ void WaveFunctionComponent::evaluateDerivRatios(const VirtualParticleSet& VP,
 {
   //default is only ratios and zero derivatives
   evaluateRatios(VP, ratios);
+}
+
+void WaveFunctionComponent::evaluateDerivRatiosWeighted(
+    const VirtualParticleSet& VP,
+    const OptVariables& optvars,
+    const std::vector<ValueType>& total_weights,
+    ParameterDerivativeView weighted_derivatives)
+{
+  const std::size_t virtual_count = VP.getTotalNum();
+  if (total_weights.size() != virtual_count || weighted_derivatives.size < optvars.size_of_active() ||
+      (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr))
+    throw std::invalid_argument("WaveFunctionComponent weighted derivative-ratio inputs have inconsistent shapes");
+
+  // Compatibility components retain their established derivative-ratio code.
+  // Only this fallback materializes the quadrature-by-parameter matrix.
+  std::vector<ValueType> component_ratios(virtual_count);
+  Matrix<ValueType> derivative_ratios(virtual_count, weighted_derivatives.size);
+  std::fill(derivative_ratios.begin(), derivative_ratios.end(), ValueType(0));
+  evaluateDerivRatios(VP, optvars, component_ratios, derivative_ratios);
+
+  for (std::size_t virtual_index = 0; virtual_index < virtual_count; ++virtual_index)
+    for (std::size_t parameter = 0; parameter < weighted_derivatives.size; ++parameter)
+      weighted_derivatives[parameter] += total_weights[virtual_index] * derivative_ratios(virtual_index, parameter);
+}
+
+void WaveFunctionComponent::mw_evaluateDerivRatiosWeighted(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<const VirtualParticleSet>& vp_list,
+    const OptVariables& optvars,
+    const RefVector<const std::vector<ValueType>>& total_weights,
+    const std::vector<ParameterDerivativeView>& weighted_derivatives) const
+{
+  assert(this == &wfc_list.getLeader());
+  if (wfc_list.size() != vp_list.size() || total_weights.size() != wfc_list.size() ||
+      weighted_derivatives.size() != wfc_list.size())
+    throw std::invalid_argument("WaveFunctionComponent batched weighted reductions have inconsistent sizes");
+
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list[walker].evaluateDerivRatiosWeighted(vp_list[walker], optvars, total_weights[walker],
+                                                 weighted_derivatives[walker]);
 }
 
 void WaveFunctionComponent::evaluateSpinorDerivRatios(const VirtualParticleSet& VP,

@@ -162,6 +162,11 @@ TEST_CASE("TrialWaveFunction flex_evaluateParameterDerivatives", "[wavefunction]
 
     CHECK(dlogpsi[0] == ValueApprox(dlogpsi_list[0][0]));
     CHECK(dhpsioverpsi[0] == ValueApprox(dhpsi_over_psi_list[0][0]));
+
+    RecordArray<ValueType> score_only_list(nentry, nparam);
+    std::fill(score_only_list.begin(), score_only_list.end(), ValueType(0));
+    TrialWaveFunction::mw_evaluateParameterDerivativesWF(wf_list, p_list, var_param, score_only_list);
+    CHECK(dlogpsi[0] == ValueApprox(score_only_list[0][0]));
   }
 
   { // Test list with two wavefunctions
@@ -190,6 +195,46 @@ TEST_CASE("TrialWaveFunction flex_evaluateParameterDerivatives", "[wavefunction]
 
     CHECK(dlogpsi2[0] == ValueApprox(dlogpsi_list[1][0]));
     CHECK(dhpsioverpsi2[0] == ValueApprox(dhpsi_over_psi_list[1][0]));
+  }
+
+  SECTION("weighted virtual derivatives match the materialized compatibility path")
+  {
+    VirtualParticleSet virtual_particles(elec);
+    std::vector<QMCTraits::PosType> displacements{{0.15, -0.10, 0.05},
+                                                   {-0.20, 0.08, -0.12},
+                                                   {0.04, 0.17, 0.09}};
+    virtual_particles.makeMoves(elec, 0, displacements);
+
+    std::vector<ValueType> materialized_ratios(displacements.size());
+    Matrix<ValueType> materialized_derivatives(displacements.size(), nparam);
+    std::fill(materialized_derivatives.begin(), materialized_derivatives.end(), ValueType(0));
+    psi.evaluateDerivRatios(virtual_particles, var_param, materialized_ratios, materialized_derivatives);
+
+    // Deliberately nonuniform signed weights exercise accumulation rather than
+    // the special case of a normalized quadrature rule.
+    const std::vector<ValueType> bare_weights{ValueType(0.25), ValueType(-0.40), ValueType(0.15)};
+    const ValueType sentinel(1.75);
+    ValueType expected = sentinel;
+    for (std::size_t move = 0; move < displacements.size(); ++move)
+      expected += bare_weights[move] * materialized_ratios[move] * materialized_derivatives(move, 0);
+
+    std::vector<ValueType> direct_ratios(displacements.size());
+    Vector<ValueType> weighted_derivative(nparam);
+    weighted_derivative = sentinel;
+    psi.evaluateDerivRatiosWeighted(virtual_particles, var_param, bare_weights, direct_ratios,
+                                    {weighted_derivative.data(), static_cast<std::size_t>(weighted_derivative.size())});
+
+    for (std::size_t move = 0; move < displacements.size(); ++move)
+      CHECK(direct_ratios[move] == ValueApprox(materialized_ratios[move]));
+    CHECK(weighted_derivative[0] == ValueApprox(expected));
+
+    // The He determinant has no active parameters. Selecting only fermionic
+    // components must therefore leave the existing destination untouched.
+    weighted_derivative = sentinel;
+    psi.evaluateDerivRatiosWeighted(virtual_particles, var_param, bare_weights, direct_ratios,
+                                    {weighted_derivative.data(), static_cast<std::size_t>(weighted_derivative.size())},
+                                    TrialWaveFunction::ComputeType::FERMIONIC);
+    CHECK(weighted_derivative[0] == ValueApprox(sentinel));
   }
 }
 

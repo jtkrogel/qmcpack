@@ -271,6 +271,23 @@ public:
                                        const Vector<ValueType>& dlogpsi,
                                        Vector<ValueType>& dhpsioverpsi);
 
+  /** Evaluate a compact ragged batch of nonlocal energies and parameter derivatives.
+   *
+   * Each entry represents one ion-electron job from a different walker in the
+   * current subbatch.  The TrialWaveFunction forms total product ratios first,
+   * then components reduce weighted logarithmic ratio derivatives directly.
+   */
+  static void mw_evaluateValueAndDerivatives(
+      const RefVectorWithLeader<NonLocalECPComponent>& ecp_component_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_list,
+      const RefVectorWithLeader<TrialWaveFunction>& psi_list,
+      const RefVector<const NLPPJob<RealType>>& joblist,
+      const OptVariables& optvars,
+      const std::vector<TrialWaveFunction::ParameterDerivativeView>& weighted_derivatives,
+      std::vector<RealType>& pairpots,
+      ResourceCollection& collection);
+
   /** 
    * @brief Evaluate contribution to B of election iel and ion iat.  Filippi scheme for computing fast derivatives.
    *        Sum over ions and electrons occurs at the NonLocalECPotential level.  

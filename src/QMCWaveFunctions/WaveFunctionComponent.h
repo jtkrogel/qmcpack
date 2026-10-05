@@ -27,6 +27,7 @@
 #include "QMCWaveFunctions/OrbitalSetTraits.h"
 #include "OptimizableObject.h"
 #include "Particle/MCWalkerConfiguration.h"
+#include "Containers/MinimalContainers/RecordArray.hpp"
 #include "type_traits/template_types.hpp"
 #include "TWFGrads.hpp"
 
@@ -83,6 +84,21 @@ public:
   using LogValue = std::complex<QTFull::RealType>;
   // the value type for psi(r')/psi(r)
   using PsiValue = QTFull::ValueType;
+
+  /** Non-owning destination for accumulated active-parameter derivatives.
+   *
+   * The scalar type follows QMCPACK's ValueType so the interface does not bake
+   * real-only arithmetic into callers.  Implementations in this change remain
+   * limited to the existing real/open-boundary PsiFormer model.
+   */
+  struct ParameterDerivativeView
+  {
+    ValueType* data  = nullptr;
+    std::size_t size = 0;
+
+    /// Access one active-parameter destination entry.
+    ValueType& operator[](std::size_t index) const { return data[index]; }
+  };
 
   /** current update mode */
   int UpdateMode;
@@ -468,6 +484,18 @@ public:
                                    Vector<ValueType>& dlogpsi,
                                    Vector<ValueType>& dhpsioverpsi) = 0;
 
+  /** Add score and kinetic-response derivatives for a batch of component clones.
+   *
+   * The default preserves every existing component by serializing over walkers.
+   * Components with a true batched reverse pass may override this narrow hook.
+   */
+  virtual void mw_evaluateParameterDerivatives(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const OptVariables& optvars,
+      RecordArray<ValueType>& dlogpsi,
+      RecordArray<ValueType>& dhpsioverpsi) const;
+
   /** Compute the derivatives of the log of the wavefunction with respect to optimizable parameters.
    *  parameters
    *  @param P particle set
@@ -477,6 +505,16 @@ public:
    *        the derivative of the log of the wavefunction.
   */
   virtual void evaluateDerivativesWF(ParticleSet& P, const OptVariables& optvars, Vector<ValueType>& dlogpsi);
+
+  /** Add score derivatives for a batch of component clones.
+   *
+   * The default is a compatibility implementation serialized over walkers.
+   */
+  virtual void mw_evaluateParameterDerivativesWF(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const OptVariables& optvars,
+      RecordArray<ValueType>& dlogpsi) const;
 
   virtual void finalizeOptimization() {}
 
@@ -522,6 +560,26 @@ public:
                                    const OptVariables& optvars,
                                    std::vector<ValueType>& ratios,
                                    Matrix<ValueType>& dratios);
+
+  /** Accumulate a weighted sum of virtual-minus-reference log-ratio derivatives.
+   *
+   * total_weights already contain the complete TrialWaveFunction ratio.  A
+   * component must therefore contribute only its logarithmic ratio derivative,
+   * preserving the product rule for mixed wavefunctions.  The default
+   * materializes a compatibility matrix; scalable components override it.
+   */
+  virtual void evaluateDerivRatiosWeighted(const VirtualParticleSet& VP,
+                                           const OptVariables& optvars,
+                                           const std::vector<ValueType>& total_weights,
+                                           ParameterDerivativeView weighted_derivatives);
+
+  /** Batched weighted derivative-ratio reduction with a serialized default. */
+  virtual void mw_evaluateDerivRatiosWeighted(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<const VirtualParticleSet>& vp_list,
+      const OptVariables& optvars,
+      const RefVector<const std::vector<ValueType>>& total_weights,
+      const std::vector<ParameterDerivativeView>& weighted_derivatives) const;
 
   /** evaluate ratios and derivatives to evaluate the SOECP
    * @param VP VirtualParticleSet

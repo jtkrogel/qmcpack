@@ -1158,6 +1158,88 @@ void TrialWaveFunction::evaluateDerivRatios(const VirtualParticleSet& VP,
   }
 }
 
+void TrialWaveFunction::evaluateDerivRatiosWeighted(const VirtualParticleSet& VP,
+                                                    const OptVariables& optvars,
+                                                    const std::vector<ValueType>& bare_weights,
+                                                    std::vector<ValueType>& ratios,
+                                                    ParameterDerivativeView weighted_derivatives,
+                                                    ComputeType ct)
+{
+  const std::size_t virtual_count = VP.getTotalNum();
+  if (bare_weights.size() != virtual_count || ratios.size() != virtual_count ||
+      weighted_derivatives.size < optvars.size_of_active() ||
+      (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr))
+    throw std::invalid_argument("TrialWaveFunction weighted derivative-ratio inputs have inconsistent shapes");
+
+  // Ratios must be formed for the complete selected product before any
+  // component derivative is reduced.  Using a component-local ratio here
+  // would omit cross-component factors from d(V_NL Psi / Psi)/d alpha.
+  evaluateRatios(VP, ratios, ct);
+  std::vector<ValueType> total_weights(virtual_count);
+  for (std::size_t virtual_index = 0; virtual_index < virtual_count; ++virtual_index)
+    total_weights[virtual_index] = bare_weights[virtual_index] * ratios[virtual_index];
+
+  for (int component = 0; component < Z.size(); ++component)
+    if (ct == ComputeType::ALL || (Z[component]->isFermionic() && ct == ComputeType::FERMIONIC) ||
+        (!Z[component]->isFermionic() && ct == ComputeType::NONFERMIONIC))
+    {
+      ScopedTimer component_timer(WFC_timers_[DERIVS_TIMER + TIMER_SKIP * component]);
+      Z[component]->evaluateDerivRatiosWeighted(VP, optvars, total_weights, weighted_derivatives);
+    }
+}
+
+void TrialWaveFunction::mw_evaluateDerivRatiosWeighted(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<const VirtualParticleSet>& vp_list,
+    const OptVariables& optvars,
+    const RefVector<const std::vector<ValueType>>& bare_weights,
+    const RefVector<std::vector<ValueType>>& ratios,
+    const std::vector<ParameterDerivativeView>& weighted_derivatives,
+    ComputeType ct)
+{
+  const std::size_t walker_count = wf_list.size();
+  if (vp_list.size() != walker_count || bare_weights.size() != walker_count || ratios.size() != walker_count ||
+      weighted_derivatives.size() != walker_count)
+    throw std::invalid_argument("TrialWaveFunction batched weighted reductions have inconsistent walker counts");
+
+  auto& leader = wf_list.getLeader();
+
+  // The existing ratio dispatcher is already component-major and respects the
+  // fermionic/nonfermionic partition.  Its results establish the total-product
+  // weights consumed by every component reverse pass below.
+  mw_evaluateRatios(wf_list, vp_list, ratios, ct);
+  std::vector<std::vector<ValueType>> total_weights_storage(walker_count);
+  RefVector<const std::vector<ValueType>> total_weights;
+  total_weights.reserve(walker_count);
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    const auto& walker_bare_weights = bare_weights[walker].get();
+    auto& walker_ratios             = ratios[walker].get();
+    if (walker_bare_weights.size() != walker_ratios.size() ||
+        walker_ratios.size() != static_cast<std::size_t>(vp_list[walker].getTotalNum()) ||
+        weighted_derivatives[walker].size < optvars.size_of_active() ||
+        (weighted_derivatives[walker].size != 0 && weighted_derivatives[walker].data == nullptr))
+      throw std::invalid_argument("TrialWaveFunction batched weighted reduction has an invalid walker shape");
+
+    auto& walker_total_weights = total_weights_storage[walker];
+    walker_total_weights.resize(walker_ratios.size());
+    for (std::size_t virtual_index = 0; virtual_index < walker_ratios.size(); ++virtual_index)
+      walker_total_weights[virtual_index] = walker_bare_weights[virtual_index] * walker_ratios[virtual_index];
+    total_weights.push_back(std::cref(walker_total_weights));
+  }
+
+  auto& components = leader.Z;
+  for (int component = 0; component < components.size(); ++component)
+    if (ct == ComputeType::ALL || (components[component]->isFermionic() && ct == ComputeType::FERMIONIC) ||
+        (!components[component]->isFermionic() && ct == ComputeType::NONFERMIONIC))
+    {
+      ScopedTimer component_timer(leader.WFC_timers_[DERIVS_TIMER + TIMER_SKIP * component]);
+      const auto wfc_list(extractWFCRefList(wf_list, component));
+      components[component]->mw_evaluateDerivRatiosWeighted(wfc_list, vp_list, optvars, total_weights,
+                                                            weighted_derivatives);
+    }
+}
+
 void TrialWaveFunction::evaluateSpinorDerivRatios(const VirtualParticleSet& VP,
                                                   const std::pair<ValueVector, ValueVector>& spinor_multiplier,
                                                   const OptVariables& optvars,
@@ -1214,13 +1296,19 @@ void TrialWaveFunction::mw_evaluateParameterDerivatives(const RefVectorWithLeade
                                                         RecordArray<ValueType>& dlogpsi,
                                                         RecordArray<ValueType>& dhpsioverpsi)
 {
-  const int nparam = dlogpsi.getNumOfParams();
-  for (int iw = 0; iw < wf_list.size(); iw++)
-  {
-    Vector<ValueType> dlogpsi_record_view(dlogpsi[iw], nparam);
-    Vector<ValueType> dhpsioverpsi_record_view(dhpsioverpsi[iw], nparam);
+  auto& leader = wf_list.getLeader();
+  if (wf_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wf_list.size() ||
+      dhpsioverpsi.getNumOfEntries() != wf_list.size() ||
+      dlogpsi.getNumOfParams() != dhpsioverpsi.getNumOfParams())
+    throw std::invalid_argument("TrialWaveFunction batched derivative inputs have inconsistent shapes");
 
-    wf_list[iw].evaluateDerivatives(p_list[iw], optvars, dlogpsi_record_view, dhpsioverpsi_record_view);
+  // Dispatch component-major so an optimized component can process the complete
+  // walker batch while legacy components retain the serialized virtual default.
+  for (int component = 0; component < leader.Z.size(); ++component)
+  {
+    ScopedTimer component_timer(leader.WFC_timers_[DERIVS_TIMER + TIMER_SKIP * component]);
+    const auto wfc_list(extractWFCRefList(wf_list, component));
+    leader.Z[component]->mw_evaluateParameterDerivatives(wfc_list, p_list, optvars, dlogpsi, dhpsioverpsi);
   }
 }
 
@@ -1239,11 +1327,15 @@ void TrialWaveFunction::mw_evaluateParameterDerivativesWF(const RefVectorWithLea
                                                           const OptVariables& optvars,
                                                           RecordArray<ValueType>& dlogpsi)
 {
-  const int nparam = dlogpsi.getNumOfParams();
-  for (int iw = 0; iw < wf_list.size(); iw++)
+  auto& leader = wf_list.getLeader();
+  if (wf_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wf_list.size())
+    throw std::invalid_argument("TrialWaveFunction batched score inputs have inconsistent shapes");
+
+  for (int component = 0; component < leader.Z.size(); ++component)
   {
-    Vector<ValueType> dlogpsi_record_view(dlogpsi[iw], nparam);
-    wf_list[iw].evaluateDerivativesWF(p_list[iw], optvars, dlogpsi_record_view);
+    ScopedTimer component_timer(leader.WFC_timers_[DERIVS_TIMER + TIMER_SKIP * component]);
+    const auto wfc_list(extractWFCRefList(wf_list, component));
+    leader.Z[component]->mw_evaluateParameterDerivativesWF(wfc_list, p_list, optvars, dlogpsi);
   }
 }
 

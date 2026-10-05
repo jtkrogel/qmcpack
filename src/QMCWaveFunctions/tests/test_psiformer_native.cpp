@@ -110,6 +110,16 @@ void checkClose(double actual, double expected, double relative = 2e-10, double 
   CHECK(actual == Catch::Approx(expected).epsilon(relative).margin(absolute));
 }
 
+void checkVectorClose(const std::vector<double>& actual,
+                      const std::vector<double>& expected,
+                      double relative,
+                      double absolute)
+{
+  REQUIRE(actual.size() == expected.size());
+  for (std::size_t index = 0; index < actual.size(); ++index)
+    checkClose(actual[index], expected[index], relative, absolute);
+}
+
 void validateCase(const std::string& system, const Golden& golden, bool finite_differences)
 {
   GeneratedFiles files = generateFiles(system);
@@ -303,7 +313,7 @@ TEST_CASE("PsiFormer explicit parameter derivative requests and total-gradient s
 
   const pf::Result standalone = model.evaluate(
       electrons, pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_AND_KINETIC, nullptr});
-  CHECK(log_only.param_gradient == standalone.param_gradient);
+  checkVectorClose(log_only.param_gradient, standalone.param_gradient, 2e-10, 2e-10);
   REQUIRE(standalone.local_energy_param_gradient.size() == model.p.size());
 
   std::vector<double> extra_gradient(standalone.gradient.size());
@@ -345,6 +355,102 @@ TEST_CASE("PsiFormer explicit parameter derivative requests and total-gradient s
                       electrons,
                       pf::EvaluationRequest{pf::ParameterDerivativeRequest::LOG_AND_KINETIC, &wrong_total_gradient}),
                   std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer observable requests return only requested products", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  const pf::Result oracle    = model.evaluate(electrons, true);
+
+  pf::EvaluationRequest value_request;
+  value_request.spatial_derivatives    = pf::SpatialDerivativeRequest::NONE;
+  value_request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result value_only          = model.evaluate(electrons, value_request);
+  checkClose(value_only.sign, oracle.sign);
+  checkClose(value_only.logabs, oracle.logabs);
+  checkClose(value_only.value, oracle.value, 2e-9, 1e-24);
+  CHECK(value_only.gradient.empty());
+  CHECK(value_only.active_gradient.empty());
+  CHECK(value_only.lap_log.empty());
+  CHECK(value_only.lap_ratio.empty());
+  CHECK(value_only.potential.empty());
+  CHECK_FALSE(value_only.has_local_energy);
+  CHECK(value_only.param_gradient.empty());
+  CHECK(value_only.local_energy_param_gradient.empty());
+
+  pf::EvaluationRequest spatial_request;
+  spatial_request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result spatial_only          = model.evaluate(electrons, spatial_request);
+  checkVectorClose(spatial_only.gradient, oracle.gradient, 2e-9, 2e-9);
+  checkVectorClose(spatial_only.lap_log, oracle.lap_log, 2e-8, 2e-8);
+  checkVectorClose(spatial_only.lap_ratio, oracle.lap_ratio, 2e-8, 2e-8);
+  CHECK(spatial_only.active_gradient.empty());
+  CHECK(spatial_only.potential.empty());
+  CHECK_FALSE(spatial_only.has_local_energy);
+
+  for (std::size_t electron = 0; electron < model.ne; ++electron)
+  {
+    pf::EvaluationRequest active_request;
+    active_request.spatial_derivatives    = pf::SpatialDerivativeRequest::ACTIVE_ELECTRON_GRADIENT;
+    active_request.active_electron        = electron;
+    active_request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+    const pf::Result active               = model.evaluate(electrons, active_request);
+    REQUIRE(active.active_gradient.size() == 3);
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      checkClose(active.active_gradient[dimension], oracle.gradient[3 * electron + dimension], 2e-9, 2e-9);
+    CHECK(active.gradient.empty());
+    CHECK(active.lap_log.empty());
+    CHECK(active.lap_ratio.empty());
+  }
+
+  pf::EvaluationRequest score_request;
+  score_request.parameter_derivatives    = pf::ParameterDerivativeRequest::LOG_ONLY;
+  score_request.spatial_derivatives      = pf::SpatialDerivativeRequest::NONE;
+  score_request.validation_hamiltonian   = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result score_only            = model.evaluate(electrons, score_request);
+  checkVectorClose(score_only.param_gradient, oracle.param_gradient, 2e-8, 2e-9);
+  CHECK(score_only.gradient.empty());
+  CHECK(score_only.lap_log.empty());
+  CHECK(score_only.potential.empty());
+  CHECK_FALSE(score_only.has_local_energy);
+  CHECK(score_only.local_energy_param_gradient.empty());
+
+  pf::EvaluationRequest kinetic_request;
+  kinetic_request.parameter_derivatives  = pf::ParameterDerivativeRequest::LOG_AND_KINETIC;
+  kinetic_request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result kinetic                = model.evaluate(electrons, kinetic_request);
+  checkVectorClose(kinetic.gradient, oracle.gradient, 2e-9, 2e-9);
+  checkVectorClose(kinetic.param_gradient, oracle.param_gradient, 2e-8, 2e-9);
+  checkVectorClose(kinetic.local_energy_param_gradient, oracle.local_energy_param_gradient, 2e-8, 2e-8);
+  CHECK(kinetic.potential.empty());
+  CHECK_FALSE(kinetic.has_local_energy);
+}
+
+TEST_CASE("PsiFormer rejects incompatible observable requests", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::Tensor electrons = model.cfg.configuration(0);
+
+  pf::EvaluationRequest invalid_active;
+  invalid_active.spatial_derivatives    = pf::SpatialDerivativeRequest::ACTIVE_ELECTRON_GRADIENT;
+  invalid_active.active_electron        = model.ne;
+  invalid_active.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  CHECK_THROWS_AS(model.evaluate(electrons, invalid_active), std::out_of_range);
+
+  pf::EvaluationRequest invalid_kinetic;
+  invalid_kinetic.parameter_derivatives  = pf::ParameterDerivativeRequest::LOG_AND_KINETIC;
+  invalid_kinetic.spatial_derivatives    = pf::SpatialDerivativeRequest::NONE;
+  invalid_kinetic.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  CHECK_THROWS_AS(model.evaluate(electrons, invalid_kinetic), std::invalid_argument);
+
+  std::vector<double> total_gradient(3 * model.ne, 0.0);
+  pf::EvaluationRequest invalid_seed;
+  invalid_seed.total_log_gradient      = &total_gradient;
+  invalid_seed.validation_hamiltonian  = pf::ValidationHamiltonianRequest::NONE;
+  CHECK_THROWS_AS(model.evaluate(electrons, invalid_seed), std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer rejects malformed or non-finite HDF5 exports", "[wavefunction][psiformer]")

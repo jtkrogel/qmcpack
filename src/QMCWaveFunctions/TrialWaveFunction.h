@@ -71,15 +71,16 @@ public:
   using FullPrecRealType = WaveFunctionComponent::FullPrecRealType;
 #endif
 
-  using ValueType    = WaveFunctionComponent::ValueType;
-  using ValueVector  = WaveFunctionComponent::ValueVector;
-  using GradType     = WaveFunctionComponent::GradType;
-  using BufferType   = WaveFunctionComponent::BufferType;
-  using WFBufferType = WaveFunctionComponent::WFBufferType;
-  using HessType     = WaveFunctionComponent::HessType;
-  using HessVector   = WaveFunctionComponent::HessVector;
-  using LogValue     = WaveFunctionComponent::LogValue;
-  using PsiValue     = WaveFunctionComponent::PsiValue;
+  using ValueType               = WaveFunctionComponent::ValueType;
+  using ValueVector             = WaveFunctionComponent::ValueVector;
+  using GradType                = WaveFunctionComponent::GradType;
+  using BufferType              = WaveFunctionComponent::BufferType;
+  using WFBufferType            = WaveFunctionComponent::WFBufferType;
+  using HessType                = WaveFunctionComponent::HessType;
+  using HessVector              = WaveFunctionComponent::HessVector;
+  using LogValue                = WaveFunctionComponent::LogValue;
+  using PsiValue                = WaveFunctionComponent::PsiValue;
+  using ParameterDerivativeView = WaveFunctionComponent::ParameterDerivativeView;
 
   using SPOMap = SPOSet::SPOMap;
 
@@ -340,6 +341,30 @@ public:
                            const OptVariables& optvars,
                            std::vector<ValueType>& ratios,
                            Matrix<ValueType>& dratio);
+
+  /** Form total virtual ratios and directly reduce weighted log-ratio derivatives.
+   *
+   * bare_weights excludes the wavefunction ratio.  This routine multiplies it
+   * by the complete selected TrialWaveFunction ratio before asking each selected
+   * component for its logarithmic derivative contribution, preserving product
+   * algebra for mixed wavefunctions.
+   */
+  void evaluateDerivRatiosWeighted(const VirtualParticleSet& VP,
+                                   const OptVariables& optvars,
+                                   const std::vector<ValueType>& bare_weights,
+                                   std::vector<ValueType>& ratios,
+                                   ParameterDerivativeView weighted_derivatives,
+                                   ComputeType ct = ComputeType::ALL);
+
+  /** Component-major batched form of evaluateDerivRatiosWeighted. */
+  static void mw_evaluateDerivRatiosWeighted(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<const VirtualParticleSet>& vp_list,
+      const OptVariables& optvars,
+      const RefVector<const std::vector<ValueType>>& bare_weights,
+      const RefVector<std::vector<ValueType>>& ratios,
+      const std::vector<ParameterDerivativeView>& weighted_derivatives,
+      ComputeType ct = ComputeType::ALL);
 
   /** compute both ratios and deriatives of ratio with respect to the optimizables
    * Used by SOECP for exact spin integration. spinor_multiplier contains the contribution of the SOECP

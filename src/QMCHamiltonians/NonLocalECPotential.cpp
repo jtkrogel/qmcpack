@@ -144,6 +144,140 @@ void NonLocalECPotential::mw_evaluate(const RefVectorWithLeader<OperatorBase>& o
                                       const RefVectorWithLeader<ParticleSet>& p_list) const
 { mw_evaluateImpl(o_list, wf_list, p_list, false, std::nullopt); }
 
+void NonLocalECPotential::mw_evaluateWithParameterDerivatives(
+    const RefVectorWithLeader<OperatorBase>& o_list,
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const OptVariables& optvars,
+    const RecordArray<ValueType>& dlogpsi,
+    RecordArray<ValueType>& dhpsioverpsi) const
+{
+  auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
+  assert(this == &leader);
+  const std::size_t walker_count = o_list.size();
+  if (wf_list.size() != walker_count || p_list.size() != walker_count ||
+      dlogpsi.getNumOfEntries() != walker_count || dhpsioverpsi.getNumOfEntries() != walker_count ||
+      dlogpsi.getNumOfParams() != dhpsioverpsi.getNumOfParams())
+    throw std::invalid_argument("NonLocalECPotential derivative batch has inconsistent shapes");
+  if (walker_count == 0)
+    return;
+
+  // Direct unit-test and legacy callers may invoke this interface without the
+  // normal Hamiltonian ResourceCollection lifecycle.  They must retain the
+  // established serialized behavior rather than dereferencing an empty handle.
+  if (!leader.mw_res_handle_)
+  {
+    leader.OperatorBase::mw_evaluateWithParameterDerivatives(o_list, wf_list, p_list, optvars, dlogpsi,
+                                                              dhpsioverpsi);
+    return;
+  }
+
+  // The legacy non-VP route mutates one accepted configuration per knot and
+  // needs its reference dlogpsi row. Preserve it through OperatorBase's
+  // serialized compatibility implementation.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+    if (!o_list.getCastedElement<NonLocalECPotential>(walker).vp_)
+    {
+      leader.OperatorBase::mw_evaluateWithParameterDerivatives(o_list, wf_list, p_list, optvars, dlogpsi,
+                                                                dhpsioverpsi);
+      return;
+    }
+
+  const int parameter_count = dhpsioverpsi.getNumOfParams();
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& potential       = o_list.getCastedElement<NonLocalECPotential>(walker);
+    const ParticleSet& ps = p_list[walker];
+    for (const auto& component : potential.PPset)
+      if (component)
+        component->rotateQuadratureGrid(generateRandomRotationMatrix(*potential.myRNG));
+
+    const auto& distance_table = ps.getDistTableAB(potential.myTableIndex);
+    for (int group = 0; group < ps.groups(); ++group)
+    {
+      auto& jobs = potential.nlpp_jobs[group];
+      jobs.clear();
+      for (int electron = ps.first(group); electron < ps.last(group); ++electron)
+      {
+        const auto& distances     = distance_table.getDistRow(electron);
+        const auto& displacements = distance_table.getDisplRow(electron);
+        for (int ion = 0; ion < potential.PP.size(); ++ion)
+          if (potential.PP[ion] && distances[ion] < potential.PP[ion]->getRmax())
+            jobs.emplace_back(ion, electron, distances[ion], -displacements[ion]);
+      }
+    }
+    potential.value_ = 0.0;
+  }
+
+  const auto leader_component =
+      std::find_if(leader.PPset.begin(), leader.PPset.end(), [](const auto& component) { return bool(component); });
+  if (leader_component == leader.PPset.end())
+    return;
+
+  std::vector<Real> pair_potentials(walker_count);
+  auto& shared_collection = leader.mw_res_handle_.getResource().collection;
+  RefVector<NonLocalECPotential> potential_batch;
+  RefVectorWithLeader<NonLocalECPComponent> component_batch(**leader_component);
+  RefVectorWithLeader<ParticleSet> particle_batch(p_list.getLeader());
+  RefVectorWithLeader<VirtualParticleSet> virtual_particle_batch(*leader.vp_);
+  RefVectorWithLeader<TrialWaveFunction> wavefunction_batch(wf_list.getLeader());
+  RefVector<const NLPPJob<Real>> job_batch;
+  std::vector<TrialWaveFunction::ParameterDerivativeView> derivative_batch;
+
+  potential_batch.reserve(walker_count);
+  component_batch.reserve(walker_count);
+  particle_batch.reserve(walker_count);
+  virtual_particle_batch.reserve(walker_count);
+  wavefunction_batch.reserve(walker_count);
+  job_batch.reserve(walker_count);
+  derivative_batch.reserve(walker_count);
+
+  // A clone owns one VirtualParticleSet, so each compact subbatch contains at
+  // most one active ion-electron job from a walker. Unequal job counts produce
+  // naturally ragged batches without padding or reordering quadrature points.
+  for (int group = 0; group < p_list.getLeader().groups(); ++group)
+  {
+    TrialWaveFunction::mw_prepareGroup(wf_list, p_list, group);
+    std::size_t maximum_jobs = 0;
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+      maximum_jobs = std::max(maximum_jobs,
+                              o_list.getCastedElement<NonLocalECPotential>(walker).nlpp_jobs[group].size());
+
+    for (std::size_t job_index = 0; job_index < maximum_jobs; ++job_index)
+    {
+      potential_batch.clear();
+      component_batch.clear();
+      particle_batch.clear();
+      virtual_particle_batch.clear();
+      wavefunction_batch.clear();
+      job_batch.clear();
+      derivative_batch.clear();
+
+      for (std::size_t walker = 0; walker < walker_count; ++walker)
+      {
+        auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+        if (job_index >= potential.nlpp_jobs[group].size())
+          continue;
+
+        const auto& job = potential.nlpp_jobs[group][job_index];
+        potential_batch.push_back(std::ref(potential));
+        component_batch.push_back(std::ref(*potential.PP[job.ion_id]));
+        particle_batch.push_back(std::ref(p_list[walker]));
+        virtual_particle_batch.push_back(std::ref(*potential.vp_));
+        wavefunction_batch.push_back(std::ref(wf_list[walker]));
+        job_batch.push_back(std::cref(job));
+        derivative_batch.push_back({dhpsioverpsi[walker], static_cast<std::size_t>(parameter_count)});
+      }
+
+      NonLocalECPComponent::mw_evaluateValueAndDerivatives(
+          component_batch, particle_batch, virtual_particle_batch, wavefunction_batch, job_batch, optvars,
+          derivative_batch, pair_potentials, shared_collection);
+      for (std::size_t batch_index = 0; batch_index < potential_batch.size(); ++batch_index)
+        potential_batch[batch_index].get().value_ += pair_potentials[batch_index];
+    }
+  }
+}
+
 NonLocalECPotential::Return_t NonLocalECPotential::evaluateWithToperator(TrialWaveFunction& psi, ParticleSet& P)
 {
   evaluateImpl(psi, P, true);

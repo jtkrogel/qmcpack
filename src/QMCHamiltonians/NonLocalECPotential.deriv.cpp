@@ -74,20 +74,28 @@ NonLocalECPComponent::RealType NonLocalECPComponent::evaluateValueAndDerivatives
     Vector<ValueType>& dhpsioverpsi)
 {
   const size_t num_vars = optvars.size_of_active();
-  dratio.resize(nknot, num_vars);
-  dlogpsi_vp.resize(dlogpsi.size());
 
   buildQuadraturePointDeltaPosAndPartialPotential(r, dr, deltaV_, knot_pots_);
 
   if (vp)
   {
     VirtualParticleSet& vp_set(*vp);
-    // Compute ratios with VP
+    // The partial potential is the bare quadrature weight. TrialWaveFunction
+    // multiplies it by the complete product ratio before reducing component
+    // log-ratio derivatives into the caller's existing output row.
     vp_set.makeMoves(W, iel, deltaV_, true, iat);
-    psi.evaluateDerivRatios(vp_set, optvars, psiratio, dratio);
+    for (int knot = 0; knot < nknot; ++knot)
+      wvec[knot] = ValueType(knot_pots_[knot]);
+    psi.evaluateDerivRatiosWeighted(vp_set, optvars, wvec, psiratio,
+                                    {dhpsioverpsi.data(), static_cast<std::size_t>(dhpsioverpsi.size())});
   }
   else
   {
+    // Preserve the legacy particle-by-particle compatibility route. Only this
+    // non-VP fallback materializes an nknot-by-nparameter matrix.
+    dratio.resize(nknot, num_vars);
+    std::fill(dratio.begin(), dratio.end(), ValueType(0));
+    dlogpsi_vp.resize(dlogpsi.size());
     for (int j = 0; j < nknot; j++)
     {
       W.makeMove(iel, deltaV_[j]);
@@ -115,9 +123,77 @@ NonLocalECPComponent::RealType NonLocalECPComponent::evaluateValueAndDerivatives
     pairpot += std::real(wvec[j]);
   }
 
-  BLAS::gemv('N', num_vars, nknot, 1.0, dratio.data(), num_vars, wvec.data(), 1, 1.0, dhpsioverpsi.data(), 1);
+  if (!vp)
+    BLAS::gemv('N', num_vars, nknot, 1.0, dratio.data(), num_vars, wvec.data(), 1, 1.0,
+               dhpsioverpsi.data(), 1);
 
   return pairpot;
+}
+
+void NonLocalECPComponent::mw_evaluateValueAndDerivatives(
+    const RefVectorWithLeader<NonLocalECPComponent>& ecp_component_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_list,
+    const RefVectorWithLeader<TrialWaveFunction>& psi_list,
+    const RefVector<const NLPPJob<RealType>>& joblist,
+    const OptVariables& optvars,
+    const std::vector<TrialWaveFunction::ParameterDerivativeView>& weighted_derivatives,
+    std::vector<RealType>& pairpots,
+    ResourceCollection& collection)
+{
+  const std::size_t batch_size = ecp_component_list.size();
+  if (p_list.size() != batch_size || vp_list.size() != batch_size || psi_list.size() != batch_size ||
+      joblist.size() != batch_size || weighted_derivatives.size() != batch_size || pairpots.size() < batch_size)
+    throw std::invalid_argument("NonLocalECPComponent derivative batch has inconsistent sizes");
+  if (batch_size == 0)
+    return;
+
+  RefVector<const std::vector<PosType>> displacement_list;
+  RefVector<const std::vector<ValueType>> bare_weight_list;
+  RefVector<std::vector<ValueType>> ratio_list;
+  displacement_list.reserve(batch_size);
+  bare_weight_list.reserve(batch_size);
+  ratio_list.reserve(batch_size);
+
+  // Build each ragged job's quadrature positions and partial potentials before
+  // entering the component-major TrialWaveFunction batch traversal.
+  for (std::size_t batch_index = 0; batch_index < batch_size; ++batch_index)
+  {
+    NonLocalECPComponent& component = ecp_component_list[batch_index];
+    const NLPPJob<RealType>& job    = joblist[batch_index];
+    component.buildQuadraturePointDeltaPosAndPartialPotential(
+        job.ion_elec_dist, job.ion_elec_displ, component.deltaV_, component.knot_pots_);
+    for (int knot = 0; knot < component.nknot; ++knot)
+      component.wvec[knot] = ValueType(component.knot_pots_[knot]);
+
+    displacement_list.push_back(std::cref(component.deltaV_));
+    bare_weight_list.push_back(std::cref(component.wvec));
+    ratio_list.push_back(std::ref(component.psiratio));
+  }
+
+  RefVectorWithLeader<const VirtualParticleSet> const_vp_list(vp_list.getLeader());
+  const_vp_list.reserve(batch_size);
+  for (VirtualParticleSet& virtual_particles : vp_list)
+    const_vp_list.push_back(virtual_particles);
+
+  ResourceCollectionTeamLock<VirtualParticleSet> vp_resource_lock(collection, vp_list);
+  VirtualParticleSet::mw_makeMoves(vp_list, p_list, displacement_list, joblist, true);
+  TrialWaveFunction::mw_evaluateDerivRatiosWeighted(psi_list, const_vp_list, optvars, bare_weight_list,
+                                                    ratio_list, weighted_derivatives);
+
+  // Energy and derivative reductions consume identical total ratios and bare
+  // potentials, preventing the two observable paths from drifting apart.
+  for (std::size_t batch_index = 0; batch_index < batch_size; ++batch_index)
+  {
+    NonLocalECPComponent& component = ecp_component_list[batch_index];
+    RealType pair_potential         = 0;
+    for (int knot = 0; knot < component.nknot; ++knot)
+    {
+      component.wvec[knot] = component.knot_pots_[knot] * component.psiratio[knot];
+      pair_potential += std::real(component.wvec[knot]);
+    }
+    pairpots[batch_index] = pair_potential;
+  }
 }
 
 } // namespace qmcplusplus

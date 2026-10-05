@@ -110,6 +110,12 @@ set(TRIALWF_SRC
     test_lattice_gaussian.cpp
     test_twf_fastderiv_raii.cpp
     test_TWFGrads.cpp
+    test_psiformer_execution_plan.cpp
+    test_psiformer_geometry.cpp
+    test_psiformer_buffer.cpp
+    test_psiformer_guards.cpp
+    test_psiformer_multiwalker.cpp
+    test_psiformer_threading.cpp
     test_psiformer_wf.cpp)
 if(ENABLE_DEEPQMC_INFERENCE)
   set(TRIALWF_SRC ${TRIALWF_SRC} test_deepqmc_wfc.cpp)
@@ -218,6 +224,27 @@ endforeach()
 
 target_link_libraries(test_wavefunction_trialwf IO::HDF5)
 
+# The ordinary deterministic suite covers the one-thread layout. Exercise the
+# same crowd API once with two outer threads while keeping BLAS single-threaded;
+# this is an oversubscription/lifetime guard, not a performance threshold.
+set(PSIFORMER_THREAD_TEST deterministic-unit_test_psiformer_crowd-t2)
+add_unit_test(${PSIFORMER_THREAD_TEST}
+              1 2
+              $<TARGET_FILE:test_wavefunction_trialwf>
+              "[psiformer][multiwalker]")
+set_tests_properties(${PSIFORMER_THREAD_TEST} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+set_property(
+  TEST ${PSIFORMER_THREAD_TEST}
+  APPEND
+  PROPERTY ENVIRONMENT
+           "OPENBLAS_NUM_THREADS=1"
+           "MKL_NUM_THREADS=1"
+           "BLIS_NUM_THREADS=1"
+           "VECLIB_MAXIMUM_THREADS=1"
+           "OMP_MAX_ACTIVE_LEVELS=1"
+           "OMP_PROC_BIND=spread"
+           "OMP_PLACES=cores")
+
 if(BUILD_MICRO_BENCHMARKS)
   # This executable is intentionally not registered with CTest. It reports
   # wall time and peak RSS for developer-selected parameter counts without
@@ -236,6 +263,25 @@ if(BUILD_MICRO_BENCHMARKS)
       qmcparticle_omptarget
       qmcwfs_omptarget)
   endif()
+
+  # This native evaluator benchmark consumes developer-supplied exported HDF5
+  # data and therefore is built, but not registered as a CTest test.
+  add_executable(benchmark_psiformer_native
+                 benchmark_psiformer_native.cpp
+                 ../PsiFormer/PsiFormerExecutionPlan.cpp
+                 ../PsiFormer/PsiFormerGeometry.cpp)
+  target_link_libraries(benchmark_psiformer_native IO::HDF5 platform_LA)
+  target_include_directories(benchmark_psiformer_native PRIVATE "${qmcpack_SOURCE_DIR}/src")
+
+  # Paired direct/oracle manifest for every optimized evaluator mode.  Like the
+  # historical benchmark above, this requires developer-supplied exports and is
+  # intentionally not registered with CTest.
+  add_executable(benchmark_psiformer_modes
+                 benchmark_psiformer_modes.cpp
+                 ../PsiFormer/PsiFormerExecutionPlan.cpp
+                 ../PsiFormer/PsiFormerGeometry.cpp)
+  target_link_libraries(benchmark_psiformer_modes IO::HDF5 platform_LA)
+  target_include_directories(benchmark_psiformer_modes PRIVATE "${qmcpack_SOURCE_DIR}/src")
 endif()
 
 if(ENABLE_DEEPQMC_INFERENCE AND BUILD_MICRO_BENCHMARKS)
@@ -284,6 +330,95 @@ target_link_libraries(test_psiformer_native catch_main IO::HDF5)
 target_include_directories(test_psiformer_native PRIVATE "${qmcpack_SOURCE_DIR}/src")
 add_unit_test(deterministic-unit_test_psiformer_native 1 1 $<TARGET_FILE:test_psiformer_native>)
 set_tests_properties(deterministic-unit_test_psiformer_native PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_executable(test_psiformer_value_executor
+               test_psiformer_value_executor.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_value_executor catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_value_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_value_executor
+              1 1 $<TARGET_FILE:test_psiformer_value_executor>)
+set_tests_properties(deterministic-unit_test_psiformer_value_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_executable(test_psiformer_score_executor
+               test_psiformer_score_executor.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_score_executor catch_main IO::HDF5)
+target_include_directories(test_psiformer_score_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_score_executor
+              1 1 $<TARGET_FILE:test_psiformer_score_executor>)
+set_tests_properties(deterministic-unit_test_psiformer_score_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_executable(test_psiformer_spatial_executor
+               test_psiformer_spatial_executor.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_spatial_executor catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_spatial_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_spatial_executor
+              1 1 $<TARGET_FILE:test_psiformer_spatial_executor>)
+set_tests_properties(deterministic-unit_test_psiformer_spatial_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# This standalone suite deliberately avoids model/HDF5 fixtures so adversarial
+# determinant arithmetic remains inexpensive enough for ordinary deterministic CI.
+add_executable(test_psiformer_determinant test_psiformer_determinant.cpp)
+target_include_directories(test_psiformer_determinant PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_determinant
+              1 1 $<TARGET_FILE:test_psiformer_determinant>)
+set_tests_properties(deterministic-unit_test_psiformer_determinant PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# Keep the native-header kinetic oracle isolated because PsiFormerNative.h owns
+# non-inline definitions.  The direct executor itself remains header-only.
+add_executable(test_psiformer_kinetic_executor
+               test_psiformer_kinetic_executor.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_kinetic_executor catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_kinetic_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_kinetic_executor
+              1 1 $<TARGET_FILE:test_psiformer_kinetic_executor>)
+set_tests_properties(deterministic-unit_test_psiformer_kinetic_executor
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# Keep the replaceable global allocation operators isolated from the broad
+# TrialWaveFunction binary while exercising the real public component boundary.
+add_executable(test_psiformer_adapter_sinks test_psiformer_adapter_sinks.cpp)
+target_link_libraries(
+  test_psiformer_adapter_sinks
+  catch_main
+  qmcwfs
+  platform_LA
+  platform_runtime
+  utilities_for_test
+  container_testing
+  minimal_particle_pool
+  IO::HDF5)
+if(USE_OBJECT_TARGET)
+  target_link_libraries(
+    test_psiformer_adapter_sinks
+    qmcutil
+    qmcparticle
+    qmcparticle_omptarget
+    qmcwfs_omptarget
+    platform_omptarget_LA)
+endif()
+target_include_directories(test_psiformer_adapter_sinks PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+add_unit_test(deterministic-unit_test_psiformer_adapter_sinks
+              1 1 $<TARGET_FILE:test_psiformer_adapter_sinks>)
+set_tests_properties(deterministic-unit_test_psiformer_adapter_sinks
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+set_property(
+  TEST deterministic-unit_test_psiformer_adapter_sinks
+  APPEND
+  PROPERTY ENVIRONMENT
+           "OPENBLAS_NUM_THREADS=1"
+           "MKL_NUM_THREADS=1"
+           "BLIS_NUM_THREADS=1"
+           "VECLIB_MAXIMUM_THREADS=1"
+           "OMP_NUM_THREADS=1"
+           "OMP_MAX_ACTIVE_LEVELS=1")
 
 get_property(CURRENT_TESTS DIRECTORY PROPERTY TESTS)
 add_labels_for_tests("${CURRENT_TESTS}")

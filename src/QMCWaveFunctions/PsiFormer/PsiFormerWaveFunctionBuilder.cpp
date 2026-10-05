@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -80,6 +82,20 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   if (targetPtcl.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electron particle sets");
+  if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
+    throw std::invalid_argument(
+        "PsiFormer supports only open-boundary molecular particle sets; periodic execution is not implemented");
+  if (optimization_enabled)
+  {
+    const auto& masses = targetPtcl.get_mass_by_group();
+    if (masses.size() == 0 ||
+        masses.size() < static_cast<std::size_t>(targetPtcl.groups()) ||
+        !targetPtcl.isSameMass() ||
+        std::abs(masses[0] - 1.0) > 64.0 * std::numeric_limits<double>::epsilon())
+      throw std::invalid_argument(
+          "PsiFormer optimization requires initialized unit electron masses; "
+          "inference observables are mass independent");
+  }
   if (system != "auto" && system != "all_electron" && system != "pseudopotential")
     throw std::invalid_argument("PsiFormer system must be auto, all_electron, or pseudopotential");
   if (optimization_enabled && system == "auto")

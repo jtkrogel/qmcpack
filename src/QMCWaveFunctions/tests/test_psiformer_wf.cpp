@@ -16,13 +16,16 @@
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
 #include "Particle/VirtualParticleSet.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "ResourceCollection.h"
 #include "Utilities/RuntimeOptions.h"
 #include "io/hdf/hdf_archive.h"
 #include "psiformer_test_utils.h"
 
+#include <array>
 #include <cmath>
 #include <complex>
 #include <filesystem>
@@ -33,6 +36,21 @@
 
 namespace qmcplusplus
 {
+namespace testing
+{
+/** Access only the crowd-workspace ownership diagnostic used by this test. */
+class TestPsiFormerWF
+{
+public:
+  static std::array<std::size_t, 2> directKineticWorkspaceOwnership(
+      const PsiFormerWF& leader,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list)
+  {
+    return leader.directKineticWorkspaceOwnershipForTesting(wfc_list);
+  }
+};
+} // namespace testing
+
 namespace
 {
 using namespace testing::psiformer;
@@ -45,6 +63,13 @@ ParticleSet makeLiHElectrons(const SimulationCell& simulation_cell)
   ParticleSet electrons(simulation_cell);
   electrons.setName("e");
   electrons.create({2, 2});
+  SpeciesSet& species = electrons.getSpeciesSet();
+  species.addSpecies("u");
+  species.addSpecies("d");
+  const int mass = species.addAttribute("mass");
+  species(mass, 0) = 1.0;
+  species(mass, 1) = 1.0;
+  electrons.resetGroups();
   for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
     for (int dimension = 0; dimension < 3; ++dimension)
       electrons.R[electron][dimension] = geometry.electrons[3 * electron + dimension];
@@ -317,6 +342,111 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
                     Catch::Matchers::ContainsSubstring("spinor"));
 }
 
+TEST_CASE("PsiFormer specialized public evaluation paths preserve high-level results", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component(
+      "pf_requests", files.parameters.string(), files.configuration.string(), true, {0, 127});
+  OptVariables active = registerSelectedParameters(component);
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue reference_log = component.evaluateLog(electrons, electrons.G, electrons.L);
+  const ParticleSet::ParticleGradient reference_gradient = electrons.G;
+
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+  {
+    const PsiFormerWF::GradType active_gradient = component.evalGrad(electrons, electron);
+    for (int dimension = 0; dimension < 3; ++dimension)
+      CHECK(std::real(active_gradient[dimension]) ==
+            Catch::Approx(std::real(reference_gradient[electron][dimension])).epsilon(2e-9).margin(2e-9));
+  }
+
+  constexpr int moved_electron = 1;
+  const ParticleSet::SingleParticlePos displacement{0.08, -0.03, 0.02};
+  ParticleSet moved = makeLiHElectrons(simulation_cell);
+  moved.R[moved_electron] += displacement;
+  moved.update();
+  PsiFormerWF moved_reference("pf_requests_moved", files.parameters.string(), files.configuration.string());
+  moved.G = ValueType(0);
+  moved.L = ValueType(0);
+  const PsiFormerWF::LogValue moved_log = moved_reference.evaluateLog(moved, moved.G, moved.L);
+  const auto expected_ratio             = std::exp(moved_log - reference_log);
+
+  electrons.makeMove(moved_electron, displacement);
+  const ValueType ratio = component.ratio(electrons, moved_electron);
+  CHECK(std::real(ratio) == Catch::Approx(std::real(expected_ratio)).epsilon(2e-9).margin(2e-12));
+  CHECK(std::imag(ratio) == Catch::Approx(std::imag(expected_ratio)).epsilon(2e-9).margin(2e-12));
+  component.restore(moved_electron);
+  electrons.rejectMove(moved_electron);
+
+  electrons.makeMove(moved_electron, displacement);
+  PsiFormerWF::GradType proposed_gradient;
+  const ValueType ratio_with_gradient = component.ratioGrad(electrons, moved_electron, proposed_gradient);
+  CHECK(std::real(ratio_with_gradient) ==
+        Catch::Approx(std::real(expected_ratio)).epsilon(2e-9).margin(2e-12));
+  CHECK(std::imag(ratio_with_gradient) ==
+        Catch::Approx(std::imag(expected_ratio)).epsilon(2e-9).margin(2e-12));
+  for (int dimension = 0; dimension < 3; ++dimension)
+    CHECK(std::real(proposed_gradient[dimension]) ==
+          Catch::Approx(std::real(moved.G[moved_electron][dimension])).epsilon(2e-9).margin(2e-9));
+  component.restore(moved_electron);
+  electrons.rejectMove(moved_electron);
+
+  Vector<ValueType> score_only(active.size());
+  Vector<ValueType> score_with_kinetic(active.size());
+  Vector<ValueType> kinetic(active.size());
+  score_only         = ValueType(0.375);
+  score_with_kinetic = ValueType(-0.125);
+  kinetic            = ValueType(0.625);
+  component.evaluateDerivativesWF(electrons, active, score_only);
+  component.evaluateDerivatives(electrons, active, score_with_kinetic, kinetic);
+  for (int parameter = 0; parameter < active.size(); ++parameter)
+    CHECK(std::real(score_only[parameter]) - 0.375 ==
+          Catch::Approx(std::real(score_with_kinetic[parameter]) + 0.125).epsilon(2e-10).margin(2e-10));
+}
+
+TEST_CASE("PsiFormer kinetic parameter derivatives require unit electron masses",
+          "[wavefunction][psiformer][optimizer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component(
+      "pf_unit_mass", files.parameters.string(), files.configuration.string(), true, {0});
+  OptVariables active = registerSelectedParameters(component);
+
+  SpeciesSet& species = electrons.getSpeciesSet();
+  const int mass       = species.getAttribute("mass");
+  REQUIRE(mass < species.numAttributes());
+  SECTION("equal nonunit masses")
+  {
+    species(mass, 0) = 2.0;
+    species(mass, 1) = 2.0;
+  }
+  SECTION("unequal masses")
+  {
+    species(mass, 0) = 1.0;
+    species(mass, 1) = 2.0;
+  }
+  electrons.resetGroups();
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  Vector<ValueType> score(active.size());
+  Vector<ValueType> kinetic_response(active.size());
+  score            = ValueType(0);
+  kinetic_response = ValueType(0);
+
+  // A score-only reverse does not use the electron masses and remains valid.
+  CHECK_NOTHROW(component.evaluateDerivativesWF(electrons, active, score));
+  CHECK_THROWS_WITH(component.evaluateDerivatives(electrons, active, score, kinetic_response),
+                    Catch::Matchers::ContainsSubstring("require unit electron masses"));
+}
+
 TEST_CASE("PsiFormer nonlocal virtual ratios and parameter derivatives", "[wavefunction][psiformer][ecp]")
 {
   GeneratedFiles files = generateFiles("lih");
@@ -553,6 +683,119 @@ TEST_CASE("PsiFormer selected parameters follow QMCPACK registration reset and d
   CHECK(std::abs(updated_log - baseline_log) > 1e-8);
 }
 
+TEST_CASE("PsiFormer component-major kinetic derivatives reuse one crowd tape",
+          "[wavefunction][psiformer][multiwalker]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+
+  ParticleSet batch_electrons0 = makeLiHElectrons(simulation_cell);
+  ParticleSet batch_electrons1 = makeLiHElectrons(simulation_cell);
+  batch_electrons1.R[0][0] += 0.11;
+  batch_electrons1.update();
+
+  PsiFormerWF leader(
+      "pf_kinetic_pool", files.parameters.string(), files.configuration.string(), true, {0, 127});
+  OptVariables active = registerSelectedParameters(leader);
+  std::unique_ptr<WaveFunctionComponent> clone_storage = leader.makeClone(batch_electrons1);
+  auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
+  REQUIRE(clone != nullptr);
+  clone->checkOutVariables(active);
+
+  // Build the complete TrialWaveFunction drift independently for each walker.
+  // The added factors emulate distinct surrounding wavefunction components.
+  auto initialize_total_drift = [](PsiFormerWF& component, ParticleSet& electrons, double scale) {
+    electrons.G = ValueType(0);
+    electrons.L = ValueType(0);
+    component.evaluateLog(electrons, electrons.G, electrons.L);
+    for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        electrons.G[electron][dimension] +=
+            ValueType(scale * (1 + 3 * electron + dimension));
+  };
+  initialize_total_drift(leader, batch_electrons0, 0.007);
+  initialize_total_drift(*clone, batch_electrons1, -0.011);
+
+  RefVectorWithLeader<WaveFunctionComponent> components(leader, {leader, *clone});
+  RefVectorWithLeader<ParticleSet> particles(
+      batch_electrons0, {batch_electrons0, batch_electrons1});
+  RecordArray<ValueType> batch_scores(2, active.size());
+  RecordArray<ValueType> batch_kinetic(2, active.size());
+  std::fill(batch_scores.begin(), batch_scores.end(), ValueType(0.25));
+  std::fill(batch_kinetic.begin(), batch_kinetic.end(), ValueType(-0.5));
+
+  ResourceCollection resource_template("psiformer_kinetic_pool_template");
+  leader.createResource(resource_template);
+  ResourceCollection crowd_resource(resource_template);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource, components);
+    const std::array<std::size_t, 2> no_kinetic_tapes{0, 0};
+    CHECK(testing::TestPsiFormerWF::directKineticWorkspaceOwnership(leader, components) == no_kinetic_tapes);
+
+    // Reject a heterogeneous-mass crowd before allocating the shared tape.
+    SpeciesSet& second_species = batch_electrons1.getSpeciesSet();
+    const int second_mass      = second_species.getAttribute("mass");
+    REQUIRE(second_mass < second_species.numAttributes());
+    second_species(second_mass, 1) = 2.0;
+    batch_electrons1.resetGroups();
+    CHECK_THROWS_WITH(
+        leader.mw_evaluateParameterDerivatives(
+            components, particles, active, batch_scores, batch_kinetic),
+        Catch::Matchers::ContainsSubstring("require unit electron masses"));
+    CHECK(testing::TestPsiFormerWF::directKineticWorkspaceOwnership(leader, components) == no_kinetic_tapes);
+    second_species(second_mass, 1) = 1.0;
+    batch_electrons1.resetGroups();
+
+    leader.mw_evaluateParameterDerivatives(
+        components, particles, active, batch_scores, batch_kinetic);
+
+    // Neither component clone owns a kinetic tape; exactly one tape belongs to
+    // the acquired crowd resource after the first component-major call.
+    const std::array<std::size_t, 2> one_crowd_kinetic_tape{0, 1};
+    CHECK(testing::TestPsiFormerWF::directKineticWorkspaceOwnership(leader, components) ==
+          one_crowd_kinetic_tape);
+  }
+
+  // Independent scalar calls provide the numerical oracle and, because their
+  // external drifts differ, catch failure to repack ParticleSet::G per walker.
+  ParticleSet scalar_electrons0 = makeLiHElectrons(simulation_cell);
+  ParticleSet scalar_electrons1 = makeLiHElectrons(simulation_cell);
+  scalar_electrons1.R[0][0] += 0.11;
+  scalar_electrons1.update();
+  PsiFormerWF scalar0(
+      "pf_kinetic_scalar0", files.parameters.string(), files.configuration.string(), true, {0, 127});
+  PsiFormerWF scalar1(
+      "pf_kinetic_scalar1", files.parameters.string(), files.configuration.string(), true, {0, 127});
+  OptVariables scalar_active0 = registerSelectedParameters(scalar0);
+  OptVariables scalar_active1 = registerSelectedParameters(scalar1);
+  initialize_total_drift(scalar0, scalar_electrons0, 0.007);
+  initialize_total_drift(scalar1, scalar_electrons1, -0.011);
+
+  std::array<Vector<ValueType>, 2> scalar_scores{
+      Vector<ValueType>(active.size()), Vector<ValueType>(active.size())};
+  std::array<Vector<ValueType>, 2> scalar_kinetic{
+      Vector<ValueType>(active.size()), Vector<ValueType>(active.size())};
+  for (int walker = 0; walker < 2; ++walker)
+  {
+    scalar_scores[walker]  = ValueType(0.25);
+    scalar_kinetic[walker] = ValueType(-0.5);
+  }
+  scalar0.evaluateDerivatives(
+      scalar_electrons0, scalar_active0, scalar_scores[0], scalar_kinetic[0]);
+  scalar1.evaluateDerivatives(
+      scalar_electrons1, scalar_active1, scalar_scores[1], scalar_kinetic[1]);
+
+  for (int walker = 0; walker < 2; ++walker)
+    for (std::size_t parameter = 0; parameter < active.size(); ++parameter)
+    {
+      CHECK(std::abs(batch_scores[walker][parameter] - scalar_scores[walker][parameter]) <
+            2e-10 * (1 + std::abs(scalar_scores[walker][parameter])));
+      CHECK(std::abs(batch_kinetic[walker][parameter] - scalar_kinetic[walker][parameter]) <
+            2e-9 * (1 + std::abs(scalar_kinetic[walker][parameter])));
+    }
+  CHECK(std::real(batch_kinetic[0][0]) != Approx(std::real(batch_kinetic[1][0])));
+}
+
 TEST_CASE("PsiFormer registration maps through surrounding ordinary parameters",
           "[wavefunction][psiformer]")
 {
@@ -593,8 +836,8 @@ TEST_CASE("PsiFormer registration maps through surrounding ordinary parameters",
   CHECK(std::real(dhpsioverpsi[4]) == Approx(37.0));
   for (int global_index = 1; global_index <= 3; ++global_index)
   {
-    CHECK(std::isfinite(std::real(dlogpsi[global_index])));
-    CHECK(std::isfinite(std::real(dhpsioverpsi[global_index])));
+    CHECK(psiformer::determinant::isFiniteReal(std::real(dlogpsi[global_index])));
+    CHECK(psiformer::determinant::isFiniteReal(std::real(dhpsioverpsi[global_index])));
     CHECK(std::real(dlogpsi[global_index]) != Approx(-91.0));
     CHECK(std::real(dhpsioverpsi[global_index]) != Approx(37.0));
   }

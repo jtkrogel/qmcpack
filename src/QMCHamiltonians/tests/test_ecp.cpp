@@ -13,6 +13,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
+#include <array>
 #include <cmath>
 
 #include "Configuration.h"
@@ -20,6 +21,7 @@
 #include "QMCHamiltonians/ECPComponentBuilder.h"
 #include "QMCHamiltonians/NonLocalECPComponent.h"
 #include "QMCHamiltonians/SOECPComponent.h"
+#include "ResourceCollection.h"
 #include "Utilities/RuntimeOptions.h"
 
 //for wavefunction
@@ -30,9 +32,9 @@
 #include "QMCWaveFunctions/Jastrow/RadialJastrowBuilder.h"
 #include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
 #include "QMCWaveFunctions/SpinorSet.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/tests/psiformer_test_utils.h"
-
 
 //for Hamiltonian manipulations.
 #include "Particle/ParticleSet.h"
@@ -319,6 +321,97 @@ TEST_CASE("PsiFormer nonlocal ECP energy derivatives", "[hamiltonian][psiformer]
   wavefunction.checkOutVariables(active);
   REQUIRE(active.size() == 2);
 
+  // Validate the compact PsiFormer sink against the legacy public matrix
+  // contract before involving radial-potential and Hamiltonian reductions.
+  {
+    VirtualParticleSet virtual_particles(electrons);
+    std::vector<QMCTraits::PosType> displacements{{0.07, -0.04, 0.03}, {-0.09, 0.02, 0.06}};
+    virtual_particles.makeMoves(electrons, 0, displacements);
+
+    std::vector<ValueType> materialized_ratios(displacements.size());
+    Matrix<ValueType> materialized_derivatives(displacements.size(), active.size());
+    std::fill(materialized_derivatives.begin(), materialized_derivatives.end(), ValueType(0));
+    wavefunction.evaluateDerivRatios(virtual_particles, active, materialized_ratios, materialized_derivatives);
+
+    const std::vector<ValueType> bare_weights{ValueType(0.35), ValueType(-0.22)};
+    std::vector<ValueType> compact_ratios(displacements.size());
+    Vector<ValueType> compact_derivatives(active.size());
+    compact_derivatives = ValueType(0.5);
+    wavefunction.evaluateDerivRatiosWeighted(
+        virtual_particles, active, bare_weights, compact_ratios,
+        {compact_derivatives.data(), static_cast<std::size_t>(compact_derivatives.size())});
+
+    for (std::size_t move = 0; move < displacements.size(); ++move)
+      CHECK(compact_ratios[move] == ValueApprox(materialized_ratios[move]));
+    for (std::size_t parameter = 0; parameter < active.size(); ++parameter)
+    {
+      ValueType expected(0.5);
+      for (std::size_t move = 0; move < displacements.size(); ++move)
+        expected += bare_weights[move] * materialized_ratios[move] * materialized_derivatives(move, parameter);
+      CHECK(compact_derivatives[parameter] == ValueApprox(expected));
+    }
+  }
+
+  // The component-major batch interface must retain independent rows and
+  // agree with scalar weighted reductions for distinct configurations.
+  {
+    ParticleSet electrons2(electrons);
+    electrons2.R[0][0] += 0.11;
+    electrons2.update();
+    std::unique_ptr<TrialWaveFunction> wavefunction2 = wavefunction.makeClone(electrons2);
+
+    VirtualParticleSet virtual_particles1(electrons);
+    VirtualParticleSet virtual_particles2(electrons2);
+    std::vector<QMCTraits::PosType> displacements1{{0.05, -0.02, 0.04}, {-0.03, 0.07, -0.01}};
+    std::vector<QMCTraits::PosType> displacements2{{-0.06, 0.01, 0.02}, {0.08, -0.05, 0.03}};
+    virtual_particles1.makeMoves(electrons, 0, displacements1);
+    virtual_particles2.makeMoves(electrons2, 0, displacements2);
+    std::vector<ValueType> weights1{ValueType(0.17), ValueType(-0.09)};
+    std::vector<ValueType> weights2{ValueType(-0.13), ValueType(0.21)};
+
+    std::array<Vector<ValueType>, 2> scalar_outputs{Vector<ValueType>(active.size()),
+                                                    Vector<ValueType>(active.size())};
+    std::array<std::vector<ValueType>, 2> scalar_ratios{
+        std::vector<ValueType>(displacements1.size()), std::vector<ValueType>(displacements2.size())};
+    scalar_outputs[0] = ValueType(0.25);
+    scalar_outputs[1] = ValueType(-0.35);
+    wavefunction.evaluateDerivRatiosWeighted(
+        virtual_particles1, active, weights1, scalar_ratios[0],
+        {scalar_outputs[0].data(), static_cast<std::size_t>(scalar_outputs[0].size())});
+    wavefunction2->evaluateDerivRatiosWeighted(
+        virtual_particles2, active, weights2, scalar_ratios[1],
+        {scalar_outputs[1].data(), static_cast<std::size_t>(scalar_outputs[1].size())});
+
+    ResourceCollection wavefunction_resources("psiformer_weighted_batch");
+    wavefunction.createResource(wavefunction_resources);
+    RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+        wavefunction, {wavefunction, *wavefunction2});
+    ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(wavefunction_resources, wavefunctions);
+    RefVectorWithLeader<const VirtualParticleSet> virtual_particles(
+        virtual_particles1, {virtual_particles1, virtual_particles2});
+    std::array<std::vector<ValueType>, 2> batch_ratios{
+        std::vector<ValueType>(displacements1.size()), std::vector<ValueType>(displacements2.size())};
+    RefVector<std::vector<ValueType>> ratio_views{std::ref(batch_ratios[0]), std::ref(batch_ratios[1])};
+    RefVector<const std::vector<ValueType>> weight_views{std::cref(weights1), std::cref(weights2)};
+    std::array<Vector<ValueType>, 2> batch_outputs{Vector<ValueType>(active.size()),
+                                                   Vector<ValueType>(active.size())};
+    batch_outputs[0] = ValueType(0.25);
+    batch_outputs[1] = ValueType(-0.35);
+    std::vector<TrialWaveFunction::ParameterDerivativeView> output_views{
+        {batch_outputs[0].data(), static_cast<std::size_t>(batch_outputs[0].size())},
+        {batch_outputs[1].data(), static_cast<std::size_t>(batch_outputs[1].size())}};
+
+    TrialWaveFunction::mw_evaluateDerivRatiosWeighted(wavefunctions, virtual_particles, active, weight_views,
+                                                      ratio_views, output_views);
+    for (int walker = 0; walker < 2; ++walker)
+    {
+      for (std::size_t move = 0; move < batch_ratios[walker].size(); ++move)
+        CHECK(batch_ratios[walker][move] == ValueApprox(scalar_ratios[walker][move]));
+      for (std::size_t parameter = 0; parameter < active.size(); ++parameter)
+        CHECK(batch_outputs[walker][parameter] == ValueApprox(scalar_outputs[walker][parameter]));
+    }
+  }
+
   ECPComponentBuilder ecp("psiformer_generated_ecp", OHMMS::Controller);
   REQUIRE(ecp.read_pp_file("Na.BFD.xml"));
   NonLocalECPComponent* nonlocal_ecp = ecp.pp_nonloc.get();
@@ -373,8 +466,8 @@ TEST_CASE("PsiFormer nonlocal ECP energy derivatives", "[hamiltonian][psiformer]
   CHECK(fixed_log == Catch::Approx(reference_log).epsilon(2e-10).margin(2e-10));
   Vector<ValueType> analytic_derivative(active.size());
   const double reference_energy = evaluate_nonlocal_derivative(analytic_derivative);
-  CHECK(std::isfinite(reference_log));
-  CHECK(std::isfinite(reference_energy));
+  CHECK(psiformer::determinant::isFiniteReal(reference_log));
+  CHECK(psiformer::determinant::isFiniteReal(reference_energy));
 
   const double original_parameter = std::real(active[0]);
   const double parameter_step      = 2e-5;
