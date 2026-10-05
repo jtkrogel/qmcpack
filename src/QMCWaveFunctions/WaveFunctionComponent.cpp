@@ -18,11 +18,28 @@
 #include "WaveFunctionComponent.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <typeinfo>
 
 namespace qmcplusplus
 {
+namespace
+{
+// Return the destination span required by possibly sparse global mappings.
+std::size_t requiredDerivativeExtent(const OptVariables& optvars)
+{
+  std::size_t required_extent = 0;
+  for (std::size_t local_index = 0; local_index < optvars.size(); ++local_index)
+  {
+    const int global_index = optvars.where(local_index);
+    if (global_index >= 0)
+      required_extent = std::max(required_extent, static_cast<std::size_t>(global_index) + 1);
+  }
+  return required_extent;
+}
+} // namespace
+
 // for return types
 using PsiValue = WaveFunctionComponent::PsiValue;
 
@@ -442,7 +459,7 @@ void WaveFunctionComponent::evaluateDerivRatiosWeighted(
     ParameterDerivativeView weighted_derivatives)
 {
   const std::size_t virtual_count = VP.getTotalNum();
-  if (total_weights.size() != virtual_count || weighted_derivatives.size < optvars.size_of_active() ||
+  if (total_weights.size() != virtual_count || weighted_derivatives.size < requiredDerivativeExtent(optvars) ||
       (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr))
     throw std::invalid_argument("WaveFunctionComponent weighted derivative-ratio inputs have inconsistent shapes");
 
@@ -456,6 +473,98 @@ void WaveFunctionComponent::evaluateDerivRatiosWeighted(
   for (std::size_t virtual_index = 0; virtual_index < virtual_count; ++virtual_index)
     for (std::size_t parameter = 0; parameter < weighted_derivatives.size; ++parameter)
       weighted_derivatives[parameter] += total_weights[virtual_index] * derivative_ratios(virtual_index, parameter);
+}
+
+WaveFunctionComponent::EvaluationStamp WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    const VirtualParticleBatch& batch,
+    const OptVariables& optvars,
+    const std::vector<ValueType>& total_weights,
+    const std::vector<ParameterDerivativeView>& weighted_derivatives) const
+{
+  if (this != std::addressof(wfc_list.getLeader()))
+    throw std::invalid_argument(
+        "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted must be invoked on the component-list "
+        "leader.");
+  if (wfc_list.size() != batch.walkerCount() || p_list.size() != batch.walkerCount() ||
+      vp_scratch_list.size() != batch.walkerCount() || weighted_derivatives.size() != batch.walkerCount())
+    throw std::invalid_argument(
+        "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted list sizes do not match the descriptor "
+        "walker count.");
+
+  batch.validateOutputExtent(total_weights.size());
+  batch.validateFor(p_list);
+
+  const std::size_t derivative_width = weighted_derivatives.empty() ? 0 : weighted_derivatives.front().size;
+  if (!weighted_derivatives.empty() && derivative_width < requiredDerivativeExtent(optvars))
+    throw std::invalid_argument(
+        "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted derivative rows are too short.");
+
+  for (std::size_t walker = 0; walker < batch.walkerCount(); ++walker)
+  {
+    if (weighted_derivatives[walker].size != derivative_width ||
+        (derivative_width != 0 && weighted_derivatives[walker].data == nullptr))
+      throw std::invalid_argument(
+          "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted derivative rows have inconsistent "
+          "shapes.");
+    if (typeid(wfc_list[walker]) != typeid(wfc_list.getLeader()))
+      throw std::invalid_argument(
+          "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted component clones have different dynamic "
+          "types.");
+    for (std::size_t other = 0; other < walker; ++other)
+    {
+      if (std::addressof(wfc_list[walker]) == std::addressof(wfc_list[other]))
+        throw std::invalid_argument(
+            "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted requires one distinct component clone "
+            "per walker.");
+      if (std::addressof(vp_scratch_list[walker]) == std::addressof(vp_scratch_list[other]))
+        throw std::invalid_argument(
+            "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted requires one distinct scratch object "
+            "per walker.");
+    }
+
+    const ParticleSet* scratch_as_particles = static_cast<const ParticleSet*>(std::addressof(vp_scratch_list[walker]));
+    for (std::size_t reference = 0; reference < batch.walkerCount(); ++reference)
+      if (scratch_as_particles == std::addressof(p_list[reference]))
+        throw std::invalid_argument(
+            "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted scratch objects must not alias "
+            "reference walkers.");
+    if (vp_scratch_list[walker].isSpinor() != p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted reference and scratch spinor modes do not "
+          "match.");
+  }
+
+  if (derivative_width != 0 && batch.walkerCount() > std::numeric_limits<std::size_t>::max() / derivative_width)
+    throw std::length_error(
+        "WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted derivative staging extent overflows.");
+  const std::size_t staged_extent = batch.walkerCount() * derivative_width;
+  std::vector<ValueType> staged_derivatives(staged_extent, ValueType(0));
+  std::vector<ParameterDerivativeView> staged_views;
+  staged_views.reserve(batch.walkerCount());
+  for (std::size_t walker = 0; walker < batch.walkerCount(); ++walker)
+    staged_views.push_back(
+        {derivative_width == 0 ? nullptr : staged_derivatives.data() + walker * derivative_width, derivative_width});
+
+  for (std::size_t segment_index = 0; segment_index < batch.segmentCount(); ++segment_index)
+  {
+    const VirtualParticleBatch::Slice slice = batch.slice(segment_index);
+    VirtualParticleSet& scratch              = vp_scratch_list[slice.walkerId()];
+    scratch.makeMovesAbsolute(p_list[slice.walkerId()], slice.electronId(), slice.positions(), slice.isOnSphere(),
+                              slice.sourceCenterId());
+
+    std::vector<ValueType> segment_weights(slice.size());
+    std::copy_n(total_weights.begin() + slice.flatOffset(), slice.size(), segment_weights.begin());
+    wfc_list[slice.walkerId()].evaluateDerivRatiosWeighted(scratch, optvars, segment_weights,
+                                                           staged_views[slice.walkerId()]);
+  }
+
+  for (std::size_t walker = 0; walker < batch.walkerCount(); ++walker)
+    for (std::size_t parameter = 0; parameter < derivative_width; ++parameter)
+      weighted_derivatives[walker][parameter] += staged_views[walker][parameter];
+  return EvaluationStamp{};
 }
 
 void WaveFunctionComponent::mw_evaluateDerivRatiosWeighted(

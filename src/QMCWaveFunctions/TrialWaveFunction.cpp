@@ -18,7 +18,9 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <typeinfo>
@@ -37,6 +39,22 @@
 
 namespace qmcplusplus
 {
+namespace
+{
+// Return the destination span required by possibly sparse global mappings.
+std::size_t requiredDerivativeExtent(const OptVariables& optvars)
+{
+  std::size_t required_extent = 0;
+  for (std::size_t local_index = 0; local_index < optvars.size(); ++local_index)
+  {
+    const int global_index = optvars.where(local_index);
+    if (global_index >= 0)
+      required_extent = std::max(required_extent, static_cast<std::size_t>(global_index) + 1);
+  }
+  return required_extent;
+}
+} // namespace
+
 typedef enum
 {
   V_TIMER = 0,
@@ -1411,6 +1429,222 @@ void TrialWaveFunction::mw_evaluateVirtualRatios(
 
   ratios.swap(staged_ratios);
   evaluation_stamps.swap(staged_stamps);
+}
+
+void TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    const VirtualParticleBatch& batch,
+    const OptVariables& optvars,
+    const std::vector<ValueType>& bare_weights,
+    std::vector<ValueType>& ratios,
+    const std::vector<ParameterDerivativeView>& weighted_derivatives,
+    std::vector<EvaluationStamp>& evaluation_stamps,
+    ComputeType ct)
+{
+  const std::size_t walker_count = batch.walkerCount();
+  if (wf_list.size() != walker_count || p_list.size() != walker_count ||
+      vp_scratch_list.size() != walker_count || weighted_derivatives.size() != walker_count)
+    throw std::invalid_argument(
+        "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted list sizes do not match the descriptor walker "
+        "count.");
+  batch.validateOutputExtent(bare_weights.size());
+  batch.validateOutputExtent(ratios.size());
+  batch.validateFor(p_list);
+
+  switch (ct)
+  {
+  case ComputeType::ALL:
+  case ComputeType::FERMIONIC:
+  case ComputeType::NONFERMIONIC:
+    break;
+  default:
+    throw std::invalid_argument(
+        "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted received an invalid ComputeType.");
+  }
+
+  const std::size_t derivative_width = weighted_derivatives.empty() ? 0 : weighted_derivatives.front().size;
+  if (!weighted_derivatives.empty() && derivative_width < requiredDerivativeExtent(optvars))
+    throw std::invalid_argument(
+        "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted derivative rows are too short.");
+  if (derivative_width != 0 && walker_count > std::numeric_limits<std::size_t>::max() / derivative_width)
+    throw std::length_error(
+        "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted derivative staging extent overflows.");
+  if (derivative_width > std::numeric_limits<std::size_t>::max() / sizeof(ValueType))
+    throw std::length_error(
+        "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted derivative destination extent overflows.");
+
+  TrialWaveFunction& wf_leader       = wf_list.getLeader();
+  const std::size_t component_count  = wf_leader.Z.size();
+  const std::size_t derivative_bytes = derivative_width * sizeof(ValueType);
+  if (batch.size() > std::numeric_limits<std::size_t>::max() / sizeof(ValueType))
+    throw std::length_error(
+        "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted flat value extent overflows.");
+  const std::size_t flat_value_bytes = batch.size() * sizeof(ValueType);
+  const auto checked_end = [](const ValueType* begin, std::size_t bytes) {
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(begin);
+    if (address > std::numeric_limits<std::uintptr_t>::max() - bytes)
+      throw std::length_error(
+          "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted caller storage range overflows.");
+    return address + bytes;
+  };
+  const std::uintptr_t ratio_begin = reinterpret_cast<std::uintptr_t>(ratios.data());
+  const std::uintptr_t ratio_end   = checked_end(ratios.data(), flat_value_bytes);
+  const std::uintptr_t weight_begin = reinterpret_cast<std::uintptr_t>(bare_weights.data());
+  const std::uintptr_t weight_end   = checked_end(bare_weights.data(), flat_value_bytes);
+  const auto ranges_overlap = [](std::uintptr_t first_begin,
+                                 std::uintptr_t first_end,
+                                 std::uintptr_t second_begin,
+                                 std::uintptr_t second_end) {
+    return first_begin < second_end && second_begin < first_end;
+  };
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    const ParameterDerivativeView destination = weighted_derivatives[walker];
+    if (destination.size != derivative_width || (derivative_width != 0 && destination.data == nullptr))
+      throw std::invalid_argument(
+          "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted derivative rows have inconsistent shapes.");
+    if (derivative_width != 0)
+    {
+      const std::uintptr_t destination_begin = reinterpret_cast<std::uintptr_t>(destination.data);
+      if (destination_begin > std::numeric_limits<std::uintptr_t>::max() - derivative_bytes)
+        throw std::length_error(
+            "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted derivative destination range overflows.");
+      const std::uintptr_t destination_end = destination_begin + derivative_bytes;
+      if (ranges_overlap(destination_begin, destination_end, ratio_begin, ratio_end) ||
+          ranges_overlap(destination_begin, destination_end, weight_begin, weight_end))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted derivative destinations must not overlap "
+            "flat value inputs or outputs.");
+      for (std::size_t other = 0; other < walker; ++other)
+      {
+        const std::uintptr_t other_begin =
+            reinterpret_cast<std::uintptr_t>(weighted_derivatives[other].data);
+        const std::uintptr_t other_end = other_begin + derivative_bytes;
+        if (destination_begin < other_end && other_begin < destination_end)
+          throw std::invalid_argument(
+              "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted requires non-overlapping derivative "
+              "destinations.");
+      }
+    }
+
+    for (std::size_t other = 0; other < walker; ++other)
+    {
+      if (std::addressof(wf_list[walker]) == std::addressof(wf_list[other]))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted requires one distinct wavefunction clone "
+            "per walker.");
+      if (std::addressof(vp_scratch_list[walker]) == std::addressof(vp_scratch_list[other]))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted requires one distinct scratch object per "
+            "walker.");
+    }
+    if (wf_list[walker].Z.size() != component_count)
+      throw std::invalid_argument(
+          "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted wavefunction clones have different component "
+          "counts.");
+
+    const ParticleSet* scratch_as_particles = static_cast<const ParticleSet*>(std::addressof(vp_scratch_list[walker]));
+    for (std::size_t reference = 0; reference < walker_count; ++reference)
+      if (scratch_as_particles == std::addressof(p_list[reference]))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted scratch objects must not alias reference "
+            "walkers.");
+    if (vp_scratch_list[walker].isSpinor() != p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted reference and scratch spinor modes do not "
+          "match.");
+  }
+
+  for (std::size_t component = 0; component < component_count; ++component)
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+      if (typeid(*wf_list[walker].Z[component]) != typeid(*wf_leader.Z[component]) ||
+          wf_list[walker].Z[component]->isFermionic() != wf_leader.Z[component]->isFermionic())
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted wavefunction clones have incompatible "
+            "component topology.");
+
+  // Both phases are private until every component has succeeded.  In
+  // particular, a late weighted-score exception cannot expose the already
+  // completed ratio product or any earlier component's derivative delta.
+  ScopedTimer local_timer(wf_leader.TWF_timers_[NL_TIMER]);
+  std::vector<ValueType> staged_ratios(batch.size(), ValueType(1));
+  std::vector<ValueType> component_ratios(batch.size());
+  std::vector<EvaluationStamp> value_stamps(component_count);
+  std::vector<bool> selected_components(component_count, false);
+  std::vector<EvaluationStamp> staged_stamps;
+  staged_stamps.reserve(component_count);
+
+  for (std::size_t component = 0; component < component_count; ++component)
+  {
+    const WaveFunctionComponent& component_leader = *wf_leader.Z[component];
+    const bool selected = ct == ComputeType::ALL ||
+        (component_leader.isFermionic() && ct == ComputeType::FERMIONIC) ||
+        (!component_leader.isFermionic() && ct == ComputeType::NONFERMIONIC);
+    selected_components[component] = selected;
+    if (!selected)
+      continue;
+
+    ScopedTimer component_timer(wf_leader.WFC_timers_[NL_TIMER + TIMER_SKIP * component]);
+    const RefVectorWithLeader<WaveFunctionComponent> wfc_list = extractWFCRefList(wf_list, component);
+    const EvaluationStamp stamp = component_leader.mw_evaluateVirtualRatios(
+        wfc_list, p_list, vp_scratch_list, batch, component_ratios);
+    if (component_ratios.size() != batch.size())
+      throw std::runtime_error(
+          "WaveFunctionComponent::mw_evaluateVirtualRatios changed the flattened output extent.");
+    value_stamps[component] = stamp;
+
+    if (stamp.isVersioned())
+    {
+      for (const EvaluationStamp& prior_stamp : staged_stamps)
+        if (prior_stamp.source_identity_ == stamp.source_identity_ && prior_stamp.version_ != stamp.version_)
+          throw std::runtime_error(
+              "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted observed conflicting value versions of "
+              "one shared state.");
+      staged_stamps.push_back(stamp);
+    }
+
+    for (std::size_t virtual_index = 0; virtual_index < batch.size(); ++virtual_index)
+      staged_ratios[virtual_index] *= component_ratios[virtual_index];
+  }
+
+  std::vector<ValueType> total_weights(batch.size());
+  for (std::size_t virtual_index = 0; virtual_index < batch.size(); ++virtual_index)
+    total_weights[virtual_index] = bare_weights[virtual_index] * staged_ratios[virtual_index];
+
+  const std::size_t staged_extent = walker_count * derivative_width;
+  std::vector<ValueType> staged_derivatives(staged_extent, ValueType(0));
+  std::vector<ParameterDerivativeView> staged_views;
+  staged_views.reserve(walker_count);
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+    staged_views.push_back(
+        {derivative_width == 0 ? nullptr : staged_derivatives.data() + walker * derivative_width, derivative_width});
+
+  for (std::size_t component = 0; component < component_count; ++component)
+  {
+    if (!selected_components[component])
+      continue;
+
+    const WaveFunctionComponent& component_leader = *wf_leader.Z[component];
+    ScopedTimer component_timer(wf_leader.WFC_timers_[DERIVS_TIMER + TIMER_SKIP * component]);
+    const RefVectorWithLeader<WaveFunctionComponent> wfc_list = extractWFCRefList(wf_list, component);
+    const EvaluationStamp weighted_stamp = component_leader.mw_evaluateVirtualDerivRatiosWeighted(
+        wfc_list, p_list, vp_scratch_list, batch, optvars, total_weights, staged_views);
+    if (weighted_stamp != value_stamps[component])
+      throw std::runtime_error(
+          "TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted observed different component versions in "
+          "the value and weighted phases.");
+  }
+
+  // Vector swaps are nonthrowing for these standard-allocator vectors, and
+  // ValueType addition is nonthrowing.  All potentially failing work has
+  // therefore completed before the first caller-visible publication.
+  ratios.swap(staged_ratios);
+  evaluation_stamps.swap(staged_stamps);
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+    for (std::size_t parameter = 0; parameter < derivative_width; ++parameter)
+      weighted_derivatives[walker][parameter] += staged_views[walker][parameter];
 }
 
 void TrialWaveFunction::evaluateDerivRatios(const VirtualParticleSet& VP,

@@ -361,6 +361,30 @@ public:
                                        std::vector<EvaluationStamp>& evaluation_stamps,
                                        ComputeType ct = ComputeType::ALL);
 
+  /** Form flattened products and weighted parameter derivatives atomically.
+   *
+   * bare_weights and ratios follow descriptor order.  weighted_derivatives
+   * contains one equal-width additive destination per descriptor walker.  The
+   * dispatcher privately stages complete-product ratios, total weights, and a
+   * walker-by-parameter delta; it publishes ratios, derivative additions, and
+   * versioned stamps only after all selected value and weighted calls succeed.
+   * Each selected component's weighted stamp must equal the stamp returned by
+   * its value call, so the two phases cannot silently mix parameter versions.
+   * Generic component fallbacks may allocate a segment-by-parameter matrix;
+   * scalable overrides provide the strict no-virtual-by-parameter path.
+   */
+  static void mw_evaluateVirtualDerivRatiosWeighted(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const VirtualParticleBatch& batch,
+      const OptVariables& optvars,
+      const std::vector<ValueType>& bare_weights,
+      std::vector<ValueType>& ratios,
+      const std::vector<ParameterDerivativeView>& weighted_derivatives,
+      std::vector<EvaluationStamp>& evaluation_stamps,
+      ComputeType ct = ComputeType::ALL);
+
   // batched version of evaluateSpinorRatios
   static void mw_evaluateSpinorRatios(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                                       const RefVectorWithLeader<const VirtualParticleSet>& Vp_list,

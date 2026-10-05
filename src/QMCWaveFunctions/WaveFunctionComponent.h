@@ -662,6 +662,31 @@ public:
                                            const std::vector<ValueType>& total_weights,
                                            ParameterDerivativeView weighted_derivatives);
 
+  /** Reduce one flattened virtual batch into a derivative row per walker.
+   *
+   * total_weights follows the descriptor's flat order and already contains
+   * the complete selected TrialWaveFunction ratio.  The compatibility
+   * implementation serializes descriptor segments through caller-owned VP
+   * scratch, stages a walker-by-parameter delta, and adds it only after every
+   * segment succeeds.  Its legacy scalar fallback may materialize one
+   * segment-by-parameter matrix; scalable components must override this
+   * method to retain the strict low-memory path.  Every override has the same
+   * component-level transaction contract: if any walker or segment fails, no
+   * caller derivative row may be changed.
+   *
+   * Versioned overrides return the state/version stamp captured inside the
+   * same weighted-derivative transaction.  Generic components return an
+   * unversioned stamp.
+   */
+  virtual EvaluationStamp mw_evaluateVirtualDerivRatiosWeighted(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const VirtualParticleBatch& batch,
+      const OptVariables& optvars,
+      const std::vector<ValueType>& total_weights,
+      const std::vector<ParameterDerivativeView>& weighted_derivatives) const;
+
   /** Batched weighted derivative-ratio reduction with a serialized default. */
   virtual void mw_evaluateDerivRatiosWeighted(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
