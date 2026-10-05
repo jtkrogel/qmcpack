@@ -150,6 +150,12 @@ public:
     return softened_radial_factors_;
   }
 
+  /// Hash backing addresses and capacities for warmed-workspace stability checks.
+  std::size_t storageFingerprint() const noexcept;
+
+  /// Return bytes reserved by all pair-table vectors.
+  std::size_t storageBytes() const noexcept;
+
 private:
   friend class PsiFormerGeometryCache;
 
@@ -231,6 +237,12 @@ public:
 
   /// Return all electron-pair incidence entries grouped by electron.
   const std::vector<ElectronPairIncidence>& incidences() const noexcept { return incidences_; }
+
+  /// Hash every geometry backing allocation for warmed-workspace stability checks.
+  std::size_t storageFingerprint() const noexcept;
+
+  /// Return bytes reserved by all geometry-owned vectors and pair tables.
+  std::size_t storageBytes() const noexcept;
 
   /// Return the regular electron-nucleus flat index for one particle pair.
   std::size_t electronNucleusPairIndex(std::size_t electron, std::size_t nucleus) const;

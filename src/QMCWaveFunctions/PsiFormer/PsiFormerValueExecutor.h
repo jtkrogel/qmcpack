@@ -149,6 +149,7 @@ public:
 private:
   friend class DirectValueExecutor;
   friend class DirectSpatialExecutor;
+  friend class DirectBatchExecutor;
 
   /// Group the eight parameter tensors consumed by one attention/residual block.
   struct DirectAttentionLayer
@@ -368,6 +369,13 @@ public:
   /// Expose immutable descriptors for diagnostics and clone-workspace construction.
   const std::shared_ptr<const DirectValueParameterLayout>& layout() const noexcept { return layout_; }
 
+  /// Expose immutable nuclear coordinates to bounded batch-workspace construction.
+  GeometryPositionView nuclearPositions() const noexcept
+  { return GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()); }
+
+  /// Expose the validated geometry policy used by direct batch scratch.
+  const GeometryBoundary& boundary() const noexcept { return boundary_; }
+
   /// Evaluate sign and log|psi| without allocating or building differentiation nodes.
   DirectValueResult evaluate(DirectValueWorkspace& workspace) const
   {
@@ -414,6 +422,8 @@ public:
   }
 
 private:
+  friend class DirectBatchExecutor;
+
   /// Return true when two electrons in the same spin block have identical positions.
   bool hasExactSameSpinCoalescence(const DirectValueWorkspace& workspace) const noexcept
   {

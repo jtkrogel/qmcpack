@@ -392,6 +392,17 @@ add_unit_test(deterministic-unit_test_psiformer_value_executor
               1 1 $<TARGET_FILE:test_psiformer_value_executor>)
 set_tests_properties(deterministic-unit_test_psiformer_value_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_batch_executor
+               test_psiformer_batch_executor.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_batch_executor catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_batch_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_batch_executor
+              1 1 $<TARGET_FILE:test_psiformer_batch_executor>)
+set_tests_properties(deterministic-unit_test_psiformer_batch_executor
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_score_executor
                test_psiformer_score_executor.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp

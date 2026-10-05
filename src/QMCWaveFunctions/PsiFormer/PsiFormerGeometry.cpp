@@ -174,6 +174,30 @@ GeometryPairTable::GeometryPairTable(std::size_t pair_count)
       softened_radial_factors_(pair_count)
 {}
 
+std::size_t GeometryPairTable::storageFingerprint() const noexcept
+{
+  std::size_t hash = 1469598103934665603ULL;
+  auto mix = [&hash](const auto& buffer) {
+    hash ^= reinterpret_cast<std::uintptr_t>(buffer.data());
+    hash *= 1099511628211ULL;
+    hash ^= buffer.capacity();
+    hash *= 1099511628211ULL;
+  };
+  mix(displacements_);
+  mix(distances_);
+  mix(inverse_distances_);
+  mix(softened_radial_factors_);
+  return hash;
+}
+
+std::size_t GeometryPairTable::storageBytes() const noexcept
+{
+  return displacements_.capacity() * sizeof(GeometryPosition) +
+      distances_.capacity() * sizeof(GeometryReal) +
+      inverse_distances_.capacity() * sizeof(GeometryReal) +
+      softened_radial_factors_.capacity() * sizeof(SoftenedRadialFactors);
+}
+
 void GeometryPairTable::updatePair(std::size_t pair_index, const GeometryPosition& displacement)
 {
   displacements_[pair_index] = displacement;
@@ -210,6 +234,38 @@ PsiFormerGeometryCache::PsiFormerGeometryCache(std::size_t electron_count,
   }
 
   initializeElectronPairs();
+}
+
+std::size_t PsiFormerGeometryCache::storageFingerprint() const noexcept
+{
+  std::size_t hash = 1469598103934665603ULL;
+  auto mix = [&hash](const auto& buffer) {
+    hash ^= reinterpret_cast<std::uintptr_t>(buffer.data());
+    hash *= 1099511628211ULL;
+    hash ^= buffer.capacity();
+    hash *= 1099511628211ULL;
+  };
+  mix(nuclei_);
+  mix(electrons_);
+  mix(electron_pairs_);
+  mix(incidence_offsets_);
+  mix(incidences_);
+  hash ^= electron_nucleus_pairs_.storageFingerprint();
+  hash *= 1099511628211ULL;
+  hash ^= electron_electron_pairs_.storageFingerprint();
+  hash *= 1099511628211ULL;
+  return hash;
+}
+
+std::size_t PsiFormerGeometryCache::storageBytes() const noexcept
+{
+  return nuclei_.capacity() * sizeof(GeometryPosition) +
+      electrons_.capacity() * sizeof(GeometryPosition) +
+      electron_pairs_.capacity() * sizeof(ElectronPair) +
+      incidence_offsets_.capacity() * sizeof(std::size_t) +
+      incidences_.capacity() * sizeof(ElectronPairIncidence) +
+      electron_nucleus_pairs_.storageBytes() +
+      electron_electron_pairs_.storageBytes();
 }
 
 std::size_t PsiFormerGeometryCache::electronNucleusPairIndex(std::size_t electron, std::size_t nucleus) const
