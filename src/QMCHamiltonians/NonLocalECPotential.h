@@ -17,6 +17,10 @@
 
 #ifndef QMCPLUSPLUS_NONLOCAL_ECPOTENTIAL_H
 #define QMCPLUSPLUS_NONLOCAL_ECPOTENTIAL_H
+
+#include <memory>
+#include <utility>
+
 #include "Configuration.h"
 #include "ForceBase.h"
 #include "OperatorBase.h"
@@ -40,6 +44,28 @@ class TestNonLocalECPotential;
 class NonLocalECPotential : public OperatorBase, public ForceBase
 {
   using Real = QMCTraits::RealType;
+
+  struct MultiWalkerResourceIdentity
+  {};
+
+  struct MultiWalkerResourceSchema
+  {
+    bool uses_virtual_particles;
+    std::size_t virtual_particle_distance_tables;
+    std::size_t electron_count;
+    std::size_t electron_group_count;
+    std::size_t ion_count;
+
+    bool operator==(const MultiWalkerResourceSchema& other) const noexcept
+    {
+      return uses_virtual_particles == other.uses_virtual_particles &&
+          virtual_particle_distance_tables == other.virtual_particle_distance_tables &&
+          electron_count == other.electron_count && electron_group_count == other.electron_group_count &&
+          ion_count == other.ion_count;
+    }
+
+    bool operator!=(const MultiWalkerResourceSchema& other) const noexcept { return !(*this == other); }
+  };
 
   struct NonLocalECPotentialMultiWalkerResource;
 
@@ -194,6 +220,8 @@ protected:
   bool use_DLA;
 
 private:
+  /// Immutable identity shared only by clones belonging to this operator family.
+  const std::shared_ptr<const MultiWalkerResourceIdentity> mw_resource_identity_;
   ///virtual particle set
   const std::unique_ptr<VirtualParticleSet> vp_;
   ///index of distance table for the ion-el pair
@@ -218,6 +246,15 @@ private:
   std::vector<std::vector<NLPPJob<Real>>> nlpp_jobs;
   /// mult walker shared resource
   ResourceHandle<NonLocalECPotentialMultiWalkerResource> mw_res_handle_;
+
+  /// Describe every shape property needed by the current multi-walker resource schema.
+  MultiWalkerResourceSchema multiWalkerResourceSchema() const noexcept;
+
+  /// Focused resource-clone diagnostics used by the ownership regression.
+  void resizeMultiWalkerListenerScratchForTesting(std::size_t walkers,
+                                                  std::size_t electrons,
+                                                  std::size_t ions);
+  std::pair<std::size_t, std::size_t> multiWalkerListenerScratchSizesForTesting() const;
 
   /** the actual implementation, used by evaluate and evaluateWithToperator
    * @param P particle set

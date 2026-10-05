@@ -12,6 +12,8 @@
 
 #include "NeighborListsForPseudo.h"
 
+#include <stdexcept>
+
 namespace qmcplusplus
 {
 NeighborListsForPseudo::NeighborListsForPseudo(size_t num_elecs,
@@ -19,6 +21,40 @@ NeighborListsForPseudo::NeighborListsForPseudo(size_t num_elecs,
                                                const std::vector<NonLocalECPComponent*>& pp)
     : elec_neighbor_ions_(num_elecs), ion_neighbor_elecs_(num_ions), PP(pp)
 {}
+
+void NeighborListsForPseudo::OwnedLists::clear()
+{
+  for (size_t iat = 0; iat < ion_neighbor_elecs_.size(); ++iat)
+    ion_neighbor_elecs_.getNeighborList(iat).clear();
+  for (size_t jel = 0; jel < elec_neighbor_ions_.size(); ++jel)
+    elec_neighbor_ions_.getNeighborList(jel).clear();
+}
+
+void NeighborListsForPseudo::OwnedLists::addElecIonPair(int jel, int iat)
+{
+  elec_neighbor_ions_.getNeighborList(jel).push_back(iat);
+  ion_neighbor_elecs_.getNeighborList(iat).push_back(jel);
+}
+
+NeighborListsForPseudo::OwnedLists NeighborListsForPseudo::makeOwnedLists() const
+{ return OwnedLists(elec_neighbor_ions_.size(), ion_neighbor_elecs_.size()); }
+
+void NeighborListsForPseudo::validateOwnedLists(const OwnedLists& lists) const
+{
+  if (lists.elec_neighbor_ions_.size() != elec_neighbor_ions_.size() ||
+      lists.ion_neighbor_elecs_.size() != ion_neighbor_elecs_.size())
+    throw std::invalid_argument("NeighborListsForPseudo staged list shape does not match the destination.");
+}
+
+bool NeighborListsForPseudo::swapOwnedLists(OwnedLists& lists) noexcept
+{
+  if (lists.elec_neighbor_ions_.size() != elec_neighbor_ions_.size() ||
+      lists.ion_neighbor_elecs_.size() != ion_neighbor_elecs_.size())
+    return false;
+  elec_neighbor_ions_.swap(lists.elec_neighbor_ions_);
+  ion_neighbor_elecs_.swap(lists.ion_neighbor_elecs_);
+  return true;
+}
 
 void NeighborListsForPseudo::markAffectedElecs(const DistanceTableAB& myTable,
                                                int iel,

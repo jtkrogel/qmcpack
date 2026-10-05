@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "Configuration.h"
@@ -161,6 +162,60 @@ public:
   {
     return nl_ecp.neighbor_lists.getNeighboringIons(jel).size();
   }
+
+  static const std::vector<int>& neighboringIons(const NonLocalECPotential& nl_ecp, int jel)
+  {
+    return nl_ecp.neighbor_lists.getNeighboringIons(jel);
+  }
+
+  static const std::vector<int>& neighboringElectrons(const NonLocalECPotential& nl_ecp, int iat)
+  {
+    return nl_ecp.neighbor_lists.getNeighboringElectrons(iat);
+  }
+
+  static bool neighborListsBindOwnComponents(const NonLocalECPotential& nl_ecp)
+  {
+    return nl_ecp.neighbor_lists.isBoundTo(nl_ecp.PP);
+  }
+
+  static bool neighborListsBindComponents(const NonLocalECPotential& owner,
+                                          const NonLocalECPotential& component_owner)
+  {
+    return owner.neighbor_lists.isBoundTo(component_owner.PP);
+  }
+
+  static NeighborListsForPseudo::OwnedLists makeNeighborListStaging(const NonLocalECPotential& nl_ecp)
+  {
+    return nl_ecp.neighbor_lists.makeOwnedLists();
+  }
+
+  static void validateNeighborListStaging(const NonLocalECPotential& nl_ecp,
+                                          const NeighborListsForPseudo::OwnedLists& staging)
+  {
+    nl_ecp.neighbor_lists.validateOwnedLists(staging);
+  }
+
+  static bool publishNeighborListStaging(NonLocalECPotential& nl_ecp,
+                                         NeighborListsForPseudo::OwnedLists& staging) noexcept
+  {
+    return nl_ecp.neighbor_lists.swapOwnedLists(staging);
+  }
+
+  static void addNeighborPair(NonLocalECPotential& nl_ecp, int electron, int ion)
+  {
+    nl_ecp.neighbor_lists.addElecIonPair(electron, ion);
+  }
+
+  static bool hasMultiWalkerResource(const NonLocalECPotential& nl_ecp) { return bool(nl_ecp.mw_res_handle_); }
+
+  static void resizeListenerScratch(NonLocalECPotential& nl_ecp,
+                                    std::size_t walkers,
+                                    std::size_t electrons,
+                                    std::size_t ions)
+  { nl_ecp.resizeMultiWalkerListenerScratchForTesting(walkers, electrons, ions); }
+
+  static std::pair<std::size_t, std::size_t> listenerScratchSizes(const NonLocalECPotential& nl_ecp)
+  { return nl_ecp.multiWalkerListenerScratchSizesForTesting(); }
 
   /** Report compatibility derivative-matrix storage without exposing it in production. */
   static size_t derivativeMatrixElements(const NonLocalECPotential& nl_ecp)
@@ -461,6 +516,169 @@ bool samePositionBits(const QMCTraits::PosType& left, const QMCTraits::PosType& 
     if (!sameRealBits(left[dimension], right[dimension]))
       return false;
   return true;
+}
+
+TEST_CASE("NonLocalECPotential clone owns neighbor-list binding and staged publication",
+          "[hamiltonian][ecp][resource]")
+{
+  static_assert(noexcept(std::declval<NeighborListsForPseudo&>().swapOwnedLists(
+      std::declval<NeighborListsForPseudo::OwnedLists&>())));
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+  ParticleSet clone_electrons(electrons);
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  TrialWaveFunction clone_wavefunction(runtime_options);
+  NonLocalECPotential potential(ions, electrons, false, true);
+  potential.addComponent(0, readTmoveV1PPComponent());
+  UPtr<OperatorBase> clone_storage = potential.makeClone(clone_electrons, clone_wavefunction);
+  auto& clone = dynamic_cast<NonLocalECPotential&>(*clone_storage);
+
+  CHECK(testing::TestNonLocalECPotential::neighborListsBindOwnComponents(potential));
+  CHECK(testing::TestNonLocalECPotential::neighborListsBindOwnComponents(clone));
+  CHECK_FALSE(testing::TestNonLocalECPotential::neighborListsBindComponents(clone, potential));
+
+  testing::TestNonLocalECPotential::addNeighborPair(clone, 0, 0);
+  testing::TestNonLocalECPotential::addNeighborPair(clone, 2, 1);
+  auto staging = testing::TestNonLocalECPotential::makeNeighborListStaging(clone);
+  staging.addElecIonPair(1, 1);
+  testing::TestNonLocalECPotential::validateNeighborListStaging(clone, staging);
+  CHECK(testing::TestNonLocalECPotential::publishNeighborListStaging(clone, staging));
+
+  CHECK(testing::TestNonLocalECPotential::neighboringIons(clone, 0).empty());
+  CHECK(testing::TestNonLocalECPotential::neighboringIons(clone, 1) == std::vector<int>{1});
+  CHECK(testing::TestNonLocalECPotential::neighboringIons(clone, 2).empty());
+  CHECK(testing::TestNonLocalECPotential::neighboringElectrons(clone, 0).empty());
+  CHECK(testing::TestNonLocalECPotential::neighboringElectrons(clone, 1) == std::vector<int>{1});
+
+  // The staging object now owns the complete former public state.  No list was
+  // copied or rebuilt during the noexcept publication operation.
+  CHECK(staging.getNeighboringIons(0) == std::vector<int>{0});
+  CHECK(staging.getNeighboringIons(1).empty());
+  CHECK(staging.getNeighboringIons(2) == std::vector<int>{1});
+  CHECK(staging.getNeighboringElectrons(0) == std::vector<int>{0});
+  CHECK(staging.getNeighboringElectrons(1) == std::vector<int>{2});
+
+  std::vector<NonLocalECPComponent*> wrong_components(1, nullptr);
+  NeighborListsForPseudo wrong_shape(1, 1, wrong_components);
+  auto wrong_staging = wrong_shape.makeOwnedLists();
+  wrong_staging.addElecIonPair(0, 0);
+  const auto before_electron_one = testing::TestNonLocalECPotential::neighboringIons(clone, 1);
+  const auto before_ion_one      = testing::TestNonLocalECPotential::neighboringElectrons(clone, 1);
+  CHECK_THROWS_AS(testing::TestNonLocalECPotential::validateNeighborListStaging(clone, wrong_staging),
+                  std::invalid_argument);
+  CHECK_FALSE(testing::TestNonLocalECPotential::publishNeighborListStaging(clone, wrong_staging));
+  CHECK(testing::TestNonLocalECPotential::neighboringIons(clone, 1) == before_electron_one);
+  CHECK(testing::TestNonLocalECPotential::neighboringElectrons(clone, 1) == before_ion_one);
+}
+
+TEST_CASE("NonLocalECPotential multi-walker resources clone empty and recover from mismatch",
+          "[hamiltonian][ecp][resource]")
+{
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+  ParticleSet clone_electrons(electrons);
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  TrialWaveFunction clone_wavefunction(runtime_options);
+  NonLocalECPotential potential(ions, electrons, false, true);
+  UPtr<OperatorBase> clone_storage = potential.makeClone(clone_electrons, clone_wavefunction);
+  auto& clone = dynamic_cast<NonLocalECPotential&>(*clone_storage);
+  RefVectorWithLeader<OperatorBase> family(potential, {potential, clone});
+
+  ResourceCollection resources("nlpp_resource_ownership");
+  potential.createResource(resources);
+  {
+    ResourceCollectionTeamLock<OperatorBase> lock(resources, family);
+    CHECK(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+    testing::TestNonLocalECPotential::resizeListenerScratch(potential, 2, electrons.getTotalNum(),
+                                                            ions.getTotalNum());
+    CHECK(testing::TestNonLocalECPotential::listenerScratchSizes(potential) ==
+          std::make_pair(std::size_t{6}, std::size_t{4}));
+  }
+  CHECK_FALSE(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+
+  // Copying the collection preserves its schema and family identity but does
+  // not copy live listener matrices or any future batch scratch.
+  ResourceCollection copied_resources(resources);
+  {
+    ResourceCollectionTeamLock<OperatorBase> copied_lock(copied_resources, family);
+    CHECK(testing::TestNonLocalECPotential::listenerScratchSizes(potential) ==
+          std::make_pair(std::size_t{0}, std::size_t{0}));
+    testing::TestNonLocalECPotential::resizeListenerScratch(potential, 1, 1, 1);
+  }
+  {
+    ResourceCollectionTeamLock<OperatorBase> original_lock(resources, family);
+    CHECK(testing::TestNonLocalECPotential::listenerScratchSizes(potential) ==
+          std::make_pair(std::size_t{6}, std::size_t{4}));
+  }
+
+  // A shape-compatible but unrelated potential must not borrow this family's
+  // resource.  The failed local-handle validation leaves both leaders empty
+  // and rewinds the collection so its rightful owner can immediately acquire.
+  NonLocalECPotential unrelated(ions, electrons, false, true);
+  RefVectorWithLeader<OperatorBase> unrelated_family(unrelated, {unrelated});
+  auto acquire_unrelated = [&]() {
+    ResourceCollectionTeamLock<OperatorBase> wrong_lock(resources, unrelated_family);
+  };
+  CHECK_THROWS_AS(acquire_unrelated(), std::logic_error);
+  CHECK_FALSE(testing::TestNonLocalECPotential::hasMultiWalkerResource(unrelated));
+  CHECK_FALSE(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+  {
+    ResourceCollectionTeamLock<OperatorBase> recovered_lock(resources, family);
+    CHECK(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+  }
+
+  // Mixing clone families is rejected before lending, with the same
+  // no-partial-handle and immediate-reacquire guarantees.
+  RefVectorWithLeader<OperatorBase> mixed_family(potential, {potential, unrelated});
+  auto acquire_mixed = [&]() {
+    ResourceCollectionTeamLock<OperatorBase> wrong_lock(resources, mixed_family);
+  };
+  CHECK_THROWS_AS(acquire_mixed(), std::invalid_argument);
+  CHECK_FALSE(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+  {
+    ResourceCollectionTeamLock<OperatorBase> recovered_lock(resources, family);
+    CHECK(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+  }
+
+  // A clone retains the family identity, but a different electron shape is an
+  // incompatible schema and is rejected before touching the collection.
+  ParticleSet short_electrons(simulation_cell);
+  short_electrons.setName("short_electrons");
+  short_electrons.create({1, 1});
+  SpeciesSet& short_species             = short_electrons.getSpeciesSet();
+  const int short_up                    = short_species.addSpecies("u");
+  const int short_charge                = short_species.addAttribute("charge");
+  const int short_mass                  = short_species.addAttribute("mass");
+  short_species(short_charge, short_up) = -1;
+  short_species(short_mass, short_up)   = 1;
+  const int short_down                  = short_species.addSpecies("d");
+  short_species(short_charge, short_down) = -1;
+  short_species(short_mass, short_down)   = 1;
+  short_electrons.resetGroups();
+  short_electrons.addTable(ions);
+  short_electrons.update();
+  TrialWaveFunction short_wavefunction(runtime_options);
+  UPtr<OperatorBase> short_clone_storage = potential.makeClone(short_electrons, short_wavefunction);
+  auto& short_clone = dynamic_cast<NonLocalECPotential&>(*short_clone_storage);
+  RefVectorWithLeader<OperatorBase> mismatched_schema(potential, {potential, short_clone});
+  auto acquire_mismatched_schema = [&]() {
+    ResourceCollectionTeamLock<OperatorBase> wrong_lock(resources, mismatched_schema);
+  };
+  CHECK_THROWS_AS(acquire_mismatched_schema(), std::invalid_argument);
+  CHECK_FALSE(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+  {
+    ResourceCollectionTeamLock<OperatorBase> recovered_lock(resources, family);
+    CHECK(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+  }
 }
 
 TEST_CASE("NonLocalECPComponent caller-owned quadrature ranges match legacy",

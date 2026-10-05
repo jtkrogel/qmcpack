@@ -35,10 +35,52 @@ public:
   /// get the neighbor list of the source particle
   std::vector<int>& getNeighborList(int source) { return neighborIDs_[source]; }
   const std::vector<int>& getNeighborList(int source) const { return neighborIDs_[source]; }
+
+  /// Exchange identically shaped owned list storage without allocating.
+  void swap(NeighborLists& other) noexcept { neighborIDs_.swap(other.neighborIDs_); }
 };
 
 class NeighborListsForPseudo
 {
+public:
+  /** Independently owned neighbor-list state suitable for transactional staging. */
+  class OwnedLists
+  {
+    friend class NeighborListsForPseudo;
+
+    OwnedLists(size_t num_elecs, size_t num_ions)
+        : elec_neighbor_ions_(num_elecs), ion_neighbor_elecs_(num_ions)
+    {}
+
+    NeighborLists elec_neighbor_ions_;
+    NeighborLists ion_neighbor_elecs_;
+
+  public:
+    OwnedLists(OwnedLists&&) noexcept            = default;
+    OwnedLists& operator=(OwnedLists&&) noexcept = default;
+    OwnedLists(const OwnedLists&)                = delete;
+    OwnedLists& operator=(const OwnedLists&)     = delete;
+
+    /// Remove all logical entries while retaining owned capacities.
+    void clear();
+
+    /// Add one electron--ion pair to both directional lists.
+    void addElecIonPair(int jel, int iat);
+
+    /// Read the staged neighboring ions for one electron.
+    const std::vector<int>& getNeighboringIons(int jel) const
+    {
+      return elec_neighbor_ions_.getNeighborList(jel);
+    }
+
+    /// Read the staged neighboring electrons for one ion.
+    const std::vector<int>& getNeighboringElectrons(int iat) const
+    {
+      return ion_neighbor_elecs_.getNeighborList(iat);
+    }
+  };
+
+private:
   ///neighborlist of electrons
   NeighborLists elec_neighbor_ions_;
   ///neighborlist of ions
@@ -49,8 +91,28 @@ class NeighborListsForPseudo
 public:
   NeighborListsForPseudo(size_t num_elecs, size_t num_ions, const std::vector<NonLocalECPComponent*>& pp);
 
+  NeighborListsForPseudo(const NeighborListsForPseudo&)            = delete;
+  NeighborListsForPseudo& operator=(const NeighborListsForPseudo&) = delete;
+
+  /// Create empty independently owned state with the same electron/ion shape.
+  OwnedLists makeOwnedLists() const;
+
+  /// Validate staged list shape before entering a no-throw publication phase.
+  void validateOwnedLists(const OwnedLists& lists) const;
+
+  /** Publish owned list state without allocation.
+   * @return true on success; false leaves both objects unchanged when shapes differ.
+   */
+  bool swapOwnedLists(OwnedLists& lists) noexcept;
+
+  /// Test whether this object refers to the expected pseudopotential vector.
+  bool isBoundTo(const std::vector<NonLocalECPComponent*>& pp) const noexcept { return &PP == &pp; }
+
   /// get the neighboring ion list of a given electron
   const std::vector<int>& getNeighboringIons(int jel) const { return elec_neighbor_ions_.getNeighborList(jel); }
+
+  /// get the neighboring electron list of a given ion
+  const std::vector<int>& getNeighboringElectrons(int iat) const { return ion_neighbor_elecs_.getNeighborList(iat); }
 
   /** mark all the electrons affected by T-moves and update elec_neighbor_ions_ and ion_neighbor_elecs_
    * @param myTable electron ion distance table

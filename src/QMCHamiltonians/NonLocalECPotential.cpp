@@ -18,6 +18,8 @@
 #include "NonLocalECPotential.h"
 
 #include <optional>
+#include <stdexcept>
+#include <utility>
 
 #include <DistanceTable.h>
 #include <IteratorUtility.h>
@@ -31,11 +33,25 @@ namespace qmcplusplus
 
 struct NonLocalECPotential::NonLocalECPotentialMultiWalkerResource : public Resource
 {
-  NonLocalECPotentialMultiWalkerResource() : Resource("NonLocalECPotential") {}
+  NonLocalECPotentialMultiWalkerResource(
+      std::shared_ptr<const MultiWalkerResourceIdentity> identity,
+      MultiWalkerResourceSchema schema)
+      : Resource("NonLocalECPotential"), identity(std::move(identity)), schema(schema)
+  {}
+
+  NonLocalECPotentialMultiWalkerResource(const NonLocalECPotentialMultiWalkerResource& other)
+      : Resource("NonLocalECPotential"),
+        identity(other.identity),
+        schema(other.schema),
+        collection(other.collection)
+  {}
 
   std::unique_ptr<Resource> makeClone() const override
   { return std::make_unique<NonLocalECPotentialMultiWalkerResource>(*this); }
 
+  /// Operator-family identity and immutable resource shape copied without scratch.
+  const std::shared_ptr<const MultiWalkerResourceIdentity> identity;
+  const MultiWalkerResourceSchema schema;
   ResourceCollection collection{"NLPPcollection"};
   /// a crowds worth of per particle nonlocal ecp potential values
   Matrix<Real> ve_samples;
@@ -52,6 +68,7 @@ NonLocalECPotential::NonLocalECPotential(ParticleSet& ions, ParticleSet& els, bo
       myRNG(nullptr),
       IonConfig(ions),
       use_DLA(enable_DLA),
+      mw_resource_identity_(std::make_shared<MultiWalkerResourceIdentity>()),
       vp_(use_VP ? std::make_unique<VirtualParticleSet>(els) : nullptr),
       Peln(els),
       neighbor_lists(els.getTotalNum(), ions.getTotalNum(), PP)
@@ -78,9 +95,10 @@ NonLocalECPotential::NonLocalECPotential(const NonLocalECPotential& nlpp, Partic
       myRNG(nullptr),
       IonConfig(nlpp.IonConfig),
       use_DLA(nlpp.use_DLA),
+      mw_resource_identity_(nlpp.mw_resource_identity_),
       vp_(nlpp.vp_ ? std::make_unique<VirtualParticleSet>(els, nlpp.vp_->getNumDistTables()) : nullptr),
       Peln(els),
-      neighbor_lists(nlpp.neighbor_lists)
+      neighbor_lists(els.getTotalNum(), nlpp.IonConfig.getTotalNum(), PP)
 {
   setEnergyDomain(POTENTIAL);
   twoBodyQuantumDomain(IonConfig, els);
@@ -103,6 +121,28 @@ NonLocalECPotential::NonLocalECPotential(const NonLocalECPotential& nlpp, Partic
 }
 
 NonLocalECPotential::~NonLocalECPotential() = default;
+
+NonLocalECPotential::MultiWalkerResourceSchema NonLocalECPotential::multiWalkerResourceSchema() const noexcept
+{
+  return {bool(vp_), vp_ ? static_cast<std::size_t>(vp_->getNumDistTables()) : 0,
+          static_cast<std::size_t>(Peln.getTotalNum()),
+          static_cast<std::size_t>(Peln.groups()), static_cast<std::size_t>(IonConfig.getTotalNum())};
+}
+
+void NonLocalECPotential::resizeMultiWalkerListenerScratchForTesting(std::size_t walkers,
+                                                                     std::size_t electrons,
+                                                                     std::size_t ions)
+{
+  auto& resource = mw_res_handle_.getResource();
+  resource.ve_samples.resize(walkers, electrons);
+  resource.vi_samples.resize(walkers, ions);
+}
+
+std::pair<std::size_t, std::size_t> NonLocalECPotential::multiWalkerListenerScratchSizesForTesting() const
+{
+  const auto& resource = mw_res_handle_.getResource();
+  return {resource.ve_samples.size(), resource.vi_samples.size()};
+}
 
 #if !defined(REMOVE_TRACEMANAGER)
 void NonLocalECPotential::contributeParticleQuantities() { request_.contribute_array(name_); }
@@ -927,23 +967,50 @@ void NonLocalECPotential::addComponent(int groupID, std::unique_ptr<NonLocalECPC
 
 void NonLocalECPotential::createResource(ResourceCollection& collection) const
 {
-  auto new_res = std::make_unique<NonLocalECPotentialMultiWalkerResource>();
+  auto new_res =
+      std::make_unique<NonLocalECPotentialMultiWalkerResource>(mw_resource_identity_, multiWalkerResourceSchema());
   if (vp_)
     vp_->createResource(new_res->collection);
-  auto resource_index = collection.addResource(std::move(new_res));
+  collection.addResource(std::move(new_res));
 }
 
 void NonLocalECPotential::acquireResource(ResourceCollection& collection,
                                           const RefVectorWithLeader<OperatorBase>& o_list) const
 {
-  auto& O_leader          = o_list.getCastedLeader<NonLocalECPotential>();
-  O_leader.mw_res_handle_ = collection.lendResource<NonLocalECPotentialMultiWalkerResource>();
+  auto& O_leader = o_list.getCastedLeader<NonLocalECPotential>();
+  if (this != std::addressof(O_leader))
+    throw std::logic_error("NonLocalECPotential resource acquisition must be invoked on the crowd leader.");
+  if (O_leader.mw_res_handle_)
+    throw std::logic_error("NonLocalECPotential multi-walker resource is already acquired.");
+
+  const MultiWalkerResourceSchema leader_schema = O_leader.multiWalkerResourceSchema();
+  for (std::size_t iw = 0; iw < o_list.size(); ++iw)
+  {
+    const auto& potential = o_list.getCastedElement<NonLocalECPotential>(iw);
+    if (potential.mw_resource_identity_.get() != O_leader.mw_resource_identity_.get())
+      throw std::invalid_argument(
+          "NonLocalECPotential crowd contains operators from different clone families.");
+    if (potential.multiWalkerResourceSchema() != leader_schema)
+      throw std::invalid_argument("NonLocalECPotential crowd contains incompatible resource schemas.");
+  }
+
+  const std::size_t entry_cursor = collection.getCursor();
+  auto candidate_handle = collection.lendResource<NonLocalECPotentialMultiWalkerResource>();
+  const NonLocalECPotentialMultiWalkerResource& candidate = candidate_handle.getResource();
+  if (candidate.identity.get() != O_leader.mw_resource_identity_.get() || candidate.schema != leader_schema)
+  {
+    collection.rewind(entry_cursor);
+    throw std::logic_error("NonLocalECPotential ResourceCollection belongs to an incompatible operator family.");
+  }
+  O_leader.mw_res_handle_ = std::move(candidate_handle);
 }
 
 void NonLocalECPotential::releaseResource(ResourceCollection& collection,
                                           const RefVectorWithLeader<OperatorBase>& o_list) const
 {
   auto& O_leader = o_list.getCastedLeader<NonLocalECPotential>();
+  if (this != std::addressof(O_leader) || !O_leader.mw_res_handle_)
+    throw std::logic_error("NonLocalECPotential resource release has no acquired crowd-leader handle.");
   collection.takebackResource(O_leader.mw_res_handle_);
 }
 
