@@ -504,12 +504,6 @@ PsiFormerWF::PsiFormerWF(std::string name,
     : WaveFunctionComponent(name),
       OptimizableObject(name),
       model_state_(std::make_shared<PsiFormerSharedState>(parameters, configuration)),
-      direct_value_workspace_(model_state_->direct_value_executor.makeWorkspace()),
-      direct_full_spatial_workspace_(model_state_->direct_spatial_executor.makeWorkspace(
-          pf::DirectSpatialMode::FULL_VGL)),
-      direct_active_spatial_workspace_(model_state_->direct_spatial_executor.makeWorkspace(
-          pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)),
-      direct_batch_workspace_(model_state_->direct_batch_executor.makeWorkspace()),
       selected_flat_indices_(std::move(selected_flat_indices)),
       optimization_enabled_(enable_optimization),
       optimize_all_(optimize_all),
@@ -598,12 +592,6 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
     : WaveFunctionComponent(other),
       OptimizableObject(other),
       model_state_(other.model_state_),
-      direct_value_workspace_(model_state_->direct_value_executor.makeWorkspace()),
-      direct_full_spatial_workspace_(model_state_->direct_spatial_executor.makeWorkspace(
-          pf::DirectSpatialMode::FULL_VGL)),
-      direct_active_spatial_workspace_(model_state_->direct_spatial_executor.makeWorkspace(
-          pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)),
-      direct_batch_workspace_(model_state_->direct_batch_executor.makeWorkspace()),
       selected_flat_indices_(other.selected_flat_indices_),
       optimization_enabled_(other.optimization_enabled_),
       optimize_all_(other.optimize_all_),
@@ -702,6 +690,34 @@ std::array<std::size_t, 2> PsiFormerWF::directKineticWorkspaceOwnershipForTestin
 
   const PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
   return {clone_workspaces, resource.kinetic_workspace ? std::size_t{1} : std::size_t{0}};
+}
+
+// Account only explicitly owned numeric buffers; immutable shared model state and
+// persistent accepted-state vectors intentionally remain outside this diagnostic.
+testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsForTesting() const
+{
+  testing::PsiFormerWorkspaceDiagnostics diagnostics;
+  diagnostics.owns_value_workspace          = static_cast<bool>(direct_value_workspace_);
+  diagnostics.owns_full_spatial_workspace   = static_cast<bool>(direct_full_spatial_workspace_);
+  diagnostics.owns_active_spatial_workspace = static_cast<bool>(direct_active_spatial_workspace_);
+  diagnostics.owns_batch_workspace          = static_cast<bool>(direct_batch_workspace_);
+  diagnostics.owns_score_workspace          = static_cast<bool>(direct_score_workspace_);
+  diagnostics.owns_kinetic_workspace        = static_cast<bool>(direct_kinetic_workspace_);
+
+  if (direct_value_workspace_)
+    diagnostics.value_bytes = direct_value_workspace_->vectorStorageBytes();
+  if (direct_full_spatial_workspace_)
+    diagnostics.full_spatial_bytes = direct_full_spatial_workspace_->vectorStorageBytes();
+  if (direct_active_spatial_workspace_)
+    diagnostics.active_spatial_bytes = direct_active_spatial_workspace_->vectorStorageBytes();
+  if (direct_batch_workspace_)
+    diagnostics.batch_bytes = direct_batch_workspace_->vectorStorageBytes();
+  if (direct_score_workspace_)
+    diagnostics.score_bytes = direct_score_workspace_->vectorStorageBytes();
+  if (direct_kinetic_workspace_)
+    diagnostics.kinetic_bytes = direct_kinetic_workspace_->vectorStorageBytes();
+  diagnostics.total_log_gradient_bytes = direct_total_log_gradient_.capacity() * sizeof(double);
+  return diagnostics;
 }
 
 // Register this object only when the input explicitly enabled optimization.
@@ -1228,15 +1244,16 @@ pf::Result PsiFormerWF::evaluatePositions(const ParticleSet& p,
   std::optional<pf::DirectValueResult> direct_result;
   if (purpose == EvaluationPurpose::VALUE_ONLY && model_state_->direct_value_mode != DirectBackendMode::ORACLE)
   {
+    pf::DirectValueWorkspace& workspace = requireDirectValueWorkspace();
     for (int electron = 0; electron < p.getTotalNum(); ++electron)
     {
       const auto& position = electron == replaced_particle
           ? (replacement_position ? *replacement_position : p.activeR(electron))
           : p.R[electron];
       for (int dimension = 0; dimension < 3; ++dimension)
-        direct_value_workspace_->setPosition(electron, dimension, position[dimension]);
+        workspace.setPosition(electron, dimension, position[dimension]);
     }
-    direct_result = model_state_->direct_value_executor.evaluate(*direct_value_workspace_);
+    direct_result = model_state_->direct_value_executor.evaluate(workspace);
     if (model_state_->direct_value_mode == DirectBackendMode::DIRECT)
     {
       pf::Result result;
@@ -1284,9 +1301,7 @@ pf::Result PsiFormerWF::evaluatePositions(const ParticleSet& p,
        purpose == EvaluationPurpose::ACTIVE_ELECTRON_GRADIENT) &&
       model_state_->direct_spatial_mode != DirectBackendMode::ORACLE)
   {
-    pf::DirectSpatialWorkspace& workspace = purpose == EvaluationPurpose::FULL_SPATIAL
-        ? *direct_full_spatial_workspace_
-        : *direct_active_spatial_workspace_;
+    pf::DirectSpatialWorkspace& workspace = requireDirectSpatialWorkspace(purpose);
     for (int electron = 0; electron < p.getTotalNum(); ++electron)
     {
       const auto& position = electron == replaced_particle
@@ -1432,15 +1447,16 @@ pf::DirectValueResult PsiFormerWF::evaluateDirectValuePositions(
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
 
+  pf::DirectValueWorkspace& workspace = requireDirectValueWorkspace();
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
   {
     const auto& position = electron == replaced_particle
         ? (replacement_position ? *replacement_position : p.activeR(electron))
         : p.R[electron];
     for (int dimension = 0; dimension < 3; ++dimension)
-      direct_value_workspace_->setPosition(electron, dimension, position[dimension]);
+      workspace.setPosition(electron, dimension, position[dimension]);
   }
-  return model_state_->direct_value_executor.evaluate(*direct_value_workspace_);
+  return model_state_->direct_value_executor.evaluate(workspace);
 }
 
 // Run one spatial request in clone-local fixed storage.  The returned views
@@ -1462,9 +1478,7 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositions(
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
 
-  pf::DirectSpatialWorkspace& workspace = purpose == EvaluationPurpose::FULL_SPATIAL
-      ? *direct_full_spatial_workspace_
-      : *direct_active_spatial_workspace_;
+  pf::DirectSpatialWorkspace& workspace = requireDirectSpatialWorkspace(purpose);
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
   {
     const auto& position = electron == replaced_particle
@@ -1478,6 +1492,42 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositions(
     return model_state_->direct_spatial_executor.evaluateFull(workspace);
   return model_state_->direct_spatial_executor.evaluateActive(
       workspace, static_cast<std::size_t>(active_gradient_particle));
+}
+
+// Delay scalar forward-buffer construction until a value path actually runs.
+pf::DirectValueWorkspace& PsiFormerWF::requireDirectValueWorkspace()
+{
+  if (!direct_value_workspace_)
+    direct_value_workspace_ = model_state_->direct_value_executor.makeWorkspace();
+  return *direct_value_workspace_;
+}
+
+// Keep the much larger full-VGL tape independent from the compact active-gradient tape.
+pf::DirectSpatialWorkspace& PsiFormerWF::requireDirectSpatialWorkspace(EvaluationPurpose purpose)
+{
+  switch (purpose)
+  {
+  case EvaluationPurpose::FULL_SPATIAL:
+    if (!direct_full_spatial_workspace_)
+      direct_full_spatial_workspace_ = model_state_->direct_spatial_executor.makeWorkspace(
+          pf::DirectSpatialMode::FULL_VGL);
+    return *direct_full_spatial_workspace_;
+  case EvaluationPurpose::ACTIVE_ELECTRON_GRADIENT:
+    if (!direct_active_spatial_workspace_)
+      direct_active_spatial_workspace_ = model_state_->direct_spatial_executor.makeWorkspace(
+          pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
+    return *direct_active_spatial_workspace_;
+  default:
+    throw std::logic_error("PsiFormer spatial workspace requires a spatial evaluation purpose");
+  }
+}
+
+// Batch scratch is needed only by scalar APIs that evaluate several related configurations.
+pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
+{
+  if (!direct_batch_workspace_)
+    direct_batch_workspace_ = model_state_->direct_batch_executor.makeWorkspace();
+  return *direct_batch_workspace_;
 }
 
 // Lazily allocate score scratch for scalar calls, keeping inference-only clones lightweight.
@@ -2298,7 +2348,7 @@ void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<Val
   std::shared_lock state_lock(model_state_->mutex);
   const std::size_t parameter_version = model_state_->model.p.version();
   synchronizeParameterVersion(parameter_version);
-  auto& batch = *direct_batch_workspace_;
+  auto& batch = requireDirectBatchWorkspace();
   const std::size_t configurations = static_cast<std::size_t>(particles.getTotalNum()) + 1;
   batch.resize(pf::DirectBatchMode::VALUE_ONLY, configurations);
   packBatchConfiguration(batch, 0, particles);
@@ -2350,7 +2400,7 @@ void PsiFormerWF::evaluateRatios(const VirtualParticleSet& virtual_particles, st
   std::shared_lock state_lock(model_state_->mutex);
   const std::size_t parameter_version = model_state_->model.p.version();
   synchronizeParameterVersion(parameter_version);
-  auto& batch = *direct_batch_workspace_;
+  auto& batch = requireDirectBatchWorkspace();
   batch.resize(pf::DirectBatchMode::VALUE_ONLY, ratios.size() + 1);
   packBatchConfiguration(batch, 0, reference);
   for (std::size_t move = 0; move < ratios.size(); ++move)

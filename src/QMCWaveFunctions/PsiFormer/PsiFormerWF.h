@@ -61,6 +61,44 @@ class PsiFormerSharedState;
 
 namespace testing
 {
+/** Describe clone-local native evaluator scratch without exposing implementation
+ * workspace types through the public wavefunction interface. */
+struct PsiFormerWorkspaceDiagnostics
+{
+  bool owns_value_workspace          = false;
+  bool owns_full_spatial_workspace   = false;
+  bool owns_active_spatial_workspace = false;
+  bool owns_batch_workspace          = false;
+  bool owns_score_workspace          = false;
+  bool owns_kinetic_workspace        = false;
+
+  std::size_t value_bytes          = 0;
+  std::size_t full_spatial_bytes   = 0;
+  std::size_t active_spatial_bytes = 0;
+  std::size_t batch_bytes          = 0;
+  std::size_t score_bytes          = 0;
+  std::size_t kinetic_bytes        = 0;
+  std::size_t total_log_gradient_bytes = 0;
+
+  /// Return all explicitly accounted clone-local evaluator scratch bytes.
+  std::size_t accountedBytes() const noexcept
+  {
+    return value_bytes + full_spatial_bytes + active_spatial_bytes + batch_bytes +
+        score_bytes + kinetic_bytes + total_log_gradient_bytes;
+  }
+
+  /// Return the number of independently owned native evaluator workspaces.
+  std::size_t ownedWorkspaceCount() const noexcept
+  {
+    return static_cast<std::size_t>(owns_value_workspace) +
+        static_cast<std::size_t>(owns_full_spatial_workspace) +
+        static_cast<std::size_t>(owns_active_spatial_workspace) +
+        static_cast<std::size_t>(owns_batch_workspace) +
+        static_cast<std::size_t>(owns_score_workspace) +
+        static_cast<std::size_t>(owns_kinetic_workspace);
+  }
+};
+
 /// Test-only accessor for bounded crowd-workspace ownership diagnostics.
 class TestPsiFormerWF;
 }
@@ -355,6 +393,15 @@ private:
   PsiFormerMultiWalkerResource& requireMultiWalkerResource(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
 
+  /// Lazily create fixed storage for scalar value evaluation.
+  pf::DirectValueWorkspace& requireDirectValueWorkspace();
+
+  /// Lazily create the requested scalar spatial-derivative workspace.
+  pf::DirectSpatialWorkspace& requireDirectSpatialWorkspace(EvaluationPurpose purpose);
+
+  /// Lazily create batch scratch for scalar all-to-one and virtual-ratio calls.
+  pf::DirectBatchWorkspace& requireDirectBatchWorkspace();
+
   /// Lazily create the clone-local score tape used by scalar evaluation paths.
   pf::DirectScoreWorkspace& requireDirectScoreWorkspace();
 
@@ -393,6 +440,9 @@ private:
   /// Count clone- and crowd-owned kinetic tapes for the bounded-memory regression.
   std::array<std::size_t, 2> directKineticWorkspaceOwnershipForTesting(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
+
+  /// Report clone-local evaluator ownership and explicitly reserved numeric bytes.
+  testing::PsiFormerWorkspaceDiagnostics directWorkspaceDiagnosticsForTesting() const;
 
   /// Return true when at least one selected local parameter maps to a global active variable.
   bool hasActiveParameters() const;
@@ -452,7 +502,7 @@ private:
 
   /// Versioned native model protected against evaluation/reset overlap.
   std::shared_ptr<PsiFormerSharedState> model_state_;
-  /// Mutable fixed-size value buffers owned independently by this component clone.
+  /// Lazily present fixed-size value buffers owned independently by this clone.
   std::unique_ptr<pf::DirectValueWorkspace> direct_value_workspace_;
   /// Lazily present fixed-size score tape owned independently by an optimizable clone.
   std::unique_ptr<pf::DirectScoreWorkspace> direct_score_workspace_;
@@ -460,11 +510,11 @@ private:
   std::unique_ptr<pf::DirectKineticWorkspace> direct_kinetic_workspace_;
   /// Lazily sized complete TrialWaveFunction drift used only by scalar calls.
   std::vector<double> direct_total_log_gradient_;
-  /// Fixed-size full-gradient and trace-Laplacian storage owned by this clone.
+  /// Lazily present full-gradient and trace-Laplacian storage owned by this clone.
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_full_spatial_workspace_;
-  /// Smaller first-order-only storage reused for active-electron gradients.
+  /// Lazily present first-order-only storage reused for active-electron gradients.
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_active_spatial_workspace_;
-  /// Clone-local batch scratch used by scalar all-to-one and virtual-ratio entry points.
+  /// Lazily present batch scratch used by scalar all-to-one and virtual-ratio calls.
   std::unique_ptr<pf::DirectBatchWorkspace> direct_batch_workspace_;
   /// ResourceCollection-owned workspace handle populated only on the crowd leader.
   ResourceHandle<PsiFormerMultiWalkerResource> mw_resource_handle_;

@@ -42,6 +42,12 @@ namespace testing
 class TestPsiFormerWF
 {
 public:
+  /// Report the scalar evaluator workspaces currently owned by one component clone.
+  static PsiFormerWorkspaceDiagnostics directWorkspaceDiagnostics(const PsiFormerWF& component)
+  {
+    return component.directWorkspaceDiagnosticsForTesting();
+  }
+
   static std::array<std::size_t, 2> directKineticWorkspaceOwnership(
       const PsiFormerWF& leader,
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list)
@@ -406,6 +412,133 @@ TEST_CASE("PsiFormer specialized public evaluation paths preserve high-level res
   for (int parameter = 0; parameter < active.size(); ++parameter)
     CHECK(std::real(score_only[parameter]) - 0.375 ==
           Catch::Approx(std::real(score_with_kinetic[parameter]) + 0.125).epsilon(2e-10).margin(2e-10));
+}
+
+TEST_CASE("PsiFormer clone-local evaluator workspaces are allocated on demand",
+          "[wavefunction][psiformer][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet source_electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF source("pf_lazy_source", files.parameters.string(), files.configuration.string());
+
+  // Establish accepted state once. Cloning preserves that state but deliberately
+  // does not copy the source's now-populated full-VGL evaluator scratch.
+  source_electrons.G = ValueType(0);
+  source_electrons.L = ValueType(0);
+  source.evaluateLog(source_electrons, source_electrons.G, source_electrons.L);
+
+  auto make_lazy_clone = [&](ParticleSet& electrons) {
+    std::unique_ptr<WaveFunctionComponent> storage = source.makeClone(electrons);
+    auto* component = dynamic_cast<PsiFormerWF*>(storage.get());
+    REQUIRE(component != nullptr);
+    return storage;
+  };
+  auto as_psiformer = [](std::unique_ptr<WaveFunctionComponent>& storage) -> PsiFormerWF& {
+    auto* component = dynamic_cast<PsiFormerWF*>(storage.get());
+    REQUIRE(component != nullptr);
+    return *component;
+  };
+  auto check_empty = [](const PsiFormerWF& component) {
+    const auto diagnostics = testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    CHECK(diagnostics.ownedWorkspaceCount() == 0);
+    CHECK(diagnostics.accountedBytes() == 0);
+  };
+
+  ParticleSet value_electrons  = makeLiHElectrons(simulation_cell);
+  ParticleSet full_electrons   = makeLiHElectrons(simulation_cell);
+  ParticleSet active_electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet batch_electrons  = makeLiHElectrons(simulation_cell);
+  ParticleSet untouched_electrons = makeLiHElectrons(simulation_cell);
+  auto value_storage     = make_lazy_clone(value_electrons);
+  auto full_storage      = make_lazy_clone(full_electrons);
+  auto active_storage    = make_lazy_clone(active_electrons);
+  auto batch_storage     = make_lazy_clone(batch_electrons);
+  auto untouched_storage = make_lazy_clone(untouched_electrons);
+  PsiFormerWF& value_component     = as_psiformer(value_storage);
+  PsiFormerWF& full_component      = as_psiformer(full_storage);
+  PsiFormerWF& active_component    = as_psiformer(active_storage);
+  PsiFormerWF& batch_component     = as_psiformer(batch_storage);
+  PsiFormerWF& untouched_component = as_psiformer(untouched_storage);
+
+  check_empty(value_component);
+  check_empty(full_component);
+  check_empty(active_component);
+  check_empty(batch_component);
+  check_empty(untouched_component);
+
+  value_electrons.makeMove(0, ParticleSet::SingleParticlePos{0.01, -0.02, 0.015});
+  value_component.ratio(value_electrons, 0);
+  value_component.restore(0);
+  value_electrons.rejectMove(0);
+  const auto value_diagnostics =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(value_component);
+  CHECK(value_diagnostics.owns_value_workspace);
+  CHECK(value_diagnostics.ownedWorkspaceCount() == 1);
+  CHECK(value_diagnostics.value_bytes > 0);
+  CHECK(value_diagnostics.accountedBytes() == value_diagnostics.value_bytes);
+
+  full_electrons.G = ValueType(0);
+  full_electrons.L = ValueType(0);
+  full_component.evaluateLog(full_electrons, full_electrons.G, full_electrons.L);
+  const auto full_diagnostics =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(full_component);
+  CHECK(full_diagnostics.owns_full_spatial_workspace);
+  CHECK(full_diagnostics.ownedWorkspaceCount() == 1);
+  CHECK(full_diagnostics.full_spatial_bytes > 0);
+  CHECK(full_diagnostics.accountedBytes() == full_diagnostics.full_spatial_bytes);
+
+  active_component.evalGrad(active_electrons, 0);
+  const auto active_diagnostics =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(active_component);
+  CHECK(active_diagnostics.owns_active_spatial_workspace);
+  CHECK(active_diagnostics.ownedWorkspaceCount() == 1);
+  CHECK(active_diagnostics.active_spatial_bytes > 0);
+  CHECK(active_diagnostics.accountedBytes() == active_diagnostics.active_spatial_bytes);
+
+  batch_electrons.makeVirtualMoves(ParticleSet::SingleParticlePos{0.37, -0.22, 0.41});
+  std::vector<ValueType> ratios(batch_electrons.getTotalNum());
+  batch_component.evaluateRatiosAlltoOne(batch_electrons, ratios);
+  const auto batch_diagnostics =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(batch_component);
+  CHECK(batch_diagnostics.owns_batch_workspace);
+  CHECK(batch_diagnostics.ownedWorkspaceCount() == 1);
+  CHECK(batch_diagnostics.batch_bytes > 0);
+  CHECK(batch_diagnostics.accountedBytes() == batch_diagnostics.batch_bytes);
+
+  // An entirely untouched clone remains free of evaluator scratch after other
+  // clones sharing the same immutable model exercise every scalar inference mode.
+  check_empty(untouched_component);
+
+  ParticleSet crowd_electrons0 = makeLiHElectrons(simulation_cell);
+  ParticleSet crowd_electrons1 = makeLiHElectrons(simulation_cell);
+  auto crowd_storage0 = make_lazy_clone(crowd_electrons0);
+  auto crowd_storage1 = make_lazy_clone(crowd_electrons1);
+  PsiFormerWF& crowd_component0 = as_psiformer(crowd_storage0);
+  PsiFormerWF& crowd_component1 = as_psiformer(crowd_storage1);
+  RefVectorWithLeader<WaveFunctionComponent> components(
+      crowd_component0, {crowd_component0, crowd_component1});
+  RefVectorWithLeader<ParticleSet> particles(
+      crowd_electrons0, {crowd_electrons0, crowd_electrons1});
+  std::array<ParticleSet::ParticleGradient, 2> gradients{
+      ParticleSet::ParticleGradient(crowd_electrons0.getTotalNum()),
+      ParticleSet::ParticleGradient(crowd_electrons1.getTotalNum())};
+  std::array<ParticleSet::ParticleLaplacian, 2> laplacians{
+      ParticleSet::ParticleLaplacian(crowd_electrons0.getTotalNum()),
+      ParticleSet::ParticleLaplacian(crowd_electrons1.getTotalNum())};
+  RefVector<ParticleSet::ParticleGradient> gradient_list{gradients[0], gradients[1]};
+  RefVector<ParticleSet::ParticleLaplacian> laplacian_list{laplacians[0], laplacians[1]};
+
+  ResourceCollection resource_template("psiformer_lazy_workspace_template");
+  crowd_component0.createResource(resource_template);
+  ResourceCollection crowd_resource(resource_template);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource, components);
+    crowd_component0.mw_evaluateLog(
+        components, particles, gradient_list, laplacian_list);
+    check_empty(crowd_component0);
+    check_empty(crowd_component1);
+  }
 }
 
 TEST_CASE("PsiFormer kinetic parameter derivatives require unit electron masses",
