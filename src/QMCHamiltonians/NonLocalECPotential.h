@@ -55,13 +55,14 @@ class NonLocalECPotential : public OperatorBase, public ForceBase
     std::size_t electron_count;
     std::size_t electron_group_count;
     std::size_t ion_count;
+    std::size_t outer_tile_capacity;
 
     bool operator==(const MultiWalkerResourceSchema& other) const noexcept
     {
       return uses_virtual_particles == other.uses_virtual_particles &&
           virtual_particle_distance_tables == other.virtual_particle_distance_tables &&
           electron_count == other.electron_count && electron_group_count == other.electron_group_count &&
-          ion_count == other.ion_count;
+          ion_count == other.ion_count && outer_tile_capacity == other.outer_tile_capacity;
     }
 
     bool operator!=(const MultiWalkerResourceSchema& other) const noexcept { return !(*this == other); }
@@ -220,8 +221,13 @@ protected:
   bool use_DLA;
 
 private:
+  /// Conservative explicit Task 08 outer capacity; Task 09 owns runtime policy.
+  static constexpr std::size_t default_outer_tile_capacity_ = 256;
+
   /// Immutable identity shared only by clones belonging to this operator family.
   const std::shared_ptr<const MultiWalkerResourceIdentity> mw_resource_identity_;
+  /// Maximum number of virtual knots held by the crowd-local outer tile.
+  std::size_t outer_tile_capacity_ = default_outer_tile_capacity_;
   ///virtual particle set
   const std::unique_ptr<VirtualParticleSet> vp_;
   ///index of distance table for the ion-el pair
@@ -255,6 +261,17 @@ private:
                                                   std::size_t electrons,
                                                   std::size_t ions);
   std::pair<std::size_t, std::size_t> multiWalkerListenerScratchSizesForTesting() const;
+
+  /// Select a small deterministic capacity before resource creation in focused tests.
+  void setOuterTileCapacityForTesting(std::size_t capacity);
+
+  /** Evaluate supported VP modes through one staged, flattened outer-tile transaction. */
+  static void mw_evaluateImplFlattenedVP(const RefVectorWithLeader<OperatorBase>& o_list,
+                                         const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+                                         const RefVectorWithLeader<ParticleSet>& p_list,
+                                         bool compute_txy_all,
+                                         const std::optional<ListenerOption<Real>>& listeners,
+                                         bool keep_grid);
 
   /** the actual implementation, used by evaluate and evaluateWithToperator
    * @param P particle set
