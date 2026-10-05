@@ -536,6 +536,16 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::vector<std::size_t> active_electrons;
   /// Prefix offsets mapping flattened ragged virtual configurations back to walkers.
   std::vector<std::size_t> virtual_offsets;
+  /// Compact active-walker order used by flattened sparse virtual batches.
+  std::vector<std::size_t> active_virtual_walkers;
+  /// Map every descriptor walker to its compact sparse-reference slot.
+  std::vector<std::size_t> virtual_reference_indices;
+  /// Atomic flattened ratio staging retained across sparse virtual calls.
+  std::vector<ValueType> flat_virtual_ratios;
+  /// Oracle reference signs retained across flattened virtual calls.
+  std::vector<double> virtual_reference_signs;
+  /// Oracle reference log magnitudes retained across flattened virtual calls.
+  std::vector<double> virtual_reference_logabs;
   /// Selected walker indices for masked recomputation.
   std::vector<std::size_t> walker_indices;
 
@@ -989,6 +999,11 @@ void PsiFormerWF::releaseResource(
   auto& resource = leader.mw_resource_handle_.getResource();
   resource.active_electrons.clear();
   resource.virtual_offsets.clear();
+  resource.active_virtual_walkers.clear();
+  resource.virtual_reference_indices.clear();
+  resource.flat_virtual_ratios.clear();
+  resource.virtual_reference_signs.clear();
+  resource.virtual_reference_logabs.clear();
   resource.walker_indices.clear();
   collection.takebackResource(leader.mw_resource_handle_);
 }
@@ -1080,7 +1095,22 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
       resource.total_log_gradient.capacity() * sizeof(double) +
       resource.active_electrons.capacity() * sizeof(std::size_t) +
       resource.virtual_offsets.capacity() * sizeof(std::size_t) +
+      resource.active_virtual_walkers.capacity() * sizeof(std::size_t) +
+      resource.virtual_reference_indices.capacity() * sizeof(std::size_t) +
+      resource.flat_virtual_ratios.capacity() * sizeof(ValueType) +
+      resource.virtual_reference_signs.capacity() * sizeof(double) +
+      resource.virtual_reference_logabs.capacity() * sizeof(double) +
       resource.walker_indices.capacity() * sizeof(std::size_t);
+  const pf::DirectBatchExecutionStatistics& batch_statistics =
+      resource.batch_workspace->executionStatistics();
+  diagnostics.reference_configurations =
+      batch_statistics.reference_configurations;
+  diagnostics.replacement_configurations =
+      batch_statistics.replacement_configurations;
+  diagnostics.reference_evaluations =
+      batch_statistics.reference_evaluations;
+  diagnostics.dense_coordinate_bytes_avoided =
+      batch_statistics.dense_coordinate_bytes_avoided;
   diagnostics.backend_modes = {
       directBackendModeName(transaction.state().direct_value_mode),
       directBackendModeName(transaction.state().direct_spatial_mode),
@@ -3319,6 +3349,243 @@ void PsiFormerWF::evaluateRatiosUnderRead(
         result.logabs[0]);
   }
   ratios.swap(staged_ratios);
+}
+
+// Evaluate a descriptor-ordered virtual batch from one sparse reference per active walker.
+WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    const VirtualParticleBatch& virtual_batch,
+    std::vector<ValueType>& ratios) const
+{
+  if (this != std::addressof(wfc_list.getLeader()))
+    throw std::invalid_argument(
+        "PsiFormer mw_evaluateVirtualRatios must be invoked on the component-list leader");
+  if (wfc_list.size() != virtual_batch.walkerCount() ||
+      p_list.size() != virtual_batch.walkerCount() ||
+      vp_scratch_list.size() != virtual_batch.walkerCount())
+    throw std::invalid_argument(
+        "PsiFormer mw_evaluateVirtualRatios list sizes do not match the descriptor walker count");
+
+  virtual_batch.validateOutputExtent(ratios.size());
+  virtual_batch.validateFor(p_list);
+
+  const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+  const std::size_t electron_count =
+      leader.model_state_->execution_plan.modelShape().electrons();
+
+  // Validate the complete crowd before changing resource scratch or lazily
+  // invalidating clone-local state after a genuine parameter publication.
+  for (std::size_t walker = 0; walker < virtual_batch.walkerCount(); ++walker)
+  {
+    if (typeid(wfc_list[walker]) != typeid(leader))
+      throw std::invalid_argument(
+          "PsiFormer mw_evaluateVirtualRatios component clones have different dynamic types");
+    for (std::size_t other = 0; other < walker; ++other)
+    {
+      if (std::addressof(wfc_list[walker]) == std::addressof(wfc_list[other]))
+        throw std::invalid_argument(
+            "PsiFormer mw_evaluateVirtualRatios requires one distinct component clone per walker");
+      if (std::addressof(vp_scratch_list[walker]) ==
+          std::addressof(vp_scratch_list[other]))
+        throw std::invalid_argument(
+            "PsiFormer mw_evaluateVirtualRatios requires one distinct scratch object per walker");
+    }
+
+    const ParticleSet* scratch_as_particles =
+        static_cast<const ParticleSet*>(std::addressof(vp_scratch_list[walker]));
+    for (std::size_t reference = 0; reference < virtual_batch.walkerCount();
+         ++reference)
+      if (scratch_as_particles == std::addressof(p_list[reference]))
+        throw std::invalid_argument(
+            "PsiFormer mw_evaluateVirtualRatios scratch objects must not alias reference walkers");
+    if (vp_scratch_list[walker].isSpinor() != p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer mw_evaluateVirtualRatios reference and scratch spinor modes do not match");
+    if (p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer flattened nonlocal ratios do not support spinor virtual moves");
+    if (static_cast<std::size_t>(p_list[walker].getTotalNum()) != electron_count)
+      throw std::invalid_argument(
+          "PsiFormer flattened virtual-ratio electron count differs from the model");
+
+    const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    if (component.model_state_.get() != leader.model_state_.get())
+      throw std::invalid_argument(
+          "PsiFormer flattened virtual-ratio crowd contains components from different models");
+  }
+
+  PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+  constexpr std::size_t no_reference = std::numeric_limits<std::size_t>::max();
+  resource.active_virtual_walkers.clear();
+  resource.virtual_reference_indices.assign(virtual_batch.walkerCount(), no_reference);
+
+  // Compact only walkers named by at least one descriptor segment.  Multiple
+  // segments, including different moved electrons, share this reference slot.
+  for (const VirtualParticleBatch::Segment& segment : virtual_batch.segments())
+  {
+    const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
+    if (resource.virtual_reference_indices[walker] == no_reference)
+    {
+      resource.virtual_reference_indices[walker] =
+          resource.active_virtual_walkers.size();
+      resource.active_virtual_walkers.push_back(walker);
+    }
+  }
+
+  resource.flat_virtual_ratios.resize(virtual_batch.size());
+  PsiFormerReadTransaction transaction(*leader.model_state_);
+  const std::size_t parameter_version = transaction.parameterVersion();
+  for (std::size_t walker = 0; walker < virtual_batch.walkerCount(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
+        parameter_version);
+
+  const EvaluationStamp evaluation_stamp = EvaluationStamp::versioned(
+      leader.model_state_.get(), static_cast<std::uint64_t>(parameter_version));
+
+  const DirectBackendMode value_mode = transaction.state().direct_value_mode;
+  const std::size_t reference_count = resource.active_virtual_walkers.size();
+  pf::DirectBatchValueResultView sparse_result;
+  if (value_mode != DirectBackendMode::ORACLE)
+  {
+    pf::DirectBatchWorkspace& workspace = *resource.batch_workspace;
+    workspace.resizeSparseValues(reference_count, virtual_batch.size());
+
+    // Pack accepted references once without assuming a ParticleSet precision or
+    // storage layout.  The sparse workspace owns the only native double copy.
+    for (std::size_t reference = 0; reference < reference_count; ++reference)
+    {
+      const ParticleSet& particles =
+          p_list[resource.active_virtual_walkers[reference]];
+      for (std::size_t electron = 0; electron < electron_count; ++electron)
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          workspace.setReferencePosition(
+              reference, electron, dimension, particles.R[electron][dimension]);
+    }
+
+    // Preserve descriptor flat order exactly in the sparse replacement table.
+    for (std::size_t segment_index = 0;
+         segment_index < virtual_batch.segmentCount(); ++segment_index)
+    {
+      const VirtualParticleBatch::Slice slice = virtual_batch.slice(segment_index);
+      const std::size_t reference = resource.virtual_reference_indices[
+          static_cast<std::size_t>(slice.walkerId())];
+      for (std::size_t local_index = 0; local_index < slice.size(); ++local_index)
+      {
+        pf::GeometryPosition position{};
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          position[dimension] = slice.absolutePosition(local_index)[dimension];
+        workspace.setVirtualReplacement(
+            slice.flatOffset() + local_index, reference,
+            static_cast<std::size_t>(slice.electronId()), position);
+      }
+    }
+
+    sparse_result =
+        transaction.state().direct_batch_executor.evaluateValues(workspace);
+    if (sparse_result.size != reference_count + virtual_batch.size())
+      throw std::logic_error(
+          "PsiFormer sparse virtual batch returned the wrong result extent");
+    for (std::size_t configuration = 0; configuration < sparse_result.size;
+         ++configuration)
+      if (sparse_result.parameter_version[configuration] != parameter_version)
+        throw std::logic_error(
+            "PsiFormer sparse virtual batch observed inconsistent parameters");
+
+    for (std::size_t segment_index = 0;
+         segment_index < virtual_batch.segmentCount(); ++segment_index)
+    {
+      const VirtualParticleBatch::Slice slice = virtual_batch.slice(segment_index);
+      const std::size_t reference = resource.virtual_reference_indices[
+          static_cast<std::size_t>(slice.walkerId())];
+      for (std::size_t local_index = 0; local_index < slice.size(); ++local_index)
+      {
+        const std::size_t flat_index = slice.flatOffset() + local_index;
+        const std::size_t replacement = reference_count + flat_index;
+        resource.flat_virtual_ratios[flat_index] = makeRatio(
+            sparse_result.sign[replacement], sparse_result.logabs[replacement],
+            sparse_result.sign[reference], sparse_result.logabs[reference]);
+      }
+    }
+  }
+
+  if (value_mode != DirectBackendMode::DIRECT)
+  {
+    // Oracle mode evaluates only the native graph.  Compare mode also checks
+    // every sparse reference/replacement against that established oracle.
+    auto requireSparseMatch = [](double sparse_sign,
+                                 double sparse_logabs,
+                                 double oracle_sign,
+                                 double oracle_logabs,
+                                 const char* description) {
+      if (sparse_sign != oracle_sign)
+        throw std::runtime_error(std::string("PsiFormer sparse ") + description +
+                                 " sign differs from the native oracle");
+      if (sparse_logabs == oracle_logabs)
+        return;
+      if (!psiformer::determinant::isFiniteReal(sparse_logabs) ||
+          !psiformer::determinant::isFiniteReal(oracle_logabs))
+        throw std::runtime_error(std::string("PsiFormer sparse ") + description +
+                                 " log amplitude differs from the native oracle");
+      const double scale = std::max(std::abs(sparse_logabs),
+                                    std::abs(oracle_logabs));
+      if (std::abs(sparse_logabs - oracle_logabs) >
+          2.0e-11 * (1.0 + scale))
+        throw std::runtime_error(std::string("PsiFormer sparse ") + description +
+                                 " log amplitude differs from the native oracle");
+    };
+
+    resource.virtual_reference_signs.resize(reference_count);
+    resource.virtual_reference_logabs.resize(reference_count);
+    for (std::size_t reference = 0; reference < reference_count; ++reference)
+    {
+      const std::size_t walker = resource.active_virtual_walkers[reference];
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      const pf::Result reference_result = component.evaluatePositionsUnderRead(
+          transaction, p_list[walker], -1, nullptr, EvaluationPurpose::VALUE_ONLY);
+      if (value_mode == DirectBackendMode::COMPARE)
+        requireSparseMatch(
+            sparse_result.sign[reference], sparse_result.logabs[reference],
+            reference_result.sign, reference_result.logabs, "reference");
+      resource.virtual_reference_signs[reference] = reference_result.sign;
+      resource.virtual_reference_logabs[reference] = reference_result.logabs;
+    }
+
+    for (std::size_t segment_index = 0;
+         segment_index < virtual_batch.segmentCount(); ++segment_index)
+    {
+      const VirtualParticleBatch::Slice slice = virtual_batch.slice(segment_index);
+      const std::size_t walker = static_cast<std::size_t>(slice.walkerId());
+      const std::size_t reference = resource.virtual_reference_indices[walker];
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      for (std::size_t local_index = 0; local_index < slice.size(); ++local_index)
+      {
+        const pf::Result virtual_result = component.evaluatePositionsUnderRead(
+            transaction, p_list[walker], slice.electronId(),
+            std::addressof(slice.absolutePosition(local_index)),
+            EvaluationPurpose::VALUE_ONLY);
+        const std::size_t flat_index = slice.flatOffset() + local_index;
+        if (value_mode == DirectBackendMode::COMPARE)
+        {
+          const std::size_t replacement = reference_count + flat_index;
+          requireSparseMatch(
+              sparse_result.sign[replacement], sparse_result.logabs[replacement],
+              virtual_result.sign, virtual_result.logabs, "replacement");
+        }
+        resource.flat_virtual_ratios[flat_index] = makeRatio(
+            virtual_result.sign, virtual_result.logabs,
+            resource.virtual_reference_signs[reference],
+            resource.virtual_reference_logabs[reference]);
+      }
+    }
+  }
+
+  // ValueType copies cannot fail; publish only after all sparse/oracle results,
+  // versions, and ratios have been validated.
+  std::copy(resource.flat_virtual_ratios.begin(),
+            resource.flat_virtual_ratios.end(), ratios.begin());
+  return evaluation_stamp;
 }
 
 // Flatten one reference plus a ragged walker-major sequence of virtual moves.

@@ -13,16 +13,20 @@
 
 #include "Particle/MCMultiParticleMoves.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/VirtualParticleBatch.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "ResourceCollection.h"
 #include "psiformer_test_utils.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
 #include <cstddef>
+#include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -32,6 +36,122 @@
 
 namespace qmcplusplus
 {
+namespace testing
+{
+/** Exact clone-local state snapshot used to prove virtual evaluations are read-only. */
+struct PsiFormerCloneStateSnapshot
+{
+  PsiFormerWF::LogValue log_value;
+  std::size_t observed_parameter_version;
+  bool restore_validation_pending;
+  bool accepted_value_valid;
+  ParticleSet::ParticleGradient accepted_gradient;
+  ParticleSet::ParticleLaplacian accepted_laplacian;
+  std::uint64_t accepted_configuration_identity;
+  std::size_t accepted_parameter_version;
+  std::uint64_t accepted_state_requirement;
+  double current_sign;
+  double proposed_sign;
+  PsiFormerWF::LogValue proposed_log_value;
+  ParticleSet::ParticleGradient proposed_gradient;
+  ParticleSet::ParticleLaplacian proposed_laplacian;
+  std::uint64_t proposed_configuration_identity;
+  std::uint64_t proposed_descriptor_fingerprint;
+  std::size_t proposed_parameter_version;
+  int proposed_particle;
+  std::uint64_t proposal_kind;
+  bool has_proposal;
+};
+
+/** Narrow friend accessor for state-isolation and crowd-workspace diagnostics. */
+class TestPsiFormerVirtualBatch
+{
+public:
+  static PsiFormerCloneStateSnapshot cloneState(const PsiFormerWF& component)
+  {
+    return {component.log_value_,
+            component.observed_parameter_version_,
+            component.restore_validation_pending_,
+            component.accepted_value_valid_,
+            component.accepted_gradient_,
+            component.accepted_laplacian_,
+            component.accepted_configuration_identity_,
+            component.accepted_parameter_version_,
+            static_cast<std::uint64_t>(component.accepted_state_requirement_),
+            component.current_sign_,
+            component.proposed_sign_,
+            component.proposed_log_value_,
+            component.proposed_gradient_,
+            component.proposed_laplacian_,
+            component.proposed_configuration_identity_,
+            component.proposed_descriptor_fingerprint_,
+            component.proposed_parameter_version_,
+            component.proposed_particle_,
+            static_cast<std::uint64_t>(component.proposal_kind_),
+            component.has_proposal_};
+  }
+
+  static bool cloneStateMatches(const PsiFormerWF& component,
+                                const PsiFormerCloneStateSnapshot& snapshot)
+  {
+    if (component.log_value_ != snapshot.log_value ||
+        component.observed_parameter_version_ != snapshot.observed_parameter_version ||
+        component.restore_validation_pending_ != snapshot.restore_validation_pending ||
+        component.accepted_value_valid_ != snapshot.accepted_value_valid ||
+        component.accepted_configuration_identity_ != snapshot.accepted_configuration_identity ||
+        component.accepted_parameter_version_ != snapshot.accepted_parameter_version ||
+        static_cast<std::uint64_t>(component.accepted_state_requirement_) !=
+            snapshot.accepted_state_requirement ||
+        component.current_sign_ != snapshot.current_sign ||
+        component.proposed_sign_ != snapshot.proposed_sign ||
+        component.proposed_log_value_ != snapshot.proposed_log_value ||
+        component.proposed_configuration_identity_ != snapshot.proposed_configuration_identity ||
+        component.proposed_descriptor_fingerprint_ != snapshot.proposed_descriptor_fingerprint ||
+        component.proposed_parameter_version_ != snapshot.proposed_parameter_version ||
+        component.proposed_particle_ != snapshot.proposed_particle ||
+        static_cast<std::uint64_t>(component.proposal_kind_) != snapshot.proposal_kind ||
+        component.has_proposal_ != snapshot.has_proposal)
+      return false;
+
+    return sameGradient(component.accepted_gradient_, snapshot.accepted_gradient) &&
+        sameLaplacian(component.accepted_laplacian_, snapshot.accepted_laplacian) &&
+        sameGradient(component.proposed_gradient_, snapshot.proposed_gradient) &&
+        sameLaplacian(component.proposed_laplacian_, snapshot.proposed_laplacian);
+  }
+
+  static PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnostics(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list)
+  {
+    return component.crowdWorkspaceDiagnosticsForTesting(wfc_list);
+  }
+
+private:
+  static bool sameGradient(const ParticleSet::ParticleGradient& actual,
+                           const ParticleSet::ParticleGradient& expected)
+  {
+    if (actual.size() != expected.size())
+      return false;
+    for (std::size_t electron = 0; electron < actual.size(); ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (actual[electron][dimension] != expected[electron][dimension])
+          return false;
+    return true;
+  }
+
+  static bool sameLaplacian(const ParticleSet::ParticleLaplacian& actual,
+                            const ParticleSet::ParticleLaplacian& expected)
+  {
+    if (actual.size() != expected.size())
+      return false;
+    for (std::size_t electron = 0; electron < actual.size(); ++electron)
+      if (actual[electron] != expected[electron])
+        return false;
+    return true;
+  }
+};
+} // namespace testing
+
 namespace
 {
 using namespace testing::psiformer;
@@ -128,6 +248,61 @@ struct Crowd
   RefVectorWithLeader<WaveFunctionComponent> wfc_list;
   std::unique_ptr<RefVectorWithLeader<ParticleSet>> p_list;
 };
+
+/// Own one compatibility VirtualParticleSet scratch object per reference walker.
+struct VirtualScratchCrowd
+{
+  explicit VirtualScratchCrowd(const Crowd& crowd)
+  {
+    storage.reserve(crowd.walkers.size());
+    for (const auto& walker : crowd.walkers)
+      storage.push_back(std::make_unique<VirtualParticleSet>(*walker));
+    list = std::make_unique<RefVectorWithLeader<VirtualParticleSet>>(*storage.front());
+    for (const auto& scratch : storage)
+      list->push_back(*scratch);
+  }
+
+  std::vector<std::unique_ptr<VirtualParticleSet>> storage;
+  std::unique_ptr<RefVectorWithLeader<VirtualParticleSet>> list;
+};
+
+/// Append one off-sphere segment using deterministic displacements from its reference electron.
+void appendVirtualSegment(
+    const Crowd& crowd,
+    std::size_t walker,
+    int electron,
+    std::initializer_list<ParticleSet::PosType> displacements,
+    std::vector<std::size_t>& offsets,
+    std::vector<VirtualParticleBatch::Segment>& segments,
+    std::vector<ParticleSet::PosType>& positions)
+{
+  segments.emplace_back(static_cast<int>(walker), electron);
+  for (const ParticleSet::PosType& displacement : displacements)
+    positions.push_back(crowd.walkers[walker]->R[electron] + displacement);
+  offsets.push_back(positions.size());
+}
+
+/// Evaluate the unchanged scalar virtual interface segment by segment as an independent oracle.
+std::vector<Value> evaluateScalarVirtualBatch(Crowd& crowd,
+                                              const VirtualParticleBatch& batch)
+{
+  std::vector<Value> ratios(batch.size());
+  for (std::size_t segment_index = 0; segment_index < batch.segmentCount();
+       ++segment_index)
+  {
+    const VirtualParticleBatch::Slice slice = batch.slice(segment_index);
+    const std::size_t walker = static_cast<std::size_t>(slice.walkerId());
+    VirtualParticleSet scratch(*crowd.walkers[walker]);
+    scratch.makeMovesAbsolute(*crowd.walkers[walker], slice.electronId(),
+                              slice.positions(), slice.isOnSphere(),
+                              slice.sourceCenterId());
+    std::vector<Value> segment_ratios(slice.size());
+    crowd.components[walker]->evaluateRatios(scratch, segment_ratios);
+    std::copy(segment_ratios.begin(), segment_ratios.end(),
+              ratios.begin() + slice.flatOffset());
+  }
+  return ratios;
+}
 
 } // namespace
 
@@ -352,6 +527,276 @@ TEST_CASE("PsiFormer all-to-one and ragged virtual batches are state isolated",
     CHECK_THROWS_AS(crowd.leader.mw_evaluateSpinorRatios(
                         crowd.wfc_list, virtual_list, unused_spin_multipliers, actual),
                     std::invalid_argument);
+  }
+}
+
+TEST_CASE("PsiFormer flattened virtual batches share sparse references and preserve state",
+          "[wavefunction][psiformer][multiwalker][ecp][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 4);
+
+  // Deliberately order segments independently of walker order, name walker 2
+  // twice with different electrons, and leave walker 3 empty.
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(crowd, 2, 3,
+                       {{0.012, -0.007, 0.005}, {-0.009, 0.011, 0.004}},
+                       offsets, segments, positions);
+  appendVirtualSegment(crowd, 0, 1, {{0.006, 0.003, -0.008}},
+                       offsets, segments, positions);
+  appendVirtualSegment(crowd, 2, 0,
+                       {{-0.004, 0.008, 0.013}, {0.015, -0.006, -0.002}},
+                       offsets, segments, positions);
+  appendVirtualSegment(crowd, 1, 2,
+                       {{0.007, -0.014, 0.009}, {-0.011, 0.005, 0.012}},
+                       offsets, segments, positions);
+  const VirtualParticleBatch batch(crowd.walkers.size(), offsets, segments,
+                                   positions);
+  const std::vector<Value> expected = evaluateScalarVirtualBatch(crowd, batch);
+  VirtualScratchCrowd scratch(crowd);
+
+  // Populate complete accepted caches, then leave one ordinary proposal live.
+  for (std::size_t walker = 0; walker < crowd.walkers.size(); ++walker)
+  {
+    crowd.walkers[walker]->G = Value(0);
+    crowd.walkers[walker]->L = Value(0);
+    crowd.components[walker]->evaluateLog(
+        *crowd.walkers[walker], crowd.walkers[walker]->G,
+        crowd.walkers[walker]->L);
+  }
+  constexpr int proposed_electron = 1;
+  crowd.walkers[2]->makeMove(
+      proposed_electron, ParticleSet::PosType{0.003, -0.005, 0.007});
+  const Value pending_ratio = crowd.components[2]->ratio(
+      *crowd.walkers[2], proposed_electron);
+  CHECK(std::isfinite(std::real(pending_ratio)));
+
+  std::vector<testing::PsiFormerCloneStateSnapshot> states_before;
+  for (const PsiFormerWF* component : crowd.components)
+    states_before.push_back(testing::TestPsiFormerVirtualBatch::cloneState(*component));
+
+  ResourceCollection resource_template("psiformer_flattened_virtual_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection crowd_resource(resource_template);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource,
+                                                            crowd.wfc_list);
+
+    // Shape failure is detected before resource or component state publication.
+    std::vector<Value> wrong_extent(batch.size() - 1, Value(-17));
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateVirtualRatios(
+                        crowd.wfc_list, *crowd.p_list, *scratch.list, batch,
+                        wrong_extent),
+                    std::invalid_argument);
+    CHECK(std::all_of(wrong_extent.begin(), wrong_extent.end(),
+                      [](Value value) { return value == Value(-17); }));
+
+    std::vector<Value> actual(batch.size(), Value(-23));
+    const WaveFunctionComponent::EvaluationStamp first_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual);
+    REQUIRE(first_stamp.isVersioned());
+    for (std::size_t virtual_index = 0; virtual_index < batch.size();
+         ++virtual_index)
+      checkValue(actual[virtual_index], expected[virtual_index]);
+
+    const testing::PsiFormerCrowdWorkspaceDiagnostics first_diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(first_diagnostics.reference_configurations == 3);
+    CHECK(first_diagnostics.replacement_configurations == batch.size());
+    CHECK(first_diagnostics.reference_evaluations == 3);
+    CHECK(first_diagnostics.dense_coordinate_bytes_avoided ==
+          batch.size() * (crowd.walkers.front()->getTotalNum() - 1) * 3 *
+              sizeof(double));
+
+    std::fill(actual.begin(), actual.end(), Value(-31));
+    const WaveFunctionComponent::EvaluationStamp repeated_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual);
+    CHECK(repeated_stamp == first_stamp);
+    for (std::size_t virtual_index = 0; virtual_index < batch.size();
+         ++virtual_index)
+      checkValue(actual[virtual_index], expected[virtual_index]);
+
+    const testing::PsiFormerCrowdWorkspaceDiagnostics repeated_diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(repeated_diagnostics.batch_workspace_identity ==
+          first_diagnostics.batch_workspace_identity);
+    CHECK(repeated_diagnostics.batch_bytes == first_diagnostics.batch_bytes);
+    CHECK(repeated_diagnostics.transient_bytes ==
+          first_diagnostics.transient_bytes);
+
+    // Empty work still reports the model version needed by an outer tiled caller.
+    const std::vector<std::size_t> empty_offsets{0};
+    const std::vector<VirtualParticleBatch::Segment> empty_segments;
+    const std::vector<ParticleSet::PosType> empty_positions;
+    const VirtualParticleBatch empty_batch(
+        crowd.walkers.size(), empty_offsets, empty_segments, empty_positions);
+    std::vector<Value> empty_ratios;
+    const WaveFunctionComponent::EvaluationStamp empty_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, empty_batch,
+            empty_ratios);
+    CHECK(empty_stamp == first_stamp);
+    CHECK(empty_ratios.empty());
+
+    // Same-version flattened evaluation must not consume or overwrite accepted
+    // values, VGL products, or the deliberately pending proposal.
+    for (std::size_t walker = 0; walker < crowd.components.size(); ++walker)
+      CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+          *crowd.components[walker], states_before[walker]));
+
+    // A genuine publication changes the opaque stamp.  The following sparse
+    // call performs the established lazy invalidation of stale clone caches.
+    wftrain::StructuredParameterSnapshot candidate =
+        crowd.leader.snapshotParameters();
+    candidate.values.at(127) += 1.0e-4;
+    crowd.leader.publishParameters(candidate, candidate.version);
+    const WaveFunctionComponent::EvaluationStamp changed_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual);
+    CHECK(changed_stamp != first_stamp);
+    for (Value value : actual)
+      CHECK(std::isfinite(std::real(value)));
+    const WaveFunctionComponent::EvaluationStamp stable_changed_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual);
+    CHECK(stable_changed_stamp == changed_stamp);
+  }
+
+  crowd.walkers[2]->rejectMove(proposed_electron);
+}
+
+TEST_CASE("PsiFormer flattened virtual batches publish atomically after ratio failure",
+          "[wavefunction][psiformer][multiwalker][ecp][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2);
+  for (std::size_t walker = 0; walker < crowd.walkers.size(); ++walker)
+  {
+    crowd.walkers[walker]->G = Value(0);
+    crowd.walkers[walker]->L = Value(0);
+    crowd.components[walker]->evaluateLog(
+        *crowd.walkers[walker], crowd.walkers[walker]->G,
+        crowd.walkers[walker]->L);
+  }
+
+  const ParticleSet::PosType saved_position = crowd.walkers[1]->R[1];
+  crowd.walkers[1]->R[1] = crowd.walkers[1]->R[0];
+  crowd.walkers[1]->update();
+
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(crowd, 1, 0, {{0.09, -0.04, 0.03}}, offsets,
+                       segments, positions);
+  const VirtualParticleBatch batch(crowd.walkers.size(), offsets, segments,
+                                   positions);
+  VirtualScratchCrowd scratch(crowd);
+
+  std::vector<testing::PsiFormerCloneStateSnapshot> states_before;
+  for (const PsiFormerWF* component : crowd.components)
+    states_before.push_back(testing::TestPsiFormerVirtualBatch::cloneState(*component));
+
+  ResourceCollection resource_template("psiformer_flattened_failure_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection crowd_resource(resource_template);
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource,
+                                                          crowd.wfc_list);
+
+  // The exact same-spin reference node is accepted by the value evaluator;
+  // forming a finite moved/reference ratio then fails after all sparse outputs exist.
+  std::vector<Value> ratios(batch.size(), Value(-41));
+  CHECK_THROWS_AS(crowd.leader.mw_evaluateVirtualRatios(
+                      crowd.wfc_list, *crowd.p_list, *scratch.list, batch,
+                      ratios),
+                  std::runtime_error);
+  CHECK(ratios.front() == Value(-41));
+  for (std::size_t walker = 0; walker < crowd.components.size(); ++walker)
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+        *crowd.components[walker], states_before[walker]));
+
+  // Correcting the reference makes the same resource immediately reusable.
+  crowd.walkers[1]->R[1] = saved_position;
+  crowd.walkers[1]->update();
+  const std::vector<Value> expected = evaluateScalarVirtualBatch(crowd, batch);
+  const WaveFunctionComponent::EvaluationStamp retry_stamp =
+      crowd.leader.mw_evaluateVirtualRatios(
+          crowd.wfc_list, *crowd.p_list, *scratch.list, batch, ratios);
+  CHECK(retry_stamp.isVersioned());
+  checkValue(ratios.front(), expected.front());
+  for (std::size_t walker = 0; walker < crowd.components.size(); ++walker)
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+        *crowd.components[walker], states_before[walker]));
+}
+
+TEST_CASE("PsiFormer flattened virtual batches honor oracle and compare backends",
+          "[wavefunction][psiformer][multiwalker][ecp][sparse]")
+{
+  const SimulationCell simulation_cell;
+  for (const char* backend : {"oracle", "compare"})
+  {
+    DYNAMIC_SECTION("backend " << backend)
+    {
+      ScopedEnvironmentVariable backend_mode("PSIFORMER_VALUE_BACKEND", backend);
+      GeneratedFiles files = generateFiles("lih");
+      Crowd crowd(files, simulation_cell, 2);
+      std::vector<std::size_t> offsets{0};
+      std::vector<VirtualParticleBatch::Segment> segments;
+      std::vector<ParticleSet::PosType> positions;
+      appendVirtualSegment(crowd, 1, 2,
+                           {{0.007, -0.006, 0.005}, {-0.004, 0.009, 0.003}},
+                           offsets, segments, positions);
+      appendVirtualSegment(crowd, 0, 0, {{0.011, 0.002, -0.008}},
+                           offsets, segments, positions);
+      const VirtualParticleBatch batch(crowd.walkers.size(), offsets, segments,
+                                       positions);
+      const std::vector<Value> expected = evaluateScalarVirtualBatch(crowd, batch);
+      VirtualScratchCrowd scratch(crowd);
+
+      std::vector<testing::PsiFormerCloneStateSnapshot> states_before;
+      for (const PsiFormerWF* component : crowd.components)
+        states_before.push_back(testing::TestPsiFormerVirtualBatch::cloneState(*component));
+
+      ResourceCollection resource_template("psiformer_flattened_backend_template");
+      crowd.leader.createResource(resource_template);
+      ResourceCollection crowd_resource(resource_template);
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource,
+                                                              crowd.wfc_list);
+      std::vector<Value> actual(batch.size(), Value(-53));
+      const WaveFunctionComponent::EvaluationStamp stamp =
+          crowd.leader.mw_evaluateVirtualRatios(
+              crowd.wfc_list, *crowd.p_list, *scratch.list, batch, actual);
+      CHECK(stamp.isVersioned());
+      for (std::size_t virtual_index = 0; virtual_index < batch.size();
+           ++virtual_index)
+        checkValue(actual[virtual_index], expected[virtual_index]);
+      for (std::size_t walker = 0; walker < crowd.components.size(); ++walker)
+        CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+            *crowd.components[walker], states_before[walker]));
+
+      const testing::PsiFormerCrowdWorkspaceDiagnostics diagnostics =
+          testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+              crowd.leader, crowd.wfc_list);
+      if (std::string(backend) == "compare")
+      {
+        CHECK(diagnostics.reference_configurations == 2);
+        CHECK(diagnostics.replacement_configurations == batch.size());
+        CHECK(diagnostics.reference_evaluations == 2);
+      }
+      else
+      {
+        CHECK(diagnostics.reference_configurations == 0);
+        CHECK(diagnostics.replacement_configurations == 0);
+        CHECK(diagnostics.reference_evaluations == 0);
+      }
+    }
   }
 }
 

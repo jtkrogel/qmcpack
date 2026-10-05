@@ -142,6 +142,11 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   std::size_t score_bytes                 = 0;
   std::size_t kinetic_bytes               = 0;
   std::size_t transient_bytes             = 0;
+  /// Sparse counters from the most recent completed direct crowd batch.
+  std::size_t reference_configurations       = 0;
+  std::size_t replacement_configurations     = 0;
+  std::size_t reference_evaluations          = 0;
+  std::size_t dense_coordinate_bytes_avoided = 0;
   std::array<std::string, 4> backend_modes;
 
   /// Return all explicitly accounted numeric storage owned by the resource.
@@ -151,6 +156,9 @@ struct PsiFormerCrowdWorkspaceDiagnostics
 
 /// Test-only accessor for bounded crowd-workspace ownership diagnostics.
 class TestPsiFormerWF;
+
+/// Test-only accessor for flattened virtual-batch state-isolation diagnostics.
+class TestPsiFormerVirtualBatch;
 }
 
 /**
@@ -348,6 +356,15 @@ public:
   void mw_evaluateRatios(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                          const RefVectorWithLeader<const VirtualParticleSet>& virtual_particle_list,
                          std::vector<std::vector<ValueType>>& ratios) const override;
+
+  /** Evaluate a flattened ragged virtual batch from sparse references and
+   * replacements while returning the shared parameter-version stamp. */
+  EvaluationStamp mw_evaluateVirtualRatios(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const VirtualParticleBatch& batch,
+      std::vector<ValueType>& ratios) const override;
 
   /// Reject crowd spin-orbit ratios before ignoring any spin quadrature multipliers.
   void mw_evaluateSpinorRatios(
@@ -685,6 +702,7 @@ private:
   bool has_proposal_          = false;
 
   friend class testing::TestPsiFormerWF;
+  friend class testing::TestPsiFormerVirtualBatch;
 };
 
 } // namespace qmcplusplus
