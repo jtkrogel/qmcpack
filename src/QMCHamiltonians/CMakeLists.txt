@@ -59,6 +59,7 @@ if(OHMMS_DIM MATCHES 3)
       ForceChiesaPBCAA.cpp
       StressPBC.cpp
       LocalECPotential.cpp
+      NLPPVirtualBatch.cpp
       NonLocalECPComponent.cpp
       NonLocalECPotential.deriv.cpp
       NonLocalECPotential.cpp
