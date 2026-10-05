@@ -10,11 +10,10 @@
  *
  * Logical positions and results are configuration-major and grow with the requested
  * batch.  Expensive geometry, activation, orbital, and determinant scratch grows only
- * to an explicitly bounded tile capacity.  VALUE_ONLY executes shared-weight dense
- * kernels over all configuration/electron rows in a tile.  The spatial modes retain
- * the validated scalar algebra temporarily, but reuse at most one scalar workspace per
- * tile slot; they are the next replacement boundary and are reported explicitly by
- * execution statistics.
+ * to an explicitly bounded tile capacity.  Value and spatial modes execute shared-weight
+ * dense kernels over all configuration/electron rows in a tile.  Spatial attention,
+ * orbital envelopes, stable determinant reduction, and cusp terms remain
+ * configuration-local while their learned projections share the tile kernel seam.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_SPATIAL_EXECUTOR_H
@@ -88,7 +87,12 @@ public:
         spatial_executor_(&spatial_executor),
         electron_count_(value_executor.layout()->electronCount()),
         tile_capacity_(default_tile_capacity)
-  {}
+  {
+    if (value_executor.layout().get() != spatial_executor.layout().get() ||
+        spatial_executor.valueExecutorIdentity() != &value_executor)
+      throw std::invalid_argument(
+          "PsiFormer batch executors do not share one parameter layout");
+  }
 
   DirectBatchWorkspace(const DirectBatchWorkspace&) = delete;
   DirectBatchWorkspace& operator=(const DirectBatchWorkspace&) = delete;
@@ -102,8 +106,14 @@ public:
   {
     if (capacity == 0)
       throw std::invalid_argument("PsiFormer batch tile capacity must be positive");
+    // A policy capacity larger than the current logical batch is harmless.  Only
+    // the effective occupancy participates in BLAS dimensions or allocation.
     if (active_size_ != 0)
-      prepareScratch(active_mode_, std::min(active_size_, capacity));
+    {
+      const std::size_t effective_capacity = std::min(active_size_, capacity);
+      validateScratchExtents(active_mode_, effective_capacity);
+      prepareScratch(active_mode_, effective_capacity);
+    }
     tile_capacity_ = capacity;
   }
 
@@ -127,11 +137,16 @@ public:
         ? batch::checkedProduct(size, electron_count_,
                                 "PsiFormer batch Laplacian extent overflowed")
         : 0;
+    const std::size_t effective_capacity = std::min(size, tile_capacity_);
+
+    // Reject impossible packed products and BLAS dimensions before changing
+    // either logical storage or a retained scratch family.
+    validateScratchExtents(mode, effective_capacity);
 
     growVector(electron_positions_, position_count);
     growVector(position_ready_, position_count);
     reserveOutputs(size, gradient_count, laplacian_count);
-    prepareScratch(mode, std::min(size, tile_capacity_));
+    prepareScratch(mode, effective_capacity);
 
     active_mode_ = mode;
     active_size_ = size;
@@ -218,8 +233,11 @@ public:
     mix_vector(pending_value_);
     mix_vector(pending_parameter_version_);
     mix_vector(gradient_);
+    mix_vector(pending_gradient_);
     mix_vector(lap_log_);
     mix_vector(lap_ratio_);
+    mix_vector(pending_lap_log_);
+    mix_vector(pending_lap_ratio_);
 
     switch (mode)
     {
@@ -246,12 +264,22 @@ public:
       }
       break;
     case DirectBatchMode::FULL_VGL:
+      mix_vector(spatial_dense_source_);
+      mix_vector(spatial_dense_target_);
       for (const auto& spatial : full_workspaces_)
+      {
         mix_value(reinterpret_cast<std::uintptr_t>(spatial.get()));
+        mix_value(spatial->storageFingerprint());
+      }
       break;
     case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      mix_vector(spatial_dense_source_);
+      mix_vector(spatial_dense_target_);
       for (const auto& spatial : active_workspaces_)
+      {
         mix_value(reinterpret_cast<std::uintptr_t>(spatial.get()));
+        mix_value(spatial->storageFingerprint());
+      }
       break;
     }
     return hash;
@@ -272,8 +300,11 @@ public:
     bytes += pending_value_.capacity() * sizeof(double);
     bytes += pending_parameter_version_.capacity() * sizeof(std::size_t);
     bytes += gradient_.capacity() * sizeof(double);
+    bytes += pending_gradient_.capacity() * sizeof(double);
     bytes += lap_log_.capacity() * sizeof(double);
     bytes += lap_ratio_.capacity() * sizeof(double);
+    bytes += pending_lap_log_.capacity() * sizeof(double);
+    bytes += pending_lap_ratio_.capacity() * sizeof(double);
     return bytes;
   }
 
@@ -296,6 +327,8 @@ public:
     add(spin_features_);
     add(backflow_values_);
     add(orbital_matrices_);
+    add(spatial_dense_source_);
+    add(spatial_dense_target_);
     std::size_t bytes = scalar_capacity * sizeof(double);
     for (const auto& geometry : value_geometries_)
       bytes += geometry.storageBytes();
@@ -306,6 +339,13 @@ public:
     for (const auto& spatial : active_workspaces_)
       bytes += spatial->vectorStorageBytes();
     return bytes;
+  }
+
+  /// Return the shared packed source/target storage used by spatial tile kernels.
+  std::size_t spatialTileKernelBytes() const noexcept
+  {
+    return (spatial_dense_source_.capacity() + spatial_dense_target_.capacity()) *
+        sizeof(double);
   }
 
   std::size_t vectorStorageBytes() const noexcept
@@ -358,8 +398,11 @@ private:
     growVector(pending_value_, size);
     growVector(pending_parameter_version_, size);
     growVector(gradient_, gradient_count);
+    growVector(pending_gradient_, gradient_count);
     growVector(lap_log_, laplacian_count);
     growVector(lap_ratio_, laplacian_count);
+    growVector(pending_lap_log_, laplacian_count);
+    growVector(pending_lap_ratio_, laplacian_count);
   }
 
   void prepareScratch(DirectBatchMode mode, std::size_t capacity)
@@ -370,27 +413,102 @@ private:
       growValueScratch(capacity);
       break;
     case DirectBatchMode::FULL_VGL:
+    {
+      const std::size_t packed_elements =
+          spatialDenseScratchElements(capacity, DirectSpatialMode::FULL_VGL);
       growWorkspaces(full_workspaces_, capacity, [this]() {
         return spatial_executor_->makeWorkspace(DirectSpatialMode::FULL_VGL);
       });
+      growVector(spatial_dense_source_, packed_elements);
+      growVector(spatial_dense_target_, packed_elements);
       break;
+    }
     case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+    {
+      const std::size_t packed_elements = spatialDenseScratchElements(
+          capacity, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
       growWorkspaces(active_workspaces_, capacity, [this]() {
         return spatial_executor_->makeWorkspace(DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
       });
+      growVector(spatial_dense_source_, packed_elements);
+      growVector(spatial_dense_target_, packed_elements);
+      break;
+    }
+    }
+  }
+
+  /// Validate scratch products and BLAS ABI dimensions without changing state.
+  void validateScratchExtents(DirectBatchMode mode, std::size_t capacity) const
+  {
+    switch (mode)
+    {
+    case DirectBatchMode::VALUE_ONLY:
+      (void)valueScratchExtents(capacity);
+      break;
+    case DirectBatchMode::FULL_VGL:
+      (void)spatialDenseScratchElements(capacity, DirectSpatialMode::FULL_VGL);
+      break;
+    case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      (void)spatialDenseScratchElements(
+          capacity, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
       break;
     }
   }
 
-  /// Grow every value-only tile buffer after all element-count products are checked.
-  void growValueScratch(std::size_t capacity)
+  /// Validate and return packed spatial elements before any slot or vector growth.
+  std::size_t spatialDenseScratchElements(std::size_t capacity,
+                                          DirectSpatialMode mode) const
   {
-    if (capacity <= value_tile_capacity_)
-      return;
+    const auto& layout = *value_executor_->layout();
+    namespace batch = qmcplusplus::psiformer::batch;
+    const std::size_t gradient_lanes =
+        mode == DirectSpatialMode::FULL_VGL
+        ? batch::checkedProduct(electron_count_, 3,
+                                "PsiFormer spatial tile gradient extent overflowed")
+        : 3;
+    const std::size_t laplacian_lanes =
+        mode == DirectSpatialMode::FULL_VGL ? electron_count_ : 0;
+    const std::size_t planes = 1 + gradient_lanes + laplacian_lanes;
+    const std::size_t orbital_channels = batch::checkedProduct(
+        layout.determinantCount(), electron_count_,
+        "PsiFormer spatial tile orbital extent overflowed");
+    const std::size_t maximum_width =
+        std::max({layout.inputWidth(), layout.featureWidth(), orbital_channels});
+    const std::size_t packed_rows = batch::checkedProduct(
+        batch::checkedProduct(capacity, planes,
+                              "PsiFormer spatial tile plane extent overflowed"),
+        electron_count_, "PsiFormer spatial tile row extent overflowed");
+    (void)qmcplusplus::psiformer::dense::checkedBlasDimension(
+        packed_rows,
+        "PsiFormer spatial tile rows exceed the BLAS integer ABI");
+    (void)qmcplusplus::psiformer::dense::checkedBlasDimension(
+        maximum_width,
+        "PsiFormer spatial tile width exceeds the BLAS integer ABI");
+    const std::size_t packed_elements = batch::checkedProduct(
+        packed_rows, maximum_width,
+        "PsiFormer spatial tile dense scratch extent overflowed");
+    return packed_elements;
+  }
+
+  struct ValueScratchExtents
+  {
+    std::size_t raw;
+    std::size_t feature;
+    std::size_t attention;
+    std::size_t backflow;
+    std::size_t orbital;
+  };
+
+  /// Validate and return every value-only scratch extent without allocating.
+  ValueScratchExtents valueScratchExtents(std::size_t capacity) const
+  {
     const auto& layout = *value_executor_->layout();
     namespace batch = qmcplusplus::psiformer::batch;
     const std::size_t electron_rows = batch::checkedProduct(
         capacity, electron_count_, "PsiFormer value tile electron extent overflowed");
+    (void)qmcplusplus::psiformer::dense::checkedBlasDimension(
+        electron_rows,
+        "PsiFormer value tile rows exceed the BLAS integer ABI");
     const std::size_t feature_elements = batch::checkedProduct(
         electron_rows, layout.featureWidth(), "PsiFormer value tile feature extent overflowed");
     const std::size_t raw_elements = batch::checkedProduct(
@@ -405,12 +523,27 @@ private:
     const std::size_t orbital_channels = batch::checkedProduct(
         layout.determinantCount(), electron_count_,
         "PsiFormer value tile orbital extent overflowed");
+    (void)qmcplusplus::psiformer::dense::checkedBlasDimension(
+        std::max({layout.inputWidth(), layout.featureWidth(), orbital_channels}),
+        "PsiFormer value tile width exceeds the BLAS integer ABI");
     const std::size_t backflow_elements = batch::checkedProduct(
         electron_rows, orbital_channels,
         "PsiFormer value tile backflow extent overflowed");
     // Both packed backflow outputs and final matrices contain
     // T * Ne * (D * Ne) scalar entries; only their index ordering differs.
     const std::size_t orbital_elements = backflow_elements;
+
+    return {raw_elements, feature_elements, attention_elements,
+            backflow_elements, orbital_elements};
+  }
+
+  /// Grow every value-only tile buffer after all element-count products are checked.
+  void growValueScratch(std::size_t capacity)
+  {
+    if (capacity <= value_tile_capacity_)
+      return;
+    const auto& layout = *value_executor_->layout();
+    const ValueScratchExtents extents = valueScratchExtents(capacity);
 
     value_geometries_.reserve(capacity);
     while (value_geometries_.size() < capacity)
@@ -422,18 +555,18 @@ private:
           std::make_unique<qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace>(
               layout.determinantCount(), electron_count_));
 
-    growVector(raw_features_, raw_elements);
-    growVector(features_a_, feature_elements);
-    growVector(features_b_, feature_elements);
-    growVector(query_, feature_elements);
-    growVector(key_, feature_elements);
-    growVector(projected_value_, feature_elements);
-    growVector(attention_, attention_elements);
-    growVector(attended_, feature_elements);
-    growVector(hidden_, feature_elements);
-    growVector(spin_features_, feature_elements);
-    growVector(backflow_values_, backflow_elements);
-    growVector(orbital_matrices_, orbital_elements);
+    growVector(raw_features_, extents.raw);
+    growVector(features_a_, extents.feature);
+    growVector(features_b_, extents.feature);
+    growVector(query_, extents.feature);
+    growVector(key_, extents.feature);
+    growVector(projected_value_, extents.feature);
+    growVector(attention_, extents.attention);
+    growVector(attended_, extents.feature);
+    growVector(hidden_, extents.feature);
+    growVector(spin_features_, extents.feature);
+    growVector(backflow_values_, extents.backflow);
+    growVector(orbital_matrices_, extents.orbital);
     value_tile_capacity_ = capacity;
   }
 
@@ -485,6 +618,8 @@ private:
       determinant_workspaces_;
   std::vector<std::unique_ptr<DirectSpatialWorkspace>> full_workspaces_;
   std::vector<std::unique_ptr<DirectSpatialWorkspace>> active_workspaces_;
+  std::vector<double> spatial_dense_source_;
+  std::vector<double> spatial_dense_target_;
 
   std::vector<double> sign_;
   std::vector<double> logabs_;
@@ -495,8 +630,11 @@ private:
   std::vector<double> pending_value_;
   std::vector<std::size_t> pending_parameter_version_;
   std::vector<double> gradient_;
+  std::vector<double> pending_gradient_;
   std::vector<double> lap_log_;
   std::vector<double> lap_ratio_;
+  std::vector<double> pending_lap_log_;
+  std::vector<double> pending_lap_ratio_;
 };
 
 /** Execute configuration-major batches against one immutable model and plan. */
@@ -506,7 +644,12 @@ public:
   DirectBatchExecutor(const DirectValueExecutor& value_executor,
                       const DirectSpatialExecutor& spatial_executor)
       : value_executor_(value_executor), spatial_executor_(spatial_executor)
-  {}
+  {
+    if (value_executor.layout().get() != spatial_executor.layout().get() ||
+        spatial_executor.valueExecutorIdentity() != &value_executor)
+      throw std::invalid_argument(
+          "PsiFormer batch executors do not share one parameter layout");
+  }
 
   std::unique_ptr<DirectBatchWorkspace> makeWorkspace() const
   { return std::make_unique<DirectBatchWorkspace>(value_executor_, spatial_executor_); }
@@ -545,81 +688,22 @@ public:
     return valueView(workspace);
   }
 
-  /** Evaluate full VGL through bounded transitional scalar tile scratch. */
+  /// Evaluate full VGL with shared dense work across every tile jet plane.
   DirectBatchSpatialResultView evaluateFull(DirectBatchWorkspace& workspace) const
   {
     requireWorkspace(workspace);
     requireMode(workspace, DirectBatchMode::FULL_VGL);
-    workspace.requireCompletePositions();
-    DirectBatchExecutionStatistics statistics;
-    const std::size_t gradient_stride = 3 * workspace.electron_count_;
-    for (std::size_t tile_begin = 0; tile_begin < workspace.active_size_;
-         tile_begin += workspace.tile_capacity_)
-    {
-      const std::size_t tile_size =
-          std::min(workspace.tile_capacity_, workspace.active_size_ - tile_begin);
-      ++statistics.tiles_executed;
-      statistics.max_tile_occupancy = std::max(statistics.max_tile_occupancy, tile_size);
-      for (std::size_t local = 0; local < tile_size; ++local)
-      {
-        const std::size_t configuration = tile_begin + local;
-        workspace.full_workspaces_[local]->setPositions(workspace.positionView(configuration));
-        const DirectSpatialResultView result =
-            spatial_executor_.evaluateFull(*workspace.full_workspaces_[local]);
-        ++statistics.scalar_executor_calls;
-        storeValue(workspace, configuration, result.sign, result.logabs, result.value,
-                   result.parameter_version);
-        std::copy(result.gradient.begin(), result.gradient.end(),
-                  workspace.gradient_.begin() + configuration * gradient_stride);
-        std::copy(result.lap_log.begin(), result.lap_log.end(),
-                  workspace.lap_log_.begin() + configuration * workspace.electron_count_);
-        std::copy(result.lap_ratio.begin(), result.lap_ratio.end(),
-                  workspace.lap_ratio_.begin() + configuration * workspace.electron_count_);
-      }
-    }
-    workspace.statistics_ = statistics;
-    return spatialView(workspace, DirectSpatialMode::FULL_VGL, gradient_stride,
-                       workspace.electron_count_);
+    return evaluateSpatialBatch(workspace, DirectSpatialMode::FULL_VGL, nullptr);
   }
 
-  /** Evaluate active gradients through bounded transitional scalar tile scratch. */
+  /// Evaluate independently selected active-electron gradients with shared tile kernels.
   DirectBatchSpatialResultView evaluateActive(DirectBatchWorkspace& workspace,
                                                const std::size_t* active_electrons) const
   {
     requireWorkspace(workspace);
     requireMode(workspace, DirectBatchMode::ACTIVE_ELECTRON_GRADIENT);
-    workspace.requireCompletePositions();
-    if (workspace.active_size_ != 0 && active_electrons == nullptr)
-      throw std::invalid_argument("PsiFormer active batch has no electron-index array");
-    for (std::size_t configuration = 0; configuration < workspace.active_size_; ++configuration)
-      if (active_electrons[configuration] >= workspace.electron_count_)
-        throw std::out_of_range("PsiFormer active batch electron index is out of range");
-
-    DirectBatchExecutionStatistics statistics;
-    constexpr std::size_t gradient_stride = 3;
-    for (std::size_t tile_begin = 0; tile_begin < workspace.active_size_;
-         tile_begin += workspace.tile_capacity_)
-    {
-      const std::size_t tile_size =
-          std::min(workspace.tile_capacity_, workspace.active_size_ - tile_begin);
-      ++statistics.tiles_executed;
-      statistics.max_tile_occupancy = std::max(statistics.max_tile_occupancy, tile_size);
-      for (std::size_t local = 0; local < tile_size; ++local)
-      {
-        const std::size_t configuration = tile_begin + local;
-        workspace.active_workspaces_[local]->setPositions(workspace.positionView(configuration));
-        const DirectSpatialResultView result = spatial_executor_.evaluateActive(
-            *workspace.active_workspaces_[local], active_electrons[configuration]);
-        ++statistics.scalar_executor_calls;
-        storeValue(workspace, configuration, result.sign, result.logabs, result.value,
-                   result.parameter_version);
-        std::copy(result.gradient.begin(), result.gradient.end(),
-                  workspace.gradient_.begin() + configuration * gradient_stride);
-      }
-    }
-    workspace.statistics_ = statistics;
-    return spatialView(workspace, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT,
-                       gradient_stride, 0);
+    return evaluateSpatialBatch(
+        workspace, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, active_electrons);
   }
 
 private:
@@ -639,6 +723,624 @@ private:
     if (workspace.value_executor_ != &value_executor_ ||
         workspace.spatial_executor_ != &spatial_executor_)
       throw std::invalid_argument("PsiFormer batch workspace belongs to another executor");
+  }
+
+  static std::vector<std::unique_ptr<DirectSpatialWorkspace>>& spatialWorkspaces(
+      DirectBatchWorkspace& workspace,
+      DirectSpatialMode mode) noexcept
+  {
+    return mode == DirectSpatialMode::FULL_VGL ? workspace.full_workspaces_
+                                                : workspace.active_workspaces_;
+  }
+
+  /** Pack [configuration,plane,row,feature] into the shared dense source matrix. */
+  template<class Source>
+  static std::size_t packSpatialTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_size,
+      std::size_t rows,
+      std::size_t input_width,
+      Source&& source)
+  {
+    if (tile_size == 0)
+      return 0;
+    const std::size_t plane_elements = rows * input_width;
+    const std::size_t gradient_lanes = workspaces.front()->gradient_lanes_;
+    const std::size_t laplacian_lanes = workspaces.front()->laplacian_lanes_;
+    const std::size_t planes = 1 + gradient_lanes + laplacian_lanes;
+    for (std::size_t local = 0; local < tile_size; ++local)
+    {
+      const DirectSpatialJetBuffer& jet = source(*workspaces[local]);
+      if (jet.value.size() != plane_elements ||
+          jet.gradient.size() != gradient_lanes * plane_elements ||
+          jet.laplacian.size() != laplacian_lanes * plane_elements)
+        throw std::logic_error("PsiFormer spatial batch jet shape is inconsistent");
+      double* configuration = batch_workspace.spatial_dense_source_.data() +
+          local * planes * plane_elements;
+      std::copy_n(jet.value.data(), plane_elements, configuration);
+      std::copy_n(jet.gradient.data(), gradient_lanes * plane_elements,
+                  configuration + plane_elements);
+      std::copy_n(jet.laplacian.data(), laplacian_lanes * plane_elements,
+                  configuration + (1 + gradient_lanes) * plane_elements);
+    }
+    return tile_size * planes * rows;
+  }
+
+  /** Scatter one dense result back to the fixed per-configuration jet buffers. */
+  template<class Target>
+  static void unpackSpatialTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_size,
+      std::size_t rows,
+      std::size_t output_width,
+      const double* bias,
+      Target&& target)
+  {
+    if (tile_size == 0)
+      return;
+    const std::size_t plane_elements = rows * output_width;
+    const std::size_t gradient_lanes = workspaces.front()->gradient_lanes_;
+    const std::size_t laplacian_lanes = workspaces.front()->laplacian_lanes_;
+    const std::size_t planes = 1 + gradient_lanes + laplacian_lanes;
+    for (std::size_t local = 0; local < tile_size; ++local)
+    {
+      DirectSpatialJetBuffer& jet = target(*workspaces[local]);
+      if (jet.value.size() != plane_elements ||
+          jet.gradient.size() != gradient_lanes * plane_elements ||
+          jet.laplacian.size() != laplacian_lanes * plane_elements)
+        throw std::logic_error("PsiFormer spatial batch target shape is inconsistent");
+      const double* configuration = batch_workspace.spatial_dense_target_.data() +
+          local * planes * plane_elements;
+      std::copy_n(configuration, plane_elements, jet.value.data());
+      std::copy_n(configuration + plane_elements,
+                  gradient_lanes * plane_elements, jet.gradient.data());
+      std::copy_n(configuration + (1 + gradient_lanes) * plane_elements,
+                  laplacian_lanes * plane_elements, jet.laplacian.data());
+      if (bias)
+        for (std::size_t row = 0; row < rows; ++row)
+          for (std::size_t output = 0; output < output_width; ++output)
+            jet.value[row * output_width + output] += bias[output];
+    }
+  }
+
+  /// Apply one shared-weight dense product to every tile configuration and jet plane.
+  template<class Source, class Target>
+  static void denseSpatialTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_size,
+      const double* weight,
+      const double* bias,
+      std::size_t rows,
+      std::size_t input_width,
+      std::size_t output_width,
+      Source&& source,
+      Target&& target,
+      DirectBatchExecutionStatistics& statistics)
+  {
+    const std::size_t packed_rows = packSpatialTile(
+        batch_workspace, workspaces, tile_size, rows, input_width, source);
+    qmcplusplus::psiformer::batch::productReal(
+        batch_workspace.spatial_dense_source_.data(), weight, nullptr,
+        packed_rows, input_width, output_width,
+        batch_workspace.spatial_dense_target_.data(), statistics);
+    unpackSpatialTile(batch_workspace, workspaces, tile_size, rows, output_width,
+                      bias, target);
+  }
+
+  /// Apply Q, K, and V weights to one packed tile jet without repacking its source.
+  template<class Source, class Query, class Key, class Value>
+  static void denseSpatialQkvTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_size,
+      const double* query_weight,
+      const double* key_weight,
+      const double* value_weight,
+      std::size_t rows,
+      std::size_t width,
+      Source&& source,
+      Query&& query,
+      Key&& key,
+      Value&& value,
+      DirectBatchExecutionStatistics& statistics)
+  {
+    const std::size_t packed_rows = packSpatialTile(
+        batch_workspace, workspaces, tile_size, rows, width, source);
+    auto project = [&](const double* weight, auto&& target) {
+      qmcplusplus::psiformer::batch::productReal(
+          batch_workspace.spatial_dense_source_.data(), weight, nullptr,
+          packed_rows, width, width, batch_workspace.spatial_dense_target_.data(),
+          statistics);
+      unpackSpatialTile(batch_workspace, workspaces, tile_size, rows, width,
+                        nullptr, target);
+    };
+    project(query_weight, query);
+    project(key_weight, key);
+    project(value_weight, value);
+  }
+
+  static void addSpatialJet(DirectSpatialJetBuffer& target,
+                            const DirectSpatialJetBuffer& source)
+  {
+    for (std::size_t element = 0; element < target.value.size(); ++element)
+      target.value[element] += source.value[element];
+    for (std::size_t element = 0; element < target.gradient.size(); ++element)
+      target.gradient[element] += source.gradient[element];
+    for (std::size_t element = 0; element < target.laplacian.size(); ++element)
+      target.laplacian[element] += source.laplacian[element];
+  }
+
+  /// Build embedding and attention/MLP jets with tile-stacked shared projections.
+  void buildSpatialNetworkTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_begin,
+      std::size_t tile_size,
+      const std::size_t* active_electrons,
+      const double* parameters,
+      DirectBatchExecutionStatistics& statistics) const
+  {
+    const auto& layout = *spatial_executor_.layout_;
+    const std::size_t electrons = layout.electronCount();
+    const std::size_t width = layout.featureWidth();
+    for (std::size_t local = 0; local < tile_size; ++local)
+    {
+      const std::size_t configuration = tile_begin + local;
+      DirectSpatialWorkspace& spatial = *workspaces[local];
+      spatial.setPositions(batch_workspace.positionView(configuration));
+      spatial.active_electron_ = spatial.mode_ == DirectSpatialMode::FULL_VGL
+          ? 0
+          : active_electrons[configuration];
+      try
+      {
+        spatial_executor_.refreshGeometry(spatial);
+        spatial_executor_.buildEmbeddingFeatures(spatial);
+      }
+      catch (const std::exception& error)
+      {
+        throw std::runtime_error(
+            "PsiFormer batch configuration " + std::to_string(configuration) +
+            " embedding failed: " + error.what());
+      }
+    }
+
+    denseSpatialTile(
+        batch_workspace, workspaces, tile_size,
+        tensor(parameters, layout.embedding_), nullptr, electrons,
+        layout.inputWidth(), width,
+        [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+          return spatial.raw_features_;
+        },
+        [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+          return spatial.features_a_;
+        },
+        statistics);
+
+    for (const auto& layer : layout.layers_)
+    {
+      denseSpatialQkvTile(
+          batch_workspace, workspaces, tile_size,
+          tensor(parameters, layer.query), tensor(parameters, layer.key),
+          tensor(parameters, layer.value), electrons, width,
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.features_a_;
+          },
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.query_;
+          },
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.key_;
+          },
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.projected_value_;
+          },
+          statistics);
+
+      for (std::size_t local = 0; local < tile_size; ++local)
+      {
+        const std::size_t configuration = tile_begin + local;
+        try
+        {
+          spatial_executor_.buildAttentionWeights(*workspaces[local]);
+          spatial_executor_.buildAttentionContext(*workspaces[local]);
+        }
+        catch (const std::exception& error)
+        {
+          throw std::runtime_error(
+              "PsiFormer batch configuration " + std::to_string(configuration) +
+              " attention failed: " + error.what());
+        }
+      }
+
+      denseSpatialTile(
+          batch_workspace, workspaces, tile_size,
+          tensor(parameters, layer.projection), nullptr, electrons, width, width,
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.attended_;
+          },
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.features_b_;
+          },
+          statistics);
+      for (std::size_t local = 0; local < tile_size; ++local)
+        addSpatialJet(workspaces[local]->features_b_,
+                      workspaces[local]->features_a_);
+
+      denseSpatialTile(
+          batch_workspace, workspaces, tile_size,
+          tensor(parameters, layer.mlp_weight_0),
+          tensor(parameters, layer.mlp_bias_0), electrons, width, width,
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.features_b_;
+          },
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.hidden_;
+          },
+          statistics);
+      for (std::size_t local = 0; local < tile_size; ++local)
+        DirectSpatialExecutor::tanhJetInPlace(
+            workspaces[local]->hidden_, workspaces[local]->gradient_lanes_,
+            workspaces[local]->laplacian_lanes_);
+
+      denseSpatialTile(
+          batch_workspace, workspaces, tile_size,
+          tensor(parameters, layer.mlp_weight_1),
+          tensor(parameters, layer.mlp_bias_1), electrons, width, width,
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.hidden_;
+          },
+          [](DirectSpatialWorkspace& spatial) -> DirectSpatialJetBuffer& {
+            return spatial.attended_;
+          },
+          statistics);
+      for (std::size_t local = 0; local < tile_size; ++local)
+      {
+        DirectSpatialExecutor::tanhJetInPlace(
+            workspaces[local]->attended_, workspaces[local]->gradient_lanes_,
+            workspaces[local]->laplacian_lanes_);
+        addSpatialJet(workspaces[local]->features_b_,
+                      workspaces[local]->attended_);
+        std::swap(workspaces[local]->features_a_, workspaces[local]->features_b_);
+      }
+    }
+  }
+
+  /// Pack and project one spin block, then combine backflow and envelope jets.
+  void buildSpatialOrbitalSpinTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_begin,
+      std::size_t tile_size,
+      bool spin_up,
+      const double* parameters,
+      DirectBatchExecutionStatistics& statistics) const
+  {
+    const auto& layout = *spatial_executor_.layout_;
+    const std::size_t electrons = layout.electronCount();
+    const std::size_t spin_begin = spin_up ? 0 : layout.spinUpCount();
+    const std::size_t spin_count =
+        spin_up ? layout.spinUpCount() : layout.spinDownCount();
+    if (spin_count == 0)
+      return;
+    const std::size_t width = layout.featureWidth();
+    const std::size_t determinant_count = layout.determinantCount();
+    const std::size_t channels = determinant_count * electrons;
+    const std::size_t gradient_lanes = workspaces.front()->gradient_lanes_;
+    const std::size_t laplacian_lanes = workspaces.front()->laplacian_lanes_;
+    const std::size_t planes = 1 + gradient_lanes + laplacian_lanes;
+
+    for (std::size_t local = 0; local < tile_size; ++local)
+    {
+      const DirectSpatialJetBuffer& features = workspaces[local]->features_a_;
+      for (std::size_t plane = 0; plane < planes; ++plane)
+      {
+        const double* plane_values = plane == 0
+            ? features.value.data()
+            : (plane <= gradient_lanes
+                   ? features.gradient.data() + (plane - 1) * features.value.size()
+                   : features.laplacian.data() +
+                       (plane - 1 - gradient_lanes) * features.value.size());
+        for (std::size_t spin_electron = 0; spin_electron < spin_count;
+             ++spin_electron)
+        {
+          const std::size_t electron = spin_begin + spin_electron;
+          const std::size_t packed_row =
+              (local * planes + plane) * spin_count + spin_electron;
+          std::copy_n(plane_values + electron * width, width,
+                      batch_workspace.spatial_dense_source_.data() +
+                          packed_row * width);
+        }
+      }
+    }
+
+    const std::size_t packed_rows = tile_size * planes * spin_count;
+    qmcplusplus::psiformer::batch::productReal(
+        batch_workspace.spatial_dense_source_.data(),
+        tensor(parameters,
+               spin_up ? layout.backflow_up_ : layout.backflow_down_),
+        nullptr, packed_rows, width, channels,
+        batch_workspace.spatial_dense_target_.data(), statistics);
+
+    const double* pi = tensor(parameters, spin_up ? layout.pi_up_ : layout.pi_down_);
+    const double* zeta =
+        tensor(parameters, spin_up ? layout.zeta_up_ : layout.zeta_down_);
+    const std::size_t nuclei = layout.nucleusCount();
+    auto projected = [&](std::size_t local, std::size_t plane,
+                         std::size_t spin_electron,
+                         std::size_t channel) -> double {
+      const std::size_t row =
+          (local * planes + plane) * spin_count + spin_electron;
+      return batch_workspace.spatial_dense_target_[row * channels + channel];
+    };
+
+    for (std::size_t local = 0; local < tile_size; ++local)
+    {
+      DirectSpatialWorkspace& spatial = *workspaces[local];
+      DirectSpatialJetBuffer& orbitals = spatial.orbital_matrices_;
+      const GeometryPairTable& pairs = spatial.geometry_.electronNucleusPairs();
+      const auto& displacements = pairs.displacements();
+      const auto& distances = pairs.distances();
+      for (std::size_t spin_electron = 0; spin_electron < spin_count;
+           ++spin_electron)
+      {
+        const std::size_t electron = spin_begin + spin_electron;
+        for (std::size_t determinant_index = 0;
+             determinant_index < determinant_count; ++determinant_index)
+          for (std::size_t orbital = 0; orbital < electrons; ++orbital)
+          {
+            const std::size_t channel = determinant_index * electrons + orbital;
+            const std::size_t matrix_element =
+                (determinant_index * electrons + electron) * electrons + orbital;
+            const double backflow_value = projected(local, 0, spin_electron, channel);
+            double envelope_value = 0;
+            std::fill(spatial.scalar_gradient_scratch_.begin(),
+                      spatial.scalar_gradient_scratch_.end(), 0.0);
+            std::fill(spatial.scalar_laplacian_scratch_.begin(),
+                      spatial.scalar_laplacian_scratch_.end(), 0.0);
+            for (std::size_t nucleus = 0; nucleus < nuclei; ++nucleus)
+            {
+              const std::size_t parameter = channel * nuclei + nucleus;
+              const std::size_t pair = electron * nuclei + nucleus;
+              const double radius = distances[pair];
+              if (radius == 0)
+                throw std::runtime_error(
+                    "PsiFormer batch configuration " +
+                    std::to_string(tile_begin + local) +
+                    " has undefined electron-nucleus spatial derivatives");
+              const double inverse_radius = 1.0 / radius;
+              const double decay_rate = std::abs(zeta[parameter]);
+              const double exponential = std::exp(-decay_rate * radius);
+              const double weighted_value = pi[parameter] * exponential;
+              const double radial_first = -decay_rate * weighted_value;
+              const double radial_second = decay_rate * decay_rate * weighted_value;
+              envelope_value += weighted_value;
+
+              for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+                if (DirectSpatialExecutor::laneElectron(spatial, lane) == electron)
+                {
+                  const std::size_t dimension =
+                      DirectSpatialExecutor::laneDimension(spatial, lane);
+                  spatial.scalar_gradient_scratch_[lane] +=
+                      radial_first * displacements[pair][dimension] * inverse_radius;
+                }
+              if (spatial.mode_ == DirectSpatialMode::FULL_VGL)
+                spatial.scalar_laplacian_scratch_[electron] +=
+                    radial_second + 2.0 * radial_first * inverse_radius;
+            }
+
+            orbitals.value[matrix_element] = backflow_value * envelope_value;
+            for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+              orbitals.gradient[lane * orbitals.value.size() + matrix_element] =
+                  projected(local, 1 + lane, spin_electron, channel) *
+                      envelope_value +
+                  backflow_value * spatial.scalar_gradient_scratch_[lane];
+
+            for (std::size_t laplacian_electron = 0;
+                 laplacian_electron < laplacian_lanes;
+                 ++laplacian_electron)
+            {
+              double gradient_dot = 0;
+              for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              {
+                const std::size_t lane = 3 * laplacian_electron + dimension;
+                gradient_dot +=
+                    projected(local, 1 + lane, spin_electron, channel) *
+                    spatial.scalar_gradient_scratch_[lane];
+              }
+              orbitals.laplacian[
+                  laplacian_electron * orbitals.value.size() + matrix_element] =
+                  projected(local, 1 + gradient_lanes + laplacian_electron,
+                            spin_electron, channel) * envelope_value +
+                  2.0 * gradient_dot + backflow_value *
+                      spatial.scalar_laplacian_scratch_[laplacian_electron];
+            }
+          }
+      }
+    }
+  }
+
+  /// Form all determinant-matrix jets from two tile-stacked spin projections.
+  void buildSpatialOrbitalsTile(
+      DirectBatchWorkspace& batch_workspace,
+      std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces,
+      std::size_t tile_begin,
+      std::size_t tile_size,
+      const double* parameters,
+      DirectBatchExecutionStatistics& statistics) const
+  {
+    for (std::size_t local = 0; local < tile_size; ++local)
+      workspaces[local]->orbital_matrices_.clear();
+    buildSpatialOrbitalSpinTile(batch_workspace, workspaces, tile_begin,
+                                tile_size, true, parameters, statistics);
+    buildSpatialOrbitalSpinTile(batch_workspace, workspaces, tile_begin,
+                                tile_size, false, parameters, statistics);
+  }
+
+  /** Complete one configuration's stable determinant and analytic cusp reduction.
+   *
+   * Results are written only to the pending arrays.  The public result arrays are
+   * committed after every tile succeeds and the parameter version is rechecked.
+   */
+  void finishSpatialConfiguration(DirectBatchWorkspace& batch_workspace,
+                                  DirectSpatialWorkspace& spatial,
+                                  std::size_t configuration,
+                                  const double* parameters,
+                                  std::size_t parameter_version) const
+  {
+    namespace determinant = qmcplusplus::psiformer::determinant;
+    try
+    {
+      const determinant::RealDeterminantResult determinant_result =
+          spatial.determinant_workspace_.evaluateSpatial(
+              spatial.orbital_matrices_.value.data(),
+              spatial.orbital_matrices_.gradient.data(), spatial.gradient_lanes_,
+              spatial.orbital_matrices_.laplacian.data(), spatial.laplacian_lanes_,
+              spatial.output_gradient_.data(), spatial.output_lap_log_.data(),
+              spatial.output_lap_ratio_.data());
+      if (determinant_result.amplitude.isZero())
+        throw std::runtime_error("reached an exact determinant node");
+
+      const double cusp_value = spatial_executor_.accumulateCusp(parameters, spatial);
+      for (std::size_t lane = 0; lane < spatial.gradient_lanes_; ++lane)
+        spatial.output_gradient_[lane] += spatial.scalar_gradient_scratch_[lane];
+
+      for (std::size_t electron = 0; electron < spatial.laplacian_lanes_; ++electron)
+      {
+        double total_squared_gradient = 0;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const std::size_t lane = 3 * electron + dimension;
+          total_squared_gradient +=
+              spatial.output_gradient_[lane] * spatial.output_gradient_[lane];
+        }
+        spatial.output_lap_log_[electron] +=
+            spatial.scalar_laplacian_scratch_[electron];
+        spatial.output_lap_ratio_[electron] =
+            spatial.output_lap_log_[electron] + total_squared_gradient;
+      }
+
+      const double logabs = determinant_result.amplitude.log_abs + cusp_value;
+      if (!determinant::isFiniteReal(logabs))
+        throw std::runtime_error("produced a non-finite log amplitude");
+      for (const double component : spatial.output_gradient_)
+        if (!determinant::isFiniteReal(component))
+          throw std::runtime_error("produced a non-finite gradient");
+      for (const double component : spatial.output_lap_log_)
+        if (!determinant::isFiniteReal(component))
+          throw std::runtime_error("produced a non-finite logarithmic Laplacian");
+      for (const double component : spatial.output_lap_ratio_)
+        if (!determinant::isFiniteReal(component))
+          throw std::runtime_error("produced a non-finite Laplacian ratio");
+
+      spatial.observed_parameter_version_ = parameter_version;
+      storePendingValue(
+          batch_workspace, configuration, determinant_result.amplitude.phase,
+          logabs, determinant::realValue(determinant_result.amplitude, cusp_value),
+          parameter_version);
+      const std::size_t gradient_stride = spatial.gradient_lanes_;
+      std::copy_n(spatial.output_gradient_.begin(), gradient_stride,
+                  batch_workspace.pending_gradient_.begin() +
+                      configuration * gradient_stride);
+      if (spatial.laplacian_lanes_ != 0)
+      {
+        std::copy_n(spatial.output_lap_log_.begin(), spatial.laplacian_lanes_,
+                    batch_workspace.pending_lap_log_.begin() +
+                        configuration * spatial.laplacian_lanes_);
+        std::copy_n(spatial.output_lap_ratio_.begin(), spatial.laplacian_lanes_,
+                    batch_workspace.pending_lap_ratio_.begin() +
+                        configuration * spatial.laplacian_lanes_);
+      }
+    }
+    catch (const std::exception& error)
+    {
+      throw std::runtime_error(
+          "PsiFormer batch configuration " + std::to_string(configuration) +
+          " spatial finalization failed: " + error.what());
+    }
+  }
+
+  static void commitSpatialOutputs(DirectBatchWorkspace& workspace,
+                                   std::size_t gradient_stride,
+                                   std::size_t laplacian_stride)
+  {
+    const std::size_t configurations = workspace.active_size_;
+    std::copy_n(workspace.pending_sign_.begin(), configurations,
+                workspace.sign_.begin());
+    std::copy_n(workspace.pending_logabs_.begin(), configurations,
+                workspace.logabs_.begin());
+    std::copy_n(workspace.pending_value_.begin(), configurations,
+                workspace.value_.begin());
+    std::copy_n(workspace.pending_parameter_version_.begin(), configurations,
+                workspace.parameter_version_.begin());
+    std::copy_n(workspace.pending_gradient_.begin(),
+                configurations * gradient_stride, workspace.gradient_.begin());
+    if (laplacian_stride != 0)
+    {
+      std::copy_n(workspace.pending_lap_log_.begin(),
+                  configurations * laplacian_stride, workspace.lap_log_.begin());
+      std::copy_n(workspace.pending_lap_ratio_.begin(),
+                  configurations * laplacian_stride, workspace.lap_ratio_.begin());
+    }
+  }
+
+  DirectBatchSpatialResultView evaluateSpatialBatch(
+      DirectBatchWorkspace& workspace,
+      DirectSpatialMode mode,
+      const std::size_t* active_electrons) const
+  {
+    workspace.requireCompletePositions();
+    if (mode == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
+    {
+      if (workspace.active_size_ != 0 && active_electrons == nullptr)
+        throw std::invalid_argument(
+            "PsiFormer active batch has no electron-index array");
+      for (std::size_t configuration = 0;
+           configuration < workspace.active_size_; ++configuration)
+        if (active_electrons[configuration] >= workspace.electron_count_)
+          throw std::out_of_range(
+              "PsiFormer active batch electron index is out of range");
+    }
+
+    const auto& layout = *spatial_executor_.layout_;
+    layout.validateParameterStore(spatial_executor_.parameters_);
+    const std::size_t parameter_version = spatial_executor_.parameters_.version();
+    const double* parameters = spatial_executor_.parameters_.flat_values().data();
+    const std::size_t gradient_stride =
+        mode == DirectSpatialMode::FULL_VGL ? 3 * workspace.electron_count_ : 3;
+    const std::size_t laplacian_stride =
+        mode == DirectSpatialMode::FULL_VGL ? workspace.electron_count_ : 0;
+    std::vector<std::unique_ptr<DirectSpatialWorkspace>>& workspaces =
+        spatialWorkspaces(workspace, mode);
+
+    DirectBatchExecutionStatistics statistics;
+    const std::size_t tile_limit = workspace.tile_capacity_;
+    for (std::size_t tile_begin = 0; tile_begin < workspace.active_size_;
+         tile_begin += tile_limit)
+    {
+      const std::size_t tile_size =
+          std::min(tile_limit, workspace.active_size_ - tile_begin);
+      ++statistics.tiles_executed;
+      statistics.max_tile_occupancy =
+          std::max(statistics.max_tile_occupancy, tile_size);
+      buildSpatialNetworkTile(workspace, workspaces, tile_begin, tile_size,
+                              active_electrons, parameters, statistics);
+      buildSpatialOrbitalsTile(workspace, workspaces, tile_begin, tile_size,
+                               parameters, statistics);
+      for (std::size_t local = 0; local < tile_size; ++local)
+        finishSpatialConfiguration(workspace, *workspaces[local],
+                                   tile_begin + local, parameters,
+                                   parameter_version);
+    }
+
+    if (spatial_executor_.parameters_.version() != parameter_version)
+      throw std::runtime_error(
+          "PsiFormer parameters changed during batch evaluation");
+    commitSpatialOutputs(workspace, gradient_stride, laplacian_stride);
+    workspace.statistics_ = statistics;
+    return spatialView(workspace, mode, gradient_stride, laplacian_stride);
   }
 
   static bool hasExactSameSpinCoalescence(const double* positions,
@@ -873,19 +1575,6 @@ private:
     workspace.pending_logabs_[configuration] = logabs;
     workspace.pending_value_[configuration] = value;
     workspace.pending_parameter_version_[configuration] = parameter_version;
-  }
-
-  static void storeValue(DirectBatchWorkspace& workspace,
-                         std::size_t configuration,
-                         double sign,
-                         double logabs,
-                         double value,
-                         std::size_t parameter_version)
-  {
-    workspace.sign_[configuration] = sign;
-    workspace.logabs_[configuration] = logabs;
-    workspace.value_[configuration] = value;
-    workspace.parameter_version_[configuration] = parameter_version;
   }
 
   static DirectBatchValueResultView valueView(const DirectBatchWorkspace& workspace)

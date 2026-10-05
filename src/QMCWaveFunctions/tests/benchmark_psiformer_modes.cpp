@@ -65,7 +65,8 @@ struct Options
   std::size_t configuration_limit    = 0;
   std::size_t kinetic_configurations = 1;
   std::size_t active_electron        = 0;
-  std::vector<std::size_t> batch_sizes{1, 2, 4};
+  std::vector<std::size_t> batch_sizes{1, 2, 4, 8, 16};
+  std::vector<std::size_t> tile_sizes{1, 2, 4, 8};
 };
 
 /** Minimal observable returned from a timed call without copying large arrays. */
@@ -86,6 +87,14 @@ struct ModeSummary
   std::size_t configurations_per_repeat = 0;
   std::size_t workspace_bytes           = 0;
   std::size_t logical_output_bytes      = 0;
+  std::size_t tile_capacity             = 0;
+  std::size_t allocated_tile_capacity   = 0;
+  std::size_t logical_storage_bytes     = 0;
+  std::size_t tile_scratch_bytes        = 0;
+  std::string timing_scope              = "complete_request";
+  bool has_batch_statistics             = false;
+  pf::DirectBatchExecutionStatistics batch_statistics;
+  double scalar_loop_seconds_per_configuration = 0.0;
   double warmup_seconds                 = 0.0;
   double peak_resident_mib_after_mode   = 0.0;
   Observation warmup;
@@ -101,6 +110,7 @@ struct ModeSummary
             << " PARAMETERS.h5 CONFIGURATIONS.h5 [--repeats N]"
                " [--configuration-limit N] [--kinetic-configurations N]"
                " [--active-electron N] [--batch-sizes 1,2,4]"
+               " [--tile-sizes 1,2,4]"
                " [--output FILE.json]\n";
   std::exit(EXIT_FAILURE);
 }
@@ -152,6 +162,8 @@ Options parseOptions(int argc, char** argv)
         options.active_electron = std::stoull(value);
       else if (option == "--batch-sizes")
         options.batch_sizes = parseBatchSizes(value);
+      else if (option == "--tile-sizes")
+        options.tile_sizes = parseBatchSizes(value);
       else if (option == "--output")
         options.output_path = value;
       else
@@ -282,6 +294,23 @@ ModeSummary benchmarkMode(std::string mode,
   return summary;
 }
 
+/// Attach bounded-arena diagnostics captured after a completed warmed batch call.
+void annotateBatchSummary(ModeSummary& summary,
+                          const pf::DirectBatchWorkspace& workspace,
+                          double scalar_loop_seconds_per_configuration,
+                          const char* timing_scope)
+{
+  summary.tile_capacity = workspace.tileCapacity();
+  summary.allocated_tile_capacity = workspace.allocatedTileCapacity();
+  summary.logical_storage_bytes = workspace.logicalStorageBytes();
+  summary.tile_scratch_bytes = workspace.tileScratchBytes();
+  summary.timing_scope = timing_scope;
+  summary.has_batch_statistics = true;
+  summary.batch_statistics = workspace.executionStatistics();
+  summary.scalar_loop_seconds_per_configuration =
+      scalar_loop_seconds_per_configuration;
+}
+
 /// Compare direct and oracle warmup observables without making timing gating decisions.
 void validatePair(const ModeSummary& direct, const ModeSummary& oracle, double tolerance)
 {
@@ -346,8 +375,11 @@ pf::EvaluationRequest request(pf::SpatialDerivativeRequest spatial,
 void writeMode(std::ostream& output, const ModeSummary& summary)
 {
   const double middle = median(summary.raw_seconds);
+  const double seconds_per_configuration =
+      middle / summary.configurations_per_repeat;
   output << "    {\"mode\":" << jsonString(summary.mode)
          << ",\"backend\":" << jsonString(summary.backend)
+         << ",\"timing_scope\":" << jsonString(summary.timing_scope)
          << ",\"batch_size\":" << summary.batch_size
          << ",\"calls_per_repeat\":" << summary.calls_per_repeat
          << ",\"configurations_per_repeat\":" << summary.configurations_per_repeat
@@ -363,10 +395,38 @@ void writeMode(std::ostream& output, const ModeSummary& summary)
   }
   output << "],\"median_seconds\":" << middle
          << ",\"median_seconds_per_configuration\":"
-         << middle / summary.configurations_per_repeat
+         << seconds_per_configuration
+         << ",\"median_configurations_per_second\":"
+         << 1.0 / seconds_per_configuration
          << ",\"peak_resident_mib_after_mode\":" << summary.peak_resident_mib_after_mode
          << ",\"warmup_sign\":" << summary.warmup.sign
-         << ",\"warmup_logabs\":" << summary.warmup.logabs << '}';
+         << ",\"warmup_logabs\":" << summary.warmup.logabs;
+  if (summary.has_batch_statistics)
+  {
+    output << ",\"tile_capacity\":" << summary.tile_capacity
+           << ",\"allocated_tile_capacity\":"
+           << summary.allocated_tile_capacity
+           << ",\"logical_storage_bytes\":"
+           << summary.logical_storage_bytes
+           << ",\"tile_scratch_bytes\":" << summary.tile_scratch_bytes
+           << ",\"scalar_loop_seconds_per_configuration\":"
+           << summary.scalar_loop_seconds_per_configuration
+           << ",\"speedup_vs_scalar_loop\":"
+           << summary.scalar_loop_seconds_per_configuration /
+                  seconds_per_configuration
+           << ",\"execution_statistics\":{"
+           << "\"tiles_executed\":"
+           << summary.batch_statistics.tiles_executed
+           << ",\"max_tile_occupancy\":"
+           << summary.batch_statistics.max_tile_occupancy
+           << ",\"grouped_dense_calls\":"
+           << summary.batch_statistics.grouped_dense_calls
+           << ",\"max_grouped_rows\":"
+           << summary.batch_statistics.max_grouped_rows
+           << ",\"scalar_executor_calls\":"
+           << summary.batch_statistics.scalar_executor_calls << '}';
+  }
+  output << '}';
 }
 
 /// Emit one self-describing benchmark manifest suitable for paired-run archiving.
@@ -378,7 +438,7 @@ void writeReport(std::ostream& output,
                  const std::vector<ModeSummary>& modes)
 {
   output << std::setprecision(12) << "{\n"
-         << "  \"schema\":\"qmcpack.psiformer.mode_benchmark.v1\",\n"
+         << "  \"schema\":\"qmcpack.psiformer.mode_benchmark.v2\",\n"
          << "  \"qmcpack_version\":"
          << jsonString(std::to_string(QMCPACK_VERSION_MAJOR) + "." +
                        std::to_string(QMCPACK_VERSION_MINOR) + "." +
@@ -398,6 +458,21 @@ void writeReport(std::ostream& output,
          << "  \"available_configuration_count\":" << model.cfg.nconfig << ",\n"
          << "  \"repeats\":" << options.repeats << ",\n"
          << "  \"active_electron\":" << options.active_electron << ",\n"
+         << "  \"batch_sizes\":[";
+  for (std::size_t index = 0; index < options.batch_sizes.size(); ++index)
+  {
+    if (index != 0)
+      output << ',';
+    output << options.batch_sizes[index];
+  }
+  output << "],\n  \"tile_sizes\":[";
+  for (std::size_t index = 0; index < options.tile_sizes.size(); ++index)
+  {
+    if (index != 0)
+      output << ',';
+    output << options.tile_sizes[index];
+  }
+  output << "],\n"
          << "  \"model_and_workspace_setup_seconds\":" << setup_seconds << ",\n"
          << "  \"baseline_peak_resident_mib\":" << baseline_peak_mib << ",\n"
          << "  \"host\":" << jsonString(hostName()) << ",\n"
@@ -415,7 +490,7 @@ void writeReport(std::ostream& output,
          << "\"VECLIB_MAXIMUM_THREADS\":"
          << jsonString(environmentValue("VECLIB_MAXIMUM_THREADS")) << "},\n"
          << "  \"notes\":["
-         << jsonString("direct timings include coordinate packing into warmed workspaces") << ','
+         << jsonString("batch prepacked_execute and pack_and_execute timings are reported separately") << ','
          << jsonString("oracle timings include native result allocation") << ','
          << jsonString("no absolute performance threshold is applied") << "],\n"
          << "  \"modes\":[\n";
@@ -438,7 +513,8 @@ int main(int argc, char** argv)
     auto setup_start      = Clock::now();
     pf::PsiFormer model(options.parameter_path, options.configuration_path);
     const qmcplusplus::psiformer::ModelShape shape{
-        model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads, 4};
+        model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+        model.dim, model.heads, model.blocks};
     const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
 
     pf::DirectValueExecutor value_executor(model, plan);
@@ -589,58 +665,111 @@ int main(int argc, char** argv)
                       }),
         3.0e-6);
 
-    // Batch entries exercise the production crowd boundary for the three modes
-    // currently supported by DirectBatchExecutor.  Score/kinetic crowd work is
-    // reported by scalar workspaces until a true grouped reverse pass exists.
-    for (const std::size_t batch_size : options.batch_sizes)
-    {
-      if (batch_size > configuration_count)
-        continue;
-      for (const auto mode : {pf::DirectBatchMode::VALUE_ONLY,
-                              pf::DirectBatchMode::FULL_VGL,
-                              pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT})
-      {
-        auto workspace = batch_executor.makeWorkspace();
-        workspace->resize(mode, batch_size);
-        for (std::size_t configuration = 0; configuration < batch_size; ++configuration)
-          for (std::size_t electron = 0; electron < model.ne; ++electron)
-            for (std::size_t dimension = 0; dimension < 3; ++dimension)
-              workspace->setPosition(configuration, electron, dimension,
-                                     configurations[configuration].x[3 * electron + dimension]);
+    auto scalar_seconds_per_configuration = [&](const char* mode_name) {
+      const auto found = std::find_if(
+          modes.begin(), modes.end(), [&](const ModeSummary& summary) {
+            return summary.mode == mode_name && summary.backend == "direct";
+          });
+      if (found == modes.end())
+        throw std::logic_error("missing scalar direct benchmark reference");
+      return median(found->raw_seconds) / found->configurations_per_repeat;
+    };
 
-        const std::size_t workspace_bytes = workspace->vectorStorageBytes();
-        if (mode == pf::DirectBatchMode::VALUE_ONLY)
-          modes.push_back(benchmarkMode(
-              "value_batch", "direct", batch_size, 1, workspace_bytes,
-              3 * sizeof(double), options.repeats, [&](std::size_t) {
-                const auto result = batch_executor.evaluateValues(*workspace);
-                return Observation{result.sign[0], result.logabs[0],
-                                   result.sign[0] + result.logabs[0] + result.value[0]};
-              }));
-        else if (mode == pf::DirectBatchMode::FULL_VGL)
-          modes.push_back(benchmarkMode(
-              "full_vgl_batch", "direct", batch_size, 1, workspace_bytes,
-              full_output_doubles * sizeof(double), options.repeats, [&](std::size_t) {
-                const auto result = batch_executor.evaluateFull(*workspace);
-                const double checksum = result.sign[0] + result.logabs[0] + result.value[0] +
-                    result.gradient[0] + result.gradient[result.gradient_stride - 1] +
-                    result.lap_log[0] + result.lap_ratio[0];
-                return Observation{result.sign[0], result.logabs[0], checksum};
-              }));
-        else
+    // Sweep logical and tile sizes independently.  Configurations repeat
+    // deterministically when B exceeds the imported fixture count rather than
+    // silently dropping a requested batch size.
+    for (const std::size_t tile_size : options.tile_sizes)
+      for (const std::size_t batch_size : options.batch_sizes)
+        for (const auto mode : {pf::DirectBatchMode::VALUE_ONLY,
+                                pf::DirectBatchMode::FULL_VGL,
+                                pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT})
         {
-          std::vector<std::size_t> active_electrons(batch_size, options.active_electron);
-          modes.push_back(benchmarkMode(
-              "active_gradient_batch", "direct", batch_size, 1, workspace_bytes,
-              6 * sizeof(double), options.repeats, [&](std::size_t) {
-                const auto result = batch_executor.evaluateActive(*workspace, active_electrons.data());
-                const double checksum = result.sign[0] + result.logabs[0] + result.value[0] +
-                    result.gradient[0] + result.gradient[result.gradient_stride - 1];
-                return Observation{result.sign[0], result.logabs[0], checksum};
-              }));
+          auto workspace = batch_executor.makeWorkspace();
+          workspace->prepareTileCapacity(tile_size);
+          std::vector<std::size_t> active_electrons(
+              batch_size, options.active_electron);
+          auto pack = [&]() {
+            workspace->resize(mode, batch_size);
+            for (std::size_t configuration = 0; configuration < batch_size;
+                 ++configuration)
+              workspace->setPositions(configuration,
+                                      positions(configuration));
+          };
+          pack();
+
+          const char* mode_name;
+          const char* scalar_mode_name;
+          std::size_t output_bytes;
+          switch (mode)
+          {
+          case pf::DirectBatchMode::VALUE_ONLY:
+            mode_name = "value_batch";
+            scalar_mode_name = "value";
+            output_bytes = 3 * sizeof(double);
+            break;
+          case pf::DirectBatchMode::FULL_VGL:
+            mode_name = "full_vgl_batch";
+            scalar_mode_name = "full_vgl";
+            output_bytes = full_output_doubles * sizeof(double);
+            break;
+          case pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+            mode_name = "active_gradient_batch";
+            scalar_mode_name = "active_gradient";
+            output_bytes = 6 * sizeof(double);
+            break;
+          default:
+            throw std::logic_error("unknown PsiFormer direct batch mode");
+          }
+          const double scalar_seconds =
+              scalar_seconds_per_configuration(scalar_mode_name);
+          auto evaluate = [&]() -> Observation {
+            const std::size_t last = batch_size - 1;
+            if (mode == pf::DirectBatchMode::VALUE_ONLY)
+            {
+              const auto result = batch_executor.evaluateValues(*workspace);
+              const double checksum = result.sign[0] + result.logabs[0] +
+                  result.value[0] + result.logabs[last];
+              return {result.sign[0], result.logabs[0], checksum};
+            }
+            if (mode == pf::DirectBatchMode::FULL_VGL)
+            {
+              const auto result = batch_executor.evaluateFull(*workspace);
+              const double checksum = result.sign[0] + result.logabs[0] +
+                  result.value[0] + result.gradient[0] +
+                  result.gradient[last * result.gradient_stride +
+                                  result.gradient_stride - 1] +
+                  result.lap_log[0] +
+                  result.lap_ratio[last * result.laplacian_stride];
+              return {result.sign[0], result.logabs[0], checksum};
+            }
+            const auto result = batch_executor.evaluateActive(
+                *workspace, active_electrons.data());
+            const double checksum = result.sign[0] + result.logabs[0] +
+                result.value[0] + result.gradient[0] +
+                result.gradient[last * result.gradient_stride +
+                                result.gradient_stride - 1];
+            return {result.sign[0], result.logabs[0], checksum};
+          };
+
+          const std::size_t workspace_bytes = workspace->vectorStorageBytes();
+          ModeSummary prepacked = benchmarkMode(
+              mode_name, "true_batch", batch_size, 1, workspace_bytes,
+              output_bytes, options.repeats,
+              [&](std::size_t) { return evaluate(); });
+          annotateBatchSummary(prepacked, *workspace, scalar_seconds,
+                               "prepacked_execute");
+          modes.push_back(std::move(prepacked));
+
+          ModeSummary pack_and_execute = benchmarkMode(
+              mode_name, "true_batch", batch_size, 1, workspace_bytes,
+              output_bytes, options.repeats, [&](std::size_t) {
+                pack();
+                return evaluate();
+              });
+          annotateBatchSummary(pack_and_execute, *workspace, scalar_seconds,
+                               "pack_and_execute");
+          modes.push_back(std::move(pack_and_execute));
         }
-      }
-    }
 
     if (options.output_path.empty())
       writeReport(std::cout, options, model, setup_seconds, baseline_peak_mib, modes);

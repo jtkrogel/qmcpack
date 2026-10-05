@@ -73,6 +73,60 @@ std::vector<double> displacedConfiguration(const pf::Tensor& base,
   return positions;
 }
 
+/** Make orbital column one nearly duplicate column zero without moving particles. */
+void makeNearSingularOrbitalColumns(
+    pf::PsiFormer& model,
+    const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+    double perturbation)
+{
+  using qmcplusplus::psiformer::ParameterRole;
+  const std::size_t channels = model.ndet * model.ne;
+  const std::size_t nuclei = model.cfg.nuclei.shape[0];
+  REQUIRE(model.ne >= 2);
+  std::vector<std::size_t> indices;
+  std::vector<double> values;
+  const auto& flat = model.p.flat_values();
+
+  auto copy_backflow_columns = [&](ParameterRole role) {
+    const auto& tensor = plan.parameter(role);
+    REQUIRE(tensor.size() == model.dim * channels);
+    for (std::size_t determinant = 0; determinant < model.ndet;
+         ++determinant)
+      for (std::size_t feature = 0; feature < model.dim; ++feature)
+      {
+        const std::size_t source = tensor.begin + feature * channels +
+            determinant * model.ne;
+        const std::size_t destination = source + 1;
+        double value = flat[source];
+        if (feature == determinant % model.dim)
+          value += perturbation * static_cast<double>(determinant + 1);
+        indices.push_back(destination);
+        values.push_back(value);
+      }
+  };
+  auto copy_envelope_columns = [&](ParameterRole role) {
+    const auto& tensor = plan.parameter(role);
+    REQUIRE(tensor.size() == channels * nuclei);
+    for (std::size_t determinant = 0; determinant < model.ndet;
+         ++determinant)
+      for (std::size_t nucleus = 0; nucleus < nuclei; ++nucleus)
+      {
+        const std::size_t source = tensor.begin +
+            (determinant * model.ne) * nuclei + nucleus;
+        indices.push_back(source + nuclei);
+        values.push_back(flat[source]);
+      }
+  };
+
+  copy_backflow_columns(ParameterRole::BACKFLOW_UP_WEIGHT);
+  copy_backflow_columns(ParameterRole::BACKFLOW_DOWN_WEIGHT);
+  copy_envelope_columns(ParameterRole::ENVELOPE_PI_UP);
+  copy_envelope_columns(ParameterRole::ENVELOPE_PI_DOWN);
+  copy_envelope_columns(ParameterRole::ENVELOPE_ZETA_UP);
+  copy_envelope_columns(ParameterRole::ENVELOPE_ZETA_DOWN);
+  model.p.set_flat_values(indices, values);
+}
+
 void loadBatch(pf::DirectBatchWorkspace& workspace,
                const pf::Tensor& base,
                std::size_t configurations)
@@ -96,6 +150,33 @@ void checkValue(const pf::DirectBatchValueResultView& batch,
   CHECK(batch.value[configuration] ==
         Catch::Approx(scalar.value).epsilon(3e-9).margin(1e-24));
   CHECK(batch.parameter_version[configuration] == scalar.parameter_version);
+}
+
+void checkSpatial(const pf::DirectBatchSpatialResultView& batch,
+                  std::size_t configuration,
+                  const pf::DirectSpatialResultView& scalar)
+{
+  CHECK(batch.sign[configuration] == scalar.sign);
+  CHECK(batch.logabs[configuration] ==
+        Catch::Approx(scalar.logabs).epsilon(3e-10).margin(3e-10));
+  CHECK(batch.value[configuration] ==
+        Catch::Approx(scalar.value).epsilon(3e-9).margin(1e-24));
+  CHECK(batch.parameter_version[configuration] == scalar.parameter_version);
+  REQUIRE(batch.gradient_stride == scalar.gradient.size());
+  for (std::size_t lane = 0; lane < scalar.gradient.size(); ++lane)
+    CHECK(batch.gradient[configuration * batch.gradient_stride + lane] ==
+          Catch::Approx(scalar.gradient[lane]).epsilon(3e-8).margin(3e-8));
+
+  REQUIRE(batch.laplacian_stride == scalar.lap_log.size());
+  REQUIRE(scalar.lap_log.size() == scalar.lap_ratio.size());
+  for (std::size_t electron = 0; electron < scalar.lap_log.size(); ++electron)
+  {
+    const std::size_t output = configuration * batch.laplacian_stride + electron;
+    CHECK(batch.lap_log[output] ==
+          Catch::Approx(scalar.lap_log[electron]).epsilon(3e-7).margin(3e-7));
+    CHECK(batch.lap_ratio[output] ==
+          Catch::Approx(scalar.lap_ratio[electron]).epsilon(3e-7).margin(3e-7));
+  }
 }
 
 void validateBatches(const std::string& system,
@@ -158,6 +239,186 @@ void validateBatches(const std::string& system,
   }
 }
 
+void validateSpatialBatches(const std::string& system,
+                            pf::DirectSpatialMode mode,
+                            const std::vector<std::size_t>& batch_sizes,
+                            const std::vector<std::size_t>& tile_sizes)
+{
+  GeneratedFiles files = generateFiles(system);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace = spatial_executor.makeWorkspace(mode);
+  const pf::Tensor base = model.cfg.configuration(0);
+  const pf::DirectBatchMode batch_mode = mode == pf::DirectSpatialMode::FULL_VGL
+      ? pf::DirectBatchMode::FULL_VGL
+      : pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT;
+
+  for (const std::size_t tile_size : tile_sizes)
+  {
+    workspace->prepareTileCapacity(tile_size);
+    for (const std::size_t batch_size : batch_sizes)
+    {
+      DYNAMIC_SECTION(system << " spatial mode=" << static_cast<int>(mode)
+                             << " B=" << batch_size << " T=" << tile_size)
+      {
+        workspace->resize(batch_mode, batch_size);
+        loadBatch(*workspace, base, batch_size);
+        std::vector<std::size_t> active_electrons(batch_size);
+        for (std::size_t configuration = 0; configuration < batch_size;
+             ++configuration)
+          active_electrons[configuration] = configuration % model.ne;
+        const pf::DirectBatchSpatialResultView batch =
+            mode == pf::DirectSpatialMode::FULL_VGL
+            ? batch_executor.evaluateFull(*workspace)
+            : batch_executor.evaluateActive(
+                  *workspace,
+                  batch_size == 0 ? nullptr : active_electrons.data());
+
+        REQUIRE(batch.size == batch_size);
+        CHECK(batch.mode == mode);
+        CHECK(batch.gradient_stride ==
+              (mode == pf::DirectSpatialMode::FULL_VGL ? 3 * model.ne : 3));
+        CHECK(batch.laplacian_stride ==
+              (mode == pf::DirectSpatialMode::FULL_VGL ? model.ne : 0));
+        if (mode == pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
+        {
+          CHECK(batch.lap_log == nullptr);
+          CHECK(batch.lap_ratio == nullptr);
+        }
+
+        for (std::size_t configuration = 0; configuration < batch_size;
+             ++configuration)
+        {
+          const std::vector<double> positions =
+              displacedConfiguration(base, model.ne, configuration);
+          scalar_workspace->setPositions(
+              pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+          const pf::DirectSpatialResultView scalar =
+              mode == pf::DirectSpatialMode::FULL_VGL
+              ? spatial_executor.evaluateFull(*scalar_workspace)
+              : spatial_executor.evaluateActive(
+                    *scalar_workspace, active_electrons[configuration]);
+          checkSpatial(batch, configuration, scalar);
+        }
+
+        const auto& statistics = workspace->executionStatistics();
+        const std::size_t expected_tiles =
+            batch_size == 0 ? 0 : (batch_size + tile_size - 1) / tile_size;
+        CHECK(statistics.tiles_executed == expected_tiles);
+        CHECK(statistics.max_tile_occupancy == std::min(batch_size, tile_size));
+        CHECK(statistics.scalar_executor_calls == 0);
+        if (batch_size == 0)
+        {
+          CHECK(statistics.grouped_dense_calls == 0);
+          CHECK(statistics.max_grouped_rows == 0);
+        }
+        else
+        {
+          const std::size_t dense_calls_per_tile =
+              1 + 6 * model.blocks + (model.cfg.nup != 0 ? 1 : 0) +
+              (model.cfg.ndown != 0 ? 1 : 0);
+          const std::size_t gradient_lanes =
+              mode == pf::DirectSpatialMode::FULL_VGL ? 3 * model.ne : 3;
+          const std::size_t laplacian_lanes =
+              mode == pf::DirectSpatialMode::FULL_VGL ? model.ne : 0;
+          CHECK(statistics.grouped_dense_calls ==
+                expected_tiles * dense_calls_per_tile);
+          CHECK(statistics.max_grouped_rows ==
+                std::min(batch_size, tile_size) *
+                    (1 + gradient_lanes + laplacian_lanes) * model.ne);
+        }
+      }
+    }
+  }
+}
+
+void validateSpatialStorage(pf::DirectSpatialMode mode)
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace = spatial_executor.makeWorkspace(mode);
+  const pf::Tensor base = model.cfg.configuration(0);
+  const pf::DirectBatchMode batch_mode = mode == pf::DirectSpatialMode::FULL_VGL
+      ? pf::DirectBatchMode::FULL_VGL
+      : pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT;
+
+  workspace->prepareTileCapacity(2);
+  workspace->resize(batch_mode, 4);
+  REQUIRE(scalar_workspace->geometryStorageBytes() > 0);
+  const std::size_t geometry_fingerprint =
+      scalar_workspace->geometryStorageFingerprint();
+  CHECK(geometry_fingerprint != 0);
+  CHECK(scalar_workspace->vectorStorageBytes() >
+        scalar_workspace->geometryStorageBytes());
+  CHECK(workspace->tileScratchBytes() ==
+        2 * scalar_workspace->vectorStorageBytes() +
+            workspace->spatialTileKernelBytes());
+  scalar_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(base.x.data(), model.ne));
+  if (mode == pf::DirectSpatialMode::FULL_VGL)
+    spatial_executor.evaluateFull(*scalar_workspace);
+  else
+    spatial_executor.evaluateActive(*scalar_workspace, 0);
+  CHECK(scalar_workspace->geometryStorageFingerprint() == geometry_fingerprint);
+  const std::size_t tile_bytes = workspace->tileScratchBytes();
+  const std::size_t logical_bytes = workspace->logicalStorageBytes();
+  REQUIRE(tile_bytes > 0);
+  workspace->resize(batch_mode, 64);
+  CHECK(workspace->tileScratchBytes() == tile_bytes);
+  CHECK(workspace->logicalStorageBytes() > logical_bytes);
+  CHECK(workspace->allocatedTileCapacity() == 2);
+  CHECK(workspace->capacity(batch_mode) == 64);
+
+  workspace->prepareTileCapacity(4);
+  workspace->resize(batch_mode, 7);
+  loadBatch(*workspace, base, 7);
+  std::vector<std::size_t> active_electrons(7);
+  for (std::size_t configuration = 0; configuration < 7; ++configuration)
+    active_electrons[configuration] = configuration % model.ne;
+  auto evaluate = [&]() {
+    return mode == pf::DirectSpatialMode::FULL_VGL
+        ? batch_executor.evaluateFull(*workspace)
+        : batch_executor.evaluateActive(*workspace, active_electrons.data());
+  };
+  evaluate();
+  const std::size_t fingerprint = workspace->storageFingerprint(batch_mode);
+
+  volatile double sink = 0;
+  allocation_count.store(0, std::memory_order_relaxed);
+  count_allocations.store(true, std::memory_order_relaxed);
+  for (int repetition = 0; repetition < 3; ++repetition)
+  {
+    const pf::DirectBatchSpatialResultView result = evaluate();
+    sink += result.logabs[repetition] + result.gradient[repetition];
+  }
+  count_allocations.store(false, std::memory_order_relaxed);
+  CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
+  CHECK(std::isfinite(sink));
+  CHECK(workspace->storageFingerprint(batch_mode) == fingerprint);
+
+  workspace->resize(batch_mode, 3);
+  loadBatch(*workspace, base, 3);
+  active_electrons.resize(3);
+  evaluate();
+  CHECK(workspace->storageFingerprint(batch_mode) == fingerprint);
+  workspace->resize(batch_mode, 7);
+  loadBatch(*workspace, base, 7);
+  active_electrons.resize(7);
+  for (std::size_t configuration = 0; configuration < 7; ++configuration)
+    active_electrons[configuration] = configuration % model.ne;
+  evaluate();
+  CHECK(workspace->storageFingerprint(batch_mode) == fingerprint);
+}
+
 } // namespace
 
 TEST_CASE("PsiFormer value batches use true bounded tile kernels",
@@ -171,6 +432,347 @@ TEST_CASE("PsiFormer value batches cover pair and pseudopotential shapes",
 {
   validateBatches("lih_pair", {1, 3}, {2});
   validateBatches("lih_pp", {1, 3}, {2});
+}
+
+TEST_CASE("PsiFormer spatial batches use true bounded tile kernels",
+          "[wavefunction][psiformer][batch]")
+{
+  validateSpatialBatches("lih", pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT,
+                         {0, 1, 2, 3, 5}, {1, 2, 4});
+  validateSpatialBatches("lih", pf::DirectSpatialMode::FULL_VGL,
+                         {0, 1, 2, 3, 5}, {1, 2, 4});
+}
+
+TEST_CASE("PsiFormer spatial batches cover pair and pseudopotential shapes",
+          "[wavefunction][psiformer][batch][ecp]")
+{
+  for (const std::string system : {"lih_pair", "lih_pp"})
+  {
+    validateSpatialBatches(system,
+                           pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT,
+                           {1, 3}, {2});
+    validateSpatialBatches(system, pf::DirectSpatialMode::FULL_VGL,
+                           {1, 3}, {2});
+  }
+}
+
+TEST_CASE("PsiFormer odd-block spatial batches preserve allocation identity",
+          "[wavefunction][psiformer][batch]")
+{
+  GeneratedFiles files = generateFiles("lih", 3);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  model.blocks = 3;
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto batch_workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace = spatial_executor.makeWorkspace(
+      pf::DirectSpatialMode::FULL_VGL);
+  const pf::Tensor base = model.cfg.configuration(0);
+
+  batch_workspace->prepareTileCapacity(2);
+  batch_workspace->resize(pf::DirectBatchMode::FULL_VGL, 3);
+  loadBatch(*batch_workspace, base, 3);
+  const std::size_t batch_fingerprint = batch_workspace->storageFingerprint(
+      pf::DirectBatchMode::FULL_VGL);
+  const pf::DirectBatchSpatialResultView batch =
+      batch_executor.evaluateFull(*batch_workspace);
+  CHECK(batch_workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL) ==
+        batch_fingerprint);
+
+  for (std::size_t configuration = 0; configuration < 3; ++configuration)
+  {
+    const std::vector<double> positions =
+        displacedConfiguration(base, model.ne, configuration);
+    scalar_workspace->setPositions(
+        pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+    const std::size_t scalar_fingerprint =
+        scalar_workspace->storageFingerprint();
+    checkSpatial(batch, configuration,
+                 spatial_executor.evaluateFull(*scalar_workspace));
+    CHECK(scalar_workspace->storageFingerprint() == scalar_fingerprint);
+  }
+
+  batch_executor.evaluateFull(*batch_workspace);
+  CHECK(batch_workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL) ==
+        batch_fingerprint);
+}
+
+TEST_CASE("PsiFormer spatial batches preserve near-singular projected determinants",
+          "[wavefunction][psiformer][batch]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  const pf::Tensor base = model.cfg.configuration(0);
+
+  pf::DirectValueExecutor baseline_value_executor(model, plan);
+  pf::DirectSpatialExecutor baseline_spatial_executor(
+      model, baseline_value_executor, plan);
+  auto baseline_workspace = baseline_spatial_executor.makeWorkspace(
+      pf::DirectSpatialMode::FULL_VGL);
+  baseline_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(base.x.data(), model.ne));
+  const double baseline_logabs =
+      baseline_spatial_executor.evaluateFull(*baseline_workspace).logabs;
+
+  // Duplicate learned orbital columns rather than particle positions.  The small
+  // independent backflow perturbation keeps every determinant nonsingular while
+  // driving the stable reduction close to its singular boundary.
+  makeNearSingularOrbitalColumns(model, plan, 1.0e-5);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto batch_workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace = spatial_executor.makeWorkspace(
+      pf::DirectSpatialMode::FULL_VGL);
+  batch_workspace->prepareTileCapacity(2);
+  batch_workspace->resize(pf::DirectBatchMode::FULL_VGL, 3);
+  loadBatch(*batch_workspace, base, 3);
+  const auto batch = batch_executor.evaluateFull(*batch_workspace);
+  REQUIRE(batch.sign[0] != 0.0);
+  CHECK(std::abs(batch.logabs[0] - baseline_logabs) > 2.0);
+  for (std::size_t configuration = 0; configuration < 3; ++configuration)
+  {
+    const std::vector<double> positions =
+        displacedConfiguration(base, model.ne, configuration);
+    scalar_workspace->setPositions(
+        pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+    checkSpatial(batch, configuration,
+                 spatial_executor.evaluateFull(*scalar_workspace));
+  }
+  CHECK(batch_workspace->executionStatistics().tiles_executed == 2);
+  CHECK(batch_workspace->executionStatistics().scalar_executor_calls == 0);
+}
+
+TEST_CASE("PsiFormer spatial batch storage is bounded stable and allocation free",
+          "[wavefunction][psiformer][batch]")
+{
+  validateSpatialStorage(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
+  validateSpatialStorage(pf::DirectSpatialMode::FULL_VGL);
+}
+
+TEST_CASE("PsiFormer spatial batches validate and commit atomically",
+          "[wavefunction][psiformer][batch]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace =
+      spatial_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  const pf::Tensor base = model.cfg.configuration(0);
+
+  workspace->prepareTileCapacity(1);
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchSpatialResultView valid =
+      batch_executor.evaluateFull(*workspace);
+  const std::vector<double> valid_sign(valid.sign, valid.sign + valid.size);
+  const std::vector<double> valid_logabs(valid.logabs, valid.logabs + valid.size);
+  const std::vector<double> valid_value(valid.value, valid.value + valid.size);
+  const std::vector<double> valid_gradient(
+      valid.gradient, valid.gradient + valid.size * valid.gradient_stride);
+  const std::vector<double> valid_lap_log(
+      valid.lap_log, valid.lap_log + valid.size * valid.laplacian_stride);
+  const std::vector<double> valid_lap_ratio(
+      valid.lap_ratio, valid.lap_ratio + valid.size * valid.laplacian_stride);
+  const pf::DirectBatchExecutionStatistics valid_statistics =
+      workspace->executionStatistics();
+
+  // A close same-spin pair exercises stable near-node reduction before the exact
+  // node below.  Compare against the unchanged scalar path at the same geometry.
+  std::vector<double> near_node = displacedConfiguration(base, model.ne, 0);
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    near_node[3 + dimension] = near_node[dimension];
+  near_node[3] += 1.0e-4;
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 1);
+  workspace->setPositions(
+      0, pf::GeometryPositionView::interleaved(near_node.data(), model.ne));
+  const pf::DirectBatchSpatialResultView near_batch =
+      batch_executor.evaluateFull(*workspace);
+  scalar_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(near_node.data(), model.ne));
+  checkSpatial(near_batch, 0,
+               spatial_executor.evaluateFull(*scalar_workspace));
+
+  // Re-establish the public output snapshot, then fail in tile one after tile zero
+  // has completed.  No partial result may become observable.
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  batch_executor.evaluateFull(*workspace);
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  const std::vector<double> node = displacedConfiguration(base, model.ne, 1);
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    workspace->setPosition(1, 1, dimension, node[dimension]);
+  CHECK_THROWS_AS(batch_executor.evaluateFull(*workspace), std::runtime_error);
+  CHECK(std::equal(valid_sign.begin(), valid_sign.end(), valid.sign));
+  CHECK(std::equal(valid_logabs.begin(), valid_logabs.end(), valid.logabs));
+  CHECK(std::equal(valid_value.begin(), valid_value.end(), valid.value));
+  CHECK(std::equal(valid_gradient.begin(), valid_gradient.end(), valid.gradient));
+  CHECK(std::equal(valid_lap_log.begin(), valid_lap_log.end(), valid.lap_log));
+  CHECK(std::equal(valid_lap_ratio.begin(), valid_lap_ratio.end(), valid.lap_ratio));
+  CHECK(workspace->executionStatistics().tiles_executed ==
+        valid_statistics.tiles_executed);
+  CHECK(workspace->executionStatistics().grouped_dense_calls ==
+        valid_statistics.grouped_dense_calls);
+
+  // A corrected transaction remains usable after the failed later tile.
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  const auto retried = batch_executor.evaluateFull(*workspace);
+  CHECK(retried.logabs[0] ==
+        Catch::Approx(valid_logabs[0]).epsilon(3e-10).margin(3e-10));
+  CHECK(retried.logabs[1] ==
+        Catch::Approx(valid_logabs[1]).epsilon(3e-10).margin(3e-10));
+
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    workspace->setPosition(1, 0, dimension,
+                           model.cfg.nuclei.x[dimension]);
+  CHECK_THROWS_AS(batch_executor.evaluateFull(*workspace), std::runtime_error);
+  CHECK(std::equal(valid_logabs.begin(), valid_logabs.end(), valid.logabs));
+
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  model.p.set_flat_value(127, model.p.flat_values()[127] + 1.0e-3);
+  const auto changed = batch_executor.evaluateFull(*workspace);
+  for (std::size_t configuration = 0; configuration < changed.size;
+       ++configuration)
+    CHECK(changed.parameter_version[configuration] == model.p.version());
+
+  workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 0);
+  const auto empty = batch_executor.evaluateActive(*workspace, nullptr);
+  CHECK(empty.size == 0);
+  CHECK(workspace->executionStatistics().tiles_executed == 0);
+  CHECK_THROWS_AS(batch_executor.evaluateFull(*workspace), std::logic_error);
+
+  workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 2);
+  loadBatch(*workspace, base, 2);
+  CHECK_THROWS_AS(batch_executor.evaluateActive(*workspace, nullptr),
+                  std::invalid_argument);
+  const std::size_t invalid_active[2]{0, model.ne};
+  CHECK_THROWS_AS(batch_executor.evaluateActive(*workspace, invalid_active),
+                  std::out_of_range);
+  workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 2);
+  workspace->setPositions(
+      0, pf::GeometryPositionView::interleaved(base.x.data(), model.ne));
+  const std::size_t valid_active[2]{0, 1};
+  CHECK_THROWS_AS(batch_executor.evaluateActive(*workspace, valid_active),
+                  std::logic_error);
+
+  // A spatial executor is permanently bound to the immutable layout supplied by
+  // its value executor.  Equal dimensions from another layout instance are not
+  // sufficient because packed scratch is sized from descriptor identity.
+  pf::DirectValueExecutor foreign_value_executor(model, plan);
+  CHECK_THROWS_AS(
+      pf::DirectBatchWorkspace(foreign_value_executor, spatial_executor),
+      std::invalid_argument);
+  CHECK_THROWS_AS(
+      pf::DirectBatchExecutor(foreign_value_executor, spatial_executor),
+      std::invalid_argument);
+
+  pf::PsiFormer foreign_model(files.parameters, files.configuration);
+  CHECK_THROWS_AS(
+      pf::DirectSpatialExecutor(foreign_model, value_executor, plan),
+      std::invalid_argument);
+  const double original_nucleus = model.cfg.nuclei.x[0];
+  model.cfg.nuclei.x[0] += 0.125;
+  CHECK_THROWS_AS(
+      pf::DirectSpatialExecutor(model, value_executor, plan),
+      std::invalid_argument);
+  model.cfg.nuclei.x[0] = original_nucleus;
+
+  const std::size_t beyond_blas_int =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1;
+  CHECK_THROWS_AS(qmcplusplus::psiformer::dense::checkedBlasDimension(
+                      beyond_blas_int, "test BLAS extent"),
+                  std::length_error);
+  CHECK_THROWS_AS(qmcplusplus::psiformer::dense::productBlasReal(
+                      nullptr, nullptr, nullptr, beyond_blas_int, 1, 1,
+                      nullptr),
+                  std::length_error);
+
+  // A large tile policy is harmless while B is small.  Once B makes that
+  // occupancy effective, resize must reject the BLAS row extent before growing
+  // either logical storage or any spatial arena.
+  const std::size_t full_rows_per_slot =
+      (1 + 4 * model.ne) * model.ne;
+  const std::size_t oversized_batch =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) /
+          full_rows_per_slot +
+      1;
+  CHECK_NOTHROW(workspace->prepareTileCapacity(oversized_batch));
+  CHECK(workspace->tileCapacity() == oversized_batch);
+  const std::size_t logical_bytes_before_preflight =
+      workspace->logicalStorageBytes();
+  const std::size_t tile_bytes_before_preflight = workspace->tileScratchBytes();
+  const std::size_t fingerprint_before_preflight = workspace->storageFingerprint(
+      pf::DirectBatchMode::FULL_VGL);
+  CHECK_THROWS_AS(workspace->resize(pf::DirectBatchMode::FULL_VGL,
+                                    oversized_batch),
+                  std::length_error);
+  CHECK(workspace->size() == 2);
+  CHECK(workspace->capacity(pf::DirectBatchMode::FULL_VGL) == 2);
+  CHECK(workspace->logicalStorageBytes() == logical_bytes_before_preflight);
+  CHECK(workspace->tileScratchBytes() == tile_bytes_before_preflight);
+  CHECK(workspace->storageFingerprint(
+            pf::DirectBatchMode::FULL_VGL) ==
+        fingerprint_before_preflight);
+}
+
+TEST_CASE("PsiFormer batch mode switching has a bounded additive high water",
+          "[wavefunction][psiformer][batch]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+  const std::size_t active_electrons[4]{0, 1, 2, 3};
+
+  workspace->prepareTileCapacity(2);
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 4);
+  loadBatch(*workspace, base, 4);
+  batch_executor.evaluateValues(*workspace);
+  const std::size_t value_high_water = workspace->tileScratchBytes();
+
+  workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 4);
+  loadBatch(*workspace, base, 4);
+  batch_executor.evaluateActive(*workspace, active_electrons);
+  const std::size_t active_high_water = workspace->tileScratchBytes();
+  CHECK(active_high_water > value_high_water);
+
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 4);
+  loadBatch(*workspace, base, 4);
+  batch_executor.evaluateFull(*workspace);
+  const std::size_t all_mode_high_water = workspace->tileScratchBytes();
+  CHECK(all_mode_high_water > active_high_water);
+  CHECK(workspace->allocatedTileCapacity() == 2);
+
+  // Logical growth and subsequent mode switching retain, but do not multiply,
+  // the already allocated T=2 scratch families.
+  for (const pf::DirectBatchMode mode : {
+           pf::DirectBatchMode::VALUE_ONLY,
+           pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT,
+           pf::DirectBatchMode::FULL_VGL})
+    workspace->resize(mode, 64);
+  CHECK(workspace->tileScratchBytes() == all_mode_high_water);
+  CHECK(workspace->logicalStorageBytes() > 0);
+
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 3);
+  loadBatch(*workspace, base, 3);
+  batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->tileScratchBytes() == all_mode_high_water);
 }
 
 TEST_CASE("PsiFormer value batch storage is bounded stable and allocation free",

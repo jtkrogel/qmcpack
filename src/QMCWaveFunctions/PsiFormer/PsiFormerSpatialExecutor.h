@@ -197,14 +197,36 @@ public:
       hash *= 1099511628211ULL;
     };
     mix(electron_positions_);
+    hash ^= geometry_.storageFingerprint();
+    hash *= 1099511628211ULL;
     auto mix_jet = [&mix](const DirectSpatialJetBuffer& buffer) {
       mix(buffer.value);
       mix(buffer.gradient);
       mix(buffer.laplacian);
     };
+    auto jet_fingerprint = [](const DirectSpatialJetBuffer& buffer) {
+      std::size_t jet_hash = 1469598103934665603ULL;
+      auto mix_buffer = [&jet_hash](const std::vector<double>& values) {
+        jet_hash ^= reinterpret_cast<std::uintptr_t>(values.data());
+        jet_hash *= 1099511628211ULL;
+        jet_hash ^= values.capacity();
+        jet_hash *= 1099511628211ULL;
+      };
+      mix_buffer(buffer.value);
+      mix_buffer(buffer.gradient);
+      mix_buffer(buffer.laplacian);
+      return jet_hash;
+    };
     mix_jet(raw_features_);
-    mix_jet(features_a_);
-    mix_jet(features_b_);
+    // Attention layers swap the two ping-pong buffer objects.  Hash their
+    // allocation identities as an unordered pair so odd block counts do not
+    // report a false allocation change after every successful evaluation.
+    const std::size_t feature_a_fingerprint = jet_fingerprint(features_a_);
+    const std::size_t feature_b_fingerprint = jet_fingerprint(features_b_);
+    hash ^= std::min(feature_a_fingerprint, feature_b_fingerprint);
+    hash *= 1099511628211ULL;
+    hash ^= std::max(feature_a_fingerprint, feature_b_fingerprint);
+    hash *= 1099511628211ULL;
     mix_jet(query_);
     mix_jet(key_);
     mix_jet(projected_value_);
@@ -222,7 +244,7 @@ public:
     return hash;
   }
 
-  /// Return bytes reserved by every explicit double-vector workspace buffer.
+  /// Return bytes reserved by every workspace buffer, including geometry tables.
   std::size_t vectorStorageBytes() const noexcept
   {
     std::size_t scalar_capacity = 0;
@@ -250,11 +272,21 @@ public:
     add(output_gradient_);
     add(output_lap_log_);
     add(output_lap_ratio_);
-    return scalar_capacity * sizeof(double) + determinant_workspace_.storageBytes();
+    return scalar_capacity * sizeof(double) + geometry_.storageBytes() +
+        determinant_workspace_.storageBytes();
   }
+
+  /// Expose geometry-cache allocation accounting for workspace diagnostics.
+  std::size_t geometryStorageBytes() const noexcept
+  { return geometry_.storageBytes(); }
+
+  /// Expose geometry allocation identity for focused storage diagnostics.
+  std::size_t geometryStorageFingerprint() const noexcept
+  { return geometry_.storageFingerprint(); }
 
 private:
   friend class DirectSpatialExecutor;
+  friend class DirectBatchExecutor;
 
   DirectSpatialMode mode_;
   std::size_t gradient_lanes_;
@@ -305,11 +337,30 @@ public:
       : parameters_(model.p),
         layout_(value_executor.layout()),
         nuclei_(model.cfg.nuclei.x),
-        boundary_(directGeometryBoundary(plan.environment().boundary))
+        boundary_(directGeometryBoundary(plan.environment().boundary)),
+        value_executor_identity_(&value_executor)
   {
     if (layout_->parameterCount() != plan.parameterCount() ||
         layout_->electronCount() != plan.modelShape().electrons())
       throw std::invalid_argument("PsiFormer spatial executor received an incompatible value layout");
+    if (value_executor.parameterStoreIdentity() != &model.p)
+      throw std::invalid_argument(
+          "PsiFormer spatial executor and value executor use different parameter stores");
+    const GeometryPositionView value_nuclei = value_executor.nuclearPositions();
+    if (value_nuclei.size() * 3 != nuclei_.size())
+      throw std::invalid_argument(
+          "PsiFormer spatial executor and value executor use different nuclei");
+    for (std::size_t nucleus = 0; nucleus < value_nuclei.size(); ++nucleus)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (value_nuclei(nucleus, dimension) != nuclei_[3 * nucleus + dimension])
+          throw std::invalid_argument(
+              "PsiFormer spatial executor and value executor use different nuclei");
+    const GeometryBoundary& value_boundary = value_executor.boundary();
+    if (value_boundary.kind != boundary_.kind ||
+        value_boundary.lattice_vectors != boundary_.lattice_vectors ||
+        value_boundary.periodic_axes != boundary_.periodic_axes)
+      throw std::invalid_argument(
+          "PsiFormer spatial executor and value executor use different boundaries");
   }
 
   /// Construct one clone-local workspace for a fixed spatial output family.
@@ -318,6 +369,14 @@ public:
     return std::make_unique<DirectSpatialWorkspace>(
         *layout_, GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()), mode, boundary_);
   }
+
+  /// Expose the immutable descriptor identity used to bind batch executors safely.
+  const std::shared_ptr<const DirectValueParameterLayout>& layout() const noexcept
+  { return layout_; }
+
+  /// Return the exact value executor whose immutable model state is shared here.
+  const DirectValueExecutor* valueExecutorIdentity() const noexcept
+  { return value_executor_identity_; }
 
   /// Evaluate complete log-gradient and per-electron log-Laplacian data.
   DirectSpatialResultView evaluateFull(DirectSpatialWorkspace& workspace) const
@@ -341,6 +400,8 @@ public:
   }
 
 private:
+  friend class DirectBatchExecutor;
+
   /// Return the beginning of one pre-resolved immutable parameter interval.
   static const double* tensor(const double* parameters,
                               const DirectParameterTensor& descriptor) noexcept
@@ -386,6 +447,9 @@ private:
 
   /// Build analytic electron-nucleus features and their spatial derivatives.
   void buildEmbedding(const double* parameters, DirectSpatialWorkspace& workspace) const;
+
+  /// Populate the embedding input jet without applying its shared dense projection.
+  void buildEmbeddingFeatures(DirectSpatialWorkspace& workspace) const;
 
   /// Apply one attention/residual block to value, gradient, and Laplacian lanes.
   void applyAttentionBlock(const double* parameters,
@@ -437,6 +501,7 @@ private:
   std::shared_ptr<const DirectValueParameterLayout> layout_;
   std::vector<double> nuclei_;
   GeometryBoundary boundary_;
+  const DirectValueExecutor* value_executor_identity_;
 };
 
 inline void DirectSpatialExecutor::refreshGeometry(DirectSpatialWorkspace& workspace) const
@@ -562,8 +627,8 @@ inline void DirectSpatialExecutor::denseQKVJet(const DirectSpatialJetBuffer& sou
       }
 }
 
-inline void DirectSpatialExecutor::buildEmbedding(const double* parameters,
-                                                  DirectSpatialWorkspace& workspace) const
+inline void DirectSpatialExecutor::buildEmbeddingFeatures(
+    DirectSpatialWorkspace& workspace) const
 {
   DirectSpatialJetBuffer& raw       = workspace.raw_features_;
   const GeometryPairTable& pairs    = workspace.geometry_.electronNucleusPairs();
@@ -624,8 +689,16 @@ inline void DirectSpatialExecutor::buildEmbedding(const double* parameters,
     raw.value[row_begin + input_width - 1] = electron < layout_->spinUpCount() ? 1.0 : -1.0;
   }
 
-  denseJet(raw, tensor(parameters, layout_->embedding_), nullptr, electron_count, input_width,
-           layout_->featureWidth(), workspace.gradient_lanes_, workspace.laplacian_lanes_,
+}
+
+inline void DirectSpatialExecutor::buildEmbedding(
+    const double* parameters,
+    DirectSpatialWorkspace& workspace) const
+{
+  buildEmbeddingFeatures(workspace);
+  denseJet(workspace.raw_features_, tensor(parameters, layout_->embedding_), nullptr,
+           layout_->electronCount(), layout_->inputWidth(), layout_->featureWidth(),
+           workspace.gradient_lanes_, workspace.laplacian_lanes_,
            workspace.features_a_);
 }
 

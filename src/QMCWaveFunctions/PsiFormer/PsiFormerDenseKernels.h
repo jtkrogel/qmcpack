@@ -26,9 +26,18 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <stdexcept>
 
 namespace qmcplusplus::psiformer::dense
 {
+
+/// Convert one BLAS dimension only after enforcing the configured integer ABI.
+inline int checkedBlasDimension(std::size_t extent, const char* quantity)
+{
+  if (extent > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error(quantity);
+  return static_cast<int>(extent);
+}
 
 /** Apply a small row-major dense product with a compiler-vectorizable loop.
  *
@@ -74,9 +83,15 @@ inline void productBlasReal(const double* source,
                             std::size_t output_width,
                             double* target)
 {
-  BLAS::gemm('N', 'N', static_cast<int>(output_width), static_cast<int>(rows),
-             static_cast<int>(input_width), 1.0, weight, static_cast<int>(output_width), source,
-             static_cast<int>(input_width), 0.0, target, static_cast<int>(output_width));
+  const int blas_rows = checkedBlasDimension(
+      rows, "PsiFormer dense row count exceeds the BLAS integer ABI");
+  const int blas_input_width = checkedBlasDimension(
+      input_width, "PsiFormer dense input width exceeds the BLAS integer ABI");
+  const int blas_output_width = checkedBlasDimension(
+      output_width, "PsiFormer dense output width exceeds the BLAS integer ABI");
+  BLAS::gemm('N', 'N', blas_output_width, blas_rows, blas_input_width, 1.0,
+             weight, blas_output_width, source, blas_input_width, 0.0, target,
+             blas_output_width);
 
   if (bias)
     for (std::size_t row = 0; row < rows; ++row)
@@ -124,11 +139,17 @@ inline void accumulateInputAdjointReal(const double* target_adjoint,
   if (stacked_rows == 0)
     return;
 
+  const int blas_rows = checkedBlasDimension(
+      stacked_rows, "PsiFormer adjoint row count exceeds the BLAS integer ABI");
+  const int blas_input_width = checkedBlasDimension(
+      input_width, "PsiFormer adjoint input width exceeds the BLAS integer ABI");
+  const int blas_output_width = checkedBlasDimension(
+      output_width, "PsiFormer adjoint output width exceeds the BLAS integer ABI");
+
   // Column-major W*Y_bar^T has the row-major storage of Y_bar*W^T.
-  BLAS::gemm('T', 'N', static_cast<int>(input_width), static_cast<int>(stacked_rows),
-             static_cast<int>(output_width), 1.0, weight, static_cast<int>(output_width),
-             target_adjoint, static_cast<int>(output_width), 1.0, source_adjoint,
-             static_cast<int>(input_width));
+  BLAS::gemm('T', 'N', blas_input_width, blas_rows, blas_output_width, 1.0,
+             weight, blas_output_width, target_adjoint, blas_output_width, 1.0,
+             source_adjoint, blas_input_width);
 }
 
 /** Accumulate the weight adjoint of a row-major dense product with real BLAS.
@@ -147,10 +168,16 @@ inline void accumulateWeightAdjointReal(const double* source,
   if (stacked_rows == 0)
     return;
 
-  BLAS::gemm('N', 'T', static_cast<int>(output_width), static_cast<int>(input_width),
-             static_cast<int>(stacked_rows), 1.0, target_adjoint,
-             static_cast<int>(output_width), source, static_cast<int>(input_width), 1.0,
-             weight_adjoint, static_cast<int>(output_width));
+  const int blas_rows = checkedBlasDimension(
+      stacked_rows, "PsiFormer adjoint row count exceeds the BLAS integer ABI");
+  const int blas_input_width = checkedBlasDimension(
+      input_width, "PsiFormer adjoint input width exceeds the BLAS integer ABI");
+  const int blas_output_width = checkedBlasDimension(
+      output_width, "PsiFormer adjoint output width exceeds the BLAS integer ABI");
+
+  BLAS::gemm('N', 'T', blas_output_width, blas_input_width, blas_rows, 1.0,
+             target_adjoint, blas_output_width, source, blas_input_width, 1.0,
+             weight_adjoint, blas_output_width);
 }
 
 /** Project a shared feature matrix into separate Q, K, and V buffers.
@@ -188,16 +215,24 @@ inline void attentionWeightsReal(const double* query,
                                  std::size_t head_width,
                                  double* attention)
 {
+  const int blas_rows = checkedBlasDimension(
+      rows, "PsiFormer attention row count exceeds the BLAS integer ABI");
+  const int blas_head_width = checkedBlasDimension(
+      head_width, "PsiFormer attention head width exceeds the BLAS integer ABI");
+  const int blas_query_stride = checkedBlasDimension(
+      query_stride, "PsiFormer attention query stride exceeds the BLAS integer ABI");
+  const int blas_key_stride = checkedBlasDimension(
+      key_stride, "PsiFormer attention key stride exceeds the BLAS integer ABI");
   const double scale = 1.0 / std::sqrt(static_cast<double>(head_width));
   for (std::size_t head = 0; head < heads; ++head)
   {
     double* head_attention = attention + head * rows * rows;
 
     // Column-major K^T*Q has the row-major storage of Q*K^T.
-    BLAS::gemm('T', 'N', static_cast<int>(rows), static_cast<int>(rows),
-               static_cast<int>(head_width), scale, key + head * head_width,
-               static_cast<int>(key_stride), query + head * head_width,
-               static_cast<int>(query_stride), 0.0, head_attention, static_cast<int>(rows));
+    BLAS::gemm('T', 'N', blas_rows, blas_rows, blas_head_width, scale,
+               key + head * head_width, blas_key_stride,
+               query + head * head_width, blas_query_stride, 0.0,
+               head_attention, blas_rows);
 
     for (std::size_t query_row = 0; query_row < rows; ++query_row)
     {
@@ -229,13 +264,21 @@ inline void attentionContextReal(const double* attention,
                                  double* target)
 {
   const std::size_t width = heads * head_width;
+  const int blas_rows = checkedBlasDimension(
+      rows, "PsiFormer attention row count exceeds the BLAS integer ABI");
+  const int blas_head_width = checkedBlasDimension(
+      head_width, "PsiFormer attention head width exceeds the BLAS integer ABI");
+  const int blas_value_stride = checkedBlasDimension(
+      value_stride, "PsiFormer attention value stride exceeds the BLAS integer ABI");
+  const int blas_width = checkedBlasDimension(
+      width, "PsiFormer attention output stride exceeds the BLAS integer ABI");
   for (std::size_t head = 0; head < heads; ++head)
   {
     // Column-major V^T*A^T has the row-major storage of A*V.
-    BLAS::gemm('N', 'N', static_cast<int>(head_width), static_cast<int>(rows),
-               static_cast<int>(rows), 1.0, value + head * head_width,
-               static_cast<int>(value_stride), attention + head * rows * rows,
-               static_cast<int>(rows), 0.0, target + head * head_width, static_cast<int>(width));
+    BLAS::gemm('N', 'N', blas_head_width, blas_rows, blas_rows, 1.0,
+               value + head * head_width, blas_value_stride,
+               attention + head * rows * rows, blas_rows, 0.0,
+               target + head * head_width, blas_width);
   }
 }
 

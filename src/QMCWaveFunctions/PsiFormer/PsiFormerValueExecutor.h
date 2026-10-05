@@ -369,6 +369,9 @@ public:
   /// Expose immutable descriptors for diagnostics and clone-workspace construction.
   const std::shared_ptr<const DirectValueParameterLayout>& layout() const noexcept { return layout_; }
 
+  /// Return the immutable parameter-store identity used to bind companion executors.
+  const Parameters* parameterStoreIdentity() const noexcept { return &parameters_; }
+
   /// Expose immutable nuclear coordinates to bounded batch-workspace construction.
   GeometryPositionView nuclearPositions() const noexcept
   { return GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()); }

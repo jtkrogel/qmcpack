@@ -82,7 +82,8 @@ struct Leaf
 /// Construct the complete four-block PsiFormer layout used by integration tests.
 inline std::vector<Leaf> makeLayout(std::size_t electron_count,
                                     std::size_t nucleus_count,
-                                    bool has_same_spin_pair = true)
+                                    bool has_same_spin_pair = true,
+                                    std::size_t attention_blocks = 4)
 {
   const std::string prefix = "neural_network_wave_function/~/";
   std::vector<Leaf> leaves{
@@ -98,7 +99,7 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count,
   if (has_same_spin_pair)
     leaves.insert(leaves.begin() + 1,
                   {prefix + "electronic_cusp_asymptotic", "same_alpha", {}});
-  for (int layer = 0; layer < 4; ++layer)
+  for (std::size_t layer = 0; layer < attention_blocks; ++layer)
   {
     const std::string layer_name = layer == 0 ? "electron_gnn_layer" : "electron_gnn_layer_" + std::to_string(layer);
     const std::string base = prefix + "omni_net/~/electron_gnn/~/" + layer_name +
@@ -264,13 +265,15 @@ struct GeneratedFiles
 };
 
 /// Generate a full-shape parameter file and matching physical-system configuration.
-inline GeneratedFiles generateFiles(const std::string& system)
+inline GeneratedFiles generateFiles(const std::string& system,
+                                    std::size_t attention_blocks = 4)
 {
   static std::atomic<std::uint64_t> fixture_sequence{0};
 
   GeneratedFiles files;
   files.directory = std::filesystem::temp_directory_path() /
-      ("qmcpack_psiformer_random_v" + std::to_string(FIXTURE_RECIPE_VERSION) + "_" + system + "_" +
+      ("qmcpack_psiformer_random_v" + std::to_string(FIXTURE_RECIPE_VERSION) + "_" + system + "_b" +
+       std::to_string(attention_blocks) + "_" +
        std::to_string(static_cast<long long>(getpid())) + "_" +
        std::to_string(fixture_sequence.fetch_add(1, std::memory_order_relaxed)));
   std::filesystem::create_directories(files.directory);
@@ -281,7 +284,8 @@ inline GeneratedFiles generateFiles(const std::string& system)
   const std::size_t electron_count = geometry.electrons.size() / 3;
   const std::size_t nucleus_count  = geometry.nuclei.size() / 3;
   const bool has_same_spin_pair = geometry.nup >= 2 || electron_count - geometry.nup >= 2;
-  const auto leaves = makeLayout(electron_count, nucleus_count, has_same_spin_pair);
+  const auto leaves = makeLayout(electron_count, nucleus_count,
+                                 has_same_spin_pair, attention_blocks);
   const auto values             = makeParameters(system, leaves);
   std::vector<std::string> modules, names;
   std::vector<std::int64_t> ranks, shapes(2 * leaves.size(), 1), offsets{0};

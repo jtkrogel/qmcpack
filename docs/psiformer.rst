@@ -199,12 +199,24 @@ Scratch is never shared by two simultaneously active crowds. Capacity growth
 occurs at explicit preparation boundaries, and warmed kernel calls retain their
 backing addresses.
 
-The current value/full-VGL/active-gradient batch boundary owns contiguous
-configuration-major outputs and performs allocation-free warmed evaluations,
-but its inner implementation loops over scalar direct workspaces. It must not be
-interpreted as a grouped or strided-batched GEMM throughput claim. Score,
-kinetic-response, and nonlocal virtual-move reverse passes are likewise
-serialized through the resource-owned tape at present.
+The value/full-VGL/active-gradient batch boundary owns contiguous
+configuration-major logical inputs and outputs. It partitions a logical batch
+``B`` into bounded tiles ``T`` and stacks all configuration/electron rows (and,
+for spatial modes, all value/gradient/Laplacian jet planes) into each shared
+dense projection. Stable attention, orbital envelopes, determinant reduction,
+and cusp terms remain configuration-local. Warming a prepared capacity makes
+subsequent calls allocation-free. The default tile capacity is four and callers
+can prepare a different positive capacity explicitly.
+
+Expensive scratch is bounded by ``T`` rather than ``B``. Value execution owns
+one contiguous tile arena. Full-VGL and active-gradient execution retain
+separate, fixed-shape pools of ``T`` spatial slots because their derivative jet
+layouts differ; both pools reuse one packed dense source/target arena. Switching
+among modes therefore retains an additive high-water mark, exposed separately
+from logical storage by ``logicalStorageBytes()`` and ``tileScratchBytes()``.
+This is bounded execution storage, not a scalar-executor loop or one workspace
+per logical configuration. Score, kinetic-response, and nonlocal virtual-move
+reverse passes remain serialized through the resource-owned tape.
 
 Zero warmed-call allocation is a contract measured inside the direct native
 executors and their prepared batch workspaces, not across every public adapter
@@ -305,11 +317,15 @@ Developer timing manifest
 When ``BUILD_MICRO_BENCHMARKS=ON``, ``benchmark_psiformer_modes`` loads a
 developer-supplied export and writes one JSON manifest containing paired direct
 and oracle timings for value, full VGL, active gradient, score, and
-score-plus-kinetic modes. It also records supported value/VGL/active crowd batch
-sizes, fixed workspace bytes, output sizes, affinity, peak resident memory, and
-thread environment. The executable is deliberately not a CTest and applies no
-fragile absolute timing threshold. It records one untimed warmup result and all
-raw measured repeats for each mode.
+score-plus-kinetic modes. Value/VGL/active measurements sweep logical batch
+size and tile capacity independently and report prepacked-execution and
+pack-plus-execution scopes. Each batch record includes scalar-loop speedup,
+logical and tile-scratch bytes, allocated tile capacity, tile occupancy, grouped
+dense calls and rows, and scalar-executor call count. The manifest also records
+output sizes, affinity, peak resident memory, and thread environment. The
+executable is deliberately not a CTest and applies no fragile absolute timing
+threshold. It records one untimed warmup result and all raw measured repeats for
+each mode.
 
 .. code-block:: bash
 
@@ -317,7 +333,8 @@ raw measured repeats for each mode.
     ./src/QMCWaveFunctions/tests/benchmark_psiformer_modes \
     parameters.h5 electron_configurations.h5 \
     --repeats 10 --configuration-limit 10 --kinetic-configurations 2 \
-    --batch-sizes 1,2,4 --output psiformer_modes.json
+    --batch-sizes 1,2,4,8,16 --tile-sizes 1,2,4,8 \
+    --output psiformer_modes.json
 
 The supplied HDF5 files are timing inputs only. Deterministic correctness tests
 generate compact random-but-reproducible models at runtime and do not depend on
