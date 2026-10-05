@@ -20,6 +20,9 @@
 #include "NonLocalData.h"
 #include "type_traits/ConvertToReal.h"
 
+#include <stdexcept>
+#include <string>
+
 namespace qmcplusplus
 {
 NonLocalECPComponent::NonLocalECPComponent() : lmax(0), nchannel(0), nknot(0), Rmax(-1), do_randomize_grid_(true) {}
@@ -821,6 +824,121 @@ void NonLocalECPComponent::rotateQuadratureGrid(const TensorType& rmat)
       rrotsgrid_m[i] = dot(rmat, sgridxyz_m[i]);
     else
       rrotsgrid_m[i] = sgridxyz_m[i];
+}
+
+namespace
+{
+template<typename T>
+void validateRange(const std::vector<T>& storage,
+                   std::size_t offset,
+                   std::size_t count,
+                   const char* description)
+{
+  if (offset > storage.size() || count > storage.size() - offset)
+    throw std::invalid_argument(std::string("Nonlocal ECP quadrature ") + description + " range is out of bounds.");
+}
+} // namespace
+
+void NonLocalECPComponent::buildQuadraturePointRange(RealType r,
+                                                      const PosType& dr,
+                                                      const PosType& reference_position,
+                                                      std::size_t first_knot,
+                                                      std::size_t knot_count,
+                                                      std::size_t output_offset,
+                                                      std::vector<PosType>& deltas,
+                                                      std::vector<PosType>& absolute_positions,
+                                                      std::vector<RealType>& bare_weights,
+                                                      std::vector<RealType>& radial_scratch,
+                                                      std::vector<RealType>& legendre_scratch) const
+{
+  const std::size_t total_knots = static_cast<std::size_t>(nknot);
+  if (first_knot > total_knots || knot_count > total_knots - first_knot)
+    throw std::invalid_argument("Nonlocal ECP quadrature knot range is out of bounds.");
+
+  validateRange(deltas, output_offset, knot_count, "delta output");
+  validateRange(absolute_positions, output_offset, knot_count, "position output");
+  validateRange(bare_weights, output_offset, knot_count, "weight output");
+  if (knot_count == 0)
+    return;
+
+  if (radial_scratch.size() < static_cast<std::size_t>(nchannel))
+    throw std::invalid_argument("Nonlocal ECP radial scratch is too small.");
+  if (legendre_scratch.size() < static_cast<std::size_t>(lmax + 1))
+    throw std::invalid_argument("Nonlocal ECP Legendre scratch is too small.");
+
+  // Preserve the scalar path's radial-spline evaluation and multiplication
+  // order while keeping every temporary in caller-owned storage.
+  for (int channel = 0; channel < nchannel; ++channel)
+    radial_scratch[channel] = nlpp_m[channel]->splint(r) * wgt_angpp_m[channel];
+
+  constexpr RealType zero(0);
+  constexpr RealType one(1);
+  const RealType inverse_radius = one / r;
+
+  for (std::size_t local_knot = 0; local_knot < knot_count; ++local_knot)
+  {
+    const std::size_t knot   = first_knot + local_knot;
+    const std::size_t output = output_offset + local_knot;
+
+    deltas[output]             = r * rrotsgrid_m[knot] - dr;
+    absolute_positions[output] = reference_position + deltas[output];
+
+    const RealType cosine = dot(dr, rrotsgrid_m[knot]) * inverse_radius;
+    legendre_scratch[0]    = one;
+    RealType previous      = zero;
+    for (int angular_momentum = 0; angular_momentum < lmax; ++angular_momentum)
+    {
+      legendre_scratch[angular_momentum + 1] =
+          (Lfactor1[angular_momentum] * cosine * legendre_scratch[angular_momentum] -
+           angular_momentum * previous) *
+          Lfactor2[angular_momentum];
+      previous = legendre_scratch[angular_momentum];
+    }
+
+    RealType channel_sum = zero;
+    for (int channel = 0; channel < nchannel; ++channel)
+      channel_sum += radial_scratch[channel] * legendre_scratch[angpp_m[channel]];
+    bare_weights[output] = channel_sum * sgridweight_m[knot];
+  }
+}
+
+void NonLocalECPComponent::reduceQuadraturePointRange(int electron_id,
+                                                       std::size_t input_offset,
+                                                       std::size_t knot_count,
+                                                       const std::vector<PosType>& deltas,
+                                                       const std::vector<RealType>& bare_weights,
+                                                       const std::vector<ValueType>& ratios,
+                                                       const std::vector<ValueType>* fermionic_ratios,
+                                                       std::size_t transformed_output_offset,
+                                                       std::vector<RealType>& transformed_weights,
+                                                       std::size_t candidate_output_offset,
+                                                       std::vector<NonLocalData>* candidates,
+                                                       RealType& pair_potential)
+{
+  validateRange(deltas, input_offset, knot_count, "delta input");
+  validateRange(bare_weights, input_offset, knot_count, "weight input");
+  validateRange(ratios, input_offset, knot_count, "ratio input");
+  if (fermionic_ratios)
+    validateRange(*fermionic_ratios, input_offset, knot_count, "fermionic-ratio input");
+  validateRange(transformed_weights, transformed_output_offset, knot_count, "transformed-weight output");
+  if (candidates)
+    validateRange(*candidates, candidate_output_offset, knot_count, "candidate output");
+
+  for (std::size_t local_knot = 0; local_knot < knot_count; ++local_knot)
+  {
+    const std::size_t input              = input_offset + local_knot;
+    const std::size_t transformed_output = transformed_output_offset + local_knot;
+    const RealType bare                  = bare_weights[input];
+    const RealType full                  = bare * std::real(ratios[input]);
+    const RealType transformed =
+        fermionic_ratios && full > RealType(0) ? bare * std::real((*fermionic_ratios)[input]) : full;
+
+    transformed_weights[transformed_output] = transformed;
+    pair_potential += transformed;
+    if (candidates)
+      (*candidates)[candidate_output_offset + local_knot] =
+          NonLocalData(electron_id, transformed, deltas[input]);
+  }
 }
 
 void NonLocalECPComponent::buildQuadraturePointDeltaPositions(RealType r,

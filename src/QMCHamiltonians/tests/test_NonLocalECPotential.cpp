@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -58,6 +59,82 @@ public:
   static bool didGridChange(NonLocalECPotential& nl_ecp)
   {
     return nl_ecp.PPset[0]->rrotsgrid_m != nl_ecp.PPset[0]->sgridxyz_m;
+  }
+
+  static void copyComponentGridUnrotatedForTest(NonLocalECPComponent& component)
+  {
+    component.rrotsgrid_m = component.sgridxyz_m;
+  }
+
+  struct LegacyQuadratureData
+  {
+    std::vector<QMCTraits::PosType> deltas;
+    std::vector<Real> bare_weights;
+  };
+
+  /** Build quadrature data through the pre-batching component scratch path. */
+  static LegacyQuadratureData buildLegacyQuadrature(NonLocalECPComponent& component,
+                                                     Real radius,
+                                                     const QMCTraits::PosType& displacement)
+  {
+    LegacyQuadratureData result;
+    result.deltas.resize(component.nknot);
+    result.bare_weights.resize(component.nknot);
+    component.buildQuadraturePointDeltaPosAndPartialPotential(
+        radius, displacement, result.deltas, result.bare_weights);
+    return result;
+  }
+
+  struct LegacyReduction
+  {
+    Real pair_potential;
+    std::vector<Real> transformed_weights;
+    std::vector<NonLocalData> candidates;
+  };
+
+  /** Reduce synthetic ratios through the pre-batching mutable component path. */
+  static LegacyReduction reduceLegacyQuadrature(NonLocalECPComponent& component,
+                                                 int electron_id,
+                                                 const LegacyQuadratureData& quadrature,
+                                                 const std::vector<QMCTraits::ValueType>& ratios,
+                                                 const std::vector<QMCTraits::ValueType>& fermionic_ratios,
+                                                 bool use_tmdla)
+  {
+    component.deltaV_      = quadrature.deltas;
+    component.knot_pots_   = quadrature.bare_weights;
+    component.psiratio     = ratios;
+    component.psiratio_det = fermionic_ratios;
+
+    LegacyReduction result;
+    result.pair_potential = component.calculatePotential(component.knot_pots_, use_tmdla);
+    result.transformed_weights = component.knot_pots_;
+    component.contributeTxy(electron_id, result.candidates);
+    return result;
+  }
+
+  struct LegacyScratchSnapshot
+  {
+    std::vector<QMCTraits::PosType> deltas;
+    std::vector<Real> legendre;
+    std::vector<Real> radial;
+    std::vector<Real> knot_weights;
+    std::vector<QMCTraits::ValueType> ratios;
+    std::vector<QMCTraits::ValueType> fermionic_ratios;
+  };
+
+  /** Capture the legacy member arrays the caller-owned seam must not touch. */
+  static LegacyScratchSnapshot snapshotLegacyScratch(const NonLocalECPComponent& component)
+  {
+    return {component.deltaV_, component.lpol, component.vrad, component.knot_pots_, component.psiratio,
+            component.psiratio_det};
+  }
+
+  static bool legacyScratchMatches(const NonLocalECPComponent& component,
+                                   const LegacyScratchSnapshot& snapshot)
+  {
+    return component.deltaV_ == snapshot.deltas && component.lpol == snapshot.legendre &&
+        component.vrad == snapshot.radial && component.knot_pots_ == snapshot.knot_weights &&
+        component.psiratio == snapshot.ratios && component.psiratio_det == snapshot.fermionic_ratios;
   }
 
   static void evaluateImpl(NonLocalECPotential& nl_ecp,
@@ -371,6 +448,290 @@ UPtr<NonLocalECPComponent> readTmoveV1PPComponent()
   bool okay = ecp_comp_builder.read_pp_file("Na.BFD.xml");
   REQUIRE(okay);
   return std::move(ecp_comp_builder.pp_nonloc);
+}
+
+bool sameRealBits(QMCTraits::RealType left, QMCTraits::RealType right)
+{
+  return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool samePositionBits(const QMCTraits::PosType& left, const QMCTraits::PosType& right)
+{
+  for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    if (!sameRealBits(left[dimension], right[dimension]))
+      return false;
+  return true;
+}
+
+TEST_CASE("NonLocalECPComponent caller-owned quadrature ranges match legacy",
+          "[hamiltonian][ecp][quadrature_range]")
+{
+  using Real     = QMCTraits::RealType;
+  using Value    = QMCTraits::ValueType;
+  using Position = QMCTraits::PosType;
+
+  UPtr<NonLocalECPComponent> component = readTmoveV1PPComponent();
+  testing::TestNonLocalECPotential::copyComponentGridUnrotatedForTest(*component);
+
+  const Position reference_position{Real(0.4), Real(-0.3), Real(0.2)};
+  const Position displacement{Real(0.7), Real(-1.1), Real(0.5)};
+  const Real radius = std::sqrt(dot(displacement, displacement));
+  const std::size_t knot_count = static_cast<std::size_t>(component->getNknot());
+  REQUIRE(knot_count > 2);
+
+  const auto legacy = testing::TestNonLocalECPotential::buildLegacyQuadrature(
+      *component, radius, displacement);
+  const auto scratch_before_builder =
+      testing::TestNonLocalECPotential::snapshotLegacyScratch(*component);
+
+  std::vector<Position> deltas(knot_count);
+  std::vector<Position> absolute_positions(knot_count);
+  std::vector<Real> bare_weights(knot_count);
+  std::vector<Real> radial_scratch(static_cast<std::size_t>(component->getNchannel()));
+  std::vector<Real> legendre_scratch(static_cast<std::size_t>(component->getLmax() + 1));
+  component->buildQuadraturePointRange(radius, displacement, reference_position, 0, knot_count, 0, deltas,
+                                       absolute_positions, bare_weights, radial_scratch, legendre_scratch);
+
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    CHECK(samePositionBits(deltas[knot], legacy.deltas[knot]));
+    CHECK(sameRealBits(bare_weights[knot], legacy.bare_weights[knot]));
+    const Position expected_absolute = reference_position + legacy.deltas[knot];
+    CHECK(samePositionBits(absolute_positions[knot], expected_absolute));
+  }
+
+  // Rebuilding into two ranges must reproduce the same positions and weights,
+  // even though each range independently evaluates its radial-channel scratch.
+  const std::size_t split = knot_count / 2;
+  std::vector<Position> split_deltas(knot_count, Position(Real(9)));
+  std::vector<Position> split_positions(knot_count, Position(Real(9)));
+  std::vector<Real> split_weights(knot_count, Real(9));
+  component->buildQuadraturePointRange(radius, displacement, reference_position, 0, split, 0, split_deltas,
+                                       split_positions, split_weights, radial_scratch, legendre_scratch);
+  component->buildQuadraturePointRange(radius, displacement, reference_position, split, knot_count - split, split,
+                                       split_deltas, split_positions, split_weights, radial_scratch,
+                                       legendre_scratch);
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    CHECK(samePositionBits(split_deltas[knot], deltas[knot]));
+    CHECK(samePositionBits(split_positions[knot], absolute_positions[knot]));
+    CHECK(sameRealBits(split_weights[knot], bare_weights[knot]));
+  }
+
+  // A nonzero source-knot offset is independent of the tile-local output
+  // offset used by the caller's bounded scratch arrays.
+  std::vector<Position> tail_deltas(knot_count - split);
+  std::vector<Position> tail_positions(knot_count - split);
+  std::vector<Real> tail_weights(knot_count - split);
+  component->buildQuadraturePointRange(radius, displacement, reference_position, split, knot_count - split, 0,
+                                       tail_deltas, tail_positions, tail_weights, radial_scratch,
+                                       legendre_scratch);
+  for (std::size_t local_knot = 0; local_knot < knot_count - split; ++local_knot)
+  {
+    CHECK(samePositionBits(tail_deltas[local_knot], deltas[split + local_knot]));
+    CHECK(samePositionBits(tail_positions[local_knot], absolute_positions[split + local_knot]));
+    CHECK(sameRealBits(tail_weights[local_knot], bare_weights[split + local_knot]));
+  }
+
+  // A zero-length tail is a true no-op and does not require arithmetic scratch.
+  std::vector<Real> empty_scratch;
+  CHECK_NOTHROW(component->buildQuadraturePointRange(
+      radius, displacement, reference_position, knot_count, 0, knot_count, deltas, absolute_positions,
+      bare_weights, empty_scratch, empty_scratch));
+
+  // Every extent is checked before radial scratch or an output is changed.
+  std::vector<Position> guarded_deltas(knot_count, Position(Real(7)));
+  std::vector<Position> guarded_positions(knot_count, Position(Real(8)));
+  std::vector<Real> short_weights(knot_count - 1, Real(6));
+  const auto guarded_deltas_before     = guarded_deltas;
+  const auto guarded_positions_before = guarded_positions;
+  const auto radial_before           = radial_scratch;
+  const auto legendre_before         = legendre_scratch;
+  CHECK_THROWS_AS(component->buildQuadraturePointRange(
+                      radius, displacement, reference_position, 0, knot_count, 0, guarded_deltas,
+                      guarded_positions, short_weights, radial_scratch, legendre_scratch),
+                  std::invalid_argument);
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    CHECK(samePositionBits(guarded_deltas[knot], guarded_deltas_before[knot]));
+    CHECK(samePositionBits(guarded_positions[knot], guarded_positions_before[knot]));
+  }
+  CHECK(radial_scratch == radial_before);
+  CHECK(legendre_scratch == legendre_before);
+  CHECK(testing::TestNonLocalECPotential::legacyScratchMatches(*component, scratch_before_builder));
+
+  auto make_value = [](Real real_part, Real imaginary_part) -> Value {
+#if defined(QMC_COMPLEX)
+    return Value(real_part, imaginary_part);
+#else
+    static_cast<void>(imaginary_part);
+    return real_part;
+#endif
+  };
+
+  // Alternate the sign of bare*real(full ratio), independently of the bare
+  // weight sign, so the TMDLA test necessarily exercises both branches.
+  std::vector<Value> full_ratios(knot_count);
+  std::vector<Value> fermionic_ratios(knot_count);
+  const auto zero_knot_iter = std::find_if(
+      bare_weights.begin(), bare_weights.end(), [](Real weight) { return weight != Real(0); });
+  REQUIRE(zero_knot_iter != bare_weights.end());
+  const std::size_t zero_knot = static_cast<std::size_t>(std::distance(bare_weights.begin(), zero_knot_iter));
+  int positive_full_knots    = 0;
+  int nonpositive_full_knots = 0;
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    const Real magnitude = Real(0.5) + Real(0.03125) * static_cast<Real>(knot);
+    const Real bare_sign = bare_weights[knot] < Real(0) ? Real(-1) : Real(1);
+    const Real branch_sign = knot % 2 == 0 ? Real(1) : Real(-1);
+    const Real full_real = knot == zero_knot ? std::copysign(Real(0), -bare_weights[knot])
+                                             : bare_sign * branch_sign * magnitude;
+    full_ratios[knot] = make_value(full_real,
+                                   Real(0.125) + Real(0.01) * static_cast<Real>(knot));
+    fermionic_ratios[knot] = make_value(Real(-0.4) + Real(0.0625) * static_cast<Real>(knot),
+                                        Real(-0.25) - Real(0.02) * static_cast<Real>(knot));
+    if (bare_weights[knot] * std::real(full_ratios[knot]) > Real(0))
+      ++positive_full_knots;
+    else
+      ++nonpositive_full_knots;
+  }
+  REQUIRE(positive_full_knots > 0);
+  REQUIRE(nonpositive_full_knots > 0);
+
+  auto compare_reduction = [&](bool use_tmdla, bool emit_candidates) {
+    const auto reference = testing::TestNonLocalECPotential::reduceLegacyQuadrature(
+        *component, 1, legacy, full_ratios, fermionic_ratios, use_tmdla);
+    std::vector<Real> transformed(knot_count, Real(11));
+    std::vector<NonLocalData> candidates(knot_count);
+    Real pair_potential = Real(0);
+    const auto scratch_before_reducer =
+        testing::TestNonLocalECPotential::snapshotLegacyScratch(*component);
+    NonLocalECPComponent::reduceQuadraturePointRange(
+        1, 0, knot_count, deltas, bare_weights, full_ratios,
+        use_tmdla ? &fermionic_ratios : nullptr, 0, transformed, 0,
+        emit_candidates ? &candidates : nullptr, pair_potential);
+    CHECK(testing::TestNonLocalECPotential::legacyScratchMatches(*component, scratch_before_reducer));
+
+    CHECK(sameRealBits(pair_potential, reference.pair_potential));
+    for (std::size_t knot = 0; knot < knot_count; ++knot)
+    {
+      CHECK(sameRealBits(transformed[knot], reference.transformed_weights[knot]));
+      if (emit_candidates)
+      {
+        CHECK(candidates[knot].PID == reference.candidates[knot].PID);
+        CHECK(sameRealBits(candidates[knot].Weight, reference.candidates[knot].Weight));
+        CHECK(samePositionBits(candidates[knot].Delta, reference.candidates[knot].Delta));
+      }
+    }
+    return reference;
+  };
+
+  compare_reduction(false, true);
+  const auto tmdla_reference = compare_reduction(true, true);
+  const Real zero_full = bare_weights[zero_knot] * std::real(full_ratios[zero_knot]);
+  REQUIRE(zero_full == Real(0));
+  CHECK(sameRealBits(tmdla_reference.transformed_weights[zero_knot], zero_full));
+  CHECK(!sameRealBits(tmdla_reference.transformed_weights[zero_knot],
+                      bare_weights[zero_knot] * std::real(fermionic_ratios[zero_knot])));
+
+  // DLA without T-move candidates uses its already selected fermionic ratio
+  // in the ordinary transform; the reducer itself does no component filtering.
+  const auto dla_reference = testing::TestNonLocalECPotential::reduceLegacyQuadrature(
+      *component, 1, legacy, fermionic_ratios, full_ratios, false);
+  std::vector<Real> dla_weights(knot_count);
+  Real dla_energy = Real(0);
+  NonLocalECPComponent::reduceQuadraturePointRange(1, 0, knot_count, deltas, bare_weights, fermionic_ratios,
+                                                   nullptr, 0, dla_weights, 0, nullptr, dla_energy);
+  CHECK(sameRealBits(dla_energy, dla_reference.pair_potential));
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+    CHECK(sameRealBits(dla_weights[knot], dla_reference.transformed_weights[knot]));
+
+  // Tile-local transformed storage and globally staged candidate storage have
+  // independent offsets.  Keep input distinct as well to pin all three maps.
+  constexpr std::size_t input_prefix       = 1;
+  constexpr std::size_t transformed_prefix = 2;
+  constexpr std::size_t candidate_prefix   = 3;
+  std::vector<Position> offset_deltas(input_prefix + knot_count, Position(Real(-5)));
+  std::vector<Real> offset_bare(input_prefix + knot_count, Real(-5));
+  std::vector<Value> offset_full(input_prefix + knot_count, Value(Real(-5)));
+  std::vector<Value> offset_fermionic(input_prefix + knot_count, Value(Real(-5)));
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    offset_deltas[input_prefix + knot]    = deltas[knot];
+    offset_bare[input_prefix + knot]      = bare_weights[knot];
+    offset_full[input_prefix + knot]      = full_ratios[knot];
+    offset_fermionic[input_prefix + knot] = fermionic_ratios[knot];
+  }
+  std::vector<Real> offset_transformed(transformed_prefix + knot_count, Real(-7));
+  std::vector<NonLocalData> offset_candidates(
+      candidate_prefix + knot_count, NonLocalData(-7, Real(-7), Position(Real(-7))));
+  Real offset_energy = Real(0);
+  NonLocalECPComponent::reduceQuadraturePointRange(
+      1, input_prefix, knot_count, offset_deltas, offset_bare, offset_full, &offset_fermionic,
+      transformed_prefix, offset_transformed, candidate_prefix, &offset_candidates, offset_energy);
+  CHECK(sameRealBits(offset_energy, tmdla_reference.pair_potential));
+  for (std::size_t offset = 0; offset < transformed_prefix; ++offset)
+    CHECK(sameRealBits(offset_transformed[offset], Real(-7)));
+  for (std::size_t offset = 0; offset < candidate_prefix; ++offset)
+    CHECK(offset_candidates[offset].PID == -7);
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    CHECK(sameRealBits(offset_transformed[transformed_prefix + knot],
+                       tmdla_reference.transformed_weights[knot]));
+    CHECK(offset_candidates[candidate_prefix + knot].PID == tmdla_reference.candidates[knot].PID);
+    CHECK(sameRealBits(offset_candidates[candidate_prefix + knot].Weight,
+                       tmdla_reference.candidates[knot].Weight));
+    CHECK(samePositionBits(offset_candidates[candidate_prefix + knot].Delta,
+                           tmdla_reference.candidates[knot].Delta));
+  }
+
+  // Range calls add one knot at a time to the supplied accumulator.  Therefore
+  // splitting inside a job retains both floating-point association and the
+  // exact candidate scan order.
+  constexpr Real initial_pair_potential = Real(0.3125);
+  std::vector<Real> one_range_weights(knot_count);
+  std::vector<Real> split_range_weights(knot_count);
+  std::vector<NonLocalData> one_range_candidates(knot_count);
+  std::vector<NonLocalData> split_range_candidates(knot_count);
+  Real one_range_energy   = initial_pair_potential;
+  Real split_range_energy = initial_pair_potential;
+  NonLocalECPComponent::reduceQuadraturePointRange(
+      1, 0, knot_count, deltas, bare_weights, full_ratios, &fermionic_ratios, 0, one_range_weights,
+      0, &one_range_candidates, one_range_energy);
+  NonLocalECPComponent::reduceQuadraturePointRange(
+      1, 0, split, deltas, bare_weights, full_ratios, &fermionic_ratios, 0, split_range_weights,
+      0, &split_range_candidates, split_range_energy);
+  NonLocalECPComponent::reduceQuadraturePointRange(
+      1, split, knot_count - split, deltas, bare_weights, full_ratios, &fermionic_ratios, split,
+      split_range_weights, split, &split_range_candidates, split_range_energy);
+
+  CHECK(sameRealBits(split_range_energy, one_range_energy));
+  for (std::size_t knot = 0; knot < knot_count; ++knot)
+  {
+    CHECK(sameRealBits(split_range_weights[knot], one_range_weights[knot]));
+    CHECK(split_range_candidates[knot].PID == one_range_candidates[knot].PID);
+    CHECK(sameRealBits(split_range_candidates[knot].Weight, one_range_candidates[knot].Weight));
+    CHECK(samePositionBits(split_range_candidates[knot].Delta, one_range_candidates[knot].Delta));
+  }
+
+  // Reducer validation precedes accumulator or output publication.
+  std::vector<Real> guarded_weights(knot_count, Real(13));
+  std::vector<NonLocalData> short_candidates(knot_count - 1);
+  Real guarded_energy = initial_pair_potential;
+  CHECK_THROWS_AS(NonLocalECPComponent::reduceQuadraturePointRange(
+                      1, 0, knot_count, deltas, bare_weights, full_ratios, &fermionic_ratios, 0,
+                      guarded_weights, 0, &short_candidates, guarded_energy),
+                  std::invalid_argument);
+  CHECK(guarded_weights == std::vector<Real>(knot_count, Real(13)));
+  CHECK(sameRealBits(guarded_energy, initial_pair_potential));
+
+  std::vector<Position> empty_deltas;
+  std::vector<Real> empty_reals;
+  std::vector<Value> empty_values;
+  Real empty_energy = initial_pair_potential;
+  CHECK_NOTHROW(NonLocalECPComponent::reduceQuadraturePointRange(
+      1, 0, 0, empty_deltas, empty_reals, empty_values, nullptr, 0, empty_reals, 0, nullptr, empty_energy));
+  CHECK(sameRealBits(empty_energy, initial_pair_potential));
 }
 
 // Electron-1 positions and RNG seeds shared by DLA and v1 T-move regressions.

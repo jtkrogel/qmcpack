@@ -163,6 +163,51 @@ public:
 
   void rotateQuadratureGrid(const TensorType& rmat);
 
+  /** Build one contiguous quadrature-knot range into caller-owned storage.
+   *
+   * The output vectors and scratch vectors must already be large enough.  A
+   * range may be split across calls without consulting or changing the
+   * component's legacy mutable work arrays.  Absolute positions are formed as
+   * reference_position + delta to reproduce VirtualParticleSet::makeMoves().
+   * Caller-owned output and scratch vectors must be distinct.
+   */
+  void buildQuadraturePointRange(RealType r,
+                                 const PosType& dr,
+                                 const PosType& reference_position,
+                                 std::size_t first_knot,
+                                 std::size_t knot_count,
+                                 std::size_t output_offset,
+                                 std::vector<PosType>& deltas,
+                                 std::vector<PosType>& absolute_positions,
+                                 std::vector<RealType>& bare_weights,
+                                 std::vector<RealType>& radial_scratch,
+                                 std::vector<RealType>& legendre_scratch) const;
+
+  /** Reduce one quadrature range without consulting component-owned scratch.
+   *
+   * ratios contains the selected ratio for ordinary locality or DLA and the
+   * complete ratio for TMDLA.  A non-null fermionic_ratios activates the
+   * established TMDLA positive-knot replacement.  Each transformed knot is
+   * added directly to pair_potential, preserving summation order when a job is
+   * split across ranges.  A non-null candidates vector receives exactly one
+   * pre-sized NonLocalData entry per knot.  Independent output offsets allow
+   * transformed weights to remain tile-local while candidates occupy their
+   * final globally ordered staging range.
+   * Input and output ranges must not alias.
+   */
+  static void reduceQuadraturePointRange(int electron_id,
+                                         std::size_t input_offset,
+                                         std::size_t knot_count,
+                                         const std::vector<PosType>& deltas,
+                                         const std::vector<RealType>& bare_weights,
+                                         const std::vector<ValueType>& ratios,
+                                         const std::vector<ValueType>* fermionic_ratios,
+                                         std::size_t transformed_output_offset,
+                                         std::vector<RealType>& transformed_weights,
+                                         std::size_t candidate_output_offset,
+                                         std::vector<NonLocalData>* candidates,
+                                         RealType& pair_potential);
+
   /** @brief Evaluate the nonlocal pp contribution via randomized quadrature grid
    * to total energy from ion "iat" and electron "iel".
    *
@@ -339,6 +384,7 @@ public:
   inline void setRmax(int rmax) { Rmax = rmax; }
   inline RealType getRmax() const { return Rmax; }
   inline int getNknot() const { return nknot; }
+  inline int getNchannel() const { return nchannel; }
   inline void setLmax(int Lmax) { lmax = Lmax; }
   inline int getLmax() const { return lmax; }
 
