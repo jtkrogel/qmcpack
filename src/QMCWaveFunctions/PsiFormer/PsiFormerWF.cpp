@@ -19,6 +19,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
 #include "Message/Communicate.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "Particle/VirtualParticleSet.h"
 #include "ResourceCollection.h"
 #include "io/hdf/hdf_archive.h"
@@ -180,6 +181,27 @@ std::uint64_t configurationIdentity(const ParticleSet& particles,
     const auto& position = electron == replaced_particle
         ? (replacement_position ? *replacement_position : particles.activeR(electron))
         : particles.R[electron];
+    for (int dimension = 0; dimension < 3; ++dimension)
+      mixPersistentDouble(hash, static_cast<double>(position[dimension]));
+  }
+  return hash;
+}
+
+/// Fingerprint a selected-electron proposal without modifying the accepted ParticleSet.
+std::uint64_t configurationIdentity(
+    const ParticleSet& particles,
+    const MCMultiParticleMoves<CoordsType::POS>::Slice& moves)
+{
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  mixPersistentInteger(hash, particles.getTotalNum());
+  std::size_t selected = 0;
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+  {
+    mixPersistentInteger(hash, static_cast<std::uint64_t>(particles.GroupID[electron]));
+    const bool replaced = selected < moves.size() && moves.particleIndex(selected) == electron;
+    const auto& position = replaced ? moves.proposedPosition(selected) : particles.R[electron];
+    if (replaced)
+      ++selected;
     for (int dimension = 0; dimension < 3; ++dimension)
       mixPersistentDouble(hash, static_cast<double>(position[dimension]));
   }
@@ -595,6 +617,23 @@ void packBatchConfiguration(pf::DirectBatchWorkspace& workspace,
   }
 }
 
+/// Pack accepted coordinates followed by descriptor-owned absolute replacements.
+void packBatchConfiguration(
+    pf::DirectBatchWorkspace& workspace,
+    std::size_t configuration,
+    const ParticleSet& particles,
+    const MCMultiParticleMoves<CoordsType::POS>::Slice& moves)
+{
+  packBatchConfiguration(workspace, configuration, particles);
+  for (std::size_t selected = 0; selected < moves.size(); ++selected)
+  {
+    const auto electron = static_cast<std::size_t>(moves.particleIndex(selected));
+    const auto& position = moves.proposedPosition(selected);
+    for (int dimension = 0; dimension < 3; ++dimension)
+      workspace.setPosition(configuration, electron, dimension, position[dimension]);
+  }
+}
+
 /// Convert the real sign/log-magnitude result to QMCPACK's complex-log convention.
 WaveFunctionComponent::LogValue makeLogValue(double sign, double logabs)
 { return WaveFunctionComponent::LogValue(logabs, sign < 0 ? M_PI : 0.0); }
@@ -803,12 +842,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
 {
   std::shared_lock state_lock(model_state_->mutex);
   synchronizeParameterVersion(model_state_->model.p.version());
-
-  proposed_sign_      = 1.0;
-  proposed_log_value_ = LogValue(0);
-  proposed_configuration_identity_ = 0;
-  proposed_particle_               = -1;
-  has_proposal_       = false;
+  clearProposalState();
 }
 
 PsiFormerWF::~PsiFormerWF() = default;
@@ -1008,18 +1042,14 @@ void PsiFormerWF::checkOutVariables(const OptVariables& active)
 void PsiFormerWF::invalidateParameterCaches(std::size_t parameter_version)
 {
   current_sign_                     = 1.0;
-  proposed_sign_                    = 1.0;
   log_value_                        = LogValue(0);
-  proposed_log_value_               = LogValue(0);
-  has_proposal_                     = false;
   accepted_value_valid_             = false;
   accepted_configuration_identity_ = 0;
-  proposed_configuration_identity_ = 0;
   accepted_parameter_version_      = parameter_version;
   accepted_state_requirement_      = AcceptedStateRequirement::INVALID;
-  proposed_particle_               = -1;
   accepted_gradient_               = ValueType(0);
   accepted_laplacian_              = ValueType(0);
+  clearProposalState();
   observed_parameter_version_      = parameter_version;
 }
 
@@ -1028,6 +1058,53 @@ void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
 {
   if (observed_parameter_version_ != parameter_version)
     invalidateParameterCaches(parameter_version);
+}
+
+// Drop all proposal discriminators while preserving reusable complete-VGL storage.
+void PsiFormerWF::clearProposalState()
+{
+  proposed_sign_                   = 1.0;
+  proposed_log_value_              = LogValue(0);
+  proposed_configuration_identity_ = 0;
+  proposed_descriptor_fingerprint_ = 0;
+  proposed_parameter_version_      = 0;
+  proposed_particle_               = -1;
+  proposal_kind_                   = ProposalKind::NONE;
+  has_proposal_                    = false;
+}
+
+// Retain the legacy one-electron proposal behind the same explicit discriminator.
+void PsiFormerWF::cacheSingleParticleProposal(double sign,
+                                              double logabs,
+                                              std::uint64_t configuration_identity,
+                                              int particle,
+                                              std::size_t parameter_version)
+{
+  proposed_sign_                   = sign;
+  proposed_log_value_              = makeLogValue(sign, logabs);
+  proposed_configuration_identity_ = configuration_identity;
+  proposed_descriptor_fingerprint_ = 0;
+  proposed_parameter_version_      = parameter_version;
+  proposed_particle_               = particle;
+  proposal_kind_                   = ProposalKind::SINGLE_PARTICLE;
+  has_proposal_                    = true;
+}
+
+// Selected transactions must be resolved rather than silently replaced by another lifecycle call.
+void PsiFormerWF::requireNoSelectedParticleProposal(const char* operation) const
+{
+  if (has_proposal_ && proposal_kind_ == ProposalKind::SELECTED_PARTICLES)
+    throw std::logic_error(std::string("PsiFormer ") + operation +
+                           " cannot run while a selected-electron proposal is pending");
+}
+
+// Prepare clone-local complete proposal products before the transaction is published.
+void PsiFormerWF::resizeProposedSpatialStorage(std::size_t electron_count)
+{
+  if (proposed_gradient_.size() != electron_count)
+    proposed_gradient_.resize(electron_count);
+  if (proposed_laplacian_.size() != electron_count)
+    proposed_laplacian_.resize(electron_count);
 }
 
 // Allocate fixed-size accepted derivative storage without changing a warmed cache.
@@ -1182,11 +1259,7 @@ void PsiFormerWF::getAcceptedState(const ParticleSet& particles,
   accepted_parameter_version_      = static_cast<std::size_t>(version);
   accepted_state_requirement_      = decoded_requirement;
   accepted_value_valid_            = true;
-  proposed_sign_                   = 1.0;
-  proposed_log_value_              = LogValue(0);
-  proposed_configuration_identity_ = 0;
-  proposed_particle_               = -1;
-  has_proposal_                     = false;
+  clearProposalState();
   observed_parameter_version_       = parameter_version;
 }
 
@@ -1890,6 +1963,7 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
                                                ParticleSet::ParticleGradient& g,
                                                ParticleSet::ParticleLaplacian& l)
 {
+  requireNoSelectedParticleProposal("evaluateLog");
   // Keep the scatter independent of result ownership.  Production direct mode
   // passes workspace-backed views; oracle and compare retain pf::Result.
   auto scatter = [&](double sign, double logabs, const auto& gradient, const auto& lap_log) {
@@ -1908,11 +1982,7 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
     accepted_parameter_version_      = observed_parameter_version_;
     accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
     accepted_value_valid_            = true;
-    proposed_sign_                   = 1.0;
-    proposed_log_value_              = LogValue(0);
-    proposed_configuration_identity_ = 0;
-    proposed_particle_               = -1;
-    has_proposal_                     = false;
+    clearProposalState();
     accumulateAcceptedSpatial(g, l);
     return log_value_;
   };
@@ -1944,6 +2014,9 @@ void PsiFormerWF::mw_evaluateLog(
 
   const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
   auto& resource     = requireMultiWalkerResource(wfc_list);
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
+        "mw_evaluateLog");
   // Preserve the developer oracle/compare switches.  Production direct mode never
   // enters the serialized component fallback.
   if (leader.model_state_->direct_spatial_mode != DirectBackendMode::DIRECT)
@@ -1992,11 +2065,7 @@ void PsiFormerWF::mw_evaluateLog(
     component.accepted_parameter_version_      = parameter_version;
     component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
     component.accepted_value_valid_            = true;
-    component.proposed_sign_                   = 1.0;
-    component.proposed_log_value_              = LogValue(0);
-    component.proposed_configuration_identity_ = 0;
-    component.proposed_particle_               = -1;
-    component.has_proposal_                     = false;
+    component.clearProposalState();
     component.accumulateAcceptedSpatial(gradient, laplacian);
   }
 }
@@ -2008,6 +2077,238 @@ void PsiFormerWF::mw_evaluateGL(
     const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list,
     bool) const
 { mw_evaluateLog(wfc_list, p_list, gradient_list, laplacian_list); }
+
+// Evaluate complete selected-electron proposals without modifying accepted ParticleSets.
+void PsiFormerWF::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::vector<LogValue>& log_ratios,
+    const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+    const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
+{
+  const std::size_t walker_count = wfc_list.size();
+  if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
+      log_ratios.size() != walker_count || proposed_gradient_list.size() != walker_count ||
+      proposed_laplacian_list.size() != walker_count)
+    throw std::invalid_argument(
+        "PsiFormer selected-electron proposal has inconsistent walker counts");
+  moves.validateFor(p_list);
+  if (walker_count == 0)
+    return;
+
+  const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+  auto& resource     = requireMultiWalkerResource(wfc_list);
+  std::shared_lock state_lock(leader.model_state_->mutex);
+  const std::size_t parameter_version = leader.model_state_->model.p.version();
+  const std::size_t electron_count    = leader.model_state_->execution_plan.modelShape().electrons();
+  const std::uint64_t descriptor_fingerprint = moves.fingerprint();
+  constexpr std::size_t no_batch_slot = std::numeric_limits<std::size_t>::max();
+
+  std::vector<std::uint64_t> proposed_identities(walker_count);
+  std::vector<std::size_t> batch_slots(walker_count, no_batch_slot);
+  std::vector<double> proposed_signs(walker_count);
+  std::vector<double> proposed_logabs(walker_count);
+  std::vector<LogValue> staged_log_ratios(walker_count);
+  resource.walker_indices.clear();
+
+  // Validate every walker and allocate all persistent proposal storage before
+  // evaluating or publishing any pending state.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    component.synchronizeParameterVersion(parameter_version);
+    if (component.has_proposal_)
+      throw std::logic_error(
+          "PsiFormer cannot start a selected-electron proposal before resolving the previous proposal");
+    if (!component.acceptedStateMatches(
+            p_list[walker], parameter_version, AcceptedStateRequirement::VALUE_ONLY))
+      throw std::logic_error(
+          "PsiFormer selected-electron proposal requested before evaluateLog");
+    if (proposed_gradient_list[walker].get().size() < electron_count ||
+        proposed_laplacian_list[walker].get().size() < electron_count)
+      throw std::invalid_argument(
+          "PsiFormer selected-electron proposal output arrays are too small");
+
+    component.resizeProposedSpatialStorage(electron_count);
+    proposed_identities[walker] = configurationIdentity(p_list[walker], moves.slice(walker));
+    const bool reuse_accepted = proposed_identities[walker] == component.accepted_configuration_identity_ &&
+        component.acceptedStateMatches(
+            p_list[walker], parameter_version, AcceptedStateRequirement::FULL_SPATIAL);
+    if (reuse_accepted)
+    {
+      proposed_signs[walker]  = component.current_sign_;
+      proposed_logabs[walker] = std::real(component.log_value_);
+    }
+    else
+    {
+      batch_slots[walker] = resource.walker_indices.size();
+      resource.walker_indices.push_back(walker);
+    }
+  }
+
+  auto& batch = *resource.batch_workspace;
+  pf::DirectBatchSpatialResultView batch_result;
+  if (!resource.walker_indices.empty())
+  {
+    batch.resize(pf::DirectBatchMode::FULL_VGL, resource.walker_indices.size());
+    for (std::size_t slot = 0; slot < resource.walker_indices.size(); ++slot)
+    {
+      const std::size_t walker = resource.walker_indices[slot];
+      packBatchConfiguration(batch, slot, p_list[walker], moves.slice(walker));
+    }
+    batch_result = leader.model_state_->direct_batch_executor.evaluateFull(batch);
+  }
+
+  // Validate the complete native result before any clone advertises a pending transaction.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    const std::size_t slot = batch_slots[walker];
+    if (slot != no_batch_slot)
+    {
+      if (batch_result.parameter_version[slot] != parameter_version)
+        throw std::logic_error(
+            "PsiFormer selected-electron batch observed inconsistent parameters");
+      proposed_signs[walker]  = batch_result.sign[slot];
+      proposed_logabs[walker] = batch_result.logabs[slot];
+    }
+    if (!psiformer::determinant::isFiniteReal(proposed_signs[walker]) ||
+        !psiformer::determinant::isFiniteReal(proposed_logabs[walker]) ||
+        proposed_signs[walker] == 0.0)
+      throw std::runtime_error(
+          "PsiFormer selected-electron proposal produced a non-finite value");
+    staged_log_ratios[walker] =
+        makeLogValue(proposed_signs[walker], proposed_logabs[walker]) - component.log_value_;
+    if (!psiformer::determinant::isFiniteReal(std::real(staged_log_ratios[walker])) ||
+        !psiformer::determinant::isFiniteReal(std::imag(staged_log_ratios[walker])))
+      throw std::runtime_error(
+          "PsiFormer selected-electron proposal produced a non-finite log ratio");
+  }
+
+  // All storage and evaluator checks have completed. Publish every clone-local
+  // proposal and add its complete component VGL contribution without further allocation.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    const std::size_t slot = batch_slots[walker];
+    for (std::size_t electron = 0; electron < electron_count; ++electron)
+    {
+      if (slot == no_batch_slot)
+      {
+        component.proposed_gradient_[electron]  = component.accepted_gradient_[electron];
+        component.proposed_laplacian_[electron] = component.accepted_laplacian_[electron];
+      }
+      else
+      {
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          component.proposed_gradient_[electron][dimension] =
+              batch_result.gradient[slot * batch_result.gradient_stride + 3 * electron + dimension];
+        component.proposed_laplacian_[electron] =
+            batch_result.lap_log[slot * batch_result.laplacian_stride + electron];
+      }
+    }
+
+    component.proposed_sign_                   = proposed_signs[walker];
+    component.proposed_log_value_              =
+        makeLogValue(proposed_signs[walker], proposed_logabs[walker]);
+    component.proposed_configuration_identity_ = proposed_identities[walker];
+    component.proposed_descriptor_fingerprint_ = descriptor_fingerprint;
+    component.proposed_parameter_version_      = parameter_version;
+    component.proposed_particle_               = -1;
+    component.proposal_kind_                   = ProposalKind::SELECTED_PARTICLES;
+    component.has_proposal_                    = true;
+    log_ratios[walker]                         = staged_log_ratios[walker];
+
+    auto& proposed_gradient  = proposed_gradient_list[walker].get();
+    auto& proposed_laplacian = proposed_laplacian_list[walker].get();
+    for (std::size_t electron = 0; electron < electron_count; ++electron)
+    {
+      proposed_gradient[electron] += component.proposed_gradient_[electron];
+      proposed_laplacian[electron] += component.proposed_laplacian_[electron];
+    }
+  }
+}
+
+// Resolve a selected-electron transaction only after validating the complete crowd.
+void PsiFormerWF::mw_accept_rejectMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    const std::vector<bool>& accepted) const
+{
+  const std::size_t walker_count = wfc_list.size();
+  if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
+      accepted.size() != walker_count)
+    throw std::invalid_argument(
+        "PsiFormer selected-electron resolution has inconsistent walker counts");
+  moves.validateFor(p_list);
+  if (walker_count == 0)
+    return;
+
+  const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+  requireMultiWalkerResource(wfc_list);
+  std::shared_lock state_lock(leader.model_state_->mutex);
+  const std::size_t parameter_version = leader.model_state_->model.p.version();
+  const std::uint64_t descriptor_fingerprint = moves.fingerprint();
+  const std::size_t electron_count = leader.model_state_->execution_plan.modelShape().electrons();
+
+  // Observe a concurrent publication across the complete crowd before reporting
+  // any stale proposal; synchronization clears every clone's pending state.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
+        parameter_version);
+
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    if (!component.has_proposal_ ||
+        component.proposal_kind_ != ProposalKind::SELECTED_PARTICLES)
+      throw std::logic_error(
+          "PsiFormer selected-electron resolution has no matching pending proposal");
+    if (component.proposed_descriptor_fingerprint_ != descriptor_fingerprint)
+      throw std::logic_error(
+          "PsiFormer selected-electron resolution descriptor does not match the pending proposal");
+    if (component.proposed_parameter_version_ != parameter_version)
+      throw std::logic_error(
+          "PsiFormer parameters changed during a selected-electron transaction");
+    if (component.proposed_gradient_.size() != electron_count ||
+        component.proposed_laplacian_.size() != electron_count)
+      throw std::logic_error(
+          "PsiFormer selected-electron proposal has incomplete spatial state");
+    if (accepted[walker] &&
+        (component.accepted_gradient_.size() != electron_count ||
+         component.accepted_laplacian_.size() != electron_count))
+      throw std::logic_error(
+          "PsiFormer selected-electron resolution has invalid accepted spatial storage");
+    // Rejection is also used to unwind an earlier component when a later TWF
+    // component fails, before ParticleSet installs proposed coordinates.
+    if (accepted[walker] &&
+        component.proposed_configuration_identity_ != configurationIdentity(p_list[walker]))
+      throw std::logic_error(
+          "PsiFormer accepted selected-electron coordinates do not match the pending proposal");
+  }
+
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    if (accepted[walker])
+    {
+      for (std::size_t electron = 0; electron < electron_count; ++electron)
+      {
+        component.accepted_gradient_[electron]  = component.proposed_gradient_[electron];
+        component.accepted_laplacian_[electron] = component.proposed_laplacian_[electron];
+      }
+      component.current_sign_                   = component.proposed_sign_;
+      component.log_value_                      = component.proposed_log_value_;
+      component.accepted_configuration_identity_ = component.proposed_configuration_identity_;
+      component.accepted_parameter_version_      = parameter_version;
+      component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
+      component.accepted_value_valid_            = true;
+    }
+    component.clearProposalState();
+  }
+}
 
 void PsiFormerWF::mw_recompute(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -2021,6 +2322,9 @@ void PsiFormerWF::mw_recompute(
 
   const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
   auto& resource     = requireMultiWalkerResource(wfc_list);
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
+        "mw_recompute");
   if (leader.model_state_->direct_value_mode != DirectBackendMode::DIRECT)
   {
     WaveFunctionComponent::mw_recompute(wfc_list, p_list, recompute_mask);
@@ -2064,17 +2368,14 @@ void PsiFormerWF::mw_recompute(
         ? AcceptedStateRequirement::FULL_SPATIAL
         : AcceptedStateRequirement::VALUE_ONLY;
     component.accepted_value_valid_ = true;
-    component.proposed_sign_                   = 1.0;
-    component.proposed_log_value_              = LogValue(0);
-    component.proposed_configuration_identity_ = 0;
-    component.proposed_particle_               = -1;
-    component.has_proposal_                     = false;
+    component.clearProposalState();
   }
 }
 
 // Evaluate and cache the wavefunction ratio for one proposed electron position.
 PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
 {
+  requireNoSelectedParticleProposal("ratio");
   auto cache_and_form_ratio = [&](double sign, double logabs) {
     if (!acceptedStateMatches(p, observed_parameter_version_, AcceptedStateRequirement::VALUE_ONLY))
     {
@@ -2084,11 +2385,8 @@ PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
 
     // Cache proposal state so acceptMove can commit it without reevaluating the
     // network.
-    proposed_sign_      = sign;
-    proposed_log_value_ = LogValue(logabs, sign < 0 ? M_PI : 0.0);
-    proposed_configuration_identity_ = configurationIdentity(p, iat);
-    proposed_particle_               = iat;
-    has_proposal_                    = true;
+    cacheSingleParticleProposal(
+        sign, logabs, configurationIdentity(p, iat), iat, observed_parameter_version_);
     return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
   };
 
@@ -2118,6 +2416,9 @@ void PsiFormerWF::mw_calcRatio(
 
   const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
   auto& resource     = requireMultiWalkerResource(wfc_list);
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
+        "mw_calcRatio");
   if (leader.model_state_->direct_value_mode != DirectBackendMode::DIRECT)
   {
     WaveFunctionComponent::mw_calcRatio(wfc_list, p_list, particle_index, ratios);
@@ -2148,12 +2449,10 @@ void PsiFormerWF::mw_calcRatio(
     if (result.parameter_version[walker] != parameter_version)
       throw std::logic_error("PsiFormer ratio batch observed inconsistent parameters");
     auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    component.proposed_sign_ = result.sign[walker];
-    component.proposed_log_value_ = makeLogValue(result.sign[walker], result.logabs[walker]);
-    component.proposed_configuration_identity_ =
-        configurationIdentity(p_list[walker], particle_index);
-    component.proposed_particle_ = particle_index;
-    component.has_proposal_ = true;
+    component.cacheSingleParticleProposal(
+        result.sign[walker], result.logabs[walker],
+        configurationIdentity(p_list[walker], particle_index), particle_index,
+        parameter_version);
     ratios[walker] = makeRatio(result.sign[walker], result.logabs[walker],
                                component.current_sign_, std::real(component.log_value_));
   }
@@ -2244,6 +2543,7 @@ void PsiFormerWF::mw_evalGrad(
 // Evaluate a proposed ratio and gradient in one native-model traversal.
 PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& gradient)
 {
+  requireNoSelectedParticleProposal("ratioGrad");
   auto scatter = [&](double sign, double logabs, const auto& active_gradient) {
     if (!acceptedStateMatches(p, observed_parameter_version_, AcceptedStateRequirement::VALUE_ONLY))
     {
@@ -2253,11 +2553,8 @@ PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& 
 
     // Evaluate the proposal once and return both its ratio and active-electron
     // gradient.
-    proposed_sign_      = sign;
-    proposed_log_value_ = LogValue(logabs, sign < 0 ? M_PI : 0.0);
-    proposed_configuration_identity_ = configurationIdentity(p, iat);
-    proposed_particle_               = iat;
-    has_proposal_                    = true;
+    cacheSingleParticleProposal(
+        sign, logabs, configurationIdentity(p, iat), iat, observed_parameter_version_);
     for (int dimension = 0; dimension < 3; ++dimension)
       gradient[dimension] += active_gradient[dimension];
     return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
@@ -2289,6 +2586,9 @@ void PsiFormerWF::mw_ratioGrad(
 
   const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
   auto& resource     = requireMultiWalkerResource(wfc_list);
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
+        "mw_ratioGrad");
   if (leader.model_state_->direct_spatial_mode != DirectBackendMode::DIRECT)
   {
     WaveFunctionComponent::mw_ratioGrad(wfc_list, p_list, particle_index, ratios, gradients);
@@ -2320,12 +2620,10 @@ void PsiFormerWF::mw_ratioGrad(
     if (result.parameter_version[walker] != parameter_version)
       throw std::logic_error("PsiFormer ratio-gradient batch observed inconsistent parameters");
     auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    component.proposed_sign_ = result.sign[walker];
-    component.proposed_log_value_ = makeLogValue(result.sign[walker], result.logabs[walker]);
-    component.proposed_configuration_identity_ =
-        configurationIdentity(p_list[walker], particle_index);
-    component.proposed_particle_ = particle_index;
-    component.has_proposal_ = true;
+    component.cacheSingleParticleProposal(
+        result.sign[walker], result.logabs[walker],
+        configurationIdentity(p_list[walker], particle_index), particle_index,
+        parameter_version);
     ratios[walker] = makeRatio(result.sign[walker], result.logabs[walker],
                                component.current_sign_, std::real(component.log_value_));
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
@@ -2341,14 +2639,14 @@ void PsiFormerWF::acceptMove(ParticleSet& particles, int particle_index, bool)
   synchronizeParameterVersion(model_state_->model.p.version());
   if (has_proposal_)
   {
-    if (particle_index != proposed_particle_ ||
+    if (proposal_kind_ != ProposalKind::SINGLE_PARTICLE)
+      throw std::logic_error(
+          "PsiFormer single-electron accept cannot resolve a selected-electron proposal");
+    if (proposed_parameter_version_ != observed_parameter_version_ ||
+        particle_index != proposed_particle_ ||
         proposed_configuration_identity_ != configurationIdentity(particles, particle_index))
     {
-      proposed_sign_                   = 1.0;
-      proposed_log_value_              = LogValue(0);
-      proposed_configuration_identity_ = 0;
-      proposed_particle_               = -1;
-      has_proposal_                     = false;
+      clearProposalState();
       throw std::logic_error("PsiFormer accepted move does not match the cached proposal");
     }
     log_value_            = proposed_log_value_;
@@ -2358,11 +2656,7 @@ void PsiFormerWF::acceptMove(ParticleSet& particles, int particle_index, bool)
     accepted_parameter_version_      = observed_parameter_version_;
     accepted_state_requirement_      = AcceptedStateRequirement::VALUE_ONLY;
   }
-  proposed_sign_                   = 1.0;
-  proposed_log_value_              = LogValue(0);
-  proposed_configuration_identity_ = 0;
-  proposed_particle_               = -1;
-  has_proposal_                     = false;
+  clearProposalState();
 }
 
 // Forget cached proposal state after a rejected move.
@@ -2370,13 +2664,16 @@ void PsiFormerWF::restore(int particle_index)
 {
   std::shared_lock state_lock(model_state_->mutex);
   synchronizeParameterVersion(model_state_->model.p.version());
-  if (has_proposal_ && particle_index != proposed_particle_)
-    throw std::logic_error("PsiFormer restored move does not match the cached proposal");
-  proposed_sign_                   = 1.0;
-  proposed_log_value_              = LogValue(0);
-  proposed_configuration_identity_ = 0;
-  proposed_particle_               = -1;
-  has_proposal_                     = false;
+  if (has_proposal_)
+  {
+    if (proposal_kind_ != ProposalKind::SINGLE_PARTICLE)
+      throw std::logic_error(
+          "PsiFormer single-electron restore cannot resolve a selected-electron proposal");
+    if (proposed_parameter_version_ != observed_parameter_version_ ||
+        particle_index != proposed_particle_)
+      throw std::logic_error("PsiFormer restored move does not match the cached proposal");
+  }
+  clearProposalState();
 }
 
 void PsiFormerWF::mw_accept_rejectMove(
@@ -2402,7 +2699,13 @@ void PsiFormerWF::mw_accept_rejectMove(
     if (component.model_state_.get() != leader.model_state_.get())
       throw std::invalid_argument("PsiFormer accept/reject list contains components from different models");
     component.synchronizeParameterVersion(parameter_version);
-    if (component.has_proposal_ && component.proposed_particle_ != particle_index)
+    if (component.has_proposal_ &&
+        component.proposal_kind_ != ProposalKind::SINGLE_PARTICLE)
+      throw std::logic_error(
+          "PsiFormer crowd single-electron resolution cannot resolve a selected-electron proposal");
+    if (component.has_proposal_ &&
+        (component.proposed_parameter_version_ != parameter_version ||
+         component.proposed_particle_ != particle_index))
       throw std::logic_error("PsiFormer crowd accept/reject does not match the cached proposal");
     if (is_accepted[walker] && component.has_proposal_ &&
         component.proposed_configuration_identity_ !=
@@ -2422,17 +2725,14 @@ void PsiFormerWF::mw_accept_rejectMove(
       component.accepted_parameter_version_      = parameter_version;
       component.accepted_state_requirement_      = AcceptedStateRequirement::VALUE_ONLY;
     }
-    component.proposed_sign_                   = 1.0;
-    component.proposed_log_value_              = LogValue(0);
-    component.proposed_configuration_identity_ = 0;
-    component.proposed_particle_               = -1;
-    component.has_proposal_                     = false;
+    component.clearProposalState();
   }
 }
 
 // Reserve fixed bulk and scalar slots without assuming that registration follows evaluation.
 void PsiFormerWF::registerData(ParticleSet& particles, WFBufferType& buffer)
 {
+  requireNoSelectedParticleProposal("registerData");
   static_assert(std::numeric_limits<FullPrecRealType>::digits >= 32,
                 "PsiFormer walker metadata requires exact 32-bit scalar limbs");
   if (particles.getTotalNum() != static_cast<int>(model_state_->model.ne))
@@ -2450,6 +2750,7 @@ PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& particles,
                                                 WFBufferType& buffer,
                                                 bool from_scratch)
 {
+  requireNoSelectedParticleProposal("updateBuffer");
   std::size_t parameter_version;
   bool can_reuse;
   {
@@ -2481,6 +2782,7 @@ PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& particles,
 // Restore only records whose model, parameter, configuration, and products match.
 void PsiFormerWF::copyFromBuffer(ParticleSet& particles, WFBufferType& buffer)
 {
+  requireNoSelectedParticleProposal("copyFromBuffer");
   std::shared_lock state_lock(model_state_->mutex);
   const std::size_t parameter_version = model_state_->model.p.version();
   synchronizeParameterVersion(parameter_version);

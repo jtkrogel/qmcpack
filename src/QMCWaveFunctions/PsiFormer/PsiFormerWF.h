@@ -235,6 +235,25 @@ public:
                      const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list,
                      bool from_scratch) const override;
 
+  /// PsiFormer can evaluate one atomic selected-electron proposal per walker.
+  bool supportsMultiParticleMoves() const noexcept override { return true; }
+
+  /// Evaluate complete proposed VGL state from descriptor-owned absolute positions.
+  void mw_evaluateMultiParticleMove(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::vector<LogValue>& log_ratios,
+      const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
+      const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const override;
+
+  /// Atomically promote or discard each clone's complete selected-electron proposal.
+  void mw_accept_rejectMultiParticleMove(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      const std::vector<bool>& accepted) const override;
+
   /// Refresh selected accepted values without serial component dispatch.
   void mw_recompute(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                     const RefVectorWithLeader<ParticleSet>& p_list,
@@ -419,6 +438,14 @@ private:
     FULL_SPATIAL = 2
   };
 
+  /// Distinguish legacy one-electron proposals from selected-electron transactions.
+  enum class ProposalKind : std::uint64_t
+  {
+    NONE,
+    SINGLE_PARTICLE,
+    SELECTED_PARTICLES
+  };
+
   /// Evaluate an accepted or proposed configuration for one public-call purpose.
   pf::Result evaluate(const ParticleSet& particles,
                       int replaced_particle,
@@ -539,6 +566,22 @@ private:
   /// Lazily invalidate this clone when another clone changed the shared parameters.
   void synchronizeParameterVersion(std::size_t parameter_version);
 
+  /// Reset every pending-proposal discriminator while retaining reusable vector capacity.
+  void clearProposalState();
+
+  /// Publish one legacy one-electron proposal with an explicit parameter-version key.
+  void cacheSingleParticleProposal(double sign,
+                                   double logabs,
+                                   std::uint64_t configuration_identity,
+                                   int particle,
+                                   std::size_t parameter_version);
+
+  /// Reject lifecycle operations that could silently overwrite a selected transaction.
+  void requireNoSelectedParticleProposal(const char* operation) const;
+
+  /// Resize clone-local complete proposed G/L storage without publishing a proposal.
+  void resizeProposedSpatialStorage(std::size_t electron_count);
+
   /// Resize clone-local accepted G/L storage to one runtime electron configuration.
   void resizeAcceptedSpatialStorage(std::size_t electron_count);
 
@@ -604,10 +647,18 @@ private:
   /// Accepted and proposed sign/log-value state used by particle-by-particle moves.
   double current_sign_ = 1.0, proposed_sign_ = 1.0;
   LogValue proposed_log_value_ = LogValue(0);
+  /// Complete component-only spatial products retained during a selected transaction.
+  ParticleSet::ParticleGradient proposed_gradient_;
+  ParticleSet::ParticleLaplacian proposed_laplacian_;
   /// Fingerprint and electron index associated with the pending proposal.
   std::uint64_t proposed_configuration_identity_ = 0;
+  /// Exact descriptor identity required by selected-particle resolution.
+  std::uint64_t proposed_descriptor_fingerprint_ = 0;
+  /// Parameter version used to evaluate the pending proposal.
+  std::size_t proposed_parameter_version_ = 0;
   int proposed_particle_ = -1;
-  bool has_proposal_           = false;
+  ProposalKind proposal_kind_ = ProposalKind::NONE;
+  bool has_proposal_          = false;
 
   friend class testing::TestPsiFormerWF;
 };
