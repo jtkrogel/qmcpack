@@ -30,6 +30,7 @@
 namespace qmcplusplus
 {
 class NonLocalECPComponent;
+class NLPPVirtualBatchStorage;
 template<typename T>
 struct NLPPJob;
 
@@ -132,11 +133,12 @@ public:
   /** make non local moves for a batch of walkers
    *
    * For TmoveKind::V1 the candidate-ratio evaluations of each electron are
-   * batched across walkers through NonLocalECPComponent::mw_evaluateOne,
-   * synchronizing walkers at electron-index granularity; move selection and
-   * the (rare) accepts stay per walker, so each walker reproduces the
-   * sequential single-walker v1 sweep, including its RNG draw order. Other
-   * T-move kinds fall back to the per-walker implementation.
+   * batched across walkers.  The VP path flattens every current-electron job
+   * into bounded outer tiles; the non-VP path retains the legacy job
+   * wavefront.  Move selection and the (rare) accepts stay per walker, so each
+   * walker reproduces the sequential single-walker v1 sweep, including its
+   * RNG draw order. Other T-move kinds fall back to the per-walker
+   * implementation.
    *
    * @return the number of accepted moves per walker
    */
@@ -272,6 +274,34 @@ private:
                                          bool compute_txy_all,
                                          const std::optional<ListenerOption<Real>>& listeners,
                                          bool keep_grid);
+
+  /** Consume all packed outer tiles belonging to one already prepared electron group. */
+  static void mw_consumeFlattenedVPPreparedGroup(
+      NonLocalECPotentialMultiWalkerResource& resource,
+      const RefVectorWithLeader<OperatorBase>& o_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      int group,
+      bool compute_txy_all,
+      bool accumulate_pair_results,
+      const std::optional<ListenerOption<Real>>& listeners,
+      bool& have_reference_stamps,
+      bool& have_nonfermionic_reference_stamps,
+      bool& tile_available);
+
+  /** Build one V1 electron's VP candidates without crossing its selection boundary. */
+  static NLPPVirtualBatchStorage& mw_evaluateV1ElectronCandidates(
+      const RefVectorWithLeader<OperatorBase>& o_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      int group,
+      int electron);
+
+  /** Size reusable VP V1 metadata and component scratch before an electron sweep. */
+  static void mw_prepareV1FlattenedVPResource(const RefVectorWithLeader<OperatorBase>& o_list,
+                                               const RefVectorWithLeader<ParticleSet>& p_list);
 
   /** the actual implementation, used by evaluate and evaluateWithToperator
    * @param P particle set

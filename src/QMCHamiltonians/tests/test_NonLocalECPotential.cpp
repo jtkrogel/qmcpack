@@ -30,6 +30,7 @@
 #include "QMCHamiltonians/NonLocalECPComponent.h"
 #include "QMCHamiltonians/NonLocalTOperator.h"
 #include "QMCHamiltonians/NLPPJob.h"
+#include "QMCHamiltonians/NLPPVirtualBatch.h"
 #include "QMCWaveFunctions/ConstantOrbital.h"
 #include "QMCWaveFunctions/Jastrow/RadialJastrowBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
@@ -248,6 +249,44 @@ public:
     const auto component = std::find_if(
         nl_ecp.PPset.begin(), nl_ecp.PPset.end(), [](const auto& candidate) { return bool(candidate); });
     return component == nl_ecp.PPset.end() ? 0 : (*component)->getNknot();
+  }
+
+  /** Evaluate one prepared V1 electron through the production flattened VP seam. */
+  static std::vector<std::vector<NonLocalData>> evaluateFlattenedV1Candidates(
+      NonLocalECPotential& leader,
+      const RefVectorWithLeader<OperatorBase>& potentials,
+      const RefVectorWithLeader<TrialWaveFunction>& wavefunctions,
+      const RefVectorWithLeader<ParticleSet>& particles,
+      int group,
+      int electron)
+  {
+    NonLocalECPotential::mw_prepareV1FlattenedVPResource(potentials, particles);
+    TrialWaveFunction::mw_prepareGroup(wavefunctions, particles, group);
+
+    RefVectorWithLeader<VirtualParticleSet> vp_scratch_list(*leader.vp_);
+    vp_scratch_list.reserve(potentials.size());
+    for (std::size_t walker = 0; walker < potentials.size(); ++walker)
+      vp_scratch_list.push_back(
+          *potentials.getCastedElement<NonLocalECPotential>(walker).vp_);
+
+    const NLPPVirtualBatchStorage& storage =
+        NonLocalECPotential::mw_evaluateV1ElectronCandidates(
+            potentials, wavefunctions, particles, vp_scratch_list, group, electron);
+    std::vector<std::vector<NonLocalData>> result(potentials.size());
+    for (std::size_t walker = 0; walker < potentials.size(); ++walker)
+      result[walker] = storage.walkerCandidates(walker);
+    return result;
+  }
+
+  /** Evaluate one V1 electron through the established scalar component path. */
+  static std::vector<NonLocalData> evaluateScalarV1Candidates(NonLocalECPotential& potential,
+                                                               TrialWaveFunction& wavefunction,
+                                                               ParticleSet& particles,
+                                                               int electron)
+  {
+    std::vector<NonLocalData> result;
+    potential.computeOneElectronTxy(wavefunction, particles, electron, result);
+    return result;
   }
 
   struct ListenerRows
@@ -544,11 +583,15 @@ bool samePositionBits(const QMCTraits::PosType& left, const QMCTraits::PosType& 
 /** Shared controls for a deterministic generic flattened-ratio test component. */
 struct StampedRatioControl
 {
+  int scalar_calls          = 0;
   int flattened_calls       = 0;
   int change_version_at_call = 0;
   int throw_after_call       = 0;
   std::uint64_t version      = 7;
   QMCTraits::ValueType ratio = QMCTraits::ValueType(1);
+  std::size_t maximum_segments = 0;
+  bool saw_repeated_walker     = false;
+  bool saw_mixed_electrons     = false;
 };
 
 QMCTraits::ValueType makeStampedRatio(QMCTraits::RealType real_part,
@@ -578,6 +621,7 @@ public:
   {
     if (ratios.size() != static_cast<std::size_t>(virtual_particles.getTotalNum()))
       throw std::invalid_argument("StampedRatioOrbital received a mismatched ratio extent.");
+    ++control_->scalar_calls;
     std::fill(ratios.begin(), ratios.end(), control_->ratio);
   }
 
@@ -592,6 +636,15 @@ public:
     const EvaluationStamp stamp = EvaluationStamp::versioned(
         control_.get(), control_->version + (control_->change_version_at_call > 0 &&
                                               call >= control_->change_version_at_call));
+    control_->maximum_segments = std::max(control_->maximum_segments, batch.segmentCount());
+    for (std::size_t segment = 0; segment < batch.segmentCount(); ++segment)
+      for (std::size_t prior = 0; prior < segment; ++prior)
+      {
+        control_->saw_repeated_walker |=
+            batch.segment(segment).walkerId() == batch.segment(prior).walkerId();
+        control_->saw_mixed_electrons |=
+            batch.segment(segment).electronId() != batch.segment(prior).electronId();
+      }
     WaveFunctionComponent::mw_evaluateVirtualRatios(component_list, particle_list, vp_scratch_list,
                                                      batch, ratios);
     if (control_->throw_after_call == call)
@@ -1184,6 +1237,149 @@ TEST_CASE("NonLocalECPotential flattened TMDLA stamp streams publish atomically"
   CHECK(sameNLPPPublicState(potential, initial, electrons.getTotalNum(), ions.getTotalNum()));
 }
 
+TEST_CASE("NonLocalECPotential flattened V1 electron candidates match scalar bits",
+          "[hamiltonian][ecp][nlpp_v1_flattened]")
+{
+  using Real = QMCTraits::RealType;
+
+  for (const bool use_dla : {false, true})
+  {
+    const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+    ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+    ParticleSet electrons = makeTmoveV1Elec(
+        simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+
+    RuntimeOptions runtime_options;
+    TrialWaveFunction wavefunction(runtime_options);
+    auto fermionic_control      = std::make_shared<StampedRatioControl>();
+    auto nonfermionic_control   = std::make_shared<StampedRatioControl>();
+    fermionic_control->ratio    = makeStampedRatio(Real(-0.75), Real(0.5));
+    nonfermionic_control->ratio = makeStampedRatio(Real(-1.25), Real(0.75));
+    wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(fermionic_control, true));
+    wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(nonfermionic_control, false));
+
+    NonLocalECPotential potential(ions, electrons, use_dla, true);
+    potential.addComponent(0, readTmoveV1PPComponent());
+    testing::TestNonLocalECPotential::copyGridUnrotatedForTest(potential);
+    const int knot_count = testing::TestNonLocalECPotential::firstComponentKnotCount(potential);
+    REQUIRE(knot_count > 1);
+    // The first tile contains a whole ion job plus the first knot of the next,
+    // proving that several same-walker jobs share one flattened descriptor;
+    // the second job also continues into a tail tile.
+    testing::TestNonLocalECPotential::setOuterTileCapacity(
+        potential, static_cast<std::size_t>(knot_count + 1));
+
+    testing::TestNonLocalECPotential::evaluateImpl(
+        potential, wavefunction, electrons, false, true);
+    wavefunction.prepareGroup(electrons, 0);
+    const auto scalar_candidates =
+        testing::TestNonLocalECPotential::evaluateScalarV1Candidates(
+            potential, wavefunction, electrons, 0);
+    const NLPPPublicSnapshot public_before = snapshotNLPPPublicState(
+        potential, electrons.getTotalNum(), ions.getTotalNum());
+
+    RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+    RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+    RefVectorWithLeader<OperatorBase> potentials(potential, {potential});
+    ResourceCollection particle_resources("flattened_v1_candidate_particles");
+    ResourceCollection potential_resources("flattened_v1_candidate_potential");
+    electrons.createResource(particle_resources);
+    potential.createResource(potential_resources);
+    ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+    ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+    fermionic_control->flattened_calls       = 0;
+    fermionic_control->maximum_segments      = 0;
+    fermionic_control->saw_repeated_walker   = false;
+    fermionic_control->saw_mixed_electrons   = false;
+    nonfermionic_control->flattened_calls     = 0;
+    nonfermionic_control->maximum_segments    = 0;
+    nonfermionic_control->saw_repeated_walker = false;
+    nonfermionic_control->saw_mixed_electrons = false;
+    const auto flattened_candidates =
+        testing::TestNonLocalECPotential::evaluateFlattenedV1Candidates(
+            potential, potentials, wavefunctions, particles, 0, 0);
+
+    REQUIRE(flattened_candidates.size() == 1);
+    CHECK(sameCandidates(flattened_candidates[0], scalar_candidates));
+    CHECK(flattened_candidates[0].size() == static_cast<std::size_t>(2 * knot_count));
+    CHECK(fermionic_control->flattened_calls == 2);
+    CHECK(fermionic_control->maximum_segments == 2);
+    CHECK(fermionic_control->saw_repeated_walker);
+    CHECK_FALSE(fermionic_control->saw_mixed_electrons);
+    CHECK(nonfermionic_control->flattened_calls == 2);
+    CHECK(nonfermionic_control->maximum_segments == 2);
+    CHECK(nonfermionic_control->saw_repeated_walker);
+    CHECK_FALSE(nonfermionic_control->saw_mixed_electrons);
+    CHECK(sameNLPPPublicState(
+        potential, public_before, electrons.getTotalNum(), ions.getTotalNum()));
+  }
+}
+
+TEST_CASE("NonLocalECPotential flattened V1 tile failure precedes selection and permits retry",
+          "[hamiltonian][ecp][nlpp_v1_flattened][atomic]")
+{
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  auto control = std::make_shared<StampedRatioControl>();
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(control, true));
+
+  NonLocalECPotential potential(ions, electrons, false, true);
+  potential.addComponent(0, readTmoveV1PPComponent());
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(potential);
+  const int knot_count = testing::TestNonLocalECPotential::firstComponentKnotCount(potential);
+  REQUIRE(knot_count > 1);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(
+      potential, static_cast<std::size_t>(knot_count + 1));
+
+  // Establish the public neighbor lists consumed by V1 and nontrivial public
+  // candidates that a failed private per-electron rebuild must not replace.
+  testing::TestNonLocalECPotential::evaluateImpl(
+      potential, wavefunction, electrons, true, true);
+  const NLPPPublicSnapshot public_before = snapshotNLPPPublicState(
+      potential, electrons.getTotalNum(), ions.getTotalNum());
+  const std::vector<QMCTraits::PosType> positions_before(electrons.R.begin(), electrons.R.end());
+
+  StdRandom<FullPrecReal> rng(271828u);
+  potential.setRandomGenerator(&rng);
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential});
+  ResourceCollection particle_resources("flattened_v1_atomic_particles");
+  ResourceCollection potential_resources("flattened_v1_atomic_potential");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  NonLocalTOperator move_operator(TmoveKind::V1, 0.5, 0.0, 0.0);
+  control->flattened_calls        = 0;
+  control->change_version_at_call = 2;
+  CHECK_THROWS_AS(
+      NonLocalECPotential::mw_makeNonLocalMovesPbyP(
+          potentials, wavefunctions, particles, move_operator),
+      std::runtime_error);
+  CHECK(control->flattened_calls == 2);
+  REQUIRE(electrons.R.size() == positions_before.size());
+  for (std::size_t particle = 0; particle < positions_before.size(); ++particle)
+    CHECK(samePositionBits(electrons.R[particle], positions_before[particle]));
+  CHECK(sameNLPPPublicState(
+      potential, public_before, electrons.getTotalNum(), ions.getTotalNum()));
+
+  control->flattened_calls        = 0;
+  control->change_version_at_call = 0;
+  CHECK_NOTHROW(NonLocalECPotential::mw_makeNonLocalMovesPbyP(
+      potentials, wavefunctions, particles, move_operator));
+  CHECK(control->flattened_calls > 2);
+}
+
 TEST_CASE("NonLocalECPotential clone owns neighbor-list binding and staged publication",
           "[hamiltonian][ecp][resource]")
 {
@@ -1685,13 +1881,14 @@ struct TmoveV1Result
 {
   std::vector<int> accepts;
   std::vector<QMCTraits::PosType> final_R;
+  std::vector<QMCTraits::FullPrecRealType> next_rng_values;
 };
 
 /** run a two-walker v1 T-move sweep with fixed quadrature grids and
  *  per-walker seeded RNGs; batched and serial paths must agree walker by
  *  walker in accepted counts and final electron positions.
  */
-TmoveV1Result runTmoveV1(bool batched, bool use_VP)
+TmoveV1Result runTmoveV1(bool batched, bool use_VP, bool use_DLA = false)
 {
   using FullPrecReal = QMCTraits::FullPrecRealType;
 
@@ -1710,8 +1907,10 @@ TmoveV1Result runTmoveV1(bool batched, bool use_VP)
   TrialWaveFunction psi2(runtime_options);
   RefVectorWithLeader<TrialWaveFunction> twf_list(psi, {psi, psi2});
 
-  NonLocalECPotential nl_ecp(ions, elec, false /*enable_DLA*/, use_VP);
+  NonLocalECPotential nl_ecp(ions, elec, use_DLA, use_VP);
   nl_ecp.addComponent(0, readTmoveV1PPComponent());
+  if (use_VP)
+    testing::TestNonLocalECPotential::setOuterTileCapacity(nl_ecp, 3);
   UPtr<OperatorBase> nl_ecp2_ptr = nl_ecp.makeClone(elec2, psi2);
   auto& nl_ecp2                  = dynamic_cast<NonLocalECPotential&>(*nl_ecp2_ptr);
 
@@ -1749,6 +1948,7 @@ TmoveV1Result runTmoveV1(bool batched, bool use_VP)
     res.final_R.push_back(elec.R[iat]);
   for (int iat = 0; iat < elec2.getTotalNum(); ++iat)
     res.final_R.push_back(elec2.R[iat]);
+  res.next_rng_values = {rng(), rng2()};
   return res;
 }
 } // namespace
@@ -1768,8 +1968,133 @@ TEST_CASE("NonLocalECPotential Tmove v1 batched matches serial", "[hamiltonian]"
 
     REQUIRE(serial.final_R.size() == batched.final_R.size());
     for (size_t i = 0; i < serial.final_R.size(); ++i)
-      for (int d = 0; d < 3; ++d)
-        CHECK(serial.final_R[i][d] == Approx(batched.final_R[i][d]).epsilon(1e-12));
+      CHECK(samePositionBits(serial.final_R[i], batched.final_R[i]));
+    CHECK(serial.next_rng_values == batched.next_rng_values);
+  }
+}
+
+TEST_CASE("NonLocalECPotential flattened TMDLA V1 seeded sweep matches scalar bits",
+          "[hamiltonian][ecp][nlpp_v1_flattened]")
+{
+  const auto scalar    = runTmoveV1(false, true, true);
+  const auto flattened = runTmoveV1(true, true, true);
+
+  CHECK(flattened.accepts == scalar.accepts);
+  REQUIRE(flattened.final_R.size() == scalar.final_R.size());
+  for (std::size_t particle = 0; particle < scalar.final_R.size(); ++particle)
+    CHECK(samePositionBits(flattened.final_R[particle], scalar.final_R[particle]));
+  CHECK(flattened.next_rng_values == scalar.next_rng_values);
+  CHECK(std::accumulate(flattened.accepts.begin(), flattened.accepts.end(), 0) > 0);
+}
+
+namespace
+{
+struct TmoveFallbackResult
+{
+  std::vector<int> accepts;
+  std::vector<QMCTraits::PosType> final_R;
+  std::vector<QMCTraits::FullPrecRealType> next_rng_values;
+  int scalar_ratio_calls;
+  int flattened_ratio_calls;
+};
+
+/** Run the unchanged V0/V3 per-walker fallback after one flattened VP energy evaluation. */
+TmoveFallbackResult runTmoveFallback(TmoveKind move_kind, bool batched)
+{
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, kTmoveV1Walker1Elec1Pos, {-0.4, 0.6, -0.3});
+  ParticleSet electrons2(electrons);
+  electrons2.R[1] = kTmoveV1Walker2Elec1Pos;
+  electrons2.update();
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  TrialWaveFunction wavefunction2(runtime_options);
+  auto control = std::make_shared<StampedRatioControl>();
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(control, true));
+  wavefunction2.addComponent(std::make_unique<StampedRatioOrbital>(control, true));
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      wavefunction, {wavefunction, wavefunction2});
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons, electrons2});
+
+  NonLocalECPotential potential(ions, electrons, false, true);
+  potential.addComponent(0, readTmoveV1PPComponent());
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 3);
+  UPtr<OperatorBase> potential2_storage = potential.makeClone(electrons2, wavefunction2);
+  auto& potential2 = dynamic_cast<NonLocalECPotential&>(*potential2_storage);
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(potential);
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(potential2);
+
+  StdRandom<FullPrecReal> rng(kTmoveV1Walker1Seed);
+  StdRandom<FullPrecReal> rng2(kTmoveV1Walker2Seed);
+  potential.setRandomGenerator(&rng);
+  potential2.setRandomGenerator(&rng2);
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential, potential2});
+
+  ResourceCollection particle_resources("tmove_fallback_particles");
+  ResourceCollection potential_resources("tmove_fallback_potentials");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  testing::TestNonLocalECPotential::mw_evaluateImpl(
+      potential, potentials, wavefunctions, particles, true, std::nullopt, true);
+  control->scalar_calls    = 0;
+  control->flattened_calls = 0;
+
+  // A large step makes the fixed-seed V3 fixture accept an early move and
+  // therefore exercise its affected-electron scalar candidate recomputation.
+  NonLocalTOperator move_operator(move_kind, 10.0, 0.0, 0.0);
+  TmoveFallbackResult result;
+  if (batched)
+    result.accepts = NonLocalECPotential::mw_makeNonLocalMovesPbyP(
+        potentials, wavefunctions, particles, move_operator);
+  else
+  {
+    result.accepts.resize(2);
+    result.accepts[0] = potential.makeNonLocalMovesPbyP(wavefunction, electrons, move_operator);
+    result.accepts[1] = potential2.makeNonLocalMovesPbyP(wavefunction2, electrons2, move_operator);
+  }
+  for (const auto& position : electrons.R)
+    result.final_R.push_back(position);
+  for (const auto& position : electrons2.R)
+    result.final_R.push_back(position);
+  result.next_rng_values       = {rng(), rng2()};
+  result.scalar_ratio_calls    = control->scalar_calls;
+  result.flattened_ratio_calls = control->flattened_calls;
+  return result;
+}
+} // namespace
+
+TEST_CASE("NonLocalECPotential V0 and V3 remain exact scalar fallbacks",
+          "[hamiltonian][ecp][nlpp_v1_flattened][fallback]")
+{
+  for (const TmoveKind move_kind : {TmoveKind::V0, TmoveKind::V3})
+  {
+    const TmoveFallbackResult scalar  = runTmoveFallback(move_kind, false);
+    const TmoveFallbackResult batched = runTmoveFallback(move_kind, true);
+
+    CHECK(batched.accepts == scalar.accepts);
+    REQUIRE(batched.final_R.size() == scalar.final_R.size());
+    for (std::size_t particle = 0; particle < scalar.final_R.size(); ++particle)
+      CHECK(samePositionBits(batched.final_R[particle], scalar.final_R[particle]));
+    CHECK(batched.next_rng_values == scalar.next_rng_values);
+    CHECK(batched.scalar_ratio_calls == scalar.scalar_ratio_calls);
+    CHECK(batched.flattened_ratio_calls == 0);
+    CHECK(scalar.flattened_ratio_calls == 0);
+
+    if (move_kind == TmoveKind::V0)
+      CHECK(batched.scalar_ratio_calls == 0);
+    else
+    {
+      CHECK(std::accumulate(batched.accepts.begin(), batched.accepts.end(), 0) > 0);
+      CHECK(batched.scalar_ratio_calls > 0);
+    }
   }
 }
 
@@ -1828,6 +2153,8 @@ TmoveV1Result runTmoveV1Ragged(bool batched, bool use_VP)
 
   NonLocalECPotential nl_ecp(ions, elec, false /*enable_DLA*/, use_VP);
   nl_ecp.addComponent(0, readTmoveV1PPComponent());
+  if (use_VP)
+    testing::TestNonLocalECPotential::setOuterTileCapacity(nl_ecp, 3);
   UPtr<OperatorBase> nl_ecp2_ptr = nl_ecp.makeClone(elec2, psi2);
   auto& nl_ecp2                  = dynamic_cast<NonLocalECPotential&>(*nl_ecp2_ptr);
   UPtr<OperatorBase> nl_ecp3_ptr = nl_ecp.makeClone(elec3, psi3);
@@ -1880,6 +2207,7 @@ TmoveV1Result runTmoveV1Ragged(bool batched, bool use_VP)
     res.final_R.push_back(elec2.R[iat]);
   for (int iat = 0; iat < elec3.getTotalNum(); ++iat)
     res.final_R.push_back(elec3.R[iat]);
+  res.next_rng_values = {rng(), rng2(), rng3()};
   return res;
 }
 } // namespace
@@ -1899,8 +2227,8 @@ TEST_CASE("NonLocalECPotential Tmove v1 batched matches serial, ragged candidate
 
     REQUIRE(serial.final_R.size() == batched.final_R.size());
     for (size_t i = 0; i < serial.final_R.size(); ++i)
-      for (int d = 0; d < 3; ++d)
-        CHECK(serial.final_R[i][d] == Approx(batched.final_R[i][d]).epsilon(1e-12));
+      CHECK(samePositionBits(serial.final_R[i], batched.final_R[i]));
+    CHECK(serial.next_rng_values == batched.next_rng_values);
   }
 }
 
@@ -1929,6 +2257,8 @@ TmoveV1Result runTmoveV1SingleWalker(bool batched, bool use_VP, const QMCTraits:
 
   NonLocalECPotential nl_ecp(ions, elec, false /*enable_DLA*/, use_VP);
   nl_ecp.addComponent(0, readTmoveV1PPComponent());
+  if (use_VP)
+    testing::TestNonLocalECPotential::setOuterTileCapacity(nl_ecp, 3);
 
   StdRandom<FullPrecReal> rng(rng_seed);
   nl_ecp.setRandomGenerator(&rng);
@@ -1958,6 +2288,7 @@ TmoveV1Result runTmoveV1SingleWalker(bool batched, bool use_VP, const QMCTraits:
   }
   for (int iat = 0; iat < elec.getTotalNum(); ++iat)
     res.final_R.push_back(elec.R[iat]);
+  res.next_rng_values = {rng()};
   return res;
 }
 } // namespace
@@ -1986,8 +2317,8 @@ TEST_CASE("NonLocalECPotential Tmove v1 batched matches serial, single walker", 
 
       REQUIRE(serial.final_R.size() == batched.final_R.size());
       for (size_t i = 0; i < serial.final_R.size(); ++i)
-        for (int d = 0; d < 3; ++d)
-          CHECK(serial.final_R[i][d] == Approx(batched.final_R[i][d]).epsilon(1e-12));
+        CHECK(samePositionBits(serial.final_R[i], batched.final_R[i]));
+      CHECK(serial.next_rng_values == batched.next_rng_values);
     }
     // a sweep with no accepted move anywhere would leave the accept path untested
     CHECK(total_accepts > 0);

@@ -384,6 +384,138 @@ void NonLocalECPotential::mw_evaluatePerParticleWithToperator(
   mw_evaluateImpl(o_list, wf_list, p_list, true, l_opt);
 }
 
+void NonLocalECPotential::mw_consumeFlattenedVPPreparedGroup(
+    NonLocalECPotentialMultiWalkerResource& resource,
+    const RefVectorWithLeader<OperatorBase>& o_list,
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    int group,
+    bool compute_txy_all,
+    bool accumulate_pair_results,
+    const std::optional<ListenerOption<Real>>& listeners,
+    bool& have_reference_stamps,
+    bool& have_nonfermionic_reference_stamps,
+    bool& tile_available)
+{
+  auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
+
+  while (tile_available)
+  {
+    const auto& segments = resource.virtual_batch->tileSegments();
+    if (segments.empty())
+      throw std::logic_error("NonLocalECPotential packed an empty active tile.");
+    if (segments.front().groupId() > group)
+      break;
+    if (segments.front().groupId() != group)
+      throw std::logic_error("NonLocalECPotential tile traversal left canonical group order.");
+
+    auto& absolute_positions = resource.virtual_batch->mutableTileAbsolutePositions();
+    auto& deltas             = resource.virtual_batch->mutableTileDeltas();
+    auto& bare_weights       = resource.virtual_batch->mutableTileBareWeights();
+    for (const auto& segment : segments)
+    {
+      const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
+      auto& potential          = o_list.getCastedElement<NonLocalECPotential>(walker);
+      const auto& group_jobs   = resource.staged_jobs[walker][group];
+      if (segment.walkerJobOrdinal() >= group_jobs.size())
+        throw std::logic_error("NonLocalECPotential tile references an absent staged job.");
+      const auto& job = group_jobs[segment.walkerJobOrdinal()];
+      if (job.ion_id != segment.ionId() || job.electron_id != segment.electronId())
+        throw std::logic_error("NonLocalECPotential tile identity disagrees with its staged job.");
+
+      potential.PP[job.ion_id]->buildQuadraturePointRange(
+          job.ion_elec_dist, job.ion_elec_displ, p_list[walker].R[job.electron_id],
+          segment.firstKnot(), segment.knotCount(), segment.tileOffset(), deltas,
+          absolute_positions, bare_weights, resource.radial_scratch, resource.legendre_scratch);
+    }
+
+    resource.virtual_batch->finalizeTileInput();
+    const VirtualParticleBatch descriptor = resource.virtual_batch->makeVirtualParticleBatch();
+    descriptor.validateFor(p_list, static_cast<std::size_t>(leader.IonConfig.getTotalNum()));
+
+    auto& ratios         = resource.virtual_batch->mutableTileRatios();
+    const bool use_tmdla = leader.use_DLA && compute_txy_all;
+    auto evaluate_and_validate_stamps =
+        [&](std::vector<ValueType>& selected_ratios,
+            TrialWaveFunction::ComputeType compute_type,
+            std::vector<TrialWaveFunction::EvaluationStamp>& tile_stamps,
+            std::vector<TrialWaveFunction::EvaluationStamp>& reference_stamps,
+            bool& have_reference,
+            const char* stream_name) {
+          tile_stamps.clear();
+          TrialWaveFunction::mw_evaluateVirtualRatios(
+              wf_list, p_list, vp_scratch_list, descriptor, selected_ratios, tile_stamps, compute_type);
+
+          if (!have_reference)
+          {
+            reference_stamps = tile_stamps;
+            have_reference   = true;
+          }
+          else if (tile_stamps != reference_stamps)
+            throw std::runtime_error(
+                std::string("NonLocalECPotential observed different wavefunction parameter versions across ") +
+                stream_name + " outer tiles.");
+        };
+
+    std::vector<ValueType>* fermionic_ratios = nullptr;
+    if (use_tmdla)
+    {
+      auto& selected_fermionic_ratios = resource.virtual_batch->mutableTileFermionicRatios();
+      evaluate_and_validate_stamps(
+          selected_fermionic_ratios, TrialWaveFunction::ComputeType::FERMIONIC,
+          resource.tile_stamps, resource.reference_stamps, have_reference_stamps, "fermionic");
+
+      auto& nonfermionic_ratios = resource.virtual_batch->mutableTileNonfermionicRatios();
+      evaluate_and_validate_stamps(
+          nonfermionic_ratios, TrialWaveFunction::ComputeType::NONFERMIONIC,
+          resource.nonfermionic_tile_stamps, resource.nonfermionic_reference_stamps,
+          have_nonfermionic_reference_stamps, "nonfermionic");
+
+      if (ratios.size() != selected_fermionic_ratios.size() || ratios.size() != nonfermionic_ratios.size())
+        throw std::logic_error("NonLocalECPotential TMDLA ratio buffers have inconsistent sizes.");
+      for (std::size_t ratio = 0; ratio < ratios.size(); ++ratio)
+      {
+        ratios[ratio] = nonfermionic_ratios[ratio];
+        ratios[ratio] *= selected_fermionic_ratios[ratio];
+      }
+      fermionic_ratios = &selected_fermionic_ratios;
+    }
+    else
+      evaluate_and_validate_stamps(
+          ratios,
+          leader.use_DLA ? TrialWaveFunction::ComputeType::FERMIONIC
+                         : TrialWaveFunction::ComputeType::ALL,
+          resource.tile_stamps, resource.reference_stamps, have_reference_stamps, "selected");
+
+    auto& transformed_weights = resource.virtual_batch->mutableTileTransformedWeights();
+    for (const auto& segment : segments)
+    {
+      const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
+      std::vector<NonLocalData>* candidates =
+          compute_txy_all ? &resource.virtual_batch->walkerCandidates(walker) : nullptr;
+      Real& pair_potential = resource.virtual_batch->jobPairPotential(segment.globalJobId());
+      NonLocalECPComponent::reduceQuadraturePointRange(
+          segment.electronId(), segment.tileOffset(), segment.knotCount(),
+          resource.virtual_batch->tileDeltas(), resource.virtual_batch->tileBareWeights(), ratios,
+          fermionic_ratios, segment.tileOffset(), transformed_weights, segment.walkerKnotOffset(), candidates,
+          pair_potential);
+
+      if (accumulate_pair_results && segment.endsJob())
+      {
+        resource.staged_values[walker] += pair_potential;
+        if (listeners)
+        {
+          resource.ve_samples(walker, segment.electronId()) += Real(0.5) * pair_potential;
+          resource.vi_samples(walker, segment.ionId()) += Real(0.5) * pair_potential;
+        }
+      }
+    }
+
+    tile_available = resource.virtual_batch->packNextTile();
+  }
+}
+
 void NonLocalECPotential::mw_evaluateImplFlattenedVP(
     const RefVectorWithLeader<OperatorBase>& o_list,
     const RefVectorWithLeader<TrialWaveFunction>& wf_list,
@@ -490,7 +622,7 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
   // build private jobs and neighbors in the scalar electron/ion order.
   for (std::size_t walker = 0; walker < walker_count; ++walker)
   {
-    auto& potential          = o_list.getCastedElement<NonLocalECPotential>(walker);
+    auto& potential              = o_list.getCastedElement<NonLocalECPotential>(walker);
     const ParticleSet& particles = p_list[walker];
     if (!keep_grid)
       for (const auto& component : potential.PPset)
@@ -551,122 +683,10 @@ void NonLocalECPotential::mw_evaluateImplFlattenedVP(
     {
       // Keep this boundary even for an empty group, matching the reference path.
       TrialWaveFunction::mw_prepareGroup(wf_list, p_list, group);
-
-      while (tile_available)
-      {
-        const auto& segments = resource.virtual_batch->tileSegments();
-        if (segments.empty())
-          throw std::logic_error("NonLocalECPotential packed an empty active tile.");
-        if (segments.front().groupId() > group)
-          break;
-        if (segments.front().groupId() != group)
-          throw std::logic_error("NonLocalECPotential tile traversal left canonical group order.");
-
-        auto& absolute_positions = resource.virtual_batch->mutableTileAbsolutePositions();
-        auto& deltas             = resource.virtual_batch->mutableTileDeltas();
-        auto& bare_weights       = resource.virtual_batch->mutableTileBareWeights();
-        for (const auto& segment : segments)
-        {
-          const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
-          auto& potential          = o_list.getCastedElement<NonLocalECPotential>(walker);
-          const auto& group_jobs   = resource.staged_jobs[walker][group];
-          if (segment.walkerJobOrdinal() >= group_jobs.size())
-            throw std::logic_error("NonLocalECPotential tile references an absent staged job.");
-          const auto& job = group_jobs[segment.walkerJobOrdinal()];
-          if (job.ion_id != segment.ionId() || job.electron_id != segment.electronId())
-            throw std::logic_error("NonLocalECPotential tile identity disagrees with its staged job.");
-
-          potential.PP[job.ion_id]->buildQuadraturePointRange(
-              job.ion_elec_dist, job.ion_elec_displ, p_list[walker].R[job.electron_id],
-              segment.firstKnot(), segment.knotCount(), segment.tileOffset(), deltas,
-              absolute_positions, bare_weights, resource.radial_scratch, resource.legendre_scratch);
-        }
-
-        resource.virtual_batch->finalizeTileInput();
-        const VirtualParticleBatch descriptor = resource.virtual_batch->makeVirtualParticleBatch();
-        descriptor.validateFor(p_list, static_cast<std::size_t>(leader.IonConfig.getTotalNum()));
-
-        auto& ratios         = resource.virtual_batch->mutableTileRatios();
-        const bool use_tmdla = leader.use_DLA && compute_txy_all;
-        auto evaluate_and_validate_stamps =
-            [&](std::vector<ValueType>& selected_ratios,
-                TrialWaveFunction::ComputeType compute_type,
-                std::vector<TrialWaveFunction::EvaluationStamp>& tile_stamps,
-                std::vector<TrialWaveFunction::EvaluationStamp>& reference_stamps,
-                bool& have_reference,
-                const char* stream_name) {
-              tile_stamps.clear();
-              TrialWaveFunction::mw_evaluateVirtualRatios(
-                  wf_list, p_list, vp_scratch_list, descriptor, selected_ratios, tile_stamps,
-                  compute_type);
-
-              if (!have_reference)
-              {
-                reference_stamps = tile_stamps;
-                have_reference   = true;
-              }
-              else if (tile_stamps != reference_stamps)
-                throw std::runtime_error(
-                    std::string("NonLocalECPotential observed different wavefunction parameter versions across ") +
-                    stream_name + " outer tiles.");
-            };
-
-        std::vector<ValueType>* fermionic_ratios = nullptr;
-        if (use_tmdla)
-        {
-          auto& selected_fermionic_ratios = resource.virtual_batch->mutableTileFermionicRatios();
-          evaluate_and_validate_stamps(
-              selected_fermionic_ratios, TrialWaveFunction::ComputeType::FERMIONIC,
-              resource.tile_stamps, resource.reference_stamps, have_reference_stamps, "fermionic");
-
-          auto& nonfermionic_ratios = resource.virtual_batch->mutableTileNonfermionicRatios();
-          evaluate_and_validate_stamps(
-              nonfermionic_ratios, TrialWaveFunction::ComputeType::NONFERMIONIC,
-              resource.nonfermionic_tile_stamps, resource.nonfermionic_reference_stamps,
-              have_nonfermionic_reference_stamps, "nonfermionic");
-
-          if (ratios.size() != selected_fermionic_ratios.size() || ratios.size() != nonfermionic_ratios.size())
-            throw std::logic_error("NonLocalECPotential TMDLA ratio buffers have inconsistent sizes.");
-          for (std::size_t ratio = 0; ratio < ratios.size(); ++ratio)
-          {
-            ratios[ratio] = nonfermionic_ratios[ratio];
-            ratios[ratio] *= selected_fermionic_ratios[ratio];
-          }
-          fermionic_ratios = &selected_fermionic_ratios;
-        }
-        else
-          evaluate_and_validate_stamps(
-              ratios,
-              leader.use_DLA ? TrialWaveFunction::ComputeType::FERMIONIC
-                             : TrialWaveFunction::ComputeType::ALL,
-              resource.tile_stamps, resource.reference_stamps, have_reference_stamps, "selected");
-
-        auto& transformed_weights = resource.virtual_batch->mutableTileTransformedWeights();
-        for (const auto& segment : segments)
-        {
-          const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
-          std::vector<NonLocalData>* candidates =
-              compute_txy_all ? &resource.virtual_batch->walkerCandidates(walker) : nullptr;
-          Real& pair_potential = resource.virtual_batch->jobPairPotential(segment.globalJobId());
-          NonLocalECPComponent::reduceQuadraturePointRange(
-              segment.electronId(), segment.tileOffset(), segment.knotCount(),
-              resource.virtual_batch->tileDeltas(), resource.virtual_batch->tileBareWeights(), ratios,
-              fermionic_ratios, segment.tileOffset(), transformed_weights, segment.walkerKnotOffset(), candidates,
-              pair_potential);
-
-          if (segment.endsJob())
-          {
-            resource.staged_values[walker] += pair_potential;
-            if (listeners)
-            {
-              ve_samples(walker, segment.electronId()) += Real(0.5) * pair_potential;
-              vi_samples(walker, segment.ionId()) += Real(0.5) * pair_potential;
-            }
-          }
-        }
-
-        tile_available = resource.virtual_batch->packNextTile();
-      }
+      mw_consumeFlattenedVPPreparedGroup(
+          resource, o_list, wf_list, p_list, vp_scratch_list, group, compute_txy_all,
+          true, listeners, have_reference_stamps, have_nonfermionic_reference_stamps,
+          tile_available);
     }
     if (tile_available)
       throw std::logic_error("NonLocalECPotential tile traversal exceeded the particle-group range.");
@@ -1040,6 +1060,133 @@ void NonLocalECPotential::computeOneElectronTxy(TrialWaveFunction& psi,
                          dist[iat], -displ[iat], tmove_xy, use_DLA);
 }
 
+void NonLocalECPotential::mw_prepareV1FlattenedVPResource(
+    const RefVectorWithLeader<OperatorBase>& o_list,
+    const RefVectorWithLeader<ParticleSet>& p_list)
+{
+  auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
+  const std::size_t walker_count = o_list.size();
+  if (!leader.vp_ || !leader.mw_res_handle_)
+    throw std::logic_error("NonLocalECPotential VP V1 preparation requires an acquired crowd resource.");
+  if (p_list.size() != walker_count)
+    throw std::invalid_argument("NonLocalECPotential VP V1 particle list has an inconsistent size.");
+
+  auto& resource = leader.mw_res_handle_.getResource();
+  resource.staged_jobs.resize(walker_count);
+  std::size_t maximum_channels = 0;
+  std::size_t maximum_legendre = 0;
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+    if (!potential.vp_ || potential.use_DLA != leader.use_DLA ||
+        p_list[walker].groups() != p_list.getLeader().groups() ||
+        p_list[walker].getTotalNum() != p_list.getLeader().getTotalNum())
+      throw std::invalid_argument("NonLocalECPotential VP V1 crowd has incompatible resource shapes.");
+
+    resource.staged_jobs[walker].resize(static_cast<std::size_t>(p_list[walker].groups()));
+    for (const auto& component : potential.PPset)
+      if (component)
+      {
+        maximum_channels = std::max(maximum_channels, static_cast<std::size_t>(component->getNchannel()));
+        maximum_legendre =
+            std::max(maximum_legendre, static_cast<std::size_t>(component->getLmax() + 1));
+      }
+  }
+  resource.radial_scratch.resize(maximum_channels);
+  resource.legendre_scratch.resize(maximum_legendre);
+}
+
+NLPPVirtualBatchStorage& NonLocalECPotential::mw_evaluateV1ElectronCandidates(
+    const RefVectorWithLeader<OperatorBase>& o_list,
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    int group,
+    int electron)
+{
+  auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
+  const std::size_t walker_count = o_list.size();
+  if (!leader.vp_ || !leader.mw_res_handle_)
+    throw std::logic_error("NonLocalECPotential VP V1 evaluation requires an acquired crowd resource.");
+  if (wf_list.size() != walker_count || p_list.size() != walker_count ||
+      vp_scratch_list.size() != walker_count)
+    throw std::invalid_argument("NonLocalECPotential VP V1 crowd lists have inconsistent sizes.");
+  if (group < 0 || group >= p_list.getLeader().groups() ||
+      electron < p_list.getLeader().first(group) || electron >= p_list.getLeader().last(group))
+    throw std::invalid_argument("NonLocalECPotential VP V1 electron does not belong to the prepared group.");
+
+  auto& resource = leader.mw_res_handle_.getResource();
+  if (!resource.virtual_batch || resource.virtual_batch->tileCapacity() != leader.outer_tile_capacity_)
+    throw std::logic_error("NonLocalECPotential VP V1 resource has an incompatible outer tile.");
+  if (resource.staged_jobs.size() != walker_count)
+    throw std::logic_error("NonLocalECPotential VP V1 staged-job walker extent is not prepared.");
+
+  resource.reference_stamps.clear();
+  resource.tile_stamps.clear();
+  resource.nonfermionic_reference_stamps.clear();
+  resource.nonfermionic_tile_stamps.clear();
+  resource.virtual_batch->reset(walker_count, true);
+
+  // V1 deliberately reuses the preceding energy evaluation's neighbor list,
+  // while distances are read after all earlier-electron accepts in this sweep.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& potential          = o_list.getCastedElement<NonLocalECPotential>(walker);
+    const ParticleSet& particles = p_list[walker];
+    if (!potential.vp_ || potential.use_DLA != leader.use_DLA ||
+        resource.staged_jobs[walker].size() != static_cast<std::size_t>(particles.groups()) ||
+        group >= particles.groups() || electron < particles.first(group) || electron >= particles.last(group))
+      throw std::invalid_argument("NonLocalECPotential VP V1 crowd has incompatible particle or localization state.");
+
+    auto& jobs = resource.staged_jobs[walker][group];
+    jobs.clear();
+    const auto& distance_table = particles.getDistTableAB(potential.myTableIndex);
+    const auto& distances      = distance_table.getDistRow(electron);
+    const auto& displacements  = distance_table.getDisplRow(electron);
+    for (const int ion : potential.neighbor_lists.getNeighboringIons(electron))
+    {
+      if (ion < 0 || static_cast<std::size_t>(ion) >= potential.PP.size() || !potential.PP[ion])
+        throw std::logic_error("NonLocalECPotential VP V1 neighbor list references an absent component.");
+      jobs.emplace_back(ion, electron, distances[ion], -displacements[ion]);
+    }
+  }
+
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    const auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+    const auto& jobs      = resource.staged_jobs[walker][group];
+    for (std::size_t ordinal = 0; ordinal < jobs.size(); ++ordinal)
+    {
+      const auto& job       = jobs[ordinal];
+      const int knot_count = potential.PP[job.ion_id]->getNknot();
+      if (knot_count <= 0)
+        throw std::logic_error("NonLocalECPotential VP V1 encountered an empty quadrature grid.");
+      resource.virtual_batch->appendJob(
+          {group, static_cast<int>(walker), job.ion_id, electron, ordinal,
+           static_cast<std::size_t>(knot_count)});
+    }
+  }
+  resource.virtual_batch->seal();
+
+  {
+    // Candidate storage must be complete before selection, and the nested VP
+    // lock must not span selectMove, calcRatioGrad, or an accepted update.
+    ResourceCollectionTeamLock<VirtualParticleSet> vp_resource_lock(resource.collection, vp_scratch_list);
+    bool have_reference_stamps              = false;
+    bool have_nonfermionic_reference_stamps = false;
+    bool tile_available                     = resource.virtual_batch->packNextTile();
+    mw_consumeFlattenedVPPreparedGroup(
+        resource, o_list, wf_list, p_list, vp_scratch_list, group, true, false,
+        std::nullopt, have_reference_stamps, have_nonfermionic_reference_stamps,
+        tile_available);
+    if (tile_available)
+      throw std::logic_error("NonLocalECPotential VP V1 tile traversal crossed an electron boundary.");
+  }
+
+  resource.virtual_batch->validateLogicalOutputExtents();
+  return *resource.virtual_batch;
+}
+
 void NonLocalECPotential::evaluateOneBodyOpMatrix(ParticleSet& P,
                                                   const TWFFastDerivWrapper& psi,
                                                   std::vector<ValueMatrix>& B)
@@ -1203,13 +1350,6 @@ std::vector<int> NonLocalECPotential::mw_makeNonLocalMovesPbyP(const RefVectorWi
   auto& O_leader           = o_list.getCastedLeader<NonLocalECPotential>();
   ParticleSet& pset_leader = p_list.getLeader();
 
-  // per-walker candidate lists and single-electron job lists, rebuilt per electron
-  std::vector<std::vector<NonLocalData>> tmove_xy(nw);
-  std::vector<std::vector<NLPPJob<Real>>> jel_jobs(nw);
-
-  auto pp_component = std::find_if(O_leader.PPset.begin(), O_leader.PPset.end(), [](auto& ptr) { return bool(ptr); });
-  assert(pp_component != std::end(O_leader.PPset));
-
   // generate random numbers in the order exactly the same as serialization code path.
   // Note that: O.myRNG of the same batch are exactly identical and thus the order matters.
   // ad-hoc allocating rng_vals memory is sub-optimal and needs to be taken care.
@@ -1221,14 +1361,74 @@ std::vector<int> NonLocalECPotential::mw_makeNonLocalMovesPbyP(const RefVectorWi
       rng_vals[iw][jel] = (*O.myRNG)();
   }
 
+  if (O_leader.vp_)
+  {
+    if (!O_leader.mw_res_handle_)
+      throw std::logic_error("NonLocalECPotential VP V1 evaluation requires an acquired crowd resource.");
+
+    mw_prepareV1FlattenedVPResource(o_list, p_list);
+
+    RefVectorWithLeader<VirtualParticleSet> vp_scratch_list(*O_leader.vp_);
+    vp_scratch_list.reserve(nw);
+    for (std::size_t walker = 0; walker < nw; ++walker)
+      vp_scratch_list.push_back(*o_list.getCastedElement<NonLocalECPotential>(walker).vp_);
+
+    for (int group = 0; group < pset_leader.groups(); ++group)
+    {
+      // This remains a group boundary, not a per-electron tile operation.
+      TrialWaveFunction::mw_prepareGroup(wf_list, p_list, group);
+
+      for (int electron = pset_leader.first(group); electron < pset_leader.last(group); ++electron)
+      {
+        NLPPVirtualBatchStorage& candidates = mw_evaluateV1ElectronCandidates(
+            o_list, wf_list, p_list, vp_scratch_list, group, electron);
+
+        // Selection and accepts remain walker-ordered and complete before the
+        // next electron's candidates observe any updated configurations.
+        for (std::size_t walker = 0; walker < nw; ++walker)
+        {
+          const NonLocalData* selected =
+              move_op.selectMove(rng_vals[walker][electron], candidates.walkerCandidates(walker));
+          if (selected)
+          {
+            TrialWaveFunction& psi = wf_list[walker];
+            ParticleSet& particles = p_list[walker];
+            GradType gradient;
+            if (particles.makeMoveAndCheck(electron, selected->Delta) &&
+                psi.calcRatioGrad(particles, electron, gradient) != ValueType(0))
+            {
+              psi.acceptMove(particles, electron, true);
+              particles.acceptMove(electron);
+              ++num_accepted[walker];
+            }
+          }
+        }
+      }
+    }
+
+    for (std::size_t walker = 0; walker < nw; ++walker)
+      if (num_accepted[walker] > 0)
+      {
+        wf_list[walker].completeUpdates();
+        // This step also updates electron positions on the device.
+        p_list[walker].donePbyP(true);
+      }
+    return num_accepted;
+  }
+
+  // The non-VP compatibility path retains the established one-job-per-walker
+  // wavefront and its per-electron candidate vectors.
+  std::vector<std::vector<NonLocalData>> tmove_xy(nw);
+  std::vector<std::vector<NLPPJob<Real>>> jel_jobs(nw);
+  auto pp_component =
+      std::find_if(O_leader.PPset.begin(), O_leader.PPset.end(), [](auto& component) { return bool(component); });
+  assert(pp_component != std::end(O_leader.PPset));
+
   RefVectorWithLeader<NonLocalECPComponent> ecp_component_list(**pp_component);
   RefVectorWithLeader<ParticleSet> pset_list(pset_leader);
   RefVectorWithLeader<TrialWaveFunction> psi_list(wf_list.getLeader());
   RefVector<const NLPPJob<Real>> batch_list;
   RefVector<std::vector<NonLocalData>> tmove_xy_batch_list;
-  RefVector<VirtualParticleSet> vp_list;
-  std::vector<Real> pairpots(nw);
-
   ecp_component_list.reserve(nw);
   pset_list.reserve(nw);
   psi_list.reserve(nw);
@@ -1268,8 +1468,6 @@ std::vector<int> NonLocalECPotential::mw_makeNonLocalMovesPbyP(const RefVectorWi
         psi_list.clear();
         batch_list.clear();
         tmove_xy_batch_list.clear();
-        vp_list.clear();
-        vp_list.reserve(nw);
         for (size_t iw = 0; iw < nw; iw++)
         {
           auto& O = o_list.getCastedElement<NonLocalECPotential>(iw);
@@ -1278,32 +1476,24 @@ std::vector<int> NonLocalECPotential::mw_makeNonLocalMovesPbyP(const RefVectorWi
             const auto& job = jel_jobs[iw][jobid];
             ecp_component_list.push_back(*O.PP[job.ion_id]);
             pset_list.push_back(p_list[iw]);
-            if (O.vp_)
-              vp_list.push_back(*O.vp_);
             psi_list.push_back(wf_list[iw]);
             batch_list.push_back(job);
             tmove_xy_batch_list.push_back(tmove_xy[iw]);
           }
         }
 
-        if (O_leader.vp_)
-          NonLocalECPComponent::mw_evaluateOne(ecp_component_list, pset_list, {*O_leader.vp_, std::move(vp_list)},
-                                               psi_list, batch_list, pairpots, tmove_xy_batch_list,
-                                               O_leader.mw_res_handle_.getResource().collection, O_leader.use_DLA);
-        else
-          for (size_t j = 0; j < ecp_component_list.size(); j++)
-            ecp_component_list[j].evaluateOne(pset_list[j], std::nullopt, batch_list[j].get().ion_id, psi_list[j],
-                                              batch_list[j].get().electron_id, batch_list[j].get().ion_elec_dist,
-                                              batch_list[j].get().ion_elec_displ,
-                                              makeOptionalRef<std::vector<NonLocalData>>(tmove_xy_batch_list[j]),
-                                              O_leader.use_DLA);
+        for (size_t j = 0; j < ecp_component_list.size(); j++)
+          ecp_component_list[j].evaluateOne(pset_list[j], std::nullopt, batch_list[j].get().ion_id, psi_list[j],
+                                            batch_list[j].get().electron_id, batch_list[j].get().ion_elec_dist,
+                                            batch_list[j].get().ion_elec_displ,
+                                            makeOptionalRef<std::vector<NonLocalData>>(tmove_xy_batch_list[j]),
+                                            O_leader.use_DLA);
       }
 
       // selection and accepts per walker: identical calls, RNG draw order,
       // and accept bookkeeping as the single-walker v1 sweep
       for (size_t iw = 0; iw < nw; iw++)
       {
-        auto& O                      = o_list.getCastedElement<NonLocalECPotential>(iw);
         const NonLocalData* oneTMove = move_op.selectMove(rng_vals[iw][jel], tmove_xy[iw]);
         if (oneTMove)
         {
