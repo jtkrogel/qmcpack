@@ -2220,13 +2220,13 @@ struct Parameters
   }
 
   /// Resolve exactly one exported parameter by Haiku module suffix and leaf name.
-  NodePtr find(const std::string& suffix, const std::string& name)
+  NodePtr find(const std::string& suffix, const std::string& name) const
   {
     // DeepQMC/Haiku module paths contain generated prefixes. A unique suffix
     // plus the parameter name identifies the corresponding weight or bias.
     NodePtr match;
     int match_count = 0;
-    for (auto& [key, parameter_node] : nodes)
+    for (const auto& [key, parameter_node] : nodes)
       if (key.second == name && key.first.size() >= suffix.size() &&
           key.first.compare(key.first.size() - suffix.size(), suffix.size(), suffix) == 0)
       {
@@ -2240,12 +2240,12 @@ struct Parameters
   }
 
   /// Pack named value adjoints back into exported flat-vector order.
-  std::vector<double> flat_gradient(const std::unordered_map<const Node*, Tensor>& adjoints)
+  std::vector<double> flat_gradient(const std::unordered_map<const Node*, Tensor>& adjoints) const
   {
     std::vector<double> flat_gradient(values.size());
     for (const Layout& layout : layouts)
     {
-      const NodePtr parameter_node = nodes[{layout.module, layout.name}];
+      const NodePtr parameter_node = nodes.at({layout.module, layout.name});
       const auto adjoint           = adjoints.find(parameter_node.get());
       if (adjoint != adjoints.end())
         std::copy(adjoint->second.x.begin(), adjoint->second.x.end(), flat_gradient.begin() + layout.begin);
@@ -2254,12 +2254,12 @@ struct Parameters
   }
 
   /// Pack the value component of mixed coordinate-jet adjoints in export order.
-  std::vector<double> flat_gradient(const std::unordered_map<const Node*, JetAdjoint>& adjoints)
+  std::vector<double> flat_gradient(const std::unordered_map<const Node*, JetAdjoint>& adjoints) const
   {
     std::vector<double> flat_gradient(values.size());
     for (const Layout& layout : layouts)
     {
-      const NodePtr parameter_node = nodes[{layout.module, layout.name}];
+      const NodePtr parameter_node = nodes.at({layout.module, layout.name});
       const auto adjoint           = adjoints.find(parameter_node.get());
       if (adjoint != adjoints.end())
         std::copy(adjoint->second.value.x.begin(), adjoint->second.value.x.end(), flat_gradient.begin() + layout.begin);
@@ -2494,7 +2494,7 @@ struct PsiFormer
   }
 
   /// Build learned electron features from electron-nucleus geometry and spin labels.
-  NodePtr embedding(const NodePtr& positions)
+  NodePtr embedding(const NodePtr& positions) const
   {
     // Construct four features for every electron-nucleus pair:
     //   log(1+r), dx*log(1+r)/r, dy*log(1+r)/r, dz*log(1+r)/r.
@@ -2538,7 +2538,7 @@ struct PsiFormer
   }
 
   /// Select one scalar from a rank-two Cartesian tensor while preserving the graph.
-  NodePtr slice_scalar(const NodePtr& tensor, size_t row, size_t column)
+  NodePtr slice_scalar(const NodePtr& tensor, size_t row, size_t column) const
   {
     // slice0 operates on the leading axis, so flatten the selected Cartesian
     // row before selecting its requested scalar component.
@@ -2548,7 +2548,7 @@ struct PsiFormer
   }
 
   /// Apply one self-attention block and its residual two-layer MLP update.
-  NodePtr attention_block(const NodePtr& input_features, int layer)
+  NodePtr attention_block(const NodePtr& input_features, int layer) const
   {
     // Exported Haiku paths number the first block implicitly and suffix later
     // blocks with their zero-based layer index.
@@ -2582,7 +2582,7 @@ struct PsiFormer
   }
 
   /// Project one spin block into determinant-specific orbital values.
-  NodePtr backflow(const NodePtr& electron_features, bool spin_up)
+  NodePtr backflow(const NodePtr& electron_features, bool spin_up) const
   {
     // Select one spin block, project every electron feature into all
     // determinant/orbital channels, and arrange it as [det, spin electron,
@@ -2599,7 +2599,7 @@ struct PsiFormer
   }
 
   /// Construct learned atom-centred exponential envelopes for one spin block.
-  NodePtr envelope(const NodePtr& positions, bool spin_up)
+  NodePtr envelope(const NodePtr& positions, bool spin_up) const
   {
     // Each orbital is multiplied by a learned sum of atom-centred exponential
     // decays. Separate parameter arrays are exported for the two spin blocks.
@@ -2646,7 +2646,7 @@ struct PsiFormer
   }
 
   /// Construct the analytic same-spin and opposite-spin electron cusp correction.
-  NodePtr cusp(const NodePtr& positions)
+  NodePtr cusp(const NodePtr& positions) const
   {
     // Same-spin and opposite-spin electron pairs use the physical 1/4 and 1/2
     // cusp factors, respectively, with learned asymptotic length scales.
@@ -2689,7 +2689,7 @@ struct PsiFormer
   }
 
   /// Evaluate observables and exactly the parameter reverse products requested by the caller.
-  Result evaluate(const Tensor& electron_positions, const EvaluationRequest& request)
+  Result evaluate(const Tensor& electron_positions, const EvaluationRequest& request) const
   {
     const bool with_parameter_gradient = request.parameter_derivatives != ParameterDerivativeRequest::NONE;
     const bool with_kinetic_parameter_gradient =
@@ -2850,7 +2850,7 @@ struct PsiFormer
   }
 
   /// Preserve the original standalone boolean API while routing through explicit requests.
-  Result evaluate(const Tensor& electron_positions, bool with_parameter_gradient = true)
+  Result evaluate(const Tensor& electron_positions, bool with_parameter_gradient = true) const
   {
     const ParameterDerivativeRequest derivative_request = with_parameter_gradient
         ? ParameterDerivativeRequest::LOG_AND_KINETIC

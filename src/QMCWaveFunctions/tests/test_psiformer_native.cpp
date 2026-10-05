@@ -19,6 +19,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace
@@ -347,6 +348,41 @@ TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefun
   const pf::Result reloaded_result = reloaded.evaluate(electrons, false);
   checkClose(reloaded_result.logabs, changed_result.logabs);
   checkClose(reloaded_result.local_energy, changed_result.local_energy, 2e-9, 2e-9);
+}
+
+TEST_CASE("PsiFormer native oracle is const and parameter packing is read only",
+          "[wavefunction][psiformer][threading]")
+{
+  GeneratedFiles files = generateFiles("lih_pp");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::PsiFormer& const_model = model;
+  const pf::Tensor electrons       = const_model.cfg.configuration(0);
+  const std::size_t node_count     = const_model.p.nodes.size();
+
+  pf::EvaluationRequest request;
+  request.spatial_derivatives   = pf::SpatialDerivativeRequest::FULL_VGL;
+  request.parameter_derivatives = pf::ParameterDerivativeRequest::LOG_ONLY;
+  const pf::Result result       = const_model.evaluate(electrons, request);
+  CHECK(std::isfinite(result.logabs));
+  CHECK(result.param_gradient.size() == const_model.p.size());
+
+  const pf::Layout& layout = const_model.p.layouts.front();
+  CHECK(const_model.p.find(layout.module, layout.name).get() ==
+        const_model.p.nodes.at({layout.module, layout.name}).get());
+
+  const std::unordered_map<const pf::Node*, pf::Tensor> empty_value_adjoints;
+  const std::unordered_map<const pf::Node*, pf::JetAdjoint> empty_jet_adjoints;
+  const std::vector<double> empty_value_gradient =
+      const_model.p.flat_gradient(empty_value_adjoints);
+  const std::vector<double> empty_jet_gradient =
+      const_model.p.flat_gradient(empty_jet_adjoints);
+  CHECK(empty_value_gradient.size() == const_model.p.size());
+  CHECK(empty_jet_gradient.size() == const_model.p.size());
+  CHECK(std::all_of(empty_value_gradient.begin(), empty_value_gradient.end(),
+                    [](double value) { return value == 0.0; }));
+  CHECK(std::all_of(empty_jet_gradient.begin(), empty_jet_gradient.end(),
+                    [](double value) { return value == 0.0; }));
+  CHECK(const_model.p.nodes.size() == node_count);
 }
 
 TEST_CASE("PsiFormer in-memory construction matches portable-file construction", "[wavefunction][psiformer]")
