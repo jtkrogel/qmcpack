@@ -31,12 +31,30 @@ namespace qmcplusplus::psiformer::batch
 /// Deterministic counters used to verify that a batch did not serialize scalar executors.
 struct ExecutionStatistics
 {
-  std::size_t tiles_executed       = 0;
-  std::size_t max_tile_occupancy   = 0;
-  std::size_t grouped_dense_calls  = 0;
-  std::size_t max_grouped_rows     = 0;
+  std::size_t tiles_executed        = 0;
+  std::size_t max_tile_occupancy    = 0;
+  std::size_t grouped_dense_calls   = 0;
+  std::size_t max_grouped_rows      = 0;
   std::size_t scalar_executor_calls = 0;
+  /// Sparse VALUE input diagnostics.  Dense and spatial calls leave these zero.
+  std::size_t reference_configurations   = 0;
+  std::size_t replacement_configurations = 0;
+  std::size_t reference_evaluations      = 0;
+  /** Coordinate bytes avoided relative to dense [R+Q,Ne,3] packing.
+   * This is exactly Q*(Ne-1)*3*sizeof(double); metadata and results are excluded.
+   */
+  std::size_t dense_coordinate_bytes_avoided = 0;
 };
+
+/// Add two extents or reject an impossible allocation before state is changed.
+inline std::size_t checkedSum(std::size_t first,
+                              std::size_t second,
+                              const char* quantity)
+{
+  if (second > std::numeric_limits<std::size_t>::max() - first)
+    throw std::length_error(quantity);
+  return first + second;
+}
 
 /// Multiply two extents or reject an impossible allocation before state is changed.
 inline std::size_t checkedProduct(std::size_t first,

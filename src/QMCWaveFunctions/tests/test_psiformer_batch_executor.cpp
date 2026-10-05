@@ -140,6 +140,68 @@ void loadBatch(pf::DirectBatchWorkspace& workspace,
   }
 }
 
+struct SparseReplacement
+{
+  std::size_t reference;
+  std::size_t electron;
+  pf::GeometryPosition position;
+};
+
+std::vector<std::vector<double>> makeSparseReferences(const pf::Tensor& base,
+                                                      std::size_t electrons)
+{
+  return {displacedConfiguration(base, electrons, 1),
+          displacedConfiguration(base, electrons, 3)};
+}
+
+std::vector<SparseReplacement> makeSparseReplacements(
+    const std::vector<std::vector<double>>& references,
+    std::size_t electrons,
+    std::size_t replacement_count = 5)
+{
+  std::vector<SparseReplacement> replacements;
+  replacements.reserve(replacement_count);
+  for (std::size_t replacement = 0; replacement < replacement_count;
+       ++replacement)
+  {
+    const std::size_t reference = replacement % references.size();
+    const std::size_t electron = (2 * replacement + 1) % electrons;
+    pf::GeometryPosition position;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      position[dimension] = references[reference][electron * 3 + dimension] +
+          0.0007 * static_cast<double>((replacement + 1) * (dimension + 1));
+    replacements.push_back({reference, electron, position});
+  }
+  return replacements;
+}
+
+std::vector<double> materializeReplacement(
+    const std::vector<std::vector<double>>& references,
+    const SparseReplacement& replacement)
+{
+  std::vector<double> positions = references[replacement.reference];
+  std::copy(replacement.position.begin(), replacement.position.end(),
+            positions.begin() + replacement.electron * 3);
+  return positions;
+}
+
+void loadSparseBatch(pf::DirectBatchWorkspace& workspace,
+                     const std::vector<std::vector<double>>& references,
+                     const std::vector<SparseReplacement>& replacements)
+{
+  workspace.resizeSparseValues(references.size(), replacements.size());
+  for (std::size_t reference = 0; reference < references.size(); ++reference)
+    workspace.setReferenceConfiguration(
+        reference, pf::GeometryPositionView::interleaved(
+                       references[reference].data(), workspace.electronCount()));
+  for (std::size_t replacement = 0; replacement < replacements.size();
+       ++replacement)
+    workspace.setVirtualReplacement(
+        replacement, replacements[replacement].reference,
+        replacements[replacement].electron,
+        replacements[replacement].position);
+}
+
 void checkValue(const pf::DirectBatchValueResultView& batch,
                 std::size_t configuration,
                 const pf::DirectValueResult& scalar)
@@ -220,6 +282,10 @@ void validateBatches(const std::string& system,
         CHECK(statistics.tiles_executed == expected_tiles);
         CHECK(statistics.max_tile_occupancy == std::min(batch_size, tile_size));
         CHECK(statistics.scalar_executor_calls == 0);
+        CHECK(statistics.reference_configurations == 0);
+        CHECK(statistics.replacement_configurations == 0);
+        CHECK(statistics.reference_evaluations == 0);
+        CHECK(statistics.dense_coordinate_bytes_avoided == 0);
         if (batch_size == 0)
         {
           CHECK(statistics.grouped_dense_calls == 0);
@@ -235,6 +301,104 @@ void validateBatches(const std::string& system,
                 std::min(batch_size, tile_size) * model.ne);
         }
       }
+    }
+  }
+}
+
+void validateSparseBatches(const std::string& system,
+                           const std::vector<std::size_t>& tile_sizes)
+{
+  GeneratedFiles files = generateFiles(system);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto sparse_workspace = batch_executor.makeWorkspace();
+  auto dense_workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace = value_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+  const auto references = makeSparseReferences(base, model.ne);
+  const auto replacements = makeSparseReplacements(references, model.ne);
+  const std::size_t total = references.size() + replacements.size();
+
+  for (const std::size_t tile_size : tile_sizes)
+  {
+    DYNAMIC_SECTION(system << " sparse R=" << references.size()
+                           << " Q=" << replacements.size()
+                           << " T=" << tile_size)
+    {
+      sparse_workspace->prepareTileCapacity(tile_size);
+      loadSparseBatch(*sparse_workspace, references, replacements);
+      const auto sparse = batch_executor.evaluateValues(*sparse_workspace);
+      REQUIRE(sparse.size == total);
+      CHECK(sparse_workspace->valueInput() ==
+            pf::DirectBatchValueInput::SPARSE_REPLACEMENTS);
+      CHECK(sparse_workspace->referenceCount() == references.size());
+      CHECK(sparse_workspace->replacementCount() == replacements.size());
+
+      dense_workspace->prepareTileCapacity(tile_size);
+      dense_workspace->resize(pf::DirectBatchMode::VALUE_ONLY, total);
+      for (std::size_t reference = 0; reference < references.size(); ++reference)
+        dense_workspace->setPositions(
+            reference, pf::GeometryPositionView::interleaved(
+                           references[reference].data(), model.ne));
+      for (std::size_t replacement = 0; replacement < replacements.size();
+           ++replacement)
+      {
+        const std::vector<double> positions =
+            materializeReplacement(references, replacements[replacement]);
+        dense_workspace->setPositions(
+            references.size() + replacement,
+            pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+      }
+      const auto dense = batch_executor.evaluateValues(*dense_workspace);
+
+      for (std::size_t configuration = 0; configuration < total;
+           ++configuration)
+      {
+        const std::vector<double> positions = configuration < references.size()
+            ? references[configuration]
+            : materializeReplacement(
+                  references, replacements[configuration - references.size()]);
+        scalar_workspace->setPositions(
+            pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+        checkValue(sparse, configuration,
+                   value_executor.evaluate(*scalar_workspace));
+        CHECK(sparse.sign[configuration] == dense.sign[configuration]);
+        CHECK(sparse.logabs[configuration] ==
+              Catch::Approx(dense.logabs[configuration])
+                  .epsilon(3e-10).margin(3e-10));
+        CHECK(sparse.value[configuration] ==
+              Catch::Approx(dense.value[configuration])
+                  .epsilon(3e-9).margin(1e-24));
+        CHECK(sparse.parameter_version[configuration] ==
+              dense.parameter_version[configuration]);
+      }
+
+      const auto& statistics = sparse_workspace->executionStatistics();
+      const std::size_t expected_tiles = (total + tile_size - 1) / tile_size;
+      const std::size_t dense_calls_per_tile =
+          1 + 6 * model.blocks + (model.cfg.nup != 0 ? 1 : 0) +
+          (model.cfg.ndown != 0 ? 1 : 0);
+      CHECK(statistics.tiles_executed == expected_tiles);
+      CHECK(statistics.max_tile_occupancy == std::min(total, tile_size));
+      CHECK(statistics.grouped_dense_calls ==
+            expected_tiles * dense_calls_per_tile);
+      CHECK(statistics.max_grouped_rows ==
+            std::min(total, tile_size) * model.ne);
+      CHECK(statistics.scalar_executor_calls == 0);
+      CHECK(statistics.reference_configurations == references.size());
+      CHECK(statistics.replacement_configurations == replacements.size());
+      CHECK(statistics.reference_evaluations == references.size());
+      CHECK(statistics.dense_coordinate_bytes_avoided ==
+            replacements.size() * (model.ne - 1) * 3 * sizeof(double));
+
+      const auto& dense_statistics = dense_workspace->executionStatistics();
+      CHECK(dense_statistics.reference_configurations == 0);
+      CHECK(dense_statistics.replacement_configurations == 0);
+      CHECK(dense_statistics.reference_evaluations == 0);
+      CHECK(dense_statistics.dense_coordinate_bytes_avoided == 0);
     }
   }
 }
@@ -311,6 +475,10 @@ void validateSpatialBatches(const std::string& system,
         CHECK(statistics.tiles_executed == expected_tiles);
         CHECK(statistics.max_tile_occupancy == std::min(batch_size, tile_size));
         CHECK(statistics.scalar_executor_calls == 0);
+        CHECK(statistics.reference_configurations == 0);
+        CHECK(statistics.replacement_configurations == 0);
+        CHECK(statistics.reference_evaluations == 0);
+        CHECK(statistics.dense_coordinate_bytes_avoided == 0);
         if (batch_size == 0)
         {
           CHECK(statistics.grouped_dense_calls == 0);
@@ -432,6 +600,329 @@ TEST_CASE("PsiFormer value batches cover pair and pseudopotential shapes",
 {
   validateBatches("lih_pair", {1, 3}, {2});
   validateBatches("lih_pp", {1, 3}, {2});
+}
+
+TEST_CASE("PsiFormer sparse value batches share references without dense packing",
+          "[wavefunction][psiformer][batch][sparse]")
+{
+  validateSparseBatches("lih", {1, 2, 3, 4});
+  validateSparseBatches("lih_pair", {3});
+  validateSparseBatches("lih_pp", {3});
+}
+
+TEST_CASE("PsiFormer sparse value input validates complete atomic transactions",
+          "[wavefunction][psiformer][batch][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+  const auto references = makeSparseReferences(base, model.ne);
+  const auto replacements = makeSparseReplacements(references, model.ne, 2);
+
+  workspace->resizeSparseValues(0, 0);
+  const auto empty = batch_executor.evaluateValues(*workspace);
+  CHECK(empty.size == 0);
+  CHECK(workspace->executionStatistics().tiles_executed == 0);
+  CHECK(workspace->valueInput() ==
+        pf::DirectBatchValueInput::SPARSE_REPLACEMENTS);
+  CHECK_THROWS_AS(workspace->resizeSparseValues(0, 1),
+                  std::invalid_argument);
+
+  workspace->resizeSparseValues(1, 0);
+  workspace->setReferenceConfiguration(
+      0, pf::GeometryPositionView::interleaved(references[0].data(), model.ne));
+  CHECK(batch_executor.evaluateValues(*workspace).size == 1);
+
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 1);
+  CHECK_THROWS_AS(workspace->setReferenceConfiguration(
+                      0, pf::GeometryPositionView::interleaved(
+                             references[0].data(), model.ne)),
+                  std::logic_error);
+  CHECK_THROWS_AS(workspace->setVirtualReplacement(
+                      0, 0, 0, replacements[0].position),
+                  std::logic_error);
+
+  workspace->resizeSparseValues(2, 2);
+  CHECK_THROWS_AS(workspace->setPositions(
+                      0, pf::GeometryPositionView::interleaved(
+                             references[0].data(), model.ne)),
+                  std::logic_error);
+  CHECK_THROWS_AS(workspace->setPosition(0, 0, 0, 0.0),
+                  std::logic_error);
+  CHECK_THROWS_AS(workspace->setReferenceConfiguration(
+                      2, pf::GeometryPositionView::interleaved(
+                             references[0].data(), model.ne)),
+                  std::out_of_range);
+  CHECK_THROWS_AS(workspace->setReferenceConfiguration(
+                      0, pf::GeometryPositionView::interleaved(
+                             references[0].data(), model.ne - 1)),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(workspace->setReferencePosition(2, 0, 0, 0.0),
+                  std::out_of_range);
+  CHECK_THROWS_AS(workspace->setReferencePosition(0, model.ne, 0, 0.0),
+                  std::out_of_range);
+  CHECK_THROWS_AS(workspace->setReferencePosition(0, 0, 3, 0.0),
+                  std::out_of_range);
+  CHECK_THROWS_AS(workspace->setReferencePosition(
+                      0, 0, 0, std::numeric_limits<double>::infinity()),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(workspace->setVirtualReplacement(
+                      2, 0, 0, replacements[0].position),
+                  std::out_of_range);
+  CHECK_THROWS_AS(workspace->setVirtualReplacement(
+                      0, 2, 0, replacements[0].position),
+                  std::out_of_range);
+  CHECK_THROWS_AS(workspace->setVirtualReplacement(
+                      0, 0, model.ne, replacements[0].position),
+                  std::out_of_range);
+
+  for (std::size_t electron = 0; electron < model.ne; ++electron)
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      workspace->setReferencePosition(
+          0, electron, dimension, references[0][electron * 3 + dimension]);
+  workspace->setVirtualReplacement(
+      0, replacements[0].reference, replacements[0].electron,
+      replacements[0].position);
+  workspace->setVirtualReplacement(
+      1, replacements[1].reference, replacements[1].electron,
+      replacements[1].position);
+  CHECK_THROWS_AS(batch_executor.evaluateValues(*workspace), std::logic_error);
+  workspace->setReferenceConfiguration(
+      1, pf::GeometryPositionView::interleaved(references[1].data(), model.ne));
+  const auto valid = batch_executor.evaluateValues(*workspace);
+  const std::vector<double> valid_logabs(valid.logabs, valid.logabs + valid.size);
+
+  std::vector<double> nonfinite_reference = references[0];
+  nonfinite_reference[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(workspace->setReferenceConfiguration(
+                      0, pf::GeometryPositionView::interleaved(
+                             nonfinite_reference.data(), model.ne)),
+                  std::invalid_argument);
+  pf::GeometryPosition nonfinite_replacement = replacements[0].position;
+  nonfinite_replacement[1] = std::numeric_limits<double>::infinity();
+  CHECK_THROWS_AS(workspace->setVirtualReplacement(
+                      0, replacements[0].reference,
+                      replacements[0].electron, nonfinite_replacement),
+                  std::invalid_argument);
+  const auto unchanged = batch_executor.evaluateValues(*workspace);
+  CHECK(std::equal(valid_logabs.begin(), valid_logabs.end(), unchanged.logabs));
+
+  const std::size_t size_before = workspace->size();
+  const std::size_t logical_bytes_before = workspace->logicalStorageBytes();
+  const std::size_t tile_bytes_before = workspace->tileScratchBytes();
+  const std::size_t fingerprint_before = workspace->storageFingerprint(
+      pf::DirectBatchMode::VALUE_ONLY);
+  CHECK_THROWS_AS(workspace->resizeSparseValues(
+                      std::numeric_limits<std::size_t>::max(), 1),
+                  std::length_error);
+  CHECK_THROWS_AS(workspace->resizeSparseValues(
+                      1, std::numeric_limits<std::size_t>::max() / 3 + 1),
+                  std::length_error);
+  CHECK(workspace->size() == size_before);
+  CHECK(workspace->logicalStorageBytes() == logical_bytes_before);
+  CHECK(workspace->tileScratchBytes() == tile_bytes_before);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        fingerprint_before);
+
+  const std::size_t oversized_batch =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) / model.ne + 1;
+  workspace->prepareTileCapacity(oversized_batch);
+  CHECK_THROWS_AS(workspace->resizeSparseValues(1, oversized_batch - 1),
+                  std::length_error);
+  CHECK(workspace->size() == size_before);
+  CHECK(workspace->logicalStorageBytes() == logical_bytes_before);
+  CHECK(workspace->tileScratchBytes() == tile_bytes_before);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        fingerprint_before);
+}
+
+TEST_CASE("PsiFormer sparse value storage is tile bounded and allocation free",
+          "[wavefunction][psiformer][batch][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+  const auto references = makeSparseReferences(base, model.ne);
+  const auto replacements_4 = makeSparseReplacements(references, model.ne, 4);
+  const auto replacements_7 = makeSparseReplacements(references, model.ne, 7);
+  const auto replacements_64 = makeSparseReplacements(references, model.ne, 64);
+
+  workspace->prepareTileCapacity(2);
+  loadSparseBatch(*workspace, references, replacements_4);
+  batch_executor.evaluateValues(*workspace);
+  const std::size_t tile_bytes = workspace->tileScratchBytes();
+  const std::size_t sparse_tile_bytes = workspace->sparseTilePositionBytes();
+  const std::size_t sparse_input_4 = workspace->sparseInputStorageBytes();
+  const std::size_t logical_bytes_4 = workspace->logicalStorageBytes();
+  CHECK(sparse_tile_bytes >= 2 * model.ne * 3 * sizeof(double));
+
+  loadSparseBatch(*workspace, references, replacements_64);
+  const auto large = batch_executor.evaluateValues(*workspace);
+  CHECK(large.size == references.size() + replacements_64.size());
+  CHECK(workspace->tileScratchBytes() == tile_bytes);
+  CHECK(workspace->sparseTilePositionBytes() == sparse_tile_bytes);
+  CHECK(workspace->sparseInputStorageBytes() > sparse_input_4);
+  CHECK(workspace->logicalStorageBytes() > logical_bytes_4);
+  CHECK(workspace->allocatedTileCapacity() == 2);
+  CHECK(workspace->capacity(pf::DirectBatchMode::VALUE_ONLY) == large.size);
+  CHECK(workspace->sparseInputStorageBytes() <
+        large.size * model.ne * 3 * sizeof(double));
+  CHECK(workspace->executionStatistics().dense_coordinate_bytes_avoided ==
+        replacements_64.size() * (model.ne - 1) * 3 * sizeof(double));
+
+  const std::size_t fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::VALUE_ONLY);
+  volatile double sink = 0;
+  allocation_count.store(0, std::memory_order_relaxed);
+  count_allocations.store(true, std::memory_order_relaxed);
+  for (int repetition = 0; repetition < 3; ++repetition)
+    sink += batch_executor.evaluateValues(*workspace).logabs[repetition];
+  count_allocations.store(false, std::memory_order_relaxed);
+  CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
+  CHECK(std::isfinite(sink));
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        fingerprint);
+
+  loadSparseBatch(*workspace, references, replacements_7);
+  batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        fingerprint);
+  loadSparseBatch(*workspace, references, replacements_64);
+  batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        fingerprint);
+
+  workspace->prepareTileCapacity(4);
+  CHECK(workspace->sparseTilePositionBytes() >=
+        4 * model.ne * 3 * sizeof(double));
+  CHECK(workspace->sparseTilePositionBytes() > sparse_tile_bytes);
+  const std::size_t larger_tile_bytes = workspace->tileScratchBytes();
+  loadSparseBatch(*workspace, references, replacements_7);
+  batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->tileScratchBytes() == larger_tile_bytes);
+
+  const std::size_t retained_sparse_input = workspace->sparseInputStorageBytes();
+  const std::size_t retained_sparse_tile = workspace->sparseTilePositionBytes();
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 3);
+  loadBatch(*workspace, base, 3);
+  batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->valueInput() ==
+        pf::DirectBatchValueInput::DENSE_CONFIGURATIONS);
+  CHECK(workspace->sparseInputStorageBytes() == retained_sparse_input);
+  CHECK(workspace->sparseTilePositionBytes() == retained_sparse_tile);
+  CHECK(workspace->executionStatistics().reference_configurations == 0);
+  CHECK(workspace->executionStatistics().replacement_configurations == 0);
+  CHECK(workspace->executionStatistics().reference_evaluations == 0);
+  CHECK(workspace->executionStatistics().dense_coordinate_bytes_avoided == 0);
+}
+
+TEST_CASE("PsiFormer sparse value batches preserve nodes versions and atomic output",
+          "[wavefunction][psiformer][batch][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  auto scalar_workspace = value_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+  REQUIRE(model.cfg.nup >= 2);
+
+  const std::vector<double> normal_reference =
+      displacedConfiguration(base, model.ne, 1);
+  std::vector<std::vector<double>> references{normal_reference};
+  pf::GeometryPosition shifted_position;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    shifted_position[dimension] = normal_reference[3 + dimension] +
+        0.001 * static_cast<double>(dimension + 1);
+  std::vector<SparseReplacement> replacements{{0, 1, shifted_position}};
+
+  workspace->prepareTileCapacity(1);
+  loadSparseBatch(*workspace, references, replacements);
+  const auto valid = batch_executor.evaluateValues(*workspace);
+  const std::vector<double> valid_sign(valid.sign, valid.sign + valid.size);
+  const std::vector<double> valid_logabs(valid.logabs, valid.logabs + valid.size);
+  const std::vector<double> valid_value(valid.value, valid.value + valid.size);
+  const std::vector<std::size_t> valid_version(
+      valid.parameter_version, valid.parameter_version + valid.size);
+  const pf::DirectBatchExecutionStatistics valid_statistics =
+      workspace->executionStatistics();
+
+  std::vector<double> node_reference = normal_reference;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    node_reference[3 + dimension] = node_reference[dimension];
+  pf::GeometryPosition recover_position;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    recover_position[dimension] = normal_reference[3 + dimension];
+  references[0] = node_reference;
+  replacements[0] = {0, 1, recover_position};
+  loadSparseBatch(*workspace, references, replacements);
+
+  const auto& same_alpha = plan.parameter(
+      qmcplusplus::psiformer::ParameterRole::CUSP_SAME_ALPHA);
+  REQUIRE(same_alpha.size() == 1);
+  const double original_same_alpha = model.p.flat_values()[same_alpha.begin];
+  model.p.set_flat_value(same_alpha.begin, 1.0e308);
+  CHECK_THROWS_AS(batch_executor.evaluateValues(*workspace), std::runtime_error);
+  CHECK(std::equal(valid_sign.begin(), valid_sign.end(), valid.sign));
+  CHECK(std::equal(valid_logabs.begin(), valid_logabs.end(), valid.logabs));
+  CHECK(std::equal(valid_value.begin(), valid_value.end(), valid.value));
+  CHECK(std::equal(valid_version.begin(), valid_version.end(),
+                   valid.parameter_version));
+  CHECK(workspace->executionStatistics().tiles_executed ==
+        valid_statistics.tiles_executed);
+  CHECK(workspace->executionStatistics().grouped_dense_calls ==
+        valid_statistics.grouped_dense_calls);
+  CHECK(workspace->executionStatistics().max_tile_occupancy ==
+        valid_statistics.max_tile_occupancy);
+  CHECK(workspace->executionStatistics().max_grouped_rows ==
+        valid_statistics.max_grouped_rows);
+  CHECK(workspace->executionStatistics().scalar_executor_calls ==
+        valid_statistics.scalar_executor_calls);
+  CHECK(workspace->executionStatistics().reference_configurations ==
+        valid_statistics.reference_configurations);
+  CHECK(workspace->executionStatistics().replacement_configurations ==
+        valid_statistics.replacement_configurations);
+  CHECK(workspace->executionStatistics().reference_evaluations ==
+        valid_statistics.reference_evaluations);
+  CHECK(workspace->executionStatistics().dense_coordinate_bytes_avoided ==
+        valid_statistics.dense_coordinate_bytes_avoided);
+
+  model.p.set_flat_value(same_alpha.begin, original_same_alpha);
+  const auto retried = batch_executor.evaluateValues(*workspace);
+  CHECK(retried.sign[0] == 0.0);
+  CHECK(retried.logabs[0] == -std::numeric_limits<double>::infinity());
+  CHECK(retried.value[0] == 0.0);
+  scalar_workspace->setPositions(pf::GeometryPositionView::interleaved(
+      normal_reference.data(), model.ne));
+  checkValue(retried, 1, value_executor.evaluate(*scalar_workspace));
+  for (std::size_t configuration = 0; configuration < retried.size;
+       ++configuration)
+    CHECK(retried.parameter_version[configuration] == model.p.version());
+
+  references[0] = normal_reference;
+  pf::GeometryPosition node_position;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    node_position[dimension] = normal_reference[dimension];
+  replacements[0] = {0, 1, node_position};
+  loadSparseBatch(*workspace, references, replacements);
+  const auto replacement_node = batch_executor.evaluateValues(*workspace);
+  CHECK(replacement_node.sign[1] == 0.0);
+  CHECK(replacement_node.logabs[1] ==
+        -std::numeric_limits<double>::infinity());
+  CHECK(replacement_node.value[1] == 0.0);
 }
 
 TEST_CASE("PsiFormer spatial batches use true bounded tile kernels",

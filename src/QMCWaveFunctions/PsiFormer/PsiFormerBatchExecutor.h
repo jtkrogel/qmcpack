@@ -47,6 +47,13 @@ enum class DirectBatchMode
   ACTIVE_ELECTRON_GRADIENT
 };
 
+/// Select dense complete configurations or sparse reference-plus-replacement VALUE input.
+enum class DirectBatchValueInput
+{
+  DENSE_CONFIGURATIONS,
+  SPARSE_REPLACEMENTS
+};
+
 /// Deterministic structural counters for the most recent completed evaluation.
 using DirectBatchExecutionStatistics = qmcplusplus::psiformer::batch::ExecutionStatistics;
 
@@ -112,7 +119,11 @@ public:
     {
       const std::size_t effective_capacity = std::min(active_size_, capacity);
       validateScratchExtents(active_mode_, effective_capacity);
+      if (active_value_input_ == DirectBatchValueInput::SPARSE_REPLACEMENTS)
+        (void)sparseTilePositionElements(effective_capacity);
       prepareScratch(active_mode_, effective_capacity);
+      if (active_value_input_ == DirectBatchValueInput::SPARSE_REPLACEMENTS)
+        growVector(sparse_tile_positions_, sparseTilePositionElements(effective_capacity));
     }
     tile_capacity_ = capacity;
   }
@@ -149,9 +160,77 @@ public:
     prepareScratch(mode, effective_capacity);
 
     active_mode_ = mode;
+    active_value_input_ = DirectBatchValueInput::DENSE_CONFIGURATIONS;
     active_size_ = size;
+    active_reference_count_ = 0;
+    active_replacement_count_ = 0;
+    active_dense_coordinate_bytes_avoided_ = 0;
     mode_capacity_[modeIndex(mode)] = std::max(mode_capacity_[modeIndex(mode)], size);
     std::fill_n(position_ready_.begin(), position_count, static_cast<unsigned char>(0));
+  }
+
+  /** Grow sparse VALUE input and begin a reference-plus-replacement transaction.
+   *
+   * Results retain the ordinary value view and are ordered as all ``R`` reference
+   * configurations followed by all ``Q`` replacement configurations.
+   */
+  void resizeSparseValues(std::size_t reference_count,
+                          std::size_t replacement_count)
+  {
+    namespace batch = qmcplusplus::psiformer::batch;
+    if (reference_count == 0 && replacement_count != 0)
+      throw std::invalid_argument(
+          "PsiFormer sparse batch replacements require a reference configuration");
+
+    const std::size_t size = batch::checkedSum(
+        reference_count, replacement_count,
+        "PsiFormer sparse batch configuration extent overflowed");
+    const std::size_t reference_position_count = batch::checkedProduct(
+        batch::checkedProduct(reference_count, electron_count_,
+                              "PsiFormer sparse reference extent overflowed"),
+        3, "PsiFormer sparse reference extent overflowed");
+    const std::size_t replacement_position_count = batch::checkedProduct(
+        replacement_count, 3,
+        "PsiFormer sparse replacement extent overflowed");
+    const std::size_t effective_capacity = std::min(size, tile_capacity_);
+    const std::size_t sparse_tile_position_count =
+        sparseTilePositionElements(effective_capacity);
+    const std::size_t avoided_coordinate_scalars = electron_count_ == 0
+        ? 0
+        : batch::checkedProduct(
+              batch::checkedProduct(replacement_count, electron_count_ - 1,
+                                    "PsiFormer avoided coordinate extent overflowed"),
+              3, "PsiFormer avoided coordinate extent overflowed");
+    const std::size_t avoided_coordinate_bytes = batch::checkedProduct(
+        avoided_coordinate_scalars, sizeof(double),
+        "PsiFormer avoided coordinate byte extent overflowed");
+
+    // Preflight every packed extent and BLAS dimension before changing the
+    // current ready transaction or any retained high-water allocation.
+    validateScratchExtents(DirectBatchMode::VALUE_ONLY, effective_capacity);
+
+    growVector(reference_positions_, reference_position_count);
+    growVector(reference_ready_, reference_position_count);
+    growVector(replacement_references_, replacement_count);
+    growVector(replacement_electrons_, replacement_count);
+    growVector(replacement_positions_, replacement_position_count);
+    growVector(replacement_ready_, replacement_count);
+    reserveOutputs(size, 0, 0);
+    prepareScratch(DirectBatchMode::VALUE_ONLY, effective_capacity);
+    growVector(sparse_tile_positions_, sparse_tile_position_count);
+
+    active_mode_ = DirectBatchMode::VALUE_ONLY;
+    active_value_input_ = DirectBatchValueInput::SPARSE_REPLACEMENTS;
+    active_size_ = size;
+    active_reference_count_ = reference_count;
+    active_replacement_count_ = replacement_count;
+    active_dense_coordinate_bytes_avoided_ = avoided_coordinate_bytes;
+    mode_capacity_[modeIndex(DirectBatchMode::VALUE_ONLY)] =
+        std::max(mode_capacity_[modeIndex(DirectBatchMode::VALUE_ONLY)], size);
+    std::fill_n(reference_ready_.begin(), reference_position_count,
+                static_cast<unsigned char>(0));
+    std::fill_n(replacement_ready_.begin(), replacement_count,
+                static_cast<unsigned char>(0));
   }
 
   /// Set one finite Cartesian coordinate in the active logical request.
@@ -160,6 +239,9 @@ public:
                    std::size_t dimension,
                    double value)
   {
+    if (active_value_input_ != DirectBatchValueInput::DENSE_CONFIGURATIONS)
+      throw std::logic_error(
+          "PsiFormer dense coordinate setter cannot modify sparse batch input");
     if (configuration >= active_size_)
       throw std::out_of_range("PsiFormer batch configuration index is out of range");
     if (electron >= electron_count_ || dimension >= 3)
@@ -174,6 +256,9 @@ public:
   /// Copy one complete configuration into contiguous logical input storage.
   void setPositions(std::size_t configuration, GeometryPositionView positions)
   {
+    if (active_value_input_ != DirectBatchValueInput::DENSE_CONFIGURATIONS)
+      throw std::logic_error(
+          "PsiFormer dense configuration setter cannot modify sparse batch input");
     if (configuration >= active_size_)
       throw std::out_of_range("PsiFormer batch configuration index is out of range");
     if (positions.size() != electron_count_)
@@ -192,9 +277,93 @@ public:
         setPosition(configuration, electron, dimension, positions(electron, dimension));
   }
 
+  /// Copy one complete finite reference configuration into sparse logical storage.
+  void setReferenceConfiguration(std::size_t reference,
+                                 GeometryPositionView positions)
+  {
+    if (active_value_input_ != DirectBatchValueInput::SPARSE_REPLACEMENTS)
+      throw std::logic_error(
+          "PsiFormer sparse reference setter requires sparse VALUE input");
+    if (reference >= active_reference_count_)
+      throw std::out_of_range("PsiFormer sparse reference index is out of range");
+    if (positions.size() != electron_count_)
+      throw std::invalid_argument(
+          "PsiFormer sparse reference has the wrong electron count");
+
+    for (std::size_t electron = 0; electron < electron_count_; ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (!qmcplusplus::psiformer::determinant::isFiniteReal(
+                positions(electron, dimension)))
+          throw std::invalid_argument(
+              "PsiFormer sparse reference coordinate is non-finite");
+
+    double* target = reference_positions_.data() + reference * electron_count_ * 3;
+    for (std::size_t electron = 0; electron < electron_count_; ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        target[electron * 3 + dimension] = positions(electron, dimension);
+    std::fill_n(reference_ready_.begin() + reference * electron_count_ * 3,
+                electron_count_ * 3, static_cast<unsigned char>(1));
+  }
+
+  /** Set one finite reference coordinate without assuming ParticleSet storage layout.
+   * This permits adapters to convert scalar precision coordinate-by-coordinate
+   * without materializing another complete reference array.
+   */
+  void setReferencePosition(std::size_t reference,
+                            std::size_t electron,
+                            std::size_t dimension,
+                            double value)
+  {
+    if (active_value_input_ != DirectBatchValueInput::SPARSE_REPLACEMENTS)
+      throw std::logic_error(
+          "PsiFormer sparse reference setter requires sparse VALUE input");
+    if (reference >= active_reference_count_)
+      throw std::out_of_range("PsiFormer sparse reference index is out of range");
+    if (electron >= electron_count_ || dimension >= 3)
+      throw std::out_of_range(
+          "PsiFormer sparse reference coordinate index is out of range");
+    if (!qmcplusplus::psiformer::determinant::isFiniteReal(value))
+      throw std::invalid_argument(
+          "PsiFormer sparse reference coordinate is non-finite");
+    const std::size_t offset =
+        (reference * electron_count_ + electron) * 3 + dimension;
+    reference_positions_[offset] = value;
+    reference_ready_[offset] = 1;
+  }
+
+  /// Store one finite absolute replacement tuple in caller-provided order.
+  void setVirtualReplacement(std::size_t replacement,
+                             std::size_t reference,
+                             std::size_t electron,
+                             const GeometryPosition& position)
+  {
+    if (active_value_input_ != DirectBatchValueInput::SPARSE_REPLACEMENTS)
+      throw std::logic_error(
+          "PsiFormer sparse replacement setter requires sparse VALUE input");
+    if (replacement >= active_replacement_count_)
+      throw std::out_of_range("PsiFormer sparse replacement index is out of range");
+    if (reference >= active_reference_count_)
+      throw std::out_of_range("PsiFormer sparse replacement reference is out of range");
+    if (electron >= electron_count_)
+      throw std::out_of_range("PsiFormer sparse replacement electron is out of range");
+    for (double coordinate : position)
+      if (!qmcplusplus::psiformer::determinant::isFiniteReal(coordinate))
+        throw std::invalid_argument(
+            "PsiFormer sparse replacement coordinate is non-finite");
+
+    replacement_references_[replacement] = reference;
+    replacement_electrons_[replacement] = electron;
+    std::copy(position.begin(), position.end(),
+              replacement_positions_.begin() + replacement * 3);
+    replacement_ready_[replacement] = 1;
+  }
+
   std::size_t size() const noexcept { return active_size_; }
   std::size_t electronCount() const noexcept { return electron_count_; }
   std::size_t tileCapacity() const noexcept { return tile_capacity_; }
+  DirectBatchValueInput valueInput() const noexcept { return active_value_input_; }
+  std::size_t referenceCount() const noexcept { return active_reference_count_; }
+  std::size_t replacementCount() const noexcept { return active_replacement_count_; }
 
   /// Return the largest allocated tile high-water mark across retained scratch.
   std::size_t allocatedTileCapacity() const noexcept
@@ -224,6 +393,12 @@ public:
 
     mix_vector(electron_positions_);
     mix_vector(position_ready_);
+    mix_vector(reference_positions_);
+    mix_vector(reference_ready_);
+    mix_vector(replacement_references_);
+    mix_vector(replacement_electrons_);
+    mix_vector(replacement_positions_);
+    mix_vector(replacement_ready_);
     mix_vector(sign_);
     mix_vector(logabs_);
     mix_vector(value_);
@@ -242,6 +417,7 @@ public:
     switch (mode)
     {
     case DirectBatchMode::VALUE_ONLY:
+      mix_vector(sparse_tile_positions_);
       mix_vector(value_geometries_);
       mix_vector(raw_features_);
       mix_vector(features_a_);
@@ -291,6 +467,7 @@ public:
     std::size_t bytes = 0;
     bytes += electron_positions_.capacity() * sizeof(double);
     bytes += position_ready_.capacity() * sizeof(unsigned char);
+    bytes += sparseInputStorageBytes();
     bytes += sign_.capacity() * sizeof(double);
     bytes += logabs_.capacity() * sizeof(double);
     bytes += value_.capacity() * sizeof(double);
@@ -307,6 +484,23 @@ public:
     bytes += pending_lap_ratio_.capacity() * sizeof(double);
     return bytes;
   }
+
+  /// Return retained sparse logical input bytes, excluding results and tile scratch.
+  std::size_t sparseInputStorageBytes() const noexcept
+  {
+    std::size_t bytes = 0;
+    bytes += reference_positions_.capacity() * sizeof(double);
+    bytes += reference_ready_.capacity() * sizeof(unsigned char);
+    bytes += replacement_references_.capacity() * sizeof(std::size_t);
+    bytes += replacement_electrons_.capacity() * sizeof(std::size_t);
+    bytes += replacement_positions_.capacity() * sizeof(double);
+    bytes += replacement_ready_.capacity() * sizeof(unsigned char);
+    return bytes;
+  }
+
+  /// Return retained sparse tile-position bytes, bounded by the tile capacity.
+  std::size_t sparseTilePositionBytes() const noexcept
+  { return sparse_tile_positions_.capacity() * sizeof(double); }
 
   /// Return expensive numeric scratch retained at the tile high-water mark.
   std::size_t tileScratchBytes() const noexcept
@@ -327,6 +521,7 @@ public:
     add(spin_features_);
     add(backflow_values_);
     add(orbital_matrices_);
+    add(sparse_tile_positions_);
     add(spatial_dense_source_);
     add(spatial_dense_target_);
     std::size_t bytes = scalar_capacity * sizeof(double);
@@ -453,6 +648,16 @@ private:
           capacity, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
       break;
     }
+  }
+
+  /// Return the bounded sparse position-arena extent after checked arithmetic.
+  std::size_t sparseTilePositionElements(std::size_t capacity) const
+  {
+    namespace batch = qmcplusplus::psiformer::batch;
+    return batch::checkedProduct(
+        batch::checkedProduct(capacity, electron_count_,
+                              "PsiFormer sparse tile position extent overflowed"),
+        3, "PsiFormer sparse tile position extent overflowed");
   }
 
   /// Validate and return packed spatial elements before any slot or vector growth.
@@ -589,11 +794,84 @@ private:
       }
   }
 
+  /// Validate every sparse reference and replacement before tile scratch changes.
+  void requireCompleteSparseInput() const
+  {
+    for (std::size_t reference = 0; reference < active_reference_count_; ++reference)
+    {
+      const double* positions = reference_positions_.data() +
+          reference * electron_count_ * 3;
+      for (std::size_t coordinate = 0; coordinate < electron_count_ * 3;
+           ++coordinate)
+      {
+        if (reference_ready_[reference * electron_count_ * 3 + coordinate] == 0)
+          throw std::logic_error(
+              "PsiFormer sparse reference " + std::to_string(reference) +
+              " has incomplete coordinates");
+        if (!qmcplusplus::psiformer::determinant::isFiniteReal(
+                positions[coordinate]))
+          throw std::invalid_argument(
+              "PsiFormer sparse reference coordinate is non-finite");
+      }
+    }
+
+    for (std::size_t replacement = 0;
+         replacement < active_replacement_count_; ++replacement)
+    {
+      if (replacement_ready_[replacement] == 0)
+        throw std::logic_error(
+            "PsiFormer sparse replacement " + std::to_string(replacement) +
+            " is incomplete");
+      if (replacement_references_[replacement] >= active_reference_count_)
+        throw std::out_of_range(
+            "PsiFormer sparse replacement reference is out of range");
+      if (replacement_electrons_[replacement] >= electron_count_)
+        throw std::out_of_range(
+            "PsiFormer sparse replacement electron is out of range");
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (!qmcplusplus::psiformer::determinant::isFiniteReal(
+                replacement_positions_[replacement * 3 + dimension]))
+          throw std::invalid_argument(
+              "PsiFormer sparse replacement coordinate is non-finite");
+    }
+  }
+
+  /// Gather one sparse tile in result order: references, then replacements.
+  void materializeSparseTile(std::size_t tile_begin, std::size_t tile_size)
+  {
+    const std::size_t position_stride = electron_count_ * 3;
+    for (std::size_t local = 0; local < tile_size; ++local)
+    {
+      const std::size_t configuration = tile_begin + local;
+      const bool is_reference = configuration < active_reference_count_;
+      const std::size_t replacement = is_reference
+          ? 0
+          : configuration - active_reference_count_;
+      const std::size_t reference = is_reference
+          ? configuration
+          : replacement_references_[replacement];
+      double* target = sparse_tile_positions_.data() + local * position_stride;
+      std::copy_n(reference_positions_.data() + reference * position_stride,
+                  position_stride, target);
+      if (!is_reference)
+      {
+        const std::size_t electron = replacement_electrons_[replacement];
+        std::copy_n(replacement_positions_.data() + replacement * 3, 3,
+                    target + electron * 3);
+      }
+    }
+  }
+
   const DirectValueExecutor* value_executor_;
   const DirectSpatialExecutor* spatial_executor_;
   const std::size_t electron_count_;
   DirectBatchMode active_mode_ = DirectBatchMode::VALUE_ONLY;
+  DirectBatchValueInput active_value_input_ =
+      DirectBatchValueInput::DENSE_CONFIGURATIONS;
   std::size_t active_size_ = 0;
+  std::size_t active_reference_count_ = 0;
+  std::size_t active_replacement_count_ = 0;
+  std::size_t active_dense_coordinate_bytes_avoided_ = 0;
   std::size_t tile_capacity_ = default_tile_capacity;
   std::size_t value_tile_capacity_ = 0;
   std::array<std::size_t, 3> mode_capacity_{};
@@ -601,6 +879,13 @@ private:
 
   std::vector<double> electron_positions_;
   std::vector<unsigned char> position_ready_;
+  std::vector<double> reference_positions_;
+  std::vector<unsigned char> reference_ready_;
+  std::vector<std::size_t> replacement_references_;
+  std::vector<std::size_t> replacement_electrons_;
+  std::vector<double> replacement_positions_;
+  std::vector<unsigned char> replacement_ready_;
+  std::vector<double> sparse_tile_positions_;
   std::vector<PsiFormerGeometryCache> value_geometries_;
   std::vector<double> raw_features_;
   std::vector<double> features_a_;
@@ -659,11 +944,24 @@ public:
   {
     requireWorkspace(workspace);
     requireMode(workspace, DirectBatchMode::VALUE_ONLY);
-    workspace.requireCompletePositions();
+    if (workspace.active_value_input_ ==
+        DirectBatchValueInput::SPARSE_REPLACEMENTS)
+      workspace.requireCompleteSparseInput();
+    else
+      workspace.requireCompletePositions();
     const auto& layout = *value_executor_.layout_;
     layout.validateParameterStore(value_executor_.parameters_);
 
     DirectBatchExecutionStatistics statistics;
+    if (workspace.active_value_input_ ==
+        DirectBatchValueInput::SPARSE_REPLACEMENTS)
+    {
+      statistics.reference_configurations = workspace.active_reference_count_;
+      statistics.replacement_configurations = workspace.active_replacement_count_;
+      statistics.reference_evaluations = workspace.active_reference_count_;
+      statistics.dense_coordinate_bytes_avoided =
+          workspace.active_dense_coordinate_bytes_avoided_;
+    }
     const std::size_t parameter_version = value_executor_.parameters_.version();
     const double* parameters = value_executor_.parameters_.flat_values().data();
     const std::size_t tile_limit = workspace.tile_capacity_;
@@ -673,7 +971,17 @@ public:
       const std::size_t tile_size = std::min(tile_limit, workspace.active_size_ - tile_begin);
       ++statistics.tiles_executed;
       statistics.max_tile_occupancy = std::max(statistics.max_tile_occupancy, tile_size);
-      evaluateValueTile(workspace, tile_begin, tile_size, parameters,
+      const double* tile_positions;
+      if (workspace.active_value_input_ ==
+          DirectBatchValueInput::SPARSE_REPLACEMENTS)
+      {
+        workspace.materializeSparseTile(tile_begin, tile_size);
+        tile_positions = workspace.sparse_tile_positions_.data();
+      }
+      else
+        tile_positions = workspace.electron_positions_.data() +
+            tile_begin * workspace.electron_count_ * 3;
+      evaluateValueTile(workspace, tile_begin, tile_size, tile_positions, parameters,
                         parameter_version, statistics);
     }
 
@@ -693,6 +1001,7 @@ public:
   {
     requireWorkspace(workspace);
     requireMode(workspace, DirectBatchMode::FULL_VGL);
+    requireDenseInput(workspace);
     return evaluateSpatialBatch(workspace, DirectSpatialMode::FULL_VGL, nullptr);
   }
 
@@ -702,6 +1011,7 @@ public:
   {
     requireWorkspace(workspace);
     requireMode(workspace, DirectBatchMode::ACTIVE_ELECTRON_GRADIENT);
+    requireDenseInput(workspace);
     return evaluateSpatialBatch(
         workspace, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, active_electrons);
   }
@@ -716,6 +1026,14 @@ private:
     if (workspace.active_mode_ != expected)
       throw std::logic_error(
           "PsiFormer batch workspace mode does not match the requested evaluation");
+  }
+
+  static void requireDenseInput(const DirectBatchWorkspace& workspace)
+  {
+    if (workspace.active_value_input_ !=
+        DirectBatchValueInput::DENSE_CONFIGURATIONS)
+      throw std::logic_error(
+          "PsiFormer spatial batch evaluation requires dense configuration input");
   }
 
   void requireWorkspace(const DirectBatchWorkspace& workspace) const
@@ -1389,6 +1707,7 @@ private:
   void evaluateValueTile(DirectBatchWorkspace& workspace,
                          std::size_t tile_begin,
                          std::size_t tile_size,
+                         const double* tile_positions,
                          const double* parameters,
                          std::size_t parameter_version,
                          DirectBatchExecutionStatistics& statistics) const
@@ -1407,8 +1726,8 @@ private:
 
     for (std::size_t local = 0; local < tile_size; ++local)
     {
-      const std::size_t configuration = tile_begin + local;
-      workspace.value_geometries_[local].update(workspace.positionView(configuration));
+      workspace.value_geometries_[local].update(
+          GeometryPositionView::interleaved(tile_positions + local * ne * 3, ne));
       const GeometryPairTable& pairs =
           workspace.value_geometries_[local].electronNucleusPairs();
       const auto& displacements = pairs.displacements();
@@ -1529,8 +1848,7 @@ private:
       }
 
       const std::size_t configuration = tile_begin + local;
-      const double* positions = workspace.electron_positions_.data() +
-          configuration * ne * 3;
+      const double* positions = tile_positions + local * ne * 3;
       if (hasExactSameSpinCoalescence(positions, layout))
       {
         storePendingValue(workspace, configuration, 0.0,
