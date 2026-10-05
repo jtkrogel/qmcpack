@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file test_psiformer_threading.cpp
- * @brief OpenMP regressions for shared-model PsiFormer clones and crowd resources.
+ * @brief Threading regressions for shared-model PsiFormer clones and crowd resources.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -60,6 +60,12 @@ using Value = QMCTraits::ValueType;
 
 constexpr int thread_count = 2;
 
+#ifdef PSIFORMER_THREAD_EXECUTOR_STD
+using PsiFormerThreadExecutor = ParallelExecutor<Executor::STD_THREADS>;
+#else
+using PsiFormerThreadExecutor = ParallelExecutor<Executor::OPENMP>;
+#endif
+
 /// Construct one deterministically displaced LiH walker.
 std::unique_ptr<ParticleSet> makeThreadWalker(const SimulationCell& simulation_cell,
                                               std::size_t walker)
@@ -104,7 +110,11 @@ bool threadValuesClose(const Actual& actual, const Expected& expected, double to
 
 void requireThreadCapacity()
 {
+#ifdef PSIFORMER_THREAD_EXECUTOR_STD
+  REQUIRE(Concurrency::maxCapacity<Executor::STD_THREADS>() >= thread_count);
+#else
   REQUIRE(omp_get_max_threads() >= thread_count);
+#endif
 }
 
 void rethrowThreadFailures(const std::array<std::exception_ptr, thread_count>& failures)
@@ -114,7 +124,7 @@ void rethrowThreadFailures(const std::array<std::exception_ptr, thread_count>& f
       std::rethrow_exception(failure);
 }
 
-/** Synchronize two executor tasks only after the test has verified a two-thread OpenMP team. */
+/** Synchronize two tasks only after the selected executor has two workers. */
 void enterThreadedSection(std::atomic<int>& ready)
 {
   ready.fetch_add(1, std::memory_order_acq_rel);
@@ -280,7 +290,7 @@ TEST_CASE("PsiFormer independent crowd resources run concurrently",
 
   std::array<std::exception_ptr, thread_count> failures{};
   std::atomic<int> ready{0};
-  ParallelExecutor<Executor::OPENMP> executor;
+  PsiFormerThreadExecutor executor;
   executor(thread_count, [&](int task) {
     try
     {
@@ -383,7 +393,7 @@ TEST_CASE("PsiFormer readers observe one complete published parameter version",
   std::array<std::size_t, publication_count> committed_versions{};
   std::vector<CrowdFingerprint> observations(observation_count);
   std::atomic<int> ready{0};
-  ParallelExecutor<Executor::OPENMP> executor;
+  PsiFormerThreadExecutor executor;
   executor(thread_count, [&](int task) {
     try
     {
@@ -554,7 +564,7 @@ TEST_CASE("PsiFormer crowds initialize score and kinetic workspaces concurrently
 
   std::array<std::exception_ptr, thread_count> failures{};
   std::atomic<int> ready{0};
-  ParallelExecutor<Executor::OPENMP> executor;
+  PsiFormerThreadExecutor executor;
   executor(thread_count, [&](int task) {
     try
     {
@@ -794,7 +804,7 @@ TEST_CASE("PsiFormer move and virtual derivative crowds remain isolated",
 
   std::array<std::exception_ptr, thread_count> failures{};
   std::atomic<int> ready{0};
-  ParallelExecutor<Executor::OPENMP> executor;
+  PsiFormerThreadExecutor executor;
   executor(thread_count, [&](int task) {
     try
     {
