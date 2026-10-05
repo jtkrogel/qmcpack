@@ -98,6 +98,41 @@ public:
   {
     return nl_ecp.tmove_xy_all_.size();
   }
+
+  struct ListenerRows
+  {
+    std::vector<Real> electron;
+    std::vector<Real> ion;
+  };
+
+  /** Compute the per-particle listener rows through the established scalar pair path. */
+  static ListenerRows evaluateScalarListenerRows(NonLocalECPotential& nl_ecp,
+                                                  TrialWaveFunction& psi,
+                                                  ParticleSet& particles)
+  {
+    ListenerRows rows{std::vector<Real>(particles.getTotalNum(), 0),
+                      std::vector<Real>(nl_ecp.IonConfig.getTotalNum(), 0)};
+    const auto& distance_table = particles.getDistTableAB(nl_ecp.myTableIndex);
+    for (int group = 0; group < particles.groups(); ++group)
+    {
+      psi.prepareGroup(particles, group);
+      for (int electron = particles.first(group); electron < particles.last(group); ++electron)
+      {
+        const auto& distances     = distance_table.getDistRow(electron);
+        const auto& displacements = distance_table.getDisplRow(electron);
+        for (int ion = 0; ion < nl_ecp.PP.size(); ++ion)
+          if (nl_ecp.PP[ion] && distances[ion] < nl_ecp.PP[ion]->getRmax())
+          {
+            const Real pair_potential = nl_ecp.PP[ion]->evaluateOne(
+                particles, nl_ecp.vp_ ? makeOptionalRef<VirtualParticleSet>(*nl_ecp.vp_) : std::nullopt, ion, psi,
+                electron, distances[ion], -displacements[ion], std::nullopt, nl_ecp.use_DLA);
+            rows.electron[electron] += Real(0.5) * pair_potential;
+            rows.ion[ion] += Real(0.5) * pair_potential;
+          }
+      }
+    }
+    return rows;
+  }
 };
 
 } // namespace testing
@@ -714,7 +749,7 @@ TEST_CASE("NonLocalECPotential Tmove v1 batched matches serial, single walker", 
   }
 }
 
-TEST_CASE("NonLocalECPotential mw_evaluate ragged job counts", "[hamiltonian]")
+TEST_CASE("NonLocalECPotential mw_evaluate ragged listener scatter", "[hamiltonian]")
 {
   using Real         = QMCTraits::RealType;
   using FullPrecReal = QMCTraits::FullPrecRealType;
@@ -772,21 +807,25 @@ TEST_CASE("NonLocalECPotential mw_evaluate ragged job counts", "[hamiltonian]")
   ParticleSet elec2(elec);
   elec2.update();
 
-  // The third walker's lone down electron sits 2.0 from ion 0 and 4.0 from
-  // ion 1; the Na.BFD.xml cutoff lies between, so this walker carries one
-  // fewer job than the other two in its species group and the per-jobid
-  // batch lists in mw_evaluateImpl are compacted below the walker count.
+  // The sparse walkers' lone down electron sits 2.0 from ion 0 and 4.0 from
+  // ion 1; the Na.BFD.xml cutoff lies between, so these walkers carry one
+  // fewer job than the full walkers in this species group.
   ParticleSet elec3(elec);
   elec3.R[2] = {0.0, 3.0, 0.0};
   elec3.update();
+  ParticleSet elec4(elec3);
+  elec4.update();
 
-  RefVectorWithLeader<ParticleSet> p_list(elec, {elec, elec2, elec3});
+  // At the second down-electron job, only crowd walkers 1 and 3 remain.  This
+  // creates both a leading and a middle hole in the compact batch.
+  RefVectorWithLeader<ParticleSet> p_list(elec3, {elec3, elec, elec4, elec2});
 
   RuntimeOptions runtime_options;
   TrialWaveFunction psi(runtime_options);
   TrialWaveFunction psi2(runtime_options);
   TrialWaveFunction psi3(runtime_options);
-  RefVectorWithLeader<TrialWaveFunction> twf_list(psi, {psi, psi2, psi3});
+  TrialWaveFunction psi4(runtime_options);
+  RefVectorWithLeader<TrialWaveFunction> twf_list(psi3, {psi3, psi, psi4, psi2});
 
   NonLocalECPotential nl_ecp(ions, elec, false /*use_DLA*/, false /*use_VP*/);
 
@@ -801,35 +840,70 @@ TEST_CASE("NonLocalECPotential mw_evaluate ragged job counts", "[hamiltonian]")
   auto& nl_ecp2                  = dynamic_cast<NonLocalECPotential&>(*nl_ecp2_ptr);
   UPtr<OperatorBase> nl_ecp3_ptr = nl_ecp.makeClone(elec3, psi3);
   auto& nl_ecp3                  = dynamic_cast<NonLocalECPotential&>(*nl_ecp3_ptr);
+  UPtr<OperatorBase> nl_ecp4_ptr = nl_ecp.makeClone(elec4, psi4);
+  auto& nl_ecp4                  = dynamic_cast<NonLocalECPotential&>(*nl_ecp4_ptr);
 
   StdRandom<FullPrecReal> rng(10101);
   StdRandom<FullPrecReal> rng2(10201);
   StdRandom<FullPrecReal> rng3(10301);
+  StdRandom<FullPrecReal> rng4(10401);
   nl_ecp.setRandomGenerator(&rng);
   nl_ecp2.setRandomGenerator(&rng2);
   nl_ecp3.setRandomGenerator(&rng3);
-
-  RefVectorWithLeader<OperatorBase> o_list(nl_ecp, {nl_ecp, nl_ecp2, nl_ecp3});
-  ResourceCollection pset_res("test_pset_res");
-  elec.createResource(pset_res);
-  ResourceCollectionTeamLock<ParticleSet> pset_lock(pset_res, p_list);
-  ResourceCollection nl_ecp_res("test_nl_ecp_res");
-  nl_ecp.createResource(nl_ecp_res);
-  ResourceCollectionTeamLock<OperatorBase> nl_ecp_lock(nl_ecp_res, o_list);
+  nl_ecp4.setRandomGenerator(&rng4);
 
   testing::TestNonLocalECPotential::copyGridUnrotatedForTest(nl_ecp);
   testing::TestNonLocalECPotential::copyGridUnrotatedForTest(nl_ecp2);
   testing::TestNonLocalECPotential::copyGridUnrotatedForTest(nl_ecp3);
+  testing::TestNonLocalECPotential::copyGridUnrotatedForTest(nl_ecp4);
 
-  testing::TestNonLocalECPotential::mw_evaluateImpl(nl_ecp, o_list, twf_list, p_list, false, std::nullopt, true);
+  std::vector<testing::TestNonLocalECPotential::ListenerRows> scalar_rows;
+  scalar_rows.reserve(4);
+  scalar_rows.push_back(testing::TestNonLocalECPotential::evaluateScalarListenerRows(nl_ecp3, psi3, elec3));
+  scalar_rows.push_back(testing::TestNonLocalECPotential::evaluateScalarListenerRows(nl_ecp, psi, elec));
+  scalar_rows.push_back(testing::TestNonLocalECPotential::evaluateScalarListenerRows(nl_ecp4, psi4, elec4));
+  scalar_rows.push_back(testing::TestNonLocalECPotential::evaluateScalarListenerRows(nl_ecp2, psi2, elec2));
+
+  RefVectorWithLeader<OperatorBase> o_list(nl_ecp3, {nl_ecp3, nl_ecp, nl_ecp4, nl_ecp2});
+  ResourceCollection pset_res("test_pset_res");
+  elec3.createResource(pset_res);
+  ResourceCollectionTeamLock<ParticleSet> pset_lock(pset_res, p_list);
+  ResourceCollection nl_ecp_res("test_nl_ecp_res");
+  nl_ecp3.createResource(nl_ecp_res);
+  ResourceCollectionTeamLock<OperatorBase> nl_ecp_lock(nl_ecp_res, o_list);
+
+  Matrix<Real> electron_samples(4, elec.getTotalNum());
+  Matrix<Real> ion_samples(4, ions.getTotalNum());
+  std::vector<ListenerVector<Real>> electron_listeners;
+  electron_listeners.emplace_back("nonlocalpotential", testing::getParticularListener(electron_samples));
+  std::vector<ListenerVector<Real>> ion_listeners;
+  ion_listeners.emplace_back("nonlocalpotential", testing::getParticularListener(ion_samples));
+  ListenerOption<Real> listener_option{electron_listeners, ion_listeners};
+
+  testing::TestNonLocalECPotential::mw_evaluateImpl(nl_ecp3, o_list, twf_list, p_list, false, listener_option, true);
+
+  for (size_t walker = 0; walker < scalar_rows.size(); ++walker)
+  {
+    for (size_t electron = 0; electron < scalar_rows[walker].electron.size(); ++electron)
+      CHECK(electron_samples(walker, electron) == Approx(scalar_rows[walker].electron[electron]));
+    for (size_t ion = 0; ion < scalar_rows[walker].ion.size(); ++ion)
+      CHECK(ion_samples(walker, ion) == Approx(scalar_rows[walker].ion[ion]));
+  }
+
+  CHECK(testing::TestNonLocalECPotential::numNeighboringIons(nl_ecp3, 2) == 1);
+  CHECK(testing::TestNonLocalECPotential::numNeighboringIons(nl_ecp, 2) == 2);
+  CHECK(testing::TestNonLocalECPotential::numNeighboringIons(nl_ecp4, 2) == 1);
+  CHECK(testing::TestNonLocalECPotential::numNeighboringIons(nl_ecp2, 2) == 2);
 
   const auto mw_value  = nl_ecp.getValue();
   const auto mw_value2 = nl_ecp2.getValue();
   const auto mw_value3 = nl_ecp3.getValue();
+  const auto mw_value4 = nl_ecp4.getValue();
 
-  // walkers 1 and 2 are identical; walker 3 differs, so a batch value bleeding
-  // across walker slots cannot satisfy all three checks below
+  // The two full and two sparse walkers agree within their shapes, while the
+  // shapes differ.  A batch value bleeding across slots cannot satisfy these.
   CHECK(mw_value == Approx(mw_value2));
+  CHECK(mw_value3 == Approx(mw_value4));
   CHECK(mw_value3 != Approx(mw_value));
 
   testing::TestNonLocalECPotential::evaluateImpl(nl_ecp, psi, elec, false, true);
@@ -838,13 +912,16 @@ TEST_CASE("NonLocalECPotential mw_evaluate ragged job counts", "[hamiltonian]")
   CHECK(nl_ecp2.getValue() == Approx(mw_value2));
   testing::TestNonLocalECPotential::evaluateImpl(nl_ecp3, psi3, elec3, false, true);
   CHECK(nl_ecp3.getValue() == Approx(mw_value3));
+  testing::TestNonLocalECPotential::evaluateImpl(nl_ecp4, psi4, elec4, false, true);
+  CHECK(nl_ecp4.getValue() == Approx(mw_value4));
 
   // the T-move candidate column flows through the same compacted lists;
   // collecting it must not disturb the values
-  testing::TestNonLocalECPotential::mw_evaluateImpl(nl_ecp, o_list, twf_list, p_list, true, std::nullopt, true);
+  testing::TestNonLocalECPotential::mw_evaluateImpl(nl_ecp3, o_list, twf_list, p_list, true, std::nullopt, true);
   CHECK(nl_ecp.getValue() == Approx(mw_value));
   CHECK(nl_ecp2.getValue() == Approx(mw_value2));
   CHECK(nl_ecp3.getValue() == Approx(mw_value3));
+  CHECK(nl_ecp4.getValue() == Approx(mw_value4));
 }
 
 TEST_CASE("NonLocalECPotential batched weighted parameter-derivative path", "[hamiltonian]")

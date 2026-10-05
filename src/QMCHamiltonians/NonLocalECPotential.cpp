@@ -455,6 +455,7 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
   RefVector<const NLPPJob<Real>> batch_list;
   RefVector<VirtualParticleSet> vp_list;
   std::vector<Real> pairpots(nw);
+  std::vector<size_t> batch_walker_indices;
   RefVector<std::vector<NonLocalData>> tmove_xy_all_batch_list;
 
   ecp_potential_list.reserve(nw);
@@ -462,6 +463,7 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
   pset_list.reserve(nw);
   psi_list.reserve(nw);
   batch_list.reserve(nw);
+  batch_walker_indices.reserve(nw);
   tmove_xy_all_batch_list.reserve(nw);
 
   for (int ig = 0; ig < pset_leader.groups(); ++ig) //loop over species
@@ -483,6 +485,7 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
       pset_list.clear();
       psi_list.clear();
       batch_list.clear();
+      batch_walker_indices.clear();
       tmove_xy_all_batch_list.clear();
       vp_list.reserve(nw);
       for (size_t iw = 0; iw < nw; iw++)
@@ -498,6 +501,7 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
             vp_list.push_back(*O.vp_);
           psi_list.push_back(wf_list[iw]);
           batch_list.push_back(job);
+          batch_walker_indices.push_back(iw);
           if (compute_txy_all)
             tmove_xy_all_batch_list.push_back(O.tmove_xy_all_);
         }
@@ -521,9 +525,6 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
                                                                 : std::nullopt,
                                                 O_leader.use_DLA);
 
-      // Right now this is just over walker but could and probably should be over a set
-      // larger than the walker count.  The easiest way to not complicate the per particle
-      // reporting code would be to add the crowd walker index to the nlpp job meta data.
       for (size_t j = 0; j < ecp_potential_list.size(); j++)
       {
         NonLocalECPotential& ecp = ecp_potential_list[j];
@@ -533,8 +534,7 @@ void NonLocalECPotential::mw_evaluateImpl(const RefVectorWithLeader<OperatorBase
         {
           auto& ve_samples = O_leader.mw_res_handle_.getResource().ve_samples;
           auto& vi_samples = O_leader.mw_res_handle_.getResource().vi_samples;
-          // CAUTION! This may not be so simple in the future
-          int iw = j;
+          const size_t iw  = batch_walker_indices[j];
           ve_samples(iw, batch_list[j].get().electron_id) += 0.5 * pairpots[j];
           vi_samples(iw, batch_list[j].get().ion_id) += 0.5 * pairpots[j];
         }
