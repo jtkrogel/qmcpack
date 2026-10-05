@@ -66,6 +66,12 @@ struct InitializedPsiFormerParameters;
 /// Shared, versioned native model state used by all clones of one component.
 class PsiFormerSharedState;
 
+/// Implementation-only guard binding one complete operation to one model version.
+class PsiFormerReadTransaction;
+
+/// Implementation-only model/optimizer snapshot using the fixed lock order.
+class PsiFormerDerivativeReadTransaction;
+
 /// Shared optimizer registration and flat-index mapping for one clone family.
 class PsiFormerOptimizationMetadata;
 
@@ -459,13 +465,30 @@ private:
                                EvaluationPurpose purpose,
                                int active_gradient_particle = -1);
 
-  /// Evaluate a scalar value request directly into clone-local fixed storage.
-  pf::DirectValueResult evaluateDirectValuePositions(const ParticleSet& particles,
-                                                     int replaced_particle,
-                                                     const PosType* replacement_position);
+  /// Evaluate through an already-held model transaction without reacquiring its mutex.
+  pf::Result evaluatePositionsUnderRead(const PsiFormerReadTransaction& transaction,
+                                        const ParticleSet& particles,
+                                        int replaced_particle,
+                                        const PosType* replacement_position,
+                                        EvaluationPurpose purpose,
+                                        int active_gradient_particle = -1);
 
-  /// Evaluate a scalar spatial request and return a view into clone-local fixed storage.
-  pf::DirectSpatialResultView evaluateDirectSpatialPositions(
+  /// Evaluate and publish one accepted full-VGL state under one model transaction.
+  LogValue evaluateLogUnderRead(const PsiFormerReadTransaction& transaction,
+                                const ParticleSet& particles,
+                                ParticleSet::ParticleGradient& gradients,
+                                ParticleSet::ParticleLaplacian& laplacians);
+
+  /// Evaluate a scalar value while the caller retains the model read transaction.
+  pf::DirectValueResult evaluateDirectValuePositionsUnderRead(
+      const PsiFormerReadTransaction& transaction,
+      const ParticleSet& particles,
+      int replaced_particle,
+      const PosType* replacement_position);
+
+  /// Evaluate a spatial request while the caller retains the model read transaction.
+  pf::DirectSpatialResultView evaluateDirectSpatialPositionsUnderRead(
+      const PsiFormerReadTransaction& transaction,
       const ParticleSet& particles,
       int replaced_particle,
       const PosType* replacement_position,
@@ -504,6 +527,14 @@ private:
                                                      int replaced_particle,
                                                      const PosType* replacement_position,
                                                      pf::DirectScoreWorkspace& workspace);
+
+  /// Evaluate a score in caller-selected scratch under one model read transaction.
+  pf::DirectScoreResult evaluateDirectScorePositionsUnderRead(
+      const PsiFormerReadTransaction& transaction,
+      const ParticleSet& particles,
+      int replaced_particle,
+      const PosType* replacement_position,
+      pf::DirectScoreWorkspace& workspace);
 
   /// Validate and reduce weighted virtual score differences using optional crowd scratch.
   void evaluateDerivRatiosWeightedImpl(const VirtualParticleSet& virtual_particles,

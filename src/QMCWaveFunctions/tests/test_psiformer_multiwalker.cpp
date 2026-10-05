@@ -21,8 +21,11 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,6 +36,30 @@ namespace
 {
 using namespace testing::psiformer;
 using Value = QMCTraits::ValueType;
+
+class ScopedEnvironmentVariable
+{
+public:
+  ScopedEnvironmentVariable(std::string name, const char* value) : name_(std::move(name))
+  {
+    if (const char* previous = std::getenv(name_.c_str()))
+      previous_ = previous;
+    if (setenv(name_.c_str(), value, 1) != 0)
+      throw std::runtime_error("Unable to set PsiFormer test environment variable");
+  }
+
+  ~ScopedEnvironmentVariable()
+  {
+    if (previous_)
+      setenv(name_.c_str(), previous_->c_str(), 1);
+    else
+      unsetenv(name_.c_str());
+  }
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
 
 std::unique_ptr<ParticleSet> makeWalker(const SimulationCell& simulation_cell, std::size_t walker)
 {
@@ -487,6 +514,109 @@ TEST_CASE("PsiFormer selected-electron proposals are atomic full-VGL transaction
     {
       checkGrad(crowd.walkers[walker]->G[electron], final_gradient[electron]);
       checkValue(crowd.walkers[walker]->L[electron], final_laplacian[electron], 3.0e-7);
+    }
+  }
+}
+
+TEST_CASE("PsiFormer selected-electron proposals honor oracle and compare backends",
+          "[wavefunction][psiformer][multiwalker][multiparticle][threading]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 3;
+
+  for (const char* backend : {"oracle", "compare"})
+  {
+    DYNAMIC_SECTION("spatial backend " << backend)
+    {
+      ScopedEnvironmentVariable backend_mode("PSIFORMER_SPATIAL_BACKEND", backend);
+      Crowd crowd(files, simulation_cell, walker_count);
+      const std::size_t electron_count = crowd.walkers.front()->getTotalNum();
+
+      std::vector<ParticleSet::ParticleGradient> accepted_gradient(walker_count);
+      std::vector<ParticleSet::ParticleLaplacian> accepted_laplacian(walker_count);
+      std::vector<PsiFormerWF::LogValue> accepted_log(walker_count);
+      for (std::size_t walker = 0; walker < walker_count; ++walker)
+      {
+        accepted_gradient[walker].resize(electron_count);
+        accepted_laplacian[walker].resize(electron_count);
+        accepted_gradient[walker]  = Value(0);
+        accepted_laplacian[walker] = Value(0);
+        accepted_log[walker] = crowd.components[walker]->evaluateLog(
+            *crowd.walkers[walker], accepted_gradient[walker],
+            accepted_laplacian[walker]);
+      }
+
+      using Moves = MCMultiParticleMoves<CoordsType::POS>;
+      const std::vector<std::size_t> offsets{0, 1, 2, 4};
+      const std::vector<Moves::IndexType> indices{0, 1, 0, 3};
+      const std::vector<Moves::PosType> positions{
+          crowd.walkers[0]->R[0] + Moves::PosType{0.013, -0.008, 0.005},
+          // Exact replacement keeps one row on the accepted full-VGL reuse path.
+          crowd.walkers[1]->R[1],
+          crowd.walkers[2]->R[0] + Moves::PosType{-0.009, 0.012, 0.004},
+          crowd.walkers[2]->R[3] + Moves::PosType{0.007, -0.006, 0.011}};
+      const Moves moves(offsets, indices, positions);
+
+      std::vector<ParticleSet::ParticleGradient> expected_gradient(walker_count);
+      std::vector<ParticleSet::ParticleLaplacian> expected_laplacian(walker_count);
+      std::vector<PsiFormerWF::LogValue> expected_log(walker_count);
+      PsiFormerWF scalar("pf_selected_backend_scalar", files.parameters.string(),
+                         files.configuration.string());
+      for (std::size_t walker = 0; walker < walker_count; ++walker)
+      {
+        auto proposed = makeWalker(simulation_cell, walker);
+        const auto selected = moves.slice(walker);
+        for (std::size_t move = 0; move < selected.size(); ++move)
+          proposed->R[selected.particleIndex(move)] = selected.proposedPosition(move);
+        proposed->update();
+        expected_gradient[walker].resize(electron_count);
+        expected_laplacian[walker].resize(electron_count);
+        expected_gradient[walker]  = Value(0);
+        expected_laplacian[walker] = Value(0);
+        expected_log[walker] = scalar.evaluateLog(
+            *proposed, expected_gradient[walker], expected_laplacian[walker]);
+      }
+
+      std::vector<ParticleSet::ParticleGradient> proposed_gradient(walker_count);
+      std::vector<ParticleSet::ParticleLaplacian> proposed_laplacian(walker_count);
+      RefVector<ParticleSet::ParticleGradient> proposed_gradient_list;
+      RefVector<ParticleSet::ParticleLaplacian> proposed_laplacian_list;
+      for (std::size_t walker = 0; walker < walker_count; ++walker)
+      {
+        proposed_gradient[walker].resize(electron_count);
+        proposed_laplacian[walker].resize(electron_count);
+        proposed_gradient[walker]  = Value(0);
+        proposed_laplacian[walker] = Value(0);
+        proposed_gradient_list.push_back(proposed_gradient[walker]);
+        proposed_laplacian_list.push_back(proposed_laplacian[walker]);
+      }
+      std::vector<PsiFormerWF::LogValue> log_ratios(walker_count);
+
+      ResourceCollection resource_template("psiformer_selected_backend_template");
+      crowd.leader.createResource(resource_template);
+      ResourceCollection crowd_resource(resource_template);
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource,
+                                                              crowd.wfc_list);
+      crowd.leader.mw_evaluateMultiParticleMove(
+          crowd.wfc_list, *crowd.p_list, moves, log_ratios,
+          proposed_gradient_list, proposed_laplacian_list);
+
+      for (std::size_t walker = 0; walker < walker_count; ++walker)
+      {
+        checkLog(log_ratios[walker], expected_log[walker] - accepted_log[walker]);
+        for (std::size_t electron = 0; electron < electron_count; ++electron)
+        {
+          checkGrad(proposed_gradient[walker][electron],
+                    expected_gradient[walker][electron]);
+          checkValue(proposed_laplacian[walker][electron],
+                     expected_laplacian[walker][electron], 3.0e-7);
+        }
+      }
+
+      crowd.leader.mw_accept_rejectMultiParticleMove(
+          crowd.wfc_list, *crowd.p_list, moves,
+          std::vector<bool>(walker_count, false));
     }
   }
 }
