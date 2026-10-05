@@ -486,6 +486,9 @@ public:
 
   const OptVariables& variables() const noexcept { return metadata_.variables; }
 
+  const PsiFormerOptimizationMetadata& metadata() const noexcept
+  { return metadata_; }
+
   bool hasActiveParameters() const noexcept
   {
     for (std::size_t local_index = 0; local_index < metadata_.variables.size();
@@ -965,9 +968,14 @@ void PsiFormerWF::acquireResource(
     if (wfc_list.getCastedElement<PsiFormerWF>(walker).model_state_.get() != leader.model_state_.get())
       throw std::invalid_argument("PsiFormer multiwalker list contains components from different models");
 
-  leader.mw_resource_handle_ = collection.lendResource<PsiFormerMultiWalkerResource>();
-  if (leader.mw_resource_handle_.getResource().model_state.get() != leader.model_state_.get())
+  const auto entry_cursor = collection.getCursor();
+  auto candidate_handle = collection.lendResource<PsiFormerMultiWalkerResource>();
+  if (candidate_handle.getResource().model_state.get() != leader.model_state_.get())
+  {
+    collection.rewind(entry_cursor);
     throw std::logic_error("PsiFormer ResourceCollection belongs to a different model");
+  }
+  leader.mw_resource_handle_ = std::move(candidate_handle);
 }
 
 // Return the exact handle previously lent to this crowd leader.
@@ -1627,29 +1635,6 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
             << " system metadata against electron and ion particle sets" << std::endl;
 }
 
-// Translate QMCPACK particle coordinates and the public-call purpose into a native request.
-pf::Result PsiFormerWF::evaluate(const ParticleSet& p,
-                                 int replaced_particle,
-                                 EvaluationPurpose purpose,
-                                 int active_gradient_particle)
-{
-  return evaluatePositions(p, replaced_particle, nullptr, purpose, active_gradient_particle);
-}
-
-// Translate a full or one-electron-replaced configuration into a native request.
-pf::Result PsiFormerWF::evaluatePositions(const ParticleSet& p,
-                                          int replaced_particle,
-                                          const PosType* replacement_position,
-                                          EvaluationPurpose purpose,
-                                          int active_gradient_particle)
-{
-  PsiFormerReadTransaction transaction(*model_state_);
-  synchronizeParameterVersion(transaction.parameterVersion());
-  return evaluatePositionsUnderRead(transaction, p, replaced_particle,
-                                    replacement_position, purpose,
-                                    active_gradient_particle);
-}
-
 // Translate one configuration while the caller retains the model read lock.
 pf::Result PsiFormerWF::evaluatePositionsUnderRead(
     const PsiFormerReadTransaction& transaction,
@@ -2001,32 +1986,6 @@ std::vector<double>& PsiFormerWF::requireDirectTotalLogGradient()
   if (direct_total_log_gradient_.size() != required_size)
     throw std::logic_error("PsiFormer direct total-drift buffer has the wrong size");
   return direct_total_log_gradient_;
-}
-
-// Run the graph-free score pass and expose its clone-local non-owning output.
-pf::DirectScoreResult PsiFormerWF::evaluateDirectScorePositions(
-    const ParticleSet& p,
-    int replaced_particle,
-    const PosType* replacement_position)
-{
-  PsiFormerReadTransaction transaction(*model_state_);
-  synchronizeParameterVersion(transaction.parameterVersion());
-  return evaluateDirectScorePositionsUnderRead(
-      transaction, p, replaced_particle, replacement_position,
-      requireDirectScoreWorkspace());
-}
-
-// Run a graph-free score pass in explicitly supplied clone- or crowd-owned scratch.
-pf::DirectScoreResult PsiFormerWF::evaluateDirectScorePositions(
-    const ParticleSet& p,
-    int replaced_particle,
-    const PosType* replacement_position,
-    pf::DirectScoreWorkspace& score_workspace)
-{
-  PsiFormerReadTransaction transaction(*model_state_);
-  synchronizeParameterVersion(transaction.parameterVersion());
-  return evaluateDirectScorePositionsUnderRead(
-      transaction, p, replaced_particle, replacement_position, score_workspace);
 }
 
 pf::DirectScoreResult PsiFormerWF::evaluateDirectScorePositionsUnderRead(
@@ -3161,129 +3120,46 @@ void PsiFormerWF::copyFromBuffer(ParticleSet& particles, WFBufferType& buffer)
   }
 }
 
-// Return whether a selected local parameter is present in the global active set.
-bool PsiFormerWF::hasActiveParameters() const
+// Copy selected score entries while both the model and optimizer mapping are immutable.
+void PsiFormerWF::gatherSelectedGradientUnderRead(
+    const PsiFormerDerivativeReadTransaction& transaction,
+    const double* flat_gradient,
+    std::size_t gradient_size,
+    ValueType scale,
+    std::size_t destination_size,
+    SelectedDerivativeDelta& output) const
 {
-  std::shared_lock metadata_lock(optimization_metadata_->mutex);
-  const OptVariables& variables = optimization_metadata_->variables;
-  for (std::size_t local_index = 0; local_index < variables.size(); ++local_index)
-    if (variables.where(local_index) >= 0)
-      return true;
-  return false;
-}
+  if (&transaction.modelTransaction().state() != model_state_.get() ||
+      &transaction.metadata() != optimization_metadata_.get())
+    throw std::logic_error("PsiFormer derivative transaction belongs to a different clone family");
+  if (gradient_size != 0 && flat_gradient == nullptr)
+    throw std::invalid_argument("PsiFormer native derivative buffer is null");
 
-// Scatter selected flat derivatives into their global QMCPACK entries.
-void PsiFormerWF::addSelectedGradient(const std::vector<double>& flat_gradient, Vector<ValueType>& output) const
-{
-  addSelectedGradient(flat_gradient.data(), flat_gradient.size(), output);
-}
+  const auto& selected_flat_indices = transaction.selectedFlatIndices();
+  const OptVariables& variables     = transaction.variables();
+  if (variables.size() != selected_flat_indices.size())
+    throw std::logic_error("PsiFormer optimizer mapping has the wrong size");
 
-// Scatter directly from a non-owning canonical score view into global active entries.
-void PsiFormerWF::addSelectedGradient(const double* flat_gradient,
-                                      std::size_t gradient_size,
-                                      Vector<ValueType>& output) const
-{
-  std::shared_lock metadata_lock(optimization_metadata_->mutex);
-  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
-  const OptVariables& variables     = optimization_metadata_->variables;
+  output.clear();
+  output.reserve(selected_flat_indices.size());
   for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
     const int global_index = variables.where(local_index);
     if (global_index < 0)
       continue;
-    if (global_index >= output.size())
-      throw std::out_of_range("PsiFormer derivative output index is out of range");
+    if (static_cast<std::size_t>(global_index) >= destination_size)
+      throw std::out_of_range("PsiFormer derivative destination index is out of range");
 
     const std::size_t flat_index = selected_flat_indices[local_index];
     if (flat_index >= gradient_size)
       throw std::out_of_range("PsiFormer native derivative is missing a selected flat index");
     if (!psiformer::determinant::isFiniteReal(flat_gradient[flat_index]))
       throw std::runtime_error("PsiFormer native parameter derivative is non-finite");
-    output[global_index] += ValueType(flat_gradient[flat_index]);
-  }
-}
-
-// Contract a canonical score into a caller-owned active-parameter row.
-void PsiFormerWF::addSelectedGradientScaled(const double* flat_gradient,
-                                            std::size_t gradient_size,
-                                            ValueType scale,
-                                            ParameterDerivativeView output) const
-{
-  std::shared_lock metadata_lock(optimization_metadata_->mutex);
-  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
-  const OptVariables& variables     = optimization_metadata_->variables;
-  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
-  {
-    const int global_index = variables.where(local_index);
-    if (global_index < 0)
-      continue;
-    if (static_cast<std::size_t>(global_index) >= output.size)
-      throw std::out_of_range("PsiFormer weighted derivative destination is out of range");
-
-    const std::size_t flat_index = selected_flat_indices[local_index];
-    if (flat_index >= gradient_size)
-      throw std::out_of_range("PsiFormer weighted native score is incomplete");
-    if (!psiformer::determinant::isFiniteReal(flat_gradient[flat_index]))
-      throw std::runtime_error("PsiFormer weighted native score is non-finite");
-    output[global_index] += scale * ValueType(flat_gradient[flat_index]);
-  }
-}
-
-// Contract a canonical score into one row of the public matrix compatibility API.
-void PsiFormerWF::addSelectedGradientScaled(const double* flat_gradient,
-                                            std::size_t gradient_size,
-                                            ValueType scale,
-                                            Matrix<ValueType>& output,
-                                            std::size_t row) const
-{
-  if (row >= output.rows())
-    throw std::out_of_range("PsiFormer derivative-ratio row is out of range");
-  std::shared_lock metadata_lock(optimization_metadata_->mutex);
-  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
-  const OptVariables& variables     = optimization_metadata_->variables;
-  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
-  {
-    const int global_index = variables.where(local_index);
-    if (global_index < 0)
-      continue;
-    if (global_index >= output.cols())
-      throw std::out_of_range("PsiFormer derivative-ratio column is out of range");
-
-    const std::size_t flat_index = selected_flat_indices[local_index];
-    if (flat_index >= gradient_size)
-      throw std::out_of_range("PsiFormer native derivative-ratio input is incomplete");
-    if (!psiformer::determinant::isFiniteReal(flat_gradient[flat_index]))
-      throw std::runtime_error("PsiFormer native derivative-ratio score is non-finite");
-    output(row, global_index) += scale * ValueType(flat_gradient[flat_index]);
-  }
-}
-
-// Scatter O_theta(virtual)-O_theta(reference), the contract consumed by NonLocalECPComponent.
-void PsiFormerWF::addSelectedGradientDifference(const std::vector<double>& reference_gradient,
-                                                const std::vector<double>& virtual_gradient,
-                                                Matrix<ValueType>& output,
-                                                std::size_t row) const
-{
-  if (row >= output.rows())
-    throw std::out_of_range("PsiFormer derivative-ratio row is out of range");
-  std::shared_lock metadata_lock(optimization_metadata_->mutex);
-  const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
-  const OptVariables& variables     = optimization_metadata_->variables;
-  for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
-  {
-    const int global_index = variables.where(local_index);
-    if (global_index < 0)
-      continue;
-    if (global_index >= output.cols())
-      throw std::out_of_range("PsiFormer derivative-ratio column is out of range");
-
-    const std::size_t flat_index = selected_flat_indices[local_index];
-    if (flat_index >= reference_gradient.size() || flat_index >= virtual_gradient.size())
-      throw std::out_of_range("PsiFormer native derivative-ratio input is incomplete");
-    const double difference = virtual_gradient[flat_index] - reference_gradient[flat_index];
-    if (!psiformer::determinant::isFiniteReal(difference))
-      throw std::runtime_error("PsiFormer native derivative ratio is non-finite");
-    output(row, global_index) += ValueType(difference);
+    const ValueType value = scale * ValueType(flat_gradient[flat_index]);
+    if (!psiformer::determinant::isFiniteReal(std::real(value)) ||
+        !psiformer::determinant::isFiniteReal(std::imag(value)))
+      throw std::runtime_error("PsiFormer scaled parameter derivative is non-finite");
+    output.emplace_back(static_cast<std::size_t>(global_index), value);
   }
 }
 
@@ -3345,6 +3221,18 @@ void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<Val
 // Evaluate independent full-network ratios for all quadrature positions without mutating walker state.
 void PsiFormerWF::evaluateRatios(const VirtualParticleSet& virtual_particles, std::vector<ValueType>& ratios)
 {
+  PsiFormerReadTransaction transaction(*model_state_);
+  synchronizeParameterVersion(transaction.parameterVersion());
+  evaluateRatiosUnderRead(transaction, virtual_particles, ratios);
+}
+
+void PsiFormerWF::evaluateRatiosUnderRead(
+    const PsiFormerReadTransaction& transaction,
+    const VirtualParticleSet& virtual_particles,
+    std::vector<ValueType>& ratios)
+{
+  if (&transaction.state() != model_state_.get())
+    throw std::logic_error("PsiFormer virtual-ratio transaction belongs to a different model");
   if (virtual_particles.getRefPS().isSpinor())
     throw std::invalid_argument("PsiFormer nonlocal ratios do not support spinor virtual moves");
   if (ratios.size() != static_cast<std::size_t>(virtual_particles.getTotalNum()))
@@ -3355,8 +3243,6 @@ void PsiFormerWF::evaluateRatios(const VirtualParticleSet& virtual_particles, st
   if (electron < 0 || electron >= reference.getTotalNum())
     throw std::out_of_range("PsiFormer virtual-particle reference electron is invalid");
 
-  PsiFormerReadTransaction transaction(*model_state_);
-  synchronizeParameterVersion(transaction.parameterVersion());
   std::vector<ValueType> staged_ratios(ratios.size());
 
   if (transaction.state().direct_value_mode != DirectBackendMode::DIRECT)
@@ -3512,9 +3398,11 @@ void PsiFormerWF::evaluateDerivRatios(const VirtualParticleSet& virtual_particle
                                       std::vector<ValueType>& ratios,
                                       Matrix<ValueType>& derivative_ratios)
 {
-  if (!optimization_metadata_->enabled || !hasActiveParameters())
+  PsiFormerDerivativeReadTransaction transaction(*model_state_, *optimization_metadata_);
+  synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
+  if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
   {
-    evaluateRatios(virtual_particles, ratios);
+    evaluateRatiosUnderRead(transaction.modelTransaction(), virtual_particles, ratios);
     return;
   }
   if (virtual_particles.getRefPS().isSpinor())
@@ -3528,49 +3416,95 @@ void PsiFormerWF::evaluateDerivRatios(const VirtualParticleSet& virtual_particle
   if (electron < 0 || electron >= reference.getTotalNum())
     throw std::out_of_range("PsiFormer virtual-particle reference electron is invalid");
 
-  // Seed every compatibility row with -O(reference) before the shared score
-  // tape is overwritten, then add O(virtual) as each move is evaluated.
-  if (model_state_->direct_score_mode == DirectBackendMode::DIRECT)
+  const std::size_t destination_size =
+      static_cast<std::size_t>(derivative_ratios.cols());
+  const DirectBackendMode score_mode =
+      transaction.modelTransaction().state().direct_score_mode;
+  pf::DirectScoreWorkspace* score_workspace = score_mode == DirectBackendMode::DIRECT
+      ? &requireDirectScoreWorkspace()
+      : nullptr;
+  SelectedDerivativeDelta requested_reference;
+  SelectedDerivativeDelta requested_virtual;
+
+  double reference_sign;
+  double reference_logabs;
+  if (score_mode == DirectBackendMode::DIRECT)
   {
     const pf::DirectScoreResult reference_result =
-        evaluateDirectScorePositions(reference, -1, nullptr);
-    const std::size_t reference_parameter_version = reference_result.parameter_version;
-    for (std::size_t move = 0; move < ratios.size(); ++move)
-      addSelectedGradientScaled(reference_result.parameter_score.data,
-                                reference_result.parameter_score.size, ValueType(-1),
-                                derivative_ratios, move);
-
-    for (std::size_t move = 0; move < ratios.size(); ++move)
-    {
-      const pf::DirectScoreResult virtual_result =
-          evaluateDirectScorePositions(reference, electron, &virtual_particles.R[move]);
-      if (virtual_result.parameter_version != reference_parameter_version)
-        throw std::runtime_error("PsiFormer parameters changed during virtual score evaluation");
-      const double ratio = (virtual_result.sign / reference_result.sign) *
-          std::exp(virtual_result.logabs - reference_result.logabs);
-      if (!psiformer::determinant::isFiniteReal(ratio))
-        throw std::runtime_error("PsiFormer virtual-particle ratio is non-finite");
-      ratios[move] = ValueType(ratio);
-      addSelectedGradientScaled(virtual_result.parameter_score.data,
-                                virtual_result.parameter_score.size, ValueType(1),
-                                derivative_ratios, move);
-    }
-    return;
+        evaluateDirectScorePositionsUnderRead(transaction.modelTransaction(),
+                                              reference, -1, nullptr,
+                                              *score_workspace);
+    reference_sign   = reference_result.sign;
+    reference_logabs = reference_result.logabs;
+    gatherSelectedGradientUnderRead(
+        transaction, reference_result.parameter_score.data,
+        reference_result.parameter_score.size, ValueType(1), destination_size,
+        requested_reference);
+  }
+  else
+  {
+    const pf::Result reference_result = evaluatePositionsUnderRead(
+        transaction.modelTransaction(), reference, -1, nullptr,
+        EvaluationPurpose::SCORE_ONLY);
+    reference_sign   = reference_result.sign;
+    reference_logabs = reference_result.logabs;
+    gatherSelectedGradientUnderRead(
+        transaction, reference_result.param_gradient.data(),
+        reference_result.param_gradient.size(), ValueType(1), destination_size,
+        requested_reference);
   }
 
-  const pf::Result reference_result =
-      evaluatePositions(reference, -1, nullptr, EvaluationPurpose::SCORE_ONLY);
+  // Publish one complete compatibility row only after its ratio, mapping, and
+  // selected score difference are valid. This keeps storage O(active) without
+  // duplicating the caller's Q x parameter matrix.
   for (std::size_t move = 0; move < ratios.size(); ++move)
   {
-    const pf::Result virtual_result =
-        evaluatePositions(reference, electron, &virtual_particles.R[move], EvaluationPurpose::SCORE_ONLY);
-    const double ratio = (virtual_result.sign / reference_result.sign) *
-        std::exp(virtual_result.logabs - reference_result.logabs);
-    if (!psiformer::determinant::isFiniteReal(ratio))
-      throw std::runtime_error("PsiFormer virtual-particle ratio is non-finite");
-    ratios[move] = ValueType(ratio);
-    addSelectedGradientDifference(reference_result.param_gradient, virtual_result.param_gradient,
-                                  derivative_ratios, move);
+    double virtual_sign;
+    double virtual_logabs;
+    if (score_mode == DirectBackendMode::DIRECT)
+    {
+      const pf::DirectScoreResult virtual_result =
+          evaluateDirectScorePositionsUnderRead(
+              transaction.modelTransaction(), reference, electron,
+              &virtual_particles.R[move], *score_workspace);
+      virtual_sign   = virtual_result.sign;
+      virtual_logabs = virtual_result.logabs;
+      gatherSelectedGradientUnderRead(
+          transaction, virtual_result.parameter_score.data,
+          virtual_result.parameter_score.size, ValueType(1), destination_size,
+          requested_virtual);
+    }
+    else
+    {
+      const pf::Result virtual_result = evaluatePositionsUnderRead(
+          transaction.modelTransaction(), reference, electron,
+          &virtual_particles.R[move], EvaluationPurpose::SCORE_ONLY);
+      virtual_sign   = virtual_result.sign;
+      virtual_logabs = virtual_result.logabs;
+      gatherSelectedGradientUnderRead(
+          transaction, virtual_result.param_gradient.data(),
+          virtual_result.param_gradient.size(), ValueType(1), destination_size,
+          requested_virtual);
+    }
+
+    const ValueType staged_ratio = makeRatio(
+        virtual_sign, virtual_logabs, reference_sign, reference_logabs);
+    if (requested_virtual.size() != requested_reference.size())
+      throw std::logic_error("PsiFormer virtual score mapping changed");
+    for (std::size_t selected = 0; selected < requested_virtual.size(); ++selected)
+    {
+      if (requested_virtual[selected].first != requested_reference[selected].first)
+        throw std::logic_error("PsiFormer virtual score mapping changed");
+      const ValueType difference = requested_virtual[selected].second -
+          requested_reference[selected].second;
+      if (!psiformer::determinant::isFiniteReal(std::real(difference)) ||
+          !psiformer::determinant::isFiniteReal(std::imag(difference)))
+        throw std::runtime_error("PsiFormer virtual score difference is non-finite");
+    }
+    for (std::size_t selected = 0; selected < requested_virtual.size(); ++selected)
+      derivative_ratios(move, requested_virtual[selected].first) +=
+          requested_virtual[selected].second - requested_reference[selected].second;
+    ratios[move] = staged_ratio;
   }
 }
 
@@ -3580,24 +3514,38 @@ void PsiFormerWF::evaluateDerivRatiosWeighted(const VirtualParticleSet& virtual_
                                               const std::vector<ValueType>& total_weights,
                                               ParameterDerivativeView weighted_derivatives)
 {
+  if (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr)
+    throw std::invalid_argument("PsiFormer weighted derivative destination is null");
+  PsiFormerDerivativeReadTransaction transaction(*model_state_,
+                                                  *optimization_metadata_);
+  synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
+  SelectedDerivativeDelta delta;
   evaluateDerivRatiosWeightedImpl(
-      virtual_particles, optvars, total_weights, weighted_derivatives, nullptr);
+      transaction, virtual_particles, optvars, total_weights,
+      weighted_derivatives.size, nullptr, delta);
+  for (const auto& [global_index, value] : delta)
+    weighted_derivatives[global_index] += value;
 }
 
 // Validate and reduce one weighted virtual-move set, optionally in crowd-owned scratch.
 void PsiFormerWF::evaluateDerivRatiosWeightedImpl(
+    const PsiFormerDerivativeReadTransaction& transaction,
     const VirtualParticleSet& virtual_particles,
     const OptVariables& optvars,
     const std::vector<ValueType>& total_weights,
-    ParameterDerivativeView weighted_derivatives,
-    pf::DirectScoreWorkspace* crowd_workspace)
+    std::size_t destination_size,
+    pf::DirectScoreWorkspace* crowd_workspace,
+    SelectedDerivativeDelta& output)
 {
   const std::size_t virtual_count = virtual_particles.getTotalNum();
-  if (total_weights.size() != virtual_count || weighted_derivatives.size < optvars.size_of_active() ||
-      (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr))
+  if (total_weights.size() != virtual_count ||
+      destination_size < static_cast<std::size_t>(optvars.size_of_active()))
     throw std::invalid_argument("PsiFormer weighted derivative-ratio outputs have the wrong shape");
-  if (!optimization_metadata_->enabled || !hasActiveParameters())
+  if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
+  {
+    output.clear();
     return;
+  }
   if (virtual_particles.getRefPS().isSpinor())
     throw std::invalid_argument("PsiFormer weighted nonlocal derivatives do not support spinor virtual moves");
 
@@ -3609,40 +3557,70 @@ void PsiFormerWF::evaluateDerivRatiosWeightedImpl(
   const ValueType reference_weight =
       std::accumulate(total_weights.begin(), total_weights.end(), ValueType(0));
 
-  if (model_state_->direct_score_mode == DirectBackendMode::DIRECT)
+  const DirectBackendMode requested_mode =
+      transaction.modelTransaction().state().direct_score_mode;
+  pf::DirectScoreWorkspace* score_workspace = requested_mode == DirectBackendMode::DIRECT
+      ? (crowd_workspace ? crowd_workspace : &requireDirectScoreWorkspace())
+      : nullptr;
+  if (requested_mode == DirectBackendMode::DIRECT)
   {
-    pf::DirectScoreWorkspace& score_workspace =
-        crowd_workspace ? *crowd_workspace : requireDirectScoreWorkspace();
     const pf::DirectScoreResult reference_result =
-        evaluateDirectScorePositions(reference, -1, nullptr, score_workspace);
-    const std::size_t reference_parameter_version = reference_result.parameter_version;
-    addSelectedGradientScaled(reference_result.parameter_score.data,
-                              reference_result.parameter_score.size, -reference_weight,
-                              weighted_derivatives);
-
-    for (std::size_t move = 0; move < virtual_count; ++move)
-    {
-      const pf::DirectScoreResult virtual_result =
-          evaluateDirectScorePositions(reference, electron, &virtual_particles.R[move], score_workspace);
-      if (virtual_result.parameter_version != reference_parameter_version)
-        throw std::runtime_error("PsiFormer parameters changed during a weighted virtual score reduction");
-      addSelectedGradientScaled(virtual_result.parameter_score.data,
-                                virtual_result.parameter_score.size, total_weights[move],
-                                weighted_derivatives);
-    }
-    return;
+        evaluateDirectScorePositionsUnderRead(
+            transaction.modelTransaction(), reference, -1, nullptr,
+            *score_workspace);
+    gatherSelectedGradientUnderRead(
+        transaction, reference_result.parameter_score.data,
+        reference_result.parameter_score.size, -reference_weight,
+        destination_size, output);
+  }
+  else
+  {
+    const pf::Result reference_result = evaluatePositionsUnderRead(
+        transaction.modelTransaction(), reference, -1, nullptr,
+        EvaluationPurpose::SCORE_ONLY);
+    gatherSelectedGradientUnderRead(
+        transaction, reference_result.param_gradient.data(),
+        reference_result.param_gradient.size(), -reference_weight,
+        destination_size, output);
   }
 
-  const pf::Result reference_result = evaluatePositions(reference, -1, nullptr, EvaluationPurpose::SCORE_ONLY);
-  addSelectedGradientScaled(reference_result.param_gradient.data(), reference_result.param_gradient.size(),
-                            -reference_weight, weighted_derivatives);
-
+  SelectedDerivativeDelta contribution;
+  contribution.reserve(output.size());
   for (std::size_t move = 0; move < virtual_count; ++move)
   {
-    const pf::Result virtual_result =
-        evaluatePositions(reference, electron, &virtual_particles.R[move], EvaluationPurpose::SCORE_ONLY);
-    addSelectedGradientScaled(virtual_result.param_gradient.data(), virtual_result.param_gradient.size(),
-                              total_weights[move], weighted_derivatives);
+    if (requested_mode == DirectBackendMode::DIRECT)
+    {
+      const pf::DirectScoreResult virtual_result =
+          evaluateDirectScorePositionsUnderRead(
+              transaction.modelTransaction(), reference, electron,
+              &virtual_particles.R[move], *score_workspace);
+      gatherSelectedGradientUnderRead(
+          transaction, virtual_result.parameter_score.data,
+          virtual_result.parameter_score.size, total_weights[move],
+          destination_size, contribution);
+    }
+    else
+    {
+      const pf::Result virtual_result = evaluatePositionsUnderRead(
+          transaction.modelTransaction(), reference, electron,
+          &virtual_particles.R[move], EvaluationPurpose::SCORE_ONLY);
+      gatherSelectedGradientUnderRead(
+          transaction, virtual_result.param_gradient.data(),
+          virtual_result.param_gradient.size(), total_weights[move],
+          destination_size, contribution);
+    }
+
+    if (contribution.size() != output.size())
+      throw std::logic_error("PsiFormer weighted score mapping changed");
+    for (std::size_t selected = 0; selected < output.size(); ++selected)
+    {
+      if (contribution[selected].first != output[selected].first)
+        throw std::logic_error("PsiFormer weighted score mapping changed");
+      output[selected].second += contribution[selected].second;
+      if (!psiformer::determinant::isFiniteReal(std::real(output[selected].second)) ||
+          !psiformer::determinant::isFiniteReal(std::imag(output[selected].second)))
+        throw std::runtime_error("PsiFormer weighted score reduction is non-finite");
+    }
   }
 }
 
@@ -3658,25 +3636,65 @@ void PsiFormerWF::mw_evaluateDerivRatiosWeighted(
   if (wfc_list.size() != vp_list.size() || total_weights.size() != wfc_list.size() ||
       weighted_derivatives.size() != wfc_list.size())
     throw std::invalid_argument("PsiFormer batched weighted reductions have inconsistent walker counts");
-
-  if (model_state_->direct_score_mode == DirectBackendMode::DIRECT)
-  {
-    pf::DirectScoreWorkspace& score_workspace =
-        requireMultiWalkerResource(wfc_list).requireScoreWorkspace();
-    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-    {
-      auto& component = dynamic_cast<PsiFormerWF&>(wfc_list[walker]);
-      component.evaluateDerivRatiosWeightedImpl(vp_list[walker], optvars, total_weights[walker].get(),
-                                                weighted_derivatives[walker], &score_workspace);
-    }
+  if (wfc_list.empty())
     return;
-  }
 
+  PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+  PsiFormerDerivativeReadTransaction transaction(*model_state_,
+                                                  *optimization_metadata_);
+  const std::size_t parameter_version =
+      transaction.modelTransaction().parameterVersion();
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
-    auto& component = dynamic_cast<PsiFormerWF&>(wfc_list[walker]);
-    component.evaluateDerivRatiosWeighted(vp_list[walker], optvars, total_weights[walker].get(),
-                                          weighted_derivatives[walker]);
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    component.synchronizeParameterVersion(parameter_version);
+    if (weighted_derivatives[walker].size != 0 &&
+        weighted_derivatives[walker].data == nullptr)
+      throw std::invalid_argument("PsiFormer weighted derivative destination is null");
+    if (total_weights[walker].get().size() !=
+            static_cast<std::size_t>(vp_list[walker].getTotalNum()) ||
+        weighted_derivatives[walker].size <
+            static_cast<std::size_t>(optvars.size_of_active()))
+      throw std::invalid_argument(
+          "PsiFormer weighted derivative-ratio outputs have the wrong shape");
+    if (vp_list[walker].getRefPS().isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer weighted nonlocal derivatives do not support spinor virtual moves");
+    if (vp_list[walker].refPtcl < 0 ||
+        vp_list[walker].refPtcl >= vp_list[walker].getRefPS().getTotalNum())
+      throw std::out_of_range(
+          "PsiFormer weighted derivative-ratio reference electron is invalid");
+    if (static_cast<std::size_t>(vp_list[walker].getRefPS().getTotalNum()) !=
+        transaction.modelTransaction().model().ne)
+      throw std::invalid_argument(
+          "PsiFormer weighted derivative-ratio walker has the wrong electron count");
+    for (std::size_t local_index = 0;
+         local_index < transaction.variables().size(); ++local_index)
+    {
+      const int global_index = transaction.variables().where(local_index);
+      if (global_index >= 0 && static_cast<std::size_t>(global_index) >=
+              weighted_derivatives[walker].size)
+        throw std::out_of_range(
+            "PsiFormer weighted derivative destination index is out of range");
+    }
+  }
+
+  pf::DirectScoreWorkspace* score_workspace =
+      transaction.modelTransaction().state().direct_score_mode ==
+          DirectBackendMode::DIRECT
+      ? &resource.requireScoreWorkspace()
+      : nullptr;
+  SelectedDerivativeDelta scratch;
+  // Each walker reduction is staged in one O(active) row and published only
+  // after all of that walker's virtual positions succeed.
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    component.evaluateDerivRatiosWeightedImpl(
+        transaction, vp_list[walker], optvars, total_weights[walker].get(),
+        weighted_derivatives[walker].size, score_workspace, scratch);
+    for (const auto& [global_index, value] : scratch)
+      weighted_derivatives[walker][global_index] += value;
   }
 }
 
@@ -3701,54 +3719,109 @@ void PsiFormerWF::evaluateSpinorDerivRatios(const VirtualParticleSet&,
 // Add only score derivatives, avoiding the mixed coordinate-jet reverse used for kinetic derivatives.
 void PsiFormerWF::evaluateDerivativesWF(ParticleSet& p, const OptVariables&, Vector<ValueType>& dlogpsi)
 {
-  if (!optimization_metadata_->enabled || !hasActiveParameters())
+  PsiFormerDerivativeReadTransaction transaction(*model_state_,
+                                                  *optimization_metadata_);
+  synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
+  if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
     return;
 
-  if (model_state_->direct_score_mode == DirectBackendMode::DIRECT)
+  SelectedDerivativeDelta delta;
+  if (transaction.modelTransaction().state().direct_score_mode ==
+      DirectBackendMode::DIRECT)
   {
-    const pf::DirectScoreResult result = evaluateDirectScorePositions(p, -1, nullptr);
-    addSelectedGradient(result.parameter_score.data, result.parameter_score.size, dlogpsi);
+    pf::DirectScoreWorkspace& workspace = requireDirectScoreWorkspace();
+    const pf::DirectScoreResult result = evaluateDirectScorePositionsUnderRead(
+        transaction.modelTransaction(), p, -1, nullptr, workspace);
+    gatherSelectedGradientUnderRead(
+        transaction, result.parameter_score.data, result.parameter_score.size,
+        ValueType(1), static_cast<std::size_t>(dlogpsi.size()), delta);
   }
   else
   {
-    const pf::Result result = evaluate(p, -1, EvaluationPurpose::SCORE_ONLY);
-    addSelectedGradient(result.param_gradient, dlogpsi);
+    const pf::Result result = evaluatePositionsUnderRead(
+        transaction.modelTransaction(), p, -1, nullptr,
+        EvaluationPurpose::SCORE_ONLY);
+    gatherSelectedGradientUnderRead(
+        transaction, result.param_gradient.data(), result.param_gradient.size(),
+        ValueType(1), static_cast<std::size_t>(dlogpsi.size()), delta);
   }
+  for (const auto& [global_index, value] : delta)
+    dlogpsi[global_index] += value;
 }
 
 // Fill score rows using one serialized crowd tape in direct mode.
 void PsiFormerWF::mw_evaluateParameterDerivativesWF(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list,
-    const OptVariables& optvars,
+    const OptVariables&,
     RecordArray<ValueType>& dlogpsi) const
 {
   assert(this == &wfc_list.getLeader());
   if (wfc_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wfc_list.size())
     throw std::invalid_argument("PsiFormer batched score outputs have inconsistent shapes");
+  if (wfc_list.empty())
+    return;
 
   const int parameter_count = dlogpsi.getNumOfParams();
-  if (model_state_->direct_score_mode == DirectBackendMode::DIRECT)
-  {
-    pf::DirectScoreWorkspace& score_workspace =
-        requireMultiWalkerResource(wfc_list).requireScoreWorkspace();
-    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-    {
-      auto& component = dynamic_cast<PsiFormerWF&>(wfc_list[walker]);
-      if (!component.optimization_metadata_->enabled || !component.hasActiveParameters())
-        continue;
-      Vector<ValueType> score(dlogpsi[walker], parameter_count);
-      const pf::DirectScoreResult result =
-          component.evaluateDirectScorePositions(p_list[walker], -1, nullptr, score_workspace);
-      component.addSelectedGradient(result.parameter_score.data, result.parameter_score.size, score);
-    }
+  PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+  PsiFormerDerivativeReadTransaction transaction(*model_state_,
+                                                  *optimization_metadata_);
+  const std::size_t parameter_version =
+      transaction.modelTransaction().parameterVersion();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
+        parameter_version);
+  if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
     return;
-  }
 
+  for (std::size_t local_index = 0;
+       local_index < transaction.variables().size(); ++local_index)
+  {
+    const int global_index = transaction.variables().where(local_index);
+    if (global_index >= parameter_count)
+      throw std::out_of_range("PsiFormer score destination index is out of range");
+  }
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    if (static_cast<std::size_t>(p_list[walker].getTotalNum()) !=
+        transaction.modelTransaction().model().ne)
+      throw std::invalid_argument("PsiFormer score walker has the wrong electron count");
+
+  const DirectBackendMode score_mode =
+      transaction.modelTransaction().state().direct_score_mode;
+  pf::DirectScoreWorkspace* score_workspace = score_mode == DirectBackendMode::DIRECT
+      ? &resource.requireScoreWorkspace()
+      : nullptr;
+  SelectedDerivativeDelta scratch;
+  auto evaluate_row = [&](PsiFormerWF& component, std::size_t walker) {
+    if (score_mode == DirectBackendMode::DIRECT)
+    {
+      const pf::DirectScoreResult result =
+          component.evaluateDirectScorePositionsUnderRead(
+              transaction.modelTransaction(), p_list[walker], -1, nullptr,
+              *score_workspace);
+      component.gatherSelectedGradientUnderRead(
+          transaction, result.parameter_score.data, result.parameter_score.size,
+          ValueType(1), static_cast<std::size_t>(parameter_count), scratch);
+    }
+    else
+    {
+      const pf::Result result = component.evaluatePositionsUnderRead(
+          transaction.modelTransaction(), p_list[walker], -1, nullptr,
+          EvaluationPurpose::SCORE_ONLY);
+      component.gatherSelectedGradientUnderRead(
+          transaction, result.param_gradient.data(), result.param_gradient.size(),
+          ValueType(1), static_cast<std::size_t>(parameter_count), scratch);
+    }
+  };
+
+  // Stage and publish one complete walker row at a time.
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    evaluate_row(component, walker);
     Vector<ValueType> score(dlogpsi[walker], parameter_count);
-    dynamic_cast<PsiFormerWF&>(wfc_list[walker]).evaluateDerivativesWF(p_list[walker], optvars, score);
+    for (const auto& [global_index, value] : scratch)
+      score[global_index] += value;
   }
 }
 
@@ -3758,68 +3831,95 @@ void PsiFormerWF::evaluateDerivatives(ParticleSet& p,
                                       Vector<ValueType>& dlogpsi,
                                       Vector<ValueType>& dhpsioverpsi)
 {
-  if (optimization_metadata_->enabled && hasActiveParameters())
+  PsiFormerDerivativeReadTransaction transaction(*model_state_,
+                                                  *optimization_metadata_);
+  synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
+  if (optimization_metadata_->enabled && transaction.hasActiveParameters())
   {
     requireUnitElectronMasses(p);
     requireRealTotalWavefunctionDrift(p);
   }
-  evaluateDerivativesImpl(p, optvars, dlogpsi, dhpsioverpsi, nullptr, nullptr);
+  SelectedDerivativeDelta score_delta;
+  SelectedDerivativeDelta kinetic_delta;
+  evaluateDerivativesImpl(
+      transaction, p, optvars, static_cast<std::size_t>(dlogpsi.size()),
+      static_cast<std::size_t>(dhpsioverpsi.size()), nullptr, nullptr,
+      score_delta, kinetic_delta);
+  for (const auto& [global_index, value] : score_delta)
+    dlogpsi[global_index] += value;
+  for (const auto& [global_index, value] : kinetic_delta)
+    dhpsioverpsi[global_index] += value;
 }
 
 // Evaluate one kinetic response using either lazy scalar scratch or an acquired crowd tape.
 void PsiFormerWF::evaluateDerivativesImpl(
+    const PsiFormerDerivativeReadTransaction& transaction,
     ParticleSet& p,
     const OptVariables&,
-    Vector<ValueType>& dlogpsi,
-    Vector<ValueType>& dhpsioverpsi,
+    std::size_t score_destination_size,
+    std::size_t kinetic_destination_size,
     pf::DirectKineticWorkspace* crowd_workspace,
-    std::vector<double>* crowd_total_log_gradient)
+    std::vector<double>* crowd_total_log_gradient,
+    SelectedDerivativeDelta& score_output,
+    SelectedDerivativeDelta& kinetic_output)
 {
-  if (!optimization_metadata_->enabled || !hasActiveParameters())
+  score_output.clear();
+  kinetic_output.clear();
+  if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
     return;
   if ((crowd_workspace == nullptr) != (crowd_total_log_gradient == nullptr))
     throw std::invalid_argument("PsiFormer kinetic scratch requires both tape and total-drift storage");
 
+  const DirectBackendMode kinetic_mode =
+      transaction.modelTransaction().state().direct_kinetic_mode;
   std::optional<pf::Result> oracle;
-  if (model_state_->direct_kinetic_mode != DirectBackendMode::DIRECT)
+  if (kinetic_mode != DirectBackendMode::DIRECT)
   {
-    oracle = evaluate(p, -1, EvaluationPurpose::SCORE_AND_KINETIC);
-    if (model_state_->direct_kinetic_mode == DirectBackendMode::ORACLE)
+    oracle = evaluatePositionsUnderRead(
+        transaction.modelTransaction(), p, -1, nullptr,
+        EvaluationPurpose::SCORE_AND_KINETIC);
+    gatherSelectedGradientUnderRead(
+        transaction, oracle->param_gradient.data(), oracle->param_gradient.size(),
+        ValueType(1), score_destination_size, score_output);
+    gatherSelectedGradientUnderRead(
+        transaction, oracle->local_energy_param_gradient.data(),
+        oracle->local_energy_param_gradient.size(), ValueType(1),
+        kinetic_destination_size, kinetic_output);
+    if (kinetic_mode == DirectBackendMode::ORACLE)
     {
-      addSelectedGradient(oracle->param_gradient, dlogpsi);
-      addSelectedGradient(oracle->local_energy_param_gradient, dhpsioverpsi);
       return;
     }
   }
 
-  pf::DirectKineticResultView direct;
-  {
-    std::shared_lock state_lock(model_state_->mutex);
-    pf::PsiFormer& model = model_state_->model;
-    synchronizeParameterVersion(model.p.version());
-    if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
-      throw std::runtime_error("PsiFormerWF electron count differs from exported model");
+  const pf::PsiFormer& model = transaction.modelTransaction().model();
+  if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
+    throw std::runtime_error("PsiFormerWF electron count differs from exported model");
 
-    pf::DirectKineticWorkspace& kinetic_workspace =
-        crowd_workspace ? *crowd_workspace : requireDirectKineticWorkspace();
-    std::vector<double>& total_log_gradient =
-        crowd_total_log_gradient ? *crowd_total_log_gradient : requireDirectTotalLogGradient();
-    if (total_log_gradient.size() != 3 * model.ne)
-      throw std::logic_error("PsiFormer direct total-drift buffer has the wrong size");
+  pf::DirectKineticWorkspace& kinetic_workspace =
+      crowd_workspace ? *crowd_workspace : requireDirectKineticWorkspace();
+  std::vector<double>& total_log_gradient =
+      crowd_total_log_gradient ? *crowd_total_log_gradient
+                               : requireDirectTotalLogGradient();
+  if (total_log_gradient.size() != 3 * model.ne)
+    throw std::logic_error("PsiFormer direct total-drift buffer has the wrong size");
 
-    // ParticleSet::G is the complete TrialWaveFunction drift, not merely the
-    // PsiFormer contribution. Repack it for every walker before tape reuse.
-    for (int electron = 0; electron < p.getTotalNum(); ++electron)
-      for (int dimension = 0; dimension < 3; ++dimension)
-      {
-        kinetic_workspace.setPosition(electron, dimension, std::real(p.R[electron][dimension]));
-        total_log_gradient[3 * electron + dimension] =
-            std::real(p.G[electron][dimension]);
-      }
+  // ParticleSet::G is the complete TrialWaveFunction drift, not merely the
+  // PsiFormer contribution. Repack it for every walker before tape reuse.
+  for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      kinetic_workspace.setPosition(electron, dimension,
+                                    std::real(p.R[electron][dimension]));
+      total_log_gradient[3 * electron + dimension] =
+          std::real(p.G[electron][dimension]);
+    }
 
-    direct = model_state_->direct_kinetic_executor.evaluate(
-        kinetic_workspace, total_log_gradient.data(), total_log_gradient.size());
-  }
+  const pf::DirectKineticResultView direct =
+      transaction.modelTransaction().state().direct_kinetic_executor.evaluate(
+          kinetic_workspace, total_log_gradient.data(),
+          total_log_gradient.size());
+  if (direct.parameter_version != transaction.modelTransaction().parameterVersion())
+    throw std::logic_error("PsiFormer direct kinetic evaluation observed inconsistent parameters");
 
   if (oracle)
   {
@@ -3836,9 +3936,13 @@ void PsiFormerWF::evaluateDerivativesImpl(
     }
   }
 
-  addSelectedGradient(direct.parameter_score.data(), direct.parameter_score.size(), dlogpsi);
-  addSelectedGradient(direct.kinetic_parameter_response.data(),
-                      direct.kinetic_parameter_response.size(), dhpsioverpsi);
+  gatherSelectedGradientUnderRead(
+      transaction, direct.parameter_score.data(), direct.parameter_score.size(),
+      ValueType(1), score_destination_size, score_output);
+  gatherSelectedGradientUnderRead(
+      transaction, direct.kinetic_parameter_response.data(),
+      direct.kinetic_parameter_response.size(), ValueType(1),
+      kinetic_destination_size, kinetic_output);
 }
 
 // Fill score and kinetic rows serially through one resource-owned direct kinetic tape.
@@ -3854,45 +3958,66 @@ void PsiFormerWF::mw_evaluateParameterDerivatives(
       dhpsioverpsi.getNumOfEntries() != wfc_list.size() ||
       dlogpsi.getNumOfParams() != dhpsioverpsi.getNumOfParams())
     throw std::invalid_argument("PsiFormer batched derivative outputs have inconsistent shapes");
+  if (wfc_list.empty())
+    return;
+
+  PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+  PsiFormerDerivativeReadTransaction transaction(*model_state_,
+                                                  *optimization_metadata_);
+  const std::size_t parameter_version =
+      transaction.modelTransaction().parameterVersion();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
+        parameter_version);
+  if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
+    return;
 
   // Validate every active walker before allocating or mutating the shared
   // kinetic tape so a heterogeneous-mass crowd fails as one atomic request.
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
-    const auto& component = dynamic_cast<const PsiFormerWF&>(wfc_list[walker]);
-    if (component.optimization_metadata_->enabled && component.hasActiveParameters())
-    {
-      requireUnitElectronMasses(p_list[walker]);
-      requireRealTotalWavefunctionDrift(p_list[walker]);
-    }
+    if (static_cast<std::size_t>(p_list[walker].getTotalNum()) !=
+        transaction.modelTransaction().model().ne)
+      throw std::invalid_argument(
+          "PsiFormer kinetic derivative walker has the wrong electron count");
+    requireUnitElectronMasses(p_list[walker]);
+    requireRealTotalWavefunctionDrift(p_list[walker]);
   }
 
   const int parameter_count = dlogpsi.getNumOfParams();
-  if (model_state_->direct_kinetic_mode != DirectBackendMode::ORACLE)
+  for (std::size_t local_index = 0;
+       local_index < transaction.variables().size(); ++local_index)
   {
-    PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
-    pf::DirectKineticWorkspace& kinetic_workspace = resource.requireKineticWorkspace();
-    std::vector<double>& total_log_gradient       = resource.requireTotalLogGradient();
-    assert(resource.kinetic_workspace);
-    assert(total_log_gradient.size() ==
-           3 * model_state_->execution_plan.modelShape().electrons());
-    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-    {
-      Vector<ValueType> score(dlogpsi[walker], parameter_count);
-      Vector<ValueType> kinetic_response(dhpsioverpsi[walker], parameter_count);
-      dynamic_cast<PsiFormerWF&>(wfc_list[walker])
-          .evaluateDerivativesImpl(p_list[walker], optvars, score, kinetic_response,
-                                   &kinetic_workspace, &total_log_gradient);
-    }
-    return;
+    const int global_index = transaction.variables().where(local_index);
+    if (global_index >= parameter_count)
+      throw std::out_of_range("PsiFormer kinetic derivative destination index is out of range");
   }
-
+  const DirectBackendMode kinetic_mode =
+      transaction.modelTransaction().state().direct_kinetic_mode;
+  pf::DirectKineticWorkspace* kinetic_workspace = nullptr;
+  std::vector<double>* total_log_gradient        = nullptr;
+  if (kinetic_mode != DirectBackendMode::ORACLE)
+  {
+    kinetic_workspace  = &resource.requireKineticWorkspace();
+    total_log_gradient = &resource.requireTotalLogGradient();
+  }
+  SelectedDerivativeDelta score_delta;
+  SelectedDerivativeDelta kinetic_delta;
+  // Stage and publish one complete score/kinetic walker row at a time.
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    component.evaluateDerivativesImpl(
+        transaction, p_list[walker], optvars,
+        static_cast<std::size_t>(parameter_count),
+        static_cast<std::size_t>(parameter_count), kinetic_workspace,
+        total_log_gradient, score_delta, kinetic_delta);
     Vector<ValueType> score(dlogpsi[walker], parameter_count);
     Vector<ValueType> kinetic_response(dhpsioverpsi[walker], parameter_count);
-    dynamic_cast<PsiFormerWF&>(wfc_list[walker])
-        .evaluateDerivatives(p_list[walker], optvars, score, kinetic_response);
+    for (const auto& [global_index, value] : score_delta)
+      score[global_index] += value;
+    for (const auto& [global_index, value] : kinetic_delta)
+      kinetic_response[global_index] += value;
   }
 }
 

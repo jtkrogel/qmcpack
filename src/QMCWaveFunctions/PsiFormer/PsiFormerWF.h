@@ -452,19 +452,6 @@ private:
     SELECTED_PARTICLES
   };
 
-  /// Evaluate an accepted or proposed configuration for one public-call purpose.
-  pf::Result evaluate(const ParticleSet& particles,
-                      int replaced_particle,
-                      EvaluationPurpose purpose,
-                      int active_gradient_particle = -1);
-
-  /// Evaluate a configuration with an optional explicit replacement for one electron position.
-  pf::Result evaluatePositions(const ParticleSet& particles,
-                               int replaced_particle,
-                               const PosType* replacement_position,
-                               EvaluationPurpose purpose,
-                               int active_gradient_particle = -1);
-
   /// Evaluate through an already-held model transaction without reacquiring its mutex.
   pf::Result evaluatePositionsUnderRead(const PsiFormerReadTransaction& transaction,
                                         const ParticleSet& particles,
@@ -517,17 +504,6 @@ private:
   /// Lazily size the clone-local complete-drift buffer used by scalar kinetic calls.
   std::vector<double>& requireDirectTotalLogGradient();
 
-  /// Evaluate a direct score and return a view into the clone-local score workspace.
-  pf::DirectScoreResult evaluateDirectScorePositions(const ParticleSet& particles,
-                                                     int replaced_particle,
-                                                     const PosType* replacement_position);
-
-  /// Evaluate a direct score into caller-owned scratch, enabling crowd-level reuse.
-  pf::DirectScoreResult evaluateDirectScorePositions(const ParticleSet& particles,
-                                                     int replaced_particle,
-                                                     const PosType* replacement_position,
-                                                     pf::DirectScoreWorkspace& workspace);
-
   /// Evaluate a score in caller-selected scratch under one model read transaction.
   pf::DirectScoreResult evaluateDirectScorePositionsUnderRead(
       const PsiFormerReadTransaction& transaction,
@@ -536,20 +512,41 @@ private:
       const PosType* replacement_position,
       pf::DirectScoreWorkspace& workspace);
 
+  /// Evaluate virtual ratios while retaining a caller-owned model transaction.
+  void evaluateRatiosUnderRead(const PsiFormerReadTransaction& transaction,
+                               const VirtualParticleSet& virtual_particles,
+                               std::vector<ValueType>& ratios);
+
+  using SelectedDerivativeDelta = std::vector<std::pair<std::size_t, ValueType>>;
+
+  /// Copy and validate active score entries while state and metadata remain locked.
+  void gatherSelectedGradientUnderRead(
+      const PsiFormerDerivativeReadTransaction& transaction,
+      const double* flat_gradient,
+      std::size_t gradient_size,
+      ValueType scale,
+      std::size_t destination_size,
+      SelectedDerivativeDelta& output) const;
+
   /// Validate and reduce weighted virtual score differences using optional crowd scratch.
-  void evaluateDerivRatiosWeightedImpl(const VirtualParticleSet& virtual_particles,
+  void evaluateDerivRatiosWeightedImpl(const PsiFormerDerivativeReadTransaction& transaction,
+                                       const VirtualParticleSet& virtual_particles,
                                        const OptVariables& optvars,
                                        const std::vector<ValueType>& total_weights,
-                                       ParameterDerivativeView weighted_derivatives,
-                                       pf::DirectScoreWorkspace* crowd_workspace);
+                                       std::size_t destination_size,
+                                       pf::DirectScoreWorkspace* crowd_workspace,
+                                       SelectedDerivativeDelta& output);
 
   /// Evaluate score and kinetic response with optional resource-owned scratch.
-  void evaluateDerivativesImpl(ParticleSet& particles,
+  void evaluateDerivativesImpl(const PsiFormerDerivativeReadTransaction& transaction,
+                               ParticleSet& particles,
                                const OptVariables& optvars,
-                               Vector<ValueType>& dlogpsi,
-                               Vector<ValueType>& dhpsioverpsi,
+                               std::size_t score_destination_size,
+                               std::size_t kinetic_destination_size,
                                pf::DirectKineticWorkspace* crowd_workspace,
-                               std::vector<double>* crowd_total_log_gradient);
+                               std::vector<double>* crowd_total_log_gradient,
+                               SelectedDerivativeDelta& score_output,
+                               SelectedDerivativeDelta& kinetic_output);
 
   /// Count clone- and crowd-owned kinetic tapes for the bounded-memory regression.
   std::array<std::size_t, 2> directKineticWorkspaceOwnershipForTesting(
@@ -560,36 +557,6 @@ private:
 
   /// Report shared optimizer metadata ownership and the empty inherited variable set.
   testing::PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnosticsForTesting() const;
-
-  /// Return true when at least one selected local parameter maps to a global active variable.
-  bool hasActiveParameters() const;
-
-  /// Add selected entries from a native flat gradient to a QMCPACK derivative vector.
-  void addSelectedGradient(const std::vector<double>& flat_gradient, Vector<ValueType>& output) const;
-
-  /// Accumulate selected entries directly from a non-owning canonical score buffer.
-  void addSelectedGradient(const double* flat_gradient,
-                           std::size_t gradient_size,
-                           Vector<ValueType>& output) const;
-
-  /// Add a scaled native score directly to one active-parameter destination view.
-  void addSelectedGradientScaled(const double* flat_gradient,
-                                 std::size_t gradient_size,
-                                 ValueType scale,
-                                 ParameterDerivativeView output) const;
-
-  /// Add a scaled native score directly to one row of a compatibility matrix.
-  void addSelectedGradientScaled(const double* flat_gradient,
-                                 std::size_t gradient_size,
-                                 ValueType scale,
-                                 Matrix<ValueType>& output,
-                                 std::size_t row) const;
-
-  /// Add selected differences between virtual and reference score vectors to one matrix row.
-  void addSelectedGradientDifference(const std::vector<double>& reference_gradient,
-                                     const std::vector<double>& virtual_gradient,
-                                     Matrix<ValueType>& output,
-                                     std::size_t row) const;
 
   /// Invalidate accepted/proposed caches and record the newly observed shared version.
   void invalidateParameterCaches(std::size_t parameter_version);

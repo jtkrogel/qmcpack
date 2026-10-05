@@ -621,4 +621,46 @@ TEST_CASE("PsiFormer selected-electron proposals honor oracle and compare backen
   }
 }
 
+TEST_CASE("PsiFormer resource mismatch leaves both crowds immediately reusable",
+          "[wavefunction][psiformer][multiwalker][resource][threading]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd_a(files, simulation_cell, 1);
+  Crowd crowd_b(files, simulation_cell, 1);
+
+  ResourceCollection template_a("psiformer_model_a_template");
+  ResourceCollection template_b("psiformer_model_b_template");
+  crowd_a.leader.createResource(template_a);
+  crowd_b.leader.createResource(template_b);
+  ResourceCollection resource_a(template_a);
+  ResourceCollection resource_b(template_b);
+
+  // A same-typed resource from a distinct shared model must be rejected without
+  // publishing a leader handle or consuming the collection cursor.
+  CHECK_THROWS_AS(ResourceCollectionTeamLock<WaveFunctionComponent>(resource_a, crowd_b.wfc_list),
+                  std::logic_error);
+
+  auto evaluate_one = [](Crowd& crowd, ResourceCollection& resource) {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, crowd.wfc_list);
+    std::vector<PsiFormerWF::GradType> gradients(crowd.wfc_list.size());
+    crowd.leader.mw_evalGrad(crowd.wfc_list, *crowd.p_list, 0, gradients);
+    for (const auto& gradient : gradients)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        CHECK(std::isfinite(std::real(gradient[dimension])));
+  };
+
+  // Both the rejected leader and the mismatched collection remain usable.
+  evaluate_one(crowd_b, resource_b);
+  evaluate_one(crowd_a, resource_a);
+
+  // Heterogeneous component lists fail before lending any resource.
+  RefVectorWithLeader<WaveFunctionComponent> mixed_components(crowd_a.leader);
+  mixed_components.push_back(crowd_a.leader);
+  mixed_components.push_back(crowd_b.leader);
+  CHECK_THROWS_AS(ResourceCollectionTeamLock<WaveFunctionComponent>(resource_a, mixed_components),
+                  std::invalid_argument);
+  evaluate_one(crowd_a, resource_a);
+}
+
 } // namespace qmcplusplus
