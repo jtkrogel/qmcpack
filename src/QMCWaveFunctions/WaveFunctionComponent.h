@@ -18,6 +18,7 @@
 #ifndef QMCPLUSPLUS_WAVEFUNCTIONCOMPONENT_H
 #define QMCPLUSPLUS_WAVEFUNCTIONCOMPONENT_H
 
+#include <cstdint>
 #include <memory>
 #include "Message/Communicate.h"
 #include "Configuration.h"
@@ -38,6 +39,7 @@ namespace qmcplusplus
 {
 ///forward declaration
 class WaveFunctionComponent;
+class TrialWaveFunction;
 class ResourceCollection;
 class TWFFastDerivWrapper;
 template<CoordsType CT>
@@ -104,6 +106,42 @@ public:
 
     /// Access one active-parameter destination entry.
     ValueType& operator[](std::size_t index) const { return data[index]; }
+  };
+
+  /** Opaque identity of the versioned state used by one value evaluation.
+   *
+   * The identity token is process-local and is meaningful only while its
+   * source object remains alive.  Consumers may test equality and whether a
+   * stamp is versioned, but the source and version deliberately remain
+   * opaque.  Versioned components must create and return this stamp while
+   * their value transaction is still held; querying a version after the
+   * value call would permit a publication race.
+   */
+  class EvaluationStamp
+  {
+  public:
+    EvaluationStamp() noexcept = default;
+
+    static EvaluationStamp versioned(const void* source_identity, std::uint64_t version);
+
+    bool isVersioned() const noexcept { return source_identity_ != nullptr; }
+
+    friend bool operator==(const EvaluationStamp& lhs, const EvaluationStamp& rhs) noexcept
+    {
+      return lhs.source_identity_ == rhs.source_identity_ && lhs.version_ == rhs.version_;
+    }
+
+    friend bool operator!=(const EvaluationStamp& lhs, const EvaluationStamp& rhs) noexcept { return !(lhs == rhs); }
+
+  private:
+    EvaluationStamp(const void* source_identity, std::uint64_t version) noexcept
+        : source_identity_(source_identity), version_(version)
+    {}
+
+    const void* source_identity_ = nullptr;
+    std::uint64_t version_       = 0;
+
+    friend class TrialWaveFunction;
   };
 
   /** current update mode */
@@ -580,6 +618,21 @@ public:
   virtual void mw_evaluateRatios(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                                  const RefVectorWithLeader<const VirtualParticleSet>& vp_list,
                                  std::vector<std::vector<ValueType>>& ratios) const;
+
+  /** Evaluate a ragged flattened batch of virtual ratios.
+   *
+   * The compatibility implementation validates all list and output shapes,
+   * serializes descriptor segments through one distinct caller-owned scratch
+   * object per walker, and publishes ratios only after every segment succeeds.
+   * Versioned overrides return the state/version stamp captured inside the
+   * same value transaction; generic components return an unversioned stamp.
+   */
+  virtual EvaluationStamp mw_evaluateVirtualRatios(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const VirtualParticleBatch& batch,
+      std::vector<ValueType>& ratios) const;
 
   // Batched version of evaluateSpinorRatios
   virtual void mw_evaluateSpinorRatios(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

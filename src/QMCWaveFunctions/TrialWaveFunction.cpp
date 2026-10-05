@@ -21,6 +21,7 @@
 #include <exception>
 #include <set>
 #include <stdexcept>
+#include <typeinfo>
 
 #include "TrialWaveFunction.h"
 #include "Particle/MCMultiParticleMoves.h"
@@ -1310,6 +1311,106 @@ void TrialWaveFunction::mw_evaluateSpinorRatios(
         ratios[j] *= t[iw][j];
     }
   }
+}
+
+void TrialWaveFunction::mw_evaluateVirtualRatios(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    const VirtualParticleBatch& batch,
+    std::vector<ValueType>& ratios,
+    std::vector<EvaluationStamp>& evaluation_stamps,
+    ComputeType ct)
+{
+  if (wf_list.size() != batch.walkerCount() || p_list.size() != batch.walkerCount() ||
+      vp_scratch_list.size() != batch.walkerCount())
+    throw std::invalid_argument(
+        "TrialWaveFunction::mw_evaluateVirtualRatios list sizes do not match the descriptor walker count.");
+  batch.validateOutputExtent(ratios.size());
+  batch.validateFor(p_list);
+
+  switch (ct)
+  {
+  case ComputeType::ALL:
+  case ComputeType::FERMIONIC:
+  case ComputeType::NONFERMIONIC:
+    break;
+  default:
+    throw std::invalid_argument("TrialWaveFunction::mw_evaluateVirtualRatios received an invalid ComputeType.");
+  }
+
+  TrialWaveFunction& wf_leader = wf_list.getLeader();
+  const std::size_t component_count = wf_leader.Z.size();
+  for (std::size_t walker = 0; walker < batch.walkerCount(); ++walker)
+  {
+    for (std::size_t other = 0; other < walker; ++other)
+    {
+      if (std::addressof(wf_list[walker]) == std::addressof(wf_list[other]))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualRatios requires one distinct wavefunction clone per walker.");
+      if (std::addressof(vp_scratch_list[walker]) == std::addressof(vp_scratch_list[other]))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualRatios requires one distinct scratch object per walker.");
+    }
+    if (wf_list[walker].Z.size() != component_count)
+      throw std::invalid_argument(
+          "TrialWaveFunction::mw_evaluateVirtualRatios wavefunction clones have different component counts.");
+
+    const ParticleSet* scratch_as_particles = static_cast<const ParticleSet*>(std::addressof(vp_scratch_list[walker]));
+    for (std::size_t reference = 0; reference < batch.walkerCount(); ++reference)
+      if (scratch_as_particles == std::addressof(p_list[reference]))
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualRatios scratch objects must not alias reference walkers.");
+    if (vp_scratch_list[walker].isSpinor() != p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "TrialWaveFunction::mw_evaluateVirtualRatios reference and scratch spinor modes do not match.");
+  }
+
+  for (std::size_t component = 0; component < component_count; ++component)
+    for (std::size_t walker = 0; walker < batch.walkerCount(); ++walker)
+      if (typeid(*wf_list[walker].Z[component]) != typeid(*wf_leader.Z[component]) ||
+          wf_list[walker].Z[component]->isFermionic() != wf_leader.Z[component]->isFermionic())
+        throw std::invalid_argument(
+            "TrialWaveFunction::mw_evaluateVirtualRatios wavefunction clones have incompatible component topology.");
+
+  ScopedTimer local_timer(wf_leader.TWF_timers_[NL_TIMER]);
+  std::vector<ValueType> staged_ratios(batch.size(), ValueType(1));
+  std::vector<EvaluationStamp> staged_stamps;
+  staged_stamps.reserve(component_count);
+  std::vector<ValueType> component_ratios(batch.size());
+
+  for (std::size_t component = 0; component < component_count; ++component)
+  {
+    const WaveFunctionComponent& component_leader = *wf_leader.Z[component];
+    const bool selected = ct == ComputeType::ALL ||
+        (component_leader.isFermionic() && ct == ComputeType::FERMIONIC) ||
+        (!component_leader.isFermionic() && ct == ComputeType::NONFERMIONIC);
+    if (!selected)
+      continue;
+
+    ScopedTimer component_timer(wf_leader.WFC_timers_[NL_TIMER + TIMER_SKIP * component]);
+    const RefVectorWithLeader<WaveFunctionComponent> wfc_list = extractWFCRefList(wf_list, component);
+    const EvaluationStamp stamp = component_leader.mw_evaluateVirtualRatios(
+        wfc_list, p_list, vp_scratch_list, batch, component_ratios);
+    if (component_ratios.size() != batch.size())
+      throw std::runtime_error(
+          "WaveFunctionComponent::mw_evaluateVirtualRatios changed the flattened output extent.");
+
+    if (stamp.isVersioned())
+    {
+      for (const EvaluationStamp& prior_stamp : staged_stamps)
+        if (prior_stamp.source_identity_ == stamp.source_identity_ && prior_stamp.version_ != stamp.version_)
+          throw std::runtime_error(
+              "TrialWaveFunction::mw_evaluateVirtualRatios observed conflicting versions of one shared state.");
+      staged_stamps.push_back(stamp);
+    }
+
+    for (std::size_t virtual_index = 0; virtual_index < batch.size(); ++virtual_index)
+      staged_ratios[virtual_index] *= component_ratios[virtual_index];
+  }
+
+  ratios.swap(staged_ratios);
+  evaluation_stamps.swap(staged_stamps);
 }
 
 void TrialWaveFunction::evaluateDerivRatios(const VirtualParticleSet& VP,

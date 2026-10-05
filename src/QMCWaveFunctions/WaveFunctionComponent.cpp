@@ -17,6 +17,10 @@
 
 #include "WaveFunctionComponent.h"
 
+#include <algorithm>
+#include <stdexcept>
+#include <typeinfo>
+
 namespace qmcplusplus
 {
 // for return types
@@ -27,6 +31,15 @@ WaveFunctionComponent::WaveFunctionComponent(const std::string& obj_name)
 {}
 
 WaveFunctionComponent::~WaveFunctionComponent() = default;
+
+WaveFunctionComponent::EvaluationStamp WaveFunctionComponent::EvaluationStamp::versioned(
+    const void* source_identity,
+    std::uint64_t version)
+{
+  if (source_identity == nullptr)
+    throw std::invalid_argument("A versioned wavefunction evaluation stamp requires a non-null source identity.");
+  return EvaluationStamp(source_identity, version);
+}
 
 void WaveFunctionComponent::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                                            const RefVectorWithLeader<ParticleSet>& p_list,
@@ -330,6 +343,69 @@ void WaveFunctionComponent::mw_evaluateRatios(const RefVectorWithLeader<WaveFunc
   assert(this == &wfc_list.getLeader());
   for (int iw = 0; iw < wfc_list.size(); iw++)
     wfc_list[iw].evaluateRatios(vp_list[iw], ratios[iw]);
+}
+
+WaveFunctionComponent::EvaluationStamp WaveFunctionComponent::mw_evaluateVirtualRatios(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    const VirtualParticleBatch& batch,
+    std::vector<ValueType>& ratios) const
+{
+  if (this != std::addressof(wfc_list.getLeader()))
+    throw std::invalid_argument(
+        "WaveFunctionComponent::mw_evaluateVirtualRatios must be invoked on the component-list leader.");
+  if (wfc_list.size() != batch.walkerCount() || p_list.size() != batch.walkerCount() ||
+      vp_scratch_list.size() != batch.walkerCount())
+    throw std::invalid_argument(
+        "WaveFunctionComponent::mw_evaluateVirtualRatios list sizes do not match the descriptor walker count.");
+
+  batch.validateOutputExtent(ratios.size());
+  batch.validateFor(p_list);
+
+  for (std::size_t walker = 0; walker < batch.walkerCount(); ++walker)
+  {
+    if (typeid(wfc_list[walker]) != typeid(wfc_list.getLeader()))
+      throw std::invalid_argument(
+          "WaveFunctionComponent::mw_evaluateVirtualRatios component clones have different dynamic types.");
+    for (std::size_t other = 0; other < walker; ++other)
+    {
+      if (std::addressof(wfc_list[walker]) == std::addressof(wfc_list[other]))
+        throw std::invalid_argument(
+            "WaveFunctionComponent::mw_evaluateVirtualRatios requires one distinct component clone per walker.");
+      if (std::addressof(vp_scratch_list[walker]) == std::addressof(vp_scratch_list[other]))
+        throw std::invalid_argument(
+            "WaveFunctionComponent::mw_evaluateVirtualRatios requires one distinct scratch object per walker.");
+    }
+
+    const ParticleSet* scratch_as_particles = static_cast<const ParticleSet*>(std::addressof(vp_scratch_list[walker]));
+    for (std::size_t reference = 0; reference < batch.walkerCount(); ++reference)
+      if (scratch_as_particles == std::addressof(p_list[reference]))
+        throw std::invalid_argument(
+            "WaveFunctionComponent::mw_evaluateVirtualRatios scratch objects must not alias reference walkers.");
+    if (vp_scratch_list[walker].isSpinor() != p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "WaveFunctionComponent::mw_evaluateVirtualRatios reference and scratch spinor modes do not match.");
+  }
+
+  std::vector<ValueType> staged_ratios(batch.size());
+  for (std::size_t segment_index = 0; segment_index < batch.segmentCount(); ++segment_index)
+  {
+    const VirtualParticleBatch::Slice slice = batch.slice(segment_index);
+    VirtualParticleSet& scratch              = vp_scratch_list[slice.walkerId()];
+    scratch.makeMovesAbsolute(p_list[slice.walkerId()], slice.electronId(), slice.positions(), slice.isOnSphere(),
+                              slice.sourceCenterId());
+
+    std::vector<ValueType> segment_ratios(slice.size());
+    wfc_list[slice.walkerId()].evaluateRatios(scratch, segment_ratios);
+    if (segment_ratios.size() != slice.size())
+      throw std::runtime_error(
+          "WaveFunctionComponent::evaluateRatios changed the flattened virtual-ratio output extent.");
+    std::copy(segment_ratios.begin(), segment_ratios.end(), staged_ratios.begin() + slice.flatOffset());
+  }
+
+  ratios.swap(staged_ratios);
+  return EvaluationStamp{};
 }
 
 void WaveFunctionComponent::mw_evaluateSpinorRatios(

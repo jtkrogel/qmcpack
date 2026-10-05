@@ -89,6 +89,7 @@ public:
   using LogValue                = WaveFunctionComponent::LogValue;
   using PsiValue                = WaveFunctionComponent::PsiValue;
   using ParameterDerivativeView = WaveFunctionComponent::ParameterDerivativeView;
+  using EvaluationStamp         = WaveFunctionComponent::EvaluationStamp;
 
   using SPOMap = SPOSet::SPOMap;
 
@@ -341,6 +342,24 @@ public:
                                 const RefVectorWithLeader<const VirtualParticleSet>& Vp_list,
                                 const RefVector<std::vector<ValueType>>& ratios_list,
                                 ComputeType ct = ComputeType::ALL);
+
+  /** Form complete products for a ragged flattened virtual-particle batch.
+   *
+   * Generic components use their serialized compatibility implementation.
+   * Ratios and process-local opaque stamps are staged and replaced together
+   * only after all selected components succeed.  Versioned stamps retain
+   * selected component order; unversioned components contribute no stamp.
+   * This generic interface has no source-particle set, so callers with
+   * on-sphere segments must first validate source-center upper bounds through
+   * VirtualParticleBatch::validateFor using the applicable source count.
+   */
+  static void mw_evaluateVirtualRatios(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+                                       const RefVectorWithLeader<ParticleSet>& p_list,
+                                       const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+                                       const VirtualParticleBatch& batch,
+                                       std::vector<ValueType>& ratios,
+                                       std::vector<EvaluationStamp>& evaluation_stamps,
+                                       ComputeType ct = ComputeType::ALL);
 
   // batched version of evaluateSpinorRatios
   static void mw_evaluateSpinorRatios(const RefVectorWithLeader<TrialWaveFunction>& wf_list,
