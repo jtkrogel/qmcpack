@@ -17,9 +17,11 @@
 // File created by: Jeongnim Kim, jeongnim.kim@gmail.com, University of Illinois at Urbana-Champaign
 //////////////////////////////////////////////////////////////////////////////////////
 
+#include <set>
 #include <stdexcept>
 
 #include "TrialWaveFunction.h"
+#include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "ResourceCollection.h"
 #include "Utilities/IteratorUtility.h"
 #include "Concurrency/Info.hpp"
@@ -923,6 +925,23 @@ UniqueOptObjRefs TrialWaveFunction::extractOptimizableObjectRefs()
   for (int i = 0; i < Z.size(); i++)
     Z[i]->extractOptimizableObjectRefs(opt_obj_refs);
   return opt_obj_refs;
+}
+
+std::vector<std::reference_wrapper<wftrain::StructuredParameterProvider>>
+TrialWaveFunction::extractStructuredParameterProviders()
+{
+  std::vector<std::reference_wrapper<wftrain::StructuredParameterProvider>> providers;
+  std::set<std::string> provider_ids;
+  for (const auto& component : Z)
+    if (wftrain::StructuredParameterProvider* provider = component->structuredParameterProvider())
+    {
+      const std::string& provider_id = provider->parameterSchema().providerId();
+      if (!provider_ids.insert(provider_id).second)
+        throw std::invalid_argument("Distinct structured parameter providers have duplicate identity " +
+                                    provider_id);
+      providers.emplace_back(*provider);
+    }
+  return providers;
 }
 
 void TrialWaveFunction::checkInVariables(OptVariables& active)

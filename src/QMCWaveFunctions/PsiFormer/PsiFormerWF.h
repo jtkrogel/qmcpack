@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_PSIFORMERWF_H
 
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
+#include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "ResourceHandle.h"
 #include <array>
 #include <cstddef>
@@ -136,7 +137,9 @@ class TestPsiFormerWF;
  * accepted and proposed move state remains clone-local. Object-specific VP
  * records persist the complete model independently of the selected scalar list.
  */
-class PsiFormerWF : public WaveFunctionComponent, public OptimizableObject
+class PsiFormerWF : public WaveFunctionComponent,
+                    public OptimizableObject,
+                    public wftrain::StructuredParameterProvider
 {
 public:
   /// Load a native model and optionally expose selected flat parameters to QMCPACK.
@@ -173,6 +176,19 @@ public:
 
   /// Report whether this component explicitly exposes selected parameters.
   bool isOptimizable() const override;
+
+  /// Expose this component to the structured route without scalar registration.
+  wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override { return this; }
+
+  /// Return native tensor metadata in canonical DeepQMC flat order.
+  const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override;
+
+  /// Copy the complete native vector under the shared model lock.
+  wftrain::StructuredParameterSnapshot snapshotParameters() const override;
+
+  /// Atomically publish one complete, version-matched native vector.
+  std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
+                                std::size_t expected_version) override;
 
   /// Add this component's optimization object when selected-parameter optimization is enabled.
   void extractOptimizableObjectRefs(UniqueOptObjRefs& opt_obj_refs) override;
@@ -547,6 +563,8 @@ private:
   std::shared_ptr<PsiFormerSharedState> model_state_;
   /// Clone-family optimizer names, global indices, and canonical flat-index mapping.
   std::shared_ptr<PsiFormerOptimizationMetadata> optimization_metadata_;
+  /// Clone-shared tensor metadata for the scalar-registration-free training route.
+  std::shared_ptr<const wftrain::StructuredParameterSchema> structured_parameter_schema_;
   /// Lazily present fixed-size value buffers owned independently by this clone.
   std::unique_ptr<pf::DirectValueWorkspace> direct_value_workspace_;
   /// Lazily present fixed-size score tape owned independently by an optimizable clone.

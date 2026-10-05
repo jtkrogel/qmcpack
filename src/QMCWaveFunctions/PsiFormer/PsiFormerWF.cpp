@@ -291,6 +291,21 @@ InitializedNativeModel makeInitializedNativeModel(
   return {std::move(model), std::move(initialized.profile), initialized.seed};
 }
 
+/// Convert the native DeepQMC leaf layout into compact tensor-level training metadata.
+std::shared_ptr<const wftrain::StructuredParameterSchema> makeStructuredParameterSchema(
+    const std::string& component_name,
+    const pf::Parameters& parameters)
+{
+  std::vector<wftrain::ParameterBlockDescriptor> blocks;
+  blocks.reserve(parameters.layouts.size());
+  for (const pf::Layout& layout : parameters.layouts)
+    blocks.push_back({layout.module + "/" + layout.name, layout.shape, layout.begin,
+                      layout.end - layout.begin, wftrain::ParameterScalarDomain::REAL64,
+                      true, "neural_network"});
+  return std::make_shared<const wftrain::StructuredParameterSchema>(
+      "psiformer/" + component_name, std::move(blocks));
+}
+
 } // namespace
 
 /** Shared native model protected at the optimizer/evaluator synchronization
@@ -674,6 +689,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
     : WaveFunctionComponent(name),
       OptimizableObject(name),
       model_state_(std::move(model_state)),
+      structured_parameter_schema_(
+          makeStructuredParameterSchema(name, model_state_->model.p)),
       optimized_parameter_export_(std::move(optimized_parameter_export))
 {
   if (!enable_optimization && !selected_flat_indices.empty())
@@ -771,6 +788,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       OptimizableObject(other),
       model_state_(other.model_state_),
       optimization_metadata_(other.optimization_metadata_),
+      structured_parameter_schema_(other.structured_parameter_schema_),
       system_kind_(other.system_kind_),
       optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
@@ -799,6 +817,42 @@ PsiFormerWF::~PsiFormerWF() = default;
 bool PsiFormerWF::isOptimizable() const
 {
   return optimization_metadata_->enabled;
+}
+
+const wftrain::StructuredParameterSchema& PsiFormerWF::parameterSchema() const noexcept
+{
+  return *structured_parameter_schema_;
+}
+
+wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  const pf::Parameters& parameters = model_state_->model.p;
+  return {structured_parameter_schema_->fingerprint(), parameters.version(),
+          parameters.flat_values()};
+}
+
+std::size_t PsiFormerWF::publishParameters(
+    const wftrain::StructuredParameterSnapshot& candidate,
+    std::size_t expected_version)
+{
+  if (candidate.schema_fingerprint != structured_parameter_schema_->fingerprint())
+    throw std::invalid_argument("PsiFormer structured update has an incompatible schema fingerprint");
+  if (candidate.values.size() != structured_parameter_schema_->parameterCount())
+    throw std::invalid_argument("PsiFormer structured update has the wrong parameter count");
+  if (candidate.version != expected_version)
+    throw std::invalid_argument("PsiFormer structured update candidate has the wrong source version");
+
+  std::unique_lock state_lock(model_state_->mutex);
+  pf::Parameters& parameters = model_state_->model.p;
+  if (parameters.version() != expected_version)
+    throw std::runtime_error("PsiFormer structured update rejected a stale parameter version");
+
+  // set_flat_values validates every value before mutating the native leaves.
+  parameters.set_flat_values(candidate.values);
+  const std::size_t committed_version = parameters.version();
+  invalidateParameterCaches(committed_version);
+  return committed_version;
 }
 
 // Add one cloneable workspace.  A copied ResourceCollection reconstructs empty

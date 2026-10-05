@@ -40,6 +40,10 @@ namespace qmcplusplus
 class WaveFunctionComponent;
 class ResourceCollection;
 class TWFFastDerivWrapper;
+namespace wftrain
+{
+class StructuredParameterProvider;
+}
 /**@defgroup WaveFunctionComponent group
  * @brief Classes which constitute a many-body trial wave function
  *
@@ -149,6 +153,13 @@ public:
    * @param active a super set of optimizable variables
    */
   virtual void checkOutVariables(const OptVariables& active);
+
+  /** Return this component's tensor-level training provider when available.
+   *
+   * The structured route is independent of legacy scalar VariableSet
+   * registration, so fixed-in-inference components may still provide it.
+   */
+  virtual wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept { return nullptr; }
 
   /** Register the component with the TWFFastDerivWrapper wrapper.  
    */

@@ -117,6 +117,7 @@ set(TRIALWF_SRC
     test_psiformer_guards.cpp
     test_psiformer_multiwalker.cpp
     test_psiformer_threading.cpp
+    test_psiformer_training_provider.cpp
     test_psiformer_wf.cpp
     test_structured_parameter_provider.cpp)
 if(ENABLE_DEEPQMC_INFERENCE)

@@ -42,6 +42,10 @@ namespace qmcplusplus
 class SlaterDet;
 class MultiSlaterDetTableMethod;
 class TWFFastDerivWrapper;
+namespace wftrain
+{
+class StructuredParameterProvider;
+}
 
 /** @ingroup MBWfs
  * @brief Class to represent a many-body trial wave function
@@ -148,6 +152,10 @@ public:
    * @param opt_obj_refs aggregated list of optimizable object references
    */
   UniqueOptObjRefs extractOptimizableObjectRefs();
+
+  /// Collect unique tensor-level providers without registering scalar variables.
+  std::vector<std::reference_wrapper<wftrain::StructuredParameterProvider>>
+      extractStructuredParameterProviders();
 
   /** Check in an optimizable parameter
    * @param o aggregated list of optimizable variables
