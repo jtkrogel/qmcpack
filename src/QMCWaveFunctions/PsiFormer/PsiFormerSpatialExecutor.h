@@ -986,7 +986,9 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
 {
   std::fill(workspace.scalar_gradient_scratch_.begin(), workspace.scalar_gradient_scratch_.end(), 0.0);
   std::fill(workspace.scalar_laplacian_scratch_.begin(), workspace.scalar_laplacian_scratch_.end(), 0.0);
-  const double same_alpha = tensor(parameters, layout_->same_alpha_)[0];
+  const double same_alpha = layout_->same_alpha_.size == 0
+      ? 1.0
+      : tensor(parameters, layout_->same_alpha_)[0];
   const double opposite_alpha = tensor(parameters, layout_->anti_alpha_)[0];
   const auto& identities      = workspace.geometry_.electronPairs();
   const GeometryPairTable& pair_table = workspace.geometry_.electronElectronPairs();

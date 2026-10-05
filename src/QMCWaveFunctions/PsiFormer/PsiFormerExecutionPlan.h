@@ -197,6 +197,15 @@ public:
   const ParameterTensorDescriptor& parameter(ParameterRole role,
                                              std::size_t attention_block = NO_ATTENTION_BLOCK) const;
 
+  /// Return whether the plan contains one typed descriptor.
+  bool hasParameter(ParameterRole role,
+                    std::size_t attention_block = NO_ATTENTION_BLOCK) const;
+
+  /// Resolve an optional typed descriptor, returning null when the role is absent.
+  const ParameterTensorDescriptor* optionalParameter(
+      ParameterRole role,
+      std::size_t attention_block = NO_ATTENTION_BLOCK) const;
+
 private:
   ModelShape model_shape_;
   ExecutionEnvironment environment_;

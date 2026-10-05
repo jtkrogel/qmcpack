@@ -1355,7 +1355,9 @@ inline double DirectKineticExecutor::buildCusp(const double* parameters,
 {
   std::fill(workspace.cusp_gradient_.begin(), workspace.cusp_gradient_.end(), 0.0);
   std::fill(workspace.cusp_laplacian_.begin(), workspace.cusp_laplacian_.end(), 0.0);
-  const double same_alpha = parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0];
+  const double same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA)
+      ? parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0]
+      : 1.0;
   const double opposite_alpha =
       parameter(parameters, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
   const auto& identities = workspace.geometry_.electronPairs();
@@ -1714,10 +1716,15 @@ inline void DirectKineticExecutor::reverseCusp(
     DirectKineticWorkspace& workspace,
     std::vector<double>& destination) const
 {
-  const double same_alpha = parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0];
+  const bool has_same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA);
+  const double same_alpha = has_same_alpha
+      ? parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0]
+      : 1.0;
   const double opposite_alpha =
       parameter(parameters, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
-  double& same_response = response(destination, ParameterRole::CUSP_SAME_ALPHA)[0];
+  double* same_response = has_same_alpha
+      ? response(destination, ParameterRole::CUSP_SAME_ALPHA)
+      : nullptr;
   double& opposite_response =
       response(destination, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
   const auto& identities = workspace.geometry_.electronPairs();
@@ -1753,7 +1760,15 @@ inline void DirectKineticExecutor::reverseCusp(
     contribution +=
         (workspace.root_adjoint_.laplacian[pair.first] +
          workspace.root_adjoint_.laplacian[pair.second]) * radial_laplacian_derivative;
-    (same_spin ? same_response : opposite_response) += contribution;
+    if (same_spin)
+    {
+      if (!same_response)
+        throw std::logic_error(
+            "PsiFormer kinetic plan omitted a required same-spin cusp parameter");
+      same_response[0] += contribution;
+    }
+    else
+      opposite_response += contribution;
   }
 }
 

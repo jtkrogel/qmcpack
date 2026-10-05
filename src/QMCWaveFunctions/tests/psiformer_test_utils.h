@@ -80,12 +80,13 @@ struct Leaf
 };
 
 /// Construct the complete four-block PsiFormer layout used by integration tests.
-inline std::vector<Leaf> makeLayout(std::size_t electron_count, std::size_t nucleus_count)
+inline std::vector<Leaf> makeLayout(std::size_t electron_count,
+                                    std::size_t nucleus_count,
+                                    bool has_same_spin_pair = true)
 {
   const std::string prefix = "neural_network_wave_function/~/";
   std::vector<Leaf> leaves{
       {prefix + "electronic_cusp_asymptotic", "anti_alpha", {}},
-      {prefix + "electronic_cusp_asymptotic", "same_alpha", {}},
       {prefix + "exponential_envelopes", "pi_down", {16 * electron_count, nucleus_count}},
       {prefix + "exponential_envelopes", "pi_up", {16 * electron_count, nucleus_count}},
       {prefix + "exponential_envelopes", "zetas_down", {16 * electron_count, nucleus_count}},
@@ -94,6 +95,9 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count, std::size_t nucl
       {prefix + "omni_net/~/Backflow_1/~/mlp/linear_0", "w", {256, 16 * electron_count}},
       {prefix + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w", {4 * nucleus_count + 1, 256}},
   };
+  if (has_same_spin_pair)
+    leaves.insert(leaves.begin() + 1,
+                  {prefix + "electronic_cusp_asymptotic", "same_alpha", {}});
   for (int layer = 0; layer < 4; ++layer)
   {
     const std::string layer_name = layer == 0 ? "electron_gnn_layer" : "electron_gnn_layer_" + std::to_string(layer);
@@ -276,7 +280,8 @@ inline GeneratedFiles generateFiles(const std::string& system)
   const Geometry geometry       = makeGeometry(system);
   const std::size_t electron_count = geometry.electrons.size() / 3;
   const std::size_t nucleus_count  = geometry.nuclei.size() / 3;
-  const auto leaves             = makeLayout(electron_count, nucleus_count);
+  const bool has_same_spin_pair = geometry.nup >= 2 || electron_count - geometry.nup >= 2;
+  const auto leaves = makeLayout(electron_count, nucleus_count, has_same_spin_pair);
   const auto values             = makeParameters(system, leaves);
   std::vector<std::string> modules, names;
   std::vector<std::int64_t> ranks, shapes(2 * leaves.size(), 1), offsets{0};

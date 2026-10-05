@@ -39,6 +39,7 @@ set(WFBASE_SRCS
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
     PsiFormer/PsiFormerExecutionPlan.cpp
+    PsiFormer/PsiFormerInitialization.cpp
     PsiFormer/PsiFormerGeometry.cpp
     PsiFormer/PsiFormerWorkspace.cpp
     PsiFormer/PsiFormerWF.cpp

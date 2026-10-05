@@ -13,6 +13,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWorkspace.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdint>
 #include <numeric>
@@ -56,15 +57,15 @@ void appendLayout(std::vector<ParameterLayoutInput>& layouts,
 }
 
 /// Construct all string-keyed layouts emitted for the test architecture.
-TestParameterStore makeParameterStore()
+TestParameterStore makeParameterStore(ModelShape model = testModelShape(), bool include_same_alpha = true)
 {
-  const ModelShape model = testModelShape();
   const std::size_t electrons = model.electrons();
   const std::string prefix = "neural_network_wave_function/~/";
   TestParameterStore store;
 
   appendLayout(store.layouts, prefix + "electronic_cusp_asymptotic", "anti_alpha", {});
-  appendLayout(store.layouts, prefix + "electronic_cusp_asymptotic", "same_alpha", {});
+  if (include_same_alpha)
+    appendLayout(store.layouts, prefix + "electronic_cusp_asymptotic", "same_alpha", {});
   appendLayout(store.layouts, prefix + "exponential_envelopes", "pi_down",
                {model.determinants * electrons, model.nuclei});
   appendLayout(store.layouts, prefix + "exponential_envelopes", "pi_up",
@@ -158,6 +159,36 @@ TEST_CASE("PsiFormer execution plan rejects unsupported or malformed models", "[
   TestParameterStore missing = makeParameterStore();
   missing.layouts.pop_back();
   CHECK_THROWS_AS(PsiFormerExecutionPlan::fromParameters(missing, testModelShape()), std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer execution plan supports a canonical optional same-spin cusp",
+          "[wavefunction][psiformer]")
+{
+  const ModelShape pair_free_shape = testModelShape();
+  TestParameterStore canonical = makeParameterStore(pair_free_shape, false);
+  const PsiFormerExecutionPlan plan =
+      PsiFormerExecutionPlan::fromParameters(canonical, pair_free_shape);
+
+  CHECK(plan.parameterTensors().size() == 24);
+  CHECK_FALSE(plan.hasParameter(ParameterRole::CUSP_SAME_ALPHA));
+  CHECK(plan.optionalParameter(ParameterRole::CUSP_SAME_ALPHA) == nullptr);
+  CHECK(plan.hasParameter(ParameterRole::CUSP_OPPOSITE_ALPHA));
+  CHECK(plan.optionalParameter(ParameterRole::CUSP_OPPOSITE_ALPHA) ==
+        &plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA));
+  CHECK_THROWS_AS(plan.parameter(ParameterRole::CUSP_SAME_ALPHA), std::out_of_range);
+
+  // An older export containing the unused scalar remains readable for a 1+1
+  // model, but any spin population containing a pair requires the leaf.
+  TestParameterStore legacy = makeParameterStore(pair_free_shape, true);
+  const PsiFormerExecutionPlan legacy_plan =
+      PsiFormerExecutionPlan::fromParameters(legacy, pair_free_shape);
+  CHECK(legacy_plan.hasParameter(ParameterRole::CUSP_SAME_ALPHA));
+
+  ModelShape same_pair_shape = pair_free_shape;
+  same_pair_shape.spin_up_electrons = 2;
+  TestParameterStore missing_required = makeParameterStore(same_pair_shape, false);
+  CHECK_THROWS_WITH(PsiFormerExecutionPlan::fromParameters(missing_required, same_pair_shape),
+                    Catch::Matchers::ContainsSubstring("same-spin cusp alpha"));
 }
 
 TEST_CASE("PsiFormer workspace grows only at explicit preparation boundaries", "[wavefunction][psiformer]")

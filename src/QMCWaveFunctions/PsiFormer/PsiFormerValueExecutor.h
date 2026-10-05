@@ -104,7 +104,8 @@ public:
       throw std::invalid_argument("PsiFormer direct value execution supports only fixed-ion real molecular models");
 
     anti_alpha_ = interval(plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA));
-    same_alpha_ = interval(plan.parameter(ParameterRole::CUSP_SAME_ALPHA));
+    if (const auto* same_alpha = plan.optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
+      same_alpha_ = interval(*same_alpha);
     pi_down_    = interval(plan.parameter(ParameterRole::ENVELOPE_PI_DOWN));
     pi_up_      = interval(plan.parameter(ParameterRole::ENVELOPE_PI_UP));
     zeta_down_  = interval(plan.parameter(ParameterRole::ENVELOPE_ZETA_DOWN));
@@ -602,7 +603,9 @@ private:
   /// Accumulate same- and opposite-spin analytic electron-electron cusp terms.
   double cuspValue(const double* parameters, const DirectValueWorkspace& workspace) const
   {
-    const double same_alpha = tensor(parameters, layout_->same_alpha_)[0];
+    const double same_alpha = layout_->same_alpha_.size == 0
+        ? 1.0
+        : tensor(parameters, layout_->same_alpha_)[0];
     const double anti_alpha = tensor(parameters, layout_->anti_alpha_)[0];
     const auto& pairs       = workspace.geometry_.electronPairs();
     const auto& distances   = workspace.geometry_.electronElectronPairs().distances();

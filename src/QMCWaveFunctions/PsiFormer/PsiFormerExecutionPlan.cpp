@@ -12,6 +12,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <optional>
 #include <sstream>
@@ -243,7 +244,43 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
   }
   parameter_count_ = expected_begin;
 
-  const std::size_t expected_tensor_count = 9 + 8 * model_shape_.attention_blocks;
+  // Every role is required except same-spin alpha when neither spin population
+  // contains a pair.  DeepQMC does not materialize that unused leaf for a 1+1
+  // system, while older portable exports may still contain it.
+  const std::array<ParameterRole, 8> required_global_roles{
+      ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
+      ParameterRole::BACKFLOW_UP_WEIGHT,
+      ParameterRole::BACKFLOW_DOWN_WEIGHT,
+      ParameterRole::ENVELOPE_PI_UP,
+      ParameterRole::ENVELOPE_PI_DOWN,
+      ParameterRole::ENVELOPE_ZETA_UP,
+      ParameterRole::ENVELOPE_ZETA_DOWN,
+      ParameterRole::CUSP_OPPOSITE_ALPHA};
+  for (ParameterRole role : required_global_roles)
+    if (!hasParameter(role))
+      throw std::invalid_argument(std::string("PsiFormer parameter export is missing required role ") +
+                                  parameterRoleName(role));
+  for (std::size_t block = 0; block < model_shape_.attention_blocks; ++block)
+    for (ParameterRole role : {ParameterRole::ATTENTION_QUERY_WEIGHT,
+                               ParameterRole::ATTENTION_KEY_WEIGHT,
+                               ParameterRole::ATTENTION_VALUE_WEIGHT,
+                               ParameterRole::ATTENTION_OUTPUT_WEIGHT,
+                               ParameterRole::UPDATE_HIDDEN_WEIGHT,
+                               ParameterRole::UPDATE_HIDDEN_BIAS,
+                               ParameterRole::UPDATE_OUTPUT_WEIGHT,
+                               ParameterRole::UPDATE_OUTPUT_BIAS})
+      if (!hasParameter(role, block))
+        throw std::invalid_argument(std::string("PsiFormer parameter export is missing required role ") +
+                                    parameterRoleName(role));
+
+  const bool has_same_spin_pair = model_shape_.spin_up_electrons >= 2 ||
+      model_shape_.spin_down_electrons >= 2;
+  if (has_same_spin_pair && !hasParameter(ParameterRole::CUSP_SAME_ALPHA))
+    throw std::invalid_argument(
+        "PsiFormer parameter export is missing same-spin cusp alpha for a populated same-spin pair");
+
+  const std::size_t expected_tensor_count = 8 + 8 * model_shape_.attention_blocks +
+      (hasParameter(ParameterRole::CUSP_SAME_ALPHA) ? 1 : 0);
   if (parameter_tensors_.size() != expected_tensor_count)
     throw std::invalid_argument("PsiFormer parameter export does not contain the complete architecture layout");
 }
@@ -269,6 +306,22 @@ AdjointConvention PsiFormerExecutionPlan::adjointConvention() const
 // Resolve typed parameter metadata without performing string lookup in an evaluation.
 const ParameterTensorDescriptor& PsiFormerExecutionPlan::parameter(ParameterRole role, std::size_t block) const
 {
+  const ParameterTensorDescriptor* descriptor = optionalParameter(role, block);
+  if (!descriptor)
+    throw std::out_of_range(std::string("PsiFormer parameter role is absent: ") + parameterRoleName(role));
+  return *descriptor;
+}
+
+// Report whether a typed role is represented without forcing optional roles to exist.
+bool PsiFormerExecutionPlan::hasParameter(ParameterRole role, std::size_t block) const
+{
+  return optionalParameter(role, block) != nullptr;
+}
+
+// Resolve a typed role while preserving the absence of architecture-dependent leaves.
+const ParameterTensorDescriptor* PsiFormerExecutionPlan::optionalParameter(ParameterRole role,
+                                                                            std::size_t block) const
+{
   const std::size_t role_index = static_cast<std::size_t>(role);
   if (role_index >= PARAMETER_ROLE_COUNT || (block != NO_ATTENTION_BLOCK && block >= model_shape_.attention_blocks))
     throw std::out_of_range("PsiFormer parameter role lookup is out of range");
@@ -276,8 +329,8 @@ const ParameterTensorDescriptor& PsiFormerExecutionPlan::parameter(ParameterRole
   const std::size_t block_slot = block == NO_ATTENTION_BLOCK ? 0 : block + 1;
   const std::size_t descriptor_index = descriptor_lookup_[role_index * lookup_stride + block_slot];
   if (descriptor_index == NO_ATTENTION_BLOCK)
-    throw std::out_of_range(std::string("PsiFormer parameter role is absent: ") + parameterRoleName(role));
-  return parameter_tensors_[descriptor_index];
+    return nullptr;
+  return &parameter_tensors_[descriptor_index];
 }
 
 // Provide readable role names for diagnostics, profiling labels, and tests.

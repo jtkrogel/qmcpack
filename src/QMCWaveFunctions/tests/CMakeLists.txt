@@ -111,6 +111,7 @@ set(TRIALWF_SRC
     test_twf_fastderiv_raii.cpp
     test_TWFGrads.cpp
     test_psiformer_execution_plan.cpp
+    test_psiformer_initialization.cpp
     test_psiformer_geometry.cpp
     test_psiformer_buffer.cpp
     test_psiformer_guards.cpp

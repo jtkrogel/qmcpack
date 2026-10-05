@@ -1980,7 +1980,7 @@ struct Parameters
   std::map<std::pair<std::string, std::string>, NodePtr> nodes;
   size_t parameter_version = 0;
 
-  /// Load flattened parameters and materialize their named graph leaves.
+  /// Load flattened parameters, then use the common in-memory validation path.
   explicit Parameters(const std::string& path)
   {
     const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -1988,7 +1988,7 @@ struct Parameters
       throw std::runtime_error("Unable to open PsiFormer parameter file " + path);
 
     // Read the single flat parameter array and its parallel layout metadata.
-    values                                 = read_double(file, "/values");
+    std::vector<double> parameter_values   = read_double(file, "/values");
     const std::vector<std::string> modules = read_strings(file, "/layout/modules");
     const std::vector<std::string> names   = read_strings(file, "/layout/names");
     const std::vector<int64_t> ranks       = read_i64(file, "/layout/ranks");
@@ -1999,13 +1999,11 @@ struct Parameters
     const size_t parameter_count = modules.size();
     if (names.size() != parameter_count || ranks.size() != parameter_count || offsets.size() != parameter_count + 1 ||
         shape_table_shape.size() != 2 || shape_table_shape[0] != parameter_count || offsets.empty() ||
-        offsets.front() != 0 || offsets.back() != static_cast<int64_t>(values.size()))
+        offsets.front() != 0 || offsets.back() != static_cast<int64_t>(parameter_values.size()))
       throw std::runtime_error("PsiFormer parameter file has inconsistent layout metadata");
-    if (std::any_of(values.begin(), values.end(), [](double value) { return !is_finite_parameter_value(value); }))
-      throw std::runtime_error("PsiFormer parameter file contains a non-finite value");
 
-    // Materialize each flattened interval as a named parameter leaf. These
-    // leaves become parents in the reverse-mode graph assembled at evaluation.
+    std::vector<Layout> parameter_layouts;
+    parameter_layouts.reserve(parameter_count);
     for (size_t parameter_index = 0; parameter_index < modules.size(); ++parameter_index)
     {
       if (ranks[parameter_index] < 0 ||
@@ -2022,20 +2020,22 @@ struct Parameters
 
       Layout layout{modules[parameter_index], names[parameter_index], parameter_shape, size_t(offsets[parameter_index]),
                     size_t(offsets[parameter_index + 1])};
-      const size_t tensor_size = std::accumulate(parameter_shape.begin(), parameter_shape.end(), size_t{1},
-                                                 std::multiplies<size_t>());
-      if (layout.end - layout.begin != tensor_size)
-        throw std::runtime_error("PsiFormer parameter tensor shape does not match its flat interval");
-      if (nodes.count({layout.module, layout.name}) != 0)
-        throw std::runtime_error("PsiFormer parameter file contains a duplicate tensor name");
-      std::vector<double> parameter_values(values.begin() + layout.begin, values.begin() + layout.end);
-      NodePtr parameter_node        = node(Tensor(parameter_shape, std::move(parameter_values)));
-      parameter_node->parameter_key = modules[parameter_index] + "/" + names[parameter_index];
-
-      layouts.push_back(layout);
-      nodes[{modules[parameter_index], names[parameter_index]}] = parameter_node;
+      parameter_layouts.push_back(std::move(layout));
     }
     H5Fclose(file);
+
+    initialize(std::move(parameter_values), std::move(parameter_layouts));
+  }
+
+  /** Construct parameters from an owning flat vector and canonical layout.
+   *
+   * This is the file-free construction boundary used by native QMCPACK model
+   * initialization.  It deliberately applies the same checks and creates the
+   * same named graph leaves as the HDF5 constructor.
+   */
+  Parameters(std::vector<double> parameter_values, std::vector<Layout> parameter_layouts)
+  {
+    initialize(std::move(parameter_values), std::move(parameter_layouts));
   }
 
   /// Return the number of scalar parameters in canonical DeepQMC export order.
@@ -2266,6 +2266,52 @@ struct Parameters
     }
     return flat_gradient;
   }
+
+private:
+  /// Validate canonical storage and materialize named reverse-graph leaves once.
+  void initialize(std::vector<double> parameter_values, std::vector<Layout> parameter_layouts)
+  {
+    if (parameter_values.empty() || parameter_layouts.empty())
+      throw std::runtime_error("PsiFormer parameters require a nonempty flat vector and tensor layout");
+    if (std::any_of(parameter_values.begin(), parameter_values.end(),
+                    [](double value) { return !is_finite_parameter_value(value); }))
+      throw std::runtime_error("PsiFormer parameters contain a non-finite value");
+
+    std::map<std::pair<std::string, std::string>, NodePtr> parameter_nodes;
+    size_t expected_begin = 0;
+    for (const Layout& layout : parameter_layouts)
+    {
+      if (layout.begin != expected_begin || layout.end < layout.begin || layout.end > parameter_values.size())
+        throw std::runtime_error("PsiFormer parameter layout is not a contiguous flat-vector partition");
+
+      size_t tensor_size = 1;
+      for (size_t extent : layout.shape)
+      {
+        if (extent != 0 && tensor_size > std::numeric_limits<size_t>::max() / extent)
+          throw std::overflow_error("PsiFormer parameter tensor size overflow");
+        tensor_size *= extent;
+      }
+      if (layout.end - layout.begin != tensor_size)
+        throw std::runtime_error("PsiFormer parameter tensor shape does not match its flat interval");
+
+      const auto key = std::make_pair(layout.module, layout.name);
+      if (parameter_nodes.count(key) != 0)
+        throw std::runtime_error("PsiFormer parameters contain a duplicate tensor name");
+
+      std::vector<double> tensor_values(parameter_values.begin() + layout.begin,
+                                        parameter_values.begin() + layout.end);
+      NodePtr parameter_node        = node(Tensor(layout.shape, std::move(tensor_values)));
+      parameter_node->parameter_key = layout.module + "/" + layout.name;
+      parameter_nodes.emplace(key, std::move(parameter_node));
+      expected_begin = layout.end;
+    }
+    if (expected_begin != parameter_values.size())
+      throw std::runtime_error("PsiFormer parameter layout does not cover the complete flat vector");
+
+    values = std::move(parameter_values);
+    layouts = std::move(parameter_layouts);
+    nodes = std::move(parameter_nodes);
+  }
 };
 
 /** System metadata and reference configurations read from the configuration
@@ -2275,11 +2321,11 @@ struct ConfigData
   Tensor electrons;
   Tensor nuclei;
   Tensor charges;
-  size_t nup;
-  size_t ndown;
-  size_t nconfig;
+  size_t nup     = 0;
+  size_t ndown   = 0;
+  size_t nconfig = 0;
 
-  /// Load electron configurations, nuclei, charges, and spin populations.
+  /// Load physical data, then use the common in-memory validation path.
   explicit ConfigData(const std::string& path)
   {
     const hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -2293,14 +2339,54 @@ struct ConfigData
     charges.x   = read_double(file, "/nuclear_charges", &charges.shape);
     const int64_t nup_input   = read_attr_i64(file, "n_up");
     const int64_t ndown_input = read_attr_i64(file, "n_down");
-    if (nup_input <= 0 || ndown_input <= 0)
-      throw std::runtime_error("PsiFormer configuration requires positive up- and down-spin populations");
-    nup     = nup_input;
-    ndown   = ndown_input;
-    nconfig = electrons.shape.empty() ? 0 : electrons.shape[0];
-
     H5Fclose(file);
 
+    if (nup_input <= 0 || ndown_input <= 0)
+      throw std::runtime_error("PsiFormer configuration requires positive up- and down-spin populations");
+    nup   = static_cast<size_t>(nup_input);
+    ndown = static_cast<size_t>(ndown_input);
+    validate();
+  }
+
+  /** Construct physical metadata and reference configurations without HDF5.
+   *
+   * The tensor shapes are part of the input so the same representation serves
+   * internally initialized models and portable-file imports.
+   */
+  ConfigData(Tensor electron_positions,
+             Tensor nuclear_positions,
+             Tensor nuclear_charges,
+             size_t spin_up_electrons,
+             size_t spin_down_electrons)
+      : electrons(std::move(electron_positions)),
+        nuclei(std::move(nuclear_positions)),
+        charges(std::move(nuclear_charges)),
+        nup(spin_up_electrons),
+        ndown(spin_down_electrons)
+  {
+    validate();
+  }
+
+  /// Extract one electron configuration as an [electron, Cartesian] tensor.
+  Tensor configuration(size_t configuration_index) const
+  {
+    if (configuration_index >= nconfig)
+      throw std::out_of_range("PsiFormer configuration index is out of range");
+    const size_t configuration_size = (nup + ndown) * 3;
+    const auto begin                = electrons.x.begin() + configuration_index * configuration_size;
+    const auto end                  = begin + configuration_size;
+    return Tensor({nup + ndown, 3}, std::vector<double>(begin, end));
+  }
+
+private:
+  /// Check the common physical-system tensor contract for every construction path.
+  void validate()
+  {
+    if (nup == 0 || ndown == 0)
+      throw std::runtime_error("PsiFormer configuration requires positive up- and down-spin populations");
+    if (nup > std::numeric_limits<size_t>::max() - ndown)
+      throw std::overflow_error("PsiFormer configuration electron count overflow");
+    nconfig = electrons.shape.empty() ? 0 : electrons.shape[0];
     const size_t electron_count = nup + ndown;
     if (electrons.shape != Shape{nconfig, electron_count, 3} || nuclei.shape.size() != 2 ||
         nuclei.shape[1] != 3 || charges.shape != Shape{nuclei.shape[0]} || nconfig == 0)
@@ -2309,16 +2395,7 @@ struct ConfigData
       return std::any_of(values.begin(), values.end(), [](double value) { return !is_finite_parameter_value(value); });
     };
     if (contains_nonfinite(electrons.x) || contains_nonfinite(nuclei.x) || contains_nonfinite(charges.x))
-      throw std::runtime_error("PsiFormer configuration file contains a non-finite value");
-  }
-
-  /// Extract one electron configuration as an [electron, Cartesian] tensor.
-  Tensor configuration(size_t configuration_index) const
-  {
-    const size_t configuration_size = (nup + ndown) * 3;
-    const auto begin                = electrons.x.begin() + configuration_index * configuration_size;
-    const auto end                  = begin + configuration_size;
-    return Tensor({nup + ndown, 3}, std::vector<double>(begin, end));
+      throw std::runtime_error("PsiFormer configuration contains a non-finite value");
   }
 };
 
@@ -2373,8 +2450,7 @@ struct EvaluationRequest
   ValidationHamiltonianRequest validation_hamiltonian = ValidationHamiltonianRequest::STRAIGHT_COULOMB;
 };
 
-/** Builds and evaluates the four-block PsiFormer wavefunction from imported
- * parameters. */
+/** Builds and evaluates a PsiFormer wavefunction from imported or in-memory data. */
 struct PsiFormer
 {
   // Short member names are retained for compatibility with the native
@@ -2382,14 +2458,40 @@ struct PsiFormer
   Parameters p;   // Exported model parameters.
   ConfigData cfg; // Physical system and stored validation configurations.
   size_t ne;      // Total electron count.
-  size_t ndet  = 16;
-  size_t dim   = 256;
-  size_t heads = 4;
+  size_t ndet   = 16;
+  size_t dim    = 256;
+  size_t heads  = 4;
+  size_t blocks = 4;
 
-  /// Load one fixed exported PsiFormer model and its physical-system metadata.
+  /// Load the established four-block DeepQMC profile from portable HDF5 files.
   PsiFormer(const std::string& parameter_path, const std::string& configuration_path)
-      : p(parameter_path), cfg(configuration_path), ne(cfg.nup + cfg.ndown)
+      : PsiFormer(Parameters(parameter_path), ConfigData(configuration_path))
   {}
+
+  /** Construct an in-memory model using explicit architectural dimensions.
+   *
+   * Parameter-layout compatibility is subsequently checked by the shared
+   * execution plan in QMCPACK and by named lookups in the standalone oracle.
+   */
+  PsiFormer(Parameters parameters,
+            ConfigData configuration_data,
+            size_t determinants = 16,
+            size_t feature_dimension = 256,
+            size_t attention_heads = 4,
+            size_t attention_blocks = 4)
+      : p(std::move(parameters)),
+        cfg(std::move(configuration_data)),
+        ne(cfg.nup + cfg.ndown),
+        ndet(determinants),
+        dim(feature_dimension),
+        heads(attention_heads),
+        blocks(attention_blocks)
+  {
+    if (ndet == 0 || dim == 0 || heads == 0 || blocks == 0)
+      throw std::invalid_argument("PsiFormer architecture dimensions must be positive");
+    if (dim % heads != 0)
+      throw std::invalid_argument("PsiFormer feature dimension must be divisible by the attention-head count");
+  }
 
   /// Build learned electron features from electron-nucleus geometry and spin labels.
   NodePtr embedding(const NodePtr& positions)
@@ -2548,7 +2650,9 @@ struct PsiFormer
   {
     // Same-spin and opposite-spin electron pairs use the physical 1/4 and 1/2
     // cusp factors, respectively, with learned asymptotic length scales.
-    NodePtr same_spin_alpha     = p.find("electronic_cusp_asymptotic", "same_alpha");
+    NodePtr same_spin_alpha;
+    if (cfg.nup >= 2 || cfg.ndown >= 2)
+      same_spin_alpha = p.find("electronic_cusp_asymptotic", "same_alpha");
     NodePtr opposite_spin_alpha = p.find("electronic_cusp_asymptotic", "anti_alpha");
     NodePtr cusp_value          = scalar(0);
 
@@ -2614,12 +2718,12 @@ struct PsiFormer
       seeded_coordinates = {first_coordinate, first_coordinate + 1, first_coordinate + 2};
     }
 
-    // Feature layers: electron-nucleus embedding followed by four attention
-    // blocks operating on all electrons.
+    // Feature layers: electron-nucleus embedding followed by the configured
+    // attention blocks operating on all electrons.
     NodePtr positions         = coordinates(electron_positions, seeded_coordinates);
     NodePtr electron_features = embedding(positions);
-    for (int layer = 0; layer < 4; ++layer)
-      electron_features = attention_block(electron_features, layer);
+    for (size_t layer = 0; layer < blocks; ++layer)
+      electron_features = attention_block(electron_features, static_cast<int>(layer));
 
     // Remaining wavefunction layers: create spin-resolved orbital matrices by
     // multiplying backflow outputs by their exponential envelopes.

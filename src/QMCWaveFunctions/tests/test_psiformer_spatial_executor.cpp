@@ -204,6 +204,42 @@ TEST_CASE("PsiFormer direct spatial separated LiH-pair observables", "[wavefunct
   validateSystem("lih_pair", pairGolden(), false);
 }
 
+TEST_CASE("PsiFormer direct spatial supports canonical pseudo-LiH without same-spin alpha",
+          "[wavefunction][psiformer][ecp]")
+{
+  GeneratedFiles files = generateFiles("lih_pp");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::Tensor positions = model.cfg.configuration(0);
+  const qmcplusplus::psiformer::PsiFormerExecutionPlan plan = makePlan(model);
+  CHECK_FALSE(plan.hasParameter(qmcplusplus::psiformer::ParameterRole::CUSP_SAME_ALPHA));
+
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor executor(model, value_executor, plan);
+  std::unique_ptr<pf::DirectSpatialWorkspace> workspace =
+      executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+
+  pf::EvaluationRequest request;
+  request.spatial_derivatives    = pf::SpatialDerivativeRequest::FULL_VGL;
+  request.parameter_derivatives  = pf::ParameterDerivativeRequest::NONE;
+  request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result oracle = model.evaluate(positions, request);
+  const pf::DirectSpatialResultView direct = executor.evaluateFull(*workspace);
+  CHECK(direct.sign == oracle.sign);
+  checkClose(direct.logabs, oracle.logabs, 3e-10, 3e-10);
+  REQUIRE(direct.gradient.size() == oracle.gradient.size());
+  REQUIRE(direct.lap_log.size() == oracle.lap_log.size());
+  REQUIRE(direct.lap_ratio.size() == oracle.lap_ratio.size());
+  for (std::size_t coordinate = 0; coordinate < direct.gradient.size(); ++coordinate)
+    checkClose(direct.gradient[coordinate], oracle.gradient[coordinate]);
+  for (std::size_t electron = 0; electron < direct.lap_log.size(); ++electron)
+  {
+    checkClose(direct.lap_log[electron], oracle.lap_log[electron], 3e-7, 3e-7);
+    checkClose(direct.lap_ratio[electron], oracle.lap_ratio[electron], 3e-7, 3e-7);
+  }
+}
+
 TEST_CASE("PsiFormer direct spatial request validation", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");

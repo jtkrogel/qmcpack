@@ -312,6 +312,46 @@ void validateSystem(const std::string& system,
   CHECK(std::isfinite(sink));
 }
 
+/// Compare the full score and kinetic response for the canonical 1+1 layout.
+void validatePairFreePseudoLiH()
+{
+  GeneratedFiles files = generateFiles("lih_pp");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const pf::Tensor positions = model.cfg.configuration(0);
+  const auto plan = makePlan(model);
+  CHECK_FALSE(plan.hasParameter(qmcplusplus::psiformer::ParameterRole::CUSP_SAME_ALPHA));
+
+  pf::DirectKineticExecutor executor(model, plan);
+  auto workspace = executor.makeWorkspace();
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+
+  pf::EvaluationRequest request;
+  request.spatial_derivatives    = pf::SpatialDerivativeRequest::FULL_VGL;
+  request.parameter_derivatives  = pf::ParameterDerivativeRequest::LOG_AND_KINETIC;
+  request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result native = model.evaluate(positions, request);
+  const pf::DirectKineticResultView direct = executor.evaluate(*workspace);
+  REQUIRE(direct.parameter_score.size() == native.param_gradient.size());
+  REQUIRE(direct.kinetic_parameter_response.size() ==
+          native.local_energy_param_gradient.size());
+
+  double maximum_score_error   = 0.0;
+  double maximum_kinetic_error = 0.0;
+  for (std::size_t parameter = 0; parameter < direct.parameter_score.size(); ++parameter)
+  {
+    maximum_score_error = std::max(
+        maximum_score_error,
+        std::abs(direct.parameter_score[parameter] - native.param_gradient[parameter]));
+    maximum_kinetic_error = std::max(
+        maximum_kinetic_error,
+        std::abs(direct.kinetic_parameter_response[parameter] -
+                 native.local_energy_param_gradient[parameter]));
+  }
+  CHECK(maximum_score_error < 3e-8);
+  CHECK(maximum_kinetic_error < 3e-6);
+}
+
 } // namespace
 
 void* operator new(std::size_t size)
@@ -336,4 +376,10 @@ TEST_CASE("PsiFormer exact graph-free score and kinetic response separated pair"
           "[wavefunction][psiformer][kinetic]")
 {
   validateSystem("lih_pair", pairGolden(), false);
+}
+
+TEST_CASE("PsiFormer exact score and kinetic response omit unused pseudo-LiH same cusp",
+          "[wavefunction][psiformer][kinetic][ecp]")
+{
+  validatePairFreePseudoLiH();
 }

@@ -257,3 +257,43 @@ TEST_CASE("PsiFormer direct parameter score matches native and JAX separated LiH
 {
   validateScore("lih_pair", pairScoreGolden());
 }
+
+TEST_CASE("PsiFormer direct score supports canonical pseudo-LiH without same-spin alpha",
+          "[wavefunction][psiformer][ecp]")
+{
+  GeneratedFiles files = generateFiles("lih_pp");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const qmcplusplus::psiformer::ModelShape shape{
+      model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet, model.dim,
+      model.heads, model.blocks};
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
+  CHECK_FALSE(plan.hasParameter(qmcplusplus::psiformer::ParameterRole::CUSP_SAME_ALPHA));
+
+  pf::DirectScoreExecutor executor(model, plan);
+  std::unique_ptr<pf::DirectScoreWorkspace> workspace = executor.makeWorkspace();
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
+
+  pf::EvaluationRequest request;
+  request.spatial_derivatives    = pf::SpatialDerivativeRequest::NONE;
+  request.parameter_derivatives  = pf::ParameterDerivativeRequest::LOG_ONLY;
+  request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result native = model.evaluate(electrons, request);
+  const pf::DirectScoreResult direct = executor.evaluate(*workspace);
+  REQUIRE(direct.parameter_score.size == model.p.size());
+  REQUIRE(native.param_gradient.size() == model.p.size());
+  CHECK(direct.sign == native.sign);
+  checkClose(direct.logabs, native.logabs, 2e-11, 2e-11);
+
+  double maximum_scaled_error = 0.0;
+  for (std::size_t parameter = 0; parameter < model.p.size(); ++parameter)
+  {
+    const double error = std::abs(direct.parameter_score[parameter] -
+                                  native.param_gradient[parameter]);
+    const double scale = std::max({1.0, std::abs(direct.parameter_score[parameter]),
+                                   std::abs(native.param_gradient[parameter])});
+    maximum_scaled_error = std::max(maximum_scaled_error, error / scale);
+  }
+  CHECK(maximum_scaled_error < 2e-10);
+}

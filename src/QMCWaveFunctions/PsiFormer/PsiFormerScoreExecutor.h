@@ -633,9 +633,14 @@ private:
   /// Accumulate the analytic cusp value and its two scalar parameter derivatives.
   double cuspValueAndReverse(const double* parameters, DirectScoreWorkspace& workspace) const
   {
-    const double same_alpha = parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0];
+    const bool has_same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA);
+    const double same_alpha = has_same_alpha
+        ? parameter(parameters, ParameterRole::CUSP_SAME_ALPHA)[0]
+        : 1.0;
     const double anti_alpha = parameter(parameters, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
-    double& same_score      = score(workspace, ParameterRole::CUSP_SAME_ALPHA)[0];
+    double* same_score      = has_same_alpha
+        ? score(workspace, ParameterRole::CUSP_SAME_ALPHA)
+        : nullptr;
     double& anti_score      = score(workspace, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
     const auto& pairs       = workspace.geometry_.electronPairs();
     const auto& distances   = workspace.geometry_.electronElectronPairs().distances();
@@ -651,7 +656,14 @@ private:
       cusp -= factor * alpha * alpha / denominator;
       const double derivative = -factor * alpha * (alpha + 2.0 * radius) /
           (denominator * denominator);
-      (same_spin ? same_score : anti_score) += derivative;
+      if (same_spin)
+      {
+        if (!same_score)
+          throw std::logic_error("PsiFormer score plan omitted a required same-spin cusp parameter");
+        same_score[0] += derivative;
+      }
+      else
+        anti_score += derivative;
     }
     return cusp;
   }

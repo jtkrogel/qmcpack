@@ -270,6 +270,35 @@ TEST_CASE("PsiFormer randomized full-shape separated LiH pair high-level observa
   validateCase("lih_pair", pairGolden(), false);
 }
 
+TEST_CASE("PsiFormer native oracle evaluates canonical one-up one-down pseudo-LiH",
+          "[wavefunction][psiformer][ecp]")
+{
+  GeneratedFiles files = generateFiles("lih_pp");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  CHECK(model.cfg.nup == 1);
+  CHECK(model.cfg.ndown == 1);
+  CHECK(std::none_of(model.p.layouts.begin(), model.p.layouts.end(), [](const pf::Layout& layout) {
+    return layout.name == "same_alpha";
+  }));
+
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  pf::EvaluationRequest request;
+  request.parameter_derivatives = pf::ParameterDerivativeRequest::LOG_AND_KINETIC;
+  const pf::Result result = model.evaluate(electrons, request);
+
+  CHECK(std::isfinite(result.logabs));
+  CHECK(std::isfinite(result.local_energy));
+  REQUIRE(result.gradient.size() == 3 * model.ne);
+  REQUIRE(result.lap_log.size() == model.ne);
+  REQUIRE(result.param_gradient.size() == model.p.size());
+  REQUIRE(result.local_energy_param_gradient.size() == model.p.size());
+  CHECK(std::all_of(result.param_gradient.begin(), result.param_gradient.end(),
+                    [](double value) { return std::isfinite(value); }));
+  CHECK(std::all_of(result.local_energy_param_gradient.begin(),
+                    result.local_energy_param_gradient.end(),
+                    [](double value) { return std::isfinite(value); }));
+}
+
 TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");
@@ -318,6 +347,57 @@ TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefun
   const pf::Result reloaded_result = reloaded.evaluate(electrons, false);
   checkClose(reloaded_result.logabs, changed_result.logabs);
   checkClose(reloaded_result.local_energy, changed_result.local_energy, 2e-9, 2e-9);
+}
+
+TEST_CASE("PsiFormer in-memory construction matches portable-file construction", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer imported(files.parameters, files.configuration);
+
+  pf::Parameters parameters(imported.p.flat_values(), imported.p.layouts);
+  pf::ConfigData configuration(imported.cfg.electrons, imported.cfg.nuclei, imported.cfg.charges,
+                               imported.cfg.nup, imported.cfg.ndown);
+  pf::PsiFormer in_memory(std::move(parameters), std::move(configuration), imported.ndet,
+                          imported.dim, imported.heads, imported.blocks);
+
+  CHECK(in_memory.p.flat_values() == imported.p.flat_values());
+  CHECK(in_memory.p.layout_fingerprint() == imported.p.layout_fingerprint());
+  CHECK(in_memory.cfg.electrons.x == imported.cfg.electrons.x);
+  CHECK(in_memory.cfg.nuclei.x == imported.cfg.nuclei.x);
+  CHECK(in_memory.cfg.charges.x == imported.cfg.charges.x);
+  CHECK(in_memory.blocks == 4);
+
+  const pf::Tensor electrons = imported.cfg.configuration(0);
+  const pf::Result expected  = imported.evaluate(electrons, false);
+  const pf::Result actual    = in_memory.evaluate(electrons, false);
+  checkClose(actual.sign, expected.sign);
+  checkClose(actual.logabs, expected.logabs);
+  checkVectorClose(actual.gradient, expected.gradient, 2e-10, 2e-10);
+  checkVectorClose(actual.lap_log, expected.lap_log, 2e-10, 2e-10);
+  checkClose(actual.local_energy, expected.local_energy, 2e-10, 2e-10);
+}
+
+TEST_CASE("PsiFormer in-memory construction validates owning inputs", "[wavefunction][psiformer]")
+{
+  CHECK_THROWS_WITH(pf::Parameters({1.0, 2.0}, {{"module", "w", {1}, 0, 1}}),
+                    Catch::Matchers::ContainsSubstring("complete flat vector"));
+  CHECK_THROWS_WITH(pf::Parameters({1.0}, {{"module", "w", {1}, 1, 2}}),
+                    Catch::Matchers::ContainsSubstring("contiguous"));
+  CHECK_THROWS_WITH(
+      pf::Parameters({std::numeric_limits<double>::quiet_NaN()}, {{"module", "w", {1}, 0, 1}}),
+      Catch::Matchers::ContainsSubstring("non-finite"));
+
+  pf::Tensor electrons({1, 2, 3}, std::vector<double>(6, 0.25));
+  pf::Tensor nuclei({1, 3}, std::vector<double>(3, 0.0));
+  pf::Tensor charges({1}, std::vector<double>{2.0});
+  pf::ConfigData configuration(electrons, nuclei, charges, 1, 1);
+  CHECK_THROWS_AS(configuration.configuration(1), std::out_of_range);
+  CHECK_THROWS_WITH(pf::ConfigData(electrons, nuclei, charges, 0, 2),
+                    Catch::Matchers::ContainsSubstring("positive"));
+
+  pf::Parameters scalar_parameter({1.0}, {{"module", "w", {}, 0, 1}});
+  CHECK_THROWS_WITH(pf::PsiFormer(std::move(scalar_parameter), std::move(configuration), 1, 7, 2, 1),
+                    Catch::Matchers::ContainsSubstring("divisible"));
 }
 
 TEST_CASE("PsiFormer explicit parameter derivative requests and total-gradient seed", "[wavefunction][psiformer]")

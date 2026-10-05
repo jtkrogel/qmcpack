@@ -128,3 +128,30 @@ TEST_CASE("PsiFormer direct value executor matches native and JAX separated LiH 
 {
   validateDirectValue("lih_pair", -1.0, -35.19505925284793, -5.187761194606605e-16);
 }
+
+TEST_CASE("PsiFormer direct value supports canonical pseudo-LiH without same-spin alpha",
+          "[wavefunction][psiformer][ecp]")
+{
+  GeneratedFiles files = generateFiles("lih_pp");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const qmcplusplus::psiformer::ModelShape shape{
+      model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet, model.dim,
+      model.heads, model.blocks};
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
+  CHECK_FALSE(plan.hasParameter(qmcplusplus::psiformer::ParameterRole::CUSP_SAME_ALPHA));
+
+  pf::DirectValueExecutor executor(model, plan);
+  std::unique_ptr<pf::DirectValueWorkspace> workspace = executor.makeWorkspace();
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  workspace->setPositions(pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
+
+  pf::EvaluationRequest request;
+  request.spatial_derivatives    = pf::SpatialDerivativeRequest::NONE;
+  request.parameter_derivatives  = pf::ParameterDerivativeRequest::NONE;
+  request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+  const pf::Result oracle            = model.evaluate(electrons, request);
+  const pf::DirectValueResult direct = executor.evaluate(*workspace);
+  CHECK(direct.sign == oracle.sign);
+  CHECK(direct.logabs == Catch::Approx(oracle.logabs).epsilon(2e-11).margin(2e-11));
+  CHECK(direct.value == Catch::Approx(oracle.value).epsilon(2e-10).margin(1e-24));
+}
