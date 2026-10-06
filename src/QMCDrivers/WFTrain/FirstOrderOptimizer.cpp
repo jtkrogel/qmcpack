@@ -251,7 +251,7 @@ FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema
 
 void FirstOrderOptimizer::validateInputs(const StructuredParameterSchema& schema,
                                          const StructuredParameterSnapshot& parameters,
-                                         const EnergyGradientResult& objective) const
+                                         ParameterGradientView objective) const
 {
   if (proposal_live_)
     throw std::logic_error("First-order optimizer already has a live proposal");
@@ -279,7 +279,7 @@ void FirstOrderOptimizer::validateInputs(const StructuredParameterSchema& schema
 StructuredParameterSnapshot FirstOrderOptimizer::propose(
     const StructuredParameterSchema& schema,
     const StructuredParameterSnapshot& parameters,
-    const EnergyGradientResult& objective)
+    ParameterGradientView objective)
 {
   validateInputs(schema, parameters, objective);
   StructuredParameterSnapshot candidate = parameters;
@@ -343,7 +343,7 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
   return candidate;
 }
 
-void FirstOrderOptimizer::commitRecurrence(const EnergyGradientResult& objective) noexcept
+void FirstOrderOptimizer::commitRecurrence(ParameterGradientView objective) noexcept
 {
   for (const BlockUpdate& block : blocks_)
     if (block.trainable)
@@ -375,7 +375,7 @@ void FirstOrderOptimizer::commitRecurrence(const EnergyGradientResult& objective
 
 void FirstOrderOptimizer::proposalAccepted(const StructuredParameterSchema& schema,
                                            const StructuredParameterSnapshot& parameters,
-                                           const EnergyGradientResult& objective) noexcept
+                                           ParameterGradientView objective) noexcept
 {
   assert(proposal_live_);
   assert(schema.fingerprint() == schema_fingerprint_);

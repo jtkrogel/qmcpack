@@ -47,6 +47,9 @@ set(QMCDRIVERS
     WFTrain/QuantileClipping.cpp
     WFTrain/EnergyGradientAccumulator.cpp
     WFTrain/DistributedParameterReduction.cpp
+    WFTrain/OrbitalPretrainingAccumulator.cpp
+    WFTrain/OrbitalPretraining.cpp
+    WFTrain/ParameterUpdateTransaction.cpp
     WFTrain/HighParameterTraining.cpp
     WFTrain/TrainingCheckpoint.cpp
     WFTrain/FirstOrderOptimizer.cpp

@@ -10,6 +10,7 @@
  */
 
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include "Message/CommOperators.h"
 
@@ -30,6 +31,7 @@ namespace
 
 constexpr std::uint64_t protocol_version = 1;
 constexpr std::uint64_t energy_channel_contract = UINT64_C(0x454752414433); // "EGRAD3"
+constexpr std::uint64_t orbital_channel_contract = UINT64_C(0x4f52424752414431); // "ORBGRAD1"
 
 /// Classify failures without communicating variable-length exception strings.
 enum class ConsensusReason : std::uint64_t
@@ -261,6 +263,51 @@ void DistributedParameterReduction::preflight(
     throwMetadataMismatch("preflight", mismatch_rank);
 }
 
+void DistributedParameterReduction::preflightOrbital(
+    const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot* parameters,
+    std::uint64_t target_fingerprint,
+    std::uint64_t loss_fingerprint,
+    std::exception_ptr local_failure) const
+{
+  ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
+                                         : ConsensusReason::NONE;
+  const std::size_t maximum_mpi_chunk =
+      static_cast<std::size_t>(std::numeric_limits<int>::max());
+  if (reason == ConsensusReason::NONE &&
+      (policy_.maximum_chunk_size == 0 || policy_.maximum_chunk_size > maximum_mpi_chunk))
+    reason = ConsensusReason::INVALID_POLICY;
+  if (reason == ConsensusReason::NONE && !parameters)
+    reason = ConsensusReason::LOCAL_EXCEPTION;
+  if (reason == ConsensusReason::NONE &&
+      (parameters->schema_fingerprint != schema.fingerprint() ||
+       parameters->values.size() != schema.parameterCount()))
+    reason = ConsensusReason::LOCAL_EXCEPTION;
+
+  const std::array<std::uint64_t, 12> local_record{
+      static_cast<std::uint64_t>(reason),
+      protocol_version,
+      hashString(schema.providerId()),
+      hashString(schema.fingerprint()),
+      parameters ? parameters->version : 0,
+      schema.parameterCount(),
+      target_fingerprint,
+      loss_fingerprint,
+      orbital_channel_contract,
+      policy_.maximum_chunk_size,
+      participantCount(),
+      parameters ? hashSnapshot(*parameters) : 0};
+  const auto records = gatherRecords(communicator_, local_record);
+  const std::size_t failed_rank = firstFailedRank(records);
+  if (failed_rank != records.size())
+    throwConsensusFailure("orbital preflight", failed_rank,
+                          static_cast<ConsensusReason>(records[failed_rank][0]),
+                          failed_rank == 0 ? local_failure : std::exception_ptr{}, records.size());
+  const std::size_t mismatch_rank = firstMismatchingRank(records);
+  if (mismatch_rank != records.size())
+    throwMetadataMismatch("orbital preflight", mismatch_rank);
+}
+
 void DistributedParameterReduction::reduce(
     EnergyGradientAccumulator& accumulator,
     std::exception_ptr local_failure) const
@@ -426,6 +473,98 @@ void DistributedParameterReduction::reduce(
   accumulator.reduction_domain_ = ReductionDomain::GLOBAL;
 }
 
+void DistributedParameterReduction::reduce(
+    OrbitalPretrainingAccumulator& accumulator,
+    std::exception_ptr local_failure) const
+{
+  ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
+                                         : ConsensusReason::NONE;
+  if (reason == ConsensusReason::NONE &&
+      (accumulator.finalized_ || accumulator.poisoned_ ||
+       accumulator.reduction_domain_ == ReductionDomain::GLOBAL))
+    reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+  if (reason == ConsensusReason::NONE &&
+      (!isFiniteTrainingReal(accumulator.loss_sum_) ||
+       !std::all_of(accumulator.gradient_sum_.begin(), accumulator.gradient_sum_.end(),
+                    isFiniteTrainingReal)))
+    reason = ConsensusReason::NONFINITE_CONTRIBUTION;
+
+  const std::array<std::uint64_t, 11> local_record{
+      static_cast<std::uint64_t>(reason),
+      protocol_version,
+      orbital_channel_contract,
+      static_cast<std::uint64_t>(accumulator.reduction_domain_),
+      accumulator.parameterCount(),
+      accumulator.sample_count_,
+      hashString(accumulator.provider_id_),
+      hashString(accumulator.schema_fingerprint_),
+      accumulator.parameter_version_,
+      accumulator.target_fingerprint_,
+      accumulator.loss_fingerprint_};
+  const auto records = gatherRecords(communicator_, local_record);
+  const std::size_t failed_rank = firstFailedRank(records);
+  if (failed_rank != records.size())
+  {
+    accumulator.poison();
+    throwConsensusFailure("orbital production", failed_rank,
+                          static_cast<ConsensusReason>(records[failed_rank][0]),
+                          failed_rank == 0 ? local_failure : std::exception_ptr{}, records.size());
+  }
+  const std::size_t mismatch_rank = firstContributionMismatch(records, 5, 5, 5);
+  if (mismatch_rank != records.size())
+  {
+    accumulator.poison();
+    throwMetadataMismatch("orbital contribution", mismatch_rank);
+  }
+
+  std::uint64_t global_sample_count = 0;
+  for (const auto& record : records)
+  {
+    if (record[5] > std::numeric_limits<std::uint64_t>::max() - global_sample_count)
+    {
+      accumulator.poison();
+      throw std::overflow_error("Distributed orbital-pretraining sample count overflow");
+    }
+    global_sample_count += record[5];
+  }
+  if (global_sample_count == 0 ||
+      global_sample_count > std::numeric_limits<std::size_t>::max())
+  {
+    accumulator.poison();
+    throw std::runtime_error("Distributed orbital-pretraining population is globally empty or too large");
+  }
+
+  try
+  {
+    if (communicator_)
+    {
+      communicator_->allreduce_in_place(&accumulator.loss_sum_, 1);
+      for (std::size_t offset = 0; offset < accumulator.parameterCount();
+           offset += policy_.maximum_chunk_size)
+      {
+        const std::size_t count =
+            std::min(policy_.maximum_chunk_size, accumulator.parameterCount() - offset);
+        communicator_->allreduce_in_place(accumulator.gradient_sum_.data() + offset, count);
+      }
+    }
+  }
+  catch (...)
+  {
+    accumulator.poison();
+    throw;
+  }
+
+  if (!isFiniteTrainingReal(accumulator.loss_sum_) ||
+      !std::all_of(accumulator.gradient_sum_.begin(), accumulator.gradient_sum_.end(),
+                   isFiniteTrainingReal))
+  {
+    accumulator.poison();
+    throw std::runtime_error("Distributed orbital-pretraining reduction produced a non-finite sum");
+  }
+  accumulator.sample_count_ = static_cast<std::size_t>(global_sample_count);
+  accumulator.reduction_domain_ = ReductionDomain::GLOBAL;
+}
+
 void DistributedParameterReduction::validateCandidate(
     const StructuredParameterSchema& schema,
     const StructuredParameterSnapshot& parameters,
@@ -441,7 +580,7 @@ void DistributedParameterReduction::validateCandidate(
        candidate->version != parameters.version ||
        candidate->values.size() != schema.parameterCount() ||
        !std::all_of(candidate->values.begin(), candidate->values.end(),
-                    [](double value) { return std::isfinite(value); })))
+                    isFiniteTrainingReal)))
     reason = ConsensusReason::INVALID_CANDIDATE;
 
   const std::array<std::uint64_t, 7> local_record{

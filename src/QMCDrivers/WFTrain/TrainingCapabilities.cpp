@@ -88,6 +88,8 @@ const char* trainingCapabilityName(TrainingCapability capability) noexcept
     return "shared_model_threading";
   case TrainingCapability::DISTRIBUTED_REDUCTION:
     return "distributed_reduction";
+  case TrainingCapability::ORBITAL_MSE_VJP:
+    return "orbital_mse_vjp";
   case TrainingCapability::DEVICE_EXECUTION:
     return "device_execution";
   }
@@ -110,4 +112,3 @@ void requireTrainingCapabilities(const TrainingCapabilities& offered,
 }
 
 } // namespace qmcplusplus::wftrain
-

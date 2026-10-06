@@ -209,6 +209,49 @@ EnergyGradientResult makeReferenceResult(int size)
   return result;
 }
 
+/// Construct one raw orbital objective with deterministic rank/sample values.
+std::unique_ptr<OrbitalPretrainingAccumulator> makeOrbitalContribution(
+    const StructuredParameterSchema& schema,
+    std::size_t version,
+    int rank,
+    std::size_t sample_count,
+    std::uint64_t target_fingerprint = 0x1234,
+    std::uint64_t loss_fingerprint = 0x5678)
+{
+  auto accumulator = std::make_unique<OrbitalPretrainingAccumulator>(
+      schema, version, target_fingerprint, loss_fingerprint);
+  std::vector<double> gradient(schema.parameterCount());
+  for (std::size_t sample = 0; sample < sample_count; ++sample)
+  {
+    const double identity = static_cast<double>(10 * rank + sample + 1);
+    for (std::size_t parameter = 0; parameter < gradient.size(); ++parameter)
+      gradient[parameter] = 0.1 * identity * static_cast<double>(parameter + 1);
+    accumulator->addSample(identity * identity, version,
+                           {gradient.data(), gradient.size()});
+  }
+  return accumulator;
+}
+
+/// Form the independently summed mean loss and gradient for all MPI ranks.
+OrbitalPretrainingResult makeOrbitalReference(int size)
+{
+  OrbitalPretrainingResult result;
+  result.gradient.assign(5, 0.0);
+  for (int rank = 0; rank < size; ++rank)
+    for (std::size_t sample = 0; sample < localSampleCount(rank, size); ++sample)
+    {
+      const double identity = static_cast<double>(10 * rank + sample + 1);
+      ++result.sample_count;
+      result.mean_loss += identity * identity;
+      for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
+        result.gradient[parameter] += 0.1 * identity * static_cast<double>(parameter + 1);
+    }
+  result.mean_loss /= result.sample_count;
+  for (double& value : result.gradient)
+    value /= result.sample_count;
+  return result;
+}
+
 /// Versioned provider used to test the complete distributed publication ordering.
 class RankProvider final : public StructuredParameterProvider
 {
@@ -293,7 +336,7 @@ public:
 
   StructuredParameterSnapshot propose(const StructuredParameterSchema&,
                                       const StructuredParameterSnapshot& parameters,
-                                      const EnergyGradientResult& objective) override
+                                      ParameterGradientView objective) override
   {
     if (events_)
       events_->push_back("propose");
@@ -413,6 +456,94 @@ TEST_CASE("Distributed reduction failures are uniform and retryable",
   CHECK_NOTHROW(retry->finalize());
 }
 
+TEST_CASE("Distributed orbital reduction handles uneven and zero-sample ranks",
+          "[drivers][training][orbital-pretraining][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema schema = makeSchema();
+  const StructuredParameterSnapshot parameters{schema.fingerprint(), 3,
+                                                std::vector<double>(5, 0.5)};
+  const OrbitalPretrainingResult reference = makeOrbitalReference(communicator.size());
+  DistributedParameterReduction reduction(communicator, {2});
+  reduction.preflightOrbital(schema, &parameters, 0x1234, 0x5678);
+  auto accumulator = makeOrbitalContribution(
+      schema, parameters.version, communicator.rank(),
+      localSampleCount(communicator.rank(), communicator.size()));
+  const std::size_t retained = accumulator->retainedBytes();
+  reduction.reduce(*accumulator);
+  CHECK(accumulator->retainedBytes() == retained);
+  const OrbitalPretrainingResult result = accumulator->finalize();
+  CHECK(result.reduction_domain == ReductionDomain::GLOBAL);
+  CHECK(result.sample_count == reference.sample_count);
+  CHECK(result.mean_loss == Catch::Approx(reference.mean_loss));
+  REQUIRE(result.gradient.size() == reference.gradient.size());
+  for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
+    CHECK(result.gradient[parameter] == Catch::Approx(reference.gradient[parameter]));
+}
+
+TEST_CASE("Distributed orbital failures are uniform and retryable",
+          "[drivers][training][orbital-pretraining][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema schema = makeSchema();
+  const StructuredParameterSnapshot parameters{schema.fingerprint(), 0,
+                                                std::vector<double>(5, 0.5)};
+  DistributedParameterReduction reduction(communicator, {2});
+  reduction.preflightOrbital(schema, &parameters, 0x1234, 0x5678);
+
+  auto empty = makeOrbitalContribution(schema, 0, communicator.rank(), 0);
+  CHECK_THROWS_WITH(reduction.reduce(*empty),
+                    Catch::Matchers::ContainsSubstring("globally empty"));
+
+  auto failed = makeOrbitalContribution(
+      schema, 0, communicator.rank(),
+      localSampleCount(communicator.rank(), communicator.size()));
+  std::exception_ptr local_failure;
+  if (communicator.rank() == 0)
+    local_failure = std::make_exception_ptr(std::runtime_error("orbital producer failed"));
+  CHECK_THROWS(reduction.reduce(*failed, local_failure));
+
+  auto retry = makeOrbitalContribution(
+      schema, 0, communicator.rank(),
+      localSampleCount(communicator.rank(), communicator.size()));
+  CHECK_NOTHROW(reduction.reduce(*retry));
+  CHECK_NOTHROW(retry->finalize());
+}
+
+TEST_CASE("Distributed orbital target and loss metadata mismatch independently",
+          "[drivers][training][orbital-pretraining][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  if (communicator.size() == 1)
+    return;
+  const bool last_rank = communicator.rank() == communicator.size() - 1;
+  const StructuredParameterSchema schema = makeSchema();
+  const StructuredParameterSnapshot parameters{schema.fingerprint(), 0,
+                                                std::vector<double>(5, 0.5)};
+  DistributedParameterReduction reduction(communicator, {2});
+
+  CHECK_THROWS_WITH(reduction.preflightOrbital(
+                        schema, &parameters, last_rank ? 0x9999 : 0x1234, 0x5678),
+                    Catch::Matchers::ContainsSubstring("metadata mismatch"));
+  CHECK_THROWS_WITH(reduction.preflightOrbital(
+                        schema, &parameters, 0x1234, last_rank ? 0x9999 : 0x5678),
+                    Catch::Matchers::ContainsSubstring("metadata mismatch"));
+
+  reduction.preflightOrbital(schema, &parameters, 0x1234, 0x5678);
+  auto target_mismatch = makeOrbitalContribution(
+      schema, 0, communicator.rank(),
+      localSampleCount(communicator.rank(), communicator.size()),
+      last_rank ? 0x9999 : 0x1234, 0x5678);
+  CHECK_THROWS_WITH(reduction.reduce(*target_mismatch),
+                    Catch::Matchers::ContainsSubstring("metadata mismatch"));
+  auto loss_mismatch = makeOrbitalContribution(
+      schema, 0, communicator.rank(),
+      localSampleCount(communicator.rank(), communicator.size()),
+      0x1234, last_rank ? 0x9999 : 0x5678);
+  CHECK_THROWS_WITH(reduction.reduce(*loss_mismatch),
+                    Catch::Matchers::ContainsSubstring("metadata mismatch"));
+}
+
 TEST_CASE("Distributed metadata and candidate mismatches precede publication",
           "[drivers][training][mpi]")
 {
@@ -455,6 +586,21 @@ TEST_CASE("Distributed metadata and candidate mismatches precede publication",
     candidate.values.front() += 1.0;
   CHECK_THROWS_WITH(reduction.validateCandidate(schema, parameters, &candidate),
                     Catch::Matchers::ContainsSubstring("candidate metadata mismatch"));
+}
+
+TEST_CASE("Distributed candidate validation rejects non-finite values under fast math",
+          "[drivers][training][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema schema = makeSchema();
+  const StructuredParameterSnapshot parameters{schema.fingerprint(), 0,
+                                                std::vector<double>(5, 0.5)};
+  StructuredParameterSnapshot candidate = parameters;
+  candidate.values.front() = std::numeric_limits<double>::quiet_NaN();
+  DistributedParameterReduction reduction(communicator, {2});
+
+  CHECK_THROWS_WITH(reduction.validateCandidate(schema, parameters, &candidate),
+                    Catch::Matchers::ContainsSubstring("invalid candidate"));
 }
 
 TEST_CASE("Distributed publication failure is reported as fatal divergence",

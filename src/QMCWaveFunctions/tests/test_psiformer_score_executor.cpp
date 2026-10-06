@@ -15,6 +15,7 @@
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
+#include "QMCDrivers/WFTrain/OrbitalPretrainingAccumulator.h"
 #include "psiformer_test_utils.h"
 
 #include <algorithm>
@@ -321,6 +322,27 @@ TEST_CASE("PsiFormer orbital MSE uses the direct tape and spin-sector normalizat
   REQUIRE(result.orbital_count == orbital_count);
   REQUIRE(result.parameter_gradient.size == model.p.size());
   CHECK(result.parameter_version == model.p.version());
+
+  // Stream the actual direct reverse result through the bounded Stage B sink.
+  // This integration check prevents the generic producer seam from drifting from
+  // the Stage A result's pointer, size, version, or normalization conventions.
+  const qmcplusplus::wftrain::StructuredParameterSchema schema(
+      "psiformer/direct-orbital-test",
+      {{"network", {model.p.size()}, 0, model.p.size(),
+        qmcplusplus::wftrain::ParameterScalarDomain::REAL64, true, "network"}});
+  qmcplusplus::wftrain::OrbitalPretrainingAccumulator accumulator(
+      schema, result.parameter_version, 0x1234, 0x5678);
+  accumulator.addSample(result.loss, result.parameter_version,
+                        {result.parameter_gradient.data,
+                         result.parameter_gradient.size});
+  accumulator.completeSingleParticipantReduction();
+  const qmcplusplus::wftrain::OrbitalPretrainingResult streamed = accumulator.finalize();
+  CHECK(streamed.sample_count == 1);
+  CHECK(streamed.mean_loss == result.loss);
+  REQUIRE(streamed.gradient.size() == result.parameter_gradient.size);
+  for (std::size_t parameter : {std::size_t{0}, model.p.size() / 2,
+                                model.p.size() - 1})
+    CHECK(streamed.gradient[parameter] == result.parameter_gradient[parameter]);
 
   double expected_up = 0.0;
   double expected_down = 0.0;

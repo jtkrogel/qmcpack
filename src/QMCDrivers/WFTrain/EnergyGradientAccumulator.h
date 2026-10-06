@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_ENERGY_GRADIENT_ACCUMULATOR_H
 
 #include "QMCDrivers/WFTrain/QuantileClipping.h"
+#include "QMCDrivers/WFTrain/ParameterGradient.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 
 #include <cstddef>
@@ -49,6 +50,13 @@ struct EnergyGradientResult
   std::optional<DerivativeValue> clipped_mean_energy;
   std::size_t clipped_sample_count = 0;
   std::vector<DerivativeReal> gradient;
+
+  /// Return only the objective-neutral metadata and gradient used by update rules.
+  ParameterGradientView parameterGradient() const noexcept
+  {
+    return {schema_fingerprint, parameter_version, reduction_domain,
+            {gradient.data(), gradient.size()}};
+  }
 };
 
 /** Accumulate checked VJP chunks and scalar moments without retaining sample rows.

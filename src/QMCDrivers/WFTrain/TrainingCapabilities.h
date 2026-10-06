@@ -36,6 +36,7 @@ enum class TrainingCapability : std::uint8_t
   MULTIWALKER_BATCHING,
   SHARED_MODEL_THREADING,
   DISTRIBUTED_REDUCTION,
+  ORBITAL_MSE_VJP,
   DEVICE_EXECUTION
 };
 
@@ -73,4 +74,3 @@ void requireTrainingCapabilities(const TrainingCapabilities& offered,
 } // namespace qmcplusplus::wftrain
 
 #endif
-

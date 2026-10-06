@@ -17,6 +17,7 @@
 #define QMCPLUSPLUS_DISTRIBUTED_PARAMETER_REDUCTION_H
 
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
+#include "QMCDrivers/WFTrain/OrbitalPretrainingAccumulator.h"
 
 #include <cstddef>
 #include <exception>
@@ -60,6 +61,17 @@ public:
    * promoted to GLOBAL. Zero-sample ranks execute the identical collective schedule.
    */
   void reduce(EnergyGradientAccumulator& accumulator,
+              std::exception_ptr local_failure = {}) const;
+
+  /// Agree on model and target identity before orbital-MSE production begins.
+  void preflightOrbital(const StructuredParameterSchema& schema,
+                        const StructuredParameterSnapshot* parameters,
+                        std::uint64_t target_fingerprint,
+                        std::uint64_t loss_fingerprint,
+                        std::exception_ptr local_failure = {}) const;
+
+  /// Reduce one complete orbital objective, allowing zero-sample local ranks.
+  void reduce(OrbitalPretrainingAccumulator& accumulator,
               std::exception_ptr local_failure = {}) const;
 
   /// Verify that every rank prepared the same complete update before publication.

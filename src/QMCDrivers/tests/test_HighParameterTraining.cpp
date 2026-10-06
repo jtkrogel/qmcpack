@@ -297,7 +297,7 @@ public:
 
   StructuredParameterSnapshot propose(const StructuredParameterSchema& schema,
                                       const StructuredParameterSnapshot& parameters,
-                                      const EnergyGradientResult& objective) override
+                                      ParameterGradientView objective) override
   {
     if (events_)
       events_->push_back("propose");
@@ -322,7 +322,7 @@ public:
 
   StructuredParameterSnapshot propose(const StructuredParameterSchema& schema,
                                       const StructuredParameterSnapshot& parameters,
-                                      const EnergyGradientResult&) override
+                                      ParameterGradientView) override
   {
     if (events_)
       events_->push_back("propose");

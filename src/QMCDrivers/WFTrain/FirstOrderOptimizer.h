@@ -66,11 +66,28 @@ public:
   StructuredParameterSnapshot propose(
       const StructuredParameterSchema& schema,
       const StructuredParameterSnapshot& parameters,
-      const EnergyGradientResult& objective) override;
+      ParameterGradientView objective) override;
+
+  /// Preserve direct source compatibility for callers retaining energy diagnostics.
+  StructuredParameterSnapshot propose(
+      const StructuredParameterSchema& schema,
+      const StructuredParameterSnapshot& parameters,
+      const EnergyGradientResult& objective)
+  {
+    return propose(schema, parameters, objective.parameterGradient());
+  }
 
   void proposalAccepted(const StructuredParameterSchema& schema,
                         const StructuredParameterSnapshot& parameters,
-                        const EnergyGradientResult& objective) noexcept override;
+                        ParameterGradientView objective) noexcept override;
+
+  /// Preserve direct source compatibility for callers retaining energy diagnostics.
+  void proposalAccepted(const StructuredParameterSchema& schema,
+                        const StructuredParameterSnapshot& parameters,
+                        const EnergyGradientResult& objective) noexcept
+  {
+    proposalAccepted(schema, parameters, objective.parameterGradient());
+  }
 
   void proposalRejected() noexcept override;
 
@@ -111,8 +128,8 @@ private:
 
   void validateInputs(const StructuredParameterSchema& schema,
                       const StructuredParameterSnapshot& parameters,
-                      const EnergyGradientResult& objective) const;
-  void commitRecurrence(const EnergyGradientResult& objective) noexcept;
+                      ParameterGradientView objective) const;
+  void commitRecurrence(ParameterGradientView objective) noexcept;
   void validateRestoredState(std::uint64_t update_count,
                              const std::vector<double>& first_moment,
                              const std::vector<double>& second_moment) const;

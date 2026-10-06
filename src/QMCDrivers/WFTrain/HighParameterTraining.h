@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_HIGH_PARAMETER_TRAINING_H
 
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
+#include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
 #include "QMCDrivers/WFTrain/TrainingCapabilities.h"
 
 #include <cstddef>
@@ -42,40 +43,6 @@ public:
   virtual TrainingCapabilities capabilities() const noexcept = 0;
   virtual void accumulate(const StructuredParameterSnapshot& parameters,
                           EnergyGradientAccumulator& accumulator) = 0;
-};
-
-/// Convert one finalized gradient into a complete candidate parameter snapshot.
-class TrainingUpdateRule
-{
-public:
-  virtual ~TrainingUpdateRule() = default;
-
-  /// Construct one speculative candidate without changing committed optimizer state.
-  virtual StructuredParameterSnapshot propose(
-      const StructuredParameterSchema& schema,
-      const StructuredParameterSnapshot& parameters,
-      const EnergyGradientResult& objective) = 0;
-
-  /** Commit recurrence state after the candidate parameters are globally published.
-   *
-   * Stateful implementations must preallocate all required storage and make this
-   * callback nonthrowing. The default supports stateless update rules.
-   */
-  virtual void proposalAccepted(const StructuredParameterSchema& schema,
-                                const StructuredParameterSnapshot& parameters,
-                                const EnergyGradientResult& objective) noexcept
-  {}
-
-  /// Discard a speculative proposal after any recoverable post-proposal failure.
-  virtual void proposalRejected() noexcept {}
-};
-
-/// Refresh sampler-side value/drift caches after atomic parameter publication.
-class ParameterUpdateObserver
-{
-public:
-  virtual ~ParameterUpdateObserver() = default;
-  virtual void parametersPublished(std::size_t new_version) noexcept = 0;
 };
 
 /// Result returned only after a complete parameter update has committed.

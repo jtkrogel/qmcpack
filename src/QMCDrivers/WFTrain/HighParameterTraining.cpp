@@ -11,8 +11,6 @@
 
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 
-#include <algorithm>
-#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -111,84 +109,12 @@ TrainingIterationResult HighParameterTraining::runIteration(
   reduction_.reduce(*accumulator, production_failure);
 
   std::optional<EnergyGradientResult> objective;
-  std::optional<StructuredParameterSnapshot> candidate;
-  std::exception_ptr update_failure;
-  bool proposal_started = false;
-  bool proposal_live = false;
-  try
-  {
-    objective.emplace(accumulator->finalize());
-    proposal_started = true;
-    candidate.emplace(update_rule.propose(schema, parameters, *objective));
-    proposal_live = true;
-    if (candidate->schema_fingerprint != schema.fingerprint() ||
-        candidate->version != parameters.version ||
-        candidate->values.size() != parameters.values.size())
-      throw std::invalid_argument("Training update rule returned an incompatible candidate snapshot");
-    if (!std::all_of(candidate->values.begin(), candidate->values.end(),
-                     [](double value) { return std::isfinite(value); }))
-      throw std::invalid_argument("Training update rule returned a non-finite candidate snapshot");
+  objective.emplace(accumulator->finalize());
+  const std::size_t committed_version = completeParameterUpdate(
+      provider, parameters, objective->parameterGradient(), update_rule, reduction_);
 
-    // Frozen tensors are a schema invariant rather than an update-rule convention.
-    for (const ParameterBlockDescriptor& block : schema.blocks())
-      if (!block.trainable)
-        for (std::size_t parameter = block.offset; parameter < block.offset + block.count;
-             ++parameter)
-          if (candidate->values[parameter] != parameters.values[parameter])
-            throw std::invalid_argument("Training update rule modified frozen parameter block " +
-                                        block.id);
-  }
-  catch (...)
-  {
-    // The updater may have established speculative bookkeeping before a later
-    // candidate check failed. The callback is safe even when propose threw first.
-    if (proposal_started)
-      update_rule.proposalRejected();
-    proposal_live = false;
-    update_failure = std::current_exception();
-  }
-  try
-  {
-    reduction_.validateCandidate(schema, parameters,
-                                 candidate ? &*candidate : nullptr, update_failure);
-  }
-  catch (...)
-  {
-    if (proposal_live)
-    {
-      update_rule.proposalRejected();
-      proposal_live = false;
-    }
-    throw;
-  }
-
-  std::size_t local_committed_version = parameters.version;
-  std::exception_ptr publication_failure;
-  try
-  {
-    local_committed_version = provider.publishParameters(*candidate, parameters.version);
-  }
-  catch (...)
-  {
-    publication_failure = std::current_exception();
-  }
-  std::size_t committed_version = parameters.version;
-  try
-  {
-    committed_version =
-        reduction_.completePublication(local_committed_version, publication_failure);
-  }
-  catch (...)
-  {
-    update_rule.proposalRejected();
-    proposal_live = false;
-    throw;
-  }
-
-  // All post-publication state operations are nonthrowing. The observer is
-  // notified only after the optimizer, provider, and iteration state expose the commit.
-  update_rule.proposalAccepted(schema, parameters, *objective);
-  proposal_live = false;
+  // The shared transaction has committed optimizer and provider state.  Publish
+  // coordinator state before notifying sampler-side caches.
   pending_state.parameter_version = committed_version;
   installTrainingState(state, pending_state);
   if (observer)
