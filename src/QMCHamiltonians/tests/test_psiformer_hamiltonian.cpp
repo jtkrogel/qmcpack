@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file test_psiformer_hamiltonian.cpp
- * @brief End-to-end all-electron Hamiltonian tests for the public PsiFormer interface.
+ * @brief End-to-end Hamiltonian tests for the public PsiFormer interface.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -15,10 +15,14 @@
 #include "Particle/ParticleSet.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/CoulombPotential.h"
+#include "QMCHamiltonians/ECPComponentBuilder.h"
+#include "QMCHamiltonians/LocalECPotential.h"
+#include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
+#include "Utilities/FakeRandom.h"
 #include "Utilities/RuntimeOptions.h"
 #include "QMCWaveFunctions/tests/psiformer_test_utils.h"
 
@@ -89,6 +93,53 @@ ParticleSet makeLiHElectrons(const SimulationCell& simulation_cell)
   return electrons;
 }
 
+/// Construct the two effective-charge-one nuclei in the pseudo-LiH fixture.
+ParticleSet makePseudoLiHIons(const SimulationCell& simulation_cell)
+{
+  const Geometry geometry = makeGeometry("lih_pp");
+  ParticleSet ions(simulation_cell);
+  ions.setName("ion0");
+  ions.create({2});
+
+  SpeciesSet& species = ions.getSpeciesSet();
+  const int sodium     = species.addSpecies("Na");
+  const int charge     = species.addAttribute("charge");
+  const int atomic_no  = species.addAttribute("atomic_number");
+  species(charge, sodium)    = 1.0;
+  species(atomic_no, sodium) = 11.0;
+  for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      ions.R[nucleus][dimension] = geometry.nuclei[OHMMS_DIM * nucleus + dimension];
+  ions.resetGroups();
+  ions.update();
+  return ions;
+}
+
+/// Construct the two explicitly represented electrons in the pseudo-LiH fixture.
+ParticleSet makePseudoLiHElectrons(const SimulationCell& simulation_cell)
+{
+  const Geometry geometry = makeGeometry("lih_pp");
+  ParticleSet electrons(simulation_cell);
+  electrons.setName("e");
+  electrons.create({1, 1});
+
+  SpeciesSet& species   = electrons.getSpeciesSet();
+  const int up          = species.addSpecies("u");
+  const int down        = species.addSpecies("d");
+  const int charge      = species.addAttribute("charge");
+  const int mass        = species.addAttribute("mass");
+  species(charge, up)   = -1.0;
+  species(charge, down) = -1.0;
+  species(mass, up)     = 1.0;
+  species(mass, down)   = 1.0;
+  for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      electrons.R[electron][dimension] = geometry.electrons[OHMMS_DIM * electron + dimension];
+  electrons.resetGroups();
+  electrons.update();
+  return electrons;
+}
+
 /// Build the physical open-boundary LiH Hamiltonian in production operator order.
 std::unique_ptr<QMCHamiltonian> makeLiHHamiltonian(ParticleSet& ions, ParticleSet& electrons)
 {
@@ -101,6 +152,33 @@ std::unique_ptr<QMCHamiltonian> makeLiHHamiltonian(ParticleSet& ions, ParticleSe
 
   // The Coulomb constructors add distance tables; update after the complete set
   // is present so every table is current for the first energy evaluation.
+  electrons.update();
+  return hamiltonian;
+}
+
+/// Build the open-boundary pseudo-LiH Hamiltonian in production operator order.
+std::unique_ptr<QMCHamiltonian> makePseudoLiHHamiltonian(ParticleSet& ions, ParticleSet& electrons)
+{
+  ECPComponentBuilder ecp("psiformer_generated_ecp", OHMMS::Controller);
+  REQUIRE(ecp.read_pp_file("Na.BFD.xml"));
+  REQUIRE(ecp.pp_loc != nullptr);
+  REQUIRE(ecp.pp_nonloc != nullptr);
+
+  auto hamiltonian = std::make_unique<QMCHamiltonian>("lih_pp_psiformer");
+  hamiltonian->addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+  hamiltonian->addOperator(std::make_unique<CoulombPotential>(electrons, true, false), "ElecElec");
+
+  auto local_ecp = std::make_unique<LocalECPotential>(ions, electrons);
+  local_ecp->add(0, std::move(ecp.pp_loc), ecp.Zeff);
+  hamiltonian->addOperator(std::move(local_ecp), "LocalECP");
+
+  auto nonlocal_ecp = std::make_unique<NonLocalECPotential>(
+      ions, electrons, false /* enable_DLA */, true /* use_VP */);
+  nonlocal_ecp->addComponent(0, std::move(ecp.pp_nonloc));
+  hamiltonian->addOperator(std::move(nonlocal_ecp), "NonLocalECP");
+  hamiltonian->addOperator(std::make_unique<CoulombPotential>(ions, false, false), "IonIon");
+  hamiltonian->addObservables(electrons);
+
   electrons.update();
   return hamiltonian;
 }
@@ -291,6 +369,155 @@ TEST_CASE("PsiFormer all-electron LiH through QMCHamiltonian",
           2e-8 * (1.0 + std::abs(energy_derivative[parameter])));
     CHECK(std::isfinite(std::real(batch_scores[1][parameter])));
     CHECK(std::isfinite(std::real(batch_energy_derivatives[1][parameter])));
+  }
+}
+
+TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
+          "[hamiltonian][psiformer][ecp][multiwalker]")
+{
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+  constexpr int walker_count = 2;
+
+  GeneratedFiles files = generateFiles("lih_pp");
+  const SimulationCell simulation_cell;
+  ParticleSet ions      = makePseudoLiHIons(simulation_cell);
+  ParticleSet electrons = makePseudoLiHElectrons(simulation_cell);
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "psiformer_pseudo_hamiltonian");
+  auto psiformer = std::make_unique<PsiFormerWF>(
+      "pf_pseudo_hamiltonian", files.parameters.string(), files.configuration.string(), true,
+      std::vector<std::size_t>{0, 127});
+  psiformer->validateSystem(electrons, ions, "pseudopotential");
+  wavefunction.addComponent(std::move(psiformer));
+  OptVariables active = registerParameters(wavefunction);
+  REQUIRE(active.size_of_active() == 2);
+  CHECK(active.name(0) == "pf_pseudo_hamiltonian_pf_0000000");
+  CHECK(active.name(1) == "pf_pseudo_hamiltonian_pf_0000127");
+
+  std::unique_ptr<QMCHamiltonian> hamiltonian = makePseudoLiHHamiltonian(ions, electrons);
+  FakeRandom<FullPrecReal> grid_rng1;
+  grid_rng1.set_value(0.371);
+  hamiltonian->setRandomGenerator(&grid_rng1);
+
+  ParticleSet electrons2(electrons);
+  electrons2.R[0] += QMCTraits::PosType{0.11, -0.04, 0.03};
+  electrons2.update();
+  std::unique_ptr<TrialWaveFunction> wavefunction2 = wavefunction.makeClone(electrons2);
+  std::unique_ptr<QMCHamiltonian> hamiltonian2 = hamiltonian->makeClone(electrons2, *wavefunction2);
+  FakeRandom<FullPrecReal> grid_rng2;
+  grid_rng2.set_value(0.619);
+  hamiltonian2->setRandomGenerator(&grid_rng2);
+
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons, electrons2});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      wavefunction, {wavefunction, *wavefunction2});
+  RefVectorWithLeader<QMCHamiltonian> hamiltonians(
+      *hamiltonian, {*hamiltonian, *hamiltonian2});
+
+  const int parameter_count = active.size_of_active();
+  std::array<Vector<ValueType>, walker_count> scalar_scores{
+      Vector<ValueType>(parameter_count), Vector<ValueType>(parameter_count)};
+  std::array<Vector<ValueType>, walker_count> scalar_energy_derivatives{
+      Vector<ValueType>(parameter_count), Vector<ValueType>(parameter_count)};
+  std::array<FullPrecReal, walker_count> scalar_energies;
+  for (int walker = 0; walker < walker_count; ++walker)
+  {
+    scalar_scores[walker]             = ValueType(0);
+    scalar_energy_derivatives[walker] = ValueType(0);
+    wavefunctions[walker].evaluateLog(particles[walker]);
+    scalar_energies[walker] = hamiltonians[walker].evaluateValueAndDerivatives(
+        wavefunctions[walker], particles[walker], active, scalar_scores[walker],
+        scalar_energy_derivatives[walker]);
+    CHECK(std::isfinite(scalar_energies[walker]));
+  }
+
+  ResourceCollection particle_resources("psiformer_pseudo_hamiltonian_particles");
+  ResourceCollection wavefunction_resources("psiformer_pseudo_hamiltonian_wavefunctions");
+  ResourceCollection hamiltonian_resources("psiformer_pseudo_hamiltonian_operators");
+  electrons.createResource(particle_resources);
+  wavefunction.createResource(wavefunction_resources);
+  hamiltonian->createResource(hamiltonian_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(
+      wavefunction_resources, wavefunctions);
+  ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(
+      hamiltonian_resources, hamiltonians);
+
+  ParticleSet::mw_update(particles);
+  TrialWaveFunction::mw_evaluateLog(wavefunctions, particles);
+  RecordArray<ValueType> batch_scores(walker_count, parameter_count);
+  RecordArray<ValueType> batch_energy_derivatives(walker_count, parameter_count);
+  std::fill(batch_scores.begin(), batch_scores.end(), ValueType(0));
+  std::fill(batch_energy_derivatives.begin(), batch_energy_derivatives.end(), ValueType(0));
+  const std::vector<FullPrecReal> batch_energies =
+      QMCHamiltonian::mw_evaluateValueAndDerivatives(
+          hamiltonians, wavefunctions, particles, active, batch_scores,
+          batch_energy_derivatives);
+
+  REQUIRE(batch_energies.size() == walker_count);
+  for (int walker = 0; walker < walker_count; ++walker)
+  {
+    CHECK(batch_energies[walker] ==
+          Catch::Approx(scalar_energies[walker]).epsilon(2e-10).margin(2e-10));
+    for (int parameter = 0; parameter < parameter_count; ++parameter)
+    {
+      CHECK(std::abs(batch_scores[walker][parameter] - scalar_scores[walker][parameter]) <=
+            2e-9 * (1.0 + std::abs(scalar_scores[walker][parameter])));
+      CHECK(std::abs(batch_energy_derivatives[walker][parameter] -
+                     scalar_energy_derivatives[walker][parameter]) <=
+            2e-8 * (1.0 + std::abs(scalar_energy_derivatives[walker][parameter])));
+    }
+  }
+
+  // Differentiate the same complete public multiwalker Hamiltonian result for
+  // both selected parameters. Constant per-walker generators make every
+  // analytic and +/- evaluation use the same rotated nonlocal grids.
+  const double parameter_step = 2e-5;
+  auto evaluate_batch = [&](std::array<double, walker_count>& logs) {
+    ParticleSet::mw_update(particles);
+    TrialWaveFunction::mw_evaluateLog(wavefunctions, particles);
+    for (int walker = 0; walker < walker_count; ++walker)
+      logs[walker] = wavefunctions[walker].getLogPsi();
+    return QMCHamiltonian::mw_evaluate(hamiltonians, wavefunctions, particles);
+  };
+
+  for (int parameter = 0; parameter < parameter_count; ++parameter)
+  {
+    const double original_parameter = std::real(active[parameter]);
+    std::array<double, walker_count> plus_logs;
+    std::array<double, walker_count> minus_logs;
+
+    active[parameter] = original_parameter + parameter_step;
+    wavefunction.resetParameters(active);
+    const std::vector<FullPrecReal> plus_energies = evaluate_batch(plus_logs);
+
+    active[parameter] = original_parameter - parameter_step;
+    wavefunction.resetParameters(active);
+    const std::vector<FullPrecReal> minus_energies = evaluate_batch(minus_logs);
+
+    active[parameter] = original_parameter;
+    wavefunction.resetParameters(active);
+    for (int walker = 0; walker < walker_count; ++walker)
+    {
+      const double score_finite_difference =
+          (plus_logs[walker] - minus_logs[walker]) / (2.0 * parameter_step);
+      const double energy_finite_difference =
+          (plus_energies[walker] - minus_energies[walker]) / (2.0 * parameter_step);
+      CHECK(std::isfinite(score_finite_difference));
+      CHECK(std::isfinite(energy_finite_difference));
+      CHECK(std::real(batch_scores[walker][parameter]) ==
+            Catch::Approx(score_finite_difference).epsilon(8e-5).margin(8e-5));
+      CHECK(std::real(batch_energy_derivatives[walker][parameter]) ==
+            Catch::Approx(energy_finite_difference).epsilon(8e-4).margin(8e-4));
+#if defined(QMC_COMPLEX)
+      // This open-boundary fixture has an entirely real model and Hamiltonian;
+      // the complex build must not hide a shared spurious imaginary response.
+      CHECK(std::imag(batch_scores[walker][parameter]) == Catch::Approx(0.0).margin(2e-10));
+      CHECK(std::imag(batch_energy_derivatives[walker][parameter]) ==
+            Catch::Approx(0.0).margin(2e-9));
+#endif
+    }
   }
 }
 
