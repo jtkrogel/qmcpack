@@ -559,6 +559,38 @@ public:
     return bytes;
   }
 
+  /// Report overlap with any retained determinant-workspace allocation.
+  bool overlapsStorage(const void* data, std::size_t bytes) const noexcept
+  {
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+    if (bytes == 0)
+      return false;
+    if (data == nullptr || begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+      return true;
+    const std::uintptr_t end = begin + bytes;
+    const auto overlaps = [begin, end](const auto& values) noexcept {
+      using Element = typename std::decay_t<decltype(values)>::value_type;
+      if (values.capacity() == 0)
+        return false;
+      if (values.capacity() > std::numeric_limits<std::size_t>::max() / sizeof(Element))
+        return true;
+      const std::size_t storage_bytes = values.capacity() * sizeof(Element);
+      const std::uintptr_t storage_begin =
+          reinterpret_cast<std::uintptr_t>(values.data());
+      if (values.data() == nullptr ||
+          storage_begin > std::numeric_limits<std::uintptr_t>::max() - storage_bytes)
+        return true;
+      const std::uintptr_t storage_end = storage_begin + storage_bytes;
+      return begin < storage_end && storage_begin < end;
+    };
+    return overlaps(lu_) || overlaps(inverses_) || overlaps(permutations_) ||
+        overlaps(factorization_) || overlaps(coefficient_) ||
+        overlaps(term_phase_) || overlaps(term_log_abs_) ||
+        overlaps(scaled_terms_) || overlaps(solve_) ||
+        overlaps(matrix_product_) || overlaps(gradient_sums_) ||
+        overlaps(laplacian_sums_);
+  }
+
 private:
   /// Add storage contributions while rejecting size_t wraparound.
   static std::size_t checkedSum(std::size_t left, std::size_t right)

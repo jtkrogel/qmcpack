@@ -835,8 +835,20 @@ private:
   BatchExecutionParticipantPlan batch_execution_plan_;
   /// Binding whose clone-local storage has completed exact preparation.
   BatchExecutionParticipantPlan prepared_clone_batch_execution_plan_;
+  /// Fixed allocation identities published immediately before the preparation marker.
+  const GradType* prepared_accepted_gradient_data_ = nullptr;
+  const ValueType* prepared_accepted_laplacian_data_ = nullptr;
+  const GradType* prepared_proposed_gradient_data_ = nullptr;
+  const ValueType* prepared_proposed_laplacian_data_ = nullptr;
+  /// Exact admitted capacities paired with the retained allocation identities.
+  std::size_t prepared_accepted_gradient_capacity_ = 0;
+  std::size_t prepared_accepted_laplacian_capacity_ = 0;
+  std::size_t prepared_proposed_gradient_capacity_ = 0;
+  std::size_t prepared_proposed_laplacian_capacity_ = 0;
   /// Inject a late clone-preparation failure for the strong-guarantee regression.
   bool fail_clone_preparation_before_publish_for_testing_ = false;
+  /// Inject a post-evaluation FULL_VGL failure before any public-state publication.
+  bool fail_planned_full_vgl_before_publish_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.
   bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.

@@ -666,6 +666,13 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::size_t prepared_crowd_index          = 0;
   std::uint64_t prepared_plan_fingerprint   = 0;
   std::size_t prepared_storage_fingerprint = 0;
+  /// Exact FULL_VGL metadata allocation identities retained at preparation.
+  const std::uint64_t* prepared_configuration_identities_data = nullptr;
+  const double* prepared_staged_signs_data                     = nullptr;
+  const double* prepared_staged_log_magnitudes_data            = nullptr;
+  std::size_t prepared_configuration_identities_capacity       = 0;
+  std::size_t prepared_staged_signs_capacity                   = 0;
+  std::size_t prepared_staged_log_magnitudes_capacity          = 0;
   BatchMemoryEstimate actual_resource_storage;
   /// Preparation provenance captured while this exact resource is on loan.
   const BatchExecutionPlan* acquired_plan_identity = nullptr;
@@ -824,6 +831,114 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   /// Recompute retained allocation identity without exposing mutable storage.
   std::size_t currentStorageFingerprint() const noexcept
   { return storageFingerprint(); }
+
+  /// Planned resources retain every typed staging vector at its full exact extent.
+  bool hasExactPreparedStagingExtents() const noexcept
+  {
+    const auto exact = [](const auto& values) noexcept {
+      return values.size() == values.capacity();
+    };
+    return exact(total_log_gradient) && exact(configuration_identities) &&
+        exact(batch_slots) && exact(staged_signs) &&
+        exact(staged_log_magnitudes) && exact(staged_value_ratios) &&
+        exact(staged_log_ratios) && exact(staged_gradients) &&
+        exact(preservation_flags) && exact(active_electrons) &&
+        exact(virtual_offsets) && exact(active_virtual_walkers) &&
+        exact(virtual_reference_indices) && exact(flat_virtual_ratios) &&
+        exact(virtual_reference_weights) &&
+        exact(active_derivative_global_indices) &&
+        exact(flat_virtual_weighted_derivatives) &&
+        exact(virtual_score_contribution) &&
+        exact(kinetic_parameter_contribution) &&
+        exact(virtual_reference_signs) && exact(virtual_reference_logabs) &&
+        exact(walker_indices);
+  }
+
+  /// Report overlap with any allocation retained directly by this resource.
+  bool overlapsStagingStorage(const void* data, std::size_t bytes) const noexcept
+  {
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+    if (bytes == 0)
+      return false;
+    if (data == nullptr || begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+      return true;
+    const std::uintptr_t end = begin + bytes;
+    const auto overlaps = [begin, end](const auto& values) noexcept {
+      using Element = typename std::decay_t<decltype(values)>::value_type;
+      if (values.capacity() == 0)
+        return false;
+      if (values.capacity() > std::numeric_limits<std::size_t>::max() / sizeof(Element))
+        return true;
+      const std::size_t storage_bytes = values.capacity() * sizeof(Element);
+      const std::uintptr_t storage_begin =
+          reinterpret_cast<std::uintptr_t>(values.data());
+      if (values.data() == nullptr ||
+          storage_begin > std::numeric_limits<std::uintptr_t>::max() - storage_bytes)
+        return true;
+      const std::uintptr_t storage_end = storage_begin + storage_bytes;
+      return begin < storage_end && storage_begin < end;
+    };
+    return overlaps(total_log_gradient) || overlaps(configuration_identities) ||
+        overlaps(batch_slots) || overlaps(staged_signs) ||
+        overlaps(staged_log_magnitudes) || overlaps(staged_value_ratios) ||
+        overlaps(staged_log_ratios) || overlaps(staged_gradients) ||
+        overlaps(preservation_flags) || overlaps(active_electrons) ||
+        overlaps(virtual_offsets) || overlaps(active_virtual_walkers) ||
+        overlaps(virtual_reference_indices) || overlaps(flat_virtual_ratios) ||
+        overlaps(virtual_reference_weights) ||
+        overlaps(active_derivative_global_indices) ||
+        overlaps(flat_virtual_weighted_derivatives) ||
+        overlaps(virtual_score_contribution) ||
+        overlaps(kinetic_parameter_contribution) ||
+        overlaps(virtual_reference_signs) ||
+        overlaps(virtual_reference_logabs) || overlaps(walker_indices);
+  }
+
+  /** Validate the full prepared metadata arrays used through bounded prefixes.
+   * Planned release retains physical extents, so runtime never resizes these
+   * vectors and any size or allocation-identity drift fails closed.
+   */
+  void requireFullVGLStaging(std::size_t live_walkers) const
+  {
+    if (!prepared_plan || !prepared_crowd_plan ||
+        prepared_storage_fingerprint == 0 ||
+        storageFingerprint() != prepared_storage_fingerprint)
+      throw std::logic_error(
+          "PsiFormer FULL_VGL staging lost its prepared allocation identity");
+
+    const pf::ResourceStagingStorageRequirement& staging =
+        prepared_crowd_plan->publication_storage;
+    if (configuration_identities.data() !=
+            prepared_configuration_identities_data ||
+        staged_signs.data() != prepared_staged_signs_data ||
+        staged_log_magnitudes.data() !=
+            prepared_staged_log_magnitudes_data ||
+        configuration_identities.capacity() !=
+            prepared_configuration_identities_capacity ||
+        staged_signs.capacity() != prepared_staged_signs_capacity ||
+        staged_log_magnitudes.capacity() !=
+            prepared_staged_log_magnitudes_capacity ||
+        configuration_identities.size() !=
+            prepared_configuration_identities_capacity ||
+        staged_signs.size() != prepared_staged_signs_capacity ||
+        staged_log_magnitudes.size() !=
+            prepared_staged_log_magnitudes_capacity ||
+        vectorBytes(configuration_identities,
+                    "PsiFormer FULL_VGL configuration staging") !=
+            staging.configuration_identities ||
+        vectorBytes(staged_signs, "PsiFormer FULL_VGL sign staging") !=
+            staging.signs ||
+        vectorBytes(staged_log_magnitudes,
+                    "PsiFormer FULL_VGL log staging") !=
+            staging.log_magnitudes)
+      throw std::logic_error(
+          "PsiFormer FULL_VGL staging capacities differ from the prepared plan");
+    if (live_walkers > configuration_identities.size() ||
+        live_walkers > staged_signs.size() ||
+        live_walkers > staged_log_magnitudes.size())
+      throw std::length_error(
+          "PsiFormer FULL_VGL staging prefix exceeds prepared capacity");
+  }
 
 private:
   /// Allocate exactly one typed vector from a byte requirement.
@@ -1186,6 +1301,14 @@ private:
       throw std::length_error(
           "PsiFormer prepared crowd categorized storage differs from policy");
 
+    prepared_configuration_identities_data = configuration_identities.data();
+    prepared_staged_signs_data              = staged_signs.data();
+    prepared_staged_log_magnitudes_data     = staged_log_magnitudes.data();
+    prepared_configuration_identities_capacity =
+        configuration_identities.capacity();
+    prepared_staged_signs_capacity = staged_signs.capacity();
+    prepared_staged_log_magnitudes_capacity =
+        staged_log_magnitudes.capacity();
     expected_plan                = selected;
     prepared_plan                = std::move(selected);
     prepared_crowd_index         = crowd_index;
@@ -1216,6 +1339,17 @@ private:
     prepared_plan_fingerprint      = candidate.prepared_plan_fingerprint;
     prepared_storage_fingerprint   = candidate.prepared_storage_fingerprint;
     actual_resource_storage        = candidate.actual_resource_storage;
+    prepared_configuration_identities_data =
+        candidate.prepared_configuration_identities_data;
+    prepared_staged_signs_data = candidate.prepared_staged_signs_data;
+    prepared_staged_log_magnitudes_data =
+        candidate.prepared_staged_log_magnitudes_data;
+    prepared_configuration_identities_capacity =
+        candidate.prepared_configuration_identities_capacity;
+    prepared_staged_signs_capacity =
+        candidate.prepared_staged_signs_capacity;
+    prepared_staged_log_magnitudes_capacity =
+        candidate.prepared_staged_log_magnitudes_capacity;
     batch_workspace                = std::move(candidate.batch_workspace);
     score_workspace                = std::move(candidate.score_workspace);
     kinetic_workspace              = std::move(candidate.kinetic_workspace);
@@ -1285,6 +1419,12 @@ private:
     prepared_crowd_index         = 0;
     prepared_plan_fingerprint    = 0;
     prepared_storage_fingerprint = 0;
+    prepared_configuration_identities_data = nullptr;
+    prepared_staged_signs_data              = nullptr;
+    prepared_staged_log_magnitudes_data     = nullptr;
+    prepared_configuration_identities_capacity = 0;
+    prepared_staged_signs_capacity             = 0;
+    prepared_staged_log_magnitudes_capacity    = 0;
     actual_resource_storage      = {};
     weighted_reference_configurations   = 0;
     weighted_replacement_configurations = 0;
@@ -1474,8 +1614,51 @@ void packBatchConfiguration(
 }
 
 /// Convert the real sign/log-magnitude result to QMCPACK's complex-log convention.
-WaveFunctionComponent::LogValue makeLogValue(double sign, double logabs)
+WaveFunctionComponent::LogValue makeLogValue(double sign, double logabs) noexcept
 { return WaveFunctionComponent::LogValue(logabs, sign < 0 ? M_PI : 0.0); }
+
+/// Checked non-owning byte range used by planned output-alias preflight.
+struct CheckedMemoryRange
+{
+  std::uintptr_t begin = 0;
+  std::uintptr_t end   = 0;
+};
+
+template<class T>
+CheckedMemoryRange checkedMemoryRange(const T* data,
+                                      std::size_t count,
+                                      const char* overflow_message)
+{
+  if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
+    throw std::length_error(overflow_message);
+  const std::size_t bytes = count * sizeof(T);
+  if (bytes == 0)
+    return {};
+  if (data == nullptr)
+    throw std::invalid_argument("PsiFormer planned output storage is null");
+  const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+  if (begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+    throw std::length_error(overflow_message);
+  return {begin, begin + bytes};
+}
+
+bool memoryRangesOverlap(CheckedMemoryRange left,
+                         CheckedMemoryRange right) noexcept
+{
+  return left.begin < right.end && right.begin < left.end;
+}
+
+bool sameMemoryRange(CheckedMemoryRange left, CheckedMemoryRange right) noexcept
+{ return left.begin == right.begin && left.end == right.end; }
+
+template<class T>
+bool isFiniteWavefunctionValue(const T& value) noexcept
+{
+  return psiformer::determinant::isFiniteReal(
+             static_cast<double>(std::real(value))) &&
+      psiformer::determinant::isFiniteReal(
+             static_cast<double>(std::imag(value)));
+}
 
 /// Form a finite real ratio without materializing either wavefunction amplitude.
 WaveFunctionComponent::PsiValue makeRatio(double proposed_sign,
@@ -1770,7 +1953,21 @@ bool PsiFormerWF::hasBatchExecutionPlanBinding(
 bool PsiFormerWF::hasPreparedBatchExecutionClone(
     const BatchExecutionParticipantPlan& plan) const noexcept
 {
-  return prepared_clone_batch_execution_plan_.sameBinding(plan);
+  return prepared_clone_batch_execution_plan_.sameBinding(plan) &&
+      !accepted_gradient_.isAttached() && !accepted_laplacian_.isAttached() &&
+      !proposed_gradient_.isAttached() && !proposed_laplacian_.isAttached() &&
+      accepted_gradient_.data() == prepared_accepted_gradient_data_ &&
+      accepted_laplacian_.data() == prepared_accepted_laplacian_data_ &&
+      proposed_gradient_.data() == prepared_proposed_gradient_data_ &&
+      proposed_laplacian_.data() == prepared_proposed_laplacian_data_ &&
+      accepted_gradient_.size() == prepared_accepted_gradient_capacity_ &&
+      accepted_gradient_.capacity() == prepared_accepted_gradient_capacity_ &&
+      accepted_laplacian_.size() == prepared_accepted_laplacian_capacity_ &&
+      accepted_laplacian_.capacity() == prepared_accepted_laplacian_capacity_ &&
+      proposed_gradient_.size() == prepared_proposed_gradient_capacity_ &&
+      proposed_gradient_.capacity() == prepared_proposed_gradient_capacity_ &&
+      proposed_laplacian_.size() == prepared_proposed_laplacian_capacity_ &&
+      proposed_laplacian_.capacity() == prepared_proposed_laplacian_capacity_;
 }
 
 // Check a prospective participant view completely before noexcept publication.
@@ -1864,6 +2061,14 @@ void PsiFormerWF::bindBatchExecutionPlan(
     // later unplanned scalar request is not constrained by stale capacities.
     batch_execution_plan_ = {};
     prepared_clone_batch_execution_plan_ = {};
+    prepared_accepted_gradient_data_ = nullptr;
+    prepared_accepted_laplacian_data_ = nullptr;
+    prepared_proposed_gradient_data_ = nullptr;
+    prepared_proposed_laplacian_data_ = nullptr;
+    prepared_accepted_gradient_capacity_ = 0;
+    prepared_accepted_laplacian_capacity_ = 0;
+    prepared_proposed_gradient_capacity_ = 0;
+    prepared_proposed_laplacian_capacity_ = 0;
     direct_value_workspace_.reset();
     direct_score_workspace_.reset();
     direct_kinetic_workspace_.reset();
@@ -1881,6 +2086,14 @@ void PsiFormerWF::bindBatchExecutionPlan(
     // water.  Drop recomputable scratch before publishing the first hard plan;
     // subsequent exact preparation can then allocate without overlap.
     prepared_clone_batch_execution_plan_ = {};
+    prepared_accepted_gradient_data_ = nullptr;
+    prepared_accepted_laplacian_data_ = nullptr;
+    prepared_proposed_gradient_data_ = nullptr;
+    prepared_proposed_laplacian_data_ = nullptr;
+    prepared_accepted_gradient_capacity_ = 0;
+    prepared_accepted_laplacian_capacity_ = 0;
+    prepared_proposed_gradient_capacity_ = 0;
+    prepared_proposed_laplacian_capacity_ = 0;
     direct_value_workspace_.reset();
     direct_score_workspace_.reset();
     direct_kinetic_workspace_.reset();
@@ -1907,15 +2120,62 @@ void PsiFormerWF::prepareBatchExecutionClone(
   if (has_proposal_)
     throw std::logic_error(
         "Cannot prepare PsiFormer clone storage while a proposal is pending");
-  if (prepared_clone_batch_execution_plan_)
-  {
-    if (prepared_clone_batch_execution_plan_.sameBinding(participant_plan))
-      return;
-    throw std::logic_error(
-        "Cannot replace a prepared PsiFormer clone batch execution plan");
-  }
 
   const BatchExecutionPlan& plan = participant_plan.plan();
+  const psiformer::PsiFormerMemoryPolicyInput input =
+      makeBatchMemoryPolicyInput();
+  const std::size_t electron_count = input.storage_shape.electrons;
+  const auto exact_storage_bytes = [electron_count](const auto& storage,
+                                                     std::size_t element_bytes,
+                                                     const char* description) {
+    if (storage.isAttached())
+      throw std::logic_error(
+          "PsiFormer prepared clone spatial storage must be owned");
+    if (storage.size() != electron_count ||
+        storage.capacity() != electron_count)
+      throw std::length_error(description);
+    return checkedBatchMemoryMultiply(storage.capacity(), element_bytes,
+                                      description);
+  };
+  const auto validate_exact_storage = [&]() {
+    const pf::CloneStateStorageRequirement clone_state =
+        pf::cloneStateStorageRequirement(
+            electron_count, input.type_sizes.value_type,
+            input.type_sizes.gradient_type);
+    std::size_t actual_clone_bytes = 0;
+    for (const std::size_t bytes : {
+             exact_storage_bytes(
+                 accepted_gradient_, sizeof(GradType),
+                 "PsiFormer accepted gradient does not have its exact admitted capacity"),
+             exact_storage_bytes(
+                 proposed_gradient_, sizeof(GradType),
+                 "PsiFormer proposed gradient does not have its exact admitted capacity"),
+             exact_storage_bytes(
+                 accepted_laplacian_, sizeof(ValueType),
+                 "PsiFormer accepted Laplacian does not have its exact admitted capacity"),
+             exact_storage_bytes(
+                 proposed_laplacian_, sizeof(ValueType),
+                 "PsiFormer proposed Laplacian does not have its exact admitted capacity")})
+      actual_clone_bytes = checkedBatchMemoryAdd(
+          actual_clone_bytes, bytes,
+          "PsiFormer prepared clone-state bytes");
+    if (actual_clone_bytes != clone_state.totalBytes())
+      throw std::length_error(
+          "PsiFormer prepared clone state does not match its admitted storage");
+  };
+
+  if (prepared_clone_batch_execution_plan_)
+  {
+    if (!prepared_clone_batch_execution_plan_.sameBinding(participant_plan))
+      throw std::logic_error(
+          "Cannot replace a prepared PsiFormer clone batch execution plan");
+    validate_exact_storage();
+    if (!hasPreparedBatchExecutionClone(participant_plan))
+      throw std::logic_error(
+          "PsiFormer prepared clone allocation identity changed");
+    return;
+  }
+
   if (plan.topology().serialized_walkers)
     throw std::invalid_argument(
         "PsiFormer clone preparation does not admit serialized-walker execution");
@@ -1927,8 +2187,6 @@ void PsiFormerWF::prepareBatchExecutionClone(
     throw std::invalid_argument(
         "PsiFormer clone preparation plan omits a component-owned requirement");
 
-  const psiformer::PsiFormerMemoryPolicyInput input =
-      makeBatchMemoryPolicyInput();
   validatePlannedBackends(input, plan.requirements());
   const pf::DirectBatchCapacityPlan scalar_plan = psiformer::makePsiFormerScalarValueCapacityPlan(
       input, plan.requirements(), plan.selectedCapacities());
@@ -1959,32 +2217,59 @@ void PsiFormerWF::prepareBatchExecutionClone(
   if (fail_clone_preparation_before_publish_for_testing_)
     throw std::bad_alloc();
 
-  // Accepted state is constructor-owned; proposed state is completed here so
-  // selected-electron moves cannot allocate after plan publication.  Ohmms
-  // vectors retain any successfully allocated high water after a later sibling
-  // allocation fails, while the preparation marker remains unpublished.
-  const std::size_t electron_count = input.storage_shape.electrons;
-  resizeAcceptedSpatialStorage(electron_count);
-  resizeProposedSpatialStorage(electron_count);
-  const pf::CloneStateStorageRequirement clone_state = pf::cloneStateStorageRequirement(
-      electron_count, input.type_sizes.value_type, input.type_sizes.gradient_type);
-  const std::size_t gradient_elements = checkedBatchMemoryAdd(
-      accepted_gradient_.size(), proposed_gradient_.size(),
-      "PsiFormer prepared clone gradient elements");
-  const std::size_t laplacian_elements = checkedBatchMemoryAdd(
-      accepted_laplacian_.size(), proposed_laplacian_.size(),
-      "PsiFormer prepared clone Laplacian elements");
-  const std::size_t actual_clone_bytes = checkedBatchMemoryAdd(
-      checkedBatchMemoryMultiply(
-          gradient_elements, sizeof(GradType),
-          "PsiFormer prepared clone gradient bytes"),
-      checkedBatchMemoryMultiply(
-          laplacian_elements, sizeof(ValueType),
-          "PsiFormer prepared clone Laplacian bytes"),
-      "PsiFormer prepared clone-state bytes");
-  if (actual_clone_bytes != clone_state.totalBytes())
-    throw std::length_error(
-        "PsiFormer prepared clone state does not match its admitted storage");
+  // Accepted nonempty state may represent a physical configuration and cannot
+  // be canonicalized by discarding it.  Empty accepted storage and all
+  // proposal storage are safe to materialize because proposals are absent.
+  const auto validate_accepted_storage = [electron_count](const auto& storage) {
+    if (storage.isAttached())
+      throw std::logic_error(
+          "PsiFormer clone preparation requires owned accepted spatial storage");
+    if (storage.size() != 0 &&
+        (storage.size() != electron_count ||
+         storage.capacity() != electron_count))
+      throw std::length_error(
+          "PsiFormer accepted spatial storage retains a noncanonical capacity");
+  };
+  validate_accepted_storage(accepted_gradient_);
+  validate_accepted_storage(accepted_laplacian_);
+  if (proposed_gradient_.isAttached() || proposed_laplacian_.isAttached())
+    throw std::logic_error(
+        "PsiFormer clone preparation requires owned proposed spatial storage");
+
+  const bool materialize_accepted = accepted_gradient_.size() == 0 ||
+      accepted_laplacian_.size() == 0;
+  if (accepted_gradient_.size() == 0)
+  {
+    if (accepted_gradient_.capacity() != electron_count)
+      accepted_gradient_.free();
+    accepted_gradient_.resize(electron_count);
+  }
+  if (accepted_laplacian_.size() == 0)
+  {
+    if (accepted_laplacian_.capacity() != electron_count)
+      accepted_laplacian_.free();
+    accepted_laplacian_.resize(electron_count);
+  }
+  if (materialize_accepted)
+  {
+    accepted_gradient_          = ValueType(0);
+    accepted_laplacian_         = ValueType(0);
+    accepted_value_valid_       = false;
+    accepted_state_requirement_ = AcceptedStateRequirement::INVALID;
+  }
+  if (proposed_gradient_.size() != electron_count ||
+      proposed_gradient_.capacity() != electron_count)
+  {
+    proposed_gradient_.free();
+    proposed_gradient_.resize(electron_count);
+  }
+  if (proposed_laplacian_.size() != electron_count ||
+      proposed_laplacian_.capacity() != electron_count)
+  {
+    proposed_laplacian_.free();
+    proposed_laplacian_.resize(electron_count);
+  }
+  validate_exact_storage();
 
   // No other clone-local evaluator tape is admitted by the first hard-plan
   // implementation.  Publish the fully staged scalar owner with no throwing
@@ -1997,6 +2282,16 @@ void PsiFormerWF::prepareBatchExecutionClone(
   std::vector<double>().swap(direct_total_log_gradient_);
   direct_batch_workspace_ = std::move(prepared_batch_workspace);
   scalar_value_publication_ = std::move(prepared_scalar_publication);
+  prepared_accepted_gradient_data_  = accepted_gradient_.data();
+  prepared_accepted_laplacian_data_ = accepted_laplacian_.data();
+  prepared_proposed_gradient_data_  = proposed_gradient_.data();
+  prepared_proposed_laplacian_data_ = proposed_laplacian_.data();
+  prepared_accepted_gradient_capacity_ = accepted_gradient_.capacity();
+  prepared_accepted_laplacian_capacity_ = accepted_laplacian_.capacity();
+  prepared_proposed_gradient_capacity_ = proposed_gradient_.capacity();
+  prepared_proposed_laplacian_capacity_ = proposed_laplacian_.capacity();
+  static_assert(std::is_nothrow_copy_assignable_v<BatchExecutionParticipantPlan>);
+  // The plan view is the validity marker and is deliberately published last.
   prepared_clone_batch_execution_plan_ = participant_plan;
 }
 
@@ -2201,30 +2496,45 @@ void PsiFormerWF::releaseResource(
           "PsiFormer multiwalker resource release order differs from acquisition");
   }
   auto& resource = leader.mw_resource_handle_.getResource();
+  if (resource.prepared_plan)
+  {
+    if (!resource.hasExactPreparedStagingExtents() ||
+        resource.currentStorageFingerprint() !=
+            resource.prepared_storage_fingerprint)
+      throw std::logic_error(
+          "PsiFormer planned resource storage changed before release");
+    resource.requireFullVGLStaging(wfc_list.size());
+  }
   // Return ownership first.  If ResourceCollection rejects the ordering, the
   // handle, logical extents, and provenance remain intact for a retry.
   collection.takebackResource(leader.mw_resource_handle_);
-  resource.configuration_identities.clear();
-  resource.batch_slots.clear();
-  resource.staged_signs.clear();
-  resource.staged_log_magnitudes.clear();
-  resource.staged_value_ratios.clear();
-  resource.staged_log_ratios.clear();
-  resource.staged_gradients.clear();
-  resource.preservation_flags.clear();
-  resource.active_electrons.clear();
-  resource.virtual_offsets.clear();
-  resource.active_virtual_walkers.clear();
-  resource.virtual_reference_indices.clear();
-  resource.flat_virtual_ratios.clear();
-  resource.virtual_reference_weights.clear();
-  resource.active_derivative_global_indices.clear();
-  resource.flat_virtual_weighted_derivatives.clear();
-  resource.virtual_score_contribution.clear();
-  resource.kinetic_parameter_contribution.clear();
-  resource.virtual_reference_signs.clear();
-  resource.virtual_reference_logabs.clear();
-  resource.walker_indices.clear();
+  // A prepared resource retains every exact physical extent.  Planned calls
+  // consume bounded prefixes and fail closed if an unmigrated path changes a
+  // size.  Legacy resources preserve their historical clear-on-release behavior.
+  if (!resource.prepared_plan)
+  {
+    resource.configuration_identities.clear();
+    resource.batch_slots.clear();
+    resource.staged_signs.clear();
+    resource.staged_log_magnitudes.clear();
+    resource.staged_value_ratios.clear();
+    resource.staged_log_ratios.clear();
+    resource.staged_gradients.clear();
+    resource.preservation_flags.clear();
+    resource.active_electrons.clear();
+    resource.virtual_offsets.clear();
+    resource.active_virtual_walkers.clear();
+    resource.virtual_reference_indices.clear();
+    resource.flat_virtual_ratios.clear();
+    resource.virtual_reference_weights.clear();
+    resource.active_derivative_global_indices.clear();
+    resource.flat_virtual_weighted_derivatives.clear();
+    resource.virtual_score_contribution.clear();
+    resource.kinetic_parameter_contribution.clear();
+    resource.virtual_reference_signs.clear();
+    resource.virtual_reference_logabs.clear();
+    resource.walker_indices.clear();
+  }
   resource.acquired_plan_identity            = nullptr;
   resource.acquired_crowd_index              = 0;
   resource.acquired_from_prepared_collection = false;
@@ -2386,7 +2696,7 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
   }
 
   if (!batch_execution_plan_ ||
-      !prepared_clone_batch_execution_plan_.sameBinding(batch_execution_plan_))
+      !hasPreparedBatchExecutionClone(batch_execution_plan_))
     throw std::logic_error(
         "PsiFormer planned operation requires an exactly prepared leader clone");
 
@@ -2424,8 +2734,7 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
       throw std::invalid_argument(
           "PsiFormer planned operation lane order differs from resource acquisition");
     if (!component.batch_execution_plan_.sameBinding(batch_execution_plan_) ||
-        !component.prepared_clone_batch_execution_plan_.sameBinding(
-            batch_execution_plan_))
+        !component.hasPreparedBatchExecutionClone(batch_execution_plan_))
       throw std::logic_error(
           "PsiFormer planned operation contains an unprepared or differently bound clone");
     if (particles.isSpinor())
@@ -2474,12 +2783,12 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
                 static_cast<double>(particles.getActivePos()[dimension])))
           throw std::invalid_argument(
               "PsiFormer planned operation received a non-finite active position");
-    if (component.accepted_gradient_.size() != electron_count ||
-        component.accepted_laplacian_.size() != electron_count ||
-        component.proposed_gradient_.size() != electron_count ||
-        component.proposed_laplacian_.size() != electron_count)
+    if (component.prepared_accepted_gradient_capacity_ != electron_count ||
+        component.prepared_accepted_laplacian_capacity_ != electron_count ||
+        component.prepared_proposed_gradient_capacity_ != electron_count ||
+        component.prepared_proposed_laplacian_capacity_ != electron_count)
       throw std::logic_error(
-          "PsiFormer planned operation clone storage has the wrong electron extent");
+          "PsiFormer planned operation clone storage differs from its exact prepared extent");
   }
 
   PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
@@ -2551,6 +2860,9 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
       storage_fingerprint != resource.prepared_storage_fingerprint)
     throw std::logic_error(
         "PsiFormer planned operation resource storage changed after preparation");
+  if (!resource.hasExactPreparedStagingExtents())
+    throw std::logic_error(
+        "PsiFormer planned operation resource staging extent changed after preparation");
 
   if (topology.serialized_walkers || topology.backend_id != "cpu" ||
       topology.device_id)
@@ -2796,11 +3108,11 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
   diagnostics.scalar_value_publication_bytes =
       scalar_value_publication_.capacity() * sizeof(ValueType);
   diagnostics.accepted_spatial_bytes =
-      accepted_gradient_.size() * sizeof(GradType) +
-      accepted_laplacian_.size() * sizeof(ValueType);
+      accepted_gradient_.capacity() * sizeof(GradType) +
+      accepted_laplacian_.capacity() * sizeof(ValueType);
   diagnostics.proposed_spatial_bytes =
-      proposed_gradient_.size() * sizeof(GradType) +
-      proposed_laplacian_.size() * sizeof(ValueType);
+      proposed_gradient_.capacity() * sizeof(GradType) +
+      proposed_laplacian_.capacity() * sizeof(ValueType);
   return diagnostics;
 }
 
@@ -4025,107 +4337,408 @@ void PsiFormerWF::mw_evaluateLog(
     const RefVector<ParticleSet::ParticleGradient>& gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list) const
 {
-  if (wfc_list.size() != p_list.size() || wfc_list.size() != gradient_list.size() ||
-      wfc_list.size() != laplacian_list.size())
-    throw std::invalid_argument("PsiFormer mw_evaluateLog list sizes do not match");
-  if (wfc_list.empty())
-    return;
-
-  const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
-  auto& resource     = requireMultiWalkerResource(wfc_list);
-  PsiFormerReadTransaction transaction(*leader.model_state_);
-  const std::size_t parameter_version = transaction.parameterVersion();
-  const std::size_t electrons =
-      transaction.state().execution_plan.modelShape().electrons();
-  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  // Preserve the historical lazy/oracle implementation byte-for-byte behind
+  // an explicit no-policy branch.
+  if (!batch_execution_plan_)
   {
-    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
-        "mw_evaluateLog");
-    component.synchronizeParameterVersion(parameter_version);
-    if (gradient_list[walker].get().size() != electrons ||
-        laplacian_list[walker].get().size() != electrons)
-      throw std::invalid_argument("PsiFormer mw_evaluateLog output arrays have the wrong size");
-    component.resizeAcceptedSpatialStorage(electrons);
-  }
+    if (wfc_list.size() != p_list.size() || wfc_list.size() != gradient_list.size() ||
+        wfc_list.size() != laplacian_list.size())
+      throw std::invalid_argument("PsiFormer mw_evaluateLog list sizes do not match");
+    if (wfc_list.empty())
+      return;
 
-  // Preserve oracle and compare validation while binding the complete crowd to
-  // the same model transaction.  Owning VGL results stage all rows before the
-  // no-fail publication pass.
-  if (transaction.state().direct_spatial_mode != DirectBackendMode::DIRECT)
-  {
-    std::vector<pf::Result> staged_results;
-    staged_results.reserve(wfc_list.size());
+    const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+    auto& resource     = requireMultiWalkerResource(wfc_list);
+    PsiFormerReadTransaction transaction(*leader.model_state_);
+    const std::size_t parameter_version = transaction.parameterVersion();
+    const std::size_t electrons =
+        transaction.state().execution_plan.modelShape().electrons();
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-      staged_results.push_back(component.evaluatePositionsUnderRead(
-          transaction, p_list[walker], -1, nullptr,
-          EvaluationPurpose::FULL_SPATIAL, -1));
-      if (staged_results.back().gradient.size() != 3 * electrons ||
-          staged_results.back().lap_log.size() != electrons)
-        throw std::logic_error("PsiFormer multiwalker oracle VGL result has the wrong shape");
+      wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
+          "mw_evaluateLog");
+      component.synchronizeParameterVersion(parameter_version);
+      if (gradient_list[walker].get().size() != electrons ||
+          laplacian_list[walker].get().size() != electrons)
+        throw std::invalid_argument("PsiFormer mw_evaluateLog output arrays have the wrong size");
+      component.resizeAcceptedSpatialStorage(electrons);
     }
 
+    // Preserve oracle and compare validation while binding the complete crowd to
+    // the same model transaction.  Owning VGL results stage all rows before the
+    // no-fail publication pass.
+    if (transaction.state().direct_spatial_mode != DirectBackendMode::DIRECT)
+    {
+      std::vector<pf::Result> staged_results;
+      staged_results.reserve(wfc_list.size());
+      for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+      {
+        auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+        staged_results.push_back(component.evaluatePositionsUnderRead(
+            transaction, p_list[walker], -1, nullptr,
+            EvaluationPurpose::FULL_SPATIAL, -1));
+        if (staged_results.back().gradient.size() != 3 * electrons ||
+            staged_results.back().lap_log.size() != electrons)
+          throw std::logic_error("PsiFormer multiwalker oracle VGL result has the wrong shape");
+      }
+
+      for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+      {
+        auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+        const pf::Result& result = staged_results[walker];
+        component.current_sign_ = result.sign;
+        component.log_value_    = makeLogValue(result.sign, result.logabs);
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            component.accepted_gradient_[electron][dimension] =
+                result.gradient[3 * electron + dimension];
+          component.accepted_laplacian_[electron] = result.lap_log[electron];
+        }
+        component.accepted_configuration_identity_ = configurationIdentity(p_list[walker]);
+        component.accepted_parameter_version_      = parameter_version;
+        component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
+        component.accepted_value_valid_            = true;
+        component.clearProposalState();
+        component.accumulateAcceptedSpatial(gradient_list[walker].get(),
+                                            laplacian_list[walker].get());
+      }
+      return;
+    }
+
+    auto& batch = *resource.batch_workspace;
+    batch.resize(pf::DirectBatchMode::FULL_VGL, wfc_list.size());
+    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    {
+      packBatchConfiguration(batch, walker, p_list[walker]);
+    }
+
+    const pf::DirectBatchSpatialResultView result =
+        transaction.state().direct_batch_executor.evaluateFull(batch);
+    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+      if (result.parameter_version[walker] != parameter_version)
+        throw std::logic_error("PsiFormer full-spatial batch observed inconsistent parameters");
+
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-      const pf::Result& result = staged_results[walker];
-      component.current_sign_ = result.sign;
-      component.log_value_    = makeLogValue(result.sign, result.logabs);
+      component.current_sign_ = result.sign[walker];
+      component.log_value_ = makeLogValue(result.sign[walker], result.logabs[walker]);
+      auto& gradient = gradient_list[walker].get();
+      auto& laplacian = laplacian_list[walker].get();
       for (std::size_t electron = 0; electron < electrons; ++electron)
       {
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           component.accepted_gradient_[electron][dimension] =
-              result.gradient[3 * electron + dimension];
-        component.accepted_laplacian_[electron] = result.lap_log[electron];
+              result.gradient[walker * result.gradient_stride + 3 * electron + dimension];
+        component.accepted_laplacian_[electron] =
+            result.lap_log[walker * result.laplacian_stride + electron];
       }
       component.accepted_configuration_identity_ = configurationIdentity(p_list[walker]);
       component.accepted_parameter_version_      = parameter_version;
       component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
       component.accepted_value_valid_            = true;
       component.clearProposalState();
-      component.accumulateAcceptedSpatial(gradient_list[walker].get(),
-                                          laplacian_list[walker].get());
+      component.accumulateAcceptedSpatial(gradient, laplacian);
     }
     return;
   }
 
-  auto& batch = *resource.batch_workspace;
-  batch.resize(pf::DirectBatchMode::FULL_VGL, wfc_list.size());
-  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-  {
-    packBatchConfiguration(batch, walker, p_list[walker]);
-  }
+  const std::size_t walker_count = wfc_list.size();
+  PlannedRuntimeRequest request;
+  request.operation            = PlannedOperation::FULL_VGL;
+  request.live_walkers         = walker_count;
+  request.dense_configurations = walker_count;
+  PlannedRuntimeAccess access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+  if (gradient_list.size() != walker_count ||
+      laplacian_list.size() != walker_count)
+    throw std::invalid_argument(
+        "PsiFormer planned FULL_VGL output-list sizes do not match the crowd");
 
-  const pf::DirectBatchSpatialResultView result =
-      transaction.state().direct_batch_executor.evaluateFull(batch);
-  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-    if (result.parameter_version[walker] != parameter_version)
-      throw std::logic_error("PsiFormer full-spatial batch observed inconsistent parameters");
+  const std::size_t electrons = access.participant.plan().particleCount();
+  PsiFormerMultiWalkerResource& resource = access.resource;
+  resource.requireFullVGLStaging(walker_count);
+  pf::DirectBatchWorkspace& batch = *resource.batch_workspace;
 
-  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  // Phase A: prove caller shapes, finite additive seeds, and complete storage
+  // separation before changing workspace contents or opening a model read.
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
   {
-    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    component.current_sign_ = result.sign[walker];
-    component.log_value_ = makeLogValue(result.sign[walker], result.logabs[walker]);
-    auto& gradient = gradient_list[walker].get();
-    auto& laplacian = laplacian_list[walker].get();
+    const auto& gradient  = gradient_list[lane].get();
+    const auto& laplacian = laplacian_list[lane].get();
+    if (gradient.size() != electrons || laplacian.size() != electrons)
+      throw std::invalid_argument(
+          "PsiFormer planned FULL_VGL output arrays have the wrong shape");
     for (std::size_t electron = 0; electron < electrons; ++electron)
     {
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
-        component.accepted_gradient_[electron][dimension] =
-            result.gradient[walker * result.gradient_stride + 3 * electron + dimension];
-      component.accepted_laplacian_[electron] =
-          result.lap_log[walker * result.laplacian_stride + electron];
+        if (!isFiniteWavefunctionValue(gradient[electron][dimension]))
+          throw std::invalid_argument(
+              "PsiFormer planned FULL_VGL gradient seed is non-finite");
+      if (!isFiniteWavefunctionValue(laplacian[electron]))
+        throw std::invalid_argument(
+            "PsiFormer planned FULL_VGL Laplacian seed is non-finite");
     }
-    component.accepted_configuration_identity_ = configurationIdentity(p_list[walker]);
-    component.accepted_parameter_version_      = parameter_version;
-    component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
-    component.accepted_value_valid_            = true;
-    component.clearProposalState();
-    component.accumulateAcceptedSpatial(gradient, laplacian);
   }
+
+  const auto output_range = [&](std::size_t lane, bool gradient) {
+    return gradient
+        ? checkedMemoryRange(gradient_list[lane].get().data(), electrons,
+                             "PsiFormer planned FULL_VGL gradient range overflowed")
+        : checkedMemoryRange(laplacian_list[lane].get().data(), electrons,
+                             "PsiFormer planned FULL_VGL Laplacian range overflowed");
+  };
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    for (int output_kind = 0; output_kind < 2; ++output_kind)
+    {
+      const bool is_gradient = output_kind == 0;
+      const CheckedMemoryRange output = output_range(lane, is_gradient);
+      const void* output_data = is_gradient
+          ? static_cast<const void*>(gradient_list[lane].get().data())
+          : static_cast<const void*>(laplacian_list[lane].get().data());
+      const std::size_t output_bytes = output.end - output.begin;
+
+      for (std::size_t prior_lane = 0; prior_lane <= lane; ++prior_lane)
+        for (int prior_kind = 0; prior_kind < 2; ++prior_kind)
+        {
+          if (prior_lane == lane && prior_kind >= output_kind)
+            continue;
+          if (memoryRangesOverlap(
+                  output, output_range(prior_lane, prior_kind == 0)))
+            throw std::invalid_argument(
+                "PsiFormer planned FULL_VGL caller outputs overlap");
+        }
+
+      for (std::size_t particle_lane = 0; particle_lane < walker_count;
+           ++particle_lane)
+      {
+        const auto& soa_positions =
+            p_list[particle_lane].getCoordinates().getAllParticlePos();
+        if (soa_positions.capacity() >
+            std::numeric_limits<std::size_t>::max() / 3)
+          throw std::length_error(
+              "PsiFormer ParticleSet SoA position range overflowed");
+        const CheckedMemoryRange position_range = checkedMemoryRange(
+            p_list[particle_lane].R.data(), electrons,
+            "PsiFormer ParticleSet position range overflowed");
+        const CheckedMemoryRange soa_position_range = checkedMemoryRange(
+            soa_positions.data(), 3 * soa_positions.capacity(),
+            "PsiFormer ParticleSet SoA position range overflowed");
+        const CheckedMemoryRange active_position_range = checkedMemoryRange(
+            std::addressof(p_list[particle_lane].getActivePos()), std::size_t{1},
+            "PsiFormer ParticleSet active-position range overflowed");
+        if (memoryRangesOverlap(output, position_range) ||
+            memoryRangesOverlap(output, soa_position_range) ||
+            memoryRangesOverlap(output, active_position_range))
+          throw std::invalid_argument(
+              "PsiFormer planned FULL_VGL output aliases ParticleSet position storage");
+        for (int particle_kind = 0; particle_kind < 2; ++particle_kind)
+        {
+          const bool particle_gradient = particle_kind == 0;
+          const CheckedMemoryRange particle_range = particle_gradient
+              ? checkedMemoryRange(p_list[particle_lane].G.data(), electrons,
+                                   "PsiFormer ParticleSet gradient range overflowed")
+              : checkedMemoryRange(p_list[particle_lane].L.data(), electrons,
+                                   "PsiFormer ParticleSet Laplacian range overflowed");
+          if (!memoryRangesOverlap(output, particle_range))
+            continue;
+          const bool exact_same_lane = particle_lane == lane &&
+              particle_gradient == is_gradient &&
+              sameMemoryRange(output, particle_range);
+          if (!exact_same_lane)
+            throw std::invalid_argument(
+                "PsiFormer planned FULL_VGL output aliases incompatible ParticleSet storage");
+        }
+      }
+
+      for (std::size_t component_lane = 0; component_lane < walker_count;
+           ++component_lane)
+      {
+        const auto& component =
+            static_cast<const PsiFormerWF&>(wfc_list[component_lane]);
+        for (const CheckedMemoryRange internal : {
+                 checkedMemoryRange(
+                     component.accepted_gradient_.data(), electrons,
+                     "PsiFormer accepted gradient range overflowed"),
+                 checkedMemoryRange(
+                     component.accepted_laplacian_.data(), electrons,
+                     "PsiFormer accepted Laplacian range overflowed"),
+                 checkedMemoryRange(
+                     component.proposed_gradient_.data(), electrons,
+                     "PsiFormer proposed gradient range overflowed"),
+                 checkedMemoryRange(
+                     component.proposed_laplacian_.data(), electrons,
+                     "PsiFormer proposed Laplacian range overflowed")})
+          if (memoryRangesOverlap(output, internal))
+            throw std::invalid_argument(
+                "PsiFormer planned FULL_VGL output aliases component state");
+      }
+      if (resource.overlapsStagingStorage(output_data, output_bytes) ||
+          batch.overlapsStorage(output_data, output_bytes))
+        throw std::invalid_argument(
+            "PsiFormer planned FULL_VGL output aliases prepared scratch");
+    }
+
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    resource.configuration_identities[lane] = configurationIdentity(p_list[lane]);
+
+  PsiFormerReadTransaction transaction(*model_state_);
+  if (transaction.state().direct_spatial_mode != DirectBackendMode::DIRECT)
+    throw std::logic_error(
+        "PsiFormer planned FULL_VGL requires the direct spatial backend");
+  const std::size_t parameter_version = transaction.parameterVersion();
+  batch.resize(pf::DirectBatchMode::FULL_VGL, walker_count);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    packBatchConfiguration(batch, lane, p_list[lane]);
+
+  const pf::DirectBatchSpatialResultView result =
+      transaction.state().direct_batch_executor.evaluateFull(batch);
+  if (!batch.ownsSpatialResult(result, pf::DirectSpatialMode::FULL_VGL,
+                               walker_count))
+    throw std::logic_error(
+        "PsiFormer planned FULL_VGL result is not the exact workspace-owned view");
+
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    if (result.parameter_version[lane] != parameter_version)
+      throw std::logic_error(
+          "PsiFormer planned FULL_VGL observed inconsistent parameters");
+    if ((result.sign[lane] != 1.0 && result.sign[lane] != -1.0) ||
+        !psiformer::determinant::isFiniteReal(result.logabs[lane]))
+      throw std::runtime_error(
+          "PsiFormer planned FULL_VGL produced an invalid sign or log magnitude");
+    resource.staged_signs[lane] = result.sign[lane];
+    resource.staged_log_magnitudes[lane] = result.logabs[lane];
+    for (std::size_t electron = 0; electron < electrons; ++electron)
+    {
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (!psiformer::determinant::isFiniteReal(
+                result.gradient[lane * result.gradient_stride +
+                                3 * electron + dimension]))
+          throw std::runtime_error(
+              "PsiFormer planned FULL_VGL produced a non-finite gradient");
+      if (!psiformer::determinant::isFiniteReal(
+              result.lap_log[lane * result.laplacian_stride + electron]) ||
+          !psiformer::determinant::isFiniteReal(
+              result.lap_ratio[lane * result.laplacian_stride + electron]))
+        throw std::runtime_error(
+            "PsiFormer planned FULL_VGL produced a non-finite Laplacian");
+    }
+  }
+
+  // Phase B: revalidate every borrowed identity and result immediately before
+  // the last possibly failing work.  Stale/invalid accepted caches are allowed:
+  // this successful operation authoritatively replaces them at the current version.
+  if (!batch.ownsSpatialResult(result, pf::DirectSpatialMode::FULL_VGL,
+                               walker_count) ||
+      resource.currentStorageFingerprint() != access.storage_fingerprint ||
+      !resource.hasExactPreparedStagingExtents())
+    throw std::logic_error(
+        "PsiFormer planned FULL_VGL storage changed during evaluation");
+  resource.requireFullVGLStaging(walker_count);
+  const PlannedRuntimeAccess final_access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+  if (&final_access.resource != &resource ||
+      !final_access.participant.sameBinding(access.participant) ||
+      &final_access.crowd != &access.crowd ||
+      final_access.storage_fingerprint != access.storage_fingerprint)
+    throw std::logic_error(
+        "PsiFormer planned FULL_VGL runtime evidence changed during evaluation");
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+    if (component.model_state_.get() != model_state_.get() ||
+        component.optimization_metadata_.get() != optimization_metadata_.get() ||
+        component.bound_particle_set_ != &p_list[lane] ||
+        component.acquired_crowd_leader_ != this ||
+        component.acquired_lane_index_ != lane ||
+        component.acquired_crowd_size_ != walker_count ||
+        !component.batch_execution_plan_.sameBinding(access.participant) ||
+        !component.hasPreparedBatchExecutionClone(access.participant) ||
+        result.parameter_version[lane] != parameter_version ||
+        configurationIdentity(p_list[lane]) !=
+            resource.configuration_identities[lane])
+      throw std::logic_error(
+          "PsiFormer planned FULL_VGL lane identity changed during evaluation");
+  }
+
+  // Friend-only regression seam for the strong guarantee at the latest
+  // throwing boundary: evaluator scratch is live, but nothing is published.
+  if (fail_planned_full_vgl_before_publish_for_testing_)
+    throw std::overflow_error(
+        "Injected PsiFormer planned FULL_VGL pre-publication failure");
+
+  // Dry-run every additive operation last.  Nothing after this loop may fail.
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    for (std::size_t electron = 0; electron < electrons; ++electron)
+    {
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const ValueType future = gradient_list[lane].get()[electron][dimension] +
+            static_cast<ValueType>(
+                result.gradient[lane * result.gradient_stride +
+                                3 * electron + dimension]);
+        if (!isFiniteWavefunctionValue(future))
+          throw std::overflow_error(
+              "PsiFormer planned FULL_VGL gradient sum is non-finite");
+      }
+      const ValueType future = laplacian_list[lane].get()[electron] +
+          static_cast<ValueType>(
+              result.lap_log[lane * result.laplacian_stride + electron]);
+      if (!isFiniteWavefunctionValue(future))
+        throw std::overflow_error(
+            "PsiFormer planned FULL_VGL Laplacian sum is non-finite");
+    }
+
+  // Dedicated mechanically nonthrowing publication: accepted arrays, caller
+  // additions, metadata, then the accepted-valid marker for every lane.
+  const auto publish = [&]() noexcept {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          component.accepted_gradient_[electron][dimension] =
+              static_cast<ValueType>(
+                  result.gradient[lane * result.gradient_stride +
+                                  3 * electron + dimension]);
+        component.accepted_laplacian_[electron] = static_cast<ValueType>(
+            result.lap_log[lane * result.laplacian_stride + electron]);
+      }
+    }
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          gradient_list[lane].get()[electron][dimension] +=
+              static_cast<ValueType>(
+                  result.gradient[lane * result.gradient_stride +
+                                  3 * electron + dimension]);
+        laplacian_list[lane].get()[electron] += static_cast<ValueType>(
+            result.lap_log[lane * result.laplacian_stride + electron]);
+      }
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+      component.current_sign_ = resource.staged_signs[lane];
+      component.log_value_ = makeLogValue(
+          resource.staged_signs[lane],
+          resource.staged_log_magnitudes[lane]);
+      component.accepted_configuration_identity_ =
+          resource.configuration_identities[lane];
+      component.accepted_parameter_version_ = parameter_version;
+      component.accepted_state_requirement_ =
+          AcceptedStateRequirement::FULL_SPATIAL;
+      component.observed_parameter_version_ = parameter_version;
+    }
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      static_cast<PsiFormerWF&>(wfc_list[lane]).accepted_value_valid_ = true;
+  };
+  static_assert(noexcept(publish()));
+  publish();
 }
 
 void PsiFormerWF::mw_evaluateGL(

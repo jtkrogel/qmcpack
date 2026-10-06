@@ -1271,6 +1271,63 @@ TEST_CASE("PsiFormer spatial batches validate and commit atomically",
         fingerprint_before_preflight);
 }
 
+TEST_CASE("PsiFormer planned spatial result ownership rejects repacked views",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  const pf::DirectBatchCapacityPlan capacity_plan{{0, 2, 0, 0, 0},
+                                                   {0, 1, 0}};
+  workspace->prepare(capacity_plan);
+
+  const pf::Tensor base = model.cfg.configuration(0);
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchSpatialResultView first =
+      batch_executor.evaluateFull(*workspace);
+  CHECK(workspace->ownsSpatialResult(first, pf::DirectSpatialMode::FULL_VGL,
+                                     2));
+
+  // A same-mode, same-size packing transaction has identical pointers and
+  // strides, but it is not the request that produced the old result.
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      first, pf::DirectSpatialMode::FULL_VGL, 2));
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchSpatialResultView second =
+      batch_executor.evaluateFull(*workspace);
+  CHECK(workspace->ownsSpatialResult(second, pf::DirectSpatialMode::FULL_VGL,
+                                     2));
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      first, pf::DirectSpatialMode::FULL_VGL, 2));
+
+  auto other_workspace = batch_executor.makeWorkspace();
+  other_workspace->prepare(capacity_plan);
+  other_workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*other_workspace, base, 2);
+  const pf::DirectBatchSpatialResultView other =
+      batch_executor.evaluateFull(*other_workspace);
+  CHECK(other_workspace->ownsSpatialResult(
+      other, pf::DirectSpatialMode::FULL_VGL, 2));
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      other, pf::DirectSpatialMode::FULL_VGL, 2));
+
+  pf::DirectBatchSpatialResultView malformed = second;
+  ++malformed.gradient_stride;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed, pf::DirectSpatialMode::FULL_VGL, 2));
+  malformed = second;
+  malformed.gradient = nullptr;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed, pf::DirectSpatialMode::FULL_VGL, 2));
+}
+
 TEST_CASE("PsiFormer batch mode switching has a bounded additive high water",
           "[wavefunction][psiformer][batch]")
 {

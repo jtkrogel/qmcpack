@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -68,6 +69,14 @@ struct PsiFormerCloneStateSnapshot
   int proposed_particle;
   std::uint64_t proposal_kind;
   bool has_proposal;
+};
+
+struct PsiFormerPreparedCloneStorage
+{
+  std::array<const void*, 4> data{};
+  std::array<std::size_t, 4> sizes{};
+  std::array<std::size_t, 4> capacities{};
+  bool exact_marker = false;
 };
 
 /** Narrow friend accessor for state-isolation and crowd-workspace diagnostics. */
@@ -132,6 +141,52 @@ public:
             component.proposed_particle_,
             static_cast<std::uint64_t>(component.proposal_kind_),
             component.has_proposal_};
+  }
+
+  static PsiFormerPreparedCloneStorage preparedCloneStorage(
+      const PsiFormerWF& component)
+  {
+    PsiFormerPreparedCloneStorage storage;
+    storage.data = {component.accepted_gradient_.data(),
+                    component.accepted_laplacian_.data(),
+                    component.proposed_gradient_.data(),
+                    component.proposed_laplacian_.data()};
+    storage.sizes = {component.accepted_gradient_.size(),
+                     component.accepted_laplacian_.size(),
+                     component.proposed_gradient_.size(),
+                     component.proposed_laplacian_.size()};
+    storage.capacities = {component.accepted_gradient_.capacity(),
+                          component.accepted_laplacian_.capacity(),
+                          component.proposed_gradient_.capacity(),
+                          component.proposed_laplacian_.capacity()};
+    storage.exact_marker =
+        component.hasPreparedBatchExecutionClone(component.batch_execution_plan_);
+    return storage;
+  }
+
+  static void invalidateAcceptedState(PsiFormerWF& component)
+  {
+    component.accepted_value_valid_ = false;
+    component.accepted_configuration_identity_ = 0;
+    component.accepted_parameter_version_ = 0;
+    component.accepted_state_requirement_ =
+        PsiFormerWF::AcceptedStateRequirement::INVALID;
+  }
+
+  static void injectPlannedFullVGLPrepublicationFailure(
+      PsiFormerWF& component, bool enabled)
+  {
+    component.fail_planned_full_vgl_before_publish_for_testing_ = enabled;
+  }
+
+  static bool hasCurrentFullAcceptedState(const PsiFormerWF& component,
+                                          const ParticleSet& particles)
+  {
+    const std::size_t current_version = component.parameterVersion();
+    return component.observed_parameter_version_ == current_version &&
+        component.acceptedStateMatches(
+            particles, current_version,
+            PsiFormerWF::AcceptedStateRequirement::FULL_SPATIAL);
   }
 
   static bool cloneStateMatches(const PsiFormerWF& component,
@@ -364,6 +419,15 @@ void checkGrad(const PsiFormerWF::GradType& actual,
 {
   for (int dimension = 0; dimension < 3; ++dimension)
     checkValue(actual[dimension], expected[dimension], tolerance);
+}
+
+template<class VectorType>
+bool sameVectorBits(const VectorType& actual, const VectorType& expected)
+{
+  return actual.size() == expected.size() &&
+      (actual.size() == 0 ||
+       std::memcmp(actual.data(), expected.data(),
+                   actual.size() * sizeof(typename VectorType::value_type)) == 0);
 }
 
 struct Crowd
@@ -662,6 +726,95 @@ void checkPreparedResourceStorage(
   CHECK(replacement.device == 0);
   REQUIRE(total.host >= replacement.host);
   CHECK(diagnostics.accountedBytes() == total.host - replacement.host);
+}
+
+void checkPreparedCloneStorageUnchanged(
+    const testing::PsiFormerPreparedCloneStorage& actual,
+    const testing::PsiFormerPreparedCloneStorage& expected)
+{
+  CHECK(actual.data == expected.data);
+  CHECK(actual.sizes == expected.sizes);
+  CHECK(actual.capacities == expected.capacities);
+  CHECK(actual.exact_marker == expected.exact_marker);
+}
+
+void checkPreparedResourceStorageUnchanged(
+    const testing::PsiFormerCrowdWorkspaceDiagnostics& actual,
+    const testing::PsiFormerCrowdWorkspaceDiagnostics& expected)
+{
+  CHECK(actual.resource_identity == expected.resource_identity);
+  CHECK(actual.batch_workspace_identity == expected.batch_workspace_identity);
+  CHECK(actual.prepared_plan_identity == expected.prepared_plan_identity);
+  CHECK(actual.prepared_plan_fingerprint == expected.prepared_plan_fingerprint);
+  CHECK(actual.prepared_storage_fingerprint ==
+        expected.prepared_storage_fingerprint);
+  CHECK(actual.current_storage_fingerprint ==
+        expected.current_storage_fingerprint);
+  CHECK(actual.logical_sizes == expected.logical_sizes);
+  CHECK(actual.batch_bytes == expected.batch_bytes);
+  CHECK(actual.score_bytes == expected.score_bytes);
+  CHECK(actual.kinetic_bytes == expected.kinetic_bytes);
+  CHECK(actual.transient_bytes == expected.transient_bytes);
+  CHECK(actual.actual_resource_storage == expected.actual_resource_storage);
+}
+
+struct PlannedFullVGLSnapshot
+{
+  std::vector<testing::PsiFormerCloneStateSnapshot> clone_states;
+  std::vector<testing::PsiFormerPreparedCloneStorage> clone_storage;
+  std::vector<ParticleSet::ParticleGradient> gradients;
+  std::vector<ParticleSet::ParticleLaplacian> laplacians;
+  testing::PsiFormerCrowdWorkspaceDiagnostics resource;
+};
+
+PlannedFullVGLSnapshot capturePlannedFullVGLSnapshot(
+    Crowd& crowd,
+    const std::vector<ParticleSet::ParticleGradient>& gradients,
+    const std::vector<ParticleSet::ParticleLaplacian>& laplacians)
+{
+  PlannedFullVGLSnapshot snapshot;
+  snapshot.clone_states.reserve(crowd.components.size());
+  snapshot.clone_storage.reserve(crowd.components.size());
+  for (const PsiFormerWF* component : crowd.components)
+  {
+    snapshot.clone_states.push_back(
+        testing::TestPsiFormerVirtualBatch::cloneState(*component));
+    snapshot.clone_storage.push_back(
+        testing::TestPsiFormerVirtualBatch::preparedCloneStorage(*component));
+  }
+  snapshot.gradients = gradients;
+  snapshot.laplacians = laplacians;
+  snapshot.resource =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list);
+  return snapshot;
+}
+
+void checkPlannedFullVGLSnapshot(
+    Crowd& crowd,
+    const std::vector<ParticleSet::ParticleGradient>& gradients,
+    const std::vector<ParticleSet::ParticleLaplacian>& laplacians,
+    const PlannedFullVGLSnapshot& expected)
+{
+  REQUIRE(crowd.components.size() == expected.clone_states.size());
+  REQUIRE(crowd.components.size() == expected.clone_storage.size());
+  REQUIRE(gradients.size() == expected.gradients.size());
+  REQUIRE(laplacians.size() == expected.laplacians.size());
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+  {
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+        *crowd.components[lane], expected.clone_states[lane]));
+    checkPreparedCloneStorageUnchanged(
+        testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+            *crowd.components[lane]),
+        expected.clone_storage[lane]);
+    CHECK(sameVectorBits(gradients[lane], expected.gradients[lane]));
+    CHECK(sameVectorBits(laplacians[lane], expected.laplacians[lane]));
+  }
+  checkPreparedResourceStorageUnchanged(
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list),
+      expected.resource);
 }
 
 /// Own one compatibility VirtualParticleSet scratch object per reference walker.
@@ -2631,6 +2784,464 @@ TEST_CASE("PsiFormer resource mismatch leaves both crowds immediately reusable",
   CHECK_THROWS_AS(ResourceCollectionTeamLock<WaveFunctionComponent>(resource_a, mixed_components),
                   std::invalid_argument);
   evaluate_one(crowd_a, resource_a);
+}
+
+TEST_CASE("PsiFormer planned FULL_VGL matches the legacy oracle and refreshes caches",
+          "[wavefunction][psiformer][multiwalker][full_vgl][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  Crowd planned(files, simulation_cell, walker_count, true, {0, 1});
+  ScopedEnvironmentVariable oracle_backend("PSIFORMER_SPATIAL_BACKEND",
+                                            "oracle");
+  Crowd oracle(files, simulation_cell, walker_count, true, {0, 1});
+  enableCrowdPreparationTestAccounting(planned);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(planned.leader);
+  const std::string participant_id = "test/psiformer/planned-full-vgl";
+  const auto plan = makeCrowdPreparationTestPlan(
+      planned.leader, requirements, {walker_count}, {3}, participant_id,
+      "planned-full-vgl-v1");
+  bindCrowdPreparationPlan(planned, plan, participant_id);
+  prepareCrowdPreparationClones(planned, plan, participant_id);
+
+  ResourceCollection planned_template("psiformer_planned_full_vgl_template");
+  planned.leader.createResource(planned_template);
+  ResourceCollection planned_resource(planned_template);
+  planned_resource.prepareBatchResources({plan, 0});
+
+  ResourceCollection oracle_template("psiformer_legacy_full_vgl_template");
+  oracle.leader.createResource(oracle_template);
+  ResourceCollection oracle_resource(oracle_template);
+
+  std::vector<testing::PsiFormerPreparedCloneStorage> clone_storage_before;
+  testing::PsiFormerCrowdWorkspaceDiagnostics resource_before;
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> planned_lock(
+        planned_resource, planned.wfc_list);
+    ResourceCollectionTeamLock<WaveFunctionComponent> oracle_lock(
+        oracle_resource, oracle.wfc_list);
+
+    const std::size_t electrons = planned.walkers.front()->getTotalNum();
+    std::vector<ParticleSet::ParticleGradient> planned_gradients(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> planned_laplacians(walker_count);
+    std::vector<ParticleSet::ParticleGradient> oracle_gradients(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> oracle_laplacians(walker_count);
+    RefVector<ParticleSet::ParticleGradient> planned_gradient_list;
+    RefVector<ParticleSet::ParticleLaplacian> planned_laplacian_list;
+    RefVector<ParticleSet::ParticleGradient> oracle_gradient_list;
+    RefVector<ParticleSet::ParticleLaplacian> oracle_laplacian_list;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      planned_gradients[lane].resize(electrons);
+      planned_laplacians[lane].resize(electrons);
+      oracle_gradients[lane].resize(electrons);
+      oracle_laplacians[lane].resize(electrons);
+      planned_gradient_list.push_back(planned_gradients[lane]);
+      planned_laplacian_list.push_back(planned_laplacians[lane]);
+      oracle_gradient_list.push_back(oracle_gradients[lane]);
+      oracle_laplacian_list.push_back(oracle_laplacians[lane]);
+    }
+
+    clone_storage_before.reserve(walker_count);
+    for (const PsiFormerWF* component : planned.components)
+    {
+      clone_storage_before.push_back(
+          testing::TestPsiFormerVirtualBatch::preparedCloneStorage(*component));
+      REQUIRE(clone_storage_before.back().exact_marker);
+    }
+    resource_before =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            planned.leader, planned.wfc_list);
+    checkPreparedResourceStorage(resource_before);
+    REQUIRE(resource_before.initial_walker_capacity == walker_count);
+    REQUIRE(resource_before.reserve_walker_capacity == 3);
+
+    auto reset_outputs = [&]() {
+      for (std::size_t lane = 0; lane < walker_count; ++lane)
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          {
+            const Value seed = makeWeight(
+                0.017 * static_cast<double>((lane + 1) * (electron + 1) *
+                                           (dimension + 1)),
+                -0.003 * static_cast<double>((lane + 1) * (dimension + 1)));
+            planned_gradients[lane][electron][dimension] = seed;
+            oracle_gradients[lane][electron][dimension] = seed;
+          }
+          const Value seed = makeWeight(
+              -0.029 * static_cast<double>((lane + 1) * (electron + 1)),
+              0.004 * static_cast<double>(electron + 1));
+          planned_laplacians[lane][electron] = seed;
+          oracle_laplacians[lane][electron] = seed;
+        }
+    };
+
+    auto evaluate_and_compare = [&](bool through_gl, bool from_scratch = true) {
+      reset_outputs();
+      if (through_gl)
+      {
+        oracle.leader.mw_evaluateGL(oracle.wfc_list, *oracle.p_list,
+                                    oracle_gradient_list,
+                                    oracle_laplacian_list, from_scratch);
+        planned.leader.mw_evaluateGL(planned.wfc_list, *planned.p_list,
+                                     planned_gradient_list,
+                                     planned_laplacian_list, from_scratch);
+      }
+      else
+      {
+        oracle.leader.mw_evaluateLog(oracle.wfc_list, *oracle.p_list,
+                                     oracle_gradient_list,
+                                     oracle_laplacian_list);
+        planned.leader.mw_evaluateLog(planned.wfc_list, *planned.p_list,
+                                      planned_gradient_list,
+                                      planned_laplacian_list);
+      }
+
+      for (std::size_t lane = 0; lane < walker_count; ++lane)
+      {
+        checkLog(planned.components[lane]->get_log_value(),
+                 oracle.components[lane]->get_log_value());
+        CHECK(testing::TestPsiFormerVirtualBatch::hasCurrentFullAcceptedState(
+            *planned.components[lane], *planned.walkers[lane]));
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          checkGrad(planned_gradients[lane][electron],
+                    oracle_gradients[lane][electron]);
+          checkValue(planned_laplacians[lane][electron],
+                     oracle_laplacians[lane][electron], 3.0e-7);
+        }
+      }
+    };
+
+    // Invalid accepted caches are legal inputs: a successful FULL_VGL replaces
+    // them with current complete spatial state.
+    for (PsiFormerWF* component : planned.components)
+      testing::TestPsiFormerVirtualBatch::invalidateAcceptedState(*component);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      CHECK_FALSE(testing::TestPsiFormerVirtualBatch::hasCurrentFullAcceptedState(
+          *planned.components[lane], *planned.walkers[lane]));
+    evaluate_and_compare(false);
+
+    // A new accepted configuration must replace the now-different cached one.
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      const ParticleSet::RealType delta =
+          0.002 * static_cast<ParticleSet::RealType>(lane + 1);
+      planned.walkers[lane]->R[1][lane] += delta;
+      oracle.walkers[lane]->R[1][lane] += delta;
+      planned.walkers[lane]->update();
+      oracle.walkers[lane]->update();
+      CHECK_FALSE(testing::TestPsiFormerVirtualBatch::hasCurrentFullAcceptedState(
+          *planned.components[lane], *planned.walkers[lane]));
+    }
+    evaluate_and_compare(false);
+
+    // Publishing on each leader leaves a mixture of explicitly invalid leader
+    // state and stale clone state.  mw_evaluateGL delegates to the same planned
+    // FULL transaction and refreshes every lane without a scalar synchronize.
+    auto publish_delta = [](PsiFormerWF& component) {
+      wftrain::StructuredParameterSnapshot candidate =
+          component.snapshotParameters();
+      REQUIRE_FALSE(candidate.values.empty());
+      candidate.values.front() += 1.0e-6;
+      return component.publishParameters(candidate, candidate.version);
+    };
+    const std::size_t planned_version = publish_delta(planned.leader);
+    const std::size_t oracle_version = publish_delta(oracle.leader);
+    REQUIRE(planned_version == oracle_version);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      CHECK_FALSE(testing::TestPsiFormerVirtualBatch::hasCurrentFullAcceptedState(
+          *planned.components[lane], *planned.walkers[lane]));
+    evaluate_and_compare(true);
+    evaluate_and_compare(true, false);
+
+    // Exact same-lane ParticleSet G/L destinations are the one intentional
+    // output alias.  They retain normal additive semantics in both branches.
+    RefVector<ParticleSet::ParticleGradient> planned_particle_gradients;
+    RefVector<ParticleSet::ParticleLaplacian> planned_particle_laplacians;
+    RefVector<ParticleSet::ParticleGradient> oracle_particle_gradients;
+    RefVector<ParticleSet::ParticleLaplacian> oracle_particle_laplacians;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const Value seed = makeWeight(
+              0.011 * static_cast<double>((lane + 1) * (dimension + 1)),
+              0.002 * static_cast<double>(electron + 1));
+          planned.walkers[lane]->G[electron][dimension] = seed;
+          oracle.walkers[lane]->G[electron][dimension] = seed;
+        }
+        const Value seed = makeWeight(-0.013 * static_cast<double>(lane + 1),
+                                      -0.001 * static_cast<double>(electron + 1));
+        planned.walkers[lane]->L[electron] = seed;
+        oracle.walkers[lane]->L[electron] = seed;
+      }
+      planned_particle_gradients.push_back(planned.walkers[lane]->G);
+      planned_particle_laplacians.push_back(planned.walkers[lane]->L);
+      oracle_particle_gradients.push_back(oracle.walkers[lane]->G);
+      oracle_particle_laplacians.push_back(oracle.walkers[lane]->L);
+    }
+    oracle.leader.mw_evaluateLog(oracle.wfc_list, *oracle.p_list,
+                                 oracle_particle_gradients,
+                                 oracle_particle_laplacians);
+    planned.leader.mw_evaluateLog(planned.wfc_list, *planned.p_list,
+                                  planned_particle_gradients,
+                                  planned_particle_laplacians);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      checkLog(planned.components[lane]->get_log_value(),
+               oracle.components[lane]->get_log_value());
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        checkGrad(planned.walkers[lane]->G[electron],
+                  oracle.walkers[lane]->G[electron]);
+        checkValue(planned.walkers[lane]->L[electron],
+                   oracle.walkers[lane]->L[electron], 3.0e-7);
+      }
+    }
+
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      checkPreparedCloneStorageUnchanged(
+          testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+              *planned.components[lane]),
+          clone_storage_before[lane]);
+    checkPreparedResourceStorageUnchanged(
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            planned.leader, planned.wfc_list),
+        resource_before);
+  }
+
+  CHECK(planned_resource.getOutstandingLoanCount() == 0);
+  CHECK(oracle_resource.getOutstandingLoanCount() == 0);
+  planned_resource.rewind();
+  CHECK(planned_resource.getCursor() == 0);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> planned_lock(
+        planned_resource, planned.wfc_list);
+    checkPreparedResourceStorageUnchanged(
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            planned.leader, planned.wfc_list),
+        resource_before);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      checkPreparedCloneStorageUnchanged(
+          testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+              *planned.components[lane]),
+          clone_storage_before[lane]);
+
+    const std::size_t electrons = planned.walkers.front()->getTotalNum();
+    std::vector<ParticleSet::ParticleGradient> retry_gradients(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> retry_laplacians(walker_count);
+    RefVector<ParticleSet::ParticleGradient> retry_gradient_list;
+    RefVector<ParticleSet::ParticleLaplacian> retry_laplacian_list;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      retry_gradients[lane].resize(electrons);
+      retry_laplacians[lane].resize(electrons);
+      retry_gradients[lane] = Value(0);
+      retry_laplacians[lane] = Value(0);
+      retry_gradient_list.push_back(retry_gradients[lane]);
+      retry_laplacian_list.push_back(retry_laplacians[lane]);
+    }
+    planned.leader.mw_evaluateLog(planned.wfc_list, *planned.p_list,
+                                  retry_gradient_list, retry_laplacian_list);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      CHECK(testing::TestPsiFormerVirtualBatch::hasCurrentFullAcceptedState(
+          *planned.components[lane], *planned.walkers[lane]));
+      checkPreparedCloneStorageUnchanged(
+          testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+              *planned.components[lane]),
+          clone_storage_before[lane]);
+    }
+    checkPreparedResourceStorageUnchanged(
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            planned.leader, planned.wfc_list),
+        resource_before);
+  }
+
+  CHECK(planned_resource.getOutstandingLoanCount() == 0);
+}
+
+TEST_CASE("PsiFormer planned FULL_VGL rejects bad destinations atomically",
+          "[wavefunction][psiformer][multiwalker][full_vgl][atomic]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  Crowd crowd(files, simulation_cell, walker_count, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/planned-full-atomic";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {walker_count}, {3}, participant_id,
+      "planned-full-atomic-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_planned_full_atomic_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                          crowd.wfc_list);
+
+  const std::size_t electrons = crowd.walkers.front()->getTotalNum();
+  std::vector<ParticleSet::ParticleGradient> gradients(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> laplacians(walker_count);
+  RefVector<ParticleSet::ParticleGradient> gradient_list;
+  RefVector<ParticleSet::ParticleLaplacian> laplacian_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    gradients[lane].resize(electrons);
+    laplacians[lane].resize(electrons);
+    gradient_list.push_back(gradients[lane]);
+    laplacian_list.push_back(laplacians[lane]);
+  }
+
+  auto reset_outputs = [&]() {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          gradients[lane][electron][dimension] = makeWeight(
+              0.01 * static_cast<double>((lane + 1) * (dimension + 1)),
+              -0.002 * static_cast<double>(electron + 1));
+        laplacians[lane][electron] = makeWeight(
+            -0.02 * static_cast<double>((lane + 1) * (electron + 1)),
+            0.003 * static_cast<double>(lane + 1));
+      }
+  };
+  auto retry = [&]() {
+    reset_outputs();
+    crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                                gradient_list, laplacian_list);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      CHECK(testing::TestPsiFormerVirtualBatch::hasCurrentFullAcceptedState(
+          *crowd.components[lane], *crowd.walkers[lane]));
+  };
+
+  std::vector<testing::PsiFormerPreparedCloneStorage> clone_storage_before;
+  clone_storage_before.reserve(walker_count);
+  for (const PsiFormerWF* component : crowd.components)
+    clone_storage_before.push_back(
+        testing::TestPsiFormerVirtualBatch::preparedCloneStorage(*component));
+  const auto resource_before =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list);
+  REQUIRE(resource_before.reserve_walker_capacity == 3);
+  const std::vector<Value> caller_sentinel{
+      makeWeight(7.0, -0.5), makeWeight(-3.0, 0.25)};
+  retry();
+
+  gradients.back().resize(electrons - 1);
+  const PlannedFullVGLSnapshot malformed =
+      capturePlannedFullVGLSnapshot(crowd, gradients, laplacians);
+  const RuntimePreflightSnapshot malformed_runtime =
+      captureRuntimePreflightState(crowd, resource, caller_sentinel);
+  CHECK_THROWS_AS(crowd.leader.mw_evaluateLog(
+                      crowd.wfc_list, *crowd.p_list, gradient_list,
+                      laplacian_list),
+                  std::invalid_argument);
+  checkPlannedFullVGLSnapshot(crowd, gradients, laplacians, malformed);
+  checkRuntimePreflightState(crowd, resource, caller_sentinel,
+                             malformed_runtime);
+  gradients.back().resize(electrons);
+  retry();
+
+  gradients.back()[electrons - 1][2] =
+      makeWeight(std::numeric_limits<double>::quiet_NaN(), 0.0);
+  const PlannedFullVGLSnapshot nonfinite =
+      capturePlannedFullVGLSnapshot(crowd, gradients, laplacians);
+  const RuntimePreflightSnapshot nonfinite_runtime =
+      captureRuntimePreflightState(crowd, resource, caller_sentinel);
+  CHECK_THROWS_AS(crowd.leader.mw_evaluateLog(
+                      crowd.wfc_list, *crowd.p_list, gradient_list,
+                      laplacian_list),
+                  std::invalid_argument);
+  checkPlannedFullVGLSnapshot(crowd, gradients, laplacians, nonfinite);
+  checkRuntimePreflightState(crowd, resource, caller_sentinel,
+                             nonfinite_runtime);
+  retry();
+
+  RefVector<ParticleSet::ParticleGradient> aliased_gradient_list;
+  aliased_gradient_list.push_back(gradients.front());
+  aliased_gradient_list.push_back(gradients.front());
+  const PlannedFullVGLSnapshot aliased =
+      capturePlannedFullVGLSnapshot(crowd, gradients, laplacians);
+  const RuntimePreflightSnapshot aliased_runtime =
+      captureRuntimePreflightState(crowd, resource, caller_sentinel);
+  CHECK_THROWS_AS(crowd.leader.mw_evaluateLog(
+                      crowd.wfc_list, *crowd.p_list,
+                      aliased_gradient_list, laplacian_list),
+                  std::invalid_argument);
+  checkPlannedFullVGLSnapshot(crowd, gradients, laplacians, aliased);
+  checkRuntimePreflightState(crowd, resource, caller_sentinel,
+                             aliased_runtime);
+  retry();
+
+  // Real builds can attach a Laplacian destination directly to the distinct
+  // SoA coordinate allocation. Reject it before publication so a successful
+  // call can never leave ParticleSet's AoS and SoA positions inconsistent.
+#ifndef QMC_COMPLEX
+  {
+    const auto& soa_positions =
+        crowd.walkers.front()->getCoordinates().getAllParticlePos();
+    ParticleSet::ParticleLaplacian soa_laplacian;
+    soa_laplacian.attachReference(
+        const_cast<ParticleSet::RealType*>(soa_positions.data()), electrons);
+    RefVector<ParticleSet::ParticleLaplacian> soa_laplacian_list;
+    soa_laplacian_list.push_back(soa_laplacian);
+    soa_laplacian_list.push_back(laplacians.back());
+    const RuntimePreflightSnapshot soa_runtime =
+        captureRuntimePreflightState(crowd, resource, caller_sentinel);
+
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateLog(
+                        crowd.wfc_list, *crowd.p_list, gradient_list,
+                        soa_laplacian_list),
+                    std::invalid_argument);
+    checkRuntimePreflightState(crowd, resource, caller_sentinel, soa_runtime);
+    retry();
+  }
+#endif
+
+  // Force the latest throwing boundary after direct evaluation and all
+  // identity revalidation. No accepted cache or caller destination may have
+  // been published when this injected failure is observed.
+  reset_outputs();
+  testing::TestPsiFormerVirtualBatch::injectPlannedFullVGLPrepublicationFailure(
+      crowd.leader, true);
+  const PlannedFullVGLSnapshot late_failure =
+      capturePlannedFullVGLSnapshot(crowd, gradients, laplacians);
+  const RuntimePreflightSnapshot late_failure_runtime =
+      captureRuntimePreflightState(crowd, resource, caller_sentinel);
+  CHECK_THROWS_AS(crowd.leader.mw_evaluateLog(
+                      crowd.wfc_list, *crowd.p_list, gradient_list,
+                      laplacian_list),
+                  std::overflow_error);
+  checkPlannedFullVGLSnapshot(crowd, gradients, laplacians, late_failure);
+  checkRuntimePreflightState(crowd, resource, caller_sentinel,
+                             late_failure_runtime);
+  testing::TestPsiFormerVirtualBatch::injectPlannedFullVGLPrepublicationFailure(
+      crowd.leader, false);
+  retry();
+
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    checkPreparedCloneStorageUnchanged(
+        testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+            *crowd.components[lane]),
+        clone_storage_before[lane]);
+  checkPreparedResourceStorageUnchanged(
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list),
+      resource_before);
 }
 
 TEST_CASE("PsiFormer planned runtime preflight is exact and read only",

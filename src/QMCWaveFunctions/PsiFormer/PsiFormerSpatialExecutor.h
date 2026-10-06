@@ -40,6 +40,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace pf
@@ -242,6 +243,46 @@ public:
     mix(output_lap_log_);
     mix(output_lap_ratio_);
     return hash;
+  }
+
+  /// Report overlap with any retained spatial-workspace allocation.
+  bool overlapsStorage(const void* data, std::size_t bytes) const noexcept
+  {
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+    if (bytes == 0)
+      return false;
+    if (data == nullptr || begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+      return true;
+    const std::uintptr_t end = begin + bytes;
+    const auto overlaps = [begin, end](const auto& values) noexcept {
+      using Element = typename std::decay_t<decltype(values)>::value_type;
+      if (values.capacity() == 0)
+        return false;
+      if (values.capacity() > std::numeric_limits<std::size_t>::max() / sizeof(Element))
+        return true;
+      const std::size_t storage_bytes = values.capacity() * sizeof(Element);
+      const std::uintptr_t storage_begin =
+          reinterpret_cast<std::uintptr_t>(values.data());
+      if (values.data() == nullptr ||
+          storage_begin > std::numeric_limits<std::uintptr_t>::max() - storage_bytes)
+        return true;
+      const std::uintptr_t storage_end = storage_begin + storage_bytes;
+      return begin < storage_end && storage_begin < end;
+    };
+    const auto overlaps_jet = [&overlaps](const DirectSpatialJetBuffer& values) noexcept {
+      return overlaps(values.value) || overlaps(values.gradient) ||
+          overlaps(values.laplacian);
+    };
+    return overlaps(electron_positions_) || geometry_.overlapsStorage(data, bytes) ||
+        overlaps_jet(raw_features_) || overlaps_jet(features_a_) ||
+        overlaps_jet(features_b_) || overlaps_jet(query_) ||
+        overlaps_jet(key_) || overlaps_jet(projected_value_) ||
+        overlaps_jet(attention_) || overlaps_jet(attended_) ||
+        overlaps_jet(hidden_) || overlaps_jet(orbital_matrices_) ||
+        determinant_workspace_.overlapsStorage(data, bytes) ||
+        overlaps(scalar_gradient_scratch_) ||
+        overlaps(scalar_laplacian_scratch_) || overlaps(output_gradient_) ||
+        overlaps(output_lap_log_) || overlaps(output_lap_ratio_);
   }
 
   /// Return bytes reserved by every workspace buffer, including geometry tables.

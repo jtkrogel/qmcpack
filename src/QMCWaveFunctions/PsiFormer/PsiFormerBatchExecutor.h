@@ -36,6 +36,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,8 @@ using DirectBatchExecutionStatistics = qmcplusplus::psiformer::batch::ExecutionS
 struct DirectBatchValueResultView
 {
   std::size_t size = 0;
+  const void* owner = nullptr;
+  std::size_t generation = 0;
   const double* sign = nullptr;
   const double* logabs = nullptr;
   const double* value = nullptr;
@@ -209,6 +212,9 @@ public:
     replacement.active_dense_coordinate_bytes_avoided_ =
         active_dense_coordinate_bytes_avoided_;
     replacement.statistics_ = statistics_;
+    replacement.successful_generation_ = successful_generation_ + 1;
+    if (replacement.successful_generation_ == 0)
+      replacement.successful_generation_ = 1;
 
     if (!sameExecutionStorage(replacement.actualStorage(), requirement))
       throw std::length_error(
@@ -255,6 +261,10 @@ public:
     reserveOutputs(size, gradient_count, laplacian_count);
     prepareScratch(mode, effective_capacity);
 
+    // All potentially throwing preparation is complete.  Invalidate any view
+    // from the previous same-shaped request before publishing this new packing
+    // transaction; a successful evaluation advances the token once more.
+    advanceResultGeneration();
     active_mode_ = mode;
     active_value_input_ = DirectBatchValueInput::DENSE_CONFIGURATIONS;
     active_size_ = size;
@@ -320,6 +330,7 @@ public:
     prepareScratch(DirectBatchMode::VALUE_ONLY, effective_capacity);
     growVector(sparse_tile_positions_, sparse_tile_position_count);
 
+    advanceResultGeneration();
     active_mode_ = DirectBatchMode::VALUE_ONLY;
     active_value_input_ = DirectBatchValueInput::SPARSE_REPLACEMENTS;
     active_size_ = size;
@@ -500,6 +511,153 @@ public:
   DirectBatchValueInput valueInput() const noexcept { return active_value_input_; }
   std::size_t referenceCount() const noexcept { return active_reference_count_; }
   std::size_t replacementCount() const noexcept { return active_replacement_count_; }
+
+  /** Prove that a spatial view is the exact result owned by this live request.
+   * This is intentionally allocation-free and nonthrowing so callers can reject
+   * malformed or stale evaluator views before publishing any result.
+   */
+  bool ownsSpatialResult(const DirectBatchSpatialResultView& result,
+                         DirectSpatialMode mode,
+                         std::size_t expected_size) const noexcept
+  {
+    if (!bound_capacity_plan_ ||
+        electron_count_ > std::numeric_limits<std::size_t>::max() / 3)
+      return false;
+    const DirectBatchMode expected_mode = mode == DirectSpatialMode::FULL_VGL
+        ? DirectBatchMode::FULL_VGL
+        : DirectBatchMode::ACTIVE_ELECTRON_GRADIENT;
+    const std::size_t expected_gradient_stride = mode == DirectSpatialMode::FULL_VGL
+        ? 3 * electron_count_
+        : 3;
+    const std::size_t expected_laplacian_stride = mode == DirectSpatialMode::FULL_VGL
+        ? electron_count_
+        : 0;
+    const auto safe_sum = [](std::size_t left, std::size_t right,
+                             std::size_t& result) noexcept {
+      if (left > std::numeric_limits<std::size_t>::max() - right)
+        return false;
+      result = left + right;
+      return true;
+    };
+    const auto safe_product = [](std::size_t left, std::size_t right,
+                                 std::size_t& result) noexcept {
+      if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left)
+        return false;
+      result = left * right;
+      return true;
+    };
+    std::size_t sparse_size = 0;
+    std::size_t full_gradient_size = 0;
+    std::size_t active_gradient_size = 0;
+    std::size_t laplacian_size = 0;
+    if (!safe_sum(bound_capacity_plan_->logical.sparse_references,
+                  bound_capacity_plan_->logical.sparse_replacements,
+                  sparse_size) ||
+        !safe_product(bound_capacity_plan_->logical.full_vgl,
+                      3 * electron_count_, full_gradient_size) ||
+        !safe_product(bound_capacity_plan_->logical.active_gradient, 3,
+                      active_gradient_size) ||
+        !safe_product(bound_capacity_plan_->logical.full_vgl, electron_count_,
+                      laplacian_size))
+      return false;
+    const std::size_t value_size = std::max(
+        {bound_capacity_plan_->logical.value_dense, sparse_size,
+         bound_capacity_plan_->logical.full_vgl,
+         bound_capacity_plan_->logical.active_gradient});
+    const std::size_t gradient_size =
+        std::max(full_gradient_size, active_gradient_size);
+    const auto exact_size = [](const auto& values,
+                               std::size_t expected) noexcept {
+      return values.size() == expected && values.capacity() == expected;
+    };
+    return active_mode_ == expected_mode &&
+        active_value_input_ == DirectBatchValueInput::DENSE_CONFIGURATIONS &&
+        active_size_ == expected_size && result.size == expected_size &&
+        result.owner == this && result.generation == successful_generation_ &&
+        result.mode == mode &&
+        result.gradient_stride == expected_gradient_stride &&
+        result.laplacian_stride == expected_laplacian_stride &&
+        result.sign == sign_.data() && result.logabs == logabs_.data() &&
+        result.value == value_.data() &&
+        result.parameter_version == parameter_version_.data() &&
+        result.gradient == gradient_.data() &&
+        result.lap_log ==
+            (expected_laplacian_stride == 0 ? nullptr : lap_log_.data()) &&
+        result.lap_ratio ==
+            (expected_laplacian_stride == 0 ? nullptr : lap_ratio_.data()) &&
+        exact_size(sign_, value_size) && exact_size(logabs_, value_size) &&
+        exact_size(value_, value_size) &&
+        exact_size(parameter_version_, value_size) &&
+        exact_size(pending_sign_, value_size) &&
+        exact_size(pending_logabs_, value_size) &&
+        exact_size(pending_value_, value_size) &&
+        exact_size(pending_parameter_version_, value_size) &&
+        exact_size(gradient_, gradient_size) &&
+        exact_size(pending_gradient_, gradient_size) &&
+        exact_size(lap_log_, laplacian_size) &&
+        exact_size(lap_ratio_, laplacian_size) &&
+        exact_size(pending_lap_log_, laplacian_size) &&
+        exact_size(pending_lap_ratio_, laplacian_size);
+  }
+
+  /// Report overlap with any allocation retained by this complete workspace.
+  bool overlapsStorage(const void* data, std::size_t bytes) const noexcept
+  {
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+    if (bytes == 0)
+      return false;
+    if (data == nullptr || begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+      return true;
+    const std::uintptr_t end = begin + bytes;
+    const auto overlaps = [begin, end](const auto& values) noexcept {
+      using Element = typename std::decay_t<decltype(values)>::value_type;
+      if (values.capacity() == 0)
+        return false;
+      if (values.capacity() > std::numeric_limits<std::size_t>::max() / sizeof(Element))
+        return true;
+      const std::size_t storage_bytes = values.capacity() * sizeof(Element);
+      const std::uintptr_t storage_begin =
+          reinterpret_cast<std::uintptr_t>(values.data());
+      if (values.data() == nullptr ||
+          storage_begin > std::numeric_limits<std::uintptr_t>::max() - storage_bytes)
+        return true;
+      const std::uintptr_t storage_end = storage_begin + storage_bytes;
+      return begin < storage_end && storage_begin < end;
+    };
+    if (overlaps(electron_positions_) || overlaps(position_ready_) ||
+        overlaps(reference_positions_) || overlaps(reference_ready_) ||
+        overlaps(replacement_references_) || overlaps(replacement_electrons_) ||
+        overlaps(replacement_positions_) || overlaps(replacement_ready_) ||
+        overlaps(sparse_tile_positions_) || overlaps(value_geometries_) ||
+        overlaps(raw_features_) || overlaps(features_a_) ||
+        overlaps(features_b_) || overlaps(query_) || overlaps(key_) ||
+        overlaps(projected_value_) || overlaps(attention_) ||
+        overlaps(attended_) || overlaps(hidden_) || overlaps(spin_features_) ||
+        overlaps(backflow_values_) || overlaps(orbital_matrices_) ||
+        overlaps(determinant_workspaces_) || overlaps(full_workspaces_) ||
+        overlaps(active_workspaces_) || overlaps(spatial_dense_source_) ||
+        overlaps(spatial_dense_target_) || overlaps(sign_) ||
+        overlaps(logabs_) || overlaps(value_) || overlaps(parameter_version_) ||
+        overlaps(pending_sign_) || overlaps(pending_logabs_) ||
+        overlaps(pending_value_) || overlaps(pending_parameter_version_) ||
+        overlaps(gradient_) || overlaps(pending_gradient_) ||
+        overlaps(lap_log_) || overlaps(lap_ratio_) ||
+        overlaps(pending_lap_log_) || overlaps(pending_lap_ratio_))
+      return true;
+    for (const auto& geometry : value_geometries_)
+      if (geometry.overlapsStorage(data, bytes))
+        return true;
+    for (const auto& determinant : determinant_workspaces_)
+      if (determinant && determinant->overlapsStorage(data, bytes))
+        return true;
+    for (const auto& spatial : full_workspaces_)
+      if (spatial && spatial->overlapsStorage(data, bytes))
+        return true;
+    for (const auto& spatial : active_workspaces_)
+      if (spatial && spatial->overlapsStorage(data, bytes))
+        return true;
+    return false;
+  }
 
   /// Return the largest allocated tile high-water mark across retained scratch.
   std::size_t allocatedTileCapacity() const noexcept
@@ -763,6 +921,14 @@ private:
       return 2;
     }
     return 0;
+  }
+
+  /// Advance the nonzero token that invalidates every previously returned view.
+  void advanceResultGeneration() noexcept
+  {
+    ++successful_generation_;
+    if (successful_generation_ == 0)
+      successful_generation_ = 1;
   }
 
   /// Publish logical diagnostic high waters after every successful plan rebind.
@@ -1562,6 +1728,7 @@ private:
   std::size_t value_tile_capacity_ = 0;
   std::array<std::size_t, 3> mode_capacity_{};
   DirectBatchExecutionStatistics statistics_{};
+  std::size_t successful_generation_ = 0;
 
   std::vector<double> electron_positions_;
   std::vector<unsigned char> position_ready_;
@@ -1680,6 +1847,7 @@ public:
     std::copy_n(workspace.pending_parameter_version_.begin(), workspace.active_size_,
                 workspace.parameter_version_.begin());
     workspace.statistics_ = statistics;
+    workspace.advanceResultGeneration();
     return valueView(workspace);
   }
 
@@ -2349,6 +2517,7 @@ private:
           "PsiFormer parameters changed during batch evaluation");
     commitSpatialOutputs(workspace, gradient_stride, laplacian_stride);
     workspace.statistics_ = statistics;
+    workspace.advanceResultGeneration();
     return spatialView(workspace, mode, gradient_stride, laplacian_stride);
   }
 
@@ -2588,7 +2757,8 @@ private:
 
   static DirectBatchValueResultView valueView(const DirectBatchWorkspace& workspace)
   {
-    return {workspace.active_size_, workspace.sign_.data(), workspace.logabs_.data(),
+    return {workspace.active_size_, &workspace, workspace.successful_generation_,
+            workspace.sign_.data(), workspace.logabs_.data(),
             workspace.value_.data(), workspace.parameter_version_.data()};
   }
 
