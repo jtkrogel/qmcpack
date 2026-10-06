@@ -128,6 +128,12 @@ public:
 
     bool isVersioned() const noexcept { return source_identity_ != nullptr; }
 
+    /// Test one known producer/version pair without exposing the opaque fields.
+    bool matches(const void* source_identity, std::uint64_t version) const noexcept
+    {
+      return source_identity_ == source_identity && version_ == version;
+    }
+
     friend bool operator==(const EvaluationStamp& lhs, const EvaluationStamp& rhs) noexcept
     {
       return lhs.source_identity_ == rhs.source_identity_ && lhs.version_ == rhs.version_;

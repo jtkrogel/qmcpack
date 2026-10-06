@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_PSIFORMERWF_H
 
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "ResourceHandle.h"
@@ -337,6 +338,17 @@ public:
       std::size_t batch_ordinal,
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size) const override;
+
+  /** Construct a bounded inline ordinary-locality ECP derivative consumer.
+   *
+   * This 11C1 seam intentionally remains separate from the advertised streaming
+   * local-energy capability until a Hamiltonian owner supplies every live tile.
+   */
+  std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
+  makeNonLocalECPDerivativeConsumer(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t maximum_parameter_chunk_size) const;
 
   /// Atomically publish one complete, version-matched native vector.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,

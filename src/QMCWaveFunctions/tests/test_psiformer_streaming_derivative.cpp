@@ -13,8 +13,11 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Particle/ParticleSet.h"
+#include "Particle/VirtualParticleBatch.h"
+#include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "ResourceCollection.h"
 #include "psiformer_test_utils.h"
 
 #include <algorithm>
@@ -647,6 +650,186 @@ TEST_CASE("Wavefunction components reject unsupported streaming derivative facto
   CHECK(requirements.requires(BatchExecutionMode::STREAMING_DERIVATIVE));
   CHECK(static_cast<std::uint32_t>(BatchExecutionMode::STREAMING_DERIVATIVE) ==
         (1U << 14));
+}
+
+TEST_CASE("PsiFormer contracts live ordinary-locality ECP tiles without dense staging",
+          "[wavefunction][psiformer][training][streaming][ecp]")
+{
+  using namespace testing::psiformer;
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons0 = makeElectrons(simulation_cell);
+  ParticleSet electrons1 = makeElectrons(simulation_cell);
+  electrons1.R[2] += ParticleSet::PosType{0.009, -0.004, 0.006};
+  electrons1.update();
+
+  const std::vector<std::size_t> selected{0, 1, 127, 2047};
+  PsiFormerWF component("pf_ecp_stream", files.parameters.string(),
+                        files.configuration.string(), true, selected);
+  PsiFormerWF clone(component);
+  OptVariables active = registerSelectedParameters(component);
+
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  components.push_back(clone);
+  RefVectorWithLeader<ParticleSet> particles(electrons0);
+  particles.push_back(electrons0);
+  particles.push_back(electrons1);
+
+  auto consumer = component.makeNonLocalECPDerivativeConsumer(
+      components, particles, 257);
+  const auto storage = consumer->storageDiagnostics();
+  CHECK(storage.sample_count == 2);
+  CHECK(storage.real_parameter_vectors == 1);
+  CHECK(storage.complex_parameter_vectors == 3);
+  CHECK(storage.parameter_scratch_bytes ==
+        storage.parameter_count *
+            (sizeof(double) + 3 * sizeof(DerivativeValue)));
+  CHECK(storage.allocation_generation == 1);
+
+  const std::size_t version = component.snapshotParameters().version;
+  wftrain::NonLocalECPDerivativeContext context;
+  context.provider_id          = component.parameterSchema().providerId();
+  context.schema_fingerprint   = component.parameterSchema().fingerprint();
+  context.parameter_version    = version;
+  context.batch_ordinal        = 71;
+  context.sample_offset        = 23;
+  context.sample_count         = 2;
+  context.expected_point_count = 3;
+  context.grid_fingerprint     = UINT64_C(0x9d735a11);
+  const std::vector<DerivativeValue> coefficients{{0.7, -0.2},
+                                                   {-0.3, 0.4}};
+  const CoefficientView coefficient_view{
+      context.provider_id, context.schema_fingerprint, context.parameter_version,
+      context.batch_ordinal, context.sample_offset,
+      {coefficients.data(), coefficients.size()}};
+  const std::vector<VJPCoefficientChannel> channels{{
+      "nonlocal", DerivativeProduct::LOCAL_ENERGY_VJP, coefficient_view,
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP)}};
+  SelectedParameterSink sink(selected);
+
+  // Unsupported localization semantics fail before activating the caller sink.
+  auto rejected = context;
+  rejected.localization = wftrain::NonLocalECPLocalization::DLA;
+  CHECK_THROWS(consumer->begin(rejected, {channels.data(), channels.size()}, sink));
+  CHECK(sink.state() == DerivativeSinkState::IDLE);
+  rejected                 = context;
+  rejected.uses_virtual_particles = false;
+  CHECK_THROWS(consumer->begin(rejected, {channels.data(), channels.size()}, sink));
+  CHECK(sink.state() == DerivativeSinkState::IDLE);
+  rejected                         = context;
+  rejected.scalar_relativistic     = false;
+  CHECK_THROWS(consumer->begin(rejected, {channels.data(), channels.size()}, sink));
+  CHECK(sink.state() == DerivativeSinkState::IDLE);
+
+  // Use a fresh one-shot consumer after completing the independent gate checks.
+  consumer = component.makeNonLocalECPDerivativeConsumer(components, particles,
+                                                         257);
+  const auto active_storage = consumer->storageDiagnostics();
+  context.localization = wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY;
+  REQUIRE(context.localization ==
+          wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY);
+  consumer->begin(context, {channels.data(), channels.size()}, sink);
+
+  std::vector<std::unique_ptr<VirtualParticleSet>> scratch_storage;
+  scratch_storage.push_back(std::make_unique<VirtualParticleSet>(electrons0));
+  scratch_storage.push_back(std::make_unique<VirtualParticleSet>(electrons1));
+  RefVectorWithLeader<VirtualParticleSet> scratch(*scratch_storage[0]);
+  scratch.push_back(*scratch_storage[0]);
+  scratch.push_back(*scratch_storage[1]);
+
+  ResourceCollection resource_template("psiformer_ecp_stream_template");
+  component.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  ResourceCollectionTeamLock<WaveFunctionComponent> resource_lock(resource,
+                                                                   components);
+
+  std::vector<std::vector<ParticleSet::PosType>> tile_positions{
+      {electrons0.R[0] + ParticleSet::PosType{0.012, -0.006, 0.004},
+       electrons0.R[0] + ParticleSet::PosType{-0.008, 0.011, 0.003}},
+      {electrons1.R[1] + ParticleSet::PosType{0.005, 0.007, -0.009}}};
+  const std::vector<std::vector<QMCTraits::ValueType>> bare_weights{
+      {QMCTraits::ValueType(0.21), QMCTraits::ValueType(-0.13)},
+      {QMCTraits::ValueType(0.17)}};
+  std::vector<std::vector<QMCTraits::ValueType>> complete_ratios(2);
+  std::vector<std::vector<WaveFunctionComponent::EvaluationStamp>> stamps(2);
+
+  for (std::size_t tile = 0; tile < 2; ++tile)
+  {
+    const int walker   = static_cast<int>(tile);
+    const int electron = static_cast<int>(tile);
+    const std::vector<std::size_t> offsets{0, tile_positions[tile].size()};
+    const std::vector<VirtualParticleBatch::Segment> segments{{walker, electron}};
+    const VirtualParticleBatch batch(2, offsets, segments,
+                                     tile_positions[tile]);
+    complete_ratios[tile].resize(batch.size());
+    const auto stamp = component.mw_evaluateVirtualRatios(
+        components, particles, scratch, batch, complete_ratios[tile]);
+    stamps[tile].push_back(stamp);
+
+    // A deterministic fixed companion factor makes the supplied ratio a complete
+    // mixed-wavefunction ratio rather than the PsiFormer ratio alone.
+    for (std::size_t point = 0; point < batch.size(); ++point)
+    {
+      const double displacement =
+          tile_positions[tile][point][0] - particles[tile].R[electron][0];
+      complete_ratios[tile][point] *= std::exp(0.23 * displacement);
+    }
+
+    consumer->consume({batch,
+                       {bare_weights[tile].data(), bare_weights[tile].size()},
+                       {complete_ratios[tile].data(), complete_ratios[tile].size()},
+                       {stamps[tile].data(), stamps[tile].size()}, tile,
+                       context.grid_fingerprint});
+  }
+  consumer->end();
+  REQUIRE(sink.results().size() == 1);
+
+  // Independently assemble the virtual-minus-reference identity through the
+  // established selected-parameter derivative interface.
+  for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
+  {
+    DerivativeValue expected{};
+    for (std::size_t tile = 0; tile < 2; ++tile)
+    {
+      auto& sample_component =
+          dynamic_cast<PsiFormerWF&>(components[tile]);
+      Vector<QMCTraits::ValueType> reference_score(active.size());
+      Vector<QMCTraits::ValueType> ignored(active.size());
+      reference_score = QMCTraits::ValueType{};
+      ignored         = QMCTraits::ValueType{};
+      sample_component.evaluateDerivatives(
+          particles[tile], active, reference_score, ignored);
+      for (std::size_t point = 0; point < tile_positions[tile].size(); ++point)
+      {
+        ParticleSet moved = particles[tile];
+        moved.R[tile]     = tile_positions[tile][point];
+        moved.update();
+        Vector<QMCTraits::ValueType> virtual_score(active.size());
+        virtual_score = QMCTraits::ValueType{};
+        ignored       = QMCTraits::ValueType{};
+        sample_component.evaluateDerivatives(moved, active, virtual_score,
+                                             ignored);
+        const QMCTraits::ValueType raw_weight =
+            bare_weights[tile][point] * complete_ratios[tile][point];
+        const DerivativeValue weight{static_cast<double>(std::real(raw_weight)),
+                                     static_cast<double>(std::imag(raw_weight))};
+        const DerivativeValue delta{
+            static_cast<double>(std::real(virtual_score[parameter] -
+                                          reference_score[parameter])),
+            static_cast<double>(std::imag(virtual_score[parameter] -
+                                          reference_score[parameter]))};
+        expected += coefficients[tile] * weight * delta;
+      }
+    }
+    checkClose(sink.results()[0][parameter], expected);
+  }
+
+  const auto warmed = consumer->storageDiagnostics();
+  CHECK(warmed.parameter_scratch_bytes == active_storage.parameter_scratch_bytes);
+  CHECK(warmed.retained_numeric_bytes == active_storage.retained_numeric_bytes);
+  CHECK(warmed.storage_fingerprint == active_storage.storage_fingerprint);
+  CHECK(warmed.allocation_generation == active_storage.allocation_generation);
 }
 
 } // namespace qmcplusplus
