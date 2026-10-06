@@ -115,13 +115,31 @@ BatchMemoryBytes checkedSaving(BatchMemoryBytes before, BatchMemoryBytes after)
   return {before.host - after.host, before.device - after.device};
 }
 
+/** Exact two-word sum used to compare host-plus-device relief without overflow. */
+struct ReliefScore
+{
+  bool carry      = false;
+  std::size_t low = 0;
+
+  bool isZero() const noexcept { return !carry && low == 0; }
+};
+
+/** Compare exact two-word relief scores. */
+bool operator>(const ReliefScore& lhs, const ReliefScore& rhs) noexcept
+{
+  return lhs.carry != rhs.carry ? lhs.carry : lhs.low > rhs.low;
+}
+
 /** Score only savings that relieve a currently exceeded hard budget. */
-std::size_t savingScore(const BatchMemoryPolicy& policy, BatchMemoryBytes current, BatchMemoryBytes saving)
+ReliefScore savingScore(const BatchMemoryPolicy& policy, BatchMemoryBytes current, BatchMemoryBytes saving)
 {
   const std::size_t host_relief = policy.host_budget && current.host > *policy.host_budget ? saving.host : 0;
   const std::size_t device_relief =
       policy.device_budget && current.device > *policy.device_budget ? saving.device : 0;
-  return checkedBatchMemoryAdd(host_relief, device_relief, "cross-space candidate relief");
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  if (device_relief > maximum - host_relief)
+    return {true, device_relief - (maximum - host_relief) - 1};
+  return {false, host_relief + device_relief};
 }
 
 /** Mix one byte into a deterministic FNV-1a plan fingerprint. */
@@ -174,6 +192,7 @@ void mixRequest(std::uint64_t& hash, const BatchTileRequest& request) noexcept
 /** Produce a stable exact-content fingerprint for an immutable selected plan. */
 std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
                               const BatchTileCapacities& selected,
+                              const BatchMemoryEstimate& minimum_estimate,
                               const BatchMemoryEstimate& estimate)
 {
   std::uint64_t hash = 14695981039346656037ULL;
@@ -206,6 +225,9 @@ std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
     mixString(hash, participant_id);
   for (std::size_t category = 0; category < static_cast<std::size_t>(BatchMemoryCategory::COUNT); ++category)
   {
+    const BatchMemoryBytes minimum_bytes = minimum_estimate.at(static_cast<BatchMemoryCategory>(category));
+    mixInteger(hash, minimum_bytes.host);
+    mixInteger(hash, minimum_bytes.device);
     const BatchMemoryBytes bytes = estimate.at(static_cast<BatchMemoryCategory>(category));
     mixInteger(hash, bytes.host);
     mixInteger(hash, bytes.device);
@@ -419,7 +441,7 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   {
     const BatchMemoryBytes current_bytes = selected_estimate.total("selected plan");
     bool found_candidate                 = false;
-    std::size_t best_saving              = 0;
+    ReliefScore best_saving;
     BatchTileCapacities best_capacities;
     BatchMemoryEstimate best_estimate;
 
@@ -434,7 +456,7 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
       setCapacity(candidate, mode, getCapacity(candidate, mode) - 1);
       BatchMemoryEstimate candidate_estimate = estimator(candidate);
       const BatchMemoryBytes saving = checkedSaving(current_bytes, candidate_estimate.total("candidate plan"));
-      const std::size_t score        = savingScore(input.policy, current_bytes, saving);
+      const ReliefScore score        = savingScore(input.policy, current_bytes, saving);
       if (!found_candidate || score > best_saving)
       {
         found_candidate = true;
@@ -444,7 +466,7 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
       }
     }
 
-    if (!found_candidate || best_saving == 0)
+    if (!found_candidate || best_saving.isZero())
     {
       std::ostringstream message;
       message << "Batch execution memory budget cannot be met without reducing a hard tile request ("
@@ -466,7 +488,7 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   plan.fixed_minimum_estimate_ = minimum_estimate;
   plan.selected_estimate_      = selected_estimate;
   plan.participant_ids_        = input.participant_ids;
-  plan.fingerprint_            = makeFingerprint(input, selected, selected_estimate);
+  plan.fingerprint_            = makeFingerprint(input, selected, minimum_estimate, selected_estimate);
   return plan;
 }
 

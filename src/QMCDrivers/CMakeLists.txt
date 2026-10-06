@@ -30,7 +30,6 @@ set(QMCDRIVERS
     MCPopulation.cpp
     PsiHamNamePairReader.cpp
     QMCDriver.cpp
-    BatchExecutionMemory.cpp
     BatchMemoryInput.cpp
     QMCDriverInput.cpp
     QMCDriverNew.cpp

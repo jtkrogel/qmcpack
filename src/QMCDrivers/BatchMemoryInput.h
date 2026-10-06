@@ -11,7 +11,7 @@
 #define QMCPLUSPLUS_BATCH_MEMORY_INPUT_H
 
 #include "InputSection.h"
-#include "QMCDrivers/BatchExecutionMemory.h"
+#include "Utilities/BatchExecutionMemory.h"
 
 #include <unordered_set>
 

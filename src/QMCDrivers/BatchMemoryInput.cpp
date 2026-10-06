@@ -118,7 +118,7 @@ BatchMemoryInput::BatchMemoryInput(xmlNodePtr cur) : BatchMemoryInput()
   }
 
   for (xmlNodePtr child = cur->children; child != nullptr; child = child->next)
-    if (child->type == XML_TEXT_NODE)
+    if (child->type == XML_TEXT_NODE || child->type == XML_CDATA_SECTION_NODE)
     {
       const std::string text = castXMLCharToChar(child->content);
       if (std::any_of(text.begin(), text.end(), [](unsigned char character) { return !std::isspace(character); }))

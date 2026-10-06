@@ -15,6 +15,7 @@ set(UTEST_NAME deterministic-unit_test_${SRC_DIR})
 
 add_executable(
   ${UTEST_EXE}
+  test_BatchExecutionMemory.cpp
   test_FakeRandom.cpp
   test_rng.cpp
   test_parser.cpp

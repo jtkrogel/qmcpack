@@ -114,6 +114,7 @@ TEST_CASE("QMCDriverInput batch memory policy rejects malformed input", "[driver
   check_rejected(R"(<batch_memory type="unexpected"/>)");
   check_rejected(R"(<batch_memory><unexpected/></batch_memory>)");
   check_rejected(R"(<batch_memory>unexpected</batch_memory>)");
+  check_rejected(R"(<batch_memory><![CDATA[unexpected]]></batch_memory>)");
   check_rejected(R"(<batch_memory/><batch_memory/>)");
 }
 

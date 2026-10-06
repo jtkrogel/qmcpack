@@ -10,7 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
-#include "QMCDrivers/BatchExecutionMemory.h"
+#include "Utilities/BatchExecutionMemory.h"
 
 #include <limits>
 #include <stdexcept>
@@ -54,7 +54,7 @@ BatchExecutionSelectionInput makeSelectionInput()
 
 } // namespace
 
-TEST_CASE("Batch execution memory checked arithmetic", "[drivers][batch_memory]")
+TEST_CASE("Batch execution memory checked arithmetic", "[utilities][batch_memory]")
 {
   const std::size_t maximum = std::numeric_limits<std::size_t>::max();
   CHECK(checkedBatchMemoryAdd(2, 3, "test") == 5);
@@ -70,7 +70,7 @@ TEST_CASE("Batch execution memory checked arithmetic", "[drivers][batch_memory]"
   CHECK_THROWS(aggregateBatchMemoryEstimates({{"duplicate", 1, per_owner}, {"duplicate", 1, per_owner}}));
 }
 
-TEST_CASE("Batch execution memory automatic selection boundaries", "[drivers][batch_memory]")
+TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][batch_memory]")
 {
   BatchExecutionSelectionInput input = makeSelectionInput();
 
@@ -113,7 +113,7 @@ TEST_CASE("Batch execution memory automatic selection boundaries", "[drivers][ba
   }
 }
 
-TEST_CASE("Batch execution memory selection relieves the capped space", "[drivers][batch_memory]")
+TEST_CASE("Batch execution memory selection relieves the capped space", "[utilities][batch_memory]")
 {
   BatchExecutionSelectionInput input = makeSelectionInput();
   input.policy.host_budget            = 114;
@@ -134,7 +134,7 @@ TEST_CASE("Batch execution memory selection relieves the capped space", "[driver
   CHECK(plan.selectedCapacities().full_vgl == 1);
 }
 
-TEST_CASE("Batch execution memory hard requests and logical modes", "[drivers][batch_memory]")
+TEST_CASE("Batch execution memory hard requests and logical modes", "[utilities][batch_memory]")
 {
   BatchExecutionSelectionInput input = makeSelectionInput();
   input.policy.tiles.value            = BatchTileRequest::fixed(7);
@@ -172,7 +172,7 @@ TEST_CASE("Batch execution memory hard requests and logical modes", "[drivers][b
   }
 }
 
-TEST_CASE("Batch execution memory plans have stable exact-content fingerprints", "[drivers][batch_memory]")
+TEST_CASE("Batch execution memory plans have stable exact-content fingerprints", "[utilities][batch_memory]")
 {
   BatchExecutionSelectionInput input = makeSelectionInput();
   input.policy.host_budget            = 240;
@@ -188,9 +188,62 @@ TEST_CASE("Batch execution memory plans have stable exact-content fingerprints",
   input.participant_ids.push_back("wavefunction/psiformer[1]");
   const BatchExecutionPlan changed_participants = selectBatchExecutionPlan(input, equalSlopeEstimate);
   CHECK(first.fingerprint() != changed_participants.fingerprint());
+
+  SECTION("the fixed minimum estimate is part of the immutable content")
+  {
+    BatchExecutionSelectionInput minimum_input;
+    minimum_input.requirements.require(BatchExecutionMode::VALUE);
+    minimum_input.logical_maximum      = {2, 0, 0, 0};
+    minimum_input.preference.preferred = {2, 0, 0, 0};
+
+    auto estimate_with_minimum = [](std::size_t minimum_bytes) {
+      return [minimum_bytes](const BatchTileCapacities& capacities) {
+        BatchMemoryEstimate estimate;
+        estimate.add(BatchMemoryCategory::FIXED_CLONE_STATE,
+                     {capacities.value == 1 ? minimum_bytes : 17, 0});
+        return estimate;
+      };
+    };
+
+    const BatchExecutionPlan minimum_one =
+        selectBatchExecutionPlan(minimum_input, estimate_with_minimum(1));
+    const BatchExecutionPlan minimum_two =
+        selectBatchExecutionPlan(minimum_input, estimate_with_minimum(2));
+    CHECK(minimum_one.selectedEstimate() == minimum_two.selectedEstimate());
+    CHECK_FALSE(minimum_one.fixedMinimumEstimate() == minimum_two.fixedMinimumEstimate());
+    CHECK(minimum_one.fingerprint() != minimum_two.fingerprint());
+  }
 }
 
-TEST_CASE("Batch execution memory rejects invalid selection contracts", "[drivers][batch_memory]")
+TEST_CASE("Batch execution memory compares dual-space relief without overflow", "[utilities][batch_memory]")
+{
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  BatchExecutionSelectionInput input;
+  input.requirements.require(BatchExecutionMode::VALUE);
+  input.requirements.require(BatchExecutionMode::FULL_VGL);
+  input.logical_maximum      = {2, 2, 0, 0};
+  input.preference.preferred = {2, 2, 0, 0};
+  input.policy.host_budget   = maximum - 1;
+  input.policy.device_budget = maximum - 1;
+
+  auto large_dual_space_estimate = [maximum](const BatchTileCapacities& capacities) {
+    BatchMemoryEstimate estimate;
+    BatchMemoryBytes bytes;
+    if (capacities.value == 2 && capacities.full_vgl == 2)
+      bytes = {maximum, maximum};
+    else if (capacities.value == 1 && capacities.full_vgl == 2)
+      bytes = {0, maximum / 2};
+    else if (capacities.value == 2 && capacities.full_vgl == 1)
+      bytes = {maximum / 2, maximum / 2};
+    estimate.add(BatchMemoryCategory::INNER_TILE_SCRATCH, bytes);
+    return estimate;
+  };
+
+  const BatchExecutionPlan plan = selectBatchExecutionPlan(input, large_dual_space_estimate);
+  CHECK(plan.selectedCapacities() == BatchTileCapacities{1, 2, 0, 0});
+}
+
+TEST_CASE("Batch execution memory rejects invalid selection contracts", "[utilities][batch_memory]")
 {
   BatchExecutionSelectionInput input = makeSelectionInput();
 

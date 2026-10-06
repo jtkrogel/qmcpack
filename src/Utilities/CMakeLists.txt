@@ -14,6 +14,7 @@ set(QMC_RNG FakeRandom.cpp RandomGenerator.cpp StdRandom.cpp)
 add_library(qmcrng ${QMC_RNG})
 
 set(UTILITIES
+    BatchExecutionMemory.cpp
     qmc_common.cpp
 
     SimpleParser.cpp
