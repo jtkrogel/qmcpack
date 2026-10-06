@@ -4534,7 +4534,11 @@ void PsiFormerWF::releaseResource(
   if (leader.acquired_resource_collection_ != &collection)
     throw std::logic_error(
         "PsiFormer multiwalker resource release received a different collection");
-  if (collection.getOutstandingLoanCount() !=
+  // Unplanned TrialWaveFunction acquisition visits components in declaration
+  // order, so later components may legitimately add loans after PsiFormer
+  // records its own.  Fewer loans means an owner was removed prematurely;
+  // extra loans are validated by this component's saved cursor and handle.
+  if (collection.getOutstandingLoanCount() <
       leader.acquired_resource_outstanding_loans_)
     throw std::logic_error(
         "PsiFormer multiwalker resource release observed changed loan ownership");

@@ -228,6 +228,12 @@ public:
   static void setOuterTileCapacity(NonLocalECPotential& nl_ecp, std::size_t capacity)
   { nl_ecp.setOuterTileCapacityForTesting(capacity); }
 
+  /** Select localization semantics for focused streaming-derivative gate tests. */
+  static void setDLA(NonLocalECPotential& nl_ecp, bool enabled)
+  {
+    nl_ecp.use_DLA = enabled;
+  }
+
   /** Report compatibility derivative-matrix storage without exposing it in production. */
   static size_t derivativeMatrixElements(const NonLocalECPotential& nl_ecp)
   {
@@ -342,6 +348,55 @@ public:
 };
 
 } // namespace testing
+
+namespace
+{
+/** Collect selected canonical parameter entries from one bounded ECP VJP. */
+class SelectedECPParameterSink final : public wftrain::ParameterReductionSink
+{
+public:
+  explicit SelectedECPParameterSink(std::vector<std::size_t> selected)
+      : selected_(std::move(selected))
+  {}
+
+  const std::vector<std::vector<wftrain::DerivativeValue>>& results() const
+  {
+    if (state() != wftrain::DerivativeSinkState::COMPLETE)
+      throw std::logic_error("selected ECP sink has no completed result");
+    return results_;
+  }
+
+protected:
+  void onBegin(
+      const wftrain::DerivativeStreamDescriptor&,
+      const wftrain::ParameterChunkPlan&,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel>
+          channels) override
+  {
+    results_.assign(
+        channels.size(),
+        std::vector<wftrain::DerivativeValue>(selected_.size()));
+  }
+
+  void consume(std::size_t channel,
+               const wftrain::ParameterChunkConstView& chunk) override
+  {
+    for (std::size_t probe = 0; probe < selected_.size(); ++probe)
+      if (selected_[probe] >= chunk.descriptor().parameter_offset &&
+          selected_[probe] < chunk.descriptor().parameter_offset +
+                  chunk.descriptor().count)
+        results_[channel][probe] =
+            chunk.values()[selected_[probe] -
+                           chunk.descriptor().parameter_offset];
+  }
+
+  void onAbort() noexcept override { results_.clear(); }
+
+private:
+  std::vector<std::size_t> selected_;
+  std::vector<std::vector<wftrain::DerivativeValue>> results_;
+};
+} // namespace
 
 TEST_CASE("NonLocalECPotential", "[hamiltonian]")
 {
@@ -3220,6 +3275,76 @@ TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
   for (int walker = 0; walker < walker_count; ++walker)
     for (int parameter = 0; parameter < parameter_count; ++parameter)
       analytic_derivatives[walker][parameter] = batch_derivatives[walker][parameter];
+
+  // Contract the same accepted ordinary-locality quadrature through the new
+  // Hamiltonian-owned bounded route.  This exercises split tiles and a fixed
+  // non-PsiFormer Jastrow factor while retaining only canonical P-vectors.
+  auto& psiformer_leader =
+      dynamic_cast<PsiFormerWF&>(*wavefunction.getOrbitals()[0]);
+  auto& psiformer_clone =
+      dynamic_cast<PsiFormerWF&>(*wavefunction2->getOrbitals()[0]);
+  RefVectorWithLeader<WaveFunctionComponent> psiformer_components(
+      psiformer_leader, {psiformer_leader, psiformer_clone});
+  auto bounded_consumer =
+      psiformer_leader.makeNonLocalECPDerivativeConsumer(
+          psiformer_components, particles, 257);
+  const auto parameter_snapshot = psiformer_leader.snapshotParameters();
+  const std::vector<wftrain::DerivativeValue> bounded_coefficients{
+      {0.625, 0.0}, {-0.375, 0.0}};
+  const wftrain::CoefficientView bounded_coefficient_view{
+      psiformer_leader.parameterSchema().providerId(),
+      psiformer_leader.parameterSchema().fingerprint(),
+      parameter_snapshot.version, 17, 0,
+      {bounded_coefficients.data(), bounded_coefficients.size()}};
+  const std::vector<wftrain::VJPCoefficientChannel> bounded_channels{{
+      "weighted_nonlocal_ecp",
+      wftrain::DerivativeProduct::LOCAL_ENERGY_VJP,
+      bounded_coefficient_view,
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP)}};
+  SelectedECPParameterSink bounded_sink({0, 127});
+
+  prepare_references_and_scores();
+  testing::TestNonLocalECPotential::setDLA(potential, true);
+  testing::TestNonLocalECPotential::setDLA(potential2, true);
+  CHECK_THROWS_AS(potential.mw_evaluateWithStreamingParameterDerivatives(
+                      potentials, wavefunctions, particles, *bounded_consumer,
+                      {bounded_channels.data(), bounded_channels.size()},
+                      bounded_sink),
+                  std::invalid_argument);
+  CHECK(bounded_sink.state() == wftrain::DerivativeSinkState::IDLE);
+  testing::TestNonLocalECPotential::setDLA(potential, false);
+  testing::TestNonLocalECPotential::setDLA(potential2, false);
+
+  CHECK_NOTHROW(potential.mw_evaluateWithStreamingParameterDerivatives(
+      potentials, wavefunctions, particles, *bounded_consumer,
+      {bounded_channels.data(), bounded_channels.size()}, bounded_sink));
+  REQUIRE(bounded_sink.results().size() == 1);
+  REQUIRE(bounded_sink.results()[0].size() == 2);
+  for (int parameter = 0; parameter < parameter_count; ++parameter)
+  {
+    wftrain::DerivativeValue expected{};
+    for (int walker = 0; walker < walker_count; ++walker)
+      expected += bounded_coefficients[walker] *
+          static_cast<wftrain::DerivativeValue>(
+              analytic_derivatives[walker][parameter] - derivative_sentinel);
+    CHECK(std::real(bounded_sink.results()[0][parameter]) ==
+          Approx(std::real(expected)).epsilon(2e-10).margin(2e-10));
+    CHECK(std::imag(bounded_sink.results()[0][parameter]) ==
+          Approx(std::imag(expected)).epsilon(2e-10).margin(2e-10));
+  }
+  CHECK(potential.getValue() ==
+        Approx(batch_energies[0]).epsilon(2e-11).margin(2e-11));
+  CHECK(potential2.getValue() ==
+        Approx(batch_energies[1]).epsilon(2e-11).margin(2e-11));
+
+  const auto bounded_statistics =
+      testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(bounded_statistics.logical_knots > outer_tile_capacity);
+  CHECK(bounded_statistics.tiles_packed > 1);
+  CHECK(bounded_statistics.split_job_continuations > 0);
+  CHECK(bounded_statistics.derivative_staging_size == 0);
+  CHECK(bounded_statistics.derivative_staging_capacity == 0);
+  CHECK(bounded_statistics.bounded_weight_size <= outer_tile_capacity);
 
   // The first request primes both sides of the staged/public job-list swap.
   // Two subsequent same-shape requests must then retain the bounded virtual-

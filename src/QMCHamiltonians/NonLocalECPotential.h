@@ -25,6 +25,7 @@
 #include "ForceBase.h"
 #include "OperatorBase.h"
 #include "NeighborListsForPseudo.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "type_traits/OptionalRef.hpp"
 
 namespace qmcplusplus
@@ -181,6 +182,21 @@ public:
                                            const RecordArray<ValueType>& dlogpsi,
                                            RecordArray<ValueType>& dhpsioverpsi) const override;
 
+  /** Evaluate ordinary-locality ECP energy and a bounded parameter VJP together.
+   *
+   * The consumer sees each accepted quadrature tile while its positions, bare
+   * weights, complete wavefunction ratios, and value-evaluation stamps are live.
+   * This is the strict O(P)+O(B)+O(Qtile) route: it neither constructs the
+   * legacy walker-by-parameter result nor retains virtual-particle descriptors.
+   */
+  void mw_evaluateWithStreamingParameterDerivatives(
+      const RefVectorWithLeader<OperatorBase>& o_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      wftrain::NonLocalECPDerivativeConsumer& consumer,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      wftrain::ParameterReductionSink& sink) const;
+
   /** Do nothing */
   bool put(xmlNodePtr cur) override { return true; }
 
@@ -323,6 +339,20 @@ private:
       const RefVectorWithLeader<ParticleSet>& p_list,
       const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
       const OptVariables& optvars,
+      int group,
+      bool& have_reference_stamps,
+      bool& tile_available);
+
+  /** Feed one prepared ordinary-locality group to the bounded derivative consumer. */
+  static void mw_consumeFlattenedVPStreamingDerivativePreparedGroup(
+      NonLocalECPotentialMultiWalkerResource& resource,
+      const RefVectorWithLeader<OperatorBase>& o_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      wftrain::NonLocalECPDerivativeConsumer& consumer,
+      std::uint64_t grid_fingerprint,
+      std::size_t& tile_ordinal,
       int group,
       bool& have_reference_stamps,
       bool& tile_available);

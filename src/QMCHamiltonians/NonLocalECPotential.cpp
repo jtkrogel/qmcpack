@@ -394,6 +394,120 @@ void NonLocalECPotential::mw_consumeFlattenedVPDerivativePreparedGroup(
   }
 }
 
+void NonLocalECPotential::mw_consumeFlattenedVPStreamingDerivativePreparedGroup(
+    NonLocalECPotentialMultiWalkerResource& resource,
+    const RefVectorWithLeader<OperatorBase>& o_list,
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    wftrain::NonLocalECPDerivativeConsumer& consumer,
+    std::uint64_t grid_fingerprint,
+    std::size_t& tile_ordinal,
+    int group,
+    bool& have_reference_stamps,
+    bool& tile_available)
+{
+  auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
+
+  while (tile_available)
+  {
+    const auto& segments = resource.virtual_batch->tileSegments();
+    if (segments.empty())
+      throw std::logic_error(
+          "NonLocalECPotential packed an empty streaming-derivative tile.");
+    if (segments.front().groupId() > group)
+      break;
+    if (segments.front().groupId() != group)
+      throw std::logic_error(
+          "NonLocalECPotential streaming-derivative traversal left canonical group order.");
+
+    // The Hamiltonian remains the sole owner of quadrature construction.  Fill
+    // the bounded tile exactly once, then use the same descriptor for the
+    // complete ratio, energy reduction, and parameter-response contraction.
+    auto& absolute_positions = resource.virtual_batch->mutableTileAbsolutePositions();
+    auto& deltas             = resource.virtual_batch->mutableTileDeltas();
+    auto& bare_weights       = resource.virtual_batch->mutableTileBareWeights();
+    for (const auto& segment : segments)
+    {
+      const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
+      auto& potential          = o_list.getCastedElement<NonLocalECPotential>(walker);
+      const auto& group_jobs   = resource.staged_jobs[walker][group];
+      if (segment.walkerJobOrdinal() >= group_jobs.size())
+        throw std::logic_error(
+            "NonLocalECPotential streaming-derivative tile references an absent staged job.");
+      const auto& job = group_jobs[segment.walkerJobOrdinal()];
+      if (job.ion_id != segment.ionId() ||
+          job.electron_id != segment.electronId())
+        throw std::logic_error(
+            "NonLocalECPotential streaming-derivative tile identity disagrees with its staged job.");
+
+      potential.PP[job.ion_id]->buildQuadraturePointRange(
+          job.ion_elec_dist, job.ion_elec_displ,
+          p_list[walker].R[job.electron_id], segment.firstKnot(),
+          segment.knotCount(), segment.tileOffset(), deltas,
+          absolute_positions, bare_weights, resource.radial_scratch,
+          resource.legendre_scratch);
+    }
+
+    resource.virtual_batch->finalizeTileInput();
+    const VirtualParticleBatch descriptor =
+        resource.virtual_batch->makeVirtualParticleBatch();
+    descriptor.validateFor(
+        p_list, static_cast<std::size_t>(leader.IonConfig.getTotalNum()));
+
+    auto& ratios = resource.virtual_batch->mutableTileRatios();
+    resource.tile_stamps.clear();
+    TrialWaveFunction::mw_evaluateVirtualRatios(
+        wf_list, p_list, vp_scratch_list, descriptor, ratios,
+        resource.tile_stamps, TrialWaveFunction::ComputeType::ALL);
+
+    // Every tile must come from one immutable wavefunction version.  This
+    // cross-tile check complements the consumer's check for its own provider.
+    if (!have_reference_stamps)
+    {
+      resource.reference_stamps = resource.tile_stamps;
+      have_reference_stamps     = true;
+    }
+    else if (resource.tile_stamps != resource.reference_stamps)
+      throw std::runtime_error(
+          "NonLocalECPotential observed different wavefunction parameter versions across streaming-derivative tiles.");
+
+    resource.derivative_bare_weights.resize(bare_weights.size());
+    for (std::size_t point = 0; point < bare_weights.size(); ++point)
+      resource.derivative_bare_weights[point] = ValueType(bare_weights[point]);
+
+    // The descriptor is intentionally consumed before either the energy
+    // reduction or packNextTile() may reuse its backing storage.  Its exact
+    // coefficient is bare_weight * complete ALL-wavefunction ratio.
+    consumer.consume({descriptor,
+                      {resource.derivative_bare_weights.data(),
+                       resource.derivative_bare_weights.size()},
+                      {ratios.data(), ratios.size()},
+                      {resource.tile_stamps.data(), resource.tile_stamps.size()},
+                      tile_ordinal, grid_fingerprint});
+
+    auto& transformed_weights =
+        resource.virtual_batch->mutableTileTransformedWeights();
+    for (const auto& segment : segments)
+    {
+      const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
+      Real& pair_potential =
+          resource.virtual_batch->jobPairPotential(segment.globalJobId());
+      NonLocalECPComponent::reduceQuadraturePointRange(
+          segment.electronId(), segment.tileOffset(), segment.knotCount(),
+          resource.virtual_batch->tileDeltas(),
+          resource.virtual_batch->tileBareWeights(), ratios, nullptr,
+          segment.tileOffset(), transformed_weights,
+          segment.walkerKnotOffset(), nullptr, pair_potential);
+      if (segment.endsJob())
+        resource.staged_values[walker] += pair_potential;
+    }
+
+    ++tile_ordinal;
+    tile_available = resource.virtual_batch->packNextTile();
+  }
+}
+
 void NonLocalECPotential::mw_evaluateWithParameterDerivativesFlattenedVP(
     const RefVectorWithLeader<OperatorBase>& o_list,
     const RefVectorWithLeader<TrialWaveFunction>& wf_list,
@@ -559,6 +673,234 @@ void NonLocalECPotential::mw_evaluateWithParameterDerivativesFlattenedVP(
     for (std::size_t parameter = 0; parameter < parameter_count; ++parameter)
       dhpsioverpsi[walker][parameter] +=
           resource.staged_parameter_derivatives[walker * parameter_count + parameter];
+  }
+}
+
+void NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
+    const RefVectorWithLeader<OperatorBase>& o_list,
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    wftrain::NonLocalECPDerivativeConsumer& consumer,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    wftrain::ParameterReductionSink& sink) const
+{
+  auto& leader = o_list.getCastedLeader<NonLocalECPotential>();
+  if (this != &leader)
+    throw std::invalid_argument(
+        "NonLocalECPotential streaming derivatives must be invoked on the crowd leader.");
+
+  const std::size_t walker_count = o_list.size();
+  if (wf_list.size() != walker_count || p_list.size() != walker_count)
+    throw std::invalid_argument(
+        "NonLocalECPotential streaming-derivative crowd has inconsistent list sizes.");
+  if (channels.empty())
+    throw std::invalid_argument(
+        "NonLocalECPotential streaming derivatives require a coefficient channel.");
+  if (!leader.vp_ || !leader.mw_res_handle_)
+    throw std::logic_error(
+        "NonLocalECPotential streaming derivatives require VP crowd resources.");
+  if (leader.use_DLA)
+    throw std::invalid_argument(
+        "NonLocalECPotential streaming derivatives do not support DLA or TMDLA localization.");
+
+  const ParticleSet& pset_leader = p_list.getLeader();
+  if (pset_leader.isSpinor())
+    throw std::invalid_argument(
+        "NonLocalECPotential streaming derivatives do not support spinor or spin-orbit ECP evaluation.");
+
+  auto& resource = leader.mw_res_handle_.getResource();
+  if (!resource.virtual_batch ||
+      resource.virtual_batch->tileCapacity() != leader.outer_tile_capacity_)
+    throw std::logic_error(
+        "NonLocalECPotential streaming-derivative resource has an incompatible outer tile.");
+
+  // Validate the complete crowd before consuming random rotations, beginning
+  // the sink, or changing any public operator state.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    const auto& potential =
+        o_list.getCastedElement<NonLocalECPotential>(walker);
+    const ParticleSet& particles = p_list[walker];
+    if (!potential.vp_ || potential.use_DLA || particles.isSpinor())
+      throw std::invalid_argument(
+          "NonLocalECPotential streaming-derivative crowd contains an unsupported localization, non-VP, or spinor member.");
+    if (particles.groups() != pset_leader.groups() ||
+        particles.getTotalNum() != pset_leader.getTotalNum() ||
+        potential.nlpp_jobs.size() !=
+            static_cast<std::size_t>(particles.groups()) ||
+        potential.PP.size() !=
+            static_cast<std::size_t>(leader.IonConfig.getTotalNum()))
+      throw std::invalid_argument(
+          "NonLocalECPotential streaming-derivative crowd has incompatible particle shapes.");
+    if (potential.myRNG == nullptr)
+      throw std::logic_error(
+          "NonLocalECPotential streaming-derivative grid rotation requires a random-number generator.");
+  }
+
+  resource.staged_jobs.resize(walker_count);
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& walker_jobs = resource.staged_jobs[walker];
+    walker_jobs.resize(static_cast<std::size_t>(p_list[walker].groups()));
+    for (auto& group_jobs : walker_jobs)
+      group_jobs.clear();
+  }
+  resource.staged_values.assign(walker_count, Real(0));
+  resource.reference_stamps.clear();
+  resource.tile_stamps.clear();
+  resource.derivative_bare_weights.clear();
+
+  // A resource may previously have served the compatibility B-by-P route.
+  // Release that storage before entering the strict bounded transaction so
+  // its live footprint contains no hidden walker-by-parameter allocation.
+  std::vector<ValueType>().swap(resource.staged_parameter_derivatives);
+  resource.parameter_derivative_views.clear();
+  resource.virtual_batch->reset(walker_count, false);
+
+  std::size_t maximum_channels = 0;
+  std::size_t maximum_legendre = 0;
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    const auto& potential =
+        o_list.getCastedElement<NonLocalECPotential>(walker);
+    for (const auto& component : potential.PPset)
+      if (component)
+      {
+        maximum_channels =
+            std::max(maximum_channels,
+                     static_cast<std::size_t>(component->getNchannel()));
+        maximum_legendre =
+            std::max(maximum_legendre,
+                     static_cast<std::size_t>(component->getLmax() + 1));
+      }
+  }
+  resource.radial_scratch.resize(maximum_channels);
+  resource.legendre_scratch.resize(maximum_legendre);
+
+  // Preserve the production grid-rotation and electron/ion enumeration order.
+  // Jobs remain private until both the Hamiltonian and sink transactions have
+  // completed successfully.
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+    const ParticleSet& particles = p_list[walker];
+    for (const auto& component : potential.PPset)
+      if (component)
+        component->rotateQuadratureGrid(
+            generateRandomRotationMatrix(*potential.myRNG));
+
+    const auto& distance_table =
+        particles.getDistTableAB(potential.myTableIndex);
+    for (int group = 0; group < particles.groups(); ++group)
+    {
+      auto& group_jobs = resource.staged_jobs[walker][group];
+      for (int electron = particles.first(group);
+           electron < particles.last(group); ++electron)
+      {
+        const auto& distances = distance_table.getDistRow(electron);
+        const auto& displacements = distance_table.getDisplRow(electron);
+        for (int ion = 0; ion < potential.PP.size(); ++ion)
+          if (potential.PP[ion] &&
+              distances[ion] < potential.PP[ion]->getRmax())
+            group_jobs.emplace_back(ion, electron, distances[ion],
+                                    -displacements[ion]);
+      }
+    }
+  }
+
+  for (int group = 0; group < pset_leader.groups(); ++group)
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      const auto& potential =
+          o_list.getCastedElement<NonLocalECPotential>(walker);
+      const auto& group_jobs = resource.staged_jobs[walker][group];
+      for (std::size_t ordinal = 0; ordinal < group_jobs.size(); ++ordinal)
+      {
+        const auto& job = group_jobs[ordinal];
+        const int knot_count = potential.PP[job.ion_id]->getNknot();
+        if (knot_count <= 0)
+          throw std::logic_error(
+              "NonLocalECPotential encountered an empty streaming-derivative quadrature grid.");
+        resource.virtual_batch->appendJob(
+            {group, static_cast<int>(walker), job.ion_id, job.electron_id,
+             ordinal, static_cast<std::size_t>(knot_count)});
+      }
+    }
+  resource.virtual_batch->seal();
+
+  std::uint64_t grid_fingerprint = resource.virtual_batch->logicalFingerprint();
+  if (grid_fingerprint == 0)
+    grid_fingerprint = 1;
+  const auto& coefficient_identity = channels[0].coefficients;
+  wftrain::NonLocalECPDerivativeContext context;
+  context.provider_id          = coefficient_identity.provider_id;
+  context.schema_fingerprint   = coefficient_identity.schema_fingerprint;
+  context.parameter_version    = coefficient_identity.parameter_version;
+  context.batch_ordinal        = coefficient_identity.batch_ordinal;
+  context.sample_offset        = coefficient_identity.sample_offset;
+  context.sample_count         = walker_count;
+  context.expected_point_count = resource.virtual_batch->totalKnotCount();
+  context.grid_fingerprint     = grid_fingerprint;
+  context.localization                   = wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY;
+  context.uses_virtual_particles         = true;
+  context.scalar_relativistic            = true;
+  context.used_dense_derivative_fallback = false;
+
+  consumer.begin(context, channels, sink);
+  try
+  {
+    RefVectorWithLeader<VirtualParticleSet> vp_scratch_list(*leader.vp_);
+    vp_scratch_list.reserve(walker_count);
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+      vp_scratch_list.push_back(
+          *o_list.getCastedElement<NonLocalECPotential>(walker).vp_);
+
+    {
+      ResourceCollectionTeamLock<VirtualParticleSet> vp_resource_lock(
+          resource.collection, vp_scratch_list);
+      bool have_reference_stamps = false;
+      bool tile_available = resource.virtual_batch->packNextTile();
+      std::size_t tile_ordinal = 0;
+      for (int group = 0; group < pset_leader.groups(); ++group)
+      {
+        TrialWaveFunction::mw_prepareGroup(wf_list, p_list, group);
+        mw_consumeFlattenedVPStreamingDerivativePreparedGroup(
+            resource, o_list, wf_list, p_list, vp_scratch_list, consumer,
+            grid_fingerprint, tile_ordinal, group, have_reference_stamps,
+            tile_available);
+      }
+      if (tile_available)
+        throw std::logic_error(
+            "NonLocalECPotential streaming-derivative traversal exceeded the particle-group range.");
+    }
+
+    // Validate every Hamiltonian destination before the sink publishes its
+    // completed response.  After consumer.end(), only noexcept swaps and
+    // scalar assignments remain, giving one failure-atomic outer transaction.
+    resource.virtual_batch->validateLogicalOutputExtents();
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      const auto& potential =
+          o_list.getCastedElement<NonLocalECPotential>(walker);
+      if (potential.nlpp_jobs.size() != resource.staged_jobs[walker].size())
+        throw std::logic_error(
+            "NonLocalECPotential staged streaming-derivative job extent changed before publication.");
+    }
+
+    consumer.end();
+  }
+  catch (...)
+  {
+    consumer.abort();
+    throw;
+  }
+
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+    for (std::size_t group = 0; group < potential.nlpp_jobs.size(); ++group)
+      potential.nlpp_jobs[group].swap(resource.staged_jobs[walker][group]);
+    potential.value_ = resource.staged_values[walker];
   }
 }
 
