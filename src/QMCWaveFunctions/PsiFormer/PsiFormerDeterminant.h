@@ -179,13 +179,15 @@ public:
     }
     if (log_abs > shift_)
     {
-      const long double factor = std::exp(static_cast<long double>(shift_ - log_abs));
+      const long double factor =
+          std::exp(static_cast<long double>(shift_) - static_cast<long double>(log_abs));
       scaled_.sum *= factor;
       scaled_.correction *= factor;
       shift_ = log_abs;
     }
     scaled_.add(static_cast<long double>(phase) *
-                std::exp(static_cast<long double>(log_abs - shift_)));
+                std::exp(static_cast<long double>(log_abs) -
+                         static_cast<long double>(shift_)));
   }
 
   /// Convert the normalized accumulator back to phase and log magnitude.
@@ -262,7 +264,11 @@ public:
         solve_(matrix_size),
         matrix_product_(matrix_elements_),
         gradient_sums_(gradient_lanes),
-        laplacian_sums_(laplacian_lanes)
+        laplacian_sums_(laplacian_lanes),
+        staged_gradient_(gradient_lanes),
+        staged_lap_log_(laplacian_lanes),
+        staged_lap_ratio_(laplacian_lanes),
+        staged_matrix_adjoint_(checkedProduct(channels, matrix_elements_))
   {
     if (channels_ == 0 || matrix_size_ == 0)
       throw std::invalid_argument("PsiFormer determinant workspace dimensions must be nonzero");
@@ -310,6 +316,9 @@ private:
                                          const double* coefficients,
                                          bool prepare_inverses)
   {
+    // A failed operation must not leave the preceding result observable.  The
+    // factorization buffers are scratch; only evaluated_ publishes their result.
+    evaluated_ = false;
     if (!matrices)
       throw std::invalid_argument("PsiFormer determinant matrices pointer is null");
 
@@ -348,7 +357,8 @@ private:
       scaled_terms_[channel] = term_phase_[channel] == 0.0
           ? 0.0L
           : static_cast<long double>(term_phase_[channel]) *
-              static_cast<long double>(std::exp(term_log_abs_[channel] - last_shift_));
+              std::exp(static_cast<long double>(term_log_abs_[channel]) -
+                       static_cast<long double>(last_shift_));
       scaled_sum.add(scaled_terms_[channel]);
     }
     last_scaled_sum_ = scaled_sum.value();
@@ -381,11 +391,25 @@ public:
                                         double* output_lap_ratio,
                                         const double* coefficients = nullptr)
   {
+    // This compound operation publishes determinant state only if both the
+    // factorization and every requested derivative lane succeed.
+    evaluated_ = false;
     validateSpatialArguments(matrix_gradients, gradient_lanes, matrix_laplacians,
                              laplacian_lanes, output_log_gradient, output_lap_log,
                              output_lap_ratio);
+    validateSpatialInputs(matrix_gradients, gradient_lanes, matrix_laplacians,
+                          laplacian_lanes);
     const RealDeterminantResult result = evaluate(matrices, coefficients);
-    requireDerivativeState();
+    try
+    {
+      requireDerivativeState();
+    }
+    catch (...)
+    {
+      evaluated_ = false;
+      throw;
+    }
+    evaluated_ = false;
 
     for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
       gradient_sums_[lane].clear();
@@ -426,8 +450,11 @@ public:
       }
     }
 
+    // Narrow the complete result into workspace-owned storage before exposing
+    // any lane to the caller.  A late overflow therefore leaves destinations
+    // byte-for-byte unchanged.
     for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
-      output_log_gradient[lane] = detail::narrowFinite(
+      staged_gradient_[lane] = detail::narrowFinite(
           gradient_sums_[lane].value(), "PsiFormer determinant gradient overflowed");
 
     for (std::size_t electron = 0; electron < laplacian_lanes; ++electron)
@@ -439,12 +466,17 @@ public:
         const long double component = gradient_sums_[3 * electron + dimension].value();
         squared_gradient += component * component;
       }
-      output_lap_ratio[electron] = detail::narrowFinite(
+      staged_lap_ratio_[electron] = detail::narrowFinite(
           lap_ratio, "PsiFormer determinant Laplacian ratio overflowed");
-      output_lap_log[electron] = detail::narrowFinite(
+      staged_lap_log_[electron] = detail::narrowFinite(
           lap_ratio - squared_gradient,
           "PsiFormer determinant logarithmic Laplacian overflowed");
     }
+
+    std::copy_n(staged_gradient_.data(), gradient_lanes, output_log_gradient);
+    std::copy_n(staged_lap_log_.data(), laplacian_lanes, output_lap_log);
+    std::copy_n(staged_lap_ratio_.data(), laplacian_lanes, output_lap_ratio);
+    evaluated_ = true;
     return result;
   }
 
@@ -458,13 +490,15 @@ public:
     {
       const long double channel_weight = scaled_terms_[channel] / last_scaled_sum_;
       const double* inverse = inverses_.data() + channel * matrix_elements_;
-      double* channel_adjoint = matrix_adjoint + channel * matrix_elements_;
       for (std::size_t row = 0; row < matrix_size_; ++row)
         for (std::size_t column = 0; column < matrix_size_; ++column)
-          channel_adjoint[row * matrix_size_ + column] = detail::narrowFinite(
+          staged_matrix_adjoint_[channel * matrix_elements_ +
+                                 row * matrix_size_ + column] = detail::narrowFinite(
               channel_weight * static_cast<long double>(inverse[column * matrix_size_ + row]),
               "PsiFormer determinant reverse seed overflowed");
     }
+    std::copy(staged_matrix_adjoint_.begin(), staged_matrix_adjoint_.end(),
+              matrix_adjoint);
   }
 
   /// Return metadata from the most recent successful evaluation.
@@ -531,6 +565,10 @@ public:
     detail::mixStorage(hash, matrix_product_);
     detail::mixStorage(hash, gradient_sums_);
     detail::mixStorage(hash, laplacian_sums_);
+    detail::mixStorage(hash, staged_gradient_);
+    detail::mixStorage(hash, staged_lap_log_);
+    detail::mixStorage(hash, staged_lap_ratio_);
+    detail::mixStorage(hash, staged_matrix_adjoint_);
     return hash;
   }
 
@@ -556,6 +594,10 @@ public:
     add(matrix_product_);
     add(gradient_sums_);
     add(laplacian_sums_);
+    add(staged_gradient_);
+    add(staged_lap_log_);
+    add(staged_lap_ratio_);
+    add(staged_matrix_adjoint_);
     return bytes;
   }
 
@@ -588,7 +630,9 @@ public:
         overlaps(term_phase_) || overlaps(term_log_abs_) ||
         overlaps(scaled_terms_) || overlaps(solve_) ||
         overlaps(matrix_product_) || overlaps(gradient_sums_) ||
-        overlaps(laplacian_sums_);
+        overlaps(laplacian_sums_) || overlaps(staged_gradient_) ||
+        overlaps(staged_lap_log_) || overlaps(staged_lap_ratio_) ||
+        overlaps(staged_matrix_adjoint_);
   }
 
 private:
@@ -640,6 +684,29 @@ private:
         (!laplacians || !output_lap_log || !output_lap_ratio ||
          gradient_lanes != 3 * laplacian_lanes))
       throw std::invalid_argument("PsiFormer determinant Laplacian storage is inconsistent");
+  }
+
+  /// Preflight every derivative input so evaluation never consumes NaN or infinity.
+  void validateSpatialInputs(const double* gradients,
+                             std::size_t gradient_lanes,
+                             const double* laplacians,
+                             std::size_t laplacian_lanes) const
+  {
+    const std::size_t batch_elements = channels_ * matrix_elements_;
+    const std::size_t gradient_elements =
+        checkedProduct(gradient_lanes, batch_elements);
+    const std::size_t laplacian_elements =
+        checkedProduct(laplacian_lanes, batch_elements);
+    for (std::size_t element = 0; element < gradient_elements;
+         ++element)
+      if (!isFiniteReal(gradients[element]))
+        throw std::invalid_argument(
+            "PsiFormer determinant gradient contains a non-finite element");
+    for (std::size_t element = 0; element < laplacian_elements;
+         ++element)
+      if (!isFiniteReal(laplacians[element]))
+        throw std::invalid_argument(
+            "PsiFormer determinant Laplacian contains a non-finite element");
   }
 
   /// Reject node or singular states where logarithmic derivatives are undefined.
@@ -825,6 +892,10 @@ private:
   std::vector<long double> matrix_product_;
   std::vector<detail::CompensatedSum> gradient_sums_;
   std::vector<detail::CompensatedSum> laplacian_sums_;
+  std::vector<double> staged_gradient_;
+  std::vector<double> staged_lap_log_;
+  std::vector<double> staged_lap_ratio_;
+  mutable std::vector<double> staged_matrix_adjoint_;
 
   double last_shift_          = -std::numeric_limits<double>::infinity();
   long double last_scaled_sum_ = 0.0L;

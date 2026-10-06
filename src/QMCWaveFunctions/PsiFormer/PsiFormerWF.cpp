@@ -10820,12 +10820,17 @@ PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
       throw std::logic_error("PsiFormer ratio requested before evaluateLog for the current parameter version");
     }
 
+    // Range-check the public result before proposal publication.  A caller
+    // receiving an exception must not be able to commit an unseen proposal.
+    const PsiValue ratio_value = makeRatio(
+        sign, logabs, current_sign_, std::real(log_value_));
+
     // Cache proposal state so acceptMove can commit it without reevaluating the
     // network.
     cacheSingleParticleProposal(
         sign, logabs, configurationIdentity(p, iat), iat,
         transaction.parameterVersion(), ProposalOrigin::SCALAR_RATIO_VALUE);
-    return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
+    return ratio_value;
   };
 
   if (transaction.state().direct_value_mode == DirectBackendMode::DIRECT)

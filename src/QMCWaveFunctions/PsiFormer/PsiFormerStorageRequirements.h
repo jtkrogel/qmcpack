@@ -671,6 +671,18 @@ inline std::size_t determinantStorageRequirement(std::size_t determinants,
                              laplacian_lanes,
                              "PsiFormer determinant Laplacian bytes overflowed"),
                   "PsiFormer determinant bytes overflowed");
+  const std::size_t staged_double_elements = checkedStorageSum(
+      determinant_matrix,
+      checkedStorageSum(
+          gradient_lanes,
+          checkedStorageProduct(2, laplacian_lanes,
+                                "PsiFormer determinant staged Laplacian extent overflowed"),
+          "PsiFormer determinant staged derivative extent overflowed"),
+      "PsiFormer determinant staged output extent overflowed");
+  addStorageBytes(bytes, checkedStorageBytes<double>(
+                             staged_double_elements,
+                             "PsiFormer determinant staged output bytes overflowed"),
+                  "PsiFormer determinant bytes overflowed");
   return bytes;
 }
 

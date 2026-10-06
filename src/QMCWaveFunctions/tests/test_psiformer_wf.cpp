@@ -669,6 +669,13 @@ public:
     return snapshot;
   }
 
+  /// Force only the accepted log magnitude to exercise ratio range handling.
+  static void setAcceptedLogMagnitude(PsiFormerWF& component, double log_magnitude)
+  {
+    component.log_value_ = PsiFormerWF::LogValue(
+        log_magnitude, std::imag(component.log_value_));
+  }
+
   /// Compare without tolerance: a rejected scalar entry must not change logical state.
   static bool scalarStateMatches(
       const PsiFormerWF& component,
@@ -2055,6 +2062,43 @@ TEST_CASE("PsiFormer specialized public evaluation paths preserve high-level res
   for (int parameter = 0; parameter < active.size(); ++parameter)
     CHECK(std::real(score_only[parameter]) - 0.375 ==
           Catch::Approx(std::real(score_with_kinetic[parameter]) + 0.125).epsilon(2e-10).margin(2e-10));
+}
+
+TEST_CASE("PsiFormer scalar ratio range failure preserves proposal state",
+          "[wavefunction][psiformer][hardening][ratio][atomic]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component(
+      "pf_ratio_range", files.parameters.string(), files.configuration.string());
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  testing::TestPsiFormerWF::setAcceptedLogMagnitude(component, -1000.0);
+  const testing::PsiFormerScalarStateSnapshot before =
+      testing::TestPsiFormerWF::scalarStateSnapshot(component);
+
+  constexpr int moved_electron = 0;
+  electrons.makeMove(
+      moved_electron, ParticleSet::SingleParticlePos{0.01, -0.005, 0.002});
+  CHECK_THROWS_WITH(
+      component.ratio(electrons, moved_electron),
+      Catch::Matchers::ContainsSubstring("ratio is non-finite"));
+  CHECK(testing::TestPsiFormerWF::scalarStateMatches(component, before));
+  electrons.rejectMove(moved_electron);
+
+  // The rejected range failure does not strand a proposal and an immediate
+  // ordinary evaluation remains usable.
+  testing::TestPsiFormerWF::setAcceptedLogMagnitude(
+      component, std::real(component.evaluateLog(
+                     electrons, electrons.G, electrons.L)));
+  electrons.makeMove(
+      moved_electron, ParticleSet::SingleParticlePos{0.01, -0.005, 0.002});
+  CHECK_NOTHROW(component.ratio(electrons, moved_electron));
+  component.restore(moved_electron);
+  electrons.rejectMove(moved_electron);
 }
 
 TEST_CASE("PsiFormer clone-local evaluator workspaces are allocated on demand",

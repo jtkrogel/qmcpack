@@ -1745,6 +1745,13 @@ TEST_CASE("PsiFormer value batches preserve exact nodes and parameter versions",
 TEST_CASE("PsiFormer batch storage requirements match prepared retained storage",
           "[wavefunction][psiformer][batch][memory]")
 {
+  // Keep the planner's closed-form determinant accounting synchronized with
+  // the workspace-owned atomic-publication scratch.
+  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace
+      determinant_workspace(3, 2, 6, 2);
+  CHECK(determinant_workspace.storageBytes() ==
+        pf::determinantStorageRequirement(3, 2, 6, 2));
+
   GeneratedFiles files = generateFiles("lih");
   pf::PsiFormer model(files.parameters, files.configuration);
   const auto execution_plan = makePlan(model);

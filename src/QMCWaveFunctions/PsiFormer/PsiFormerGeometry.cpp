@@ -76,6 +76,18 @@ void validatePosition(const GeometryPosition& position)
       throw std::invalid_argument("PsiFormer geometry position contains a non-finite component");
 }
 
+/// Validate every derived pair quantity without changing an accepted table.
+void preflightPair(const GeometryPosition& displacement)
+{
+  validatePosition(displacement);
+  const GeometryReal distance =
+      std::hypot(displacement[0], displacement[1], displacement[2]);
+  if (!isFiniteGeometryValue(distance))
+    throw std::invalid_argument(
+        "PsiFormer geometry pair distance is non-finite");
+  (void)evaluateSoftenedRadialFactors(distance);
+}
+
 /// Evaluate a polynomial with coefficients ordered from highest to lowest degree.
 template<std::size_t N>
 GeometryReal evaluatePolynomial(const std::array<GeometryReal, N>& coefficients, GeometryReal argument)
@@ -305,6 +317,15 @@ void PsiFormerGeometryCache::update(GeometryPositionView electrons)
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     validatePosition(electrons.position(electron));
 
+  // Preflight all subtraction, norm, and radial-factor arithmetic before
+  // changing accepted electron or pair-table state.
+  for (std::size_t electron = 0; electron < electronCount(); ++electron)
+    for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
+      preflightPair(displacement(electrons.position(electron), nuclei_[nucleus]));
+  for (const ElectronPair& pair : electron_pairs_)
+    preflightPair(displacement(electrons.position(pair.first),
+                               electrons.position(pair.second)));
+
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     electrons_[electron] = electrons.position(electron);
 
@@ -330,6 +351,22 @@ void PsiFormerGeometryCache::updateElectron(std::size_t electron, const Geometry
   if (electron >= electronCount())
     throw std::out_of_range("PsiFormer geometry electron index is out of range");
   validatePosition(position);
+
+  // Validate every affected derived quantity while the accepted cache is
+  // untouched.  The publication pass below repeats only proven-safe arithmetic.
+  for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
+    preflightPair(displacement(position, nuclei_[nucleus]));
+  for (std::size_t incidence_index = incidence_offsets_[electron];
+       incidence_index < incidence_offsets_[electron + 1]; ++incidence_index)
+  {
+    const ElectronPair& pair =
+        electron_pairs_[incidences_[incidence_index].pair_index];
+    const GeometryPosition& first =
+        pair.first == electron ? position : electrons_[pair.first];
+    const GeometryPosition& second =
+        pair.second == electron ? position : electrons_[pair.second];
+    preflightPair(displacement(first, second));
+  }
 
   electrons_[electron] = position;
   for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)

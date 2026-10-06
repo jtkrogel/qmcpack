@@ -167,23 +167,29 @@ void testOverflowAndUnderflow()
 /// Exercise near-singular matrices and discontinuous LU pivot selection boundaries.
 void testNearlySingularAndPivotChanges()
 {
-  const double delta = 1.0e-11;
-  const std::array<double, 4> near_singular{1.0, 1.0, 1.0, 1.0 + delta};
   det::RealOpenDeterminantWorkspace workspace(1, 2);
-  auto result = workspace.evaluate(near_singular.data());
-  const long double reference = referenceDeterminant(near_singular.data(), 2);
-  check(result.amplitude.phase == 1.0, "nearly singular determinant sign");
-  check(near(result.amplitude.log_abs,
-             std::log(static_cast<double>(reference)), 2.0e-10, 2.0e-10),
-        "nearly singular determinant remains evaluable");
-  check(workspace.factorization(0).minimum_scaled_pivot < 2.0e-11,
-        "near-singularity is visible through pivot diagnostics");
+  for (int exponent : {20, 35, 48})
+  {
+    const double delta = std::ldexp(1.0, -exponent);
+    const std::array<double, 4> near_singular{
+        1.0, 1.0, 1.0, 1.0 + delta};
+    const auto result = workspace.evaluate(near_singular.data());
+    const long double reference =
+        referenceDeterminant(near_singular.data(), 2);
+    check(result.amplitude.phase == 1.0,
+          "near-singular ladder determinant sign");
+    check(near(result.amplitude.log_abs,
+               std::log(static_cast<double>(reference)), 2.0e-10, 2.0e-10),
+          "near-singular ladder remains evaluable");
+    check(workspace.factorization(0).minimum_scaled_pivot <= 2.0 * delta,
+          "near-singular ladder is visible through pivot diagnostics");
+  }
 
   for (double epsilon : {-1.0e-12, 0.0, 1.0e-12})
   {
     const std::array<double, 4> pivot_change{1.0 + epsilon, 2.0,
                                              1.0 - epsilon, 3.0};
-    result = workspace.evaluate(pivot_change.data());
+    const auto result = workspace.evaluate(pivot_change.data());
     const long double determinant = referenceDeterminant(pivot_change.data(), 2);
     check(result.amplitude.phase == (determinant > 0.0L ? 1.0 : -1.0),
           "pivot-change sign parity");
@@ -227,6 +233,152 @@ void testSignedCancellationAndNearNodeGradient()
                                   cancelling_coefficients.data());
       },
       "log gradient is explicitly undefined at cancellation node");
+}
+
+/// Preserve a residual channel whose determinant lies below binary64 exp range.
+void testWideGapSignedCancellation()
+{
+  const double tiny = std::exp(-400.0);
+  const std::array<double, 12> matrices{
+      1.0, 0.0, 0.0, 1.0,
+      1.0, 0.0, 0.0, 1.0,
+      tiny, 0.0, 0.0, tiny};
+  const std::array<double, 3> coefficients{1.0, -1.0, 1.0};
+  det::RealOpenDeterminantWorkspace workspace(3, 2);
+
+  const auto result = workspace.evaluateValue(matrices.data(), coefficients.data());
+  check(result.amplitude.phase == 1.0,
+        "wide-gap cancellation preserves residual phase");
+  check(near(result.amplitude.log_abs, -800.0, 2.0e-14, 2.0e-12),
+        "wide-gap cancellation preserves residual log magnitude");
+}
+
+/// A failed evaluation must invalidate rather than expose the preceding result.
+void testFailedEvaluationInvalidatesResult()
+{
+  const std::array<double, 4> identity{1.0, 0.0, 0.0, 1.0};
+  det::RealOpenDeterminantWorkspace workspace(1, 2);
+  workspace.evaluate(identity.data());
+  check(workspace.result().amplitude.phase == 1.0,
+        "successful determinant result is initially observable");
+
+  auto invalid = identity;
+  invalid[3]   = std::numeric_limits<double>::quiet_NaN();
+  checkThrows([&] { workspace.evaluate(invalid.data()); },
+              "non-finite determinant input is rejected");
+  checkThrows([&] { (void)workspace.result(); },
+              "failed determinant evaluation invalidates prior result");
+
+  invalid[3] = std::numeric_limits<double>::infinity();
+  checkThrows([&] { workspace.evaluate(invalid.data()); },
+              "infinite determinant input is rejected");
+  const double invalid_coefficient =
+      std::numeric_limits<double>::infinity();
+  checkThrows(
+      [&] { workspace.evaluate(identity.data(), &invalid_coefficient); },
+      "infinite determinant coefficient is rejected");
+
+  const auto recovered = workspace.evaluate(identity.data());
+  check(recovered.amplitude.phase == 1.0 && near(recovered.amplitude.log_abs, 0.0),
+        "determinant workspace recovers after invalid input");
+}
+
+/// Derivative failures must not publish a valid prefix of caller destinations.
+void testDerivativePublicationIsAtomic()
+{
+  const std::array<double, 4> matrix{1.0, 0.0, 0.0, 1.0};
+  std::array<double, 8> gradients{};
+  gradients[0] = 1.0;
+  gradients[4] = std::numeric_limits<double>::quiet_NaN();
+  det::RealOpenDeterminantWorkspace workspace(1, 2, 2, 0);
+  std::array<double, 2> outputs{17.0, -23.0};
+
+  checkThrows(
+      [&] {
+        workspace.evaluateSpatial(matrix.data(), gradients.data(), 2, nullptr, 0,
+                                  outputs.data(), nullptr, nullptr);
+      },
+      "non-finite determinant gradient lane is rejected");
+  check(outputs == std::array<double, 2>{17.0, -23.0},
+        "failed spatial derivative leaves every destination unchanged");
+  checkThrows([&] { (void)workspace.result(); },
+              "failed spatial derivative invalidates compound result");
+
+  gradients[4] = 2.0;
+  workspace.evaluateSpatial(matrix.data(), gradients.data(), 2, nullptr, 0,
+                            outputs.data(), nullptr, nullptr);
+  check(near(outputs[0], 1.0) && near(outputs[1], 2.0),
+        "spatial derivative workspace recovers after invalid input");
+
+  const std::array<double, 4> exact_node{};
+  std::array<double, 4> node_gradient{};
+  double node_output = 41.0;
+  det::RealOpenDeterminantWorkspace node_workspace(1, 2, 1, 0);
+  checkThrows(
+      [&] {
+        node_workspace.evaluateSpatial(
+            exact_node.data(), node_gradient.data(), 1, nullptr, 0,
+            &node_output, nullptr, nullptr);
+      },
+      "exact-node spatial derivative is rejected");
+  check(node_output == 41.0,
+        "exact-node spatial failure leaves its destination unchanged");
+  checkThrows([&] { (void)node_workspace.result(); },
+              "exact-node spatial failure invalidates compound result");
+
+  const std::array<double, 8> singular_channel{
+      1.0, 2.0, 2.0, 4.0,
+      1.0, 0.0, 0.0, 1.0};
+  std::array<double, 8> singular_gradient{};
+  double singular_output = -43.0;
+  det::RealOpenDeterminantWorkspace singular_workspace(2, 2, 1, 0);
+  checkThrows(
+      [&] {
+        singular_workspace.evaluateSpatial(
+            singular_channel.data(), singular_gradient.data(), 1, nullptr, 0,
+            &singular_output, nullptr, nullptr);
+      },
+      "spatial derivative requiring a singular-channel inverse is rejected");
+  check(singular_output == -43.0,
+        "singular-channel spatial failure leaves its destination unchanged");
+  checkThrows([&] { (void)singular_workspace.result(); },
+              "singular-channel spatial failure invalidates compound result");
+
+  std::array<double, 12> lap_gradients{};
+  std::array<double, 4> laplacians{};
+  laplacians[0] = std::numeric_limits<double>::infinity();
+  det::RealOpenDeterminantWorkspace lap_workspace(1, 2, 3, 1);
+  std::array<double, 3> lap_output_gradient{5.0, 6.0, 7.0};
+  double lap_output_log   = 8.0;
+  double lap_output_ratio = 9.0;
+  checkThrows(
+      [&] {
+        lap_workspace.evaluateSpatial(
+            matrix.data(), lap_gradients.data(), 3, laplacians.data(), 1,
+            lap_output_gradient.data(), &lap_output_log, &lap_output_ratio);
+      },
+      "non-finite determinant Laplacian lane is rejected");
+  check(lap_output_gradient == std::array<double, 3>{5.0, 6.0, 7.0} &&
+            lap_output_log == 8.0 && lap_output_ratio == 9.0,
+        "failed Laplacian derivative leaves every destination unchanged");
+
+  const std::array<double, 8> near_cancelling_channels{
+      1.0, 0.0, 0.0, 1.0,
+      1.0e-300, 0.0, 0.0, 1.0};
+  const double residual = std::ldexp(1.0, -48);
+  const std::array<double, 2> coefficients{
+      1.0, -1.0e300 * (1.0 - residual)};
+  det::RealOpenDeterminantWorkspace reverse_workspace(2, 2);
+  reverse_workspace.evaluate(near_cancelling_channels.data(),
+                             coefficients.data());
+  std::array<double, 8> adjoints;
+  adjoints.fill(31.0);
+  checkThrows(
+      [&] { reverse_workspace.fillLogAmplitudeMatrixAdjoints(adjoints.data()); },
+      "overflowing reverse determinant lane is rejected");
+  check(std::all_of(adjoints.begin(), adjoints.end(),
+                    [](double value) { return value == 31.0; }),
+        "failed reverse derivative leaves every destination unchanged");
 }
 
 /// Construct a two-channel matrix family and its first/trace-second derivatives.
@@ -371,6 +523,9 @@ int main()
   testOverflowAndUnderflow();
   testNearlySingularAndPivotChanges();
   testSignedCancellationAndNearNodeGradient();
+  testWideGapSignedCancellation();
+  testFailedEvaluationInvalidatesResult();
+  testDerivativePublicationIsAtomic();
   testSpatialFiniteDifferences();
   testReverseSeedFiniteDifferences();
   testFourByFourReferenceAndStorageStability();
