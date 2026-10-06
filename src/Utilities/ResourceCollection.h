@@ -25,9 +25,26 @@
 namespace qmcplusplus
 {
 struct BatchResourcePreparationContext;
+class BatchExecutionPlan;
 struct DriverWalkerResourceCollection;
 template<class CONSUMER>
 class ResourceCollectionTeamLock;
+
+/** Describes whether collection storage may accept a nonnull batch plan. */
+enum class BatchResourcePreparationState
+{
+  UNPREPARED,
+  PREPARED,
+  DERIVED_REQUIRES_CLEAR
+};
+
+/** Records the plan identity carried by prepared or derived collection storage. */
+struct BatchResourcePreparationProvenance
+{
+  BatchResourcePreparationState state = BatchResourcePreparationState::UNPREPARED;
+  std::shared_ptr<const BatchExecutionPlan> plan;
+  std::size_t crowd_index = 0;
+};
 
 /** Owns the ordered resource clones lent to one multi-walker consumer family. */
 class ResourceCollection
@@ -42,11 +59,30 @@ public:
   size_t size() const { return collection_.size(); }
   bool empty() const { return collection_.size() == 0; }
 
+  /** Return immutable preparation provenance for acquisition-time validation. */
+  const BatchResourcePreparationProvenance& getBatchResourcePreparationProvenance() const noexcept
+  {
+    return batch_preparation_;
+  }
+
   size_t addResource(std::unique_ptr<Resource>&& res, bool noprint = false);
   void printResources(std::ostream& os) const;
 
-  /** Prepare every resource transactionally while the collection is idle. */
+  /**
+   * Prepare every resource transactionally while the collection is idle.
+   *
+   * A nonnull plan may be applied only to unprepared template storage.  A
+   * null context rebuilds no-policy resources and clears prior provenance.
+   */
   void prepareBatchResources(const BatchResourcePreparationContext& context);
+
+  /**
+   * Validate collection and resource preconditions without cloning or mutation.
+   *
+   * Compound owners use this preflight to validate all related collections
+   * before allocating the first replacement collection.
+   */
+  void validateBatchResourcePreparation(const BatchResourcePreparationContext& context) const;
 
   template<class RS>
   ResourceHandle<RS> lendResource()
@@ -93,6 +129,10 @@ private:
   /** Build a fully prepared clone without changing this collection. */
   ResourceCollection makePreparedBatchResources(const BatchResourcePreparationContext& context) const;
 
+  /** Build a prepared clone after the caller has completed collection preflight. */
+  ResourceCollection makePreparedBatchResourcesAfterValidation(
+      const BatchResourcePreparationContext& context) const;
+
   /** Publish already-prepared storage without an allocation or exception. */
   void swapResourceStorage(ResourceCollection& other) noexcept;
 
@@ -106,6 +146,7 @@ private:
   size_t cursor_index_;
   size_t outstanding_loans_;
   std::vector<std::unique_ptr<Resource>> collection_;
+  BatchResourcePreparationProvenance batch_preparation_;
 
   friend struct DriverWalkerResourceCollection;
   template<class CONSUMER>

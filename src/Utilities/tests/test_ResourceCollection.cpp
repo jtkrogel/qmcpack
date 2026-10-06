@@ -26,18 +26,47 @@ public:
   std::vector<int> data;
 };
 
+/** Externally records preflight, cloning, and preparation hook calls. */
+struct PreparationCallCounts
+{
+  int validate = 0;
+  int clone    = 0;
+  int prepare  = 0;
+};
+
 /** Records the context delivered by transactional batch preparation. */
 class PreparingResource : public Resource
 {
 public:
-  PreparingResource(const std::string& name, bool fail_on_prepare = false)
-      : Resource(name), fail_on_prepare_(fail_on_prepare)
+  PreparingResource(const std::string& name,
+                    bool fail_on_prepare = false,
+                    bool fail_on_validate = false,
+                    std::shared_ptr<PreparationCallCounts> call_counts = nullptr)
+      : Resource(name),
+        fail_on_prepare_(fail_on_prepare),
+        fail_on_validate_(fail_on_validate),
+        call_counts_(std::move(call_counts))
   {}
 
-  std::unique_ptr<Resource> makeClone() const override { return std::make_unique<PreparingResource>(*this); }
+  std::unique_ptr<Resource> makeClone() const override
+  {
+    if (call_counts_)
+      ++call_counts_->clone;
+    return std::make_unique<PreparingResource>(*this);
+  }
+
+  void validateBatchResourcePreparation(const BatchResourcePreparationContext&) const override
+  {
+    if (call_counts_)
+      ++call_counts_->validate;
+    if (fail_on_validate_)
+      throw std::runtime_error("deliberate batch resource preflight failure");
+  }
 
   void prepareBatchResource(const BatchResourcePreparationContext& context) override
   {
+    if (call_counts_)
+      ++call_counts_->prepare;
     ++prepare_count;
     prepared_plan    = context.plan;
     prepared_crowd   = context.crowd_index;
@@ -55,6 +84,8 @@ public:
 
 private:
   bool fail_on_prepare_;
+  bool fail_on_validate_;
+  std::shared_ptr<PreparationCallCounts> call_counts_;
 };
 
 /** Build a storage-free plan with the requested crowd topology. */
@@ -230,12 +261,20 @@ TEST_CASE("ResourceCollectionTeamLock construction failure preserves cursor", "[
 
 TEST_CASE("ResourceCollection prepares zero-lane and no-policy resources", "[utilities][batch_resource]")
 {
+  auto first_counts  = std::make_shared<PreparationCallCounts>();
+  auto second_counts = std::make_shared<PreparationCallCounts>();
   ResourceCollection collection("batch_preparation");
-  collection.addResource(std::make_unique<PreparingResource>("first"));
-  collection.addResource(std::make_unique<PreparingResource>("second"));
+  collection.addResource(std::make_unique<PreparingResource>("first", false, false, first_counts));
+  collection.addResource(std::make_unique<PreparingResource>("second", false, false, second_counts));
 
   const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({0}, {0});
   collection.prepareBatchResources({plan, 0});
+
+  const BatchResourcePreparationProvenance& prepared_provenance =
+      collection.getBatchResourcePreparationProvenance();
+  CHECK(prepared_provenance.state == BatchResourcePreparationState::PREPARED);
+  CHECK(prepared_provenance.plan.get() == plan.get());
+  CHECK(prepared_provenance.crowd_index == 0);
 
   auto first  = collection.lendResource<PreparingResource>();
   auto second = collection.lendResource<PreparingResource>();
@@ -246,6 +285,12 @@ TEST_CASE("ResourceCollection prepares zero-lane and no-policy resources", "[uti
   CHECK(first.getResource().prepared_crowd == 0);
   CHECK(first.getResource().initial_capacity == 0);
   CHECK(first.getResource().reserve_capacity == 0);
+  CHECK(first_counts->validate == 1);
+  CHECK(second_counts->validate == 1);
+  CHECK(first_counts->clone == 1);
+  CHECK(second_counts->clone == 1);
+  CHECK(first_counts->prepare == 1);
+  CHECK(second_counts->prepare == 1);
   collection.rewind();
   collection.takebackResource(first);
   collection.takebackResource(second);
@@ -253,6 +298,11 @@ TEST_CASE("ResourceCollection prepares zero-lane and no-policy resources", "[uti
   // The explicit no-policy state is forwarded instead of being mistaken for
   // "nothing to do".  Its crowd index is unrestricted because it has no topology.
   collection.prepareBatchResources({nullptr, 91});
+  const BatchResourcePreparationProvenance& cleared_provenance =
+      collection.getBatchResourcePreparationProvenance();
+  CHECK(cleared_provenance.state == BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(cleared_provenance.plan);
+  CHECK(cleared_provenance.crowd_index == 0);
   first  = collection.lendResource<PreparingResource>();
   second = collection.lendResource<PreparingResource>();
   CHECK(first.getResource().prepare_count == 2);
@@ -260,9 +310,96 @@ TEST_CASE("ResourceCollection prepares zero-lane and no-policy resources", "[uti
   CHECK_FALSE(first.getResource().prepared_plan);
   CHECK_FALSE(second.getResource().prepared_plan);
   CHECK(first.getResource().prepared_crowd == 91);
+  CHECK(first_counts->validate == 2);
+  CHECK(second_counts->validate == 2);
+  CHECK(first_counts->clone == 2);
+  CHECK(second_counts->clone == 2);
+  CHECK(first_counts->prepare == 2);
+  CHECK(second_counts->prepare == 2);
   collection.rewind();
   collection.takebackResource(first);
   collection.takebackResource(second);
+}
+
+TEST_CASE("ResourceCollection preparation provenance requires explicit clearing",
+          "[utilities][batch_resource]")
+{
+  auto call_counts = std::make_shared<PreparationCallCounts>();
+  ResourceCollection collection("preparation_provenance");
+  collection.addResource(std::make_unique<PreparingResource>("tracked", false, false, call_counts));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({1}, {2});
+  collection.prepareBatchResources({plan, 0});
+  REQUIRE(collection.getBatchResourcePreparationProvenance().state ==
+          BatchResourcePreparationState::PREPARED);
+  REQUIRE(collection.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+
+  const PreparationCallCounts counts_after_preparation = *call_counts;
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::logic_error);
+  CHECK(call_counts->validate == counts_after_preparation.validate);
+  CHECK(call_counts->clone == counts_after_preparation.clone);
+  CHECK(call_counts->prepare == counts_after_preparation.prepare);
+  CHECK(collection.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(collection.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+  CHECK_THROWS_AS(collection.addResource(std::make_unique<DummyResource>()), std::logic_error);
+
+  ResourceCollection derived(collection);
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::DERIVED_REQUIRES_CLEAR);
+  CHECK(derived.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+  CHECK(derived.getBatchResourcePreparationProvenance().crowd_index == 0);
+
+  const PreparationCallCounts counts_after_copy = *call_counts;
+  CHECK_THROWS_AS(derived.prepareBatchResources({plan, 0}), std::logic_error);
+  CHECK(call_counts->validate == counts_after_copy.validate);
+  CHECK(call_counts->clone == counts_after_copy.clone);
+  CHECK(call_counts->prepare == counts_after_copy.prepare);
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::DERIVED_REQUIRES_CLEAR);
+  CHECK(derived.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+  CHECK_THROWS_AS(derived.addResource(std::make_unique<DummyResource>()), std::logic_error);
+
+  // A null preparation rebuilds no-policy resources and explicitly clears the
+  // provenance barrier before a later nonnull plan may be applied.
+  derived.prepareBatchResources({nullptr, 71});
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(derived.getBatchResourcePreparationProvenance().plan);
+  derived.prepareBatchResources({plan, 0});
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+
+  ResourceCollection moved(std::move(derived));
+  CHECK(moved.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(moved.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(derived.getBatchResourcePreparationProvenance().plan);
+}
+
+TEST_CASE("ResourceCollection successful preflight is mutation free",
+          "[utilities][batch_resource]")
+{
+  auto call_counts = std::make_shared<PreparationCallCounts>();
+  ResourceCollection collection("successful_preflight");
+  collection.addResource(std::make_unique<PreparingResource>("tracked", false, false, call_counts));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({1}, {3});
+  collection.validateBatchResourcePreparation({plan, 0});
+  collection.validateBatchResourcePreparation({nullptr, 97});
+  CHECK(call_counts->validate == 2);
+  CHECK(call_counts->clone == 0);
+  CHECK(call_counts->prepare == 0);
+  CHECK(collection.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+
+  auto tracked = collection.lendResource<PreparingResource>();
+  CHECK(tracked.getResource().prepare_count == 0);
+  CHECK_FALSE(tracked.getResource().prepared_plan);
+  collection.rewind();
+  collection.takebackResource(tracked);
 }
 
 TEST_CASE("ResourceCollection preparation rejects invalid topology before mutation",
@@ -285,6 +422,59 @@ TEST_CASE("ResourceCollection preparation rejects invalid topology before mutati
   CHECK_THROWS_AS(collection.prepareBatchResources({empty_topology_plan, 0}), std::out_of_range);
 }
 
+TEST_CASE("ResourceCollection preflight rejects before cloning or preparation",
+          "[utilities][batch_resource]")
+{
+  auto first_counts     = std::make_shared<PreparationCallCounts>();
+  auto rejecting_counts = std::make_shared<PreparationCallCounts>();
+
+  ResourceCollection collection("failed_preflight");
+  collection.addResource(std::make_unique<PreparingResource>("first", false, false, first_counts));
+  collection.addResource(std::make_unique<PreparingResource>("rejecting", false, true, rejecting_counts));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({1}, {2});
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::runtime_error);
+  CHECK(collection.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(collection.getBatchResourcePreparationProvenance().plan);
+  CHECK(first_counts->validate == 1);
+  CHECK(rejecting_counts->validate == 1);
+  CHECK(first_counts->clone == 0);
+  CHECK(rejecting_counts->clone == 0);
+  CHECK(first_counts->prepare == 0);
+  CHECK(rejecting_counts->prepare == 0);
+
+  // Failure leaves the source resources in their original, unprepared state.
+  auto first     = collection.lendResource<PreparingResource>();
+  auto rejecting = collection.lendResource<PreparingResource>();
+  CHECK(first.getResource().prepare_count == 0);
+  CHECK(rejecting.getResource().prepare_count == 0);
+  CHECK_FALSE(first.getResource().prepared_plan);
+  CHECK_FALSE(rejecting.getResource().prepared_plan);
+  collection.rewind();
+  collection.takebackResource(first);
+  collection.takebackResource(rejecting);
+}
+
+TEST_CASE("ResourceCollection live-loan preflight precedes resource hooks",
+          "[utilities][batch_resource]")
+{
+  auto call_counts = std::make_shared<PreparationCallCounts>();
+  ResourceCollection collection("live_loan_preflight");
+  collection.addResource(std::make_unique<PreparingResource>("tracked", false, false, call_counts));
+
+  auto tracked = collection.lendResource<PreparingResource>();
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({1}, {1});
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::logic_error);
+  CHECK(call_counts->validate == 0);
+  CHECK(call_counts->clone == 0);
+  CHECK(call_counts->prepare == 0);
+  CHECK(tracked.getResource().prepare_count == 0);
+
+  collection.rewind();
+  collection.takebackResource(tracked);
+}
+
 TEST_CASE("ResourceCollection preparation is transactional", "[utilities][batch_resource]")
 {
   ResourceCollection collection("transactional_batch_preparation");
@@ -293,6 +483,9 @@ TEST_CASE("ResourceCollection preparation is transactional", "[utilities][batch_
 
   const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({2}, {4});
   CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::runtime_error);
+  CHECK(collection.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(collection.getBatchResourcePreparationProvenance().plan);
 
   // Although the first candidate clone ran its hook, neither candidate was published.
   auto first    = collection.lendResource<PreparingResource>();

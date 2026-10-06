@@ -26,6 +26,8 @@ public:
   Resource(const std::string& name) : name_(name) {}
   virtual ~Resource()                                 = default;
   virtual std::unique_ptr<Resource> makeClone() const = 0;
+  /// Reject an unsupported context during collection preflight, before cloning.
+  virtual void validateBatchResourcePreparation(const BatchResourcePreparationContext&) const {}
   /// Prepare one idle crowd-local clone; legacy resources require no preparation.
   virtual void prepareBatchResource(const BatchResourcePreparationContext&) {}
   const std::string& getName() const { return name_; }

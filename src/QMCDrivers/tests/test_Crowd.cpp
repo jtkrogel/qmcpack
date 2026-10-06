@@ -24,21 +24,47 @@ namespace qmcplusplus
 {
 namespace testing
 {
+/** Externally records resource lifecycle hooks across transactional candidates. */
+struct CrowdPreparationCallCounts
+{
+  int validate = 0;
+  int clone    = 0;
+  int prepare  = 0;
+};
+
 /** Test resource that exposes crowd-plan preparation without requiring a walker leader. */
 class CrowdPreparationResource : public Resource
 {
 public:
-  CrowdPreparationResource(const std::string& name, bool fail_on_prepare = false)
-      : Resource(name), fail_on_prepare_(fail_on_prepare)
+  CrowdPreparationResource(const std::string& name,
+                           bool fail_on_prepare = false,
+                           bool fail_on_validate = false,
+                           std::shared_ptr<CrowdPreparationCallCounts> call_counts = nullptr)
+      : Resource(name),
+        fail_on_prepare_(fail_on_prepare),
+        fail_on_validate_(fail_on_validate),
+        call_counts_(std::move(call_counts))
   {}
 
   std::unique_ptr<Resource> makeClone() const override
   {
+    if (call_counts_)
+      ++call_counts_->clone;
     return std::make_unique<CrowdPreparationResource>(*this);
+  }
+
+  void validateBatchResourcePreparation(const BatchResourcePreparationContext&) const override
+  {
+    if (call_counts_)
+      ++call_counts_->validate;
+    if (fail_on_validate_)
+      throw std::runtime_error("deliberate DriverWalker resource preflight failure");
   }
 
   void prepareBatchResource(const BatchResourcePreparationContext& context) override
   {
+    if (call_counts_)
+      ++call_counts_->prepare;
     ++prepare_count;
     prepared_plan    = context.plan;
     prepared_crowd   = context.crowd_index;
@@ -56,6 +82,8 @@ public:
 
 private:
   bool fail_on_prepare_;
+  bool fail_on_validate_;
+  std::shared_ptr<CrowdPreparationCallCounts> call_counts_;
 };
 
 /** Build a storage-free plan suitable for driver resource lifecycle tests. */
@@ -170,6 +198,14 @@ TEST_CASE("Crowd prepares reserve resources without a living walker", "[drivers]
   const std::shared_ptr<const BatchExecutionPlan> plan = makeCrowdPreparationPlan({0}, {5});
   crowd.getSharedResource().prepareBatchResources({plan, 0});
 
+  CHECK(crowd.getSharedResource().pset_res.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(crowd.getSharedResource().twf_res.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(crowd.getSharedResource().ham_res.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(crowd.getSharedResource().pset_res.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+
   ResourceCollection& particle_resources = crowd.getSharedResource().pset_res;
   auto prepared = particle_resources.lendResource<CrowdPreparationResource>();
   CHECK(prepared.getResource().prepare_count == 1);
@@ -182,6 +218,13 @@ TEST_CASE("Crowd prepares reserve resources without a living walker", "[drivers]
 
   // A later no-policy section still visits the clone and clears its prior plan.
   crowd.getSharedResource().prepareBatchResources({nullptr, 17});
+  CHECK(crowd.getSharedResource().pset_res.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK(crowd.getSharedResource().twf_res.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK(crowd.getSharedResource().ham_res.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(crowd.getSharedResource().pset_res.getBatchResourcePreparationProvenance().plan);
   prepared = particle_resources.lendResource<CrowdPreparationResource>();
   CHECK(prepared.getResource().prepare_count == 2);
   CHECK_FALSE(prepared.getResource().prepared_plan);
@@ -217,6 +260,89 @@ TEST_CASE("DriverWalker resource preparation is atomic across families", "[drive
   resources.pset_res.takebackResource(particle);
   resources.twf_res.rewind();
   resources.twf_res.takebackResource(wavefunction);
+  resources.ham_res.rewind();
+  resources.ham_res.takebackResource(hamiltonian);
+}
+
+TEST_CASE("DriverWalker resource preflight covers all families before cloning",
+          "[drivers][batch_resource]")
+{
+  using namespace testing;
+  auto particle_counts     = std::make_shared<CrowdPreparationCallCounts>();
+  auto wavefunction_counts = std::make_shared<CrowdPreparationCallCounts>();
+  auto hamiltonian_counts  = std::make_shared<CrowdPreparationCallCounts>();
+
+  DriverWalkerResourceCollection resources;
+  resources.pset_res.addResource(
+      std::make_unique<CrowdPreparationResource>("particle", false, false, particle_counts));
+  resources.twf_res.addResource(
+      std::make_unique<CrowdPreparationResource>("wavefunction", false, false, wavefunction_counts));
+  resources.ham_res.addResource(
+      std::make_unique<CrowdPreparationResource>("rejecting_hamiltonian", false, true, hamiltonian_counts));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeCrowdPreparationPlan({1}, {3});
+  CHECK_THROWS_AS(resources.prepareBatchResources({plan, 0}), std::runtime_error);
+
+  CHECK(particle_counts->validate == 1);
+  CHECK(wavefunction_counts->validate == 1);
+  CHECK(hamiltonian_counts->validate == 1);
+  CHECK(particle_counts->clone == 0);
+  CHECK(wavefunction_counts->clone == 0);
+  CHECK(hamiltonian_counts->clone == 0);
+  CHECK(particle_counts->prepare == 0);
+  CHECK(wavefunction_counts->prepare == 0);
+  CHECK(hamiltonian_counts->prepare == 0);
+
+  // No family was replaced or modified by the failed preflight.
+  auto particle     = resources.pset_res.lendResource<CrowdPreparationResource>();
+  auto wavefunction = resources.twf_res.lendResource<CrowdPreparationResource>();
+  auto hamiltonian  = resources.ham_res.lendResource<CrowdPreparationResource>();
+  CHECK(particle.getResource().prepare_count == 0);
+  CHECK(wavefunction.getResource().prepare_count == 0);
+  CHECK(hamiltonian.getResource().prepare_count == 0);
+  CHECK_FALSE(particle.getResource().prepared_plan);
+  CHECK_FALSE(wavefunction.getResource().prepared_plan);
+  CHECK_FALSE(hamiltonian.getResource().prepared_plan);
+
+  resources.pset_res.rewind();
+  resources.pset_res.takebackResource(particle);
+  resources.twf_res.rewind();
+  resources.twf_res.takebackResource(wavefunction);
+  resources.ham_res.rewind();
+  resources.ham_res.takebackResource(hamiltonian);
+}
+
+TEST_CASE("DriverWalker resource preflight rejects a late-family live loan",
+          "[drivers][batch_resource]")
+{
+  using namespace testing;
+  auto particle_counts     = std::make_shared<CrowdPreparationCallCounts>();
+  auto wavefunction_counts = std::make_shared<CrowdPreparationCallCounts>();
+  auto hamiltonian_counts  = std::make_shared<CrowdPreparationCallCounts>();
+
+  DriverWalkerResourceCollection resources;
+  resources.pset_res.addResource(
+      std::make_unique<CrowdPreparationResource>("particle", false, false, particle_counts));
+  resources.twf_res.addResource(
+      std::make_unique<CrowdPreparationResource>("wavefunction", false, false, wavefunction_counts));
+  resources.ham_res.addResource(
+      std::make_unique<CrowdPreparationResource>("hamiltonian", false, false, hamiltonian_counts));
+
+  auto hamiltonian = resources.ham_res.lendResource<CrowdPreparationResource>();
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeCrowdPreparationPlan({1}, {2});
+  CHECK_THROWS_AS(resources.prepareBatchResources({plan, 0}), std::logic_error);
+
+  CHECK(particle_counts->validate == 1);
+  CHECK(wavefunction_counts->validate == 1);
+  CHECK(hamiltonian_counts->validate == 0);
+  CHECK(particle_counts->clone == 0);
+  CHECK(wavefunction_counts->clone == 0);
+  CHECK(hamiltonian_counts->clone == 0);
+  CHECK(particle_counts->prepare == 0);
+  CHECK(wavefunction_counts->prepare == 0);
+  CHECK(hamiltonian_counts->prepare == 0);
+  CHECK(hamiltonian.getResource().prepare_count == 0);
+
   resources.ham_res.rewind();
   resources.ham_res.takebackResource(hamiltonian);
 }

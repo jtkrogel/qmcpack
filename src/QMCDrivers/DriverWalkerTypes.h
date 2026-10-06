@@ -39,11 +39,18 @@ struct DriverWalkerResourceCollection
   /** Prepare all three collection families as one all-or-nothing publication. */
   void prepareBatchResources(const BatchResourcePreparationContext& context)
   {
+    // Preflight all families before cloning the first candidate.  A late
+    // family can therefore reject the context without transient allocations
+    // or preparation side effects in an earlier family.
+    pset_res.validateBatchResourcePreparation(context);
+    twf_res.validateBatchResourcePreparation(context);
+    ham_res.validateBatchResourcePreparation(context);
+
     // Construct every candidate before publishing any of them.  This preserves
     // all original resources when cloning or any preparation hook fails.
-    ResourceCollection prepared_pset = pset_res.makePreparedBatchResources(context);
-    ResourceCollection prepared_twf  = twf_res.makePreparedBatchResources(context);
-    ResourceCollection prepared_ham  = ham_res.makePreparedBatchResources(context);
+    ResourceCollection prepared_pset = pset_res.makePreparedBatchResourcesAfterValidation(context);
+    ResourceCollection prepared_twf  = twf_res.makePreparedBatchResourcesAfterValidation(context);
+    ResourceCollection prepared_ham  = ham_res.makePreparedBatchResourcesAfterValidation(context);
 
     pset_res.swapResourceStorage(prepared_pset);
     twf_res.swapResourceStorage(prepared_twf);

@@ -28,6 +28,10 @@ ResourceCollection::ResourceCollection(const ResourceCollection& ref)
 {
   for (auto& res : ref.collection_)
     addResource(std::unique_ptr<Resource>(res->makeClone()), true);
+
+  batch_preparation_ = ref.batch_preparation_;
+  if (batch_preparation_.state != BatchResourcePreparationState::UNPREPARED)
+    batch_preparation_.state = BatchResourcePreparationState::DERIVED_REQUIRES_CLEAR;
 }
 
 ResourceCollection::ResourceCollection(ResourceCollection&& ref)
@@ -36,9 +40,11 @@ ResourceCollection::ResourceCollection(ResourceCollection&& ref)
   if (ref.outstanding_loans_ != 0)
     throw std::logic_error("Cannot move a ResourceCollection while resources are acquired");
 
-  cursor_index_     = ref.cursor_index_;
-  collection_       = std::move(ref.collection_);
+  cursor_index_      = ref.cursor_index_;
+  collection_        = std::move(ref.collection_);
+  batch_preparation_ = std::move(ref.batch_preparation_);
   ref.cursor_index_ = 0;
+  ref.batch_preparation_ = {};
 }
 
 void ResourceCollection::printResources(std::ostream& os) const
@@ -51,16 +57,23 @@ void ResourceCollection::printResources(std::ostream& os) const
   os << "-------------------------------" << std::endl << std::endl;
 }
 
-ResourceCollection ResourceCollection::makePreparedBatchResources(
-    const BatchResourcePreparationContext& context) const
+void ResourceCollection::validateBatchResourcePreparation(const BatchResourcePreparationContext& context) const
 {
-  // Validate all collection-wide preconditions before cloning or invoking a
-  // resource hook.  Cursor position is traversal state, not loan ownership:
-  // normal release leaves it at the end and callers may rewind it at any time.
   context.validate();
   if (outstanding_loans_ != 0)
     throw std::logic_error("Cannot prepare a ResourceCollection while resources are acquired");
+  if (context.plan && batch_preparation_.state != BatchResourcePreparationState::UNPREPARED)
+    throw std::logic_error(
+        "Cannot apply a nonnull batch plan to prepared or prepared-derived ResourceCollection storage; "
+        "clear it with a null preparation context first");
 
+  for (const std::unique_ptr<Resource>& resource : collection_)
+    resource->validateBatchResourcePreparation(context);
+}
+
+ResourceCollection ResourceCollection::makePreparedBatchResourcesAfterValidation(
+    const BatchResourcePreparationContext& context) const
+{
   ResourceCollection prepared(name_);
   prepared.collection_.reserve(collection_.size());
   for (const std::unique_ptr<Resource>& resource : collection_)
@@ -73,7 +86,20 @@ ResourceCollection ResourceCollection::makePreparedBatchResources(
     clone->prepareBatchResource(context);
     prepared.collection_.emplace_back(std::move(clone));
   }
+
+  if (context.plan)
+    prepared.batch_preparation_ =
+        {BatchResourcePreparationState::PREPARED, context.plan, context.crowd_index};
   return prepared;
+}
+
+ResourceCollection ResourceCollection::makePreparedBatchResources(
+    const BatchResourcePreparationContext& context) const
+{
+  // Cursor position is traversal state, not loan ownership: normal release
+  // leaves it at the end and callers may rewind it at any time.
+  validateBatchResourcePreparation(context);
+  return makePreparedBatchResourcesAfterValidation(context);
 }
 
 void ResourceCollection::swapResourceStorage(ResourceCollection& other) noexcept
@@ -82,6 +108,7 @@ void ResourceCollection::swapResourceStorage(ResourceCollection& other) noexcept
   swap(cursor_index_, other.cursor_index_);
   swap(outstanding_loans_, other.outstanding_loans_);
   collection_.swap(other.collection_);
+  swap(batch_preparation_, other.batch_preparation_);
 }
 
 void ResourceCollection::prepareBatchResources(const BatchResourcePreparationContext& context)
@@ -92,6 +119,9 @@ void ResourceCollection::prepareBatchResources(const BatchResourcePreparationCon
 
 size_t ResourceCollection::addResource(std::unique_ptr<Resource>&& res, bool noprint)
 {
+  if (batch_preparation_.state != BatchResourcePreparationState::UNPREPARED)
+    throw std::logic_error("Cannot add a resource to prepared or prepared-derived ResourceCollection storage");
+
   size_t index              = collection_.size();
   res->index_in_collection_ = index;
   if (!noprint)
