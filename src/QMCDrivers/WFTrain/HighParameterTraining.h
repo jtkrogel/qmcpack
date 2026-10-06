@@ -30,7 +30,11 @@ struct TrainingIterationState
   std::string schema_fingerprint;
 };
 
-/// Produce one iteration's scalar statistics and derivative contractions.
+/** Produce one iteration's scalar statistics and checked derivative products.
+ *
+ * Implementations compose bounded StreamingDerivativeOperator products through
+ * accumulateEnergyGradientBatch(); they must not materialize sample-by-parameter rows.
+ */
 class GradientProducer
 {
 public:
@@ -67,6 +71,22 @@ struct TrainingIterationResult
   EnergyGradientResult objective;
 };
 
+/** Describe the deliberately local Task-10 reduction transport.
+ *
+ * A single participant can promote its complete local raw sums to global scope.
+ * Multi-participant communicator transport is introduced separately in Task 12.
+ */
+struct LocalTrainingReduction
+{
+  std::size_t participant_count = 1;
+
+  /// Reject unsupported distributed execution before producer work begins.
+  void preflight() const;
+
+  /// Promote one complete single-participant result to global scope.
+  void complete(EnergyGradientAccumulator& accumulator) const;
+};
+
 /** Enforce preflight, reduction, update, publication, and cache-refresh order.
  *
  * This class deliberately owns no sampler, model, optimizer, or checkpoint
@@ -77,9 +97,8 @@ class HighParameterTraining
 public:
   explicit HighParameterTraining(
       TrainingCapabilities requirements,
-      EnergyGradientConvention convention = EnergyGradientConvention::REAL_VMC)
-      : requirements_(requirements), convention_(convention)
-  {}
+      EnergyGradientEstimator estimator = EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+      LocalTrainingReduction reduction = {});
 
   /// Execute one failure-atomic local training iteration.
   TrainingIterationResult runIteration(StructuredParameterProvider& provider,
@@ -90,10 +109,10 @@ public:
 
 private:
   TrainingCapabilities requirements_;
-  EnergyGradientConvention convention_;
+  EnergyGradientEstimator estimator_;
+  LocalTrainingReduction reduction_;
 };
 
 } // namespace qmcplusplus::wftrain
 
 #endif
-
