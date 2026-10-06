@@ -101,6 +101,7 @@ endif()
 
 set(COMMON_SRC test_variable_set.cpp test_OptimizableObject.cpp test_NaNguard.cpp)
 set(TRIALWF_SRC
+    test_batch_execution_wavefunction.cpp
     test_TrialWaveFunction.cpp
     test_wavefunction_factory.cpp
     test_TrialWaveFunction_diamondC_2x1x1.cpp

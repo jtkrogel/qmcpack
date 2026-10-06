@@ -575,6 +575,31 @@ public:
    *  See WaveFunctionComponent::updateBuffer for more detail */
   void copyFromBuffer(ParticleSet& P, WFBufferType& buf);
 
+  /// Aggregate operation requirements in stable component order.
+  void contributeBatchExecutionRequirements(
+      BatchExecutionRequirements& requirements) const;
+
+  /// Return ordered, structurally identified component memory contributions.
+  std::vector<BatchMemoryParticipantContribution>
+      estimateBatchExecutionMemory(
+          const BatchExecutionPlanningContext& context) const;
+
+  /** Atomically validate and publish one plan across every component.
+   * Passing nullptr explicitly clears a prior no-longer-active section plan.
+   */
+  void bindBatchExecutionPlan(
+      std::shared_ptr<const BatchExecutionPlan> plan);
+
+  /// Prepare every bound component clone at an idle lifecycle boundary.
+  void prepareBatchExecutionClones();
+
+  /// Return the exact shared plan identity currently bound to this object.
+  const std::shared_ptr<const BatchExecutionPlan>& batchExecutionPlan() const noexcept
+  { return batch_execution_plan_; }
+
+  /// Report whether this object currently participates in an acquired team resource.
+  bool hasAcquiredResource() const noexcept { return resource_acquired_; }
+
   /// initialize a shared resource and hand it to a collection
   void createResource(ResourceCollection& collection) const;
   /** acquire external resource
@@ -698,6 +723,18 @@ private:
 
   ///a list of WaveFunctionComponents constituting many-body wave functions
   std::vector<std::unique_ptr<WaveFunctionComponent>> Z;
+
+  /// Immutable section plan shared by the golden object and all of its clones.
+  std::shared_ptr<const BatchExecutionPlan> batch_execution_plan_;
+
+  /// Stable component identities validated when the current plan was published.
+  std::vector<std::string> bound_batch_participant_ids_;
+
+  /// Topology snapshot retained only for the duration of one resource loan.
+  std::vector<std::string> acquired_batch_participant_ids_;
+
+  /// Guard plan/topology mutation while a standard component resource list is lent.
+  bool resource_acquired_ = false;
 
   //TWFFastDerivWrapper twf_prototype;
   /// timers at TrialWaveFunction function call level

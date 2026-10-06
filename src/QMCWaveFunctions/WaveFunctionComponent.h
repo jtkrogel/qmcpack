@@ -29,6 +29,7 @@
 #include "OptimizableObject.h"
 #include "Particle/MCWalkerConfiguration.h"
 #include "Containers/MinimalContainers/RecordArray.hpp"
+#include "Utilities/BatchExecutionMemory.h"
 #include "type_traits/template_types.hpp"
 #include "TWFGrads.hpp"
 
@@ -502,6 +503,37 @@ public:
    * @param buf Anonymous storage
    */
   virtual void copyFromBuffer(ParticleSet& P, WFBufferType& buf) = 0;
+
+  /** Add operation families reachable through this component.
+   *
+   * Legacy components intentionally contribute no requirements until they opt
+   * into the batch-memory planning contract.
+   */
+  virtual void contributeBatchExecutionRequirements(BatchExecutionRequirements&) const {}
+
+  /** Estimate this component's clone-local storage for one candidate plan.
+   *
+   * The compatibility default is explicitly unaccounted rather than claiming
+   * that a legacy component consumes zero bytes.
+   */
+  virtual BatchMemoryContribution estimateBatchExecutionMemory(
+      const BatchExecutionPlanningContext&) const
+  {
+    return {};
+  }
+
+  /** Validate a prospective immutable participant binding without mutation. */
+  virtual void validateBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan&) const
+  {}
+
+  /** Publish a previously validated participant binding without throwing. */
+  virtual void bindBatchExecutionPlan(BatchExecutionParticipantPlan) noexcept {}
+
+  /** Prepare clone-local storage at an explicit idle lifecycle boundary. */
+  virtual void prepareBatchExecutionClone(
+      const BatchExecutionParticipantPlan&)
+  {}
 
   /** initialize a shared resource and hand it to a collection
    */
