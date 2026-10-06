@@ -61,6 +61,33 @@ TEST_CASE("Vector simple intializer list", "[OhmmsPETE]")
   CHECK(vec_double[4] == Approx(1.0));
 }
 
+TEST_CASE("Vector reports retained allocation capacity", "[OhmmsPETE]")
+{
+  Vector<double> owned;
+  STATIC_CHECK(noexcept(owned.capacity()));
+  CHECK(owned.capacity() == 0);
+
+  owned.resize(4);
+  CHECK(owned.size() == 4);
+  CHECK(owned.capacity() == 4);
+
+  owned.resize(2);
+  CHECK(owned.size() == 2);
+  CHECK(owned.capacity() == 4);
+
+  owned.clear();
+  CHECK(owned.size() == 0);
+  CHECK(owned.capacity() == 4);
+
+  owned.free();
+  CHECK(owned.capacity() == 0);
+
+  double external[3] = {};
+  Vector<double> attached(external, 3);
+  CHECK(attached.size() == 3);
+  CHECK(attached.capacity() == 3);
+}
+
 TEST_CASE("Vector nested intializer list", "[OhmmsPETE]")
 {
   Vector<TinyVector<double, 3>> vec_tinyd3({{1, 2, 3}, {4, 5, 6}, {7, 8, 9}});

@@ -96,6 +96,115 @@ public:
   {
     wavefunction.twf_fastderiv_ = std::make_unique<TWFFastDerivWrapper>();
   }
+
+  /// Aggregate clone storage and preparation provenance exposed only to tests.
+  struct AggregateCloneDiagnostics
+  {
+    bool prepared                          = false;
+    bool storage_shape_matches_plan        = false;
+    bool allocation_identity_matches       = false;
+    const void* plan_identity              = nullptr;
+    const void* accepted_gradient_data     = nullptr;
+    const void* accepted_laplacian_data    = nullptr;
+    const void* proposed_gradient_data     = nullptr;
+    const void* proposed_laplacian_data    = nullptr;
+    std::size_t accepted_gradient_size     = 0;
+    std::size_t accepted_gradient_capacity = 0;
+    std::size_t accepted_laplacian_size     = 0;
+    std::size_t accepted_laplacian_capacity = 0;
+    std::size_t proposed_gradient_size      = 0;
+    std::size_t proposed_gradient_capacity  = 0;
+    std::size_t proposed_laplacian_size     = 0;
+    std::size_t proposed_laplacian_capacity = 0;
+    std::size_t accepted_gradient_bytes     = 0;
+    std::size_t accepted_laplacian_bytes    = 0;
+    std::size_t proposed_gradient_bytes     = 0;
+    std::size_t proposed_laplacian_bytes    = 0;
+  };
+
+  /// Snapshot exact aggregate clone allocation diagnostics without mutation.
+  static AggregateCloneDiagnostics aggregateCloneDiagnostics(
+      const TrialWaveFunction& wavefunction)
+  {
+    AggregateCloneDiagnostics diagnostics;
+    diagnostics.prepared =
+        static_cast<bool>(wavefunction.prepared_aggregate_batch_execution_plan_);
+    if (diagnostics.prepared)
+      diagnostics.plan_identity =
+          &wavefunction.prepared_aggregate_batch_execution_plan_.plan();
+    diagnostics.accepted_gradient_data  = wavefunction.G.data();
+    diagnostics.accepted_laplacian_data = wavefunction.L.data();
+    diagnostics.proposed_gradient_data =
+        wavefunction.multi_particle_proposed_gradient_.data();
+    diagnostics.proposed_laplacian_data =
+        wavefunction.multi_particle_proposed_laplacian_.data();
+    diagnostics.accepted_gradient_size     = wavefunction.G.size();
+    diagnostics.accepted_gradient_capacity = wavefunction.G.capacity();
+    diagnostics.accepted_laplacian_size     = wavefunction.L.size();
+    diagnostics.accepted_laplacian_capacity = wavefunction.L.capacity();
+    diagnostics.proposed_gradient_size =
+        wavefunction.multi_particle_proposed_gradient_.size();
+    diagnostics.proposed_gradient_capacity =
+        wavefunction.multi_particle_proposed_gradient_.capacity();
+    diagnostics.proposed_laplacian_size =
+        wavefunction.multi_particle_proposed_laplacian_.size();
+    diagnostics.proposed_laplacian_capacity =
+        wavefunction.multi_particle_proposed_laplacian_.capacity();
+    diagnostics.accepted_gradient_bytes =
+        diagnostics.accepted_gradient_capacity *
+        sizeof(ParticleSet::ParticleGradient::value_type);
+    diagnostics.accepted_laplacian_bytes =
+        diagnostics.accepted_laplacian_capacity *
+        sizeof(ParticleSet::ParticleLaplacian::value_type);
+    diagnostics.proposed_gradient_bytes =
+        diagnostics.proposed_gradient_capacity *
+        sizeof(ParticleSet::ParticleGradient::value_type);
+    diagnostics.proposed_laplacian_bytes =
+        diagnostics.proposed_laplacian_capacity *
+        sizeof(ParticleSet::ParticleLaplacian::value_type);
+    if (diagnostics.prepared)
+    {
+      const std::size_t particle_count =
+          wavefunction.prepared_aggregate_batch_execution_plan_.plan().particleCount();
+      diagnostics.storage_shape_matches_plan =
+          !wavefunction.G.isAttached() && !wavefunction.L.isAttached() &&
+          !wavefunction.multi_particle_proposed_gradient_.isAttached() &&
+          !wavefunction.multi_particle_proposed_laplacian_.isAttached() &&
+          diagnostics.accepted_gradient_size == particle_count &&
+          diagnostics.accepted_gradient_capacity == particle_count &&
+          diagnostics.accepted_laplacian_size == particle_count &&
+          diagnostics.accepted_laplacian_capacity == particle_count &&
+          diagnostics.proposed_gradient_size == particle_count &&
+          diagnostics.proposed_gradient_capacity == particle_count &&
+          diagnostics.proposed_laplacian_size == particle_count &&
+          diagnostics.proposed_laplacian_capacity == particle_count;
+    }
+    diagnostics.allocation_identity_matches = !diagnostics.prepared ||
+        (diagnostics.accepted_gradient_data ==
+             wavefunction.prepared_aggregate_accepted_gradient_data_ &&
+         diagnostics.accepted_laplacian_data ==
+             wavefunction.prepared_aggregate_accepted_laplacian_data_ &&
+         diagnostics.proposed_gradient_data ==
+             wavefunction.prepared_aggregate_proposed_gradient_data_ &&
+         diagnostics.proposed_laplacian_data ==
+             wavefunction.prepared_aggregate_proposed_laplacian_data_);
+    return diagnostics;
+  }
+
+  /// Exercise aggregate participant identity validation independently of the wrapper.
+  static void prepareAggregateClone(
+      TrialWaveFunction& wavefunction,
+      const BatchExecutionParticipantPlan& aggregate_plan)
+  {
+    wavefunction.prepareBatchExecutionClone(aggregate_plan);
+  }
+
+  /// Model an unresolved selected-electron proposal for lifecycle guard tests.
+  static void setMultiParticleProposalPending(TrialWaveFunction& wavefunction,
+                                              bool pending)
+  {
+    wavefunction.multi_particle_proposal_pending_ = pending;
+  }
 };
 } // namespace testing
 
@@ -200,6 +309,8 @@ public:
     if (!bound_plan_.sameBinding(plan))
       throw std::logic_error("component preparation received the wrong plan view");
     ++prepare_calls_;
+    if (throw_on_prepare_)
+      throw std::runtime_error("deliberate component clone-preparation failure");
   }
 
   void acquireResource(
@@ -238,6 +349,8 @@ public:
   { reject_empty_binding_ = reject; }
   void throwOnAcquire(bool should_throw) noexcept
   { throw_on_acquire_ = should_throw; }
+  void throwOnPrepare(bool should_throw) noexcept
+  { throw_on_prepare_ = should_throw; }
   void copyBindingInClone(bool copy) noexcept
   { copy_binding_in_clone_ = copy; }
   void setAtomicPublication(bool atomic) noexcept
@@ -268,6 +381,7 @@ private:
   bool reject_nonempty_binding_                       = false;
   bool reject_empty_binding_                          = false;
   bool throw_on_acquire_                              = false;
+  bool throw_on_prepare_                              = false;
   bool copy_binding_in_clone_                         = false;
   bool atomic_publication_                            = true;
   mutable std::size_t requirement_calls_              = 0;
@@ -288,14 +402,15 @@ private:
 std::shared_ptr<const BatchExecutionPlan> makePlan(
     const TrialWaveFunction& wavefunction,
     std::string profile_id = "twf-test-v1",
-    std::size_t preferred_value_tile = 3)
+    std::size_t preferred_value_tile = 3,
+    std::size_t particle_count = 4)
 {
   BatchExecutionSelectionInput input;
   wavefunction.contributeBatchExecutionRequirements(input.requirements);
   input.topology.initial_walkers_per_crowd = {2};
   input.topology.reserve_walkers_per_crowd = {3};
   input.topology.run_kind              = "wavefunction-unit-test";
-  input.particle_count                 = 4;
+  input.particle_count                 = particle_count;
   input.active_parameter_count         = 17;
   input.parameter_derivative_width     = 17;
   input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
@@ -433,21 +548,32 @@ TEST_CASE("TrialWaveFunction batch plan binding is aggregate-atomic",
       wavefunction.addComponent(std::make_unique<ConstantOrbital>()),
       std::logic_error);
 
-  component_ptr->setAtomicPublication(false);
+  // A distinct nonempty plan requires an explicit null boundary, so prepared
+  // aggregate/child provenance cannot silently cross plan identities.
   CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(second_plan),
-                  std::invalid_argument);
+                  std::logic_error);
   CHECK(wavefunction.batchExecutionPlan().get() == first_plan.get());
   CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == first_plan.get());
   CHECK(&component_ptr->boundPlan().plan() == first_plan.get());
+
+  wavefunction.bindBatchExecutionPlan(nullptr);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+
+  component_ptr->setAtomicPublication(false);
+  CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(second_plan),
+                  std::invalid_argument);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(component_ptr->boundPlan());
   component_ptr->setAtomicPublication(true);
 
   const std::size_t first_bind_count = component_ptr->bindCalls();
   component_ptr->rejectNonemptyBinding(true);
   CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(second_plan),
                   std::runtime_error);
-  CHECK(wavefunction.batchExecutionPlan().get() == first_plan.get());
-  CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == first_plan.get());
-  CHECK(&component_ptr->boundPlan().plan() == first_plan.get());
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(component_ptr->boundPlan());
   CHECK(component_ptr->bindCalls() == first_bind_count);
 
   component_ptr->rejectNonemptyBinding(false);
@@ -636,13 +762,258 @@ TEST_CASE("TrialWaveFunction aggregate binding recomputes minimum evidence",
   CHECK_FALSE(planningComponent(wavefunction, 0).boundPlan());
 }
 
+TEST_CASE("TrialWaveFunction prepares exact aggregate clone storage",
+          "[wavefunction][batch_memory]")
+{
+  constexpr std::size_t particle_count = 4;
+  RuntimeOptions runtime_options;
+  TrialWaveFunction resident(runtime_options, "aggregate-clone-storage");
+  auto component = std::make_unique<PlanningComponent>(
+      "Prepared", "component", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 23);
+  PlanningComponent* component_ptr = component.get();
+  resident.addComponent(std::move(component));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(resident);
+
+  const auto plan = makePlan(resident, "aggregate-clone-v1", 3, particle_count);
+  resident.bindBatchExecutionPlan(plan);
+  const auto empty =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(resident);
+  CHECK_FALSE(empty.prepared);
+  CHECK(empty.accepted_gradient_capacity == 0);
+  CHECK(empty.accepted_laplacian_capacity == 0);
+  CHECK(empty.proposed_gradient_capacity == 0);
+  CHECK(empty.proposed_laplacian_capacity == 0);
+
+  // A child failure may retain only bounded aggregate high water.  It publishes
+  // no marker, and retry reuses all four allocations before publishing last.
+  component_ptr->throwOnPrepare(true);
+  CHECK_THROWS_AS(resident.prepareBatchExecutionClones(), std::runtime_error);
+  const auto partial =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(resident);
+  CHECK_FALSE(partial.prepared);
+  CHECK(partial.accepted_gradient_size == particle_count);
+  CHECK(partial.accepted_gradient_capacity == particle_count);
+  CHECK(partial.accepted_laplacian_size == particle_count);
+  CHECK(partial.accepted_laplacian_capacity == particle_count);
+  CHECK(partial.proposed_gradient_size == particle_count);
+  CHECK(partial.proposed_gradient_capacity == particle_count);
+  CHECK(partial.proposed_laplacian_size == particle_count);
+  CHECK(partial.proposed_laplacian_capacity == particle_count);
+
+  component_ptr->throwOnPrepare(false);
+  resident.prepareBatchExecutionClones();
+  const auto prepared =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(resident);
+  REQUIRE(prepared.prepared);
+  CHECK(prepared.plan_identity == plan.get());
+  CHECK(prepared.storage_shape_matches_plan);
+  CHECK(prepared.allocation_identity_matches);
+  CHECK(prepared.accepted_gradient_data == partial.accepted_gradient_data);
+  CHECK(prepared.accepted_laplacian_data == partial.accepted_laplacian_data);
+  CHECK(prepared.proposed_gradient_data == partial.proposed_gradient_data);
+  CHECK(prepared.proposed_laplacian_data == partial.proposed_laplacian_data);
+  CHECK(component_ptr->prepareCalls() == 2);
+
+  const TrialWaveFunctionMemoryTypeSizes type_sizes =
+      makeTrialWaveFunctionMemoryTypeSizes<
+          TrialWaveFunction::ValueType,
+          ParticleSet::ParticleGradient::value_type,
+          ParticleSet::ParticleLaplacian::value_type,
+          std::reference_wrapper<WaveFunctionComponent>,
+          std::reference_wrapper<ParticleSet::ParticleGradient>,
+          std::reference_wrapper<ParticleSet::ParticleLaplacian>,
+          TrialWaveFunction::ParameterDerivativeView,
+          TrialWaveFunction::EvaluationStamp,
+          unsigned char>();
+  const TrialWaveFunctionCloneStorageRequirement expected =
+      trialWaveFunctionCloneStorageRequirement(1, particle_count, type_sizes);
+  CHECK(prepared.accepted_gradient_bytes == expected.accepted_gradients);
+  CHECK(prepared.proposed_gradient_bytes == expected.proposed_gradients);
+  CHECK(prepared.accepted_laplacian_bytes == expected.accepted_laplacians);
+  CHECK(prepared.proposed_laplacian_bytes == expected.proposed_laplacians);
+
+  // Repeating the same preparation is a strict no-op after exact capacity and
+  // allocation-identity validation.
+  resident.prepareBatchExecutionClones();
+  const auto repeated =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(resident);
+  CHECK(component_ptr->prepareCalls() == 2);
+  CHECK(repeated.accepted_gradient_data == prepared.accepted_gradient_data);
+  CHECK(repeated.accepted_laplacian_data == prepared.accepted_laplacian_data);
+  CHECK(repeated.proposed_gradient_data == prepared.proposed_gradient_data);
+  CHECK(repeated.proposed_laplacian_data == prepared.proposed_laplacian_data);
+
+  resident.G[0] = TrialWaveFunction::GradType(1.25);
+  resident.L[0] = TrialWaveFunction::ValueType(2.5);
+  const TrialWaveFunction::GradType accepted_gradient_sentinel = resident.G[0];
+  const TrialWaveFunction::ValueType accepted_laplacian_sentinel = resident.L[0];
+
+  SimulationCell simulation_cell;
+  ParticleSet particles(simulation_cell);
+  particles.create({static_cast<int>(particle_count)});
+  std::unique_ptr<TrialWaveFunction> clone = resident.makeClone(particles);
+  const auto clone_empty =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(*clone);
+  CHECK(clone->batchExecutionPlan().get() == plan.get());
+  CHECK_FALSE(clone_empty.prepared);
+  CHECK(clone_empty.accepted_gradient_capacity == 0);
+  CHECK(clone_empty.accepted_laplacian_capacity == 0);
+  CHECK(clone_empty.proposed_gradient_capacity == 0);
+  CHECK(clone_empty.proposed_laplacian_capacity == 0);
+
+  clone->prepareBatchExecutionClones();
+  const auto clone_prepared =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(*clone);
+  CHECK(clone_prepared.prepared);
+  CHECK(clone_prepared.storage_shape_matches_plan);
+  CHECK(clone_prepared.allocation_identity_matches);
+  CHECK(clone_prepared.accepted_gradient_data != prepared.accepted_gradient_data);
+  CHECK(clone_prepared.accepted_laplacian_data != prepared.accepted_laplacian_data);
+  CHECK(clone_prepared.proposed_gradient_data != prepared.proposed_gradient_data);
+  CHECK(clone_prepared.proposed_laplacian_data != prepared.proposed_laplacian_data);
+
+  // Null binding clears provenance but retains fixed same-shape high water.
+  // Accepted state in particular is physical and must remain bit-for-bit intact.
+  resident.bindBatchExecutionPlan(nullptr);
+  const auto unbound =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(resident);
+  CHECK_FALSE(unbound.prepared);
+  CHECK(unbound.accepted_gradient_data == prepared.accepted_gradient_data);
+  CHECK(unbound.accepted_laplacian_data == prepared.accepted_laplacian_data);
+  CHECK(unbound.proposed_gradient_data == prepared.proposed_gradient_data);
+  CHECK(unbound.proposed_laplacian_data == prepared.proposed_laplacian_data);
+  CHECK(resident.G[0] == accepted_gradient_sentinel);
+  CHECK(resident.L[0] == accepted_laplacian_sentinel);
+
+  const auto replanned =
+      makePlan(resident, "aggregate-clone-v2", 2, particle_count);
+  resident.bindBatchExecutionPlan(replanned);
+  resident.prepareBatchExecutionClones();
+  const auto after_replan =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(resident);
+  CHECK(after_replan.prepared);
+  CHECK(after_replan.plan_identity == replanned.get());
+  CHECK(after_replan.storage_shape_matches_plan);
+  CHECK(after_replan.allocation_identity_matches);
+  CHECK(after_replan.accepted_gradient_data == prepared.accepted_gradient_data);
+  CHECK(after_replan.accepted_laplacian_data == prepared.accepted_laplacian_data);
+  CHECK(after_replan.proposed_gradient_data == prepared.proposed_gradient_data);
+  CHECK(after_replan.proposed_laplacian_data == prepared.proposed_laplacian_data);
+  CHECK(resident.G[0] == accepted_gradient_sentinel);
+  CHECK(resident.L[0] == accepted_laplacian_sentinel);
+  CHECK(component_ptr->prepareCalls() == 3);
+}
+
+TEST_CASE("TrialWaveFunction aggregate clone preparation guards lifecycle and identity",
+          "[wavefunction][batch_memory][resources]")
+{
+  constexpr std::size_t particle_count = 4;
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "aggregate-clone-guards");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Guarded", "component", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 19));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+  const auto plan = makePlan(wavefunction, "aggregate-guards-v1", 3, particle_count);
+  const auto other_plan =
+      makePlan(wavefunction, "aggregate-guards-v2", 2, particle_count);
+  wavefunction.bindBatchExecutionPlan(plan);
+
+  CHECK_THROWS_AS(
+      testing::TestTrialWaveFunction::prepareAggregateClone(
+          wavefunction,
+          testing::TestTrialWaveFunction::soleComponentPlan(wavefunction)),
+      std::logic_error);
+  CHECK_THROWS_AS(
+      testing::TestTrialWaveFunction::prepareAggregateClone(
+          wavefunction,
+          makeBatchExecutionParticipantPlan(
+              other_plan, TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID)),
+      std::logic_error);
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregateCloneDiagnostics(
+                  wavefunction).prepared);
+
+  testing::TestTrialWaveFunction::setMultiParticleProposalPending(
+      wavefunction, true);
+  CHECK_THROWS_AS(wavefunction.prepareBatchExecutionClones(), std::logic_error);
+  CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(nullptr), std::logic_error);
+  CHECK(wavefunction.batchExecutionPlan().get() == plan.get());
+  testing::TestTrialWaveFunction::setMultiParticleProposalPending(
+      wavefunction, false);
+
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction);
+  ResourceCollection resources("aggregate-clone-preparation-guard");
+  TrialWaveFunction::acquireResource(resources, wavefunctions);
+  CHECK_THROWS_AS(wavefunction.prepareBatchExecutionClones(), std::logic_error);
+  TrialWaveFunction::releaseResource(resources, wavefunctions);
+
+  // Logical size alone is insufficient: a shrink retains five allocated
+  // entries and must be rejected against the exact four-particle descriptor.
+  wavefunction.G.resize(particle_count + 1);
+  wavefunction.G.resize(particle_count);
+  wavefunction.L.resize(particle_count);
+  CHECK_THROWS_AS(wavefunction.prepareBatchExecutionClones(), std::length_error);
+  const auto over_capacity =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(wavefunction);
+  CHECK_FALSE(over_capacity.prepared);
+  CHECK(over_capacity.accepted_gradient_size == particle_count);
+  CHECK(over_capacity.accepted_gradient_capacity == particle_count + 1);
+  CHECK(over_capacity.proposed_gradient_capacity == 0);
+  CHECK(planningComponent(wavefunction, 0).prepareCalls() == 0);
+
+  TrialWaveFunction prepared_capacity_guard(
+      runtime_options, "prepared-capacity-guard");
+  prepared_capacity_guard.addComponent(std::make_unique<PlanningComponent>(
+      "PreparedGuard", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 11));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(
+      prepared_capacity_guard);
+  prepared_capacity_guard.bindBatchExecutionPlan(
+      makePlan(prepared_capacity_guard, "prepared-capacity", 2,
+               particle_count));
+  prepared_capacity_guard.prepareBatchExecutionClones();
+  prepared_capacity_guard.G.resize(particle_count + 1);
+  prepared_capacity_guard.G.resize(particle_count);
+  CHECK_THROWS_AS(prepared_capacity_guard.prepareBatchExecutionClones(),
+                  std::length_error);
+  const auto corrupted_prepared =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(
+          prepared_capacity_guard);
+  CHECK(corrupted_prepared.prepared);
+  CHECK_FALSE(corrupted_prepared.storage_shape_matches_plan);
+  CHECK(planningComponent(prepared_capacity_guard, 0).prepareCalls() == 1);
+
+  TrialWaveFunction attached_guard(runtime_options, "attached-storage-guard");
+  attached_guard.addComponent(std::make_unique<PlanningComponent>(
+      "AttachedGuard", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 13));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(
+      attached_guard);
+  attached_guard.bindBatchExecutionPlan(
+      makePlan(attached_guard, "attached-storage", 2, particle_count));
+  ParticleSet::ParticleGradient::value_type external_gradient[particle_count] = {};
+  attached_guard.G.attachReference(external_gradient, particle_count);
+  CHECK_THROWS_AS(attached_guard.prepareBatchExecutionClones(),
+                  std::logic_error);
+  CHECK(planningComponent(attached_guard, 0).prepareCalls() == 0);
+
+  TrialWaveFunction zero_shape(runtime_options, "zero-particle-plan");
+  zero_shape.addComponent(std::make_unique<PlanningComponent>(
+      "Zero", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 7));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(zero_shape);
+  CHECK_THROWS_AS(makePlan(zero_shape, "zero-particle", 2, 0),
+                  std::invalid_argument);
+}
+
 TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparation",
           "[wavefunction][batch_memory][resources]")
 {
   RuntimeOptions runtime_options;
   SimulationCell simulation_cell;
   ParticleSet particles(simulation_cell);
-  particles.create({1});
+  particles.create({4});
 
   TrialWaveFunction leader(runtime_options, "clone");
   leader.addComponent(std::make_unique<PlanningComponent>(
@@ -722,6 +1093,7 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
       std::logic_error);
 
   const auto other_plan = makePlan(leader, "other-plan", 1);
+  clone->bindBatchExecutionPlan(nullptr);
   clone->bindBatchExecutionPlan(other_plan);
   CHECK_THROWS_AS(
       TrialWaveFunction::acquireResource(resources, wavefunctions),

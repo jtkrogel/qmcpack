@@ -598,7 +598,10 @@ public:
   void bindBatchExecutionPlan(
       std::shared_ptr<const BatchExecutionPlan> plan);
 
-  /// Prepare every bound component clone at an idle lifecycle boundary.
+  /** Prepare aggregate and component storage at an idle resident-clone boundary.
+   * The future driver owns the golden-versus-resident role distinction; callers
+   * must not prepare and charge the uncounted golden prototype.
+   */
   void prepareBatchExecutionClones();
 
   /// Return the exact shared plan identity currently bound to this object.
@@ -733,6 +736,10 @@ private:
   InlineBatchTopologyState captureBatchTopologyState(
       const std::shared_ptr<const BatchExecutionPlan>& plan) const;
 
+  /// Prepare aggregate and sole-child clone state for one exact participant view.
+  void prepareBatchExecutionClone(
+      const BatchExecutionParticipantPlan& aggregate_plan);
+
   /// @brief top-level runtime options from project data information > WaveFunctionPool
   const RuntimeOptions& runtime_options_;
 
@@ -781,6 +788,15 @@ private:
 
   /// Fixed-size aggregate/sole-child binding and structural topology snapshot.
   InlineBatchTopologyState bound_batch_topology_;
+
+  /// Aggregate participant whose exact clone-owned state is materialized.
+  BatchExecutionParticipantPlan prepared_aggregate_batch_execution_plan_;
+
+  /// Allocation identities published immediately before the prepared marker.
+  const void* prepared_aggregate_accepted_gradient_data_  = nullptr;
+  const void* prepared_aggregate_accepted_laplacian_data_ = nullptr;
+  const void* prepared_aggregate_proposed_gradient_data_  = nullptr;
+  const void* prepared_aggregate_proposed_laplacian_data_ = nullptr;
 
   /// Fixed-size topology snapshot retained only for one resource loan.
   InlineBatchTopologyState acquired_batch_topology_;

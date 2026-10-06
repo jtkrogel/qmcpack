@@ -153,6 +153,13 @@ public:
   //! return the current size
   inline size_type size() const { return nLocal; }
 
+  /** Return the number of elements available in the backing allocation.
+   * Live attached views report their current referenced extent even though they
+   * do not own that storage.  Owning vectors retain this value across shrink and
+   * clear operations so exact resident-memory accounting can observe high water.
+   */
+  inline size_type capacity() const noexcept { return nAllocated ? nAllocated : nLocal; }
+
   /// Resize the container. For performance consideration, previous data may or may not get kept.
   /// Please avoid relying on previous data after resizing.
   inline void resize(size_type n, Type_t val = Type_t())

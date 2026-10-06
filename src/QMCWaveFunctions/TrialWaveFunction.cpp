@@ -122,6 +122,17 @@ bool capacitiesFitWithin(const BatchTileCapacities& capacities,
       capacities.active_gradient <= envelope.active_gradient && capacities.ecp_outer <= envelope.ecp_outer;
 }
 
+/// Return the exact aggregate type widths used by this executable.
+TrialWaveFunctionMemoryTypeSizes makeTrialWaveFunctionMemoryTypeSizesForBuild() noexcept
+{
+  return makeTrialWaveFunctionMemoryTypeSizes<
+      TrialWaveFunction::ValueType, ParticleSet::ParticleGradient::value_type,
+      ParticleSet::ParticleLaplacian::value_type, std::reference_wrapper<WaveFunctionComponent>,
+      std::reference_wrapper<ParticleSet::ParticleGradient>,
+      std::reference_wrapper<ParticleSet::ParticleLaplacian>, TrialWaveFunction::ParameterDerivativeView,
+      TrialWaveFunction::EvaluationStamp, unsigned char>();
+}
+
 /** Build aggregate policy input from current object and sole-child evidence.
  * The accounting override is private test state; production claims stay false
  * until every aggregate runtime owner is migrated to prepared storage.
@@ -135,12 +146,7 @@ TrialWaveFunctionMemoryPolicyInput makeTrialWaveFunctionMemoryPolicyInput(
     bool sole_child_atomic_publication)
 {
   TrialWaveFunctionMemoryPolicyInput input;
-  input.type_sizes = makeTrialWaveFunctionMemoryTypeSizes<
-      TrialWaveFunction::ValueType, ParticleSet::ParticleGradient::value_type,
-      ParticleSet::ParticleLaplacian::value_type, std::reference_wrapper<WaveFunctionComponent>,
-      std::reference_wrapper<ParticleSet::ParticleGradient>,
-      std::reference_wrapper<ParticleSet::ParticleLaplacian>, TrialWaveFunction::ParameterDerivativeView,
-      TrialWaveFunction::EvaluationStamp, unsigned char>();
+  input.type_sizes = makeTrialWaveFunctionMemoryTypeSizesForBuild();
   input.accounting_claims = complete_accounting_for_testing
       ? TrialWaveFunctionMemoryAccountingClaims::complete()
       : TrialWaveFunctionMemoryAccountingClaims{};
@@ -397,6 +403,14 @@ void TrialWaveFunction::validateRetainedBatchExecutionBinding() const
 void TrialWaveFunction::bindBatchExecutionPlan(
     std::shared_ptr<const BatchExecutionPlan> plan)
 {
+  const bool changes_binding = plan.get() != batch_execution_plan_.get();
+  if (changes_binding && multi_particle_proposal_pending_)
+    throw std::logic_error(
+        "Cannot change a TrialWaveFunction batch execution plan while a proposal is pending");
+  if (changes_binding && plan && batch_execution_plan_)
+    throw std::logic_error(
+        "TrialWaveFunction nonempty batch replanning requires an explicit null-plan clear");
+
   if (resource_acquired_)
   {
     if (plan.get() == batch_execution_plan_.get())
@@ -429,6 +443,19 @@ void TrialWaveFunction::bindBatchExecutionPlan(
   static_assert(std::is_nothrow_copy_assignable_v<InlineBatchTopologyState>);
   static_assert(noexcept(std::declval<WaveFunctionComponent&>().bindBatchExecutionPlan(
       std::declval<BatchExecutionParticipantPlan>())));
+
+  // G/L are accepted physical wavefunction state and must survive null binding.
+  // Retain the exact proposed arrays as intrinsic fixed clone state as well;
+  // they are reusable by a same-shape replan and cannot alias a pending move
+  // because plan changes were rejected above.
+  if (changes_binding)
+  {
+    prepared_aggregate_batch_execution_plan_ = {};
+    prepared_aggregate_accepted_gradient_data_  = nullptr;
+    prepared_aggregate_accepted_laplacian_data_ = nullptr;
+    prepared_aggregate_proposed_gradient_data_  = nullptr;
+    prepared_aggregate_proposed_laplacian_data_ = nullptr;
+  }
   bound_batch_topology_ = candidate;
   if (plan)
     Z.front()->bindBatchExecutionPlan(candidate.sole_component_plan);
@@ -438,22 +465,161 @@ void TrialWaveFunction::bindBatchExecutionPlan(
   batch_execution_plan_ = std::move(plan);
 }
 
-void TrialWaveFunction::prepareBatchExecutionClones()
+void TrialWaveFunction::prepareBatchExecutionClone(
+    const BatchExecutionParticipantPlan& aggregate_plan)
 {
   if (resource_acquired_)
     throw std::logic_error(
         "Cannot prepare TrialWaveFunction clone storage while resources are acquired");
-  if (!batch_execution_plan_)
-    return;
+  if (multi_particle_proposal_pending_)
+    throw std::logic_error(
+        "Cannot prepare TrialWaveFunction clone storage while a proposal is pending");
+  if (!aggregate_plan || !batch_execution_plan_ ||
+      !bound_batch_topology_.aggregate_plan.sameBinding(aggregate_plan))
+    throw std::logic_error(
+        "TrialWaveFunction clone preparation received the wrong aggregate participant plan");
 
   validateRetainedBatchExecutionBinding();
+  if (Z.size() != 1)
+    throw std::logic_error(
+        "Planned TrialWaveFunction clone preparation requires exactly one component");
+
+  const std::size_t particle_count = aggregate_plan.plan().particleCount();
+  if (particle_count == 0)
+    throw std::invalid_argument(
+        "TrialWaveFunction clone preparation requires a positive particle count");
+
+  const TrialWaveFunctionCloneStorageRequirement expected =
+      trialWaveFunctionCloneStorageRequirement(
+          1, particle_count, makeTrialWaveFunctionMemoryTypeSizesForBuild());
+
+  // Measure allocation capacity rather than logical size: Ohmms vectors retain
+  // high water when shrunk, and attached storage is not an aggregate-owned byte.
+  const auto exact_storage_bytes = [particle_count](const auto& storage,
+                                                     std::size_t element_size,
+                                                     std::string_view description) {
+    if (storage.isAttached())
+      throw std::logic_error(
+          std::string("TrialWaveFunction prepared ") + std::string(description) +
+          " must own its storage");
+    if (storage.size() != particle_count || storage.capacity() != particle_count)
+      throw std::length_error(
+          std::string("TrialWaveFunction prepared ") + std::string(description) +
+          " does not have the exact admitted particle capacity");
+    return checkedBatchMemoryMultiply(
+        storage.capacity(), element_size,
+        std::string("TWF prepared ") + std::string(description) + " bytes");
+  };
+  const auto validate_exact_storage = [&]() {
+    const std::size_t accepted_gradient_bytes = exact_storage_bytes(
+        G, sizeof(ParticleSet::ParticleGradient::value_type), "accepted gradient storage");
+    const std::size_t proposed_gradient_bytes = exact_storage_bytes(
+        multi_particle_proposed_gradient_,
+        sizeof(ParticleSet::ParticleGradient::value_type),
+        "proposed gradient storage");
+    const std::size_t accepted_laplacian_bytes = exact_storage_bytes(
+        L, sizeof(ParticleSet::ParticleLaplacian::value_type),
+        "accepted Laplacian storage");
+    const std::size_t proposed_laplacian_bytes = exact_storage_bytes(
+        multi_particle_proposed_laplacian_,
+        sizeof(ParticleSet::ParticleLaplacian::value_type),
+        "proposed Laplacian storage");
+    if (accepted_gradient_bytes != expected.accepted_gradients ||
+        proposed_gradient_bytes != expected.proposed_gradients ||
+        accepted_laplacian_bytes != expected.accepted_laplacians ||
+        proposed_laplacian_bytes != expected.proposed_laplacians)
+      throw std::length_error(
+          "TrialWaveFunction prepared aggregate clone state differs from its admitted storage");
+  };
+
+  if (prepared_aggregate_batch_execution_plan_)
+  {
+    if (!prepared_aggregate_batch_execution_plan_.sameBinding(aggregate_plan))
+      throw std::logic_error(
+          "Cannot replace a prepared TrialWaveFunction aggregate clone plan");
+    validate_exact_storage();
+    if (G.data() != prepared_aggregate_accepted_gradient_data_ ||
+        L.data() != prepared_aggregate_accepted_laplacian_data_ ||
+        multi_particle_proposed_gradient_.data() !=
+            prepared_aggregate_proposed_gradient_data_ ||
+        multi_particle_proposed_laplacian_.data() !=
+            prepared_aggregate_proposed_laplacian_data_)
+      throw std::logic_error(
+          "TrialWaveFunction prepared aggregate clone allocation identity changed");
+    return;
+  }
 
   // Validate the complete binding before allowing the first component to grow
-  // clone-local storage.  Individual component preparation owns its strong
-  // exception guarantee; already prepared high water remains usable on failure.
-  validateAggregateBatchExecutionPlanBinding(bound_batch_topology_.aggregate_plan);
+  // clone-local storage.  Individual component preparation owns its retry
+  // contract; bounded aggregate high water remains reusable on a child failure.
+  validateAggregateBatchExecutionPlanBinding(aggregate_plan);
   Z.front()->validateBatchExecutionPlanBinding(bound_batch_topology_.sole_component_plan);
+
+  // Existing accepted state may already hold a physical configuration.  It is
+  // safe to allocate an empty array, but a nonempty wrong extent or retained
+  // excess capacity cannot be canonicalized without risking those values.
+  const auto validate_accepted_storage = [particle_count](const auto& storage,
+                                                           std::string_view description) {
+    if (storage.size() != 0 && storage.size() != particle_count)
+      throw std::logic_error(
+          std::string("TrialWaveFunction accepted ") + std::string(description) +
+          " has the wrong particle extent");
+    if (storage.size() == particle_count && storage.capacity() != particle_count)
+      throw std::length_error(
+          std::string("TrialWaveFunction accepted ") + std::string(description) +
+          " retains storage beyond the admitted particle extent");
+  };
+  validate_accepted_storage(G, "gradient storage");
+  validate_accepted_storage(L, "Laplacian storage");
+  if (G.isAttached() || L.isAttached() ||
+      multi_particle_proposed_gradient_.isAttached() ||
+      multi_particle_proposed_laplacian_.isAttached())
+    throw std::logic_error(
+        "TrialWaveFunction aggregate clone preparation requires owned spatial storage");
+
+  // Ohmms Vector cannot publish an off-side candidate allocation.  Empty or
+  // retry-retained selected high water is therefore materialized in place;
+  // the aggregate marker remains empty until every child also succeeds.
+  if (G.size() == 0)
+  {
+    G.free();
+    G.resize(particle_count);
+  }
+  if (L.size() == 0)
+  {
+    L.free();
+    L.resize(particle_count);
+  }
+  if (multi_particle_proposed_gradient_.size() != particle_count ||
+      multi_particle_proposed_gradient_.capacity() != particle_count)
+  {
+    multi_particle_proposed_gradient_.free();
+    multi_particle_proposed_gradient_.resize(particle_count);
+  }
+  if (multi_particle_proposed_laplacian_.size() != particle_count ||
+      multi_particle_proposed_laplacian_.capacity() != particle_count)
+  {
+    multi_particle_proposed_laplacian_.free();
+    multi_particle_proposed_laplacian_.resize(particle_count);
+  }
+
+  validate_exact_storage();
+
   Z.front()->prepareBatchExecutionClone(bound_batch_topology_.sole_component_plan);
+  static_assert(std::is_nothrow_copy_assignable_v<BatchExecutionParticipantPlan>);
+  prepared_aggregate_accepted_gradient_data_  = G.data();
+  prepared_aggregate_accepted_laplacian_data_ = L.data();
+  prepared_aggregate_proposed_gradient_data_  = multi_particle_proposed_gradient_.data();
+  prepared_aggregate_proposed_laplacian_data_ = multi_particle_proposed_laplacian_.data();
+  // The participant view is the validity marker and is deliberately published last.
+  prepared_aggregate_batch_execution_plan_ = aggregate_plan;
+}
+
+void TrialWaveFunction::prepareBatchExecutionClones()
+{
+  if (!batch_execution_plan_)
+    return;
+  prepareBatchExecutionClone(bound_batch_topology_.aggregate_plan);
 }
 
 const SPOSet& TrialWaveFunction::getSPOSet(const std::string& name) const
@@ -2111,6 +2277,9 @@ std::unique_ptr<TrialWaveFunction> TrialWaveFunction::makeClone(ParticleSet& tqp
       complete_batch_memory_accounting_for_testing_;
   for (int i = 0; i < Z.size(); ++i)
     myclone->addComponent(Z[i]->makeClone(tqp));
+  // The clone receives immutable participant identity only.  Constructor-empty
+  // aggregate G/L and preparation provenance are materialized independently at
+  // the later resident-clone boundary.
   // Visit children even for a null aggregate plan: a legacy clone constructor
   // may have copied stale internal binding state that explicit no-policy bind
   // must clear before the clone enters a new section.
