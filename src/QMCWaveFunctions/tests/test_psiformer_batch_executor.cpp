@@ -19,6 +19,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
 #include "psiformer_test_utils.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -48,6 +49,19 @@ void operator delete(void* storage) noexcept { std::free(storage); }
 void operator delete[](void* storage) noexcept { std::free(storage); }
 void operator delete(void* storage, std::size_t) noexcept { std::free(storage); }
 void operator delete[](void* storage, std::size_t) noexcept { std::free(storage); }
+
+namespace pf
+{
+/// Expose the private deterministic late-failure seam only to this test translation unit.
+struct DirectBatchWorkspaceTestAccess
+{
+  static void setPreparationFailureBeforePublish(DirectBatchWorkspace& workspace,
+                                                 bool enabled) noexcept
+  {
+    workspace.fail_preparation_before_publish_for_testing_ = enabled;
+  }
+};
+} // namespace pf
 
 namespace
 {
@@ -212,6 +226,45 @@ void checkValue(const pf::DirectBatchValueResultView& batch,
   CHECK(batch.value[configuration] ==
         Catch::Approx(scalar.value).epsilon(3e-9).margin(1e-24));
   CHECK(batch.parameter_version[configuration] == scalar.parameter_version);
+}
+
+void checkExecutionStorageEqual(
+    const pf::DirectBatchStorageRequirement& actual,
+    const pf::DirectBatchStorageRequirement& expected)
+{
+  CHECK(actual.dense_logical == expected.dense_logical);
+  CHECK(actual.sparse_logical == expected.sparse_logical);
+  CHECK(actual.logical_outputs == expected.logical_outputs);
+  CHECK(actual.sparse_tile_positions == expected.sparse_tile_positions);
+  CHECK(actual.value_tile == expected.value_tile);
+  CHECK(actual.full_vgl_tile == expected.full_vgl_tile);
+  CHECK(actual.active_gradient_tile == expected.active_gradient_tile);
+  CHECK(actual.shared_spatial_arena == expected.shared_spatial_arena);
+  CHECK(actual.executionBytes() == expected.executionBytes());
+}
+
+void checkStorageEqual(const pf::DirectBatchStorageRequirement& actual,
+                       const pf::DirectBatchStorageRequirement& expected)
+{
+  checkExecutionStorageEqual(actual, expected);
+  CHECK(actual.replacementTransientBytes() ==
+        expected.replacementTransientBytes());
+  CHECK(actual.setupPeakBytes() == expected.setupPeakBytes());
+}
+
+void checkCapacityPlanEqual(const pf::DirectBatchCapacityPlan& actual,
+                            const pf::DirectBatchCapacityPlan& expected)
+{
+  CHECK(actual.logical.value_dense == expected.logical.value_dense);
+  CHECK(actual.logical.full_vgl == expected.logical.full_vgl);
+  CHECK(actual.logical.active_gradient == expected.logical.active_gradient);
+  CHECK(actual.logical.sparse_references ==
+        expected.logical.sparse_references);
+  CHECK(actual.logical.sparse_replacements ==
+        expected.logical.sparse_replacements);
+  CHECK(actual.tile.value == expected.tile.value);
+  CHECK(actual.tile.full_vgl == expected.tile.full_vgl);
+  CHECK(actual.tile.active_gradient == expected.tile.active_gradient);
 }
 
 void checkSpatial(const pf::DirectBatchSpatialResultView& batch,
@@ -1390,4 +1443,462 @@ TEST_CASE("PsiFormer value batches preserve exact nodes and parameter versions",
     checkValue(changed_batch, configuration, value_executor.evaluate(*scalar_workspace));
     CHECK(changed_batch.parameter_version[configuration] == model.p.version());
   }
+}
+
+TEST_CASE("PsiFormer batch storage requirements match prepared retained storage",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+
+  for (const std::size_t logical_size : {0UL, 1UL, 3UL, 7UL})
+    for (const std::size_t tile_size : {1UL, 2UL, 4UL})
+    {
+      CAPTURE(logical_size, tile_size);
+      auto workspace = batch_executor.makeWorkspace();
+      const std::size_t selected_tile = logical_size == 0 ? 0 : tile_size;
+      const pf::DirectBatchCapacityPlan plan{
+          {logical_size, logical_size, logical_size, 0, 0},
+          {selected_tile, selected_tile, selected_tile}};
+      const pf::DirectBatchStorageRequirement estimated =
+          workspace->storageRequirement(plan);
+      workspace->prepare(plan);
+      const pf::DirectBatchStorageRequirement actual = workspace->actualStorage();
+      checkStorageEqual(actual, estimated);
+      CHECK(workspace->vectorStorageBytes() == actual.totalBytes());
+      CHECK(workspace->tileCapacity(pf::DirectBatchMode::VALUE_ONLY) ==
+            selected_tile);
+      CHECK(workspace->tileCapacity(pf::DirectBatchMode::FULL_VGL) ==
+            selected_tile);
+      CHECK(workspace->tileCapacity(
+                pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) == selected_tile);
+      CHECK(workspace->allocatedTileCapacity(
+                pf::DirectBatchMode::VALUE_ONLY) ==
+            std::min(logical_size, selected_tile));
+      CHECK(workspace->allocatedTileCapacity(
+                pf::DirectBatchMode::FULL_VGL) ==
+            std::min(logical_size, selected_tile));
+      CHECK(workspace->allocatedTileCapacity(
+                pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) ==
+            std::min(logical_size, selected_tile));
+    }
+}
+
+TEST_CASE("PsiFormer asymmetric batch capacities account for shared and sparse storage",
+          "[wavefunction][psiformer][batch][memory][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+
+  const pf::DirectBatchCapacityPlan large_plan{
+      {7, 3, 7, 2, 5}, {4, 1, 2}};
+  const pf::DirectBatchStorageRequirement estimate =
+      workspace->storageRequirement(large_plan);
+  auto independent_workspace = batch_executor.makeWorkspace();
+  checkStorageEqual(independent_workspace->storageRequirement(large_plan),
+                    estimate);
+  workspace->prepare(large_plan);
+  const pf::DirectBatchStorageRequirement large_actual =
+      workspace->actualStorage();
+  checkStorageEqual(large_actual, estimate);
+  CHECK(large_actual.dense_logical > 0);
+  CHECK(large_actual.sparse_logical > 0);
+  CHECK(large_actual.sparse_tile_positions > 0);
+  CHECK(large_actual.value_tile > 0);
+  CHECK(large_actual.full_vgl_tile > 0);
+  CHECK(large_actual.active_gradient_tile > 0);
+  CHECK(large_actual.shared_spatial_arena > 0);
+  CHECK(workspace->tileCapacity(pf::DirectBatchMode::VALUE_ONLY) == 4);
+  CHECK(workspace->tileCapacity(pf::DirectBatchMode::FULL_VGL) == 1);
+  CHECK(workspace->tileCapacity(
+            pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) == 2);
+
+  // A later smaller plan must account the existing high water rather than claim
+  // that grow-only storage was reclaimed.  Only the selected execution tiles shrink.
+  const pf::DirectBatchCapacityPlan smaller_plan{{1, 1, 1, 0, 0}, {1, 1, 1}};
+  const pf::DirectBatchStorageRequirement retained_estimate =
+      workspace->storageRequirement(smaller_plan);
+  checkStorageEqual(retained_estimate, large_actual);
+  workspace->prepare(smaller_plan);
+  checkStorageEqual(workspace->actualStorage(), large_actual);
+  CHECK(workspace->tileCapacity(pf::DirectBatchMode::VALUE_ONLY) == 1);
+  CHECK(workspace->tileCapacity(pf::DirectBatchMode::FULL_VGL) == 1);
+  CHECK(workspace->tileCapacity(
+            pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) == 1);
+  CHECK(workspace->allocatedTileCapacity(
+            pf::DirectBatchMode::VALUE_ONLY) == 4);
+  CHECK(workspace->allocatedTileCapacity(
+            pf::DirectBatchMode::FULL_VGL) == 1);
+  CHECK(workspace->allocatedTileCapacity(
+            pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) == 2);
+}
+
+TEST_CASE("PsiFormer per-mode capacity controls execution independently",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+  std::vector<std::size_t> active_electrons(7);
+  for (std::size_t index = 0; index < active_electrons.size(); ++index)
+    active_electrons[index] = index % model.ne;
+
+  workspace->prepareTileCapacity(pf::DirectBatchMode::VALUE_ONLY, 4);
+  workspace->prepareTileCapacity(pf::DirectBatchMode::FULL_VGL, 1);
+  workspace->prepareTileCapacity(
+      pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 2);
+
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 7);
+  loadBatch(*workspace, base, 7);
+  batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->executionStatistics().tiles_executed == 2);
+
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 3);
+  loadBatch(*workspace, base, 3);
+  batch_executor.evaluateFull(*workspace);
+  CHECK(workspace->executionStatistics().tiles_executed == 3);
+
+  workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 7);
+  loadBatch(*workspace, base, 7);
+  batch_executor.evaluateActive(*workspace, active_electrons.data());
+  CHECK(workspace->executionStatistics().tiles_executed == 4);
+
+  CHECK_THROWS_AS(workspace->prepareTileCapacity(
+                      pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 0),
+                  std::invalid_argument);
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 0);
+  workspace->prepareTileCapacity(pf::DirectBatchMode::FULL_VGL, 0);
+  CHECK_THROWS_AS(workspace->resize(pf::DirectBatchMode::FULL_VGL, 1),
+                  std::logic_error);
+}
+
+TEST_CASE("PsiFormer batch storage requirements reject overflowing plans",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+
+  const pf::DirectBatchCapacityPlan overflowing_plan{
+      {std::numeric_limits<std::size_t>::max(), 0, 0, 0, 0}, {1, 0, 0}};
+  CHECK_THROWS_AS(workspace->storageRequirement(overflowing_plan),
+                  std::length_error);
+  CHECK(workspace->vectorStorageBytes() == 0);
+  CHECK(workspace->tileCapacity(pf::DirectBatchMode::VALUE_ONLY) ==
+        pf::DirectBatchWorkspace::default_tile_capacity);
+}
+
+TEST_CASE("PsiFormer bound capacity plans reject overruns atomically",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+  const pf::DirectBatchCapacityPlan bound_plan{{3, 2, 2, 2, 3}, {2, 1, 1}};
+  workspace->prepare(bound_plan);
+  REQUIRE(workspace->hasCapacityPlan());
+  checkCapacityPlanEqual(workspace->capacityPlan(), bound_plan);
+
+  const std::size_t initial_size = workspace->size();
+  const std::size_t initial_bytes = workspace->vectorStorageBytes();
+  const pf::DirectBatchTileCapacities initial_tiles =
+      workspace->tileCapacities();
+  const std::size_t value_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::VALUE_ONLY);
+  const std::size_t full_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::FULL_VGL);
+  const std::size_t active_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT);
+  auto check_initial_state = [&]() {
+    CHECK(workspace->size() == initial_size);
+    CHECK(workspace->referenceCount() == 0);
+    CHECK(workspace->replacementCount() == 0);
+    CHECK(workspace->vectorStorageBytes() == initial_bytes);
+    CHECK(workspace->tileCapacities().value == initial_tiles.value);
+    CHECK(workspace->tileCapacities().full_vgl == initial_tiles.full_vgl);
+    CHECK(workspace->tileCapacities().active_gradient ==
+          initial_tiles.active_gradient);
+    CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+          value_fingerprint);
+    CHECK(workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL) ==
+          full_fingerprint);
+    CHECK(workspace->storageFingerprint(
+              pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) ==
+          active_fingerprint);
+    checkCapacityPlanEqual(workspace->capacityPlan(), bound_plan);
+  };
+
+  CHECK_THROWS_AS(workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 4),
+                  std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->resize(pf::DirectBatchMode::FULL_VGL, 3),
+                  std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->resize(
+                      pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 3),
+                  std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->resizeSparseValues(3, 3), std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->resizeSparseValues(2, 4), std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->prepareTileCapacity(3), std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->prepareTileCapacity(
+                      pf::DirectBatchMode::VALUE_ONLY, 3),
+                  std::length_error);
+  check_initial_state();
+  CHECK_THROWS_AS(workspace->prepareTileCapacity(
+                      pf::DirectBatchMode::VALUE_ONLY, 1),
+                  std::logic_error);
+  check_initial_state();
+
+  // A nonempty logical transaction also blocks explicit plan rebinding.
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 2);
+  const std::size_t active_bytes = workspace->vectorStorageBytes();
+  const std::size_t active_state_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::VALUE_ONLY);
+  const pf::DirectBatchCapacityPlan replacement_plan{{4, 0, 0, 0, 0},
+                                                      {2, 0, 0}};
+  CHECK_THROWS_AS(workspace->prepare(replacement_plan), std::logic_error);
+  CHECK(workspace->size() == 2);
+  CHECK(workspace->vectorStorageBytes() == active_bytes);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        active_state_fingerprint);
+  checkCapacityPlanEqual(workspace->capacityPlan(), bound_plan);
+}
+
+TEST_CASE("PsiFormer warmed replans fold crossed high waters per buffer",
+          "[wavefunction][psiformer][batch][memory][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+
+  const pf::DirectBatchCapacityPlan full_plan{{0, 7, 0, 0, 0}, {0, 3, 0}};
+  workspace->prepare(full_plan);
+  const pf::DirectBatchStorageRequirement full_storage =
+      workspace->actualStorage();
+  const pf::DirectBatchCapacityPlan value_plan{{31, 0, 0, 0, 0}, {4, 0, 0}};
+  const pf::DirectBatchStorageRequirement value_requirement =
+      workspace->storageRequirement(value_plan);
+  CHECK(value_requirement.replacementTransientBytes() ==
+        full_storage.executionBytes());
+  CHECK(value_requirement.setupPeakBytes() ==
+        value_requirement.executionBytes() + full_storage.executionBytes());
+  CHECK(value_requirement.full_vgl_tile == full_storage.full_vgl_tile);
+  CHECK(value_requirement.logical_outputs > full_storage.logical_outputs);
+  workspace->prepare(value_plan);
+  checkExecutionStorageEqual(workspace->actualStorage(), value_requirement);
+  CHECK(workspace->actualStorage().replacementTransientBytes() == 0);
+  const pf::DirectBatchStorageRequirement no_growth_requirement =
+      workspace->storageRequirement(value_plan);
+  CHECK(no_growth_requirement.replacementTransientBytes() == 0);
+  checkExecutionStorageEqual(no_growth_requirement,
+                             workspace->actualStorage());
+
+  const pf::DirectBatchCapacityPlan reference_heavy_plan{
+      {0, 0, 0, 12, 1}, {2, 0, 0}};
+  workspace->prepare(reference_heavy_plan);
+  const pf::DirectBatchStorageRequirement reference_heavy_storage =
+      workspace->actualStorage();
+  const pf::DirectBatchCapacityPlan replacement_heavy_plan{
+      {0, 0, 0, 1, 12}, {2, 0, 0}};
+  const pf::DirectBatchStorageRequirement sparse_requirement =
+      workspace->storageRequirement(replacement_heavy_plan);
+  CHECK(sparse_requirement.replacementTransientBytes() ==
+        reference_heavy_storage.executionBytes());
+  CHECK(sparse_requirement.sparse_logical >
+        reference_heavy_storage.sparse_logical);
+  workspace->prepare(replacement_heavy_plan);
+  checkExecutionStorageEqual(workspace->actualStorage(), sparse_requirement);
+
+  // An overflowing replan fails during checked preflight, before either the
+  // published plan or any retained storage identity can change.
+  const pf::DirectBatchStorageRequirement accepted_storage =
+      workspace->actualStorage();
+  const std::size_t accepted_value_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::VALUE_ONLY);
+  const std::size_t accepted_full_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::FULL_VGL);
+  const pf::DirectBatchCapacityPlan overflowing_plan{
+      {std::numeric_limits<std::size_t>::max(), 0, 0, 0, 0}, {1, 0, 0}};
+  CHECK_THROWS_AS(workspace->prepare(overflowing_plan), std::length_error);
+  checkExecutionStorageEqual(workspace->actualStorage(), accepted_storage);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+        accepted_value_fingerprint);
+  CHECK(workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL) ==
+        accepted_full_fingerprint);
+  checkCapacityPlanEqual(workspace->capacityPlan(), replacement_heavy_plan);
+}
+
+TEST_CASE("PsiFormer growing capacity plans publish transactionally",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto workspace = batch_executor.makeWorkspace();
+
+  const pf::DirectBatchCapacityPlan accepted_plan{{2, 1, 1, 1, 1},
+                                                   {1, 1, 1}};
+  workspace->prepare(accepted_plan);
+  const pf::DirectBatchStorageRequirement accepted_storage =
+      workspace->actualStorage();
+  const pf::DirectBatchTileCapacities accepted_tiles =
+      workspace->tileCapacities();
+  const std::array<std::size_t, 3> accepted_fingerprints{
+      workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY),
+      workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL),
+      workspace->storageFingerprint(
+          pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT)};
+  const std::array<std::size_t, 3> accepted_logical_high_waters{
+      workspace->capacity(pf::DirectBatchMode::VALUE_ONLY),
+      workspace->capacity(pf::DirectBatchMode::FULL_VGL),
+      workspace->capacity(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT)};
+  const std::array<std::size_t, 3> accepted_tile_high_waters{
+      workspace->allocatedTileCapacity(pf::DirectBatchMode::VALUE_ONLY),
+      workspace->allocatedTileCapacity(pf::DirectBatchMode::FULL_VGL),
+      workspace->allocatedTileCapacity(
+          pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT)};
+  const pf::DirectBatchValueInput accepted_input = workspace->valueInput();
+  const std::size_t accepted_size = workspace->size();
+  const std::size_t accepted_references = workspace->referenceCount();
+  const std::size_t accepted_replacements = workspace->replacementCount();
+
+  auto check_accepted_state = [&]() {
+    checkExecutionStorageEqual(workspace->actualStorage(), accepted_storage);
+    CHECK(workspace->tileCapacities().value == accepted_tiles.value);
+    CHECK(workspace->tileCapacities().full_vgl == accepted_tiles.full_vgl);
+    CHECK(workspace->tileCapacities().active_gradient ==
+          accepted_tiles.active_gradient);
+    CHECK(workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY) ==
+          accepted_fingerprints[0]);
+    CHECK(workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL) ==
+          accepted_fingerprints[1]);
+    CHECK(workspace->storageFingerprint(
+              pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) ==
+          accepted_fingerprints[2]);
+    CHECK(workspace->capacity(pf::DirectBatchMode::VALUE_ONLY) ==
+          accepted_logical_high_waters[0]);
+    CHECK(workspace->capacity(pf::DirectBatchMode::FULL_VGL) ==
+          accepted_logical_high_waters[1]);
+    CHECK(workspace->capacity(
+              pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) ==
+          accepted_logical_high_waters[2]);
+    CHECK(workspace->allocatedTileCapacity(pf::DirectBatchMode::VALUE_ONLY) ==
+          accepted_tile_high_waters[0]);
+    CHECK(workspace->allocatedTileCapacity(pf::DirectBatchMode::FULL_VGL) ==
+          accepted_tile_high_waters[1]);
+    CHECK(workspace->allocatedTileCapacity(
+              pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) ==
+          accepted_tile_high_waters[2]);
+    CHECK(workspace->valueInput() == accepted_input);
+    CHECK(workspace->size() == accepted_size);
+    CHECK(workspace->referenceCount() == accepted_references);
+    CHECK(workspace->replacementCount() == accepted_replacements);
+    checkCapacityPlanEqual(workspace->capacityPlan(), accepted_plan);
+  };
+
+  const pf::DirectBatchCapacityPlan growing_plan{{7, 5, 4, 3, 6},
+                                                  {4, 2, 3}};
+  const pf::DirectBatchStorageRequirement growing_requirement =
+      workspace->storageRequirement(growing_plan);
+  REQUIRE(growing_requirement.replacementTransientBytes() ==
+          accepted_storage.executionBytes());
+  pf::DirectBatchWorkspaceTestAccess::setPreparationFailureBeforePublish(
+      *workspace, true);
+  CHECK_THROWS_AS(workspace->prepare(growing_plan), std::bad_alloc);
+  check_accepted_state();
+
+  pf::DirectBatchWorkspaceTestAccess::setPreparationFailureBeforePublish(
+      *workspace, false);
+  workspace->prepare(growing_plan);
+  checkExecutionStorageEqual(workspace->actualStorage(), growing_requirement);
+  checkCapacityPlanEqual(workspace->capacityPlan(), growing_plan);
+
+  // FULL_VGL already supplies enough shared dense/output high water for a larger
+  // active-gradient logical bound.  Publishing that bound must update the active
+  // diagnostic even though no owned buffer is replaced.
+  const pf::DirectBatchCapacityPlan crossed_no_growth_plan{
+      {7, 5, 7, 3, 6}, {4, 2, 3}};
+  const pf::DirectBatchStorageRequirement no_growth_requirement =
+      workspace->storageRequirement(crossed_no_growth_plan);
+  CHECK(no_growth_requirement.replacementTransientBytes() == 0);
+  const std::size_t active_fingerprint = workspace->storageFingerprint(
+      pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT);
+  workspace->prepare(crossed_no_growth_plan);
+  CHECK(workspace->capacity(
+            pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) == 7);
+  CHECK(workspace->storageFingerprint(
+            pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT) ==
+        active_fingerprint);
+  checkExecutionStorageEqual(workspace->actualStorage(),
+                             no_growth_requirement);
+  checkCapacityPlanEqual(workspace->capacityPlan(), crossed_no_growth_plan);
+}
+
+TEST_CASE("PsiFormer storage byte arithmetic rejects wraparound",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  CHECK_THROWS_AS(
+      pf::checkedStorageSum(maximum, 1,
+                            "intentional storage sum overflow"),
+      std::length_error);
+  CHECK_THROWS_AS(
+      pf::checkedStorageProduct(maximum, 2,
+                                "intentional storage product overflow"),
+      std::length_error);
+  CHECK_THROWS_AS(
+      pf::checkedStorageBytes<double>(maximum,
+                                      "intentional storage byte overflow"),
+      std::length_error);
+
+  pf::DirectBatchStorageRequirement execution_overflow;
+  execution_overflow.dense_logical = maximum;
+  execution_overflow.sparse_logical = 1;
+  CHECK_THROWS_AS(execution_overflow.executionBytes(), std::length_error);
+
+  pf::DirectBatchStorageRequirement peak_overflow;
+  peak_overflow.dense_logical = maximum;
+  peak_overflow.replacement_transient = 1;
+  CHECK(peak_overflow.executionBytes() == maximum);
+  CHECK_THROWS_AS(peak_overflow.setupPeakBytes(), std::length_error);
 }

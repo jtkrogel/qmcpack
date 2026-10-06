@@ -245,11 +245,15 @@ public:
   }
 
   /// Return bytes reserved by every workspace buffer, including geometry tables.
-  std::size_t vectorStorageBytes() const noexcept
+  std::size_t vectorStorageBytes() const
   {
-    std::size_t scalar_capacity = 0;
-    auto add = [&scalar_capacity](const std::vector<double>& buffer) {
-      scalar_capacity += buffer.capacity();
+    std::size_t bytes = 0;
+    auto add = [&bytes](const std::vector<double>& buffer) {
+      addStorageBytes(bytes,
+                      checkedStorageBytes<double>(
+                          buffer.capacity(),
+                          "PsiFormer spatial storage bytes overflowed"),
+                      "PsiFormer spatial storage bytes overflowed");
     };
     auto add_jet = [&add](const DirectSpatialJetBuffer& buffer) {
       add(buffer.value);
@@ -272,17 +276,34 @@ public:
     add(output_gradient_);
     add(output_lap_log_);
     add(output_lap_ratio_);
-    return scalar_capacity * sizeof(double) + geometry_.storageBytes() +
-        determinant_workspace_.storageBytes();
+    addStorageBytes(bytes, geometry_.storageBytes(),
+                    "PsiFormer spatial storage bytes overflowed");
+    addStorageBytes(bytes, determinant_workspace_.storageBytes(),
+                    "PsiFormer spatial storage bytes overflowed");
+    return bytes;
   }
 
   /// Expose geometry-cache allocation accounting for workspace diagnostics.
-  std::size_t geometryStorageBytes() const noexcept
+  std::size_t geometryStorageBytes() const
   { return geometry_.storageBytes(); }
 
   /// Expose geometry allocation identity for focused storage diagnostics.
   std::size_t geometryStorageFingerprint() const noexcept
   { return geometry_.storageFingerprint(); }
+
+  /// Return the checked constructor-time requirement for this fixed model shape.
+  std::size_t requiredStorageBytes() const
+  {
+    const std::size_t electrons = geometry_.electronCount();
+    const std::size_t electron_square = checkedStorageProduct(
+        electrons, electrons, "PsiFormer spatial shape overflowed");
+    return spatialWorkspaceStorageRequirement(
+        {electrons, geometry_.nucleusCount(), determinant_workspace_.channels(),
+         features_a_.value.size() / electrons,
+         attention_.value.size() / electron_square,
+         raw_features_.value.size() / electrons, 0, 0},
+        mode_ == DirectSpatialMode::FULL_VGL);
+  }
 
 private:
   friend class DirectSpatialExecutor;

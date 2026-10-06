@@ -37,6 +37,7 @@
 
 #include "PsiFormerDirectKernels.h"
 #include "PsiFormerDeterminant.h"
+#include "PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
 
@@ -293,19 +294,43 @@ public:
   /// Return the fixed number of canonical score components.
   std::size_t scoreSize() const noexcept { return parameter_score_.size(); }
 
-  /// Return bytes reserved by explicit tape/adjoint vectors (excluding geometry metadata).
-  std::size_t vectorStorageBytes() const noexcept
+  /// Return bytes reserved by the complete tape, geometry, and determinant workspace.
+  std::size_t vectorStorageBytes() const
   {
-    const std::size_t elements = electron_positions_.capacity() + raw_features_.capacity() +
-        features_.capacity() + queries_.capacity() + keys_.capacity() + values_.capacity() +
-        attention_weights_.capacity() + contexts_.capacity() + residuals_.capacity() + hidden_.capacity() +
-        updates_.capacity() + orbital_matrices_.capacity() + matrix_adjoints_.capacity() +
-        parameter_score_.capacity() +
-        feature_adjoint_a_.capacity() + feature_adjoint_b_.capacity() + query_adjoint_.capacity() +
-        key_adjoint_.capacity() + value_adjoint_.capacity() + attention_adjoint_.capacity() +
-        context_adjoint_.capacity() + residual_adjoint_.capacity() + hidden_adjoint_.capacity() +
-        update_adjoint_.capacity();
-    return elements * sizeof(double) + determinant_workspace_.storageBytes();
+    std::size_t bytes = 0;
+    auto add = [&bytes](const std::vector<double>& buffer) {
+      addStorageBytes(bytes,
+                      checkedStorageBytes<double>(
+                          buffer.capacity(),
+                          "PsiFormer score storage bytes overflowed"),
+                      "PsiFormer score storage bytes overflowed");
+    };
+    for (const auto* buffer : {
+             &electron_positions_, &raw_features_, &features_, &queries_,
+             &keys_, &values_, &attention_weights_, &contexts_, &residuals_,
+             &hidden_, &updates_, &orbital_matrices_, &matrix_adjoints_,
+             &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
+             &query_adjoint_, &key_adjoint_, &value_adjoint_,
+             &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
+             &hidden_adjoint_, &update_adjoint_})
+      add(*buffer);
+    addStorageBytes(bytes, geometry_.storageBytes(),
+                    "PsiFormer score storage bytes overflowed");
+    addStorageBytes(bytes, determinant_workspace_.storageBytes(),
+                    "PsiFormer score storage bytes overflowed");
+    return bytes;
+  }
+
+  /// Expose the geometry contribution for focused inclusive-accounting tests.
+  std::size_t geometryStorageBytes() const
+  { return geometry_.storageBytes(); }
+
+  /// Return the checked constructor-time requirement for this fixed model shape.
+  std::size_t requiredStorageBytes() const
+  {
+    return scoreWorkspaceStorageRequirement(
+        {electrons_, nuclei_, determinants_, width_, heads_, input_width_,
+         blocks_, parameter_score_.size()});
   }
 
 private:

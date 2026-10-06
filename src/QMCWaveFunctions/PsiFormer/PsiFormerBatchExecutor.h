@@ -24,6 +24,7 @@
 #define QMCPLUSPLUS_PSIFORMER_BATCH_EXECUTOR_H
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchKernels.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 
 #include <algorithm>
 #include <array>
@@ -31,6 +32,8 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -92,8 +95,7 @@ public:
                        const DirectSpatialExecutor& spatial_executor)
       : value_executor_(&value_executor),
         spatial_executor_(&spatial_executor),
-        electron_count_(value_executor.layout()->electronCount()),
-        tile_capacity_(default_tile_capacity)
+        electron_count_(value_executor.layout()->electronCount())
   {
     if (value_executor.layout().get() != spatial_executor.layout().get() ||
         spatial_executor.valueExecutorIdentity() != &value_executor)
@@ -103,8 +105,8 @@ public:
 
   DirectBatchWorkspace(const DirectBatchWorkspace&) = delete;
   DirectBatchWorkspace& operator=(const DirectBatchWorkspace&) = delete;
-  DirectBatchWorkspace(DirectBatchWorkspace&&) = default;
-  DirectBatchWorkspace& operator=(DirectBatchWorkspace&&) = default;
+  DirectBatchWorkspace(DirectBatchWorkspace&&) noexcept = default;
+  DirectBatchWorkspace& operator=(DirectBatchWorkspace&&) noexcept = default;
 
   /** Select a nonzero execution tile capacity and prepare the current request.
    * Scratch remains grow-only, while a smaller selection takes effect immediately.
@@ -113,6 +115,9 @@ public:
   {
     if (capacity == 0)
       throw std::invalid_argument("PsiFormer batch tile capacity must be positive");
+    requireTileWithinBound(DirectBatchMode::VALUE_ONLY, capacity);
+    requireTileWithinBound(DirectBatchMode::FULL_VGL, capacity);
+    requireTileWithinBound(DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, capacity);
     // A policy capacity larger than the current logical batch is harmless.  Only
     // the effective occupancy participates in BLAS dimensions or allocation.
     if (active_size_ != 0)
@@ -125,12 +130,99 @@ public:
       if (active_value_input_ == DirectBatchValueInput::SPARSE_REPLACEMENTS)
         growVector(sparse_tile_positions_, sparseTilePositionElements(effective_capacity));
     }
-    tile_capacity_ = capacity;
+    tile_capacities_ = {capacity, capacity, capacity};
+  }
+
+  /** Select and, when active, prepare one mode without changing other selections.
+   * A zero capacity disables an idle mode; a nonempty active transaction cannot be
+   * disabled because its next evaluation would otherwise have no forward progress.
+   */
+  void prepareTileCapacity(DirectBatchMode mode, std::size_t capacity)
+  {
+    requireTileWithinBound(mode, capacity);
+    if (active_mode_ == mode && active_size_ != 0 && capacity == 0)
+      throw std::invalid_argument(
+          "PsiFormer cannot disable the active nonempty batch mode");
+    if (active_mode_ == mode && active_size_ != 0)
+    {
+      const std::size_t effective_capacity = std::min(active_size_, capacity);
+      validateScratchExtents(mode, effective_capacity);
+      if (mode == DirectBatchMode::VALUE_ONLY &&
+          active_value_input_ == DirectBatchValueInput::SPARSE_REPLACEMENTS)
+        (void)sparseTilePositionElements(effective_capacity);
+      prepareScratch(mode, effective_capacity);
+      if (mode == DirectBatchMode::VALUE_ONLY &&
+          active_value_input_ == DirectBatchValueInput::SPARSE_REPLACEMENTS)
+        growVector(sparse_tile_positions_,
+                   sparseTilePositionElements(effective_capacity));
+    }
+
+    switch (mode)
+    {
+    case DirectBatchMode::VALUE_ONLY:
+      tile_capacities_.value = capacity;
+      break;
+    case DirectBatchMode::FULL_VGL:
+      tile_capacities_.full_vgl = capacity;
+      break;
+    case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      tile_capacities_.active_gradient = capacity;
+      break;
+    }
+  }
+
+  /** Transactionally prepare all logical and mode-specific retained storage.
+   *
+   * A growing replan is built in a complete clone-local staging workspace.  Only
+   * after every allocation and byte-accounting validation succeeds is that workspace
+   * moved into place.  Thus allocation, capacity, and injected late failures leave
+   * the old storage identities, active state, and published plan unchanged.
+   */
+  void prepare(const DirectBatchCapacityPlan& plan)
+  {
+    if (active_size_ != 0)
+      throw std::logic_error(
+          "PsiFormer batch capacity plans may be rebound only while idle");
+    bool requires_growth = false;
+    DirectBatchStorageRequirement requirement =
+        prospectiveStorageRequirement(plan, requires_growth);
+    if (requires_growth)
+      requirement.replacement_transient = actualStorage().executionBytes();
+
+    if (!requires_growth)
+    {
+      recordPlanLogicalHighWaters(plan);
+      tile_capacities_     = plan.tile;
+      bound_capacity_plan_ = plan;
+      return;
+    }
+
+    DirectBatchWorkspace replacement(*value_executor_, *spatial_executor_);
+    replacement.prepareReplacementFrom(*this, plan);
+    replacement.tile_capacities_     = plan.tile;
+    replacement.bound_capacity_plan_ = plan;
+    replacement.active_mode_         = active_mode_;
+    replacement.active_value_input_  = active_value_input_;
+    replacement.active_size_         = 0;
+    replacement.active_reference_count_ = active_reference_count_;
+    replacement.active_replacement_count_ = active_replacement_count_;
+    replacement.active_dense_coordinate_bytes_avoided_ =
+        active_dense_coordinate_bytes_avoided_;
+    replacement.statistics_ = statistics_;
+
+    if (!sameExecutionStorage(replacement.actualStorage(), requirement))
+      throw std::length_error(
+          "PsiFormer staged batch storage did not match its admitted requirement");
+    if (fail_preparation_before_publish_for_testing_)
+      throw std::bad_alloc();
+
+    *this = std::move(replacement);
   }
 
   /// Grow logical storage, prepare bounded scratch, and begin a packing transaction.
   void resize(DirectBatchMode mode, std::size_t size)
   {
+    requireDenseLogicalWithinBound(mode, size);
     namespace batch = qmcplusplus::psiformer::batch;
     const std::size_t position_count = batch::checkedProduct(
         batch::checkedProduct(size, electron_count_,
@@ -148,7 +240,11 @@ public:
         ? batch::checkedProduct(size, electron_count_,
                                 "PsiFormer batch Laplacian extent overflowed")
         : 0;
-    const std::size_t effective_capacity = std::min(size, tile_capacity_);
+    const std::size_t selected_capacity = tileCapacity(mode);
+    if (size != 0 && selected_capacity == 0)
+      throw std::logic_error(
+          "PsiFormer batch mode is disabled by a zero tile capacity");
+    const std::size_t effective_capacity = std::min(size, selected_capacity);
 
     // Reject impossible packed products and BLAS dimensions before changing
     // either logical storage or a retained scratch family.
@@ -177,6 +273,7 @@ public:
   void resizeSparseValues(std::size_t reference_count,
                           std::size_t replacement_count)
   {
+    requireSparseLogicalWithinBound(reference_count, replacement_count);
     namespace batch = qmcplusplus::psiformer::batch;
     if (reference_count == 0 && replacement_count != 0)
       throw std::invalid_argument(
@@ -192,7 +289,11 @@ public:
     const std::size_t replacement_position_count = batch::checkedProduct(
         replacement_count, 3,
         "PsiFormer sparse replacement extent overflowed");
-    const std::size_t effective_capacity = std::min(size, tile_capacity_);
+    const std::size_t selected_capacity = tileCapacity(DirectBatchMode::VALUE_ONLY);
+    if (size != 0 && selected_capacity == 0)
+      throw std::logic_error(
+          "PsiFormer VALUE batch mode is disabled by a zero tile capacity");
+    const std::size_t effective_capacity = std::min(size, selected_capacity);
     const std::size_t sparse_tile_position_count =
         sparseTilePositionElements(effective_capacity);
     const std::size_t avoided_coordinate_scalars = electron_count_ == 0
@@ -360,7 +461,42 @@ public:
 
   std::size_t size() const noexcept { return active_size_; }
   std::size_t electronCount() const noexcept { return electron_count_; }
-  std::size_t tileCapacity() const noexcept { return tile_capacity_; }
+  /// Legacy accessor returning the largest selected mode capacity.
+  std::size_t tileCapacity() const noexcept
+  {
+    return std::max({tile_capacities_.value, tile_capacities_.full_vgl,
+                     tile_capacities_.active_gradient});
+  }
+
+  /// Return the independently selected capacity for one call family.
+  std::size_t tileCapacity(DirectBatchMode mode) const noexcept
+  {
+    switch (mode)
+    {
+    case DirectBatchMode::VALUE_ONLY:
+      return tile_capacities_.value;
+    case DirectBatchMode::FULL_VGL:
+      return tile_capacities_.full_vgl;
+    case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      return tile_capacities_.active_gradient;
+    }
+    return 0;
+  }
+
+  /// Return all independently selected capacities as one typed value.
+  DirectBatchTileCapacities tileCapacities() const noexcept
+  { return tile_capacities_; }
+
+  /// Report whether deterministic logical and tile bounds have been published.
+  bool hasCapacityPlan() const noexcept { return bound_capacity_plan_.has_value(); }
+
+  /// Return the published admitted bounds, or reject an unrestricted legacy workspace.
+  const DirectBatchCapacityPlan& capacityPlan() const
+  {
+    if (!bound_capacity_plan_)
+      throw std::logic_error("PsiFormer batch workspace has no bound capacity plan");
+    return *bound_capacity_plan_;
+  }
   DirectBatchValueInput valueInput() const noexcept { return active_value_input_; }
   std::size_t referenceCount() const noexcept { return active_reference_count_; }
   std::size_t replacementCount() const noexcept { return active_replacement_count_; }
@@ -369,6 +505,21 @@ public:
   std::size_t allocatedTileCapacity() const noexcept
   {
     return std::max({value_tile_capacity_, full_workspaces_.size(), active_workspaces_.size()});
+  }
+
+  /// Return the retained slot high-water mark for one call family.
+  std::size_t allocatedTileCapacity(DirectBatchMode mode) const noexcept
+  {
+    switch (mode)
+    {
+    case DirectBatchMode::VALUE_ONLY:
+      return value_tile_capacity_;
+    case DirectBatchMode::FULL_VGL:
+      return full_workspaces_.size();
+    case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      return active_workspaces_.size();
+    }
+    return 0;
   }
 
   /// Return the logical high-water configuration count requested for one mode.
@@ -462,92 +613,143 @@ public:
   }
 
   /// Return bytes retained by logical inputs, outputs, readiness, and staging arrays.
-  std::size_t logicalStorageBytes() const noexcept
+  std::size_t logicalStorageBytes() const
   {
-    std::size_t bytes = 0;
-    bytes += electron_positions_.capacity() * sizeof(double);
-    bytes += position_ready_.capacity() * sizeof(unsigned char);
-    bytes += sparseInputStorageBytes();
-    bytes += sign_.capacity() * sizeof(double);
-    bytes += logabs_.capacity() * sizeof(double);
-    bytes += value_.capacity() * sizeof(double);
-    bytes += parameter_version_.capacity() * sizeof(std::size_t);
-    bytes += pending_sign_.capacity() * sizeof(double);
-    bytes += pending_logabs_.capacity() * sizeof(double);
-    bytes += pending_value_.capacity() * sizeof(double);
-    bytes += pending_parameter_version_.capacity() * sizeof(std::size_t);
-    bytes += gradient_.capacity() * sizeof(double);
-    bytes += pending_gradient_.capacity() * sizeof(double);
-    bytes += lap_log_.capacity() * sizeof(double);
-    bytes += lap_ratio_.capacity() * sizeof(double);
-    bytes += pending_lap_log_.capacity() * sizeof(double);
-    bytes += pending_lap_ratio_.capacity() * sizeof(double);
-    return bytes;
+    const DirectBatchStorageRequirement storage = actualStorage();
+    return checkedStorageSum(
+        checkedStorageSum(storage.dense_logical, storage.sparse_logical,
+                          "PsiFormer logical storage bytes overflowed"),
+        storage.logical_outputs,
+        "PsiFormer logical storage bytes overflowed");
   }
 
   /// Return retained sparse logical input bytes, excluding results and tile scratch.
-  std::size_t sparseInputStorageBytes() const noexcept
+  std::size_t sparseInputStorageBytes() const
   {
     std::size_t bytes = 0;
-    bytes += reference_positions_.capacity() * sizeof(double);
-    bytes += reference_ready_.capacity() * sizeof(unsigned char);
-    bytes += replacement_references_.capacity() * sizeof(std::size_t);
-    bytes += replacement_electrons_.capacity() * sizeof(std::size_t);
-    bytes += replacement_positions_.capacity() * sizeof(double);
-    bytes += replacement_ready_.capacity() * sizeof(unsigned char);
+    auto add = [&bytes](std::size_t capacity, std::size_t element_bytes) {
+      addStorageBytes(bytes,
+                      checkedStorageProduct(
+                          capacity, element_bytes,
+                          "PsiFormer sparse storage bytes overflowed"),
+                      "PsiFormer sparse storage bytes overflowed");
+    };
+    add(reference_positions_.capacity(), sizeof(double));
+    add(reference_ready_.capacity(), sizeof(unsigned char));
+    add(replacement_references_.capacity(), sizeof(std::size_t));
+    add(replacement_electrons_.capacity(), sizeof(std::size_t));
+    add(replacement_positions_.capacity(), sizeof(double));
+    add(replacement_ready_.capacity(), sizeof(unsigned char));
     return bytes;
   }
 
   /// Return retained sparse tile-position bytes, bounded by the tile capacity.
-  std::size_t sparseTilePositionBytes() const noexcept
-  { return sparse_tile_positions_.capacity() * sizeof(double); }
+  std::size_t sparseTilePositionBytes() const
+  {
+    return checkedStorageBytes<double>(
+        sparse_tile_positions_.capacity(),
+        "PsiFormer sparse tile storage bytes overflowed");
+  }
+
+  /// Estimate the complete numeric high water for one proposed capacity plan.
+  DirectBatchStorageRequirement storageRequirement(
+      const DirectBatchCapacityPlan& plan) const
+  {
+    bool requires_growth = false;
+    DirectBatchStorageRequirement requirement =
+        prospectiveStorageRequirement(plan, requires_growth);
+    if (requires_growth)
+      requirement.replacement_transient = actualStorage().executionBytes();
+    return requirement;
+  }
+
+  /// Return exact categorized bytes retained by the current vector capacities.
+  DirectBatchStorageRequirement actualStorage() const
+  {
+    DirectBatchStorageRequirement storage;
+    auto add_capacity = [](std::size_t& category, std::size_t capacity,
+                           std::size_t element_bytes, const char* quantity) {
+      addStorageBytes(category,
+                      checkedStorageProduct(capacity, element_bytes, quantity),
+                      quantity);
+    };
+    add_capacity(storage.dense_logical, electron_positions_.capacity(),
+                 sizeof(double),
+                 "PsiFormer dense logical storage bytes overflowed");
+    add_capacity(storage.dense_logical, position_ready_.capacity(),
+                 sizeof(unsigned char),
+                 "PsiFormer dense logical storage bytes overflowed");
+    storage.sparse_logical = sparseInputStorageBytes();
+
+    for (const auto* buffer : {&sign_, &logabs_, &value_, &pending_sign_,
+                               &pending_logabs_, &pending_value_, &gradient_,
+                               &pending_gradient_, &lap_log_, &lap_ratio_,
+                               &pending_lap_log_, &pending_lap_ratio_})
+      add_capacity(storage.logical_outputs, buffer->capacity(), sizeof(double),
+                   "PsiFormer logical output storage bytes overflowed");
+    add_capacity(storage.logical_outputs, parameter_version_.capacity(),
+                 sizeof(std::size_t),
+                 "PsiFormer logical output storage bytes overflowed");
+    add_capacity(storage.logical_outputs,
+                 pending_parameter_version_.capacity(), sizeof(std::size_t),
+                 "PsiFormer logical output storage bytes overflowed");
+    storage.sparse_tile_positions = sparseTilePositionBytes();
+
+    for (const auto* buffer : {&raw_features_, &features_a_, &features_b_,
+                               &query_, &key_, &projected_value_, &attention_,
+                               &attended_, &hidden_, &spin_features_,
+                               &backflow_values_, &orbital_matrices_})
+      add_capacity(storage.value_tile, buffer->capacity(), sizeof(double),
+                   "PsiFormer value tile storage bytes overflowed");
+    for (const auto& geometry : value_geometries_)
+      addStorageBytes(storage.value_tile, geometry.storageBytes(),
+                      "PsiFormer value tile storage bytes overflowed");
+    for (const auto& determinant : determinant_workspaces_)
+      addStorageBytes(storage.value_tile, determinant->storageBytes(),
+                      "PsiFormer value tile storage bytes overflowed");
+    for (const auto& spatial : full_workspaces_)
+      addStorageBytes(storage.full_vgl_tile, spatial->vectorStorageBytes(),
+                      "PsiFormer full tile storage bytes overflowed");
+    for (const auto& spatial : active_workspaces_)
+      addStorageBytes(storage.active_gradient_tile,
+                      spatial->vectorStorageBytes(),
+                      "PsiFormer active tile storage bytes overflowed");
+    storage.shared_spatial_arena = spatialTileKernelBytes();
+    return storage;
+  }
 
   /// Return expensive numeric scratch retained at the tile high-water mark.
-  std::size_t tileScratchBytes() const noexcept
+  std::size_t tileScratchBytes() const
   {
-    std::size_t scalar_capacity = 0;
-    auto add = [&scalar_capacity](const std::vector<double>& buffer) {
-      scalar_capacity += buffer.capacity();
-    };
-    add(raw_features_);
-    add(features_a_);
-    add(features_b_);
-    add(query_);
-    add(key_);
-    add(projected_value_);
-    add(attention_);
-    add(attended_);
-    add(hidden_);
-    add(spin_features_);
-    add(backflow_values_);
-    add(orbital_matrices_);
-    add(sparse_tile_positions_);
-    add(spatial_dense_source_);
-    add(spatial_dense_target_);
-    std::size_t bytes = scalar_capacity * sizeof(double);
-    for (const auto& geometry : value_geometries_)
-      bytes += geometry.storageBytes();
-    for (const auto& determinant : determinant_workspaces_)
-      bytes += determinant->storageBytes();
-    for (const auto& spatial : full_workspaces_)
-      bytes += spatial->vectorStorageBytes();
-    for (const auto& spatial : active_workspaces_)
-      bytes += spatial->vectorStorageBytes();
+    const DirectBatchStorageRequirement storage = actualStorage();
+    std::size_t bytes = 0;
+    for (const std::size_t category : {
+             storage.sparse_tile_positions, storage.value_tile,
+             storage.full_vgl_tile, storage.active_gradient_tile,
+             storage.shared_spatial_arena})
+      addStorageBytes(bytes, category,
+                      "PsiFormer tile scratch storage bytes overflowed");
     return bytes;
   }
 
   /// Return the shared packed source/target storage used by spatial tile kernels.
-  std::size_t spatialTileKernelBytes() const noexcept
+  std::size_t spatialTileKernelBytes() const
   {
-    return (spatial_dense_source_.capacity() + spatial_dense_target_.capacity()) *
-        sizeof(double);
+    return checkedStorageBytes<double>(
+        checkedStorageSum(spatial_dense_source_.capacity(),
+                          spatial_dense_target_.capacity(),
+                          "PsiFormer spatial tile storage extent overflowed"),
+        "PsiFormer spatial tile storage bytes overflowed");
   }
 
-  std::size_t vectorStorageBytes() const noexcept
-  { return logicalStorageBytes() + tileScratchBytes(); }
+  std::size_t vectorStorageBytes() const
+  {
+    return actualStorage().executionBytes();
+  }
 
 private:
   friend class DirectBatchExecutor;
+  friend struct DirectBatchWorkspaceTestAccess;
 
   static std::size_t modeIndex(DirectBatchMode mode) noexcept
   {
@@ -563,11 +765,109 @@ private:
     return 0;
   }
 
+  /// Publish logical diagnostic high waters after every successful plan rebind.
+  void recordPlanLogicalHighWaters(const DirectBatchCapacityPlan& plan)
+  {
+    const std::size_t value_logical = std::max(
+        plan.logical.value_dense,
+        checkedStorageSum(plan.logical.sparse_references,
+                          plan.logical.sparse_replacements,
+                          "PsiFormer prepared sparse extent overflowed"));
+    mode_capacity_[modeIndex(DirectBatchMode::VALUE_ONLY)] = std::max(
+        mode_capacity_[modeIndex(DirectBatchMode::VALUE_ONLY)], value_logical);
+    mode_capacity_[modeIndex(DirectBatchMode::FULL_VGL)] = std::max(
+        mode_capacity_[modeIndex(DirectBatchMode::FULL_VGL)],
+        plan.logical.full_vgl);
+    mode_capacity_[modeIndex(DirectBatchMode::ACTIVE_ELECTRON_GRADIENT)] =
+        std::max(mode_capacity_[modeIndex(
+                     DirectBatchMode::ACTIVE_ELECTRON_GRADIENT)],
+                 plan.logical.active_gradient);
+  }
+
+  /// Return one admitted tile bound from the immutable published plan.
+  std::size_t admittedTileCapacity(DirectBatchMode mode) const noexcept
+  {
+    if (!bound_capacity_plan_)
+      return std::numeric_limits<std::size_t>::max();
+    switch (mode)
+    {
+    case DirectBatchMode::VALUE_ONLY:
+      return bound_capacity_plan_->tile.value;
+    case DirectBatchMode::FULL_VGL:
+      return bound_capacity_plan_->tile.full_vgl;
+    case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      return bound_capacity_plan_->tile.active_gradient;
+    }
+    return 0;
+  }
+
+  /// Reject a compatibility tile update before it can grow or alter selected state.
+  void requireTileWithinBound(DirectBatchMode mode, std::size_t capacity) const
+  {
+    if (!bound_capacity_plan_ || capacity == admittedTileCapacity(mode))
+      return;
+    if (capacity > admittedTileCapacity(mode))
+      throw std::length_error(
+          "PsiFormer batch tile capacity exceeds the bound memory plan");
+    throw std::logic_error(
+        "PsiFormer bound tile capacities change only through an idle replan");
+  }
+
+  /// Reject a dense logical request beyond its mode-specific admitted high water.
+  void requireDenseLogicalWithinBound(DirectBatchMode mode,
+                                      std::size_t size) const
+  {
+    if (!bound_capacity_plan_)
+      return;
+    std::size_t admitted = 0;
+    switch (mode)
+    {
+    case DirectBatchMode::VALUE_ONLY:
+      admitted = bound_capacity_plan_->logical.value_dense;
+      break;
+    case DirectBatchMode::FULL_VGL:
+      admitted = bound_capacity_plan_->logical.full_vgl;
+      break;
+    case DirectBatchMode::ACTIVE_ELECTRON_GRADIENT:
+      admitted = bound_capacity_plan_->logical.active_gradient;
+      break;
+    }
+    if (size > admitted)
+      throw std::length_error(
+          "PsiFormer dense batch exceeds the bound logical capacity");
+  }
+
+  /// Reject sparse reference or replacement growth beyond either admitted bound.
+  void requireSparseLogicalWithinBound(std::size_t references,
+                                       std::size_t replacements) const
+  {
+    if (bound_capacity_plan_ &&
+        (references > bound_capacity_plan_->logical.sparse_references ||
+         replacements > bound_capacity_plan_->logical.sparse_replacements))
+      throw std::length_error(
+          "PsiFormer sparse batch exceeds the bound logical capacity");
+  }
+
   template<class T>
   static void growVector(std::vector<T>& buffer, std::size_t required_size)
   {
-    if (buffer.size() < required_size)
+    if (buffer.size() >= required_size)
+      return;
+    if (buffer.capacity() >= required_size)
+    {
       buffer.resize(required_size);
+      return;
+    }
+
+    // Construct the replacement before publishing it so allocation failure leaves
+    // the old transaction intact.  Exact capacity makes the checked byte descriptor
+    // a hard upper bound rather than an assumption about vector growth heuristics.
+    std::vector<T> replacement(required_size);
+    if (replacement.capacity() != required_size)
+      throw std::length_error(
+          "PsiFormer standard-library vector over-allocated planned storage");
+    std::copy(buffer.begin(), buffer.end(), replacement.begin());
+    buffer.swap(replacement);
   }
 
   template<class Workspace, class Factory>
@@ -673,7 +973,11 @@ private:
         : 3;
     const std::size_t laplacian_lanes =
         mode == DirectSpatialMode::FULL_VGL ? electron_count_ : 0;
-    const std::size_t planes = 1 + gradient_lanes + laplacian_lanes;
+    const std::size_t planes = batch::checkedSum(
+        1,
+        batch::checkedSum(gradient_lanes, laplacian_lanes,
+                          "PsiFormer spatial tile plane extent overflowed"),
+        "PsiFormer spatial tile plane extent overflowed");
     const std::size_t orbital_channels = batch::checkedProduct(
         layout.determinantCount(), electron_count_,
         "PsiFormer spatial tile orbital extent overflowed");
@@ -740,6 +1044,384 @@ private:
 
     return {raw_elements, feature_elements, attention_elements,
             backflow_elements, orbital_elements};
+  }
+
+  /** Project retained storage after a replan by folding every owned buffer separately.
+   *
+   * Per-buffer maxima are essential: aggregate category maxima would lose crossed
+   * high waters such as retained FULL_VGL gradients plus newly enlarged VALUE
+   * outputs, or reference-heavy sparse input followed by replacement-heavy input.
+   */
+  DirectBatchStorageRequirement prospectiveStorageRequirement(
+      const DirectBatchCapacityPlan& plan,
+      bool& requires_growth) const
+  {
+    const auto& layout = *value_executor_->layout();
+    const PsiFormerStorageShape shape{layout.electronCount(),
+                                      layout.nucleusCount(),
+                                      layout.determinantCount(),
+                                      layout.featureWidth(),
+                                      layout.headCount(),
+                                      layout.inputWidth(),
+                                      0,
+                                      layout.parameterCount()};
+    // Validate every requested product and the zero-tile contract before examining
+    // or changing retained storage.
+    (void)directBatchStorageRequirement(shape, plan);
+
+    DirectBatchStorageRequirement result;
+    requires_growth = false;
+    auto add_capacity = [&requires_growth](std::size_t& category,
+                                           std::size_t retained,
+                                           std::size_t requested,
+                                           std::size_t element_bytes,
+                                           const char* quantity) {
+      requires_growth = requires_growth || requested > retained;
+      addStorageBytes(category,
+                      checkedStorageProduct(std::max(retained, requested),
+                                            element_bytes, quantity),
+                      quantity);
+    };
+
+    const std::size_t sparse_size = checkedStorageSum(
+        plan.logical.sparse_references, plan.logical.sparse_replacements,
+        "PsiFormer prospective sparse extent overflowed");
+    const std::size_t value_logical = std::max(plan.logical.value_dense,
+                                               sparse_size);
+    const std::size_t dense_logical = std::max(
+        {plan.logical.value_dense, plan.logical.full_vgl,
+         plan.logical.active_gradient});
+    const std::size_t maximum_logical = std::max(
+        {value_logical, plan.logical.full_vgl,
+         plan.logical.active_gradient});
+    const std::size_t dense_positions = checkedStorageProduct(
+        checkedStorageProduct(dense_logical, electron_count_,
+                              "PsiFormer prospective dense extent overflowed"),
+        3, "PsiFormer prospective dense extent overflowed");
+    add_capacity(result.dense_logical, electron_positions_.capacity(),
+                 dense_positions, sizeof(double),
+                 "PsiFormer prospective dense bytes overflowed");
+    add_capacity(result.dense_logical, position_ready_.capacity(),
+                 dense_positions, sizeof(unsigned char),
+                 "PsiFormer prospective dense bytes overflowed");
+
+    const std::size_t reference_positions = checkedStorageProduct(
+        checkedStorageProduct(plan.logical.sparse_references, electron_count_,
+                              "PsiFormer prospective reference extent overflowed"),
+        3, "PsiFormer prospective reference extent overflowed");
+    const std::size_t replacement_positions = checkedStorageProduct(
+        plan.logical.sparse_replacements, 3,
+        "PsiFormer prospective replacement extent overflowed");
+    add_capacity(result.sparse_logical, reference_positions_.capacity(),
+                 reference_positions, sizeof(double),
+                 "PsiFormer prospective sparse bytes overflowed");
+    add_capacity(result.sparse_logical, reference_ready_.capacity(),
+                 reference_positions, sizeof(unsigned char),
+                 "PsiFormer prospective sparse bytes overflowed");
+    add_capacity(result.sparse_logical, replacement_references_.capacity(),
+                 plan.logical.sparse_replacements, sizeof(std::size_t),
+                 "PsiFormer prospective sparse bytes overflowed");
+    add_capacity(result.sparse_logical, replacement_electrons_.capacity(),
+                 plan.logical.sparse_replacements, sizeof(std::size_t),
+                 "PsiFormer prospective sparse bytes overflowed");
+    add_capacity(result.sparse_logical, replacement_positions_.capacity(),
+                 replacement_positions, sizeof(double),
+                 "PsiFormer prospective sparse bytes overflowed");
+    add_capacity(result.sparse_logical, replacement_ready_.capacity(),
+                 plan.logical.sparse_replacements, sizeof(unsigned char),
+                 "PsiFormer prospective sparse bytes overflowed");
+
+    for (const auto* buffer : {&sign_, &logabs_, &value_, &pending_sign_,
+                               &pending_logabs_, &pending_value_})
+      add_capacity(result.logical_outputs, buffer->capacity(), maximum_logical,
+                   sizeof(double),
+                   "PsiFormer prospective value output bytes overflowed");
+    add_capacity(result.logical_outputs, parameter_version_.capacity(),
+                 maximum_logical, sizeof(std::size_t),
+                 "PsiFormer prospective version output bytes overflowed");
+    add_capacity(result.logical_outputs,
+                 pending_parameter_version_.capacity(), maximum_logical,
+                 sizeof(std::size_t),
+                 "PsiFormer prospective version output bytes overflowed");
+    const std::size_t gradient_count = std::max(
+        checkedStorageProduct(
+            checkedStorageProduct(plan.logical.full_vgl, electron_count_,
+                                  "PsiFormer prospective full gradient overflowed"),
+            3, "PsiFormer prospective full gradient overflowed"),
+        checkedStorageProduct(plan.logical.active_gradient, 3,
+                              "PsiFormer prospective active gradient overflowed"));
+    for (const auto* buffer : {&gradient_, &pending_gradient_})
+      add_capacity(result.logical_outputs, buffer->capacity(), gradient_count,
+                   sizeof(double),
+                   "PsiFormer prospective gradient output bytes overflowed");
+    const std::size_t laplacian_count = checkedStorageProduct(
+        plan.logical.full_vgl, electron_count_,
+        "PsiFormer prospective Laplacian extent overflowed");
+    for (const auto* buffer : {&lap_log_, &lap_ratio_, &pending_lap_log_,
+                               &pending_lap_ratio_})
+      add_capacity(result.logical_outputs, buffer->capacity(), laplacian_count,
+                   sizeof(double),
+                   "PsiFormer prospective Laplacian output bytes overflowed");
+
+    const std::size_t value_tile = std::min(plan.tile.value, value_logical);
+    const std::size_t full_tile = std::min(plan.tile.full_vgl,
+                                           plan.logical.full_vgl);
+    const std::size_t active_tile = std::min(plan.tile.active_gradient,
+                                             plan.logical.active_gradient);
+    const std::size_t sparse_tile_positions = sparse_size == 0
+        ? 0
+        : sparseTilePositionElements(value_tile);
+    add_capacity(result.sparse_tile_positions,
+                 sparse_tile_positions_.capacity(), sparse_tile_positions,
+                 sizeof(double),
+                 "PsiFormer prospective sparse tile bytes overflowed");
+
+    const ValueScratchExtents value_extents = valueScratchExtents(value_tile);
+    add_capacity(result.value_tile, raw_features_.capacity(), value_extents.raw,
+                 sizeof(double),
+                 "PsiFormer prospective value tile bytes overflowed");
+    for (const auto* buffer : {&features_a_, &features_b_, &query_, &key_,
+                               &projected_value_, &attended_, &hidden_,
+                               &spin_features_})
+      add_capacity(result.value_tile, buffer->capacity(), value_extents.feature,
+                   sizeof(double),
+                   "PsiFormer prospective value tile bytes overflowed");
+    add_capacity(result.value_tile, attention_.capacity(),
+                 value_extents.attention, sizeof(double),
+                 "PsiFormer prospective value tile bytes overflowed");
+    add_capacity(result.value_tile, backflow_values_.capacity(),
+                 value_extents.backflow, sizeof(double),
+                 "PsiFormer prospective value tile bytes overflowed");
+    add_capacity(result.value_tile, orbital_matrices_.capacity(),
+                 value_extents.orbital, sizeof(double),
+                 "PsiFormer prospective value tile bytes overflowed");
+
+    for (const auto& geometry : value_geometries_)
+      addStorageBytes(result.value_tile, geometry.storageBytes(),
+                      "PsiFormer prospective value geometry bytes overflowed");
+    if (value_tile > value_geometries_.size())
+    {
+      requires_growth = true;
+      addStorageBytes(
+          result.value_tile,
+          checkedStorageProduct(
+              value_tile - value_geometries_.size(),
+              geometryStorageRequirement(shape.electrons, shape.nuclei),
+              "PsiFormer prospective value geometry bytes overflowed"),
+          "PsiFormer prospective value tile bytes overflowed");
+    }
+    for (const auto& determinant : determinant_workspaces_)
+      addStorageBytes(result.value_tile, determinant->storageBytes(),
+                      "PsiFormer prospective determinant bytes overflowed");
+    if (value_tile > determinant_workspaces_.size())
+    {
+      requires_growth = true;
+      addStorageBytes(
+          result.value_tile,
+          checkedStorageProduct(
+              value_tile - determinant_workspaces_.size(),
+              determinantStorageRequirement(shape.determinants,
+                                            shape.electrons),
+              "PsiFormer prospective determinant bytes overflowed"),
+          "PsiFormer prospective value tile bytes overflowed");
+    }
+
+    for (const auto& workspace : full_workspaces_)
+      addStorageBytes(result.full_vgl_tile, workspace->vectorStorageBytes(),
+                      "PsiFormer prospective full tile bytes overflowed");
+    if (full_tile > full_workspaces_.size())
+    {
+      requires_growth = true;
+      addStorageBytes(
+          result.full_vgl_tile,
+          checkedStorageProduct(
+              full_tile - full_workspaces_.size(),
+              spatialWorkspaceStorageRequirement(shape, true),
+              "PsiFormer prospective full tile bytes overflowed"),
+          "PsiFormer prospective full tile bytes overflowed");
+    }
+    for (const auto& workspace : active_workspaces_)
+      addStorageBytes(result.active_gradient_tile,
+                      workspace->vectorStorageBytes(),
+                      "PsiFormer prospective active tile bytes overflowed");
+    if (active_tile > active_workspaces_.size())
+    {
+      requires_growth = true;
+      addStorageBytes(
+          result.active_gradient_tile,
+          checkedStorageProduct(
+              active_tile - active_workspaces_.size(),
+              spatialWorkspaceStorageRequirement(shape, false),
+              "PsiFormer prospective active tile bytes overflowed"),
+          "PsiFormer prospective active tile bytes overflowed");
+    }
+
+    const std::size_t packed_elements = std::max(
+        spatialDenseScratchElements(full_tile, DirectSpatialMode::FULL_VGL),
+        spatialDenseScratchElements(
+            active_tile, DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT));
+    add_capacity(result.shared_spatial_arena,
+                 spatial_dense_source_.capacity(), packed_elements,
+                 sizeof(double),
+                 "PsiFormer prospective spatial arena bytes overflowed");
+    add_capacity(result.shared_spatial_arena,
+                 spatial_dense_target_.capacity(), packed_elements,
+                 sizeof(double),
+                 "PsiFormer prospective spatial arena bytes overflowed");
+    return result;
+  }
+
+  /// Compare every retained execution category while ignoring setup transients.
+  static bool sameExecutionStorage(const DirectBatchStorageRequirement& left,
+                                   const DirectBatchStorageRequirement& right) noexcept
+  {
+    return left.dense_logical == right.dense_logical &&
+        left.sparse_logical == right.sparse_logical &&
+        left.logical_outputs == right.logical_outputs &&
+        left.sparse_tile_positions == right.sparse_tile_positions &&
+        left.value_tile == right.value_tile &&
+        left.full_vgl_tile == right.full_vgl_tile &&
+        left.active_gradient_tile == right.active_gradient_tile &&
+        left.shared_spatial_arena == right.shared_spatial_arena;
+  }
+
+  /** Build exact prospective high waters in an otherwise empty staging workspace.
+   * Every target is the per-buffer maximum used by prospectiveStorageRequirement;
+   * final category equality is checked before the caller publishes this object.
+   */
+  void prepareReplacementFrom(const DirectBatchWorkspace& retained,
+                              const DirectBatchCapacityPlan& plan)
+  {
+    const std::size_t sparse_size = checkedStorageSum(
+        plan.logical.sparse_references, plan.logical.sparse_replacements,
+        "PsiFormer staged sparse extent overflowed");
+    const std::size_t value_logical = std::max(plan.logical.value_dense,
+                                               sparse_size);
+    const std::size_t dense_logical = std::max(
+        {plan.logical.value_dense, plan.logical.full_vgl,
+         plan.logical.active_gradient});
+    const std::size_t maximum_logical = std::max(
+        {value_logical, plan.logical.full_vgl,
+         plan.logical.active_gradient});
+    const std::size_t dense_positions = checkedStorageProduct(
+        checkedStorageProduct(dense_logical, electron_count_,
+                              "PsiFormer staged dense extent overflowed"),
+        3, "PsiFormer staged dense extent overflowed");
+    const std::size_t reference_positions = checkedStorageProduct(
+        checkedStorageProduct(plan.logical.sparse_references, electron_count_,
+                              "PsiFormer staged reference extent overflowed"),
+        3, "PsiFormer staged reference extent overflowed");
+    const std::size_t replacement_positions = checkedStorageProduct(
+        plan.logical.sparse_replacements, 3,
+        "PsiFormer staged replacement extent overflowed");
+    const std::size_t gradient_count = std::max(
+        checkedStorageProduct(
+            checkedStorageProduct(plan.logical.full_vgl, electron_count_,
+                                  "PsiFormer staged full gradient overflowed"),
+            3, "PsiFormer staged full gradient overflowed"),
+        checkedStorageProduct(plan.logical.active_gradient, 3,
+                              "PsiFormer staged active gradient overflowed"));
+    const std::size_t laplacian_count = checkedStorageProduct(
+        plan.logical.full_vgl, electron_count_,
+        "PsiFormer staged Laplacian extent overflowed");
+    const std::size_t value_tile = std::min(plan.tile.value, value_logical);
+    const std::size_t full_tile = std::min(plan.tile.full_vgl,
+                                           plan.logical.full_vgl);
+    const std::size_t active_tile = std::min(plan.tile.active_gradient,
+                                             plan.logical.active_gradient);
+
+    validateScratchExtents(DirectBatchMode::VALUE_ONLY,
+                           std::max(value_tile,
+                                    retained.value_tile_capacity_));
+    validateScratchExtents(DirectBatchMode::FULL_VGL,
+                           std::max(full_tile,
+                                    retained.full_workspaces_.size()));
+    validateScratchExtents(
+        DirectBatchMode::ACTIVE_ELECTRON_GRADIENT,
+        std::max(active_tile, retained.active_workspaces_.size()));
+
+    growVector(electron_positions_,
+               std::max(dense_positions,
+                        retained.electron_positions_.capacity()));
+    growVector(position_ready_,
+               std::max(dense_positions, retained.position_ready_.capacity()));
+    growVector(reference_positions_,
+               std::max(reference_positions,
+                        retained.reference_positions_.capacity()));
+    growVector(reference_ready_,
+               std::max(reference_positions,
+                        retained.reference_ready_.capacity()));
+    growVector(replacement_references_,
+               std::max(plan.logical.sparse_replacements,
+                        retained.replacement_references_.capacity()));
+    growVector(replacement_electrons_,
+               std::max(plan.logical.sparse_replacements,
+                        retained.replacement_electrons_.capacity()));
+    growVector(replacement_positions_,
+               std::max(replacement_positions,
+                        retained.replacement_positions_.capacity()));
+    growVector(replacement_ready_,
+               std::max(plan.logical.sparse_replacements,
+                        retained.replacement_ready_.capacity()));
+
+    for (std::size_t index = 0; index < 6; ++index)
+    {
+      std::vector<double>* target_buffers[]{&sign_, &logabs_, &value_,
+                                             &pending_sign_, &pending_logabs_,
+                                             &pending_value_};
+      const std::vector<double>* retained_buffers[]{
+          &retained.sign_, &retained.logabs_, &retained.value_,
+          &retained.pending_sign_, &retained.pending_logabs_,
+          &retained.pending_value_};
+      growVector(*target_buffers[index],
+                 std::max(maximum_logical,
+                          retained_buffers[index]->capacity()));
+    }
+    growVector(parameter_version_,
+               std::max(maximum_logical,
+                        retained.parameter_version_.capacity()));
+    growVector(pending_parameter_version_,
+               std::max(maximum_logical,
+                        retained.pending_parameter_version_.capacity()));
+    growVector(gradient_,
+               std::max(gradient_count, retained.gradient_.capacity()));
+    growVector(pending_gradient_,
+               std::max(gradient_count,
+                        retained.pending_gradient_.capacity()));
+    growVector(lap_log_,
+               std::max(laplacian_count, retained.lap_log_.capacity()));
+    growVector(lap_ratio_,
+               std::max(laplacian_count, retained.lap_ratio_.capacity()));
+    growVector(pending_lap_log_,
+               std::max(laplacian_count,
+                        retained.pending_lap_log_.capacity()));
+    growVector(pending_lap_ratio_,
+               std::max(laplacian_count,
+                        retained.pending_lap_ratio_.capacity()));
+
+    const std::size_t retained_value_tile = retained.value_tile_capacity_;
+    const std::size_t retained_full_tile = retained.full_workspaces_.size();
+    const std::size_t retained_active_tile = retained.active_workspaces_.size();
+    growValueScratch(std::max(value_tile, retained_value_tile));
+    prepareScratch(DirectBatchMode::FULL_VGL,
+                   std::max(full_tile, retained_full_tile));
+    prepareScratch(DirectBatchMode::ACTIVE_ELECTRON_GRADIENT,
+                   std::max(active_tile, retained_active_tile));
+    const std::size_t requested_sparse_tile = sparse_size == 0
+        ? 0
+        : sparseTilePositionElements(value_tile);
+    growVector(sparse_tile_positions_,
+               std::max(requested_sparse_tile,
+                        retained.sparse_tile_positions_.capacity()));
+    growVector(spatial_dense_source_,
+               std::max(spatial_dense_source_.capacity(),
+                        retained.spatial_dense_source_.capacity()));
+    growVector(spatial_dense_target_,
+               std::max(spatial_dense_target_.capacity(),
+                        retained.spatial_dense_target_.capacity()));
+
+    mode_capacity_ = retained.mode_capacity_;
+    recordPlanLogicalHighWaters(plan);
   }
 
   /// Grow every value-only tile buffer after all element-count products are checked.
@@ -864,7 +1546,9 @@ private:
 
   const DirectValueExecutor* value_executor_;
   const DirectSpatialExecutor* spatial_executor_;
-  const std::size_t electron_count_;
+  // Logically fixed by the two executors.  This is assignable only so a completely
+  // prepared staging workspace can be published with one noexcept move assignment.
+  std::size_t electron_count_;
   DirectBatchMode active_mode_ = DirectBatchMode::VALUE_ONLY;
   DirectBatchValueInput active_value_input_ =
       DirectBatchValueInput::DENSE_CONFIGURATIONS;
@@ -872,7 +1556,9 @@ private:
   std::size_t active_reference_count_ = 0;
   std::size_t active_replacement_count_ = 0;
   std::size_t active_dense_coordinate_bytes_avoided_ = 0;
-  std::size_t tile_capacity_ = default_tile_capacity;
+  DirectBatchTileCapacities tile_capacities_{};
+  std::optional<DirectBatchCapacityPlan> bound_capacity_plan_;
+  bool fail_preparation_before_publish_for_testing_ = false;
   std::size_t value_tile_capacity_ = 0;
   std::array<std::size_t, 3> mode_capacity_{};
   DirectBatchExecutionStatistics statistics_{};
@@ -964,7 +1650,8 @@ public:
     }
     const std::size_t parameter_version = value_executor_.parameters_.version();
     const double* parameters = value_executor_.parameters_.flat_values().data();
-    const std::size_t tile_limit = workspace.tile_capacity_;
+    const std::size_t tile_limit =
+        workspace.tileCapacity(DirectBatchMode::VALUE_ONLY);
     for (std::size_t tile_begin = 0; tile_begin < workspace.active_size_;
          tile_begin += tile_limit)
     {
@@ -1634,7 +2321,11 @@ private:
         spatialWorkspaces(workspace, mode);
 
     DirectBatchExecutionStatistics statistics;
-    const std::size_t tile_limit = workspace.tile_capacity_;
+    const DirectBatchMode batch_mode =
+        mode == DirectSpatialMode::FULL_VGL
+        ? DirectBatchMode::FULL_VGL
+        : DirectBatchMode::ACTIVE_ELECTRON_GRADIENT;
+    const std::size_t tile_limit = workspace.tileCapacity(batch_mode);
     for (std::size_t tile_begin = 0; tile_begin < workspace.active_size_;
          tile_begin += tile_limit)
     {

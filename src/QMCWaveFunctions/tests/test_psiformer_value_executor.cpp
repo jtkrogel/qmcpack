@@ -75,6 +75,8 @@ void validateDirectValue(const std::string& system,
   const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
   pf::DirectValueExecutor executor(model, plan);
   std::unique_ptr<pf::DirectValueWorkspace> workspace = executor.makeWorkspace();
+  CHECK(workspace->geometryStorageBytes() > 0);
+  CHECK(workspace->vectorStorageBytes() == workspace->requiredStorageBytes());
   const pf::Tensor electrons = model.cfg.configuration(0);
   workspace->setPositions(pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
 

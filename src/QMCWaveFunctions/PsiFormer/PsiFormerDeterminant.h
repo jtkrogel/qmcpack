@@ -535,19 +535,39 @@ public:
   }
 
   /// Bytes reserved by explicit determinant workspace vectors.
-  std::size_t storageBytes() const noexcept
+  std::size_t storageBytes() const
   {
-    return lu_.capacity() * sizeof(double) + inverses_.capacity() * sizeof(double) +
-        permutations_.capacity() * sizeof(std::size_t) +
-        factorization_.capacity() * sizeof(ChannelFactorization) +
-        coefficient_.capacity() * sizeof(double) + term_phase_.capacity() * sizeof(double) +
-        term_log_abs_.capacity() * sizeof(double) + scaled_terms_.capacity() * sizeof(long double) +
-        solve_.capacity() * sizeof(double) + matrix_product_.capacity() * sizeof(long double) +
-        gradient_sums_.capacity() * sizeof(detail::CompensatedSum) +
-        laplacian_sums_.capacity() * sizeof(detail::CompensatedSum);
+    std::size_t bytes = 0;
+    auto add = [&bytes](const auto& buffer) {
+      using Element = typename std::decay_t<decltype(buffer)>::value_type;
+      bytes = checkedSum(
+          bytes,
+          checkedProduct(buffer.capacity(), sizeof(Element)));
+    };
+    add(lu_);
+    add(inverses_);
+    add(permutations_);
+    add(factorization_);
+    add(coefficient_);
+    add(term_phase_);
+    add(term_log_abs_);
+    add(scaled_terms_);
+    add(solve_);
+    add(matrix_product_);
+    add(gradient_sums_);
+    add(laplacian_sums_);
+    return bytes;
   }
 
 private:
+  /// Add storage contributions while rejecting size_t wraparound.
+  static std::size_t checkedSum(std::size_t left, std::size_t right)
+  {
+    if (right > std::numeric_limits<std::size_t>::max() - left)
+      throw std::overflow_error("PsiFormer determinant storage byte extent overflow");
+    return left + right;
+  }
+
   /// Square an extent with an explicit size_t overflow check.
   static std::size_t checkedSquare(std::size_t value)
   {

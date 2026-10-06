@@ -154,7 +154,7 @@ public:
   std::size_t storageFingerprint() const noexcept;
 
   /// Return bytes reserved by all pair-table vectors.
-  std::size_t storageBytes() const noexcept;
+  std::size_t storageBytes() const;
 
 private:
   friend class PsiFormerGeometryCache;
@@ -242,7 +242,7 @@ public:
   std::size_t storageFingerprint() const noexcept;
 
   /// Return bytes reserved by all geometry-owned vectors and pair tables.
-  std::size_t storageBytes() const noexcept;
+  std::size_t storageBytes() const;
 
   /// Return the regular electron-nucleus flat index for one particle pair.
   std::size_t electronNucleusPairIndex(std::size_t electron, std::size_t nucleus) const;

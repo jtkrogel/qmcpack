@@ -29,6 +29,21 @@ std::size_t checkedProduct(std::size_t left, std::size_t right)
   return left * right;
 }
 
+/// Reject byte-accounting sums whose addition would overflow size_t.
+std::size_t checkedSum(std::size_t left, std::size_t right)
+{
+  if (right > std::numeric_limits<std::size_t>::max() - left)
+    throw std::length_error("PsiFormer geometry storage bytes overflow size_t");
+  return left + right;
+}
+
+/// Convert a vector capacity to bytes with checked arithmetic.
+template<class T>
+std::size_t checkedCapacityBytes(const std::vector<T>& values)
+{
+  return checkedProduct(values.capacity(), sizeof(T));
+}
+
 /// Return n*(n-1)/2 without overflowing the intermediate product.
 std::size_t checkedUniquePairCount(std::size_t particle_count)
 {
@@ -190,12 +205,15 @@ std::size_t GeometryPairTable::storageFingerprint() const noexcept
   return hash;
 }
 
-std::size_t GeometryPairTable::storageBytes() const noexcept
+std::size_t GeometryPairTable::storageBytes() const
 {
-  return displacements_.capacity() * sizeof(GeometryPosition) +
-      distances_.capacity() * sizeof(GeometryReal) +
-      inverse_distances_.capacity() * sizeof(GeometryReal) +
-      softened_radial_factors_.capacity() * sizeof(SoftenedRadialFactors);
+  std::size_t bytes = 0;
+  for (const std::size_t contribution : {
+           checkedCapacityBytes(displacements_), checkedCapacityBytes(distances_),
+           checkedCapacityBytes(inverse_distances_),
+           checkedCapacityBytes(softened_radial_factors_)})
+    bytes = checkedSum(bytes, contribution);
+  return bytes;
 }
 
 void GeometryPairTable::updatePair(std::size_t pair_index, const GeometryPosition& displacement)
@@ -257,15 +275,18 @@ std::size_t PsiFormerGeometryCache::storageFingerprint() const noexcept
   return hash;
 }
 
-std::size_t PsiFormerGeometryCache::storageBytes() const noexcept
+std::size_t PsiFormerGeometryCache::storageBytes() const
 {
-  return nuclei_.capacity() * sizeof(GeometryPosition) +
-      electrons_.capacity() * sizeof(GeometryPosition) +
-      electron_pairs_.capacity() * sizeof(ElectronPair) +
-      incidence_offsets_.capacity() * sizeof(std::size_t) +
-      incidences_.capacity() * sizeof(ElectronPairIncidence) +
-      electron_nucleus_pairs_.storageBytes() +
-      electron_electron_pairs_.storageBytes();
+  std::size_t bytes = 0;
+  for (const std::size_t contribution : {
+           checkedCapacityBytes(nuclei_), checkedCapacityBytes(electrons_),
+           checkedCapacityBytes(electron_pairs_),
+           checkedCapacityBytes(incidence_offsets_),
+           checkedCapacityBytes(incidences_),
+           electron_nucleus_pairs_.storageBytes(),
+           electron_electron_pairs_.storageBytes()})
+    bytes = checkedSum(bytes, contribution);
+  return bytes;
 }
 
 std::size_t PsiFormerGeometryCache::electronNucleusPairIndex(std::size_t electron, std::size_t nucleus) const

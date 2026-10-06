@@ -129,6 +129,8 @@ void validateScore(const std::string& system, const ScoreGolden& golden)
   const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
   pf::DirectScoreExecutor executor(model, plan);
   std::unique_ptr<pf::DirectScoreWorkspace> workspace = executor.makeWorkspace();
+  CHECK(workspace->geometryStorageBytes() > 0);
+  CHECK(workspace->vectorStorageBytes() == workspace->requiredStorageBytes());
   const pf::Tensor electrons = model.cfg.configuration(0);
   workspace->setPositions(pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
 

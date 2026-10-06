@@ -42,6 +42,7 @@
 
 #include "PsiFormerDenseKernels.h"
 #include "PsiFormerDeterminant.h"
+#include "PsiFormerStorageRequirements.h"
 
 #include <algorithm>
 #include <cmath>
@@ -337,13 +338,17 @@ public:
     return hash;
   }
 
-  /// Bytes reserved by explicit tape/factor/output vectors (geometry excluded).
-  std::size_t vectorStorageBytes() const noexcept
+  /// Bytes reserved by the complete tape, geometry, and determinant workspace.
+  std::size_t vectorStorageBytes() const
   {
     std::size_t bytes = 0;
     auto add = [&bytes](const auto& buffer) {
       using Element = typename std::decay_t<decltype(buffer)>::value_type;
-      bytes += buffer.capacity() * sizeof(Element);
+      addStorageBytes(bytes,
+                      checkedStorageBytes<Element>(
+                          buffer.capacity(),
+                          "PsiFormer kinetic storage bytes overflowed"),
+                      "PsiFormer kinetic storage bytes overflowed");
     };
     auto add_jet = [&add](const DirectTraceJetBuffer& jet) {
       add(jet.value);
@@ -388,7 +393,23 @@ public:
                                &parameter_score_, &kinetic_parameter_response_,
                                &matrix_scratch_a_, &matrix_scratch_b_, &matrix_scratch_c_})
       add(*buffer);
-    return bytes + determinant_.storageBytes();
+    addStorageBytes(bytes, geometry_.storageBytes(),
+                    "PsiFormer kinetic storage bytes overflowed");
+    addStorageBytes(bytes, determinant_.storageBytes(),
+                    "PsiFormer kinetic storage bytes overflowed");
+    return bytes;
+  }
+
+  /// Expose the geometry contribution for focused inclusive-accounting tests.
+  std::size_t geometryStorageBytes() const
+  { return geometry_.storageBytes(); }
+
+  /// Return the checked constructor-time requirement for this fixed model shape.
+  std::size_t requiredStorageBytes() const
+  {
+    return kineticWorkspaceStorageRequirement(
+        {electrons_, nuclei_, determinants_, width_, heads_, input_width_,
+         blocks_, parameter_score_.size()});
   }
 
 private:

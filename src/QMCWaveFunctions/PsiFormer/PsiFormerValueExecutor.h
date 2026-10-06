@@ -40,6 +40,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDenseKernels.h"
 #include "PsiFormerDeterminant.h"
+#include "PsiFormerStorageRequirements.h"
 
 #include <algorithm>
 #include <array>
@@ -278,12 +279,16 @@ public:
     return hash;
   }
 
-  /// Return bytes reserved by explicit numeric workspace buffers.
-  std::size_t vectorStorageBytes() const noexcept
+  /// Return bytes reserved by all numeric buffers, including geometry and determinants.
+  std::size_t vectorStorageBytes() const
   {
-    std::size_t scalar_capacity = 0;
-    auto add = [&scalar_capacity](const std::vector<double>& buffer) {
-      scalar_capacity += buffer.capacity();
+    std::size_t bytes = 0;
+    auto add = [&bytes](const std::vector<double>& buffer) {
+      addStorageBytes(bytes,
+                      checkedStorageBytes<double>(
+                          buffer.capacity(),
+                          "PsiFormer value storage bytes overflowed"),
+                      "PsiFormer value storage bytes overflowed");
     };
     add(electron_positions_);
     add(raw_features_);
@@ -296,7 +301,28 @@ public:
     add(attended_);
     add(hidden_);
     add(orbital_matrices_);
-    return scalar_capacity * sizeof(double) + determinant_workspace_.storageBytes();
+    addStorageBytes(bytes, geometry_.storageBytes(),
+                    "PsiFormer value storage bytes overflowed");
+    addStorageBytes(bytes, determinant_workspace_.storageBytes(),
+                    "PsiFormer value storage bytes overflowed");
+    return bytes;
+  }
+
+  /// Expose the geometry contribution for focused inclusive-accounting tests.
+  std::size_t geometryStorageBytes() const
+  { return geometry_.storageBytes(); }
+
+  /// Return the checked constructor-time requirement for this fixed model shape.
+  std::size_t requiredStorageBytes() const
+  {
+    const std::size_t electrons = geometry_.electronCount();
+    const std::size_t electron_square = checkedStorageProduct(
+        electrons, electrons, "PsiFormer value shape overflowed");
+    return valueWorkspaceStorageRequirement(
+        {electrons, geometry_.nucleusCount(), determinant_workspace_.channels(),
+         features_a_.size() / electrons,
+         attention_.size() / electron_square,
+         raw_features_.size() / electrons, 0, 0});
   }
 
 private:

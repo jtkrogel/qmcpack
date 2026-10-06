@@ -108,6 +108,12 @@ void validateSystem(const std::string& system, const SpatialGolden& golden, bool
       executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
   std::unique_ptr<pf::DirectSpatialWorkspace> active_workspace =
       executor.makeWorkspace(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
+  CHECK(full_workspace->geometryStorageBytes() > 0);
+  CHECK(active_workspace->geometryStorageBytes() > 0);
+  CHECK(full_workspace->vectorStorageBytes() ==
+        full_workspace->requiredStorageBytes());
+  CHECK(active_workspace->vectorStorageBytes() ==
+        active_workspace->requiredStorageBytes());
   full_workspace->setPositions(position_view);
   active_workspace->setPositions(position_view);
   const std::size_t full_storage   = full_workspace->storageFingerprint();

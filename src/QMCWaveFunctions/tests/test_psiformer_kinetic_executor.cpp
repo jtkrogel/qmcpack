@@ -139,6 +139,8 @@ void validateSystem(const std::string& system,
   const auto plan = makePlan(model);
   pf::DirectKineticExecutor executor(model, plan);
   auto workspace = executor.makeWorkspace();
+  CHECK(workspace->geometryStorageBytes() > 0);
+  CHECK(workspace->vectorStorageBytes() == workspace->requiredStorageBytes());
   workspace->setPositions(
       pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
   const std::size_t fingerprint = workspace->storageFingerprint();
