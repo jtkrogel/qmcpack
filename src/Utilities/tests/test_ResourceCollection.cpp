@@ -239,6 +239,78 @@ TEST_CASE("ResourceCollection typed lend failure preserves cursor", "[utilities]
   CHECK(collection.getOutstandingLoanCount() == 0);
 }
 
+TEST_CASE("ResourceCollection supports aggregate-last release choreography",
+          "[utilities][batch_resource]")
+{
+  ResourceCollection collection("aggregate_last_release");
+  collection.addResource(std::make_unique<PreparingResource>("aggregate"));
+  collection.addResource(std::make_unique<PreparingResource>("first_child"));
+  collection.addResource(std::make_unique<PreparingResource>("second_child"));
+
+  const std::size_t aggregate_slot = collection.getCursor();
+  auto aggregate                  = collection.lendResource<PreparingResource>();
+  const std::size_t child_start   = collection.getCursor();
+  auto first_child                = collection.lendResource<PreparingResource>();
+  auto second_child               = collection.lendResource<PreparingResource>();
+  const std::size_t final_cursor  = collection.getCursor();
+
+  REQUIRE(aggregate.getResource().getName() == "aggregate");
+  REQUIRE(first_child.getResource().getName() == "first_child");
+  REQUIRE(second_child.getResource().getName() == "second_child");
+  CHECK(aggregate_slot == 0);
+  CHECK(child_start == 1);
+  CHECK(final_cursor == collection.size());
+  CHECK(collection.getOutstandingLoanCount() == 3);
+
+  // Release child resources first while the aggregate handle remains live.
+  collection.rewind(child_start);
+  collection.takebackResource(first_child);
+  collection.takebackResource(second_child);
+  CHECK(collection.getCursor() == final_cursor);
+  CHECK(collection.getOutstandingLoanCount() == 1);
+  CHECK(aggregate.hasResource());
+  CHECK_FALSE(first_child.hasResource());
+  CHECK_FALSE(second_child.hasResource());
+
+  // ResourceCollection traversal is forward-only, so return slot zero from
+  // its own checkpoint and then restore the normal end-of-release cursor.
+  collection.rewind(aggregate_slot);
+  collection.takebackResource(aggregate);
+  CHECK(collection.getCursor() == child_start);
+  CHECK(collection.getOutstandingLoanCount() == 0);
+  CHECK_FALSE(aggregate.hasResource());
+  collection.rewind(final_cursor);
+  CHECK(collection.getCursor() == final_cursor);
+
+  // No live handle or unusual traversal order may prevent later preparation.
+  const std::shared_ptr<const BatchExecutionPlan> plan =
+      makeResourcePreparationPlan({1}, {2});
+  collection.prepareBatchResources({plan, 0});
+  CHECK(collection.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(collection.getBatchResourcePreparationProvenance().plan.get() == plan.get());
+  CHECK(collection.getCursor() == 0);
+
+  // The prepared replacement remains reusable through the ordinary traversal.
+  auto prepared_aggregate    = collection.lendResource<PreparingResource>();
+  auto prepared_first_child  = collection.lendResource<PreparingResource>();
+  auto prepared_second_child = collection.lendResource<PreparingResource>();
+  CHECK(collection.getOutstandingLoanCount() == 3);
+  collection.rewind();
+  collection.takebackResource(prepared_aggregate);
+  collection.takebackResource(prepared_first_child);
+  collection.takebackResource(prepared_second_child);
+  CHECK(collection.getOutstandingLoanCount() == 0);
+  CHECK_FALSE(prepared_aggregate.hasResource());
+  CHECK_FALSE(prepared_first_child.hasResource());
+  CHECK_FALSE(prepared_second_child.hasResource());
+
+  collection.prepareBatchResources({nullptr, 7});
+  CHECK(collection.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(collection.getBatchResourcePreparationProvenance().plan);
+}
+
 TEST_CASE("ResourceCollectionTeamLock construction failure preserves cursor", "[utilities]")
 {
   ResourceCollection collection("team_lock_construction_failure");
