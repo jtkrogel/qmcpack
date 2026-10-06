@@ -529,6 +529,13 @@ public:
     return {};
   }
 
+  /** Report whether every planned multi-walker entry point publishes atomically.
+   *
+   * Aggregate owners may rely on this capability only after independently
+   * validating the component's complete memory-accounting evidence.
+   */
+  virtual bool supportsAtomicBatchPublication() const noexcept { return false; }
+
   /** Validate a prospective immutable participant binding without mutation. */
   virtual void validateBatchExecutionPlanBinding(
       const BatchExecutionParticipantPlan&) const

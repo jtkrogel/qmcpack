@@ -14,6 +14,7 @@
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/ConstantOrbital.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/TrialWaveFunctionMemoryPolicy.h"
 #include "SimulationCell.h"
 #include "Utilities/ResourceCollection.h"
 #include "Utilities/RuntimeOptions.h"
@@ -26,6 +27,28 @@
 
 namespace qmcplusplus
 {
+namespace testing
+{
+/** Friend-only access to aggregate accounting state and binding diagnostics. */
+class TestTrialWaveFunction
+{
+public:
+  /// Enable complete aggregate claims only for explicitly bounded test paths.
+  static void useCompleteBatchMemoryAccounting(TrialWaveFunction& wavefunction,
+                                                bool enabled = true)
+  {
+    wavefunction.complete_batch_memory_accounting_for_testing_ = enabled;
+  }
+
+  /// Return the aggregate participant view retained by the wavefunction.
+  static const BatchExecutionParticipantPlan& aggregatePlan(
+      const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.aggregate_batch_execution_plan_;
+  }
+};
+} // namespace testing
+
 namespace
 {
 
@@ -101,6 +124,11 @@ public:
     return contribution;
   }
 
+  bool supportsAtomicBatchPublication() const noexcept override
+  {
+    return atomic_publication_;
+  }
+
   void validateBatchExecutionPlanBinding(
       const BatchExecutionParticipantPlan& plan) const override
   {
@@ -147,6 +175,7 @@ public:
     auto clone = std::make_unique<PlanningComponent>(
         class_name_, getName(), required_mode_, logical_maximum_, bytes_);
     clone->copy_binding_in_clone_ = copy_binding_in_clone_;
+    clone->atomic_publication_    = atomic_publication_;
     if (copy_binding_in_clone_)
       clone->bound_plan_ = bound_plan_;
     return clone;
@@ -161,6 +190,8 @@ public:
   { throw_on_acquire_ = should_throw; }
   void copyBindingInClone(bool copy) noexcept
   { copy_binding_in_clone_ = copy; }
+  void setAtomicPublication(bool atomic) noexcept
+  { atomic_publication_ = atomic; }
 
   const BatchExecutionParticipantPlan& boundPlan() const noexcept
   { return bound_plan_; }
@@ -188,6 +219,7 @@ private:
   bool reject_empty_binding_                          = false;
   bool throw_on_acquire_                              = false;
   bool copy_binding_in_clone_                         = false;
+  bool atomic_publication_                            = true;
   mutable std::size_t requirement_calls_              = 0;
   mutable std::size_t logical_maximum_calls_           = 0;
   mutable BatchExecutionRequirements last_workload_requirements_;
@@ -212,9 +244,11 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(
   wavefunction.contributeBatchExecutionRequirements(input.requirements);
   input.topology.initial_walkers_per_crowd = {2};
   input.topology.reserve_walkers_per_crowd = {3};
-  input.topology.run_kind      = "wavefunction-unit-test";
-  input.active_parameter_count = 17;
-  input.logical_maximum        = wavefunction.batchExecutionLogicalMaximum(
+  input.topology.run_kind              = "wavefunction-unit-test";
+  input.particle_count                 = 4;
+  input.active_parameter_count         = 17;
+  input.parameter_derivative_width     = 17;
+  input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
       {input.requirements, input.topology, input.particle_count,
        input.active_parameter_count, input.parameter_derivative_width});
   input.preference.id        = std::move(profile_id);
@@ -265,7 +299,9 @@ TEST_CASE("TrialWaveFunction aggregates ordered batch planning participants",
   workload_context.topology.initial_walkers_per_crowd = {2, 3};
   workload_context.topology.reserve_walkers_per_crowd = {4, 5};
   workload_context.topology.run_kind                  = "logical-envelope-test";
+  workload_context.particle_count                     = 4;
   workload_context.active_parameter_count             = 19;
+  workload_context.parameter_derivative_width         = 23;
   CHECK(wavefunction.batchExecutionLogicalMaximum(workload_context) ==
         BatchTileCapacities{8, 6, 0, 0});
   CHECK(first_ptr->logicalMaximumCalls() == 1);
@@ -276,19 +312,28 @@ TEST_CASE("TrialWaveFunction aggregates ordered batch planning participants",
   CHECK(first_ptr->lastWorkloadParameterCount() == 19);
 
   BatchExecutionPlanningContext context;
-  context.requirements         = requirements;
-  context.logical_maximum      = {8, 6, 4, 0};
-  context.candidate_capacities = {3, 2, 0, 0};
+  context.requirements               = requirements;
+  context.topology                   = workload_context.topology;
+  context.logical_maximum            = {8, 6, 4, 0};
+  context.candidate_capacities       = {3, 2, 0, 0};
+  context.particle_count             = 4;
+  context.active_parameter_count     = 19;
+  context.parameter_derivative_width = 23;
   const auto contributions = wavefunction.estimateBatchExecutionMemory(context);
-  REQUIRE(contributions.size() == 2);
-  CHECK(contributions[0].participant_id ==
-        "twf/component/0/A%2FB%25%20C/n%2F%25");
+  REQUIRE(contributions.size() == 3);
+  CHECK(contributions[0].participant_id == TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
   CHECK(contributions[1].participant_id ==
+        "twf/component/0/A%2FB%25%20C/n%2F%25");
+  CHECK(contributions[2].participant_id ==
         "twf/component/1/Second/");
-  CHECK(contributions[0].contribution.per_owner.total().host == 11);
-  CHECK(contributions[1].contribution.per_owner.total().host == 13);
-  CHECK(contributions[0].contribution.fully_accounted);
+  CHECK_FALSE(contributions[0].contribution.fully_accounted);
+  CHECK(contributions[0].contribution.owner_multiplicity == 1);
+  CHECK(contributions[1].contribution.per_owner.total().host == 11);
+  CHECK(contributions[2].contribution.per_owner.total().host == 13);
   CHECK(contributions[1].contribution.fully_accounted);
+  CHECK(contributions[2].contribution.fully_accounted);
+  CHECK(first_ptr->estimateCalls() == 1);
+  CHECK(second_ptr->estimateCalls() == 1);
 
   ConstantOrbital legacy_component;
   BatchExecutionRequirements legacy_requirements;
@@ -299,6 +344,7 @@ TEST_CASE("TrialWaveFunction aggregates ordered batch planning participants",
   CHECK_FALSE(legacy_contribution.fully_accounted);
   CHECK(legacy_contribution.owner_multiplicity == 0);
   CHECK(legacy_contribution.per_owner.total() == BatchMemoryBytes{});
+  CHECK_FALSE(legacy_component.supportsAtomicBatchPublication());
 }
 
 TEST_CASE("TrialWaveFunction batch plan binding is aggregate-atomic",
@@ -306,65 +352,211 @@ TEST_CASE("TrialWaveFunction batch plan binding is aggregate-atomic",
 {
   RuntimeOptions runtime_options;
   TrialWaveFunction wavefunction(runtime_options, "binding");
-  auto first = std::make_unique<PlanningComponent>(
+  auto component = std::make_unique<PlanningComponent>(
       "First", "one", BatchExecutionMode::VALUE,
       BatchTileCapacities{8, 0, 0, 0}, 17);
-  PlanningComponent* first_ptr = first.get();
-  wavefunction.addComponent(std::move(first));
-  auto second = std::make_unique<PlanningComponent>(
-      "Second", "two", BatchExecutionMode::FULL_VGL,
-      BatchTileCapacities{0, 6, 0, 0}, 19);
-  PlanningComponent* second_ptr = second.get();
-  wavefunction.addComponent(std::move(second));
+  PlanningComponent* component_ptr = component.get();
+  wavefunction.addComponent(std::move(component));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
 
   const auto first_plan = makePlan(wavefunction, "binding-v1", 3);
   const auto second_plan = makePlan(wavefunction, "binding-v2", 2);
   wavefunction.bindBatchExecutionPlan(first_plan);
   REQUIRE(wavefunction.batchExecutionPlan().get() == first_plan.get());
-  REQUIRE(first_ptr->boundPlan());
-  REQUIRE(second_ptr->boundPlan());
-  CHECK(&first_ptr->boundPlan().plan() == first_plan.get());
-  CHECK(&second_ptr->boundPlan().plan() == first_plan.get());
-  CHECK(first_ptr->boundPlan().evidence().participant_id ==
+  REQUIRE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  REQUIRE(component_ptr->boundPlan());
+  CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == first_plan.get());
+  CHECK(&component_ptr->boundPlan().plan() == first_plan.get());
+  CHECK(testing::TestTrialWaveFunction::aggregatePlan(wavefunction).evidence().participant_id ==
+        TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
+  CHECK(component_ptr->boundPlan().evidence().participant_id ==
         "twf/component/0/First/one");
-  CHECK(second_ptr->boundPlan().evidence().participant_id ==
-        "twf/component/1/Second/two");
 
   CHECK_THROWS_AS(
       wavefunction.addComponent(std::make_unique<ConstantOrbital>()),
       std::logic_error);
 
-  const std::size_t first_bind_count = first_ptr->bindCalls();
-  second_ptr->rejectNonemptyBinding(true);
+  component_ptr->setAtomicPublication(false);
+  CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(second_plan),
+                  std::invalid_argument);
+  CHECK(wavefunction.batchExecutionPlan().get() == first_plan.get());
+  CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == first_plan.get());
+  CHECK(&component_ptr->boundPlan().plan() == first_plan.get());
+  component_ptr->setAtomicPublication(true);
+
+  const std::size_t first_bind_count = component_ptr->bindCalls();
+  component_ptr->rejectNonemptyBinding(true);
   CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(second_plan),
                   std::runtime_error);
   CHECK(wavefunction.batchExecutionPlan().get() == first_plan.get());
-  CHECK(&first_ptr->boundPlan().plan() == first_plan.get());
-  CHECK(first_ptr->bindCalls() == first_bind_count);
+  CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == first_plan.get());
+  CHECK(&component_ptr->boundPlan().plan() == first_plan.get());
+  CHECK(component_ptr->bindCalls() == first_bind_count);
 
-  second_ptr->rejectNonemptyBinding(false);
+  component_ptr->rejectNonemptyBinding(false);
   wavefunction.bindBatchExecutionPlan(second_plan);
   CHECK(wavefunction.batchExecutionPlan().get() == second_plan.get());
-  CHECK(&first_ptr->boundPlan().plan() == second_plan.get());
-  CHECK(&second_ptr->boundPlan().plan() == second_plan.get());
+  CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == second_plan.get());
+  CHECK(&component_ptr->boundPlan().plan() == second_plan.get());
 
-  second_ptr->rejectEmptyBinding(true);
+  component_ptr->rejectEmptyBinding(true);
   CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(nullptr),
                   std::runtime_error);
   CHECK(wavefunction.batchExecutionPlan().get() == second_plan.get());
-  CHECK(first_ptr->boundPlan());
+  CHECK(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK(component_ptr->boundPlan());
 
-  second_ptr->rejectEmptyBinding(false);
+  component_ptr->rejectEmptyBinding(false);
   wavefunction.bindBatchExecutionPlan(nullptr);
   CHECK_FALSE(wavefunction.batchExecutionPlan());
-  CHECK_FALSE(first_ptr->boundPlan());
-  CHECK_FALSE(second_ptr->boundPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(component_ptr->boundPlan());
 
   // Null-to-null binding still visits every child to clear stale copied state.
-  const std::size_t null_bind_count = first_ptr->bindCalls();
+  const std::size_t null_bind_count = component_ptr->bindCalls();
   wavefunction.bindBatchExecutionPlan(nullptr);
-  CHECK(first_ptr->bindCalls() == null_bind_count + 1);
+  CHECK(component_ptr->bindCalls() == null_bind_count + 1);
   wavefunction.addComponent(std::make_unique<ConstantOrbital>());
+}
+
+TEST_CASE("TrialWaveFunction hard planning rejects multiple components",
+          "[wavefunction][batch_memory]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "multiple-components");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "First", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 5));
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Second", "", BatchExecutionMode::FULL_VGL,
+      BatchTileCapacities{0, 8, 0, 0}, 7));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+
+  CHECK_THROWS_AS(makePlan(wavefunction), std::invalid_argument);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+}
+
+TEST_CASE("TrialWaveFunction aggregate binding rejects fabricated accounting evidence",
+          "[wavefunction][batch_memory]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "fabricated-accounting");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Sole", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 5));
+
+  BatchExecutionSelectionInput input;
+  wavefunction.contributeBatchExecutionRequirements(input.requirements);
+  input.topology.initial_walkers_per_crowd = {2};
+  input.topology.reserve_walkers_per_crowd = {3};
+  input.topology.run_kind                  = "fabricated-accounting-test";
+  input.particle_count                    = 4;
+  input.active_parameter_count            = 2;
+  input.parameter_derivative_width        = 2;
+  input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
+      {input.requirements, input.topology, input.particle_count,
+       input.active_parameter_count, input.parameter_derivative_width});
+  input.preference.id        = "fabricated-accounting-v1";
+  input.preference.preferred = {3, 1, 1, 0};
+
+  const auto fabricated_plan = std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(
+          input, [&wavefunction](const BatchExecutionPlanningContext& context) {
+            auto contributions = wavefunction.estimateBatchExecutionMemory(context);
+            if (contributions.empty() || contributions.front().participant_id !=
+                    TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID)
+              throw std::logic_error("aggregate participant is not first");
+            contributions.front().contribution.fully_accounted = true;
+            return contributions;
+          }));
+
+  CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(fabricated_plan),
+                  std::invalid_argument);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(planningComponent(wavefunction, 0).boundPlan());
+}
+
+TEST_CASE("TrialWaveFunction aggregate binding recomputes selected evidence",
+          "[wavefunction][batch_memory]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "stale-selected");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Sole", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 5));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+
+  BatchExecutionSelectionInput input;
+  wavefunction.contributeBatchExecutionRequirements(input.requirements);
+  input.topology.initial_walkers_per_crowd = {2};
+  input.topology.reserve_walkers_per_crowd = {3};
+  input.topology.run_kind                  = "stale-selected-test";
+  input.particle_count                    = 4;
+  input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
+      {input.requirements, input.topology, input.particle_count, 0, 0});
+  input.preference.id        = "stale-selected-v1";
+  input.preference.preferred = {3, 1, 1, 0};
+
+  const auto stale_plan = std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(
+          input, [&wavefunction](const BatchExecutionPlanningContext& context) {
+            auto contributions = wavefunction.estimateBatchExecutionMemory(context);
+            contributions.front().contribution.per_owner.add(
+                BatchMemoryCategory::RETAINED_HIGH_WATER, {1, 0},
+                "deliberately stale selected evidence");
+            return contributions;
+          }));
+
+  CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(stale_plan),
+                  std::invalid_argument);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(planningComponent(wavefunction, 0).boundPlan());
+}
+
+TEST_CASE("TrialWaveFunction aggregate binding recomputes minimum evidence",
+          "[wavefunction][batch_memory]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "stale-minimum");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Sole", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 5));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+
+  BatchExecutionSelectionInput input;
+  wavefunction.contributeBatchExecutionRequirements(input.requirements);
+  input.topology.initial_walkers_per_crowd = {2};
+  input.topology.reserve_walkers_per_crowd = {3};
+  input.topology.run_kind                  = "stale-minimum-test";
+  input.particle_count                    = 4;
+  input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
+      {input.requirements, input.topology, input.particle_count, 0, 0});
+  input.preference.id        = "stale-minimum-v1";
+  input.preference.preferred = {3, 1, 1, 0};
+
+  const auto stale_plan = std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(
+          input, [&wavefunction](const BatchExecutionPlanningContext& context) {
+            auto contributions = wavefunction.estimateBatchExecutionMemory(context);
+            contributions.back().contribution.per_owner.add(
+                BatchMemoryCategory::INNER_TILE_SCRATCH,
+                {2 * context.candidate_capacities.value, 0},
+                "monotone synthetic child slope");
+            if (context.candidate_capacities.value == 1)
+              contributions.front().contribution.per_owner.add(
+                  BatchMemoryCategory::RETAINED_HIGH_WATER, {1, 0},
+                  "deliberately stale minimum evidence");
+            return contributions;
+          }));
+
+  CHECK_THROWS_AS(wavefunction.bindBatchExecutionPlan(stale_plan),
+                  std::invalid_argument);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(planningComponent(wavefunction, 0).boundPlan());
 }
 
 TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparation",
@@ -379,11 +571,15 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
   leader.addComponent(std::make_unique<PlanningComponent>(
       "Cloneable", "component", BatchExecutionMode::VALUE,
       BatchTileCapacities{8, 0, 0, 0}, 23));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(leader);
   const auto plan = makePlan(leader);
   leader.bindBatchExecutionPlan(plan);
 
   std::unique_ptr<TrialWaveFunction> clone = leader.makeClone(particles);
   CHECK(clone->batchExecutionPlan().get() == plan.get());
+  REQUIRE(testing::TestTrialWaveFunction::aggregatePlan(*clone));
+  CHECK(testing::TestTrialWaveFunction::aggregatePlan(*clone).sameBinding(
+      testing::TestTrialWaveFunction::aggregatePlan(leader)));
   PlanningComponent& clone_component = planningComponent(*clone, 0);
   REQUIRE(clone_component.boundPlan());
   CHECK(&clone_component.boundPlan().plan() == plan.get());
@@ -443,7 +639,7 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
   CHECK_FALSE(clone->hasAcquiredResource());
 }
 
-TEST_CASE("TrialWaveFunction acquisition failure preserves unacquired state",
+TEST_CASE("TrialWaveFunction legacy multi-component acquisition preserves rollback",
           "[wavefunction][batch_memory][resources]")
 {
   RuntimeOptions runtime_options;
@@ -459,8 +655,10 @@ TEST_CASE("TrialWaveFunction acquisition failure preserves unacquired state",
   PlanningComponent* second_ptr = second.get();
   second_ptr->throwOnAcquire(true);
   wavefunction.addComponent(std::move(second));
-  const auto plan = makePlan(wavefunction);
-  wavefunction.bindBatchExecutionPlan(plan);
+
+  // Multiple components remain supported without a hard plan while the
+  // aggregate planner deliberately rejects that topology.
+  REQUIRE_FALSE(wavefunction.batchExecutionPlan());
 
   RefVectorWithLeader<TrialWaveFunction> wavefunctions(
       wavefunction, {wavefunction});
@@ -491,6 +689,7 @@ TEST_CASE("TrialWaveFunction resource lifecycle accepts legacy batch lane shapes
       BatchTileCapacities{8, 0, 0, 0}, 5);
   PlanningComponent* component_ptr = component.get();
   wavefunction.addComponent(std::move(component));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
   wavefunction.bindBatchExecutionPlan(makePlan(wavefunction));
   ResourceCollection resources("batch-planning-lane-shapes");
 
@@ -532,6 +731,7 @@ TEST_CASE("TrialWaveFunction null clone binding clears stale child state",
   plan_source.addComponent(std::make_unique<PlanningComponent>(
       "LegacyClone", "", BatchExecutionMode::VALUE,
       BatchTileCapacities{8, 0, 0, 0}, 3));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(plan_source);
   const auto stale_plan = makePlan(plan_source);
 
   TrialWaveFunction unbound(runtime_options, "unbound");

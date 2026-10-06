@@ -20,15 +20,18 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 #include <typeinfo>
 
 #include "TrialWaveFunction.h"
 #include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
+#include "QMCWaveFunctions/TrialWaveFunctionMemoryPolicy.h"
 #include "ResourceCollection.h"
 #include "Utilities/IteratorUtility.h"
 #include "Concurrency/Info.hpp"
@@ -76,6 +79,43 @@ std::vector<std::string> batchParticipantIds(
   for (std::size_t index = 0; index < components.size(); ++index)
     ids.push_back(batchParticipantId(index, *components[index]));
   return ids;
+}
+
+/// Return whether one participant envelope fits within the aggregate envelope.
+bool capacitiesFitWithin(const BatchTileCapacities& capacities,
+                         const BatchTileCapacities& envelope) noexcept
+{
+  return capacities.value <= envelope.value && capacities.full_vgl <= envelope.full_vgl &&
+      capacities.active_gradient <= envelope.active_gradient && capacities.ecp_outer <= envelope.ecp_outer;
+}
+
+/** Build aggregate policy input from current object and sole-child evidence.
+ * The accounting override is private test state; production claims stay false
+ * until every aggregate runtime owner is migrated to prepared storage.
+ */
+TrialWaveFunctionMemoryPolicyInput makeTrialWaveFunctionMemoryPolicyInput(
+    std::size_t component_count,
+    bool use_tasking,
+    bool complete_accounting_for_testing,
+    const BatchMemoryContribution* sole_child,
+    bool sole_child_atomic_publication)
+{
+  TrialWaveFunctionMemoryPolicyInput input;
+  input.type_sizes = makeTrialWaveFunctionMemoryTypeSizes<
+      TrialWaveFunction::ValueType, ParticleSet::ParticleGradient::value_type,
+      ParticleSet::ParticleLaplacian::value_type, std::reference_wrapper<WaveFunctionComponent>,
+      std::reference_wrapper<ParticleSet::ParticleGradient>,
+      std::reference_wrapper<ParticleSet::ParticleLaplacian>, TrialWaveFunction::ParameterDerivativeView,
+      TrialWaveFunction::EvaluationStamp, unsigned char>();
+  input.accounting_claims = complete_accounting_for_testing
+      ? TrialWaveFunctionMemoryAccountingClaims::complete()
+      : TrialWaveFunctionMemoryAccountingClaims{};
+  input.component_count = component_count;
+  input.use_tasking     = use_tasking;
+  if (sole_child)
+    input.sole_child = {sole_child->owner_multiplicity, sole_child->fully_accounted,
+                        sole_child_atomic_publication};
+  return input;
 }
 } // namespace
 
@@ -169,7 +209,7 @@ void TrialWaveFunction::contributeBatchExecutionRequirements(
 BatchTileCapacities TrialWaveFunction::batchExecutionLogicalMaximum(
     const BatchExecutionWorkloadContext& context) const
 {
-  BatchTileCapacities maximum;
+  BatchTileCapacities maximum = trialWaveFunctionBatchLogicalMaximum(context);
   for (const auto& component : Z)
     includeBatchExecutionLogicalMaximum(
         maximum, component->batchExecutionLogicalMaximum(context));
@@ -180,13 +220,121 @@ std::vector<BatchMemoryParticipantContribution>
 TrialWaveFunction::estimateBatchExecutionMemory(
     const BatchExecutionPlanningContext& context) const
 {
-  std::vector<BatchMemoryParticipantContribution> contributions;
-  contributions.reserve(Z.size());
+  // Evaluate each child exactly once for this candidate.  The aggregate's
+  // completeness decision consumes that same live sole-child evidence.
+  std::vector<BatchMemoryParticipantContribution> child_contributions;
+  child_contributions.reserve(Z.size());
   for (std::size_t index = 0; index < Z.size(); ++index)
-    contributions.push_back(
+    child_contributions.push_back(
         {batchParticipantId(index, *Z[index]),
          Z[index]->estimateBatchExecutionMemory(context)});
+
+  const BatchMemoryContribution* sole_child =
+      child_contributions.size() == 1 ? &child_contributions.front().contribution : nullptr;
+  const bool sole_child_atomic_publication =
+      Z.size() == 1 && Z.front()->supportsAtomicBatchPublication();
+  const TrialWaveFunctionMemoryPolicyInput aggregate_input =
+      makeTrialWaveFunctionMemoryPolicyInput(
+          Z.size(), use_tasking_, complete_batch_memory_accounting_for_testing_, sole_child,
+          sole_child_atomic_publication);
+
+  std::vector<BatchMemoryParticipantContribution> contributions;
+  contributions.reserve(child_contributions.size() + 1);
+  contributions.push_back(
+      {std::string(TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID),
+       estimateTrialWaveFunctionBatchMemory(aggregate_input, context)});
+  contributions.insert(contributions.end(),
+                       std::make_move_iterator(child_contributions.begin()),
+                       std::make_move_iterator(child_contributions.end()));
   return contributions;
+}
+
+void TrialWaveFunction::validateAggregateBatchExecutionPlanBinding(
+    const BatchExecutionParticipantPlan& participant_plan) const
+{
+  if (!participant_plan)
+    return;
+
+  const BatchExecutionPlan& plan = participant_plan.plan();
+  const BatchMemoryParticipantEvidence& evidence = participant_plan.evidence();
+  if (evidence.participant_id != TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID)
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate batch participant has the wrong identity");
+
+  const auto makeAggregateContribution = [this](const BatchExecutionPlanningContext& context) {
+    BatchMemoryContribution child;
+    const BatchMemoryContribution* sole_child = nullptr;
+    bool sole_child_atomic_publication        = false;
+    if (Z.size() == 1)
+    {
+      child = Z.front()->estimateBatchExecutionMemory(context);
+      sole_child = &child;
+      sole_child_atomic_publication = Z.front()->supportsAtomicBatchPublication();
+    }
+    const TrialWaveFunctionMemoryPolicyInput input =
+        makeTrialWaveFunctionMemoryPolicyInput(
+            Z.size(), use_tasking_, complete_batch_memory_accounting_for_testing_, sole_child,
+            sole_child_atomic_publication);
+    return estimateTrialWaveFunctionBatchMemory(input, context);
+  };
+
+  const BatchExecutionPlanningContext selected_context{
+      plan.requirements(), plan.topology(), plan.logicalMaximum(), plan.selectedCapacities(),
+      plan.particleCount(), plan.activeParameterCount(), plan.parameterDerivativeWidth()};
+  const BatchMemoryContribution selected = makeAggregateContribution(selected_context);
+  if (!capacitiesFitWithin(selected.logical_maximum, plan.logicalMaximum()))
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate logical maximum exceeds the batch plan envelope");
+  if (!(evidence.logical_maximum == selected.logical_maximum))
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate logical-maximum evidence is stale");
+  if (selected.owner_multiplicity != 1 ||
+      evidence.owner_multiplicity != selected.owner_multiplicity)
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate must have one exact rank-local owner");
+  if (!(evidence.selected_per_owner == selected.per_owner))
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate selected memory evidence is stale");
+
+  BatchExecutionPlanningContext minimum_context = selected_context;
+  minimum_context.candidate_capacities           = plan.minimumCapacities();
+  const BatchMemoryContribution minimum = makeAggregateContribution(minimum_context);
+  if (!(minimum.logical_maximum == selected.logical_maximum) ||
+      minimum.owner_multiplicity != selected.owner_multiplicity)
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate invariant evidence changed at the minimum capacity");
+  if (!(evidence.fixed_minimum_per_owner == minimum.per_owner))
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate minimum memory evidence is stale");
+  if (evidence.fully_accounted != selected.fully_accounted ||
+      minimum.fully_accounted != selected.fully_accounted)
+    throw std::invalid_argument(
+        "TrialWaveFunction aggregate accounting evidence is stale");
+  if (!selected.fully_accounted)
+    throw std::logic_error(
+        "TrialWaveFunction aggregate planned execution is not fully storage-accounted");
+}
+
+void TrialWaveFunction::validateRetainedBatchExecutionBinding(
+    const std::vector<std::string>& participant_ids) const
+{
+  if (!batch_execution_plan_)
+  {
+    if (aggregate_batch_execution_plan_ || !bound_batch_participant_ids_.empty())
+      throw std::logic_error(
+          "TrialWaveFunction retained participant bindings without a batch plan");
+    return;
+  }
+
+  if (participant_ids != bound_batch_participant_ids_)
+    throw std::logic_error(
+        "TrialWaveFunction component topology changed after batch plan binding");
+  const BatchExecutionParticipantPlan expected_aggregate =
+      makeBatchExecutionParticipantPlan(
+          batch_execution_plan_, TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
+  if (!aggregate_batch_execution_plan_.sameBinding(expected_aggregate))
+    throw std::logic_error(
+        "TrialWaveFunction aggregate participant no longer shares the bound plan identity");
 }
 
 void TrialWaveFunction::bindBatchExecutionPlan(
@@ -197,22 +345,34 @@ void TrialWaveFunction::bindBatchExecutionPlan(
   {
     if (plan.get() == batch_execution_plan_.get() &&
         participant_ids == acquired_batch_participant_ids_)
+    {
+      validateRetainedBatchExecutionBinding(participant_ids);
       return;
+    }
     throw std::logic_error(
         "Cannot rebind a TrialWaveFunction batch execution plan while resources are acquired");
   }
 
-  // Construct every participant view, then validate every component before the
-  // noexcept publication loop.  Missing IDs or any component-level rejection
-  // therefore leave the entire aggregate at its previous binding.
+  // Construct every participant view, then validate the aggregate and every
+  // component before the noexcept publication loop.  Missing IDs, stale
+  // evidence, or a child rejection therefore preserve the previous family.
+  const BatchExecutionParticipantPlan aggregate_plan =
+      makeBatchExecutionParticipantPlan(
+          plan, TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
   std::vector<BatchExecutionParticipantPlan> participant_plans;
   participant_plans.reserve(Z.size());
   for (std::size_t index = 0; index < Z.size(); ++index)
     participant_plans.push_back(makeBatchExecutionParticipantPlan(
         plan, participant_ids[index]));
+
+  validateAggregateBatchExecutionPlanBinding(aggregate_plan);
   for (std::size_t index = 0; index < Z.size(); ++index)
     Z[index]->validateBatchExecutionPlanBinding(participant_plans[index]);
 
+  static_assert(std::is_nothrow_copy_assignable_v<BatchExecutionParticipantPlan>);
+  static_assert(noexcept(std::declval<WaveFunctionComponent&>().bindBatchExecutionPlan(
+      std::declval<BatchExecutionParticipantPlan>())));
+  aggregate_batch_execution_plan_ = aggregate_plan;
   for (std::size_t index = 0; index < Z.size(); ++index)
     Z[index]->bindBatchExecutionPlan(std::move(participant_plans[index]));
   batch_execution_plan_ = std::move(plan);
@@ -231,10 +391,11 @@ void TrialWaveFunction::prepareBatchExecutionClones()
     return;
 
   const std::vector<std::string> participant_ids = batchParticipantIds(Z);
-  if (participant_ids != bound_batch_participant_ids_)
-    throw std::logic_error(
-        "TrialWaveFunction component topology changed after batch plan binding");
+  validateRetainedBatchExecutionBinding(participant_ids);
 
+  const BatchExecutionParticipantPlan aggregate_plan =
+      makeBatchExecutionParticipantPlan(
+          batch_execution_plan_, TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
   std::vector<BatchExecutionParticipantPlan> participant_plans;
   participant_plans.reserve(Z.size());
   for (std::size_t index = 0; index < Z.size(); ++index)
@@ -244,6 +405,7 @@ void TrialWaveFunction::prepareBatchExecutionClones()
   // Validate the complete binding before allowing the first component to grow
   // clone-local storage.  Individual component preparation owns its strong
   // exception guarantee; already prepared high water remains usable on failure.
+  validateAggregateBatchExecutionPlanBinding(aggregate_plan);
   for (std::size_t index = 0; index < Z.size(); ++index)
     Z[index]->validateBatchExecutionPlanBinding(participant_plans[index]);
   for (std::size_t index = 0; index < Z.size(); ++index)
@@ -1896,14 +2058,13 @@ std::unique_ptr<TrialWaveFunction> TrialWaveFunction::makeClone(ParticleSet& tqp
   if (resource_acquired_)
     throw std::logic_error(
         "Cannot clone a TrialWaveFunction while its resources are acquired");
-  if (batch_execution_plan_ &&
-      batchParticipantIds(Z) != bound_batch_participant_ids_)
-    throw std::logic_error(
-        "Cannot clone a TrialWaveFunction whose component topology changed after plan binding");
+  validateRetainedBatchExecutionBinding(batchParticipantIds(Z));
 
   auto myclone                 = std::make_unique<TrialWaveFunction>(runtime_options_, myName, use_tasking_);
   myclone->BufferCursor        = BufferCursor;
   myclone->BufferCursor_scalar = BufferCursor_scalar;
+  myclone->complete_batch_memory_accounting_for_testing_ =
+      complete_batch_memory_accounting_for_testing_;
   for (int i = 0; i < Z.size(); ++i)
     myclone->addComponent(Z[i]->makeClone(tqp));
   // Visit children even for a null aggregate plan: a legacy clone constructor
@@ -2027,14 +2188,7 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
 
   const std::vector<std::string> leader_participant_ids =
       batchParticipantIds(wf_leader.Z);
-  if (wf_leader.batch_execution_plan_ &&
-      leader_participant_ids != wf_leader.bound_batch_participant_ids_)
-    throw std::logic_error(
-        "TrialWaveFunction leader topology changed after batch plan binding");
-  if (!wf_leader.batch_execution_plan_ &&
-      !wf_leader.bound_batch_participant_ids_.empty())
-    throw std::logic_error(
-        "TrialWaveFunction leader retained participant IDs without a plan");
+  wf_leader.validateRetainedBatchExecutionBinding(leader_participant_ids);
 
   // Allocate every acquisition snapshot before the first resource is lent.
   // Publishing these vectors after successful acquisition is then noexcept.
@@ -2062,6 +2216,10 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
         wf_leader.batch_execution_plan_.get())
       throw std::invalid_argument(
           "TrialWaveFunction resource clones do not share one batch execution plan identity");
+    if (!wavefunction.aggregate_batch_execution_plan_.sameBinding(
+            wf_leader.aggregate_batch_execution_plan_))
+      throw std::invalid_argument(
+          "TrialWaveFunction resource clones do not share one aggregate participant binding");
     if (wavefunction.Z.size() != wf_leader.Z.size())
       throw std::invalid_argument(
           "TrialWaveFunction resource clones have different component counts");
@@ -2074,14 +2232,7 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
     if (participant_ids != leader_participant_ids)
       throw std::invalid_argument(
           "TrialWaveFunction resource clones have incompatible component topology");
-    if (wavefunction.batch_execution_plan_ &&
-        participant_ids != wavefunction.bound_batch_participant_ids_)
-      throw std::logic_error(
-          "TrialWaveFunction clone topology changed after batch plan binding");
-    if (!wavefunction.batch_execution_plan_ &&
-        !wavefunction.bound_batch_participant_ids_.empty())
-      throw std::logic_error(
-          "TrialWaveFunction clone retained participant IDs without a plan");
+    wavefunction.validateRetainedBatchExecutionBinding(participant_ids);
     if (first_occurrence && &wavefunction != &wf_leader)
       acquired_topologies.emplace_back(&wavefunction, participant_ids);
   }
@@ -2090,10 +2241,16 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
   // resource.  This catches a stale or independently rebound component while
   // collection and acquisition state are still untouched.
   for (const auto& [wavefunction, participant_ids] : acquired_topologies)
+  {
+    wavefunction->validateAggregateBatchExecutionPlanBinding(
+        makeBatchExecutionParticipantPlan(
+            wavefunction->batch_execution_plan_,
+            TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID));
     for (std::size_t index = 0; index < wavefunction->Z.size(); ++index)
       wavefunction->Z[index]->validateBatchExecutionPlanBinding(
           makeBatchExecutionParticipantPlan(
               wavefunction->batch_execution_plan_, participant_ids[index]));
+  }
 
   // Build every reference list before lending the first resource.  Besides
   // making all lane-shape validation precede mutation, retaining these lists
@@ -2177,6 +2334,7 @@ void TrialWaveFunction::releaseResource(ResourceCollection& collection,
       wf_leader.acquired_batch_participant_ids_)
     throw std::logic_error(
         "TrialWaveFunction leader topology changed while resources were acquired");
+  wf_leader.validateRetainedBatchExecutionBinding(leader_participant_ids);
   std::vector<TrialWaveFunction*> acquired_wavefunctions;
   acquired_wavefunctions.reserve(wf_list.size() + 1);
   acquired_wavefunctions.push_back(&wf_leader);
@@ -2193,6 +2351,10 @@ void TrialWaveFunction::releaseResource(ResourceCollection& collection,
         wf_leader.batch_execution_plan_.get())
       throw std::logic_error(
           "TrialWaveFunction acquired clones no longer share one batch execution plan identity");
+    if (!wavefunction.aggregate_batch_execution_plan_.sameBinding(
+            wf_leader.aggregate_batch_execution_plan_))
+      throw std::logic_error(
+          "TrialWaveFunction acquired clones no longer share one aggregate participant binding");
     if (wavefunction.Z.size() != wf_leader.Z.size())
       throw std::logic_error(
           "TrialWaveFunction acquired clones no longer share component topology");
@@ -2202,6 +2364,7 @@ void TrialWaveFunction::releaseResource(ResourceCollection& collection,
         participant_ids != wavefunction.acquired_batch_participant_ids_)
       throw std::logic_error(
           "TrialWaveFunction component topology changed while resources were acquired");
+    wavefunction.validateRetainedBatchExecutionBinding(participant_ids);
     if (static_cast<bool>(wavefunction.twf_fastderiv_) !=
         static_cast<bool>(wf_leader.twf_fastderiv_))
       throw std::logic_error(

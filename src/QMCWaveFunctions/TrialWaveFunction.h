@@ -50,6 +50,10 @@ namespace wftrain
 {
 class StructuredParameterProvider;
 }
+namespace testing
+{
+class TestTrialWaveFunction;
+}
 
 /** @ingroup MBWfs
  * @brief Class to represent a many-body trial wave function
@@ -685,6 +689,14 @@ public:
 private:
   static void debugOnlyCheckBuffer(WFBufferType& buffer);
 
+  /// Recompute and validate the aggregate participant evidence without mutation.
+  void validateAggregateBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan& participant_plan) const;
+
+  /// Check that the aggregate and child participant views retain one plan identity.
+  void validateRetainedBatchExecutionBinding(
+      const std::vector<std::string>& participant_ids) const;
+
   /// @brief top-level runtime options from project data information > WaveFunctionPool
   const RuntimeOptions& runtime_options_;
 
@@ -731,6 +743,9 @@ private:
   /// Immutable section plan shared by the golden object and all of its clones.
   std::shared_ptr<const BatchExecutionPlan> batch_execution_plan_;
 
+  /// Immutable selected-plan slice for aggregate TrialWaveFunction storage.
+  BatchExecutionParticipantPlan aggregate_batch_execution_plan_;
+
   /// Stable component identities validated when the current plan was published.
   std::vector<std::string> bound_batch_participant_ids_;
 
@@ -739,6 +754,9 @@ private:
 
   /// Guard plan/topology mutation while a standard component resource list is lent.
   bool resource_acquired_ = false;
+
+  /// Friend-only seam enabling complete aggregate ownership claims in tests.
+  bool complete_batch_memory_accounting_for_testing_ = false;
 
   //TWFFastDerivWrapper twf_prototype;
   /// timers at TrialWaveFunction function call level
@@ -766,6 +784,8 @@ private:
       const RefVectorWithLeader<TrialWaveFunction>& wf_list);
 
   std::unique_ptr<TWFFastDerivWrapper> twf_fastderiv_;
+
+  friend class testing::TestTrialWaveFunction;
 };
 
 } // namespace qmcplusplus
