@@ -147,6 +147,12 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   std::size_t replacement_configurations     = 0;
   std::size_t reference_evaluations          = 0;
   std::size_t dense_coordinate_bytes_avoided = 0;
+  /// Logical score configurations from the most recent completed reduction.
+  std::size_t weighted_reference_configurations   = 0;
+  std::size_t weighted_replacement_configurations = 0;
+  std::size_t weighted_active_parameters           = 0;
+  /// Capacity of the compact active-walker by active-parameter staging buffer.
+  std::size_t weighted_derivative_staging_bytes = 0;
   std::array<std::string, 4> backend_modes;
 
   /// Return all explicitly accounted numeric storage owned by the resource.
@@ -384,6 +390,17 @@ public:
                                    const OptVariables& optvars,
                                    const std::vector<ValueType>& total_weights,
                                    ParameterDerivativeView weighted_derivatives) override;
+
+  /** Reduce one flattened virtual batch with one reference score per active
+   * walker and compact active-parameter staging. */
+  EvaluationStamp mw_evaluateVirtualDerivRatiosWeighted(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const VirtualParticleBatch& batch,
+      const OptVariables& optvars,
+      const std::vector<ValueType>& total_weights,
+      const std::vector<ParameterDerivativeView>& weighted_derivatives) const override;
 
   /// Reduce ragged walker rows serially through one resource-owned direct score tape.
   void mw_evaluateDerivRatiosWeighted(

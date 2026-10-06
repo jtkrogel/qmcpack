@@ -542,12 +542,24 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::vector<std::size_t> virtual_reference_indices;
   /// Atomic flattened ratio staging retained across sparse virtual calls.
   std::vector<ValueType> flat_virtual_ratios;
+  /// Sum of descriptor weights multiplying each compact walker reference score.
+  std::vector<ValueType> virtual_reference_weights;
+  /// Global derivative destinations in selected-parameter iteration order.
+  std::vector<std::size_t> active_derivative_global_indices;
+  /// Atomic compact rows indexed by active virtual walker then active parameter.
+  std::vector<ValueType> flat_virtual_weighted_derivatives;
+  /// Reusable selected-score contribution gathered after each serialized reverse pass.
+  SelectedDerivativeDelta virtual_score_contribution;
   /// Oracle reference signs retained across flattened virtual calls.
   std::vector<double> virtual_reference_signs;
   /// Oracle reference log magnitudes retained across flattened virtual calls.
   std::vector<double> virtual_reference_logabs;
   /// Selected walker indices for masked recomputation.
   std::vector<std::size_t> walker_indices;
+  /// Successful flattened weighted-call diagnostics; failures leave these unchanged.
+  std::size_t weighted_reference_configurations   = 0;
+  std::size_t weighted_replacement_configurations = 0;
+  std::size_t weighted_active_parameters           = 0;
 
   /// Create the single reusable score tape only when an optimizer path requests it.
   pf::DirectScoreWorkspace& requireScoreWorkspace()
@@ -1002,6 +1014,10 @@ void PsiFormerWF::releaseResource(
   resource.active_virtual_walkers.clear();
   resource.virtual_reference_indices.clear();
   resource.flat_virtual_ratios.clear();
+  resource.virtual_reference_weights.clear();
+  resource.active_derivative_global_indices.clear();
+  resource.flat_virtual_weighted_derivatives.clear();
+  resource.virtual_score_contribution.clear();
   resource.virtual_reference_signs.clear();
   resource.virtual_reference_logabs.clear();
   resource.walker_indices.clear();
@@ -1098,6 +1114,10 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
       resource.active_virtual_walkers.capacity() * sizeof(std::size_t) +
       resource.virtual_reference_indices.capacity() * sizeof(std::size_t) +
       resource.flat_virtual_ratios.capacity() * sizeof(ValueType) +
+      resource.virtual_reference_weights.capacity() * sizeof(ValueType) +
+      resource.active_derivative_global_indices.capacity() * sizeof(std::size_t) +
+      resource.flat_virtual_weighted_derivatives.capacity() * sizeof(ValueType) +
+      resource.virtual_score_contribution.capacity() * sizeof(SelectedDerivativeDelta::value_type) +
       resource.virtual_reference_signs.capacity() * sizeof(double) +
       resource.virtual_reference_logabs.capacity() * sizeof(double) +
       resource.walker_indices.capacity() * sizeof(std::size_t);
@@ -1111,6 +1131,13 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
       batch_statistics.reference_evaluations;
   diagnostics.dense_coordinate_bytes_avoided =
       batch_statistics.dense_coordinate_bytes_avoided;
+  diagnostics.weighted_reference_configurations =
+      resource.weighted_reference_configurations;
+  diagnostics.weighted_replacement_configurations =
+      resource.weighted_replacement_configurations;
+  diagnostics.weighted_active_parameters = resource.weighted_active_parameters;
+  diagnostics.weighted_derivative_staging_bytes =
+      resource.flat_virtual_weighted_derivatives.capacity() * sizeof(ValueType);
   diagnostics.backend_modes = {
       directBackendModeName(transaction.state().direct_value_mode),
       directBackendModeName(transaction.state().direct_spatial_mode),
@@ -3207,7 +3234,7 @@ void PsiFormerWF::gatherSelectedGradientUnderRead(
     throw std::logic_error("PsiFormer optimizer mapping has the wrong size");
 
   output.clear();
-  output.reserve(selected_flat_indices.size());
+  output.reserve(static_cast<std::size_t>(variables.size_of_active()));
   for (std::size_t local_index = 0; local_index < selected_flat_indices.size(); ++local_index)
   {
     const int global_index = variables.where(local_index);
@@ -3828,6 +3855,344 @@ void PsiFormerWF::evaluateDerivRatiosWeighted(const VirtualParticleSet& virtual_
       weighted_derivatives.size, nullptr, delta);
   for (const auto& [global_index, value] : delta)
     weighted_derivatives[global_index] += value;
+}
+
+// Contract one flattened virtual batch without materializing a Q-by-parameter matrix.
+WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualDerivRatiosWeighted(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+    const VirtualParticleBatch& virtual_batch,
+    const OptVariables& optvars,
+    const std::vector<ValueType>& total_weights,
+    const std::vector<ParameterDerivativeView>& weighted_derivatives) const
+{
+  if (this != std::addressof(wfc_list.getLeader()))
+    throw std::invalid_argument(
+        "PsiFormer flattened weighted reduction must be invoked on the component-list leader");
+  if (wfc_list.size() != virtual_batch.walkerCount() ||
+      p_list.size() != virtual_batch.walkerCount() ||
+      vp_scratch_list.size() != virtual_batch.walkerCount() ||
+      weighted_derivatives.size() != virtual_batch.walkerCount())
+    throw std::invalid_argument(
+        "PsiFormer flattened weighted-reduction lists do not match the descriptor walker count");
+
+  virtual_batch.validateOutputExtent(total_weights.size());
+  virtual_batch.validateFor(p_list);
+
+  std::size_t required_destination_extent = 0;
+  for (std::size_t local_index = 0; local_index < optvars.size(); ++local_index)
+  {
+    const int global_index = optvars.where(local_index);
+    if (global_index >= 0)
+      required_destination_extent =
+          std::max(required_destination_extent,
+                   static_cast<std::size_t>(global_index) + 1);
+  }
+
+  const std::size_t destination_size =
+      weighted_derivatives.empty() ? 0 : weighted_derivatives.front().size;
+  if (!weighted_derivatives.empty() &&
+      destination_size < required_destination_extent)
+    throw std::invalid_argument(
+        "PsiFormer flattened weighted derivative rows are too short");
+
+  const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+  const std::size_t electron_count =
+      leader.model_state_->execution_plan.modelShape().electrons();
+
+  // Validate all topology and caller storage before synchronizing clone caches
+  // or lazily constructing the resource-owned score tape.
+  for (std::size_t walker = 0; walker < virtual_batch.walkerCount(); ++walker)
+  {
+    if (weighted_derivatives[walker].size != destination_size ||
+        (destination_size != 0 && weighted_derivatives[walker].data == nullptr))
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted derivative rows have inconsistent shapes");
+    if (typeid(wfc_list[walker]) != typeid(leader))
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted crowd contains different component types");
+    for (std::size_t other = 0; other < walker; ++other)
+    {
+      if (std::addressof(wfc_list[walker]) == std::addressof(wfc_list[other]))
+        throw std::invalid_argument(
+            "PsiFormer flattened weighted reduction requires distinct component clones");
+      if (std::addressof(vp_scratch_list[walker]) ==
+          std::addressof(vp_scratch_list[other]))
+        throw std::invalid_argument(
+            "PsiFormer flattened weighted reduction requires distinct scratch objects");
+    }
+
+    const ParticleSet* scratch_as_particles =
+        static_cast<const ParticleSet*>(std::addressof(vp_scratch_list[walker]));
+    for (std::size_t reference = 0; reference < virtual_batch.walkerCount();
+         ++reference)
+      if (scratch_as_particles == std::addressof(p_list[reference]))
+        throw std::invalid_argument(
+            "PsiFormer flattened weighted scratch objects must not alias reference walkers");
+    if (vp_scratch_list[walker].isSpinor() != p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted reference and scratch spinor modes differ");
+    if (p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted derivatives do not support spinor virtual moves");
+    if (static_cast<std::size_t>(p_list[walker].getTotalNum()) != electron_count)
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted walker has the wrong electron count");
+
+    const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    if (component.model_state_.get() != leader.model_state_.get())
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted crowd contains different models");
+    if (component.optimization_metadata_.get() !=
+        leader.optimization_metadata_.get())
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted crowd contains different optimizer mappings");
+  }
+  for (ValueType weight : total_weights)
+    if (!psiformer::determinant::isFiniteReal(std::real(weight)) ||
+        !psiformer::determinant::isFiniteReal(std::imag(weight)))
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted reduction received a non-finite weight");
+
+  PsiFormerDerivativeReadTransaction transaction(
+      *leader.model_state_, *leader.optimization_metadata_);
+  const std::size_t parameter_version =
+      transaction.modelTransaction().parameterVersion();
+  const EvaluationStamp evaluation_stamp = EvaluationStamp::versioned(
+      leader.model_state_.get(), static_cast<std::uint64_t>(parameter_version));
+
+  // RefVectorWithLeader retains a leader even when its element list is empty.
+  // Such a no-walker request still participates in the outer version protocol.
+  if (virtual_batch.walkerCount() == 0)
+    return evaluation_stamp;
+
+  PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+  std::vector<std::size_t>& active_global_indices =
+      resource.active_derivative_global_indices;
+  active_global_indices.clear();
+  active_global_indices.reserve(
+      static_cast<std::size_t>(transaction.variables().size_of_active()));
+  if (transaction.variables().size() != transaction.selectedFlatIndices().size())
+    throw std::logic_error("PsiFormer flattened weighted optimizer mapping has the wrong size");
+  const std::size_t parameter_count =
+      transaction.modelTransaction().model().p.flat_values().size();
+  for (std::size_t local_index = 0; local_index < transaction.variables().size();
+       ++local_index)
+  {
+    const std::size_t flat_index = transaction.selectedFlatIndices()[local_index];
+    if (flat_index >= parameter_count)
+      throw std::out_of_range(
+          "PsiFormer flattened weighted selected parameter is out of range");
+    const int global_index = transaction.variables().where(local_index);
+    if (global_index !=
+        optvars.getIndex(transaction.variables().name(local_index)))
+      throw std::invalid_argument(
+          "PsiFormer flattened weighted optimizer mapping is stale");
+    if (global_index < 0)
+      continue;
+    if (static_cast<std::size_t>(global_index) >= destination_size)
+      throw std::out_of_range(
+          "PsiFormer flattened weighted derivative destination is out of range");
+    active_global_indices.push_back(static_cast<std::size_t>(global_index));
+  }
+
+  // A successful no-work call still observes and propagates a genuine shared
+  // parameter publication so no clone retains a stale accepted-state cache.
+  for (std::size_t walker = 0; walker < virtual_batch.walkerCount(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
+        parameter_version);
+
+  constexpr std::size_t no_reference = std::numeric_limits<std::size_t>::max();
+  resource.active_virtual_walkers.clear();
+  resource.virtual_reference_indices.assign(virtual_batch.walkerCount(),
+                                             no_reference);
+  for (const VirtualParticleBatch::Segment& segment : virtual_batch.segments())
+  {
+    const std::size_t walker = static_cast<std::size_t>(segment.walkerId());
+    if (resource.virtual_reference_indices[walker] == no_reference)
+    {
+      resource.virtual_reference_indices[walker] =
+          resource.active_virtual_walkers.size();
+      resource.active_virtual_walkers.push_back(walker);
+    }
+  }
+
+  const std::size_t reference_count = resource.active_virtual_walkers.size();
+  const std::size_t active_count    = active_global_indices.size();
+  if (active_count != 0 &&
+      reference_count > std::numeric_limits<std::size_t>::max() / active_count)
+    throw std::length_error(
+        "PsiFormer flattened weighted derivative staging extent overflows");
+
+  resource.virtual_reference_weights.assign(reference_count, ValueType(0));
+  for (std::size_t segment_index = 0;
+       segment_index < virtual_batch.segmentCount(); ++segment_index)
+  {
+    const VirtualParticleBatch::Slice slice = virtual_batch.slice(segment_index);
+    const std::size_t reference = resource.virtual_reference_indices[
+        static_cast<std::size_t>(slice.walkerId())];
+    for (std::size_t local_index = 0; local_index < slice.size(); ++local_index)
+    {
+      ValueType& sum = resource.virtual_reference_weights[reference];
+      sum += total_weights[slice.flatOffset() + local_index];
+      if (!psiformer::determinant::isFiniteReal(std::real(sum)) ||
+          !psiformer::determinant::isFiniteReal(std::imag(sum)))
+        throw std::runtime_error(
+            "PsiFormer flattened weighted reference coefficient is non-finite");
+    }
+  }
+  resource.flat_virtual_weighted_derivatives.assign(reference_count * active_count,
+                                                     ValueType(0));
+
+  // Empty, fixed, and inactive calls still certify the model version observed
+  // by the value phase, but they do not construct a large score tape.
+  if (!transaction.metadata().enabled || active_count == 0 || reference_count == 0)
+  {
+    resource.weighted_reference_configurations   = 0;
+    resource.weighted_replacement_configurations = 0;
+    resource.weighted_active_parameters           = active_count;
+    return evaluation_stamp;
+  }
+
+  const DirectBackendMode score_mode =
+      transaction.modelTransaction().state().direct_score_mode;
+  pf::DirectScoreWorkspace* score_workspace =
+      score_mode == DirectBackendMode::ORACLE
+      ? nullptr
+      : &resource.requireScoreWorkspace();
+
+  // Gather one selected score and immediately fold it into its compact row;
+  // direct result views alias the serialized workspace and cannot be retained.
+  auto accumulate_score = [&](PsiFormerWF& component,
+                              const ParticleSet& particles,
+                              int replaced_particle,
+                              const PosType* replacement_position,
+                              ValueType scale,
+                              std::size_t reference) {
+    SelectedDerivativeDelta& contribution = resource.virtual_score_contribution;
+    if (score_mode == DirectBackendMode::ORACLE)
+    {
+      const pf::Result oracle = component.evaluatePositionsUnderRead(
+          transaction.modelTransaction(), particles, replaced_particle,
+          replacement_position, EvaluationPurpose::SCORE_ONLY);
+      component.gatherSelectedGradientUnderRead(
+          transaction, oracle.param_gradient.data(), oracle.param_gradient.size(),
+          scale, destination_size, contribution);
+    }
+    else
+    {
+      const pf::DirectScoreResult direct =
+          component.evaluateDirectScorePositionsUnderRead(
+              transaction.modelTransaction(), particles, replaced_particle,
+              replacement_position, *score_workspace);
+
+      if (score_mode == DirectBackendMode::COMPARE)
+      {
+        pf::Tensor positions({static_cast<std::size_t>(particles.getTotalNum()), 3});
+        for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+        {
+          const PosType& position = electron == replaced_particle
+              ? (replacement_position ? *replacement_position
+                                      : particles.activeR(electron))
+              : particles.R[electron];
+          for (int dimension = 0; dimension < 3; ++dimension)
+            positions.x[3 * electron + dimension] = position[dimension];
+        }
+        pf::EvaluationRequest request;
+        request.spatial_derivatives   = pf::SpatialDerivativeRequest::NONE;
+        request.parameter_derivatives = pf::ParameterDerivativeRequest::LOG_ONLY;
+        request.validation_hamiltonian = pf::ValidationHamiltonianRequest::NONE;
+        const pf::Result oracle =
+            transaction.modelTransaction().model().evaluate(positions, request);
+        const double log_scale =
+            std::max(std::abs(oracle.logabs), std::abs(direct.logabs));
+        if (oracle.sign != direct.sign ||
+            std::abs(oracle.logabs - direct.logabs) >
+                2.0e-11 * (1.0 + log_scale) ||
+            oracle.param_gradient.size() != direct.parameter_score.size)
+          throw std::runtime_error(
+              "PsiFormer flattened direct score differs from the native oracle");
+        for (std::size_t parameter = 0;
+             parameter < oracle.param_gradient.size(); ++parameter)
+          if (std::abs(oracle.param_gradient[parameter] -
+                       direct.parameter_score[parameter]) > 2.0e-8)
+            throw std::runtime_error(
+                "PsiFormer flattened direct parameter score differs from the native oracle");
+
+        // Compare mode follows the established migration convention: validate
+        // the direct engine, then publish the native oracle result.
+        component.gatherSelectedGradientUnderRead(
+            transaction, oracle.param_gradient.data(),
+            oracle.param_gradient.size(), scale, destination_size,
+            contribution);
+      }
+      else
+        component.gatherSelectedGradientUnderRead(
+            transaction, direct.parameter_score.data,
+            direct.parameter_score.size, scale, destination_size,
+            contribution);
+    }
+
+    if (contribution.size() != active_count)
+      throw std::logic_error(
+          "PsiFormer flattened weighted score mapping changed");
+    const std::size_t row_offset = reference * active_count;
+    for (std::size_t selected = 0; selected < active_count; ++selected)
+    {
+      if (contribution[selected].first !=
+          resource.active_derivative_global_indices[selected])
+        throw std::logic_error(
+            "PsiFormer flattened weighted score mapping changed");
+      ValueType& destination =
+          resource.flat_virtual_weighted_derivatives[row_offset + selected];
+      destination += contribution[selected].second;
+      if (!psiformer::determinant::isFiniteReal(std::real(destination)) ||
+          !psiformer::determinant::isFiniteReal(std::imag(destination)))
+        throw std::runtime_error(
+            "PsiFormer flattened weighted score reduction is non-finite");
+    }
+  };
+
+  for (std::size_t reference = 0; reference < reference_count; ++reference)
+  {
+    const std::size_t walker = resource.active_virtual_walkers[reference];
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    accumulate_score(component, p_list[walker], -1, nullptr,
+                     -resource.virtual_reference_weights[reference], reference);
+  }
+
+  for (std::size_t segment_index = 0;
+       segment_index < virtual_batch.segmentCount(); ++segment_index)
+  {
+    const VirtualParticleBatch::Slice slice = virtual_batch.slice(segment_index);
+    const std::size_t walker = static_cast<std::size_t>(slice.walkerId());
+    const std::size_t reference = resource.virtual_reference_indices[walker];
+    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    for (std::size_t local_index = 0; local_index < slice.size(); ++local_index)
+    {
+      const std::size_t flat_index = slice.flatOffset() + local_index;
+      accumulate_score(component, p_list[walker], slice.electronId(),
+                       std::addressof(slice.absolutePosition(local_index)),
+                       total_weights[flat_index], reference);
+    }
+  }
+
+  // Caller rows change only after every reference and replacement score has
+  // succeeded, preserving the component-level whole-crowd transaction.
+  for (std::size_t reference = 0; reference < reference_count; ++reference)
+  {
+    const std::size_t walker = resource.active_virtual_walkers[reference];
+    const std::size_t row_offset = reference * active_count;
+    for (std::size_t selected = 0; selected < active_count; ++selected)
+      weighted_derivatives[walker][resource.active_derivative_global_indices[selected]] +=
+          resource.flat_virtual_weighted_derivatives[row_offset + selected];
+  }
+
+  resource.weighted_reference_configurations   = reference_count;
+  resource.weighted_replacement_configurations = virtual_batch.size();
+  resource.weighted_active_parameters           = active_count;
+  return evaluation_stamp;
 }
 
 // Validate and reduce one weighted virtual-move set, optionally in crowd-owned scratch.

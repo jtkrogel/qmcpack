@@ -16,7 +16,9 @@
 #include "Particle/VirtualParticleBatch.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
+#include "Utilities/RuntimeOptions.h"
 #include "psiformer_test_utils.h"
 
 #include <algorithm>
@@ -28,6 +30,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -126,6 +129,20 @@ public:
     return component.crowdWorkspaceDiagnosticsForTesting(wfc_list);
   }
 
+  /// Count clone-local score tapes; flattened crowd scoring must own none.
+  static std::size_t cloneScoreWorkspaceCount(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list)
+  {
+    std::size_t count = 0;
+    for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    {
+      const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      if (component.direct_score_workspace_)
+        ++count;
+    }
+    return count;
+  }
+
 private:
   static bool sameGradient(const ParticleSet::ParticleGradient& actual,
                            const ParticleSet::ParticleGradient& expected)
@@ -219,8 +236,13 @@ void checkGrad(const PsiFormerWF::GradType& actual,
 
 struct Crowd
 {
-  Crowd(const GeneratedFiles& files, const SimulationCell& simulation_cell, std::size_t size)
-      : leader("pf_mw", files.parameters.string(), files.configuration.string()),
+  Crowd(const GeneratedFiles& files,
+        const SimulationCell& simulation_cell,
+        std::size_t size,
+        bool optimize = false,
+        std::vector<std::size_t> selected_flat_indices = {})
+      : leader("pf_mw", files.parameters.string(), files.configuration.string(),
+               optimize, std::move(selected_flat_indices)),
         wfc_list(leader)
   {
     walkers.reserve(size);
@@ -302,6 +324,122 @@ std::vector<Value> evaluateScalarVirtualBatch(Crowd& crowd,
               ratios.begin() + slice.flatOffset());
   }
   return ratios;
+}
+
+/// Build a global optimizer map whose PsiFormer destinations are sparse and reordered.
+OptVariables configureSparseSelectedMapping(PsiFormerWF& component)
+{
+  OptVariables selected;
+  component.checkInVariablesExclusive(selected);
+  REQUIRE(selected.size() == 3);
+
+  OptVariables active;
+  active.insert("ordinary_padding_0", -1.0, true, optimize::LINEAR_P);
+  active.insert(selected.name(2), selected[2]);
+  active.insert("ordinary_padding_1", 2.0, true, optimize::LOGLINEAR_P);
+  active.insert(selected.name(0), selected[0]);
+  active.insert("ordinary_padding_2", 3.0, true, optimize::SPO_P);
+  active.insert(selected.name(1), selected[1]);
+  active.resetIndex();
+  component.checkOutVariables(active);
+
+  CHECK(active.getIndex(selected.name(0)) == 3);
+  CHECK(active.getIndex(selected.name(1)) == 5);
+  CHECK(active.getIndex(selected.name(2)) == 1);
+  return active;
+}
+
+/// Map only the first selected PsiFormer variable behind one unrelated global slot.
+OptVariables configureFirstSelectedOnly(PsiFormerWF& component,
+                                        std::size_t expected_selected_count)
+{
+  OptVariables selected;
+  component.checkInVariablesExclusive(selected);
+  REQUIRE(selected.size() == expected_selected_count);
+
+  OptVariables active;
+  active.insert("ordinary_partial_padding", -2.0, true, optimize::LINEAR_P);
+  active.insert(selected.name(0), selected[0]);
+  active.resetIndex();
+  component.checkOutVariables(active);
+  CHECK(active.getIndex(selected.name(0)) == 1);
+  return active;
+}
+
+/// Construct a real or genuinely complex quadrature coefficient for both builds.
+Value makeWeight(double real_part, double imaginary_part = 0.0)
+{
+#ifdef QMC_COMPLEX
+  return Value(real_part, imaginary_part);
+#else
+  static_cast<void>(imaginary_part);
+  return Value(real_part);
+#endif
+}
+
+/** Materialized scalar result used as the established compatibility oracle for the
+ * compact flattened weighted implementation. */
+struct MaterializedWeightedOracle
+{
+  std::vector<Value> ratios;
+  std::vector<Value> total_weights;
+  std::vector<std::vector<Value>> derivatives;
+};
+
+/// Contract scalar derivative-ratio matrices segment by segment as an oracle.
+MaterializedWeightedOracle evaluateMaterializedWeightedOracle(
+    Crowd& crowd,
+    const VirtualParticleBatch& batch,
+    const OptVariables& active,
+    const std::vector<Value>& bare_weights,
+    const std::vector<std::vector<Value>>& initial_derivatives)
+{
+  REQUIRE(bare_weights.size() == batch.size());
+  REQUIRE(initial_derivatives.size() == crowd.walkers.size());
+
+  MaterializedWeightedOracle oracle;
+  oracle.ratios.resize(batch.size());
+  oracle.total_weights.resize(batch.size());
+  oracle.derivatives = initial_derivatives;
+  for (std::size_t segment_index = 0; segment_index < batch.segmentCount();
+       ++segment_index)
+  {
+    const VirtualParticleBatch::Slice slice = batch.slice(segment_index);
+    const std::size_t walker = static_cast<std::size_t>(slice.walkerId());
+    VirtualParticleSet scratch(*crowd.walkers[walker]);
+    scratch.makeMovesAbsolute(*crowd.walkers[walker], slice.electronId(),
+                              slice.positions(), slice.isOnSphere(),
+                              slice.sourceCenterId());
+    std::vector<Value> segment_ratios(slice.size());
+    Matrix<Value> derivative_ratios(slice.size(), active.size());
+    derivative_ratios = Value(0);
+    crowd.components[walker]->evaluateDerivRatios(
+        scratch, active, segment_ratios, derivative_ratios);
+
+    for (std::size_t local_index = 0; local_index < slice.size(); ++local_index)
+    {
+      const std::size_t flat_index = slice.flatOffset() + local_index;
+      oracle.ratios[flat_index] = segment_ratios[local_index];
+      oracle.total_weights[flat_index] =
+          bare_weights[flat_index] * segment_ratios[local_index];
+      for (std::size_t parameter = 0; parameter < active.size(); ++parameter)
+        oracle.derivatives[walker][parameter] +=
+            oracle.total_weights[flat_index] *
+            derivative_ratios(local_index, parameter);
+    }
+  }
+  return oracle;
+}
+
+/// Create non-owning derivative rows for a vector-backed test destination.
+std::vector<WaveFunctionComponent::ParameterDerivativeView> makeDerivativeViews(
+    std::vector<std::vector<Value>>& derivatives)
+{
+  std::vector<WaveFunctionComponent::ParameterDerivativeView> views;
+  views.reserve(derivatives.size());
+  for (std::vector<Value>& row : derivatives)
+    views.push_back({row.empty() ? nullptr : row.data(), row.size()});
+  return views;
 }
 
 } // namespace
@@ -798,6 +936,704 @@ TEST_CASE("PsiFormer flattened virtual batches honor oracle and compare backends
       }
     }
   }
+}
+
+TEST_CASE("PsiFormer flattened weighted derivatives match materialized sparse scores",
+          "[wavefunction][psiformer][multiwalker][ecp][weighted]")
+{
+  ScopedEnvironmentVariable score_backend("PSIFORMER_SCORE_BACKEND", "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const std::vector<std::size_t> selected_flat_indices{0, 1, 127};
+  Crowd crowd(files, simulation_cell, 4, true, selected_flat_indices);
+  Crowd oracle_crowd(files, simulation_cell, 4, true, selected_flat_indices);
+  const OptVariables active = configureSparseSelectedMapping(crowd.leader);
+  const OptVariables oracle_active =
+      configureSparseSelectedMapping(oracle_crowd.leader);
+  REQUIRE(active.size() == oracle_active.size());
+
+  // Segments are not walker ordered, walker 2 moves two different electrons,
+  // and walker 3 is deliberately absent from the descriptor.
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(crowd, 2, 3,
+                       {{0.012, -0.007, 0.005}, {-0.009, 0.011, 0.004}},
+                       offsets, segments, positions);
+  appendVirtualSegment(crowd, 0, 1, {{0.006, 0.003, -0.008}}, offsets,
+                       segments, positions);
+  appendVirtualSegment(crowd, 2, 0,
+                       {{-0.004, 0.008, 0.013}, {0.015, -0.006, -0.002}},
+                       offsets, segments, positions);
+  appendVirtualSegment(crowd, 1, 2,
+                       {{0.007, -0.014, 0.009}, {-0.011, 0.005, 0.012}},
+                       offsets, segments, positions);
+  const VirtualParticleBatch batch(crowd.walkers.size(), offsets, segments,
+                                   positions);
+
+  const std::vector<Value> bare_weights{
+      makeWeight(0.17, 0.03),  makeWeight(-0.09, 0.02),
+      makeWeight(0.13, -0.04), makeWeight(0.21, 0.01),
+      makeWeight(-0.08, 0.05), makeWeight(0.11, -0.02),
+      makeWeight(-0.06, -0.03)};
+  REQUIRE(bare_weights.size() == batch.size());
+
+  // Oversized rows exercise sparse destinations 1, 3, and 5 while protecting
+  // padding and trailing entries from accidental dense writes.
+  std::vector<std::vector<Value>> initial_derivatives(crowd.walkers.size());
+  for (std::size_t walker = 0; walker < initial_derivatives.size(); ++walker)
+    initial_derivatives[walker].assign(active.size() + 2,
+                                       Value(10.0 + walker));
+  const MaterializedWeightedOracle oracle =
+      evaluateMaterializedWeightedOracle(oracle_crowd, batch, oracle_active,
+                                         bare_weights, initial_derivatives);
+
+  // A second descriptor keeps the same active walkers and parameters while
+  // increasing Q, so diagnostics can verify retained derivative staging is Q-independent.
+  std::vector<std::size_t> larger_offsets{0};
+  std::vector<VirtualParticleBatch::Segment> larger_segments;
+  std::vector<ParticleSet::PosType> larger_positions;
+  appendVirtualSegment(crowd, 2, 3,
+                       {{0.012, -0.007, 0.005}, {-0.009, 0.011, 0.004},
+                        {0.003, 0.006, -0.010}, {-0.013, -0.002, 0.007}},
+                       larger_offsets, larger_segments, larger_positions);
+  appendVirtualSegment(crowd, 0, 1,
+                       {{0.006, 0.003, -0.008}, {-0.005, 0.010, 0.004},
+                        {0.009, -0.004, 0.006}},
+                       larger_offsets, larger_segments, larger_positions);
+  appendVirtualSegment(crowd, 1, 2,
+                       {{0.007, -0.014, 0.009}, {-0.011, 0.005, 0.012},
+                        {0.004, 0.008, -0.006}},
+                       larger_offsets, larger_segments, larger_positions);
+  const VirtualParticleBatch larger_batch(
+      crowd.walkers.size(), larger_offsets, larger_segments, larger_positions);
+  const std::vector<Value> larger_bare_weights{
+      Value(0.03), Value(-0.04), Value(0.05), Value(-0.06), Value(0.07),
+      Value(-0.08), Value(0.09), Value(-0.10), Value(0.11), Value(-0.12)};
+  REQUIRE(larger_bare_weights.size() == larger_batch.size());
+  const MaterializedWeightedOracle larger_oracle =
+      evaluateMaterializedWeightedOracle(
+          oracle_crowd, larger_batch, oracle_active, larger_bare_weights,
+          initial_derivatives);
+
+  // Populate accepted VGL state and leave one ordinary proposal pending.  The
+  // flattened value and score paths must be completely read-only at this version.
+  for (std::size_t walker = 0; walker < crowd.walkers.size(); ++walker)
+  {
+    crowd.walkers[walker]->G = Value(0);
+    crowd.walkers[walker]->L = Value(0);
+    crowd.components[walker]->evaluateLog(
+        *crowd.walkers[walker], crowd.walkers[walker]->G,
+        crowd.walkers[walker]->L);
+  }
+  constexpr int proposed_electron = 1;
+  crowd.walkers[2]->makeMove(
+      proposed_electron, ParticleSet::PosType{0.003, -0.005, 0.007});
+  CHECK(std::isfinite(std::real(
+      crowd.components[2]->ratio(*crowd.walkers[2], proposed_electron))));
+
+  std::vector<testing::PsiFormerCloneStateSnapshot> states_before;
+  for (const PsiFormerWF* component : crowd.components)
+    states_before.push_back(
+        testing::TestPsiFormerVirtualBatch::cloneState(*component));
+
+  VirtualScratchCrowd scratch(crowd);
+  std::vector<std::vector<ParticleSet::PosType>> scratch_positions_before;
+  for (const auto& virtual_particles : scratch.storage)
+    scratch_positions_before.emplace_back(virtual_particles->R.begin(),
+                                          virtual_particles->R.end());
+
+  ResourceCollection resource_template("psiformer_flattened_weighted_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection crowd_resource(resource_template);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(crowd_resource,
+                                                            crowd.wfc_list);
+    std::vector<Value> actual_ratios(batch.size(), Value(-71));
+    const WaveFunctionComponent::EvaluationStamp value_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch,
+            actual_ratios);
+
+    std::vector<std::vector<Value>> actual_derivatives = initial_derivatives;
+    std::vector<WaveFunctionComponent::ParameterDerivativeView> derivative_views =
+        makeDerivativeViews(actual_derivatives);
+    const WaveFunctionComponent::EvaluationStamp derivative_stamp =
+        crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, active,
+            oracle.total_weights, derivative_views);
+    REQUIRE(value_stamp.isVersioned());
+    CHECK(derivative_stamp == value_stamp);
+
+    for (std::size_t virtual_index = 0; virtual_index < batch.size();
+         ++virtual_index)
+      checkValue(actual_ratios[virtual_index], oracle.ratios[virtual_index]);
+    for (std::size_t walker = 0; walker < crowd.walkers.size(); ++walker)
+    {
+      for (std::size_t parameter = 0; parameter < actual_derivatives[walker].size();
+           ++parameter)
+        checkValue(actual_derivatives[walker][parameter],
+                   oracle.derivatives[walker][parameter], 5.0e-8);
+      for (std::size_t padding : {std::size_t{0}, std::size_t{2},
+                                  std::size_t{4}, std::size_t{6},
+                                  std::size_t{7}})
+        CHECK(actual_derivatives[walker][padding] ==
+              initial_derivatives[walker][padding]);
+    }
+
+    const testing::PsiFormerCrowdWorkspaceDiagnostics first_diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(first_diagnostics.score_workspace_identity != nullptr);
+    CHECK(first_diagnostics.weighted_reference_configurations == 3);
+    CHECK(first_diagnostics.weighted_replacement_configurations == batch.size());
+    CHECK(first_diagnostics.weighted_active_parameters == 3);
+    CHECK(first_diagnostics.weighted_derivative_staging_bytes >=
+          3 * 3 * sizeof(Value));
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneScoreWorkspaceCount(
+              crowd.wfc_list) == 0);
+
+    // A warmed call reuses the single score tape and compact staging capacity.
+    std::vector<std::vector<Value>> repeated_derivatives = initial_derivatives;
+    derivative_views = makeDerivativeViews(repeated_derivatives);
+    const WaveFunctionComponent::EvaluationStamp repeated_stamp =
+        crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, active,
+            oracle.total_weights, derivative_views);
+    CHECK(repeated_stamp == derivative_stamp);
+    for (std::size_t walker = 0; walker < crowd.walkers.size(); ++walker)
+      for (std::size_t parameter = 0;
+           parameter < repeated_derivatives[walker].size(); ++parameter)
+        checkValue(repeated_derivatives[walker][parameter],
+                   oracle.derivatives[walker][parameter], 5.0e-8);
+
+    const testing::PsiFormerCrowdWorkspaceDiagnostics repeated_diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(repeated_diagnostics.score_workspace_identity ==
+          first_diagnostics.score_workspace_identity);
+    CHECK(repeated_diagnostics.score_bytes == first_diagnostics.score_bytes);
+    CHECK(repeated_diagnostics.weighted_derivative_staging_bytes ==
+          first_diagnostics.weighted_derivative_staging_bytes);
+    CHECK(repeated_diagnostics.transient_bytes == first_diagnostics.transient_bytes);
+
+    std::vector<std::vector<Value>> larger_derivatives = initial_derivatives;
+    derivative_views = makeDerivativeViews(larger_derivatives);
+    crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+        crowd.wfc_list, *crowd.p_list, *scratch.list, larger_batch, active,
+        larger_oracle.total_weights, derivative_views);
+    for (std::size_t walker = 0; walker < crowd.walkers.size(); ++walker)
+      for (std::size_t parameter = 0;
+           parameter < larger_derivatives[walker].size(); ++parameter)
+        checkValue(larger_derivatives[walker][parameter],
+                   larger_oracle.derivatives[walker][parameter], 5.0e-8);
+    const testing::PsiFormerCrowdWorkspaceDiagnostics larger_diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(larger_diagnostics.weighted_reference_configurations == 3);
+    CHECK(larger_diagnostics.weighted_replacement_configurations ==
+          larger_batch.size());
+    CHECK(larger_diagnostics.weighted_derivative_staging_bytes ==
+          first_diagnostics.weighted_derivative_staging_bytes);
+    CHECK(larger_diagnostics.score_workspace_identity ==
+          first_diagnostics.score_workspace_identity);
+    CHECK(larger_diagnostics.transient_bytes ==
+          repeated_diagnostics.transient_bytes);
+  }
+
+  for (std::size_t walker = 0; walker < crowd.components.size(); ++walker)
+  {
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+        *crowd.components[walker], states_before[walker]));
+    CHECK(std::vector<ParticleSet::PosType>(scratch.storage[walker]->R.begin(),
+                                            scratch.storage[walker]->R.end()) ==
+          scratch_positions_before[walker]);
+  }
+  crowd.walkers[2]->rejectMove(proposed_electron);
+}
+
+TEST_CASE("PsiFormer flattened weighted scratch follows mapped active parameters",
+          "[wavefunction][psiformer][multiwalker][ecp][weighted]")
+{
+  ScopedEnvironmentVariable score_backend("PSIFORMER_SCORE_BACKEND", "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  std::vector<std::size_t> many_selected(128);
+  std::iota(many_selected.begin(), many_selected.end(), std::size_t{0});
+
+  Crowd many_crowd(files, simulation_cell, 2, true, many_selected);
+  Crowd one_crowd(files, simulation_cell, 2, true, {0});
+  const OptVariables many_active =
+      configureFirstSelectedOnly(many_crowd.leader, many_selected.size());
+  const OptVariables one_active =
+      configureFirstSelectedOnly(one_crowd.leader, 1);
+  REQUIRE(many_active.size() == one_active.size());
+
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(many_crowd, 0, 1,
+                       {{0.006, 0.003, -0.008}, {-0.005, 0.010, 0.004}},
+                       offsets, segments, positions);
+  appendVirtualSegment(many_crowd, 1, 2, {{0.007, -0.014, 0.009}}, offsets,
+                       segments, positions);
+  const VirtualParticleBatch batch(2, offsets, segments, positions);
+  const std::vector<Value> weights{Value(0.14), Value(-0.08), Value(0.11)};
+
+  auto evaluate = [&](Crowd& crowd, const OptVariables& active,
+                      const std::string& resource_name) {
+    VirtualScratchCrowd scratch(crowd);
+    std::vector<std::vector<Value>> derivatives(
+        2, std::vector<Value>(active.size(), Value(3.5)));
+    std::vector<WaveFunctionComponent::ParameterDerivativeView> views =
+        makeDerivativeViews(derivatives);
+    ResourceCollection resource_template(resource_name);
+    crowd.leader.createResource(resource_template);
+    ResourceCollection resource(resource_template);
+    {
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                              crowd.wfc_list);
+      crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+          crowd.wfc_list, *crowd.p_list, *scratch.list, batch, active, weights,
+          views);
+      return std::pair{
+          std::move(derivatives),
+          testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+              crowd.leader, crowd.wfc_list)};
+    }
+  };
+
+  auto [many_derivatives, many_diagnostics] =
+      evaluate(many_crowd, many_active, "psiformer_many_selected_partial");
+  auto [one_derivatives, one_diagnostics] =
+      evaluate(one_crowd, one_active, "psiformer_one_selected_partial");
+  for (std::size_t walker = 0; walker < many_derivatives.size(); ++walker)
+  {
+    CHECK(many_derivatives[walker][0] == Value(3.5));
+    CHECK(one_derivatives[walker][0] == Value(3.5));
+    checkValue(many_derivatives[walker][1], one_derivatives[walker][1],
+               5.0e-8);
+  }
+  CHECK(many_diagnostics.weighted_active_parameters == 1);
+  CHECK(one_diagnostics.weighted_active_parameters == 1);
+  CHECK(many_diagnostics.weighted_derivative_staging_bytes ==
+        one_diagnostics.weighted_derivative_staging_bytes);
+  CHECK(many_diagnostics.transient_bytes == one_diagnostics.transient_bytes);
+  CHECK(many_diagnostics.score_bytes == one_diagnostics.score_bytes);
+
+  // A large selected set with no mapped PsiFormer variables must not create
+  // either the full score tape or any active-parameter staging.
+  Crowd inactive_crowd(files, simulation_cell, 2, true, many_selected);
+  OptVariables unrelated_active;
+  unrelated_active.insert("ordinary_only", 1.0, true, optimize::LINEAR_P);
+  unrelated_active.resetIndex();
+  inactive_crowd.leader.checkOutVariables(unrelated_active);
+  VirtualScratchCrowd inactive_scratch(inactive_crowd);
+  std::vector<std::vector<Value>> inactive_derivatives(
+      2, std::vector<Value>(1, Value(7.0)));
+  std::vector<WaveFunctionComponent::ParameterDerivativeView> inactive_views =
+      makeDerivativeViews(inactive_derivatives);
+  ResourceCollection inactive_template("psiformer_many_selected_inactive");
+  inactive_crowd.leader.createResource(inactive_template);
+  ResourceCollection inactive_resource(inactive_template);
+  ResourceCollectionTeamLock<WaveFunctionComponent> inactive_lock(
+      inactive_resource, inactive_crowd.wfc_list);
+  inactive_crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+      inactive_crowd.wfc_list, *inactive_crowd.p_list, *inactive_scratch.list,
+      batch, unrelated_active, weights, inactive_views);
+  CHECK(inactive_derivatives ==
+        std::vector<std::vector<Value>>(2, std::vector<Value>(1, Value(7.0))));
+  const testing::PsiFormerCrowdWorkspaceDiagnostics inactive_diagnostics =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          inactive_crowd.leader, inactive_crowd.wfc_list);
+  CHECK(inactive_diagnostics.score_workspace_identity == nullptr);
+  CHECK(inactive_diagnostics.weighted_active_parameters == 0);
+  CHECK(inactive_diagnostics.weighted_derivative_staging_bytes == 0);
+}
+
+TEST_CASE("TrialWaveFunction flattened weighted dispatch accepts PsiFormer version stamps",
+          "[wavefunction][psiformer][multiwalker][ecp][weighted][trialwf]")
+{
+  ScopedEnvironmentVariable score_backend("PSIFORMER_SCORE_BACKEND", "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const std::vector<std::size_t> selected_flat_indices{0, 1, 127};
+
+  RuntimeOptions runtime_options;
+  auto walker0 = makeWalker(simulation_cell, 0);
+  auto walker1 = makeWalker(simulation_cell, 1);
+  TrialWaveFunction wavefunction0(runtime_options, "pf_weighted_twf");
+  auto component = std::make_unique<PsiFormerWF>(
+      "pf_mw", files.parameters.string(), files.configuration.string(), true,
+      selected_flat_indices);
+  PsiFormerWF* component0 = component.get();
+  wavefunction0.addComponent(std::move(component));
+  const OptVariables active = configureSparseSelectedMapping(*component0);
+  wavefunction0.checkOutVariables(active);
+
+  std::unique_ptr<TrialWaveFunction> wavefunction1 =
+      wavefunction0.makeClone(*walker1);
+  wavefunction1->checkOutVariables(active);
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction0);
+  wavefunctions.push_back(wavefunction0);
+  wavefunctions.push_back(*wavefunction1);
+  RefVectorWithLeader<ParticleSet> particles(*walker0);
+  particles.push_back(*walker0);
+  particles.push_back(*walker1);
+
+  // Use a distinct component crowd for the materialized scalar oracle so the
+  // integration fixture begins without clone-local score tapes.
+  Crowd oracle_crowd(files, simulation_cell, 2, true, selected_flat_indices);
+  const OptVariables oracle_active =
+      configureSparseSelectedMapping(oracle_crowd.leader);
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(oracle_crowd, 1, 2,
+                       {{0.007, -0.006, 0.005}, {-0.004, 0.009, 0.003}},
+                       offsets, segments, positions);
+  appendVirtualSegment(oracle_crowd, 0, 0, {{0.011, 0.002, -0.008}},
+                       offsets, segments, positions);
+  appendVirtualSegment(oracle_crowd, 1, 3, {{-0.006, 0.004, 0.010}},
+                       offsets, segments, positions);
+  const VirtualParticleBatch batch(2, offsets, segments, positions);
+  const std::vector<Value> bare_weights{
+      makeWeight(0.19, 0.03), makeWeight(-0.12, -0.02),
+      makeWeight(0.08, 0.01), makeWeight(0.16, -0.04)};
+  std::vector<std::vector<Value>> initial_derivatives(
+      2, std::vector<Value>(active.size(), Value(4.25)));
+  const MaterializedWeightedOracle oracle =
+      evaluateMaterializedWeightedOracle(
+          oracle_crowd, batch, oracle_active, bare_weights,
+          initial_derivatives);
+
+  auto scratch0 = std::make_unique<VirtualParticleSet>(*walker0);
+  auto scratch1 = std::make_unique<VirtualParticleSet>(*walker1);
+  RefVectorWithLeader<VirtualParticleSet> scratch(*scratch0);
+  scratch.push_back(*scratch0);
+  scratch.push_back(*scratch1);
+
+  std::vector<Value> ratios(batch.size(), Value(-79));
+  std::vector<std::vector<Value>> derivatives = initial_derivatives;
+  std::vector<TrialWaveFunction::ParameterDerivativeView> derivative_views =
+      makeDerivativeViews(derivatives);
+  std::vector<TrialWaveFunction::EvaluationStamp> stamps;
+
+  ResourceCollection resource_collection("psiformer_weighted_twf_resources");
+  wavefunction0.createResource(resource_collection);
+  {
+    ResourceCollectionTeamLock<TrialWaveFunction> lock(resource_collection,
+                                                        wavefunctions);
+    TrialWaveFunction::mw_evaluateVirtualDerivRatiosWeighted(
+        wavefunctions, particles, scratch, batch, active, bare_weights, ratios,
+        derivative_views, stamps);
+  }
+
+  for (std::size_t virtual_index = 0; virtual_index < batch.size();
+       ++virtual_index)
+    checkValue(ratios[virtual_index], oracle.ratios[virtual_index]);
+  for (std::size_t walker = 0; walker < derivatives.size(); ++walker)
+    for (std::size_t parameter = 0; parameter < derivatives[walker].size();
+         ++parameter)
+      checkValue(derivatives[walker][parameter],
+                 oracle.derivatives[walker][parameter], 5.0e-8);
+  REQUIRE(stamps.size() == 1);
+  CHECK(stamps.front().isVersioned());
+}
+
+TEST_CASE("PsiFormer flattened weighted no-work paths retain version semantics",
+          "[wavefunction][psiformer][multiwalker][ecp][weighted]")
+{
+  ScopedEnvironmentVariable score_backend("PSIFORMER_SCORE_BACKEND", "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+
+  SECTION("fixed component with virtual positions")
+  {
+    Crowd crowd(files, simulation_cell, 2);
+    std::vector<std::size_t> offsets{0};
+    std::vector<VirtualParticleBatch::Segment> segments;
+    std::vector<ParticleSet::PosType> positions;
+    appendVirtualSegment(crowd, 1, 2,
+                         {{0.007, -0.006, 0.005}, {-0.004, 0.009, 0.003}},
+                         offsets, segments, positions);
+    const VirtualParticleBatch batch(2, offsets, segments, positions);
+    VirtualScratchCrowd scratch(crowd);
+    const OptVariables no_parameters;
+    std::vector<Value> ratios(batch.size(), Value(-83));
+    std::vector<Value> total_weights(batch.size(), Value(0.125));
+    std::vector<std::vector<Value>> derivatives(2);
+    std::vector<WaveFunctionComponent::ParameterDerivativeView> views =
+        makeDerivativeViews(derivatives);
+
+    ResourceCollection resource_template("psiformer_fixed_weighted_template");
+    crowd.leader.createResource(resource_template);
+    ResourceCollection resource(resource_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                            crowd.wfc_list);
+    const WaveFunctionComponent::EvaluationStamp value_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch, ratios);
+    const WaveFunctionComponent::EvaluationStamp weighted_stamp =
+        crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, batch,
+            no_parameters, total_weights, views);
+    REQUIRE(value_stamp.isVersioned());
+    CHECK(weighted_stamp == value_stamp);
+    CHECK(derivatives[0].empty());
+    CHECK(derivatives[1].empty());
+
+    const testing::PsiFormerCrowdWorkspaceDiagnostics diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(diagnostics.score_workspace_identity == nullptr);
+    CHECK(diagnostics.weighted_reference_configurations == 0);
+    CHECK(diagnostics.weighted_replacement_configurations == 0);
+    CHECK(diagnostics.weighted_active_parameters == 0);
+  }
+
+  SECTION("empty active descriptor before and after parameter publication")
+  {
+    Crowd crowd(files, simulation_cell, 2, true, {0, 1, 127});
+    const OptVariables active = configureSparseSelectedMapping(crowd.leader);
+    const std::vector<std::size_t> offsets{0};
+    const std::vector<VirtualParticleBatch::Segment> segments;
+    const std::vector<ParticleSet::PosType> positions;
+    const VirtualParticleBatch empty_batch(2, offsets, segments, positions);
+    VirtualScratchCrowd scratch(crowd);
+    std::vector<Value> ratios;
+    const std::vector<Value> weights;
+    std::vector<std::vector<Value>> derivatives(
+        2, std::vector<Value>(active.size(), Value(6.5)));
+    const std::vector<std::vector<Value>> original_derivatives = derivatives;
+    std::vector<WaveFunctionComponent::ParameterDerivativeView> views =
+        makeDerivativeViews(derivatives);
+
+    ResourceCollection resource_template("psiformer_empty_weighted_template");
+    crowd.leader.createResource(resource_template);
+    ResourceCollection resource(resource_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                            crowd.wfc_list);
+    const WaveFunctionComponent::EvaluationStamp first_value_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, empty_batch, ratios);
+    const WaveFunctionComponent::EvaluationStamp first_weighted_stamp =
+        crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, empty_batch, active,
+            weights, views);
+    CHECK(first_weighted_stamp == first_value_stamp);
+    CHECK(derivatives == original_derivatives);
+
+    wftrain::StructuredParameterSnapshot candidate =
+        crowd.leader.snapshotParameters();
+    candidate.values.at(127) += 1.0e-4;
+    crowd.leader.publishParameters(candidate, candidate.version);
+    const WaveFunctionComponent::EvaluationStamp changed_value_stamp =
+        crowd.leader.mw_evaluateVirtualRatios(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, empty_batch, ratios);
+    const WaveFunctionComponent::EvaluationStamp changed_weighted_stamp =
+        crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+            crowd.wfc_list, *crowd.p_list, *scratch.list, empty_batch, active,
+            weights, views);
+    CHECK(changed_value_stamp != first_value_stamp);
+    CHECK(changed_weighted_stamp == changed_value_stamp);
+    CHECK(derivatives == original_derivatives);
+
+    const testing::PsiFormerCrowdWorkspaceDiagnostics diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    CHECK(diagnostics.score_workspace_identity == nullptr);
+    CHECK(diagnostics.weighted_reference_configurations == 0);
+    CHECK(diagnostics.weighted_replacement_configurations == 0);
+    CHECK(diagnostics.weighted_active_parameters == 3);
+    CHECK(diagnostics.weighted_derivative_staging_bytes == 0);
+  }
+
+  SECTION("zero-walker descriptor")
+  {
+    PsiFormerWF leader("pf_mw", files.parameters.string(),
+                       files.configuration.string(), true, {0, 1, 127});
+    const OptVariables active = configureSparseSelectedMapping(leader);
+    auto reference = makeWalker(simulation_cell, 0);
+    VirtualParticleSet scratch_object(*reference);
+    RefVectorWithLeader<WaveFunctionComponent> components(leader);
+    RefVectorWithLeader<ParticleSet> particles(*reference);
+    RefVectorWithLeader<VirtualParticleSet> scratch(scratch_object);
+    const std::vector<std::size_t> offsets{0};
+    const std::vector<VirtualParticleBatch::Segment> segments;
+    const std::vector<ParticleSet::PosType> positions;
+    const VirtualParticleBatch empty_batch(0, offsets, segments, positions);
+    std::vector<Value> ratios;
+    const std::vector<Value> weights;
+    const std::vector<WaveFunctionComponent::ParameterDerivativeView> views;
+
+    ResourceCollection resource_template("psiformer_zero_walker_template");
+    leader.createResource(resource_template);
+    ResourceCollection resource(resource_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+    const WaveFunctionComponent::EvaluationStamp value_stamp =
+        leader.mw_evaluateVirtualRatios(components, particles, scratch,
+                                        empty_batch, ratios);
+    const WaveFunctionComponent::EvaluationStamp weighted_stamp =
+        leader.mw_evaluateVirtualDerivRatiosWeighted(
+            components, particles, scratch, empty_batch, active, weights,
+            views);
+    REQUIRE(value_stamp.isVersioned());
+    CHECK(weighted_stamp == value_stamp);
+  }
+}
+
+TEST_CASE("PsiFormer flattened weighted derivatives honor score backends",
+          "[wavefunction][psiformer][multiwalker][ecp][weighted]")
+{
+  const SimulationCell simulation_cell;
+  const std::vector<std::size_t> selected_flat_indices{0, 1, 127};
+  for (const char* backend : {"oracle", "compare"})
+  {
+    DYNAMIC_SECTION("backend " << backend)
+    {
+      ScopedEnvironmentVariable backend_mode("PSIFORMER_SCORE_BACKEND", backend);
+      GeneratedFiles files = generateFiles("lih");
+      Crowd crowd(files, simulation_cell, 2, true, selected_flat_indices);
+      Crowd oracle_crowd(files, simulation_cell, 2, true,
+                         selected_flat_indices);
+      const OptVariables active = configureSparseSelectedMapping(crowd.leader);
+      const OptVariables oracle_active =
+          configureSparseSelectedMapping(oracle_crowd.leader);
+
+      std::vector<std::size_t> offsets{0};
+      std::vector<VirtualParticleBatch::Segment> segments;
+      std::vector<ParticleSet::PosType> positions;
+      appendVirtualSegment(crowd, 1, 2,
+                           {{0.007, -0.006, 0.005}, {-0.004, 0.009, 0.003}},
+                           offsets, segments, positions);
+      appendVirtualSegment(crowd, 0, 0, {{0.011, 0.002, -0.008}}, offsets,
+                           segments, positions);
+      const VirtualParticleBatch batch(2, offsets, segments, positions);
+      const std::vector<Value> bare_weights{
+          makeWeight(0.17, 0.02), makeWeight(-0.09, -0.03),
+          makeWeight(0.13, 0.04)};
+      std::vector<std::vector<Value>> initial_derivatives(
+          2, std::vector<Value>(active.size(), Value(2.75)));
+      const MaterializedWeightedOracle oracle =
+          evaluateMaterializedWeightedOracle(
+              oracle_crowd, batch, oracle_active, bare_weights,
+              initial_derivatives);
+      VirtualScratchCrowd scratch(crowd);
+
+      ResourceCollection resource_template(
+          std::string("psiformer_weighted_backend_") + backend);
+      crowd.leader.createResource(resource_template);
+      ResourceCollection resource(resource_template);
+      ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                              crowd.wfc_list);
+      std::vector<std::vector<Value>> derivatives = initial_derivatives;
+      std::vector<WaveFunctionComponent::ParameterDerivativeView> views =
+          makeDerivativeViews(derivatives);
+      const WaveFunctionComponent::EvaluationStamp stamp =
+          crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+              crowd.wfc_list, *crowd.p_list, *scratch.list, batch, active,
+              oracle.total_weights, views);
+      REQUIRE(stamp.isVersioned());
+      for (std::size_t walker = 0; walker < derivatives.size(); ++walker)
+        for (std::size_t parameter = 0; parameter < derivatives[walker].size();
+             ++parameter)
+          checkValue(derivatives[walker][parameter],
+                     oracle.derivatives[walker][parameter], 5.0e-8);
+
+      const testing::PsiFormerCrowdWorkspaceDiagnostics diagnostics =
+          testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+              crowd.leader, crowd.wfc_list);
+      CHECK(diagnostics.backend_modes[2] == backend);
+      CHECK((diagnostics.score_workspace_identity != nullptr) ==
+            (std::string(backend) == "compare"));
+      CHECK(testing::TestPsiFormerVirtualBatch::cloneScoreWorkspaceCount(
+                crowd.wfc_list) == 0);
+      CHECK(diagnostics.weighted_reference_configurations == 2);
+      CHECK(diagnostics.weighted_replacement_configurations == batch.size());
+    }
+  }
+}
+
+TEST_CASE("PsiFormer flattened weighted derivatives publish atomically after score failure",
+          "[wavefunction][psiformer][multiwalker][ecp][weighted]")
+{
+  ScopedEnvironmentVariable score_backend("PSIFORMER_SCORE_BACKEND", "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const std::vector<std::size_t> selected_flat_indices{0, 1, 127};
+  Crowd crowd(files, simulation_cell, 2, true, selected_flat_indices);
+  Crowd oracle_crowd(files, simulation_cell, 2, true, selected_flat_indices);
+  const OptVariables active = configureSparseSelectedMapping(crowd.leader);
+  const OptVariables oracle_active =
+      configureSparseSelectedMapping(oracle_crowd.leader);
+
+  std::vector<std::size_t> offsets{0};
+  std::vector<VirtualParticleBatch::Segment> segments;
+  std::vector<ParticleSet::PosType> positions;
+  appendVirtualSegment(crowd, 0, 1, {{0.006, 0.003, -0.008}}, offsets,
+                       segments, positions);
+  appendVirtualSegment(crowd, 1, 0, {{0.09, -0.04, 0.03}}, offsets, segments,
+                       positions);
+  const VirtualParticleBatch batch(2, offsets, segments, positions);
+  const std::vector<Value> bare_weights{Value(0.18), Value(-0.11)};
+  std::vector<std::vector<Value>> initial_derivatives(
+      2, std::vector<Value>(active.size(), Value(9.0)));
+  const MaterializedWeightedOracle oracle =
+      evaluateMaterializedWeightedOracle(
+          oracle_crowd, batch, oracle_active, bare_weights,
+          initial_derivatives);
+  VirtualScratchCrowd scratch(crowd);
+
+  // Collapse two same-spin electrons in the later reference configuration.
+  const ParticleSet::PosType saved_position = crowd.walkers[1]->R[1];
+  crowd.walkers[1]->R[1] = crowd.walkers[1]->R[0];
+  crowd.walkers[1]->update();
+  std::vector<testing::PsiFormerCloneStateSnapshot> states_before;
+  for (const PsiFormerWF* component : crowd.components)
+    states_before.push_back(
+        testing::TestPsiFormerVirtualBatch::cloneState(*component));
+
+  ResourceCollection resource_template("psiformer_weighted_failure_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                          crowd.wfc_list);
+  std::vector<std::vector<Value>> derivatives = initial_derivatives;
+  std::vector<WaveFunctionComponent::ParameterDerivativeView> views =
+      makeDerivativeViews(derivatives);
+  CHECK_THROWS_AS(crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+                      crowd.wfc_list, *crowd.p_list, *scratch.list, batch,
+                      active, oracle.total_weights, views),
+                  std::domain_error);
+  CHECK(derivatives == initial_derivatives);
+  for (std::size_t walker = 0; walker < crowd.components.size(); ++walker)
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+        *crowd.components[walker], states_before[walker]));
+  const testing::PsiFormerCrowdWorkspaceDiagnostics failed_diagnostics =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list);
+  CHECK(failed_diagnostics.weighted_reference_configurations == 0);
+  CHECK(failed_diagnostics.weighted_replacement_configurations == 0);
+
+  // Repair the reference and reuse the same acquired resource immediately.
+  crowd.walkers[1]->R[1] = saved_position;
+  crowd.walkers[1]->update();
+  const WaveFunctionComponent::EvaluationStamp retry_stamp =
+      crowd.leader.mw_evaluateVirtualDerivRatiosWeighted(
+          crowd.wfc_list, *crowd.p_list, *scratch.list, batch, active,
+          oracle.total_weights, views);
+  REQUIRE(retry_stamp.isVersioned());
+  for (std::size_t walker = 0; walker < derivatives.size(); ++walker)
+    for (std::size_t parameter = 0; parameter < derivatives[walker].size();
+         ++parameter)
+      checkValue(derivatives[walker][parameter],
+                 oracle.derivatives[walker][parameter], 5.0e-8);
+  const testing::PsiFormerCrowdWorkspaceDiagnostics retry_diagnostics =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list);
+  CHECK(retry_diagnostics.weighted_reference_configurations == 2);
+  CHECK(retry_diagnostics.weighted_replacement_configurations == batch.size());
 }
 
 TEST_CASE("PsiFormer selected-electron proposals are atomic full-VGL transactions",
