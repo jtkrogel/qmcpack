@@ -347,6 +347,14 @@ public:
     return component.crowdWorkspaceDiagnosticsForTesting(wfc_list);
   }
 
+  /// Exercise either typed ratio representation without borrowing crowd state.
+  static PsiFormerWF::PsiValue ratioArenaRoundTrip(
+      PsiFormerWF::PsiValue value, bool use_log_value_arena)
+  {
+    return PsiFormerWF::ratioArenaRoundTripForTesting(
+        value, use_log_value_arena);
+  }
+
   /// Bind a directly constructed test component to its actual ParticleSet lane.
   static void bindParticleSet(PsiFormerWF& component, const ParticleSet& particles)
   { component.bound_particle_set_ = &particles; }
@@ -959,6 +967,7 @@ void checkRuntimePreflightState(
   CHECK(actual_resource.current_storage_fingerprint ==
         expected.resource.current_storage_fingerprint);
   CHECK(actual_resource.logical_sizes == expected.resource.logical_sizes);
+  CHECK(actual_resource.ratio_arena == expected.resource.ratio_arena);
   CHECK(actual_resource.actual_resource_storage ==
         expected.resource.actual_resource_storage);
   CHECK(collection.getCursor() == expected.collection_cursor);
@@ -999,6 +1008,50 @@ void checkPreparedResourceStorage(
   CHECK(diagnostics.accountedBytes() == total.host - replacement.host);
 }
 
+/// Check the named ratio-arena view and both immutable preparation records.
+void checkPreparedRatioArena(
+    const testing::PsiFormerCrowdWorkspaceDiagnostics& diagnostics,
+    testing::PsiFormerRatioArenaKind expected_kind,
+    std::size_t expected_extent)
+{
+  const auto& arena = diagnostics.ratio_arena;
+  CHECK(arena.kind == expected_kind);
+  CHECK(arena.prepared_kind == expected_kind);
+  CHECK(arena.psi_value_data == arena.prepared_psi_value_data);
+  CHECK(arena.log_value_data == arena.prepared_log_value_data);
+  CHECK(arena.psi_value_size == arena.prepared_psi_value_size);
+  CHECK(arena.log_value_size == arena.prepared_log_value_size);
+  CHECK(arena.psi_value_capacity == arena.prepared_psi_value_capacity);
+  CHECK(arena.log_value_capacity == arena.prepared_log_value_capacity);
+
+  switch (expected_kind)
+  {
+  case testing::PsiFormerRatioArenaKind::NONE:
+    CHECK(arena.psi_value_size == 0);
+    CHECK(arena.log_value_size == 0);
+    CHECK(arena.psi_value_capacity == 0);
+    CHECK(arena.log_value_capacity == 0);
+    CHECK(expected_extent == 0);
+    break;
+  case testing::PsiFormerRatioArenaKind::PSI_VALUE:
+    CHECK(arena.psi_value_size == expected_extent);
+    CHECK(arena.psi_value_capacity == expected_extent);
+    CHECK(arena.log_value_size == 0);
+    CHECK(arena.log_value_capacity == 0);
+    if (expected_extent != 0)
+      CHECK(arena.psi_value_data != nullptr);
+    break;
+  case testing::PsiFormerRatioArenaKind::LOG_VALUE:
+    CHECK(arena.psi_value_size == 0);
+    CHECK(arena.psi_value_capacity == 0);
+    CHECK(arena.log_value_size == expected_extent);
+    CHECK(arena.log_value_capacity == expected_extent);
+    if (expected_extent != 0)
+      CHECK(arena.log_value_data != nullptr);
+    break;
+  }
+}
+
 void checkPreparedCloneStorageUnchanged(
     const testing::PsiFormerPreparedCloneStorage& actual,
     const testing::PsiFormerPreparedCloneStorage& expected)
@@ -1022,6 +1075,7 @@ void checkPreparedResourceStorageUnchanged(
   CHECK(actual.current_storage_fingerprint ==
         expected.current_storage_fingerprint);
   CHECK(actual.logical_sizes == expected.logical_sizes);
+  CHECK(actual.ratio_arena == expected.ratio_arena);
   CHECK(actual.batch_bytes == expected.batch_bytes);
   CHECK(actual.score_bytes == expected.score_bytes);
   CHECK(actual.kinetic_bytes == expected.kinetic_bytes);
@@ -2800,6 +2854,8 @@ TEST_CASE("PsiFormer prepares exact planned crowd storage for uneven reserves",
     CHECK(diagnostics.batch_bytes > 0);
     CHECK(diagnostics.score_bytes > 0);
     CHECK(diagnostics.kinetic_bytes > 0);
+    checkPreparedRatioArena(
+        diagnostics, testing::PsiFormerRatioArenaKind::LOG_VALUE, 3);
     prepared_storage_fingerprint = diagnostics.prepared_storage_fingerprint;
   }
 
@@ -2842,6 +2898,8 @@ TEST_CASE("PsiFormer prepares exact planned crowd storage for uneven reserves",
     CHECK(diagnostics.reserve_walker_capacity == 0);
     CHECK(diagnostics.batch_workspace_identity != nullptr);
     CHECK(diagnostics.accountedBytes() == 0);
+    checkPreparedRatioArena(
+        diagnostics, testing::PsiFormerRatioArenaKind::NONE, 0);
   }
 
   // A crowd with no initially living walkers may later occupy its admitted
@@ -2859,7 +2917,25 @@ TEST_CASE("PsiFormer prepares exact planned crowd storage for uneven reserves",
     CHECK(diagnostics.initial_walker_capacity == 0);
     CHECK(diagnostics.reserve_walker_capacity == 2);
     CHECK(diagnostics.accountedBytes() > 0);
+    checkPreparedRatioArena(
+        diagnostics, testing::PsiFormerRatioArenaKind::LOG_VALUE, 2);
   }
+}
+
+TEST_CASE("PsiFormer typed ratio arena preserves public values",
+          "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
+{
+  using PsiValue = PsiFormerWF::PsiValue;
+#ifdef QMC_COMPLEX
+  const PsiValue probe(1.25, -0.375);
+#else
+  const PsiValue probe(1.25);
+#endif
+
+  CHECK(testing::TestPsiFormerVirtualBatch::ratioArenaRoundTrip(probe, false) ==
+        probe);
+  CHECK(testing::TestPsiFormerVirtualBatch::ratioArenaRoundTrip(probe, true) ==
+        probe);
 }
 
 TEST_CASE("PsiFormer planned resource copies require clear and support replanning",
@@ -5605,9 +5681,13 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
            Probe::ProposalOrigin::MW_CALC_RATIO_VALUE,
            Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE})
   {
+    // Manually setting lane-local fields cannot forge the registered crowd
+    // transaction, exact configuration identities, or domain-separated
+    // fingerprint required by SINGLE_PENDING.  Successful preflight is
+    // exercised below through the real planned producers.
     for (PsiFormerWF* component : crowd.components)
       Probe::installSingleProposal(*component, 0, origin);
-    require_unchanged(crowd.wfc_list, *crowd.p_list, accept_request, false);
+    require_unchanged(crowd.wfc_list, *crowd.p_list, accept_request, true);
     for (PsiFormerWF* component : crowd.components)
       Probe::clearProposal(*component);
   }

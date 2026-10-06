@@ -159,6 +159,10 @@ constexpr std::uint64_t SELECTED_TEAM_FINGERPRINT_DOMAIN =
 constexpr std::uint64_t SELECTED_TRANSACTION_FINGERPRINT_DOMAIN =
     UINT64_C(0x50534654584e3031); // "PSFTXN01"
 
+/// Keep a one-electron transaction disjoint from selected and persistent identities.
+constexpr std::uint64_t SINGLE_TRANSACTION_FINGERPRINT_DOMAIN =
+    UINT64_C(0x5053463154583031); // "PSF1TX01"
+
 /// Identify the fixed scalar record layout used by the Stage-8 walker buffer.
 constexpr std::uint64_t WALKER_BUFFER_MAGIC = UINT64_C(0x505349464f524d38);
 
@@ -473,6 +477,9 @@ public:
   {}
 
   mutable std::shared_mutex mutex;
+  /// Number of pending planned one-electron crowd transactions sharing this model.
+  /// Each crowd checks in once, never once per lane.
+  std::atomic<std::size_t> planned_single_transaction_count{0};
   /// Number of pending planned selected crowd transactions sharing this model.
   /// Each crowd checks in once, never once per lane.
   std::atomic<std::size_t> planned_selected_transaction_count{0};
@@ -599,6 +606,121 @@ private:
  * against the same immutable/versioned model state without copying buffers. */
 struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
 {
+  /// Identify which of the two statically typed ratio vectors owns the arena.
+  enum class RatioArenaKind : std::uint8_t
+  {
+    NONE,
+    PSI_VALUE,
+    LOG_VALUE
+  };
+
+  /** Provide checked scalar access without reinterpreting one vector's bytes as
+   * the other scalar type.  LOG_VALUE is a storage representation here: its
+   * entries still contain ordinary wavefunction ratios, not logarithms. */
+  struct RatioArenaView
+  {
+    RatioArenaKind kind       = RatioArenaKind::NONE;
+    PsiValue* psi_value_data  = nullptr;
+    LogValue* log_value_data  = nullptr;
+    std::size_t extent        = 0;
+
+    /// Load one public ratio, rejecting a non-real value in a real build.
+    PsiValue load(std::size_t index) const
+    {
+      if (index >= extent)
+        throw std::out_of_range("PsiFormer ratio-arena read exceeds its prepared extent");
+      switch (kind)
+      {
+      case RatioArenaKind::PSI_VALUE:
+        if (!psi_value_data || log_value_data)
+          throw std::logic_error("PsiFormer PsiValue ratio arena has invalid typed storage");
+        return psi_value_data[index];
+      case RatioArenaKind::LOG_VALUE:
+        if (!log_value_data || psi_value_data)
+          throw std::logic_error("PsiFormer LogValue ratio arena has invalid typed storage");
+        return fromLogValue(log_value_data[index]);
+      case RatioArenaKind::NONE:
+        break;
+      }
+      throw std::logic_error("PsiFormer ratio arena has no active typed storage");
+    }
+
+    /** Load after checked Phase-B validation without any throwing operation.
+     * The caller must have proved the arena kind, pointers, extent, and (for a
+     * real build using LOG_VALUE storage) zero imaginary component. */
+    PsiValue loadUnchecked(std::size_t index) const noexcept
+    {
+      switch (kind)
+      {
+      case RatioArenaKind::PSI_VALUE:
+        return psi_value_data[index];
+      case RatioArenaKind::LOG_VALUE:
+        return fromLogValueUnchecked(log_value_data[index]);
+      case RatioArenaKind::NONE:
+        return PsiValue{};
+      }
+      return PsiValue{};
+    }
+
+    /// Store one public ratio in the selected typed vector without allocation.
+    void store(std::size_t index, PsiValue value) const
+    {
+      if (index >= extent)
+        throw std::out_of_range("PsiFormer ratio-arena write exceeds its prepared extent");
+      switch (kind)
+      {
+      case RatioArenaKind::PSI_VALUE:
+        if (!psi_value_data || log_value_data)
+          throw std::logic_error("PsiFormer PsiValue ratio arena has invalid typed storage");
+        psi_value_data[index] = value;
+        return;
+      case RatioArenaKind::LOG_VALUE:
+        if (!log_value_data || psi_value_data)
+          throw std::logic_error("PsiFormer LogValue ratio arena has invalid typed storage");
+        log_value_data[index] = toLogValue(value);
+        return;
+      case RatioArenaKind::NONE:
+        break;
+      }
+      throw std::logic_error("PsiFormer ratio arena has no active typed storage");
+    }
+
+  private:
+    /// Convert through full-precision real and imaginary components explicitly.
+    static LogValue toLogValue(PsiValue value) noexcept
+    {
+      return {static_cast<FullPrecRealType>(std::real(value)),
+              static_cast<FullPrecRealType>(std::imag(value))};
+    }
+
+    /// Preserve complex ratios and reject accidental phase loss in real builds.
+    template<class Target = PsiValue>
+    static Target fromLogValue(LogValue value)
+    {
+      if constexpr (IsComplex_t<Target>::value)
+        return Target(static_cast<typename Target::value_type>(std::real(value)),
+                      static_cast<typename Target::value_type>(std::imag(value)));
+      else
+      {
+        if (std::imag(value) != FullPrecRealType{0})
+          throw std::domain_error(
+              "PsiFormer complex ratio cannot be published by a real build");
+        return static_cast<Target>(std::real(value));
+      }
+    }
+
+    /// Convert data already proved representable by the checked Phase-B load.
+    template<class Target = PsiValue>
+    static Target fromLogValueUnchecked(LogValue value) noexcept
+    {
+      if constexpr (IsComplex_t<Target>::value)
+        return Target(static_cast<typename Target::value_type>(std::real(value)),
+                      static_cast<typename Target::value_type>(std::imag(value)));
+      else
+        return static_cast<Target>(std::real(value));
+    }
+  };
+
   /** Create an empty template bound to one model and, when selected, one
    * structurally identified participant view. */
   PsiFormerMultiWalkerResource(std::shared_ptr<PsiFormerSharedState> model_state,
@@ -706,6 +828,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   const unsigned char* prepared_preservation_flags_data         = nullptr;
   const std::size_t* prepared_active_electrons_data             = nullptr;
   const GradType* prepared_staged_gradients_data                = nullptr;
+  const PsiValue* prepared_staged_value_ratios_data             = nullptr;
+  const LogValue* prepared_staged_log_ratios_data               = nullptr;
   std::size_t prepared_configuration_identities_capacity       = 0;
   std::size_t prepared_staged_signs_capacity                   = 0;
   std::size_t prepared_staged_log_magnitudes_capacity          = 0;
@@ -713,6 +837,11 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::size_t prepared_preservation_flags_capacity              = 0;
   std::size_t prepared_active_electrons_capacity                = 0;
   std::size_t prepared_staged_gradients_capacity                = 0;
+  std::size_t prepared_staged_value_ratios_size                 = 0;
+  std::size_t prepared_staged_log_ratios_size                   = 0;
+  std::size_t prepared_staged_value_ratios_capacity             = 0;
+  std::size_t prepared_staged_log_ratios_capacity               = 0;
+  RatioArenaKind prepared_ratio_arena_kind = RatioArenaKind::NONE;
   BatchMemoryEstimate actual_resource_storage;
   /// Preparation provenance captured while this exact resource is on loan.
   const BatchExecutionPlan* acquired_plan_identity = nullptr;
@@ -735,9 +864,11 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   /// Shared logarithmic-amplitude staging across dense crowd operation families.
   std::vector<double> staged_log_magnitudes;
   /// Real/complex wavefunction-value ratios when FULL_VGL is not reachable.
-  std::vector<ValueType> staged_value_ratios;
+  std::vector<PsiValue> staged_value_ratios;
   /// Full-precision complex log ratios, also reused by narrower ratio calls.
   std::vector<LogValue> staged_log_ratios;
+  /// Typed arena selected once during exact resource materialization.
+  RatioArenaKind ratio_arena_kind = RatioArenaKind::NONE;
   /// Shared gradient publication staging for active and full spatial calls.
   std::vector<GradType> staged_gradients;
   /// Byte-addressable flags retaining accepted spatial products during recompute.
@@ -934,17 +1065,16 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
         overlaps(virtual_reference_logabs) || overlaps(walker_indices);
   }
 
-  /** Validate the full prepared metadata arrays used through bounded prefixes.
+  /** Validate the common value-result metadata used through bounded prefixes.
    * Planned release retains physical extents, so runtime never resizes these
-   * vectors and any size or allocation-identity drift fails closed.
-   */
-  void requireFullVGLStaging(std::size_t live_walkers) const
+   * vectors and any size or allocation-identity drift fails closed. */
+  void requireValueMetadataStaging(std::size_t live_walkers) const
   {
     if (!prepared_plan || !prepared_crowd_plan ||
         prepared_storage_fingerprint == 0 ||
         storageFingerprint() != prepared_storage_fingerprint)
       throw std::logic_error(
-          "PsiFormer FULL_VGL staging lost its prepared allocation identity");
+          "PsiFormer value metadata lost its prepared allocation identity");
 
     const pf::ResourceStagingStorageRequirement& staging =
         prepared_crowd_plan->publication_storage;
@@ -969,16 +1099,20 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
         vectorBytes(staged_signs, "PsiFormer FULL_VGL sign staging") !=
             staging.signs ||
         vectorBytes(staged_log_magnitudes,
-                    "PsiFormer FULL_VGL log staging") !=
+                    "PsiFormer value-metadata log staging") !=
             staging.log_magnitudes)
       throw std::logic_error(
-          "PsiFormer FULL_VGL staging capacities differ from the prepared plan");
+          "PsiFormer value-metadata extents differ from the prepared plan");
     if (live_walkers > configuration_identities.size() ||
         live_walkers > staged_signs.size() ||
         live_walkers > staged_log_magnitudes.size())
       throw std::length_error(
-          "PsiFormer FULL_VGL staging prefix exceeds prepared capacity");
+          "PsiFormer value-metadata prefix exceeds prepared capacity");
   }
+
+  /// Validate value metadata needed by a complete spatial publication.
+  void requireFullVGLStaging(std::size_t live_walkers) const
+  { requireValueMetadataStaging(live_walkers); }
 
   /// Validate every exact prepared prefix used by masked value recomputation.
   void requireRecomputeStaging(std::size_t selected_walkers) const
@@ -1071,10 +1205,126 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
           "PsiFormer ACTIVE_GRADIENT staging prefix exceeds prepared capacity");
   }
 
+  /** Validate both candidate ratio vectors against their exact prepared
+   * identities and the single active scalar representation selected by policy. */
+  void requireRatioArenaStaging(std::size_t live_walkers) const
+  {
+    if (!prepared_plan || !prepared_crowd_plan ||
+        prepared_storage_fingerprint == 0 ||
+        storageFingerprint() != prepared_storage_fingerprint)
+      throw std::logic_error(
+          "PsiFormer ratio arena lost its prepared allocation identity");
+
+    const auto& staging = prepared_crowd_plan->publication_storage;
+    const auto& capacity = prepared_crowd_plan->publication_staging;
+    const RatioArenaKind expected_kind = staging.ratios == 0
+        ? RatioArenaKind::NONE
+        : (capacity.full_vgl ? RatioArenaKind::LOG_VALUE
+                             : RatioArenaKind::PSI_VALUE);
+    const std::size_t psi_value_bytes = vectorBytes(
+        staged_value_ratios, "PsiFormer PsiValue ratio staging");
+    const std::size_t log_value_bytes = vectorBytes(
+        staged_log_ratios, "PsiFormer LogValue ratio staging");
+
+    if (ratio_arena_kind != expected_kind ||
+        prepared_ratio_arena_kind != expected_kind ||
+        staged_value_ratios.data() !=
+            prepared_staged_value_ratios_data ||
+        staged_log_ratios.data() != prepared_staged_log_ratios_data ||
+        staged_value_ratios.size() !=
+            prepared_staged_value_ratios_size ||
+        staged_log_ratios.size() != prepared_staged_log_ratios_size ||
+        staged_value_ratios.capacity() !=
+            prepared_staged_value_ratios_capacity ||
+        staged_log_ratios.capacity() !=
+            prepared_staged_log_ratios_capacity ||
+        prepared_staged_value_ratios_size !=
+            prepared_staged_value_ratios_capacity ||
+        prepared_staged_log_ratios_size !=
+            prepared_staged_log_ratios_capacity ||
+        pf::checkedStorageSum(
+            psi_value_bytes, log_value_bytes,
+            "PsiFormer prepared ratio staging overflowed") != staging.ratios)
+      throw std::logic_error(
+          "PsiFormer ratio-arena identity differs from the prepared plan");
+
+    std::size_t active_extent = 0;
+    switch (expected_kind)
+    {
+    case RatioArenaKind::NONE:
+      if (psi_value_bytes != 0 || log_value_bytes != 0)
+        throw std::logic_error(
+            "PsiFormer empty ratio arena retained typed storage");
+      break;
+    case RatioArenaKind::PSI_VALUE:
+      if (psi_value_bytes != staging.ratios || log_value_bytes != 0)
+        throw std::logic_error(
+            "PsiFormer PsiValue ratio arena has mixed typed storage");
+      active_extent = staged_value_ratios.size();
+      break;
+    case RatioArenaKind::LOG_VALUE:
+      if (log_value_bytes != staging.ratios || psi_value_bytes != 0)
+        throw std::logic_error(
+            "PsiFormer LogValue ratio arena has mixed typed storage");
+      active_extent = staged_log_ratios.size();
+      break;
+    }
+    if (expected_kind != RatioArenaKind::NONE &&
+        active_extent != capacity.reserve_walkers)
+      throw std::logic_error(
+          "PsiFormer ratio arena does not contain exactly one entry per reserve walker");
+    if (live_walkers > active_extent)
+      throw std::length_error(
+          "PsiFormer ratio-arena prefix exceeds prepared capacity");
+  }
+
+  /// Return mutable typed access after exact arena validation has succeeded.
+  RatioArenaView ratioArenaView() noexcept
+  {
+    switch (ratio_arena_kind)
+    {
+    case RatioArenaKind::PSI_VALUE:
+      return {ratio_arena_kind, staged_value_ratios.data(), nullptr,
+              staged_value_ratios.size()};
+    case RatioArenaKind::LOG_VALUE:
+      return {ratio_arena_kind, nullptr, staged_log_ratios.data(),
+              staged_log_ratios.size()};
+    case RatioArenaKind::NONE:
+      return {};
+    }
+    return {};
+  }
+
+  /// Validate all scratch consumed by a planned value-only ratio producer.
+  RatioArenaView requireCalcRatioStaging(std::size_t live_walkers)
+  {
+    requireValueMetadataStaging(live_walkers);
+    requireRatioArenaStaging(live_walkers);
+    return ratioArenaView();
+  }
+
+  /// Validate all scratch consumed by a planned ratio-and-gradient producer.
+  RatioArenaView requireRatioGradientStaging(std::size_t live_walkers)
+  {
+    requireValueMetadataStaging(live_walkers);
+    requireActiveGradientStaging(live_walkers);
+    requireRatioArenaStaging(live_walkers);
+    return ratioArenaView();
+  }
+
+  /// Revalidate retained proposal scratch before a planned resolution commit.
+  RatioArenaView requireSingleResolutionStaging(std::size_t live_walkers)
+  {
+    requireValueMetadataStaging(live_walkers);
+    requireRatioArenaStaging(live_walkers);
+    return ratioArenaView();
+  }
+
   /// Validate every prepared prefix used by a selected full-VGL proposal.
   void requireSelectedProposalStaging(std::size_t live_walkers) const
   {
     requireFullVGLStaging(live_walkers);
+    requireRatioArenaStaging(live_walkers);
     const pf::ResourceStagingStorageRequirement& staging =
         prepared_crowd_plan->publication_storage;
     if (vectorBytes(batch_slots,
@@ -1083,13 +1333,11 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
         vectorBytes(walker_indices,
                     "PsiFormer selected walker-index staging") !=
             staging.walker_indices ||
-        vectorBytes(staged_log_ratios,
-                    "PsiFormer selected log-ratio staging") != staging.ratios)
+        ratio_arena_kind != RatioArenaKind::LOG_VALUE)
       throw std::logic_error(
           "PsiFormer selected staging capacities differ from the prepared plan");
     if (live_walkers > batch_slots.size() ||
-        live_walkers > walker_indices.size() ||
-        live_walkers > staged_log_ratios.size())
+        live_walkers > walker_indices.size())
       throw std::length_error(
           "PsiFormer selected staging prefix exceeds prepared capacity");
   }
@@ -1394,12 +1642,32 @@ private:
                                            "PsiFormer sign staging");
     staged_log_magnitudes = makeExactVector<double>(
         staging.log_magnitudes, "PsiFormer log-magnitude staging");
-    if (crowd_plan.publication_staging.full_vgl)
+    if (staging.ratios == 0)
+      ratio_arena_kind = RatioArenaKind::NONE;
+    else if (crowd_plan.publication_staging.full_vgl)
+    {
+      const std::size_t exact_ratio_bytes = pf::checkedStorageBytes<LogValue>(
+          crowd_plan.publication_staging.reserve_walkers,
+          "PsiFormer LogValue ratio-arena extent overflowed");
+      if (staging.ratios != exact_ratio_bytes)
+        throw std::length_error(
+            "PsiFormer LogValue ratio arena is not exactly one entry per reserve walker");
+      ratio_arena_kind = RatioArenaKind::LOG_VALUE;
       staged_log_ratios = makeExactVector<LogValue>(
-          staging.ratios, "PsiFormer log-ratio staging");
+          exact_ratio_bytes, "PsiFormer log-ratio staging");
+    }
     else
-      staged_value_ratios = makeExactVector<ValueType>(
-          staging.ratios, "PsiFormer value-ratio staging");
+    {
+      const std::size_t exact_ratio_bytes = pf::checkedStorageBytes<PsiValue>(
+          crowd_plan.publication_staging.reserve_walkers,
+          "PsiFormer PsiValue ratio-arena extent overflowed");
+      if (staging.ratios != exact_ratio_bytes)
+        throw std::length_error(
+            "PsiFormer PsiValue ratio arena is not exactly one entry per reserve walker");
+      ratio_arena_kind = RatioArenaKind::PSI_VALUE;
+      staged_value_ratios = makeExactVector<PsiValue>(
+          exact_ratio_bytes, "PsiFormer value-ratio staging");
+    }
     staged_gradients = makeExactVector<GradType>(
         staging.gradients, "PsiFormer gradient staging");
     preservation_flags = makeExactVector<unsigned char>(
@@ -1462,6 +1730,8 @@ private:
     prepared_preservation_flags_data        = preservation_flags.data();
     prepared_active_electrons_data           = active_electrons.data();
     prepared_staged_gradients_data           = staged_gradients.data();
+    prepared_staged_value_ratios_data        = staged_value_ratios.data();
+    prepared_staged_log_ratios_data          = staged_log_ratios.data();
     prepared_configuration_identities_capacity =
         configuration_identities.capacity();
     prepared_staged_signs_capacity = staged_signs.capacity();
@@ -1471,6 +1741,11 @@ private:
     prepared_preservation_flags_capacity = preservation_flags.capacity();
     prepared_active_electrons_capacity   = active_electrons.capacity();
     prepared_staged_gradients_capacity   = staged_gradients.capacity();
+    prepared_staged_value_ratios_size     = staged_value_ratios.size();
+    prepared_staged_log_ratios_size       = staged_log_ratios.size();
+    prepared_staged_value_ratios_capacity = staged_value_ratios.capacity();
+    prepared_staged_log_ratios_capacity   = staged_log_ratios.capacity();
+    prepared_ratio_arena_kind             = ratio_arena_kind;
     expected_plan                = selected;
     prepared_plan                = std::move(selected);
     prepared_crowd_index         = crowd_index;
@@ -1513,6 +1788,10 @@ private:
         candidate.prepared_active_electrons_data;
     prepared_staged_gradients_data =
         candidate.prepared_staged_gradients_data;
+    prepared_staged_value_ratios_data =
+        candidate.prepared_staged_value_ratios_data;
+    prepared_staged_log_ratios_data =
+        candidate.prepared_staged_log_ratios_data;
     prepared_configuration_identities_capacity =
         candidate.prepared_configuration_identities_capacity;
     prepared_staged_signs_capacity =
@@ -1527,6 +1806,15 @@ private:
         candidate.prepared_active_electrons_capacity;
     prepared_staged_gradients_capacity =
         candidate.prepared_staged_gradients_capacity;
+    prepared_staged_value_ratios_size =
+        candidate.prepared_staged_value_ratios_size;
+    prepared_staged_log_ratios_size =
+        candidate.prepared_staged_log_ratios_size;
+    prepared_staged_value_ratios_capacity =
+        candidate.prepared_staged_value_ratios_capacity;
+    prepared_staged_log_ratios_capacity =
+        candidate.prepared_staged_log_ratios_capacity;
+    prepared_ratio_arena_kind = candidate.prepared_ratio_arena_kind;
     batch_workspace                = std::move(candidate.batch_workspace);
     score_workspace                = std::move(candidate.score_workspace);
     kinetic_workspace              = std::move(candidate.kinetic_workspace);
@@ -1537,6 +1825,7 @@ private:
     staged_log_magnitudes          = std::move(candidate.staged_log_magnitudes);
     staged_value_ratios            = std::move(candidate.staged_value_ratios);
     staged_log_ratios              = std::move(candidate.staged_log_ratios);
+    ratio_arena_kind               = candidate.ratio_arena_kind;
     staged_gradients               = std::move(candidate.staged_gradients);
     preservation_flags             = std::move(candidate.preservation_flags);
     active_electrons               = std::move(candidate.active_electrons);
@@ -1603,6 +1892,8 @@ private:
     prepared_preservation_flags_data        = nullptr;
     prepared_active_electrons_data           = nullptr;
     prepared_staged_gradients_data           = nullptr;
+    prepared_staged_value_ratios_data        = nullptr;
+    prepared_staged_log_ratios_data          = nullptr;
     prepared_configuration_identities_capacity = 0;
     prepared_staged_signs_capacity             = 0;
     prepared_staged_log_magnitudes_capacity    = 0;
@@ -1610,6 +1901,12 @@ private:
     prepared_preservation_flags_capacity       = 0;
     prepared_active_electrons_capacity         = 0;
     prepared_staged_gradients_capacity         = 0;
+    prepared_staged_value_ratios_size           = 0;
+    prepared_staged_log_ratios_size             = 0;
+    prepared_staged_value_ratios_capacity       = 0;
+    prepared_staged_log_ratios_capacity         = 0;
+    prepared_ratio_arena_kind                   = RatioArenaKind::NONE;
+    ratio_arena_kind                            = RatioArenaKind::NONE;
     actual_resource_storage      = {};
     weighted_reference_configurations   = 0;
     weighted_replacement_configurations = 0;
@@ -1653,6 +1950,7 @@ private:
     mix_vector(staged_log_magnitudes);
     mix_vector(staged_value_ratios);
     mix_vector(staged_log_ratios);
+    mix(static_cast<std::uintptr_t>(ratio_arena_kind));
     mix_vector(staged_gradients);
     mix_vector(preservation_flags);
     mix_vector(active_electrons);
@@ -2514,7 +2812,7 @@ std::size_t PsiFormerWF::publishParameters(
     const wftrain::StructuredParameterSnapshot& candidate,
     std::size_t expected_version)
 {
-  requireNoPlannedSelectedProposalMutation("structured parameter publication");
+  requireNoPlannedProposalMutation("structured parameter publication");
   if (candidate.schema_fingerprint != structured_parameter_schema_->fingerprint())
     throw std::invalid_argument("PsiFormer structured update has an incompatible schema fingerprint");
   if (candidate.values.size() != structured_parameter_schema_->parameterCount())
@@ -2523,7 +2821,7 @@ std::size_t PsiFormerWF::publishParameters(
     throw std::invalid_argument("PsiFormer structured update candidate has the wrong source version");
 
   std::unique_lock state_lock(model_state_->mutex);
-  requireNoPlannedSelectedProposalMutation("structured parameter publication");
+  requireNoPlannedProposalMutation("structured parameter publication");
   pf::Parameters& parameters = model_state_->model.p;
   if (parameters.version() != expected_version)
     throw std::runtime_error("PsiFormer structured update rejected a stale parameter version");
@@ -2829,6 +3127,30 @@ std::uint64_t PsiFormerWF::selectedTransactionFingerprint(
   return hash;
 }
 
+// Bind a one-electron proposal to its exact producer and ordered crowd state.
+std::uint64_t PsiFormerWF::singleTransactionFingerprint(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    ProposalOrigin origin,
+    std::size_t active_electron,
+    std::size_t proposal_version) const noexcept
+{
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  mixPersistentInteger(hash, SINGLE_TRANSACTION_FINGERPRINT_DOMAIN);
+  mixPersistentInteger(hash, selectedTeamFingerprint(wfc_list, p_list));
+  mixPersistentInteger(hash, static_cast<std::uint8_t>(origin));
+  mixPersistentInteger(hash, active_electron);
+  mixPersistentInteger(hash, proposal_version);
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+    mixPersistentInteger(hash, component.accepted_configuration_identity_);
+    mixPersistentInteger(
+        hash, configurationIdentity(p_list[lane], static_cast<int>(active_electron)));
+  }
+  return hash;
+}
+
 // Map each typed operation to the explicit modes that authorize its runtime path.
 BatchExecutionRequirements PsiFormerWF::plannedOperationRequiredModes(
     PlannedOperation operation) noexcept
@@ -2869,6 +3191,7 @@ BatchExecutionRequirements PsiFormerWF::plannedOperationRequiredModes(
     modes.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
     break;
   case PlannedOperation::ACCEPT_REJECT_VALUE:
+  case PlannedOperation::SINGLE_CANCEL:
   case PlannedOperation::SELECTED_RESOLVE:
   case PlannedOperation::SELECTED_CANCEL:
   case PlannedOperation::BUFFER_READ:
@@ -2887,6 +3210,7 @@ PsiFormerWF::ProposalRequirement PsiFormerWF::plannedOperationProposalRequiremen
   switch (operation)
   {
   case PlannedOperation::ACCEPT_REJECT_VALUE:
+  case PlannedOperation::SINGLE_CANCEL:
     return ProposalRequirement::SINGLE_PENDING;
   case PlannedOperation::SELECTED_RESOLVE:
   case PlannedOperation::SELECTED_CANCEL:
@@ -2967,7 +3291,8 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
   const bool requires_active_move =
       request.operation == PlannedOperation::CALC_RATIO ||
       request.operation == PlannedOperation::RATIO_GRADIENT ||
-      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE;
+      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE ||
+      request.operation == PlannedOperation::SINGLE_CANCEL;
 
   for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
   {
@@ -3194,6 +3519,7 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
     dense_rule = DenseExtentRule::SCALAR_CLONE;
     break;
   case PlannedOperation::ACCEPT_REJECT_VALUE:
+  case PlannedOperation::SINGLE_CANCEL:
   case PlannedOperation::SELECTED_RESOLVE:
   case PlannedOperation::SELECTED_CANCEL:
   case PlannedOperation::ECP_VALUE:
@@ -3256,7 +3582,8 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
       request.operation == PlannedOperation::CALC_RATIO ||
       request.operation == PlannedOperation::ACTIVE_GRADIENT ||
       request.operation == PlannedOperation::RATIO_GRADIENT ||
-      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE;
+      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE ||
+      request.operation == PlannedOperation::SINGLE_CANCEL;
   if (single_particle_operation)
   {
     if (!request.active_electron || *request.active_electron >= electron_count)
@@ -3278,16 +3605,40 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
   const bool consumes_selected_proposal =
       request.operation == PlannedOperation::SELECTED_RESOLVE ||
       request.operation == PlannedOperation::SELECTED_CANCEL;
-  if (consumes_selected_proposal !=
+  const bool consumes_single_proposal =
+      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE ||
+      request.operation == PlannedOperation::SINGLE_CANCEL;
+  if ((consumes_selected_proposal || consumes_single_proposal) !=
       request.expected_proposal_version.has_value())
     throw std::invalid_argument(
-        "PsiFormer selected proposal-version token is absent or unexpected");
+        "PsiFormer proposal-version token is absent or unexpected");
+  if (consumes_single_proposal != request.expected_proposal_origin.has_value() ||
+      consumes_single_proposal !=
+          request.expected_single_transaction_fingerprint.has_value())
+    throw std::invalid_argument(
+        "PsiFormer single-particle proposal identity token is absent or unexpected");
+  if (request.expected_proposal_origin &&
+      *request.expected_proposal_origin != ProposalOrigin::MW_CALC_RATIO_VALUE &&
+      *request.expected_proposal_origin != ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE)
+    throw std::invalid_argument(
+        "PsiFormer planned single-particle operation has an incompatible origin");
 
   const std::optional<std::uint64_t> selected_transaction_fingerprint =
       selected_operation
       ? std::optional<std::uint64_t>(selectedTransactionFingerprint(
             wfc_list, p_list, *request.descriptor_fingerprint))
       : std::nullopt;
+  const std::optional<std::uint64_t> single_transaction_fingerprint =
+      consumes_single_proposal
+      ? std::optional<std::uint64_t>(singleTransactionFingerprint(
+            wfc_list, p_list, *request.expected_proposal_origin,
+            *request.active_electron, *request.expected_proposal_version))
+      : std::nullopt;
+  if (consumes_single_proposal &&
+      (*request.expected_single_transaction_fingerprint == 0 ||
+       *single_transaction_fingerprint == 0))
+    throw std::invalid_argument(
+        "PsiFormer planned single-particle transaction fingerprint is zero");
 
   if (selected_operation)
   {
@@ -3298,6 +3649,11 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
       throw std::logic_error(
           "PsiFormer planned selected operation has inconsistent shared transaction state");
   }
+  if (consumes_single_proposal &&
+      model_state_->planned_single_transaction_count.load(
+          std::memory_order_acquire) == 0)
+    throw std::logic_error(
+        "PsiFormer planned single-particle operation has inconsistent shared transaction state");
 
   const ProposalRequirement expected_proposal =
       plannedOperationProposalRequirement(request.operation);
@@ -3316,11 +3672,32 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
       break;
     case ProposalRequirement::SINGLE_PENDING:
       if (!component.has_proposal_ ||
-          (component.proposal_origin_ != ProposalOrigin::MW_CALC_RATIO_VALUE &&
-           component.proposal_origin_ != ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE) ||
+          component.proposal_origin_ != *request.expected_proposal_origin ||
           component.proposed_particle_ != static_cast<int>(*request.active_electron) ||
+          component.proposed_descriptor_fingerprint_ !=
+              *request.expected_single_transaction_fingerprint ||
+          component.proposed_descriptor_fingerprint_ !=
+              *single_transaction_fingerprint ||
           component.proposed_parameter_version_ !=
-              component.observed_parameter_version_)
+              *request.expected_proposal_version ||
+          component.proposed_parameter_version_ !=
+              component.observed_parameter_version_ ||
+          !component.accepted_value_valid_ ||
+          (component.accepted_state_requirement_ !=
+               AcceptedStateRequirement::VALUE_ONLY &&
+           component.accepted_state_requirement_ !=
+               AcceptedStateRequirement::FULL_SPATIAL) ||
+          component.accepted_parameter_version_ !=
+              *request.expected_proposal_version ||
+          component.accepted_configuration_identity_ !=
+              configurationIdentity(p_list[lane]) ||
+          component.proposed_configuration_identity_ !=
+              configurationIdentity(
+                  p_list[lane], static_cast<int>(*request.active_electron)) ||
+          !isCoherentAcceptedValue(component.current_sign_,
+                                   component.log_value_) ||
+          !isCoherentAcceptedValue(component.proposed_sign_,
+                                   component.proposed_log_value_))
         throw std::logic_error(
             "PsiFormer planned operation requires one exact single-particle proposal");
       break;
@@ -3343,7 +3720,96 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
     throw std::logic_error(
         "PsiFormer planned operation resource storage changed during preflight");
   return {resource, batch_execution_plan_, crowd, storage_fingerprint,
-          selected_transaction_fingerprint};
+          single_transaction_fingerprint, selected_transaction_fingerprint};
+}
+
+// Reserve one model-wide one-electron transaction count before publication.
+bool PsiFormerWF::tryRegisterPlannedSingleTransaction() const noexcept
+{
+  std::size_t pending_transactions =
+      model_state_->planned_single_transaction_count.load(
+          std::memory_order_acquire);
+  while (pending_transactions != std::numeric_limits<std::size_t>::max())
+    if (model_state_->planned_single_transaction_count.compare_exchange_weak(
+            pending_transactions, pending_transactions + 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+      return true;
+  return false;
+}
+
+// Withdraw one one-electron crowd transaction after a nonthrowing state clear.
+void PsiFormerWF::unregisterPlannedSingleTransaction() const noexcept
+{
+  std::size_t pending_transactions =
+      model_state_->planned_single_transaction_count.load(
+          std::memory_order_acquire);
+  for (;;)
+  {
+    assert(pending_transactions != 0);
+    if (pending_transactions == 0)
+      std::terminate();
+    if (model_state_->planned_single_transaction_count.compare_exchange_weak(
+            pending_transactions, pending_transactions - 1,
+            std::memory_order_release, std::memory_order_acquire))
+      return;
+  }
+}
+
+// Abandon an exact planned one-electron transaction without consulting model version.
+void PsiFormerWF::cancelPlannedSingleProposal(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::size_t active_electron,
+    ProposalOrigin expected_origin,
+    std::size_t expected_proposal_version,
+    std::uint64_t expected_transaction_fingerprint) const
+{
+  PlannedRuntimeRequest request;
+  request.operation                = PlannedOperation::SINGLE_CANCEL;
+  request.live_walkers             = wfc_list.size();
+  request.active_electron          = active_electron;
+  request.expected_proposal_origin = expected_origin;
+  request.expected_proposal_version = expected_proposal_version;
+  request.expected_single_transaction_fingerprint =
+      expected_transaction_fingerprint;
+  const PlannedRuntimeAccess access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+  const std::size_t pending_transactions =
+      model_state_->planned_single_transaction_count.load(
+          std::memory_order_acquire);
+  if (pending_transactions == 0 ||
+      !access.single_transaction_fingerprint ||
+      *access.single_transaction_fingerprint != expected_transaction_fingerprint)
+    throw std::logic_error(
+        "PsiFormer planned single-particle cancellation has inconsistent Phase-A evidence");
+
+  // Re-run the complete nonmutating boundary immediately before the marker-last
+  // commit so a concurrent lifecycle change can only reject the cancellation.
+  const PlannedRuntimeAccess final_access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+  if (&final_access.resource != &access.resource ||
+      !final_access.participant.sameBinding(access.participant) ||
+      &final_access.crowd != &access.crowd ||
+      final_access.storage_fingerprint != access.storage_fingerprint ||
+      final_access.single_transaction_fingerprint !=
+          access.single_transaction_fingerprint ||
+      model_state_->planned_single_transaction_count.load(
+          std::memory_order_acquire) == 0)
+    throw std::logic_error(
+        "PsiFormer planned single-particle cancellation evidence changed during preflight");
+  if (fail_planned_single_cancellation_before_publish_for_testing_)
+    throw std::overflow_error(
+        "Injected PsiFormer planned single-particle cancellation failure");
+
+  const auto publish = [&]() noexcept {
+    for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+      static_cast<PsiFormerWF&>(wfc_list[lane]).resetProposalMetadata();
+    for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+      static_cast<PsiFormerWF&>(wfc_list[lane]).has_proposal_ = false;
+    unregisterPlannedSingleTransaction();
+  };
+  static_assert(noexcept(publish()));
+  publish();
 }
 
 // Reserve one model-wide transaction count before nonthrowing clone publication.
@@ -3497,6 +3963,33 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
   return diagnostics;
 }
 
+// Exercise both typed adapter branches without borrowing or modifying a resource.
+PsiFormerWF::PsiValue PsiFormerWF::ratioArenaRoundTripForTesting(
+    PsiValue value, bool use_log_value_arena)
+{
+  PsiValue psi_value{};
+  LogValue log_value{};
+  PsiFormerMultiWalkerResource::RatioArenaView arena;
+  arena.extent = 1;
+  if (use_log_value_arena)
+  {
+    arena.kind = PsiFormerMultiWalkerResource::RatioArenaKind::LOG_VALUE;
+    arena.log_value_data = &log_value;
+  }
+  else
+  {
+    arena.kind = PsiFormerMultiWalkerResource::RatioArenaKind::PSI_VALUE;
+    arena.psi_value_data = &psi_value;
+  }
+  arena.store(0, value);
+  const PsiValue checked = arena.load(0);
+  const PsiValue unchecked = arena.loadUnchecked(0);
+  if (checked != unchecked)
+    throw std::logic_error(
+        "PsiFormer checked and nonthrowing ratio-arena loads disagree");
+  return unchecked;
+}
+
 // Expose only opaque identities and numeric capacities needed by the
 // non-gating production-thread benchmark.  The read transaction binds every
 // model field in this snapshot to one published parameter version.
@@ -3526,7 +4019,7 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
       resource.batch_slots.capacity() * sizeof(std::size_t) +
       resource.staged_signs.capacity() * sizeof(double) +
       resource.staged_log_magnitudes.capacity() * sizeof(double) +
-      resource.staged_value_ratios.capacity() * sizeof(ValueType) +
+      resource.staged_value_ratios.capacity() * sizeof(PsiValue) +
       resource.staged_log_ratios.capacity() * sizeof(LogValue) +
       resource.staged_gradients.capacity() * sizeof(GradType) +
       resource.preservation_flags.capacity() * sizeof(unsigned char) +
@@ -3583,6 +4076,43 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
   diagnostics.prepared_storage_fingerprint =
       resource.prepared_storage_fingerprint;
   diagnostics.current_storage_fingerprint = resource.currentStorageFingerprint();
+  const auto diagnostic_kind = [](PsiFormerMultiWalkerResource::RatioArenaKind kind) {
+    switch (kind)
+    {
+    case PsiFormerMultiWalkerResource::RatioArenaKind::NONE:
+      return testing::PsiFormerRatioArenaKind::NONE;
+    case PsiFormerMultiWalkerResource::RatioArenaKind::PSI_VALUE:
+      return testing::PsiFormerRatioArenaKind::PSI_VALUE;
+    case PsiFormerMultiWalkerResource::RatioArenaKind::LOG_VALUE:
+      return testing::PsiFormerRatioArenaKind::LOG_VALUE;
+    }
+    return testing::PsiFormerRatioArenaKind::NONE;
+  };
+  diagnostics.ratio_arena.kind = diagnostic_kind(resource.ratio_arena_kind);
+  diagnostics.ratio_arena.prepared_kind =
+      diagnostic_kind(resource.prepared_ratio_arena_kind);
+  diagnostics.ratio_arena.psi_value_data =
+      resource.staged_value_ratios.data();
+  diagnostics.ratio_arena.log_value_data = resource.staged_log_ratios.data();
+  diagnostics.ratio_arena.prepared_psi_value_data =
+      resource.prepared_staged_value_ratios_data;
+  diagnostics.ratio_arena.prepared_log_value_data =
+      resource.prepared_staged_log_ratios_data;
+  diagnostics.ratio_arena.psi_value_size =
+      resource.staged_value_ratios.size();
+  diagnostics.ratio_arena.log_value_size = resource.staged_log_ratios.size();
+  diagnostics.ratio_arena.psi_value_capacity =
+      resource.staged_value_ratios.capacity();
+  diagnostics.ratio_arena.log_value_capacity =
+      resource.staged_log_ratios.capacity();
+  diagnostics.ratio_arena.prepared_psi_value_size =
+      resource.prepared_staged_value_ratios_size;
+  diagnostics.ratio_arena.prepared_log_value_size =
+      resource.prepared_staged_log_ratios_size;
+  diagnostics.ratio_arena.prepared_psi_value_capacity =
+      resource.prepared_staged_value_ratios_capacity;
+  diagnostics.ratio_arena.prepared_log_value_capacity =
+      resource.prepared_staged_log_ratios_capacity;
   diagnostics.logical_sizes = {
       resource.total_log_gradient.size(),
       resource.configuration_identities.size(),
@@ -3637,6 +4167,13 @@ PsiFormerWF::selectedProposalMapDiagnosticsForTesting(
 std::size_t PsiFormerWF::plannedSelectedTransactionCountForTesting() const noexcept
 {
   return model_state_->planned_selected_transaction_count.load(
+      std::memory_order_acquire);
+}
+
+// Expose the one-electron guard count without granting a production lifecycle API.
+std::size_t PsiFormerWF::plannedSingleTransactionCountForTesting() const noexcept
+{
+  return model_state_->planned_single_transaction_count.load(
       std::memory_order_acquire);
 }
 
@@ -3720,10 +4257,13 @@ void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
 {
   if (observed_parameter_version_ != parameter_version)
   {
-    if (batch_execution_plan_ && has_proposal_ &&
-        proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL)
+    const bool has_planned_proposal = has_proposal_ &&
+        (proposal_origin_ == ProposalOrigin::MW_CALC_RATIO_VALUE ||
+         proposal_origin_ == ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE ||
+         proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL);
+    if (has_planned_proposal)
       throw std::logic_error(
-          "PsiFormer planned selected proposal cannot be cleared by parameter-version synchronization");
+          "PsiFormer planned proposal cannot be cleared by parameter-version synchronization");
     invalidateParameterCaches(parameter_version);
   }
 }
@@ -3779,17 +4319,21 @@ void PsiFormerWF::requireNoSelectedParticleProposal(const char* operation) const
                            " cannot run while a selected-electron proposal is pending");
 }
 
-// Planned selected state is crowd-owned and cannot be cleared by one parameter publisher.
-void PsiFormerWF::requireNoPlannedSelectedProposalMutation(
-    const char* operation) const
+// Planned crowd state cannot be stranded by a shared-parameter publisher.
+void PsiFormerWF::requireNoPlannedProposalMutation(const char* operation) const
 {
-  if (model_state_->planned_selected_transaction_count.load(
+  const bool has_planned_proposal = has_proposal_ &&
+      (proposal_origin_ == ProposalOrigin::MW_CALC_RATIO_VALUE ||
+       proposal_origin_ == ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE ||
+       proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL);
+  if (model_state_->planned_single_transaction_count.load(
           std::memory_order_acquire) != 0 ||
-      (batch_execution_plan_ && has_proposal_ &&
-       proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL))
+      model_state_->planned_selected_transaction_count.load(
+          std::memory_order_acquire) != 0 ||
+      has_planned_proposal)
     throw std::logic_error(
         std::string("PsiFormer ") + operation +
-        " cannot mutate parameters while a planned selected-electron proposal is pending");
+        " cannot mutate parameters while a planned crowd proposal is pending");
 }
 
 // Prepare clone-local complete proposal products before the transaction is published.
@@ -3969,10 +4513,10 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
 {
   if (!optimization_metadata_->enabled)
     return;
-  requireNoPlannedSelectedProposalMutation("optimizer reset");
+  requireNoPlannedProposalMutation("optimizer reset");
 
   std::unique_lock state_lock(model_state_->mutex);
-  requireNoPlannedSelectedProposalMutation("optimizer reset");
+  requireNoPlannedProposalMutation("optimizer reset");
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   pf::Parameters& parameters = model_state_->model.p;
   const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
@@ -4126,7 +4670,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
 {
   if (!optimization_metadata_->enabled)
     return;
-  requireNoPlannedSelectedProposalMutation("variational-parameter restore");
+  requireNoPlannedProposalMutation("variational-parameter restore");
   if (!input.is_group("PsiFormer"))
     throw std::runtime_error("PsiFormer VP file has no PsiFormer object group");
 
@@ -4170,7 +4714,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   input.pop();
 
   std::unique_lock state_lock(model_state_->mutex);
-  requireNoPlannedSelectedProposalMutation("variational-parameter restore");
+  requireNoPlannedProposalMutation("variational-parameter restore");
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   pf::PsiFormer& model = model_state_->model;
 

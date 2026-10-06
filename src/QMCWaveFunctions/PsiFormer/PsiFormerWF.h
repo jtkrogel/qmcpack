@@ -140,6 +140,52 @@ struct PsiFormerOptimizationMetadataDiagnostics
   std::size_t inherited_variable_count    = 0;
 };
 
+/// Public test spelling of the scalar representation selected for ratio scratch.
+enum class PsiFormerRatioArenaKind : std::uint8_t
+{
+  NONE,
+  PSI_VALUE,
+  LOG_VALUE
+};
+
+/** Describe both typed ratio-arena candidates and their immutable preparation
+ * records without granting tests mutable access to either allocation. */
+struct PsiFormerRatioArenaDiagnostics
+{
+  PsiFormerRatioArenaKind kind          = PsiFormerRatioArenaKind::NONE;
+  PsiFormerRatioArenaKind prepared_kind = PsiFormerRatioArenaKind::NONE;
+  const void* psi_value_data          = nullptr;
+  const void* log_value_data          = nullptr;
+  const void* prepared_psi_value_data = nullptr;
+  const void* prepared_log_value_data = nullptr;
+  std::size_t psi_value_size          = 0;
+  std::size_t log_value_size          = 0;
+  std::size_t psi_value_capacity      = 0;
+  std::size_t log_value_capacity      = 0;
+  std::size_t prepared_psi_value_size     = 0;
+  std::size_t prepared_log_value_size     = 0;
+  std::size_t prepared_psi_value_capacity = 0;
+  std::size_t prepared_log_value_capacity = 0;
+
+  /// Compare the complete read-only identity and extent snapshot.
+  bool operator==(const PsiFormerRatioArenaDiagnostics& other) const noexcept
+  {
+    return kind == other.kind && prepared_kind == other.prepared_kind &&
+        psi_value_data == other.psi_value_data &&
+        log_value_data == other.log_value_data &&
+        prepared_psi_value_data == other.prepared_psi_value_data &&
+        prepared_log_value_data == other.prepared_log_value_data &&
+        psi_value_size == other.psi_value_size &&
+        log_value_size == other.log_value_size &&
+        psi_value_capacity == other.psi_value_capacity &&
+        log_value_capacity == other.log_value_capacity &&
+        prepared_psi_value_size == other.prepared_psi_value_size &&
+        prepared_log_value_size == other.prepared_log_value_size &&
+        prepared_psi_value_capacity == other.prepared_psi_value_capacity &&
+        prepared_log_value_capacity == other.prepared_log_value_capacity;
+  }
+};
+
 /** Describe one acquired crowd resource without exposing mutable workspace
  * storage or implementation types. */
 struct PsiFormerCrowdWorkspaceDiagnostics
@@ -177,6 +223,7 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   std::size_t reserve_walker_capacity       = 0;
   std::size_t prepared_storage_fingerprint  = 0;
   std::size_t current_storage_fingerprint   = 0;
+  PsiFormerRatioArenaDiagnostics ratio_arena;
   std::array<std::size_t, 22> logical_sizes = {};
   BatchMemoryEstimate expected_resource_storage;
   BatchMemoryEstimate actual_resource_storage;
@@ -592,6 +639,7 @@ private:
     ACTIVE_GRADIENT,
     RATIO_GRADIENT,
     ACCEPT_REJECT_VALUE,
+    SINGLE_CANCEL,
     SELECTED_PROPOSE,
     SELECTED_RESOLVE,
     SELECTED_CANCEL,
@@ -615,6 +663,18 @@ private:
     SELECTED_PENDING
   };
 
+  /// Identify the exact evaluator that published clone-local proposal state.
+  enum class ProposalOrigin : std::uint8_t
+  {
+    NONE                         = 0,
+    SCALAR_RATIO_VALUE           = 1,
+    SCALAR_RATIO_GRADIENT_ACTIVE = 2,
+    MW_CALC_RATIO_VALUE          = 3,
+    MW_RATIO_GRADIENT_ACTIVE     = 4,
+    MW_SELECTED_FULL_VGL         = 5
+  };
+  static_assert(sizeof(ProposalOrigin) == sizeof(std::uint8_t));
+
   /** Carry allocation-free runtime extents and proposal identity into common
    * planned-operation validation. */
   struct PlannedRuntimeRequest
@@ -629,6 +689,8 @@ private:
     std::optional<std::size_t> active_electron;
     std::optional<std::uint64_t> descriptor_fingerprint;
     std::optional<std::size_t> expected_proposal_version;
+    std::optional<ProposalOrigin> expected_proposal_origin;
+    std::optional<std::uint64_t> expected_single_transaction_fingerprint;
   };
 
   /** Return read-only bindings proved by preflight without changing logical
@@ -639,6 +701,7 @@ private:
     const BatchExecutionParticipantPlan& participant;
     const psiformer::PsiFormerCrowdMemoryPlan& crowd;
     std::size_t storage_fingerprint;
+    std::optional<std::uint64_t> single_transaction_fingerprint;
     std::optional<std::uint64_t> selected_transaction_fingerprint;
   };
 
@@ -682,18 +745,6 @@ private:
     VALUE_ONLY   = 1,
     FULL_SPATIAL = 2
   };
-
-  /// Identify the exact evaluator that published clone-local proposal state.
-  enum class ProposalOrigin : std::uint8_t
-  {
-    NONE                         = 0,
-    SCALAR_RATIO_VALUE           = 1,
-    SCALAR_RATIO_GRADIENT_ACTIVE = 2,
-    MW_CALC_RATIO_VALUE          = 3,
-    MW_RATIO_GRADIENT_ACTIVE     = 4,
-    MW_SELECTED_FULL_VGL         = 5
-  };
-  static_assert(sizeof(ProposalOrigin) == sizeof(std::uint8_t));
 
   /// Evaluate through an already-held model transaction without reacquiring its mutex.
   pf::Result evaluatePositionsUnderRead(const PsiFormerReadTransaction& transaction,
@@ -746,6 +797,31 @@ private:
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       std::uint64_t descriptor_fingerprint) const noexcept;
+
+  /** Bind one planned one-electron proposal to its exact team, producer,
+   * parameter version, electron, and ordered accepted/proposed identities. */
+  std::uint64_t singleTransactionFingerprint(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      ProposalOrigin origin,
+      std::size_t active_electron,
+      std::size_t proposal_version) const noexcept;
+
+  /// Reserve one shared one-electron transaction slot without throwing.
+  bool tryRegisterPlannedSingleTransaction() const noexcept;
+
+  /// Withdraw one previously registered one-electron transaction without underflow.
+  void unregisterPlannedSingleTransaction() const noexcept;
+
+  /** Validate and abandon one planned one-electron proposal, including stale
+   * proposals that ordinary version synchronization must not silently clear. */
+  void cancelPlannedSingleProposal(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t active_electron,
+      ProposalOrigin expected_origin,
+      std::size_t expected_proposal_version,
+      std::uint64_t expected_transaction_fingerprint) const;
 
   /// Publish lifecycle metadata only; planned selected numerical evaluation is not implemented here.
   PlannedSelectedProposalEvidence publishPlannedSelectedProposalMetadata(
@@ -856,6 +932,10 @@ private:
   testing::PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnosticsForTesting(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
 
+  /// Exercise the allocation-free typed ratio conversion independently of a call path.
+  static PsiValue ratioArenaRoundTripForTesting(PsiValue value,
+                                                bool use_log_value_arena);
+
   /// Copy bounded selected-compaction prefixes without exposing mutable scratch.
   testing::PsiFormerSelectedProposalMapDiagnostics
   selectedProposalMapDiagnosticsForTesting(
@@ -865,6 +945,9 @@ private:
 
   /// Report the model-wide selected-transaction count without changing it.
   std::size_t plannedSelectedTransactionCountForTesting() const noexcept;
+
+  /// Report the model-wide planned one-electron count without changing it.
+  std::size_t plannedSingleTransactionCountForTesting() const noexcept;
 
   /// Advance the shared model version behind a pending proposal for a stale-state test.
   std::size_t advanceParameterVersionForTesting();
@@ -895,8 +978,8 @@ private:
   /// Reject lifecycle operations that could silently overwrite a selected transaction.
   void requireNoSelectedParticleProposal(const char* operation) const;
 
-  /// Reject shared-parameter mutation that would strand a planned selected crowd.
-  void requireNoPlannedSelectedProposalMutation(const char* operation) const;
+  /// Reject shared-parameter mutation that would strand any planned crowd proposal.
+  void requireNoPlannedProposalMutation(const char* operation) const;
 
   /// Resize clone-local complete proposed G/L storage without publishing a proposal.
   void resizeProposedSpatialStorage(std::size_t electron_count);
@@ -974,6 +1057,12 @@ private:
   bool fail_planned_selected_proposal_before_publish_for_testing_ = false;
   /// Inject a selected-resolution failure after its final read-only recheck.
   bool fail_planned_selected_resolution_before_publish_for_testing_ = false;
+  /// Inject a one-electron producer failure after its final read-only recheck.
+  bool fail_planned_single_proposal_before_publish_for_testing_ = false;
+  /// Inject a one-electron resolution failure after its final read-only recheck.
+  bool fail_planned_single_resolution_before_publish_for_testing_ = false;
+  /// Inject a one-electron cancellation failure after its final preflight.
+  bool fail_planned_single_cancellation_before_publish_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.
   bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
@@ -1015,7 +1104,7 @@ private:
   ParticleSet::ParticleLaplacian proposed_laplacian_;
   /// Fingerprint and electron index associated with the pending proposal.
   std::uint64_t proposed_configuration_identity_ = 0;
-  /// Exact descriptor identity required by selected-particle resolution.
+  /// Exact transaction identity required by planned single- or selected-particle resolution.
   std::uint64_t proposed_descriptor_fingerprint_ = 0;
   /// Parameter version used to evaluate the pending proposal.
   std::size_t proposed_parameter_version_ = 0;
