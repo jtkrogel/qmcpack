@@ -194,10 +194,40 @@ public:
         PsiFormerWF::AcceptedStateRequirement::INVALID;
   }
 
+  /// Replace one accepted gradient entry to exercise finite sum overflow.
+  static void setAcceptedGradient(PsiFormerWF& component,
+                                  std::size_t electron,
+                                  std::size_t dimension,
+                                  PsiFormerWF::ValueType value)
+  {
+    if (electron >= component.accepted_gradient_.size() || dimension >= 3)
+      throw std::out_of_range("Accepted-gradient test index is out of range");
+    component.accepted_gradient_[electron][dimension] = value;
+  }
+
   static void injectPlannedFullVGLPrepublicationFailure(
       PsiFormerWF& component, bool enabled)
   {
     component.fail_planned_full_vgl_before_publish_for_testing_ = enabled;
+  }
+
+  /// Toggle the selected-proposal failure immediately before publication.
+  static void injectPlannedSelectedPrepublicationFailure(
+      PsiFormerWF& component, bool enabled)
+  {
+    component.fail_planned_selected_proposal_before_publish_for_testing_ =
+        enabled;
+  }
+
+  /// Copy only the live selected-proposal mapping prefixes from crowd scratch.
+  static PsiFormerSelectedProposalMapDiagnostics selectedCompactMap(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      std::size_t live_walkers,
+      std::size_t evaluated_rows)
+  {
+    return component.selectedProposalMapDiagnosticsForTesting(
+        wfc_list, live_walkers, evaluated_rows);
   }
 
   static bool hasCurrentFullAcceptedState(const PsiFormerWF& component,
@@ -3401,6 +3431,467 @@ TEST_CASE("PsiFormer planned FULL_VGL rejects bad destinations atomically",
       resource_before);
 }
 
+TEST_CASE("PsiFormer planned selected proposals match legacy full-VGL results",
+          "[wavefunction][psiformer][multiwalker][selected_proposal]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  constexpr std::size_t no_slot = std::numeric_limits<std::size_t>::max();
+
+  auto run_case = [&](std::size_t walker_count, bool select_all,
+                      std::size_t reserve_walkers,
+                      const std::vector<std::size_t>& expected_slots,
+                      const std::vector<std::size_t>& expected_walkers) {
+    Crowd planned(files, simulation_cell, walker_count, true, {0, 1});
+    Crowd legacy(files, simulation_cell, walker_count);
+    enableCrowdPreparationTestAccounting(planned);
+    const BatchExecutionRequirements requirements =
+        makeCrowdPreparationRequirements(planned.leader);
+    const std::string participant_id =
+        "test/psiformer/planned-selected-" + std::to_string(walker_count) +
+        (select_all ? "-all" : "-sparse");
+    const auto plan = makeCrowdPreparationTestPlan(
+        planned.leader, requirements, {walker_count}, {reserve_walkers},
+        participant_id, participant_id + "-v1");
+    bindCrowdPreparationPlan(planned, plan, participant_id);
+    prepareCrowdPreparationClones(planned, plan, participant_id);
+
+    ResourceCollection planned_template("psiformer_planned_selected_template");
+    planned.leader.createResource(planned_template);
+    ResourceCollection planned_resource(planned_template);
+    planned_resource.prepareBatchResources({plan, 0});
+    ResourceCollection legacy_template("psiformer_legacy_selected_template");
+    legacy.leader.createResource(legacy_template);
+    ResourceCollection legacy_resource(legacy_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> planned_lock(
+        planned_resource, planned.wfc_list);
+    ResourceCollectionTeamLock<WaveFunctionComponent> legacy_lock(
+        legacy_resource, legacy.wfc_list);
+
+    const std::size_t electrons = planned.walkers.front()->getTotalNum();
+    std::vector<ParticleSet::ParticleGradient> planned_initial_g(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> planned_initial_l(walker_count);
+    std::vector<ParticleSet::ParticleGradient> legacy_initial_g(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> legacy_initial_l(walker_count);
+    RefVector<ParticleSet::ParticleGradient> planned_initial_g_list;
+    RefVector<ParticleSet::ParticleLaplacian> planned_initial_l_list;
+    RefVector<ParticleSet::ParticleGradient> legacy_initial_g_list;
+    RefVector<ParticleSet::ParticleLaplacian> legacy_initial_l_list;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      planned_initial_g[lane].resize(electrons);
+      planned_initial_l[lane].resize(electrons);
+      legacy_initial_g[lane].resize(electrons);
+      legacy_initial_l[lane].resize(electrons);
+      planned_initial_g[lane] = Value(0);
+      planned_initial_l[lane] = Value(0);
+      legacy_initial_g[lane] = Value(0);
+      legacy_initial_l[lane] = Value(0);
+      planned_initial_g_list.push_back(planned_initial_g[lane]);
+      planned_initial_l_list.push_back(planned_initial_l[lane]);
+      legacy_initial_g_list.push_back(legacy_initial_g[lane]);
+      legacy_initial_l_list.push_back(legacy_initial_l[lane]);
+    }
+    planned.leader.mw_evaluateLog(planned.wfc_list, *planned.p_list,
+                                  planned_initial_g_list,
+                                  planned_initial_l_list);
+    legacy.leader.mw_evaluateLog(legacy.wfc_list, *legacy.p_list,
+                                 legacy_initial_g_list,
+                                 legacy_initial_l_list);
+
+    std::vector<std::size_t> offsets(walker_count + 1, 0);
+    std::vector<Moves::IndexType> indices;
+    std::vector<Moves::PosType> positions;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      const bool select_lane = select_all || walker_count == 2;
+      if (select_lane)
+      {
+        const std::size_t selected_electrons = select_all ? electrons : 1;
+        for (std::size_t electron = 0; electron < selected_electrons;
+             ++electron)
+        {
+          indices.push_back(static_cast<Moves::IndexType>(electron));
+          Moves::PosType position = planned.walkers[lane]->R[electron];
+          // The first lane of the mixed case carries a nonempty exact no-op
+          // descriptor, proving that reuse is based on bitwise coordinates.
+          if (select_all || lane != 0)
+          {
+            position[0] += 0.002 * static_cast<double>(lane + 1);
+            position[1] -= 0.001 * static_cast<double>(electron + 1);
+            position[2] +=
+                0.0005 * static_cast<double>(lane + electron + 1);
+          }
+          positions.push_back(position);
+        }
+      }
+      offsets[lane + 1] = indices.size();
+    }
+    const Moves moves(offsets, indices, positions);
+
+    std::vector<testing::PsiFormerCloneStateSnapshot> accepted_before;
+    std::vector<std::vector<ParticleSet::PosType>> positions_before;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      accepted_before.push_back(
+          testing::TestPsiFormerVirtualBatch::cloneState(
+              *planned.components[lane]));
+      positions_before.emplace_back(planned.walkers[lane]->R.begin(),
+                                    planned.walkers[lane]->R.end());
+    }
+
+    std::vector<ParticleSet::ParticleGradient> planned_g(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> planned_l(walker_count);
+    std::vector<ParticleSet::ParticleGradient> legacy_g(walker_count);
+    std::vector<ParticleSet::ParticleLaplacian> legacy_l(walker_count);
+    RefVector<ParticleSet::ParticleGradient> planned_g_list;
+    RefVector<ParticleSet::ParticleLaplacian> planned_l_list;
+    RefVector<ParticleSet::ParticleGradient> legacy_g_list;
+    RefVector<ParticleSet::ParticleLaplacian> legacy_l_list;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      planned_g[lane].resize(electrons);
+      planned_l[lane].resize(electrons);
+      legacy_g[lane].resize(electrons);
+      legacy_l[lane].resize(electrons);
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        const Value gradient_seed = makeWeight(
+            0.013 * static_cast<double>((lane + 1) * (electron + 1)),
+            -0.002 * static_cast<double>(lane + 1));
+        planned_g[lane][electron] = gradient_seed;
+        legacy_g[lane][electron] = gradient_seed;
+        const Value laplacian_seed = makeWeight(
+            -0.017 * static_cast<double>((lane + 1) * (electron + 1)),
+            0.003 * static_cast<double>(electron + 1));
+        planned_l[lane][electron] = laplacian_seed;
+        legacy_l[lane][electron] = laplacian_seed;
+      }
+      planned_g_list.push_back(planned_g[lane]);
+      planned_l_list.push_back(planned_l[lane]);
+      legacy_g_list.push_back(legacy_g[lane]);
+      legacy_l_list.push_back(legacy_l[lane]);
+    }
+    std::vector<PsiFormerWF::LogValue> planned_ratios(
+        walker_count, PsiFormerWF::LogValue(9));
+    std::vector<PsiFormerWF::LogValue> legacy_ratios(
+        walker_count, PsiFormerWF::LogValue(9));
+    planned.leader.mw_evaluateMultiParticleMove(
+        planned.wfc_list, *planned.p_list, moves, planned_ratios,
+        planned_g_list, planned_l_list);
+    legacy.leader.mw_evaluateMultiParticleMove(
+        legacy.wfc_list, *legacy.p_list, moves, legacy_ratios,
+        legacy_g_list, legacy_l_list);
+
+    const auto compact =
+        testing::TestPsiFormerVirtualBatch::selectedCompactMap(
+            planned.leader, planned.wfc_list, walker_count,
+            expected_walkers.size());
+    CHECK(compact.batch_slots == expected_slots);
+    CHECK(compact.walker_indices == expected_walkers);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      checkLog(planned_ratios[lane], legacy_ratios[lane]);
+      const auto accepted_after =
+          testing::TestPsiFormerVirtualBatch::cloneState(
+              *planned.components[lane]);
+      const auto legacy_after =
+          testing::TestPsiFormerVirtualBatch::cloneState(
+              *legacy.components[lane]);
+      CHECK(accepted_after.has_proposal);
+      CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                *planned.components[lane]) ==
+            testing::TestPsiFormerVirtualBatch::ProposalOrigin::MW_SELECTED_FULL_VGL);
+      CHECK(accepted_after.proposed_sign == legacy_after.proposed_sign);
+      checkLog(accepted_after.proposed_log_value,
+               legacy_after.proposed_log_value);
+      CHECK(accepted_after.proposed_configuration_identity ==
+            legacy_after.proposed_configuration_identity);
+      CHECK(accepted_after.proposed_parameter_version ==
+            planned.leader.parameterVersion());
+      CHECK(accepted_after.proposed_particle == -1);
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        checkGrad(accepted_after.proposed_gradient[electron],
+                  legacy_after.proposed_gradient[electron]);
+        checkValue(accepted_after.proposed_laplacian[electron],
+                   legacy_after.proposed_laplacian[electron], 3.0e-7);
+      }
+      CHECK(accepted_after.log_value == accepted_before[lane].log_value);
+      CHECK(accepted_after.observed_parameter_version ==
+            accepted_before[lane].observed_parameter_version);
+      CHECK(accepted_after.restore_validation_pending ==
+            accepted_before[lane].restore_validation_pending);
+      CHECK(accepted_after.accepted_value_valid ==
+            accepted_before[lane].accepted_value_valid);
+      CHECK(accepted_after.accepted_configuration_identity ==
+            accepted_before[lane].accepted_configuration_identity);
+      CHECK(accepted_after.accepted_parameter_version ==
+            accepted_before[lane].accepted_parameter_version);
+      CHECK(accepted_after.accepted_state_requirement ==
+            accepted_before[lane].accepted_state_requirement);
+      CHECK(accepted_after.current_sign == accepted_before[lane].current_sign);
+      CHECK(sameVectorBits(accepted_after.accepted_gradient,
+                           accepted_before[lane].accepted_gradient));
+      CHECK(sameVectorBits(accepted_after.accepted_laplacian,
+                           accepted_before[lane].accepted_laplacian));
+      CHECK(planned.walkers[lane]->R.size() == positions_before[lane].size());
+      CHECK(std::memcmp(planned.walkers[lane]->R.data(),
+                        positions_before[lane].data(),
+                        electrons * sizeof(ParticleSet::PosType)) == 0);
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        checkGrad(planned_g[lane][electron], legacy_g[lane][electron]);
+        checkValue(planned_l[lane][electron], legacy_l[lane][electron],
+                   3.0e-7);
+      }
+    }
+
+    testing::TestPsiFormerVirtualBatch::cancelPlannedSelectedProposal(
+        planned.leader, planned.wfc_list, *planned.p_list, moves,
+        planned.leader.parameterVersion());
+    legacy.leader.mw_accept_rejectMultiParticleMove(
+        legacy.wfc_list, *legacy.p_list, moves,
+        std::vector<bool>(walker_count, false));
+
+    // The ordinary same-lane ParticleSet G/L accumulators are intentional
+    // aliases and must retain the same additive semantics as the legacy path.
+    if (walker_count == 2)
+    {
+      RefVector<ParticleSet::ParticleGradient> planned_particle_g;
+      RefVector<ParticleSet::ParticleLaplacian> planned_particle_l;
+      RefVector<ParticleSet::ParticleGradient> legacy_particle_g;
+      RefVector<ParticleSet::ParticleLaplacian> legacy_particle_l;
+      for (std::size_t lane = 0; lane < walker_count; ++lane)
+      {
+        planned.walkers[lane]->G = Value(0.031 * (lane + 1));
+        planned.walkers[lane]->L = Value(-0.027 * (lane + 1));
+        legacy.walkers[lane]->G = Value(0.031 * (lane + 1));
+        legacy.walkers[lane]->L = Value(-0.027 * (lane + 1));
+        planned_particle_g.push_back(planned.walkers[lane]->G);
+        planned_particle_l.push_back(planned.walkers[lane]->L);
+        legacy_particle_g.push_back(legacy.walkers[lane]->G);
+        legacy_particle_l.push_back(legacy.walkers[lane]->L);
+      }
+      planned.leader.mw_evaluateMultiParticleMove(
+          planned.wfc_list, *planned.p_list, moves, planned_ratios,
+          planned_particle_g, planned_particle_l);
+      legacy.leader.mw_evaluateMultiParticleMove(
+          legacy.wfc_list, *legacy.p_list, moves, legacy_ratios,
+          legacy_particle_g, legacy_particle_l);
+      for (std::size_t lane = 0; lane < walker_count; ++lane)
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          checkGrad(planned.walkers[lane]->G[electron],
+                    legacy.walkers[lane]->G[electron]);
+          checkValue(planned.walkers[lane]->L[electron],
+                     legacy.walkers[lane]->L[electron], 3.0e-7);
+        }
+      testing::TestPsiFormerVirtualBatch::cancelPlannedSelectedProposal(
+          planned.leader, planned.wfc_list, *planned.p_list, moves,
+          planned.leader.parameterVersion());
+      legacy.leader.mw_accept_rejectMultiParticleMove(
+          legacy.wfc_list, *legacy.p_list, moves,
+          std::vector<bool>(walker_count, false));
+    }
+  };
+
+  DYNAMIC_SECTION("one walker, empty descriptor, q=0")
+  { run_case(1, false, 2, {no_slot}, {}); }
+  DYNAMIC_SECTION("two walkers, one selected row, q=1")
+  { run_case(2, false, 3, {no_slot, 0}, {1}); }
+  DYNAMIC_SECTION("three walkers, all electrons selected, q=b and j=J")
+  { run_case(3, true, 3, {0, 1, 2}, {0, 1, 2}); }
+}
+
+TEST_CASE("PsiFormer planned selected proposal failures are crowd atomic",
+          "[wavefunction][psiformer][multiwalker][selected_proposal][atomic]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  Crowd crowd(files, simulation_cell, walker_count, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id =
+      "test/psiformer/planned-selected-atomic";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {walker_count}, {3}, participant_id,
+      "planned-selected-atomic-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+  ResourceCollection resource_template(
+      "psiformer_planned_selected_atomic_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                          crowd.wfc_list);
+
+  const std::size_t electrons = crowd.walkers.front()->getTotalNum();
+  std::vector<ParticleSet::ParticleGradient> accepted_g(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> accepted_l(walker_count);
+  RefVector<ParticleSet::ParticleGradient> accepted_g_list;
+  RefVector<ParticleSet::ParticleLaplacian> accepted_l_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    accepted_g[lane].resize(electrons);
+    accepted_l[lane].resize(electrons);
+    accepted_g[lane] = Value(0);
+    accepted_l[lane] = Value(0);
+    accepted_g_list.push_back(accepted_g[lane]);
+    accepted_l_list.push_back(accepted_l[lane]);
+  }
+  auto refresh_accepted = [&]() {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      accepted_g[lane] = Value(0);
+      accepted_l[lane] = Value(0);
+    }
+    crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                                accepted_g_list, accepted_l_list);
+  };
+  refresh_accepted();
+
+  using Moves = MCMultiParticleMoves<CoordsType::POS>;
+  Moves::PosType moved = crowd.walkers[1]->R[0];
+  moved[0] += 0.004;
+  moved[1] -= 0.002;
+  const Moves moves({0, 0, 1}, {0}, {moved});
+  std::vector<ParticleSet::ParticleGradient> gradients(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> laplacians(walker_count);
+  RefVector<ParticleSet::ParticleGradient> gradient_list;
+  RefVector<ParticleSet::ParticleLaplacian> laplacian_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    gradients[lane].resize(electrons);
+    laplacians[lane].resize(electrons);
+    gradient_list.push_back(gradients[lane]);
+    laplacian_list.push_back(laplacians[lane]);
+  }
+  std::vector<PsiFormerWF::LogValue> ratios(walker_count);
+  auto reset_outputs = [&]() {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+      {
+        gradients[lane][electron] = makeWeight(
+            0.01 * static_cast<double>((lane + 1) * (electron + 1)),
+            -0.001 * static_cast<double>(electron + 1));
+        laplacians[lane][electron] = makeWeight(
+            -0.02 * static_cast<double>((lane + 1) * (electron + 1)),
+            0.002 * static_cast<double>(lane + 1));
+      }
+    ratios.assign(walker_count, PsiFormerWF::LogValue(11));
+  };
+  reset_outputs();
+
+  auto require_failure_atomic = [&](auto&& invocation) {
+    const PlannedFullVGLSnapshot state =
+        capturePlannedFullVGLSnapshot(crowd, gradients, laplacians);
+    const std::vector<PsiFormerWF::LogValue> ratio_state = ratios;
+    std::vector<std::vector<ParticleSet::PosType>> position_state;
+    for (const auto& walker : crowd.walkers)
+      position_state.emplace_back(walker->R.begin(), walker->R.end());
+    invocation();
+    checkPlannedFullVGLSnapshot(crowd, gradients, laplacians, state);
+    CHECK(sameVectorBits(ratios, ratio_state));
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      CHECK(std::memcmp(crowd.walkers[lane]->R.data(),
+                        position_state[lane].data(),
+                        electrons * sizeof(ParticleSet::PosType)) == 0);
+  };
+
+  laplacians.back().resize(electrons - 1);
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        gradient_list, laplacian_list),
+                    std::invalid_argument);
+  });
+  laplacians.back().resize(electrons);
+  reset_outputs();
+
+  gradients.back()[electrons - 1][2] =
+      makeWeight(std::numeric_limits<double>::quiet_NaN(), 0.0);
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        gradient_list, laplacian_list),
+                    std::invalid_argument);
+  });
+  reset_outputs();
+
+  RefVector<ParticleSet::ParticleGradient> aliased_gradients;
+  aliased_gradients.push_back(gradients.front());
+  aliased_gradients.push_back(gradients.front());
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        aliased_gradients, laplacian_list),
+                    std::invalid_argument);
+  });
+
+  // Both operands are finite, but their prospective additive publication is
+  // not. The dry-sum boundary must fail before any proposal is advertised.
+  reset_outputs();
+  const Value largest =
+      makeWeight(std::numeric_limits<ParticleSet::RealType>::max(), 0.0);
+  testing::TestPsiFormerVirtualBatch::setAcceptedGradient(
+      crowd.leader, 0, 0, largest);
+  gradients.front()[0][0] = largest;
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        gradient_list, laplacian_list),
+                    std::overflow_error);
+  });
+  refresh_accepted();
+  reset_outputs();
+
+  testing::TestPsiFormerVirtualBatch::invalidateAcceptedState(
+      *crowd.components[1]);
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        gradient_list, laplacian_list),
+                    std::logic_error);
+  });
+  refresh_accepted();
+  reset_outputs();
+
+  testing::TestPsiFormerVirtualBatch::installSingleProposal(
+      crowd.leader, 0);
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        gradient_list, laplacian_list),
+                    std::logic_error);
+  });
+  testing::TestPsiFormerVirtualBatch::clearProposal(crowd.leader);
+
+  testing::TestPsiFormerVirtualBatch::injectPlannedSelectedPrepublicationFailure(
+      crowd.leader, true);
+  require_failure_atomic([&]() {
+    CHECK_THROWS_AS(crowd.leader.mw_evaluateMultiParticleMove(
+                        crowd.wfc_list, *crowd.p_list, moves, ratios,
+                        gradient_list, laplacian_list),
+                    std::overflow_error);
+  });
+  testing::TestPsiFormerVirtualBatch::injectPlannedSelectedPrepublicationFailure(
+      crowd.leader, false);
+
+  crowd.leader.mw_evaluateMultiParticleMove(
+      crowd.wfc_list, *crowd.p_list, moves, ratios, gradient_list,
+      laplacian_list);
+  for (const PsiFormerWF* component : crowd.components)
+    CHECK(testing::TestPsiFormerVirtualBatch::hasProposal(*component));
+  testing::TestPsiFormerVirtualBatch::cancelPlannedSelectedProposal(
+      crowd.leader, crowd.wfc_list, *crowd.p_list, moves,
+      crowd.leader.parameterVersion());
+}
+
 TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
           "[wavefunction][psiformer][multiwalker][batch_memory][preflight]")
 {
@@ -3607,7 +4098,7 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
           crowd.wfc_list, *crowd.p_list, selected_moves,
           rejected_log_ratios, missing_proposed_gradients,
           missing_proposed_laplacians),
-      Catch::Matchers::ContainsSubstring("not implemented"));
+      Catch::Matchers::ContainsSubstring("inconsistent walker counts"));
   CHECK_THROWS_WITH(
       crowd.leader.mw_accept_rejectMultiParticleMove(
           crowd.wfc_list, *crowd.p_list, selected_moves, {false, false}),
@@ -3621,6 +4112,7 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
   Probe::RuntimeRequest selected_propose;
   selected_propose.operation = Probe::RuntimeOperation::SELECTED_PROPOSE;
   selected_propose.live_walkers = 2;
+  selected_propose.dense_configurations = 2;
   selected_propose.descriptor_fingerprint = selected_descriptor;
   require_unchanged(crowd.wfc_list, *crowd.p_list, selected_propose, false);
 

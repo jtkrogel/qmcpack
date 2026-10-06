@@ -187,6 +187,13 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   { return batch_bytes + score_bytes + kinetic_bytes + transient_bytes; }
 };
 
+/// Test-only copy of the live selected-proposal compaction prefixes.
+struct PsiFormerSelectedProposalMapDiagnostics
+{
+  std::vector<std::size_t> batch_slots;
+  std::vector<std::size_t> walker_indices;
+};
+
 /// Test-only accessor for bounded crowd-workspace ownership diagnostics.
 class TestPsiFormerWF;
 
@@ -700,6 +707,9 @@ private:
       const RefVectorWithLeader<ParticleSet>& p_list,
       std::uint64_t descriptor_fingerprint) const;
 
+  /// Reserve one shared selected-transaction slot without throwing.
+  bool tryRegisterPlannedSelectedTransaction() const noexcept;
+
   /// Validate and abandon one planned selected proposal without a public API.
   void cancelPlannedSelectedProposal(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -796,6 +806,13 @@ private:
   /// Report opaque identity and numeric capacity for one acquired crowd resource.
   testing::PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnosticsForTesting(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
+
+  /// Copy bounded selected-compaction prefixes without exposing mutable scratch.
+  testing::PsiFormerSelectedProposalMapDiagnostics
+  selectedProposalMapDiagnosticsForTesting(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      std::size_t live_walkers,
+      std::size_t evaluated_rows) const;
 
   /// Report shared optimizer metadata ownership and the empty inherited variable set.
   testing::PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnosticsForTesting() const;
@@ -894,6 +911,8 @@ private:
   bool fail_clone_preparation_before_publish_for_testing_ = false;
   /// Inject a post-evaluation FULL_VGL failure before any public-state publication.
   bool fail_planned_full_vgl_before_publish_for_testing_ = false;
+  /// Inject a post-evaluation selected-proposal failure before publication.
+  bool fail_planned_selected_proposal_before_publish_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.
   bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
