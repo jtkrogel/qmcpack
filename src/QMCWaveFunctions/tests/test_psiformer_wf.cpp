@@ -264,11 +264,13 @@ std::shared_ptr<const BatchExecutionPlan> makeClonePreparationTestPlan(
   selection.topology.reserve_walkers_per_crowd = {1};
   selection.topology.run_kind                  = "psiformer-clone-preparation-test";
   selection.active_parameter_count             = 2;
+  selection.target_coordinate                  = BatchExecutionTargetCoordinate::POS_ONLY;
   selection.preference.id                      = profile_id;
   selection.preference.preferred               = {value_tile, 1, 1, ecp_outer_maximum};
   selection.logical_maximum = component.batchExecutionLogicalMaximum(
       {requirements, selection.topology, selection.particle_count,
-       selection.active_parameter_count, selection.parameter_derivative_width});
+       selection.active_parameter_count, selection.parameter_derivative_width,
+       selection.target_coordinate});
   selection.logical_maximum.ecp_outer = ecp_outer_maximum;
 
   return std::make_shared<const BatchExecutionPlan>(
@@ -878,14 +880,16 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   topology.run_kind                  = "psiformer-hook-test";
 
   const BatchExecutionWorkloadContext workload{
-      broad_requirements, topology, 0, 2, 0};
+      broad_requirements, topology, 0, 2, 0,
+      BatchExecutionTargetCoordinate::POS_ONLY};
   const BatchTileCapacities logical_maximum =
       component.batchExecutionLogicalMaximum(workload);
   CHECK(logical_maximum == BatchTileCapacities{5, 3, 3, 0});
 
   const BatchExecutionPlanningContext context{
       broad_requirements, topology, logical_maximum,
-      BatchTileCapacities{2, 2, 1, 0}, 0, 2, 0};
+      BatchTileCapacities{2, 2, 1, 0}, 0, 2, 0,
+      BatchExecutionTargetCoordinate::POS_ONLY};
   const BatchMemoryContribution contribution =
       component.estimateBatchExecutionMemory(context);
   CHECK(contribution.logical_maximum == logical_maximum);
@@ -901,9 +905,10 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   selection.requirements                       = requirements;
   selection.topology                           = topology;
   selection.active_parameter_count             = 2;
+  selection.target_coordinate                  = BatchExecutionTargetCoordinate::POS_ONLY;
   const BatchExecutionWorkloadContext selection_workload{
       requirements, topology, selection.particle_count, 2,
-      selection.parameter_derivative_width};
+      selection.parameter_derivative_width, selection.target_coordinate};
   selection.logical_maximum =
       component.batchExecutionLogicalMaximum(selection_workload);
   CHECK_THROWS_WITH(
@@ -922,7 +927,8 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   missing_requirement_selection.requirements = {};
   const BatchExecutionWorkloadContext missing_workload{
       {}, topology, missing_requirement_selection.particle_count, 2,
-      missing_requirement_selection.parameter_derivative_width};
+      missing_requirement_selection.parameter_derivative_width,
+      missing_requirement_selection.target_coordinate};
   missing_requirement_selection.logical_maximum =
       component.batchExecutionLogicalMaximum(missing_workload);
   const std::string participant_id =

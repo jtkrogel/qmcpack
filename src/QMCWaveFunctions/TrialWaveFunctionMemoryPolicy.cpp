@@ -62,7 +62,7 @@ bool accountingIsComplete(const TrialWaveFunctionMemoryPolicyInput& input,
   const bool derivative_storage_required = parameter_derivative && context.active_parameter_count != 0;
 
   bool complete = !context.topology.serialized_walkers && input.component_count == 1 && !input.use_tasking &&
-      !input.spinor_path_reachable && !input.fallback_path_reachable &&
+      context.target_coordinate == BatchExecutionTargetCoordinate::POS_ONLY && !input.fallback_path_reachable &&
       input.accounting_claims.runtime_preflight_and_unsupported_fail_closed && input.accounting_claims.clone_state &&
       input.accounting_claims.reference_views && input.accounting_claims.sole_component_dispatch &&
       input.sole_child.owner_multiplicity == 1 && input.sole_child.fully_accounted &&
@@ -299,7 +299,7 @@ BatchMemoryContribution estimateTrialWaveFunctionBatchMemory(const TrialWaveFunc
   BatchMemoryContribution contribution;
   contribution.logical_maximum = trialWaveFunctionBatchLogicalMaximum(
       {context.requirements, context.topology, context.particle_count, context.active_parameter_count,
-       context.parameter_derivative_width});
+       context.parameter_derivative_width, context.target_coordinate});
   contribution.owner_multiplicity = 1;
   contribution.fully_accounted    = accountingIsComplete(input, context, reserves);
   for (const TrialWaveFunctionCrowdMemoryPlan& plan : plans)

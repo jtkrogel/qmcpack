@@ -193,9 +193,10 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(const QMCHamiltonian& hamilto
   hamiltonian.contributeBatchExecutionRequirements(input.requirements);
   input.preference.preferred   = {3, 0, 0, 0};
   input.active_parameter_count = active_parameter_count;
+  input.target_coordinate      = BatchExecutionTargetCoordinate::POS_ONLY;
   input.logical_maximum        = hamiltonian.batchExecutionLogicalMaximum(
       {input.requirements, input.topology, input.particle_count,
-       input.active_parameter_count, input.parameter_derivative_width});
+       input.active_parameter_count, input.parameter_derivative_width, input.target_coordinate});
   auto provider = [&hamiltonian](const BatchExecutionPlanningContext& context) {
     return hamiltonian.estimateBatchExecutionMemory(context);
   };

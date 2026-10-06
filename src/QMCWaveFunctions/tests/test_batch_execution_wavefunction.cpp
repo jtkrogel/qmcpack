@@ -524,9 +524,10 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(
   input.particle_count                 = particle_count;
   input.active_parameter_count         = 17;
   input.parameter_derivative_width     = 17;
+  input.target_coordinate              = BatchExecutionTargetCoordinate::POS_ONLY;
   input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
       {input.requirements, input.topology, input.particle_count,
-       input.active_parameter_count, input.parameter_derivative_width});
+       input.active_parameter_count, input.parameter_derivative_width, input.target_coordinate});
   input.preference.id        = std::move(profile_id);
   input.preference.preferred = {preferred_value_tile, 2, 2,
                                 preferred_ecp_outer_tile};
@@ -769,9 +770,10 @@ TEST_CASE("TrialWaveFunction aggregate binding rejects fabricated accounting evi
   input.particle_count                    = 4;
   input.active_parameter_count            = 2;
   input.parameter_derivative_width        = 2;
+  input.target_coordinate                 = BatchExecutionTargetCoordinate::POS_ONLY;
   input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
       {input.requirements, input.topology, input.particle_count,
-       input.active_parameter_count, input.parameter_derivative_width});
+       input.active_parameter_count, input.parameter_derivative_width, input.target_coordinate});
   input.preference.id        = "fabricated-accounting-v1";
   input.preference.preferred = {3, 1, 1, 0};
 
@@ -809,8 +811,9 @@ TEST_CASE("TrialWaveFunction aggregate binding recomputes selected evidence",
   input.topology.reserve_walkers_per_crowd = {3};
   input.topology.run_kind                  = "stale-selected-test";
   input.particle_count                    = 4;
+  input.target_coordinate                 = BatchExecutionTargetCoordinate::POS_ONLY;
   input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
-      {input.requirements, input.topology, input.particle_count, 0, 0});
+      {input.requirements, input.topology, input.particle_count, 0, 0, input.target_coordinate});
   input.preference.id        = "stale-selected-v1";
   input.preference.preferred = {3, 1, 1, 0};
 
@@ -847,8 +850,9 @@ TEST_CASE("TrialWaveFunction aggregate binding recomputes minimum evidence",
   input.topology.reserve_walkers_per_crowd = {3};
   input.topology.run_kind                  = "stale-minimum-test";
   input.particle_count                    = 4;
+  input.target_coordinate                 = BatchExecutionTargetCoordinate::POS_ONLY;
   input.logical_maximum = wavefunction.batchExecutionLogicalMaximum(
-      {input.requirements, input.topology, input.particle_count, 0, 0});
+      {input.requirements, input.topology, input.particle_count, 0, 0, input.target_coordinate});
   input.preference.id        = "stale-minimum-v1";
   input.preference.preferred = {3, 1, 1, 0};
 

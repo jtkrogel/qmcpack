@@ -93,6 +93,7 @@ std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationPlan(std::vector<s
   BatchExecutionSelectionInput input;
   input.topology.initial_walkers_per_crowd = std::move(initial_walkers);
   input.topology.reserve_walkers_per_crowd = std::move(reserve_walkers);
+  input.target_coordinate = BatchExecutionTargetCoordinate::POS_ONLY;
   return std::make_shared<const BatchExecutionPlan>(
       selectBatchExecutionPlan(input, [](const BatchExecutionPlanningContext&) {
         return std::vector<BatchMemoryParticipantContribution>{};

@@ -10,6 +10,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/TrialWaveFunctionMemoryPolicy.h"
@@ -59,15 +60,17 @@ BatchExecutionPlanningContext makeContext(BatchExecutionRequirements requirement
                                           BatchTileCapacities candidate,
                                           std::size_t particle_count,
                                           std::size_t active_parameter_count = 0,
-                                          std::size_t parameter_derivative_width = 0)
+                                          std::size_t parameter_derivative_width = 0,
+                                          BatchExecutionTargetCoordinate target_coordinate =
+                                              BatchExecutionTargetCoordinate::POS_ONLY)
 {
   BatchExecutionTopology topology;
   topology.initial_walkers_per_crowd = std::move(initial);
   topology.reserve_walkers_per_crowd = std::move(reserve);
   const BatchExecutionWorkloadContext workload{requirements, topology, particle_count, active_parameter_count,
-                                                parameter_derivative_width};
+                                                parameter_derivative_width, target_coordinate};
   return {requirements, topology, trialWaveFunctionBatchLogicalMaximum(workload), candidate, particle_count,
-          active_parameter_count, parameter_derivative_width};
+          active_parameter_count, parameter_derivative_width, target_coordinate};
 }
 
 /** Return one host category and assert that its device counterpart is empty. */
@@ -224,6 +227,33 @@ TEST_CASE("TrialWaveFunction aggregate completeness is mode-conditional and fail
   TrialWaveFunctionMemoryPolicyInput input = makePolicyInput();
   CHECK(estimateTrialWaveFunctionBatchMemory(input, base_context).fully_accounted);
 
+  BatchExecutionPlanningContext unknown_target = base_context;
+  unknown_target.target_coordinate = BatchExecutionTargetCoordinate::UNKNOWN;
+  CHECK_FALSE(estimateTrialWaveFunctionBatchMemory(input, unknown_target).fully_accounted);
+  BatchExecutionPlanningContext spin_target = base_context;
+  spin_target.target_coordinate = BatchExecutionTargetCoordinate::POS_SPIN;
+  CHECK_FALSE(estimateTrialWaveFunctionBatchMemory(input, spin_target).fully_accounted);
+
+  for (const BatchExecutionTargetCoordinate unsupported_target :
+       {BatchExecutionTargetCoordinate::UNKNOWN, BatchExecutionTargetCoordinate::POS_SPIN})
+  {
+    BatchExecutionSelectionInput selection;
+    selection.requirements                       = base_requirements;
+    selection.topology                           = base_context.topology;
+    selection.logical_maximum                    = base_context.logical_maximum;
+    selection.preference.preferred               = {2, 0, 0, 0};
+    selection.particle_count                     = base_context.particle_count;
+    selection.target_coordinate                  = unsupported_target;
+    CHECK_THROWS_WITH(
+        selectBatchExecutionPlan(
+            selection, [&input](const BatchExecutionPlanningContext& candidate) {
+              return std::vector<BatchMemoryParticipantContribution>{
+                  {std::string(TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID),
+                   estimateTrialWaveFunctionBatchMemory(input, candidate)}};
+            }),
+        "Batch memory participant is not fully accounted: twf/aggregate");
+  }
+
   BatchExecutionPlanningContext value_only_global_width = base_context;
   value_only_global_width.active_parameter_count        = 2;
   value_only_global_width.parameter_derivative_width    = 7;
@@ -255,7 +285,6 @@ TEST_CASE("TrialWaveFunction aggregate completeness is mode-conditional and fail
   for (const UnsupportedConfiguration configure_unsupported : {
            +[](TrialWaveFunctionMemoryPolicyInput& policy) { policy.component_count = 2; },
            +[](TrialWaveFunctionMemoryPolicyInput& policy) { policy.use_tasking = true; },
-           +[](TrialWaveFunctionMemoryPolicyInput& policy) { policy.spinor_path_reachable = true; },
            +[](TrialWaveFunctionMemoryPolicyInput& policy) { policy.fallback_path_reachable = true; },
            +[](TrialWaveFunctionMemoryPolicyInput& policy) { policy.sole_child.owner_multiplicity = 2; },
            +[](TrialWaveFunctionMemoryPolicyInput& policy) { policy.sole_child.fully_accounted = false; },

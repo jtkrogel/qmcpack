@@ -69,6 +69,7 @@ BatchExecutionSelectionInput makeSelectionInput()
   input.particle_count                     = 23;
   input.active_parameter_count             = 17;
   input.parameter_derivative_width         = 19;
+  input.target_coordinate                  = BatchExecutionTargetCoordinate::POS_ONLY;
   return input;
 }
 
@@ -100,6 +101,14 @@ TEST_CASE("Batch execution memory checked arithmetic", "[utilities][batch_memory
   CHECK_THROWS_AS(aggregateBatchMemoryContributions({{"overflow", contribution}}), std::overflow_error);
 }
 
+TEST_CASE("Batch execution target coordinate evidence has distinct states", "[utilities][batch_memory]")
+{
+  CHECK(BatchExecutionTargetCoordinate::UNKNOWN == BatchExecutionTargetCoordinate::UNKNOWN);
+  CHECK(BatchExecutionTargetCoordinate::UNKNOWN != BatchExecutionTargetCoordinate::POS_ONLY);
+  CHECK(BatchExecutionTargetCoordinate::UNKNOWN != BatchExecutionTargetCoordinate::POS_SPIN);
+  CHECK(BatchExecutionTargetCoordinate::POS_ONLY != BatchExecutionTargetCoordinate::POS_SPIN);
+}
+
 TEST_CASE("Batch execution logical maxima combine elementwise", "[utilities][batch_memory]")
 {
   BatchTileCapacities aggregate{4, 1, 8, 2};
@@ -127,10 +136,11 @@ TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][
     CHECK(plan.selectedCapacities() == BatchTileCapacities{4, 4, 4, 4});
     CHECK(plan.selectedEstimate().total() == BatchMemoryBytes{260, 52});
     CHECK(plan.fixedMinimumEstimate().total() == BatchMemoryBytes{140, 28});
-    CHECK(plan.schemaId() == "batch-execution-memory-v2");
+    CHECK(plan.schemaId() == "batch-execution-memory-v3");
     CHECK(plan.particleCount() == 23);
     CHECK(plan.activeParameterCount() == 17);
     CHECK(plan.parameterDerivativeWidth() == 19);
+    CHECK(plan.targetCoordinate() == BatchExecutionTargetCoordinate::POS_ONLY);
     REQUIRE(plan.participantEvidence().size() == 1);
     const BatchMemoryParticipantEvidence& evidence = plan.participantEvidence().front();
     CHECK(evidence.participant_id == "twf/component/0/Test/component");
@@ -277,6 +287,14 @@ TEST_CASE("Batch execution memory plans have stable exact-content fingerprints",
   const BatchExecutionPlan repeated = selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
   CHECK(first.fingerprint() == repeated.fingerprint());
 
+  BatchExecutionSelectionInput unknown_target_input = input;
+  unknown_target_input.target_coordinate = BatchExecutionTargetCoordinate::UNKNOWN;
+  const BatchExecutionPlan unknown_target =
+      selectBatchExecutionPlan(unknown_target_input, makeProvider(equalSlopeEstimate));
+  CHECK(unknown_target.targetCoordinate() == BatchExecutionTargetCoordinate::UNKNOWN);
+  CHECK(first.targetCoordinate() == BatchExecutionTargetCoordinate::POS_ONLY);
+  CHECK(first.fingerprint() != unknown_target.fingerprint());
+
   input.topology.initial_walkers_per_crowd = {2, 3, 0};
   const BatchExecutionPlan changed_topology =
       selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
@@ -305,6 +323,15 @@ TEST_CASE("Batch execution memory plans have stable exact-content fingerprints",
       selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
   CHECK(first.fingerprint() != changed_parameter_derivative_width.fingerprint());
   CHECK(first.selectedCapacities() == changed_parameter_derivative_width.selectedCapacities());
+
+  input.parameter_derivative_width = 19;
+  input.target_coordinate          = BatchExecutionTargetCoordinate::POS_SPIN;
+  const BatchExecutionPlan changed_target_coordinate =
+      selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
+  CHECK(changed_target_coordinate.targetCoordinate() == BatchExecutionTargetCoordinate::POS_SPIN);
+  CHECK(first.fingerprint() != changed_target_coordinate.fingerprint());
+  CHECK(unknown_target.fingerprint() != changed_target_coordinate.fingerprint());
+  CHECK(first.selectedCapacities() == changed_target_coordinate.selectedCapacities());
 
   SECTION("the fixed minimum estimate is part of the immutable content")
   {
@@ -414,6 +441,7 @@ TEST_CASE("Batch execution planning context reaches participant providers", "[ut
   input.particle_count                     = 57;
   input.active_parameter_count             = 1234;
   input.parameter_derivative_width         = 4321;
+  input.target_coordinate                  = BatchExecutionTargetCoordinate::POS_SPIN;
 
   bool provider_called = false;
   auto provider = [&](const BatchExecutionPlanningContext& context) {
@@ -427,6 +455,7 @@ TEST_CASE("Batch execution planning context reaches participant providers", "[ut
     CHECK(context.particle_count == 57);
     CHECK(context.active_parameter_count == 1234);
     CHECK(context.parameter_derivative_width == 4321);
+    CHECK(context.target_coordinate == BatchExecutionTargetCoordinate::POS_SPIN);
 
     BatchMemoryContribution contribution;
     contribution.logical_maximum    = context.logical_maximum;
@@ -440,6 +469,7 @@ TEST_CASE("Batch execution planning context reaches participant providers", "[ut
   CHECK(plan.particleCount() == 57);
   CHECK(plan.activeParameterCount() == 1234);
   CHECK(plan.parameterDerivativeWidth() == 4321);
+  CHECK(plan.targetCoordinate() == BatchExecutionTargetCoordinate::POS_SPIN);
 }
 
 TEST_CASE("Batch execution participant views have explicit shared and null semantics",
@@ -529,6 +559,13 @@ TEST_CASE("Batch execution memory rejects invalid selection contracts", "[utilit
   {
     input.topology.reserve_walkers_per_crowd = {2, 2, 0};
     CHECK_THROWS_AS(selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate)), std::invalid_argument);
+  }
+
+  SECTION("target coordinate capability must be a recognized value")
+  {
+    input.target_coordinate = static_cast<BatchExecutionTargetCoordinate>(255);
+    CHECK_THROWS_WITH(selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate)),
+                      "Batch execution target coordinate capability is invalid");
   }
 
   SECTION("participant IDs must be nonempty and unique")

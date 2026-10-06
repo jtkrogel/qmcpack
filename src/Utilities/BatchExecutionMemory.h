@@ -73,6 +73,17 @@ enum class BatchExecutionMode : std::uint32_t
   SCALAR_VALUE_COMPATIBILITY = 1U << 9
 };
 
+/** Exact target coordinate/move capability proved by the driver workload. */
+enum class BatchExecutionTargetCoordinate : std::uint8_t
+{
+  /// No target or move-mode evidence was supplied; never infer POS-only support.
+  UNKNOWN,
+  /// The target and every reachable move operate on spatial coordinates only.
+  POS_ONLY,
+  /// The target or a reachable move includes spin coordinates.
+  POS_SPIN
+};
+
 /** Compact mask of operation families reachable from one driver section. */
 class BatchExecutionRequirements
 {
@@ -200,6 +211,8 @@ struct BatchExecutionWorkloadContext
   std::size_t active_parameter_count = 0;
   /// Exact width of each global parameter-derivative destination row.
   std::size_t parameter_derivative_width = 0;
+  /// Exact coordinate capability proved jointly by the target and driver move mode.
+  BatchExecutionTargetCoordinate target_coordinate = BatchExecutionTargetCoordinate::UNKNOWN;
 };
 
 /** Complete neutral context presented to every participant estimator. */
@@ -215,6 +228,8 @@ struct BatchExecutionPlanningContext
   std::size_t active_parameter_count = 0;
   /// Exact width of each global parameter-derivative destination row.
   std::size_t parameter_derivative_width = 0;
+  /// Exact coordinate capability proved jointly by the target and driver move mode.
+  BatchExecutionTargetCoordinate target_coordinate = BatchExecutionTargetCoordinate::UNKNOWN;
 };
 
 /** Expand an aggregate logical envelope by the elementwise participant maxima. */
@@ -270,7 +285,7 @@ struct BatchMemoryParticipantEvidence
 /** Complete pure input to deterministic tile selection. */
 struct BatchExecutionSelectionInput
 {
-  std::string schema_id{"batch-execution-memory-v2"};
+  std::string schema_id{"batch-execution-memory-v3"};
   BatchMemoryPolicy policy;
   BatchExecutionRequirements requirements;
   BatchExecutionTopology topology;
@@ -282,6 +297,8 @@ struct BatchExecutionSelectionInput
   std::size_t active_parameter_count = 0;
   /// Exact width of each global parameter-derivative destination row.
   std::size_t parameter_derivative_width = 0;
+  /// Exact coordinate capability proved jointly by the target and driver move mode.
+  BatchExecutionTargetCoordinate target_coordinate = BatchExecutionTargetCoordinate::UNKNOWN;
 };
 
 using BatchMemoryContributionProvider =
@@ -305,6 +322,7 @@ public:
   std::size_t particleCount() const noexcept { return particle_count_; }
   std::size_t activeParameterCount() const noexcept { return active_parameter_count_; }
   std::size_t parameterDerivativeWidth() const noexcept { return parameter_derivative_width_; }
+  BatchExecutionTargetCoordinate targetCoordinate() const noexcept { return target_coordinate_; }
   const std::vector<BatchMemoryParticipantEvidence>& participantEvidence() const noexcept
   {
     return participant_evidence_;
@@ -328,6 +346,7 @@ private:
   std::size_t particle_count_ = 0;
   std::size_t active_parameter_count_ = 0;
   std::size_t parameter_derivative_width_ = 0;
+  BatchExecutionTargetCoordinate target_coordinate_ = BatchExecutionTargetCoordinate::UNKNOWN;
   std::vector<BatchMemoryParticipantEvidence> participant_evidence_;
 };
 

@@ -216,6 +216,7 @@ std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
   mixInteger(hash, input.particle_count);
   mixInteger(hash, input.active_parameter_count);
   mixInteger(hash, input.parameter_derivative_width);
+  mixByte(hash, static_cast<std::uint8_t>(input.target_coordinate));
 
   mixByte(hash, input.topology.serialized_walkers);
   mixString(hash, input.topology.run_kind);
@@ -250,6 +251,15 @@ void validateSelectionInput(const BatchExecutionSelectionInput& input)
     throw std::invalid_argument("Batch execution memory schema ID must not be empty");
   if (input.preference.id.empty())
     throw std::invalid_argument("Batch execution memory preference ID must not be empty");
+  switch (input.target_coordinate)
+  {
+  case BatchExecutionTargetCoordinate::UNKNOWN:
+  case BatchExecutionTargetCoordinate::POS_ONLY:
+  case BatchExecutionTargetCoordinate::POS_SPIN:
+    break;
+  default:
+    throw std::invalid_argument("Batch execution target coordinate capability is invalid");
+  }
   validateBatchExecutionTopology(input.topology);
 }
 
@@ -577,7 +587,8 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
                                           capacities,
                                           input.particle_count,
                                           input.active_parameter_count,
-                                          input.parameter_derivative_width};
+                                          input.parameter_derivative_width,
+                                          input.target_coordinate};
     ContributionEvaluation evaluation;
     evaluation.contributions = provider(context);
     evaluation.aggregate     = aggregateBatchMemoryContributions(evaluation.contributions);
@@ -676,6 +687,7 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   plan.particle_count_             = input.particle_count;
   plan.active_parameter_count_     = input.active_parameter_count;
   plan.parameter_derivative_width_ = input.parameter_derivative_width;
+  plan.target_coordinate_          = input.target_coordinate;
   plan.participant_evidence_        = std::move(participant_evidence);
   plan.fingerprint_ =
       makeFingerprint(input, minimum, selected, plan.fixed_minimum_estimate_,

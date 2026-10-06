@@ -10,6 +10,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 
@@ -56,16 +57,18 @@ BatchExecutionPlanningContext makeContext(
     std::vector<std::size_t> initial,
     std::vector<std::size_t> reserve,
     BatchTileCapacities candidate,
-    std::size_t active_parameters = 0)
+    std::size_t active_parameters = 0,
+    BatchExecutionTargetCoordinate target_coordinate =
+        BatchExecutionTargetCoordinate::POS_ONLY)
 {
   BatchExecutionTopology topology;
   topology.initial_walkers_per_crowd = std::move(initial);
   topology.reserve_walkers_per_crowd = std::move(reserve);
   const BatchExecutionWorkloadContext workload{requirements, topology, 0,
-                                                active_parameters, 0};
+                                                active_parameters, 0, target_coordinate};
   return {requirements, topology,
           psiformer::psiFormerBatchLogicalMaximum(input, workload), candidate,
-          0, active_parameters, 0};
+          0, active_parameters, 0, target_coordinate};
 }
 
 std::size_t hostBytes(const BatchMemoryContribution& contribution,
@@ -712,6 +715,34 @@ TEST_CASE("PsiFormer memory policy fails closed for unsupported execution",
 
   input.accounting_claims = PsiFormerMemoryAccountingClaims::complete();
   CHECK(psiformer::estimatePsiFormerBatchMemory(input, context).fully_accounted);
+
+  context.target_coordinate = BatchExecutionTargetCoordinate::UNKNOWN;
+  CHECK_FALSE(
+      psiformer::estimatePsiFormerBatchMemory(input, context).fully_accounted);
+  context.target_coordinate = BatchExecutionTargetCoordinate::POS_SPIN;
+  CHECK_FALSE(
+      psiformer::estimatePsiFormerBatchMemory(input, context).fully_accounted);
+  context.target_coordinate = BatchExecutionTargetCoordinate::POS_ONLY;
+  CHECK(psiformer::estimatePsiFormerBatchMemory(input, context).fully_accounted);
+
+  for (const BatchExecutionTargetCoordinate unsupported_target :
+       {BatchExecutionTargetCoordinate::UNKNOWN, BatchExecutionTargetCoordinate::POS_SPIN})
+  {
+    BatchExecutionSelectionInput selection;
+    selection.requirements          = requirements;
+    selection.topology              = context.topology;
+    selection.logical_maximum       = context.logical_maximum;
+    selection.preference.preferred  = {2, 0, 0, 0};
+    selection.target_coordinate     = unsupported_target;
+    CHECK_THROWS_WITH(
+        selectBatchExecutionPlan(
+            selection, [&input](const BatchExecutionPlanningContext& candidate) {
+              return std::vector<BatchMemoryParticipantContribution>{
+                  {"twf/component/0/PsiFormer/test",
+                   psiformer::estimatePsiFormerBatchMemory(input, candidate)}};
+            }),
+        "Batch memory participant is not fully accounted: twf/component/0/PsiFormer/test");
+  }
 
   input.backends.value = PsiFormerMemoryBackend::ORACLE;
   CHECK_FALSE(

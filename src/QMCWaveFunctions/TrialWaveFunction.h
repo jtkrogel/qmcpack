@@ -612,7 +612,7 @@ public:
   /// Report whether this object currently participates in an acquired team resource.
   bool hasAcquiredResource() const noexcept { return resource_acquired_; }
 
-  /// initialize a shared resource and hand it to a collection
+  /// Add the plan-owned aggregate resource when bound, followed by legacy child resources.
   void createResource(ResourceCollection& collection) const;
   /** acquire external resource
    * Note: use RAII ResourceCollectionLock whenever possible

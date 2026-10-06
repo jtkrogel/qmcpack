@@ -98,9 +98,10 @@ struct TrialWaveFunctionMemoryPolicyInput
   TrialWaveFunctionMemoryAccountingClaims accounting_claims;
   TrialWaveFunctionSoleChildEvidence sole_child;
 
+  // Target-coordinate support belongs to the planning context so missing
+  // workload evidence cannot be mistaken for a non-spinor default here.
   std::size_t component_count  = 0;
   bool use_tasking             = false;
-  bool spinor_path_reachable   = false;
   bool fallback_path_reachable = false;
 };
 

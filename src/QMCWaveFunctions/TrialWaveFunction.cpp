@@ -496,7 +496,7 @@ private:
         policy_input_,
         {selected.requirements(), selected.topology(), selected.logicalMaximum(),
          selected.selectedCapacities(), selected.particleCount(),
-         selected.activeParameterCount(), selected.parameterDerivativeWidth()});
+         selected.activeParameterCount(), selected.parameterDerivativeWidth(), selected.targetCoordinate()});
   }
 
   /// Recompute selected and minimum evidence from immutable resource facts.
@@ -511,7 +511,7 @@ private:
     BatchExecutionPlanningContext context{
         plan.requirements(), plan.topology(), plan.logicalMaximum(),
         plan.selectedCapacities(), plan.particleCount(),
-        plan.activeParameterCount(), plan.parameterDerivativeWidth()};
+        plan.activeParameterCount(), plan.parameterDerivativeWidth(), plan.targetCoordinate()};
     const BatchMemoryContribution selected =
         estimateTrialWaveFunctionBatchMemory(policy_input_, context);
     if (!(selected.logical_maximum == evidence.logical_maximum) ||
@@ -1080,7 +1080,7 @@ void TrialWaveFunction::validateAggregateBatchExecutionPlanBinding(
 
   const BatchExecutionPlanningContext selected_context{
       plan.requirements(), plan.topology(), plan.logicalMaximum(), plan.selectedCapacities(),
-      plan.particleCount(), plan.activeParameterCount(), plan.parameterDerivativeWidth()};
+      plan.particleCount(), plan.activeParameterCount(), plan.parameterDerivativeWidth(), plan.targetCoordinate()};
   const BatchMemoryContribution selected = makeAggregateContribution(selected_context);
   if (!capacitiesFitWithin(selected.logical_maximum, plan.logicalMaximum()))
     throw std::invalid_argument(
@@ -3189,9 +3189,9 @@ void TrialWaveFunction::createResource(ResourceCollection& collection) const
             Z.size(), use_tasking_, static_cast<bool>(twf_fastderiv_),
             complete_batch_memory_accounting_for_testing_, sole_child_ptr,
             sole_child_atomic);
-    // Production accounting claims remain false.  In particular, target spin
-    // capability is not yet fingerprinted here; the complete-claims override is
-    // confined to friend tests until that later driver boundary supplies it.
+    // The bound plan already carries fingerprinted target-coordinate evidence.
+    // Production accounting claims remain false until the remaining runtime
+    // owners are migrated; the complete-claims override is confined to tests.
     collection.addResource(std::make_unique<TrialWaveFunctionMultiWalkerResource>(
         Z.empty() ? nullptr : Z.front().get(), policy_input,
         bound_batch_topology_.aggregate_plan));

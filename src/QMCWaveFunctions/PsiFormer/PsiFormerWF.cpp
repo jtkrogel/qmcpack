@@ -899,7 +899,7 @@ private:
     const BatchExecutionPlanningContext selected_context{
         plan.requirements(), plan.topology(), plan.logicalMaximum(),
         plan.selectedCapacities(), plan.particleCount(), plan.activeParameterCount(),
-        plan.parameterDerivativeWidth()};
+        plan.parameterDerivativeWidth(), plan.targetCoordinate()};
     const BatchMemoryContribution selected =
         psiformer::estimatePsiFormerBatchMemory(memory_policy_input,
                                                 selected_context);
@@ -939,7 +939,7 @@ private:
         memory_policy_input,
         {plan.requirements(), plan.topology(), plan.logicalMaximum(),
          plan.selectedCapacities(), plan.particleCount(), plan.activeParameterCount(),
-         plan.parameterDerivativeWidth()});
+         plan.parameterDerivativeWidth(), plan.targetCoordinate()});
   }
 
   /// Report every retained numeric byte, including legacy-only lazy staging.
@@ -1806,7 +1806,7 @@ void PsiFormerWF::validateBatchExecutionPlanBinding(
   BatchExecutionPlanningContext selected_context{
       plan.requirements(), plan.topology(), plan.logicalMaximum(),
       plan.selectedCapacities(), plan.particleCount(), plan.activeParameterCount(),
-      plan.parameterDerivativeWidth()};
+      plan.parameterDerivativeWidth(), plan.targetCoordinate()};
   const BatchMemoryContribution selected =
       psiformer::estimatePsiFormerBatchMemory(input, selected_context);
 
