@@ -23,6 +23,7 @@
 #include "Particle/MCMultiParticleMoves.h"
 #include "Particle/VirtualParticleSet.h"
 #include "ResourceCollection.h"
+#include "Utilities/BatchResourcePreparation.h"
 #include "io/hdf/hdf_archive.h"
 
 #include <algorithm>
@@ -32,6 +33,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -42,6 +44,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace qmcplusplus
@@ -564,23 +567,107 @@ private:
  * against the same immutable/versioned model state without copying buffers. */
 struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
 {
-  /// Create empty crowd scratch bound to one shared immutable model state.
-  explicit PsiFormerMultiWalkerResource(std::shared_ptr<PsiFormerSharedState> model_state)
+  /** Create an empty template bound to one model and, when selected, one
+   * structurally identified participant view. */
+  PsiFormerMultiWalkerResource(std::shared_ptr<PsiFormerSharedState> model_state,
+                               psiformer::PsiFormerMemoryPolicyInput memory_policy_input,
+                               std::string participant_id = {},
+                               BatchExecutionParticipantPlan expected_plan = {})
       : Resource("PsiFormerMultiWalkerResource"),
         model_state(std::move(model_state)),
+        memory_policy_input(std::move(memory_policy_input)),
+        participant_id(std::move(participant_id)),
+        expected_plan(std::move(expected_plan)),
         batch_workspace(this->model_state->direct_batch_executor.makeWorkspace())
   {}
 
-  /// Clone only model identity; ResourceCollection copies never duplicate live scratch.
+  /** Clone template provenance but never prepared or lazily accumulated
+   * numeric storage.  Collection provenance separately marks copies derived
+   * from a prepared collection as requiring an explicit clear. */
   PsiFormerMultiWalkerResource(const PsiFormerMultiWalkerResource& other)
-      : PsiFormerMultiWalkerResource(other.model_state)
+      : PsiFormerMultiWalkerResource(other.model_state,
+                                     other.memory_policy_input,
+                                     other.participant_id,
+                                     other.expected_plan)
   {}
 
   /// Recreate an independent resource for a copied crowd resource collection.
   std::unique_ptr<Resource> makeClone() const override
   { return std::make_unique<PsiFormerMultiWalkerResource>(*this); }
 
+  /** Reject invalid or overlapping preparation before ResourceCollection
+   * constructs the first transactional candidate. */
+  void validateBatchResourcePreparation(
+      const BatchResourcePreparationContext& context) const override
+  {
+    context.validate();
+    if (!context.plan)
+      return;
+    if (prepared_plan)
+      throw std::logic_error(
+          "PsiFormer nonnull crowd-resource replanning requires an explicit null clear");
+    if (retainedNumericBytes() != 0)
+      throw std::logic_error(
+          "PsiFormer lazy crowd storage must be cleared before applying a batch plan");
+    if (participant_id.empty())
+      throw std::logic_error(
+          "PsiFormer crowd resource was created before its batch participant identity was bound");
+
+    const BatchExecutionParticipantPlan selected =
+        makeBatchExecutionParticipantPlan(context.plan, participant_id);
+    if (expected_plan && !expected_plan.sameBinding(selected))
+      throw std::invalid_argument(
+          "PsiFormer crowd resource preparation received the wrong participant plan");
+    validateParticipantEvidence(selected);
+    const std::vector<psiformer::PsiFormerCrowdMemoryPlan> crowd_plans =
+        makeCrowdPlans(selected);
+    if (context.crowd_index >= crowd_plans.size())
+      throw std::out_of_range(
+          "PsiFormer crowd resource preparation index is outside its memory plan");
+  }
+
+  /** Materialize one exact candidate, or return it to empty legacy mode for a
+   * null context.  Publication into this resource happens only after every
+   * candidate allocation and byte check succeeds. */
+  void prepareBatchResource(const BatchResourcePreparationContext& context) override
+  {
+    validateBatchResourcePreparation(context);
+    if (!context.plan)
+    {
+      clearToNoPolicy();
+      return;
+    }
+
+    BatchExecutionParticipantPlan selected =
+        makeBatchExecutionParticipantPlan(context.plan, participant_id);
+    std::vector<psiformer::PsiFormerCrowdMemoryPlan> crowd_plans =
+        makeCrowdPlans(selected);
+    psiformer::PsiFormerCrowdMemoryPlan crowd_plan =
+        std::move(crowd_plans.at(context.crowd_index));
+
+    PsiFormerMultiWalkerResource candidate(model_state, memory_policy_input,
+                                            participant_id, selected);
+    candidate.materializePreparedStorage(selected, context.crowd_index,
+                                         std::move(crowd_plan));
+    publishPreparedStorage(std::move(candidate));
+  }
+
   std::shared_ptr<PsiFormerSharedState> model_state;
+  /// Immutable model/backend/type facts used to reproduce selected evidence.
+  psiformer::PsiFormerMemoryPolicyInput memory_policy_input;
+  /// Stable structural identity retained across an explicit null clear.
+  std::string participant_id;
+  /// Template binding captured when the golden ResourceCollection was built.
+  BatchExecutionParticipantPlan expected_plan;
+  /// Binding published only after exact crowd storage is complete.
+  BatchExecutionParticipantPlan prepared_plan;
+  /// Exact crowd allocation descriptor paired with the prepared binding.
+  std::optional<psiformer::PsiFormerCrowdMemoryPlan> prepared_crowd_plan;
+  std::size_t prepared_crowd_index          = 0;
+  std::uint64_t prepared_plan_fingerprint   = 0;
+  std::size_t prepared_storage_fingerprint = 0;
+  BatchMemoryEstimate actual_resource_storage;
+
   std::unique_ptr<pf::DirectBatchWorkspace> batch_workspace;
   /// Lazily allocated score tape serialized across component-major crowd calls.
   std::unique_ptr<pf::DirectScoreWorkspace> score_workspace;
@@ -588,6 +675,22 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::unique_ptr<pf::DirectKineticWorkspace> kinetic_workspace;
   /// Complete per-walker drift packed immediately before a kinetic reverse pass.
   std::vector<double> total_log_gradient;
+  /// Exact identities used to publish accepted/proposed state transactionally.
+  std::vector<std::uint64_t> configuration_identities;
+  /// Dense-result slots for configurations that require native evaluation.
+  std::vector<std::size_t> batch_slots;
+  /// Shared phase/sign staging across dense crowd operation families.
+  std::vector<double> staged_signs;
+  /// Shared logarithmic-amplitude staging across dense crowd operation families.
+  std::vector<double> staged_log_magnitudes;
+  /// Real/complex wavefunction-value ratios when FULL_VGL is not reachable.
+  std::vector<ValueType> staged_value_ratios;
+  /// Full-precision complex log ratios, also reused by narrower ratio calls.
+  std::vector<LogValue> staged_log_ratios;
+  /// Shared gradient publication staging for active and full spatial calls.
+  std::vector<GradType> staged_gradients;
+  /// Byte-addressable flags retaining accepted spatial products during recompute.
+  std::vector<unsigned char> preservation_flags;
   /// Per-configuration active-electron indices consumed by the native batch API.
   std::vector<std::size_t> active_electrons;
   /// Prefix offsets mapping flattened ragged virtual configurations back to walkers.
@@ -606,6 +709,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::vector<ValueType> flat_virtual_weighted_derivatives;
   /// Reusable selected-score contribution gathered after each serialized reverse pass.
   SelectedDerivativeDelta virtual_score_contribution;
+  /// Second selected-derivative contribution retained for kinetic responses.
+  SelectedDerivativeDelta kinetic_parameter_contribution;
   /// Oracle reference signs retained across flattened virtual calls.
   std::vector<double> virtual_reference_signs;
   /// Oracle reference log magnitudes retained across flattened virtual calls.
@@ -617,32 +722,615 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::size_t weighted_replacement_configurations = 0;
   std::size_t weighted_active_parameters           = 0;
 
-  /// Create the single reusable score tape only when an optimizer path requests it.
+  /** Return the score tape, allocating only under the legacy no-policy
+   * contract.  A hard plan must have prepared it already. */
   pf::DirectScoreWorkspace& requireScoreWorkspace()
   {
+    if (expected_plan || prepared_plan)
+    {
+      if (!prepared_plan || !score_workspace)
+        throw std::logic_error(
+            "PsiFormer planned crowd score workspace was not prepared");
+      return *score_workspace;
+    }
     if (!score_workspace)
       score_workspace = model_state->direct_score_executor.makeWorkspace();
     return *score_workspace;
   }
 
-  /// Create the single reusable kinetic tape only when an optimizer path requests it.
+  /** Return the kinetic tape, allocating only under the legacy no-policy
+   * contract. */
   pf::DirectKineticWorkspace& requireKineticWorkspace()
   {
+    if (expected_plan || prepared_plan)
+    {
+      if (!prepared_plan || !kinetic_workspace)
+        throw std::logic_error(
+            "PsiFormer planned crowd kinetic workspace was not prepared");
+      return *kinetic_workspace;
+    }
     if (!kinetic_workspace)
       kinetic_workspace = model_state->direct_kinetic_executor.makeWorkspace();
     return *kinetic_workspace;
   }
 
-  /// Return fixed-size crowd drift storage paired with the reusable kinetic tape.
+  /** Return fixed-size drift storage without growing it under a hard plan. */
   std::vector<double>& requireTotalLogGradient()
   {
     const std::size_t required_size =
         3 * model_state->execution_plan.modelShape().electrons();
+    if (expected_plan || prepared_plan)
+    {
+      if (!prepared_plan || total_log_gradient.capacity() != required_size)
+        throw std::logic_error(
+            "PsiFormer planned crowd total-drift buffer was not prepared");
+      // releaseResource clears logical contents while retaining capacity.
+      // Restoring the admitted extent cannot reallocate after the exact check.
+      total_log_gradient.resize(required_size);
+      return total_log_gradient;
+    }
     if (total_log_gradient.empty())
       total_log_gradient.resize(required_size);
     if (total_log_gradient.size() != required_size)
       throw std::logic_error("PsiFormer crowd total-drift buffer has the wrong size");
     return total_log_gradient;
+  }
+
+  /** Validate one acquired resource against model, participant, crowd, and
+   * live-lane provenance. */
+  void validateAcquiredBinding(const PsiFormerSharedState* expected_model,
+                               const BatchExecutionParticipantPlan& component_plan,
+                               std::optional<std::size_t> collection_crowd,
+                               std::size_t live_lanes) const
+  {
+    if (model_state.get() != expected_model)
+      throw std::logic_error(
+          "PsiFormer ResourceCollection belongs to a different model");
+
+    if (!component_plan)
+    {
+      if (expected_plan || prepared_plan || prepared_crowd_plan)
+        throw std::logic_error(
+            "PsiFormer no-policy component acquired a planned crowd resource");
+      return;
+    }
+
+    if (!expected_plan.sameBinding(component_plan) ||
+        !prepared_plan.sameBinding(component_plan) || !prepared_crowd_plan)
+      throw std::logic_error(
+          "PsiFormer crowd resource was not prepared for the component batch plan");
+    if (participant_id != component_plan.evidence().participant_id)
+      throw std::logic_error(
+          "PsiFormer crowd resource has the wrong participant identity");
+    if (prepared_plan_fingerprint != component_plan.plan().fingerprint())
+      throw std::logic_error(
+          "PsiFormer crowd resource has stale plan provenance");
+    if (collection_crowd && prepared_crowd_index != *collection_crowd)
+      throw std::logic_error(
+          "PsiFormer crowd resource and ResourceCollection disagree on crowd identity");
+    if (live_lanes > prepared_crowd_plan->reserve_walkers)
+      throw std::length_error(
+          "PsiFormer live crowd exceeds its prepared reserve envelope");
+    if (prepared_storage_fingerprint == 0 ||
+        prepared_storage_fingerprint != storageFingerprint())
+      throw std::logic_error(
+          "PsiFormer prepared crowd storage changed after plan publication");
+  }
+
+private:
+  /// Allocate exactly one typed vector from a byte requirement.
+  template<class T>
+  static std::vector<T> makeExactVector(std::size_t bytes, const char* description)
+  {
+    if (bytes % sizeof(T) != 0)
+      throw std::length_error(std::string(description) +
+                              " is not divisible by its element width");
+    std::vector<T> result(bytes / sizeof(T));
+    if (result.capacity() * sizeof(T) != bytes)
+      throw std::length_error(std::string(description) +
+                              " exceeded its admitted vector capacity");
+    return result;
+  }
+
+  /// Release one vector's allocation rather than retaining lazy high water.
+  template<class T>
+  static void releaseVector(std::vector<T>& values)
+  { std::vector<T>().swap(values); }
+
+  /// Return exact capacity bytes for one typed vector.
+  template<class T>
+  static std::size_t vectorBytes(const std::vector<T>& values,
+                                 const char* description)
+  { return pf::checkedStorageBytes<T>(values.capacity(), description); }
+
+  /// Compare every retained direct-batch byte category.
+  static bool sameDirectStorage(const pf::DirectBatchStorageRequirement& left,
+                                const pf::DirectBatchStorageRequirement& right) noexcept
+  {
+    return left.dense_logical == right.dense_logical &&
+        left.sparse_logical == right.sparse_logical &&
+        left.logical_outputs == right.logical_outputs &&
+        left.sparse_tile_positions == right.sparse_tile_positions &&
+        left.value_tile == right.value_tile &&
+        left.full_vgl_tile == right.full_vgl_tile &&
+        left.active_gradient_tile == right.active_gradient_tile &&
+        left.shared_spatial_arena == right.shared_spatial_arena &&
+        left.replacement_transient == right.replacement_transient;
+  }
+
+  /// Compare every resource publication-staging byte category.
+  static bool sameStagingStorage(const pf::ResourceStagingStorageRequirement& left,
+                                 const pf::ResourceStagingStorageRequirement& right) noexcept
+  {
+    return left.walker_indices == right.walker_indices &&
+        left.active_electrons == right.active_electrons &&
+        left.configuration_identities == right.configuration_identities &&
+        left.batch_slots == right.batch_slots && left.signs == right.signs &&
+        left.log_magnitudes == right.log_magnitudes &&
+        left.ratios == right.ratios && left.gradients == right.gradients &&
+        left.preservation_flags == right.preservation_flags &&
+        left.active_virtual_walkers == right.active_virtual_walkers &&
+        left.virtual_reference_indices == right.virtual_reference_indices &&
+        left.flattened_virtual_ratios == right.flattened_virtual_ratios &&
+        left.virtual_reference_weights == right.virtual_reference_weights &&
+        left.active_parameter_indices == right.active_parameter_indices &&
+        left.selected_derivative_deltas == right.selected_derivative_deltas &&
+        left.weighted_derivatives == right.weighted_derivatives;
+  }
+
+  /// Reconstruct the selected rank evidence without trusting mutable runtime state.
+  void validateParticipantEvidence(
+      const BatchExecutionParticipantPlan& participant_plan) const
+  {
+    const BatchExecutionPlan& plan = participant_plan.plan();
+    const BatchMemoryParticipantEvidence& evidence = participant_plan.evidence();
+    if (evidence.participant_id != participant_id ||
+        evidence.participant_id.empty())
+      throw std::invalid_argument(
+          "PsiFormer crowd resource participant evidence has the wrong identity");
+    if (plan.topology().serialized_walkers)
+      throw std::invalid_argument(
+          "PsiFormer crowd resource preparation does not admit serialized walkers");
+    if (!plan.requirements().requires(BatchExecutionMode::FULL_VGL))
+      throw std::invalid_argument(
+          "PsiFormer crowd resource plan omits the component-owned FULL_VGL requirement");
+    validatePlannedBackends(memory_policy_input, plan.requirements());
+
+    const BatchExecutionPlanningContext selected_context{
+        plan.requirements(), plan.topology(), plan.logicalMaximum(),
+        plan.selectedCapacities(), plan.activeParameterCount()};
+    const BatchMemoryContribution selected =
+        psiformer::estimatePsiFormerBatchMemory(memory_policy_input,
+                                                selected_context);
+    if (!capacitiesFitWithin(selected.logical_maximum, plan.logicalMaximum()) ||
+        !(evidence.logical_maximum == selected.logical_maximum))
+      throw std::invalid_argument(
+          "PsiFormer crowd resource logical-maximum evidence is stale");
+    if (selected.owner_multiplicity != 1 || evidence.owner_multiplicity != 1)
+      throw std::invalid_argument(
+          "PsiFormer crowd resource requires one exact rank-local owner");
+    if (!(evidence.selected_per_owner == selected.per_owner))
+      throw std::invalid_argument(
+          "PsiFormer crowd resource selected storage evidence is stale");
+    if (!evidence.fully_accounted)
+      throw std::invalid_argument(
+          "PsiFormer crowd resource plan lacks complete accounting evidence");
+
+    BatchExecutionPlanningContext minimum_context = selected_context;
+    minimum_context.candidate_capacities = plan.minimumCapacities();
+    const BatchMemoryContribution minimum =
+        psiformer::estimatePsiFormerBatchMemory(memory_policy_input,
+                                                minimum_context);
+    if (!(evidence.fixed_minimum_per_owner == minimum.per_owner))
+      throw std::invalid_argument(
+          "PsiFormer crowd resource fixed-minimum storage evidence is stale");
+  }
+
+  /// Build stable per-crowd allocation records from one validated view.
+  std::vector<psiformer::PsiFormerCrowdMemoryPlan> makeCrowdPlans(
+      const BatchExecutionParticipantPlan& participant_plan) const
+  {
+    const BatchExecutionPlan& plan = participant_plan.plan();
+    return psiformer::makePsiFormerCrowdMemoryPlans(
+        memory_policy_input,
+        {plan.requirements(), plan.topology(), plan.logicalMaximum(),
+         plan.selectedCapacities(), plan.activeParameterCount()});
+  }
+
+  /// Report every retained numeric byte, including legacy-only lazy staging.
+  std::size_t retainedNumericBytes() const
+  {
+    std::size_t bytes = batch_workspace
+        ? batch_workspace->actualStorage().executionBytes()
+        : 0;
+    auto add = [&bytes](std::size_t value, const char* description) {
+      pf::addStorageBytes(bytes, value, description);
+    };
+    if (score_workspace)
+      add(score_workspace->vectorStorageBytes(),
+          "PsiFormer retained score bytes overflowed");
+    if (kinetic_workspace)
+      add(kinetic_workspace->vectorStorageBytes(),
+          "PsiFormer retained kinetic bytes overflowed");
+    add(actualStagingStorage().totalBytes(),
+        "PsiFormer retained staging bytes overflowed");
+    add(vectorBytes(total_log_gradient, "PsiFormer retained drift bytes overflowed"),
+        "PsiFormer retained drift total overflowed");
+    add(vectorBytes(virtual_offsets, "PsiFormer retained virtual-offset bytes overflowed"),
+        "PsiFormer retained legacy bytes overflowed");
+    add(vectorBytes(virtual_reference_signs,
+                    "PsiFormer retained oracle-sign bytes overflowed"),
+        "PsiFormer retained legacy bytes overflowed");
+    add(vectorBytes(virtual_reference_logabs,
+                    "PsiFormer retained oracle-log bytes overflowed"),
+        "PsiFormer retained legacy bytes overflowed");
+    return bytes;
+  }
+
+  /// Measure publication staging directly from typed vector capacities.
+  pf::ResourceStagingStorageRequirement actualStagingStorage() const
+  {
+    pf::ResourceStagingStorageRequirement result;
+    result.walker_indices = vectorBytes(
+        walker_indices, "PsiFormer walker-index bytes overflowed");
+    result.active_electrons = vectorBytes(
+        active_electrons, "PsiFormer active-electron bytes overflowed");
+    result.configuration_identities = vectorBytes(
+        configuration_identities,
+        "PsiFormer configuration-identity bytes overflowed");
+    result.batch_slots = vectorBytes(
+        batch_slots, "PsiFormer batch-slot bytes overflowed");
+    result.signs = vectorBytes(staged_signs,
+                               "PsiFormer sign bytes overflowed");
+    result.log_magnitudes = vectorBytes(
+        staged_log_magnitudes, "PsiFormer log-magnitude bytes overflowed");
+    result.ratios = pf::checkedStorageSum(
+        vectorBytes(staged_value_ratios,
+                    "PsiFormer value-ratio bytes overflowed"),
+        vectorBytes(staged_log_ratios,
+                    "PsiFormer log-ratio bytes overflowed"),
+        "PsiFormer ratio bytes overflowed");
+    result.gradients = vectorBytes(
+        staged_gradients, "PsiFormer gradient bytes overflowed");
+    result.preservation_flags = vectorBytes(
+        preservation_flags, "PsiFormer preservation bytes overflowed");
+    result.active_virtual_walkers = vectorBytes(
+        active_virtual_walkers,
+        "PsiFormer active-virtual-walker bytes overflowed");
+    result.virtual_reference_indices = vectorBytes(
+        virtual_reference_indices,
+        "PsiFormer virtual-reference-index bytes overflowed");
+    result.flattened_virtual_ratios = vectorBytes(
+        flat_virtual_ratios,
+        "PsiFormer flattened-ratio bytes overflowed");
+    result.virtual_reference_weights = vectorBytes(
+        virtual_reference_weights,
+        "PsiFormer virtual-reference-weight bytes overflowed");
+    result.active_parameter_indices = vectorBytes(
+        active_derivative_global_indices,
+        "PsiFormer active-parameter-index bytes overflowed");
+    result.selected_derivative_deltas = pf::checkedStorageSum(
+        vectorBytes(virtual_score_contribution,
+                    "PsiFormer score-delta bytes overflowed"),
+        vectorBytes(kinetic_parameter_contribution,
+                    "PsiFormer kinetic-delta bytes overflowed"),
+        "PsiFormer selected-delta bytes overflowed");
+    result.weighted_derivatives = vectorBytes(
+        flat_virtual_weighted_derivatives,
+        "PsiFormer weighted-derivative bytes overflowed");
+    return result;
+  }
+
+  /// Categorize measured resource-owned storage independently of policy.
+  BatchMemoryEstimate measureActualResourceStorage() const
+  {
+    BatchMemoryEstimate actual;
+    const pf::DirectBatchStorageRequirement direct =
+        batch_workspace->actualStorage();
+    std::size_t logical = pf::checkedStorageSum(
+        direct.dense_logical, direct.sparse_logical,
+        "PsiFormer actual logical storage overflowed");
+    logical = pf::checkedStorageSum(
+        logical, direct.logical_outputs,
+        "PsiFormer actual logical storage overflowed");
+    std::size_t inner_tile = 0;
+    for (const std::size_t bytes : {
+             direct.sparse_tile_positions, direct.value_tile,
+             direct.full_vgl_tile, direct.active_gradient_tile,
+             direct.shared_spatial_arena})
+      inner_tile = pf::checkedStorageSum(
+          inner_tile, bytes,
+          "PsiFormer actual inner-tile storage overflowed");
+
+    actual.add(BatchMemoryCategory::LOGICAL_INPUT_OUTPUT, {logical, 0},
+               "PsiFormer actual logical storage");
+    actual.add(BatchMemoryCategory::INNER_TILE_SCRATCH, {inner_tile, 0},
+               "PsiFormer actual inner-tile storage");
+    actual.add(BatchMemoryCategory::REALLOCATION_TRANSIENT,
+               {direct.replacementTransientBytes(), 0},
+               "PsiFormer actual replacement transient");
+    actual.add(BatchMemoryCategory::PUBLICATION_STAGING,
+               {actualStagingStorage().totalBytes(), 0},
+               "PsiFormer actual publication staging");
+    if (score_workspace)
+      actual.add(BatchMemoryCategory::SCORE_TAPE,
+                 {score_workspace->vectorStorageBytes(), 0},
+                 "PsiFormer actual score tape");
+
+    std::size_t kinetic_bytes = vectorBytes(
+        total_log_gradient, "PsiFormer actual drift bytes overflowed");
+    if (kinetic_workspace)
+      kinetic_bytes = pf::checkedStorageSum(
+          kinetic_bytes, kinetic_workspace->vectorStorageBytes(),
+          "PsiFormer actual kinetic storage overflowed");
+    actual.add(BatchMemoryCategory::KINETIC_TAPE, {kinetic_bytes, 0},
+               "PsiFormer actual kinetic tape");
+    return actual;
+  }
+
+  /// Fill an unpublished candidate with every byte selected for one crowd.
+  void materializePreparedStorage(
+      BatchExecutionParticipantPlan selected,
+      std::size_t crowd_index,
+      psiformer::PsiFormerCrowdMemoryPlan crowd_plan)
+  {
+    batch_workspace->prepare(crowd_plan.direct_batch);
+    if (!sameDirectStorage(batch_workspace->actualStorage(),
+                           crowd_plan.direct_storage))
+      throw std::length_error(
+          "PsiFormer prepared crowd batch storage differs from policy");
+
+    if (crowd_plan.score_workspace_bytes != 0)
+    {
+      score_workspace = model_state->direct_score_executor.makeWorkspace();
+      if (score_workspace->vectorStorageBytes() !=
+          crowd_plan.score_workspace_bytes)
+        throw std::length_error(
+            "PsiFormer prepared crowd score storage differs from policy");
+    }
+    if (crowd_plan.kinetic_workspace_bytes != 0)
+    {
+      kinetic_workspace = model_state->direct_kinetic_executor.makeWorkspace();
+      if (kinetic_workspace->vectorStorageBytes() !=
+          crowd_plan.kinetic_workspace_bytes)
+        throw std::length_error(
+            "PsiFormer prepared crowd kinetic storage differs from policy");
+    }
+
+    const pf::ResourceStagingStorageRequirement& staging =
+        crowd_plan.publication_storage;
+    walker_indices = makeExactVector<std::size_t>(
+        staging.walker_indices, "PsiFormer walker-index staging");
+    active_electrons = makeExactVector<std::size_t>(
+        staging.active_electrons, "PsiFormer active-electron staging");
+    configuration_identities = makeExactVector<std::uint64_t>(
+        staging.configuration_identities,
+        "PsiFormer configuration-identity staging");
+    batch_slots = makeExactVector<std::size_t>(
+        staging.batch_slots, "PsiFormer batch-slot staging");
+    staged_signs = makeExactVector<double>(staging.signs,
+                                           "PsiFormer sign staging");
+    staged_log_magnitudes = makeExactVector<double>(
+        staging.log_magnitudes, "PsiFormer log-magnitude staging");
+    if (crowd_plan.publication_staging.full_vgl)
+      staged_log_ratios = makeExactVector<LogValue>(
+          staging.ratios, "PsiFormer log-ratio staging");
+    else
+      staged_value_ratios = makeExactVector<ValueType>(
+          staging.ratios, "PsiFormer value-ratio staging");
+    staged_gradients = makeExactVector<GradType>(
+        staging.gradients, "PsiFormer gradient staging");
+    preservation_flags = makeExactVector<unsigned char>(
+        staging.preservation_flags, "PsiFormer preservation staging");
+    active_virtual_walkers = makeExactVector<std::size_t>(
+        staging.active_virtual_walkers,
+        "PsiFormer active-virtual-walker staging");
+    virtual_reference_indices = makeExactVector<std::size_t>(
+        staging.virtual_reference_indices,
+        "PsiFormer virtual-reference-index staging");
+    flat_virtual_ratios = makeExactVector<ValueType>(
+        staging.flattened_virtual_ratios,
+        "PsiFormer flattened-ratio staging");
+    virtual_reference_weights = makeExactVector<ValueType>(
+        staging.virtual_reference_weights,
+        "PsiFormer virtual-reference-weight staging");
+    active_derivative_global_indices = makeExactVector<std::size_t>(
+        staging.active_parameter_indices,
+        "PsiFormer active-parameter-index staging");
+
+    const bool first_delta = crowd_plan.publication_staging.weighted_ecp_score ||
+        crowd_plan.publication_staging.score ||
+        crowd_plan.publication_staging.kinetic;
+    const std::size_t one_delta_bytes = first_delta
+        ? pf::checkedStorageBytes<SelectedDerivativeDelta::value_type>(
+              crowd_plan.publication_staging.active_parameters,
+              "PsiFormer selected-delta staging overflowed")
+        : 0;
+    virtual_score_contribution =
+        makeExactVector<SelectedDerivativeDelta::value_type>(
+            one_delta_bytes, "PsiFormer score-delta staging");
+    kinetic_parameter_contribution =
+        makeExactVector<SelectedDerivativeDelta::value_type>(
+            crowd_plan.publication_staging.kinetic ? one_delta_bytes : 0,
+            "PsiFormer kinetic-delta staging");
+    flat_virtual_weighted_derivatives = makeExactVector<ValueType>(
+        staging.weighted_derivatives,
+        "PsiFormer weighted-derivative staging");
+    total_log_gradient = makeExactVector<double>(
+        crowd_plan.total_log_gradient_bytes,
+        "PsiFormer total-drift staging");
+
+    if (!sameStagingStorage(actualStagingStorage(), staging))
+      throw std::length_error(
+          "PsiFormer prepared crowd publication storage differs from policy");
+    if (!virtual_offsets.empty() || !virtual_reference_signs.empty() ||
+        !virtual_reference_logabs.empty())
+      throw std::logic_error(
+          "PsiFormer planned crowd retained legacy ragged or oracle staging");
+
+    BatchMemoryEstimate measured_storage = measureActualResourceStorage();
+    if (!(measured_storage == crowd_plan.expected_resource_storage))
+      throw std::length_error(
+          "PsiFormer prepared crowd categorized storage differs from policy");
+
+    expected_plan                = selected;
+    prepared_plan                = std::move(selected);
+    prepared_crowd_index         = crowd_index;
+    prepared_plan_fingerprint    = prepared_plan.plan().fingerprint();
+    actual_resource_storage      = std::move(measured_storage);
+    prepared_crowd_plan          = std::move(crowd_plan);
+    prepared_storage_fingerprint = storageFingerprint();
+    if (prepared_storage_fingerprint == 0)
+      throw std::logic_error(
+          "PsiFormer prepared crowd produced an invalid storage fingerprint");
+  }
+
+  /// Publish a complete candidate using only ownership transfers.
+  void publishPreparedStorage(PsiFormerMultiWalkerResource&& candidate) noexcept
+  {
+    static_assert(std::is_nothrow_move_assignable_v<BatchExecutionParticipantPlan>);
+    static_assert(
+        std::is_nothrow_move_assignable_v<std::optional<psiformer::PsiFormerCrowdMemoryPlan>>);
+    static_assert(std::is_nothrow_copy_assignable_v<BatchMemoryEstimate>);
+    static_assert(std::is_nothrow_move_assignable_v<std::unique_ptr<pf::DirectBatchWorkspace>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::vector<SelectedDerivativeDelta::value_type>>);
+
+    expected_plan                  = std::move(candidate.expected_plan);
+    prepared_plan                  = std::move(candidate.prepared_plan);
+    prepared_crowd_plan            = std::move(candidate.prepared_crowd_plan);
+    prepared_crowd_index           = candidate.prepared_crowd_index;
+    prepared_plan_fingerprint      = candidate.prepared_plan_fingerprint;
+    prepared_storage_fingerprint   = candidate.prepared_storage_fingerprint;
+    actual_resource_storage        = candidate.actual_resource_storage;
+    batch_workspace                = std::move(candidate.batch_workspace);
+    score_workspace                = std::move(candidate.score_workspace);
+    kinetic_workspace              = std::move(candidate.kinetic_workspace);
+    total_log_gradient             = std::move(candidate.total_log_gradient);
+    configuration_identities       = std::move(candidate.configuration_identities);
+    batch_slots                    = std::move(candidate.batch_slots);
+    staged_signs                   = std::move(candidate.staged_signs);
+    staged_log_magnitudes          = std::move(candidate.staged_log_magnitudes);
+    staged_value_ratios            = std::move(candidate.staged_value_ratios);
+    staged_log_ratios              = std::move(candidate.staged_log_ratios);
+    staged_gradients               = std::move(candidate.staged_gradients);
+    preservation_flags             = std::move(candidate.preservation_flags);
+    active_electrons               = std::move(candidate.active_electrons);
+    virtual_offsets                = std::move(candidate.virtual_offsets);
+    active_virtual_walkers         = std::move(candidate.active_virtual_walkers);
+    virtual_reference_indices      = std::move(candidate.virtual_reference_indices);
+    flat_virtual_ratios            = std::move(candidate.flat_virtual_ratios);
+    virtual_reference_weights      = std::move(candidate.virtual_reference_weights);
+    active_derivative_global_indices =
+        std::move(candidate.active_derivative_global_indices);
+    flat_virtual_weighted_derivatives =
+        std::move(candidate.flat_virtual_weighted_derivatives);
+    virtual_score_contribution =
+        std::move(candidate.virtual_score_contribution);
+    kinetic_parameter_contribution =
+        std::move(candidate.kinetic_parameter_contribution);
+    virtual_reference_signs =
+        std::move(candidate.virtual_reference_signs);
+    virtual_reference_logabs =
+        std::move(candidate.virtual_reference_logabs);
+    walker_indices = std::move(candidate.walker_indices);
+  }
+
+  /// Rebuild empty no-policy storage and clear every hard-plan marker.
+  void clearToNoPolicy()
+  {
+    std::unique_ptr<pf::DirectBatchWorkspace> empty_batch =
+        model_state->direct_batch_executor.makeWorkspace();
+    batch_workspace = std::move(empty_batch);
+    score_workspace.reset();
+    kinetic_workspace.reset();
+    releaseVector(total_log_gradient);
+    releaseVector(configuration_identities);
+    releaseVector(batch_slots);
+    releaseVector(staged_signs);
+    releaseVector(staged_log_magnitudes);
+    releaseVector(staged_value_ratios);
+    releaseVector(staged_log_ratios);
+    releaseVector(staged_gradients);
+    releaseVector(preservation_flags);
+    releaseVector(active_electrons);
+    releaseVector(virtual_offsets);
+    releaseVector(active_virtual_walkers);
+    releaseVector(virtual_reference_indices);
+    releaseVector(flat_virtual_ratios);
+    releaseVector(virtual_reference_weights);
+    releaseVector(active_derivative_global_indices);
+    releaseVector(flat_virtual_weighted_derivatives);
+    releaseVector(virtual_score_contribution);
+    releaseVector(kinetic_parameter_contribution);
+    releaseVector(virtual_reference_signs);
+    releaseVector(virtual_reference_logabs);
+    releaseVector(walker_indices);
+    expected_plan                 = {};
+    prepared_plan                 = {};
+    prepared_crowd_plan.reset();
+    prepared_crowd_index         = 0;
+    prepared_plan_fingerprint    = 0;
+    prepared_storage_fingerprint = 0;
+    actual_resource_storage      = {};
+    weighted_reference_configurations   = 0;
+    weighted_replacement_configurations = 0;
+    weighted_active_parameters           = 0;
+  }
+
+  /// Hash all retained allocation identities and capacities.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](std::uintptr_t value) {
+      hash ^= value;
+      hash *= 1099511628211ULL;
+    };
+    auto mix_vector = [&mix](const auto& values) {
+      mix(reinterpret_cast<std::uintptr_t>(values.data()));
+      mix(values.capacity());
+    };
+    if (batch_workspace)
+    {
+      mix(reinterpret_cast<std::uintptr_t>(batch_workspace.get()));
+      mix(batch_workspace->storageFingerprint(pf::DirectBatchMode::VALUE_ONLY));
+      mix(batch_workspace->storageFingerprint(pf::DirectBatchMode::FULL_VGL));
+      mix(batch_workspace->storageFingerprint(
+          pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT));
+    }
+    if (score_workspace)
+    {
+      mix(reinterpret_cast<std::uintptr_t>(score_workspace.get()));
+      mix(score_workspace->vectorStorageBytes());
+    }
+    if (kinetic_workspace)
+    {
+      mix(reinterpret_cast<std::uintptr_t>(kinetic_workspace.get()));
+      mix(kinetic_workspace->storageFingerprint());
+    }
+    mix_vector(total_log_gradient);
+    mix_vector(configuration_identities);
+    mix_vector(batch_slots);
+    mix_vector(staged_signs);
+    mix_vector(staged_log_magnitudes);
+    mix_vector(staged_value_ratios);
+    mix_vector(staged_log_ratios);
+    mix_vector(staged_gradients);
+    mix_vector(preservation_flags);
+    mix_vector(active_electrons);
+    mix_vector(virtual_offsets);
+    mix_vector(active_virtual_walkers);
+    mix_vector(virtual_reference_indices);
+    mix_vector(flat_virtual_ratios);
+    mix_vector(virtual_reference_weights);
+    mix_vector(active_derivative_global_indices);
+    mix_vector(flat_virtual_weighted_derivatives);
+    mix_vector(virtual_score_contribution);
+    mix_vector(kinetic_parameter_contribution);
+    mix_vector(virtual_reference_signs);
+    mix_vector(virtual_reference_logabs);
+    mix_vector(walker_indices);
+    return hash;
   }
 };
 
@@ -1019,9 +1707,10 @@ psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() 
                             "PsiFormer all-to-one logical envelope");
   input.flattened_ecp = true;
 
-  // Clone state and scalar compatibility are prepared, but crowd resources and
-  // their publication paths remain incomplete.  Keep the aggregate gate closed
-  // until every reachable owner and runtime guard has landed.
+  // Clone and crowd resources now have exact preparation boundaries, but
+  // aggregate TrialWaveFunction scratch and every planned runtime path are not
+  // yet allocation-free. Keep the production gate closed until those owners
+  // and guards land.
   input.accounting_claims = {};
   return input;
 }
@@ -1317,10 +2006,17 @@ std::size_t PsiFormerWF::publishParameters(
   return committed_version;
 }
 
-// Add one cloneable workspace.  A copied ResourceCollection reconstructs empty
-// batch scratch while retaining the same shared model/plan identity.
+// Add one empty resource template after the component's selected participant
+// view is known.  Crowd copies retain this provenance but no numeric scratch.
 void PsiFormerWF::createResource(ResourceCollection& collection) const
-{ collection.addResource(std::make_unique<PsiFormerMultiWalkerResource>(model_state_)); }
+{
+  const std::string participant_id = batch_execution_plan_
+      ? batch_execution_plan_.evidence().participant_id
+      : std::string{};
+  collection.addResource(std::make_unique<PsiFormerMultiWalkerResource>(
+      model_state_, makeBatchMemoryPolicyInput(), participant_id,
+      batch_execution_plan_));
+}
 
 // Lend the crowd workspace to the leader after validating homogeneous clone identity.
 void PsiFormerWF::acquireResource(
@@ -1333,15 +2029,53 @@ void PsiFormerWF::acquireResource(
   if (leader.mw_resource_handle_)
     throw std::logic_error("PsiFormer multiwalker resource is already acquired");
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-    if (wfc_list.getCastedElement<PsiFormerWF>(walker).model_state_.get() != leader.model_state_.get())
+  {
+    const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    if (component.model_state_.get() != leader.model_state_.get())
       throw std::invalid_argument("PsiFormer multiwalker list contains components from different models");
+    if (!component.batch_execution_plan_.sameBinding(
+            leader.batch_execution_plan_))
+      throw std::invalid_argument(
+          "PsiFormer multiwalker list contains components with different batch plans");
+  }
+
+  const BatchResourcePreparationProvenance& collection_provenance =
+      collection.getBatchResourcePreparationProvenance();
+  if (leader.batch_execution_plan_)
+  {
+    if (collection_provenance.state !=
+            BatchResourcePreparationState::PREPARED ||
+        collection_provenance.plan.get() !=
+            &leader.batch_execution_plan_.plan())
+      throw std::logic_error(
+          "PsiFormer hard-plan acquisition requires a matching prepared ResourceCollection");
+  }
+  else if (collection_provenance.state !=
+               BatchResourcePreparationState::UNPREPARED ||
+           collection_provenance.plan)
+    throw std::logic_error(
+        "PsiFormer no-policy acquisition received planned ResourceCollection storage");
 
   const auto entry_cursor = collection.getCursor();
   auto candidate_handle = collection.lendResource<PsiFormerMultiWalkerResource>();
-  if (candidate_handle.getResource().model_state.get() != leader.model_state_.get())
+  try
   {
+    candidate_handle.getResource().validateAcquiredBinding(
+        leader.model_state_.get(), leader.batch_execution_plan_,
+        leader.batch_execution_plan_
+            ? std::optional<std::size_t>(collection_provenance.crowd_index)
+            : std::nullopt,
+        wfc_list.size());
+  }
+  catch (...)
+  {
+    const std::exception_ptr failure = std::current_exception();
+    // ResourceCollection takeback traverses from the cursor at which the
+    // candidate was lent.  Return the loan before restoring the entry cursor.
     collection.rewind(entry_cursor);
-    throw std::logic_error("PsiFormer ResourceCollection belongs to a different model");
+    collection.takebackResource(candidate_handle);
+    collection.rewind(entry_cursor);
+    std::rethrow_exception(failure);
   }
   leader.mw_resource_handle_ = std::move(candidate_handle);
 }
@@ -1355,6 +2089,14 @@ void PsiFormerWF::releaseResource(
   if (this != &leader || !leader.mw_resource_handle_)
     throw std::logic_error("PsiFormer multiwalker resource release has no acquired leader handle");
   auto& resource = leader.mw_resource_handle_.getResource();
+  resource.configuration_identities.clear();
+  resource.batch_slots.clear();
+  resource.staged_signs.clear();
+  resource.staged_log_magnitudes.clear();
+  resource.staged_value_ratios.clear();
+  resource.staged_log_ratios.clear();
+  resource.staged_gradients.clear();
+  resource.preservation_flags.clear();
   resource.active_electrons.clear();
   resource.virtual_offsets.clear();
   resource.active_virtual_walkers.clear();
@@ -1364,6 +2106,7 @@ void PsiFormerWF::releaseResource(
   resource.active_derivative_global_indices.clear();
   resource.flat_virtual_weighted_derivatives.clear();
   resource.virtual_score_contribution.clear();
+  resource.kinetic_parameter_contribution.clear();
   resource.virtual_reference_signs.clear();
   resource.virtual_reference_logabs.clear();
   resource.walker_indices.clear();
@@ -1381,11 +2124,19 @@ PsiFormerWF::PsiFormerMultiWalkerResource& PsiFormerWF::requireMultiWalkerResour
     throw std::logic_error("PsiFormer multiwalker method requires an acquired ResourceCollection");
 
   auto& resource = leader.mw_resource_handle_.getResource();
-  if (resource.model_state.get() != leader.model_state_.get())
-    throw std::logic_error("PsiFormer acquired workspace belongs to a different model");
+  resource.validateAcquiredBinding(leader.model_state_.get(),
+                                   leader.batch_execution_plan_, std::nullopt,
+                                   wfc_list.size());
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
-    if (wfc_list.getCastedElement<PsiFormerWF>(walker).model_state_.get() != leader.model_state_.get())
+  {
+    const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    if (component.model_state_.get() != leader.model_state_.get())
       throw std::invalid_argument("PsiFormer multiwalker list contains components from different models");
+    if (!component.batch_execution_plan_.sameBinding(
+            leader.batch_execution_plan_))
+      throw std::invalid_argument(
+          "PsiFormer multiwalker list contains components with different batch plans");
+  }
   return resource;
 }
 
@@ -1469,6 +2220,14 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
     diagnostics.kinetic_bytes = resource.kinetic_workspace->vectorStorageBytes();
   diagnostics.transient_bytes =
       resource.total_log_gradient.capacity() * sizeof(double) +
+      resource.configuration_identities.capacity() * sizeof(std::uint64_t) +
+      resource.batch_slots.capacity() * sizeof(std::size_t) +
+      resource.staged_signs.capacity() * sizeof(double) +
+      resource.staged_log_magnitudes.capacity() * sizeof(double) +
+      resource.staged_value_ratios.capacity() * sizeof(ValueType) +
+      resource.staged_log_ratios.capacity() * sizeof(LogValue) +
+      resource.staged_gradients.capacity() * sizeof(GradType) +
+      resource.preservation_flags.capacity() * sizeof(unsigned char) +
       resource.active_electrons.capacity() * sizeof(std::size_t) +
       resource.virtual_offsets.capacity() * sizeof(std::size_t) +
       resource.active_virtual_walkers.capacity() * sizeof(std::size_t) +
@@ -1478,6 +2237,7 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
       resource.active_derivative_global_indices.capacity() * sizeof(std::size_t) +
       resource.flat_virtual_weighted_derivatives.capacity() * sizeof(ValueType) +
       resource.virtual_score_contribution.capacity() * sizeof(SelectedDerivativeDelta::value_type) +
+      resource.kinetic_parameter_contribution.capacity() * sizeof(SelectedDerivativeDelta::value_type) +
       resource.virtual_reference_signs.capacity() * sizeof(double) +
       resource.virtual_reference_logabs.capacity() * sizeof(double) +
       resource.walker_indices.capacity() * sizeof(std::size_t);
@@ -1498,6 +2258,28 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
   diagnostics.weighted_active_parameters = resource.weighted_active_parameters;
   diagnostics.weighted_derivative_staging_bytes =
       resource.flat_virtual_weighted_derivatives.capacity() * sizeof(ValueType);
+  diagnostics.has_expected_plan  = static_cast<bool>(resource.expected_plan);
+  diagnostics.has_prepared_plan  = static_cast<bool>(resource.prepared_plan);
+  diagnostics.participant_id     = resource.participant_id;
+  if (resource.prepared_plan)
+  {
+    diagnostics.prepared_plan_identity = &resource.prepared_plan.plan();
+    diagnostics.prepared_plan_fingerprint =
+        resource.prepared_plan_fingerprint;
+  }
+  if (resource.prepared_crowd_plan)
+  {
+    diagnostics.prepared_crowd_index = resource.prepared_crowd_index;
+    diagnostics.initial_walker_capacity =
+        resource.prepared_crowd_plan->initial_walkers;
+    diagnostics.reserve_walker_capacity =
+        resource.prepared_crowd_plan->reserve_walkers;
+    diagnostics.expected_resource_storage =
+        resource.prepared_crowd_plan->expected_resource_storage;
+  }
+  diagnostics.actual_resource_storage = resource.actual_resource_storage;
+  diagnostics.prepared_storage_fingerprint =
+      resource.prepared_storage_fingerprint;
   diagnostics.backend_modes = {
       directBackendModeName(transaction.state().direct_value_mode),
       directBackendModeName(transaction.state().direct_spatial_mode),

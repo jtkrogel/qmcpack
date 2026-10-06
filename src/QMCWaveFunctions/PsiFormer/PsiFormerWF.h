@@ -163,6 +163,18 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   std::size_t weighted_active_parameters           = 0;
   /// Capacity of the compact active-walker by active-parameter staging buffer.
   std::size_t weighted_derivative_staging_bytes = 0;
+  /// Hard-plan provenance published only after exact crowd preparation.
+  bool has_expected_plan                    = false;
+  bool has_prepared_plan                    = false;
+  const void* prepared_plan_identity        = nullptr;
+  std::uint64_t prepared_plan_fingerprint   = 0;
+  std::string participant_id;
+  std::size_t prepared_crowd_index          = 0;
+  std::size_t initial_walker_capacity       = 0;
+  std::size_t reserve_walker_capacity       = 0;
+  std::size_t prepared_storage_fingerprint  = 0;
+  BatchMemoryEstimate expected_resource_storage;
+  BatchMemoryEstimate actual_resource_storage;
   std::array<std::string, 4> backend_modes;
 
   /// Return all explicitly accounted numeric storage owned by the resource.

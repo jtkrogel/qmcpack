@@ -15,9 +15,11 @@
 #include "Particle/ParticleSet.h"
 #include "Particle/VirtualParticleBatch.h"
 #include "Particle/VirtualParticleSet.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
+#include "Utilities/BatchResourcePreparation.h"
 #include "Utilities/RuntimeOptions.h"
 #include "psiformer_test_utils.h"
 
@@ -270,6 +272,105 @@ struct Crowd
   RefVectorWithLeader<WaveFunctionComponent> wfc_list;
   std::unique_ptr<RefVectorWithLeader<ParticleSet>> p_list;
 };
+
+/** Build internally consistent selected evidence while overriding only the
+ * production stage gate that remains false until the complete runtime lands. */
+std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationTestPlan(
+    PsiFormerWF& component,
+    const BatchExecutionRequirements& requirements,
+    std::vector<std::size_t> initial_walkers,
+    std::vector<std::size_t> reserve_walkers,
+    const std::string& participant_id,
+    const std::string& profile_id,
+    BatchTileCapacities preferred = {2, 1, 1, 2},
+    std::size_t active_parameter_count = 2)
+{
+  BatchExecutionSelectionInput selection;
+  selection.requirements                         = requirements;
+  selection.topology.initial_walkers_per_crowd   = std::move(initial_walkers);
+  selection.topology.reserve_walkers_per_crowd   = std::move(reserve_walkers);
+  selection.topology.run_kind                    = "psiformer-crowd-preparation-test";
+  selection.active_parameter_count               = active_parameter_count;
+  selection.preference.id                        = profile_id;
+  selection.preference.preferred                 = preferred;
+  selection.logical_maximum = component.batchExecutionLogicalMaximum(
+      {requirements, selection.topology, active_parameter_count});
+
+  // ECP_OUTER is an aggregate-driver capacity. PsiFormer contributes no
+  // component-local maximum even though its flattened ECP path consumes it.
+  if (requirements.requires(BatchExecutionMode::ECP_OUTER))
+    selection.logical_maximum.ecp_outer = preferred.ecp_outer;
+
+  return std::make_shared<const BatchExecutionPlan>(selectBatchExecutionPlan(
+      selection,
+      [&component, &participant_id](
+          const BatchExecutionPlanningContext& candidate) {
+        BatchMemoryContribution fabricated =
+            component.estimateBatchExecutionMemory(candidate);
+        fabricated.fully_accounted = true;
+        return std::vector<BatchMemoryParticipantContribution>{
+            {participant_id, std::move(fabricated)}};
+      }));
+}
+
+/// Return the broad operation set needed to exercise every Stage-5 resource owner.
+BatchExecutionRequirements makeCrowdPreparationRequirements(
+    const PsiFormerWF& component)
+{
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::VALUE);
+  requirements.require(BatchExecutionMode::ACTIVE_GRADIENT);
+  requirements.require(BatchExecutionMode::SCORE);
+  requirements.require(BatchExecutionMode::KINETIC);
+  requirements.require(BatchExecutionMode::ECP_OUTER);
+  requirements.require(BatchExecutionMode::ECP_WEIGHTED_SCORE);
+  requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  return requirements;
+}
+
+/** Bind the same fabricated participant view to every member of one clone
+ * family. The production validator intentionally rejects the fabricated gate. */
+void bindCrowdPreparationPlan(
+    Crowd& crowd,
+    const std::shared_ptr<const BatchExecutionPlan>& plan,
+    const std::string& participant_id)
+{
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  for (PsiFormerWF* component : crowd.components)
+    component->bindBatchExecutionPlan(participant_plan);
+}
+
+/// Clear every component plan without changing shared model ownership.
+void clearCrowdPreparationPlan(Crowd& crowd)
+{
+  for (PsiFormerWF* component : crowd.components)
+    component->bindBatchExecutionPlan({});
+}
+
+/// Compare exact prepared storage and its retained/setup accounting split.
+void checkPreparedResourceStorage(
+    const testing::PsiFormerCrowdWorkspaceDiagnostics& diagnostics)
+{
+  CHECK(diagnostics.has_expected_plan);
+  CHECK(diagnostics.has_prepared_plan);
+  CHECK(diagnostics.prepared_plan_identity != nullptr);
+  CHECK(diagnostics.prepared_plan_fingerprint != 0);
+  CHECK(diagnostics.prepared_storage_fingerprint != 0);
+  CHECK(diagnostics.expected_resource_storage ==
+        diagnostics.actual_resource_storage);
+
+  const BatchMemoryBytes total =
+      diagnostics.expected_resource_storage.total();
+  const BatchMemoryBytes replacement =
+      diagnostics.expected_resource_storage.at(
+          BatchMemoryCategory::REALLOCATION_TRANSIENT);
+  CHECK(total.device == 0);
+  CHECK(replacement.device == 0);
+  REQUIRE(total.host >= replacement.host);
+  CHECK(diagnostics.accountedBytes() == total.host - replacement.host);
+}
 
 /// Own one compatibility VirtualParticleSet scratch object per reference walker.
 struct VirtualScratchCrowd
@@ -1900,6 +2001,261 @@ TEST_CASE("PsiFormer selected-electron proposals honor oracle and compare backen
           std::vector<bool>(walker_count, false));
     }
   }
+}
+
+TEST_CASE("PsiFormer prepares exact planned crowd storage for uneven reserves",
+          "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/crowd-resource";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {2, 0, 0}, {3, 0, 2},
+      participant_id, "crowd-resource-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_planned_template");
+  crowd.leader.createResource(resource_template);
+  CHECK(resource_template.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+
+  // The first crowd has both initially living walkers and spare reserve.
+  ResourceCollection first_resource(resource_template);
+  first_resource.prepareBatchResources({plan, 0});
+  CHECK(first_resource.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::PREPARED);
+  CHECK(first_resource.getBatchResourcePreparationProvenance().plan == plan);
+  CHECK(first_resource.getBatchResourcePreparationProvenance().crowd_index == 0);
+
+  std::size_t prepared_storage_fingerprint = 0;
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(first_resource,
+                                                            crowd.wfc_list);
+    const auto diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    checkPreparedResourceStorage(diagnostics);
+    CHECK(diagnostics.participant_id == participant_id);
+    CHECK(diagnostics.prepared_plan_identity == plan.get());
+    CHECK(diagnostics.prepared_plan_fingerprint == plan->fingerprint());
+    CHECK(diagnostics.prepared_crowd_index == 0);
+    CHECK(diagnostics.initial_walker_capacity == 2);
+    CHECK(diagnostics.reserve_walker_capacity == 3);
+    CHECK(diagnostics.batch_workspace_identity != nullptr);
+    CHECK(diagnostics.score_workspace_identity != nullptr);
+    CHECK(diagnostics.kinetic_workspace_identity != nullptr);
+    CHECK(diagnostics.batch_bytes > 0);
+    CHECK(diagnostics.score_bytes > 0);
+    CHECK(diagnostics.kinetic_bytes > 0);
+    prepared_storage_fingerprint = diagnostics.prepared_storage_fingerprint;
+  }
+
+  // Publishing a new parameter vector invalidates values, not resource
+  // allocation identities or capacities.
+  wftrain::StructuredParameterSnapshot candidate =
+      crowd.leader.snapshotParameters();
+  REQUIRE_FALSE(candidate.values.empty());
+  const std::size_t old_parameter_version = candidate.version;
+  candidate.values.front() += 1.0e-10;
+  const std::size_t new_parameter_version =
+      crowd.leader.publishParameters(candidate, old_parameter_version);
+  CHECK(new_parameter_version > old_parameter_version);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(first_resource,
+                                                            crowd.wfc_list);
+    const auto diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    checkPreparedResourceStorage(diagnostics);
+    CHECK(diagnostics.parameter_version == new_parameter_version);
+    CHECK(diagnostics.prepared_storage_fingerprint ==
+          prepared_storage_fingerprint);
+  }
+
+  // A topology record with neither living nor reserve walkers remains a
+  // prepared, canonically empty resource with a real batch-workspace identity.
+  ResourceCollection zero_resource(resource_template);
+  zero_resource.prepareBatchResources({plan, 1});
+  RefVectorWithLeader<WaveFunctionComponent> empty_components(crowd.leader);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(zero_resource,
+                                                            empty_components);
+    const auto diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, empty_components);
+    checkPreparedResourceStorage(diagnostics);
+    CHECK(diagnostics.prepared_crowd_index == 1);
+    CHECK(diagnostics.initial_walker_capacity == 0);
+    CHECK(diagnostics.reserve_walker_capacity == 0);
+    CHECK(diagnostics.batch_workspace_identity != nullptr);
+    CHECK(diagnostics.accountedBytes() == 0);
+  }
+
+  // A crowd with no initially living walkers may later occupy its admitted
+  // reserve without changing the exact prepared owner.
+  ResourceCollection reserve_only_resource(resource_template);
+  reserve_only_resource.prepareBatchResources({plan, 2});
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(
+        reserve_only_resource, crowd.wfc_list);
+    const auto diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    checkPreparedResourceStorage(diagnostics);
+    CHECK(diagnostics.prepared_crowd_index == 2);
+    CHECK(diagnostics.initial_walker_capacity == 0);
+    CHECK(diagnostics.reserve_walker_capacity == 2);
+    CHECK(diagnostics.accountedBytes() > 0);
+  }
+}
+
+TEST_CASE("PsiFormer planned resource copies require clear and support replanning",
+          "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 1, true, {0, 1});
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/resource-replan";
+  const auto first_plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {1}, {2}, participant_id,
+      "resource-replan-v1");
+  bindCrowdPreparationPlan(crowd, first_plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_replan_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection prepared(resource_template);
+  prepared.prepareBatchResources({first_plan, 0});
+
+  // A copy of prepared storage carries aggregate provenance but receives an
+  // empty numeric resource clone, so neither same-plan nor different-plan
+  // preparation may proceed until the explicit clear transition.
+  ResourceCollection derived(prepared);
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::DERIVED_REQUIRES_CLEAR);
+  CHECK(derived.getBatchResourcePreparationProvenance().plan == first_plan);
+  CHECK_THROWS_AS(derived.prepareBatchResources({first_plan, 0}),
+                  std::logic_error);
+  derived.prepareBatchResources({nullptr, 0});
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(derived.getBatchResourcePreparationProvenance().plan);
+
+  // The cleared owner resumes historical lazy behavior. Exercise it before
+  // proving that retained high water must itself pass through another clear.
+  clearCrowdPreparationPlan(crowd);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(derived,
+                                                            crowd.wfc_list);
+    std::vector<PsiFormerWF::GradType> gradients(crowd.wfc_list.size());
+    crowd.leader.mw_evalGrad(crowd.wfc_list, *crowd.p_list, 0, gradients);
+    for (const PsiFormerWF::GradType& gradient : gradients)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        CHECK(std::isfinite(std::real(gradient[dimension])));
+  }
+
+  const auto second_plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {1}, {2}, participant_id,
+      "resource-replan-v2", {1, 1, 1, 1});
+  REQUIRE(second_plan->fingerprint() != first_plan->fingerprint());
+  bindCrowdPreparationPlan(crowd, second_plan, participant_id);
+  CHECK_THROWS_AS(derived.prepareBatchResources({second_plan, 0}),
+                  std::logic_error);
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+
+  derived.prepareBatchResources({nullptr, 0});
+  derived.prepareBatchResources({second_plan, 0});
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(derived,
+                                                            crowd.wfc_list);
+    const auto diagnostics =
+        testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+    checkPreparedResourceStorage(diagnostics);
+    CHECK(diagnostics.participant_id == participant_id);
+    CHECK(diagnostics.prepared_plan_identity == second_plan.get());
+    CHECK(diagnostics.prepared_plan_fingerprint ==
+          second_plan->fingerprint());
+    CHECK(diagnostics.reserve_walker_capacity == 2);
+  }
+}
+
+TEST_CASE("PsiFormer planned acquisition failures roll back direct loans",
+          "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/resource-rollback";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {1}, {1}, participant_id,
+      "resource-rollback-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_rollback_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+
+  RefVectorWithLeader<WaveFunctionComponent> singleton(crowd.leader);
+  singleton.push_back(crowd.leader);
+  auto check_successful_reuse = [&]() {
+    resource.rewind();
+    crowd.leader.acquireResource(resource, singleton);
+    CHECK(resource.getCursor() == 1);
+    CHECK(resource.getOutstandingLoanCount() == 1);
+    resource.rewind();
+    crowd.leader.releaseResource(resource, singleton);
+    CHECK(resource.getCursor() == 1);
+    CHECK(resource.getOutstandingLoanCount() == 0);
+    resource.rewind();
+  };
+
+  // Reserve overflow happens after lending; acquisition must return the exact
+  // candidate before propagating the failure.
+  resource.rewind();
+  CHECK_THROWS_AS(crowd.leader.acquireResource(resource, crowd.wfc_list),
+                  std::length_error);
+  CHECK(resource.getCursor() == 0);
+  CHECK(resource.getOutstandingLoanCount() == 0);
+  check_successful_reuse();
+
+  Crowd other_model(files, simulation_cell, 1, true, {0, 1});
+  const auto other_plan = makeCrowdPreparationTestPlan(
+      other_model.leader, requirements, {1}, {1}, participant_id,
+      "resource-rollback-v2");
+  bindCrowdPreparationPlan(other_model, other_plan, participant_id);
+
+  // Aggregate plan mismatch is rejected before lending.
+  resource.rewind();
+  CHECK_THROWS_AS(
+      other_model.leader.acquireResource(resource, other_model.wfc_list),
+      std::logic_error);
+  CHECK(resource.getCursor() == 0);
+  CHECK(resource.getOutstandingLoanCount() == 0);
+  check_successful_reuse();
+
+  // With matching aggregate provenance, the distinct shared model is rejected
+  // after lending and exercises the same takeback rollback path.
+  clearCrowdPreparationPlan(other_model);
+  bindCrowdPreparationPlan(other_model, plan, participant_id);
+  resource.rewind();
+  CHECK_THROWS_AS(
+      other_model.leader.acquireResource(resource, other_model.wfc_list),
+      std::logic_error);
+  CHECK(resource.getCursor() == 0);
+  CHECK(resource.getOutstandingLoanCount() == 0);
+  check_successful_reuse();
 }
 
 TEST_CASE("PsiFormer resource mismatch leaves both crowds immediately reusable",
