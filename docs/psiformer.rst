@@ -156,8 +156,22 @@ restart still uses the files described above.
 Pseudopotentials and current limits
 -----------------------------------
 
-Scalar-relativistic nonlocal pseudopotentials are supported. For every virtual
-quadrature move, PsiFormer evaluates
+Scalar-relativistic local and semilocal nonlocal pseudopotentials are supported.
+The local channel uses the ordinary coordinate-only local-ECP operator. With the
+batched virtual-particle nonlocal operator, the following paths are supported:
+
+* locality-approximation and determinant-localization-approximation (DLA)
+  energies;
+* ordinary T-move candidate generation and the fermionic/nonfermionic split
+  used by TMDLA;
+* the V1 T-move electron sweep, whose candidate ratios are flattened across
+  walkers before per-walker selection and acceptance; and
+* energy parameter derivatives, reduced directly into the selected optimizer
+  destinations.
+
+V0 and V3 T-move selection remain supported by their established per-walker
+fallback; only the V1 selection sweep uses the new flattened candidate path.
+For every virtual quadrature move, PsiFormer evaluates
 
 .. math::
 
@@ -173,18 +187,72 @@ and contributes the logarithmic score change
    \frac{\partial \log|\Psi(\mathbf R)|}{\partial\theta}.
 
 The nonlocal operator multiplies this by its quadrature weight and ``R_q``
-exactly once. Value ratios use a prepared, allocation-free direct configuration
-batch workspace. The weighted derivative path reduces directly into the
-caller's selected-parameter destination and does not materialize a
-knot-by-parameter matrix. The surrounding nonlocal total-weight orchestration
-still creates small per-call vectors. Virtual score reverses are currently
-serialized through one resource-owned tape; this bounds crowd memory but is not
-a grouped reverse kernel.
+exactly once. It enumerates jobs in electron-group/walker/job order and packs
+their quadrature knots into bounded outer tiles. A job larger than the tile is
+split only at knot boundaries, and a tile does not cross an electron-group
+boundary. The current conservative outer capacity is 256 knots and is not a
+user tuning input in this revision.
+
+Within one outer tile, the PsiFormer descriptor is sparse: it contains one
+reference configuration for each walker represented in that tile and only the
+electron-replacement configurations actually requested. This is distinct from
+the inner direct-evaluator tile (capacity four by default) used to bound dense
+projection scratch. Value ratios use its prepared direct batch workspace. The
+weighted derivative path reduces directly into the caller's selected-parameter
+destination and does not materialize a knot-by-parameter matrix.
+
+Flattening the weighted dispatch does **not** make parameter reverse mode a
+batched reverse kernel. Virtual reference and replacement scores are still
+reversed serially through one resource-owned tape. The compact reduction staging
+is active-walker by active-parameter and independent of the number of knots,
+while the surrounding nonlocal orchestration retains small per-call vectors.
 
 Spinor electrons and spin-orbit pseudopotential ratios are unsupported and
-fail during validation. The model is real-valued; it can be represented in a
-complex QMCPACK build with phase zero or pi, but is not a general complex
-neural ansatz.
+fail during validation. Source-ion gradients, Pulay terms, and force evaluation
+with a PsiFormer component are also unsupported; successful scalar-relativistic
+energy evaluation does not imply force support. The model is real-valued; it
+can be represented in a complex QMCPACK build with phase zero or pi, but is not
+a general complex neural ansatz.
+
+ECP resource, version, and memory ownership
+-------------------------------------------
+
+Each active crowd acquires one nonlocal-ECP resource whose immutable identity
+and shape must match the operator leader and all its clones. That resource owns
+the outer tile, job and neighbor-list staging, optional final T-move candidates,
+and whole-request energy or derivative staging. The corresponding PsiFormer
+crowd resource owns the sparse direct batch workspace and, when derivatives are
+requested, one lazily allocated score tape. Component clones share the immutable
+model and its published parameter version but do not share mutable accepted or
+proposal state.
+
+Value and weighted-score calls return opaque component stamps. All selected
+components must agree within a tile, and every outer tile in the request must
+retain the first tile's stamps. A parameter publication during the transaction
+therefore fails before Hamiltonian-owned results are committed. Energies, jobs,
+neighbor lists, T-move candidates, and derivative rows are staged privately and
+published only after the complete internal request succeeds. This guarantee
+does not rewind consumed random numbers or rotated quadrature grids after a
+failure. Listener callbacks form a later external commit phase and cannot be
+rolled back if a callback throws after an earlier callback has returned.
+
+Memory reported for this path has several deliberately separate classes:
+
+* shared persistent model storage, held once by the clone family;
+* clone-local accepted/proposal state and scalar workspaces;
+* bounded crowd scratch proportional to the ECP outer capacity and the
+  PsiFormer inner tile capacity;
+* logical job metadata proportional to the number of ion-electron jobs;
+* optional T-move candidate output proportional to the total knot count;
+* whole-request derivative staging proportional to walkers times caller-row
+  extent; and
+* one full canonical PsiFormer score tape per active crowd, plus compact
+  active-walker by active-parameter reduction staging.
+
+Capacity accounting covers owned numeric/vector storage, not allocator
+metadata, libraries, HDF5 state, or process RSS. Zero-allocation guarantees
+apply only to warmed native kernels and prepared workspaces, not to the complete
+Hamiltonian adapter transaction.
 
 Execution backends and workspaces
 ---------------------------------
@@ -311,8 +379,8 @@ outer parallel region is active. Component clones and crowd resources are the
 unit of mutable ownership; invoking one clone concurrently from multiple host
 threads is unsupported.
 
-Developer timing manifest
--------------------------
+Developer timing manifests
+--------------------------
 
 When ``BUILD_MICRO_BENCHMARKS=ON``, ``benchmark_psiformer_modes`` loads a
 developer-supplied export and writes one JSON manifest containing paired direct
@@ -339,6 +407,37 @@ each mode.
 The supplied HDF5 files are timing inputs only. Deterministic correctness tests
 generate compact random-but-reproducible models at runtime and do not depend on
 external checkpoints.
+
+``benchmark_psiformer_ecp`` measures the production nonlocal-ECP crowd boundary
+with a generated pseudo-LiH fixture. It times locality energy, T-move candidate
+generation, and weighted parameter derivatives while sweeping diagnostic outer
+tile capacities. The sweep uses a test-only seam and does not advertise a
+production tile-size input. The JSON report separates logical job, knot, and
+candidate counts; tile occupancy and split-job counters; derivative and bounded
+weight capacities; and PsiFormer crowd-resource byte counts. It also records
+parameter-version and sparse-work counters and labels reverse execution as
+serialized through the crowd-owned score tape. Each requested mode is run with
+an independent crowd so retained scratch from one mode cannot contaminate the
+next mode's memory report. Two warmup calls are the default because the staged
+operator/public job-list swap needs two calls before both sides are warm.
+
+Build and run it from the Hamiltonian test binary directory so the configured
+``Na.BFD.xml`` link is available:
+
+.. code-block:: bash
+
+  cmake --build build --target benchmark_psiformer_ecp
+  cd build/src/QMCHamiltonians/tests
+  taskset -c 0 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    ./benchmark_psiformer_ecp \
+    --walkers 4 --outer-tile-sizes 3,12,256 \
+    --modes energy,tmove,derivative --warmup-calls 2 --repeats 5 \
+    --output psiformer_ecp.json
+
+This benchmark uses ordinary scalar-relativistic locality/T-move ratios; DLA,
+TMDLA, stochastic V1 move acceptance, spin-orbit ECPs, and force estimators are
+outside its timing workload. It is deliberately not registered with CTest and
+has no absolute timing threshold.
 
 Validation coverage
 -------------------

@@ -87,6 +87,31 @@ endforeach()
 
 target_link_libraries(test_hamiltonian_ham IO::HDF5)
 
+if(BUILD_MICRO_BENCHMARKS)
+  # Production-boundary PsiFormer nonlocal-ECP timing and storage manifest.
+  # This developer executable deliberately has no CTest registration or timing
+  # threshold; it generates its compact model fixture at runtime.
+  add_executable(benchmark_psiformer_ecp benchmark_psiformer_ecp.cpp)
+  target_link_libraries(
+    benchmark_psiformer_ecp
+    qmcham
+    IO::HDF5
+    utilities_for_test
+    qmc_external_catch2)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      benchmark_psiformer_ecp
+      qmcwfs
+      qmcwfs_omptarget
+      qmcparticle
+      qmcparticle_omptarget
+      spline2
+      spline2_omptarget
+      qmcutil
+      platform_omptarget_LA)
+  endif()
+endif()
+
 # PsiFormer Hamiltonian cases live in the ordinary Hamiltonian executables so
 # they exercise the same public operators as production.  Filtered aliases keep
 # them selectable with ``ctest -R psiformer`` without building duplicate tests.
