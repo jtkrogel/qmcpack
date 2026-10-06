@@ -80,7 +80,9 @@ enum class BatchExecutionMode : std::uint32_t
   /// Enter one validated component group lifecycle interval.
   PREPARE_GROUP               = 1U << 12,
   /// Complete one validated component update lifecycle interval.
-  COMPLETE_UPDATES            = 1U << 13
+  COMPLETE_UPDATES            = 1U << 13,
+  /// Apply bounded matrix-free parameter products through a streaming provider.
+  STREAMING_DERIVATIVE        = 1U << 14
 };
 
 /** Exact target coordinate/move capability proved by the driver workload. */

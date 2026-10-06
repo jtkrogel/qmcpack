@@ -330,6 +330,14 @@ public:
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
+  /// Construct an O(P)+O(B) score-product provider bound to this model version.
+  std::unique_ptr<wftrain::StreamingDerivativeOperator> makeStreamingDerivativeOperator(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t maximum_parameter_chunk_size) const override;
+
   /// Atomically publish one complete, version-matched native vector.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;

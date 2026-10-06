@@ -518,6 +518,8 @@ struct StreamingDerivativeCapabilities
   std::size_t maximum_vjp_channels              = 0;
   std::size_t maximum_parameter_chunk_size      = 0;
   std::size_t maximum_sample_tile_size          = 0;
+  /// Fixed number of full-P scratch vectors retained by the producer.
+  std::size_t fixed_parameter_scratch_vectors   = 0;
   bool block_streaming                          = false;
 
   /// Report whether one product is implemented.
@@ -528,6 +530,27 @@ struct StreamingDerivativeCapabilities
 
   /// Report whether all requested local-energy contributions are implemented.
   bool coversLocalEnergyTerms(std::uint32_t requested_terms) const noexcept;
+};
+
+/** Exact retained numeric-storage diagnostics for a prepared derivative producer.
+ *
+ * Metadata owned by schemas and chunk descriptors is deliberately excluded.  The
+ * reported bytes cover every numeric buffer retained by the producer and therefore
+ * provide the quantity that a future driver must add to its aggregate memory budget.
+ */
+struct StreamingDerivativeStorageDiagnostics
+{
+  std::size_t parameter_count                 = 0;
+  std::size_t sample_count                    = 0;
+  std::size_t real_parameter_vectors          = 0;
+  std::size_t complex_parameter_vectors       = 0;
+  std::size_t parameter_scratch_bytes         = 0;
+  std::size_t evaluator_workspace_bytes       = 0;
+  std::size_t sample_position_bytes           = 0;
+  std::size_t sample_product_bytes            = 0;
+  std::size_t retained_numeric_bytes          = 0;
+  std::size_t allocation_generation           = 0;
+  std::size_t storage_fingerprint              = 0;
 };
 
 /** Common checked front end for bounded multi-channel VJP and score JVP kernels.
@@ -560,6 +583,14 @@ public:
 
   /// Return the immutable chunk plan used by all VJP products.
   virtual const ParameterChunkPlan& parameterChunkPlan() const noexcept = 0;
+
+  /** Return exact prepared storage evidence.
+   *
+   * The compatibility default describes no retained storage.  Production
+   * high-parameter providers override this method so their independent owner can be
+   * incorporated into the driver-wide budget before execution.
+   */
+  virtual StreamingDerivativeStorageDiagnostics storageDiagnostics() const noexcept { return {}; }
 
   /// Apply several independently weighted score/local-energy VJPs in one traversal.
   void applyVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,

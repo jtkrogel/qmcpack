@@ -549,6 +549,35 @@ add_unit_test(deterministic-unit_test_psiformer_adapter_sinks
               1 1 $<TARGET_FILE:test_psiformer_adapter_sinks>)
 set_tests_properties(deterministic-unit_test_psiformer_adapter_sinks
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# Exercise the public bounded derivative factory without dense B-by-P storage.
+add_executable(test_psiformer_streaming_derivative
+               test_psiformer_streaming_derivative.cpp)
+target_link_libraries(
+  test_psiformer_streaming_derivative
+  catch_main
+  qmcwfs
+  platform_LA
+  platform_runtime
+  utilities_for_test
+  container_testing
+  minimal_particle_pool
+  IO::HDF5)
+if(USE_OBJECT_TARGET)
+  target_link_libraries(
+    test_psiformer_streaming_derivative
+    qmcutil
+    qmcparticle
+    qmcparticle_omptarget
+    qmcwfs_omptarget
+    platform_omptarget_LA)
+endif()
+target_include_directories(test_psiformer_streaming_derivative
+                           PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+add_unit_test(deterministic-unit_test_psiformer_streaming_derivative
+              1 1 $<TARGET_FILE:test_psiformer_streaming_derivative>)
+set_tests_properties(deterministic-unit_test_psiformer_streaming_derivative
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 set_property(
   TEST deterministic-unit_test_psiformer_adapter_sinks
   APPEND

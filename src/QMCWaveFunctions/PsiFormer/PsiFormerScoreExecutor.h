@@ -294,6 +294,13 @@ public:
   /// Return the fixed number of canonical score components.
   std::size_t scoreSize() const noexcept { return parameter_score_.size(); }
 
+  /// Return bytes retained by the one full canonical score vector.
+  std::size_t scoreStorageBytes() const
+  {
+    return checkedStorageBytes<double>(parameter_score_.capacity(),
+                                       "PsiFormer score-vector bytes overflowed");
+  }
+
   /// Return bytes reserved by the complete tape, geometry, and determinant workspace.
   std::size_t vectorStorageBytes() const
   {

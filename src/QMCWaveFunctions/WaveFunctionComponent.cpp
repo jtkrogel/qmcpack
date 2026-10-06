@@ -16,6 +16,7 @@
 
 
 #include "WaveFunctionComponent.h"
+#include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 
 #include <algorithm>
 #include <limits>
@@ -48,6 +49,17 @@ WaveFunctionComponent::WaveFunctionComponent(const std::string& obj_name)
 {}
 
 WaveFunctionComponent::~WaveFunctionComponent() = default;
+
+std::unique_ptr<wftrain::StreamingDerivativeOperator>
+WaveFunctionComponent::makeStreamingDerivativeOperator(
+    const RefVectorWithLeader<WaveFunctionComponent>&,
+    const RefVectorWithLeader<ParticleSet>&,
+    std::size_t,
+    std::size_t,
+    std::size_t) const
+{
+  throw std::runtime_error("Wavefunction component does not support streaming parameter derivatives");
+}
 
 WaveFunctionComponent::EvaluationStamp WaveFunctionComponent::EvaluationStamp::versioned(
     const void* source_identity,

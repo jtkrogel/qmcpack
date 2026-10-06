@@ -48,6 +48,7 @@ class MCMultiParticleMoves;
 namespace wftrain
 {
 class StructuredParameterProvider;
+class StreamingDerivativeOperator;
 }
 /**@defgroup WaveFunctionComponent group
  * @brief Classes which constitute a many-body trial wave function
@@ -201,6 +202,19 @@ public:
    * registration, so fixed-in-inference components may still provide it.
    */
   virtual wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept { return nullptr; }
+
+  /** Construct a bounded derivative producer for one ordered component batch.
+   *
+   * The default implementation rejects unsupported components.  Concrete providers
+   * copy any caller-owned sample data needed after this call and bind the returned
+   * operator to the current parameter version.
+   */
+  virtual std::unique_ptr<wftrain::StreamingDerivativeOperator> makeStreamingDerivativeOperator(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t maximum_parameter_chunk_size) const;
 
   /** Register the component with the TWFFastDerivWrapper wrapper.  
    */
