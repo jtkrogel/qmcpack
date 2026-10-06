@@ -80,8 +80,19 @@ TEST_CASE("Batch execution memory checked arithmetic", "[utilities][batch_memory
   const std::size_t maximum = std::numeric_limits<std::size_t>::max();
   CHECK(checkedBatchMemoryAdd(2, 3, "test") == 5);
   CHECK(checkedBatchMemoryMultiply(6, 7, "test") == 42);
-  CHECK_THROWS_AS(checkedBatchMemoryAdd(maximum, 1, "test"), std::overflow_error);
-  CHECK_THROWS_AS(checkedBatchMemoryMultiply(maximum, 2, "test"), std::overflow_error);
+  CHECK_THROWS_WITH(checkedBatchMemoryAdd(maximum, 1, "scalar addition"),
+                    "Batch memory size overflow in scalar addition");
+  CHECK_THROWS_WITH(checkedBatchMemoryMultiply(maximum, 2, "scalar multiplication"),
+                    "Batch memory size overflow in scalar multiplication");
+  const BatchMemoryBytes host_maximum{maximum, 0};
+  const BatchMemoryBytes host_one{1, 0};
+  CHECK_THROWS_WITH(checkedBatchMemoryAdd(host_maximum, host_one,
+                                         "dual-space addition"),
+                    "Batch memory size overflow in dual-space addition host");
+  const BatchMemoryBytes device_maximum{0, maximum};
+  CHECK_THROWS_WITH(checkedBatchMemoryMultiply(device_maximum, 2,
+                                              "dual-space multiplication"),
+                    "Batch memory size overflow in dual-space multiplication device");
 
   BatchMemoryContribution contribution;
   contribution.owner_multiplicity = 3;

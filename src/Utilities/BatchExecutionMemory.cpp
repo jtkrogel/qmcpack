@@ -25,6 +25,17 @@ constexpr std::array<BatchExecutionMode, 4> TUNABLE_MODES{BatchExecutionMode::VA
                                                           BatchExecutionMode::ACTIVE_GRADIENT,
                                                           BatchExecutionMode::ECP_OUTER};
 
+[[noreturn]] void throwBatchMemoryOverflow(std::string_view context,
+                                           std::string_view suffix = {})
+{
+  std::string message("Batch memory size overflow in ");
+  if (!context.empty())
+    message.append(context.data(), context.size());
+  if (!suffix.empty())
+    message.append(suffix.data(), suffix.size());
+  throw std::overflow_error(message);
+}
+
 /** Return the capacity associated with one tunable operation family. */
 std::size_t getCapacity(const BatchTileCapacities& capacities, BatchExecutionMode mode)
 {
@@ -392,15 +403,19 @@ void validateBatchExecutionTopology(const BatchExecutionTopology& topology)
 
 void BatchMemoryEstimate::add(BatchMemoryCategory category,
                               BatchMemoryBytes bytes,
-                              const std::string& context)
+                              std::string_view context)
 {
   const std::size_t index = static_cast<std::size_t>(category);
   if (index >= categories_.size())
     throw std::out_of_range("Invalid batch memory category");
-  categories_[index] = checkedBatchMemoryAdd(categories_[index], bytes, context.empty() ? "category bytes" : context);
+  const std::string_view checked_context =
+      context.empty() ? std::string_view{"category bytes"} : context;
+  categories_[index] =
+      checkedBatchMemoryAdd(categories_[index], bytes, checked_context);
 }
 
-void BatchMemoryEstimate::add(const BatchMemoryEstimate& other, const std::string& context)
+void BatchMemoryEstimate::add(const BatchMemoryEstimate& other,
+                              std::string_view context)
 {
   for (std::size_t category = 0; category < categories_.size(); ++category)
     add(static_cast<BatchMemoryCategory>(category), other.categories_[category], context);
@@ -414,42 +429,54 @@ const BatchMemoryBytes& BatchMemoryEstimate::at(BatchMemoryCategory category) co
   return categories_[index];
 }
 
-BatchMemoryBytes BatchMemoryEstimate::total(const std::string& context) const
+BatchMemoryBytes BatchMemoryEstimate::total(std::string_view context) const
 {
   BatchMemoryBytes total;
+  const std::string_view checked_context =
+      context.empty() ? std::string_view{"total bytes"} : context;
   for (const BatchMemoryBytes bytes : categories_)
-    total = checkedBatchMemoryAdd(total, bytes, context.empty() ? "total bytes" : context);
+    total = checkedBatchMemoryAdd(total, bytes, checked_context);
   return total;
 }
 
-std::size_t checkedBatchMemoryAdd(std::size_t lhs, std::size_t rhs, const std::string& context)
+std::size_t checkedBatchMemoryAdd(std::size_t lhs, std::size_t rhs,
+                                  std::string_view context)
 {
   if (rhs > std::numeric_limits<std::size_t>::max() - lhs)
-    throw std::overflow_error("Batch memory size overflow in " + context);
+    throwBatchMemoryOverflow(context);
   return lhs + rhs;
 }
 
-std::size_t checkedBatchMemoryMultiply(std::size_t lhs, std::size_t rhs, const std::string& context)
+std::size_t checkedBatchMemoryMultiply(std::size_t lhs, std::size_t rhs,
+                                       std::string_view context)
 {
   if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs)
-    throw std::overflow_error("Batch memory size overflow in " + context);
+    throwBatchMemoryOverflow(context);
   return lhs * rhs;
 }
 
 BatchMemoryBytes checkedBatchMemoryAdd(BatchMemoryBytes lhs,
                                        BatchMemoryBytes rhs,
-                                       const std::string& context)
+                                       std::string_view context)
 {
-  return {checkedBatchMemoryAdd(lhs.host, rhs.host, context + " host"),
-          checkedBatchMemoryAdd(lhs.device, rhs.device, context + " device")};
+  if (rhs.host > std::numeric_limits<std::size_t>::max() - lhs.host)
+    throwBatchMemoryOverflow(context, " host");
+  if (rhs.device > std::numeric_limits<std::size_t>::max() - lhs.device)
+    throwBatchMemoryOverflow(context, " device");
+  return {lhs.host + rhs.host, lhs.device + rhs.device};
 }
 
 BatchMemoryBytes checkedBatchMemoryMultiply(BatchMemoryBytes bytes,
                                             std::size_t multiplicity,
-                                            const std::string& context)
+                                            std::string_view context)
 {
-  return {checkedBatchMemoryMultiply(bytes.host, multiplicity, context + " host"),
-          checkedBatchMemoryMultiply(bytes.device, multiplicity, context + " device")};
+  if (bytes.host != 0 &&
+      multiplicity > std::numeric_limits<std::size_t>::max() / bytes.host)
+    throwBatchMemoryOverflow(context, " host");
+  if (bytes.device != 0 &&
+      multiplicity > std::numeric_limits<std::size_t>::max() / bytes.device)
+    throwBatchMemoryOverflow(context, " device");
+  return {bytes.host * multiplicity, bytes.device * multiplicity};
 }
 
 void includeBatchExecutionLogicalMaximum(BatchTileCapacities& aggregate,

@@ -240,11 +240,11 @@ void includeBatchExecutionLogicalMaximum(BatchTileCapacities& aggregate,
 class BatchMemoryEstimate
 {
 public:
-  void add(BatchMemoryCategory category, BatchMemoryBytes bytes, const std::string& context = {});
-  void add(const BatchMemoryEstimate& other, const std::string& context = {});
+  void add(BatchMemoryCategory category, BatchMemoryBytes bytes, std::string_view context = {});
+  void add(const BatchMemoryEstimate& other, std::string_view context = {});
 
   const BatchMemoryBytes& at(BatchMemoryCategory category) const;
-  BatchMemoryBytes total(const std::string& context = {}) const;
+  BatchMemoryBytes total(std::string_view context = {}) const;
 
   friend bool operator==(const BatchMemoryEstimate& lhs, const BatchMemoryEstimate& rhs)
   {
@@ -377,20 +377,20 @@ private:
 };
 
 /** Checked scalar addition used by estimators and storage owners. */
-std::size_t checkedBatchMemoryAdd(std::size_t lhs, std::size_t rhs, const std::string& context);
+std::size_t checkedBatchMemoryAdd(std::size_t lhs, std::size_t rhs, std::string_view context);
 
 /** Checked scalar multiplication used by estimators and storage owners. */
-std::size_t checkedBatchMemoryMultiply(std::size_t lhs, std::size_t rhs, const std::string& context);
+std::size_t checkedBatchMemoryMultiply(std::size_t lhs, std::size_t rhs, std::string_view context);
 
 /** Checked addition of independently accounted host and device bytes. */
 BatchMemoryBytes checkedBatchMemoryAdd(BatchMemoryBytes lhs,
                                        BatchMemoryBytes rhs,
-                                       const std::string& context);
+                                       std::string_view context);
 
 /** Checked multiplication of host and device bytes by an owner count. */
 BatchMemoryBytes checkedBatchMemoryMultiply(BatchMemoryBytes bytes,
                                             std::size_t multiplicity,
-                                            const std::string& context);
+                                            std::string_view context);
 
 /** Escape one structural-identity segment using deterministic byte percent encoding. */
 std::string escapeBatchParticipantIdSegment(std::string_view segment);
