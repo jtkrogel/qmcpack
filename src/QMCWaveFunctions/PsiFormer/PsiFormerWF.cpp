@@ -2088,7 +2088,8 @@ psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() 
   input.storage_shape.attention_blocks = model_shape.attention_blocks;
   input.storage_shape.parameter_count  = model_state_->execution_plan.parameterCount();
   input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
-      ValueType, LogValue, GradType, SelectedDerivativeDelta::value_type>();
+      ValueType, PsiValue, LogValue, GradType,
+      SelectedDerivativeDelta::value_type>();
   input.backends.value   = memoryPolicyBackend(model_state_->direct_value_mode);
   input.backends.spatial = memoryPolicyBackend(model_state_->direct_spatial_mode);
   input.backends.score   = memoryPolicyBackend(model_state_->direct_score_mode);

@@ -369,6 +369,7 @@ std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
         plan.direct_batch.logical.sparse_replacements,
         input.active_parameter_count,
         input.type_sizes.value_type,
+        input.type_sizes.psi_value_type,
         input.type_sizes.log_value_type,
         input.type_sizes.gradient_type,
         input.type_sizes.selected_delta_element,

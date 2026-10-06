@@ -210,6 +210,7 @@ struct ResourceStagingCapacityPlan
   std::size_t sparse_replacements  = 0;
   std::size_t active_parameters    = 0;
   std::size_t value_type_bytes     = 0;
+  std::size_t psi_value_type_bytes = 0;
   std::size_t log_value_type_bytes = 0;
   std::size_t gradient_type_bytes  = 0;
   std::size_t selected_delta_bytes = 0;
@@ -267,9 +268,9 @@ inline ResourceStagingStorageRequirement resourceStagingStorageRequirement(
         "PsiFormer weighted ECP staging requires flattened ECP storage");
 
   const bool dense = plan.value || plan.full_vgl || plan.active_gradient;
-  if ((plan.value || plan.active_gradient) && plan.reserve_walkers != 0 && plan.value_type_bytes == 0)
+  if (dense && plan.reserve_walkers != 0 && plan.psi_value_type_bytes == 0)
     throw std::invalid_argument(
-        "PsiFormer publication value element width must be positive");
+        "PsiFormer publication wavefunction-ratio element width must be positive");
   if (plan.full_vgl && plan.reserve_walkers != 0 && plan.log_value_type_bytes == 0)
     throw std::invalid_argument(
         "PsiFormer publication log-value element width must be positive");
@@ -312,8 +313,8 @@ inline ResourceStagingStorageRequirement resourceStagingStorageRequirement(
         plan.reserve_walkers,
         "PsiFormer log-magnitude staging bytes overflowed");
     const std::size_t ratio_element_bytes = plan.full_vgl
-        ? std::max(plan.value_type_bytes, plan.log_value_type_bytes)
-        : plan.value_type_bytes;
+        ? std::max(plan.psi_value_type_bytes, plan.log_value_type_bytes)
+        : plan.psi_value_type_bytes;
     result.ratios = typed_bytes(
         plan.reserve_walkers, ratio_element_bytes,
         "PsiFormer ratio staging bytes overflowed");

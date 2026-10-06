@@ -38,16 +38,22 @@ enum class PsiFormerMemoryBackend : std::uint8_t
 struct PsiFormerMemoryTypeSizes
 {
   std::size_t value_type             = 0;
+  std::size_t psi_value_type         = 0;
   std::size_t log_value_type         = 0;
   std::size_t gradient_type          = 0;
   std::size_t selected_delta_element = 0;
 };
 
 /** Construct build-exact widths without exposing the corresponding types here. */
-template<class ValueType, class LogValueType, class GradientType, class SelectedDeltaElement>
+template<class ValueType,
+         class PsiValueType,
+         class LogValueType,
+         class GradientType,
+         class SelectedDeltaElement>
 constexpr PsiFormerMemoryTypeSizes makePsiFormerMemoryTypeSizes() noexcept
 {
-  return {sizeof(ValueType), sizeof(LogValueType), sizeof(GradientType), sizeof(SelectedDeltaElement)};
+  return {sizeof(ValueType), sizeof(PsiValueType), sizeof(LogValueType),
+          sizeof(GradientType), sizeof(SelectedDeltaElement)};
 }
 
 /** Backends selected for the four independently dispatched native families. */

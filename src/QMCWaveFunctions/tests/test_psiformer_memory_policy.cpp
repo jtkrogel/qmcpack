@@ -45,7 +45,7 @@ PsiFormerMemoryPolicyInput makePolicyInput()
                          /* parameter_count */ 7};
   input.type_sizes =
       psiformer::makePsiFormerMemoryTypeSizes<
-          double, std::complex<double>, std::array<double, 3>,
+          double, double, std::complex<double>, std::array<double, 3>,
           std::pair<std::size_t, double>>();
   input.accounting_claims = PsiFormerMemoryAccountingClaims::complete();
   return input;
@@ -111,7 +111,7 @@ std::size_t innerTileBytes(const pf::DirectBatchStorageRequirement& storage)
  * the policy tests do not use the implementation under test as their oracle.
  */
 std::size_t densePublicationBytes(std::size_t walkers,
-                                  std::size_t value_type_bytes,
+                                  std::size_t psi_value_type_bytes,
                                   std::size_t log_value_type_bytes,
                                   std::size_t gradient_type_bytes,
                                   bool value,
@@ -132,8 +132,9 @@ std::size_t densePublicationBytes(std::size_t walkers,
     add_array(sizeof(std::uint64_t), "test configuration publication");
     add_array(sizeof(double), "test sign publication");
     add_array(sizeof(double), "test log-magnitude publication");
-    add_array(full_vgl ? std::max(value_type_bytes, log_value_type_bytes)
-                       : value_type_bytes,
+    add_array(full_vgl
+                  ? std::max(psi_value_type_bytes, log_value_type_bytes)
+                  : psi_value_type_bytes,
               "test ratio publication");
   }
   if (value)
@@ -257,7 +258,7 @@ TEST_CASE("PsiFormer memory policy sums exact uneven crowd owners",
         expected_inner, innerTileBytes(storage), "test inner sum");
     expected_publication = checkedBatchMemoryAdd(
         expected_publication,
-        densePublicationBytes(reserve, input.type_sizes.value_type,
+        densePublicationBytes(reserve, input.type_sizes.psi_value_type,
                               input.type_sizes.log_value_type,
                               input.type_sizes.gradient_type, true, true, true),
         "test publication sum");
@@ -318,6 +319,7 @@ TEST_CASE("PsiFormer crowd plans are exact allocation and category targets",
   CHECK(first.publication_staging.sparse_replacements == 2);
   CHECK(first.publication_staging.active_parameters == 3);
   CHECK(first.publication_staging.value_type_bytes == sizeof(double));
+  CHECK(first.publication_staging.psi_value_type_bytes == sizeof(double));
   CHECK(first.publication_staging.log_value_type_bytes ==
         sizeof(std::complex<double>));
   CHECK(first.publication_staging.gradient_type_bytes ==
@@ -436,7 +438,7 @@ TEST_CASE("PsiFormer crowd plans preserve build-dependent element widths",
 {
   PsiFormerMemoryPolicyInput input = makePolicyInput();
   input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
-      std::complex<double>, std::complex<double>,
+      std::complex<double>, std::complex<double>, std::complex<double>,
       std::array<std::complex<double>, 3>,
       std::pair<std::size_t, std::complex<double>>>();
 
@@ -450,6 +452,8 @@ TEST_CASE("PsiFormer crowd plans preserve build-dependent element widths",
 
   const psiformer::PsiFormerCrowdMemoryPlan& plan = plans.front();
   CHECK(plan.publication_staging.value_type_bytes ==
+        sizeof(std::complex<double>));
+  CHECK(plan.publication_staging.psi_value_type_bytes ==
         sizeof(std::complex<double>));
   CHECK(plan.publication_staging.gradient_type_bytes ==
         sizeof(std::array<std::complex<double>, 3>));
@@ -650,6 +654,7 @@ TEST_CASE("PsiFormer score and kinetic minima require active parameters",
   const pf::ResourceStagingStorageRequirement local_staging =
       pf::resourceStagingStorageRequirement(
           {3, 0, 0, 2, active_input.type_sizes.value_type,
+           active_input.type_sizes.psi_value_type,
            active_input.type_sizes.log_value_type,
            active_input.type_sizes.gradient_type,
            active_input.type_sizes.selected_delta_element,
@@ -675,7 +680,8 @@ TEST_CASE("PsiFormer publication staging uses operation-specific scalar widths",
 {
   pf::ResourceStagingCapacityPlan real_full;
   real_full.reserve_walkers      = 3;
-  real_full.value_type_bytes     = sizeof(double);
+  real_full.value_type_bytes     = sizeof(float);
+  real_full.psi_value_type_bytes = sizeof(double);
   real_full.log_value_type_bytes = sizeof(std::complex<double>);
   real_full.gradient_type_bytes  = sizeof(std::array<double, 3>);
   real_full.full_vgl             = true;
@@ -691,7 +697,7 @@ TEST_CASE("PsiFormer publication staging uses operation-specific scalar widths",
   CHECK(value_storage.ratios == 3 * sizeof(double));
 
   pf::ResourceStagingCapacityPlan complex_full = real_full;
-  complex_full.value_type_bytes = sizeof(std::complex<double>);
+  complex_full.psi_value_type_bytes = sizeof(std::complex<double>);
   const pf::ResourceStagingStorageRequirement complex_storage =
       pf::resourceStagingStorageRequirement(complex_full);
   CHECK(complex_storage.ratios == 3 * sizeof(std::complex<double>));
@@ -790,6 +796,7 @@ TEST_CASE("PsiFormer memory policy checks every ownership extent",
   weighted.sparse_replacements = 1;
   weighted.active_parameters = 2;
   weighted.value_type_bytes = sizeof(double);
+  weighted.psi_value_type_bytes = sizeof(double);
   weighted.log_value_type_bytes = sizeof(std::complex<double>);
   weighted.gradient_type_bytes = sizeof(std::array<double, 3>);
   weighted.selected_delta_bytes = sizeof(std::pair<std::size_t, double>);
