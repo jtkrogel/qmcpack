@@ -3219,6 +3219,24 @@ bool PsiFormerWF::tryRegisterPlannedSelectedTransaction() const noexcept
   return false;
 }
 
+// Withdraw one crowd transaction only after its mechanically nonthrowing commit.
+void PsiFormerWF::unregisterPlannedSelectedTransaction() const noexcept
+{
+  std::size_t pending_transactions =
+      model_state_->planned_selected_transaction_count.load(
+          std::memory_order_acquire);
+  for (;;)
+  {
+    assert(pending_transactions != 0);
+    if (pending_transactions == 0)
+      std::terminate();
+    if (model_state_->planned_selected_transaction_count.compare_exchange_weak(
+            pending_transactions, pending_transactions - 1,
+            std::memory_order_release, std::memory_order_acquire))
+      return;
+  }
+}
+
 // Publish only selected lifecycle provenance while holding the model read barrier.
 PsiFormerWF::PlannedSelectedProposalEvidence
 PsiFormerWF::publishPlannedSelectedProposalMetadata(
@@ -3280,20 +3298,7 @@ void PsiFormerWF::cancelPlannedSelectedProposal(
     static_cast<PsiFormerWF&>(wfc_list[lane]).resetProposalMetadata();
   for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
     static_cast<PsiFormerWF&>(wfc_list[lane]).has_proposal_ = false;
-
-  std::size_t pending_transactions =
-      model_state_->planned_selected_transaction_count.load(
-          std::memory_order_acquire);
-  for (;;)
-  {
-    assert(pending_transactions != 0);
-    if (pending_transactions == 0)
-      std::terminate();
-    if (model_state_->planned_selected_transaction_count.compare_exchange_weak(
-            pending_transactions, pending_transactions - 1,
-            std::memory_order_release, std::memory_order_acquire))
-      break;
-  }
+  unregisterPlannedSelectedTransaction();
 }
 
 // Expose only ownership counts needed to prove bounded crowd scratch in a regression test.
@@ -3485,6 +3490,23 @@ PsiFormerWF::selectedProposalMapDiagnosticsForTesting(
            resource.batch_slots.begin() + live_walkers},
           {resource.walker_indices.begin(),
            resource.walker_indices.begin() + evaluated_rows}};
+}
+
+// Expose the scalar guard count without granting a production lifecycle API.
+std::size_t PsiFormerWF::plannedSelectedTransactionCountForTesting() const noexcept
+{
+  return model_state_->planned_selected_transaction_count.load(
+      std::memory_order_acquire);
+}
+
+// Deliberately create model-version drift behind a pending proposal for testing.
+std::size_t PsiFormerWF::advanceParameterVersionForTesting()
+{
+  std::unique_lock state_lock(model_state_->mutex);
+  pf::Parameters& parameters = model_state_->model.p;
+  const std::vector<double> unchanged_values = parameters.flat_values();
+  parameters.set_flat_values(unchanged_values);
+  return parameters.version();
 }
 
 // Expose metadata identity and cardinalities without copying the shared vectors.
@@ -5851,83 +5873,267 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
     const MCMultiParticleMoves<CoordsType::POS>& moves,
     const std::vector<bool>& accepted) const
 {
-  if (batch_execution_plan_)
-    throw std::logic_error("PsiFormer planned selected-electron resolution is not implemented");
   const std::size_t walker_count = wfc_list.size();
+  if (!batch_execution_plan_)
+  {
+    if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
+        accepted.size() != walker_count)
+      throw std::invalid_argument(
+          "PsiFormer selected-electron resolution has inconsistent walker counts");
+    moves.validateFor(p_list);
+    if (walker_count == 0)
+      return;
+
+    const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+    requireMultiWalkerResource(wfc_list);
+    PsiFormerReadTransaction transaction(*leader.model_state_);
+    const std::size_t parameter_version = transaction.parameterVersion();
+    const std::uint64_t descriptor_fingerprint = moves.fingerprint();
+    const std::size_t electron_count =
+        transaction.state().execution_plan.modelShape().electrons();
+
+    // Observe a concurrent publication across the complete crowd before reporting
+    // any stale proposal; synchronization clears every clone's pending state.
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+      wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
+          parameter_version);
+
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      if (!component.has_proposal_ ||
+          component.proposal_origin_ != ProposalOrigin::MW_SELECTED_FULL_VGL)
+        throw std::logic_error(
+            "PsiFormer selected-electron resolution has no matching pending proposal");
+      if (component.proposed_descriptor_fingerprint_ != descriptor_fingerprint)
+        throw std::logic_error(
+            "PsiFormer selected-electron resolution descriptor does not match the pending proposal");
+      if (component.proposed_parameter_version_ != parameter_version)
+        throw std::logic_error(
+            "PsiFormer parameters changed during a selected-electron transaction");
+      if (component.proposed_gradient_.size() != electron_count ||
+          component.proposed_laplacian_.size() != electron_count)
+        throw std::logic_error(
+            "PsiFormer selected-electron proposal has incomplete spatial state");
+      if (accepted[walker] &&
+          (component.accepted_gradient_.size() != electron_count ||
+           component.accepted_laplacian_.size() != electron_count))
+        throw std::logic_error(
+            "PsiFormer selected-electron resolution has invalid accepted spatial storage");
+      // Rejection is also used to unwind an earlier component when a later TWF
+      // component fails, before ParticleSet installs proposed coordinates.
+      if (accepted[walker] &&
+          component.proposed_configuration_identity_ != configurationIdentity(p_list[walker]))
+        throw std::logic_error(
+            "PsiFormer accepted selected-electron coordinates do not match the pending proposal");
+    }
+
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+    {
+      auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      if (accepted[walker])
+      {
+        for (std::size_t electron = 0; electron < electron_count; ++electron)
+        {
+          component.accepted_gradient_[electron]  = component.proposed_gradient_[electron];
+          component.accepted_laplacian_[electron] = component.proposed_laplacian_[electron];
+        }
+        component.current_sign_                   = component.proposed_sign_;
+        component.log_value_                      = component.proposed_log_value_;
+        component.accepted_configuration_identity_ = component.proposed_configuration_identity_;
+        component.accepted_parameter_version_      = parameter_version;
+        component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
+        component.accepted_value_valid_            = true;
+      }
+    }
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+      wfc_list.getCastedElement<PsiFormerWF>(walker).resetProposalMetadata();
+    for (std::size_t walker = 0; walker < walker_count; ++walker)
+      wfc_list.getCastedElement<PsiFormerWF>(walker).has_proposal_ = false;
+    return;
+  }
+
   if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
       accepted.size() != walker_count)
     throw std::invalid_argument(
-        "PsiFormer selected-electron resolution has inconsistent walker counts");
+        "PsiFormer planned selected-electron resolution has inconsistent walker counts");
   moves.validateFor(p_list);
-  if (walker_count == 0)
-    return;
 
-  const auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
-  requireMultiWalkerResource(wfc_list);
-  PsiFormerReadTransaction transaction(*leader.model_state_);
-  const std::size_t parameter_version = transaction.parameterVersion();
   const std::uint64_t descriptor_fingerprint = moves.fingerprint();
-  const std::size_t electron_count =
-      transaction.state().execution_plan.modelShape().electrons();
+  PlannedRuntimeRequest request;
+  request.operation                 = PlannedOperation::SELECTED_RESOLVE;
+  request.live_walkers              = walker_count;
+  request.descriptor_fingerprint    = descriptor_fingerprint;
+  request.expected_proposal_version = proposed_parameter_version_;
+  const PlannedRuntimeAccess access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
 
-  // Observe a concurrent publication across the complete crowd before reporting
-  // any stale proposal; synchronization clears every clone's pending state.
-  for (std::size_t walker = 0; walker < walker_count; ++walker)
-    wfc_list.getCastedElement<PsiFormerWF>(walker).synchronizeParameterVersion(
-        parameter_version);
+  const std::size_t electron_count = access.participant.plan().particleCount();
+  const std::size_t reserve_walkers = access.crowd.reserve_walkers;
+  if (electron_count != 0 &&
+      reserve_walkers > std::numeric_limits<std::size_t>::max() / electron_count)
+    throw std::length_error(
+        "PsiFormer planned selected resolution descriptor capacity overflowed");
+  const std::size_t selected_capacity = reserve_walkers * electron_count;
+  if (electron_count != 0 &&
+      walker_count > std::numeric_limits<std::size_t>::max() / electron_count)
+    throw std::length_error(
+        "PsiFormer planned selected resolution live descriptor extent overflowed");
+  if (moves.size() > walker_count * electron_count ||
+      moves.size() > selected_capacity)
+    throw std::length_error(
+        "PsiFormer planned selected resolution descriptor exceeds prepared capacity");
 
-  for (std::size_t walker = 0; walker < walker_count; ++walker)
-  {
-    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    if (!component.has_proposal_ ||
-        component.proposal_origin_ != ProposalOrigin::MW_SELECTED_FULL_VGL)
-      throw std::logic_error(
-          "PsiFormer selected-electron resolution has no matching pending proposal");
-    if (component.proposed_descriptor_fingerprint_ != descriptor_fingerprint)
-      throw std::logic_error(
-          "PsiFormer selected-electron resolution descriptor does not match the pending proposal");
-    if (component.proposed_parameter_version_ != parameter_version)
-      throw std::logic_error(
-          "PsiFormer parameters changed during a selected-electron transaction");
-    if (component.proposed_gradient_.size() != electron_count ||
-        component.proposed_laplacian_.size() != electron_count)
-      throw std::logic_error(
-          "PsiFormer selected-electron proposal has incomplete spatial state");
-    if (accepted[walker] &&
-        (component.accepted_gradient_.size() != electron_count ||
-         component.accepted_laplacian_.size() != electron_count))
-      throw std::logic_error(
-          "PsiFormer selected-electron resolution has invalid accepted spatial storage");
-    // Rejection is also used to unwind an earlier component when a later TWF
-    // component fails, before ParticleSet installs proposed coordinates.
-    if (accepted[walker] &&
-        component.proposed_configuration_identity_ != configurationIdentity(p_list[walker]))
-      throw std::logic_error(
-          "PsiFormer accepted selected-electron coordinates do not match the pending proposal");
-  }
-
-  for (std::size_t walker = 0; walker < walker_count; ++walker)
-  {
-    auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    if (accepted[walker])
+  const std::size_t proposal_version = *request.expected_proposal_version;
+  const std::uint64_t transaction_fingerprint =
+      *access.selected_transaction_fingerprint;
+  const auto validate_lane_state = [&](std::optional<std::size_t> authoritative_version) {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
     {
+      const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+      if (!component.has_proposal_ ||
+          component.proposal_origin_ != ProposalOrigin::MW_SELECTED_FULL_VGL ||
+          component.proposed_particle_ != -1 ||
+          component.proposed_descriptor_fingerprint_ != transaction_fingerprint ||
+          component.proposed_configuration_identity_ !=
+              access.resource.configuration_identities[lane] ||
+          component.proposed_sign_ != access.resource.staged_signs[lane] ||
+          component.proposed_log_value_ != makeLogValue(
+              access.resource.staged_signs[lane],
+              access.resource.staged_log_magnitudes[lane]))
+        throw std::logic_error(
+            "PsiFormer planned selected resolution has incomplete proposal provenance");
+      if (!component.accepted_value_valid_ ||
+          component.accepted_state_requirement_ !=
+              AcceptedStateRequirement::FULL_SPATIAL ||
+          component.accepted_parameter_version_ != proposal_version ||
+          component.observed_parameter_version_ != proposal_version ||
+          component.proposed_parameter_version_ != proposal_version)
+        throw std::logic_error(
+            "PsiFormer planned selected resolution has incoherent cached versions");
+      if (authoritative_version &&
+          (*authoritative_version != proposal_version ||
+           component.accepted_parameter_version_ != *authoritative_version ||
+           component.observed_parameter_version_ != *authoritative_version ||
+           component.proposed_parameter_version_ != *authoritative_version))
+        throw std::logic_error(
+            "PsiFormer parameters changed during a planned selected transaction");
+      if (component.accepted_gradient_.size() != electron_count ||
+          component.accepted_laplacian_.size() != electron_count ||
+          component.proposed_gradient_.size() != electron_count ||
+          component.proposed_laplacian_.size() != electron_count)
+        throw std::logic_error(
+            "PsiFormer planned selected resolution has incomplete spatial state");
+      if ((component.current_sign_ != 1.0 && component.current_sign_ != -1.0) ||
+          (component.proposed_sign_ != 1.0 && component.proposed_sign_ != -1.0) ||
+          !isFiniteWavefunctionValue(component.log_value_) ||
+          !isFiniteWavefunctionValue(component.proposed_log_value_))
+        throw std::logic_error(
+            "PsiFormer planned selected resolution has invalid value state");
       for (std::size_t electron = 0; electron < electron_count; ++electron)
       {
-        component.accepted_gradient_[electron]  = component.proposed_gradient_[electron];
-        component.accepted_laplacian_[electron] = component.proposed_laplacian_[electron];
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          if (!isFiniteWavefunctionValue(
+                  component.accepted_gradient_[electron][dimension]) ||
+              !isFiniteWavefunctionValue(
+                  component.proposed_gradient_[electron][dimension]))
+            throw std::logic_error(
+                "PsiFormer planned selected resolution has non-finite gradient state");
+        if (!isFiniteWavefunctionValue(component.accepted_laplacian_[electron]) ||
+            !isFiniteWavefunctionValue(component.proposed_laplacian_[electron]))
+          throw std::logic_error(
+              "PsiFormer planned selected resolution has non-finite Laplacian state");
       }
-      component.current_sign_                   = component.proposed_sign_;
-      component.log_value_                      = component.proposed_log_value_;
-      component.accepted_configuration_identity_ = component.proposed_configuration_identity_;
-      component.accepted_parameter_version_      = parameter_version;
-      component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
-      component.accepted_value_valid_            = true;
+
+      // Rejected lanes deliberately have no live-coordinate identity
+      // prerequisite: the outer ParticleSet transaction may not have rolled
+      // them back yet. Accepted lanes must already expose the proposed state.
+      if (accepted[lane] &&
+          component.proposed_configuration_identity_ !=
+              configurationIdentity(p_list[lane]))
+        throw std::logic_error(
+            "PsiFormer planned accepted selected coordinates do not match the proposal");
     }
-  }
-  for (std::size_t walker = 0; walker < walker_count; ++walker)
-    wfc_list.getCastedElement<PsiFormerWF>(walker).resetProposalMetadata();
-  for (std::size_t walker = 0; walker < walker_count; ++walker)
-    wfc_list.getCastedElement<PsiFormerWF>(walker).has_proposal_ = false;
+  };
+
+  // Phase A is strictly read only and deliberately precedes model-lock
+  // acquisition so malformed non-version evidence cannot open a transaction.
+  validate_lane_state(std::nullopt);
+
+  PsiFormerReadTransaction transaction(*model_state_);
+  const std::size_t parameter_version = transaction.parameterVersion();
+  if (transaction.state().execution_plan.modelShape().electrons() != electron_count)
+    throw std::logic_error(
+        "PsiFormer planned selected resolution model shape changed");
+  validate_lane_state(parameter_version);
+
+  // Phase B repeats the exact descriptor, resource, allocation, team, and lane
+  // evidence under the authoritative model read transaction.
+  if (accepted.size() != walker_count || moves.walkerCount() != walker_count)
+    throw std::logic_error(
+        "PsiFormer planned selected resolution counts changed during preflight");
+  moves.validateFor(p_list);
+  if (moves.fingerprint() != descriptor_fingerprint ||
+      moves.size() > walker_count * electron_count ||
+      moves.size() > selected_capacity)
+    throw std::logic_error(
+        "PsiFormer planned selected resolution descriptor changed during preflight");
+  const PlannedRuntimeAccess final_access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+  if (&final_access.resource != &access.resource ||
+      !final_access.participant.sameBinding(access.participant) ||
+      &final_access.crowd != &access.crowd ||
+      final_access.storage_fingerprint != access.storage_fingerprint ||
+      final_access.selected_transaction_fingerprint !=
+          access.selected_transaction_fingerprint)
+    throw std::logic_error(
+        "PsiFormer planned selected resolution runtime evidence changed during preflight");
+  validate_lane_state(parameter_version);
+
+  if (fail_planned_selected_resolution_before_publish_for_testing_)
+    throw std::overflow_error(
+        "Injected PsiFormer planned selected resolution pre-publication failure");
+
+  const auto publish = [&]() noexcept {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      if (accepted[lane])
+      {
+        auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+        for (std::size_t electron = 0; electron < electron_count; ++electron)
+        {
+          component.accepted_gradient_[electron] =
+              component.proposed_gradient_[electron];
+          component.accepted_laplacian_[electron] =
+              component.proposed_laplacian_[electron];
+        }
+      }
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      if (accepted[lane])
+      {
+        auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+        component.current_sign_ = component.proposed_sign_;
+        component.log_value_ = component.proposed_log_value_;
+        component.accepted_configuration_identity_ =
+            component.proposed_configuration_identity_;
+        component.accepted_parameter_version_ = parameter_version;
+        component.accepted_state_requirement_ =
+            AcceptedStateRequirement::FULL_SPATIAL;
+        component.observed_parameter_version_ = parameter_version;
+      }
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      if (accepted[lane])
+        static_cast<PsiFormerWF&>(wfc_list[lane]).accepted_value_valid_ = true;
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      static_cast<PsiFormerWF&>(wfc_list[lane]).resetProposalMetadata();
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      static_cast<PsiFormerWF&>(wfc_list[lane]).has_proposal_ = false;
+  };
+  static_assert(noexcept(publish()));
+  publish();
+
+  // The count remains conservatively nonzero until every lane has completed
+  // the mechanically nonthrowing state publication above.
+  unregisterPlannedSelectedTransaction();
 }
 
 void PsiFormerWF::mw_recompute(

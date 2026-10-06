@@ -710,6 +710,9 @@ private:
   /// Reserve one shared selected-transaction slot without throwing.
   bool tryRegisterPlannedSelectedTransaction() const noexcept;
 
+  /// Withdraw one previously registered selected transaction without underflow.
+  void unregisterPlannedSelectedTransaction() const noexcept;
+
   /// Validate and abandon one planned selected proposal without a public API.
   void cancelPlannedSelectedProposal(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -814,6 +817,12 @@ private:
       std::size_t live_walkers,
       std::size_t evaluated_rows) const;
 
+  /// Report the model-wide selected-transaction count without changing it.
+  std::size_t plannedSelectedTransactionCountForTesting() const noexcept;
+
+  /// Advance the shared model version behind a pending proposal for a stale-state test.
+  std::size_t advanceParameterVersionForTesting();
+
   /// Report shared optimizer metadata ownership and the empty inherited variable set.
   testing::PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnosticsForTesting() const;
 
@@ -913,6 +922,8 @@ private:
   bool fail_planned_full_vgl_before_publish_for_testing_ = false;
   /// Inject a post-evaluation selected-proposal failure before publication.
   bool fail_planned_selected_proposal_before_publish_for_testing_ = false;
+  /// Inject a selected-resolution failure after its final read-only recheck.
+  bool fail_planned_selected_resolution_before_publish_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.
   bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
