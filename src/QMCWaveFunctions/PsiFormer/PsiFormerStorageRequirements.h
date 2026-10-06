@@ -822,7 +822,7 @@ inline std::size_t scoreWorkspaceStorageRequirement(const PsiFormerStorageShape&
   addStorageBytes(elements, block_attention,
                   "PsiFormer score element extent overflowed");
   addStorageBytes(elements, checkedStorageProduct(
-                                2, orbitals,
+                                3, orbitals,
                                 "PsiFormer score orbital extent overflowed"),
                   "PsiFormer score element extent overflowed");
   addStorageBytes(elements, shape.parameter_count,

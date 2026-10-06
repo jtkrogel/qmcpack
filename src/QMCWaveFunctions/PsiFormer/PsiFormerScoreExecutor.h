@@ -38,6 +38,7 @@
 #include "PsiFormerDirectKernels.h"
 #include "PsiFormerDeterminant.h"
 #include "PsiFormerStorageRequirements.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
 
@@ -264,6 +265,7 @@ public:
         orbital_matrices_(orbital_elements_),
         determinant_workspace_(determinants_, electrons_),
         matrix_adjoints_(orbital_elements_),
+        backflow_adjoints_(electrons_ * determinants_ * electrons_),
         parameter_score_(plan.parameterCount()),
         feature_adjoint_a_(feature_elements_),
         feature_adjoint_b_(feature_elements_),
@@ -333,6 +335,7 @@ public:
              &electron_positions_, &raw_features_, &features_, &queries_,
              &keys_, &values_, &attention_weights_, &contexts_, &residuals_,
              &hidden_, &updates_, &orbital_matrices_, &matrix_adjoints_,
+             &backflow_adjoints_,
              &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
              &query_adjoint_, &key_adjoint_, &value_adjoint_,
              &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
@@ -360,6 +363,7 @@ public:
              &electron_positions_, &raw_features_, &features_, &queries_,
              &keys_, &values_, &attention_weights_, &contexts_, &residuals_,
              &hidden_, &updates_, &orbital_matrices_, &matrix_adjoints_,
+             &backflow_adjoints_,
              &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
              &query_adjoint_, &key_adjoint_, &value_adjoint_,
              &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
@@ -435,6 +439,7 @@ private:
   std::vector<double> orbital_matrices_;
   qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_workspace_;
   std::vector<double> matrix_adjoints_;
+  std::vector<double> backflow_adjoints_;
   std::vector<double> parameter_score_;
 
   std::vector<double> feature_adjoint_a_;
@@ -494,6 +499,22 @@ public:
   /// Execute one taped forward evaluation and one explicit parameter reverse pass.
   DirectScoreResult evaluate(DirectScoreWorkspace& workspace) const
   {
+    return evaluateImpl(workspace, nullptr);
+  }
+
+  /** Evaluate a score while streaming every supported affine layer boundary. */
+  DirectScoreResult evaluateWithAffineObservations(
+      DirectScoreWorkspace& workspace,
+      DirectAffineObservationSink& observer) const
+  {
+    return evaluateImpl(workspace, &observer);
+  }
+
+private:
+  /// Share the exact score traversal between ordinary and observed evaluations.
+  DirectScoreResult evaluateImpl(DirectScoreWorkspace& workspace,
+                                 DirectAffineObservationSink* observer) const
+  {
     validateWorkspaceAndParameters(workspace);
     const double* parameter_values = parameters_.flat_values().data();
     std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
@@ -518,10 +539,16 @@ public:
     if (!is_finite_parameter_value(logabs))
       throw std::runtime_error("PsiFormer score executor produced a non-finite log wavefunction");
 
-    reverseOrbitals(parameter_values, workspace);
+    reverseOrbitals(parameter_values, workspace, observer);
     for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
-      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace);
+      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace, observer);
     reverseEmbedding(workspace);
+    if (observer)
+      observer->observe({ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
+                         qmcplusplus::psiformer::NO_ATTENTION_BLOCK,
+                         workspace.raw_features_.data(),
+                         workspace.feature_adjoint_a_.data(), workspace.electrons_,
+                         workspace.input_width_, workspace.width_});
 
     workspace.observed_parameter_version_ = parameters_.version();
     const double sign = determinant_result.amplitude.phase;
@@ -532,6 +559,7 @@ public:
             workspace.observed_parameter_version_};
   }
 
+public:
   /** Copy selected canonical score entries after a full evaluation without allocation. */
   DirectScoreResult evaluateSelected(DirectScoreWorkspace& workspace,
                                      const std::size_t* indices,
@@ -814,7 +842,8 @@ private:
 
   /// Seed determinant adjoints and reverse orbitals, backflow, and envelopes.
   void reverseOrbitals(const double* parameters,
-                       DirectScoreWorkspace& workspace) const
+                       DirectScoreWorkspace& workspace,
+                       DirectAffineObservationSink* observer = nullptr) const
   {
     std::fill(workspace.feature_adjoint_a_.begin(), workspace.feature_adjoint_a_.end(), 0.0);
     const double* final_features = workspace.features(workspace.blocks_);
@@ -858,6 +887,10 @@ private:
           }
 
           const double backflow_adjoint = matrix_adjoint * envelope_value;
+          if (observer)
+            workspace.backflow_adjoints_[
+                electron * workspace.determinants_ * workspace.electrons_ + channel] =
+                backflow_adjoint;
           const double envelope_adjoint = matrix_adjoint * backflow_value;
           for (std::size_t feature = 0; feature < workspace.width_; ++feature)
           {
@@ -878,12 +911,29 @@ private:
           }
         }
     }
+
+    if (observer)
+    {
+      const std::size_t output_width = workspace.determinants_ * workspace.electrons_;
+      observer->observe({ParameterRole::BACKFLOW_UP_WEIGHT,
+                         qmcplusplus::psiformer::NO_ATTENTION_BLOCK,
+                         final_features, workspace.backflow_adjoints_.data(),
+                         spin_up_electrons_, workspace.width_, output_width});
+      const std::size_t down_electrons = workspace.electrons_ - spin_up_electrons_;
+      observer->observe({ParameterRole::BACKFLOW_DOWN_WEIGHT,
+                         qmcplusplus::psiformer::NO_ATTENTION_BLOCK,
+                         final_features + spin_up_electrons_ * workspace.width_,
+                         workspace.backflow_adjoints_.data() +
+                             spin_up_electrons_ * output_width,
+                         down_electrons, workspace.width_, output_width});
+    }
   }
 
   /// Reverse one attention/residual block into its input and eight parameter tensors.
   void reverseAttentionBlock(const double* parameters,
                              std::size_t block,
-                             DirectScoreWorkspace& workspace) const
+                             DirectScoreWorkspace& workspace,
+                             DirectAffineObservationSink* observer = nullptr) const
   {
     const double* input = workspace.features(block);
     const double* query = DirectScoreWorkspace::blockBuffer(workspace.queries_, block,
@@ -916,6 +966,10 @@ private:
         workspace.update_adjoint_.data(), workspace.electrons_, workspace.width_, workspace.width_,
         workspace.hidden_adjoint_.data(), score(workspace, ParameterRole::UPDATE_OUTPUT_WEIGHT, block),
         score(workspace, ParameterRole::UPDATE_OUTPUT_BIAS, block));
+    if (observer)
+      observer->observe({ParameterRole::UPDATE_OUTPUT_WEIGHT, block, hidden,
+                         workspace.update_adjoint_.data(), workspace.electrons_,
+                         workspace.width_, workspace.width_});
     for (std::size_t element = 0; element < workspace.feature_elements_; ++element)
       workspace.hidden_adjoint_[element] *= 1.0 - hidden[element] * hidden[element];
     qmcplusplus::psiformer::direct::denseReverse(
@@ -923,6 +977,10 @@ private:
         workspace.hidden_adjoint_.data(), workspace.electrons_, workspace.width_, workspace.width_,
         workspace.residual_adjoint_.data(), score(workspace, ParameterRole::UPDATE_HIDDEN_WEIGHT, block),
         score(workspace, ParameterRole::UPDATE_HIDDEN_BIAS, block));
+    if (observer)
+      observer->observe({ParameterRole::UPDATE_HIDDEN_WEIGHT, block, residual,
+                         workspace.hidden_adjoint_.data(), workspace.electrons_,
+                         workspace.width_, workspace.width_});
 
     // Reverse the output projection and seed the explicit attention residual branch.
     std::fill(workspace.context_adjoint_.begin(), workspace.context_adjoint_.end(), 0.0);
@@ -931,6 +989,10 @@ private:
         workspace.residual_adjoint_.data(), workspace.electrons_, workspace.width_, workspace.width_,
         workspace.context_adjoint_.data(), score(workspace, ParameterRole::ATTENTION_OUTPUT_WEIGHT, block),
         nullptr);
+    if (observer)
+      observer->observe({ParameterRole::ATTENTION_OUTPUT_WEIGHT, block, context,
+                         workspace.residual_adjoint_.data(), workspace.electrons_,
+                         workspace.width_, workspace.width_});
     std::copy(workspace.residual_adjoint_.begin(), workspace.residual_adjoint_.end(),
               workspace.feature_adjoint_b_.begin());
 
@@ -945,6 +1007,19 @@ private:
     qmcplusplus::psiformer::direct::attentionWeightsReverse(
         query, key, attention, workspace.attention_adjoint_.data(), workspace.electrons_, workspace.heads_,
         workspace.head_width_, workspace.query_adjoint_.data(), workspace.key_adjoint_.data());
+
+    if (observer)
+    {
+      observer->observe({ParameterRole::ATTENTION_QUERY_WEIGHT, block, input,
+                         workspace.query_adjoint_.data(), workspace.electrons_,
+                         workspace.width_, workspace.width_});
+      observer->observe({ParameterRole::ATTENTION_KEY_WEIGHT, block, input,
+                         workspace.key_adjoint_.data(), workspace.electrons_,
+                         workspace.width_, workspace.width_});
+      observer->observe({ParameterRole::ATTENTION_VALUE_WEIGHT, block, input,
+                         workspace.value_adjoint_.data(), workspace.electrons_,
+                         workspace.width_, workspace.width_});
+    }
 
     // Each Q/K/V projection contributes independently to the same input-feature adjoint.
     qmcplusplus::psiformer::direct::denseReverse(

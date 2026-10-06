@@ -98,6 +98,7 @@ list(APPEND DRIVER_TEST_SRC test_LegacyWaveFunctionAdapter.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeOperator.cpp)
 list(APPEND DRIVER_TEST_SRC test_KrylovSolver.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeStochasticReconfiguration.cpp)
+list(APPEND DRIVER_TEST_SRC test_KFACPreconditioner.cpp)
 add_executable(${UTEST_EXE} ${DRIVER_TEST_SRC})
 target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)
 if(USE_OBJECT_TARGET)
@@ -162,6 +163,29 @@ if(HAVE_MPI)
   foreach(NUM_RANKS 1 2 3 4)
     set(UTEST_NAME deterministic-unit_${UTEST_EXE}-r${NUM_RANKS})
     add_unit_test(${UTEST_NAME} ${NUM_RANKS} 1 $<TARGET_FILE:${UTEST_EXE}>)
+    set_tests_properties(${UTEST_NAME} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+  endforeach()
+
+  set(UTEST_EXE test_kfac_mpi)
+  add_executable(${UTEST_EXE} test_KFACPreconditioner.cpp)
+  target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      ${UTEST_EXE}
+      qmcestimators
+      qmcham
+      qmcwfs
+      qmcwfs_omptarget
+      spline2
+      spline2_omptarget
+      qmcparticle
+      qmcparticle_omptarget
+      qmcutil
+      platform_omptarget_LA)
+  endif()
+  foreach(NUM_RANKS 1 2)
+    set(UTEST_NAME deterministic-unit_${UTEST_EXE}-r${NUM_RANKS})
+    add_unit_test(${UTEST_NAME} ${NUM_RANKS} 1 $<TARGET_FILE:${UTEST_EXE}> "[mpi]")
     set_tests_properties(${UTEST_NAME} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
   endforeach()
 

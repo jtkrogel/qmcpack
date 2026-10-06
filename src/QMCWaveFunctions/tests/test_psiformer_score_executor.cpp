@@ -78,6 +78,36 @@ struct ScoreGolden
   std::vector<double> selected_values;
 };
 
+/// Own one copied affine boundary after the executor has reused its reverse scratch.
+struct CapturedAffineObservation
+{
+  qmcplusplus::psiformer::ParameterRole role;
+  std::size_t attention_block;
+  std::size_t rows;
+  std::size_t input_width;
+  std::size_t output_width;
+  std::vector<double> activations;
+  std::vector<double> sensitivities;
+};
+
+/// Capture transient affine rows solely for an independent test reconstruction.
+class CapturingAffineSink final : public pf::DirectAffineObservationSink
+{
+public:
+  void observe(const pf::DirectAffineObservation& observation) override
+  {
+    observations.push_back(
+        {observation.role, observation.attention_block, observation.row_count,
+         observation.input_width, observation.output_width,
+         {observation.activations,
+          observation.activations + observation.row_count * observation.input_width},
+         {observation.sensitivities,
+          observation.sensitivities + observation.row_count * observation.output_width}});
+  }
+
+  std::vector<CapturedAffineObservation> observations;
+};
+
 /// Return independent DeepQMC/JAX score aggregates for the generated LiH fixture.
 ScoreGolden lihScoreGolden()
 {
@@ -404,4 +434,75 @@ TEST_CASE("PsiFormer orbital MSE uses the direct tape and spin-sector normalizat
             .parameter_gradient[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] == 0.0);
   CHECK_THROWS_AS(executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size() - 1}),
                   std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer affine observations reconstruct every supported score block",
+          "[wavefunction][psiformer][score][kfac]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const qmcplusplus::psiformer::ModelShape shape{
+      model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+      model.dim, model.heads, model.blocks};
+  const auto plan =
+      qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
+  pf::DirectScoreExecutor executor(model, plan);
+  auto workspace = executor.makeWorkspace();
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
+
+  CapturingAffineSink sink;
+  const pf::DirectScoreResult score =
+      executor.evaluateWithAffineObservations(*workspace, sink);
+  REQUIRE(sink.observations.size() == 3 + 6 * model.blocks);
+
+  using qmcplusplus::psiformer::ParameterRole;
+  for (const CapturedAffineObservation& observation : sink.observations)
+  {
+    const auto& weight = plan.parameter(observation.role,
+                                        observation.attention_block);
+    REQUIRE(weight.size() == observation.input_width * observation.output_width);
+    double maximum_scaled_error = 0.0;
+    for (std::size_t input = 0; input < observation.input_width; ++input)
+      for (std::size_t output = 0; output < observation.output_width; ++output)
+      {
+        double reconstructed = 0.0;
+        for (std::size_t row = 0; row < observation.rows; ++row)
+          reconstructed +=
+              observation.activations[row * observation.input_width + input] *
+              observation.sensitivities[row * observation.output_width + output];
+        const double actual = score.parameter_score[
+            weight.begin + input * observation.output_width + output];
+        maximum_scaled_error = std::max(
+            maximum_scaled_error,
+            std::abs(actual - reconstructed) /
+                std::max({1.0, std::abs(actual), std::abs(reconstructed)}));
+      }
+    CHECK(maximum_scaled_error < 2e-11);
+
+    ParameterRole bias_role = ParameterRole::COUNT;
+    if (observation.role == ParameterRole::UPDATE_HIDDEN_WEIGHT)
+      bias_role = ParameterRole::UPDATE_HIDDEN_BIAS;
+    else if (observation.role == ParameterRole::UPDATE_OUTPUT_WEIGHT)
+      bias_role = ParameterRole::UPDATE_OUTPUT_BIAS;
+    if (bias_role != ParameterRole::COUNT)
+    {
+      const auto& bias = plan.parameter(bias_role, observation.attention_block);
+      double maximum_bias_scaled_error = 0.0;
+      for (std::size_t output = 0; output < observation.output_width; ++output)
+      {
+        double reconstructed = 0.0;
+        for (std::size_t row = 0; row < observation.rows; ++row)
+          reconstructed += observation.sensitivities[
+              row * observation.output_width + output];
+        const double actual = score.parameter_score[bias.begin + output];
+        maximum_bias_scaled_error = std::max(
+            maximum_bias_scaled_error,
+            std::abs(actual - reconstructed) /
+                std::max({1.0, std::abs(actual), std::abs(reconstructed)}));
+      }
+      CHECK(maximum_bias_scaled_error < 2e-11);
+    }
+  }
 }
