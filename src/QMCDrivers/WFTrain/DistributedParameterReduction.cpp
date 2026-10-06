@@ -32,6 +32,7 @@ namespace
 constexpr std::uint64_t protocol_version = 1;
 constexpr std::uint64_t energy_channel_contract = UINT64_C(0x454752414433); // "EGRAD3"
 constexpr std::uint64_t orbital_channel_contract = UINT64_C(0x4f52424752414431); // "ORBGRAD1"
+constexpr std::uint64_t parameter_vector_contract = UINT64_C(0x5056454353554d31); // "PVECSUM1"
 
 /// Classify failures without communicating variable-length exception strings.
 enum class ConsensusReason : std::uint64_t
@@ -41,7 +42,8 @@ enum class ConsensusReason : std::uint64_t
   INVALID_POLICY,
   INCOMPLETE_CONTRIBUTION,
   NONFINITE_CONTRIBUTION,
-  INVALID_CANDIDATE
+  INVALID_CANDIDATE,
+  SCALAR_DOMAIN_VIOLATION
 };
 
 /// Return a stable diagnostic label for one fixed-record failure reason.
@@ -61,6 +63,8 @@ const char* consensusReasonName(ConsensusReason reason) noexcept
     return "non-finite contribution";
   case ConsensusReason::INVALID_CANDIDATE:
     return "invalid candidate";
+  case ConsensusReason::SCALAR_DOMAIN_VIOLATION:
+    return "scalar-domain violation";
   }
   return "unknown";
 }
@@ -68,7 +72,8 @@ const char* consensusReasonName(ConsensusReason reason) noexcept
 /// Return whether a full-precision contraction scalar is finite.
 bool isFinite(DerivativeValue value) noexcept
 {
-  return std::isfinite(value.real()) && std::isfinite(value.imag());
+  return isFiniteTrainingReal(value.real()) &&
+      isFiniteTrainingReal(value.imag());
 }
 
 /// Extend a stable FNV-1a identity hash with one byte interval.
@@ -563,6 +568,101 @@ void DistributedParameterReduction::reduce(
   }
   accumulator.sample_count_ = static_cast<std::size_t>(global_sample_count);
   accumulator.reduction_domain_ = ReductionDomain::GLOBAL;
+}
+
+ReductionDomain DistributedParameterReduction::reduceParameterVector(
+    const StructuredParameterSchema& schema,
+    std::size_t parameter_version,
+    DerivativeArrayView<DerivativeValue> values,
+    std::exception_ptr local_failure) const
+{
+  ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
+                                         : ConsensusReason::NONE;
+  constexpr std::size_t complex_dimension = 2;
+  const std::size_t maximum_mpi_chunk =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) / complex_dimension;
+  if (reason == ConsensusReason::NONE &&
+      (policy_.maximum_chunk_size == 0 ||
+       policy_.maximum_chunk_size > maximum_mpi_chunk))
+    reason = ConsensusReason::INVALID_POLICY;
+  if (reason == ConsensusReason::NONE &&
+      (values.size() != schema.parameterCount() ||
+       (!values.empty() && values.data() == nullptr)))
+    reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+
+  ParameterScalarDomain scalar_domain = schema.blocks().front().scalar_domain;
+  if (reason == ConsensusReason::NONE)
+    for (const ParameterBlockDescriptor& block : schema.blocks())
+      if (block.scalar_domain != scalar_domain)
+      {
+        reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+        break;
+      }
+  if (reason == ConsensusReason::NONE &&
+      !std::all_of(values.begin(), values.end(), isFinite))
+    reason = ConsensusReason::NONFINITE_CONTRIBUTION;
+  if (reason == ConsensusReason::NONE &&
+      scalar_domain == ParameterScalarDomain::REAL64 &&
+      std::any_of(values.begin(), values.end(),
+                  [](DerivativeValue value) { return value.imag() != 0.0; }))
+    reason = ConsensusReason::SCALAR_DOMAIN_VIOLATION;
+
+  const std::array<std::uint64_t, 10> local_record{
+      static_cast<std::uint64_t>(reason),
+      protocol_version,
+      parameter_vector_contract,
+      hashString(schema.providerId()),
+      hashString(schema.fingerprint()),
+      parameter_version,
+      schema.parameterCount(),
+      static_cast<std::uint64_t>(scalar_domain),
+      policy_.maximum_chunk_size,
+      participantCount()};
+  const auto records = gatherRecords(communicator_, local_record);
+
+  const std::size_t failed_rank = firstFailedRank(records);
+  if (failed_rank != records.size())
+    throwConsensusFailure("matrix-free vector reduction", failed_rank,
+                          static_cast<ConsensusReason>(records[failed_rank][0]),
+                          failed_rank == 0 ? local_failure : std::exception_ptr{},
+                          records.size());
+  const std::size_t mismatch_rank = firstMismatchingRank(records);
+  if (mismatch_rank != records.size())
+    throwMetadataMismatch("matrix-free vector reduction", mismatch_rank);
+
+  // Once data collectives begin, an exception can leave only a prefix globally
+  // reduced. Poison the complete destination on every post-consensus failure so a
+  // caller cannot mistake a partial action for a valid replicated vector.
+  const auto poison = [&values]() {
+    const DerivativeReal sentinel = std::numeric_limits<DerivativeReal>::quiet_NaN();
+    std::fill(values.begin(), values.end(), DerivativeValue{sentinel, sentinel});
+  };
+  try
+  {
+    if (communicator_)
+      for (std::size_t offset = 0; offset < values.size();
+           offset += policy_.maximum_chunk_size)
+      {
+        const std::size_t count =
+            std::min(policy_.maximum_chunk_size, values.size() - offset);
+        communicator_->allreduce_in_place(values.data() + offset, count);
+      }
+
+    if (!std::all_of(values.begin(), values.end(), isFinite))
+      throw std::runtime_error(
+          "Distributed matrix-free parameter-vector reduction produced a non-finite sum");
+    if (scalar_domain == ParameterScalarDomain::REAL64 &&
+        std::any_of(values.begin(), values.end(),
+                    [](DerivativeValue value) { return value.imag() != 0.0; }))
+      throw std::runtime_error(
+          "Distributed real parameter-vector reduction produced an imaginary value");
+  }
+  catch (...)
+  {
+    poison();
+    throw;
+  }
+  return ReductionDomain::GLOBAL;
 }
 
 void DistributedParameterReduction::validateCandidate(

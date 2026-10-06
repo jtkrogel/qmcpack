@@ -74,6 +74,17 @@ public:
   void reduce(OrbitalPretrainingAccumulator& accumulator,
               std::exception_ptr local_failure = {}) const;
 
+  /** Sum one rank-local parameter-vector contribution on every participant.
+   *
+   * The input is replaced in place by a replicated global vector. All ranks execute
+   * one fixed metadata/failure consensus before entering the chunked data collectives.
+   */
+  ReductionDomain reduceParameterVector(
+      const StructuredParameterSchema& schema,
+      std::size_t parameter_version,
+      DerivativeArrayView<DerivativeValue> values,
+      std::exception_ptr local_failure = {}) const;
+
   /// Verify that every rank prepared the same complete update before publication.
   void validateCandidate(const StructuredParameterSchema& schema,
                          const StructuredParameterSnapshot& parameters,

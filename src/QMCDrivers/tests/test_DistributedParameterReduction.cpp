@@ -15,6 +15,7 @@
 
 #include "Message/Communicate.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include <algorithm>
 #include <array>
@@ -404,6 +405,119 @@ TEST_CASE("Distributed parameter reduction matches an independent global referen
     CHECK(result.energy_variance == Catch::Approx(reference.energy_variance).margin(1e-14));
     for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
       CHECK(result.gradient[parameter] == Catch::Approx(reference.gradient[parameter]));
+  }
+}
+
+TEST_CASE("Distributed matrix-free vectors are reduced once into replicated storage",
+          "[drivers][training][matrix-free][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema complex_schema{
+      "distributed/matrix_free_complex",
+      {{"weights", {5}, 0, 5, ParameterScalarDomain::COMPLEX128, true,
+        "weights"}}};
+
+  for (const std::size_t chunk_size : {std::size_t{1}, std::size_t{2}})
+  {
+    // Rank one deliberately contributes zero when it exists. This checks both the
+    // fixed collective schedule and a non-divisible final transport chunk.
+    const double rank_factor = communicator.size() > 1 && communicator.rank() == 1
+        ? 0.0
+        : static_cast<double>(communicator.rank() + 1);
+    std::vector<DerivativeValue> values(5);
+    for (std::size_t parameter = 0; parameter < values.size(); ++parameter)
+      values[parameter] = rank_factor *
+          DerivativeValue{static_cast<double>(parameter + 1),
+                          -0.25 * static_cast<double>(parameter + 1)};
+
+    double global_factor = 0.0;
+    for (int rank = 0; rank < communicator.size(); ++rank)
+      if (!(communicator.size() > 1 && rank == 1))
+        global_factor += rank + 1;
+
+    DistributedParameterReduction reduction(communicator, {chunk_size});
+    CHECK(reduction.reduceParameterVector(
+              complex_schema, 9, {values.data(), values.size()}) ==
+          ReductionDomain::GLOBAL);
+    for (std::size_t parameter = 0; parameter < values.size(); ++parameter)
+    {
+      CHECK(values[parameter].real() ==
+            Catch::Approx(global_factor * static_cast<double>(parameter + 1)));
+      CHECK(values[parameter].imag() ==
+            Catch::Approx(-0.25 * global_factor *
+                          static_cast<double>(parameter + 1)));
+    }
+  }
+}
+
+TEST_CASE("Distributed matrix-free vector failures precede data collectives",
+          "[drivers][training][matrix-free][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const bool last_rank = communicator.rank() == communicator.size() - 1;
+  DistributedParameterReduction reduction(communicator, {2});
+
+  const StructuredParameterSchema schema = makeSchema();
+  std::vector<DerivativeValue> values(5, DerivativeValue{1.0, 0.0});
+  std::exception_ptr local_failure;
+  if (communicator.rank() == 0)
+    local_failure =
+        std::make_exception_ptr(std::runtime_error("matrix-free action failed"));
+  CHECK_THROWS(reduction.reduceParameterVector(
+      schema, 0, {values.data(), values.size()}, local_failure));
+
+  // An imaginary REAL64 contribution must fail before reduction even if two ranks
+  // would otherwise cancel it to an apparently valid real result.
+  if (communicator.size() > 1)
+  {
+    values.assign(5, DerivativeValue{1.0, 0.0});
+    if (communicator.rank() == 0)
+      values.front() = {1.0, 1.0};
+    else if (communicator.rank() == 1)
+      values.front() = {1.0, -1.0};
+    CHECK_THROWS_WITH(
+        reduction.reduceParameterVector(schema, 0,
+                                        {values.data(), values.size()}),
+        Catch::Matchers::ContainsSubstring("scalar-domain violation"));
+  }
+
+  if (communicator.size() > 1)
+  {
+    const StructuredParameterSchema mismatched =
+        makeSchema(last_rank ? "distributed/matrix_free_mismatch" :
+                               "distributed/toy");
+    values.assign(5, DerivativeValue{1.0, 0.0});
+    CHECK_THROWS_WITH(
+        reduction.reduceParameterVector(mismatched, 0,
+                                        {values.data(), values.size()}),
+        Catch::Matchers::ContainsSubstring("metadata mismatch"));
+  }
+
+  // The same reduction owner remains usable after every pre-collective failure.
+  values.assign(5, DerivativeValue{static_cast<double>(communicator.rank() + 1),
+                                   0.0});
+  CHECK_NOTHROW(reduction.reduceParameterVector(
+      schema, 0, {values.data(), values.size()}));
+}
+
+TEST_CASE("Distributed matrix-free post-collective failures poison the result",
+          "[drivers][training][matrix-free][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  if (communicator.size() < 2)
+    return;
+
+  const StructuredParameterSchema schema = makeSchema();
+  std::vector<DerivativeValue> values(
+      5, DerivativeValue{std::numeric_limits<double>::max(), 0.0});
+  DistributedParameterReduction reduction(communicator, {2});
+  CHECK_THROWS_WITH(
+      reduction.reduceParameterVector(schema, 0, {values.data(), values.size()}),
+      Catch::Matchers::ContainsSubstring("non-finite sum"));
+  for (const DerivativeValue value : values)
+  {
+    CHECK_FALSE(isFiniteTrainingReal(value.real()));
+    CHECK_FALSE(isFiniteTrainingReal(value.imag()));
   }
 }
 

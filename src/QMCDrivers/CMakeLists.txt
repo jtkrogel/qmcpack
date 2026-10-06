@@ -53,6 +53,8 @@ set(QMCDRIVERS
     WFTrain/HighParameterTraining.cpp
     WFTrain/TrainingCheckpoint.cpp
     WFTrain/FirstOrderOptimizer.cpp
+    WFTrain/MatrixFreeOperator.cpp
+    WFTrain/KrylovSolver.cpp
     Optimizers/DescentEngine.cpp
     Optimizers/HybridEngine.cpp
     WFOpt/QMCCostFunctionBase.cpp
