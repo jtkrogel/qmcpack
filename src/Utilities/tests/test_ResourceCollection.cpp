@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <iostream>
 #include <sstream>
+#include "BatchResourcePreparation.h"
 #include "ResourceCollection.h"
 
 namespace qmcplusplus
@@ -24,6 +25,51 @@ public:
 
   std::vector<int> data;
 };
+
+/** Records the context delivered by transactional batch preparation. */
+class PreparingResource : public Resource
+{
+public:
+  PreparingResource(const std::string& name, bool fail_on_prepare = false)
+      : Resource(name), fail_on_prepare_(fail_on_prepare)
+  {}
+
+  std::unique_ptr<Resource> makeClone() const override { return std::make_unique<PreparingResource>(*this); }
+
+  void prepareBatchResource(const BatchResourcePreparationContext& context) override
+  {
+    ++prepare_count;
+    prepared_plan    = context.plan;
+    prepared_crowd   = context.crowd_index;
+    initial_capacity = context.plan ? context.initialWalkerCapacity() : 0;
+    reserve_capacity = context.plan ? context.reserveWalkerCapacity() : 0;
+    if (fail_on_prepare_)
+      throw std::runtime_error("deliberate batch resource preparation failure");
+  }
+
+  std::shared_ptr<const BatchExecutionPlan> prepared_plan;
+  std::size_t prepared_crowd   = 0;
+  std::size_t initial_capacity = 0;
+  std::size_t reserve_capacity = 0;
+  int prepare_count            = 0;
+
+private:
+  bool fail_on_prepare_;
+};
+
+/** Build a storage-free plan with the requested crowd topology. */
+std::shared_ptr<const BatchExecutionPlan> makeResourcePreparationPlan(
+    std::vector<std::size_t> initial_walkers,
+    std::vector<std::size_t> reserve_walkers = {})
+{
+  BatchExecutionSelectionInput input;
+  input.topology.initial_walkers_per_crowd = std::move(initial_walkers);
+  input.topology.reserve_walkers_per_crowd = std::move(reserve_walkers);
+  return std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(input, [](const BatchExecutionPlanningContext&) {
+        return std::vector<BatchMemoryParticipantContribution>{};
+      }));
+}
 
 TEST_CASE("Resource", "[utilities]")
 {
@@ -100,6 +146,7 @@ TEST_CASE("ResourceCollection", "[utilities]")
     ResourceCollectionTeamLock lock(res_collection, wfc_list);
     auto& res_handle = wfc.getResourceHandle();
     REQUIRE(res_handle);
+    CHECK(res_collection.getOutstandingLoanCount() == 1);
 
     MemoryResource& mem_res             = res_handle;
     const MemoryResource& const_mem_res = res_handle;
@@ -108,6 +155,11 @@ TEST_CASE("ResourceCollection", "[utilities]")
   }
 
   REQUIRE(wfc.getResourceHandle().hasResource() == false);
+  CHECK(res_collection.getOutstandingLoanCount() == 0);
+
+  // Normal release leaves cursor traversal at the end, but no live handle
+  // remains and preparation is therefore legal without another rewind.
+  res_collection.prepareBatchResources({nullptr, 0});
 }
 
 
@@ -134,17 +186,26 @@ TEST_CASE("ResourceCollection typed lend failure preserves cursor", "[utilities]
 
   auto memory_handle = collection.lendResource<MemoryResource>();
   REQUIRE(collection.getCursor() == 1);
+  REQUIRE(collection.getOutstandingLoanCount() == 1);
   CHECK_THROWS_AS(collection.lendResource<MemoryResource>(), std::bad_cast);
   CHECK(collection.getCursor() == 1);
+  CHECK(collection.getOutstandingLoanCount() == 1);
 
   auto dummy_handle = collection.lendResource<DummyResource>();
   CHECK(collection.getCursor() == 2);
+  CHECK(collection.getOutstandingLoanCount() == 2);
 
   collection.rewind();
+  CHECK_THROWS_AS(collection.takebackResource(dummy_handle), std::runtime_error);
+  CHECK(collection.getCursor() == 0);
+  CHECK(collection.getOutstandingLoanCount() == 2);
+  CHECK(dummy_handle.hasResource());
+
   collection.takebackResource(memory_handle);
   collection.takebackResource(dummy_handle);
   CHECK_FALSE(memory_handle.hasResource());
   CHECK_FALSE(dummy_handle.hasResource());
+  CHECK(collection.getOutstandingLoanCount() == 0);
 }
 
 TEST_CASE("ResourceCollectionTeamLock construction failure preserves cursor", "[utilities]")
@@ -156,12 +217,127 @@ TEST_CASE("ResourceCollectionTeamLock construction failure preserves cursor", "[
 
   CHECK_THROWS_AS(ResourceCollectionTeamLock(collection, consumer_list), std::runtime_error);
   CHECK(collection.getCursor() == 0);
+  CHECK(collection.getOutstandingLoanCount() == 0);
   CHECK_FALSE(consumer.release_called);
 
   auto recovered_handle = collection.lendResource<MemoryResource>();
   REQUIRE(recovered_handle.hasResource());
+  CHECK(collection.getOutstandingLoanCount() == 1);
   collection.rewind();
   collection.takebackResource(recovered_handle);
+  CHECK(collection.getOutstandingLoanCount() == 0);
+}
+
+TEST_CASE("ResourceCollection prepares zero-lane and no-policy resources", "[utilities][batch_resource]")
+{
+  ResourceCollection collection("batch_preparation");
+  collection.addResource(std::make_unique<PreparingResource>("first"));
+  collection.addResource(std::make_unique<PreparingResource>("second"));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({0}, {0});
+  collection.prepareBatchResources({plan, 0});
+
+  auto first  = collection.lendResource<PreparingResource>();
+  auto second = collection.lendResource<PreparingResource>();
+  CHECK(first.getResource().prepare_count == 1);
+  CHECK(second.getResource().prepare_count == 1);
+  CHECK(first.getResource().prepared_plan.get() == plan.get());
+  CHECK(second.getResource().prepared_plan.get() == plan.get());
+  CHECK(first.getResource().prepared_crowd == 0);
+  CHECK(first.getResource().initial_capacity == 0);
+  CHECK(first.getResource().reserve_capacity == 0);
+  collection.rewind();
+  collection.takebackResource(first);
+  collection.takebackResource(second);
+
+  // The explicit no-policy state is forwarded instead of being mistaken for
+  // "nothing to do".  Its crowd index is unrestricted because it has no topology.
+  collection.prepareBatchResources({nullptr, 91});
+  first  = collection.lendResource<PreparingResource>();
+  second = collection.lendResource<PreparingResource>();
+  CHECK(first.getResource().prepare_count == 2);
+  CHECK(second.getResource().prepare_count == 2);
+  CHECK_FALSE(first.getResource().prepared_plan);
+  CHECK_FALSE(second.getResource().prepared_plan);
+  CHECK(first.getResource().prepared_crowd == 91);
+  collection.rewind();
+  collection.takebackResource(first);
+  collection.takebackResource(second);
+}
+
+TEST_CASE("ResourceCollection preparation rejects invalid topology before mutation",
+          "[utilities][batch_resource]")
+{
+  ResourceCollection collection("invalid_batch_preparation");
+  collection.addResource(std::make_unique<PreparingResource>("tracked"));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({0});
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 1}), std::out_of_range);
+
+  auto tracked = collection.lendResource<PreparingResource>();
+  CHECK(tracked.getResource().prepare_count == 0);
+  CHECK_FALSE(tracked.getResource().prepared_plan);
+  collection.rewind();
+  collection.takebackResource(tracked);
+
+  CHECK_THROWS_AS(makeResourcePreparationPlan({0}, {0, 0}), std::invalid_argument);
+  const std::shared_ptr<const BatchExecutionPlan> empty_topology_plan = makeResourcePreparationPlan({});
+  CHECK_THROWS_AS(collection.prepareBatchResources({empty_topology_plan, 0}), std::out_of_range);
+}
+
+TEST_CASE("ResourceCollection preparation is transactional", "[utilities][batch_resource]")
+{
+  ResourceCollection collection("transactional_batch_preparation");
+  collection.addResource(std::make_unique<PreparingResource>("first"));
+  collection.addResource(std::make_unique<PreparingResource>("throwing", true));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeResourcePreparationPlan({2}, {4});
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::runtime_error);
+
+  // Although the first candidate clone ran its hook, neither candidate was published.
+  auto first    = collection.lendResource<PreparingResource>();
+  auto throwing = collection.lendResource<PreparingResource>();
+  CHECK(first.getResource().prepare_count == 0);
+  CHECK(throwing.getResource().prepare_count == 0);
+  CHECK_FALSE(first.getResource().prepared_plan);
+  CHECK_FALSE(throwing.getResource().prepared_plan);
+  collection.rewind();
+  collection.takebackResource(first);
+  collection.takebackResource(throwing);
+
+  // Preparation is an idle-boundary operation and refuses to replace lent storage.
+  collection.rewind();
+  first = collection.lendResource<PreparingResource>();
+  CHECK(collection.getOutstandingLoanCount() == 1);
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::logic_error);
+  CHECK(first.getResource().prepare_count == 0);
+
+  // Rewinding traversal must not disguise a still-live handle as an idle collection.
+  collection.rewind();
+  CHECK_THROWS_AS(collection.prepareBatchResources({plan, 0}), std::logic_error);
+  CHECK(collection.getOutstandingLoanCount() == 1);
+  collection.takebackResource(first);
+  CHECK(collection.getOutstandingLoanCount() == 0);
+}
+
+TEST_CASE("ResourceCollection rejects moving live loans", "[utilities][batch_resource]")
+{
+  ResourceCollection collection("move_with_live_loan");
+  collection.addResource(std::make_unique<MemoryResource>("memory"));
+
+  auto memory = collection.lendResource<MemoryResource>();
+  CHECK_THROWS_AS([&collection] { ResourceCollection moved(std::move(collection)); }(), std::logic_error);
+  CHECK(collection.size() == 1);
+  CHECK(collection.getOutstandingLoanCount() == 1);
+  CHECK(memory.hasResource());
+
+  collection.rewind();
+  collection.takebackResource(memory);
+  ResourceCollection moved(std::move(collection));
+  CHECK(moved.size() == 1);
+  CHECK(moved.getOutstandingLoanCount() == 0);
+  CHECK(collection.size() == 0);
+  CHECK(collection.getOutstandingLoanCount() == 0);
 }
 
 } // namespace qmcplusplus

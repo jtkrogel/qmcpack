@@ -15,6 +15,8 @@
 #include <string>
 #include <memory>
 #include <cstddef>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 #include "Resource.h"
 #include "ResourceHandle.h"
@@ -22,11 +24,18 @@
 
 namespace qmcplusplus
 {
+struct BatchResourcePreparationContext;
+struct DriverWalkerResourceCollection;
+template<class CONSUMER>
+class ResourceCollectionTeamLock;
+
+/** Owns the ordered resource clones lent to one multi-walker consumer family. */
 class ResourceCollection
 {
 public:
   ResourceCollection(const std::string& name);
   ResourceCollection(const ResourceCollection&);
+  ResourceCollection(ResourceCollection&&);
 
   const std::string& getName() const { return name_; }
 
@@ -36,13 +45,21 @@ public:
   size_t addResource(std::unique_ptr<Resource>&& res, bool noprint = false);
   void printResources(std::ostream& os) const;
 
+  /** Prepare every resource transactionally while the collection is idle. */
+  void prepareBatchResources(const BatchResourcePreparationContext& context);
+
   template<class RS>
   ResourceHandle<RS> lendResource()
   {
     const size_t cursor_begin = cursor_index_;
     try
     {
-      return dynamic_cast<RS&>(lendResourceImpl());
+      RS& resource = dynamic_cast<RS&>(lendResourceImpl());
+      ResourceHandle<RS> handle(resource);
+      if (outstanding_loans_ == std::numeric_limits<size_t>::max())
+        throw std::overflow_error("ResourceCollection outstanding loan count overflow");
+      ++outstanding_loans_;
+      return handle;
     }
     catch (...)
     {
@@ -53,20 +70,46 @@ public:
 
   template<class RS>
   void takebackResource(ResourceHandle<RS>& res_handle)
-  { takebackResourceImpl(res_handle.release()); }
+  {
+    // Do not clear the caller's handle until every ownership and ordering
+    // check succeeds.  A failed return remains retryable after a rewind.
+    RS& resource = res_handle.getResource();
+    if (outstanding_loans_ == 0)
+      throw std::logic_error("ResourceCollection has no outstanding resource loan to take back");
+    takebackResourceImpl(resource);
+    res_handle.release();
+    --outstanding_loans_;
+  }
 
   /// Return the next collection slot, for transactional acquisition rollback.
   size_t getCursor() const noexcept { return cursor_index_; }
 
+  /// Return the number of lent resources whose handles have not been returned.
+  size_t getOutstandingLoanCount() const noexcept { return outstanding_loans_; }
+
   void rewind(size_t cursor = 0) { cursor_index_ = cursor; }
 
 private:
+  /** Build a fully prepared clone without changing this collection. */
+  ResourceCollection makePreparedBatchResources(const BatchResourcePreparationContext& context) const;
+
+  /** Publish already-prepared storage without an allocation or exception. */
+  void swapResourceStorage(ResourceCollection& other) noexcept;
+
+  /** Restore the ownership checkpoint after a failed team-lock acquisition. */
+  void restoreOutstandingLoanCount(size_t count) noexcept { outstanding_loans_ = count; }
+
   Resource& lendResourceImpl();
   void takebackResourceImpl(Resource& res);
 
   const std::string name_;
   size_t cursor_index_;
+  size_t outstanding_loans_;
   std::vector<std::unique_ptr<Resource>> collection_;
+
+  friend struct DriverWalkerResourceCollection;
+  template<class CONSUMER>
+  friend class ResourceCollectionTeamLock;
 };
 
 /** handles acquire/release resource by the consumer (RefVectorWithLeader type).
@@ -80,7 +123,11 @@ public:
   ResourceCollectionTeamLock(ResourceCollection& res_ref,
                              const RefVectorWithLeader<CONSUMER>& consumer_ref,
                              size_t cursor = 0)
-      : resource(res_ref), consumer(consumer_ref), cursor_begin_(cursor), active(!res_ref.empty())
+      : resource(res_ref),
+        consumer(consumer_ref),
+        cursor_begin_(cursor),
+        active(!res_ref.empty()),
+        outstanding_loans_begin_(res_ref.getOutstandingLoanCount())
   {
     if (active)
     {
@@ -92,8 +139,10 @@ public:
       catch (...)
       {
         // A consumer owns unwinding any handles it published before throwing.
-        // Restore the shared cursor as a final construction-failure guarantee.
+        // Restore collection traversal and ownership bookkeeping as the final
+        // construction-failure guarantee.
         resource.rewind(cursor_begin_);
+        resource.restoreOutstandingLoanCount(outstanding_loans_begin_);
         throw;
       }
     }
@@ -116,6 +165,7 @@ private:
   const RefVectorWithLeader<CONSUMER>& consumer;
   const size_t cursor_begin_;
   const bool active;
+  const size_t outstanding_loans_begin_;
 };
 
 } // namespace qmcplusplus

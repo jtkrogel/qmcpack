@@ -24,6 +24,53 @@ namespace qmcplusplus
 {
 namespace testing
 {
+/** Test resource that exposes crowd-plan preparation without requiring a walker leader. */
+class CrowdPreparationResource : public Resource
+{
+public:
+  CrowdPreparationResource(const std::string& name, bool fail_on_prepare = false)
+      : Resource(name), fail_on_prepare_(fail_on_prepare)
+  {}
+
+  std::unique_ptr<Resource> makeClone() const override
+  {
+    return std::make_unique<CrowdPreparationResource>(*this);
+  }
+
+  void prepareBatchResource(const BatchResourcePreparationContext& context) override
+  {
+    ++prepare_count;
+    prepared_plan    = context.plan;
+    prepared_crowd   = context.crowd_index;
+    initial_capacity = context.plan ? context.initialWalkerCapacity() : 0;
+    reserve_capacity = context.plan ? context.reserveWalkerCapacity() : 0;
+    if (fail_on_prepare_)
+      throw std::runtime_error("deliberate DriverWalker resource preparation failure");
+  }
+
+  std::shared_ptr<const BatchExecutionPlan> prepared_plan;
+  std::size_t prepared_crowd   = 0;
+  std::size_t initial_capacity = 0;
+  std::size_t reserve_capacity = 0;
+  int prepare_count            = 0;
+
+private:
+  bool fail_on_prepare_;
+};
+
+/** Build a storage-free plan suitable for driver resource lifecycle tests. */
+std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationPlan(std::vector<std::size_t> initial_walkers,
+                                                                  std::vector<std::size_t> reserve_walkers)
+{
+  BatchExecutionSelectionInput input;
+  input.topology.initial_walkers_per_crowd = std::move(initial_walkers);
+  input.topology.reserve_walkers_per_crowd = std::move(reserve_walkers);
+  return std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(input, [](const BatchExecutionPlanningContext&) {
+        return std::vector<BatchMemoryParticipantContribution>{};
+      }));
+}
+
 class CrowdWithWalkers
 {
 public:
@@ -103,6 +150,75 @@ TEST_CASE("Crowd redistribute walkers")
     crowd.addWalker(*crowd_with_walkers.walkers[iw], *crowd_with_walkers.psets[iw], *crowd_with_walkers.twfs[iw],
                     *crowd_with_walkers.hams[iw]);
   REQUIRE(crowd.size() == 3);
+}
+
+TEST_CASE("Crowd prepares reserve resources without a living walker", "[drivers][batch_resource]")
+{
+  using namespace testing;
+  SetupPools pools;
+  EstimatorManagerNew estimator_manager(pools.hamiltonian_pool->getHamiltonian().value(), pools.comm);
+
+  DriverWalkerResourceCollection golden_resources;
+  golden_resources.pset_res.addResource(std::make_unique<CrowdPreparationResource>("zero_walker_resource"));
+
+  Crowd crowd(estimator_manager, golden_resources, *pools.particle_pool->getParticleSet("e"),
+              pools.wavefunction_pool->getWaveFunction().value(),
+              pools.hamiltonian_pool->getHamiltonian().value());
+  REQUIRE(crowd.size() == 0);
+  crowd.reserve(5);
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeCrowdPreparationPlan({0}, {5});
+  crowd.getSharedResource().prepareBatchResources({plan, 0});
+
+  ResourceCollection& particle_resources = crowd.getSharedResource().pset_res;
+  auto prepared = particle_resources.lendResource<CrowdPreparationResource>();
+  CHECK(prepared.getResource().prepare_count == 1);
+  CHECK(prepared.getResource().prepared_plan.get() == plan.get());
+  CHECK(prepared.getResource().prepared_crowd == 0);
+  CHECK(prepared.getResource().initial_capacity == 0);
+  CHECK(prepared.getResource().reserve_capacity == 5);
+  particle_resources.rewind();
+  particle_resources.takebackResource(prepared);
+
+  // A later no-policy section still visits the clone and clears its prior plan.
+  crowd.getSharedResource().prepareBatchResources({nullptr, 17});
+  prepared = particle_resources.lendResource<CrowdPreparationResource>();
+  CHECK(prepared.getResource().prepare_count == 2);
+  CHECK_FALSE(prepared.getResource().prepared_plan);
+  CHECK(prepared.getResource().prepared_crowd == 17);
+  particle_resources.rewind();
+  particle_resources.takebackResource(prepared);
+}
+
+TEST_CASE("DriverWalker resource preparation is atomic across families", "[drivers][batch_resource]")
+{
+  using namespace testing;
+  DriverWalkerResourceCollection resources;
+  resources.pset_res.addResource(std::make_unique<CrowdPreparationResource>("particle"));
+  resources.twf_res.addResource(std::make_unique<CrowdPreparationResource>("throwing_wavefunction", true));
+  resources.ham_res.addResource(std::make_unique<CrowdPreparationResource>("hamiltonian"));
+
+  const std::shared_ptr<const BatchExecutionPlan> plan = makeCrowdPreparationPlan({0}, {3});
+  CHECK_THROWS_AS(resources.prepareBatchResources({plan, 0}), std::runtime_error);
+
+  // The particle candidate completed, but failure in the next family prevented
+  // publication in all three original collections.
+  auto particle = resources.pset_res.lendResource<CrowdPreparationResource>();
+  auto wavefunction = resources.twf_res.lendResource<CrowdPreparationResource>();
+  auto hamiltonian = resources.ham_res.lendResource<CrowdPreparationResource>();
+  CHECK(particle.getResource().prepare_count == 0);
+  CHECK(wavefunction.getResource().prepare_count == 0);
+  CHECK(hamiltonian.getResource().prepare_count == 0);
+  CHECK_FALSE(particle.getResource().prepared_plan);
+  CHECK_FALSE(wavefunction.getResource().prepared_plan);
+  CHECK_FALSE(hamiltonian.getResource().prepared_plan);
+
+  resources.pset_res.rewind();
+  resources.pset_res.takebackResource(particle);
+  resources.twf_res.rewind();
+  resources.twf_res.takebackResource(wavefunction);
+  resources.ham_res.rewind();
+  resources.ham_res.takebackResource(hamiltonian);
 }
 
 } // namespace qmcplusplus
