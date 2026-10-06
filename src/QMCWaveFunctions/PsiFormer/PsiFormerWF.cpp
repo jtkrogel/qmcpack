@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cassert>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -148,6 +150,14 @@ constexpr std::uint64_t PERSISTENT_FINGERPRINT_OFFSET = UINT64_C(146959810393466
 
 /// Prime used by deterministic FNV-1a identities stored in walker buffers.
 constexpr std::uint64_t PERSISTENT_FINGERPRINT_PRIME = UINT64_C(1099511628211);
+
+/// Keep ephemeral selected-team identities disjoint from persistent model/configuration hashes.
+constexpr std::uint64_t SELECTED_TEAM_FINGERPRINT_DOMAIN =
+    UINT64_C(0x5053464c414e4531); // "PSFLANE1"
+
+/// Keep a descriptor-bound selected transaction disjoint from its owning team identity.
+constexpr std::uint64_t SELECTED_TRANSACTION_FINGERPRINT_DOMAIN =
+    UINT64_C(0x50534654584e3031); // "PSFTXN01"
 
 /// Identify the fixed scalar record layout used by the Stage-8 walker buffer.
 constexpr std::uint64_t WALKER_BUFFER_MAGIC = UINT64_C(0x505349464f524d38);
@@ -444,6 +454,9 @@ public:
   {}
 
   mutable std::shared_mutex mutex;
+  /// Number of pending planned selected crowd transactions sharing this model.
+  /// Each crowd checks in once, never once per lane.
+  std::atomic<std::size_t> planned_selected_transaction_count{0};
   pf::PsiFormer model;
   /// Whether the initial model came from the legacy HDF5 import or an internal initializer.
   const std::string model_origin;
@@ -2318,6 +2331,7 @@ std::size_t PsiFormerWF::publishParameters(
     const wftrain::StructuredParameterSnapshot& candidate,
     std::size_t expected_version)
 {
+  requireNoPlannedSelectedProposalMutation("structured parameter publication");
   if (candidate.schema_fingerprint != structured_parameter_schema_->fingerprint())
     throw std::invalid_argument("PsiFormer structured update has an incompatible schema fingerprint");
   if (candidate.values.size() != structured_parameter_schema_->parameterCount())
@@ -2326,6 +2340,7 @@ std::size_t PsiFormerWF::publishParameters(
     throw std::invalid_argument("PsiFormer structured update candidate has the wrong source version");
 
   std::unique_lock state_lock(model_state_->mutex);
+  requireNoPlannedSelectedProposalMutation("structured parameter publication");
   pf::Parameters& parameters = model_state_->model.p;
   if (parameters.version() != expected_version)
     throw std::runtime_error("PsiFormer structured update rejected a stale parameter version");
@@ -2498,6 +2513,13 @@ void PsiFormerWF::releaseResource(
   auto& resource = leader.mw_resource_handle_.getResource();
   if (resource.prepared_plan)
   {
+    for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    {
+      const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+      if (component.has_proposal_ || component.proposal_origin_ != ProposalOrigin::NONE)
+        throw std::logic_error(
+            "Cannot release a planned PsiFormer crowd resource while a proposal is pending");
+    }
     if (!resource.hasExactPreparedStagingExtents() ||
         resource.currentStorageFingerprint() !=
             resource.prepared_storage_fingerprint)
@@ -2577,6 +2599,53 @@ PsiFormerWF::PsiFormerMultiWalkerResource& PsiFormerWF::requireMultiWalkerResour
   return resource;
 }
 
+// Fingerprint the exact ephemeral component/PSet team established at acquisition.
+std::uint64_t PsiFormerWF::selectedTeamFingerprint(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list) const noexcept
+{
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  const auto mix_pointer = [&hash](const void* pointer) noexcept {
+    mixPersistentInteger(
+        hash, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer)));
+  };
+  mixPersistentInteger(hash, SELECTED_TEAM_FINGERPRINT_DOMAIN);
+  mixPersistentInteger(hash, wfc_list.size());
+  mix_pointer(this);
+  mix_pointer(model_state_.get());
+  mixPersistentInteger(hash, model_state_->persistent_model_identity);
+  const BatchExecutionPlan& plan = batch_execution_plan_.plan();
+  mix_pointer(&plan);
+  mixPersistentInteger(hash, plan.fingerprint());
+  mix_pointer(acquired_resource_collection_);
+  mixPersistentInteger(hash, acquired_resource_cursor_);
+  mixPersistentInteger(hash, acquired_resource_outstanding_loans_);
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+    mix_pointer(&component);
+    mix_pointer(component.acquired_crowd_leader_);
+    mixPersistentInteger(hash, component.acquired_lane_index_);
+    mixPersistentInteger(hash, component.acquired_crowd_size_);
+    mix_pointer(component.bound_particle_set_);
+    mix_pointer(&p_list[lane]);
+  }
+  return hash;
+}
+
+// Bind a selected descriptor to one exact acquired component/PSet team.
+std::uint64_t PsiFormerWF::selectedTransactionFingerprint(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::uint64_t descriptor_fingerprint) const noexcept
+{
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  mixPersistentInteger(hash, SELECTED_TRANSACTION_FINGERPRINT_DOMAIN);
+  mixPersistentInteger(hash, descriptor_fingerprint);
+  mixPersistentInteger(hash, selectedTeamFingerprint(wfc_list, p_list));
+  return hash;
+}
+
 // Map each typed operation to the explicit modes that authorize its runtime path.
 BatchExecutionRequirements PsiFormerWF::plannedOperationRequiredModes(
     PlannedOperation operation) noexcept
@@ -2618,6 +2687,7 @@ BatchExecutionRequirements PsiFormerWF::plannedOperationRequiredModes(
     break;
   case PlannedOperation::ACCEPT_REJECT_VALUE:
   case PlannedOperation::SELECTED_RESOLVE:
+  case PlannedOperation::SELECTED_CANCEL:
   case PlannedOperation::BUFFER_READ:
   case PlannedOperation::BUFFER_WRITE:
   case PlannedOperation::PREPARE_GROUP:
@@ -2636,6 +2706,7 @@ PsiFormerWF::ProposalRequirement PsiFormerWF::plannedOperationProposalRequiremen
   case PlannedOperation::ACCEPT_REJECT_VALUE:
     return ProposalRequirement::SINGLE_PENDING;
   case PlannedOperation::SELECTED_RESOLVE:
+  case PlannedOperation::SELECTED_CANCEL:
     return ProposalRequirement::SELECTED_PENDING;
   case PlannedOperation::FULL_VGL:
   case PlannedOperation::RECOMPUTE_VALUE:
@@ -2941,6 +3012,7 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
     break;
   case PlannedOperation::ACCEPT_REJECT_VALUE:
   case PlannedOperation::SELECTED_RESOLVE:
+  case PlannedOperation::SELECTED_CANCEL:
   case PlannedOperation::ECP_VALUE:
   case PlannedOperation::ECP_WEIGHTED_SCORE:
   case PlannedOperation::BUFFER_READ:
@@ -3014,10 +3086,35 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
 
   const bool selected_operation =
       request.operation == PlannedOperation::SELECTED_PROPOSE ||
-      request.operation == PlannedOperation::SELECTED_RESOLVE;
+      request.operation == PlannedOperation::SELECTED_RESOLVE ||
+      request.operation == PlannedOperation::SELECTED_CANCEL;
   if (selected_operation != request.descriptor_fingerprint.has_value())
     throw std::invalid_argument(
         "PsiFormer selected-operation descriptor identity is absent or unexpected");
+
+  const bool consumes_selected_proposal =
+      request.operation == PlannedOperation::SELECTED_RESOLVE ||
+      request.operation == PlannedOperation::SELECTED_CANCEL;
+  if (consumes_selected_proposal !=
+      request.expected_proposal_version.has_value())
+    throw std::invalid_argument(
+        "PsiFormer selected proposal-version token is absent or unexpected");
+
+  const std::optional<std::uint64_t> selected_transaction_fingerprint =
+      selected_operation
+      ? std::optional<std::uint64_t>(selectedTransactionFingerprint(
+            wfc_list, p_list, *request.descriptor_fingerprint))
+      : std::nullopt;
+
+  if (selected_operation)
+  {
+    const std::size_t pending_selected_transactions =
+        model_state_->planned_selected_transaction_count.load(
+            std::memory_order_acquire);
+    if (consumes_selected_proposal && pending_selected_transactions == 0)
+      throw std::logic_error(
+          "PsiFormer planned selected operation has inconsistent shared transaction state");
+  }
 
   const ProposalRequirement expected_proposal =
       plannedOperationProposalRequirement(request.operation);
@@ -3029,13 +3126,15 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
     case ProposalRequirement::NONE:
       break;
     case ProposalRequirement::ABSENT:
-      if (component.has_proposal_ || component.proposal_kind_ != ProposalKind::NONE)
+      if (component.has_proposal_ ||
+          component.proposal_origin_ != ProposalOrigin::NONE)
         throw std::logic_error(
             "PsiFormer planned operation requires absent proposal state");
       break;
     case ProposalRequirement::SINGLE_PENDING:
       if (!component.has_proposal_ ||
-          component.proposal_kind_ != ProposalKind::SINGLE_PARTICLE ||
+          (component.proposal_origin_ != ProposalOrigin::MW_CALC_RATIO_VALUE &&
+           component.proposal_origin_ != ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE) ||
           component.proposed_particle_ != static_cast<int>(*request.active_electron) ||
           component.proposed_parameter_version_ !=
               component.observed_parameter_version_)
@@ -3044,9 +3143,11 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
       break;
     case ProposalRequirement::SELECTED_PENDING:
       if (!component.has_proposal_ ||
-          component.proposal_kind_ != ProposalKind::SELECTED_PARTICLES ||
+          component.proposal_origin_ != ProposalOrigin::MW_SELECTED_FULL_VGL ||
           component.proposed_descriptor_fingerprint_ !=
-              *request.descriptor_fingerprint ||
+              *selected_transaction_fingerprint ||
+          component.proposed_parameter_version_ !=
+              *request.expected_proposal_version ||
           component.proposed_parameter_version_ !=
               component.observed_parameter_version_)
         throw std::logic_error(
@@ -3058,7 +3159,93 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
   if (storage_fingerprint != resource.currentStorageFingerprint())
     throw std::logic_error(
         "PsiFormer planned operation resource storage changed during preflight");
-  return {resource, batch_execution_plan_, crowd, storage_fingerprint};
+  return {resource, batch_execution_plan_, crowd, storage_fingerprint,
+          selected_transaction_fingerprint};
+}
+
+// Publish only selected lifecycle provenance while holding the model read barrier.
+PsiFormerWF::PlannedSelectedProposalEvidence
+PsiFormerWF::publishPlannedSelectedProposalMetadata(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::uint64_t descriptor_fingerprint) const
+{
+  PlannedRuntimeRequest request;
+  request.operation              = PlannedOperation::SELECTED_PROPOSE;
+  request.live_walkers           = wfc_list.size();
+  request.descriptor_fingerprint = descriptor_fingerprint;
+  const PlannedRuntimeAccess access =
+      requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+
+  PsiFormerReadTransaction transaction(*model_state_);
+  const std::size_t proposal_version = transaction.parameterVersion();
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    if (static_cast<const PsiFormerWF&>(wfc_list[lane])
+            .observed_parameter_version_ != proposal_version)
+      throw std::logic_error(
+          "PsiFormer planned selected proposal has stale clone parameter state");
+
+  std::size_t pending_transactions =
+      model_state_->planned_selected_transaction_count.load(
+          std::memory_order_acquire);
+  do
+  {
+    if (pending_transactions == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error(
+          "PsiFormer planned selected transaction count overflow");
+  } while (!model_state_->planned_selected_transaction_count
+                .compare_exchange_weak(
+                    pending_transactions, pending_transactions + 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire));
+
+  const std::uint64_t transaction_fingerprint =
+      *access.selected_transaction_fingerprint;
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+    component.proposed_descriptor_fingerprint_ = transaction_fingerprint;
+    component.proposed_parameter_version_      = proposal_version;
+    component.proposed_particle_               = -1;
+    component.proposal_origin_                 = ProposalOrigin::MW_SELECTED_FULL_VGL;
+  }
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    static_cast<PsiFormerWF&>(wfc_list[lane]).has_proposal_ = true;
+  return {transaction_fingerprint, proposal_version};
+}
+
+// Abandon a selected planned transaction only after proving its full provenance.
+void PsiFormerWF::cancelPlannedSelectedProposal(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const MCMultiParticleMoves<CoordsType::POS>& moves,
+    std::size_t expected_proposal_version) const
+{
+  moves.validateFor(p_list);
+  PlannedRuntimeRequest request;
+  request.operation                 = PlannedOperation::SELECTED_CANCEL;
+  request.live_walkers              = wfc_list.size();
+  request.descriptor_fingerprint    = moves.fingerprint();
+  request.expected_proposal_version = expected_proposal_version;
+  requirePlannedMultiWalkerOperation(wfc_list, p_list, request);
+
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    static_cast<PsiFormerWF&>(wfc_list[lane]).resetProposalMetadata();
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    static_cast<PsiFormerWF&>(wfc_list[lane]).has_proposal_ = false;
+
+  std::size_t pending_transactions =
+      model_state_->planned_selected_transaction_count.load(
+          std::memory_order_acquire);
+  for (;;)
+  {
+    assert(pending_transactions != 0);
+    if (pending_transactions == 0)
+      std::terminate();
+    if (model_state_->planned_selected_transaction_count.compare_exchange_weak(
+            pending_transactions, pending_transactions - 1,
+            std::memory_order_release, std::memory_order_acquire))
+      break;
+  }
 }
 
 // Expose only ownership counts needed to prove bounded crowd scratch in a regression test.
@@ -3302,11 +3489,17 @@ void PsiFormerWF::invalidateParameterCaches(std::size_t parameter_version)
 void PsiFormerWF::synchronizeParameterVersion(std::size_t parameter_version)
 {
   if (observed_parameter_version_ != parameter_version)
+  {
+    if (batch_execution_plan_ && has_proposal_ &&
+        proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL)
+      throw std::logic_error(
+          "PsiFormer planned selected proposal cannot be cleared by parameter-version synchronization");
     invalidateParameterCaches(parameter_version);
+  }
 }
 
-// Drop all proposal discriminators while preserving reusable complete-VGL storage.
-void PsiFormerWF::clearProposalState()
+// Reset proposal metadata without withdrawing the externally visible pending marker.
+void PsiFormerWF::resetProposalMetadata() noexcept
 {
   proposed_sign_                   = 1.0;
   proposed_log_value_              = LogValue(0);
@@ -3314,33 +3507,59 @@ void PsiFormerWF::clearProposalState()
   proposed_descriptor_fingerprint_ = 0;
   proposed_parameter_version_      = 0;
   proposed_particle_               = -1;
-  proposal_kind_                   = ProposalKind::NONE;
-  has_proposal_                    = false;
+  proposal_origin_                 = ProposalOrigin::NONE;
 }
 
-// Retain the legacy one-electron proposal behind the same explicit discriminator.
+// Drop all proposal discriminators while preserving reusable complete-VGL storage.
+void PsiFormerWF::clearProposalState() noexcept
+{
+  resetProposalMetadata();
+  has_proposal_ = false;
+}
+
+// Retain a one-electron proposal behind its exact scalar or crowd origin.
 void PsiFormerWF::cacheSingleParticleProposal(double sign,
                                               double logabs,
                                               std::uint64_t configuration_identity,
                                               int particle,
-                                              std::size_t parameter_version)
+                                              std::size_t parameter_version,
+                                              ProposalOrigin origin)
 {
+  if (origin != ProposalOrigin::SCALAR_RATIO_VALUE &&
+      origin != ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE &&
+      origin != ProposalOrigin::MW_CALC_RATIO_VALUE &&
+      origin != ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE)
+    throw std::invalid_argument(
+        "PsiFormer one-electron proposal has an incompatible origin");
   proposed_sign_                   = sign;
   proposed_log_value_              = makeLogValue(sign, logabs);
   proposed_configuration_identity_ = configuration_identity;
   proposed_descriptor_fingerprint_ = 0;
   proposed_parameter_version_      = parameter_version;
   proposed_particle_               = particle;
-  proposal_kind_                   = ProposalKind::SINGLE_PARTICLE;
+  proposal_origin_                 = origin;
   has_proposal_                    = true;
 }
 
 // Selected transactions must be resolved rather than silently replaced by another lifecycle call.
 void PsiFormerWF::requireNoSelectedParticleProposal(const char* operation) const
 {
-  if (has_proposal_ && proposal_kind_ == ProposalKind::SELECTED_PARTICLES)
+  if (has_proposal_ && proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL)
     throw std::logic_error(std::string("PsiFormer ") + operation +
                            " cannot run while a selected-electron proposal is pending");
+}
+
+// Planned selected state is crowd-owned and cannot be cleared by one parameter publisher.
+void PsiFormerWF::requireNoPlannedSelectedProposalMutation(
+    const char* operation) const
+{
+  if (model_state_->planned_selected_transaction_count.load(
+          std::memory_order_acquire) != 0 ||
+      (batch_execution_plan_ && has_proposal_ &&
+       proposal_origin_ == ProposalOrigin::MW_SELECTED_FULL_VGL))
+    throw std::logic_error(
+        std::string("PsiFormer ") + operation +
+        " cannot mutate parameters while a planned selected-electron proposal is pending");
 }
 
 // Prepare clone-local complete proposal products before the transaction is published.
@@ -3520,8 +3739,10 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
 {
   if (!optimization_metadata_->enabled)
     return;
+  requireNoPlannedSelectedProposalMutation("optimizer reset");
 
   std::unique_lock state_lock(model_state_->mutex);
+  requireNoPlannedSelectedProposalMutation("optimizer reset");
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   pf::Parameters& parameters = model_state_->model.p;
   const auto& selected_flat_indices = optimization_metadata_->selected_flat_indices;
@@ -3675,6 +3896,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
 {
   if (!optimization_metadata_->enabled)
     return;
+  requireNoPlannedSelectedProposalMutation("variational-parameter restore");
   if (!input.is_group("PsiFormer"))
     throw std::runtime_error("PsiFormer VP file has no PsiFormer object group");
 
@@ -3718,6 +3940,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   input.pop();
 
   std::unique_lock state_lock(model_state_->mutex);
+  requireNoPlannedSelectedProposalMutation("variational-parameter restore");
   std::unique_lock metadata_lock(optimization_metadata_->mutex);
   pf::PsiFormer& model = model_state_->model;
 
@@ -3817,6 +4040,10 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
           "PsiFormer runtime ionic/effective charges do not match the exported model; use an export trained for this pseudopotential system");
   }
 
+  if ((bound_particle_set_ != &electrons || system_kind_ != system_kind) &&
+      (has_proposal_ || proposal_origin_ != ProposalOrigin::NONE))
+    throw std::logic_error(
+        "Cannot rebind a PsiFormer system while a proposal is pending");
   system_kind_ = system_kind;
   bound_particle_set_ = &electrons;
   app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": validated " << system_kind_
@@ -4758,6 +4985,8 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
     const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
 {
+  if (batch_execution_plan_)
+    throw std::logic_error("PsiFormer planned selected-electron proposal is not implemented");
   const std::size_t walker_count = wfc_list.size();
   if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
       log_ratios.size() != walker_count || proposed_gradient_list.size() != walker_count ||
@@ -4971,7 +5200,7 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
     component.proposed_descriptor_fingerprint_ = descriptor_fingerprint;
     component.proposed_parameter_version_      = parameter_version;
     component.proposed_particle_               = -1;
-    component.proposal_kind_                   = ProposalKind::SELECTED_PARTICLES;
+    component.proposal_origin_                 = ProposalOrigin::MW_SELECTED_FULL_VGL;
     component.has_proposal_                    = true;
     log_ratios[walker]                         = staged_log_ratios[walker];
 
@@ -4992,6 +5221,8 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
     const MCMultiParticleMoves<CoordsType::POS>& moves,
     const std::vector<bool>& accepted) const
 {
+  if (batch_execution_plan_)
+    throw std::logic_error("PsiFormer planned selected-electron resolution is not implemented");
   const std::size_t walker_count = wfc_list.size();
   if (p_list.size() != walker_count || moves.walkerCount() != walker_count ||
       accepted.size() != walker_count)
@@ -5019,7 +5250,7 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
   {
     auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
     if (!component.has_proposal_ ||
-        component.proposal_kind_ != ProposalKind::SELECTED_PARTICLES)
+        component.proposal_origin_ != ProposalOrigin::MW_SELECTED_FULL_VGL)
       throw std::logic_error(
           "PsiFormer selected-electron resolution has no matching pending proposal");
     if (component.proposed_descriptor_fingerprint_ != descriptor_fingerprint)
@@ -5062,8 +5293,11 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
       component.accepted_state_requirement_      = AcceptedStateRequirement::FULL_SPATIAL;
       component.accepted_value_valid_            = true;
     }
-    component.clearProposalState();
   }
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).resetProposalMetadata();
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).has_proposal_ = false;
 }
 
 void PsiFormerWF::mw_recompute(
@@ -5172,7 +5406,7 @@ PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
     // network.
     cacheSingleParticleProposal(
         sign, logabs, configurationIdentity(p, iat), iat,
-        transaction.parameterVersion());
+        transaction.parameterVersion(), ProposalOrigin::SCALAR_RATIO_VALUE);
     return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
   };
 
@@ -5274,7 +5508,8 @@ void PsiFormerWF::mw_calcRatio(
     auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
     component.cacheSingleParticleProposal(
         staged_sign[walker], staged_logabs[walker],
-        staged_configuration[walker], particle_index, parameter_version);
+        staged_configuration[walker], particle_index, parameter_version,
+        ProposalOrigin::MW_CALC_RATIO_VALUE);
   }
 }
 
@@ -5401,7 +5636,8 @@ PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& 
     // gradient.
     cacheSingleParticleProposal(
         sign, logabs, configurationIdentity(p, iat), iat,
-        transaction.parameterVersion());
+        transaction.parameterVersion(),
+        ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE);
     for (int dimension = 0; dimension < 3; ++dimension)
       gradient[dimension] += active_gradient[dimension];
     return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
@@ -5516,7 +5752,8 @@ void PsiFormerWF::mw_ratioGrad(
     auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
     component.cacheSingleParticleProposal(
         staged_sign[walker], staged_logabs[walker],
-        staged_configuration[walker], particle_index, parameter_version);
+        staged_configuration[walker], particle_index, parameter_version,
+        ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE);
     gradients[walker] += staged_gradients[walker];
   }
 }
@@ -5528,9 +5765,10 @@ void PsiFormerWF::acceptMove(ParticleSet& particles, int particle_index, bool)
   synchronizeParameterVersion(transaction.parameterVersion());
   if (has_proposal_)
   {
-    if (proposal_kind_ != ProposalKind::SINGLE_PARTICLE)
+    if (proposal_origin_ != ProposalOrigin::SCALAR_RATIO_VALUE &&
+        proposal_origin_ != ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE)
       throw std::logic_error(
-          "PsiFormer single-electron accept cannot resolve a selected-electron proposal");
+          "PsiFormer scalar single-electron accept cannot resolve a proposal from a different origin");
     if (proposed_parameter_version_ != observed_parameter_version_ ||
         particle_index != proposed_particle_ ||
         proposed_configuration_identity_ != configurationIdentity(particles, particle_index))
@@ -5555,9 +5793,10 @@ void PsiFormerWF::restore(int particle_index)
   synchronizeParameterVersion(transaction.parameterVersion());
   if (has_proposal_)
   {
-    if (proposal_kind_ != ProposalKind::SINGLE_PARTICLE)
+    if (proposal_origin_ != ProposalOrigin::SCALAR_RATIO_VALUE &&
+        proposal_origin_ != ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE)
       throw std::logic_error(
-          "PsiFormer single-electron restore cannot resolve a selected-electron proposal");
+          "PsiFormer scalar single-electron restore cannot resolve a proposal from a different origin");
     if (proposed_parameter_version_ != observed_parameter_version_ ||
         particle_index != proposed_particle_)
       throw std::logic_error("PsiFormer restored move does not match the cached proposal");
@@ -5589,9 +5828,10 @@ void PsiFormerWF::mw_accept_rejectMove(
       throw std::invalid_argument("PsiFormer accept/reject list contains components from different models");
     component.synchronizeParameterVersion(parameter_version);
     if (component.has_proposal_ &&
-        component.proposal_kind_ != ProposalKind::SINGLE_PARTICLE)
+        component.proposal_origin_ != ProposalOrigin::MW_CALC_RATIO_VALUE &&
+        component.proposal_origin_ != ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE)
       throw std::logic_error(
-          "PsiFormer crowd single-electron resolution cannot resolve a selected-electron proposal");
+          "PsiFormer crowd single-electron resolution cannot resolve a proposal from a different origin");
     if (component.has_proposal_ &&
         (component.proposed_parameter_version_ != parameter_version ||
          component.proposed_particle_ != particle_index))
@@ -5614,8 +5854,11 @@ void PsiFormerWF::mw_accept_rejectMove(
       component.accepted_parameter_version_      = parameter_version;
       component.accepted_state_requirement_      = AcceptedStateRequirement::VALUE_ONLY;
     }
-    component.clearProposalState();
   }
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).resetProposalMetadata();
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    wfc_list.getCastedElement<PsiFormerWF>(walker).has_proposal_ = false;
 }
 
 // Reserve fixed bulk and scalar slots without assuming that registration follows evaluation.

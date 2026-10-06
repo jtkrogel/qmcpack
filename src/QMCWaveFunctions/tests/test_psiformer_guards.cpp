@@ -143,6 +143,38 @@ TEST_CASE("PsiFormer system validation rejects periodic electron and source-ion 
   }
 }
 
+TEST_CASE("PsiFormer system rebinding preserves a pending proposal",
+          "[wavefunction][psiformer][hardening][lifecycle]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell open_cell;
+  ParticleSet electrons = makeMassTaggedElectrons(open_cell, 1.0, 1.0);
+  ParticleSet rebound_electrons(electrons);
+  auto ions = makeGuardTestIons(open_cell);
+  PsiFormerWF component("pf_guard", files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+
+  ParticleSet::ParticleGradient gradient(electrons.getTotalNum());
+  ParticleSet::ParticleLaplacian laplacian(electrons.getTotalNum());
+  gradient = QMCTraits::ValueType(0);
+  laplacian = QMCTraits::ValueType(0);
+  component.evaluateLog(electrons, gradient, laplacian);
+  electrons.makeMove(0, ParticleSet::PosType{0.01, -0.005, 0.002});
+  component.ratio(electrons, 0);
+
+  CHECK_THROWS_WITH(
+      component.validateSystem(rebound_electrons, *ions, "all_electron"),
+      Catch::Matchers::ContainsSubstring("proposal is pending"));
+
+  // The failed rebind did not consume the proposal; its original scalar
+  // resolver remains valid, after which the same rebind succeeds.
+  CHECK_NOTHROW(component.restore(0));
+  electrons.rejectMove(0);
+  CHECK_NOTHROW(component.validateSystem(
+      rebound_electrons, *ions, "all_electron"));
+}
+
 TEST_CASE("PsiFormer rejects both source-gradient force interfaces",
           "[wavefunction][psiformer][hardening][capability]")
 {

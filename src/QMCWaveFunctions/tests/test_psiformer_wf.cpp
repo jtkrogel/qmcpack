@@ -73,8 +73,8 @@ public:
   /// Install a pending selected proposal without running an unrelated evaluator.
   static void markSelectedProposalPending(PsiFormerWF& component)
   {
-    component.proposal_kind_ = PsiFormerWF::ProposalKind::SELECTED_PARTICLES;
-    component.has_proposal_  = true;
+    component.proposal_origin_ = PsiFormerWF::ProposalOrigin::MW_SELECTED_FULL_VGL;
+    component.has_proposal_    = true;
   }
 
   /// Restore the ordinary idle lifecycle after a transition-guard check.

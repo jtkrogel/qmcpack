@@ -22,6 +22,7 @@
 #include "ResourceCollection.h"
 #include "Utilities/BatchResourcePreparation.h"
 #include "Utilities/RuntimeOptions.h"
+#include "io/hdf/hdf_archive.h"
 #include "psiformer_test_utils.h"
 
 #include <algorithm>
@@ -67,7 +68,7 @@ struct PsiFormerCloneStateSnapshot
   std::uint64_t proposed_descriptor_fingerprint;
   std::size_t proposed_parameter_version;
   int proposed_particle;
-  std::uint64_t proposal_kind;
+  std::uint64_t proposal_origin;
   bool has_proposal;
 };
 
@@ -83,6 +84,24 @@ struct PsiFormerPreparedCloneStorage
 class TestPsiFormerVirtualBatch
 {
 public:
+  /// Public test spelling of the private proposal-origin discriminator.
+  enum class ProposalOrigin
+  {
+    NONE,
+    SCALAR_RATIO_VALUE,
+    SCALAR_RATIO_GRADIENT_ACTIVE,
+    MW_CALC_RATIO_VALUE,
+    MW_RATIO_GRADIENT_ACTIVE,
+    MW_SELECTED_FULL_VGL
+  };
+
+  /// Exact fingerprint and version returned by the lifecycle-only proposal seam.
+  struct SelectedProposalEvidence
+  {
+    std::uint64_t transaction_fingerprint;
+    std::size_t proposal_version;
+  };
+
   /// Public test spelling of the private typed runtime-operation discriminator.
   enum class RuntimeOperation
   {
@@ -94,6 +113,7 @@ public:
     ACCEPT_REJECT_VALUE,
     SELECTED_PROPOSE,
     SELECTED_RESOLVE,
+    SELECTED_CANCEL,
     ECP_VALUE,
     ECP_WEIGHTED_SCORE,
     SCORE_DERIVATIVES,
@@ -117,6 +137,7 @@ public:
     std::size_t derivative_width = 0;
     std::optional<std::size_t> active_electron;
     std::optional<std::uint64_t> descriptor_fingerprint;
+    std::optional<std::size_t> expected_proposal_version;
   };
 
   static PsiFormerCloneStateSnapshot cloneState(const PsiFormerWF& component)
@@ -139,7 +160,7 @@ public:
             component.proposed_descriptor_fingerprint_,
             component.proposed_parameter_version_,
             component.proposed_particle_,
-            static_cast<std::uint64_t>(component.proposal_kind_),
+            static_cast<std::uint64_t>(component.proposal_origin_),
             component.has_proposal_};
   }
 
@@ -207,7 +228,7 @@ public:
         component.proposed_descriptor_fingerprint_ != snapshot.proposed_descriptor_fingerprint ||
         component.proposed_parameter_version_ != snapshot.proposed_parameter_version ||
         component.proposed_particle_ != snapshot.proposed_particle ||
-        static_cast<std::uint64_t>(component.proposal_kind_) != snapshot.proposal_kind ||
+        static_cast<std::uint64_t>(component.proposal_origin_) != snapshot.proposal_origin ||
         component.has_proposal_ != snapshot.has_proposal)
       return false;
 
@@ -228,10 +249,21 @@ public:
   static void bindParticleSet(PsiFormerWF& component, const ParticleSet& particles)
   { component.bound_particle_set_ = &particles; }
 
+  /// Corrupt one acquisition marker long enough to test exact lane validation.
+  static void setAcquiredLaneIndex(PsiFormerWF& component, std::size_t lane)
+  { component.acquired_lane_index_ = lane; }
+
   /// Rebind metadata only long enough to exercise shared-identity validation.
   static void useOptimizationMetadata(PsiFormerWF& component,
                                       const PsiFormerWF& donor)
   { component.optimization_metadata_ = donor.optimization_metadata_; }
+
+  /// Share a model between independently acquired test crowds.
+  static void useSharedModelState(PsiFormerWF& component, const PsiFormerWF& donor)
+  {
+    component.model_state_ = donor.model_state_;
+    component.observed_parameter_version_ = donor.observed_parameter_version_;
+  }
 
   /// Invoke only the read-only common planned-runtime boundary.
   static std::size_t requirePlannedRuntime(
@@ -241,31 +273,122 @@ public:
       const RuntimeRequest& request)
   {
     PsiFormerWF::PlannedRuntimeRequest private_request;
-    private_request.operation = operation(request.operation);
-    private_request.live_walkers = request.live_walkers;
-    private_request.dense_configurations = request.dense_configurations;
-    private_request.sparse_references = request.sparse_references;
-    private_request.sparse_replacements = request.sparse_replacements;
-    private_request.selected_parameters = request.selected_parameters;
-    private_request.derivative_width = request.derivative_width;
-    private_request.active_electron = request.active_electron;
-    private_request.descriptor_fingerprint = request.descriptor_fingerprint;
+    private_request.operation                 = operation(request.operation);
+    private_request.live_walkers              = request.live_walkers;
+    private_request.dense_configurations      = request.dense_configurations;
+    private_request.sparse_references         = request.sparse_references;
+    private_request.sparse_replacements       = request.sparse_replacements;
+    private_request.selected_parameters       = request.selected_parameters;
+    private_request.derivative_width          = request.derivative_width;
+    private_request.active_electron           = request.active_electron;
+    private_request.descriptor_fingerprint    = request.descriptor_fingerprint;
+    private_request.expected_proposal_version = request.expected_proposal_version;
     return component
         .requirePlannedMultiWalkerOperation(wfc_list, p_list, private_request)
         .storage_fingerprint;
   }
 
-  /// Install and clear one coherent pending proposal to test absence guards.
+  /// Install one coherent crowd single-particle proposal to test absence guards.
   static void installSingleProposal(PsiFormerWF& component, int electron)
   {
-    component.has_proposal_ = true;
-    component.proposal_kind_ = PsiFormerWF::ProposalKind::SINGLE_PARTICLE;
-    component.proposed_particle_ = electron;
+    component.proposal_origin_            = PsiFormerWF::ProposalOrigin::MW_CALC_RATIO_VALUE;
+    component.proposed_particle_          = electron;
     component.proposed_parameter_version_ = component.observed_parameter_version_;
+    component.has_proposal_               = true;
   }
 
+  /// Restore one component to its ordinary proposal-free lifecycle state.
   static void clearProposal(PsiFormerWF& component)
   { component.clearProposalState(); }
+
+  /// Translate the private proposal origin into a stable public test enum.
+  static ProposalOrigin proposalOrigin(const PsiFormerWF& component)
+  {
+    switch (component.proposal_origin_)
+    {
+    case PsiFormerWF::ProposalOrigin::NONE:
+      return ProposalOrigin::NONE;
+    case PsiFormerWF::ProposalOrigin::SCALAR_RATIO_VALUE:
+      return ProposalOrigin::SCALAR_RATIO_VALUE;
+    case PsiFormerWF::ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE:
+      return ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE;
+    case PsiFormerWF::ProposalOrigin::MW_CALC_RATIO_VALUE:
+      return ProposalOrigin::MW_CALC_RATIO_VALUE;
+    case PsiFormerWF::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE:
+      return ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE;
+    case PsiFormerWF::ProposalOrigin::MW_SELECTED_FULL_VGL:
+      return ProposalOrigin::MW_SELECTED_FULL_VGL;
+    }
+    throw std::logic_error("Unknown PsiFormer proposal origin");
+  }
+
+  /// Report the externally visible pending-proposal marker.
+  static bool hasProposal(const PsiFormerWF& component)
+  { return component.has_proposal_; }
+
+  /// Exercise lazy version synchronization without exposing it in production.
+  static void synchronizeParameterVersion(PsiFormerWF& component,
+                                          std::size_t parameter_version)
+  { component.synchronizeParameterVersion(parameter_version); }
+
+  /// Install a single-particle proposal with one exact scalar or crowd origin.
+  static void installSingleProposal(PsiFormerWF& component,
+                                    int electron,
+                                    ProposalOrigin origin)
+  {
+    component.clearProposalState();
+    component.proposed_particle_          = electron;
+    component.proposed_parameter_version_ = component.observed_parameter_version_;
+    switch (origin)
+    {
+    case ProposalOrigin::SCALAR_RATIO_VALUE:
+      component.proposal_origin_ =
+          PsiFormerWF::ProposalOrigin::SCALAR_RATIO_VALUE;
+      break;
+    case ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE:
+      component.proposal_origin_ =
+          PsiFormerWF::ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE;
+      break;
+    case ProposalOrigin::MW_CALC_RATIO_VALUE:
+      component.proposal_origin_ =
+          PsiFormerWF::ProposalOrigin::MW_CALC_RATIO_VALUE;
+      break;
+    case ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE:
+      component.proposal_origin_ =
+          PsiFormerWF::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE;
+      break;
+    case ProposalOrigin::NONE:
+    case ProposalOrigin::MW_SELECTED_FULL_VGL:
+      throw std::invalid_argument(
+          "Test single-particle proposal requires a single-particle origin");
+    }
+    component.has_proposal_ = true;
+  }
+
+  /// Publish only the private lifecycle evidence needed by planned-path tests.
+  static SelectedProposalEvidence installPlannedSelectedProposal(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::uint64_t descriptor_fingerprint)
+  {
+    const PsiFormerWF::PlannedSelectedProposalEvidence evidence =
+        component.publishPlannedSelectedProposalMetadata(
+            wfc_list, p_list, descriptor_fingerprint);
+    return {evidence.transaction_fingerprint, evidence.proposal_version};
+  }
+
+  /// Cancel one lifecycle-only proposal through the exact private recovery path.
+  static void cancelPlannedSelectedProposal(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::size_t expected_proposal_version)
+  {
+    component.cancelPlannedSelectedProposal(
+        wfc_list, p_list, moves, expected_proposal_version);
+  }
 
   /// Toggle complete Stage-5 ownership claims without exposing a production API.
   static void useCompleteBatchMemoryAccounting(PsiFormerWF& component,
@@ -309,6 +432,8 @@ private:
       return PsiFormerWF::PlannedOperation::SELECTED_PROPOSE;
     case RuntimeOperation::SELECTED_RESOLVE:
       return PsiFormerWF::PlannedOperation::SELECTED_RESOLVE;
+    case RuntimeOperation::SELECTED_CANCEL:
+      return PsiFormerWF::PlannedOperation::SELECTED_CANCEL;
     case RuntimeOperation::ECP_VALUE:
       return PsiFormerWF::PlannedOperation::ECP_VALUE;
     case RuntimeOperation::ECP_WEIGHTED_SCORE:
@@ -1067,12 +1192,30 @@ TEST_CASE("PsiFormer crowd APIs match scalar paths for batches 1 2 and 4",
         {
           scalar_ratios[walker] = crowd.components[walker]->ratio(
               *crowd.walkers[walker], moved_electron);
+          CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                    *crowd.components[walker]) ==
+                testing::TestPsiFormerVirtualBatch::ProposalOrigin::SCALAR_RATIO_VALUE);
+        }
+        CHECK_THROWS_AS(crowd.leader.mw_accept_rejectMove(
+                            crowd.wfc_list, *crowd.p_list, moved_electron,
+                            std::vector<bool>(batch_size, false), true),
+                        std::logic_error);
+        for (std::size_t walker = 0; walker < batch_size; ++walker)
+        {
+          CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                    *crowd.components[walker]) ==
+                testing::TestPsiFormerVirtualBatch::ProposalOrigin::SCALAR_RATIO_VALUE);
           crowd.components[walker]->restore(moved_electron);
         }
         crowd.leader.mw_calcRatio(
             crowd.wfc_list, *crowd.p_list, moved_electron, batch_ratios);
         for (std::size_t walker = 0; walker < batch_size; ++walker)
+        {
           checkValue(batch_ratios[walker], scalar_ratios[walker]);
+          CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                    *crowd.components[walker]) ==
+                testing::TestPsiFormerVirtualBatch::ProposalOrigin::MW_CALC_RATIO_VALUE);
+        }
 
         std::vector<PsiFormerWF::GradType> scalar_ratio_grads(batch_size);
         std::vector<PsiFormerWF::GradType> batch_ratio_grads(batch_size);
@@ -1083,6 +1226,9 @@ TEST_CASE("PsiFormer crowd APIs match scalar paths for batches 1 2 and 4",
           batch_ratio_grads[walker] = seed;
           scalar_ratios[walker] = crowd.components[walker]->ratioGrad(
               *crowd.walkers[walker], moved_electron, scalar_ratio_grads[walker]);
+          CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                    *crowd.components[walker]) ==
+                testing::TestPsiFormerVirtualBatch::ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE);
           crowd.components[walker]->restore(moved_electron);
         }
         crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list, moved_electron,
@@ -1091,7 +1237,15 @@ TEST_CASE("PsiFormer crowd APIs match scalar paths for batches 1 2 and 4",
         {
           checkValue(batch_ratios[walker], scalar_ratios[walker]);
           checkGrad(batch_ratio_grads[walker], scalar_ratio_grads[walker]);
+          CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                    *crowd.components[walker]) ==
+                testing::TestPsiFormerVirtualBatch::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE);
         }
+        CHECK_THROWS_AS(crowd.components.front()->restore(moved_electron),
+                        std::logic_error);
+        CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+                  *crowd.components.front()) ==
+              testing::TestPsiFormerVirtualBatch::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE);
 
         std::vector<PsiFormerWF::LogValue> old_logs(batch_size);
         std::vector<PsiFormerWF::LogValue> proposed_logs(batch_size);
@@ -2281,6 +2435,9 @@ TEST_CASE("PsiFormer selected-electron proposals are atomic full-VGL transaction
 
   for (std::size_t walker = 0; walker < walker_count; ++walker)
   {
+    CHECK(testing::TestPsiFormerVirtualBatch::proposalOrigin(
+              *crowd.components[walker]) ==
+          testing::TestPsiFormerVirtualBatch::ProposalOrigin::MW_SELECTED_FULL_VGL);
     // Evaluation consumes descriptor-owned absolute coordinates and leaves P accepted.
     for (std::size_t electron = 0; electron < electron_count; ++electron)
       for (int dimension = 0; dimension < 3; ++dimension)
@@ -3284,7 +3441,8 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
             request.dense_configurations, request.sparse_references,
             request.sparse_replacements, request.selected_parameters,
             request.derivative_width, request.active_electron.has_value(),
-            request.descriptor_fingerprint.has_value());
+            request.descriptor_fingerprint.has_value(),
+            request.expected_proposal_version.has_value());
     const RuntimePreflightSnapshot before = captureRuntimePreflightState(
         crowd, resource, caller_output);
     if (should_throw)
@@ -3396,6 +3554,31 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
   for (auto& walker : crowd.walkers)
     walker->makeMove(0, ParticleSet::PosType(0.002, -0.001, 0.003));
   require_unchanged(crowd.wfc_list, *crowd.p_list, ratio_request, false);
+
+  Probe::RuntimeRequest accept_request;
+  accept_request.operation = Probe::RuntimeOperation::ACCEPT_REJECT_VALUE;
+  accept_request.live_walkers = 2;
+  accept_request.active_electron = 0;
+  for (const Probe::ProposalOrigin origin : {
+           Probe::ProposalOrigin::MW_CALC_RATIO_VALUE,
+           Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE})
+  {
+    for (PsiFormerWF* component : crowd.components)
+      Probe::installSingleProposal(*component, 0, origin);
+    require_unchanged(crowd.wfc_list, *crowd.p_list, accept_request, false);
+    for (PsiFormerWF* component : crowd.components)
+      Probe::clearProposal(*component);
+  }
+  for (const Probe::ProposalOrigin origin : {
+           Probe::ProposalOrigin::SCALAR_RATIO_VALUE,
+           Probe::ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE})
+  {
+    for (PsiFormerWF* component : crowd.components)
+      Probe::installSingleProposal(*component, 0, origin);
+    require_unchanged(crowd.wfc_list, *crowd.p_list, accept_request, true);
+    for (PsiFormerWF* component : crowd.components)
+      Probe::clearProposal(*component);
+  }
   for (auto& walker : crowd.walkers)
     walker->rejectMove(0);
 
@@ -3407,10 +3590,210 @@ TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
   for (auto& walker : crowd.walkers)
     walker->rejectMove(0);
 
+  // Selected proposal identity is descriptor- and team-domain separated, and
+  // resolution/cancellation requires the exact publication version token.
+  const MCMultiParticleMoves<CoordsType::POS> selected_moves(
+      {0, 0, 1}, {0}, {crowd.walkers[1]->R[0]});
+  const std::uint64_t selected_descriptor = selected_moves.fingerprint();
+  std::vector<testing::PsiFormerCloneStateSnapshot> before_planned_selected_rejection;
+  for (const PsiFormerWF* component : crowd.components)
+    before_planned_selected_rejection.push_back(Probe::cloneState(*component));
+  std::vector<PsiFormerWF::LogValue> rejected_log_ratios(2,
+                                                         PsiFormerWF::LogValue(7));
+  RefVector<ParticleSet::ParticleGradient> missing_proposed_gradients;
+  RefVector<ParticleSet::ParticleLaplacian> missing_proposed_laplacians;
+  CHECK_THROWS_WITH(
+      crowd.leader.mw_evaluateMultiParticleMove(
+          crowd.wfc_list, *crowd.p_list, selected_moves,
+          rejected_log_ratios, missing_proposed_gradients,
+          missing_proposed_laplacians),
+      Catch::Matchers::ContainsSubstring("not implemented"));
+  CHECK_THROWS_WITH(
+      crowd.leader.mw_accept_rejectMultiParticleMove(
+          crowd.wfc_list, *crowd.p_list, selected_moves, {false, false}),
+      Catch::Matchers::ContainsSubstring("not implemented"));
+  CHECK(rejected_log_ratios ==
+        std::vector<PsiFormerWF::LogValue>(2, PsiFormerWF::LogValue(7)));
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+    CHECK(Probe::cloneStateMatches(
+        *crowd.components[lane], before_planned_selected_rejection[lane]));
+
+  Probe::RuntimeRequest selected_propose;
+  selected_propose.operation = Probe::RuntimeOperation::SELECTED_PROPOSE;
+  selected_propose.live_walkers = 2;
+  selected_propose.descriptor_fingerprint = selected_descriptor;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, selected_propose, false);
+
+  // A second acquired crowd may hold an independent selected transaction on
+  // the same shared model. Its identical raw descriptor must still acquire a
+  // distinct team-domain transaction identity.
+  Crowd sibling_crowd(files, simulation_cell, 2, true, {0, 1});
+  for (PsiFormerWF* component : sibling_crowd.components)
+  {
+    Probe::useSharedModelState(*component, crowd.leader);
+    Probe::useOptimizationMetadata(*component, crowd.leader);
+  }
+  enableCrowdPreparationTestAccounting(sibling_crowd);
+  bindCrowdPreparationPlan(sibling_crowd, plan, participant_id);
+  prepareCrowdPreparationClones(sibling_crowd, plan, participant_id);
+  ResourceCollection sibling_template(
+      "psiformer_runtime_preflight_sibling_template");
+  sibling_crowd.leader.createResource(sibling_template);
+  ResourceCollection sibling_resource(sibling_template);
+  sibling_resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> sibling_lock(
+      sibling_resource, sibling_crowd.wfc_list);
+  const MCMultiParticleMoves<CoordsType::POS> sibling_selected_moves(
+      {0, 0, 1}, {0}, {sibling_crowd.walkers[1]->R[0]});
+  CHECK(sibling_selected_moves.fingerprint() == selected_descriptor);
+  CHECK(Probe::requirePlannedRuntime(
+            sibling_crowd.leader, sibling_crowd.wfc_list,
+            *sibling_crowd.p_list, selected_propose) != 0);
+
+  Probe::RuntimeRequest malformed_selected = selected_propose;
+  malformed_selected.expected_proposal_version = 0;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed_selected, true);
+
+  const Probe::SelectedProposalEvidence selected_evidence =
+      Probe::installPlannedSelectedProposal(
+          crowd.leader, crowd.wfc_list, *crowd.p_list,
+          selected_descriptor);
+  const Probe::SelectedProposalEvidence sibling_selected_evidence =
+      Probe::installPlannedSelectedProposal(
+          sibling_crowd.leader, sibling_crowd.wfc_list,
+          *sibling_crowd.p_list, selected_descriptor);
+  CHECK(selected_evidence.transaction_fingerprint != selected_descriptor);
+  CHECK(sibling_selected_evidence.transaction_fingerprint !=
+        selected_evidence.transaction_fingerprint);
+  for (const PsiFormerWF* component : crowd.components)
+  {
+    CHECK(Probe::hasProposal(*component));
+    CHECK(Probe::proposalOrigin(*component) ==
+          Probe::ProposalOrigin::MW_SELECTED_FULL_VGL);
+  }
+  const testing::PsiFormerCloneStateSnapshot before_version_drift =
+      Probe::cloneState(crowd.leader);
+  CHECK_THROWS_AS(Probe::synchronizeParameterVersion(
+                      crowd.leader,
+                      selected_evidence.proposal_version + 1),
+                  std::logic_error);
+  CHECK(Probe::cloneStateMatches(crowd.leader, before_version_drift));
+
+  std::vector<testing::PsiFormerCloneStateSnapshot> before_parameter_update;
+  for (const PsiFormerWF* component : crowd.components)
+    before_parameter_update.push_back(Probe::cloneState(*component));
+  wftrain::StructuredParameterSnapshot candidate =
+      crowd.leader.snapshotParameters();
+  const std::size_t version_before_update = candidate.version;
+  candidate.values.front() += 1.0e-4;
+  CHECK_THROWS_AS(crowd.leader.publishParameters(
+                      candidate, version_before_update),
+                  std::logic_error);
+  CHECK(crowd.leader.parameterVersion() == version_before_update);
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+    CHECK(Probe::cloneStateMatches(
+        *crowd.components[lane], before_parameter_update[lane]));
+
+  std::unique_ptr<WaveFunctionComponent> detached_storage =
+      crowd.leader.makeClone(*crowd.walkers.front());
+  auto& detached = static_cast<PsiFormerWF&>(*detached_storage);
+  CHECK_FALSE(Probe::hasProposal(detached));
+  CHECK_THROWS_AS(detached.publishParameters(candidate, version_before_update),
+                  std::logic_error);
+
+  OptVariables active;
+  CHECK_THROWS_AS(detached.resetParametersExclusive(active),
+                  std::logic_error);
+  hdf_archive unread_archive;
+  CHECK_THROWS_AS(detached.readVariationalParameters(unread_archive),
+                  std::logic_error);
+  CHECK(crowd.leader.parameterVersion() == version_before_update);
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+    CHECK(Probe::cloneStateMatches(
+        *crowd.components[lane], before_parameter_update[lane]));
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+
+  Probe::RuntimeRequest selected_resolve;
+  selected_resolve.operation = Probe::RuntimeOperation::SELECTED_RESOLVE;
+  selected_resolve.live_walkers = 2;
+  selected_resolve.descriptor_fingerprint = selected_descriptor;
+  selected_resolve.expected_proposal_version =
+      selected_evidence.proposal_version;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, selected_resolve, false);
+  CHECK(Probe::requirePlannedRuntime(
+            sibling_crowd.leader, sibling_crowd.wfc_list,
+            *sibling_crowd.p_list, selected_resolve) != 0);
+
+  malformed_selected = selected_resolve;
+  malformed_selected.descriptor_fingerprint = selected_descriptor + 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed_selected, true);
+  malformed_selected = selected_resolve;
+  malformed_selected.expected_proposal_version =
+      selected_evidence.proposal_version + 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed_selected, true);
+  malformed_selected = selected_resolve;
+  malformed_selected.expected_proposal_version.reset();
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed_selected, true);
+
+  // Both the bound ParticleSet marker and acquisition lane marker are part of
+  // the exact transaction team, and failed checks leave cancellation retryable.
+  Probe::bindParticleSet(*crowd.components[1], *crowd.walkers[0]);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, selected_resolve, true);
+  Probe::bindParticleSet(*crowd.components[1], *crowd.walkers[1]);
+  Probe::setAcquiredLaneIndex(*crowd.components[1], 0);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, selected_resolve, true);
+  Probe::setAcquiredLaneIndex(*crowd.components[1], 1);
+
+  resource.rewind(0);
+  CHECK_THROWS_AS(
+      crowd.leader.releaseResource(resource, crowd.wfc_list),
+      std::logic_error);
+  CHECK(resource.getOutstandingLoanCount() == 1);
+  resource.rewind(1);
+
+  Probe::RuntimeRequest selected_cancel = selected_resolve;
+  selected_cancel.operation = Probe::RuntimeOperation::SELECTED_CANCEL;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, selected_cancel, false);
+  MCMultiParticleMoves<CoordsType::POS>::PosType mismatched_position =
+      crowd.walkers[1]->R[0];
+  mismatched_position[0] += 1.0e-4;
+  const MCMultiParticleMoves<CoordsType::POS> mismatched_selected_moves(
+      {0, 0, 1}, {0}, {mismatched_position});
+  CHECK_THROWS_AS(Probe::cancelPlannedSelectedProposal(
+                      crowd.leader, crowd.wfc_list, *crowd.p_list,
+                      mismatched_selected_moves,
+                      selected_evidence.proposal_version),
+                  std::logic_error);
+  for (const PsiFormerWF* component : crowd.components)
+    CHECK(Probe::hasProposal(*component));
+  Probe::cancelPlannedSelectedProposal(
+      crowd.leader, crowd.wfc_list, *crowd.p_list, selected_moves,
+      selected_evidence.proposal_version);
+  for (const PsiFormerWF* component : crowd.components)
+  {
+    CHECK_FALSE(Probe::hasProposal(*component));
+    CHECK(Probe::proposalOrigin(*component) == Probe::ProposalOrigin::NONE);
+  }
+  require_unchanged(crowd.wfc_list, *crowd.p_list, selected_resolve, true);
+  CHECK_THROWS_AS(detached.publishParameters(candidate, version_before_update),
+                  std::logic_error);
+
+  Probe::cancelPlannedSelectedProposal(
+      sibling_crowd.leader, sibling_crowd.wfc_list, *sibling_crowd.p_list,
+      sibling_selected_moves, sibling_selected_evidence.proposal_version);
+  for (const PsiFormerWF* component : sibling_crowd.components)
+  {
+    CHECK_FALSE(Probe::hasProposal(*component));
+    CHECK(Probe::proposalOrigin(*component) == Probe::ProposalOrigin::NONE);
+  }
+
   // Runtime preflight rechecks the exact post-acquire collection cursor.
   resource.rewind(0);
   require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
   resource.rewind(1);
+
+  CHECK(detached.publishParameters(candidate, version_before_update) ==
+        version_before_update + 1);
 }
 
 TEST_CASE("PsiFormer planned runtime rejects unprepared clones before mutation",

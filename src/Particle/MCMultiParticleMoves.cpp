@@ -90,9 +90,6 @@ void MCMultiParticleMoves<CoordsType::POS>::validateIntrinsic() const
     const std::size_t end   = walker_offsets_[iw + 1];
     if (end < begin || end > particle_indices_.size())
       throw std::invalid_argument("Multi-particle move walker offsets are not monotonic and in range.");
-    if (begin == end)
-      throw std::invalid_argument("Every walker must select at least one particle.");
-
     for (std::size_t entry = begin; entry < end; ++entry)
     {
       if (particle_indices_[entry] < 0)

@@ -479,7 +479,13 @@ TEST_CASE("MCMultiParticleMoves validates CSR structure and fingerprints exact c
   REQUIRE_THROWS_AS(Moves({1, 2}, {0, 1}, {positions[0], positions[1]}), std::invalid_argument);
   REQUIRE_THROWS_AS(Moves({0, 2, 1}, {0}, {positions[0]}), std::invalid_argument);
   REQUIRE_THROWS_AS(Moves({0, 1}, {0, 1}, {positions[0], positions[1]}), std::invalid_argument);
-  REQUIRE_THROWS_AS(Moves({0, 0}, {}, {}), std::invalid_argument);
+  const Moves zero_walkers({0}, {}, {});
+  const Moves one_empty_walker({0, 0}, {}, {});
+  const Moves two_empty_walkers({0, 0, 0}, {}, {});
+  CHECK(one_empty_walker.walkerCount() == 1);
+  CHECK(one_empty_walker.slice(0).empty());
+  CHECK(one_empty_walker.fingerprint() != zero_walkers.fingerprint());
+  CHECK(two_empty_walkers.fingerprint() != one_empty_walker.fingerprint());
   REQUIRE_THROWS_AS(Moves({0, 2}, {0, 0}, {positions[0], positions[1]}), std::invalid_argument);
   REQUIRE_THROWS_AS(Moves({0, 2}, {1, 0}, {positions[0], positions[1]}), std::invalid_argument);
   REQUIRE_THROWS_AS(Moves({0, 1}, {-1}, {positions[0]}), std::invalid_argument);
@@ -506,6 +512,9 @@ TEST_CASE("MCMultiParticleMoves validates crowd-dependent shape and bounds", "[p
   MCMultiParticleMoves<CoordsType::POS> out_of_range({0, 1, 2}, {0, 3},
                                                      {{0.6, 0.5, 0.5}, {0.5, 0.8, 0.5}});
   REQUIRE_THROWS_AS(out_of_range.validateFor(p_list), std::invalid_argument);
+
+  MCMultiParticleMoves<CoordsType::POS> empty_lanes({0, 0, 0}, {}, {});
+  CHECK_NOTHROW(empty_lanes.validateFor(p_list));
 
   ParticleSet p_short(cell);
   p_short.create({2});
@@ -613,6 +622,52 @@ TEST_CASE("ParticleSet selected-particle transactions enforce masks nesting and 
   p0.makeMove(0, {0.1, 0.0, 0.0});
   REQUIRE_THROWS_AS(ParticleSet::mw_makeMoveSelectedParticles(p_list, moves, validity), std::runtime_error);
   p0.rejectMove(0);
+}
+
+TEST_CASE("ParticleSet selected-particle transactions permit empty walker slices",
+          "[particle]")
+{
+  const SimulationCell cell = makeOpenCell();
+  ParticleSet p0(cell);
+  p0.create({2});
+  p0.R[0] = {0.5, 0.5, 0.5};
+  p0.R[1] = {1.5, 0.5, 0.5};
+  p0.update();
+  ParticleSet p1(p0);
+  RefVectorWithLeader<ParticleSet> p_list(p0, {p0, p1});
+  ResourceCollection resources("selected_particle_empty_lane_resources");
+  p0.createResource(resources);
+  ResourceCollectionTeamLock<ParticleSet> lock(resources, p_list);
+
+  const ParticleSet::PosType p0_first = p0.R[0];
+  const ParticleSet::PosType p0_second = p0.R[1];
+  const ParticleSet::PosType p1_first = p1.R[0];
+
+  // Lane zero is an explicit no-op while lane one owns one real replacement.
+  const ParticleSet::PosType replacement{1.5, 0.75, 0.5};
+  MCMultiParticleMoves<CoordsType::POS> mixed({0, 0, 1}, {1}, {replacement});
+  std::vector<bool> valid;
+  ParticleSet::mw_makeMoveSelectedParticles(p_list, mixed, valid);
+  CHECK(valid == std::vector<bool>{true});
+  checkPosition(p0, 0, p0_first);
+  checkPosition(p0, 1, p0_second);
+  checkPosition(p1, 0, p1_first);
+  checkPosition(p1, 1, replacement);
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {true, true});
+  checkPosition(p0, 0, p0_first);
+  checkPosition(p0, 1, p0_second);
+  checkPosition(p1, 0, p1_first);
+  checkPosition(p1, 1, replacement);
+
+  // An all-zero CSR still forms and resolves one ordinary atomic transaction.
+  MCMultiParticleMoves<CoordsType::POS> all_empty({0, 0, 0}, {}, {});
+  ParticleSet::mw_makeMoveSelectedParticles(p_list, all_empty, valid);
+  CHECK(valid.empty());
+  ParticleSet::mw_accept_rejectMoveSelectedParticles(p_list, {false, true});
+  checkPosition(p0, 0, p0_first);
+  checkPosition(p0, 1, p0_second);
+  checkPosition(p1, 0, p1_first);
+  checkPosition(p1, 1, replacement);
 }
 
 TEST_CASE("ParticleSet selected-particle transaction blocks premature resource release", "[particle]")

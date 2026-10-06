@@ -541,6 +541,7 @@ private:
     ACCEPT_REJECT_VALUE,
     SELECTED_PROPOSE,
     SELECTED_RESOLVE,
+    SELECTED_CANCEL,
     ECP_VALUE,
     ECP_WEIGHTED_SCORE,
     SCORE_DERIVATIVES,
@@ -574,6 +575,7 @@ private:
     std::size_t derivative_width     = 0;
     std::optional<std::size_t> active_electron;
     std::optional<std::uint64_t> descriptor_fingerprint;
+    std::optional<std::size_t> expected_proposal_version;
   };
 
   /** Return read-only bindings proved by preflight without changing logical
@@ -584,6 +586,14 @@ private:
     const BatchExecutionParticipantPlan& participant;
     const psiformer::PsiFormerCrowdMemoryPlan& crowd;
     std::size_t storage_fingerprint;
+    std::optional<std::uint64_t> selected_transaction_fingerprint;
+  };
+
+  /// Fixed metadata published by the lifecycle-only selected proposal seam.
+  struct PlannedSelectedProposalEvidence
+  {
+    std::uint64_t transaction_fingerprint;
+    std::size_t proposal_version;
   };
 
   /// Return the exact explicit mode mask assigned to one typed operation.
@@ -620,13 +630,17 @@ private:
     FULL_SPATIAL = 2
   };
 
-  /// Distinguish legacy one-electron proposals from selected-electron transactions.
-  enum class ProposalKind : std::uint64_t
+  /// Identify the exact evaluator that published clone-local proposal state.
+  enum class ProposalOrigin : std::uint8_t
   {
-    NONE,
-    SINGLE_PARTICLE,
-    SELECTED_PARTICLES
+    NONE                         = 0,
+    SCALAR_RATIO_VALUE           = 1,
+    SCALAR_RATIO_GRADIENT_ACTIVE = 2,
+    MW_CALC_RATIO_VALUE          = 3,
+    MW_RATIO_GRADIENT_ACTIVE     = 4,
+    MW_SELECTED_FULL_VGL         = 5
   };
+  static_assert(sizeof(ProposalOrigin) == sizeof(std::uint8_t));
 
   /// Evaluate through an already-held model transaction without reacquiring its mutex.
   pf::Result evaluatePositionsUnderRead(const PsiFormerReadTransaction& transaction,
@@ -668,6 +682,30 @@ private:
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       const PlannedRuntimeRequest& request) const;
+
+  /// Hash one validated acquired team without allocating or dereferencing scratch.
+  std::uint64_t selectedTeamFingerprint(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list) const noexcept;
+
+  /// Domain-separate a selected descriptor from the exact team that owns it.
+  std::uint64_t selectedTransactionFingerprint(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::uint64_t descriptor_fingerprint) const noexcept;
+
+  /// Publish lifecycle metadata only; planned selected numerical evaluation is not implemented here.
+  PlannedSelectedProposalEvidence publishPlannedSelectedProposalMetadata(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::uint64_t descriptor_fingerprint) const;
+
+  /// Validate and abandon one planned selected proposal without a public API.
+  void cancelPlannedSelectedProposal(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const MCMultiParticleMoves<CoordsType::POS>& moves,
+      std::size_t expected_proposal_version) const;
 
   /// Lazily create fixed storage for scalar value evaluation.
   pf::DirectValueWorkspace& requireDirectValueWorkspace();
@@ -768,18 +806,25 @@ private:
   /// Lazily invalidate this clone when another clone changed the shared parameters.
   void synchronizeParameterVersion(std::size_t parameter_version);
 
-  /// Reset every pending-proposal discriminator while retaining reusable vector capacity.
-  void clearProposalState();
+  /// Reset proposal metadata while deliberately retaining the publication marker.
+  void resetProposalMetadata() noexcept;
+
+  /// Reset all proposal metadata, publishing has_proposal_ false last.
+  void clearProposalState() noexcept;
 
   /// Publish one legacy one-electron proposal with an explicit parameter-version key.
   void cacheSingleParticleProposal(double sign,
                                    double logabs,
                                    std::uint64_t configuration_identity,
                                    int particle,
-                                   std::size_t parameter_version);
+                                   std::size_t parameter_version,
+                                   ProposalOrigin origin);
 
   /// Reject lifecycle operations that could silently overwrite a selected transaction.
   void requireNoSelectedParticleProposal(const char* operation) const;
+
+  /// Reject shared-parameter mutation that would strand a planned selected crowd.
+  void requireNoPlannedSelectedProposalMutation(const char* operation) const;
 
   /// Resize clone-local complete proposed G/L storage without publishing a proposal.
   void resizeProposedSpatialStorage(std::size_t electron_count);
@@ -895,8 +940,8 @@ private:
   /// Parameter version used to evaluate the pending proposal.
   std::size_t proposed_parameter_version_ = 0;
   int proposed_particle_ = -1;
-  ProposalKind proposal_kind_ = ProposalKind::NONE;
-  bool has_proposal_          = false;
+  ProposalOrigin proposal_origin_ = ProposalOrigin::NONE;
+  bool has_proposal_              = false;
 
   friend class testing::TestPsiFormerWF;
   friend class testing::TestPsiFormerVirtualBatch;
