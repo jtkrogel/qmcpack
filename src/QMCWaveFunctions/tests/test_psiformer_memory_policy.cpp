@@ -61,11 +61,11 @@ BatchExecutionPlanningContext makeContext(
   BatchExecutionTopology topology;
   topology.initial_walkers_per_crowd = std::move(initial);
   topology.reserve_walkers_per_crowd = std::move(reserve);
-  const BatchExecutionWorkloadContext workload{requirements, topology,
-                                                active_parameters};
+  const BatchExecutionWorkloadContext workload{requirements, topology, 0,
+                                                active_parameters, 0};
   return {requirements, topology,
           psiformer::psiFormerBatchLogicalMaximum(input, workload), candidate,
-          active_parameters};
+          0, active_parameters, 0};
 }
 
 std::size_t hostBytes(const BatchMemoryContribution& contribution,
@@ -161,7 +161,7 @@ TEST_CASE("PsiFormer memory policy discovers stable logical envelopes",
   BatchExecutionTopology topology;
   topology.initial_walkers_per_crowd = {1, 4, 0};
   topology.reserve_walkers_per_crowd = {3, 0, 2};
-  const BatchExecutionWorkloadContext workload{requirements, topology, 0};
+  const BatchExecutionWorkloadContext workload{requirements, topology, 0, 0, 0};
   CHECK(psiformer::psiFormerBatchLogicalMaximum(input, workload) ==
         BatchTileCapacities{5, 3, 3, 0});
 
@@ -172,7 +172,7 @@ TEST_CASE("PsiFormer memory policy discovers stable logical envelopes",
 
   // Omitting the reserve vector uses the uneven initial topology exactly.
   topology.reserve_walkers_per_crowd.clear();
-  const BatchExecutionWorkloadContext fallback{requirements, topology, 0};
+  const BatchExecutionWorkloadContext fallback{requirements, topology, 0, 0, 0};
   CHECK(psiformer::psiFormerBatchLogicalMaximum(input, fallback) ==
         BatchTileCapacities{5, 4, 4, 0});
   const psiformer::PsiFormerMemoryTopologySummary fallback_summary =
@@ -199,7 +199,7 @@ TEST_CASE("PsiFormer memory policy discovers stable logical envelopes",
   // envelope or claim the operator-owned ECP_OUTER maximum.
   BatchExecutionRequirements scalar_only;
   scalar_only.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
-  const BatchExecutionWorkloadContext scalar_workload{scalar_only, topology, 0};
+  const BatchExecutionWorkloadContext scalar_workload{scalar_only, topology, 0, 0, 0};
   CHECK(batchExecutionModeIsRequired(scalar_only, BatchExecutionMode::VALUE));
   CHECK(psiformer::psiFormerBatchLogicalMaximum(input, scalar_workload) ==
         BatchTileCapacities{5, 0, 0, 0});
@@ -738,7 +738,7 @@ TEST_CASE("PsiFormer memory policy fails closed for unsupported execution",
   BatchExecutionTopology zero_topology;
   zero_topology.initial_walkers_per_crowd = {0};
   zero_topology.reserve_walkers_per_crowd = {0};
-  const BatchExecutionWorkloadContext invalid_workload{invalid_ecp, zero_topology, 0};
+  const BatchExecutionWorkloadContext invalid_workload{invalid_ecp, zero_topology, 0, 0, 0};
   CHECK_THROWS_AS(
       psiformer::psiFormerBatchLogicalMaximum(input, invalid_workload),
       std::invalid_argument);

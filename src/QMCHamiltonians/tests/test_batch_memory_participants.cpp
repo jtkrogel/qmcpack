@@ -194,7 +194,8 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(const QMCHamiltonian& hamilto
   input.preference.preferred   = {3, 0, 0, 0};
   input.active_parameter_count = active_parameter_count;
   input.logical_maximum        = hamiltonian.batchExecutionLogicalMaximum(
-      {input.requirements, input.topology, input.active_parameter_count});
+      {input.requirements, input.topology, input.particle_count,
+       input.active_parameter_count, input.parameter_derivative_width});
   auto provider = [&hamiltonian](const BatchExecutionPlanningContext& context) {
     return hamiltonian.estimateBatchExecutionMemory(context);
   };
@@ -239,12 +240,12 @@ TEST_CASE("QMCHamiltonian batch participants bind atomically and clone plans",
   CHECK(requirements.requires(BatchExecutionMode::VALUE));
   CHECK(requirements.requires(BatchExecutionMode::SCORE));
 
-  BatchExecutionWorkloadContext workload_context{requirements, {}, 17};
+  BatchExecutionWorkloadContext workload_context{requirements, {}, 0, 17, 0};
   CHECK(hamiltonian.batchExecutionLogicalMaximum(workload_context) ==
         BatchTileCapacities{5, 6, 4, 7});
 
   BatchExecutionPlanningContext context{
-      requirements, {}, {5, 6, 4, 7}, {2, 0, 0, 0}, 17};
+      requirements, {}, {5, 6, 4, 7}, {2, 0, 0, 0}, 0, 17, 0};
   const auto contributions = hamiltonian.estimateBatchExecutionMemory(context);
   REQUIRE(contributions.size() == 2);
   CHECK(contributions[0].participant_id ==

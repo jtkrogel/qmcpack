@@ -301,7 +301,8 @@ std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationTestPlan(
   selection.preference.id                        = profile_id;
   selection.preference.preferred                 = preferred;
   selection.logical_maximum = component.batchExecutionLogicalMaximum(
-      {requirements, selection.topology, active_parameter_count});
+      {requirements, selection.topology, selection.particle_count,
+       active_parameter_count, selection.parameter_derivative_width});
 
   // ECP_OUTER is an aggregate-driver capacity. PsiFormer contributes no
   // component-local maximum even though its flattened ECP path consumes it.

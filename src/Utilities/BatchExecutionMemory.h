@@ -194,7 +194,12 @@ struct BatchExecutionWorkloadContext
 {
   BatchExecutionRequirements requirements;
   BatchExecutionTopology topology;
+  /// Exact number of target particles represented by every resident lane.
+  std::size_t particle_count = 0;
+  /// Component-local active parameter count used by derivative evaluators.
   std::size_t active_parameter_count = 0;
+  /// Exact width of each global parameter-derivative destination row.
+  std::size_t parameter_derivative_width = 0;
 };
 
 /** Complete neutral context presented to every participant estimator. */
@@ -204,7 +209,12 @@ struct BatchExecutionPlanningContext
   BatchExecutionTopology topology;
   BatchTileCapacities logical_maximum;
   BatchTileCapacities candidate_capacities;
+  /// Exact number of target particles represented by every resident lane.
+  std::size_t particle_count = 0;
+  /// Component-local active parameter count used by derivative evaluators.
   std::size_t active_parameter_count = 0;
+  /// Exact width of each global parameter-derivative destination row.
+  std::size_t parameter_derivative_width = 0;
 };
 
 /** Expand an aggregate logical envelope by the elementwise participant maxima. */
@@ -260,13 +270,18 @@ struct BatchMemoryParticipantEvidence
 /** Complete pure input to deterministic tile selection. */
 struct BatchExecutionSelectionInput
 {
-  std::string schema_id{"batch-execution-memory-v1"};
+  std::string schema_id{"batch-execution-memory-v2"};
   BatchMemoryPolicy policy;
   BatchExecutionRequirements requirements;
   BatchExecutionTopology topology;
   BatchTileCapacities logical_maximum;
   BatchExecutionPreferenceProfile preference;
+  /// Exact number of target particles represented by every resident lane.
+  std::size_t particle_count = 0;
+  /// Component-local active parameter count used by derivative evaluators.
   std::size_t active_parameter_count = 0;
+  /// Exact width of each global parameter-derivative destination row.
+  std::size_t parameter_derivative_width = 0;
 };
 
 using BatchMemoryContributionProvider =
@@ -287,7 +302,9 @@ public:
   const BatchTileCapacities& selectedCapacities() const noexcept { return selected_capacities_; }
   const BatchMemoryEstimate& fixedMinimumEstimate() const noexcept { return fixed_minimum_estimate_; }
   const BatchMemoryEstimate& selectedEstimate() const noexcept { return selected_estimate_; }
+  std::size_t particleCount() const noexcept { return particle_count_; }
   std::size_t activeParameterCount() const noexcept { return active_parameter_count_; }
+  std::size_t parameterDerivativeWidth() const noexcept { return parameter_derivative_width_; }
   const std::vector<BatchMemoryParticipantEvidence>& participantEvidence() const noexcept
   {
     return participant_evidence_;
@@ -308,7 +325,9 @@ private:
   BatchTileCapacities selected_capacities_;
   BatchMemoryEstimate fixed_minimum_estimate_;
   BatchMemoryEstimate selected_estimate_;
+  std::size_t particle_count_ = 0;
   std::size_t active_parameter_count_ = 0;
+  std::size_t parameter_derivative_width_ = 0;
   std::vector<BatchMemoryParticipantEvidence> participant_evidence_;
 };
 

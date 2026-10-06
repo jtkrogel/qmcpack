@@ -215,7 +215,8 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(
   input.topology.run_kind      = "wavefunction-unit-test";
   input.active_parameter_count = 17;
   input.logical_maximum        = wavefunction.batchExecutionLogicalMaximum(
-      {input.requirements, input.topology, input.active_parameter_count});
+      {input.requirements, input.topology, input.particle_count,
+       input.active_parameter_count, input.parameter_derivative_width});
   input.preference.id        = std::move(profile_id);
   input.preference.preferred = {preferred_value_tile, 2, 2, 0};
   return std::make_shared<const BatchExecutionPlan>(

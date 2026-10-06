@@ -267,8 +267,8 @@ std::shared_ptr<const BatchExecutionPlan> makeClonePreparationTestPlan(
   selection.preference.id                      = profile_id;
   selection.preference.preferred               = {value_tile, 1, 1, ecp_outer_maximum};
   selection.logical_maximum = component.batchExecutionLogicalMaximum(
-      {requirements, selection.topology,
-       selection.active_parameter_count});
+      {requirements, selection.topology, selection.particle_count,
+       selection.active_parameter_count, selection.parameter_derivative_width});
   selection.logical_maximum.ecp_outer = ecp_outer_maximum;
 
   return std::make_shared<const BatchExecutionPlan>(
@@ -878,14 +878,14 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   topology.run_kind                  = "psiformer-hook-test";
 
   const BatchExecutionWorkloadContext workload{
-      broad_requirements, topology, 2};
+      broad_requirements, topology, 0, 2, 0};
   const BatchTileCapacities logical_maximum =
       component.batchExecutionLogicalMaximum(workload);
   CHECK(logical_maximum == BatchTileCapacities{5, 3, 3, 0});
 
   const BatchExecutionPlanningContext context{
       broad_requirements, topology, logical_maximum,
-      BatchTileCapacities{2, 2, 1, 0}, 2};
+      BatchTileCapacities{2, 2, 1, 0}, 0, 2, 0};
   const BatchMemoryContribution contribution =
       component.estimateBatchExecutionMemory(context);
   CHECK(contribution.logical_maximum == logical_maximum);
@@ -902,7 +902,8 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   selection.topology                           = topology;
   selection.active_parameter_count             = 2;
   const BatchExecutionWorkloadContext selection_workload{
-      requirements, topology, 2};
+      requirements, topology, selection.particle_count, 2,
+      selection.parameter_derivative_width};
   selection.logical_maximum =
       component.batchExecutionLogicalMaximum(selection_workload);
   CHECK_THROWS_WITH(
@@ -920,7 +921,8 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   BatchExecutionSelectionInput missing_requirement_selection = selection;
   missing_requirement_selection.requirements = {};
   const BatchExecutionWorkloadContext missing_workload{
-      {}, topology, 2};
+      {}, topology, missing_requirement_selection.particle_count, 2,
+      missing_requirement_selection.parameter_derivative_width};
   missing_requirement_selection.logical_maximum =
       component.batchExecutionLogicalMaximum(missing_workload);
   const std::string participant_id =

@@ -213,7 +213,9 @@ std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
   mixCapacities(hash, input.preference.preferred);
   mixCapacities(hash, minimum);
   mixCapacities(hash, selected);
+  mixInteger(hash, input.particle_count);
   mixInteger(hash, input.active_parameter_count);
+  mixInteger(hash, input.parameter_derivative_width);
 
   mixByte(hash, input.topology.serialized_walkers);
   mixString(hash, input.topology.run_kind);
@@ -569,8 +571,13 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   std::vector<BatchMemoryParticipantContribution> reference_contributions;
   bool have_reference = false;
   auto evaluate = [&](const BatchTileCapacities& capacities) {
-    BatchExecutionPlanningContext context{input.requirements, input.topology, input.logical_maximum, capacities,
-                                          input.active_parameter_count};
+    BatchExecutionPlanningContext context{input.requirements,
+                                          input.topology,
+                                          input.logical_maximum,
+                                          capacities,
+                                          input.particle_count,
+                                          input.active_parameter_count,
+                                          input.parameter_derivative_width};
     ContributionEvaluation evaluation;
     evaluation.contributions = provider(context);
     evaluation.aggregate     = aggregateBatchMemoryContributions(evaluation.contributions);
@@ -666,8 +673,10 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   plan.selected_capacities_    = selected;
   plan.fixed_minimum_estimate_ = minimum_evaluation.aggregate;
   plan.selected_estimate_      = selected_evaluation.aggregate;
-  plan.active_parameter_count_ = input.active_parameter_count;
-  plan.participant_evidence_   = std::move(participant_evidence);
+  plan.particle_count_             = input.particle_count;
+  plan.active_parameter_count_     = input.active_parameter_count;
+  plan.parameter_derivative_width_ = input.parameter_derivative_width;
+  plan.participant_evidence_        = std::move(participant_evidence);
   plan.fingerprint_ =
       makeFingerprint(input, minimum, selected, plan.fixed_minimum_estimate_,
                       plan.selected_estimate_, plan.participant_evidence_);

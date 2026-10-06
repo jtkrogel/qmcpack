@@ -66,7 +66,9 @@ BatchExecutionSelectionInput makeSelectionInput()
   input.logical_maximum                    = {8, 8, 8, 8};
   input.preference.id                      = "test-cpu-v1";
   input.preference.preferred               = {4, 4, 4, 4};
+  input.particle_count                     = 23;
   input.active_parameter_count             = 17;
+  input.parameter_derivative_width         = 19;
   return input;
 }
 
@@ -125,7 +127,10 @@ TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][
     CHECK(plan.selectedCapacities() == BatchTileCapacities{4, 4, 4, 4});
     CHECK(plan.selectedEstimate().total() == BatchMemoryBytes{260, 52});
     CHECK(plan.fixedMinimumEstimate().total() == BatchMemoryBytes{140, 28});
+    CHECK(plan.schemaId() == "batch-execution-memory-v2");
+    CHECK(plan.particleCount() == 23);
     CHECK(plan.activeParameterCount() == 17);
+    CHECK(plan.parameterDerivativeWidth() == 19);
     REQUIRE(plan.participantEvidence().size() == 1);
     const BatchMemoryParticipantEvidence& evidence = plan.participantEvidence().front();
     CHECK(evidence.participant_id == "twf/component/0/Test/component");
@@ -283,9 +288,23 @@ TEST_CASE("Batch execution memory plans have stable exact-content fingerprints",
   CHECK(first.fingerprint() != changed_participants.fingerprint());
 
   input.active_parameter_count = 18;
-  const BatchExecutionPlan changed_parameter_count =
+  const BatchExecutionPlan changed_active_parameter_count =
       selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
-  CHECK(first.fingerprint() != changed_parameter_count.fingerprint());
+  CHECK(first.fingerprint() != changed_active_parameter_count.fingerprint());
+
+  input.active_parameter_count = 17;
+  input.particle_count          = 24;
+  const BatchExecutionPlan changed_particle_count =
+      selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
+  CHECK(first.fingerprint() != changed_particle_count.fingerprint());
+  CHECK(first.selectedCapacities() == changed_particle_count.selectedCapacities());
+
+  input.particle_count             = 23;
+  input.parameter_derivative_width = 20;
+  const BatchExecutionPlan changed_parameter_derivative_width =
+      selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
+  CHECK(first.fingerprint() != changed_parameter_derivative_width.fingerprint());
+  CHECK(first.selectedCapacities() == changed_parameter_derivative_width.selectedCapacities());
 
   SECTION("the fixed minimum estimate is part of the immutable content")
   {
@@ -392,7 +411,9 @@ TEST_CASE("Batch execution planning context reaches participant providers", "[ut
   input.topology.run_kind                  = "context-test";
   input.logical_maximum                    = {1, 0, 0, 0};
   input.preference.preferred               = {1, 0, 0, 0};
+  input.particle_count                     = 57;
   input.active_parameter_count             = 1234;
+  input.parameter_derivative_width         = 4321;
 
   bool provider_called = false;
   auto provider = [&](const BatchExecutionPlanningContext& context) {
@@ -403,7 +424,9 @@ TEST_CASE("Batch execution planning context reaches participant providers", "[ut
     CHECK(context.topology.run_kind == "context-test");
     CHECK(context.logical_maximum == input.logical_maximum);
     CHECK(context.candidate_capacities == BatchTileCapacities{1, 0, 0, 0});
+    CHECK(context.particle_count == 57);
     CHECK(context.active_parameter_count == 1234);
+    CHECK(context.parameter_derivative_width == 4321);
 
     BatchMemoryContribution contribution;
     contribution.logical_maximum    = context.logical_maximum;
@@ -414,7 +437,9 @@ TEST_CASE("Batch execution planning context reaches participant providers", "[ut
 
   const BatchExecutionPlan plan = selectBatchExecutionPlan(input, provider);
   CHECK(provider_called);
+  CHECK(plan.particleCount() == 57);
   CHECK(plan.activeParameterCount() == 1234);
+  CHECK(plan.parameterDerivativeWidth() == 4321);
 }
 
 TEST_CASE("Batch execution participant views have explicit shared and null semantics",

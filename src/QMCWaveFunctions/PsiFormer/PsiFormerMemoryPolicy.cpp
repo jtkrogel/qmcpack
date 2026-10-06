@@ -426,7 +426,8 @@ BatchMemoryContribution estimatePsiFormerBatchMemory(
     const BatchExecutionPlanningContext& context)
 {
   const BatchExecutionWorkloadContext workload{
-      context.requirements, context.topology, context.active_parameter_count};
+      context.requirements, context.topology, context.particle_count, context.active_parameter_count,
+      context.parameter_derivative_width};
   BatchMemoryContribution contribution;
   contribution.logical_maximum =
       psiFormerBatchLogicalMaximum(input, workload);
