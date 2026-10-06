@@ -14,6 +14,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 
 #include <algorithm>
 #include <array>
@@ -702,6 +703,56 @@ TEST_CASE("Streaming and stale publication failures are atomic and retryable",
       training.runIteration(provider, producer, updater, state, &observer);
   CHECK(retry.completed_iteration == 1);
   CHECK(observer.calls == 1);
+}
+
+TEST_CASE("Stateful optimizer publication failure preserves exact retry state",
+          "[drivers][training][optimizer]")
+{
+  FirstOrderOptimizerOptions options;
+  options.method         = FirstOrderMethod::ADAM;
+  options.learning_rates = {{"weights", 0.05}};
+  options.adam_beta1     = 0.5;
+  options.adam_beta2     = 0.75;
+  options.epsilon        = 1.0e-7;
+
+  ToyProvider retry_provider;
+  ReferenceProducer retry_producer;
+  retry_producer.bindSchema(retry_provider.parameterSchema());
+  FirstOrderOptimizer retry_optimizer(retry_provider.parameterSchema(), options);
+  TrainingIterationState retry_state;
+  HighParameterTraining training({});
+  const StructuredParameterSnapshot initial = retry_provider.snapshotParameters();
+
+  retry_provider.rejectNextPublish();
+  CHECK_THROWS_WITH(
+      training.runIteration(retry_provider, retry_producer, retry_optimizer, retry_state),
+      "stale toy version");
+  CHECK(retry_provider.snapshotParameters().values == initial.values);
+  CHECK(retry_optimizer.acceptedUpdateCount() == 0);
+  CHECK_FALSE(retry_optimizer.hasLiveProposal());
+  CHECK(std::all_of(retry_optimizer.firstMoment().begin(),
+                    retry_optimizer.firstMoment().end(),
+                    [](double value) { return value == 0.0; }));
+  CHECK(std::all_of(retry_optimizer.secondMoment().begin(),
+                    retry_optimizer.secondMoment().end(),
+                    [](double value) { return value == 0.0; }));
+
+  training.runIteration(retry_provider, retry_producer, retry_optimizer, retry_state);
+
+  ToyProvider reference_provider;
+  ReferenceProducer reference_producer;
+  reference_producer.bindSchema(reference_provider.parameterSchema());
+  FirstOrderOptimizer reference_optimizer(reference_provider.parameterSchema(), options);
+  TrainingIterationState reference_state;
+  training.runIteration(reference_provider, reference_producer, reference_optimizer,
+                        reference_state);
+
+  CHECK(retry_provider.snapshotParameters().values ==
+        reference_provider.snapshotParameters().values);
+  CHECK(retry_optimizer.firstMoment() == reference_optimizer.firstMoment());
+  CHECK(retry_optimizer.secondMoment() == reference_optimizer.secondMoment());
+  CHECK(retry_optimizer.acceptedUpdateCount() == 1);
+  CHECK(retry_state.completed_iterations == 1);
 }
 
 TEST_CASE("Training iteration-count overflow fails before producer and publication",

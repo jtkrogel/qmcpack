@@ -49,6 +49,7 @@ set(QMCDRIVERS
     WFTrain/DistributedParameterReduction.cpp
     WFTrain/HighParameterTraining.cpp
     WFTrain/TrainingCheckpoint.cpp
+    WFTrain/FirstOrderOptimizer.cpp
     Optimizers/DescentEngine.cpp
     Optimizers/HybridEngine.cpp
     WFOpt/QMCCostFunctionBase.cpp

@@ -92,6 +92,7 @@ set(DRIVER_TEST_SRC
 list(APPEND DRIVER_TEST_SRC test_HighParameterTraining.cpp)
 list(APPEND DRIVER_TEST_SRC test_QuantileClipping.cpp)
 list(APPEND DRIVER_TEST_SRC test_TrainingCheckpoint.cpp)
+list(APPEND DRIVER_TEST_SRC test_FirstOrderOptimizer.cpp)
 add_executable(${UTEST_EXE} ${DRIVER_TEST_SRC})
 target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)
 if(USE_OBJECT_TARGET)

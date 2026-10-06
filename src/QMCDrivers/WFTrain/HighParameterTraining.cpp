@@ -113,10 +113,14 @@ TrainingIterationResult HighParameterTraining::runIteration(
   std::optional<EnergyGradientResult> objective;
   std::optional<StructuredParameterSnapshot> candidate;
   std::exception_ptr update_failure;
+  bool proposal_started = false;
+  bool proposal_live = false;
   try
   {
     objective.emplace(accumulator->finalize());
+    proposal_started = true;
     candidate.emplace(update_rule.propose(schema, parameters, *objective));
+    proposal_live = true;
     if (candidate->schema_fingerprint != schema.fingerprint() ||
         candidate->version != parameters.version ||
         candidate->values.size() != parameters.values.size())
@@ -136,10 +140,27 @@ TrainingIterationResult HighParameterTraining::runIteration(
   }
   catch (...)
   {
+    // The updater may have established speculative bookkeeping before a later
+    // candidate check failed. The callback is safe even when propose threw first.
+    if (proposal_started)
+      update_rule.proposalRejected();
+    proposal_live = false;
     update_failure = std::current_exception();
   }
-  reduction_.validateCandidate(schema, parameters,
-                               candidate ? &*candidate : nullptr, update_failure);
+  try
+  {
+    reduction_.validateCandidate(schema, parameters,
+                                 candidate ? &*candidate : nullptr, update_failure);
+  }
+  catch (...)
+  {
+    if (proposal_live)
+    {
+      update_rule.proposalRejected();
+      proposal_live = false;
+    }
+    throw;
+  }
 
   std::size_t local_committed_version = parameters.version;
   std::exception_ptr publication_failure;
@@ -151,11 +172,23 @@ TrainingIterationResult HighParameterTraining::runIteration(
   {
     publication_failure = std::current_exception();
   }
-  const std::size_t committed_version =
-      reduction_.completePublication(local_committed_version, publication_failure);
+  std::size_t committed_version = parameters.version;
+  try
+  {
+    committed_version =
+        reduction_.completePublication(local_committed_version, publication_failure);
+  }
+  catch (...)
+  {
+    update_rule.proposalRejected();
+    proposal_live = false;
+    throw;
+  }
 
   // All post-publication state operations are nonthrowing. The observer is
-  // notified only after both the provider and iteration state expose the commit.
+  // notified only after the optimizer, provider, and iteration state expose the commit.
+  update_rule.proposalAccepted(schema, parameters, *objective);
+  proposal_live = false;
   pending_state.parameter_version = committed_version;
   installTrainingState(state, pending_state);
   if (observer)

@@ -49,10 +49,25 @@ class TrainingUpdateRule
 {
 public:
   virtual ~TrainingUpdateRule() = default;
+
+  /// Construct one speculative candidate without changing committed optimizer state.
   virtual StructuredParameterSnapshot propose(
       const StructuredParameterSchema& schema,
       const StructuredParameterSnapshot& parameters,
       const EnergyGradientResult& objective) = 0;
+
+  /** Commit recurrence state after the candidate parameters are globally published.
+   *
+   * Stateful implementations must preallocate all required storage and make this
+   * callback nonthrowing. The default supports stateless update rules.
+   */
+  virtual void proposalAccepted(const StructuredParameterSchema& schema,
+                                const StructuredParameterSnapshot& parameters,
+                                const EnergyGradientResult& objective) noexcept
+  {}
+
+  /// Discard a speculative proposal after any recoverable post-proposal failure.
+  virtual void proposalRejected() noexcept {}
 };
 
 /// Refresh sampler-side value/drift caches after atomic parameter publication.
