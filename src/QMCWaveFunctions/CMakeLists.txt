@@ -136,6 +136,7 @@ set(FERMION_SRCS
     Fermion/DiracDeterminantWithBackflow.cpp
     Fermion/SlaterDetWithBackflow.cpp
     SPOSetBuilderFactory.cpp
+    TrialWaveFunctionMemoryPolicy.cpp
     TrialWaveFunction.cpp
     TWFdispatcher.cpp
     TWFFastDerivWrapper.cpp
