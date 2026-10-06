@@ -36,10 +36,8 @@ struct BatchResourcePreparationContext
       return;
 
     const BatchExecutionTopology& topology = plan->topology();
-    const std::size_t crowd_count           = topology.initial_walkers_per_crowd.size();
-    if (!topology.reserve_walkers_per_crowd.empty() &&
-        topology.reserve_walkers_per_crowd.size() != crowd_count)
-      throw std::logic_error("Batch resource preparation received an inconsistent crowd topology");
+    validateBatchExecutionTopology(topology);
+    const std::size_t crowd_count = topology.initial_walkers_per_crowd.size();
     if (crowd_index >= crowd_count)
       throw std::out_of_range("Batch resource preparation crowd index is outside the planned topology");
   }

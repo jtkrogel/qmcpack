@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
@@ -149,6 +150,244 @@ struct DirectBatchStorageRequirement
                              "PsiFormer batch setup peak overflowed");
   }
 };
+
+/** Categorize the accepted/proposed spatial arrays owned by one component clone.
+ *
+ * Element widths are supplied by PsiFormerWF so real and complex-adapter builds
+ * charge their actual ``ValueType`` and ``GradType`` representations.
+ */
+struct CloneStateStorageRequirement
+{
+  std::size_t accepted_gradients   = 0;
+  std::size_t proposed_gradients   = 0;
+  std::size_t accepted_laplacians  = 0;
+  std::size_t proposed_laplacians  = 0;
+
+  std::size_t totalBytes() const
+  {
+    std::size_t total = 0;
+    for (const std::size_t bytes : {accepted_gradients, proposed_gradients,
+                                    accepted_laplacians, proposed_laplacians})
+      addStorageBytes(total, bytes,
+                      "PsiFormer clone-state storage total overflowed");
+    return total;
+  }
+};
+
+/** Return exact numeric backing for one resident component clone's fixed state. */
+inline CloneStateStorageRequirement cloneStateStorageRequirement(
+    std::size_t electrons,
+    std::size_t value_type_bytes,
+    std::size_t gradient_type_bytes)
+{
+  if (electrons != 0 && (value_type_bytes == 0 || gradient_type_bytes == 0))
+    throw std::invalid_argument(
+        "PsiFormer clone-state element widths must be positive");
+
+  CloneStateStorageRequirement result;
+  result.accepted_gradients = checkedStorageProduct(
+      electrons, gradient_type_bytes,
+      "PsiFormer accepted-gradient storage overflowed");
+  result.proposed_gradients = result.accepted_gradients;
+  result.accepted_laplacians = checkedStorageProduct(
+      electrons, value_type_bytes,
+      "PsiFormer accepted-Laplacian storage overflowed");
+  result.proposed_laplacians = result.accepted_laplacians;
+  return result;
+}
+
+/** Logical capacities for shared, resource-owned publication staging.
+ *
+ * Dense operation families share typed staging arrays at the reserve-walker high
+ * water.  Sparse flattened ECP arrays coexist because an ECP call consumes both
+ * reference and replacement metadata.  Legacy unflattened storage is deliberately
+ * absent: an explicit memory policy must reject that path.
+ */
+struct ResourceStagingCapacityPlan
+{
+  std::size_t reserve_walkers      = 0;
+  std::size_t sparse_references    = 0;
+  std::size_t sparse_replacements  = 0;
+  std::size_t active_parameters    = 0;
+  std::size_t value_type_bytes     = 0;
+  std::size_t log_value_type_bytes = 0;
+  std::size_t gradient_type_bytes  = 0;
+  std::size_t selected_delta_bytes = 0;
+  bool value                       = false;
+  bool full_vgl                    = false;
+  bool active_gradient             = false;
+  bool flattened_ecp               = false;
+  bool weighted_ecp_score          = false;
+  bool score                       = false;
+  bool kinetic                     = false;
+};
+
+/** Categorized numeric buffers used to validate then publish direct results. */
+struct ResourceStagingStorageRequirement
+{
+  std::size_t walker_indices              = 0;
+  std::size_t active_electrons            = 0;
+  std::size_t configuration_identities    = 0;
+  std::size_t batch_slots                 = 0;
+  std::size_t signs                       = 0;
+  std::size_t log_magnitudes              = 0;
+  std::size_t ratios                      = 0;
+  std::size_t gradients                   = 0;
+  std::size_t preservation_flags          = 0;
+  std::size_t active_virtual_walkers      = 0;
+  std::size_t virtual_reference_indices   = 0;
+  std::size_t flattened_virtual_ratios    = 0;
+  std::size_t virtual_reference_weights   = 0;
+  std::size_t active_parameter_indices    = 0;
+  std::size_t selected_derivative_deltas  = 0;
+  std::size_t weighted_derivatives        = 0;
+
+  std::size_t totalBytes() const
+  {
+    std::size_t total = 0;
+    for (const std::size_t bytes : {
+             walker_indices, active_electrons, configuration_identities,
+             batch_slots, signs, log_magnitudes, ratios, gradients,
+             preservation_flags, active_virtual_walkers,
+             virtual_reference_indices, flattened_virtual_ratios,
+             virtual_reference_weights, active_parameter_indices,
+             selected_derivative_deltas, weighted_derivatives})
+      addStorageBytes(total, bytes,
+                      "PsiFormer publication staging total overflowed");
+    return total;
+  }
+};
+
+/** Estimate exact shared publication staging for one prepared crowd. */
+inline ResourceStagingStorageRequirement resourceStagingStorageRequirement(
+    const ResourceStagingCapacityPlan& plan)
+{
+  if (plan.weighted_ecp_score && !plan.flattened_ecp)
+    throw std::invalid_argument(
+        "PsiFormer weighted ECP staging requires flattened ECP storage");
+
+  const bool dense = plan.value || plan.full_vgl || plan.active_gradient;
+  if ((plan.value || plan.active_gradient) && plan.reserve_walkers != 0 && plan.value_type_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer publication value element width must be positive");
+  if (plan.full_vgl && plan.reserve_walkers != 0 && plan.log_value_type_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer publication log-value element width must be positive");
+  if ((plan.full_vgl || plan.active_gradient) &&
+      plan.reserve_walkers != 0 && plan.gradient_type_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer publication gradient element width must be positive");
+  const bool flattened_values =
+      plan.flattened_ecp && plan.sparse_replacements != 0;
+  const bool weighted_reference_values =
+      plan.weighted_ecp_score && plan.sparse_references != 0;
+  if ((flattened_values || weighted_reference_values) &&
+      plan.value_type_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer flattened ECP value element width must be positive");
+  if ((plan.weighted_ecp_score || plan.score || plan.kinetic) &&
+      plan.active_parameters != 0 &&
+      plan.selected_delta_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer selected-derivative element width must be positive");
+
+  const auto typed_bytes = [](std::size_t elements, std::size_t element_bytes,
+                              const char* quantity) {
+    return checkedStorageProduct(elements, element_bytes, quantity);
+  };
+
+  ResourceStagingStorageRequirement result;
+  if (dense)
+  {
+    result.walker_indices = checkedStorageBytes<std::size_t>(
+        plan.reserve_walkers,
+        "PsiFormer walker-index staging bytes overflowed");
+    result.configuration_identities = checkedStorageBytes<std::uint64_t>(
+        plan.reserve_walkers,
+        "PsiFormer configuration-identity staging bytes overflowed");
+    result.signs = checkedStorageBytes<double>(
+        plan.reserve_walkers,
+        "PsiFormer sign staging bytes overflowed");
+    result.log_magnitudes = checkedStorageBytes<double>(
+        plan.reserve_walkers,
+        "PsiFormer log-magnitude staging bytes overflowed");
+    const std::size_t ratio_element_bytes = plan.full_vgl
+        ? std::max(plan.value_type_bytes, plan.log_value_type_bytes)
+        : plan.value_type_bytes;
+    result.ratios = typed_bytes(
+        plan.reserve_walkers, ratio_element_bytes,
+        "PsiFormer ratio staging bytes overflowed");
+  }
+  if (plan.value)
+    result.preservation_flags = checkedStorageBytes<unsigned char>(
+        plan.reserve_walkers,
+        "PsiFormer preservation-flag staging bytes overflowed");
+  if (plan.full_vgl)
+    result.batch_slots = checkedStorageBytes<std::size_t>(
+        plan.reserve_walkers,
+        "PsiFormer batch-slot staging bytes overflowed");
+  if (plan.full_vgl || plan.active_gradient)
+    result.gradients = typed_bytes(
+        plan.reserve_walkers, plan.gradient_type_bytes,
+        "PsiFormer gradient staging bytes overflowed");
+  if (plan.active_gradient)
+    result.active_electrons = checkedStorageBytes<std::size_t>(
+        plan.reserve_walkers,
+        "PsiFormer active-electron staging bytes overflowed");
+
+  if (plan.flattened_ecp)
+  {
+    result.active_virtual_walkers = checkedStorageBytes<std::size_t>(
+        plan.sparse_references,
+        "PsiFormer active-virtual-walker staging bytes overflowed");
+    result.virtual_reference_indices = checkedStorageBytes<std::size_t>(
+        plan.reserve_walkers,
+        "PsiFormer virtual-reference-index staging bytes overflowed");
+    result.flattened_virtual_ratios = typed_bytes(
+        plan.sparse_replacements, plan.value_type_bytes,
+        "PsiFormer flattened-ratio staging bytes overflowed");
+  }
+
+  if (plan.weighted_ecp_score)
+  {
+    result.virtual_reference_weights = typed_bytes(
+        plan.sparse_references, plan.value_type_bytes,
+        "PsiFormer reference-weight staging bytes overflowed");
+    result.weighted_derivatives = typed_bytes(
+        checkedStorageProduct(
+            plan.sparse_references, plan.active_parameters,
+            "PsiFormer weighted-derivative staging extent overflowed"),
+        plan.value_type_bytes,
+        "PsiFormer weighted-derivative staging bytes overflowed");
+  }
+  if (plan.weighted_ecp_score || plan.score || plan.kinetic)
+  {
+    result.active_parameter_indices = checkedStorageBytes<std::size_t>(
+        plan.active_parameters,
+        "PsiFormer active-parameter-index staging bytes overflowed");
+    const std::size_t delta_copies = plan.kinetic ? 2 : 1;
+    result.selected_derivative_deltas = typed_bytes(
+        checkedStorageProduct(
+            delta_copies, plan.active_parameters,
+            "PsiFormer selected-derivative staging extent overflowed"),
+        plan.selected_delta_bytes,
+        "PsiFormer selected-derivative staging bytes overflowed");
+  }
+  return result;
+}
+
+/** Return clone-local scalar VALUE publication scratch at its logical envelope. */
+inline std::size_t scalarValuePublicationStorageRequirement(
+    std::size_t logical_maximum,
+    std::size_t value_type_bytes)
+{
+  if (logical_maximum != 0 && value_type_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer scalar VALUE element width must be positive");
+  return checkedStorageProduct(
+      logical_maximum, value_type_bytes,
+      "PsiFormer scalar VALUE publication bytes overflowed");
+}
 
 /// Return N*(N-1)/2 with checked arithmetic and no overflowing intermediate.
 inline std::size_t checkedUniqueElectronPairs(std::size_t electrons)

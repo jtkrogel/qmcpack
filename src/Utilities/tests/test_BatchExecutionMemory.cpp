@@ -496,6 +496,12 @@ TEST_CASE("Batch execution memory rejects invalid selection contracts", "[utilit
     CHECK_THROWS(selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate)));
   }
 
+  SECTION("rank reserve topology must cover the initial population")
+  {
+    input.topology.reserve_walkers_per_crowd = {2, 2, 0};
+    CHECK_THROWS_AS(selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate)), std::invalid_argument);
+  }
+
   SECTION("participant IDs must be nonempty and unique")
   {
     auto empty_id = makeProvider(equalSlopeEstimate, "");

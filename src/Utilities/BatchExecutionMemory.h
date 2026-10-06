@@ -186,6 +186,9 @@ struct BatchExecutionTopology
   std::size_t reserveWalkerCount() const;
 };
 
+/** Validate crowd-vector shape, checked totals, and the rank reserve envelope. */
+void validateBatchExecutionTopology(const BatchExecutionTopology& topology);
+
 /** Candidate-independent workload facts used to discover logical envelopes. */
 struct BatchExecutionWorkloadContext
 {

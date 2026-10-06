@@ -246,13 +246,7 @@ void validateSelectionInput(const BatchExecutionSelectionInput& input)
     throw std::invalid_argument("Batch execution memory schema ID must not be empty");
   if (input.preference.id.empty())
     throw std::invalid_argument("Batch execution memory preference ID must not be empty");
-  if (!input.topology.reserve_walkers_per_crowd.empty() &&
-      input.topology.reserve_walkers_per_crowd.size() != input.topology.initial_walkers_per_crowd.size())
-    throw std::invalid_argument("Initial and reserve batch crowd topologies must have the same number of crowds");
-
-  // Checked totals validate even topologies whose sum is not otherwise needed by this selection boundary.
-  input.topology.initialWalkerCount();
-  input.topology.reserveWalkerCount();
+  validateBatchExecutionTopology(input.topology);
 }
 
 /** Return whether every participant maximum fits within the driver envelope. */
@@ -368,6 +362,18 @@ std::size_t BatchExecutionTopology::reserveWalkerCount() const
   for (const std::size_t walkers : topology)
     total = checkedBatchMemoryAdd(total, walkers, "reserve walker count");
   return total;
+}
+
+void validateBatchExecutionTopology(const BatchExecutionTopology& topology)
+{
+  if (!topology.reserve_walkers_per_crowd.empty() &&
+      topology.reserve_walkers_per_crowd.size() != topology.initial_walkers_per_crowd.size())
+    throw std::invalid_argument("Initial and reserve batch crowd topologies must have the same number of crowds");
+
+  const std::size_t initial_walkers = topology.initialWalkerCount();
+  const std::size_t reserve_walkers = topology.reserveWalkerCount();
+  if (!topology.reserve_walkers_per_crowd.empty() && reserve_walkers < initial_walkers)
+    throw std::invalid_argument("The rank reserve walker envelope is smaller than the initial population");
 }
 
 void BatchMemoryEstimate::add(BatchMemoryCategory category,

@@ -113,6 +113,7 @@ set(TRIALWF_SRC
     test_TWFGrads.cpp
     test_virtual_particle_batch_dispatch.cpp
     test_psiformer_execution_plan.cpp
+    test_psiformer_memory_policy.cpp
     test_psiformer_initialization.cpp
     test_psiformer_geometry.cpp
     test_psiformer_buffer.cpp
