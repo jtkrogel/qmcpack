@@ -83,12 +83,14 @@ const BatchTileRequest& getRequest(const BatchTileRequests& requests, BatchExecu
   }
 }
 
-/** ECP weighted-score execution uses the same outer tile as ECP value execution. */
+/** All flattened ECP operation families use the same outer tile dimension. */
 bool modeIsRequired(const BatchExecutionRequirements& requirements, BatchExecutionMode mode)
 {
   if (mode == BatchExecutionMode::ECP_OUTER)
     return requirements.requires(BatchExecutionMode::ECP_OUTER) ||
-        requirements.requires(BatchExecutionMode::ECP_WEIGHTED_SCORE);
+        requirements.requires(BatchExecutionMode::ECP_WEIGHTED_SCORE) ||
+        requirements.requires(BatchExecutionMode::ECP_TMOVE_CANDIDATES) ||
+        requirements.requires(BatchExecutionMode::ECP_LISTENER_OUTPUT);
   return requirements.requires(mode);
 }
 
@@ -189,11 +191,23 @@ void mixRequest(std::uint64_t& hash, const BatchTileRequest& request) noexcept
     mixInteger(hash, request.fixedCapacity());
 }
 
+/** Mix every category of one estimate in stable host/device order. */
+void mixEstimate(std::uint64_t& hash, const BatchMemoryEstimate& estimate) noexcept
+{
+  for (std::size_t category = 0; category < static_cast<std::size_t>(BatchMemoryCategory::COUNT); ++category)
+  {
+    const BatchMemoryBytes bytes = estimate.at(static_cast<BatchMemoryCategory>(category));
+    mixInteger(hash, bytes.host);
+    mixInteger(hash, bytes.device);
+  }
+}
+
 /** Produce a stable exact-content fingerprint for an immutable selected plan. */
 std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
                               const BatchTileCapacities& selected,
                               const BatchMemoryEstimate& minimum_estimate,
-                              const BatchMemoryEstimate& estimate)
+                              const BatchMemoryEstimate& estimate,
+                              const std::vector<BatchMemoryParticipantEvidence>& participant_evidence)
 {
   std::uint64_t hash = 14695981039346656037ULL;
   mixString(hash, input.schema_id);
@@ -208,6 +222,7 @@ std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
   mixCapacities(hash, input.logical_maximum);
   mixCapacities(hash, input.preference.preferred);
   mixCapacities(hash, selected);
+  mixInteger(hash, input.active_parameter_count);
 
   mixByte(hash, input.topology.serialized_walkers);
   mixString(hash, input.topology.run_kind);
@@ -220,22 +235,22 @@ std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
   for (const std::size_t walkers : input.topology.reserve_walkers_per_crowd)
     mixInteger(hash, walkers);
 
-  mixInteger(hash, input.participant_ids.size());
-  for (const std::string& participant_id : input.participant_ids)
-    mixString(hash, participant_id);
-  for (std::size_t category = 0; category < static_cast<std::size_t>(BatchMemoryCategory::COUNT); ++category)
+  mixInteger(hash, participant_evidence.size());
+  for (const BatchMemoryParticipantEvidence& evidence : participant_evidence)
   {
-    const BatchMemoryBytes minimum_bytes = minimum_estimate.at(static_cast<BatchMemoryCategory>(category));
-    mixInteger(hash, minimum_bytes.host);
-    mixInteger(hash, minimum_bytes.device);
-    const BatchMemoryBytes bytes = estimate.at(static_cast<BatchMemoryCategory>(category));
-    mixInteger(hash, bytes.host);
-    mixInteger(hash, bytes.device);
+    mixString(hash, evidence.participant_id);
+    mixCapacities(hash, evidence.logical_maximum);
+    mixInteger(hash, evidence.owner_multiplicity);
+    mixByte(hash, evidence.fully_accounted);
+    mixEstimate(hash, evidence.fixed_minimum_per_owner);
+    mixEstimate(hash, evidence.selected_per_owner);
   }
+  mixEstimate(hash, minimum_estimate);
+  mixEstimate(hash, estimate);
   return hash;
 }
 
-/** Validate topology and structural identifiers before invoking any owner estimator. */
+/** Validate selection-wide fields before invoking any owner estimator. */
 void validateSelectionInput(const BatchExecutionSelectionInput& input)
 {
   if (input.schema_id.empty())
@@ -249,16 +264,47 @@ void validateSelectionInput(const BatchExecutionSelectionInput& input)
   // Checked totals validate even topologies whose sum is not otherwise needed by this selection boundary.
   input.topology.initialWalkerCount();
   input.topology.reserveWalkerCount();
+}
 
-  std::unordered_set<std::string> participant_ids;
-  for (const std::string& participant_id : input.participant_ids)
+/** Return whether every participant maximum fits within the driver envelope. */
+bool capacitiesFitWithin(const BatchTileCapacities& capacities, const BatchTileCapacities& envelope) noexcept
+{
+  return capacities.value <= envelope.value && capacities.full_vgl <= envelope.full_vgl &&
+      capacities.active_gradient <= envelope.active_gradient && capacities.ecp_outer <= envelope.ecp_outer;
+}
+
+/** Check invariant participant metadata against the first candidate evaluation. */
+void validateContributionInvariants(
+    const std::vector<BatchMemoryParticipantContribution>& contributions,
+    const std::vector<BatchMemoryParticipantContribution>& reference)
+{
+  if (contributions.size() != reference.size())
+    throw std::logic_error("Batch memory participant count changed across candidate estimates");
+
+  for (std::size_t index = 0; index < contributions.size(); ++index)
   {
-    if (participant_id.empty())
-      throw std::invalid_argument("Batch memory participant ID must not be empty");
-    if (!participant_ids.insert(participant_id).second)
-      throw std::invalid_argument("Duplicate batch memory participant ID: " + participant_id);
+    const BatchMemoryParticipantContribution& contribution = contributions[index];
+    const BatchMemoryParticipantContribution& expected     = reference[index];
+    if (contribution.participant_id != expected.participant_id)
+      throw std::logic_error("Batch memory participant identity or order changed across candidate estimates");
+    if (!(contribution.contribution.logical_maximum == expected.contribution.logical_maximum))
+      throw std::logic_error("Batch memory participant logical maximum changed across candidate estimates: " +
+                             contribution.participant_id);
+    if (contribution.contribution.owner_multiplicity != expected.contribution.owner_multiplicity)
+      throw std::logic_error("Batch memory participant owner multiplicity changed across candidate estimates: " +
+                             contribution.participant_id);
+    if (contribution.contribution.fully_accounted != expected.contribution.fully_accounted)
+      throw std::logic_error("Batch memory participant accounting status changed across candidate estimates: " +
+                             contribution.participant_id);
   }
 }
+
+/** One provider evaluation paired with its checked rank-local aggregate. */
+struct ContributionEvaluation
+{
+  std::vector<BatchMemoryParticipantContribution> contributions;
+  BatchMemoryEstimate aggregate;
+};
 
 /** Resolve one request against whether the mode is reachable and its logical maximum. */
 std::size_t initialCapacity(const BatchTileRequest& request,
@@ -381,36 +427,107 @@ BatchMemoryBytes checkedBatchMemoryMultiply(BatchMemoryBytes bytes,
           checkedBatchMemoryMultiply(bytes.device, multiplicity, context + " device")};
 }
 
-BatchMemoryEstimate aggregateBatchMemoryEstimates(const std::vector<BatchMemoryParticipantEstimate>& participants)
+std::string escapeBatchParticipantIdSegment(std::string_view segment)
+{
+  constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
+  std::string escaped;
+  escaped.reserve(segment.size());
+  for (const unsigned char character : segment)
+  {
+    const bool unreserved = (character >= 'a' && character <= 'z') ||
+        (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
+        character == '-' || character == '.' || character == '_' || character == '~';
+    if (unreserved)
+      escaped.push_back(static_cast<char>(character));
+    else
+    {
+      escaped.push_back('%');
+      escaped.push_back(HEX_DIGITS[character >> 4]);
+      escaped.push_back(HEX_DIGITS[character & 0x0fU]);
+    }
+  }
+  return escaped;
+}
+
+BatchMemoryEstimate aggregateBatchMemoryContributions(
+    const std::vector<BatchMemoryParticipantContribution>& participants)
 {
   BatchMemoryEstimate aggregate;
   std::unordered_set<std::string> participant_ids;
-  for (const BatchMemoryParticipantEstimate& participant : participants)
+  for (const BatchMemoryParticipantContribution& participant : participants)
   {
     if (participant.participant_id.empty())
       throw std::invalid_argument("Batch memory participant ID must not be empty");
     if (!participant_ids.insert(participant.participant_id).second)
       throw std::invalid_argument("Duplicate batch memory participant ID: " + participant.participant_id);
-    if (participant.owner_multiplicity == 0)
+    if (!participant.contribution.fully_accounted)
+      throw std::invalid_argument("Batch memory participant is not fully accounted: " + participant.participant_id);
+    if (participant.contribution.owner_multiplicity == 0)
       continue;
 
     for (std::size_t category = 0; category < static_cast<std::size_t>(BatchMemoryCategory::COUNT); ++category)
     {
       const BatchMemoryBytes bytes = checkedBatchMemoryMultiply(
-          participant.per_owner.at(static_cast<BatchMemoryCategory>(category)), participant.owner_multiplicity,
-          participant.participant_id);
+          participant.contribution.per_owner.at(static_cast<BatchMemoryCategory>(category)),
+          participant.contribution.owner_multiplicity, participant.participant_id);
       aggregate.add(static_cast<BatchMemoryCategory>(category), bytes, participant.participant_id);
     }
   }
   return aggregate;
 }
 
+const BatchExecutionPlan& BatchExecutionParticipantPlan::plan() const
+{
+  if (!plan_)
+    throw std::logic_error("An empty batch execution participant view has no plan");
+  return *plan_;
+}
+
+const BatchMemoryParticipantEvidence& BatchExecutionParticipantPlan::evidence() const
+{
+  if (!plan_)
+    throw std::logic_error("An empty batch execution participant view has no evidence");
+  const std::vector<BatchMemoryParticipantEvidence>& all_evidence = plan_->participantEvidence();
+  if (participant_index_ >= all_evidence.size())
+    throw std::logic_error("Batch execution participant view has an invalid evidence index");
+  return all_evidence[participant_index_];
+}
+
+bool BatchExecutionParticipantPlan::sameBinding(const BatchExecutionParticipantPlan& other) const noexcept
+{
+  if (!plan_ || !other.plan_)
+    return plan_.get() == other.plan_.get();
+  return plan_.get() == other.plan_.get() && participant_index_ == other.participant_index_;
+}
+
+BatchExecutionParticipantPlan makeBatchExecutionParticipantPlan(
+    std::shared_ptr<const BatchExecutionPlan> plan,
+    std::string_view participant_id)
+{
+  // A null plan is the explicit no-policy binding. The participant identity is
+  // intentionally ignored because no evidence exists to resolve it against.
+  if (!plan)
+    return {};
+  if (participant_id.empty())
+    throw std::invalid_argument("Batch memory participant ID must not be empty");
+
+  const std::vector<BatchMemoryParticipantEvidence>& evidence = plan->participantEvidence();
+  const auto match = std::find_if(evidence.begin(), evidence.end(), [participant_id](const auto& item) {
+    return item.participant_id == participant_id;
+  });
+  if (match == evidence.end())
+    throw std::invalid_argument("Batch execution plan has no evidence for participant: " +
+                                std::string(participant_id));
+  const std::size_t participant_index = static_cast<std::size_t>(std::distance(evidence.begin(), match));
+  return BatchExecutionParticipantPlan(std::move(plan), participant_index);
+}
+
 BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& input,
-                                            const BatchMemoryEstimator& estimator)
+                                            const BatchMemoryContributionProvider& provider)
 {
   validateSelectionInput(input);
-  if (!estimator)
-    throw std::invalid_argument("Batch execution memory selection requires an estimator");
+  if (!provider)
+    throw std::invalid_argument("Batch execution memory selection requires a contribution provider");
 
   BatchTileCapacities selected;
   for (const BatchExecutionMode mode : TUNABLE_MODES)
@@ -426,8 +543,32 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
     if (modeIsRequired(input.requirements, mode) && getRequest(input.policy.tiles, mode).isAutomatic())
       setCapacity(minimum, mode, 1);
 
-  const BatchMemoryEstimate minimum_estimate = estimator(minimum);
-  const BatchMemoryBytes minimum_bytes        = minimum_estimate.total("fixed minimum");
+  std::vector<BatchMemoryParticipantContribution> reference_contributions;
+  bool have_reference = false;
+  auto evaluate = [&](const BatchTileCapacities& capacities) {
+    BatchExecutionPlanningContext context{input.requirements, input.topology, input.logical_maximum, capacities,
+                                          input.active_parameter_count};
+    ContributionEvaluation evaluation;
+    evaluation.contributions = provider(context);
+    evaluation.aggregate     = aggregateBatchMemoryContributions(evaluation.contributions);
+
+    for (const BatchMemoryParticipantContribution& participant : evaluation.contributions)
+      if (!capacitiesFitWithin(participant.contribution.logical_maximum, input.logical_maximum))
+        throw std::invalid_argument("Batch memory participant logical maximum exceeds the selection envelope: " +
+                                    participant.participant_id);
+
+    if (have_reference)
+      validateContributionInvariants(evaluation.contributions, reference_contributions);
+    else
+    {
+      reference_contributions = evaluation.contributions;
+      have_reference          = true;
+    }
+    return evaluation;
+  };
+
+  ContributionEvaluation minimum_evaluation = evaluate(minimum);
+  const BatchMemoryBytes minimum_bytes       = minimum_evaluation.aggregate.total("fixed minimum");
   if (!fitsBudget(input.policy, minimum_bytes))
   {
     std::ostringstream message;
@@ -436,14 +577,15 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
     throw std::runtime_error(message.str());
   }
 
-  BatchMemoryEstimate selected_estimate = estimator(selected);
-  while (!fitsBudget(input.policy, selected_estimate.total("selected plan")))
+  ContributionEvaluation selected_evaluation =
+      selected == minimum ? minimum_evaluation : evaluate(selected);
+  while (!fitsBudget(input.policy, selected_evaluation.aggregate.total("selected plan")))
   {
-    const BatchMemoryBytes current_bytes = selected_estimate.total("selected plan");
+    const BatchMemoryBytes current_bytes = selected_evaluation.aggregate.total("selected plan");
     bool found_candidate                 = false;
     ReliefScore best_saving;
     BatchTileCapacities best_capacities;
-    BatchMemoryEstimate best_estimate;
+    ContributionEvaluation best_evaluation;
 
     // Iteration order is the documented stable tie break: VALUE, FULL_VGL,
     // ACTIVE_GRADIENT, then ECP_OUTER.
@@ -454,15 +596,16 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
 
       BatchTileCapacities candidate = selected;
       setCapacity(candidate, mode, getCapacity(candidate, mode) - 1);
-      BatchMemoryEstimate candidate_estimate = estimator(candidate);
-      const BatchMemoryBytes saving = checkedSaving(current_bytes, candidate_estimate.total("candidate plan"));
+      ContributionEvaluation candidate_evaluation = evaluate(candidate);
+      const BatchMemoryBytes saving =
+          checkedSaving(current_bytes, candidate_evaluation.aggregate.total("candidate plan"));
       const ReliefScore score        = savingScore(input.policy, current_bytes, saving);
       if (!found_candidate || score > best_saving)
       {
         found_candidate = true;
-        best_saving     = score;
-        best_capacities = candidate;
-        best_estimate   = std::move(candidate_estimate);
+        best_saving      = score;
+        best_capacities  = candidate;
+        best_evaluation  = std::move(candidate_evaluation);
       }
     }
 
@@ -473,8 +616,20 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
               << formatBytes(current_bytes) << ")";
       throw std::runtime_error(message.str());
     }
-    selected          = best_capacities;
-    selected_estimate = std::move(best_estimate);
+    selected            = best_capacities;
+    selected_evaluation = std::move(best_evaluation);
+  }
+
+  std::vector<BatchMemoryParticipantEvidence> participant_evidence;
+  participant_evidence.reserve(minimum_evaluation.contributions.size());
+  for (std::size_t index = 0; index < minimum_evaluation.contributions.size(); ++index)
+  {
+    const BatchMemoryParticipantContribution& minimum_contribution  = minimum_evaluation.contributions[index];
+    const BatchMemoryParticipantContribution& selected_contribution = selected_evaluation.contributions[index];
+    participant_evidence.push_back(
+        {minimum_contribution.participant_id, minimum_contribution.contribution.logical_maximum,
+         minimum_contribution.contribution.owner_multiplicity, minimum_contribution.contribution.fully_accounted,
+         minimum_contribution.contribution.per_owner, selected_contribution.contribution.per_owner});
   }
 
   BatchExecutionPlan plan;
@@ -485,10 +640,12 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   plan.policy_                 = input.policy;
   plan.logical_maximum_        = input.logical_maximum;
   plan.selected_capacities_    = selected;
-  plan.fixed_minimum_estimate_ = minimum_estimate;
-  plan.selected_estimate_      = selected_estimate;
-  plan.participant_ids_        = input.participant_ids;
-  plan.fingerprint_            = makeFingerprint(input, selected, minimum_estimate, selected_estimate);
+  plan.fixed_minimum_estimate_ = minimum_evaluation.aggregate;
+  plan.selected_estimate_      = selected_evaluation.aggregate;
+  plan.active_parameter_count_ = input.active_parameter_count;
+  plan.participant_evidence_   = std::move(participant_evidence);
+  plan.fingerprint_ = makeFingerprint(input, selected, plan.fixed_minimum_estimate_, plan.selected_estimate_,
+                                      plan.participant_evidence_);
   return plan;
 }
 

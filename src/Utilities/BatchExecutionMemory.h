@@ -14,8 +14,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace qmcplusplus
@@ -59,13 +61,15 @@ enum class BatchMemoryCategory : std::size_t
 /** Required operation families determine which tile dimensions may be nonzero. */
 enum class BatchExecutionMode : std::uint32_t
 {
-  VALUE              = 1U << 0,
-  FULL_VGL           = 1U << 1,
-  ACTIVE_GRADIENT    = 1U << 2,
-  SCORE              = 1U << 3,
-  KINETIC            = 1U << 4,
-  ECP_OUTER          = 1U << 5,
-  ECP_WEIGHTED_SCORE = 1U << 6
+  VALUE                = 1U << 0,
+  FULL_VGL             = 1U << 1,
+  ACTIVE_GRADIENT      = 1U << 2,
+  SCORE                = 1U << 3,
+  KINETIC              = 1U << 4,
+  ECP_OUTER            = 1U << 5,
+  ECP_WEIGHTED_SCORE   = 1U << 6,
+  ECP_TMOVE_CANDIDATES = 1U << 7,
+  ECP_LISTENER_OUTPUT  = 1U << 8
 };
 
 /** Compact mask of operation families reachable from one driver section. */
@@ -177,6 +181,16 @@ struct BatchExecutionTopology
   std::size_t reserveWalkerCount() const;
 };
 
+/** Complete neutral context presented to every participant estimator. */
+struct BatchExecutionPlanningContext
+{
+  BatchExecutionRequirements requirements;
+  BatchExecutionTopology topology;
+  BatchTileCapacities logical_maximum;
+  BatchTileCapacities candidate_capacities;
+  std::size_t active_parameter_count = 0;
+};
+
 /** Categorized exact estimate returned by one or more registered owners. */
 class BatchMemoryEstimate
 {
@@ -196,12 +210,31 @@ private:
   std::array<BatchMemoryBytes, static_cast<std::size_t>(BatchMemoryCategory::COUNT)> categories_{};
 };
 
-/** Estimate from a stable participant, with the number of simultaneously resident owners. */
-struct BatchMemoryParticipantEstimate
+/** Candidate estimate and invariant metadata supplied by one storage owner family. */
+struct BatchMemoryContribution
+{
+  BatchTileCapacities logical_maximum;
+  std::size_t owner_multiplicity = 0;
+  bool fully_accounted           = false;
+  BatchMemoryEstimate per_owner;
+};
+
+/** One contribution paired with its deterministic aggregate-assigned identity. */
+struct BatchMemoryParticipantContribution
 {
   std::string participant_id;
-  std::size_t owner_multiplicity = 1;
-  BatchMemoryEstimate per_owner;
+  BatchMemoryContribution contribution;
+};
+
+/** Minimum and selected evidence retained for one ordered participant. */
+struct BatchMemoryParticipantEvidence
+{
+  std::string participant_id;
+  BatchTileCapacities logical_maximum;
+  std::size_t owner_multiplicity = 0;
+  bool fully_accounted           = false;
+  BatchMemoryEstimate fixed_minimum_per_owner;
+  BatchMemoryEstimate selected_per_owner;
 };
 
 /** Complete pure input to deterministic tile selection. */
@@ -213,8 +246,11 @@ struct BatchExecutionSelectionInput
   BatchExecutionTopology topology;
   BatchTileCapacities logical_maximum;
   BatchExecutionPreferenceProfile preference;
-  std::vector<std::string> participant_ids;
+  std::size_t active_parameter_count = 0;
 };
+
+using BatchMemoryContributionProvider =
+    std::function<std::vector<BatchMemoryParticipantContribution>(const BatchExecutionPlanningContext&)>;
 
 /** Logically immutable result bound to all resources created for one driver section. */
 class BatchExecutionPlan
@@ -230,12 +266,15 @@ public:
   const BatchTileCapacities& selectedCapacities() const noexcept { return selected_capacities_; }
   const BatchMemoryEstimate& fixedMinimumEstimate() const noexcept { return fixed_minimum_estimate_; }
   const BatchMemoryEstimate& selectedEstimate() const noexcept { return selected_estimate_; }
-  const std::vector<std::string>& participantIds() const noexcept { return participant_ids_; }
+  std::size_t activeParameterCount() const noexcept { return active_parameter_count_; }
+  const std::vector<BatchMemoryParticipantEvidence>& participantEvidence() const noexcept
+  {
+    return participant_evidence_;
+  }
 
 private:
-  friend BatchExecutionPlan selectBatchExecutionPlan(
-      const BatchExecutionSelectionInput&,
-      const std::function<BatchMemoryEstimate(const BatchTileCapacities&)>&);
+  friend BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput&,
+                                                      const BatchMemoryContributionProvider&);
 
   std::string schema_id_;
   std::string preference_id_;
@@ -247,10 +286,35 @@ private:
   BatchTileCapacities selected_capacities_;
   BatchMemoryEstimate fixed_minimum_estimate_;
   BatchMemoryEstimate selected_estimate_;
-  std::vector<std::string> participant_ids_;
+  std::size_t active_parameter_count_ = 0;
+  std::vector<BatchMemoryParticipantEvidence> participant_evidence_;
 };
 
 using BatchMemoryEstimator = std::function<BatchMemoryEstimate(const BatchTileCapacities&)>;
+
+/** Shared immutable view of one participant's slice of a selected plan. */
+class BatchExecutionParticipantPlan
+{
+public:
+  BatchExecutionParticipantPlan() noexcept = default;
+
+  bool hasPlan() const noexcept { return static_cast<bool>(plan_); }
+  explicit operator bool() const noexcept { return hasPlan(); }
+  const BatchExecutionPlan& plan() const;
+  const BatchMemoryParticipantEvidence& evidence() const;
+  bool sameBinding(const BatchExecutionParticipantPlan& other) const noexcept;
+
+private:
+  BatchExecutionParticipantPlan(std::shared_ptr<const BatchExecutionPlan> plan, std::size_t participant_index)
+      : plan_(std::move(plan)), participant_index_(participant_index)
+  {}
+
+  std::shared_ptr<const BatchExecutionPlan> plan_;
+  std::size_t participant_index_ = 0;
+
+  friend BatchExecutionParticipantPlan makeBatchExecutionParticipantPlan(
+      std::shared_ptr<const BatchExecutionPlan>, std::string_view);
+};
 
 /** Checked scalar addition used by estimators and storage owners. */
 std::size_t checkedBatchMemoryAdd(std::size_t lhs, std::size_t rhs, const std::string& context);
@@ -268,12 +332,21 @@ BatchMemoryBytes checkedBatchMemoryMultiply(BatchMemoryBytes bytes,
                                             std::size_t multiplicity,
                                             const std::string& context);
 
-/** Aggregate stable participant estimates with checked owner multiplicities. */
-BatchMemoryEstimate aggregateBatchMemoryEstimates(const std::vector<BatchMemoryParticipantEstimate>& participants);
+/** Escape one structural-identity segment using deterministic byte percent encoding. */
+std::string escapeBatchParticipantIdSegment(std::string_view segment);
+
+/** Aggregate complete stable contributions with checked owner multiplicities. */
+BatchMemoryEstimate aggregateBatchMemoryContributions(
+    const std::vector<BatchMemoryParticipantContribution>& participants);
+
+/** Make a shared view; null plans make an empty view and missing IDs are rejected. */
+BatchExecutionParticipantPlan makeBatchExecutionParticipantPlan(
+    std::shared_ptr<const BatchExecutionPlan> plan,
+    std::string_view participant_id);
 
 /** Resolve hard requests and deterministic automatic tiles against exact estimates. */
 BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& input,
-                                            const BatchMemoryEstimator& estimator);
+                                            const BatchMemoryContributionProvider& provider);
 
 } // namespace qmcplusplus
 
