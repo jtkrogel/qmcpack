@@ -61,6 +61,9 @@ namespace psiformer
 {
 /// Dependency-light result of deterministic native PsiFormer initialization.
 struct InitializedPsiFormerParameters;
+
+/// Pure input used to estimate this component family's planned batch storage.
+struct PsiFormerMemoryPolicyInput;
 }
 
 /// Shared, versioned native model state used by all clones of one component.
@@ -431,6 +434,24 @@ public:
   /// Restore a matching accepted-state record or invalidate a stale one.
   void copyFromBuffer(ParticleSet& particles, WFBufferType& buffer) override;
 
+  /// Declare the full-spatial initialization path required by this component.
+  void contributeBatchExecutionRequirements(BatchExecutionRequirements& requirements) const override;
+
+  /// Return shape- and topology-derived logical maxima without allocating scratch.
+  BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext& context) const override;
+
+  /// Estimate exact rank-local ownership while execution storage remains fail-closed.
+  BatchMemoryContribution estimateBatchExecutionMemory(
+      const BatchExecutionPlanningContext& context) const override;
+
+  /// Validate an immutable participant view and its exact selected evidence.
+  void validateBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan& plan) const override;
+
+  /// Publish a validated participant view, including an explicit null clearing view.
+  void bindBatchExecutionPlan(BatchExecutionParticipantPlan plan) noexcept override;
+
   /// Add one cloneable crowd workspace resource to the collection.
   void createResource(ResourceCollection& collection) const override;
 
@@ -648,6 +669,9 @@ private:
                             std::size_t parameter_version,
                             AcceptedStateRequirement requirement) const;
 
+  /// Translate immutable model, backend, and optimizer facts into the pure policy input.
+  psiformer::PsiFormerMemoryPolicyInput makeBatchMemoryPolicyInput() const;
+
   /// Add cached component G/L contributions to caller-owned wavefunction accumulators.
   void accumulateAcceptedSpatial(ParticleSet::ParticleGradient& gradient,
                                  ParticleSet::ParticleLaplacian& laplacian) const;
@@ -682,6 +706,8 @@ private:
   std::unique_ptr<pf::DirectBatchWorkspace> direct_batch_workspace_;
   /// ResourceCollection-owned workspace handle populated only on the crowd leader.
   ResourceHandle<PsiFormerMultiWalkerResource> mw_resource_handle_;
+  /// Immutable selected-plan slice copied to component clones without copying scratch.
+  BatchExecutionParticipantPlan batch_execution_plan_;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
   std::string system_kind_ = "unvalidated";
   /// Optional DeepQMC-format destination written with the final QMCPACK VP report.

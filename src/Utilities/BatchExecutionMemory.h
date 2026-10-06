@@ -283,6 +283,7 @@ public:
   const BatchExecutionTopology& topology() const noexcept { return topology_; }
   const BatchMemoryPolicy& policy() const noexcept { return policy_; }
   const BatchTileCapacities& logicalMaximum() const noexcept { return logical_maximum_; }
+  const BatchTileCapacities& minimumCapacities() const noexcept { return minimum_capacities_; }
   const BatchTileCapacities& selectedCapacities() const noexcept { return selected_capacities_; }
   const BatchMemoryEstimate& fixedMinimumEstimate() const noexcept { return fixed_minimum_estimate_; }
   const BatchMemoryEstimate& selectedEstimate() const noexcept { return selected_estimate_; }
@@ -303,6 +304,7 @@ private:
   BatchExecutionTopology topology_;
   BatchMemoryPolicy policy_;
   BatchTileCapacities logical_maximum_;
+  BatchTileCapacities minimum_capacities_;
   BatchTileCapacities selected_capacities_;
   BatchMemoryEstimate fixed_minimum_estimate_;
   BatchMemoryEstimate selected_estimate_;

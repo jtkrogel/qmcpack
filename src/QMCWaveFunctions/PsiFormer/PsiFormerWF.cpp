@@ -13,6 +13,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
@@ -82,6 +83,61 @@ const char* directBackendModeName(DirectBackendMode mode)
     return "compare";
   }
   return "unknown";
+}
+
+/// Convert the implementation switch to the dependency-light memory-policy enum.
+psiformer::PsiFormerMemoryBackend memoryPolicyBackend(DirectBackendMode mode)
+{
+  switch (mode)
+  {
+  case DirectBackendMode::DIRECT:
+    return psiformer::PsiFormerMemoryBackend::DIRECT;
+  case DirectBackendMode::ORACLE:
+    return psiformer::PsiFormerMemoryBackend::ORACLE;
+  case DirectBackendMode::COMPARE:
+    return psiformer::PsiFormerMemoryBackend::COMPARE;
+  }
+  throw std::logic_error("PsiFormer has an unknown direct-backend mode");
+}
+
+/// Return whether one component maximum fits inside the aggregate plan envelope.
+bool capacitiesFitWithin(const BatchTileCapacities& capacities,
+                         const BatchTileCapacities& envelope) noexcept
+{
+  return capacities.value <= envelope.value &&
+      capacities.full_vgl <= envelope.full_vgl &&
+      capacities.active_gradient <= envelope.active_gradient &&
+      capacities.ecp_outer <= envelope.ecp_outer;
+}
+
+/// Reject planned operation families routed through an unaccounted developer backend.
+void validatePlannedBackends(
+    const psiformer::PsiFormerMemoryPolicyInput& input,
+    const BatchExecutionRequirements& requirements)
+{
+  using Backend = psiformer::PsiFormerMemoryBackend;
+  const bool has_active_parameters = input.active_parameter_count != 0;
+
+  if (batchExecutionModeIsRequired(requirements, BatchExecutionMode::VALUE) &&
+      input.backends.value != Backend::DIRECT)
+    throw std::invalid_argument(
+        "PsiFormer planned VALUE execution requires the direct backend");
+  if ((requirements.requires(BatchExecutionMode::FULL_VGL) ||
+       requirements.requires(BatchExecutionMode::ACTIVE_GRADIENT)) &&
+      input.backends.spatial != Backend::DIRECT)
+    throw std::invalid_argument(
+        "PsiFormer planned spatial execution requires the direct backend");
+  if (has_active_parameters &&
+      (requirements.requires(BatchExecutionMode::SCORE) ||
+       requirements.requires(BatchExecutionMode::ECP_WEIGHTED_SCORE)) &&
+      input.backends.score != Backend::DIRECT)
+    throw std::invalid_argument(
+        "PsiFormer planned score execution requires the direct backend");
+  if (has_active_parameters &&
+      requirements.requires(BatchExecutionMode::KINETIC) &&
+      input.backends.kinetic != Backend::DIRECT)
+    throw std::invalid_argument(
+        "PsiFormer planned kinetic execution requires the direct backend");
 }
 
 /// Initial value for deterministic FNV-1a identities stored in walker buffers.
@@ -910,6 +966,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       model_state_(other.model_state_),
       optimization_metadata_(other.optimization_metadata_),
       structured_parameter_schema_(other.structured_parameter_schema_),
+      batch_execution_plan_(other.batch_execution_plan_),
       system_kind_(other.system_kind_),
       optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
@@ -928,6 +985,147 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
 }
 
 PsiFormerWF::~PsiFormerWF() = default;
+
+// Translate immutable component facts into one allocation-free policy input.
+psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() const
+{
+  const psiformer::ModelShape& model_shape = model_state_->execution_plan.modelShape();
+  const auto& value_layout                = model_state_->direct_value_executor.layout();
+  if (!value_layout)
+    throw std::logic_error("PsiFormer direct value layout is not initialized");
+
+  psiformer::PsiFormerMemoryPolicyInput input;
+  input.storage_shape.electrons        = model_shape.electrons();
+  input.storage_shape.nuclei           = model_shape.nuclei;
+  input.storage_shape.determinants     = model_shape.determinants;
+  input.storage_shape.feature_width    = model_shape.feature_dimension;
+  input.storage_shape.attention_heads  = model_shape.attention_heads;
+  input.storage_shape.input_width      = value_layout->inputWidth();
+  input.storage_shape.attention_blocks = model_shape.attention_blocks;
+  input.storage_shape.parameter_count  = model_state_->execution_plan.parameterCount();
+  input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
+      ValueType, LogValue, GradType, SelectedDerivativeDelta::value_type>();
+  input.backends.value   = memoryPolicyBackend(model_state_->direct_value_mode);
+  input.backends.spatial = memoryPolicyBackend(model_state_->direct_spatial_mode);
+  input.backends.score   = memoryPolicyBackend(model_state_->direct_score_mode);
+  input.backends.kinetic = memoryPolicyBackend(model_state_->direct_kinetic_mode);
+
+  // The selected flat-index vector is immutable after construction.  It is the
+  // component-local derivative width, whereas the planning context carries the
+  // aggregate active width across every wavefunction component.
+  input.active_parameter_count = optimization_metadata_->selected_flat_indices.size();
+  input.scalar_value_logical_maximum =
+      checkedBatchMemoryAdd(model_shape.electrons(), 1,
+                            "PsiFormer all-to-one logical envelope");
+  input.flattened_ecp = true;
+
+  // Stage 3 binds policy identity but deliberately leaves execution and storage
+  // preparation unchanged.  No live path may therefore advertise a hard cap yet.
+  input.accounting_claims = {};
+  return input;
+}
+
+// Full VGL initialization is always reachable; phase-specific drivers add all other modes.
+void PsiFormerWF::contributeBatchExecutionRequirements(
+    BatchExecutionRequirements& requirements) const
+{
+  requirements.require(BatchExecutionMode::FULL_VGL);
+}
+
+// Discover this component's shape-derived maxima before candidate selection.
+BatchTileCapacities PsiFormerWF::batchExecutionLogicalMaximum(
+    const BatchExecutionWorkloadContext& context) const
+{
+  return psiformer::psiFormerBatchLogicalMaximum(
+      makeBatchMemoryPolicyInput(), context);
+}
+
+// Delegate exact mixed clone/crowd ownership accounting to the pure policy.
+BatchMemoryContribution PsiFormerWF::estimateBatchExecutionMemory(
+    const BatchExecutionPlanningContext& context) const
+{
+  return psiformer::estimatePsiFormerBatchMemory(
+      makeBatchMemoryPolicyInput(), context);
+}
+
+// Check a prospective participant view completely before noexcept publication.
+void PsiFormerWF::validateBatchExecutionPlanBinding(
+    const BatchExecutionParticipantPlan& participant_plan) const
+{
+  if (!participant_plan)
+  {
+    if (mw_resource_handle_ && batch_execution_plan_)
+      throw std::logic_error(
+          "Cannot clear a PsiFormer batch execution plan while its resource is acquired");
+    return;
+  }
+
+  if (mw_resource_handle_ &&
+      !batch_execution_plan_.sameBinding(participant_plan))
+    throw std::logic_error(
+        "Cannot rebind a PsiFormer batch execution plan while its resource is acquired");
+
+  const BatchExecutionPlan& plan = participant_plan.plan();
+  const BatchMemoryParticipantEvidence& evidence = participant_plan.evidence();
+  if (evidence.participant_id.empty())
+    throw std::invalid_argument(
+        "PsiFormer batch execution participant evidence has an empty identity");
+
+  BatchExecutionRequirements component_requirements;
+  contributeBatchExecutionRequirements(component_requirements);
+  if ((plan.requirements().mask() & component_requirements.mask()) !=
+      component_requirements.mask())
+    throw std::invalid_argument(
+        "PsiFormer batch execution plan omits a component-owned requirement");
+
+  const psiformer::PsiFormerMemoryPolicyInput input =
+      makeBatchMemoryPolicyInput();
+  validatePlannedBackends(input, plan.requirements());
+
+  BatchExecutionPlanningContext selected_context{
+      plan.requirements(), plan.topology(), plan.logicalMaximum(),
+      plan.selectedCapacities(), plan.activeParameterCount()};
+  const BatchMemoryContribution selected =
+      psiformer::estimatePsiFormerBatchMemory(input, selected_context);
+
+  if (!capacitiesFitWithin(selected.logical_maximum, plan.logicalMaximum()))
+    throw std::invalid_argument(
+        "PsiFormer logical maximum exceeds the aggregate batch plan envelope");
+  if (!(evidence.logical_maximum == selected.logical_maximum))
+    throw std::invalid_argument(
+        "PsiFormer batch participant logical-maximum evidence is stale");
+  if (selected.owner_multiplicity != 1 ||
+      evidence.owner_multiplicity != selected.owner_multiplicity)
+    throw std::invalid_argument(
+        "PsiFormer batch participant must have one exact rank-local owner");
+  if (!(evidence.selected_per_owner == selected.per_owner))
+    throw std::invalid_argument(
+        "PsiFormer selected batch-memory evidence does not match the current model and topology");
+
+  BatchExecutionPlanningContext minimum_context = selected_context;
+  minimum_context.candidate_capacities = plan.minimumCapacities();
+  const BatchMemoryContribution minimum =
+      psiformer::estimatePsiFormerBatchMemory(input, minimum_context);
+  if (!(evidence.fixed_minimum_per_owner == minimum.per_owner))
+    throw std::invalid_argument(
+        "PsiFormer fixed-minimum batch-memory evidence does not match the current model and topology");
+  if (evidence.fully_accounted != selected.fully_accounted)
+    throw std::invalid_argument(
+        "PsiFormer batch participant accounting evidence is stale");
+
+  // Subsequent stages will turn on claims only after preparing every reachable
+  // owner and guarding each live call.  Until then, a nonempty binding fails closed.
+  if (!selected.fully_accounted)
+    throw std::logic_error(
+        "PsiFormer planned execution is not yet fully storage-accounted");
+}
+
+// Publish only views that the aggregate two-phase binding boundary already validated.
+void PsiFormerWF::bindBatchExecutionPlan(
+    BatchExecutionParticipantPlan participant_plan) noexcept
+{
+  batch_execution_plan_ = std::move(participant_plan);
+}
 
 // Report the immutable optimization mode shared by the complete clone family.
 bool PsiFormerWF::isOptimizable() const

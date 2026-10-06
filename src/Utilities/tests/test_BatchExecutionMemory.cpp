@@ -121,6 +121,7 @@ TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][
   SECTION("generous or absent budgets retain the versioned preference")
   {
     const BatchExecutionPlan plan = selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
+    CHECK(plan.minimumCapacities() == BatchTileCapacities{1, 1, 1, 1});
     CHECK(plan.selectedCapacities() == BatchTileCapacities{4, 4, 4, 4});
     CHECK(plan.selectedEstimate().total() == BatchMemoryBytes{260, 52});
     CHECK(plan.fixedMinimumEstimate().total() == BatchMemoryBytes{140, 28});
@@ -195,6 +196,7 @@ TEST_CASE("Batch execution memory hard requests and logical modes", "[utilities]
   input.policy.host_budget            = 180;
 
   const BatchExecutionPlan plan = selectBatchExecutionPlan(input, makeProvider(equalSlopeEstimate));
+  CHECK(plan.minimumCapacities() == BatchTileCapacities{5, 1, 1, 1});
   CHECK(plan.selectedCapacities().value == 5);
   CHECK(plan.selectedCapacities() == BatchTileCapacities{5, 1, 1, 1});
 
@@ -223,6 +225,7 @@ TEST_CASE("Batch execution memory hard requests and logical modes", "[utilities]
     scalar_compatibility.preference.preferred = {4, 4, 4, 4};
     const BatchExecutionPlan scalar_plan =
         selectBatchExecutionPlan(scalar_compatibility, makeProvider(equalSlopeEstimate));
+    CHECK(scalar_plan.minimumCapacities() == BatchTileCapacities{1, 0, 0, 0});
     CHECK(scalar_plan.selectedCapacities() == BatchTileCapacities{4, 0, 0, 0});
   }
 
@@ -234,6 +237,7 @@ TEST_CASE("Batch execution memory hard requests and logical modes", "[utilities]
     weighted_ecp.preference.preferred = {4, 4, 4, 4};
     const BatchExecutionPlan ecp_plan =
         selectBatchExecutionPlan(weighted_ecp, makeProvider(equalSlopeEstimate));
+    CHECK(ecp_plan.minimumCapacities() == BatchTileCapacities{0, 0, 0, 1});
     CHECK(ecp_plan.selectedCapacities() == BatchTileCapacities{0, 0, 0, 4});
   }
 

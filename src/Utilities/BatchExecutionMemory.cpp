@@ -193,6 +193,7 @@ void mixEstimate(std::uint64_t& hash, const BatchMemoryEstimate& estimate) noexc
 
 /** Produce a stable exact-content fingerprint for an immutable selected plan. */
 std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
+                              const BatchTileCapacities& minimum,
                               const BatchTileCapacities& selected,
                               const BatchMemoryEstimate& minimum_estimate,
                               const BatchMemoryEstimate& estimate,
@@ -210,6 +211,7 @@ std::uint64_t makeFingerprint(const BatchExecutionSelectionInput& input,
   mixRequest(hash, input.policy.tiles.ecp_outer);
   mixCapacities(hash, input.logical_maximum);
   mixCapacities(hash, input.preference.preferred);
+  mixCapacities(hash, minimum);
   mixCapacities(hash, selected);
   mixInteger(hash, input.active_parameter_count);
 
@@ -660,13 +662,15 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   plan.topology_               = input.topology;
   plan.policy_                 = input.policy;
   plan.logical_maximum_        = input.logical_maximum;
+  plan.minimum_capacities_     = minimum;
   plan.selected_capacities_    = selected;
   plan.fixed_minimum_estimate_ = minimum_evaluation.aggregate;
   plan.selected_estimate_      = selected_evaluation.aggregate;
   plan.active_parameter_count_ = input.active_parameter_count;
   plan.participant_evidence_   = std::move(participant_evidence);
-  plan.fingerprint_ = makeFingerprint(input, selected, plan.fixed_minimum_estimate_, plan.selected_estimate_,
-                                      plan.participant_evidence_);
+  plan.fingerprint_ =
+      makeFingerprint(input, minimum, selected, plan.fixed_minimum_estimate_,
+                      plan.selected_estimate_, plan.participant_evidence_);
   return plan;
 }
 

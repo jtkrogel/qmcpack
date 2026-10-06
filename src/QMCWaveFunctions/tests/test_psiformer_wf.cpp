@@ -63,6 +63,12 @@ public:
   {
     return component.optimizationMetadataDiagnosticsForTesting();
   }
+
+  /// Report whether the component currently retains a nonempty participant view.
+  static bool hasBatchExecutionPlan(const PsiFormerWF& component)
+  {
+    return static_cast<bool>(component.batch_execution_plan_);
+  }
 };
 } // namespace testing
 
@@ -782,6 +788,110 @@ TEST_CASE("PsiFormer clone-local evaluator workspaces are allocated on demand",
     check_empty(crowd_component0);
     check_empty(crowd_component1);
   }
+}
+
+TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component("pf_batch_policy", files.parameters.string(),
+                        files.configuration.string(), true, {0, 1});
+
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  CHECK(requirements.requires(BatchExecutionMode::FULL_VGL));
+  CHECK_FALSE(requirements.requires(BatchExecutionMode::VALUE));
+  CHECK_FALSE(requirements.requires(BatchExecutionMode::ACTIVE_GRADIENT));
+  CHECK_FALSE(requirements.requires(BatchExecutionMode::SCORE));
+  CHECK_FALSE(requirements.requires(BatchExecutionMode::KINETIC));
+
+  BatchExecutionRequirements broad_requirements = requirements;
+  broad_requirements.require(BatchExecutionMode::VALUE);
+  broad_requirements.require(BatchExecutionMode::ACTIVE_GRADIENT);
+  broad_requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  BatchExecutionTopology topology;
+  topology.initial_walkers_per_crowd = {1, 2};
+  topology.reserve_walkers_per_crowd = {3, 2};
+  topology.run_kind                  = "psiformer-hook-test";
+
+  const BatchExecutionWorkloadContext workload{
+      broad_requirements, topology, 2};
+  const BatchTileCapacities logical_maximum =
+      component.batchExecutionLogicalMaximum(workload);
+  CHECK(logical_maximum == BatchTileCapacities{5, 3, 3, 0});
+
+  const BatchExecutionPlanningContext context{
+      broad_requirements, topology, logical_maximum,
+      BatchTileCapacities{2, 2, 1, 0}, 2};
+  const BatchMemoryContribution contribution =
+      component.estimateBatchExecutionMemory(context);
+  CHECK(contribution.logical_maximum == logical_maximum);
+  CHECK(contribution.owner_multiplicity == 1);
+  CHECK_FALSE(contribution.fully_accounted);
+  CHECK(contribution.per_owner.total().host > 0);
+  CHECK(contribution.per_owner.total().device == 0);
+
+  // A real plan cannot be selected from partial evidence.  Later preparation
+  // stages will enable accounting claims only as the corresponding ownership
+  // and runtime guards become complete.
+  BatchExecutionSelectionInput selection;
+  selection.requirements                       = requirements;
+  selection.topology                           = topology;
+  selection.active_parameter_count             = 2;
+  const BatchExecutionWorkloadContext selection_workload{
+      requirements, topology, 2};
+  selection.logical_maximum =
+      component.batchExecutionLogicalMaximum(selection_workload);
+  CHECK_THROWS_WITH(
+      selectBatchExecutionPlan(
+          selection,
+          [&component](const BatchExecutionPlanningContext& candidate) {
+            return std::vector<BatchMemoryParticipantContribution>{
+                {"twf/component/0/PsiFormerWF/pf_batch_policy",
+                 component.estimateBatchExecutionMemory(candidate)}};
+          }),
+      Catch::Matchers::ContainsSubstring("not fully accounted"));
+
+  // Even internally consistent evidence cannot authorize a plan that omitted
+  // the component-owned FULL_VGL initialization requirement.
+  BatchExecutionSelectionInput missing_requirement_selection = selection;
+  missing_requirement_selection.requirements = {};
+  const BatchExecutionWorkloadContext missing_workload{
+      {}, topology, 2};
+  missing_requirement_selection.logical_maximum =
+      component.batchExecutionLogicalMaximum(missing_workload);
+  const std::string participant_id =
+      "twf/component/0/PsiFormerWF/pf_batch_policy";
+  auto missing_plan = std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(
+          missing_requirement_selection,
+          [&component, &participant_id](
+              const BatchExecutionPlanningContext& candidate) {
+            BatchMemoryContribution fabricated =
+                component.estimateBatchExecutionMemory(candidate);
+            fabricated.fully_accounted = true;
+            return std::vector<BatchMemoryParticipantContribution>{
+                {participant_id, std::move(fabricated)}};
+          }));
+  const BatchExecutionParticipantPlan missing_view =
+      makeBatchExecutionParticipantPlan(missing_plan, participant_id);
+  CHECK_THROWS_WITH(
+      component.validateBatchExecutionPlanBinding(missing_view),
+      Catch::Matchers::ContainsSubstring("component-owned requirement"));
+
+  // The explicit empty view is always safe while idle and is copied as empty
+  // state rather than causing any evaluator scratch to be materialized.
+  BatchExecutionParticipantPlan empty_plan;
+  component.validateBatchExecutionPlanBinding(empty_plan);
+  component.bindBatchExecutionPlan(empty_plan);
+  CHECK_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+  std::unique_ptr<WaveFunctionComponent> clone_storage =
+      component.makeClone(electrons);
+  auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
+  REQUIRE(clone != nullptr);
+  CHECK_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(*clone));
 }
 
 TEST_CASE("PsiFormer kinetic parameter derivatives require unit electron masses",
