@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -252,6 +253,14 @@ public:
     const auto component = std::find_if(
         nl_ecp.PPset.begin(), nl_ecp.PPset.end(), [](const auto& candidate) { return bool(candidate); });
     return component == nl_ecp.PPset.end() ? 0 : (*component)->getNknot();
+  }
+
+  /** Report the quadrature size selected for one concrete ion. */
+  static int componentKnotCountForIon(const NonLocalECPotential& nl_ecp, int ion)
+  {
+    if (ion < 0 || static_cast<std::size_t>(ion) >= nl_ecp.PP.size() || !nl_ecp.PP[ion])
+      throw std::out_of_range("NonLocalECPotential test ion has no component");
+    return nl_ecp.PP[ion]->getNknot();
   }
 
   /** Evaluate one prepared V1 electron through the production flattened VP seam. */
@@ -560,11 +569,11 @@ ParticleSet makeTmoveV1Elec(const SimulationCell& simulation_cell,
   return elec;
 }
 
-/// reads the same Na.BFD.xml component all three v1 T-move tests attach
-UPtr<NonLocalECPComponent> readTmoveV1PPComponent()
+/// Read the Na.BFD.xml component with an explicitly selected angular rule.
+UPtr<NonLocalECPComponent> readTmoveV1PPComponent(int quadrature_rule = 4)
 {
   Communicate* comm = OHMMS::Controller;
-  ECPComponentBuilder ecp_comp_builder("test_read_ecp", comm, 4, 1);
+  ECPComponentBuilder ecp_comp_builder("test_read_ecp", comm, quadrature_rule, 1);
   bool okay = ecp_comp_builder.read_pp_file("Na.BFD.xml");
   REQUIRE(okay);
   return std::move(ecp_comp_builder.pp_nonloc);
@@ -594,11 +603,12 @@ struct StampedRatioControl
   int throw_after_call                = 0;
   int weighted_throw_after_call       = 0;
   std::uint64_t version               = 7;
-  QMCTraits::ValueType ratio          = QMCTraits::ValueType(1);
+  QMCTraits::ValueType ratio                = QMCTraits::ValueType(1);
   QMCTraits::ValueType derivative_increment = QMCTraits::ValueType(0);
-  std::size_t maximum_segments = 0;
-  bool saw_repeated_walker     = false;
-  bool saw_mixed_electrons     = false;
+  bool derivative_uses_total_weights        = false;
+  std::size_t maximum_segments               = 0;
+  bool saw_repeated_walker                   = false;
+  bool saw_mixed_electrons                   = false;
 };
 
 QMCTraits::ValueType makeStampedRatio(QMCTraits::RealType real_part,
@@ -671,8 +681,13 @@ public:
     // A deterministic per-segment contribution lets the atomicity regression
     // detect even one prematurely published tile. Other stamped-ratio tests
     // retain the default zero increment.
-    const ValueType segment_increment =
-        control_->derivative_increment * ValueType(virtual_particles.getTotalNum());
+    ValueType segment_increment;
+    if (control_->derivative_uses_total_weights)
+      segment_increment = control_->derivative_increment * std::accumulate(
+          total_weights.begin(), total_weights.end(), ValueType(0));
+    else
+      segment_increment =
+          control_->derivative_increment * ValueType(virtual_particles.getTotalNum());
     for (std::size_t parameter = 0; parameter < weighted_derivatives.size; ++parameter)
       weighted_derivatives[parameter] += segment_increment;
   }
@@ -1601,6 +1616,9 @@ TEST_CASE("NonLocalECPotential clone owns neighbor-list binding and staged publi
 TEST_CASE("NonLocalECPotential multi-walker resources clone empty and recover from mismatch",
           "[hamiltonian][ecp][resource]")
 {
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+  using ValueType    = QMCTraits::ValueType;
+
   const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
   ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
   ParticleSet electrons = makeTmoveV1Elec(
@@ -1611,15 +1629,58 @@ TEST_CASE("NonLocalECPotential multi-walker resources clone empty and recover fr
   TrialWaveFunction wavefunction(runtime_options);
   TrialWaveFunction clone_wavefunction(runtime_options);
   NonLocalECPotential potential(ions, electrons, false, true);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 5);
+  potential.addComponent(0, readTmoveV1PPComponent());
   UPtr<OperatorBase> clone_storage = potential.makeClone(clone_electrons, clone_wavefunction);
   auto& clone = dynamic_cast<NonLocalECPotential&>(*clone_storage);
+  electrons.update();
+  clone_electrons.update();
   RefVectorWithLeader<OperatorBase> family(potential, {potential, clone});
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons, clone_electrons});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      wavefunction, {wavefunction, clone_wavefunction});
+
+  FakeRandom<FullPrecReal> grid_rng;
+  FakeRandom<FullPrecReal> clone_grid_rng;
+  grid_rng.set_value(0.371);
+  clone_grid_rng.set_value(0.371);
+  potential.setRandomGenerator(&grid_rng);
+  clone.setRandomGenerator(&clone_grid_rng);
+
+  ResourceCollection particle_resources("nlpp_resource_ownership_particles");
+  electrons.createResource(particle_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+
+  OptVariables active;
+  active.insert("resource_scratch_guard", 0.0);
+  active.resetIndex();
+  RecordArray<ValueType> scores(2, 1);
+  RecordArray<ValueType> derivatives(2, 1);
+  std::fill(scores.begin(), scores.end(), ValueType(0));
+  std::fill(derivatives.begin(), derivatives.end(), ValueType(0));
+
+  std::size_t warmed_storage_fingerprint = 0;
+  std::size_t warmed_derivative_capacity = 0;
+  std::size_t warmed_weight_capacity     = 0;
+  std::size_t warmed_logical_jobs        = 0;
+  std::size_t warmed_logical_knots       = 0;
 
   ResourceCollection resources("nlpp_resource_ownership");
   potential.createResource(resources);
   {
     ResourceCollectionTeamLock<OperatorBase> lock(resources, family);
     CHECK(testing::TestNonLocalECPotential::hasMultiWalkerResource(potential));
+    potential.mw_evaluateWithParameterDerivatives(
+        family, wavefunctions, particles, active, scores, derivatives);
+    const auto statistics = testing::TestNonLocalECPotential::derivativeStatistics(potential);
+    REQUIRE(statistics.logical_jobs > 0);
+    REQUIRE(statistics.logical_knots > 0);
+    REQUIRE(statistics.derivative_staging_size == 2);
+    warmed_storage_fingerprint = statistics.virtual_batch_storage_fingerprint;
+    warmed_derivative_capacity = statistics.derivative_staging_capacity;
+    warmed_weight_capacity     = statistics.bounded_weight_capacity;
+    warmed_logical_jobs        = statistics.logical_jobs;
+    warmed_logical_knots       = statistics.logical_knots;
     testing::TestNonLocalECPotential::resizeListenerScratch(potential, 2, electrons.getTotalNum(),
                                                             ions.getTotalNum());
     CHECK(testing::TestNonLocalECPotential::listenerScratchSizes(potential) ==
@@ -1634,12 +1695,28 @@ TEST_CASE("NonLocalECPotential multi-walker resources clone empty and recover fr
     ResourceCollectionTeamLock<OperatorBase> copied_lock(copied_resources, family);
     CHECK(testing::TestNonLocalECPotential::listenerScratchSizes(potential) ==
           std::make_pair(std::size_t{0}, std::size_t{0}));
+    const auto copied_statistics =
+        testing::TestNonLocalECPotential::derivativeStatistics(potential);
+    CHECK(copied_statistics.logical_jobs == 0);
+    CHECK(copied_statistics.logical_knots == 0);
+    CHECK(copied_statistics.tiles_packed == 0);
+    CHECK(copied_statistics.derivative_staging_size == 0);
+    CHECK(copied_statistics.virtual_batch_storage_fingerprint !=
+          warmed_storage_fingerprint);
     testing::TestNonLocalECPotential::resizeListenerScratch(potential, 1, 1, 1);
   }
   {
     ResourceCollectionTeamLock<OperatorBase> original_lock(resources, family);
     CHECK(testing::TestNonLocalECPotential::listenerScratchSizes(potential) ==
           std::make_pair(std::size_t{6}, std::size_t{4}));
+    const auto retained_statistics =
+        testing::TestNonLocalECPotential::derivativeStatistics(potential);
+    CHECK(retained_statistics.virtual_batch_storage_fingerprint ==
+          warmed_storage_fingerprint);
+    CHECK(retained_statistics.derivative_staging_capacity == warmed_derivative_capacity);
+    CHECK(retained_statistics.bounded_weight_capacity == warmed_weight_capacity);
+    CHECK(retained_statistics.logical_jobs == warmed_logical_jobs);
+    CHECK(retained_statistics.logical_knots == warmed_logical_knots);
   }
 
   // A shape-compatible but unrelated potential must not borrow this family's
@@ -2799,6 +2876,181 @@ TEST_CASE("NonLocalECPotential batched weighted parameter-derivative path", "[ha
   CHECK(empty_stats.max_tile_occupancy <= 3);
 }
 
+TEST_CASE("NonLocalECPotential mixed ion quadratures preserve scalar derivatives",
+          "[hamiltonian][ecp][multiwalker][derivatives][mixed_species]")
+{
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+  using ValueType    = QMCTraits::ValueType;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions(simulation_cell);
+  ions.setName("mixed_rule_ions");
+  ions.create({1, 1});
+  ions.R[0] = {0.0, 1.0, 0.0};
+  ions.R[1] = {0.0, -1.0, 0.0};
+  SpeciesSet& ion_species                  = ions.getSpeciesSet();
+  const int rule_four                      = ion_species.addSpecies("Na_rule4");
+  const int rule_six                       = ion_species.addSpecies("Na_rule6");
+  const int ion_charge                     = ion_species.addAttribute("charge");
+  const int ion_atomic_number              = ion_species.addAttribute("atomic_number");
+  ion_species(ion_charge, rule_four)        = 1;
+  ion_species(ion_charge, rule_six)         = 1;
+  ion_species(ion_atomic_number, rule_four) = 11;
+  ion_species(ion_atomic_number, rule_six)  = 11;
+  ions.createSK();
+  ions.resetGroups();
+  ions.update();
+
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.35, 0.0, 0.0}, {0.9, 0.15, 0.0}, {-0.3, -0.2, 0.1});
+  ParticleSet electrons2(electrons);
+  electrons2.R[1] += QMCTraits::PosType{-0.08, 0.04, 0.03};
+  electrons2.update();
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "mixed_rule_wavefunction");
+  auto control                            = std::make_shared<StampedRatioControl>();
+  control->ratio                          = makeStampedRatio(0.83, 0.19);
+  control->derivative_increment           = makeStampedRatio(0.03125, 0.015625);
+  control->derivative_uses_total_weights = true;
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(control, true));
+  std::unique_ptr<TrialWaveFunction> wavefunction2 = wavefunction.makeClone(electrons2);
+
+  constexpr std::size_t outer_tile_capacity = 7;
+  NonLocalECPotential potential(ions, electrons, false /* enable_DLA */, true /* use_VP */);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, outer_tile_capacity);
+  potential.addComponent(rule_four, readTmoveV1PPComponent(4));
+  potential.addComponent(rule_six, readTmoveV1PPComponent(6));
+  REQUIRE(testing::TestNonLocalECPotential::componentKnotCountForIon(potential, 0) == 12);
+  REQUIRE(testing::TestNonLocalECPotential::componentKnotCountForIon(potential, 1) == 26);
+
+  UPtr<OperatorBase> potential2_storage = potential.makeClone(electrons2, *wavefunction2);
+  auto& potential2                       = dynamic_cast<NonLocalECPotential&>(*potential2_storage);
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons, electrons2});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      wavefunction, {wavefunction, *wavefunction2});
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential, potential2});
+
+  FakeRandom<FullPrecReal> grid_rng;
+  FakeRandom<FullPrecReal> grid_rng2;
+  grid_rng.set_value(0.371);
+  grid_rng2.set_value(0.371);
+  potential.setRandomGenerator(&grid_rng);
+  potential2.setRandomGenerator(&grid_rng2);
+
+  ResourceCollection particle_resources("mixed_rule_derivative_particles");
+  ResourceCollection potential_resources("mixed_rule_derivative_potentials");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  OptVariables active;
+  active.insert("mixed_rule_guard", 0.0);
+  active.resetIndex();
+  constexpr ValueType derivative_sentinel = ValueType(1.75);
+  RecordArray<ValueType> scores(2, 1);
+  RecordArray<ValueType> derivatives(2, 1);
+  std::fill(scores.begin(), scores.end(), ValueType(0));
+  std::fill(derivatives.begin(), derivatives.end(), derivative_sentinel);
+
+  potential.mw_evaluateWithParameterDerivatives(
+      potentials, wavefunctions, particles, active, scores, derivatives);
+  const std::array<double, 2> batched_energies{potential.getValue(), potential2.getValue()};
+  const std::array<ValueType, 2> batched_derivatives{derivatives[0][0], derivatives[1][0]};
+  const auto statistics = testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(statistics.logical_jobs == 12);
+  CHECK(statistics.logical_knots == 228);
+  CHECK(statistics.tiles_packed > 1);
+  CHECK(statistics.split_job_continuations > 0);
+  CHECK(statistics.tail_tiles > 0);
+  CHECK(statistics.max_tile_occupancy <= outer_tile_capacity);
+
+  // Re-run each walker through the public scalar operator with the same fixed
+  // rotations. This checks unequal job lengths in both the energy reduction
+  // and the weighted parameter destination, not just descriptor construction.
+  FakeRandom<FullPrecReal> scalar_rng;
+  FakeRandom<FullPrecReal> scalar_rng2;
+  scalar_rng.set_value(0.371);
+  scalar_rng2.set_value(0.371);
+  potential.setRandomGenerator(&scalar_rng);
+  potential2.setRandomGenerator(&scalar_rng2);
+  Vector<ValueType> scalar_score(1);
+  scalar_score = ValueType(0);
+  std::array<Vector<ValueType>, 2> scalar_derivatives{Vector<ValueType>(1), Vector<ValueType>(1)};
+  scalar_derivatives[0] = derivative_sentinel;
+  scalar_derivatives[1] = derivative_sentinel;
+  const std::array<double, 2> scalar_energies{
+      potential.evaluateValueAndDerivatives(
+          wavefunction, electrons, active, scalar_score, scalar_derivatives[0]),
+      potential2.evaluateValueAndDerivatives(
+          *wavefunction2, electrons2, active, scalar_score, scalar_derivatives[1])};
+
+  for (int walker = 0; walker < 2; ++walker)
+  {
+    CHECK(batched_energies[walker] == Approx(scalar_energies[walker]).epsilon(1e-12));
+    CHECK(batched_derivatives[walker] == ValueApprox(scalar_derivatives[walker][0]));
+    CHECK(std::abs(batched_derivatives[walker] - derivative_sentinel) > 1e-8);
+  }
+}
+
+TEST_CASE("NonLocalECPotential empty derivative workload",
+          "[hamiltonian][ecp][multiwalker][derivatives]")
+{
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+  using ValueType    = QMCTraits::ValueType;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {7.0, 7.0, 7.0}, {6.0, 7.0, 7.0}, {7.0, 6.0, 7.0});
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  NonLocalECPotential potential(ions, electrons, false /* enable_DLA */, true /* use_VP */);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 5);
+  potential.addComponent(0, readTmoveV1PPComponent());
+
+  FakeRandom<FullPrecReal> grid_rng;
+  grid_rng.set_value(0.371);
+  potential.setRandomGenerator(&grid_rng);
+
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential});
+  ResourceCollection particle_resources("empty_derivative_particles");
+  ResourceCollection potential_resources("empty_derivative_potential");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  OptVariables active;
+  active.insert("empty_workload_guard", 0.0);
+  active.resetIndex();
+  RecordArray<ValueType> scores(1, 1);
+  RecordArray<ValueType> derivatives(1, 1);
+  scores[0][0]      = ValueType(0);
+  derivatives[0][0] = ValueType(2.75);
+
+  CHECK_NOTHROW(potential.mw_evaluateWithParameterDerivatives(
+      potentials, wavefunctions, particles, active, scores, derivatives));
+  CHECK(potential.getValue() == Approx(0.0));
+  CHECK(derivatives[0][0] == ValueApprox(ValueType(2.75)));
+  for (const auto& group_jobs : testing::TestNonLocalECPotential::jobs(potential))
+    CHECK(group_jobs.empty());
+
+  const auto statistics = testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(statistics.logical_jobs == 0);
+  CHECK(statistics.logical_knots == 0);
+  CHECK(statistics.tiles_packed == 0);
+  CHECK(statistics.tail_tiles == 0);
+  CHECK(statistics.max_tile_occupancy == 0);
+  CHECK(statistics.derivative_staging_size == 1);
+  CHECK(statistics.bounded_weight_size == 0);
+  CHECK(testing::TestNonLocalECPotential::derivativeMatrixElements(potential) == 0);
+}
+
 TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
           "[hamiltonian][psiformer][ecp][multiwalker]")
 {
@@ -2911,7 +3163,8 @@ TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
   CHECK(std::abs(jastrow_ratios[0] - ValueType(1)) > 1e-5);
 
   NonLocalECPotential potential(ions, electrons, false /* enable_DLA */, true /* use_VP */);
-  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 3);
+  constexpr std::size_t outer_tile_capacity = 5;
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, outer_tile_capacity);
   ECPComponentBuilder ecp_builder("psiformer_nlpp_e2e", OHMMS::Controller);
   REQUIRE(ecp_builder.read_pp_file("Na.BFD.xml"));
   REQUIRE(ecp_builder.pp_nonloc != nullptr);
@@ -2952,17 +3205,49 @@ TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
   const auto batch_energies = run_batch(batch_derivatives, derivative_sentinel);
   const auto derivative_stats =
       testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(derivative_stats.logical_jobs > 0);
+  CHECK(derivative_stats.logical_knots > outer_tile_capacity);
   CHECK(derivative_stats.tiles_packed > 1);
   CHECK(derivative_stats.split_job_continuations > 0);
-  CHECK(derivative_stats.max_tile_occupancy <= 3);
+  CHECK(derivative_stats.tail_tiles > 0);
+  CHECK(derivative_stats.logical_knots % outer_tile_capacity != 0);
+  CHECK(derivative_stats.max_tile_occupancy <= outer_tile_capacity);
   CHECK(derivative_stats.derivative_staging_size ==
         static_cast<std::size_t>(walker_count * parameter_count));
-  CHECK(derivative_stats.bounded_weight_size <= 3);
-  CHECK(derivative_stats.bounded_weight_capacity >= 3);
+  CHECK(derivative_stats.bounded_weight_size <= outer_tile_capacity);
+  CHECK(derivative_stats.bounded_weight_capacity >= outer_tile_capacity);
   std::array<std::array<ValueType, 2>, walker_count> analytic_derivatives;
   for (int walker = 0; walker < walker_count; ++walker)
     for (int parameter = 0; parameter < parameter_count; ++parameter)
       analytic_derivatives[walker][parameter] = batch_derivatives[walker][parameter];
+
+  // The first request primes both sides of the staged/public job-list swap.
+  // Two subsequent same-shape requests must then retain the bounded virtual-
+  // batch allocation identity and derivative/weight staging capacities.
+  RecordArray<ValueType> warmed_derivatives(walker_count, parameter_count);
+  const auto warmed_energies = run_batch(warmed_derivatives, derivative_sentinel);
+  const auto warmed_stats = testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  RecordArray<ValueType> rewarmed_derivatives(walker_count, parameter_count);
+  const auto rewarmed_energies = run_batch(rewarmed_derivatives, derivative_sentinel);
+  const auto rewarmed_stats = testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(rewarmed_stats.virtual_batch_storage_fingerprint ==
+        warmed_stats.virtual_batch_storage_fingerprint);
+  CHECK(rewarmed_stats.derivative_staging_capacity == warmed_stats.derivative_staging_capacity);
+  CHECK(rewarmed_stats.bounded_weight_capacity == warmed_stats.bounded_weight_capacity);
+  CHECK(warmed_stats.logical_jobs == derivative_stats.logical_jobs);
+  CHECK(warmed_stats.logical_knots == derivative_stats.logical_knots);
+  for (int walker = 0; walker < walker_count; ++walker)
+  {
+    CHECK(warmed_energies[walker] == Approx(batch_energies[walker]).epsilon(1e-13));
+    CHECK(rewarmed_energies[walker] == Approx(batch_energies[walker]).epsilon(1e-13));
+    for (int parameter = 0; parameter < parameter_count; ++parameter)
+    {
+      CHECK(warmed_derivatives[walker][parameter] ==
+            ValueApprox(analytic_derivatives[walker][parameter]));
+      CHECK(rewarmed_derivatives[walker][parameter] ==
+            ValueApprox(analytic_derivatives[walker][parameter]));
+    }
+  }
 
   CHECK(testing::TestNonLocalECPotential::derivativeMatrixElements(potential) == 0);
   CHECK(testing::TestNonLocalECPotential::derivativeMatrixElements(potential2) == 0);

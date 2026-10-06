@@ -204,9 +204,13 @@ NonLocalECPotential::multiWalkerDerivativeStatisticsForTesting() const
 {
   const auto& resource    = mw_res_handle_.getResource();
   const auto batch_stats  = resource.virtual_batch->statistics();
-  return {batch_stats.tiles_packed,
+  return {batch_stats.logical_jobs,
+          batch_stats.logical_knots,
+          batch_stats.tiles_packed,
           batch_stats.split_job_continuations,
+          batch_stats.tail_tiles,
           batch_stats.max_tile_occupancy,
+          resource.virtual_batch->storageFingerprint(),
           resource.staged_parameter_derivatives.size(),
           resource.staged_parameter_derivatives.capacity(),
           resource.derivative_bare_weights.size(),

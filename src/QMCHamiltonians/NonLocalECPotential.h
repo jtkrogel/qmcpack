@@ -72,9 +72,13 @@ class NonLocalECPotential : public OperatorBase, public ForceBase
   /** Focused accounting for the private flattened derivative transaction. */
   struct MultiWalkerDerivativeStatistics
   {
+    std::size_t logical_jobs;
+    std::size_t logical_knots;
     std::size_t tiles_packed;
     std::size_t split_job_continuations;
+    std::size_t tail_tiles;
     std::size_t max_tile_occupancy;
+    std::size_t virtual_batch_storage_fingerprint;
     std::size_t derivative_staging_size;
     std::size_t derivative_staging_capacity;
     std::size_t bounded_weight_size;
