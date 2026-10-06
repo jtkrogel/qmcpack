@@ -69,6 +69,18 @@ class NonLocalECPotential : public OperatorBase, public ForceBase
     bool operator!=(const MultiWalkerResourceSchema& other) const noexcept { return !(*this == other); }
   };
 
+  /** Focused accounting for the private flattened derivative transaction. */
+  struct MultiWalkerDerivativeStatistics
+  {
+    std::size_t tiles_packed;
+    std::size_t split_job_continuations;
+    std::size_t max_tile_occupancy;
+    std::size_t derivative_staging_size;
+    std::size_t derivative_staging_capacity;
+    std::size_t bounded_weight_size;
+    std::size_t bounded_weight_capacity;
+  };
+
   struct NonLocalECPotentialMultiWalkerResource;
 
 public:
@@ -263,6 +275,7 @@ private:
                                                   std::size_t electrons,
                                                   std::size_t ions);
   std::pair<std::size_t, std::size_t> multiWalkerListenerScratchSizesForTesting() const;
+  MultiWalkerDerivativeStatistics multiWalkerDerivativeStatisticsForTesting() const;
 
   /// Select a small deterministic capacity before resource creation in focused tests.
   void setOuterTileCapacityForTesting(std::size_t capacity);
@@ -274,6 +287,14 @@ private:
                                          bool compute_txy_all,
                                          const std::optional<ListenerOption<Real>>& listeners,
                                          bool keep_grid);
+
+  /** Evaluate VP nonlocal energies and parameter derivatives as one tiled transaction. */
+  static void mw_evaluateWithParameterDerivativesFlattenedVP(
+      const RefVectorWithLeader<OperatorBase>& o_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const OptVariables& optvars,
+      RecordArray<ValueType>& dhpsioverpsi);
 
   /** Consume all packed outer tiles belonging to one already prepared electron group. */
   static void mw_consumeFlattenedVPPreparedGroup(
@@ -288,6 +309,18 @@ private:
       const std::optional<ListenerOption<Real>>& listeners,
       bool& have_reference_stamps,
       bool& have_nonfermionic_reference_stamps,
+      bool& tile_available);
+
+  /** Consume derivative tiles for one prepared group into private request staging. */
+  static void mw_consumeFlattenedVPDerivativePreparedGroup(
+      NonLocalECPotentialMultiWalkerResource& resource,
+      const RefVectorWithLeader<OperatorBase>& o_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const OptVariables& optvars,
+      int group,
+      bool& have_reference_stamps,
       bool& tile_available);
 
   /** Build one V1 electron's VP candidates without crossing its selection boundary. */

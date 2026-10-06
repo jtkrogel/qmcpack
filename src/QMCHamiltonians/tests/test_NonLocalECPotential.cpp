@@ -221,6 +221,9 @@ public:
   static std::pair<std::size_t, std::size_t> listenerScratchSizes(const NonLocalECPotential& nl_ecp)
   { return nl_ecp.multiWalkerListenerScratchSizesForTesting(); }
 
+  static auto derivativeStatistics(const NonLocalECPotential& nl_ecp)
+  { return nl_ecp.multiWalkerDerivativeStatisticsForTesting(); }
+
   static void setOuterTileCapacity(NonLocalECPotential& nl_ecp, std::size_t capacity)
   { nl_ecp.setOuterTileCapacityForTesting(capacity); }
 
@@ -583,12 +586,16 @@ bool samePositionBits(const QMCTraits::PosType& left, const QMCTraits::PosType& 
 /** Shared controls for a deterministic generic flattened-ratio test component. */
 struct StampedRatioControl
 {
-  int scalar_calls          = 0;
-  int flattened_calls       = 0;
-  int change_version_at_call = 0;
-  int throw_after_call       = 0;
-  std::uint64_t version      = 7;
-  QMCTraits::ValueType ratio = QMCTraits::ValueType(1);
+  int scalar_calls                    = 0;
+  int flattened_calls                 = 0;
+  int weighted_calls                  = 0;
+  int change_version_at_call          = 0;
+  int weighted_change_version_at_call = 0;
+  int throw_after_call                = 0;
+  int weighted_throw_after_call       = 0;
+  std::uint64_t version               = 7;
+  QMCTraits::ValueType ratio          = QMCTraits::ValueType(1);
+  QMCTraits::ValueType derivative_increment = QMCTraits::ValueType(0);
   std::size_t maximum_segments = 0;
   bool saw_repeated_walker     = false;
   bool saw_mixed_electrons     = false;
@@ -650,6 +657,53 @@ public:
     if (control_->throw_after_call == call)
       throw std::runtime_error("deliberate late flattened NLPP tile failure");
     return stamp;
+  }
+
+  void evaluateDerivRatiosWeighted(
+      const VirtualParticleSet& virtual_particles,
+      const OptVariables&,
+      const std::vector<ValueType>& total_weights,
+      ParameterDerivativeView weighted_derivatives) override
+  {
+    if (total_weights.size() != static_cast<std::size_t>(virtual_particles.getTotalNum()))
+      throw std::invalid_argument("StampedRatioOrbital received mismatched weighted-derivative input.");
+
+    // A deterministic per-segment contribution lets the atomicity regression
+    // detect even one prematurely published tile. Other stamped-ratio tests
+    // retain the default zero increment.
+    const ValueType segment_increment =
+        control_->derivative_increment * ValueType(virtual_particles.getTotalNum());
+    for (std::size_t parameter = 0; parameter < weighted_derivatives.size; ++parameter)
+      weighted_derivatives[parameter] += segment_increment;
+  }
+
+  EvaluationStamp mw_evaluateVirtualDerivRatiosWeighted(
+      const RefVectorWithLeader<WaveFunctionComponent>& component_list,
+      const RefVectorWithLeader<ParticleSet>& particle_list,
+      const RefVectorWithLeader<VirtualParticleSet>& vp_scratch_list,
+      const VirtualParticleBatch& batch,
+      const OptVariables& optvars,
+      const std::vector<ValueType>& total_weights,
+      const std::vector<ParameterDerivativeView>& weighted_derivatives) const override
+  {
+    const int call = ++control_->weighted_calls;
+    WaveFunctionComponent::mw_evaluateVirtualDerivRatiosWeighted(
+        component_list, particle_list, vp_scratch_list, batch, optvars, total_weights,
+        weighted_derivatives);
+    if (control_->weighted_throw_after_call == call)
+      throw std::runtime_error("deliberate late flattened NLPP weighted-derivative failure");
+
+    // Mirror an intentional value-version change by default so that the
+    // Hamiltonian can detect it across tiles. The independent weighted knob
+    // instead exercises the TrialWaveFunction's same-tile phase check.
+    const bool value_version_changed =
+        control_->change_version_at_call > 0 &&
+        control_->flattened_calls >= control_->change_version_at_call;
+    const bool weighted_version_changed =
+        control_->weighted_change_version_at_call > 0 &&
+        call >= control_->weighted_change_version_at_call;
+    return EvaluationStamp::versioned(
+        control_.get(), control_->version + value_version_changed + weighted_version_changed);
   }
 
   std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet&) const override
@@ -983,6 +1037,112 @@ TEST_CASE("NonLocalECPotential flattened outer tiles publish atomically",
   CHECK_NOTHROW(testing::TestNonLocalECPotential::mw_evaluateImpl(
       potential, potentials, wavefunctions, particles, true, std::nullopt, true));
   CHECK(sameNLPPPublicState(potential, after_retry, electrons.getTotalNum(), ions.getTotalNum()));
+}
+
+TEST_CASE("NonLocalECPotential flattened weighted derivatives publish atomically",
+          "[hamiltonian][ecp][nlpp_flattened][derivatives][atomic]")
+{
+  using FullPrecReal = QMCTraits::FullPrecRealType;
+  using ValueType    = QMCTraits::ValueType;
+
+  const SimulationCell simulation_cell = makeTmoveV1SimulationCell();
+  ParticleSet ions                     = makeTmoveV1Ions(simulation_cell);
+  ParticleSet electrons = makeTmoveV1Elec(
+      simulation_cell, ions, {0.4, 0.0, 0.0}, {1.0, 0.0, 0.0}, {-0.4, 0.6, -0.3});
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options);
+  auto control   = std::make_shared<StampedRatioControl>();
+  control->ratio = makeStampedRatio(0.83, 0.27);
+  control->derivative_increment = makeStampedRatio(0.125, 0.0625);
+  wavefunction.addComponent(std::make_unique<StampedRatioOrbital>(control, true));
+
+  NonLocalECPotential potential(ions, electrons, false, true);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 3);
+  potential.addComponent(0, readTmoveV1PPComponent());
+  REQUIRE(testing::TestNonLocalECPotential::firstComponentKnotCount(potential) > 3);
+
+  FakeRandom<FullPrecReal> grid_rng;
+  grid_rng.set_value(0.371);
+  potential.setRandomGenerator(&grid_rng);
+
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction, {wavefunction});
+  RefVectorWithLeader<OperatorBase> potentials(potential, {potential});
+  ResourceCollection particle_resources("flattened_derivative_atomic_particles");
+  ResourceCollection potential_resources("flattened_derivative_atomic_potential");
+  electrons.createResource(particle_resources);
+  potential.createResource(potential_resources);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resources, particles);
+  ResourceCollectionTeamLock<OperatorBase> potential_lock(potential_resources, potentials);
+
+  OptVariables active;
+  active.insert("unused_guard_parameter", 0.0);
+  active.resetIndex();
+  RecordArray<ValueType> scores(1, 1);
+  RecordArray<ValueType> derivatives(1, 1);
+  scores[0][0]      = ValueType(-2.25);
+  derivatives[0][0] = ValueType(1.25);
+
+  // Establish a successful derivative result and public-state baseline using
+  // multiple outer tiles. The deterministic nonzero component contribution
+  // also measures the full-request delta expected from a successful retry.
+  potential.mw_evaluateWithParameterDerivatives(
+      potentials, wavefunctions, particles, active, scores, derivatives);
+  REQUIRE(control->flattened_calls > 1);
+  REQUIRE(control->weighted_calls == control->flattened_calls);
+  const ValueType successful_derivative_delta = derivatives[0][0] - ValueType(1.25);
+  CHECK(std::abs(successful_derivative_delta) > 0);
+  const NLPPPublicSnapshot baseline = snapshotNLPPPublicState(
+      potential, electrons.getTotalNum(), ions.getTotalNum());
+
+  auto exercise_failure_and_retry = [&]() {
+    control->flattened_calls = 0;
+    control->weighted_calls  = 0;
+    derivatives[0][0]        = ValueType(9.25);
+    CHECK_THROWS_AS(potential.mw_evaluateWithParameterDerivatives(
+                        potentials, wavefunctions, particles, active, scores, derivatives),
+                    std::runtime_error);
+    CHECK(control->flattened_calls == 2);
+    CHECK(control->weighted_calls == 2);
+    CHECK(scores[0][0] == ValueApprox(ValueType(-2.25)));
+    CHECK(derivatives[0][0] == ValueApprox(ValueType(9.25)));
+    CHECK(sameNLPPPublicState(
+        potential, baseline, electrons.getTotalNum(), ions.getTotalNum()));
+
+    // Clear every failure mode and prove the same borrowed crowd resource can
+    // immediately complete and publish a new request.
+    control->change_version_at_call          = 0;
+    control->weighted_change_version_at_call = 0;
+    control->weighted_throw_after_call       = 0;
+    control->flattened_calls                 = 0;
+    control->weighted_calls                  = 0;
+    derivatives[0][0]                        = ValueType(-6.5);
+    CHECK_NOTHROW(potential.mw_evaluateWithParameterDerivatives(
+        potentials, wavefunctions, particles, active, scores, derivatives));
+    CHECK(control->flattened_calls > 1);
+    CHECK(control->weighted_calls == control->flattened_calls);
+    CHECK(derivatives[0][0] ==
+          ValueApprox(ValueType(-6.5) + successful_derivative_delta));
+    CHECK(sameNLPPPublicState(
+        potential, baseline, electrons.getTotalNum(), ions.getTotalNum()));
+  };
+
+  SECTION("value version changes on a later tile")
+  {
+    control->change_version_at_call = 2;
+    exercise_failure_and_retry();
+  }
+  SECTION("weighted phase changes version on a later tile")
+  {
+    control->weighted_change_version_at_call = 2;
+    exercise_failure_and_retry();
+  }
+  SECTION("weighted phase throws on a later tile")
+  {
+    control->weighted_throw_after_call = 2;
+    exercise_failure_and_retry();
+  }
 }
 
 TEST_CASE("NonLocalECPotential flattened DLA selects only fermionic components",
@@ -2527,6 +2687,7 @@ TEST_CASE("NonLocalECPotential batched weighted parameter-derivative path", "[ha
   RefVectorWithLeader<ParticleSet> particles(electrons, {electrons, electrons2, electrons3});
 
   NonLocalECPotential potential(ions, electrons, false /* enable_DLA */, true /* use_VP */);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 3);
   potential.addComponent(0, readTmoveV1PPComponent());
   UPtr<OperatorBase> potential2_ptr = potential.makeClone(electrons2, wavefunction2);
   UPtr<OperatorBase> potential3_ptr = potential.makeClone(electrons3, wavefunction3);
@@ -2589,6 +2750,53 @@ TEST_CASE("NonLocalECPotential batched weighted parameter-derivative path", "[ha
     CHECK(batched_energies[walker] == Approx(scalar_energies[walker]).epsilon(1e-12));
     CHECK(scalar_derivatives[walker][0] == ValueApprox(ValueType(2.5)));
   }
+
+  // The Hamiltonian preflight must honor the largest sparse global mapping,
+  // not merely the number of selected variables. Padding destinations remain
+  // untouched because this empty trial wavefunction has no parameter score.
+  OptVariables global;
+  global.insert("padding_0", 0.0);
+  global.insert("guard_p0", 0.0);
+  global.insert("padding_1", 0.0);
+  global.insert("padding_2", 0.0);
+  global.insert("guard_p2", 0.0);
+  global.resetIndex();
+  OptVariables sparse;
+  sparse.insert("guard_p0", 0.0);
+  sparse.insert("guard_p2", 0.0);
+  sparse.getIndex(global);
+  REQUIRE(sparse.where(0) == 1);
+  REQUIRE(sparse.where(1) == 4);
+
+  RecordArray<ValueType> short_scores(3, 2);
+  RecordArray<ValueType> short_derivatives(3, 2);
+  std::fill(short_scores.begin(), short_scores.end(), ValueType(-3));
+  std::fill(short_derivatives.begin(), short_derivatives.end(), ValueType(7));
+  CHECK_THROWS_AS(potential.mw_evaluateWithParameterDerivatives(
+                      potentials, wavefunctions, particles, sparse, short_scores, short_derivatives),
+                  std::invalid_argument);
+  for (const ValueType& derivative : short_derivatives)
+    CHECK(derivative == ValueApprox(ValueType(7)));
+
+  RecordArray<ValueType> padded_scores(3, 5);
+  RecordArray<ValueType> padded_derivatives(3, 5);
+  std::fill(padded_scores.begin(), padded_scores.end(), ValueType(-3));
+  std::fill(padded_derivatives.begin(), padded_derivatives.end(), ValueType(7));
+  CHECK_NOTHROW(potential.mw_evaluateWithParameterDerivatives(
+      potentials, wavefunctions, particles, sparse, padded_scores, padded_derivatives));
+  for (const ValueType& derivative : padded_derivatives)
+    CHECK(derivative == ValueApprox(ValueType(7)));
+
+  // Zero-width derivative rows remain a valid energy-only transaction.
+  OptVariables inactive;
+  inactive.resetIndex();
+  RecordArray<ValueType> empty_scores(3, 0);
+  RecordArray<ValueType> empty_derivatives(3, 0);
+  CHECK_NOTHROW(potential.mw_evaluateWithParameterDerivatives(
+      potentials, wavefunctions, particles, inactive, empty_scores, empty_derivatives));
+  const auto empty_stats = testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(empty_stats.derivative_staging_size == 0);
+  CHECK(empty_stats.max_tile_occupancy <= 3);
 }
 
 TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
@@ -2703,6 +2911,7 @@ TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
   CHECK(std::abs(jastrow_ratios[0] - ValueType(1)) > 1e-5);
 
   NonLocalECPotential potential(ions, electrons, false /* enable_DLA */, true /* use_VP */);
+  testing::TestNonLocalECPotential::setOuterTileCapacity(potential, 3);
   ECPComponentBuilder ecp_builder("psiformer_nlpp_e2e", OHMMS::Controller);
   REQUIRE(ecp_builder.read_pp_file("Na.BFD.xml"));
   REQUIRE(ecp_builder.pp_nonloc != nullptr);
@@ -2741,6 +2950,15 @@ TEST_CASE("PsiFormer NonLocalECPotential multiwalker parameter derivatives",
   };
 
   const auto batch_energies = run_batch(batch_derivatives, derivative_sentinel);
+  const auto derivative_stats =
+      testing::TestNonLocalECPotential::derivativeStatistics(potential);
+  CHECK(derivative_stats.tiles_packed > 1);
+  CHECK(derivative_stats.split_job_continuations > 0);
+  CHECK(derivative_stats.max_tile_occupancy <= 3);
+  CHECK(derivative_stats.derivative_staging_size ==
+        static_cast<std::size_t>(walker_count * parameter_count));
+  CHECK(derivative_stats.bounded_weight_size <= 3);
+  CHECK(derivative_stats.bounded_weight_capacity >= 3);
   std::array<std::array<ValueType, 2>, walker_count> analytic_derivatives;
   for (int walker = 0; walker < walker_count; ++walker)
     for (int parameter = 0; parameter < parameter_count; ++parameter)
