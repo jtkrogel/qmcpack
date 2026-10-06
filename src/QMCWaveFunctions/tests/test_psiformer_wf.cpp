@@ -15,6 +15,7 @@
 #include "Message/Communicate.h"
 #include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/VirtualParticleBatch.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
@@ -30,10 +31,15 @@
 #include <atomic>
 #include <cmath>
 #include <complex>
+#include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <limits>
+#include <optional>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace qmcplusplus
@@ -70,6 +76,7 @@ struct PsiFormerScalarStateSnapshot
   std::size_t accepted_laplacian_capacity;
   std::size_t proposed_gradient_capacity;
   std::size_t proposed_laplacian_capacity;
+  const ParticleSet* bound_particle_set;
   std::vector<PsiFormerWF::GradType> accepted_gradient;
   std::vector<QMCTraits::ValueType> accepted_laplacian;
   std::vector<PsiFormerWF::GradType> proposed_gradient;
@@ -80,6 +87,42 @@ struct PsiFormerScalarStateSnapshot
 class TestPsiFormerWF
 {
 public:
+  /// Public mirror of the private reversible scalar Phase-B fault selector.
+  enum class PlannedScalarValueFault
+  {
+    NONE,
+    RESULT_OWNER,
+    RESULT_GENERATION,
+    RESULT_SIZE,
+    RESULT_VERSION,
+    RESULT_SIGN,
+    RESULT_LOG_MAGNITUDE,
+    RESULT_RATIO,
+    INPUT_FINGERPRINT,
+    OUTPUT_IDENTITY,
+    WORKSPACE_EVIDENCE,
+    PUBLICATION_EVIDENCE
+  };
+
+  /// Public mirror of the private prepared scalar-capacity corruption seam.
+  enum class PreparedScalarWorkspaceFault
+  {
+    NONE,
+    LOGICAL_CAPACITY,
+    TILE_CAPACITY
+  };
+
+  /// Identify one malformed caller range for direct typed-preflight coverage.
+  enum class PlannedScalarOutputFault
+  {
+    NULL_STORAGE,
+    RANGE_OVERFLOW,
+    PUBLICATION_ALIAS,
+    COMPONENT_ALIAS,
+    PARTICLE_ALIAS,
+    VIRTUAL_PARTICLE_ALIAS
+  };
+
   /// Report the scalar evaluator workspaces currently owned by one component clone.
   static PsiFormerWorkspaceDiagnostics directWorkspaceDiagnostics(const PsiFormerWF& component)
   {
@@ -111,6 +154,16 @@ public:
   {
     component.proposal_origin_ = PsiFormerWF::ProposalOrigin::MW_SELECTED_FULL_VGL;
     component.has_proposal_    = true;
+  }
+
+  /// Install only the visible planned-single marker needed by Phase-A rejection.
+  static void markPlannedSingleProposalPending(PsiFormerWF& component,
+                                               int particle)
+  {
+    component.proposed_particle_ = particle;
+    component.proposal_origin_ =
+        PsiFormerWF::ProposalOrigin::MW_CALC_RATIO_VALUE;
+    component.has_proposal_ = true;
   }
 
   /// Install a scalar proposal whose legacy restore path would visibly clear state.
@@ -178,22 +231,23 @@ public:
         component.accepted_laplacian_.capacity(),
         component.proposed_gradient_.capacity(),
         component.proposed_laplacian_.capacity(),
+        component.bound_particle_set_,
         {},
         {},
         {},
         {}};
-    snapshot.accepted_gradient.reserve(component.accepted_gradient_.size());
-    snapshot.accepted_laplacian.reserve(component.accepted_laplacian_.size());
-    snapshot.proposed_gradient.reserve(component.proposed_gradient_.size());
-    snapshot.proposed_laplacian.reserve(component.proposed_laplacian_.size());
+    snapshot.accepted_gradient.resize(component.accepted_gradient_.size());
+    snapshot.accepted_laplacian.resize(component.accepted_laplacian_.size());
+    snapshot.proposed_gradient.resize(component.proposed_gradient_.size());
+    snapshot.proposed_laplacian.resize(component.proposed_laplacian_.size());
     for (std::size_t particle = 0; particle < component.accepted_gradient_.size(); ++particle)
-      snapshot.accepted_gradient.push_back(component.accepted_gradient_[particle]);
+      snapshot.accepted_gradient[particle] = component.accepted_gradient_[particle];
     for (std::size_t particle = 0; particle < component.accepted_laplacian_.size(); ++particle)
-      snapshot.accepted_laplacian.push_back(component.accepted_laplacian_[particle]);
+      snapshot.accepted_laplacian[particle] = component.accepted_laplacian_[particle];
     for (std::size_t particle = 0; particle < component.proposed_gradient_.size(); ++particle)
-      snapshot.proposed_gradient.push_back(component.proposed_gradient_[particle]);
+      snapshot.proposed_gradient[particle] = component.proposed_gradient_[particle];
     for (std::size_t particle = 0; particle < component.proposed_laplacian_.size(); ++particle)
-      snapshot.proposed_laplacian.push_back(component.proposed_laplacian_[particle]);
+      snapshot.proposed_laplacian[particle] = component.proposed_laplacian_[particle];
     return snapshot;
   }
 
@@ -202,16 +256,21 @@ public:
       const PsiFormerWF& component,
       const PsiFormerScalarStateSnapshot& snapshot)
   {
-    if (component.current_sign_ != snapshot.current_sign ||
-        component.log_value_ != snapshot.log_value ||
+    const auto scalar_bits_match = [](const auto& actual, const auto& expected) {
+      return std::memcmp(std::addressof(actual), std::addressof(expected),
+                         sizeof(actual)) == 0;
+    };
+
+    if (!scalar_bits_match(component.current_sign_, snapshot.current_sign) ||
+        !scalar_bits_match(component.log_value_, snapshot.log_value) ||
         component.restore_validation_pending_ != snapshot.restore_validation_pending ||
         component.accepted_value_valid_ != snapshot.accepted_value_valid ||
         component.accepted_configuration_identity_ != snapshot.accepted_configuration_identity ||
         component.accepted_parameter_version_ != snapshot.accepted_parameter_version ||
         static_cast<std::uint64_t>(component.accepted_state_requirement_) != snapshot.accepted_state_requirement ||
         component.observed_parameter_version_ != snapshot.observed_parameter_version ||
-        component.proposed_sign_ != snapshot.proposed_sign ||
-        component.proposed_log_value_ != snapshot.proposed_log_value ||
+        !scalar_bits_match(component.proposed_sign_, snapshot.proposed_sign) ||
+        !scalar_bits_match(component.proposed_log_value_, snapshot.proposed_log_value) ||
         component.proposed_configuration_identity_ != snapshot.proposed_configuration_identity ||
         component.proposed_descriptor_fingerprint_ != snapshot.proposed_descriptor_fingerprint ||
         component.proposed_parameter_version_ != snapshot.proposed_parameter_version ||
@@ -228,6 +287,7 @@ public:
         component.accepted_laplacian_.capacity() != snapshot.accepted_laplacian_capacity ||
         component.proposed_gradient_.capacity() != snapshot.proposed_gradient_capacity ||
         component.proposed_laplacian_.capacity() != snapshot.proposed_laplacian_capacity ||
+        component.bound_particle_set_ != snapshot.bound_particle_set ||
         component.accepted_gradient_.size() != snapshot.accepted_gradient.size() ||
         component.accepted_laplacian_.size() != snapshot.accepted_laplacian.size() ||
         component.proposed_gradient_.size() != snapshot.proposed_gradient.size() ||
@@ -237,7 +297,9 @@ public:
     const auto gradients_match = [](const auto& actual, const auto& expected) {
       for (std::size_t particle = 0; particle < expected.size(); ++particle)
         for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
-          if (actual[particle][dimension] != expected[particle][dimension])
+          if (std::memcmp(std::addressof(actual[particle][dimension]),
+                          std::addressof(expected[particle][dimension]),
+                          sizeof(actual[particle][dimension])) != 0)
             return false;
       return true;
     };
@@ -245,12 +307,202 @@ public:
         !gradients_match(component.proposed_gradient_, snapshot.proposed_gradient))
       return false;
     for (std::size_t particle = 0; particle < snapshot.accepted_laplacian.size(); ++particle)
-      if (component.accepted_laplacian_[particle] != snapshot.accepted_laplacian[particle])
+      if (!scalar_bits_match(component.accepted_laplacian_[particle],
+                             snapshot.accepted_laplacian[particle]))
         return false;
     for (std::size_t particle = 0; particle < snapshot.proposed_laplacian.size(); ++particle)
-      if (component.proposed_laplacian_[particle] != snapshot.proposed_laplacian[particle])
+      if (!scalar_bits_match(component.proposed_laplacian_[particle],
+                             snapshot.proposed_laplacian[particle]))
         return false;
     return true;
+  }
+
+  /// Report the model-wide proposal counters surrounding a scalar query.
+  static std::array<std::size_t, 2> plannedProposalCounts(
+      const PsiFormerWF& component) noexcept
+  {
+    return {component.plannedSingleTransactionCountForTesting(),
+            component.plannedSelectedTransactionCountForTesting()};
+  }
+
+  /// Bind malformed reference evidence without invoking system validation.
+  static void bindParticleSetForTesting(PsiFormerWF& component,
+                                        const ParticleSet& particles)
+  {
+    component.bound_particle_set_ = &particles;
+  }
+
+  /// Toggle the deterministic final scalar-publication failure.
+  static void failPlannedScalarValueBeforePublish(PsiFormerWF& component,
+                                                  bool enabled)
+  {
+    component.fail_planned_scalar_value_before_publish_for_testing_ = enabled;
+  }
+
+  /// Select one reversible corruption between direct evaluation and Phase B.
+  static void setPlannedScalarValueFault(PsiFormerWF& component,
+                                         PlannedScalarValueFault fault)
+  {
+    using PrivateFault = PsiFormerWF::PlannedScalarValueFaultForTesting;
+    switch (fault)
+    {
+    case PlannedScalarValueFault::NONE:
+      component.planned_scalar_value_fault_for_testing_ = PrivateFault::NONE;
+      break;
+    case PlannedScalarValueFault::RESULT_OWNER:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_OWNER;
+      break;
+    case PlannedScalarValueFault::RESULT_GENERATION:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_GENERATION;
+      break;
+    case PlannedScalarValueFault::RESULT_SIZE:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_SIZE;
+      break;
+    case PlannedScalarValueFault::RESULT_VERSION:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_VERSION;
+      break;
+    case PlannedScalarValueFault::RESULT_SIGN:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_SIGN;
+      break;
+    case PlannedScalarValueFault::RESULT_LOG_MAGNITUDE:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_LOG_MAGNITUDE;
+      break;
+    case PlannedScalarValueFault::RESULT_RATIO:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::RESULT_RATIO;
+      break;
+    case PlannedScalarValueFault::INPUT_FINGERPRINT:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::INPUT_FINGERPRINT;
+      break;
+    case PlannedScalarValueFault::OUTPUT_IDENTITY:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::OUTPUT_IDENTITY;
+      break;
+    case PlannedScalarValueFault::WORKSPACE_EVIDENCE:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::WORKSPACE_EVIDENCE;
+      break;
+    case PlannedScalarValueFault::PUBLICATION_EVIDENCE:
+      component.planned_scalar_value_fault_for_testing_ =
+          PrivateFault::PUBLICATION_EVIDENCE;
+      break;
+    }
+  }
+
+  /// Exchange opaque batch owners without exposing their implementation type.
+  static void swapBatchWorkspaces(PsiFormerWF& first,
+                                  PsiFormerWF& second) noexcept
+  {
+    first.direct_batch_workspace_.swap(second.direct_batch_workspace_);
+  }
+
+  /// Corrupt or canonically restore the prepared scalar capacity record.
+  static void setPreparedScalarWorkspaceFault(
+      PsiFormerWF& component,
+      PreparedScalarWorkspaceFault fault)
+  {
+    using PrivateFault = PsiFormerWF::PreparedScalarWorkspaceFaultForTesting;
+    switch (fault)
+    {
+    case PreparedScalarWorkspaceFault::NONE:
+      component.setPreparedScalarWorkspaceFaultForTesting(PrivateFault::NONE);
+      break;
+    case PreparedScalarWorkspaceFault::LOGICAL_CAPACITY:
+      component.setPreparedScalarWorkspaceFaultForTesting(
+          PrivateFault::LOGICAL_CAPACITY);
+      break;
+    case PreparedScalarWorkspaceFault::TILE_CAPACITY:
+      component.setPreparedScalarWorkspaceFaultForTesting(
+          PrivateFault::TILE_CAPACITY);
+      break;
+    }
+  }
+
+  /// Invoke typed scalar preflight with one otherwise unreachable caller range.
+  static void probePlannedScalarOutput(
+      PsiFormerWF& component,
+      const ParticleSet& reference,
+      const VirtualParticleSet* virtual_particles,
+      std::vector<QMCTraits::ValueType>& ordinary_output,
+      PlannedScalarOutputFault fault)
+  {
+    const bool is_virtual = virtual_particles != nullptr;
+    const std::size_t output_count = is_virtual
+        ? static_cast<std::size_t>(virtual_particles->getTotalNum())
+        : static_cast<std::size_t>(reference.getTotalNum());
+    PsiFormerWF::PlannedScalarValueRequest request{
+        is_virtual
+            ? PsiFormerWF::PlannedScalarValueOperation::VIRTUAL_PARTICLE_VALUE
+            : PsiFormerWF::PlannedScalarValueOperation::ALL_TO_ONE,
+        std::addressof(reference), virtual_particles, output_count + 1,
+        ordinary_output.data(), output_count, ordinary_output.capacity()};
+
+    switch (fault)
+    {
+    case PlannedScalarOutputFault::NULL_STORAGE:
+      request.output_data = nullptr;
+      break;
+    case PlannedScalarOutputFault::RANGE_OVERFLOW:
+      request.output_capacity =
+          std::numeric_limits<std::size_t>::max() /
+              sizeof(QMCTraits::ValueType) +
+          1;
+      break;
+    case PlannedScalarOutputFault::PUBLICATION_ALIAS:
+      request.output_data = component.scalar_value_publication_.data();
+      request.output_capacity = output_count;
+      break;
+    case PlannedScalarOutputFault::COMPONENT_ALIAS:
+      request.output_data = component.accepted_laplacian_.data();
+      request.output_capacity = output_count;
+      break;
+    case PlannedScalarOutputFault::PARTICLE_ALIAS:
+      request.output_data = const_cast<QMCTraits::ValueType*>(reference.L.data());
+      request.output_capacity = output_count;
+      break;
+    case PlannedScalarOutputFault::VIRTUAL_PARTICLE_ALIAS:
+      request.output_data = reinterpret_cast<QMCTraits::ValueType*>(
+          const_cast<ParticleSet::PosType*>(virtual_particles->R.data()));
+      request.output_capacity = output_count;
+      break;
+    }
+    static_cast<void>(component.requirePlannedScalarValueOperation(request));
+  }
+
+  /// Copy the private publication payload for strict Phase-A atomicity checks.
+  static std::vector<QMCTraits::ValueType> scalarValuePublication(
+      const PsiFormerWF& component)
+  {
+    return component.scalar_value_publication_;
+  }
+
+  /// Temporarily detach the exact scalar publication allocation.
+  static std::vector<QMCTraits::ValueType> takeScalarValuePublication(
+      PsiFormerWF& component)
+  {
+    return std::move(component.scalar_value_publication_);
+  }
+
+  /// Install scalar publication storage, including deliberately malformed storage.
+  static void restoreScalarValuePublication(
+      PsiFormerWF& component,
+      std::vector<QMCTraits::ValueType> publication)
+  {
+    component.scalar_value_publication_ = std::move(publication);
+  }
+
+  /// Change only the live publication extent while retaining its allocation.
+  static void resizeScalarValuePublication(PsiFormerWF& component,
+                                           std::size_t size)
+  {
+    component.scalar_value_publication_.resize(size);
   }
 };
 } // namespace testing
@@ -259,6 +511,228 @@ namespace
 {
 using namespace testing::psiformer;
 using ValueType = QMCTraits::ValueType;
+
+/// Temporarily select one PsiFormer migration backend for a self-contained test.
+class ScopedEnvironmentVariable
+{
+public:
+  ScopedEnvironmentVariable(std::string name, const char* value)
+      : name_(std::move(name))
+  {
+    if (const char* previous = std::getenv(name_.c_str()))
+      previous_ = previous;
+    if (setenv(name_.c_str(), value, 1) != 0)
+      throw std::runtime_error(
+          "Unable to set PsiFormer test environment variable");
+  }
+
+  ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+  ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) =
+      delete;
+
+  ~ScopedEnvironmentVariable()
+  {
+    if (previous_)
+      setenv(name_.c_str(), previous_->c_str(), 1);
+    else
+      unsetenv(name_.c_str());
+  }
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+
+/// Capture all public ParticleSet data and retained allocation identities read by scalar VALUE.
+struct ScalarParticleStateSnapshot
+{
+  bool spinor = false;
+  int total_particles = 0;
+  int group_count = 0;
+  std::vector<int> group_sizes;
+  const void* position_data = nullptr;
+  const void* soa_position_data = nullptr;
+  const void* gradient_data = nullptr;
+  const void* laplacian_data = nullptr;
+  const void* group_data = nullptr;
+  const void* spin_data = nullptr;
+  std::array<std::size_t, 6> sizes{};
+  std::array<std::size_t, 6> capacities{};
+  ParticleSet::ParticlePos positions;
+  std::vector<ParticleSet::PosType> soa_positions;
+  ParticleSet::ParticleGradient gradients;
+  ParticleSet::ParticleLaplacian laplacians;
+  ParticleSet::ParticleIndex group_ids;
+  ParticleSet::ParticleScalar spins;
+  ParticleSet::Index_t active_particle = -1;
+  ParticleSet::PosType active_position{};
+  ParticleSet::RealType active_spin{};
+};
+
+/// Capture VirtualParticleSet provenance in addition to its ParticleSet base state.
+struct ScalarVirtualParticleStateSnapshot
+{
+  ScalarParticleStateSnapshot particles;
+  const ParticleSet* reference = nullptr;
+  int reference_particle = -1;
+  int reference_source_particle = -1;
+  bool on_sphere = false;
+};
+
+/// Compare one floating or complex scalar without normalizing signed zero or NaN payloads.
+template<class T>
+bool sameScalarBits(const T& actual, const T& expected)
+{
+  return std::memcmp(std::addressof(actual), std::addressof(expected),
+                     sizeof(T)) == 0;
+}
+
+/// Snapshot one reference or virtual ParticleSet before a scalar query.
+ScalarParticleStateSnapshot captureScalarParticleState(
+    const ParticleSet& particles)
+{
+  ScalarParticleStateSnapshot snapshot;
+  const auto& soa = particles.getCoordinates().getAllParticlePos();
+  snapshot.spinor = particles.isSpinor();
+  snapshot.total_particles = particles.getTotalNum();
+  snapshot.group_count = particles.groups();
+  if (snapshot.group_count > 0)
+  {
+    snapshot.group_sizes.resize(static_cast<std::size_t>(snapshot.group_count));
+    for (int group = 0; group < snapshot.group_count; ++group)
+      snapshot.group_sizes[static_cast<std::size_t>(group)] =
+          particles.groupsize(group);
+  }
+  snapshot.position_data = particles.R.data();
+  snapshot.soa_position_data = soa.data();
+  snapshot.gradient_data = particles.G.data();
+  snapshot.laplacian_data = particles.L.data();
+  snapshot.group_data = particles.GroupID.data();
+  snapshot.spin_data = particles.spins.data();
+  snapshot.sizes = {particles.R.size(), soa.size(), particles.G.size(),
+                    particles.L.size(), particles.GroupID.size(),
+                    particles.spins.size()};
+  snapshot.capacities = {particles.R.capacity(), soa.capacity(),
+                         particles.G.capacity(), particles.L.capacity(),
+                         particles.GroupID.capacity(),
+                         particles.spins.capacity()};
+  snapshot.positions = particles.R;
+  snapshot.soa_positions.resize(soa.size());
+  for (std::size_t particle = 0; particle < soa.size(); ++particle)
+    snapshot.soa_positions[particle] = soa[particle];
+  snapshot.gradients = particles.G;
+  snapshot.laplacians = particles.L;
+  snapshot.group_ids = particles.GroupID;
+  snapshot.spins = particles.spins;
+  snapshot.active_particle = particles.getActivePtcl();
+  snapshot.active_position = particles.getActivePos();
+  snapshot.active_spin = particles.getActiveSpinVal();
+  return snapshot;
+}
+
+/// Require exact scalar-query isolation for one ParticleSet.
+void checkScalarParticleState(const ParticleSet& particles,
+                              const ScalarParticleStateSnapshot& expected)
+{
+  const auto& soa = particles.getCoordinates().getAllParticlePos();
+  CHECK(particles.isSpinor() == expected.spinor);
+  CHECK(particles.getTotalNum() == expected.total_particles);
+  REQUIRE(particles.groups() == expected.group_count);
+  if (expected.group_count <= 0)
+    REQUIRE(expected.group_sizes.empty());
+  else
+    REQUIRE(static_cast<std::size_t>(expected.group_count) ==
+            expected.group_sizes.size());
+  for (int group = 0; group < expected.group_count; ++group)
+    CHECK(particles.groupsize(group) ==
+          expected.group_sizes[static_cast<std::size_t>(group)]);
+  CHECK(particles.R.data() == expected.position_data);
+  CHECK(soa.data() == expected.soa_position_data);
+  CHECK(particles.G.data() == expected.gradient_data);
+  CHECK(particles.L.data() == expected.laplacian_data);
+  CHECK(particles.GroupID.data() == expected.group_data);
+  CHECK(particles.spins.data() == expected.spin_data);
+  CHECK(std::array<std::size_t, 6>{particles.R.size(), soa.size(),
+                                   particles.G.size(), particles.L.size(),
+                                   particles.GroupID.size(),
+                                   particles.spins.size()} == expected.sizes);
+  CHECK(std::array<std::size_t, 6>{particles.R.capacity(), soa.capacity(),
+                                   particles.G.capacity(),
+                                   particles.L.capacity(),
+                                   particles.GroupID.capacity(),
+                                   particles.spins.capacity()} ==
+        expected.capacities);
+  CHECK(particles.getActivePtcl() == expected.active_particle);
+  CHECK(sameScalarBits(particles.getActiveSpinVal(), expected.active_spin));
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    CHECK(sameScalarBits(particles.getActivePos()[dimension],
+                         expected.active_position[dimension]));
+
+  REQUIRE(particles.R.size() == expected.positions.size());
+  REQUIRE(soa.size() == expected.soa_positions.size());
+  REQUIRE(particles.G.size() == expected.gradients.size());
+  REQUIRE(particles.L.size() == expected.laplacians.size());
+  REQUIRE(particles.GroupID.size() == expected.group_ids.size());
+  REQUIRE(particles.spins.size() == expected.spins.size());
+  for (std::size_t particle = 0; particle < particles.R.size(); ++particle)
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      CHECK(sameScalarBits(particles.R[particle][dimension],
+                           expected.positions[particle][dimension]));
+
+  for (std::size_t particle = 0; particle < soa.size(); ++particle)
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      CHECK(sameScalarBits(soa[particle][dimension],
+                           expected.soa_positions[particle][dimension]));
+
+  for (std::size_t particle = 0; particle < particles.G.size(); ++particle)
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      CHECK(sameScalarBits(particles.G[particle][dimension],
+                           expected.gradients[particle][dimension]));
+
+  for (std::size_t particle = 0; particle < particles.L.size(); ++particle)
+    CHECK(sameScalarBits(particles.L[particle],
+                         expected.laplacians[particle]));
+
+  for (std::size_t particle = 0; particle < particles.GroupID.size(); ++particle)
+    CHECK(particles.GroupID[particle] == expected.group_ids[particle]);
+
+  for (std::size_t particle = 0; particle < particles.spins.size(); ++particle)
+    CHECK(sameScalarBits(particles.spins[particle],
+                         expected.spins[particle]));
+}
+
+/// Snapshot a fully initialized VirtualParticleSet and its reference identity.
+ScalarVirtualParticleStateSnapshot captureScalarVirtualParticleState(
+    const VirtualParticleSet& virtual_particles)
+{
+  return {captureScalarParticleState(virtual_particles),
+          std::addressof(virtual_particles.getRefPS()),
+          virtual_particles.refPtcl, virtual_particles.refSourcePtcl,
+          virtual_particles.isOnSphere()};
+}
+
+/// Require a VirtualParticleSet and its provenance to remain bitwise unchanged.
+void checkScalarVirtualParticleState(
+    const VirtualParticleSet& virtual_particles,
+    const ScalarVirtualParticleStateSnapshot& expected)
+{
+  checkScalarParticleState(virtual_particles, expected.particles);
+  CHECK(std::addressof(virtual_particles.getRefPS()) == expected.reference);
+  CHECK(virtual_particles.refPtcl == expected.reference_particle);
+  CHECK(virtual_particles.refSourcePtcl ==
+        expected.reference_source_particle);
+  CHECK(virtual_particles.isOnSphere() == expected.on_sphere);
+}
+
+/// Compare a real or complex wavefunction ratio to an independent reference.
+void checkScalarRatio(ValueType actual, ValueType expected,
+                      double tolerance = 3.0e-9)
+{
+  CHECK(std::real(actual) ==
+        Catch::Approx(std::real(expected)).epsilon(tolerance).margin(tolerance));
+  CHECK(std::imag(actual) ==
+        Catch::Approx(std::imag(expected)).epsilon(tolerance).margin(tolerance));
+}
 
 /// Own a unique scratch directory used only for object-specific VP round trips.
 struct ScopedTestDirectory
@@ -419,18 +893,26 @@ std::shared_ptr<const BatchExecutionPlan> makeClonePreparationTestPlan(
     const std::string& participant_id,
     const std::string& profile_id,
     std::size_t value_tile = 2,
-    std::size_t ecp_outer_maximum = 0)
+    std::size_t ecp_outer_maximum = 0,
+    BatchExecutionTargetCoordinate target_coordinate =
+        BatchExecutionTargetCoordinate::POS_ONLY,
+    const std::string& backend_id = "cpu",
+    std::optional<std::size_t> device_id = std::nullopt,
+    bool serialized_walkers = false)
 {
   BatchExecutionSelectionInput selection;
-  selection.requirements                           = requirements;
+  selection.requirements                       = requirements;
   selection.topology.initial_walkers_per_crowd = {1};
   selection.topology.reserve_walkers_per_crowd = {1};
-  selection.topology.run_kind                  = "psiformer-clone-preparation-test";
-  selection.particle_count                     = 4;
-  selection.active_parameter_count             = 2;
-  selection.target_coordinate                  = BatchExecutionTargetCoordinate::POS_ONLY;
-  selection.preference.id                      = profile_id;
-  selection.preference.preferred               = {value_tile, 1, 1, ecp_outer_maximum};
+  selection.topology.serialized_walkers         = serialized_walkers;
+  selection.topology.run_kind = "psiformer-clone-preparation-test";
+  selection.topology.backend_id    = backend_id;
+  selection.topology.device_id     = device_id;
+  selection.particle_count         = 4;
+  selection.active_parameter_count = 2;
+  selection.target_coordinate      = target_coordinate;
+  selection.preference.id          = profile_id;
+  selection.preference.preferred = {value_tile, 1, 1, ecp_outer_maximum};
   selection.logical_maximum = component.batchExecutionLogicalMaximum(
       {requirements, selection.topology, selection.particle_count,
        selection.active_parameter_count, selection.parameter_derivative_width,
@@ -448,6 +930,177 @@ std::shared_ptr<const BatchExecutionPlan> makeClonePreparationTestPlan(
             return std::vector<BatchMemoryParticipantContribution>{
                 {participant_id, std::move(fabricated)}};
           }));
+}
+
+/// Keep a selected plan alive while one clone exercises scalar compatibility.
+struct PreparedScalarPlan
+{
+  std::shared_ptr<const BatchExecutionPlan> plan;
+  BatchExecutionParticipantPlan participant;
+};
+
+/// Select, bind, and prepare the exact clone-local scalar owner used by a test.
+PreparedScalarPlan prepareScalarValuePlan(PsiFormerWF& component,
+                                          const std::string& participant_id,
+                                          const std::string& profile_id,
+                                          bool select_ecp_outer = false)
+{
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  if (select_ecp_outer)
+  {
+    requirements.require(BatchExecutionMode::VALUE);
+    requirements.require(BatchExecutionMode::ECP_OUTER);
+  }
+  PreparedScalarPlan prepared;
+  prepared.plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, profile_id, 2,
+      select_ecp_outer ? 2 : 0);
+  prepared.participant =
+      makeBatchExecutionParticipantPlan(prepared.plan, participant_id);
+  component.bindBatchExecutionPlan(prepared.participant);
+  component.prepareBatchExecutionClone(prepared.participant);
+  return prepared;
+}
+
+/// Require that a scalar call changed no retained clone-local allocation evidence.
+void checkScalarWorkspaceStorage(
+    const testing::PsiFormerWorkspaceDiagnostics& actual,
+    const testing::PsiFormerWorkspaceDiagnostics& expected)
+{
+  CHECK(actual.owns_value_workspace == expected.owns_value_workspace);
+  CHECK(actual.owns_full_spatial_workspace ==
+        expected.owns_full_spatial_workspace);
+  CHECK(actual.owns_active_spatial_workspace ==
+        expected.owns_active_spatial_workspace);
+  CHECK(actual.owns_batch_workspace == expected.owns_batch_workspace);
+  CHECK(actual.owns_score_workspace == expected.owns_score_workspace);
+  CHECK(actual.owns_kinetic_workspace == expected.owns_kinetic_workspace);
+  CHECK(actual.has_prepared_clone_plan == expected.has_prepared_clone_plan);
+  CHECK(actual.value_bytes == expected.value_bytes);
+  CHECK(actual.full_spatial_bytes == expected.full_spatial_bytes);
+  CHECK(actual.active_spatial_bytes == expected.active_spatial_bytes);
+  CHECK(actual.batch_bytes == expected.batch_bytes);
+  CHECK(actual.score_bytes == expected.score_bytes);
+  CHECK(actual.kinetic_bytes == expected.kinetic_bytes);
+  CHECK(actual.total_log_gradient_bytes ==
+        expected.total_log_gradient_bytes);
+  CHECK(actual.scalar_value_publication_bytes ==
+        expected.scalar_value_publication_bytes);
+  CHECK(actual.accepted_spatial_bytes == expected.accepted_spatial_bytes);
+  CHECK(actual.proposed_spatial_bytes == expected.proposed_spatial_bytes);
+  CHECK(actual.batch_storage_fingerprint ==
+        expected.batch_storage_fingerprint);
+  CHECK(actual.batch_workspace_identity == expected.batch_workspace_identity);
+  CHECK(actual.scalar_value_publication_identity ==
+        expected.scalar_value_publication_identity);
+  CHECK(actual.scalar_value_publication_size ==
+        expected.scalar_value_publication_size);
+  CHECK(actual.scalar_value_publication_capacity ==
+        expected.scalar_value_publication_capacity);
+  CHECK(actual.prepared_scalar_value_compatibility ==
+        expected.prepared_scalar_value_compatibility);
+  CHECK(actual.prepared_batch_workspace_identity ==
+        expected.prepared_batch_workspace_identity);
+  CHECK(actual.prepared_batch_storage_fingerprint ==
+        expected.prepared_batch_storage_fingerprint);
+  CHECK(actual.prepared_batch_bytes == expected.prepared_batch_bytes);
+  CHECK(actual.prepared_scalar_value_publication_identity ==
+        expected.prepared_scalar_value_publication_identity);
+  CHECK(actual.prepared_scalar_value_publication_size ==
+        expected.prepared_scalar_value_publication_size);
+  CHECK(actual.prepared_scalar_value_publication_capacity ==
+        expected.prepared_scalar_value_publication_capacity);
+  CHECK(actual.accountedBytes() == expected.accountedBytes());
+  CHECK(actual.ownedWorkspaceCount() == expected.ownedWorkspaceCount());
+}
+
+/// Snapshot every persistent or caller-owned object surrounding one scalar transaction.
+struct PlannedScalarTransactionSnapshot
+{
+  testing::PsiFormerScalarStateSnapshot component;
+  testing::PsiFormerWorkspaceDiagnostics workspace;
+  std::vector<ValueType> publication;
+  ScalarParticleStateSnapshot reference;
+  std::optional<ScalarVirtualParticleStateSnapshot> virtual_particles;
+  std::size_t parameter_version = 0;
+  std::array<std::size_t, 2> proposal_counts{};
+  const ValueType* output_data = nullptr;
+  std::size_t output_size = 0;
+  std::size_t output_capacity = 0;
+  std::vector<ValueType> output;
+};
+
+/// Capture the complete externally observable boundary for one planned scalar call.
+PlannedScalarTransactionSnapshot capturePlannedScalarTransaction(
+    const PsiFormerWF& component,
+    const ParticleSet& reference,
+    const std::vector<ValueType>& output,
+    const VirtualParticleSet* virtual_particles = nullptr)
+{
+  PlannedScalarTransactionSnapshot snapshot{
+      testing::TestPsiFormerWF::scalarStateSnapshot(component),
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component),
+      testing::TestPsiFormerWF::scalarValuePublication(component),
+      captureScalarParticleState(reference),
+      std::nullopt,
+      component.parameterVersion(),
+      testing::TestPsiFormerWF::plannedProposalCounts(component),
+      output.data(),
+      output.size(),
+      output.capacity(),
+      output};
+  if (virtual_particles)
+    snapshot.virtual_particles =
+        captureScalarVirtualParticleState(*virtual_particles);
+  return snapshot;
+}
+
+/// Check exact state isolation after either a successful scalar query or a rejected one.
+void checkPlannedScalarTransaction(
+    const PsiFormerWF& component,
+    const ParticleSet& reference,
+    const std::vector<ValueType>& output,
+    const PlannedScalarTransactionSnapshot& expected,
+    const VirtualParticleSet* virtual_particles = nullptr,
+    bool check_output_contents = true,
+    bool check_publication_contents = false)
+{
+  CHECK(testing::TestPsiFormerWF::scalarStateMatches(component,
+                                                      expected.component));
+  checkScalarWorkspaceStorage(
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component),
+      expected.workspace);
+  checkScalarParticleState(reference, expected.reference);
+  CHECK(component.parameterVersion() == expected.parameter_version);
+  CHECK(testing::TestPsiFormerWF::plannedProposalCounts(component) ==
+        expected.proposal_counts);
+  if (check_publication_contents)
+  {
+    const std::vector<ValueType> publication =
+        testing::TestPsiFormerWF::scalarValuePublication(component);
+    REQUIRE(publication.size() == expected.publication.size());
+    for (std::size_t value = 0; value < publication.size(); ++value)
+      CHECK(sameScalarBits(publication[value], expected.publication[value]));
+  }
+  CHECK(output.data() == expected.output_data);
+  CHECK(output.size() == expected.output_size);
+  CHECK(output.capacity() == expected.output_capacity);
+  if (check_output_contents)
+  {
+    REQUIRE(output.size() == expected.output.size());
+    for (std::size_t value = 0; value < output.size(); ++value)
+      CHECK(sameScalarBits(output[value], expected.output[value]));
+  }
+  if (virtual_particles)
+  {
+    REQUIRE(expected.virtual_particles.has_value());
+    checkScalarVirtualParticleState(*virtual_particles,
+                                    *expected.virtual_particles);
+  }
+  else
+    CHECK_FALSE(expected.virtual_particles.has_value());
 }
 
 /// Capture the high-level observables and selected derivatives of one component.
@@ -1133,10 +1786,12 @@ TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
   const std::size_t electrons_count =
       static_cast<std::size_t>(electrons.getTotalNum());
   PsiFormerWF component("pf_clone_prepare", files.parameters.string(),
                         files.configuration.string(), true, {0, 1});
+  component.validateSystem(electrons, *ions, "all_electron");
 
   BatchExecutionRequirements requirements;
   component.contributeBatchExecutionRequirements(requirements);
@@ -1369,14 +2024,1200 @@ TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
   CHECK_FALSE(rebound.owns_batch_workspace);
 }
 
+TEST_CASE("PsiFormer planned scalar VALUE matches independent direct evaluation",
+          "[wavefunction][psiformer][batch_memory][scalar_value]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet planned_electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet legacy_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(planned_electrons.getTotalNum());
+  REQUIRE(electron_count > 2);
+
+  PsiFormerWF planned("pf_planned_scalar_value", files.parameters.string(),
+                      files.configuration.string());
+  PsiFormerWF legacy("pf_legacy_scalar_value", files.parameters.string(),
+                     files.configuration.string());
+  planned.validateSystem(planned_electrons, *ions, "all_electron");
+
+  // Give the component nontrivial accepted spatial state before binding the
+  // plan so the read-only scalar queries must preserve meaningful payload.
+  planned_electrons.G = ValueType(0);
+  planned_electrons.L = ValueType(0);
+  planned.evaluateLog(planned_electrons, planned_electrons.G,
+                      planned_electrons.L);
+  const PreparedScalarPlan prepared = prepareScalarValuePlan(
+      planned, "test/psiformer/scalar-value-correctness",
+      "scalar-value-correctness-v1");
+  static_cast<void>(prepared);
+
+  const ParticleSet::SingleParticlePos common_position{0.43, -0.31, 0.27};
+  planned_electrons.makeVirtualMoves(common_position);
+  legacy_electrons.makeVirtualMoves(common_position);
+  std::vector<ValueType> planned_all_to_one(electron_count,
+                                             ValueType(17));
+  std::vector<ValueType> legacy_all_to_one(electron_count, ValueType(0));
+  const PlannedScalarTransactionSnapshot all_to_one_before =
+      capturePlannedScalarTransaction(planned, planned_electrons,
+                                      planned_all_to_one);
+  legacy.evaluateRatiosAlltoOne(legacy_electrons, legacy_all_to_one);
+  planned.evaluateRatiosAlltoOne(planned_electrons, planned_all_to_one);
+  checkPlannedScalarTransaction(planned, planned_electrons,
+                                planned_all_to_one, all_to_one_before,
+                                nullptr, false);
+  bool changed_all_to_one = false;
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+  {
+    checkScalarRatio(planned_all_to_one[electron],
+                     legacy_all_to_one[electron]);
+    changed_all_to_one = changed_all_to_one ||
+        std::abs(planned_all_to_one[electron] - ValueType(1)) > 1.0e-8;
+  }
+  CHECK(changed_all_to_one);
+
+  // Reuse the same prepared VALUE owner at a singleton, an interior prefix,
+  // and its exact N_e replacement envelope. VirtualParticleSet cannot safely
+  // construct an empty move set; the direct adapter tests cover q == 0.
+  // Alternating with all-to-one catches unsafe retained logical extents.
+  const std::array<std::size_t, 3> virtual_counts{1, 2, electron_count};
+  for (std::size_t cycle = 0; cycle < 2; ++cycle)
+    for (const std::size_t virtual_count : virtual_counts)
+    {
+      CAPTURE(cycle, virtual_count);
+      std::vector<ParticleSet::SingleParticlePos> displacements;
+      displacements.reserve(virtual_count);
+      for (std::size_t move = 0; move < virtual_count; ++move)
+      {
+        const double scale = static_cast<double>((cycle + 1) * (move + 1));
+        displacements.emplace_back(0.019 * scale, -0.013 * scale,
+                                   0.011 * scale);
+      }
+      VirtualParticleSet planned_virtual(planned_electrons);
+      VirtualParticleSet legacy_virtual(legacy_electrons);
+      planned_virtual.makeMoves(planned_electrons, 1, displacements);
+      legacy_virtual.makeMoves(legacy_electrons, 1, displacements);
+      std::vector<ValueType> planned_ratios(virtual_count, ValueType(-23));
+      std::vector<ValueType> legacy_ratios(virtual_count, ValueType(0));
+      const PlannedScalarTransactionSnapshot before =
+          capturePlannedScalarTransaction(planned, planned_electrons,
+                                          planned_ratios, &planned_virtual);
+
+      legacy.evaluateRatios(legacy_virtual, legacy_ratios);
+      planned.evaluateRatios(planned_virtual, planned_ratios);
+      checkPlannedScalarTransaction(planned, planned_electrons,
+                                    planned_ratios, before,
+                                    &planned_virtual, false);
+      bool changed_virtual = false;
+      for (std::size_t move = 0; move < virtual_count; ++move)
+      {
+        checkScalarRatio(planned_ratios[move], legacy_ratios[move]);
+        changed_virtual = changed_virtual ||
+            std::abs(planned_ratios[move] - ValueType(1)) > 1.0e-10;
+      }
+      CHECK(changed_virtual);
+
+      std::fill(planned_all_to_one.begin(), planned_all_to_one.end(),
+                ValueType(29));
+      legacy.evaluateRatiosAlltoOne(legacy_electrons, legacy_all_to_one);
+      const PlannedScalarTransactionSnapshot alternating_before =
+          capturePlannedScalarTransaction(planned, planned_electrons,
+                                          planned_all_to_one);
+      planned.evaluateRatiosAlltoOne(planned_electrons,
+                                     planned_all_to_one);
+      checkPlannedScalarTransaction(planned, planned_electrons,
+                                    planned_all_to_one,
+                                    alternating_before, nullptr, false);
+      for (std::size_t electron = 0; electron < electron_count; ++electron)
+        checkScalarRatio(planned_all_to_one[electron],
+                         legacy_all_to_one[electron]);
+    }
+}
+
+TEST_CASE("PsiFormer planned scalar VALUE late failures are atomic and retryable",
+          "[wavefunction][psiformer][batch_memory][scalar_value][atomic]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet reference_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(electrons.getTotalNum());
+
+  PsiFormerWF component("pf_scalar_value_late_failure",
+                        files.parameters.string(),
+                        files.configuration.string());
+  PsiFormerWF reference("pf_scalar_value_late_reference",
+                        files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  const PreparedScalarPlan prepared = prepareScalarValuePlan(
+      component, "test/psiformer/scalar-value-late-failure",
+      "scalar-value-late-failure-v1");
+  static_cast<void>(prepared);
+
+  const ParticleSet::SingleParticlePos common_position{0.39, -0.23, 0.34};
+  electrons.makeVirtualMoves(common_position);
+  reference_electrons.makeVirtualMoves(common_position);
+  std::vector<ValueType> expected_all_to_one(electron_count);
+  reference.evaluateRatiosAlltoOne(reference_electrons,
+                                   expected_all_to_one);
+  std::vector<ValueType> all_to_one(electron_count, ValueType(-31));
+  const PlannedScalarTransactionSnapshot all_to_one_before =
+      capturePlannedScalarTransaction(component, electrons, all_to_one);
+  testing::TestPsiFormerWF::failPlannedScalarValueBeforePublish(component,
+                                                                true);
+  CHECK_THROWS_WITH(
+      component.evaluateRatiosAlltoOne(electrons, all_to_one),
+      Catch::Matchers::ContainsSubstring(
+          "planned scalar VALUE pre-publication failure"));
+  testing::TestPsiFormerWF::failPlannedScalarValueBeforePublish(component,
+                                                                false);
+  checkPlannedScalarTransaction(component, electrons, all_to_one,
+                                all_to_one_before);
+  component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+    checkScalarRatio(all_to_one[electron], expected_all_to_one[electron]);
+
+  const std::vector<ParticleSet::SingleParticlePos> displacements{
+      {0.023, -0.017, 0.012}, {-0.031, 0.014, 0.027}};
+  VirtualParticleSet virtual_particles(electrons);
+  VirtualParticleSet reference_virtual(reference_electrons);
+  virtual_particles.makeMoves(electrons, 2, displacements);
+  reference_virtual.makeMoves(reference_electrons, 2, displacements);
+  std::vector<ValueType> expected_virtual(displacements.size());
+  reference.evaluateRatios(reference_virtual, expected_virtual);
+  std::vector<ValueType> virtual_ratios(displacements.size(), ValueType(37));
+  const PlannedScalarTransactionSnapshot virtual_before =
+      capturePlannedScalarTransaction(component, electrons, virtual_ratios,
+                                      &virtual_particles);
+  testing::TestPsiFormerWF::failPlannedScalarValueBeforePublish(component,
+                                                                true);
+  CHECK_THROWS_WITH(
+      component.evaluateRatios(virtual_particles, virtual_ratios),
+      Catch::Matchers::ContainsSubstring(
+          "planned scalar VALUE pre-publication failure"));
+  testing::TestPsiFormerWF::failPlannedScalarValueBeforePublish(component,
+                                                                false);
+  checkPlannedScalarTransaction(component, electrons, virtual_ratios,
+                                virtual_before, &virtual_particles);
+  component.evaluateRatios(virtual_particles, virtual_ratios);
+  for (std::size_t move = 0; move < virtual_ratios.size(); ++move)
+    checkScalarRatio(virtual_ratios[move], expected_virtual[move]);
+}
+
+TEST_CASE("PsiFormer planned scalar VALUE rejects malformed provenance atomically",
+          "[wavefunction][psiformer][batch_memory][scalar_value][preflight]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet foreign_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(electrons.getTotalNum());
+  REQUIRE(electron_count > 1);
+
+  PsiFormerWF component("pf_scalar_value_preflight",
+                        files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  const PreparedScalarPlan prepared = prepareScalarValuePlan(
+      component, "test/psiformer/scalar-value-preflight",
+      "scalar-value-preflight-v1");
+  static_cast<void>(prepared);
+
+  const ParticleSet::SingleParticlePos common_position{0.41, -0.26, 0.33};
+  electrons.makeVirtualMoves(common_position);
+  foreign_electrons.makeVirtualMoves(common_position);
+
+  const auto require_failure = [&](ParticleSet& reference,
+                                   std::vector<ValueType>& output,
+                                   const VirtualParticleSet* virtual_particles,
+                                   auto&& invocation) {
+    const PlannedScalarTransactionSnapshot before =
+        capturePlannedScalarTransaction(component, reference, output,
+                                        virtual_particles);
+    CHECK_THROWS(invocation());
+    checkPlannedScalarTransaction(component, reference, output, before,
+                                  virtual_particles, true, true);
+  };
+
+  std::vector<ValueType> wrong_size(electron_count - 1, ValueType(5));
+  require_failure(electrons, wrong_size, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, wrong_size);
+  });
+
+  std::vector<ValueType> all_to_one(electron_count, ValueType(7));
+  require_failure(foreign_electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(foreign_electrons, all_to_one);
+  });
+
+  electrons.setSpinor(true);
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  electrons.setSpinor(false);
+
+  const ParticleSet::RealType saved_coordinate = electrons.R[0][0];
+  electrons.R[0][0] += ParticleSet::RealType(0.125);
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  electrons.R[0][0] = saved_coordinate;
+
+  electrons.R[0][0] =
+      std::numeric_limits<ParticleSet::RealType>::infinity();
+  electrons.update();
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  electrons.R[0][0] = saved_coordinate;
+  electrons.update();
+  electrons.makeVirtualMoves(common_position);
+
+  const int saved_group = electrons.GroupID[0];
+  electrons.GroupID[0] = 1;
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  electrons.GroupID[0] = saved_group;
+
+  electrons.makeMove(0, ParticleSet::SingleParticlePos{0.01, -0.02, 0.03});
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  electrons.rejectMove(0);
+  electrons.makeVirtualMoves(common_position);
+
+  electrons.makeVirtualMoves(ParticleSet::SingleParticlePos{
+      std::numeric_limits<ParticleSet::RealType>::infinity(), 0.0, 0.0});
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  electrons.makeVirtualMoves(common_position);
+
+  testing::TestPsiFormerWF::markScalarProposalPending(component, 0);
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  testing::TestPsiFormerWF::clearProposal(component);
+  testing::TestPsiFormerWF::markPlannedSingleProposalPending(component, 0);
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  testing::TestPsiFormerWF::clearProposal(component);
+  testing::TestPsiFormerWF::markSelectedProposalPending(component);
+  require_failure(electrons, all_to_one, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(electrons, all_to_one);
+  });
+  testing::TestPsiFormerWF::clearProposal(component);
+
+  const auto initialize_two_spin_species = [](ParticleSet& particles) {
+    SpeciesSet& species = particles.getSpeciesSet();
+    species.addSpecies("u");
+    species.addSpecies("d");
+    const int mass = species.addAttribute("mass");
+    species(mass, 0) = 1.0;
+    species(mass, 1) = 1.0;
+    particles.resetGroups();
+  };
+
+  ParticleSet wrong_count(simulation_cell);
+  wrong_count.setName("wrong_scalar_reference");
+  wrong_count.create({3, 2});
+  initialize_two_spin_species(wrong_count);
+  wrong_count.update();
+  wrong_count.makeVirtualMoves(common_position);
+  testing::TestPsiFormerWF::bindParticleSetForTesting(component, wrong_count);
+  std::vector<ValueType> wrong_count_output(
+      static_cast<std::size_t>(wrong_count.getTotalNum()), ValueType(11));
+  require_failure(wrong_count, wrong_count_output, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(wrong_count, wrong_count_output);
+  });
+  testing::TestPsiFormerWF::bindParticleSetForTesting(component, electrons);
+
+  ParticleSet wrong_partition(simulation_cell);
+  wrong_partition.setName("wrong_scalar_spin_partition");
+  wrong_partition.create({1, 3});
+  initialize_two_spin_species(wrong_partition);
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+    wrong_partition.R[electron] = electrons.R[electron];
+  wrong_partition.update();
+  wrong_partition.makeVirtualMoves(common_position);
+  testing::TestPsiFormerWF::bindParticleSetForTesting(component,
+                                                      wrong_partition);
+  std::vector<ValueType> wrong_partition_output(electron_count,
+                                                ValueType(12));
+  require_failure(wrong_partition, wrong_partition_output, nullptr, [&]() {
+    component.evaluateRatiosAlltoOne(wrong_partition,
+                                     wrong_partition_output);
+  });
+  testing::TestPsiFormerWF::bindParticleSetForTesting(component, electrons);
+
+  const std::vector<ParticleSet::SingleParticlePos> displacements{
+      {0.017, -0.012, 0.009}, {-0.026, 0.018, 0.013}};
+  VirtualParticleSet virtual_particles(electrons);
+  virtual_particles.makeMoves(electrons, 1, displacements);
+  std::vector<ValueType> virtual_ratios(displacements.size(), ValueType(13));
+
+  VirtualParticleSet foreign_virtual(foreign_electrons);
+  foreign_virtual.makeMoves(foreign_electrons, 1, displacements);
+  require_failure(foreign_electrons, virtual_ratios, &foreign_virtual, [&]() {
+    component.evaluateRatios(foreign_virtual, virtual_ratios);
+  });
+
+  virtual_particles.refPtcl = -1;
+  require_failure(electrons, virtual_ratios, &virtual_particles, [&]() {
+    component.evaluateRatios(virtual_particles, virtual_ratios);
+  });
+  virtual_particles.refPtcl = 1;
+
+  virtual_particles.setSpinor(true);
+  require_failure(electrons, virtual_ratios, &virtual_particles, [&]() {
+    component.evaluateRatios(virtual_particles, virtual_ratios);
+  });
+  virtual_particles.setSpinor(false);
+
+  std::vector<ValueType> wrong_virtual_size(displacements.size() - 1,
+                                            ValueType(15));
+  require_failure(electrons, wrong_virtual_size, &virtual_particles, [&]() {
+    component.evaluateRatios(virtual_particles, wrong_virtual_size);
+  });
+
+  virtual_particles.R.resize(displacements.size() - 1);
+  require_failure(electrons, virtual_ratios, &virtual_particles, [&]() {
+    component.evaluateRatios(virtual_particles, virtual_ratios);
+  });
+  virtual_particles.makeMoves(electrons, 1, displacements);
+
+  const ParticleSet::RealType saved_virtual_coordinate =
+      virtual_particles.R[0][0];
+  virtual_particles.R[0][0] =
+      std::numeric_limits<ParticleSet::RealType>::quiet_NaN();
+  virtual_particles.update();
+  require_failure(electrons, virtual_ratios, &virtual_particles, [&]() {
+    component.evaluateRatios(virtual_particles, virtual_ratios);
+  });
+  virtual_particles.R[0][0] = saved_virtual_coordinate;
+  virtual_particles.update();
+
+  using OutputFault = testing::TestPsiFormerWF::PlannedScalarOutputFault;
+  const auto require_output_probe_failure =
+      [&](OutputFault fault, const VirtualParticleSet* virtual_input,
+          std::vector<ValueType>& output, const char* expected_message) {
+        const PlannedScalarTransactionSnapshot before =
+            capturePlannedScalarTransaction(component, electrons, output,
+                                            virtual_input);
+        CHECK_THROWS_WITH(
+            testing::TestPsiFormerWF::probePlannedScalarOutput(
+                component, electrons, virtual_input, output, fault),
+            Catch::Matchers::ContainsSubstring(expected_message));
+        checkPlannedScalarTransaction(component, electrons, output, before,
+                                      virtual_input, true, true);
+      };
+  require_output_probe_failure(OutputFault::NULL_STORAGE, nullptr, all_to_one,
+                               "planned output storage is null");
+  require_output_probe_failure(OutputFault::RANGE_OVERFLOW, nullptr,
+                               all_to_one, "output range overflowed");
+  require_output_probe_failure(OutputFault::PUBLICATION_ALIAS, nullptr,
+                               all_to_one, "aliases prepared scratch");
+  require_output_probe_failure(OutputFault::COMPONENT_ALIAS, nullptr,
+                               all_to_one, "aliases component state");
+  require_output_probe_failure(OutputFault::PARTICLE_ALIAS, nullptr,
+                               all_to_one, "aliases ParticleSet state");
+  require_output_probe_failure(OutputFault::VIRTUAL_PARTICLE_ALIAS,
+                               &virtual_particles, virtual_ratios,
+                               "aliases VirtualParticleSet state");
+
+  // Every rejected path leaves the prepared owner immediately reusable.
+  std::fill(virtual_ratios.begin(), virtual_ratios.end(), ValueType(19));
+  CHECK_NOTHROW(component.evaluateRatios(virtual_particles, virtual_ratios));
+  CHECK(std::any_of(virtual_ratios.begin(), virtual_ratios.end(),
+                    [](ValueType value) { return value != ValueType(19); }));
+}
+
+TEST_CASE("PsiFormer planned scalar VALUE rejects corrupted prepared storage atomically",
+          "[wavefunction][psiformer][batch_memory][scalar_value][preflight]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet donor_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(electrons.getTotalNum());
+
+  PsiFormerWF component("pf_scalar_storage_corruption",
+                        files.parameters.string(),
+                        files.configuration.string());
+  PsiFormerWF donor("pf_scalar_storage_donor", files.parameters.string(),
+                    files.configuration.string());
+  PsiFormerWF empty_owner("pf_scalar_storage_empty", files.parameters.string(),
+                          files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  donor.validateSystem(donor_electrons, *ions, "all_electron");
+  const PreparedScalarPlan prepared = prepareScalarValuePlan(
+      component, "test/psiformer/scalar-storage-corruption",
+      "scalar-storage-corruption-v1");
+  const PreparedScalarPlan donor_prepared = prepareScalarValuePlan(
+      donor, "test/psiformer/scalar-storage-donor",
+      "scalar-storage-donor-v1");
+  static_cast<void>(prepared);
+  static_cast<void>(donor_prepared);
+
+  electrons.makeVirtualMoves(
+      ParticleSet::SingleParticlePos{0.38, -0.24, 0.31});
+  std::vector<ValueType> ratios(electron_count, ValueType(79));
+  const auto require_failure = [&]() {
+    const PlannedScalarTransactionSnapshot before =
+        capturePlannedScalarTransaction(component, electrons, ratios);
+    CHECK_THROWS(component.evaluateRatiosAlltoOne(electrons, ratios));
+    checkPlannedScalarTransaction(component, electrons, ratios, before,
+                                  nullptr, true, true);
+  };
+
+  // Missing and foreign workspace owners must fail before any numerical work.
+  testing::TestPsiFormerWF::swapBatchWorkspaces(component, empty_owner);
+  require_failure();
+  testing::TestPsiFormerWF::swapBatchWorkspaces(component, empty_owner);
+
+  testing::TestPsiFormerWF::swapBatchWorkspaces(component, donor);
+  require_failure();
+  testing::TestPsiFormerWF::swapBatchWorkspaces(component, donor);
+
+  // Independently corrupt logical and tile-capacity preparation records while
+  // retaining the same workspace allocation, then restore the exact plan.
+  using WorkspaceFault =
+      testing::TestPsiFormerWF::PreparedScalarWorkspaceFault;
+  testing::TestPsiFormerWF::setPreparedScalarWorkspaceFault(
+      component, WorkspaceFault::LOGICAL_CAPACITY);
+  require_failure();
+  testing::TestPsiFormerWF::setPreparedScalarWorkspaceFault(
+      component, WorkspaceFault::NONE);
+
+  testing::TestPsiFormerWF::setPreparedScalarWorkspaceFault(
+      component, WorkspaceFault::TILE_CAPACITY);
+  require_failure();
+  testing::TestPsiFormerWF::setPreparedScalarWorkspaceFault(
+      component, WorkspaceFault::NONE);
+
+  // Missing, foreign, wrong-extent, and wrong-capacity publication storage are
+  // distinct provenance failures even when their element type is compatible.
+  auto retained_publication =
+      testing::TestPsiFormerWF::takeScalarValuePublication(component);
+  const std::vector<ValueType> publication_contents = retained_publication;
+  const std::size_t publication_size = retained_publication.size();
+  const std::size_t publication_capacity = retained_publication.capacity();
+  testing::TestPsiFormerWF::restoreScalarValuePublication(component, {});
+  require_failure();
+  testing::TestPsiFormerWF::restoreScalarValuePublication(
+      component, std::move(retained_publication));
+
+  retained_publication =
+      testing::TestPsiFormerWF::takeScalarValuePublication(component);
+  testing::TestPsiFormerWF::restoreScalarValuePublication(
+      component, std::vector<ValueType>(publication_size, ValueType(83)));
+  require_failure();
+  auto foreign_publication =
+      testing::TestPsiFormerWF::takeScalarValuePublication(component);
+  testing::TestPsiFormerWF::restoreScalarValuePublication(
+      component, std::move(retained_publication));
+
+  testing::TestPsiFormerWF::resizeScalarValuePublication(
+      component, publication_size - 1);
+  require_failure();
+  retained_publication =
+      testing::TestPsiFormerWF::takeScalarValuePublication(component);
+  retained_publication.resize(publication_size);
+  std::copy(publication_contents.begin(), publication_contents.end(),
+            retained_publication.begin());
+  testing::TestPsiFormerWF::restoreScalarValuePublication(
+      component, std::move(retained_publication));
+
+  retained_publication =
+      testing::TestPsiFormerWF::takeScalarValuePublication(component);
+  std::vector<ValueType> oversized_publication(publication_size,
+                                                ValueType(89));
+  oversized_publication.reserve(publication_capacity + 1);
+  REQUIRE(oversized_publication.capacity() != publication_capacity);
+  testing::TestPsiFormerWF::restoreScalarValuePublication(
+      component, std::move(oversized_publication));
+  require_failure();
+  oversized_publication =
+      testing::TestPsiFormerWF::takeScalarValuePublication(component);
+  testing::TestPsiFormerWF::restoreScalarValuePublication(
+      component, std::move(retained_publication));
+  static_cast<void>(foreign_publication);
+  static_cast<void>(oversized_publication);
+
+  // All rejected corruptions leave the restored owner immediately usable.
+  CHECK_NOTHROW(component.evaluateRatiosAlltoOne(electrons, ratios));
+  CHECK(std::any_of(ratios.begin(), ratios.end(), [](ValueType ratio) {
+    return ratio != ValueType(79);
+  }));
+}
+
+TEST_CASE("PsiFormer planned scalar VALUE rejects incompatible plan provenance",
+          "[wavefunction][psiformer][batch_memory][scalar_value][preflight]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+
+  const auto require_runtime_rejection =
+      [&](const std::string& label,
+          BatchExecutionTargetCoordinate target_coordinate,
+          const std::string& topology_backend,
+          std::optional<std::size_t> device_id,
+          const char* expected_message) {
+        ParticleSet electrons = makeLiHElectrons(simulation_cell);
+        PsiFormerWF component("pf_scalar_plan_" + label,
+                              files.parameters.string(),
+                              files.configuration.string());
+        component.validateSystem(electrons, *ions, "all_electron");
+        electrons.G = ValueType(0);
+        electrons.L = ValueType(0);
+        component.evaluateLog(electrons, electrons.G, electrons.L);
+
+        BatchExecutionRequirements requirements;
+        component.contributeBatchExecutionRequirements(requirements);
+        requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+        const std::string participant_id =
+            "test/psiformer/scalar-plan-" + label;
+        const auto plan = makeClonePreparationTestPlan(
+            component, requirements, participant_id,
+            "scalar-plan-" + label + "-v1", 2, 0, target_coordinate,
+            topology_backend, device_id);
+        const BatchExecutionParticipantPlan participant =
+            makeBatchExecutionParticipantPlan(plan, participant_id);
+        component.bindBatchExecutionPlan(participant);
+        component.prepareBatchExecutionClone(participant);
+
+        electrons.makeVirtualMoves(
+            ParticleSet::SingleParticlePos{0.34, -0.27, 0.39});
+        std::vector<ValueType> output(
+            static_cast<std::size_t>(electrons.getTotalNum()), ValueType(139));
+        const PlannedScalarTransactionSnapshot before =
+            capturePlannedScalarTransaction(component, electrons, output);
+        CHECK_THROWS_WITH(
+            component.evaluateRatiosAlltoOne(electrons, output),
+            Catch::Matchers::ContainsSubstring(expected_message));
+        checkPlannedScalarTransaction(component, electrons, output, before,
+                                      nullptr, true, true);
+      };
+
+  for (const auto target : {BatchExecutionTargetCoordinate::UNKNOWN,
+                            BatchExecutionTargetCoordinate::POS_SPIN})
+  {
+    CAPTURE(static_cast<int>(target));
+    require_runtime_rejection(
+        target == BatchExecutionTargetCoordinate::UNKNOWN ? "unknown-target"
+                                                          : "spin-target",
+        target, "cpu", std::nullopt,
+        "requires explicit POS-only target evidence");
+  }
+  require_runtime_rejection(
+      "device-topology", BatchExecutionTargetCoordinate::POS_ONLY,
+      "accelerator", std::size_t{0},
+      "requires direct nonserialized CPU execution");
+
+  for (const char* backend : {"oracle", "compare"})
+  {
+    CAPTURE(backend);
+    ScopedEnvironmentVariable select_backend("PSIFORMER_VALUE_BACKEND",
+                                              backend);
+    ParticleSet electrons = makeLiHElectrons(simulation_cell);
+    PsiFormerWF component(std::string("pf_scalar_plan_") + backend,
+                          files.parameters.string(),
+                          files.configuration.string());
+    component.validateSystem(electrons, *ions, "all_electron");
+    electrons.G = ValueType(0);
+    electrons.L = ValueType(0);
+    component.evaluateLog(electrons, electrons.G, electrons.L);
+    electrons.makeVirtualMoves(
+        ParticleSet::SingleParticlePos{0.34, -0.27, 0.39});
+    std::vector<ValueType> output(
+        static_cast<std::size_t>(electrons.getTotalNum()), ValueType(149));
+    const PlannedScalarTransactionSnapshot before =
+        capturePlannedScalarTransaction(component, electrons, output);
+
+    BatchExecutionRequirements requirements;
+    component.contributeBatchExecutionRequirements(requirements);
+    requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+    const std::string participant_id =
+        std::string("test/psiformer/scalar-plan-") + backend;
+    const auto plan = makeClonePreparationTestPlan(
+        component, requirements, participant_id,
+        std::string("scalar-plan-") + backend + "-v1");
+    const BatchExecutionParticipantPlan participant =
+        makeBatchExecutionParticipantPlan(plan, participant_id);
+    CHECK_THROWS_WITH(
+        component.validateBatchExecutionPlanBinding(participant),
+        Catch::Matchers::ContainsSubstring(
+            "planned VALUE execution requires the direct backend"));
+    CHECK_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+    checkPlannedScalarTransaction(component, electrons, output, before,
+                                  nullptr, true, true);
+  }
+
+  // Serialized topology is rejected transactionally during clone preparation,
+  // before any scalar owner or prepared marker can be published.
+  ParticleSet serialized_electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF serialized_component("pf_scalar_plan_serialized",
+                                   files.parameters.string(),
+                                   files.configuration.string());
+  serialized_component.validateSystem(serialized_electrons, *ions,
+                                      "all_electron");
+  BatchExecutionRequirements serialized_requirements;
+  serialized_component.contributeBatchExecutionRequirements(
+      serialized_requirements);
+  serialized_requirements.require(
+      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  const std::string serialized_participant_id =
+      "test/psiformer/scalar-plan-serialized";
+  const auto serialized_plan = makeClonePreparationTestPlan(
+      serialized_component, serialized_requirements,
+      serialized_participant_id, "scalar-plan-serialized-v1", 2, 0,
+      BatchExecutionTargetCoordinate::POS_ONLY, "cpu", std::nullopt, true);
+  const BatchExecutionParticipantPlan serialized_participant =
+      makeBatchExecutionParticipantPlan(serialized_plan,
+                                        serialized_participant_id);
+  serialized_component.bindBatchExecutionPlan(serialized_participant);
+  const auto serialized_before =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(
+          serialized_component);
+  CHECK_THROWS_WITH(
+      serialized_component.prepareBatchExecutionClone(serialized_participant),
+      Catch::Matchers::ContainsSubstring(
+          "does not admit serialized-walker execution"));
+  checkScalarWorkspaceStorage(
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(
+          serialized_component),
+      serialized_before);
+}
+
+TEST_CASE("PsiFormer planned scalar VALUE Phase-B faults are atomic and retryable",
+          "[wavefunction][psiformer][batch_memory][scalar_value][atomic]")
+{
+  using Fault = testing::TestPsiFormerWF::PlannedScalarValueFault;
+  struct FaultCase
+  {
+    Fault fault;
+    const char* label;
+    const char* expected_message;
+  };
+  const std::array<FaultCase, 11> faults{{
+      {Fault::RESULT_OWNER, "result owner", "evidence changed during evaluation"},
+      {Fault::RESULT_GENERATION, "result generation", "evidence changed during evaluation"},
+      {Fault::RESULT_SIZE, "result size", "evidence changed during evaluation"},
+      {Fault::RESULT_VERSION, "result version", "result changed before publication"},
+      {Fault::RESULT_SIGN, "result sign", "result changed before publication"},
+      {Fault::RESULT_LOG_MAGNITUDE, "result log magnitude", "result changed before publication"},
+      {Fault::RESULT_RATIO, "result ratio", "PsiFormer batch ratio is non-finite"},
+      {Fault::INPUT_FINGERPRINT, "input fingerprint", "evidence changed during evaluation"},
+      {Fault::OUTPUT_IDENTITY, "output identity", "planned output storage is null"},
+      {Fault::WORKSPACE_EVIDENCE, "workspace evidence",
+       "PsiFormer scalar VALUE workspace was not prepared for the bound batch plan"},
+      {Fault::PUBLICATION_EVIDENCE, "publication evidence",
+       "PsiFormer scalar VALUE workspace was not prepared for the bound batch plan"},
+  }};
+
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet reference_electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(electrons.getTotalNum());
+  PsiFormerWF component("pf_scalar_phase_b", files.parameters.string(),
+                        files.configuration.string());
+  PsiFormerWF reference("pf_scalar_phase_b_reference",
+                        files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  const PreparedScalarPlan prepared = prepareScalarValuePlan(
+      component, "test/psiformer/scalar-phase-b", "scalar-phase-b-v1");
+  static_cast<void>(prepared);
+
+  const ParticleSet::SingleParticlePos common_position{0.42, -0.29, 0.35};
+  electrons.makeVirtualMoves(common_position);
+  reference_electrons.makeVirtualMoves(common_position);
+  std::vector<ValueType> expected_all_to_one(electron_count);
+  reference.evaluateRatiosAlltoOne(reference_electrons,
+                                   expected_all_to_one);
+  const std::vector<ParticleSet::SingleParticlePos> displacements{
+      {0.024, -0.015, 0.009}, {-0.028, 0.019, 0.014}};
+  VirtualParticleSet virtual_particles(electrons);
+  VirtualParticleSet reference_virtual(reference_electrons);
+  virtual_particles.makeMoves(electrons, 1, displacements);
+  reference_virtual.makeMoves(reference_electrons, 1, displacements);
+  std::vector<ValueType> expected_virtual(displacements.size());
+  reference.evaluateRatios(reference_virtual, expected_virtual);
+
+  for (std::size_t index = 0; index < faults.size(); ++index)
+  {
+    CAPTURE(faults[index].label);
+    const bool use_all_to_one = index % 2 == 0;
+    std::vector<ValueType> output(
+        use_all_to_one ? electron_count : displacements.size(), ValueType(97));
+    const PlannedScalarTransactionSnapshot before =
+        capturePlannedScalarTransaction(
+            component, electrons, output,
+            use_all_to_one ? nullptr : &virtual_particles);
+    testing::TestPsiFormerWF::setPlannedScalarValueFault(component,
+                                                         faults[index].fault);
+    std::string exception_message;
+    bool unexpected_exception = false;
+    try
+    {
+      if (use_all_to_one)
+        component.evaluateRatiosAlltoOne(electrons, output);
+      else
+        component.evaluateRatios(virtual_particles, output);
+    }
+    catch (const std::exception& error)
+    {
+      exception_message = error.what();
+    }
+    catch (...)
+    {
+      unexpected_exception = true;
+    }
+    testing::TestPsiFormerWF::setPlannedScalarValueFault(component,
+                                                         Fault::NONE);
+    CHECK_FALSE(unexpected_exception);
+    CHECK(exception_message.find(faults[index].expected_message) !=
+          std::string::npos);
+    CHECK(exception_message.find("test fault was not detected") ==
+          std::string::npos);
+    checkPlannedScalarTransaction(
+        component, electrons, output, before,
+        use_all_to_one ? nullptr : &virtual_particles);
+
+    if (use_all_to_one)
+      component.evaluateRatiosAlltoOne(electrons, output);
+    else
+      component.evaluateRatios(virtual_particles, output);
+    const std::vector<ValueType>& expected =
+        use_all_to_one ? expected_all_to_one : expected_virtual;
+    REQUIRE(output.size() == expected.size());
+    for (std::size_t value = 0; value < output.size(); ++value)
+      checkScalarRatio(output[value], expected[value]);
+  }
+}
+
+TEST_CASE("PsiFormer planned scalar VALUE rejects derivative API bypasses",
+          "[wavefunction][psiformer][batch_memory][scalar_value][derivative_guard]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+
+  for (const bool optimize : {false, true})
+  {
+    DYNAMIC_SECTION("optimization enabled = " << optimize)
+    {
+      ParticleSet electrons = makeLiHElectrons(simulation_cell);
+      const std::vector<std::size_t> selected_indices =
+          optimize ? std::vector<std::size_t>{0, 127}
+                   : std::vector<std::size_t>{};
+      PsiFormerWF component(
+          optimize ? "pf_planned_derivative_active"
+                   : "pf_planned_derivative_inactive",
+          files.parameters.string(), files.configuration.string(), optimize,
+          selected_indices);
+      component.validateSystem(electrons, *ions, "all_electron");
+      electrons.G = ValueType(0);
+      electrons.L = ValueType(0);
+      component.evaluateLog(electrons, electrons.G, electrons.L);
+      const PreparedScalarPlan prepared = prepareScalarValuePlan(
+          component,
+          optimize ? "test/psiformer/scalar-derivative-active"
+                   : "test/psiformer/scalar-derivative-inactive",
+          optimize ? "scalar-derivative-active-v1"
+                   : "scalar-derivative-inactive-v1");
+      static_cast<void>(prepared);
+
+      const std::vector<ParticleSet::SingleParticlePos> displacements{
+          {0.021, -0.014, 0.008}, {-0.029, 0.016, 0.025}};
+      VirtualParticleSet virtual_particles(electrons);
+      virtual_particles.makeMoves(electrons, 1, displacements);
+      OptVariables active = optimize ? registerSelectedParameters(component)
+                                     : OptVariables{};
+
+      std::vector<ValueType> ratios(displacements.size(), ValueType(41));
+      Matrix<ValueType> derivative_ratios(displacements.size(), 3);
+      derivative_ratios = ValueType(43);
+      const ValueType* const derivative_data =
+          std::addressof(*derivative_ratios.begin());
+      const std::vector<ValueType> derivative_before(
+          derivative_ratios.begin(), derivative_ratios.end());
+      const PlannedScalarTransactionSnapshot ratio_before =
+          capturePlannedScalarTransaction(component, electrons, ratios,
+                                          &virtual_particles);
+      CHECK_THROWS_WITH(
+          component.evaluateDerivRatios(virtual_particles, active, ratios,
+                                        derivative_ratios),
+          Catch::Matchers::ContainsSubstring(
+              "derivative-ratio evaluation is not admitted as a clone-local operation"));
+      checkPlannedScalarTransaction(component, electrons, ratios, ratio_before,
+                                    &virtual_particles, true, true);
+      CHECK(std::addressof(*derivative_ratios.begin()) == derivative_data);
+      REQUIRE(derivative_ratios.size() == derivative_before.size());
+      for (std::size_t value = 0; value < derivative_before.size(); ++value)
+        CHECK(sameScalarBits(derivative_ratios.begin()[value],
+                             derivative_before[value]));
+
+      const std::vector<ValueType> weights{ValueType(0.37), ValueType(-0.19)};
+      std::vector<ValueType> weighted_derivatives(3, ValueType(47));
+      const ValueType* const weighted_data = weighted_derivatives.data();
+      const std::vector<ValueType> weighted_before = weighted_derivatives;
+      std::vector<ValueType> unchanged_ratios(displacements.size(),
+                                               ValueType(53));
+      const PlannedScalarTransactionSnapshot weighted_transaction_before =
+          capturePlannedScalarTransaction(component, electrons,
+                                          unchanged_ratios,
+                                          &virtual_particles);
+      CHECK_THROWS_WITH(
+          component.evaluateDerivRatiosWeighted(
+              virtual_particles, active, weights,
+              {weighted_derivatives.data(), weighted_derivatives.size()}),
+          Catch::Matchers::ContainsSubstring(
+              "weighted derivative-ratio evaluation is not admitted as a clone-local operation"));
+      checkPlannedScalarTransaction(component, electrons, unchanged_ratios,
+                                    weighted_transaction_before,
+                                    &virtual_particles, true, true);
+      CHECK(weighted_derivatives.data() == weighted_data);
+      REQUIRE(weighted_derivatives.size() == weighted_before.size());
+      for (std::size_t value = 0; value < weighted_before.size(); ++value)
+        CHECK(sameScalarBits(weighted_derivatives[value],
+                             weighted_before[value]));
+
+      Vector<ValueType> score(3);
+      Vector<ValueType> kinetic(3);
+      score   = ValueType(101);
+      kinetic = ValueType(-103);
+      const ValueType* const score_data = std::addressof(*score.begin());
+      const ValueType* const kinetic_data = std::addressof(*kinetic.begin());
+      const std::vector<ValueType> score_before(score.begin(), score.end());
+      const std::vector<ValueType> kinetic_before(kinetic.begin(),
+                                                  kinetic.end());
+      const PlannedScalarTransactionSnapshot score_transaction_before =
+          capturePlannedScalarTransaction(component, electrons, ratios,
+                                          &virtual_particles);
+      CHECK_THROWS_WITH(
+          component.evaluateDerivativesWF(electrons, active, score),
+          Catch::Matchers::ContainsSubstring(
+              "parameter-score evaluation is not admitted as a clone-local operation by the explicit batch plan"));
+      checkPlannedScalarTransaction(component, electrons, ratios,
+                                    score_transaction_before,
+                                    &virtual_particles, true, true);
+      CHECK(std::addressof(*score.begin()) == score_data);
+      for (std::size_t value = 0; value < score_before.size(); ++value)
+        CHECK(sameScalarBits(score[value], score_before[value]));
+
+      const PlannedScalarTransactionSnapshot kinetic_transaction_before =
+          capturePlannedScalarTransaction(component, electrons, ratios,
+                                          &virtual_particles);
+      CHECK_THROWS_WITH(
+          component.evaluateDerivatives(electrons, active, score, kinetic),
+          Catch::Matchers::ContainsSubstring(
+              "kinetic-parameter evaluation is not admitted as a clone-local operation by the explicit batch plan"));
+      checkPlannedScalarTransaction(component, electrons, ratios,
+                                    kinetic_transaction_before,
+                                    &virtual_particles, true, true);
+      CHECK(std::addressof(*score.begin()) == score_data);
+      CHECK(std::addressof(*kinetic.begin()) == kinetic_data);
+      for (std::size_t value = 0; value < score_before.size(); ++value)
+      {
+        CHECK(sameScalarBits(score[value], score_before[value]));
+        CHECK(sameScalarBits(kinetic[value], kinetic_before[value]));
+      }
+    }
+  }
+}
+
+TEST_CASE("PsiFormer scalar plan rejects every deferred crowd API before dispatch",
+          "[wavefunction][psiformer][batch_memory][scalar_value][derivative_guard]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+
+  for (const bool optimize : {false, true})
+  {
+    DYNAMIC_SECTION("optimization enabled = " << optimize)
+    {
+      ParticleSet electrons = makeLiHElectrons(simulation_cell);
+      const std::vector<std::size_t> selected_indices =
+          optimize ? std::vector<std::size_t>{0, 127}
+                   : std::vector<std::size_t>{};
+      PsiFormerWF component(
+          optimize ? "pf_planned_crowd_guard_active"
+                   : "pf_planned_crowd_guard_inactive",
+          files.parameters.string(), files.configuration.string(), optimize,
+          selected_indices);
+      component.validateSystem(electrons, *ions, "all_electron");
+      electrons.G = ValueType(0);
+      electrons.L = ValueType(0);
+      component.evaluateLog(electrons, electrons.G, electrons.L);
+      OptVariables active = optimize ? registerSelectedParameters(component)
+                                     : OptVariables{};
+      const PreparedScalarPlan prepared = prepareScalarValuePlan(
+          component,
+          optimize ? "test/psiformer/scalar-crowd-guard-active"
+                   : "test/psiformer/scalar-crowd-guard-inactive",
+          optimize ? "scalar-crowd-guard-active-v1"
+                   : "scalar-crowd-guard-inactive-v1");
+      static_cast<void>(prepared);
+
+      const std::vector<ParticleSet::SingleParticlePos> displacements{
+          {0.016, -0.012, 0.009}, {-0.023, 0.018, 0.011}};
+      VirtualParticleSet virtual_particles(electrons);
+      virtual_particles.makeMoves(electrons, 1, displacements);
+      RefVectorWithLeader<WaveFunctionComponent> components(component,
+                                                             {component});
+      RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+      RefVectorWithLeader<const VirtualParticleSet> virtual_list(
+          virtual_particles);
+      virtual_list.push_back(virtual_particles);
+      RefVectorWithLeader<VirtualParticleSet> scratch_list(virtual_particles);
+      scratch_list.push_back(virtual_particles);
+
+      const std::vector<std::size_t> offsets{0, displacements.size()};
+      const std::vector<VirtualParticleBatch::Segment> segments{{0, 1}};
+      const std::vector<ParticleSet::PosType> absolute_positions(
+          virtual_particles.R.begin(), virtual_particles.R.end());
+      const VirtualParticleBatch batch(1, offsets, segments,
+                                       absolute_positions);
+
+      std::vector<std::vector<ValueType>> ragged_ratios{
+          std::vector<ValueType>(displacements.size(), ValueType(107))};
+      std::vector<ValueType> flat_ratios(displacements.size(),
+                                         ValueType(109));
+      const std::vector<ValueType> total_weights(displacements.size(),
+                                                 ValueType(0.25));
+      RefVector<const std::vector<ValueType>> weight_views;
+      weight_views.push_back(std::cref(total_weights));
+      std::vector<ValueType> weighted_derivatives(3, ValueType(113));
+      std::vector<WaveFunctionComponent::ParameterDerivativeView>
+          derivative_views{{weighted_derivatives.data(),
+                            weighted_derivatives.size()}};
+      RecordArray<ValueType> score_rows(1, 3);
+      RecordArray<ValueType> kinetic_rows(1, 3);
+      std::fill(score_rows.begin(), score_rows.end(), ValueType(127));
+      std::fill(kinetic_rows.begin(), kinetic_rows.end(), ValueType(-131));
+
+      const ValueType* const ragged_data = ragged_ratios.front().data();
+      const ValueType* const flat_data = flat_ratios.data();
+      const ValueType* const weighted_data = weighted_derivatives.data();
+      const std::vector<ValueType> ragged_before = ragged_ratios.front();
+      const std::vector<ValueType> flat_before = flat_ratios;
+      const std::vector<ValueType> weighted_before = weighted_derivatives;
+      const std::vector<ValueType> score_before(score_rows.begin(),
+                                                score_rows.end());
+      const std::vector<ValueType> kinetic_before(kinetic_rows.begin(),
+                                                  kinetic_rows.end());
+      std::vector<ValueType> scalar_probe(
+          static_cast<std::size_t>(electrons.getTotalNum()), ValueType(137));
+      const PlannedScalarTransactionSnapshot transaction_before =
+          capturePlannedScalarTransaction(component, electrons, scalar_probe,
+                                          &virtual_particles);
+
+      const auto require_crowd_guard = [&](const char* operation,
+                                           auto&& invocation) {
+        const std::string expected = std::string(operation) +
+            " is not admitted as a multi-walker operation by the explicit batch plan";
+        CHECK_THROWS_WITH(invocation(),
+                          Catch::Matchers::ContainsSubstring(expected));
+        checkPlannedScalarTransaction(component, electrons, scalar_probe,
+                                      transaction_before, &virtual_particles,
+                                      true, true);
+      };
+
+      require_crowd_guard("ragged virtual-ratio evaluation", [&]() {
+        component.mw_evaluateRatios(components, virtual_list, ragged_ratios);
+      });
+      require_crowd_guard("flattened virtual-ratio evaluation", [&]() {
+        component.mw_evaluateVirtualRatios(components, particles, scratch_list,
+                                           batch, flat_ratios);
+      });
+      require_crowd_guard("batched weighted derivative-ratio evaluation", [&]() {
+        component.mw_evaluateDerivRatiosWeighted(
+            components, virtual_list, active, weight_views, derivative_views);
+      });
+      require_crowd_guard("flattened weighted derivative-ratio evaluation",
+                          [&]() {
+                            component.mw_evaluateVirtualDerivRatiosWeighted(
+                                components, particles, scratch_list, batch,
+                                active, total_weights, derivative_views);
+                          });
+      require_crowd_guard("batched parameter-score evaluation", [&]() {
+        component.mw_evaluateParameterDerivativesWF(components, particles,
+                                                    active, score_rows);
+      });
+      require_crowd_guard("batched kinetic-parameter evaluation", [&]() {
+        component.mw_evaluateParameterDerivatives(
+            components, particles, active, score_rows, kinetic_rows);
+      });
+
+      CHECK(ragged_ratios.front().data() == ragged_data);
+      CHECK(flat_ratios.data() == flat_data);
+      CHECK(weighted_derivatives.data() == weighted_data);
+      for (std::size_t value = 0; value < ragged_before.size(); ++value)
+      {
+        CHECK(sameScalarBits(ragged_ratios.front()[value],
+                             ragged_before[value]));
+        CHECK(sameScalarBits(flat_ratios[value], flat_before[value]));
+      }
+      for (std::size_t value = 0; value < weighted_before.size(); ++value)
+      {
+        CHECK(sameScalarBits(weighted_derivatives[value],
+                             weighted_before[value]));
+        CHECK(sameScalarBits(score_rows.begin()[value], score_before[value]));
+        CHECK(sameScalarBits(kinetic_rows.begin()[value],
+                             kinetic_before[value]));
+      }
+    }
+  }
+}
+
+TEST_CASE("PsiFormer no-plan scalar VALUE backends and derivative fallback remain compatible",
+          "[wavefunction][psiformer][scalar_value][legacy]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const ParticleSet::SingleParticlePos common_position{0.36, -0.28, 0.32};
+  const std::vector<ParticleSet::SingleParticlePos> displacements{
+      {0.018, -0.011, 0.007}, {-0.025, 0.017, 0.012},
+      {0.014, 0.022, -0.019}};
+
+  struct LegacyScalarResults
+  {
+    std::vector<ValueType> all_to_one;
+    std::vector<ValueType> virtual_ratios;
+  };
+
+  const auto evaluate_backend = [&](const char* backend) {
+    ScopedEnvironmentVariable select_backend("PSIFORMER_VALUE_BACKEND",
+                                              backend);
+    ParticleSet electrons = makeLiHElectrons(simulation_cell);
+    PsiFormerWF component(std::string("pf_legacy_scalar_") + backend,
+                          files.parameters.string(),
+                          files.configuration.string());
+    electrons.makeVirtualMoves(common_position);
+    const ScalarParticleStateSnapshot before_all_to_one =
+        captureScalarParticleState(electrons);
+    LegacyScalarResults results;
+    results.all_to_one.resize(
+        static_cast<std::size_t>(electrons.getTotalNum()), ValueType(59));
+    component.evaluateRatiosAlltoOne(electrons, results.all_to_one);
+    checkScalarParticleState(electrons, before_all_to_one);
+
+    VirtualParticleSet virtual_particles(electrons);
+    virtual_particles.makeMoves(electrons, 1, displacements);
+    const ScalarParticleStateSnapshot before_reference =
+        captureScalarParticleState(electrons);
+    const ScalarVirtualParticleStateSnapshot before_virtual =
+        captureScalarVirtualParticleState(virtual_particles);
+    results.virtual_ratios.resize(displacements.size(), ValueType(61));
+    component.evaluateRatios(virtual_particles, results.virtual_ratios);
+    checkScalarParticleState(electrons, before_reference);
+    checkScalarVirtualParticleState(virtual_particles, before_virtual);
+    return results;
+  };
+
+  const LegacyScalarResults direct = evaluate_backend("direct");
+  for (const char* backend : {"oracle", "compare"})
+  {
+    CAPTURE(backend);
+    const LegacyScalarResults candidate = evaluate_backend(backend);
+    REQUIRE(candidate.all_to_one.size() == direct.all_to_one.size());
+    REQUIRE(candidate.virtual_ratios.size() == direct.virtual_ratios.size());
+    for (std::size_t electron = 0; electron < direct.all_to_one.size();
+         ++electron)
+      checkScalarRatio(candidate.all_to_one[electron],
+                       direct.all_to_one[electron]);
+    for (std::size_t move = 0; move < direct.virtual_ratios.size(); ++move)
+      checkScalarRatio(candidate.virtual_ratios[move],
+                       direct.virtual_ratios[move]);
+  }
+  CHECK(std::any_of(direct.all_to_one.begin(), direct.all_to_one.end(),
+                    [](ValueType ratio) {
+                      return std::abs(ratio - ValueType(1)) > 1.0e-8;
+                    }));
+  CHECK(std::any_of(direct.virtual_ratios.begin(),
+                    direct.virtual_ratios.end(), [](ValueType ratio) {
+                      return std::abs(ratio - ValueType(1)) > 1.0e-10;
+                    }));
+
+  // A fixed, unplanned component historically treats the derivative-ratio API
+  // as an ordinary ratio request while leaving derivative destinations alone.
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component("pf_legacy_no_active_derivatives",
+                        files.parameters.string(),
+                        files.configuration.string());
+  VirtualParticleSet virtual_particles(electrons);
+  virtual_particles.makeMoves(electrons, 1, displacements);
+  std::vector<ValueType> expected_ratios(displacements.size());
+  component.evaluateRatios(virtual_particles, expected_ratios);
+
+  std::vector<ValueType> ratios(displacements.size(), ValueType(67));
+  Matrix<ValueType> derivative_ratios(displacements.size(), 3);
+  derivative_ratios = ValueType(71);
+  const ValueType* const derivative_data =
+      std::addressof(*derivative_ratios.begin());
+  const std::vector<ValueType> derivative_before(
+      derivative_ratios.begin(), derivative_ratios.end());
+  const ScalarParticleStateSnapshot derivative_reference_before =
+      captureScalarParticleState(electrons);
+  const ScalarVirtualParticleStateSnapshot derivative_virtual_before =
+      captureScalarVirtualParticleState(virtual_particles);
+  component.evaluateDerivRatios(virtual_particles, OptVariables{}, ratios,
+                                derivative_ratios);
+  checkScalarParticleState(electrons, derivative_reference_before);
+  checkScalarVirtualParticleState(virtual_particles,
+                                  derivative_virtual_before);
+  CHECK(std::addressof(*derivative_ratios.begin()) == derivative_data);
+  for (std::size_t move = 0; move < ratios.size(); ++move)
+    checkScalarRatio(ratios[move], expected_ratios[move]);
+  for (std::size_t value = 0; value < derivative_before.size(); ++value)
+    CHECK(sameScalarBits(derivative_ratios.begin()[value],
+                         derivative_before[value]));
+
+  const std::vector<ValueType> weights{ValueType(0.2), ValueType(-0.3),
+                                       ValueType(0.4)};
+  std::vector<ValueType> weighted_derivatives(3, ValueType(73));
+  const ValueType* const weighted_data = weighted_derivatives.data();
+  const std::vector<ValueType> weighted_before = weighted_derivatives;
+  component.evaluateDerivRatiosWeighted(
+      virtual_particles, OptVariables{}, weights,
+      {weighted_derivatives.data(), weighted_derivatives.size()});
+  CHECK(weighted_derivatives.data() == weighted_data);
+  for (std::size_t value = 0; value < weighted_before.size(); ++value)
+    CHECK(sameScalarBits(weighted_derivatives[value],
+                         weighted_before[value]));
+}
+
 TEST_CASE("PsiFormer hard plans reject scalar lifecycle entries before mutation",
           "[wavefunction][psiformer][batch_memory][scalar_guard]")
 {
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
   PsiFormerWF component("pf_scalar_guard", files.parameters.string(),
                         files.configuration.string(), true, {0, 1});
+  component.validateSystem(electrons, *ions, "all_electron");
 
   // Keep a small legacy smoke path for each inherited/no-op wrapper added by
   // the hard-plan guard. Spin-independent wrappers must leave the spin output
@@ -1550,9 +3391,11 @@ TEST_CASE("PsiFormer planned scalar scope excludes unselected and legacy ECP pat
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
 
   PsiFormerWF no_scalar("pf_no_scalar", files.parameters.string(),
                         files.configuration.string(), true, {0, 1});
+  no_scalar.validateSystem(electrons, *ions, "all_electron");
   BatchExecutionRequirements no_scalar_requirements;
   no_scalar.contributeBatchExecutionRequirements(no_scalar_requirements);
   const std::string no_scalar_id = "test/psiformer/no-scalar";
@@ -1573,6 +3416,7 @@ TEST_CASE("PsiFormer planned scalar scope excludes unselected and legacy ECP pat
 
   PsiFormerWF ecp_component("pf_ecp_scalar", files.parameters.string(),
                             files.configuration.string());
+  ecp_component.validateSystem(electrons, *ions, "all_electron");
   BatchExecutionRequirements ecp_requirements;
   ecp_component.contributeBatchExecutionRequirements(ecp_requirements);
   ecp_requirements.require(BatchExecutionMode::VALUE);

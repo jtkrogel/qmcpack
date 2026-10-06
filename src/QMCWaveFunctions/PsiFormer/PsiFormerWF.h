@@ -95,18 +95,29 @@ struct PsiFormerWorkspaceDiagnostics
   bool owns_kinetic_workspace        = false;
   bool has_prepared_clone_plan       = false;
 
-  std::size_t value_bytes          = 0;
-  std::size_t full_spatial_bytes   = 0;
-  std::size_t active_spatial_bytes = 0;
-  std::size_t batch_bytes          = 0;
-  std::size_t score_bytes          = 0;
-  std::size_t kinetic_bytes        = 0;
-  std::size_t total_log_gradient_bytes = 0;
-  std::size_t scalar_value_publication_bytes = 0;
-  std::size_t accepted_spatial_bytes          = 0;
-  std::size_t proposed_spatial_bytes          = 0;
-  std::size_t batch_storage_fingerprint       = 0;
-  const void* batch_workspace_identity        = nullptr;
+  std::size_t value_bytes                       = 0;
+  std::size_t full_spatial_bytes                = 0;
+  std::size_t active_spatial_bytes              = 0;
+  std::size_t batch_bytes                       = 0;
+  std::size_t score_bytes                       = 0;
+  std::size_t kinetic_bytes                     = 0;
+  std::size_t total_log_gradient_bytes          = 0;
+  std::size_t scalar_value_publication_bytes    = 0;
+  std::size_t accepted_spatial_bytes            = 0;
+  std::size_t proposed_spatial_bytes            = 0;
+  std::size_t batch_storage_fingerprint         = 0;
+  const void* batch_workspace_identity          = nullptr;
+  const void* scalar_value_publication_identity = nullptr;
+  std::size_t scalar_value_publication_size = 0;
+  std::size_t scalar_value_publication_capacity = 0;
+
+  bool prepared_scalar_value_compatibility = false;
+  const void* prepared_batch_workspace_identity = nullptr;
+  std::size_t prepared_batch_storage_fingerprint = 0;
+  std::size_t prepared_batch_bytes = 0;
+  const void* prepared_scalar_value_publication_identity = nullptr;
+  std::size_t prepared_scalar_value_publication_size = 0;
+  std::size_t prepared_scalar_value_publication_capacity = 0;
 
   /// Return all explicitly accounted clone-local evaluator scratch bytes.
   std::size_t accountedBytes() const noexcept
@@ -705,6 +716,64 @@ private:
     std::optional<std::uint64_t> selected_transaction_fingerprint;
   };
 
+  /// Identify one clone-local scalar VALUE compatibility call family.
+  enum class PlannedScalarValueOperation
+  {
+    ALL_TO_ONE,
+    VIRTUAL_PARTICLE_VALUE
+  };
+
+  /// Carry immutable scalar inputs and caller-owned output evidence into preflight.
+  struct PlannedScalarValueRequest
+  {
+    PlannedScalarValueOperation operation;
+    const ParticleSet* reference                = nullptr;
+    const VirtualParticleSet* virtual_particles = nullptr;
+    std::size_t configuration_count             = 0;
+    ValueType* output_data                      = nullptr;
+    std::size_t output_size                     = 0;
+    std::size_t output_capacity                 = 0;
+  };
+
+  /// Return exact prepared scalar bindings proved without changing logical state.
+  struct PlannedScalarValueAccess
+  {
+    pf::DirectBatchWorkspace& workspace;
+    ValueType* publication;
+    const BatchExecutionParticipantPlan& participant;
+    std::size_t workspace_fingerprint;
+    std::size_t workspace_bytes;
+    std::uint64_t input_fingerprint;
+    ValueType* output_data;
+    std::size_t output_size;
+    std::size_t output_capacity;
+  };
+
+  /// Select one transient post-evaluation corruption for Phase-B regressions.
+  enum class PlannedScalarValueFaultForTesting
+  {
+    NONE,
+    RESULT_OWNER,
+    RESULT_GENERATION,
+    RESULT_SIZE,
+    RESULT_VERSION,
+    RESULT_SIGN,
+    RESULT_LOG_MAGNITUDE,
+    RESULT_RATIO,
+    INPUT_FINGERPRINT,
+    OUTPUT_IDENTITY,
+    WORKSPACE_EVIDENCE,
+    PUBLICATION_EVIDENCE
+  };
+
+  /// Select one reversible corruption of the prepared scalar capacity record.
+  enum class PreparedScalarWorkspaceFaultForTesting
+  {
+    NONE,
+    LOGICAL_CAPACITY,
+    TILE_CAPACITY
+  };
+
   /// Fixed metadata published by the lifecycle-only selected proposal seam.
   struct PlannedSelectedProposalEvidence
   {
@@ -848,16 +917,22 @@ private:
   /// Lazily create the requested scalar spatial-derivative workspace.
   pf::DirectSpatialWorkspace& requireDirectSpatialWorkspace(EvaluationPurpose purpose);
 
-  /// Lazily create batch scratch for scalar all-to-one and virtual-ratio calls.
+  /// Lazily create legacy batch scratch only when no explicit plan is bound.
   pf::DirectBatchWorkspace& requireDirectBatchWorkspace();
 
-  /** Return preallocated scalar publication storage under a hard plan.
-   * A null result tells the caller to retain the legacy lazy staging path.
-   */
-  ValueType* requirePlannedScalarValuePublication(
-      std::size_t configuration_count,
-      std::size_t output_count,
-      const char* operation);
+  /// Fingerprint one exact ordered scalar VALUE input without allocating.
+  std::uint64_t scalarValueInputFingerprint(
+      const PlannedScalarValueRequest& request) const noexcept;
+
+  /// Prove exact clone-local scalar input, output, plan, and storage evidence.
+  PlannedScalarValueAccess requirePlannedScalarValueOperation(
+      const PlannedScalarValueRequest& request);
+
+  /// Execute and atomically publish one prepared scalar VALUE transaction.
+  void evaluatePlannedScalarValue(PlannedScalarValueOperation operation,
+                                  const ParticleSet& reference,
+                                  const VirtualParticleSet* virtual_particles,
+                                  std::vector<ValueType>& ratios);
 
   /// Reject unaccounted scalar value/spatial evaluators under an explicit plan.
   void requireUnplannedScalarEvaluation(const char* operation) const;
@@ -867,6 +942,9 @@ private:
 
   /// Reject clone-local score/kinetic tapes while an explicit plan is bound.
   void requireUnplannedScalarDerivative(const char* operation) const;
+
+  /// Reject deferred crowd owners at their first explicit-plan dispatch point.
+  void requireUnplannedMultiWalkerOperation(const char* operation) const;
 
   /// Lazily create the clone-local score tape used by scalar evaluation paths.
   pf::DirectScoreWorkspace& requireDirectScoreWorkspace();
@@ -927,6 +1005,10 @@ private:
 
   /// Report clone-local evaluator ownership and explicitly reserved numeric bytes.
   testing::PsiFormerWorkspaceDiagnostics directWorkspaceDiagnosticsForTesting() const;
+
+  /// Corrupt or canonically restore only the prepared scalar capacity record.
+  void setPreparedScalarWorkspaceFaultForTesting(
+      PreparedScalarWorkspaceFaultForTesting fault);
 
   /// Report opaque identity and numeric capacity for one acquired crowd resource.
   testing::PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnosticsForTesting(
@@ -1065,6 +1147,14 @@ private:
   std::size_t prepared_accepted_laplacian_capacity_ = 0;
   std::size_t prepared_proposed_gradient_capacity_ = 0;
   std::size_t prepared_proposed_laplacian_capacity_ = 0;
+  /// Exact scalar owner evidence published immediately before the plan marker.
+  bool prepared_scalar_value_compatibility_ = false;
+  const pf::DirectBatchWorkspace* prepared_batch_workspace_identity_ = nullptr;
+  std::size_t prepared_batch_storage_fingerprint_ = 0;
+  std::size_t prepared_batch_bytes_ = 0;
+  const ValueType* prepared_scalar_value_publication_data_ = nullptr;
+  std::size_t prepared_scalar_value_publication_size_ = 0;
+  std::size_t prepared_scalar_value_publication_capacity_ = 0;
   /// Inject a late clone-preparation failure for the strong-guarantee regression.
   bool fail_clone_preparation_before_publish_for_testing_ = false;
   /// Inject a post-evaluation FULL_VGL failure before any public-state publication.
@@ -1083,6 +1173,12 @@ private:
   bool fail_planned_single_resolution_before_publish_for_testing_ = false;
   /// Inject a one-electron cancellation failure after its final preflight.
   bool fail_planned_single_cancellation_before_publish_for_testing_ = false;
+  /// Inject a scalar VALUE failure after its final recheck but before publication.
+  bool fail_planned_scalar_value_before_publish_for_testing_ = false;
+  /// Apply one reversible corruption between evaluation and scalar Phase B.
+  PlannedScalarValueFaultForTesting
+      planned_scalar_value_fault_for_testing_ =
+          PlannedScalarValueFaultForTesting::NONE;
   /// Substitute a finite maximum contribution to exercise additive overflow.
   bool force_planned_ratio_gradient_overflow_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.

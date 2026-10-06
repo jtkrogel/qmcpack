@@ -115,6 +115,35 @@ bool capacitiesFitWithin(const BatchTileCapacities& capacities,
       capacities.ecp_outer <= envelope.ecp_outer;
 }
 
+/// Compare every logical and tiled bound in two direct-batch capacity plans.
+bool sameDirectBatchCapacityPlan(const pf::DirectBatchCapacityPlan& left,
+                                 const pf::DirectBatchCapacityPlan& right) noexcept
+{
+  return left.logical.value_dense == right.logical.value_dense &&
+      left.logical.full_vgl == right.logical.full_vgl &&
+      left.logical.active_gradient == right.logical.active_gradient &&
+      left.logical.sparse_references == right.logical.sparse_references &&
+      left.logical.sparse_replacements == right.logical.sparse_replacements &&
+      left.tile.value == right.tile.value &&
+      left.tile.full_vgl == right.tile.full_vgl &&
+      left.tile.active_gradient == right.tile.active_gradient;
+}
+
+/// Compare retained direct-batch storage without setup-only replacement overlap.
+bool sameDirectBatchExecutionStorage(
+    const pf::DirectBatchStorageRequirement& left,
+    const pf::DirectBatchStorageRequirement& right) noexcept
+{
+  return left.dense_logical == right.dense_logical &&
+      left.sparse_logical == right.sparse_logical &&
+      left.logical_outputs == right.logical_outputs &&
+      left.sparse_tile_positions == right.sparse_tile_positions &&
+      left.value_tile == right.value_tile &&
+      left.full_vgl_tile == right.full_vgl_tile &&
+      left.active_gradient_tile == right.active_gradient_tile &&
+      left.shared_spatial_arena == right.shared_spatial_arena;
+}
+
 /// Reject planned operation families routed through an unaccounted developer backend.
 void validatePlannedBackends(
     const psiformer::PsiFormerMemoryPolicyInput& input,
@@ -162,6 +191,14 @@ constexpr std::uint64_t SELECTED_TRANSACTION_FINGERPRINT_DOMAIN =
 /// Keep a one-electron transaction disjoint from selected and persistent identities.
 constexpr std::uint64_t SINGLE_TRANSACTION_FINGERPRINT_DOMAIN =
     UINT64_C(0x5053463154583031); // "PSF1TX01"
+
+/// Keep all-to-one scalar observations disjoint from other transaction identities.
+constexpr std::uint64_t ALL_TO_ONE_VALUE_FINGERPRINT_DOMAIN =
+    UINT64_C(0x50534641544f3031); // "PSFATO01"
+
+/// Keep virtual-particle scalar observations disjoint from other input identities.
+constexpr std::uint64_t VIRTUAL_VALUE_FINGERPRINT_DOMAIN =
+    UINT64_C(0x5053465650543031); // "PSFVPT01"
 
 /// Identify the fixed scalar record layout used by the Stage-8 walker buffer.
 constexpr std::uint64_t WALKER_BUFFER_MAGIC = UINT64_C(0x505349464f524d38);
@@ -2447,21 +2484,92 @@ bool PsiFormerWF::hasBatchExecutionPlanBinding(
 bool PsiFormerWF::hasPreparedBatchExecutionClone(
     const BatchExecutionParticipantPlan& plan) const noexcept
 {
-  return prepared_clone_batch_execution_plan_.sameBinding(plan) &&
-      !accepted_gradient_.isAttached() && !accepted_laplacian_.isAttached() &&
-      !proposed_gradient_.isAttached() && !proposed_laplacian_.isAttached() &&
-      accepted_gradient_.data() == prepared_accepted_gradient_data_ &&
-      accepted_laplacian_.data() == prepared_accepted_laplacian_data_ &&
-      proposed_gradient_.data() == prepared_proposed_gradient_data_ &&
-      proposed_laplacian_.data() == prepared_proposed_laplacian_data_ &&
-      accepted_gradient_.size() == prepared_accepted_gradient_capacity_ &&
-      accepted_gradient_.capacity() == prepared_accepted_gradient_capacity_ &&
-      accepted_laplacian_.size() == prepared_accepted_laplacian_capacity_ &&
-      accepted_laplacian_.capacity() == prepared_accepted_laplacian_capacity_ &&
-      proposed_gradient_.size() == prepared_proposed_gradient_capacity_ &&
-      proposed_gradient_.capacity() == prepared_proposed_gradient_capacity_ &&
-      proposed_laplacian_.size() == prepared_proposed_laplacian_capacity_ &&
-      proposed_laplacian_.capacity() == prepared_proposed_laplacian_capacity_;
+  if (!plan || !prepared_clone_batch_execution_plan_.sameBinding(plan))
+    return false;
+
+  const std::size_t electron_count =
+      model_state_->execution_plan.modelShape().electrons();
+  if (plan.plan().particleCount() != electron_count ||
+      prepared_accepted_gradient_capacity_ != electron_count ||
+      prepared_accepted_laplacian_capacity_ != electron_count ||
+      prepared_proposed_gradient_capacity_ != electron_count ||
+      prepared_proposed_laplacian_capacity_ != electron_count ||
+      accepted_gradient_.isAttached() || accepted_laplacian_.isAttached() ||
+      proposed_gradient_.isAttached() || proposed_laplacian_.isAttached() ||
+      accepted_gradient_.data() != prepared_accepted_gradient_data_ ||
+      accepted_laplacian_.data() != prepared_accepted_laplacian_data_ ||
+      proposed_gradient_.data() != prepared_proposed_gradient_data_ ||
+      proposed_laplacian_.data() != prepared_proposed_laplacian_data_ ||
+      accepted_gradient_.size() != electron_count ||
+      accepted_gradient_.capacity() != electron_count ||
+      accepted_laplacian_.size() != electron_count ||
+      accepted_laplacian_.capacity() != electron_count ||
+      proposed_gradient_.size() != electron_count ||
+      proposed_gradient_.capacity() != electron_count ||
+      proposed_laplacian_.size() != electron_count ||
+      proposed_laplacian_.capacity() != electron_count)
+    return false;
+
+  const bool scalar_selected = plan.plan().requirements().requires(
+      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  if (!scalar_selected)
+    return !prepared_scalar_value_compatibility_ && !direct_batch_workspace_ &&
+        scalar_value_publication_.empty() &&
+        scalar_value_publication_.capacity() == 0 &&
+        prepared_batch_workspace_identity_ == nullptr &&
+        prepared_batch_storage_fingerprint_ == 0 &&
+        prepared_batch_bytes_ == 0 &&
+        prepared_scalar_value_publication_data_ == nullptr &&
+        prepared_scalar_value_publication_size_ == 0 &&
+        prepared_scalar_value_publication_capacity_ == 0;
+
+  if (!prepared_scalar_value_compatibility_ || !direct_batch_workspace_ ||
+      direct_batch_workspace_.get() != prepared_batch_workspace_identity_ ||
+      !direct_batch_workspace_->hasCapacityPlan())
+    return false;
+
+  // The public preparation predicate is noexcept.  Treat malformed byte or
+  // capacity evidence as an unprepared clone rather than allowing an
+  // accounting helper's checked arithmetic to escape.
+  try
+  {
+    const psiformer::PsiFormerMemoryPolicyInput input =
+        makeBatchMemoryPolicyInput();
+    const pf::DirectBatchCapacityPlan expected_capacity =
+        psiformer::makePsiFormerScalarValueCapacityPlan(
+            input, plan.plan().requirements(),
+            plan.plan().selectedCapacities());
+    const pf::DirectBatchStorageRequirement expected_storage =
+        pf::directBatchStorageRequirement(input.storage_shape,
+                                          expected_capacity);
+    const pf::DirectBatchStorageRequirement actual_storage =
+        direct_batch_workspace_->actualStorage();
+    const std::size_t expected_bytes = expected_storage.executionBytes();
+    const std::size_t actual_bytes   = actual_storage.executionBytes();
+    const std::size_t scalar_extent =
+        input.scalar_value_logical_maximum;
+
+    return sameDirectBatchCapacityPlan(
+               direct_batch_workspace_->capacityPlan(), expected_capacity) &&
+        sameDirectBatchExecutionStorage(actual_storage, expected_storage) &&
+        actual_bytes == expected_bytes &&
+        direct_batch_workspace_->vectorStorageBytes() == actual_bytes &&
+        prepared_batch_bytes_ == actual_bytes &&
+        direct_batch_workspace_->storageFingerprint(
+            pf::DirectBatchMode::VALUE_ONLY) ==
+            prepared_batch_storage_fingerprint_ &&
+        prepared_batch_storage_fingerprint_ != 0 &&
+        scalar_value_publication_.data() ==
+            prepared_scalar_value_publication_data_ &&
+        scalar_value_publication_.size() == scalar_extent &&
+        scalar_value_publication_.capacity() == scalar_extent &&
+        prepared_scalar_value_publication_size_ == scalar_extent &&
+        prepared_scalar_value_publication_capacity_ == scalar_extent;
+  }
+  catch (...)
+  {
+    return false;
+  }
 }
 
 // Check a prospective participant view completely before noexcept publication.
@@ -2563,6 +2671,13 @@ void PsiFormerWF::bindBatchExecutionPlan(
     prepared_accepted_laplacian_capacity_ = 0;
     prepared_proposed_gradient_capacity_ = 0;
     prepared_proposed_laplacian_capacity_ = 0;
+    prepared_scalar_value_compatibility_ = false;
+    prepared_batch_workspace_identity_ = nullptr;
+    prepared_batch_storage_fingerprint_ = 0;
+    prepared_batch_bytes_ = 0;
+    prepared_scalar_value_publication_data_ = nullptr;
+    prepared_scalar_value_publication_size_ = 0;
+    prepared_scalar_value_publication_capacity_ = 0;
     direct_value_workspace_.reset();
     direct_score_workspace_.reset();
     direct_kinetic_workspace_.reset();
@@ -2588,6 +2703,13 @@ void PsiFormerWF::bindBatchExecutionPlan(
     prepared_accepted_laplacian_capacity_ = 0;
     prepared_proposed_gradient_capacity_ = 0;
     prepared_proposed_laplacian_capacity_ = 0;
+    prepared_scalar_value_compatibility_ = false;
+    prepared_batch_workspace_identity_ = nullptr;
+    prepared_batch_storage_fingerprint_ = 0;
+    prepared_batch_bytes_ = 0;
+    prepared_scalar_value_publication_data_ = nullptr;
+    prepared_scalar_value_publication_size_ = 0;
+    prepared_scalar_value_publication_capacity_ = 0;
     direct_value_workspace_.reset();
     direct_score_workspace_.reset();
     direct_kinetic_workspace_.reset();
@@ -2658,6 +2780,12 @@ void PsiFormerWF::prepareBatchExecutionClone(
           "PsiFormer prepared clone state does not match its admitted storage");
   };
 
+  const pf::DirectBatchCapacityPlan scalar_plan =
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, plan.requirements(), plan.selectedCapacities());
+  const bool scalar_value = plan.requirements().requires(
+      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+
   if (prepared_clone_batch_execution_plan_)
   {
     if (!prepared_clone_batch_execution_plan_.sameBinding(participant_plan))
@@ -2667,6 +2795,24 @@ void PsiFormerWF::prepareBatchExecutionClone(
     if (!hasPreparedBatchExecutionClone(participant_plan))
       throw std::logic_error(
           "PsiFormer prepared clone allocation identity changed");
+    if (scalar_value)
+    {
+      const pf::DirectBatchStorageRequirement expected =
+          pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
+      if (!sameDirectBatchCapacityPlan(
+              direct_batch_workspace_->capacityPlan(), scalar_plan) ||
+          !sameDirectBatchExecutionStorage(
+              direct_batch_workspace_->actualStorage(), expected) ||
+          direct_batch_workspace_->vectorStorageBytes() !=
+              expected.executionBytes() ||
+          prepared_batch_bytes_ != expected.executionBytes() ||
+          scalar_value_publication_.size() !=
+              input.scalar_value_logical_maximum ||
+          scalar_value_publication_.capacity() !=
+              input.scalar_value_logical_maximum)
+        throw std::logic_error(
+            "PsiFormer prepared scalar owner differs from its admitted storage");
+    }
     return;
   }
 
@@ -2682,11 +2828,6 @@ void PsiFormerWF::prepareBatchExecutionClone(
         "PsiFormer clone preparation plan omits a component-owned requirement");
 
   validatePlannedBackends(input, plan.requirements());
-  const pf::DirectBatchCapacityPlan scalar_plan = psiformer::makePsiFormerScalarValueCapacityPlan(
-      input, plan.requirements(), plan.selectedCapacities());
-  const bool scalar_value = plan.requirements().requires(
-      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
-
   // Construct scalar scratch off to the side.  A failed allocation therefore
   // preserves both the old workspace and the unpublished preparation marker.
   std::unique_ptr<pf::DirectBatchWorkspace> prepared_batch_workspace;
@@ -2697,7 +2838,9 @@ void PsiFormerWF::prepareBatchExecutionClone(
     prepared_batch_workspace->prepare(scalar_plan);
     const pf::DirectBatchStorageRequirement expected =
         pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
-    if (prepared_batch_workspace->vectorStorageBytes() !=
+    if (!sameDirectBatchExecutionStorage(
+            prepared_batch_workspace->actualStorage(), expected) ||
+        prepared_batch_workspace->vectorStorageBytes() !=
         expected.executionBytes())
       throw std::length_error(
           "PsiFormer prepared scalar workspace does not match its admitted storage");
@@ -2710,6 +2853,25 @@ void PsiFormerWF::prepareBatchExecutionClone(
   }
   if (fail_clone_preparation_before_publish_for_testing_)
     throw std::bad_alloc();
+
+  const pf::DirectBatchWorkspace* const prepared_batch_identity =
+      prepared_batch_workspace.get();
+  const std::size_t prepared_batch_fingerprint = scalar_value
+      ? prepared_batch_workspace->storageFingerprint(
+            pf::DirectBatchMode::VALUE_ONLY)
+      : 0;
+  const std::size_t prepared_batch_bytes = scalar_value
+      ? prepared_batch_workspace->vectorStorageBytes()
+      : 0;
+  const ValueType* const prepared_publication_data = scalar_value
+      ? prepared_scalar_publication.data()
+      : nullptr;
+  const std::size_t prepared_publication_size = scalar_value
+      ? prepared_scalar_publication.size()
+      : 0;
+  const std::size_t prepared_publication_capacity = scalar_value
+      ? prepared_scalar_publication.capacity()
+      : 0;
 
   // Accepted nonempty state may represent a physical configuration and cannot
   // be canonicalized by discarding it.  Empty accepted storage and all
@@ -2784,6 +2946,14 @@ void PsiFormerWF::prepareBatchExecutionClone(
   prepared_accepted_laplacian_capacity_ = accepted_laplacian_.capacity();
   prepared_proposed_gradient_capacity_ = proposed_gradient_.capacity();
   prepared_proposed_laplacian_capacity_ = proposed_laplacian_.capacity();
+  prepared_scalar_value_compatibility_ = scalar_value;
+  prepared_batch_workspace_identity_ = prepared_batch_identity;
+  prepared_batch_storage_fingerprint_ = prepared_batch_fingerprint;
+  prepared_batch_bytes_ = prepared_batch_bytes;
+  prepared_scalar_value_publication_data_ = prepared_publication_data;
+  prepared_scalar_value_publication_size_ = prepared_publication_size;
+  prepared_scalar_value_publication_capacity_ =
+      prepared_publication_capacity;
   static_assert(std::is_nothrow_copy_assignable_v<BatchExecutionParticipantPlan>);
   // The plan view is the validity marker and is deliberately published last.
   prepared_clone_batch_execution_plan_ = participant_plan;
@@ -3419,18 +3589,7 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
 
   const pf::DirectBatchCapacityPlan& workspace_plan =
       resource.batch_workspace->capacityPlan();
-  const auto same_direct_capacity = [](const pf::DirectBatchCapacityPlan& left,
-                                       const pf::DirectBatchCapacityPlan& right) {
-    return left.logical.value_dense == right.logical.value_dense &&
-        left.logical.full_vgl == right.logical.full_vgl &&
-        left.logical.active_gradient == right.logical.active_gradient &&
-        left.logical.sparse_references == right.logical.sparse_references &&
-        left.logical.sparse_replacements == right.logical.sparse_replacements &&
-        left.tile.value == right.tile.value &&
-        left.tile.full_vgl == right.tile.full_vgl &&
-        left.tile.active_gradient == right.tile.active_gradient;
-  };
-  if (!same_direct_capacity(workspace_plan, crowd.direct_batch))
+  if (!sameDirectBatchCapacityPlan(workspace_plan, crowd.direct_batch))
     throw std::logic_error(
         "PsiFormer planned operation direct-batch capacity changed after preparation");
 
@@ -3956,6 +4115,25 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
   diagnostics.total_log_gradient_bytes = direct_total_log_gradient_.capacity() * sizeof(double);
   diagnostics.scalar_value_publication_bytes =
       scalar_value_publication_.capacity() * sizeof(ValueType);
+  diagnostics.scalar_value_publication_identity =
+      scalar_value_publication_.data();
+  diagnostics.scalar_value_publication_size =
+      scalar_value_publication_.size();
+  diagnostics.scalar_value_publication_capacity =
+      scalar_value_publication_.capacity();
+  diagnostics.prepared_scalar_value_compatibility =
+      prepared_scalar_value_compatibility_;
+  diagnostics.prepared_batch_workspace_identity =
+      prepared_batch_workspace_identity_;
+  diagnostics.prepared_batch_storage_fingerprint =
+      prepared_batch_storage_fingerprint_;
+  diagnostics.prepared_batch_bytes = prepared_batch_bytes_;
+  diagnostics.prepared_scalar_value_publication_identity =
+      prepared_scalar_value_publication_data_;
+  diagnostics.prepared_scalar_value_publication_size =
+      prepared_scalar_value_publication_size_;
+  diagnostics.prepared_scalar_value_publication_capacity =
+      prepared_scalar_value_publication_capacity_;
   diagnostics.accepted_spatial_bytes =
       accepted_gradient_.capacity() * sizeof(GradType) +
       accepted_laplacian_.capacity() * sizeof(ValueType);
@@ -3963,6 +4141,95 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
       proposed_gradient_.capacity() * sizeof(GradType) +
       proposed_laplacian_.capacity() * sizeof(ValueType);
   return diagnostics;
+}
+
+// Rebind only the prepared scalar capacity descriptor for focused corruption tests.
+void PsiFormerWF::setPreparedScalarWorkspaceFaultForTesting(
+    PreparedScalarWorkspaceFaultForTesting fault)
+{
+  if (!batch_execution_plan_ || !prepared_clone_batch_execution_plan_ ||
+      !prepared_clone_batch_execution_plan_.sameBinding(batch_execution_plan_) ||
+      !prepared_scalar_value_compatibility_ || !direct_batch_workspace_ ||
+      direct_batch_workspace_.get() != prepared_batch_workspace_identity_ ||
+      !direct_batch_workspace_->hasCapacityPlan() ||
+      direct_batch_workspace_->storageFingerprint(
+          pf::DirectBatchMode::VALUE_ONLY) !=
+          prepared_batch_storage_fingerprint_ ||
+      direct_batch_workspace_->vectorStorageBytes() != prepared_batch_bytes_ ||
+      scalar_value_publication_.data() !=
+          prepared_scalar_value_publication_data_ ||
+      scalar_value_publication_.size() !=
+          prepared_scalar_value_publication_size_ ||
+      scalar_value_publication_.capacity() !=
+          prepared_scalar_value_publication_capacity_)
+    throw std::logic_error(
+        "PsiFormer scalar workspace fault injection requires an exactly prepared owner");
+
+  const psiformer::PsiFormerMemoryPolicyInput input =
+      makeBatchMemoryPolicyInput();
+  const pf::DirectBatchCapacityPlan canonical_capacity =
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, batch_execution_plan_.plan().requirements(),
+          batch_execution_plan_.plan().selectedCapacities());
+  pf::DirectBatchCapacityPlan selected_capacity = canonical_capacity;
+
+  switch (fault)
+  {
+  case PreparedScalarWorkspaceFaultForTesting::NONE:
+    break;
+  case PreparedScalarWorkspaceFaultForTesting::LOGICAL_CAPACITY:
+    if (selected_capacity.logical.value_dense == 0)
+      throw std::logic_error(
+          "PsiFormer scalar logical capacity cannot be corrupted");
+    --selected_capacity.logical.value_dense;
+    break;
+  case PreparedScalarWorkspaceFaultForTesting::TILE_CAPACITY:
+    if (selected_capacity.tile.value > 1)
+      --selected_capacity.tile.value;
+    else if (selected_capacity.tile.full_vgl == 0)
+      selected_capacity.tile.full_vgl = 1;
+    else
+      throw std::logic_error(
+          "PsiFormer scalar tile capacity cannot be corrupted");
+    break;
+  }
+
+  direct_batch_workspace_->prepare(selected_capacity);
+  if (fault != PreparedScalarWorkspaceFaultForTesting::NONE)
+    return;
+
+  const pf::DirectBatchStorageRequirement expected_storage =
+      pf::directBatchStorageRequirement(input.storage_shape,
+                                        canonical_capacity);
+  const pf::DirectBatchStorageRequirement actual_storage =
+      direct_batch_workspace_->actualStorage();
+  const std::size_t expected_bytes = expected_storage.executionBytes();
+  if (!sameDirectBatchCapacityPlan(direct_batch_workspace_->capacityPlan(),
+                                   canonical_capacity) ||
+      !sameDirectBatchExecutionStorage(actual_storage, expected_storage) ||
+      actual_storage.executionBytes() != expected_bytes ||
+      direct_batch_workspace_->vectorStorageBytes() != expected_bytes ||
+      scalar_value_publication_.size() !=
+          input.scalar_value_logical_maximum ||
+      scalar_value_publication_.capacity() !=
+          input.scalar_value_logical_maximum)
+    throw std::logic_error(
+        "PsiFormer scalar workspace fault restoration is not canonical");
+
+  // Publish refreshed evidence only after the restored owner has been proved
+  // canonical.  No allocation identity changes during this test-only rebind.
+  prepared_scalar_value_compatibility_ = true;
+  prepared_batch_workspace_identity_   = direct_batch_workspace_.get();
+  prepared_batch_storage_fingerprint_ =
+      direct_batch_workspace_->storageFingerprint(
+          pf::DirectBatchMode::VALUE_ONLY);
+  prepared_batch_bytes_ = expected_bytes;
+  prepared_scalar_value_publication_data_ =
+      scalar_value_publication_.data();
+  prepared_scalar_value_publication_size_ =
+      scalar_value_publication_.size();
+  prepared_scalar_value_publication_capacity_ =
+      scalar_value_publication_.capacity();
 }
 
 // Exercise both typed adapter branches without borrowing or modifying a resource.
@@ -5362,40 +5629,432 @@ pf::DirectSpatialWorkspace& PsiFormerWF::requireDirectSpatialWorkspace(Evaluatio
   }
 }
 
-// Batch scratch is needed only by scalar APIs that evaluate several related configurations.
+// Lazy batch scratch belongs only to legacy scalar APIs. Planned scalar VALUE
+// operations must use the exact workspace published during clone preparation.
 pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
 {
   if (batch_execution_plan_)
-  {
-    if (!batch_execution_plan_.plan().requirements().requires(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY))
-      throw std::logic_error(
-          "PsiFormer scalar VALUE compatibility is not admitted by the explicit batch plan");
-    if (!prepared_clone_batch_execution_plan_.sameBinding(batch_execution_plan_) || !direct_batch_workspace_ ||
-        !direct_batch_workspace_->hasCapacityPlan())
-      throw std::logic_error(
-          "PsiFormer scalar VALUE workspace was not prepared for the bound batch plan");
-  }
-  else if (!direct_batch_workspace_)
+    throw std::logic_error(
+        "PsiFormer legacy scalar batch workspace is not admitted by the explicit batch plan");
+  if (!direct_batch_workspace_)
     direct_batch_workspace_ = model_state_->direct_batch_executor.makeWorkspace();
   return *direct_batch_workspace_;
 }
 
-// Validate planned scalar extents before any output or workspace state changes.
-PsiFormerWF::ValueType* PsiFormerWF::requirePlannedScalarValuePublication(
-    std::size_t configuration_count,
-    std::size_t output_count,
-    const char* operation)
+// Fingerprint exact scalar VALUE input provenance without touching prepared scratch.
+std::uint64_t PsiFormerWF::scalarValueInputFingerprint(
+    const PlannedScalarValueRequest& request) const noexcept
+{
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  const auto mix_pointer = [&hash](const void* pointer) noexcept {
+    mixPersistentInteger(
+        hash,
+        static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(pointer)));
+  };
+
+  mixPersistentInteger(
+      hash,
+      request.operation == PlannedScalarValueOperation::ALL_TO_ONE
+          ? ALL_TO_ONE_VALUE_FINGERPRINT_DOMAIN
+          : VIRTUAL_VALUE_FINGERPRINT_DOMAIN);
+  mix_pointer(this);
+  mix_pointer(model_state_.get());
+  mix_pointer(request.reference);
+  mix_pointer(request.virtual_particles);
+  mix_pointer(&batch_execution_plan_.plan());
+  mixPersistentInteger(hash, batch_execution_plan_.plan().fingerprint());
+  mixPersistentInteger(hash, request.configuration_count);
+  mixPersistentInteger(hash, request.output_size);
+  mixPersistentInteger(hash, configurationIdentity(*request.reference));
+
+  if (request.operation == PlannedScalarValueOperation::ALL_TO_ONE)
+  {
+    mixPersistentInteger(
+        hash,
+        static_cast<std::uint64_t>(request.reference->getActivePtcl()));
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      mixPersistentDouble(
+          hash,
+          static_cast<double>(
+              request.reference->getActivePos()[dimension]));
+  }
+  else
+  {
+    mixPersistentInteger(
+        hash,
+        static_cast<std::uint64_t>(request.virtual_particles->refPtcl));
+    mixPersistentInteger(
+        hash, request.virtual_particles->getTotalNum());
+    for (const auto& position : request.virtual_particles->R)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        mixPersistentDouble(
+            hash, static_cast<double>(position[dimension]));
+  }
+  return hash;
+}
+
+// Prove exact scalar input, output, plan, and prepared-owner evidence.
+PsiFormerWF::PlannedScalarValueAccess
+PsiFormerWF::requirePlannedScalarValueOperation(
+    const PlannedScalarValueRequest& request)
 {
   if (!batch_execution_plan_)
-    return nullptr;
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE operation has no bound batch plan");
+  if (!request.reference)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation has no reference ParticleSet");
+  if (!hasPreparedBatchExecutionClone(batch_execution_plan_))
+    throw std::logic_error(
+        "PsiFormer scalar VALUE workspace was not prepared for the bound batch plan");
+  if (bound_particle_set_ != request.reference)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation received a foreign reference ParticleSet");
+  if (has_proposal_ || proposal_origin_ != ProposalOrigin::NONE)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE operation requires absent proposal state");
 
-  pf::DirectBatchWorkspace& workspace = requireDirectBatchWorkspace();
-  const pf::DirectBatchCapacityPlan& capacity = workspace.capacityPlan();
-  if (configuration_count > capacity.logical.value_dense ||
-      output_count > scalar_value_publication_.size())
-    throw std::length_error(std::string("PsiFormer ") + operation +
-                            " exceeds the planned scalar VALUE envelope");
-  return scalar_value_publication_.data();
+  const BatchExecutionPlan& plan = batch_execution_plan_.plan();
+  if (!plan.requirements().requires(
+          BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY))
+    throw std::logic_error(
+        "PsiFormer scalar VALUE compatibility is not admitted by the explicit batch plan");
+  if (plan.targetCoordinate() != BatchExecutionTargetCoordinate::POS_ONLY)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation requires explicit POS-only target evidence");
+  const BatchExecutionTopology& topology = plan.topology();
+  if (topology.serialized_walkers || topology.backend_id != "cpu" ||
+      topology.device_id)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation requires direct nonserialized CPU execution");
+  if (model_state_->direct_value_mode != DirectBackendMode::DIRECT)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE operation requires the direct VALUE backend");
+
+  const psiformer::PsiFormerMemoryPolicyInput input =
+      makeBatchMemoryPolicyInput();
+  const psiformer::ModelShape& model_shape =
+      model_state_->execution_plan.modelShape();
+  const std::size_t electron_count = model_shape.electrons();
+  if (plan.particleCount() != electron_count)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE particle count differs from its model");
+  if (prepared_accepted_gradient_capacity_ != electron_count ||
+      prepared_accepted_laplacian_capacity_ != electron_count ||
+      prepared_proposed_gradient_capacity_ != electron_count ||
+      prepared_proposed_laplacian_capacity_ != electron_count)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE clone storage differs from its exact prepared extent");
+
+  // Prove the exact accepted configuration and spin ordering before deriving
+  // either operation-specific replacement sequence.
+  const ParticleSet& reference = *request.reference;
+  const auto& soa_positions =
+      reference.getCoordinates().getAllParticlePos();
+  if (reference.isSpinor())
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation received a spinor ParticleSet");
+  if (static_cast<std::size_t>(reference.getTotalNum()) != electron_count ||
+      reference.R.size() != electron_count ||
+      reference.G.size() != electron_count ||
+      reference.L.size() != electron_count ||
+      reference.GroupID.size() != electron_count ||
+      reference.spins.size() != electron_count ||
+      soa_positions.size() != electron_count)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation received incompatible ParticleSet extents");
+  if (reference.groups() != 2 ||
+      reference.groupsize(0) !=
+          static_cast<int>(model_shape.spin_up_electrons) ||
+      reference.groupsize(1) !=
+          static_cast<int>(model_shape.spin_down_electrons))
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation received an incompatible spin partition");
+  if (reference.getActivePtcl() != -1)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE operation requires an inactive ParticleSet move");
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+  {
+    const int expected_group =
+        electron < model_shape.spin_up_electrons ? 0 : 1;
+    if (reference.GroupID[electron] != expected_group)
+      throw std::invalid_argument(
+          "PsiFormer planned scalar VALUE operation received noncanonical spin ordering");
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      if (!psiformer::determinant::isFiniteReal(
+              static_cast<double>(reference.R[electron][dimension])))
+        throw std::invalid_argument(
+            "PsiFormer planned scalar VALUE operation received a non-finite accepted position");
+      if (soa_positions[electron][dimension] !=
+          reference.R[electron][dimension])
+        throw std::invalid_argument(
+            "PsiFormer planned scalar VALUE operation has inconsistent AoS and SoA positions");
+    }
+  }
+
+  std::size_t expected_configurations = 0;
+  std::size_t expected_outputs        = 0;
+  if (request.operation == PlannedScalarValueOperation::ALL_TO_ONE)
+  {
+    if (request.virtual_particles)
+      throw std::invalid_argument(
+          "PsiFormer all-to-one scalar request has unexpected virtual-particle input");
+    expected_outputs = electron_count;
+    expected_configurations = checkedBatchMemoryAdd(
+        electron_count, 1,
+        "PsiFormer planned all-to-one configuration count");
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      if (!psiformer::determinant::isFiniteReal(
+              static_cast<double>(
+                  reference.getActivePos()[dimension])))
+        throw std::invalid_argument(
+            "PsiFormer planned all-to-one position is non-finite");
+  }
+  else
+  {
+    if (!request.virtual_particles)
+      throw std::invalid_argument(
+          "PsiFormer planned virtual scalar request has no VirtualParticleSet");
+    const VirtualParticleSet& virtual_particles =
+        *request.virtual_particles;
+    if (&virtual_particles.getRefPS() != &reference)
+      throw std::invalid_argument(
+          "PsiFormer planned virtual scalar request has a foreign reference ParticleSet");
+    if (virtual_particles.isSpinor() != reference.isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer planned virtual scalar request has an incompatible coordinate mode");
+    if (virtual_particles.refPtcl < 0 ||
+        virtual_particles.refPtcl >= reference.getTotalNum())
+      throw std::out_of_range(
+          "PsiFormer planned virtual scalar reference electron is invalid");
+    expected_outputs = virtual_particles.getTotalNum();
+    if (virtual_particles.R.size() != expected_outputs)
+      throw std::invalid_argument(
+          "PsiFormer planned virtual scalar positions have the wrong extent");
+    expected_configurations = checkedBatchMemoryAdd(
+        expected_outputs, 1,
+        "PsiFormer planned virtual scalar configuration count");
+    if (expected_configurations >
+        input.scalar_value_logical_maximum)
+      throw std::length_error(
+          "PsiFormer planned virtual scalar request exceeds the planned scalar VALUE envelope");
+    for (const auto& position : virtual_particles.R)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (!psiformer::determinant::isFiniteReal(
+                static_cast<double>(position[dimension])))
+          throw std::invalid_argument(
+              "PsiFormer planned virtual scalar position is non-finite");
+    if (batchExecutionModeIsRequired(
+            plan.requirements(), BatchExecutionMode::ECP_OUTER))
+      throw std::logic_error(
+          "PsiFormer scalar virtual-ratio evaluation must use flattened multiwalker ECP dispatch under the explicit batch plan");
+  }
+
+  if (request.configuration_count != expected_configurations ||
+      request.output_size != expected_outputs ||
+      request.output_size > request.output_capacity)
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE request has incompatible output extents");
+  if (request.configuration_count >
+      input.scalar_value_logical_maximum)
+    throw std::length_error(
+        "PsiFormer planned scalar VALUE request exceeds the planned scalar VALUE envelope");
+
+  // Reconcile the live owner with both its preparation record and the
+  // independently reconstructed canonical scalar capacity plan.
+  if (!prepared_scalar_value_compatibility_ ||
+      !direct_batch_workspace_ ||
+      direct_batch_workspace_.get() !=
+          prepared_batch_workspace_identity_ ||
+      !direct_batch_workspace_->hasCapacityPlan())
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE workspace lacks exact preparation evidence");
+  pf::DirectBatchWorkspace& workspace = *direct_batch_workspace_;
+  const pf::DirectBatchCapacityPlan expected_capacity =
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, plan.requirements(), plan.selectedCapacities());
+  const pf::DirectBatchStorageRequirement expected_storage =
+      pf::directBatchStorageRequirement(
+          input.storage_shape, expected_capacity);
+  const pf::DirectBatchStorageRequirement actual_storage =
+      workspace.actualStorage();
+  const std::size_t workspace_bytes = actual_storage.executionBytes();
+  const std::size_t workspace_fingerprint = workspace.storageFingerprint(
+      pf::DirectBatchMode::VALUE_ONLY);
+  if (!sameDirectBatchCapacityPlan(
+          workspace.capacityPlan(), expected_capacity) ||
+      !sameDirectBatchExecutionStorage(
+          actual_storage, expected_storage) ||
+      workspace_bytes != expected_storage.executionBytes() ||
+      workspace_bytes != workspace.vectorStorageBytes() ||
+      workspace_bytes != prepared_batch_bytes_ ||
+      workspace_fingerprint == 0 ||
+      workspace_fingerprint !=
+          prepared_batch_storage_fingerprint_)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE workspace changed after preparation");
+
+  if (scalar_value_publication_.data() !=
+          prepared_scalar_value_publication_data_ ||
+      scalar_value_publication_.size() !=
+          prepared_scalar_value_publication_size_ ||
+      scalar_value_publication_.capacity() !=
+          prepared_scalar_value_publication_capacity_ ||
+      scalar_value_publication_.size() !=
+          input.scalar_value_logical_maximum ||
+      scalar_value_publication_.capacity() !=
+          input.scalar_value_logical_maximum)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE publication storage changed after preparation");
+
+  // The caller's complete retained range must be disjoint from all scalar
+  // inputs and every component-owned state or scratch allocation.
+  const CheckedMemoryRange output_range = checkedMemoryRange(
+      request.output_data, request.output_capacity,
+      "PsiFormer planned scalar VALUE output range overflowed");
+  const std::size_t output_bytes = output_range.end - output_range.begin;
+  const CheckedMemoryRange publication_range = checkedMemoryRange(
+      scalar_value_publication_.data(),
+      scalar_value_publication_.capacity(),
+      "PsiFormer planned scalar VALUE publication range overflowed");
+  if (memoryRangesOverlap(output_range, publication_range) ||
+      workspace.overlapsStorage(request.output_data, output_bytes))
+    throw std::invalid_argument(
+        "PsiFormer planned scalar VALUE output aliases prepared scratch");
+
+  for (const CheckedMemoryRange internal : {
+           checkedMemoryRange(
+               accepted_gradient_.data(), electron_count,
+               "PsiFormer accepted gradient range overflowed"),
+           checkedMemoryRange(
+               accepted_laplacian_.data(), electron_count,
+               "PsiFormer accepted Laplacian range overflowed"),
+           checkedMemoryRange(
+               proposed_gradient_.data(), electron_count,
+               "PsiFormer proposed gradient range overflowed"),
+           checkedMemoryRange(
+               proposed_laplacian_.data(), electron_count,
+               "PsiFormer proposed Laplacian range overflowed"),
+           checkedMemoryRange(
+               std::addressof(current_sign_), std::size_t{1},
+               "PsiFormer accepted sign range overflowed"),
+           checkedMemoryRange(
+               std::addressof(log_value_), std::size_t{1},
+               "PsiFormer accepted log-value range overflowed"),
+           checkedMemoryRange(
+               std::addressof(accepted_value_valid_), std::size_t{1},
+               "PsiFormer accepted-validity range overflowed"),
+           checkedMemoryRange(
+               std::addressof(accepted_configuration_identity_),
+               std::size_t{1},
+               "PsiFormer accepted-configuration range overflowed"),
+           checkedMemoryRange(
+               std::addressof(accepted_parameter_version_),
+               std::size_t{1},
+               "PsiFormer accepted-version range overflowed"),
+           checkedMemoryRange(
+               std::addressof(accepted_state_requirement_),
+               std::size_t{1},
+               "PsiFormer accepted-requirement range overflowed"),
+           checkedMemoryRange(
+               std::addressof(observed_parameter_version_),
+               std::size_t{1},
+               "PsiFormer observed-version range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposed_sign_), std::size_t{1},
+               "PsiFormer proposed sign range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposed_log_value_), std::size_t{1},
+               "PsiFormer proposed log-value range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposed_configuration_identity_),
+               std::size_t{1},
+               "PsiFormer proposed-configuration range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposed_descriptor_fingerprint_),
+               std::size_t{1},
+               "PsiFormer proposed-fingerprint range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposed_parameter_version_),
+               std::size_t{1},
+               "PsiFormer proposed-version range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposed_particle_), std::size_t{1},
+               "PsiFormer proposed-particle range overflowed"),
+           checkedMemoryRange(
+               std::addressof(proposal_origin_), std::size_t{1},
+               "PsiFormer proposal-origin range overflowed"),
+           checkedMemoryRange(
+               std::addressof(has_proposal_), std::size_t{1},
+               "PsiFormer proposal marker range overflowed")})
+    if (memoryRangesOverlap(output_range, internal))
+      throw std::invalid_argument(
+          "PsiFormer planned scalar VALUE output aliases component state");
+
+  if (soa_positions.capacity() >
+      std::numeric_limits<std::size_t>::max() / 3)
+    throw std::length_error(
+        "PsiFormer ParticleSet SoA position range overflowed");
+  for (const CheckedMemoryRange particle_storage : {
+           checkedMemoryRange(
+               reference.R.data(), electron_count,
+               "PsiFormer ParticleSet position range overflowed"),
+           checkedMemoryRange(
+               soa_positions.data(), 3 * soa_positions.capacity(),
+               "PsiFormer ParticleSet SoA position range overflowed"),
+           checkedMemoryRange(
+               std::addressof(reference.getActivePos()), std::size_t{1},
+               "PsiFormer ParticleSet active-position range overflowed"),
+           checkedMemoryRange(
+               reference.G.data(), electron_count,
+               "PsiFormer ParticleSet gradient range overflowed"),
+           checkedMemoryRange(
+               reference.L.data(), electron_count,
+               "PsiFormer ParticleSet Laplacian range overflowed"),
+           checkedMemoryRange(
+               reference.GroupID.data(), electron_count,
+               "PsiFormer ParticleSet group range overflowed"),
+           checkedMemoryRange(
+               reference.spins.data(), electron_count,
+               "PsiFormer ParticleSet spin range overflowed")})
+    if (memoryRangesOverlap(output_range, particle_storage))
+      throw std::invalid_argument(
+          "PsiFormer planned scalar VALUE output aliases ParticleSet state");
+
+  if (request.virtual_particles)
+  {
+    const VirtualParticleSet& virtual_particles =
+        *request.virtual_particles;
+    const auto& virtual_soa =
+        virtual_particles.getCoordinates().getAllParticlePos();
+    if (virtual_soa.capacity() >
+        std::numeric_limits<std::size_t>::max() / 3)
+      throw std::length_error(
+          "PsiFormer VirtualParticleSet SoA range overflowed");
+    for (const CheckedMemoryRange virtual_storage : {
+             checkedMemoryRange(
+                 virtual_particles.R.data(),
+                 virtual_particles.R.size(),
+                 "PsiFormer VirtualParticleSet position range overflowed"),
+             checkedMemoryRange(
+                 virtual_soa.data(), 3 * virtual_soa.capacity(),
+                 "PsiFormer VirtualParticleSet SoA range overflowed")})
+      if (memoryRangesOverlap(output_range, virtual_storage))
+        throw std::invalid_argument(
+            "PsiFormer planned scalar VALUE output aliases VirtualParticleSet state");
+  }
+
+  return {workspace,
+          scalar_value_publication_.data(),
+          batch_execution_plan_,
+          workspace_fingerprint,
+          workspace_bytes,
+          scalarValueInputFingerprint(request),
+          request.output_data,
+          request.output_size,
+          request.output_capacity};
 }
 
 // Scalar direct value and spatial tapes are not part of the hard-plan owner set.
@@ -5422,6 +6081,16 @@ void PsiFormerWF::requireUnplannedScalarDerivative(const char* operation) const
   if (batch_execution_plan_)
     throw std::logic_error(std::string("PsiFormer ") + operation +
                            " is not admitted as a clone-local operation by the explicit batch plan");
+}
+
+// Deferred crowd owners must not borrow legacy resources under a hard plan.
+void PsiFormerWF::requireUnplannedMultiWalkerOperation(
+    const char* operation) const
+{
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        std::string("PsiFormer ") + operation +
+        " is not admitted as a multi-walker operation by the explicit batch plan");
 }
 
 // Lazily allocate score scratch for scalar calls, keeping inference-only clones lightweight.
@@ -9241,37 +9910,292 @@ void PsiFormerWF::gatherSelectedGradientUnderRead(
   }
 }
 
-// Replace each electron by the common virtual position in one state-isolated batch.
-void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<ValueType>& ratios)
+// Execute one prepared scalar VALUE batch and publish only after a full recheck.
+void PsiFormerWF::evaluatePlannedScalarValue(
+    PlannedScalarValueOperation operation,
+    const ParticleSet& reference,
+    const VirtualParticleSet* virtual_particles,
+    std::vector<ValueType>& ratios)
 {
+  const std::size_t configurations = checkedBatchMemoryAdd(
+      ratios.size(), 1,
+      "PsiFormer planned scalar VALUE configuration count");
+  PlannedScalarValueRequest request{
+      operation, &reference, virtual_particles, configurations,
+      ratios.data(), ratios.size(), ratios.capacity()};
+  PlannedScalarValueAccess access =
+      requirePlannedScalarValueOperation(request);
+
+  PsiFormerReadTransaction transaction(*model_state_);
+  if (transaction.state().direct_value_mode != DirectBackendMode::DIRECT)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE operation requires the direct VALUE backend");
+  const std::size_t parameter_version = transaction.parameterVersion();
+  pf::DirectBatchWorkspace& workspace = access.workspace;
+  workspace.resize(pf::DirectBatchMode::VALUE_ONLY, configurations);
+  packBatchConfiguration(workspace, 0, reference);
+  if (operation == PlannedScalarValueOperation::ALL_TO_ONE)
+    for (std::size_t electron = 0; electron < access.output_size; ++electron)
+      packBatchConfiguration(
+          workspace, electron + 1, reference,
+          static_cast<int>(electron), &reference.getActivePos());
+  else
+    for (std::size_t move = 0; move < access.output_size; ++move)
+      packBatchConfiguration(
+          workspace, move + 1, reference,
+          virtual_particles->refPtcl, &virtual_particles->R[move]);
+
+  pf::DirectBatchValueResultView result =
+      transaction.state().direct_batch_executor.evaluateValues(workspace);
+  if (!workspace.ownsValueResult(
+          result, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS,
+          configurations))
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE result is not the exact workspace-owned view");
+
+  for (std::size_t configuration = 0;
+       configuration < configurations; ++configuration)
+    if (result.parameter_version[configuration] != parameter_version ||
+        (result.sign[configuration] != -1.0 &&
+         result.sign[configuration] != 1.0) ||
+        !psiformer::determinant::isFiniteReal(
+            result.logabs[configuration]))
+      throw std::runtime_error(
+          "PsiFormer planned scalar VALUE produced invalid version, sign, or log evidence");
+
+  for (std::size_t output = 0; output < access.output_size; ++output)
+  {
+    const ValueType ratio = makeRatio(
+        result.sign[output + 1], result.logabs[output + 1],
+        result.sign[0], result.logabs[0]);
+    if (!isFiniteWavefunctionValue(ratio))
+      throw std::runtime_error(
+          "PsiFormer planned scalar VALUE produced a non-finite ratio");
+    access.publication[output] = ratio;
+  }
+
+  // A single friend-only selector makes otherwise unreachable Phase-B
+  // corruptions deterministic.  Any mutation of live input or owner evidence
+  // is restored before the injected validation failure escapes.
+  std::size_t* mutated_version = nullptr;
+  double* mutated_sign        = nullptr;
+  double* mutated_log_zero    = nullptr;
+  double* mutated_log_one     = nullptr;
+  std::size_t saved_version   = 0;
+  double saved_sign           = 0.0;
+  double saved_log_zero       = 0.0;
+  double saved_log_one        = 0.0;
+  ParticleSet* mutated_reference = nullptr;
+  using MutableSoAPositions = std::remove_const_t<
+      std::remove_reference_t<decltype(
+          reference.getCoordinates().getAllParticlePos())>>;
+  ParticleSet::RealType saved_aos_coordinate{};
+  ParticleSet::RealType saved_soa_coordinate{};
+  bool mutated_workspace_evidence   = false;
+  bool mutated_publication_evidence = false;
+  const std::size_t saved_prepared_workspace_fingerprint =
+      prepared_batch_storage_fingerprint_;
+  const ValueType* const saved_prepared_publication_data =
+      prepared_scalar_value_publication_data_;
+
+  switch (planned_scalar_value_fault_for_testing_)
+  {
+  case PlannedScalarValueFaultForTesting::NONE:
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_OWNER:
+    result.owner = nullptr;
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_GENERATION:
+    result.generation ^= std::size_t{1};
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_SIZE:
+    ++result.size;
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_VERSION:
+    mutated_version = const_cast<std::size_t*>(result.parameter_version);
+    saved_version = mutated_version[0];
+    mutated_version[0] ^= std::size_t{1};
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_SIGN:
+    mutated_sign = const_cast<double*>(result.sign);
+    saved_sign = mutated_sign[0];
+    mutated_sign[0] = 0.0;
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_LOG_MAGNITUDE:
+    mutated_log_zero = const_cast<double*>(result.logabs);
+    saved_log_zero = mutated_log_zero[0];
+    mutated_log_zero[0] =
+        std::numeric_limits<double>::infinity();
+    break;
+  case PlannedScalarValueFaultForTesting::RESULT_RATIO:
+    mutated_log_zero = const_cast<double*>(result.logabs);
+    saved_log_zero = mutated_log_zero[0];
+    if (configurations > 1)
+    {
+      mutated_log_one = mutated_log_zero + 1;
+      saved_log_one = mutated_log_one[0];
+      mutated_log_zero[0] = -std::numeric_limits<double>::max();
+      mutated_log_one[0]  = std::numeric_limits<double>::max();
+    }
+    else
+      mutated_log_zero[0] =
+          std::numeric_limits<double>::infinity();
+    break;
+  case PlannedScalarValueFaultForTesting::INPUT_FINGERPRINT:
+  {
+    mutated_reference = const_cast<ParticleSet*>(&reference);
+    auto& mutable_soa = const_cast<MutableSoAPositions&>(
+        mutated_reference->getCoordinates().getAllParticlePos());
+    saved_aos_coordinate = mutated_reference->R[0][0];
+    saved_soa_coordinate = mutable_soa[0][0];
+    const ParticleSet::RealType changed = std::nextafter(
+        saved_aos_coordinate,
+        std::numeric_limits<ParticleSet::RealType>::infinity());
+    mutated_reference->R[0][0] = changed;
+    mutable_soa.getNonConstData()[0] = changed;
+    break;
+  }
+  case PlannedScalarValueFaultForTesting::OUTPUT_IDENTITY:
+    break;
+  case PlannedScalarValueFaultForTesting::WORKSPACE_EVIDENCE:
+    mutated_workspace_evidence = true;
+    prepared_batch_storage_fingerprint_ ^= std::size_t{1};
+    break;
+  case PlannedScalarValueFaultForTesting::PUBLICATION_EVIDENCE:
+    mutated_publication_evidence = true;
+    prepared_scalar_value_publication_data_ = nullptr;
+    break;
+  }
+
+  const auto restore_fault = [&]() noexcept {
+    if (mutated_version)
+      mutated_version[0] = saved_version;
+    if (mutated_sign)
+      mutated_sign[0] = saved_sign;
+    if (mutated_log_zero)
+      mutated_log_zero[0] = saved_log_zero;
+    if (mutated_log_one)
+      mutated_log_one[0] = saved_log_one;
+    if (mutated_reference)
+    {
+      mutated_reference->R[0][0] = saved_aos_coordinate;
+      auto& mutable_soa = const_cast<MutableSoAPositions&>(
+          mutated_reference->getCoordinates().getAllParticlePos());
+      mutable_soa.getNonConstData()[0] = saved_soa_coordinate;
+    }
+    if (mutated_workspace_evidence)
+      prepared_batch_storage_fingerprint_ =
+          saved_prepared_workspace_fingerprint;
+    if (mutated_publication_evidence)
+      prepared_scalar_value_publication_data_ =
+          saved_prepared_publication_data;
+  };
+
+  // Phase B reconstructs the request from live caller evidence and repeats
+  // every throwing storage/input check without resetting workspace state.
+  PlannedScalarValueRequest final_request{
+      operation, &reference, virtual_particles, configurations,
+      ratios.data(), ratios.size(), ratios.capacity()};
+  if (planned_scalar_value_fault_for_testing_ ==
+      PlannedScalarValueFaultForTesting::OUTPUT_IDENTITY)
+    final_request.output_data = nullptr;
+  try
+  {
+    PlannedScalarValueAccess final_access =
+        requirePlannedScalarValueOperation(final_request);
+    if (&final_access.workspace != &workspace ||
+        final_access.publication != access.publication ||
+        !final_access.participant.sameBinding(access.participant) ||
+        final_access.workspace_fingerprint !=
+            access.workspace_fingerprint ||
+        final_access.workspace_bytes != access.workspace_bytes ||
+        final_access.input_fingerprint != access.input_fingerprint ||
+        final_access.output_data != access.output_data ||
+        final_access.output_size != access.output_size ||
+        final_access.output_capacity != access.output_capacity ||
+        !workspace.ownsValueResult(
+            result, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS,
+            configurations))
+      throw std::logic_error(
+          "PsiFormer planned scalar VALUE evidence changed during evaluation");
+
+    for (std::size_t configuration = 0;
+         configuration < configurations; ++configuration)
+      if (result.parameter_version[configuration] != parameter_version ||
+          (result.sign[configuration] != -1.0 &&
+           result.sign[configuration] != 1.0) ||
+          !psiformer::determinant::isFiniteReal(
+              result.logabs[configuration]))
+        throw std::runtime_error(
+            "PsiFormer planned scalar VALUE result changed before publication");
+    for (std::size_t output = 0; output < access.output_size; ++output)
+    {
+      const ValueType expected = makeRatio(
+          result.sign[output + 1], result.logabs[output + 1],
+          result.sign[0], result.logabs[0]);
+      if (!isFiniteWavefunctionValue(access.publication[output]) ||
+          access.publication[output] != expected)
+        throw std::runtime_error(
+            "PsiFormer planned scalar VALUE staging changed before publication");
+    }
+  }
+  catch (...)
+  {
+    restore_fault();
+    throw;
+  }
+  restore_fault();
+
+  if (planned_scalar_value_fault_for_testing_ !=
+      PlannedScalarValueFaultForTesting::NONE)
+    throw std::logic_error(
+        "PsiFormer planned scalar VALUE test fault was not detected");
+
+  for (std::size_t output = 0; output < access.output_size; ++output)
+    if (!isFiniteWavefunctionValue(access.publication[output]))
+      throw std::runtime_error(
+          "PsiFormer planned scalar VALUE publication became non-finite");
+
+  if (fail_planned_scalar_value_before_publish_for_testing_)
+    throw std::overflow_error(
+        "Injected PsiFormer planned scalar VALUE pre-publication failure");
+
+  static_assert(std::is_nothrow_copy_assignable_v<ValueType>);
+  const auto publish = [&]() noexcept {
+    for (std::size_t output = 0; output < access.output_size; ++output)
+      access.output_data[output] = access.publication[output];
+  };
+  publish();
+}
+
+// Replace each electron by the common virtual position in one state-isolated batch.
+void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles,
+                                         std::vector<ValueType>& ratios)
+{
+  if (batch_execution_plan_)
+  {
+    evaluatePlannedScalarValue(
+        PlannedScalarValueOperation::ALL_TO_ONE, particles, nullptr, ratios);
+    return;
+  }
+
   if (particles.isSpinor())
-    throw std::invalid_argument("PsiFormer all-to-one ratios do not support spinor virtual moves");
-  if (ratios.size() != static_cast<std::size_t>(particles.getTotalNum()))
-    throw std::invalid_argument("PsiFormer all-to-one ratio output has the wrong size");
+    throw std::invalid_argument(
+        "PsiFormer all-to-one ratios do not support spinor virtual moves");
+  if (ratios.size() !=
+      static_cast<std::size_t>(particles.getTotalNum()))
+    throw std::invalid_argument(
+        "PsiFormer all-to-one ratio output has the wrong size");
 
   const std::size_t configurations = checkedBatchMemoryAdd(
       static_cast<std::size_t>(particles.getTotalNum()), 1,
       "PsiFormer all-to-one configuration count");
-  ValueType* staged_values = requirePlannedScalarValuePublication(
-      configurations, ratios.size(), "all-to-one ratios");
-  std::vector<ValueType> legacy_staged_ratios;
-  if (!staged_values)
-  {
-    legacy_staged_ratios.resize(ratios.size());
-    staged_values = legacy_staged_ratios.data();
-  }
-  const auto publish_ratios = [&]() {
-    if (batch_execution_plan_)
-      std::copy_n(staged_values, ratios.size(), ratios.begin());
-    else
-      ratios.swap(legacy_staged_ratios);
-  };
-
+  std::vector<ValueType> staged_ratios(ratios.size());
   PsiFormerReadTransaction transaction(*model_state_);
   synchronizeParameterVersion(transaction.parameterVersion());
 
-  // Oracle and compare modes retain the scalar validation path but use the explicit
-  // common position; the WaveFunctionComponent default incorrectly calls activeR().
+  // Oracle and compare modes retain the scalar validation path but use the
+  // explicit common position; the inherited default incorrectly calls activeR().
   if (transaction.state().direct_value_mode != DirectBackendMode::DIRECT)
   {
     const pf::Result reference = evaluatePositionsUnderRead(
@@ -9281,10 +10205,10 @@ void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<Val
       const pf::Result moved = evaluatePositionsUnderRead(
           transaction, particles, electron, &particles.getActivePos(),
           EvaluationPurpose::VALUE_ONLY);
-      staged_values[electron] =
-          makeRatio(moved.sign, moved.logabs, reference.sign, reference.logabs);
+      staged_ratios[electron] = makeRatio(
+          moved.sign, moved.logabs, reference.sign, reference.logabs);
     }
-    publish_ratios();
+    ratios.swap(staged_ratios);
     return;
   }
 
@@ -9293,38 +10217,47 @@ void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<Val
   batch.resize(pf::DirectBatchMode::VALUE_ONLY, configurations);
   packBatchConfiguration(batch, 0, particles);
   for (int electron = 0; electron < particles.getTotalNum(); ++electron)
-    packBatchConfiguration(batch, static_cast<std::size_t>(electron) + 1, particles, electron,
-                           &particles.getActivePos());
+    packBatchConfiguration(
+        batch, static_cast<std::size_t>(electron) + 1, particles,
+        electron, &particles.getActivePos());
 
   const pf::DirectBatchValueResultView result =
       transaction.state().direct_batch_executor.evaluateValues(batch);
   if (result.parameter_version[0] != parameter_version)
-    throw std::logic_error("PsiFormer all-to-one reference observed inconsistent parameters");
+    throw std::logic_error(
+        "PsiFormer all-to-one reference observed inconsistent parameters");
   for (int electron = 0; electron < particles.getTotalNum(); ++electron)
   {
-    const std::size_t configuration = static_cast<std::size_t>(electron) + 1;
+    const std::size_t configuration =
+        static_cast<std::size_t>(electron) + 1;
     if (result.parameter_version[configuration] != parameter_version)
-      throw std::logic_error("PsiFormer all-to-one batch observed inconsistent parameters");
-    staged_values[electron] = makeRatio(
-        result.sign[configuration], result.logabs[configuration], result.sign[0],
-        result.logabs[0]);
+      throw std::logic_error(
+          "PsiFormer all-to-one batch observed inconsistent parameters");
+    staged_ratios[electron] = makeRatio(
+        result.sign[configuration], result.logabs[configuration],
+        result.sign[0], result.logabs[0]);
   }
-  publish_ratios();
+  ratios.swap(staged_ratios);
 }
 
 // Evaluate independent full-network ratios for all quadrature positions without mutating walker state.
 void PsiFormerWF::evaluateRatios(const VirtualParticleSet& virtual_particles, std::vector<ValueType>& ratios)
 {
+  if (batch_execution_plan_)
+  {
+    requireNoPlannedEcpScalarDispatch(
+        "scalar virtual-ratio evaluation");
+    evaluatePlannedScalarValue(
+        PlannedScalarValueOperation::VIRTUAL_PARTICLE_VALUE,
+        virtual_particles.getRefPS(), &virtual_particles, ratios);
+    return;
+  }
+
   if (ratios.size() !=
       static_cast<std::size_t>(virtual_particles.getTotalNum()))
     throw std::invalid_argument(
         "PsiFormer virtual-particle ratio output has the wrong size");
   requireNoPlannedEcpScalarDispatch("scalar virtual-ratio evaluation");
-  const std::size_t configurations = checkedBatchMemoryAdd(
-      ratios.size(), 1, "PsiFormer virtual-ratio configuration count");
-  (void)requirePlannedScalarValuePublication(
-      configurations, ratios.size(), "virtual ratios");
-
   PsiFormerReadTransaction transaction(*model_state_);
   synchronizeParameterVersion(transaction.parameterVersion());
   evaluateRatiosUnderRead(transaction, virtual_particles, ratios);
@@ -9335,6 +10268,7 @@ void PsiFormerWF::evaluateRatiosUnderRead(
     const VirtualParticleSet& virtual_particles,
     std::vector<ValueType>& ratios)
 {
+  requireUnplannedScalarEvaluation("virtual-ratio evaluation");
   if (&transaction.state() != model_state_.get())
     throw std::logic_error("PsiFormer virtual-ratio transaction belongs to a different model");
   if (virtual_particles.getRefPS().isSpinor())
@@ -9349,20 +10283,7 @@ void PsiFormerWF::evaluateRatiosUnderRead(
 
   const std::size_t configurations = checkedBatchMemoryAdd(
       ratios.size(), 1, "PsiFormer virtual-ratio configuration count");
-  ValueType* staged_values = requirePlannedScalarValuePublication(
-      configurations, ratios.size(), "virtual ratios");
-  std::vector<ValueType> legacy_staged_ratios;
-  if (!staged_values)
-  {
-    legacy_staged_ratios.resize(ratios.size());
-    staged_values = legacy_staged_ratios.data();
-  }
-  const auto publish_ratios = [&]() {
-    if (batch_execution_plan_)
-      std::copy_n(staged_values, ratios.size(), ratios.begin());
-    else
-      ratios.swap(legacy_staged_ratios);
-  };
+  std::vector<ValueType> staged_ratios(ratios.size());
 
   if (transaction.state().direct_value_mode != DirectBackendMode::DIRECT)
   {
@@ -9374,11 +10295,11 @@ void PsiFormerWF::evaluateRatiosUnderRead(
       const pf::Result virtual_result = evaluatePositionsUnderRead(
           transaction, reference, electron, &virtual_particles.R[move],
           EvaluationPurpose::VALUE_ONLY);
-      staged_values[move] = makeRatio(
+      staged_ratios[move] = makeRatio(
           virtual_result.sign, virtual_result.logabs, reference_result.sign,
           reference_result.logabs);
     }
-    publish_ratios();
+    ratios.swap(staged_ratios);
     return;
   }
 
@@ -9397,11 +10318,11 @@ void PsiFormerWF::evaluateRatiosUnderRead(
   {
     if (result.parameter_version[move + 1] != parameter_version)
       throw std::logic_error("PsiFormer virtual-ratio batch observed inconsistent parameters");
-    staged_values[move] = makeRatio(
+    staged_ratios[move] = makeRatio(
         result.sign[move + 1], result.logabs[move + 1], result.sign[0],
         result.logabs[0]);
   }
-  publish_ratios();
+  ratios.swap(staged_ratios);
 }
 
 // Evaluate a descriptor-ordered virtual batch from one sparse reference per active walker.
@@ -9412,6 +10333,8 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
     const VirtualParticleBatch& virtual_batch,
     std::vector<ValueType>& ratios) const
 {
+  requireUnplannedMultiWalkerOperation(
+      "flattened virtual-ratio evaluation");
   if (this != std::addressof(wfc_list.getLeader()))
     throw std::invalid_argument(
         "PsiFormer mw_evaluateVirtualRatios must be invoked on the component-list leader");
@@ -9647,6 +10570,7 @@ void PsiFormerWF::mw_evaluateRatios(
     const RefVectorWithLeader<const VirtualParticleSet>& virtual_particle_list,
     std::vector<std::vector<ValueType>>& ratios) const
 {
+  requireUnplannedMultiWalkerOperation("ragged virtual-ratio evaluation");
   if (wfc_list.size() != virtual_particle_list.size() || wfc_list.size() != ratios.size())
     throw std::invalid_argument("PsiFormer mw_evaluateRatios list sizes do not match");
   if (wfc_list.empty())
@@ -9754,21 +10678,8 @@ void PsiFormerWF::evaluateDerivRatios(const VirtualParticleSet& virtual_particle
                                       std::vector<ValueType>& ratios,
                                       Matrix<ValueType>& derivative_ratios)
 {
+  requireUnplannedScalarDerivative("derivative-ratio evaluation");
   requireNoPlannedEcpScalarDispatch("scalar derivative-ratio evaluation");
-  if (optimization_metadata_->enabled)
-    requireUnplannedScalarDerivative("derivative-ratio evaluation");
-  else
-  {
-    if (ratios.size() !=
-        static_cast<std::size_t>(virtual_particles.getTotalNum()))
-      throw std::invalid_argument(
-          "PsiFormer virtual derivative-ratio output has the wrong shape");
-    const std::size_t configurations = checkedBatchMemoryAdd(
-        ratios.size(), 1,
-        "PsiFormer virtual derivative-ratio configuration count");
-    (void)requirePlannedScalarValuePublication(
-        configurations, ratios.size(), "virtual derivative ratios");
-  }
   PsiFormerDerivativeReadTransaction transaction(*model_state_, *optimization_metadata_);
   synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
   if (!optimization_metadata_->enabled || !transaction.hasActiveParameters())
@@ -9885,12 +10796,11 @@ void PsiFormerWF::evaluateDerivRatiosWeighted(const VirtualParticleSet& virtual_
                                               const std::vector<ValueType>& total_weights,
                                               ParameterDerivativeView weighted_derivatives)
 {
+  requireUnplannedScalarDerivative("weighted derivative-ratio evaluation");
   if (weighted_derivatives.size != 0 && weighted_derivatives.data == nullptr)
     throw std::invalid_argument("PsiFormer weighted derivative destination is null");
   requireNoPlannedEcpScalarDispatch(
       "scalar weighted derivative-ratio evaluation");
-  if (optimization_metadata_->enabled)
-    requireUnplannedScalarDerivative("weighted derivative-ratio evaluation");
   PsiFormerDerivativeReadTransaction transaction(*model_state_,
                                                   *optimization_metadata_);
   synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
@@ -9912,6 +10822,8 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualDerivRatio
     const std::vector<ValueType>& total_weights,
     const std::vector<ParameterDerivativeView>& weighted_derivatives) const
 {
+  requireUnplannedMultiWalkerOperation(
+      "flattened weighted derivative-ratio evaluation");
   if (this != std::addressof(wfc_list.getLeader()))
     throw std::invalid_argument(
         "PsiFormer flattened weighted reduction must be invoked on the component-list leader");
@@ -10345,6 +11257,8 @@ void PsiFormerWF::mw_evaluateDerivRatiosWeighted(
     const RefVector<const std::vector<ValueType>>& total_weights,
     const std::vector<ParameterDerivativeView>& weighted_derivatives) const
 {
+  requireUnplannedMultiWalkerOperation(
+      "batched weighted derivative-ratio evaluation");
   assert(this == &wfc_list.getLeader());
   if (wfc_list.size() != vp_list.size() || total_weights.size() != wfc_list.size() ||
       weighted_derivatives.size() != wfc_list.size())
@@ -10432,8 +11346,7 @@ void PsiFormerWF::evaluateSpinorDerivRatios(const VirtualParticleSet&,
 // Add only score derivatives, avoiding the mixed coordinate-jet reverse used for kinetic derivatives.
 void PsiFormerWF::evaluateDerivativesWF(ParticleSet& p, const OptVariables&, Vector<ValueType>& dlogpsi)
 {
-  if (optimization_metadata_->enabled)
-    requireUnplannedScalarDerivative("parameter-score evaluation");
+  requireUnplannedScalarDerivative("parameter-score evaluation");
   PsiFormerDerivativeReadTransaction transaction(*model_state_,
                                                   *optimization_metadata_);
   synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
@@ -10471,6 +11384,8 @@ void PsiFormerWF::mw_evaluateParameterDerivativesWF(
     const OptVariables&,
     RecordArray<ValueType>& dlogpsi) const
 {
+  requireUnplannedMultiWalkerOperation(
+      "batched parameter-score evaluation");
   assert(this == &wfc_list.getLeader());
   if (wfc_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wfc_list.size())
     throw std::invalid_argument("PsiFormer batched score outputs have inconsistent shapes");
@@ -10546,8 +11461,7 @@ void PsiFormerWF::evaluateDerivatives(ParticleSet& p,
                                       Vector<ValueType>& dlogpsi,
                                       Vector<ValueType>& dhpsioverpsi)
 {
-  if (optimization_metadata_->enabled)
-    requireUnplannedScalarDerivative("kinetic-parameter evaluation");
+  requireUnplannedScalarDerivative("kinetic-parameter evaluation");
   PsiFormerDerivativeReadTransaction transaction(*model_state_,
                                                   *optimization_metadata_);
   synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
@@ -10670,6 +11584,8 @@ void PsiFormerWF::mw_evaluateParameterDerivatives(
     RecordArray<ValueType>& dlogpsi,
     RecordArray<ValueType>& dhpsioverpsi) const
 {
+  requireUnplannedMultiWalkerOperation(
+      "batched kinetic-parameter evaluation");
   assert(this == &wfc_list.getLeader());
   if (wfc_list.size() != p_list.size() || dlogpsi.getNumOfEntries() != wfc_list.size() ||
       dhpsioverpsi.getNumOfEntries() != wfc_list.size() ||

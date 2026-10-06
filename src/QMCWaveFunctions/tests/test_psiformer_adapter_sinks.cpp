@@ -14,6 +14,7 @@
 
 #include "Particle/MCMultiParticleMoves.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "ResourceCollection.h"
@@ -209,6 +210,31 @@ struct PsiFormerAllocationCloneStorage
   bool exact_marker = false;
 };
 
+/** Complete persistent clone state frozen around a scalar allocation window. */
+struct PsiFormerScalarAllocationState
+{
+  PsiFormerWF::LogValue log_value;
+  std::size_t observed_parameter_version = 0;
+  bool restore_validation_pending = false;
+  bool accepted_value_valid = false;
+  ParticleSet::ParticleGradient accepted_gradient;
+  ParticleSet::ParticleLaplacian accepted_laplacian;
+  std::uint64_t accepted_configuration_identity = 0;
+  std::size_t accepted_parameter_version = 0;
+  std::uint64_t accepted_state_requirement = 0;
+  double current_sign = 0.0;
+  double proposed_sign = 0.0;
+  PsiFormerWF::LogValue proposed_log_value;
+  ParticleSet::ParticleGradient proposed_gradient;
+  ParticleSet::ParticleLaplacian proposed_laplacian;
+  std::uint64_t proposed_configuration_identity = 0;
+  std::uint64_t proposed_descriptor_fingerprint = 0;
+  std::size_t proposed_parameter_version = 0;
+  int proposed_particle = -1;
+  std::uint64_t proposal_origin = 0;
+  bool has_proposal = false;
+};
+
 /** Narrow friend seam for the component-only hard-plan allocation gate. */
 class TestPsiFormerVirtualBatch
 {
@@ -257,6 +283,32 @@ public:
              component.proposed_laplacian_.capacity()},
             component.hasPreparedBatchExecutionClone(
                 component.batch_execution_plan_)};
+  }
+
+  static PsiFormerScalarAllocationState scalarAllocationState(
+      const PsiFormerWF& component)
+  {
+    return {component.log_value_,
+            component.observed_parameter_version_,
+            component.restore_validation_pending_,
+            component.accepted_value_valid_,
+            component.accepted_gradient_,
+            component.accepted_laplacian_,
+            component.accepted_configuration_identity_,
+            component.accepted_parameter_version_,
+            static_cast<std::uint64_t>(
+                component.accepted_state_requirement_),
+            component.current_sign_,
+            component.proposed_sign_,
+            component.proposed_log_value_,
+            component.proposed_gradient_,
+            component.proposed_laplacian_,
+            component.proposed_configuration_identity_,
+            component.proposed_descriptor_fingerprint_,
+            component.proposed_parameter_version_,
+            component.proposed_particle_,
+            static_cast<std::uint64_t>(component.proposal_origin_),
+            component.has_proposal_};
   }
 
   static PsiFormerWorkspaceDiagnostics cloneWorkspaceDiagnostics(
@@ -523,7 +575,8 @@ struct PlannedAllocationCrowd
 std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
     PsiFormerWF& component, std::size_t walker_count,
     const std::string& participant_id,
-    std::size_t reserve_walker_count = 0)
+    std::size_t reserve_walker_count = 0,
+    bool include_scalar_value = false)
 {
   if (reserve_walker_count == 0)
     reserve_walker_count = walker_count;
@@ -532,6 +585,8 @@ std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
   component.contributeBatchExecutionRequirements(requirements);
   requirements.require(BatchExecutionMode::VALUE);
   requirements.require(BatchExecutionMode::ACTIVE_GRADIENT);
+  if (include_scalar_value)
+    requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
 
   BatchExecutionSelectionInput selection;
   selection.requirements                       = requirements;
@@ -633,6 +688,25 @@ void checkCloneWorkspaceUnchanged(
   CHECK(actual.batch_storage_fingerprint ==
         expected.batch_storage_fingerprint);
   CHECK(actual.batch_workspace_identity == expected.batch_workspace_identity);
+  CHECK(actual.scalar_value_publication_identity ==
+        expected.scalar_value_publication_identity);
+  CHECK(actual.scalar_value_publication_size ==
+        expected.scalar_value_publication_size);
+  CHECK(actual.scalar_value_publication_capacity ==
+        expected.scalar_value_publication_capacity);
+  CHECK(actual.prepared_scalar_value_compatibility ==
+        expected.prepared_scalar_value_compatibility);
+  CHECK(actual.prepared_batch_workspace_identity ==
+        expected.prepared_batch_workspace_identity);
+  CHECK(actual.prepared_batch_storage_fingerprint ==
+        expected.prepared_batch_storage_fingerprint);
+  CHECK(actual.prepared_batch_bytes == expected.prepared_batch_bytes);
+  CHECK(actual.prepared_scalar_value_publication_identity ==
+        expected.prepared_scalar_value_publication_identity);
+  CHECK(actual.prepared_scalar_value_publication_size ==
+        expected.prepared_scalar_value_publication_size);
+  CHECK(actual.prepared_scalar_value_publication_capacity ==
+        expected.prepared_scalar_value_publication_capacity);
 }
 
 void checkResourceStorageUnchanged(
@@ -758,6 +832,63 @@ bool sameVectorBits(const VectorType& actual, const VectorType& expected)
        std::memcmp(actual.data(), expected.data(),
                    actual.size() * sizeof(typename VectorType::value_type)) ==
            0);
+}
+
+std::vector<testing::PsiFormerScalarAllocationState>
+captureScalarAllocationStates(const PlannedAllocationCrowd& crowd)
+{
+  std::vector<testing::PsiFormerScalarAllocationState> states;
+  states.reserve(crowd.components.size());
+  for (const PsiFormerWF* component : crowd.components)
+    states.push_back(
+        testing::TestPsiFormerVirtualBatch::scalarAllocationState(*component));
+  return states;
+}
+
+void checkScalarAllocationStatesUnchanged(
+    const PlannedAllocationCrowd& crowd,
+    const std::vector<testing::PsiFormerScalarAllocationState>& expected)
+{
+  REQUIRE(crowd.components.size() == expected.size());
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+  {
+    const auto actual =
+        testing::TestPsiFormerVirtualBatch::scalarAllocationState(
+            *crowd.components[lane]);
+    const auto& reference = expected[lane];
+    CHECK(actual.log_value == reference.log_value);
+    CHECK(actual.observed_parameter_version ==
+          reference.observed_parameter_version);
+    CHECK(actual.restore_validation_pending ==
+          reference.restore_validation_pending);
+    CHECK(actual.accepted_value_valid == reference.accepted_value_valid);
+    CHECK(sameVectorBits(actual.accepted_gradient,
+                         reference.accepted_gradient));
+    CHECK(sameVectorBits(actual.accepted_laplacian,
+                         reference.accepted_laplacian));
+    CHECK(actual.accepted_configuration_identity ==
+          reference.accepted_configuration_identity);
+    CHECK(actual.accepted_parameter_version ==
+          reference.accepted_parameter_version);
+    CHECK(actual.accepted_state_requirement ==
+          reference.accepted_state_requirement);
+    CHECK(actual.current_sign == reference.current_sign);
+    CHECK(actual.proposed_sign == reference.proposed_sign);
+    CHECK(actual.proposed_log_value == reference.proposed_log_value);
+    CHECK(sameVectorBits(actual.proposed_gradient,
+                         reference.proposed_gradient));
+    CHECK(sameVectorBits(actual.proposed_laplacian,
+                         reference.proposed_laplacian));
+    CHECK(actual.proposed_configuration_identity ==
+          reference.proposed_configuration_identity);
+    CHECK(actual.proposed_descriptor_fingerprint ==
+          reference.proposed_descriptor_fingerprint);
+    CHECK(actual.proposed_parameter_version ==
+          reference.proposed_parameter_version);
+    CHECK(actual.proposed_particle == reference.proposed_particle);
+    CHECK(actual.proposal_origin == reference.proposal_origin);
+    CHECK(actual.has_proposal == reference.has_proposal);
+  }
 }
 
 struct ScalarObservation
@@ -1809,6 +1940,255 @@ TEST_CASE("PsiFormer warmed hard-plan active gradient freezes reserve storage",
   for (const PsiFormerWF* component : crowd.components)
     CHECK_FALSE(Probe::hasProposal(*component));
   checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+}
+
+TEST_CASE("PsiFormer warmed planned scalar VALUE calls freeze clone storage",
+          "[wavefunction][psiformer][allocation][batch_memory][scalar_value]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  constexpr std::size_t clone_count = 2;
+
+  GeneratedFiles files = generateFiles("lih");
+  setBackend("direct");
+  const SimulationCell simulation_cell;
+  PlannedAllocationCrowd crowd(files, simulation_cell, clone_count);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(crowd.walkers.front()->getTotalNum());
+  REQUIRE(electron_count >= 3);
+
+  // Establish nontrivial accepted state before plan binding.  Scalar VALUE
+  // queries must preserve it bit-for-bit on every prepared clone.
+  for (std::size_t lane = 0; lane < clone_count; ++lane)
+  {
+    crowd.walkers[lane]->G = Value(0);
+    crowd.walkers[lane]->L = Value(0);
+    crowd.components[lane]->evaluateLog(
+        *crowd.walkers[lane], crowd.walkers[lane]->G,
+        crowd.walkers[lane]->L);
+  }
+
+  const std::string participant_id =
+      "test/psiformer/planned-scalar-value-allocation";
+  const auto plan = makeAllocationPlan(
+      crowd.leader, clone_count, participant_id, clone_count, true);
+  bindAndPrepareAllocationCrowd(crowd, plan, participant_id);
+
+  // Keep the selected crowd owner acquired so the existing reconciliation
+  // helper can prove selected participant bytes equal independently measured
+  // resource plus clone bytes.  Neither scalar call consumes this resource.
+  ResourceCollection resource_template(
+      "psiformer_planned_scalar_value_allocation_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> resource_lock(
+      resource, crowd.wfc_list);
+
+  PsiFormerWF& component = *crowd.components.front();
+  ParticleSet& particles = *crowd.walkers.front();
+  particles.makeVirtualMoves(
+      ParticleSet::SingleParticlePos{0.37, -0.22, 0.41});
+
+  const Value sentinel(-1907.0);
+  std::vector<Value> all_to_one_ratios(electron_count, sentinel);
+  std::vector<std::unique_ptr<VirtualParticleSet>> virtual_particles;
+  std::vector<std::vector<Value>> virtual_ratios;
+  virtual_particles.reserve(electron_count + 1);
+  virtual_ratios.reserve(electron_count + 1);
+  for (std::size_t count = 0; count <= electron_count; ++count)
+  {
+    std::vector<ParticleSet::SingleParticlePos> displacements;
+    displacements.reserve(count);
+    for (std::size_t move = 0; move < count; ++move)
+    {
+      const double scale = static_cast<double>(move + 1);
+      displacements.emplace_back(0.025 * scale, -0.017 * scale,
+                                 0.013 * scale);
+    }
+    auto virtual_set = std::make_unique<VirtualParticleSet>(particles);
+    virtual_set->makeMoves(particles, 1, displacements);
+    virtual_particles.push_back(std::move(virtual_set));
+    virtual_ratios.emplace_back(count, sentinel);
+  }
+  const std::size_t interior_count = electron_count / 2;
+  REQUIRE(interior_count > 1);
+  REQUIRE(interior_count < electron_count);
+
+  // Warm the all-to-one envelope, every virtual logical prefix (including the
+  // constructible zero prefix), and alternating dense/sparse mode reuse before
+  // enabling allocation interposition.
+  component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+  for (std::size_t count = 0; count <= electron_count; ++count)
+    component.evaluateRatios(*virtual_particles[count],
+                             virtual_ratios[count]);
+  component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+  component.evaluateRatios(*virtual_particles[1], virtual_ratios[1]);
+  component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+  component.evaluateRatios(*virtual_particles[interior_count],
+                           virtual_ratios[interior_count]);
+  component.evaluateRatios(*virtual_particles[electron_count],
+                           virtual_ratios[electron_count]);
+
+  const PlannedAllocationFreeze frozen =
+      capturePlannedAllocationFreeze(crowd, resource);
+  const auto frozen_states = captureScalarAllocationStates(crowd);
+  REQUIRE(frozen_states.size() == clone_count);
+  for (const auto& state : frozen_states)
+  {
+    REQUIRE(state.accepted_value_valid);
+    REQUIRE_FALSE(state.has_proposal);
+  }
+  const std::size_t parameter_version = component.parameterVersion();
+  const std::size_t selected_transactions =
+      Probe::plannedSelectedTransactionCount(component);
+  const std::size_t single_transactions =
+      Probe::plannedSingleTransactionCount(component);
+  REQUIRE(selected_transactions == 0);
+  REQUIRE(single_transactions == 0);
+  REQUIRE(frozen.clone_workspaces.size() == clone_count);
+  for (const auto& diagnostics : frozen.clone_workspaces)
+  {
+    REQUIRE(diagnostics.owns_batch_workspace);
+    REQUIRE(diagnostics.has_prepared_clone_plan);
+    REQUIRE(diagnostics.prepared_scalar_value_compatibility);
+    REQUIRE(diagnostics.batch_workspace_identity != nullptr);
+    REQUIRE(diagnostics.batch_workspace_identity ==
+            diagnostics.prepared_batch_workspace_identity);
+    REQUIRE(diagnostics.batch_storage_fingerprint != 0);
+    REQUIRE(diagnostics.batch_storage_fingerprint ==
+            diagnostics.prepared_batch_storage_fingerprint);
+    REQUIRE(diagnostics.batch_bytes != 0);
+    REQUIRE(diagnostics.batch_bytes == diagnostics.prepared_batch_bytes);
+    REQUIRE(diagnostics.scalar_value_publication_identity != nullptr);
+    REQUIRE(diagnostics.scalar_value_publication_identity ==
+            diagnostics.prepared_scalar_value_publication_identity);
+    REQUIRE(diagnostics.scalar_value_publication_size == electron_count + 1);
+    REQUIRE(diagnostics.scalar_value_publication_capacity ==
+            electron_count + 1);
+    REQUIRE(diagnostics.scalar_value_publication_size ==
+            diagnostics.prepared_scalar_value_publication_size);
+    REQUIRE(diagnostics.scalar_value_publication_capacity ==
+            diagnostics.prepared_scalar_value_publication_capacity);
+    REQUIRE(diagnostics.scalar_value_publication_bytes ==
+            (electron_count + 1) * sizeof(Value));
+    REQUIRE(diagnostics.accountedBytes() ==
+            diagnostics.batch_bytes +
+                diagnostics.scalar_value_publication_bytes);
+  }
+  REQUIRE(frozen.clone_workspaces[0].batch_workspace_identity !=
+          frozen.clone_workspaces[1].batch_workspace_identity);
+  REQUIRE(frozen.clone_workspaces[0].scalar_value_publication_identity !=
+          frozen.clone_workspaces[1].scalar_value_publication_identity);
+  checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+
+  const auto check_frozen_state = [&] {
+    checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+    checkScalarAllocationStatesUnchanged(crowd, frozen_states);
+    CHECK(component.parameterVersion() == parameter_version);
+    CHECK(Probe::plannedSelectedTransactionCount(component) ==
+          selected_transactions);
+    CHECK(Probe::plannedSingleTransactionCount(component) ==
+          single_transactions);
+    for (const PsiFormerWF* clone : crowd.components)
+      CHECK_FALSE(Probe::hasProposal(*clone));
+  };
+
+  const auto check_ratios = [&](const std::vector<Value>& ratios,
+                                const Value* expected_data,
+                                std::size_t expected_capacity) {
+    CHECK(ratios.data() == expected_data);
+    CHECK(ratios.capacity() == expected_capacity);
+    bool has_nonunit_ratio = false;
+    for (const Value ratio : ratios)
+    {
+      CHECK(ratio != sentinel);
+      CHECK(std::isfinite(std::real(ratio)));
+      CHECK(std::isfinite(std::imag(ratio)));
+      has_nonunit_ratio = has_nonunit_ratio ||
+          std::abs(ratio - Value(1)) > 1.0e-10;
+    }
+    CHECK((ratios.empty() || has_nonunit_ratio));
+  };
+
+  const auto audit_scalar_call = [&](std::vector<Value>& ratios,
+                                     const char* scope,
+                                     auto&& operation) {
+    std::fill(ratios.begin(), ratios.end(), sentinel);
+    Value* const output_data = ratios.data();
+    const std::size_t output_size = ratios.size();
+    const std::size_t output_capacity = ratios.capacity();
+    const AllocationSnapshot allocations = auditAllocations(
+        std::forward<decltype(operation)>(operation));
+    checkNoAllocations(allocations, scope);
+    CHECK(ratios.size() == output_size);
+    check_ratios(ratios, output_data, output_capacity);
+    check_frozen_state();
+  };
+
+  audit_scalar_call(all_to_one_ratios, "planned scalar all-to-one Ne+1", [&] {
+    component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+  });
+  audit_scalar_call(virtual_ratios[0], "planned scalar virtual q=0", [&] {
+    component.evaluateRatios(*virtual_particles[0], virtual_ratios[0]);
+  });
+  audit_scalar_call(virtual_ratios[1], "planned scalar virtual q=1", [&] {
+    component.evaluateRatios(*virtual_particles[1], virtual_ratios[1]);
+  });
+  audit_scalar_call(
+      virtual_ratios[interior_count], "planned scalar virtual interior prefix",
+      [&] {
+        component.evaluateRatios(*virtual_particles[interior_count],
+                                 virtual_ratios[interior_count]);
+      });
+  audit_scalar_call(
+      virtual_ratios[electron_count], "planned scalar virtual q=Ne", [&] {
+        component.evaluateRatios(*virtual_particles[electron_count],
+                                 virtual_ratios[electron_count]);
+      });
+
+  // Repeatedly alternate the two public entry points and four virtual
+  // prefixes inside one window.  This catches allocation growth hidden by an
+  // individually warmed mode while retaining every caller allocation.
+  constexpr std::size_t alternating_output_count = 5;
+  const std::array<std::vector<Value>*, alternating_output_count>
+      alternating_outputs{
+      &all_to_one_ratios, &virtual_ratios[0], &virtual_ratios[1],
+      &virtual_ratios[interior_count], &virtual_ratios[electron_count]};
+  std::array<Value*, alternating_output_count> alternating_data{};
+  std::array<std::size_t, alternating_output_count> alternating_sizes{};
+  std::array<std::size_t, alternating_output_count> alternating_capacities{};
+  for (std::size_t output = 0; output < alternating_outputs.size(); ++output)
+  {
+    std::fill(alternating_outputs[output]->begin(),
+              alternating_outputs[output]->end(), sentinel);
+    alternating_data[output] = alternating_outputs[output]->data();
+    alternating_sizes[output] = alternating_outputs[output]->size();
+    alternating_capacities[output] = alternating_outputs[output]->capacity();
+  }
+  const AllocationSnapshot alternating_allocations = auditAllocations([&] {
+    for (int repetition = 0; repetition < 3; ++repetition)
+    {
+      component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+      component.evaluateRatios(*virtual_particles[0], virtual_ratios[0]);
+      component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+      component.evaluateRatios(*virtual_particles[1], virtual_ratios[1]);
+      component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+      component.evaluateRatios(*virtual_particles[interior_count],
+                               virtual_ratios[interior_count]);
+      component.evaluateRatiosAlltoOne(particles, all_to_one_ratios);
+      component.evaluateRatios(*virtual_particles[electron_count],
+                               virtual_ratios[electron_count]);
+    }
+  });
+  checkNoAllocations(alternating_allocations,
+                     "planned scalar alternating all-to-one/virtual");
+  for (std::size_t output = 0; output < alternating_outputs.size(); ++output)
+  {
+    CHECK(alternating_outputs[output]->size() == alternating_sizes[output]);
+    check_ratios(*alternating_outputs[output], alternating_data[output],
+                 alternating_capacities[output]);
+  }
+  check_frozen_state();
 }
 
 TEST_CASE("PsiFormer warmed planned one-electron transactions allocate no storage",
