@@ -48,6 +48,7 @@ set(QMCDRIVERS
     WFTrain/EnergyGradientAccumulator.cpp
     WFTrain/DistributedParameterReduction.cpp
     WFTrain/HighParameterTraining.cpp
+    WFTrain/TrainingCheckpoint.cpp
     Optimizers/DescentEngine.cpp
     Optimizers/HybridEngine.cpp
     WFOpt/QMCCostFunctionBase.cpp
