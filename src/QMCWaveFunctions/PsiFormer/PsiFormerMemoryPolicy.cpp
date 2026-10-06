@@ -36,6 +36,12 @@ bool scoreTapeRequired(const BatchExecutionRequirements& requirements) noexcept
       requirements.requires(BatchExecutionMode::ECP_WEIGHTED_SCORE);
 }
 
+bool walkerRecordRequired(const BatchExecutionRequirements& requirements) noexcept
+{
+  return requirements.requires(BatchExecutionMode::BUFFER_READ) ||
+      requirements.requires(BatchExecutionMode::BUFFER_WRITE);
+}
+
 void validateModeStructure(const BatchExecutionRequirements& requirements)
 {
   if (flattenedEcpRequired(requirements) &&
@@ -99,6 +105,7 @@ bool accountingIsComplete(const PsiFormerMemoryPolicyInput& input,
       input.active_parameter_count != 0;
   const bool resource_direct = value || full || active || ecp;
   const bool publication = resource_direct || score || kinetic;
+  const bool walker_record = walkerRecordRequired(requirements);
 
   bool complete = context.target_coordinate == BatchExecutionTargetCoordinate::POS_ONLY &&
       input.accounting_claims.clone_state &&
@@ -113,6 +120,8 @@ bool accountingIsComplete(const PsiFormerMemoryPolicyInput& input,
     complete = complete && input.accounting_claims.kinetic_tape;
   if (scalar)
     complete = complete && input.accounting_claims.scalar_value_compatibility;
+  if (walker_record)
+    complete = complete && input.accounting_claims.walker_record;
   if (ecp)
     complete = complete && input.flattened_ecp &&
         input.accounting_claims.flattened_ecp;
@@ -154,6 +163,16 @@ PsiFormerMemoryTopologySummary summarizePsiFormerMemoryTopology(
           "PsiFormer prepared crowd count");
   }
   return result;
+}
+
+pf::WalkerBufferLayout makePsiFormerWalkerBufferLayout(
+    const PsiFormerMemoryPolicyInput& input)
+{
+  return pf::walkerBufferLayoutRequirement(
+      input.storage_shape.electrons, input.type_sizes.value_type,
+      input.type_sizes.gradient_type,
+      input.type_sizes.full_precision_real_type,
+      input.walker_buffer_alignment);
 }
 
 BatchTileCapacities psiFormerBatchLogicalMaximum(
@@ -296,6 +315,10 @@ std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
 
   const bool scalar = context.requirements.requires(
       BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  const bool walker_record = walkerRecordRequired(context.requirements);
+  const pf::WalkerBufferLayout walker_buffer_layout =
+      walker_record ? makePsiFormerWalkerBufferLayout(input)
+                    : pf::WalkerBufferLayout{};
   pf::DirectBatchStorageRequirement scalar_storage;
   std::size_t scalar_publication_bytes = 0;
   if (scalar)
@@ -319,6 +342,7 @@ std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
     plan.reserve_walkers = reserves[crowd];
     plan.score_required = score;
     plan.kinetic_required = kinetic;
+    plan.walker_buffer_layout = walker_buffer_layout;
 
     addHostBytes(
         plan.expected_clone_storage, BatchMemoryCategory::FIXED_CLONE_STATE,
@@ -341,6 +365,15 @@ std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
           "PsiFormer scalar VALUE publication");
     }
 
+    if (walker_record)
+      addHostBytes(
+          plan.expected_external_walker_record_storage,
+          BatchMemoryCategory::PERSISTENT_WALKER_RECORD,
+          checkedBatchMemoryMultiply(
+              walker_buffer_layout.totalBytes(), plan.reserve_walkers,
+              "PsiFormer external walker-record multiplicity"),
+          "PsiFormer external walker-record storage");
+
     // Construct the canonical direct descriptor even for an empty reserve;
     // its zero tile distinguishes a prepared empty crowd from default legacy
     // workspace capacities.
@@ -356,6 +389,9 @@ std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
     {
       plan.expected_storage.add(plan.expected_clone_storage,
                                 "PsiFormer crowd clone storage");
+      plan.expected_storage.add(
+          plan.expected_external_walker_record_storage,
+          "PsiFormer crowd external walker-record storage");
       plans.push_back(std::move(plan));
       continue;
     }
@@ -418,6 +454,9 @@ std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
                               "PsiFormer crowd clone storage");
     plan.expected_storage.add(plan.expected_resource_storage,
                               "PsiFormer crowd resource storage");
+    plan.expected_storage.add(
+        plan.expected_external_walker_record_storage,
+        "PsiFormer crowd external walker-record storage");
     plans.push_back(std::move(plan));
   }
   return plans;

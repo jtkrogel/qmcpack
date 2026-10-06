@@ -55,6 +55,8 @@ enum class BatchMemoryCategory : std::size_t
   PUBLICATION_STAGING,
   RETAINED_HIGH_WATER,
   REALLOCATION_TRANSIENT,
+  /// Caller-owned walker records retained outside component and crowd-resource heaps.
+  PERSISTENT_WALKER_RECORD,
   COUNT
 };
 
@@ -70,7 +72,15 @@ enum class BatchExecutionMode : std::uint32_t
   ECP_WEIGHTED_SCORE         = 1U << 6,
   ECP_TMOVE_CANDIDATES       = 1U << 7,
   ECP_LISTENER_OUTPUT        = 1U << 8,
-  SCALAR_VALUE_COMPATIBILITY = 1U << 9
+  SCALAR_VALUE_COMPATIBILITY = 1U << 9,
+  /// Restore one component record from caller-owned walker storage.
+  BUFFER_READ                 = 1U << 10,
+  /// Register or refresh one component record in caller-owned walker storage.
+  BUFFER_WRITE                = 1U << 11,
+  /// Enter one validated component group lifecycle interval.
+  PREPARE_GROUP               = 1U << 12,
+  /// Complete one validated component update lifecycle interval.
+  COMPLETE_UPDATES            = 1U << 13
 };
 
 /** Exact target coordinate/move capability proved by the driver workload. */
@@ -285,7 +295,7 @@ struct BatchMemoryParticipantEvidence
 /** Complete pure input to deterministic tile selection. */
 struct BatchExecutionSelectionInput
 {
-  std::string schema_id{"batch-execution-memory-v3"};
+  std::string schema_id{"batch-execution-memory-v4"};
   BatchMemoryPolicy policy;
   BatchExecutionRequirements requirements;
   BatchExecutionTopology topology;

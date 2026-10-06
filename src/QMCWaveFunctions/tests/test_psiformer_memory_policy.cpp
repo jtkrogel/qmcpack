@@ -46,7 +46,8 @@ PsiFormerMemoryPolicyInput makePolicyInput()
   input.type_sizes =
       psiformer::makePsiFormerMemoryTypeSizes<
           double, double, std::complex<double>, std::array<double, 3>,
-          std::pair<std::size_t, double>>();
+          std::pair<std::size_t, double>, double>();
+  input.walker_buffer_alignment = QMC_SIMD_ALIGNMENT;
   input.accounting_claims = PsiFormerMemoryAccountingClaims::complete();
   return input;
 }
@@ -149,6 +150,184 @@ std::size_t densePublicationBytes(std::size_t walkers,
 }
 
 } // namespace
+
+TEST_CASE("PsiFormer external walker-record layout is exact and checked",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  const auto align_bytes = [](std::size_t bytes, std::size_t alignment) {
+    return ((bytes + alignment - 1) / alignment) * alignment;
+  };
+
+  const pf::WalkerBufferLayout real = pf::walkerBufferLayoutRequirement(
+      3, sizeof(double), sizeof(std::array<double, 3>), sizeof(double),
+      QMC_SIMD_ALIGNMENT);
+  const std::size_t expected_gradient = align_bytes(
+      3 * sizeof(std::array<double, 3>), QMC_SIMD_ALIGNMENT);
+  const std::size_t expected_laplacian =
+      align_bytes(3 * sizeof(double), QMC_SIMD_ALIGNMENT);
+  CHECK(real.schema_version == pf::WALKER_BUFFER_LAYOUT_SCHEMA_VERSION);
+  CHECK(real.electrons == 3);
+  CHECK(real.gradient_offset == 0);
+  CHECK(real.gradient_bytes == expected_gradient);
+  CHECK(real.laplacian_offset == expected_gradient);
+  CHECK(real.laplacian_bytes == expected_laplacian);
+  CHECK(real.bulk_bytes == expected_gradient + expected_laplacian);
+  CHECK(real.scalar_count == 17);
+  CHECK(real.scalar_bytes == 17 * sizeof(double));
+  CHECK(real.totalBytes() == real.bulk_bytes + real.scalar_bytes);
+  CHECK(real.alignment == QMC_SIMD_ALIGNMENT);
+  CHECK(real.fingerprint != 0);
+  CHECK(real == pf::walkerBufferLayoutRequirement(
+                    3, sizeof(double), sizeof(std::array<double, 3>),
+                    sizeof(double), QMC_SIMD_ALIGNMENT));
+
+  const pf::WalkerBufferLayout complex = pf::walkerBufferLayoutRequirement(
+      3, sizeof(std::complex<double>),
+      sizeof(std::array<std::complex<double>, 3>), sizeof(double),
+      QMC_SIMD_ALIGNMENT);
+  CHECK(complex.value_type_bytes == sizeof(std::complex<double>));
+  CHECK(complex.gradient_type_bytes ==
+        sizeof(std::array<std::complex<double>, 3>));
+  CHECK(complex.gradient_bytes ==
+        align_bytes(3 * sizeof(std::array<std::complex<double>, 3>),
+                    QMC_SIMD_ALIGNMENT));
+  CHECK(complex.laplacian_bytes ==
+        align_bytes(3 * sizeof(std::complex<double>), QMC_SIMD_ALIGNMENT));
+  CHECK(complex.totalBytes() ==
+        complex.gradient_bytes + complex.laplacian_bytes +
+            17 * sizeof(double));
+  CHECK(complex.fingerprint != real.fingerprint);
+
+  const pf::WalkerBufferLayout synthetic =
+      pf::walkerBufferLayoutRequirement(5, 3, 7, 5, 16);
+  CHECK(synthetic.gradient_bytes == 48);
+  CHECK(synthetic.laplacian_offset == 48);
+  CHECK(synthetic.laplacian_bytes == 16);
+  CHECK(synthetic.bulk_bytes == 64);
+  CHECK(synthetic.scalar_bytes == 85);
+  CHECK(synthetic.totalBytes() == 149);
+  CHECK(synthetic.fingerprint != 0);
+  CHECK(synthetic.fingerprint !=
+        pf::walkerBufferLayoutRequirement(5, 3, 8, 5, 16).fingerprint);
+  CHECK(synthetic.fingerprint !=
+        pf::walkerBufferLayoutRequirement(5, 3, 7, 4, 16).fingerprint);
+
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  CHECK_THROWS_AS(pf::walkerBufferLayoutRequirement(1, 0, 1, 1, 16),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(pf::walkerBufferLayoutRequirement(1, 1, 1, 1, 0),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(pf::walkerBufferLayoutRequirement(1, 1, 1, 1, 3),
+                  std::invalid_argument);
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(maximum, 1, 2, 1, 8),
+      "PsiFormer walker-buffer gradient extent overflowed");
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(maximum, 1, 1, 1, 8),
+      "PsiFormer walker-buffer alignment overflowed");
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(maximum, 2, 1, 1, 1),
+      "PsiFormer walker-buffer Laplacian extent overflowed");
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(maximum / 2, 2, 1, 1, 8),
+      "PsiFormer walker-buffer alignment overflowed");
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(maximum / 2 + 1, 1, 1, 1, 1),
+      "PsiFormer walker-buffer bulk extent overflowed");
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(maximum / 2, 1, 1, 1, 1),
+      "PsiFormer walker-buffer total extent overflowed");
+  CHECK_THROWS_WITH(
+      pf::walkerBufferLayoutRequirement(0, 1, 1, maximum, 8),
+      "PsiFormer walker-buffer scalar extent overflowed");
+}
+
+TEST_CASE("PsiFormer memory policy accounts external walker records separately",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  PsiFormerMemoryPolicyInput input = makePolicyInput();
+  BatchExecutionRequirements requirements;
+  requirements.require(BatchExecutionMode::BUFFER_READ);
+  const BatchExecutionPlanningContext context = makeContext(
+      input, requirements, {1, 0, 1}, {3, 0, 2}, {});
+  CHECK(context.logical_maximum == BatchTileCapacities{});
+
+  const pf::WalkerBufferLayout layout =
+      psiformer::makePsiFormerWalkerBufferLayout(input);
+  CHECK(input.type_sizes.full_precision_real_type == sizeof(double));
+  const std::vector<psiformer::PsiFormerCrowdMemoryPlan> plans =
+      psiformer::makePsiFormerCrowdMemoryPlans(input, context);
+  REQUIRE(plans.size() == 3);
+  CHECK(plans[0].walker_buffer_layout == layout);
+  CHECK(plans[1].walker_buffer_layout == layout);
+  CHECK(plans[2].walker_buffer_layout == layout);
+  CHECK(plans[0].expected_external_walker_record_storage.at(
+            BatchMemoryCategory::PERSISTENT_WALKER_RECORD).host ==
+        3 * layout.totalBytes());
+  CHECK(plans[1].expected_external_walker_record_storage.total().host == 0);
+  CHECK(plans[2].expected_external_walker_record_storage.at(
+            BatchMemoryCategory::PERSISTENT_WALKER_RECORD).host ==
+        2 * layout.totalBytes());
+  for (const psiformer::PsiFormerCrowdMemoryPlan& plan : plans)
+  {
+    CHECK(plan.expected_clone_storage.at(
+              BatchMemoryCategory::PERSISTENT_WALKER_RECORD).host == 0);
+    CHECK(plan.expected_resource_storage.at(
+              BatchMemoryCategory::PERSISTENT_WALKER_RECORD).host == 0);
+    CHECK(plan.expected_storage.at(
+              BatchMemoryCategory::PERSISTENT_WALKER_RECORD) ==
+          plan.expected_external_walker_record_storage.at(
+              BatchMemoryCategory::PERSISTENT_WALKER_RECORD));
+  }
+
+  const BatchMemoryContribution read =
+      psiformer::estimatePsiFormerBatchMemory(input, context);
+  CHECK(read.fully_accounted);
+  CHECK(hostBytes(read, BatchMemoryCategory::PERSISTENT_WALKER_RECORD) ==
+        5 * layout.totalBytes());
+
+  BatchExecutionRequirements read_write = requirements;
+  read_write.require(BatchExecutionMode::BUFFER_WRITE);
+  const BatchExecutionPlanningContext read_write_context = makeContext(
+      input, read_write, {1, 0, 1}, {3, 0, 2}, {});
+  CHECK(hostBytes(psiformer::estimatePsiFormerBatchMemory(
+                      input, read_write_context),
+                  BatchMemoryCategory::PERSISTENT_WALKER_RECORD) ==
+        5 * layout.totalBytes());
+
+  BatchExecutionRequirements write_only;
+  write_only.require(BatchExecutionMode::BUFFER_WRITE);
+  const BatchExecutionPlanningContext write_context = makeContext(
+      input, write_only, {1, 0, 1}, {3, 0, 2}, {});
+  const BatchMemoryContribution write =
+      psiformer::estimatePsiFormerBatchMemory(input, write_context);
+  CHECK(write.fully_accounted);
+  CHECK(hostBytes(write, BatchMemoryCategory::PERSISTENT_WALKER_RECORD) ==
+        5 * layout.totalBytes());
+
+  BatchExecutionRequirements lifecycle;
+  lifecycle.require(BatchExecutionMode::PREPARE_GROUP);
+  lifecycle.require(BatchExecutionMode::COMPLETE_UPDATES);
+  const BatchExecutionPlanningContext lifecycle_context = makeContext(
+      input, lifecycle, {1, 0, 1}, {3, 0, 2}, {});
+  const std::vector<psiformer::PsiFormerCrowdMemoryPlan> lifecycle_plans =
+      psiformer::makePsiFormerCrowdMemoryPlans(input, lifecycle_context);
+  for (const psiformer::PsiFormerCrowdMemoryPlan& plan : lifecycle_plans)
+  {
+    CHECK(plan.walker_buffer_layout.empty());
+    CHECK(plan.expected_external_walker_record_storage.total().host == 0);
+  }
+  CHECK(psiformer::estimatePsiFormerBatchMemory(
+            input, lifecycle_context).fully_accounted);
+
+  input.accounting_claims.walker_record = false;
+  CHECK_FALSE(psiformer::estimatePsiFormerBatchMemory(input, context)
+                  .fully_accounted);
+  CHECK_FALSE(psiformer::estimatePsiFormerBatchMemory(input, write_context)
+                  .fully_accounted);
+  CHECK(psiformer::estimatePsiFormerBatchMemory(input, lifecycle_context)
+            .fully_accounted);
+}
 
 TEST_CASE("PsiFormer memory policy discovers stable logical envelopes",
           "[wavefunction][psiformer][batch_memory]")
@@ -866,6 +1045,21 @@ TEST_CASE("PsiFormer memory policy checks every ownership extent",
   CHECK_THROWS_AS(
       psiformer::summarizePsiFormerMemoryTopology(mismatched),
       std::invalid_argument);
+
+  PsiFormerMemoryPolicyInput external_input = makePolicyInput();
+  external_input.storage_shape.electrons = 0;
+  BatchExecutionRequirements external_requirements;
+  external_requirements.require(BatchExecutionMode::BUFFER_WRITE);
+  const BatchExecutionPlanningContext external_context = makeContext(
+      external_input, external_requirements, {0}, {maximum}, {});
+  CHECK_THROWS_AS(
+      psiformer::makePsiFormerCrowdMemoryPlans(external_input,
+                                               external_context),
+      std::overflow_error);
+  CHECK_THROWS_AS(
+      psiformer::estimatePsiFormerBatchMemory(external_input,
+                                              external_context),
+      std::overflow_error);
 }
 
 } // namespace qmcplusplus

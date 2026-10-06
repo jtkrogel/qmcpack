@@ -12,6 +12,7 @@
 
 #include "Utilities/BatchExecutionMemory.h"
 
+#include <array>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -110,6 +111,14 @@ TEST_CASE("Batch execution memory checked arithmetic", "[utilities][batch_memory
   contribution.per_owner.add(BatchMemoryCategory::LOGICAL_INPUT_OUTPUT, {maximum, 0});
   contribution.owner_multiplicity = 2;
   CHECK_THROWS_AS(aggregateBatchMemoryContributions({{"overflow", contribution}}), std::overflow_error);
+
+  BatchMemoryEstimate external_record;
+  external_record.add(BatchMemoryCategory::PERSISTENT_WALKER_RECORD, {37, 0});
+  CHECK(external_record.at(BatchMemoryCategory::PERSISTENT_WALKER_RECORD) ==
+        BatchMemoryBytes{37, 0});
+  CHECK(external_record.total() == BatchMemoryBytes{37, 0});
+  CHECK(static_cast<std::size_t>(BatchMemoryCategory::PERSISTENT_WALKER_RECORD) + 1 ==
+        static_cast<std::size_t>(BatchMemoryCategory::COUNT));
 }
 
 TEST_CASE("Batch execution target coordinate evidence has distinct states", "[utilities][batch_memory]")
@@ -134,6 +143,27 @@ TEST_CASE("Batch execution logical maxima combine elementwise", "[utilities][bat
   BatchExecutionRequirements weighted_ecp;
   weighted_ecp.require(BatchExecutionMode::ECP_WEIGHTED_SCORE);
   CHECK(batchExecutionModeIsRequired(weighted_ecp, BatchExecutionMode::ECP_OUTER));
+
+  CHECK(static_cast<std::uint32_t>(BatchExecutionMode::BUFFER_READ) == (1U << 10));
+  CHECK(static_cast<std::uint32_t>(BatchExecutionMode::BUFFER_WRITE) == (1U << 11));
+  CHECK(static_cast<std::uint32_t>(BatchExecutionMode::PREPARE_GROUP) == (1U << 12));
+  CHECK(static_cast<std::uint32_t>(BatchExecutionMode::COMPLETE_UPDATES) == (1U << 13));
+  constexpr std::array<BatchExecutionMode, 4> independent_modes{
+      BatchExecutionMode::BUFFER_READ, BatchExecutionMode::BUFFER_WRITE,
+      BatchExecutionMode::PREPARE_GROUP, BatchExecutionMode::COMPLETE_UPDATES};
+  for (const BatchExecutionMode selected : independent_modes)
+  {
+    BatchExecutionRequirements exact;
+    exact.require(selected);
+    CHECK(exact.mask() == static_cast<std::uint32_t>(selected));
+    for (const BatchExecutionMode candidate : independent_modes)
+      CHECK(batchExecutionModeIsRequired(exact, candidate) ==
+            (candidate == selected));
+    CHECK_FALSE(batchExecutionModeIsRequired(exact, BatchExecutionMode::VALUE));
+    CHECK_FALSE(batchExecutionModeIsRequired(exact, BatchExecutionMode::FULL_VGL));
+    CHECK_FALSE(batchExecutionModeIsRequired(exact, BatchExecutionMode::ACTIVE_GRADIENT));
+    CHECK_FALSE(batchExecutionModeIsRequired(exact, BatchExecutionMode::ECP_OUTER));
+  }
 }
 
 TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][batch_memory]")
@@ -147,7 +177,7 @@ TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][
     CHECK(plan.selectedCapacities() == BatchTileCapacities{4, 4, 4, 4});
     CHECK(plan.selectedEstimate().total() == BatchMemoryBytes{260, 52});
     CHECK(plan.fixedMinimumEstimate().total() == BatchMemoryBytes{140, 28});
-    CHECK(plan.schemaId() == "batch-execution-memory-v3");
+    CHECK(plan.schemaId() == "batch-execution-memory-v4");
     CHECK(plan.particleCount() == 23);
     CHECK(plan.activeParameterCount() == 17);
     CHECK(plan.parameterDerivativeWidth() == 19);
@@ -241,6 +271,33 @@ TEST_CASE("Batch execution memory hard requests and logical modes", "[utilities]
     const BatchExecutionPlan value_plan =
         selectBatchExecutionPlan(value_only, makeProvider(equalSlopeEstimate));
     CHECK(value_plan.selectedCapacities() == BatchTileCapacities{4, 0, 0, 0});
+  }
+
+  SECTION("non-tunable buffer and lifecycle modes retain zero tile capacities")
+  {
+    constexpr std::array<BatchExecutionMode, 4> non_tunable_modes{
+        BatchExecutionMode::BUFFER_READ, BatchExecutionMode::BUFFER_WRITE,
+        BatchExecutionMode::PREPARE_GROUP,
+        BatchExecutionMode::COMPLETE_UPDATES};
+    std::array<std::uint64_t, non_tunable_modes.size()> fingerprints{};
+    for (std::size_t index = 0; index < non_tunable_modes.size(); ++index)
+    {
+      BatchExecutionSelectionInput non_tunable;
+      non_tunable.requirements.require(non_tunable_modes[index]);
+      non_tunable.logical_maximum      = {9, 9, 9, 9};
+      non_tunable.preference.preferred = {4, 4, 4, 4};
+      const BatchExecutionPlan mode_plan =
+          selectBatchExecutionPlan(non_tunable,
+                                   makeProvider(equalSlopeEstimate));
+      CHECK(mode_plan.requirements().mask() ==
+            static_cast<std::uint32_t>(non_tunable_modes[index]));
+      CHECK(mode_plan.minimumCapacities() == BatchTileCapacities{});
+      CHECK(mode_plan.selectedCapacities() == BatchTileCapacities{});
+      fingerprints[index] = mode_plan.fingerprint();
+    }
+    for (std::size_t left = 0; left < fingerprints.size(); ++left)
+      for (std::size_t right = left + 1; right < fingerprints.size(); ++right)
+        CHECK(fingerprints[left] != fingerprints[right]);
   }
 
   SECTION("scalar value compatibility alone activates the value capacity")
@@ -408,6 +465,32 @@ TEST_CASE("Batch execution memory plans have stable exact-content fingerprints",
     CHECK(original.selectedEstimate() == changed_order.selectedEstimate());
     CHECK(original.fingerprint() != changed_detail.fingerprint());
     CHECK(original.fingerprint() != changed_order.fingerprint());
+  }
+
+  SECTION("external walker-record category identity is fingerprinted")
+  {
+    BatchExecutionSelectionInput category_input;
+    category_input.requirements.require(BatchExecutionMode::BUFFER_READ);
+
+    const auto category_provider = [](BatchMemoryCategory category) {
+      return makeProvider([category](const BatchTileCapacities&) {
+        BatchMemoryEstimate estimate;
+        estimate.add(category, {37, 0});
+        return estimate;
+      });
+    };
+
+    const BatchExecutionPlan component_owned = selectBatchExecutionPlan(
+        category_input,
+        category_provider(BatchMemoryCategory::FIXED_CLONE_STATE));
+    const BatchExecutionPlan external = selectBatchExecutionPlan(
+        category_input,
+        category_provider(BatchMemoryCategory::PERSISTENT_WALKER_RECORD));
+    CHECK(component_owned.selectedEstimate().total() ==
+          external.selectedEstimate().total());
+    CHECK_FALSE(component_owned.selectedEstimate() ==
+                external.selectedEstimate());
+    CHECK(component_owned.fingerprint() != external.fingerprint());
   }
 }
 

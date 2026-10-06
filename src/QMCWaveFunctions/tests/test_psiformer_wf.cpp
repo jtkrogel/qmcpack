@@ -40,6 +40,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qmcplusplus
@@ -198,6 +199,36 @@ public:
                                                 bool enabled)
   {
     component.fail_clone_preparation_before_publish_for_testing_ = enabled;
+  }
+
+  /// Replace only the scalar prepared-layout evidence for exact predicate tests.
+  static void setPreparedWalkerBufferLayout(
+      PsiFormerWF& component, const pf::WalkerBufferLayout& layout) noexcept
+  {
+    component.prepared_walker_buffer_layout_ = layout;
+  }
+
+  /// Expose the private typed-operation mapping without exposing its private enum.
+  static BatchExecutionRequirements plannedWalkerOperationModes(
+      BatchExecutionMode mode) noexcept
+  {
+    switch (mode)
+    {
+    case BatchExecutionMode::BUFFER_READ:
+      return PsiFormerWF::plannedOperationRequiredModes(
+          PsiFormerWF::PlannedOperation::BUFFER_READ);
+    case BatchExecutionMode::BUFFER_WRITE:
+      return PsiFormerWF::plannedOperationRequiredModes(
+          PsiFormerWF::PlannedOperation::BUFFER_WRITE);
+    case BatchExecutionMode::PREPARE_GROUP:
+      return PsiFormerWF::plannedOperationRequiredModes(
+          PsiFormerWF::PlannedOperation::PREPARE_GROUP);
+    case BatchExecutionMode::COMPLETE_UPDATES:
+      return PsiFormerWF::plannedOperationRequiredModes(
+          PsiFormerWF::PlannedOperation::COMPLETE_UPDATES);
+    default:
+      return {};
+    }
   }
 
   /// Capture every scalar accepted/proposal field and its fixed backing store.
@@ -1012,6 +1043,8 @@ void checkScalarWorkspaceStorage(
         expected.prepared_scalar_value_publication_size);
   CHECK(actual.prepared_scalar_value_publication_capacity ==
         expected.prepared_scalar_value_publication_capacity);
+  CHECK(actual.prepared_walker_buffer_layout ==
+        expected.prepared_walker_buffer_layout);
   CHECK(actual.accountedBytes() == expected.accountedBytes());
   CHECK(actual.ownedWorkspaceCount() == expected.ownedWorkspaceCount());
 }
@@ -2022,6 +2055,278 @@ TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
   CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
   CHECK_FALSE(rebound.has_prepared_clone_plan);
   CHECK_FALSE(rebound.owns_batch_workspace);
+}
+
+TEST_CASE("PsiFormer prepares exact Boundary-32 walker layout evidence",
+          "[wavefunction][psiformer][batch_memory][walker_layout]")
+{
+  static_assert(noexcept(
+      std::declval<const PsiFormerWF&>().hasPreparedBatchExecutionClone(
+          std::declval<const BatchExecutionParticipantPlan&>())));
+
+  constexpr std::array<BatchExecutionMode, 4> planned_operations{
+      BatchExecutionMode::BUFFER_READ, BatchExecutionMode::BUFFER_WRITE,
+      BatchExecutionMode::PREPARE_GROUP,
+      BatchExecutionMode::COMPLETE_UPDATES};
+  for (const BatchExecutionMode mode : planned_operations)
+    CHECK(testing::TestPsiFormerWF::plannedWalkerOperationModes(mode).mask() ==
+          static_cast<std::uint32_t>(mode));
+
+  struct LayoutCase
+  {
+    const char* name;
+    bool buffer_read;
+    bool buffer_write;
+    bool prepare_group;
+    bool complete_updates;
+  };
+  constexpr std::array<LayoutCase, 6> cases{
+      LayoutCase{"read-only", true, false, false, false},
+      LayoutCase{"write-only", false, true, false, false},
+      LayoutCase{"read-write", true, true, false, false},
+      LayoutCase{"prepare-group-only", false, false, true, false},
+      LayoutCase{"complete-updates-only", false, false, false, true},
+      LayoutCase{"no-buffer-reference", false, false, false, false}};
+
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const ParticleSet reference_electrons = makeLiHElectrons(simulation_cell);
+  const std::size_t electron_count =
+      static_cast<std::size_t>(reference_electrons.getTotalNum());
+  const pf::WalkerBufferLayout build_layout =
+      pf::walkerBufferLayoutRequirement(
+          electron_count, sizeof(ValueType), sizeof(PsiFormerWF::GradType),
+          sizeof(QMCTraits::FullPrecRealType), QMC_SIMD_ALIGNMENT);
+  REQUIRE(build_layout.fingerprint != 0);
+  CHECK(build_layout.electrons == electron_count);
+  CHECK(build_layout.value_type_bytes == sizeof(ValueType));
+  CHECK(build_layout.gradient_type_bytes == sizeof(PsiFormerWF::GradType));
+  CHECK(build_layout.full_precision_real_type_bytes ==
+        sizeof(QMCTraits::FullPrecRealType));
+
+  for (std::size_t case_index = 0; case_index < cases.size(); ++case_index)
+  {
+    const LayoutCase& layout_case = cases[case_index];
+    CAPTURE(layout_case.name);
+    ParticleSet electrons = reference_electrons;
+    std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+    PsiFormerWF component("pf_walker_layout_" + std::to_string(case_index),
+                          files.parameters.string(),
+                          files.configuration.string(), true, {0, 1});
+    component.validateSystem(electrons, *ions, "all_electron");
+
+    BatchExecutionRequirements requirements;
+    component.contributeBatchExecutionRequirements(requirements);
+    if (layout_case.buffer_read)
+      requirements.require(BatchExecutionMode::BUFFER_READ);
+    if (layout_case.buffer_write)
+      requirements.require(BatchExecutionMode::BUFFER_WRITE);
+    if (layout_case.prepare_group)
+      requirements.require(BatchExecutionMode::PREPARE_GROUP);
+    if (layout_case.complete_updates)
+      requirements.require(BatchExecutionMode::COMPLETE_UPDATES);
+    CHECK(requirements.requires(BatchExecutionMode::BUFFER_READ) ==
+          layout_case.buffer_read);
+    CHECK(requirements.requires(BatchExecutionMode::BUFFER_WRITE) ==
+          layout_case.buffer_write);
+    CHECK(requirements.requires(BatchExecutionMode::PREPARE_GROUP) ==
+          layout_case.prepare_group);
+    CHECK(requirements.requires(BatchExecutionMode::COMPLETE_UPDATES) ==
+          layout_case.complete_updates);
+
+    const bool buffer_selected =
+        layout_case.buffer_read || layout_case.buffer_write;
+    const pf::WalkerBufferLayout expected_layout =
+        buffer_selected ? build_layout : pf::WalkerBufferLayout{};
+    const std::string participant_id =
+        "test/psiformer/walker-layout/" + std::to_string(case_index);
+    const auto plan = makeClonePreparationTestPlan(
+        component, requirements, participant_id,
+        "walker-layout-v" + std::to_string(case_index));
+    const BatchExecutionParticipantPlan participant_plan =
+        makeBatchExecutionParticipantPlan(plan, participant_id);
+
+    const BatchExecutionPlanningContext production_context{
+        requirements,
+        plan->topology(),
+        plan->logicalMaximum(),
+        plan->selectedCapacities(),
+        plan->particleCount(),
+        plan->activeParameterCount(),
+        plan->parameterDerivativeWidth(),
+        plan->targetCoordinate()};
+    CHECK_FALSE(component.estimateBatchExecutionMemory(production_context)
+                    .fully_accounted);
+    CHECK_FALSE(component.supportsAtomicBatchPublication());
+
+    component.bindBatchExecutionPlan(participant_plan);
+    const auto before_failure =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    const testing::PsiFormerScalarStateSnapshot component_before_failure =
+        testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    const ScalarParticleStateSnapshot particles_before_failure =
+        captureScalarParticleState(electrons);
+    CHECK(before_failure.prepared_walker_buffer_layout.empty());
+    CHECK_FALSE(before_failure.has_prepared_clone_plan);
+    CHECK_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+
+    testing::TestPsiFormerWF::failClonePreparationBeforePublish(component,
+                                                                 true);
+    CHECK_THROWS_AS(component.prepareBatchExecutionClone(participant_plan),
+                    std::bad_alloc);
+    testing::TestPsiFormerWF::failClonePreparationBeforePublish(component,
+                                                                 false);
+    const auto after_failure =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    checkScalarWorkspaceStorage(after_failure, before_failure);
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(
+        component, component_before_failure));
+    checkScalarParticleState(electrons, particles_before_failure);
+    CHECK_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+
+    component.prepareBatchExecutionClone(participant_plan);
+    const auto prepared =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    CHECK(prepared.has_prepared_clone_plan);
+    CHECK(component.hasPreparedBatchExecutionClone(participant_plan));
+    CHECK(prepared.prepared_walker_buffer_layout == expected_layout);
+    CHECK(prepared.prepared_walker_buffer_layout.empty() == !buffer_selected);
+    if (buffer_selected)
+      CHECK(prepared.prepared_walker_buffer_layout.fingerprint ==
+            build_layout.fingerprint);
+    CHECK(prepared.accountedBytes() == before_failure.accountedBytes());
+    CHECK(prepared.ownedWorkspaceCount() ==
+          before_failure.ownedWorkspaceCount());
+
+    const testing::PsiFormerScalarStateSnapshot component_before_repeat =
+        testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    component.prepareBatchExecutionClone(participant_plan);
+    const auto repeated =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    checkScalarWorkspaceStorage(repeated, prepared);
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(
+        component, component_before_repeat));
+
+    pf::WalkerBufferLayout corrupted_layout = expected_layout;
+    if (buffer_selected)
+      ++corrupted_layout.total_bytes;
+    else
+      corrupted_layout = build_layout;
+    testing::TestPsiFormerWF::setPreparedWalkerBufferLayout(
+        component, corrupted_layout);
+    bool corrupted_is_prepared = true;
+    CHECK_NOTHROW(corrupted_is_prepared =
+                      component.hasPreparedBatchExecutionClone(
+                          participant_plan));
+    CHECK_FALSE(corrupted_is_prepared);
+    testing::TestPsiFormerWF::setPreparedWalkerBufferLayout(
+        component, expected_layout);
+    CHECK(component.hasPreparedBatchExecutionClone(participant_plan));
+
+    std::unique_ptr<WaveFunctionComponent> clone_storage =
+        component.makeClone(electrons);
+    auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
+    REQUIRE(clone != nullptr);
+    CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(*clone));
+    const auto clone_diagnostics =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(*clone);
+    CHECK_FALSE(clone_diagnostics.has_prepared_clone_plan);
+    CHECK(clone_diagnostics.prepared_walker_buffer_layout.empty());
+    CHECK_FALSE(clone->hasPreparedBatchExecutionClone(participant_plan));
+    CHECK(clone_diagnostics.accountedBytes() == 0);
+    CHECK(clone_diagnostics.ownedWorkspaceCount() == 0);
+
+    PsiFormerWF::WFBufferType guarded_buffer;
+    PsiFormerWF::GradType buffer_gradient;
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      buffer_gradient[dimension] = ValueType(0.125 * (dimension + 1));
+    QMCTraits::FullPrecRealType buffer_scalar = -3.75;
+    guarded_buffer.add(&buffer_gradient, &buffer_gradient + 1);
+    guarded_buffer.add(buffer_scalar);
+    guarded_buffer.allocate();
+    guarded_buffer.rewind();
+    guarded_buffer.put(&buffer_gradient, &buffer_gradient + 1);
+    guarded_buffer.put(buffer_scalar);
+    const auto buffer_bulk_cursor   = guarded_buffer.current();
+    const auto buffer_scalar_cursor = guarded_buffer.current_scalar();
+    const auto buffer_storage       = guarded_buffer.myData;
+    const auto buffer_capacity      = guarded_buffer.myData.capacity();
+    const auto* buffer_data         = guarded_buffer.myData.data();
+    const auto* buffer_scalar_data  = guarded_buffer.Scalar_ptr;
+    const testing::PsiFormerScalarStateSnapshot component_before_guard =
+        testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    const ScalarParticleStateSnapshot particles_before_guard =
+        captureScalarParticleState(electrons);
+    const auto workspace_before_guard =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    const std::size_t parameter_version_before_guard =
+        component.parameterVersion();
+
+    const auto check_guarded_state = [&]() {
+      CHECK(testing::TestPsiFormerWF::scalarStateMatches(
+          component, component_before_guard));
+      checkScalarParticleState(electrons, particles_before_guard);
+      checkScalarWorkspaceStorage(
+          testing::TestPsiFormerWF::directWorkspaceDiagnostics(component),
+          workspace_before_guard);
+      CHECK(component.parameterVersion() == parameter_version_before_guard);
+      CHECK(guarded_buffer.current() == buffer_bulk_cursor);
+      CHECK(guarded_buffer.current_scalar() == buffer_scalar_cursor);
+      CHECK(guarded_buffer.myData.data() == buffer_data);
+      CHECK(guarded_buffer.myData.capacity() == buffer_capacity);
+      CHECK(guarded_buffer.Scalar_ptr == buffer_scalar_data);
+      REQUIRE(guarded_buffer.myData.size() == buffer_storage.size());
+      for (std::size_t byte = 0; byte < buffer_storage.size(); ++byte)
+        CHECK(guarded_buffer.myData[byte] == buffer_storage[byte]);
+    };
+    const auto expect_plan_guard = [&](auto&& operation) {
+      CHECK_THROWS_WITH(
+          operation(),
+          Catch::Matchers::ContainsSubstring(
+              "not admitted as a scalar operation by the explicit batch plan"));
+      check_guarded_state();
+    };
+
+    // Every Stage-1 runtime entry remains closed under every hard plan.  This
+    // covers the selected mode, a wrong mode, and the no-buffer reference plan.
+    expect_plan_guard(
+        [&]() { component.registerData(electrons, guarded_buffer); });
+    expect_plan_guard([&]() {
+      component.updateBuffer(electrons, guarded_buffer, false);
+    });
+    expect_plan_guard(
+        [&]() { component.copyFromBuffer(electrons, guarded_buffer); });
+    expect_plan_guard([&]() { component.prepareGroup(electrons, 0); });
+    expect_plan_guard([&]() { component.completeUpdates(); });
+    RefVectorWithLeader<WaveFunctionComponent> components(component,
+                                                           {component});
+    RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+    expect_plan_guard(
+        [&]() { component.mw_prepareGroup(components, particles, 0); });
+    expect_plan_guard([&]() { component.mw_completeUpdates(components); });
+
+    BatchExecutionParticipantPlan empty_plan;
+    component.validateBatchExecutionPlanBinding(empty_plan);
+    component.bindBatchExecutionPlan(empty_plan);
+    const auto cleared =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    CHECK_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+    CHECK_FALSE(cleared.has_prepared_clone_plan);
+    CHECK(cleared.prepared_walker_buffer_layout.empty());
+    CHECK(cleared.accountedBytes() == prepared.accountedBytes());
+    CHECK(cleared.ownedWorkspaceCount() == prepared.ownedWorkspaceCount());
+    CHECK_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+
+    component.bindBatchExecutionPlan(participant_plan);
+    const auto rebound =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+    CHECK_FALSE(rebound.has_prepared_clone_plan);
+    CHECK(rebound.prepared_walker_buffer_layout.empty());
+    CHECK(rebound.accountedBytes() == prepared.accountedBytes());
+    CHECK(rebound.ownedWorkspaceCount() == prepared.ownedWorkspaceCount());
+    CHECK_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+  }
 }
 
 TEST_CASE("PsiFormer planned scalar VALUE matches independent direct evaluation",

@@ -14,6 +14,7 @@
 
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "ResourceHandle.h"
 #include <array>
 #include <cstddef>
@@ -118,8 +119,13 @@ struct PsiFormerWorkspaceDiagnostics
   const void* prepared_scalar_value_publication_identity = nullptr;
   std::size_t prepared_scalar_value_publication_size = 0;
   std::size_t prepared_scalar_value_publication_capacity = 0;
+  /// Walker-record layout evidence for caller-owned storage; never component heap bytes.
+  pf::WalkerBufferLayout prepared_walker_buffer_layout;
 
-  /// Return all explicitly accounted clone-local evaluator scratch bytes.
+  /** Return all explicitly accounted clone-local evaluator scratch bytes.
+   * The prepared walker-record layout is evidence for caller-owned storage and
+   * deliberately contributes no component-owned bytes here.
+   */
   std::size_t accountedBytes() const noexcept
   {
     return value_bytes + full_spatial_bytes + active_spatial_bytes + batch_bytes +
@@ -127,7 +133,9 @@ struct PsiFormerWorkspaceDiagnostics
         scalar_value_publication_bytes;
   }
 
-  /// Return the number of independently owned native evaluator workspaces.
+  /** Return the number of independently owned native evaluator workspaces.
+   * The prepared walker layout describes no component-owned workspace.
+   */
   std::size_t ownedWorkspaceCount() const noexcept
   {
     return static_cast<std::size_t>(owns_value_workspace) +
@@ -1137,6 +1145,8 @@ private:
   BatchExecutionParticipantPlan batch_execution_plan_;
   /// Binding whose clone-local storage has completed exact preparation.
   BatchExecutionParticipantPlan prepared_clone_batch_execution_plan_;
+  /// Layout evidence for externally owned persistent walker-record regions.
+  pf::WalkerBufferLayout prepared_walker_buffer_layout_;
   /// Fixed allocation identities published immediately before the preparation marker.
   const GradType* prepared_accepted_gradient_data_ = nullptr;
   const ValueType* prepared_accepted_laplacian_data_ = nullptr;

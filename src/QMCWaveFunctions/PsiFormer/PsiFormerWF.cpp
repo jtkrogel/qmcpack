@@ -203,12 +203,6 @@ constexpr std::uint64_t VIRTUAL_VALUE_FINGERPRINT_DOMAIN =
 /// Identify the fixed scalar record layout used by the Stage-8 walker buffer.
 constexpr std::uint64_t WALKER_BUFFER_MAGIC = UINT64_C(0x505349464f524d38);
 
-/// Version the persistent accepted-state layout independently of VP persistence.
-constexpr std::uint64_t WALKER_BUFFER_SCHEMA_VERSION = 1;
-
-/// Number of exact scalar slots occupied by one complete accepted-state header.
-constexpr std::size_t WALKER_BUFFER_SCALAR_COUNT = 17;
-
 /// Mix one byte into a deterministic persistent-state fingerprint.
 void mixPersistentByte(std::uint64_t& hash, std::uint8_t byte) noexcept
 {
@@ -2424,7 +2418,8 @@ psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() 
   input.storage_shape.parameter_count  = model_state_->execution_plan.parameterCount();
   input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
       ValueType, PsiValue, LogValue, GradType,
-      SelectedDerivativeDelta::value_type>();
+      SelectedDerivativeDelta::value_type, FullPrecRealType>();
+  input.walker_buffer_alignment = QMC_SIMD_ALIGNMENT;
   input.backends.value   = memoryPolicyBackend(model_state_->direct_value_mode);
   input.backends.spatial = memoryPolicyBackend(model_state_->direct_spatial_mode);
   input.backends.score   = memoryPolicyBackend(model_state_->direct_score_mode);
@@ -2510,34 +2505,49 @@ bool PsiFormerWF::hasPreparedBatchExecutionClone(
       proposed_laplacian_.capacity() != electron_count)
     return false;
 
-  const bool scalar_selected = plan.plan().requirements().requires(
-      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
-  if (!scalar_selected)
-    return !prepared_scalar_value_compatibility_ && !direct_batch_workspace_ &&
-        scalar_value_publication_.empty() &&
-        scalar_value_publication_.capacity() == 0 &&
-        prepared_batch_workspace_identity_ == nullptr &&
-        prepared_batch_storage_fingerprint_ == 0 &&
-        prepared_batch_bytes_ == 0 &&
-        prepared_scalar_value_publication_data_ == nullptr &&
-        prepared_scalar_value_publication_size_ == 0 &&
-        prepared_scalar_value_publication_capacity_ == 0;
-
-  if (!prepared_scalar_value_compatibility_ || !direct_batch_workspace_ ||
-      direct_batch_workspace_.get() != prepared_batch_workspace_identity_ ||
-      !direct_batch_workspace_->hasCapacityPlan())
-    return false;
-
   // The public preparation predicate is noexcept.  Treat malformed byte or
   // capacity evidence as an unprepared clone rather than allowing an
   // accounting helper's checked arithmetic to escape.
   try
   {
+    const BatchExecutionRequirements& requirements =
+        plan.plan().requirements();
+    const bool scalar_selected = requirements.requires(
+        BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+    const bool walker_buffer_selected =
+        requirements.requires(BatchExecutionMode::BUFFER_READ) ||
+        requirements.requires(BatchExecutionMode::BUFFER_WRITE);
     const psiformer::PsiFormerMemoryPolicyInput input =
         makeBatchMemoryPolicyInput();
+    const pf::WalkerBufferLayout expected_walker_buffer_layout =
+        walker_buffer_selected
+        ? psiformer::makePsiFormerWalkerBufferLayout(input)
+        : pf::WalkerBufferLayout{};
+    if (prepared_walker_buffer_layout_ != expected_walker_buffer_layout ||
+        (walker_buffer_selected &&
+         prepared_walker_buffer_layout_.fingerprint == 0))
+      return false;
+
+    if (!scalar_selected)
+      return !prepared_scalar_value_compatibility_ &&
+          !direct_batch_workspace_ && scalar_value_publication_.empty() &&
+          scalar_value_publication_.capacity() == 0 &&
+          prepared_batch_workspace_identity_ == nullptr &&
+          prepared_batch_storage_fingerprint_ == 0 &&
+          prepared_batch_bytes_ == 0 &&
+          prepared_scalar_value_publication_data_ == nullptr &&
+          prepared_scalar_value_publication_size_ == 0 &&
+          prepared_scalar_value_publication_capacity_ == 0;
+
+    if (!prepared_scalar_value_compatibility_ || !direct_batch_workspace_ ||
+        direct_batch_workspace_.get() !=
+            prepared_batch_workspace_identity_ ||
+        !direct_batch_workspace_->hasCapacityPlan())
+      return false;
+
     const pf::DirectBatchCapacityPlan expected_capacity =
         psiformer::makePsiFormerScalarValueCapacityPlan(
-            input, plan.plan().requirements(),
+            input, requirements,
             plan.plan().selectedCapacities());
     const pf::DirectBatchStorageRequirement expected_storage =
         pf::directBatchStorageRequirement(input.storage_shape,
@@ -2663,6 +2673,7 @@ void PsiFormerWF::bindBatchExecutionPlan(
     // later unplanned scalar request is not constrained by stale capacities.
     batch_execution_plan_ = {};
     prepared_clone_batch_execution_plan_ = {};
+    prepared_walker_buffer_layout_ = {};
     prepared_accepted_gradient_data_ = nullptr;
     prepared_accepted_laplacian_data_ = nullptr;
     prepared_proposed_gradient_data_ = nullptr;
@@ -2695,6 +2706,7 @@ void PsiFormerWF::bindBatchExecutionPlan(
     // water.  Drop recomputable scratch before publishing the first hard plan;
     // subsequent exact preparation can then allocate without overlap.
     prepared_clone_batch_execution_plan_ = {};
+    prepared_walker_buffer_layout_ = {};
     prepared_accepted_gradient_data_ = nullptr;
     prepared_accepted_laplacian_data_ = nullptr;
     prepared_proposed_gradient_data_ = nullptr;
@@ -2785,6 +2797,13 @@ void PsiFormerWF::prepareBatchExecutionClone(
           input, plan.requirements(), plan.selectedCapacities());
   const bool scalar_value = plan.requirements().requires(
       BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  const bool walker_buffer_selected =
+      plan.requirements().requires(BatchExecutionMode::BUFFER_READ) ||
+      plan.requirements().requires(BatchExecutionMode::BUFFER_WRITE);
+  const pf::WalkerBufferLayout prepared_walker_buffer_layout =
+      walker_buffer_selected
+      ? psiformer::makePsiFormerWalkerBufferLayout(input)
+      : pf::WalkerBufferLayout{};
 
   if (prepared_clone_batch_execution_plan_)
   {
@@ -2954,6 +2973,8 @@ void PsiFormerWF::prepareBatchExecutionClone(
   prepared_scalar_value_publication_size_ = prepared_publication_size;
   prepared_scalar_value_publication_capacity_ =
       prepared_publication_capacity;
+  static_assert(std::is_nothrow_copy_assignable_v<pf::WalkerBufferLayout>);
+  prepared_walker_buffer_layout_ = prepared_walker_buffer_layout;
   static_assert(std::is_nothrow_copy_assignable_v<BatchExecutionParticipantPlan>);
   // The plan view is the validity marker and is deliberately published last.
   prepared_clone_batch_execution_plan_ = participant_plan;
@@ -3360,14 +3381,22 @@ BatchExecutionRequirements PsiFormerWF::plannedOperationRequiredModes(
   case PlannedOperation::SCALAR_VALUE_COMPATIBILITY:
     modes.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
     break;
+  case PlannedOperation::BUFFER_READ:
+    modes.require(BatchExecutionMode::BUFFER_READ);
+    break;
+  case PlannedOperation::BUFFER_WRITE:
+    modes.require(BatchExecutionMode::BUFFER_WRITE);
+    break;
+  case PlannedOperation::PREPARE_GROUP:
+    modes.require(BatchExecutionMode::PREPARE_GROUP);
+    break;
+  case PlannedOperation::COMPLETE_UPDATES:
+    modes.require(BatchExecutionMode::COMPLETE_UPDATES);
+    break;
   case PlannedOperation::ACCEPT_REJECT_VALUE:
   case PlannedOperation::SINGLE_CANCEL:
   case PlannedOperation::SELECTED_RESOLVE:
   case PlannedOperation::SELECTED_CANCEL:
-  case PlannedOperation::BUFFER_READ:
-  case PlannedOperation::BUFFER_WRITE:
-  case PlannedOperation::PREPARE_GROUP:
-  case PlannedOperation::COMPLETE_UPDATES:
     break;
   }
   return modes;
@@ -3615,7 +3644,11 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
            BatchExecutionMode::ECP_WEIGHTED_SCORE,
            BatchExecutionMode::ECP_TMOVE_CANDIDATES,
            BatchExecutionMode::ECP_LISTENER_OUTPUT,
-           BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY})
+           BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY,
+           BatchExecutionMode::BUFFER_READ,
+           BatchExecutionMode::BUFFER_WRITE,
+           BatchExecutionMode::PREPARE_GROUP,
+           BatchExecutionMode::COMPLETE_UPDATES})
     if (operation_modes.requires(mode) &&
         !plan.requirements().requires(mode))
       throw std::invalid_argument(
@@ -4134,6 +4167,8 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
       prepared_scalar_value_publication_size_;
   diagnostics.prepared_scalar_value_publication_capacity =
       prepared_scalar_value_publication_capacity_;
+  diagnostics.prepared_walker_buffer_layout =
+      prepared_walker_buffer_layout_;
   diagnostics.accepted_spatial_bytes =
       accepted_gradient_.capacity() * sizeof(GradType) +
       accepted_laplacian_.capacity() * sizeof(ValueType);
@@ -4881,7 +4916,7 @@ void PsiFormerWF::putAcceptedState(WFBufferType& buffer) const
   buffer.put(accepted_gradient_.data(), accepted_gradient_.data() + accepted_gradient_.size());
   buffer.put(accepted_laplacian_.data(), accepted_laplacian_.data() + accepted_laplacian_.size());
   putPersistentInteger(buffer, WALKER_BUFFER_MAGIC);
-  putPersistentInteger(buffer, WALKER_BUFFER_SCHEMA_VERSION);
+  putPersistentInteger(buffer, pf::WALKER_BUFFER_LAYOUT_SCHEMA_VERSION);
   putPersistentInteger(buffer, static_cast<std::uint64_t>(accepted_state_requirement_));
   putPersistentInteger(buffer, model_state_->persistent_model_identity);
   putPersistentInteger(buffer, static_cast<std::uint64_t>(accepted_parameter_version_));
@@ -4942,7 +4977,7 @@ void PsiFormerWF::getAcceptedState(const ParticleSet& particles,
     invalidateParameterCaches(parameter_version);
     throw std::runtime_error("PsiFormer walker buffer magic does not match");
   }
-  if (schema != WALKER_BUFFER_SCHEMA_VERSION)
+  if (schema != pf::WALKER_BUFFER_LAYOUT_SCHEMA_VERSION)
   {
     invalidateParameterCaches(parameter_version);
     throw std::runtime_error("PsiFormer walker buffer schema is unsupported");
@@ -9818,7 +9853,7 @@ void PsiFormerWF::registerData(ParticleSet& particles, WFBufferType& buffer)
   buffer.add(accepted_gradient_.data(), accepted_gradient_.data() + accepted_gradient_.size());
   buffer.add(accepted_laplacian_.data(), accepted_laplacian_.data() + accepted_laplacian_.size());
   double placeholder = 0.0;
-  for (std::size_t scalar = 0; scalar < WALKER_BUFFER_SCALAR_COUNT; ++scalar)
+  for (std::size_t scalar = 0; scalar < pf::WALKER_BUFFER_SCALAR_COUNT; ++scalar)
     buffer.add(placeholder);
 }
 

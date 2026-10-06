@@ -8,14 +8,18 @@
 /** @file PsiFormerStorageRequirements.h
  * @brief Checked numeric-storage descriptors shared by direct PsiFormer workspaces.
  *
- * These descriptors count owned numeric backing storage, not C++ object overhead,
+ * Most descriptors count owned numeric backing storage, not C++ object overhead,
  * allocator metadata, stacks, immutable model parameters, or caller-owned outputs.
- * Keeping the extent arithmetic beside the corresponding workspace allocation code
- * gives the batch-memory policy a deterministic estimate without constructing scratch.
+ * WalkerBufferLayout is the explicit exception: it accounts a caller-owned external
+ * record without treating those bytes as component-owned storage.  Keeping the extent
+ * arithmetic beside the corresponding allocation contracts gives the batch-memory
+ * policy a deterministic estimate without constructing scratch.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_STORAGE_REQUIREMENTS_H
 #define QMCPLUSPLUS_PSIFORMER_STORAGE_REQUIREMENTS_H
+
+#include <config.h>
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerGeometry.h"
@@ -62,6 +66,170 @@ inline void addStorageBytes(std::size_t& total,
                             const char* quantity)
 {
   total = checkedStorageSum(total, bytes, quantity);
+}
+
+/// Number of full-precision scalar elements in one persistent PsiFormer record.
+inline constexpr std::size_t WALKER_BUFFER_SCALAR_COUNT = 17;
+
+/// Version of the persistent component record represented by WalkerBufferLayout.
+inline constexpr std::uint64_t WALKER_BUFFER_LAYOUT_SCHEMA_VERSION = 1;
+
+/** Exact component region reserved in caller-owned PooledMemory for one walker.
+ *
+ * Bulk cursor advances are aligned independently, while the scalar cursor advances
+ * in full-precision elements.  ``total_bytes`` is an accounting quantity only: the
+ * bulk and scalar regions occupy distinct logical address spaces in PooledMemory.
+ */
+struct WalkerBufferLayout
+{
+  std::uint64_t schema_version               = 0;
+  std::size_t electrons                      = 0;
+  std::size_t value_type_bytes               = 0;
+  std::size_t gradient_type_bytes            = 0;
+  std::size_t full_precision_real_type_bytes = 0;
+  std::size_t alignment                      = 0;
+  std::size_t gradient_offset                = 0;
+  /// Aligned bulk-cursor advance occupied by the gradient payload.
+  std::size_t gradient_bytes                 = 0;
+  std::size_t laplacian_offset               = 0;
+  /// Aligned bulk-cursor advance occupied by the Laplacian payload.
+  std::size_t laplacian_bytes                = 0;
+  std::size_t bulk_bytes                     = 0;
+  std::size_t scalar_count                   = 0;
+  std::size_t scalar_bytes                   = 0;
+  std::size_t total_bytes                    = 0;
+  std::uint64_t fingerprint                  = 0;
+
+  /// Return whether this descriptor contains no prepared record layout.
+  bool empty() const noexcept { return fingerprint == 0; }
+
+  /// Return the combined accounting extent of the distinct bulk and scalar regions.
+  std::size_t totalBytes() const noexcept { return total_bytes; }
+
+  /// Compare every immutable record-layout and identity field.
+  friend bool operator==(const WalkerBufferLayout& lhs,
+                         const WalkerBufferLayout& rhs) noexcept
+  {
+    return lhs.schema_version == rhs.schema_version &&
+        lhs.electrons == rhs.electrons &&
+        lhs.value_type_bytes == rhs.value_type_bytes &&
+        lhs.gradient_type_bytes == rhs.gradient_type_bytes &&
+        lhs.full_precision_real_type_bytes ==
+            rhs.full_precision_real_type_bytes &&
+        lhs.alignment == rhs.alignment &&
+        lhs.gradient_offset == rhs.gradient_offset &&
+        lhs.gradient_bytes == rhs.gradient_bytes &&
+        lhs.laplacian_offset == rhs.laplacian_offset &&
+        lhs.laplacian_bytes == rhs.laplacian_bytes &&
+        lhs.bulk_bytes == rhs.bulk_bytes &&
+        lhs.scalar_count == rhs.scalar_count &&
+        lhs.scalar_bytes == rhs.scalar_bytes &&
+        lhs.total_bytes == rhs.total_bytes &&
+        lhs.fingerprint == rhs.fingerprint;
+  }
+
+  /// Compare complete walker-record layout descriptors for inequality.
+  friend bool operator!=(const WalkerBufferLayout& lhs,
+                         const WalkerBufferLayout& rhs) noexcept
+  {
+    return !(lhs == rhs);
+  }
+};
+
+/** Round one byte extent exactly as canonical PooledMemory storage does.
+ * PooledMemory's allocator alignment is a nonzero power of two; preserving that
+ * invariant here keeps synthetic descriptors representative of live buffers.
+ */
+inline std::size_t checkedWalkerBufferAlignment(std::size_t bytes,
+                                                std::size_t alignment)
+{
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0)
+    throw std::invalid_argument(
+        "PsiFormer walker-buffer alignment must be a nonzero power of two");
+  const std::size_t remainder = bytes % alignment;
+  return remainder == 0
+      ? bytes
+      : checkedStorageSum(bytes, alignment - remainder,
+                          "PsiFormer walker-buffer alignment overflowed");
+}
+
+namespace walker_buffer_detail
+{
+/// Mix one byte into the stable walker-record layout fingerprint.
+inline void mixByte(std::uint64_t& hash, std::uint8_t byte) noexcept
+{
+  hash ^= byte;
+  hash *= 1099511628211ULL;
+}
+
+/// Mix one fixed-width integer into the stable walker-record layout fingerprint.
+inline void mixInteger(std::uint64_t& hash, std::uint64_t value) noexcept
+{
+  for (unsigned shift = 0; shift < 64; shift += 8)
+    mixByte(hash, static_cast<std::uint8_t>((value >> shift) & 0xffU));
+}
+} // namespace walker_buffer_detail
+
+/** Build the checked persistent-record layout for one PsiFormer component.
+ *
+ * Explicit element widths make the formula testable for real, complex-adapter,
+ * and synthetic representations without allocating a PooledMemory object.
+ */
+inline WalkerBufferLayout walkerBufferLayoutRequirement(
+    std::size_t electrons,
+    std::size_t value_type_bytes,
+    std::size_t gradient_type_bytes,
+    std::size_t full_precision_real_type_bytes,
+    std::size_t alignment = QMC_SIMD_ALIGNMENT)
+{
+  checkedWalkerBufferAlignment(0, alignment);
+  if (value_type_bytes == 0 || gradient_type_bytes == 0 ||
+      full_precision_real_type_bytes == 0)
+    throw std::invalid_argument(
+        "PsiFormer walker-buffer element widths must be positive");
+
+  WalkerBufferLayout result;
+  result.schema_version = WALKER_BUFFER_LAYOUT_SCHEMA_VERSION;
+  result.electrons = electrons;
+  result.value_type_bytes = value_type_bytes;
+  result.gradient_type_bytes = gradient_type_bytes;
+  result.full_precision_real_type_bytes = full_precision_real_type_bytes;
+  result.alignment = alignment;
+  result.gradient_offset = 0;
+  result.gradient_bytes = checkedWalkerBufferAlignment(
+      checkedStorageProduct(
+          electrons, gradient_type_bytes,
+          "PsiFormer walker-buffer gradient extent overflowed"),
+      alignment);
+  result.laplacian_offset = result.gradient_bytes;
+  result.laplacian_bytes = checkedWalkerBufferAlignment(
+      checkedStorageProduct(
+          electrons, value_type_bytes,
+          "PsiFormer walker-buffer Laplacian extent overflowed"),
+      alignment);
+  result.bulk_bytes = checkedStorageSum(
+      result.gradient_bytes, result.laplacian_bytes,
+      "PsiFormer walker-buffer bulk extent overflowed");
+  result.scalar_count = WALKER_BUFFER_SCALAR_COUNT;
+  result.scalar_bytes = checkedStorageProduct(
+      result.scalar_count, full_precision_real_type_bytes,
+      "PsiFormer walker-buffer scalar extent overflowed");
+  result.total_bytes = checkedStorageSum(
+      result.bulk_bytes, result.scalar_bytes,
+      "PsiFormer walker-buffer total extent overflowed");
+
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (const std::size_t value : {
+           static_cast<std::size_t>(result.schema_version), result.electrons,
+           result.value_type_bytes, result.gradient_type_bytes,
+           result.full_precision_real_type_bytes, result.alignment,
+           result.gradient_offset, result.gradient_bytes,
+           result.laplacian_offset, result.laplacian_bytes,
+           result.bulk_bytes, result.scalar_count, result.scalar_bytes,
+           result.total_bytes})
+    walker_buffer_detail::mixInteger(hash, value);
+  result.fingerprint = hash == 0 ? 1 : hash;
+  return result;
 }
 
 /// Fixed model dimensions needed by allocation-free storage estimators.

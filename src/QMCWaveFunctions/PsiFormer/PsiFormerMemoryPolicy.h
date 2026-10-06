@@ -37,11 +37,12 @@ enum class PsiFormerMemoryBackend : std::uint8_t
 /** Actual build-dependent element widths at the PsiFormerWF ownership boundary. */
 struct PsiFormerMemoryTypeSizes
 {
-  std::size_t value_type             = 0;
-  std::size_t psi_value_type         = 0;
-  std::size_t log_value_type         = 0;
-  std::size_t gradient_type          = 0;
-  std::size_t selected_delta_element = 0;
+  std::size_t value_type               = 0;
+  std::size_t psi_value_type           = 0;
+  std::size_t log_value_type           = 0;
+  std::size_t gradient_type            = 0;
+  std::size_t selected_delta_element   = 0;
+  std::size_t full_precision_real_type = 0;
 };
 
 /** Construct build-exact widths without exposing the corresponding types here. */
@@ -49,11 +50,13 @@ template<class ValueType,
          class PsiValueType,
          class LogValueType,
          class GradientType,
-         class SelectedDeltaElement>
+         class SelectedDeltaElement,
+         class FullPrecisionRealType = double>
 constexpr PsiFormerMemoryTypeSizes makePsiFormerMemoryTypeSizes() noexcept
 {
   return {sizeof(ValueType), sizeof(PsiValueType), sizeof(LogValueType),
-          sizeof(GradientType), sizeof(SelectedDeltaElement)};
+          sizeof(GradientType), sizeof(SelectedDeltaElement),
+          sizeof(FullPrecisionRealType)};
 }
 
 /** Backends selected for the four independently dispatched native families. */
@@ -80,10 +83,11 @@ struct PsiFormerMemoryAccountingClaims
   bool kinetic_tape               = false;
   bool flattened_ecp              = false;
   bool scalar_value_compatibility = false;
+  bool walker_record              = false;
 
   static constexpr PsiFormerMemoryAccountingClaims complete() noexcept
   {
-    return {true, true, true, true, true, true, true};
+    return {true, true, true, true, true, true, true, true};
   }
 };
 
@@ -103,6 +107,9 @@ struct PsiFormerMemoryPolicyInput
    */
   std::size_t scalar_value_logical_maximum = 0;
 
+  /** Byte alignment used by PooledMemory for independent bulk cursor advances. */
+  std::size_t walker_buffer_alignment = 0;
+
   /** The admitted nonlocal path uses sparse flattened references/replacements. */
   bool flattened_ecp = true;
 };
@@ -116,10 +123,10 @@ struct PsiFormerMemoryTopologySummary
 
 /** Exact allocation and accounting target for one rank-local crowd.
  *
- * Zero-reserve crowds retain their topology identity but have empty capacity
- * and storage descriptors.  ``expected_storage`` includes the fixed state of
- * every clone in the crowd as well as its shared resource storage, so summing
- * these records reproduces the complete rank-local owner estimate.
+ * Zero-reserve crowds retain their topology identity and canonical metadata but
+ * have empty owned capacities and storage.  ``expected_storage`` includes fixed
+ * clone state, shared crowd-resource storage, and caller-owned external records,
+ * so summing these records reproduces the complete rank-local policy estimate.
  */
 struct PsiFormerCrowdMemoryPlan
 {
@@ -130,6 +137,8 @@ struct PsiFormerCrowdMemoryPlan
   pf::ResourceStagingCapacityPlan publication_staging;
   pf::DirectBatchStorageRequirement direct_storage;
   pf::ResourceStagingStorageRequirement publication_storage;
+  /** Metadata-only descriptor for externally owned bulk and scalar record regions. */
+  pf::WalkerBufferLayout walker_buffer_layout;
 
   bool score_required   = false;
   bool kinetic_required = false;
@@ -141,7 +150,9 @@ struct PsiFormerCrowdMemoryPlan
   BatchMemoryEstimate expected_clone_storage;
   /** Shared crowd-resource storage, suitable for exact post-prepare checks. */
   BatchMemoryEstimate expected_resource_storage;
-  /** Checked sum of clone and resource storage used by rank-level policy. */
+  /** Caller-owned persistent records, never clone or crowd-resource actual bytes. */
+  BatchMemoryEstimate expected_external_walker_record_storage;
+  /** Checked sum of clone, resource, and external storage used by rank policy. */
   BatchMemoryEstimate expected_storage;
 };
 
@@ -152,6 +163,10 @@ const std::vector<std::size_t>& psiFormerReserveWalkersPerCrowd(
 /** Return checked rank-local walker and nonempty-resource multiplicities. */
 PsiFormerMemoryTopologySummary summarizePsiFormerMemoryTopology(
     const BatchExecutionTopology& topology);
+
+/** Return the checked, build-exact external walker-record layout. */
+pf::WalkerBufferLayout makePsiFormerWalkerBufferLayout(
+    const PsiFormerMemoryPolicyInput& input);
 
 /** Return candidate-independent component maxima; PsiFormer never supplies ECP_OUTER. */
 BatchTileCapacities psiFormerBatchLogicalMaximum(

@@ -345,7 +345,9 @@ bool batchExecutionModeIsRequired(const BatchExecutionRequirements& requirements
                                   BatchExecutionMode mode) noexcept
 {
   // Scalar compatibility shares the ordinary VALUE tile, while all flattened
-  // nonlocal-ECP products share the outer replacement tile.
+  // nonlocal-ECP products share the outer replacement tile.  Buffer and
+  // lifecycle modes are deliberately independent and therefore fall through
+  // to their exact requirement bit below.
   if (mode == BatchExecutionMode::VALUE)
     return requirements.requires(BatchExecutionMode::VALUE) ||
         requirements.requires(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
