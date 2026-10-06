@@ -10,6 +10,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/ConstantOrbital.h"
@@ -268,10 +269,15 @@ public:
   PsiValue ratio(ParticleSet&, int) override { return 1.0; }
   GradType evalGrad(ParticleSet&, int) override { return GradType(0.0); }
   PsiValue ratioGrad(ParticleSet&, int, GradType&) override { return 1.0; }
-  void registerData(ParticleSet&, WFBufferType&) override {}
+  void registerData(ParticleSet&, WFBufferType&) override
+  { ++register_data_calls_; }
   LogValue updateBuffer(ParticleSet&, WFBufferType&, bool = false) override
-  { return 0.0; }
-  void copyFromBuffer(ParticleSet&, WFBufferType&) override {}
+  {
+    ++update_buffer_calls_;
+    return 0.0;
+  }
+  void copyFromBuffer(ParticleSet&, WFBufferType&) override
+  { ++copy_from_buffer_calls_; }
   void evaluateDerivatives(ParticleSet&,
                            const OptVariables&,
                            Vector<ValueType>&,
@@ -453,6 +459,12 @@ public:
   std::size_t prepareCalls() const noexcept { return prepare_calls_; }
   std::size_t acquireCalls() const noexcept { return acquire_calls_; }
   std::size_t releaseCalls() const noexcept { return release_calls_; }
+  std::size_t registerDataCalls() const noexcept
+  { return register_data_calls_; }
+  std::size_t updateBufferCalls() const noexcept
+  { return update_buffer_calls_; }
+  std::size_t copyFromBufferCalls() const noexcept
+  { return copy_from_buffer_calls_; }
 
 private:
   static std::uint64_t makeTopologyToken(std::string_view class_name,
@@ -498,6 +510,9 @@ private:
   std::size_t prepare_calls_                            = 0;
   mutable std::size_t acquire_calls_                   = 0;
   mutable std::size_t release_calls_                   = 0;
+  std::size_t register_data_calls_                     = 0;
+  std::size_t update_buffer_calls_                     = 0;
+  std::size_t copy_from_buffer_calls_                  = 0;
   BatchExecutionParticipantPlan bound_plan_;
   BatchExecutionParticipantPlan prepared_plan_;
   std::uint64_t topology_token_          = 0;
@@ -717,6 +732,82 @@ TEST_CASE("TrialWaveFunction batch plan binding is aggregate-atomic",
   wavefunction.bindBatchExecutionPlan(nullptr);
   CHECK(component_ptr->bindCalls() == null_bind_count + 1);
   wavefunction.addComponent(std::make_unique<ConstantOrbital>());
+}
+
+TEST_CASE("TrialWaveFunction planned walker-buffer aggregate entries fail first",
+          "[wavefunction][batch_memory][walker_transaction]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "buffer-entry-guard");
+  auto component = std::make_unique<PlanningComponent>(
+      "BufferGuard", "sole", BatchExecutionMode::VALUE,
+      BatchTileCapacities{4, 0, 0, 0}, 17);
+  PlanningComponent* component_ptr = component.get();
+  wavefunction.addComponent(std::move(component));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(
+      wavefunction);
+  wavefunction.bindBatchExecutionPlan(
+      makePlan(wavefunction, "buffer-entry-guard-v1", 2));
+
+  const SimulationCell simulation_cell;
+  ParticleSet particles(simulation_cell);
+  particles.setName("buffer_guard_particles");
+  particles.create({4});
+  for (std::size_t particle = 0; particle < particles.G.size(); ++particle)
+  {
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      particles.G[particle][dimension] =
+          QMCTraits::ValueType(0.125 * (1 + 3 * particle + dimension));
+    particles.L[particle] = QMCTraits::ValueType(-0.25 * (1 + particle));
+  }
+  const ParticleSet::ParticleGradient gradients_before = particles.G;
+  const ParticleSet::ParticleLaplacian laplacians_before = particles.L;
+
+  TrialWaveFunction::WFBufferType buffer;
+  TrialWaveFunction::GradType prefix_gradient;
+  prefix_gradient = QMCTraits::ValueType(0.75);
+  QMCTraits::FullPrecRealType prefix_scalar = 2.5;
+  buffer.add(&prefix_gradient, &prefix_gradient + 1);
+  buffer.add(prefix_scalar);
+  const std::size_t bulk_cursor_before = buffer.current();
+  const std::size_t scalar_cursor_before = buffer.current_scalar();
+  const std::size_t size_before = buffer.myData.size();
+  const std::size_t capacity_before = buffer.myData.capacity();
+
+  const auto check_unchanged = [&]() {
+    CHECK(buffer.current() == bulk_cursor_before);
+    CHECK(buffer.current_scalar() == scalar_cursor_before);
+    CHECK(buffer.myData.size() == size_before);
+    CHECK(buffer.myData.capacity() == capacity_before);
+    REQUIRE(particles.G.size() == gradients_before.size());
+    REQUIRE(particles.L.size() == laplacians_before.size());
+    for (std::size_t particle = 0; particle < particles.G.size(); ++particle)
+    {
+      for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+        CHECK(particles.G[particle][dimension] ==
+              gradients_before[particle][dimension]);
+      CHECK(particles.L[particle] == laplacians_before[particle]);
+    }
+    CHECK(component_ptr->registerDataCalls() == 0);
+    CHECK(component_ptr->updateBufferCalls() == 0);
+    CHECK(component_ptr->copyFromBufferCalls() == 0);
+  };
+
+  CHECK_THROWS_WITH(
+      wavefunction.registerData(particles, buffer),
+      Catch::Matchers::ContainsSubstring(
+          "planned aggregate walker-buffer ownership is deferred"));
+  check_unchanged();
+  CHECK_THROWS_WITH(
+      wavefunction.copyFromBuffer(particles, buffer),
+      Catch::Matchers::ContainsSubstring(
+          "planned aggregate walker-buffer ownership is deferred"));
+  check_unchanged();
+  CHECK_THROWS_WITH(
+      wavefunction.updateBuffer(particles, buffer, false),
+      Catch::Matchers::ContainsSubstring(
+          "planned aggregate walker-buffer ownership is deferred"));
+  check_unchanged();
 }
 
 TEST_CASE("TrialWaveFunction hard planning rejects multiple components",

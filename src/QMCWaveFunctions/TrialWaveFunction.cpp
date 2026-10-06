@@ -2450,6 +2450,9 @@ void TrialWaveFunction::getPhases(std::vector<RealType>& pvals)
 
 void TrialWaveFunction::registerData(ParticleSet& P, WFBufferType& buf)
 {
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        "TrialWaveFunction planned aggregate walker-buffer ownership is deferred");
   ScopedTimer local_timer(TWF_timers_[BUFFER_TIMER]);
   //save the current position
   BufferCursor        = buf.current();
@@ -2480,6 +2483,9 @@ void TrialWaveFunction::debugOnlyCheckBuffer(WFBufferType& buffer)
 
 TrialWaveFunction::RealType TrialWaveFunction::updateBuffer(ParticleSet& P, WFBufferType& buf, bool fromscratch)
 {
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        "TrialWaveFunction planned aggregate walker-buffer ownership is deferred");
   ScopedTimer local_timer(TWF_timers_[BUFFER_TIMER]);
   P.G = 0.0;
   P.L = 0.0;
@@ -2506,6 +2512,9 @@ TrialWaveFunction::RealType TrialWaveFunction::updateBuffer(ParticleSet& P, WFBu
 
 void TrialWaveFunction::copyFromBuffer(ParticleSet& P, WFBufferType& buf)
 {
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        "TrialWaveFunction planned aggregate walker-buffer ownership is deferred");
   ScopedTimer local_timer(TWF_timers_[BUFFER_TIMER]);
   buf.rewind(BufferCursor, BufferCursor_scalar);
   for (int i = 0; i < Z.size(); ++i)

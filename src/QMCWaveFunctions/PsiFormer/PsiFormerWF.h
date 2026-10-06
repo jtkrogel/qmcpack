@@ -803,6 +803,15 @@ private:
     PREPARED_STORAGE_EVIDENCE
   };
 
+  /// Select one final buffer-transaction failure after every Phase-B check.
+  enum class PlannedWalkerBufferLateFaultForTesting
+  {
+    NONE,
+    REGISTER,
+    RESTORE,
+    REFRESH
+  };
+
   /// Classify a completely validated persistent component record.
   enum class WalkerBufferRecordClassification : std::uint8_t
   {
@@ -839,8 +848,9 @@ private:
     std::uint64_t input_fingerprint = 0;
   };
 
-  /** Hold checked nonowning byte ranges and decoded persistent metadata.
-   * No pointer in this view is dereferenced as a typed object.
+  /** Hold checked nonowning byte ranges and optionally decoded metadata.
+   * WRITE uses only the ranges and raw content identity; no pointer in this
+   * view is dereferenced as a typed object.
    */
   struct WalkerBufferRecordView
   {
@@ -866,6 +876,14 @@ private:
     std::uint64_t content_fingerprint = 0;
     WalkerBufferRecordClassification classification =
         WalkerBufferRecordClassification::MALFORMED;
+  };
+
+  /// Retain the complete no-allocation evidence for one cache-reuse refresh.
+  struct WalkerBufferRefreshEvidence
+  {
+    std::uint64_t input_fingerprint = 0;
+    std::size_t parameter_version   = 0;
+    LogValue log_value              = LogValue(0);
   };
 
   /// Select one transient malformed snapshot or nonowning range for unit tests.
@@ -1144,6 +1162,10 @@ private:
       WFBufferType& buffer,
       PlannedWalkerBufferBetweenPhaseFaultForTesting fault);
 
+  /// Select or clear one true late failure in a public buffer transaction.
+  void setPlannedWalkerBufferLateFaultForTesting(
+      PlannedWalkerBufferLateFaultForTesting fault) noexcept;
+
   /// Exercise one reversible malformed snapshot or range through production checks.
   void probePlannedWalkerBufferFaultForTesting(
       const ParticleSet& particles,
@@ -1255,6 +1277,11 @@ private:
   static WalkerBufferCursorSnapshot fingerprintWalkerBufferCursorSnapshot(
       WalkerBufferCursorSnapshot snapshot) noexcept;
 
+  /// Form checked destination ranges without interpreting their old contents.
+  WalkerBufferRecordView makePlannedWalkerBufferRecordView(
+      const ParticleSet& particles,
+      WalkerBufferCursorSnapshot snapshot) const;
+
   /// Decode and classify one complete record without mutating either cursor.
   WalkerBufferRecordView parsePlannedWalkerBufferRecord(
       const ParticleSet& particles,
@@ -1270,10 +1297,35 @@ private:
       const ParticleSet& particles,
       const WalkerBufferRecordView& record) const;
 
+  /// Validate and fingerprint one complete cache-reuse refresh input set.
+  WalkerBufferRefreshEvidence requirePlannedWalkerBufferRefreshInputs(
+      const ParticleSet& particles,
+      std::size_t parameter_version) const;
+
+  /// Reject aliasing among ParticleSet outputs and component spatial caches.
+  void requireDisjointPlannedWalkerBufferRefresh(
+      const ParticleSet& particles) const;
+
+  /// Require a repeat observation to preserve every Phase-A cursor identity.
+  static void requireSameWalkerBufferCursorObservation(
+      const WalkerBufferCursorSnapshot& expected,
+      const WalkerBufferCursorSnapshot& observed);
+
   /// Require an exact Phase-B match to one earlier cursor and record observation.
   static void requireSameWalkerBufferObservation(
       const WalkerBufferRecordView& expected,
       const WalkerBufferRecordView& observed);
+
+  /// Reserve a planned persistent record without touching allocated storage.
+  void registerDataPlanned(ParticleSet& particles, WFBufferType& buffer);
+
+  /// Restore one checked planned record under authoritative model ownership.
+  void copyFromBufferPlanned(ParticleSet& particles, WFBufferType& buffer);
+
+  /// Write one current accepted cache through the planned no-evaluation route.
+  LogValue updateBufferPlanned(ParticleSet& particles,
+                               WFBufferType& buffer,
+                               bool from_scratch);
 
   /// Serialize the complete accepted-state record at the current buffer cursor.
   void putAcceptedState(WFBufferType& buffer) const;
@@ -1355,6 +1407,10 @@ private:
   PlannedScalarValueFaultForTesting
       planned_scalar_value_fault_for_testing_ =
           PlannedScalarValueFaultForTesting::NONE;
+  /// Inject a final failure after one walker-buffer transaction's Phase B.
+  PlannedWalkerBufferLateFaultForTesting
+      planned_walker_buffer_late_fault_for_testing_ =
+          PlannedWalkerBufferLateFaultForTesting::NONE;
   /// Substitute a finite maximum contribution to exercise additive overflow.
   bool force_planned_ratio_gradient_overflow_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.

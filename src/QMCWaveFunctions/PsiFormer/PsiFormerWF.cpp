@@ -212,6 +212,10 @@ constexpr std::uint64_t WALKER_BUFFER_INPUT_FINGERPRINT_DOMAIN =
 constexpr std::uint64_t WALKER_BUFFER_CONTENT_FINGERPRINT_DOMAIN =
     UINT64_C(0x5053465742433031); // "PSFWBC01"
 
+/// Keep cache-reuse inputs disjoint from storage and persistent record hashes.
+constexpr std::uint64_t WALKER_BUFFER_REFRESH_FINGERPRINT_DOMAIN =
+    UINT64_C(0x5053465742523031); // "PSFWBR01"
+
 /// Identify the fixed scalar record layout used by the Stage-8 walker buffer.
 constexpr std::uint64_t WALKER_BUFFER_MAGIC = UINT64_C(0x505349464f524d38);
 
@@ -447,6 +451,42 @@ T loadWalkerBufferValue(const char* source) noexcept
   T value;
   std::memcpy(std::addressof(value), source, sizeof(T));
   return value;
+}
+
+/// Store one trivially copyable value in an already validated character range.
+template<class T>
+void storeWalkerBufferValue(char* destination, const T& value) noexcept
+{
+  static_assert(std::is_trivially_copyable_v<T>);
+  std::memcpy(destination, std::addressof(value), sizeof(T));
+}
+
+/// Encode one uint64 as two exact full-precision scalar limbs without a cursor.
+void storePersistentInteger(char* scalar_data,
+                            std::size_t scalar,
+                            std::uint64_t value) noexcept
+{
+  using FullPrecRealType = QMCTraits::FullPrecRealType;
+  static_assert(std::numeric_limits<FullPrecRealType>::digits >= 32);
+  const FullPrecRealType low = static_cast<FullPrecRealType>(
+      value & UINT64_C(0xffffffff));
+  const FullPrecRealType high =
+      static_cast<FullPrecRealType>(value >> 32);
+  storeWalkerBufferValue(
+      scalar_data + scalar * sizeof(FullPrecRealType), low);
+  storeWalkerBufferValue(
+      scalar_data + (scalar + 1) * sizeof(FullPrecRealType), high);
+}
+
+/// Mix one trivially copyable object's exact representation into a fingerprint.
+template<class T>
+void mixPersistentObject(std::uint64_t& hash, const T& value) noexcept
+{
+  static_assert(std::is_trivially_copyable_v<T>);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(
+      std::addressof(value));
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte)
+    mixPersistentByte(hash, bytes[byte]);
 }
 
 /// Return whether every byte in one validated range is the canonical zero byte.
@@ -5450,9 +5490,9 @@ void PsiFormerWF::requireDisjointWalkerBufferRecord(
       "PsiFormer planned walker buffer aliases ParticleSet spin storage");
 }
 
-// Decode and classify one complete record without touching either PooledMemory cursor.
+// Form exact nonowning record ranges without requiring old destination bytes to be valid.
 PsiFormerWF::WalkerBufferRecordView
-PsiFormerWF::parsePlannedWalkerBufferRecord(
+PsiFormerWF::makePlannedWalkerBufferRecordView(
     const ParticleSet& particles,
     WalkerBufferCursorSnapshot snapshot) const
 {
@@ -5491,6 +5531,8 @@ PsiFormerWF::parsePlannedWalkerBufferRecord(
 
   requireDisjointWalkerBufferRecord(particles, record);
 
+  // Content is part of Phase-B destination identity even for WRITE, but no
+  // WRITE preflight interprets or classifies these freely overwritable bytes.
   std::uint64_t content_hash = PERSISTENT_FINGERPRINT_OFFSET;
   mixPersistentInteger(content_hash,
                        WALKER_BUFFER_CONTENT_FINGERPRINT_DOMAIN);
@@ -5502,6 +5544,18 @@ PsiFormerWF::parsePlannedWalkerBufferRecord(
     mixPersistentByte(content_hash,
                       static_cast<unsigned char>(record.scalar_data[byte]));
   record.content_fingerprint = content_hash == 0 ? 1 : content_hash;
+  return record;
+}
+
+// Decode and classify one complete record without touching either PooledMemory cursor.
+PsiFormerWF::WalkerBufferRecordView
+PsiFormerWF::parsePlannedWalkerBufferRecord(
+    const ParticleSet& particles,
+    WalkerBufferCursorSnapshot snapshot) const
+{
+  WalkerBufferRecordView record =
+      makePlannedWalkerBufferRecordView(particles, std::move(snapshot));
+  const pf::WalkerBufferLayout& layout = prepared_walker_buffer_layout_;
 
   const bool zero_bulk = walkerBufferBytesAreZero(
       record.gradient_data, layout.bulk_bytes);
@@ -5623,13 +5677,11 @@ PsiFormerWF::classifyPlannedWalkerBufferRecord(
   return record;
 }
 
-// Require a repeat observation to preserve every Phase-A identity and record bit.
-void PsiFormerWF::requireSameWalkerBufferObservation(
-    const WalkerBufferRecordView& expected,
-    const WalkerBufferRecordView& observed)
+// Require a repeat cursor observation to preserve every Phase-A identity.
+void PsiFormerWF::requireSameWalkerBufferCursorObservation(
+    const WalkerBufferCursorSnapshot& left,
+    const WalkerBufferCursorSnapshot& right)
 {
-  const WalkerBufferCursorSnapshot& left  = expected.cursor;
-  const WalkerBufferCursorSnapshot& right = observed.cursor;
   if (left.operation != right.operation || left.buffer != right.buffer ||
       left.plan_identity != right.plan_identity || left.data != right.data ||
       left.scalar_data != right.scalar_data || left.size != right.size ||
@@ -5648,6 +5700,14 @@ void PsiFormerWF::requireSameWalkerBufferObservation(
       left.input_fingerprint != right.input_fingerprint)
     throw std::logic_error(
         "PsiFormer planned walker-buffer input evidence changed after Phase A");
+}
+
+// Require a repeat observation to preserve every Phase-A identity and record bit.
+void PsiFormerWF::requireSameWalkerBufferObservation(
+    const WalkerBufferRecordView& expected,
+    const WalkerBufferRecordView& observed)
+{
+  requireSameWalkerBufferCursorObservation(expected.cursor, observed.cursor);
   if (expected.gradient_data != observed.gradient_data ||
       expected.laplacian_data != observed.laplacian_data ||
       expected.scalar_data != observed.scalar_data ||
@@ -5656,6 +5716,131 @@ void PsiFormerWF::requireSameWalkerBufferObservation(
       expected.content_fingerprint != observed.content_fingerprint)
     throw std::logic_error(
         "PsiFormer planned walker-buffer record content changed after Phase A");
+}
+
+// Reject refresh inputs that overlap and could mutate a source during publication.
+void PsiFormerWF::requireDisjointPlannedWalkerBufferRefresh(
+    const ParticleSet& particles) const
+{
+  const auto checked_bytes = [](std::size_t elements, std::size_t width,
+                                const char* description) {
+    return pf::checkedStorageProduct(elements, width, description);
+  };
+  const std::size_t particle_gradient_bytes = checked_bytes(
+      particles.G.size(), sizeof(ParticleSet::ParticleGradient::value_type),
+      "PsiFormer planned refresh ParticleSet gradient range overflowed");
+  const std::size_t particle_laplacian_bytes = checked_bytes(
+      particles.L.size(), sizeof(ParticleSet::ParticleLaplacian::value_type),
+      "PsiFormer planned refresh ParticleSet Laplacian range overflowed");
+  const std::size_t accepted_gradient_bytes = checked_bytes(
+      accepted_gradient_.size(), sizeof(GradType),
+      "PsiFormer planned refresh accepted-gradient range overflowed");
+  const std::size_t accepted_laplacian_bytes = checked_bytes(
+      accepted_laplacian_.size(), sizeof(ValueType),
+      "PsiFormer planned refresh accepted-Laplacian range overflowed");
+  const std::size_t proposed_gradient_bytes = checked_bytes(
+      proposed_gradient_.size(), sizeof(GradType),
+      "PsiFormer planned refresh proposed-gradient range overflowed");
+  const std::size_t proposed_laplacian_bytes = checked_bytes(
+      proposed_laplacian_.size(), sizeof(ValueType),
+      "PsiFormer planned refresh proposed-Laplacian range overflowed");
+
+  const auto reject_overlap = [](const void* left, std::size_t left_bytes,
+                                 const void* right, std::size_t right_bytes,
+                                 const char* description) {
+    if (checkedByteRangesOverlap(left, left_bytes, right, right_bytes,
+                                 description))
+      throw std::invalid_argument(description);
+  };
+  reject_overlap(particles.G.data(), particle_gradient_bytes,
+                 particles.L.data(), particle_laplacian_bytes,
+                 "PsiFormer planned refresh ParticleSet G/L storage overlaps");
+  for (const auto& source : {
+           std::pair<const void*, std::size_t>{accepted_gradient_.data(),
+                                               accepted_gradient_bytes},
+           {accepted_laplacian_.data(), accepted_laplacian_bytes},
+           {proposed_gradient_.data(), proposed_gradient_bytes},
+           {proposed_laplacian_.data(), proposed_laplacian_bytes}})
+  {
+    reject_overlap(
+        particles.G.data(), particle_gradient_bytes, source.first,
+        source.second,
+        "PsiFormer planned refresh ParticleSet gradient aliases component storage");
+    reject_overlap(
+        particles.L.data(), particle_laplacian_bytes, source.first,
+        source.second,
+        "PsiFormer planned refresh ParticleSet Laplacian aliases component storage");
+  }
+}
+
+// Prove one accepted FULL_VGL cache and all prospective ParticleSet additions.
+PsiFormerWF::WalkerBufferRefreshEvidence
+PsiFormerWF::requirePlannedWalkerBufferRefreshInputs(
+    const ParticleSet& particles,
+    std::size_t parameter_version) const
+{
+  const std::size_t electron_count =
+      model_state_->execution_plan.modelShape().electrons();
+  if (!accepted_value_valid_ ||
+      accepted_state_requirement_ != AcceptedStateRequirement::FULL_SPATIAL ||
+      accepted_configuration_identity_ != configurationIdentity(particles) ||
+      accepted_parameter_version_ != parameter_version ||
+      observed_parameter_version_ != parameter_version ||
+      accepted_gradient_.size() != electron_count ||
+      accepted_laplacian_.size() != electron_count)
+    throw std::logic_error(
+        "PsiFormer planned walker-buffer refresh requires a current FULL_VGL accepted state");
+
+  if (!isCoherentAcceptedValue(current_sign_, log_value_) ||
+      (current_sign_ > 0.0 && isNegativeZero(std::imag(log_value_))))
+    throw std::logic_error(
+        "PsiFormer planned walker-buffer refresh has an invalid accepted amplitude");
+
+  requireDisjointPlannedWalkerBufferRefresh(particles);
+
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  mixPersistentInteger(hash, WALKER_BUFFER_REFRESH_FINGERPRINT_DOMAIN);
+  mixPersistentInteger(hash, static_cast<std::uint64_t>(parameter_version));
+  mixPersistentInteger(hash, accepted_configuration_identity_);
+  mixPersistentInteger(
+      hash, static_cast<std::uint64_t>(accepted_state_requirement_));
+  mixPersistentInteger(hash, static_cast<std::uint64_t>(accepted_value_valid_));
+  mixPersistentInteger(
+      hash, static_cast<std::uint64_t>(restore_validation_pending_));
+  mixPersistentObject(hash, current_sign_);
+  mixPersistentObject(hash, log_value_);
+
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+  {
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      const ValueType accepted = accepted_gradient_[electron][dimension];
+      const ValueType particle = particles.G[electron][dimension];
+      const ValueType prospective = particle + accepted;
+      if (!walkerBufferScalarIsFinite(accepted) ||
+          !walkerBufferScalarIsFinite(particle) ||
+          !walkerBufferScalarIsFinite(prospective))
+        throw std::logic_error(
+            "PsiFormer planned walker-buffer refresh has a non-finite gradient input or sum");
+      mixPersistentObject(hash, accepted);
+      mixPersistentObject(hash, particle);
+      mixPersistentObject(hash, prospective);
+    }
+
+    const ValueType accepted = accepted_laplacian_[electron];
+    const ValueType particle = particles.L[electron];
+    const ValueType prospective = particle + accepted;
+    if (!walkerBufferScalarIsFinite(accepted) ||
+        !walkerBufferScalarIsFinite(particle) ||
+        !walkerBufferScalarIsFinite(prospective))
+      throw std::logic_error(
+          "PsiFormer planned walker-buffer refresh has a non-finite Laplacian input or sum");
+    mixPersistentObject(hash, accepted);
+    mixPersistentObject(hash, particle);
+    mixPersistentObject(hash, prospective);
+  }
+
+  return {hash == 0 ? 1 : hash, parameter_version, log_value_};
 }
 
 // Inspect one typed preflight without parsing or publishing state.
@@ -5835,6 +6020,13 @@ void PsiFormerWF::probePlannedWalkerBufferBetweenPhaseFaultForTesting(
     return;
   throw std::logic_error(
       "PsiFormer planned walker-buffer between-phase fault was not rejected");
+}
+
+// Select one deterministic failure immediately before a buffer publication.
+void PsiFormerWF::setPlannedWalkerBufferLateFaultForTesting(
+    PlannedWalkerBufferLateFaultForTesting fault) noexcept
+{
+  planned_walker_buffer_late_fault_for_testing_ = fault;
 }
 
 // Exercise structural and alias failures without changing the live PooledMemory object.
@@ -10896,9 +11088,229 @@ void PsiFormerWF::mw_completeUpdates(
   WaveFunctionComponent::mw_completeUpdates(wfc_list);
 }
 
+// Reserve one planned record only after two exact sizing-cursor observations.
+void PsiFormerWF::registerDataPlanned(ParticleSet& particles,
+                                      WFBufferType& buffer)
+{
+  static_assert(std::numeric_limits<FullPrecRealType>::digits >= 32,
+                "PsiFormer walker metadata requires exact 32-bit scalar limbs");
+  const WalkerBufferCursorSnapshot phase_a =
+      requirePlannedWalkerBufferOperation(
+          PlannedWalkerBufferOperation::REGISTER, particles, buffer);
+  const std::size_t next_bulk_cursor = pf::checkedStorageSum(
+      phase_a.bulk_cursor, prepared_walker_buffer_layout_.bulk_bytes,
+      "PsiFormer planned walker-buffer bulk cursor overflowed");
+  const std::size_t next_scalar_cursor = pf::checkedStorageSum(
+      phase_a.scalar_cursor, prepared_walker_buffer_layout_.scalar_count,
+      "PsiFormer planned walker-buffer scalar cursor overflowed");
+
+  const WalkerBufferCursorSnapshot phase_b =
+      requirePlannedWalkerBufferOperation(
+          PlannedWalkerBufferOperation::REGISTER, particles, buffer);
+  requireSameWalkerBufferCursorObservation(phase_a, phase_b);
+  if (planned_walker_buffer_late_fault_for_testing_ ==
+      PlannedWalkerBufferLateFaultForTesting::REGISTER)
+    throw std::runtime_error(
+        "PsiFormer injected late planned walker-buffer registration failure");
+
+  const auto publish = [&]() noexcept {
+    buffer.Current        = next_bulk_cursor;
+    buffer.Current_scalar = next_scalar_cursor;
+  };
+  static_assert(noexcept(publish()));
+  publish();
+}
+
+// Restore one planned record under a single authoritative parameter read.
+void PsiFormerWF::copyFromBufferPlanned(ParticleSet& particles,
+                                        WFBufferType& buffer)
+{
+  const WalkerBufferCursorSnapshot phase_a_snapshot =
+      requirePlannedWalkerBufferOperation(
+          PlannedWalkerBufferOperation::READ, particles, buffer);
+  const WalkerBufferRecordView phase_a =
+      parsePlannedWalkerBufferRecord(particles, phase_a_snapshot);
+
+  PsiFormerReadTransaction transaction(*model_state_);
+  const std::size_t parameter_version = transaction.parameterVersion();
+  const WalkerBufferCursorSnapshot phase_b_snapshot =
+      requirePlannedWalkerBufferOperation(
+          PlannedWalkerBufferOperation::READ, particles, buffer);
+  WalkerBufferRecordView phase_b =
+      parsePlannedWalkerBufferRecord(particles, phase_b_snapshot);
+  requireSameWalkerBufferObservation(phase_a, phase_b);
+  phase_b = classifyPlannedWalkerBufferRecord(std::move(phase_b),
+                                               parameter_version);
+  if (planned_walker_buffer_late_fault_for_testing_ ==
+      PlannedWalkerBufferLateFaultForTesting::RESTORE)
+    throw std::runtime_error(
+        "PsiFormer injected late planned walker-buffer restoration failure");
+
+  const auto publish = [&]() noexcept {
+    // The live marker is withdrawn before any accepted payload changes.
+    accepted_value_valid_ = false;
+    if (phase_b.classification ==
+        WalkerBufferRecordClassification::RESTORABLE)
+    {
+      static_assert(std::is_trivially_copyable_v<GradType>);
+      static_assert(std::is_trivially_copyable_v<ValueType>);
+      std::memcpy(accepted_gradient_.data(), phase_b.gradient_data,
+                  phase_b.gradient_payload_bytes);
+      std::memcpy(accepted_laplacian_.data(), phase_b.laplacian_data,
+                  phase_b.laplacian_payload_bytes);
+      current_sign_ = phase_b.sign;
+      log_value_ = LogValue(phase_b.log_magnitude, phase_b.phase);
+      accepted_configuration_identity_ = phase_b.configuration_identity;
+      accepted_parameter_version_ = parameter_version;
+      accepted_state_requirement_ = AcceptedStateRequirement::FULL_SPATIAL;
+      observed_parameter_version_ = parameter_version;
+      // Publish validity only after the complete payload and key are live.
+      accepted_value_valid_ = true;
+    }
+    else
+    {
+      // Stale and zero records consume successfully without exposing their
+      // spatial payload or disturbing reusable proposal allocations.
+      current_sign_ = 1.0;
+      log_value_ = LogValue(0);
+      accepted_configuration_identity_ = 0;
+      accepted_parameter_version_ = parameter_version;
+      accepted_state_requirement_ = AcceptedStateRequirement::INVALID;
+      observed_parameter_version_ = parameter_version;
+    }
+
+    // Both discontiguous cursors advance only after component publication.
+    buffer.Current        = phase_b.next_bulk_cursor;
+    buffer.Current_scalar = phase_b.next_scalar_cursor;
+  };
+  static_assert(noexcept(publish()));
+  publish();
+}
+
+// Refresh one planned record solely from a current accepted FULL_VGL cache.
+PsiFormerWF::LogValue PsiFormerWF::updateBufferPlanned(
+    ParticleSet& particles,
+    WFBufferType& buffer,
+    bool from_scratch)
+{
+  if (from_scratch)
+    throw std::logic_error(
+        "PsiFormer planned walker-buffer update does not support from_scratch; a planned FULL_VGL refresh is required");
+
+  const WalkerBufferCursorSnapshot phase_a_snapshot =
+      requirePlannedWalkerBufferOperation(
+          PlannedWalkerBufferOperation::WRITE, particles, buffer);
+  const WalkerBufferRecordView phase_a =
+      makePlannedWalkerBufferRecordView(particles, phase_a_snapshot);
+  const WalkerBufferRefreshEvidence phase_a_inputs =
+      requirePlannedWalkerBufferRefreshInputs(
+          particles, accepted_parameter_version_);
+
+  PsiFormerReadTransaction transaction(*model_state_);
+  const std::size_t parameter_version = transaction.parameterVersion();
+  const WalkerBufferCursorSnapshot phase_b_snapshot =
+      requirePlannedWalkerBufferOperation(
+          PlannedWalkerBufferOperation::WRITE, particles, buffer);
+  const WalkerBufferRecordView phase_b =
+      makePlannedWalkerBufferRecordView(particles, phase_b_snapshot);
+  requireSameWalkerBufferObservation(phase_a, phase_b);
+  const WalkerBufferRefreshEvidence phase_b_inputs =
+      requirePlannedWalkerBufferRefreshInputs(particles, parameter_version);
+  if (phase_a_inputs.input_fingerprint != phase_b_inputs.input_fingerprint ||
+      phase_a_inputs.parameter_version != phase_b_inputs.parameter_version ||
+      std::memcmp(std::addressof(phase_a_inputs.log_value),
+                  std::addressof(phase_b_inputs.log_value),
+                  sizeof(LogValue)) != 0)
+    throw std::logic_error(
+        "PsiFormer planned walker-buffer refresh inputs changed after Phase A");
+
+  std::array<char, pf::WALKER_BUFFER_SCALAR_COUNT *
+                       sizeof(FullPrecRealType)>
+      scalar_record{};
+  storePersistentInteger(scalar_record.data(), 0, WALKER_BUFFER_MAGIC);
+  storePersistentInteger(scalar_record.data(), 2,
+                         pf::WALKER_BUFFER_LAYOUT_SCHEMA_VERSION);
+  storePersistentInteger(
+      scalar_record.data(), 4,
+      static_cast<std::uint64_t>(AcceptedStateRequirement::FULL_SPATIAL));
+  storePersistentInteger(scalar_record.data(), 6,
+                         model_state_->persistent_model_identity);
+  storePersistentInteger(scalar_record.data(), 8,
+                         static_cast<std::uint64_t>(parameter_version));
+  storePersistentInteger(scalar_record.data(), 10,
+                         accepted_configuration_identity_);
+  storePersistentInteger(scalar_record.data(), 12,
+                         accepted_gradient_.size());
+  const FullPrecRealType sign =
+      static_cast<FullPrecRealType>(current_sign_);
+  const FullPrecRealType log_magnitude =
+      static_cast<FullPrecRealType>(std::real(log_value_));
+  const FullPrecRealType phase =
+      static_cast<FullPrecRealType>(std::imag(log_value_));
+  storeWalkerBufferValue(
+      scalar_record.data() + 14 * sizeof(FullPrecRealType), sign);
+  storeWalkerBufferValue(
+      scalar_record.data() + 15 * sizeof(FullPrecRealType), log_magnitude);
+  storeWalkerBufferValue(
+      scalar_record.data() + 16 * sizeof(FullPrecRealType), phase);
+
+  if (planned_walker_buffer_late_fault_for_testing_ ==
+      PlannedWalkerBufferLateFaultForTesting::REFRESH)
+    throw std::runtime_error(
+        "PsiFormer injected late planned walker-buffer refresh failure");
+
+  const pf::WalkerBufferLayout& layout = prepared_walker_buffer_layout_;
+  const LogValue result = phase_b_inputs.log_value;
+  const auto publish = [&]() noexcept {
+    char* const gradient_destination =
+        const_cast<char*>(phase_b.gradient_data);
+    char* const laplacian_destination =
+        const_cast<char*>(phase_b.laplacian_data);
+    char* const scalar_destination = const_cast<char*>(phase_b.scalar_data);
+
+    // Withdraw any old magic marker before replacing a reused destination.
+    std::memset(scalar_destination, 0, phase_b.scalar_payload_bytes);
+
+    // Canonicalize aligned padding before copying the exact typed payloads.
+    std::memset(gradient_destination, 0, layout.bulk_bytes);
+    std::memcpy(gradient_destination, accepted_gradient_.data(),
+                phase_b.gradient_payload_bytes);
+    std::memcpy(laplacian_destination, accepted_laplacian_.data(),
+                phase_b.laplacian_payload_bytes);
+
+    // Keep the magic marker zero until all remaining record fields are live.
+    std::memcpy(scalar_destination + 2 * sizeof(FullPrecRealType),
+                scalar_record.data() + 2 * sizeof(FullPrecRealType),
+                phase_b.scalar_payload_bytes -
+                    2 * sizeof(FullPrecRealType));
+    std::memcpy(scalar_destination, scalar_record.data(),
+                2 * sizeof(FullPrecRealType));
+
+    for (std::size_t electron = 0; electron < accepted_gradient_.size();
+         ++electron)
+    {
+      particles.G[electron] += accepted_gradient_[electron];
+      particles.L[electron] += accepted_laplacian_[electron];
+    }
+
+    // Cursor movement is the final visibility marker for the whole operation.
+    buffer.Current        = phase_b.next_bulk_cursor;
+    buffer.Current_scalar = phase_b.next_scalar_cursor;
+  };
+  static_assert(noexcept(publish()));
+  publish();
+  return result;
+}
+
 // Reserve fixed bulk and scalar slots without assuming that registration follows evaluation.
 void PsiFormerWF::registerData(ParticleSet& particles, WFBufferType& buffer)
 {
+  if (batch_execution_plan_)
+  {
+    registerDataPlanned(particles, buffer);
+    return;
+  }
+
   requireUnplannedScalarEvaluation("registerData");
   requireNoSelectedParticleProposal("registerData");
   static_assert(std::numeric_limits<FullPrecRealType>::digits >= 32,
@@ -10919,6 +11331,9 @@ PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& particles,
                                                 WFBufferType& buffer,
                                                 bool from_scratch)
 {
+  if (batch_execution_plan_)
+    return updateBufferPlanned(particles, buffer, from_scratch);
+
   requireUnplannedScalarEvaluation("updateBuffer");
   requireNoSelectedParticleProposal("updateBuffer");
   PsiFormerReadTransaction transaction(*model_state_);
@@ -10943,6 +11358,12 @@ PsiFormerWF::LogValue PsiFormerWF::updateBuffer(ParticleSet& particles,
 // Restore only records whose model, parameter, configuration, and products match.
 void PsiFormerWF::copyFromBuffer(ParticleSet& particles, WFBufferType& buffer)
 {
+  if (batch_execution_plan_)
+  {
+    copyFromBufferPlanned(particles, buffer);
+    return;
+  }
+
   requireUnplannedScalarEvaluation("copyFromBuffer");
   requireNoSelectedParticleProposal("copyFromBuffer");
   PsiFormerReadTransaction transaction(*model_state_);
