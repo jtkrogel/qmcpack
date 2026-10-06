@@ -43,6 +43,7 @@ struct CommunicatorTraits
 };
 #endif
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -154,6 +155,13 @@ public:
 
   template<typename T>
   void allreduce(T&);
+  /** Sum a contiguous logical-scalar interval in place without a transport copy.
+   *
+   * Composite scalar types such as std::complex are expanded through scalar_traits;
+   * the resulting MPI count is checked before entering the collective.
+   */
+  template<typename T>
+  void allreduce_in_place(T* restrict, std::size_t count);
   template<typename T>
   void reduce(T&);
   template<typename T>

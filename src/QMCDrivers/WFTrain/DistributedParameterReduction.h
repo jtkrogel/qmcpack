@@ -1,0 +1,88 @@
+//////////////////////////////////////////////////////////////////////////////////////
+// This file is distributed under the University of Illinois/NCSA Open Source License.
+// See LICENSE file in top directory for details.
+//
+// Copyright (c) 2026 QMCPACK developers.
+//////////////////////////////////////////////////////////////////////////////////////
+
+/** @file DistributedParameterReduction.h
+ * @brief Synchronous replicated reduction of bounded training statistics.
+ *
+ * The context deliberately implements one conservative collective schedule. It owns
+ * no parameter-sized staging buffer: the three raw accumulator vectors are reduced
+ * in place, in canonical chunks, after all ranks agree that production completed.
+ */
+
+#ifndef QMCPLUSPLUS_DISTRIBUTED_PARAMETER_REDUCTION_H
+#define QMCPLUSPLUS_DISTRIBUTED_PARAMETER_REDUCTION_H
+
+#include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
+
+#include <cstddef>
+#include <exception>
+
+class Communicate;
+
+namespace qmcplusplus::wftrain
+{
+
+/// Configure the only tunable property of the synchronous replicated reduction.
+struct DistributedReductionPolicy
+{
+  std::size_t maximum_chunk_size = 65536;
+};
+
+/** Coordinate fixed-record consensus and in-place replicated parameter reductions.
+ *
+ * A default-constructed context is a one-participant local context. Binding a
+ * communicator enables the same protocol across its ranks without changing result
+ * ownership: every successful rank receives the complete globally summed vectors.
+ */
+class DistributedParameterReduction
+{
+public:
+  /// Construct a single-participant reduction context.
+  DistributedParameterReduction(DistributedReductionPolicy policy = {});
+
+  /// Bind the reduction context to an existing communicator with nonowning lifetime.
+  DistributedParameterReduction(Communicate& communicator,
+                                DistributedReductionPolicy policy = {});
+
+  /// Agree on immutable iteration metadata before derivative production begins.
+  void preflight(const StructuredParameterSchema& schema,
+                 const StructuredParameterSnapshot* parameters,
+                 EnergyGradientEstimator estimator,
+                 std::exception_ptr local_failure = {}) const;
+
+  /** Reduce one complete local accumulator or report a uniform producer failure.
+   *
+   * Raw scalar moments and the three P-vectors are summed before the accumulator is
+   * promoted to GLOBAL. Zero-sample ranks execute the identical collective schedule.
+   */
+  void reduce(EnergyGradientAccumulator& accumulator,
+              std::exception_ptr local_failure = {}) const;
+
+  /// Verify that every rank prepared the same complete update before publication.
+  void validateCandidate(const StructuredParameterSchema& schema,
+                         const StructuredParameterSnapshot& parameters,
+                         const StructuredParameterSnapshot* candidate,
+                         std::exception_ptr local_failure = {}) const;
+
+  /// Agree on publication success and return the common committed version.
+  std::size_t completePublication(std::size_t local_version,
+                                  std::exception_ptr local_failure = {}) const;
+
+  /// Return the number of participants in the bound context.
+  std::size_t participantCount() const noexcept;
+
+  /// Return the configured logical-parameter chunk limit.
+  std::size_t maximumChunkSize() const noexcept { return policy_.maximum_chunk_size; }
+
+private:
+  Communicate* communicator_ = nullptr;
+  DistributedReductionPolicy policy_;
+};
+
+} // namespace qmcplusplus::wftrain
+
+#endif

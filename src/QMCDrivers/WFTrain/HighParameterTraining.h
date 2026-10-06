@@ -12,7 +12,7 @@
 #ifndef QMCPLUSPLUS_HIGH_PARAMETER_TRAINING_H
 #define QMCPLUSPLUS_HIGH_PARAMETER_TRAINING_H
 
-#include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
+#include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
 #include "QMCDrivers/WFTrain/TrainingCapabilities.h"
 
 #include <cstddef>
@@ -71,22 +71,6 @@ struct TrainingIterationResult
   EnergyGradientResult objective;
 };
 
-/** Describe the deliberately local Task-10 reduction transport.
- *
- * A single participant can promote its complete local raw sums to global scope.
- * Multi-participant communicator transport is introduced separately in Task 12.
- */
-struct LocalTrainingReduction
-{
-  std::size_t participant_count = 1;
-
-  /// Reject unsupported distributed execution before producer work begins.
-  void preflight() const;
-
-  /// Promote one complete single-participant result to global scope.
-  void complete(EnergyGradientAccumulator& accumulator) const;
-};
-
 /** Enforce preflight, reduction, update, publication, and cache-refresh order.
  *
  * This class deliberately owns no sampler, model, optimizer, or checkpoint
@@ -98,9 +82,9 @@ public:
   explicit HighParameterTraining(
       TrainingCapabilities requirements,
       EnergyGradientEstimator estimator = EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
-      LocalTrainingReduction reduction = {});
+      DistributedParameterReduction reduction = {});
 
-  /// Execute one failure-atomic local training iteration.
+  /// Execute one failure-atomic replicated training iteration.
   TrainingIterationResult runIteration(StructuredParameterProvider& provider,
                                        GradientProducer& producer,
                                        TrainingUpdateRule& update_rule,
@@ -110,7 +94,7 @@ public:
 private:
   TrainingCapabilities requirements_;
   EnergyGradientEstimator estimator_;
-  LocalTrainingReduction reduction_;
+  DistributedParameterReduction reduction_;
 };
 
 } // namespace qmcplusplus::wftrain

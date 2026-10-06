@@ -3,7 +3,9 @@
 // See LICENSE file in top directory for details.
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <array>
 #include <complex>
+#include <limits>
 #include <vector>
 
 #include "Message/CommOperators.h"
@@ -212,6 +214,34 @@ TEST_CASE("communicate_collectives_scalar_allreduce", "[message][collectives]")
   // Sum(rank+1) = S. Sum(1) = size. So S + size.
   double expected_imag = static_cast<double>(comm->size() * (comm->size() + 1) / 2 + comm->size());
   CHECK(val_c == Complex{expected_real, expected_imag});
+}
+
+TEST_CASE("communicate_collectives_pointer_allreduce_in_place", "[message][collectives]")
+{
+  Communicate* comm = OHMMS::Controller;
+  const double rank_scale = static_cast<double>(comm->rank() + 1);
+  std::array<double, 3> real_values{rank_scale, 2.0 * rank_scale, -rank_scale};
+  std::array<Complex, 2> complex_values{{{rank_scale, -rank_scale},
+                                         {2.0 * rank_scale, rank_scale}}};
+
+  comm->allreduce_in_place(real_values.data(), real_values.size());
+  comm->allreduce_in_place(complex_values.data(), complex_values.size());
+
+  const double rank_sum = static_cast<double>(comm->size() * (comm->size() + 1) / 2);
+  CHECK(real_values == std::array<double, 3>{rank_sum, 2.0 * rank_sum, -rank_sum});
+  CHECK(complex_values ==
+        std::array<Complex, 2>{{{rank_sum, -rank_sum}, {2.0 * rank_sum, rank_sum}}});
+
+  // Zero logical elements never dereference the pointer or enter MPI.
+  CHECK_NOTHROW(comm->allreduce_in_place(static_cast<double*>(nullptr), 0));
+  CHECK_THROWS_AS(comm->allreduce_in_place(static_cast<double*>(nullptr), 1),
+                  std::invalid_argument);
+
+  Complex one_value{1.0, 0.0};
+  const std::size_t overflowing_complex_count =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) / 2 + 1;
+  CHECK_THROWS_AS(comm->allreduce_in_place(&one_value, overflowing_complex_count),
+                  std::overflow_error);
 }
 
 TEST_CASE("communicate_collectives_complex_matrix_allreduce", "[message][collectives]")

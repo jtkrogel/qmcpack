@@ -752,7 +752,7 @@ TEST_CASE("Updater cannot modify a frozen parameter block",
   CHECK(events == std::vector<std::string>{"produce", "propose"});
 }
 
-TEST_CASE("Unsupported local reduction fails before producer work",
+TEST_CASE("Invalid distributed reduction policy fails before producer work",
           "[drivers][training]")
 {
   ToyProvider provider;
@@ -760,11 +760,12 @@ TEST_CASE("Unsupported local reduction fails before producer work",
   producer.bindSchema(provider.parameterSchema());
   ScaleAndSubtract updater(0.1);
   TrainingIterationState state;
-  HighParameterTraining training({}, EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
-                                 LocalTrainingReduction{2});
+  HighParameterTraining training(
+      {}, EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+      DistributedParameterReduction{DistributedReductionPolicy{0}});
 
   CHECK_THROWS_WITH(training.runIteration(provider, producer, updater, state),
-                    Catch::Matchers::ContainsSubstring("exactly one participant"));
+                    Catch::Matchers::ContainsSubstring("invalid reduction policy"));
   CHECK(producer.calls == 0);
 }
 

@@ -60,6 +60,8 @@ BOOSTSUB_MPI_DATATYPE(unsigned int, MPI_UNSIGNED);
 
 BOOSTSUB_MPI_DATATYPE(unsigned long, MPI_UNSIGNED_LONG);
 
+BOOSTSUB_MPI_DATATYPE(unsigned long long, MPI_UNSIGNED_LONG_LONG);
+
 template<typename T>
 inline MPI_Datatype get_mpi_datatype(const std::complex<T>&)
 {

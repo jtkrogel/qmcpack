@@ -18,6 +18,7 @@
 #include "Pools/PooledData.h"
 #include "container_proxy.h"
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 ///dummy declarations to be specialized
 
@@ -65,6 +66,25 @@ inline void Communicate::allreduce(T& g)
   MPI_Datatype type_id = qmcplusplus::mpi::get_mpi_datatype(*t_in.data());
   MPI_Allreduce(t_in.data(), t_out.data(), t_in.size(), type_id, MPI_SUM, myMPI);
   g = gt;
+}
+
+template<typename T>
+inline void Communicate::allreduce_in_place(T* restrict values, std::size_t count)
+{
+  constexpr std::size_t scalar_dimension = qmcplusplus::scalar_traits<T>::DIM;
+  if (count == 0)
+    return;
+  if (values == nullptr)
+    throw std::invalid_argument("Communicate::allreduce_in_place requires storage for a nonzero count");
+  if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()) / scalar_dimension)
+    throw std::overflow_error("Communicate::allreduce_in_place count exceeds the MPI int count domain");
+
+  auto* address = qmcplusplus::scalar_traits<T>::get_address(values);
+  if (d_ncontexts == 1)
+    return;
+  const int mpi_count = static_cast<int>(count * scalar_dimension);
+  MPI_Datatype type_id = qmcplusplus::mpi::get_mpi_datatype(*address);
+  MPI_Allreduce(MPI_IN_PLACE, address, mpi_count, type_id, MPI_SUM, myMPI);
 }
 
 template<typename T>

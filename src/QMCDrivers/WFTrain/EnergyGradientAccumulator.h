@@ -22,6 +22,8 @@
 namespace qmcplusplus::wftrain
 {
 
+class DistributedParameterReduction;
+
 /// Select one explicitly named finite-sample estimator of the energy gradient.
 enum class EnergyGradientEstimator
 {
@@ -73,11 +75,7 @@ public:
   /// Merge one complete compatible partial result in deterministic caller order.
   void merge(const EnergyGradientAccumulator& other);
 
-  /** Mark a local result global when it is the only reduction participant.
-   *
-   * This is the deliberately narrow Task-10 transport seam. Multi-participant
-   * reduction is rejected until the communicator-backed Task-12 implementation.
-   */
+  /// Mark a local result global when it is the only reduction participant.
   void completeSingleParticipantReduction();
 
   /// Normalize raw sums exactly once and construct the selected estimator.
@@ -123,6 +121,8 @@ protected:
   void onReset() noexcept override;
 
 private:
+  friend class DistributedParameterReduction;
+
   enum class ChannelKind
   {
     WEIGHTED_SCORE,
