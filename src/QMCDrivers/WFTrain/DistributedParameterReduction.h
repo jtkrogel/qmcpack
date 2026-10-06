@@ -27,6 +27,19 @@ class Communicate;
 namespace qmcplusplus::wftrain
 {
 
+/** One weighted sample scalar reduced before a matrix-free parameter action.
+ *
+ * Local producers submit RANK_LOCAL raw moments.  A successful distributed
+ * reduction returns the exact global sample count and replicated GLOBAL sums.
+ */
+struct DistributedWeightedSampleMoments
+{
+  std::size_t sample_count = 0;
+  DerivativeReal weight_sum = 0.0;
+  DerivativeValue weighted_value_sum{};
+  ReductionDomain reduction_domain = ReductionDomain::RANK_LOCAL;
+};
+
 /// Configure the only tunable property of the synchronous replicated reduction.
 struct DistributedReductionPolicy
 {
@@ -83,6 +96,18 @@ public:
       const StructuredParameterSchema& schema,
       std::size_t parameter_version,
       DerivativeArrayView<DerivativeValue> values,
+      std::exception_ptr local_failure = {}) const;
+
+  /** Reduce rank-local weighted scalar moments for a matrix-free sample action.
+   *
+   * Different ranks may contribute different (including zero) sample counts.  The
+   * fixed-record consensus precedes both scalar collectives, so a rank-local JVP
+   * failure cannot strand peers in an unmatched all-reduce.
+   */
+  DistributedWeightedSampleMoments reduceWeightedSampleMoments(
+      const StructuredParameterSchema& schema,
+      std::size_t parameter_version,
+      const DistributedWeightedSampleMoments& local_moments,
       std::exception_ptr local_failure = {}) const;
 
   /// Verify that every rank prepared the same complete update before publication.

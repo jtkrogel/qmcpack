@@ -33,6 +33,7 @@ constexpr std::uint64_t protocol_version = 1;
 constexpr std::uint64_t energy_channel_contract = UINT64_C(0x454752414433); // "EGRAD3"
 constexpr std::uint64_t orbital_channel_contract = UINT64_C(0x4f52424752414431); // "ORBGRAD1"
 constexpr std::uint64_t parameter_vector_contract = UINT64_C(0x5056454353554d31); // "PVECSUM1"
+constexpr std::uint64_t weighted_sample_contract = UINT64_C(0x57534d4f4d454e31); // "WSMOMEN1"
 
 /// Classify failures without communicating variable-length exception strings.
 enum class ConsensusReason : std::uint64_t
@@ -663,6 +664,110 @@ ReductionDomain DistributedParameterReduction::reduceParameterVector(
     throw;
   }
   return ReductionDomain::GLOBAL;
+}
+
+DistributedWeightedSampleMoments
+DistributedParameterReduction::reduceWeightedSampleMoments(
+    const StructuredParameterSchema& schema,
+    std::size_t parameter_version,
+    const DistributedWeightedSampleMoments& local_moments,
+    std::exception_ptr local_failure) const
+{
+  ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
+                                         : ConsensusReason::NONE;
+  constexpr std::size_t complex_dimension = 2;
+  const std::size_t maximum_mpi_chunk =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) / complex_dimension;
+  if (reason == ConsensusReason::NONE &&
+      (policy_.maximum_chunk_size == 0 ||
+       policy_.maximum_chunk_size > maximum_mpi_chunk))
+    reason = ConsensusReason::INVALID_POLICY;
+  if (reason == ConsensusReason::NONE &&
+      local_moments.reduction_domain != ReductionDomain::RANK_LOCAL)
+    reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+  if (reason == ConsensusReason::NONE &&
+      (!isFiniteTrainingReal(local_moments.weight_sum) ||
+       local_moments.weight_sum < 0.0 ||
+       !isFinite(local_moments.weighted_value_sum)))
+    reason = ConsensusReason::NONFINITE_CONTRIBUTION;
+  if (reason == ConsensusReason::NONE && local_moments.sample_count == 0 &&
+      (local_moments.weight_sum != 0.0 || local_moments.weighted_value_sum != DerivativeValue{}))
+    reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+  if (reason == ConsensusReason::NONE && local_moments.weight_sum == 0.0 &&
+      local_moments.weighted_value_sum != DerivativeValue{})
+    reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+
+  ParameterScalarDomain scalar_domain = schema.blocks().front().scalar_domain;
+  if (reason == ConsensusReason::NONE)
+    for (const ParameterBlockDescriptor& block : schema.blocks())
+      if (block.scalar_domain != scalar_domain)
+      {
+        reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
+        break;
+      }
+
+  const std::array<std::uint64_t, 10> local_record{
+      static_cast<std::uint64_t>(reason),
+      protocol_version,
+      weighted_sample_contract,
+      hashString(schema.providerId()),
+      hashString(schema.fingerprint()),
+      parameter_version,
+      schema.parameterCount(),
+      static_cast<std::uint64_t>(scalar_domain),
+      policy_.maximum_chunk_size,
+      participantCount()};
+  const auto records = gatherRecords(communicator_, local_record);
+
+  const std::size_t failed_rank = firstFailedRank(records);
+  if (failed_rank != records.size())
+    throwConsensusFailure("matrix-free weighted-sample reduction", failed_rank,
+                          static_cast<ConsensusReason>(records[failed_rank][0]),
+                          failed_rank == 0 ? local_failure : std::exception_ptr{},
+                          records.size());
+  const std::size_t mismatch_rank = firstMismatchingRank(records);
+  if (mismatch_rank != records.size())
+    throwMetadataMismatch("matrix-free weighted-sample reduction", mismatch_rank);
+
+  std::uint64_t global_sample_count = 0;
+  // Counts may differ by rank and therefore travel in a second exact all-gather.
+  const std::array<std::uint64_t, 1> local_count{
+      static_cast<std::uint64_t>(local_moments.sample_count)};
+  const auto count_records = gatherRecords(communicator_, local_count);
+  for (const auto& record : count_records)
+  {
+    if (record[0] > std::numeric_limits<std::uint64_t>::max() - global_sample_count)
+      throw std::overflow_error("Distributed weighted-sample count overflow");
+    global_sample_count += record[0];
+  }
+  if (global_sample_count == 0 ||
+      global_sample_count > std::numeric_limits<std::size_t>::max())
+    throw std::runtime_error(
+        "Distributed weighted-sample population is globally empty or too large");
+
+  DistributedWeightedSampleMoments global = local_moments;
+  global.sample_count = static_cast<std::size_t>(global_sample_count);
+  try
+  {
+    if (communicator_)
+    {
+      communicator_->allreduce_in_place(&global.weight_sum, 1);
+      communicator_->allreduce_in_place(&global.weighted_value_sum, 1);
+    }
+    if (!isFiniteTrainingReal(global.weight_sum) || global.weight_sum <= 0.0 ||
+        !isFinite(global.weighted_value_sum))
+      throw std::runtime_error(
+          "Distributed weighted-sample reduction produced an invalid global sum");
+  }
+  catch (...)
+  {
+    global.weight_sum = std::numeric_limits<DerivativeReal>::quiet_NaN();
+    const DerivativeReal sentinel = std::numeric_limits<DerivativeReal>::quiet_NaN();
+    global.weighted_value_sum = {sentinel, sentinel};
+    throw;
+  }
+  global.reduction_domain = ReductionDomain::GLOBAL;
+  return global;
 }
 
 void DistributedParameterReduction::validateCandidate(

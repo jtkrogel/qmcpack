@@ -15,6 +15,7 @@
 
 #include "Message/Communicate.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include <algorithm>
@@ -45,6 +46,119 @@ StructuredParameterSchema makeSchema(std::string provider_id = "distributed/toy"
   return {std::move(provider_id),
           {{"weight", {5}, 0, 5, ParameterScalarDomain::REAL64, true, "weights"}}};
 }
+
+/// Two-parameter schema used by the distributed SR dense oracle.
+StructuredParameterSchema makeSRSchema()
+{
+  return {"distributed/sr",
+          {{"weights", {2}, 0, 2, ParameterScalarDomain::REAL64, true,
+            "weights"}}};
+}
+
+/// Stream deterministic rank-local score rows and support injected pass failures.
+class DistributedSRStreamingOperator final : public StreamingDerivativeOperator
+{
+public:
+  DistributedSRStreamingOperator(const StructuredParameterSchema& schema,
+                                 std::size_t version,
+                                 int rank,
+                                 std::size_t sample_count,
+                                 bool* fail_jvp,
+                                 bool* fail_vjp)
+      : schema_(schema), version_(version), rank_(rank),
+        sample_count_(sample_count), plan_(schema_, version_, 1),
+        fail_jvp_(fail_jvp), fail_vjp_(fail_vjp)
+  {}
+
+  StreamingDerivativeCapabilities capabilities() const noexcept override
+  {
+    StreamingDerivativeCapabilities result;
+    result.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
+        derivativeProductBit(DerivativeProduct::SCORE_JVP);
+    result.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
+    result.parameter_scalar_domain = ParameterScalarDomain::REAL64;
+    result.result_scalar_domain = ParameterScalarDomain::COMPLEX128;
+    result.reduction_domain = ReductionDomain::RANK_LOCAL;
+    result.execution_domain = DerivativeExecutionDomain::HOST;
+    result.maximum_vjp_channels = 1;
+    result.maximum_parameter_chunk_size = 1;
+    result.maximum_sample_tile_size = std::max<std::size_t>(sample_count_, 1);
+    result.block_streaming = true;
+    return result;
+  }
+
+  const StructuredParameterSchema& parameterSchema() const noexcept override
+  {
+    return schema_;
+  }
+  std::size_t parameterVersion() const noexcept override { return version_; }
+  std::size_t batchOrdinal() const noexcept override
+  {
+    return static_cast<std::size_t>(rank_);
+  }
+  std::size_t sampleOffset() const noexcept override
+  {
+    return static_cast<std::size_t>(100 * rank_);
+  }
+  std::size_t sampleCount() const noexcept override { return sample_count_; }
+  const ParameterChunkPlan& parameterChunkPlan() const noexcept override
+  {
+    return plan_;
+  }
+
+  /// Return one deterministic real score component without stored rows.
+  DerivativeValue score(std::size_t sample, std::size_t parameter) const noexcept
+  {
+    const double identity = static_cast<double>(10 * rank_ + sample + 1);
+    return parameter == 0 ? DerivativeValue{identity, 0.0}
+                          : DerivativeValue{1.0 - 0.1 * identity, 0.0};
+  }
+
+protected:
+  void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
+                    DerivativeAdjoint,
+                    ParameterReductionSink& sink) const override
+  {
+    if (*fail_vjp_)
+      throw std::runtime_error("injected distributed SR VJP failure");
+    for (const ParameterChunkDescriptor& chunk : plan_.chunks())
+    {
+      DerivativeValue value{};
+      for (std::size_t sample = 0; sample < sample_count_; ++sample)
+        value += channels[0].coefficients.values[sample] *
+            std::conj(score(sample, chunk.parameter_offset));
+      sink.add(0, {chunk, {&value, 1}});
+    }
+  }
+
+  void evaluateScoreJVP(const StructuredParameterVectorConstView& direction,
+                        SampleProductSink& sink) const override
+  {
+    if (*fail_jvp_)
+      throw std::runtime_error("injected distributed SR JVP failure");
+    std::vector<DerivativeValue> products(sample_count_);
+    for (std::size_t sample = 0; sample < sample_count_; ++sample)
+      for (std::size_t parameter = 0; parameter < 2; ++parameter)
+        products[sample] += score(sample, parameter) *
+            direction.values()[parameter];
+    if (!products.empty())
+    {
+      const SampleProductTileDescriptor descriptor{
+          schema_.providerId(), schema_.fingerprint(), version_, batchOrdinal(),
+          sampleOffset(), products.size(), 0};
+      sink.add({descriptor, {products.data(), products.size()}});
+    }
+  }
+
+private:
+  StructuredParameterSchema schema_;
+  std::size_t version_;
+  int rank_;
+  std::size_t sample_count_;
+  ParameterChunkPlan plan_;
+  bool* fail_jvp_;
+  bool* fail_vjp_;
+};
 
 /// Generate deterministic rank/sample data independently of the derivative producer.
 void makeSamples(int rank,
@@ -448,6 +562,89 @@ TEST_CASE("Distributed matrix-free vectors are reduced once into replicated stor
                           static_cast<double>(parameter + 1)));
     }
   }
+}
+
+TEST_CASE("Distributed streaming SR matches one global centered dense population",
+          "[drivers][training][matrix-free][sr][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema schema = makeSRSchema();
+  const std::size_t local_count =
+      localSampleCount(communicator.rank(), communicator.size());
+  bool fail_jvp = false;
+  bool fail_vjp = false;
+  DistributedSRStreamingOperator stream(schema, 5, communicator.rank(),
+                                         local_count, &fail_jvp, &fail_vjp);
+  std::vector<DerivativeReal> weights(local_count);
+  for (std::size_t sample = 0; sample < local_count; ++sample)
+    weights[sample] = 1.0 + 0.25 * sample;
+  const StochasticReconfigurationBatch batch{
+      &stream, {weights.data(), weights.size()}};
+  StochasticReconfigurationOperator covariance(
+      schema, 5, {&batch, 1},
+      DistributedParameterReduction(communicator, {1}));
+
+  const std::vector<DerivativeValue> direction{{0.3, 0.0}, {-0.7, 0.0}};
+  const StructuredParameterVectorConstView direction_view(
+      schema, 5, {direction.data(), direction.size()});
+  std::vector<DerivativeValue> result(2);
+  covariance.apply(direction_view, {result.data(), result.size()});
+
+  DerivativeReal global_weight = 0.0;
+  DerivativeValue global_product{};
+  for (int rank = 0; rank < communicator.size(); ++rank)
+  {
+    const std::size_t count = localSampleCount(rank, communicator.size());
+    for (std::size_t sample = 0; sample < count; ++sample)
+    {
+      const DerivativeReal weight = 1.0 + 0.25 * sample;
+      const double identity = static_cast<double>(10 * rank + sample + 1);
+      const DerivativeValue product = identity * direction[0] +
+          (1.0 - 0.1 * identity) * direction[1];
+      global_weight += weight;
+      global_product += weight * product;
+    }
+  }
+  const DerivativeValue mean_product = global_product / global_weight;
+  std::vector<DerivativeValue> expected(2);
+  for (int rank = 0; rank < communicator.size(); ++rank)
+  {
+    const std::size_t count = localSampleCount(rank, communicator.size());
+    for (std::size_t sample = 0; sample < count; ++sample)
+    {
+      const DerivativeReal weight = 1.0 + 0.25 * sample;
+      const double identity = static_cast<double>(10 * rank + sample + 1);
+      const DerivativeValue score0{identity, 0.0};
+      const DerivativeValue score1{1.0 - 0.1 * identity, 0.0};
+      const DerivativeValue product = score0 * direction[0] +
+          score1 * direction[1];
+      expected[0] += std::conj(score0) * (weight / global_weight) *
+          (product - mean_product);
+      expected[1] += std::conj(score1) * (weight / global_weight) *
+          (product - mean_product);
+    }
+  }
+  CHECK(result[0].real() ==
+        Catch::Approx(expected[0].real()).epsilon(1.0e-12).margin(1.0e-12));
+  CHECK(result[1].real() ==
+        Catch::Approx(expected[1].real()).epsilon(1.0e-12).margin(1.0e-12));
+  CHECK(result[0].imag() == 0.0);
+  CHECK(result[1].imag() == 0.0);
+
+  // Each injected pass failure is reported uniformly before the corresponding
+  // data collective. Reusing the same prepared action afterwards must remain safe.
+  fail_jvp = communicator.rank() == 0;
+  CHECK_THROWS(covariance.apply(direction_view, {result.data(), result.size()}));
+  fail_jvp = false;
+  CHECK_NOTHROW(covariance.apply(direction_view, {result.data(), result.size()}));
+  int vjp_failure_rank = communicator.size() - 1;
+  while (vjp_failure_rank > 0 &&
+         localSampleCount(vjp_failure_rank, communicator.size()) == 0)
+    --vjp_failure_rank;
+  fail_vjp = communicator.rank() == vjp_failure_rank;
+  CHECK_THROWS(covariance.apply(direction_view, {result.data(), result.size()}));
+  fail_vjp = false;
+  CHECK_NOTHROW(covariance.apply(direction_view, {result.data(), result.size()}));
 }
 
 TEST_CASE("Distributed matrix-free vector failures precede data collectives",

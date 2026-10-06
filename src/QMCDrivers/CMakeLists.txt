@@ -55,6 +55,7 @@ set(QMCDRIVERS
     WFTrain/FirstOrderOptimizer.cpp
     WFTrain/MatrixFreeOperator.cpp
     WFTrain/KrylovSolver.cpp
+    WFTrain/MatrixFreeStochasticReconfiguration.cpp
     Optimizers/DescentEngine.cpp
     Optimizers/HybridEngine.cpp
     WFOpt/QMCCostFunctionBase.cpp
