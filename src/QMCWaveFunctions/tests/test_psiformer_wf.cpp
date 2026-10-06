@@ -502,6 +502,19 @@ public:
     }
   }
 
+  /// Replace one accepted gradient element while retaining all cache metadata.
+  static void setAcceptedGradientElement(PsiFormerWF& component,
+                                         std::size_t electron,
+                                         std::size_t dimension,
+                                         QMCTraits::ValueType value)
+  {
+    if (electron >= component.accepted_gradient_.size() ||
+        dimension >= OHMMS_DIM)
+      throw std::out_of_range(
+          "PsiFormer accepted-gradient test index is out of range");
+    component.accepted_gradient_[electron][dimension] = value;
+  }
+
   /// Compare only accepted spatial payloads when stale/zero metadata changes.
   static bool acceptedSpatialStateMatches(
       const PsiFormerWF& component,
@@ -3300,6 +3313,145 @@ TEST_CASE("PsiFormer planned walker-buffer public APIs obey exact selected modes
       component.copyFromBuffer(electrons, buffer);
     });
   }
+}
+
+TEST_CASE("PsiFormer planned walker-buffer refresh rejects finite additive overflow",
+          "[wavefunction][psiformer][batch_memory][walker_transaction][closure]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  PsiFormerWF component("pf_walker_refresh_closure",
+                        files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  electrons.update();
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::BUFFER_WRITE);
+  const std::string participant_id =
+      "test/psiformer/walker-refresh-closure";
+  const auto plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, "walker-refresh-closure-v1");
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  component.bindBatchExecutionPlan(participant_plan);
+  component.prepareBatchExecutionClone(participant_plan);
+
+  PsiFormerWF::WFBufferType buffer;
+  component.registerData(electrons, buffer);
+  buffer.allocate();
+  buffer.zero();
+  buffer.rewind();
+
+  const ValueType largest_finite(
+      std::numeric_limits<QMCTraits::RealType>::max());
+  testing::TestPsiFormerWF::setAcceptedGradientElement(
+      component, 0, 0, largest_finite);
+  electrons.G[0][0] = largest_finite;
+  const testing::PsiFormerScalarStateSnapshot component_before =
+      testing::TestPsiFormerWF::scalarStateSnapshot(component);
+  const ScalarParticleStateSnapshot particles_before =
+      captureScalarParticleState(electrons);
+  const WalkerBufferStateSnapshot buffer_before =
+      captureWalkerBufferState(buffer);
+
+  CHECK_THROWS_WITH(
+      component.updateBuffer(electrons, buffer, false),
+      Catch::Matchers::ContainsSubstring(
+          "non-finite gradient input or sum"));
+  CHECK(testing::TestPsiFormerWF::scalarStateMatches(component,
+                                                      component_before));
+  checkScalarParticleState(electrons, particles_before);
+  checkWalkerBufferState(buffer, buffer_before);
+}
+
+TEST_CASE("PsiFormer plan clear restores the legacy walker-buffer round trip",
+          "[wavefunction][psiformer][batch_memory][buffer][closure]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  PsiFormerWF component("pf_walker_plan_clear", files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  electrons.update();
+
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  const std::string participant_id = "test/psiformer/walker-plan-clear";
+  const auto plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, "walker-plan-clear-v1");
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  component.bindBatchExecutionPlan(participant_plan);
+  component.prepareBatchExecutionClone(participant_plan);
+  REQUIRE(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+
+  component.bindBatchExecutionPlan({});
+  REQUIRE_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+
+  PsiFormerWF::WFBufferType buffer;
+  component.registerData(electrons, buffer);
+  const std::size_t bulk_end = buffer.current();
+  const std::size_t scalar_end = buffer.current_scalar();
+  REQUIRE(bulk_end > 0);
+  REQUIRE(scalar_end > 0);
+  buffer.allocate();
+  buffer.zero();
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  buffer.rewind();
+  const PsiFormerWF::LogValue expected_log =
+      component.updateBuffer(electrons, buffer, true);
+  const ParticleSet::ParticleGradient expected_gradient = electrons.G;
+  const ParticleSet::ParticleLaplacian expected_laplacian = electrons.L;
+  const testing::PsiFormerScalarStateSnapshot expected_cache =
+      testing::TestPsiFormerWF::scalarStateSnapshot(component);
+  REQUIRE(buffer.current() == bulk_end);
+  REQUIRE(buffer.current_scalar() == scalar_end);
+
+  testing::TestPsiFormerWF::poisonAcceptedStateForRestore(component);
+  buffer.rewind();
+  component.copyFromBuffer(electrons, buffer);
+  REQUIRE(buffer.current() == bulk_end);
+  REQUIRE(buffer.current_scalar() == scalar_end);
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(
+      component, expected_cache));
+  const testing::PsiFormerScalarStateSnapshot restored_cache =
+      testing::TestPsiFormerWF::scalarStateSnapshot(component);
+  CHECK(restored_cache.accepted_value_valid);
+  CHECK(sameScalarBits(restored_cache.current_sign,
+                       expected_cache.current_sign));
+  CHECK(sameScalarBits(restored_cache.log_value,
+                       expected_cache.log_value));
+
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  buffer.rewind();
+  const PsiFormerWF::LogValue restored_log =
+      component.updateBuffer(electrons, buffer, false);
+  CHECK(sameScalarBits(restored_log, expected_log));
+  REQUIRE(electrons.G.size() == expected_gradient.size());
+  REQUIRE(electrons.L.size() == expected_laplacian.size());
+  for (std::size_t electron = 0; electron < expected_gradient.size();
+       ++electron)
+  {
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      CHECK(sameScalarBits(electrons.G[electron][dimension],
+                           expected_gradient[electron][dimension]));
+    CHECK(sameScalarBits(electrons.L[electron],
+                         expected_laplacian[electron]));
+  }
+  CHECK(buffer.current() == bulk_end);
+  CHECK(buffer.current_scalar() == scalar_end);
 }
 
 TEST_CASE("PsiFormer planned walker parser classifies records without mutation",

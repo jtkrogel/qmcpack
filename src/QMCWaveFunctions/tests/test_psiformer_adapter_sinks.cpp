@@ -358,6 +358,16 @@ public:
     return component.has_proposal_;
   }
 
+  /// Invalidate accepted metadata while preserving every prepared allocation.
+  static void invalidateAcceptedState(PsiFormerWF& component) noexcept
+  {
+    component.accepted_value_valid_ = false;
+    component.accepted_configuration_identity_ = 0;
+    component.accepted_parameter_version_ = 0;
+    component.accepted_state_requirement_ =
+        PsiFormerWF::AcceptedStateRequirement::INVALID;
+  }
+
   static std::size_t plannedSelectedTransactionCount(
       const PsiFormerWF& component) noexcept
   {
@@ -577,7 +587,8 @@ std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
     const std::string& participant_id,
     std::size_t reserve_walker_count = 0,
     bool include_scalar_value = false,
-    bool include_lifecycle = false)
+    bool include_lifecycle = false,
+    bool include_walker_buffer = false)
 {
   if (reserve_walker_count == 0)
     reserve_walker_count = walker_count;
@@ -592,6 +603,11 @@ std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
   {
     requirements.require(BatchExecutionMode::PREPARE_GROUP);
     requirements.require(BatchExecutionMode::COMPLETE_UPDATES);
+  }
+  if (include_walker_buffer)
+  {
+    requirements.require(BatchExecutionMode::BUFFER_READ);
+    requirements.require(BatchExecutionMode::BUFFER_WRITE);
   }
 
   BatchExecutionSelectionInput selection;
@@ -713,6 +729,8 @@ void checkCloneWorkspaceUnchanged(
         expected.prepared_scalar_value_publication_size);
   CHECK(actual.prepared_scalar_value_publication_capacity ==
         expected.prepared_scalar_value_publication_capacity);
+  CHECK(actual.prepared_walker_buffer_layout ==
+        expected.prepared_walker_buffer_layout);
 }
 
 void checkResourceStorageUnchanged(
@@ -821,11 +839,17 @@ void checkPlannedAllocationFreeze(
         expected_total.host - replacement.host);
   const BatchMemoryBytes selected_total =
       plan.participantEvidence().front().selected_per_owner.total();
-  REQUIRE(selected_total.host >= expected_total.host);
-  REQUIRE(selected_total.device >= expected_total.device);
-  CHECK(selected_total.host - expected_total.host ==
+  const BatchMemoryBytes selected_external =
+      plan.participantEvidence().front().selected_per_owner.at(
+          BatchMemoryCategory::PERSISTENT_WALKER_RECORD);
+  REQUIRE(selected_total.host >= expected_total.host +
+          selected_external.host);
+  REQUIRE(selected_total.device >= expected_total.device +
+          selected_external.device);
+  CHECK(selected_total.host - expected_total.host - selected_external.host ==
         selected_actual_clone_bytes);
-  CHECK(selected_total.device - expected_total.device == 0);
+  CHECK(selected_total.device - expected_total.device -
+            selected_external.device == 0);
   CHECK(actual.resource.prepared_storage_fingerprint ==
         actual.resource.current_storage_fingerprint);
 }
@@ -1038,6 +1062,212 @@ void checkPlannedLifecycleAllocations(
   checkNoAllocations(alternating_allocations,
                      "alternating scalar/team lifecycle calls");
   check_frozen_state();
+}
+
+/** Exercise the public planned walker-record family inside one prepared crowd
+ * while reconciling external bytes with real cursor deltas.
+ */
+void checkPlannedWalkerClosureAllocations(const GeneratedFiles& files)
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  using Scalar = QMCTraits::FullPrecRealType;
+  constexpr std::size_t walker_count = 2;
+  constexpr std::size_t reserve_walker_count = 3;
+
+  const SimulationCell simulation_cell;
+  PlannedAllocationCrowd crowd(files, simulation_cell, walker_count);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    crowd.walkers[lane]->G = Value(0);
+    crowd.walkers[lane]->L = Value(0);
+    crowd.components[lane]->evaluateLog(
+        *crowd.walkers[lane], crowd.walkers[lane]->G,
+        crowd.walkers[lane]->L);
+  }
+
+  const std::string participant_id =
+      "test/psiformer/planned-walker-closure-allocation";
+  const auto plan = makeAllocationPlan(
+      crowd.leader, walker_count, participant_id, reserve_walker_count,
+      false, false, true);
+  bindAndPrepareAllocationCrowd(crowd, plan, participant_id);
+
+  ResourceCollection resource_template(
+      "psiformer_planned_walker_closure_allocation_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> resource_lock(
+      resource, crowd.wfc_list);
+
+  PsiFormerWF& component = crowd.leader;
+  ParticleSet& particles = *crowd.walkers.front();
+  const auto prepared_states = captureScalarAllocationStates(crowd);
+  REQUIRE(prepared_states.front().accepted_value_valid);
+  const auto clone_diagnostics = Probe::cloneWorkspaceDiagnostics(component);
+  const pf::WalkerBufferLayout layout =
+      clone_diagnostics.prepared_walker_buffer_layout;
+  REQUIRE_FALSE(layout.empty());
+
+  PsiFormerWF::GradType prefix_gradient;
+  PsiFormerWF::GradType suffix_gradient;
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+  {
+    prefix_gradient[dimension] = Value(0.125 * (dimension + 1));
+    suffix_gradient[dimension] = Value(-0.375 * (dimension + 1));
+  }
+  std::array<Scalar, 2> prefix_scalars{Scalar(3.25), Scalar(-1.75)};
+  std::array<Scalar, 2> suffix_scalars{Scalar(-6.5), Scalar(8.125)};
+
+  const auto add_prefix = [&](PsiFormerWF::WFBufferType& buffer) {
+    buffer.add(&prefix_gradient, &prefix_gradient + 1);
+    for (Scalar& scalar : prefix_scalars)
+      buffer.add(scalar);
+  };
+
+  // Warm registration on an independent sizing buffer, then audit an exact
+  // nonzero-prefix registration without materializing external storage.
+  PsiFormerWF::WFBufferType warm_registration;
+  add_prefix(warm_registration);
+  component.registerData(particles, warm_registration);
+
+  PsiFormerWF::WFBufferType buffer;
+  add_prefix(buffer);
+  const std::size_t component_bulk_entry = buffer.current();
+  const std::size_t component_scalar_entry = buffer.current_scalar();
+  REQUIRE(component_bulk_entry != 0);
+  REQUIRE(component_scalar_entry != 0);
+  REQUIRE(component_bulk_entry % layout.alignment == 0);
+
+  const PlannedAllocationFreeze registration_freeze =
+      capturePlannedAllocationFreeze(crowd, resource);
+  const AllocationSnapshot registration_allocations = auditAllocations([&] {
+    component.registerData(particles, buffer);
+  });
+  checkNoAllocations(registration_allocations,
+                     "planned walker-record registration");
+  const std::size_t component_bulk_end = buffer.current();
+  const std::size_t component_scalar_end = buffer.current_scalar();
+  CHECK(component_bulk_end - component_bulk_entry == layout.bulk_bytes);
+  CHECK(component_scalar_end - component_scalar_entry ==
+        layout.scalar_count);
+  const std::size_t measured_record_bytes =
+      component_bulk_end - component_bulk_entry +
+      (component_scalar_end - component_scalar_entry) * sizeof(Scalar);
+  CHECK(measured_record_bytes == layout.totalBytes());
+  checkPlannedAllocationFreeze(crowd, resource, *plan,
+                               registration_freeze);
+  checkScalarAllocationStatesUnchanged(crowd, prepared_states);
+
+  REQUIRE(plan->participantEvidence().size() == 1);
+  const BatchMemoryBytes selected_external =
+      plan->participantEvidence().front().selected_per_owner.at(
+          BatchMemoryCategory::PERSISTENT_WALKER_RECORD);
+  CHECK(selected_external.host ==
+        reserve_walker_count * measured_record_bytes);
+  CHECK(selected_external.device == 0);
+  CHECK(registration_freeze.resource.expected_resource_storage.at(
+            BatchMemoryCategory::PERSISTENT_WALKER_RECORD).host == 0);
+  CHECK(registration_freeze.resource.actual_resource_storage.at(
+            BatchMemoryCategory::PERSISTENT_WALKER_RECORD).host == 0);
+  for (const auto& diagnostics : registration_freeze.clone_workspaces)
+  {
+    CHECK(diagnostics.prepared_walker_buffer_layout == layout);
+    CHECK(diagnostics.prepared_walker_buffer_layout.totalBytes() ==
+          measured_record_bytes);
+  }
+
+  // Allocate the complete caller-owned prefix/component/suffix record outside
+  // every measured window and seed neighboring canaries once.
+  buffer.add(&suffix_gradient, &suffix_gradient + 1);
+  for (Scalar& scalar : suffix_scalars)
+    buffer.add(scalar);
+  buffer.allocate();
+  buffer.zero();
+  buffer.rewind();
+  buffer.put(&prefix_gradient, &prefix_gradient + 1);
+  for (Scalar& scalar : prefix_scalars)
+    buffer.put(scalar);
+  REQUIRE(buffer.current() == component_bulk_entry);
+  REQUIRE(buffer.current_scalar() == component_scalar_entry);
+  buffer.rewind(component_bulk_end, component_scalar_end);
+  buffer.put(&suffix_gradient, &suffix_gradient + 1);
+  for (Scalar& scalar : suffix_scalars)
+    buffer.put(scalar);
+
+  const char* const buffer_data = buffer.myData.data();
+  const std::size_t buffer_size = buffer.myData.size();
+  const std::size_t buffer_capacity = buffer.myData.capacity();
+  const Scalar* const scalar_data = buffer.Scalar_ptr;
+  const auto require_buffer_identity = [&] {
+    CHECK(buffer.myData.data() == buffer_data);
+    CHECK(buffer.myData.size() == buffer_size);
+    CHECK(buffer.myData.capacity() == buffer_capacity);
+    CHECK(buffer.Scalar_ptr == scalar_data);
+  };
+
+  // Warm refresh, then repeat it under allocation interposition.  With an
+  // unchanged accepted cache the canonical record remains byte-identical.
+  particles.G = Value(0);
+  particles.L = Value(0);
+  buffer.rewind(component_bulk_entry, component_scalar_entry);
+  component.updateBuffer(particles, buffer, false);
+  const auto canonical_buffer = buffer.myData;
+  particles.G = Value(0);
+  particles.L = Value(0);
+  buffer.rewind(component_bulk_entry, component_scalar_entry);
+  const PlannedAllocationFreeze refresh_freeze =
+      capturePlannedAllocationFreeze(crowd, resource);
+  const AllocationSnapshot refresh_allocations = auditAllocations([&] {
+    component.updateBuffer(particles, buffer, false);
+  });
+  checkNoAllocations(refresh_allocations,
+                     "planned walker-record refresh");
+  CHECK(buffer.current() == component_bulk_end);
+  CHECK(buffer.current_scalar() == component_scalar_end);
+  require_buffer_identity();
+  CHECK(sameVectorBits(buffer.myData, canonical_buffer));
+  for (std::size_t electron = 0; electron < particles.G.size(); ++electron)
+  {
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      CHECK(particles.G[electron][dimension] ==
+            prepared_states.front().accepted_gradient[electron][dimension]);
+    CHECK(particles.L[electron] ==
+          prepared_states.front().accepted_laplacian[electron]);
+  }
+  checkPlannedAllocationFreeze(crowd, resource, *plan, refresh_freeze);
+  checkScalarAllocationStatesUnchanged(crowd, prepared_states);
+
+  // Warm restoration from the same record, invalidate metadata again, and
+  // prove the measured restore publishes only into prepared clone storage.
+  Probe::invalidateAcceptedState(component);
+  buffer.rewind(component_bulk_entry, component_scalar_entry);
+  component.copyFromBuffer(particles, buffer);
+  const auto restored_states = captureScalarAllocationStates(crowd);
+  REQUIRE(restored_states.front().accepted_value_valid);
+  Probe::invalidateAcceptedState(component);
+  const ParticleSet::ParticlePos positions_before_restore = particles.R;
+  const ParticleSet::ParticleGradient gradients_before_restore =
+      particles.G;
+  const ParticleSet::ParticleLaplacian laplacians_before_restore =
+      particles.L;
+  buffer.rewind(component_bulk_entry, component_scalar_entry);
+  const PlannedAllocationFreeze restore_freeze =
+      capturePlannedAllocationFreeze(crowd, resource);
+  const AllocationSnapshot restore_allocations = auditAllocations([&] {
+    component.copyFromBuffer(particles, buffer);
+  });
+  checkNoAllocations(restore_allocations,
+                     "planned walker-record restoration");
+  CHECK(buffer.current() == component_bulk_end);
+  CHECK(buffer.current_scalar() == component_scalar_end);
+  require_buffer_identity();
+  CHECK(sameVectorBits(buffer.myData, canonical_buffer));
+  CHECK(sameVectorBits(particles.R, positions_before_restore));
+  CHECK(sameVectorBits(particles.G, gradients_before_restore));
+  CHECK(sameVectorBits(particles.L, laplacians_before_restore));
+  checkPlannedAllocationFreeze(crowd, resource, *plan, restore_freeze);
+  checkScalarAllocationStatesUnchanged(crowd, restored_states);
 }
 
 struct ScalarObservation
@@ -1967,6 +2197,14 @@ TEST_CASE("PsiFormer planned lifecycle hooks allocate no storage",
   {
     checkPlannedLifecycleAllocations(files, 3, 3);
   }
+}
+
+TEST_CASE("PsiFormer planned walker records allocate no storage and reconcile external bytes",
+          "[wavefunction][psiformer][allocation][batch_memory][walker_closure]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  setBackend("direct");
+  checkPlannedWalkerClosureAllocations(files);
 }
 
 TEST_CASE("PsiFormer warmed hard-plan active gradient freezes reserve storage",
