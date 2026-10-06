@@ -119,7 +119,8 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count,
 /// Fill every parameter region with deterministic values appropriate to its role.
 inline std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
 {
-  const std::size_t electron_count = system == "lih" ? 4 : (system == "lih_pair" ? 8 : 2);
+  const std::size_t electron_count = system == "lih" ? 4 :
+      (system == "lih_pair" ? 8 : (system == "unequal" ? 3 : 2));
   SplitMix64 random(PARAMETER_RECIPE_SEED + electron_count);
   std::vector<double> values;
   for (const Leaf& leaf : leaves)
@@ -179,6 +180,13 @@ inline Geometry makeGeometry(const std::string& system)
     geometry.charges = {1, 1};
     centers          = {0, 1};
     geometry.nup     = 1;
+  }
+  else if (system == "unequal")
+  {
+    geometry.nuclei = {0, 0, 0, 2.4, 0.1, 0};
+    geometry.charges = {2, 1};
+    centers          = {0, 1, 0};
+    geometry.nup     = 2;
   }
   else
     throw std::invalid_argument("Unknown generated PsiFormer test system: " + system);

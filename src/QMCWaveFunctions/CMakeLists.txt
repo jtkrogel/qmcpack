@@ -45,6 +45,7 @@ set(WFBASE_SRCS
     PsiFormer/PsiFormerMemoryPolicy.cpp
     PsiFormer/PsiFormerInitialization.cpp
     PsiFormer/PsiFormerGeometry.cpp
+    PsiFormer/PsiFormerOrbitalTargets.cpp
     PsiFormer/PsiFormerWorkspace.cpp
     PsiFormer/PsiFormerWF.cpp
     PsiFormer/PsiFormerWaveFunctionBuilder.cpp

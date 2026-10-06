@@ -144,6 +144,7 @@ public:
   std::unique_ptr<SPOSet> clonePhi() const;
 
   SPOSetPtr getPhi() { return Phi.get(); };
+  const SPOSet* getPhi() const { return Phi.get(); }
 
   inline bool isOptimizable() const { return Phi->isOptimizable(); }
 
@@ -263,6 +264,15 @@ public:
   inline int getNumPtcls() const { return NumPtcls; }
   inline int getFirstIndex() const { return FirstIndex; }
   inline int getNumOrbitals() const { return NumOrbitals; }
+  /// Report whether this determinant evaluates spinor orbitals.
+  inline bool isSpinor() const { return is_spinor_; }
+  /// Return one immutable unique occupation configuration.
+  const ci_configuration2& getConfiguration(std::size_t index) const
+  {
+    if (index >= ciConfigList->size())
+      throw std::out_of_range("MultiDiracDeterminant configuration index is out of range");
+    return (*ciConfigList)[index];
+  }
   inline int getNdetPerExcLevel(int i) const { return (*ndets_per_excitation_level_)[i]; }
   inline int getMaxExcLevel() const { return ndets_per_excitation_level_->size() - 1; }
 

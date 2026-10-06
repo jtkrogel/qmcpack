@@ -281,8 +281,12 @@ public:
   inline int getNumDets() const { return Dets.size(); }
   ///return the i-th determinant
   inline auto& getDet(const int i) { return *Dets[i]; }
+  ///return the immutable i-th determinant
+  inline const auto& getDet(const int i) const { return *Dets[i]; }
   ///return the sposet of the i-th determinant
   SPOSet& getPhi(int i = 0) { return Dets[i]->getPhi(); }
+  ///return the immutable sposet of the i-th determinant
+  const SPOSet& getPhi(int i = 0) const { return Dets[i]->getPhi(); }
 
 private:
   //get Det ID

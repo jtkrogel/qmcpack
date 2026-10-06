@@ -113,6 +113,8 @@ public:
 
   const std::vector<ValueType>& get_C() const { return *C; }
   const std::vector<std::vector<size_t>>& get_C2node() const { return *C2node; }
+  /// Report whether coefficients describe spin-adapted CSFs rather than explicit DETS.
+  bool hasCSFExpansion() const noexcept { return static_cast<bool>(csf_data_); }
 
   LogValue evaluate_vgl_impl(const ParticleSet& P,
                              ParticleSet::ParticleGradient& g_tmp,

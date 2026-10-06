@@ -207,6 +207,23 @@ struct DirectScoreResult
   std::size_t parameter_version = 0;
 };
 
+/** Identify the fixed target matrix consumed by one orbital-MSE evaluation. */
+struct DirectOrbitalMSEArguments
+{
+  const double* target = nullptr;
+  std::size_t target_size = 0;
+};
+
+/** Return one pre-determinant orbital loss and its direct reverse derivative. */
+struct DirectOrbitalMSEResult
+{
+  double loss = 0.0;
+  DirectParameterScoreView parameter_gradient;
+  const double* predicted_orbitals = nullptr;
+  std::size_t orbital_count = 0;
+  std::size_t parameter_version = 0;
+};
+
 /**
  * Own the forward tape, reverse adjoints, geometry cache, and score for one clone.
  *
@@ -526,6 +543,74 @@ public:
     DirectScoreResult result = evaluate(workspace);
     DirectScoreOutput::writeSelected(result.parameter_score, indices, selected_count, selected_output);
     return result;
+  }
+
+  /**
+   * Evaluate the DeepQMC-style pre-determinant orbital loss and its VJP.
+   *
+   * The alpha and beta electron-row sectors are normalized separately.  Each
+   * sector includes every full-determinant column, so the target's off-spin
+   * blocks contribute their required exact-zero constraints.  No determinant,
+   * cusp, or scalar wavefunction operation enters this route.
+   */
+  DirectOrbitalMSEResult evaluateOrbitalMSE(DirectScoreWorkspace& workspace,
+                                            DirectOrbitalMSEArguments arguments) const
+  {
+    validateWorkspaceAndParameters(workspace);
+    if (arguments.target_size != workspace.orbital_elements_ ||
+        (arguments.target_size != 0 && !arguments.target))
+      throw std::invalid_argument("PsiFormer orbital-MSE target has the wrong size");
+
+    const double* parameter_values = parameters_.flat_values().data();
+    std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
+    workspace.geometry_.update(
+        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
+    buildEmbedding(parameter_values, workspace);
+    for (std::size_t block = 0; block < workspace.blocks_; ++block)
+      applyAttentionBlock(parameter_values, block, workspace);
+    buildOrbitals(parameter_values, workspace);
+
+    const std::size_t up_elements =
+        workspace.determinants_ * spin_up_electrons_ * workspace.electrons_;
+    const std::size_t down_electrons = workspace.electrons_ - spin_up_electrons_;
+    const std::size_t down_elements =
+        workspace.determinants_ * down_electrons * workspace.electrons_;
+    const double up_scale = up_elements == 0 ? 0.0 : 1.0 / static_cast<double>(up_elements);
+    const double down_scale = down_elements == 0 ? 0.0 : 1.0 / static_cast<double>(down_elements);
+
+    double up_loss = 0.0;
+    double down_loss = 0.0;
+    const std::size_t matrix_elements = workspace.electrons_ * workspace.electrons_;
+    for (std::size_t determinant = 0; determinant < workspace.determinants_; ++determinant)
+      for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
+        for (std::size_t orbital = 0; orbital < workspace.electrons_; ++orbital)
+        {
+          const std::size_t index = determinant * matrix_elements +
+              electron * workspace.electrons_ + orbital;
+          const double residual = workspace.orbital_matrices_[index] - arguments.target[index];
+          const double scale = electron < spin_up_electrons_ ? up_scale : down_scale;
+          workspace.matrix_adjoints_[index] = 2.0 * scale * residual;
+          if (electron < spin_up_electrons_)
+            up_loss += scale * residual * residual;
+          else
+            down_loss += scale * residual * residual;
+        }
+
+    reverseOrbitals(parameter_values, workspace);
+    for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
+      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace);
+    reverseEmbedding(workspace);
+
+    workspace.observed_parameter_version_ = parameters_.version();
+    const double loss = up_loss + down_loss;
+    if (!is_finite_parameter_value(loss) ||
+        !std::all_of(workspace.parameter_score_.begin(), workspace.parameter_score_.end(),
+                     [](double value) { return is_finite_parameter_value(value); }))
+      throw std::runtime_error("PsiFormer orbital-MSE reverse pass produced a non-finite result");
+    return {loss,
+            {workspace.parameter_score_.data(), workspace.parameter_score_.size()},
+            workspace.orbital_matrices_.data(), workspace.orbital_matrices_.size(),
+            workspace.observed_parameter_version_};
   }
 
 private:

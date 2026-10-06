@@ -299,3 +299,87 @@ TEST_CASE("PsiFormer direct score supports canonical pseudo-LiH without same-spi
   }
   CHECK(maximum_scaled_error < 2e-10);
 }
+
+TEST_CASE("PsiFormer orbital MSE uses the direct tape and spin-sector normalization",
+          "[wavefunction][psiformer][pretraining]")
+{
+  GeneratedFiles files = generateFiles("unequal");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const qmcplusplus::psiformer::ModelShape shape{
+      model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet, model.dim,
+      model.heads, model.blocks};
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
+  pf::DirectScoreExecutor executor(model, plan);
+  std::unique_ptr<pf::DirectScoreWorkspace> workspace = executor.makeWorkspace();
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  workspace->setPositions(pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
+
+  const std::size_t orbital_count = model.ndet * model.ne * model.ne;
+  std::vector<double> target(orbital_count, 0.0);
+  const pf::DirectOrbitalMSEResult result =
+      executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()});
+  REQUIRE(result.orbital_count == orbital_count);
+  REQUIRE(result.parameter_gradient.size == model.p.size());
+  CHECK(result.parameter_version == model.p.version());
+
+  double expected_up = 0.0;
+  double expected_down = 0.0;
+  for (std::size_t determinant = 0; determinant < model.ndet; ++determinant)
+    for (std::size_t electron = 0; electron < model.ne; ++electron)
+      for (std::size_t orbital = 0; orbital < model.ne; ++orbital)
+      {
+        const std::size_t index = (determinant * model.ne + electron) * model.ne + orbital;
+        const double square = result.predicted_orbitals[index] * result.predicted_orbitals[index];
+        if (electron < model.cfg.nup)
+          expected_up += square / static_cast<double>(model.ndet * model.cfg.nup * model.ne);
+        else
+          expected_down += square /
+              static_cast<double>(model.ndet * model.cfg.ndown * model.ne);
+      }
+  checkClose(result.loss, expected_up + expected_down, 2e-12, 2e-12);
+
+  using qmcplusplus::psiformer::ParameterRole;
+  const std::array<std::size_t, 5> checked_parameters{
+      plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).begin,
+      plan.parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, 0).begin,
+      plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT).begin,
+      plan.parameter(ParameterRole::ENVELOPE_PI_DOWN).begin,
+      plan.parameter(ParameterRole::ENVELOPE_ZETA_UP).begin};
+  std::array<double, checked_parameters.size()> analytic;
+  for (std::size_t index = 0; index < checked_parameters.size(); ++index)
+    analytic[index] = result.parameter_gradient[checked_parameters[index]];
+
+  // A different target must not leave residual matrix or parameter adjoints in
+  // the reusable workspace when the original target is evaluated again.
+  const std::size_t storage_fingerprint = workspace->storageFingerprint();
+  target[0] = 1.25;
+  executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()});
+  target[0] = 0.0;
+  const pf::DirectOrbitalMSEResult repeated =
+      executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()});
+  for (std::size_t index = 0; index < checked_parameters.size(); ++index)
+    checkClose(repeated.parameter_gradient[checked_parameters[index]], analytic[index], 2e-12, 2e-12);
+  CHECK(workspace->storageFingerprint() == storage_fingerprint);
+
+  const double epsilon = 2.0e-6;
+  for (std::size_t index = 0; index < checked_parameters.size(); ++index)
+  {
+    const std::size_t parameter = checked_parameters[index];
+    const double original = model.p.flat_values()[parameter];
+    model.p.set_flat_value(parameter, original + epsilon);
+    const double plus = executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()}).loss;
+    model.p.set_flat_value(parameter, original - epsilon);
+    const double minus = executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()}).loss;
+    model.p.set_flat_value(parameter, original);
+    CHECK(analytic[index] == Catch::Approx((plus - minus) / (2.0 * epsilon))
+                                 .epsilon(3.0e-5).margin(3.0e-7));
+  }
+
+  CHECK(result.parameter_gradient.size == model.p.size());
+  CHECK(executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()})
+            .parameter_gradient[plan.parameter(ParameterRole::CUSP_SAME_ALPHA).begin] == 0.0);
+  CHECK(executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()})
+            .parameter_gradient[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] == 0.0);
+  CHECK_THROWS_AS(executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size() - 1}),
+                  std::invalid_argument);
+}

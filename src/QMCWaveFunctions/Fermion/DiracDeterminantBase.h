@@ -61,6 +61,7 @@ public:
 
   // get the SPO pointer
   inline SPOSet& getPhi() { return phi_; }
+  inline const SPOSet& getPhi() const { return phi_; }
 
   // get FirstIndex, Last Index
   inline int getFirstIndex() const { return FirstIndex; }
