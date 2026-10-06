@@ -667,6 +667,10 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   std::uint64_t prepared_plan_fingerprint   = 0;
   std::size_t prepared_storage_fingerprint = 0;
   BatchMemoryEstimate actual_resource_storage;
+  /// Preparation provenance captured while this exact resource is on loan.
+  const BatchExecutionPlan* acquired_plan_identity = nullptr;
+  std::size_t acquired_crowd_index                  = 0;
+  bool acquired_from_prepared_collection            = false;
 
   std::unique_ptr<pf::DirectBatchWorkspace> batch_workspace;
   /// Lazily allocated score tape serialized across component-major crowd calls.
@@ -816,6 +820,10 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
       throw std::logic_error(
           "PsiFormer prepared crowd storage changed after plan publication");
   }
+
+  /// Recompute retained allocation identity without exposing mutable storage.
+  std::size_t currentStorageFingerprint() const noexcept
+  { return storageFingerprint(); }
 
 private:
   /// Allocate exactly one typed vector from a byte requirement.
@@ -1547,7 +1555,9 @@ PsiFormerWF::PsiFormerWF(std::string name,
                   std::make_shared<PsiFormerSharedState>(std::move(initialized_parameters), electrons, ions),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
-{}
+{
+  bound_particle_set_ = &electrons;
+}
 
 // Register selected or complete parameters after either model-construction route.
 PsiFormerWF::PsiFormerWF(std::string name,
@@ -1663,6 +1673,7 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       complete_batch_memory_accounting_for_testing_(
           other.complete_batch_memory_accounting_for_testing_),
       system_kind_(other.system_kind_),
+      bound_particle_set_(other.bound_particle_set_),
       optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
       restore_validation_pending_(other.restore_validation_pending_),
@@ -2048,20 +2059,43 @@ void PsiFormerWF::acquireResource(
     ResourceCollection& collection,
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const
 {
-  auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+  auto* leader_ptr = dynamic_cast<PsiFormerWF*>(&wfc_list.getLeader());
+  if (leader_ptr == nullptr)
+    throw std::invalid_argument(
+        "PsiFormer multiwalker resource acquisition received a foreign leader type");
+  auto& leader = *leader_ptr;
   if (this != &leader)
     throw std::logic_error("PsiFormer multiwalker resource acquisition must be invoked on the leader");
   if (leader.mw_resource_handle_)
     throw std::logic_error("PsiFormer multiwalker resource is already acquired");
+  if (!wfc_list.empty() && &wfc_list[0] != &leader)
+    throw std::invalid_argument(
+        "PsiFormer multiwalker resource acquisition requires its leader in lane zero");
+  if (leader.acquired_crowd_leader_ != nullptr ||
+      leader.acquired_crowd_size_ != 0)
+    throw std::logic_error(
+        "PsiFormer multiwalker leader retained stale acquisition-lane state");
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
-    const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    auto* component_ptr = dynamic_cast<PsiFormerWF*>(&wfc_list[walker]);
+    if (component_ptr == nullptr)
+      throw std::invalid_argument(
+          "PsiFormer multiwalker resource acquisition contains a foreign component type");
+    const auto& component = *component_ptr;
+    for (std::size_t prior = 0; prior < walker; ++prior)
+      if (&wfc_list[walker] == &wfc_list[prior])
+        throw std::invalid_argument(
+            "PsiFormer multiwalker resource acquisition contains a duplicate component");
     if (component.model_state_.get() != leader.model_state_.get())
       throw std::invalid_argument("PsiFormer multiwalker list contains components from different models");
     if (!component.batch_execution_plan_.sameBinding(
             leader.batch_execution_plan_))
       throw std::invalid_argument(
           "PsiFormer multiwalker list contains components with different batch plans");
+    if (component.acquired_crowd_leader_ != nullptr ||
+        component.acquired_crowd_size_ != 0)
+      throw std::logic_error(
+          "PsiFormer multiwalker component retained stale acquisition-lane state");
   }
 
   const BatchResourcePreparationProvenance& collection_provenance =
@@ -2103,6 +2137,23 @@ void PsiFormerWF::acquireResource(
     std::rethrow_exception(failure);
   }
   leader.mw_resource_handle_ = std::move(candidate_handle);
+  auto& acquired_resource = leader.mw_resource_handle_.getResource();
+  if (leader.batch_execution_plan_)
+  {
+    acquired_resource.acquired_plan_identity            = collection_provenance.plan.get();
+    acquired_resource.acquired_crowd_index              = collection_provenance.crowd_index;
+    acquired_resource.acquired_from_prepared_collection = true;
+  }
+  leader.acquired_resource_collection_        = &collection;
+  leader.acquired_resource_cursor_            = collection.getCursor();
+  leader.acquired_resource_outstanding_loans_ = collection.getOutstandingLoanCount();
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+    component.acquired_crowd_leader_ = &leader;
+    component.acquired_lane_index_   = lane;
+    component.acquired_crowd_size_   = wfc_list.size();
+  }
 }
 
 // Return the exact handle previously lent to this crowd leader.
@@ -2110,10 +2161,49 @@ void PsiFormerWF::releaseResource(
     ResourceCollection& collection,
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const
 {
-  auto& leader = wfc_list.getCastedLeader<PsiFormerWF>();
+  auto* leader_ptr = dynamic_cast<PsiFormerWF*>(&wfc_list.getLeader());
+  if (leader_ptr == nullptr)
+    throw std::invalid_argument(
+        "PsiFormer multiwalker resource release received a foreign leader type");
+  auto& leader = *leader_ptr;
   if (this != &leader || !leader.mw_resource_handle_)
     throw std::logic_error("PsiFormer multiwalker resource release has no acquired leader handle");
+  if (leader.acquired_resource_collection_ != &collection)
+    throw std::logic_error(
+        "PsiFormer multiwalker resource release received a different collection");
+  if (collection.getOutstandingLoanCount() !=
+      leader.acquired_resource_outstanding_loans_)
+    throw std::logic_error(
+        "PsiFormer multiwalker resource release observed changed loan ownership");
+  if (!wfc_list.empty() && &wfc_list[0] != &leader)
+    throw std::invalid_argument(
+        "PsiFormer multiwalker resource release requires its leader in lane zero");
+  if (wfc_list.empty() &&
+      (leader.acquired_crowd_leader_ != nullptr ||
+       leader.acquired_crowd_size_ != 0))
+    throw std::invalid_argument(
+        "PsiFormer multiwalker empty release does not match its acquired crowd");
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    auto* component_ptr = dynamic_cast<PsiFormerWF*>(&wfc_list[lane]);
+    if (component_ptr == nullptr)
+      throw std::invalid_argument(
+          "PsiFormer multiwalker resource release contains a foreign component type");
+    const auto& component = *component_ptr;
+    for (std::size_t prior = 0; prior < lane; ++prior)
+      if (&wfc_list[lane] == &wfc_list[prior])
+        throw std::invalid_argument(
+            "PsiFormer multiwalker resource release contains a duplicate component");
+    if (component.acquired_crowd_leader_ != &leader ||
+        component.acquired_lane_index_ != lane ||
+        component.acquired_crowd_size_ != wfc_list.size())
+      throw std::invalid_argument(
+          "PsiFormer multiwalker resource release order differs from acquisition");
+  }
   auto& resource = leader.mw_resource_handle_.getResource();
+  // Return ownership first.  If ResourceCollection rejects the ordering, the
+  // handle, logical extents, and provenance remain intact for a retry.
+  collection.takebackResource(leader.mw_resource_handle_);
   resource.configuration_identities.clear();
   resource.batch_slots.clear();
   resource.staged_signs.clear();
@@ -2135,7 +2225,19 @@ void PsiFormerWF::releaseResource(
   resource.virtual_reference_signs.clear();
   resource.virtual_reference_logabs.clear();
   resource.walker_indices.clear();
-  collection.takebackResource(leader.mw_resource_handle_);
+  resource.acquired_plan_identity            = nullptr;
+  resource.acquired_crowd_index              = 0;
+  resource.acquired_from_prepared_collection = false;
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
+    component.acquired_crowd_leader_ = nullptr;
+    component.acquired_lane_index_   = 0;
+    component.acquired_crowd_size_   = 0;
+  }
+  leader.acquired_resource_collection_        = nullptr;
+  leader.acquired_resource_cursor_            = 0;
+  leader.acquired_resource_outstanding_loans_ = 0;
 }
 
 // Validate a crowd call before dereferencing mutable shared scratch.
@@ -2163,6 +2265,488 @@ PsiFormerWF::PsiFormerMultiWalkerResource& PsiFormerWF::requireMultiWalkerResour
           "PsiFormer multiwalker list contains components with different batch plans");
   }
   return resource;
+}
+
+// Map each typed operation to the explicit modes that authorize its runtime path.
+BatchExecutionRequirements PsiFormerWF::plannedOperationRequiredModes(
+    PlannedOperation operation) noexcept
+{
+  BatchExecutionRequirements modes;
+  switch (operation)
+  {
+  case PlannedOperation::FULL_VGL:
+  case PlannedOperation::SELECTED_PROPOSE:
+    modes.require(BatchExecutionMode::FULL_VGL);
+    break;
+  case PlannedOperation::RECOMPUTE_VALUE:
+  case PlannedOperation::CALC_RATIO:
+    modes.require(BatchExecutionMode::VALUE);
+    break;
+  case PlannedOperation::ACTIVE_GRADIENT:
+    modes.require(BatchExecutionMode::ACTIVE_GRADIENT);
+    break;
+  case PlannedOperation::RATIO_GRADIENT:
+    modes.require(BatchExecutionMode::ACTIVE_GRADIENT);
+    break;
+  case PlannedOperation::ECP_VALUE:
+    modes.require(BatchExecutionMode::VALUE);
+    modes.require(BatchExecutionMode::ECP_OUTER);
+    break;
+  case PlannedOperation::ECP_WEIGHTED_SCORE:
+    modes.require(BatchExecutionMode::VALUE);
+    modes.require(BatchExecutionMode::ECP_OUTER);
+    modes.require(BatchExecutionMode::ECP_WEIGHTED_SCORE);
+    break;
+  case PlannedOperation::SCORE_DERIVATIVES:
+    modes.require(BatchExecutionMode::SCORE);
+    break;
+  case PlannedOperation::KINETIC_DERIVATIVES:
+    modes.require(BatchExecutionMode::KINETIC);
+    break;
+  case PlannedOperation::SCALAR_VALUE_COMPATIBILITY:
+    modes.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+    break;
+  case PlannedOperation::ACCEPT_REJECT_VALUE:
+  case PlannedOperation::SELECTED_RESOLVE:
+  case PlannedOperation::BUFFER_READ:
+  case PlannedOperation::BUFFER_WRITE:
+  case PlannedOperation::PREPARE_GROUP:
+  case PlannedOperation::COMPLETE_UPDATES:
+    break;
+  }
+  return modes;
+}
+
+// Map each typed operation to the proposal state required before it may begin.
+PsiFormerWF::ProposalRequirement PsiFormerWF::plannedOperationProposalRequirement(
+    PlannedOperation operation) noexcept
+{
+  switch (operation)
+  {
+  case PlannedOperation::ACCEPT_REJECT_VALUE:
+    return ProposalRequirement::SINGLE_PENDING;
+  case PlannedOperation::SELECTED_RESOLVE:
+    return ProposalRequirement::SELECTED_PENDING;
+  case PlannedOperation::FULL_VGL:
+  case PlannedOperation::RECOMPUTE_VALUE:
+  case PlannedOperation::CALC_RATIO:
+  case PlannedOperation::ACTIVE_GRADIENT:
+  case PlannedOperation::RATIO_GRADIENT:
+  case PlannedOperation::SELECTED_PROPOSE:
+  case PlannedOperation::ECP_VALUE:
+  case PlannedOperation::ECP_WEIGHTED_SCORE:
+  case PlannedOperation::SCORE_DERIVATIVES:
+  case PlannedOperation::KINETIC_DERIVATIVES:
+  case PlannedOperation::SCALAR_VALUE_COMPATIBILITY:
+  case PlannedOperation::BUFFER_READ:
+  case PlannedOperation::BUFFER_WRITE:
+  case PlannedOperation::PREPARE_GROUP:
+  case PlannedOperation::COMPLETE_UPDATES:
+    return ProposalRequirement::ABSENT;
+  }
+  return ProposalRequirement::NONE;
+}
+
+// Prove all common planned-runtime facts without synchronizing or publishing state.
+PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperation(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    const PlannedRuntimeRequest& request) const
+{
+  if (wfc_list.empty() || p_list.empty())
+    throw std::invalid_argument("PsiFormer planned operation requires a nonempty crowd");
+  if (wfc_list.size() != p_list.size() ||
+      request.live_walkers != wfc_list.size())
+    throw std::invalid_argument(
+        "PsiFormer planned operation has inconsistent live-lane counts");
+  if (&wfc_list.getLeader() != &wfc_list[0] ||
+      &p_list.getLeader() != &p_list[0])
+    throw std::invalid_argument(
+        "PsiFormer planned operation lists must place their leaders in lane zero");
+
+  auto* component_leader = dynamic_cast<PsiFormerWF*>(&wfc_list.getLeader());
+  if (component_leader == nullptr || component_leader != this)
+    throw std::invalid_argument(
+        "PsiFormer planned operation was not invoked on its component leader");
+
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    if (dynamic_cast<PsiFormerWF*>(&wfc_list[lane]) == nullptr)
+      throw std::invalid_argument(
+          "PsiFormer planned operation contains a foreign component type");
+    for (std::size_t prior = 0; prior < lane; ++prior)
+    {
+      if (&wfc_list[lane] == &wfc_list[prior])
+        throw std::invalid_argument(
+            "PsiFormer planned operation contains a duplicate component");
+      if (&p_list[lane] == &p_list[prior])
+        throw std::invalid_argument(
+            "PsiFormer planned operation contains a duplicate ParticleSet");
+    }
+  }
+
+  if (!batch_execution_plan_ ||
+      !prepared_clone_batch_execution_plan_.sameBinding(batch_execution_plan_))
+    throw std::logic_error(
+        "PsiFormer planned operation requires an exactly prepared leader clone");
+
+  const BatchExecutionPlan& plan = batch_execution_plan_.plan();
+  const psiformer::ModelShape& model_shape =
+      model_state_->execution_plan.modelShape();
+  const std::size_t electron_count = model_shape.electrons();
+  if (plan.targetCoordinate() != BatchExecutionTargetCoordinate::POS_ONLY)
+    throw std::invalid_argument(
+        "PsiFormer planned operation requires explicit POS-only target evidence");
+  if (plan.particleCount() != electron_count)
+    throw std::invalid_argument(
+        "PsiFormer planned operation particle count differs from its model");
+  const bool requires_active_move =
+      request.operation == PlannedOperation::CALC_RATIO ||
+      request.operation == PlannedOperation::RATIO_GRADIENT ||
+      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE;
+
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+    const ParticleSet& particles = p_list[lane];
+    if (component.model_state_.get() != model_state_.get())
+      throw std::invalid_argument(
+          "PsiFormer planned operation mixes distinct shared models");
+    if (component.optimization_metadata_.get() != optimization_metadata_.get())
+      throw std::invalid_argument(
+          "PsiFormer planned operation mixes distinct optimizer metadata");
+    if (component.bound_particle_set_ != &particles)
+      throw std::invalid_argument(
+          "PsiFormer planned operation component and ParticleSet lanes are not identically bound");
+    if (component.acquired_crowd_leader_ != component_leader ||
+        component.acquired_lane_index_ != lane ||
+        component.acquired_crowd_size_ != wfc_list.size())
+      throw std::invalid_argument(
+          "PsiFormer planned operation lane order differs from resource acquisition");
+    if (!component.batch_execution_plan_.sameBinding(batch_execution_plan_) ||
+        !component.prepared_clone_batch_execution_plan_.sameBinding(
+            batch_execution_plan_))
+      throw std::logic_error(
+          "PsiFormer planned operation contains an unprepared or differently bound clone");
+    if (particles.isSpinor())
+      throw std::invalid_argument(
+          "PsiFormer planned POS-only operation received a spinor ParticleSet");
+    if (static_cast<std::size_t>(particles.getTotalNum()) != electron_count ||
+        particles.R.size() != electron_count || particles.G.size() != electron_count ||
+        particles.L.size() != electron_count || particles.GroupID.size() != electron_count ||
+        particles.spins.size() != electron_count ||
+        particles.getCoordinates().getAllParticlePos().size() != electron_count)
+      throw std::invalid_argument(
+          "PsiFormer planned operation received incompatible ParticleSet extents");
+    if (particles.groups() != 2 ||
+        particles.groupsize(0) != static_cast<int>(model_shape.spin_up_electrons) ||
+        particles.groupsize(1) != static_cast<int>(model_shape.spin_down_electrons))
+      throw std::invalid_argument(
+          "PsiFormer planned operation received an incompatible spin partition");
+    for (std::size_t electron = 0; electron < electron_count; ++electron)
+    {
+      const int expected_group =
+          electron < model_shape.spin_up_electrons ? 0 : 1;
+      if (particles.GroupID[electron] != expected_group)
+        throw std::invalid_argument(
+            "PsiFormer planned operation received noncanonical spin ordering");
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        if (!psiformer::determinant::isFiniteReal(
+                static_cast<double>(particles.R[electron][dimension])))
+          throw std::invalid_argument(
+              "PsiFormer planned operation received a non-finite position");
+        if (particles.getCoordinates().getAllParticlePos()[electron][dimension] !=
+            particles.R[electron][dimension])
+          throw std::invalid_argument(
+              "PsiFormer planned operation has inconsistent AoS and SoA positions");
+      }
+    }
+    if ((requires_active_move &&
+         (!request.active_electron || particles.getActivePtcl() !=
+              static_cast<int>(*request.active_electron))) ||
+        (!requires_active_move && particles.getActivePtcl() != -1))
+      throw std::invalid_argument(
+          "PsiFormer planned operation has incompatible ParticleSet active-move state");
+    if (requires_active_move)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (!psiformer::determinant::isFiniteReal(
+                static_cast<double>(particles.getActivePos()[dimension])))
+          throw std::invalid_argument(
+              "PsiFormer planned operation received a non-finite active position");
+    if (component.accepted_gradient_.size() != electron_count ||
+        component.accepted_laplacian_.size() != electron_count ||
+        component.proposed_gradient_.size() != electron_count ||
+        component.proposed_laplacian_.size() != electron_count)
+      throw std::logic_error(
+          "PsiFormer planned operation clone storage has the wrong electron extent");
+  }
+
+  PsiFormerMultiWalkerResource& resource = requireMultiWalkerResource(wfc_list);
+  if (acquired_resource_collection_ == nullptr ||
+      acquired_resource_cursor_ == 0 ||
+      acquired_resource_outstanding_loans_ == 0)
+    throw std::logic_error(
+        "PsiFormer planned operation lacks borrowed collection provenance");
+  const BatchResourcePreparationProvenance& collection_provenance =
+      acquired_resource_collection_->getBatchResourcePreparationProvenance();
+  if (collection_provenance.state != BatchResourcePreparationState::PREPARED ||
+      collection_provenance.plan.get() != &plan ||
+      collection_provenance.crowd_index != resource.prepared_crowd_index ||
+      acquired_resource_collection_->getCursor() != acquired_resource_cursor_ ||
+      acquired_resource_collection_->getOutstandingLoanCount() !=
+          acquired_resource_outstanding_loans_)
+    throw std::logic_error(
+        "PsiFormer planned operation borrowed collection changed after acquisition");
+  if (!resource.acquired_from_prepared_collection ||
+      resource.acquired_plan_identity != &plan ||
+      resource.acquired_crowd_index != resource.prepared_crowd_index)
+    throw std::logic_error(
+        "PsiFormer planned operation lacks exact prepared-collection provenance");
+  if (!resource.prepared_plan.sameBinding(batch_execution_plan_) ||
+      !resource.prepared_crowd_plan ||
+      resource.prepared_plan_fingerprint != plan.fingerprint())
+    throw std::logic_error(
+        "PsiFormer planned operation has stale resource plan provenance");
+
+  const std::size_t crowd_index = resource.prepared_crowd_index;
+  const BatchExecutionTopology& topology = plan.topology();
+  const std::vector<std::size_t>& reserve_walkers =
+      psiformer::psiFormerReserveWalkersPerCrowd(topology);
+  if (crowd_index >= topology.initial_walkers_per_crowd.size() ||
+      crowd_index >= reserve_walkers.size())
+    throw std::logic_error(
+        "PsiFormer planned operation resource crowd index is outside the topology");
+
+  const psiformer::PsiFormerCrowdMemoryPlan& crowd =
+      *resource.prepared_crowd_plan;
+  if (crowd.initial_walkers != topology.initial_walkers_per_crowd[crowd_index] ||
+      crowd.reserve_walkers != reserve_walkers[crowd_index] ||
+      request.live_walkers > crowd.reserve_walkers)
+    throw std::length_error(
+        "PsiFormer planned operation exceeds or mismatches its crowd envelope");
+  if (!resource.batch_workspace || !resource.batch_workspace->hasCapacityPlan())
+    throw std::logic_error(
+        "PsiFormer planned operation has no prepared direct-batch workspace");
+
+  const pf::DirectBatchCapacityPlan& workspace_plan =
+      resource.batch_workspace->capacityPlan();
+  const auto same_direct_capacity = [](const pf::DirectBatchCapacityPlan& left,
+                                       const pf::DirectBatchCapacityPlan& right) {
+    return left.logical.value_dense == right.logical.value_dense &&
+        left.logical.full_vgl == right.logical.full_vgl &&
+        left.logical.active_gradient == right.logical.active_gradient &&
+        left.logical.sparse_references == right.logical.sparse_references &&
+        left.logical.sparse_replacements == right.logical.sparse_replacements &&
+        left.tile.value == right.tile.value &&
+        left.tile.full_vgl == right.tile.full_vgl &&
+        left.tile.active_gradient == right.tile.active_gradient;
+  };
+  if (!same_direct_capacity(workspace_plan, crowd.direct_batch))
+    throw std::logic_error(
+        "PsiFormer planned operation direct-batch capacity changed after preparation");
+
+  const std::size_t storage_fingerprint = resource.currentStorageFingerprint();
+  if (storage_fingerprint == 0 ||
+      storage_fingerprint != resource.prepared_storage_fingerprint)
+    throw std::logic_error(
+        "PsiFormer planned operation resource storage changed after preparation");
+
+  if (topology.serialized_walkers || topology.backend_id != "cpu" ||
+      topology.device_id)
+    throw std::invalid_argument(
+        "PsiFormer planned operation requires direct nonserialized CPU execution");
+  const BatchExecutionRequirements operation_modes =
+      plannedOperationRequiredModes(request.operation);
+  for (const BatchExecutionMode mode : {
+           BatchExecutionMode::VALUE, BatchExecutionMode::FULL_VGL,
+           BatchExecutionMode::ACTIVE_GRADIENT, BatchExecutionMode::SCORE,
+           BatchExecutionMode::KINETIC, BatchExecutionMode::ECP_OUTER,
+           BatchExecutionMode::ECP_WEIGHTED_SCORE,
+           BatchExecutionMode::ECP_TMOVE_CANDIDATES,
+           BatchExecutionMode::ECP_LISTENER_OUTPUT,
+           BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY})
+    if (operation_modes.requires(mode) &&
+        !plan.requirements().requires(mode))
+      throw std::invalid_argument(
+          "PsiFormer planned operation lacks an explicitly required mode");
+  validatePlannedBackends(makeBatchMemoryPolicyInput(), operation_modes);
+
+  const bool sparse_operation = request.operation == PlannedOperation::ECP_VALUE ||
+      request.operation == PlannedOperation::ECP_WEIGHTED_SCORE;
+  if (sparse_operation)
+  {
+    if (request.dense_configurations != 0 ||
+        request.sparse_references > crowd.direct_batch.logical.sparse_references ||
+        request.sparse_references > request.live_walkers ||
+        request.sparse_replacements > crowd.direct_batch.logical.sparse_replacements)
+      throw std::length_error(
+          "PsiFormer planned sparse operation exceeds its prepared extents");
+  }
+  else if (request.sparse_references != 0 || request.sparse_replacements != 0)
+    throw std::invalid_argument(
+        "PsiFormer planned dense operation received sparse extents");
+
+  std::size_t dense_capacity = 0;
+  enum class DenseExtentRule
+  {
+    ZERO,
+    EXACT_LIVE,
+    AT_MOST_LIVE,
+    SCALAR_CLONE
+  };
+  DenseExtentRule dense_rule = DenseExtentRule::ZERO;
+  switch (request.operation)
+  {
+  case PlannedOperation::FULL_VGL:
+    dense_capacity    = crowd.direct_batch.logical.full_vgl;
+    dense_rule        = DenseExtentRule::EXACT_LIVE;
+    break;
+  case PlannedOperation::SELECTED_PROPOSE:
+    dense_capacity = crowd.direct_batch.logical.full_vgl;
+    dense_rule     = DenseExtentRule::AT_MOST_LIVE;
+    break;
+  case PlannedOperation::RECOMPUTE_VALUE:
+    dense_capacity    = crowd.direct_batch.logical.value_dense;
+    dense_rule        = DenseExtentRule::AT_MOST_LIVE;
+    break;
+  case PlannedOperation::CALC_RATIO:
+    dense_capacity = crowd.direct_batch.logical.value_dense;
+    dense_rule     = DenseExtentRule::EXACT_LIVE;
+    break;
+  case PlannedOperation::ACTIVE_GRADIENT:
+  case PlannedOperation::RATIO_GRADIENT:
+    dense_capacity    = crowd.direct_batch.logical.active_gradient;
+    dense_rule        = DenseExtentRule::EXACT_LIVE;
+    break;
+  case PlannedOperation::SCORE_DERIVATIVES:
+  case PlannedOperation::KINETIC_DERIVATIVES:
+    dense_capacity    = crowd.reserve_walkers;
+    dense_rule        = DenseExtentRule::EXACT_LIVE;
+    break;
+  case PlannedOperation::SCALAR_VALUE_COMPATIBILITY:
+    dense_rule = DenseExtentRule::SCALAR_CLONE;
+    break;
+  case PlannedOperation::ACCEPT_REJECT_VALUE:
+  case PlannedOperation::SELECTED_RESOLVE:
+  case PlannedOperation::ECP_VALUE:
+  case PlannedOperation::ECP_WEIGHTED_SCORE:
+  case PlannedOperation::BUFFER_READ:
+  case PlannedOperation::BUFFER_WRITE:
+  case PlannedOperation::PREPARE_GROUP:
+  case PlannedOperation::COMPLETE_UPDATES:
+    break;
+  }
+  bool invalid_dense_extent = false;
+  switch (dense_rule)
+  {
+  case DenseExtentRule::ZERO:
+    invalid_dense_extent = request.dense_configurations != 0;
+    break;
+  case DenseExtentRule::EXACT_LIVE:
+    invalid_dense_extent = request.dense_configurations != request.live_walkers ||
+        request.dense_configurations > dense_capacity;
+    break;
+  case DenseExtentRule::AT_MOST_LIVE:
+    invalid_dense_extent = request.dense_configurations > request.live_walkers ||
+        request.dense_configurations > dense_capacity;
+    break;
+  case DenseExtentRule::SCALAR_CLONE:
+    for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+    {
+      const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+      if (!component.direct_batch_workspace_ ||
+          !component.direct_batch_workspace_->hasCapacityPlan() ||
+          request.dense_configurations >
+              component.direct_batch_workspace_->capacityPlan().logical.value_dense)
+      {
+        invalid_dense_extent = true;
+        break;
+      }
+    }
+    break;
+  }
+  if (invalid_dense_extent)
+    throw std::length_error(
+        "PsiFormer planned operation has incompatible dense extents");
+
+  const bool derivative_operation =
+      request.operation == PlannedOperation::ECP_WEIGHTED_SCORE ||
+      request.operation == PlannedOperation::SCORE_DERIVATIVES ||
+      request.operation == PlannedOperation::KINETIC_DERIVATIVES;
+  if (derivative_operation)
+  {
+    if (request.selected_parameters != crowd.publication_staging.active_parameters ||
+        request.derivative_width != plan.parameterDerivativeWidth())
+      throw std::invalid_argument(
+          "PsiFormer planned derivative operation has incompatible parameter extents");
+  }
+  else if (request.selected_parameters != 0 || request.derivative_width != 0)
+    throw std::invalid_argument(
+        "PsiFormer planned nonderivative operation received derivative extents");
+
+  const bool single_particle_operation =
+      request.operation == PlannedOperation::CALC_RATIO ||
+      request.operation == PlannedOperation::ACTIVE_GRADIENT ||
+      request.operation == PlannedOperation::RATIO_GRADIENT ||
+      request.operation == PlannedOperation::ACCEPT_REJECT_VALUE;
+  if (single_particle_operation)
+  {
+    if (!request.active_electron || *request.active_electron >= electron_count)
+      throw std::out_of_range(
+          "PsiFormer planned one-electron operation has an invalid active electron");
+  }
+  else if (request.active_electron)
+    throw std::invalid_argument(
+        "PsiFormer planned operation received an unexpected active electron");
+
+  const bool selected_operation =
+      request.operation == PlannedOperation::SELECTED_PROPOSE ||
+      request.operation == PlannedOperation::SELECTED_RESOLVE;
+  if (selected_operation != request.descriptor_fingerprint.has_value())
+    throw std::invalid_argument(
+        "PsiFormer selected-operation descriptor identity is absent or unexpected");
+
+  const ProposalRequirement expected_proposal =
+      plannedOperationProposalRequirement(request.operation);
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
+    switch (expected_proposal)
+    {
+    case ProposalRequirement::NONE:
+      break;
+    case ProposalRequirement::ABSENT:
+      if (component.has_proposal_ || component.proposal_kind_ != ProposalKind::NONE)
+        throw std::logic_error(
+            "PsiFormer planned operation requires absent proposal state");
+      break;
+    case ProposalRequirement::SINGLE_PENDING:
+      if (!component.has_proposal_ ||
+          component.proposal_kind_ != ProposalKind::SINGLE_PARTICLE ||
+          component.proposed_particle_ != static_cast<int>(*request.active_electron) ||
+          component.proposed_parameter_version_ !=
+              component.observed_parameter_version_)
+        throw std::logic_error(
+            "PsiFormer planned operation requires one exact single-particle proposal");
+      break;
+    case ProposalRequirement::SELECTED_PENDING:
+      if (!component.has_proposal_ ||
+          component.proposal_kind_ != ProposalKind::SELECTED_PARTICLES ||
+          component.proposed_descriptor_fingerprint_ !=
+              *request.descriptor_fingerprint ||
+          component.proposed_parameter_version_ !=
+              component.observed_parameter_version_)
+        throw std::logic_error(
+            "PsiFormer planned operation requires one exact selected-particle proposal");
+      break;
+    }
+  }
+
+  if (storage_fingerprint != resource.currentStorageFingerprint())
+    throw std::logic_error(
+        "PsiFormer planned operation resource storage changed during preflight");
+  return {resource, batch_execution_plan_, crowd, storage_fingerprint};
 }
 
 // Expose only ownership counts needed to prove bounded crowd scratch in a regression test.
@@ -2305,6 +2889,30 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
   diagnostics.actual_resource_storage = resource.actual_resource_storage;
   diagnostics.prepared_storage_fingerprint =
       resource.prepared_storage_fingerprint;
+  diagnostics.current_storage_fingerprint = resource.currentStorageFingerprint();
+  diagnostics.logical_sizes = {
+      resource.total_log_gradient.size(),
+      resource.configuration_identities.size(),
+      resource.batch_slots.size(),
+      resource.staged_signs.size(),
+      resource.staged_log_magnitudes.size(),
+      resource.staged_value_ratios.size(),
+      resource.staged_log_ratios.size(),
+      resource.staged_gradients.size(),
+      resource.preservation_flags.size(),
+      resource.active_electrons.size(),
+      resource.virtual_offsets.size(),
+      resource.active_virtual_walkers.size(),
+      resource.virtual_reference_indices.size(),
+      resource.flat_virtual_ratios.size(),
+      resource.virtual_reference_weights.size(),
+      resource.active_derivative_global_indices.size(),
+      resource.flat_virtual_weighted_derivatives.size(),
+      resource.virtual_score_contribution.size(),
+      resource.kinetic_parameter_contribution.size(),
+      resource.virtual_reference_signs.size(),
+      resource.virtual_reference_logabs.size(),
+      resource.walker_indices.size()};
   diagnostics.backend_modes = {
       directBackendModeName(transaction.state().direct_value_mode),
       directBackendModeName(transaction.state().direct_spatial_mode),
@@ -2898,6 +3506,7 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
   }
 
   system_kind_ = system_kind;
+  bound_particle_set_ = &electrons;
   app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": validated " << system_kind_
             << " system metadata against electron and ion particle sets" << std::endl;
 }
@@ -5997,9 +6606,11 @@ void PsiFormerWF::mw_evaluateParameterDerivatives(
 }
 
 // Copy optimizer mapping and accepted state while sharing the synchronized native model.
-std::unique_ptr<WaveFunctionComponent> PsiFormerWF::makeClone(ParticleSet&) const
+std::unique_ptr<WaveFunctionComponent> PsiFormerWF::makeClone(ParticleSet& particles) const
 {
-  return std::make_unique<PsiFormerWF>(*this);
+  auto clone = std::make_unique<PsiFormerWF>(*this);
+  clone->bound_particle_set_ = &particles;
+  return clone;
 }
 
 } // namespace qmcplusplus

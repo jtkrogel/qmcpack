@@ -263,6 +263,7 @@ std::shared_ptr<const BatchExecutionPlan> makeClonePreparationTestPlan(
   selection.topology.initial_walkers_per_crowd = {1};
   selection.topology.reserve_walkers_per_crowd = {1};
   selection.topology.run_kind                  = "psiformer-clone-preparation-test";
+  selection.particle_count                     = 4;
   selection.active_parameter_count             = 2;
   selection.target_coordinate                  = BatchExecutionTargetCoordinate::POS_ONLY;
   selection.preference.id                      = profile_id;

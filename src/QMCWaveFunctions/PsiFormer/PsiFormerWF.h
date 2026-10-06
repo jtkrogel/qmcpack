@@ -64,6 +64,9 @@ struct InitializedPsiFormerParameters;
 
 /// Pure input used to estimate this component family's planned batch storage.
 struct PsiFormerMemoryPolicyInput;
+
+/// Exact allocation record retained by one prepared PsiFormer crowd resource.
+struct PsiFormerCrowdMemoryPlan;
 }
 
 /// Shared, versioned native model state used by all clones of one component.
@@ -173,6 +176,8 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   std::size_t initial_walker_capacity       = 0;
   std::size_t reserve_walker_capacity       = 0;
   std::size_t prepared_storage_fingerprint  = 0;
+  std::size_t current_storage_fingerprint   = 0;
+  std::array<std::size_t, 22> logical_sizes = {};
   BatchMemoryEstimate expected_resource_storage;
   BatchMemoryEstimate actual_resource_storage;
   std::array<std::string, 4> backend_modes;
@@ -525,6 +530,70 @@ public:
 private:
   struct PsiFormerMultiWalkerResource;
 
+  /// Identify the exact planned entry point whose common runtime contract is checked.
+  enum class PlannedOperation
+  {
+    FULL_VGL,
+    RECOMPUTE_VALUE,
+    CALC_RATIO,
+    ACTIVE_GRADIENT,
+    RATIO_GRADIENT,
+    ACCEPT_REJECT_VALUE,
+    SELECTED_PROPOSE,
+    SELECTED_RESOLVE,
+    ECP_VALUE,
+    ECP_WEIGHTED_SCORE,
+    SCORE_DERIVATIVES,
+    KINETIC_DERIVATIVES,
+    SCALAR_VALUE_COMPATIBILITY,
+    BUFFER_READ,
+    BUFFER_WRITE,
+    PREPARE_GROUP,
+    COMPLETE_UPDATES
+  };
+
+  /// State whether a planned operation permits or requires clone-local proposal state.
+  enum class ProposalRequirement
+  {
+    NONE,
+    ABSENT,
+    SINGLE_PENDING,
+    SELECTED_PENDING
+  };
+
+  /** Carry allocation-free runtime extents and proposal identity into common
+   * planned-operation validation. */
+  struct PlannedRuntimeRequest
+  {
+    PlannedOperation operation;
+    std::size_t live_walkers         = 0;
+    std::size_t dense_configurations = 0;
+    std::size_t sparse_references    = 0;
+    std::size_t sparse_replacements  = 0;
+    std::size_t selected_parameters  = 0;
+    std::size_t derivative_width     = 0;
+    std::optional<std::size_t> active_electron;
+    std::optional<std::uint64_t> descriptor_fingerprint;
+  };
+
+  /** Return read-only bindings proved by preflight without changing logical
+   * extents, parameter versions, proposals, or caller state. */
+  struct PlannedRuntimeAccess
+  {
+    PsiFormerMultiWalkerResource& resource;
+    const BatchExecutionParticipantPlan& participant;
+    const psiformer::PsiFormerCrowdMemoryPlan& crowd;
+    std::size_t storage_fingerprint;
+  };
+
+  /// Return the exact explicit mode mask assigned to one typed operation.
+  static BatchExecutionRequirements plannedOperationRequiredModes(
+      PlannedOperation operation) noexcept;
+
+  /// Return the exact proposal-state contract assigned to one typed operation.
+  static ProposalRequirement plannedOperationProposalRequirement(
+      PlannedOperation operation) noexcept;
+
   /// Complete common construction once either HDF5 import or internal initialization creates shared state.
   PsiFormerWF(std::string name,
               std::shared_ptr<PsiFormerSharedState> model_state,
@@ -592,6 +661,13 @@ private:
   /// Validate one homogeneous clone crowd and return its exclusively acquired resource.
   PsiFormerMultiWalkerResource& requireMultiWalkerResource(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
+
+  /** Validate the immutable component, ParticleSet, plan, resource, operation,
+   * capacity, and proposal contract before a planned numerical transaction. */
+  PlannedRuntimeAccess requirePlannedMultiWalkerOperation(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const PlannedRuntimeRequest& request) const;
 
   /// Lazily create fixed storage for scalar value evaluation.
   pf::DirectValueWorkspace& requireDirectValueWorkspace();
@@ -765,6 +841,17 @@ private:
   bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
   std::string system_kind_ = "unvalidated";
+  /// Non-owning lane identity established by system validation or clone construction.
+  const ParticleSet* bound_particle_set_ = nullptr;
+  /// Borrowed collection identity retained while the leader owns its crowd resource.
+  const ResourceCollection* acquired_resource_collection_ = nullptr;
+  /// Exact cursor and loan counts immediately after this component acquired its resource.
+  std::size_t acquired_resource_cursor_            = 0;
+  std::size_t acquired_resource_outstanding_loans_ = 0;
+  /// Exact ephemeral lane order published after the crowd resource loan succeeds.
+  const PsiFormerWF* acquired_crowd_leader_ = nullptr;
+  std::size_t acquired_lane_index_           = 0;
+  std::size_t acquired_crowd_size_           = 0;
   /// Optional DeepQMC-format destination written with the final QMCPACK VP report.
   std::string optimized_parameter_export_;
   /// Last shared parameter version observed by this component clone.

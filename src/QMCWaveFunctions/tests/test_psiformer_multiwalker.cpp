@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <memory>
 #include <numeric>
@@ -73,6 +74,42 @@ struct PsiFormerCloneStateSnapshot
 class TestPsiFormerVirtualBatch
 {
 public:
+  /// Public test spelling of the private typed runtime-operation discriminator.
+  enum class RuntimeOperation
+  {
+    FULL_VGL,
+    RECOMPUTE_VALUE,
+    CALC_RATIO,
+    ACTIVE_GRADIENT,
+    RATIO_GRADIENT,
+    ACCEPT_REJECT_VALUE,
+    SELECTED_PROPOSE,
+    SELECTED_RESOLVE,
+    ECP_VALUE,
+    ECP_WEIGHTED_SCORE,
+    SCORE_DERIVATIVES,
+    KINETIC_DERIVATIVES,
+    SCALAR_VALUE_COMPATIBILITY,
+    BUFFER_READ,
+    BUFFER_WRITE,
+    PREPARE_GROUP,
+    COMPLETE_UPDATES
+  };
+
+  /// Allocation-free dimensions supplied to the friend-only preflight probe.
+  struct RuntimeRequest
+  {
+    RuntimeOperation operation = RuntimeOperation::FULL_VGL;
+    std::size_t live_walkers = 0;
+    std::size_t dense_configurations = 0;
+    std::size_t sparse_references = 0;
+    std::size_t sparse_replacements = 0;
+    std::size_t selected_parameters = 0;
+    std::size_t derivative_width = 0;
+    std::optional<std::size_t> active_electron;
+    std::optional<std::uint64_t> descriptor_fingerprint;
+  };
+
   static PsiFormerCloneStateSnapshot cloneState(const PsiFormerWF& component)
   {
     return {component.log_value_,
@@ -132,6 +169,49 @@ public:
     return component.crowdWorkspaceDiagnosticsForTesting(wfc_list);
   }
 
+  /// Bind a directly constructed test component to its actual ParticleSet lane.
+  static void bindParticleSet(PsiFormerWF& component, const ParticleSet& particles)
+  { component.bound_particle_set_ = &particles; }
+
+  /// Rebind metadata only long enough to exercise shared-identity validation.
+  static void useOptimizationMetadata(PsiFormerWF& component,
+                                      const PsiFormerWF& donor)
+  { component.optimization_metadata_ = donor.optimization_metadata_; }
+
+  /// Invoke only the read-only common planned-runtime boundary.
+  static std::size_t requirePlannedRuntime(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      const RuntimeRequest& request)
+  {
+    PsiFormerWF::PlannedRuntimeRequest private_request;
+    private_request.operation = operation(request.operation);
+    private_request.live_walkers = request.live_walkers;
+    private_request.dense_configurations = request.dense_configurations;
+    private_request.sparse_references = request.sparse_references;
+    private_request.sparse_replacements = request.sparse_replacements;
+    private_request.selected_parameters = request.selected_parameters;
+    private_request.derivative_width = request.derivative_width;
+    private_request.active_electron = request.active_electron;
+    private_request.descriptor_fingerprint = request.descriptor_fingerprint;
+    return component
+        .requirePlannedMultiWalkerOperation(wfc_list, p_list, private_request)
+        .storage_fingerprint;
+  }
+
+  /// Install and clear one coherent pending proposal to test absence guards.
+  static void installSingleProposal(PsiFormerWF& component, int electron)
+  {
+    component.has_proposal_ = true;
+    component.proposal_kind_ = PsiFormerWF::ProposalKind::SINGLE_PARTICLE;
+    component.proposed_particle_ = electron;
+    component.proposed_parameter_version_ = component.observed_parameter_version_;
+  }
+
+  static void clearProposal(PsiFormerWF& component)
+  { component.clearProposalState(); }
+
   /// Toggle complete Stage-5 ownership claims without exposing a production API.
   static void useCompleteBatchMemoryAccounting(PsiFormerWF& component,
                                                bool enabled)
@@ -154,6 +234,48 @@ public:
   }
 
 private:
+  static PsiFormerWF::PlannedOperation operation(RuntimeOperation operation)
+  {
+    switch (operation)
+    {
+    case RuntimeOperation::FULL_VGL:
+      return PsiFormerWF::PlannedOperation::FULL_VGL;
+    case RuntimeOperation::RECOMPUTE_VALUE:
+      return PsiFormerWF::PlannedOperation::RECOMPUTE_VALUE;
+    case RuntimeOperation::CALC_RATIO:
+      return PsiFormerWF::PlannedOperation::CALC_RATIO;
+    case RuntimeOperation::ACTIVE_GRADIENT:
+      return PsiFormerWF::PlannedOperation::ACTIVE_GRADIENT;
+    case RuntimeOperation::RATIO_GRADIENT:
+      return PsiFormerWF::PlannedOperation::RATIO_GRADIENT;
+    case RuntimeOperation::ACCEPT_REJECT_VALUE:
+      return PsiFormerWF::PlannedOperation::ACCEPT_REJECT_VALUE;
+    case RuntimeOperation::SELECTED_PROPOSE:
+      return PsiFormerWF::PlannedOperation::SELECTED_PROPOSE;
+    case RuntimeOperation::SELECTED_RESOLVE:
+      return PsiFormerWF::PlannedOperation::SELECTED_RESOLVE;
+    case RuntimeOperation::ECP_VALUE:
+      return PsiFormerWF::PlannedOperation::ECP_VALUE;
+    case RuntimeOperation::ECP_WEIGHTED_SCORE:
+      return PsiFormerWF::PlannedOperation::ECP_WEIGHTED_SCORE;
+    case RuntimeOperation::SCORE_DERIVATIVES:
+      return PsiFormerWF::PlannedOperation::SCORE_DERIVATIVES;
+    case RuntimeOperation::KINETIC_DERIVATIVES:
+      return PsiFormerWF::PlannedOperation::KINETIC_DERIVATIVES;
+    case RuntimeOperation::SCALAR_VALUE_COMPATIBILITY:
+      return PsiFormerWF::PlannedOperation::SCALAR_VALUE_COMPATIBILITY;
+    case RuntimeOperation::BUFFER_READ:
+      return PsiFormerWF::PlannedOperation::BUFFER_READ;
+    case RuntimeOperation::BUFFER_WRITE:
+      return PsiFormerWF::PlannedOperation::BUFFER_WRITE;
+    case RuntimeOperation::PREPARE_GROUP:
+      return PsiFormerWF::PlannedOperation::PREPARE_GROUP;
+    case RuntimeOperation::COMPLETE_UPDATES:
+      return PsiFormerWF::PlannedOperation::COMPLETE_UPDATES;
+    }
+    throw std::logic_error("Unknown PsiFormer runtime-operation test value");
+  }
+
   static bool sameGradient(const ParticleSet::ParticleGradient& actual,
                            const ParticleSet::ParticleGradient& expected)
   {
@@ -270,6 +392,8 @@ struct Crowd
     {
       p_list->push_back(*walkers[walker]);
       wfc_list.push_back(*components[walker]);
+      testing::TestPsiFormerVirtualBatch::bindParticleSet(
+          *components[walker], *walkers[walker]);
     }
   }
 
@@ -297,6 +421,7 @@ std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationTestPlan(
   selection.topology.initial_walkers_per_crowd   = std::move(initial_walkers);
   selection.topology.reserve_walkers_per_crowd   = std::move(reserve_walkers);
   selection.topology.run_kind                    = "psiformer-crowd-preparation-test";
+  selection.particle_count                       = 4;
   selection.active_parameter_count               = active_parameter_count;
   selection.target_coordinate                    = BatchExecutionTargetCoordinate::POS_ONLY;
   selection.preference.id                        = profile_id;
@@ -358,6 +483,152 @@ void bindCrowdPreparationPlan(
     component->validateBatchExecutionPlanBinding(participant_plan);
   for (PsiFormerWF* component : crowd.components)
     component->bindBatchExecutionPlan(participant_plan);
+}
+
+/// Materialize every clone-local byte associated with an already-bound plan.
+void prepareCrowdPreparationClones(
+    Crowd& crowd,
+    const std::shared_ptr<const BatchExecutionPlan>& plan,
+    const std::string& participant_id)
+{
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  for (PsiFormerWF* component : crowd.components)
+    component->prepareBatchExecutionClone(participant_plan);
+}
+
+/// Snapshot every state category that a read-only runtime preflight must preserve.
+struct RuntimePreflightSnapshot
+{
+  std::size_t parameter_version = 0;
+  std::vector<testing::PsiFormerCloneStateSnapshot> clones;
+  std::vector<ParticleSet::ParticlePos> positions;
+  std::vector<ParticleSet::ParticleScalar> spins;
+  std::vector<ParticleSet::ParticleIndex> group_ids;
+  std::vector<std::vector<ParticleSet::PosType>> soa_positions;
+  std::vector<ParticleSet::Index_t> active_particles;
+  std::vector<ParticleSet::PosType> active_positions;
+  std::vector<ParticleSet::RealType> active_spins;
+  std::vector<ParticleSet::ParticleGradient> gradients;
+  std::vector<ParticleSet::ParticleLaplacian> laplacians;
+  testing::PsiFormerCrowdWorkspaceDiagnostics resource;
+  std::size_t collection_cursor = 0;
+  std::size_t outstanding_loans = 0;
+  std::vector<Value> caller_output;
+};
+
+RuntimePreflightSnapshot captureRuntimePreflightState(
+    Crowd& crowd,
+    ResourceCollection& collection,
+    const std::vector<Value>& caller_output)
+{
+  RuntimePreflightSnapshot snapshot;
+  snapshot.parameter_version = crowd.leader.parameterVersion();
+  snapshot.clones.reserve(crowd.components.size());
+  snapshot.positions.reserve(crowd.walkers.size());
+  snapshot.spins.reserve(crowd.walkers.size());
+  snapshot.group_ids.reserve(crowd.walkers.size());
+  snapshot.soa_positions.reserve(crowd.walkers.size());
+  snapshot.active_particles.reserve(crowd.walkers.size());
+  snapshot.active_positions.reserve(crowd.walkers.size());
+  snapshot.active_spins.reserve(crowd.walkers.size());
+  snapshot.gradients.reserve(crowd.walkers.size());
+  snapshot.laplacians.reserve(crowd.walkers.size());
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+  {
+    snapshot.clones.push_back(
+        testing::TestPsiFormerVirtualBatch::cloneState(*crowd.components[lane]));
+    snapshot.positions.push_back(crowd.walkers[lane]->R);
+    snapshot.spins.push_back(crowd.walkers[lane]->spins);
+    snapshot.group_ids.push_back(crowd.walkers[lane]->GroupID);
+    std::vector<ParticleSet::PosType> soa;
+    soa.reserve(crowd.walkers[lane]->getTotalNum());
+    for (int electron = 0; electron < crowd.walkers[lane]->getTotalNum(); ++electron)
+      soa.push_back(crowd.walkers[lane]->getCoordinates().getAllParticlePos()[electron]);
+    snapshot.soa_positions.push_back(std::move(soa));
+    snapshot.active_particles.push_back(crowd.walkers[lane]->getActivePtcl());
+    snapshot.active_positions.push_back(crowd.walkers[lane]->getActivePos());
+    snapshot.active_spins.push_back(crowd.walkers[lane]->getActiveSpinVal());
+    snapshot.gradients.push_back(crowd.walkers[lane]->G);
+    snapshot.laplacians.push_back(crowd.walkers[lane]->L);
+  }
+  snapshot.resource =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list);
+  snapshot.collection_cursor = collection.getCursor();
+  snapshot.outstanding_loans = collection.getOutstandingLoanCount();
+  snapshot.caller_output = caller_output;
+  return snapshot;
+}
+
+void checkRuntimePreflightState(
+    Crowd& crowd,
+    ResourceCollection& collection,
+    const std::vector<Value>& caller_output,
+    const RuntimePreflightSnapshot& expected)
+{
+  const auto same_real = [](ParticleSet::RealType actual,
+                            ParticleSet::RealType reference) {
+    return std::memcmp(&actual, &reference, sizeof(actual)) == 0;
+  };
+  CHECK(crowd.leader.parameterVersion() == expected.parameter_version);
+  REQUIRE(crowd.components.size() == expected.clones.size());
+  for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
+  {
+    CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
+        *crowd.components[lane], expected.clones[lane]));
+    REQUIRE(crowd.walkers[lane]->R.size() == expected.positions[lane].size());
+    REQUIRE(crowd.walkers[lane]->spins.size() == expected.spins[lane].size());
+    REQUIRE(crowd.walkers[lane]->GroupID.size() == expected.group_ids[lane].size());
+    REQUIRE(crowd.walkers[lane]->getCoordinates().getAllParticlePos().size() ==
+            expected.soa_positions[lane].size());
+    CHECK(crowd.walkers[lane]->getActivePtcl() == expected.active_particles[lane]);
+    CHECK(same_real(crowd.walkers[lane]->getActiveSpinVal(),
+                    expected.active_spins[lane]));
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      CHECK(same_real(crowd.walkers[lane]->getActivePos()[dimension],
+                      expected.active_positions[lane][dimension]));
+    REQUIRE(crowd.walkers[lane]->G.size() == expected.gradients[lane].size());
+    REQUIRE(crowd.walkers[lane]->L.size() == expected.laplacians[lane].size());
+    for (std::size_t electron = 0; electron < expected.gradients[lane].size(); ++electron)
+    {
+      CHECK(crowd.walkers[lane]->spins[electron] == expected.spins[lane][electron]);
+      CHECK(crowd.walkers[lane]->GroupID[electron] == expected.group_ids[lane][electron]);
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        CHECK(same_real(crowd.walkers[lane]->R[electron][dimension],
+                        expected.positions[lane][electron][dimension]));
+        CHECK(same_real(
+            crowd.walkers[lane]->getCoordinates().getAllParticlePos()[electron][dimension],
+            expected.soa_positions[lane][electron][dimension]));
+        CHECK(crowd.walkers[lane]->G[electron][dimension] ==
+              expected.gradients[lane][electron][dimension]);
+      }
+      CHECK(crowd.walkers[lane]->L[electron] ==
+            expected.laplacians[lane][electron]);
+    }
+  }
+
+  const auto actual_resource =
+      testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
+          crowd.leader, crowd.wfc_list);
+  CHECK(actual_resource.resource_identity == expected.resource.resource_identity);
+  CHECK(actual_resource.batch_workspace_identity ==
+        expected.resource.batch_workspace_identity);
+  CHECK(actual_resource.prepared_plan_identity ==
+        expected.resource.prepared_plan_identity);
+  CHECK(actual_resource.prepared_plan_fingerprint ==
+        expected.resource.prepared_plan_fingerprint);
+  CHECK(actual_resource.prepared_storage_fingerprint ==
+        expected.resource.prepared_storage_fingerprint);
+  CHECK(actual_resource.current_storage_fingerprint ==
+        expected.resource.current_storage_fingerprint);
+  CHECK(actual_resource.logical_sizes == expected.resource.logical_sizes);
+  CHECK(actual_resource.actual_resource_storage ==
+        expected.resource.actual_resource_storage);
+  CHECK(collection.getCursor() == expected.collection_cursor);
+  CHECK(collection.getOutstandingLoanCount() == expected.outstanding_loans);
+  CHECK(caller_output == expected.caller_output);
 }
 
 /// Clear every component plan without changing shared model ownership.
@@ -2360,6 +2631,291 @@ TEST_CASE("PsiFormer resource mismatch leaves both crowds immediately reusable",
   CHECK_THROWS_AS(ResourceCollectionTeamLock<WaveFunctionComponent>(resource_a, mixed_components),
                   std::invalid_argument);
   evaluate_one(crowd_a, resource_a);
+}
+
+TEST_CASE("PsiFormer planned runtime preflight is exact and read only",
+          "[wavefunction][psiformer][multiwalker][batch_memory][preflight]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/runtime-preflight";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {2}, {2}, participant_id,
+      "runtime-preflight-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_runtime_preflight_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, crowd.wfc_list);
+
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  Probe::RuntimeRequest full_request;
+  full_request.operation = Probe::RuntimeOperation::FULL_VGL;
+  full_request.live_walkers = 2;
+  full_request.dense_configurations = 2;
+  std::vector<Value> caller_output{Value(7.0), Value(-3.0)};
+  std::size_t preflight_invocation = 0;
+
+  auto require_unchanged = [&](const auto& wfc_list, const auto& p_list,
+                               const Probe::RuntimeRequest& request,
+                               bool should_throw) {
+    const std::size_t invocation = preflight_invocation++;
+    CAPTURE(invocation);
+    CAPTURE(static_cast<int>(request.operation), request.live_walkers,
+            request.dense_configurations, request.sparse_references,
+            request.sparse_replacements, request.selected_parameters,
+            request.derivative_width, request.active_electron.has_value(),
+            request.descriptor_fingerprint.has_value());
+    const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+        crowd, resource, caller_output);
+    if (should_throw)
+      CHECK_THROWS(Probe::requirePlannedRuntime(
+          crowd.leader, wfc_list, p_list, request));
+    else
+      CHECK(Probe::requirePlannedRuntime(
+                crowd.leader, wfc_list, p_list, request) ==
+            before.resource.current_storage_fingerprint);
+    checkRuntimePreflightState(crowd, resource, caller_output, before);
+  };
+
+  // A complete VGL crowd and masked value recomputation both validate without
+  // opening a model transaction or changing any caller/component storage.
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, false);
+  Probe::RuntimeRequest masked_recompute;
+  masked_recompute.operation = Probe::RuntimeOperation::RECOMPUTE_VALUE;
+  masked_recompute.live_walkers = 2;
+  masked_recompute.dense_configurations = 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, masked_recompute, false);
+
+  Probe::RuntimeRequest malformed = full_request;
+  malformed.live_walkers = 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed, true);
+
+  malformed = full_request;
+  malformed.dense_configurations = 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed, true);
+
+  malformed = full_request;
+  malformed.sparse_references = 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed, true);
+
+  malformed = full_request;
+  malformed.selected_parameters = 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed, true);
+
+  malformed = full_request;
+  malformed.active_electron = 0;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed, true);
+
+  malformed = full_request;
+  malformed.descriptor_fingerprint = UINT64_C(17);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, malformed, true);
+
+  // Duplicate and reordered lanes fail before resource or proposal state can change.
+  RefVectorWithLeader<WaveFunctionComponent> duplicate_components(crowd.leader);
+  duplicate_components.push_back(crowd.leader);
+  duplicate_components.push_back(crowd.leader);
+  require_unchanged(duplicate_components, *crowd.p_list, full_request, true);
+
+  RefVectorWithLeader<ParticleSet> duplicate_particles(*crowd.walkers[0]);
+  duplicate_particles.push_back(*crowd.walkers[0]);
+  duplicate_particles.push_back(*crowd.walkers[0]);
+  require_unchanged(crowd.wfc_list, duplicate_particles, full_request, true);
+
+  RefVectorWithLeader<ParticleSet> reordered_particles(*crowd.walkers[1]);
+  reordered_particles.push_back(*crowd.walkers[1]);
+  reordered_particles.push_back(*crowd.walkers[0]);
+  require_unchanged(crowd.wfc_list, reordered_particles, full_request, true);
+
+  Crowd foreign_crowd(files, simulation_cell, 1, true, {0, 1});
+  RefVectorWithLeader<WaveFunctionComponent> mixed_components(crowd.leader);
+  mixed_components.push_back(crowd.leader);
+  mixed_components.push_back(foreign_crowd.leader);
+  RefVectorWithLeader<ParticleSet> mixed_particles(*crowd.walkers[0]);
+  mixed_particles.push_back(*crowd.walkers[0]);
+  mixed_particles.push_back(*foreign_crowd.walkers[0]);
+  require_unchanged(mixed_components, mixed_particles, full_request, true);
+
+  Probe::useOptimizationMetadata(*crowd.components[1], foreign_crowd.leader);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  Probe::useOptimizationMetadata(*crowd.components[1], crowd.leader);
+
+  // Target-coordinate, coordinate-value, and proposal-absence failures are
+  // similarly nonmutating, including clone-local observed parameter versions.
+  crowd.walkers[1]->setSpinor(true);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  crowd.walkers[1]->setSpinor(false);
+
+  const int saved_group = crowd.walkers[1]->GroupID[0];
+  crowd.walkers[1]->GroupID[0] = 1;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  crowd.walkers[1]->GroupID[0] = saved_group;
+
+  const auto saved_finite_position = crowd.walkers[1]->R[0][0];
+  crowd.walkers[1]->R[0][0] += 0.125;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  crowd.walkers[1]->R[0][0] = saved_finite_position;
+
+  const auto saved_position = crowd.walkers[1]->R[0][0];
+  crowd.walkers[1]->R[0][0] = std::numeric_limits<ParticleSet::RealType>::quiet_NaN();
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  crowd.walkers[1]->R[0][0] = saved_position;
+
+  Probe::installSingleProposal(crowd.leader, 0);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  Probe::clearProposal(crowd.leader);
+
+  // A one-electron operation additionally requires the matching live
+  // ParticleSet proposal, not merely an in-range electron index.
+  Probe::RuntimeRequest ratio_request;
+  ratio_request.operation = Probe::RuntimeOperation::RATIO_GRADIENT;
+  ratio_request.live_walkers = 2;
+  ratio_request.dense_configurations = 2;
+  ratio_request.active_electron = 0;
+  require_unchanged(crowd.wfc_list, *crowd.p_list, ratio_request, true);
+
+  for (auto& walker : crowd.walkers)
+    walker->makeMove(0, ParticleSet::PosType(0.002, -0.001, 0.003));
+  require_unchanged(crowd.wfc_list, *crowd.p_list, ratio_request, false);
+  for (auto& walker : crowd.walkers)
+    walker->rejectMove(0);
+
+  for (auto& walker : crowd.walkers)
+    walker->makeMove(
+        0, ParticleSet::PosType(
+               std::numeric_limits<ParticleSet::RealType>::quiet_NaN(), 0.0, 0.0));
+  require_unchanged(crowd.wfc_list, *crowd.p_list, ratio_request, true);
+  for (auto& walker : crowd.walkers)
+    walker->rejectMove(0);
+
+  // Runtime preflight rechecks the exact post-acquire collection cursor.
+  resource.rewind(0);
+  require_unchanged(crowd.wfc_list, *crowd.p_list, full_request, true);
+  resource.rewind(1);
+}
+
+TEST_CASE("PsiFormer planned runtime rejects unprepared clones before mutation",
+          "[wavefunction][psiformer][multiwalker][batch_memory][preflight]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/unprepared-runtime";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {2}, {2}, participant_id,
+      "unprepared-runtime-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  crowd.leader.prepareBatchExecutionClone(participant_plan);
+
+  ResourceCollection resource_template("psiformer_unprepared_runtime_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, crowd.wfc_list);
+
+  testing::TestPsiFormerVirtualBatch::RuntimeRequest request;
+  request.operation = testing::TestPsiFormerVirtualBatch::RuntimeOperation::FULL_VGL;
+  request.live_walkers = 2;
+  request.dense_configurations = 2;
+  std::vector<Value> caller_output{Value(11.0)};
+  const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+      crowd, resource, caller_output);
+  CHECK_THROWS(testing::TestPsiFormerVirtualBatch::requirePlannedRuntime(
+      crowd.leader, crowd.wfc_list, *crowd.p_list, request));
+  checkRuntimePreflightState(crowd, resource, caller_output, before);
+}
+
+TEST_CASE("PsiFormer planned runtime retains exact acquired lane order",
+          "[wavefunction][psiformer][multiwalker][batch_memory][preflight]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 3, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/acquired-lane-order";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {3}, {3}, participant_id,
+      "acquired-lane-order-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_acquired_lane_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  resource.rewind();
+  crowd.leader.acquireResource(resource, crowd.wfc_list);
+
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  Probe::RuntimeRequest request;
+  request.operation = Probe::RuntimeOperation::FULL_VGL;
+  request.live_walkers = 3;
+  request.dense_configurations = 3;
+  const std::size_t storage_fingerprint = Probe::requirePlannedRuntime(
+      crowd.leader, crowd.wfc_list, *crowd.p_list, request);
+
+  // Permute components and their correctly bound ParticleSets together.  All
+  // pairwise identities and shapes remain valid, so only the exact ephemeral
+  // acquisition-lane markers can reject this otherwise plausible crowd.
+  RefVectorWithLeader<WaveFunctionComponent> permuted_components(crowd.leader);
+  permuted_components.push_back(crowd.leader);
+  permuted_components.push_back(*crowd.components[2]);
+  permuted_components.push_back(*crowd.components[1]);
+  RefVectorWithLeader<ParticleSet> permuted_particles(*crowd.walkers[0]);
+  permuted_particles.push_back(*crowd.walkers[0]);
+  permuted_particles.push_back(*crowd.walkers[2]);
+  permuted_particles.push_back(*crowd.walkers[1]);
+
+  std::vector<Value> caller_output{Value(19.0)};
+  const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+      crowd, resource, caller_output);
+  CHECK_THROWS(Probe::requirePlannedRuntime(
+      crowd.leader, permuted_components, permuted_particles, request));
+  checkRuntimePreflightState(crowd, resource, caller_output, before);
+
+  // A wrong-order release fails before takeback or marker clearing.  Restoring
+  // the collection cursor makes the original crowd immediately usable again.
+  resource.rewind(0);
+  CHECK_THROWS(crowd.leader.releaseResource(resource, permuted_components));
+  CHECK(resource.getCursor() == 0);
+  CHECK(resource.getOutstandingLoanCount() == 1);
+  resource.rewind(1);
+  CHECK(Probe::requirePlannedRuntime(
+            crowd.leader, crowd.wfc_list, *crowd.p_list, request) ==
+        storage_fingerprint);
+
+  resource.rewind(0);
+  crowd.leader.releaseResource(resource, crowd.wfc_list);
+  CHECK(resource.getCursor() == 1);
+  CHECK(resource.getOutstandingLoanCount() == 0);
+
+  // A second complete loan proves successful release cleared every fixed
+  // clone-local marker rather than leaving stale crowd identity behind.
+  resource.rewind(0);
+  crowd.leader.acquireResource(resource, crowd.wfc_list);
+  CHECK(Probe::requirePlannedRuntime(
+            crowd.leader, crowd.wfc_list, *crowd.p_list, request) ==
+        storage_fingerprint);
+  resource.rewind(0);
+  crowd.leader.releaseResource(resource, crowd.wfc_list);
+  CHECK(resource.getOutstandingLoanCount() == 0);
 }
 
 } // namespace qmcplusplus
