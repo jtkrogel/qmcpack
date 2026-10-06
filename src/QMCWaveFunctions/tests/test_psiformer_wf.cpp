@@ -69,6 +69,26 @@ public:
   {
     return static_cast<bool>(component.batch_execution_plan_);
   }
+
+  /// Install a pending selected proposal without running an unrelated evaluator.
+  static void markSelectedProposalPending(PsiFormerWF& component)
+  {
+    component.proposal_kind_ = PsiFormerWF::ProposalKind::SELECTED_PARTICLES;
+    component.has_proposal_  = true;
+  }
+
+  /// Restore the ordinary idle lifecycle after a transition-guard check.
+  static void clearProposal(PsiFormerWF& component)
+  {
+    component.clearProposalState();
+  }
+
+  /// Inject or clear the late allocation failure used by the preparation test.
+  static void failClonePreparationBeforePublish(PsiFormerWF& component,
+                                                bool enabled)
+  {
+    component.fail_clone_preparation_before_publish_for_testing_ = enabled;
+  }
 };
 } // namespace testing
 
@@ -221,6 +241,47 @@ double coulombPotential(const ParticleSet& electrons)
       potential += geometry.charges[first] * geometry.charges[second] / std::sqrt(squared_distance);
     }
   return potential;
+}
+
+/** Select internally consistent evidence while deliberately overriding only
+ * the stage-gating accounting claim.
+ *
+ * Production PsiFormer binding remains fail closed until later crowd-storage
+ * stages are complete.  This test seam exercises the already implemented
+ * clone owner without weakening that production gate.
+ */
+std::shared_ptr<const BatchExecutionPlan> makeClonePreparationTestPlan(
+    PsiFormerWF& component,
+    const BatchExecutionRequirements& requirements,
+    const std::string& participant_id,
+    const std::string& profile_id,
+    std::size_t value_tile = 2,
+    std::size_t ecp_outer_maximum = 0)
+{
+  BatchExecutionSelectionInput selection;
+  selection.requirements                           = requirements;
+  selection.topology.initial_walkers_per_crowd = {1};
+  selection.topology.reserve_walkers_per_crowd = {1};
+  selection.topology.run_kind                  = "psiformer-clone-preparation-test";
+  selection.active_parameter_count             = 2;
+  selection.preference.id                      = profile_id;
+  selection.preference.preferred               = {value_tile, 1, 1, ecp_outer_maximum};
+  selection.logical_maximum = component.batchExecutionLogicalMaximum(
+      {requirements, selection.topology,
+       selection.active_parameter_count});
+  selection.logical_maximum.ecp_outer = ecp_outer_maximum;
+
+  return std::make_shared<const BatchExecutionPlan>(
+      selectBatchExecutionPlan(
+          selection,
+          [&component, &participant_id](
+              const BatchExecutionPlanningContext& candidate) {
+            BatchMemoryContribution fabricated =
+                component.estimateBatchExecutionMemory(candidate);
+            fabricated.fully_accounted = true;
+            return std::vector<BatchMemoryParticipantContribution>{
+                {participant_id, std::move(fabricated)}};
+          }));
 }
 
 /// Capture the high-level observables and selected derivatives of one component.
@@ -892,6 +953,304 @@ TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
   auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
   REQUIRE(clone != nullptr);
   CHECK_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(*clone));
+}
+
+TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  const std::size_t electrons_count =
+      static_cast<std::size_t>(electrons.getTotalNum());
+  PsiFormerWF component("pf_clone_prepare", files.parameters.string(),
+                        files.configuration.string(), true, {0, 1});
+
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  const std::string participant_id = "test/psiformer/clone-prepare";
+  const auto plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, "clone-prepare-v1");
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+
+  // Fabricated completeness permits selection only inside this test.  The
+  // production validator still compares it with PsiFormer's false stage gate.
+  CHECK_THROWS_WITH(
+      component.validateBatchExecutionPlanBinding(participant_plan),
+      Catch::Matchers::ContainsSubstring(
+          "accounting evidence is stale"));
+  component.bindBatchExecutionPlan(participant_plan);
+  const auto before = testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK_FALSE(before.has_prepared_clone_plan);
+  CHECK_FALSE(before.owns_batch_workspace);
+  CHECK(before.proposed_spatial_bytes == 0);
+
+  electrons.makeVirtualMoves(
+      ParticleSet::SingleParticlePos{0.11, -0.07, 0.19});
+  std::vector<ValueType> unprepared_ratios(electrons_count, ValueType(11));
+  CHECK_THROWS_WITH(
+      component.evaluateRatiosAlltoOne(electrons, unprepared_ratios),
+      Catch::Matchers::ContainsSubstring(
+          "was not prepared for the bound batch plan"));
+  CHECK(std::all_of(unprepared_ratios.begin(), unprepared_ratios.end(),
+                    [](ValueType value) { return value == ValueType(11); }));
+  CHECK_FALSE(testing::TestPsiFormerWF::directWorkspaceDiagnostics(component)
+                  .owns_batch_workspace);
+
+  testing::TestPsiFormerWF::failClonePreparationBeforePublish(component, true);
+  CHECK_THROWS_AS(component.prepareBatchExecutionClone(participant_plan),
+                  std::bad_alloc);
+  const auto after_failure =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK_FALSE(after_failure.has_prepared_clone_plan);
+  CHECK_FALSE(after_failure.owns_batch_workspace);
+  CHECK(after_failure.scalar_value_publication_bytes == 0);
+  CHECK(after_failure.proposed_spatial_bytes == 0);
+  testing::TestPsiFormerWF::failClonePreparationBeforePublish(component, false);
+
+  component.prepareBatchExecutionClone(participant_plan);
+  const auto prepared =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  const std::size_t one_spatial_state =
+      electrons_count *
+      (sizeof(PsiFormerWF::GradType) + sizeof(ValueType));
+  CHECK(prepared.has_prepared_clone_plan);
+  CHECK(prepared.owns_batch_workspace);
+  CHECK(prepared.batch_bytes > 0);
+  CHECK(prepared.accepted_spatial_bytes == one_spatial_state);
+  CHECK(prepared.proposed_spatial_bytes == one_spatial_state);
+  CHECK(prepared.scalar_value_publication_bytes ==
+        (electrons_count + 1) * sizeof(ValueType));
+  CHECK(prepared.accountedBytes() ==
+        prepared.batch_bytes + prepared.scalar_value_publication_bytes);
+
+  // A malformed restore target must fail before resizing the fixed clone
+  // state or consuming a walker-buffer record.
+  ParticleSet wrong_electron_count(simulation_cell);
+  wrong_electron_count.setName("wrong_electron_count");
+  wrong_electron_count.create(
+      {static_cast<int>(electrons_count + 1)});
+  PsiFormerWF::WFBufferType empty_buffer;
+  CHECK_THROWS_WITH(
+      component.copyFromBuffer(wrong_electron_count, empty_buffer),
+      Catch::Matchers::ContainsSubstring(
+          "walker buffer electron count differs from the model"));
+  const auto after_wrong_restore =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK(after_wrong_restore.accepted_spatial_bytes ==
+        prepared.accepted_spatial_bytes);
+  CHECK(after_wrong_restore.proposed_spatial_bytes ==
+        prepared.proposed_spatial_bytes);
+  CHECK(after_wrong_restore.batch_workspace_identity ==
+        prepared.batch_workspace_identity);
+  CHECK(after_wrong_restore.batch_storage_fingerprint ==
+        prepared.batch_storage_fingerprint);
+
+  // Repeating the same preparation is a strict no-op with stable backing.
+  component.prepareBatchExecutionClone(participant_plan);
+  const auto repeated =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK(repeated.batch_workspace_identity ==
+        prepared.batch_workspace_identity);
+  CHECK(repeated.batch_storage_fingerprint ==
+        prepared.batch_storage_fingerprint);
+  CHECK(repeated.accountedBytes() == prepared.accountedBytes());
+
+  // A clone inherits only immutable plan identity and accepted physical state;
+  // its mutable proposal, scalar publication, and batch workspace start empty.
+  std::unique_ptr<WaveFunctionComponent> clone_storage =
+      component.makeClone(electrons);
+  auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
+  REQUIRE(clone != nullptr);
+  CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(*clone));
+  const auto clone_before =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(*clone);
+  CHECK_FALSE(clone_before.has_prepared_clone_plan);
+  CHECK_FALSE(clone_before.owns_batch_workspace);
+  CHECK(clone_before.scalar_value_publication_bytes == 0);
+  CHECK(clone_before.proposed_spatial_bytes == 0);
+  clone->prepareBatchExecutionClone(participant_plan);
+  const auto clone_prepared =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(*clone);
+  CHECK(clone_prepared.has_prepared_clone_plan);
+  CHECK(clone_prepared.batch_workspace_identity !=
+        prepared.batch_workspace_identity);
+  CHECK(clone_prepared.batch_bytes == prepared.batch_bytes);
+
+  // Reject a one-element logical overrun before touching retained scratch or
+  // caller output.
+  std::vector<ParticleSet::SingleParticlePos> too_many_moves(
+      electrons_count + 1,
+      ParticleSet::SingleParticlePos{0.01, -0.02, 0.03});
+  VirtualParticleSet virtual_particles(electrons);
+  virtual_particles.makeMoves(electrons, 1, too_many_moves);
+  std::vector<ValueType> overflow_ratios(too_many_moves.size(),
+                                         ValueType(7));
+  CHECK_THROWS_WITH(
+      component.evaluateRatios(virtual_particles, overflow_ratios),
+      Catch::Matchers::ContainsSubstring("exceeds the planned scalar VALUE envelope"));
+  CHECK(std::all_of(overflow_ratios.begin(), overflow_ratios.end(),
+                    [](ValueType value) { return value == ValueType(7); }));
+  const auto after_overflow =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK(after_overflow.batch_storage_fingerprint ==
+        prepared.batch_storage_fingerprint);
+
+  // The largest admitted scalar virtual-ratio batch uses all Ne + 1 logical
+  // configurations without changing the prepared capacity fingerprint.
+  std::vector<ParticleSet::SingleParticlePos> boundary_moves;
+  boundary_moves.reserve(electrons_count);
+  for (std::size_t move = 0; move < electrons_count; ++move)
+    boundary_moves.emplace_back(0.01 * (move + 1),
+                                -0.015 * (move + 1),
+                                0.02 * (move + 1));
+  VirtualParticleSet boundary_virtual_particles(electrons);
+  boundary_virtual_particles.makeMoves(electrons, 1, boundary_moves);
+  std::vector<ValueType> boundary_ratios(electrons_count);
+  component.evaluateRatios(boundary_virtual_particles, boundary_ratios);
+  const std::vector<ValueType> planned_boundary_ratios = boundary_ratios;
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(component)
+            .batch_storage_fingerprint == prepared.batch_storage_fingerprint);
+
+  // The admitted all-to-one path copies through persistent staging and does
+  // not replace that storage with the caller's vector.
+  electrons.makeVirtualMoves(
+      ParticleSet::SingleParticlePos{0.37, -0.22, 0.41});
+  std::vector<ValueType> ratios(electrons_count);
+  component.evaluateRatiosAlltoOne(electrons, ratios);
+  const std::vector<ValueType> planned_all_to_one_ratios = ratios;
+  const auto after_value =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK(after_value.batch_workspace_identity ==
+        prepared.batch_workspace_identity);
+  CHECK(after_value.batch_storage_fingerprint ==
+        prepared.batch_storage_fingerprint);
+  CHECK(after_value.scalar_value_publication_bytes ==
+        prepared.scalar_value_publication_bytes);
+
+  Vector<ValueType> score(2);
+  Vector<ValueType> kinetic(2);
+  score   = ValueType(0);
+  kinetic = ValueType(0);
+  CHECK_THROWS_WITH(
+      component.evaluateDerivativesWF(electrons, OptVariables{}, score),
+      Catch::Matchers::ContainsSubstring("not admitted as a clone-local operation"));
+  CHECK_THROWS_WITH(
+      component.evaluateDerivatives(electrons, OptVariables{}, score, kinetic),
+      Catch::Matchers::ContainsSubstring("not admitted as a clone-local operation"));
+
+  // Lifecycle transitions cannot invalidate storage beneath an in-flight
+  // proposal, and a nonempty replan must pass through an explicit null clear.
+  testing::TestPsiFormerWF::markSelectedProposalPending(component);
+  CHECK_THROWS_WITH(
+      component.prepareBatchExecutionClone(participant_plan),
+      Catch::Matchers::ContainsSubstring("proposal is pending"));
+  BatchExecutionParticipantPlan empty_plan;
+  CHECK_THROWS_WITH(
+      component.validateBatchExecutionPlanBinding(empty_plan),
+      Catch::Matchers::ContainsSubstring("proposal is pending"));
+  testing::TestPsiFormerWF::clearProposal(component);
+
+  const auto replacement_plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, "clone-prepare-v2", 1);
+  const BatchExecutionParticipantPlan replacement_view =
+      makeBatchExecutionParticipantPlan(replacement_plan, participant_id);
+  CHECK_THROWS_WITH(
+      component.validateBatchExecutionPlanBinding(replacement_view),
+      Catch::Matchers::ContainsSubstring("explicit null-plan clear"));
+
+  // Clearing the plan removes bounded and unaccounted evaluator scratch.  A
+  // subsequent scalar call follows the original unrestricted lazy behavior.
+  component.validateBatchExecutionPlanBinding(empty_plan);
+  component.bindBatchExecutionPlan(empty_plan);
+  const auto cleared =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK_FALSE(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+  CHECK_FALSE(cleared.has_prepared_clone_plan);
+  CHECK_FALSE(cleared.owns_batch_workspace);
+  CHECK(cleared.scalar_value_publication_bytes == 0);
+  component.evaluateRatiosAlltoOne(electrons, ratios);
+  for (std::size_t electron = 0; electron < electrons_count; ++electron)
+    CHECK(std::abs(ratios[electron] - planned_all_to_one_ratios[electron]) ==
+          Catch::Approx(0.0).margin(2e-12));
+
+  std::vector<ValueType> legacy_boundary_ratios(electrons_count);
+  component.evaluateRatios(boundary_virtual_particles,
+                           legacy_boundary_ratios);
+  for (std::size_t move = 0; move < electrons_count; ++move)
+    CHECK(std::abs(legacy_boundary_ratios[move] -
+                   planned_boundary_ratios[move]) ==
+          Catch::Approx(0.0).margin(2e-12));
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(component)
+            .owns_batch_workspace);
+
+  // First binding from legacy mode canonicalizes the lazy workspace without
+  // allocation; preparation remains a separate explicit lifecycle step.
+  component.bindBatchExecutionPlan(replacement_view);
+  const auto rebound =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+  CHECK_FALSE(rebound.has_prepared_clone_plan);
+  CHECK_FALSE(rebound.owns_batch_workspace);
+}
+
+TEST_CASE("PsiFormer planned scalar scope excludes unselected and legacy ECP paths",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+
+  PsiFormerWF no_scalar("pf_no_scalar", files.parameters.string(),
+                        files.configuration.string(), true, {0, 1});
+  BatchExecutionRequirements no_scalar_requirements;
+  no_scalar.contributeBatchExecutionRequirements(no_scalar_requirements);
+  const std::string no_scalar_id = "test/psiformer/no-scalar";
+  const auto no_scalar_plan = makeClonePreparationTestPlan(
+      no_scalar, no_scalar_requirements, no_scalar_id, "no-scalar-v1");
+  const BatchExecutionParticipantPlan no_scalar_view =
+      makeBatchExecutionParticipantPlan(no_scalar_plan, no_scalar_id);
+  no_scalar.bindBatchExecutionPlan(no_scalar_view);
+  no_scalar.prepareBatchExecutionClone(no_scalar_view);
+  electrons.makeVirtualMoves(
+      ParticleSet::SingleParticlePos{0.17, -0.12, 0.21});
+  std::vector<ValueType> all_to_one(electrons.getTotalNum());
+  CHECK_THROWS_WITH(
+      no_scalar.evaluateRatiosAlltoOne(electrons, all_to_one),
+      Catch::Matchers::ContainsSubstring("not admitted by the explicit batch plan"));
+  CHECK_FALSE(testing::TestPsiFormerWF::directWorkspaceDiagnostics(no_scalar)
+                  .owns_batch_workspace);
+
+  PsiFormerWF ecp_component("pf_ecp_scalar", files.parameters.string(),
+                            files.configuration.string());
+  BatchExecutionRequirements ecp_requirements;
+  ecp_component.contributeBatchExecutionRequirements(ecp_requirements);
+  ecp_requirements.require(BatchExecutionMode::VALUE);
+  ecp_requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  ecp_requirements.require(BatchExecutionMode::ECP_OUTER);
+  const std::string ecp_id = "test/psiformer/ecp-scalar";
+  const auto ecp_plan = makeClonePreparationTestPlan(
+      ecp_component, ecp_requirements, ecp_id, "ecp-scalar-v1", 2, 2);
+  const BatchExecutionParticipantPlan ecp_view =
+      makeBatchExecutionParticipantPlan(ecp_plan, ecp_id);
+  ecp_component.bindBatchExecutionPlan(ecp_view);
+  ecp_component.prepareBatchExecutionClone(ecp_view);
+
+  const std::vector<ParticleSet::SingleParticlePos> displacements{
+      {0.02, -0.01, 0.03}};
+  VirtualParticleSet virtual_particles(electrons);
+  virtual_particles.makeMoves(electrons, 1, displacements);
+  std::vector<ValueType> virtual_ratios(displacements.size(), ValueType(9));
+  CHECK_THROWS_WITH(
+      ecp_component.evaluateRatios(virtual_particles, virtual_ratios),
+      Catch::Matchers::ContainsSubstring("flattened multiwalker ECP dispatch"));
+  CHECK(virtual_ratios[0] == ValueType(9));
+
+  // Scalar compatibility can coexist with flattened ECP for unrelated
+  // estimator calls; only the legacy virtual-particle dispatch is excluded.
+  ecp_component.evaluateRatiosAlltoOne(electrons, all_to_one);
 }
 
 TEST_CASE("PsiFormer kinetic parameter derivatives require unit electron masses",

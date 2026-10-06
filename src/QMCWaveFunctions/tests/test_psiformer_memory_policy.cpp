@@ -292,9 +292,15 @@ TEST_CASE("PsiFormer memory policy keeps scalar VALUE ownership clone local",
   CHECK(contribution.fully_accounted);
   CHECK(contribution.logical_maximum == BatchTileCapacities{3, 0, 0, 0});
 
-  pf::DirectBatchCapacityPlan scalar_plan;
-  scalar_plan.logical.value_dense = 3;
-  scalar_plan.tile.value = 2;
+  const pf::DirectBatchCapacityPlan scalar_plan =
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, requirements, context.candidate_capacities);
+  CHECK(scalar_plan.logical.value_dense == 3);
+  CHECK(scalar_plan.logical.full_vgl == 0);
+  CHECK(scalar_plan.logical.active_gradient == 0);
+  CHECK(scalar_plan.tile.value == 2);
+  CHECK(scalar_plan.tile.full_vgl == 0);
+  CHECK(scalar_plan.tile.active_gradient == 0);
   const pf::DirectBatchStorageRequirement scalar_storage =
       pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
   CHECK(hostBytes(contribution, BatchMemoryCategory::LOGICAL_INPUT_OUTPUT) ==
@@ -305,6 +311,24 @@ TEST_CASE("PsiFormer memory policy keeps scalar VALUE ownership clone local",
                                    "test scalar clones"));
   CHECK(hostBytes(contribution, BatchMemoryCategory::PUBLICATION_STAGING) ==
         3 * 3 * sizeof(double));
+
+  BatchExecutionRequirements no_scalar;
+  const pf::DirectBatchCapacityPlan empty_plan =
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, no_scalar, context.candidate_capacities);
+  CHECK(empty_plan.logical.value_dense == 0);
+  CHECK(empty_plan.tile.value == 0);
+
+  input.scalar_value_logical_maximum = 0;
+  CHECK_THROWS_AS(
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, requirements, context.candidate_capacities),
+      std::invalid_argument);
+  input.scalar_value_logical_maximum = 3;
+  CHECK_THROWS_AS(
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, requirements, BatchTileCapacities{}),
+      std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer memory policy maps flattened sparse and derivative storage",

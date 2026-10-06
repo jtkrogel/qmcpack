@@ -90,6 +90,7 @@ struct PsiFormerWorkspaceDiagnostics
   bool owns_batch_workspace          = false;
   bool owns_score_workspace          = false;
   bool owns_kinetic_workspace        = false;
+  bool has_prepared_clone_plan       = false;
 
   std::size_t value_bytes          = 0;
   std::size_t full_spatial_bytes   = 0;
@@ -98,12 +99,18 @@ struct PsiFormerWorkspaceDiagnostics
   std::size_t score_bytes          = 0;
   std::size_t kinetic_bytes        = 0;
   std::size_t total_log_gradient_bytes = 0;
+  std::size_t scalar_value_publication_bytes = 0;
+  std::size_t accepted_spatial_bytes          = 0;
+  std::size_t proposed_spatial_bytes          = 0;
+  std::size_t batch_storage_fingerprint       = 0;
+  const void* batch_workspace_identity        = nullptr;
 
   /// Return all explicitly accounted clone-local evaluator scratch bytes.
   std::size_t accountedBytes() const noexcept
   {
     return value_bytes + full_spatial_bytes + active_spatial_bytes + batch_bytes +
-        score_bytes + kinetic_bytes + total_log_gradient_bytes;
+        score_bytes + kinetic_bytes + total_log_gradient_bytes +
+        scalar_value_publication_bytes;
   }
 
   /// Return the number of independently owned native evaluator workspaces.
@@ -452,6 +459,9 @@ public:
   /// Publish a validated participant view, including an explicit null clearing view.
   void bindBatchExecutionPlan(BatchExecutionParticipantPlan plan) noexcept override;
 
+  /// Prepare exact clone-owned state and any admitted scalar VALUE workspace.
+  void prepareBatchExecutionClone(const BatchExecutionParticipantPlan& plan) override;
+
   /// Add one cloneable crowd workspace resource to the collection.
   void createResource(ResourceCollection& collection) const override;
 
@@ -571,6 +581,23 @@ private:
 
   /// Lazily create batch scratch for scalar all-to-one and virtual-ratio calls.
   pf::DirectBatchWorkspace& requireDirectBatchWorkspace();
+
+  /** Return preallocated scalar publication storage under a hard plan.
+   * A null result tells the caller to retain the legacy lazy staging path.
+   */
+  ValueType* requirePlannedScalarValuePublication(
+      std::size_t configuration_count,
+      std::size_t output_count,
+      const char* operation);
+
+  /// Reject unaccounted scalar value/spatial evaluators under an explicit plan.
+  void requireUnplannedScalarEvaluation(const char* operation) const;
+
+  /// Reject legacy scalar virtual-particle dispatch when flattened ECP is planned.
+  void requireNoPlannedEcpScalarDispatch(const char* operation) const;
+
+  /// Reject clone-local score/kinetic tapes while an explicit plan is bound.
+  void requireUnplannedScalarDerivative(const char* operation) const;
 
   /// Lazily create the clone-local score tape used by scalar evaluation paths.
   pf::DirectScoreWorkspace& requireDirectScoreWorkspace();
@@ -704,10 +731,16 @@ private:
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_active_spatial_workspace_;
   /// Lazily present batch scratch used by scalar all-to-one and virtual-ratio calls.
   std::unique_ptr<pf::DirectBatchWorkspace> direct_batch_workspace_;
+  /// Exact clone-local output staging for admitted scalar VALUE compatibility.
+  std::vector<ValueType> scalar_value_publication_;
   /// ResourceCollection-owned workspace handle populated only on the crowd leader.
   ResourceHandle<PsiFormerMultiWalkerResource> mw_resource_handle_;
   /// Immutable selected-plan slice copied to component clones without copying scratch.
   BatchExecutionParticipantPlan batch_execution_plan_;
+  /// Binding whose clone-local storage has completed exact preparation.
+  BatchExecutionParticipantPlan prepared_clone_batch_execution_plan_;
+  /// Inject a late clone-preparation failure for the strong-guarantee regression.
+  bool fail_clone_preparation_before_publish_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
   std::string system_kind_ = "unvalidated";
   /// Optional DeepQMC-format destination written with the final QMCPACK VP report.

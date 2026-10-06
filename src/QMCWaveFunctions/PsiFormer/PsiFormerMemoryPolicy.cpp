@@ -189,6 +189,28 @@ BatchTileCapacities psiFormerBatchLogicalMaximum(
   return maximum;
 }
 
+pf::DirectBatchCapacityPlan makePsiFormerScalarValueCapacityPlan(
+    const PsiFormerMemoryPolicyInput& input,
+    const BatchExecutionRequirements& requirements,
+    const BatchTileCapacities& selected_capacities)
+{
+  pf::DirectBatchCapacityPlan plan;
+  plan.tile = {0, 0, 0};
+  if (!requirements.requires(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY))
+    return plan;
+
+  if (input.scalar_value_logical_maximum == 0)
+    throw std::invalid_argument(
+        "PsiFormer scalar VALUE compatibility requires a finite logical envelope");
+  if (selected_capacities.value == 0)
+    throw std::invalid_argument(
+        "PsiFormer scalar VALUE compatibility requires a positive VALUE tile");
+
+  plan.logical.value_dense = input.scalar_value_logical_maximum;
+  plan.tile.value           = selected_capacities.value;
+  return plan;
+}
+
 pf::DirectBatchCapacityPlan makePsiFormerDirectBatchCapacityPlan(
     const BatchExecutionRequirements& requirements,
     const BatchTileCapacities& selected_capacities,
@@ -268,9 +290,8 @@ BatchMemoryContribution estimatePsiFormerBatchMemory(
       BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
   if (scalar)
   {
-    pf::DirectBatchCapacityPlan scalar_plan;
-    scalar_plan.logical.value_dense = input.scalar_value_logical_maximum;
-    scalar_plan.tile = {context.candidate_capacities.value, 0, 0};
+    const pf::DirectBatchCapacityPlan scalar_plan = makePsiFormerScalarValueCapacityPlan(
+        input, context.requirements, context.candidate_capacities);
     const pf::DirectBatchStorageRequirement scalar_storage =
         pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
     addDirectStorage(contribution.per_owner, scalar_storage,

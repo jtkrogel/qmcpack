@@ -121,6 +121,17 @@ BatchTileCapacities psiFormerBatchLogicalMaximum(
     const PsiFormerMemoryPolicyInput& input,
     const BatchExecutionWorkloadContext& context);
 
+/** Construct the exact clone-local scalar VALUE plan, or an empty plan when
+ * scalar compatibility is not requested.
+ *
+ * Keeping this translation shared by accounting and live preparation prevents
+ * the retained workspace from drifting away from the bytes selected by policy.
+ */
+pf::DirectBatchCapacityPlan makePsiFormerScalarValueCapacityPlan(
+    const PsiFormerMemoryPolicyInput& input,
+    const BatchExecutionRequirements& requirements,
+    const BatchTileCapacities& selected_capacities);
+
 /** Construct the exact direct-workspace plan for one reserve crowd. */
 pf::DirectBatchCapacityPlan makePsiFormerDirectBatchCapacityPlan(
     const BatchExecutionRequirements& requirements,
