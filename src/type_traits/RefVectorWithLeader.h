@@ -14,8 +14,10 @@
 #define QMCPLUSPLUS_REFVECTORWITHLEADER_H
 
 #include <cassert>
-#include <vector>
+#include <functional>
 #include <memory>
+#include <type_traits>
+#include <vector>
 
 namespace qmcplusplus
 {
@@ -36,6 +38,24 @@ public:
   RefVectorWithLeader(T& leader, BaseVec&& vec) : BaseVec(std::move(vec)), leader_(leader) {}
 
   T& getLeader() const { return leader_; }
+
+  /** Rebind the leader wrapper without assigning to the previously referred object. */
+  void rebindLeader(T& leader) noexcept
+  {
+    static_assert(std::is_nothrow_copy_assignable_v<std::reference_wrapper<T>>,
+                  "Rebinding a reference wrapper must not throw.");
+    leader_ = std::ref(leader);
+  }
+
+  /** Rebind an existing element slot without changing the vector's storage or size. */
+  void rebindElement(size_t i, T& element) noexcept
+  {
+    static_assert(std::is_nothrow_copy_assignable_v<std::reference_wrapper<T>>,
+                  "Rebinding a reference wrapper must not throw.");
+    assert(i < BaseVec::size());
+    // operator[] below returns T&, so qualify the base operation to assign the wrapper itself.
+    BaseVec::operator[](i) = std::ref(element);
+  }
 
   T& operator[](size_t i) const { return BaseVec::operator[](i).get(); }
 

@@ -100,4 +100,65 @@ TEST_CASE("convertPtrToRefvectorSubset", "[type_traits]")
   for (int i = 0; i < 5; ++i)
     delete pvec[i];
 }
+
+TEST_CASE("RefVectorWithLeader rebinds references without changing storage", "[type_traits]")
+{
+  struct RebindProbe
+  {
+    explicit RebindProbe(int initial_value) : value(initial_value) {}
+
+    RebindProbe(const RebindProbe&) = default;
+
+    RebindProbe& operator=(const RebindProbe& other) noexcept
+    {
+      value = other.value;
+      ++assignment_count;
+      return *this;
+    }
+
+    int value;
+    int assignment_count = 0;
+  };
+
+  RebindProbe original_leader(1);
+  RebindProbe replacement_leader(2);
+  RebindProbe original_element(3);
+  RebindProbe untouched_element(4);
+  RebindProbe replacement_element(5);
+
+  RefVectorWithLeader<RebindProbe>::BaseVec element_refs{std::ref(original_element), std::ref(untouched_element)};
+  RefVectorWithLeader<RebindProbe> refs(original_leader, std::move(element_refs));
+
+  const auto* const data_before       = refs.data();
+  const std::size_t size_before       = refs.size();
+  const std::size_t capacity_before   = refs.capacity();
+  const int original_leader_value     = original_leader.value;
+  const int original_element_value    = original_element.value;
+  const int replacement_leader_value  = replacement_leader.value;
+  const int replacement_element_value = replacement_element.value;
+
+  static_assert(noexcept(refs.rebindLeader(replacement_leader)));
+  static_assert(noexcept(refs.rebindElement(0, replacement_element)));
+
+  refs.rebindLeader(replacement_leader);
+  refs.rebindElement(0, replacement_element);
+
+  CHECK(&refs.getLeader() == &replacement_leader);
+  CHECK(&refs[0] == &replacement_element);
+  CHECK(&refs[1] == &untouched_element);
+
+  CHECK(refs.data() == data_before);
+  CHECK(refs.size() == size_before);
+  CHECK(refs.capacity() == capacity_before);
+
+  // Rebinding must replace reference_wrapper targets rather than assign through them.
+  CHECK(original_leader.value == original_leader_value);
+  CHECK(original_element.value == original_element_value);
+  CHECK(replacement_leader.value == replacement_leader_value);
+  CHECK(replacement_element.value == replacement_element_value);
+  CHECK(original_leader.assignment_count == 0);
+  CHECK(original_element.assignment_count == 0);
+  CHECK(replacement_leader.assignment_count == 0);
+  CHECK(replacement_element.assignment_count == 0);
+}
 } // namespace qmcplusplus
