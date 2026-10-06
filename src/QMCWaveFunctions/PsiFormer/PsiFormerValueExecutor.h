@@ -85,7 +85,7 @@ public:
         feature_width_(plan.modelShape().feature_dimension),
         head_count_(plan.modelShape().attention_heads),
         head_width_(feature_width_ / head_count_),
-        input_width_(4 * nucleus_count_ + 1),
+        input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
         layers_(plan.modelShape().attention_blocks)
   {
     if (electron_count_ == 0 || spin_up_count_ + spin_down_count_ != electron_count_ ||
@@ -98,11 +98,10 @@ public:
     using qmcplusplus::psiformer::ParameterRole;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan.environment();
-    if (environment.boundary != BoundaryCondition::OPEN ||
-        environment.parameter_scalar_domain != ScalarDomain::REAL ||
+    if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
-      throw std::invalid_argument("PsiFormer direct value execution supports only fixed-ion real molecular models");
+      throw std::invalid_argument("PsiFormer direct value execution supports only fixed-ion real models");
 
     anti_alpha_ = interval(plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA));
     if (const auto* same_alpha = plan.optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
@@ -359,20 +358,22 @@ struct DirectValueResult
 };
 
 /// Map the model-plan boundary axis to the geometry cache without relying on enum ordinals.
-inline GeometryBoundary directGeometryBoundary(qmcplusplus::psiformer::BoundaryCondition boundary)
+inline GeometryBoundary directGeometryBoundary(
+    const qmcplusplus::psiformer::ExecutionEnvironment& environment)
 {
   using qmcplusplus::psiformer::BoundaryCondition;
-  switch (boundary)
+  switch (environment.boundary)
   {
   case BoundaryCondition::OPEN:
     return {GeometryBoundaryKind::OPEN};
   case BoundaryCondition::PERIODIC:
-    throw std::invalid_argument("Periodic PsiFormer value execution is not implemented");
+    return {GeometryBoundaryKind::PERIODIC, environment.lattice_vectors,
+            environment.periodic_axes};
   }
   throw std::invalid_argument("Unknown PsiFormer execution-plan boundary condition");
 }
 
-/** Evaluate the real, open-boundary PsiFormer forward path with direct kernels. */
+/** Evaluate the real PsiFormer forward path under the selected geometry policy. */
 class DirectValueExecutor
 {
 public:
@@ -382,7 +383,7 @@ public:
       : parameters_(model.p),
         layout_(std::make_shared<const DirectValueParameterLayout>(model, plan)),
         nuclei_(model.cfg.nuclei.x),
-        boundary_(directGeometryBoundary(plan.environment().boundary))
+        boundary_(directGeometryBoundary(plan.environment()))
   {}
 
   /// Construct one independently mutable workspace suitable for a component clone.
@@ -413,14 +414,12 @@ public:
         workspace.geometry_.nucleusCount() != layout_->nucleusCount())
       throw std::invalid_argument("PsiFormer direct workspace belongs to a different model shape");
 
-    // Identical same-spin coordinates are an exact fermionic node.  Detect
-    // this algebraic boundary before dense contractions introduce roundoff
-    // differences between otherwise identical determinant rows.
-    if (hasExactSameSpinCoalescence(workspace))
-      return exactNodeResult(workspace);
-
     const double* parameter_values = parameters_.flat_values().data();
     refreshGeometry(workspace);
+    // Same-spin particles at the same physical point, including distinct
+    // lattice images, are an exact fermionic node.
+    if (hasExactSameSpinCoalescence(workspace))
+      return exactNodeResult(workspace);
     buildEmbedding(parameter_values, workspace);
     for (std::size_t layer = 0; layer < layout_->layers_.size(); ++layer)
       applyAttentionBlock(parameter_values, layout_->layers_[layer], workspace);
@@ -453,25 +452,16 @@ public:
 private:
   friend class DirectBatchExecutor;
 
-  /// Return true when two electrons in the same spin block have identical positions.
+  /// Return true when two same-spin electrons have zero boundary-aware separation.
   bool hasExactSameSpinCoalescence(const DirectValueWorkspace& workspace) const noexcept
   {
-    for (std::size_t first = 0; first < layout_->electronCount(); ++first)
-      for (std::size_t second = first + 1; second < layout_->electronCount(); ++second)
-      {
-        const bool first_is_up  = first < layout_->spinUpCount();
-        const bool second_is_up = second < layout_->spinUpCount();
-        if (first_is_up != second_is_up)
-          continue;
-
-        bool positions_match = true;
-        for (std::size_t dimension = 0; dimension < 3; ++dimension)
-          positions_match = positions_match &&
-              workspace.electron_positions_[3 * first + dimension] ==
-                  workspace.electron_positions_[3 * second + dimension];
-        if (positions_match)
-          return true;
-      }
+    const auto& identities = workspace.geometry_.electronPairs();
+    const auto& distances  = workspace.geometry_.electronElectronPairs().distances();
+    for (std::size_t pair = 0; pair < identities.size(); ++pair)
+      if ((identities[pair].first < layout_->spinUpCount()) ==
+              (identities[pair].second < layout_->spinUpCount()) &&
+          distances[pair] == 0)
+        return true;
     return false;
   }
 
@@ -549,10 +539,13 @@ private:
   {
     const GeometryPairTable& pairs = workspace.geometry_.electronNucleusPairs();
     const auto& displacements      = pairs.displacements();
+    const auto& complementary      = pairs.complementaryDisplacements();
     const auto& radial_factors     = pairs.softenedRadialFactors();
     const std::size_t ne           = layout_->electronCount();
     const std::size_t na           = layout_->nucleusCount();
     const std::size_t input_width  = layout_->inputWidth();
+    const bool periodic = workspace.geometry_.boundary().kind == GeometryBoundaryKind::PERIODIC;
+    const std::size_t pair_width = periodic ? 7 : 4;
 
     for (std::size_t electron = 0; electron < ne; ++electron)
     {
@@ -560,10 +553,15 @@ private:
       for (std::size_t nucleus = 0; nucleus < na; ++nucleus)
       {
         const std::size_t pair = electron * na + nucleus;
-        feature_row[4 * nucleus] = radial_factors[pair].log1p_radius;
+        const std::size_t feature_begin = pair_width * nucleus;
+        feature_row[feature_begin] = radial_factors[pair].log1p_radius;
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
-          feature_row[4 * nucleus + 1 + dimension] =
+          feature_row[feature_begin + 1 + dimension] =
               displacements[pair][dimension] * radial_factors[pair].log1p_over_radius;
+        if (periodic)
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            feature_row[feature_begin + 4 + dimension] =
+                complementary[pair][dimension] * radial_factors[pair].log1p_over_radius;
       }
       feature_row[input_width - 1] = electron < layout_->spinUpCount() ? 1.0 : -1.0;
     }

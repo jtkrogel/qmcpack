@@ -302,10 +302,132 @@ TEST_CASE("PsiFormer geometry rejects derived overflow atomically",
   CHECK(cache.electrons()[0] == pf::GeometryPosition{3, 0, 0});
 }
 
-TEST_CASE("PsiFormer rejects unavailable periodic geometry", "[wavefunction][psiformer]")
+TEST_CASE("PsiFormer periodic torus geometry is image invariant and differentiable",
+          "[wavefunction][psiformer][periodic]")
+{
+  const pf::GeometryBoundary boundary{
+      pf::GeometryBoundaryKind::PERIODIC,
+      {{{5.0, 0.0, 0.0}, {0.7, 4.6, 0.0}, {-0.2, 0.4, 5.3}}},
+      {{true, true, true}}};
+  const std::array<double, 3> nuclei{0.35, -0.22, 0.41};
+  const std::array<double, 3> electron{1.13, 0.87, -0.36};
+  pf::PsiFormerGeometryCache cache(
+      1, pf::GeometryPositionView::interleaved(nuclei.data(), 1), boundary);
+  cache.update(pf::GeometryPositionView::interleaved(electron.data(), 1));
+
+  const auto& pairs = cache.electronNucleusPairs();
+  const pf::GeometryPosition q = pairs.displacements()[0];
+  const pf::GeometryPosition p = pairs.complementaryDisplacements()[0];
+  const double radius = pairs.distances()[0];
+
+  // Moving the electron by two independent lattice vectors leaves the complete
+  // periodic feature, not merely its scalar radius, unchanged.
+  std::array<double, 3> image = electron;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    image[dimension] += boundary.lattice_vectors[0][dimension] -
+        2 * boundary.lattice_vectors[2][dimension];
+  cache.update(pf::GeometryPositionView::interleaved(image.data(), 1));
+  for (std::size_t component = 0; component < 3; ++component)
+  {
+    checkClose(cache.electronNucleusPairs().displacements()[0][component], q[component], 2e-13);
+    checkClose(cache.electronNucleusPairs().complementaryDisplacements()[0][component], p[component], 2e-13);
+  }
+  checkClose(cache.electronNucleusPairs().distances()[0], radius, 2e-13);
+
+  // A common translation of ions and electrons is represented by a fresh cache
+  // because nuclei are intentionally immutable inside one workspace.
+  const pf::GeometryPosition translation{1.7, -0.9, 0.6};
+  std::array<double, 3> shifted_nucleus{};
+  std::array<double, 3> shifted_electron{};
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    shifted_nucleus[dimension] = nuclei[dimension] + translation[dimension];
+    shifted_electron[dimension] = electron[dimension] + translation[dimension];
+  }
+  pf::PsiFormerGeometryCache shifted_cache(
+      1, pf::GeometryPositionView::interleaved(shifted_nucleus.data(), 1), boundary);
+  shifted_cache.update(
+      pf::GeometryPositionView::interleaved(shifted_electron.data(), 1));
+  for (std::size_t component = 0; component < 3; ++component)
+  {
+    checkClose(shifted_cache.electronNucleusPairs().displacements()[0][component], q[component], 2e-14);
+    checkClose(shifted_cache.electronNucleusPairs().complementaryDisplacements()[0][component], p[component], 2e-14);
+  }
+  checkClose(shifted_cache.electronNucleusPairs().distances()[0], radius, 2e-14);
+
+  // Independently difference all cached Cartesian first derivatives and traces.
+  cache.update(pf::GeometryPositionView::interleaved(electron.data(), 1));
+  const auto analytic_q_jacobian = pairs.displacementJacobians()[0];
+  const auto analytic_p_jacobian = pairs.complementaryDisplacementJacobians()[0];
+  const auto analytic_radius_gradient = pairs.distanceGradients()[0];
+  const auto analytic_q_laplacian = pairs.displacementLaplacians()[0];
+  const auto analytic_p_laplacian = pairs.complementaryDisplacementLaplacians()[0];
+  const double analytic_radius_laplacian = pairs.distanceLaplacians()[0];
+  constexpr double first_step = 2e-6;
+  constexpr double second_step = 2e-4;
+  pf::GeometryPosition finite_q_laplacian{};
+  pf::GeometryPosition finite_p_laplacian{};
+  double finite_radius_laplacian = 0;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    std::array<double, 3> plus = electron;
+    std::array<double, 3> minus = electron;
+    plus[dimension] += first_step;
+    minus[dimension] -= first_step;
+    cache.update(pf::GeometryPositionView::interleaved(plus.data(), 1));
+    const pf::GeometryPosition q_plus = pairs.displacements()[0];
+    const pf::GeometryPosition p_plus = pairs.complementaryDisplacements()[0];
+    const double r_plus = pairs.distances()[0];
+    cache.update(pf::GeometryPositionView::interleaved(minus.data(), 1));
+    const pf::GeometryPosition q_minus = pairs.displacements()[0];
+    const pf::GeometryPosition p_minus = pairs.complementaryDisplacements()[0];
+    const double r_minus = pairs.distances()[0];
+    for (std::size_t component = 0; component < 3; ++component)
+    {
+      checkClose((q_plus[component] - q_minus[component]) / (2 * first_step),
+                 analytic_q_jacobian[component][dimension], 2e-9);
+      checkClose((p_plus[component] - p_minus[component]) / (2 * first_step),
+                 analytic_p_jacobian[component][dimension], 2e-9);
+    }
+    checkClose((r_plus - r_minus) / (2 * first_step),
+               analytic_radius_gradient[dimension], 2e-9);
+
+    plus = electron;
+    minus = electron;
+    plus[dimension] += second_step;
+    minus[dimension] -= second_step;
+    cache.update(pf::GeometryPositionView::interleaved(plus.data(), 1));
+    const pf::GeometryPosition q_second_plus = pairs.displacements()[0];
+    const pf::GeometryPosition p_second_plus = pairs.complementaryDisplacements()[0];
+    const double r_second_plus = pairs.distances()[0];
+    cache.update(pf::GeometryPositionView::interleaved(minus.data(), 1));
+    const pf::GeometryPosition q_second_minus = pairs.displacements()[0];
+    const pf::GeometryPosition p_second_minus = pairs.complementaryDisplacements()[0];
+    const double r_second_minus = pairs.distances()[0];
+    for (std::size_t component = 0; component < 3; ++component)
+    {
+      finite_q_laplacian[component] +=
+          (q_second_plus[component] - 2 * q[component] + q_second_minus[component]) /
+          (second_step * second_step);
+      finite_p_laplacian[component] +=
+          (p_second_plus[component] - 2 * p[component] + p_second_minus[component]) /
+          (second_step * second_step);
+    }
+    finite_radius_laplacian +=
+        (r_second_plus - 2 * radius + r_second_minus) / (second_step * second_step);
+  }
+  for (std::size_t component = 0; component < 3; ++component)
+  {
+    checkClose(finite_q_laplacian[component], analytic_q_laplacian[component], 2e-6);
+    checkClose(finite_p_laplacian[component], analytic_p_laplacian[component], 2e-6);
+  }
+  checkClose(finite_radius_laplacian, analytic_radius_laplacian, 2e-6);
+}
+
+TEST_CASE("PsiFormer periodic geometry validates bulk cells", "[wavefunction][psiformer][periodic]")
 {
   CHECK(pf::supportsGeometryBoundary(pf::GeometryBoundaryKind::OPEN));
-  CHECK_FALSE(pf::supportsGeometryBoundary(pf::GeometryBoundaryKind::PERIODIC));
+  CHECK(pf::supportsGeometryBoundary(pf::GeometryBoundaryKind::PERIODIC));
 
   pf::GeometryBoundary periodic;
   periodic.kind          = pf::GeometryBoundaryKind::PERIODIC;
@@ -314,7 +436,16 @@ TEST_CASE("PsiFormer rejects unavailable periodic geometry", "[wavefunction][psi
       {pf::GeometryPosition{8, 0, 0}, pf::GeometryPosition{0, 8, 0}, pf::GeometryPosition{0, 0, 8}};
   const std::array<double, 3> nucleus{0, 0, 0};
 
-  CHECK_THROWS_AS(
-      pf::PsiFormerGeometryCache(2, pf::GeometryPositionView::interleaved(nucleus.data(), 1), periodic),
-      std::invalid_argument);
+  CHECK_NOTHROW(
+      pf::PsiFormerGeometryCache(2, pf::GeometryPositionView::interleaved(nucleus.data(), 1), periodic));
+
+  periodic.periodic_axes[2] = false;
+  CHECK_THROWS_AS(pf::PsiFormerGeometryCache(
+                      2, pf::GeometryPositionView::interleaved(nucleus.data(), 1), periodic),
+                  std::invalid_argument);
+  periodic.periodic_axes[2] = true;
+  periodic.lattice_vectors[2] = periodic.lattice_vectors[1];
+  CHECK_THROWS_AS(pf::PsiFormerGeometryCache(
+                      2, pf::GeometryPositionView::interleaved(nucleus.data(), 1), periodic),
+                  std::invalid_argument);
 }

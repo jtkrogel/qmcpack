@@ -11,6 +11,7 @@
 
 #include "PsiFormerGeometry.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -102,7 +103,7 @@ GeometryReal evaluatePolynomial(const std::array<GeometryReal, N>& coefficients,
 
 bool supportsGeometryBoundary(GeometryBoundaryKind kind) noexcept
 {
-  return kind == GeometryBoundaryKind::OPEN;
+  return kind == GeometryBoundaryKind::OPEN || kind == GeometryBoundaryKind::PERIODIC;
 }
 
 GeometryPositionView::GeometryPositionView(std::array<const GeometryReal*, 3> components,
@@ -196,8 +197,16 @@ SoftenedRadialFactors evaluateSoftenedRadialFactors(GeometryReal radius)
 
 GeometryPairTable::GeometryPairTable(std::size_t pair_count)
     : displacements_(pair_count),
+      complementary_displacements_(pair_count),
+      displacement_jacobians_(pair_count),
+      complementary_displacement_jacobians_(pair_count),
+      displacement_laplacians_(pair_count),
+      complementary_displacement_laplacians_(pair_count),
       distances_(pair_count),
       inverse_distances_(pair_count),
+      distance_gradients_(pair_count),
+      distance_gradient_norms_squared_(pair_count),
+      distance_laplacians_(pair_count),
       softened_radial_factors_(pair_count)
 {}
 
@@ -211,8 +220,16 @@ std::size_t GeometryPairTable::storageFingerprint() const noexcept
     hash *= 1099511628211ULL;
   };
   mix(displacements_);
+  mix(complementary_displacements_);
+  mix(displacement_jacobians_);
+  mix(complementary_displacement_jacobians_);
+  mix(displacement_laplacians_);
+  mix(complementary_displacement_laplacians_);
   mix(distances_);
   mix(inverse_distances_);
+  mix(distance_gradients_);
+  mix(distance_gradient_norms_squared_);
+  mix(distance_laplacians_);
   mix(softened_radial_factors_);
   return hash;
 }
@@ -221,20 +238,45 @@ std::size_t GeometryPairTable::storageBytes() const
 {
   std::size_t bytes = 0;
   for (const std::size_t contribution : {
-           checkedCapacityBytes(displacements_), checkedCapacityBytes(distances_),
+           checkedCapacityBytes(displacements_), checkedCapacityBytes(complementary_displacements_),
+           checkedCapacityBytes(displacement_jacobians_),
+           checkedCapacityBytes(complementary_displacement_jacobians_),
+           checkedCapacityBytes(displacement_laplacians_),
+           checkedCapacityBytes(complementary_displacement_laplacians_),
+           checkedCapacityBytes(distances_),
            checkedCapacityBytes(inverse_distances_),
+           checkedCapacityBytes(distance_gradients_),
+           checkedCapacityBytes(distance_gradient_norms_squared_),
+           checkedCapacityBytes(distance_laplacians_),
            checkedCapacityBytes(softened_radial_factors_)})
     bytes = checkedSum(bytes, contribution);
   return bytes;
 }
 
-void GeometryPairTable::updatePair(std::size_t pair_index, const GeometryPosition& displacement)
+void GeometryPairTable::updatePair(std::size_t pair_index,
+                                   const GeometryPosition& displacement,
+                                   const GeometryPosition& complementary_displacement,
+                                   const GeometryJacobian& displacement_jacobian,
+                                   const GeometryJacobian& complementary_displacement_jacobian,
+                                   const GeometryPosition& displacement_laplacian,
+                                   const GeometryPosition& complementary_displacement_laplacian,
+                                   GeometryReal distance,
+                                   const GeometryPosition& distance_gradient,
+                                   GeometryReal distance_gradient_norm_squared,
+                                   GeometryReal distance_laplacian)
 {
-  displacements_[pair_index] = displacement;
-  const GeometryReal distance = std::hypot(displacement[0], displacement[1], displacement[2]);
-  distances_[pair_index]      = distance;
+  displacements_[pair_index]                       = displacement;
+  complementary_displacements_[pair_index]         = complementary_displacement;
+  displacement_jacobians_[pair_index]              = displacement_jacobian;
+  complementary_displacement_jacobians_[pair_index] = complementary_displacement_jacobian;
+  displacement_laplacians_[pair_index]              = displacement_laplacian;
+  complementary_displacement_laplacians_[pair_index] = complementary_displacement_laplacian;
+  distances_[pair_index]                            = distance;
   inverse_distances_[pair_index] =
       distance == 0 ? std::numeric_limits<GeometryReal>::infinity() : 1 / distance;
+  distance_gradients_[pair_index]                   = distance_gradient;
+  distance_gradient_norms_squared_[pair_index]      = distance_gradient_norm_squared;
+  distance_laplacians_[pair_index]                  = distance_laplacian;
   softened_radial_factors_[pair_index] = evaluateSoftenedRadialFactors(distance);
 }
 
@@ -251,11 +293,49 @@ PsiFormerGeometryCache::PsiFormerGeometryCache(std::size_t electron_count,
       incidences_(checkedProduct(2, checkedUniquePairCount(electron_count)))
 {
   if (!supportsGeometryBoundary(boundary_.kind))
-    throw std::invalid_argument("PsiFormer geometry supports only open boundary conditions");
+    throw std::invalid_argument("PsiFormer geometry received an unknown boundary policy");
   if (electron_count == 0)
     throw std::invalid_argument("PsiFormer geometry requires at least one electron");
   if (nuclei.size() == 0)
     throw std::invalid_argument("Molecular PsiFormer geometry requires at least one fixed nucleus");
+
+  if (boundary_.kind == GeometryBoundaryKind::PERIODIC)
+  {
+    if (!std::all_of(boundary_.periodic_axes.begin(), boundary_.periodic_axes.end(),
+                     [](bool periodic) { return periodic; }))
+      throw std::invalid_argument("Real Gamma PsiFormer geometry requires three periodic lattice axes");
+    for (const GeometryPosition& vector : boundary_.lattice_vectors)
+      validatePosition(vector);
+
+    const GeometryPosition& a = boundary_.lattice_vectors[0];
+    const GeometryPosition& b = boundary_.lattice_vectors[1];
+    const GeometryPosition& c = boundary_.lattice_vectors[2];
+    const GeometryPosition b_cross_c{b[1] * c[2] - b[2] * c[1],
+                                     b[2] * c[0] - b[0] * c[2],
+                                     b[0] * c[1] - b[1] * c[0]};
+    const GeometryPosition c_cross_a{c[1] * a[2] - c[2] * a[1],
+                                     c[2] * a[0] - c[0] * a[2],
+                                     c[0] * a[1] - c[1] * a[0]};
+    const GeometryPosition a_cross_b{a[1] * b[2] - a[2] * b[1],
+                                     a[2] * b[0] - a[0] * b[2],
+                                     a[0] * b[1] - a[1] * b[0]};
+    const GeometryReal determinant =
+        a[0] * b_cross_c[0] + a[1] * b_cross_c[1] + a[2] * b_cross_c[2];
+    GeometryReal scale = 0;
+    for (const GeometryPosition& vector : boundary_.lattice_vectors)
+      for (GeometryReal component : vector)
+        scale = std::max(scale, std::abs(component));
+    if (!isFiniteGeometryValue(determinant) || scale == 0 ||
+        std::abs(determinant) <= 128 * std::numeric_limits<GeometryReal>::epsilon() * scale * scale * scale)
+      throw std::invalid_argument("Periodic PsiFormer geometry requires a finite full-rank lattice");
+
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      reciprocal_vectors_[0][dimension] = b_cross_c[dimension] / determinant;
+      reciprocal_vectors_[1][dimension] = c_cross_a[dimension] / determinant;
+      reciprocal_vectors_[2][dimension] = a_cross_b[dimension] / determinant;
+    }
+  }
 
   for (std::size_t nucleus = 0; nucleus < nuclei_.size(); ++nucleus)
   {
@@ -317,27 +397,27 @@ void PsiFormerGeometryCache::update(GeometryPositionView electrons)
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     validatePosition(electrons.position(electron));
 
-  // Preflight all subtraction, norm, and radial-factor arithmetic before
+  // Preflight all boundary transforms, norms, and radial-factor arithmetic before
   // changing accepted electron or pair-table state.
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
-      preflightPair(displacement(electrons.position(electron), nuclei_[nucleus]));
+      (void)pairGeometry(electrons.position(electron), nuclei_[nucleus]);
   for (const ElectronPair& pair : electron_pairs_)
-    preflightPair(displacement(electrons.position(pair.first),
-                               electrons.position(pair.second)));
+    (void)pairGeometry(electrons.position(pair.first), electrons.position(pair.second));
 
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     electrons_[electron] = electrons.position(electron);
 
   for (std::size_t electron = 0; electron < electronCount(); ++electron)
     for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
-      electron_nucleus_pairs_.updatePair(electronNucleusPairIndex(electron, nucleus),
-                                         displacement(electrons_[electron], nuclei_[nucleus]));
+      updatePair(electron_nucleus_pairs_, electronNucleusPairIndex(electron, nucleus),
+                 pairGeometry(electrons_[electron], nuclei_[nucleus]));
 
   for (std::size_t pair_index = 0; pair_index < electron_pairs_.size(); ++pair_index)
   {
     const ElectronPair& pair = electron_pairs_[pair_index];
-    electron_electron_pairs_.updatePair(pair_index, displacement(electrons_[pair.first], electrons_[pair.second]));
+    updatePair(electron_electron_pairs_, pair_index,
+               pairGeometry(electrons_[pair.first], electrons_[pair.second]));
   }
 
   valid_ = true;
@@ -355,7 +435,7 @@ void PsiFormerGeometryCache::updateElectron(std::size_t electron, const Geometry
   // Validate every affected derived quantity while the accepted cache is
   // untouched.  The publication pass below repeats only proven-safe arithmetic.
   for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
-    preflightPair(displacement(position, nuclei_[nucleus]));
+    (void)pairGeometry(position, nuclei_[nucleus]);
   for (std::size_t incidence_index = incidence_offsets_[electron];
        incidence_index < incidence_offsets_[electron + 1]; ++incidence_index)
   {
@@ -365,31 +445,171 @@ void PsiFormerGeometryCache::updateElectron(std::size_t electron, const Geometry
         pair.first == electron ? position : electrons_[pair.first];
     const GeometryPosition& second =
         pair.second == electron ? position : electrons_[pair.second];
-    preflightPair(displacement(first, second));
+    (void)pairGeometry(first, second);
   }
 
   electrons_[electron] = position;
   for (std::size_t nucleus = 0; nucleus < nucleusCount(); ++nucleus)
-    electron_nucleus_pairs_.updatePair(electronNucleusPairIndex(electron, nucleus),
-                                       displacement(electrons_[electron], nuclei_[nucleus]));
+    updatePair(electron_nucleus_pairs_, electronNucleusPairIndex(electron, nucleus),
+               pairGeometry(electrons_[electron], nuclei_[nucleus]));
 
   for (std::size_t incidence_index = incidence_offsets_[electron];
        incidence_index < incidence_offsets_[electron + 1]; ++incidence_index)
   {
     const std::size_t pair_index = incidences_[incidence_index].pair_index;
     const ElectronPair& pair     = electron_pairs_[pair_index];
-    electron_electron_pairs_.updatePair(pair_index, displacement(electrons_[pair.first], electrons_[pair.second]));
+    updatePair(electron_electron_pairs_, pair_index,
+               pairGeometry(electrons_[pair.first], electrons_[pair.second]));
   }
 
   ++generation_;
 }
 
-GeometryPosition PsiFormerGeometryCache::displacement(const GeometryPosition& target,
-                                                      const GeometryPosition& source) const
+PsiFormerGeometryCache::PairGeometry PsiFormerGeometryCache::pairGeometry(
+    const GeometryPosition& target,
+    const GeometryPosition& source) const
 {
-  if (boundary_.kind != GeometryBoundaryKind::OPEN)
-    throw std::logic_error("Unsupported PsiFormer boundary policy reached displacement evaluation");
-  return {target[0] - source[0], target[1] - source[1], target[2] - source[2]};
+  PairGeometry pair;
+  const GeometryPosition difference{target[0] - source[0], target[1] - source[1], target[2] - source[2]};
+  validatePosition(difference);
+
+  if (boundary_.kind == GeometryBoundaryKind::OPEN)
+  {
+    pair.displacement = difference;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      pair.displacement_jacobian[dimension][dimension] = 1;
+    pair.distance = std::hypot(difference[0], difference[1], difference[2]);
+    if (pair.distance != 0)
+    {
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        pair.distance_gradient[dimension] = difference[dimension] / pair.distance;
+      pair.distance_gradient_norm_squared = 1;
+      pair.distance_laplacian              = 2 / pair.distance;
+    }
+  }
+  else
+  {
+    constexpr GeometryReal two_pi = 6.283185307179586476925286766559;
+    GeometryPosition sine_coordinates{};
+    GeometryPosition cosine_coordinates{};
+    GeometryPosition sine_first{};
+    GeometryPosition cosine_first{};
+    GeometryPosition sine_second{};
+    GeometryPosition cosine_second{};
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+      GeometryReal fractional = 0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        fractional += reciprocal_vectors_[axis][dimension] * difference[dimension];
+      if (boundary_.periodic_axes[axis])
+      {
+        const GeometryReal nearest_image = std::nearbyint(fractional);
+        GeometryReal reduced = fractional - nearest_image;
+        const GeometryReal image_tolerance = 64 * std::numeric_limits<GeometryReal>::epsilon() *
+            (1 + std::abs(fractional));
+        if (std::abs(reduced) <= image_tolerance)
+          reduced = 0;
+        const GeometryReal angle = two_pi * reduced;
+        sine_coordinates[axis]   = std::sin(angle) / two_pi;
+        cosine_coordinates[axis] = (1 - std::cos(angle)) / two_pi;
+        sine_first[axis]         = std::cos(angle);
+        cosine_first[axis]       = std::sin(angle);
+        sine_second[axis]        = -two_pi * std::sin(angle);
+        cosine_second[axis]      = two_pi * std::cos(angle);
+      }
+      else
+      {
+        sine_coordinates[axis] = fractional;
+        sine_first[axis]       = 1;
+      }
+    }
+
+    for (std::size_t component = 0; component < 3; ++component)
+      for (std::size_t axis = 0; axis < 3; ++axis)
+      {
+        const GeometryReal lattice_component = boundary_.lattice_vectors[axis][component];
+        pair.displacement[component] += lattice_component * sine_coordinates[axis];
+        pair.complementary_displacement[component] += lattice_component * cosine_coordinates[axis];
+        GeometryReal reciprocal_norm_squared = 0;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const GeometryReal reciprocal_component = reciprocal_vectors_[axis][dimension];
+          pair.displacement_jacobian[component][dimension] +=
+              lattice_component * sine_first[axis] * reciprocal_component;
+          pair.complementary_displacement_jacobian[component][dimension] +=
+              lattice_component * cosine_first[axis] * reciprocal_component;
+          reciprocal_norm_squared += reciprocal_component * reciprocal_component;
+        }
+        pair.displacement_laplacian[component] +=
+            lattice_component * sine_second[axis] * reciprocal_norm_squared;
+        pair.complementary_displacement_laplacian[component] +=
+            lattice_component * cosine_second[axis] * reciprocal_norm_squared;
+      }
+
+    GeometryReal squared_distance = 0;
+    for (std::size_t component = 0; component < 3; ++component)
+      squared_distance += pair.displacement[component] * pair.displacement[component] +
+          pair.complementary_displacement[component] * pair.complementary_displacement[component];
+    pair.distance = std::sqrt(squared_distance);
+    if (pair.distance != 0)
+    {
+      GeometryReal distance_laplacian = 0;
+      for (std::size_t derivative = 0; derivative < 3; ++derivative)
+      {
+        GeometryReal half_first_squared_distance = 0;
+        GeometryReal half_second_squared_distance = 0;
+        for (std::size_t component = 0; component < 3; ++component)
+        {
+          const GeometryReal q_first = pair.displacement_jacobian[component][derivative];
+          const GeometryReal p_first = pair.complementary_displacement_jacobian[component][derivative];
+          half_first_squared_distance += pair.displacement[component] * q_first +
+              pair.complementary_displacement[component] * p_first;
+          half_second_squared_distance += q_first * q_first + p_first * p_first;
+        }
+        pair.distance_gradient[derivative] = half_first_squared_distance / pair.distance;
+        distance_laplacian += half_second_squared_distance / pair.distance -
+            half_first_squared_distance * half_first_squared_distance /
+                (pair.distance * pair.distance * pair.distance);
+      }
+      for (std::size_t component = 0; component < 3; ++component)
+        distance_laplacian +=
+            (pair.displacement[component] * pair.displacement_laplacian[component] +
+             pair.complementary_displacement[component] *
+                 pair.complementary_displacement_laplacian[component]) /
+            pair.distance;
+      pair.distance_laplacian = distance_laplacian;
+      for (GeometryReal component : pair.distance_gradient)
+        pair.distance_gradient_norm_squared += component * component;
+    }
+  }
+
+  preflightPair(pair.displacement);
+  if (!isFiniteGeometryValue(pair.distance) ||
+      !isFiniteGeometryValue(pair.distance_gradient_norm_squared) ||
+      !isFiniteGeometryValue(pair.distance_laplacian))
+    throw std::invalid_argument("PsiFormer boundary transform produced non-finite radial geometry");
+  for (const GeometryPosition& values : pair.displacement_jacobian)
+    validatePosition(values);
+  validatePosition(pair.complementary_displacement);
+  for (const GeometryPosition& values : pair.complementary_displacement_jacobian)
+    validatePosition(values);
+  validatePosition(pair.displacement_laplacian);
+  validatePosition(pair.complementary_displacement_laplacian);
+  validatePosition(pair.distance_gradient);
+  (void)evaluateSoftenedRadialFactors(pair.distance);
+  return pair;
+}
+
+void PsiFormerGeometryCache::updatePair(GeometryPairTable& table,
+                                        std::size_t pair_index,
+                                        const PairGeometry& pair)
+{
+  table.updatePair(pair_index, pair.displacement, pair.complementary_displacement,
+                   pair.displacement_jacobian, pair.complementary_displacement_jacobian,
+                   pair.displacement_laplacian, pair.complementary_displacement_laplacian,
+                   pair.distance,
+                   pair.distance_gradient, pair.distance_gradient_norm_squared,
+                   pair.distance_laplacian);
 }
 
 void PsiFormerGeometryCache::initializeElectronPairs()

@@ -246,7 +246,7 @@ public:
         heads_(plan.modelShape().attention_heads),
         blocks_(plan.modelShape().attention_blocks),
         head_width_(width_ / heads_),
-        input_width_(4 * nuclei_ + 1),
+        input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
         feature_elements_(electrons_ * width_),
         attention_elements_(heads_ * electrons_ * electrons_),
         orbital_elements_(determinants_ * electrons_ * electrons_),
@@ -466,7 +466,7 @@ public:
         plan_(plan),
         nuclei_(model.cfg.nuclei.x),
         spin_up_electrons_(model.cfg.nup),
-        boundary_(mappedBoundary(plan.environment().boundary))
+        boundary_(mappedBoundary(plan.environment()))
   {
     if (plan_.parameterCount() != parameters_.size() ||
         plan_.modelShape().electrons() != model.ne ||
@@ -475,12 +475,11 @@ public:
         plan_.modelShape().feature_dimension != model.dim ||
         plan_.modelShape().attention_heads != model.heads)
       throw std::invalid_argument("PsiFormer score execution plan does not match the imported model");
-    if (plan_.environment().boundary != qmcplusplus::psiformer::BoundaryCondition::OPEN ||
-        plan_.environment().parameter_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
+    if (plan_.environment().parameter_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
         plan_.environment().compute_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
         plan_.environment().amplitude_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
         !plan_.environment().fixed_nuclei)
-      throw std::invalid_argument("Direct PsiFormer score supports only real, open, fixed-nucleus models");
+      throw std::invalid_argument("Direct PsiFormer score supports only real, fixed-nucleus models");
   }
 
   /// Construct independently mutable tape and adjoint storage for one clone.
@@ -646,11 +645,13 @@ private:
   using ParameterTensorDescriptor = qmcplusplus::psiformer::ParameterTensorDescriptor;
 
   /// Map supported execution-plan boundaries to the geometry policy explicitly.
-  static GeometryBoundary mappedBoundary(qmcplusplus::psiformer::BoundaryCondition boundary)
+  static GeometryBoundary mappedBoundary(
+      const qmcplusplus::psiformer::ExecutionEnvironment& environment)
   {
-    if (boundary == qmcplusplus::psiformer::BoundaryCondition::OPEN)
+    if (environment.boundary == qmcplusplus::psiformer::BoundaryCondition::OPEN)
       return {GeometryBoundaryKind::OPEN};
-    throw std::invalid_argument("Periodic PsiFormer score execution is not implemented");
+    return {GeometryBoundaryKind::PERIODIC, environment.lattice_vectors,
+            environment.periodic_axes};
   }
 
   /// Return the first scalar in one typed parameter tensor.
@@ -690,17 +691,25 @@ private:
   {
     const GeometryPairTable& pairs = workspace.geometry_.electronNucleusPairs();
     const auto& displacements      = pairs.displacements();
+    const auto& complementary      = pairs.complementaryDisplacements();
     const auto& radial_factors     = pairs.softenedRadialFactors();
+    const bool periodic = workspace.geometry_.boundary().kind == GeometryBoundaryKind::PERIODIC;
+    const std::size_t pair_width = periodic ? 7 : 4;
     for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
     {
       double* feature_row = workspace.raw_features_.data() + electron * workspace.input_width_;
       for (std::size_t nucleus = 0; nucleus < workspace.nuclei_; ++nucleus)
       {
         const std::size_t pair = electron * workspace.nuclei_ + nucleus;
-        feature_row[4 * nucleus] = radial_factors[pair].log1p_radius;
+        const std::size_t feature_begin = pair_width * nucleus;
+        feature_row[feature_begin] = radial_factors[pair].log1p_radius;
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
-          feature_row[4 * nucleus + 1 + dimension] =
+          feature_row[feature_begin + 1 + dimension] =
               displacements[pair][dimension] * radial_factors[pair].log1p_over_radius;
+        if (periodic)
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            feature_row[feature_begin + 4 + dimension] =
+                complementary[pair][dimension] * radial_factors[pair].log1p_over_radius;
       }
       feature_row[workspace.input_width_ - 1] = electron < spin_up_electrons_ ? 1.0 : -1.0;
     }

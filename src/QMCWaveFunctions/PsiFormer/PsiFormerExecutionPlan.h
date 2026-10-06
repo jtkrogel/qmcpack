@@ -13,15 +13,15 @@
  * immutable metadata: parameter values remain in the versioned model store and
  * are supplied to kernels as non-owning views.
  *
- * Boundary and scalar-domain choices are represented now so future periodic
- * and genuinely complex implementations do not require another evaluator API.
- * This implementation accepts only open-boundary, real-scalar, fixed-nucleus
- * models; unsupported choices fail during plan construction.
+ * Boundary and scalar-domain choices are represented explicitly.  Open and
+ * real Gamma-point periodic fixed-nucleus models are supported; genuinely
+ * complex scalar domains remain reserved for the twist implementation.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_EXECUTION_PLAN_H
 #define QMCPLUSPLUS_PSIFORMER_EXECUTION_PLAN_H
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -66,6 +66,13 @@ enum class BoundaryCondition
   PERIODIC
 };
 
+/// Version the geometry-to-network feature contract independently of tensor shape.
+enum class GeometryFeaturePolicy
+{
+  OPEN_EUCLIDEAN_V1,
+  PERIODIC_TORUS_V1
+};
+
 /// Select the scalar algebra expected by forward and adjoint kernels.
 enum class ScalarDomain
 {
@@ -99,6 +106,9 @@ struct ModelShape
 struct ExecutionEnvironment
 {
   BoundaryCondition boundary = BoundaryCondition::OPEN;
+  GeometryFeaturePolicy geometry_feature_policy = GeometryFeaturePolicy::OPEN_EUCLIDEAN_V1;
+  std::array<std::array<double, 3>, 3> lattice_vectors{};
+  std::array<bool, 3> periodic_axes{};
   ScalarDomain parameter_scalar_domain = ScalarDomain::REAL;
   ScalarDomain compute_scalar_domain   = ScalarDomain::REAL;
   ScalarDomain amplitude_scalar_domain = ScalarDomain::REAL;

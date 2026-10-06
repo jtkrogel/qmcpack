@@ -246,6 +246,83 @@ TEST_CASE("PsiFormer direct spatial supports canonical pseudo-LiH without same-s
   }
 }
 
+TEST_CASE("PsiFormer periodic spatial evaluation is image invariant and matches finite differences",
+          "[wavefunction][psiformer][periodic]")
+{
+  GeneratedFiles files = generateFiles("lih", 4, 7);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  qmcplusplus::psiformer::ExecutionEnvironment environment;
+  environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy =
+      qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.lattice_vectors = {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+  environment.periodic_axes = {{true, true, true}};
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
+      model.p, {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+                model.dim, model.heads, 4}, environment);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  auto value_workspace = value_executor.makeWorkspace();
+  auto spatial_workspace = spatial_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+
+  std::vector<double> positions = model.cfg.configuration(0).x;
+  value_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+  spatial_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(positions.data(), model.ne));
+  const pf::DirectValueResult reference_value = value_executor.evaluate(*value_workspace);
+  const pf::DirectSpatialResultView reference_view =
+      spatial_executor.evaluateFull(*spatial_workspace);
+  const std::vector<double> reference_gradient(reference_view.gradient.begin(), reference_view.gradient.end());
+  const std::vector<double> reference_lap_log(reference_view.lap_log.begin(), reference_view.lap_log.end());
+
+  std::vector<double> image_positions = positions;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    image_positions[dimension] += environment.lattice_vectors[1][dimension] -
+        environment.lattice_vectors[2][dimension];
+  value_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(image_positions.data(), model.ne));
+  spatial_workspace->setPositions(
+      pf::GeometryPositionView::interleaved(image_positions.data(), model.ne));
+  const pf::DirectValueResult image_value = value_executor.evaluate(*value_workspace);
+  const pf::DirectSpatialResultView image_view = spatial_executor.evaluateFull(*spatial_workspace);
+  CHECK(image_value.sign == reference_value.sign);
+  checkClose(image_value.logabs, reference_value.logabs, 2e-11, 2e-11);
+  REQUIRE(image_view.gradient.size() == reference_gradient.size());
+  REQUIRE(image_view.lap_log.size() == reference_lap_log.size());
+  for (std::size_t coordinate = 0; coordinate < reference_gradient.size(); ++coordinate)
+    checkClose(image_view.gradient[coordinate], reference_gradient[coordinate], 2e-9, 2e-9);
+  for (std::size_t electron = 0; electron < reference_lap_log.size(); ++electron)
+    checkClose(image_view.lap_log[electron], reference_lap_log[electron], 2e-8, 2e-8);
+
+  constexpr double gradient_step = 2e-5;
+  std::vector<double> plus = positions;
+  std::vector<double> minus = positions;
+  plus[1] += gradient_step;
+  minus[1] -= gradient_step;
+  const double finite_gradient =
+      (valueLogAbs(value_executor, *value_workspace, plus, model.ne) -
+       valueLogAbs(value_executor, *value_workspace, minus, model.ne)) /
+      (2 * gradient_step);
+  checkClose(reference_gradient[1], finite_gradient, 6e-5, 6e-5);
+
+  constexpr double laplacian_step = 2e-4;
+  double finite_laplacian = 0;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    plus = positions;
+    minus = positions;
+    plus[dimension] += laplacian_step;
+    minus[dimension] -= laplacian_step;
+    finite_laplacian +=
+        (valueLogAbs(value_executor, *value_workspace, plus, model.ne) -
+         2 * reference_value.logabs +
+         valueLogAbs(value_executor, *value_workspace, minus, model.ne)) /
+        (laplacian_step * laplacian_step);
+  }
+  checkClose(reference_lap_log[0], finite_laplacian, 8e-4, 8e-4);
+}
+
 TEST_CASE("PsiFormer direct spatial request validation", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");

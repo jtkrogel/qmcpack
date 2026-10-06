@@ -2322,8 +2322,10 @@ private:
       DirectSpatialWorkspace& spatial = *workspaces[local];
       DirectSpatialJetBuffer& orbitals = spatial.orbital_matrices_;
       const GeometryPairTable& pairs = spatial.geometry_.electronNucleusPairs();
-      const auto& displacements = pairs.displacements();
       const auto& distances = pairs.distances();
+      const auto& distance_gradients = pairs.distanceGradients();
+      const auto& distance_gradient_norms = pairs.distanceGradientNormsSquared();
+      const auto& distance_laplacians = pairs.distanceLaplacians();
       for (std::size_t spin_electron = 0; spin_electron < spin_count;
            ++spin_electron)
       {
@@ -2351,7 +2353,6 @@ private:
                     "PsiFormer batch configuration " +
                     std::to_string(tile_begin + local) +
                     " has undefined electron-nucleus spatial derivatives");
-              const double inverse_radius = 1.0 / radius;
               const double decay_rate = std::abs(zeta[parameter]);
               const double exponential = std::exp(-decay_rate * radius);
               const double weighted_value = pi[parameter] * exponential;
@@ -2365,11 +2366,12 @@ private:
                   const std::size_t dimension =
                       DirectSpatialExecutor::laneDimension(spatial, lane);
                   spatial.scalar_gradient_scratch_[lane] +=
-                      radial_first * displacements[pair][dimension] * inverse_radius;
+                      radial_first * distance_gradients[pair][dimension];
                 }
               if (spatial.mode_ == DirectSpatialMode::FULL_VGL)
                 spatial.scalar_laplacian_scratch_[electron] +=
-                    radial_second + 2.0 * radial_first * inverse_radius;
+                    radial_second * distance_gradient_norms[pair] +
+                    radial_first * distance_laplacians[pair];
             }
 
             orbitals.value[matrix_element] = backflow_value * envelope_value;
@@ -2589,23 +2591,17 @@ private:
     return spatialView(workspace, mode, gradient_stride, laplacian_stride);
   }
 
-  static bool hasExactSameSpinCoalescence(const double* positions,
+  /// Detect boundary-aware same-spin nodes from the tile's refreshed pair table.
+  static bool hasExactSameSpinCoalescence(const PsiFormerGeometryCache& geometry,
                                           const DirectValueParameterLayout& layout) noexcept
   {
-    for (std::size_t first = 0; first < layout.electronCount(); ++first)
-      for (std::size_t second = first + 1; second < layout.electronCount(); ++second)
-      {
-        const bool first_up = first < layout.spinUpCount();
-        const bool second_up = second < layout.spinUpCount();
-        if (first_up != second_up)
-          continue;
-        bool equal = true;
-        for (std::size_t dimension = 0; dimension < 3; ++dimension)
-          equal = equal && positions[3 * first + dimension] ==
-              positions[3 * second + dimension];
-        if (equal)
-          return true;
-      }
+    const auto& identities = geometry.electronPairs();
+    const auto& distances  = geometry.electronElectronPairs().distances();
+    for (std::size_t pair = 0; pair < identities.size(); ++pair)
+      if ((identities[pair].first < layout.spinUpCount()) ==
+              (identities[pair].second < layout.spinUpCount()) &&
+          distances[pair] == 0)
+        return true;
     return false;
   }
 
@@ -2659,7 +2655,11 @@ private:
       const GeometryPairTable& pairs =
           workspace.value_geometries_[local].electronNucleusPairs();
       const auto& displacements = pairs.displacements();
+      const auto& complementary = pairs.complementaryDisplacements();
       const auto& radial_factors = pairs.softenedRadialFactors();
+      const bool periodic = workspace.value_geometries_[local].boundary().kind ==
+          GeometryBoundaryKind::PERIODIC;
+      const std::size_t pair_width = periodic ? 7 : 4;
       for (std::size_t electron = 0; electron < ne; ++electron)
       {
         double* row = workspace.raw_features_.data() +
@@ -2667,10 +2667,15 @@ private:
         for (std::size_t nucleus = 0; nucleus < na; ++nucleus)
         {
           const std::size_t pair = electron * na + nucleus;
-          row[4 * nucleus] = radial_factors[pair].log1p_radius;
+          const std::size_t feature_begin = pair_width * nucleus;
+          row[feature_begin] = radial_factors[pair].log1p_radius;
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
-            row[4 * nucleus + 1 + dimension] =
+            row[feature_begin + 1 + dimension] =
                 displacements[pair][dimension] * radial_factors[pair].log1p_over_radius;
+          if (periodic)
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              row[feature_begin + 4 + dimension] = complementary[pair][dimension] *
+                  radial_factors[pair].log1p_over_radius;
         }
         row[input_width - 1] = electron < layout.spinUpCount() ? 1.0 : -1.0;
       }
@@ -2776,8 +2781,7 @@ private:
       }
 
       const std::size_t configuration = tile_begin + local;
-      const double* positions = tile_positions + local * ne * 3;
-      if (hasExactSameSpinCoalescence(positions, layout))
+      if (hasExactSameSpinCoalescence(workspace.value_geometries_[local], layout))
       {
         storePendingValue(workspace, configuration, 0.0,
                           -std::numeric_limits<double>::infinity(), 0.0,

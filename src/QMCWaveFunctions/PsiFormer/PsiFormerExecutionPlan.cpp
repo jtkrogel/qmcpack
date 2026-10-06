@@ -127,13 +127,16 @@ std::pair<ParameterRole, std::size_t> classifyParameter(const ParameterLayoutInp
 }
 
 /// Return the exact tensor shape required for one role by the current architecture.
-std::vector<std::size_t> expectedShape(ParameterRole role, const ModelShape& model)
+std::vector<std::size_t> expectedShape(ParameterRole role,
+                                       const ModelShape& model,
+                                       const ExecutionEnvironment& environment)
 {
   const std::size_t electrons = model.electrons();
   switch (role)
   {
   case ParameterRole::ELECTRON_EMBEDDING_WEIGHT:
-    return {4 * model.nuclei + 1, model.feature_dimension};
+    return {(environment.boundary == BoundaryCondition::PERIODIC ? 7 : 4) * model.nuclei + 1,
+            model.feature_dimension};
   case ParameterRole::ATTENTION_QUERY_WEIGHT:
   case ParameterRole::ATTENTION_KEY_WEIGHT:
   case ParameterRole::ATTENTION_VALUE_WEIGHT:
@@ -195,6 +198,17 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
   if ((environment_.boundary == BoundaryCondition::OPEN && !support.open_boundary) ||
       (environment_.boundary == BoundaryCondition::PERIODIC && !support.periodic_boundary))
     throw std::invalid_argument("Requested PsiFormer boundary condition is not implemented");
+  if (environment_.boundary == BoundaryCondition::OPEN &&
+      environment_.geometry_feature_policy != GeometryFeaturePolicy::OPEN_EUCLIDEAN_V1)
+    throw std::invalid_argument("Open PsiFormer execution requires open_euclidean_v1 features");
+  if (environment_.boundary == BoundaryCondition::PERIODIC)
+  {
+    if (environment_.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
+      throw std::invalid_argument("Periodic PsiFormer execution requires periodic_torus_v1 features");
+    if (!std::all_of(environment_.periodic_axes.begin(), environment_.periodic_axes.end(),
+                     [](bool periodic) { return periodic; }))
+      throw std::invalid_argument("Real Gamma PsiFormer currently supports only 3D bulk periodic cells");
+  }
   const auto require_supported_scalar_domain = [&support](ScalarDomain domain, const char* description) {
     if ((domain == ScalarDomain::REAL && !support.real_scalars) ||
         (domain == ScalarDomain::COMPLEX && !support.complex_scalars))
@@ -229,7 +243,7 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
     const auto [role, block] = classifyParameter(layout);
     if (block != NO_ATTENTION_BLOCK && block >= model_shape_.attention_blocks)
       throw std::invalid_argument("PsiFormer parameter references an out-of-range attention block");
-    const std::vector<std::size_t> expected_shape = expectedShape(role, model_shape_);
+    const std::vector<std::size_t> expected_shape = expectedShape(role, model_shape_, environment_);
     if (layout.shape != expected_shape)
       throwShapeMismatch(layout, role, expected_shape);
     const std::size_t block_slot = block == NO_ATTENTION_BLOCK ? 0 : block + 1;
@@ -289,7 +303,7 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
 ModelCapabilities PsiFormerExecutionPlan::capabilities()
 {
   return {/*open_boundary=*/true,
-          /*periodic_boundary=*/false,
+          /*periodic_boundary=*/true,
           /*real_scalars=*/true,
           /*complex_scalars=*/false,
           /*fixed_nuclei=*/true,

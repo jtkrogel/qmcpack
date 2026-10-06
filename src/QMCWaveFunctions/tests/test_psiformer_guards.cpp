@@ -92,7 +92,7 @@ std::string makePsiFormerXml(const GeneratedFiles& files, bool optimize)
 
 } // namespace
 
-TEST_CASE("PsiFormer builder rejects periodic particle sets before model execution",
+TEST_CASE("PsiFormer builder requires an explicit periodic feature policy",
           "[wavefunction][psiformer][hardening]")
 {
   GeneratedFiles files = generateFiles("lih");
@@ -109,10 +109,10 @@ TEST_CASE("PsiFormer builder rejects periodic particle sets before model executi
   Libxml2Document document;
   REQUIRE(document.parseFromString(makePsiFormerXml(files, false)));
   CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
-                    Catch::Matchers::ContainsSubstring("open-boundary"));
+                    Catch::Matchers::ContainsSubstring("feature_policy=periodic_torus_v1"));
 }
 
-TEST_CASE("PsiFormer system validation rejects periodic electron and source-ion lattices",
+TEST_CASE("PsiFormer system validation rejects mismatched electron and source-ion lattices",
           "[wavefunction][psiformer][hardening][capability]")
 {
   GeneratedFiles files = generateFiles("lih");
@@ -131,7 +131,7 @@ TEST_CASE("PsiFormer system validation rejects periodic electron and source-ion 
     ParticleSet electrons = makeMassTaggedElectrons(periodic_cell, 1.0, 1.0);
     auto ions             = makeGuardTestIons(open_cell);
     CHECK_THROWS_WITH(component.validateSystem(electrons, *ions, "all_electron"),
-                      Catch::Matchers::ContainsSubstring("open-boundary electron particle sets"));
+                      Catch::Matchers::ContainsSubstring("boundary conditions differ"));
   }
 
   SECTION("source-ion lattice")
@@ -139,7 +139,20 @@ TEST_CASE("PsiFormer system validation rejects periodic electron and source-ion 
     ParticleSet electrons = makeMassTaggedElectrons(open_cell, 1.0, 1.0);
     auto ions             = makeGuardTestIons(periodic_cell);
     CHECK_THROWS_WITH(component.validateSystem(electrons, *ions, "all_electron"),
-                      Catch::Matchers::ContainsSubstring("open-boundary source-ion particle sets"));
+                      Catch::Matchers::ContainsSubstring("boundary conditions differ"));
+  }
+
+  SECTION("different open bounding cells")
+  {
+    Lattice alternate_lattice;
+    alternate_lattice.R = {17.0, 0.0, 0.0, 0.0, 19.0, 0.0, 0.0, 0.0, 23.0};
+    alternate_lattice.BoxBConds = {false, false, false};
+    alternate_lattice.reset();
+    const SimulationCell alternate_open_cell(alternate_lattice);
+
+    ParticleSet electrons = makeMassTaggedElectrons(open_cell, 1.0, 1.0);
+    auto ions             = makeGuardTestIons(alternate_open_cell);
+    CHECK_NOTHROW(component.validateSystem(electrons, *ions, "all_electron"));
   }
 }
 

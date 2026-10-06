@@ -686,6 +686,93 @@ TEST_CASE("PsiFormer value batches cover pair and pseudopotential shapes",
   validateBatches("lih_pp", {1, 3}, {2});
 }
 
+TEST_CASE("PsiFormer periodic value batches agree with scalar execution and preserve image nodes",
+          "[wavefunction][psiformer][batch][periodic]")
+{
+  GeneratedFiles files = generateFiles("lih", 4, 7);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  qmcplusplus::psiformer::ExecutionEnvironment environment;
+  environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy =
+      qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.lattice_vectors =
+      {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+  environment.periodic_axes = {{true, true, true}};
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
+      model.p, {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+                model.dim, model.heads, model.blocks}, environment);
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  auto batch_workspace  = batch_executor.makeWorkspace();
+  auto scalar_workspace = value_executor.makeWorkspace();
+  const pf::Tensor base = model.cfg.configuration(0);
+
+  std::vector<std::vector<double>> configurations(3, base.x);
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    // Configuration one is an exact image of configuration zero.
+    configurations[1][dimension] += environment.lattice_vectors[0][dimension] +
+        environment.lattice_vectors[2][dimension];
+
+    // The first two electrons have the same spin. Placing electron one at an
+    // image of electron zero must therefore produce the exact fermionic node.
+    configurations[2][3 + dimension] = configurations[2][dimension] +
+        environment.lattice_vectors[1][dimension];
+  }
+
+  batch_workspace->prepareTileCapacity(2);
+  batch_workspace->resize(pf::DirectBatchMode::VALUE_ONLY, configurations.size());
+  for (std::size_t configuration = 0; configuration < configurations.size(); ++configuration)
+    batch_workspace->setPositions(
+        configuration, pf::GeometryPositionView::interleaved(
+                           configurations[configuration].data(), model.ne));
+  const pf::DirectBatchValueResultView batch =
+      batch_executor.evaluateValues(*batch_workspace);
+
+  for (std::size_t configuration = 0; configuration < configurations.size(); ++configuration)
+  {
+    scalar_workspace->setPositions(pf::GeometryPositionView::interleaved(
+        configurations[configuration].data(), model.ne));
+    checkValue(batch, configuration, value_executor.evaluate(*scalar_workspace));
+  }
+  CHECK(batch.sign[1] == batch.sign[0]);
+  CHECK(batch.logabs[1] == Catch::Approx(batch.logabs[0]).epsilon(3e-10).margin(3e-10));
+  CHECK(batch.value[1] == Catch::Approx(batch.value[0]).epsilon(3e-9).margin(1e-24));
+  CHECK(batch.sign[2] == 0.0);
+  CHECK(batch.logabs[2] == -std::numeric_limits<double>::infinity());
+  CHECK(batch.value[2] == 0.0);
+
+  // Exercise the independently implemented tiled envelope jets as well as the
+  // embedding path: both scalar and batched VGL must agree for two images.
+  batch_workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+    batch_workspace->setPositions(
+        configuration, pf::GeometryPositionView::interleaved(
+                           configurations[configuration].data(), model.ne));
+  const pf::DirectBatchSpatialResultView spatial_batch =
+      batch_executor.evaluateFull(*batch_workspace);
+  auto scalar_spatial_workspace =
+      spatial_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+  {
+    scalar_spatial_workspace->setPositions(pf::GeometryPositionView::interleaved(
+        configurations[configuration].data(), model.ne));
+    checkSpatial(spatial_batch, configuration,
+                 spatial_executor.evaluateFull(*scalar_spatial_workspace));
+  }
+  for (std::size_t lane = 0; lane < spatial_batch.gradient_stride; ++lane)
+    CHECK(spatial_batch.gradient[spatial_batch.gradient_stride + lane] ==
+          Catch::Approx(spatial_batch.gradient[lane]).epsilon(3e-8).margin(3e-8));
+  for (std::size_t electron = 0; electron < spatial_batch.laplacian_stride; ++electron)
+  {
+    CHECK(spatial_batch.lap_log[spatial_batch.laplacian_stride + electron] ==
+          Catch::Approx(spatial_batch.lap_log[electron]).epsilon(3e-7).margin(3e-7));
+    CHECK(spatial_batch.lap_ratio[spatial_batch.laplacian_stride + electron] ==
+          Catch::Approx(spatial_batch.lap_ratio[electron]).epsilon(3e-7).margin(3e-7));
+  }
+}
+
 TEST_CASE("PsiFormer sparse value batches share references without dense packing",
           "[wavefunction][psiformer][batch][sparse]")
 {

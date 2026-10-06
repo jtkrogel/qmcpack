@@ -476,3 +476,77 @@ TEST_CASE("PsiFormer exact score and kinetic response omit unused pseudo-LiH sam
 {
   validatePairFreePseudoLiH();
 }
+
+TEST_CASE("PsiFormer periodic score and kinetic response are image invariant and differentiable",
+          "[wavefunction][psiformer][kinetic][periodic]")
+{
+  GeneratedFiles files = generateFiles("lih", 4, 7);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  qmcplusplus::psiformer::ExecutionEnvironment environment;
+  environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy =
+      qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.lattice_vectors = {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+  environment.periodic_axes = {{true, true, true}};
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
+      model.p, {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+                model.dim, model.heads, 4}, environment);
+  pf::DirectKineticExecutor executor(model, plan);
+  auto workspace = executor.makeWorkspace();
+  const pf::Tensor positions = model.cfg.configuration(0);
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+  const pf::DirectKineticResultView baseline_view = executor.evaluate(*workspace);
+  const double baseline_logabs = baseline_view.logabs;
+  const std::vector<double> baseline_score(baseline_view.parameter_score.begin(),
+                                           baseline_view.parameter_score.end());
+  const std::vector<double> baseline_kinetic_response(
+      baseline_view.kinetic_parameter_response.begin(),
+      baseline_view.kinetic_parameter_response.end());
+
+  std::vector<double> image_positions = positions.x;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    image_positions[dimension] += environment.lattice_vectors[0][dimension] +
+        environment.lattice_vectors[2][dimension];
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(image_positions.data(), model.ne));
+  const pf::DirectKineticResultView image = executor.evaluate(*workspace);
+  checkClose(image.logabs, baseline_logabs, 2e-11, 2e-11);
+  for (std::size_t parameter : {std::size_t{0}, plan.parameterCount() / 3,
+                                plan.parameterCount() - 1})
+  {
+    checkClose(image.parameter_score[parameter], baseline_score[parameter], 2e-8, 2e-8);
+    checkClose(image.kinetic_parameter_response[parameter],
+               baseline_kinetic_response[parameter], 3e-7, 3e-7);
+  }
+
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+  using qmcplusplus::psiformer::ParameterRole;
+  const std::array<std::size_t, 3> checked_parameters{
+      plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).begin + 256,
+      plan.parameter(ParameterRole::ENVELOPE_ZETA_UP).begin,
+      plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin};
+  constexpr double step = 2e-6;
+  for (std::size_t parameter : checked_parameters)
+  {
+    const double original = model.p.flat_values()[parameter];
+    model.p.set_flat_value(parameter, original + step);
+    const pf::DirectKineticResultView plus = executor.evaluate(*workspace);
+    const double plus_logabs = plus.logabs;
+    double plus_kinetic = 0;
+    for (double lap_ratio : plus.lap_ratio)
+      plus_kinetic -= 0.5 * lap_ratio;
+    model.p.set_flat_value(parameter, original - step);
+    const pf::DirectKineticResultView minus = executor.evaluate(*workspace);
+    const double minus_logabs = minus.logabs;
+    double minus_kinetic = 0;
+    for (double lap_ratio : minus.lap_ratio)
+      minus_kinetic -= 0.5 * lap_ratio;
+    model.p.set_flat_value(parameter, original);
+    checkClose(baseline_score[parameter],
+               (plus_logabs - minus_logabs) / (2 * step), 2e-5, 2e-5);
+    checkClose(baseline_kinetic_response[parameter],
+               (plus_kinetic - minus_kinetic) / (2 * step), 2e-4, 2e-4);
+  }
+}

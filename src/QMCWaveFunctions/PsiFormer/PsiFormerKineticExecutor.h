@@ -156,7 +156,7 @@ public:
         heads_(plan.modelShape().attention_heads),
         blocks_(plan.modelShape().attention_blocks),
         head_width_(width_ / heads_),
-        input_width_(4 * nuclei_ + 1),
+        input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
         gradient_lanes_(3 * electrons_),
         laplacian_lanes_(electrons_),
         feature_elements_(electrons_ * width_),
@@ -529,7 +529,7 @@ public:
         plan_(plan),
         nuclei_(model.cfg.nuclei.x),
         spin_up_electrons_(model.cfg.nup),
-        boundary_(mappedBoundary(plan.environment().boundary))
+        boundary_(mappedBoundary(plan.environment()))
   {
     const auto& shape = plan_.modelShape();
     if (plan_.parameterCount() != parameters_.size() || shape.electrons() != model.ne ||
@@ -539,12 +539,11 @@ public:
     using qmcplusplus::psiformer::BoundaryCondition;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan_.environment();
-    if (environment.boundary != BoundaryCondition::OPEN ||
-        environment.parameter_scalar_domain != ScalarDomain::REAL ||
+    if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
       throw std::invalid_argument(
-          "Direct PsiFormer kinetic response supports only real, open, fixed-ion models");
+          "Direct PsiFormer kinetic response supports only real, fixed-ion models");
   }
 
   /// Allocate one independent fixed-capacity workspace for a component clone.
@@ -578,11 +577,13 @@ private:
   using ParameterRole = qmcplusplus::psiformer::ParameterRole;
 
   /// Translate the execution-plan boundary tag to the geometry-kernel boundary tag.
-  static GeometryBoundary mappedBoundary(qmcplusplus::psiformer::BoundaryCondition boundary)
+  static GeometryBoundary mappedBoundary(
+      const qmcplusplus::psiformer::ExecutionEnvironment& environment)
   {
-    if (boundary == qmcplusplus::psiformer::BoundaryCondition::OPEN)
+    if (environment.boundary == qmcplusplus::psiformer::BoundaryCondition::OPEN)
       return {GeometryBoundaryKind::OPEN};
-    throw std::invalid_argument("Periodic PsiFormer kinetic response is not implemented");
+    return {GeometryBoundaryKind::PERIODIC, environment.lattice_vectors,
+            environment.periodic_axes};
   }
 
   /// Locate one typed tensor in the immutable canonical parameter vector.
@@ -1074,8 +1075,18 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
   raw.clear();
   const GeometryPairTable& pairs = workspace.geometry_.electronNucleusPairs();
   const auto& displacements      = pairs.displacements();
+  const auto& complementary      = pairs.complementaryDisplacements();
+  const auto& displacement_jacobians = pairs.displacementJacobians();
+  const auto& complementary_jacobians = pairs.complementaryDisplacementJacobians();
+  const auto& displacement_laplacians = pairs.displacementLaplacians();
+  const auto& complementary_laplacians = pairs.complementaryDisplacementLaplacians();
   const auto& distances          = pairs.distances();
+  const auto& distance_gradients = pairs.distanceGradients();
+  const auto& distance_gradient_norms = pairs.distanceGradientNormsSquared();
+  const auto& distance_laplacians = pairs.distanceLaplacians();
   const auto& factors            = pairs.softenedRadialFactors();
+  const bool periodic = workspace.geometry_.boundary().kind == GeometryBoundaryKind::PERIODIC;
+  const std::size_t pair_width = periodic ? 7 : 4;
 
   for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
   {
@@ -1087,39 +1098,68 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
       if (radius == 0.0)
         throw std::runtime_error(
             "PsiFormer kinetic response is undefined at electron-nucleus coalescence");
-      const double inverse_radius = 1.0 / radius;
       const GeometryPosition& displacement = displacements[pair];
       const SoftenedRadialFactors& radial  = factors[pair];
-      const std::size_t radial_element     = row_begin + 4 * nucleus;
+      const std::size_t radial_element     = row_begin + pair_width * nucleus;
       raw.value[radial_element]            = radial.log1p_radius;
       for (std::size_t component = 0; component < 3; ++component)
         raw.value[radial_element + 1 + component] =
             displacement[component] * radial.log1p_over_radius;
+      if (periodic)
+        for (std::size_t component = 0; component < 3; ++component)
+          raw.value[radial_element + 4 + component] =
+              complementary[pair][component] * radial.log1p_over_radius;
 
       for (std::size_t derivative_dimension = 0; derivative_dimension < 3;
            ++derivative_dimension)
       {
         const std::size_t lane = 3 * electron + derivative_dimension;
-        const double unit_component = displacement[derivative_dimension] * inverse_radius;
+        const double radius_gradient = distance_gradients[pair][derivative_dimension];
         raw.gradient[gradientIndex(raw, lane, radial_element)] =
-            radial.log1p_first * unit_component;
+            radial.log1p_first * radius_gradient;
         for (std::size_t component = 0; component < 3; ++component)
         {
-          const double kronecker = component == derivative_dimension ? 1.0 : 0.0;
           raw.gradient[gradientIndex(raw, lane, radial_element + 1 + component)] =
-              kronecker * radial.log1p_over_radius + displacement[component] *
-                  radial.log1p_over_radius_first * unit_component;
+              displacement_jacobians[pair][component][derivative_dimension] *
+                  radial.log1p_over_radius + displacement[component] *
+                  radial.log1p_over_radius_first * radius_gradient;
+          if (periodic)
+            raw.gradient[gradientIndex(raw, lane, radial_element + 4 + component)] =
+                complementary_jacobians[pair][component][derivative_dimension] *
+                    radial.log1p_over_radius + complementary[pair][component] *
+                    radial.log1p_over_radius_first * radius_gradient;
         }
       }
 
       raw.laplacian[laplacianIndex(raw, electron, radial_element)] =
-          radial.log1p_second + 2.0 * radial.log1p_first * inverse_radius;
-      const double directional_laplacian_factor =
-          radial.log1p_over_radius_second +
-          4.0 * radial.log1p_over_radius_first * inverse_radius;
+          radial.log1p_second * distance_gradient_norms[pair] +
+          radial.log1p_first * distance_laplacians[pair];
       for (std::size_t component = 0; component < 3; ++component)
+      {
+        double displacement_gradient_dot_radius_gradient = 0;
+        double complementary_gradient_dot_radius_gradient = 0;
+        for (std::size_t derivative = 0; derivative < 3; ++derivative)
+        {
+          displacement_gradient_dot_radius_gradient +=
+              displacement_jacobians[pair][component][derivative] *
+              distance_gradients[pair][derivative];
+          complementary_gradient_dot_radius_gradient +=
+              complementary_jacobians[pair][component][derivative] *
+              distance_gradients[pair][derivative];
+        }
+        const double radial_trace =
+            radial.log1p_over_radius_second * distance_gradient_norms[pair] +
+            radial.log1p_over_radius_first * distance_laplacians[pair];
         raw.laplacian[laplacianIndex(raw, electron, radial_element + 1 + component)] =
-            displacement[component] * directional_laplacian_factor;
+            displacement_laplacians[pair][component] * radial.log1p_over_radius +
+            2 * radial.log1p_over_radius_first * displacement_gradient_dot_radius_gradient +
+            displacement[component] * radial_trace;
+        if (periodic)
+          raw.laplacian[laplacianIndex(raw, electron, radial_element + 4 + component)] =
+              complementary_laplacians[pair][component] * radial.log1p_over_radius +
+              2 * radial.log1p_over_radius_first * complementary_gradient_dot_radius_gradient +
+              complementary[pair][component] * radial_trace;
+      }
     }
     raw.value[row_begin + workspace.input_width_ - 1] =
         electron < spin_up_electrons_ ? 1.0 : -1.0;
@@ -1336,8 +1376,10 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
   orbitals.clear();
   const DirectTraceJetBuffer& features = workspace.features_[workspace.blocks_];
   const GeometryPairTable& pairs = workspace.geometry_.electronNucleusPairs();
-  const auto& displacements      = pairs.displacements();
   const auto& distances          = pairs.distances();
+  const auto& distance_gradients = pairs.distanceGradients();
+  const auto& distance_gradient_norms = pairs.distanceGradientNormsSquared();
+  const auto& distance_laplacians = pairs.distanceLaplacians();
   const std::size_t channel_count = workspace.determinants_ * workspace.electrons_;
 
   for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
@@ -1383,7 +1425,6 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
           if (radius == 0.0)
             throw std::runtime_error(
                 "PsiFormer kinetic response is undefined at electron-nucleus coalescence");
-          const double inverse_radius = 1.0 / radius;
           const double decay_rate     = std::abs(zeta[parameter_index]);
           const double exponential    = std::exp(-decay_rate * radius);
           const double weighted_value = pi[parameter_index] * exponential;
@@ -1394,10 +1435,11 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
           {
             const std::size_t lane = 3 * electron + dimension;
             envelopes.gradient[gradientIndex(envelopes, lane, matrix_element)] +=
-                radial_first * displacements[pair][dimension] * inverse_radius;
+                radial_first * distance_gradients[pair][dimension];
           }
           envelopes.laplacian[laplacianIndex(envelopes, electron, matrix_element)] +=
-              radial_second + 2.0 * radial_first * inverse_radius;
+              radial_second * distance_gradient_norms[pair] +
+              radial_first * distance_laplacians[pair];
         }
 
         productForwardElement(backflows, matrix_element, envelopes, matrix_element,
@@ -1420,8 +1462,10 @@ inline double DirectKineticExecutor::buildCusp(const double* parameters,
       parameter(parameters, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
   const auto& identities = workspace.geometry_.electronPairs();
   const GeometryPairTable& pair_table = workspace.geometry_.electronElectronPairs();
-  const auto& displacements = pair_table.displacements();
   const auto& distances     = pair_table.distances();
+  const auto& distance_gradients = pair_table.distanceGradients();
+  const auto& distance_gradient_norms = pair_table.distanceGradientNormsSquared();
+  const auto& distance_laplacians = pair_table.distanceLaplacians();
   double value = 0.0;
 
   for (std::size_t pair_index = 0; pair_index < identities.size(); ++pair_index)
@@ -1445,11 +1489,13 @@ inline double DirectKineticExecutor::buildCusp(const double* parameters,
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
     {
       const double component =
-          radial_first * displacements[pair_index][dimension] / radius;
+          radial_first * distance_gradients[pair_index][dimension];
       workspace.cusp_gradient_[3 * pair.first + dimension] += component;
       workspace.cusp_gradient_[3 * pair.second + dimension] -= component;
     }
-    const double pair_laplacian = radial_second + 2.0 * radial_first / radius;
+    const double pair_laplacian =
+        radial_second * distance_gradient_norms[pair_index] +
+        radial_first * distance_laplacians[pair_index];
     workspace.cusp_laplacian_[pair.first] += pair_laplacian;
     workspace.cusp_laplacian_[pair.second] += pair_laplacian;
   }
@@ -1659,8 +1705,13 @@ inline void DirectKineticExecutor::reverseOrbitals(
 
   workspace.feature_adjoint_a_.clear();
   const DirectTraceJetBuffer& features = workspace.features_[workspace.blocks_];
-  const auto& distances = workspace.geometry_.electronNucleusPairs().distances();
-  const auto& displacements = workspace.geometry_.electronNucleusPairs().displacements();
+  const GeometryPairTable& electron_nucleus_pairs =
+      workspace.geometry_.electronNucleusPairs();
+  const auto& distances = electron_nucleus_pairs.distances();
+  const auto& distance_gradients = electron_nucleus_pairs.distanceGradients();
+  const auto& distance_gradient_norms =
+      electron_nucleus_pairs.distanceGradientNormsSquared();
+  const auto& distance_laplacians = electron_nucleus_pairs.distanceLaplacians();
   const std::size_t channel_count = workspace.determinants_ * workspace.electrons_;
 
   for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
@@ -1729,7 +1780,6 @@ inline void DirectKineticExecutor::reverseOrbitals(
           const std::size_t parameter_index = channel * workspace.nuclei_ + nucleus;
           const std::size_t pair             = electron * workspace.nuclei_ + nucleus;
           const double radius                = distances[pair];
-          const double inverse_radius        = 1.0 / radius;
           const double decay_rate            = std::abs(zeta[parameter_index]);
           const double decay                 = std::exp(-decay_rate * radius);
           const double signed_abs_derivative = zeta[parameter_index] > 0.0
@@ -1737,13 +1787,12 @@ inline void DirectKineticExecutor::reverseOrbitals(
               : (zeta[parameter_index] < 0.0 ? -1.0 : 0.0);
           const double weighted_decay = pi[parameter_index] * decay;
           const double pi_gradient_radial = -decay_rate * decay;
-          const double pi_laplacian =
-              (decay_rate * decay_rate - 2.0 * decay_rate * inverse_radius) * decay;
+          const double pi_radial_second = decay_rate * decay_rate * decay;
           const double zeta_value = -signed_abs_derivative * radius * weighted_decay;
           const double zeta_gradient_radial = signed_abs_derivative * weighted_decay *
               (decay_rate * radius - 1.0);
-          const double zeta_laplacian = signed_abs_derivative * weighted_decay *
-              (-radius * decay_rate * decay_rate + 4.0 * decay_rate - 2.0 * inverse_radius);
+          const double zeta_radial_second = signed_abs_derivative * weighted_decay *
+              (-radius * decay_rate * decay_rate + 2.0 * decay_rate);
 
           double pi_contribution = workspace.envelope_adjoint_.value[matrix_element] * decay;
           double zeta_contribution =
@@ -1751,16 +1800,20 @@ inline void DirectKineticExecutor::reverseOrbitals(
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
           {
             const std::size_t lane = 3 * electron + dimension;
-            const double unit = displacements[pair][dimension] * inverse_radius;
+            const double radial_gradient = distance_gradients[pair][dimension];
             const double upstream = workspace.envelope_adjoint_.gradient[
                 gradientIndex(workspace.envelope_adjoint_, lane, matrix_element)];
-            pi_contribution += upstream * pi_gradient_radial * unit;
-            zeta_contribution += upstream * zeta_gradient_radial * unit;
+            pi_contribution += upstream * pi_gradient_radial * radial_gradient;
+            zeta_contribution += upstream * zeta_gradient_radial * radial_gradient;
           }
           const double laplacian_upstream = workspace.envelope_adjoint_.laplacian[
               laplacianIndex(workspace.envelope_adjoint_, electron, matrix_element)];
-          pi_contribution += laplacian_upstream * pi_laplacian;
-          zeta_contribution += laplacian_upstream * zeta_laplacian;
+          pi_contribution += laplacian_upstream *
+              (pi_radial_second * distance_gradient_norms[pair] +
+               pi_gradient_radial * distance_laplacians[pair]);
+          zeta_contribution += laplacian_upstream *
+              (zeta_radial_second * distance_gradient_norms[pair] +
+               zeta_gradient_radial * distance_laplacians[pair]);
           pi_response[parameter_index] += pi_contribution;
           zeta_response[parameter_index] += zeta_contribution;
         }
@@ -1786,8 +1839,11 @@ inline void DirectKineticExecutor::reverseCusp(
   double& opposite_response =
       response(destination, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
   const auto& identities = workspace.geometry_.electronPairs();
-  const auto& distances = workspace.geometry_.electronElectronPairs().distances();
-  const auto& displacements = workspace.geometry_.electronElectronPairs().displacements();
+  const GeometryPairTable& electron_pairs = workspace.geometry_.electronElectronPairs();
+  const auto& distances = electron_pairs.distances();
+  const auto& distance_gradients = electron_pairs.distanceGradients();
+  const auto& distance_gradient_norms = electron_pairs.distanceGradientNormsSquared();
+  const auto& distance_laplacians = electron_pairs.distanceLaplacians();
 
   for (std::size_t pair_index = 0; pair_index < identities.size(); ++pair_index)
   {
@@ -1805,19 +1861,21 @@ inline void DirectKineticExecutor::reverseCusp(
         -factor * alpha * (alpha + 2.0 * radius) / denominator2;
     const double radial_first_derivative =
         2.0 * factor * alpha * radius / denominator3;
-    const double radial_laplacian_derivative =
-        6.0 * factor * alpha * alpha / denominator4;
+    const double radial_second_derivative =
+        2.0 * factor * alpha * (alpha - 2.0 * radius) / denominator4;
     double contribution = workspace.root_adjoint_.value[0] * value_derivative;
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
     {
       const double directional = radial_first_derivative *
-          displacements[pair_index][dimension] / radius;
+          distance_gradients[pair_index][dimension];
       contribution += workspace.root_adjoint_.gradient[3 * pair.first + dimension] * directional;
       contribution -= workspace.root_adjoint_.gradient[3 * pair.second + dimension] * directional;
     }
     contribution +=
         (workspace.root_adjoint_.laplacian[pair.first] +
-         workspace.root_adjoint_.laplacian[pair.second]) * radial_laplacian_derivative;
+         workspace.root_adjoint_.laplacian[pair.second]) *
+        (radial_second_derivative * distance_gradient_norms[pair_index] +
+         radial_first_derivative * distance_laplacians[pair_index]);
     if (same_spin)
     {
       if (!same_response)

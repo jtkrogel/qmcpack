@@ -83,7 +83,8 @@ struct Leaf
 inline std::vector<Leaf> makeLayout(std::size_t electron_count,
                                     std::size_t nucleus_count,
                                     bool has_same_spin_pair = true,
-                                    std::size_t attention_blocks = 4)
+                                    std::size_t attention_blocks = 4,
+                                    std::size_t channels_per_nucleus = 4)
 {
   const std::string prefix = "neural_network_wave_function/~/";
   std::vector<Leaf> leaves{
@@ -94,7 +95,8 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count,
       {prefix + "exponential_envelopes", "zetas_up", {16 * electron_count, nucleus_count}},
       {prefix + "omni_net/~/Backflow/~/mlp/linear_0", "w", {256, 16 * electron_count}},
       {prefix + "omni_net/~/Backflow_1/~/mlp/linear_0", "w", {256, 16 * electron_count}},
-      {prefix + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w", {4 * nucleus_count + 1, 256}},
+      {prefix + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w",
+       {channels_per_nucleus * nucleus_count + 1, 256}},
   };
   if (has_same_spin_pair)
     leaves.insert(leaves.begin() + 1,
@@ -274,14 +276,15 @@ struct GeneratedFiles
 
 /// Generate a full-shape parameter file and matching physical-system configuration.
 inline GeneratedFiles generateFiles(const std::string& system,
-                                    std::size_t attention_blocks = 4)
+                                    std::size_t attention_blocks = 4,
+                                    std::size_t channels_per_nucleus = 4)
 {
   static std::atomic<std::uint64_t> fixture_sequence{0};
 
   GeneratedFiles files;
   files.directory = std::filesystem::temp_directory_path() /
       ("qmcpack_psiformer_random_v" + std::to_string(FIXTURE_RECIPE_VERSION) + "_" + system + "_b" +
-       std::to_string(attention_blocks) + "_" +
+       std::to_string(attention_blocks) + "_c" + std::to_string(channels_per_nucleus) + "_" +
        std::to_string(static_cast<long long>(getpid())) + "_" +
        std::to_string(fixture_sequence.fetch_add(1, std::memory_order_relaxed)));
   std::filesystem::create_directories(files.directory);
@@ -293,7 +296,8 @@ inline GeneratedFiles generateFiles(const std::string& system,
   const std::size_t nucleus_count  = geometry.nuclei.size() / 3;
   const bool has_same_spin_pair = geometry.nup >= 2 || electron_count - geometry.nup >= 2;
   const auto leaves = makeLayout(electron_count, nucleus_count,
-                                 has_same_spin_pair, attention_blocks);
+                                 has_same_spin_pair, attention_blocks,
+                                 channels_per_nucleus);
   const auto values             = makeParameters(system, leaves);
   std::vector<std::string> modules, names;
   std::vector<std::int64_t> ranks, shapes(2 * leaves.size(), 1), offsets{0};

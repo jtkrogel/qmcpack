@@ -188,7 +188,8 @@ void validateProfileShape(const ModelShape& model)
         "attention_blocks=4");
 
   checkedAdd(model.spin_up_electrons, model.spin_down_electrons, "electron count");
-  checkedAdd(checkedMultiply(4, model.nuclei, "embedding input width"), 1, "embedding input width");
+  checkedAdd(checkedMultiply(7, model.nuclei, "maximum embedding input width"), 1,
+             "maximum embedding input width");
 }
 
 /// Append one tensor specification before canonical lexical ordering is applied.
@@ -208,12 +209,17 @@ void appendSpecification(std::vector<TensorSpecification>& tensors,
 }
 
 /// Build every DeepQMC-compatible leaf and put it in portable export order.
-std::vector<TensorSpecification> makeTensorSpecifications(const ModelShape& model)
+std::vector<TensorSpecification> makeTensorSpecifications(
+    const ModelShape& model,
+    const ExecutionEnvironment& environment)
 {
   const std::size_t electrons = checkedAdd(model.spin_up_electrons, model.spin_down_electrons, "electron count");
   const std::size_t channels = checkedMultiply(model.determinants, electrons, "determinant-orbital channels");
-  const std::size_t input_width = checkedAdd(checkedMultiply(4, model.nuclei, "embedding input width"), 1,
-                                             "embedding input width");
+  const std::size_t channels_per_nucleus =
+      environment.boundary == BoundaryCondition::PERIODIC ? 7 : 4;
+  const std::size_t input_width =
+      checkedAdd(checkedMultiply(channels_per_nucleus, model.nuclei, "embedding input width"), 1,
+                 "embedding input width");
   const double feature_sigma = 1.0 / std::sqrt(static_cast<double>(model.feature_dimension));
   const double embedding_sigma = 1.0 / std::sqrt(static_cast<double>(input_width));
   const std::string prefix = "neural_network_wave_function/~/";
@@ -330,13 +336,15 @@ TensorInitializationDiagnostic makeDiagnostic(const TensorSpecification& tensor,
 // Construct a complete neutral parameter store from the versioned profile.
 InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& model_shape,
                                                              std::uint64_t seed,
-                                                             const std::string& profile)
+                                                             const std::string& profile,
+                                                             ExecutionEnvironment environment)
 {
   if (profile != DEEPQMC_PSIFORMER_V1)
     throw std::invalid_argument("Unknown PsiFormer initialization profile: " + profile);
   validateProfileShape(model_shape);
 
-  const std::vector<TensorSpecification> specifications = makeTensorSpecifications(model_shape);
+  const std::vector<TensorSpecification> specifications =
+      makeTensorSpecifications(model_shape, environment);
   InitializedPsiFormerParameters initialized;
   initialized.model_shape = model_shape;
   initialized.profile     = profile;
@@ -378,7 +386,7 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
 
   // Reuse the production plan validator as a final assertion that generated
   // names, shapes, intervals, and architecture completeness remain compatible.
-  const PsiFormerExecutionPlan plan(model_shape, initialized.layouts);
+  const PsiFormerExecutionPlan plan(model_shape, initialized.layouts, environment);
   if (plan.parameterCount() != initialized.values.size())
     throw std::logic_error("Generated PsiFormer layout and flat parameter vector disagree");
   return initialized;

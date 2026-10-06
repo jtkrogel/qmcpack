@@ -6,15 +6,14 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerGeometry.h
- * @brief Allocation-free geometry cache for molecular PsiFormer evaluations.
+ * @brief Allocation-free geometry cache for open and real periodic PsiFormer evaluations.
  *
  * Geometry remains real even when a future wavefunction value type is complex.  Keeping
  * this cache independent of the wavefunction scalar type lets a later periodic/complex
  * evaluator reuse the same pair tables while a separate phase policy handles twists.
- * Only open boundaries are implemented here.  The boundary descriptor deliberately
- * reserves the cell and periodic-axis data needed by a future minimum-image policy;
- * requesting that unsupported policy fails immediately rather than silently evaluating
- * open-boundary displacements.
+ * Periodic evaluations use a smooth sine/cosine torus embedding rather than a
+ * discontinuous minimum-image displacement.  The real geometry and its Cartesian
+ * derivative jets are independent of a future complex twist-phase policy.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_GEOMETRY_H
@@ -36,10 +35,10 @@ using GeometryReal = double;
 /// Three-dimensional Cartesian coordinate or displacement.
 using GeometryPosition = std::array<GeometryReal, 3>;
 
-/** Identify the displacement convention requested by an evaluator.
- *
- * PERIODIC is an interface reservation, not a currently supported calculation mode.
- */
+/// Cartesian Jacobian with output component first and derivative component second.
+using GeometryJacobian = std::array<GeometryPosition, 3>;
+
+/// Identify the displacement convention requested by an evaluator.
 enum class GeometryBoundaryKind
 {
   OPEN,
@@ -48,8 +47,8 @@ enum class GeometryBoundaryKind
 
 /** Describe the real-space cell without embedding boundary arithmetic in consumers.
  *
- * Cell vectors and periodic axes are ignored for OPEN and retained only so a future
- * periodic displacement policy can be introduced without changing geometry clients.
+ * Lattice vectors are Cartesian row vectors.  OPEN ignores the cell.  The
+ * current PERIODIC policy requires a finite, full-rank cell with all axes periodic.
  */
 struct GeometryBoundary
 {
@@ -140,11 +139,43 @@ public:
   /// Return all pair displacements in pair-major order.
   const std::vector<GeometryPosition>& displacements() const noexcept { return displacements_; }
 
+  /// Return complementary one-minus-cosine feature vectors for periodic pairs.
+  const std::vector<GeometryPosition>& complementaryDisplacements() const noexcept
+  { return complementary_displacements_; }
+
+  /// Return Cartesian Jacobians of the feature displacement.
+  const std::vector<GeometryJacobian>& displacementJacobians() const noexcept
+  { return displacement_jacobians_; }
+
+  /// Return Cartesian Jacobians of complementary feature vectors.
+  const std::vector<GeometryJacobian>& complementaryDisplacementJacobians() const noexcept
+  { return complementary_displacement_jacobians_; }
+
+  /// Return Cartesian Laplacians of each feature-displacement component.
+  const std::vector<GeometryPosition>& displacementLaplacians() const noexcept
+  { return displacement_laplacians_; }
+
+  /// Return Cartesian Laplacians of complementary feature-vector components.
+  const std::vector<GeometryPosition>& complementaryDisplacementLaplacians() const noexcept
+  { return complementary_displacement_laplacians_; }
+
   /// Return all pair distances in pair-major order.
   const std::vector<GeometryReal>& distances() const noexcept { return distances_; }
 
   /// Return all inverse pair distances in pair-major order.
   const std::vector<GeometryReal>& inverseDistances() const noexcept { return inverse_distances_; }
+
+  /// Return Cartesian gradients of the smooth radial coordinate.
+  const std::vector<GeometryPosition>& distanceGradients() const noexcept
+  { return distance_gradients_; }
+
+  /// Return squared Cartesian gradient norms of the smooth radial coordinate.
+  const std::vector<GeometryReal>& distanceGradientNormsSquared() const noexcept
+  { return distance_gradient_norms_squared_; }
+
+  /// Return Cartesian Laplacians of the smooth radial coordinate.
+  const std::vector<GeometryReal>& distanceLaplacians() const noexcept
+  { return distance_laplacians_; }
 
   /// Return all PsiFormer softened radial factors in pair-major order.
   const std::vector<SoftenedRadialFactors>& softenedRadialFactors() const noexcept
@@ -182,19 +213,42 @@ public:
       const std::uintptr_t storage_end = storage_begin + storage_bytes;
       return begin < storage_end && storage_begin < end;
     };
-    return overlaps(displacements_) || overlaps(distances_) ||
-        overlaps(inverse_distances_) || overlaps(softened_radial_factors_);
+    return overlaps(displacements_) || overlaps(complementary_displacements_) ||
+        overlaps(displacement_jacobians_) || overlaps(complementary_displacement_jacobians_) ||
+        overlaps(displacement_laplacians_) || overlaps(complementary_displacement_laplacians_) ||
+        overlaps(distances_) ||
+        overlaps(inverse_distances_) || overlaps(distance_gradients_) ||
+        overlaps(distance_gradient_norms_squared_) || overlaps(distance_laplacians_) ||
+        overlaps(softened_radial_factors_);
   }
 
 private:
   friend class PsiFormerGeometryCache;
 
-  /// Replace one pair entry from its already boundary-adjusted displacement.
-  void updatePair(std::size_t pair_index, const GeometryPosition& displacement);
+  /// Replace one pair entry from complete boundary-adjusted feature geometry.
+  void updatePair(std::size_t pair_index,
+                  const GeometryPosition& displacement,
+                  const GeometryPosition& complementary_displacement,
+                  const GeometryJacobian& displacement_jacobian,
+                  const GeometryJacobian& complementary_displacement_jacobian,
+                  const GeometryPosition& displacement_laplacian,
+                  const GeometryPosition& complementary_displacement_laplacian,
+                  GeometryReal distance,
+                  const GeometryPosition& distance_gradient,
+                  GeometryReal distance_gradient_norm_squared,
+                  GeometryReal distance_laplacian);
 
   std::vector<GeometryPosition> displacements_;
+  std::vector<GeometryPosition> complementary_displacements_;
+  std::vector<GeometryJacobian> displacement_jacobians_;
+  std::vector<GeometryJacobian> complementary_displacement_jacobians_;
+  std::vector<GeometryPosition> displacement_laplacians_;
+  std::vector<GeometryPosition> complementary_displacement_laplacians_;
   std::vector<GeometryReal> distances_;
   std::vector<GeometryReal> inverse_distances_;
+  std::vector<GeometryPosition> distance_gradients_;
+  std::vector<GeometryReal> distance_gradient_norms_squared_;
+  std::vector<GeometryReal> distance_laplacians_;
   std::vector<SoftenedRadialFactors> softened_radial_factors_;
 };
 
@@ -227,7 +281,7 @@ struct ElectronPairIncidence
 class PsiFormerGeometryCache
 {
 public:
-  /// Construct fixed-size pair tables and immutable open-boundary nuclear geometry.
+  /// Construct fixed-size pair tables and immutable boundary-aware nuclear geometry.
   PsiFormerGeometryCache(std::size_t electron_count,
                          GeometryPositionView nuclei,
                          GeometryBoundary boundary = {});
@@ -315,13 +369,35 @@ public:
   void updateElectron(std::size_t electron, const GeometryPosition& position);
 
 private:
-  /// Form an open-boundary target-minus-source displacement.
-  GeometryPosition displacement(const GeometryPosition& target, const GeometryPosition& source) const;
+  /// Complete value and Cartesian derivative data for one pair feature.
+  struct PairGeometry
+  {
+    GeometryPosition displacement{};
+    GeometryPosition complementary_displacement{};
+    GeometryJacobian displacement_jacobian{};
+    GeometryJacobian complementary_displacement_jacobian{};
+    GeometryPosition displacement_laplacian{};
+    GeometryPosition complementary_displacement_laplacian{};
+    GeometryReal distance = 0;
+    GeometryPosition distance_gradient{};
+    GeometryReal distance_gradient_norm_squared = 0;
+    GeometryReal distance_laplacian = 0;
+  };
+
+  /// Form open Cartesian or smooth image-periodic geometry for one pair.
+  PairGeometry pairGeometry(const GeometryPosition& target,
+                            const GeometryPosition& source) const;
+
+  /// Store one already validated pair result in the selected table entry.
+  static void updatePair(GeometryPairTable& table,
+                         std::size_t pair_index,
+                         const PairGeometry& pair);
 
   /// Populate immutable pair identities and grouped incidence metadata once.
   void initializeElectronPairs();
 
   GeometryBoundary boundary_;
+  std::array<GeometryPosition, 3> reciprocal_vectors_{};
   std::vector<GeometryPosition> nuclei_;
   std::vector<GeometryPosition> electrons_;
   GeometryPairTable electron_nucleus_pairs_;

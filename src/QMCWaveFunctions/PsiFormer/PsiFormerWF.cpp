@@ -260,12 +260,26 @@ void mixPersistentDouble(std::uint64_t& hash, double value) noexcept
 std::uint64_t persistentModelIdentity(const pf::PsiFormer& model,
                                       const std::string& model_origin,
                                       const std::string& initialization_profile,
-                                      std::uint64_t initialization_seed)
+                                      std::uint64_t initialization_seed,
+                                      const psiformer::ExecutionEnvironment& environment)
 {
   std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
   mixPersistentString(hash, model_origin);
   mixPersistentString(hash, initialization_profile);
   mixPersistentInteger(hash, initialization_seed);
+  // Preserve the established OPEN identity exactly.  Periodic models add the
+  // complete feature-policy and cell contract because identical parameters in
+  // distinct cells do not represent the same physical wavefunction.
+  if (environment.boundary == psiformer::BoundaryCondition::PERIODIC)
+  {
+    mixPersistentInteger(hash, static_cast<std::uint64_t>(environment.boundary));
+    mixPersistentInteger(hash, static_cast<std::uint64_t>(environment.geometry_feature_policy));
+    for (bool periodic : environment.periodic_axes)
+      mixPersistentInteger(hash, periodic ? 1 : 0);
+    for (const auto& vector : environment.lattice_vectors)
+      for (double component : vector)
+        mixPersistentDouble(hash, component);
+  }
   mixPersistentString(hash, model.p.layout_fingerprint());
   mixPersistentInteger(hash, model.ne);
   mixPersistentInteger(hash, model.cfg.nup);
@@ -575,6 +589,109 @@ struct InitializedNativeModel
   std::uint64_t seed;
 };
 
+/// Translate a QMCPACK simulation cell into immutable PsiFormer geometry metadata.
+psiformer::ExecutionEnvironment makeExecutionEnvironment(const ParticleSet& electrons)
+{
+  psiformer::ExecutionEnvironment environment;
+  const auto& lattice = electrons.getLattice();
+  if (lattice.getSuperCellEnum() == SUPERCELL_OPEN)
+    return environment;
+  if (lattice.getSuperCellEnum() != SUPERCELL_BULK)
+    throw std::invalid_argument(
+        "Real Gamma PsiFormer currently supports only fully periodic 3D bulk cells");
+
+  environment.boundary = psiformer::BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy =
+      psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.periodic_axes = {true, true, true};
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      environment.lattice_vectors[axis][dimension] = lattice.R(axis, dimension);
+  return environment;
+}
+
+/// Require one runtime particle set to match the model's boundary and lattice.
+void validateRuntimeLattice(const ParticleSet& particles,
+                            const psiformer::ExecutionEnvironment& environment,
+                            const char* context)
+{
+  const auto& lattice = particles.getLattice();
+  if (environment.boundary == psiformer::BoundaryCondition::OPEN)
+  {
+    if (lattice.getSuperCellEnum() != SUPERCELL_OPEN)
+      throw std::invalid_argument(std::string(context) +
+                                  " boundary differs from the open model feature policy");
+    return;
+  }
+
+  if (lattice.getSuperCellEnum() != SUPERCELL_BULK)
+    throw std::invalid_argument(std::string(context) +
+                                " requires the model's 3D bulk periodic cell");
+  constexpr double tolerance = 128 * std::numeric_limits<double>::epsilon();
+  for (std::size_t axis = 0; axis < 3; ++axis)
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double expected = environment.lattice_vectors[axis][dimension];
+      if (std::abs(lattice.R(axis, dimension) - expected) >
+          tolerance * (1 + std::abs(expected)))
+        throw std::invalid_argument(std::string(context) +
+                                    " lattice differs from the model lattice");
+    }
+}
+
+/// Require compatible boundaries and an identical cell when features are periodic.
+void validateMatchingLattices(const ParticleSet& electrons, const ParticleSet& ions)
+{
+  const auto& electron_lattice = electrons.getLattice();
+  const auto& ion_lattice      = ions.getLattice();
+  if (electron_lattice.getSuperCellEnum() != ion_lattice.getSuperCellEnum())
+    throw std::invalid_argument("PsiFormer electron and source-ion boundary conditions differ");
+  // The lattice matrix is not part of the open-boundary feature policy.  Open
+  // ParticleSets may therefore carry different finite bounding boxes without
+  // changing any PsiFormer input or observable.
+  if (electron_lattice.getSuperCellEnum() == SUPERCELL_OPEN)
+    return;
+  constexpr double tolerance = 128 * std::numeric_limits<double>::epsilon();
+  for (std::size_t row = 0; row < 3; ++row)
+    for (std::size_t column = 0; column < 3; ++column)
+      if (std::abs(electron_lattice.R(row, column) - ion_lattice.R(row, column)) >
+          tolerance * (1 + std::abs(electron_lattice.R(row, column))))
+        throw std::invalid_argument("PsiFormer electron and source-ion lattices differ");
+}
+
+/** Bind imported periodic nuclei to runtime positions after proving that order is
+ * preserved up to one common translation and individual lattice images. */
+void retargetPeriodicNuclei(pf::PsiFormer& model,
+                            const ParticleSet& ions,
+                            const psiformer::ExecutionEnvironment& environment)
+{
+  if (environment.boundary != psiformer::BoundaryCondition::PERIODIC)
+    return;
+  if (static_cast<std::size_t>(ions.getTotalNum()) != model.cfg.nuclei.shape[0])
+    throw std::invalid_argument("Periodic PsiFormer runtime nucleus count differs from the export");
+
+  ParticleSet::PosType common_translation;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    common_translation[dimension] =
+        ions.R[0][dimension] - model.cfg.nuclei.x[dimension];
+  const auto& lattice = ions.getLattice();
+  constexpr double image_tolerance = 2.0e-10;
+  for (int nucleus = 0; nucleus < ions.getTotalNum(); ++nucleus)
+  {
+    ParticleSet::PosType residual;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      residual[dimension] = ions.R[nucleus][dimension] -
+          model.cfg.nuclei.x[3 * nucleus + dimension] - common_translation[dimension];
+    const auto fractional = lattice.toUnit(residual);
+    for (std::size_t axis = 0; axis < 3; ++axis)
+      if (std::abs(fractional[axis] - std::nearbyint(fractional[axis])) > image_tolerance)
+        throw std::invalid_argument(
+            "Periodic PsiFormer runtime ions differ from exported ordering/geometry");
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      model.cfg.nuclei.x[3 * nucleus + dimension] = ions.R[nucleus][dimension];
+  }
+}
+
 /** Convert dependency-light initialized parameters and QMCPACK particle metadata
  * into the native evaluator's owning representation. */
 InitializedNativeModel makeInitializedNativeModel(
@@ -656,33 +773,52 @@ class PsiFormerSharedState
 public:
   /// Load the model that all clones of one PsiFormer component will share.
   PsiFormerSharedState(const std::string& parameters, const std::string& configuration)
-      : PsiFormerSharedState(pf::PsiFormer(parameters, configuration), "hdf5", "external_hdf5", 0)
+      : PsiFormerSharedState(pf::PsiFormer(parameters, configuration), "hdf5", "external_hdf5", 0, {})
+  {}
+
+  /// Load and retarget a periodic import against explicit runtime particle sets.
+  PsiFormerSharedState(const std::string& parameters,
+                       const std::string& configuration,
+                       const ParticleSet& electrons,
+                       const ParticleSet& ions)
+      : PsiFormerSharedState([&]() {
+          validateMatchingLattices(electrons, ions);
+          pf::PsiFormer model(parameters, configuration);
+          const auto environment = makeExecutionEnvironment(electrons);
+          retargetPeriodicNuclei(model, ions, environment);
+          return model;
+        }(), "hdf5", "external_hdf5", 0, makeExecutionEnvironment(electrons))
   {}
 
   /// Materialize a fresh in-memory model and retain its reproducibility provenance.
   PsiFormerSharedState(psiformer::InitializedPsiFormerParameters initialized,
                        const ParticleSet& electrons,
                        const ParticleSet& ions)
-      : PsiFormerSharedState(makeInitializedNativeModel(std::move(initialized), electrons, ions))
+      : PsiFormerSharedState(makeInitializedNativeModel(std::move(initialized), electrons, ions),
+                             makeExecutionEnvironment(electrons))
   {}
 
   /// Take ownership of a converted initialized model without copying its flat parameters.
-  explicit PsiFormerSharedState(InitializedNativeModel initialized)
+  PsiFormerSharedState(InitializedNativeModel initialized,
+                       psiformer::ExecutionEnvironment environment)
       : PsiFormerSharedState(std::move(initialized.model), "internal",
-                             std::move(initialized.profile), initialized.seed)
+                             std::move(initialized.profile), initialized.seed,
+                             std::move(environment))
   {}
 
   /// Complete shared executor construction for imported and internally initialized models.
   PsiFormerSharedState(pf::PsiFormer model_input,
                        std::string origin,
                        std::string profile,
-                       std::uint64_t seed)
+                       std::uint64_t seed,
+                       psiformer::ExecutionEnvironment environment)
       : model(std::move(model_input)),
         model_origin(std::move(origin)),
         initialization_profile(std::move(profile)),
         initialization_seed(seed),
         persistent_model_identity(
-            persistentModelIdentity(model, model_origin, initialization_profile, initialization_seed)),
+            persistentModelIdentity(model, model_origin, initialization_profile,
+                                    initialization_seed, environment)),
         execution_plan(psiformer::PsiFormerExecutionPlan::fromParameters(
             model.p,
             {/*spin_up_electrons=*/model.cfg.nup,
@@ -691,7 +827,7 @@ public:
              /*determinants=*/model.ndet,
              /*feature_dimension=*/model.dim,
              /*attention_heads=*/model.heads,
-             /*attention_blocks=*/model.blocks})),
+             /*attention_blocks=*/model.blocks}, std::move(environment))),
         direct_value_executor(model, execution_plan),
         direct_spatial_executor(model, direct_value_executor, execution_plan),
         direct_batch_executor(direct_value_executor, direct_spatial_executor),
@@ -701,7 +837,16 @@ public:
         direct_spatial_mode(configuredDirectBackend("PSIFORMER_SPATIAL_BACKEND")),
         direct_score_mode(configuredDirectBackend("PSIFORMER_SCORE_BACKEND")),
         direct_kinetic_mode(configuredDirectBackend("PSIFORMER_KINETIC_BACKEND"))
-  {}
+  {
+    if (execution_plan.environment().boundary == psiformer::BoundaryCondition::PERIODIC &&
+        (direct_value_mode != DirectBackendMode::DIRECT ||
+         direct_spatial_mode != DirectBackendMode::DIRECT ||
+         direct_score_mode != DirectBackendMode::DIRECT ||
+         direct_kinetic_mode != DirectBackendMode::DIRECT))
+      throw std::invalid_argument(
+          "Periodic PsiFormer requires direct value/spatial/score/kinetic backends; "
+          "the molecular native oracle is not periodic");
+  }
 
   mutable std::shared_mutex mutex;
   /// Number of pending planned one-electron crowd transactions sharing this model.
@@ -3179,7 +3324,8 @@ constexpr std::array<int, 3> PERSISTENCE_VERSION{1, 2, 0};
 std::string modelFingerprint(const pf::PsiFormer& model,
                              const std::string& model_origin,
                              const std::string& initialization_profile,
-                             std::uint64_t initialization_seed)
+                             std::uint64_t initialization_seed,
+                             const psiformer::ExecutionEnvironment& environment)
 {
   std::uint64_t hash = 14695981039346656037ULL;
   auto mix_byte      = [&hash](std::uint8_t byte) {
@@ -3205,6 +3351,18 @@ std::string modelFingerprint(const pf::PsiFormer& model,
   mix_string(model_origin);
   mix_string(initialization_profile);
   mix_integer(initialization_seed);
+  // Keep OPEN restart fingerprints backward compatible while binding periodic
+  // state to the exact feature policy and simulation cell.
+  if (environment.boundary == psiformer::BoundaryCondition::PERIODIC)
+  {
+    mix_integer(static_cast<std::uint64_t>(environment.boundary));
+    mix_integer(static_cast<std::uint64_t>(environment.geometry_feature_policy));
+    for (bool periodic : environment.periodic_axes)
+      mix_integer(periodic ? 1 : 0);
+    for (const auto& vector : environment.lattice_vectors)
+      for (double component : vector)
+        mix_double(component);
+  }
   mix_string(model.p.layout_fingerprint());
   mix_integer(model.cfg.nup);
   mix_integer(model.cfg.ndown);
@@ -3419,6 +3577,25 @@ PsiFormerWF::PsiFormerWF(std::string name,
                   std::move(optimized_parameter_export))
 {}
 
+// Load a periodic model only after binding its cell and ordered runtime ions.
+PsiFormerWF::PsiFormerWF(std::string name,
+                         std::string parameters,
+                         std::string configuration,
+                         const ParticleSet& electrons,
+                         const ParticleSet& ions,
+                         bool enable_optimization,
+                         std::vector<std::size_t> selected_flat_indices,
+                         bool optimize_all,
+                         std::string optimized_parameter_export)
+    : PsiFormerWF(std::move(name),
+                  std::make_shared<PsiFormerSharedState>(parameters, configuration,
+                                                        electrons, ions),
+                  enable_optimization, std::move(selected_flat_indices), optimize_all,
+                  std::move(optimized_parameter_export))
+{
+  bound_particle_set_ = &electrons;
+}
+
 // Construct a native model directly from initialized parameters and QMCPACK system metadata.
 PsiFormerWF::PsiFormerWF(std::string name,
                          psiformer::InitializedPsiFormerParameters initialized_parameters,
@@ -3505,7 +3682,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
   app_log() << "  PsiFormer " << WaveFunctionComponent::getName() << ": model="
             << modelFingerprint(model_state_->model, model_state_->model_origin,
                                 model_state_->initialization_profile,
-                                model_state_->initialization_seed)
+                                model_state_->initialization_seed,
+                                model_state_->execution_plan.environment())
             << ", origin=" << model_state_->model_origin;
   if (!model_state_->initialization_profile.empty())
     app_log() << ", initialization=" << model_state_->initialization_profile
@@ -4236,10 +4414,11 @@ PsiFormerWF::makeStreamingDerivativeOperator(
     if (particles.isSpinor() || particles.getTotalNum() < 0 ||
         static_cast<std::size_t>(particles.getTotalNum()) != electron_count ||
         particles.R.size() != electron_count ||
-        particles.GroupID.size() != electron_count ||
-        particles.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
+        particles.GroupID.size() != electron_count)
       throw std::invalid_argument(
-          "PsiFormer streaming derivative requires open-boundary POS-only samples with the model electron count");
+          "PsiFormer streaming derivative requires boundary-compatible POS-only samples with the model electron count");
+    validateRuntimeLattice(particles, model_state_->execution_plan.environment(),
+                           "PsiFormer streaming derivative sample");
     if (particles.groups() != 2 ||
         particles.groupsize(0) !=
             static_cast<int>(model_shape.spin_up_electrons) ||
@@ -4350,10 +4529,11 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
     const ParticleSet& particles = p_list[sample];
     if (particles.isSpinor() || particles.getTotalNum() < 0 ||
         static_cast<std::size_t>(particles.getTotalNum()) != electron_count ||
-        particles.R.size() != electron_count ||
-        particles.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
+        particles.R.size() != electron_count)
       throw std::invalid_argument(
-          "PsiFormer ECP consumer requires open-boundary POS-only samples with the model electron count");
+          "PsiFormer ECP consumer requires boundary-compatible POS-only samples with the model electron count");
+    validateRuntimeLattice(particles, model_state_->execution_plan.environment(),
+                           "PsiFormer ECP consumer sample");
     for (std::size_t electron = 0; electron < electron_count; ++electron)
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
@@ -7882,7 +8062,8 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   const std::string layout_fingerprint              = model.p.layout_fingerprint();
   const std::string model_fingerprint =
       modelFingerprint(model, model_state_->model_origin, model_state_->initialization_profile,
-                       model_state_->initialization_seed);
+                       model_state_->initialization_seed,
+                       model_state_->execution_plan.environment());
 
   output.write(format_version, "format_version");
   output.write(parameter_count, "parameter_count");
@@ -7987,7 +8168,8 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
                  "initialization seed");
     if (model_fingerprint !=
         modelFingerprint(model, model_state_->model_origin, model_state_->initialization_profile,
-                         model_state_->initialization_seed))
+                         model_state_->initialization_seed,
+                         model_state_->execution_plan.environment()))
       throw std::runtime_error("PsiFormer VP model fingerprint does not match the configured model");
     if (system_kind != system_kind_)
       throw std::runtime_error("PsiFormer VP system declaration does not match the configured model");
@@ -8038,14 +8220,11 @@ void PsiFormerWF::validateSystem(const ParticleSet& electrons,
     throw std::invalid_argument("PsiFormer system must be all_electron or pseudopotential");
   if (electrons.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electrons or spin-orbit pseudopotentials");
-  if (electrons.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
-    throw std::invalid_argument(
-        "PsiFormer supports only open-boundary electron particle sets; periodic execution is not implemented");
-  if (ions.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
-    throw std::invalid_argument(
-        "PsiFormer supports only open-boundary source-ion particle sets; periodic execution is not implemented");
+  validateMatchingLattices(electrons, ions);
 
   std::shared_lock state_lock(model_state_->mutex);
+  const auto& environment = model_state_->execution_plan.environment();
+  validateRuntimeLattice(electrons, environment, "PsiFormer runtime electron set");
   const pf::PsiFormer& model = model_state_->model;
   if (electrons.getTotalNum() != static_cast<int>(model.ne))
     throw std::invalid_argument("PsiFormer runtime electron count does not match the exported model");

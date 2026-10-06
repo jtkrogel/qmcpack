@@ -388,7 +388,7 @@ struct DirectSpatialResultView
   std::size_t parameter_version = 0;
 };
 
-/** Evaluate real open-boundary PsiFormer spatial observables with direct kernels. */
+/** Evaluate real PsiFormer spatial observables with boundary-aware direct kernels. */
 class DirectSpatialExecutor
 {
 public:
@@ -399,7 +399,7 @@ public:
       : parameters_(model.p),
         layout_(value_executor.layout()),
         nuclei_(model.cfg.nuclei.x),
-        boundary_(directGeometryBoundary(plan.environment().boundary)),
+        boundary_(directGeometryBoundary(plan.environment())),
         value_executor_identity_(&value_executor)
   {
     if (layout_->parameterCount() != plan.parameterCount() ||
@@ -695,11 +695,21 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
   DirectSpatialJetBuffer& raw       = workspace.raw_features_;
   const GeometryPairTable& pairs    = workspace.geometry_.electronNucleusPairs();
   const auto& displacements         = pairs.displacements();
+  const auto& complementary         = pairs.complementaryDisplacements();
+  const auto& displacement_jacobians = pairs.displacementJacobians();
+  const auto& complementary_jacobians = pairs.complementaryDisplacementJacobians();
+  const auto& displacement_laplacians = pairs.displacementLaplacians();
+  const auto& complementary_laplacians = pairs.complementaryDisplacementLaplacians();
   const auto& distances             = pairs.distances();
+  const auto& distance_gradients    = pairs.distanceGradients();
+  const auto& distance_gradient_norms = pairs.distanceGradientNormsSquared();
+  const auto& distance_laplacians   = pairs.distanceLaplacians();
   const auto& factors               = pairs.softenedRadialFactors();
   const std::size_t electron_count  = layout_->electronCount();
   const std::size_t nucleus_count   = layout_->nucleusCount();
   const std::size_t input_width     = layout_->inputWidth();
+  const bool periodic = workspace.geometry_.boundary().kind == GeometryBoundaryKind::PERIODIC;
+  const std::size_t pair_width = periodic ? 7 : 4;
   raw.clear();
 
   for (std::size_t electron = 0; electron < electron_count; ++electron)
@@ -711,41 +721,72 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
       const double radius    = distances[pair];
       if (radius == 0)
         throw std::runtime_error("PsiFormer spatial derivatives are undefined at an electron-nucleus coalescence");
-      const double inverse_radius = 1.0 / radius;
       const GeometryPosition& displacement = displacements[pair];
       const SoftenedRadialFactors& radial  = factors[pair];
-      const std::size_t radial_element     = row_begin + 4 * nucleus;
+      const std::size_t radial_element     = row_begin + pair_width * nucleus;
       raw.value[radial_element]            = radial.log1p_radius;
       for (std::size_t component = 0; component < 3; ++component)
         raw.value[radial_element + 1 + component] =
             displacement[component] * radial.log1p_over_radius;
+      if (periodic)
+        for (std::size_t component = 0; component < 3; ++component)
+          raw.value[radial_element + 4 + component] =
+              complementary[pair][component] * radial.log1p_over_radius;
 
       for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
       {
         if (laneElectron(workspace, lane) != electron)
           continue;
         const std::size_t derivative_dimension = laneDimension(workspace, lane);
-        const double unit_component = displacement[derivative_dimension] * inverse_radius;
+        const double radius_gradient = distance_gradients[pair][derivative_dimension];
         raw.gradient[gradientIndex(raw, lane, radial_element)] =
-            radial.log1p_first * unit_component;
+            radial.log1p_first * radius_gradient;
         for (std::size_t component = 0; component < 3; ++component)
         {
-          const double kronecker = component == derivative_dimension ? 1.0 : 0.0;
           raw.gradient[gradientIndex(raw, lane, radial_element + 1 + component)] =
-              kronecker * radial.log1p_over_radius +
-              displacement[component] * radial.log1p_over_radius_first * unit_component;
+              displacement_jacobians[pair][component][derivative_dimension] *
+                  radial.log1p_over_radius +
+              displacement[component] * radial.log1p_over_radius_first * radius_gradient;
+          if (periodic)
+            raw.gradient[gradientIndex(raw, lane, radial_element + 4 + component)] =
+                complementary_jacobians[pair][component][derivative_dimension] *
+                    radial.log1p_over_radius +
+                complementary[pair][component] * radial.log1p_over_radius_first *
+                    radius_gradient;
         }
       }
 
       if (workspace.mode_ == DirectSpatialMode::FULL_VGL)
       {
         raw.laplacian[laplacianIndex(raw, electron, radial_element)] =
-            radial.log1p_second + 2.0 * radial.log1p_first * inverse_radius;
-        const double directional_laplacian_factor =
-            radial.log1p_over_radius_second + 4.0 * radial.log1p_over_radius_first * inverse_radius;
+            radial.log1p_second * distance_gradient_norms[pair] +
+            radial.log1p_first * distance_laplacians[pair];
         for (std::size_t component = 0; component < 3; ++component)
+        {
+          double displacement_gradient_dot_radius_gradient = 0;
+          double complementary_gradient_dot_radius_gradient = 0;
+          for (std::size_t derivative = 0; derivative < 3; ++derivative)
+          {
+            displacement_gradient_dot_radius_gradient +=
+                displacement_jacobians[pair][component][derivative] *
+                distance_gradients[pair][derivative];
+            complementary_gradient_dot_radius_gradient +=
+                complementary_jacobians[pair][component][derivative] *
+                distance_gradients[pair][derivative];
+          }
+          const double radial_trace =
+              radial.log1p_over_radius_second * distance_gradient_norms[pair] +
+              radial.log1p_over_radius_first * distance_laplacians[pair];
           raw.laplacian[laplacianIndex(raw, electron, radial_element + 1 + component)] =
-              displacement[component] * directional_laplacian_factor;
+              displacement_laplacians[pair][component] * radial.log1p_over_radius +
+              2 * radial.log1p_over_radius_first * displacement_gradient_dot_radius_gradient +
+              displacement[component] * radial_trace;
+          if (periodic)
+            raw.laplacian[laplacianIndex(raw, electron, radial_element + 4 + component)] =
+                complementary_laplacians[pair][component] * radial.log1p_over_radius +
+                2 * radial.log1p_over_radius_first * complementary_gradient_dot_radius_gradient +
+                complementary[pair][component] * radial_trace;
+        }
       }
     }
     raw.value[row_begin + input_width - 1] = electron < layout_->spinUpCount() ? 1.0 : -1.0;
@@ -1023,8 +1064,10 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
   DirectSpatialJetBuffer& orbitals    = workspace.orbital_matrices_;
   const DirectSpatialJetBuffer& features = workspace.features_a_;
   const GeometryPairTable& pairs      = workspace.geometry_.electronNucleusPairs();
-  const auto& displacements           = pairs.displacements();
   const auto& distances               = pairs.distances();
+  const auto& distance_gradients      = pairs.distanceGradients();
+  const auto& distance_gradient_norms = pairs.distanceGradientNormsSquared();
+  const auto& distance_laplacians     = pairs.distanceLaplacians();
   const std::size_t electron_count    = layout_->electronCount();
   const std::size_t nucleus_count     = layout_->nucleusCount();
   const std::size_t determinant_count = layout_->determinantCount();
@@ -1061,7 +1104,6 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
           if (radius == 0)
             throw std::runtime_error(
                 "PsiFormer spatial derivatives are undefined at an electron-nucleus coalescence");
-          const double inverse_radius = 1.0 / radius;
           const double decay_rate     = std::abs(zeta[parameter]);
           const double exponential    = std::exp(-decay_rate * radius);
           const double weighted_value = pi[parameter] * exponential;
@@ -1074,11 +1116,12 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
             {
               const std::size_t dimension = laneDimension(workspace, lane);
               workspace.scalar_gradient_scratch_[lane] +=
-                  radial_first * displacements[pair][dimension] * inverse_radius;
+                  radial_first * distance_gradients[pair][dimension];
             }
           if (workspace.mode_ == DirectSpatialMode::FULL_VGL)
             workspace.scalar_laplacian_scratch_[row_electron] +=
-                radial_second + 2.0 * radial_first * inverse_radius;
+                radial_second * distance_gradient_norms[pair] +
+                radial_first * distance_laplacians[pair];
         }
 
         orbitals.value[matrix_element] = backflow_value * envelope_value;
@@ -1127,8 +1170,10 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
   const double opposite_alpha = tensor(parameters, layout_->anti_alpha_)[0];
   const auto& identities      = workspace.geometry_.electronPairs();
   const GeometryPairTable& pair_table = workspace.geometry_.electronElectronPairs();
-  const auto& displacements = pair_table.displacements();
   const auto& distances     = pair_table.distances();
+  const auto& distance_gradients = pair_table.distanceGradients();
+  const auto& distance_gradient_norms = pair_table.distanceGradientNormsSquared();
+  const auto& distance_laplacians = pair_table.distanceLaplacians();
   double cusp_value         = 0;
 
   for (std::size_t pair_index = 0; pair_index < identities.size(); ++pair_index)
@@ -1156,11 +1201,13 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
       const double incidence_sign = electron == pair.first ? 1.0 : -1.0;
       const std::size_t dimension = laneDimension(workspace, lane);
       workspace.scalar_gradient_scratch_[lane] += incidence_sign * radial_first *
-          displacements[pair_index][dimension] / radius;
+          distance_gradients[pair_index][dimension];
     }
     if (workspace.mode_ == DirectSpatialMode::FULL_VGL)
     {
-      const double pair_laplacian = radial_second + 2.0 * radial_first / radius;
+      const double pair_laplacian =
+          radial_second * distance_gradient_norms[pair_index] +
+          radial_first * distance_laplacians[pair_index];
       workspace.scalar_laplacian_scratch_[pair.first] += pair_laplacian;
       workspace.scalar_laplacian_scratch_[pair.second] += pair_laplacian;
     }

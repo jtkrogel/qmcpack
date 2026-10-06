@@ -98,7 +98,8 @@ struct InitializedPsiFormerParameters
 InitializedPsiFormerParameters initializePsiFormerParameters(
     const ModelShape& model_shape,
     std::uint64_t seed,
-    const std::string& profile = DEEPQMC_PSIFORMER_V1);
+    const std::string& profile = DEEPQMC_PSIFORMER_V1,
+    ExecutionEnvironment environment = {});
 
 /// Return a stable display name for an initialization law.
 const char* initializationLawName(InitializationLaw law);

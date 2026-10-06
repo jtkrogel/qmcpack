@@ -582,9 +582,11 @@ inline std::size_t geometryStorageRequirement(std::size_t electrons,
       electrons, nuclei, "PsiFormer electron-nucleus extent overflowed");
   const auto pair_table_bytes = [](std::size_t pairs) {
     std::size_t per_pair = 0;
-    addStorageBytes(per_pair, sizeof(GeometryPosition),
+    addStorageBytes(per_pair, 5 * sizeof(GeometryPosition),
                     "PsiFormer pair-table element bytes overflowed");
-    addStorageBytes(per_pair, 2 * sizeof(GeometryReal),
+    addStorageBytes(per_pair, 2 * sizeof(GeometryJacobian),
+                    "PsiFormer pair-table element bytes overflowed");
+    addStorageBytes(per_pair, 4 * sizeof(GeometryReal),
                     "PsiFormer pair-table element bytes overflowed");
     addStorageBytes(per_pair, sizeof(SoftenedRadialFactors),
                     "PsiFormer pair-table element bytes overflowed");

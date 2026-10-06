@@ -1652,14 +1652,18 @@ std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder
                                                    const std::string& name,
                                                    std::uint64_t seed,
                                                    const std::string& system = "all_electron",
-                                                   const std::string& selected_indices = "0 514")
+                                                   const std::string& selected_indices = "0 514",
+                                                   const std::string& feature_policy = "")
 {
   std::ostringstream xml;
   xml << "<psiformer name=\"" << name
       << "\" initialization=\"" << psiformer::DEEPQMC_PSIFORMER_V1
       << "\" initialization_seed=\"" << seed
       << "\" source=\"ion0\" system=\"" << system << "\" optimize=\"yes\" "
-         "optimize_scope=\"indices\" optimize_indices=\"" << selected_indices << "\"/>";
+         "optimize_scope=\"indices\" optimize_indices=\"" << selected_indices << "\"";
+  if (!feature_policy.empty())
+    xml << " feature_policy=\"" << feature_policy << "\"";
+  xml << "/>";
 
   Libxml2Document document;
   if (!document.parseFromString(xml.str()))
@@ -1962,6 +1966,55 @@ TEST_CASE("PsiFormer internal initialization evaluates and restores without mode
   CHECK_THROWS_WITH(mismatched_seed->readVariationalParameters(mismatch_input),
                     Catch::Matchers::ContainsSubstring("initialization seed"));
   mismatch_input.close();
+}
+
+TEST_CASE("PsiFormer internally initialized periodic model is lattice-image invariant",
+          "[wavefunction][psiformer][initialization][periodic]")
+{
+  Lattice lattice;
+  lattice.R         = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap particle_sets;
+  auto ions = makeLiHIons(simulation_cell);
+  particle_sets.emplace(ions->getName(), std::move(ions));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
+
+  std::unique_ptr<PsiFormerWF> component = buildInternalPsiFormer(
+      builder, "pf_periodic_internal", 29, "all_electron", "0 514", "periodic_torus_v1");
+  OptVariables active = registerSelectedParameters(*component);
+  const ComponentSnapshot baseline = evaluateComponent(*component, electrons, active);
+
+  // Replacing one electron by an exact lattice image must leave the real
+  // Gamma wavefunction, spatial derivatives, and parameter derivatives fixed.
+  for (int dimension = 0; dimension < 3; ++dimension)
+    electrons.R[0][dimension] += lattice.R(0, dimension) + lattice.R(2, dimension);
+  electrons.update();
+  const ComponentSnapshot image = evaluateComponent(*component, electrons, active);
+
+  CHECK(image.log_value == Catch::Approx(baseline.log_value).epsilon(2e-10).margin(2e-10));
+  CHECK(image.phase == Catch::Approx(baseline.phase).epsilon(2e-10).margin(2e-10));
+  REQUIRE(image.gradient.size() == baseline.gradient.size());
+  REQUIRE(image.laplacian.size() == baseline.laplacian.size());
+  REQUIRE(image.log_parameter_derivative.size() == baseline.log_parameter_derivative.size());
+  REQUIRE(image.kinetic_parameter_derivative.size() ==
+          baseline.kinetic_parameter_derivative.size());
+  for (std::size_t index = 0; index < image.gradient.size(); ++index)
+    CHECK(image.gradient[index] ==
+          Catch::Approx(baseline.gradient[index]).epsilon(2e-9).margin(2e-9));
+  for (std::size_t index = 0; index < image.laplacian.size(); ++index)
+    CHECK(image.laplacian[index] ==
+          Catch::Approx(baseline.laplacian[index]).epsilon(2e-8).margin(2e-8));
+  for (std::size_t index = 0; index < image.log_parameter_derivative.size(); ++index)
+  {
+    CHECK(image.log_parameter_derivative[index] ==
+          Catch::Approx(baseline.log_parameter_derivative[index]).epsilon(2e-8).margin(2e-8));
+    CHECK(image.kinetic_parameter_derivative[index] ==
+          Catch::Approx(baseline.kinetic_parameter_derivative[index]).epsilon(2e-7).margin(2e-7));
+  }
 }
 
 TEST_CASE("PsiFormer internal initialization uses the canonical pseudo-LiH layout",

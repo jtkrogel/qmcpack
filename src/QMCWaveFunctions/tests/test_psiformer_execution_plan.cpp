@@ -128,7 +128,7 @@ TEST_CASE("PsiFormer execution plan types imported parameter layouts", "[wavefun
   const ModelCapabilities capabilities = PsiFormerExecutionPlan::capabilities();
   CHECK(capabilities.open_boundary);
   CHECK(capabilities.real_scalars);
-  CHECK_FALSE(capabilities.periodic_boundary);
+  CHECK(capabilities.periodic_boundary);
   CHECK_FALSE(capabilities.complex_scalars);
 }
 
@@ -138,6 +138,11 @@ TEST_CASE("PsiFormer execution plan rejects unsupported or malformed models", "[
 
   ExecutionEnvironment periodic;
   periodic.boundary = BoundaryCondition::PERIODIC;
+  periodic.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  periodic.periodic_axes = {true, true, true};
+  periodic.lattice_vectors = {{{8, 0, 0}, {0, 8, 0}, {0, 0, 8}}};
+  // The molecular fixture has a 4*Nion+1 embedding and must not be silently
+  // reinterpreted under the periodic 7*Nion+1 feature contract.
   CHECK_THROWS_AS(PsiFormerExecutionPlan::fromParameters(store, testModelShape(), periodic), std::invalid_argument);
 
   ExecutionEnvironment complex;

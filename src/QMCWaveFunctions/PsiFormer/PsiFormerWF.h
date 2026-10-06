@@ -296,6 +296,17 @@ public:
               bool optimize_all = false,
               std::string optimized_parameter_export = {});
 
+  /// Load a periodic import using explicit runtime ions and simulation cell metadata.
+  PsiFormerWF(std::string name,
+              std::string parameters,
+              std::string configuration,
+              const ParticleSet& electrons,
+              const ParticleSet& ions,
+              bool optimize = false,
+              std::vector<std::size_t> selected_flat_indices = {},
+              bool optimize_all = false,
+              std::string optimized_parameter_export = {});
+
   /** Construct a self-contained model from initialized parameters and QMCPACK
    * electron/ion particle sets, without reading a model or configuration file. */
   PsiFormerWF(std::string name,

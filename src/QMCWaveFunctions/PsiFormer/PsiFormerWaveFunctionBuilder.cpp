@@ -75,7 +75,7 @@ std::uint64_t parseInitializationSeed(const std::string& value)
 std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildComponent(xmlNodePtr cur)
 {
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
-  std::string export_parameters, initialization, initialization_seed_text = "0";
+  std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
   std::string optimize = "no", optimize_scope = "indices", optimize_indices;
 
   // Both files use the compact export format consumed by PsiFormerNative.h.
@@ -87,6 +87,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(configuration, "configuration");
   attributes.add(initialization, "initialization");
   attributes.add(initialization_seed_text, "initialization_seed");
+  attributes.add(feature_policy, "feature_policy");
   attributes.add(source, "source");
   attributes.add(system, "system");
   attributes.add(export_parameters, "export_parameters");
@@ -121,9 +122,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   if (targetPtcl.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electron particle sets");
-  if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN)
+  const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
+  if (periodic && targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
+    throw std::invalid_argument("Real Gamma PsiFormer currently supports only 3D bulk periodic cells");
+  if (periodic && feature_policy != "periodic_torus_v1")
     throw std::invalid_argument(
-        "PsiFormer supports only open-boundary molecular particle sets; periodic execution is not implemented");
+        "Periodic PsiFormer requires explicit feature_policy=periodic_torus_v1 metadata");
+  if (!periodic && !feature_policy.empty() && feature_policy != "open_euclidean_v1")
+    throw std::invalid_argument("Open PsiFormer requires feature_policy=open_euclidean_v1 when specified");
   if (optimization_enabled)
   {
     const auto& masses = targetPtcl.get_mass_by_group();
@@ -142,6 +148,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         "Internally initialized PsiFormer requires explicit system=all_electron or system=pseudopotential");
   if (internal_initialization && !has_explicit_source)
     throw std::invalid_argument("Internally initialized PsiFormer requires an explicit source particle set");
+  if (periodic && !has_explicit_source)
+    throw std::invalid_argument("Periodic PsiFormer requires an explicit ordered source particle set");
   if (optimization_enabled && system == "auto")
     throw std::invalid_argument(
         "PsiFormer optimization requires system=all_electron or system=pseudopotential for metadata validation");
@@ -159,7 +167,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     throw std::invalid_argument("PsiFormer optimize=yes requires a nonempty optimize_indices list");
 
   const ParticleSet* source_particles = nullptr;
-  if (system != "auto" || internal_initialization)
+  if (system != "auto" || internal_initialization || periodic)
   {
     const auto source_particle_set = particle_sets_.find(source);
     if (source_particle_set == particle_sets_.end())
@@ -182,8 +190,19 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         /*feature_dimension=*/256,
         /*attention_heads=*/4,
         /*attention_blocks=*/4};
+    psiformer::ExecutionEnvironment environment;
+    if (periodic)
+    {
+      environment.boundary = psiformer::BoundaryCondition::PERIODIC;
+      environment.geometry_feature_policy = psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+      environment.periodic_axes = {true, true, true};
+      for (std::size_t axis = 0; axis < 3; ++axis)
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          environment.lattice_vectors[axis][dimension] = targetPtcl.getLattice().R(axis, dimension);
+    }
     psiformer::InitializedPsiFormerParameters initialized =
-        psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization);
+        psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization,
+                                                 environment);
 
     // All ranks must evaluate exactly the same model even when platform math
     // libraries round the Gaussian transform differently.  Communicate's
@@ -202,6 +221,11 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         name, std::move(initialized), targetPtcl, *source_particles, optimization_enabled,
         std::move(selected_indices), optimize_all, export_parameters);
   }
+  else if (periodic)
+    component = std::make_unique<PsiFormerWF>(name, parameters, configuration, targetPtcl,
+                                              *source_particles, optimization_enabled,
+                                              std::move(selected_indices), optimize_all,
+                                              export_parameters);
   else
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
