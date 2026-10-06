@@ -936,6 +936,26 @@ private:
   static PsiValue ratioArenaRoundTripForTesting(PsiValue value,
                                                 bool use_log_value_arena);
 
+  /// Identify one deliberately malformed ratio-arena condition for friend-only tests.
+  enum class RatioArenaFaultForTesting
+  {
+    WRONG_KIND,
+    WRONG_PREFIX,
+    CHANGED_POINTER,
+    CHANGED_SIZE,
+    CHANGED_CAPACITY,
+    DUAL_ARENAS,
+    NO_ARENA,
+    NONZERO_LOG_IMAGINARY
+  };
+
+  /** Exercise production ratio-arena validation through a transient malformed
+   * state.  Every resource mutation is restored before this test-only seam
+   * returns or propagates an exception. */
+  PsiValue ratioArenaFaultForTesting(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      RatioArenaFaultForTesting fault) const;
+
   /// Copy bounded selected-compaction prefixes without exposing mutable scratch.
   testing::PsiFormerSelectedProposalMapDiagnostics
   selectedProposalMapDiagnosticsForTesting(
@@ -1063,6 +1083,8 @@ private:
   bool fail_planned_single_resolution_before_publish_for_testing_ = false;
   /// Inject a one-electron cancellation failure after its final preflight.
   bool fail_planned_single_cancellation_before_publish_for_testing_ = false;
+  /// Substitute a finite maximum contribution to exercise additive overflow.
+  bool force_planned_ratio_gradient_overflow_for_testing_ = false;
   /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.
   bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.

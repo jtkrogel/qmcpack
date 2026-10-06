@@ -95,6 +95,19 @@ public:
     MW_SELECTED_FULL_VGL
   };
 
+  /// Stable test spelling of one deliberately malformed ratio-arena condition.
+  enum class RatioArenaFault
+  {
+    WRONG_KIND,
+    WRONG_PREFIX,
+    CHANGED_POINTER,
+    CHANGED_SIZE,
+    CHANGED_CAPACITY,
+    DUAL_ARENAS,
+    NO_ARENA,
+    NONZERO_LOG_IMAGINARY
+  };
+
   /// Exact fingerprint and version returned by the lifecycle-only proposal seam.
   struct SelectedProposalEvidence
   {
@@ -111,6 +124,7 @@ public:
     ACTIVE_GRADIENT,
     RATIO_GRADIENT,
     ACCEPT_REJECT_VALUE,
+    SINGLE_CANCEL,
     SELECTED_PROPOSE,
     SELECTED_RESOLVE,
     SELECTED_CANCEL,
@@ -138,6 +152,8 @@ public:
     std::optional<std::size_t> active_electron;
     std::optional<std::uint64_t> descriptor_fingerprint;
     std::optional<std::size_t> expected_proposal_version;
+    std::optional<ProposalOrigin> expected_proposal_origin;
+    std::optional<std::uint64_t> expected_single_transaction_fingerprint;
   };
 
   static PsiFormerCloneStateSnapshot cloneState(const PsiFormerWF& component)
@@ -268,6 +284,37 @@ public:
         enabled;
   }
 
+  /// Toggle the one-electron producer failure after its final read-only check.
+  static void injectPlannedSinglePrepublicationFailure(
+      PsiFormerWF& component, bool enabled)
+  {
+    component.fail_planned_single_proposal_before_publish_for_testing_ =
+        enabled;
+  }
+
+  /// Toggle the one-electron resolver failure after final Phase-B validation.
+  static void injectPlannedSingleResolutionPrepublicationFailure(
+      PsiFormerWF& component, bool enabled)
+  {
+    component.fail_planned_single_resolution_before_publish_for_testing_ =
+        enabled;
+  }
+
+  /// Toggle exact stale-proposal cancellation failure before its commit.
+  static void injectPlannedSingleCancellationPrepublicationFailure(
+      PsiFormerWF& component, bool enabled)
+  {
+    component.fail_planned_single_cancellation_before_publish_for_testing_ =
+        enabled;
+  }
+
+  /// Replace the direct finite gradient with a finite maximum test contribution.
+  static void forcePlannedRatioGradientOverflow(PsiFormerWF& component,
+                                                bool enabled)
+  {
+    component.force_planned_ratio_gradient_overflow_for_testing_ = enabled;
+  }
+
   /// Replace one proposed gradient entry to exercise resolution finiteness checks.
   static void setProposedGradient(PsiFormerWF& component,
                                   std::size_t electron,
@@ -310,6 +357,13 @@ public:
         component.acceptedStateMatches(
             particles, current_version,
             PsiFormerWF::AcceptedStateRequirement::VALUE_ONLY);
+  }
+
+  /// Return the stable snapshot spelling of the VALUE_ONLY cache contract.
+  static std::uint64_t valueOnlyAcceptedStateRequirement() noexcept
+  {
+    return static_cast<std::uint64_t>(
+        PsiFormerWF::AcceptedStateRequirement::VALUE_ONLY);
   }
 
   static bool cloneStateMatches(const PsiFormerWF& component,
@@ -355,9 +409,37 @@ public:
         value, use_log_value_arena);
   }
 
+  /// Exercise one transient malformed arena and restore its exact resource state.
+  static PsiFormerWF::PsiValue ratioArenaFault(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      RatioArenaFault fault)
+  {
+    return component.ratioArenaFaultForTesting(
+        wfc_list, privateRatioArenaFault(fault));
+  }
+
   /// Bind a directly constructed test component to its actual ParticleSet lane.
   static void bindParticleSet(PsiFormerWF& component, const ParticleSet& particles)
   { component.bound_particle_set_ = &particles; }
+
+  /// Remove or restore the selected hard-plan binding without changing storage.
+  static void useBatchExecutionPlan(PsiFormerWF& component,
+                                    const PsiFormerWF* donor)
+  {
+    component.batch_execution_plan_ = donor
+        ? donor->batch_execution_plan_
+        : BatchExecutionParticipantPlan{};
+  }
+
+  /// Corrupt borrowed-collection cursor evidence without touching the resource.
+  static void setAcquiredResourceCursor(PsiFormerWF& component,
+                                        std::size_t cursor)
+  { component.acquired_resource_cursor_ = cursor; }
+
+  /// Read borrowed-collection cursor evidence for exact test restoration.
+  static std::size_t acquiredResourceCursor(const PsiFormerWF& component)
+  { return component.acquired_resource_cursor_; }
 
   /// Corrupt one acquisition marker long enough to test exact lane validation.
   static void setAcquiredLaneIndex(PsiFormerWF& component, std::size_t lane)
@@ -393,6 +475,11 @@ public:
     private_request.active_electron           = request.active_electron;
     private_request.descriptor_fingerprint    = request.descriptor_fingerprint;
     private_request.expected_proposal_version = request.expected_proposal_version;
+    if (request.expected_proposal_origin)
+      private_request.expected_proposal_origin =
+          privateOrigin(*request.expected_proposal_origin);
+    private_request.expected_single_transaction_fingerprint =
+        request.expected_single_transaction_fingerprint;
     return component
         .requirePlannedMultiWalkerOperation(wfc_list, p_list, private_request)
         .storage_fingerprint;
@@ -435,6 +522,41 @@ public:
   /// Report the externally visible pending-proposal marker.
   static bool hasProposal(const PsiFormerWF& component)
   { return component.has_proposal_; }
+
+  /// Corrupt one origin discriminator without changing the remaining proposal.
+  static void setProposalOrigin(PsiFormerWF& component, ProposalOrigin origin)
+  { component.proposal_origin_ = privateOrigin(origin); }
+
+  /// Corrupt one proposed electron index without changing other provenance.
+  static void setProposalParticle(PsiFormerWF& component, int particle) noexcept
+  { component.proposed_particle_ = particle; }
+
+  /// Corrupt one proposed parameter version without synchronizing the clone.
+  static void setProposalParameterVersion(PsiFormerWF& component,
+                                          std::size_t version) noexcept
+  { component.proposed_parameter_version_ = version; }
+
+  /// Corrupt one crowd transaction token without changing lane ownership.
+  static void setProposalFingerprint(PsiFormerWF& component,
+                                     std::uint64_t fingerprint) noexcept
+  { component.proposed_descriptor_fingerprint_ = fingerprint; }
+
+  /// Corrupt one proposed configuration identity without changing coordinates.
+  static void setProposedConfigurationIdentity(PsiFormerWF& component,
+                                               std::uint64_t identity) noexcept
+  { component.proposed_configuration_identity_ = identity; }
+
+  /// Hide or restore one lane's final proposal-publication marker.
+  static void setProposalMarker(PsiFormerWF& component, bool present) noexcept
+  { component.has_proposal_ = present; }
+
+  /// Remove one registered count to exercise missing model-wide evidence.
+  static void unregisterPlannedSingleTransaction(PsiFormerWF& component) noexcept
+  { component.unregisterPlannedSingleTransaction(); }
+
+  /// Restore one deliberately removed model-wide transaction registration.
+  static bool registerPlannedSingleTransaction(PsiFormerWF& component) noexcept
+  { return component.tryRegisterPlannedSingleTransaction(); }
 
   /// Exercise lazy version synchronization without exposing it in production.
   static void synchronizeParameterVersion(PsiFormerWF& component,
@@ -500,10 +622,30 @@ public:
         wfc_list, p_list, moves, expected_proposal_version);
   }
 
+  /// Cancel an exact planned one-electron proposal, including after version drift.
+  static void cancelPlannedSingleProposal(
+      const PsiFormerWF& component,
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t active_electron,
+      ProposalOrigin expected_origin,
+      std::size_t expected_proposal_version,
+      std::uint64_t expected_transaction_fingerprint)
+  {
+    component.cancelPlannedSingleProposal(
+        wfc_list, p_list, active_electron, privateOrigin(expected_origin),
+        expected_proposal_version, expected_transaction_fingerprint);
+  }
+
   /// Observe the shared transaction guard used by parameter publishers.
   static std::size_t plannedSelectedTransactionCount(
       const PsiFormerWF& component) noexcept
   { return component.plannedSelectedTransactionCountForTesting(); }
+
+  /// Observe the independent one-electron crowd transaction guard.
+  static std::size_t plannedSingleTransactionCount(
+      const PsiFormerWF& component) noexcept
+  { return component.plannedSingleTransactionCountForTesting(); }
 
   /// Create deliberate model-version drift without synchronizing any clone.
   static std::size_t advanceParameterVersion(PsiFormerWF& component)
@@ -531,6 +673,31 @@ public:
   }
 
 private:
+  static PsiFormerWF::RatioArenaFaultForTesting privateRatioArenaFault(
+      RatioArenaFault fault)
+  {
+    switch (fault)
+    {
+    case RatioArenaFault::WRONG_KIND:
+      return PsiFormerWF::RatioArenaFaultForTesting::WRONG_KIND;
+    case RatioArenaFault::WRONG_PREFIX:
+      return PsiFormerWF::RatioArenaFaultForTesting::WRONG_PREFIX;
+    case RatioArenaFault::CHANGED_POINTER:
+      return PsiFormerWF::RatioArenaFaultForTesting::CHANGED_POINTER;
+    case RatioArenaFault::CHANGED_SIZE:
+      return PsiFormerWF::RatioArenaFaultForTesting::CHANGED_SIZE;
+    case RatioArenaFault::CHANGED_CAPACITY:
+      return PsiFormerWF::RatioArenaFaultForTesting::CHANGED_CAPACITY;
+    case RatioArenaFault::DUAL_ARENAS:
+      return PsiFormerWF::RatioArenaFaultForTesting::DUAL_ARENAS;
+    case RatioArenaFault::NO_ARENA:
+      return PsiFormerWF::RatioArenaFaultForTesting::NO_ARENA;
+    case RatioArenaFault::NONZERO_LOG_IMAGINARY:
+      return PsiFormerWF::RatioArenaFaultForTesting::NONZERO_LOG_IMAGINARY;
+    }
+    throw std::logic_error("Unknown PsiFormer ratio-arena fault test value");
+  }
+
   static PsiFormerWF::PlannedOperation operation(RuntimeOperation operation)
   {
     switch (operation)
@@ -547,6 +714,8 @@ private:
       return PsiFormerWF::PlannedOperation::RATIO_GRADIENT;
     case RuntimeOperation::ACCEPT_REJECT_VALUE:
       return PsiFormerWF::PlannedOperation::ACCEPT_REJECT_VALUE;
+    case RuntimeOperation::SINGLE_CANCEL:
+      return PsiFormerWF::PlannedOperation::SINGLE_CANCEL;
     case RuntimeOperation::SELECTED_PROPOSE:
       return PsiFormerWF::PlannedOperation::SELECTED_PROPOSE;
     case RuntimeOperation::SELECTED_RESOLVE:
@@ -573,6 +742,27 @@ private:
       return PsiFormerWF::PlannedOperation::COMPLETE_UPDATES;
     }
     throw std::logic_error("Unknown PsiFormer runtime-operation test value");
+  }
+
+  /// Translate a stable test origin into the private production discriminator.
+  static PsiFormerWF::ProposalOrigin privateOrigin(ProposalOrigin origin)
+  {
+    switch (origin)
+    {
+    case ProposalOrigin::NONE:
+      return PsiFormerWF::ProposalOrigin::NONE;
+    case ProposalOrigin::SCALAR_RATIO_VALUE:
+      return PsiFormerWF::ProposalOrigin::SCALAR_RATIO_VALUE;
+    case ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE:
+      return PsiFormerWF::ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE;
+    case ProposalOrigin::MW_CALC_RATIO_VALUE:
+      return PsiFormerWF::ProposalOrigin::MW_CALC_RATIO_VALUE;
+    case ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE:
+      return PsiFormerWF::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE;
+    case ProposalOrigin::MW_SELECTED_FULL_VGL:
+      return PsiFormerWF::ProposalOrigin::MW_SELECTED_FULL_VGL;
+    }
+    throw std::logic_error("Unknown PsiFormer proposal-origin test value");
   }
 
   static bool sameGradient(const ParticleSet::ParticleGradient& actual,
@@ -844,7 +1034,10 @@ void prepareCrowdPreparationClones(
 struct RuntimePreflightSnapshot
 {
   std::size_t parameter_version = 0;
+  std::size_t planned_single_transactions = 0;
+  std::size_t planned_selected_transactions = 0;
   std::vector<testing::PsiFormerCloneStateSnapshot> clones;
+  std::vector<testing::PsiFormerPreparedCloneStorage> clone_storage;
   std::vector<ParticleSet::ParticlePos> positions;
   std::vector<ParticleSet::ParticleScalar> spins;
   std::vector<ParticleSet::ParticleIndex> group_ids;
@@ -857,6 +1050,9 @@ struct RuntimePreflightSnapshot
   testing::PsiFormerCrowdWorkspaceDiagnostics resource;
   std::size_t collection_cursor = 0;
   std::size_t outstanding_loans = 0;
+  const Value* caller_data = nullptr;
+  std::size_t caller_size = 0;
+  std::size_t caller_capacity = 0;
   std::vector<Value> caller_output;
 };
 
@@ -867,7 +1063,14 @@ RuntimePreflightSnapshot captureRuntimePreflightState(
 {
   RuntimePreflightSnapshot snapshot;
   snapshot.parameter_version = crowd.leader.parameterVersion();
+  snapshot.planned_single_transactions =
+      testing::TestPsiFormerVirtualBatch::plannedSingleTransactionCount(
+          crowd.leader);
+  snapshot.planned_selected_transactions =
+      testing::TestPsiFormerVirtualBatch::plannedSelectedTransactionCount(
+          crowd.leader);
   snapshot.clones.reserve(crowd.components.size());
+  snapshot.clone_storage.reserve(crowd.components.size());
   snapshot.positions.reserve(crowd.walkers.size());
   snapshot.spins.reserve(crowd.walkers.size());
   snapshot.group_ids.reserve(crowd.walkers.size());
@@ -881,6 +1084,9 @@ RuntimePreflightSnapshot captureRuntimePreflightState(
   {
     snapshot.clones.push_back(
         testing::TestPsiFormerVirtualBatch::cloneState(*crowd.components[lane]));
+    snapshot.clone_storage.push_back(
+        testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+            *crowd.components[lane]));
     snapshot.positions.push_back(crowd.walkers[lane]->R);
     snapshot.spins.push_back(crowd.walkers[lane]->spins);
     snapshot.group_ids.push_back(crowd.walkers[lane]->GroupID);
@@ -900,6 +1106,9 @@ RuntimePreflightSnapshot captureRuntimePreflightState(
           crowd.leader, crowd.wfc_list);
   snapshot.collection_cursor = collection.getCursor();
   snapshot.outstanding_loans = collection.getOutstandingLoanCount();
+  snapshot.caller_data = caller_output.data();
+  snapshot.caller_size = caller_output.size();
+  snapshot.caller_capacity = caller_output.capacity();
   snapshot.caller_output = caller_output;
   return snapshot;
 }
@@ -915,11 +1124,25 @@ void checkRuntimePreflightState(
     return std::memcmp(&actual, &reference, sizeof(actual)) == 0;
   };
   CHECK(crowd.leader.parameterVersion() == expected.parameter_version);
+  CHECK(testing::TestPsiFormerVirtualBatch::plannedSingleTransactionCount(
+            crowd.leader) == expected.planned_single_transactions);
+  CHECK(testing::TestPsiFormerVirtualBatch::plannedSelectedTransactionCount(
+            crowd.leader) == expected.planned_selected_transactions);
   REQUIRE(crowd.components.size() == expected.clones.size());
+  REQUIRE(crowd.components.size() == expected.clone_storage.size());
   for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
   {
     CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
         *crowd.components[lane], expected.clones[lane]));
+    const auto actual_clone_storage =
+        testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
+            *crowd.components[lane]);
+    CHECK(actual_clone_storage.data == expected.clone_storage[lane].data);
+    CHECK(actual_clone_storage.sizes == expected.clone_storage[lane].sizes);
+    CHECK(actual_clone_storage.capacities ==
+          expected.clone_storage[lane].capacities);
+    CHECK(actual_clone_storage.exact_marker ==
+          expected.clone_storage[lane].exact_marker);
     REQUIRE(crowd.walkers[lane]->R.size() == expected.positions[lane].size());
     REQUIRE(crowd.walkers[lane]->spins.size() == expected.spins[lane].size());
     REQUIRE(crowd.walkers[lane]->GroupID.size() == expected.group_ids[lane].size());
@@ -972,6 +1195,9 @@ void checkRuntimePreflightState(
         expected.resource.actual_resource_storage);
   CHECK(collection.getCursor() == expected.collection_cursor);
   CHECK(collection.getOutstandingLoanCount() == expected.outstanding_loans);
+  CHECK(caller_output.data() == expected.caller_data);
+  CHECK(caller_output.size() == expected.caller_size);
+  CHECK(caller_output.capacity() == expected.caller_capacity);
   CHECK(caller_output == expected.caller_output);
 }
 
@@ -2938,6 +3164,87 @@ TEST_CASE("PsiFormer typed ratio arena preserves public values",
         probe);
 }
 
+TEST_CASE("PsiFormer typed ratio arena rejects malformed evidence",
+          "[wavefunction][psiformer][multiwalker][resource][batch_memory]"
+          "[ratio_arena]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id = "test/psiformer/ratio-arena-faults";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {2}, {3}, participant_id,
+      "ratio-arena-faults-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+
+  ResourceCollection resource_template("psiformer_ratio_arena_fault_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource,
+                                                          crowd.wfc_list);
+
+  const auto baseline = Probe::crowdWorkspaceDiagnostics(crowd.leader,
+                                                          crowd.wfc_list);
+  checkPreparedRatioArena(baseline,
+                          testing::PsiFormerRatioArenaKind::LOG_VALUE, 3);
+
+  SECTION("prepared resource evidence")
+  {
+    using Fault = Probe::RatioArenaFault;
+    const std::array<std::pair<Fault, const char*>, 7> faults{{
+        {Fault::WRONG_KIND, "wrong kind"},
+        {Fault::WRONG_PREFIX, "wrong prefix"},
+        {Fault::CHANGED_POINTER, "changed pointer"},
+        {Fault::CHANGED_SIZE, "changed size"},
+        {Fault::CHANGED_CAPACITY, "changed capacity"},
+        {Fault::DUAL_ARENAS, "dual arenas"},
+        {Fault::NO_ARENA, "no arena"},
+    }};
+
+    for (const auto& [fault, description] : faults)
+      DYNAMIC_SECTION(description)
+      {
+        if (fault == Fault::WRONG_PREFIX)
+          CHECK_THROWS_AS(
+              Probe::ratioArenaFault(crowd.leader, crowd.wfc_list, fault),
+              std::length_error);
+        else
+          CHECK_THROWS_AS(
+              Probe::ratioArenaFault(crowd.leader, crowd.wfc_list, fault),
+              std::logic_error);
+
+        const auto restored = Probe::crowdWorkspaceDiagnostics(
+            crowd.leader, crowd.wfc_list);
+        checkPreparedResourceStorageUnchanged(restored, baseline);
+      }
+  }
+
+  SECTION("nonzero LogValue imaginary component")
+  {
+#ifdef QMC_COMPLEX
+    const PsiFormerWF::PsiValue value = Probe::ratioArenaFault(
+        crowd.leader, crowd.wfc_list,
+        Probe::RatioArenaFault::NONZERO_LOG_IMAGINARY);
+    CHECK(value == PsiFormerWF::PsiValue(1.25, -0.375));
+#else
+    CHECK_THROWS_AS(
+        Probe::ratioArenaFault(
+            crowd.leader, crowd.wfc_list,
+            Probe::RatioArenaFault::NONZERO_LOG_IMAGINARY),
+        std::domain_error);
+#endif
+    const auto unchanged = Probe::crowdWorkspaceDiagnostics(crowd.leader,
+                                                             crowd.wfc_list);
+    checkPreparedResourceStorageUnchanged(unchanged, baseline);
+  }
+}
+
 TEST_CASE("PsiFormer planned resource copies require clear and support replanning",
           "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
 {
@@ -3969,12 +4276,6 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
     const std::vector<Value> ratios_before = ratios;
     Value* const ratios_data = ratios.data();
     const std::size_t ratios_capacity = ratios.capacity();
-    expect_guard("mw_calcRatio", [&]() {
-      crowd.leader.mw_calcRatio(crowd.wfc_list, *crowd.p_list, 0, ratios);
-    });
-    CHECK(ratios.data() == ratios_data);
-    CHECK(ratios.capacity() == ratios_capacity);
-    CHECK(sameVectorBits(ratios, ratios_before));
 
     std::vector<PsiFormerWF::GradType> gradients(walker_count);
     for (std::size_t lane = 0; lane < walker_count; ++lane)
@@ -3985,17 +4286,6 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
     const std::vector<PsiFormerWF::GradType> gradients_before = gradients;
     PsiFormerWF::GradType* const gradients_data = gradients.data();
     const std::size_t gradients_capacity = gradients.capacity();
-    expect_guard("mw_ratioGrad", [&]() {
-      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list, 0, ratios,
-                                gradients);
-    });
-    CHECK(ratios.data() == ratios_data);
-    CHECK(ratios.capacity() == ratios_capacity);
-    CHECK(sameVectorBits(ratios, ratios_before));
-    CHECK(gradients.data() == gradients_data);
-    CHECK(gradients.capacity() == gradients_capacity);
-    CHECK(sameVectorBits(gradients, gradients_before));
-
     std::vector<PsiFormerWF::ComplexType> spin_gradients{
         PsiFormerWF::ComplexType(1.25, -0.5),
         PsiFormerWF::ComplexType(-2.5, 0.75)};
@@ -4040,14 +4330,6 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
         empty_gradients.data();
     PsiFormerWF::ComplexType* const empty_spin_gradients_data =
         empty_spin_gradients.data();
-    expect_guard("mw_calcRatio", [&]() {
-      crowd.leader.mw_calcRatio(crowd.wfc_list, *crowd.p_list, 0,
-                                empty_ratios);
-    });
-    expect_guard("mw_ratioGrad", [&]() {
-      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list, 0,
-                                empty_ratios, empty_gradients);
-    });
     expect_guard("mw_evalGradWithSpin", [&]() {
       crowd.leader.mw_evalGradWithSpin(
           crowd.wfc_list, *crowd.p_list, 0, empty_gradients,
@@ -4065,63 +4347,6 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
     CHECK(empty_spin_gradients.empty());
     CHECK(empty_spin_gradients.data() == empty_spin_gradients_data);
 
-    // A literal zero-lane crowd must encounter the hard-plan guard before the
-    // inherited empty-list clear/return paths can touch seeded destinations.
-    RefVectorWithLeader<WaveFunctionComponent> empty_wfc_list(crowd.leader);
-    RefVectorWithLeader<ParticleSet> empty_p_list(*crowd.walkers.front());
-    std::vector<Value> empty_crowd_ratios{
-        makeWeight(37.0, -1.5), makeWeight(-43.0, 2.5)};
-    std::vector<PsiFormerWF::GradType> empty_crowd_gradients(walker_count);
-    for (std::size_t lane = 0; lane < walker_count; ++lane)
-      for (std::size_t dimension = 0; dimension < 3; ++dimension)
-        empty_crowd_gradients[lane][dimension] = makeWeight(
-            53.0 + static_cast<double>(lane + dimension),
-            -29.0 - static_cast<double>(3 * lane + dimension));
-    const std::vector<Value> empty_crowd_ratios_before =
-        empty_crowd_ratios;
-    const std::vector<PsiFormerWF::GradType> empty_crowd_gradients_before =
-        empty_crowd_gradients;
-    Value* const empty_crowd_ratios_data = empty_crowd_ratios.data();
-    PsiFormerWF::GradType* const empty_crowd_gradients_data =
-        empty_crowd_gradients.data();
-    const std::size_t empty_crowd_ratios_capacity =
-        empty_crowd_ratios.capacity();
-    const std::size_t empty_crowd_gradients_capacity =
-        empty_crowd_gradients.capacity();
-    expect_guard("mw_calcRatio", [&]() {
-      crowd.leader.mw_calcRatio(
-          empty_wfc_list, empty_p_list, 0, empty_crowd_ratios);
-    });
-    expect_guard("mw_ratioGrad", [&]() {
-      crowd.leader.mw_ratioGrad(
-          empty_wfc_list, empty_p_list, 0, empty_crowd_ratios,
-          empty_crowd_gradients);
-    });
-    CHECK(empty_crowd_ratios.data() == empty_crowd_ratios_data);
-    CHECK(empty_crowd_ratios.capacity() == empty_crowd_ratios_capacity);
-    CHECK(sameVectorBits(empty_crowd_ratios,
-                         empty_crowd_ratios_before));
-    CHECK(empty_crowd_gradients.data() == empty_crowd_gradients_data);
-    CHECK(empty_crowd_gradients.capacity() ==
-          empty_crowd_gradients_capacity);
-    CHECK(sameVectorBits(empty_crowd_gradients,
-                         empty_crowd_gradients_before));
-
-    // A rejected legacy proposal would clear clone metadata if dispatch passed
-    // the guard. Keep it installed to make that mutation directly observable.
-    for (PsiFormerWF* component : crowd.components)
-      Probe::installSingleProposal(
-          *component, 0, Probe::ProposalOrigin::MW_CALC_RATIO_VALUE);
-    const std::vector<bool> rejected(walker_count, false);
-    expect_guard("mw_accept_rejectMove", [&]() {
-      crowd.leader.mw_accept_rejectMove(
-          crowd.wfc_list, *crowd.p_list, 0, rejected);
-    });
-    for (const PsiFormerWF* component : crowd.components)
-      CHECK(Probe::hasProposal(*component));
-    for (PsiFormerWF* component : crowd.components)
-      Probe::clearProposal(*component);
-
     expect_guard("mw_prepareGroup", [&]() {
       crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0);
     });
@@ -4130,6 +4355,949 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
     });
   }
 
+  CHECK(resource.getOutstandingLoanCount() == 0);
+}
+
+TEST_CASE("PsiFormer planned one-electron transactions match direct legacy",
+          "[wavefunction][psiformer][multiwalker][single_transaction]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  ScopedEnvironmentVariable value_backend("PSIFORMER_VALUE_BACKEND", "direct");
+  ScopedEnvironmentVariable spatial_backend("PSIFORMER_SPATIAL_BACKEND",
+                                             "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const std::size_t electron_count =
+      makeWalker(simulation_cell, 0)->getTotalNum();
+  REQUIRE(electron_count != 0);
+
+  for (const std::size_t walker_count : {std::size_t{1}, std::size_t{2}})
+  {
+    const std::vector<std::size_t> reserve_counts = walker_count == 1
+        ? std::vector<std::size_t>{2}
+        : std::vector<std::size_t>{2, 3};
+    for (const std::size_t reserve_walkers : reserve_counts)
+      for (const int active_electron :
+           {0, static_cast<int>(electron_count - 1)})
+        for (const bool use_ratio_gradient : {false, true})
+        {
+          DYNAMIC_SECTION("live " << walker_count << " of reserve "
+                                   << reserve_walkers << ", electron "
+                                   << active_electron << ", producer "
+                                   << (use_ratio_gradient ? "ratioGrad"
+                                                          : "calcRatio"))
+          {
+            Crowd planned(files, simulation_cell, walker_count, true, {0, 1});
+            Crowd legacy(files, simulation_cell, walker_count, true, {0, 1});
+            enableCrowdPreparationTestAccounting(planned);
+
+            const BatchExecutionRequirements requirements =
+                makeCrowdPreparationRequirements(planned.leader);
+            const std::string participant_id =
+                "test/psiformer/planned-single-transaction-" +
+                std::to_string(reserve_walkers) + "-" +
+                std::to_string(active_electron) +
+                (use_ratio_gradient ? "-gradient" : "-value");
+            const auto plan = makeCrowdPreparationTestPlan(
+                planned.leader, requirements, {walker_count},
+                {reserve_walkers}, participant_id,
+                "planned-single-transaction-v1");
+            bindCrowdPreparationPlan(planned, plan, participant_id);
+            prepareCrowdPreparationClones(planned, plan, participant_id);
+
+            ResourceCollection planned_template(
+                "psiformer_planned_single_transaction_template");
+            planned.leader.createResource(planned_template);
+            ResourceCollection planned_resource(planned_template);
+            planned_resource.prepareBatchResources({plan, 0});
+            ResourceCollection legacy_template(
+                "psiformer_legacy_single_transaction_template");
+            legacy.leader.createResource(legacy_template);
+            ResourceCollection legacy_resource(legacy_template);
+
+            ResourceCollection planned_particle_resource(
+                "psiformer_planned_single_transaction_particles");
+            ResourceCollection legacy_particle_resource(
+                "psiformer_legacy_single_transaction_particles");
+            planned.walkers.front()->createResource(planned_particle_resource);
+            legacy.walkers.front()->createResource(legacy_particle_resource);
+            ResourceCollectionTeamLock<ParticleSet> planned_particle_lock(
+                planned_particle_resource, *planned.p_list);
+            ResourceCollectionTeamLock<ParticleSet> legacy_particle_lock(
+                legacy_particle_resource, *legacy.p_list);
+            ResourceCollectionTeamLock<WaveFunctionComponent> planned_lock(
+                planned_resource, planned.wfc_list);
+            ResourceCollectionTeamLock<WaveFunctionComponent> legacy_lock(
+                legacy_resource, legacy.wfc_list);
+
+            REQUIRE(active_electron >= 0);
+            REQUIRE(static_cast<std::size_t>(active_electron) < electron_count);
+
+            std::vector<ParticleSet::ParticleGradient> planned_full_g(
+                walker_count);
+            std::vector<ParticleSet::ParticleLaplacian> planned_full_l(
+                walker_count);
+            std::vector<ParticleSet::ParticleGradient> legacy_full_g(
+                walker_count);
+            std::vector<ParticleSet::ParticleLaplacian> legacy_full_l(
+                walker_count);
+            RefVector<ParticleSet::ParticleGradient> planned_full_g_list;
+            RefVector<ParticleSet::ParticleLaplacian> planned_full_l_list;
+            RefVector<ParticleSet::ParticleGradient> legacy_full_g_list;
+            RefVector<ParticleSet::ParticleLaplacian> legacy_full_l_list;
+            for (std::size_t lane = 0; lane < walker_count; ++lane)
+            {
+              planned_full_g[lane].resize(electron_count);
+              planned_full_l[lane].resize(electron_count);
+              legacy_full_g[lane].resize(electron_count);
+              legacy_full_l[lane].resize(electron_count);
+              planned_full_g_list.push_back(planned_full_g[lane]);
+              planned_full_l_list.push_back(planned_full_l[lane]);
+              legacy_full_g_list.push_back(legacy_full_g[lane]);
+              legacy_full_l_list.push_back(legacy_full_l[lane]);
+            }
+
+            const auto refresh_accepted = [&]() {
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                planned_full_g[lane] = Value(0);
+                planned_full_l[lane] = Value(0);
+                legacy_full_g[lane] = Value(0);
+                legacy_full_l[lane] = Value(0);
+              }
+              planned.leader.mw_evaluateLog(
+                  planned.wfc_list, *planned.p_list, planned_full_g_list,
+                  planned_full_l_list);
+              legacy.leader.mw_evaluateLog(
+                  legacy.wfc_list, *legacy.p_list, legacy_full_g_list,
+                  legacy_full_l_list);
+            };
+
+            std::vector<std::vector<bool>> acceptance_masks{
+                std::vector<bool>(walker_count, false),
+                std::vector<bool>(walker_count, true)};
+            if (walker_count > 1)
+            {
+              std::vector<bool> mixed(walker_count, false);
+              mixed.front() = true;
+              acceptance_masks.push_back(std::move(mixed));
+            }
+            std::size_t cycle = 0;
+            for (const std::vector<bool>& accepted : acceptance_masks)
+            {
+              CAPTURE(walker_count, reserve_walkers, active_electron,
+                      use_ratio_gradient,
+                      std::count(accepted.begin(), accepted.end(), true));
+              refresh_accepted();
+
+              std::vector<testing::PsiFormerCloneStateSnapshot> accepted_before;
+              for (const PsiFormerWF* component : planned.components)
+                accepted_before.push_back(Probe::cloneState(*component));
+
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                const double scale = static_cast<double>((cycle + 1) * (lane + 1));
+                const ParticleSet::SingleParticlePos displacement{
+                    0.004 * scale, -0.003 * scale, 0.002 * scale};
+                planned.walkers[lane]->makeMove(active_electron, displacement);
+                legacy.walkers[lane]->makeMove(active_electron, displacement);
+              }
+
+              std::vector<Value> planned_ratios(walker_count);
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+                planned_ratios[lane] = makeWeight(
+                    17.0 + 2.0 * static_cast<double>(lane),
+                    -0.5 + 0.25 * static_cast<double>(lane));
+              std::vector<Value> legacy_ratios = planned_ratios;
+              std::vector<PsiFormerWF::GradType> planned_gradients(walker_count);
+              std::vector<PsiFormerWF::GradType> legacy_gradients(walker_count);
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+                for (std::size_t dimension = 0; dimension < 3; ++dimension)
+                {
+                  const Value seed = makeWeight(
+                      0.21 + 0.07 * static_cast<double>(lane + dimension),
+                      -0.03 * static_cast<double>(lane + dimension + 1));
+                  planned_gradients[lane][dimension] = seed;
+                  legacy_gradients[lane][dimension] = seed;
+                }
+              Value* const ratio_data = planned_ratios.data();
+              const std::size_t ratio_capacity = planned_ratios.capacity();
+              PsiFormerWF::GradType* const gradient_data =
+                  planned_gradients.data();
+              const std::size_t gradient_capacity = planned_gradients.capacity();
+              const RuntimePreflightSnapshot producer_before =
+                  captureRuntimePreflightState(planned, planned_resource,
+                                               planned_ratios);
+
+              if (use_ratio_gradient)
+              {
+                legacy.leader.mw_ratioGrad(
+                    legacy.wfc_list, *legacy.p_list, active_electron,
+                    legacy_ratios, legacy_gradients);
+                planned.leader.mw_ratioGrad(
+                    planned.wfc_list, *planned.p_list, active_electron,
+                    planned_ratios, planned_gradients);
+              }
+              else
+              {
+                legacy.leader.mw_calcRatio(
+                    legacy.wfc_list, *legacy.p_list, active_electron,
+                    legacy_ratios);
+                planned.leader.mw_calcRatio(
+                    planned.wfc_list, *planned.p_list, active_electron,
+                    planned_ratios);
+              }
+
+              CHECK(planned_ratios.data() == ratio_data);
+              CHECK(planned_ratios.capacity() == ratio_capacity);
+              CHECK(planned_gradients.data() == gradient_data);
+              CHECK(planned_gradients.capacity() == gradient_capacity);
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                checkValue(planned_ratios[lane], legacy_ratios[lane]);
+                if (use_ratio_gradient)
+                  checkGrad(planned_gradients[lane], legacy_gradients[lane]);
+              }
+
+              RuntimePreflightSnapshot producer_expected = producer_before;
+              producer_expected.planned_single_transactions = 1;
+              producer_expected.caller_output = planned_ratios;
+              std::vector<testing::PsiFormerCloneStateSnapshot> proposed_state;
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                const auto proposal = Probe::cloneState(*planned.components[lane]);
+                proposed_state.push_back(proposal);
+                auto& expected = producer_expected.clones[lane];
+                expected.proposed_sign = proposal.proposed_sign;
+                expected.proposed_log_value = proposal.proposed_log_value;
+                expected.proposed_configuration_identity =
+                    proposal.proposed_configuration_identity;
+                expected.proposed_descriptor_fingerprint =
+                    proposal.proposed_descriptor_fingerprint;
+                expected.proposed_parameter_version =
+                    proposal.proposed_parameter_version;
+                expected.proposed_particle = proposal.proposed_particle;
+                expected.proposal_origin = proposal.proposal_origin;
+                expected.has_proposal = true;
+
+                CHECK(proposal.proposed_descriptor_fingerprint != 0);
+                CHECK(proposal.proposed_descriptor_fingerprint ==
+                      proposed_state.front().proposed_descriptor_fingerprint);
+                CHECK(proposal.proposed_parameter_version ==
+                      planned.leader.parameterVersion());
+                CHECK(proposal.proposed_particle == active_electron);
+                CHECK(Probe::proposalOrigin(*planned.components[lane]) ==
+                      (use_ratio_gradient
+                           ? Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE
+                           : Probe::ProposalOrigin::MW_CALC_RATIO_VALUE));
+                CHECK(proposal.proposed_configuration_identity !=
+                      accepted_before[lane].accepted_configuration_identity);
+              }
+              checkRuntimePreflightState(planned, planned_resource,
+                                         planned_ratios, producer_expected);
+              CHECK(Probe::plannedSingleTransactionCount(planned.leader) == 1);
+
+              const std::vector<PsiFormerWF::GradType>
+                  gradients_before_resolution = planned_gradients;
+              RuntimePreflightSnapshot resolution_expected =
+                  captureRuntimePreflightState(planned, planned_resource,
+                                               planned_ratios);
+              resolution_expected.planned_single_transactions = 0;
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                auto& expected = resolution_expected.clones[lane];
+                if (accepted[lane])
+                {
+                  expected.log_value = proposed_state[lane].proposed_log_value;
+                  expected.accepted_value_valid = true;
+                  expected.accepted_configuration_identity =
+                      proposed_state[lane].proposed_configuration_identity;
+                  expected.accepted_parameter_version =
+                      proposed_state[lane].proposed_parameter_version;
+                  expected.accepted_state_requirement =
+                      Probe::valueOnlyAcceptedStateRequirement();
+                  expected.current_sign = proposed_state[lane].proposed_sign;
+                }
+                expected.proposed_sign = 1.0;
+                expected.proposed_log_value = PsiFormerWF::LogValue(0);
+                expected.proposed_configuration_identity = 0;
+                expected.proposed_descriptor_fingerprint = 0;
+                expected.proposed_parameter_version = 0;
+                expected.proposed_particle = -1;
+                expected.proposal_origin = 0;
+                expected.has_proposal = false;
+              }
+
+              planned.leader.mw_accept_rejectMove(
+                  planned.wfc_list, *planned.p_list, active_electron, accepted,
+                  true);
+              legacy.leader.mw_accept_rejectMove(
+                  legacy.wfc_list, *legacy.p_list, active_electron, accepted,
+                  true);
+              checkRuntimePreflightState(planned, planned_resource,
+                                         planned_ratios, resolution_expected);
+              CHECK(Probe::plannedSingleTransactionCount(planned.leader) == 0);
+              CHECK(sameVectorBits(planned_gradients,
+                                   gradients_before_resolution));
+
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                const auto planned_state = Probe::cloneState(*planned.components[lane]);
+                const auto legacy_state = Probe::cloneState(*legacy.components[lane]);
+                CHECK(planned_state.current_sign == legacy_state.current_sign);
+                checkLog(planned_state.log_value, legacy_state.log_value);
+                CHECK(planned_state.accepted_configuration_identity ==
+                      legacy_state.accepted_configuration_identity);
+                CHECK(planned_state.accepted_parameter_version ==
+                      legacy_state.accepted_parameter_version);
+                CHECK(planned_state.accepted_state_requirement ==
+                      legacy_state.accepted_state_requirement);
+                CHECK_FALSE(planned_state.has_proposal);
+                if (!accepted[lane])
+                  CHECK(sameCloneStateBits(planned_state,
+                                           resolution_expected.clones[lane]));
+              }
+
+              // The component resolver deliberately leaves coordinate ownership
+              // to ParticleSet; this handoff makes the promoted configuration live.
+              ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+                  *planned.p_list, active_electron, accepted);
+              ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+                  *legacy.p_list, active_electron, accepted);
+              for (std::size_t lane = 0; lane < walker_count; ++lane)
+              {
+                CHECK(sameVectorBits(planned.walkers[lane]->R,
+                                     legacy.walkers[lane]->R));
+                CHECK(planned.walkers[lane]->getActivePtcl() == -1);
+                if (accepted[lane])
+                  CHECK(Probe::hasCurrentValueOnlyAcceptedState(
+                      *planned.components[lane], *planned.walkers[lane]));
+                else
+                  CHECK(Probe::hasCurrentFullAcceptedState(
+                      *planned.components[lane], *planned.walkers[lane]));
+              }
+              ++cycle;
+            }
+          }
+        }
+  }
+}
+
+TEST_CASE("PsiFormer planned one-electron failures retain exact recovery evidence",
+          "[wavefunction][psiformer][multiwalker][single_transaction][atomic]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  ScopedEnvironmentVariable value_backend("PSIFORMER_VALUE_BACKEND", "direct");
+  ScopedEnvironmentVariable spatial_backend("PSIFORMER_SPATIAL_BACKEND",
+                                             "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  constexpr std::size_t reserve_walkers = 3;
+  Crowd crowd(files, simulation_cell, walker_count, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id =
+      "test/psiformer/planned-single-transaction-atomic";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {walker_count}, {reserve_walkers},
+      participant_id, "planned-single-transaction-atomic-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+  ResourceCollection wf_template(
+      "psiformer_planned_single_transaction_atomic_template");
+  crowd.leader.createResource(wf_template);
+  ResourceCollection wf_resource(wf_template);
+  wf_resource.prepareBatchResources({plan, 0});
+  ResourceCollection particle_resource(
+      "psiformer_planned_single_transaction_atomic_particles");
+  crowd.walkers.front()->createResource(particle_resource);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(particle_resource,
+                                                         *crowd.p_list);
+  ResourceCollectionTeamLock<WaveFunctionComponent> wf_lock(wf_resource,
+                                                             crowd.wfc_list);
+
+  const std::size_t electron_count = crowd.walkers.front()->getTotalNum();
+  std::vector<ParticleSet::ParticleGradient> full_gradients(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> full_laplacians(walker_count);
+  RefVector<ParticleSet::ParticleGradient> full_gradient_list;
+  RefVector<ParticleSet::ParticleLaplacian> full_laplacian_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    full_gradients[lane].resize(electron_count);
+    full_laplacians[lane].resize(electron_count);
+    full_gradient_list.push_back(full_gradients[lane]);
+    full_laplacian_list.push_back(full_laplacians[lane]);
+  }
+  const auto refresh_accepted = [&]() {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      full_gradients[lane] = Value(0);
+      full_laplacians[lane] = Value(0);
+    }
+    crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                                full_gradient_list, full_laplacian_list);
+  };
+  const auto make_moves = [&](int active_electron, double scale) {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      const double lane_scale = scale * static_cast<double>(lane + 1);
+      crowd.walkers[lane]->makeMove(
+          active_electron,
+          ParticleSet::SingleParticlePos{0.005 * lane_scale,
+                                         -0.004 * lane_scale,
+                                         0.003 * lane_scale});
+    }
+  };
+  const auto seed_gradients = [&]() {
+    std::vector<PsiFormerWF::GradType> gradients(walker_count);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        gradients[lane][dimension] = makeWeight(
+            0.17 + 0.05 * static_cast<double>(lane + dimension),
+            -0.02 * static_cast<double>(lane + dimension + 1));
+    return gradients;
+  };
+  const auto clear_expected_proposals = [](RuntimePreflightSnapshot& expected) {
+    expected.planned_single_transactions = 0;
+    for (auto& clone : expected.clones)
+    {
+      clone.proposed_sign = 1.0;
+      clone.proposed_log_value = PsiFormerWF::LogValue(0);
+      clone.proposed_configuration_identity = 0;
+      clone.proposed_descriptor_fingerprint = 0;
+      clone.proposed_parameter_version = 0;
+      clone.proposed_particle = -1;
+      clone.proposal_origin = 0;
+      clone.has_proposal = false;
+    }
+  };
+
+  // Exercise the final pre-publication failure seams in mw_ratioGrad and
+  // mw_accept_rejectMove, then prove that the active move is reusable.
+  refresh_accepted();
+  constexpr int late_failure_electron = 1;
+  make_moves(late_failure_electron, 1.0);
+  std::vector<Value> ratios{makeWeight(31.0, -0.25),
+                            makeWeight(-37.0, 0.5)};
+  std::vector<PsiFormerWF::GradType> gradients = seed_gradients();
+  const std::vector<PsiFormerWF::GradType> gradients_before_failure = gradients;
+  const RuntimePreflightSnapshot producer_before =
+      captureRuntimePreflightState(crowd, wf_resource, ratios);
+  Probe::injectPlannedSinglePrepublicationFailure(crowd.leader, true);
+  CHECK_THROWS_WITH(
+      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list,
+                                late_failure_electron, ratios, gradients),
+      Catch::Matchers::ContainsSubstring(
+          "single-particle pre-publication failure"));
+  checkRuntimePreflightState(crowd, wf_resource, ratios, producer_before);
+  CHECK(sameVectorBits(gradients, gradients_before_failure));
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+  Probe::injectPlannedSinglePrepublicationFailure(crowd.leader, false);
+  crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list,
+                            late_failure_electron, ratios, gradients);
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+
+  // A registered proposal is accepted only as one exact crowd transaction.
+  // Corrupt one provenance field at a time, prove rejection is nonmutating,
+  // then restore the precise proposal before exercising the next field.
+  const RuntimePreflightSnapshot pristine_proposal =
+      captureRuntimePreflightState(crowd, wf_resource, ratios);
+  const auto lane_one_proposal = Probe::cloneState(*crowd.components[1]);
+  const std::vector<PsiFormerWF::GradType> pristine_gradients = gradients;
+  const auto require_corruption_rejected = [&](auto&& corrupt,
+                                                auto&& restore) {
+    corrupt();
+    const RuntimePreflightSnapshot corrupted =
+        captureRuntimePreflightState(crowd, wf_resource, ratios);
+    CHECK_THROWS_AS(crowd.leader.mw_accept_rejectMove(
+                        crowd.wfc_list, *crowd.p_list,
+                        late_failure_electron, {false, false}, true),
+                    std::logic_error);
+    checkRuntimePreflightState(crowd, wf_resource, ratios, corrupted);
+    CHECK(sameVectorBits(gradients, pristine_gradients));
+    restore();
+    checkRuntimePreflightState(crowd, wf_resource, ratios,
+                               pristine_proposal);
+  };
+  require_corruption_rejected(
+      [&]() {
+        Probe::setProposalOrigin(
+            *crowd.components[1],
+            Probe::ProposalOrigin::MW_CALC_RATIO_VALUE);
+      },
+      [&]() {
+        Probe::setProposalOrigin(
+            *crowd.components[1],
+            Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE);
+      });
+  require_corruption_rejected(
+      [&]() {
+        Probe::setProposalOrigin(*crowd.components[1],
+                                 Probe::ProposalOrigin::NONE);
+      },
+      [&]() {
+        Probe::setProposalOrigin(
+            *crowd.components[1],
+            Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE);
+      });
+  require_corruption_rejected(
+      [&]() {
+        Probe::setProposalParticle(*crowd.components[1],
+                                   late_failure_electron + 1);
+      },
+      [&]() {
+        Probe::setProposalParticle(*crowd.components[1],
+                                   lane_one_proposal.proposed_particle);
+      });
+  require_corruption_rejected(
+      [&]() {
+        Probe::setProposalParameterVersion(
+            *crowd.components[1],
+            lane_one_proposal.proposed_parameter_version + 1);
+      },
+      [&]() {
+        Probe::setProposalParameterVersion(
+            *crowd.components[1],
+            lane_one_proposal.proposed_parameter_version);
+      });
+  std::uint64_t corrupt_fingerprint =
+      lane_one_proposal.proposed_descriptor_fingerprint ^
+      UINT64_C(0xd6e8feb86659fd93);
+  if (corrupt_fingerprint == 0)
+    corrupt_fingerprint = 1;
+  require_corruption_rejected(
+      [&]() {
+        Probe::setProposalFingerprint(*crowd.components[1],
+                                      corrupt_fingerprint);
+      },
+      [&]() {
+        Probe::setProposalFingerprint(
+            *crowd.components[1],
+            lane_one_proposal.proposed_descriptor_fingerprint);
+      });
+  std::uint64_t corrupt_configuration =
+      lane_one_proposal.proposed_configuration_identity ^
+      UINT64_C(0xa0761d6478bd642f);
+  if (corrupt_configuration == 0)
+    corrupt_configuration = 1;
+  require_corruption_rejected(
+      [&]() {
+        Probe::setProposedConfigurationIdentity(*crowd.components[1],
+                                                corrupt_configuration);
+      },
+      [&]() {
+        Probe::setProposedConfigurationIdentity(
+            *crowd.components[1],
+            lane_one_proposal.proposed_configuration_identity);
+      });
+  require_corruption_rejected(
+      [&]() { Probe::setProposalMarker(*crowd.components[1], false); },
+      [&]() { Probe::setProposalMarker(*crowd.components[1], true); });
+  require_corruption_rejected(
+      [&]() { Probe::unregisterPlannedSingleTransaction(crowd.leader); },
+      [&]() {
+        REQUIRE(Probe::registerPlannedSingleTransaction(crowd.leader));
+      });
+
+  const std::vector<PsiFormerWF::GradType> gradients_before_resolution =
+      gradients;
+  const RuntimePreflightSnapshot resolver_before =
+      captureRuntimePreflightState(crowd, wf_resource, ratios);
+  Probe::injectPlannedSingleResolutionPrepublicationFailure(crowd.leader, true);
+  CHECK_THROWS_WITH(
+      crowd.leader.mw_accept_rejectMove(crowd.wfc_list, *crowd.p_list,
+                                        late_failure_electron, {true, false},
+                                        true),
+      Catch::Matchers::ContainsSubstring(
+          "single-particle resolution pre-publication failure"));
+  checkRuntimePreflightState(crowd, wf_resource, ratios, resolver_before);
+  CHECK(sameVectorBits(gradients, gradients_before_resolution));
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+  Probe::injectPlannedSingleResolutionPrepublicationFailure(crowd.leader,
+                                                             false);
+  crowd.leader.mw_accept_rejectMove(crowd.wfc_list, *crowd.p_list,
+                                    late_failure_electron, {true, false}, true);
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+  ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+      *crowd.p_list, late_failure_electron, {true, false});
+
+  // A non-finite additive seed is rejected before evaluation or registration.
+  refresh_accepted();
+  constexpr int nonfinite_electron = 0;
+  make_moves(nonfinite_electron, 1.5);
+  ratios = {makeWeight(41.0, -0.5), makeWeight(-43.0, 0.75)};
+  gradients = seed_gradients();
+  gradients.front()[1] =
+      makeWeight(std::numeric_limits<double>::infinity(), 0.0);
+  const std::vector<PsiFormerWF::GradType> nonfinite_gradients = gradients;
+  const RuntimePreflightSnapshot nonfinite_before =
+      captureRuntimePreflightState(crowd, wf_resource, ratios);
+  CHECK_THROWS_WITH(
+      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list,
+                                nonfinite_electron, ratios, gradients),
+      Catch::Matchers::ContainsSubstring("gradient seed is non-finite"));
+  checkRuntimePreflightState(crowd, wf_resource, ratios, nonfinite_before);
+  CHECK(sameVectorBits(gradients, nonfinite_gradients));
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+  ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+      *crowd.p_list, nonfinite_electron, {false, false});
+
+  // Exercise the prospective finite-plus-finite check through the public
+  // planned path.  The friend-only seam substitutes the largest finite direct
+  // contribution; the equally finite seed must overflow before registration.
+  refresh_accepted();
+  constexpr int overflow_electron = 0;
+  make_moves(overflow_electron, 1.75);
+  ratios = {makeWeight(43.0, -0.5), makeWeight(-47.0, 0.75)};
+  gradients.assign(walker_count, PsiFormerWF::GradType(Value(0)));
+  gradients.front()[0] = makeWeight(
+      std::numeric_limits<ParticleSet::RealType>::max(), 0.0);
+  const std::vector<PsiFormerWF::GradType> overflow_gradients = gradients;
+  const RuntimePreflightSnapshot overflow_before =
+      captureRuntimePreflightState(crowd, wf_resource, ratios);
+  Probe::forcePlannedRatioGradientOverflow(crowd.leader, true);
+  CHECK_THROWS_WITH(
+      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list,
+                                overflow_electron, ratios, gradients),
+      Catch::Matchers::ContainsSubstring("gradient sum is non-finite"));
+  Probe::forcePlannedRatioGradientOverflow(crowd.leader, false);
+  checkRuntimePreflightState(crowd, wf_resource, ratios, overflow_before);
+  CHECK(sameVectorBits(gradients, overflow_gradients));
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+  ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+      *crowd.p_list, overflow_electron, {false, false});
+
+  // Each producer retains complete evidence across model-version drift, rejects
+  // wrong cancellation provenance, and supports exact cancellation plus retry.
+  for (const bool use_ratio_gradient : {false, true})
+  {
+    CAPTURE(use_ratio_gradient);
+    refresh_accepted();
+    const int active_electron = use_ratio_gradient
+        ? static_cast<int>(electron_count - 1)
+        : 0;
+    make_moves(active_electron, use_ratio_gradient ? 2.5 : 2.0);
+    ratios = {makeWeight(47.0, -0.25), makeWeight(-53.0, 0.5)};
+    gradients = seed_gradients();
+    if (use_ratio_gradient)
+      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list,
+                                active_electron, ratios, gradients);
+    else
+      crowd.leader.mw_calcRatio(crowd.wfc_list, *crowd.p_list,
+                                active_electron, ratios);
+    CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+
+    const auto evidence = Probe::cloneState(crowd.leader);
+    const auto origin = use_ratio_gradient
+        ? Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE
+        : Probe::ProposalOrigin::MW_CALC_RATIO_VALUE;
+    const auto wrong_origin = use_ratio_gradient
+        ? Probe::ProposalOrigin::MW_CALC_RATIO_VALUE
+        : Probe::ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE;
+    REQUIRE(evidence.proposed_descriptor_fingerprint != 0);
+    const std::size_t proposal_version = evidence.proposed_parameter_version;
+    const std::uint64_t transaction_fingerprint =
+        evidence.proposed_descriptor_fingerprint;
+    const auto lane_one_evidence = Probe::cloneState(*crowd.components[1]);
+    const std::size_t drifted_version = Probe::advanceParameterVersion(crowd.leader);
+    REQUIRE(drifted_version == proposal_version + 1);
+
+    const auto require_failure_atomic = [&](auto&& invocation) {
+      const RuntimePreflightSnapshot before =
+          captureRuntimePreflightState(crowd, wf_resource, ratios);
+      const std::vector<PsiFormerWF::GradType> gradients_before = gradients;
+      invocation();
+      checkRuntimePreflightState(crowd, wf_resource, ratios, before);
+      CHECK(sameVectorBits(gradients, gradients_before));
+      CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+    };
+
+    require_failure_atomic([&]() {
+      CHECK_THROWS_AS(crowd.leader.mw_accept_rejectMove(
+                          crowd.wfc_list, *crowd.p_list, active_electron,
+                          {false, false}, true),
+                      std::logic_error);
+    });
+    require_failure_atomic([&]() {
+      CHECK_THROWS_AS(Probe::cancelPlannedSingleProposal(
+                          crowd.leader, crowd.wfc_list, *crowd.p_list,
+                          active_electron, wrong_origin, proposal_version,
+                          transaction_fingerprint),
+                      std::logic_error);
+    });
+    require_failure_atomic([&]() {
+      CHECK_THROWS_AS(Probe::cancelPlannedSingleProposal(
+                          crowd.leader, crowd.wfc_list, *crowd.p_list,
+                          active_electron, origin, drifted_version,
+                          transaction_fingerprint),
+                      std::logic_error);
+    });
+    const std::size_t wrong_electron =
+        (static_cast<std::size_t>(active_electron) + 1) % electron_count;
+    require_failure_atomic([&]() {
+      CHECK_THROWS(Probe::cancelPlannedSingleProposal(
+          crowd.leader, crowd.wfc_list, *crowd.p_list, wrong_electron, origin,
+          proposal_version, transaction_fingerprint));
+    });
+
+    RefVectorWithLeader<WaveFunctionComponent> reordered_components(
+        *crowd.components[1]);
+    reordered_components.push_back(*crowd.components[1]);
+    reordered_components.push_back(*crowd.components[0]);
+    RefVectorWithLeader<ParticleSet> reordered_particles(*crowd.walkers[1]);
+    reordered_particles.push_back(*crowd.walkers[1]);
+    reordered_particles.push_back(*crowd.walkers[0]);
+    require_failure_atomic([&]() {
+      CHECK_THROWS(Probe::cancelPlannedSingleProposal(
+          crowd.leader, reordered_components, reordered_particles,
+          active_electron, origin, proposal_version,
+          transaction_fingerprint));
+    });
+
+    std::uint64_t wrong_configuration =
+        lane_one_evidence.proposed_configuration_identity ^
+        UINT64_C(0xe7037ed1a0b428db);
+    if (wrong_configuration == 0)
+      wrong_configuration = 1;
+    require_failure_atomic([&]() {
+      Probe::setProposedConfigurationIdentity(*crowd.components[1],
+                                              wrong_configuration);
+      CHECK_THROWS_AS(Probe::cancelPlannedSingleProposal(
+                          crowd.leader, crowd.wfc_list, *crowd.p_list,
+                          active_electron, origin, proposal_version,
+                          transaction_fingerprint),
+                      std::logic_error);
+      Probe::setProposedConfigurationIdentity(
+          *crowd.components[1],
+          lane_one_evidence.proposed_configuration_identity);
+    });
+    require_failure_atomic([&]() {
+      Probe::bindParticleSet(*crowd.components[1], *crowd.walkers[0]);
+      CHECK_THROWS(Probe::cancelPlannedSingleProposal(
+          crowd.leader, crowd.wfc_list, *crowd.p_list, active_electron, origin,
+          proposal_version, transaction_fingerprint));
+      Probe::bindParticleSet(*crowd.components[1], *crowd.walkers[1]);
+    });
+    require_failure_atomic([&]() {
+      Probe::useBatchExecutionPlan(*crowd.components[1], nullptr);
+      CHECK_THROWS(Probe::cancelPlannedSingleProposal(
+          crowd.leader, crowd.wfc_list, *crowd.p_list, active_electron, origin,
+          proposal_version, transaction_fingerprint));
+      Probe::useBatchExecutionPlan(*crowd.components[1], &crowd.leader);
+    });
+    require_failure_atomic([&]() {
+      const std::size_t cursor =
+          Probe::acquiredResourceCursor(crowd.leader);
+      Probe::setAcquiredResourceCursor(crowd.leader, 0);
+      CHECK_THROWS(Probe::cancelPlannedSingleProposal(
+          crowd.leader, crowd.wfc_list, *crowd.p_list, active_electron, origin,
+          proposal_version, transaction_fingerprint));
+      Probe::setAcquiredResourceCursor(crowd.leader, cursor);
+    });
+    require_failure_atomic([&]() {
+      Probe::unregisterPlannedSingleTransaction(crowd.leader);
+      CHECK_THROWS_AS(Probe::cancelPlannedSingleProposal(
+                          crowd.leader, crowd.wfc_list, *crowd.p_list,
+                          active_electron, origin, proposal_version,
+                          transaction_fingerprint),
+                      std::logic_error);
+      REQUIRE(Probe::registerPlannedSingleTransaction(crowd.leader));
+    });
+    std::uint64_t wrong_fingerprint = transaction_fingerprint ^
+        UINT64_C(0x9e3779b97f4a7c15);
+    if (wrong_fingerprint == 0)
+      wrong_fingerprint = 1;
+    require_failure_atomic([&]() {
+      CHECK_THROWS_AS(Probe::cancelPlannedSingleProposal(
+                          crowd.leader, crowd.wfc_list, *crowd.p_list,
+                          active_electron, origin, proposal_version,
+                          wrong_fingerprint),
+                      std::logic_error);
+    });
+
+    Probe::injectPlannedSingleCancellationPrepublicationFailure(crowd.leader,
+                                                                 true);
+    require_failure_atomic([&]() {
+      CHECK_THROWS_WITH(
+          Probe::cancelPlannedSingleProposal(
+              crowd.leader, crowd.wfc_list, *crowd.p_list, active_electron,
+              origin, proposal_version, transaction_fingerprint),
+          Catch::Matchers::ContainsSubstring(
+              "single-particle cancellation failure"));
+    });
+    Probe::injectPlannedSingleCancellationPrepublicationFailure(crowd.leader,
+                                                                 false);
+
+    RuntimePreflightSnapshot cancellation_expected =
+        captureRuntimePreflightState(crowd, wf_resource, ratios);
+    clear_expected_proposals(cancellation_expected);
+    Probe::cancelPlannedSingleProposal(
+        crowd.leader, crowd.wfc_list, *crowd.p_list, active_electron, origin,
+        proposal_version, transaction_fingerprint);
+    checkRuntimePreflightState(crowd, wf_resource, ratios,
+                               cancellation_expected);
+    CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+    ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+        *crowd.p_list, active_electron, {false, false});
+
+    // Refresh at the new parameter version, then prove that the canceled route
+    // can immediately produce, resolve, and install another proposal.
+    refresh_accepted();
+    make_moves(active_electron, use_ratio_gradient ? 3.5 : 3.0);
+    ratios = {Value(0), Value(0)};
+    gradients = seed_gradients();
+    if (use_ratio_gradient)
+      crowd.leader.mw_ratioGrad(crowd.wfc_list, *crowd.p_list,
+                                active_electron, ratios, gradients);
+    else
+      crowd.leader.mw_calcRatio(crowd.wfc_list, *crowd.p_list,
+                                active_electron, ratios);
+    CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+    crowd.leader.mw_accept_rejectMove(crowd.wfc_list, *crowd.p_list,
+                                      active_electron, {true, true}, true);
+    CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+    ParticleSet::mw_accept_rejectMove<CoordsType::POS>(
+        *crowd.p_list, active_electron, {true, true});
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+      CHECK(Probe::hasCurrentValueOnlyAcceptedState(
+          *crowd.components[lane], *crowd.walkers[lane]));
+  }
+}
+
+TEST_CASE("PsiFormer pending one-electron transactions guard model and resource lifetime",
+          "[wavefunction][psiformer][multiwalker][single_transaction][lifecycle]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  ScopedEnvironmentVariable value_backend("PSIFORMER_VALUE_BACKEND", "direct");
+  ScopedEnvironmentVariable spatial_backend("PSIFORMER_SPATIAL_BACKEND",
+                                             "direct");
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  constexpr int active_electron = 1;
+  Crowd crowd(files, simulation_cell, walker_count, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(crowd.leader);
+  const std::string participant_id =
+      "test/psiformer/planned-single-transaction-lifecycle";
+  const auto plan = makeCrowdPreparationTestPlan(
+      crowd.leader, requirements, {walker_count}, {3}, participant_id,
+      "planned-single-transaction-lifecycle-v1");
+  bindCrowdPreparationPlan(crowd, plan, participant_id);
+  prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+  ResourceCollection resource_template(
+      "psiformer_planned_single_transaction_lifecycle_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  resource.rewind();
+  crowd.leader.acquireResource(resource, crowd.wfc_list);
+  REQUIRE(resource.getOutstandingLoanCount() == 1);
+
+  const std::size_t electron_count = crowd.walkers.front()->getTotalNum();
+  std::vector<ParticleSet::ParticleGradient> full_gradients(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> full_laplacians(walker_count);
+  RefVector<ParticleSet::ParticleGradient> full_gradient_list;
+  RefVector<ParticleSet::ParticleLaplacian> full_laplacian_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    full_gradients[lane].resize(electron_count);
+    full_laplacians[lane].resize(electron_count);
+    full_gradients[lane] = Value(0);
+    full_laplacians[lane] = Value(0);
+    full_gradient_list.push_back(full_gradients[lane]);
+    full_laplacian_list.push_back(full_laplacians[lane]);
+  }
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              full_gradient_list, full_laplacian_list);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    crowd.walkers[lane]->makeMove(
+        active_electron,
+        ParticleSet::SingleParticlePos{0.004 * static_cast<double>(lane + 1),
+                                       -0.003 * static_cast<double>(lane + 1),
+                                       0.002 * static_cast<double>(lane + 1)});
+
+  std::vector<Value> ratios(walker_count, Value(0));
+  crowd.leader.mw_calcRatio(crowd.wfc_list, *crowd.p_list,
+                            active_electron, ratios);
+  REQUIRE(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+  const auto proposal = Probe::cloneState(crowd.leader);
+  REQUIRE(proposal.proposed_descriptor_fingerprint != 0);
+
+  wftrain::StructuredParameterSnapshot candidate =
+      crowd.leader.snapshotParameters();
+  const std::size_t proposal_version = candidate.version;
+  const std::vector<double> parameters_before = candidate.values;
+  candidate.values.front() += 1.0e-4;
+  std::unique_ptr<WaveFunctionComponent> detached_storage =
+      crowd.leader.makeClone(*crowd.walkers.front());
+  auto& detached = static_cast<PsiFormerWF&>(*detached_storage);
+  REQUIRE_FALSE(Probe::hasProposal(detached));
+
+  const auto require_mutation_guard = [&](auto&& invocation) {
+    const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+        crowd, resource, ratios);
+    invocation();
+    checkRuntimePreflightState(crowd, resource, ratios, before);
+    CHECK(crowd.leader.snapshotParameters().values == parameters_before);
+    CHECK(crowd.leader.parameterVersion() == proposal_version);
+    CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+  };
+  require_mutation_guard([&]() {
+    CHECK_THROWS_AS(detached.publishParameters(candidate, proposal_version),
+                    std::logic_error);
+  });
+  OptVariables active;
+  require_mutation_guard([&]() {
+    CHECK_THROWS_AS(detached.resetParametersExclusive(active),
+                    std::logic_error);
+  });
+  hdf_archive unread_archive;
+  require_mutation_guard([&]() {
+    CHECK_THROWS_AS(detached.readVariationalParameters(unread_archive),
+                    std::logic_error);
+  });
+
+  // Failed takeback leaves both the exact loan and transaction retryable.
+  resource.rewind(0);
+  const RuntimePreflightSnapshot release_before =
+      captureRuntimePreflightState(crowd, resource, ratios);
+  CHECK_THROWS_AS(crowd.leader.releaseResource(resource, crowd.wfc_list),
+                  std::logic_error);
+  checkRuntimePreflightState(crowd, resource, ratios, release_before);
+  CHECK(resource.getCursor() == 0);
+  CHECK(resource.getOutstandingLoanCount() == 1);
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+  resource.rewind(1);
+
+  Probe::cancelPlannedSingleProposal(
+      crowd.leader, crowd.wfc_list, *crowd.p_list, active_electron,
+      Probe::ProposalOrigin::MW_CALC_RATIO_VALUE, proposal_version,
+      proposal.proposed_descriptor_fingerprint);
+  CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 0);
+  for (auto& walker : crowd.walkers)
+    walker->rejectMove(active_electron);
+
+  // The same model-wide clone can publish once the exact transaction is gone,
+  // and the formerly blocked resource can be returned and acquired again.
+  CHECK(detached.publishParameters(candidate, proposal_version) ==
+        proposal_version + 1);
+  resource.rewind(0);
+  crowd.leader.releaseResource(resource, crowd.wfc_list);
+  CHECK(resource.getCursor() == 1);
+  CHECK(resource.getOutstandingLoanCount() == 0);
+  resource.rewind(0);
+  crowd.leader.acquireResource(resource, crowd.wfc_list);
+  CHECK(resource.getOutstandingLoanCount() == 1);
+  resource.rewind(0);
+  crowd.leader.releaseResource(resource, crowd.wfc_list);
   CHECK(resource.getOutstandingLoanCount() == 0);
 }
 
@@ -5259,6 +6427,7 @@ TEST_CASE("PsiFormer planned selected resolution commits whole-crowd masks",
   std::vector<Value> caller_sentinel{Value(7), Value(-9)};
   RuntimePreflightSnapshot expected = captureRuntimePreflightState(
       crowd, wf_resource, caller_sentinel);
+  expected.planned_selected_transactions = 0;
   for (std::size_t lane = 0; lane < walker_count; ++lane)
   {
     auto& clone = expected.clones[lane];
@@ -5482,6 +6651,7 @@ TEST_CASE("PsiFormer planned selected resolution failures retain cancellation ev
 
   RuntimePreflightSnapshot expected_after_cancel =
       captureRuntimePreflightState(crowd, wf_resource, caller_sentinel);
+  expected_after_cancel.planned_selected_transactions = 0;
   for (auto& clone : expected_after_cancel.clones)
   {
     clone.proposed_sign = 1.0;
