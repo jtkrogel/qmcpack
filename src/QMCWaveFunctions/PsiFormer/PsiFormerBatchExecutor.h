@@ -512,6 +512,68 @@ public:
   std::size_t referenceCount() const noexcept { return active_reference_count_; }
   std::size_t replacementCount() const noexcept { return active_replacement_count_; }
 
+  /** Prove that a value view is the exact result owned by this live request.
+   * This allocation-free check rejects stale, foreign, differently packed, or
+   * structurally malformed views before a caller publishes their contents.
+   */
+  bool ownsValueResult(const DirectBatchValueResultView& result,
+                       DirectBatchValueInput expected_input,
+                       std::size_t expected_size) const noexcept
+  {
+    if (!bound_capacity_plan_)
+      return false;
+
+    const auto safe_sum = [](std::size_t left, std::size_t right,
+                             std::size_t& result) noexcept {
+      if (left > std::numeric_limits<std::size_t>::max() - right)
+        return false;
+      result = left + right;
+      return true;
+    };
+    std::size_t sparse_capacity = 0;
+    std::size_t active_sparse_size = 0;
+    if (!safe_sum(bound_capacity_plan_->logical.sparse_references,
+                  bound_capacity_plan_->logical.sparse_replacements,
+                  sparse_capacity) ||
+        !safe_sum(active_reference_count_, active_replacement_count_,
+                  active_sparse_size))
+      return false;
+
+    const std::size_t value_size = std::max(
+        {bound_capacity_plan_->logical.value_dense, sparse_capacity,
+         bound_capacity_plan_->logical.full_vgl,
+         bound_capacity_plan_->logical.active_gradient});
+    const bool input_extents_match =
+        expected_input == DirectBatchValueInput::DENSE_CONFIGURATIONS
+        ? active_reference_count_ == 0 && active_replacement_count_ == 0 &&
+            expected_size <= bound_capacity_plan_->logical.value_dense
+        : active_sparse_size == expected_size &&
+            active_reference_count_ <=
+                bound_capacity_plan_->logical.sparse_references &&
+            active_replacement_count_ <=
+                bound_capacity_plan_->logical.sparse_replacements;
+    const auto exact_size = [](const auto& values,
+                               std::size_t expected) noexcept {
+      return values.size() == expected && values.capacity() == expected;
+    };
+
+    return active_mode_ == DirectBatchMode::VALUE_ONLY &&
+        active_value_input_ == expected_input && input_extents_match &&
+        active_size_ == expected_size && result.size == expected_size &&
+        result.owner == this && successful_generation_ != 0 &&
+        result.generation == successful_generation_ &&
+        result.sign == sign_.data() && result.logabs == logabs_.data() &&
+        result.value == value_.data() &&
+        result.parameter_version == parameter_version_.data() &&
+        exact_size(sign_, value_size) && exact_size(logabs_, value_size) &&
+        exact_size(value_, value_size) &&
+        exact_size(parameter_version_, value_size) &&
+        exact_size(pending_sign_, value_size) &&
+        exact_size(pending_logabs_, value_size) &&
+        exact_size(pending_value_, value_size) &&
+        exact_size(pending_parameter_version_, value_size);
+  }
+
   /** Prove that a spatial view is the exact result owned by this live request.
    * This is intentionally allocation-free and nonthrowing so callers can reject
    * malformed or stale evaluator views before publishing any result.
@@ -572,8 +634,10 @@ public:
     };
     return active_mode_ == expected_mode &&
         active_value_input_ == DirectBatchValueInput::DENSE_CONFIGURATIONS &&
+        active_reference_count_ == 0 && active_replacement_count_ == 0 &&
         active_size_ == expected_size && result.size == expected_size &&
-        result.owner == this && result.generation == successful_generation_ &&
+        result.owner == this && successful_generation_ != 0 &&
+        result.generation == successful_generation_ &&
         result.mode == mode &&
         result.gradient_stride == expected_gradient_stride &&
         result.laplacian_stride == expected_laplacian_stride &&

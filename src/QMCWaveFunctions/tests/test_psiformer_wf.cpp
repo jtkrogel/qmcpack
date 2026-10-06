@@ -40,6 +40,42 @@ namespace qmcplusplus
 {
 namespace testing
 {
+/** Exact clone-local state used to prove that planned scalar guard failures
+ * precede any mutation of accepted or proposed PsiFormer state. */
+struct PsiFormerScalarStateSnapshot
+{
+  double current_sign;
+  PsiFormerWF::LogValue log_value;
+  bool restore_validation_pending;
+  bool accepted_value_valid;
+  std::uint64_t accepted_configuration_identity;
+  std::size_t accepted_parameter_version;
+  std::uint64_t accepted_state_requirement;
+  std::size_t observed_parameter_version;
+  double proposed_sign;
+  PsiFormerWF::LogValue proposed_log_value;
+  std::uint64_t proposed_configuration_identity;
+  std::uint64_t proposed_descriptor_fingerprint;
+  std::size_t proposed_parameter_version;
+  int proposed_particle;
+  std::uint8_t proposal_origin;
+  bool has_proposal;
+  int update_mode;
+  std::size_t bytes_in_wf_buffer;
+  const void* accepted_gradient_data;
+  const void* accepted_laplacian_data;
+  const void* proposed_gradient_data;
+  const void* proposed_laplacian_data;
+  std::size_t accepted_gradient_capacity;
+  std::size_t accepted_laplacian_capacity;
+  std::size_t proposed_gradient_capacity;
+  std::size_t proposed_laplacian_capacity;
+  std::vector<PsiFormerWF::GradType> accepted_gradient;
+  std::vector<QMCTraits::ValueType> accepted_laplacian;
+  std::vector<PsiFormerWF::GradType> proposed_gradient;
+  std::vector<QMCTraits::ValueType> proposed_laplacian;
+};
+
 /** Access only the crowd-workspace ownership diagnostic used by this test. */
 class TestPsiFormerWF
 {
@@ -77,6 +113,27 @@ public:
     component.has_proposal_    = true;
   }
 
+  /// Install a scalar proposal whose legacy restore path would visibly clear state.
+  static void markScalarProposalPending(PsiFormerWF& component, int particle)
+  {
+    component.proposed_sign_ = -component.current_sign_;
+    component.proposed_log_value_ = component.log_value_ + PsiFormerWF::LogValue(0.125);
+    component.proposed_configuration_identity_ = component.accepted_configuration_identity_ ^ 0x9e3779b97f4a7c15ULL;
+    component.proposed_descriptor_fingerprint_ = 0x6a09e667f3bcc909ULL;
+    component.proposed_parameter_version_ = component.observed_parameter_version_;
+    component.proposed_particle_          = particle;
+    component.proposal_origin_ = PsiFormerWF::ProposalOrigin::SCALAR_RATIO_VALUE;
+    for (std::size_t electron = 0; electron < component.proposed_gradient_.size(); ++electron)
+    {
+      for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+        component.proposed_gradient_[electron][dimension] =
+            QMCTraits::ValueType(0.25 * (1 + electron + dimension));
+      component.proposed_laplacian_[electron] =
+          QMCTraits::ValueType(-0.5 * (1 + electron));
+    }
+    component.has_proposal_ = true;
+  }
+
   /// Restore the ordinary idle lifecycle after a transition-guard check.
   static void clearProposal(PsiFormerWF& component)
   {
@@ -88,6 +145,112 @@ public:
                                                 bool enabled)
   {
     component.fail_clone_preparation_before_publish_for_testing_ = enabled;
+  }
+
+  /// Capture every scalar accepted/proposal field and its fixed backing store.
+  static PsiFormerScalarStateSnapshot scalarStateSnapshot(
+      const PsiFormerWF& component)
+  {
+    PsiFormerScalarStateSnapshot snapshot{
+        component.current_sign_,
+        component.log_value_,
+        component.restore_validation_pending_,
+        component.accepted_value_valid_,
+        component.accepted_configuration_identity_,
+        component.accepted_parameter_version_,
+        static_cast<std::uint64_t>(component.accepted_state_requirement_),
+        component.observed_parameter_version_,
+        component.proposed_sign_,
+        component.proposed_log_value_,
+        component.proposed_configuration_identity_,
+        component.proposed_descriptor_fingerprint_,
+        component.proposed_parameter_version_,
+        component.proposed_particle_,
+        static_cast<std::uint8_t>(component.proposal_origin_),
+        component.has_proposal_,
+        component.UpdateMode,
+        component.Bytes_in_WFBuffer,
+        component.accepted_gradient_.data(),
+        component.accepted_laplacian_.data(),
+        component.proposed_gradient_.data(),
+        component.proposed_laplacian_.data(),
+        component.accepted_gradient_.capacity(),
+        component.accepted_laplacian_.capacity(),
+        component.proposed_gradient_.capacity(),
+        component.proposed_laplacian_.capacity(),
+        {},
+        {},
+        {},
+        {}};
+    snapshot.accepted_gradient.reserve(component.accepted_gradient_.size());
+    snapshot.accepted_laplacian.reserve(component.accepted_laplacian_.size());
+    snapshot.proposed_gradient.reserve(component.proposed_gradient_.size());
+    snapshot.proposed_laplacian.reserve(component.proposed_laplacian_.size());
+    for (std::size_t particle = 0; particle < component.accepted_gradient_.size(); ++particle)
+      snapshot.accepted_gradient.push_back(component.accepted_gradient_[particle]);
+    for (std::size_t particle = 0; particle < component.accepted_laplacian_.size(); ++particle)
+      snapshot.accepted_laplacian.push_back(component.accepted_laplacian_[particle]);
+    for (std::size_t particle = 0; particle < component.proposed_gradient_.size(); ++particle)
+      snapshot.proposed_gradient.push_back(component.proposed_gradient_[particle]);
+    for (std::size_t particle = 0; particle < component.proposed_laplacian_.size(); ++particle)
+      snapshot.proposed_laplacian.push_back(component.proposed_laplacian_[particle]);
+    return snapshot;
+  }
+
+  /// Compare without tolerance: a rejected scalar entry must not change logical state.
+  static bool scalarStateMatches(
+      const PsiFormerWF& component,
+      const PsiFormerScalarStateSnapshot& snapshot)
+  {
+    if (component.current_sign_ != snapshot.current_sign ||
+        component.log_value_ != snapshot.log_value ||
+        component.restore_validation_pending_ != snapshot.restore_validation_pending ||
+        component.accepted_value_valid_ != snapshot.accepted_value_valid ||
+        component.accepted_configuration_identity_ != snapshot.accepted_configuration_identity ||
+        component.accepted_parameter_version_ != snapshot.accepted_parameter_version ||
+        static_cast<std::uint64_t>(component.accepted_state_requirement_) != snapshot.accepted_state_requirement ||
+        component.observed_parameter_version_ != snapshot.observed_parameter_version ||
+        component.proposed_sign_ != snapshot.proposed_sign ||
+        component.proposed_log_value_ != snapshot.proposed_log_value ||
+        component.proposed_configuration_identity_ != snapshot.proposed_configuration_identity ||
+        component.proposed_descriptor_fingerprint_ != snapshot.proposed_descriptor_fingerprint ||
+        component.proposed_parameter_version_ != snapshot.proposed_parameter_version ||
+        component.proposed_particle_ != snapshot.proposed_particle ||
+        static_cast<std::uint8_t>(component.proposal_origin_) != snapshot.proposal_origin ||
+        component.has_proposal_ != snapshot.has_proposal ||
+        component.UpdateMode != snapshot.update_mode ||
+        component.Bytes_in_WFBuffer != snapshot.bytes_in_wf_buffer ||
+        component.accepted_gradient_.data() != snapshot.accepted_gradient_data ||
+        component.accepted_laplacian_.data() != snapshot.accepted_laplacian_data ||
+        component.proposed_gradient_.data() != snapshot.proposed_gradient_data ||
+        component.proposed_laplacian_.data() != snapshot.proposed_laplacian_data ||
+        component.accepted_gradient_.capacity() != snapshot.accepted_gradient_capacity ||
+        component.accepted_laplacian_.capacity() != snapshot.accepted_laplacian_capacity ||
+        component.proposed_gradient_.capacity() != snapshot.proposed_gradient_capacity ||
+        component.proposed_laplacian_.capacity() != snapshot.proposed_laplacian_capacity ||
+        component.accepted_gradient_.size() != snapshot.accepted_gradient.size() ||
+        component.accepted_laplacian_.size() != snapshot.accepted_laplacian.size() ||
+        component.proposed_gradient_.size() != snapshot.proposed_gradient.size() ||
+        component.proposed_laplacian_.size() != snapshot.proposed_laplacian.size())
+      return false;
+
+    const auto gradients_match = [](const auto& actual, const auto& expected) {
+      for (std::size_t particle = 0; particle < expected.size(); ++particle)
+        for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+          if (actual[particle][dimension] != expected[particle][dimension])
+            return false;
+      return true;
+    };
+    if (!gradients_match(component.accepted_gradient_, snapshot.accepted_gradient) ||
+        !gradients_match(component.proposed_gradient_, snapshot.proposed_gradient))
+      return false;
+    for (std::size_t particle = 0; particle < snapshot.accepted_laplacian.size(); ++particle)
+      if (component.accepted_laplacian_[particle] != snapshot.accepted_laplacian[particle])
+        return false;
+    for (std::size_t particle = 0; particle < snapshot.proposed_laplacian.size(); ++particle)
+      if (component.proposed_laplacian_[particle] != snapshot.proposed_laplacian[particle])
+        return false;
+    return true;
   }
 };
 } // namespace testing
@@ -1035,8 +1198,9 @@ TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
   CHECK(prepared.accountedBytes() ==
         prepared.batch_bytes + prepared.scalar_value_publication_bytes);
 
-  // A malformed restore target must fail before resizing the fixed clone
-  // state or consuming a walker-buffer record.
+  // Planned buffer restoration remains fail closed until its private parser
+  // transaction lands; the guard must precede target validation, clone-state
+  // resizing, and walker-buffer cursor movement.
   ParticleSet wrong_electron_count(simulation_cell);
   wrong_electron_count.setName("wrong_electron_count");
   wrong_electron_count.create(
@@ -1045,7 +1209,7 @@ TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
   CHECK_THROWS_WITH(
       component.copyFromBuffer(wrong_electron_count, empty_buffer),
       Catch::Matchers::ContainsSubstring(
-          "walker buffer electron count differs from the model"));
+          "not admitted as a scalar operation by the explicit batch plan"));
   const auto after_wrong_restore =
       testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
   CHECK(after_wrong_restore.accepted_spatial_bytes ==
@@ -1203,6 +1367,181 @@ TEST_CASE("PsiFormer prepares bounded clone scalar storage transactionally",
   CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
   CHECK_FALSE(rebound.has_prepared_clone_plan);
   CHECK_FALSE(rebound.owns_batch_workspace);
+}
+
+TEST_CASE("PsiFormer hard plans reject scalar lifecycle entries before mutation",
+          "[wavefunction][psiformer][batch_memory][scalar_guard]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  PsiFormerWF component("pf_scalar_guard", files.parameters.string(),
+                        files.configuration.string(), true, {0, 1});
+
+  // Keep a small legacy smoke path for each inherited/no-op wrapper added by
+  // the hard-plan guard. Spin-independent wrappers must leave the spin output
+  // alone while delegating to the ordinary scalar evaluator.
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+  component.recompute(electrons);
+  component.prepareGroup(electrons, 0);
+  component.completeUpdates();
+  PsiFormerWF::ComplexType legacy_spin_gradient(1.25, -0.75);
+  const auto legacy_spin_before = legacy_spin_gradient;
+  const PsiFormerWF::GradType legacy_gradient =
+      component.evalGradWithSpin(electrons, 0, legacy_spin_gradient);
+  CHECK(legacy_spin_gradient == legacy_spin_before);
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    CHECK(std::isfinite(std::real(legacy_gradient[dimension])));
+
+  electrons.makeMove(0, ParticleSet::SingleParticlePos{0.013, -0.009, 0.007});
+  PsiFormerWF::GradType legacy_ratio_gradient;
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    legacy_ratio_gradient[dimension] = ValueType(0);
+  PsiFormerWF::ComplexType legacy_ratio_spin(-2.0, 0.625);
+  const auto legacy_ratio_spin_before = legacy_ratio_spin;
+  const ValueType legacy_ratio = component.ratioGradWithSpin(
+      electrons, 0, legacy_ratio_gradient, legacy_ratio_spin);
+  CHECK(std::isfinite(std::real(legacy_ratio)));
+  CHECK(std::isfinite(std::imag(legacy_ratio)));
+  CHECK(legacy_ratio_spin == legacy_ratio_spin_before);
+  component.restore(0);
+  electrons.rejectMove(0);
+
+  PsiFormerWF::WFBufferType legacy_buffer;
+  component.registerData(electrons, legacy_buffer);
+  REQUIRE(legacy_buffer.current() > 0);
+  REQUIRE(legacy_buffer.current_scalar() > 0);
+  legacy_buffer.allocate();
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  legacy_buffer.rewind();
+  component.updateBuffer(electrons, legacy_buffer, false);
+  legacy_buffer.rewind();
+  component.copyFromBuffer(electrons, legacy_buffer);
+
+  // Reestablish one unambiguous FULL accepted state before entering the plan.
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.evaluateLog(electrons, electrons.G, electrons.L);
+
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  const std::string participant_id = "test/psiformer/scalar-guard";
+  const auto plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, "scalar-guard-v1");
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  component.bindBatchExecutionPlan(participant_plan);
+  component.prepareBatchExecutionClone(participant_plan);
+
+  // The pending scalar proposal makes legacy accept/restore observably
+  // destructive, so retaining this exact state proves the plan guard ran first.
+  testing::TestPsiFormerWF::markScalarProposalPending(component, 0);
+  const auto component_before =
+      testing::TestPsiFormerWF::scalarStateSnapshot(component);
+  const auto workspace_before =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  const ParticleSet::ParticleGradient particle_gradient_before = electrons.G;
+  const ParticleSet::ParticleLaplacian particle_laplacian_before = electrons.L;
+
+  // Seed both pooled-buffer regions and advance both cursors. A first-entry
+  // rejection must neither consume nor rewrite either region.
+  PsiFormerWF::WFBufferType guarded_buffer;
+  PsiFormerWF::GradType buffer_gradient;
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    buffer_gradient[dimension] = ValueType(0.375 * (dimension + 1));
+  double buffer_scalar = -4.25;
+  guarded_buffer.add(&buffer_gradient, &buffer_gradient + 1);
+  guarded_buffer.add(buffer_scalar);
+  guarded_buffer.allocate();
+  guarded_buffer.rewind();
+  guarded_buffer.put(&buffer_gradient, &buffer_gradient + 1);
+  guarded_buffer.put(buffer_scalar);
+  const auto buffer_bulk_cursor   = guarded_buffer.current();
+  const auto buffer_scalar_cursor = guarded_buffer.current_scalar();
+  const auto buffer_storage       = guarded_buffer.myData;
+  const auto* buffer_scalar_data  = guarded_buffer.Scalar_ptr;
+
+  const auto check_unchanged = [&]() {
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(component,
+                                                        component_before));
+    REQUIRE(electrons.G.size() == particle_gradient_before.size());
+    REQUIRE(electrons.L.size() == particle_laplacian_before.size());
+    for (std::size_t electron = 0; electron < electrons.G.size(); ++electron)
+    {
+      for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+        CHECK(electrons.G[electron][dimension] ==
+              particle_gradient_before[electron][dimension]);
+      CHECK(electrons.L[electron] == particle_laplacian_before[electron]);
+    }
+
+    const auto workspace_after =
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    CHECK(workspace_after.has_prepared_clone_plan ==
+          workspace_before.has_prepared_clone_plan);
+    CHECK(workspace_after.owns_batch_workspace ==
+          workspace_before.owns_batch_workspace);
+    CHECK(workspace_after.batch_workspace_identity ==
+          workspace_before.batch_workspace_identity);
+    CHECK(workspace_after.batch_storage_fingerprint ==
+          workspace_before.batch_storage_fingerprint);
+    CHECK(workspace_after.accountedBytes() == workspace_before.accountedBytes());
+    CHECK(workspace_after.accepted_spatial_bytes ==
+          workspace_before.accepted_spatial_bytes);
+    CHECK(workspace_after.proposed_spatial_bytes ==
+          workspace_before.proposed_spatial_bytes);
+
+    CHECK(guarded_buffer.current() == buffer_bulk_cursor);
+    CHECK(guarded_buffer.current_scalar() == buffer_scalar_cursor);
+    CHECK(guarded_buffer.Scalar_ptr == buffer_scalar_data);
+    REQUIRE(guarded_buffer.myData.size() == buffer_storage.size());
+    for (std::size_t byte = 0; byte < buffer_storage.size(); ++byte)
+      CHECK(guarded_buffer.myData[byte] == buffer_storage[byte]);
+  };
+  const auto expect_plan_guard = [&](auto&& operation) {
+    CHECK_THROWS_WITH(
+        operation(),
+        Catch::Matchers::ContainsSubstring(
+            "not admitted as a scalar operation by the explicit batch plan"));
+    check_unchanged();
+  };
+
+  expect_plan_guard([&]() { component.recompute(electrons); });
+  expect_plan_guard([&]() { component.acceptMove(electrons, 0); });
+  expect_plan_guard([&]() { component.restore(0); });
+  expect_plan_guard([&]() { component.prepareGroup(electrons, 0); });
+  expect_plan_guard([&]() { component.completeUpdates(); });
+
+  PsiFormerWF::ComplexType spin_gradient(3.5, -1.75);
+  const auto spin_gradient_before = spin_gradient;
+  expect_plan_guard(
+      [&]() { component.evalGradWithSpin(electrons, 0, spin_gradient); });
+  CHECK(spin_gradient == spin_gradient_before);
+
+  PsiFormerWF::GradType ratio_gradient;
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    ratio_gradient[dimension] = ValueType(-0.5 * (dimension + 1));
+  const PsiFormerWF::GradType ratio_gradient_before = ratio_gradient;
+  PsiFormerWF::ComplexType ratio_spin_gradient(-0.875, 2.625);
+  const auto ratio_spin_gradient_before = ratio_spin_gradient;
+  expect_plan_guard([&]() {
+    component.ratioGradWithSpin(electrons, 0, ratio_gradient,
+                                ratio_spin_gradient);
+  });
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    CHECK(ratio_gradient[dimension] == ratio_gradient_before[dimension]);
+  CHECK(ratio_spin_gradient == ratio_spin_gradient_before);
+
+  expect_plan_guard(
+      [&]() { component.registerData(electrons, guarded_buffer); });
+  expect_plan_guard([&]() {
+    component.updateBuffer(electrons, guarded_buffer, true);
+  });
+  expect_plan_guard(
+      [&]() { component.copyFromBuffer(electrons, guarded_buffer); });
 }
 
 TEST_CASE("PsiFormer planned scalar scope excludes unselected and legacy ECP paths",

@@ -60,6 +60,37 @@ struct DirectBatchWorkspaceTestAccess
   {
     workspace.fail_preparation_before_publish_for_testing_ = enabled;
   }
+
+  /// Make the published sign buffer noncanonical while keeping a view's pointer current.
+  static void widenPublishedSignCapacity(
+      DirectBatchWorkspace& workspace,
+      DirectBatchValueResultView& result)
+  {
+    workspace.sign_.reserve(workspace.sign_.capacity() + 1);
+    result.sign = workspace.sign_.data();
+  }
+
+  /// Make one unpublished VALUE output buffer noncanonical.
+  static void widenPendingSignCapacity(DirectBatchWorkspace& workspace)
+  {
+    workspace.pending_sign_.reserve(workspace.pending_sign_.capacity() + 1);
+  }
+
+  /// Corrupt the private generation token to exercise fail-closed ownership.
+  static void setSuccessfulGeneration(DirectBatchWorkspace& workspace,
+                                      std::size_t generation) noexcept
+  {
+    workspace.successful_generation_ = generation;
+  }
+
+  /// Corrupt sparse counters while retaining a nominally dense live request.
+  static void setDenseSparseCounts(DirectBatchWorkspace& workspace,
+                                   std::size_t references,
+                                   std::size_t replacements) noexcept
+  {
+    workspace.active_reference_count_   = references;
+    workspace.active_replacement_count_ = replacements;
+  }
 };
 } // namespace pf
 
@@ -1282,8 +1313,8 @@ TEST_CASE("PsiFormer planned spatial result ownership rejects repacked views",
                                              execution_plan);
   pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
   auto workspace = batch_executor.makeWorkspace();
-  const pf::DirectBatchCapacityPlan capacity_plan{{0, 2, 0, 0, 0},
-                                                   {0, 1, 0}};
+  const pf::DirectBatchCapacityPlan capacity_plan{{0, 2, 2, 0, 0},
+                                                   {0, 1, 1}};
   workspace->prepare(capacity_plan);
 
   const pf::Tensor base = model.cfg.configuration(0);
@@ -1326,6 +1357,215 @@ TEST_CASE("PsiFormer planned spatial result ownership rejects repacked views",
   malformed.gradient = nullptr;
   CHECK_FALSE(workspace->ownsSpatialResult(
       malformed, pf::DirectSpatialMode::FULL_VGL, 2));
+
+  const std::size_t active_electrons[2]{0, 1};
+  workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 2);
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchSpatialResultView active =
+      batch_executor.evaluateActive(*workspace, active_electrons);
+  CHECK(workspace->ownsSpatialResult(
+      active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+  CHECK(active.gradient_stride == 3);
+  CHECK(active.laplacian_stride == 0);
+  CHECK(active.lap_log == nullptr);
+  CHECK(active.lap_ratio == nullptr);
+
+  other_workspace->resize(pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 2);
+  loadBatch(*other_workspace, base, 2);
+  const pf::DirectBatchSpatialResultView other_active =
+      batch_executor.evaluateActive(*other_workspace, active_electrons);
+  CHECK(other_workspace->ownsSpatialResult(
+      other_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      other_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+
+  pf::DirectBatchSpatialResultView malformed_active = active;
+  ++malformed_active.gradient_stride;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+  malformed_active = active;
+  malformed_active.gradient = nullptr;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+  malformed_active = active;
+  ++malformed_active.laplacian_stride;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+  malformed_active = active;
+  malformed_active.lap_log = active.gradient;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+  malformed_active = active;
+  malformed_active.lap_ratio = active.gradient;
+  CHECK_FALSE(workspace->ownsSpatialResult(
+      malformed_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+
+  // A spatial view never owns an unevaluated generation, even when a corrupt
+  // private token and the returned view are made to agree on zero.
+  pf::DirectBatchSpatialResultView zero_generation = other_active;
+  zero_generation.generation = 0;
+  pf::DirectBatchWorkspaceTestAccess::setSuccessfulGeneration(
+      *other_workspace, 0);
+  CHECK_FALSE(other_workspace->ownsSpatialResult(
+      zero_generation, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+
+  // Dense spatial ownership also proves that no stale sparse request extents
+  // survive in the workspace's private live-request state.
+  pf::DirectBatchWorkspaceTestAccess::setSuccessfulGeneration(
+      *other_workspace, other_active.generation);
+  pf::DirectBatchWorkspaceTestAccess::setDenseSparseCounts(
+      *other_workspace, 1, 0);
+  CHECK_FALSE(other_workspace->ownsSpatialResult(
+      other_active, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT, 2));
+}
+
+TEST_CASE("PsiFormer planned value result ownership validates exact live views",
+          "[wavefunction][psiformer][batch][memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  const pf::DirectBatchCapacityPlan capacity_plan{{2, 2, 0, 2, 2},
+                                                   {2, 1, 0}};
+  const pf::Tensor base = model.cfg.configuration(0);
+
+  auto workspace = batch_executor.makeWorkspace();
+  workspace->prepare(capacity_plan);
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 2);
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchValueResultView first =
+      batch_executor.evaluateValues(*workspace);
+  static_assert(noexcept(workspace->ownsValueResult(
+      first, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2)));
+  CHECK(workspace->ownsValueResult(
+      first, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  CHECK_FALSE(workspace->ownsValueResult(
+      first, pf::DirectBatchValueInput::SPARSE_REPLACEMENTS, 2));
+  CHECK_FALSE(workspace->ownsValueResult(
+      first, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 1));
+
+  pf::DirectBatchValueResultView malformed = first;
+  ++malformed.size;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  malformed = first;
+  malformed.owner = nullptr;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  malformed = first;
+  ++malformed.generation;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  malformed = first;
+  malformed.sign = nullptr;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  malformed = first;
+  malformed.logabs = nullptr;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  malformed = first;
+  malformed.value = nullptr;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  malformed = first;
+  malformed.parameter_version = nullptr;
+  CHECK_FALSE(workspace->ownsValueResult(
+      malformed, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+
+  auto foreign_workspace = batch_executor.makeWorkspace();
+  foreign_workspace->prepare(capacity_plan);
+  foreign_workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 2);
+  loadBatch(*foreign_workspace, base, 2);
+  const pf::DirectBatchValueResultView foreign =
+      batch_executor.evaluateValues(*foreign_workspace);
+  CHECK(foreign_workspace->ownsValueResult(
+      foreign, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  CHECK_FALSE(workspace->ownsValueResult(
+      foreign, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+
+  // Repacking advances the generation before evaluation, invalidating the old view.
+  workspace->resize(pf::DirectBatchMode::VALUE_ONLY, 2);
+  CHECK_FALSE(workspace->ownsValueResult(
+      first, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchValueResultView second =
+      batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->ownsValueResult(
+      second, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+  CHECK_FALSE(workspace->ownsValueResult(
+      first, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+
+  // A fresh spatial result shares the value-result shape but has the wrong live mode.
+  workspace->resize(pf::DirectBatchMode::FULL_VGL, 2);
+  loadBatch(*workspace, base, 2);
+  const pf::DirectBatchSpatialResultView spatial =
+      batch_executor.evaluateFull(*workspace);
+  const pf::DirectBatchValueResultView& spatial_value = spatial;
+  CHECK_FALSE(workspace->ownsValueResult(
+      spatial_value, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 2));
+
+  auto unprepared_workspace = batch_executor.makeWorkspace();
+  CHECK_FALSE(unprepared_workspace->ownsValueResult(
+      {}, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, 0));
+}
+
+TEST_CASE("PsiFormer planned value ownership validates sparse input and capacity",
+          "[wavefunction][psiformer][batch][memory][sparse]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto execution_plan = makePlan(model);
+  pf::DirectValueExecutor value_executor(model, execution_plan);
+  pf::DirectSpatialExecutor spatial_executor(model, value_executor,
+                                             execution_plan);
+  pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
+  const pf::DirectBatchCapacityPlan capacity_plan{{2, 0, 0, 2, 2},
+                                                   {2, 0, 0}};
+  const pf::Tensor base = model.cfg.configuration(0);
+  const auto references = makeSparseReferences(base, model.ne);
+  const auto replacements = makeSparseReplacements(references, model.ne, 2);
+  const std::size_t result_size = references.size() + replacements.size();
+
+  auto workspace = batch_executor.makeWorkspace();
+  workspace->prepare(capacity_plan);
+  loadSparseBatch(*workspace, references, replacements);
+  pf::DirectBatchValueResultView result =
+      batch_executor.evaluateValues(*workspace);
+  CHECK(workspace->ownsValueResult(
+      result, pf::DirectBatchValueInput::SPARSE_REPLACEMENTS, result_size));
+  CHECK_FALSE(workspace->ownsValueResult(
+      result, pf::DirectBatchValueInput::DENSE_CONFIGURATIONS, result_size));
+  CHECK_FALSE(workspace->ownsValueResult(
+      result, pf::DirectBatchValueInput::SPARSE_REPLACEMENTS,
+      result_size - 1));
+
+  // Retained output buffers must have the exact capacity admitted by the plan,
+  // even when every public pointer in the returned view is kept current.
+  pf::DirectBatchWorkspaceTestAccess::widenPublishedSignCapacity(*workspace,
+                                                                 result);
+  CHECK_FALSE(workspace->ownsValueResult(
+      result, pf::DirectBatchValueInput::SPARSE_REPLACEMENTS, result_size));
+
+  // Pending publication buffers are equally part of the exact prepared storage
+  // contract even though no pointer to them is exposed by the result view.
+  auto pending_workspace = batch_executor.makeWorkspace();
+  pending_workspace->prepare(capacity_plan);
+  loadSparseBatch(*pending_workspace, references, replacements);
+  const pf::DirectBatchValueResultView pending_result =
+      batch_executor.evaluateValues(*pending_workspace);
+  CHECK(pending_workspace->ownsValueResult(
+      pending_result, pf::DirectBatchValueInput::SPARSE_REPLACEMENTS,
+      result_size));
+  pf::DirectBatchWorkspaceTestAccess::widenPendingSignCapacity(
+      *pending_workspace);
+  CHECK_FALSE(pending_workspace->ownsValueResult(
+      pending_result, pf::DirectBatchValueInput::SPARSE_REPLACEMENTS,
+      result_size));
 }
 
 TEST_CASE("PsiFormer batch mode switching has a bounded additive high water",

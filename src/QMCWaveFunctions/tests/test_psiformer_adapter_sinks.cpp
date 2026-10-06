@@ -49,6 +49,7 @@ enum class Form : std::size_t
   ALIGNED_ARRAY,
   ALIGNED_NOTHROW,
   ALIGNED_NOTHROW_ARRAY,
+  DEALLOCATION,
   COUNT
 };
 
@@ -169,23 +170,30 @@ void* operator new[](std::size_t bytes,
   }
 }
 
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete[](void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete(void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept { std::free(pointer); }
+void recordDeallocation(void* pointer) noexcept
+{
+  psiformer_adapter_allocation_audit::record(
+      psiformer_adapter_allocation_audit::Form::DEALLOCATION);
+  std::free(pointer);
+}
+
+void operator delete(void* pointer) noexcept { recordDeallocation(pointer); }
+void operator delete[](void* pointer) noexcept { recordDeallocation(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { recordDeallocation(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { recordDeallocation(pointer); }
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { recordDeallocation(pointer); }
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept { recordDeallocation(pointer); }
+void operator delete(void* pointer, std::align_val_t) noexcept { recordDeallocation(pointer); }
+void operator delete[](void* pointer, std::align_val_t) noexcept { recordDeallocation(pointer); }
+void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept { recordDeallocation(pointer); }
+void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept { recordDeallocation(pointer); }
 void operator delete(void* pointer, std::align_val_t, const std::nothrow_t&) noexcept
 {
-  std::free(pointer);
+  recordDeallocation(pointer);
 }
 void operator delete[](void* pointer, std::align_val_t, const std::nothrow_t&) noexcept
 {
-  std::free(pointer);
+  recordDeallocation(pointer);
 }
 
 namespace qmcplusplus
@@ -267,6 +275,16 @@ public:
             PsiFormerWF::AcceptedStateRequirement::FULL_SPATIAL);
   }
 
+  static bool hasCurrentAcceptedValue(const PsiFormerWF& component,
+                                      const ParticleSet& particles)
+  {
+    const std::size_t version = component.parameterVersion();
+    return component.observed_parameter_version_ == version &&
+        component.acceptedStateMatches(
+            particles, version,
+            PsiFormerWF::AcceptedStateRequirement::VALUE_ONLY);
+  }
+
   static bool hasProposal(const PsiFormerWF& component) noexcept
   {
     return component.has_proposal_;
@@ -302,7 +320,7 @@ struct AllocationSnapshot
              static_cast<std::size_t>(psiformer_adapter_allocation_audit::Form::COUNT)> counts{};
 };
 
-/** Count every replaceable C++ allocation form only while one warmed call runs.
+/** Count every replaceable C++ allocation and deallocation form in one warmed call.
  * Direct calls to malloc are outside this language-level interposition seam;
  * pointer/capacity/fingerprint and selected-byte checks below cover the owning
  * PsiFormer storage that such a call could otherwise replace.
@@ -344,6 +362,7 @@ void checkNoAllocations(const AllocationSnapshot& snapshot,
   CHECK(snapshot.counts[static_cast<std::size_t>(Form::ALIGNED_ARRAY)] == 0);
   CHECK(snapshot.counts[static_cast<std::size_t>(Form::ALIGNED_NOTHROW)] == 0);
   CHECK(snapshot.counts[static_cast<std::size_t>(Form::ALIGNED_NOTHROW_ARRAY)] == 0);
+  CHECK(snapshot.counts[static_cast<std::size_t>(Form::DEALLOCATION)] == 0);
 }
 
 ParticleSet makeElectrons(const SimulationCell& simulation_cell)
@@ -442,21 +461,27 @@ struct PlannedAllocationCrowd
 
 std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
     PsiFormerWF& component, std::size_t walker_count,
-    const std::string& participant_id)
+    const std::string& participant_id,
+    std::size_t reserve_walker_count = 0)
 {
+  if (reserve_walker_count == 0)
+    reserve_walker_count = walker_count;
+
   BatchExecutionRequirements requirements;
   component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::VALUE);
+  requirements.require(BatchExecutionMode::ACTIVE_GRADIENT);
 
   BatchExecutionSelectionInput selection;
   selection.requirements                       = requirements;
   selection.topology.initial_walkers_per_crowd = {walker_count};
-  selection.topology.reserve_walkers_per_crowd = {walker_count};
+  selection.topology.reserve_walkers_per_crowd = {reserve_walker_count};
   selection.topology.run_kind = "psiformer-hard-plan-allocation-gate";
   selection.particle_count    = 4;
   selection.target_coordinate = BatchExecutionTargetCoordinate::POS_ONLY;
   selection.preference.id     = "psiformer-hard-plan-allocation-v1";
   selection.preference.preferred = {
-      walker_count, walker_count, 1, walker_count};
+      reserve_walker_count, reserve_walker_count, 1, reserve_walker_count};
   selection.logical_maximum = component.batchExecutionLogicalMaximum(
       {selection.requirements, selection.topology, selection.particle_count,
        selection.active_parameter_count, selection.parameter_derivative_width,
@@ -626,7 +651,18 @@ void checkPlannedAllocationFreeze(
         diagnostics.accepted_spatial_bytes +
         diagnostics.proposed_spatial_bytes;
   }
-  CHECK(selected_clone.host == fixed_clone_bytes);
+  const std::size_t live_clones = actual.clone_workspaces.size();
+  REQUIRE(live_clones > 0);
+  REQUIRE(actual.resource.reserve_walker_capacity >= live_clones);
+  REQUIRE(fixed_clone_bytes % live_clones == 0);
+  REQUIRE(actual_clone_bytes % live_clones == 0);
+  const std::size_t selected_fixed_clone_bytes =
+      (fixed_clone_bytes / live_clones) *
+      actual.resource.reserve_walker_capacity;
+  const std::size_t selected_actual_clone_bytes =
+      (actual_clone_bytes / live_clones) *
+      actual.resource.reserve_walker_capacity;
+  CHECK(selected_clone.host == selected_fixed_clone_bytes);
   CHECK(selected_clone.device == 0);
 
   CHECK(actual.resource.expected_resource_storage ==
@@ -645,7 +681,8 @@ void checkPlannedAllocationFreeze(
       plan.participantEvidence().front().selected_per_owner.total();
   REQUIRE(selected_total.host >= expected_total.host);
   REQUIRE(selected_total.device >= expected_total.device);
-  CHECK(selected_total.host - expected_total.host == actual_clone_bytes);
+  CHECK(selected_total.host - expected_total.host ==
+        selected_actual_clone_bytes);
   CHECK(selected_total.device - expected_total.device == 0);
   CHECK(actual.resource.prepared_storage_fingerprint ==
         actual.resource.current_storage_fingerprint);
@@ -875,6 +912,9 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
   setBackend("direct");
   const SimulationCell simulation_cell;
   PlannedAllocationCrowd crowd(files, simulation_cell, walker_count);
+  PsiFormerWF reference("pf_hard_plan_allocation_reference",
+                        files.parameters.string(),
+                        files.configuration.string());
   const std::string participant_id =
       "test/psiformer/hard-plan-allocation";
   const auto plan = makeAllocationPlan(
@@ -909,6 +949,14 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
     laplacian_list.push_back(laplacians[lane]);
   }
   std::vector<PsiFormerWF::LogValue> log_ratios(walker_count);
+  std::vector<PsiFormerWF::GradType> active_gradients(walker_count);
+  std::vector<PsiFormerWF::GradType> expected_active_gradients(walker_count);
+  std::vector<PsiFormerWF::LogValue> recompute_logs_before(walker_count);
+  std::vector<PsiFormerWF::LogValue> expected_recompute_logs(walker_count);
+  ParticleSet::ParticleGradient reference_gradient;
+  ParticleSet::ParticleLaplacian reference_laplacian;
+  reference_gradient.resize(electron_count);
+  reference_laplacian.resize(electron_count);
   auto reset_outputs = [&]() {
     for (std::size_t lane = 0; lane < walker_count; ++lane)
     {
@@ -921,10 +969,15 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
   Moves::PosType moved = crowd.walkers[1]->R[0];
   moved[0] += 0.004;
   moved[1] -= 0.002;
+  const std::array<Moves::PosType, walker_count> baseline_positions{
+      crowd.walkers[0]->R[0], crowd.walkers[1]->R[0]};
   const Moves moves(
       {0, 1, 2}, {0, 0}, {crowd.walkers[0]->R[0], moved});
   const std::vector<bool> all_reject{false, false};
   const std::vector<bool> mixed_resolution{false, true};
+  const std::vector<bool> recompute_none{false, false};
+  const std::vector<bool> recompute_sparse{true, false};
+  const std::vector<bool> recompute_all{true, true};
 
   // Warm the executor, proposal bookkeeping, both abandonment routes, and
   // resource ownership transitions before enabling global-new accounting.
@@ -954,6 +1007,14 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
   reset_outputs();
   crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
                               gradient_list, laplacian_list);
+  crowd.leader.mw_recompute(crowd.wfc_list, *crowd.p_list,
+                            recompute_none);
+  crowd.leader.mw_recompute(crowd.wfc_list, *crowd.p_list,
+                            recompute_sparse);
+  crowd.leader.mw_recompute(crowd.wfc_list, *crowd.p_list,
+                            recompute_all);
+  crowd.leader.mw_evalGrad(crowd.wfc_list, *crowd.p_list, 1,
+                           active_gradients);
   for (std::size_t lane = 0; lane < walker_count; ++lane)
     CHECK(Probe::hasCurrentFullAcceptedState(
         *crowd.components[lane], *crowd.walkers[lane]));
@@ -995,6 +1056,116 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
   for (std::size_t lane = 0; lane < walker_count; ++lane)
     CHECK(Probe::hasCurrentFullAcceptedState(
         *crowd.components[lane], *crowd.walkers[lane]));
+  checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+
+  const auto audit_recompute = [&](const std::vector<bool>& mask,
+                                   const char* scope,
+                                   double coordinate_shift) {
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      recompute_logs_before[lane] = crowd.components[lane]->get_log_value();
+      expected_recompute_logs[lane] = recompute_logs_before[lane];
+      if (!mask[lane])
+        continue;
+
+      // Make a selected lane's accepted value stale, then obtain an
+      // independent scalar-direct reference before opening the allocation
+      // window.  A no-op planned recompute can no longer satisfy this test.
+      crowd.walkers[lane]->R[0][0] +=
+          coordinate_shift * static_cast<double>(lane + 1);
+      crowd.walkers[lane]->update();
+      reference_gradient = Value(0);
+      reference_laplacian = Value(0);
+      expected_recompute_logs[lane] = reference.evaluateLog(
+          *crowd.walkers[lane], reference_gradient, reference_laplacian);
+      REQUIRE(std::abs(expected_recompute_logs[lane] -
+                       recompute_logs_before[lane]) > 1.0e-10);
+    }
+
+    const AllocationSnapshot allocations = auditAllocations([&] {
+      crowd.leader.mw_recompute(crowd.wfc_list, *crowd.p_list, mask);
+    });
+    checkNoAllocations(allocations, scope);
+    CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 0);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      if (mask[lane])
+      {
+        CHECK(Probe::hasCurrentAcceptedValue(
+            *crowd.components[lane], *crowd.walkers[lane]));
+        CHECK_FALSE(Probe::hasCurrentFullAcceptedState(
+            *crowd.components[lane], *crowd.walkers[lane]));
+        checkObservation(observe(crowd.components[lane]->get_log_value()),
+                         observe(expected_recompute_logs[lane]));
+        CHECK(std::abs(crowd.components[lane]->get_log_value() -
+                       recompute_logs_before[lane]) > 1.0e-10);
+      }
+      else
+      {
+        CHECK(Probe::hasCurrentFullAcceptedState(
+            *crowd.components[lane], *crowd.walkers[lane]));
+        CHECK(crowd.components[lane]->get_log_value() ==
+              recompute_logs_before[lane]);
+      }
+      CHECK_FALSE(Probe::hasProposal(*crowd.components[lane]));
+    }
+    checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+  };
+  audit_recompute(recompute_none, "planned RECOMPUTE_VALUE q=0", 0.0);
+  audit_recompute(recompute_sparse, "planned RECOMPUTE_VALUE sparse",
+                  0.003);
+  audit_recompute(recompute_all, "planned RECOMPUTE_VALUE all", -0.002);
+
+  // Restore complete accepted spatial state after the VALUE-only refreshes so
+  // the following ACTIVE audit begins from the same strong baseline as the
+  // rest of the selected-transaction checks.
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    crowd.walkers[lane]->R[0] = baseline_positions[lane];
+    crowd.walkers[lane]->update();
+  }
+  reset_outputs();
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              gradient_list, laplacian_list);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+    expected_active_gradients[lane] =
+        reference.evalGrad(*crowd.walkers[lane], 1);
+    for (int dimension = 0; dimension < 3; ++dimension)
+      active_gradients[lane][dimension] =
+          Value(-1700.0 - 10.0 * static_cast<double>(lane) - dimension);
+  }
+
+  PsiFormerWF::GradType* const active_gradient_data = active_gradients.data();
+  const std::size_t active_gradient_capacity = active_gradients.capacity();
+  const AllocationSnapshot active_gradient_allocations = auditAllocations([&] {
+    crowd.leader.mw_evalGrad(crowd.wfc_list, *crowd.p_list, 1,
+                             active_gradients);
+  });
+  checkNoAllocations(active_gradient_allocations,
+                     "planned ACTIVE_GRADIENT b=B");
+  CHECK(active_gradients.data() == active_gradient_data);
+  CHECK(active_gradients.size() == walker_count);
+  CHECK(active_gradients.capacity() == active_gradient_capacity);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      const Value sentinel(
+          -1700.0 - 10.0 * static_cast<double>(lane) - dimension);
+      CHECK(active_gradients[lane][dimension] != sentinel);
+      checkObservation(observe(active_gradients[lane][dimension]),
+                       observe(expected_active_gradients[lane][dimension]),
+                       2.0e-8);
+    }
+  CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 0);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+    CHECK_FALSE(Probe::hasProposal(*crowd.components[lane]));
+  }
   checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
 
   // Lane one differs from its accepted coordinates, so this is a real q=1
@@ -1089,6 +1260,150 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
                   std::logic_error);
   CHECK(sameVectorBits(gradients[0], scalar_gradient_before));
   CHECK(sameVectorBits(laplacians[0], scalar_laplacian_before));
+  checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+}
+
+TEST_CASE("PsiFormer warmed hard-plan active gradient freezes reserve storage",
+          "[wavefunction][psiformer][allocation][batch_memory]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  constexpr std::size_t walker_count = 2;
+  constexpr std::size_t reserve_walker_count = 3;
+
+  GeneratedFiles files = generateFiles("lih");
+  setBackend("direct");
+  const SimulationCell simulation_cell;
+  PlannedAllocationCrowd crowd(files, simulation_cell, walker_count);
+  PsiFormerWF reference("pf_hard_plan_active_gradient_reserve_reference",
+                        files.parameters.string(),
+                        files.configuration.string());
+  const std::string participant_id =
+      "test/psiformer/hard-plan-active-gradient-reserve";
+  const auto plan = makeAllocationPlan(
+      crowd.leader, walker_count, participant_id, reserve_walker_count);
+  bindAndPrepareAllocationCrowd(crowd, plan, participant_id);
+
+  ResourceCollection particle_resource(
+      "psiformer_hard_plan_active_gradient_reserve_particles");
+  crowd.walkers.front()->createResource(particle_resource);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(
+      particle_resource, *crowd.p_list);
+
+  ResourceCollection resource_template(
+      "psiformer_hard_plan_active_gradient_reserve_template");
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> resource_lock(
+      resource, crowd.wfc_list);
+
+  const std::size_t electron_count =
+      static_cast<std::size_t>(crowd.walkers.front()->getTotalNum());
+  std::vector<ParticleSet::ParticleGradient> gradients(walker_count);
+  std::vector<ParticleSet::ParticleLaplacian> laplacians(walker_count);
+  RefVector<ParticleSet::ParticleGradient> gradient_list;
+  RefVector<ParticleSet::ParticleLaplacian> laplacian_list;
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    gradients[lane].resize(electron_count);
+    laplacians[lane].resize(electron_count);
+    gradients[lane] = Value(0);
+    laplacians[lane] = Value(0);
+    gradient_list.push_back(gradients[lane]);
+    laplacian_list.push_back(laplacians[lane]);
+  }
+
+  // Establish accepted value/spatial state and warm the active executor before
+  // opening the allocation window at a live count below reserve capacity.
+  crowd.leader.mw_evaluateLog(crowd.wfc_list, *crowd.p_list,
+                              gradient_list, laplacian_list);
+  std::vector<PsiFormerWF::GradType> active_gradients(walker_count);
+  crowd.leader.mw_evalGrad(crowd.wfc_list, *crowd.p_list, 1,
+                           active_gradients);
+  std::vector<PsiFormerWF::GradType> expected_active_gradients(walker_count);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    expected_active_gradients[lane] =
+        reference.evalGrad(*crowd.walkers[lane], 1);
+
+  const PlannedAllocationFreeze frozen =
+      capturePlannedAllocationFreeze(crowd, resource);
+  CHECK(frozen.resource.initial_walker_capacity == walker_count);
+  CHECK(frozen.resource.reserve_walker_capacity == reserve_walker_count);
+  CHECK(frozen.resource.prepared_storage_fingerprint ==
+        frozen.resource.current_storage_fingerprint);
+  CHECK(frozen.collection_cursor == 1);
+  CHECK(frozen.outstanding_loans == 1);
+  checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+
+  PsiFormerWF::GradType* const output_data = active_gradients.data();
+  const std::size_t output_capacity = active_gradients.capacity();
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      active_gradients[lane][dimension] =
+          Value(-1900.0 - 10.0 * static_cast<double>(lane) - dimension);
+  const AllocationSnapshot allocations = auditAllocations([&] {
+    crowd.leader.mw_evalGrad(crowd.wfc_list, *crowd.p_list, 1,
+                             active_gradients);
+  });
+  checkNoAllocations(allocations, "planned ACTIVE_GRADIENT b<B");
+  CHECK(active_gradients.data() == output_data);
+  CHECK(active_gradients.size() == walker_count);
+  CHECK(active_gradients.capacity() == output_capacity);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      const Value sentinel(
+          -1900.0 - 10.0 * static_cast<double>(lane) - dimension);
+      CHECK(active_gradients[lane][dimension] != sentinel);
+      checkObservation(observe(active_gradients[lane][dimension]),
+                       observe(expected_active_gradients[lane][dimension]),
+                       2.0e-8);
+    }
+  CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 0);
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    CHECK(Probe::hasCurrentFullAcceptedState(
+        *crowd.components[lane], *crowd.walkers[lane]));
+    CHECK_FALSE(Probe::hasProposal(*crowd.components[lane]));
+  }
+  checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+
+  // Exercise VALUE refresh with live population below reserve capacity.  The
+  // selected accepted value is deliberately stale and compared with a scalar
+  // direct reference, making a no-op implementation observable.
+  const PsiFormerWF::LogValue old_log =
+      crowd.components[0]->get_log_value();
+  crowd.walkers[0]->R[0][1] += 0.0035;
+  crowd.walkers[0]->update();
+  ParticleSet::ParticleGradient reference_gradient;
+  ParticleSet::ParticleLaplacian reference_laplacian;
+  reference_gradient.resize(electron_count);
+  reference_laplacian.resize(electron_count);
+  reference_gradient = Value(0);
+  reference_laplacian = Value(0);
+  const PsiFormerWF::LogValue expected_log = reference.evaluateLog(
+      *crowd.walkers[0], reference_gradient, reference_laplacian);
+  REQUIRE(std::abs(expected_log - old_log) > 1.0e-10);
+  const std::vector<bool> recompute_sparse{true, false};
+  const AllocationSnapshot recompute_allocations = auditAllocations([&] {
+    crowd.leader.mw_recompute(crowd.wfc_list, *crowd.p_list,
+                              recompute_sparse);
+  });
+  checkNoAllocations(recompute_allocations,
+                     "planned RECOMPUTE_VALUE b<B");
+  CHECK(Probe::hasCurrentAcceptedValue(
+      *crowd.components[0], *crowd.walkers[0]));
+  CHECK_FALSE(Probe::hasCurrentFullAcceptedState(
+      *crowd.components[0], *crowd.walkers[0]));
+  CHECK(Probe::hasCurrentFullAcceptedState(
+      *crowd.components[1], *crowd.walkers[1]));
+  checkObservation(observe(crowd.components[0]->get_log_value()),
+                   observe(expected_log));
+  CHECK(std::abs(crowd.components[0]->get_log_value() - old_log) >
+        1.0e-10);
+  CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 0);
+  for (const PsiFormerWF* component : crowd.components)
+    CHECK_FALSE(Probe::hasProposal(*component));
   checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
 }
 

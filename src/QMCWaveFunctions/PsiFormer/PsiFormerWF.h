@@ -330,10 +330,21 @@ public:
       const MCMultiParticleMoves<CoordsType::POS>& moves,
       const std::vector<bool>& accepted) const override;
 
+  /// Retain the inherited scalar recompute route only without a hard batch plan.
+  void recompute(const ParticleSet& particles) override;
+
   /// Refresh selected accepted values without serial component dispatch.
   void mw_recompute(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                     const RefVectorWithLeader<ParticleSet>& p_list,
                     const std::vector<bool>& recompute) const override;
+
+  /// Preserve the inherited group-preparation no-op only without a hard plan.
+  void prepareGroup(ParticleSet& particles, int group_index) override;
+
+  /// Preserve inherited serialized group preparation only without a hard plan.
+  void mw_prepareGroup(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+                       const RefVectorWithLeader<ParticleSet>& p_list,
+                       int group_index) const override;
 
   /// Commit the wavefunction state cached by the most recent proposed move.
   void acceptMove(ParticleSet& particles, int particle_index, bool safe_to_delay = false) override;
@@ -353,6 +364,11 @@ public:
   /// Evaluate the logarithmic gradient of one electron at the accepted configuration.
   GradType evalGrad(ParticleSet& particles, int particle_index) override;
 
+  /// Preserve inherited spin-independent gradient semantics only without a hard plan.
+  GradType evalGradWithSpin(ParticleSet& particles,
+                            int particle_index,
+                            ComplexType& spin_gradient) override;
+
   /// Reject ionic gradients because imported PsiFormer models have fixed nuclei.
   GradType evalGradSource(ParticleSet& particles, ParticleSet& source, int particle_index) override;
 
@@ -369,8 +385,22 @@ public:
                    int particle_index,
                    std::vector<GradType>& gradients) const override;
 
+  /// Preserve inherited POS_SPIN gradient dispatch only without a hard plan.
+  void mw_evalGradWithSpin(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      int particle_index,
+      std::vector<GradType>& gradients,
+      std::vector<ComplexType>& spin_gradients) const override;
+
   /// Evaluate a proposed ratio and active-electron logarithmic gradient together.
   PsiValue ratioGrad(ParticleSet& particles, int particle_index, GradType& gradient) override;
+
+  /// Preserve inherited spin-independent ratio-gradient semantics only without a hard plan.
+  PsiValue ratioGradWithSpin(ParticleSet& particles,
+                             int particle_index,
+                             GradType& gradient,
+                             ComplexType& spin_gradient) override;
 
   /// Evaluate proposal ratios and active-electron gradients in one crowd traversal.
   void mw_ratioGrad(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -379,12 +409,28 @@ public:
                     std::vector<PsiValue>& ratios,
                     std::vector<GradType>& gradients) const override;
 
+  /// Preserve inherited POS_SPIN ratio-gradient dispatch only without a hard plan.
+  void mw_ratioGradWithSpin(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      int particle_index,
+      std::vector<PsiValue>& ratios,
+      std::vector<GradType>& gradients,
+      std::vector<ComplexType>& spin_gradients) const override;
+
   /// Commit or discard each walker's independently cached proposal state.
   void mw_accept_rejectMove(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                             const RefVectorWithLeader<ParticleSet>& p_list,
                             int particle_index,
                             const std::vector<bool>& is_accepted,
                             bool safe_to_delay = false) const override;
+
+  /// Preserve the inherited completion no-op only without a hard plan.
+  void completeUpdates() override;
+
+  /// Preserve inherited serialized completion only without a hard plan.
+  void mw_completeUpdates(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override;
 
   /// Evaluate replacement of each electron by ParticleSet::getActivePos() without state changes.
   void evaluateRatiosAlltoOne(ParticleSet& particles, std::vector<ValueType>& ratios) override;
@@ -920,6 +966,10 @@ private:
   bool fail_clone_preparation_before_publish_for_testing_ = false;
   /// Inject a post-evaluation FULL_VGL failure before any public-state publication.
   bool fail_planned_full_vgl_before_publish_for_testing_ = false;
+  /// Inject a post-evaluation recompute failure before accepted-value publication.
+  bool fail_planned_recompute_before_publish_for_testing_ = false;
+  /// Inject a post-evaluation active-gradient failure before caller publication.
+  bool fail_planned_active_gradient_before_publish_for_testing_ = false;
   /// Inject a post-evaluation selected-proposal failure before publication.
   bool fail_planned_selected_proposal_before_publish_for_testing_ = false;
   /// Inject a selected-resolution failure after its final read-only recheck.
