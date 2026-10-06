@@ -56,6 +56,7 @@ set(QMCDRIVERS
     WFTrain/MatrixFreeOperator.cpp
     WFTrain/KrylovSolver.cpp
     WFTrain/MatrixFreeStochasticReconfiguration.cpp
+    WFTrain/MatrixFreeLinearMethod.cpp
     WFTrain/KFACPreconditioner.cpp
     WFTrain/PsiFormerKFAC.cpp
     Optimizers/DescentEngine.cpp
