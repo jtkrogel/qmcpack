@@ -65,6 +65,28 @@ double mixedKinetic(const pf::DirectKineticResultView& result,
   return kinetic;
 }
 
+/// Evaluate the heterogeneous-mass kinetic energy represented by the lifted roots.
+double massWeightedMixedKinetic(const pf::DirectKineticResultView& result,
+                                const std::vector<double>& extra_gradient,
+                                const std::vector<double>& inverse_masses)
+{
+  double kinetic = 0.0;
+  for (std::size_t electron = 0; electron < inverse_masses.size(); ++electron)
+  {
+    kinetic -= 0.5 * inverse_masses[electron] * result.lap_log[electron];
+    double squared_total_gradient = 0.0;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const std::size_t coordinate = 3 * electron + dimension;
+      const double total = result.gradient[coordinate] +
+          extra_gradient[coordinate];
+      squared_total_gradient += total * total;
+    }
+    kinetic -= 0.5 * inverse_masses[electron] * squared_total_gradient;
+  }
+  return kinetic;
+}
+
 /// Gradient of a fixed two-body Pade Jastrow log factor a*r/(1+b*r).
 std::vector<double> jastrowGradient(const pf::Tensor& positions, std::size_t electrons)
 {
@@ -212,6 +234,11 @@ void validateSystem(const std::string& system,
   const pf::Result native_mixed = model.evaluate(positions, request);
   const pf::DirectKineticResultView direct_mixed =
       executor.evaluate(*workspace, total_gradient.data(), total_gradient.size());
+  const std::vector<double> mixed_kinetic_response(
+      direct_mixed.kinetic_parameter_response.begin(),
+      direct_mixed.kinetic_parameter_response.end());
+  const std::vector<double> mixed_score(direct_mixed.parameter_score.begin(),
+                                        direct_mixed.parameter_score.end());
   double maximum_mixed_error = 0.0;
   for (std::size_t parameter = 0; parameter < direct_mixed.parameter_score.size(); ++parameter)
     maximum_mixed_error = std::max(
@@ -220,6 +247,70 @@ void validateSystem(const std::string& system,
                  native_mixed.local_energy_param_gradient[parameter]));
   CHECK(maximum_mixed_error < 3e-6);
 
+  // The explicit-mass overload applies the electron-specific inverse mass to
+  // both Cartesian and trace roots.  Unit masses reproduce the compatibility
+  // overload, while heterogeneous masses agree with parameter finite differences.
+  std::vector<double> unit_inverse_masses(model.ne, 1.0);
+  const pf::DirectKineticResultView direct_unit_masses = executor.evaluate(
+      *workspace, total_gradient.data(), total_gradient.size(),
+      unit_inverse_masses.data(), unit_inverse_masses.size());
+  for (std::size_t parameter = 0;
+       parameter < direct_unit_masses.kinetic_parameter_response.size(); ++parameter)
+    checkClose(direct_unit_masses.kinetic_parameter_response[parameter],
+               mixed_kinetic_response[parameter], 1e-13, 1e-13);
+
+  std::vector<double> inverse_masses(model.ne);
+  for (std::size_t electron = 0; electron < model.ne; ++electron)
+    inverse_masses[electron] = 0.55 + 0.17 * electron;
+  CHECK_THROWS_AS(
+      executor.evaluate(*workspace, total_gradient.data(), total_gradient.size(),
+                        inverse_masses.data(), inverse_masses.size() - 1),
+      std::invalid_argument);
+  std::vector<double> invalid_masses = inverse_masses;
+  invalid_masses[0] = 0.0;
+  CHECK_THROWS_AS(
+      executor.evaluate(*workspace, total_gradient.data(), total_gradient.size(),
+                        invalid_masses.data(), invalid_masses.size()),
+      std::invalid_argument);
+  invalid_masses[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(
+      executor.evaluate(*workspace, total_gradient.data(), total_gradient.size(),
+                        invalid_masses.data(), invalid_masses.size()),
+      std::invalid_argument);
+  std::vector<double> invalid_drift = total_gradient;
+  invalid_drift[0] = std::numeric_limits<double>::infinity();
+  CHECK_THROWS_AS(
+      executor.evaluate(*workspace, invalid_drift.data(), invalid_drift.size(),
+                        inverse_masses.data(), inverse_masses.size()),
+      std::invalid_argument);
+
+  const pf::DirectKineticResultView direct_mass_weighted = executor.evaluate(
+      *workspace, total_gradient.data(), total_gradient.size(),
+      inverse_masses.data(), inverse_masses.size());
+  const std::array<std::size_t, 2> mass_probes{0, golden.indices.back()};
+  std::array<double, 2> baseline_mass_response{};
+  for (std::size_t probe = 0; probe < mass_probes.size(); ++probe)
+    baseline_mass_response[probe] =
+        direct_mass_weighted.kinetic_parameter_response[mass_probes[probe]];
+  const double mass_step = 2e-5;
+  for (std::size_t probe = 0; probe < mass_probes.size(); ++probe)
+  {
+    const std::size_t parameter = mass_probes[probe];
+    const double original = model.p.flat_values()[parameter];
+    model.p.set_flat_value(parameter, original + mass_step);
+    const pf::DirectKineticResultView plus = executor.evaluate(*workspace);
+    const double plus_kinetic =
+        massWeightedMixedKinetic(plus, extra_gradient, inverse_masses);
+    model.p.set_flat_value(parameter, original - mass_step);
+    const pf::DirectKineticResultView minus = executor.evaluate(*workspace);
+    const double minus_kinetic =
+        massWeightedMixedKinetic(minus, extra_gradient, inverse_masses);
+    model.p.set_flat_value(parameter, original);
+    checkClose(baseline_mass_response[probe],
+               (plus_kinetic - minus_kinetic) / (2.0 * mass_step),
+               4e-4, 4e-4);
+  }
+
   if (finite_difference)
   {
     const std::array<std::size_t, 3> probes{0, 127, golden.indices.back()};
@@ -227,8 +318,8 @@ void validateSystem(const std::string& system,
     std::array<double, 3> baseline_kinetic{};
     for (std::size_t probe = 0; probe < probes.size(); ++probe)
     {
-      baseline_score[probe] = direct_mixed.parameter_score[probes[probe]];
-      baseline_kinetic[probe] = direct_mixed.kinetic_parameter_response[probes[probe]];
+      baseline_score[probe] = mixed_score[probes[probe]];
+      baseline_kinetic[probe] = mixed_kinetic_response[probes[probe]];
     }
     const double step = 2e-5;
     for (std::size_t probe = 0; probe < probes.size(); ++probe)

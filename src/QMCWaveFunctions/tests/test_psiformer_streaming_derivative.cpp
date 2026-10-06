@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <complex>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,32 @@ using wftrain::SampleProductSink;
 using wftrain::SampleProductTileConstView;
 using wftrain::StreamingDerivativeOperator;
 using wftrain::VJPCoefficientChannel;
+
+/// Restore one process environment setting after a backend-selection check.
+class ScopedEnvironmentVariable
+{
+public:
+  ScopedEnvironmentVariable(std::string name, const char* value)
+      : name_(std::move(name))
+  {
+    if (const char* previous = std::getenv(name_.c_str()))
+      previous_ = previous;
+    if (setenv(name_.c_str(), value, 1) != 0)
+      throw std::runtime_error("failed to set PsiFormer test environment");
+  }
+
+  ~ScopedEnvironmentVariable()
+  {
+    if (previous_)
+      setenv(name_.c_str(), previous_->c_str(), 1);
+    else
+      unsetenv(name_.c_str());
+  }
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
 
 /// Construct the electron ParticleSet matching the generated LiH fixture.
 ParticleSet makeElectrons(const SimulationCell& simulation_cell)
@@ -238,7 +266,7 @@ public:
 
 } // namespace
 
-TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
+TEST_CASE("PsiFormer streams bounded score and kinetic products",
           "[wavefunction][psiformer][training][streaming]")
 {
   using namespace testing::psiformer;
@@ -255,6 +283,25 @@ TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
   PsiFormerWF clone(component);
   OptVariables active = registerSelectedParameters(component);
   REQUIRE(active.size() == selected.size());
+
+  // Populate the authoritative complete TrialWaveFunction drift before the
+  // factory snapshots it.  The deterministic offset represents a fixed
+  // companion factor and exercises the kinetic cross term without adding a
+  // second trainable provider.
+  electrons0.G = QMCTraits::GradType{};
+  electrons0.L = QMCTraits::ValueType{};
+  electrons1.G = QMCTraits::GradType{};
+  electrons1.L = QMCTraits::ValueType{};
+  component.evaluateLog(electrons0, electrons0.G, electrons0.L);
+  clone.evaluateLog(electrons1, electrons1.G, electrons1.L);
+  for (int electron = 0; electron < electrons0.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      const double fixed_drift =
+          0.007 * (1 + electron) * (dimension % 2 == 0 ? 1.0 : -1.0);
+      electrons0.G[electron][dimension] += fixed_drift;
+      electrons1.G[electron][dimension] -= 0.6 * fixed_drift;
+    }
 
   RefVectorWithLeader<WaveFunctionComponent> components(component);
   components.push_back(component);
@@ -288,6 +335,24 @@ TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
   CHECK_THROWS(component.makeStreamingDerivativeOperator(
       foreign_components, particles, 31, 17, 257));
 
+  // A component configured with an oracle kinetic backend cannot advertise the
+  // direct streaming capability, even when its score backend is direct.
+  std::unique_ptr<PsiFormerWF> oracle_kinetic_component;
+  {
+    ScopedEnvironmentVariable kinetic_backend("PSIFORMER_KINETIC_BACKEND",
+                                               "oracle");
+    oracle_kinetic_component = std::make_unique<PsiFormerWF>(
+        "pf_stream_oracle_kinetic", files.parameters.string(),
+        files.configuration.string());
+  }
+  RefVectorWithLeader<WaveFunctionComponent> oracle_kinetic_components(
+      *oracle_kinetic_component);
+  oracle_kinetic_components.push_back(*oracle_kinetic_component);
+  RefVectorWithLeader<ParticleSet> oracle_kinetic_particles(electrons0);
+  oracle_kinetic_particles.push_back(electrons0);
+  CHECK_THROWS(oracle_kinetic_component->makeStreamingDerivativeOperator(
+      oracle_kinetic_components, oracle_kinetic_particles, 31, 17, 257));
+
   ParticleSet wrong_spin = makeElectrons(simulation_cell);
   wrong_spin.GroupID[0]   = 1;
   RefVectorWithLeader<WaveFunctionComponent> one_valid_component(component);
@@ -303,6 +368,24 @@ TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
   nonfinite_particles.push_back(nonfinite);
   CHECK_THROWS(component.makeStreamingDerivativeOperator(
       one_valid_component, nonfinite_particles, 31, 17, 257));
+
+  ParticleSet nonfinite_drift = electrons0;
+  nonfinite_drift.G[0][0] = std::numeric_limits<double>::infinity();
+  RefVectorWithLeader<ParticleSet> nonfinite_drift_particles(nonfinite_drift);
+  nonfinite_drift_particles.push_back(nonfinite_drift);
+  CHECK_THROWS(component.makeStreamingDerivativeOperator(
+      one_valid_component, nonfinite_drift_particles, 31, 17, 257));
+
+  ParticleSet invalid_mass = electrons0;
+  SpeciesSet& invalid_mass_species = invalid_mass.getSpeciesSet();
+  const int mass_attribute = invalid_mass_species.getAttribute("mass");
+  REQUIRE(mass_attribute >= 0);
+  invalid_mass_species(mass_attribute, 0) = 0.0;
+  invalid_mass.resetGroups();
+  RefVectorWithLeader<ParticleSet> invalid_mass_particles(invalid_mass);
+  invalid_mass_particles.push_back(invalid_mass);
+  CHECK_THROWS(component.makeStreamingDerivativeOperator(
+      one_valid_component, invalid_mass_particles, 31, 17, 257));
 
   // A one-sample owner has exactly the same P-dependent storage as the full batch.
   RefVectorWithLeader<WaveFunctionComponent> one_component(component);
@@ -322,26 +405,31 @@ TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
   const auto storage    = op->storageDiagnostics();
   CHECK(capability.supports(DerivativeProduct::SCORE_VJP));
   CHECK(capability.supports(DerivativeProduct::SCORE_JVP));
-  CHECK_FALSE(capability.supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+  CHECK(capability.supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+  CHECK(capability.local_energy_term_mask ==
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC));
   CHECK(capability.maximum_vjp_channels == 3);
   CHECK(capability.maximum_sample_tile_size == 1);
-  CHECK(capability.fixed_parameter_scratch_vectors == 4);
+  CHECK(capability.fixed_parameter_scratch_vectors == 6);
   CHECK(storage.parameter_count == component.parameterSchema().parameterCount());
   CHECK(storage.sample_count == 2);
-  CHECK(storage.real_parameter_vectors == 1);
+  CHECK(storage.real_parameter_vectors == 3);
   CHECK(storage.complex_parameter_vectors == 3);
   CHECK(storage.parameter_scratch_bytes ==
         storage.parameter_count *
-            (sizeof(double) + 3 * sizeof(DerivativeValue)));
+            (3 * sizeof(double) + 3 * sizeof(DerivativeValue)));
   CHECK(storage.retained_numeric_bytes ==
         storage.evaluator_workspace_bytes +
             3 * storage.parameter_count * sizeof(DerivativeValue) +
-            storage.sample_position_bytes + storage.sample_product_bytes);
+            storage.sample_position_bytes + storage.sample_auxiliary_bytes +
+            storage.sample_product_bytes);
   CHECK(storage.parameter_scratch_bytes ==
         one_sample_storage.parameter_scratch_bytes);
   CHECK(storage.evaluator_workspace_bytes ==
         one_sample_storage.evaluator_workspace_bytes);
   CHECK(storage.sample_position_bytes == 2 * one_sample_storage.sample_position_bytes);
+  CHECK(storage.sample_auxiliary_bytes ==
+        2 * one_sample_storage.sample_auxiliary_bytes);
   CHECK(storage.sample_product_bytes == 2 * one_sample_storage.sample_product_bytes);
   CHECK(storage.allocation_generation == 1);
   CHECK(storage.storage_fingerprint != 0);
@@ -349,28 +437,59 @@ TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
   // Existing selected-score evaluations provide a separate high-level oracle.
   std::vector<std::vector<DerivativeValue>> expected_scores(
       2, std::vector<DerivativeValue>(selected.size()));
+  std::vector<std::vector<DerivativeValue>> expected_kinetic(
+      2, std::vector<DerivativeValue>(selected.size()));
   for (std::size_t sample = 0; sample < 2; ++sample)
   {
-    Vector<QMCTraits::ValueType> legacy(active.size());
-    legacy = QMCTraits::ValueType{};
+    Vector<QMCTraits::ValueType> legacy_score(active.size());
+    Vector<QMCTraits::ValueType> legacy_kinetic(active.size());
+    legacy_score   = QMCTraits::ValueType{};
+    legacy_kinetic = QMCTraits::ValueType{};
     auto& sample_component =
         dynamic_cast<PsiFormerWF&>(components[sample]);
-    sample_component.evaluateDerivativesWF(particles[sample], active, legacy);
+    sample_component.evaluateDerivatives(particles[sample], active, legacy_score,
+                                         legacy_kinetic);
     for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
+    {
       expected_scores[sample][parameter] = {
-          static_cast<double>(std::real(legacy[parameter])),
-          static_cast<double>(std::imag(legacy[parameter]))};
+          static_cast<double>(std::real(legacy_score[parameter])),
+          static_cast<double>(std::imag(legacy_score[parameter]))};
+      expected_kinetic[sample][parameter] = {
+          static_cast<double>(std::real(legacy_kinetic[parameter])),
+          static_cast<double>(std::imag(legacy_kinetic[parameter]))};
+    }
   }
 
   const std::vector<DerivativeValue> coefficients0{{0.7, -0.2},
                                                     {-0.3, 0.5}};
   const std::vector<DerivativeValue> coefficients1{{-0.4, 0.1},
                                                     {0.2, 0.6}};
+  const std::vector<DerivativeValue> coefficients2{{0.31, -0.27},
+                                                    {-0.22, 0.14}};
   const std::vector<VJPCoefficientChannel> channels{
       {"energy", DerivativeProduct::SCORE_VJP,
        coefficientsFor(*op, coefficients0), 0},
       {"metric", DerivativeProduct::SCORE_VJP,
-       coefficientsFor(*op, coefficients1), 0}};
+       coefficientsFor(*op, coefficients1), 0},
+      {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP,
+       coefficientsFor(*op, coefficients2),
+       wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)}};
+
+  // Exercise the dedicated score-only runtime branch independently of the
+  // fused kinetic traversal.
+  const std::vector<VJPCoefficientChannel> score_only_channels{
+      {"score_only", DerivativeProduct::SCORE_VJP,
+       coefficientsFor(*op, coefficients0), 0}};
+  SelectedParameterSink score_only_sink(selected);
+  op->applyVJPs({score_only_channels.data(), score_only_channels.size()},
+                wftrain::DerivativeAdjoint::TRANSPOSE, score_only_sink);
+  for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
+  {
+    DerivativeValue expected{};
+    for (std::size_t sample = 0; sample < 2; ++sample)
+      expected += coefficients0[sample] * expected_scores[sample][parameter];
+    checkClose(score_only_sink.results()[0][parameter], expected);
+  }
 
   SelectedParameterSink transpose_sink(selected);
   op->applyVJPs({channels.data(), channels.size()},
@@ -383,10 +502,27 @@ TEST_CASE("PsiFormer streams bounded score VJPs and JVPs",
     {
       DerivativeValue expected{};
       for (std::size_t sample = 0; sample < 2; ++sample)
-        expected += channels[channel].coefficients.values[sample] *
-            expected_scores[sample][parameter];
+      {
+        const DerivativeValue oracle = channels[channel].product ==
+                DerivativeProduct::LOCAL_ENERGY_VJP
+            ? expected_kinetic[sample][parameter]
+            : expected_scores[sample][parameter];
+        expected += channels[channel].coefficients.values[sample] * oracle;
+      }
       checkClose(transpose_sink.results()[channel][parameter], expected);
     }
+
+  // Nonlocal coverage is intentionally deferred.  Common preflight rejects it
+  // before beginning or poisoning caller-owned sink state.
+  const std::vector<VJPCoefficientChannel> unsupported_channels{
+      {"unsupported_ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+       coefficientsFor(*op, coefficients2),
+       wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP)}};
+  SelectedParameterSink unsupported_sink(selected);
+  CHECK_THROWS(op->applyVJPs(
+      {unsupported_channels.data(), unsupported_channels.size()},
+      wftrain::DerivativeAdjoint::TRANSPOSE, unsupported_sink));
+  CHECK(unsupported_sink.state() == DerivativeSinkState::IDLE);
 
   // The imported Jacobian is real, so transpose and Hermitian products coincide.
   SelectedParameterSink hermitian_sink(selected);

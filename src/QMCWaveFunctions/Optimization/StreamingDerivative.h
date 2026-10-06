@@ -547,6 +547,7 @@ struct StreamingDerivativeStorageDiagnostics
   std::size_t parameter_scratch_bytes         = 0;
   std::size_t evaluator_workspace_bytes       = 0;
   std::size_t sample_position_bytes           = 0;
+  std::size_t sample_auxiliary_bytes           = 0;
   std::size_t sample_product_bytes            = 0;
   std::size_t retained_numeric_bytes          = 0;
   std::size_t allocation_generation           = 0;
@@ -590,7 +591,7 @@ public:
    * high-parameter providers override this method so their independent owner can be
    * incorporated into the driver-wide budget before execution.
    */
-  virtual StreamingDerivativeStorageDiagnostics storageDiagnostics() const noexcept { return {}; }
+  virtual StreamingDerivativeStorageDiagnostics storageDiagnostics() const { return {}; }
 
   /// Apply several independently weighted score/local-energy VJPs in one traversal.
   void applyVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,

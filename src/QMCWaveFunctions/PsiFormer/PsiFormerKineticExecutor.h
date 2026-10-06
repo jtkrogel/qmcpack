@@ -280,6 +280,30 @@ public:
   /// Return the stable backing address of the canonical kinetic-response vector.
   const double* kineticData() const noexcept { return kinetic_parameter_response_.data(); }
 
+  /// Return the fixed number of canonical score components.
+  std::size_t scoreSize() const noexcept { return parameter_score_.size(); }
+
+  /// Return the fixed number of canonical kinetic-response components.
+  std::size_t kineticSize() const noexcept
+  {
+    return kinetic_parameter_response_.size();
+  }
+
+  /// Return bytes retained by the two canonical parameter-response vectors.
+  std::size_t parameterStorageBytes() const
+  {
+    std::size_t bytes = checkedStorageBytes<double>(
+        parameter_score_.capacity(),
+        "PsiFormer kinetic score-vector bytes overflowed");
+    addStorageBytes(
+        bytes,
+        checkedStorageBytes<double>(
+            kinetic_parameter_response_.capacity(),
+            "PsiFormer kinetic response-vector bytes overflowed"),
+        "PsiFormer kinetic parameter-vector bytes overflowed");
+    return bytes;
+  }
+
   /// Hash every explicit backing allocation for warmed-call stability tests.
   std::size_t storageFingerprint() const noexcept
   {
@@ -333,6 +357,8 @@ public:
                                &parameter_score_, &kinetic_parameter_response_,
                                &matrix_scratch_a_, &matrix_scratch_b_, &matrix_scratch_c_})
       mix(*buffer);
+    hash ^= geometry_.storageFingerprint();
+    hash *= 1099511628211ULL;
     hash ^= determinant_.storageFingerprint();
     hash *= 1099511628211ULL;
     return hash;
@@ -536,6 +562,17 @@ public:
   DirectKineticResultView evaluate(DirectKineticWorkspace& workspace,
                                    const double* total_log_gradient = nullptr,
                                    std::size_t total_log_gradient_size = 0) const;
+
+  /** Evaluate with explicit positive inverse masses for each electron.
+   *
+   * This overload preserves the unit-mass entry point above while allowing the
+   * streaming local-energy route to match the kinetic Hamiltonian exactly.
+   */
+  DirectKineticResultView evaluate(DirectKineticWorkspace& workspace,
+                                   const double* total_log_gradient,
+                                   std::size_t total_log_gradient_size,
+                                   const double* inverse_masses,
+                                   std::size_t inverse_mass_count) const;
 
 private:
   using ParameterRole = qmcplusplus::psiformer::ParameterRole;
@@ -2157,10 +2194,36 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
     const double* total_log_gradient,
     std::size_t total_log_gradient_size) const
 {
+  return evaluate(workspace, total_log_gradient, total_log_gradient_size,
+                  nullptr, 0);
+}
+
+/// Evaluate score and mass-weighted kinetic response from one shared forward tape.
+inline DirectKineticResultView DirectKineticExecutor::evaluate(
+    DirectKineticWorkspace& workspace,
+    const double* total_log_gradient,
+    std::size_t total_log_gradient_size,
+    const double* inverse_masses,
+    std::size_t inverse_mass_count) const
+{
   validateWorkspace(workspace);
   if ((total_log_gradient && total_log_gradient_size != workspace.gradient_lanes_) ||
       (!total_log_gradient && total_log_gradient_size != 0))
     throw std::invalid_argument("PsiFormer total TrialWaveFunction drift has the wrong size");
+  if (total_log_gradient)
+    for (std::size_t lane = 0; lane < total_log_gradient_size; ++lane)
+      if (!is_finite_parameter_value(total_log_gradient[lane]))
+        throw std::invalid_argument(
+            "PsiFormer total TrialWaveFunction drift must be finite");
+  if ((inverse_masses && inverse_mass_count != workspace.laplacian_lanes_) ||
+      (!inverse_masses && inverse_mass_count != 0))
+    throw std::invalid_argument("PsiFormer inverse-mass view has the wrong size");
+  if (inverse_masses)
+    for (std::size_t electron = 0; electron < inverse_mass_count; ++electron)
+      if (!is_finite_parameter_value(inverse_masses[electron]) ||
+          inverse_masses[electron] <= 0.0)
+        throw std::invalid_argument(
+            "PsiFormer inverse masses must be finite and positive");
 
   const double* parameter_values = parameters_.flat_values().data();
   workspace.geometry_.update(GeometryPositionView::interleaved(
@@ -2220,9 +2283,16 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
   const double* drift = total_log_gradient ? total_log_gradient
                                            : workspace.output_gradient_.data();
   for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
-    workspace.root_adjoint_.gradient[lane] = -drift[lane];
-  std::fill(workspace.root_adjoint_.laplacian.begin(),
-            workspace.root_adjoint_.laplacian.end(), -0.5);
+  {
+    const std::size_t electron = lane / 3;
+    const double inverse_mass = inverse_masses ? inverse_masses[electron] : 1.0;
+    workspace.root_adjoint_.gradient[lane] = -inverse_mass * drift[lane];
+  }
+  for (std::size_t electron = 0; electron < workspace.laplacian_lanes_; ++electron)
+  {
+    const double inverse_mass = inverse_masses ? inverse_masses[electron] : 1.0;
+    workspace.root_adjoint_.laplacian[electron] = -0.5 * inverse_mass;
+  }
   reverse(parameter_values, workspace, workspace.kinetic_parameter_response_);
 
   for (double value : workspace.parameter_score_)

@@ -829,13 +829,14 @@ private:
   std::shared_lock<std::shared_mutex> metadata_lock_;
 };
 
-/** Apply bounded score products without materializing a sample-by-parameter matrix.
+/** Apply bounded score and kinetic products without a sample-by-parameter matrix.
  *
- * The operator owns one reusable direct-score tape, three fixed complex contraction
- * vectors, and a packed copy of the ordered sample positions.  Its numeric storage is
- * therefore O(P)+O(B Ne), independent of sample history.  It is an independent memory
- * owner: the training driver must add storageDiagnostics().retained_numeric_bytes to
- * its aggregate memory budget before constructing the operator.
+ * The operator owns reusable direct score and kinetic tapes, three fixed complex
+ * contraction vectors, and packed copies of positions, complete TrialWaveFunction
+ * drift, and inverse masses.  Its numeric storage is therefore O(P)+O(B Ne),
+ * independent of sample history.  It is an independent memory owner: the training
+ * driver must add storageDiagnostics().retained_numeric_bytes to its aggregate memory
+ * budget before constructing the operator.
  */
 class PsiFormerStreamingDerivativeOperator final : public wftrain::StreamingDerivativeOperator
 {
@@ -853,6 +854,8 @@ public:
       std::size_t sample_offset,
       std::size_t sample_count,
       std::vector<double> positions,
+      std::vector<double> total_log_gradients,
+      std::vector<double> inverse_masses,
       std::size_t maximum_parameter_chunk_size)
       : model_state_(std::move(model_state)),
         schema_(std::move(schema)),
@@ -862,8 +865,11 @@ public:
         sample_count_(sample_count),
         electron_count_(model_state_->execution_plan.modelShape().electrons()),
         positions_(std::move(positions)),
+        total_log_gradients_(std::move(total_log_gradients)),
+        inverse_masses_(std::move(inverse_masses)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
         score_workspace_(model_state_->direct_score_executor.makeWorkspace()),
+        kinetic_workspace_(model_state_->direct_kinetic_executor.makeWorkspace()),
         channel_accumulators_{makeParameterVector(schema_->parameterCount()),
                               makeParameterVector(schema_->parameterCount()),
                               makeParameterVector(schema_->parameterCount())},
@@ -872,21 +878,31 @@ public:
     const std::size_t expected_positions = checkedPositionCount(sample_count_, electron_count_);
     if (positions_.size() != expected_positions)
       throw std::invalid_argument("PsiFormer streaming derivative received the wrong position extent");
+    if (total_log_gradients_.size() != expected_positions)
+      throw std::invalid_argument(
+          "PsiFormer streaming derivative received the wrong total-drift extent");
+    const std::size_t expected_masses = checkedMassCount(sample_count_, electron_count_);
+    if (inverse_masses_.size() != expected_masses)
+      throw std::invalid_argument(
+          "PsiFormer streaming derivative received the wrong inverse-mass extent");
     if (schema_->parameterCount() != model_state_->execution_plan.parameterCount() ||
-        score_workspace_->scoreSize() != schema_->parameterCount())
+        score_workspace_->scoreSize() != schema_->parameterCount() ||
+        kinetic_workspace_->scoreSize() != schema_->parameterCount() ||
+        kinetic_workspace_->kineticSize() != schema_->parameterCount())
       throw std::invalid_argument("PsiFormer streaming derivative schema does not match the execution plan");
     checkedBatchMemoryAdd(sample_offset_, sample_count_,
                           "PsiFormer streaming derivative sample interval");
     initializeStorageDiagnostics();
   }
 
-  /// Advertise score-only products and the fixed four-vector O(P) scratch bound.
+  /// Advertise score and kinetic products with the exact six-vector O(P) bound.
   wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
   {
     wftrain::StreamingDerivativeCapabilities result;
     result.product_mask =
         wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_VJP) |
-        wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_JVP);
+        wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_JVP) |
+        wftrain::derivativeProductBit(wftrain::DerivativeProduct::LOCAL_ENERGY_VJP);
     result.adjoint_mask =
         wftrain::derivativeAdjointBit(wftrain::DerivativeAdjoint::TRANSPOSE) |
         wftrain::derivativeAdjointBit(wftrain::DerivativeAdjoint::HERMITIAN);
@@ -894,10 +910,12 @@ public:
     result.result_scalar_domain    = wftrain::ParameterScalarDomain::COMPLEX128;
     result.reduction_domain        = wftrain::ReductionDomain::CROWD_LOCAL;
     result.execution_domain        = wftrain::DerivativeExecutionDomain::HOST;
+    result.local_energy_term_mask =
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
     result.maximum_vjp_channels              = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size          = 1;
-    result.fixed_parameter_scratch_vectors   = 1 + MAXIMUM_VJP_CHANNELS;
+    result.fixed_parameter_scratch_vectors   = 3 + MAXIMUM_VJP_CHANNELS;
     result.block_streaming                   = true;
     return result;
   }
@@ -927,13 +945,21 @@ public:
   }
 
   /// Return exact prepared numeric bytes and allocation-identity evidence.
-  wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const noexcept override
+  wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
   {
-    return storage_diagnostics_;
+    wftrain::StreamingDerivativeStorageDiagnostics current =
+        measureStorageDiagnostics();
+    if (storage_diagnostics_.storage_fingerprint != 0 &&
+        current.storage_fingerprint !=
+            storage_diagnostics_.storage_fingerprint)
+      current.allocation_generation = checkedBatchMemoryAdd(
+          storage_diagnostics_.allocation_generation, std::size_t{1},
+          "PsiFormer streaming allocation generation");
+    return current;
   }
 
 protected:
-  /// Accumulate at most three score VJPs, then emit canonical bounded chunks.
+  /// Accumulate fused score/kinetic VJPs, then emit canonical bounded chunks.
   void evaluateVJPs(
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
       wftrain::DerivativeAdjoint,
@@ -947,22 +973,47 @@ protected:
                   channel_accumulators_[channel].end(),
                   wftrain::DerivativeValue{});
 
+      const bool needs_kinetic = std::any_of(
+          channels.begin(), channels.end(), [](const auto& channel) {
+            return channel.product ==
+                wftrain::DerivativeProduct::LOCAL_ENERGY_VJP;
+          });
+
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
-        setWorkspacePositions(sample);
-        const pf::DirectScoreResult score =
-            model_state_->direct_score_executor.evaluate(*score_workspace_);
-        requireResultVersion(score);
-        for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        if (needs_kinetic)
         {
-          const wftrain::DerivativeValue coefficient =
-              channels[channel].coefficients.values[sample];
-          std::vector<wftrain::DerivativeValue>& destination =
-              channel_accumulators_[channel];
-          for (std::size_t parameter = 0;
-               parameter < score.parameter_score.size; ++parameter)
-            destination[parameter] +=
-                coefficient * score.parameter_score[parameter];
+          setKineticWorkspacePositions(sample);
+          const double* total_drift = total_log_gradients_.data() +
+              sample * electron_count_ * std::size_t{3};
+          const double* inverse_mass = inverse_masses_.data() +
+              sample * electron_count_;
+          const pf::DirectKineticResultView result =
+              model_state_->direct_kinetic_executor.evaluate(
+                  *kinetic_workspace_, total_drift,
+                  electron_count_ * std::size_t{3}, inverse_mass,
+                  electron_count_);
+          requireResultVersion(result);
+          for (std::size_t channel = 0; channel < channels.size(); ++channel)
+          {
+            const auto response = channels[channel].product ==
+                    wftrain::DerivativeProduct::LOCAL_ENERGY_VJP
+                ? result.kinetic_parameter_response
+                : result.parameter_score;
+            accumulateResponse(
+                channel, channels[channel].coefficients.values[sample], response);
+          }
+        }
+        else
+        {
+          setScoreWorkspacePositions(sample);
+          const pf::DirectScoreResult score =
+              model_state_->direct_score_executor.evaluate(*score_workspace_);
+          requireResultVersion(score);
+          for (std::size_t channel = 0; channel < channels.size(); ++channel)
+            accumulateResponse(
+                channel, channels[channel].coefficients.values[sample],
+                score.parameter_score);
         }
       }
     }
@@ -987,7 +1038,7 @@ protected:
       requireBoundVersion();
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
-        setWorkspacePositions(sample);
+        setScoreWorkspacePositions(sample);
         const pf::DirectScoreResult score =
             model_state_->direct_score_executor.evaluate(*score_workspace_);
         requireResultVersion(score);
@@ -1022,6 +1073,14 @@ private:
         std::size_t{3}, "PsiFormer streaming Cartesian positions");
   }
 
+  /// Validate one sample-major inverse-mass extent with checked arithmetic.
+  static std::size_t checkedMassCount(std::size_t samples,
+                                      std::size_t electrons)
+  {
+    return checkedBatchMemoryMultiply(
+        samples, electrons, "PsiFormer streaming inverse masses");
+  }
+
   /// Validate one complex P-vector byte extent before allocating it.
   static std::vector<wftrain::DerivativeValue> makeParameterVector(
       std::size_t parameter_count)
@@ -1042,12 +1101,51 @@ private:
   }
 
   /// Copy one packed configuration into the reusable score workspace.
-  void setWorkspacePositions(std::size_t sample) const
+  void setScoreWorkspacePositions(std::size_t sample) const
   {
     const double* positions =
         positions_.data() + sample * electron_count_ * std::size_t{3};
     score_workspace_->setPositions(
         pf::GeometryPositionView::interleaved(positions, electron_count_));
+  }
+
+  /// Copy one packed configuration into the reusable kinetic workspace.
+  void setKineticWorkspacePositions(std::size_t sample) const
+  {
+    const double* positions =
+        positions_.data() + sample * electron_count_ * std::size_t{3};
+    kinetic_workspace_->setPositions(
+        pf::GeometryPositionView::interleaved(positions, electron_count_));
+  }
+
+  /// Fold one real canonical response into a complex coefficient channel.
+  template<class ResponseView>
+  void accumulateResponse(std::size_t channel,
+                          wftrain::DerivativeValue coefficient,
+                          const ResponseView& response) const
+  {
+    const std::size_t response_size = responseExtent(response);
+    if (response_size != schema_->parameterCount())
+      throw std::logic_error(
+          "PsiFormer streaming response has the wrong parameter extent");
+    std::vector<wftrain::DerivativeValue>& destination =
+        channel_accumulators_[channel];
+    for (std::size_t parameter = 0; parameter < response_size; ++parameter)
+      destination[parameter] += coefficient * response[parameter];
+  }
+
+  /// Return the extent of the score executor's dependency-light response view.
+  static std::size_t responseExtent(
+      const pf::DirectParameterScoreView& response) noexcept
+  {
+    return response.size;
+  }
+
+  /// Return the extent of the kinetic executor's span-like response view.
+  static std::size_t responseExtent(
+      const pf::DirectKineticConstView& response) noexcept
+  {
+    return response.size();
   }
 
   /// Reject publication that occurred after this operator was prepared.
@@ -1066,6 +1164,14 @@ private:
           "PsiFormer streaming derivative result has the wrong parameter version");
   }
 
+  /// Reject a kinetic result not produced from the bound read transaction.
+  void requireResultVersion(const pf::DirectKineticResultView& result) const
+  {
+    if (result.parameter_version != parameter_version_)
+      throw std::logic_error(
+          "PsiFormer streaming kinetic result has the wrong parameter version");
+  }
+
   /// Mix one allocation identity into the stable prepared-storage fingerprint.
   static void mixFingerprint(std::size_t& fingerprint, std::size_t value) noexcept
   {
@@ -1073,10 +1179,27 @@ private:
         (fingerprint >> 2);
   }
 
-  /// Measure every retained numeric allocation after construction succeeds.
+  /// Cache the construction-time identity used to detect later storage changes.
   void initializeStorageDiagnostics()
   {
+    storage_diagnostics_ = measureStorageDiagnostics();
+  }
+
+  /// Re-measure every retained numeric owner for live warmed-call diagnostics.
+  wftrain::StreamingDerivativeStorageDiagnostics measureStorageDiagnostics() const
+  {
     const std::size_t score_bytes = score_workspace_->scoreStorageBytes();
+    const std::size_t kinetic_parameter_bytes =
+        kinetic_workspace_->parameterStorageBytes();
+    const std::size_t expected_kinetic_parameter_bytes =
+        checkedBatchMemoryMultiply(
+            checkedBatchMemoryMultiply(
+                std::size_t{2}, schema_->parameterCount(),
+                "PsiFormer streaming kinetic parameter vectors"),
+            sizeof(double), "PsiFormer streaming kinetic parameter bytes");
+    if (kinetic_parameter_bytes != expected_kinetic_parameter_bytes)
+      throw std::length_error(
+          "PsiFormer streaming kinetic parameter storage is not exact");
     std::size_t channel_bytes     = 0;
     for (const auto& channel : channel_accumulators_)
       channel_bytes = checkedBatchMemoryAdd(
@@ -1088,27 +1211,50 @@ private:
     const std::size_t position_bytes = checkedBatchMemoryMultiply(
         positions_.capacity(), sizeof(double),
         "PsiFormer streaming position capacity");
+    const std::size_t gradient_bytes = checkedBatchMemoryMultiply(
+        total_log_gradients_.capacity(), sizeof(double),
+        "PsiFormer streaming total-drift capacity");
+    const std::size_t inverse_mass_bytes = checkedBatchMemoryMultiply(
+        inverse_masses_.capacity(), sizeof(double),
+        "PsiFormer streaming inverse-mass capacity");
+    const std::size_t auxiliary_bytes = checkedBatchMemoryAdd(
+        gradient_bytes, inverse_mass_bytes,
+        "PsiFormer streaming sample auxiliary storage");
     const std::size_t sample_product_bytes = checkedBatchMemoryMultiply(
         sample_products_.capacity(), sizeof(wftrain::DerivativeValue),
         "PsiFormer streaming sample-product capacity");
-    const std::size_t workspace_bytes = score_workspace_->vectorStorageBytes();
+    const std::size_t workspace_bytes = checkedBatchMemoryAdd(
+        score_workspace_->vectorStorageBytes(),
+        kinetic_workspace_->vectorStorageBytes(),
+        "PsiFormer streaming evaluator workspaces");
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
-        score_bytes, channel_bytes,
+        checkedBatchMemoryAdd(score_bytes, kinetic_parameter_bytes,
+                              "PsiFormer streaming real parameter scratch"),
+        channel_bytes,
         "PsiFormer streaming parameter scratch");
     const std::size_t retained_bytes = checkedBatchMemoryAdd(
         checkedBatchMemoryAdd(
             checkedBatchMemoryAdd(workspace_bytes, channel_bytes,
                                   "PsiFormer streaming evaluator and channels"),
             position_bytes, "PsiFormer streaming positions"),
-        sample_product_bytes, "PsiFormer streaming retained storage");
+        checkedBatchMemoryAdd(
+            auxiliary_bytes, sample_product_bytes,
+            "PsiFormer streaming sample storage"),
+        "PsiFormer streaming retained storage");
 
     std::size_t fingerprint = std::size_t{1469598103U};
-    mixFingerprint(fingerprint,
-                   reinterpret_cast<std::uintptr_t>(score_workspace_->scoreData()));
+    mixFingerprint(fingerprint, score_workspace_->storageFingerprint());
     mixFingerprint(fingerprint, workspace_bytes);
+    mixFingerprint(fingerprint, kinetic_workspace_->storageFingerprint());
     mixFingerprint(fingerprint,
                    reinterpret_cast<std::uintptr_t>(positions_.data()));
     mixFingerprint(fingerprint, positions_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(total_log_gradients_.data()));
+    mixFingerprint(fingerprint, total_log_gradients_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(inverse_masses_.data()));
+    mixFingerprint(fingerprint, inverse_masses_.capacity());
     for (const auto& channel : channel_accumulators_)
     {
       mixFingerprint(fingerprint,
@@ -1121,17 +1267,18 @@ private:
     if (fingerprint == 0)
       fingerprint = 1;
 
-    storage_diagnostics_ = {schema_->parameterCount(),
-                            sample_count_,
-                            1,
-                            MAXIMUM_VJP_CHANNELS,
-                            parameter_bytes,
-                            workspace_bytes,
-                            position_bytes,
-                            sample_product_bytes,
-                            retained_bytes,
-                            1,
-                            fingerprint};
+    return {schema_->parameterCount(),
+            sample_count_,
+            3,
+            MAXIMUM_VJP_CHANNELS,
+            parameter_bytes,
+            workspace_bytes,
+            position_bytes,
+            auxiliary_bytes,
+            sample_product_bytes,
+            retained_bytes,
+            1,
+            fingerprint};
   }
 
   std::shared_ptr<PsiFormerSharedState> model_state_;
@@ -1142,8 +1289,11 @@ private:
   std::size_t sample_count_      = 0;
   std::size_t electron_count_    = 0;
   std::vector<double> positions_;
+  std::vector<double> total_log_gradients_;
+  std::vector<double> inverse_masses_;
   wftrain::ParameterChunkPlan chunk_plan_;
   mutable std::unique_ptr<pf::DirectScoreWorkspace> score_workspace_;
+  mutable std::unique_ptr<pf::DirectKineticWorkspace> kinetic_workspace_;
   mutable std::array<std::vector<wftrain::DerivativeValue>,
                      MAXIMUM_VJP_CHANNELS>
       channel_accumulators_;
@@ -3541,9 +3691,17 @@ PsiFormerWF::makeStreamingDerivativeOperator(
   if (maximum_parameter_chunk_size == 0)
     throw std::invalid_argument(
         "PsiFormer streaming derivative requires a positive parameter chunk size");
+
+  // Bind the copied configurations and both direct workspaces to one immutable
+  // parameter version.  Publication needs the exclusive side of this lock and
+  // therefore cannot race the factory snapshot or operator construction.
+  std::shared_lock state_lock(model_state_->mutex);
   if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
     throw std::runtime_error(
         "PsiFormer streaming derivative requires the direct score backend");
+  if (model_state_->direct_kinetic_mode != DirectBackendMode::DIRECT)
+    throw std::runtime_error(
+        "PsiFormer streaming derivative requires the direct kinetic backend");
 
   const std::size_t sample_count = wfc_list.size();
   const psiformer::ModelShape& model_shape =
@@ -3555,7 +3713,14 @@ PsiFormerWF::makeStreamingDerivativeOperator(
       std::size_t{3}, "PsiFormer streaming Cartesian positions");
   checkedBatchMemoryMultiply(position_count, sizeof(double),
                              "PsiFormer streaming position bytes");
+  const std::size_t mass_count = checkedBatchMemoryMultiply(
+      sample_count, electron_count,
+      "PsiFormer streaming inverse-mass count");
+  checkedBatchMemoryMultiply(mass_count, sizeof(double),
+                             "PsiFormer streaming inverse-mass bytes");
   std::vector<double> positions(position_count);
+  std::vector<double> total_log_gradients(position_count);
+  std::vector<double> inverse_masses(mass_count);
 
   for (std::size_t sample = 0; sample < sample_count; ++sample)
   {
@@ -3580,6 +3745,13 @@ PsiFormerWF::makeStreamingDerivativeOperator(
             static_cast<int>(model_shape.spin_down_electrons))
       throw std::invalid_argument(
           "PsiFormer streaming derivative sample has an incompatible spin partition");
+    if (particles.G.size() != electron_count)
+      throw std::invalid_argument(
+          "PsiFormer streaming derivative requires one current total TrialWaveFunction drift per electron");
+    const auto& masses = particles.get_mass_by_group();
+    if (masses.size() < static_cast<std::size_t>(particles.groups()))
+      throw std::invalid_argument(
+          "PsiFormer streaming derivative requires initialized electron masses");
     for (std::size_t electron = 0; electron < electron_count; ++electron)
     {
       const int expected_group =
@@ -3587,6 +3759,15 @@ PsiFormerWF::makeStreamingDerivativeOperator(
       if (particles.GroupID[electron] != expected_group)
         throw std::invalid_argument(
             "PsiFormer streaming derivative sample has noncanonical spin ordering");
+      const double mass = masses[expected_group];
+      if (!psiformer::determinant::isFiniteReal(mass) || mass <= 0.0)
+        throw std::invalid_argument(
+            "PsiFormer streaming derivative electron masses must be finite and positive");
+      const double inverse_mass = 1.0 / mass;
+      if (!psiformer::determinant::isFiniteReal(inverse_mass))
+        throw std::invalid_argument(
+            "PsiFormer streaming derivative inverse electron masses must be finite");
+      inverse_masses[sample * electron_count + electron] = inverse_mass;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
         const double coordinate = particles.R[electron][dimension];
@@ -3595,15 +3776,25 @@ PsiFormerWF::makeStreamingDerivativeOperator(
               "PsiFormer streaming derivative sample positions must be finite");
         positions[(sample * electron_count + electron) * 3 + dimension] =
             coordinate;
+        const auto drift_value = particles.G[electron][dimension];
+        const double drift_real = static_cast<double>(std::real(drift_value));
+        const double drift_imaginary = static_cast<double>(std::imag(drift_value));
+        if (!psiformer::determinant::isFiniteReal(drift_real) ||
+            !psiformer::determinant::isFiniteReal(drift_imaginary) ||
+            drift_imaginary != 0.0)
+          throw std::invalid_argument(
+              "PsiFormer streaming derivative requires a finite real total TrialWaveFunction drift");
+        total_log_gradients[
+            (sample * electron_count + electron) * 3 + dimension] = drift_real;
       }
     }
   }
 
-  std::shared_lock state_lock(model_state_->mutex);
   const std::size_t parameter_version = model_state_->model.p.version();
   return std::make_unique<PsiFormerStreamingDerivativeOperator>(
       model_state_, structured_parameter_schema_, parameter_version, batch_ordinal,
       sample_offset, sample_count, std::move(positions),
+      std::move(total_log_gradients), std::move(inverse_masses),
       maximum_parameter_chunk_size);
 }
 

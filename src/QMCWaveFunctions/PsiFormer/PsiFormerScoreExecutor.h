@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -299,6 +300,32 @@ public:
   {
     return checkedStorageBytes<double>(parameter_score_.capacity(),
                                        "PsiFormer score-vector bytes overflowed");
+  }
+
+  /// Hash every explicit backing allocation for warmed-call stability tests.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](const auto& buffer) {
+      hash ^= reinterpret_cast<std::uintptr_t>(buffer.data());
+      hash *= 1099511628211ULL;
+      hash ^= buffer.capacity();
+      hash *= 1099511628211ULL;
+    };
+    for (const auto* buffer : {
+             &electron_positions_, &raw_features_, &features_, &queries_,
+             &keys_, &values_, &attention_weights_, &contexts_, &residuals_,
+             &hidden_, &updates_, &orbital_matrices_, &matrix_adjoints_,
+             &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
+             &query_adjoint_, &key_adjoint_, &value_adjoint_,
+             &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
+             &hidden_adjoint_, &update_adjoint_})
+      mix(*buffer);
+    hash ^= geometry_.storageFingerprint();
+    hash *= 1099511628211ULL;
+    hash ^= determinant_workspace_.storageFingerprint();
+    hash *= 1099511628211ULL;
+    return hash;
   }
 
   /// Return bytes reserved by the complete tape, geometry, and determinant workspace.
