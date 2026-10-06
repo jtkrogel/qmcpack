@@ -22,6 +22,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -44,7 +45,56 @@ public:
   static const BatchExecutionParticipantPlan& aggregatePlan(
       const TrialWaveFunction& wavefunction)
   {
-    return wavefunction.aggregate_batch_execution_plan_;
+    return wavefunction.bound_batch_topology_.aggregate_plan;
+  }
+
+  /// Return the exact sole-component participant view retained inline.
+  static const BatchExecutionParticipantPlan& soleComponentPlan(
+      const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.bound_batch_topology_.sole_component_plan;
+  }
+
+  /// Report whether the fixed-size bound topology snapshot is active.
+  static bool hasBoundTopology(const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.bound_batch_topology_.engaged;
+  }
+
+  /// Report whether a fixed-size resource-loan topology snapshot is active.
+  static bool hasAcquiredTopology(const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.acquired_batch_topology_.engaged;
+  }
+
+  /// Return the retained component count without exposing private state types.
+  static std::size_t boundComponentCount(const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.bound_batch_topology_.component_count;
+  }
+
+  /// Return the resource-loan component count from fixed-size retained state.
+  static std::size_t acquiredComponentCount(const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.acquired_batch_topology_.component_count;
+  }
+
+  /// Return the fixed-width structural identity retained for the bound topology.
+  static std::uint64_t boundTopologyFingerprint(const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.bound_batch_topology_.participant_fingerprint;
+  }
+
+  /// Confirm publication of the inline state cannot throw after validation.
+  static constexpr bool inlineTopologyPublicationIsNothrow()
+  {
+    return std::is_nothrow_copy_assignable_v<TrialWaveFunction::InlineBatchTopologyState>;
+  }
+
+  /// Install the currently unaccounted fast-derivative fallback for a gate test.
+  static void installFastDerivativeFallback(TrialWaveFunction& wavefunction)
+  {
+    wavefunction.twf_fastderiv_ = std::make_unique<TWFFastDerivWrapper>();
   }
 };
 } // namespace testing
@@ -363,10 +413,17 @@ TEST_CASE("TrialWaveFunction batch plan binding is aggregate-atomic",
   const auto second_plan = makePlan(wavefunction, "binding-v2", 2);
   wavefunction.bindBatchExecutionPlan(first_plan);
   REQUIRE(wavefunction.batchExecutionPlan().get() == first_plan.get());
+  STATIC_CHECK(testing::TestTrialWaveFunction::inlineTopologyPublicationIsNothrow());
+  CHECK(testing::TestTrialWaveFunction::hasBoundTopology(wavefunction));
+  CHECK(testing::TestTrialWaveFunction::boundComponentCount(wavefunction) == 1);
+  CHECK(testing::TestTrialWaveFunction::boundTopologyFingerprint(wavefunction) != 0);
   REQUIRE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  REQUIRE(testing::TestTrialWaveFunction::soleComponentPlan(wavefunction));
   REQUIRE(component_ptr->boundPlan());
   CHECK(&testing::TestTrialWaveFunction::aggregatePlan(wavefunction).plan() == first_plan.get());
   CHECK(&component_ptr->boundPlan().plan() == first_plan.get());
+  CHECK(testing::TestTrialWaveFunction::soleComponentPlan(wavefunction).sameBinding(
+      component_ptr->boundPlan()));
   CHECK(testing::TestTrialWaveFunction::aggregatePlan(wavefunction).evidence().participant_id ==
         TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
   CHECK(component_ptr->boundPlan().evidence().participant_id ==
@@ -409,7 +466,11 @@ TEST_CASE("TrialWaveFunction batch plan binding is aggregate-atomic",
   component_ptr->rejectEmptyBinding(false);
   wavefunction.bindBatchExecutionPlan(nullptr);
   CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasBoundTopology(wavefunction));
+  CHECK(testing::TestTrialWaveFunction::boundComponentCount(wavefunction) == 0);
+  CHECK(testing::TestTrialWaveFunction::boundTopologyFingerprint(wavefunction) == 0);
   CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+  CHECK_FALSE(testing::TestTrialWaveFunction::soleComponentPlan(wavefunction));
   CHECK_FALSE(component_ptr->boundPlan());
 
   // Null-to-null binding still visits every child to clear stale copied state.
@@ -435,6 +496,22 @@ TEST_CASE("TrialWaveFunction hard planning rejects multiple components",
   CHECK_THROWS_AS(makePlan(wavefunction), std::invalid_argument);
   CHECK_FALSE(wavefunction.batchExecutionPlan());
   CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlan(wavefunction));
+}
+
+TEST_CASE("TrialWaveFunction hard planning rejects fast-derivative fallback",
+          "[wavefunction][batch_memory]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "fast-derivative-fallback");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Sole", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 5));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+  testing::TestTrialWaveFunction::installFastDerivativeFallback(wavefunction);
+
+  CHECK_THROWS_AS(makePlan(wavefunction), std::invalid_argument);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasBoundTopology(wavefunction));
 }
 
 TEST_CASE("TrialWaveFunction aggregate binding rejects fabricated accounting evidence",
@@ -577,9 +654,15 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
 
   std::unique_ptr<TrialWaveFunction> clone = leader.makeClone(particles);
   CHECK(clone->batchExecutionPlan().get() == plan.get());
+  CHECK(testing::TestTrialWaveFunction::hasBoundTopology(*clone));
+  CHECK(testing::TestTrialWaveFunction::boundComponentCount(*clone) == 1);
+  CHECK(testing::TestTrialWaveFunction::boundTopologyFingerprint(*clone) ==
+        testing::TestTrialWaveFunction::boundTopologyFingerprint(leader));
   REQUIRE(testing::TestTrialWaveFunction::aggregatePlan(*clone));
   CHECK(testing::TestTrialWaveFunction::aggregatePlan(*clone).sameBinding(
       testing::TestTrialWaveFunction::aggregatePlan(leader)));
+  CHECK(testing::TestTrialWaveFunction::soleComponentPlan(*clone).sameBinding(
+      testing::TestTrialWaveFunction::soleComponentPlan(leader)));
   PlanningComponent& clone_component = planningComponent(*clone, 0);
   REQUIRE(clone_component.boundPlan());
   CHECK(&clone_component.boundPlan().plan() == plan.get());
@@ -608,6 +691,10 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
   TrialWaveFunction::acquireResource(resources, wavefunctions);
   CHECK(leader.hasAcquiredResource());
   CHECK(clone->hasAcquiredResource());
+  CHECK(testing::TestTrialWaveFunction::hasAcquiredTopology(leader));
+  CHECK(testing::TestTrialWaveFunction::hasAcquiredTopology(*clone));
+  CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(leader) == 1);
+  CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(*clone) == 1);
 
   leader_component.setClassName("mutated/while-acquired");
   CHECK_THROWS_AS(leader.bindBatchExecutionPlan(plan), std::logic_error);
@@ -626,6 +713,10 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
   TrialWaveFunction::releaseResource(resources, wavefunctions);
   CHECK_FALSE(leader.hasAcquiredResource());
   CHECK_FALSE(clone->hasAcquiredResource());
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasAcquiredTopology(leader));
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasAcquiredTopology(*clone));
+  CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(leader) == 0);
+  CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(*clone) == 0);
   CHECK_THROWS_AS(
       TrialWaveFunction::releaseResource(resources, wavefunctions),
       std::logic_error);
@@ -667,6 +758,7 @@ TEST_CASE("TrialWaveFunction legacy multi-component acquisition preserves rollba
       TrialWaveFunction::acquireResource(resources, wavefunctions),
       std::runtime_error);
   CHECK_FALSE(wavefunction.hasAcquiredResource());
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasAcquiredTopology(wavefunction));
   CHECK(first_ptr->acquireCalls() == 1);
   CHECK(first_ptr->releaseCalls() == 1);
   CHECK(second_ptr->acquireCalls() == 1);
@@ -675,8 +767,12 @@ TEST_CASE("TrialWaveFunction legacy multi-component acquisition preserves rollba
   second_ptr->throwOnAcquire(false);
   TrialWaveFunction::acquireResource(resources, wavefunctions);
   CHECK(wavefunction.hasAcquiredResource());
+  CHECK(testing::TestTrialWaveFunction::hasAcquiredTopology(wavefunction));
+  CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(wavefunction) == 2);
   TrialWaveFunction::releaseResource(resources, wavefunctions);
   CHECK_FALSE(wavefunction.hasAcquiredResource());
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasAcquiredTopology(wavefunction));
+  CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(wavefunction) == 0);
 }
 
 TEST_CASE("TrialWaveFunction resource lifecycle accepts legacy batch lane shapes",

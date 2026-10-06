@@ -689,13 +689,49 @@ public:
 private:
   static void debugOnlyCheckBuffer(WFBufferType& buffer);
 
+  /** Fixed-size snapshot of one component topology and its planned views.
+   * A hard plan currently admits exactly one component; legacy no-plan resource
+   * loans use only the count/fingerprint fields and retain no component names.
+   */
+  struct InlineBatchTopologyState
+  {
+    std::size_t component_count           = 0;
+    std::uint64_t participant_fingerprint = 0;
+    BatchExecutionParticipantPlan aggregate_plan;
+    BatchExecutionParticipantPlan sole_component_plan;
+    bool engaged = false;
+
+    /// Return this snapshot to its canonical allocation-free empty state.
+    void clear() noexcept
+    {
+      component_count           = 0;
+      participant_fingerprint   = 0;
+      aggregate_plan            = {};
+      sole_component_plan       = {};
+      engaged                   = false;
+    }
+
+    /// Compare topology and immutable plan views without allocating.
+    bool sameState(const InlineBatchTopologyState& other) const noexcept
+    {
+      return component_count == other.component_count &&
+          participant_fingerprint == other.participant_fingerprint &&
+          aggregate_plan.sameBinding(other.aggregate_plan) &&
+          sole_component_plan.sameBinding(other.sole_component_plan) &&
+          engaged == other.engaged;
+    }
+  };
+
   /// Recompute and validate the aggregate participant evidence without mutation.
   void validateAggregateBatchExecutionPlanBinding(
       const BatchExecutionParticipantPlan& participant_plan) const;
 
   /// Check that the aggregate and child participant views retain one plan identity.
-  void validateRetainedBatchExecutionBinding(
-      const std::vector<std::string>& participant_ids) const;
+  void validateRetainedBatchExecutionBinding() const;
+
+  /// Capture current topology and optional C==1 plan views in fixed-size state.
+  InlineBatchTopologyState captureBatchTopologyState(
+      const std::shared_ptr<const BatchExecutionPlan>& plan) const;
 
   /// @brief top-level runtime options from project data information > WaveFunctionPool
   const RuntimeOptions& runtime_options_;
@@ -743,14 +779,11 @@ private:
   /// Immutable section plan shared by the golden object and all of its clones.
   std::shared_ptr<const BatchExecutionPlan> batch_execution_plan_;
 
-  /// Immutable selected-plan slice for aggregate TrialWaveFunction storage.
-  BatchExecutionParticipantPlan aggregate_batch_execution_plan_;
+  /// Fixed-size aggregate/sole-child binding and structural topology snapshot.
+  InlineBatchTopologyState bound_batch_topology_;
 
-  /// Stable component identities validated when the current plan was published.
-  std::vector<std::string> bound_batch_participant_ids_;
-
-  /// Topology snapshot retained only for the duration of one resource loan.
-  std::vector<std::string> acquired_batch_participant_ids_;
+  /// Fixed-size topology snapshot retained only for one resource loan.
+  InlineBatchTopologyState acquired_batch_topology_;
 
   /// Guard plan/topology mutation while a standard component resource list is lent.
   bool resource_acquired_ = false;
