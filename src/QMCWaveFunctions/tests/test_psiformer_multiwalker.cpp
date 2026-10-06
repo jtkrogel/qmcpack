@@ -9,6 +9,7 @@
  * @brief Deterministic public-API tests for PsiFormer crowd and virtual batches.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Particle/MCMultiParticleMoves.h"
@@ -129,6 +130,13 @@ public:
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list)
   {
     return component.crowdWorkspaceDiagnosticsForTesting(wfc_list);
+  }
+
+  /// Toggle complete Stage-5 ownership claims without exposing a production API.
+  static void useCompleteBatchMemoryAccounting(PsiFormerWF& component,
+                                               bool enabled)
+  {
+    component.complete_batch_memory_accounting_for_testing_ = enabled;
   }
 
   /// Count clone-local score tapes; flattened crowd scoring must own none.
@@ -273,8 +281,7 @@ struct Crowd
   std::unique_ptr<RefVectorWithLeader<ParticleSet>> p_list;
 };
 
-/** Build internally consistent selected evidence while overriding only the
- * production stage gate that remains false until the complete runtime lands. */
+/// Build a selected plan from the component's current, internally consistent evidence.
 std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationTestPlan(
     PsiFormerWF& component,
     const BatchExecutionRequirements& requirements,
@@ -305,11 +312,10 @@ std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationTestPlan(
       selection,
       [&component, &participant_id](
           const BatchExecutionPlanningContext& candidate) {
-        BatchMemoryContribution fabricated =
+        BatchMemoryContribution contribution =
             component.estimateBatchExecutionMemory(candidate);
-        fabricated.fully_accounted = true;
         return std::vector<BatchMemoryParticipantContribution>{
-            {participant_id, std::move(fabricated)}};
+            {participant_id, std::move(contribution)}};
       }));
 }
 
@@ -329,8 +335,15 @@ BatchExecutionRequirements makeCrowdPreparationRequirements(
   return requirements;
 }
 
-/** Bind the same fabricated participant view to every member of one clone
- * family. The production validator intentionally rejects the fabricated gate. */
+/// Enable the friend-only complete-accounting seam for one test clone family.
+void enableCrowdPreparationTestAccounting(Crowd& crowd, bool enabled = true)
+{
+  for (PsiFormerWF* component : crowd.components)
+    testing::TestPsiFormerVirtualBatch::useCompleteBatchMemoryAccounting(
+        *component, enabled);
+}
+
+/// Validate and bind the same selected participant view to one clone family.
 void bindCrowdPreparationPlan(
     Crowd& crowd,
     const std::shared_ptr<const BatchExecutionPlan>& plan,
@@ -339,14 +352,19 @@ void bindCrowdPreparationPlan(
   const BatchExecutionParticipantPlan participant_plan =
       makeBatchExecutionParticipantPlan(plan, participant_id);
   for (PsiFormerWF* component : crowd.components)
+    component->validateBatchExecutionPlanBinding(participant_plan);
+  for (PsiFormerWF* component : crowd.components)
     component->bindBatchExecutionPlan(participant_plan);
 }
 
 /// Clear every component plan without changing shared model ownership.
 void clearCrowdPreparationPlan(Crowd& crowd)
 {
+  const BatchExecutionParticipantPlan empty_plan;
   for (PsiFormerWF* component : crowd.components)
-    component->bindBatchExecutionPlan({});
+    component->validateBatchExecutionPlanBinding(empty_plan);
+  for (PsiFormerWF* component : crowd.components)
+    component->bindBatchExecutionPlan(empty_plan);
 }
 
 /// Compare exact prepared storage and its retained/setup accounting split.
@@ -2009,6 +2027,7 @@ TEST_CASE("PsiFormer prepares exact planned crowd storage for uneven reserves",
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
 
   const BatchExecutionRequirements requirements =
       makeCrowdPreparationRequirements(crowd.leader);
@@ -2119,6 +2138,7 @@ TEST_CASE("PsiFormer planned resource copies require clear and support replannin
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   Crowd crowd(files, simulation_cell, 1, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
 
   const BatchExecutionRequirements requirements =
       makeCrowdPreparationRequirements(crowd.leader);
@@ -2187,12 +2207,50 @@ TEST_CASE("PsiFormer planned resource copies require clear and support replannin
   }
 }
 
+TEST_CASE("PsiFormer resource preparation rejects stale accounting evidence",
+          "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  Crowd plan_crowd(files, simulation_cell, 1, true, {0, 1});
+  enableCrowdPreparationTestAccounting(plan_crowd);
+
+  const BatchExecutionRequirements requirements =
+      makeCrowdPreparationRequirements(plan_crowd.leader);
+  const std::string participant_id = "test/psiformer/resource-stale";
+  const auto plan = makeCrowdPreparationTestPlan(
+      plan_crowd.leader, requirements, {1}, {1}, participant_id,
+      "resource-stale-v1");
+
+  // Bypass aggregate validation exactly as a direct component caller could.
+  // The second same-shape crowd retains the production-incomplete claims, so
+  // resource preflight must reject the otherwise compatible selected evidence.
+  Crowd default_claims_crowd(files, simulation_cell, 1, true, {0, 1});
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  for (PsiFormerWF* component : default_claims_crowd.components)
+    component->bindBatchExecutionPlan(participant_plan);
+
+  ResourceCollection resource_template("psiformer_stale_template");
+  default_claims_crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  CHECK_THROWS_WITH(
+      resource.prepareBatchResources({plan, 0}),
+      Catch::Matchers::ContainsSubstring("accounting evidence is stale"));
+  CHECK(resource.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::UNPREPARED);
+  CHECK_FALSE(resource.getBatchResourcePreparationProvenance().plan);
+  CHECK(resource.getCursor() == 0);
+  CHECK(resource.getOutstandingLoanCount() == 0);
+}
+
 TEST_CASE("PsiFormer planned acquisition failures roll back direct loans",
           "[wavefunction][psiformer][multiwalker][resource][batch_memory]")
 {
   GeneratedFiles files = generateFiles("lih");
   const SimulationCell simulation_cell;
   Crowd crowd(files, simulation_cell, 2, true, {0, 1});
+  enableCrowdPreparationTestAccounting(crowd);
 
   const BatchExecutionRequirements requirements =
       makeCrowdPreparationRequirements(crowd.leader);
@@ -2231,6 +2289,7 @@ TEST_CASE("PsiFormer planned acquisition failures roll back direct loans",
   check_successful_reuse();
 
   Crowd other_model(files, simulation_cell, 1, true, {0, 1});
+  enableCrowdPreparationTestAccounting(other_model);
   const auto other_plan = makeCrowdPreparationTestPlan(
       other_model.leader, requirements, {1}, {1}, participant_id,
       "resource-rollback-v2");

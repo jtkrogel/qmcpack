@@ -912,7 +912,10 @@ private:
     if (!(evidence.selected_per_owner == selected.per_owner))
       throw std::invalid_argument(
           "PsiFormer crowd resource selected storage evidence is stale");
-    if (!evidence.fully_accounted)
+    if (evidence.fully_accounted != selected.fully_accounted)
+      throw std::invalid_argument(
+          "PsiFormer crowd resource accounting evidence is stale");
+    if (!selected.fully_accounted)
       throw std::invalid_argument(
           "PsiFormer crowd resource plan lacks complete accounting evidence");
 
@@ -1655,6 +1658,8 @@ PsiFormerWF::PsiFormerWF(const PsiFormerWF& other)
       optimization_metadata_(other.optimization_metadata_),
       structured_parameter_schema_(other.structured_parameter_schema_),
       batch_execution_plan_(other.batch_execution_plan_),
+      complete_batch_memory_accounting_for_testing_(
+          other.complete_batch_memory_accounting_for_testing_),
       system_kind_(other.system_kind_),
       optimized_parameter_export_(other.optimized_parameter_export_),
       observed_parameter_version_(other.observed_parameter_version_),
@@ -1710,8 +1715,11 @@ psiformer::PsiFormerMemoryPolicyInput PsiFormerWF::makeBatchMemoryPolicyInput() 
   // Clone and crowd resources now have exact preparation boundaries, but
   // aggregate TrialWaveFunction scratch and every planned runtime path are not
   // yet allocation-free. Keep the production gate closed until those owners
-  // and guards land.
-  input.accounting_claims = {};
+  // and guards land; the friend-only override exercises this completed owner
+  // boundary without widening the public API.
+  input.accounting_claims = complete_batch_memory_accounting_for_testing_
+      ? psiformer::PsiFormerMemoryAccountingClaims::complete()
+      : psiformer::PsiFormerMemoryAccountingClaims{};
   return input;
 }
 

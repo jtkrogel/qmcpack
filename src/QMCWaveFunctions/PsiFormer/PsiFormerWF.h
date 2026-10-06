@@ -753,6 +753,8 @@ private:
   BatchExecutionParticipantPlan prepared_clone_batch_execution_plan_;
   /// Inject a late clone-preparation failure for the strong-guarantee regression.
   bool fail_clone_preparation_before_publish_for_testing_ = false;
+  /// Friend-only seam enabling complete Stage-5 ownership evidence in tests.
+  bool complete_batch_memory_accounting_for_testing_ = false;
   /// Runtime system declaration validated against the export and QMCPACK particle sets.
   std::string system_kind_ = "unvalidated";
   /// Optional DeepQMC-format destination written with the final QMCPACK VP report.
