@@ -751,6 +751,10 @@ public:
   const DirectBatchExecutionStatistics& executionStatistics() const noexcept
   { return statistics_; }
 
+  /// Return the generation token guarding the workspace's current result view.
+  std::size_t successfulGeneration() const noexcept
+  { return successful_generation_; }
+
   /** Hash backing addresses and capacities for warmed-call allocation tests. */
   std::size_t storageFingerprint(DirectBatchMode mode) const noexcept
   {

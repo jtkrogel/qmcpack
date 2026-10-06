@@ -80,6 +80,15 @@ struct PsiFormerPreparedCloneStorage
   bool exact_marker = false;
 };
 
+/** Nonowning lane metadata retained when one component joins a crowd loan. */
+struct PsiFormerAcquisitionEvidence
+{
+  const ParticleSet* bound_particles = nullptr;
+  const PsiFormerWF* crowd_leader = nullptr;
+  std::size_t lane_index = 0;
+  std::size_t crowd_size = 0;
+};
+
 /** Narrow friend accessor for state-isolation and crowd-workspace diagnostics. */
 class TestPsiFormerVirtualBatch
 {
@@ -199,6 +208,14 @@ public:
     storage.exact_marker =
         component.hasPreparedBatchExecutionClone(component.batch_execution_plan_);
     return storage;
+  }
+
+  /// Observe immutable ParticleSet binding and crowd-acquisition lane metadata.
+  static PsiFormerAcquisitionEvidence acquisitionEvidence(
+      const PsiFormerWF& component) noexcept
+  {
+    return {component.bound_particle_set_, component.acquired_crowd_leader_,
+            component.acquired_lane_index_, component.acquired_crowd_size_};
   }
 
   static void invalidateAcceptedState(PsiFormerWF& component)
@@ -557,6 +574,15 @@ public:
   /// Restore one deliberately removed model-wide transaction registration.
   static bool registerPlannedSingleTransaction(PsiFormerWF& component) noexcept
   { return component.tryRegisterPlannedSingleTransaction(); }
+
+  /// Add a concurrent selected-transaction count without local proposal state.
+  static bool registerPlannedSelectedTransaction(PsiFormerWF& component) noexcept
+  { return component.tryRegisterPlannedSelectedTransaction(); }
+
+  /// Remove one selected-transaction count installed by a focused test.
+  static void unregisterPlannedSelectedTransaction(
+      PsiFormerWF& component) noexcept
+  { component.unregisterPlannedSelectedTransaction(); }
 
   /// Exercise lazy version synchronization without exposing it in production.
   static void synchronizeParameterVersion(PsiFormerWF& component,
@@ -938,6 +964,40 @@ struct Crowd
   std::unique_ptr<RefVectorWithLeader<ParticleSet>> p_list;
 };
 
+/** Trap scalar lifecycle dispatch so planned component-team tests can prove
+ * the PsiFormer overrides never enter inherited serialized lane loops. */
+class LifecycleDispatchTrapPsiFormer : public PsiFormerWF
+{
+public:
+  using PsiFormerWF::PsiFormerWF;
+
+  /// Fail if planned team preparation dispatches the scalar virtual method.
+  void prepareGroup(ParticleSet&, int) override
+  {
+    ++scalar_prepare_calls_;
+    throw std::logic_error("Unexpected scalar prepareGroup dispatch");
+  }
+
+  /// Fail if planned team completion dispatches the scalar virtual method.
+  void completeUpdates() override
+  {
+    ++scalar_complete_calls_;
+    throw std::logic_error("Unexpected scalar completeUpdates dispatch");
+  }
+
+  /// Return the number of forbidden scalar preparation dispatches.
+  std::size_t scalarPrepareCalls() const noexcept
+  { return scalar_prepare_calls_; }
+
+  /// Return the number of forbidden scalar completion dispatches.
+  std::size_t scalarCompleteCalls() const noexcept
+  { return scalar_complete_calls_; }
+
+private:
+  std::size_t scalar_prepare_calls_  = 0;
+  std::size_t scalar_complete_calls_ = 0;
+};
+
 /// Build a selected plan from the component's current, internally consistent evidence.
 std::shared_ptr<const BatchExecutionPlan> makeCrowdPreparationTestPlan(
     PsiFormerWF& component,
@@ -996,6 +1056,21 @@ BatchExecutionRequirements makeCrowdPreparationRequirements(
   return requirements;
 }
 
+/// Select only the independently requested lifecycle modes above mandatory FULL_VGL.
+BatchExecutionRequirements makeLifecycleRequirements(
+    const PsiFormerWF& component,
+    bool prepare_group,
+    bool complete_updates)
+{
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  if (prepare_group)
+    requirements.require(BatchExecutionMode::PREPARE_GROUP);
+  if (complete_updates)
+    requirements.require(BatchExecutionMode::COMPLETE_UPDATES);
+  return requirements;
+}
+
 /// Enable the friend-only complete-accounting seam for one test clone family.
 void enableCrowdPreparationTestAccounting(Crowd& crowd, bool enabled = true)
 {
@@ -1038,7 +1113,9 @@ struct RuntimePreflightSnapshot
   std::size_t planned_selected_transactions = 0;
   std::vector<testing::PsiFormerCloneStateSnapshot> clones;
   std::vector<testing::PsiFormerPreparedCloneStorage> clone_storage;
+  std::vector<testing::PsiFormerAcquisitionEvidence> acquisition_evidence;
   std::vector<ParticleSet::ParticlePos> positions;
+  std::vector<bool> spinor_flags;
   std::vector<ParticleSet::ParticleScalar> spins;
   std::vector<ParticleSet::ParticleIndex> group_ids;
   std::vector<std::vector<ParticleSet::PosType>> soa_positions;
@@ -1071,7 +1148,9 @@ RuntimePreflightSnapshot captureRuntimePreflightState(
           crowd.leader);
   snapshot.clones.reserve(crowd.components.size());
   snapshot.clone_storage.reserve(crowd.components.size());
+  snapshot.acquisition_evidence.reserve(crowd.components.size());
   snapshot.positions.reserve(crowd.walkers.size());
+  snapshot.spinor_flags.reserve(crowd.walkers.size());
   snapshot.spins.reserve(crowd.walkers.size());
   snapshot.group_ids.reserve(crowd.walkers.size());
   snapshot.soa_positions.reserve(crowd.walkers.size());
@@ -1087,7 +1166,11 @@ RuntimePreflightSnapshot captureRuntimePreflightState(
     snapshot.clone_storage.push_back(
         testing::TestPsiFormerVirtualBatch::preparedCloneStorage(
             *crowd.components[lane]));
+    snapshot.acquisition_evidence.push_back(
+        testing::TestPsiFormerVirtualBatch::acquisitionEvidence(
+            *crowd.components[lane]));
     snapshot.positions.push_back(crowd.walkers[lane]->R);
+    snapshot.spinor_flags.push_back(crowd.walkers[lane]->isSpinor());
     snapshot.spins.push_back(crowd.walkers[lane]->spins);
     snapshot.group_ids.push_back(crowd.walkers[lane]->GroupID);
     std::vector<ParticleSet::PosType> soa;
@@ -1130,6 +1213,7 @@ void checkRuntimePreflightState(
             crowd.leader) == expected.planned_selected_transactions);
   REQUIRE(crowd.components.size() == expected.clones.size());
   REQUIRE(crowd.components.size() == expected.clone_storage.size());
+  REQUIRE(crowd.components.size() == expected.acquisition_evidence.size());
   for (std::size_t lane = 0; lane < crowd.components.size(); ++lane)
   {
     CHECK(testing::TestPsiFormerVirtualBatch::cloneStateMatches(
@@ -1143,7 +1227,20 @@ void checkRuntimePreflightState(
           expected.clone_storage[lane].capacities);
     CHECK(actual_clone_storage.exact_marker ==
           expected.clone_storage[lane].exact_marker);
+    const auto actual_acquisition =
+        testing::TestPsiFormerVirtualBatch::acquisitionEvidence(
+            *crowd.components[lane]);
+    CHECK(actual_acquisition.bound_particles ==
+          expected.acquisition_evidence[lane].bound_particles);
+    CHECK(actual_acquisition.crowd_leader ==
+          expected.acquisition_evidence[lane].crowd_leader);
+    CHECK(actual_acquisition.lane_index ==
+          expected.acquisition_evidence[lane].lane_index);
+    CHECK(actual_acquisition.crowd_size ==
+          expected.acquisition_evidence[lane].crowd_size);
     REQUIRE(crowd.walkers[lane]->R.size() == expected.positions[lane].size());
+    CHECK(crowd.walkers[lane]->isSpinor() ==
+          expected.spinor_flags[lane]);
     REQUIRE(crowd.walkers[lane]->spins.size() == expected.spins[lane].size());
     REQUIRE(crowd.walkers[lane]->GroupID.size() == expected.group_ids[lane].size());
     REQUIRE(crowd.walkers[lane]->getCoordinates().getAllParticlePos().size() ==
@@ -1178,13 +1275,54 @@ void checkRuntimePreflightState(
   const auto actual_resource =
       testing::TestPsiFormerVirtualBatch::crowdWorkspaceDiagnostics(
           crowd.leader, crowd.wfc_list);
+  CHECK(actual_resource.shared_model_identity ==
+        expected.resource.shared_model_identity);
   CHECK(actual_resource.resource_identity == expected.resource.resource_identity);
   CHECK(actual_resource.batch_workspace_identity ==
         expected.resource.batch_workspace_identity);
+  CHECK(actual_resource.score_workspace_identity ==
+        expected.resource.score_workspace_identity);
+  CHECK(actual_resource.kinetic_workspace_identity ==
+        expected.resource.kinetic_workspace_identity);
+  CHECK(actual_resource.persistent_model_identity ==
+        expected.resource.persistent_model_identity);
+  CHECK(actual_resource.parameter_version ==
+        expected.resource.parameter_version);
+  CHECK(actual_resource.batch_bytes == expected.resource.batch_bytes);
+  CHECK(actual_resource.score_bytes == expected.resource.score_bytes);
+  CHECK(actual_resource.kinetic_bytes == expected.resource.kinetic_bytes);
+  CHECK(actual_resource.transient_bytes == expected.resource.transient_bytes);
+  CHECK(actual_resource.reference_configurations ==
+        expected.resource.reference_configurations);
+  CHECK(actual_resource.replacement_configurations ==
+        expected.resource.replacement_configurations);
+  CHECK(actual_resource.reference_evaluations ==
+        expected.resource.reference_evaluations);
+  CHECK(actual_resource.dense_coordinate_bytes_avoided ==
+        expected.resource.dense_coordinate_bytes_avoided);
+  CHECK(actual_resource.weighted_reference_configurations ==
+        expected.resource.weighted_reference_configurations);
+  CHECK(actual_resource.weighted_replacement_configurations ==
+        expected.resource.weighted_replacement_configurations);
+  CHECK(actual_resource.weighted_active_parameters ==
+        expected.resource.weighted_active_parameters);
+  CHECK(actual_resource.weighted_derivative_staging_bytes ==
+        expected.resource.weighted_derivative_staging_bytes);
+  CHECK(actual_resource.has_expected_plan ==
+        expected.resource.has_expected_plan);
+  CHECK(actual_resource.has_prepared_plan ==
+        expected.resource.has_prepared_plan);
   CHECK(actual_resource.prepared_plan_identity ==
         expected.resource.prepared_plan_identity);
   CHECK(actual_resource.prepared_plan_fingerprint ==
         expected.resource.prepared_plan_fingerprint);
+  CHECK(actual_resource.participant_id == expected.resource.participant_id);
+  CHECK(actual_resource.prepared_crowd_index ==
+        expected.resource.prepared_crowd_index);
+  CHECK(actual_resource.initial_walker_capacity ==
+        expected.resource.initial_walker_capacity);
+  CHECK(actual_resource.reserve_walker_capacity ==
+        expected.resource.reserve_walker_capacity);
   CHECK(actual_resource.prepared_storage_fingerprint ==
         expected.resource.prepared_storage_fingerprint);
   CHECK(actual_resource.current_storage_fingerprint ==
@@ -1193,6 +1331,9 @@ void checkRuntimePreflightState(
   CHECK(actual_resource.ratio_arena == expected.resource.ratio_arena);
   CHECK(actual_resource.actual_resource_storage ==
         expected.resource.actual_resource_storage);
+  CHECK(actual_resource.expected_resource_storage ==
+        expected.resource.expected_resource_storage);
+  CHECK(actual_resource.backend_modes == expected.resource.backend_modes);
   CHECK(collection.getCursor() == expected.collection_cursor);
   CHECK(collection.getOutstandingLoanCount() == expected.outstanding_loans);
   CHECK(caller_output.data() == expected.caller_data);
@@ -4270,6 +4411,19 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
             Probe::preparedCloneStorage(*crowd.components[lane]),
             clone_storage[lane]);
     };
+    auto expect_lifecycle_mode_guard = [&](auto&& invoke) {
+      const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+          crowd, resource, caller_marker);
+      CHECK_THROWS_WITH(
+          invoke(),
+          Catch::Matchers::ContainsSubstring(
+              "lifecycle operation is not admitted by its explicit batch mode"));
+      checkRuntimePreflightState(crowd, resource, caller_marker, before);
+      for (std::size_t lane = 0; lane < walker_count; ++lane)
+        checkPreparedCloneStorageUnchanged(
+            Probe::preparedCloneStorage(*crowd.components[lane]),
+            clone_storage[lane]);
+    };
 
     std::vector<Value> ratios{makeWeight(3.0, -0.25),
                               makeWeight(-5.0, 0.75)};
@@ -4347,14 +4501,407 @@ TEST_CASE("PsiFormer hard plan rejects inherited crowd fallbacks before mutation
     CHECK(empty_spin_gradients.empty());
     CHECK(empty_spin_gradients.data() == empty_spin_gradients_data);
 
-    expect_guard("mw_prepareGroup", [&]() {
+    expect_lifecycle_mode_guard([&]() {
       crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0);
     });
-    expect_guard("mw_completeUpdates", [&]() {
+    expect_lifecycle_mode_guard([&]() {
       crowd.leader.mw_completeUpdates(crowd.wfc_list);
     });
   }
 
+  CHECK(resource.getOutstandingLoanCount() == 0);
+}
+
+TEST_CASE("PsiFormer planned lifecycle teams are validated allocation-free no-ops",
+          "[wavefunction][psiformer][multiwalker][batch_memory][lifecycle]")
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  struct LifecycleModeCase
+  {
+    const char* name;
+    bool prepare_group;
+    bool complete_updates;
+  };
+  constexpr std::array<LifecycleModeCase, 4> mode_cases{
+      LifecycleModeCase{"prepare-only", true, false},
+      LifecycleModeCase{"complete-only", false, true},
+      LifecycleModeCase{"both", true, true},
+      LifecycleModeCase{"neither", false, false}};
+
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  constexpr std::size_t walker_count = 2;
+  constexpr std::size_t reserve_walkers = 3;
+  const std::vector<Value> caller_marker{Value(29), Value(-31)};
+
+  for (std::size_t case_index = 0; case_index < mode_cases.size(); ++case_index)
+  {
+    const LifecycleModeCase& mode = mode_cases[case_index];
+    DYNAMIC_SECTION(mode.name)
+    {
+      Crowd crowd(files, simulation_cell, walker_count, true, {0, 1});
+      enableCrowdPreparationTestAccounting(crowd);
+      const BatchExecutionRequirements requirements =
+          makeLifecycleRequirements(crowd.leader, mode.prepare_group,
+                                    mode.complete_updates);
+      const std::string participant_id =
+          "test/psiformer/lifecycle/" + std::to_string(case_index);
+      const auto plan = makeCrowdPreparationTestPlan(
+          crowd.leader, requirements, {walker_count}, {reserve_walkers},
+          participant_id,
+          "lifecycle-v" + std::to_string(case_index));
+      bindCrowdPreparationPlan(crowd, plan, participant_id);
+      prepareCrowdPreparationClones(crowd, plan, participant_id);
+
+      for (const PsiFormerWF* component : crowd.components)
+        REQUIRE_FALSE(Probe::cloneState(*component).accepted_value_valid);
+
+      ResourceCollection resource_template(
+          "psiformer_lifecycle_template_" + std::to_string(case_index));
+      crowd.leader.createResource(resource_template);
+      ResourceCollection resource(resource_template);
+      resource.prepareBatchResources({plan, 0});
+
+      // Team lifecycle authority requires the exact acquired resource even
+      // though the successful operation consumes no numerical workspace.
+      if (mode.prepare_group)
+        CHECK_THROWS_WITH(
+            crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0),
+            Catch::Matchers::ContainsSubstring("requires an acquired crowd resource"));
+      if (mode.complete_updates)
+        CHECK_THROWS_WITH(
+            crowd.leader.mw_completeUpdates(crowd.wfc_list),
+            Catch::Matchers::ContainsSubstring("requires an acquired crowd resource"));
+
+      resource.rewind(0);
+      crowd.leader.acquireResource(resource, crowd.wfc_list);
+      REQUIRE(resource.getCursor() == 1);
+      REQUIRE(resource.getOutstandingLoanCount() == 1);
+
+      const auto check_generation_unchanged =
+          [&](const RuntimePreflightSnapshot& expected) {
+            const auto actual = Probe::crowdWorkspaceDiagnostics(
+                crowd.leader, crowd.wfc_list);
+            CHECK(actual.successful_batch_generation ==
+                  expected.resource.successful_batch_generation);
+          };
+      const auto require_noop = [&](auto&& operation) {
+        const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+            crowd, resource, caller_marker);
+        CHECK_NOTHROW(operation());
+        checkRuntimePreflightState(crowd, resource, caller_marker, before);
+        check_generation_unchanged(before);
+      };
+      const auto require_mode_rejection = [&](auto&& operation) {
+        const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+            crowd, resource, caller_marker);
+        CHECK_THROWS_WITH(
+            operation(),
+            Catch::Matchers::ContainsSubstring(
+                "lifecycle operation is not admitted by its explicit batch mode"));
+        checkRuntimePreflightState(crowd, resource, caller_marker, before);
+        check_generation_unchanged(before);
+      };
+      const auto require_atomic_rejection = [&](auto&& operation,
+                                                const char* diagnostic) {
+        const RuntimePreflightSnapshot before = captureRuntimePreflightState(
+            crowd, resource, caller_marker);
+        CHECK_THROWS_WITH(operation(),
+                          Catch::Matchers::ContainsSubstring(diagnostic));
+        checkRuntimePreflightState(crowd, resource, caller_marker, before);
+        check_generation_unchanged(before);
+      };
+
+      // Completion is independent of preparation and remains idempotent.
+      if (mode.complete_updates)
+      {
+        require_noop([&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); });
+        require_noop([&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); });
+      }
+      else
+        require_mode_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); });
+
+      if (mode.prepare_group)
+      {
+        for (const int group : {0, 1, 0})
+          require_noop([&]() {
+            crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                         group);
+          });
+      }
+      else
+        require_mode_rejection([&]() {
+          crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0);
+        });
+
+      // Shared counters may belong to another crowd. Locally quiescent lanes
+      // retain lifecycle authority and must not consume either registration.
+      REQUIRE(Probe::registerPlannedSingleTransaction(crowd.leader));
+      REQUIRE(Probe::registerPlannedSelectedTransaction(crowd.leader));
+      if (mode.prepare_group)
+        require_noop([&]() {
+          crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 1);
+        });
+      if (mode.complete_updates)
+        require_noop([&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); });
+      CHECK(Probe::plannedSingleTransactionCount(crowd.leader) == 1);
+      CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) == 1);
+      Probe::unregisterPlannedSelectedTransaction(crowd.leader);
+      Probe::unregisterPlannedSingleTransaction(crowd.leader);
+
+      if (mode.prepare_group && mode.complete_updates)
+      {
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                           -1);
+            },
+            "invalid group index");
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                           2);
+            },
+            "invalid group index");
+
+        crowd.walkers[1]->makeMove(
+            0, ParticleSet::SingleParticlePos{0.002, -0.001, 0.003});
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                           0);
+            },
+            "requires an inactive ParticleSet move");
+        crowd.walkers[1]->rejectMove(0);
+
+        Probe::installSingleProposal(*crowd.components[1], 0);
+        require_atomic_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); },
+            "requires absent proposal state");
+        Probe::clearProposal(*crowd.components[1]);
+
+        // Every malformed ParticleSet fact is rejected before the no-op can
+        // acquire model state or change any lane/resource evidence.
+        const ParticleSet::ParticleGradient saved_gradient =
+            crowd.walkers[1]->G;
+        crowd.walkers[1]->G.resize(saved_gradient.size() - 1);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                           0);
+            },
+            "incompatible ParticleSet extents");
+        crowd.walkers[1]->G = saved_gradient;
+
+        crowd.walkers[1]->setSpinor(true);
+        require_atomic_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); },
+            "received a spinor ParticleSet");
+        crowd.walkers[1]->setSpinor(false);
+
+        const int saved_group = crowd.walkers[1]->GroupID[0];
+        crowd.walkers[1]->GroupID[0] = 1 - saved_group;
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                           0);
+            },
+            "noncanonical spin ordering");
+        crowd.walkers[1]->GroupID[0] = saved_group;
+
+        const ParticleSet::RealType saved_coordinate =
+            crowd.walkers[1]->R[0][0];
+        crowd.walkers[1]->R[0][0] =
+            std::numeric_limits<ParticleSet::RealType>::infinity();
+        require_atomic_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); },
+            "received a non-finite position");
+        crowd.walkers[1]->R[0][0] = saved_coordinate;
+
+        crowd.walkers[1]->R[0][0] += ParticleSet::RealType(0.001);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                           1);
+            },
+            "inconsistent AoS and SoA positions");
+        crowd.walkers[1]->R[0][0] = saved_coordinate;
+
+        RefVectorWithLeader<ParticleSet> wrong_particle_leader(
+            *crowd.walkers[1]);
+        wrong_particle_leader.push_back(*crowd.walkers[0]);
+        wrong_particle_leader.push_back(*crowd.walkers[1]);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(crowd.wfc_list,
+                                           wrong_particle_leader, 0);
+            },
+            "ParticleSet leader must occupy lane zero");
+
+        // Parameter-version drift must remain entirely unobserved by these
+        // structural no-ops; numerical paths own later synchronization.
+        const std::size_t drifted_version =
+            Probe::advanceParameterVersion(crowd.leader);
+        REQUIRE(drifted_version == crowd.leader.parameterVersion());
+        require_noop([&]() {
+          crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0);
+        });
+        require_noop(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); });
+
+        const std::size_t saved_lane = 1;
+        Probe::setAcquiredLaneIndex(*crowd.components[1], 0);
+        require_atomic_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); },
+            "lane order differs from resource acquisition");
+        CHECK(Probe::acquiredResourceCursor(crowd.leader) == 1);
+        Probe::setAcquiredLaneIndex(*crowd.components[1], saved_lane);
+
+        const std::size_t saved_cursor =
+            Probe::acquiredResourceCursor(crowd.leader);
+        Probe::setAcquiredResourceCursor(crowd.leader, saved_cursor + 1);
+        require_atomic_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); },
+            "resource acquisition provenance changed");
+        CHECK(Probe::acquiredResourceCursor(crowd.leader) ==
+              saved_cursor + 1);
+        Probe::setAcquiredResourceCursor(crowd.leader, saved_cursor);
+
+        Probe::bindParticleSet(*crowd.components[1], *crowd.walkers[0]);
+        require_atomic_rejection(
+            [&]() { crowd.leader.mw_completeUpdates(crowd.wfc_list); },
+            "duplicate ParticleSet");
+        Probe::bindParticleSet(*crowd.components[1], *crowd.walkers[1]);
+
+        RefVectorWithLeader<WaveFunctionComponent> duplicate_components(
+            crowd.leader);
+        duplicate_components.push_back(crowd.leader);
+        duplicate_components.push_back(crowd.leader);
+        RefVectorWithLeader<ParticleSet> duplicate_particles(
+            *crowd.walkers[0]);
+        duplicate_particles.push_back(*crowd.walkers[0]);
+        duplicate_particles.push_back(*crowd.walkers[0]);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(duplicate_components,
+                                           duplicate_particles, 0);
+            },
+            "duplicate component");
+
+        RefVectorWithLeader<WaveFunctionComponent> empty_components(
+            crowd.leader);
+        RefVectorWithLeader<ParticleSet> empty_particles(
+            *crowd.walkers[0]);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(empty_components,
+                                           empty_particles, 0);
+            },
+            "requires a nonempty component team");
+
+        RefVectorWithLeader<WaveFunctionComponent> singleton_components(
+            crowd.leader);
+        singleton_components.push_back(crowd.leader);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(singleton_components,
+                                           *crowd.p_list, 0);
+            },
+            "inconsistent live-lane counts");
+
+        RefVectorWithLeader<WaveFunctionComponent> reordered_components(
+            *crowd.components[1]);
+        reordered_components.push_back(crowd.leader);
+        reordered_components.push_back(*crowd.components[1]);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(reordered_components,
+                                           *crowd.p_list, 0);
+            },
+            "component leader must occupy lane zero");
+
+        RefVectorWithLeader<WaveFunctionComponent> over_reserve_components(
+            crowd.leader);
+        over_reserve_components.push_back(crowd.leader);
+        over_reserve_components.push_back(*crowd.components[1]);
+        over_reserve_components.push_back(crowd.leader);
+        over_reserve_components.push_back(*crowd.components[1]);
+        RefVectorWithLeader<ParticleSet> over_reserve_particles(
+            *crowd.walkers[0]);
+        over_reserve_particles.push_back(*crowd.walkers[0]);
+        over_reserve_particles.push_back(*crowd.walkers[1]);
+        over_reserve_particles.push_back(*crowd.walkers[0]);
+        over_reserve_particles.push_back(*crowd.walkers[1]);
+        require_atomic_rejection(
+            [&]() {
+              crowd.leader.mw_prepareGroup(over_reserve_components,
+                                           over_reserve_particles, 0);
+            },
+            "exceeds or mismatches its crowd envelope");
+      }
+
+      resource.rewind(0);
+      crowd.leader.releaseResource(resource, crowd.wfc_list);
+      CHECK(resource.getOutstandingLoanCount() == 0);
+      if (mode.prepare_group)
+        CHECK_THROWS_WITH(
+            crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0),
+            Catch::Matchers::ContainsSubstring("requires an acquired crowd resource"));
+      if (mode.complete_updates)
+        CHECK_THROWS_WITH(
+            crowd.leader.mw_completeUpdates(crowd.wfc_list),
+            Catch::Matchers::ContainsSubstring("requires an acquired crowd resource"));
+    }
+  }
+}
+
+TEST_CASE("PsiFormer planned lifecycle teams bypass inherited scalar dispatch",
+          "[wavefunction][psiformer][multiwalker][batch_memory][lifecycle]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  std::unique_ptr<ParticleSet> particles = makeWalker(simulation_cell, 0);
+  LifecycleDispatchTrapPsiFormer component(
+      "pf_lifecycle_dispatch_trap", files.parameters.string(),
+      files.configuration.string());
+  testing::TestPsiFormerVirtualBatch::bindParticleSet(component, *particles);
+  testing::TestPsiFormerVirtualBatch::useCompleteBatchMemoryAccounting(
+      component, true);
+
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  RefVectorWithLeader<ParticleSet> particle_list(*particles);
+  particle_list.push_back(*particles);
+
+  const BatchExecutionRequirements requirements =
+      makeLifecycleRequirements(component, true, true);
+  const std::string participant_id =
+      "test/psiformer/lifecycle-dispatch-trap";
+  const auto plan = makeCrowdPreparationTestPlan(
+      component, requirements, {1}, {1}, participant_id,
+      "lifecycle-dispatch-trap-v1");
+  const BatchExecutionParticipantPlan participant =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  component.validateBatchExecutionPlanBinding(participant);
+  component.bindBatchExecutionPlan(participant);
+  component.prepareBatchExecutionClone(participant);
+
+  ResourceCollection resource_template(
+      "psiformer_lifecycle_dispatch_trap_template");
+  component.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  resource.rewind(0);
+  component.acquireResource(resource, components);
+
+  CHECK_NOTHROW(component.mw_prepareGroup(components, particle_list, 0));
+  CHECK_NOTHROW(component.mw_completeUpdates(components));
+  CHECK(component.scalarPrepareCalls() == 0);
+  CHECK(component.scalarCompleteCalls() == 0);
+
+  resource.rewind(0);
+  component.releaseResource(resource, components);
   CHECK(resource.getOutstandingLoanCount() == 0);
 }
 

@@ -220,6 +220,8 @@ struct PsiFormerCrowdWorkspaceDiagnostics
   std::size_t score_bytes                 = 0;
   std::size_t kinetic_bytes               = 0;
   std::size_t transient_bytes             = 0;
+  /// Numerical-result generation; lifecycle-only calls must not advance it.
+  std::size_t successful_batch_generation = 0;
   /// Sparse counters from the most recent completed direct crowd batch.
   std::size_t reference_configurations       = 0;
   std::size_t replacement_configurations     = 0;
@@ -404,10 +406,10 @@ public:
                     const RefVectorWithLeader<ParticleSet>& p_list,
                     const std::vector<bool>& recompute) const override;
 
-  /// Preserve the inherited group-preparation no-op only without a hard plan.
+  /// Validate planned group preparation as an allocation-free component no-op.
   void prepareGroup(ParticleSet& particles, int group_index) override;
 
-  /// Preserve inherited serialized group preparation only without a hard plan.
+  /// Validate planned crowd group preparation without inherited lane dispatch.
   void mw_prepareGroup(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
                        const RefVectorWithLeader<ParticleSet>& p_list,
                        int group_index) const override;
@@ -491,10 +493,10 @@ public:
                             const std::vector<bool>& is_accepted,
                             bool safe_to_delay = false) const override;
 
-  /// Preserve the inherited completion no-op only without a hard plan.
+  /// Validate planned scalar completion as an allocation-free component no-op.
   void completeUpdates() override;
 
-  /// Preserve inherited serialized completion only without a hard plan.
+  /// Validate planned crowd completion from retained acquisition provenance.
   void mw_completeUpdates(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override;
 
@@ -991,6 +993,32 @@ private:
       const RefVectorWithLeader<ParticleSet>& p_list,
       const PlannedRuntimeRequest& request) const;
 
+  /** Validate one scalar lifecycle no-op without acquiring numerical scratch,
+   * synchronizing parameters, or changing proposal state. */
+  void requirePlannedScalarLifecycleOperation(
+      PlannedOperation operation,
+      const ParticleSet& particles,
+      std::optional<int> group_index) const;
+
+  /** Validate one acquired lifecycle team using caller lanes for preparation
+   * or retained bound ParticleSets for completion. */
+  void requirePlannedMultiWalkerLifecycleOperation(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>* p_list,
+      PlannedOperation operation,
+      std::optional<int> group_index) const;
+
+  /** Check only the immutable plan and ParticleSet preparation evidence needed
+   * by lifecycle no-ops, without consulting numerical workspace storage. */
+  bool hasPreparedLifecycleClone(
+      const BatchExecutionParticipantPlan& plan) const noexcept;
+
+  /// Validate the immutable POS-only particle facts shared by lifecycle hooks.
+  void requirePlannedLifecycleParticleSet(
+      const ParticleSet& particles,
+      const BatchExecutionPlan& plan,
+      std::optional<int> group_index) const;
+
   /// Hash one validated acquired team without allocating or dereferencing scratch.
   std::uint64_t selectedTeamFingerprint(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -1363,6 +1391,8 @@ private:
   BatchExecutionParticipantPlan batch_execution_plan_;
   /// Binding whose clone-local storage has completed exact preparation.
   BatchExecutionParticipantPlan prepared_clone_batch_execution_plan_;
+  /// Exact non-owning ParticleSet binding retained by clone preparation.
+  const ParticleSet* prepared_bound_particle_set_ = nullptr;
   /// Layout evidence for externally owned persistent walker-record regions.
   pf::WalkerBufferLayout prepared_walker_buffer_layout_;
   /// Fixed allocation identities published immediately before the preparation marker.

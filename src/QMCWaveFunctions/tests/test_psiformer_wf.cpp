@@ -730,6 +730,40 @@ public:
             component.plannedSelectedTransactionCountForTesting()};
   }
 
+  /// Add one model-wide single-particle transaction owned by another crowd.
+  static bool registerPlannedSingleTransaction(
+      const PsiFormerWF& component) noexcept
+  {
+    return component.tryRegisterPlannedSingleTransaction();
+  }
+
+  /// Remove one model-wide single-particle transaction installed by a test.
+  static void unregisterPlannedSingleTransaction(
+      const PsiFormerWF& component) noexcept
+  {
+    component.unregisterPlannedSingleTransaction();
+  }
+
+  /// Add one model-wide selected-particle transaction owned by another crowd.
+  static bool registerPlannedSelectedTransaction(
+      const PsiFormerWF& component) noexcept
+  {
+    return component.tryRegisterPlannedSelectedTransaction();
+  }
+
+  /// Remove one model-wide selected-particle transaction installed by a test.
+  static void unregisterPlannedSelectedTransaction(
+      const PsiFormerWF& component) noexcept
+  {
+    component.unregisterPlannedSelectedTransaction();
+  }
+
+  /// Advance only the authoritative model version, leaving clone caches stale.
+  static std::size_t advanceParameterVersion(PsiFormerWF& component)
+  {
+    return component.advanceParameterVersionForTesting();
+  }
+
   /// Bind malformed reference evidence without invoking system validation.
   static void bindParticleSetForTesting(PsiFormerWF& component,
                                         const ParticleSet& particles)
@@ -2712,11 +2746,14 @@ TEST_CASE("PsiFormer prepares exact Boundary-32 walker layout evidence",
       for (std::size_t byte = 0; byte < buffer_storage.size(); ++byte)
         CHECK(guarded_buffer.myData[byte] == buffer_storage[byte]);
     };
-    const auto expect_plan_guard = [&](auto&& operation) {
-      CHECK_THROWS_WITH(
-          operation(),
-          Catch::Matchers::ContainsSubstring(
-              "not admitted as a scalar operation by the explicit batch plan"));
+    const auto expect_lifecycle_guard = [&](auto&& operation,
+                                            const char* diagnostic) {
+      CHECK_THROWS_WITH(operation(),
+                        Catch::Matchers::ContainsSubstring(diagnostic));
+      check_guarded_state();
+    };
+    const auto expect_lifecycle_success = [&](auto&& operation) {
+      CHECK_NOTHROW(operation());
       check_guarded_state();
     };
     const auto expect_buffer_guard = [&](auto&& operation) {
@@ -2724,8 +2761,9 @@ TEST_CASE("PsiFormer prepares exact Boundary-32 walker layout evidence",
       check_guarded_state();
     };
 
-    // Selected buffer modes now enter typed Stage-3 preflight, while malformed
-    // storage and wrong modes remain atomic. Lifecycle modes stay fail closed.
+    // Selected buffer modes enter typed Stage-3 preflight, while malformed
+    // storage and wrong modes remain atomic. Selected scalar lifecycle hooks
+    // are now validated no-ops; crowd hooks still require an acquired resource.
     expect_buffer_guard(
         [&]() { component.registerData(electrons, guarded_buffer); });
     expect_buffer_guard([&]() {
@@ -2733,14 +2771,32 @@ TEST_CASE("PsiFormer prepares exact Boundary-32 walker layout evidence",
     });
     expect_buffer_guard(
         [&]() { component.copyFromBuffer(electrons, guarded_buffer); });
-    expect_plan_guard([&]() { component.prepareGroup(electrons, 0); });
-    expect_plan_guard([&]() { component.completeUpdates(); });
+    if (layout_case.prepare_group)
+      expect_lifecycle_success(
+          [&]() { component.prepareGroup(electrons, 0); });
+    else
+      expect_lifecycle_guard(
+          [&]() { component.prepareGroup(electrons, 0); },
+          "lifecycle operation is not admitted by its explicit batch mode");
+    if (layout_case.complete_updates)
+      expect_lifecycle_success([&]() { component.completeUpdates(); });
+    else
+      expect_lifecycle_guard(
+          [&]() { component.completeUpdates(); },
+          "lifecycle operation is not admitted by its explicit batch mode");
     RefVectorWithLeader<WaveFunctionComponent> components(component,
                                                            {component});
     RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
-    expect_plan_guard(
-        [&]() { component.mw_prepareGroup(components, particles, 0); });
-    expect_plan_guard([&]() { component.mw_completeUpdates(components); });
+    expect_lifecycle_guard(
+        [&]() { component.mw_prepareGroup(components, particles, 0); },
+        layout_case.prepare_group
+            ? "requires an acquired crowd resource"
+            : "lifecycle operation is not admitted by its explicit batch mode");
+    expect_lifecycle_guard(
+        [&]() { component.mw_completeUpdates(components); },
+        layout_case.complete_updates
+            ? "requires an acquired crowd resource"
+            : "lifecycle operation is not admitted by its explicit batch mode");
 
     BatchExecutionParticipantPlan empty_plan;
     component.validateBatchExecutionPlanBinding(empty_plan);
@@ -2763,6 +2819,266 @@ TEST_CASE("PsiFormer prepares exact Boundary-32 walker layout evidence",
     CHECK(rebound.accountedBytes() == prepared.accountedBytes());
     CHECK(rebound.ownedWorkspaceCount() == prepared.ownedWorkspaceCount());
     CHECK_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+  }
+}
+
+TEST_CASE("PsiFormer planned scalar lifecycle hooks obey independent modes",
+          "[wavefunction][psiformer][batch_memory][lifecycle]")
+{
+  struct LifecycleCase
+  {
+    const char* name;
+    bool prepare_group;
+    bool complete_updates;
+    bool scalar_value_compatibility;
+  };
+  constexpr std::array<LifecycleCase, 6> cases{
+      LifecycleCase{"prepare-group-only", true, false, false},
+      LifecycleCase{"complete-updates-only", false, true, false},
+      LifecycleCase{"both-lifecycle-modes", true, true, false},
+      LifecycleCase{"scalar-value-and-both-lifecycle-modes", true, true, true},
+      LifecycleCase{"scalar-value-only", false, false, true},
+      LifecycleCase{"base-full-vgl-only", false, false, false}};
+
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  const ParticleSet reference_electrons = makeLiHElectrons(simulation_cell);
+
+  for (std::size_t case_index = 0; case_index < cases.size(); ++case_index)
+  {
+    const LifecycleCase& lifecycle_case = cases[case_index];
+    CAPTURE(lifecycle_case.name);
+    ParticleSet electrons = reference_electrons;
+    ParticleSet foreign_electrons = makeLiHElectrons(simulation_cell);
+    std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+    PsiFormerWF component("pf_lifecycle_" + std::to_string(case_index),
+                          files.parameters.string(),
+                          files.configuration.string(), true, {0, 1});
+    component.validateSystem(electrons, *ions, "all_electron");
+
+    BatchExecutionRequirements requirements;
+    component.contributeBatchExecutionRequirements(requirements);
+    if (lifecycle_case.prepare_group)
+      requirements.require(BatchExecutionMode::PREPARE_GROUP);
+    if (lifecycle_case.complete_updates)
+      requirements.require(BatchExecutionMode::COMPLETE_UPDATES);
+    if (lifecycle_case.scalar_value_compatibility)
+      requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+    const std::string participant_id =
+        "test/psiformer/lifecycle/" + std::to_string(case_index);
+    const auto plan = makeClonePreparationTestPlan(
+        component, requirements, participant_id,
+        "lifecycle-v" + std::to_string(case_index));
+    const BatchExecutionParticipantPlan participant_plan =
+        makeBatchExecutionParticipantPlan(plan, participant_id);
+    component.bindBatchExecutionPlan(participant_plan);
+    component.prepareBatchExecutionClone(participant_plan);
+    REQUIRE(component.hasPreparedBatchExecutionClone(participant_plan));
+
+    // Lifecycle hooks must remain valid when the accepted numerical cache is
+    // deliberately INVALID: these operations validate sequencing, not values.
+    testing::TestPsiFormerWF::poisonAcceptedStateForRestore(component);
+    REQUIRE_FALSE(testing::TestPsiFormerWF::scalarStateSnapshot(component)
+                      .accepted_value_valid);
+
+    const auto exercise_lifecycle = [&](PsiFormerWF& target,
+                                        ParticleSet& particles,
+                                        auto&& operation,
+                                        const char* expected_diagnostic) {
+      const testing::PsiFormerScalarStateSnapshot component_before =
+          testing::TestPsiFormerWF::scalarStateSnapshot(target);
+      const ScalarParticleStateSnapshot particles_before =
+          captureScalarParticleState(particles);
+      const testing::PsiFormerWorkspaceDiagnostics workspace_before =
+          testing::TestPsiFormerWF::directWorkspaceDiagnostics(target);
+      const std::size_t parameter_version_before = target.parameterVersion();
+      const std::array<std::size_t, 2> counters_before =
+          testing::TestPsiFormerWF::plannedProposalCounts(target);
+
+      if (expected_diagnostic)
+        CHECK_THROWS_WITH(
+            operation(),
+            Catch::Matchers::ContainsSubstring(expected_diagnostic));
+      else
+        CHECK_NOTHROW(operation());
+
+      CHECK(testing::TestPsiFormerWF::scalarStateMatches(target,
+                                                          component_before));
+      checkScalarParticleState(particles, particles_before);
+      checkScalarWorkspaceStorage(
+          testing::TestPsiFormerWF::directWorkspaceDiagnostics(target),
+          workspace_before);
+      CHECK(target.parameterVersion() == parameter_version_before);
+      CHECK(testing::TestPsiFormerWF::plannedProposalCounts(target) ==
+            counters_before);
+    };
+
+    // Lifecycle authority is deliberately structural.  An unrelated scalar
+    // VALUE workspace may be unusable without disabling either lifecycle hook.
+    if (lifecycle_case.scalar_value_compatibility &&
+        lifecycle_case.prepare_group && lifecycle_case.complete_updates)
+    {
+      using WorkspaceFault =
+          testing::TestPsiFormerWF::PreparedScalarWorkspaceFault;
+      testing::TestPsiFormerWF::setPreparedScalarWorkspaceFault(
+          component, WorkspaceFault::LOGICAL_CAPACITY);
+      REQUIRE_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+      exercise_lifecycle(
+          component, electrons,
+          [&]() { component.prepareGroup(electrons, 0); }, nullptr);
+      exercise_lifecycle(
+          component, electrons, [&]() { component.completeUpdates(); },
+          nullptr);
+      testing::TestPsiFormerWF::setPreparedScalarWorkspaceFault(
+          component, WorkspaceFault::NONE);
+      REQUIRE(component.hasPreparedBatchExecutionClone(participant_plan));
+    }
+
+    constexpr const char* mode_diagnostic =
+        "lifecycle operation is not admitted by its explicit batch mode";
+    for (const int group : {0, 1, 0, 1})
+      exercise_lifecycle(
+          component, electrons,
+          [&]() { component.prepareGroup(electrons, group); },
+          lifecycle_case.prepare_group ? nullptr : mode_diagnostic);
+    for (int repeat = 0; repeat < 3; ++repeat)
+      exercise_lifecycle(
+          component, electrons, [&]() { component.completeUpdates(); },
+          lifecycle_case.complete_updates ? nullptr : mode_diagnostic);
+
+    if (lifecycle_case.prepare_group && lifecycle_case.complete_updates &&
+        !lifecycle_case.scalar_value_compatibility)
+    {
+      // Model-wide counters can describe transactions in another crowd.  They
+      // neither revoke authority from nor get consumed by this idle clone.
+      REQUIRE(testing::TestPsiFormerWF::plannedProposalCounts(component) ==
+              std::array<std::size_t, 2>{0, 0});
+      REQUIRE(testing::TestPsiFormerWF::registerPlannedSingleTransaction(
+          component));
+      REQUIRE(testing::TestPsiFormerWF::registerPlannedSelectedTransaction(
+          component));
+      exercise_lifecycle(
+          component, electrons,
+          [&]() { component.prepareGroup(electrons, 1); }, nullptr);
+      exercise_lifecycle(
+          component, electrons, [&]() { component.completeUpdates(); },
+          nullptr);
+      CHECK(testing::TestPsiFormerWF::plannedProposalCounts(component) ==
+            std::array<std::size_t, 2>{1, 1});
+      testing::TestPsiFormerWF::unregisterPlannedSelectedTransaction(component);
+      testing::TestPsiFormerWF::unregisterPlannedSingleTransaction(component);
+      REQUIRE(testing::TestPsiFormerWF::plannedProposalCounts(component) ==
+              std::array<std::size_t, 2>{0, 0});
+
+      // Deliberate model-version drift proves that lifecycle validation does
+      // not acquire numerical authority or synchronize stale clone caches.
+      const testing::PsiFormerScalarStateSnapshot state_before_drift =
+          testing::TestPsiFormerWF::scalarStateSnapshot(component);
+      const testing::PsiFormerWorkspaceDiagnostics workspace_before_drift =
+          testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+      const std::size_t parameter_version_before_drift =
+          component.parameterVersion();
+      const std::size_t drifted_parameter_version =
+          testing::TestPsiFormerWF::advanceParameterVersion(component);
+      REQUIRE(drifted_parameter_version > parameter_version_before_drift);
+      REQUIRE(component.parameterVersion() == drifted_parameter_version);
+      REQUIRE(state_before_drift.observed_parameter_version !=
+              drifted_parameter_version);
+      REQUIRE(testing::TestPsiFormerWF::scalarStateMatches(
+          component, state_before_drift));
+      checkScalarWorkspaceStorage(
+          testing::TestPsiFormerWF::directWorkspaceDiagnostics(component),
+          workspace_before_drift);
+      exercise_lifecycle(
+          component, electrons,
+          [&]() { component.prepareGroup(electrons, 0); }, nullptr);
+      exercise_lifecycle(
+          component, electrons, [&]() { component.completeUpdates(); },
+          nullptr);
+      CHECK(component.parameterVersion() == drifted_parameter_version);
+      CHECK(testing::TestPsiFormerWF::scalarStateMatches(
+          component, state_before_drift));
+      checkScalarWorkspaceStorage(
+          testing::TestPsiFormerWF::directWorkspaceDiagnostics(component),
+          workspace_before_drift);
+    }
+
+    if (lifecycle_case.prepare_group)
+    {
+      for (const int invalid_group : {-1, electrons.groups()})
+        exercise_lifecycle(
+            component, electrons,
+            [&]() { component.prepareGroup(electrons, invalid_group); },
+            "received an invalid group index");
+      exercise_lifecycle(
+          component, foreign_electrons,
+          [&]() { component.prepareGroup(foreign_electrons, 0); },
+          "received a foreign ParticleSet");
+    }
+
+    // Rebinding after preparation invalidates the retained exact ParticleSet
+    // evidence even when the replacement has an otherwise compatible shape.
+    if (lifecycle_case.prepare_group || lifecycle_case.complete_updates)
+    {
+      testing::TestPsiFormerWF::bindParticleSetForTesting(component,
+                                                           foreign_electrons);
+      if (lifecycle_case.prepare_group)
+        exercise_lifecycle(
+            component, foreign_electrons,
+            [&]() { component.prepareGroup(foreign_electrons, 0); },
+            "requires an exactly prepared clone");
+      if (lifecycle_case.complete_updates)
+        exercise_lifecycle(
+            component, foreign_electrons,
+            [&]() { component.completeUpdates(); },
+            "requires an exactly prepared clone");
+      testing::TestPsiFormerWF::bindParticleSetForTesting(component,
+                                                           electrons);
+      REQUIRE(component.hasPreparedBatchExecutionClone(participant_plan));
+    }
+
+    if (lifecycle_case.prepare_group || lifecycle_case.complete_updates)
+    {
+      electrons.makeMove(
+          0, ParticleSet::SingleParticlePos{0.013, -0.009, 0.007});
+      if (lifecycle_case.prepare_group)
+        exercise_lifecycle(
+            component, electrons,
+            [&]() { component.prepareGroup(electrons, 0); },
+            "requires an inactive ParticleSet move");
+      if (lifecycle_case.complete_updates)
+        exercise_lifecycle(
+            component, electrons, [&]() { component.completeUpdates(); },
+            "requires an inactive ParticleSet move");
+      electrons.rejectMove(0);
+
+      testing::TestPsiFormerWF::markScalarProposalPending(component, 0);
+      if (lifecycle_case.prepare_group)
+        exercise_lifecycle(
+            component, electrons,
+            [&]() { component.prepareGroup(electrons, 0); },
+            "requires absent proposal state");
+      if (lifecycle_case.complete_updates)
+        exercise_lifecycle(
+            component, electrons, [&]() { component.completeUpdates(); },
+            "requires absent proposal state");
+      testing::TestPsiFormerWF::clearProposal(component);
+    }
+
+    std::unique_ptr<WaveFunctionComponent> clone_storage =
+        component.makeClone(electrons);
+    auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
+    REQUIRE(clone != nullptr);
+    REQUIRE(testing::TestPsiFormerWF::hasBatchExecutionPlan(*clone));
+    REQUIRE_FALSE(clone->hasPreparedBatchExecutionClone(participant_plan));
+    if (lifecycle_case.prepare_group)
+      exercise_lifecycle(
+          *clone, electrons, [&]() { clone->prepareGroup(electrons, 0); },
+          "requires an exactly prepared clone");
+    if (lifecycle_case.complete_updates)
+      exercise_lifecycle(
+          *clone, electrons, [&]() { clone->completeUpdates(); },
+          "requires an exactly prepared clone");
   }
 }
 
@@ -5109,8 +5425,14 @@ TEST_CASE("PsiFormer hard plans reject scalar lifecycle entries before mutation"
   expect_plan_guard([&]() { component.recompute(electrons); });
   expect_plan_guard([&]() { component.acceptMove(electrons, 0); });
   expect_plan_guard([&]() { component.restore(0); });
-  expect_plan_guard([&]() { component.prepareGroup(electrons, 0); });
-  expect_plan_guard([&]() { component.completeUpdates(); });
+  CHECK_THROWS_WITH(
+      component.prepareGroup(electrons, 0),
+      Catch::Matchers::ContainsSubstring("requires absent proposal state"));
+  check_unchanged();
+  CHECK_THROWS_WITH(
+      component.completeUpdates(),
+      Catch::Matchers::ContainsSubstring("requires absent proposal state"));
+  check_unchanged();
 
   PsiFormerWF::ComplexType spin_gradient(3.5, -1.75);
   const auto spin_gradient_before = spin_gradient;

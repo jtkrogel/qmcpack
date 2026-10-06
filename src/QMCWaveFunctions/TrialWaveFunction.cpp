@@ -1823,6 +1823,9 @@ void TrialWaveFunction::mw_calcRatio(const RefVectorWithLeader<TrialWaveFunction
 
 void TrialWaveFunction::prepareGroup(ParticleSet& P, int ig)
 {
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        "TrialWaveFunction planned aggregate lifecycle ownership is deferred");
   ScopedTimer local_timer(TWF_timers_[PREPAREGROUP_TIMER]);
   for (int i = 0; i < Z.size(); ++i)
   {
@@ -1835,6 +1838,10 @@ void TrialWaveFunction::mw_prepareGroup(const RefVectorWithLeader<TrialWaveFunct
                                         const RefVectorWithLeader<ParticleSet>& p_list,
                                         int ig)
 {
+  for (const TrialWaveFunction& wavefunction : wf_list)
+    if (wavefunction.batch_execution_plan_)
+      throw std::logic_error(
+          "TrialWaveFunction planned aggregate lifecycle ownership is deferred");
   auto& wf_leader = wf_list.getLeader();
   ScopedTimer local_timer(wf_leader.TWF_timers_[PREPAREGROUP_TIMER]);
   const int num_wfc             = wf_leader.Z.size();
@@ -2282,6 +2289,9 @@ const ParticleSet::ParticleGradient& TrialWaveFunction::multiParticleProposalGra
 
 void TrialWaveFunction::completeUpdates()
 {
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        "TrialWaveFunction planned aggregate lifecycle ownership is deferred");
   ScopedTimer local_timer(TWF_timers_[ACCEPT_TIMER]);
   for (int i = 0; i < Z.size(); i++)
   {
@@ -2292,6 +2302,10 @@ void TrialWaveFunction::completeUpdates()
 
 void TrialWaveFunction::mw_completeUpdates(const RefVectorWithLeader<TrialWaveFunction>& wf_list)
 {
+  for (const TrialWaveFunction& wavefunction : wf_list)
+    if (wavefunction.batch_execution_plan_)
+      throw std::logic_error(
+          "TrialWaveFunction planned aggregate lifecycle ownership is deferred");
   auto& wf_leader = wf_list.getLeader();
   ScopedTimer local_timer(wf_leader.TWF_timers_[ACCEPT_TIMER]);
   const int num_wfc             = wf_leader.Z.size();

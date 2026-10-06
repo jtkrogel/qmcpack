@@ -576,7 +576,8 @@ std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
     PsiFormerWF& component, std::size_t walker_count,
     const std::string& participant_id,
     std::size_t reserve_walker_count = 0,
-    bool include_scalar_value = false)
+    bool include_scalar_value = false,
+    bool include_lifecycle = false)
 {
   if (reserve_walker_count == 0)
     reserve_walker_count = walker_count;
@@ -587,6 +588,11 @@ std::shared_ptr<const BatchExecutionPlan> makeAllocationPlan(
   requirements.require(BatchExecutionMode::ACTIVE_GRADIENT);
   if (include_scalar_value)
     requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  if (include_lifecycle)
+  {
+    requirements.require(BatchExecutionMode::PREPARE_GROUP);
+    requirements.require(BatchExecutionMode::COMPLETE_UPDATES);
+  }
 
   BatchExecutionSelectionInput selection;
   selection.requirements                       = requirements;
@@ -889,6 +895,149 @@ void checkScalarAllocationStatesUnchanged(
     CHECK(actual.proposal_origin == reference.proposal_origin);
     CHECK(actual.has_proposal == reference.has_proposal);
   }
+}
+
+/** Prove every selected lifecycle hook is an allocation-free structural
+ * no-op for one full or partial prepared crowd.
+ */
+void checkPlannedLifecycleAllocations(
+    const GeneratedFiles& files, std::size_t walker_count,
+    std::size_t reserve_walker_count)
+{
+  using Probe = testing::TestPsiFormerVirtualBatch;
+  REQUIRE(walker_count > 0);
+  REQUIRE(reserve_walker_count >= walker_count);
+
+  const SimulationCell simulation_cell;
+  PlannedAllocationCrowd crowd(files, simulation_cell, walker_count);
+  const std::string population_label =
+      std::to_string(walker_count) + "-of-" +
+      std::to_string(reserve_walker_count);
+  const std::string participant_id =
+      "test/psiformer/planned-lifecycle-allocation-" + population_label;
+  const auto plan = makeAllocationPlan(
+      crowd.leader, walker_count, participant_id, reserve_walker_count,
+      false, true);
+  bindAndPrepareAllocationCrowd(crowd, plan, participant_id);
+
+  ResourceCollection resource_template(
+      "psiformer_planned_lifecycle_allocation_template_" +
+      population_label);
+  crowd.leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  resource.prepareBatchResources({plan, 0});
+  ResourceCollectionTeamLock<WaveFunctionComponent> resource_lock(
+      resource, crowd.wfc_list);
+
+  // Warm each scalar and team entry, including both physical spin groups,
+  // before enabling global allocation interposition.
+  for (std::size_t lane = 0; lane < walker_count; ++lane)
+  {
+    crowd.components[lane]->prepareGroup(*crowd.walkers[lane], 0);
+    crowd.components[lane]->completeUpdates();
+    crowd.components[lane]->prepareGroup(*crowd.walkers[lane], 1);
+    crowd.components[lane]->completeUpdates();
+  }
+  crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 0);
+  crowd.leader.mw_completeUpdates(crowd.wfc_list);
+  crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 1);
+  crowd.leader.mw_completeUpdates(crowd.wfc_list);
+
+  const PlannedAllocationFreeze frozen =
+      capturePlannedAllocationFreeze(crowd, resource);
+  const auto frozen_states = captureScalarAllocationStates(crowd);
+  std::vector<ParticleSet::ParticlePos> frozen_positions;
+  std::vector<ParticleSet::ParticleGradient> frozen_gradients;
+  std::vector<ParticleSet::ParticleLaplacian> frozen_laplacians;
+  frozen_positions.reserve(walker_count);
+  frozen_gradients.reserve(walker_count);
+  frozen_laplacians.reserve(walker_count);
+  for (const auto& particles : crowd.walkers)
+  {
+    frozen_positions.push_back(particles->R);
+    frozen_gradients.push_back(particles->G);
+    frozen_laplacians.push_back(particles->L);
+  }
+  const std::size_t parameter_version = crowd.leader.parameterVersion();
+  const std::size_t selected_transactions =
+      Probe::plannedSelectedTransactionCount(crowd.leader);
+  const std::size_t single_transactions =
+      Probe::plannedSingleTransactionCount(crowd.leader);
+
+  const auto check_frozen_state = [&] {
+    checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+    const auto current_resource =
+        Probe::crowdWorkspaceDiagnostics(crowd.leader, crowd.wfc_list);
+    CHECK(current_resource.successful_batch_generation ==
+          frozen.resource.successful_batch_generation);
+    checkScalarAllocationStatesUnchanged(crowd, frozen_states);
+    CHECK(crowd.leader.parameterVersion() == parameter_version);
+    CHECK(Probe::plannedSelectedTransactionCount(crowd.leader) ==
+          selected_transactions);
+    CHECK(Probe::plannedSingleTransactionCount(crowd.leader) ==
+          single_transactions);
+    for (std::size_t lane = 0; lane < walker_count; ++lane)
+    {
+      CHECK(sameVectorBits(crowd.walkers[lane]->R,
+                           frozen_positions[lane]));
+      CHECK(sameVectorBits(crowd.walkers[lane]->G,
+                           frozen_gradients[lane]));
+      CHECK(sameVectorBits(crowd.walkers[lane]->L,
+                           frozen_laplacians[lane]));
+    }
+  };
+
+  const AllocationSnapshot scalar_prepare_allocations =
+      auditAllocations([&] {
+        for (std::size_t lane = 0; lane < walker_count; ++lane)
+          crowd.components[lane]->prepareGroup(*crowd.walkers[lane], 0);
+      });
+  checkNoAllocations(scalar_prepare_allocations,
+                     "planned scalar prepareGroup");
+  check_frozen_state();
+
+  const AllocationSnapshot scalar_complete_allocations =
+      auditAllocations([&] {
+        for (PsiFormerWF* component : crowd.components)
+          component->completeUpdates();
+      });
+  checkNoAllocations(scalar_complete_allocations,
+                     "planned scalar completeUpdates");
+  check_frozen_state();
+
+  const AllocationSnapshot team_prepare_allocations =
+      auditAllocations([&] {
+        crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list, 1);
+      });
+  checkNoAllocations(team_prepare_allocations,
+                     "planned team prepareGroup");
+  check_frozen_state();
+
+  const AllocationSnapshot team_complete_allocations =
+      auditAllocations([&] {
+        crowd.leader.mw_completeUpdates(crowd.wfc_list);
+      });
+  checkNoAllocations(team_complete_allocations,
+                     "planned team completeUpdates");
+  check_frozen_state();
+
+  const AllocationSnapshot alternating_allocations = auditAllocations([&] {
+    for (int repetition = 0; repetition < 3; ++repetition)
+    {
+      for (std::size_t lane = 0; lane < walker_count; ++lane)
+      {
+        crowd.components[lane]->prepareGroup(*crowd.walkers[lane],
+                                              repetition % 2);
+        crowd.components[lane]->completeUpdates();
+      }
+      crowd.leader.mw_prepareGroup(crowd.wfc_list, *crowd.p_list,
+                                   repetition % 2);
+      crowd.leader.mw_completeUpdates(crowd.wfc_list);
+    }
+  });
+  checkNoAllocations(alternating_allocations,
+                     "alternating scalar/team lifecycle calls");
+  check_frozen_state();
 }
 
 struct ScalarObservation
@@ -1796,6 +1945,28 @@ TEST_CASE("PsiFormer warmed hard-plan transactions freeze selected storage",
   CHECK(sameVectorBits(gradients[0], scalar_gradient_before));
   CHECK(sameVectorBits(laplacians[0], scalar_laplacian_before));
   checkPlannedAllocationFreeze(crowd, resource, *plan, frozen);
+}
+
+TEST_CASE("PsiFormer planned lifecycle hooks allocate no storage",
+          "[wavefunction][psiformer][allocation][batch_memory][lifecycle]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  setBackend("direct");
+
+  SECTION("singleton live crowd")
+  {
+    checkPlannedLifecycleAllocations(files, 1, 1);
+  }
+
+  SECTION("live crowd is a strict prepared-reserve prefix")
+  {
+    checkPlannedLifecycleAllocations(files, 2, 3);
+  }
+
+  SECTION("live crowd fills its prepared reserve")
+  {
+    checkPlannedLifecycleAllocations(files, 3, 3);
+  }
 }
 
 TEST_CASE("PsiFormer warmed hard-plan active gradient freezes reserve storage",

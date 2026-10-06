@@ -229,6 +229,11 @@ public:
   {
     wavefunction.multi_particle_proposal_pending_ = pending;
   }
+
+  /// Observe whether aggregate selected-move publication is still pending.
+  static bool multiParticleProposalPending(
+      const TrialWaveFunction& wavefunction) noexcept
+  { return wavefunction.multi_particle_proposal_pending_; }
 };
 } // namespace testing
 
@@ -269,6 +274,22 @@ public:
   PsiValue ratio(ParticleSet&, int) override { return 1.0; }
   GradType evalGrad(ParticleSet&, int) override { return GradType(0.0); }
   PsiValue ratioGrad(ParticleSet&, int, GradType&) override { return 1.0; }
+  void prepareGroup(ParticleSet&, int) override
+  { ++prepare_group_calls_; }
+  void mw_prepareGroup(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>&,
+      int) const override
+  {
+    ++wfc_list.getCastedLeader<PlanningComponent>().mw_prepare_group_calls_;
+  }
+  void completeUpdates() override
+  { ++complete_updates_calls_; }
+  void mw_completeUpdates(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override
+  {
+    ++wfc_list.getCastedLeader<PlanningComponent>().mw_complete_updates_calls_;
+  }
   void registerData(ParticleSet&, WFBufferType&) override
   { ++register_data_calls_; }
   LogValue updateBuffer(ParticleSet&, WFBufferType&, bool = false) override
@@ -459,6 +480,14 @@ public:
   std::size_t prepareCalls() const noexcept { return prepare_calls_; }
   std::size_t acquireCalls() const noexcept { return acquire_calls_; }
   std::size_t releaseCalls() const noexcept { return release_calls_; }
+  std::size_t prepareGroupCalls() const noexcept
+  { return prepare_group_calls_; }
+  std::size_t mwPrepareGroupCalls() const noexcept
+  { return mw_prepare_group_calls_; }
+  std::size_t completeUpdatesCalls() const noexcept
+  { return complete_updates_calls_; }
+  std::size_t mwCompleteUpdatesCalls() const noexcept
+  { return mw_complete_updates_calls_; }
   std::size_t registerDataCalls() const noexcept
   { return register_data_calls_; }
   std::size_t updateBufferCalls() const noexcept
@@ -510,6 +539,10 @@ private:
   std::size_t prepare_calls_                            = 0;
   mutable std::size_t acquire_calls_                   = 0;
   mutable std::size_t release_calls_                   = 0;
+  std::size_t prepare_group_calls_                     = 0;
+  std::size_t mw_prepare_group_calls_                  = 0;
+  std::size_t complete_updates_calls_                  = 0;
+  std::size_t mw_complete_updates_calls_               = 0;
   std::size_t register_data_calls_                     = 0;
   std::size_t update_buffer_calls_                     = 0;
   std::size_t copy_from_buffer_calls_                  = 0;
@@ -808,6 +841,352 @@ TEST_CASE("TrialWaveFunction planned walker-buffer aggregate entries fail first"
       Catch::Matchers::ContainsSubstring(
           "planned aggregate walker-buffer ownership is deferred"));
   check_unchanged();
+}
+
+TEST_CASE("TrialWaveFunction planned aggregate lifecycle entries fail first",
+          "[wavefunction][batch_memory][lifecycle_guard][resources]")
+{
+  constexpr const char* deferred_diagnostic =
+      "TrialWaveFunction planned aggregate lifecycle ownership is deferred";
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "lifecycle-entry-guard");
+  auto component = std::make_unique<PlanningComponent>(
+      "LifecycleGuard", "sole", BatchExecutionMode::VALUE,
+      BatchTileCapacities{4, 0, 0, 0}, 17);
+  PlanningComponent* component_ptr = component.get();
+  component_ptr->useResource();
+  wavefunction.addComponent(std::move(component));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(
+      wavefunction);
+  const auto plan =
+      makePlan(wavefunction, "lifecycle-entry-guard-v1", 2);
+  wavefunction.bindBatchExecutionPlan(plan);
+  wavefunction.prepareBatchExecutionClones();
+
+  const SimulationCell simulation_cell;
+  ParticleSet particles(simulation_cell);
+  particles.setName("lifecycle_guard_particles");
+  particles.create({4});
+  for (std::size_t particle = 0; particle < particles.G.size(); ++particle)
+  {
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      particles.R[particle][dimension] =
+          QMCTraits::RealType(0.0625 * (1 + 3 * particle + dimension));
+      particles.G[particle][dimension] =
+          QMCTraits::ValueType(0.125 * (1 + 3 * particle + dimension));
+      wavefunction.G[particle][dimension] =
+          QMCTraits::ValueType(-0.375 * (1 + 3 * particle + dimension));
+    }
+    particles.L[particle] = QMCTraits::ValueType(-0.25 * (1 + particle));
+    wavefunction.L[particle] =
+        QMCTraits::ValueType(0.5 * (1 + particle));
+  }
+  const ParticleSet::ParticlePos positions_before = particles.R;
+  const ParticleSet::ParticleGradient particle_gradients_before = particles.G;
+  const ParticleSet::ParticleLaplacian particle_laplacians_before = particles.L;
+  const ParticleSet::ParticleGradient aggregate_gradients_before =
+      wavefunction.G;
+  const ParticleSet::ParticleLaplacian aggregate_laplacians_before =
+      wavefunction.L;
+  wavefunction.setPhase(QMCTraits::RealType(0.875));
+  wavefunction.setLogPsi(QMCTraits::RealType(-3.25));
+  const TrialWaveFunction::RealType phase_before = wavefunction.getPhase();
+  const TrialWaveFunction::RealType log_before = wavefunction.getLogPsi();
+
+  TrialWaveFunction::WFBufferType buffer;
+  TrialWaveFunction::GradType buffer_gradient;
+  buffer_gradient = QMCTraits::ValueType(0.75);
+  QMCTraits::FullPrecRealType buffer_scalar = 2.5;
+  buffer.add(&buffer_gradient, &buffer_gradient + 1);
+  buffer.add(buffer_scalar);
+  const auto buffer_data_before = buffer.myData;
+  const std::size_t buffer_cursor_before = buffer.current();
+  const std::size_t buffer_scalar_cursor_before = buffer.current_scalar();
+  const std::size_t buffer_capacity_before = buffer.myData.capacity();
+
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      wavefunction, {wavefunction});
+  RefVectorWithLeader<ParticleSet> particle_sets(particles, {particles});
+  ResourceCollection resources("planned-lifecycle-entry-guard");
+  wavefunction.createResource(resources);
+  resources.prepareBatchResources({plan, 0});
+  TrialWaveFunction::acquireResource(resources, wavefunctions);
+  testing::TestTrialWaveFunction::setMultiParticleProposalPending(
+      wavefunction, true);
+  const bool proposal_pending_before =
+      testing::TestTrialWaveFunction::multiParticleProposalPending(
+          wavefunction);
+
+  const auto clone_before =
+      testing::TestTrialWaveFunction::aggregateCloneDiagnostics(wavefunction);
+  const auto resource_before =
+      testing::TestTrialWaveFunction::aggregateResourceDiagnostics(
+          wavefunction);
+  const std::size_t resource_cursor_before = resources.getCursor();
+  const std::size_t loan_count_before = resources.getOutstandingLoanCount();
+  const std::size_t acquire_calls_before = component_ptr->acquireCalls();
+  const std::size_t release_calls_before = component_ptr->releaseCalls();
+
+  const auto check_first_entry_atomicity = [&]() {
+    CHECK(wavefunction.batchExecutionPlan().get() == plan.get());
+    CHECK(wavefunction.hasAcquiredResource());
+    CHECK(testing::TestTrialWaveFunction::hasAcquiredTopology(wavefunction));
+    CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(wavefunction) ==
+          1);
+    CHECK(resources.getCursor() == resource_cursor_before);
+    CHECK(resources.getOutstandingLoanCount() == loan_count_before);
+    CHECK(component_ptr->acquireCalls() == acquire_calls_before);
+    CHECK(component_ptr->releaseCalls() == release_calls_before);
+    CHECK(wavefunction.getPhase() == phase_before);
+    CHECK(wavefunction.getLogPsi() == log_before);
+    CHECK(testing::TestTrialWaveFunction::multiParticleProposalPending(
+              wavefunction) == proposal_pending_before);
+
+    const auto clone_after =
+        testing::TestTrialWaveFunction::aggregateCloneDiagnostics(
+            wavefunction);
+    CHECK(clone_after.prepared == clone_before.prepared);
+    CHECK(clone_after.storage_shape_matches_plan ==
+          clone_before.storage_shape_matches_plan);
+    CHECK(clone_after.allocation_identity_matches ==
+          clone_before.allocation_identity_matches);
+    CHECK(clone_after.plan_identity == clone_before.plan_identity);
+    CHECK(clone_after.accepted_gradient_data ==
+          clone_before.accepted_gradient_data);
+    CHECK(clone_after.accepted_laplacian_data ==
+          clone_before.accepted_laplacian_data);
+    CHECK(clone_after.proposed_gradient_data ==
+          clone_before.proposed_gradient_data);
+    CHECK(clone_after.proposed_laplacian_data ==
+          clone_before.proposed_laplacian_data);
+    CHECK(clone_after.accepted_gradient_size ==
+          clone_before.accepted_gradient_size);
+    CHECK(clone_after.accepted_gradient_capacity ==
+          clone_before.accepted_gradient_capacity);
+    CHECK(clone_after.accepted_laplacian_size ==
+          clone_before.accepted_laplacian_size);
+    CHECK(clone_after.accepted_laplacian_capacity ==
+          clone_before.accepted_laplacian_capacity);
+    CHECK(clone_after.proposed_gradient_size ==
+          clone_before.proposed_gradient_size);
+    CHECK(clone_after.proposed_gradient_capacity ==
+          clone_before.proposed_gradient_capacity);
+    CHECK(clone_after.proposed_laplacian_size ==
+          clone_before.proposed_laplacian_size);
+    CHECK(clone_after.proposed_laplacian_capacity ==
+          clone_before.proposed_laplacian_capacity);
+    CHECK(clone_after.accepted_gradient_bytes ==
+          clone_before.accepted_gradient_bytes);
+    CHECK(clone_after.accepted_laplacian_bytes ==
+          clone_before.accepted_laplacian_bytes);
+    CHECK(clone_after.proposed_gradient_bytes ==
+          clone_before.proposed_gradient_bytes);
+    CHECK(clone_after.proposed_laplacian_bytes ==
+          clone_before.proposed_laplacian_bytes);
+
+    const auto resource_after =
+        testing::TestTrialWaveFunction::aggregateResourceDiagnostics(
+            wavefunction);
+    CHECK(resource_after.prepared == resource_before.prepared);
+    CHECK(resource_after.plan_identity == resource_before.plan_identity);
+    CHECK(resource_after.crowd_index == resource_before.crowd_index);
+    CHECK(resource_after.reserve_walkers == resource_before.reserve_walkers);
+    CHECK(resource_after.storage_fingerprint ==
+          resource_before.storage_fingerprint);
+    CHECK(resource_after.expected_bytes == resource_before.expected_bytes);
+    CHECK(resource_after.actual_bytes == resource_before.actual_bytes);
+    CHECK(resource_after.component_reference_bytes ==
+          resource_before.component_reference_bytes);
+    CHECK(resource_after.gradient_reference_bytes ==
+          resource_before.gradient_reference_bytes);
+    CHECK(resource_after.laplacian_reference_bytes ==
+          resource_before.laplacian_reference_bytes);
+    CHECK(resource_after.private_ratio_bytes ==
+          resource_before.private_ratio_bytes);
+    CHECK(resource_after.total_weight_bytes ==
+          resource_before.total_weight_bytes);
+    CHECK(resource_after.derivative_delta_bytes ==
+          resource_before.derivative_delta_bytes);
+    CHECK(resource_after.derivative_view_bytes ==
+          resource_before.derivative_view_bytes);
+    CHECK(resource_after.value_stamp_bytes ==
+          resource_before.value_stamp_bytes);
+    CHECK(resource_after.transaction_flag_bytes ==
+          resource_before.transaction_flag_bytes);
+    CHECK(resource_after.component_reference_data ==
+          resource_before.component_reference_data);
+    CHECK(resource_after.gradient_reference_data ==
+          resource_before.gradient_reference_data);
+    CHECK(resource_after.laplacian_reference_data ==
+          resource_before.laplacian_reference_data);
+    CHECK(resource_after.component_leader == resource_before.component_leader);
+    CHECK(resource_after.first_component == resource_before.first_component);
+    CHECK(resource_after.gradient_leader == resource_before.gradient_leader);
+    CHECK(resource_after.first_gradient == resource_before.first_gradient);
+    CHECK(resource_after.laplacian_leader == resource_before.laplacian_leader);
+    CHECK(resource_after.first_laplacian == resource_before.first_laplacian);
+
+    REQUIRE(particles.R.size() == positions_before.size());
+    REQUIRE(particles.G.size() == particle_gradients_before.size());
+    REQUIRE(particles.L.size() == particle_laplacians_before.size());
+    REQUIRE(wavefunction.G.size() == aggregate_gradients_before.size());
+    REQUIRE(wavefunction.L.size() == aggregate_laplacians_before.size());
+    for (std::size_t particle = 0; particle < particles.G.size(); ++particle)
+    {
+      for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      {
+        CHECK(particles.R[particle][dimension] ==
+              positions_before[particle][dimension]);
+        CHECK(particles.G[particle][dimension] ==
+              particle_gradients_before[particle][dimension]);
+        CHECK(wavefunction.G[particle][dimension] ==
+              aggregate_gradients_before[particle][dimension]);
+      }
+      CHECK(particles.L[particle] == particle_laplacians_before[particle]);
+      CHECK(wavefunction.L[particle] == aggregate_laplacians_before[particle]);
+    }
+
+    CHECK(buffer.current() == buffer_cursor_before);
+    CHECK(buffer.current_scalar() == buffer_scalar_cursor_before);
+    CHECK(buffer.myData.capacity() == buffer_capacity_before);
+    CHECK(buffer.myData == buffer_data_before);
+    CHECK(component_ptr->prepareGroupCalls() == 0);
+    CHECK(component_ptr->mwPrepareGroupCalls() == 0);
+    CHECK(component_ptr->completeUpdatesCalls() == 0);
+    CHECK(component_ptr->mwCompleteUpdatesCalls() == 0);
+  };
+
+  CHECK_THROWS_WITH(wavefunction.prepareGroup(particles, 0),
+                    deferred_diagnostic);
+  check_first_entry_atomicity();
+  CHECK_THROWS_WITH(wavefunction.completeUpdates(), deferred_diagnostic);
+  check_first_entry_atomicity();
+  CHECK_THROWS_WITH(
+      TrialWaveFunction::mw_prepareGroup(wavefunctions, particle_sets, 0),
+      deferred_diagnostic);
+  check_first_entry_atomicity();
+  CHECK_THROWS_WITH(TrialWaveFunction::mw_completeUpdates(wavefunctions),
+                    deferred_diagnostic);
+  check_first_entry_atomicity();
+
+  // Once the loan is safely returned and the plan is cleared, the unchanged
+  // legacy dispatch path remains available for all four lifecycle entries.
+  testing::TestTrialWaveFunction::setMultiParticleProposalPending(
+      wavefunction, false);
+  TrialWaveFunction::releaseResource(resources, wavefunctions);
+  CHECK_FALSE(wavefunction.hasAcquiredResource());
+  CHECK_FALSE(testing::TestTrialWaveFunction::hasAcquiredTopology(
+      wavefunction));
+  CHECK(resources.getOutstandingLoanCount() == 0);
+  CHECK(resources.getCursor() == resource_cursor_before);
+  wavefunction.bindBatchExecutionPlan(nullptr);
+  CHECK_FALSE(wavefunction.batchExecutionPlan());
+  CHECK_FALSE(component_ptr->boundPlan());
+  wavefunction.prepareGroup(particles, 0);
+  wavefunction.completeUpdates();
+  TrialWaveFunction::mw_prepareGroup(wavefunctions, particle_sets, 0);
+  TrialWaveFunction::mw_completeUpdates(wavefunctions);
+  CHECK(component_ptr->prepareGroupCalls() == 1);
+  CHECK(component_ptr->mwPrepareGroupCalls() == 1);
+  CHECK(component_ptr->completeUpdatesCalls() == 1);
+  CHECK(component_ptr->mwCompleteUpdatesCalls() == 1);
+}
+
+TEST_CASE("TrialWaveFunction planned lifecycle scans every batch lane before dispatch",
+          "[wavefunction][batch_memory][lifecycle_guard]")
+{
+  constexpr const char* deferred_diagnostic =
+      "TrialWaveFunction planned aggregate lifecycle ownership is deferred";
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction leader(runtime_options, "legacy-lifecycle-leader");
+  auto leader_component = std::make_unique<PlanningComponent>(
+      "LifecycleLane", "sole", BatchExecutionMode::VALUE,
+      BatchTileCapacities{4, 0, 0, 0}, 17);
+  PlanningComponent* leader_component_ptr = leader_component.get();
+  leader.addComponent(std::move(leader_component));
+
+  TrialWaveFunction planned_lane(runtime_options, "planned-lifecycle-lane");
+  auto lane_component = std::make_unique<PlanningComponent>(
+      "LifecycleLane", "sole", BatchExecutionMode::VALUE,
+      BatchTileCapacities{4, 0, 0, 0}, 17);
+  PlanningComponent* lane_component_ptr = lane_component.get();
+  planned_lane.addComponent(std::move(lane_component));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(
+      planned_lane);
+  const auto lane_plan =
+      makePlan(planned_lane, "nonleader-lifecycle-guard-v1", 2);
+  planned_lane.bindBatchExecutionPlan(lane_plan);
+
+  const SimulationCell simulation_cell;
+  ParticleSet leader_particles(simulation_cell);
+  leader_particles.create({4});
+  ParticleSet lane_particles(simulation_cell);
+  lane_particles.create({4});
+  leader_particles.G = QMCTraits::ValueType(0.25);
+  leader_particles.L = QMCTraits::ValueType(-0.5);
+  lane_particles.G = QMCTraits::ValueType(0.75);
+  lane_particles.L = QMCTraits::ValueType(-1.0);
+  const ParticleSet::ParticleGradient leader_gradients_before =
+      leader_particles.G;
+  const ParticleSet::ParticleLaplacian leader_laplacians_before =
+      leader_particles.L;
+  const ParticleSet::ParticleGradient lane_gradients_before =
+      lane_particles.G;
+  const ParticleSet::ParticleLaplacian lane_laplacians_before =
+      lane_particles.L;
+
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      leader, {leader, planned_lane});
+  RefVectorWithLeader<ParticleSet> particle_sets(
+      leader_particles, {leader_particles, lane_particles});
+
+  const auto check_no_dispatch = [&]() {
+    CHECK_FALSE(leader.batchExecutionPlan());
+    CHECK(planned_lane.batchExecutionPlan().get() == lane_plan.get());
+    CHECK(leader_component_ptr->prepareGroupCalls() == 0);
+    CHECK(leader_component_ptr->mwPrepareGroupCalls() == 0);
+    CHECK(leader_component_ptr->completeUpdatesCalls() == 0);
+    CHECK(leader_component_ptr->mwCompleteUpdatesCalls() == 0);
+    CHECK(lane_component_ptr->prepareGroupCalls() == 0);
+    CHECK(lane_component_ptr->mwPrepareGroupCalls() == 0);
+    CHECK(lane_component_ptr->completeUpdatesCalls() == 0);
+    CHECK(lane_component_ptr->mwCompleteUpdatesCalls() == 0);
+    for (std::size_t particle = 0; particle < leader_particles.G.size();
+         ++particle)
+    {
+      for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      {
+        CHECK(leader_particles.G[particle][dimension] ==
+              leader_gradients_before[particle][dimension]);
+        CHECK(lane_particles.G[particle][dimension] ==
+              lane_gradients_before[particle][dimension]);
+      }
+      CHECK(leader_particles.L[particle] ==
+            leader_laplacians_before[particle]);
+      CHECK(lane_particles.L[particle] == lane_laplacians_before[particle]);
+    }
+  };
+
+  CHECK_THROWS_WITH(
+      TrialWaveFunction::mw_prepareGroup(wavefunctions, particle_sets, 1),
+      deferred_diagnostic);
+  check_no_dispatch();
+  CHECK_THROWS_WITH(TrialWaveFunction::mw_completeUpdates(wavefunctions),
+                    deferred_diagnostic);
+  check_no_dispatch();
+
+  planned_lane.bindBatchExecutionPlan(nullptr);
+  CHECK_FALSE(planned_lane.batchExecutionPlan());
+  CHECK_FALSE(lane_component_ptr->boundPlan());
+  TrialWaveFunction::mw_prepareGroup(wavefunctions, particle_sets, 1);
+  TrialWaveFunction::mw_completeUpdates(wavefunctions);
+  CHECK(leader_component_ptr->mwPrepareGroupCalls() == 1);
+  CHECK(leader_component_ptr->mwCompleteUpdatesCalls() == 1);
+  CHECK(lane_component_ptr->mwPrepareGroupCalls() == 0);
+  CHECK(lane_component_ptr->mwCompleteUpdatesCalls() == 0);
 }
 
 TEST_CASE("TrialWaveFunction hard planning rejects multiple components",

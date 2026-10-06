@@ -2676,6 +2676,9 @@ bool PsiFormerWF::hasPreparedBatchExecutionClone(
 {
   if (!plan || !prepared_clone_batch_execution_plan_.sameBinding(plan))
     return false;
+  if (!bound_particle_set_ ||
+      prepared_bound_particle_set_ != bound_particle_set_)
+    return false;
 
   const std::size_t electron_count =
       model_state_->execution_plan.modelShape().electrons();
@@ -2868,6 +2871,7 @@ void PsiFormerWF::bindBatchExecutionPlan(
     // later unplanned scalar request is not constrained by stale capacities.
     batch_execution_plan_ = {};
     prepared_clone_batch_execution_plan_ = {};
+    prepared_bound_particle_set_ = nullptr;
     prepared_walker_buffer_layout_ = {};
     prepared_accepted_gradient_data_ = nullptr;
     prepared_accepted_laplacian_data_ = nullptr;
@@ -2901,6 +2905,7 @@ void PsiFormerWF::bindBatchExecutionPlan(
     // water.  Drop recomputable scratch before publishing the first hard plan;
     // subsequent exact preparation can then allocate without overlap.
     prepared_clone_batch_execution_plan_ = {};
+    prepared_bound_particle_set_ = nullptr;
     prepared_walker_buffer_layout_ = {};
     prepared_accepted_gradient_data_ = nullptr;
     prepared_accepted_laplacian_data_ = nullptr;
@@ -2945,6 +2950,9 @@ void PsiFormerWF::prepareBatchExecutionClone(
         "Cannot prepare PsiFormer clone storage while a proposal is pending");
 
   const BatchExecutionPlan& plan = participant_plan.plan();
+  if (!bound_particle_set_)
+    throw std::logic_error(
+        "PsiFormer clone preparation requires a bound ParticleSet");
   const psiformer::PsiFormerMemoryPolicyInput input =
       makeBatchMemoryPolicyInput();
   const std::size_t electron_count = input.storage_shape.electrons;
@@ -3170,6 +3178,7 @@ void PsiFormerWF::prepareBatchExecutionClone(
       prepared_publication_capacity;
   static_assert(std::is_nothrow_copy_assignable_v<pf::WalkerBufferLayout>);
   prepared_walker_buffer_layout_ = prepared_walker_buffer_layout;
+  prepared_bound_particle_set_ = bound_particle_set_;
   static_assert(std::is_nothrow_copy_assignable_v<BatchExecutionParticipantPlan>);
   // The plan view is the validity marker and is deliberately published last.
   prepared_clone_batch_execution_plan_ = participant_plan;
@@ -3627,6 +3636,299 @@ PsiFormerWF::ProposalRequirement PsiFormerWF::plannedOperationProposalRequiremen
     return ProposalRequirement::ABSENT;
   }
   return ProposalRequirement::NONE;
+}
+
+// Check lifecycle preparation without depending on unrelated numeric scratch.
+bool PsiFormerWF::hasPreparedLifecycleClone(
+    const BatchExecutionParticipantPlan& plan) const noexcept
+{
+  return plan && batch_execution_plan_.sameBinding(plan) &&
+      prepared_clone_batch_execution_plan_.sameBinding(plan) &&
+      bound_particle_set_ &&
+      prepared_bound_particle_set_ == bound_particle_set_ &&
+      plan.plan().particleCount() ==
+          model_state_->execution_plan.modelShape().electrons();
+}
+
+// Validate one bound ParticleSet without evaluating the model or touching caches.
+void PsiFormerWF::requirePlannedLifecycleParticleSet(
+    const ParticleSet& particles,
+    const BatchExecutionPlan& plan,
+    std::optional<int> group_index) const
+{
+  if (plan.targetCoordinate() != BatchExecutionTargetCoordinate::POS_ONLY)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation requires explicit POS-only target evidence");
+
+  const psiformer::ModelShape& model_shape =
+      model_state_->execution_plan.modelShape();
+  const std::size_t electron_count = model_shape.electrons();
+  const auto& soa_positions = particles.getCoordinates().getAllParticlePos();
+  if (plan.particleCount() != electron_count)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle particle count differs from its model");
+  if (particles.isSpinor())
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation received a spinor ParticleSet");
+  if (particles.getTotalNum() < 0 ||
+      static_cast<std::size_t>(particles.getTotalNum()) != electron_count ||
+      particles.R.size() != electron_count ||
+      soa_positions.size() != electron_count ||
+      soa_positions.capacity() < electron_count ||
+      particles.G.size() != electron_count ||
+      particles.L.size() != electron_count ||
+      particles.GroupID.size() != electron_count ||
+      particles.spins.size() != electron_count)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation received incompatible ParticleSet extents");
+  if (electron_count != 0 &&
+      (!particles.R.data() || !soa_positions.data() || !particles.G.data() ||
+       !particles.L.data() || !particles.GroupID.data() ||
+       !particles.spins.data()))
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation received null ParticleSet storage");
+  if (particles.groups() != 2 ||
+      particles.groupsize(0) !=
+          static_cast<int>(model_shape.spin_up_electrons) ||
+      particles.groupsize(1) !=
+          static_cast<int>(model_shape.spin_down_electrons))
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation received an incompatible spin partition");
+  if (group_index &&
+      (*group_index < 0 || *group_index >= particles.groups()))
+    throw std::out_of_range(
+        "PsiFormer planned lifecycle operation received an invalid group index");
+  if (particles.getActivePtcl() != -1)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation requires an inactive ParticleSet move");
+
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+  {
+    const auto soa_position = soa_positions[electron];
+    const int expected_group =
+        electron < model_shape.spin_up_electrons ? 0 : 1;
+    if (particles.GroupID[electron] != expected_group)
+      throw std::invalid_argument(
+          "PsiFormer planned lifecycle operation received noncanonical spin ordering");
+    for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      const auto& aos_coordinate = particles.R[electron][dimension];
+      const auto& soa_coordinate = soa_position[dimension];
+      if (!psiformer::determinant::isFiniteReal(
+              static_cast<double>(aos_coordinate)))
+        throw std::invalid_argument(
+            "PsiFormer planned lifecycle operation received a non-finite position");
+      if (std::memcmp(std::addressof(aos_coordinate),
+                      std::addressof(soa_coordinate),
+                      sizeof(aos_coordinate)) != 0)
+        throw std::invalid_argument(
+            "PsiFormer planned lifecycle operation has inconsistent AoS and SoA positions");
+    }
+  }
+}
+
+// Prove one scalar lifecycle no-op through its independent explicit mode.
+void PsiFormerWF::requirePlannedScalarLifecycleOperation(
+    PlannedOperation operation,
+    const ParticleSet& particles,
+    std::optional<int> group_index) const
+{
+  const bool prepares_group = operation == PlannedOperation::PREPARE_GROUP;
+  const bool completes_updates =
+      operation == PlannedOperation::COMPLETE_UPDATES;
+  if ((!prepares_group && !completes_updates) ||
+      prepares_group != group_index.has_value())
+    throw std::invalid_argument(
+        "PsiFormer scalar lifecycle preflight received an incompatible operation");
+  if (!batch_execution_plan_)
+    throw std::logic_error(
+        "PsiFormer planned lifecycle operation has no bound batch plan");
+  if (!hasPreparedLifecycleClone(batch_execution_plan_))
+    throw std::logic_error(
+        "PsiFormer planned lifecycle operation requires an exactly prepared clone");
+  if (bound_particle_set_ != std::addressof(particles))
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation received a foreign ParticleSet");
+  if (has_proposal_ || proposal_origin_ != ProposalOrigin::NONE)
+    throw std::logic_error(
+        "PsiFormer planned lifecycle operation requires absent proposal state");
+
+  const BatchExecutionPlan& plan = batch_execution_plan_.plan();
+  const BatchExecutionRequirements required_modes =
+      plannedOperationRequiredModes(operation);
+  const BatchExecutionMode required_mode = prepares_group
+      ? BatchExecutionMode::PREPARE_GROUP
+      : BatchExecutionMode::COMPLETE_UPDATES;
+  if (!required_modes.requires(required_mode) ||
+      !plan.requirements().requires(required_mode))
+    throw std::logic_error(
+        "PsiFormer lifecycle operation is not admitted by its explicit batch mode");
+  const BatchExecutionTopology& topology = plan.topology();
+  if (topology.serialized_walkers || topology.backend_id != "cpu" ||
+      topology.device_id)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation requires direct nonserialized CPU execution");
+  requirePlannedLifecycleParticleSet(particles, plan, group_index);
+}
+
+// Prove one acquired component team without consulting numerical workspaces.
+void PsiFormerWF::requirePlannedMultiWalkerLifecycleOperation(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>* p_list,
+    PlannedOperation operation,
+    std::optional<int> group_index) const
+{
+  const bool prepares_group = operation == PlannedOperation::PREPARE_GROUP;
+  const bool completes_updates =
+      operation == PlannedOperation::COMPLETE_UPDATES;
+  if ((!prepares_group && !completes_updates) ||
+      prepares_group != group_index.has_value() ||
+      prepares_group != (p_list != nullptr))
+    throw std::invalid_argument(
+        "PsiFormer crowd lifecycle preflight received incompatible inputs");
+  if (wfc_list.empty())
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation requires a nonempty component team");
+  if (p_list && (p_list->empty() || p_list->size() != wfc_list.size()))
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation has inconsistent live-lane counts");
+  if (std::addressof(wfc_list.getLeader()) !=
+      std::addressof(wfc_list[0]))
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle component leader must occupy lane zero");
+  if (p_list && std::addressof(p_list->getLeader()) !=
+          std::addressof((*p_list)[0]))
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle ParticleSet leader must occupy lane zero");
+
+  auto* component_leader =
+      dynamic_cast<PsiFormerWF*>(std::addressof(wfc_list.getLeader()));
+  if (!component_leader || component_leader != this)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation was not invoked on its component leader");
+  if (!batch_execution_plan_ ||
+      !hasPreparedLifecycleClone(batch_execution_plan_))
+    throw std::logic_error(
+        "PsiFormer planned lifecycle operation requires an exactly prepared leader clone");
+
+  const BatchExecutionPlan& plan = batch_execution_plan_.plan();
+  const BatchExecutionRequirements required_modes =
+      plannedOperationRequiredModes(operation);
+  const BatchExecutionMode required_mode = prepares_group
+      ? BatchExecutionMode::PREPARE_GROUP
+      : BatchExecutionMode::COMPLETE_UPDATES;
+  if (!required_modes.requires(required_mode) ||
+      !plan.requirements().requires(required_mode))
+    throw std::logic_error(
+        "PsiFormer lifecycle operation is not admitted by its explicit batch mode");
+  const BatchExecutionTopology& topology = plan.topology();
+  if (topology.serialized_walkers || topology.backend_id != "cpu" ||
+      topology.device_id)
+    throw std::invalid_argument(
+        "PsiFormer planned lifecycle operation requires direct nonserialized CPU execution");
+
+  if (!mw_resource_handle_ || !acquired_resource_collection_ ||
+      acquired_resource_cursor_ == 0 ||
+      acquired_resource_outstanding_loans_ == 0)
+    throw std::logic_error(
+        "PsiFormer planned lifecycle operation requires an acquired crowd resource");
+  const PsiFormerMultiWalkerResource& resource =
+      mw_resource_handle_.getResource();
+  if (resource.model_state.get() != model_state_.get() ||
+      !resource.expected_plan.sameBinding(batch_execution_plan_) ||
+      !resource.prepared_plan.sameBinding(batch_execution_plan_) ||
+      !resource.prepared_crowd_plan ||
+      resource.participant_id !=
+          batch_execution_plan_.evidence().participant_id ||
+      resource.prepared_plan_fingerprint != plan.fingerprint())
+    throw std::logic_error(
+        "PsiFormer planned lifecycle resource has stale preparation provenance");
+
+  const BatchResourcePreparationProvenance& collection_provenance =
+      acquired_resource_collection_->getBatchResourcePreparationProvenance();
+  if (collection_provenance.state != BatchResourcePreparationState::PREPARED ||
+      collection_provenance.plan.get() != std::addressof(plan) ||
+      collection_provenance.crowd_index !=
+          resource.prepared_crowd_index ||
+      acquired_resource_collection_->getCursor() !=
+          acquired_resource_cursor_ ||
+      acquired_resource_collection_->getOutstandingLoanCount() !=
+          acquired_resource_outstanding_loans_ ||
+      !resource.acquired_from_prepared_collection ||
+      resource.acquired_plan_identity != std::addressof(plan) ||
+      resource.acquired_crowd_index != resource.prepared_crowd_index)
+    throw std::logic_error(
+        "PsiFormer planned lifecycle resource acquisition provenance changed");
+
+  const std::vector<std::size_t>& reserve_walkers =
+      psiformer::psiFormerReserveWalkersPerCrowd(topology);
+  const std::size_t crowd_index = resource.prepared_crowd_index;
+  if (crowd_index >= topology.initial_walkers_per_crowd.size() ||
+      crowd_index >= reserve_walkers.size())
+    throw std::logic_error(
+        "PsiFormer planned lifecycle crowd index is outside the topology");
+  const psiformer::PsiFormerCrowdMemoryPlan& crowd =
+      *resource.prepared_crowd_plan;
+  if (crowd.initial_walkers !=
+          topology.initial_walkers_per_crowd[crowd_index] ||
+      crowd.reserve_walkers != reserve_walkers[crowd_index] ||
+      wfc_list.size() > crowd.reserve_walkers)
+    throw std::length_error(
+        "PsiFormer planned lifecycle team exceeds or mismatches its crowd envelope");
+
+  for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+  {
+    auto* component =
+        dynamic_cast<PsiFormerWF*>(std::addressof(wfc_list[lane]));
+    if (!component)
+      throw std::invalid_argument(
+          "PsiFormer planned lifecycle team contains a foreign component type");
+    const ParticleSet* particles = p_list
+        ? std::addressof((*p_list)[lane])
+        : component->bound_particle_set_;
+    if (!particles || component->bound_particle_set_ != particles)
+      throw std::invalid_argument(
+          "PsiFormer planned lifecycle component and ParticleSet lanes are not identically bound");
+
+    for (std::size_t prior = 0; prior < lane; ++prior)
+    {
+      if (std::addressof(wfc_list[lane]) ==
+          std::addressof(wfc_list[prior]))
+        throw std::invalid_argument(
+            "PsiFormer planned lifecycle team contains a duplicate component");
+      const auto* prior_component =
+          dynamic_cast<const PsiFormerWF*>(
+              std::addressof(wfc_list[prior]));
+      const ParticleSet* prior_particles = p_list
+          ? std::addressof((*p_list)[prior])
+          : (prior_component ? prior_component->bound_particle_set_ : nullptr);
+      if (particles == prior_particles)
+        throw std::invalid_argument(
+            "PsiFormer planned lifecycle team contains a duplicate ParticleSet");
+    }
+
+    if (component->model_state_.get() != model_state_.get() ||
+        component->optimization_metadata_.get() !=
+            optimization_metadata_.get())
+      throw std::invalid_argument(
+          "PsiFormer planned lifecycle team mixes distinct shared state");
+    if (!component->batch_execution_plan_.sameBinding(
+            batch_execution_plan_) ||
+        !component->hasPreparedLifecycleClone(
+            batch_execution_plan_))
+      throw std::logic_error(
+          "PsiFormer planned lifecycle team contains an unprepared or differently bound clone");
+    if (component->acquired_crowd_leader_ != component_leader ||
+        component->acquired_lane_index_ != lane ||
+        component->acquired_crowd_size_ != wfc_list.size())
+      throw std::invalid_argument(
+          "PsiFormer planned lifecycle lane order differs from resource acquisition");
+    if (component->has_proposal_ ||
+        component->proposal_origin_ != ProposalOrigin::NONE)
+      throw std::logic_error(
+          "PsiFormer planned lifecycle operation requires absent proposal state");
+    requirePlannedLifecycleParticleSet(*particles, plan, group_index);
+  }
 }
 
 // Prove all common planned-runtime facts without synchronizing or publishing state.
@@ -4721,6 +5023,8 @@ PsiFormerWF::crowdWorkspaceDiagnosticsForTesting(
   diagnostics.persistent_model_identity  = transaction.state().persistent_model_identity;
   diagnostics.parameter_version          = transaction.parameterVersion();
   diagnostics.batch_bytes                = resource.batch_workspace->vectorStorageBytes();
+  diagnostics.successful_batch_generation =
+      resource.batch_workspace->successfulGeneration();
   if (resource.score_workspace)
     diagnostics.score_bytes = resource.score_workspace->vectorStorageBytes();
   if (resource.kinetic_workspace)
@@ -9293,21 +9597,32 @@ void PsiFormerWF::mw_recompute(
   publish();
 }
 
-// Retain inherited scalar group preparation only for legacy no-plan execution.
+// Validate planned group preparation as a pure no-op after exact preflight.
 void PsiFormerWF::prepareGroup(ParticleSet& particles, int group_index)
 {
-  requireUnplannedScalarEvaluation("prepareGroup");
-  WaveFunctionComponent::prepareGroup(particles, group_index);
+  if (!batch_execution_plan_)
+  {
+    WaveFunctionComponent::prepareGroup(particles, group_index);
+    return;
+  }
+  requirePlannedScalarLifecycleOperation(
+      PlannedOperation::PREPARE_GROUP, particles, group_index);
 }
 
-// Retain inherited crowd group preparation only for legacy no-plan execution.
+// Validate one acquired planned team without inherited serialized dispatch.
 void PsiFormerWF::mw_prepareGroup(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list,
     int group_index) const
 {
-  requireUnplannedScalarEvaluation("mw_prepareGroup");
-  WaveFunctionComponent::mw_prepareGroup(wfc_list, p_list, group_index);
+  if (!batch_execution_plan_)
+  {
+    WaveFunctionComponent::mw_prepareGroup(wfc_list, p_list, group_index);
+    return;
+  }
+  requirePlannedMultiWalkerLifecycleOperation(
+      wfc_list, std::addressof(p_list), PlannedOperation::PREPARE_GROUP,
+      group_index);
 }
 
 // Evaluate and cache the wavefunction ratio for one proposed electron position.
@@ -11073,19 +11388,32 @@ void PsiFormerWF::mw_accept_rejectMove(
   unregisterPlannedSingleTransaction();
 }
 
-// Retain inherited scalar update completion only for legacy no-plan execution.
+// Validate planned scalar completion against the retained bound ParticleSet.
 void PsiFormerWF::completeUpdates()
 {
-  requireUnplannedScalarEvaluation("completeUpdates");
-  WaveFunctionComponent::completeUpdates();
+  if (!batch_execution_plan_)
+  {
+    WaveFunctionComponent::completeUpdates();
+    return;
+  }
+  if (!bound_particle_set_)
+    throw std::logic_error(
+        "PsiFormer planned completion has no bound ParticleSet");
+  requirePlannedScalarLifecycleOperation(
+      PlannedOperation::COMPLETE_UPDATES, *bound_particle_set_, std::nullopt);
 }
 
-// Retain inherited crowd completion only for legacy no-plan execution.
+// Validate planned crowd completion from retained lane bindings only.
 void PsiFormerWF::mw_completeUpdates(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const
 {
-  requireUnplannedScalarEvaluation("mw_completeUpdates");
-  WaveFunctionComponent::mw_completeUpdates(wfc_list);
+  if (!batch_execution_plan_)
+  {
+    WaveFunctionComponent::mw_completeUpdates(wfc_list);
+    return;
+  }
+  requirePlannedMultiWalkerLifecycleOperation(
+      wfc_list, nullptr, PlannedOperation::COMPLETE_UPDATES, std::nullopt);
 }
 
 // Reserve one planned record only after two exact sizing-cursor observations.
