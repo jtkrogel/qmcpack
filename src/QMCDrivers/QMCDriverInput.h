@@ -18,6 +18,7 @@
 #include "OhmmsData/ParameterSet.h"
 #include "DriverDebugChecks.h"
 #include "EstimatorManagerInput.h"
+#include "QMCDrivers/BatchMemoryInput.h"
 #include "type_traits/template_types.hpp"
 
 namespace qmcplusplus
@@ -86,6 +87,9 @@ protected:
    */
   std::optional<EstimatorManagerInput> estimator_manager_input_;
 
+  /** Optional section-local cap and tile policy for accounted batch execution storage. */
+  std::optional<BatchMemoryInput> batch_memory_input_;
+
   // from putQMCInfo
   IndexType check_point_period_ = 0;
   bool dump_config_             = false;
@@ -126,6 +130,7 @@ public:
   RealType get_drift_modifier_unr_a() const { return drift_modifier_unr_a_; }
 
   const std::optional<EstimatorManagerInput>& get_estimator_manager_input() const { return estimator_manager_input_; }
+  const std::optional<BatchMemoryInput>& get_batch_memory_input() const { return batch_memory_input_; }
 };
 
 // These will cause a compiler error if the implicit move constructor has been broken

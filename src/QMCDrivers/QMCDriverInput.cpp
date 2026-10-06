@@ -33,6 +33,10 @@ namespace qmcplusplus
  */
 void QMCDriverInput::readXML(xmlNodePtr cur)
 {
+  // Structured policy is section-local. Reusing a QMCDriverInput for a later
+  // section must not retain a policy that is absent from the new section.
+  batch_memory_input_.reset();
+
   // ParameterSet has an dependency on the lifetime of the backing xmlNodePtr
   // so its better it not live long
 
@@ -106,6 +110,12 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
           estimator_manager_input_->readXML(tcur);
         else
           estimator_manager_input_ = std::optional<EstimatorManagerInput>(std::in_place, tcur);
+      }
+      else if (cname == "batch_memory")
+      {
+        if (batch_memory_input_)
+          throw UniformCommunicateError("QMCDriverInput: duplicate batch_memory section");
+        batch_memory_input_.emplace(tcur);
       }
       tcur = tcur->next;
     }
