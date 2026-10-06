@@ -29,6 +29,7 @@ set(HAM_SRCS
     test_L2Potential.cpp
     test_NonLocalTOperator.cpp
     test_ecp.cpp
+    test_batch_memory_participants.cpp
     test_psiformer_hamiltonian.cpp
     test_hamiltonian_pool.cpp
     test_hamiltonian_factory.cpp

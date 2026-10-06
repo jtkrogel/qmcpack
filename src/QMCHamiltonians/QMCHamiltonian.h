@@ -21,7 +21,10 @@
 #ifndef QMCPLUSPLUS_HAMILTONIAN_H
 #define QMCPLUSPLUS_HAMILTONIAN_H
 
+#include <memory>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include <ResourceHandle.h>
 
@@ -399,6 +402,29 @@ public:
 
   /// initialize a shared resource and hand it to a collection
   void createResource(ResourceCollection& collection) const;
+
+  /// Add requirements from physical operators followed by auxiliary operators.
+  void contributeBatchExecutionRequirements(BatchExecutionRequirements& requirements) const;
+
+  /// Return deterministic physical-then-auxiliary participant contributions.
+  std::vector<BatchMemoryParticipantContribution> estimateBatchExecutionMemory(
+      const BatchExecutionPlanningContext& context) const;
+
+  /** Atomically bind or clear one immutable plan across every operator.
+   * Validation of all participant views completes before any child is changed.
+   */
+  void bindBatchExecutionPlan(std::shared_ptr<const BatchExecutionPlan> plan);
+
+  /// Prepare clone-local operator state after a plan has been bound.
+  void prepareBatchExecutionClones();
+
+  /// Return the exact immutable plan identity currently bound to this aggregate.
+  const std::shared_ptr<const BatchExecutionPlan>& batchExecutionPlan() const noexcept
+  { return batch_execution_plan_; }
+
+  /// Report whether the standard Hamiltonian team currently owns its resources.
+  bool hasAcquiredResource() const noexcept { return batch_resources_acquired_; }
+
   /** acquire external resource
    * Note: use RAII ResourceCollectionLock whenever possible
    */
@@ -415,6 +441,12 @@ private:
   static constexpr std::array<std::string_view, 8> available_quantities_{"weight", "LocalEnergy", "LocalPotential",
                                                                          "Vq",     "Vc",          "Vqq",
                                                                          "Vqc",    "Vcc"};
+
+  /// Build escaped structural IDs in physical-then-auxiliary order.
+  std::vector<std::string> batchExecutionParticipantIds() const;
+
+  /// Reject post-bind structural changes before preparation or acquisition.
+  void validateBatchExecutionStructure() const;
 
   ///starting index
   int myIndex;
@@ -475,6 +507,16 @@ private:
   /// multiwalker shared resource
   struct QMCHamiltonianMultiWalkerResource;
   ResourceHandle<QMCHamiltonianMultiWalkerResource> mw_res_handle_;
+
+  /// Immutable section plan and the structural IDs validated when it was bound.
+  std::shared_ptr<const BatchExecutionPlan> batch_execution_plan_;
+  std::vector<std::string> bound_batch_participant_ids_;
+
+  /// Structural snapshot retained for every member of an acquired resource family.
+  std::vector<std::string> acquired_batch_participant_ids_;
+
+  /// True only while the standard Hamiltonian team owns its resource collection.
+  bool batch_resources_acquired_ = false;
 };
 } // namespace qmcplusplus
 #endif

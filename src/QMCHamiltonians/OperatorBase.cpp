@@ -42,6 +42,8 @@ OperatorBase::OperatorBase()
 
 std::bitset<8>& OperatorBase::getUpdateMode() noexcept { return update_mode_; }
 
+const std::bitset<8>& OperatorBase::getUpdateMode() const noexcept { return update_mode_; }
+
 OperatorBase::Return_t OperatorBase::getValue() const noexcept { return value_; }
 
 std::string OperatorBase::getName() const noexcept { return name_; }

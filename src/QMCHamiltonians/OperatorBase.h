@@ -29,6 +29,7 @@
 #include "QMCHamiltonians/ObservableHelper.h"
 #include "Containers/MinimalContainers/RecordArray.hpp"
 #include "QMCWaveFunctions/TWFFastDerivWrapper.h"
+#include "Utilities/BatchExecutionMemory.h"
 #if !defined(REMOVE_TRACEMANAGER)
 #include "Estimators/TraceManager.h"
 #endif
@@ -137,6 +138,9 @@ public:
    * @return std::bitset<8>& reference of get_update_mode_
    */
   std::bitset<8>& getUpdateMode() noexcept;
+
+  /// Return update-mode flags without permitting lifecycle mutation.
+  const std::bitset<8>& getUpdateMode() const noexcept;
 
   /**
    * @brief get a copy of value_
@@ -433,6 +437,35 @@ public:
    * @param o_list 
    */
   virtual void releaseResource(ResourceCollection& collection, const RefVectorWithLeader<OperatorBase>& o_list) const;
+
+  /** Add every batch operation family reachable through this operator.
+   * Legacy operators contribute no requirements until they opt into bounded execution.
+   */
+  virtual void contributeBatchExecutionRequirements(BatchExecutionRequirements&) const {}
+
+  /** Estimate this operator's candidate-dependent batch storage.
+   * The incomplete default prevents an explicit hard policy from silently omitting
+   * an unregistered operator.
+   */
+  virtual BatchMemoryContribution estimateBatchExecutionMemory(
+      const BatchExecutionPlanningContext&) const
+  {
+    return {};
+  }
+
+  /// Validate a proposed participant binding without changing operator state.
+  virtual void validateBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan&) const
+  {}
+
+  /// Publish a previously validated participant binding without throwing.
+  virtual void bindBatchExecutionPlan(BatchExecutionParticipantPlan) noexcept
+  {}
+
+  /// Prepare clone-local storage after the immutable plan has been bound.
+  virtual void prepareBatchExecutionClone(
+      const BatchExecutionParticipantPlan&)
+  {}
 
   /**
    * @brief Set the Random Generator object

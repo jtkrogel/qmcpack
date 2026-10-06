@@ -29,6 +29,10 @@
 #include "type_traits/ConvertToReal.h"
 #include "CPU/math.hpp"
 
+#include <exception>
+#include <set>
+#include <stdexcept>
+
 namespace qmcplusplus
 {
 struct QMCHamiltonian::QMCHamiltonianMultiWalkerResource : public Resource
@@ -100,6 +104,13 @@ bool QMCHamiltonian::get(std::ostream& os) const
  */
 void QMCHamiltonian::addOperator(std::unique_ptr<OperatorBase>&& h, const std::string& aname, bool physical)
 {
+  if (batch_resources_acquired_)
+    throw std::logic_error(
+        "Cannot add a Hamiltonian operator while resources are acquired");
+  if (batch_execution_plan_)
+    throw std::logic_error(
+        "Cannot add a Hamiltonian operator while a batch execution plan is bound");
+
   //change UpdateMode[PHYSICAL] of h so that cloning can be done correctly
   h->getUpdateMode()[OperatorBase::PHYSICAL] = physical;
   if (physical)
@@ -1014,15 +1025,255 @@ void QMCHamiltonian::createResource(ResourceCollection& collection) const
     H[i]->createResource(collection);
 }
 
+void QMCHamiltonian::contributeBatchExecutionRequirements(
+    BatchExecutionRequirements& requirements) const
+{
+  for (const auto& component : H)
+    component->contributeBatchExecutionRequirements(requirements);
+  for (const auto& component : auxH)
+    component->contributeBatchExecutionRequirements(requirements);
+}
+
+std::vector<std::string> QMCHamiltonian::batchExecutionParticipantIds() const
+{
+  std::vector<std::string> participant_ids;
+  participant_ids.reserve(H.size() + auxH.size());
+
+  const auto append_ids = [&participant_ids](const auto& operators,
+                                              std::string_view role,
+                                              bool physical) {
+    for (std::size_t index = 0; index < operators.size(); ++index)
+    {
+      const OperatorBase& component = *operators[index];
+      if (component.getUpdateMode()[OperatorBase::PHYSICAL] != physical)
+        throw std::logic_error(
+            "Hamiltonian operator physical role changed after insertion");
+      participant_ids.push_back(
+          "ham/" + std::string(role) + "/operator/" + std::to_string(index) +
+          "/" + escapeBatchParticipantIdSegment(component.getClassName()) +
+          "/" + escapeBatchParticipantIdSegment(component.getName()));
+    }
+  };
+
+  append_ids(H, "physical", true);
+  append_ids(auxH, "auxiliary", false);
+  return participant_ids;
+}
+
+std::vector<BatchMemoryParticipantContribution>
+QMCHamiltonian::estimateBatchExecutionMemory(
+    const BatchExecutionPlanningContext& context) const
+{
+  std::vector<std::string> participant_ids = batchExecutionParticipantIds();
+  std::vector<BatchMemoryParticipantContribution> contributions;
+  contributions.reserve(participant_ids.size());
+
+  std::size_t participant = 0;
+  for (const auto& component : H)
+    contributions.push_back(
+        {participant_ids[participant++],
+         component->estimateBatchExecutionMemory(context)});
+  for (const auto& component : auxH)
+    contributions.push_back(
+        {participant_ids[participant++],
+         component->estimateBatchExecutionMemory(context)});
+  return contributions;
+}
+
+void QMCHamiltonian::bindBatchExecutionPlan(
+    std::shared_ptr<const BatchExecutionPlan> plan)
+{
+  std::vector<std::string> participant_ids = batchExecutionParticipantIds();
+
+  if (batch_resources_acquired_)
+  {
+    if (plan != batch_execution_plan_ ||
+        participant_ids != acquired_batch_participant_ids_)
+      throw std::logic_error(
+          "Cannot change a Hamiltonian batch execution plan while resources are acquired");
+    validateBatchExecutionStructure();
+    return;
+  }
+
+  if (plan && plan == batch_execution_plan_ &&
+      participant_ids == bound_batch_participant_ids_)
+  {
+    validateBatchExecutionStructure();
+    return;
+  }
+
+  std::vector<BatchExecutionParticipantPlan> participant_plans;
+  participant_plans.reserve(participant_ids.size());
+  for (const std::string& participant_id : participant_ids)
+    participant_plans.push_back(
+        makeBatchExecutionParticipantPlan(plan, participant_id));
+
+  std::size_t participant = 0;
+  for (const auto& component : H)
+    component->validateBatchExecutionPlanBinding(
+        participant_plans[participant++]);
+  for (const auto& component : auxH)
+    component->validateBatchExecutionPlanBinding(
+        participant_plans[participant++]);
+
+  participant = 0;
+  for (const auto& component : H)
+    component->bindBatchExecutionPlan(
+        std::move(participant_plans[participant++]));
+  for (const auto& component : auxH)
+    component->bindBatchExecutionPlan(
+        std::move(participant_plans[participant++]));
+
+  batch_execution_plan_ = std::move(plan);
+  if (batch_execution_plan_)
+    bound_batch_participant_ids_ = std::move(participant_ids);
+  else
+    bound_batch_participant_ids_.clear();
+}
+
+void QMCHamiltonian::validateBatchExecutionStructure() const
+{
+  const std::vector<std::string> participant_ids =
+      batchExecutionParticipantIds();
+  if (batch_resources_acquired_ &&
+      participant_ids != acquired_batch_participant_ids_)
+    throw std::logic_error(
+        "Hamiltonian structure changed while resources were acquired");
+  if (batch_execution_plan_ &&
+      participant_ids != bound_batch_participant_ids_)
+    throw std::logic_error(
+        "Hamiltonian structure changed after its batch execution plan was bound");
+  if (!batch_execution_plan_ && !bound_batch_participant_ids_.empty())
+    throw std::logic_error(
+        "Hamiltonian retained participant IDs without a batch execution plan");
+
+  std::size_t participant = 0;
+  for (const auto& component : H)
+    component->validateBatchExecutionPlanBinding(
+        makeBatchExecutionParticipantPlan(
+            batch_execution_plan_, participant_ids[participant++]));
+  for (const auto& component : auxH)
+    component->validateBatchExecutionPlanBinding(
+        makeBatchExecutionParticipantPlan(
+            batch_execution_plan_, participant_ids[participant++]));
+}
+
+void QMCHamiltonian::prepareBatchExecutionClones()
+{
+  if (batch_resources_acquired_)
+    throw std::logic_error(
+        "Cannot prepare Hamiltonian batch storage while resources are acquired");
+  validateBatchExecutionStructure();
+
+  const std::vector<std::string> participant_ids =
+      batchExecutionParticipantIds();
+  std::size_t participant = 0;
+  for (const auto& component : H)
+    component->prepareBatchExecutionClone(makeBatchExecutionParticipantPlan(
+        batch_execution_plan_, participant_ids[participant++]));
+  for (const auto& component : auxH)
+    component->prepareBatchExecutionClone(makeBatchExecutionParticipantPlan(
+        batch_execution_plan_, participant_ids[participant++]));
+}
+
 void QMCHamiltonian::acquireResource(ResourceCollection& collection,
                                      const RefVectorWithLeader<QMCHamiltonian>& ham_list)
 {
-  auto& ham_leader          = ham_list.getLeader();
-  ham_leader.mw_res_handle_ = collection.lendResource<QMCHamiltonianMultiWalkerResource>();
-  for (int i_ham_op = 0; i_ham_op < ham_leader.H.size(); ++i_ham_op)
+  auto& ham_leader = ham_list.getLeader();
+  if (ham_leader.batch_resources_acquired_)
+    throw std::logic_error(
+        "Hamiltonian resources are already acquired for the leader");
+  if (!ham_leader.acquired_batch_participant_ids_.empty())
+    throw std::logic_error(
+        "Hamiltonian leader retained a stale resource-acquisition topology");
+
+  ham_leader.validateBatchExecutionStructure();
+  const std::vector<std::string> leader_participant_ids =
+      ham_leader.batchExecutionParticipantIds();
+
+  // Retain one lifecycle snapshot for the leader even when the caller's clone
+  // vector does not repeat it.  The snapshot vectors are fully allocated before
+  // any resource is lent, so successful publication below cannot throw.
+  std::vector<std::pair<QMCHamiltonian*, std::vector<std::string>>>
+      acquired_topologies;
+  acquired_topologies.reserve(ham_list.size() + 1);
+  acquired_topologies.emplace_back(&ham_leader, leader_participant_ids);
+
+  std::set<const QMCHamiltonian*> distinct_hamiltonians;
+  for (QMCHamiltonian& hamiltonian : ham_list)
   {
-    const auto HC_list(extract_HC_list(ham_list, i_ham_op));
-    ham_leader.H[i_ham_op]->acquireResource(collection, HC_list);
+    // Entries are evaluation lanes rather than ownership identities.  Keep
+    // repeated lanes in component ref-lists but publish aggregate lifecycle
+    // state only once for each distinct object.
+    if (!distinct_hamiltonians.insert(&hamiltonian).second)
+      continue;
+    hamiltonian.validateBatchExecutionStructure();
+    if (hamiltonian.batchExecutionParticipantIds() != leader_participant_ids)
+      throw std::logic_error(
+          "Hamiltonian resource family has inconsistent operator structure");
+    if (hamiltonian.batch_resources_acquired_)
+      throw std::logic_error(
+          "Hamiltonian batch resources are already acquired");
+    if (!hamiltonian.acquired_batch_participant_ids_.empty())
+      throw std::logic_error(
+          "Hamiltonian clone retained a stale resource-acquisition topology");
+    if (hamiltonian.batch_execution_plan_ !=
+        ham_leader.batch_execution_plan_)
+      throw std::logic_error(
+          "Hamiltonian resource family has inconsistent batch execution plans");
+    if (&hamiltonian != &ham_leader)
+      acquired_topologies.emplace_back(&hamiltonian, leader_participant_ids);
+  }
+
+  // Building component lists may allocate.  Finish that work before lending
+  // the container resource so rollback only traverses already-built lists.
+  std::vector<RefVectorWithLeader<OperatorBase>> component_lists;
+  component_lists.reserve(ham_leader.H.size());
+  for (int i_ham_op = 0; i_ham_op < ham_leader.H.size(); ++i_ham_op)
+    component_lists.push_back(extract_HC_list(ham_list, i_ham_op));
+
+  const std::size_t cursor_begin = collection.getCursor();
+  int acquired_components       = 0;
+  bool acquired_container       = false;
+  try
+  {
+    ham_leader.mw_res_handle_ =
+        collection.lendResource<QMCHamiltonianMultiWalkerResource>();
+    acquired_container = true;
+    for (int i_ham_op = 0; i_ham_op < ham_leader.H.size(); ++i_ham_op)
+    {
+      ham_leader.H[i_ham_op]->acquireResource(
+          collection, component_lists[i_ham_op]);
+      ++acquired_components;
+    }
+  }
+  catch (...)
+  {
+    const std::exception_ptr acquisition_failure =
+        std::current_exception();
+    collection.rewind(cursor_begin);
+    try
+    {
+      if (acquired_container)
+        collection.takebackResource(ham_leader.mw_res_handle_);
+      for (int i_ham_op = 0; i_ham_op < acquired_components; ++i_ham_op)
+        ham_leader.H[i_ham_op]->releaseResource(
+            collection, component_lists[i_ham_op]);
+    }
+    catch (...)
+    {
+      collection.rewind(cursor_begin);
+      throw;
+    }
+    collection.rewind(cursor_begin);
+    std::rethrow_exception(acquisition_failure);
+  }
+
+  for (auto& [hamiltonian, participant_ids] : acquired_topologies)
+  {
+    hamiltonian->acquired_batch_participant_ids_ =
+        std::move(participant_ids);
+    hamiltonian->batch_resources_acquired_ = true;
   }
 }
 
@@ -1030,11 +1281,59 @@ void QMCHamiltonian::releaseResource(ResourceCollection& collection,
                                      const RefVectorWithLeader<QMCHamiltonian>& ham_list)
 {
   auto& ham_leader = ham_list.getLeader();
+  if (!ham_leader.batch_resources_acquired_)
+    throw std::logic_error(
+        "Hamiltonian resources are not acquired for the leader");
+
+  const std::vector<std::string> leader_participant_ids =
+      ham_leader.batchExecutionParticipantIds();
+  if (leader_participant_ids !=
+      ham_leader.acquired_batch_participant_ids_)
+    throw std::logic_error(
+        "Hamiltonian leader topology changed while resources were acquired");
+
+  std::vector<QMCHamiltonian*> acquired_hamiltonians;
+  acquired_hamiltonians.reserve(ham_list.size() + 1);
+  acquired_hamiltonians.push_back(&ham_leader);
+
+  std::set<const QMCHamiltonian*> distinct_hamiltonians;
+  for (QMCHamiltonian& hamiltonian : ham_list)
+  {
+    if (!distinct_hamiltonians.insert(&hamiltonian).second)
+      continue;
+    const std::vector<std::string> participant_ids =
+        hamiltonian.batchExecutionParticipantIds();
+    if (participant_ids != leader_participant_ids ||
+        participant_ids != hamiltonian.acquired_batch_participant_ids_)
+      throw std::logic_error(
+          "Hamiltonian operator topology changed while resources were acquired");
+    if (!hamiltonian.batch_resources_acquired_)
+      throw std::logic_error(
+          "Hamiltonian batch resources are not acquired");
+    if (hamiltonian.batch_execution_plan_ !=
+        ham_leader.batch_execution_plan_)
+      throw std::logic_error(
+          "Hamiltonian resource family has inconsistent batch execution plans");
+    if (&hamiltonian != &ham_leader)
+      acquired_hamiltonians.push_back(&hamiltonian);
+  }
+
+  // As in acquisition, allocate all component views before mutating the
+  // resource collection or any retained handle.
+  std::vector<RefVectorWithLeader<OperatorBase>> component_lists;
+  component_lists.reserve(ham_leader.H.size());
+  for (int i_ham_op = 0; i_ham_op < ham_leader.H.size(); ++i_ham_op)
+    component_lists.push_back(extract_HC_list(ham_list, i_ham_op));
+
   collection.takebackResource(ham_leader.mw_res_handle_);
   for (int i_ham_op = 0; i_ham_op < ham_leader.H.size(); ++i_ham_op)
+    ham_leader.H[i_ham_op]->releaseResource(
+        collection, component_lists[i_ham_op]);
+
+  for (QMCHamiltonian* hamiltonian : acquired_hamiltonians)
   {
-    const auto HC_list(extract_HC_list(ham_list, i_ham_op));
-    ham_leader.H[i_ham_op]->releaseResource(collection, HC_list);
+    hamiltonian->acquired_batch_participant_ids_.clear();
+    hamiltonian->batch_resources_acquired_ = false;
   }
 }
 
@@ -1053,6 +1352,7 @@ std::unique_ptr<QMCHamiltonian> QMCHamiltonian::makeClone(ParticleSet& qp, Trial
     qp.Collectables.clear();
     qp.Collectables.resize(numCollectables);
   }
+  myclone->bindBatchExecutionPlan(batch_execution_plan_);
   //Assume tau is correct for the Kinetic energy operator and assign to the rest of the clones
   //Return_t tau = H[0]->Tau;
   //myclone->setTau(tau);
