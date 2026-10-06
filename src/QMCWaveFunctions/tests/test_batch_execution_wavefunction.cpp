@@ -78,14 +78,24 @@ public:
     ++requirement_calls_;
   }
 
+  BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext& context) const override
+  {
+    last_workload_requirements_    = context.requirements;
+    last_workload_topology_        = context.topology;
+    last_workload_parameter_count_ = context.active_parameter_count;
+    ++logical_maximum_calls_;
+    return logical_maximum_;
+  }
+
   BatchMemoryContribution estimateBatchExecutionMemory(
       const BatchExecutionPlanningContext&) const override
   {
     ++estimate_calls_;
     BatchMemoryContribution contribution;
-    contribution.logical_maximum = logical_maximum_;
+    contribution.logical_maximum    = logical_maximum_;
     contribution.owner_multiplicity = 1;
-    contribution.fully_accounted = true;
+    contribution.fully_accounted    = true;
     contribution.per_owner.add(BatchMemoryCategory::FIXED_CLONE_STATE,
                                {bytes_, 0});
     return contribution;
@@ -155,6 +165,13 @@ public:
   const BatchExecutionParticipantPlan& boundPlan() const noexcept
   { return bound_plan_; }
   std::size_t requirementCalls() const noexcept { return requirement_calls_; }
+  std::size_t logicalMaximumCalls() const noexcept { return logical_maximum_calls_; }
+  const BatchExecutionRequirements& lastWorkloadRequirements() const noexcept
+  {
+    return last_workload_requirements_;
+  }
+  const BatchExecutionTopology& lastWorkloadTopology() const noexcept { return last_workload_topology_; }
+  std::size_t lastWorkloadParameterCount() const noexcept { return last_workload_parameter_count_; }
   std::size_t estimateCalls() const noexcept { return estimate_calls_; }
   std::size_t validationCalls() const noexcept { return validation_calls_; }
   std::size_t bindCalls() const noexcept { return bind_calls_; }
@@ -167,17 +184,21 @@ private:
   BatchExecutionMode required_mode_;
   BatchTileCapacities logical_maximum_;
   std::size_t bytes_;
-  bool reject_nonempty_binding_ = false;
-  bool reject_empty_binding_ = false;
-  bool throw_on_acquire_ = false;
-  bool copy_binding_in_clone_ = false;
-  mutable std::size_t requirement_calls_ = 0;
-  mutable std::size_t estimate_calls_ = 0;
-  mutable std::size_t validation_calls_ = 0;
-  std::size_t bind_calls_ = 0;
-  std::size_t prepare_calls_ = 0;
-  mutable std::size_t acquire_calls_ = 0;
-  mutable std::size_t release_calls_ = 0;
+  bool reject_nonempty_binding_                       = false;
+  bool reject_empty_binding_                          = false;
+  bool throw_on_acquire_                              = false;
+  bool copy_binding_in_clone_                         = false;
+  mutable std::size_t requirement_calls_              = 0;
+  mutable std::size_t logical_maximum_calls_           = 0;
+  mutable BatchExecutionRequirements last_workload_requirements_;
+  mutable BatchExecutionTopology last_workload_topology_;
+  mutable std::size_t last_workload_parameter_count_   = 0;
+  mutable std::size_t estimate_calls_                  = 0;
+  mutable std::size_t validation_calls_                = 0;
+  std::size_t bind_calls_                               = 0;
+  std::size_t prepare_calls_                            = 0;
+  mutable std::size_t acquire_calls_                   = 0;
+  mutable std::size_t release_calls_                   = 0;
   BatchExecutionParticipantPlan bound_plan_;
 };
 
@@ -191,9 +212,11 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(
   wavefunction.contributeBatchExecutionRequirements(input.requirements);
   input.topology.initial_walkers_per_crowd = {2};
   input.topology.reserve_walkers_per_crowd = {3};
-  input.topology.run_kind = "wavefunction-unit-test";
-  input.logical_maximum = {8, 6, 4, 0};
-  input.preference.id = std::move(profile_id);
+  input.topology.run_kind      = "wavefunction-unit-test";
+  input.active_parameter_count = 17;
+  input.logical_maximum        = wavefunction.batchExecutionLogicalMaximum(
+      {input.requirements, input.topology, input.active_parameter_count});
+  input.preference.id        = std::move(profile_id);
   input.preference.preferred = {preferred_value_tile, 2, 2, 0};
   return std::make_shared<const BatchExecutionPlan>(
       selectBatchExecutionPlan(
@@ -236,9 +259,24 @@ TEST_CASE("TrialWaveFunction aggregates ordered batch planning participants",
   CHECK(first_ptr->requirementCalls() == 1);
   CHECK(second_ptr->requirementCalls() == 1);
 
+  BatchExecutionWorkloadContext workload_context;
+  workload_context.requirements                       = requirements;
+  workload_context.topology.initial_walkers_per_crowd = {2, 3};
+  workload_context.topology.reserve_walkers_per_crowd = {4, 5};
+  workload_context.topology.run_kind                  = "logical-envelope-test";
+  workload_context.active_parameter_count             = 19;
+  CHECK(wavefunction.batchExecutionLogicalMaximum(workload_context) ==
+        BatchTileCapacities{8, 6, 0, 0});
+  CHECK(first_ptr->logicalMaximumCalls() == 1);
+  CHECK(first_ptr->lastWorkloadRequirements() == requirements);
+  CHECK(first_ptr->lastWorkloadTopology().initial_walkers_per_crowd == std::vector<std::size_t>{2, 3});
+  CHECK(first_ptr->lastWorkloadTopology().reserve_walkers_per_crowd == std::vector<std::size_t>{4, 5});
+  CHECK(first_ptr->lastWorkloadTopology().run_kind == "logical-envelope-test");
+  CHECK(first_ptr->lastWorkloadParameterCount() == 19);
+
   BatchExecutionPlanningContext context;
-  context.requirements = requirements;
-  context.logical_maximum = {8, 6, 4, 0};
+  context.requirements         = requirements;
+  context.logical_maximum      = {8, 6, 4, 0};
   context.candidate_capacities = {3, 2, 0, 0};
   const auto contributions = wavefunction.estimateBatchExecutionMemory(context);
   REQUIRE(contributions.size() == 2);

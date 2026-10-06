@@ -83,17 +83,6 @@ const BatchTileRequest& getRequest(const BatchTileRequests& requests, BatchExecu
   }
 }
 
-/** All flattened ECP operation families use the same outer tile dimension. */
-bool modeIsRequired(const BatchExecutionRequirements& requirements, BatchExecutionMode mode)
-{
-  if (mode == BatchExecutionMode::ECP_OUTER)
-    return requirements.requires(BatchExecutionMode::ECP_OUTER) ||
-        requirements.requires(BatchExecutionMode::ECP_WEIGHTED_SCORE) ||
-        requirements.requires(BatchExecutionMode::ECP_TMOVE_CANDIDATES) ||
-        requirements.requires(BatchExecutionMode::ECP_LISTENER_OUTPUT);
-  return requirements.requires(mode);
-}
-
 /** Format a byte pair for setup-time policy errors. */
 std::string formatBytes(BatchMemoryBytes bytes)
 {
@@ -333,6 +322,22 @@ bool BatchExecutionRequirements::requires(BatchExecutionMode mode) const noexcep
   return (mask_ & static_cast<std::uint32_t>(mode)) != 0;
 }
 
+bool batchExecutionModeIsRequired(const BatchExecutionRequirements& requirements,
+                                  BatchExecutionMode mode) noexcept
+{
+  // Scalar compatibility shares the ordinary VALUE tile, while all flattened
+  // nonlocal-ECP products share the outer replacement tile.
+  if (mode == BatchExecutionMode::VALUE)
+    return requirements.requires(BatchExecutionMode::VALUE) ||
+        requirements.requires(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  if (mode == BatchExecutionMode::ECP_OUTER)
+    return requirements.requires(BatchExecutionMode::ECP_OUTER) ||
+        requirements.requires(BatchExecutionMode::ECP_WEIGHTED_SCORE) ||
+        requirements.requires(BatchExecutionMode::ECP_TMOVE_CANDIDATES) ||
+        requirements.requires(BatchExecutionMode::ECP_LISTENER_OUTPUT);
+  return requirements.requires(mode);
+}
+
 BatchTileRequest BatchTileRequest::fixed(std::size_t capacity)
 {
   if (capacity == 0)
@@ -425,6 +430,15 @@ BatchMemoryBytes checkedBatchMemoryMultiply(BatchMemoryBytes bytes,
 {
   return {checkedBatchMemoryMultiply(bytes.host, multiplicity, context + " host"),
           checkedBatchMemoryMultiply(bytes.device, multiplicity, context + " device")};
+}
+
+void includeBatchExecutionLogicalMaximum(BatchTileCapacities& aggregate,
+                                         const BatchTileCapacities& participant) noexcept
+{
+  aggregate.value           = std::max(aggregate.value, participant.value);
+  aggregate.full_vgl        = std::max(aggregate.full_vgl, participant.full_vgl);
+  aggregate.active_gradient = std::max(aggregate.active_gradient, participant.active_gradient);
+  aggregate.ecp_outer       = std::max(aggregate.ecp_outer, participant.ecp_outer);
 }
 
 std::string escapeBatchParticipantIdSegment(std::string_view segment)
@@ -532,7 +546,7 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
   BatchTileCapacities selected;
   for (const BatchExecutionMode mode : TUNABLE_MODES)
   {
-    const bool required = modeIsRequired(input.requirements, mode);
+    const bool required = batchExecutionModeIsRequired(input.requirements, mode);
     setCapacity(selected, mode,
                 initialCapacity(getRequest(input.policy.tiles, mode), getCapacity(input.preference.preferred, mode),
                                 getCapacity(input.logical_maximum, mode), required));
@@ -540,7 +554,8 @@ BatchExecutionPlan selectBatchExecutionPlan(const BatchExecutionSelectionInput& 
 
   BatchTileCapacities minimum = selected;
   for (const BatchExecutionMode mode : TUNABLE_MODES)
-    if (modeIsRequired(input.requirements, mode) && getRequest(input.policy.tiles, mode).isAutomatic())
+    if (batchExecutionModeIsRequired(input.requirements, mode) &&
+        getRequest(input.policy.tiles, mode).isAutomatic())
       setCapacity(minimum, mode, 1);
 
   std::vector<BatchMemoryParticipantContribution> reference_contributions;

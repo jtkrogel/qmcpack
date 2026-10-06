@@ -1034,6 +1034,19 @@ void QMCHamiltonian::contributeBatchExecutionRequirements(
     component->contributeBatchExecutionRequirements(requirements);
 }
 
+BatchTileCapacities QMCHamiltonian::batchExecutionLogicalMaximum(
+    const BatchExecutionWorkloadContext& context) const
+{
+  BatchTileCapacities maximum;
+  for (const auto& component : H)
+    includeBatchExecutionLogicalMaximum(
+        maximum, component->batchExecutionLogicalMaximum(context));
+  for (const auto& component : auxH)
+    includeBatchExecutionLogicalMaximum(
+        maximum, component->batchExecutionLogicalMaximum(context));
+  return maximum;
+}
+
 std::vector<std::string> QMCHamiltonian::batchExecutionParticipantIds() const
 {
   std::vector<std::string> participant_ids;

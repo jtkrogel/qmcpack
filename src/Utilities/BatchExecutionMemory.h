@@ -61,15 +61,16 @@ enum class BatchMemoryCategory : std::size_t
 /** Required operation families determine which tile dimensions may be nonzero. */
 enum class BatchExecutionMode : std::uint32_t
 {
-  VALUE                = 1U << 0,
-  FULL_VGL             = 1U << 1,
-  ACTIVE_GRADIENT      = 1U << 2,
-  SCORE                = 1U << 3,
-  KINETIC              = 1U << 4,
-  ECP_OUTER            = 1U << 5,
-  ECP_WEIGHTED_SCORE   = 1U << 6,
-  ECP_TMOVE_CANDIDATES = 1U << 7,
-  ECP_LISTENER_OUTPUT  = 1U << 8
+  VALUE                      = 1U << 0,
+  FULL_VGL                   = 1U << 1,
+  ACTIVE_GRADIENT            = 1U << 2,
+  SCORE                      = 1U << 3,
+  KINETIC                    = 1U << 4,
+  ECP_OUTER                  = 1U << 5,
+  ECP_WEIGHTED_SCORE         = 1U << 6,
+  ECP_TMOVE_CANDIDATES       = 1U << 7,
+  ECP_LISTENER_OUTPUT        = 1U << 8,
+  SCALAR_VALUE_COMPATIBILITY = 1U << 9
 };
 
 /** Compact mask of operation families reachable from one driver section. */
@@ -92,6 +93,10 @@ public:
 private:
   std::uint32_t mask_ = 0;
 };
+
+/** Return whether an operation family is reachable, including shared-capacity implications. */
+bool batchExecutionModeIsRequired(const BatchExecutionRequirements& requirements,
+                                  BatchExecutionMode mode) noexcept;
 
 /** A tile request is either selected automatically or fixed by the input. */
 class BatchTileRequest
@@ -181,6 +186,14 @@ struct BatchExecutionTopology
   std::size_t reserveWalkerCount() const;
 };
 
+/** Candidate-independent workload facts used to discover logical envelopes. */
+struct BatchExecutionWorkloadContext
+{
+  BatchExecutionRequirements requirements;
+  BatchExecutionTopology topology;
+  std::size_t active_parameter_count = 0;
+};
+
 /** Complete neutral context presented to every participant estimator. */
 struct BatchExecutionPlanningContext
 {
@@ -190,6 +203,10 @@ struct BatchExecutionPlanningContext
   BatchTileCapacities candidate_capacities;
   std::size_t active_parameter_count = 0;
 };
+
+/** Expand an aggregate logical envelope by the elementwise participant maxima. */
+void includeBatchExecutionLogicalMaximum(BatchTileCapacities& aggregate,
+                                         const BatchTileCapacities& participant) noexcept;
 
 /** Categorized exact estimate returned by one or more registered owners. */
 class BatchMemoryEstimate

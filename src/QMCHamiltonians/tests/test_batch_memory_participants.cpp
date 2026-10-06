@@ -68,6 +68,7 @@ public:
   {
     auto clone = std::make_unique<PlanningOperator>(id_, class_name_, *release_order_);
     clone->host_bytes_per_value_ = host_bytes_per_value_;
+    clone->logical_maximum_      = logical_maximum_;
     clone->requirements_         = requirements_;
     clone->throw_on_validation_  = throw_on_validation_;
     clone->throw_on_prepare_     = throw_on_prepare_;
@@ -83,11 +84,17 @@ public:
       requirements.require(BatchExecutionMode::SCORE);
   }
 
+  BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext&) const override
+  {
+    return logical_maximum_;
+  }
+
   BatchMemoryContribution estimateBatchExecutionMemory(
       const BatchExecutionPlanningContext& context) const override
   {
     BatchMemoryContribution contribution;
-    contribution.logical_maximum    = context.logical_maximum;
+    contribution.logical_maximum    = logical_maximum_;
     contribution.owner_multiplicity = 1;
     contribution.fully_accounted    = true;
     contribution.per_owner.add(
@@ -149,6 +156,7 @@ public:
 
   void require(BatchExecutionMode mode) { requirements_.require(mode); }
   void setHostBytesPerValue(std::size_t bytes) noexcept { host_bytes_per_value_ = bytes; }
+  void setLogicalMaximum(BatchTileCapacities maximum) noexcept { logical_maximum_ = maximum; }
   void setThrowOnValidation(bool should_throw) noexcept { throw_on_validation_ = should_throw; }
   void setThrowOnPrepare(bool should_throw) noexcept { throw_on_prepare_ = should_throw; }
   void setThrowOnAcquire(bool should_throw) noexcept { throw_on_acquire_ = should_throw; }
@@ -165,6 +173,7 @@ private:
   std::string class_name_;
   std::vector<int>* release_order_;
   std::size_t host_bytes_per_value_ = 1;
+  BatchTileCapacities logical_maximum_{4, 0, 0, 0};
   BatchExecutionRequirements requirements_;
   bool throw_on_validation_ = false;
   bool throw_on_prepare_    = false;
@@ -182,9 +191,10 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(const QMCHamiltonian& hamilto
 {
   BatchExecutionSelectionInput input;
   hamiltonian.contributeBatchExecutionRequirements(input.requirements);
-  input.logical_maximum      = {4, 0, 0, 0};
-  input.preference.preferred = {3, 0, 0, 0};
+  input.preference.preferred   = {3, 0, 0, 0};
   input.active_parameter_count = active_parameter_count;
+  input.logical_maximum        = hamiltonian.batchExecutionLogicalMaximum(
+      {input.requirements, input.topology, input.active_parameter_count});
   auto provider = [&hamiltonian](const BatchExecutionPlanningContext& context) {
     return hamiltonian.estimateBatchExecutionMemory(context);
   };
@@ -220,6 +230,8 @@ TEST_CASE("QMCHamiltonian batch participants bind atomically and clone plans",
       hamiltonian, 2, "Aux Op", "aux/name", false, release_order);
   physical->setHostBytesPerValue(3);
   auxiliary->setHostBytesPerValue(5);
+  physical->setLogicalMaximum({5, 2, 0, 7});
+  auxiliary->setLogicalMaximum({3, 6, 4, 1});
   auxiliary->require(BatchExecutionMode::SCORE);
 
   BatchExecutionRequirements requirements;
@@ -227,8 +239,12 @@ TEST_CASE("QMCHamiltonian batch participants bind atomically and clone plans",
   CHECK(requirements.requires(BatchExecutionMode::VALUE));
   CHECK(requirements.requires(BatchExecutionMode::SCORE));
 
+  BatchExecutionWorkloadContext workload_context{requirements, {}, 17};
+  CHECK(hamiltonian.batchExecutionLogicalMaximum(workload_context) ==
+        BatchTileCapacities{5, 6, 4, 7});
+
   BatchExecutionPlanningContext context{
-      requirements, {}, {4, 0, 0, 0}, {2, 0, 0, 0}, 17};
+      requirements, {}, {5, 6, 4, 7}, {2, 0, 0, 0}, 17};
   const auto contributions = hamiltonian.estimateBatchExecutionMemory(context);
   REQUIRE(contributions.size() == 2);
   CHECK(contributions[0].participant_id ==

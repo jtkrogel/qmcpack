@@ -511,6 +511,13 @@ public:
    */
   virtual void contributeBatchExecutionRequirements(BatchExecutionRequirements&) const {}
 
+  /** Return candidate-independent logical maxima imposed by this component. */
+  virtual BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext&) const
+  {
+    return {};
+  }
+
   /** Estimate this component's clone-local storage for one candidate plan.
    *
    * The compatibility default is explicitly unaccounted rather than claiming

@@ -166,6 +166,16 @@ void TrialWaveFunction::contributeBatchExecutionRequirements(
     component->contributeBatchExecutionRequirements(requirements);
 }
 
+BatchTileCapacities TrialWaveFunction::batchExecutionLogicalMaximum(
+    const BatchExecutionWorkloadContext& context) const
+{
+  BatchTileCapacities maximum;
+  for (const auto& component : Z)
+    includeBatchExecutionLogicalMaximum(
+        maximum, component->batchExecutionLogicalMaximum(context));
+  return maximum;
+}
+
 std::vector<BatchMemoryParticipantContribution>
 TrialWaveFunction::estimateBatchExecutionMemory(
     const BatchExecutionPlanningContext& context) const

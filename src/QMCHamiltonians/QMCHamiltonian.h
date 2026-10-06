@@ -406,6 +406,10 @@ public:
   /// Add requirements from physical operators followed by auxiliary operators.
   void contributeBatchExecutionRequirements(BatchExecutionRequirements& requirements) const;
 
+  /// Combine candidate-independent logical maxima from all operators.
+  BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext& context) const;
+
   /// Return deterministic physical-then-auxiliary participant contributions.
   std::vector<BatchMemoryParticipantContribution> estimateBatchExecutionMemory(
       const BatchExecutionPlanningContext& context) const;

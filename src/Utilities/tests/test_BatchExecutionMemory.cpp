@@ -98,6 +98,22 @@ TEST_CASE("Batch execution memory checked arithmetic", "[utilities][batch_memory
   CHECK_THROWS_AS(aggregateBatchMemoryContributions({{"overflow", contribution}}), std::overflow_error);
 }
 
+TEST_CASE("Batch execution logical maxima combine elementwise", "[utilities][batch_memory]")
+{
+  BatchTileCapacities aggregate{4, 1, 8, 2};
+  includeBatchExecutionLogicalMaximum(aggregate, {3, 7, 5, 9});
+  CHECK(aggregate == BatchTileCapacities{4, 7, 8, 9});
+
+  BatchExecutionRequirements scalar;
+  scalar.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  CHECK(batchExecutionModeIsRequired(scalar, BatchExecutionMode::VALUE));
+  CHECK_FALSE(batchExecutionModeIsRequired(scalar, BatchExecutionMode::FULL_VGL));
+
+  BatchExecutionRequirements weighted_ecp;
+  weighted_ecp.require(BatchExecutionMode::ECP_WEIGHTED_SCORE);
+  CHECK(batchExecutionModeIsRequired(weighted_ecp, BatchExecutionMode::ECP_OUTER));
+}
+
 TEST_CASE("Batch execution memory automatic selection boundaries", "[utilities][batch_memory]")
 {
   BatchExecutionSelectionInput input = makeSelectionInput();
@@ -197,6 +213,17 @@ TEST_CASE("Batch execution memory hard requests and logical modes", "[utilities]
     const BatchExecutionPlan value_plan =
         selectBatchExecutionPlan(value_only, makeProvider(equalSlopeEstimate));
     CHECK(value_plan.selectedCapacities() == BatchTileCapacities{4, 0, 0, 0});
+  }
+
+  SECTION("scalar value compatibility alone activates the value capacity")
+  {
+    BatchExecutionSelectionInput scalar_compatibility;
+    scalar_compatibility.requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+    scalar_compatibility.logical_maximum      = {9, 9, 9, 9};
+    scalar_compatibility.preference.preferred = {4, 4, 4, 4};
+    const BatchExecutionPlan scalar_plan =
+        selectBatchExecutionPlan(scalar_compatibility, makeProvider(equalSlopeEstimate));
+    CHECK(scalar_plan.selectedCapacities() == BatchTileCapacities{4, 0, 0, 0});
   }
 
   SECTION("weighted ECP score requires the shared ECP outer capacity")

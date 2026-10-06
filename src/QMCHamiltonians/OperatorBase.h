@@ -443,6 +443,13 @@ public:
    */
   virtual void contributeBatchExecutionRequirements(BatchExecutionRequirements&) const {}
 
+  /** Return candidate-independent logical maxima imposed by this operator. */
+  virtual BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext&) const
+  {
+    return {};
+  }
+
   /** Estimate this operator's candidate-dependent batch storage.
    * The incomplete default prevents an explicit hard policy from silently omitting
    * an unregistered operator.

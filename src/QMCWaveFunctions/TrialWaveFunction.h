@@ -579,6 +579,10 @@ public:
   void contributeBatchExecutionRequirements(
       BatchExecutionRequirements& requirements) const;
 
+  /// Combine candidate-independent logical maxima in stable component order.
+  BatchTileCapacities batchExecutionLogicalMaximum(
+      const BatchExecutionWorkloadContext& context) const;
+
   /// Return ordered, structurally identified component memory contributions.
   std::vector<BatchMemoryParticipantContribution>
       estimateBatchExecutionMemory(
