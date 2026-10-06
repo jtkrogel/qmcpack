@@ -28,6 +28,7 @@ set(WFBASE_SRCS
     WaveFunctionPool.cpp
     WaveFunctionComponent.cpp
     WaveFunctionComponentBuilder.cpp
+    Optimization/LegacyWaveFunctionAdapter.cpp
     Optimization/StreamingDerivative.cpp
     Optimization/StructuredParameterProvider.cpp
     SPOSetBuilder.cpp
