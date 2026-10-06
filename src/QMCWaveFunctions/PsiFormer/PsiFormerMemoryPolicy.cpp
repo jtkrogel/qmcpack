@@ -254,7 +254,7 @@ std::vector<pf::DirectBatchCapacityPlan> makePsiFormerDirectBatchCapacityPlans(
   return plans;
 }
 
-BatchMemoryContribution estimatePsiFormerBatchMemory(
+std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
     const PsiFormerMemoryPolicyInput& input,
     const BatchExecutionPlanningContext& context)
 {
@@ -265,48 +265,11 @@ BatchMemoryContribution estimatePsiFormerBatchMemory(
     throw std::invalid_argument(
         "PsiFormer component active-parameter count exceeds the plan-wide active count");
 
-  const BatchExecutionWorkloadContext workload{
-      context.requirements, context.topology, context.active_parameter_count};
-  BatchMemoryContribution contribution;
-  contribution.logical_maximum =
-      psiFormerBatchLogicalMaximum(input, workload);
-  contribution.owner_multiplicity = 1;
-  contribution.fully_accounted = accountingIsComplete(input, context);
-
-  const PsiFormerMemoryTopologySummary topology =
-      summarizePsiFormerMemoryTopology(context.topology);
-  const pf::CloneStateStorageRequirement clone_state =
-      pf::cloneStateStorageRequirement(
-          input.storage_shape.electrons, input.type_sizes.value_type,
-          input.type_sizes.gradient_type);
-  addHostBytes(
-      contribution.per_owner, BatchMemoryCategory::FIXED_CLONE_STATE,
-      checkedBatchMemoryMultiply(
-          clone_state.totalBytes(), topology.resident_walkers,
-          "PsiFormer rank clone-state storage"),
-      "PsiFormer rank clone-state storage");
-
-  const bool scalar = context.requirements.requires(
-      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
-  if (scalar)
-  {
-    const pf::DirectBatchCapacityPlan scalar_plan = makePsiFormerScalarValueCapacityPlan(
-        input, context.requirements, context.candidate_capacities);
-    const pf::DirectBatchStorageRequirement scalar_storage =
-        pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
-    addDirectStorage(contribution.per_owner, scalar_storage,
-                     topology.resident_walkers,
-                     "PsiFormer scalar VALUE compatibility");
-    addHostBytes(
-        contribution.per_owner, BatchMemoryCategory::PUBLICATION_STAGING,
-        checkedBatchMemoryMultiply(
-            pf::scalarValuePublicationStorageRequirement(
-                input.scalar_value_logical_maximum,
-                input.type_sizes.value_type),
-            topology.resident_walkers,
-            "PsiFormer scalar VALUE publication multiplicity"),
-        "PsiFormer scalar VALUE publication");
-  }
+  validateModeStructure(context.requirements);
+  const std::vector<std::size_t>& reserves =
+      psiFormerReserveWalkersPerCrowd(context.topology);
+  const std::vector<std::size_t>& initial =
+      context.topology.initial_walkers_per_crowd;
 
   const bool value = context.requirements.requires(BatchExecutionMode::VALUE);
   const bool full = context.requirements.requires(BatchExecutionMode::FULL_VGL);
@@ -323,26 +286,86 @@ BatchMemoryContribution estimatePsiFormerBatchMemory(
     throw std::invalid_argument(
         "PsiFormer active derivatives require a nonzero model parameter count");
 
-  const std::vector<std::size_t>& reserves =
-      psiFormerReserveWalkersPerCrowd(context.topology);
+  // Validate the clone representation even when no crowd currently reserves a
+  // walker.  This keeps malformed type-width inputs independent of topology.
+  const pf::CloneStateStorageRequirement clone_state =
+      pf::cloneStateStorageRequirement(
+          input.storage_shape.electrons, input.type_sizes.value_type,
+          input.type_sizes.gradient_type);
+
+  const bool scalar = context.requirements.requires(
+      BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  pf::DirectBatchStorageRequirement scalar_storage;
+  std::size_t scalar_publication_bytes = 0;
+  if (scalar)
+  {
+    const pf::DirectBatchCapacityPlan scalar_plan =
+        makePsiFormerScalarValueCapacityPlan(
+            input, context.requirements, context.candidate_capacities);
+    scalar_storage =
+        pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
+    scalar_publication_bytes =
+        pf::scalarValuePublicationStorageRequirement(
+            input.scalar_value_logical_maximum, input.type_sizes.value_type);
+  }
+
+  std::vector<PsiFormerCrowdMemoryPlan> plans;
+  plans.reserve(reserves.size());
   for (std::size_t crowd = 0; crowd < reserves.size(); ++crowd)
   {
-    const std::size_t reserve = reserves[crowd];
-    if (reserve == 0)
-      continue;
+    PsiFormerCrowdMemoryPlan plan;
+    plan.initial_walkers = initial[crowd];
+    plan.reserve_walkers = reserves[crowd];
+    plan.score_required = score;
+    plan.kinetic_required = kinetic;
 
-    const pf::DirectBatchCapacityPlan batch_plan =
-        makePsiFormerDirectBatchCapacityPlan(
-            context.requirements, context.candidate_capacities, reserve);
-    const pf::DirectBatchStorageRequirement direct_storage =
-        pf::directBatchStorageRequirement(input.storage_shape, batch_plan);
-    addDirectStorage(contribution.per_owner, direct_storage, 1,
+    addHostBytes(
+        plan.expected_clone_storage, BatchMemoryCategory::FIXED_CLONE_STATE,
+        checkedBatchMemoryMultiply(
+            clone_state.totalBytes(), plan.reserve_walkers,
+            "PsiFormer crowd clone-state storage"),
+        "PsiFormer crowd clone-state storage");
+
+    if (scalar)
+    {
+      addDirectStorage(plan.expected_clone_storage, scalar_storage,
+                       plan.reserve_walkers,
+                       "PsiFormer scalar VALUE compatibility");
+      addHostBytes(
+          plan.expected_clone_storage,
+          BatchMemoryCategory::PUBLICATION_STAGING,
+          checkedBatchMemoryMultiply(
+              scalar_publication_bytes, plan.reserve_walkers,
+              "PsiFormer scalar VALUE publication multiplicity"),
+          "PsiFormer scalar VALUE publication");
+    }
+
+    // Construct the canonical direct descriptor even for an empty reserve;
+    // its zero tile distinguishes a prepared empty crowd from default legacy
+    // workspace capacities.
+    plan.direct_batch = makePsiFormerDirectBatchCapacityPlan(
+        context.requirements, context.candidate_capacities,
+        plan.reserve_walkers);
+    plan.direct_storage = pf::directBatchStorageRequirement(
+        input.storage_shape, plan.direct_batch);
+
+    // A resource still has a stable crowd record when its reserve is zero, but
+    // no resource-owned arrays or derivative tapes may be allocated for it.
+    if (plan.reserve_walkers == 0)
+    {
+      plan.expected_storage.add(plan.expected_clone_storage,
+                                "PsiFormer crowd clone storage");
+      plans.push_back(std::move(plan));
+      continue;
+    }
+
+    addDirectStorage(plan.expected_resource_storage, plan.direct_storage, 1,
                      "PsiFormer crowd " + std::to_string(crowd));
 
-    const pf::ResourceStagingCapacityPlan staging_plan{
-        reserve,
-        batch_plan.logical.sparse_references,
-        batch_plan.logical.sparse_replacements,
+    plan.publication_staging = {
+        plan.reserve_walkers,
+        plan.direct_batch.logical.sparse_references,
+        plan.direct_batch.logical.sparse_replacements,
         input.active_parameter_count,
         input.type_sizes.value_type,
         input.type_sizes.log_value_type,
@@ -355,33 +378,65 @@ BatchMemoryContribution estimatePsiFormerBatchMemory(
         weighted_ecp,
         score,
         kinetic};
-    const pf::ResourceStagingStorageRequirement staging =
-        pf::resourceStagingStorageRequirement(staging_plan);
-    addHostBytes(contribution.per_owner,
+    plan.publication_storage = pf::resourceStagingStorageRequirement(
+        plan.publication_staging);
+    addHostBytes(plan.expected_resource_storage,
                  BatchMemoryCategory::PUBLICATION_STAGING,
-                 staging.totalBytes(),
+                 plan.publication_storage.totalBytes(),
                  "PsiFormer crowd publication staging");
 
     if (score)
-      addHostBytes(
-          contribution.per_owner, BatchMemoryCategory::SCORE_TAPE,
-          pf::scoreWorkspaceStorageRequirement(input.storage_shape),
-          "PsiFormer crowd score tape");
+    {
+      plan.score_workspace_bytes =
+          pf::scoreWorkspaceStorageRequirement(input.storage_shape);
+      addHostBytes(plan.expected_resource_storage,
+                   BatchMemoryCategory::SCORE_TAPE,
+                   plan.score_workspace_bytes,
+                   "PsiFormer crowd score tape");
+    }
     if (kinetic)
     {
-      const std::size_t drift = checkedBatchMemoryMultiply(
+      plan.kinetic_workspace_bytes =
+          pf::kineticWorkspaceStorageRequirement(input.storage_shape);
+      plan.total_log_gradient_bytes = checkedBatchMemoryMultiply(
           checkedBatchMemoryMultiply(
               input.storage_shape.electrons, 3,
               "PsiFormer kinetic total-drift extent"),
           sizeof(double), "PsiFormer kinetic total-drift bytes");
       addHostBytes(
-          contribution.per_owner, BatchMemoryCategory::KINETIC_TAPE,
+          plan.expected_resource_storage, BatchMemoryCategory::KINETIC_TAPE,
           checkedBatchMemoryAdd(
-              pf::kineticWorkspaceStorageRequirement(input.storage_shape),
-              drift, "PsiFormer kinetic tape and total drift"),
+              plan.kinetic_workspace_bytes,
+              plan.total_log_gradient_bytes,
+              "PsiFormer kinetic tape and total drift"),
           "PsiFormer crowd kinetic tape");
     }
+
+    plan.expected_storage.add(plan.expected_clone_storage,
+                              "PsiFormer crowd clone storage");
+    plan.expected_storage.add(plan.expected_resource_storage,
+                              "PsiFormer crowd resource storage");
+    plans.push_back(std::move(plan));
   }
+  return plans;
+}
+
+BatchMemoryContribution estimatePsiFormerBatchMemory(
+    const PsiFormerMemoryPolicyInput& input,
+    const BatchExecutionPlanningContext& context)
+{
+  const BatchExecutionWorkloadContext workload{
+      context.requirements, context.topology, context.active_parameter_count};
+  BatchMemoryContribution contribution;
+  contribution.logical_maximum =
+      psiFormerBatchLogicalMaximum(input, workload);
+  contribution.owner_multiplicity = 1;
+  contribution.fully_accounted = accountingIsComplete(input, context);
+
+  for (const PsiFormerCrowdMemoryPlan& plan :
+       makePsiFormerCrowdMemoryPlans(input, context))
+    contribution.per_owner.add(plan.expected_storage,
+                               "PsiFormer rank crowd storage");
 
   return contribution;
 }

@@ -108,6 +108,37 @@ struct PsiFormerMemoryTopologySummary
   std::size_t prepared_crowds  = 0;
 };
 
+/** Exact allocation and accounting target for one rank-local crowd.
+ *
+ * Zero-reserve crowds retain their topology identity but have empty capacity
+ * and storage descriptors.  ``expected_storage`` includes the fixed state of
+ * every clone in the crowd as well as its shared resource storage, so summing
+ * these records reproduces the complete rank-local owner estimate.
+ */
+struct PsiFormerCrowdMemoryPlan
+{
+  std::size_t initial_walkers = 0;
+  std::size_t reserve_walkers = 0;
+
+  pf::DirectBatchCapacityPlan direct_batch;
+  pf::ResourceStagingCapacityPlan publication_staging;
+  pf::DirectBatchStorageRequirement direct_storage;
+  pf::ResourceStagingStorageRequirement publication_storage;
+
+  bool score_required   = false;
+  bool kinetic_required = false;
+  std::size_t score_workspace_bytes       = 0;
+  std::size_t kinetic_workspace_bytes     = 0;
+  std::size_t total_log_gradient_bytes    = 0;
+
+  /** Clone-owned fixed and scalar-compatibility storage for this reserve. */
+  BatchMemoryEstimate expected_clone_storage;
+  /** Shared crowd-resource storage, suitable for exact post-prepare checks. */
+  BatchMemoryEstimate expected_resource_storage;
+  /** Checked sum of clone and resource storage used by rank-level policy. */
+  BatchMemoryEstimate expected_storage;
+};
+
 /** Select reserve crowds, falling back to initial crowds, and validate the topology. */
 const std::vector<std::size_t>& psiFormerReserveWalkersPerCrowd(
     const BatchExecutionTopology& topology);
@@ -140,6 +171,11 @@ pf::DirectBatchCapacityPlan makePsiFormerDirectBatchCapacityPlan(
 
 /** Construct exact direct-workspace plans in stable crowd-index order. */
 std::vector<pf::DirectBatchCapacityPlan> makePsiFormerDirectBatchCapacityPlans(
+    const BatchExecutionPlanningContext& context);
+
+/** Construct exact allocation and category targets in stable crowd-index order. */
+std::vector<PsiFormerCrowdMemoryPlan> makePsiFormerCrowdMemoryPlans(
+    const PsiFormerMemoryPolicyInput& input,
     const BatchExecutionPlanningContext& context);
 
 /** Estimate one exact rank-local PsiFormer owner contribution.

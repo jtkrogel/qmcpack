@@ -276,6 +276,194 @@ TEST_CASE("PsiFormer memory policy sums exact uneven crowd owners",
   CHECK(plans[1].tile.value == 0);
 }
 
+TEST_CASE("PsiFormer crowd plans are exact allocation and category targets",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  PsiFormerMemoryPolicyInput input = makePolicyInput();
+  input.active_parameter_count = 3;
+  input.scalar_value_logical_maximum = input.storage_shape.electrons + 1;
+
+  BatchExecutionRequirements requirements;
+  requirements.require(BatchExecutionMode::VALUE);
+  requirements.require(BatchExecutionMode::FULL_VGL);
+  requirements.require(BatchExecutionMode::ACTIVE_GRADIENT);
+  requirements.require(BatchExecutionMode::KINETIC);
+  requirements.require(BatchExecutionMode::ECP_WEIGHTED_SCORE);
+  requirements.require(BatchExecutionMode::SCALAR_VALUE_COMPATIBILITY);
+  BatchExecutionPlanningContext context = makeContext(
+      input, requirements, {2, 2, 0}, {3, 0, 1}, {2, 1, 1, 2}, 5);
+  context.logical_maximum.ecp_outer = 2;
+
+  const std::vector<psiformer::PsiFormerCrowdMemoryPlan> plans =
+      psiformer::makePsiFormerCrowdMemoryPlans(input, context);
+  REQUIRE(plans.size() == 3);
+
+  const psiformer::PsiFormerCrowdMemoryPlan& first = plans[0];
+  CHECK(first.initial_walkers == 2);
+  CHECK(first.reserve_walkers == 3);
+  CHECK(first.direct_batch.logical.value_dense == 3);
+  CHECK(first.direct_batch.logical.full_vgl == 3);
+  CHECK(first.direct_batch.logical.active_gradient == 3);
+  CHECK(first.direct_batch.logical.sparse_references == 2);
+  CHECK(first.direct_batch.logical.sparse_replacements == 2);
+  CHECK(first.direct_batch.tile.value == 2);
+  CHECK(first.direct_batch.tile.full_vgl == 1);
+  CHECK(first.direct_batch.tile.active_gradient == 1);
+
+  CHECK(first.publication_staging.reserve_walkers == 3);
+  CHECK(first.publication_staging.sparse_references == 2);
+  CHECK(first.publication_staging.sparse_replacements == 2);
+  CHECK(first.publication_staging.active_parameters == 3);
+  CHECK(first.publication_staging.value_type_bytes == sizeof(double));
+  CHECK(first.publication_staging.log_value_type_bytes ==
+        sizeof(std::complex<double>));
+  CHECK(first.publication_staging.gradient_type_bytes ==
+        sizeof(std::array<double, 3>));
+  CHECK(first.publication_staging.value);
+  CHECK(first.publication_staging.full_vgl);
+  CHECK(first.publication_staging.active_gradient);
+  CHECK(first.publication_staging.flattened_ecp);
+  CHECK(first.publication_staging.weighted_ecp_score);
+  CHECK(first.publication_staging.score);
+  CHECK(first.publication_staging.kinetic);
+
+  CHECK(first.score_required);
+  CHECK(first.kinetic_required);
+  CHECK(first.score_workspace_bytes ==
+        pf::scoreWorkspaceStorageRequirement(input.storage_shape));
+  CHECK(first.kinetic_workspace_bytes ==
+        pf::kineticWorkspaceStorageRequirement(input.storage_shape));
+  CHECK(first.total_log_gradient_bytes ==
+        3 * input.storage_shape.electrons * sizeof(double));
+
+  const pf::CloneStateStorageRequirement clone_storage =
+      pf::cloneStateStorageRequirement(
+          input.storage_shape.electrons, input.type_sizes.value_type,
+          input.type_sizes.gradient_type);
+  CHECK(first.expected_clone_storage.at(
+            BatchMemoryCategory::FIXED_CLONE_STATE).host ==
+        3 * clone_storage.totalBytes());
+  CHECK(first.expected_storage.at(BatchMemoryCategory::FIXED_CLONE_STATE).host ==
+        3 * clone_storage.totalBytes());
+
+  const pf::DirectBatchCapacityPlan scalar_plan =
+      psiformer::makePsiFormerScalarValueCapacityPlan(
+          input, requirements, context.candidate_capacities);
+  const pf::DirectBatchStorageRequirement scalar_storage =
+      pf::directBatchStorageRequirement(input.storage_shape, scalar_plan);
+  CHECK(first.expected_clone_storage.at(
+            BatchMemoryCategory::LOGICAL_INPUT_OUTPUT).host ==
+        3 * logicalBytes(scalar_storage));
+  CHECK(first.expected_resource_storage.at(
+            BatchMemoryCategory::LOGICAL_INPUT_OUTPUT).host ==
+        logicalBytes(first.direct_storage));
+  CHECK(first.expected_storage.at(BatchMemoryCategory::LOGICAL_INPUT_OUTPUT).host ==
+        logicalBytes(first.direct_storage) +
+            3 * logicalBytes(scalar_storage));
+  CHECK(first.expected_storage.at(BatchMemoryCategory::INNER_TILE_SCRATCH).host ==
+        innerTileBytes(first.direct_storage) +
+            3 * innerTileBytes(scalar_storage));
+  CHECK(first.expected_storage.at(BatchMemoryCategory::REALLOCATION_TRANSIENT).host ==
+        first.direct_storage.replacementTransientBytes() +
+            3 * scalar_storage.replacementTransientBytes());
+  CHECK(first.expected_storage.at(BatchMemoryCategory::PUBLICATION_STAGING).host ==
+        first.publication_storage.totalBytes() +
+            3 * input.scalar_value_logical_maximum * sizeof(double));
+  CHECK(first.expected_resource_storage.at(
+            BatchMemoryCategory::PUBLICATION_STAGING).host ==
+        first.publication_storage.totalBytes());
+  CHECK(first.expected_storage.at(BatchMemoryCategory::SCORE_TAPE).host ==
+        first.score_workspace_bytes);
+  CHECK(first.expected_storage.at(BatchMemoryCategory::KINETIC_TAPE).host ==
+        first.kinetic_workspace_bytes + first.total_log_gradient_bytes);
+
+  // A zero-reserve record preserves its original topology position without
+  // inventing any resource allocation, even when every mode is required.
+  const psiformer::PsiFormerCrowdMemoryPlan& empty = plans[1];
+  CHECK(empty.initial_walkers == 2);
+  CHECK(empty.reserve_walkers == 0);
+  CHECK(empty.score_required);
+  CHECK(empty.kinetic_required);
+  CHECK(empty.direct_batch.logical.value_dense == 0);
+  CHECK(empty.direct_batch.logical.full_vgl == 0);
+  CHECK(empty.direct_batch.logical.active_gradient == 0);
+  CHECK(empty.direct_batch.logical.sparse_references == 0);
+  CHECK(empty.direct_batch.logical.sparse_replacements == 0);
+  CHECK(empty.direct_batch.tile.value == 0);
+  CHECK(empty.direct_batch.tile.full_vgl == 0);
+  CHECK(empty.direct_batch.tile.active_gradient == 0);
+  CHECK(empty.publication_staging.reserve_walkers == 0);
+  CHECK(empty.score_workspace_bytes == 0);
+  CHECK(empty.kinetic_workspace_bytes == 0);
+  CHECK(empty.total_log_gradient_bytes == 0);
+  CHECK(empty.expected_clone_storage.total().host == 0);
+  CHECK(empty.expected_resource_storage.total().host == 0);
+  CHECK(empty.expected_storage.total().host == 0);
+  CHECK(empty.expected_storage.total().device == 0);
+
+  CHECK(plans[2].initial_walkers == 0);
+  CHECK(plans[2].reserve_walkers == 1);
+  CHECK(plans[2].direct_batch.logical.sparse_references == 1);
+  CHECK(plans[2].direct_batch.logical.sparse_replacements == 2);
+
+  BatchExecutionPlanningContext fallback_context = context;
+  fallback_context.topology.initial_walkers_per_crowd = {1, 3};
+  fallback_context.topology.reserve_walkers_per_crowd.clear();
+  const std::vector<psiformer::PsiFormerCrowdMemoryPlan> fallback_plans =
+      psiformer::makePsiFormerCrowdMemoryPlans(input, fallback_context);
+  REQUIRE(fallback_plans.size() == 2);
+  CHECK(fallback_plans[0].initial_walkers == 1);
+  CHECK(fallback_plans[0].reserve_walkers == 1);
+  CHECK(fallback_plans[1].initial_walkers == 3);
+  CHECK(fallback_plans[1].reserve_walkers == 3);
+
+  // The public estimator is deliberately just the checked category sum of the
+  // allocation plans consumed later by live resource preparation.
+  BatchMemoryEstimate expected_rank;
+  for (const psiformer::PsiFormerCrowdMemoryPlan& plan : plans)
+    expected_rank.add(plan.expected_storage, "test crowd-plan sum");
+  const BatchMemoryContribution contribution =
+      psiformer::estimatePsiFormerBatchMemory(input, context);
+  CHECK(contribution.per_owner == expected_rank);
+  checkHostOnly(contribution);
+}
+
+TEST_CASE("PsiFormer crowd plans preserve build-dependent element widths",
+          "[wavefunction][psiformer][batch_memory]")
+{
+  PsiFormerMemoryPolicyInput input = makePolicyInput();
+  input.type_sizes = psiformer::makePsiFormerMemoryTypeSizes<
+      std::complex<double>, std::complex<double>,
+      std::array<std::complex<double>, 3>,
+      std::pair<std::size_t, std::complex<double>>>();
+
+  BatchExecutionRequirements requirements;
+  requirements.require(BatchExecutionMode::FULL_VGL);
+  const BatchExecutionPlanningContext context = makeContext(
+      input, requirements, {1}, {2}, {0, 1, 0, 0});
+  const std::vector<psiformer::PsiFormerCrowdMemoryPlan> plans =
+      psiformer::makePsiFormerCrowdMemoryPlans(input, context);
+  REQUIRE(plans.size() == 1);
+
+  const psiformer::PsiFormerCrowdMemoryPlan& plan = plans.front();
+  CHECK(plan.publication_staging.value_type_bytes ==
+        sizeof(std::complex<double>));
+  CHECK(plan.publication_staging.gradient_type_bytes ==
+        sizeof(std::array<std::complex<double>, 3>));
+  CHECK(plan.publication_storage.ratios ==
+        2 * sizeof(std::complex<double>));
+  CHECK(plan.publication_storage.gradients ==
+        2 * sizeof(std::array<std::complex<double>, 3>));
+
+  const pf::CloneStateStorageRequirement clone_storage =
+      pf::cloneStateStorageRequirement(
+          input.storage_shape.electrons, input.type_sizes.value_type,
+          input.type_sizes.gradient_type);
+  CHECK(plan.expected_storage.at(BatchMemoryCategory::FIXED_CLONE_STATE).host ==
+        2 * clone_storage.totalBytes());
+  checkHostOnly(psiformer::estimatePsiFormerBatchMemory(input, context));
+}
+
 TEST_CASE("PsiFormer memory policy keeps scalar VALUE ownership clone local",
           "[wavefunction][psiformer][batch_memory]")
 {
@@ -622,7 +810,17 @@ TEST_CASE("PsiFormer memory policy checks every ownership extent",
   requirements.require(BatchExecutionMode::ECP_OUTER);
   const BatchExecutionPlanningContext sparse_context = makeContext(
       input, requirements, {1}, {1}, {1, 0, 0, maximum});
+  CHECK_THROWS(
+      psiformer::makePsiFormerCrowdMemoryPlans(input, sparse_context));
   CHECK_THROWS(psiformer::estimatePsiFormerBatchMemory(input, sparse_context));
+
+  const BatchExecutionPlanningContext clone_multiplicity_context = makeContext(
+      input, BatchExecutionRequirements{BatchExecutionMode::VALUE},
+      {1}, {maximum}, {1, 0, 0, 0});
+  CHECK_THROWS_AS(
+      psiformer::makePsiFormerCrowdMemoryPlans(
+          input, clone_multiplicity_context),
+      std::overflow_error);
 
   BatchExecutionTopology mismatched;
   mismatched.initial_walkers_per_crowd = {1, 2};
