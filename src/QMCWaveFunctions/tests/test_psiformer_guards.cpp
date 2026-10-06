@@ -21,6 +21,7 @@
 #include <complex>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -110,6 +111,64 @@ TEST_CASE("PsiFormer builder requires an explicit periodic feature policy",
   REQUIRE(document.parseFromString(makePsiFormerXml(files, false)));
   CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
                     Catch::Matchers::ContainsSubstring("feature_policy=periodic_torus_v1"));
+}
+
+TEST_CASE("PsiFormer periodic import binds ordered runtime ions",
+          "[wavefunction][psiformer][hardening][periodic]")
+{
+  GeneratedFiles files = generateFiles("lih", 4, 7);
+
+  Lattice lattice;
+  lattice.R         = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell periodic_cell(lattice);
+
+  const auto make_document = [&files]() {
+    std::ostringstream xml;
+    xml << "<psiformer name=\"pf_periodic_import\" parameters=\""
+        << files.parameters.string() << "\" configuration=\""
+        << files.configuration.string()
+        << "\" source=\"ion0\" system=\"all_electron\" "
+           "feature_policy=\"periodic_torus_v1\"/>";
+    Libxml2Document document;
+    if (!document.parseFromString(xml.str()))
+      throw std::runtime_error("Unable to parse periodic PsiFormer guard XML");
+    return document;
+  };
+
+  SECTION("common translation and individual images")
+  {
+    ParticleSet electrons = makeMassTaggedElectrons(periodic_cell, 1.0, 1.0);
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    auto ions = makeGuardTestIons(periodic_cell);
+    const ParticleSet::PosType translation{0.31, -0.27, 0.18};
+    for (int nucleus = 0; nucleus < ions->getTotalNum(); ++nucleus)
+      ions->R[nucleus] += translation;
+    for (int dimension = 0; dimension < 3; ++dimension)
+      ions->R[1][dimension] += lattice.R(1, dimension);
+    ions->update();
+    particle_sets.emplace(ions->getName(), std::move(ions));
+
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document = make_document();
+    CHECK_NOTHROW(builder.buildComponent(document.getRoot()));
+  }
+
+  SECTION("non-image geometry change")
+  {
+    ParticleSet electrons = makeMassTaggedElectrons(periodic_cell, 1.0, 1.0);
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    auto ions = makeGuardTestIons(periodic_cell);
+    ions->R[1][0] += 0.125;
+    ions->update();
+    particle_sets.emplace(ions->getName(), std::move(ions));
+
+    PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document = make_document();
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring("ordering/geometry"));
+  }
 }
 
 TEST_CASE("PsiFormer system validation rejects mismatched electron and source-ion lattices",
