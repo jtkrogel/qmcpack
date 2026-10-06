@@ -17,6 +17,7 @@
 #include "QMCWaveFunctions/TrialWaveFunctionMemoryPolicy.h"
 #include "SimulationCell.h"
 #include "Utilities/ResourceCollection.h"
+#include "Utilities/BatchResourcePreparation.h"
 #include "Utilities/RuntimeOptions.h"
 
 #include <memory>
@@ -65,6 +66,28 @@ public:
   static bool hasAcquiredTopology(const TrialWaveFunction& wavefunction)
   {
     return wavefunction.acquired_batch_topology_.engaged;
+  }
+
+  /// Inspect exact typed storage and live bindings of the aggregate resource.
+  static auto aggregateResourceDiagnostics(
+      const TrialWaveFunction& wavefunction)
+  {
+    return wavefunction.aggregateResourceDiagnosticsForTesting();
+  }
+
+  /// Corrupt only crowd provenance to exercise post-loan validation rollback.
+  static void setAggregateResourceCrowd(ResourceCollection& collection,
+                                        std::size_t crowd_index)
+  {
+    TrialWaveFunction::setAggregateResourceCrowdForTesting(collection,
+                                                           crowd_index);
+  }
+
+  /// Verify prepared idle views refer only to destination-owned fillers.
+  static bool aggregatePlaceholdersMatchFillers(ResourceCollection& collection)
+  {
+    return TrialWaveFunction::aggregateResourcePlaceholdersMatchFillersForTesting(
+        collection);
   }
 
   /// Return the retained component count without exposing private state types.
@@ -225,7 +248,9 @@ public:
         required_mode_(required_mode),
         logical_maximum_(logical_maximum),
         bytes_(bytes)
-  {}
+  {
+    topology_token_ = makeTopologyToken(class_name_, getName());
+  }
 
   std::string getClassName() const override { return class_name_; }
 
@@ -257,6 +282,8 @@ public:
       BatchExecutionRequirements& requirements) const override
   {
     requirements.require(required_mode_);
+    if (require_value_mode_)
+      requirements.require(BatchExecutionMode::VALUE);
     ++requirement_calls_;
   }
 
@@ -288,6 +315,20 @@ public:
     return atomic_publication_;
   }
 
+  bool hasBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan& plan) const noexcept override
+  {
+    return bound_plan_.sameBinding(plan) &&
+        bound_topology_token_ == topology_token_;
+  }
+
+  bool hasPreparedBatchExecutionClone(
+      const BatchExecutionParticipantPlan& plan) const noexcept override
+  {
+    return prepared_plan_.sameBinding(plan) &&
+        prepared_topology_token_ == topology_token_;
+  }
+
   void validateBatchExecutionPlanBinding(
       const BatchExecutionParticipantPlan& plan) const override
   {
@@ -299,7 +340,10 @@ public:
 
   void bindBatchExecutionPlan(BatchExecutionParticipantPlan plan) noexcept override
   {
+    if (!bound_plan_.sameBinding(plan))
+      prepared_plan_ = {};
     bound_plan_ = std::move(plan);
+    bound_topology_token_ = topology_token_;
     ++bind_calls_;
   }
 
@@ -311,23 +355,49 @@ public:
     ++prepare_calls_;
     if (throw_on_prepare_)
       throw std::runtime_error("deliberate component clone-preparation failure");
+    prepared_plan_ = plan;
+    prepared_topology_token_ = topology_token_;
+  }
+
+  void createResource(ResourceCollection& collection) const override
+  {
+    if (resource_backed_)
+      collection.addResource(
+          std::make_unique<DummyResource>("PlanningComponentResource"));
   }
 
   void acquireResource(
-      ResourceCollection&,
+      ResourceCollection& collection,
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override
   {
     auto& leader = wfc_list.getCastedLeader<PlanningComponent>();
     ++leader.acquire_calls_;
+    if (leader.resource_backed_)
+    {
+      const std::size_t entry_cursor = collection.getCursor();
+      auto candidate = collection.lendResource<DummyResource>();
+      if (leader.throw_on_acquire_)
+      {
+        collection.rewind(entry_cursor);
+        collection.takebackResource(candidate);
+        collection.rewind(entry_cursor);
+        throw std::runtime_error(
+            "deliberate component acquisition failure after child loan");
+      }
+      leader.resource_handle_ = std::move(candidate);
+      return;
+    }
     if (leader.throw_on_acquire_)
       throw std::runtime_error("deliberate component acquisition failure");
   }
 
   void releaseResource(
-      ResourceCollection&,
+      ResourceCollection& collection,
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override
   {
     auto& leader = wfc_list.getCastedLeader<PlanningComponent>();
+    if (leader.resource_backed_ && !leader.skip_resource_release_)
+      collection.takebackResource(leader.resource_handle_);
     ++leader.release_calls_;
   }
 
@@ -337,12 +407,18 @@ public:
         class_name_, getName(), required_mode_, logical_maximum_, bytes_);
     clone->copy_binding_in_clone_ = copy_binding_in_clone_;
     clone->atomic_publication_    = atomic_publication_;
+    clone->resource_backed_       = resource_backed_;
+    clone->require_value_mode_     = require_value_mode_;
     if (copy_binding_in_clone_)
       clone->bound_plan_ = bound_plan_;
     return clone;
   }
 
-  void setClassName(std::string class_name) { class_name_ = std::move(class_name); }
+  void setClassName(std::string class_name)
+  {
+    class_name_ = std::move(class_name);
+    topology_token_ = makeTopologyToken(class_name_, getName());
+  }
   void rejectNonemptyBinding(bool reject) noexcept
   { reject_nonempty_binding_ = reject; }
   void rejectEmptyBinding(bool reject) noexcept
@@ -355,6 +431,11 @@ public:
   { copy_binding_in_clone_ = copy; }
   void setAtomicPublication(bool atomic) noexcept
   { atomic_publication_ = atomic; }
+  void useResource(bool enabled = true) noexcept { resource_backed_ = enabled; }
+  void skipResourceRelease(bool skip = true) noexcept
+  { skip_resource_release_ = skip; }
+  void requireValueMode(bool required = true) noexcept
+  { require_value_mode_ = required; }
 
   const BatchExecutionParticipantPlan& boundPlan() const noexcept
   { return bound_plan_; }
@@ -374,6 +455,25 @@ public:
   std::size_t releaseCalls() const noexcept { return release_calls_; }
 
 private:
+  static std::uint64_t makeTopologyToken(std::string_view class_name,
+                                         std::string_view name) noexcept
+  {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char byte : class_name)
+    {
+      hash ^= byte;
+      hash *= 1099511628211ULL;
+    }
+    hash ^= 0xffU;
+    hash *= 1099511628211ULL;
+    for (unsigned char byte : name)
+    {
+      hash ^= byte;
+      hash *= 1099511628211ULL;
+    }
+    return hash;
+  }
+
   std::string class_name_;
   BatchExecutionMode required_mode_;
   BatchTileCapacities logical_maximum_;
@@ -384,6 +484,9 @@ private:
   bool throw_on_prepare_                              = false;
   bool copy_binding_in_clone_                         = false;
   bool atomic_publication_                            = true;
+  bool resource_backed_                               = false;
+  bool skip_resource_release_                         = false;
+  bool require_value_mode_                            = false;
   mutable std::size_t requirement_calls_              = 0;
   mutable std::size_t logical_maximum_calls_           = 0;
   mutable BatchExecutionRequirements last_workload_requirements_;
@@ -396,6 +499,11 @@ private:
   mutable std::size_t acquire_calls_                   = 0;
   mutable std::size_t release_calls_                   = 0;
   BatchExecutionParticipantPlan bound_plan_;
+  BatchExecutionParticipantPlan prepared_plan_;
+  std::uint64_t topology_token_          = 0;
+  std::uint64_t bound_topology_token_    = 0;
+  std::uint64_t prepared_topology_token_ = 0;
+  mutable ResourceHandle<DummyResource> resource_handle_;
 };
 
 /// Select a small immutable plan using the TrialWaveFunction as provider.
@@ -403,12 +511,15 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(
     const TrialWaveFunction& wavefunction,
     std::string profile_id = "twf-test-v1",
     std::size_t preferred_value_tile = 3,
-    std::size_t particle_count = 4)
+    std::size_t particle_count = 4,
+    std::vector<std::size_t> initial_walkers = {2},
+    std::vector<std::size_t> reserve_walkers = {3},
+    std::size_t preferred_ecp_outer_tile = 0)
 {
   BatchExecutionSelectionInput input;
   wavefunction.contributeBatchExecutionRequirements(input.requirements);
-  input.topology.initial_walkers_per_crowd = {2};
-  input.topology.reserve_walkers_per_crowd = {3};
+  input.topology.initial_walkers_per_crowd = std::move(initial_walkers);
+  input.topology.reserve_walkers_per_crowd = std::move(reserve_walkers);
   input.topology.run_kind              = "wavefunction-unit-test";
   input.particle_count                 = particle_count;
   input.active_parameter_count         = 17;
@@ -417,7 +528,8 @@ std::shared_ptr<const BatchExecutionPlan> makePlan(
       {input.requirements, input.topology, input.particle_count,
        input.active_parameter_count, input.parameter_derivative_width});
   input.preference.id        = std::move(profile_id);
-  input.preference.preferred = {preferred_value_tile, 2, 2, 0};
+  input.preference.preferred = {preferred_value_tile, 2, 2,
+                                preferred_ecp_outer_tile};
   return std::make_shared<const BatchExecutionPlan>(
       selectBatchExecutionPlan(
           input, [&wavefunction](const BatchExecutionPlanningContext& context) {
@@ -944,6 +1056,9 @@ TEST_CASE("TrialWaveFunction aggregate clone preparation guards lifecycle and id
 
   RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction);
   ResourceCollection resources("aggregate-clone-preparation-guard");
+  wavefunction.prepareBatchExecutionClones();
+  wavefunction.createResource(resources);
+  resources.prepareBatchResources({plan, 0});
   TrialWaveFunction::acquireResource(resources, wavefunctions);
   CHECK_THROWS_AS(wavefunction.prepareBatchExecutionClones(), std::logic_error);
   TrialWaveFunction::releaseResource(resources, wavefunctions);
@@ -956,11 +1071,11 @@ TEST_CASE("TrialWaveFunction aggregate clone preparation guards lifecycle and id
   CHECK_THROWS_AS(wavefunction.prepareBatchExecutionClones(), std::length_error);
   const auto over_capacity =
       testing::TestTrialWaveFunction::aggregateCloneDiagnostics(wavefunction);
-  CHECK_FALSE(over_capacity.prepared);
+  CHECK(over_capacity.prepared);
   CHECK(over_capacity.accepted_gradient_size == particle_count);
   CHECK(over_capacity.accepted_gradient_capacity == particle_count + 1);
-  CHECK(over_capacity.proposed_gradient_capacity == 0);
-  CHECK(planningComponent(wavefunction, 0).prepareCalls() == 0);
+  CHECK(over_capacity.proposed_gradient_capacity == particle_count);
+  CHECK(planningComponent(wavefunction, 0).prepareCalls() == 1);
 
   TrialWaveFunction prepared_capacity_guard(
       runtime_options, "prepared-capacity-guard");
@@ -1022,6 +1137,8 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
   testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(leader);
   const auto plan = makePlan(leader);
   leader.bindBatchExecutionPlan(plan);
+  CHECK_THROWS_AS(leader.getOrCreateTWFFastDerivWrapper(particles),
+                  std::logic_error);
 
   std::unique_ptr<TrialWaveFunction> clone = leader.makeClone(particles);
   CHECK(clone->batchExecutionPlan().get() == plan.get());
@@ -1049,11 +1166,14 @@ TEST_CASE("TrialWaveFunction propagates plan identity and defers clone preparati
   RefVectorWithLeader<TrialWaveFunction> wavefunctions(
       leader, {leader, *clone});
   ResourceCollection resources("batch-planning-wavefunction");
+  leader.prepareBatchExecutionClones();
+  leader.createResource(resources);
+  resources.prepareBatchResources({plan, 0});
 
   clone_component.setClassName("mutated/clone");
   CHECK_THROWS_AS(
       TrialWaveFunction::acquireResource(resources, wavefunctions),
-      std::invalid_argument);
+      std::logic_error);
   CHECK_FALSE(leader.hasAcquiredResource());
   CHECK_FALSE(clone->hasAcquiredResource());
   CHECK(leader_component.acquireCalls() == 0);
@@ -1111,11 +1231,13 @@ TEST_CASE("TrialWaveFunction legacy multi-component acquisition preserves rollba
       "First", "", BatchExecutionMode::VALUE,
       BatchTileCapacities{8, 0, 0, 0}, 5);
   PlanningComponent* first_ptr = first.get();
+  first_ptr->useResource();
   wavefunction.addComponent(std::move(first));
   auto second = std::make_unique<PlanningComponent>(
       "Second", "", BatchExecutionMode::FULL_VGL,
       BatchTileCapacities{0, 6, 0, 0}, 7);
   PlanningComponent* second_ptr = second.get();
+  second_ptr->useResource();
   second_ptr->throwOnAcquire(true);
   wavefunction.addComponent(std::move(second));
 
@@ -1126,6 +1248,18 @@ TEST_CASE("TrialWaveFunction legacy multi-component acquisition preserves rollba
   RefVectorWithLeader<TrialWaveFunction> wavefunctions(
       wavefunction, {wavefunction});
   ResourceCollection resources("batch-planning-rollback");
+  wavefunction.createResource(resources);
+  // Omitting a hard plan preserves the historical child-only template:
+  // there is no aggregate prefix and both component resources retain order.
+  REQUIRE(resources.size() == 2);
+  auto first_resource = resources.lendResource<DummyResource>();
+  auto second_resource = resources.lendResource<DummyResource>();
+  CHECK(first_resource.getResource().getName() == "PlanningComponentResource");
+  CHECK(second_resource.getResource().getName() == "PlanningComponentResource");
+  resources.rewind();
+  resources.takebackResource(first_resource);
+  resources.takebackResource(second_resource);
+  resources.rewind();
   CHECK_THROWS_AS(
       TrialWaveFunction::acquireResource(resources, wavefunctions),
       std::runtime_error);
@@ -1141,6 +1275,7 @@ TEST_CASE("TrialWaveFunction legacy multi-component acquisition preserves rollba
   CHECK(wavefunction.hasAcquiredResource());
   CHECK(testing::TestTrialWaveFunction::hasAcquiredTopology(wavefunction));
   CHECK(testing::TestTrialWaveFunction::acquiredComponentCount(wavefunction) == 2);
+  resources.rewind();
   TrialWaveFunction::releaseResource(resources, wavefunctions);
   CHECK_FALSE(wavefunction.hasAcquiredResource());
   CHECK_FALSE(testing::TestTrialWaveFunction::hasAcquiredTopology(wavefunction));
@@ -1160,6 +1295,9 @@ TEST_CASE("TrialWaveFunction resource lifecycle accepts legacy batch lane shapes
   testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
   wavefunction.bindBatchExecutionPlan(makePlan(wavefunction));
   ResourceCollection resources("batch-planning-lane-shapes");
+  wavefunction.prepareBatchExecutionClones();
+  wavefunction.createResource(resources);
+  resources.prepareBatchResources({wavefunction.batchExecutionPlan(), 0});
 
   SECTION("one object may occupy multiple batch lanes")
   {
@@ -1168,10 +1306,65 @@ TEST_CASE("TrialWaveFunction resource lifecycle accepts legacy batch lane shapes
     TrialWaveFunction::acquireResource(resources, wavefunctions);
     CHECK(wavefunction.hasAcquiredResource());
     CHECK(component_ptr->acquireCalls() == 1);
+    CHECK(resources.getOutstandingLoanCount() == 1);
+    CHECK(resources.getCursor() == resources.size());
+    const auto first_resource =
+        testing::TestTrialWaveFunction::aggregateResourceDiagnostics(
+            wavefunction);
+    REQUIRE(first_resource.prepared);
+    CHECK(first_resource.plan_identity ==
+          wavefunction.batchExecutionPlan().get());
+    CHECK(first_resource.reserve_walkers == 3);
+    CHECK(first_resource.expected_bytes == first_resource.actual_bytes);
+    CHECK(first_resource.component_reference_bytes ==
+          3 * sizeof(std::reference_wrapper<WaveFunctionComponent>));
+    CHECK(first_resource.gradient_reference_bytes ==
+          3 * sizeof(std::reference_wrapper<ParticleSet::ParticleGradient>));
+    CHECK(first_resource.laplacian_reference_bytes ==
+          3 * sizeof(std::reference_wrapper<ParticleSet::ParticleLaplacian>));
+    CHECK(first_resource.transaction_flag_bytes == 3);
+    CHECK(first_resource.private_ratio_bytes == 0);
+    CHECK(first_resource.derivative_delta_bytes == 0);
+    CHECK(first_resource.component_leader == component_ptr);
+    CHECK(first_resource.first_component == component_ptr);
+    CHECK(first_resource.gradient_leader == &wavefunction.G);
+    CHECK(first_resource.first_gradient == &wavefunction.G);
+    CHECK(first_resource.laplacian_leader == &wavefunction.L);
+    CHECK(first_resource.first_laplacian == &wavefunction.L);
 
     TrialWaveFunction::releaseResource(resources, wavefunctions);
     CHECK_FALSE(wavefunction.hasAcquiredResource());
     CHECK(component_ptr->releaseCalls() == 1);
+    CHECK(resources.getOutstandingLoanCount() == 0);
+    CHECK(resources.getCursor() == resources.size());
+
+    resources.rewind();
+    TrialWaveFunction::acquireResource(resources, wavefunctions);
+    const auto second_resource =
+        testing::TestTrialWaveFunction::aggregateResourceDiagnostics(
+            wavefunction);
+    CHECK(second_resource.storage_fingerprint ==
+          first_resource.storage_fingerprint);
+    CHECK(second_resource.component_reference_data ==
+          first_resource.component_reference_data);
+    CHECK(second_resource.gradient_reference_data ==
+          first_resource.gradient_reference_data);
+    CHECK(second_resource.laplacian_reference_data ==
+          first_resource.laplacian_reference_data);
+    TrialWaveFunction::releaseResource(resources, wavefunctions);
+
+    resources.rewind();
+    RefVectorWithLeader<TrialWaveFunction> full_reserve(
+        wavefunction, {wavefunction, wavefunction, wavefunction});
+    TrialWaveFunction::acquireResource(resources, full_reserve);
+    const auto full_resource =
+        testing::TestTrialWaveFunction::aggregateResourceDiagnostics(
+            wavefunction);
+    CHECK(full_resource.storage_fingerprint ==
+          first_resource.storage_fingerprint);
+    CHECK(full_resource.component_reference_data ==
+          first_resource.component_reference_data);
+    TrialWaveFunction::releaseResource(resources, full_reserve);
   }
 
   SECTION("an empty lane vector still manages its designated leader")
@@ -1180,11 +1373,259 @@ TEST_CASE("TrialWaveFunction resource lifecycle accepts legacy batch lane shapes
     TrialWaveFunction::acquireResource(resources, wavefunctions);
     CHECK(wavefunction.hasAcquiredResource());
     CHECK(component_ptr->acquireCalls() == 1);
+    const auto diagnostics =
+        testing::TestTrialWaveFunction::aggregateResourceDiagnostics(
+            wavefunction);
+    CHECK(diagnostics.component_leader == component_ptr);
+    CHECK(diagnostics.first_component == nullptr);
 
     TrialWaveFunction::releaseResource(resources, wavefunctions);
     CHECK_FALSE(wavefunction.hasAcquiredResource());
     CHECK(component_ptr->releaseCalls() == 1);
   }
+}
+
+TEST_CASE("TrialWaveFunction prepares exact aggregate resources for uneven and zero crowds",
+          "[wavefunction][batch_memory][resources]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "aggregate-crowd-shapes");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "CrowdShape", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 7));
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+
+  const auto uneven_plan = makePlan(wavefunction, "uneven-crowds", 3, 4,
+                                    {1, 2}, {2, 4});
+  wavefunction.bindBatchExecutionPlan(uneven_plan);
+  wavefunction.prepareBatchExecutionClones();
+  ResourceCollection resources("uneven-aggregate-resource");
+  wavefunction.createResource(resources);
+  CHECK(resources.size() == 1);
+  resources.prepareBatchResources({uneven_plan, 1});
+  CHECK(testing::TestTrialWaveFunction::aggregatePlaceholdersMatchFillers(
+      resources));
+
+  RefVectorWithLeader<TrialWaveFunction> two_lanes(
+      wavefunction, {wavefunction, wavefunction});
+  TrialWaveFunction::acquireResource(resources, two_lanes);
+  const auto uneven =
+      testing::TestTrialWaveFunction::aggregateResourceDiagnostics(wavefunction);
+  REQUIRE(uneven.prepared);
+  CHECK(uneven.crowd_index == 1);
+  CHECK(uneven.reserve_walkers == 4);
+  CHECK(uneven.expected_bytes == uneven.actual_bytes);
+  CHECK(uneven.component_reference_bytes ==
+        4 * sizeof(std::reference_wrapper<WaveFunctionComponent>));
+  CHECK(uneven.gradient_reference_bytes ==
+        4 * sizeof(std::reference_wrapper<ParticleSet::ParticleGradient>));
+  CHECK(uneven.laplacian_reference_bytes ==
+        4 * sizeof(std::reference_wrapper<ParticleSet::ParticleLaplacian>));
+  CHECK(uneven.transaction_flag_bytes == 4);
+  TrialWaveFunction::releaseResource(resources, two_lanes);
+
+  // Copies of prepared collections preserve provenance but intentionally copy
+  // no prepared storage.  An explicit null clear makes the copy reusable.
+  ResourceCollection derived(resources);
+  CHECK(derived.getBatchResourcePreparationProvenance().state ==
+        BatchResourcePreparationState::DERIVED_REQUIRES_CLEAR);
+  CHECK_FALSE(testing::TestTrialWaveFunction::aggregatePlaceholdersMatchFillers(
+      derived));
+  CHECK_THROWS_AS(TrialWaveFunction::acquireResource(derived, two_lanes),
+                  std::logic_error);
+  CHECK(derived.getOutstandingLoanCount() == 0);
+  derived.prepareBatchResources({nullptr, 0});
+  derived.prepareBatchResources({uneven_plan, 0});
+  CHECK(testing::TestTrialWaveFunction::aggregatePlaceholdersMatchFillers(
+      derived));
+  TrialWaveFunction::acquireResource(derived, two_lanes);
+  const auto copied =
+      testing::TestTrialWaveFunction::aggregateResourceDiagnostics(wavefunction);
+  CHECK(copied.crowd_index == 0);
+  CHECK(copied.reserve_walkers == 2);
+  TrialWaveFunction::releaseResource(derived, two_lanes);
+
+  // A zero-reserve crowd still carries exact plan/crowd provenance while all
+  // category backing remains empty and its fingerprint stays valid.
+  wavefunction.bindBatchExecutionPlan(nullptr);
+  const auto zero_plan = makePlan(wavefunction, "zero-crowd", 1, 4,
+                                  {0}, {0});
+  wavefunction.bindBatchExecutionPlan(zero_plan);
+  wavefunction.prepareBatchExecutionClones();
+  resources.prepareBatchResources({nullptr, 0});
+  resources.prepareBatchResources({zero_plan, 0});
+  CHECK(testing::TestTrialWaveFunction::aggregatePlaceholdersMatchFillers(
+      resources));
+  RefVectorWithLeader<TrialWaveFunction> empty_lanes(wavefunction);
+  TrialWaveFunction::acquireResource(resources, empty_lanes);
+  const auto zero =
+      testing::TestTrialWaveFunction::aggregateResourceDiagnostics(wavefunction);
+  REQUIRE(zero.prepared);
+  CHECK(zero.reserve_walkers == 0);
+  CHECK(zero.expected_bytes == 0);
+  CHECK(zero.actual_bytes == 0);
+  CHECK(zero.component_reference_bytes == 0);
+  CHECK(zero.gradient_reference_bytes == 0);
+  CHECK(zero.laplacian_reference_bytes == 0);
+  CHECK(zero.transaction_flag_bytes == 0);
+  CHECK(zero.storage_fingerprint != 0);
+  TrialWaveFunction::releaseResource(resources, empty_lanes);
+}
+
+TEST_CASE("TrialWaveFunction prepares exact weighted aggregate staging",
+          "[wavefunction][batch_memory][resources]")
+{
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction(runtime_options, "weighted-aggregate-resource");
+  wavefunction.addComponent(std::make_unique<PlanningComponent>(
+      "Weighted", "", BatchExecutionMode::ECP_WEIGHTED_SCORE,
+      BatchTileCapacities{0, 0, 0, 8}, 13));
+  planningComponent(wavefunction, 0).requireValueMode();
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(wavefunction);
+  const auto plan = makePlan(wavefunction, "weighted-aggregate", 1, 4,
+                             {2}, {3}, 2);
+  wavefunction.bindBatchExecutionPlan(plan);
+  wavefunction.prepareBatchExecutionClones();
+
+  ResourceCollection resources("weighted-aggregate-resource");
+  wavefunction.createResource(resources);
+  resources.prepareBatchResources({plan, 0});
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(
+      wavefunction, {wavefunction});
+  TrialWaveFunction::acquireResource(resources, wavefunctions);
+  const auto diagnostics =
+      testing::TestTrialWaveFunction::aggregateResourceDiagnostics(wavefunction);
+  const std::size_t reserve = 3;
+  const std::size_t outer = plan->selectedCapacities().ecp_outer;
+  const std::size_t derivative_width = plan->parameterDerivativeWidth();
+  REQUIRE(outer > 0);
+  CHECK(diagnostics.expected_bytes == diagnostics.actual_bytes);
+  CHECK(diagnostics.private_ratio_bytes == outer * sizeof(TrialWaveFunction::ValueType));
+  CHECK(diagnostics.total_weight_bytes == outer * sizeof(TrialWaveFunction::ValueType));
+  CHECK(diagnostics.derivative_delta_bytes ==
+        reserve * derivative_width * sizeof(TrialWaveFunction::ValueType));
+  CHECK(diagnostics.derivative_view_bytes ==
+        reserve * sizeof(TrialWaveFunction::ParameterDerivativeView));
+  CHECK(diagnostics.value_stamp_bytes ==
+        sizeof(TrialWaveFunction::EvaluationStamp));
+  CHECK(diagnostics.transaction_flag_bytes == reserve);
+  TrialWaveFunction::releaseResource(resources, wavefunctions);
+}
+
+TEST_CASE("TrialWaveFunction planned aggregate acquisition is transactional",
+          "[wavefunction][batch_memory][resources]")
+{
+  RuntimeOptions runtime_options;
+  SimulationCell simulation_cell;
+  ParticleSet particles(simulation_cell);
+  particles.create({4});
+
+  TrialWaveFunction leader(runtime_options, "aggregate-transaction");
+  leader.addComponent(std::make_unique<PlanningComponent>(
+      "Transactional", "", BatchExecutionMode::VALUE,
+      BatchTileCapacities{8, 0, 0, 0}, 11));
+  planningComponent(leader, 0).useResource();
+  testing::TestTrialWaveFunction::useCompleteBatchMemoryAccounting(leader);
+  const auto plan = makePlan(leader, "aggregate-transaction-v1");
+  leader.bindBatchExecutionPlan(plan);
+  leader.prepareBatchExecutionClones();
+  auto clone = leader.makeClone(particles);
+  clone->prepareBatchExecutionClones();
+  auto second_clone = leader.makeClone(particles);
+  second_clone->prepareBatchExecutionClones();
+  auto unprepared = leader.makeClone(particles);
+
+  ResourceCollection resources("aggregate-transaction-resource");
+  leader.createResource(resources);
+  resources.addResource(std::make_unique<DummyResource>("trailing-resource"));
+  CHECK(resources.size() == 3);
+  resources.prepareBatchResources({plan, 0});
+  const std::size_t entry_cursor = resources.getCursor();
+
+  RefVectorWithLeader<TrialWaveFunction> too_many(
+      leader, {leader, leader, leader, leader});
+  CHECK_THROWS_AS(TrialWaveFunction::acquireResource(resources, too_many),
+                  std::length_error);
+  CHECK(resources.getOutstandingLoanCount() == 0);
+  CHECK(resources.getCursor() == entry_cursor);
+
+  RefVectorWithLeader<TrialWaveFunction> unprepared_team(leader, {*unprepared});
+  CHECK_THROWS_AS(
+      TrialWaveFunction::acquireResource(resources, unprepared_team),
+      std::logic_error);
+  CHECK(resources.getOutstandingLoanCount() == 0);
+  CHECK_FALSE(leader.hasAcquiredResource());
+  CHECK_FALSE(unprepared->hasAcquiredResource());
+
+  RefVectorWithLeader<TrialWaveFunction> team(leader, {*clone});
+  testing::TestTrialWaveFunction::setMultiParticleProposalPending(*clone, true);
+  CHECK_THROWS_AS(TrialWaveFunction::acquireResource(resources, team),
+                  std::logic_error);
+  testing::TestTrialWaveFunction::setMultiParticleProposalPending(*clone, false);
+  CHECK(resources.getOutstandingLoanCount() == 0);
+
+  testing::TestTrialWaveFunction::setAggregateResourceCrowd(resources, 1);
+  CHECK_THROWS_AS(TrialWaveFunction::acquireResource(resources, team),
+                  std::logic_error);
+  CHECK(resources.getOutstandingLoanCount() == 0);
+  CHECK(resources.getCursor() == entry_cursor);
+  testing::TestTrialWaveFunction::setAggregateResourceCrowd(resources, 0);
+
+  PlanningComponent& component = planningComponent(leader, 0);
+  component.throwOnAcquire(true);
+  CHECK_THROWS_AS(TrialWaveFunction::acquireResource(resources, team),
+                  std::runtime_error);
+  CHECK(resources.getOutstandingLoanCount() == 0);
+  CHECK(resources.getCursor() == entry_cursor);
+  CHECK_FALSE(leader.hasAcquiredResource());
+  CHECK_FALSE(clone->hasAcquiredResource());
+
+  // The same collection remains usable after rollback of an aggregate-first
+  // loan whose child acquisition failed.
+  component.throwOnAcquire(false);
+  RefVectorWithLeader<TrialWaveFunction> exact_team(
+      leader, {*clone, *second_clone});
+  TrialWaveFunction::acquireResource(resources, exact_team);
+  CHECK(resources.getOutstandingLoanCount() == 2);
+  CHECK(resources.getCursor() == 2);
+
+  ResourceCollection wrong_collection("wrong-release-collection");
+  CHECK_THROWS_AS(
+      TrialWaveFunction::releaseResource(wrong_collection, exact_team),
+      std::logic_error);
+
+  auto trailing = resources.lendResource<DummyResource>();
+  CHECK_THROWS_AS(TrialWaveFunction::releaseResource(resources, exact_team),
+                  std::logic_error);
+  resources.rewind(2);
+  resources.takebackResource(trailing);
+  CHECK(resources.getOutstandingLoanCount() == 2);
+
+  RefVectorWithLeader<TrialWaveFunction> subset(leader, {*clone});
+  CHECK_THROWS_AS(TrialWaveFunction::releaseResource(resources, subset),
+                  std::invalid_argument);
+  RefVectorWithLeader<TrialWaveFunction> reordered(
+      leader, {*second_clone, *clone});
+  CHECK_THROWS_AS(TrialWaveFunction::releaseResource(resources, reordered),
+                  std::invalid_argument);
+  RefVectorWithLeader<TrialWaveFunction> wrong_lane(
+      leader, {*clone, *unprepared});
+  CHECK_THROWS_AS(TrialWaveFunction::releaseResource(resources, wrong_lane),
+                  std::logic_error);
+  CHECK(resources.getOutstandingLoanCount() == 2);
+  CHECK(leader.hasAcquiredResource());
+  CHECK(clone->hasAcquiredResource());
+  CHECK(second_clone->hasAcquiredResource());
+
+  component.skipResourceRelease(true);
+  CHECK_THROWS_AS(TrialWaveFunction::releaseResource(resources, exact_team),
+                  std::logic_error);
+  CHECK(resources.getOutstandingLoanCount() == 2);
+  CHECK(leader.hasAcquiredResource());
+  component.skipResourceRelease(false);
+  TrialWaveFunction::releaseResource(resources, exact_team);
+  CHECK(resources.getOutstandingLoanCount() == 0);
+  CHECK(resources.getCursor() == 2);
 }
 
 TEST_CASE("TrialWaveFunction null clone binding clears stale child state",

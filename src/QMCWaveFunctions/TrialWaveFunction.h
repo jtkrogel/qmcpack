@@ -32,6 +32,7 @@
 #include "QMCWaveFunctions/TWFFastDerivWrapper.h"
 #include "TWFGrads.hpp"
 #include "Utilities/RuntimeOptions.h"
+#include "Utilities/ResourceHandle.h"
 
 #include <cstdint>
 
@@ -617,8 +618,10 @@ public:
    * Note: use RAII ResourceCollectionLock whenever possible
    */
   static void acquireResource(ResourceCollection& collection, const RefVectorWithLeader<TrialWaveFunction>& wf_list);
-  /** release external resource
-   * Note: use RAII ResourceCollectionLock whenever possible
+  /** Release external resources.
+   * Note: use RAII ResourceCollectionLock whenever possible.  Under a hard
+   * plan, a child release that throws must leave every child loan intact so
+   * the exact same team release remains retryable.
    */
   static void releaseResource(ResourceCollection& collection, const RefVectorWithLeader<TrialWaveFunction>& wf_list);
 
@@ -690,6 +693,9 @@ public:
 
 
 private:
+  /// Crowd-owned aggregate views and staging for one planned TWF team.
+  struct TrialWaveFunctionMultiWalkerResource;
+
   static void debugOnlyCheckBuffer(WFBufferType& buffer);
 
   /** Fixed-size snapshot of one component topology and its planned views.
@@ -739,6 +745,51 @@ private:
   /// Prepare aggregate and sole-child clone state for one exact participant view.
   void prepareBatchExecutionClone(
       const BatchExecutionParticipantPlan& aggregate_plan);
+
+  /// Revalidate exact clone storage and its published aggregate plan marker.
+  void validatePreparedBatchExecutionClone(
+      const BatchExecutionParticipantPlan& aggregate_plan) const;
+
+  /// Friend-test snapshot of the currently lent aggregate crowd resource.
+  struct AggregateResourceDiagnostics
+  {
+    bool prepared                                            = false;
+    const void* plan_identity                                = nullptr;
+    std::size_t crowd_index                                  = 0;
+    std::size_t reserve_walkers                              = 0;
+    std::size_t storage_fingerprint                          = 0;
+    std::size_t expected_bytes                               = 0;
+    std::size_t actual_bytes                                 = 0;
+    std::size_t component_reference_bytes                    = 0;
+    std::size_t gradient_reference_bytes                     = 0;
+    std::size_t laplacian_reference_bytes                    = 0;
+    std::size_t private_ratio_bytes                          = 0;
+    std::size_t total_weight_bytes                           = 0;
+    std::size_t derivative_delta_bytes                       = 0;
+    std::size_t derivative_view_bytes                        = 0;
+    std::size_t value_stamp_bytes                            = 0;
+    std::size_t transaction_flag_bytes                       = 0;
+    const void* component_reference_data                     = nullptr;
+    const void* gradient_reference_data                      = nullptr;
+    const void* laplacian_reference_data                     = nullptr;
+    const WaveFunctionComponent* component_leader            = nullptr;
+    const WaveFunctionComponent* first_component             = nullptr;
+    const ParticleSet::ParticleGradient* gradient_leader     = nullptr;
+    const ParticleSet::ParticleGradient* first_gradient      = nullptr;
+    const ParticleSet::ParticleLaplacian* laplacian_leader   = nullptr;
+    const ParticleSet::ParticleLaplacian* first_laplacian    = nullptr;
+  };
+
+  /// Snapshot exact aggregate allocation and binding state for friend tests.
+  AggregateResourceDiagnostics aggregateResourceDiagnosticsForTesting() const;
+
+  /// Deliberately corrupt crowd provenance for focused acquisition guard tests.
+  static void setAggregateResourceCrowdForTesting(ResourceCollection& collection,
+                                                   std::size_t crowd_index);
+
+  /// Verify prepared idle reference views target their destination fillers.
+  static bool aggregateResourcePlaceholdersMatchFillersForTesting(
+      ResourceCollection& collection);
 
   /// @brief top-level runtime options from project data information > WaveFunctionPool
   const RuntimeOptions& runtime_options_;
@@ -800,6 +851,16 @@ private:
 
   /// Fixed-size topology snapshot retained only for one resource loan.
   InlineBatchTopologyState acquired_batch_topology_;
+
+  /// Aggregate crowd storage remains lent while the sole component is active.
+  ResourceHandle<TrialWaveFunctionMultiWalkerResource> aggregate_mw_resource_handle_;
+
+  /// Exact collection traversal checkpoints retained across one team loan.
+  std::size_t aggregate_resource_cursor_ = 0;
+  std::size_t child_resource_cursor_ = 0;
+  std::size_t final_resource_cursor_ = 0;
+  std::size_t acquired_resource_outstanding_loans_ = 0;
+  const ResourceCollection* acquired_resource_collection_ = nullptr;
 
   /// Guard plan/topology mutation while a standard component resource list is lent.
   bool resource_acquired_ = false;

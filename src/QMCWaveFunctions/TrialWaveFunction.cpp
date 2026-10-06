@@ -32,6 +32,7 @@
 #include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunctionMemoryPolicy.h"
+#include "Utilities/BatchResourcePreparation.h"
 #include "ResourceCollection.h"
 #include "Utilities/IteratorUtility.h"
 #include "Concurrency/Info.hpp"
@@ -175,6 +176,762 @@ typedef enum
 
 static const std::vector<std::string> suffixes{"V",         "VGL",    "accept", "NLratio",
                                                "recompute", "buffer", "derivs", "preparegroup"};
+
+/** Exact crowd-owned aggregate views and staging for one TrialWaveFunction team.
+ *
+ * Copies retain only immutable filler and planning provenance.  Prepared
+ * storage is rebuilt by ResourceCollection for the destination crowd, so a
+ * copied prepared collection remains storage-empty until explicitly cleared.
+ */
+struct TrialWaveFunction::TrialWaveFunctionMultiWalkerResource : public Resource
+{
+  using ComponentView = RefVectorWithLeader<WaveFunctionComponent>;
+  using GradientView  = RefVectorWithLeader<ParticleSet::ParticleGradient>;
+  using LaplacianView = RefVectorWithLeader<ParticleSet::ParticleLaplacian>;
+
+  /// Construct an empty template retaining only stable filler and plan facts.
+  TrialWaveFunctionMultiWalkerResource(
+      WaveFunctionComponent* component_filler,
+      TrialWaveFunctionMemoryPolicyInput policy_input,
+      BatchExecutionParticipantPlan expected_plan = {})
+      : Resource("TrialWaveFunctionMultiWalkerResource"),
+        component_filler_(component_filler),
+        policy_input_(std::move(policy_input)),
+        expected_plan_(std::move(expected_plan))
+  {}
+
+  /// Copy immutable template provenance without prepared storage or bindings.
+  TrialWaveFunctionMultiWalkerResource(
+      const TrialWaveFunctionMultiWalkerResource& other)
+      : TrialWaveFunctionMultiWalkerResource(other.component_filler_,
+                                               other.policy_input_,
+                                               other.expected_plan_)
+  {}
+
+  /// Recreate an empty resource for a copied ResourceCollection.
+  std::unique_ptr<Resource> makeClone() const override
+  {
+    return std::make_unique<TrialWaveFunctionMultiWalkerResource>(*this);
+  }
+
+  /// Validate one preparation context without mutating resource state.
+  void validateBatchResourcePreparation(
+      const BatchResourcePreparationContext& context) const override
+  {
+    context.validate();
+    if (!context.plan)
+      return;
+    if (prepared_plan_)
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource replanning requires an explicit null clear");
+    if (retainedBytes() != 0)
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource retained storage before preparation");
+    if (policy_input_.component_count != 1 || policy_input_.use_tasking ||
+        policy_input_.fallback_path_reachable || !component_filler_)
+      throw std::invalid_argument(
+          "TrialWaveFunction planned aggregate resource requires one direct component");
+
+    const BatchExecutionParticipantPlan selected =
+        makeBatchExecutionParticipantPlan(
+            context.plan, TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
+    if (expected_plan_ && !expected_plan_.sameBinding(selected))
+      throw std::invalid_argument(
+          "TrialWaveFunction aggregate resource received the wrong plan");
+    validateEvidence(selected);
+    const auto plans = makeCrowdPlans(selected);
+    if (context.crowd_index >= plans.size())
+      throw std::out_of_range(
+          "TrialWaveFunction aggregate resource crowd index is outside its plan");
+  }
+
+  /// Materialize exact crowd storage transactionally, or clear it on null.
+  void prepareBatchResource(
+      const BatchResourcePreparationContext& context) override
+  {
+    validateBatchResourcePreparation(context);
+    if (!context.plan)
+    {
+      clearToNoPolicy();
+      return;
+    }
+
+    BatchExecutionParticipantPlan selected =
+        makeBatchExecutionParticipantPlan(
+            context.plan, TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID);
+    auto plans = makeCrowdPlans(selected);
+    TrialWaveFunctionCrowdMemoryPlan crowd_plan =
+        std::move(plans.at(context.crowd_index));
+    TrialWaveFunctionMultiWalkerResource candidate(
+        component_filler_, policy_input_, selected);
+    candidate.materialize(std::move(selected), context.crowd_index,
+                          std::move(crowd_plan));
+    publish(std::move(candidate));
+  }
+
+  /** Verify prepared provenance and storage before any runtime view is rebound. */
+  void validateAcquiredBinding(const BatchExecutionParticipantPlan& plan,
+                               std::optional<std::size_t> crowd_index,
+                               std::size_t live_walkers) const
+  {
+    if (!plan)
+    {
+      if (expected_plan_ || prepared_plan_ || prepared_crowd_plan_)
+        throw std::logic_error(
+            "TrialWaveFunction no-policy acquisition received a planned aggregate resource");
+      return;
+    }
+    if (!expected_plan_.sameBinding(plan) || !prepared_plan_.sameBinding(plan) ||
+        !prepared_crowd_plan_)
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource was not prepared for this plan");
+    if (prepared_plan_fingerprint_ != plan.plan().fingerprint())
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource has stale plan provenance");
+    if (crowd_index && *crowd_index != prepared_crowd_index_)
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource has the wrong crowd identity");
+    if (live_walkers > prepared_crowd_plan_->reserve_walkers)
+      throw std::length_error(
+          "TrialWaveFunction live crowd exceeds the prepared reserve");
+    if (prepared_storage_fingerprint_ == 0 ||
+        prepared_storage_fingerprint_ != storageFingerprint())
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource allocation identity changed");
+    if (!matchesPreparedCapacities())
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource capacity changed");
+  }
+
+  /** Verify that release presents the identical leader and ordered lane list. */
+  bool sameBoundTeam(
+      const RefVectorWithLeader<TrialWaveFunction>& wavefunctions) const noexcept
+  {
+    if (!component_refs_ || !gradient_refs_ || !laplacian_refs_ ||
+        &component_refs_->getLeader() !=
+            wavefunctions.getLeader().Z.front().get() ||
+        &gradient_refs_->getLeader() != &wavefunctions.getLeader().G ||
+        &laplacian_refs_->getLeader() != &wavefunctions.getLeader().L ||
+        component_refs_->size() != wavefunctions.size() ||
+        gradient_refs_->size() != wavefunctions.size() ||
+        laplacian_refs_->size() != wavefunctions.size())
+      return false;
+    for (std::size_t walker = 0; walker < wavefunctions.size(); ++walker)
+      if (&(*component_refs_)[walker] != wavefunctions[walker].Z.front().get() ||
+          &(*gradient_refs_)[walker] != &wavefunctions[walker].G ||
+          &(*laplacian_refs_)[walker] != &wavefunctions[walker].L)
+        return false;
+    return true;
+  }
+
+  /** Rebind fixed-capacity reference views to the current live team. */
+  void bindViews(const RefVectorWithLeader<TrialWaveFunction>& wavefunctions)
+  {
+    const std::size_t live = wavefunctions.size();
+    const std::size_t reserve = prepared_crowd_plan_->reserve_walkers;
+    restoreReferenceExtent(reserve);
+    restoreScratchExtent();
+
+    component_refs_->rebindLeader(*wavefunctions.getLeader().Z.front());
+    gradient_refs_->rebindLeader(wavefunctions.getLeader().G);
+    laplacian_refs_->rebindLeader(wavefunctions.getLeader().L);
+    for (std::size_t walker = 0; walker < live; ++walker)
+    {
+      component_refs_->rebindElement(walker, *wavefunctions[walker].Z.front());
+      gradient_refs_->rebindElement(walker, wavefunctions[walker].G);
+      laplacian_refs_->rebindElement(walker, wavefunctions[walker].L);
+    }
+    component_refs_->erase(component_refs_->begin() + live,
+                           component_refs_->end());
+    gradient_refs_->erase(gradient_refs_->begin() + live,
+                          gradient_refs_->end());
+    laplacian_refs_->erase(laplacian_refs_->begin() + live,
+                           laplacian_refs_->end());
+    if (!weighted_derivative_views_.empty())
+      weighted_derivative_views_.resize(live);
+    transaction_flags_.resize(live);
+    std::fill(transaction_flags_.begin(), transaction_flags_.end(), 0);
+  }
+
+  /** Restore stable filler references without touching large numeric staging. */
+  void resetViews() noexcept
+  {
+    if (!prepared_crowd_plan_)
+      return;
+    component_refs_->rebindLeader(*component_filler_);
+    gradient_refs_->rebindLeader(gradient_filler_);
+    laplacian_refs_->rebindLeader(laplacian_filler_);
+    for (std::size_t walker = 0; walker < component_refs_->size(); ++walker)
+    {
+      component_refs_->rebindElement(walker, *component_filler_);
+      gradient_refs_->rebindElement(walker, gradient_filler_);
+      laplacian_refs_->rebindElement(walker, laplacian_filler_);
+    }
+    // Numeric staging remains at its admitted extent.  Its contents are dead
+    // outside a loan, so release avoids an O(B*P) clear; only the small live
+    // transaction mask is invalidated before the resource is returned.
+    std::fill(transaction_flags_.begin(), transaction_flags_.end(), 0);
+  }
+
+  /// Expose the sole-component lane view to TrialWaveFunction runtime paths.
+  ComponentView& componentView() { return *component_refs_; }
+  const ComponentView& componentView() const { return *component_refs_; }
+
+  /// Expose the aggregate gradient lane view to TrialWaveFunction runtime paths.
+  GradientView& gradientView() { return *gradient_refs_; }
+  const GradientView& gradientView() const { return *gradient_refs_; }
+
+  /// Expose the aggregate Laplacian lane view to TrialWaveFunction runtime paths.
+  LaplacianView& laplacianView() { return *laplacian_refs_; }
+  const LaplacianView& laplacianView() const { return *laplacian_refs_; }
+
+  /// Return private weighted-ECP ratios retained for the admitted outer tile.
+  std::vector<ValueType>& privateRatios() noexcept { return private_ratios_; }
+
+  /// Return accumulated weighted-ECP walker weights.
+  std::vector<ValueType>& totalWeights() noexcept { return total_weights_; }
+
+  /// Return flat parameter-derivative delta staging.
+  std::vector<ValueType>& derivativeDelta() noexcept
+  { return weighted_derivative_delta_; }
+
+  /// Return walker views into flat parameter-derivative delta staging.
+  std::vector<ParameterDerivativeView>& derivativeViews() noexcept
+  { return weighted_derivative_views_; }
+
+  /// Return accepted-value stamps used by weighted evaluations.
+  std::vector<EvaluationStamp>& valueStamps() noexcept { return value_stamps_; }
+
+  /// Return per-walker transaction-state flags.
+  std::vector<unsigned char>& transactionFlags() noexcept
+  { return transaction_flags_; }
+
+  /// Report whether this crowd resource has exact prepared provenance.
+  bool isPrepared() const noexcept { return static_cast<bool>(prepared_plan_); }
+
+  /// Return the retained allocation-identity fingerprint for tests.
+  std::size_t storageFingerprintForTesting() const noexcept
+  { return prepared_storage_fingerprint_; }
+
+  /// Return the exact crowd descriptor retained after preparation.
+  const std::optional<TrialWaveFunctionCrowdMemoryPlan>&
+  crowdPlanForTesting() const noexcept
+  { return prepared_crowd_plan_; }
+
+  /// Return measured category bytes retained after preparation.
+  const BatchMemoryEstimate& actualStorageForTesting() const noexcept
+  { return actual_resource_storage_; }
+
+  /// Return the participant plan view used to prepare this crowd resource.
+  const BatchExecutionParticipantPlan& preparedPlanForTesting() const noexcept
+  { return prepared_plan_; }
+
+  /// Return the prepared crowd index for diagnostics.
+  std::size_t preparedCrowdIndexForTesting() const noexcept
+  { return prepared_crowd_index_; }
+
+  /// Corrupt the retained crowd index for a focused fail-closed test.
+  void setPreparedCrowdIndexForTesting(std::size_t crowd_index) noexcept
+  { prepared_crowd_index_ = crowd_index; }
+
+  /// Measure typed allocation capacities for focused exactness tests.
+  TrialWaveFunctionResourceStorageRequirement measuredRequirementForTesting() const
+  { return measureRequirement(); }
+
+  /** Verify every idle reference view targets this resource's own fillers. */
+  bool placeholdersMatchDestinationFillersForTesting() const noexcept
+  {
+    if (!component_refs_ || !gradient_refs_ || !laplacian_refs_ ||
+        &component_refs_->getLeader() != component_filler_ ||
+        &gradient_refs_->getLeader() != &gradient_filler_ ||
+        &laplacian_refs_->getLeader() != &laplacian_filler_ ||
+        component_refs_->size() != gradient_refs_->size() ||
+        component_refs_->size() != laplacian_refs_->size())
+      return false;
+    for (std::size_t slot = 0; slot < component_refs_->size(); ++slot)
+      if (&(*component_refs_)[slot] != component_filler_ ||
+          &(*gradient_refs_)[slot] != &gradient_filler_ ||
+          &(*laplacian_refs_)[slot] != &laplacian_filler_)
+        return false;
+    return true;
+  }
+
+private:
+  /// Allocate a vector whose capacity exactly matches one byte descriptor.
+  template<class T>
+  static std::vector<T> makeExactVector(std::size_t bytes,
+                                        const char* description)
+  {
+    if (bytes % sizeof(T) != 0)
+      throw std::length_error(std::string(description) +
+                              " is not divisible by its element size");
+    std::vector<T> result(bytes / sizeof(T));
+    if (result.capacity() * sizeof(T) != bytes)
+      throw std::length_error(std::string(description) +
+                              " exceeded its exact admitted capacity");
+    return result;
+  }
+
+  /// Measure one vector's owned allocation capacity in bytes.
+  template<class T>
+  static std::size_t vectorBytes(const std::vector<T>& values,
+                                 const char* description)
+  {
+    return checkedBatchMemoryMultiply(values.capacity(), sizeof(T), description);
+  }
+
+  /// Release all capacity retained by one typed vector.
+  template<class T>
+  static void freeVector(std::vector<T>& values)
+  {
+    std::vector<T>().swap(values);
+  }
+
+  /// Reconstruct stable per-crowd descriptors for one validated plan view.
+  std::vector<TrialWaveFunctionCrowdMemoryPlan> makeCrowdPlans(
+      const BatchExecutionParticipantPlan& plan) const
+  {
+    const BatchExecutionPlan& selected = plan.plan();
+    return makeTrialWaveFunctionCrowdMemoryPlans(
+        policy_input_,
+        {selected.requirements(), selected.topology(), selected.logicalMaximum(),
+         selected.selectedCapacities(), selected.particleCount(),
+         selected.activeParameterCount(), selected.parameterDerivativeWidth()});
+  }
+
+  /// Recompute selected and minimum evidence from immutable resource facts.
+  void validateEvidence(const BatchExecutionParticipantPlan& participant) const
+  {
+    const BatchExecutionPlan& plan = participant.plan();
+    const auto& evidence = participant.evidence();
+    if (evidence.participant_id !=
+        TRIAL_WAVEFUNCTION_MEMORY_PARTICIPANT_ID)
+      throw std::invalid_argument(
+          "TrialWaveFunction aggregate resource participant identity is stale");
+    BatchExecutionPlanningContext context{
+        plan.requirements(), plan.topology(), plan.logicalMaximum(),
+        plan.selectedCapacities(), plan.particleCount(),
+        plan.activeParameterCount(), plan.parameterDerivativeWidth()};
+    const BatchMemoryContribution selected =
+        estimateTrialWaveFunctionBatchMemory(policy_input_, context);
+    if (!(selected.logical_maximum == evidence.logical_maximum) ||
+        selected.owner_multiplicity != evidence.owner_multiplicity ||
+        !(selected.per_owner == evidence.selected_per_owner) ||
+        selected.fully_accounted != evidence.fully_accounted ||
+        !selected.fully_accounted)
+      throw std::invalid_argument(
+          "TrialWaveFunction aggregate resource selected evidence is stale");
+    context.candidate_capacities = plan.minimumCapacities();
+    const BatchMemoryContribution minimum =
+        estimateTrialWaveFunctionBatchMemory(policy_input_, context);
+    if (!(minimum.logical_maximum == evidence.logical_maximum) ||
+        minimum.owner_multiplicity != evidence.owner_multiplicity ||
+        !(minimum.per_owner == evidence.fixed_minimum_per_owner) ||
+        minimum.fully_accounted != evidence.fully_accounted)
+      throw std::invalid_argument(
+          "TrialWaveFunction aggregate resource minimum evidence is stale");
+  }
+
+  /// Compare every field of two typed resource-storage descriptors.
+  static bool sameRequirement(
+      const TrialWaveFunctionResourceStorageRequirement& lhs,
+      const TrialWaveFunctionResourceStorageRequirement& rhs) noexcept
+  {
+    return lhs.component_reference_slots == rhs.component_reference_slots &&
+        lhs.aggregate_gradient_reference_slots ==
+            rhs.aggregate_gradient_reference_slots &&
+        lhs.aggregate_laplacian_reference_slots ==
+            rhs.aggregate_laplacian_reference_slots &&
+        lhs.weighted_ecp_private_ratios == rhs.weighted_ecp_private_ratios &&
+        lhs.weighted_ecp_total_weights == rhs.weighted_ecp_total_weights &&
+        lhs.weighted_parameter_derivative_delta ==
+            rhs.weighted_parameter_derivative_delta &&
+        lhs.weighted_parameter_derivative_views ==
+            rhs.weighted_parameter_derivative_views &&
+        lhs.weighted_value_stamps == rhs.weighted_value_stamps &&
+        lhs.transaction_flags == rhs.transaction_flags;
+  }
+
+  /// Measure all typed allocation capacities by their runtime purpose.
+  TrialWaveFunctionResourceStorageRequirement measureRequirement() const
+  {
+    TrialWaveFunctionResourceStorageRequirement measured;
+    measured.component_reference_slots = component_refs_
+        ? vectorBytes(static_cast<const ComponentView::BaseVec&>(*component_refs_),
+                      "TWF component-reference storage")
+        : 0;
+    measured.aggregate_gradient_reference_slots = gradient_refs_
+        ? vectorBytes(static_cast<const GradientView::BaseVec&>(*gradient_refs_),
+                      "TWF gradient-reference storage")
+        : 0;
+    measured.aggregate_laplacian_reference_slots = laplacian_refs_
+        ? vectorBytes(static_cast<const LaplacianView::BaseVec&>(*laplacian_refs_),
+                      "TWF Laplacian-reference storage")
+        : 0;
+    measured.weighted_ecp_private_ratios =
+        vectorBytes(private_ratios_, "TWF private-ratio storage");
+    measured.weighted_ecp_total_weights =
+        vectorBytes(total_weights_, "TWF total-weight storage");
+    measured.weighted_parameter_derivative_delta = vectorBytes(
+        weighted_derivative_delta_, "TWF derivative-delta storage");
+    measured.weighted_parameter_derivative_views = vectorBytes(
+        weighted_derivative_views_, "TWF derivative-view storage");
+    measured.weighted_value_stamps =
+        vectorBytes(value_stamps_, "TWF value-stamp storage");
+    measured.transaction_flags =
+        vectorBytes(transaction_flags_, "TWF transaction-flag storage");
+    return measured;
+  }
+
+  /// Convert the typed capacity measurement to batch-memory categories.
+  BatchMemoryEstimate measureStorage() const
+  {
+    const auto requirement = measureRequirement();
+    BatchMemoryEstimate measured;
+    measured.add(BatchMemoryCategory::LOGICAL_INPUT_OUTPUT,
+                 {requirement.logicalInputOutputBytes(), 0});
+    measured.add(BatchMemoryCategory::OUTER_TILE_SCRATCH,
+                 {requirement.outerTileScratchBytes(), 0});
+    measured.add(BatchMemoryCategory::PUBLICATION_STAGING,
+                 {requirement.publicationStagingBytes(), 0});
+    measured.add(BatchMemoryCategory::ECP_METADATA,
+                 {requirement.ecpMetadataBytes(), 0});
+    return measured;
+  }
+
+  /// Compare capacities without checked-arithmetic diagnostics after a loan.
+  bool matchesPreparedCapacities() const noexcept
+  {
+    if (!prepared_crowd_plan_ || !component_refs_ || !gradient_refs_ ||
+        !laplacian_refs_)
+      return false;
+    const auto& required = prepared_crowd_plan_->resource_storage;
+    return component_refs_->capacity() *
+                sizeof(std::reference_wrapper<WaveFunctionComponent>) ==
+            required.component_reference_slots &&
+        gradient_refs_->capacity() *
+                sizeof(std::reference_wrapper<ParticleSet::ParticleGradient>) ==
+            required.aggregate_gradient_reference_slots &&
+        laplacian_refs_->capacity() *
+                sizeof(std::reference_wrapper<ParticleSet::ParticleLaplacian>) ==
+            required.aggregate_laplacian_reference_slots &&
+        private_ratios_.capacity() * sizeof(ValueType) ==
+            required.weighted_ecp_private_ratios &&
+        total_weights_.capacity() * sizeof(ValueType) ==
+            required.weighted_ecp_total_weights &&
+        weighted_derivative_delta_.capacity() * sizeof(ValueType) ==
+            required.weighted_parameter_derivative_delta &&
+        weighted_derivative_views_.capacity() *
+                sizeof(ParameterDerivativeView) ==
+            required.weighted_parameter_derivative_views &&
+        value_stamps_.capacity() * sizeof(EvaluationStamp) ==
+            required.weighted_value_stamps &&
+        transaction_flags_.capacity() * sizeof(unsigned char) ==
+            required.transaction_flags;
+  }
+
+  /// Allocate and verify every typed buffer for one crowd descriptor.
+  void materialize(BatchExecutionParticipantPlan plan,
+                   std::size_t crowd_index,
+                   TrialWaveFunctionCrowdMemoryPlan crowd_plan)
+  {
+    const auto& required = crowd_plan.resource_storage;
+    component_refs_.emplace(*component_filler_);
+    gradient_refs_.emplace(gradient_filler_);
+    laplacian_refs_.emplace(laplacian_filler_);
+    const std::size_t reserve = crowd_plan.reserve_walkers;
+    const std::size_t component_slots = checkedBatchMemoryMultiply(
+        reserve, crowd_plan.component_count,
+        "TWF aggregate component-reference extent");
+    component_refs_->reserve(component_slots);
+    gradient_refs_->reserve(reserve);
+    laplacian_refs_->reserve(reserve);
+    for (std::size_t slot = 0; slot < reserve; ++slot)
+    {
+      component_refs_->push_back(*component_filler_);
+      gradient_refs_->push_back(gradient_filler_);
+      laplacian_refs_->push_back(laplacian_filler_);
+    }
+    private_ratios_ = makeExactVector<ValueType>(
+        required.weighted_ecp_private_ratios, "TWF private ratios");
+    total_weights_ = makeExactVector<ValueType>(
+        required.weighted_ecp_total_weights, "TWF total weights");
+    weighted_derivative_delta_ = makeExactVector<ValueType>(
+        required.weighted_parameter_derivative_delta,
+        "TWF weighted derivative delta");
+    weighted_derivative_views_ = makeExactVector<ParameterDerivativeView>(
+        required.weighted_parameter_derivative_views,
+        "TWF weighted derivative views");
+    value_stamps_ = makeExactVector<EvaluationStamp>(
+        required.weighted_value_stamps, "TWF value stamps");
+    transaction_flags_ = makeExactVector<unsigned char>(
+        required.transaction_flags, "TWF transaction flags");
+    bindDerivativeViews(crowd_plan.parameter_derivative_width);
+
+    const auto measured_requirement = measureRequirement();
+    if (!sameRequirement(measured_requirement, required))
+      throw std::length_error(
+          "TrialWaveFunction aggregate resource typed capacities differ from policy");
+    const BatchMemoryEstimate measured = measureStorage();
+    if (!(measured == crowd_plan.expected_resource_storage))
+      throw std::length_error(
+          "TrialWaveFunction aggregate resource categorized bytes differ from policy");
+
+    expected_plan_                = plan;
+    prepared_plan_                = std::move(plan);
+    prepared_crowd_plan_          = std::move(crowd_plan);
+    prepared_crowd_index_         = crowd_index;
+    prepared_plan_fingerprint_    = prepared_plan_.plan().fingerprint();
+    actual_resource_storage_      = measured;
+    prepared_storage_fingerprint_ = storageFingerprint();
+    if (prepared_storage_fingerprint_ == 0)
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource fingerprint is invalid");
+  }
+
+  /// Publish a completely materialized candidate using noexcept moves.
+  void publish(TrialWaveFunctionMultiWalkerResource&& candidate) noexcept
+  {
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::optional<ComponentView>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::optional<GradientView>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::optional<LaplacianView>>);
+    static_assert(std::is_nothrow_move_assignable_v<std::vector<ValueType>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::vector<ParameterDerivativeView>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::vector<EvaluationStamp>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::vector<unsigned char>>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  BatchExecutionParticipantPlan>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  std::optional<TrialWaveFunctionCrowdMemoryPlan>>);
+    static_assert(std::is_nothrow_copy_assignable_v<BatchMemoryEstimate>);
+    component_refs_                    = std::move(candidate.component_refs_);
+    gradient_refs_                     = std::move(candidate.gradient_refs_);
+    laplacian_refs_                    = std::move(candidate.laplacian_refs_);
+    private_ratios_                    = std::move(candidate.private_ratios_);
+    total_weights_                     = std::move(candidate.total_weights_);
+    weighted_derivative_delta_         = std::move(candidate.weighted_derivative_delta_);
+    weighted_derivative_views_         = std::move(candidate.weighted_derivative_views_);
+    value_stamps_                      = std::move(candidate.value_stamps_);
+    transaction_flags_                 = std::move(candidate.transaction_flags_);
+    expected_plan_                     = std::move(candidate.expected_plan_);
+    prepared_plan_                     = std::move(candidate.prepared_plan_);
+    prepared_crowd_plan_               = std::move(candidate.prepared_crowd_plan_);
+    prepared_crowd_index_              = candidate.prepared_crowd_index_;
+    prepared_plan_fingerprint_         = candidate.prepared_plan_fingerprint_;
+    prepared_storage_fingerprint_      = candidate.prepared_storage_fingerprint_;
+    actual_resource_storage_           = candidate.actual_resource_storage_;
+
+    // Reference-wrapper storage was constructed against the temporary
+    // candidate's owned fillers.  Rebind it to this destination resource
+    // before candidate destruction; this touches only O(B) reference slots.
+    resetViews();
+  }
+
+  /// Release all prepared storage and return to reusable no-policy state.
+  void clearToNoPolicy()
+  {
+    component_refs_.reset();
+    gradient_refs_.reset();
+    laplacian_refs_.reset();
+    freeVector(private_ratios_);
+    freeVector(total_weights_);
+    freeVector(weighted_derivative_delta_);
+    freeVector(weighted_derivative_views_);
+    freeVector(value_stamps_);
+    freeVector(transaction_flags_);
+    expected_plan_ = {};
+    prepared_plan_ = {};
+    prepared_crowd_plan_.reset();
+    prepared_crowd_index_ = 0;
+    prepared_plan_fingerprint_ = 0;
+    prepared_storage_fingerprint_ = 0;
+    actual_resource_storage_ = {};
+  }
+
+  /// Restore full reference-view extents using already admitted capacity.
+  void restoreReferenceExtent(std::size_t reserve)
+  {
+    component_refs_->resize(reserve, std::ref(*component_filler_));
+    gradient_refs_->resize(reserve, std::ref(gradient_filler_));
+    laplacian_refs_->resize(reserve, std::ref(laplacian_filler_));
+  }
+
+  /// Restore exact logical staging extents without exceeding prepared capacity.
+  void restoreScratchExtent()
+  {
+    const auto& required = prepared_crowd_plan_->resource_storage;
+    private_ratios_.resize(required.weighted_ecp_private_ratios /
+                           sizeof(ValueType));
+    total_weights_.resize(required.weighted_ecp_total_weights /
+                          sizeof(ValueType));
+    weighted_derivative_delta_.resize(
+        required.weighted_parameter_derivative_delta / sizeof(ValueType));
+    weighted_derivative_views_.resize(
+        required.weighted_parameter_derivative_views /
+        sizeof(ParameterDerivativeView));
+    value_stamps_.resize(required.weighted_value_stamps /
+                         sizeof(EvaluationStamp));
+    transaction_flags_.resize(required.transaction_flags /
+                              sizeof(unsigned char));
+    bindDerivativeViews(prepared_crowd_plan_->parameter_derivative_width);
+  }
+
+  /// Point each derivative row view into its stable slice of the flat buffer.
+  void bindDerivativeViews(std::size_t width) noexcept
+  {
+    for (std::size_t walker = 0; walker < weighted_derivative_views_.size(); ++walker)
+      weighted_derivative_views_[walker] = {
+          width ? weighted_derivative_delta_.data() + walker * width : nullptr,
+          width};
+  }
+
+  /// Return every currently retained heap byte across typed buffers.
+  std::size_t retainedBytes() const
+  {
+    return measureRequirement().totalBytes();
+  }
+
+  /// Hash allocation addresses and capacities for post-publication validation.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](std::uintptr_t value) {
+      hash ^= value;
+      hash *= 1099511628211ULL;
+    };
+    auto mix_vector = [&mix](const auto& values) {
+      mix(reinterpret_cast<std::uintptr_t>(values.data()));
+      mix(values.capacity());
+    };
+    if (component_refs_)
+      mix_vector(static_cast<const ComponentView::BaseVec&>(*component_refs_));
+    if (gradient_refs_)
+      mix_vector(static_cast<const GradientView::BaseVec&>(*gradient_refs_));
+    if (laplacian_refs_)
+      mix_vector(static_cast<const LaplacianView::BaseVec&>(*laplacian_refs_));
+    mix_vector(private_ratios_);
+    mix_vector(total_weights_);
+    mix_vector(weighted_derivative_delta_);
+    mix_vector(weighted_derivative_views_);
+    mix_vector(value_stamps_);
+    mix_vector(transaction_flags_);
+    return hash;
+  }
+
+  WaveFunctionComponent* component_filler_;
+  ParticleSet::ParticleGradient gradient_filler_;
+  ParticleSet::ParticleLaplacian laplacian_filler_;
+  TrialWaveFunctionMemoryPolicyInput policy_input_;
+  BatchExecutionParticipantPlan expected_plan_;
+  BatchExecutionParticipantPlan prepared_plan_;
+  std::optional<TrialWaveFunctionCrowdMemoryPlan> prepared_crowd_plan_;
+  std::size_t prepared_crowd_index_ = 0;
+  std::uint64_t prepared_plan_fingerprint_ = 0;
+  std::size_t prepared_storage_fingerprint_ = 0;
+  BatchMemoryEstimate actual_resource_storage_;
+
+  std::optional<ComponentView> component_refs_;
+  std::optional<GradientView> gradient_refs_;
+  std::optional<LaplacianView> laplacian_refs_;
+  std::vector<ValueType> private_ratios_;
+  std::vector<ValueType> total_weights_;
+  std::vector<ValueType> weighted_derivative_delta_;
+  std::vector<ParameterDerivativeView> weighted_derivative_views_;
+  std::vector<EvaluationStamp> value_stamps_;
+  std::vector<unsigned char> transaction_flags_;
+};
+
+// Snapshot exact aggregate allocation and live team bindings for friend tests.
+TrialWaveFunction::AggregateResourceDiagnostics
+TrialWaveFunction::aggregateResourceDiagnosticsForTesting() const
+{
+  if (!aggregate_mw_resource_handle_)
+    throw std::logic_error(
+        "TrialWaveFunction aggregate resource diagnostics require a live loan");
+  const auto& resource = aggregate_mw_resource_handle_.getResource();
+  AggregateResourceDiagnostics diagnostics;
+  diagnostics.prepared = resource.isPrepared();
+  diagnostics.storage_fingerprint = resource.storageFingerprintForTesting();
+  if (!resource.crowdPlanForTesting())
+    return diagnostics;
+
+  const auto& crowd = *resource.crowdPlanForTesting();
+  const auto measured = resource.measuredRequirementForTesting();
+  diagnostics.plan_identity =
+      &resource.preparedPlanForTesting().plan();
+  diagnostics.crowd_index = resource.preparedCrowdIndexForTesting();
+  diagnostics.reserve_walkers = crowd.reserve_walkers;
+  diagnostics.expected_bytes =
+      crowd.expected_resource_storage.total().host;
+  diagnostics.actual_bytes =
+      resource.actualStorageForTesting().total().host;
+  diagnostics.component_reference_bytes = measured.component_reference_slots;
+  diagnostics.gradient_reference_bytes =
+      measured.aggregate_gradient_reference_slots;
+  diagnostics.laplacian_reference_bytes =
+      measured.aggregate_laplacian_reference_slots;
+  diagnostics.private_ratio_bytes = measured.weighted_ecp_private_ratios;
+  diagnostics.total_weight_bytes = measured.weighted_ecp_total_weights;
+  diagnostics.derivative_delta_bytes =
+      measured.weighted_parameter_derivative_delta;
+  diagnostics.derivative_view_bytes =
+      measured.weighted_parameter_derivative_views;
+  diagnostics.value_stamp_bytes = measured.weighted_value_stamps;
+  diagnostics.transaction_flag_bytes = measured.transaction_flags;
+  const auto& components = static_cast<const TrialWaveFunctionMultiWalkerResource::ComponentView::BaseVec&>(
+      resource.componentView());
+  const auto& gradients = static_cast<const TrialWaveFunctionMultiWalkerResource::GradientView::BaseVec&>(
+      resource.gradientView());
+  const auto& laplacians = static_cast<const TrialWaveFunctionMultiWalkerResource::LaplacianView::BaseVec&>(
+      resource.laplacianView());
+  diagnostics.component_reference_data = components.data();
+  diagnostics.gradient_reference_data = gradients.data();
+  diagnostics.laplacian_reference_data = laplacians.data();
+  diagnostics.component_leader = &resource.componentView().getLeader();
+  diagnostics.gradient_leader = &resource.gradientView().getLeader();
+  diagnostics.laplacian_leader = &resource.laplacianView().getLeader();
+  if (!resource.componentView().empty())
+  {
+    diagnostics.first_component = &resource.componentView()[0];
+    diagnostics.first_gradient = &resource.gradientView()[0];
+    diagnostics.first_laplacian = &resource.laplacianView()[0];
+  }
+  return diagnostics;
+}
+
+// Corrupt retained crowd provenance for a focused fail-closed test.
+void TrialWaveFunction::setAggregateResourceCrowdForTesting(
+    ResourceCollection& collection, std::size_t crowd_index)
+{
+  const std::size_t entry_cursor = collection.getCursor();
+  auto resource =
+      collection.lendResource<TrialWaveFunctionMultiWalkerResource>();
+  resource.getResource().setPreparedCrowdIndexForTesting(crowd_index);
+  collection.rewind(entry_cursor);
+  collection.takebackResource(resource);
+  collection.rewind(entry_cursor);
+}
+
+// Check idle placeholder ownership without publishing a runtime resource loan.
+bool TrialWaveFunction::aggregateResourcePlaceholdersMatchFillersForTesting(
+    ResourceCollection& collection)
+{
+  const std::size_t entry_cursor = collection.getCursor();
+  auto resource =
+      collection.lendResource<TrialWaveFunctionMultiWalkerResource>();
+  const bool matches =
+      resource.getResource().placeholdersMatchDestinationFillersForTesting();
+  collection.rewind(entry_cursor);
+  collection.takebackResource(resource);
+  collection.rewind(entry_cursor);
+  return matches;
+}
 
 static TimerNameList_t<TimerEnum> create_names(std::string_view myName)
 {
@@ -613,6 +1370,39 @@ void TrialWaveFunction::prepareBatchExecutionClone(
   prepared_aggregate_proposed_laplacian_data_ = multi_particle_proposed_laplacian_.data();
   // The participant view is the validity marker and is deliberately published last.
   prepared_aggregate_batch_execution_plan_ = aggregate_plan;
+}
+
+void TrialWaveFunction::validatePreparedBatchExecutionClone(
+    const BatchExecutionParticipantPlan& aggregate_plan) const
+{
+  if (!aggregate_plan ||
+      !prepared_aggregate_batch_execution_plan_.sameBinding(aggregate_plan))
+    throw std::logic_error(
+        "TrialWaveFunction aggregate clone is not prepared for the active plan");
+  if (multi_particle_proposal_pending_)
+    throw std::logic_error(
+        "TrialWaveFunction planned acquisition cannot overlap a pending proposal");
+
+  const std::size_t particle_count = aggregate_plan.plan().particleCount();
+  const auto validate_storage = [particle_count](const auto& storage,
+                                                  const void* identity,
+                                                  std::string_view name) {
+    if (storage.isAttached() || storage.size() != particle_count ||
+        storage.capacity() != particle_count || storage.data() != identity)
+      throw std::logic_error(std::string("TrialWaveFunction prepared ") +
+                             std::string(name) +
+                             " allocation changed before resource acquisition");
+  };
+  validate_storage(G, prepared_aggregate_accepted_gradient_data_,
+                   "accepted gradient");
+  validate_storage(L, prepared_aggregate_accepted_laplacian_data_,
+                   "accepted Laplacian");
+  validate_storage(multi_particle_proposed_gradient_,
+                   prepared_aggregate_proposed_gradient_data_,
+                   "proposed gradient");
+  validate_storage(multi_particle_proposed_laplacian_,
+                   prepared_aggregate_proposed_laplacian_data_,
+                   "proposed Laplacian");
 }
 
 void TrialWaveFunction::prepareBatchExecutionClones()
@@ -2380,6 +3170,33 @@ void TrialWaveFunction::evaluateRatiosAlltoOne(ParticleSet& P, std::vector<Value
 
 void TrialWaveFunction::createResource(ResourceCollection& collection) const
 {
+  if (batch_execution_plan_)
+  {
+    BatchMemoryContribution sole_child;
+    const BatchMemoryContribution* sole_child_ptr = nullptr;
+    bool sole_child_atomic = false;
+    if (Z.size() == 1)
+    {
+      const auto& evidence = bound_batch_topology_.sole_component_plan.evidence();
+      sole_child.logical_maximum    = evidence.logical_maximum;
+      sole_child.owner_multiplicity = evidence.owner_multiplicity;
+      sole_child.fully_accounted    = evidence.fully_accounted;
+      sole_child_ptr                = &sole_child;
+      sole_child_atomic             = Z.front()->supportsAtomicBatchPublication();
+    }
+    const TrialWaveFunctionMemoryPolicyInput policy_input =
+        makeTrialWaveFunctionMemoryPolicyInput(
+            Z.size(), use_tasking_, static_cast<bool>(twf_fastderiv_),
+            complete_batch_memory_accounting_for_testing_, sole_child_ptr,
+            sole_child_atomic);
+    // Production accounting claims remain false.  In particular, target spin
+    // capability is not yet fingerprinted here; the complete-claims override is
+    // confined to friend tests until that later driver boundary supplies it.
+    collection.addResource(std::make_unique<TrialWaveFunctionMultiWalkerResource>(
+        Z.empty() ? nullptr : Z.front().get(), policy_input,
+        bound_batch_topology_.aggregate_plan));
+  }
+
   for (int i = 0; i < Z.size(); ++i)
     Z[i]->createResource(collection);
 
@@ -2395,13 +3212,127 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
   if (wf_leader.resource_acquired_)
     throw std::logic_error(
         "TrialWaveFunction resources are already acquired for the leader");
+  if (wf_leader.aggregate_mw_resource_handle_)
+    throw std::logic_error(
+        "TrialWaveFunction leader retained a stale aggregate resource handle");
+  if (wf_leader.acquired_resource_collection_)
+    throw std::logic_error(
+        "TrialWaveFunction leader retained stale ResourceCollection provenance");
   if (!wf_leader.acquired_batch_topology_.sameState({}))
     throw std::logic_error(
         "TrialWaveFunction leader retained a stale resource-acquisition topology");
 
-  wf_leader.validateRetainedBatchExecutionBinding();
+  const BatchResourcePreparationProvenance& provenance =
+      collection.getBatchResourcePreparationProvenance();
+  if (wf_leader.batch_execution_plan_)
+  {
+    const InlineBatchTopologyState leader_topology =
+        wf_leader.bound_batch_topology_;
+    if (provenance.state != BatchResourcePreparationState::PREPARED ||
+        provenance.plan.get() != wf_leader.batch_execution_plan_.get())
+      throw std::logic_error(
+          "TrialWaveFunction planned acquisition requires its prepared ResourceCollection");
+    if (wf_leader.Z.size() != 1 || wf_leader.use_tasking_ ||
+        wf_leader.twf_fastderiv_ || !leader_topology.engaged ||
+        leader_topology.component_count != 1 ||
+        !leader_topology.aggregate_plan ||
+        !leader_topology.sole_component_plan ||
+        &leader_topology.aggregate_plan.plan() !=
+            wf_leader.batch_execution_plan_.get() ||
+        &leader_topology.sole_component_plan.plan() !=
+            wf_leader.batch_execution_plan_.get())
+      throw std::logic_error(
+          "TrialWaveFunction planned acquisition requires the direct C==1 topology");
+    const auto& reserves = trialWaveFunctionReserveWalkersPerCrowd(
+        provenance.plan->topology());
+    if (provenance.crowd_index >= reserves.size() ||
+        wf_list.size() > reserves[provenance.crowd_index])
+      throw std::length_error(
+          "TrialWaveFunction live crowd exceeds its planned reserve");
+
+    wf_leader.validatePreparedBatchExecutionClone(
+        leader_topology.aggregate_plan);
+    if (!wf_leader.Z.front()->hasBatchExecutionPlanBinding(
+            leader_topology.sole_component_plan) ||
+        !wf_leader.Z.front()->hasPreparedBatchExecutionClone(
+            leader_topology.sole_component_plan))
+      throw std::logic_error(
+          "TrialWaveFunction leader child lacks exact planned preparation");
+    for (TrialWaveFunction& wavefunction : wf_list)
+    {
+      if (wavefunction.resource_acquired_ ||
+          !wavefunction.acquired_batch_topology_.sameState({}))
+        throw std::logic_error(
+            "TrialWaveFunction clone already owns resources or stale acquisition state");
+      if (wavefunction.batch_execution_plan_.get() !=
+              wf_leader.batch_execution_plan_.get() ||
+          !wavefunction.bound_batch_topology_.sameState(leader_topology) ||
+          wavefunction.Z.size() != 1 || wavefunction.use_tasking_ ||
+          wavefunction.twf_fastderiv_)
+        throw std::invalid_argument(
+            "TrialWaveFunction planned resource lanes have incompatible provenance");
+      wavefunction.validatePreparedBatchExecutionClone(
+          leader_topology.aggregate_plan);
+      if (!wavefunction.Z.front()->hasBatchExecutionPlanBinding(
+              leader_topology.sole_component_plan) ||
+          !wavefunction.Z.front()->hasPreparedBatchExecutionClone(
+              leader_topology.sole_component_plan))
+        throw std::logic_error(
+            "TrialWaveFunction resource lane child lacks exact planned preparation");
+    }
+
+    const std::size_t aggregate_slot = collection.getCursor();
+    auto aggregate =
+        collection.lendResource<TrialWaveFunctionMultiWalkerResource>();
+    try
+    {
+      aggregate.getResource().validateAcquiredBinding(
+          leader_topology.aggregate_plan, provenance.crowd_index,
+          wf_list.size());
+      aggregate.getResource().bindViews(wf_list);
+      wf_leader.Z.front()->acquireResource(
+          collection, aggregate.getResource().componentView());
+    }
+    catch (...)
+    {
+      const std::exception_ptr failure = std::current_exception();
+      aggregate.getResource().resetViews();
+      collection.rewind(aggregate_slot);
+      collection.takebackResource(aggregate);
+      collection.rewind(aggregate_slot);
+      std::rethrow_exception(failure);
+    }
+
+    // No throwing operation follows child acquisition: either every owner is
+    // live or no lane publishes acquisition state.
+    static_assert(std::is_nothrow_copy_assignable_v<InlineBatchTopologyState>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  ResourceHandle<TrialWaveFunctionMultiWalkerResource>>);
+    wf_leader.aggregate_resource_cursor_ = aggregate_slot;
+    wf_leader.child_resource_cursor_     = aggregate_slot + 1;
+    wf_leader.final_resource_cursor_     = collection.getCursor();
+    wf_leader.acquired_resource_outstanding_loans_ =
+        collection.getOutstandingLoanCount();
+    wf_leader.acquired_resource_collection_ = &collection;
+    wf_leader.aggregate_mw_resource_handle_ = std::move(aggregate);
+    wf_leader.acquired_batch_topology_       = leader_topology;
+    wf_leader.resource_acquired_             = true;
+    for (TrialWaveFunction& wavefunction : wf_list)
+    {
+      wavefunction.acquired_batch_topology_ = leader_topology;
+      wavefunction.resource_acquired_       = true;
+    }
+    return;
+  }
+
   const InlineBatchTopologyState leader_topology =
       wf_leader.captureBatchTopologyState(wf_leader.batch_execution_plan_);
+  wf_leader.validateRetainedBatchExecutionBinding();
+
+  if (provenance.state != BatchResourcePreparationState::UNPREPARED ||
+      provenance.plan)
+    throw std::logic_error(
+        "TrialWaveFunction no-policy acquisition received planned ResourceCollection storage");
 
   // Collect fixed-size acquisition snapshots before the first resource loan.
   // Publishing them after successful acquisition is then allocation-free and
@@ -2505,7 +3436,7 @@ void TrialWaveFunction::acquireResource(ResourceCollection& collection,
     for (const auto& [wavefunction, topology] : acquired_topologies)
     {
       wavefunction->acquired_batch_topology_ = topology;
-      wavefunction->resource_acquired_ = true;
+      wavefunction->resource_acquired_       = true;
     }
   }
   catch (...)
@@ -2539,6 +3470,88 @@ void TrialWaveFunction::releaseResource(ResourceCollection& collection,
   if (!wf_leader.resource_acquired_)
     throw std::logic_error(
         "TrialWaveFunction resources are not acquired for the leader");
+  if (wf_leader.batch_execution_plan_)
+  {
+    if (wf_leader.acquired_resource_collection_ != &collection ||
+        collection.getOutstandingLoanCount() !=
+            wf_leader.acquired_resource_outstanding_loans_)
+      throw std::logic_error(
+          "TrialWaveFunction release received the wrong or changed ResourceCollection");
+    if (!wf_leader.aggregate_mw_resource_handle_)
+      throw std::logic_error(
+          "TrialWaveFunction aggregate resource handle is not acquired");
+    const InlineBatchTopologyState leader_topology =
+        wf_leader.bound_batch_topology_;
+    if (!wf_leader.acquired_batch_topology_.sameState(leader_topology) ||
+        wf_leader.multi_particle_proposal_pending_)
+      throw std::logic_error(
+          "TrialWaveFunction planned release found changed state or a pending proposal");
+    wf_leader.validatePreparedBatchExecutionClone(
+        leader_topology.aggregate_plan);
+    if (!wf_leader.Z.front()->hasBatchExecutionPlanBinding(
+            leader_topology.sole_component_plan) ||
+        !wf_leader.Z.front()->hasPreparedBatchExecutionClone(
+            leader_topology.sole_component_plan))
+      throw std::logic_error(
+          "TrialWaveFunction planned release found stale leader-child provenance");
+    for (TrialWaveFunction& wavefunction : wf_list)
+    {
+      if (!wavefunction.resource_acquired_ ||
+          !wavefunction.acquired_batch_topology_.sameState(leader_topology) ||
+          !wavefunction.bound_batch_topology_.sameState(leader_topology) ||
+          wavefunction.batch_execution_plan_.get() !=
+              wf_leader.batch_execution_plan_.get() ||
+          wavefunction.multi_particle_proposal_pending_)
+        throw std::logic_error(
+            "TrialWaveFunction planned release found incompatible lane state");
+      wavefunction.validatePreparedBatchExecutionClone(
+          leader_topology.aggregate_plan);
+      if (!wavefunction.Z.front()->hasBatchExecutionPlanBinding(
+              leader_topology.sole_component_plan) ||
+          !wavefunction.Z.front()->hasPreparedBatchExecutionClone(
+              leader_topology.sole_component_plan))
+        throw std::logic_error(
+            "TrialWaveFunction planned release found stale lane-child provenance");
+    }
+
+    auto& aggregate =
+        wf_leader.aggregate_mw_resource_handle_.getResource();
+    if (!aggregate.sameBoundTeam(wf_list))
+      throw std::invalid_argument(
+          "TrialWaveFunction release requires the exact acquired lane order");
+    const std::size_t aggregate_slot = wf_leader.aggregate_resource_cursor_;
+    const std::size_t child_slot     = wf_leader.child_resource_cursor_;
+    const std::size_t expected_final = wf_leader.final_resource_cursor_;
+    collection.rewind(child_slot);
+    wf_leader.Z.front()->releaseResource(collection,
+                                         aggregate.componentView());
+    const std::size_t final_cursor = collection.getCursor();
+    if (final_cursor != expected_final)
+      throw std::logic_error(
+          "TrialWaveFunction child release did not consume its exact resource segment");
+    aggregate.resetViews();
+    collection.rewind(aggregate_slot);
+    collection.takebackResource(wf_leader.aggregate_mw_resource_handle_);
+    collection.rewind(final_cursor);
+
+    wf_leader.acquired_batch_topology_.clear();
+    wf_leader.resource_acquired_                    = false;
+    wf_leader.aggregate_resource_cursor_            = 0;
+    wf_leader.child_resource_cursor_                = 0;
+    wf_leader.final_resource_cursor_                = 0;
+    wf_leader.acquired_resource_outstanding_loans_ = 0;
+    wf_leader.acquired_resource_collection_        = nullptr;
+    for (TrialWaveFunction& wavefunction : wf_list)
+    {
+      wavefunction.acquired_batch_topology_.clear();
+      wavefunction.resource_acquired_ = false;
+    }
+    return;
+  }
+
+  if (wf_leader.aggregate_mw_resource_handle_)
+    throw std::logic_error(
+        "TrialWaveFunction no-policy release retained an aggregate resource handle");
 
   const InlineBatchTopologyState leader_topology =
       wf_leader.captureBatchTopologyState(wf_leader.batch_execution_plan_);
@@ -2610,7 +3623,8 @@ void TrialWaveFunction::releaseResource(ResourceCollection& collection,
       wrapper_list->push_back(*wavefunction.twf_fastderiv_);
   }
 
-  // Release WFC resources
+  // Preserve the historical no-policy choreography: callers position the
+  // collection cursor before release and components return their own slots.
   for (int i = 0; i < wf_leader.Z.size(); ++i)
     wf_leader.Z[i]->releaseResource(collection, wfc_lists[i]);
 
@@ -2678,11 +3692,14 @@ void TrialWaveFunction::initializeTWFFastDerivWrapper(const ParticleSet& P, TWFF
 }
 
 
-// Add debug checks in getOrCreateTWFFastDerivWrapper
+// Lazily build the fast-derivative topology only before any plan or loan fixes it.
 TWFFastDerivWrapper& TrialWaveFunction::getOrCreateTWFFastDerivWrapper(const ParticleSet& P)
 {
   if (!twf_fastderiv_)
   {
+    if (resource_acquired_ || batch_execution_plan_)
+      throw std::logic_error(
+          "Cannot add a fast-derivative wrapper while resources or a batch plan are active");
     twf_fastderiv_ = std::make_unique<TWFFastDerivWrapper>();
     initializeTWFFastDerivWrapper(P, *twf_fastderiv_);
   }

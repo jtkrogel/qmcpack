@@ -1748,6 +1748,20 @@ BatchMemoryContribution PsiFormerWF::estimateBatchExecutionMemory(
       makeBatchMemoryPolicyInput(), context);
 }
 
+// Check the retained participant identity without rebuilding plan evidence.
+bool PsiFormerWF::hasBatchExecutionPlanBinding(
+    const BatchExecutionParticipantPlan& plan) const noexcept
+{
+  return batch_execution_plan_.sameBinding(plan);
+}
+
+// Check exact clone-local preparation provenance without touching storage.
+bool PsiFormerWF::hasPreparedBatchExecutionClone(
+    const BatchExecutionParticipantPlan& plan) const noexcept
+{
+  return prepared_clone_batch_execution_plan_.sameBinding(plan);
+}
+
 // Check a prospective participant view completely before noexcept publication.
 void PsiFormerWF::validateBatchExecutionPlanBinding(
     const BatchExecutionParticipantPlan& participant_plan) const

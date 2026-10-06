@@ -536,6 +536,20 @@ public:
    */
   virtual bool supportsAtomicBatchPublication() const noexcept { return false; }
 
+  /** Test one already-published participant binding without allocation. */
+  virtual bool hasBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan& plan) const noexcept
+  {
+    return !plan;
+  }
+
+  /** Test exact clone preparation provenance without rebuilding evidence. */
+  virtual bool hasPreparedBatchExecutionClone(
+      const BatchExecutionParticipantPlan& plan) const noexcept
+  {
+    return !plan;
+  }
+
   /** Validate a prospective immutable participant binding without mutation. */
   virtual void validateBatchExecutionPlanBinding(
       const BatchExecutionParticipantPlan&) const
@@ -559,7 +573,9 @@ public:
                                const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const
   {}
 
-  /** return a shared resource to a collection
+  /** Return shared resources to a collection.
+   * Planned implementations that can throw must leave every child loan intact
+   * on failure so their owning TrialWaveFunction can retry the exact release.
    */
   virtual void releaseResource(ResourceCollection& collection,
                                const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const

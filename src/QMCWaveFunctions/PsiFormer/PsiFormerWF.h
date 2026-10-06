@@ -464,6 +464,14 @@ public:
   BatchMemoryContribution estimateBatchExecutionMemory(
       const BatchExecutionPlanningContext& context) const override;
 
+  /// Check the retained participant identity without rebuilding plan evidence.
+  bool hasBatchExecutionPlanBinding(
+      const BatchExecutionParticipantPlan& plan) const noexcept override;
+
+  /// Check that exact clone-local preparation was published for one plan view.
+  bool hasPreparedBatchExecutionClone(
+      const BatchExecutionParticipantPlan& plan) const noexcept override;
+
   /// Validate an immutable participant view and its exact selected evidence.
   void validateBatchExecutionPlanBinding(
       const BatchExecutionParticipantPlan& plan) const override;
