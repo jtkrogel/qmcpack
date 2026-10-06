@@ -782,6 +782,115 @@ private:
     TILE_CAPACITY
   };
 
+  /// Identify one planned walker-buffer contract without borrowing crowd state.
+  enum class PlannedWalkerBufferOperation
+  {
+    REGISTER,
+    READ,
+    WRITE
+  };
+
+  /// Select one reversible inspection-only mutation between Phase A and B.
+  enum class PlannedWalkerBufferBetweenPhaseFaultForTesting
+  {
+    NONE,
+    STORAGE_POINTER,
+    BULK_CURSOR,
+    RECORD_CONTENT,
+    PARTICLE_INPUT,
+    PLAN_BINDING,
+    LAYOUT_EVIDENCE,
+    PREPARED_STORAGE_EVIDENCE
+  };
+
+  /// Classify a completely validated persistent component record.
+  enum class WalkerBufferRecordClassification : std::uint8_t
+  {
+    RESTORABLE,
+    VALID_ZERO,
+    VALID_STALE,
+    MALFORMED
+  };
+
+  /** Capture both independent PooledMemory cursors and immutable storage evidence.
+   * Pointer-derived offsets are populated only after numeric provenance checks.
+   * The caller must retain exclusive ownership of this buffer lane while the
+   * snapshot is inspected; fingerprints cannot make concurrent mutation safe.
+   */
+  struct WalkerBufferCursorSnapshot
+  {
+    PlannedWalkerBufferOperation operation =
+        PlannedWalkerBufferOperation::REGISTER;
+    const WFBufferType* buffer = nullptr;
+    const BatchExecutionPlan* plan_identity = nullptr;
+    const char* data = nullptr;
+    const FullPrecRealType* scalar_data = nullptr;
+    std::size_t size = 0;
+    std::size_t capacity = 0;
+    std::size_t bulk_cursor = 0;
+    std::size_t scalar_cursor = 0;
+    std::size_t scalar_offset = 0;
+    std::size_t scalar_capacity = 0;
+    bool attached_storage = false;
+    std::uint64_t plan_fingerprint = 0;
+    std::uint64_t layout_fingerprint = 0;
+    std::uint64_t configuration_identity = 0;
+    std::uint64_t storage_fingerprint = 0;
+    std::uint64_t input_fingerprint = 0;
+  };
+
+  /** Hold checked nonowning byte ranges and decoded persistent metadata.
+   * No pointer in this view is dereferenced as a typed object.
+   */
+  struct WalkerBufferRecordView
+  {
+    WalkerBufferCursorSnapshot cursor;
+    const char* gradient_data = nullptr;
+    const char* laplacian_data = nullptr;
+    const char* scalar_data = nullptr;
+    std::size_t gradient_payload_bytes = 0;
+    std::size_t laplacian_payload_bytes = 0;
+    std::size_t scalar_payload_bytes = 0;
+    std::size_t next_bulk_cursor = 0;
+    std::size_t next_scalar_cursor = 0;
+    std::uint64_t magic = 0;
+    std::uint64_t schema = 0;
+    std::uint64_t requirement = 0;
+    std::uint64_t model_identity = 0;
+    std::uint64_t parameter_version = 0;
+    std::uint64_t configuration_identity = 0;
+    std::uint64_t electron_count = 0;
+    double sign = 0.0;
+    double log_magnitude = 0.0;
+    double phase = 0.0;
+    std::uint64_t content_fingerprint = 0;
+    WalkerBufferRecordClassification classification =
+        WalkerBufferRecordClassification::MALFORMED;
+  };
+
+  /// Select one transient malformed snapshot or nonowning range for unit tests.
+  enum class PlannedWalkerBufferFaultForTesting
+  {
+    NULL_BACKING,
+    NULL_SCALAR,
+    SIZE_EXCEEDS_CAPACITY,
+    ATTACHED_STORAGE,
+    MISALIGNED_BACKING,
+    SCALAR_BEFORE_BACKING,
+    SCALAR_AFTER_BACKING,
+    MISALIGNED_SCALAR,
+    MISALIGNED_BULK_CURSOR,
+    BULK_CURSOR_BEYOND_DOMAIN,
+    SCALAR_CURSOR_BEYOND_DOMAIN,
+    BULK_CURSOR_OVERFLOW,
+    SCALAR_CURSOR_OVERFLOW,
+    TRUNCATED_BULK,
+    TRUNCATED_SCALAR,
+    ACCEPTED_STORAGE_ALIAS,
+    PROPOSED_STORAGE_ALIAS,
+    PARTICLE_STORAGE_ALIAS
+  };
+
   /// Fixed metadata published by the lifecycle-only selected proposal seam.
   struct PlannedSelectedProposalEvidence
   {
@@ -1018,6 +1127,29 @@ private:
   void setPreparedScalarWorkspaceFaultForTesting(
       PreparedScalarWorkspaceFaultForTesting fault);
 
+  /// Inspect one typed preflight without parsing or changing either cursor.
+  WalkerBufferCursorSnapshot inspectPlannedWalkerBufferPreflightForTesting(
+      PlannedWalkerBufferOperation operation,
+      const ParticleSet& particles,
+      const WFBufferType& buffer) const;
+
+  /// Parse one planned read record without advancing cursors or publishing state.
+  WalkerBufferRecordView inspectPlannedWalkerBufferForTesting(
+      const ParticleSet& particles,
+      const WFBufferType& buffer) const;
+
+  /// Inject one reversible mutation inside the actual two-phase inspection flow.
+  void probePlannedWalkerBufferBetweenPhaseFaultForTesting(
+      ParticleSet& particles,
+      WFBufferType& buffer,
+      PlannedWalkerBufferBetweenPhaseFaultForTesting fault);
+
+  /// Exercise one reversible malformed snapshot or range through production checks.
+  void probePlannedWalkerBufferFaultForTesting(
+      const ParticleSet& particles,
+      const WFBufferType& buffer,
+      PlannedWalkerBufferFaultForTesting fault) const;
+
   /// Report opaque identity and numeric capacity for one acquired crowd resource.
   testing::PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnosticsForTesting(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
@@ -1108,6 +1240,40 @@ private:
   /// Add cached component G/L contributions to caller-owned wavefunction accumulators.
   void accumulateAcceptedSpatial(ParticleSet::ParticleGradient& gradient,
                                  ParticleSet::ParticleLaplacian& laplacian) const;
+
+  /// Prove clone, plan, ParticleSet, and cursor evidence for one buffer contract.
+  WalkerBufferCursorSnapshot requirePlannedWalkerBufferOperation(
+      PlannedWalkerBufferOperation operation,
+      const ParticleSet& particles,
+      const WFBufferType& buffer) const;
+
+  /// Validate allocated PooledMemory domains and derive their checked scalar extent.
+  WalkerBufferCursorSnapshot validateWalkerBufferCursorSnapshot(
+      WalkerBufferCursorSnapshot snapshot) const;
+
+  /// Hash exact operation, PooledMemory identity, cursors, and prepared layout.
+  static WalkerBufferCursorSnapshot fingerprintWalkerBufferCursorSnapshot(
+      WalkerBufferCursorSnapshot snapshot) noexcept;
+
+  /// Decode and classify one complete record without mutating either cursor.
+  WalkerBufferRecordView parsePlannedWalkerBufferRecord(
+      const ParticleSet& particles,
+      WalkerBufferCursorSnapshot snapshot) const;
+
+  /// Apply authoritative version/configuration evidence to a valid record.
+  static WalkerBufferRecordView classifyPlannedWalkerBufferRecord(
+      WalkerBufferRecordView record,
+      std::size_t authoritative_parameter_version);
+
+  /// Reject overlap between record ranges and component or ParticleSet storage.
+  void requireDisjointWalkerBufferRecord(
+      const ParticleSet& particles,
+      const WalkerBufferRecordView& record) const;
+
+  /// Require an exact Phase-B match to one earlier cursor and record observation.
+  static void requireSameWalkerBufferObservation(
+      const WalkerBufferRecordView& expected,
+      const WalkerBufferRecordView& observed);
 
   /// Serialize the complete accepted-state record at the current buffer cursor.
   void putAcceptedState(WFBufferType& buffer) const;

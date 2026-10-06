@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -122,6 +123,82 @@ public:
     COMPONENT_ALIAS,
     PARTICLE_ALIAS,
     VIRTUAL_PARTICLE_ALIAS
+  };
+
+  /// Public spelling of each successful planned walker-record classification.
+  enum class WalkerBufferClassification
+  {
+    RESTORABLE,
+    VALID_ZERO,
+    VALID_STALE
+  };
+
+  /// Public mirror of the private reversible walker-buffer fault selector.
+  enum class PlannedWalkerBufferFault
+  {
+    NULL_BACKING,
+    NULL_SCALAR,
+    SIZE_EXCEEDS_CAPACITY,
+    ATTACHED_STORAGE,
+    MISALIGNED_BACKING,
+    SCALAR_BEFORE_BACKING,
+    SCALAR_AFTER_BACKING,
+    MISALIGNED_SCALAR,
+    MISALIGNED_BULK_CURSOR,
+    BULK_CURSOR_BEYOND_DOMAIN,
+    SCALAR_CURSOR_BEYOND_DOMAIN,
+    BULK_CURSOR_OVERFLOW,
+    SCALAR_CURSOR_OVERFLOW,
+    TRUNCATED_BULK,
+    TRUNCATED_SCALAR,
+    ACCEPTED_STORAGE_ALIAS,
+    PROPOSED_STORAGE_ALIAS,
+    PARTICLE_STORAGE_ALIAS
+  };
+
+  /// Public mirror of each private typed walker-buffer preflight.
+  enum class PlannedWalkerBufferOperation
+  {
+    REGISTER,
+    READ,
+    WRITE
+  };
+
+  /// Public mirror of inspection-only mutations injected between both phases.
+  enum class PlannedWalkerBufferBetweenPhaseFault
+  {
+    STORAGE_POINTER,
+    BULK_CURSOR,
+    RECORD_CONTENT,
+    PARTICLE_INPUT,
+    PLAN_BINDING,
+    LAYOUT_EVIDENCE,
+    PREPARED_STORAGE_EVIDENCE
+  };
+
+  /// Copy the immutable cursor and fingerprint evidence from one typed preflight.
+  struct WalkerBufferPreflightInspection
+  {
+    std::size_t bulk_cursor;
+    std::size_t scalar_cursor;
+    std::uint64_t storage_fingerprint;
+    std::uint64_t input_fingerprint;
+  };
+
+  /// Copy only immutable parser observations needed by the public regression.
+  struct WalkerBufferInspection
+  {
+    WalkerBufferClassification classification =
+        WalkerBufferClassification::VALID_STALE;
+    std::size_t next_bulk_cursor;
+    std::size_t next_scalar_cursor;
+    std::uint64_t schema;
+    std::uint64_t requirement;
+    std::uint64_t parameter_version;
+    std::uint64_t configuration_identity;
+    std::uint64_t storage_fingerprint;
+    std::uint64_t input_fingerprint;
+    std::uint64_t content_fingerprint;
   };
 
   /// Report the scalar evaluator workspaces currently owned by one component clone.
@@ -229,6 +306,192 @@ public:
     default:
       return {};
     }
+  }
+
+  /// Inspect one planned walker record without exposing its nonowning byte ranges.
+  static WalkerBufferInspection inspectPlannedWalkerBuffer(
+      const PsiFormerWF& component,
+      const ParticleSet& particles,
+      const PsiFormerWF::WFBufferType& buffer)
+  {
+    const auto record =
+        component.inspectPlannedWalkerBufferForTesting(particles, buffer);
+    WalkerBufferClassification classification =
+        WalkerBufferClassification::VALID_STALE;
+    switch (record.classification)
+    {
+    case PsiFormerWF::WalkerBufferRecordClassification::RESTORABLE:
+      classification = WalkerBufferClassification::RESTORABLE;
+      break;
+    case PsiFormerWF::WalkerBufferRecordClassification::VALID_ZERO:
+      classification = WalkerBufferClassification::VALID_ZERO;
+      break;
+    case PsiFormerWF::WalkerBufferRecordClassification::VALID_STALE:
+      classification = WalkerBufferClassification::VALID_STALE;
+      break;
+    case PsiFormerWF::WalkerBufferRecordClassification::MALFORMED:
+      throw std::logic_error(
+          "PsiFormer planned walker parser returned a malformed record");
+    default:
+      throw std::logic_error(
+          "PsiFormer planned walker parser returned an unknown classification");
+    }
+
+    return {classification,
+            record.next_bulk_cursor,
+            record.next_scalar_cursor,
+            record.schema,
+            record.requirement,
+            record.parameter_version,
+            record.configuration_identity,
+            record.cursor.storage_fingerprint,
+            record.cursor.input_fingerprint,
+            record.content_fingerprint};
+  }
+
+  /// Inspect one private REGISTER, READ, or WRITE preflight without parsing.
+  static WalkerBufferPreflightInspection inspectPlannedWalkerBufferPreflight(
+      const PsiFormerWF& component,
+      const ParticleSet& particles,
+      const PsiFormerWF::WFBufferType& buffer,
+      PlannedWalkerBufferOperation operation)
+  {
+    using PrivateOperation = PsiFormerWF::PlannedWalkerBufferOperation;
+    PrivateOperation private_operation = PrivateOperation::REGISTER;
+    switch (operation)
+    {
+    case PlannedWalkerBufferOperation::REGISTER:
+      private_operation = PrivateOperation::REGISTER;
+      break;
+    case PlannedWalkerBufferOperation::READ:
+      private_operation = PrivateOperation::READ;
+      break;
+    case PlannedWalkerBufferOperation::WRITE:
+      private_operation = PrivateOperation::WRITE;
+      break;
+    default:
+      throw std::logic_error(
+          "PsiFormer test received an unknown walker-buffer operation");
+    }
+    const auto snapshot =
+        component.inspectPlannedWalkerBufferPreflightForTesting(
+            private_operation, particles, buffer);
+    return {snapshot.bulk_cursor, snapshot.scalar_cursor,
+            snapshot.storage_fingerprint, snapshot.input_fingerprint};
+  }
+
+  /// Inject one reversible mutation inside the actual Phase-A/Phase-B flow.
+  static void probePlannedWalkerBufferBetweenPhaseFault(
+      PsiFormerWF& component,
+      ParticleSet& particles,
+      PsiFormerWF::WFBufferType& buffer,
+      PlannedWalkerBufferBetweenPhaseFault fault)
+  {
+    using PrivateFault =
+        PsiFormerWF::PlannedWalkerBufferBetweenPhaseFaultForTesting;
+    PrivateFault private_fault = PrivateFault::NONE;
+    switch (fault)
+    {
+    case PlannedWalkerBufferBetweenPhaseFault::STORAGE_POINTER:
+      private_fault = PrivateFault::STORAGE_POINTER;
+      break;
+    case PlannedWalkerBufferBetweenPhaseFault::BULK_CURSOR:
+      private_fault = PrivateFault::BULK_CURSOR;
+      break;
+    case PlannedWalkerBufferBetweenPhaseFault::RECORD_CONTENT:
+      private_fault = PrivateFault::RECORD_CONTENT;
+      break;
+    case PlannedWalkerBufferBetweenPhaseFault::PARTICLE_INPUT:
+      private_fault = PrivateFault::PARTICLE_INPUT;
+      break;
+    case PlannedWalkerBufferBetweenPhaseFault::PLAN_BINDING:
+      private_fault = PrivateFault::PLAN_BINDING;
+      break;
+    case PlannedWalkerBufferBetweenPhaseFault::LAYOUT_EVIDENCE:
+      private_fault = PrivateFault::LAYOUT_EVIDENCE;
+      break;
+    case PlannedWalkerBufferBetweenPhaseFault::PREPARED_STORAGE_EVIDENCE:
+      private_fault = PrivateFault::PREPARED_STORAGE_EVIDENCE;
+      break;
+    default:
+      throw std::logic_error(
+          "PsiFormer test received an unknown between-phase fault");
+    }
+    component.probePlannedWalkerBufferBetweenPhaseFaultForTesting(
+        particles, buffer, private_fault);
+  }
+
+  /// Exercise one private structural or alias fault through production checks.
+  static void probePlannedWalkerBufferFault(
+      const PsiFormerWF& component,
+      const ParticleSet& particles,
+      const PsiFormerWF::WFBufferType& buffer,
+      PlannedWalkerBufferFault fault)
+  {
+    using PrivateFault = PsiFormerWF::PlannedWalkerBufferFaultForTesting;
+    PrivateFault private_fault = PrivateFault::NULL_BACKING;
+    switch (fault)
+    {
+    case PlannedWalkerBufferFault::NULL_BACKING:
+      private_fault = PrivateFault::NULL_BACKING;
+      break;
+    case PlannedWalkerBufferFault::NULL_SCALAR:
+      private_fault = PrivateFault::NULL_SCALAR;
+      break;
+    case PlannedWalkerBufferFault::SIZE_EXCEEDS_CAPACITY:
+      private_fault = PrivateFault::SIZE_EXCEEDS_CAPACITY;
+      break;
+    case PlannedWalkerBufferFault::ATTACHED_STORAGE:
+      private_fault = PrivateFault::ATTACHED_STORAGE;
+      break;
+    case PlannedWalkerBufferFault::MISALIGNED_BACKING:
+      private_fault = PrivateFault::MISALIGNED_BACKING;
+      break;
+    case PlannedWalkerBufferFault::SCALAR_BEFORE_BACKING:
+      private_fault = PrivateFault::SCALAR_BEFORE_BACKING;
+      break;
+    case PlannedWalkerBufferFault::SCALAR_AFTER_BACKING:
+      private_fault = PrivateFault::SCALAR_AFTER_BACKING;
+      break;
+    case PlannedWalkerBufferFault::MISALIGNED_SCALAR:
+      private_fault = PrivateFault::MISALIGNED_SCALAR;
+      break;
+    case PlannedWalkerBufferFault::MISALIGNED_BULK_CURSOR:
+      private_fault = PrivateFault::MISALIGNED_BULK_CURSOR;
+      break;
+    case PlannedWalkerBufferFault::BULK_CURSOR_BEYOND_DOMAIN:
+      private_fault = PrivateFault::BULK_CURSOR_BEYOND_DOMAIN;
+      break;
+    case PlannedWalkerBufferFault::SCALAR_CURSOR_BEYOND_DOMAIN:
+      private_fault = PrivateFault::SCALAR_CURSOR_BEYOND_DOMAIN;
+      break;
+    case PlannedWalkerBufferFault::BULK_CURSOR_OVERFLOW:
+      private_fault = PrivateFault::BULK_CURSOR_OVERFLOW;
+      break;
+    case PlannedWalkerBufferFault::SCALAR_CURSOR_OVERFLOW:
+      private_fault = PrivateFault::SCALAR_CURSOR_OVERFLOW;
+      break;
+    case PlannedWalkerBufferFault::TRUNCATED_BULK:
+      private_fault = PrivateFault::TRUNCATED_BULK;
+      break;
+    case PlannedWalkerBufferFault::TRUNCATED_SCALAR:
+      private_fault = PrivateFault::TRUNCATED_SCALAR;
+      break;
+    case PlannedWalkerBufferFault::ACCEPTED_STORAGE_ALIAS:
+      private_fault = PrivateFault::ACCEPTED_STORAGE_ALIAS;
+      break;
+    case PlannedWalkerBufferFault::PROPOSED_STORAGE_ALIAS:
+      private_fault = PrivateFault::PROPOSED_STORAGE_ALIAS;
+      break;
+    case PlannedWalkerBufferFault::PARTICLE_STORAGE_ALIAS:
+      private_fault = PrivateFault::PARTICLE_STORAGE_ALIAS;
+      break;
+    default:
+      throw std::logic_error(
+          "PsiFormer walker parser test received an unknown fault");
+    }
+    component.probePlannedWalkerBufferFaultForTesting(particles, buffer,
+                                                       private_fault);
   }
 
   /// Capture every scalar accepted/proposal field and its fixed backing store.
@@ -609,6 +872,66 @@ struct ScalarVirtualParticleStateSnapshot
   int reference_source_particle = -1;
   bool on_sphere = false;
 };
+
+/** Preserve both independent PooledMemory cursors, allocation identities, and
+ * exact bytes around one nonmutating planned walker-record inspection. */
+struct WalkerBufferStateSnapshot
+{
+  std::size_t bulk_cursor;
+  std::size_t scalar_cursor;
+  const char* data;
+  const QMCTraits::FullPrecRealType* scalar_data;
+  std::size_t size;
+  std::size_t capacity;
+  std::vector<char> bytes;
+};
+
+/// Capture a valid allocated walker buffer without invoking scalar_offset().
+WalkerBufferStateSnapshot captureWalkerBufferState(
+    const PsiFormerWF::WFBufferType& buffer)
+{
+  WalkerBufferStateSnapshot snapshot{buffer.current(),
+                                     buffer.current_scalar(),
+                                     buffer.myData.data(),
+                                     buffer.Scalar_ptr,
+                                     buffer.myData.size(),
+                                     buffer.myData.capacity(),
+                                     {}};
+  if (snapshot.size != 0)
+    snapshot.bytes.assign(snapshot.data, snapshot.data + snapshot.size);
+  return snapshot;
+}
+
+/// Require that parsing or a rejected parser probe changed no caller storage.
+void checkWalkerBufferState(const PsiFormerWF::WFBufferType& buffer,
+                            const WalkerBufferStateSnapshot& expected)
+{
+  CHECK(buffer.current() == expected.bulk_cursor);
+  CHECK(buffer.current_scalar() == expected.scalar_cursor);
+  CHECK(buffer.myData.data() == expected.data);
+  CHECK(buffer.Scalar_ptr == expected.scalar_data);
+  CHECK(buffer.myData.size() == expected.size);
+  CHECK(buffer.myData.capacity() == expected.capacity);
+  REQUIRE(buffer.myData.size() == expected.bytes.size());
+  for (std::size_t byte = 0; byte < expected.bytes.size(); ++byte)
+    CHECK(buffer.myData[byte] == expected.bytes[byte]);
+}
+
+/** Write one persistent uint64 field in the exact two-limb representation used
+ * by PsiFormer walker records. */
+void setWalkerBufferInteger(PsiFormerWF::WFBufferType& buffer,
+                            std::size_t scalar_entry,
+                            std::size_t first_limb,
+                            std::uint64_t value)
+{
+  using Scalar = QMCTraits::FullPrecRealType;
+  static_assert(std::numeric_limits<Scalar>::digits >= 32);
+  REQUIRE(buffer.Scalar_ptr != nullptr);
+  buffer.Scalar_ptr[scalar_entry + first_limb] =
+      static_cast<Scalar>(value & UINT64_C(0xffffffff));
+  buffer.Scalar_ptr[scalar_entry + first_limb + 1] =
+      static_cast<Scalar>(value >> 32);
+}
 
 /// Compare one floating or complex scalar without normalizing signed zero or NaN payloads.
 template<class T>
@@ -2326,6 +2649,448 @@ TEST_CASE("PsiFormer prepares exact Boundary-32 walker layout evidence",
     CHECK(rebound.accountedBytes() == prepared.accountedBytes());
     CHECK(rebound.ownedWorkspaceCount() == prepared.ownedWorkspaceCount());
     CHECK_FALSE(component.hasPreparedBatchExecutionClone(participant_plan));
+  }
+}
+
+TEST_CASE("PsiFormer planned walker parser classifies records without mutation",
+          "[wavefunction][psiformer][batch_memory][walker_parser]")
+{
+  using Classification =
+      testing::TestPsiFormerWF::WalkerBufferClassification;
+  using Fault = testing::TestPsiFormerWF::PlannedWalkerBufferFault;
+  using BetweenPhaseFault =
+      testing::TestPsiFormerWF::PlannedWalkerBufferBetweenPhaseFault;
+  using Operation =
+      testing::TestPsiFormerWF::PlannedWalkerBufferOperation;
+  using Scalar = QMCTraits::FullPrecRealType;
+
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  std::unique_ptr<ParticleSet> ions = makeLiHIons(simulation_cell);
+  PsiFormerWF component("pf_planned_walker_parser",
+                        files.parameters.string(),
+                        files.configuration.string());
+  component.validateSystem(electrons, *ions, "all_electron");
+  electrons.update();
+
+  // Build a legacy record between independent prefix and suffix records.  The
+  // parser must hash only this component slice while preserving outer bytes.
+  PsiFormerWF::WFBufferType buffer;
+  PsiFormerWF::GradType prefix_gradient;
+  PsiFormerWF::GradType suffix_gradient;
+  for (std::size_t dimension = 0; dimension < OHMMS_DIM; ++dimension)
+  {
+    prefix_gradient[dimension] = ValueType(0.125 * (dimension + 1));
+    suffix_gradient[dimension] = ValueType(-0.25 * (dimension + 1));
+  }
+  std::array<Scalar, 2> prefix_scalars{Scalar(3.25), Scalar(-1.75)};
+  std::array<Scalar, 2> suffix_scalars{Scalar(-7.5), Scalar(9.125)};
+  buffer.add(&prefix_gradient, &prefix_gradient + 1);
+  for (Scalar& scalar : prefix_scalars)
+    buffer.add(scalar);
+  const std::size_t component_bulk_entry = buffer.current();
+  const std::size_t component_scalar_entry = buffer.current_scalar();
+  component.registerData(electrons, buffer);
+  const std::size_t component_bulk_end = buffer.current();
+  const std::size_t component_scalar_end = buffer.current_scalar();
+  buffer.add(&suffix_gradient, &suffix_gradient + 1);
+  for (Scalar& scalar : suffix_scalars)
+    buffer.add(scalar);
+  buffer.allocate();
+
+  buffer.rewind();
+  buffer.put(&prefix_gradient, &prefix_gradient + 1);
+  for (Scalar& scalar : prefix_scalars)
+    buffer.put(scalar);
+  REQUIRE(buffer.current() == component_bulk_entry);
+  REQUIRE(buffer.current_scalar() == component_scalar_entry);
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  component.updateBuffer(electrons, buffer, false);
+  REQUIRE(buffer.current() == component_bulk_end);
+  REQUIRE(buffer.current_scalar() == component_scalar_end);
+  buffer.put(&suffix_gradient, &suffix_gradient + 1);
+  for (Scalar& scalar : suffix_scalars)
+    buffer.put(scalar);
+  buffer.rewind(component_bulk_entry, component_scalar_entry);
+
+  BatchExecutionRequirements requirements;
+  component.contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::BUFFER_READ);
+  requirements.require(BatchExecutionMode::BUFFER_WRITE);
+  const std::string participant_id = "test/psiformer/walker-parser";
+  const auto plan = makeClonePreparationTestPlan(
+      component, requirements, participant_id, "walker-parser-v1");
+  const BatchExecutionParticipantPlan participant_plan =
+      makeBatchExecutionParticipantPlan(plan, participant_id);
+  component.bindBatchExecutionPlan(participant_plan);
+  component.prepareBatchExecutionClone(participant_plan);
+
+  const auto workspace =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  const pf::WalkerBufferLayout layout = workspace.prepared_walker_buffer_layout;
+  REQUIRE_FALSE(layout.empty());
+  REQUIRE(component_bulk_end - component_bulk_entry == layout.bulk_bytes);
+  REQUIRE(component_scalar_end - component_scalar_entry ==
+          layout.scalar_count);
+
+  // Exercise all three typed preflights. Registration uses a nonzero aligned
+  // sizing prefix, while READ and WRITE observe the same allocated record but
+  // retain operation-distinct storage identities.
+  PsiFormerWF::WFBufferType sizing_buffer;
+  sizing_buffer.add(&prefix_gradient, &prefix_gradient + 1);
+  for (Scalar& scalar : prefix_scalars)
+    sizing_buffer.add(scalar);
+  const auto registration_preflight =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBufferPreflight(
+          component, electrons, sizing_buffer, Operation::REGISTER);
+  const auto read_preflight =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBufferPreflight(
+          component, electrons, buffer, Operation::READ);
+  const auto write_preflight =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBufferPreflight(
+          component, electrons, buffer, Operation::WRITE);
+  CHECK(registration_preflight.bulk_cursor == component_bulk_entry);
+  CHECK(registration_preflight.scalar_cursor == component_scalar_entry);
+  CHECK(registration_preflight.storage_fingerprint != 0);
+  CHECK(registration_preflight.input_fingerprint != 0);
+  CHECK(read_preflight.bulk_cursor == component_bulk_entry);
+  CHECK(read_preflight.scalar_cursor == component_scalar_entry);
+  CHECK(write_preflight.bulk_cursor == component_bulk_entry);
+  CHECK(write_preflight.scalar_cursor == component_scalar_entry);
+  CHECK(registration_preflight.storage_fingerprint !=
+        write_preflight.storage_fingerprint);
+  CHECK(read_preflight.storage_fingerprint !=
+        write_preflight.storage_fingerprint);
+
+  PsiFormerWF::WFBufferType second_sizing_buffer;
+  second_sizing_buffer.add(&prefix_gradient, &prefix_gradient + 1);
+  for (Scalar& scalar : prefix_scalars)
+    second_sizing_buffer.add(scalar);
+  const auto second_registration_preflight =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBufferPreflight(
+          component, electrons, second_sizing_buffer, Operation::REGISTER);
+  CHECK(second_registration_preflight.storage_fingerprint !=
+        registration_preflight.storage_fingerprint);
+
+  sizing_buffer.rewind(component_bulk_entry + layout.alignment,
+                       component_scalar_entry + 1);
+  const auto shifted_registration_preflight =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBufferPreflight(
+          component, electrons, sizing_buffer, Operation::REGISTER);
+  CHECK(shifted_registration_preflight.storage_fingerprint !=
+        registration_preflight.storage_fingerprint);
+  sizing_buffer.rewind(component_bulk_entry, component_scalar_entry);
+
+  const WalkerBufferStateSnapshot sizing_before =
+      captureWalkerBufferState(sizing_buffer);
+  sizing_buffer.rewind(component_bulk_entry + 1, component_scalar_entry);
+  CHECK_THROWS_WITH(
+      testing::TestPsiFormerWF::inspectPlannedWalkerBufferPreflight(
+          component, electrons, sizing_buffer, Operation::REGISTER),
+      Catch::Matchers::ContainsSubstring("registration cursor is misaligned"));
+  sizing_buffer.rewind(component_bulk_entry, component_scalar_entry);
+  checkWalkerBufferState(sizing_buffer, sizing_before);
+
+  const testing::PsiFormerScalarStateSnapshot component_before =
+      testing::TestPsiFormerWF::scalarStateSnapshot(component);
+  const ScalarParticleStateSnapshot particles_before =
+      captureScalarParticleState(electrons);
+  const auto require_isolated = [&](const PsiFormerWF::WFBufferType& candidate,
+                                    const WalkerBufferStateSnapshot& before) {
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(component,
+                                                        component_before));
+    checkScalarParticleState(electrons, particles_before);
+    checkWalkerBufferState(candidate, before);
+  };
+
+  const WalkerBufferStateSnapshot valid_before =
+      captureWalkerBufferState(buffer);
+  const auto current = testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+      component, electrons, buffer);
+  CHECK(current.classification == Classification::RESTORABLE);
+  CHECK(current.next_bulk_cursor == component_bulk_end);
+  CHECK(current.next_scalar_cursor == component_scalar_end);
+  CHECK(current.storage_fingerprint != 0);
+  CHECK(current.input_fingerprint != 0);
+  CHECK(current.content_fingerprint != 0);
+  require_isolated(buffer, valid_before);
+
+  // Bytes owned by neighboring components are outside the content identity.
+  const std::size_t scalar_offset = static_cast<std::size_t>(
+      reinterpret_cast<const char*>(buffer.Scalar_ptr) -
+      buffer.myData.data());
+  REQUIRE(component_bulk_entry > 0);
+  REQUIRE(component_bulk_end < scalar_offset);
+  const std::size_t scalar_capacity =
+      (buffer.myData.size() - scalar_offset) / sizeof(Scalar);
+  REQUIRE(component_scalar_entry == prefix_scalars.size());
+  REQUIRE(component_scalar_end + suffix_scalars.size() <= scalar_capacity);
+  const char prefix_byte = buffer.myData[0];
+  const char suffix_byte = buffer.myData[component_bulk_end];
+  const std::array<Scalar, 2> outer_prefix_scalars{
+      buffer.Scalar_ptr[0], buffer.Scalar_ptr[1]};
+  const std::array<Scalar, 2> outer_suffix_scalars{
+      buffer.Scalar_ptr[component_scalar_end],
+      buffer.Scalar_ptr[component_scalar_end + 1]};
+  buffer.myData[0] ^= char{0x1};
+  buffer.myData[component_bulk_end] ^= char{0x2};
+  buffer.Scalar_ptr[0] += Scalar(1);
+  buffer.Scalar_ptr[1] -= Scalar(2);
+  buffer.Scalar_ptr[component_scalar_end] -= Scalar(3);
+  buffer.Scalar_ptr[component_scalar_end + 1] += Scalar(4);
+  const auto outside_slice =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+          component, electrons, buffer);
+  CHECK(outside_slice.storage_fingerprint == current.storage_fingerprint);
+  CHECK(outside_slice.input_fingerprint == current.input_fingerprint);
+  CHECK(outside_slice.content_fingerprint == current.content_fingerprint);
+  buffer.myData[0] = prefix_byte;
+  buffer.myData[component_bulk_end] = suffix_byte;
+  buffer.Scalar_ptr[0] = outer_prefix_scalars[0];
+  buffer.Scalar_ptr[1] = outer_prefix_scalars[1];
+  buffer.Scalar_ptr[component_scalar_end] = outer_suffix_scalars[0];
+  buffer.Scalar_ptr[component_scalar_end + 1] = outer_suffix_scalars[1];
+  require_isolated(buffer, valid_before);
+
+  // An entirely zero component record is the one canonical registration
+  // sentinel.  Every aligned bulk byte, including padding, participates.
+  PsiFormerWF::WFBufferType zero_record(buffer);
+  std::memset(zero_record.myData.data() + component_bulk_entry, 0,
+              layout.bulk_bytes);
+  std::memset(zero_record.Scalar_ptr + component_scalar_entry, 0,
+              layout.scalar_count * sizeof(Scalar));
+  const WalkerBufferStateSnapshot zero_before =
+      captureWalkerBufferState(zero_record);
+  const auto zero = testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+      component, electrons, zero_record);
+  CHECK(zero.classification == Classification::VALID_ZERO);
+  CHECK(zero.next_bulk_cursor == component_bulk_end);
+  CHECK(zero.next_scalar_cursor == component_scalar_end);
+  require_isolated(zero_record, zero_before);
+
+  // Structurally valid but nonrestorable metadata must classify as stale,
+  // including both INVALID/VALUE requirements and canonical zero amplitude.
+  const auto require_stale = [&](PsiFormerWF::WFBufferType& stale_record) {
+    const WalkerBufferStateSnapshot stale_before =
+        captureWalkerBufferState(stale_record);
+    const auto inspected =
+        testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+            component, electrons, stale_record);
+    CHECK(inspected.classification == Classification::VALID_STALE);
+    require_isolated(stale_record, stale_before);
+  };
+
+  PsiFormerWF::WFBufferType invalid_requirement(buffer);
+  setWalkerBufferInteger(invalid_requirement, component_scalar_entry, 4, 0);
+  require_stale(invalid_requirement);
+
+  PsiFormerWF::WFBufferType value_requirement(buffer);
+  setWalkerBufferInteger(value_requirement, component_scalar_entry, 4, 1);
+  require_stale(value_requirement);
+
+  PsiFormerWF::WFBufferType stale_version(buffer);
+  setWalkerBufferInteger(stale_version, component_scalar_entry, 8,
+                         current.parameter_version + 1);
+  require_stale(stale_version);
+
+  PsiFormerWF::WFBufferType stale_configuration(buffer);
+  setWalkerBufferInteger(stale_configuration, component_scalar_entry, 10,
+                         current.configuration_identity ^ UINT64_C(1));
+  require_stale(stale_configuration);
+
+  PsiFormerWF::WFBufferType zero_amplitude(buffer);
+  zero_amplitude.Scalar_ptr[component_scalar_entry + 14] = Scalar(0);
+  zero_amplitude.Scalar_ptr[component_scalar_entry + 15] =
+      -std::numeric_limits<Scalar>::infinity();
+  zero_amplitude.Scalar_ptr[component_scalar_entry + 16] = Scalar(0);
+  require_stale(zero_amplitude);
+
+  // A live coordinate change leaves the record structurally valid but stale,
+  // and changes only the input fingerprint domain after AoS/SoA resynchronization.
+  const ParticleSet::PosType original_position = electrons.R[0];
+  electrons.R[0][0] = original_position[0] + ParticleSet::RealType(0.03125);
+  electrons.update();
+  const ScalarParticleStateSnapshot moved_particles =
+      captureScalarParticleState(electrons);
+  const auto moved_configuration =
+      testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+          component, electrons, buffer);
+  CHECK(moved_configuration.classification == Classification::VALID_STALE);
+  CHECK(moved_configuration.storage_fingerprint == current.storage_fingerprint);
+  CHECK(moved_configuration.content_fingerprint == current.content_fingerprint);
+  CHECK(moved_configuration.input_fingerprint != current.input_fingerprint);
+  CHECK(testing::TestPsiFormerWF::scalarStateMatches(component,
+                                                      component_before));
+  checkScalarParticleState(electrons, moved_particles);
+  checkWalkerBufferState(buffer, valid_before);
+  electrons.R[0] = original_position;
+  electrons.update();
+  require_isolated(buffer, valid_before);
+
+  // Wrong schemas, partial zero sentinels, malformed limbs, nonfinite bulk
+  // products, and incoherent amplitudes are malformed rather than stale.
+  const auto require_malformed = [&](PsiFormerWF::WFBufferType& malformed,
+                                     const char* message) {
+    const WalkerBufferStateSnapshot malformed_before =
+        captureWalkerBufferState(malformed);
+    CHECK_THROWS_WITH(
+        testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+            component, electrons, malformed),
+        Catch::Matchers::ContainsSubstring(message));
+    require_isolated(malformed, malformed_before);
+  };
+
+  PsiFormerWF::WFBufferType wrong_schema(buffer);
+  setWalkerBufferInteger(wrong_schema, component_scalar_entry, 2,
+                         current.schema + 1);
+  require_malformed(wrong_schema, "schema is unsupported");
+
+  PsiFormerWF::WFBufferType partial_zero(zero_record);
+  partial_zero.myData[component_bulk_entry] = char{1};
+  require_malformed(partial_zero, "partial zero sentinel");
+
+  const std::size_t gradient_payload_bytes =
+      layout.electrons * sizeof(PsiFormerWF::GradType);
+  const std::size_t laplacian_payload_bytes =
+      layout.electrons * sizeof(ValueType);
+  if (layout.gradient_bytes > gradient_payload_bytes ||
+      layout.laplacian_bytes > laplacian_payload_bytes)
+  {
+    PsiFormerWF::WFBufferType nonzero_padding(zero_record);
+    const std::size_t padding_offset =
+        layout.gradient_bytes > gradient_payload_bytes
+        ? gradient_payload_bytes
+        : layout.laplacian_offset + laplacian_payload_bytes;
+    nonzero_padding.myData[component_bulk_entry + padding_offset] = char{1};
+    require_malformed(nonzero_padding, "partial zero sentinel");
+  }
+
+  PsiFormerWF::WFBufferType fractional_magic(buffer);
+  fractional_magic.Scalar_ptr[component_scalar_entry] = Scalar(0.5);
+  require_malformed(fractional_magic, "fractional magic limb");
+
+  PsiFormerWF::WFBufferType negative_zero_magic(buffer);
+  const std::uint64_t negative_zero_bits = UINT64_C(0x8000000000000000);
+  static_assert(sizeof(negative_zero_bits) == sizeof(Scalar));
+  std::memcpy(negative_zero_magic.Scalar_ptr + component_scalar_entry,
+              std::addressof(negative_zero_bits), sizeof(negative_zero_bits));
+  require_malformed(negative_zero_magic, "invalid magic limb");
+
+  PsiFormerWF::WFBufferType negative_zero_amplitude(buffer);
+  std::memcpy(
+      negative_zero_amplitude.Scalar_ptr + component_scalar_entry + 14,
+      std::addressof(negative_zero_bits), sizeof(negative_zero_bits));
+  negative_zero_amplitude.Scalar_ptr[component_scalar_entry + 15] =
+      -std::numeric_limits<Scalar>::infinity();
+  negative_zero_amplitude.Scalar_ptr[component_scalar_entry + 16] =
+      Scalar(0);
+  require_malformed(negative_zero_amplitude, "amplitude is invalid");
+
+  PsiFormerWF::WFBufferType nonfinite_gradient(buffer);
+  PsiFormerWF::GradType bad_gradient;
+  bad_gradient = ValueType(0);
+  bad_gradient[0] =
+      ValueType(std::numeric_limits<double>::quiet_NaN());
+  std::memcpy(nonfinite_gradient.myData.data() + component_bulk_entry,
+              std::addressof(bad_gradient), sizeof(bad_gradient));
+  require_malformed(nonfinite_gradient, "non-finite gradient");
+
+  PsiFormerWF::WFBufferType invalid_amplitude(buffer);
+  invalid_amplitude.Scalar_ptr[component_scalar_entry + 14] = Scalar(0);
+  invalid_amplitude.Scalar_ptr[component_scalar_entry + 15] = Scalar(-1);
+  invalid_amplitude.Scalar_ptr[component_scalar_entry + 16] = Scalar(0);
+  require_malformed(invalid_amplitude, "amplitude is invalid");
+
+  // Each inspection-only mutation occurs after the real Phase-A parse and
+  // before Phase B recaptures its evidence. RAII restoration makes the same
+  // record immediately retryable without rewinding or re-preparing.
+  struct BetweenPhaseCase
+  {
+    BetweenPhaseFault fault;
+    const char* message;
+  };
+  constexpr std::array<BetweenPhaseCase, 7> between_phase_cases{
+      BetweenPhaseCase{BetweenPhaseFault::STORAGE_POINTER,
+                       "storage has no scalar region"},
+      BetweenPhaseCase{BetweenPhaseFault::BULK_CURSOR,
+                       "bulk cursor overflowed"},
+      BetweenPhaseCase{BetweenPhaseFault::RECORD_CONTENT,
+                       "record content changed after Phase A"},
+      BetweenPhaseCase{BetweenPhaseFault::PARTICLE_INPUT,
+                       "input evidence changed after Phase A"},
+      BetweenPhaseCase{BetweenPhaseFault::PLAN_BINDING,
+                       "has no bound batch plan"},
+      BetweenPhaseCase{BetweenPhaseFault::LAYOUT_EVIDENCE,
+                       "requires an exactly prepared clone"},
+      BetweenPhaseCase{BetweenPhaseFault::PREPARED_STORAGE_EVIDENCE,
+                       "requires an exactly prepared clone"}};
+  const auto workspace_before_between_phase =
+      testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+  for (const BetweenPhaseCase& phase_case : between_phase_cases)
+  {
+    CAPTURE(static_cast<int>(phase_case.fault));
+    CHECK_THROWS_WITH(
+        testing::TestPsiFormerWF::probePlannedWalkerBufferBetweenPhaseFault(
+            component, electrons, buffer, phase_case.fault),
+        Catch::Matchers::ContainsSubstring(phase_case.message));
+    require_isolated(buffer, valid_before);
+    checkScalarWorkspaceStorage(
+        testing::TestPsiFormerWF::directWorkspaceDiagnostics(component),
+        workspace_before_between_phase);
+    CHECK(testing::TestPsiFormerWF::hasBatchExecutionPlan(component));
+
+    const auto retry =
+        testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+            component, electrons, buffer);
+    CHECK(retry.classification == Classification::RESTORABLE);
+    CHECK(retry.storage_fingerprint == current.storage_fingerprint);
+    CHECK(retry.input_fingerprint == current.input_fingerprint);
+    CHECK(retry.content_fingerprint == current.content_fingerprint);
+    require_isolated(buffer, valid_before);
+  }
+
+  // Prepared-layout corruption and every structural/alias seam are rejected
+  // against a snapshot, leaving the live PooledMemory object untouched.
+  pf::WalkerBufferLayout wrong_layout = layout;
+  ++wrong_layout.total_bytes;
+  testing::TestPsiFormerWF::setPreparedWalkerBufferLayout(component,
+                                                           wrong_layout);
+  CHECK_THROWS(testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+      component, electrons, buffer));
+  require_isolated(buffer, valid_before);
+  testing::TestPsiFormerWF::setPreparedWalkerBufferLayout(component, layout);
+  CHECK(testing::TestPsiFormerWF::inspectPlannedWalkerBuffer(
+            component, electrons, buffer)
+            .classification == Classification::RESTORABLE);
+  require_isolated(buffer, valid_before);
+
+  const std::array<Fault, 18> faults{
+      Fault::NULL_BACKING,
+      Fault::NULL_SCALAR,
+      Fault::SIZE_EXCEEDS_CAPACITY,
+      Fault::ATTACHED_STORAGE,
+      Fault::MISALIGNED_BACKING,
+      Fault::SCALAR_BEFORE_BACKING,
+      Fault::SCALAR_AFTER_BACKING,
+      Fault::MISALIGNED_SCALAR,
+      Fault::MISALIGNED_BULK_CURSOR,
+      Fault::BULK_CURSOR_BEYOND_DOMAIN,
+      Fault::SCALAR_CURSOR_BEYOND_DOMAIN,
+      Fault::BULK_CURSOR_OVERFLOW,
+      Fault::SCALAR_CURSOR_OVERFLOW,
+      Fault::TRUNCATED_BULK,
+      Fault::TRUNCATED_SCALAR,
+      Fault::ACCEPTED_STORAGE_ALIAS,
+      Fault::PROPOSED_STORAGE_ALIAS,
+      Fault::PARTICLE_STORAGE_ALIAS};
+  for (const Fault fault : faults)
+  {
+    CAPTURE(static_cast<int>(fault));
+    CHECK_THROWS(testing::TestPsiFormerWF::probePlannedWalkerBufferFault(
+        component, electrons, buffer, fault));
+    require_isolated(buffer, valid_before);
   }
 }
 
