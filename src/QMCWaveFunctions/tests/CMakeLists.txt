@@ -398,6 +398,28 @@ if(BUILD_MICRO_BENCHMARKS)
   endif()
   target_include_directories(benchmark_psiformer_threading PRIVATE "${qmcpack_SOURCE_DIR}/src")
 
+  # Short fixed-population optimization smoke benchmark.  External portable
+  # PsiFormer exports are supplied by the developer, so timing is never a CTest
+  # pass/fail threshold and no large model artifact belongs in the source tree.
+  add_executable(benchmark_psiformer_optimization benchmark_psiformer_optimization.cpp)
+  target_link_libraries(
+    benchmark_psiformer_optimization
+    qmcdriver
+    qmcwfs
+    IO::HDF5
+    platform_LA
+    platform_runtime)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      benchmark_psiformer_optimization
+      qmcutil
+      qmcparticle
+      qmcparticle_omptarget
+      qmcwfs_omptarget)
+  endif()
+  target_include_directories(
+    benchmark_psiformer_optimization PRIVATE "${qmcpack_SOURCE_DIR}/src")
+
   # Native executor workspaces cannot share a target with qmcwfs because the
   # restricted PsiFormerNative implementation header is instantiated inside
   # PsiFormerWF.cpp.  Build the scalar scenarios separately and let the launcher
