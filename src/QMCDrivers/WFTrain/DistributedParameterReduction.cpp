@@ -130,13 +130,25 @@ std::vector<std::array<std::uint64_t, field_count>> gatherRecords(
 template<std::size_t field_count>
 std::size_t firstContributionMismatch(
     const std::vector<std::array<std::uint64_t, field_count>>& records,
-    std::size_t sample_count_field) noexcept
+    std::size_t sample_count_field,
+    std::size_t clip_count_field,
+    std::size_t consumed_count_field) noexcept
 {
   for (std::size_t rank = 1; rank < records.size(); ++rank)
     for (std::size_t field = 1; field < field_count; ++field)
-      if (field != sample_count_field && records.front()[field] != records[rank][field])
+      if (field != sample_count_field && field != clip_count_field &&
+          field != consumed_count_field &&
+          records.front()[field] != records[rank][field])
         return rank;
   return records.size();
+}
+
+/// Return the binary64 representation used in fixed clipping metadata records.
+std::uint64_t doubleBits(double value) noexcept
+{
+  std::uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
 }
 
 /// Rethrow a useful local exception or issue one rank-uniform distributed diagnostic.
@@ -264,7 +276,9 @@ void DistributedParameterReduction::reduce(
   {
     const bool finite_scalars = std::isfinite(accumulator.weight_sum_) &&
         isFinite(accumulator.weighted_energy_sum_) &&
-        std::isfinite(accumulator.weighted_energy_norm_sum_);
+        std::isfinite(accumulator.weighted_energy_norm_sum_) &&
+        (!accumulator.clipping_descriptor_ ||
+         isFinite(accumulator.clipped_weighted_energy_sum_));
     const auto all_finite = [](const std::vector<DerivativeValue>& values) {
       return std::all_of(values.begin(), values.end(), isFinite);
     };
@@ -272,9 +286,15 @@ void DistributedParameterReduction::reduce(
         !all_finite(accumulator.weighted_energy_score_sum_) ||
         !all_finite(accumulator.weighted_energy_derivative_sum_))
       reason = ConsensusReason::NONFINITE_CONTRIBUTION;
+    if (accumulator.clipping_descriptor_ &&
+        accumulator.clipping_consumed_sample_count_ != accumulator.sample_count_)
+      reason = ConsensusReason::INCOMPLETE_CONTRIBUTION;
   }
 
-  const std::array<std::uint64_t, 10> local_record{
+  const EnergyClippingDescriptor* clipping = accumulator.clipping_descriptor_
+      ? &*accumulator.clipping_descriptor_
+      : nullptr;
+  const std::array<std::uint64_t, 21> local_record{
       static_cast<std::uint64_t>(reason),
       protocol_version,
       accumulator.local_energy_term_mask_,
@@ -284,7 +304,18 @@ void DistributedParameterReduction::reduce(
       static_cast<std::uint64_t>(accumulator.estimator_),
       hashString(accumulator.schema_fingerprint_),
       accumulator.parameter_version_,
-      static_cast<std::uint64_t>(accumulator.adjoint_)};
+      static_cast<std::uint64_t>(accumulator.adjoint_),
+      clipping != nullptr,
+      clipping ? clipping->identity : 0,
+      clipping ? static_cast<std::uint64_t>(clipping->policy.scale_rule) : 0,
+      clipping ? clipping->population : 0,
+      clipping ? doubleBits(clipping->policy.width_multiplier) : 0,
+      clipping ? doubleBits(clipping->policy.residual_quantile) : 0,
+      clipping ? doubleBits(clipping->center) : 0,
+      clipping ? doubleBits(clipping->scale) : 0,
+      clipping ? doubleBits(clipping->width) : 0,
+      accumulator.clipped_sample_count_,
+      accumulator.clipping_consumed_sample_count_};
   const auto records = gatherRecords(communicator_, local_record);
 
   const std::size_t failed_rank = firstFailedRank(records);
@@ -295,7 +326,7 @@ void DistributedParameterReduction::reduce(
                           static_cast<ConsensusReason>(records[failed_rank][0]),
                           failed_rank == 0 ? local_failure : std::exception_ptr{}, records.size());
   }
-  const std::size_t mismatch_rank = firstContributionMismatch(records, 5);
+  const std::size_t mismatch_rank = firstContributionMismatch(records, 5, 19, 20);
   if (mismatch_rank != records.size())
   {
     accumulator.abort();
@@ -305,6 +336,8 @@ void DistributedParameterReduction::reduce(
   // Counts are gathered exactly before floating-point collectives so overflow and a
   // globally empty population are diagnosed uniformly without unsigned wraparound.
   std::uint64_t global_sample_count = 0;
+  std::uint64_t global_clipped_sample_count = 0;
+  std::uint64_t global_clipping_consumed_count = 0;
   for (const auto& record : records)
   {
     if (record[5] > std::numeric_limits<std::uint64_t>::max() - global_sample_count)
@@ -313,12 +346,30 @@ void DistributedParameterReduction::reduce(
       throw std::overflow_error("Distributed energy-gradient sample count overflow");
     }
     global_sample_count += record[5];
+    if (record[19] > std::numeric_limits<std::uint64_t>::max() -
+            global_clipped_sample_count ||
+        record[20] > std::numeric_limits<std::uint64_t>::max() -
+            global_clipping_consumed_count)
+    {
+      accumulator.abort();
+      throw std::overflow_error("Distributed energy-gradient clipping count overflow");
+    }
+    global_clipped_sample_count += record[19];
+    global_clipping_consumed_count += record[20];
   }
   if (global_sample_count == 0 ||
       global_sample_count > std::numeric_limits<std::size_t>::max())
   {
     accumulator.abort();
     throw std::runtime_error("Distributed energy-gradient population is globally empty or too large");
+  }
+  if (clipping &&
+      (global_clipping_consumed_count != global_sample_count ||
+       global_sample_count != clipping->population))
+  {
+    accumulator.abort();
+    throw std::runtime_error(
+        "Distributed energy clipping transform did not consume its complete population");
   }
 
   try
@@ -329,6 +380,8 @@ void DistributedParameterReduction::reduce(
       communicator_->allreduce_in_place(&accumulator.weight_sum_, 1);
       communicator_->allreduce_in_place(&accumulator.weighted_energy_sum_, 1);
       communicator_->allreduce_in_place(&accumulator.weighted_energy_norm_sum_, 1);
+      if (clipping)
+        communicator_->allreduce_in_place(&accumulator.clipped_weighted_energy_sum_, 1);
 
       for (std::size_t offset = 0; offset < accumulator.parameterCount();
            offset += policy_.maximum_chunk_size)
@@ -352,7 +405,8 @@ void DistributedParameterReduction::reduce(
 
   const bool finite_scalars = std::isfinite(accumulator.weight_sum_) &&
       isFinite(accumulator.weighted_energy_sum_) &&
-      std::isfinite(accumulator.weighted_energy_norm_sum_);
+      std::isfinite(accumulator.weighted_energy_norm_sum_) &&
+      (!clipping || isFinite(accumulator.clipped_weighted_energy_sum_));
   const auto all_finite = [](const std::vector<DerivativeValue>& values) {
     return std::all_of(values.begin(), values.end(), isFinite);
   };
@@ -365,6 +419,10 @@ void DistributedParameterReduction::reduce(
   }
 
   accumulator.sample_count_     = static_cast<std::size_t>(global_sample_count);
+  accumulator.clipped_sample_count_ =
+      static_cast<std::size_t>(global_clipped_sample_count);
+  accumulator.clipping_consumed_sample_count_ =
+      static_cast<std::size_t>(global_clipping_consumed_count);
   accumulator.reduction_domain_ = ReductionDomain::GLOBAL;
 }
 

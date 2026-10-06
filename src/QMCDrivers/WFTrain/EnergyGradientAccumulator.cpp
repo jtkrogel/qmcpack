@@ -168,6 +168,10 @@ void EnergyGradientAccumulator::clearRawSums() noexcept
   weight_sum_ = 0.0;
   weighted_energy_sum_ = 0.0;
   weighted_energy_norm_sum_ = 0.0;
+  clipped_weighted_energy_sum_ = 0.0;
+  clipping_descriptor_.reset();
+  clipping_consumed_sample_count_ = 0;
+  clipped_sample_count_ = 0;
   std::fill(weighted_score_sum_.begin(), weighted_score_sum_.end(), DerivativeValue{});
   std::fill(weighted_energy_score_sum_.begin(), weighted_energy_score_sum_.end(),
             DerivativeValue{});
@@ -186,7 +190,10 @@ void EnergyGradientAccumulator::addScalarSums(
     std::size_t sample_count,
     DerivativeReal weight_sum,
     DerivativeValue weighted_energy_sum,
-    DerivativeReal weighted_energy_norm_sum)
+    DerivativeReal weighted_energy_norm_sum,
+    const EnergyClippingTransform* clipping_transform,
+    DerivativeValue clipped_weighted_energy_sum,
+    std::size_t clipped_sample_count)
 {
   if (state() != DerivativeSinkState::COMPLETE || !derivative_complete_)
     throw std::logic_error("Scalar sums require a complete energy-gradient VJP stream");
@@ -197,13 +204,25 @@ void EnergyGradientAccumulator::addScalarSums(
   requireFinite(weight_sum, "weight sum");
   requireFinite(weighted_energy_sum, "weighted energy sum");
   requireFinite(weighted_energy_norm_sum, "weighted energy-norm sum");
+  requireFinite(clipped_weighted_energy_sum, "clipped weighted energy sum");
   if (weight_sum < 0.0 || weighted_energy_norm_sum < 0.0)
     throw std::invalid_argument("Energy-gradient scalar sums contain a negative weight or norm");
+  if (clipping_transform == nullptr && clipped_sample_count != 0)
+    throw std::invalid_argument("A disabled clipping transform cannot report clipped samples");
+  if (clipped_sample_count > sample_count)
+    throw std::invalid_argument("Clipped sample count exceeds the consumed batch population");
 
   sample_count_ = sample_count;
   weight_sum_ = weight_sum;
   weighted_energy_sum_ = weighted_energy_sum;
   weighted_energy_norm_sum_ = weighted_energy_norm_sum;
+  if (clipping_transform)
+  {
+    clipping_descriptor_ = clipping_transform->descriptor();
+    clipping_consumed_sample_count_ = sample_count;
+    clipped_sample_count_ = clipped_sample_count;
+    clipped_weighted_energy_sum_ = clipped_weighted_energy_sum;
+  }
   scalar_sums_complete_ = true;
 }
 
@@ -219,6 +238,7 @@ void EnergyGradientAccumulator::requireUsableContribution() const
 
 void EnergyGradientAccumulator::merge(const EnergyGradientAccumulator& other)
 {
+  const bool had_contribution = hasCompleteContribution();
   if (state() == DerivativeSinkState::ACTIVE)
     throw std::logic_error("Cannot merge into an active energy-gradient accumulator");
   if (state() == DerivativeSinkState::POISONED)
@@ -238,8 +258,19 @@ void EnergyGradientAccumulator::merge(const EnergyGradientAccumulator& other)
         "Cannot merge energy-gradient accumulators with different local-energy term coverage");
   if (hasCompleteContribution() && reduction_domain_ != other.reduction_domain_)
     throw std::invalid_argument("Cannot merge energy-gradient accumulators from different domains");
+  if (had_contribution &&
+      (clipping_descriptor_.has_value() != other.clipping_descriptor_.has_value() ||
+       (clipping_descriptor_ &&
+        !clipping_descriptor_->equivalent(*other.clipping_descriptor_))))
+    throw std::invalid_argument(
+        "Cannot merge energy-gradient accumulators with different clipping transforms");
   if (sample_count_ > std::numeric_limits<std::size_t>::max() - other.sample_count_)
     throw std::overflow_error("Streaming energy-gradient sample count overflow");
+  if (clipping_consumed_sample_count_ >
+          std::numeric_limits<std::size_t>::max() - other.clipping_consumed_sample_count_ ||
+      clipped_sample_count_ >
+          std::numeric_limits<std::size_t>::max() - other.clipped_sample_count_)
+    throw std::overflow_error("Streaming energy-gradient clipping count overflow");
 
   // Validate the whole merge before mutating any raw sum, so a numerical
   // overflow cannot leave an apparently usable partial reduction behind.
@@ -248,6 +279,8 @@ void EnergyGradientAccumulator::merge(const EnergyGradientAccumulator& other)
                 "merged weighted energy sum");
   requireFinite(weighted_energy_norm_sum_ + other.weighted_energy_norm_sum_,
                 "merged weighted energy norm sum");
+  requireFinite(clipped_weighted_energy_sum_ + other.clipped_weighted_energy_sum_,
+                "merged clipped weighted energy sum");
   for (std::size_t parameter = 0; parameter < weighted_score_sum_.size(); ++parameter)
   {
     requireFinite(weighted_score_sum_[parameter] + other.weighted_score_sum_[parameter],
@@ -264,6 +297,11 @@ void EnergyGradientAccumulator::merge(const EnergyGradientAccumulator& other)
   weight_sum_ += other.weight_sum_;
   weighted_energy_sum_ += other.weighted_energy_sum_;
   weighted_energy_norm_sum_ += other.weighted_energy_norm_sum_;
+  clipped_weighted_energy_sum_ += other.clipped_weighted_energy_sum_;
+  clipping_consumed_sample_count_ += other.clipping_consumed_sample_count_;
+  clipped_sample_count_ += other.clipped_sample_count_;
+  if (!had_contribution)
+    clipping_descriptor_ = other.clipping_descriptor_;
   for (std::size_t parameter = 0; parameter < weighted_score_sum_.size(); ++parameter)
   {
     weighted_score_sum_[parameter] += other.weighted_score_sum_[parameter];
@@ -293,6 +331,14 @@ EnergyGradientResult EnergyGradientAccumulator::finalize()
   requireFinite(weight_sum_, "total weight");
   requireFinite(weighted_energy_sum_, "total weighted energy");
   requireFinite(weighted_energy_norm_sum_, "total weighted energy norm");
+  if (clipping_descriptor_)
+  {
+    requireFinite(clipped_weighted_energy_sum_, "total clipped weighted energy");
+    if (clipping_consumed_sample_count_ != sample_count_ ||
+        sample_count_ != clipping_descriptor_->population)
+      throw std::runtime_error(
+          "Energy clipping transform was not consumed by its complete population");
+  }
 
   EnergyGradientResult result;
   result.schema_fingerprint = schema_fingerprint_;
@@ -305,7 +351,15 @@ EnergyGradientResult EnergyGradientAccumulator::finalize()
   result.mean_energy        = weighted_energy_sum_ / weight_sum_;
   result.energy_variance = std::max(
       DerivativeReal{}, weighted_energy_norm_sum_ / weight_sum_ - std::norm(result.mean_energy));
+  result.clipping = clipping_descriptor_;
+  result.clipped_sample_count = clipped_sample_count_;
   result.gradient.resize(weighted_score_sum_.size());
+
+  const DerivativeValue covariance_center = clipping_descriptor_
+      ? clipped_weighted_energy_sum_ / weight_sum_
+      : result.mean_energy;
+  if (clipping_descriptor_)
+    result.clipped_mean_energy = covariance_center;
 
   for (std::size_t parameter = 0; parameter < result.gradient.size(); ++parameter)
   {
@@ -314,7 +368,7 @@ EnergyGradientResult EnergyGradientAccumulator::finalize()
       const DerivativeValue contraction =
           weighted_energy_derivative_sum_[parameter] +
           weighted_energy_score_sum_[parameter] -
-          result.mean_energy * weighted_score_sum_[parameter];
+          covariance_center * weighted_score_sum_[parameter];
       result.gradient[parameter] = 2.0 * std::real(contraction) / weight_sum_;
     }
     else
@@ -322,7 +376,7 @@ EnergyGradientResult EnergyGradientAccumulator::finalize()
       result.gradient[parameter] =
           std::real(weighted_energy_derivative_sum_[parameter]) / weight_sum_ +
           2.0 * (std::real(weighted_energy_score_sum_[parameter]) / weight_sum_ -
-                 std::real(result.mean_energy) *
+                 std::real(covariance_center) *
                      std::real(weighted_score_sum_[parameter]) / weight_sum_);
     }
   }
@@ -344,7 +398,8 @@ void accumulateEnergyGradientBatch(
     DerivativeArrayView<const DerivativeValue> local_energies,
     std::uint32_t local_energy_term_mask,
     EnergyGradientAccumulator& accumulator,
-    DerivativeAdjoint adjoint)
+    DerivativeAdjoint adjoint,
+    const EnergyClippingTransform* clipping_transform)
 {
   if ((weights.size() != 0 && weights.data() == nullptr) ||
       (local_energies.size() != 0 && local_energies.data() == nullptr))
@@ -357,6 +412,8 @@ void accumulateEnergyGradientBatch(
   DerivativeReal weight_sum = 0.0;
   DerivativeValue weighted_energy_sum = 0.0;
   DerivativeReal weighted_energy_norm_sum = 0.0;
+  DerivativeValue clipped_weighted_energy_sum = 0.0;
+  std::size_t clipped_sample_count = 0;
   std::vector<DerivativeValue> weighted_score_coefficients(sample_count);
   std::vector<DerivativeValue> energy_weighted_score_coefficients(sample_count);
   for (std::size_t sample = 0; sample < sample_count; ++sample)
@@ -369,16 +426,25 @@ void accumulateEnergyGradientBatch(
     weight_sum += weights[sample];
     weighted_energy_sum += weights[sample] * local_energies[sample];
     weighted_energy_norm_sum += weights[sample] * std::norm(local_energies[sample]);
+    const DerivativeValue score_energy = clipping_transform
+        ? clipping_transform->apply(local_energies[sample])
+        : local_energies[sample];
+    if (clipping_transform)
+    {
+      clipped_weighted_energy_sum += weights[sample] * score_energy;
+      clipped_sample_count += clipping_transform->clips(local_energies[sample]);
+    }
     weighted_score_coefficients[sample] = weights[sample];
     energy_weighted_score_coefficients[sample] =
         weights[sample] *
         (accumulator.estimator() == EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN
-             ? local_energies[sample]
-             : DerivativeValue{std::real(local_energies[sample]), 0.0});
+             ? score_energy
+             : DerivativeValue{std::real(score_energy), 0.0});
   }
   requireFinite(weight_sum, "batch weight sum");
   requireFinite(weighted_energy_sum, "batch weighted energy sum");
   requireFinite(weighted_energy_norm_sum, "batch weighted energy norm sum");
+  requireFinite(clipped_weighted_energy_sum, "batch clipped weighted energy sum");
 
   const StructuredParameterSchema& schema = derivative_operator.parameterSchema();
   const auto make_coefficients = [&](const std::vector<DerivativeValue>& values) {
@@ -401,7 +467,8 @@ void accumulateEnergyGradientBatch(
 
   derivative_operator.applyVJPs({channels.data(), channels.size()}, adjoint, accumulator);
   accumulator.addScalarSums(sample_count, weight_sum, weighted_energy_sum,
-                            weighted_energy_norm_sum);
+                            weighted_energy_norm_sum, clipping_transform,
+                            clipped_weighted_energy_sum, clipped_sample_count);
 }
 
 } // namespace qmcplusplus::wftrain

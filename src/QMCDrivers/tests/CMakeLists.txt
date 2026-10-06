@@ -90,6 +90,7 @@ set(DRIVER_TEST_SRC
     test_Eigensolver.cpp
     test_WFOptDriverInput.cpp)
 list(APPEND DRIVER_TEST_SRC test_HighParameterTraining.cpp)
+list(APPEND DRIVER_TEST_SRC test_QuantileClipping.cpp)
 add_executable(${UTEST_EXE} ${DRIVER_TEST_SRC})
 target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)
 if(USE_OBJECT_TARGET)
@@ -111,6 +112,29 @@ add_unit_test(${UTEST_NAME} 1 8 $<TARGET_FILE:${UTEST_EXE}>)
 set_tests_properties(${UTEST_NAME} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
 if(HAVE_MPI)
+  set(UTEST_EXE test_quantile_clipping_mpi)
+  add_executable(${UTEST_EXE} test_QuantileClipping.cpp)
+  target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(
+      ${UTEST_EXE}
+      qmcestimators
+      qmcham
+      qmcwfs
+      qmcwfs_omptarget
+      spline2
+      spline2_omptarget
+      qmcparticle
+      qmcparticle_omptarget
+      qmcutil
+      platform_omptarget_LA)
+  endif()
+  foreach(NUM_RANKS 1 2 3 4)
+    set(UTEST_NAME deterministic-unit_${UTEST_EXE}-r${NUM_RANKS})
+    add_unit_test(${UTEST_NAME} ${NUM_RANKS} 1 $<TARGET_FILE:${UTEST_EXE}>)
+    set_tests_properties(${UTEST_NAME} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+  endforeach()
+
   set(UTEST_EXE test_distributed_parameter_reduction_mpi)
   add_executable(${UTEST_EXE} test_DistributedParameterReduction.cpp)
   target_link_libraries(${UTEST_EXE} catch_main qmcdriver minimal_test_pools)

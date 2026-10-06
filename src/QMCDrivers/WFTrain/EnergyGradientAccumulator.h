@@ -12,10 +12,12 @@
 #ifndef QMCPLUSPLUS_ENERGY_GRADIENT_ACCUMULATOR_H
 #define QMCPLUSPLUS_ENERGY_GRADIENT_ACCUMULATOR_H
 
+#include "QMCDrivers/WFTrain/QuantileClipping.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,9 @@ struct EnergyGradientResult
   DerivativeReal weight_sum          = 0.0;
   DerivativeValue mean_energy        = 0.0;
   DerivativeReal energy_variance     = 0.0;
+  std::optional<EnergyClippingDescriptor> clipping;
+  std::optional<DerivativeValue> clipped_mean_energy;
+  std::size_t clipped_sample_count = 0;
   std::vector<DerivativeReal> gradient;
 };
 
@@ -70,7 +75,10 @@ public:
   void addScalarSums(std::size_t sample_count,
                      DerivativeReal weight_sum,
                      DerivativeValue weighted_energy_sum,
-                     DerivativeReal weighted_energy_norm_sum);
+                     DerivativeReal weighted_energy_norm_sum,
+                     const EnergyClippingTransform* clipping_transform = nullptr,
+                     DerivativeValue clipped_weighted_energy_sum = {},
+                     std::size_t clipped_sample_count = 0);
 
   /// Merge one complete compatible partial result in deterministic caller order.
   void merge(const EnergyGradientAccumulator& other);
@@ -142,6 +150,10 @@ private:
   DerivativeReal weight_sum_ = 0.0;
   DerivativeValue weighted_energy_sum_ = 0.0;
   DerivativeReal weighted_energy_norm_sum_ = 0.0;
+  DerivativeValue clipped_weighted_energy_sum_ = 0.0;
+  std::optional<EnergyClippingDescriptor> clipping_descriptor_;
+  std::size_t clipping_consumed_sample_count_ = 0;
+  std::size_t clipped_sample_count_ = 0;
   std::vector<DerivativeValue> weighted_score_sum_;
   std::vector<DerivativeValue> weighted_energy_score_sum_;
   std::vector<DerivativeValue> weighted_energy_derivative_sum_;
@@ -165,7 +177,8 @@ void accumulateEnergyGradientBatch(
     DerivativeArrayView<const DerivativeValue> local_energies,
     std::uint32_t local_energy_term_mask,
     EnergyGradientAccumulator& accumulator,
-    DerivativeAdjoint adjoint = DerivativeAdjoint::TRANSPOSE);
+    DerivativeAdjoint adjoint = DerivativeAdjoint::TRANSPOSE,
+    const EnergyClippingTransform* clipping_transform = nullptr);
 
 } // namespace qmcplusplus::wftrain
 
