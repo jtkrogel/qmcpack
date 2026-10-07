@@ -47,6 +47,35 @@ PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
     const BatchedAttentionForwardLayout& attention,
     const BatchedValueLayout& value);
 
+/** Prepared per-epoch maxima for every execution diagnostic producer.
+ *
+ * The production builder must aggregate these maxima over the complete recorded
+ * graph, including every attention block, nonlinear site, determinant producer,
+ * and ECP producer.  The recorder deliberately cannot infer that topology from
+ * one value descriptor.
+ */
+struct PsiFormerExecutionDiagnosticBounds
+{
+  std::uint64_t nonfinite_count = 0;
+  std::uint64_t invalid_softmax_count = 0;
+  std::uint64_t small_determinant_pivot_count = 0;
+  std::uint64_t severe_cancellation_count = 0;
+  std::uint64_t extreme_ecp_ratio_count = 0;
+  std::uint64_t aggregate_count = 0;
+  std::uint64_t fingerprint = 0;
+};
+
+static_assert(std::is_standard_layout_v<PsiFormerExecutionDiagnosticBounds>);
+static_assert(std::is_trivially_copyable_v<PsiFormerExecutionDiagnosticBounds>);
+
+/** Construct a checked and fingerprinted full-graph diagnostic bound contract. */
+PsiFormerExecutionDiagnosticBounds makePsiFormerExecutionDiagnosticBounds(
+    std::uint64_t nonfinite_count,
+    std::uint64_t invalid_softmax_count,
+    std::uint64_t small_determinant_pivot_count,
+    std::uint64_t severe_cancellation_count,
+    std::uint64_t extreme_ecp_ratio_count);
+
 /** Metadata which must agree across every crowd/rank participant in one operation. */
 struct PsiFormerPrecisionParticipantMetadata
 {
@@ -61,6 +90,7 @@ struct PsiFormerPrecisionParticipantMetadata
   std::uint64_t arena_fingerprint = 0;
   std::uint64_t conversion_fingerprint = 0;
   std::uint64_t value_descriptor_fingerprint = 0;
+  std::uint64_t execution_diagnostic_bounds_fingerprint = 0;
   bool reduced_multiply = false;
   bool full_precision_retry_available = false;
 
@@ -76,6 +106,8 @@ struct PsiFormerPrecisionParticipantMetadata
         lhs.arena_fingerprint == rhs.arena_fingerprint &&
         lhs.conversion_fingerprint == rhs.conversion_fingerprint &&
         lhs.value_descriptor_fingerprint == rhs.value_descriptor_fingerprint &&
+        lhs.execution_diagnostic_bounds_fingerprint ==
+            rhs.execution_diagnostic_bounds_fingerprint &&
         lhs.reduced_multiply == rhs.reduced_multiply &&
         lhs.full_precision_retry_available == rhs.full_precision_retry_available;
   }
@@ -87,7 +119,8 @@ static_assert(std::is_trivially_copyable_v<PsiFormerPrecisionParticipantMetadata
 /** Derive the immutable metadata advertised by one prepared participant. */
 PsiFormerPrecisionParticipantMetadata makePsiFormerPrecisionParticipantMetadata(
     const PsiFormerPrecisionExecutionPlan& plan,
-    const PsiFormerMixedValueDescriptors& descriptors);
+    const PsiFormerMixedValueDescriptors& descriptors,
+    const PsiFormerExecutionDiagnosticBounds& diagnostic_bounds);
 
 /** Reject an empty or nonidentical simulated crowd/rank metadata set. */
 void validatePsiFormerPrecisionParticipantMetadata(
@@ -189,6 +222,7 @@ public:
   explicit PsiFormerPrecisionRecordingOrchestrator(
       PsiFormerPrecisionExecutionPlan plan,
       PsiFormerMixedValueDescriptors descriptors,
+      PsiFormerExecutionDiagnosticBounds diagnostic_bounds,
       std::size_t active_version = 0,
       std::uint64_t active_fingerprint = 1,
       std::uint8_t active_slot = 0);
@@ -227,6 +261,10 @@ public:
   {
     return execution_diagnostic_increment_bound_;
   }
+  const PsiFormerExecutionDiagnosticBounds& executionDiagnosticBounds() const noexcept
+  {
+    return diagnostic_bounds_;
+  }
   const std::vector<PsiFormerPrecisionRecordEvent>& events() const noexcept
   {
     return events_;
@@ -264,6 +302,7 @@ private:
 
   PsiFormerPrecisionExecutionPlan plan_;
   PsiFormerMixedValueDescriptors descriptors_;
+  PsiFormerExecutionDiagnosticBounds diagnostic_bounds_;
   PsiFormerPrecisionParticipantMetadata metadata_;
   PsiFormerMixedPublicationState publication_;
   std::vector<PsiFormerPrecisionRecordEvent> events_;

@@ -55,6 +55,16 @@ std::size_t checkedSum(std::size_t left,
   return left + right;
 }
 
+/// Add diagnostic maxima without permitting a wrapped prepared contract.
+std::uint64_t checkedDiagnosticSum(std::uint64_t left,
+                                   std::uint64_t right)
+{
+  if (right > std::numeric_limits<std::uint64_t>::max() - left)
+    throw std::length_error(
+        "PsiFormer execution diagnostic aggregate bound overflow");
+  return left + right;
+}
+
 /// Return whether two nonempty arena slices overlap.
 bool slicesOverlap(const PsiFormerDeviceArenaSlice& lhs,
                    const PsiFormerDeviceArenaSlice& rhs) noexcept
@@ -230,6 +240,21 @@ void validateDiagnosticSpan(std::size_t offset,
         "PsiFormer recording diagnostic span exceeds the combined record");
 }
 
+/// Require the aggregate and fingerprint to match the five advertised maxima.
+void validateDiagnosticBoundsIdentity(
+    const PsiFormerExecutionDiagnosticBounds& bounds)
+{
+  const PsiFormerExecutionDiagnosticBounds canonical =
+      makePsiFormerExecutionDiagnosticBounds(
+          bounds.nonfinite_count, bounds.invalid_softmax_count,
+          bounds.small_determinant_pivot_count,
+          bounds.severe_cancellation_count, bounds.extreme_ecp_ratio_count);
+  if (bounds.aggregate_count != canonical.aggregate_count ||
+      bounds.fingerprint != canonical.fingerprint)
+    throw std::invalid_argument(
+        "PsiFormer execution diagnostic bounds fingerprint does not match its contents");
+}
+
 } // namespace
 
 PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
@@ -311,13 +336,46 @@ PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
   return {dense, dense_source, attention, value, hash == 0 ? 1 : hash};
 }
 
+PsiFormerExecutionDiagnosticBounds makePsiFormerExecutionDiagnosticBounds(
+    std::uint64_t nonfinite_count,
+    std::uint64_t invalid_softmax_count,
+    std::uint64_t small_determinant_pivot_count,
+    std::uint64_t severe_cancellation_count,
+    std::uint64_t extreme_ecp_ratio_count)
+{
+  std::uint64_t aggregate = checkedDiagnosticSum(
+      nonfinite_count, invalid_softmax_count);
+  aggregate = checkedDiagnosticSum(aggregate, small_determinant_pivot_count);
+  aggregate = checkedDiagnosticSum(aggregate, severe_cancellation_count);
+  aggregate = checkedDiagnosticSum(aggregate, extreme_ecp_ratio_count);
+
+  std::uint64_t hash = FNV_OFFSET;
+  mixInteger(hash, UINT64_C(1));
+  mixInteger(hash, nonfinite_count);
+  mixInteger(hash, invalid_softmax_count);
+  mixInteger(hash, small_determinant_pivot_count);
+  mixInteger(hash, severe_cancellation_count);
+  mixInteger(hash, extreme_ecp_ratio_count);
+  mixInteger(hash, aggregate);
+
+  return {nonfinite_count,
+          invalid_softmax_count,
+          small_determinant_pivot_count,
+          severe_cancellation_count,
+          extreme_ecp_ratio_count,
+          aggregate,
+          hash == 0 ? 1 : hash};
+}
+
 PsiFormerPrecisionParticipantMetadata makePsiFormerPrecisionParticipantMetadata(
     const PsiFormerPrecisionExecutionPlan& plan,
-    const PsiFormerMixedValueDescriptors& descriptors)
+    const PsiFormerMixedValueDescriptors& descriptors,
+    const PsiFormerExecutionDiagnosticBounds& diagnostic_bounds)
 {
   if (descriptors.fingerprint == 0)
     throw std::invalid_argument(
         "PsiFormer precision participant requires validated value descriptors");
+  validateDiagnosticBoundsIdentity(diagnostic_bounds);
   return {plan.policy,
           plan.math_mode,
           plan.backend,
@@ -328,6 +386,7 @@ PsiFormerPrecisionParticipantMetadata makePsiFormerPrecisionParticipantMetadata(
           plan.arena.fingerprint,
           plan.conversion.fingerprint,
           descriptors.fingerprint,
+          diagnostic_bounds.fingerprint,
           plan.blas_math.reduced_multiply,
           plan.full_precision_retry_available};
 }
@@ -343,7 +402,8 @@ void validatePsiFormerPrecisionParticipantMetadata(
       canonical.device_layout_fingerprint == 0 ||
       canonical.arena_fingerprint == 0 ||
       canonical.conversion_fingerprint == 0 ||
-      canonical.value_descriptor_fingerprint == 0)
+      canonical.value_descriptor_fingerprint == 0 ||
+      canonical.execution_diagnostic_bounds_fingerprint == 0)
     throw std::invalid_argument(
         "PsiFormer precision participant metadata is incomplete");
   if ((canonical.policy == PsiFormerPrecisionPolicy::FP64_REFERENCE &&
@@ -369,12 +429,15 @@ void validatePsiFormerPrecisionParticipantMetadata(
 PsiFormerPrecisionRecordingOrchestrator::PsiFormerPrecisionRecordingOrchestrator(
     PsiFormerPrecisionExecutionPlan plan,
     PsiFormerMixedValueDescriptors descriptors,
+    PsiFormerExecutionDiagnosticBounds diagnostic_bounds,
     std::size_t active_version,
     std::uint64_t active_fingerprint,
     std::uint8_t active_slot)
     : plan_(std::move(plan)),
       descriptors_(std::move(descriptors)),
-      metadata_(makePsiFormerPrecisionParticipantMetadata(plan_, descriptors_)),
+      diagnostic_bounds_(std::move(diagnostic_bounds)),
+      metadata_(makePsiFormerPrecisionParticipantMetadata(
+          plan_, descriptors_, diagnostic_bounds_)),
       publication_(plan_.policy, active_version, active_fingerprint, active_slot)
 {}
 
@@ -390,33 +453,13 @@ void PsiFormerPrecisionRecordingOrchestrator::prepare()
   if (validated_descriptors.fingerprint != descriptors_.fingerprint)
     throw std::invalid_argument(
         "PsiFormer mixed value descriptor fingerprint does not match its contents");
-
-  const std::size_t attention_rows = checkedProduct(
-      descriptors_.attention.configuration_count,
-      descriptors_.attention.attention.heads,
-      "PsiFormer diagnostic attention-row bound overflow");
-  const std::size_t softmax_rows = checkedProduct(
-      attention_rows, descriptors_.attention.attention.rows,
-      "PsiFormer diagnostic softmax-row bound overflow");
-  const std::size_t attention_values = checkedProduct(
-      softmax_rows, descriptors_.attention.attention.rows,
-      "PsiFormer diagnostic attention-value bound overflow");
-  const std::size_t nonlinear_and_promotion = checkedProduct(
-      descriptors_.value.logicalElements(), 2,
-      "PsiFormer diagnostic value-path bound overflow");
-  const std::size_t source_conversion =
-      descriptors_.dense_source.logicalElements();
-  const std::size_t sensitive_statuses = checkedProduct(
-      descriptors_.attention.configuration_count, 3,
-      "PsiFormer diagnostic sensitive-status bound overflow");
-  execution_diagnostic_increment_bound_ = checkedSum(
-      checkedSum(attention_values, softmax_rows,
-                 "PsiFormer diagnostic counter bound overflow"),
-      checkedSum(checkedSum(nonlinear_and_promotion, source_conversion,
-                            "PsiFormer diagnostic counter bound overflow"),
-                 sensitive_statuses,
-                 "PsiFormer diagnostic counter bound overflow"),
-      "PsiFormer diagnostic counter bound overflow");
+  validateDiagnosticBoundsIdentity(diagnostic_bounds_);
+  if (diagnostic_bounds_.aggregate_count >
+      std::numeric_limits<std::size_t>::max())
+    throw std::length_error(
+        "PsiFormer execution diagnostic aggregate does not fit event ABI");
+  execution_diagnostic_increment_bound_ =
+      static_cast<std::size_t>(diagnostic_bounds_.aggregate_count);
 
   constexpr std::size_t maximum_value_events = 14;
   const std::size_t maximum_publication_events = checkedSum(
@@ -517,7 +560,12 @@ void PsiFormerPrecisionRecordingOrchestrator::validateConversionDiagnostics(
 void PsiFormerPrecisionRecordingOrchestrator::validateExecutionDiagnostics(
     const PsiFormerNumericalDiagnostics& diagnostics) const
 {
-  const std::uint64_t bound = execution_diagnostic_increment_bound_;
+  const std::uint64_t bounds[]{
+      diagnostic_bounds_.nonfinite_count,
+      diagnostic_bounds_.invalid_softmax_count,
+      diagnostic_bounds_.small_determinant_pivot_count,
+      diagnostic_bounds_.severe_cancellation_count,
+      diagnostic_bounds_.extreme_ecp_ratio_count};
   std::uint64_t total = 0;
   const std::uint64_t counters[]{
       diagnostics.nonfinite_count,
@@ -525,11 +573,16 @@ void PsiFormerPrecisionRecordingOrchestrator::validateExecutionDiagnostics(
       diagnostics.small_determinant_pivot_count,
       diagnostics.severe_cancellation_count,
       diagnostics.extreme_ecp_ratio_count};
-  for (const std::uint64_t count : counters)
+  for (std::size_t index = 0; index < 5; ++index)
   {
-    if (count > bound || total > bound - count)
+    const std::uint64_t count = counters[index];
+    if (count > bounds[index])
       throw std::invalid_argument(
-          "PsiFormer execution diagnostics exceed the prepared epoch bound");
+          "PsiFormer execution diagnostic counter exceeds its prepared bound");
+    if (total > diagnostic_bounds_.aggregate_count ||
+        count > diagnostic_bounds_.aggregate_count - total)
+      throw std::invalid_argument(
+          "PsiFormer execution diagnostics exceed the prepared aggregate bound");
     total += count;
   }
 }

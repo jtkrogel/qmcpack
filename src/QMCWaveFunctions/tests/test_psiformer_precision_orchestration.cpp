@@ -132,6 +132,15 @@ PsiFormerMixedValueDescriptors makeDescriptors()
       dense, dense_source, batched, value);
 }
 
+/** Supply aggregate maxima representative of several blocks and sensitive sites. */
+PsiFormerExecutionDiagnosticBounds makeDiagnosticBounds()
+{
+  return makePsiFormerExecutionDiagnosticBounds(
+      /*nonfinite_count=*/64, /*invalid_softmax_count=*/12,
+      /*small_determinant_pivot_count=*/8,
+      /*severe_cancellation_count=*/8, /*extreme_ecp_ratio_count=*/16);
+}
+
 /// Construct one exact mixed plan for the requested canonical version.
 PsiFormerPrecisionExecutionPlan makePlan(std::size_t version = 5,
                                          bool retry_available = true,
@@ -169,6 +178,11 @@ TEST_CASE("PsiFormer mixed descriptors require one exact padded interpretation",
   CHECK(descriptors.attention.featureElements() == 39);
   CHECK(descriptors.value.storageElements() == 39);
   CHECK(makeDescriptors().fingerprint == descriptors.fingerprint);
+
+  const PsiFormerExecutionDiagnosticBounds bounds = makeDiagnosticBounds();
+  CHECK(bounds.aggregate_count == 108);
+  CHECK(bounds.fingerprint != 0);
+  CHECK(makeDiagnosticBounds().fingerprint == bounds.fingerprint);
 
   DenseForwardLayout bad_dense = descriptors.dense;
   bad_dense.rows = 5;
@@ -210,7 +224,7 @@ TEST_CASE("PsiFormer recording preparation seals allocation and slot identities"
           "[psiformer][precision_orchestration]")
 {
   PsiFormerPrecisionRecordingOrchestrator recorder(
-      makePlan(), makeDescriptors(), /*active_version=*/4,
+      makePlan(), makeDescriptors(), makeDiagnosticBounds(), /*active_version=*/4,
       /*active_fingerprint=*/41, /*active_slot=*/0);
   CHECK_FALSE(recorder.prepared());
   CHECK_THROWS_AS(recorder.recordPublicationStart(), std::logic_error);
@@ -320,7 +334,7 @@ TEST_CASE("PsiFormer conversion hazards preserve the old complete slot pair",
           "[psiformer][precision_orchestration]")
 {
   PsiFormerPrecisionRecordingOrchestrator recorder(
-      makePlan(), makeDescriptors(), /*active_version=*/4,
+      makePlan(), makeDescriptors(), makeDiagnosticBounds(), /*active_version=*/4,
       /*active_fingerprint=*/43, /*active_slot=*/1);
   recorder.prepare();
 
@@ -368,7 +382,7 @@ TEST_CASE("PsiFormer mixed value graph records boundaries and one bounded retry"
           "[psiformer][precision_orchestration]")
 {
   PsiFormerPrecisionRecordingOrchestrator recorder(
-      makePlan(), makeDescriptors(), /*active_version=*/4,
+      makePlan(), makeDescriptors(), makeDiagnosticBounds(), /*active_version=*/4,
       /*active_fingerprint=*/47, /*active_slot=*/0);
   recorder.prepare();
   recorder.recordPublicationStart();
@@ -413,10 +427,16 @@ TEST_CASE("PsiFormer mixed value graph records boundaries and one bounded retry"
   CHECK(ordinary[8].kind ==
         PsiFormerPrecisionRecordEventKind::EVALUATION_COMPLETE);
   CHECK(ordinary[8].diagnostic_epoch == ordinary[0].diagnostic_epoch);
-  CHECK(recorder.executionDiagnosticIncrementBound() == 132);
+  CHECK(recorder.executionDiagnosticIncrementBound() == 108);
+  CHECK(ordinary[0].diagnostic_increment_bound == 108);
+  CHECK(ordinary[6].diagnostic_increment_bound == 108);
 
   PsiFormerNumericalDiagnostics mixed_invalid;
-  mixed_invalid.nonfinite_count = 1;
+  mixed_invalid.nonfinite_count = 48;
+  mixed_invalid.invalid_softmax_count = 8;
+  mixed_invalid.small_determinant_pivot_count = 4;
+  mixed_invalid.severe_cancellation_count = 4;
+  mixed_invalid.extreme_ecp_ratio_count = 12;
   allocation_probe::Scope retry_probe;
   recorder.recordValueEvaluationStart(5, fingerprint);
   const PsiFormerPrecisionEvaluationResult pending_result =
@@ -486,8 +506,8 @@ TEST_CASE("PsiFormer mixed value graph records boundaries and one bounded retry"
   const std::vector<PsiFormerPrecisionRecordEvent> pending_graph =
       recorder.events();
   PsiFormerNumericalDiagnostics excessive;
-  excessive.nonfinite_count =
-      recorder.executionDiagnosticIncrementBound() + 1;
+  excessive.invalid_softmax_count =
+      recorder.executionDiagnosticBounds().invalid_softmax_count + 1;
   CHECK_THROWS_AS(recorder.observeMixedValueCompletion(excessive),
                   std::invalid_argument);
   CHECK(recorder.events() == pending_graph);
@@ -500,6 +520,7 @@ TEST_CASE("PsiFormer unavailable retry terminates without a second mixed attempt
 {
   PsiFormerPrecisionRecordingOrchestrator recorder(
       makePlan(/*version=*/6, /*retry_available=*/false), makeDescriptors(),
+      makeDiagnosticBounds(),
       /*active_version=*/5, /*active_fingerprint=*/53, /*active_slot=*/1);
   recorder.prepare();
   recorder.recordPublicationStart();
@@ -527,14 +548,24 @@ TEST_CASE("PsiFormer participant metadata agrees across simulated crowds and ran
           "[psiformer][precision_orchestration]")
 {
   const PsiFormerMixedValueDescriptors descriptors = makeDescriptors();
+  const PsiFormerExecutionDiagnosticBounds bounds = makeDiagnosticBounds();
+  PsiFormerExecutionDiagnosticBounds mutated_bounds = bounds;
+  mutated_bounds.fingerprint ^= UINT64_C(1);
+  CHECK_THROWS_WITH(makePsiFormerPrecisionParticipantMetadata(
+                        makePlan(), descriptors, mutated_bounds),
+                    Catch::Matchers::ContainsSubstring("fingerprint"));
   const PsiFormerPrecisionParticipantMetadata metadata =
-      makePsiFormerPrecisionParticipantMetadata(makePlan(), descriptors);
+      makePsiFormerPrecisionParticipantMetadata(makePlan(), descriptors, bounds);
   std::vector<PsiFormerPrecisionParticipantMetadata> participants(6, metadata);
   CHECK_NOTHROW(validatePsiFormerPrecisionParticipantMetadata(participants));
   CHECK_THROWS_AS(validatePsiFormerPrecisionParticipantMetadata({}),
                   std::invalid_argument);
 
   participants[4].value_descriptor_fingerprint ^= UINT64_C(1);
+  CHECK_THROWS_WITH(validatePsiFormerPrecisionParticipantMetadata(participants),
+                    Catch::Matchers::ContainsSubstring("differs"));
+  participants.assign(6, metadata);
+  participants[2].execution_diagnostic_bounds_fingerprint ^= UINT64_C(1);
   CHECK_THROWS_WITH(validatePsiFormerPrecisionParticipantMetadata(participants),
                     Catch::Matchers::ContainsSubstring("differs"));
   participants.assign(6, metadata);
@@ -552,7 +583,7 @@ TEST_CASE("PsiFormer participant metadata agrees across simulated crowds and ran
   participants[5] = makePsiFormerPrecisionParticipantMetadata(
       makePlan(/*version=*/5, /*retry_available=*/true,
                PsiFormerAcceleratorBackend::HIP),
-      descriptors);
+      descriptors, bounds);
   CHECK_THROWS_WITH(validatePsiFormerPrecisionParticipantMetadata(participants),
                     Catch::Matchers::ContainsSubstring("differs"));
 }
@@ -570,7 +601,7 @@ TEST_CASE("PsiFormer recorder rejects mutated prepared identities",
       overlapping.arena.find(PsiFormerDeviceArenaRegion::MODEL_COMPUTE_PARAMETERS_0)
           ->offset;
   PsiFormerPrecisionRecordingOrchestrator overlap_recorder(
-      std::move(overlapping), makeDescriptors(), 4, 59, 0);
+      std::move(overlapping), makeDescriptors(), makeDiagnosticBounds(), 4, 59, 0);
   CHECK_THROWS_WITH(overlap_recorder.prepare(),
                     Catch::Matchers::ContainsSubstring("arena identity"));
 
@@ -585,14 +616,15 @@ TEST_CASE("PsiFormer recorder rejects mutated prepared identities",
                                       PRECISION_CONVERSION_WORKSPACE)
                             ->offset;
   PsiFormerPrecisionRecordingOrchestrator diagnostic_overlap_recorder(
-      std::move(diagnostic_overlap), makeDescriptors(), 4, 60, 0);
+      std::move(diagnostic_overlap), makeDescriptors(), makeDiagnosticBounds(),
+      4, 60, 0);
   CHECK_THROWS_WITH(diagnostic_overlap_recorder.prepare(),
                     Catch::Matchers::ContainsSubstring("arena identity"));
 
   PsiFormerMixedValueDescriptors mutated = makeDescriptors();
   mutated.fingerprint ^= UINT64_C(1);
   PsiFormerPrecisionRecordingOrchestrator descriptor_recorder(
-      makePlan(), mutated, 4, 61, 0);
+      makePlan(), mutated, makeDiagnosticBounds(), 4, 61, 0);
   CHECK_THROWS_WITH(descriptor_recorder.prepare(),
                     Catch::Matchers::ContainsSubstring("fingerprint"));
 }
