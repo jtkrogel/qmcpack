@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_SPATIAL_H
 
 #include "PsiFormerDeviceDense.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
 
 namespace qmcplusplus::psiformer::device
@@ -57,6 +58,50 @@ Error launchAttentionContextJets(Stream stream,
                                  const double* attention,
                                  const double* value,
                                  double* context);
+
+Error launchOpenFeatureJets(Stream stream,
+                            const OpenFeatureJetLayout& layout,
+                            const double* positions,
+                            const double* nuclei,
+                            const std::size_t* active_electrons,
+                            double* output,
+                            OpenSpatialStatus* status);
+
+Error launchBiasTanhJets(Stream stream,
+                         const SpatialElementwiseJetLayout& layout,
+                         const double* input,
+                         const double* bias,
+                         double* output,
+                         OpenSpatialStatus* status);
+
+Error launchResidualSpatialJets(Stream stream,
+                                const SpatialElementwiseJetLayout& layout,
+                                const double* left,
+                                const double* right,
+                                double* output,
+                                OpenSpatialStatus* status);
+
+Error launchOpenCuspJets(Stream stream,
+                         const OpenCuspJetLayout& layout,
+                         const double* positions,
+                         const std::size_t* active_electrons,
+                         double same_spin_alpha,
+                         double opposite_spin_alpha,
+                         double* output,
+                         OpenSpatialStatus* status);
+
+Error launchFinalSpatialCombination(
+    Stream stream,
+    const FinalSpatialJetLayout& layout,
+    const device_determinant::CombinationMetadata* determinant_metadata,
+    const device_determinant::DerivativeStatus* determinant_status,
+    const double* determinant_gradient,
+    const double* determinant_laplacian_log,
+    const double* cusp,
+    double* phase,
+    double* output,
+    double* laplacian_ratio,
+    OpenSpatialStatus* status);
 
 } // namespace qmcplusplus::psiformer::device
 

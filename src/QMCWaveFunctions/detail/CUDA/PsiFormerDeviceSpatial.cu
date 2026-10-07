@@ -90,6 +90,92 @@ __global__ void attentionContextJetsKernel(SpatialAttentionJetLayout layout,
       context);
 }
 
+__global__ void openFeatureJetsKernel(OpenFeatureJetLayout layout,
+                                      const double* positions,
+                                      const double* nuclei,
+                                      const std::size_t* active_electrons,
+                                      double* output,
+                                      OpenSpatialStatus* status)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration < layout.output.configuration_count)
+    status[configuration] = open_spatial::buildOpenFeatureJetsForConfiguration(
+        layout, positions, nuclei, configuration, active_electrons[configuration], output);
+}
+
+__global__ void biasTanhJetsKernel(SpatialElementwiseJetLayout layout,
+                                   const double* input,
+                                   const double* bias,
+                                   double* output,
+                                   OpenSpatialStatus* status)
+{
+  const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t per_configuration = layout.row_count * layout.row_width;
+  const std::size_t count = layout.jets.configuration_count * per_configuration;
+  if (logical >= count)
+    return;
+  const std::size_t configuration = logical / per_configuration;
+  const std::size_t within = logical % per_configuration;
+  const std::size_t element = (within / layout.row_width) * layout.row_stride +
+      within % layout.row_width;
+  status[logical] = open_spatial::biasTanhJetElement(
+      layout, input, bias, configuration, element, output);
+}
+
+__global__ void residualSpatialJetsKernel(SpatialElementwiseJetLayout layout,
+                                          const double* left,
+                                          const double* right,
+                                          double* output,
+                                          OpenSpatialStatus* status)
+{
+  const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t per_configuration = layout.row_count * layout.row_width;
+  const std::size_t count = layout.jets.configuration_count * per_configuration;
+  if (logical >= count)
+    return;
+  const std::size_t configuration = logical / per_configuration;
+  const std::size_t within = logical % per_configuration;
+  const std::size_t element = (within / layout.row_width) * layout.row_stride +
+      within % layout.row_width;
+  status[logical] = open_spatial::residualJetElement(
+      layout, left, right, configuration, element, output);
+}
+
+__global__ void openCuspJetsKernel(OpenCuspJetLayout layout,
+                                   const double* positions,
+                                   const std::size_t* active_electrons,
+                                   double same_spin_alpha,
+                                   double opposite_spin_alpha,
+                                   double* output,
+                                   OpenSpatialStatus* status)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration < layout.output.configuration_count)
+    status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
+        layout, positions, configuration, active_electrons[configuration],
+        same_spin_alpha, opposite_spin_alpha, output);
+}
+
+__global__ void finalSpatialCombinationKernel(
+    FinalSpatialJetLayout layout,
+    const device_determinant::CombinationMetadata* determinant_metadata,
+    const device_determinant::DerivativeStatus* determinant_status,
+    const double* determinant_gradient,
+    const double* determinant_laplacian_log,
+    const double* cusp,
+    double* phase,
+    double* output,
+    double* laplacian_ratio,
+    OpenSpatialStatus* status)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration < layout.output.configuration_count)
+    status[configuration] = open_spatial::combineFinalSpatialForConfiguration(
+        layout, determinant_metadata, determinant_status, determinant_gradient,
+        determinant_laplacian_log, cusp, configuration, phase, output,
+        laplacian_ratio);
+}
+
 } // namespace
 
 Error launchSoftmaxJetRows(Stream stream,
@@ -251,6 +337,126 @@ Error launchAttentionContextJets(Stream stream,
 #else
   return cudaPeekAtLastError();
 #endif
+}
+
+namespace
+{
+unsigned int checkedSpatialBlockCount(std::size_t count, const char* description)
+{
+  if (count > std::numeric_limits<unsigned int>::max())
+    throw std::length_error(description);
+  return static_cast<unsigned int>((count + spatial_block_size - 1) / spatial_block_size);
+}
+
+Error peekSpatialLaunchError()
+{
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+} // namespace
+
+Error launchOpenFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
+                            const double* positions, const double* nuclei,
+                            const std::size_t* active_electrons, double* output,
+                            OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.nucleus_count == 0)
+    return success;
+  validateOpenFeatureJetLayout(layout);
+  if (!positions || !nuclei || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer open feature device storage is null");
+  const unsigned int blocks = checkedSpatialBlockCount(
+      layout.output.configuration_count, "PsiFormer open feature grid exceeds device x dimension");
+  openFeatureJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      layout, positions, nuclei, active_electrons, output, status);
+  return peekSpatialLaunchError();
+}
+
+Error launchBiasTanhJets(Stream stream, const SpatialElementwiseJetLayout& layout,
+                         const double* input, const double* bias, double* output,
+                         OpenSpatialStatus* status)
+{
+  if (layout.jets.configuration_count == 0 && layout.row_count == 0 && layout.row_width == 0)
+    return success;
+  validateSpatialElementwiseJetLayout(layout);
+  if (!input || !bias || !output || !status)
+    throw std::invalid_argument("PsiFormer tanh jet device storage is null");
+  const std::size_t count = spatial_detail::checkedProduct(
+      layout.jets.configuration_count,
+      spatial_detail::checkedProduct(layout.row_count, layout.row_width,
+                                     "PsiFormer tanh jet extent overflow"),
+      "PsiFormer tanh jet batch extent overflow");
+  const unsigned int blocks = checkedSpatialBlockCount(
+      count, "PsiFormer tanh jet grid exceeds device x dimension");
+  biasTanhJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      layout, input, bias, output, status);
+  return peekSpatialLaunchError();
+}
+
+Error launchResidualSpatialJets(Stream stream, const SpatialElementwiseJetLayout& layout,
+                                const double* left, const double* right, double* output,
+                                OpenSpatialStatus* status)
+{
+  if (layout.jets.configuration_count == 0 && layout.row_count == 0 && layout.row_width == 0)
+    return success;
+  validateSpatialElementwiseJetLayout(layout);
+  if (!left || !right || !output || !status)
+    throw std::invalid_argument("PsiFormer residual jet device storage is null");
+  const std::size_t count = spatial_detail::checkedProduct(
+      layout.jets.configuration_count,
+      spatial_detail::checkedProduct(layout.row_count, layout.row_width,
+                                     "PsiFormer residual jet extent overflow"),
+      "PsiFormer residual jet batch extent overflow");
+  const unsigned int blocks = checkedSpatialBlockCount(
+      count, "PsiFormer residual jet grid exceeds device x dimension");
+  residualSpatialJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      layout, left, right, output, status);
+  return peekSpatialLaunchError();
+}
+
+Error launchOpenCuspJets(Stream stream, const OpenCuspJetLayout& layout,
+                         const double* positions, const std::size_t* active_electrons,
+                         double same_spin_alpha, double opposite_spin_alpha,
+                         double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.output.electron_count == 0)
+    return success;
+  validateOpenCuspJetLayout(layout);
+  if (!positions || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer cusp jet device storage is null");
+  const unsigned int blocks = checkedSpatialBlockCount(
+      layout.output.configuration_count, "PsiFormer cusp jet grid exceeds device x dimension");
+  openCuspJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      layout, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
+      output, status);
+  return peekSpatialLaunchError();
+}
+
+Error launchFinalSpatialCombination(
+    Stream stream, const FinalSpatialJetLayout& layout,
+    const device_determinant::CombinationMetadata* determinant_metadata,
+    const device_determinant::DerivativeStatus* determinant_status,
+    const double* determinant_gradient, const double* determinant_laplacian_log,
+    const double* cusp, double* phase, double* output, double* laplacian_ratio,
+    OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.output.electron_count == 0)
+    return success;
+  validateFinalSpatialJetLayout(layout);
+  if (!determinant_metadata || !determinant_status || !determinant_gradient ||
+      !cusp || !phase || !output || !status ||
+      (layout.output.laplacian_lanes != 0 &&
+       (!determinant_laplacian_log || !laplacian_ratio)))
+    throw std::invalid_argument("PsiFormer final spatial device storage is null");
+  const unsigned int blocks = checkedSpatialBlockCount(
+      layout.output.configuration_count, "PsiFormer final spatial grid exceeds device x dimension");
+  finalSpatialCombinationKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      layout, determinant_metadata, determinant_status, determinant_gradient,
+      determinant_laplacian_log, cusp, phase, output, laplacian_ratio, status);
+  return peekSpatialLaunchError();
 }
 
 } // namespace qmcplusplus::psiformer::device

@@ -20,6 +20,12 @@
 #include <stdexcept>
 #include <type_traits>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define QMC_PF_SPATIAL_HOST_DEVICE __host__ __device__
+#else
+#define QMC_PF_SPATIAL_HOST_DEVICE
+#endif
+
 namespace qmcplusplus::psiformer
 {
 
@@ -46,29 +52,29 @@ struct SpatialJetLayout
   std::size_t configuration_stride = 0;
   SpatialJetMode mode             = SpatialJetMode::ACTIVE;
 
-  std::size_t uncheckedPlaneOffset(std::size_t configuration,
-                                   std::size_t plane,
-                                   std::size_t element) const noexcept
+  QMC_PF_SPATIAL_HOST_DEVICE std::size_t uncheckedPlaneOffset(
+      std::size_t configuration, std::size_t plane,
+      std::size_t element) const noexcept
   {
     return configuration * configuration_stride + plane * plane_stride + element;
   }
 
-  std::size_t uncheckedValueOffset(std::size_t configuration,
-                                   std::size_t element) const noexcept
+  QMC_PF_SPATIAL_HOST_DEVICE std::size_t uncheckedValueOffset(
+      std::size_t configuration, std::size_t element) const noexcept
   {
     return uncheckedPlaneOffset(configuration, 0, element);
   }
 
-  std::size_t uncheckedGradientOffset(std::size_t configuration,
-                                      std::size_t lane,
-                                      std::size_t element) const noexcept
+  QMC_PF_SPATIAL_HOST_DEVICE std::size_t uncheckedGradientOffset(
+      std::size_t configuration, std::size_t lane,
+      std::size_t element) const noexcept
   {
     return uncheckedPlaneOffset(configuration, 1 + lane, element);
   }
 
-  std::size_t uncheckedLaplacianOffset(std::size_t configuration,
-                                       std::size_t electron,
-                                       std::size_t element) const noexcept
+  QMC_PF_SPATIAL_HOST_DEVICE std::size_t uncheckedLaplacianOffset(
+      std::size_t configuration, std::size_t electron,
+      std::size_t element) const noexcept
   {
     return uncheckedPlaneOffset(configuration, 1 + gradient_lanes + electron, element);
   }
@@ -535,5 +541,7 @@ inline void stableSoftmaxJetRows(const SoftmaxJetRowLayout& layout, double* jets
 }
 
 } // namespace qmcplusplus::psiformer
+
+#undef QMC_PF_SPATIAL_HOST_DEVICE
 
 #endif // QMCPLUSPLUS_PSIFORMER_SPATIAL_LAYOUT_H

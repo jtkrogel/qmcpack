@@ -51,11 +51,28 @@ int main()
       launchAttentionContextJets(
           nullptr, qmcplusplus::psiformer::SpatialAttentionJetLayout{},
           nullptr, nullptr, nullptr) == success;
+  const bool open_feature_linked =
+      launchOpenFeatureJets(nullptr, qmcplusplus::psiformer::OpenFeatureJetLayout{},
+                            nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool tanh_jet_linked =
+      launchBiasTanhJets(nullptr, qmcplusplus::psiformer::SpatialElementwiseJetLayout{},
+                         nullptr, nullptr, nullptr, nullptr) == success;
+  const bool residual_jet_linked =
+      launchResidualSpatialJets(nullptr, qmcplusplus::psiformer::SpatialElementwiseJetLayout{},
+                                nullptr, nullptr, nullptr, nullptr) == success;
+  const bool cusp_jet_linked =
+      launchOpenCuspJets(nullptr, qmcplusplus::psiformer::OpenCuspJetLayout{},
+                         nullptr, nullptr, 0.0, 0.0, nullptr, nullptr) == success;
+  const bool final_spatial_linked =
+      launchFinalSpatialCombination(nullptr, qmcplusplus::psiformer::FinalSpatialJetLayout{},
+                                    nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    nullptr, nullptr, nullptr, nullptr) == success;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
          determinant_spatial_linked && spatial_softmax_linked &&
          spatial_dense_linked && spatial_qkv_linked &&
-         spatial_attention_linked && spatial_context_linked
+         spatial_attention_linked && spatial_context_linked && open_feature_linked &&
+         tanh_jet_linked && residual_jet_linked && cusp_jet_linked && final_spatial_linked
       ? 0
       : 1;
 }

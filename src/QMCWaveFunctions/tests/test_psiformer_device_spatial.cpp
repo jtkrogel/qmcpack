@@ -15,6 +15,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,8 @@
 namespace psiformer = qmcplusplus::psiformer;
 namespace math = qmcplusplus::psiformer::device_math;
 namespace spatial_jet = qmcplusplus::psiformer::spatial_jet;
+namespace open_spatial = qmcplusplus::psiformer::open_spatial;
+namespace determinant = qmcplusplus::psiformer::device_determinant;
 
 namespace
 {
@@ -529,6 +532,258 @@ TEST_CASE("PsiFormer softmax jet host diagnostics reject invalid and non-finite 
   active_jets[active.jets.uncheckedValueOffset(0, 1)] = -2.0;
   psiformer::stableSoftmaxJetRows(active, active_jets.data());
   CHECK(active_jets[active.jets.uncheckedValueOffset(0, 0)] > 0.99);
+}
+
+TEST_CASE("PsiFormer open raw feature jets match independent finite differences",
+          "[psiformer][device][spatial][open]")
+{
+  CHECK_THROWS_AS(psiformer::makeOpenFeatureJetLayout(
+                      1, 2, 0, 1, psiformer::SpatialJetMode::ACTIVE),
+                  std::invalid_argument);
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t electrons = 2;
+  const auto layout = psiformer::makeOpenFeatureJetLayout(
+      configurations, electrons, 1, 1, psiformer::SpatialJetMode::FULL_VGL,
+      4, 9, 4, 13, 120);
+  std::vector<double> positions{
+      0.7, -0.2, 0.4, 91.0, -0.3, 0.8, 1.1, 92.0, 93.0,
+      1.2, 0.1, -0.6, 94.0, 0.2, -1.0, 0.5, 95.0};
+  const std::array<double, 4> nuclei{0.1, -0.4, 0.2, 88.0};
+  std::vector<double> output(psiformer::spatialJetSpanElements(layout.output), -17.0);
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    CHECK(open_spatial::buildOpenFeatureJetsForConfiguration(
+              layout, positions.data(), nuclei.data(), configuration,
+              configuration, output.data()) == psiformer::OpenSpatialStatus::REGULAR);
+
+  auto value = [&](std::size_t configuration, std::size_t electron,
+                   std::size_t feature, std::size_t moved_electron,
+                   std::size_t dimension, long double delta) {
+    std::array<long double, 3> displacement{};
+    for (std::size_t d = 0; d < 3; ++d)
+      displacement[d] = positions[configuration * 9 + electron * 4 + d] - nuclei[d] +
+          (electron == moved_electron && d == dimension ? delta : 0.0L);
+    const long double radius = std::sqrt(displacement[0] * displacement[0] +
+                                         displacement[1] * displacement[1] +
+                                         displacement[2] * displacement[2]);
+    if (feature == 0)
+      return std::log1p(radius);
+    if (feature < 4)
+      return displacement[feature - 1] * std::log1p(radius) / radius;
+    return electron == 0 ? 1.0L : -1.0L;
+  };
+  constexpr long double step = 1.0e-4L;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t electron = 0; electron < electrons; ++electron)
+      for (std::size_t feature = 0; feature < layout.feature_width; ++feature)
+      {
+        const std::size_t element = electron * layout.feature_width + feature;
+        checkClose(output[layout.output.uncheckedValueOffset(configuration, element)],
+                   value(configuration, electron, feature, electron, 0, 0.0L));
+        long double trace = 0.0L;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const long double plus = value(configuration, electron, feature, electron,
+                                         dimension, step);
+          const long double minus = value(configuration, electron, feature, electron,
+                                          dimension, -step);
+          const long double base = value(configuration, electron, feature, electron,
+                                         dimension, 0.0L);
+          checkClose(output[layout.output.uncheckedGradientOffset(
+                         configuration, 3 * electron + dimension, element)],
+                     (plus - minus) / (2.0L * step), 2.0e-8);
+          trace += (plus - 2.0L * base + minus) / (step * step);
+        }
+        checkClose(output[layout.output.uncheckedLaplacianOffset(
+                       configuration, electron, element)], trace, 4.0e-7);
+      }
+
+  const auto active = psiformer::makeOpenFeatureJetLayout(
+      configurations, electrons, 1, 1, psiformer::SpatialJetMode::ACTIVE, 4, 9);
+  std::vector<double> active_output(psiformer::spatialJetSpanElements(active.output));
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    CHECK(open_spatial::buildOpenFeatureJetsForConfiguration(
+              active, positions.data(), nuclei.data(), configuration,
+              1 - configuration, active_output.data()) ==
+          psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(active_output[active.output.uncheckedGradientOffset(0, 0, 0)] == 0.0);
+  CHECK(std::abs(active_output[active.output.uncheckedGradientOffset(
+                     0, 0, active.feature_width)]) > 0.0);
+
+  std::vector<double> coalesced = positions;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    coalesced[dimension] = nuclei[dimension];
+  CHECK(open_spatial::buildOpenFeatureJetsForConfiguration(
+            active, coalesced.data(), nuclei.data(), 0, 0, active_output.data()) ==
+        psiformer::OpenSpatialStatus::COALESCENCE);
+}
+
+TEST_CASE("PsiFormer open cusp jets and transforms preserve spatial algebra",
+          "[psiformer][device][spatial][open]")
+{
+  CHECK_THROWS_AS(psiformer::makeOpenCuspJetLayout(
+                      1, 2, 3, psiformer::SpatialJetMode::ACTIVE),
+                  std::invalid_argument);
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t electrons = 3;
+  const auto cusp_layout = psiformer::makeOpenCuspJetLayout(
+      configurations, electrons, 2, psiformer::SpatialJetMode::FULL_VGL, 4, 13,
+      2, 25);
+  std::vector<double> positions{
+      0.2, -0.1, 0.4, 8.0, 1.0, 0.3, -0.2, 8.0, -0.4, 1.1, 0.6, 8.0, 8.0,
+      -0.5, 0.2, 0.9, 8.0, 0.6, -0.7, 0.1, 8.0, 1.3, 0.8, -0.4, 8.0};
+  std::vector<double> cusp(psiformer::spatialJetSpanElements(cusp_layout.output), -5.0);
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    CHECK(open_spatial::buildOpenCuspJetsForConfiguration(
+              cusp_layout, positions.data(), configuration, 0, 0.7, 1.1,
+              cusp.data()) == psiformer::OpenSpatialStatus::REGULAR);
+
+  auto cusp_value = [&](std::size_t configuration, std::size_t moved_electron,
+                        std::size_t dimension, long double delta) {
+    long double result = 0.0L;
+    for (std::size_t first = 0; first < electrons; ++first)
+      for (std::size_t second = first + 1; second < electrons; ++second)
+      {
+        long double radius_squared = 0.0L;
+        for (std::size_t d = 0; d < 3; ++d)
+        {
+          const long double first_value = positions[configuration * 13 + first * 4 + d] +
+              (first == moved_electron && d == dimension ? delta : 0.0L);
+          const long double second_value = positions[configuration * 13 + second * 4 + d] +
+              (second == moved_electron && d == dimension ? delta : 0.0L);
+          const long double difference = first_value - second_value;
+          radius_squared += difference * difference;
+        }
+        const bool same = (first < 2) == (second < 2);
+        const long double alpha = same ? 0.7L : 1.1L;
+        const long double factor = same ? 0.25L : 0.5L;
+        result -= factor * alpha * alpha / (alpha + std::sqrt(radius_squared));
+      }
+    return result;
+  };
+  constexpr long double step = 1.0e-4L;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    checkClose(cusp[cusp_layout.output.uncheckedValueOffset(configuration, 0)],
+               cusp_value(configuration, 0, 0, 0.0L));
+    for (std::size_t electron = 0; electron < electrons; ++electron)
+    {
+      long double trace = 0.0L;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const long double plus = cusp_value(configuration, electron, dimension, step);
+        const long double minus = cusp_value(configuration, electron, dimension, -step);
+        const long double base = cusp_value(configuration, electron, dimension, 0.0L);
+        checkClose(cusp[cusp_layout.output.uncheckedGradientOffset(
+                       configuration, 3 * electron + dimension, 0)],
+                   (plus - minus) / (2.0L * step), 2.0e-8);
+        trace += (plus - 2.0L * base + minus) / (step * step);
+      }
+      checkClose(cusp[cusp_layout.output.uncheckedLaplacianOffset(
+                     configuration, electron, 0)], trace, 3.0e-7);
+    }
+  }
+
+  const auto transform = psiformer::makeSpatialElementwiseJetLayout(
+      1, 1, 2, 1, psiformer::SpatialJetMode::FULL_VGL, 3, 4, 21);
+  std::vector<double> input(psiformer::spatialJetSpanElements(transform.jets), 0.0);
+  std::vector<double> tanh_output(input.size(), 0.0), residual(input.size(), 0.0);
+  const std::array<double, 2> bias{0.2, -0.1};
+  for (std::size_t element = 0; element < 2; ++element)
+  {
+    input[transform.jets.uncheckedValueOffset(0, element)] = 0.3 + element;
+    for (std::size_t lane = 0; lane < 3; ++lane)
+      input[transform.jets.uncheckedGradientOffset(0, lane, element)] = 0.1 * (lane + 1);
+    input[transform.jets.uncheckedLaplacianOffset(0, 0, element)] = -0.4;
+    CHECK(open_spatial::biasTanhJetElement(transform, input.data(), bias.data(),
+                                           0, element, tanh_output.data()) ==
+          psiformer::OpenSpatialStatus::REGULAR);
+    CHECK(open_spatial::residualJetElement(transform, input.data(), tanh_output.data(),
+                                            0, element, residual.data()) ==
+          psiformer::OpenSpatialStatus::REGULAR);
+    checkClose(tanh_output[transform.jets.uncheckedValueOffset(0, element)],
+               std::tanh(static_cast<long double>(0.3 + element + bias[element])));
+    checkClose(residual[transform.jets.uncheckedValueOffset(0, element)],
+               0.3L + element + std::tanh(static_cast<long double>(0.3 + element + bias[element])));
+  }
+}
+
+TEST_CASE("PsiFormer final spatial combination distinguishes log Laplacian and ratio",
+          "[psiformer][device][spatial][open]")
+{
+  const auto layout = psiformer::makeFinalSpatialJetLayout(
+      2, 2, psiformer::SpatialJetMode::FULL_VGL, 8, 3, 4, 2, 24);
+  std::array<determinant::CombinationMetadata, 2> metadata{};
+  std::array<determinant::DerivativeStatus, 2> derivative_status{
+      determinant::DerivativeStatus::AVAILABLE,
+      determinant::DerivativeStatus::AVAILABLE};
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+  {
+    metadata[configuration].status = determinant::CombinationStatus::REGULAR;
+    metadata[configuration].phase = configuration == 0 ? 1.0 : -1.0;
+    metadata[configuration].log_abs = 0.7 + configuration;
+  }
+  std::array<double, 16> determinant_gradient{};
+  std::array<double, 6> determinant_laplacian{};
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+  {
+    for (std::size_t lane = 0; lane < 6; ++lane)
+      determinant_gradient[configuration * 8 + lane] = 0.1 * (1 + lane + 8 * configuration);
+    determinant_laplacian[configuration * 3] = -0.3 - configuration;
+    determinant_laplacian[configuration * 3 + 1] = 0.2 + configuration;
+  }
+  std::vector<double> cusp(psiformer::spatialJetSpanElements(layout.output), 0.0);
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+  {
+    cusp[layout.output.uncheckedValueOffset(configuration, 0)] = -0.25;
+    for (std::size_t lane = 0; lane < 6; ++lane)
+      cusp[layout.output.uncheckedGradientOffset(configuration, lane, 0)] = -0.01 * (lane + 1);
+    cusp[layout.output.uncheckedLaplacianOffset(configuration, 0, 0)] = 0.05;
+    cusp[layout.output.uncheckedLaplacianOffset(configuration, 1, 0)] = -0.07;
+  }
+  std::array<double, 2> phase{};
+  std::vector<double> output(psiformer::spatialJetSpanElements(layout.output), -9.0);
+  std::array<double, 8> ratio{};
+  for (std::size_t configuration = 0; configuration < 2; ++configuration)
+  {
+    CHECK(open_spatial::combineFinalSpatialForConfiguration(
+              layout, metadata.data(), derivative_status.data(),
+              determinant_gradient.data(), determinant_laplacian.data(), cusp.data(),
+              configuration, phase.data(), output.data(), ratio.data()) ==
+          psiformer::OpenSpatialStatus::REGULAR);
+    CHECK(phase[configuration] == metadata[configuration].phase);
+    checkClose(output[layout.output.uncheckedValueOffset(configuration, 0)],
+               metadata[configuration].log_abs - 0.25L);
+    for (std::size_t electron = 0; electron < 2; ++electron)
+    {
+      const long double lap_log = determinant_laplacian[configuration * 3 + electron] +
+          (electron == 0 ? 0.05L : -0.07L);
+      long double square = 0.0L;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const long double gradient = determinant_gradient[configuration * 8 + lane] -
+            0.01L * (lane + 1);
+        square += gradient * gradient;
+      }
+      checkClose(output[layout.output.uncheckedLaplacianOffset(configuration, electron, 0)],
+                 lap_log);
+      checkClose(ratio[configuration * 4 + electron], lap_log + square);
+    }
+  }
+  metadata[1].status = determinant::CombinationStatus::NODE;
+  CHECK(open_spatial::combineFinalSpatialForConfiguration(
+            layout, metadata.data(), derivative_status.data(), determinant_gradient.data(),
+            determinant_laplacian.data(), cusp.data(), 1, phase.data(), output.data(),
+            ratio.data()) == psiformer::OpenSpatialStatus::NODE);
+  CHECK(phase[1] == 0.0);
+  CHECK(ratio[4] == 0.0);
+  CHECK(ratio[5] == 0.0);
+  metadata[1].status = determinant::CombinationStatus::REGULAR;
+  derivative_status[1] = determinant::DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE;
+  CHECK(open_spatial::combineFinalSpatialForConfiguration(
+            layout, metadata.data(), derivative_status.data(), determinant_gradient.data(),
+            determinant_laplacian.data(), cusp.data(), 1, phase.data(), output.data(),
+            ratio.data()) == psiformer::OpenSpatialStatus::REQUIRED_INVERSE_UNAVAILABLE);
 }
 
 int main(int argc, char* argv[])
