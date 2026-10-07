@@ -42,6 +42,7 @@ set(WFBASE_SRCS
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
     PsiFormer/PsiFormerAcceleratorPlanning.cpp
+    PsiFormer/PsiFormerAcceleratorSchedule.cpp
     PsiFormer/PsiFormerExecutionPlan.cpp
     PsiFormer/PsiFormerMemoryPolicy.cpp
     PsiFormer/PsiFormerPrecisionPolicy.cpp
@@ -184,7 +185,7 @@ target_link_libraries(qmcwfs_omptarget PUBLIC spline2 qmcutil qmcparticle contai
 target_link_libraries(qmcwfs PUBLIC qmcwfs_omptarget)
 
 if(ENABLE_CUDA)
-  target_link_libraries(qmcwfs PRIVATE qmcwfs_cuda)
+  target_link_libraries(qmcwfs PRIVATE qmcwfs_cuda psiformer_device)
 elseif(ENABLE_SYCL)
   target_link_libraries(qmcwfs PRIVATE qmcwfs_sycl)
 endif()

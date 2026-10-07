@@ -114,6 +114,7 @@ set(TRIALWF_SRC
     test_TWFGrads.cpp
     test_virtual_particle_batch_dispatch.cpp
     test_psiformer_accelerator_planning.cpp
+    test_psiformer_accelerator_schedule.cpp
     test_psiformer_execution_plan.cpp
     test_psiformer_memory_policy.cpp
     test_psiformer_precision_policy.cpp
@@ -484,6 +485,16 @@ target_link_libraries(test_psiformer_native catch_main IO::HDF5)
 target_include_directories(test_psiformer_native PRIVATE "${qmcpack_SOURCE_DIR}/src")
 add_unit_test(deterministic-unit_test_psiformer_native 1 1 $<TARGET_FILE:test_psiformer_native>)
 set_tests_properties(deterministic-unit_test_psiformer_native PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# These host-callable cores are the exact scalar functions included by the CUDA/HIP
+# wrappers.  Their oracle suite remains available in ordinary CPU-only builds.
+add_executable(test_psiformer_device_math test_psiformer_device_math.cpp)
+target_link_libraries(test_psiformer_device_math qmc_external_catch2)
+target_include_directories(test_psiformer_device_math PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_device_math
+              1 1 $<TARGET_FILE:test_psiformer_device_math>)
+set_tests_properties(deterministic-unit_test_psiformer_device_math
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
 add_executable(test_psiformer_value_executor
                test_psiformer_value_executor.cpp
