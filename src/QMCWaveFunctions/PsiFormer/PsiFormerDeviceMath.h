@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define QMC_PF_HOST_DEVICE __host__ __device__
@@ -29,6 +30,25 @@
 
 namespace qmcplusplus::psiformer::device_math
 {
+
+enum class JetMathStatus : std::uint8_t
+{
+  REGULAR,
+  NONFINITE_INPUT,
+  NONFINITE_NORMALIZATION,
+  NONFINITE_RESULT
+};
+
+/** IEEE-754 classification that remains meaningful with accelerator fast-math. */
+QMC_PF_HOST_DEVICE QMC_PF_FORCE_INLINE bool isFiniteBinary64(double value) noexcept
+{
+  union Binary64
+  {
+    double floating;
+    std::uint64_t integer;
+  } encoded{value};
+  return (encoded.integer & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
 
 template<typename T>
 struct SoftenedRadial
@@ -124,6 +144,138 @@ QMC_PF_HOST_DEVICE QMC_PF_FORCE_INLINE ScalarJet<T> addJets(ScalarJet<T> left,
                                                             ScalarJet<T> right) noexcept
 {
   return {left.value + right.value, left.first + right.first, left.second + right.second};
+}
+
+/** General product rule for first lanes and one contracted trace-Laplacian.
+ *
+ * The Laplacian is formed before any gradient output, so output gradients may
+ * safely alias either input gradient array.
+ */
+template<typename T>
+QMC_PF_HOST_DEVICE inline void productJet(T left_value,
+                                          const T* left_gradient,
+                                          T left_laplacian,
+                                          T right_value,
+                                          const T* right_gradient,
+                                          T right_laplacian,
+                                          std::size_t gradient_dimensions,
+                                          T* output_value,
+                                          T* output_gradient,
+                                          T* output_laplacian) noexcept
+{
+  T gradient_dot = T(0);
+  for (std::size_t dimension = 0; dimension < gradient_dimensions; ++dimension)
+    gradient_dot += left_gradient[dimension] * right_gradient[dimension];
+  *output_laplacian = left_laplacian * right_value + T(2) * gradient_dot +
+      left_value * right_laplacian;
+  for (std::size_t dimension = 0; dimension < gradient_dimensions; ++dimension)
+    output_gradient[dimension] = left_gradient[dimension] * right_value +
+        left_value * right_gradient[dimension];
+  *output_value = left_value * right_value;
+}
+
+/** Stable in-place softmax of one multi-plane jet row.
+ *
+ * ``gradient`` addresses lane zero and ``laplacian`` addresses electron zero;
+ * successive planes are separated by ``plane_stride``. Trace-Laplacians are
+ * transformed before gradients because their centered rule consumes original
+ * logit gradients. The row maximum is a numerical shift only and carries no jet.
+ */
+QMC_PF_HOST_DEVICE inline JetMathStatus softmaxJetRowInPlace(
+    double* values,
+    double* gradient,
+    double* laplacian,
+    std::size_t width,
+    std::size_t plane_stride,
+    std::size_t gradient_lanes,
+    std::size_t laplacian_lanes) noexcept
+{
+  for (std::size_t column = 0; column < width; ++column)
+    if (!isFiniteBinary64(values[column]))
+      return JetMathStatus::NONFINITE_INPUT;
+  for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+    for (std::size_t column = 0; column < width; ++column)
+      if (!isFiniteBinary64(gradient[lane * plane_stride + column]))
+        return JetMathStatus::NONFINITE_INPUT;
+  for (std::size_t electron = 0; electron < laplacian_lanes; ++electron)
+    for (std::size_t column = 0; column < width; ++column)
+      if (!isFiniteBinary64(laplacian[electron * plane_stride + column]))
+        return JetMathStatus::NONFINITE_INPUT;
+
+  double maximum = values[0];
+  for (std::size_t column = 1; column < width; ++column)
+    maximum = values[column] > maximum ? values[column] : maximum;
+  double normalization = 0.0;
+  for (std::size_t column = 0; column < width; ++column)
+  {
+    values[column] = ::exp(values[column] - maximum);
+    normalization += values[column];
+  }
+  if (!isFiniteBinary64(normalization) || normalization <= 0.0)
+    return JetMathStatus::NONFINITE_NORMALIZATION;
+  for (std::size_t column = 0; column < width; ++column)
+    values[column] /= normalization;
+
+  for (std::size_t electron = 0; electron < laplacian_lanes; ++electron)
+  {
+    double mean_laplacian = 0.0;
+    double mean_gradient[3]{0.0, 0.0, 0.0};
+    for (std::size_t column = 0; column < width; ++column)
+    {
+      const double probability = values[column];
+      mean_laplacian += probability * laplacian[electron * plane_stride + column];
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        mean_gradient[dimension] += probability *
+            gradient[(3 * electron + dimension) * plane_stride + column];
+    }
+
+    double mean_squared_deviation = 0.0;
+    for (std::size_t column = 0; column < width; ++column)
+    {
+      double squared_deviation = 0.0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double deviation =
+            gradient[(3 * electron + dimension) * plane_stride + column] -
+            mean_gradient[dimension];
+        squared_deviation += deviation * deviation;
+      }
+      mean_squared_deviation += values[column] * squared_deviation;
+    }
+
+    for (std::size_t column = 0; column < width; ++column)
+    {
+      double squared_deviation = 0.0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double deviation =
+            gradient[(3 * electron + dimension) * plane_stride + column] -
+            mean_gradient[dimension];
+        squared_deviation += deviation * deviation;
+      }
+      const std::size_t index = electron * plane_stride + column;
+      laplacian[index] = values[column] *
+          (laplacian[index] - mean_laplacian + squared_deviation -
+           mean_squared_deviation);
+      if (!isFiniteBinary64(laplacian[index]))
+        return JetMathStatus::NONFINITE_RESULT;
+    }
+  }
+
+  for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+  {
+    double mean_gradient = 0.0;
+    for (std::size_t column = 0; column < width; ++column)
+      mean_gradient += values[column] * gradient[lane * plane_stride + column];
+    for (std::size_t column = 0; column < width; ++column)
+    {
+      const std::size_t index = lane * plane_stride + column;
+      gradient[index] = values[column] * (gradient[index] - mean_gradient);
+      if (!isFiniteBinary64(gradient[index]))
+        return JetMathStatus::NONFINITE_RESULT;
+    }
+  }
+  return JetMathStatus::REGULAR;
 }
 
 /** One atom contribution to an exponential orbital envelope. */

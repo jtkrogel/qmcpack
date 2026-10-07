@@ -12,6 +12,7 @@
 #include "PsiFormerDeviceKernels.h"
 #include "PsiFormerDeviceDense.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
+#include "PsiFormerDeviceSpatial.h"
 
 int main()
 {
@@ -37,9 +38,12 @@ int main()
           nullptr, qmcplusplus::psiformer::device_determinant::SpatialLayout{},
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
           nullptr, nullptr, nullptr, nullptr) == success;
+  const bool spatial_softmax_linked =
+      launchSoftmaxJetRows(nullptr, qmcplusplus::psiformer::SoftmaxJetRowLayout{},
+                           nullptr, nullptr) == success;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
-         determinant_spatial_linked
+         determinant_spatial_linked && spatial_softmax_linked
       ? 0
       : 1;
 }

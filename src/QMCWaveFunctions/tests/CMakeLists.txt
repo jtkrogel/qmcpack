@@ -515,6 +515,14 @@ add_unit_test(deterministic-unit_test_psiformer_device_determinant_math
 set_tests_properties(deterministic-unit_test_psiformer_device_determinant_math
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_device_spatial test_psiformer_device_spatial.cpp)
+target_link_libraries(test_psiformer_device_spatial qmc_external_catch2)
+target_include_directories(test_psiformer_device_spatial PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_device_spatial
+              1 1 $<TARGET_FILE:test_psiformer_device_spatial>)
+set_tests_properties(deterministic-unit_test_psiformer_device_spatial
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_value_executor
                test_psiformer_value_executor.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp

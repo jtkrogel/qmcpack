@@ -14,7 +14,8 @@ set(WFSSRCS_CUDA cuBLAS_LU.cu delayed_update_helper.cu matrix_update_helper.cu)
 set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceKernels.cu
     PsiFormerDeviceDense.cu
-    PsiFormerDeviceDeterminantKernels.cu)
+    PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDeviceSpatial.cu)
 
 add_library(qmcwfs_cuda ${WFSSRCS_CUDA})
 if(QMC_CUDA2HIP)
