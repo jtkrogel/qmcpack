@@ -33,6 +33,19 @@ Error launchDeterminantFactorization(
     double* solve,
     device_determinant::FactorizationMetadata* metadata);
 
+/** Serial-per-configuration signed-log determinant-channel reduction. */
+Error launchDeterminantCombination(
+    Stream stream,
+    const device_determinant::FactorizationMetadata* channel_metadata,
+    const double* coefficients,
+    std::size_t configuration_count,
+    std::size_t determinant_count,
+    double* term_phase,
+    double* term_log_abs,
+    double* scaled_terms,
+    double* normalized_weights,
+    device_determinant::CombinationMetadata* combination_metadata);
+
 } // namespace qmcplusplus::psiformer::device
 
 #endif // QMCPLUSPLUS_PSIFORMER_DEVICE_DETERMINANT_KERNELS_H

@@ -62,6 +62,32 @@ struct FactorizationMetadata
 static_assert(std::is_standard_layout_v<FactorizationMetadata>);
 static_assert(std::is_trivially_copyable_v<FactorizationMetadata>);
 
+enum class CombinationStatus : std::uint8_t
+{
+  REGULAR,
+  NODE,
+  NONFINITE_INPUT
+};
+
+/** Result and diagnostics for one configuration's determinant-channel sum. */
+struct CombinationMetadata
+{
+  double phase                          = 0.0;
+  double log_abs                        = negativeInfinityBinary64();
+  double reduction_shift                = negativeInfinityBinary64();
+  double sum_abs_scaled                 = 0.0;
+  double abs_sum_scaled                 = 0.0;
+  std::size_t singular_channels         = 0;
+  std::size_t underflowed_nonzero_terms = 0;
+  CombinationStatus status              = CombinationStatus::NODE;
+  bool all_required_inverses_available  = true;
+  bool normalized_weights_available     = false;
+  bool severe_cancellation              = false;
+};
+
+static_assert(std::is_standard_layout_v<CombinationMetadata>);
+static_assert(std::is_trivially_copyable_v<CombinationMetadata>);
+
 static_assert(sizeof(double) == sizeof(std::uint64_t));
 static_assert(std::numeric_limits<double>::is_iec559);
 
@@ -231,6 +257,158 @@ QMC_PF_DET_HOST_DEVICE inline FactorizationMetadata factorizeScaledReal(
   result.status               = FactorizationStatus::REGULAR;
   result.inverse_available    = prepare_inverse && inverse && solve &&
       buildInverse(lu, permutation, matrix_size, scale, inverse, solve);
+  return result;
+}
+
+/** Deterministic binary64 Neumaier accumulator shared by host and device. */
+struct CompensatedSumBinary64
+{
+  double sum        = 0.0;
+  double correction = 0.0;
+
+  QMC_PF_DET_HOST_DEVICE QMC_PF_DET_FORCE_INLINE void add(double value) noexcept
+  {
+    const double updated = sum + value;
+    if (::fabs(sum) >= ::fabs(value))
+      correction += (sum - updated) + value;
+    else
+      correction += (value - updated) + sum;
+    sum = updated;
+  }
+
+  QMC_PF_DET_HOST_DEVICE QMC_PF_DET_FORCE_INLINE double value() const noexcept
+  {
+    return sum + correction;
+  }
+};
+
+/** Combine one configuration's determinant channels in signed-log form.
+ *
+ * The caller supplies all per-channel output storage. A null coefficient pointer
+ * means coefficient one for every channel. At an exact node, normalized weights
+ * are cleared and marked unavailable. Device ``long double`` is not portably wider
+ * than double, so this baseline deliberately uses deterministic FP64 Neumaier
+ * summation. Terms lost by shifted-exponential underflow are counted explicitly.
+ */
+QMC_PF_DET_HOST_DEVICE inline CombinationMetadata combineChannelsReal(
+    const FactorizationMetadata* channel_metadata,
+    const double* coefficients,
+    std::size_t channel_count,
+    double* term_phase,
+    double* term_log_abs,
+    double* scaled_terms,
+    double* normalized_weights) noexcept
+{
+  CombinationMetadata result;
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+  {
+    term_phase[channel]         = 0.0;
+    term_log_abs[channel]       = negativeInfinityBinary64();
+    scaled_terms[channel]       = 0.0;
+    normalized_weights[channel] = 0.0;
+  }
+
+  bool invalid = false;
+  double shift = negativeInfinityBinary64();
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+  {
+    const FactorizationMetadata& factorization = channel_metadata[channel];
+    const double coefficient                   = coefficients ? coefficients[channel] : 1.0;
+    if (factorization.status == FactorizationStatus::SINGULAR)
+      ++result.singular_channels;
+    if (!isFiniteBinary64(coefficient) ||
+        factorization.status == FactorizationStatus::NONFINITE_INPUT)
+    {
+      invalid = true;
+      continue;
+    }
+    if (coefficient != 0.0 && !factorization.inverse_available)
+      result.all_required_inverses_available = false;
+    if (coefficient == 0.0 || factorization.status != FactorizationStatus::REGULAR ||
+        factorization.phase == 0.0)
+      continue;
+    if ((factorization.phase != 1.0 && factorization.phase != -1.0) ||
+        !isFiniteBinary64(factorization.log_abs))
+    {
+      invalid = true;
+      continue;
+    }
+
+    term_phase[channel] = coefficient < 0.0 ? -factorization.phase : factorization.phase;
+    term_log_abs[channel] = factorization.log_abs + ::log(::fabs(coefficient));
+    if (!isFiniteBinary64(term_log_abs[channel]))
+    {
+      invalid = true;
+      continue;
+    }
+    shift = term_log_abs[channel] > shift ? term_log_abs[channel] : shift;
+  }
+
+  if (invalid)
+  {
+    for (std::size_t channel = 0; channel < channel_count; ++channel)
+    {
+      term_phase[channel]         = 0.0;
+      term_log_abs[channel]       = negativeInfinityBinary64();
+      scaled_terms[channel]       = 0.0;
+      normalized_weights[channel] = 0.0;
+    }
+    result.status                          = CombinationStatus::NONFINITE_INPUT;
+    result.all_required_inverses_available = false;
+    return result;
+  }
+
+  result.reduction_shift = shift;
+  CompensatedSumBinary64 signed_sum;
+  CompensatedSumBinary64 absolute_sum;
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+  {
+    if (term_phase[channel] == 0.0)
+      continue;
+    const double magnitude = ::exp(term_log_abs[channel] - shift);
+    if (magnitude == 0.0)
+      ++result.underflowed_nonzero_terms;
+    scaled_terms[channel] = term_phase[channel] * magnitude;
+    signed_sum.add(scaled_terms[channel]);
+    absolute_sum.add(magnitude);
+  }
+
+  const double sum_scaled = signed_sum.value();
+  result.sum_abs_scaled   = absolute_sum.value();
+  result.abs_sum_scaled   = ::fabs(sum_scaled);
+  constexpr double severe_cancellation_ratio = 64.0 * DBL_EPSILON;
+  result.severe_cancellation = result.sum_abs_scaled > 0.0 &&
+      (result.underflowed_nonzero_terms != 0 ||
+       result.abs_sum_scaled <= severe_cancellation_ratio * result.sum_abs_scaled);
+
+  if (sum_scaled == 0.0 || !isFiniteBinary64(shift))
+    return result;
+
+  result.phase   = sum_scaled < 0.0 ? -1.0 : 1.0;
+  result.log_abs = shift + ::log(result.abs_sum_scaled);
+  if (!isFiniteBinary64(result.log_abs))
+  {
+    result.phase                           = 0.0;
+    result.log_abs                         = negativeInfinityBinary64();
+    result.status                         = CombinationStatus::NONFINITE_INPUT;
+    result.all_required_inverses_available = false;
+    return result;
+  }
+
+  bool finite_weights = true;
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+  {
+    normalized_weights[channel] = scaled_terms[channel] / sum_scaled;
+    finite_weights = finite_weights && isFiniteBinary64(normalized_weights[channel]);
+  }
+  if (!finite_weights)
+  {
+    for (std::size_t channel = 0; channel < channel_count; ++channel)
+      normalized_weights[channel] = 0.0;
+    result.severe_cancellation = true;
+  }
+  result.normalized_weights_available = finite_weights;
+  result.status                       = CombinationStatus::REGULAR;
   return result;
 }
 

@@ -40,6 +40,18 @@ struct FactorizationStorage
   std::vector<double> solve;
 };
 
+struct CombinationStorage
+{
+  explicit CombinationStorage(std::size_t channels)
+      : term_phase(channels), term_log_abs(channels), scaled_terms(channels), weights(channels)
+  {}
+
+  std::vector<double> term_phase;
+  std::vector<double> term_log_abs;
+  std::vector<double> scaled_terms;
+  std::vector<double> weights;
+};
+
 determinant::FactorizationMetadata factor(const std::vector<double>& matrix,
                                           std::size_t matrix_size,
                                           FactorizationStorage& storage,
@@ -48,6 +60,28 @@ determinant::FactorizationMetadata factor(const std::vector<double>& matrix,
   return determinant::factorizeScaledReal(
       matrix.data(), matrix_size, storage.lu.data(), storage.permutation.data(),
       prepare_inverse, storage.inverse.data(), storage.solve.data());
+}
+
+determinant::FactorizationMetadata signedLogChannel(double phase,
+                                                    double log_abs,
+                                                    bool inverse_available = true)
+{
+  determinant::FactorizationMetadata metadata;
+  metadata.phase             = phase;
+  metadata.log_abs           = log_abs;
+  metadata.status            = determinant::FactorizationStatus::REGULAR;
+  metadata.inverse_available = inverse_available;
+  return metadata;
+}
+
+determinant::CombinationMetadata combine(
+    const std::vector<determinant::FactorizationMetadata>& channels,
+    const double* coefficients,
+    CombinationStorage& storage)
+{
+  return determinant::combineChannelsReal(
+      channels.data(), coefficients, channels.size(), storage.term_phase.data(),
+      storage.term_log_abs.data(), storage.scaled_terms.data(), storage.weights.data());
 }
 
 long double referenceDeterminant(const double* matrix, std::size_t matrix_size)
@@ -225,6 +259,122 @@ TEST_CASE("PsiFormer determinant batch indexing keeps configurations isolated",
 
   CHECK(determinant::matrixIndex(1, 0, channels) == 2);
   CHECK(determinant::matrixOffset(3, matrix_size) == 12);
+}
+
+TEST_CASE("PsiFormer determinant channels preserve signed-log and singular semantics",
+          "[psiformer][device][determinant]")
+{
+  std::vector<determinant::FactorizationMetadata> channels{
+      signedLogChannel(1.0, std::log(2.0)),
+      signedLogChannel(-1.0, std::log(3.0)),
+      signedLogChannel(1.0, std::log(5.0)),
+      determinant::FactorizationMetadata{}};
+  std::array<double, 4> coefficients{1.0, -2.0, 0.0, 0.0};
+  CombinationStorage storage(channels.size());
+  auto result = combine(channels, coefficients.data(), storage);
+
+  CHECK(result.status == determinant::CombinationStatus::REGULAR);
+  CHECK(result.phase == 1.0);
+  CHECK(result.log_abs == Catch::Approx(std::log(8.0)));
+  CHECK(result.singular_channels == 1);
+  CHECK(result.all_required_inverses_available);
+  CHECK(result.normalized_weights_available);
+  CHECK(storage.term_phase == std::vector<double>{1.0, 1.0, 0.0, 0.0});
+  CHECK(storage.weights[0] == Catch::Approx(0.25));
+  CHECK(storage.weights[1] == Catch::Approx(0.75));
+  CHECK(storage.weights[2] == 0.0);
+  CHECK(storage.weights[3] == 0.0);
+
+  coefficients[3] = 1.0;
+  result = combine(channels, coefficients.data(), storage);
+  CHECK(result.status == determinant::CombinationStatus::REGULAR);
+  CHECK_FALSE(result.all_required_inverses_available);
+  CHECK(storage.scaled_terms[3] == 0.0);
+
+  coefficients[0] = std::numeric_limits<double>::infinity();
+  result = combine(channels, coefficients.data(), storage);
+  CHECK(result.status == determinant::CombinationStatus::NONFINITE_INPUT);
+  CHECK_FALSE(result.normalized_weights_available);
+}
+
+TEST_CASE("PsiFormer determinant channel cancellation is explicit and deterministic",
+          "[psiformer][device][determinant]")
+{
+  const auto unit = signedLogChannel(1.0, 0.0);
+  {
+    const std::vector<determinant::FactorizationMetadata> channels{unit, unit};
+    const std::array<double, 2> coefficients{1.0, -1.0};
+    CombinationStorage storage(channels.size());
+    const auto result = combine(channels, coefficients.data(), storage);
+    CHECK(result.status == determinant::CombinationStatus::NODE);
+    CHECK(result.phase == 0.0);
+    CHECK(result.log_abs == -std::numeric_limits<double>::infinity());
+    CHECK(result.sum_abs_scaled == 2.0);
+    CHECK(result.abs_sum_scaled == 0.0);
+    CHECK(result.underflowed_nonzero_terms == 0);
+    CHECK(result.severe_cancellation);
+    CHECK_FALSE(result.normalized_weights_available);
+    CHECK(storage.weights == std::vector<double>{0.0, 0.0});
+  }
+
+  {
+    constexpr double residual = 0x1p-40;
+    const std::vector<determinant::FactorizationMetadata> channels{
+        unit, signedLogChannel(1.0, std::log1p(-residual))};
+    const std::array<double, 2> coefficients{1.0, -1.0};
+    CombinationStorage storage(channels.size());
+    const auto result = combine(channels, coefficients.data(), storage);
+    CHECK(result.status == determinant::CombinationStatus::REGULAR);
+    CHECK(result.phase == 1.0);
+    CHECK(result.log_abs == Catch::Approx(std::log(residual)).epsilon(2.0e-4));
+    CHECK_FALSE(result.severe_cancellation);
+    CHECK(result.normalized_weights_available);
+    CHECK(storage.weights[0] == Catch::Approx(1.0 / residual).epsilon(2.0e-4));
+    CHECK(storage.weights[1] == Catch::Approx(-(1.0 / residual - 1.0)).epsilon(2.0e-4));
+  }
+
+  {
+    const std::vector<determinant::FactorizationMetadata> channels{
+        unit, unit, signedLogChannel(1.0, -800.0)};
+    const std::array<double, 3> coefficients{1.0, -1.0, 1.0};
+    CombinationStorage storage(channels.size());
+    const auto result = combine(channels, coefficients.data(), storage);
+    CHECK(result.status == determinant::CombinationStatus::NODE);
+    CHECK(result.underflowed_nonzero_terms == 1);
+    CHECK(result.sum_abs_scaled == 2.0);
+    CHECK(result.abs_sum_scaled == 0.0);
+    CHECK(result.severe_cancellation);
+    CHECK(storage.scaled_terms[2] == 0.0);
+  }
+}
+
+TEST_CASE("PsiFormer determinant channel batches remain configuration isolated",
+          "[psiformer][device][determinant]")
+{
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t channels_per_configuration = 2;
+  const std::vector<determinant::FactorizationMetadata> channels{
+      signedLogChannel(1.0, 0.0), signedLogChannel(1.0, std::log(2.0)),
+      signedLogChannel(-1.0, std::log(4.0)), signedLogChannel(1.0, 0.0)};
+  CombinationStorage storage(channels.size());
+  std::array<determinant::CombinationMetadata, configurations> results;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    const std::size_t offset = configuration * channels_per_configuration;
+    results[configuration] = determinant::combineChannelsReal(
+        channels.data() + offset, nullptr, channels_per_configuration,
+        storage.term_phase.data() + offset, storage.term_log_abs.data() + offset,
+        storage.scaled_terms.data() + offset, storage.weights.data() + offset);
+  }
+
+  CHECK(results[0].phase == 1.0);
+  CHECK(results[0].log_abs == Catch::Approx(std::log(3.0)));
+  CHECK(storage.weights[0] == Catch::Approx(1.0 / 3.0));
+  CHECK(storage.weights[1] == Catch::Approx(2.0 / 3.0));
+  CHECK(results[1].phase == -1.0);
+  CHECK(results[1].log_abs == Catch::Approx(std::log(3.0)));
+  CHECK(storage.weights[2] == Catch::Approx(4.0 / 3.0));
+  CHECK(storage.weights[3] == Catch::Approx(-1.0 / 3.0));
 }
 
 int main(int argc, char* argv[])

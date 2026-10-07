@@ -44,6 +44,27 @@ __global__ void determinantFactorizationKernel(
       solve ? solve + vector_offset : nullptr);
 }
 
+__global__ void determinantCombinationKernel(
+    const device_determinant::FactorizationMetadata* channel_metadata,
+    const double* coefficients,
+    std::size_t configuration_count,
+    std::size_t determinant_count,
+    double* term_phase,
+    double* term_log_abs,
+    double* scaled_terms,
+    double* normalized_weights,
+    device_determinant::CombinationMetadata* combination_metadata)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= configuration_count)
+    return;
+  const std::size_t offset = configuration * determinant_count;
+  combination_metadata[configuration] = device_determinant::combineChannelsReal(
+      channel_metadata + offset, coefficients, determinant_count,
+      term_phase + offset, term_log_abs + offset, scaled_terms + offset,
+      normalized_weights + offset);
+}
+
 std::size_t checkedProduct(std::size_t left, std::size_t right, const char* description)
 {
   if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left)
@@ -89,6 +110,43 @@ Error launchDeterminantFactorization(
   determinantFactorizationKernel<<<block_count, determinant_block_size, 0, stream>>>(
       matrices, matrix_count, matrix_size, prepare_inverse, lu, inverse,
       permutation, solve, metadata);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+Error launchDeterminantCombination(
+    Stream stream,
+    const device_determinant::FactorizationMetadata* channel_metadata,
+    const double* coefficients,
+    std::size_t configuration_count,
+    std::size_t determinant_count,
+    double* term_phase,
+    double* term_log_abs,
+    double* scaled_terms,
+    double* normalized_weights,
+    device_determinant::CombinationMetadata* combination_metadata)
+{
+  if (configuration_count == 0)
+    return success;
+  if (determinant_count == 0)
+    throw std::invalid_argument("PsiFormer determinant combination requires channels");
+  (void)checkedProduct(configuration_count, determinant_count,
+                       "PsiFormer determinant combination extent overflow");
+  if (configuration_count > std::numeric_limits<unsigned int>::max())
+    throw std::length_error("PsiFormer determinant combination grid exceeds the CUDA/HIP x dimension");
+  if (!channel_metadata || !term_phase || !term_log_abs || !scaled_terms ||
+      !normalized_weights || !combination_metadata)
+    throw std::invalid_argument("PsiFormer determinant combination storage is null");
+
+  const unsigned int block_count = static_cast<unsigned int>(
+      (configuration_count + determinant_block_size - 1) / determinant_block_size);
+  determinantCombinationKernel<<<block_count, determinant_block_size, 0, stream>>>(
+      channel_metadata, coefficients, configuration_count, determinant_count,
+      term_phase, term_log_abs, scaled_terms, normalized_weights,
+      combination_metadata);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else
