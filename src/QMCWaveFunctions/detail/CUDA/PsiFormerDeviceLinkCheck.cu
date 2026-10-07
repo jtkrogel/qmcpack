@@ -10,14 +10,19 @@
  */
 
 #include "PsiFormerDeviceKernels.h"
+#include "PsiFormerDeviceDense.h"
 
 int main()
 {
   using namespace qmcplusplus::psiformer::device;
   // Zero work performs no runtime call but keeps the wrapper translation unit in the
   // executable, forcing CUDA nvlink or the HIP device-link step to inspect it.
-  return launchResidualJets(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                            nullptr, 0, nullptr, nullptr, nullptr) == success
+  const bool foundation_linked =
+      launchResidualJets(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         nullptr, 0, nullptr, nullptr, nullptr) == success;
+  const bool attention_linked =
+      launchAttentionSoftmax(nullptr, qmcplusplus::psiformer::AttentionForwardLayout{}, nullptr) == success;
+  return foundation_linked && attention_linked
       ? 0
       : 1;
 }

@@ -11,7 +11,7 @@
 
 set(WFSSRCS_CUDA cuBLAS_LU.cu delayed_update_helper.cu matrix_update_helper.cu)
 
-set(PSIFORMER_DEVICE_SRCS PsiFormerDeviceKernels.cu)
+set(PSIFORMER_DEVICE_SRCS PsiFormerDeviceKernels.cu PsiFormerDeviceDense.cu)
 
 add_library(qmcwfs_cuda ${WFSSRCS_CUDA})
 if(QMC_CUDA2HIP)
@@ -34,7 +34,7 @@ endif()
 target_include_directories(psiformer_device PUBLIC
                            "${qmcpack_SOURCE_DIR}/src"
                            "${qmcpack_BINARY_DIR}/src")
-target_link_libraries(psiformer_device PUBLIC platform_cuda_runtime)
+target_link_libraries(psiformer_device PUBLIC platform_LA)
 
 # Explicit developer target: it is not a runtime CTest and may be built safely on
 # driverless development hosts to force the backend device-link step.

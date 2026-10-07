@@ -140,6 +140,20 @@ QMC_PF_HOST_DEVICE QMC_PF_FORCE_INLINE T cuspPair(T distance, T alpha, T cusp_fa
   return -cusp_factor * alpha * alpha / (alpha + distance);
 }
 
+/** Softmax exponential after the row maximum has been removed. */
+template<typename T>
+QMC_PF_HOST_DEVICE QMC_PF_FORCE_INLINE T shiftedExponential(T logit, T row_maximum) noexcept
+{
+  return ::exp(logit - row_maximum);
+}
+
+/** Normalize one already exponentiated softmax element. */
+template<typename T>
+QMC_PF_HOST_DEVICE QMC_PF_FORCE_INLINE T normalizeExponential(T exponential, T row_sum) noexcept
+{
+  return exponential / row_sum;
+}
+
 } // namespace qmcplusplus::psiformer::device_math
 
 #undef QMC_PF_HOST_DEVICE
