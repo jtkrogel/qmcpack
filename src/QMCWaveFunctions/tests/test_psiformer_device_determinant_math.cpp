@@ -377,6 +377,184 @@ TEST_CASE("PsiFormer determinant channel batches remain configuration isolated",
   CHECK(storage.weights[3] == Catch::Approx(-1.0 / 3.0));
 }
 
+TEST_CASE("PsiFormer determinant reverse and spatial traces match finite differences",
+          "[psiformer][device][determinant]")
+{
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t channels       = 2;
+  constexpr std::size_t matrix_size    = 2;
+  constexpr std::size_t matrix_elements = matrix_size * matrix_size;
+  constexpr std::size_t gradient_lanes = 3;
+  constexpr std::size_t electrons      = 1;
+  constexpr std::size_t channel_elements = channels * matrix_elements;
+  const std::array<double, channels> coefficients{1.0, -0.35};
+  const std::vector<double> matrices{
+      1.4, 0.2, -0.1, 1.1,
+      0.8, -0.3, 0.4, 1.2,
+      1.1, 0.25, 0.15, 0.95,
+      1.3, -0.2, 0.1, 0.85};
+  const std::array<double, 8> gradient_pattern{
+      0.07, -0.03, 0.02, 0.05, -0.04, 0.06, 0.01, -0.02};
+  const std::array<double, 8> laplacian_pattern{
+      0.03, 0.01, -0.02, 0.04, -0.01, 0.02, 0.05, -0.03};
+  std::vector<double> gradients(configurations * gradient_lanes * channel_elements);
+  std::vector<double> laplacians(configurations * electrons * channel_elements);
+  for (std::size_t element = 0; element < gradients.size(); ++element)
+    gradients[element] = gradient_pattern[element % gradient_pattern.size()] *
+        (1.0 + 0.1 * static_cast<double>(element / gradient_pattern.size()));
+  for (std::size_t element = 0; element < laplacians.size(); ++element)
+    laplacians[element] = laplacian_pattern[element % laplacian_pattern.size()] *
+        (1.0 + 0.2 * static_cast<double>(element / laplacian_pattern.size()));
+
+  std::vector<double> lu(matrices.size());
+  std::vector<double> inverses(matrices.size());
+  std::vector<std::size_t> permutations(configurations * channels * matrix_size);
+  std::vector<double> solve(configurations * channels * matrix_size);
+  std::vector<determinant::FactorizationMetadata> factorization(configurations * channels);
+  std::vector<double> term_phase(configurations * channels);
+  std::vector<double> term_log_abs(configurations * channels);
+  std::vector<double> scaled_terms(configurations * channels);
+  std::vector<double> weights(configurations * channels);
+  std::array<determinant::CombinationMetadata, configurations> combination;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    for (std::size_t channel = 0; channel < channels; ++channel)
+    {
+      const std::size_t matrix = configuration * channels + channel;
+      const std::size_t offset = matrix * matrix_elements;
+      factorization[matrix] = determinant::factorizeScaledReal(
+          matrices.data() + offset, matrix_size, lu.data() + offset,
+          permutations.data() + matrix * matrix_size, true,
+          inverses.data() + offset, solve.data() + matrix * matrix_size);
+    }
+    const std::size_t channel_offset = configuration * channels;
+    combination[configuration] = determinant::combineChannelsReal(
+        factorization.data() + channel_offset, coefficients.data(), channels,
+        term_phase.data() + channel_offset, term_log_abs.data() + channel_offset,
+        scaled_terms.data() + channel_offset, weights.data() + channel_offset);
+  }
+
+  const auto reference_wave = [&](const std::vector<double>& batch,
+                                  std::size_t configuration) {
+    long double value = 0.0L;
+    const std::size_t base = configuration * channel_elements;
+    for (std::size_t channel = 0; channel < channels; ++channel)
+      value += static_cast<long double>(coefficients[channel]) *
+          referenceDeterminant(batch.data() + base + channel * matrix_elements, matrix_size);
+    return value;
+  };
+
+  std::vector<double> reverse_seeds(matrices.size());
+  std::array<determinant::DerivativeStatus, configurations> reverse_status;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    const std::size_t channel_offset = configuration * channels;
+    const std::size_t matrix_offset  = configuration * channel_elements;
+    reverse_status[configuration] = determinant::fillMatrixReverseSeeds(
+        factorization.data() + channel_offset, combination[configuration],
+        weights.data() + channel_offset, inverses.data() + matrix_offset,
+        channels, matrix_size, reverse_seeds.data() + matrix_offset);
+    CHECK(reverse_status[configuration] == determinant::DerivativeStatus::AVAILABLE);
+  }
+
+  constexpr double reverse_step = 1.0e-6;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t element = 0; element < channel_elements; ++element)
+    {
+      std::vector<double> plus = matrices;
+      std::vector<double> minus = matrices;
+      const std::size_t offset = configuration * channel_elements + element;
+      plus[offset] += reverse_step;
+      minus[offset] -= reverse_step;
+      const double finite_difference = static_cast<double>(
+          (std::log(std::abs(reference_wave(plus, configuration))) -
+           std::log(std::abs(reference_wave(minus, configuration)))) /
+          (2.0L * reverse_step));
+      CHECK(reverse_seeds[offset] == Catch::Approx(finite_difference).epsilon(2.0e-8).margin(2.0e-8));
+    }
+
+  std::vector<double> matrix_product_scratch(configurations * matrix_elements);
+  std::vector<double> output_gradient(configurations * gradient_lanes);
+  std::vector<double> output_lap_ratio(configurations * electrons);
+  std::vector<double> output_lap_log(configurations * electrons);
+  std::array<determinant::DerivativeStatus, configurations> spatial_status;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    const std::size_t channel_offset = configuration * channels;
+    const std::size_t matrix_offset  = configuration * channel_elements;
+    spatial_status[configuration] = determinant::combineSpatialTraces(
+        factorization.data() + channel_offset, combination[configuration],
+        weights.data() + channel_offset, inverses.data() + matrix_offset,
+        gradients.data() + configuration * gradient_lanes * channel_elements,
+        laplacians.data() + configuration * electrons * channel_elements,
+        channels, matrix_size, gradient_lanes, electrons,
+        matrix_product_scratch.data() + configuration * matrix_elements,
+        output_gradient.data() + configuration * gradient_lanes,
+        output_lap_ratio.data() + configuration * electrons,
+        output_lap_log.data() + configuration * electrons);
+    CHECK(spatial_status[configuration] == determinant::DerivativeStatus::AVAILABLE);
+  }
+
+  constexpr double spatial_step = 2.0e-4;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    const long double wave = reference_wave(matrices, configuration);
+    long double finite_difference_lap_ratio = 0.0L;
+    long double squared_gradient            = 0.0L;
+    for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+    {
+      std::vector<double> plus = matrices;
+      std::vector<double> minus = matrices;
+      const std::size_t matrix_offset = configuration * channel_elements;
+      const std::size_t gradient_offset =
+          (configuration * gradient_lanes + lane) * channel_elements;
+      const std::size_t laplacian_offset = configuration * channel_elements;
+      for (std::size_t element = 0; element < channel_elements; ++element)
+      {
+        const double first = gradients[gradient_offset + element];
+        const double diagonal_second = laplacians[laplacian_offset + element] / 3.0;
+        plus[matrix_offset + element] += spatial_step * first +
+            0.5 * spatial_step * spatial_step * diagonal_second;
+        minus[matrix_offset + element] += -spatial_step * first +
+            0.5 * spatial_step * spatial_step * diagonal_second;
+      }
+      const long double plus_wave  = reference_wave(plus, configuration);
+      const long double minus_wave = reference_wave(minus, configuration);
+      const long double finite_difference_gradient =
+          (plus_wave - minus_wave) / (2.0L * spatial_step * wave);
+      finite_difference_lap_ratio +=
+          (plus_wave - 2.0L * wave + minus_wave) /
+          (spatial_step * spatial_step * wave);
+      squared_gradient += finite_difference_gradient * finite_difference_gradient;
+      CHECK(output_gradient[configuration * gradient_lanes + lane] ==
+            Catch::Approx(static_cast<double>(finite_difference_gradient))
+                .epsilon(2.0e-8).margin(2.0e-8));
+    }
+    CHECK(output_lap_ratio[configuration] ==
+          Catch::Approx(static_cast<double>(finite_difference_lap_ratio))
+              .epsilon(2.0e-6).margin(2.0e-7));
+    CHECK(output_lap_log[configuration] ==
+          Catch::Approx(static_cast<double>(finite_difference_lap_ratio - squared_gradient))
+              .epsilon(2.0e-6).margin(2.0e-7));
+  }
+
+  std::array<double, channel_elements> unavailable_output;
+  unavailable_output.fill(7.0);
+  const auto node_status = determinant::fillMatrixReverseSeeds(
+      factorization.data(), determinant::CombinationMetadata{}, weights.data(),
+      inverses.data(), channels, matrix_size, unavailable_output.data());
+  CHECK(node_status == determinant::DerivativeStatus::NODE);
+  CHECK(std::all_of(unavailable_output.begin(), unavailable_output.end(),
+                    [](double value) { return value == 0.0; }));
+
+  auto unavailable_combination = combination[0];
+  unavailable_combination.all_required_inverses_available = false;
+  const auto unavailable_status = determinant::fillMatrixReverseSeeds(
+      factorization.data(), unavailable_combination, weights.data(), inverses.data(),
+      channels, matrix_size, unavailable_output.data());
+  CHECK(unavailable_status == determinant::DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE);
+}
+
 int main(int argc, char* argv[])
 {
   return Catch::Session().run(argc, argv);

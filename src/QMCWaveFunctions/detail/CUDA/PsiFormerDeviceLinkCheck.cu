@@ -29,8 +29,17 @@ int main()
   const bool determinant_combination_linked =
       launchDeterminantCombination(nullptr, nullptr, nullptr, 0, 0,
                                    nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool determinant_reverse_linked =
+      launchDeterminantMatrixReverseSeeds(nullptr, nullptr, nullptr, nullptr, nullptr,
+                                          0, 0, 0, nullptr, nullptr) == success;
+  const bool determinant_spatial_linked =
+      launchDeterminantSpatialTraces(
+          nullptr, qmcplusplus::psiformer::device_determinant::SpatialLayout{},
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr, nullptr) == success;
   return foundation_linked && attention_linked && determinant_linked &&
-         determinant_combination_linked
+         determinant_combination_linked && determinant_reverse_linked &&
+         determinant_spatial_linked
       ? 0
       : 1;
 }

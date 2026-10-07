@@ -46,6 +46,35 @@ Error launchDeterminantCombination(
     double* normalized_weights,
     device_determinant::CombinationMetadata* combination_metadata);
 
+/** Fill [B,D,N,N] channel reverse seeds from prepared inverses and weights. */
+Error launchDeterminantMatrixReverseSeeds(
+    Stream stream,
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights,
+    const double* inverses,
+    std::size_t configuration_count,
+    std::size_t determinant_count,
+    std::size_t matrix_size,
+    double* reverse_seeds,
+    device_determinant::DerivativeStatus* status);
+
+/** Evaluate canonical [B,lane,D,N,N] determinant spatial trace planes. */
+Error launchDeterminantSpatialTraces(
+    Stream stream,
+    device_determinant::SpatialLayout layout,
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights,
+    const double* inverses,
+    const double* matrix_gradients,
+    const double* matrix_laplacians,
+    double* matrix_product_scratch,
+    double* output_log_gradient,
+    double* output_lap_ratio,
+    double* output_lap_log,
+    device_determinant::DerivativeStatus* status);
+
 } // namespace qmcplusplus::psiformer::device
 
 #endif // QMCPLUSPLUS_PSIFORMER_DEVICE_DETERMINANT_KERNELS_H

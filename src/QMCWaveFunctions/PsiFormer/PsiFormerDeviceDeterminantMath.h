@@ -88,6 +88,27 @@ struct CombinationMetadata
 static_assert(std::is_standard_layout_v<CombinationMetadata>);
 static_assert(std::is_trivially_copyable_v<CombinationMetadata>);
 
+enum class DerivativeStatus : std::uint8_t
+{
+  AVAILABLE,
+  NODE,
+  REQUIRED_INVERSE_UNAVAILABLE,
+  NONFINITE_INPUT_OR_RESULT
+};
+
+/** Canonical spatial storage is [B,lane,D,N,N] and [B,electron,D,N,N]. */
+struct SpatialLayout
+{
+  std::size_t configuration_count = 0;
+  std::size_t determinant_count   = 0;
+  std::size_t matrix_size         = 0;
+  std::size_t gradient_lanes      = 0;
+  std::size_t electron_count      = 0;
+};
+
+static_assert(std::is_standard_layout_v<SpatialLayout>);
+static_assert(std::is_trivially_copyable_v<SpatialLayout>);
+
 static_assert(sizeof(double) == sizeof(std::uint64_t));
 static_assert(std::numeric_limits<double>::is_iec559);
 
@@ -410,6 +431,226 @@ QMC_PF_DET_HOST_DEVICE inline CombinationMetadata combineChannelsReal(
   result.normalized_weights_available = finite_weights;
   result.status                       = CombinationStatus::REGULAR;
   return result;
+}
+
+QMC_PF_DET_HOST_DEVICE inline DerivativeStatus derivativeAvailability(
+    const FactorizationMetadata* factorization,
+    const CombinationMetadata& combination,
+    const double* normalized_weights,
+    std::size_t channel_count) noexcept
+{
+  if (combination.status == CombinationStatus::NODE || combination.phase == 0.0)
+    return DerivativeStatus::NODE;
+  if (combination.status != CombinationStatus::REGULAR ||
+      !combination.normalized_weights_available)
+    return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  if (!combination.all_required_inverses_available)
+    return DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE;
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+  {
+    const double weight = normalized_weights[channel];
+    if (!isFiniteBinary64(weight))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+    if (factorization[channel].status == FactorizationStatus::NONFINITE_INPUT)
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+    if (weight != 0.0 &&
+        (factorization[channel].status != FactorizationStatus::REGULAR ||
+         !factorization[channel].inverse_available))
+      return DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE;
+  }
+  return DerivativeStatus::AVAILABLE;
+}
+
+/** Fill channel-major d log|Psi|/d A_k = w_k A_k^-T. */
+QMC_PF_DET_HOST_DEVICE inline DerivativeStatus fillMatrixReverseSeeds(
+    const FactorizationMetadata* factorization,
+    const CombinationMetadata& combination,
+    const double* normalized_weights,
+    const double* inverses,
+    std::size_t channel_count,
+    std::size_t matrix_size,
+    double* reverse_seeds) noexcept
+{
+  const std::size_t matrix_elements = matrix_size * matrix_size;
+  clearMatrix(reverse_seeds, channel_count * matrix_elements);
+  const DerivativeStatus availability = derivativeAvailability(
+      factorization, combination, normalized_weights, channel_count);
+  if (availability != DerivativeStatus::AVAILABLE)
+    return availability;
+
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+  {
+    const double weight = normalized_weights[channel];
+    if (weight == 0.0)
+      continue;
+    const double* inverse = inverses + channel * matrix_elements;
+    for (std::size_t element = 0; element < matrix_elements; ++element)
+      if (!isFiniteBinary64(inverse[element]))
+      {
+        clearMatrix(reverse_seeds, channel_count * matrix_elements);
+        return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+      }
+    for (std::size_t row = 0; row < matrix_size; ++row)
+      for (std::size_t column = 0; column < matrix_size; ++column)
+      {
+        const std::size_t output = channel * matrix_elements + row * matrix_size + column;
+        reverse_seeds[output] = weight * inverse[column * matrix_size + row];
+        if (!isFiniteBinary64(reverse_seeds[output]))
+        {
+          clearMatrix(reverse_seeds, channel_count * matrix_elements);
+          return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+        }
+      }
+  }
+  return DerivativeStatus::AVAILABLE;
+}
+
+QMC_PF_DET_HOST_DEVICE inline double traceProductBinary64(const double* left,
+                                                          const double* right,
+                                                          std::size_t matrix_size) noexcept
+{
+  CompensatedSumBinary64 trace;
+  for (std::size_t row = 0; row < matrix_size; ++row)
+    for (std::size_t column = 0; column < matrix_size; ++column)
+      trace.add(left[row * matrix_size + column] * right[column * matrix_size + row]);
+  return trace.value();
+}
+
+QMC_PF_DET_HOST_DEVICE inline double inverseProductSquareTraceBinary64(
+    const double* inverse,
+    const double* derivative,
+    std::size_t matrix_size,
+    double* matrix_product) noexcept
+{
+  for (std::size_t row = 0; row < matrix_size; ++row)
+    for (std::size_t column = 0; column < matrix_size; ++column)
+    {
+      CompensatedSumBinary64 entry;
+      for (std::size_t inner = 0; inner < matrix_size; ++inner)
+        entry.add(inverse[row * matrix_size + inner] *
+                  derivative[inner * matrix_size + column]);
+      matrix_product[row * matrix_size + column] = entry.value();
+    }
+
+  CompensatedSumBinary64 trace;
+  for (std::size_t row = 0; row < matrix_size; ++row)
+    for (std::size_t column = 0; column < matrix_size; ++column)
+      trace.add(matrix_product[row * matrix_size + column] *
+                matrix_product[column * matrix_size + row]);
+  return trace.value();
+}
+
+/** Combine determinant spatial traces for one configuration.
+ *
+ * Gradient planes are [lane,D,N,N], diagonal-second-derivative planes are
+ * [electron,D,N,N], and matrix_product is caller-owned N*N scratch.
+ */
+QMC_PF_DET_HOST_DEVICE inline DerivativeStatus combineSpatialTraces(
+    const FactorizationMetadata* factorization,
+    const CombinationMetadata& combination,
+    const double* normalized_weights,
+    const double* inverses,
+    const double* matrix_gradients,
+    const double* matrix_laplacians,
+    std::size_t channel_count,
+    std::size_t matrix_size,
+    std::size_t gradient_lanes,
+    std::size_t electron_count,
+    double* matrix_product,
+    double* output_log_gradient,
+    double* output_lap_ratio,
+    double* output_lap_log) noexcept
+{
+  const std::size_t matrix_elements = matrix_size * matrix_size;
+  const std::size_t channel_elements = channel_count * matrix_elements;
+  clearMatrix(output_log_gradient, gradient_lanes);
+  clearMatrix(output_lap_ratio, electron_count);
+  clearMatrix(output_lap_log, electron_count);
+  clearMatrix(matrix_product, matrix_elements);
+
+  const DerivativeStatus availability = derivativeAvailability(
+      factorization, combination, normalized_weights, channel_count);
+  if (availability != DerivativeStatus::AVAILABLE)
+    return availability;
+
+  for (std::size_t channel = 0; channel < channel_count; ++channel)
+    if (normalized_weights[channel] != 0.0)
+      for (std::size_t element = 0; element < matrix_elements; ++element)
+        if (!isFiniteBinary64(inverses[channel * matrix_elements + element]))
+          return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  for (std::size_t element = 0; element < gradient_lanes * channel_elements; ++element)
+    if (!isFiniteBinary64(matrix_gradients[element]))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  for (std::size_t element = 0; element < electron_count * channel_elements; ++element)
+    if (!isFiniteBinary64(matrix_laplacians[element]))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+
+  for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+  {
+    CompensatedSumBinary64 combined_trace;
+    for (std::size_t channel = 0; channel < channel_count; ++channel)
+    {
+      const double weight = normalized_weights[channel];
+      if (weight == 0.0)
+        continue;
+      const double* inverse = inverses + channel * matrix_elements;
+      const double* gradient = matrix_gradients + lane * channel_elements +
+          channel * matrix_elements;
+      combined_trace.add(weight * traceProductBinary64(inverse, gradient, matrix_size));
+    }
+    output_log_gradient[lane] = combined_trace.value();
+    if (!isFiniteBinary64(output_log_gradient[lane]))
+    {
+      clearMatrix(output_log_gradient, gradient_lanes);
+      clearMatrix(output_lap_ratio, electron_count);
+      clearMatrix(output_lap_log, electron_count);
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+    }
+  }
+
+  for (std::size_t electron = 0; electron < electron_count; ++electron)
+  {
+    CompensatedSumBinary64 combined_laplacian;
+    for (std::size_t channel = 0; channel < channel_count; ++channel)
+    {
+      const double weight = normalized_weights[channel];
+      if (weight == 0.0)
+        continue;
+      const double* inverse = inverses + channel * matrix_elements;
+      const double* laplacian = matrix_laplacians + electron * channel_elements +
+          channel * matrix_elements;
+      CompensatedSumBinary64 channel_bracket;
+      channel_bracket.add(traceProductBinary64(inverse, laplacian, matrix_size));
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const double* gradient = matrix_gradients + lane * channel_elements +
+            channel * matrix_elements;
+        const double trace = traceProductBinary64(inverse, gradient, matrix_size);
+        channel_bracket.add(trace * trace);
+        channel_bracket.add(-inverseProductSquareTraceBinary64(
+            inverse, gradient, matrix_size, matrix_product));
+      }
+      combined_laplacian.add(weight * channel_bracket.value());
+    }
+    output_lap_ratio[electron] = combined_laplacian.value();
+    CompensatedSumBinary64 squared_gradient;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double component = output_log_gradient[3 * electron + dimension];
+      squared_gradient.add(component * component);
+    }
+    output_lap_log[electron] = output_lap_ratio[electron] - squared_gradient.value();
+    if (!isFiniteBinary64(output_lap_ratio[electron]) ||
+        !isFiniteBinary64(output_lap_log[electron]))
+    {
+      clearMatrix(output_log_gradient, gradient_lanes);
+      clearMatrix(output_lap_ratio, electron_count);
+      clearMatrix(output_lap_log, electron_count);
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+    }
+  }
+  return DerivativeStatus::AVAILABLE;
 }
 
 } // namespace qmcplusplus::psiformer::device_determinant
