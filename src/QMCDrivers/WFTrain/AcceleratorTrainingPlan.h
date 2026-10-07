@@ -48,7 +48,8 @@ struct AcceleratorRankPlanInput
   std::size_t device_id         = 0;
   std::size_t local_sample_count = 0;
   std::optional<std::size_t> device_budget_bytes;
-  std::size_t required_device_bytes = 0;
+  /// Device bytes required before adding this plan's collective buffers.
+  std::size_t base_required_device_bytes = 0;
   std::size_t maximum_chunk_elements = 0;
   std::size_t parameter_version = 0;
   std::uint64_t model_fingerprint = 0;
@@ -87,6 +88,8 @@ struct AcceleratorDistributedPlan
   std::size_t buffer_slots       = 1;
   std::size_t host_staging_bytes_per_rank = 0;
   std::size_t device_collective_bytes_per_rank = 0;
+  /// Complete device requirement in rank order, including collective buffers.
+  std::vector<std::size_t> required_device_bytes_per_rank;
   std::uint64_t model_fingerprint     = 0;
   std::uint64_t precision_fingerprint = 0;
   std::uint64_t fingerprint           = 0;
@@ -165,6 +168,7 @@ AcceleratorRestartMode validateAcceleratorRestart(
     std::size_t requested_participant_count,
     std::uint64_t expected_model_fingerprint,
     std::uint64_t expected_precision_fingerprint,
+    std::uint64_t expected_plan_fingerprint,
     bool allow_rank_count_change);
 
 } // namespace qmcplusplus::wftrain

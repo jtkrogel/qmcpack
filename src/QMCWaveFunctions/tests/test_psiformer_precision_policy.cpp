@@ -162,6 +162,11 @@ TEST_CASE("PsiFormer numerical diagnostics request deterministic FP64 retry",
   CHECK(aggregate.maximum_gradient_norm == 2.0);
   CHECK(aggregate.maximum_update_norm == 0.25);
   CHECK(aggregate.requiresFullPrecisionRetry());
+
+  aggregate.nonfinite_count = std::numeric_limits<std::uint64_t>::max();
+  tile.nonfinite_count      = 1;
+  aggregate.merge(tile);
+  CHECK(aggregate.nonfinite_count == std::numeric_limits<std::uint64_t>::max());
 }
 
 } // namespace qmcplusplus::psiformer

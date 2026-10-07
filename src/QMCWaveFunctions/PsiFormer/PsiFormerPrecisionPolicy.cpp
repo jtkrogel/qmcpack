@@ -53,15 +53,21 @@ bool lowerPrecisionDenseOperation(PsiFormerArithmeticOperation operation) noexce
   }
 }
 
-/// Extend a stable FNV-1a fingerprint with one byte interval.
-template<class T>
-void extendFingerprint(std::uint64_t& fingerprint, const T& value) noexcept
+/// Saturating addition prevents a wrapped diagnostic counter from hiding a hazard.
+std::uint64_t saturatingAdd(std::uint64_t lhs, std::uint64_t rhs) noexcept
 {
-  const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
-  for (std::size_t byte = 0; byte < sizeof(T); ++byte)
+  const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+  return lhs > maximum - rhs ? maximum : lhs + rhs;
+}
+
+/// Extend a stable FNV-1a fingerprint with one fixed-width unsigned value.
+void extendFingerprint(std::uint64_t& fingerprint, std::uint64_t value) noexcept
+{
+  for (std::size_t byte = 0; byte < sizeof(value); ++byte)
   {
-    fingerprint ^= bytes[byte];
+    fingerprint ^= static_cast<unsigned char>(value & UINT64_C(0xff));
     fingerprint *= UINT64_C(1099511628211);
+    value >>= 8;
   }
 }
 
@@ -82,11 +88,14 @@ bool PsiFormerNumericalDiagnostics::requiresFullPrecisionRetry() const noexcept
 
 void PsiFormerNumericalDiagnostics::merge(const PsiFormerNumericalDiagnostics& other) noexcept
 {
-  nonfinite_count += other.nonfinite_count;
-  invalid_softmax_count += other.invalid_softmax_count;
-  small_determinant_pivot_count += other.small_determinant_pivot_count;
-  severe_cancellation_count += other.severe_cancellation_count;
-  extreme_ecp_ratio_count += other.extreme_ecp_ratio_count;
+  nonfinite_count = saturatingAdd(nonfinite_count, other.nonfinite_count);
+  invalid_softmax_count = saturatingAdd(invalid_softmax_count, other.invalid_softmax_count);
+  small_determinant_pivot_count = saturatingAdd(small_determinant_pivot_count,
+                                                other.small_determinant_pivot_count);
+  severe_cancellation_count = saturatingAdd(severe_cancellation_count,
+                                            other.severe_cancellation_count);
+  extreme_ecp_ratio_count = saturatingAdd(extreme_ecp_ratio_count,
+                                          other.extreme_ecp_ratio_count);
   maximum_absolute_laplacian = std::max(maximum_absolute_laplacian,
                                         other.maximum_absolute_laplacian);
   maximum_gradient_norm = std::max(maximum_gradient_norm, other.maximum_gradient_norm);
@@ -199,18 +208,18 @@ PsiFormerPrecisionStorageRequirements makePsiFormerPrecisionStorageRequirements(
 std::uint64_t psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy policy) noexcept
 {
   std::uint64_t fingerprint = UINT64_C(14695981039346656037);
-  extendFingerprint(fingerprint, policy);
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(policy));
   for (std::uint8_t index = 0;
        index < static_cast<std::uint8_t>(PsiFormerArithmeticOperation::COUNT);
        ++index)
   {
     const PsiFormerPrecisionRule rule =
         psiFormerPrecisionRule(policy, static_cast<PsiFormerArithmeticOperation>(index));
-    extendFingerprint(fingerprint, rule.storage);
-    extendFingerprint(fingerprint, rule.compute);
-    extendFingerprint(fingerprint, rule.accumulation);
-    extendFingerprint(fingerprint, rule.numerically_sensitive);
-    extendFingerprint(fingerprint, rule.allow_fast_math);
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rule.storage));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rule.compute));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rule.accumulation));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rule.numerically_sensitive));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rule.allow_fast_math));
   }
   return fingerprint;
 }

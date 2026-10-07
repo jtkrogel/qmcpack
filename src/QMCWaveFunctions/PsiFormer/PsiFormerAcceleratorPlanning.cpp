@@ -23,15 +23,14 @@ namespace qmcplusplus::psiformer
 namespace
 {
 
-/// Extend a stable FNV-1a fingerprint with one trivially represented value.
-template<class T>
-void extendFingerprint(std::uint64_t& fingerprint, const T& value) noexcept
+/// Extend a stable FNV-1a fingerprint with one fixed-width unsigned value.
+void extendFingerprint(std::uint64_t& fingerprint, std::uint64_t value) noexcept
 {
-  const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
-  for (std::size_t byte = 0; byte < sizeof(T); ++byte)
+  for (std::size_t byte = 0; byte < sizeof(value); ++byte)
   {
-    fingerprint ^= bytes[byte];
+    fingerprint ^= static_cast<unsigned char>(value & UINT64_C(0xff));
     fingerprint *= UINT64_C(1099511628211);
+    value >>= 8;
   }
 }
 
@@ -222,21 +221,21 @@ PsiFormerDeviceLayout makePsiFormerDeviceLayout(const PsiFormerExecutionPlan& pl
                                   layout.model_shape.attention_heads,
                                   layout.model_shape.attention_blocks,
                                   layout.parameter_count})
-    extendFingerprint(fingerprint, value);
-  extendFingerprint(fingerprint, layout.boundary);
-  extendFingerprint(fingerprint, layout.geometry_feature_policy);
-  extendFingerprint(fingerprint, layout.parameter_scalar_domain);
-  extendFingerprint(fingerprint, layout.compute_scalar_domain);
-  extendFingerprint(fingerprint, layout.amplitude_scalar_domain);
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(value));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(layout.boundary));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(layout.geometry_feature_policy));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(layout.parameter_scalar_domain));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(layout.compute_scalar_domain));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(layout.amplitude_scalar_domain));
   for (const PsiFormerDeviceTensorDescriptor& tensor : layout.tensors)
   {
-    extendFingerprint(fingerprint, tensor.role);
-    extendFingerprint(fingerprint, tensor.attention_block);
-    extendFingerprint(fingerprint, tensor.rank);
-    extendFingerprint(fingerprint, tensor.extents[0]);
-    extendFingerprint(fingerprint, tensor.extents[1]);
-    extendFingerprint(fingerprint, tensor.begin);
-    extendFingerprint(fingerprint, tensor.end);
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.role));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.attention_block));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.rank));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.extents[0]));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.extents[1]));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.begin));
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(tensor.end));
   }
   layout.fingerprint = fingerprint;
   return layout;

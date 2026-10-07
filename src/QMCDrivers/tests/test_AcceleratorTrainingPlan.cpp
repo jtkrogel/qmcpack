@@ -34,7 +34,7 @@ AcceleratorRankPlanInput makeRank(std::size_t rank,
           /*device_id=*/rank < 2 ? rank : 0U,
           /*local_sample_count=*/local_samples,
           /*device_budget_bytes=*/std::size_t{4096},
-          /*required_device_bytes=*/2048,
+          /*base_required_device_bytes=*/2048,
           /*maximum_chunk_elements=*/chunk,
           /*parameter_version=*/7,
           /*model_fingerprint=*/101,
@@ -60,6 +60,7 @@ TEST_CASE("Accelerator training plan selects one bounded canonical schedule",
   CHECK(plan.chunk_elements == 2);
   CHECK(plan.host_staging_bytes_per_rank == 64);
   CHECK(plan.device_collective_bytes_per_rank == 64);
+  CHECK(plan.required_device_bytes_per_rank == std::vector<std::size_t>{2112, 2112, 2112});
   CHECK(plan.fingerprint != 0);
   REQUIRE(plan.chunks.size() == 3);
   CHECK(plan.chunks[0] == AcceleratorChunkDescriptor{0, 0, 2});
@@ -107,11 +108,19 @@ TEST_CASE("Accelerator training plan validates all rank metadata and budgets",
                   std::invalid_argument);
   ranks[2].precision_fingerprint = 202;
 
-  ranks[1].required_device_bytes = 4097;
+  ranks[1].base_required_device_bytes = 4097;
   CHECK_THROWS_WITH(makeAcceleratorDistributedPlan(
                         ranks, 8, 16, AcceleratorTransportRequest::AUTO),
                     Catch::Matchers::ContainsSubstring("hard budget"));
-  ranks[1].required_device_bytes = 2048;
+  ranks[1].base_required_device_bytes = 2048;
+
+  // The collective allocation is part of feasibility, not an unaccounted
+  // post-plan addition to an otherwise legal base workspace.
+  ranks[0].device_budget_bytes = 2050;
+  CHECK_THROWS_WITH(makeAcceleratorDistributedPlan(
+                        ranks, 8, 16, AcceleratorTransportRequest::AUTO),
+                    Catch::Matchers::ContainsSubstring("hard budget"));
+  ranks[0].device_budget_bytes = 4096;
 
   ranks[0].maximum_chunk_elements = 0;
   CHECK_THROWS_AS(makeAcceleratorDistributedPlan(
@@ -167,18 +176,21 @@ TEST_CASE("Accelerator checkpoint restart distinguishes exact and repartitioned 
                                          /*model_fingerprint=*/101,
                                          /*precision_fingerprint=*/202,
                                          /*plan_fingerprint=*/303};
-  CHECK(validateAcceleratorRestart(manifest, 4, 101, 202, false) ==
+  CHECK(validateAcceleratorRestart(manifest, 4, 101, 202, 303, false) ==
         AcceleratorRestartMode::EXACT_DECOMPOSITION);
-  CHECK(validateAcceleratorRestart(manifest, 2, 101, 202, true) ==
+  CHECK(validateAcceleratorRestart(manifest, 2, 101, 202, 999, true) ==
         AcceleratorRestartMode::STATISTICAL_REPARTITION);
-  CHECK_THROWS_WITH(validateAcceleratorRestart(manifest, 2, 101, 202, false),
+  CHECK_THROWS_WITH(validateAcceleratorRestart(manifest, 2, 101, 202, 999, false),
                     Catch::Matchers::ContainsSubstring("rank-count change"));
 
+  CHECK_THROWS_WITH(validateAcceleratorRestart(manifest, 4, 101, 202, 999, false),
+                    Catch::Matchers::ContainsSubstring("execution-plan fingerprint"));
+
   manifest.complete = false;
-  CHECK_THROWS_WITH(validateAcceleratorRestart(manifest, 4, 101, 202, false),
+  CHECK_THROWS_WITH(validateAcceleratorRestart(manifest, 4, 101, 202, 303, false),
                     Catch::Matchers::ContainsSubstring("incomplete"));
   manifest.complete = true;
-  CHECK_THROWS_AS(validateAcceleratorRestart(manifest, 4, 999, 202, false),
+  CHECK_THROWS_AS(validateAcceleratorRestart(manifest, 4, 999, 202, 303, false),
                   std::invalid_argument);
 }
 

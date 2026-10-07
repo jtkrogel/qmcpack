@@ -39,15 +39,14 @@ std::size_t checkedMultiply(std::size_t lhs, std::size_t rhs, const char* descri
   return lhs * rhs;
 }
 
-/// Extend a stable FNV-1a plan identity with one trivially represented value.
-template<class T>
-void extendFingerprint(std::uint64_t& fingerprint, const T& value) noexcept
+/// Extend a stable FNV-1a plan identity with one fixed-width unsigned value.
+void extendFingerprint(std::uint64_t& fingerprint, std::uint64_t value) noexcept
 {
-  const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
-  for (std::size_t byte = 0; byte < sizeof(T); ++byte)
+  for (std::size_t byte = 0; byte < sizeof(value); ++byte)
   {
-    fingerprint ^= bytes[byte];
+    fingerprint ^= static_cast<unsigned char>(value & UINT64_C(0xff));
     fingerprint *= UINT64_C(1099511628211);
+    value >>= 8;
   }
 }
 
@@ -121,8 +120,6 @@ AcceleratorDistributedPlan makeAcceleratorDistributedPlan(
       throw std::invalid_argument("Accelerator training rank semantic metadata mismatch");
     if (rank->maximum_chunk_elements == 0)
       throw std::invalid_argument("Accelerator rank reports a zero collective chunk capacity");
-    if (rank->device_budget_bytes && rank->required_device_bytes > *rank->device_budget_bytes)
-      throw std::runtime_error("Accelerator rank device-memory plan exceeds its hard budget");
     if (!placements.emplace(rank->node_id, rank->device_id).second)
       throw std::invalid_argument("Accelerator topology assigns two local ranks to the same device");
 
@@ -169,23 +166,34 @@ AcceleratorDistributedPlan makeAcceleratorDistributedPlan(
     plan.host_staging_bytes_per_rank = checkedMultiply(
         one_slot_bytes, buffer_slots, "pinned host collective buffers");
 
+  plan.required_device_bytes_per_rank.reserve(ordered.size());
+  for (const AcceleratorRankPlanInput* rank : ordered)
+  {
+    const std::size_t required = checkedAdd(
+        rank->base_required_device_bytes, plan.device_collective_bytes_per_rank,
+        "rank device storage including collectives");
+    if (rank->device_budget_bytes && required > *rank->device_budget_bytes)
+      throw std::runtime_error("Accelerator rank device-memory plan exceeds its hard budget");
+    plan.required_device_bytes_per_rank.push_back(required);
+  }
+
   std::uint64_t fingerprint = UINT64_C(14695981039346656037);
   constexpr std::uint64_t protocol_version = 1;
   extendFingerprint(fingerprint, protocol_version);
-  extendFingerprint(fingerprint, plan.transport);
-  extendFingerprint(fingerprint, plan.participant_count);
-  extendFingerprint(fingerprint, plan.parameter_count);
-  extendFingerprint(fingerprint, plan.parameter_version);
-  extendFingerprint(fingerprint, plan.chunk_elements);
-  extendFingerprint(fingerprint, plan.collective_element_bytes);
-  extendFingerprint(fingerprint, plan.buffer_slots);
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.transport));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.participant_count));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.parameter_count));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.parameter_version));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.chunk_elements));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.collective_element_bytes));
+  extendFingerprint(fingerprint, static_cast<std::uint64_t>(plan.buffer_slots));
   extendFingerprint(fingerprint, plan.model_fingerprint);
   extendFingerprint(fingerprint, plan.precision_fingerprint);
   for (const AcceleratorRankPlanInput* rank : ordered)
   {
-    extendFingerprint(fingerprint, rank->rank);
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rank->rank));
     extendFingerprint(fingerprint, rank->node_id);
-    extendFingerprint(fingerprint, rank->device_id);
+    extendFingerprint(fingerprint, static_cast<std::uint64_t>(rank->device_id));
   }
   plan.fingerprint = fingerprint;
   return plan;
@@ -222,6 +230,7 @@ AcceleratorRestartMode validateAcceleratorRestart(
     std::size_t requested_participant_count,
     std::uint64_t expected_model_fingerprint,
     std::uint64_t expected_precision_fingerprint,
+    std::uint64_t expected_plan_fingerprint,
     bool allow_rank_count_change)
 {
   if (!manifest.complete)
@@ -232,7 +241,11 @@ AcceleratorRestartMode validateAcceleratorRestart(
       manifest.precision_fingerprint != expected_precision_fingerprint)
     throw std::invalid_argument("Accelerator checkpoint semantic fingerprint mismatch");
   if (manifest.participant_count == requested_participant_count)
+  {
+    if (manifest.plan_fingerprint != expected_plan_fingerprint)
+      throw std::invalid_argument("Accelerator checkpoint execution-plan fingerprint mismatch");
     return AcceleratorRestartMode::EXACT_DECOMPOSITION;
+  }
   if (!allow_rank_count_change)
     throw std::runtime_error("Accelerator checkpoint rank-count change is disabled");
   return AcceleratorRestartMode::STATISTICAL_REPARTITION;
