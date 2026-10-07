@@ -15,6 +15,7 @@
 #include "PsiFormerDeviceRuntime.h"
 #include "Platforms/Common/AccelBLASHandle.hpp"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAttention.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionPolicy.h"
 
 namespace qmcplusplus::psiformer::device
 {
@@ -54,6 +55,75 @@ void attentionContextForward(AcceleratorBlasHandle& handle,
                              const double* attention,
                              const double* value,
                              double* target);
+
+/** Apply one strict-FP32 row-major dense projection.
+ *
+ * BLAS math-mode containment is added in Task 27.A4; this explicit ABI keeps the
+ * storage type separate without changing the established FP64 entry point.
+ */
+void denseForwardFp32(AcceleratorBlasHandle& handle,
+                      const DenseForwardLayout& layout,
+                      const float* source,
+                      const float* weight,
+                      float* target);
+
+/// Apply three independent FP32 projections into Q, K, and V buffers.
+void projectQkvForwardFp32(AcceleratorBlasHandle& handle,
+                           const DenseForwardLayout& layout,
+                           const float* source,
+                           const float* query_weight,
+                           const float* key_weight,
+                           const float* value_weight,
+                           float* query,
+                           float* key,
+                           float* value);
+
+/// Form configuration-local FP32 attention logits with FP32 GEMM accumulation.
+void attentionLogitsForwardFp32(AcceleratorBlasHandle& handle,
+                                const BatchedAttentionForwardLayout& layout,
+                                const float* query,
+                                const float* key,
+                                float* logits);
+
+/** Normalize FP32 logits in place with FP64 maximum and sum reductions.
+ *
+ * Invalid rows are zeroed and reported through the bounded diagnostic record.
+ */
+Error launchAttentionSoftmaxFp32(Stream stream,
+                                 const BatchedAttentionForwardLayout& layout,
+                                 float* logits_and_weights,
+                                 PsiFormerNumericalDiagnostics* diagnostics);
+
+/// Contract FP32 attention weights with values independently per configuration.
+void attentionContextForwardFp32(AcceleratorBlasHandle& handle,
+                                 const BatchedAttentionForwardLayout& layout,
+                                 const float* attention,
+                                 const float* value,
+                                 float* target);
+
+/// Apply tanh(input+bias) to every logical FP32 value while preserving padding.
+Error launchBiasTanhValueFp32(Stream stream,
+                              const BatchedValueLayout& layout,
+                              const float* input,
+                              const float* bias,
+                              float* output);
+
+/// Add two FP32 value tensors elementwise while preserving padding.
+Error launchResidualValueFp32(Stream stream,
+                              const BatchedValueLayout& layout,
+                              const float* left,
+                              const float* right,
+                              float* output);
+
+/** Cross the audited ABI barrier from FP32 value storage back into FP64.
+ *
+ * Orbital assembly, determinants, spatial jets, and reductions consume only the
+ * resulting double buffer; no FP32 overload is provided for those APIs.
+ */
+Error launchValueFp32ToFp64(Stream stream,
+                            const BatchedValueLayout& layout,
+                            const float* source,
+                            double* target);
 
 } // namespace qmcplusplus::psiformer::device
 

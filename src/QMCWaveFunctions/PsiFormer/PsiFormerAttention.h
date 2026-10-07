@@ -68,8 +68,79 @@ struct AttentionForwardLayout
   { return head * attention_head_stride + query * attention_row_stride + key; }
 };
 
+/** Configuration-major collection of independent attention problems.
+ *
+ * Feature and attention configuration strides include any desired tail padding.
+ * Attention never crosses a configuration boundary.
+ */
+struct BatchedAttentionForwardLayout
+{
+  std::size_t configuration_count = 0;
+  AttentionForwardLayout attention;
+  std::size_t feature_configuration_stride   = 0;
+  std::size_t attention_configuration_stride = 0;
+
+  std::size_t softmaxRowCount() const noexcept
+  { return configuration_count * attention.softmaxRowCount(); }
+  std::size_t featureElements() const noexcept
+  {
+    return configuration_count == 0 ? 0
+        : (configuration_count - 1) * feature_configuration_stride +
+            attention.featureElements();
+  }
+  std::size_t attentionElements() const noexcept
+  {
+    return configuration_count == 0 ? 0
+        : (configuration_count - 1) * attention_configuration_stride +
+            attention.attentionElements();
+  }
+  std::size_t featureOffset(std::size_t configuration,
+                            std::size_t row,
+                            std::size_t head,
+                            std::size_t feature) const noexcept
+  {
+    return configuration * feature_configuration_stride +
+        attention.featureOffset(row, head, feature);
+  }
+  std::size_t attentionOffset(std::size_t configuration,
+                              std::size_t head,
+                              std::size_t query,
+                              std::size_t key) const noexcept
+  {
+    return configuration * attention_configuration_stride +
+        attention.attentionOffset(head, query, key);
+  }
+};
+
+/** Configuration-major value tensor used by FP32 nonlinear and cast kernels. */
+struct BatchedValueLayout
+{
+  std::size_t configuration_count = 0;
+  std::size_t rows                 = 0;
+  std::size_t width                = 0;
+  std::size_t row_stride           = 0;
+  std::size_t configuration_stride = 0;
+
+  std::size_t logicalElements() const noexcept
+  { return configuration_count * rows * width; }
+  std::size_t storageElements() const noexcept
+  {
+    return configuration_count == 0 || rows == 0 ? 0
+        : (configuration_count - 1) * configuration_stride +
+            (rows - 1) * row_stride + width;
+  }
+  std::size_t offset(std::size_t configuration,
+                     std::size_t row,
+                     std::size_t feature) const noexcept
+  {
+    return configuration * configuration_stride + row * row_stride + feature;
+  }
+};
+
 static_assert(std::is_trivially_copyable_v<DenseForwardLayout>);
 static_assert(std::is_trivially_copyable_v<AttentionForwardLayout>);
+static_assert(std::is_trivially_copyable_v<BatchedAttentionForwardLayout>);
+static_assert(std::is_trivially_copyable_v<BatchedValueLayout>);
 
 namespace attention_detail
 {
@@ -192,6 +263,96 @@ inline AttentionForwardLayout makeAttentionForwardLayout(std::size_t rows,
                                 row_stride,
                                 attention_head_stride == 0 ? one_head : attention_head_stride};
   validateAttentionForwardLayout(layout);
+  return layout;
+}
+
+/** Validate a configuration-major attention descriptor and all padded spans. */
+inline void validateBatchedAttentionForwardLayout(const BatchedAttentionForwardLayout& layout)
+{
+  if (layout.configuration_count == 0)
+    throw std::invalid_argument("PsiFormer attention batch must contain a configuration");
+  validateAttentionForwardLayout(layout.attention);
+  const std::size_t minimum_feature_stride = attention_detail::checkedProduct(
+      layout.attention.rows, layout.attention.feature_row_stride,
+      "PsiFormer attention configuration feature stride overflow");
+  const std::size_t minimum_attention_stride = attention_detail::checkedProduct(
+      layout.attention.heads, layout.attention.attention_head_stride,
+      "PsiFormer attention configuration matrix stride overflow");
+  if (layout.feature_configuration_stride < minimum_feature_stride ||
+      layout.attention_configuration_stride < minimum_attention_stride)
+    throw std::invalid_argument("PsiFormer attention configuration stride is too small");
+  (void)attention_detail::checkedMatrixSpan(
+      layout.configuration_count, layout.feature_configuration_stride,
+      layout.attention.featureElements(), "PsiFormer batched attention feature extent overflow");
+  (void)attention_detail::checkedMatrixSpan(
+      layout.configuration_count, layout.attention_configuration_stride,
+      layout.attention.attentionElements(), "PsiFormer batched attention matrix extent overflow");
+  (void)attention_detail::checkedProduct(
+      layout.configuration_count, layout.attention.softmaxRowCount(),
+      "PsiFormer batched attention softmax row count overflow");
+}
+
+/** Construct a checked configuration-major attention descriptor. */
+inline BatchedAttentionForwardLayout makeBatchedAttentionForwardLayout(
+    std::size_t configuration_count,
+    const AttentionForwardLayout& attention,
+    std::size_t feature_configuration_stride = 0,
+    std::size_t attention_configuration_stride = 0)
+{
+  const std::size_t minimum_feature_stride = attention_detail::checkedProduct(
+      attention.rows, attention.feature_row_stride,
+      "PsiFormer attention configuration feature stride overflow");
+  const std::size_t minimum_attention_stride = attention_detail::checkedProduct(
+      attention.heads, attention.attention_head_stride,
+      "PsiFormer attention configuration matrix stride overflow");
+  BatchedAttentionForwardLayout layout{
+      configuration_count, attention,
+      feature_configuration_stride == 0 ? minimum_feature_stride
+                                        : feature_configuration_stride,
+      attention_configuration_stride == 0 ? minimum_attention_stride
+                                          : attention_configuration_stride};
+  validateBatchedAttentionForwardLayout(layout);
+  return layout;
+}
+
+/** Validate one padded configuration-major value tensor. */
+inline void validateBatchedValueLayout(const BatchedValueLayout& layout)
+{
+  if (layout.configuration_count == 0 || layout.rows == 0 || layout.width == 0)
+    throw std::invalid_argument("PsiFormer value batch dimensions must be positive");
+  if (layout.row_stride < layout.width)
+    throw std::invalid_argument("PsiFormer value row stride is too small");
+  const std::size_t minimum_configuration_stride = attention_detail::checkedProduct(
+      layout.rows, layout.row_stride, "PsiFormer value configuration stride overflow");
+  if (layout.configuration_stride < minimum_configuration_stride)
+    throw std::invalid_argument("PsiFormer value configuration stride is too small");
+  (void)attention_detail::checkedProduct(
+      layout.configuration_count,
+      attention_detail::checkedProduct(layout.rows, layout.width,
+                                       "PsiFormer value logical extent overflow"),
+      "PsiFormer value batch logical extent overflow");
+  (void)attention_detail::checkedMatrixSpan(
+      layout.configuration_count, layout.configuration_stride,
+      attention_detail::checkedMatrixSpan(layout.rows, layout.row_stride, layout.width,
+                                          "PsiFormer value extent overflow"),
+      "PsiFormer value batch extent overflow");
+}
+
+/** Construct one checked padded configuration-major value tensor. */
+inline BatchedValueLayout makeBatchedValueLayout(
+    std::size_t configuration_count,
+    std::size_t rows,
+    std::size_t width,
+    std::size_t row_stride = 0,
+    std::size_t configuration_stride = 0)
+{
+  const std::size_t actual_row_stride = row_stride == 0 ? width : row_stride;
+  const std::size_t minimum_configuration_stride = attention_detail::checkedProduct(
+      rows, actual_row_stride, "PsiFormer value configuration stride overflow");
+  BatchedValueLayout layout{configuration_count, rows, width, actual_row_stride,
+                            configuration_stride == 0 ? minimum_configuration_stride
+                                                      : configuration_stride};
+  validateBatchedValueLayout(layout);
   return layout;
 }
 

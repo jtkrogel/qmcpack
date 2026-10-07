@@ -76,13 +76,36 @@ int main()
       launchFp64ToFp32ParameterConversion(
           nullptr, qmcplusplus::psiformer::PsiFormerParameterConversionTile{},
           nullptr, 0, nullptr, 0, nullptr) == success;
+  const bool fp32_dense_linked   = &denseForwardFp32 != nullptr;
+  const bool fp32_qkv_linked     = &projectQkvForwardFp32 != nullptr;
+  const bool fp32_logits_linked  = &attentionLogitsForwardFp32 != nullptr;
+  const bool fp32_context_linked = &attentionContextForwardFp32 != nullptr;
+  const bool fp32_softmax_linked =
+      launchAttentionSoftmaxFp32(
+          nullptr, qmcplusplus::psiformer::BatchedAttentionForwardLayout{},
+          nullptr, nullptr) == success;
+  const bool fp32_tanh_linked =
+      launchBiasTanhValueFp32(
+          nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
+          nullptr, nullptr, nullptr) == success;
+  const bool fp32_residual_linked =
+      launchResidualValueFp32(
+          nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
+          nullptr, nullptr, nullptr) == success;
+  const bool fp32_to_fp64_linked =
+      launchValueFp32ToFp64(
+          nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
+          nullptr, nullptr) == success;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
          determinant_spatial_linked && spatial_softmax_linked &&
          spatial_dense_linked && spatial_qkv_linked &&
          spatial_attention_linked && spatial_context_linked && open_feature_linked &&
          tanh_jet_linked && residual_jet_linked && cusp_jet_linked &&
-         final_spatial_linked && open_orbital_linked && precision_conversion_linked
+         final_spatial_linked && open_orbital_linked && precision_conversion_linked &&
+         fp32_dense_linked && fp32_qkv_linked && fp32_logits_linked &&
+         fp32_context_linked && fp32_softmax_linked && fp32_tanh_linked &&
+         fp32_residual_linked && fp32_to_fp64_linked
       ? 0
       : 1;
 }
