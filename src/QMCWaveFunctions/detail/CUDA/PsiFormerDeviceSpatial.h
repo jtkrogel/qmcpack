@@ -13,6 +13,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_SPATIAL_H
 
 #include "PsiFormerDeviceDense.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
 
@@ -102,6 +103,21 @@ Error launchFinalSpatialCombination(
     double* output,
     double* laplacian_ratio,
     OpenSpatialStatus* status);
+
+Error launchOpenOrbitalJets(Stream stream,
+                            const OpenOrbitalJetLayout& layout,
+                            const double* features,
+                            const double* positions,
+                            const double* nuclei,
+                            const double* backflow_up,
+                            const double* backflow_down,
+                            const double* pi_up,
+                            const double* pi_down,
+                            const double* zeta_up,
+                            const double* zeta_down,
+                            const std::size_t* active_electrons,
+                            double* output,
+                            OpenSpatialStatus* status);
 
 } // namespace qmcplusplus::psiformer::device
 

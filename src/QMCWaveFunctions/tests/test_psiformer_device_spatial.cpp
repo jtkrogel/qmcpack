@@ -16,6 +16,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,7 @@ namespace math = qmcplusplus::psiformer::device_math;
 namespace spatial_jet = qmcplusplus::psiformer::spatial_jet;
 namespace open_spatial = qmcplusplus::psiformer::open_spatial;
 namespace determinant = qmcplusplus::psiformer::device_determinant;
+namespace open_orbital = qmcplusplus::psiformer::open_orbital;
 
 namespace
 {
@@ -784,6 +786,187 @@ TEST_CASE("PsiFormer final spatial combination distinguishes log Laplacian and r
             layout, metadata.data(), derivative_status.data(), determinant_gradient.data(),
             determinant_laplacian.data(), cusp.data(), 1, phase.data(), output.data(),
             ratio.data()) == psiformer::OpenSpatialStatus::REQUIRED_INVERSE_UNAVAILABLE);
+}
+
+TEST_CASE("PsiFormer open orbital jets match active and full finite differences",
+          "[psiformer][device][spatial][open][orbital]")
+{
+  constexpr std::size_t B = 2, N = 2, A = 2, F = 2;
+  const std::array<std::size_t, B> active{0, 1};
+  const std::vector<double> positions{
+      0.7, -0.2, 0.4, 90.0, -0.3, 0.8, 1.1, 91.0, 92.0,
+      1.2, 0.1, -0.6, 93.0, 0.2, -1.0, 0.5, 94.0};
+  const std::array<double, 8> nuclei{0.1, -0.4, 0.2, 80.0,
+                                     -0.8, 0.5, -0.7, 81.0};
+  // CPU-compatible indices with deliberate padding: weight=f*4+orbital,
+  // envelope=orbital*3+nucleus. Row zero/up and row one/down use distinct data.
+  const std::array<double, 6> backflow_up{0.7, -0.2, 0.0, 0.0, -0.4, 0.9};
+  const std::array<double, 6> backflow_down{-0.3, 0.6, 0.0, 0.0, 0.8, 0.2};
+  const std::array<double, 5> pi_up{0.8, -0.25, 0.0, 0.4, 0.7};
+  const std::array<double, 5> pi_down{-0.5, 0.3, 0.0, 0.9, -0.2};
+  const std::array<double, 5> zeta_up{-0.7, 1.1, 0.0, 0.45, -0.9};
+  const std::array<double, 5> zeta_down{0.6, -1.2, 0.0, -0.35, 0.8};
+
+  auto linear = [](std::size_t row, std::size_t feature,
+                   std::size_t electron, std::size_t dimension) {
+    return 0.03L * static_cast<long double>(1 + row + 2 * feature +
+                                            3 * electron + dimension);
+  };
+  auto quadratic = [](std::size_t row, std::size_t feature,
+                      std::size_t electron, std::size_t dimension) {
+    return 0.01L * static_cast<long double>(1 + row + feature + electron + dimension);
+  };
+  std::vector<long double> coordinates(B * N * 3);
+  for (std::size_t configuration = 0; configuration < B; ++configuration)
+    for (std::size_t electron = 0; electron < N; ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        coordinates[configuration * 6 + 3 * electron + dimension] =
+            positions[configuration * 9 + electron * 4 + dimension];
+  auto feature_value = [&](const std::vector<long double>& coordinates_in,
+                           std::size_t configuration, std::size_t row,
+                           std::size_t feature) {
+    long double result = 0.2L + 0.11L * row - 0.07L * feature + 0.05L * configuration;
+    for (std::size_t electron = 0; electron < N; ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const long double x = coordinates_in[configuration * 6 + 3 * electron + dimension];
+        result += linear(row, feature, electron, dimension) * x +
+            0.5L * quadratic(row, feature, electron, dimension) * x * x;
+      }
+    return result;
+  };
+  auto reference = [&](const std::vector<long double>& coordinates_in,
+                       std::size_t configuration, std::size_t row,
+                       std::size_t orbital) {
+    const auto& backflow = row == 0 ? backflow_up : backflow_down;
+    const auto& pi = row == 0 ? pi_up : pi_down;
+    const auto& zeta = row == 0 ? zeta_up : zeta_down;
+    long double backflow_value = 0.0L;
+    for (std::size_t feature = 0; feature < F; ++feature)
+      backflow_value += feature_value(coordinates_in, configuration, row, feature) *
+          backflow[feature * 4 + orbital];
+    long double envelope = 0.0L;
+    for (std::size_t nucleus = 0; nucleus < A; ++nucleus)
+    {
+      long double radius_squared = 0.0L;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const long double difference =
+            coordinates_in[configuration * 6 + 3 * row + dimension] -
+            nuclei[nucleus * 4 + dimension];
+        radius_squared += difference * difference;
+      }
+      const std::size_t parameter = orbital * 3 + nucleus;
+      envelope += pi[parameter] *
+          std::exp(-std::abs(static_cast<long double>(zeta[parameter])) *
+                   std::sqrt(radius_squared));
+    }
+    return backflow_value * envelope;
+  };
+
+  auto run_mode = [&](psiformer::SpatialJetMode mode) {
+    const auto layout = psiformer::makeOpenOrbitalJetLayout(
+        B, 1, N, A, F, 1, mode, 3, 3, 6, 3, 4, 3, 7,
+        4, 9, 4, 7, 70, 7, 70);
+    std::vector<double> features(psiformer::spatialJetSpanElements(layout.features), 0.0);
+    for (std::size_t configuration = 0; configuration < B; ++configuration)
+      for (std::size_t row = 0; row < N; ++row)
+        for (std::size_t feature = 0; feature < F; ++feature)
+        {
+          const std::size_t element = row * layout.feature_row_stride + feature;
+          features[layout.features.uncheckedValueOffset(configuration, element)] =
+              static_cast<double>(feature_value(coordinates, configuration, row, feature));
+          for (std::size_t lane = 0; lane < layout.features.gradient_lanes; ++lane)
+          {
+            const std::size_t electron = mode == psiformer::SpatialJetMode::ACTIVE
+                ? active[configuration] : lane / 3;
+            const std::size_t dimension = lane % 3;
+            const long double x = coordinates[configuration * 6 + 3 * electron + dimension];
+            features[layout.features.uncheckedGradientOffset(configuration, lane, element)] =
+                static_cast<double>(linear(row, feature, electron, dimension) +
+                                    quadratic(row, feature, electron, dimension) * x);
+          }
+          for (std::size_t electron = 0;
+               electron < layout.features.laplacian_lanes; ++electron)
+          {
+            long double laplacian = 0.0L;
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              laplacian += quadratic(row, feature, electron, dimension);
+            features[layout.features.uncheckedLaplacianOffset(
+                configuration, electron, element)] = static_cast<double>(laplacian);
+          }
+        }
+    std::vector<double> output(psiformer::spatialJetSpanElements(layout.orbitals), -4.0);
+    for (std::size_t configuration = 0; configuration < B; ++configuration)
+      for (std::size_t row = 0; row < N; ++row)
+        for (std::size_t orbital = 0; orbital < N; ++orbital)
+          CHECK(open_orbital::buildElement(
+                    layout, features.data(), positions.data(), nuclei.data(),
+                    backflow_up.data(), backflow_down.data(), pi_up.data(), pi_down.data(),
+                    zeta_up.data(), zeta_down.data(), configuration, active[configuration],
+                    0, row, orbital, output.data()) == psiformer::OpenSpatialStatus::REGULAR);
+
+    constexpr long double step = 1.0e-4L;
+    for (std::size_t configuration = 0; configuration < B; ++configuration)
+      for (std::size_t row = 0; row < N; ++row)
+        for (std::size_t orbital = 0; orbital < N; ++orbital)
+        {
+          const std::size_t element = open_orbital::outputElement(layout, 0, row, orbital);
+          const long double base = reference(coordinates, configuration, row, orbital);
+          checkClose(output[layout.orbitals.uncheckedValueOffset(configuration, element)], base);
+          const std::size_t first_electron = mode == psiformer::SpatialJetMode::ACTIVE
+              ? active[configuration] : 0;
+          const std::size_t electron_limit = mode == psiformer::SpatialJetMode::ACTIVE
+              ? first_electron + 1 : N;
+          for (std::size_t electron = first_electron; electron < electron_limit; ++electron)
+          {
+            long double trace = 0.0L;
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            {
+              std::vector<long double> plus = coordinates, minus = coordinates;
+              plus[configuration * 6 + 3 * electron + dimension] += step;
+              minus[configuration * 6 + 3 * electron + dimension] -= step;
+              const long double plus_value = reference(plus, configuration, row, orbital);
+              const long double minus_value = reference(minus, configuration, row, orbital);
+              const std::size_t lane = mode == psiformer::SpatialJetMode::ACTIVE
+                  ? dimension : 3 * electron + dimension;
+              checkClose(output[layout.orbitals.uncheckedGradientOffset(
+                             configuration, lane, element)],
+                         (plus_value - minus_value) / (2.0L * step), 3.0e-8);
+              trace += (plus_value - 2.0L * base + minus_value) / (step * step);
+            }
+            if (mode == psiformer::SpatialJetMode::FULL_VGL)
+              checkClose(output[layout.orbitals.uncheckedLaplacianOffset(
+                             configuration, electron, element)], trace, 3.0e-6);
+          }
+        }
+    return layout;
+  };
+
+  (void)run_mode(psiformer::SpatialJetMode::ACTIVE);
+  const auto full = run_mode(psiformer::SpatialJetMode::FULL_VGL);
+  std::vector<double> features(psiformer::spatialJetSpanElements(full.features), 0.0);
+  std::vector<double> output(psiformer::spatialJetSpanElements(full.orbitals), 0.0);
+  std::vector<double> coalesced = positions;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    coalesced[dimension] = nuclei[dimension];
+  CHECK(open_orbital::buildElement(
+            full, features.data(), coalesced.data(), nuclei.data(),
+            backflow_up.data(), backflow_down.data(), pi_up.data(), pi_down.data(),
+            zeta_up.data(), zeta_down.data(), 0, 0, 0, 0, 0, output.data()) ==
+        psiformer::OpenSpatialStatus::COALESCENCE);
+  std::array<double, 5> nonfinite_zeta = zeta_up;
+  nonfinite_zeta[0] = std::numeric_limits<double>::infinity();
+  CHECK(open_orbital::buildElement(
+            full, features.data(), positions.data(), nuclei.data(),
+            backflow_up.data(), backflow_down.data(), pi_up.data(), pi_down.data(),
+            nonfinite_zeta.data(), zeta_down.data(), 0, 0, 0, 0, 0, output.data()) ==
+        psiformer::OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT);
+  CHECK(psiformer::openOrbitalBackflowSpan(full) == 6);
+  CHECK(psiformer::openOrbitalEnvelopeSpan(full) == 5);
+  CHECK_THROWS_AS(psiformer::makeOpenOrbitalJetLayout(
+                      1, 1, 2, 1, 2, 3, psiformer::SpatialJetMode::ACTIVE),
+                  std::invalid_argument);
 }
 
 int main(int argc, char* argv[])

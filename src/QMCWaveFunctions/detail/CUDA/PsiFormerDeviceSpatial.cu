@@ -176,6 +176,38 @@ __global__ void finalSpatialCombinationKernel(
         laplacian_ratio);
 }
 
+__global__ void openOrbitalJetsKernel(OpenOrbitalJetLayout layout,
+                                      const double* features,
+                                      const double* positions,
+                                      const double* nuclei,
+                                      const double* backflow_up,
+                                      const double* backflow_down,
+                                      const double* pi_up,
+                                      const double* pi_down,
+                                      const double* zeta_up,
+                                      const double* zeta_down,
+                                      const std::size_t* active_electrons,
+                                      double* output,
+                                      OpenSpatialStatus* status)
+{
+  const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t electron_count = layout.features.electron_count;
+  const std::size_t per_configuration =
+      layout.determinant_count * electron_count * electron_count;
+  const std::size_t count = layout.features.configuration_count * per_configuration;
+  if (logical >= count)
+    return;
+  const std::size_t configuration = logical / per_configuration;
+  const std::size_t remainder = logical % per_configuration;
+  const std::size_t determinant = remainder / (electron_count * electron_count);
+  const std::size_t matrix_element = remainder % (electron_count * electron_count);
+  status[logical] = open_orbital::buildElement(
+      layout, features, positions, nuclei, backflow_up, backflow_down,
+      pi_up, pi_down, zeta_up, zeta_down, configuration,
+      active_electrons[configuration], determinant,
+      matrix_element / electron_count, matrix_element % electron_count, output);
+}
+
 } // namespace
 
 Error launchSoftmaxJetRows(Stream stream,
@@ -456,6 +488,34 @@ Error launchFinalSpatialCombination(
   finalSpatialCombinationKernel<<<blocks, spatial_block_size, 0, stream>>>(
       layout, determinant_metadata, determinant_status, determinant_gradient,
       determinant_laplacian_log, cusp, phase, output, laplacian_ratio, status);
+  return peekSpatialLaunchError();
+}
+
+Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
+                            const double* features, const double* positions,
+                            const double* nuclei, const double* backflow_up,
+                            const double* backflow_down, const double* pi_up,
+                            const double* pi_down, const double* zeta_up,
+                            const double* zeta_down,
+                            const std::size_t* active_electrons, double* output,
+                            OpenSpatialStatus* status)
+{
+  if (layout.features.configuration_count == 0 &&
+      layout.determinant_count == 0 && layout.features.electron_count == 0)
+    return success;
+  validateOpenOrbitalJetLayout(layout);
+  const bool need_up = layout.spin_up_count != 0;
+  const bool need_down = layout.spin_up_count != layout.features.electron_count;
+  if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
+      (need_up && (!backflow_up || !pi_up || !zeta_up)) ||
+      (need_down && (!backflow_down || !pi_down || !zeta_down)))
+    throw std::invalid_argument("PsiFormer open orbital device storage is null");
+  const std::size_t count = openOrbitalElementCount(layout);
+  const unsigned int blocks = checkedSpatialBlockCount(
+      count, "PsiFormer open orbital grid exceeds device x dimension");
+  openOrbitalJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      layout, features, positions, nuclei, backflow_up, backflow_down,
+      pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status);
   return peekSpatialLaunchError();
 }
 
