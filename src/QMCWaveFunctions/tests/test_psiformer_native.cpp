@@ -401,6 +401,8 @@ TEST_CASE("PsiFormer in-memory construction matches portable-file construction",
   CHECK(in_memory.cfg.electrons.x == imported.cfg.electrons.x);
   CHECK(in_memory.cfg.nuclei.x == imported.cfg.nuclei.x);
   CHECK(in_memory.cfg.charges.x == imported.cfg.charges.x);
+  CHECK(imported.cfg.determinants == 16);
+  CHECK(in_memory.cfg.determinants == imported.cfg.determinants);
   CHECK(in_memory.blocks == 4);
 
   const pf::Tensor electrons = imported.cfg.configuration(0);
@@ -411,6 +413,30 @@ TEST_CASE("PsiFormer in-memory construction matches portable-file construction",
   checkVectorClose(actual.gradient, expected.gradient, 2e-10, 2e-10);
   checkVectorClose(actual.lap_log, expected.lap_log, 2e-10, 2e-10);
   checkClose(actual.local_energy, expected.local_energy, 2e-10, 2e-10);
+}
+
+TEST_CASE("PsiFormer configuration imports determinant-count metadata", "[wavefunction][psiformer]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const hid_t file      = H5Fopen(files.configuration.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+  REQUIRE(file >= 0);
+  const hid_t attribute = H5Aopen(file, "n_determinants", H5P_DEFAULT);
+  REQUIRE(attribute >= 0);
+  const std::int64_t determinant_count = 160;
+  REQUIRE(H5Awrite(attribute, H5T_NATIVE_LLONG, &determinant_count) >= 0);
+  H5Aclose(attribute);
+  H5Fclose(file);
+
+  const pf::ConfigData configuration(files.configuration.string());
+  CHECK(configuration.determinants == 160);
+
+  const hid_t legacy_file = H5Fopen(files.configuration.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+  REQUIRE(legacy_file >= 0);
+  REQUIRE(H5Adelete(legacy_file, "n_determinants") >= 0);
+  H5Fclose(legacy_file);
+
+  const pf::ConfigData legacy_configuration(files.configuration.string());
+  CHECK(legacy_configuration.determinants == 16);
 }
 
 TEST_CASE("PsiFormer in-memory construction validates owning inputs", "[wavefunction][psiformer]")

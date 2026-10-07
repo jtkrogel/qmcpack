@@ -327,6 +327,7 @@ inline GeneratedFiles generateFiles(const std::string& system,
   writeNumeric(file, "/electron_positions", H5T_NATIVE_DOUBLE, {1, electron_count, 3}, geometry.electrons);
   writeIntAttribute(file, "n_up", geometry.nup);
   writeIntAttribute(file, "n_down", electron_count - geometry.nup);
+  writeIntAttribute(file, "n_determinants", 16);
   H5Fclose(file);
   return files;
 }

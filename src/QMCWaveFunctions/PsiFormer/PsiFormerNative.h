@@ -2321,9 +2321,10 @@ struct ConfigData
   Tensor electrons;
   Tensor nuclei;
   Tensor charges;
-  size_t nup     = 0;
-  size_t ndown   = 0;
-  size_t nconfig = 0;
+  size_t nup          = 0;
+  size_t ndown        = 0;
+  size_t nconfig      = 0;
+  size_t determinants = 16;
 
   /// Load physical data, then use the common in-memory validation path.
   explicit ConfigData(const std::string& path)
@@ -2339,12 +2340,23 @@ struct ConfigData
     charges.x   = read_double(file, "/nuclear_charges", &charges.shape);
     const int64_t nup_input   = read_attr_i64(file, "n_up");
     const int64_t ndown_input = read_attr_i64(file, "n_down");
+    const htri_t has_determinant_count = H5Aexists(file, "n_determinants");
+    if (has_determinant_count < 0)
+    {
+      H5Fclose(file);
+      throw std::runtime_error("Unable to inspect PsiFormer determinant-count metadata");
+    }
+    const int64_t determinant_input =
+        has_determinant_count > 0 ? read_attr_i64(file, "n_determinants") : 16;
     H5Fclose(file);
 
     if (nup_input <= 0 || ndown_input <= 0)
       throw std::runtime_error("PsiFormer configuration requires positive up- and down-spin populations");
-    nup   = static_cast<size_t>(nup_input);
-    ndown = static_cast<size_t>(ndown_input);
+    if (determinant_input <= 0)
+      throw std::runtime_error("PsiFormer configuration requires a positive determinant count");
+    nup          = static_cast<size_t>(nup_input);
+    ndown        = static_cast<size_t>(ndown_input);
+    determinants = static_cast<size_t>(determinant_input);
     validate();
   }
 
@@ -2357,12 +2369,14 @@ struct ConfigData
              Tensor nuclear_positions,
              Tensor nuclear_charges,
              size_t spin_up_electrons,
-             size_t spin_down_electrons)
+             size_t spin_down_electrons,
+             size_t determinant_count = 16)
       : electrons(std::move(electron_positions)),
         nuclei(std::move(nuclear_positions)),
         charges(std::move(nuclear_charges)),
         nup(spin_up_electrons),
-        ndown(spin_down_electrons)
+        ndown(spin_down_electrons),
+        determinants(determinant_count)
   {
     validate();
   }
@@ -2384,6 +2398,8 @@ private:
   {
     if (nup == 0 || ndown == 0)
       throw std::runtime_error("PsiFormer configuration requires positive up- and down-spin populations");
+    if (determinants == 0)
+      throw std::runtime_error("PsiFormer configuration requires a positive determinant count");
     if (nup > std::numeric_limits<size_t>::max() - ndown)
       throw std::overflow_error("PsiFormer configuration electron count overflow");
     nconfig = electrons.shape.empty() ? 0 : electrons.shape[0];
@@ -2472,17 +2488,19 @@ struct PsiFormer
    *
    * Parameter-layout compatibility is subsequently checked by the shared
    * execution plan in QMCPACK and by named lookups in the standalone oracle.
+   * The default sentinel adopts the determinant count imported with the
+   * physical-system metadata; explicit in-memory callers may override it.
    */
   PsiFormer(Parameters parameters,
             ConfigData configuration_data,
-            size_t determinants = 16,
+            size_t determinants = std::numeric_limits<size_t>::max(),
             size_t feature_dimension = 256,
             size_t attention_heads = 4,
             size_t attention_blocks = 4)
       : p(std::move(parameters)),
         cfg(std::move(configuration_data)),
         ne(cfg.nup + cfg.ndown),
-        ndet(determinants),
+        ndet(determinants == std::numeric_limits<size_t>::max() ? cfg.determinants : determinants),
         dim(feature_dimension),
         heads(attention_heads),
         blocks(attention_blocks)
