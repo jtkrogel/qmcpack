@@ -14,6 +14,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@
 
 namespace psiformer = qmcplusplus::psiformer;
 namespace math = qmcplusplus::psiformer::device_math;
+namespace spatial_jet = qmcplusplus::psiformer::spatial_jet;
 
 namespace
 {
@@ -144,6 +146,69 @@ TEST_CASE("PsiFormer product jet retains the trace-gradient cross term",
                    right_value, right_gradient.data(), right_laplacian,
                    3, &aliased_value, aliased_gradient.data(), &aliased_laplacian);
   checkClose(aliased_laplacian, output_laplacian);
+}
+
+TEST_CASE("PsiFormer active spatial dense and QKV preserve every padded plane",
+          "[psiformer][device][spatial]")
+{
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t rows = 2;
+  constexpr std::size_t input_width = 3;
+  constexpr std::size_t output_width = 4;
+  const psiformer::SpatialDenseJetLayout layout = psiformer::makeSpatialDenseJetLayout(
+      configurations, rows, input_width, output_width, 3,
+      psiformer::SpatialJetMode::ACTIVE, 4, 5, 5, 9, 11, 38, 47);
+  CHECK(layout.source.gradient_lanes == 3);
+  CHECK(layout.source.laplacian_lanes == 0);
+  CHECK(layout.source.configuration_count == 2);
+
+  std::vector<double> source(psiformer::spatialJetSpanElements(layout.source), -71.0);
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t plane = 0; plane < layout.source.plane_count; ++plane)
+      for (std::size_t row = 0; row < rows; ++row)
+        for (std::size_t input = 0; input < input_width; ++input)
+          source[layout.source.uncheckedPlaneOffset(
+              configuration, plane, row * layout.source_row_stride + input)] =
+              0.1 * static_cast<double>(1 + input + 3 * row + 7 * plane + 19 * configuration);
+
+  std::array<std::vector<double>, 3> weights{
+      std::vector<double>(14), std::vector<double>(14), std::vector<double>(14)};
+  for (std::size_t projection = 0; projection < weights.size(); ++projection)
+    for (std::size_t input = 0; input < input_width; ++input)
+      for (std::size_t output = 0; output < output_width; ++output)
+        weights[projection][input * layout.weight_row_stride + output] =
+            0.03 * static_cast<double>(1 + output + 2 * input + 5 * projection);
+
+  std::array<std::vector<double>, 3> projected{
+      std::vector<double>(psiformer::spatialJetSpanElements(layout.target), -83.0),
+      std::vector<double>(psiformer::spatialJetSpanElements(layout.target), -83.0),
+      std::vector<double>(psiformer::spatialJetSpanElements(layout.target), -83.0)};
+  spatial_jet::projectQkvJetsHost(
+      layout, source.data(), weights[0].data(), weights[1].data(), weights[2].data(),
+      projected[0].data(), projected[1].data(), projected[2].data());
+
+  for (std::size_t projection = 0; projection < projected.size(); ++projection)
+    for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+      for (std::size_t plane = 0; plane < layout.source.plane_count; ++plane)
+        for (std::size_t row = 0; row < rows; ++row)
+          for (std::size_t output = 0; output < output_width; ++output)
+          {
+            long double expected = 0.0L;
+            for (std::size_t input = 0; input < input_width; ++input)
+              expected += source[layout.source.uncheckedPlaneOffset(
+                              configuration, plane,
+                              row * layout.source_row_stride + input)] *
+                  static_cast<long double>(weights[projection][
+                      input * layout.weight_row_stride + output]);
+            checkClose(projected[projection][layout.target.uncheckedPlaneOffset(
+                           configuration, plane,
+                           row * layout.target_row_stride + output)],
+                       expected);
+          }
+
+  CHECK_THROWS_AS(psiformer::makeSpatialDenseJetLayout(
+                      1, 2, 3, 4, 1, psiformer::SpatialJetMode::ACTIVE, 2),
+                  std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer softmax jets preserve padded B greater than one rows",
@@ -291,6 +356,149 @@ TEST_CASE("PsiFormer softmax jets preserve padded B greater than one rows",
                    finite_difference_configuration, 0, element)],
                trace_second, 3.0e-7);
   }
+}
+
+TEST_CASE("PsiFormer full-VGL attention jets match independent context finite differences",
+          "[psiformer][device][spatial]")
+{
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t rows            = 2;
+  constexpr std::size_t heads           = 2;
+  constexpr std::size_t head_width      = 2;
+  constexpr std::size_t feature_width   = heads * head_width;
+  const psiformer::SpatialAttentionJetLayout layout =
+      psiformer::makeSpatialAttentionJetLayout(
+          configurations, rows, heads, head_width, 1,
+          psiformer::SpatialJetMode::FULL_VGL,
+          5, 3, 7, 11, 14, 57, 73);
+  const psiformer::SoftmaxJetRowLayout softmax_layout =
+      psiformer::makeAttentionSoftmaxJetRowLayout(layout);
+  CHECK(softmax_layout.row_count == heads * rows);
+  CHECK(softmax_layout.rows_per_group == rows);
+  CHECK(softmax_layout.row_group_stride == 7);
+
+  const std::size_t feature_storage = psiformer::spatialJetSpanElements(layout.features);
+  std::vector<double> query(feature_storage, -61.0);
+  std::vector<double> key(feature_storage, -62.0);
+  std::vector<double> value(feature_storage, -63.0);
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t row = 0; row < rows; ++row)
+      for (std::size_t feature = 0; feature < feature_width; ++feature)
+      {
+        const std::size_t element = row * layout.feature_row_stride + feature;
+        const double label = static_cast<double>(1 + feature + 5 * row + 13 * configuration);
+        query[layout.features.uncheckedValueOffset(configuration, element)] = 0.07 * label - 0.3;
+        key[layout.features.uncheckedValueOffset(configuration, element)] = -0.04 * label + 0.5;
+        value[layout.features.uncheckedValueOffset(configuration, element)] = 0.05 * label - 0.2;
+        for (std::size_t lane = 0; lane < 3; ++lane)
+        {
+          query[layout.features.uncheckedGradientOffset(configuration, lane, element)] =
+              0.01 * label - 0.015 * static_cast<double>(lane);
+          key[layout.features.uncheckedGradientOffset(configuration, lane, element)] =
+              -0.008 * label + 0.012 * static_cast<double>(lane);
+          value[layout.features.uncheckedGradientOffset(configuration, lane, element)] =
+              0.006 * label + 0.009 * static_cast<double>(lane);
+        }
+        query[layout.features.uncheckedLaplacianOffset(configuration, 0, element)] =
+            0.013 * label - 0.04;
+        key[layout.features.uncheckedLaplacianOffset(configuration, 0, element)] =
+            -0.011 * label + 0.03;
+        value[layout.features.uncheckedLaplacianOffset(configuration, 0, element)] =
+            0.009 * label - 0.02;
+      }
+
+  std::vector<double> attention(
+      psiformer::spatialJetSpanElements(layout.attention), -75.0);
+  std::vector<double> context(feature_storage, -76.0);
+  spatial_jet::attentionLogitJetsHost(
+      layout, query.data(), key.data(), attention.data());
+  psiformer::stableSoftmaxJetRows(softmax_layout, attention.data());
+  spatial_jet::attentionContextJetsHost(
+      layout, attention.data(), value.data(), context.data());
+
+  const auto reference_context = [&](std::size_t configuration,
+                                     std::size_t dimension,
+                                     long double displacement) {
+    std::vector<long double> output(rows * feature_width, 0.0L);
+    const auto component = [&](const std::vector<double>& buffer,
+                               std::size_t element) {
+      const long double base = buffer[
+          layout.features.uncheckedValueOffset(configuration, element)];
+      const long double first = buffer[
+          layout.features.uncheckedGradientOffset(configuration, dimension, element)];
+      const long double trace_second = buffer[
+          layout.features.uncheckedLaplacianOffset(configuration, 0, element)];
+      return base + displacement * first +
+          displacement * displacement * trace_second / 6.0L;
+    };
+
+    for (std::size_t head = 0; head < heads; ++head)
+      for (std::size_t output_row = 0; output_row < rows; ++output_row)
+      {
+        std::vector<long double> logits(rows, 0.0L);
+        for (std::size_t input_row = 0; input_row < rows; ++input_row)
+          for (std::size_t feature = 0; feature < head_width; ++feature)
+          {
+            const std::size_t query_element =
+                output_row * layout.feature_row_stride + head * head_width + feature;
+            const std::size_t key_element =
+                input_row * layout.feature_row_stride + head * head_width + feature;
+            logits[input_row] += component(query, query_element) * component(key, key_element) /
+                std::sqrt(static_cast<long double>(head_width));
+          }
+        const std::vector<long double> probability = referenceSoftmax(logits);
+        for (std::size_t feature = 0; feature < head_width; ++feature)
+          for (std::size_t input_row = 0; input_row < rows; ++input_row)
+          {
+            const std::size_t value_element =
+                input_row * layout.feature_row_stride + head * head_width + feature;
+            output[output_row * feature_width + head * head_width + feature] +=
+                probability[input_row] * component(value, value_element);
+          }
+      }
+    return output;
+  };
+
+  constexpr long double step = 2.0e-4L;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    const std::vector<long double> base = reference_context(configuration, 0, 0.0L);
+    std::array<std::vector<long double>, 3> plus;
+    std::array<std::vector<long double>, 3> minus;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      plus[dimension] = reference_context(configuration, dimension, step);
+      minus[dimension] = reference_context(configuration, dimension, -step);
+    }
+    for (std::size_t row = 0; row < rows; ++row)
+      for (std::size_t feature = 0; feature < feature_width; ++feature)
+      {
+        const std::size_t packed = row * feature_width + feature;
+        const std::size_t element = row * layout.feature_row_stride + feature;
+        checkClose(context[layout.features.uncheckedValueOffset(configuration, element)],
+                   base[packed]);
+        long double trace_second = 0.0L;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const long double first =
+              (plus[dimension][packed] - minus[dimension][packed]) /
+              (2.0L * step);
+          checkClose(context[layout.features.uncheckedGradientOffset(
+                         configuration, dimension, element)],
+                     first, 3.0e-8);
+          trace_second +=
+              (plus[dimension][packed] - 2.0L * base[packed] +
+               minus[dimension][packed]) / (step * step);
+        }
+        checkClose(context[layout.features.uncheckedLaplacianOffset(
+                       configuration, 0, element)],
+                   trace_second, 3.0e-6);
+      }
+  }
+
+  CHECK_THROWS_AS(psiformer::makeSpatialAttentionJetLayout(
+                      1, 2, 2, 2, 1, psiformer::SpatialJetMode::ACTIVE, 3),
+                  std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer softmax jet host diagnostics reject invalid and non-finite rows",

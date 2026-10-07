@@ -77,15 +77,47 @@ struct SpatialJetLayout
 struct SoftmaxJetRowLayout
 {
   SpatialJetLayout jets;
-  std::size_t row_count  = 0;
-  std::size_t row_width  = 0;
-  std::size_t row_stride = 0;
+  std::size_t row_count        = 0;
+  std::size_t row_width        = 0;
+  std::size_t row_stride       = 0;
+  std::size_t rows_per_group   = 0;
+  std::size_t row_group_stride = 0;
+};
+
+struct SpatialDenseJetLayout
+{
+  SpatialJetLayout source;
+  SpatialJetLayout target;
+  std::size_t rows              = 0;
+  std::size_t input_width       = 0;
+  std::size_t output_width      = 0;
+  std::size_t source_row_stride = 0;
+  std::size_t weight_row_stride = 0;
+  std::size_t target_row_stride = 0;
+};
+
+struct SpatialAttentionJetLayout
+{
+  SpatialJetLayout features;
+  SpatialJetLayout attention;
+  std::size_t rows                  = 0;
+  std::size_t heads                 = 0;
+  std::size_t head_width            = 0;
+  std::size_t feature_row_stride    = 0;
+  std::size_t attention_row_stride  = 0;
+  std::size_t attention_head_stride = 0;
 };
 
 static_assert(std::is_standard_layout_v<SpatialJetLayout>);
 static_assert(std::is_trivially_copyable_v<SpatialJetLayout>);
 static_assert(std::is_standard_layout_v<SoftmaxJetRowLayout>);
 static_assert(std::is_trivially_copyable_v<SoftmaxJetRowLayout>);
+static_assert(std::is_standard_layout_v<SpatialDenseJetLayout>);
+static_assert(std::is_trivially_copyable_v<SpatialDenseJetLayout>);
+static_assert(std::is_standard_layout_v<SpatialAttentionJetLayout>);
+static_assert(std::is_trivially_copyable_v<SpatialAttentionJetLayout>);
+
+inline void validateSoftmaxJetRowLayout(const SoftmaxJetRowLayout& layout);
 
 namespace spatial_detail
 {
@@ -200,6 +232,167 @@ inline SpatialJetLayout makeSpatialJetLayout(std::size_t configuration_count,
   return layout;
 }
 
+inline bool haveMatchingSpatialPlanes(const SpatialJetLayout& left,
+                                      const SpatialJetLayout& right) noexcept
+{
+  return left.configuration_count == right.configuration_count &&
+      left.electron_count == right.electron_count &&
+      left.gradient_lanes == right.gradient_lanes &&
+      left.laplacian_lanes == right.laplacian_lanes &&
+      left.plane_count == right.plane_count && left.mode == right.mode;
+}
+
+inline void validateSpatialDenseJetLayout(const SpatialDenseJetLayout& layout)
+{
+  validateSpatialJetLayout(layout.source);
+  validateSpatialJetLayout(layout.target);
+  if (!haveMatchingSpatialPlanes(layout.source, layout.target))
+    throw std::invalid_argument("PsiFormer spatial dense plane layouts do not match");
+  if (layout.rows == 0 || layout.input_width == 0 || layout.output_width == 0)
+    throw std::invalid_argument("PsiFormer spatial dense dimensions must be positive");
+  if (layout.source_row_stride < layout.input_width ||
+      layout.weight_row_stride < layout.output_width ||
+      layout.target_row_stride < layout.output_width)
+    throw std::invalid_argument("PsiFormer spatial dense row stride is too small");
+  const std::size_t source_elements = spatial_detail::checkedSpan(
+      layout.rows, layout.source_row_stride, layout.input_width,
+      "PsiFormer spatial dense source extent overflow");
+  const std::size_t target_elements = spatial_detail::checkedSpan(
+      layout.rows, layout.target_row_stride, layout.output_width,
+      "PsiFormer spatial dense target extent overflow");
+  (void)spatial_detail::checkedSpan(
+      layout.input_width, layout.weight_row_stride, layout.output_width,
+      "PsiFormer spatial dense weight extent overflow");
+  if (source_elements > layout.source.element_count ||
+      target_elements > layout.target.element_count)
+    throw std::invalid_argument("PsiFormer spatial dense rows exceed the plane extent");
+}
+
+inline SpatialDenseJetLayout makeSpatialDenseJetLayout(
+    std::size_t configuration_count,
+    std::size_t rows,
+    std::size_t input_width,
+    std::size_t output_width,
+    std::size_t electron_count,
+    SpatialJetMode mode,
+    std::size_t source_row_stride = 0,
+    std::size_t weight_row_stride = 0,
+    std::size_t target_row_stride = 0,
+    std::size_t source_plane_stride = 0,
+    std::size_t target_plane_stride = 0,
+    std::size_t source_configuration_stride = 0,
+    std::size_t target_configuration_stride = 0)
+{
+  const std::size_t actual_source_row_stride =
+      source_row_stride == 0 ? input_width : source_row_stride;
+  const std::size_t actual_weight_row_stride =
+      weight_row_stride == 0 ? output_width : weight_row_stride;
+  const std::size_t actual_target_row_stride =
+      target_row_stride == 0 ? output_width : target_row_stride;
+  const std::size_t source_elements = spatial_detail::checkedSpan(
+      rows, actual_source_row_stride, input_width,
+      "PsiFormer spatial dense source extent overflow");
+  const std::size_t target_elements = spatial_detail::checkedSpan(
+      rows, actual_target_row_stride, output_width,
+      "PsiFormer spatial dense target extent overflow");
+  SpatialDenseJetLayout layout{
+      makeSpatialJetLayout(configuration_count, source_elements, electron_count,
+                           mode, source_plane_stride, source_configuration_stride),
+      makeSpatialJetLayout(configuration_count, target_elements, electron_count,
+                           mode, target_plane_stride, target_configuration_stride),
+      rows, input_width, output_width, actual_source_row_stride,
+      actual_weight_row_stride, actual_target_row_stride};
+  validateSpatialDenseJetLayout(layout);
+  return layout;
+}
+
+inline void validateSpatialAttentionJetLayout(const SpatialAttentionJetLayout& layout)
+{
+  validateSpatialJetLayout(layout.features);
+  validateSpatialJetLayout(layout.attention);
+  if (!haveMatchingSpatialPlanes(layout.features, layout.attention))
+    throw std::invalid_argument("PsiFormer spatial attention plane layouts do not match");
+  if (layout.rows == 0 || layout.heads == 0 || layout.head_width == 0)
+    throw std::invalid_argument("PsiFormer spatial attention dimensions must be positive");
+  const std::size_t feature_width = spatial_detail::checkedProduct(
+      layout.heads, layout.head_width,
+      "PsiFormer spatial attention feature width overflow");
+  if (layout.feature_row_stride < feature_width ||
+      layout.attention_row_stride < layout.rows)
+    throw std::invalid_argument("PsiFormer spatial attention row stride is too small");
+  const std::size_t feature_elements = spatial_detail::checkedSpan(
+      layout.rows, layout.feature_row_stride, feature_width,
+      "PsiFormer spatial attention feature extent overflow");
+  const std::size_t one_head_elements = spatial_detail::checkedSpan(
+      layout.rows, layout.attention_row_stride, layout.rows,
+      "PsiFormer spatial attention head extent overflow");
+  if (layout.attention_head_stride < one_head_elements)
+    throw std::invalid_argument("PsiFormer spatial attention head stride is too small");
+  const std::size_t attention_elements = spatial_detail::checkedSpan(
+      layout.heads, layout.attention_head_stride, one_head_elements,
+      "PsiFormer spatial attention extent overflow");
+  if (feature_elements > layout.features.element_count ||
+      attention_elements > layout.attention.element_count)
+    throw std::invalid_argument("PsiFormer spatial attention data exceed the plane extent");
+}
+
+inline SpatialAttentionJetLayout makeSpatialAttentionJetLayout(
+    std::size_t configuration_count,
+    std::size_t rows,
+    std::size_t heads,
+    std::size_t head_width,
+    std::size_t electron_count,
+    SpatialJetMode mode,
+    std::size_t feature_row_stride = 0,
+    std::size_t attention_row_stride = 0,
+    std::size_t attention_head_stride = 0,
+    std::size_t feature_plane_stride = 0,
+    std::size_t attention_plane_stride = 0,
+    std::size_t feature_configuration_stride = 0,
+    std::size_t attention_configuration_stride = 0)
+{
+  const std::size_t feature_width = spatial_detail::checkedProduct(
+      heads, head_width, "PsiFormer spatial attention feature width overflow");
+  const std::size_t actual_feature_row_stride =
+      feature_row_stride == 0 ? feature_width : feature_row_stride;
+  const std::size_t actual_attention_row_stride =
+      attention_row_stride == 0 ? rows : attention_row_stride;
+  const std::size_t feature_elements = spatial_detail::checkedSpan(
+      rows, actual_feature_row_stride, feature_width,
+      "PsiFormer spatial attention feature extent overflow");
+  const std::size_t one_head_elements = spatial_detail::checkedSpan(
+      rows, actual_attention_row_stride, rows,
+      "PsiFormer spatial attention head extent overflow");
+  const std::size_t actual_attention_head_stride =
+      attention_head_stride == 0 ? one_head_elements : attention_head_stride;
+  const std::size_t attention_elements = spatial_detail::checkedSpan(
+      heads, actual_attention_head_stride, one_head_elements,
+      "PsiFormer spatial attention extent overflow");
+  SpatialAttentionJetLayout layout{
+      makeSpatialJetLayout(configuration_count, feature_elements, electron_count,
+                           mode, feature_plane_stride, feature_configuration_stride),
+      makeSpatialJetLayout(configuration_count, attention_elements, electron_count,
+                           mode, attention_plane_stride, attention_configuration_stride),
+      rows, heads, head_width, actual_feature_row_stride,
+      actual_attention_row_stride, actual_attention_head_stride};
+  validateSpatialAttentionJetLayout(layout);
+  return layout;
+}
+
+inline SoftmaxJetRowLayout makeAttentionSoftmaxJetRowLayout(
+    const SpatialAttentionJetLayout& layout)
+{
+  validateSpatialAttentionJetLayout(layout);
+  const std::size_t total_rows = spatial_detail::checkedProduct(
+      layout.heads, layout.rows,
+      "PsiFormer spatial attention softmax row count overflow");
+  SoftmaxJetRowLayout softmax{layout.attention, total_rows, layout.rows,
+                              layout.attention_row_stride, layout.rows,
+                              layout.attention_head_stride};
+  validateSoftmaxJetRowLayout(softmax);
+  return softmax;
+}
+
 inline std::size_t checkedSpatialPlaneOffset(const SpatialJetLayout& layout,
                                              std::size_t configuration,
                                              std::size_t plane,
@@ -247,9 +440,17 @@ inline void validateSoftmaxJetRowLayout(const SoftmaxJetRowLayout& layout)
     throw std::invalid_argument("PsiFormer softmax jet row dimensions must be positive");
   if (layout.row_stride < layout.row_width)
     throw std::invalid_argument("PsiFormer softmax jet row stride is too small");
-  const std::size_t row_elements = spatial_detail::checkedSpan(
-      layout.row_count, layout.row_stride, layout.row_width,
+  if (layout.rows_per_group == 0 || layout.row_count % layout.rows_per_group != 0)
+    throw std::invalid_argument("PsiFormer softmax jet row grouping is invalid");
+  const std::size_t group_count = layout.row_count / layout.rows_per_group;
+  const std::size_t one_group_elements = spatial_detail::checkedSpan(
+      layout.rows_per_group, layout.row_stride, layout.row_width,
       "PsiFormer softmax jet row extent overflow");
+  if (layout.row_group_stride < one_group_elements)
+    throw std::invalid_argument("PsiFormer softmax jet row-group stride is too small");
+  const std::size_t row_elements = spatial_detail::checkedSpan(
+      group_count, layout.row_group_stride, one_group_elements,
+      "PsiFormer softmax jet row-group extent overflow");
   if (row_elements > layout.jets.element_count)
     throw std::invalid_argument("PsiFormer softmax jet rows exceed the plane extent");
   (void)spatial_detail::checkedProduct(
@@ -265,16 +466,30 @@ inline SoftmaxJetRowLayout makeSoftmaxJetRowLayout(
     SpatialJetMode mode,
     std::size_t row_stride = 0,
     std::size_t plane_stride = 0,
-    std::size_t configuration_stride = 0)
+    std::size_t configuration_stride = 0,
+    std::size_t rows_per_group = 0,
+    std::size_t row_group_stride = 0)
 {
+  if (row_count == 0 || row_width == 0)
+    throw std::invalid_argument("PsiFormer softmax jet row dimensions must be positive");
   const std::size_t actual_row_stride = row_stride == 0 ? row_width : row_stride;
-  const std::size_t element_count = spatial_detail::checkedSpan(
-      row_count, actual_row_stride, row_width,
+  const std::size_t actual_rows_per_group =
+      rows_per_group == 0 ? row_count : rows_per_group;
+  if (row_count % actual_rows_per_group != 0)
+    throw std::invalid_argument("PsiFormer softmax jet row grouping is invalid");
+  const std::size_t one_group_elements = spatial_detail::checkedSpan(
+      actual_rows_per_group, actual_row_stride, row_width,
       "PsiFormer softmax jet row extent overflow");
+  const std::size_t actual_group_stride =
+      row_group_stride == 0 ? one_group_elements : row_group_stride;
+  const std::size_t element_count = spatial_detail::checkedSpan(
+      row_count / actual_rows_per_group, actual_group_stride, one_group_elements,
+      "PsiFormer softmax jet row-group extent overflow");
   SoftmaxJetRowLayout layout{
       makeSpatialJetLayout(configuration_count, element_count, electron_count,
                            mode, plane_stride, configuration_stride),
-      row_count, row_width, actual_row_stride};
+      row_count, row_width, actual_row_stride, actual_rows_per_group,
+      actual_group_stride};
   validateSoftmaxJetRowLayout(layout);
   return layout;
 }
@@ -297,8 +512,10 @@ inline void stableSoftmaxJetRows(const SoftmaxJetRowLayout& layout, double* jets
        configuration < layout.jets.configuration_count; ++configuration)
     for (std::size_t row = 0; row < layout.row_count; ++row)
     {
+      const std::size_t group = row / layout.rows_per_group;
+      const std::size_t row_in_group = row % layout.rows_per_group;
       const std::size_t row_offset = configuration * layout.jets.configuration_stride +
-          row * layout.row_stride;
+          group * layout.row_group_stride + row_in_group * layout.row_stride;
       const device_math::JetMathStatus status = device_math::softmaxJetRowInPlace(
           jets + row_offset,
           jets + row_offset + layout.jets.plane_stride,
