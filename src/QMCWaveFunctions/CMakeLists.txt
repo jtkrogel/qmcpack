@@ -41,6 +41,7 @@ set(WFBASE_SRCS
     HarmonicOscillator/SHOSetBuilder.cpp
     ExampleHeBuilder.cpp
     ExampleHeComponent.cpp
+    PsiFormer/PsiFormerAcceleratorPlanning.cpp
     PsiFormer/PsiFormerExecutionPlan.cpp
     PsiFormer/PsiFormerMemoryPolicy.cpp
     PsiFormer/PsiFormerInitialization.cpp
