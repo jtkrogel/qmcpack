@@ -261,7 +261,9 @@ std::uint64_t persistentModelIdentity(const pf::PsiFormer& model,
                                       const std::string& model_origin,
                                       const std::string& initialization_profile,
                                       std::uint64_t initialization_seed,
-                                      const psiformer::ExecutionEnvironment& environment)
+                                      const psiformer::ExecutionEnvironment& environment,
+                                      const std::array<double, 3>& reduced_twist,
+                                      const std::array<double, 3>& cartesian_twist)
 {
   std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
   mixPersistentString(hash, model_origin);
@@ -279,6 +281,15 @@ std::uint64_t persistentModelIdentity(const pf::PsiFormer& model,
     for (const auto& vector : environment.lattice_vectors)
       for (double component : vector)
         mixPersistentDouble(hash, component);
+  }
+  if (std::any_of(reduced_twist.begin(), reduced_twist.end(),
+                  [](double component) { return component != 0.0; }))
+  {
+    mixPersistentString(hash, "outer_twist_phase_v1");
+    for (double component : reduced_twist)
+      mixPersistentDouble(hash, component);
+    for (double component : cartesian_twist)
+      mixPersistentDouble(hash, component);
   }
   mixPersistentString(hash, model.p.layout_fingerprint());
   mixPersistentInteger(hash, model.ne);
@@ -589,6 +600,45 @@ struct InitializedNativeModel
   std::uint64_t seed;
 };
 
+/** Immutable outer Bloch phase applied by the QMCPACK adapter.
+ * The native network and all trainable parameters remain real.
+ */
+struct PsiFormerTwistPhase
+{
+  std::array<double, 3> reduced{};
+  std::array<double, 3> cartesian{};
+  bool enabled = false;
+
+  bool active() const noexcept { return enabled; }
+};
+
+/// Convert a reduced twist to the Cartesian wavevector used by the outer phase.
+PsiFormerTwistPhase makeTwistPhase(const ParticleSet& electrons,
+                                   std::array<double, 3> reduced)
+{
+  PsiFormerTwistPhase phase;
+  phase.reduced = reduced;
+  phase.enabled = std::any_of(
+      reduced.begin(), reduced.end(),
+      [](double component) { return component != 0.0; });
+  ParticleSet::PosType reduced_position;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    if (!psiformer::determinant::isFiniteReal(reduced[dimension]))
+      throw std::invalid_argument("PsiFormer reduced twist must be finite");
+    reduced_position[dimension] = reduced[dimension];
+  }
+  const auto cartesian = electrons.getLattice().k_cart(reduced_position);
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    if (!psiformer::determinant::isFiniteReal(cartesian[dimension]))
+      throw std::invalid_argument(
+          "PsiFormer Cartesian twist must be finite for the simulation cell");
+    phase.cartesian[dimension] = cartesian[dimension];
+  }
+  return phase;
+}
+
 /// Translate a QMCPACK simulation cell into immutable PsiFormer geometry metadata.
 psiformer::ExecutionEnvironment makeExecutionEnvironment(const ParticleSet& electrons)
 {
@@ -773,37 +823,42 @@ class PsiFormerSharedState
 public:
   /// Load the model that all clones of one PsiFormer component will share.
   PsiFormerSharedState(const std::string& parameters, const std::string& configuration)
-      : PsiFormerSharedState(pf::PsiFormer(parameters, configuration), "hdf5", "external_hdf5", 0, {})
+      : PsiFormerSharedState(pf::PsiFormer(parameters, configuration), "hdf5", "external_hdf5", 0, {}, {})
   {}
 
   /// Load and retarget a periodic import against explicit runtime particle sets.
   PsiFormerSharedState(const std::string& parameters,
                        const std::string& configuration,
                        const ParticleSet& electrons,
-                       const ParticleSet& ions)
+                       const ParticleSet& ions,
+                       std::array<double, 3> reduced_twist)
       : PsiFormerSharedState([&]() {
           validateMatchingLattices(electrons, ions);
           pf::PsiFormer model(parameters, configuration);
           const auto environment = makeExecutionEnvironment(electrons);
           retargetPeriodicNuclei(model, ions, environment);
           return model;
-        }(), "hdf5", "external_hdf5", 0, makeExecutionEnvironment(electrons))
+        }(), "hdf5", "external_hdf5", 0, makeExecutionEnvironment(electrons),
+            makeTwistPhase(electrons, reduced_twist))
   {}
 
   /// Materialize a fresh in-memory model and retain its reproducibility provenance.
   PsiFormerSharedState(psiformer::InitializedPsiFormerParameters initialized,
                        const ParticleSet& electrons,
-                       const ParticleSet& ions)
+                       const ParticleSet& ions,
+                       std::array<double, 3> reduced_twist)
       : PsiFormerSharedState(makeInitializedNativeModel(std::move(initialized), electrons, ions),
-                             makeExecutionEnvironment(electrons))
+                             makeExecutionEnvironment(electrons),
+                             makeTwistPhase(electrons, reduced_twist))
   {}
 
   /// Take ownership of a converted initialized model without copying its flat parameters.
   PsiFormerSharedState(InitializedNativeModel initialized,
-                       psiformer::ExecutionEnvironment environment)
+                       psiformer::ExecutionEnvironment environment,
+                       PsiFormerTwistPhase twist_phase)
       : PsiFormerSharedState(std::move(initialized.model), "internal",
                              std::move(initialized.profile), initialized.seed,
-                             std::move(environment))
+                             std::move(environment), std::move(twist_phase))
   {}
 
   /// Complete shared executor construction for imported and internally initialized models.
@@ -811,14 +866,18 @@ public:
                        std::string origin,
                        std::string profile,
                        std::uint64_t seed,
-                       psiformer::ExecutionEnvironment environment)
+                       psiformer::ExecutionEnvironment environment,
+                       PsiFormerTwistPhase twist_phase)
       : model(std::move(model_input)),
         model_origin(std::move(origin)),
         initialization_profile(std::move(profile)),
         initialization_seed(seed),
+        twist_phase(std::move(twist_phase)),
         persistent_model_identity(
             persistentModelIdentity(model, model_origin, initialization_profile,
-                                    initialization_seed, environment)),
+                                    initialization_seed, environment,
+                                    this->twist_phase.reduced,
+                                    this->twist_phase.cartesian)),
         execution_plan(psiformer::PsiFormerExecutionPlan::fromParameters(
             model.p,
             {/*spin_up_electrons=*/model.cfg.nup,
@@ -838,6 +897,15 @@ public:
         direct_score_mode(configuredDirectBackend("PSIFORMER_SCORE_BACKEND")),
         direct_kinetic_mode(configuredDirectBackend("PSIFORMER_KINETIC_BACKEND"))
   {
+    if (twist_phase.active() &&
+        execution_plan.environment().boundary != psiformer::BoundaryCondition::PERIODIC)
+      throw std::invalid_argument(
+          "A nonzero PsiFormer twist requires a fully periodic model");
+#ifndef QMC_COMPLEX
+    if (twist_phase.active())
+      throw std::invalid_argument(
+          "A nonzero PsiFormer twist requires a complex QMCPACK build");
+#endif
     if (execution_plan.environment().boundary == psiformer::BoundaryCondition::PERIODIC &&
         (direct_value_mode != DirectBackendMode::DIRECT ||
          direct_spatial_mode != DirectBackendMode::DIRECT ||
@@ -862,6 +930,8 @@ public:
   const std::string initialization_profile;
   /// Explicit component-local initialization seed, zero for imported models.
   const std::uint64_t initialization_seed;
+  /// Fixed outer Bloch phase; zero keeps the exact Gamma/open adapter path.
+  const PsiFormerTwistPhase twist_phase;
   /// Stable content identity used to reject buffers from another physical model.
   const std::uint64_t persistent_model_identity;
   /// Immutable typed tensor descriptors shared by every component clone.
@@ -974,6 +1044,140 @@ private:
   std::shared_lock<std::shared_mutex> metadata_lock_;
 };
 
+namespace
+{
+/// Convert explicit real/imaginary parts to the build-selected scalar type.
+template<class Target>
+Target makePsiFormerScalar(double real_part, double imaginary_part)
+{
+  if constexpr (IsComplex_t<Target>::value)
+    return Target(real_part, imaginary_part);
+  else
+  {
+    if (imaginary_part != 0.0)
+      throw std::logic_error(
+          "A nonzero PsiFormer twist cannot publish through a real scalar build");
+    return static_cast<Target>(real_part);
+  }
+}
+
+/// Return the fixed outer-phase angle for one complete electron configuration.
+double twistPhaseAngle(const PsiFormerSharedState& state,
+                       const ParticleSet& particles,
+                       int replaced_particle = -1,
+                       const ParticleSet::PosType* replacement_position = nullptr) noexcept
+{
+  if (!state.twist_phase.active())
+    return 0.0;
+  double phase = 0.0;
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+  {
+    const auto& position = electron == replaced_particle
+        ? (replacement_position ? *replacement_position : particles.activeR(electron))
+        : particles.R[electron];
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      phase += state.twist_phase.cartesian[dimension] * position[dimension];
+  }
+  return phase;
+}
+
+/// Return the outer-phase change for replacing one electron position.
+double twistDisplacementPhase(const PsiFormerSharedState& state,
+                              const ParticleSet::PosType& accepted,
+                              const ParticleSet::PosType& proposed) noexcept
+{
+  if (!state.twist_phase.active())
+    return 0.0;
+  double phase = 0.0;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    phase += state.twist_phase.cartesian[dimension] *
+        (proposed[dimension] - accepted[dimension]);
+  return phase;
+}
+
+/// Return the phase for an atomic selected-electron descriptor.
+double twistPhaseAngle(const PsiFormerSharedState& state,
+                       const ParticleSet& particles,
+                       const MCMultiParticleMoves<CoordsType::POS>::Slice& moves) noexcept
+{
+  if (!state.twist_phase.active())
+    return 0.0;
+  double phase = twistPhaseAngle(state, particles);
+  for (std::size_t selected = 0; selected < moves.size(); ++selected)
+  {
+    const std::size_t electron =
+        static_cast<std::size_t>(moves.particleIndex(selected));
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      phase += state.twist_phase.cartesian[dimension] *
+          (moves.proposedPosition(selected)[dimension] -
+           particles.R[electron][dimension]);
+  }
+  return phase;
+}
+
+/// Combine the real native amplitude with the immutable outer twist phase.
+WaveFunctionComponent::LogValue makePhysicalLogValue(
+    const PsiFormerSharedState& state,
+    double sign,
+    double logabs,
+    double twist_phase) noexcept
+{
+  return {logabs, (sign < 0.0 ? M_PI : 0.0) +
+          (state.twist_phase.active() ? twist_phase : 0.0)};
+}
+
+/// Form a physical ratio from real amplitude data and an outer-phase change.
+WaveFunctionComponent::PsiValue makePhysicalRatio(
+    const PsiFormerSharedState& state,
+    double proposed_sign,
+    double proposed_logabs,
+    double reference_sign,
+    double reference_logabs,
+    double phase_change)
+{
+  const double real_ratio = (proposed_sign / reference_sign) *
+      std::exp(proposed_logabs - reference_logabs);
+  if (!psiformer::determinant::isFiniteReal(real_ratio) ||
+      !psiformer::determinant::isFiniteReal(phase_change))
+    throw std::runtime_error("PsiFormer batch ratio is non-finite");
+  if (!state.twist_phase.active())
+    return WaveFunctionComponent::PsiValue(real_ratio);
+  return makePsiFormerScalar<WaveFunctionComponent::PsiValue>(
+      real_ratio * std::cos(phase_change),
+      real_ratio * std::sin(phase_change));
+}
+
+/// Convert one real native log-gradient component to its physical complex value.
+WaveFunctionComponent::ValueType makePhysicalGradient(
+    const PsiFormerSharedState& state,
+    double native,
+    std::size_t dimension) noexcept
+{
+  if (!state.twist_phase.active())
+    return static_cast<WaveFunctionComponent::ValueType>(native);
+  return makePsiFormerScalar<WaveFunctionComponent::ValueType>(
+      native, state.twist_phase.cartesian[dimension]);
+}
+
+/// Validate sign, magnitude, and phase against the immutable policy and coordinates.
+bool isCoherentPhysicalValue(const PsiFormerSharedState& state,
+                             double sign,
+                             const WaveFunctionComponent::LogValue& log_value,
+                             const ParticleSet& particles,
+                             int replaced_particle = -1,
+                             const ParticleSet::PosType* replacement_position = nullptr) noexcept
+{
+  if ((sign != -1.0 && sign != 1.0) ||
+      !psiformer::determinant::isFiniteReal(std::real(log_value)) ||
+      !psiformer::determinant::isFiniteReal(std::imag(log_value)))
+    return false;
+  return log_value == makePhysicalLogValue(
+      state, sign, std::real(log_value),
+      twistPhaseAngle(state, particles, replaced_particle,
+                      replacement_position));
+}
+} // namespace
+
 /** Apply bounded score and kinetic products without a sample-by-parameter matrix.
  *
  * The operator owns reusable direct score and kinetic tapes, three fixed complex
@@ -999,7 +1203,8 @@ public:
       std::size_t sample_offset,
       std::size_t sample_count,
       std::vector<double> positions,
-      std::vector<double> total_log_gradients,
+      std::vector<double> total_log_gradients_real,
+      std::vector<double> total_log_gradients_imaginary,
       std::vector<double> inverse_masses,
       std::size_t maximum_parameter_chunk_size)
       : model_state_(std::move(model_state)),
@@ -1010,7 +1215,8 @@ public:
         sample_count_(sample_count),
         electron_count_(model_state_->execution_plan.modelShape().electrons()),
         positions_(std::move(positions)),
-        total_log_gradients_(std::move(total_log_gradients)),
+        total_log_gradients_real_(std::move(total_log_gradients_real)),
+        total_log_gradients_imaginary_(std::move(total_log_gradients_imaginary)),
         inverse_masses_(std::move(inverse_masses)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
         score_workspace_(model_state_->direct_score_executor.makeWorkspace()),
@@ -1023,7 +1229,8 @@ public:
     const std::size_t expected_positions = checkedPositionCount(sample_count_, electron_count_);
     if (positions_.size() != expected_positions)
       throw std::invalid_argument("PsiFormer streaming derivative received the wrong position extent");
-    if (total_log_gradients_.size() != expected_positions)
+    if (total_log_gradients_real_.size() != expected_positions ||
+        total_log_gradients_imaginary_.size() != expected_positions)
       throw std::invalid_argument(
           "PsiFormer streaming derivative received the wrong total-drift extent");
     const std::size_t expected_masses = checkedMassCount(sample_count_, electron_count_);
@@ -1107,7 +1314,7 @@ protected:
   /// Accumulate fused score/kinetic VJPs, then emit canonical bounded chunks.
   void evaluateVJPs(
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
-      wftrain::DerivativeAdjoint,
+      wftrain::DerivativeAdjoint adjoint,
       wftrain::ParameterReductionSink& sink) const override
   {
     {
@@ -1129,7 +1336,10 @@ protected:
         if (needs_kinetic)
         {
           setKineticWorkspacePositions(sample);
-          const double* total_drift = total_log_gradients_.data() +
+          const double* total_drift = total_log_gradients_real_.data() +
+              sample * electron_count_ * std::size_t{3};
+          const double* imaginary_drift =
+              total_log_gradients_imaginary_.data() +
               sample * electron_count_ * std::size_t{3};
           const double* inverse_mass = inverse_masses_.data() +
               sample * electron_count_;
@@ -1147,6 +1357,31 @@ protected:
                 : result.parameter_score;
             accumulateResponse(
                 channel, channels[channel].coefficients.values[sample], response);
+          }
+          const bool has_imaginary_drift = std::any_of(
+              imaginary_drift,
+              imaginary_drift + electron_count_ * std::size_t{3},
+              [](double value) { return value != 0.0; });
+          if (has_imaginary_drift)
+          {
+            const pf::DirectKineticConstView imaginary_response =
+                model_state_->direct_kinetic_executor
+                    .evaluateGradientParameterResponse(
+                        *kinetic_workspace_, imaginary_drift,
+                        electron_count_ * std::size_t{3}, inverse_mass,
+                        electron_count_);
+            const wftrain::DerivativeValue imaginary_unit =
+                adjoint == wftrain::DerivativeAdjoint::HERMITIAN
+                ? wftrain::DerivativeValue(0.0, -1.0)
+                : wftrain::DerivativeValue(0.0, 1.0);
+            for (std::size_t channel = 0; channel < channels.size(); ++channel)
+              if (channels[channel].product ==
+                  wftrain::DerivativeProduct::LOCAL_ENERGY_VJP)
+                accumulateResponse(
+                    channel,
+                    channels[channel].coefficients.values[sample] *
+                        imaginary_unit,
+                    imaginary_response);
           }
         }
         else
@@ -1357,13 +1592,18 @@ private:
         positions_.capacity(), sizeof(double),
         "PsiFormer streaming position capacity");
     const std::size_t gradient_bytes = checkedBatchMemoryMultiply(
-        total_log_gradients_.capacity(), sizeof(double),
-        "PsiFormer streaming total-drift capacity");
+        total_log_gradients_real_.capacity(), sizeof(double),
+        "PsiFormer streaming real total-drift capacity");
+    const std::size_t imaginary_gradient_bytes = checkedBatchMemoryMultiply(
+        total_log_gradients_imaginary_.capacity(), sizeof(double),
+        "PsiFormer streaming imaginary total-drift capacity");
     const std::size_t inverse_mass_bytes = checkedBatchMemoryMultiply(
         inverse_masses_.capacity(), sizeof(double),
         "PsiFormer streaming inverse-mass capacity");
     const std::size_t auxiliary_bytes = checkedBatchMemoryAdd(
-        gradient_bytes, inverse_mass_bytes,
+        checkedBatchMemoryAdd(gradient_bytes, imaginary_gradient_bytes,
+                              "PsiFormer streaming complex drift storage"),
+        inverse_mass_bytes,
         "PsiFormer streaming sample auxiliary storage");
     const std::size_t sample_product_bytes = checkedBatchMemoryMultiply(
         sample_products_.capacity(), sizeof(wftrain::DerivativeValue),
@@ -1395,8 +1635,11 @@ private:
                    reinterpret_cast<std::uintptr_t>(positions_.data()));
     mixFingerprint(fingerprint, positions_.capacity());
     mixFingerprint(fingerprint,
-                   reinterpret_cast<std::uintptr_t>(total_log_gradients_.data()));
-    mixFingerprint(fingerprint, total_log_gradients_.capacity());
+                   reinterpret_cast<std::uintptr_t>(total_log_gradients_real_.data()));
+    mixFingerprint(fingerprint, total_log_gradients_real_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(total_log_gradients_imaginary_.data()));
+    mixFingerprint(fingerprint, total_log_gradients_imaginary_.capacity());
     mixFingerprint(fingerprint,
                    reinterpret_cast<std::uintptr_t>(inverse_masses_.data()));
     mixFingerprint(fingerprint, inverse_masses_.capacity());
@@ -1434,7 +1677,8 @@ private:
   std::size_t sample_count_      = 0;
   std::size_t electron_count_    = 0;
   std::vector<double> positions_;
-  std::vector<double> total_log_gradients_;
+  std::vector<double> total_log_gradients_real_;
+  std::vector<double> total_log_gradients_imaginary_;
   std::vector<double> inverse_masses_;
   wftrain::ParameterChunkPlan chunk_plan_;
   mutable std::unique_ptr<pf::DirectScoreWorkspace> score_workspace_;
@@ -3325,7 +3569,9 @@ std::string modelFingerprint(const pf::PsiFormer& model,
                              const std::string& model_origin,
                              const std::string& initialization_profile,
                              std::uint64_t initialization_seed,
-                             const psiformer::ExecutionEnvironment& environment)
+                             const psiformer::ExecutionEnvironment& environment,
+                             const std::array<double, 3>& reduced_twist,
+                             const std::array<double, 3>& cartesian_twist)
 {
   std::uint64_t hash = 14695981039346656037ULL;
   auto mix_byte      = [&hash](std::uint8_t byte) {
@@ -3362,6 +3608,15 @@ std::string modelFingerprint(const pf::PsiFormer& model,
     for (const auto& vector : environment.lattice_vectors)
       for (double component : vector)
         mix_double(component);
+  }
+  if (std::any_of(reduced_twist.begin(), reduced_twist.end(),
+                  [](double component) { return component != 0.0; }))
+  {
+    mix_string("outer_twist_phase_v1");
+    for (double component : reduced_twist)
+      mix_double(component);
+    for (double component : cartesian_twist)
+      mix_double(component);
   }
   mix_string(model.p.layout_fingerprint());
   mix_integer(model.cfg.nup);
@@ -3455,20 +3710,6 @@ void packBatchConfiguration(
   }
 }
 
-/// Convert the real sign/log-magnitude result to QMCPACK's complex-log convention.
-WaveFunctionComponent::LogValue makeLogValue(double sign, double logabs) noexcept
-{ return WaveFunctionComponent::LogValue(logabs, sign < 0 ? M_PI : 0.0); }
-
-/// Validate the exact real-wavefunction sign/phase convention of an accepted value.
-bool isCoherentAcceptedValue(double sign,
-                             const WaveFunctionComponent::LogValue& log_value) noexcept
-{
-  return (sign == -1.0 || sign == 1.0) &&
-      psiformer::determinant::isFiniteReal(std::real(log_value)) &&
-      psiformer::determinant::isFiniteReal(std::imag(log_value)) &&
-      log_value == makeLogValue(sign, std::real(log_value));
-}
-
 /// Checked non-owning byte range used by planned output-alias preflight.
 struct CheckedMemoryRange
 {
@@ -3512,18 +3753,6 @@ bool isFiniteWavefunctionValue(const T& value) noexcept
              static_cast<double>(std::imag(value)));
 }
 
-/// Form a finite real ratio without materializing either wavefunction amplitude.
-WaveFunctionComponent::PsiValue makeRatio(double proposed_sign,
-                                          double proposed_logabs,
-                                          double reference_sign,
-                                          double reference_logabs)
-{
-  const double ratio = (proposed_sign / reference_sign) * std::exp(proposed_logabs - reference_logabs);
-  if (!psiformer::determinant::isFiniteReal(ratio))
-    throw std::runtime_error("PsiFormer batch ratio is non-finite");
-  return WaveFunctionComponent::PsiValue(ratio);
-}
-
 /// Require the unit electron masses assumed by the native kinetic-response formula.
 void requireUnitElectronMasses(const ParticleSet& particles)
 {
@@ -3547,20 +3776,6 @@ void requireUnitElectronMasses(const ParticleSet& particles)
   }
 }
 
-/// Reject complex total drifts until kinetic reverse kernels support complex arithmetic.
-void requireRealTotalWavefunctionDrift(const ParticleSet& particles)
-{
-#ifdef QMC_COMPLEX
-  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
-    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
-      if (std::imag(particles.G[electron][dimension]) != 0.0)
-        throw std::invalid_argument(
-            "PsiFormer kinetic parameter derivatives require a real total wavefunction drift; "
-            "genuinely complex kinetic response is not implemented");
-#else
-  static_cast<void>(particles);
-#endif
-}
 } // namespace
 
 // Load an exported model before entering the common optimizer-registration path.
@@ -3586,10 +3801,11 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          bool enable_optimization,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
-                         std::string optimized_parameter_export)
+                         std::string optimized_parameter_export,
+                         std::array<double, 3> reduced_twist)
     : PsiFormerWF(std::move(name),
                   std::make_shared<PsiFormerSharedState>(parameters, configuration,
-                                                        electrons, ions),
+                                                        electrons, ions, reduced_twist),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {
@@ -3604,9 +3820,11 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          bool enable_optimization,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
-                         std::string optimized_parameter_export)
+                         std::string optimized_parameter_export,
+                         std::array<double, 3> reduced_twist)
     : PsiFormerWF(std::move(name),
-                  std::make_shared<PsiFormerSharedState>(std::move(initialized_parameters), electrons, ions),
+                  std::make_shared<PsiFormerSharedState>(std::move(initialized_parameters), electrons, ions,
+                                                        reduced_twist),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {
@@ -3683,7 +3901,9 @@ PsiFormerWF::PsiFormerWF(std::string name,
             << modelFingerprint(model_state_->model, model_state_->model_origin,
                                 model_state_->initialization_profile,
                                 model_state_->initialization_seed,
-                                model_state_->execution_plan.environment())
+                                model_state_->execution_plan.environment(),
+                                model_state_->twist_phase.reduced,
+                                model_state_->twist_phase.cartesian)
             << ", origin=" << model_state_->model_origin;
   if (!model_state_->initialization_profile.empty())
     app_log() << ", initialization=" << model_state_->initialization_profile
@@ -4399,7 +4619,8 @@ PsiFormerWF::makeStreamingDerivativeOperator(
   checkedBatchMemoryMultiply(mass_count, sizeof(double),
                              "PsiFormer streaming inverse-mass bytes");
   std::vector<double> positions(position_count);
-  std::vector<double> total_log_gradients(position_count);
+  std::vector<double> total_log_gradients_real(position_count);
+  std::vector<double> total_log_gradients_imaginary(position_count);
   std::vector<double> inverse_masses(mass_count);
 
   for (std::size_t sample = 0; sample < sample_count; ++sample)
@@ -4461,12 +4682,14 @@ PsiFormerWF::makeStreamingDerivativeOperator(
         const double drift_real = static_cast<double>(std::real(drift_value));
         const double drift_imaginary = static_cast<double>(std::imag(drift_value));
         if (!psiformer::determinant::isFiniteReal(drift_real) ||
-            !psiformer::determinant::isFiniteReal(drift_imaginary) ||
-            drift_imaginary != 0.0)
+            !psiformer::determinant::isFiniteReal(drift_imaginary))
           throw std::invalid_argument(
-              "PsiFormer streaming derivative requires a finite real total TrialWaveFunction drift");
-        total_log_gradients[
+              "PsiFormer streaming derivative requires a finite total TrialWaveFunction drift");
+        total_log_gradients_real[
             (sample * electron_count + electron) * 3 + dimension] = drift_real;
+        total_log_gradients_imaginary[
+            (sample * electron_count + electron) * 3 + dimension] =
+                drift_imaginary;
       }
     }
   }
@@ -4475,7 +4698,8 @@ PsiFormerWF::makeStreamingDerivativeOperator(
   return std::make_unique<PsiFormerStreamingDerivativeOperator>(
       model_state_, structured_parameter_schema_, parameter_version, batch_ordinal,
       sample_offset, sample_count, std::move(positions),
-      std::move(total_log_gradients), std::move(inverse_masses),
+      std::move(total_log_gradients_real),
+      std::move(total_log_gradients_imaginary), std::move(inverse_masses),
       maximum_parameter_chunk_size);
 }
 
@@ -5744,10 +5968,13 @@ PsiFormerWF::PlannedRuntimeAccess PsiFormerWF::requirePlannedMultiWalkerOperatio
           component.proposed_configuration_identity_ !=
               configurationIdentity(
                   p_list[lane], static_cast<int>(*request.active_electron)) ||
-          !isCoherentAcceptedValue(component.current_sign_,
-                                   component.log_value_) ||
-          !isCoherentAcceptedValue(component.proposed_sign_,
-                                   component.proposed_log_value_))
+          !isCoherentPhysicalValue(*component.model_state_,
+                                   component.current_sign_, component.log_value_,
+                                   p_list[lane]) ||
+          !isCoherentPhysicalValue(
+              *component.model_state_, component.proposed_sign_,
+              component.proposed_log_value_, p_list[lane],
+              static_cast<int>(*request.active_electron), nullptr))
         throw std::logic_error(
             "PsiFormer planned operation requires one exact single-particle proposal");
       break;
@@ -6669,7 +6896,7 @@ void PsiFormerWF::clearProposalState() noexcept
 
 // Retain a one-electron proposal behind its exact scalar or crowd origin.
 void PsiFormerWF::cacheSingleParticleProposal(double sign,
-                                              double logabs,
+                                              LogValue physical_log_value,
                                               std::uint64_t configuration_identity,
                                               int particle,
                                               std::size_t parameter_version,
@@ -6682,7 +6909,7 @@ void PsiFormerWF::cacheSingleParticleProposal(double sign,
     throw std::invalid_argument(
         "PsiFormer one-electron proposal has an incompatible origin");
   proposed_sign_                   = sign;
-  proposed_log_value_              = makeLogValue(sign, logabs);
+  proposed_log_value_              = physical_log_value;
   proposed_configuration_identity_ = configuration_identity;
   proposed_descriptor_fingerprint_ = 0;
   proposed_parameter_version_      = parameter_version;
@@ -7299,11 +7526,9 @@ PsiFormerWF::parsePlannedWalkerBufferRecord(
   const bool zero_amplitude = positive_zero_sign &&
       isNegativeInfinity(record.log_magnitude) && positive_zero_phase;
   const bool finite_nonzero_amplitude =
-      (record.sign == -1.0 || record.sign == 1.0) &&
-      psiformer::determinant::isFiniteReal(record.log_magnitude) &&
-      psiformer::determinant::isFiniteReal(record.phase) &&
-      record.phase == (record.sign < 0.0 ? M_PI : 0.0) &&
-      (record.sign < 0.0 || !isNegativeZero(record.phase));
+      isCoherentPhysicalValue(
+          *model_state_, record.sign,
+          LogValue(record.log_magnitude, record.phase), particles);
   if (!zero_amplitude && !finite_nonzero_amplitude)
     throw std::runtime_error(
         "PsiFormer planned walker buffer amplitude is invalid");
@@ -7456,8 +7681,9 @@ PsiFormerWF::requirePlannedWalkerBufferRefreshInputs(
     throw std::logic_error(
         "PsiFormer planned walker-buffer refresh requires a current FULL_VGL accepted state");
 
-  if (!isCoherentAcceptedValue(current_sign_, log_value_) ||
-      (current_sign_ > 0.0 && isNegativeZero(std::imag(log_value_))))
+  if (!isCoherentPhysicalValue(*model_state_, current_sign_, log_value_, particles) ||
+      (!model_state_->twist_phase.active() && current_sign_ > 0.0 &&
+       isNegativeZero(std::imag(log_value_))))
     throw std::logic_error(
         "PsiFormer planned walker-buffer refresh has an invalid accepted amplitude");
 
@@ -7916,11 +8142,14 @@ void PsiFormerWF::getAcceptedState(const ParticleSet& particles,
     invalidateParameterCaches(parameter_version);
     throw std::runtime_error("PsiFormer walker buffer parameter version is out of range");
   }
+  const bool zero_amplitude = sign == 0.0 && isNegativeInfinity(logabs) &&
+      phase == 0.0;
+  const bool finite_nonzero_amplitude = isCoherentPhysicalValue(
+      *model_state_, sign, LogValue(logabs, phase), particles);
   if (!psiformer::determinant::isFiniteReal(sign) ||
       (!psiformer::determinant::isFiniteReal(logabs) && !(sign == 0.0 && isNegativeInfinity(logabs))) ||
       !psiformer::determinant::isFiniteReal(phase) ||
-      (sign != -1.0 && sign != 0.0 && sign != 1.0) ||
-      phase != (sign < 0.0 ? M_PI : 0.0))
+      (!zero_amplitude && !finite_nonzero_amplitude))
   {
     invalidateParameterCaches(parameter_version);
     throw std::runtime_error("PsiFormer walker buffer amplitude is invalid");
@@ -8063,7 +8292,9 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   const std::string model_fingerprint =
       modelFingerprint(model, model_state_->model_origin, model_state_->initialization_profile,
                        model_state_->initialization_seed,
-                       model_state_->execution_plan.environment());
+                       model_state_->execution_plan.environment(),
+                       model_state_->twist_phase.reduced,
+                       model_state_->twist_phase.cartesian);
 
   output.write(format_version, "format_version");
   output.write(parameter_count, "parameter_count");
@@ -8079,6 +8310,15 @@ void PsiFormerWF::writeVariationalParameters(hdf_archive& output)
   output.write(model.cfg.nuclei.x, "nuclear_positions");
   output.write(model.cfg.charges.x, "nuclear_charges");
   output.write(selected_indices, "selected_flat_indices");
+  if (model_state_->twist_phase.active())
+  {
+    output.write(std::vector<double>(model_state_->twist_phase.reduced.begin(),
+                                     model_state_->twist_phase.reduced.end()),
+                 "reduced_twist");
+    output.write(std::vector<double>(model_state_->twist_phase.cartesian.begin(),
+                                     model_state_->twist_phase.cartesian.end()),
+                 "cartesian_twist");
+  }
   output.write(model.p.flat_values(), "flat_values");
 
   output.pop();
@@ -8136,6 +8376,13 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
   const std::vector<double> nuclear_charges         = readVector<double>(input, "nuclear_charges");
   const std::vector<std::uint64_t> selected_indices =
       readVector<std::uint64_t>(input, "selected_flat_indices");
+  std::vector<double> reduced_twist;
+  std::vector<double> cartesian_twist;
+  if (model_state_->twist_phase.active())
+  {
+    reduced_twist   = readVector<double>(input, "reduced_twist");
+    cartesian_twist = readVector<double>(input, "cartesian_twist");
+  }
   const std::vector<double> flat_values = readVector<double>(input, "flat_values");
   std::string layout_fingerprint;
   std::string model_fingerprint;
@@ -8169,7 +8416,9 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
     if (model_fingerprint !=
         modelFingerprint(model, model_state_->model_origin, model_state_->initialization_profile,
                          model_state_->initialization_seed,
-                         model_state_->execution_plan.environment()))
+                         model_state_->execution_plan.environment(),
+                         model_state_->twist_phase.reduced,
+                         model_state_->twist_phase.cartesian))
       throw std::runtime_error("PsiFormer VP model fingerprint does not match the configured model");
     if (system_kind != system_kind_)
       throw std::runtime_error("PsiFormer VP system declaration does not match the configured model");
@@ -8184,6 +8433,17 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
     requireEqual(nuclear_charges, model.cfg.charges.x, "nuclear charges");
     requireEqual(selected_indices, persistIndices(optimization_metadata_->selected_flat_indices),
                  "selected flat indices");
+    if (model_state_->twist_phase.active())
+    {
+      requireEqual(reduced_twist,
+                   std::vector<double>(model_state_->twist_phase.reduced.begin(),
+                                       model_state_->twist_phase.reduced.end()),
+                   "reduced twist");
+      requireEqual(cartesian_twist,
+                   std::vector<double>(model_state_->twist_phase.cartesian.begin(),
+                                       model_state_->twist_phase.cartesian.end()),
+                   "Cartesian twist");
+    }
 
     if (flat_values != model.p.flat_values())
       model.p.set_flat_values(flat_values);
@@ -9140,11 +9400,14 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLogUnderRead(
     current_sign_ = sign;
     // QMCPACK represents a negative real wavefunction by adding pi to its complex
     // phase.
-    log_value_ = LogValue(logabs, sign < 0 ? M_PI : 0.0);
+    log_value_ = makePhysicalLogValue(
+        transaction.state(), sign, logabs,
+        twistPhaseAngle(transaction.state(), p));
     for (int electron = 0; electron < p.getTotalNum(); ++electron)
     {
       for (int dimension = 0; dimension < 3; ++dimension)
-        accepted_gradient_[electron][dimension] = gradient[3 * electron + dimension];
+        accepted_gradient_[electron][dimension] = makePhysicalGradient(
+            transaction.state(), gradient[3 * electron + dimension], dimension);
       accepted_laplacian_[electron] = lap_log[electron];
     }
     accepted_configuration_identity_ = configurationIdentity(p);
@@ -9227,12 +9490,16 @@ void PsiFormerWF::mw_evaluateLog(
         auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
         const pf::Result& result = staged_results[walker];
         component.current_sign_ = result.sign;
-        component.log_value_    = makeLogValue(result.sign, result.logabs);
+        component.log_value_ = makePhysicalLogValue(
+            transaction.state(), result.sign, result.logabs,
+            twistPhaseAngle(transaction.state(), p_list[walker]));
         for (std::size_t electron = 0; electron < electrons; ++electron)
         {
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
             component.accepted_gradient_[electron][dimension] =
-                result.gradient[3 * electron + dimension];
+                makePhysicalGradient(transaction.state(),
+                                     result.gradient[3 * electron + dimension],
+                                     dimension);
           component.accepted_laplacian_[electron] = result.lap_log[electron];
         }
         component.accepted_configuration_identity_ = configurationIdentity(p_list[walker]);
@@ -9263,14 +9530,20 @@ void PsiFormerWF::mw_evaluateLog(
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
       component.current_sign_ = result.sign[walker];
-      component.log_value_ = makeLogValue(result.sign[walker], result.logabs[walker]);
+      component.log_value_ = makePhysicalLogValue(
+          transaction.state(), result.sign[walker], result.logabs[walker],
+          twistPhaseAngle(transaction.state(), p_list[walker]));
       auto& gradient = gradient_list[walker].get();
       auto& laplacian = laplacian_list[walker].get();
       for (std::size_t electron = 0; electron < electrons; ++electron)
       {
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           component.accepted_gradient_[electron][dimension] =
-              result.gradient[walker * result.gradient_stride + 3 * electron + dimension];
+              makePhysicalGradient(
+                  transaction.state(),
+                  result.gradient[walker * result.gradient_stride +
+                                  3 * electron + dimension],
+                  dimension);
         component.accepted_laplacian_[electron] =
             result.lap_log[walker * result.laplacian_stride + electron];
       }
@@ -9516,9 +9789,9 @@ void PsiFormerWF::mw_evaluateLog(
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
         const ValueType future = gradient_list[lane].get()[electron][dimension] +
-            static_cast<ValueType>(
+            makePhysicalGradient(transaction.state(),
                 result.gradient[lane * result.gradient_stride +
-                                3 * electron + dimension]);
+                                3 * electron + dimension], dimension);
         if (!isFiniteWavefunctionValue(future))
           throw std::overflow_error(
               "PsiFormer planned FULL_VGL gradient sum is non-finite");
@@ -9541,9 +9814,9 @@ void PsiFormerWF::mw_evaluateLog(
       {
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           component.accepted_gradient_[electron][dimension] =
-              static_cast<ValueType>(
+              makePhysicalGradient(transaction.state(),
                   result.gradient[lane * result.gradient_stride +
-                                  3 * electron + dimension]);
+                                  3 * electron + dimension], dimension);
         component.accepted_laplacian_[electron] = static_cast<ValueType>(
             result.lap_log[lane * result.laplacian_stride + electron]);
       }
@@ -9553,9 +9826,9 @@ void PsiFormerWF::mw_evaluateLog(
       {
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           gradient_list[lane].get()[electron][dimension] +=
-              static_cast<ValueType>(
+              makePhysicalGradient(transaction.state(),
                   result.gradient[lane * result.gradient_stride +
-                                  3 * electron + dimension]);
+                                  3 * electron + dimension], dimension);
         laplacian_list[lane].get()[electron] += static_cast<ValueType>(
             result.lap_log[lane * result.laplacian_stride + electron]);
       }
@@ -9563,9 +9836,10 @@ void PsiFormerWF::mw_evaluateLog(
     {
       auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
       component.current_sign_ = resource.staged_signs[lane];
-      component.log_value_ = makeLogValue(
-          resource.staged_signs[lane],
-          resource.staged_log_magnitudes[lane]);
+      component.log_value_ = makePhysicalLogValue(
+          transaction.state(), resource.staged_signs[lane],
+          resource.staged_log_magnitudes[lane],
+          twistPhaseAngle(transaction.state(), p_list[lane]));
       component.accepted_configuration_identity_ =
           resource.configuration_identities[lane];
       component.accepted_parameter_version_ = parameter_version;
@@ -9763,7 +10037,11 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
         throw std::runtime_error(
             "PsiFormer selected-electron proposal produced a non-finite value");
       staged_log_ratios[walker] =
-          makeLogValue(proposed_signs[walker], proposed_logabs[walker]) - component.log_value_;
+          makePhysicalLogValue(
+              transaction.state(), proposed_signs[walker],
+              proposed_logabs[walker],
+              twistPhaseAngle(transaction.state(), p_list[walker],
+                              moves.slice(walker))) - component.log_value_;
       if (!psiformer::determinant::isFiniteReal(std::real(staged_log_ratios[walker])) ||
           !psiformer::determinant::isFiniteReal(std::imag(staged_log_ratios[walker])))
         throw std::runtime_error(
@@ -9789,8 +10067,11 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
           {
             for (std::size_t dimension = 0; dimension < 3; ++dimension)
               component.proposed_gradient_[electron][dimension] =
-                  batch_result.gradient[slot * batch_result.gradient_stride +
-                                        3 * electron + dimension];
+                  makePhysicalGradient(
+                      transaction.state(),
+                      batch_result.gradient[slot * batch_result.gradient_stride +
+                                            3 * electron + dimension],
+                      dimension);
             component.proposed_laplacian_[electron] =
                 batch_result.lap_log[slot * batch_result.laplacian_stride + electron];
           }
@@ -9799,7 +10080,9 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
             const pf::Result& oracle = oracle_results[slot];
             for (std::size_t dimension = 0; dimension < 3; ++dimension)
               component.proposed_gradient_[electron][dimension] =
-                  oracle.gradient[3 * electron + dimension];
+                  makePhysicalGradient(
+                      transaction.state(),
+                      oracle.gradient[3 * electron + dimension], dimension);
             component.proposed_laplacian_[electron] = oracle.lap_log[electron];
           }
         }
@@ -9807,7 +10090,11 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
 
       component.proposed_sign_                   = proposed_signs[walker];
       component.proposed_log_value_              =
-          makeLogValue(proposed_signs[walker], proposed_logabs[walker]);
+          makePhysicalLogValue(
+              transaction.state(), proposed_signs[walker],
+              proposed_logabs[walker],
+              twistPhaseAngle(transaction.state(), p_list[walker],
+                              moves.slice(walker)));
       component.proposed_configuration_identity_ = proposed_identities[walker];
       component.proposed_descriptor_fingerprint_ = descriptor_fingerprint;
       component.proposed_parameter_version_      = parameter_version;
@@ -10174,9 +10461,11 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
       throw std::runtime_error(
           "PsiFormer planned selected proposal produced an invalid value");
     if (slot != no_batch_slot)
-      resource.staged_log_ratios[lane] = makeLogValue(
-          resource.staged_signs[lane],
-          resource.staged_log_magnitudes[lane]) - component.log_value_;
+      resource.staged_log_ratios[lane] = makePhysicalLogValue(
+          transaction.state(), resource.staged_signs[lane],
+          resource.staged_log_magnitudes[lane],
+          twistPhaseAngle(transaction.state(), p_list[lane],
+                          moves.slice(lane))) - component.log_value_;
     if (!isFiniteWavefunctionValue(resource.staged_log_ratios[lane]))
       throw std::runtime_error(
           "PsiFormer planned selected proposal produced a non-finite ratio");
@@ -10253,7 +10542,10 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
           resource.staged_signs[lane] != result.sign[slot] ||
           resource.staged_log_magnitudes[lane] != result.logabs[slot] ||
           resource.staged_log_ratios[lane] !=
-              makeLogValue(result.sign[slot], result.logabs[slot]) -
+              makePhysicalLogValue(
+                  transaction.state(), result.sign[slot], result.logabs[slot],
+                  twistPhaseAngle(transaction.state(), p_list[lane],
+                                  moves.slice(lane))) -
                   component.log_value_)
         throw std::logic_error(
             "PsiFormer planned selected native value staging changed during evaluation");
@@ -10308,9 +10600,9 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
       {
         const ValueType contribution = slot == no_batch_slot
             ? component.accepted_gradient_[electron][dimension]
-            : static_cast<ValueType>(
+            : makePhysicalGradient(transaction.state(),
                   result.gradient[slot * result.gradient_stride +
-                                  3 * electron + dimension]);
+                                  3 * electron + dimension], dimension);
         const ValueType future =
             proposed_gradient_list[lane].get()[electron][dimension] +
             contribution;
@@ -10347,9 +10639,9 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
           component.proposed_gradient_[electron][dimension] =
               slot == no_batch_slot
               ? component.accepted_gradient_[electron][dimension]
-              : static_cast<ValueType>(
+              : makePhysicalGradient(transaction.state(),
                     result.gradient[slot * result.gradient_stride +
-                                    3 * electron + dimension]);
+                                    3 * electron + dimension], dimension);
         component.proposed_laplacian_[electron] = slot == no_batch_slot
             ? component.accepted_laplacian_[electron]
             : static_cast<ValueType>(
@@ -10372,9 +10664,10 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
     {
       auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
       component.proposed_sign_ = resource.staged_signs[lane];
-      component.proposed_log_value_ = makeLogValue(
-          resource.staged_signs[lane],
-          resource.staged_log_magnitudes[lane]);
+      component.proposed_log_value_ = makePhysicalLogValue(
+          transaction.state(), resource.staged_signs[lane],
+          resource.staged_log_magnitudes[lane],
+          twistPhaseAngle(transaction.state(), p_list[lane], moves.slice(lane)));
       component.proposed_configuration_identity_ =
           resource.configuration_identities[lane];
       component.proposed_descriptor_fingerprint_ = transaction_fingerprint;
@@ -10521,9 +10814,11 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
           component.proposed_configuration_identity_ !=
               access.resource.configuration_identities[lane] ||
           component.proposed_sign_ != access.resource.staged_signs[lane] ||
-          component.proposed_log_value_ != makeLogValue(
-              access.resource.staged_signs[lane],
-              access.resource.staged_log_magnitudes[lane]))
+          component.proposed_log_value_ != makePhysicalLogValue(
+              *component.model_state_, access.resource.staged_signs[lane],
+              access.resource.staged_log_magnitudes[lane],
+              twistPhaseAngle(*component.model_state_, p_list[lane],
+                              moves.slice(lane))))
         throw std::logic_error(
             "PsiFormer planned selected resolution has incomplete proposal provenance");
       if (!component.accepted_value_valid_ ||
@@ -10748,7 +11043,10 @@ void PsiFormerWF::mw_recompute(
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(resource.walker_indices[selected]);
       component.current_sign_ = staged_sign[selected];
-      component.log_value_ = makeLogValue(staged_sign[selected], staged_logabs[selected]);
+      const std::size_t walker = resource.walker_indices[selected];
+      component.log_value_ = makePhysicalLogValue(
+          transaction.state(), staged_sign[selected], staged_logabs[selected],
+          twistPhaseAngle(transaction.state(), p_list[walker]));
       component.accepted_configuration_identity_ = staged_configuration[selected];
       component.accepted_parameter_version_      = parameter_version;
       component.accepted_state_requirement_ = preserve_spatial[selected]
@@ -10800,11 +11098,12 @@ void PsiFormerWF::mw_recompute(
   const std::size_t parameter_version = transaction.parameterVersion();
   const std::size_t electron_count = access.participant.plan().particleCount();
 
-  const auto has_finite_full_state = [&](const PsiFormerWF& component) noexcept {
+  const auto has_finite_full_state = [&](const PsiFormerWF& component,
+                                         const ParticleSet& particles) noexcept {
     if (component.accepted_state_requirement_ !=
             AcceptedStateRequirement::FULL_SPATIAL ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(transaction.state(), component.current_sign_,
+                                 component.log_value_, particles))
       return false;
     for (std::size_t electron = 0; electron < electron_count; ++electron)
     {
@@ -10831,7 +11130,7 @@ void PsiFormerWF::mw_recompute(
         component.acceptedStateMatches(
             p_list[lane], parameter_version,
             AcceptedStateRequirement::FULL_SPATIAL) &&
-        has_finite_full_state(component);
+        has_finite_full_state(component, p_list[lane]);
     resource.preservation_flags[slot] =
         static_cast<unsigned char>(preserve_full);
   }
@@ -10902,7 +11201,7 @@ void PsiFormerWF::mw_recompute(
           component.acceptedStateMatches(
               p_list[lane], parameter_version,
               AcceptedStateRequirement::FULL_SPATIAL) &&
-          has_finite_full_state(component);
+          has_finite_full_state(component, p_list[lane]);
       if (component.model_state_.get() != model_state_.get() ||
           component.optimization_metadata_.get() != optimization_metadata_.get() ||
           component.bound_particle_set_ != &p_list[lane] ||
@@ -10937,9 +11236,11 @@ void PsiFormerWF::mw_recompute(
       auto& component = static_cast<PsiFormerWF&>(
           wfc_list[resource.walker_indices[slot]]);
       component.current_sign_ = resource.staged_signs[slot];
-      component.log_value_ = makeLogValue(
-          resource.staged_signs[slot],
-          resource.staged_log_magnitudes[slot]);
+      const std::size_t lane = resource.walker_indices[slot];
+      component.log_value_ = makePhysicalLogValue(
+          transaction.state(), resource.staged_signs[slot],
+          resource.staged_log_magnitudes[slot],
+          twistPhaseAngle(transaction.state(), p_list[lane]));
       component.accepted_configuration_identity_ =
           resource.configuration_identities[slot];
       component.accepted_parameter_version_ = parameter_version;
@@ -11001,13 +11302,21 @@ PsiFormerWF::PsiValue PsiFormerWF::ratio(ParticleSet& p, int iat)
 
     // Range-check the public result before proposal publication.  A caller
     // receiving an exception must not be able to commit an unseen proposal.
-    const PsiValue ratio_value = makeRatio(
-        sign, logabs, current_sign_, std::real(log_value_));
+    const LogValue proposed_log = makePhysicalLogValue(
+        transaction.state(), sign, logabs,
+        twistPhaseAngle(transaction.state(), p, iat));
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), p.R[iat], p.activeR(iat));
+    const PsiValue ratio_value = makePhysicalRatio(
+        transaction.state(), sign, logabs, current_sign_,
+        std::real(log_value_), phase_change);
+    if (!isFiniteWavefunctionValue(ratio_value))
+      throw std::runtime_error("PsiFormer single-particle ratio is non-finite");
 
     // Cache proposal state so acceptMove can commit it without reevaluating the
     // network.
     cacheSingleParticleProposal(
-        sign, logabs, configurationIdentity(p, iat), iat,
+        sign, proposed_log, configurationIdentity(p, iat), iat,
         transaction.parameterVersion(), ProposalOrigin::SCALAR_RATIO_VALUE);
     return ratio_value;
   };
@@ -11105,17 +11414,23 @@ void PsiFormerWF::mw_calcRatio(
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-      staged_ratios[walker] = makeRatio(
-          staged_sign[walker], staged_logabs[walker], component.current_sign_,
-          std::real(component.log_value_));
+      const double phase_change = twistDisplacementPhase(
+          transaction.state(), p_list[walker].R[particle_index],
+          p_list[walker].activeR(particle_index));
+      staged_ratios[walker] = makePhysicalRatio(
+          transaction.state(), staged_sign[walker], staged_logabs[walker],
+          component.current_sign_, std::real(component.log_value_), phase_change);
     }
 
     ratios.swap(staged_ratios);
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      const LogValue physical_log = makePhysicalLogValue(
+          transaction.state(), staged_sign[walker], staged_logabs[walker],
+          twistPhaseAngle(transaction.state(), p_list[walker], particle_index));
       component.cacheSingleParticleProposal(
-          staged_sign[walker], staged_logabs[walker],
+          staged_sign[walker], physical_log,
           staged_configuration[walker], particle_index, parameter_version,
           ProposalOrigin::MW_CALC_RATIO_VALUE);
     }
@@ -11287,8 +11602,8 @@ void PsiFormerWF::mw_calcRatio(
       throw std::logic_error(
           "PsiFormer planned CALC_RATIO requires current accepted value state");
     if (!valid_requirement ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(*component.model_state_, component.current_sign_,
+                                 component.log_value_, p_list[lane]))
       throw std::logic_error(
           "PsiFormer planned CALC_RATIO has invalid accepted value state");
   }
@@ -11316,8 +11631,8 @@ void PsiFormerWF::mw_calcRatio(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(*component.model_state_, component.current_sign_,
+                                 component.log_value_, p_list[lane]))
       throw std::logic_error(
           "PsiFormer planned CALC_RATIO has stale accepted parameters");
   }
@@ -11347,9 +11662,12 @@ void PsiFormerWF::mw_calcRatio(
           "PsiFormer planned CALC_RATIO produced an invalid value");
 
     const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
-    const PsiValue ratio = makeRatio(
-        result.sign[lane], result.logabs[lane], component.current_sign_,
-        std::real(component.log_value_));
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), p_list[lane].R[particle_index],
+        p_list[lane].activeR(particle_index));
+    const PsiValue ratio = makePhysicalRatio(
+        transaction.state(), result.sign[lane], result.logabs[lane],
+        component.current_sign_, std::real(component.log_value_), phase_change);
     if (!isFiniteWavefunctionValue(ratio))
       throw std::overflow_error(
           "PsiFormer planned CALC_RATIO ratio conversion is non-finite");
@@ -11407,9 +11725,12 @@ void PsiFormerWF::mw_calcRatio(
     const auto& component = static_cast<const PsiFormerWF&>(wfc_list[lane]);
     const std::uint64_t proposed_configuration =
         configurationIdentity(p_list[lane], particle_index);
-    const PsiValue expected_ratio = makeRatio(
-        result.sign[lane], result.logabs[lane], component.current_sign_,
-        std::real(component.log_value_));
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), p_list[lane].R[particle_index],
+        p_list[lane].activeR(particle_index));
+    const PsiValue expected_ratio = makePhysicalRatio(
+        transaction.state(), result.sign[lane], result.logabs[lane],
+        component.current_sign_, std::real(component.log_value_), phase_change);
     const PsiValue staged_ratio = final_ratio_arena.load(lane);
     if (component.model_state_.get() != model_state_.get() ||
         component.optimization_metadata_.get() != optimization_metadata_.get() ||
@@ -11427,8 +11748,8 @@ void PsiFormerWF::mw_calcRatio(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_) ||
+        !isCoherentPhysicalValue(transaction.state(), component.current_sign_,
+                                 component.log_value_, p_list[lane]) ||
         resource.configuration_identities[lane] != proposed_configuration ||
         result.parameter_version[lane] != parameter_version ||
         (result.sign[lane] != 1.0 && result.sign[lane] != -1.0) ||
@@ -11462,9 +11783,10 @@ void PsiFormerWF::mw_calcRatio(
     {
       auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
       component.proposed_sign_ = resource.staged_signs[lane];
-      component.proposed_log_value_ = makeLogValue(
-          resource.staged_signs[lane],
-          resource.staged_log_magnitudes[lane]);
+      component.proposed_log_value_ = makePhysicalLogValue(
+          transaction.state(), resource.staged_signs[lane],
+          resource.staged_log_magnitudes[lane],
+          twistPhaseAngle(transaction.state(), p_list[lane], particle_index));
       component.proposed_configuration_identity_ =
           resource.configuration_identities[lane];
       component.proposed_descriptor_fingerprint_ = transaction_fingerprint;
@@ -11485,10 +11807,11 @@ PsiFormerWF::GradType PsiFormerWF::evalGrad(ParticleSet& p, int iat)
   requireUnplannedScalarEvaluation("active-electron gradient");
   PsiFormerReadTransaction transaction(*model_state_);
   synchronizeParameterVersion(transaction.parameterVersion());
-  auto scatter = [](const auto& source) {
+  auto scatter = [&](const auto& source) {
     GradType gradient;
     for (int dimension = 0; dimension < 3; ++dimension)
-      gradient[dimension] = source[dimension];
+      gradient[dimension] = makePhysicalGradient(
+          transaction.state(), source[dimension], dimension);
     return gradient;
   };
 
@@ -11580,7 +11903,10 @@ void PsiFormerWF::mw_evalGrad(
           throw std::logic_error("PsiFormer active-gradient batch observed inconsistent parameters");
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           staged_gradients[walker][dimension] =
-              result.gradient[walker * result.gradient_stride + dimension];
+              makePhysicalGradient(
+                  transaction.state(),
+                  result.gradient[walker * result.gradient_stride + dimension],
+                  dimension);
       }
     }
     else
@@ -11593,7 +11919,8 @@ void PsiFormerWF::mw_evalGrad(
         if (result.active_gradient.size() != 3)
           throw std::logic_error("PsiFormer multiwalker active gradient has the wrong shape");
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
-          staged_gradients[walker][dimension] = result.active_gradient[dimension];
+          staged_gradients[walker][dimension] = makePhysicalGradient(
+              transaction.state(), result.active_gradient[dimension], dimension);
       }
 
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
@@ -11703,8 +12030,8 @@ void PsiFormerWF::mw_evalGrad(
       throw std::logic_error(
           "PsiFormer planned ACTIVE_GRADIENT requires current accepted value state");
     if (!valid_requirement ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(*component.model_state_, component.current_sign_,
+                                 component.log_value_, p_list[lane]))
       throw std::logic_error(
           "PsiFormer planned ACTIVE_GRADIENT has invalid accepted value state");
   }
@@ -11725,8 +12052,8 @@ void PsiFormerWF::mw_evalGrad(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(transaction.state(), component.current_sign_,
+                                 component.log_value_, p_list[lane]))
       throw std::logic_error(
           "PsiFormer planned ACTIVE_GRADIENT has stale accepted parameters");
   }
@@ -11765,7 +12092,7 @@ void PsiFormerWF::mw_evalGrad(
         throw std::runtime_error(
             "PsiFormer planned ACTIVE_GRADIENT produced a non-finite gradient");
       resource.staged_gradients[lane][dimension] =
-          static_cast<ValueType>(native);
+          makePhysicalGradient(transaction.state(), native, dimension);
       if (!isFiniteWavefunctionValue(
               resource.staged_gradients[lane][dimension]))
         throw std::overflow_error(
@@ -11817,8 +12144,8 @@ void PsiFormerWF::mw_evalGrad(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_) ||
+        !isCoherentPhysicalValue(transaction.state(), component.current_sign_,
+                                 component.log_value_, p_list[lane]) ||
         resource.active_electrons[lane] !=
             static_cast<std::size_t>(particle_index) ||
         result.parameter_version[lane] != parameter_version ||
@@ -11830,7 +12157,8 @@ void PsiFormerWF::mw_evalGrad(
     {
       const double native =
           result.gradient[lane * result.gradient_stride + dimension];
-      const ValueType staged = static_cast<ValueType>(native);
+      const ValueType staged =
+          makePhysicalGradient(transaction.state(), native, dimension);
       if (!psiformer::determinant::isFiniteReal(native) ||
           !isFiniteWavefunctionValue(staged) ||
           resource.staged_gradients[lane][dimension] != staged)
@@ -11880,13 +12208,24 @@ PsiFormerWF::PsiValue PsiFormerWF::ratioGrad(ParticleSet& p, int iat, GradType& 
 
     // Evaluate the proposal once and return both its ratio and active-electron
     // gradient.
+    const LogValue physical_log = makePhysicalLogValue(
+        transaction.state(), sign, logabs,
+        twistPhaseAngle(transaction.state(), p, iat));
     cacheSingleParticleProposal(
-        sign, logabs, configurationIdentity(p, iat), iat,
+        sign, physical_log, configurationIdentity(p, iat), iat,
         transaction.parameterVersion(),
         ProposalOrigin::SCALAR_RATIO_GRADIENT_ACTIVE);
     for (int dimension = 0; dimension < 3; ++dimension)
-      gradient[dimension] += active_gradient[dimension];
-    return (proposed_sign_ / current_sign_) * std::exp(std::real(proposed_log_value_ - log_value_));
+      gradient[dimension] += makePhysicalGradient(
+          transaction.state(), active_gradient[dimension], dimension);
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), p.R[iat], p.activeR(iat));
+    const PsiValue ratio_value = makePhysicalRatio(
+        transaction.state(), sign, logabs, current_sign_,
+        std::real(log_value_), phase_change);
+    if (!isFiniteWavefunctionValue(ratio_value))
+      throw std::runtime_error("PsiFormer single-particle ratio-gradient ratio is non-finite");
+    return ratio_value;
   };
 
   if (transaction.state().direct_spatial_mode == DirectBackendMode::DIRECT)
@@ -11984,7 +12323,10 @@ void PsiFormerWF::mw_ratioGrad(
         staged_logabs[walker] = result.logabs[walker];
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           staged_gradients[walker][dimension] =
-              result.gradient[walker * result.gradient_stride + dimension];
+              makePhysicalGradient(
+                  transaction.state(),
+                  result.gradient[walker * result.gradient_stride + dimension],
+                  dimension);
       }
     }
     else
@@ -11999,23 +12341,30 @@ void PsiFormerWF::mw_ratioGrad(
         staged_sign[walker]   = result.sign;
         staged_logabs[walker] = result.logabs;
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
-          staged_gradients[walker][dimension] = result.active_gradient[dimension];
+          staged_gradients[walker][dimension] = makePhysicalGradient(
+              transaction.state(), result.active_gradient[dimension], dimension);
       }
 
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-      staged_ratios[walker] = makeRatio(
-          staged_sign[walker], staged_logabs[walker], component.current_sign_,
-          std::real(component.log_value_));
+      const double phase_change = twistDisplacementPhase(
+          transaction.state(), p_list[walker].R[particle_index],
+          p_list[walker].activeR(particle_index));
+      staged_ratios[walker] = makePhysicalRatio(
+          transaction.state(), staged_sign[walker], staged_logabs[walker],
+          component.current_sign_, std::real(component.log_value_), phase_change);
     }
 
     ratios.swap(staged_ratios);
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+      const LogValue physical_log = makePhysicalLogValue(
+          transaction.state(), staged_sign[walker], staged_logabs[walker],
+          twistPhaseAngle(transaction.state(), p_list[walker], particle_index));
       component.cacheSingleParticleProposal(
-          staged_sign[walker], staged_logabs[walker],
+          staged_sign[walker], physical_log,
           staged_configuration[walker], particle_index, parameter_version,
           ProposalOrigin::MW_RATIO_GRADIENT_ACTIVE);
       gradients[walker] += staged_gradients[walker];
@@ -12198,8 +12547,8 @@ void PsiFormerWF::mw_ratioGrad(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(*component.model_state_, component.current_sign_,
+                                 component.log_value_, p_list[lane]))
       throw std::logic_error(
           "PsiFormer planned RATIO_GRADIENT requires current coherent accepted state");
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
@@ -12224,8 +12573,8 @@ void PsiFormerWF::mw_ratioGrad(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_))
+        !isCoherentPhysicalValue(transaction.state(), component.current_sign_,
+                                 component.log_value_, p_list[lane]))
       throw std::logic_error(
           "PsiFormer planned RATIO_GRADIENT has stale accepted parameters");
     resource.configuration_identities[lane] =
@@ -12262,9 +12611,12 @@ void PsiFormerWF::mw_ratioGrad(
 
     resource.staged_signs[lane]          = result.sign[lane];
     resource.staged_log_magnitudes[lane] = result.logabs[lane];
-    const PsiValue ratio = makeRatio(
-        result.sign[lane], result.logabs[lane], component.current_sign_,
-        std::real(component.log_value_));
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), p_list[lane].R[particle_index],
+        p_list[lane].activeR(particle_index));
+    const PsiValue ratio = makePhysicalRatio(
+        transaction.state(), result.sign[lane], result.logabs[lane],
+        component.current_sign_, std::real(component.log_value_), phase_change);
     if (!isFiniteWavefunctionValue(ratio))
       throw std::runtime_error(
           "PsiFormer planned RATIO_GRADIENT produced a non-finite ratio");
@@ -12281,7 +12633,8 @@ void PsiFormerWF::mw_ratioGrad(
       if (!psiformer::determinant::isFiniteReal(native))
         throw std::runtime_error(
             "PsiFormer planned RATIO_GRADIENT produced a non-finite gradient");
-      const ValueType contribution = static_cast<ValueType>(native);
+      const ValueType contribution =
+          makePhysicalGradient(transaction.state(), native, dimension);
       if (!isFiniteWavefunctionValue(contribution))
         throw std::overflow_error(
             "PsiFormer planned RATIO_GRADIENT gradient conversion is non-finite");
@@ -12353,8 +12706,8 @@ void PsiFormerWF::mw_ratioGrad(
              AcceptedStateRequirement::VALUE_ONLY &&
          component.accepted_state_requirement_ !=
              AcceptedStateRequirement::FULL_SPATIAL) ||
-        !isCoherentAcceptedValue(component.current_sign_,
-                                 component.log_value_) ||
+        !isCoherentPhysicalValue(transaction.state(), component.current_sign_,
+                                 component.log_value_, p_list[lane]) ||
         resource.active_electrons[lane] !=
             static_cast<std::size_t>(particle_index) ||
         resource.configuration_identities[lane] !=
@@ -12367,9 +12720,12 @@ void PsiFormerWF::mw_ratioGrad(
       throw std::logic_error(
           "PsiFormer planned RATIO_GRADIENT lane evidence changed during evaluation");
 
-    const PsiValue expected_ratio = makeRatio(
-        result.sign[lane], result.logabs[lane], component.current_sign_,
-        std::real(component.log_value_));
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), p_list[lane].R[particle_index],
+        p_list[lane].activeR(particle_index));
+    const PsiValue expected_ratio = makePhysicalRatio(
+        transaction.state(), result.sign[lane], result.logabs[lane],
+        component.current_sign_, std::real(component.log_value_), phase_change);
     if (!isFiniteWavefunctionValue(expected_ratio) ||
         final_ratio_arena.load(lane) != expected_ratio)
       throw std::logic_error(
@@ -12378,7 +12734,8 @@ void PsiFormerWF::mw_ratioGrad(
     {
       const double native =
           result.gradient[lane * result.gradient_stride + dimension];
-      const ValueType contribution = static_cast<ValueType>(native);
+      const ValueType contribution =
+          makePhysicalGradient(transaction.state(), native, dimension);
       if (!psiformer::determinant::isFiniteReal(native) ||
           !isFiniteWavefunctionValue(contribution) ||
           !isFiniteWavefunctionValue(gradients[lane][dimension]))
@@ -12415,9 +12772,10 @@ void PsiFormerWF::mw_ratioGrad(
     {
       auto& component = static_cast<PsiFormerWF&>(wfc_list[lane]);
       component.proposed_sign_ = resource.staged_signs[lane];
-      component.proposed_log_value_ = makeLogValue(
-          resource.staged_signs[lane],
-          resource.staged_log_magnitudes[lane]);
+      component.proposed_log_value_ = makePhysicalLogValue(
+          transaction.state(), resource.staged_signs[lane],
+          resource.staged_log_magnitudes[lane],
+          twistPhaseAngle(transaction.state(), p_list[lane], particle_index));
       component.proposed_configuration_identity_ =
           resource.configuration_identities[lane];
       component.proposed_descriptor_fingerprint_ = transaction_fingerprint;
@@ -12633,10 +12991,13 @@ void PsiFormerWF::mw_accept_rejectMove(
             throw std::logic_error(
                 "PsiFormer planned single-particle resolution has incomplete proposal provenance");
 
-          if (!isCoherentAcceptedValue(component.current_sign_,
-                                       component.log_value_) ||
-              !isCoherentAcceptedValue(component.proposed_sign_,
-                                       component.proposed_log_value_))
+          if (!isCoherentPhysicalValue(*component.model_state_,
+                                       component.current_sign_,
+                                       component.log_value_, p_list[lane]) ||
+              !isCoherentPhysicalValue(
+                  *component.model_state_, component.proposed_sign_,
+                  component.proposed_log_value_, p_list[lane], particle_index,
+                  nullptr))
             throw std::logic_error(
                 "PsiFormer planned single-particle resolution has incoherent value state");
 
@@ -12647,16 +13008,24 @@ void PsiFormerWF::mw_accept_rejectMove(
               access.resource.staged_log_magnitudes[lane] !=
                   std::real(component.proposed_log_value_) ||
               component.proposed_log_value_ !=
-                  makeLogValue(access.resource.staged_signs[lane],
-                               access.resource.staged_log_magnitudes[lane]))
+                  makePhysicalLogValue(
+                      *component.model_state_,
+                      access.resource.staged_signs[lane],
+                      access.resource.staged_log_magnitudes[lane],
+                      twistPhaseAngle(*component.model_state_, p_list[lane],
+                                      particle_index)))
             throw std::logic_error(
                 "PsiFormer planned single-particle resolution has changed value staging");
 
           const PsiValue staged_ratio = ratio_arena.load(lane);
-          const PsiValue expected_ratio =
-              makeRatio(component.proposed_sign_,
-                        std::real(component.proposed_log_value_),
-                        component.current_sign_, std::real(component.log_value_));
+          const double phase_change = twistDisplacementPhase(
+              *component.model_state_, p_list[lane].R[particle_index],
+              p_list[lane].activeR(particle_index));
+          const PsiValue expected_ratio = makePhysicalRatio(
+              *component.model_state_, component.proposed_sign_,
+              std::real(component.proposed_log_value_),
+              component.current_sign_, std::real(component.log_value_),
+              phase_change);
           if (!isFiniteWavefunctionValue(staged_ratio) ||
               staged_ratio != expected_ratio)
             throw std::logic_error(
@@ -13171,9 +13540,18 @@ void PsiFormerWF::evaluatePlannedScalarValue(
 
   for (std::size_t output = 0; output < access.output_size; ++output)
   {
-    const ValueType ratio = makeRatio(
+    const int electron = operation == PlannedScalarValueOperation::ALL_TO_ONE
+        ? static_cast<int>(output)
+        : virtual_particles->refPtcl;
+    const auto& proposed = operation == PlannedScalarValueOperation::ALL_TO_ONE
+        ? reference.getActivePos()
+        : virtual_particles->R[output];
+    const double phase_change = twistDisplacementPhase(
+        transaction.state(), reference.R[electron], proposed);
+    const ValueType ratio = makePhysicalRatio(
+        transaction.state(),
         result.sign[output + 1], result.logabs[output + 1],
-        result.sign[0], result.logabs[0]);
+        result.sign[0], result.logabs[0], phase_change);
     if (!isFiniteWavefunctionValue(ratio))
       throw std::runtime_error(
           "PsiFormer planned scalar VALUE produced a non-finite ratio");
@@ -13336,9 +13714,18 @@ void PsiFormerWF::evaluatePlannedScalarValue(
             "PsiFormer planned scalar VALUE result changed before publication");
     for (std::size_t output = 0; output < access.output_size; ++output)
     {
-      const ValueType expected = makeRatio(
+      const int electron = operation == PlannedScalarValueOperation::ALL_TO_ONE
+          ? static_cast<int>(output)
+          : virtual_particles->refPtcl;
+      const auto& proposed = operation == PlannedScalarValueOperation::ALL_TO_ONE
+          ? reference.getActivePos()
+          : virtual_particles->R[output];
+      const double phase_change = twistDisplacementPhase(
+          transaction.state(), reference.R[electron], proposed);
+      const ValueType expected = makePhysicalRatio(
+          transaction.state(),
           result.sign[output + 1], result.logabs[output + 1],
-          result.sign[0], result.logabs[0]);
+          result.sign[0], result.logabs[0], phase_change);
       if (!isFiniteWavefunctionValue(access.publication[output]) ||
           access.publication[output] != expected)
         throw std::runtime_error(
@@ -13411,8 +13798,11 @@ void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles,
       const pf::Result moved = evaluatePositionsUnderRead(
           transaction, particles, electron, &particles.getActivePos(),
           EvaluationPurpose::VALUE_ONLY);
-      staged_ratios[electron] = makeRatio(
-          moved.sign, moved.logabs, reference.sign, reference.logabs);
+      staged_ratios[electron] = makePhysicalRatio(
+          transaction.state(), moved.sign, moved.logabs, reference.sign,
+          reference.logabs, twistDisplacementPhase(
+              transaction.state(), particles.R[electron],
+              particles.getActivePos()));
     }
     ratios.swap(staged_ratios);
     return;
@@ -13439,9 +13829,12 @@ void PsiFormerWF::evaluateRatiosAlltoOne(ParticleSet& particles,
     if (result.parameter_version[configuration] != parameter_version)
       throw std::logic_error(
           "PsiFormer all-to-one batch observed inconsistent parameters");
-    staged_ratios[electron] = makeRatio(
+    staged_ratios[electron] = makePhysicalRatio(
+        transaction.state(),
         result.sign[configuration], result.logabs[configuration],
-        result.sign[0], result.logabs[0]);
+        result.sign[0], result.logabs[0], twistDisplacementPhase(
+            transaction.state(), particles.R[electron],
+            particles.getActivePos()));
   }
   ratios.swap(staged_ratios);
 }
@@ -13501,9 +13894,12 @@ void PsiFormerWF::evaluateRatiosUnderRead(
       const pf::Result virtual_result = evaluatePositionsUnderRead(
           transaction, reference, electron, &virtual_particles.R[move],
           EvaluationPurpose::VALUE_ONLY);
-      staged_ratios[move] = makeRatio(
+      staged_ratios[move] = makePhysicalRatio(
+          transaction.state(),
           virtual_result.sign, virtual_result.logabs, reference_result.sign,
-          reference_result.logabs);
+          reference_result.logabs, twistDisplacementPhase(
+              transaction.state(), reference.R[electron],
+              virtual_particles.R[move]));
     }
     ratios.swap(staged_ratios);
     return;
@@ -13524,9 +13920,12 @@ void PsiFormerWF::evaluateRatiosUnderRead(
   {
     if (result.parameter_version[move + 1] != parameter_version)
       throw std::logic_error("PsiFormer virtual-ratio batch observed inconsistent parameters");
-    staged_ratios[move] = makeRatio(
+    staged_ratios[move] = makePhysicalRatio(
+        transaction.state(),
         result.sign[move + 1], result.logabs[move + 1], result.sign[0],
-        result.logabs[0]);
+        result.logabs[0], twistDisplacementPhase(
+            transaction.state(), reference.R[electron],
+            virtual_particles.R[move]));
   }
   ratios.swap(staged_ratios);
 }
@@ -13685,9 +14084,15 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
       {
         const std::size_t flat_index = slice.flatOffset() + local_index;
         const std::size_t replacement = reference_count + flat_index;
-        resource.flat_virtual_ratios[flat_index] = makeRatio(
+        const ParticleSet& particles =
+            p_list[static_cast<std::size_t>(slice.walkerId())];
+        resource.flat_virtual_ratios[flat_index] = makePhysicalRatio(
+            transaction.state(),
             sparse_result.sign[replacement], sparse_result.logabs[replacement],
-            sparse_result.sign[reference], sparse_result.logabs[reference]);
+            sparse_result.sign[reference], sparse_result.logabs[reference],
+            twistDisplacementPhase(
+                transaction.state(), particles.R[slice.electronId()],
+                slice.absolutePosition(local_index)));
       }
     }
   }
@@ -13755,10 +14160,14 @@ WaveFunctionComponent::EvaluationStamp PsiFormerWF::mw_evaluateVirtualRatios(
               sparse_result.sign[replacement], sparse_result.logabs[replacement],
               virtual_result.sign, virtual_result.logabs, "replacement");
         }
-        resource.flat_virtual_ratios[flat_index] = makeRatio(
+        resource.flat_virtual_ratios[flat_index] = makePhysicalRatio(
+            transaction.state(),
             virtual_result.sign, virtual_result.logabs,
             resource.virtual_reference_signs[reference],
-            resource.virtual_reference_logabs[reference]);
+            resource.virtual_reference_logabs[reference],
+            twistDisplacementPhase(
+                transaction.state(), p_list[walker].R[slice.electronId()],
+                slice.absolutePosition(local_index)));
       }
     }
   }
@@ -13837,13 +14246,19 @@ void PsiFormerWF::mw_evaluateRatios(
 
     for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
     {
+      const auto& virtual_particles = virtual_particle_list[walker];
       const std::size_t reference = resource.virtual_offsets[walker];
       for (std::size_t move = 0; move < ratios[walker].size(); ++move)
       {
         const std::size_t configuration = reference + move + 1;
-        staged_ratios[walker][move] = makeRatio(
+        staged_ratios[walker][move] = makePhysicalRatio(
+            transaction.state(),
             result.sign[configuration], result.logabs[configuration],
-            result.sign[reference], result.logabs[reference]);
+            result.sign[reference], result.logabs[reference],
+            twistDisplacementPhase(
+                transaction.state(),
+                virtual_particles.getRefPS().R[virtual_particles.refPtcl],
+                virtual_particles.R[move]));
       }
     }
   }
@@ -13860,9 +14275,12 @@ void PsiFormerWF::mw_evaluateRatios(
         const pf::Result virtual_result = component.evaluatePositionsUnderRead(
             transaction, reference, virtual_particles.refPtcl,
             &virtual_particles.R[move], EvaluationPurpose::VALUE_ONLY);
-        staged_ratios[walker][move] = makeRatio(
+        staged_ratios[walker][move] = makePhysicalRatio(
+            transaction.state(),
             virtual_result.sign, virtual_result.logabs, reference_result.sign,
-            reference_result.logabs);
+            reference_result.logabs, twistDisplacementPhase(
+                transaction.state(), reference.R[virtual_particles.refPtcl],
+                virtual_particles.R[move]));
       }
     }
 
@@ -13975,8 +14393,11 @@ void PsiFormerWF::evaluateDerivRatios(const VirtualParticleSet& virtual_particle
           requested_virtual);
     }
 
-    const ValueType staged_ratio = makeRatio(
-        virtual_sign, virtual_logabs, reference_sign, reference_logabs);
+    const ValueType staged_ratio = makePhysicalRatio(
+        transaction.modelTransaction().state(), virtual_sign, virtual_logabs,
+        reference_sign, reference_logabs, twistDisplacementPhase(
+            transaction.modelTransaction().state(), reference.R[electron],
+            virtual_particles.R[move]));
     if (requested_virtual.size() != requested_reference.size())
       throw std::logic_error("PsiFormer virtual score mapping changed");
     for (std::size_t selected = 0; selected < requested_virtual.size(); ++selected)
@@ -14672,10 +15093,7 @@ void PsiFormerWF::evaluateDerivatives(ParticleSet& p,
                                                   *optimization_metadata_);
   synchronizeParameterVersion(transaction.modelTransaction().parameterVersion());
   if (optimization_metadata_->enabled && transaction.hasActiveParameters())
-  {
     requireUnitElectronMasses(p);
-    requireRealTotalWavefunctionDrift(p);
-  }
   SelectedDerivativeDelta score_delta;
   SelectedDerivativeDelta kinetic_delta;
   evaluateDerivativesImpl(
@@ -14709,6 +15127,14 @@ void PsiFormerWF::evaluateDerivativesImpl(
 
   const DirectBackendMode kinetic_mode =
       transaction.modelTransaction().state().direct_kinetic_mode;
+  bool has_imaginary_drift = false;
+  for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      has_imaginary_drift = has_imaginary_drift ||
+          std::imag(p.G[electron][dimension]) != 0.0;
+  if (has_imaginary_drift && kinetic_mode != DirectBackendMode::DIRECT)
+    throw std::invalid_argument(
+        "Complex PsiFormer kinetic parameter response requires the direct backend");
   std::optional<pf::Result> oracle;
   if (kinetic_mode != DirectBackendMode::DIRECT)
   {
@@ -14780,6 +15206,55 @@ void PsiFormerWF::evaluateDerivativesImpl(
       transaction, direct.kinetic_parameter_response.data(),
       direct.kinetic_parameter_response.size(), ValueType(1),
       kinetic_destination_size, kinetic_output);
+
+  if (has_imaginary_drift)
+  {
+    // The score has already been gathered.  Reuse its O(P) workspace vector for
+    // the gradient-only imaginary reverse while preserving the real kinetic row.
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        total_log_gradient[3 * electron + dimension] =
+            std::imag(p.G[electron][dimension]);
+    const pf::DirectKineticConstView imaginary_response =
+        transaction.modelTransaction().state().direct_kinetic_executor
+            .evaluateGradientParameterResponse(
+                kinetic_workspace, total_log_gradient.data(),
+                total_log_gradient.size());
+    // Accumulate directly into the already-materialized selected response.  A
+    // temporary selected-parameter row would add an avoidable O(P) allocation
+    // to every complex kinetic-derivative call.
+    const auto& selected_flat_indices = transaction.selectedFlatIndices();
+    const OptVariables& variables     = transaction.variables();
+    std::size_t active_parameter      = 0;
+    for (std::size_t local_index = 0;
+         local_index < selected_flat_indices.size(); ++local_index)
+    {
+      const int global_index = variables.where(local_index);
+      if (global_index < 0)
+        continue;
+      if (static_cast<std::size_t>(global_index) >= kinetic_destination_size)
+        throw std::out_of_range(
+            "PsiFormer complex kinetic destination index is out of range");
+      const std::size_t flat_index = selected_flat_indices[local_index];
+      if (flat_index >= imaginary_response.size() ||
+          !psiformer::determinant::isFiniteReal(
+              imaginary_response[flat_index]))
+        throw std::runtime_error(
+            "PsiFormer imaginary kinetic parameter derivative is invalid");
+      if (active_parameter >= kinetic_output.size() ||
+          kinetic_output[active_parameter].first !=
+              static_cast<std::size_t>(global_index))
+        throw std::logic_error(
+            "PsiFormer complex kinetic response index changed between reverses");
+      kinetic_output[active_parameter].second +=
+          makePsiFormerScalar<ValueType>(
+              0.0, imaginary_response[flat_index]);
+      ++active_parameter;
+    }
+    if (active_parameter != kinetic_output.size())
+      throw std::logic_error(
+          "PsiFormer complex kinetic response mapping changed between reverses");
+  }
 }
 
 // Fill score and kinetic rows serially through one resource-owned direct kinetic tape.
@@ -14820,7 +15295,6 @@ void PsiFormerWF::mw_evaluateParameterDerivatives(
       throw std::invalid_argument(
           "PsiFormer kinetic derivative walker has the wrong electron count");
     requireUnitElectronMasses(p_list[walker]);
-    requireRealTotalWavefunctionDrift(p_list[walker]);
   }
 
   const int parameter_count = dlogpsi.getNumOfParams();

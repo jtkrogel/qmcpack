@@ -12,13 +12,17 @@
 #include "Message/CommOperators.h"
 #include "OhmmsData/AttributeSet.h"
 #include "OhmmsData/XMLParsingString.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <charconv>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -69,6 +73,39 @@ std::uint64_t parseInitializationSeed(const std::string& value)
     throw std::invalid_argument("PsiFormer initialization_seed must be an unsigned integer");
   return seed;
 }
+
+/// Parse exactly three finite reduced-twist components from one XML attribute.
+std::array<double, 3> parseReducedTwist(const std::string& value)
+{
+  std::array<double, 3> twist{};
+  const char* cursor = value.c_str();
+  const char* const end_of_value = cursor + value.size();
+  for (double& component : twist)
+  {
+    while (cursor != end_of_value &&
+           std::isspace(static_cast<unsigned char>(*cursor)))
+      ++cursor;
+    if (cursor == end_of_value)
+      throw std::invalid_argument(
+          "PsiFormer twist must contain exactly three components");
+
+    errno = 0;
+    char* parsed_end = nullptr;
+    component = std::strtod(cursor, &parsed_end);
+    if (parsed_end == cursor)
+      throw std::invalid_argument("PsiFormer twist contains a malformed component");
+    if (errno == ERANGE || !psiformer::determinant::isFiniteReal(component))
+      throw std::invalid_argument("PsiFormer twist components must be finite");
+    cursor = parsed_end;
+  }
+  while (cursor != end_of_value &&
+         std::isspace(static_cast<unsigned char>(*cursor)))
+    ++cursor;
+  if (cursor != end_of_value)
+    throw std::invalid_argument(
+        "PsiFormer twist must contain exactly three components");
+  return twist;
+}
 } // namespace
 
 // Select HDF5 import or deterministic internal construction and validate optimizer controls.
@@ -77,6 +114,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
   std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
   std::string optimize = "no", optimize_scope = "indices", optimize_indices;
+  ParticleSet::PosType reduced_twist(0.0);
 
   // Both files use the compact export format consumed by PsiFormerNative.h.
   // Optimization remains off unless explicitly requested, preserving existing
@@ -106,6 +144,14 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const bool has_configuration_path  = !configuration.empty();
   const bool has_initialization_seed = xmlHasProp(cur, BAD_CAST "initialization_seed") != nullptr;
   const bool has_explicit_source     = xmlHasProp(cur, BAD_CAST "source") != nullptr;
+  const bool has_explicit_twist      = xmlHasProp(cur, BAD_CAST "twist") != nullptr;
+  if (has_explicit_twist)
+  {
+    const std::array<double, 3> parsed_twist =
+        parseReducedTwist(getXMLAttributeValue(cur, "twist"));
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      reduced_twist[dimension] = parsed_twist[dimension];
+  }
   if (internal_initialization && (has_parameter_path || has_configuration_path))
     throw std::invalid_argument(
         "PsiFormer internal initialization cannot be combined with parameters or configuration paths");
@@ -123,8 +169,44 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (targetPtcl.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electron particle sets");
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
+  const auto& particle_twist = targetPtcl.getTwist();
+  bool particle_twist_is_zero = true;
+  for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+  {
+    if (!psiformer::determinant::isFiniteReal(particle_twist[dimension]))
+      throw std::invalid_argument("PsiFormer target ParticleSet twist must be finite");
+    particle_twist_is_zero =
+        particle_twist_is_zero && particle_twist[dimension] == 0.0;
+  }
+  const bool adopt_explicit_twist = has_explicit_twist && particle_twist_is_zero;
+  bool nonzero_twist = false;
+  for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+  {
+    if (!psiformer::determinant::isFiniteReal(reduced_twist[dimension]))
+      throw std::invalid_argument("PsiFormer twist components must be finite");
+    nonzero_twist = nonzero_twist || reduced_twist[dimension] != 0.0;
+  }
+  if (nonzero_twist && !periodic)
+    throw std::invalid_argument("A nonzero PsiFormer twist requires a 3D bulk periodic cell");
+  if (has_explicit_twist)
+  {
+    constexpr double twist_tolerance = 128.0 * std::numeric_limits<double>::epsilon();
+    if (!particle_twist_is_zero)
+      for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+        if (std::abs(particle_twist[dimension] - reduced_twist[dimension]) >
+            twist_tolerance * (1.0 + std::abs(reduced_twist[dimension])))
+          throw std::invalid_argument(
+              "Explicit PsiFormer twist disagrees with the target ParticleSet twist");
+  }
+  else if (!particle_twist_is_zero)
+    throw std::invalid_argument(
+        "A nonzero target ParticleSet twist requires an explicit matching PsiFormer twist");
+#ifndef QMC_COMPLEX
+  if (nonzero_twist)
+    throw std::invalid_argument("A nonzero PsiFormer twist requires a complex QMCPACK build");
+#endif
   if (periodic && targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK)
-    throw std::invalid_argument("Real Gamma PsiFormer currently supports only 3D bulk periodic cells");
+    throw std::invalid_argument("Periodic PsiFormer currently supports only 3D bulk periodic cells");
   if (periodic && feature_policy != "periodic_torus_v1")
     throw std::invalid_argument(
         "Periodic PsiFormer requires explicit feature_policy=periodic_torus_v1 metadata");
@@ -176,6 +258,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
 
   std::unique_ptr<PsiFormerWF> component;
+  const std::array<double, 3> twist_array{
+      reduced_twist[0], reduced_twist[1], reduced_twist[2]};
   if (internal_initialization)
   {
     if (targetPtcl.groups() != 2 || targetPtcl.groupsize(0) <= 0 || targetPtcl.groupsize(1) <= 0)
@@ -219,13 +303,13 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     }
     component = std::make_unique<PsiFormerWF>(
         name, std::move(initialized), targetPtcl, *source_particles, optimization_enabled,
-        std::move(selected_indices), optimize_all, export_parameters);
+        std::move(selected_indices), optimize_all, export_parameters, twist_array);
   }
   else if (periodic)
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, targetPtcl,
                                               *source_particles, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
-                                              export_parameters);
+                                              export_parameters, twist_array);
   else
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
@@ -233,6 +317,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 
   if (system != "auto")
     component->validateSystem(targetPtcl, *source_particles, system);
+  // Publish framework twist ownership only after construction and system
+  // validation succeed, so a failed builder call cannot mutate its target.
+  if (adopt_explicit_twist)
+    targetPtcl.setTwist(reduced_twist);
   return component;
 }
 

@@ -304,6 +304,16 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
           0.007 * (1 + electron) * (dimension % 2 == 0 ? 1.0 : -1.0);
       electrons0.G[electron][dimension] += fixed_drift;
       electrons1.G[electron][dimension] -= 0.6 * fixed_drift;
+#ifdef QMC_COMPLEX
+      // A fixed complex companion factor exercises the separate imaginary
+      // kinetic reverse and distinguishes transpose from Hermitian products.
+      const double imaginary_drift =
+          0.005 * (1 + dimension) * (electron % 2 == 0 ? 1.0 : -1.0);
+      electrons0.G[electron][dimension] +=
+          QMCTraits::ValueType(0.0, imaginary_drift);
+      electrons1.G[electron][dimension] -=
+          QMCTraits::ValueType(0.0, 0.4 * imaginary_drift);
+#endif
     }
 
   RefVectorWithLeader<WaveFunctionComponent> components(component);
@@ -527,14 +537,27 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
       wftrain::DerivativeAdjoint::TRANSPOSE, unsupported_sink));
   CHECK(unsupported_sink.state() == DerivativeSinkState::IDLE);
 
-  // The imported Jacobian is real, so transpose and Hermitian products coincide.
+  // Hermitian mode conjugates each derivative response before applying the
+  // caller coefficient.  This differs from transpose for the complex kinetic
+  // response while the parameter score itself remains real.
   SelectedParameterSink hermitian_sink(selected);
   op->applyVJPs({channels.data(), channels.size()},
                 wftrain::DerivativeAdjoint::HERMITIAN, hermitian_sink);
   for (std::size_t channel = 0; channel < channels.size(); ++channel)
     for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
-      checkClose(hermitian_sink.results()[channel][parameter],
-                 transpose_sink.results()[channel][parameter]);
+    {
+      DerivativeValue expected{};
+      for (std::size_t sample = 0; sample < 2; ++sample)
+      {
+        const DerivativeValue oracle = channels[channel].product ==
+                DerivativeProduct::LOCAL_ENERGY_VJP
+            ? expected_kinetic[sample][parameter]
+            : expected_scores[sample][parameter];
+        expected += channels[channel].coefficients.values[sample] *
+            std::conj(oracle);
+      }
+      checkClose(hermitian_sink.results()[channel][parameter], expected);
+    }
 
   std::vector<DerivativeValue> direction(storage.parameter_count);
   const std::vector<DerivativeValue> selected_direction{

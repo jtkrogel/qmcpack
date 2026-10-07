@@ -296,7 +296,7 @@ public:
               bool optimize_all = false,
               std::string optimized_parameter_export = {});
 
-  /// Load a periodic import using explicit runtime ions and simulation cell metadata.
+  /// Load a periodic import and optionally apply a fixed reduced-twist outer phase.
   PsiFormerWF(std::string name,
               std::string parameters,
               std::string configuration,
@@ -305,10 +305,11 @@ public:
               bool optimize = false,
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
-              std::string optimized_parameter_export = {});
+              std::string optimized_parameter_export = {},
+              std::array<double, 3> reduced_twist = {});
 
   /** Construct a self-contained model from initialized parameters and QMCPACK
-   * electron/ion particle sets, without reading a model or configuration file. */
+   * particle sets, optionally with a fixed reduced-twist outer phase. */
   PsiFormerWF(std::string name,
               psiformer::InitializedPsiFormerParameters initialized_parameters,
               const ParticleSet& electrons,
@@ -316,7 +317,8 @@ public:
               bool optimize = false,
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
-              std::string optimized_parameter_export = {});
+              std::string optimized_parameter_export = {},
+              std::array<double, 3> reduced_twist = {});
 
   /// Copy accepted state and optimizer mappings while dropping any in-flight proposal.
   PsiFormerWF(const PsiFormerWF& other);
@@ -1292,7 +1294,7 @@ private:
 
   /// Publish one legacy one-electron proposal with an explicit parameter-version key.
   void cacheSingleParticleProposal(double sign,
-                                   double logabs,
+                                   LogValue physical_log_value,
                                    std::uint64_t configuration_identity,
                                    int particle,
                                    std::size_t parameter_version,

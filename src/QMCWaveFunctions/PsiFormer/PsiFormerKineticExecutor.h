@@ -573,6 +573,21 @@ public:
                                    const double* inverse_masses,
                                    std::size_t inverse_mass_count) const;
 
+  /** Reverse only the first-derivative kinetic seed over the current forward tape.
+   *
+   * This must immediately follow ``evaluate`` for the same parameter version.
+   * The result reuses the workspace's score vector, whose previous contents are
+   * therefore invalidated, and introduces no additional O(P) allocation.  It is
+   * used for the imaginary part of a complex total logarithmic drift; the
+   * Laplacian seed belongs exclusively to the ordinary real response.
+   */
+  DirectKineticConstView evaluateGradientParameterResponse(
+      DirectKineticWorkspace& workspace,
+      const double* total_log_gradient,
+      std::size_t total_log_gradient_size,
+      const double* inverse_masses = nullptr,
+      std::size_t inverse_mass_count = 0) const;
+
 private:
   using ParameterRole = qmcplusplus::psiformer::ParameterRole;
 
@@ -2373,6 +2388,49 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
           {workspace.kinetic_parameter_response_.data(),
            workspace.kinetic_parameter_response_.size()},
           workspace.observed_parameter_version_};
+}
+
+/// Apply a gradient-only reverse to the forward tape retained by the latest evaluation.
+inline DirectKineticConstView DirectKineticExecutor::evaluateGradientParameterResponse(
+    DirectKineticWorkspace& workspace,
+    const double* total_log_gradient,
+    std::size_t total_log_gradient_size,
+    const double* inverse_masses,
+    std::size_t inverse_mass_count) const
+{
+  validateWorkspace(workspace);
+  if (workspace.observed_parameter_version_ != parameters_.version())
+    throw std::logic_error(
+        "PsiFormer gradient-only kinetic reverse requires a current forward tape");
+  if (!total_log_gradient || total_log_gradient_size != workspace.gradient_lanes_)
+    throw std::invalid_argument(
+        "PsiFormer gradient-only kinetic reverse has the wrong drift extent");
+  if ((inverse_masses && inverse_mass_count != workspace.laplacian_lanes_) ||
+      (!inverse_masses && inverse_mass_count != 0))
+    throw std::invalid_argument(
+        "PsiFormer gradient-only kinetic reverse has the wrong inverse-mass extent");
+
+  workspace.root_adjoint_.clear();
+  for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+  {
+    if (!is_finite_parameter_value(total_log_gradient[lane]))
+      throw std::invalid_argument(
+          "PsiFormer gradient-only kinetic drift must be finite");
+    const std::size_t electron = lane / 3;
+    const double inverse_mass = inverse_masses ? inverse_masses[electron] : 1.0;
+    if (!is_finite_parameter_value(inverse_mass) || inverse_mass <= 0.0)
+      throw std::invalid_argument(
+          "PsiFormer gradient-only kinetic inverse masses must be finite and positive");
+    workspace.root_adjoint_.gradient[lane] =
+        -inverse_mass * total_log_gradient[lane];
+  }
+
+  reverse(parameters_.flat_values().data(), workspace, workspace.parameter_score_);
+  for (double value : workspace.parameter_score_)
+    if (!is_finite_parameter_value(value))
+      throw std::runtime_error(
+          "PsiFormer gradient-only kinetic response is non-finite");
+  return {workspace.parameter_score_.data(), workspace.parameter_score_.size()};
 }
 
 } // namespace pf

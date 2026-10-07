@@ -91,7 +91,127 @@ std::string makePsiFormerXml(const GeneratedFiles& files, bool optimize)
   return xml.str();
 }
 
+/// Format a periodic imported PsiFormer with an optional explicit reduced twist.
+std::string makePeriodicPsiFormerXml(const GeneratedFiles& files,
+                                     const std::string& twist = "")
+{
+  std::ostringstream xml;
+  xml << "<psiformer name=\"pf_periodic_twist\" parameters=\""
+      << files.parameters.string() << "\" configuration=\""
+      << files.configuration.string()
+      << "\" source=\"ion0\" system=\"all_electron\" "
+         "feature_policy=\"periodic_torus_v1\"";
+  if (!twist.empty())
+    xml << " twist=\"" << twist << "\"";
+  xml << "/>";
+  return xml.str();
+}
+
 } // namespace
+
+TEST_CASE("PsiFormer builder enforces the bounded outer-twist contract",
+          "[wavefunction][psiformer][hardening][twist]")
+{
+  SECTION("nonfinite twist")
+  {
+    GeneratedFiles files = generateFiles("lih");
+    const SimulationCell open_cell;
+    ParticleSet electrons = makeMassTaggedElectrons(open_cell, 1.0, 1.0);
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    PsiFormerWaveFunctionBuilder builder(
+        OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document;
+    const std::string xml = makePsiFormerXml(files, false);
+    REQUIRE(document.parseFromString(
+        xml.substr(0, xml.size() - 2) + " twist=\"nan 0 0\"/>"));
+    REQUIRE(xmlHasProp(document.getRoot(), BAD_CAST "twist") != nullptr);
+    REQUIRE(getXMLAttributeValue(document.getRoot(), "twist") == "nan 0 0");
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring("must be finite"));
+  }
+
+  SECTION("nonzero open-boundary twist")
+  {
+    GeneratedFiles files = generateFiles("lih");
+    const SimulationCell open_cell;
+    ParticleSet electrons = makeMassTaggedElectrons(open_cell, 1.0, 1.0);
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    PsiFormerWaveFunctionBuilder builder(
+        OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document;
+    const std::string xml = makePsiFormerXml(files, false);
+    REQUIRE(document.parseFromString(
+        xml.substr(0, xml.size() - 2) + " twist=\"0.1 0 0\"/>"));
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring(
+                          "requires a 3D bulk periodic cell"));
+  }
+
+  Lattice lattice;
+  lattice.R         = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell periodic_cell(lattice);
+  GeneratedFiles periodic_files = generateFiles("lih", 4, 7);
+
+  SECTION("nonzero ParticleSet twist requires explicit ownership")
+  {
+    ParticleSet electrons = makeMassTaggedElectrons(periodic_cell, 1.0, 1.0);
+    electrons.setTwist(ParticleSet::PosType{0.1, 0.0, 0.0});
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    auto ions = makeGuardTestIons(periodic_cell);
+    particle_sets.emplace(ions->getName(), std::move(ions));
+    PsiFormerWaveFunctionBuilder builder(
+        OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(makePeriodicPsiFormerXml(periodic_files)));
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring(
+                          "requires an explicit matching PsiFormer twist"));
+  }
+
+  SECTION("explicit and ParticleSet twists must agree")
+  {
+    ParticleSet electrons = makeMassTaggedElectrons(periodic_cell, 1.0, 1.0);
+    electrons.setTwist(ParticleSet::PosType{0.1, 0.0, 0.0});
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    auto ions = makeGuardTestIons(periodic_cell);
+    particle_sets.emplace(ions->getName(), std::move(ions));
+    PsiFormerWaveFunctionBuilder builder(
+        OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(
+        makePeriodicPsiFormerXml(periodic_files, "0.2 0 0")));
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring("disagrees"));
+  }
+
+  SECTION("explicit twist adopts an otherwise Gamma ParticleSet")
+  {
+    ParticleSet electrons = makeMassTaggedElectrons(periodic_cell, 1.0, 1.0);
+    WaveFunctionComponentBuilder::PSetMap particle_sets;
+    auto ions = makeGuardTestIons(periodic_cell);
+    particle_sets.emplace(ions->getName(), std::move(ions));
+    PsiFormerWaveFunctionBuilder builder(
+        OHMMS::Controller, electrons, particle_sets);
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(
+        makePeriodicPsiFormerXml(periodic_files, "0.1 -0.2 0.3")));
+#ifdef QMC_COMPLEX
+    CHECK_NOTHROW(builder.buildComponent(document.getRoot()));
+    CHECK(electrons.getTwist()[0] == 0.1);
+    CHECK(electrons.getTwist()[1] == -0.2);
+    CHECK(electrons.getTwist()[2] == 0.3);
+#else
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring(
+                          "requires a complex QMCPACK build"));
+    CHECK(electrons.getTwist()[0] == 0.0);
+    CHECK(electrons.getTwist()[1] == 0.0);
+    CHECK(electrons.getTwist()[2] == 0.0);
+#endif
+  }
+}
 
 TEST_CASE("PsiFormer builder requires an explicit periodic feature policy",
           "[wavefunction][psiformer][hardening]")
@@ -324,7 +444,7 @@ TEST_CASE("PsiFormer exact same-spin node produces a zero public ratio",
 }
 
 #ifdef QMC_COMPLEX
-TEST_CASE("PsiFormer kinetic response rejects a genuinely complex total drift",
+TEST_CASE("PsiFormer kinetic response supports a genuinely complex total drift",
           "[wavefunction][psiformer][hardening][complex]")
 {
   GeneratedFiles files = generateFiles("lih");
@@ -351,9 +471,13 @@ TEST_CASE("PsiFormer kinetic response rejects a genuinely complex total drift",
   // Scores do not contract against the total spatial drift and remain valid
   // for the real ansatz embedded in a complex QMCPACK build.
   CHECK_NOTHROW(component.evaluateDerivativesWF(electrons, active, score));
-  CHECK_THROWS_WITH(
-      component.evaluateDerivatives(electrons, active, score, kinetic_response),
-      Catch::Matchers::ContainsSubstring("real total wavefunction drift"));
+  CHECK_NOTHROW(
+      component.evaluateDerivatives(electrons, active, score, kinetic_response));
+  for (const QMCTraits::ValueType response : kinetic_response)
+  {
+    CHECK(psiformer::determinant::isFiniteReal(std::real(response)));
+    CHECK(psiformer::determinant::isFiniteReal(std::imag(response)));
+  }
 }
 #endif
 

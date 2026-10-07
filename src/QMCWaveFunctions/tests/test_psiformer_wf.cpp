@@ -1653,7 +1653,8 @@ std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder
                                                    std::uint64_t seed,
                                                    const std::string& system = "all_electron",
                                                    const std::string& selected_indices = "0 514",
-                                                   const std::string& feature_policy = "")
+                                                   const std::string& feature_policy = "",
+                                                   const std::string& twist = "")
 {
   std::ostringstream xml;
   xml << "<psiformer name=\"" << name
@@ -1663,6 +1664,8 @@ std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder
          "optimize_scope=\"indices\" optimize_indices=\"" << selected_indices << "\"";
   if (!feature_policy.empty())
     xml << " feature_policy=\"" << feature_policy << "\"";
+  if (!twist.empty())
+    xml << " twist=\"" << twist << "\"";
   xml << "/>";
 
   Libxml2Document document;
@@ -2016,6 +2019,436 @@ TEST_CASE("PsiFormer internally initialized periodic model is lattice-image inva
           Catch::Approx(baseline.kinetic_parameter_derivative[index]).epsilon(2e-7).margin(2e-7));
   }
 }
+
+#ifdef QMC_COMPLEX
+TEST_CASE("PsiFormer fixed outer twist decorates periodic high-level evaluations",
+          "[wavefunction][psiformer][periodic][complex][twist]")
+{
+  Lattice lattice;
+  lattice.R         = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+  lattice.BoxBConds = {true, true, true};
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  const ParticleSet::PosType reduced_twist{0.17, -0.11, 0.07};
+  const ParticleSet::PosType cartesian_twist = lattice.k_cart(reduced_twist);
+
+  ParticleSet gamma_electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet twist_electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap gamma_particle_sets;
+  WaveFunctionComponentBuilder::PSetMap twist_particle_sets;
+  auto gamma_ions = makeLiHIons(simulation_cell);
+  auto twist_ions = makeLiHIons(simulation_cell);
+  gamma_particle_sets.emplace(gamma_ions->getName(), std::move(gamma_ions));
+  twist_particle_sets.emplace(twist_ions->getName(), std::move(twist_ions));
+  PsiFormerWaveFunctionBuilder gamma_builder(
+      OHMMS::Controller, gamma_electrons, gamma_particle_sets);
+  PsiFormerWaveFunctionBuilder twist_builder(
+      OHMMS::Controller, twist_electrons, twist_particle_sets);
+
+  constexpr std::uint64_t seed = 37;
+  std::unique_ptr<PsiFormerWF> gamma = buildInternalPsiFormer(
+      gamma_builder, "pf_gamma", seed, "all_electron", "0 514",
+      "periodic_torus_v1");
+  std::unique_ptr<PsiFormerWF> twisted = buildInternalPsiFormer(
+      twist_builder, "pf_twisted", seed, "all_electron", "0 514",
+      "periodic_torus_v1", "0.17 -0.11 0.07");
+  OptVariables gamma_active = registerSelectedParameters(*gamma);
+  OptVariables twist_active = registerSelectedParameters(*twisted);
+
+  gamma_electrons.G = ValueType(0);
+  gamma_electrons.L = ValueType(0);
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue gamma_log =
+      gamma->evaluateLog(gamma_electrons, gamma_electrons.G, gamma_electrons.L);
+  const PsiFormerWF::LogValue twist_log =
+      twisted->evaluateLog(twist_electrons, twist_electrons.G, twist_electrons.L);
+
+  double expected_phase = 0.0;
+  for (const auto& position : twist_electrons.R)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      expected_phase += cartesian_twist[dimension] * position[dimension];
+  CHECK(std::real(twist_log) ==
+        Catch::Approx(std::real(gamma_log)).epsilon(2e-10).margin(2e-10));
+  CHECK(std::imag(twist_log) - std::imag(gamma_log) ==
+        Catch::Approx(expected_phase).epsilon(2e-10).margin(2e-10));
+
+  for (int electron = 0; electron < twist_electrons.getTotalNum(); ++electron)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+    {
+      CHECK(std::real(twist_electrons.G[electron][dimension]) ==
+            Catch::Approx(std::real(gamma_electrons.G[electron][dimension]))
+                .epsilon(2e-9)
+                .margin(2e-9));
+      CHECK(std::imag(twist_electrons.G[electron][dimension]) ==
+            Catch::Approx(cartesian_twist[dimension]).epsilon(2e-10).margin(2e-10));
+    }
+    CHECK(twist_electrons.L[electron].real() ==
+          Catch::Approx(gamma_electrons.L[electron].real()).epsilon(2e-8).margin(2e-8));
+    CHECK(twist_electrons.L[electron].imag() == Catch::Approx(0.0).margin(2e-10));
+  }
+
+  Vector<ValueType> gamma_score(gamma_active.size(), ValueType(0));
+  Vector<ValueType> gamma_kinetic(gamma_active.size(), ValueType(0));
+  Vector<ValueType> twist_score(twist_active.size(), ValueType(0));
+  Vector<ValueType> twist_kinetic(twist_active.size(), ValueType(0));
+  gamma->evaluateDerivatives(
+      gamma_electrons, gamma_active, gamma_score, gamma_kinetic);
+  twisted->evaluateDerivatives(
+      twist_electrons, twist_active, twist_score, twist_kinetic);
+  for (int parameter = 0; parameter < gamma_active.size(); ++parameter)
+  {
+    CHECK(twist_score[parameter].real() ==
+          Catch::Approx(gamma_score[parameter].real()).epsilon(2e-8).margin(2e-8));
+    CHECK(twist_score[parameter].imag() == Catch::Approx(0.0).margin(2e-10));
+    CHECK(twist_kinetic[parameter].real() ==
+          Catch::Approx(gamma_kinetic[parameter].real()).epsilon(2e-7).margin(2e-7));
+    CHECK(std::isfinite(twist_kinetic[parameter].imag()));
+  }
+
+  // A central difference of the complex kinetic energy validates the extra
+  // reverse pass seeded by the imaginary outer-phase drift.
+  const auto complex_kinetic = [](const ParticleSet& electrons) {
+    ValueType value = 0;
+    for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+    {
+      ValueType gradient_square = 0;
+      for (int dimension = 0; dimension < 3; ++dimension)
+        gradient_square += electrons.G[electron][dimension] *
+            electrons.G[electron][dimension];
+      value -= ValueType(0.5) * (electrons.L[electron] + gradient_square);
+    }
+    return value;
+  };
+  constexpr double parameter_step = 2e-5;
+  const double original_parameter = std::real(twist_active[0]);
+  twist_active[0] = original_parameter + parameter_step;
+  twisted->resetParametersExclusive(twist_active);
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  twisted->evaluateLog(twist_electrons, twist_electrons.G, twist_electrons.L);
+  const ValueType plus_kinetic = complex_kinetic(twist_electrons);
+  twist_active[0] = original_parameter - parameter_step;
+  twisted->resetParametersExclusive(twist_active);
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  twisted->evaluateLog(twist_electrons, twist_electrons.G, twist_electrons.L);
+  const ValueType minus_kinetic = complex_kinetic(twist_electrons);
+  twist_active[0] = original_parameter;
+  twisted->resetParametersExclusive(twist_active);
+  const ValueType kinetic_finite_difference =
+      (plus_kinetic - minus_kinetic) / (2.0 * parameter_step);
+  CHECK(kinetic_finite_difference.real() ==
+        Catch::Approx(twist_kinetic[0].real()).epsilon(3e-4).margin(3e-4));
+  CHECK(kinetic_finite_difference.imag() ==
+        Catch::Approx(twist_kinetic[0].imag()).epsilon(3e-4).margin(3e-4));
+
+  // Single-electron and virtual-move ratios acquire only the displacement
+  // phase; their real periodic amplitudes remain identical to Gamma.
+  gamma_electrons.G = ValueType(0);
+  gamma_electrons.L = ValueType(0);
+  gamma->evaluateLog(gamma_electrons, gamma_electrons.G, gamma_electrons.L);
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  twisted->evaluateLog(twist_electrons, twist_electrons.G, twist_electrons.L);
+  constexpr int moved_electron = 1;
+  const ParticleSet::SingleParticlePos displacement{0.08, -0.03, 0.02};
+  gamma_electrons.makeMove(moved_electron, displacement);
+  twist_electrons.makeMove(moved_electron, displacement);
+  PsiFormerWF::GradType gamma_gradient;
+  PsiFormerWF::GradType twist_gradient;
+  const ValueType gamma_ratio =
+      gamma->ratioGrad(gamma_electrons, moved_electron, gamma_gradient);
+  const ValueType twist_ratio =
+      twisted->ratioGrad(twist_electrons, moved_electron, twist_gradient);
+  double displacement_phase = 0.0;
+  for (int dimension = 0; dimension < 3; ++dimension)
+    displacement_phase += cartesian_twist[dimension] * displacement[dimension];
+  const ValueType expected_ratio =
+      gamma_ratio * std::exp(ValueType(0.0, displacement_phase));
+  CHECK(twist_ratio.real() == Catch::Approx(expected_ratio.real()).epsilon(2e-9).margin(2e-12));
+  CHECK(twist_ratio.imag() == Catch::Approx(expected_ratio.imag()).epsilon(2e-9).margin(2e-12));
+  for (int dimension = 0; dimension < 3; ++dimension)
+  {
+    CHECK(twist_gradient[dimension].real() ==
+          Catch::Approx(gamma_gradient[dimension].real()).epsilon(2e-9).margin(2e-9));
+    CHECK(twist_gradient[dimension].imag() ==
+          Catch::Approx(cartesian_twist[dimension]).epsilon(2e-10).margin(2e-10));
+  }
+  gamma->restore(moved_electron);
+  twisted->restore(moved_electron);
+  gamma_electrons.rejectMove(moved_electron);
+  twist_electrons.rejectMove(moved_electron);
+
+  const std::vector<ParticleSet::SingleParticlePos> virtual_displacements{
+      {0.023, -0.017, 0.012}, {-0.031, 0.014, 0.027}};
+  VirtualParticleSet gamma_virtual(gamma_electrons);
+  VirtualParticleSet twist_virtual(twist_electrons);
+  gamma_virtual.makeMoves(gamma_electrons, 2, virtual_displacements);
+  twist_virtual.makeMoves(twist_electrons, 2, virtual_displacements);
+  std::vector<ValueType> gamma_virtual_ratios(virtual_displacements.size());
+  std::vector<ValueType> twist_virtual_ratios(virtual_displacements.size());
+  gamma->evaluateRatios(gamma_virtual, gamma_virtual_ratios);
+  twisted->evaluateRatios(twist_virtual, twist_virtual_ratios);
+  for (std::size_t move = 0; move < virtual_displacements.size(); ++move)
+  {
+    double phase = 0.0;
+    for (int dimension = 0; dimension < 3; ++dimension)
+      phase += cartesian_twist[dimension] * virtual_displacements[move][dimension];
+    const ValueType expected = gamma_virtual_ratios[move] * std::exp(ValueType(0.0, phase));
+    CHECK(twist_virtual_ratios[move].real() ==
+          Catch::Approx(expected.real()).epsilon(2e-9).margin(2e-12));
+    CHECK(twist_virtual_ratios[move].imag() ==
+          Catch::Approx(expected.imag()).epsilon(2e-9).margin(2e-12));
+  }
+
+  // The legacy crowd VGL path must decorate each walker exactly once.  Use two
+  // distinct configurations and compare its published state against scalar
+  // Gamma references rather than against another twist-aware call path.
+  ParticleSet twist_crowd_electrons0 = makeLiHElectrons(simulation_cell);
+  ParticleSet twist_crowd_electrons1 = makeLiHElectrons(simulation_cell);
+  twist_crowd_electrons0.setTwist(reduced_twist);
+  twist_crowd_electrons1.setTwist(reduced_twist);
+  twist_crowd_electrons1.R[0] +=
+      ParticleSet::SingleParticlePos{0.037, -0.021, 0.016};
+  twist_crowd_electrons1.update();
+  ParticleSet gamma_crowd_electrons0 = makeLiHElectrons(simulation_cell);
+  ParticleSet gamma_crowd_electrons1 = makeLiHElectrons(simulation_cell);
+  gamma_crowd_electrons1.R = twist_crowd_electrons1.R;
+  gamma_crowd_electrons1.update();
+
+  std::unique_ptr<WaveFunctionComponent> twist_crowd_storage0 =
+      twisted->makeClone(twist_crowd_electrons0);
+  std::unique_ptr<WaveFunctionComponent> twist_crowd_storage1 =
+      twisted->makeClone(twist_crowd_electrons1);
+  auto* twist_crowd_component0 =
+      dynamic_cast<PsiFormerWF*>(twist_crowd_storage0.get());
+  auto* twist_crowd_component1 =
+      dynamic_cast<PsiFormerWF*>(twist_crowd_storage1.get());
+  REQUIRE(twist_crowd_component0 != nullptr);
+  REQUIRE(twist_crowd_component1 != nullptr);
+  RefVectorWithLeader<WaveFunctionComponent> twist_crowd_components(
+      *twist_crowd_component0,
+      {*twist_crowd_component0, *twist_crowd_component1});
+  RefVectorWithLeader<ParticleSet> twist_crowd_particles(
+      twist_crowd_electrons0,
+      {twist_crowd_electrons0, twist_crowd_electrons1});
+  std::array<ParticleSet::ParticleGradient, 2> twist_crowd_gradients{
+      ParticleSet::ParticleGradient(twist_crowd_electrons0.getTotalNum()),
+      ParticleSet::ParticleGradient(twist_crowd_electrons1.getTotalNum())};
+  std::array<ParticleSet::ParticleLaplacian, 2> twist_crowd_laplacians{
+      ParticleSet::ParticleLaplacian(twist_crowd_electrons0.getTotalNum()),
+      ParticleSet::ParticleLaplacian(twist_crowd_electrons1.getTotalNum())};
+  RefVector<ParticleSet::ParticleGradient> twist_crowd_gradient_list{
+      twist_crowd_gradients[0], twist_crowd_gradients[1]};
+  RefVector<ParticleSet::ParticleLaplacian> twist_crowd_laplacian_list{
+      twist_crowd_laplacians[0], twist_crowd_laplacians[1]};
+  ResourceCollection twist_crowd_resource_template("psiformer_twist_crowd_template");
+  twist_crowd_component0->createResource(twist_crowd_resource_template);
+  ResourceCollection twist_crowd_resource(twist_crowd_resource_template);
+  {
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(
+        twist_crowd_resource, twist_crowd_components);
+    twist_crowd_component0->mw_evaluateLog(
+        twist_crowd_components, twist_crowd_particles,
+        twist_crowd_gradient_list, twist_crowd_laplacian_list);
+  }
+
+  std::array<ParticleSet*, 2> gamma_crowd_particles{
+      &gamma_crowd_electrons0, &gamma_crowd_electrons1};
+  std::array<ParticleSet*, 2> twist_crowd_particle_ptrs{
+      &twist_crowd_electrons0, &twist_crowd_electrons1};
+  std::array<PsiFormerWF*, 2> twist_crowd_components_ptrs{
+      twist_crowd_component0, twist_crowd_component1};
+  for (std::size_t walker = 0; walker < 2; ++walker)
+  {
+    std::unique_ptr<WaveFunctionComponent> gamma_crowd_storage =
+        gamma->makeClone(*gamma_crowd_particles[walker]);
+    auto* gamma_crowd_component =
+        dynamic_cast<PsiFormerWF*>(gamma_crowd_storage.get());
+    REQUIRE(gamma_crowd_component != nullptr);
+    gamma_crowd_particles[walker]->G = ValueType(0);
+    gamma_crowd_particles[walker]->L = ValueType(0);
+    const PsiFormerWF::LogValue gamma_crowd_log =
+        gamma_crowd_component->evaluateLog(
+            *gamma_crowd_particles[walker], gamma_crowd_particles[walker]->G,
+            gamma_crowd_particles[walker]->L);
+    const testing::PsiFormerScalarStateSnapshot twist_crowd_state =
+        testing::TestPsiFormerWF::scalarStateSnapshot(
+            *twist_crowd_components_ptrs[walker]);
+    double crowd_phase = 0.0;
+    for (const auto& position : twist_crowd_particle_ptrs[walker]->R)
+      for (int dimension = 0; dimension < 3; ++dimension)
+        crowd_phase += cartesian_twist[dimension] * position[dimension];
+    CHECK(std::real(twist_crowd_state.log_value) ==
+          Catch::Approx(std::real(gamma_crowd_log)).epsilon(2e-9).margin(2e-9));
+    CHECK(std::imag(twist_crowd_state.log_value) - std::imag(gamma_crowd_log) ==
+          Catch::Approx(crowd_phase).epsilon(2e-9).margin(2e-9));
+    for (int electron = 0;
+         electron < twist_crowd_particle_ptrs[walker]->getTotalNum(); ++electron)
+    {
+      for (int dimension = 0; dimension < 3; ++dimension)
+      {
+        CHECK(std::real(twist_crowd_gradients[walker][electron][dimension]) ==
+              Catch::Approx(std::real(
+                  gamma_crowd_particles[walker]->G[electron][dimension]))
+                  .epsilon(2e-9)
+                  .margin(2e-9));
+        CHECK(std::imag(twist_crowd_gradients[walker][electron][dimension]) ==
+              Catch::Approx(cartesian_twist[dimension])
+                  .epsilon(2e-10)
+                  .margin(2e-10));
+      }
+      CHECK(std::real(twist_crowd_laplacians[walker][electron]) ==
+            Catch::Approx(std::real(
+                gamma_crowd_particles[walker]->L[electron]))
+                .epsilon(2e-8)
+                .margin(2e-8));
+      CHECK(std::imag(twist_crowd_laplacians[walker][electron]) ==
+            Catch::Approx(0.0).margin(2e-10));
+    }
+  }
+
+  // Exercise the hard-planned scalar VALUE owner with all-to-one replacements.
+  // Each output must receive only the phase of its own electron displacement.
+  ParticleSet planned_gamma_electrons = makeLiHElectrons(simulation_cell);
+  ParticleSet planned_twist_electrons = makeLiHElectrons(simulation_cell);
+  planned_twist_electrons.setTwist(reduced_twist);
+  std::unique_ptr<WaveFunctionComponent> planned_gamma_storage =
+      gamma->makeClone(planned_gamma_electrons);
+  std::unique_ptr<WaveFunctionComponent> planned_twist_storage =
+      twisted->makeClone(planned_twist_electrons);
+  auto* planned_gamma = dynamic_cast<PsiFormerWF*>(planned_gamma_storage.get());
+  auto* planned_twist = dynamic_cast<PsiFormerWF*>(planned_twist_storage.get());
+  REQUIRE(planned_gamma != nullptr);
+  REQUIRE(planned_twist != nullptr);
+  const PreparedScalarPlan gamma_plan = prepareScalarValuePlan(
+      *planned_gamma, "test/psiformer/twist-gamma-planned",
+      "twist-gamma-planned-v1");
+  const PreparedScalarPlan twist_plan = prepareScalarValuePlan(
+      *planned_twist, "test/psiformer/twist-planned",
+      "twist-planned-v1");
+  static_cast<void>(gamma_plan);
+  static_cast<void>(twist_plan);
+  const ParticleSet::SingleParticlePos common_position{0.43, -0.31, 0.27};
+  planned_gamma_electrons.makeVirtualMoves(common_position);
+  planned_twist_electrons.makeVirtualMoves(common_position);
+  std::vector<ValueType> planned_gamma_ratios(
+      planned_gamma_electrons.getTotalNum());
+  std::vector<ValueType> planned_twist_ratios(
+      planned_twist_electrons.getTotalNum());
+  planned_gamma->evaluateRatiosAlltoOne(
+      planned_gamma_electrons, planned_gamma_ratios);
+  planned_twist->evaluateRatiosAlltoOne(
+      planned_twist_electrons, planned_twist_ratios);
+  for (int electron = 0; electron < planned_twist_electrons.getTotalNum(); ++electron)
+  {
+    double phase = 0.0;
+    for (int dimension = 0; dimension < 3; ++dimension)
+      phase += cartesian_twist[dimension] *
+          (common_position[dimension] -
+           planned_twist_electrons.R[electron][dimension]);
+    const ValueType expected = planned_gamma_ratios[electron] *
+        std::exp(ValueType(0.0, phase));
+    CHECK(planned_twist_ratios[electron].real() ==
+          Catch::Approx(expected.real()).epsilon(2e-9).margin(2e-12));
+    CHECK(planned_twist_ratios[electron].imag() ==
+          Catch::Approx(expected.imag()).epsilon(2e-9).margin(2e-12));
+  }
+
+  // A lattice image retains the periodic amplitude and picks up the Bloch
+  // phase exp(i 2 pi t dot n).
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue before_image = twisted->evaluateLog(
+      twist_electrons, twist_electrons.G, twist_electrons.L);
+  for (int dimension = 0; dimension < 3; ++dimension)
+    twist_electrons.R[0][dimension] +=
+        lattice.R(0, dimension) + lattice.R(2, dimension);
+  twist_electrons.update();
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue after_image = twisted->evaluateLog(
+      twist_electrons, twist_electrons.G, twist_electrons.L);
+  CHECK(std::real(after_image) ==
+        Catch::Approx(std::real(before_image)).epsilon(2e-9).margin(2e-9));
+  CHECK(std::imag(after_image) - std::imag(before_image) ==
+        Catch::Approx(2.0 * M_PI * (reduced_twist[0] + reduced_twist[2]))
+            .epsilon(2e-9)
+            .margin(2e-9));
+
+  // Legacy walker persistence must retain the nonzero physical phase instead
+  // of reconstructing the native determinant's 0/pi sign phase.
+  PsiFormerWF::WFBufferType walker_buffer;
+  twisted->registerData(twist_electrons, walker_buffer);
+  const std::size_t walker_bulk_end = walker_buffer.current();
+  const std::size_t walker_scalar_end = walker_buffer.current_scalar();
+  walker_buffer.allocate();
+  walker_buffer.zero();
+  walker_buffer.rewind();
+  twist_electrons.G = ValueType(0);
+  twist_electrons.L = ValueType(0);
+  const PsiFormerWF::LogValue persisted_log =
+      twisted->updateBuffer(twist_electrons, walker_buffer, true);
+  REQUIRE(std::imag(persisted_log) != 0.0);
+  const testing::PsiFormerScalarStateSnapshot persisted_state =
+      testing::TestPsiFormerWF::scalarStateSnapshot(*twisted);
+  testing::TestPsiFormerWF::poisonAcceptedStateForRestore(*twisted);
+  walker_buffer.rewind();
+  twisted->copyFromBuffer(twist_electrons, walker_buffer);
+  CHECK(walker_buffer.current() == walker_bulk_end);
+  CHECK(walker_buffer.current_scalar() == walker_scalar_end);
+  const testing::PsiFormerScalarStateSnapshot restored_walker_state =
+      testing::TestPsiFormerWF::scalarStateSnapshot(*twisted);
+  CHECK(sameScalarBits(restored_walker_state.log_value,
+                       persisted_state.log_value));
+  CHECK(std::imag(restored_walker_state.log_value) != 0.0);
+
+  // The variational-parameter payload stores and fingerprints both reduced and
+  // Cartesian twist metadata.  An identical component can restore it, while a
+  // different physical twist cannot consume the checkpoint.
+  ScopedTestDirectory restart_files("twist_restart");
+  const std::filesystem::path state_path =
+      restart_files.path / "psiformer_twist.vp.h5";
+  hdf_archive output;
+  twist_active.writeToHDF(state_path.string(), output);
+  twisted->writeVariationalParameters(output);
+  output.close();
+
+  ParticleSet restored_electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap restored_particle_sets;
+  auto restored_ions = makeLiHIons(simulation_cell);
+  restored_particle_sets.emplace(restored_ions->getName(),
+                                 std::move(restored_ions));
+  PsiFormerWaveFunctionBuilder restored_builder(
+      OHMMS::Controller, restored_electrons, restored_particle_sets);
+  std::unique_ptr<PsiFormerWF> restored = buildInternalPsiFormer(
+      restored_builder, "pf_twisted", seed, "all_electron", "0 514",
+      "periodic_torus_v1", "0.17 -0.11 0.07");
+  OptVariables restored_active = registerSelectedParameters(*restored);
+  hdf_archive input;
+  restored_active.readFromHDF(state_path.string(), input);
+  CHECK_NOTHROW(restored->readVariationalParameters(input));
+  input.close();
+
+  ParticleSet mismatched_electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap mismatched_particle_sets;
+  auto mismatched_ions = makeLiHIons(simulation_cell);
+  mismatched_particle_sets.emplace(mismatched_ions->getName(),
+                                   std::move(mismatched_ions));
+  PsiFormerWaveFunctionBuilder mismatched_builder(
+      OHMMS::Controller, mismatched_electrons, mismatched_particle_sets);
+  std::unique_ptr<PsiFormerWF> mismatched = buildInternalPsiFormer(
+      mismatched_builder, "pf_twisted", seed, "all_electron", "0 514",
+      "periodic_torus_v1", "0.19 -0.11 0.07");
+  hdf_archive mismatch_input;
+  REQUIRE(mismatch_input.open(state_path, H5F_ACC_RDONLY));
+  CHECK_THROWS_WITH(mismatched->readVariationalParameters(mismatch_input),
+                    Catch::Matchers::ContainsSubstring("fingerprint"));
+  mismatch_input.close();
+}
+#endif
 
 TEST_CASE("PsiFormer internal initialization uses the canonical pseudo-LiH layout",
           "[wavefunction][psiformer][initialization][ecp]")
