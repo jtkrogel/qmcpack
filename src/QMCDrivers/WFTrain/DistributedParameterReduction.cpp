@@ -34,6 +34,7 @@ constexpr std::uint64_t energy_channel_contract = UINT64_C(0x454752414433); // "
 constexpr std::uint64_t orbital_channel_contract = UINT64_C(0x4f52424752414431); // "ORBGRAD1"
 constexpr std::uint64_t parameter_vector_contract = UINT64_C(0x5056454353554d31); // "PVECSUM1"
 constexpr std::uint64_t weighted_sample_contract = UINT64_C(0x57534d4f4d454e31); // "WSMOMEN1"
+constexpr std::uint64_t accelerator_plan_contract = UINT64_C(0x414343504c414e31); // "ACCPLAN1"
 
 /// Classify failures without communicating variable-length exception strings.
 enum class ConsensusReason : std::uint64_t
@@ -222,6 +223,76 @@ DistributedParameterReduction::DistributedParameterReduction(
 std::size_t DistributedParameterReduction::participantCount() const noexcept
 {
   return communicator_ ? static_cast<std::size_t>(communicator_->size()) : 1;
+}
+
+AcceleratorDistributedPlan DistributedParameterReduction::preflightAcceleratorPlan(
+    const AcceleratorRankPlanInput& local_rank,
+    std::size_t parameter_count,
+    std::size_t collective_element_bytes,
+    AcceleratorTransportRequest transport_request,
+    std::size_t buffer_slots) const
+{
+  // Keep every field fixed-width so a malformed local rank cannot strand peers
+  // before the common pure planner produces one rank-uniform diagnostic.
+  const std::array<std::uint64_t, 19> local_record{
+      protocol_version,
+      accelerator_plan_contract,
+      local_rank.rank,
+      local_rank.participant_count,
+      local_rank.node_id,
+      local_rank.device_id,
+      local_rank.local_sample_count,
+      local_rank.device_budget_bytes.has_value(),
+      local_rank.device_budget_bytes.value_or(0),
+      local_rank.base_required_device_bytes,
+      local_rank.maximum_chunk_elements,
+      local_rank.parameter_version,
+      local_rank.model_fingerprint,
+      local_rank.precision_fingerprint,
+      local_rank.device_mpi_available,
+      parameter_count,
+      collective_element_bytes,
+      static_cast<std::uint64_t>(transport_request),
+      buffer_slots};
+  const auto records = gatherRecords(communicator_, local_record);
+
+  // Fields describing the collective itself must be identical. Rank-varying
+  // placement, memory, work, and device-MPI capability are validated below by
+  // makeAcceleratorDistributedPlan.
+  constexpr std::array<std::size_t, 6> common_fields{0, 1, 15, 16, 17, 18};
+  for (std::size_t rank = 0; rank < records.size(); ++rank)
+  {
+    if (records[rank][2] != rank || records[rank][3] != records.size())
+      throwMetadataMismatch("accelerator plan preflight", rank);
+    for (const std::size_t field : common_fields)
+      if (records[rank][field] != records.front()[field])
+        throwMetadataMismatch("accelerator plan preflight", rank);
+  }
+
+  std::vector<AcceleratorRankPlanInput> inputs;
+  inputs.reserve(records.size());
+  for (const auto& record : records)
+  {
+    AcceleratorRankPlanInput input;
+    input.rank                         = record[2];
+    input.participant_count            = record[3];
+    input.node_id                      = record[4];
+    input.device_id                    = record[5];
+    input.local_sample_count           = record[6];
+    if (record[7] != 0)
+      input.device_budget_bytes        = record[8];
+    input.base_required_device_bytes   = record[9];
+    input.maximum_chunk_elements       = record[10];
+    input.parameter_version            = record[11];
+    input.model_fingerprint            = record[12];
+    input.precision_fingerprint        = record[13];
+    input.device_mpi_available         = record[14] != 0;
+    inputs.push_back(input);
+  }
+
+  return makeAcceleratorDistributedPlan(
+      inputs, parameter_count, collective_element_bytes, transport_request,
+      buffer_slots);
 }
 
 void DistributedParameterReduction::preflight(

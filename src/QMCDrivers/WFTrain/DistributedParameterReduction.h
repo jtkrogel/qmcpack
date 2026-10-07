@@ -16,6 +16,7 @@
 #ifndef QMCPLUSPLUS_DISTRIBUTED_PARAMETER_REDUCTION_H
 #define QMCPLUSPLUS_DISTRIBUTED_PARAMETER_REDUCTION_H
 
+#include "QMCDrivers/WFTrain/AcceleratorTrainingPlan.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/OrbitalPretrainingAccumulator.h"
 
@@ -61,6 +62,19 @@ public:
   /// Bind the reduction context to an existing communicator with nonowning lifetime.
   DistributedParameterReduction(Communicate& communicator,
                                 DistributedReductionPolicy policy = {});
+
+  /** Agree on accelerator topology, semantic identity, and bounded transport.
+   *
+   * Every rank contributes one fixed-width record.  The returned plan is identical
+   * on every participant and is constructed before device buffers or bulk parameter
+   * collectives are touched.
+   */
+  AcceleratorDistributedPlan preflightAcceleratorPlan(
+      const AcceleratorRankPlanInput& local_rank,
+      std::size_t parameter_count,
+      std::size_t collective_element_bytes,
+      AcceleratorTransportRequest transport_request,
+      std::size_t buffer_slots = 1) const;
 
   /// Agree on immutable iteration metadata before derivative production begins.
   void preflight(const StructuredParameterSchema& schema,

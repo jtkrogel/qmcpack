@@ -522,6 +522,65 @@ TEST_CASE("Distributed parameter reduction matches an independent global referen
   }
 }
 
+TEST_CASE("Distributed accelerator-plan preflight is fixed-record and retryable",
+          "[drivers][training][accelerator][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const std::size_t rank = static_cast<std::size_t>(communicator.rank());
+  const std::size_t participants = static_cast<std::size_t>(communicator.size());
+  AcceleratorRankPlanInput local{
+      /*rank=*/rank,
+      /*participant_count=*/participants,
+      /*node_id=*/rank / 2,
+      /*device_id=*/rank % 2,
+      /*local_sample_count=*/rank == 1 ? 0 : rank + 1,
+      /*device_budget_bytes=*/std::size_t{4096},
+      /*base_required_device_bytes=*/128,
+      /*maximum_chunk_elements=*/rank + 2,
+      /*parameter_version=*/7,
+      /*model_fingerprint=*/101,
+      /*precision_fingerprint=*/202,
+      /*device_mpi_available=*/false};
+  DistributedParameterReduction reduction(communicator, {2});
+  const AcceleratorDistributedPlan plan = reduction.preflightAcceleratorPlan(
+      local, /*parameter_count=*/5, /*collective_element_bytes=*/16,
+      AcceleratorTransportRequest::AUTO, /*buffer_slots=*/2);
+
+  std::size_t expected_samples = 0;
+  for (std::size_t remote_rank = 0; remote_rank < participants; ++remote_rank)
+    expected_samples += remote_rank == 1 ? 0 : remote_rank + 1;
+  CHECK(plan.participant_count == participants);
+  CHECK(plan.total_sample_count == expected_samples);
+  CHECK(plan.transport == AcceleratorCollectiveTransport::HOST_STAGED_MPI);
+  CHECK(plan.chunk_elements == 2);
+  CHECK(plan.parameter_version == 7);
+  CHECK(plan.host_staging_bytes_per_rank == 64);
+  REQUIRE(plan.required_device_bytes_per_rank.size() == participants);
+  for (const std::size_t required : plan.required_device_bytes_per_rank)
+    CHECK(required == 192);
+
+  if (participants > 1)
+  {
+    AcceleratorRankPlanInput mismatched = local;
+    if (rank == participants - 1)
+      mismatched.precision_fingerprint = 999;
+    CHECK_THROWS_WITH(
+        reduction.preflightAcceleratorPlan(
+            mismatched, 5, 16, AcceleratorTransportRequest::AUTO, 2),
+        Catch::Matchers::ContainsSubstring("semantic metadata mismatch"));
+
+    // A failed preflight performs no bulk collective and leaves the same
+    // coordinator immediately reusable with corrected metadata.
+    CHECK_NOTHROW(reduction.preflightAcceleratorPlan(
+        local, 5, 16, AcceleratorTransportRequest::AUTO, 2));
+  }
+
+  CHECK_THROWS_WITH(
+      reduction.preflightAcceleratorPlan(
+          local, 5, 16, AcceleratorTransportRequest::DEVICE_MPI, 2),
+      Catch::Matchers::ContainsSubstring("not available on every rank"));
+}
+
 TEST_CASE("Distributed matrix-free vectors are reduced once into replicated storage",
           "[drivers][training][matrix-free][mpi]")
 {
