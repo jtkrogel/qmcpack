@@ -90,6 +90,7 @@ set(DRIVER_TEST_SRC
     test_Eigensolver.cpp
     test_WFOptDriverInput.cpp)
 list(APPEND DRIVER_TEST_SRC test_HighParameterTraining.cpp)
+list(APPEND DRIVER_TEST_SRC test_AcceleratorTrainingPlan.cpp)
 list(APPEND DRIVER_TEST_SRC test_QuantileClipping.cpp)
 list(APPEND DRIVER_TEST_SRC test_TrainingCheckpoint.cpp)
 list(APPEND DRIVER_TEST_SRC test_FirstOrderOptimizer.cpp)
