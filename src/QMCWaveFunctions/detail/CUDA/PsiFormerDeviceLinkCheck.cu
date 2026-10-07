@@ -11,6 +11,7 @@
 
 #include "PsiFormerDeviceKernels.h"
 #include "PsiFormerDeviceDense.h"
+#include "PsiFormerDeviceDeterminantKernels.h"
 
 int main()
 {
@@ -22,7 +23,10 @@ int main()
                          nullptr, 0, nullptr, nullptr, nullptr) == success;
   const bool attention_linked =
       launchAttentionSoftmax(nullptr, qmcplusplus::psiformer::AttentionForwardLayout{}, nullptr) == success;
-  return foundation_linked && attention_linked
+  const bool determinant_linked =
+      launchDeterminantFactorization(nullptr, nullptr, 0, 0, 0, false,
+                                     nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  return foundation_linked && attention_linked && determinant_linked
       ? 0
       : 1;
 }
