@@ -46,6 +46,7 @@ set(WFBASE_SRCS
     PsiFormer/PsiFormerExecutionPlan.cpp
     PsiFormer/PsiFormerMemoryPolicy.cpp
     PsiFormer/PsiFormerPrecisionExecution.cpp
+    PsiFormer/PsiFormerPrecisionOrchestration.cpp
     PsiFormer/PsiFormerPrecisionPolicy.cpp
     PsiFormer/PsiFormerInitialization.cpp
     PsiFormer/PsiFormerGeometry.cpp
