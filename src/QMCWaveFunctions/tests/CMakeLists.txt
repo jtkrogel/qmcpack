@@ -117,6 +117,7 @@ set(TRIALWF_SRC
     test_psiformer_accelerator_schedule.cpp
     test_psiformer_execution_plan.cpp
     test_psiformer_memory_policy.cpp
+    test_psiformer_precision_execution.cpp
     test_psiformer_precision_policy.cpp
     test_psiformer_orbital_targets.cpp
     test_psiformer_initialization.cpp

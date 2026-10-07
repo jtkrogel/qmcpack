@@ -15,6 +15,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceKernels.cu
     PsiFormerDeviceDense.cu
     PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDevicePrecision.cu
     PsiFormerDeviceSpatial.cu)
 
 add_library(qmcwfs_cuda ${WFSSRCS_CUDA})

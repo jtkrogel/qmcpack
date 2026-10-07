@@ -12,6 +12,7 @@
 #include "PsiFormerDeviceKernels.h"
 #include "PsiFormerDeviceDense.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
+#include "PsiFormerDevicePrecision.h"
 #include "PsiFormerDeviceSpatial.h"
 
 int main()
@@ -71,13 +72,17 @@ int main()
       launchOpenOrbitalJets(nullptr, qmcplusplus::psiformer::OpenOrbitalJetLayout{},
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool precision_conversion_linked =
+      launchFp64ToFp32ParameterConversion(
+          nullptr, qmcplusplus::psiformer::PsiFormerParameterConversionTile{},
+          nullptr, 0, nullptr, 0, nullptr) == success;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
          determinant_spatial_linked && spatial_softmax_linked &&
          spatial_dense_linked && spatial_qkv_linked &&
          spatial_attention_linked && spatial_context_linked && open_feature_linked &&
          tanh_jet_linked && residual_jet_linked && cusp_jet_linked &&
-         final_spatial_linked && open_orbital_linked
+         final_spatial_linked && open_orbital_linked && precision_conversion_linked
       ? 0
       : 1;
 }

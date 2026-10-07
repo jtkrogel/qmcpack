@@ -45,7 +45,6 @@ bool lowerPrecisionDenseOperation(PsiFormerArithmeticOperation operation) noexce
   case PsiFormerArithmeticOperation::DENSE_PROJECTION:
   case PsiFormerArithmeticOperation::ATTENTION_LOGITS:
   case PsiFormerArithmeticOperation::RESIDUAL_NONLINEAR:
-  case PsiFormerArithmeticOperation::ORBITAL_CONSTRUCTION:
   case PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE:
     return true;
   default:
@@ -112,6 +111,20 @@ const char* psiFormerPrecisionPolicyName(PsiFormerPrecisionPolicy policy) noexce
     return "fp32_compute_fp64_reduce";
   case PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE:
     return "tf32_dense_fp64_sensitive";
+  }
+  return "unknown";
+}
+
+const char* psiFormerBackendMathModeName(PsiFormerBackendMathMode mode) noexcept
+{
+  switch (mode)
+  {
+  case PsiFormerBackendMathMode::FP64_STRICT:
+    return "fp64_strict";
+  case PsiFormerBackendMathMode::FP32_STRICT:
+    return "fp32_strict";
+  case PsiFormerBackendMathMode::CUDA_TF32:
+    return "cuda_tf32";
   }
   return "unknown";
 }
@@ -208,6 +221,8 @@ PsiFormerPrecisionStorageRequirements makePsiFormerPrecisionStorageRequirements(
 std::uint64_t psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy policy) noexcept
 {
   std::uint64_t fingerprint = UINT64_C(14695981039346656037);
+  // Version 2 corrects ORBITAL_CONSTRUCTION to its FP64-sensitive island.
+  extendFingerprint(fingerprint, UINT64_C(2));
   extendFingerprint(fingerprint, static_cast<std::uint64_t>(policy));
   for (std::uint8_t index = 0;
        index < static_cast<std::uint8_t>(PsiFormerArithmeticOperation::COUNT);

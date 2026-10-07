@@ -27,10 +27,12 @@ namespace qmcplusplus::psiformer::device
 using Stream = hipStream_t;
 using Error  = hipError_t;
 inline constexpr Error success = hipSuccess;
+inline constexpr Error invalid_value = hipErrorInvalidValue;
 #else
 using Stream = cudaStream_t;
 using Error  = cudaError_t;
 inline constexpr Error success = cudaSuccess;
+inline constexpr Error invalid_value = cudaErrorInvalidValue;
 #endif
 
 } // namespace qmcplusplus::psiformer::device

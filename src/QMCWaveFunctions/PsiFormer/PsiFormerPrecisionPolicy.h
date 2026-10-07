@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <type_traits>
 
 namespace qmcplusplus::psiformer
 {
@@ -65,6 +66,91 @@ enum class PsiFormerArithmeticPrecision : std::uint8_t
   BINARY32,
   TENSOR_FLOAT32
 };
+
+/// Select the backend multiplication mode independently of scalar storage.
+enum class PsiFormerBackendMathMode : std::uint8_t
+{
+  FP64_STRICT,
+  FP32_STRICT,
+  CUDA_TF32
+};
+
+namespace detail
+{
+
+/// Compile-time classification of the value operations approved for FP32 storage.
+template<PsiFormerArithmeticOperation Operation>
+inline constexpr bool lower_precision_value_operation_v =
+    Operation == PsiFormerArithmeticOperation::DENSE_PROJECTION ||
+    Operation == PsiFormerArithmeticOperation::ATTENTION_LOGITS ||
+    Operation == PsiFormerArithmeticOperation::RESIDUAL_NONLINEAR ||
+    Operation == PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE;
+
+} // namespace detail
+
+/** Expose the C++ scalar types used by one pre-instantiated policy/operation pair.
+ *
+ * TF32 affects only the vendor multiply mode, so its C++ input, product, and output
+ * scalar types remain float.  Sensitive reductions and orbital assembly remain
+ * double under every policy.
+ */
+template<PsiFormerPrecisionPolicy Policy, PsiFormerArithmeticOperation Operation>
+struct PsiFormerPrecisionTraits
+{
+  static constexpr bool lower_value =
+      Policy != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+      (detail::lower_precision_value_operation_v<Operation> ||
+       Operation == PsiFormerArithmeticOperation::SOFTMAX_NORMALIZATION);
+  static constexpr bool fp64_accumulation =
+      !lower_value || Operation == PsiFormerArithmeticOperation::SOFTMAX_NORMALIZATION;
+
+  using storage_type      = std::conditional_t<lower_value, float, double>;
+  using input_type        = storage_type;
+  using product_type      = storage_type;
+  using accumulation_type = std::conditional_t<fp64_accumulation, double, float>;
+  using output_type       = storage_type;
+};
+
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::ORBITAL_CONSTRUCTION>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+                                 PsiFormerArithmeticOperation::DENSE_PROJECTION>::product_type,
+                             float>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::SOFTMAX_NORMALIZATION>::accumulation_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::GEOMETRY_FEATURES>::output_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::DETERMINANT_SOLVE>::accumulation_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::SPATIAL_JETS>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::LOCAL_ENERGY_REDUCTION>::output_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::PARAMETER_ACCUMULATION>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::MASTER_PARAMETERS>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                                 PsiFormerArithmeticOperation::OPTIMIZER_STATE>::storage_type,
+                             double>);
 
 /// Record storage, multiply, and reduction precision for one operation class.
 struct PsiFormerPrecisionRule
@@ -122,6 +208,9 @@ struct PsiFormerNumericalDiagnostics
 
 /// Return the stable input/checkpoint spelling for one named policy.
 const char* psiFormerPrecisionPolicyName(PsiFormerPrecisionPolicy policy) noexcept;
+
+/// Return the stable diagnostic spelling for a contained backend math mode.
+const char* psiFormerBackendMathModeName(PsiFormerBackendMathMode mode) noexcept;
 
 /// Parse one complete policy name; aliases are deliberately not accepted.
 PsiFormerPrecisionPolicy parsePsiFormerPrecisionPolicy(std::string_view value);

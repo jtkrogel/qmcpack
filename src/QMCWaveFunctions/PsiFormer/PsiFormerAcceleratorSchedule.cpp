@@ -187,6 +187,16 @@ const char* psiFormerDeviceArenaRegionName(PsiFormerDeviceArenaRegion region) no
     return "host_staging";
   case PsiFormerDeviceArenaRegion::VENDOR_WORKSPACE:
     return "vendor_workspace";
+  case PsiFormerDeviceArenaRegion::MODEL_PARAMETERS_STAGING:
+    return "model_parameters_staging";
+  case PsiFormerDeviceArenaRegion::MODEL_COMPUTE_PARAMETERS_0:
+    return "model_compute_parameters_0";
+  case PsiFormerDeviceArenaRegion::MODEL_COMPUTE_PARAMETERS_1:
+    return "model_compute_parameters_1";
+  case PsiFormerDeviceArenaRegion::PRECISION_CONVERSION_WORKSPACE:
+    return "precision_conversion_workspace";
+  case PsiFormerDeviceArenaRegion::NUMERICAL_DIAGNOSTICS:
+    return "numerical_diagnostics";
   case PsiFormerDeviceArenaRegion::COUNT:
     return "invalid";
   }

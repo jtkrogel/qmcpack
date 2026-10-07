@@ -15,6 +15,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <limits>
+#include <string>
+#include <type_traits>
 
 namespace qmcplusplus::psiformer
 {
@@ -54,6 +56,26 @@ TEST_CASE("PsiFormer mixed policy lowers only audited operation classes",
   CHECK(softmax.storage == PsiFormerArithmeticPrecision::BINARY32);
   CHECK(softmax.accumulation == PsiFormerArithmeticPrecision::BINARY64);
   CHECK(softmax.numerically_sensitive);
+
+  const PsiFormerPrecisionRule orbital = psiFormerPrecisionRule(
+      PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+      PsiFormerArithmeticOperation::ORBITAL_CONSTRUCTION);
+  CHECK(orbital.storage == PsiFormerArithmeticPrecision::BINARY64);
+  CHECK(orbital.compute == PsiFormerArithmeticPrecision::BINARY64);
+  CHECK(orbital.accumulation == PsiFormerArithmeticPrecision::BINARY64);
+  CHECK(orbital.numerically_sensitive);
+
+  using MixedOrbital = PsiFormerPrecisionTraits<
+      PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+      PsiFormerArithmeticOperation::ORBITAL_CONSTRUCTION>;
+  using Tf32Dense = PsiFormerPrecisionTraits<
+      PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+      PsiFormerArithmeticOperation::DENSE_PROJECTION>;
+  CHECK((std::is_same_v<typename MixedOrbital::output_type, double>));
+  CHECK((std::is_same_v<typename Tf32Dense::input_type, float>));
+  CHECK((std::is_same_v<typename Tf32Dense::product_type, float>));
+  CHECK(std::string(psiFormerBackendMathModeName(PsiFormerBackendMathMode::CUDA_TF32)) ==
+        "cuda_tf32");
 
   for (const PsiFormerArithmeticOperation operation : {
            PsiFormerArithmeticOperation::GEOMETRY_FEATURES,
