@@ -10,6 +10,7 @@
  */
 
 #include "PsiFormerDeviceDense.h"
+#include "PsiFormerDeviceBlasMathMode.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <cfloat>
@@ -82,7 +83,7 @@ __device__ bool finiteDouble(double value)
 /** Normalize one row per block while retaining FP64 maximum/sum reductions. */
 __global__ void attentionSoftmaxFp32Kernel(BatchedAttentionForwardLayout layout,
                                            float* attention,
-                                           PsiFormerNumericalDiagnostics* diagnostics)
+                                           PsiFormerDeviceNumericalDiagnostics* diagnostics)
 {
   const std::size_t rows_per_configuration =
       layout.attention.heads * layout.attention.rows;
@@ -125,9 +126,10 @@ __global__ void attentionSoftmaxFp32Kernel(BatchedAttentionForwardLayout layout,
       row[key] = 0.0F;
     if (threadIdx.x == 0)
     {
-      atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->nonfinite_count),
+      atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.nonfinite_count),
                 invalid_values[0]);
-      atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->invalid_softmax_count),
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    &diagnostics->execution.invalid_softmax_count),
                 1ULL);
     }
     return;
@@ -159,7 +161,8 @@ __global__ void attentionSoftmaxFp32Kernel(BatchedAttentionForwardLayout layout,
     for (std::size_t key = threadIdx.x; key < layout.attention.rows; key += blockDim.x)
       row[key] = 0.0F;
     if (threadIdx.x == 0)
-      atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->invalid_softmax_count),
+      atomicAdd(reinterpret_cast<unsigned long long*>(
+                    &diagnostics->execution.invalid_softmax_count),
                 1ULL);
     return;
   }
@@ -172,7 +175,8 @@ __global__ void attentionSoftmaxFp32Kernel(BatchedAttentionForwardLayout layout,
 __global__ void biasTanhValueFp32Kernel(BatchedValueLayout layout,
                                         const float* input,
                                         const float* bias,
-                                        float* output)
+                                        float* output,
+                                        PsiFormerDeviceNumericalDiagnostics* diagnostics)
 {
   const std::size_t logical =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -184,7 +188,15 @@ __global__ void biasTanhValueFp32Kernel(BatchedValueLayout layout,
   const std::size_t configuration = row_index / layout.rows;
   const std::size_t offset = configuration * layout.configuration_stride +
       row * layout.row_stride + feature;
-  output[offset] = tanhf(input[offset] + bias[feature]);
+  const float preactivation = input[offset] + bias[feature];
+  if (!finiteFloat(preactivation))
+  {
+    output[offset] = 0.0F;
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.nonfinite_count),
+              1ULL);
+    return;
+  }
+  output[offset] = tanhf(preactivation);
 }
 
 /// Add FP32 residual values without touching padding.
@@ -209,7 +221,8 @@ __global__ void residualValueFp32Kernel(BatchedValueLayout layout,
 /// Cross the explicit value-path type barrier while leaving padding untouched.
 __global__ void valueFp32ToFp64Kernel(BatchedValueLayout layout,
                                       const float* source,
-                                      double* target)
+                                      double* target,
+                                      PsiFormerDeviceNumericalDiagnostics* diagnostics)
 {
   const std::size_t logical =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -221,7 +234,15 @@ __global__ void valueFp32ToFp64Kernel(BatchedValueLayout layout,
   const std::size_t configuration = row_index / layout.rows;
   const std::size_t offset = configuration * layout.configuration_stride +
       row * layout.row_stride + feature;
-  target[offset] = static_cast<double>(source[offset]);
+  const float value = source[offset];
+  if (!finiteFloat(value))
+  {
+    target[offset] = 0.0;
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.nonfinite_count),
+              1ULL);
+    return;
+  }
+  target[offset] = static_cast<double>(value);
 }
 
 inline int blasExtent(std::size_t extent) noexcept
@@ -237,6 +258,20 @@ unsigned int valueBlockCount(std::size_t count)
   if (blocks > std::numeric_limits<unsigned int>::max())
     throw std::length_error("PsiFormer FP32 value grid exceeds the CUDA/HIP x dimension");
   return static_cast<unsigned int>(blocks);
+}
+
+/// Issue one raw SGEMM after its caller has established the scoped math mode.
+void denseForwardFp32Raw(AcceleratorBlasHandle& handle,
+                         const DenseForwardLayout& layout,
+                         const float* source,
+                         const float* weight,
+                         float* target)
+{
+  compute::BLAS::gemm(handle, 'N', 'N', blasExtent(layout.output_width),
+                      blasExtent(layout.rows), blasExtent(layout.input_width), 1.0F,
+                      weight, blasExtent(layout.weight_row_stride),
+                      source, blasExtent(layout.source_row_stride), 0.0F,
+                      target, blasExtent(layout.target_row_stride));
 }
 
 } // namespace
@@ -323,20 +358,20 @@ void attentionContextForward(AcceleratorBlasHandle& handle,
 }
 
 void denseForwardFp32(AcceleratorBlasHandle& handle,
+                      const PsiFormerBlasMathModePlan& math_mode,
                       const DenseForwardLayout& layout,
                       const float* source,
                       const float* weight,
                       float* target)
 {
   validateDenseForwardLayout(layout);
-  compute::BLAS::gemm(handle, 'N', 'N', blasExtent(layout.output_width),
-                      blasExtent(layout.rows), blasExtent(layout.input_width), 1.0F,
-                      weight, blasExtent(layout.weight_row_stride),
-                      source, blasExtent(layout.source_row_stride), 0.0F,
-                      target, blasExtent(layout.target_row_stride));
+  executeWithDeviceBlasMathMode(handle, math_mode, [&] {
+    denseForwardFp32Raw(handle, layout, source, weight, target);
+  });
 }
 
 void projectQkvForwardFp32(AcceleratorBlasHandle& handle,
+                           const PsiFormerBlasMathModePlan& math_mode,
                            const DenseForwardLayout& layout,
                            const float* source,
                            const float* query_weight,
@@ -346,12 +381,16 @@ void projectQkvForwardFp32(AcceleratorBlasHandle& handle,
                            float* key,
                            float* value)
 {
-  denseForwardFp32(handle, layout, source, query_weight, query);
-  denseForwardFp32(handle, layout, source, key_weight, key);
-  denseForwardFp32(handle, layout, source, value_weight, value);
+  validateDenseForwardLayout(layout);
+  executeWithDeviceBlasMathMode(handle, math_mode, [&] {
+    denseForwardFp32Raw(handle, layout, source, query_weight, query);
+    denseForwardFp32Raw(handle, layout, source, key_weight, key);
+    denseForwardFp32Raw(handle, layout, source, value_weight, value);
+  });
 }
 
 void attentionLogitsForwardFp32(AcceleratorBlasHandle& handle,
+                                const PsiFormerBlasMathModePlan& math_mode,
                                 const BatchedAttentionForwardLayout& layout,
                                 const float* query,
                                 const float* key,
@@ -359,28 +398,30 @@ void attentionLogitsForwardFp32(AcceleratorBlasHandle& handle,
 {
   validateBatchedAttentionForwardLayout(layout);
   const float scale = 1.0F / std::sqrt(static_cast<float>(layout.attention.head_width));
-  for (std::size_t configuration = 0; configuration < layout.configuration_count;
-       ++configuration)
-    for (std::size_t head = 0; head < layout.attention.heads; ++head)
-      compute::BLAS::gemm(
-          handle, 'T', 'N', blasExtent(layout.attention.rows),
-          blasExtent(layout.attention.rows), blasExtent(layout.attention.head_width),
-          scale,
-          key + configuration * layout.feature_configuration_stride +
-              head * layout.attention.head_width,
-          blasExtent(layout.attention.feature_row_stride),
-          query + configuration * layout.feature_configuration_stride +
-              head * layout.attention.head_width,
-          blasExtent(layout.attention.feature_row_stride), 0.0F,
-          logits + configuration * layout.attention_configuration_stride +
-              head * layout.attention.attention_head_stride,
-          blasExtent(layout.attention.attention_row_stride));
+  executeWithDeviceBlasMathMode(handle, math_mode, [&] {
+    for (std::size_t configuration = 0; configuration < layout.configuration_count;
+         ++configuration)
+      for (std::size_t head = 0; head < layout.attention.heads; ++head)
+        compute::BLAS::gemm(
+            handle, 'T', 'N', blasExtent(layout.attention.rows),
+            blasExtent(layout.attention.rows), blasExtent(layout.attention.head_width),
+            scale,
+            key + configuration * layout.feature_configuration_stride +
+                head * layout.attention.head_width,
+            blasExtent(layout.attention.feature_row_stride),
+            query + configuration * layout.feature_configuration_stride +
+                head * layout.attention.head_width,
+            blasExtent(layout.attention.feature_row_stride), 0.0F,
+            logits + configuration * layout.attention_configuration_stride +
+                head * layout.attention.attention_head_stride,
+            blasExtent(layout.attention.attention_row_stride));
+  });
 }
 
 Error launchAttentionSoftmaxFp32(Stream stream,
                                  const BatchedAttentionForwardLayout& layout,
                                  float* logits_and_weights,
-                                 PsiFormerNumericalDiagnostics* diagnostics)
+                                 PsiFormerDeviceNumericalDiagnostics* diagnostics)
 {
   if (layout.configuration_count == 0 && layout.attention.rows == 0 &&
       layout.attention.heads == 0 && layout.attention.head_width == 0)
@@ -390,7 +431,8 @@ Error launchAttentionSoftmaxFp32(Stream stream,
     throw std::invalid_argument("PsiFormer FP32 attention softmax storage is null");
   const std::size_t row_count = layout.softmaxRowCount();
   if (row_count > std::numeric_limits<unsigned int>::max())
-    throw std::length_error("PsiFormer FP32 attention softmax grid exceeds the CUDA/HIP x dimension");
+    throw std::length_error(
+        "PsiFormer FP32 attention softmax grid exceeds the CUDA/HIP x dimension");
   attentionSoftmaxFp32Kernel<<<static_cast<unsigned int>(row_count),
                                softmax_block_size, 0, stream>>>(
       layout, logits_and_weights, diagnostics);
@@ -402,43 +444,47 @@ Error launchAttentionSoftmaxFp32(Stream stream,
 }
 
 void attentionContextForwardFp32(AcceleratorBlasHandle& handle,
+                                 const PsiFormerBlasMathModePlan& math_mode,
                                  const BatchedAttentionForwardLayout& layout,
                                  const float* attention,
                                  const float* value,
                                  float* target)
 {
   validateBatchedAttentionForwardLayout(layout);
-  for (std::size_t configuration = 0; configuration < layout.configuration_count;
-       ++configuration)
-    for (std::size_t head = 0; head < layout.attention.heads; ++head)
-      compute::BLAS::gemm(
-          handle, 'N', 'N', blasExtent(layout.attention.head_width),
-          blasExtent(layout.attention.rows), blasExtent(layout.attention.rows), 1.0F,
-          value + configuration * layout.feature_configuration_stride +
-              head * layout.attention.head_width,
-          blasExtent(layout.attention.feature_row_stride),
-          attention + configuration * layout.attention_configuration_stride +
-              head * layout.attention.attention_head_stride,
-          blasExtent(layout.attention.attention_row_stride), 0.0F,
-          target + configuration * layout.feature_configuration_stride +
-              head * layout.attention.head_width,
-          blasExtent(layout.attention.feature_row_stride));
+  executeWithDeviceBlasMathMode(handle, math_mode, [&] {
+    for (std::size_t configuration = 0; configuration < layout.configuration_count;
+         ++configuration)
+      for (std::size_t head = 0; head < layout.attention.heads; ++head)
+        compute::BLAS::gemm(
+            handle, 'N', 'N', blasExtent(layout.attention.head_width),
+            blasExtent(layout.attention.rows), blasExtent(layout.attention.rows), 1.0F,
+            value + configuration * layout.feature_configuration_stride +
+                head * layout.attention.head_width,
+            blasExtent(layout.attention.feature_row_stride),
+            attention + configuration * layout.attention_configuration_stride +
+                head * layout.attention.attention_head_stride,
+            blasExtent(layout.attention.attention_row_stride), 0.0F,
+            target + configuration * layout.feature_configuration_stride +
+                head * layout.attention.head_width,
+            blasExtent(layout.attention.feature_row_stride));
+  });
 }
 
 Error launchBiasTanhValueFp32(Stream stream,
                               const BatchedValueLayout& layout,
                               const float* input,
                               const float* bias,
-                              float* output)
+                              float* output,
+                              PsiFormerDeviceNumericalDiagnostics* diagnostics)
 {
   if (layout.configuration_count == 0 && layout.rows == 0 && layout.width == 0)
     return success;
   validateBatchedValueLayout(layout);
-  if (!input || !bias || !output)
+  if (!input || !bias || !output || !diagnostics)
     throw std::invalid_argument("PsiFormer FP32 bias/tanh storage is null");
   const unsigned int blocks = valueBlockCount(layout.logicalElements());
   biasTanhValueFp32Kernel<<<blocks, value_block_size, 0, stream>>>(
-      layout, input, bias, output);
+      layout, input, bias, output, diagnostics);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else
@@ -470,15 +516,17 @@ Error launchResidualValueFp32(Stream stream,
 Error launchValueFp32ToFp64(Stream stream,
                             const BatchedValueLayout& layout,
                             const float* source,
-                            double* target)
+                            double* target,
+                            PsiFormerDeviceNumericalDiagnostics* diagnostics)
 {
   if (layout.configuration_count == 0 && layout.rows == 0 && layout.width == 0)
     return success;
   validateBatchedValueLayout(layout);
-  if (!source || !target)
+  if (!source || !target || !diagnostics)
     throw std::invalid_argument("PsiFormer FP32-to-FP64 value storage is null");
   const unsigned int blocks = valueBlockCount(layout.logicalElements());
-  valueFp32ToFp64Kernel<<<blocks, value_block_size, 0, stream>>>(layout, source, target);
+  valueFp32ToFp64Kernel<<<blocks, value_block_size, 0, stream>>>(
+      layout, source, target, diagnostics);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else

@@ -17,11 +17,13 @@
 #define QMCPLUSPLUS_PSIFORMER_PRECISION_EXECUTION_H
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorSchedule.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerBlasMathMode.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionPolicy.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 namespace qmcplusplus::psiformer
@@ -51,6 +53,20 @@ struct PsiFormerParameterConversionDiagnostics
   /// Merge an independent tile using saturating counters and maximum errors.
   void merge(const PsiFormerParameterConversionDiagnostics& other) noexcept;
 };
+
+/** One fixed-layout device record with disjoint conversion and execution evidence. */
+struct PsiFormerDeviceNumericalDiagnostics
+{
+  PsiFormerParameterConversionDiagnostics conversion;
+  PsiFormerNumericalDiagnostics execution;
+};
+
+static_assert(std::is_standard_layout_v<PsiFormerParameterConversionDiagnostics>);
+static_assert(std::is_trivially_copyable_v<PsiFormerParameterConversionDiagnostics>);
+static_assert(std::is_standard_layout_v<PsiFormerNumericalDiagnostics>);
+static_assert(std::is_trivially_copyable_v<PsiFormerNumericalDiagnostics>);
+static_assert(std::is_standard_layout_v<PsiFormerDeviceNumericalDiagnostics>);
+static_assert(std::is_trivially_copyable_v<PsiFormerDeviceNumericalDiagnostics>);
 
 /// Describe one checked contiguous FP64-to-FP32 parameter conversion tile.
 struct PsiFormerParameterConversionTile
@@ -90,6 +106,8 @@ struct PsiFormerPrecisionExecutionPlan
 {
   PsiFormerPrecisionPolicy policy = PsiFormerPrecisionPolicy::FP64_REFERENCE;
   PsiFormerBackendMathMode math_mode = PsiFormerBackendMathMode::FP64_STRICT;
+  PsiFormerAcceleratorBackend backend = PsiFormerAcceleratorBackend::CPU;
+  PsiFormerBlasMathModePlan blas_math;
   std::size_t parameter_count = 0;
   std::size_t canonical_source_version = 0;
   std::size_t compute_copy_version      = 0;
@@ -179,6 +197,8 @@ private:
 PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
     PsiFormerPrecisionPolicy policy,
     PsiFormerBackendMathMode math_mode,
+    PsiFormerAcceleratorBackend backend,
+    bool tf32_hardware_supported,
     std::size_t parameter_count,
     std::size_t cast_tile_parameters,
     std::size_t block_size,

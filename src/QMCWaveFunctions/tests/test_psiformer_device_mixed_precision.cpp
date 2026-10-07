@@ -166,6 +166,68 @@ void contextModel(const BatchedAttentionForwardLayout& layout,
         }
 }
 
+/// Apply the device bias/tanh contract, diagnosing before tanh can hide infinities.
+void biasTanhModel(const BatchedValueLayout& layout,
+                   const float* input,
+                   const float* bias,
+                   float* output,
+                   PsiFormerNumericalDiagnostics& diagnostics)
+{
+  for (std::size_t configuration = 0; configuration < layout.configuration_count;
+       ++configuration)
+    for (std::size_t row = 0; row < layout.rows; ++row)
+      for (std::size_t feature = 0; feature < layout.width; ++feature)
+      {
+        const std::size_t offset = layout.offset(configuration, row, feature);
+        const float preactivation = input[offset] + bias[feature];
+        if (!finiteFloat(preactivation))
+        {
+          output[offset] = 0.0F;
+          ++diagnostics.nonfinite_count;
+        }
+        else
+          output[offset] = std::tanh(preactivation);
+      }
+}
+
+/// Add logical FP32 values while leaving all padded storage untouched.
+void residualModel(const BatchedValueLayout& layout,
+                   const float* left,
+                   const float* right,
+                   float* output)
+{
+  for (std::size_t configuration = 0; configuration < layout.configuration_count;
+       ++configuration)
+    for (std::size_t row = 0; row < layout.rows; ++row)
+      for (std::size_t feature = 0; feature < layout.width; ++feature)
+      {
+        const std::size_t offset = layout.offset(configuration, row, feature);
+        output[offset] = left[offset] + right[offset];
+      }
+}
+
+/// Model the final checked FP32-to-FP64 barrier and its deterministic zero poison.
+void promoteModel(const BatchedValueLayout& layout,
+                  const float* source,
+                  double* target,
+                  PsiFormerNumericalDiagnostics& diagnostics)
+{
+  for (std::size_t configuration = 0; configuration < layout.configuration_count;
+       ++configuration)
+    for (std::size_t row = 0; row < layout.rows; ++row)
+      for (std::size_t feature = 0; feature < layout.width; ++feature)
+      {
+        const std::size_t offset = layout.offset(configuration, row, feature);
+        if (!finiteFloat(source[offset]))
+        {
+          target[offset] = 0.0;
+          ++diagnostics.nonfinite_count;
+        }
+        else
+          target[offset] = static_cast<double>(source[offset]);
+      }
+}
+
 /// Return whether an offset is one of the logical values rather than padding.
 bool isLogicalOffset(const BatchedValueLayout& layout, std::size_t offset)
 {
@@ -224,8 +286,10 @@ TEST_CASE("PsiFormer mixed CPU model preserves B greater than one attention mapp
     {
       const std::size_t offset = input * dense.weight_row_stride + output;
       query_weight[offset] = static_cast<float>(0.03 * (1 + input + 2 * output));
-      key_weight[offset]   = static_cast<float>(-0.02 * (1 + 2 * input - output));
-      value_weight[offset] = static_cast<float>(0.04 * (1 - input + output));
+      key_weight[offset] = static_cast<float>(
+          -0.02 * (1.0 + 2.0 * static_cast<double>(input) - static_cast<double>(output)));
+      value_weight[offset] = static_cast<float>(
+          0.04 * (1.0 - static_cast<double>(input) + static_cast<double>(output)));
     }
 
   std::vector<float> query(dense.targetElements(), 101.0F);
@@ -250,6 +314,7 @@ TEST_CASE("PsiFormer mixed CPU model preserves B greater than one attention mapp
       makeBatchedAttentionForwardLayout(configurations, single, 21, 36);
   std::vector<float> weights(attention.attentionElements(), 303.0F);
   logitsModel(attention, query.data(), key.data(), weights.data());
+  const std::vector<float> logits = weights;
   PsiFormerNumericalDiagnostics diagnostics;
   softmaxModel(attention, weights.data(), diagnostics);
   CHECK(diagnostics.nonfinite_count == 0);
@@ -271,23 +336,126 @@ TEST_CASE("PsiFormer mixed CPU model preserves B greater than one attention mapp
   std::vector<float> nonlinear(values.storageElements(), 808.0F);
   std::vector<float> residual(values.storageElements(), 909.0F);
   std::vector<double> promoted(values.storageElements(), -1001.0);
+  biasTanhModel(values, context.data(), bias.data(), nonlinear.data(), diagnostics);
+  residualModel(values, nonlinear.data(), query.data(), residual.data());
+  promoteModel(values, residual.data(), promoted.data(), diagnostics);
+
+  // Build an independent long-double reference for the complete block.  It uses
+  // only source parameters and explicit indices, never an intermediate model value.
+  std::vector<long double> reference_query(values.storageElements(), 0.0L);
+  std::vector<long double> reference_key(values.storageElements(), 0.0L);
+  std::vector<long double> reference_value(values.storageElements(), 0.0L);
   for (std::size_t configuration = 0; configuration < configurations; ++configuration)
     for (std::size_t row = 0; row < rows; ++row)
-      for (std::size_t feature = 0; feature < width; ++feature)
+      for (std::size_t output = 0; output < width; ++output)
       {
-        const std::size_t offset = values.offset(configuration, row, feature);
-        nonlinear[offset] = std::tanh(context[offset] + bias[feature]);
-        residual[offset]  = nonlinear[offset] + query[offset];
-        promoted[offset]  = static_cast<double>(residual[offset]);
-        CHECK(promoted[offset] == static_cast<double>(residual[offset]));
+        const std::size_t dense_row = configuration * rows + row;
+        const std::size_t offset = values.offset(configuration, row, output);
+        for (std::size_t input = 0; input < width; ++input)
+        {
+          const long double source_value = source[dense_row * dense.source_row_stride + input];
+          const std::size_t weight_offset = input * dense.weight_row_stride + output;
+          reference_query[offset] += source_value * query_weight[weight_offset];
+          reference_key[offset] += source_value * key_weight[weight_offset];
+          reference_value[offset] += source_value * value_weight[weight_offset];
+        }
       }
+
+  std::vector<long double> reference_logits(attention.attentionElements(), 0.0L);
+  std::vector<long double> reference_probability(attention.attentionElements(), 0.0L);
+  const long double attention_scale = 1.0L / std::sqrt(static_cast<long double>(2));
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t head = 0; head < single.heads; ++head)
+      for (std::size_t query_row = 0; query_row < rows; ++query_row)
+      {
+        long double maximum = -std::numeric_limits<long double>::max();
+        for (std::size_t key_row = 0; key_row < rows; ++key_row)
+        {
+          long double dot = 0.0L;
+          for (std::size_t feature = 0; feature < single.head_width; ++feature)
+          {
+            const std::size_t headed_feature = head * single.head_width + feature;
+            dot += reference_query[values.offset(configuration, query_row, headed_feature)] *
+                reference_key[values.offset(configuration, key_row, headed_feature)];
+          }
+          const std::size_t offset =
+              attention.attentionOffset(configuration, head, query_row, key_row);
+          reference_logits[offset] = dot * attention_scale;
+          maximum = std::max(maximum, reference_logits[offset]);
+          CHECK(logits[offset] == Catch::Approx(static_cast<float>(reference_logits[offset]))
+                                      .margin(3.0e-6));
+        }
+        long double normalization = 0.0L;
+        for (std::size_t key_row = 0; key_row < rows; ++key_row)
+        {
+          const std::size_t offset =
+              attention.attentionOffset(configuration, head, query_row, key_row);
+          reference_probability[offset] = std::exp(reference_logits[offset] - maximum);
+          normalization += reference_probability[offset];
+        }
+        for (std::size_t key_row = 0; key_row < rows; ++key_row)
+        {
+          const std::size_t offset =
+              attention.attentionOffset(configuration, head, query_row, key_row);
+          reference_probability[offset] /= normalization;
+          CHECK(weights[offset] == Catch::Approx(static_cast<float>(reference_probability[offset]))
+                                       .margin(3.0e-7));
+        }
+      }
+
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t row = 0; row < rows; ++row)
+      for (std::size_t head = 0; head < single.heads; ++head)
+        for (std::size_t feature = 0; feature < single.head_width; ++feature)
+        {
+          const std::size_t headed_feature = head * single.head_width + feature;
+          const std::size_t value_offset =
+              values.offset(configuration, row, headed_feature);
+          long double reference_context = 0.0L;
+          for (std::size_t source_row = 0; source_row < rows; ++source_row)
+            reference_context +=
+                reference_probability[attention.attentionOffset(
+                    configuration, head, row, source_row)] *
+                reference_value[values.offset(configuration, source_row, headed_feature)];
+          const long double reference_nonlinear =
+              std::tanh(reference_context + static_cast<long double>(bias[headed_feature]));
+          const long double reference_residual =
+              reference_nonlinear + reference_query[value_offset];
+          CHECK(context[value_offset] ==
+                Catch::Approx(static_cast<float>(reference_context)).margin(4.0e-6));
+          CHECK(nonlinear[value_offset] ==
+                Catch::Approx(static_cast<float>(reference_nonlinear)).margin(4.0e-6));
+          CHECK(residual[value_offset] ==
+                Catch::Approx(static_cast<float>(reference_residual)).margin(6.0e-6));
+          CHECK(promoted[value_offset] ==
+                Catch::Approx(static_cast<double>(reference_residual)).margin(6.0e-6));
+        }
+  CHECK(diagnostics.nonfinite_count == 0);
+  CHECK(diagnostics.invalid_softmax_count == 0);
+
   for (std::size_t offset = 0; offset < values.storageElements(); ++offset)
     if (!isLogicalOffset(values, offset))
     {
+      CHECK(query[offset] == 101.0F);
+      CHECK(key[offset] == 101.0F);
+      CHECK(value[offset] == 101.0F);
+      CHECK(context[offset] == 707.0F);
       CHECK(nonlinear[offset] == 808.0F);
       CHECK(residual[offset] == 909.0F);
       CHECK(promoted[offset] == -1001.0);
     }
+  for (std::size_t offset = 0; offset < attention.attentionElements(); ++offset)
+  {
+    bool logical = false;
+    for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+      for (std::size_t head = 0; head < single.heads; ++head)
+        for (std::size_t row = 0; row < rows; ++row)
+          for (std::size_t key_row = 0; key_row < rows; ++key_row)
+            logical = logical || offset ==
+                attention.attentionOffset(configuration, head, row, key_row);
+    if (!logical)
+      CHECK(weights[offset] == 303.0F);
+  }
   CHECK(promoted[values.offset(0, 0, 0)] != promoted[values.offset(1, 0, 0)]);
 }
 
@@ -330,6 +498,45 @@ TEST_CASE("PsiFormer mixed sensitive islands require the explicit FP64 cast boun
   CHECK((std::is_same_v<typename MixedDeterminant::input_type, double>));
   CHECK_FALSE((std::is_convertible_v<float*, typename MixedOrbital::input_type*>));
   CHECK_FALSE((std::is_convertible_v<float*, typename MixedDeterminant::input_type*>));
+}
+
+TEST_CASE("PsiFormer mixed nonlinear and promotion barriers expose hidden nonfinite values",
+          "[psiformer][device][mixed_precision]")
+{
+  const BatchedValueLayout layout = makeBatchedValueLayout(2, 2, 3, 5, 13);
+  std::vector<float> input(layout.storageElements(), 71.0F);
+  std::vector<float> nonlinear(layout.storageElements(), 72.0F);
+  std::vector<float> residual(layout.storageElements(), 73.0F);
+  std::vector<double> promoted(layout.storageElements(), 74.0);
+  const std::vector<float> bias{0.25F, 0.5F, -0.75F};
+  for (std::size_t configuration = 0; configuration < layout.configuration_count;
+       ++configuration)
+    for (std::size_t row = 0; row < layout.rows; ++row)
+      for (std::size_t feature = 0; feature < layout.width; ++feature)
+        input[layout.offset(configuration, row, feature)] =
+            static_cast<float>(configuration + row + feature);
+  input[layout.offset(0, 1, 1)] = std::numeric_limits<float>::infinity();
+
+  PsiFormerNumericalDiagnostics diagnostics;
+  biasTanhModel(layout, input.data(), bias.data(), nonlinear.data(), diagnostics);
+  CHECK(nonlinear[layout.offset(0, 1, 1)] == 0.0F);
+  CHECK(diagnostics.nonfinite_count == 1);
+
+  residualModel(layout, nonlinear.data(), input.data(), residual.data());
+  residual[layout.offset(1, 0, 2)] = std::numeric_limits<float>::quiet_NaN();
+  promoteModel(layout, residual.data(), promoted.data(), diagnostics);
+  CHECK(promoted[layout.offset(0, 1, 1)] == 0.0);
+  CHECK(promoted[layout.offset(1, 0, 2)] == 0.0);
+  CHECK(diagnostics.nonfinite_count == 3);
+  CHECK((diagnostics.nonfinite_count != 0 || diagnostics.invalid_softmax_count != 0));
+
+  for (std::size_t offset = 0; offset < layout.storageElements(); ++offset)
+    if (!isLogicalOffset(layout, offset))
+    {
+      CHECK(nonlinear[offset] == 72.0F);
+      CHECK(residual[offset] == 73.0F);
+      CHECK(promoted[offset] == 74.0);
+    }
 }
 
 int main(int argc, char* argv[])

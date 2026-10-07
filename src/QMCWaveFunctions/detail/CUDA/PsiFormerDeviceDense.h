@@ -15,6 +15,7 @@
 #include "PsiFormerDeviceRuntime.h"
 #include "Platforms/Common/AccelBLASHandle.hpp"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAttention.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionExecution.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionPolicy.h"
 
 namespace qmcplusplus::psiformer::device
@@ -62,6 +63,7 @@ void attentionContextForward(AcceleratorBlasHandle& handle,
  * storage type separate without changing the established FP64 entry point.
  */
 void denseForwardFp32(AcceleratorBlasHandle& handle,
+                      const PsiFormerBlasMathModePlan& math_mode,
                       const DenseForwardLayout& layout,
                       const float* source,
                       const float* weight,
@@ -69,6 +71,7 @@ void denseForwardFp32(AcceleratorBlasHandle& handle,
 
 /// Apply three independent FP32 projections into Q, K, and V buffers.
 void projectQkvForwardFp32(AcceleratorBlasHandle& handle,
+                           const PsiFormerBlasMathModePlan& math_mode,
                            const DenseForwardLayout& layout,
                            const float* source,
                            const float* query_weight,
@@ -80,6 +83,7 @@ void projectQkvForwardFp32(AcceleratorBlasHandle& handle,
 
 /// Form configuration-local FP32 attention logits with FP32 GEMM accumulation.
 void attentionLogitsForwardFp32(AcceleratorBlasHandle& handle,
+                                const PsiFormerBlasMathModePlan& math_mode,
                                 const BatchedAttentionForwardLayout& layout,
                                 const float* query,
                                 const float* key,
@@ -92,21 +96,27 @@ void attentionLogitsForwardFp32(AcceleratorBlasHandle& handle,
 Error launchAttentionSoftmaxFp32(Stream stream,
                                  const BatchedAttentionForwardLayout& layout,
                                  float* logits_and_weights,
-                                 PsiFormerNumericalDiagnostics* diagnostics);
+                                 PsiFormerDeviceNumericalDiagnostics* diagnostics);
 
 /// Contract FP32 attention weights with values independently per configuration.
 void attentionContextForwardFp32(AcceleratorBlasHandle& handle,
+                                 const PsiFormerBlasMathModePlan& math_mode,
                                  const BatchedAttentionForwardLayout& layout,
                                  const float* attention,
                                  const float* value,
                                  float* target);
 
-/// Apply tanh(input+bias) to every logical FP32 value while preserving padding.
+/** Apply tanh(input+bias) to every logical FP32 value while preserving padding.
+ *
+ * Non-finite preactivations are counted before tanh can mask infinities and the
+ * corresponding output is deterministically zeroed.
+ */
 Error launchBiasTanhValueFp32(Stream stream,
                               const BatchedValueLayout& layout,
                               const float* input,
                               const float* bias,
-                              float* output);
+                              float* output,
+                              PsiFormerDeviceNumericalDiagnostics* diagnostics);
 
 /// Add two FP32 value tensors elementwise while preserving padding.
 Error launchResidualValueFp32(Stream stream,
@@ -118,12 +128,15 @@ Error launchResidualValueFp32(Stream stream,
 /** Cross the audited ABI barrier from FP32 value storage back into FP64.
  *
  * Orbital assembly, determinants, spatial jets, and reductions consume only the
- * resulting double buffer; no FP32 overload is provided for those APIs.
+ * resulting double buffer; no FP32 overload is provided for those APIs.  Every
+ * logical source value is checked here, and invalid values are counted and
+ * deterministically promoted as zero so orchestration can reject/retry the epoch.
  */
 Error launchValueFp32ToFp64(Stream stream,
                             const BatchedValueLayout& layout,
                             const float* source,
-                            double* target);
+                            double* target,
+                            PsiFormerDeviceNumericalDiagnostics* diagnostics);
 
 } // namespace qmcplusplus::psiformer::device
 

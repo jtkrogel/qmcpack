@@ -517,6 +517,15 @@ add_unit_test(deterministic-unit_test_psiformer_device_mixed_precision
 set_tests_properties(deterministic-unit_test_psiformer_device_mixed_precision
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_blas_math_mode test_psiformer_blas_math_mode.cpp)
+target_link_libraries(test_psiformer_blas_math_mode qmc_external_catch2)
+target_include_directories(test_psiformer_blas_math_mode PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_blas_math_mode
+              1 1 $<TARGET_FILE:test_psiformer_blas_math_mode>)
+set_tests_properties(deterministic-unit_test_psiformer_blas_math_mode
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_device_determinant_math
                test_psiformer_device_determinant_math.cpp)
 target_link_libraries(test_psiformer_device_determinant_math qmc_external_catch2)

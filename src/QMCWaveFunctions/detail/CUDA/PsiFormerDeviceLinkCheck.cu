@@ -87,7 +87,7 @@ int main()
   const bool fp32_tanh_linked =
       launchBiasTanhValueFp32(
           nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
-          nullptr, nullptr, nullptr) == success;
+          nullptr, nullptr, nullptr, nullptr) == success;
   const bool fp32_residual_linked =
       launchResidualValueFp32(
           nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
@@ -95,7 +95,7 @@ int main()
   const bool fp32_to_fp64_linked =
       launchValueFp32ToFp64(
           nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
-          nullptr, nullptr) == success;
+          nullptr, nullptr, nullptr) == success;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
          determinant_spatial_linked && spatial_softmax_linked &&

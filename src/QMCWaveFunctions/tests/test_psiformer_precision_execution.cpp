@@ -12,6 +12,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionExecution.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cmath>
 #include <cstddef>
@@ -82,14 +83,17 @@ TEST_CASE("PsiFormer precision execution accounts two slot pairs exactly",
   const PsiFormerPrecisionExecutionPlan plan = makePsiFormerPrecisionExecutionPlan(
       PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
       PsiFormerBackendMathMode::FP32_STRICT,
+      PsiFormerAcceleratorBackend::CUDA, /*tf32_hardware_supported=*/false,
       /*parameter_count=*/10, /*cast_tile_parameters=*/4, /*block_size=*/3,
       /*device_layout_fingerprint=*/77, /*source_version=*/5,
       /*full_precision_retry_available=*/true);
 
   CHECK(plan.master_slot_bytes == 80);
+  CHECK(plan.backend == PsiFormerAcceleratorBackend::CUDA);
+  CHECK(plan.blas_math.native == PsiFormerNativeBlasMathMode::CUDA_PEDANTIC);
   CHECK(plan.compute_slot_bytes == 40);
   CHECK(plan.conversion_workspace_bytes == 16);
-  CHECK(plan.diagnostic_bytes == sizeof(PsiFormerParameterConversionDiagnostics));
+  CHECK(plan.diagnostic_bytes == sizeof(PsiFormerDeviceNumericalDiagnostics));
   CHECK(plan.arena.slices.size() == 6);
   REQUIRE(plan.arena.find(PsiFormerDeviceArenaRegion::MODEL_PARAMETERS));
   REQUIRE(plan.arena.find(PsiFormerDeviceArenaRegion::MODEL_PARAMETERS_STAGING));
@@ -99,9 +103,15 @@ TEST_CASE("PsiFormer precision execution accounts two slot pairs exactly",
   CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::MODEL_PARAMETERS_STAGING)->offset == 256);
   CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::MODEL_COMPUTE_PARAMETERS_0)->offset == 512);
   CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::MODEL_COMPUTE_PARAMETERS_1)->offset == 768);
-  CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::PRECISION_CONVERSION_WORKSPACE)->offset == 1024);
+  CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::PRECISION_CONVERSION_WORKSPACE)
+            ->offset == 1024);
   CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::NUMERICAL_DIAGNOSTICS)->offset == 1040);
-  CHECK(plan.arena.total_bytes == 1040 + sizeof(PsiFormerParameterConversionDiagnostics));
+  CHECK(plan.arena.total_bytes == 1040 + sizeof(PsiFormerDeviceNumericalDiagnostics));
+  CHECK(offsetof(PsiFormerDeviceNumericalDiagnostics, conversion) == 0);
+  CHECK(offsetof(PsiFormerDeviceNumericalDiagnostics, execution) >=
+        sizeof(PsiFormerParameterConversionDiagnostics));
+  CHECK(plan.arena.find(PsiFormerDeviceArenaRegion::NUMERICAL_DIAGNOSTICS)->bytes ==
+        sizeof(PsiFormerDeviceNumericalDiagnostics));
 
   REQUIRE(plan.conversion.tiles.size() == 3);
   CHECK(plan.conversion.tiles[0].count == 4);
@@ -125,25 +135,30 @@ TEST_CASE("PsiFormer precision execution validates policy and extent boundaries"
 {
   CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
                       PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
-                      PsiFormerBackendMathMode::FP64_STRICT, 4, 2, 32, 1, 1, true),
+                      PsiFormerBackendMathMode::FP64_STRICT,
+                      PsiFormerAcceleratorBackend::CUDA, false, 4, 2, 32, 1, 1, true),
                   std::invalid_argument);
   CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
                       PsiFormerPrecisionPolicy::FP64_REFERENCE,
-                      PsiFormerBackendMathMode::FP64_STRICT, 4, 1, 32, 1, 1, true),
-                  std::invalid_argument);
-  CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
-                      PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
-                      PsiFormerBackendMathMode::FP32_STRICT, 4, 5, 32, 1, 1, true),
+                      PsiFormerBackendMathMode::FP64_STRICT,
+                      PsiFormerAcceleratorBackend::CPU, false, 4, 1, 32, 1, 1, true),
                   std::invalid_argument);
   CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
                       PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
                       PsiFormerBackendMathMode::FP32_STRICT,
+                      PsiFormerAcceleratorBackend::CUDA, false, 4, 5, 32, 1, 1, true),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
+                      PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+                      PsiFormerBackendMathMode::FP32_STRICT,
+                      PsiFormerAcceleratorBackend::CUDA, false,
                       std::numeric_limits<std::size_t>::max(), 1, 32, 1, 1, true),
                   std::overflow_error);
 
   const PsiFormerPrecisionExecutionPlan empty = makePsiFormerPrecisionExecutionPlan(
       PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
-      PsiFormerBackendMathMode::FP32_STRICT, 0, 0, 32, 9, 0, true);
+      PsiFormerBackendMathMode::FP32_STRICT,
+      PsiFormerAcceleratorBackend::CUDA, false, 0, 0, 32, 9, 0, true);
   CHECK(empty.conversion.tiles.empty());
   CHECK(empty.master_slot_bytes == 0);
   CHECK(empty.compute_slot_bytes == 0);
@@ -151,8 +166,34 @@ TEST_CASE("PsiFormer precision execution validates policy and extent boundaries"
 
   const PsiFormerPrecisionExecutionPlan changed_version = makePsiFormerPrecisionExecutionPlan(
       PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
-      PsiFormerBackendMathMode::FP32_STRICT, 0, 0, 32, 9, 1, true);
+      PsiFormerBackendMathMode::FP32_STRICT,
+      PsiFormerAcceleratorBackend::CUDA, false, 0, 0, 32, 9, 1, true);
   CHECK(changed_version.fingerprint != empty.fingerprint);
+
+  const PsiFormerPrecisionExecutionPlan hip = makePsiFormerPrecisionExecutionPlan(
+      PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
+      PsiFormerBackendMathMode::FP32_STRICT,
+      PsiFormerAcceleratorBackend::HIP, false, 0, 0, 32, 9, 0, true);
+  CHECK(hip.blas_math.native == PsiFormerNativeBlasMathMode::HIP_DEFAULT_STRICT);
+  CHECK(hip.fingerprint != empty.fingerprint);
+
+  CHECK_THROWS_WITH(makePsiFormerPrecisionExecutionPlan(
+                        PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+                        PsiFormerBackendMathMode::CUDA_TF32,
+                        PsiFormerAcceleratorBackend::CUDA, false,
+                        0, 0, 32, 9, 0, true),
+                    Catch::Matchers::ContainsSubstring("hardware support"));
+  const PsiFormerPrecisionExecutionPlan tf32 = makePsiFormerPrecisionExecutionPlan(
+      PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+      PsiFormerBackendMathMode::CUDA_TF32,
+      PsiFormerAcceleratorBackend::CUDA, true, 0, 0, 32, 9, 0, true);
+  CHECK(tf32.blas_math.native == PsiFormerNativeBlasMathMode::CUDA_TF32);
+  CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
+                      PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+                      PsiFormerBackendMathMode::CUDA_TF32,
+                      PsiFormerAcceleratorBackend::HIP, true,
+                      0, 0, 32, 9, 0, true),
+                  std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer FP64 to FP32 reference conversion classifies edge values",

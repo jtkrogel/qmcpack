@@ -168,7 +168,8 @@ void PsiFormerMixedPublicationState::begin(std::size_t source_version,
   if (pending_)
     throw std::logic_error("PsiFormer mixed parameter publication is already pending");
   if (source_version <= active_version_)
-    throw std::invalid_argument("PsiFormer mixed publication requires a strictly newer model version");
+    throw std::invalid_argument(
+        "PsiFormer mixed publication requires a strictly newer model version");
   if (execution_fingerprint == 0)
     throw std::invalid_argument("PsiFormer pending precision fingerprint must be nonzero");
 
@@ -181,7 +182,8 @@ PsiFormerMixedPublicationState::Pending&
 PsiFormerMixedPublicationState::matchingPending(std::size_t source_version)
 {
   if (!pending_ || pending_->version != source_version)
-    throw std::logic_error("PsiFormer mixed publication milestone does not match the pending version");
+    throw std::logic_error(
+        "PsiFormer mixed publication milestone does not match the pending version");
   return *pending_;
 }
 
@@ -254,6 +256,8 @@ std::optional<std::uint8_t> PsiFormerMixedPublicationState::pendingSlot() const 
 PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
     PsiFormerPrecisionPolicy policy,
     PsiFormerBackendMathMode math_mode,
+    PsiFormerAcceleratorBackend backend,
+    bool tf32_hardware_supported,
     std::size_t parameter_count,
     std::size_t cast_tile_parameters,
     std::size_t block_size,
@@ -262,8 +266,12 @@ PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
     bool full_precision_retry_available)
 {
   validateMathMode(policy, math_mode);
+  validatePsiFormerPrecisionBackend(policy, backend, tf32_hardware_supported);
+  const PsiFormerBlasMathModePlan blas_math =
+      makePsiFormerBlasMathModePlan(math_mode, backend);
   if (device_layout_fingerprint == 0)
-    throw std::invalid_argument("PsiFormer precision execution requires a nonzero device-layout fingerprint");
+    throw std::invalid_argument(
+        "PsiFormer precision execution requires a nonzero device-layout fingerprint");
   if (block_size == 0)
     throw std::invalid_argument("PsiFormer precision conversion block size must be positive");
 
@@ -272,13 +280,16 @@ PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
     throw std::invalid_argument("PsiFormer FP64 execution does not require a conversion tile");
   if (mixed && parameter_count != 0 &&
       (cast_tile_parameters == 0 || cast_tile_parameters > parameter_count))
-    throw std::invalid_argument("PsiFormer mixed conversion tile must be within the parameter vector");
+    throw std::invalid_argument(
+        "PsiFormer mixed conversion tile must be within the parameter vector");
   if (mixed && parameter_count == 0 && cast_tile_parameters != 0)
     throw std::invalid_argument("PsiFormer empty mixed model requires an empty conversion tile");
 
   PsiFormerPrecisionExecutionPlan plan;
   plan.policy                       = policy;
   plan.math_mode                    = math_mode;
+  plan.backend                      = backend;
+  plan.blas_math                    = blas_math;
   plan.parameter_count              = parameter_count;
   plan.canonical_source_version     = source_version;
   plan.compute_copy_version         = source_version;
@@ -291,7 +302,7 @@ PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
   plan.conversion_workspace_bytes = mixed
       ? checkedBytes(cast_tile_parameters, sizeof(float), "FP32 conversion tile")
       : 0;
-  plan.diagnostic_bytes = mixed ? sizeof(PsiFormerParameterConversionDiagnostics) : 0;
+  plan.diagnostic_bytes = mixed ? sizeof(PsiFormerDeviceNumericalDiagnostics) : 0;
 
   std::vector<PsiFormerDeviceArenaRequest> requests{
       {PsiFormerDeviceArenaRegion::MODEL_PARAMETERS, plan.master_slot_bytes, 256},
@@ -305,7 +316,7 @@ PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
     requests.push_back({PsiFormerDeviceArenaRegion::PRECISION_CONVERSION_WORKSPACE,
                         plan.conversion_workspace_bytes, 256});
     requests.push_back({PsiFormerDeviceArenaRegion::NUMERICAL_DIAGNOSTICS,
-                        plan.diagnostic_bytes, alignof(PsiFormerParameterConversionDiagnostics)});
+                        plan.diagnostic_bytes, alignof(PsiFormerDeviceNumericalDiagnostics)});
   }
   plan.arena = makePsiFormerDeviceArenaLayout(requests);
 
@@ -327,6 +338,9 @@ PsiFormerPrecisionExecutionPlan makePsiFormerPrecisionExecutionPlan(
   mixInteger(hash, UINT64_C(1));
   mixInteger(hash, psiFormerPrecisionPolicyFingerprint(policy));
   mixInteger(hash, static_cast<std::uint8_t>(math_mode));
+  mixInteger(hash, static_cast<std::uint8_t>(backend));
+  mixInteger(hash, static_cast<std::uint8_t>(blas_math.native));
+  mixInteger(hash, blas_math.reduced_multiply ? 1 : 0);
   mixInteger(hash, parameter_count);
   mixInteger(hash, source_version);
   mixInteger(hash, device_layout_fingerprint);
