@@ -234,10 +234,12 @@ void validateDiagnosticSpan(std::size_t offset,
 
 PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
     const DenseForwardLayout& dense,
+    const BatchedValueLayout& dense_source,
     const BatchedAttentionForwardLayout& attention,
     const BatchedValueLayout& value)
 {
   validateDenseForwardLayout(dense);
+  validateBatchedValueLayout(dense_source);
   validateBatchedAttentionForwardLayout(attention);
   validateBatchedValueLayout(value);
 
@@ -248,6 +250,19 @@ PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
   const std::size_t expected_configuration_stride = checkedProduct(
       attention.attention.rows, dense.target_row_stride,
       "PsiFormer mixed feature configuration stride overflow");
+  const std::size_t expected_source_configuration_stride = checkedProduct(
+      attention.attention.rows, dense.source_row_stride,
+      "PsiFormer mixed source configuration stride overflow");
+
+  if (dense_source.configuration_count != attention.configuration_count ||
+      dense_source.rows != attention.attention.rows ||
+      dense_source.width != dense.input_width ||
+      dense_source.row_stride != dense.source_row_stride ||
+      dense_source.configuration_stride !=
+          expected_source_configuration_stride ||
+      dense_source.storageElements() != dense.sourceElements())
+    throw std::invalid_argument(
+        "PsiFormer FP64-to-FP32 source layout is incompatible with dense input");
 
   if (dense.rows != dense_rows || dense.output_width != feature_width ||
       dense.target_row_stride != attention.attention.feature_row_stride ||
@@ -273,6 +288,11 @@ PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
   mixInteger(hash, dense.source_row_stride);
   mixInteger(hash, dense.weight_row_stride);
   mixInteger(hash, dense.target_row_stride);
+  mixInteger(hash, dense_source.configuration_count);
+  mixInteger(hash, dense_source.rows);
+  mixInteger(hash, dense_source.width);
+  mixInteger(hash, dense_source.row_stride);
+  mixInteger(hash, dense_source.configuration_stride);
   mixInteger(hash, attention.configuration_count);
   mixInteger(hash, attention.attention.rows);
   mixInteger(hash, attention.attention.heads);
@@ -288,7 +308,7 @@ PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
   mixInteger(hash, value.row_stride);
   mixInteger(hash, value.configuration_stride);
 
-  return {dense, attention, value, hash == 0 ? 1 : hash};
+  return {dense, dense_source, attention, value, hash == 0 ? 1 : hash};
 }
 
 PsiFormerPrecisionParticipantMetadata makePsiFormerPrecisionParticipantMetadata(
@@ -365,7 +385,8 @@ void PsiFormerPrecisionRecordingOrchestrator::prepare()
   validateRecordingPlan(plan_);
   const PsiFormerMixedValueDescriptors validated_descriptors =
       makePsiFormerMixedValueDescriptors(
-      descriptors_.dense, descriptors_.attention, descriptors_.value);
+          descriptors_.dense, descriptors_.dense_source,
+          descriptors_.attention, descriptors_.value);
   if (validated_descriptors.fingerprint != descriptors_.fingerprint)
     throw std::invalid_argument(
         "PsiFormer mixed value descriptor fingerprint does not match its contents");
@@ -383,13 +404,17 @@ void PsiFormerPrecisionRecordingOrchestrator::prepare()
   const std::size_t nonlinear_and_promotion = checkedProduct(
       descriptors_.value.logicalElements(), 2,
       "PsiFormer diagnostic value-path bound overflow");
+  const std::size_t source_conversion =
+      descriptors_.dense_source.logicalElements();
   const std::size_t sensitive_statuses = checkedProduct(
       descriptors_.attention.configuration_count, 3,
       "PsiFormer diagnostic sensitive-status bound overflow");
   execution_diagnostic_increment_bound_ = checkedSum(
       checkedSum(attention_values, softmax_rows,
                  "PsiFormer diagnostic counter bound overflow"),
-      checkedSum(nonlinear_and_promotion, sensitive_statuses,
+      checkedSum(checkedSum(nonlinear_and_promotion, source_conversion,
+                            "PsiFormer diagnostic counter bound overflow"),
+                 sensitive_statuses,
                  "PsiFormer diagnostic counter bound overflow"),
       "PsiFormer diagnostic counter bound overflow");
 
@@ -698,9 +723,8 @@ void PsiFormerPrecisionRecordingOrchestrator::recordValueEvaluationStart(
       PsiFormerPrecisionRecordEventKind::EXECUTION_DIAGNOSTICS_CLEAR,
       execution_offset, sizeof(PsiFormerNumericalDiagnostics), version, slot);
 
-  const std::size_t dense_source_values = checkedProduct(
-      descriptors_.dense.rows, descriptors_.dense.input_width,
-      "PsiFormer mixed dense source event extent overflow");
+  const std::size_t dense_source_values =
+      descriptors_.dense_source.logicalElements();
   const std::size_t value_count = descriptors_.value.logicalElements();
 
   PsiFormerPrecisionRecordEvent fp32_input;

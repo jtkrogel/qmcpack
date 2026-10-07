@@ -31,6 +31,7 @@ namespace qmcplusplus::psiformer
 struct PsiFormerMixedValueDescriptors
 {
   DenseForwardLayout dense;
+  BatchedValueLayout dense_source;
   BatchedAttentionForwardLayout attention;
   BatchedValueLayout value;
   std::uint64_t fingerprint = 0;
@@ -42,6 +43,7 @@ static_assert(std::is_trivially_copyable_v<PsiFormerMixedValueDescriptors>);
 /** Construct and validate one deterministic mixed-value descriptor identity. */
 PsiFormerMixedValueDescriptors makePsiFormerMixedValueDescriptors(
     const DenseForwardLayout& dense,
+    const BatchedValueLayout& dense_source,
     const BatchedAttentionForwardLayout& attention,
     const BatchedValueLayout& value);
 
@@ -104,7 +106,6 @@ enum class PsiFormerPrecisionRecordEventKind : std::uint8_t
   PARAMETER_PUBLICATION,
   PARAMETER_CANCELLATION,
   EXECUTION_DIAGNOSTICS_CLEAR,
-  // Contract-only until A7 supplies the initial FP64 feature/value cast leaf.
   VALUE_FP64_TO_FP32,
   VALUE_FP32_NETWORK,
   VALUE_FP32_TO_FP64,
@@ -179,9 +180,8 @@ enum class PsiFormerPrecisionEvaluationResult : std::uint8_t
  * completion and diagnostic-readback barriers have completed.
  *
  * Value/retry records remain contract-only until Task 26.A8 provides production value
- * and retry workspaces/dispatch.  The initial FP64-to-FP32 value cast also awaits its
- * Task 27.A7 device leaf.  Host-recorder allocation tests make no production-runtime
- * allocation claim.
+ * and retry workspaces/dispatch.  Host-recorder allocation tests make no
+ * production-runtime allocation claim.
  */
 class PsiFormerPrecisionRecordingOrchestrator
 {

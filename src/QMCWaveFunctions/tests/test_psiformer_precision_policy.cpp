@@ -123,6 +123,18 @@ TEST_CASE("PsiFormer precision backend validation never enables TF32 implicitly"
                       PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
                       PsiFormerAcceleratorBackend::SYCL, true),
                   std::invalid_argument);
+  CHECK_THROWS_AS(validatePsiFormerPrecisionBackend(
+                      PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+                      PsiFormerAcceleratorBackend::CPU, true),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(validatePsiFormerPrecisionBackend(
+                      PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+                      PsiFormerAcceleratorBackend::HIP, true),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(validatePsiFormerPrecisionBackend(
+                      PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+                      PsiFormerAcceleratorBackend::OPENMP_TARGET, true),
+                  std::invalid_argument);
   CHECK_THROWS_WITH(validatePsiFormerPrecisionBackend(
                         PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
                         PsiFormerAcceleratorBackend::CUDA, false),

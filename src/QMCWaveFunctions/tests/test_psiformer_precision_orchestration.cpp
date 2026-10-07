@@ -122,10 +122,14 @@ PsiFormerMixedValueDescriptors makeDescriptors()
           /*configuration_count=*/2, attention,
           /*feature_configuration_stride=*/21,
           /*attention_configuration_stride=*/36);
+  const BatchedValueLayout dense_source = makeBatchedValueLayout(
+      /*configuration_count=*/2, /*rows=*/3, /*width=*/5,
+      /*row_stride=*/7, /*configuration_stride=*/21);
   const BatchedValueLayout value = makeBatchedValueLayout(
       /*configuration_count=*/2, /*rows=*/3, /*width=*/4,
       /*row_stride=*/7, /*configuration_stride=*/21);
-  return makePsiFormerMixedValueDescriptors(dense, batched, value);
+  return makePsiFormerMixedValueDescriptors(
+      dense, dense_source, batched, value);
 }
 
 /// Construct one exact mixed plan for the requested canonical version.
@@ -161,6 +165,7 @@ TEST_CASE("PsiFormer mixed descriptors require one exact padded interpretation",
   const PsiFormerMixedValueDescriptors descriptors = makeDescriptors();
   CHECK(descriptors.fingerprint != 0);
   CHECK(descriptors.dense.targetElements() == 39);
+  CHECK(descriptors.dense_source.storageElements() == 40);
   CHECK(descriptors.attention.featureElements() == 39);
   CHECK(descriptors.value.storageElements() == 39);
   CHECK(makeDescriptors().fingerprint == descriptors.fingerprint);
@@ -168,25 +173,36 @@ TEST_CASE("PsiFormer mixed descriptors require one exact padded interpretation",
   DenseForwardLayout bad_dense = descriptors.dense;
   bad_dense.rows = 5;
   CHECK_THROWS_AS(makePsiFormerMixedValueDescriptors(
-                      bad_dense, descriptors.attention, descriptors.value),
+                      bad_dense, descriptors.dense_source,
+                      descriptors.attention, descriptors.value),
                   std::invalid_argument);
 
   bad_dense = descriptors.dense;
   bad_dense.output_width = 3;
   CHECK_THROWS_AS(makePsiFormerMixedValueDescriptors(
-                      bad_dense, descriptors.attention, descriptors.value),
+                      bad_dense, descriptors.dense_source,
+                      descriptors.attention, descriptors.value),
                   std::invalid_argument);
+
+  BatchedValueLayout bad_source = descriptors.dense_source;
+  bad_source.configuration_stride += 1;
+  CHECK_THROWS_WITH(makePsiFormerMixedValueDescriptors(
+                        descriptors.dense, bad_source,
+                        descriptors.attention, descriptors.value),
+                    Catch::Matchers::ContainsSubstring("source layout"));
 
   BatchedAttentionForwardLayout bad_attention = descriptors.attention;
   bad_attention.feature_configuration_stride += 1;
   CHECK_THROWS_AS(makePsiFormerMixedValueDescriptors(
-                      descriptors.dense, bad_attention, descriptors.value),
+                      descriptors.dense, descriptors.dense_source,
+                      bad_attention, descriptors.value),
                   std::invalid_argument);
 
   BatchedValueLayout bad_value = descriptors.value;
   bad_value.row_stride += 1;
   CHECK_THROWS_AS(makePsiFormerMixedValueDescriptors(
-                      descriptors.dense, descriptors.attention, bad_value),
+                      descriptors.dense, descriptors.dense_source,
+                      descriptors.attention, bad_value),
                   std::invalid_argument);
 }
 
@@ -377,6 +393,7 @@ TEST_CASE("PsiFormer mixed value graph records boundaries and one bounded retry"
   CHECK(ordinary[0].diagnostic_bytes == sizeof(PsiFormerNumericalDiagnostics));
   CHECK(ordinary[1].kind ==
         PsiFormerPrecisionRecordEventKind::VALUE_FP64_TO_FP32);
+  CHECK(ordinary[1].count == 30);
   CHECK(ordinary[2].kind ==
         PsiFormerPrecisionRecordEventKind::VALUE_FP32_NETWORK);
   CHECK(ordinary[2].source_region ==
@@ -396,7 +413,7 @@ TEST_CASE("PsiFormer mixed value graph records boundaries and one bounded retry"
   CHECK(ordinary[8].kind ==
         PsiFormerPrecisionRecordEventKind::EVALUATION_COMPLETE);
   CHECK(ordinary[8].diagnostic_epoch == ordinary[0].diagnostic_epoch);
-  CHECK(recorder.executionDiagnosticIncrementBound() == 102);
+  CHECK(recorder.executionDiagnosticIncrementBound() == 132);
 
   PsiFormerNumericalDiagnostics mixed_invalid;
   mixed_invalid.nonfinite_count = 1;

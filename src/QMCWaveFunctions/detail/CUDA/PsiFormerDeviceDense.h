@@ -125,6 +125,18 @@ Error launchResidualValueFp32(Stream stream,
                               const float* right,
                               float* output);
 
+/** Cast padded logical FP64 feature/value storage into FP32 dense input.
+ *
+ * Non-finite values and finite magnitudes beyond ``FLT_MAX`` are counted in
+ * execution diagnostics and deterministically written as zero.  Padding remains
+ * untouched, forcing the later orchestration decision to retry the whole batch.
+ */
+Error launchValueFp64ToFp32(Stream stream,
+                            const BatchedValueLayout& layout,
+                            const double* source,
+                            float* target,
+                            PsiFormerDeviceNumericalDiagnostics* diagnostics);
+
 /** Cross the audited ABI barrier from FP32 value storage back into FP64.
  *
  * Orbital assembly, determinants, spatial jets, and reductions consume only the

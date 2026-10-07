@@ -92,6 +92,10 @@ int main()
       launchResidualValueFp32(
           nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
           nullptr, nullptr, nullptr) == success;
+  const bool fp64_to_fp32_linked =
+      launchValueFp64ToFp32(
+          nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
+          nullptr, nullptr, nullptr) == success;
   const bool fp32_to_fp64_linked =
       launchValueFp32ToFp64(
           nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
@@ -105,7 +109,7 @@ int main()
          final_spatial_linked && open_orbital_linked && precision_conversion_linked &&
          fp32_dense_linked && fp32_qkv_linked && fp32_logits_linked &&
          fp32_context_linked && fp32_softmax_linked && fp32_tanh_linked &&
-         fp32_residual_linked && fp32_to_fp64_linked
+         fp32_residual_linked && fp64_to_fp32_linked && fp32_to_fp64_linked
       ? 0
       : 1;
 }

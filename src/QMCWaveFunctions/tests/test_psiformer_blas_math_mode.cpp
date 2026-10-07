@@ -107,8 +107,16 @@ TEST_CASE("PsiFormer BLAS math modes map to enforceable CUDA and HIP behavior",
                       PsiFormerAcceleratorBackend::CPU),
                   std::invalid_argument);
   CHECK_THROWS_AS(makePsiFormerBlasMathModePlan(
-                      PsiFormerBackendMathMode::FP64_STRICT,
+                      PsiFormerBackendMathMode::CUDA_TF32,
+                      PsiFormerAcceleratorBackend::CPU),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(makePsiFormerBlasMathModePlan(
+                      PsiFormerBackendMathMode::CUDA_TF32,
                       PsiFormerAcceleratorBackend::SYCL),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(makePsiFormerBlasMathModePlan(
+                      PsiFormerBackendMathMode::CUDA_TF32,
+                      PsiFormerAcceleratorBackend::OPENMP_TARGET),
                   std::invalid_argument);
   CHECK(std::string(psiFormerNativeBlasMathModeName(cuda_fp32.native)) ==
         "cuda_pedantic");

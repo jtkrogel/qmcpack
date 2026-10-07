@@ -218,6 +218,38 @@ __global__ void residualValueFp32Kernel(BatchedValueLayout layout,
   output[offset] = left[offset] + right[offset];
 }
 
+/** Cast FP64 logical values to FP32 while diagnosing unrepresentable inputs. */
+__global__ void valueFp64ToFp32Kernel(BatchedValueLayout layout,
+                                      const double* source,
+                                      float* target,
+                                      PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  const std::size_t logical =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (logical >= layout.configuration_count * layout.rows * layout.width)
+    return;
+  const std::size_t feature = logical % layout.width;
+  const std::size_t row_index = logical / layout.width;
+  const std::size_t row = row_index % layout.rows;
+  const std::size_t configuration = row_index / layout.rows;
+  const std::size_t offset = configuration * layout.configuration_stride +
+      row * layout.row_stride + feature;
+  const double value = source[offset];
+  const unsigned long long magnitude_bits =
+      static_cast<unsigned long long>(__double_as_longlong(value)) &
+      0x7fffffffffffffffULL;
+  const unsigned long long fp32_max_bits = static_cast<unsigned long long>(
+      __double_as_longlong(static_cast<double>(FLT_MAX)));
+  if (!finiteDouble(value) || magnitude_bits > fp32_max_bits)
+  {
+    target[offset] = 0.0F;
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.nonfinite_count),
+              1ULL);
+    return;
+  }
+  target[offset] = static_cast<float>(value);
+}
+
 /// Cross the explicit value-path type barrier while leaving padding untouched.
 __global__ void valueFp32ToFp64Kernel(BatchedValueLayout layout,
                                       const float* source,
@@ -506,6 +538,27 @@ Error launchResidualValueFp32(Stream stream,
   const unsigned int blocks = valueBlockCount(layout.logicalElements());
   residualValueFp32Kernel<<<blocks, value_block_size, 0, stream>>>(
       layout, left, right, output);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+Error launchValueFp64ToFp32(Stream stream,
+                            const BatchedValueLayout& layout,
+                            const double* source,
+                            float* target,
+                            PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  if (layout.configuration_count == 0 && layout.rows == 0 && layout.width == 0)
+    return success;
+  validateBatchedValueLayout(layout);
+  if (!source || !target || !diagnostics)
+    throw std::invalid_argument("PsiFormer FP64-to-FP32 value storage is null");
+  const unsigned int blocks = valueBlockCount(layout.logicalElements());
+  valueFp64ToFp32Kernel<<<blocks, value_block_size, 0, stream>>>(
+      layout, source, target, diagnostics);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else

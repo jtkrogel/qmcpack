@@ -59,6 +59,52 @@ bool finiteFloat(float value) noexcept
   return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
+/// Return the exact IEEE binary32 representation for signed-zero checks.
+std::uint32_t floatBits(float value) noexcept
+{
+  std::uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+/// Classify binary64 and its FP32 range without trusting fast-math comparisons.
+bool representableAsFloat(double value) noexcept
+{
+  std::uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint64_t magnitude = bits & UINT64_C(0x7fffffffffffffff);
+  if ((magnitude & UINT64_C(0x7ff0000000000000)) ==
+      UINT64_C(0x7ff0000000000000))
+    return false;
+
+  const double fp32_max = static_cast<double>(std::numeric_limits<float>::max());
+  std::uint64_t fp32_max_bits;
+  std::memcpy(&fp32_max_bits, &fp32_max, sizeof(fp32_max_bits));
+  return magnitude <= fp32_max_bits;
+}
+
+/// Model the padded device FP64-to-FP32 value boundary and retry evidence.
+void castValueFp64ToFp32Model(const BatchedValueLayout& layout,
+                             const double* source,
+                             float* target,
+                             PsiFormerNumericalDiagnostics& diagnostics)
+{
+  for (std::size_t configuration = 0; configuration < layout.configuration_count;
+       ++configuration)
+    for (std::size_t row = 0; row < layout.rows; ++row)
+      for (std::size_t feature = 0; feature < layout.width; ++feature)
+      {
+        const std::size_t offset = layout.offset(configuration, row, feature);
+        if (!representableAsFloat(source[offset]))
+        {
+          target[offset] = 0.0F;
+          ++diagnostics.nonfinite_count;
+        }
+        else
+          target[offset] = static_cast<float>(source[offset]);
+      }
+}
+
 /// Apply the deliberately simple row-major FP32 dense arithmetic model.
 void denseModel(const DenseForwardLayout& layout,
                 const float* source,
@@ -488,6 +534,49 @@ TEST_CASE("PsiFormer mixed softmax uses FP64 reductions and diagnoses invalid ro
   for (std::size_t key = 0; key < 3; ++key)
     CHECK(values[batch.attentionOffset(1, 0, 1, key)] == 0.0F);
   CHECK((diagnostics.nonfinite_count != 0 || diagnostics.invalid_softmax_count != 0));
+}
+
+TEST_CASE("PsiFormer FP64 value cast diagnoses range hazards and preserves padding",
+          "[psiformer][device][mixed_precision]")
+{
+  const BatchedValueLayout layout = makeBatchedValueLayout(
+      /*configuration_count=*/2, /*rows=*/2, /*width=*/4,
+      /*row_stride=*/6, /*configuration_stride=*/14);
+  std::vector<double> source(layout.storageElements(), 911.0);
+  std::vector<float> target(layout.storageElements(), 733.0F);
+  for (std::size_t configuration = 0; configuration < layout.configuration_count;
+       ++configuration)
+    for (std::size_t row = 0; row < layout.rows; ++row)
+      for (std::size_t feature = 0; feature < layout.width; ++feature)
+        source[layout.offset(configuration, row, feature)] =
+            0.125 * static_cast<double>(1 + configuration + row + feature);
+
+  const double fp32_max = static_cast<double>(std::numeric_limits<float>::max());
+  source[layout.offset(0, 0, 0)] = -0.0;
+  source[layout.offset(0, 0, 1)] = fp32_max;
+  source[layout.offset(0, 0, 2)] =
+      std::nextafter(fp32_max, std::numeric_limits<double>::infinity());
+  source[layout.offset(0, 0, 3)] = -2.0 * fp32_max;
+  source[layout.offset(1, 0, 0)] = std::numeric_limits<double>::infinity();
+  source[layout.offset(1, 0, 1)] =
+      std::numeric_limits<double>::quiet_NaN();
+
+  PsiFormerNumericalDiagnostics diagnostics;
+  castValueFp64ToFp32Model(
+      layout, source.data(), target.data(), diagnostics);
+  CHECK(floatBits(target[layout.offset(0, 0, 0)]) == UINT32_C(0x80000000));
+  CHECK(target[layout.offset(0, 0, 1)] == std::numeric_limits<float>::max());
+  CHECK(target[layout.offset(0, 0, 2)] == 0.0F);
+  CHECK(target[layout.offset(0, 0, 3)] == 0.0F);
+  CHECK(target[layout.offset(1, 0, 0)] == 0.0F);
+  CHECK(target[layout.offset(1, 0, 1)] == 0.0F);
+  CHECK(diagnostics.nonfinite_count == 4);
+  CHECK((diagnostics.nonfinite_count != 0 ||
+         diagnostics.invalid_softmax_count != 0));
+
+  for (std::size_t offset = 0; offset < layout.storageElements(); ++offset)
+    if (!isLogicalOffset(layout, offset))
+      CHECK(target[offset] == 733.0F);
 }
 
 TEST_CASE("PsiFormer mixed sensitive islands require the explicit FP64 cast boundary",
