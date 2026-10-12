@@ -105,6 +105,127 @@ TEST_CASE("PsiFormer accelerator backend selection fails closed", "[wavefunction
   CHECK(selectPsiFormerAcceleratorBackend("auto", support) == PsiFormerAcceleratorBackend::CUDA);
 }
 
+TEST_CASE("PsiFormer production accelerator resolution applies every readiness gate",
+          "[wavefunction][psiformer][accelerator]")
+{
+  PsiFormerAcceleratorReadiness readiness;
+
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("auto", readiness, 0),
+                  std::invalid_argument);
+  readiness.cuda.operation_coverage = UINT32_C(1) << 31;
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("auto", readiness),
+                  std::invalid_argument);
+  readiness.cuda.operation_coverage = 0;
+
+  PsiFormerAcceleratorReadiness selective_validation;
+  selective_validation.cuda = {true, true, allPsiFormerAcceleratorOperations(),
+                               PsiFormerRuntimeValidation::PASSED};
+  selective_validation.hip.operation_coverage = UINT32_C(1) << 31;
+  CHECK(resolvePsiFormerAcceleratorRequest("auto", selective_validation).backend ==
+        PsiFormerAcceleratorBackend::CUDA);
+  CHECK(resolvePsiFormerAcceleratorRequest("cuda", selective_validation).backend ==
+        PsiFormerAcceleratorBackend::CUDA);
+  selective_validation.cuda.operation_coverage = UINT32_C(1) << 31;
+  selective_validation.hip = {true, true, allPsiFormerAcceleratorOperations(),
+                              PsiFormerRuntimeValidation::PASSED};
+  CHECK(resolvePsiFormerAcceleratorRequest("hip", selective_validation).backend ==
+        PsiFormerAcceleratorBackend::HIP);
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("auto", selective_validation),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(resolvePsiFormerAcceleratorRequest("mystery", selective_validation),
+                  std::invalid_argument);
+  CHECK_THROWS_WITH(resolvePsiFormerAcceleratorRequest("sycl", selective_validation),
+                    Catch::Matchers::ContainsSubstring("no production executor"));
+
+  // Explicit CPU requests do not inspect runtime accelerator state and are not fallbacks.
+  for (const std::string request : {"", "no", "CPU"})
+  {
+    const PsiFormerAcceleratorResolution result =
+        resolvePsiFormerAcceleratorRequest(request, readiness);
+    CHECK(result.backend == PsiFormerAcceleratorBackend::CPU);
+    CHECK(result.reason == PsiFormerAcceleratorResolutionReason::CPU_REQUESTED);
+    CHECK(result.readiness_records_consulted == 0);
+    CHECK(result.fallback_count == 0);
+  }
+
+  PsiFormerAcceleratorResolution result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.backend == PsiFormerAcceleratorBackend::CPU);
+  CHECK(result.reason == PsiFormerAcceleratorResolutionReason::NOT_COMPILED);
+  CHECK(result.readiness_records_consulted == 2);
+  CHECK(result.fallback_count == 1);
+
+  readiness.cuda.compiled = true;
+  result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.reason == PsiFormerAcceleratorResolutionReason::NO_USABLE_DEVICE);
+
+  readiness.cuda.usable_device = true;
+  result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.reason == PsiFormerAcceleratorResolutionReason::INCOMPLETE_OPERATION_COVERAGE);
+
+  readiness.cuda.operation_coverage = allPsiFormerAcceleratorOperations();
+  result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.reason == PsiFormerAcceleratorResolutionReason::RUNTIME_VALIDATION_NOT_RUN);
+
+  readiness.cuda.runtime_validation = PsiFormerRuntimeValidation::FAILED;
+  result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.reason == PsiFormerAcceleratorResolutionReason::RUNTIME_VALIDATION_FAILED);
+
+  readiness.cuda.runtime_validation = PsiFormerRuntimeValidation::PASSED;
+  result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.backend == PsiFormerAcceleratorBackend::CUDA);
+  CHECK(result.reason == PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY);
+  CHECK(result.readiness_records_consulted == 1);
+  CHECK(result.fallback_count == 0);
+
+  // Auto may pass an unusable preferred family and select a fully ready HIP path.
+  readiness.cuda.usable_device = false;
+  readiness.hip = {true, true, allPsiFormerAcceleratorOperations(),
+                   PsiFormerRuntimeValidation::PASSED};
+  result = resolvePsiFormerAcceleratorRequest("auto", readiness);
+  CHECK(result.backend == PsiFormerAcceleratorBackend::HIP);
+  CHECK(result.readiness_records_consulted == 2);
+
+  // Strict yes selects the preferred compiled family and never silently falls back.
+  CHECK_THROWS_WITH(resolvePsiFormerAcceleratorRequest("yes", readiness),
+                    Catch::Matchers::ContainsSubstring("no usable runtime device"));
+  CHECK(resolvePsiFormerAcceleratorRequest("hip", readiness).backend ==
+        PsiFormerAcceleratorBackend::HIP);
+  CHECK_THROWS_WITH(resolvePsiFormerAcceleratorRequest("cuda", readiness),
+                    Catch::Matchers::ContainsSubstring("no usable runtime device"));
+  CHECK_THROWS_WITH(resolvePsiFormerAcceleratorRequest("sycl", readiness),
+                    Catch::Matchers::ContainsSubstring("no production executor"));
+  CHECK_THROWS_WITH(resolvePsiFormerAcceleratorRequest("omptarget", readiness),
+                    Catch::Matchers::ContainsSubstring("no production executor"));
+
+  PsiFormerAcceleratorReadiness hip_only;
+  hip_only.hip = {true, true, allPsiFormerAcceleratorOperations(),
+                  PsiFormerRuntimeValidation::PASSED};
+  const PsiFormerAcceleratorResolution yes_hip =
+      resolvePsiFormerAcceleratorRequest("yes", hip_only);
+  CHECK(yes_hip.backend == PsiFormerAcceleratorBackend::HIP);
+  CHECK(yes_hip.readiness_records_consulted == 2);
+  CHECK(resolvePsiFormerAcceleratorRequest("hip", hip_only).readiness_records_consulted == 1);
+
+  PsiFormerAcceleratorReadiness cuda_only;
+  cuda_only.cuda = {true, true, allPsiFormerAcceleratorOperations(),
+                    PsiFormerRuntimeValidation::PASSED};
+  CHECK(resolvePsiFormerAcceleratorRequest("yes", cuda_only).readiness_records_consulted == 1);
+  CHECK(resolvePsiFormerAcceleratorRequest("cuda", cuda_only).readiness_records_consulted == 1);
+
+  // A focused route may request a strict subset, but linked leaves still grant no bits.
+  readiness.cuda.usable_device = true;
+  readiness.cuda.operation_coverage = acceleratorOperationBit(PsiFormerAcceleratorOperation::VALUES);
+  readiness.cuda.runtime_validation = PsiFormerRuntimeValidation::PASSED;
+  CHECK(resolvePsiFormerAcceleratorRequest(
+            "cuda", readiness,
+            acceleratorOperationBit(PsiFormerAcceleratorOperation::VALUES)).backend ==
+        PsiFormerAcceleratorBackend::CUDA);
+  CHECK_THROWS_WITH(resolvePsiFormerAcceleratorRequest(
+                        "cuda", readiness,
+                        acceleratorOperationBit(PsiFormerAcceleratorOperation::VGL)),
+                    Catch::Matchers::ContainsSubstring("incomplete end-to-end operation coverage"));
+}
+
 TEST_CASE("PsiFormer device layout is pointer-free and deterministic",
           "[wavefunction][psiformer][accelerator]")
 {

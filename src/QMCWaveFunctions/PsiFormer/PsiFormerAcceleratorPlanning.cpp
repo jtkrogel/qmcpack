@@ -52,6 +52,46 @@ std::string normalizedToken(std::string_view input)
                            "' is not compiled into this executable");
 }
 
+/// Return the readiness record for a supported production accelerator backend.
+const PsiFormerAcceleratorBackendReadiness& readinessFor(
+    PsiFormerAcceleratorBackend backend,
+    const PsiFormerAcceleratorReadiness& readiness)
+{
+  if (backend == PsiFormerAcceleratorBackend::CUDA)
+    return readiness.cuda;
+  if (backend == PsiFormerAcceleratorBackend::HIP)
+    return readiness.hip;
+  throw std::logic_error("PsiFormer readiness requested for a backend without a production executor");
+}
+
+/// Return the first failed production-readiness gate, or ACCELERATOR_READY.
+PsiFormerAcceleratorResolutionReason readinessReason(
+    const PsiFormerAcceleratorBackendReadiness& readiness,
+    PsiFormerAcceleratorOperationMask required_operations) noexcept
+{
+  if (!readiness.compiled)
+    return PsiFormerAcceleratorResolutionReason::NOT_COMPILED;
+  if (!readiness.usable_device)
+    return PsiFormerAcceleratorResolutionReason::NO_USABLE_DEVICE;
+  if ((readiness.operation_coverage & required_operations) != required_operations)
+    return PsiFormerAcceleratorResolutionReason::INCOMPLETE_OPERATION_COVERAGE;
+  if (readiness.runtime_validation == PsiFormerRuntimeValidation::NOT_RUN)
+    return PsiFormerAcceleratorResolutionReason::RUNTIME_VALIDATION_NOT_RUN;
+  if (readiness.runtime_validation == PsiFormerRuntimeValidation::FAILED)
+    return PsiFormerAcceleratorResolutionReason::RUNTIME_VALIDATION_FAILED;
+  return PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY;
+}
+
+/// Throw a strict-request diagnostic naming the first failed readiness gate.
+[[noreturn]] void throwNotReady(PsiFormerAcceleratorBackend backend,
+                                PsiFormerAcceleratorResolutionReason reason)
+{
+  throw std::runtime_error(std::string("PsiFormer accelerator backend '") +
+                           psiFormerAcceleratorBackendName(backend) +
+                           "' is not production-ready: " +
+                           psiFormerAcceleratorResolutionReasonName(reason));
+}
+
 } // namespace
 
 bool PsiFormerCompiledAcceleratorSupport::supports(PsiFormerAcceleratorBackend backend) const noexcept
@@ -176,6 +216,101 @@ PsiFormerAcceleratorBackend selectPsiFormerAcceleratorBackend(
   if (!support.supports(selected))
     throwUnavailable(selected);
   return selected;
+}
+
+PsiFormerAcceleratorResolution resolvePsiFormerAcceleratorRequest(
+    std::string_view request,
+    const PsiFormerAcceleratorReadiness& readiness,
+    PsiFormerAcceleratorOperationMask required_operations)
+{
+  const std::string value = normalizedToken(request);
+  if (value == "omptarget" || value == "sycl")
+    throw std::runtime_error(std::string("PsiFormer accelerator backend '") + value +
+                             "' has no production executor");
+  const bool cpu_requested = value.empty() || value == "no" || value == "cpu";
+  if (!cpu_requested && value != "auto" && value != "yes" && value != "cuda" && value != "hip")
+    throw std::invalid_argument("PsiFormer gpu must be no, cpu, auto, yes, omptarget, cuda, hip, or sycl");
+  if (required_operations == 0 ||
+      (required_operations & ~allPsiFormerAcceleratorOperations()) != 0)
+    throw std::invalid_argument("PsiFormer accelerator request requires a nonzero known operation mask");
+  if (cpu_requested)
+    return {};
+
+  const auto inspect = [&](PsiFormerAcceleratorBackend backend) {
+    const PsiFormerAcceleratorBackendReadiness& backend_readiness =
+        readinessFor(backend, readiness);
+    if ((backend_readiness.operation_coverage &
+         ~allPsiFormerAcceleratorOperations()) != 0)
+      throw std::invalid_argument("PsiFormer accelerator readiness contains unknown operation bits");
+    return readinessReason(backend_readiness, required_operations);
+  };
+
+  if (value == "auto")
+  {
+    PsiFormerAcceleratorResolutionReason fallback_reason =
+        PsiFormerAcceleratorResolutionReason::NOT_COMPILED;
+    std::size_t consulted = 0;
+    for (const PsiFormerAcceleratorBackend backend :
+         {PsiFormerAcceleratorBackend::CUDA, PsiFormerAcceleratorBackend::HIP})
+    {
+      const PsiFormerAcceleratorResolutionReason reason = inspect(backend);
+      ++consulted;
+      if (reason == PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY)
+        return {backend, reason, consulted, 0};
+      if (fallback_reason == PsiFormerAcceleratorResolutionReason::NOT_COMPILED ||
+          reason != PsiFormerAcceleratorResolutionReason::NOT_COMPILED)
+        fallback_reason = reason;
+    }
+    return {PsiFormerAcceleratorBackend::CPU, fallback_reason, consulted, 1};
+  }
+
+  PsiFormerAcceleratorBackend selected = PsiFormerAcceleratorBackend::CUDA;
+  std::size_t consulted = 1;
+  if (value == "hip")
+    selected = PsiFormerAcceleratorBackend::HIP;
+  else if (value == "yes")
+  {
+    if (readiness.cuda.compiled)
+      selected = PsiFormerAcceleratorBackend::CUDA;
+    else if (readiness.hip.compiled)
+    {
+      selected = PsiFormerAcceleratorBackend::HIP;
+      consulted = 2;
+    }
+    else
+      throwNotReady(PsiFormerAcceleratorBackend::CUDA,
+                    PsiFormerAcceleratorResolutionReason::NOT_COMPILED);
+  }
+
+  const PsiFormerAcceleratorResolutionReason reason = inspect(selected);
+  if (reason != PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY)
+    throwNotReady(selected, reason);
+  return {selected, reason, consulted, 0};
+}
+
+const char* psiFormerAcceleratorResolutionReasonName(
+    PsiFormerAcceleratorResolutionReason reason) noexcept
+{
+  switch (reason)
+  {
+  case PsiFormerAcceleratorResolutionReason::CPU_REQUESTED:
+    return "cpu requested";
+  case PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY:
+    return "accelerator ready";
+  case PsiFormerAcceleratorResolutionReason::NOT_COMPILED:
+    return "backend not compiled";
+  case PsiFormerAcceleratorResolutionReason::NO_USABLE_DEVICE:
+    return "no usable runtime device";
+  case PsiFormerAcceleratorResolutionReason::INCOMPLETE_OPERATION_COVERAGE:
+    return "incomplete end-to-end operation coverage";
+  case PsiFormerAcceleratorResolutionReason::RUNTIME_VALIDATION_NOT_RUN:
+    return "runtime validation not run";
+  case PsiFormerAcceleratorResolutionReason::RUNTIME_VALIDATION_FAILED:
+    return "runtime validation failed";
+  case PsiFormerAcceleratorResolutionReason::NO_PRODUCTION_EXECUTOR:
+    return "no production executor";
+  }
+  return "unknown";
 }
 
 PsiFormerDeviceLayout makePsiFormerDeviceLayout(const PsiFormerExecutionPlan& plan)

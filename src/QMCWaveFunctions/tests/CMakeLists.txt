@@ -114,6 +114,7 @@ set(TRIALWF_SRC
     test_TWFGrads.cpp
     test_virtual_particle_batch_dispatch.cpp
     test_psiformer_accelerator_planning.cpp
+    test_psiformer_accelerator_executor.cpp
     test_psiformer_accelerator_schedule.cpp
     test_psiformer_execution_plan.cpp
     test_psiformer_memory_policy.cpp
