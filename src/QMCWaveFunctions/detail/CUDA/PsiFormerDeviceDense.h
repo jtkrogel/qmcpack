@@ -29,6 +29,41 @@ void denseForward(AcceleratorBlasHandle& handle,
                   const double* weight,
                   double* target);
 
+/** Accumulate the FP64 input adjoint of a row-major dense product.
+ *
+ * For ``target = source * weight``, this applies
+ * ``source_adjoint += target_adjoint * transpose(weight)``.  The destination
+ * uses ``layout.source_row_stride`` and is updated with BLAS beta equal to one.
+ */
+void accumulateDenseInputAdjoint(AcceleratorBlasHandle& handle,
+                                 const DenseForwardLayout& layout,
+                                 const double* target_adjoint,
+                                 const double* weight,
+                                 double* source_adjoint);
+
+/** Accumulate the FP64 weight adjoint of a row-major dense product.
+ *
+ * This applies ``weight_adjoint += transpose(source) * target_adjoint``.  The
+ * destination uses ``layout.weight_row_stride`` and is updated with BLAS beta
+ * equal to one.
+ */
+void accumulateDenseWeightAdjoint(AcceleratorBlasHandle& handle,
+                                  const DenseForwardLayout& layout,
+                                  const double* source,
+                                  const double* target_adjoint,
+                                  double* weight_adjoint);
+
+/** Deterministically accumulate one FP64 bias adjoint per output feature.
+ *
+ * Each output-indexed device thread sums rows in increasing order and adds the
+ * result to the existing destination.  The launch allocates no temporary
+ * storage.  A fully zero-initialized layout is accepted as a no-work link check.
+ */
+Error launchDenseBiasAdjoint(Stream stream,
+                             const DenseForwardLayout& layout,
+                             const double* target_adjoint,
+                             double* bias_adjoint);
+
 void projectQkvForward(AcceleratorBlasHandle& handle,
                        const DenseForwardLayout& layout,
                        const double* source,

@@ -11,6 +11,7 @@
 
 #include "PsiFormerDeviceKernels.h"
 #include "PsiFormerDeviceDense.h"
+#include "PsiFormerDeviceDerivativeKernels.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDevicePrecision.h"
 #include "PsiFormerDeviceSpatial.h"
@@ -100,6 +101,58 @@ int main()
       launchValueFp32ToFp64(
           nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
           nullptr, nullptr, nullptr) == success;
+  const bool derivative_zero_linked =
+      launchDerivativeZero(nullptr, DerivativeVectorLayout{}, nullptr) == success;
+  const bool derivative_copy_linked =
+      launchDerivativeCopy(nullptr, DerivativeVectorLayout{}, nullptr, nullptr) == success;
+  const bool derivative_axpy_linked =
+      launchRealToComplexAxpy(nullptr, RealToComplexAxpyLayout{}, 0.0, 0.0,
+                              nullptr, nullptr) == success;
+  const bool derivative_dot_partials_linked =
+      launchResponseDotDirectionPartials(nullptr, ResponseDotLayout{}, nullptr,
+                                         nullptr, nullptr, nullptr) == success;
+  const bool derivative_dot_finalize_linked =
+      launchFinalizeResponseDotDirection(nullptr, 0, 0, nullptr, nullptr,
+                                         nullptr, nullptr) == success;
+  const bool derivative_dot_linked =
+      launchResponseDotDirection(nullptr, ResponseDotLayout{}, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr) == success;
+  const bool derivative_tanh_reverse_linked =
+      launchTanhOutputResidualReverse(nullptr, qmcplusplus::psiformer::BatchedValueLayout{},
+                                      nullptr, nullptr, nullptr, nullptr) == success;
+  const bool derivative_context_reverse_linked =
+      launchAttentionContextReverse(nullptr,
+                                    qmcplusplus::psiformer::BatchedAttentionForwardLayout{},
+                                    nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool derivative_qk_reverse_linked =
+      launchSoftmaxScaledQkReverse(nullptr,
+                                   qmcplusplus::psiformer::BatchedAttentionForwardLayout{},
+                                   nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool derivative_orbital_reverse_linked =
+      launchOrbitalBbarEbar(nullptr, OrbitalProductReverseLayout{}, nullptr, nullptr,
+                            nullptr, nullptr, nullptr) == success;
+  const bool derivative_envelope_reverse_linked =
+      launchEnvelopeParameterReverse(nullptr, EnvelopeParameterReverseLayout{}, nullptr,
+                                     nullptr, nullptr, nullptr, nullptr) == success;
+  const bool derivative_cusp_reverse_linked =
+      launchCuspAlphaReverse(nullptr, CuspAlphaReverseLayout{}, nullptr, nullptr,
+                             0.0, 0.0, nullptr) == success;
+  const bool derivative_finite_scan_linked =
+      launchDerivativeFiniteScan(nullptr, DerivativeFiniteScanLayout{}, nullptr,
+                                 nullptr) == success;
+  const bool dense_bias_reverse_linked =
+      launchDenseBiasAdjoint(nullptr, qmcplusplus::psiformer::DenseForwardLayout{},
+                             nullptr, nullptr) == success;
+  // The BLAS wrappers require a live handle even for an empty layout.  Retain
+  // volatile function pointers so the device-link step cannot discard either
+  // reverse symbol as a compile-time-true address comparison.
+  using DenseInputReverse = void (*)(
+      AcceleratorBlasHandle&, const qmcplusplus::psiformer::DenseForwardLayout&,
+      const double*, const double*, double*);
+  volatile DenseInputReverse dense_input_reverse_entry = &accumulateDenseInputAdjoint;
+  volatile DenseInputReverse dense_weight_reverse_entry = &accumulateDenseWeightAdjoint;
+  const bool dense_input_reverse_linked = dense_input_reverse_entry != nullptr;
+  const bool dense_weight_reverse_linked = dense_weight_reverse_entry != nullptr;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
          determinant_spatial_linked && spatial_softmax_linked &&
@@ -109,7 +162,14 @@ int main()
          final_spatial_linked && open_orbital_linked && precision_conversion_linked &&
          fp32_dense_linked && fp32_qkv_linked && fp32_logits_linked &&
          fp32_context_linked && fp32_softmax_linked && fp32_tanh_linked &&
-         fp32_residual_linked && fp64_to_fp32_linked && fp32_to_fp64_linked
+         fp32_residual_linked && fp64_to_fp32_linked && fp32_to_fp64_linked &&
+         derivative_zero_linked && derivative_copy_linked && derivative_axpy_linked &&
+         derivative_dot_partials_linked && derivative_dot_finalize_linked &&
+         derivative_dot_linked && derivative_tanh_reverse_linked &&
+         derivative_context_reverse_linked && derivative_qk_reverse_linked &&
+         derivative_orbital_reverse_linked && derivative_envelope_reverse_linked &&
+         derivative_cusp_reverse_linked && derivative_finite_scan_linked &&
+         dense_bias_reverse_linked && dense_input_reverse_linked && dense_weight_reverse_linked
       ? 0
       : 1;
 }

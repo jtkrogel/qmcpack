@@ -22,8 +22,25 @@ namespace qmcplusplus::psiformer::device
 namespace
 {
 
-constexpr unsigned int softmax_block_size = 128;
-constexpr unsigned int value_block_size   = 128;
+constexpr unsigned int softmax_block_size    = 128;
+constexpr unsigned int value_block_size      = 128;
+constexpr unsigned int dense_bias_block_size = 128;
+
+/** Sum one output column in a fixed row order without auxiliary storage. */
+__global__ void denseBiasAdjointKernel(DenseForwardLayout layout,
+                                       const double* target_adjoint,
+                                       double* bias_adjoint)
+{
+  const std::size_t output =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (output >= layout.output_width)
+    return;
+
+  double sum = 0.0;
+  for (std::size_t row = 0; row < layout.rows; ++row)
+    sum += target_adjoint[row * layout.target_row_stride + output];
+  bias_adjoint[output] += sum;
+}
 
 __global__ void attentionSoftmaxKernel(AttentionForwardLayout layout, double* attention)
 {
@@ -320,6 +337,72 @@ void denseForward(AcceleratorBlasHandle& handle,
                       weight, blasExtent(layout.weight_row_stride),
                       source, blasExtent(layout.source_row_stride), 0.0,
                       target, blasExtent(layout.target_row_stride));
+}
+
+void accumulateDenseInputAdjoint(AcceleratorBlasHandle& handle,
+                                 const DenseForwardLayout& layout,
+                                 const double* target_adjoint,
+                                 const double* weight,
+                                 double* source_adjoint)
+{
+  validateDenseForwardLayout(layout);
+  if (!target_adjoint || !weight || !source_adjoint)
+    throw std::invalid_argument("PsiFormer dense input-adjoint storage is null");
+
+  // Row-major target_adjoint * weight^T is the column-major product
+  // weight * target_adjoint^T.  Preserve every padded row stride as its BLAS LD.
+  compute::BLAS::gemm(handle, 'T', 'N', blasExtent(layout.input_width),
+                      blasExtent(layout.rows), blasExtent(layout.output_width), 1.0,
+                      weight, blasExtent(layout.weight_row_stride),
+                      target_adjoint, blasExtent(layout.target_row_stride), 1.0,
+                      source_adjoint, blasExtent(layout.source_row_stride));
+}
+
+void accumulateDenseWeightAdjoint(AcceleratorBlasHandle& handle,
+                                  const DenseForwardLayout& layout,
+                                  const double* source,
+                                  const double* target_adjoint,
+                                  double* weight_adjoint)
+{
+  validateDenseForwardLayout(layout);
+  if (!source || !target_adjoint || !weight_adjoint)
+    throw std::invalid_argument("PsiFormer dense weight-adjoint storage is null");
+
+  // Update the column-major view weight_adjoint^T with
+  // target_adjoint^T * source, which is source^T * target_adjoint row-major.
+  compute::BLAS::gemm(handle, 'N', 'T', blasExtent(layout.output_width),
+                      blasExtent(layout.input_width), blasExtent(layout.rows), 1.0,
+                      target_adjoint, blasExtent(layout.target_row_stride),
+                      source, blasExtent(layout.source_row_stride), 1.0,
+                      weight_adjoint, blasExtent(layout.weight_row_stride));
+}
+
+Error launchDenseBiasAdjoint(Stream stream,
+                             const DenseForwardLayout& layout,
+                             const double* target_adjoint,
+                             double* bias_adjoint)
+{
+  if (layout.rows == 0 && layout.input_width == 0 && layout.output_width == 0 &&
+      layout.source_row_stride == 0 && layout.weight_row_stride == 0 &&
+      layout.target_row_stride == 0)
+    return success;
+  validateDenseForwardLayout(layout);
+  if (!target_adjoint || !bias_adjoint)
+    throw std::invalid_argument("PsiFormer dense bias-adjoint storage is null");
+
+  const std::size_t blocks = layout.output_width / dense_bias_block_size +
+      (layout.output_width % dense_bias_block_size == 0 ? 0 : 1);
+  if (blocks > std::numeric_limits<unsigned int>::max())
+    throw std::length_error(
+        "PsiFormer dense bias-adjoint grid exceeds the CUDA/HIP x dimension");
+  denseBiasAdjointKernel<<<static_cast<unsigned int>(blocks),
+                           dense_bias_block_size, 0, stream>>>(
+      layout, target_adjoint, bias_adjoint);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
 }
 
 void projectQkvForward(AcceleratorBlasHandle& handle,
