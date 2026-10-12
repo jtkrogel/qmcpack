@@ -1556,11 +1556,13 @@ inline void DirectKineticExecutor::buildDeterminantFactors(
   for (std::size_t channel = 0; channel < workspace.determinants_; ++channel)
   {
     const std::size_t begin = channel * matrix_elements;
+    const double weight = static_cast<double>(workspace.determinant_.channelWeight(channel));
+    if (weight == 0.0)
+      continue;
     const double* inverse = workspace.determinant_.inverse(channel);
     if (!inverse)
       throw std::domain_error(
           "PsiFormer determinant mixed reverse requires every contributing inverse");
-    const double weight = static_cast<double>(workspace.determinant_.channelWeight(channel));
 
     // B = d log(sum_k det A_k) / d A_channel = w A^{-T}.
     for (std::size_t row = 0; row < matrix_size; ++row)

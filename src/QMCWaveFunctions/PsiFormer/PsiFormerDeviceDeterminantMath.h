@@ -12,6 +12,8 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_DETERMINANT_MATH_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_DETERMINANT_MATH_H
 
+#include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
+
 #include <cmath>
 #include <cfloat>
 #include <cstddef>
@@ -538,6 +540,286 @@ QMC_PF_DET_HOST_DEVICE inline double inverseProductSquareTraceBinary64(
       trace.add(matrix_product[row * matrix_size + column] *
                 matrix_product[column * matrix_size + row]);
   return trace.value();
+}
+
+QMC_PF_DET_HOST_DEVICE inline void multiplyMatricesBinary64(
+    const double* left,
+    const double* right,
+    std::size_t matrix_size,
+    double* output) noexcept
+{
+  for (std::size_t row = 0; row < matrix_size; ++row)
+    for (std::size_t column = 0; column < matrix_size; ++column)
+    {
+      CompensatedSumBinary64 entry;
+      for (std::size_t inner = 0; inner < matrix_size; ++inner)
+        entry.add(left[row * matrix_size + inner] *
+                  right[inner * matrix_size + column]);
+      output[row * matrix_size + column] = entry.value();
+    }
+}
+
+QMC_PF_DET_HOST_DEVICE inline void clearSpatialConfiguration(
+    const SpatialJetLayout& layout,
+    std::size_t configuration,
+    double* jets) noexcept
+{
+  if (!jets)
+    return;
+  for (std::size_t plane = 0; plane < layout.plane_count; ++plane)
+    clearMatrix(jets + layout.uncheckedPlaneOffset(configuration, plane, 0),
+                layout.element_count);
+}
+
+/** Build the value, gradient, and trace-Laplacian jets of
+ * d log|Psi|/d A_k = w_k A_k^-T for one configuration.
+ *
+ * The factorization, weights, inverses, determinant derivatives, and scratch
+ * pointers are configuration-local. Orbital and factor jets use the batched
+ * canonical FULL_VGL descriptor. Scratch contains three consecutive N*N
+ * matrices and is caller-owned.
+ */
+QMC_PF_DET_HOST_DEVICE inline DerivativeStatus buildLiftedDeterminantFactors(
+    const SpatialJetLayout& matrices,
+    std::size_t configuration,
+    const FactorizationMetadata* factorization,
+    const CombinationMetadata& combination,
+    const double* normalized_weights,
+    const double* inverses,
+    const double* orbital_jets,
+    const double* determinant_log_gradient,
+    const double* determinant_log_laplacian,
+    std::size_t determinant_count,
+    std::size_t matrix_size,
+    double* factor_jets,
+    double* three_matrix_scratch) noexcept
+{
+  clearSpatialConfiguration(matrices, configuration, factor_jets);
+  const std::size_t matrix_elements = matrix_size * matrix_size;
+  clearMatrix(three_matrix_scratch, 3 * matrix_elements);
+
+  if (!factorization || !normalized_weights || !inverses || !orbital_jets ||
+      !determinant_log_gradient || !determinant_log_laplacian ||
+      !factor_jets || !three_matrix_scratch)
+    return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  const DerivativeStatus availability = derivativeAvailability(
+      factorization, combination, normalized_weights, determinant_count);
+  if (availability != DerivativeStatus::AVAILABLE)
+    return availability;
+
+  const std::size_t channel_elements = determinant_count * matrix_elements;
+  double* scratch_a = three_matrix_scratch;
+  double* scratch_b = scratch_a + matrix_elements;
+  double* scratch_c = scratch_b + matrix_elements;
+
+  for (std::size_t lane = 0; lane < matrices.gradient_lanes; ++lane)
+    if (!isFiniteBinary64(determinant_log_gradient[lane]))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  for (std::size_t electron = 0; electron < matrices.laplacian_lanes; ++electron)
+    if (!isFiniteBinary64(determinant_log_laplacian[electron]))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+
+  for (std::size_t channel = 0; channel < determinant_count; ++channel)
+  {
+    const double weight = normalized_weights[channel];
+    if (weight == 0.0)
+      continue;
+    const double* inverse = inverses + channel * matrix_elements;
+    for (std::size_t element = 0; element < matrix_elements; ++element)
+      if (!isFiniteBinary64(inverse[element]))
+        goto nonfinite;
+
+    const std::size_t begin = channel * matrix_elements;
+    double* factor_value = factor_jets +
+        matrices.uncheckedValueOffset(configuration, begin);
+    for (std::size_t row = 0; row < matrix_size; ++row)
+      for (std::size_t column = 0; column < matrix_size; ++column)
+        factor_value[row * matrix_size + column] =
+            weight * inverse[column * matrix_size + row];
+
+    for (std::size_t lane = 0; lane < matrices.gradient_lanes; ++lane)
+    {
+      const double* matrix_gradient = orbital_jets +
+          matrices.uncheckedGradientOffset(configuration, lane, begin);
+      for (std::size_t element = 0; element < matrix_elements; ++element)
+        if (!isFiniteBinary64(matrix_gradient[element]))
+          goto nonfinite;
+      const double channel_gradient =
+          traceProductBinary64(inverse, matrix_gradient, matrix_size);
+      const double weight_gradient = weight *
+          (channel_gradient - determinant_log_gradient[lane]);
+      multiplyMatricesBinary64(inverse, matrix_gradient, matrix_size, scratch_a);
+      multiplyMatricesBinary64(scratch_a, inverse, matrix_size, scratch_b);
+      double* factor_gradient = factor_jets +
+          matrices.uncheckedGradientOffset(configuration, lane, begin);
+      for (std::size_t row = 0; row < matrix_size; ++row)
+        for (std::size_t column = 0; column < matrix_size; ++column)
+          factor_gradient[row * matrix_size + column] =
+              weight_gradient * inverse[column * matrix_size + row] -
+              weight * scratch_b[column * matrix_size + row];
+    }
+
+    for (std::size_t electron = 0; electron < matrices.laplacian_lanes; ++electron)
+    {
+      const double* matrix_laplacian = orbital_jets +
+          matrices.uncheckedLaplacianOffset(configuration, electron, begin);
+      for (std::size_t element = 0; element < matrix_elements; ++element)
+        if (!isFiniteBinary64(matrix_laplacian[element]))
+          goto nonfinite;
+      double channel_log_laplacian =
+          traceProductBinary64(inverse, matrix_laplacian, matrix_size);
+      double squared_gradient_difference = 0.0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const double* matrix_gradient = orbital_jets +
+            matrices.uncheckedGradientOffset(configuration, lane, begin);
+        const double channel_gradient =
+            traceProductBinary64(inverse, matrix_gradient, matrix_size);
+        multiplyMatricesBinary64(inverse, matrix_gradient, matrix_size, scratch_a);
+        channel_log_laplacian -=
+            traceProductBinary64(scratch_a, scratch_a, matrix_size);
+        const double difference =
+            channel_gradient - determinant_log_gradient[lane];
+        squared_gradient_difference += difference * difference;
+      }
+      const double weight_laplacian = weight *
+          (channel_log_laplacian - determinant_log_laplacian[electron] +
+           squared_gradient_difference);
+      double* factor_laplacian = factor_jets +
+          matrices.uncheckedLaplacianOffset(configuration, electron, begin);
+      for (std::size_t row = 0; row < matrix_size; ++row)
+        for (std::size_t column = 0; column < matrix_size; ++column)
+          factor_laplacian[row * matrix_size + column] =
+              weight_laplacian * inverse[column * matrix_size + row];
+
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const std::size_t lane = 3 * electron + dimension;
+        const double* matrix_gradient = orbital_jets +
+            matrices.uncheckedGradientOffset(configuration, lane, begin);
+        const double channel_gradient =
+            traceProductBinary64(inverse, matrix_gradient, matrix_size);
+        const double weight_gradient = weight *
+            (channel_gradient - determinant_log_gradient[lane]);
+        multiplyMatricesBinary64(inverse, matrix_gradient, matrix_size, scratch_a);
+        multiplyMatricesBinary64(scratch_a, inverse, matrix_size, scratch_b);
+        for (std::size_t row = 0; row < matrix_size; ++row)
+          for (std::size_t column = 0; column < matrix_size; ++column)
+            factor_laplacian[row * matrix_size + column] -=
+                2.0 * weight_gradient *
+                scratch_b[column * matrix_size + row];
+
+        multiplyMatricesBinary64(scratch_a, scratch_a, matrix_size, scratch_b);
+        multiplyMatricesBinary64(scratch_b, inverse, matrix_size, scratch_c);
+        for (std::size_t row = 0; row < matrix_size; ++row)
+          for (std::size_t column = 0; column < matrix_size; ++column)
+            factor_laplacian[row * matrix_size + column] +=
+                2.0 * weight * scratch_c[column * matrix_size + row];
+      }
+
+      multiplyMatricesBinary64(inverse, matrix_laplacian, matrix_size, scratch_a);
+      multiplyMatricesBinary64(scratch_a, inverse, matrix_size, scratch_b);
+      for (std::size_t row = 0; row < matrix_size; ++row)
+        for (std::size_t column = 0; column < matrix_size; ++column)
+          factor_laplacian[row * matrix_size + column] -=
+              weight * scratch_b[column * matrix_size + row];
+    }
+  }
+
+  for (std::size_t plane = 0; plane < matrices.plane_count; ++plane)
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      if (!isFiniteBinary64(factor_jets[
+              matrices.uncheckedPlaneOffset(configuration, plane, element)]))
+        goto nonfinite;
+  return DerivativeStatus::AVAILABLE;
+
+nonfinite:
+  clearSpatialConfiguration(matrices, configuration, factor_jets);
+  clearMatrix(three_matrix_scratch, 3 * matrix_elements);
+  return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+}
+
+/** Reverse a lifted determinant factor jet into the matrix jet for one configuration. */
+QMC_PF_DET_HOST_DEVICE inline DerivativeStatus reverseLiftedDeterminant(
+    const SpatialJetLayout& matrices,
+    const SpatialJetLayout& roots,
+    std::size_t configuration,
+    DerivativeStatus factor_status,
+    const double* factor_jets,
+    const double* root_jets,
+    double* orbital_adjoint_jets) noexcept
+{
+  clearSpatialConfiguration(matrices, configuration, orbital_adjoint_jets);
+  if (factor_status != DerivativeStatus::AVAILABLE)
+    return factor_status;
+  if (!factor_jets || !root_jets || !orbital_adjoint_jets)
+    return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+
+  const double root_value = root_jets[roots.uncheckedValueOffset(configuration, 0)];
+  if (!isFiniteBinary64(root_value))
+    return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  for (std::size_t lane = 0; lane < matrices.gradient_lanes; ++lane)
+    if (!isFiniteBinary64(
+            root_jets[roots.uncheckedGradientOffset(configuration, lane, 0)]))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+  for (std::size_t electron = 0; electron < matrices.laplacian_lanes; ++electron)
+    if (!isFiniteBinary64(
+            root_jets[roots.uncheckedLaplacianOffset(configuration, electron, 0)]))
+      return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
+
+  for (std::size_t element = 0; element < matrices.element_count; ++element)
+  {
+    const double factor_value =
+        factor_jets[matrices.uncheckedValueOffset(configuration, element)];
+    if (!isFiniteBinary64(factor_value))
+      goto reverse_nonfinite;
+    CompensatedSumBinary64 value_adjoint;
+    value_adjoint.add(root_value * factor_value);
+    for (std::size_t lane = 0; lane < matrices.gradient_lanes; ++lane)
+    {
+      const double factor_gradient =
+          factor_jets[matrices.uncheckedGradientOffset(configuration, lane, element)];
+      if (!isFiniteBinary64(factor_gradient))
+        goto reverse_nonfinite;
+      const double root_gradient =
+          root_jets[roots.uncheckedGradientOffset(configuration, lane, 0)];
+      const double root_laplacian =
+          root_jets[roots.uncheckedLaplacianOffset(configuration, lane / 3, 0)];
+      value_adjoint.add(root_gradient * factor_gradient);
+      orbital_adjoint_jets[
+          matrices.uncheckedGradientOffset(configuration, lane, element)] =
+          root_gradient * factor_value +
+          2.0 * root_laplacian * factor_gradient;
+    }
+    for (std::size_t electron = 0; electron < matrices.laplacian_lanes; ++electron)
+    {
+      const double factor_laplacian = factor_jets[
+          matrices.uncheckedLaplacianOffset(configuration, electron, element)];
+      if (!isFiniteBinary64(factor_laplacian))
+        goto reverse_nonfinite;
+      const double root_laplacian = root_jets[
+          roots.uncheckedLaplacianOffset(configuration, electron, 0)];
+      value_adjoint.add(root_laplacian * factor_laplacian);
+      orbital_adjoint_jets[
+          matrices.uncheckedLaplacianOffset(configuration, electron, element)] =
+          root_laplacian * factor_value;
+    }
+    orbital_adjoint_jets[
+        matrices.uncheckedValueOffset(configuration, element)] =
+        value_adjoint.value();
+  }
+
+  for (std::size_t plane = 0; plane < matrices.plane_count; ++plane)
+    for (std::size_t element = 0; element < matrices.element_count; ++element)
+      if (!isFiniteBinary64(orbital_adjoint_jets[
+              matrices.uncheckedPlaneOffset(configuration, plane, element)]))
+        goto reverse_nonfinite;
+  return DerivativeStatus::AVAILABLE;
+
+reverse_nonfinite:
+  clearSpatialConfiguration(matrices, configuration, orbital_adjoint_jets);
+  return DerivativeStatus::NONFINITE_INPUT_OR_RESULT;
 }
 
 /** Combine determinant spatial traces for one configuration.

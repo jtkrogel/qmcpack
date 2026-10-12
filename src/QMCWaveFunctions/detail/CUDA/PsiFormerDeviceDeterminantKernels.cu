@@ -125,11 +125,100 @@ __global__ void determinantSpatialTracesKernel(
       output_lap_log ? output_lap_log + configuration * layout.electron_count : nullptr);
 }
 
+__global__ void determinantFactorJetsKernel(
+    LiftedDeterminantLayout layout,
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights,
+    const double* inverses,
+    const double* orbital_jets,
+    const double* determinant_log_gradient,
+    const double* determinant_log_laplacian,
+    double* factor_jets,
+    double* three_matrix_scratch,
+    device_determinant::DerivativeStatus* status)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= layout.matrices.configuration_count)
+    return;
+  const std::size_t matrix_elements = layout.matrix_size * layout.matrix_size;
+  const std::size_t channel_elements = layout.determinant_count * matrix_elements;
+  const std::size_t channel_offset = configuration * layout.determinant_count;
+  status[configuration] = device_determinant::buildLiftedDeterminantFactors(
+      layout.matrices, configuration, factorization_metadata + channel_offset,
+      combination_metadata[configuration], normalized_weights + channel_offset,
+      inverses + configuration * channel_elements, orbital_jets,
+      determinant_log_gradient + configuration * layout.matrices.gradient_lanes,
+      determinant_log_laplacian + configuration * layout.matrices.laplacian_lanes,
+      layout.determinant_count, layout.matrix_size, factor_jets,
+      three_matrix_scratch + configuration * 3 * matrix_elements);
+}
+
+__global__ void determinantJetReverseKernel(
+    LiftedDeterminantLayout layout,
+    const device_determinant::DerivativeStatus* factor_status,
+    const double* factor_jets,
+    const double* root_jets,
+    double* orbital_adjoint_jets,
+    device_determinant::DerivativeStatus* status)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= layout.matrices.configuration_count)
+    return;
+  status[configuration] = device_determinant::reverseLiftedDeterminant(
+      layout.matrices, layout.roots, configuration, factor_status[configuration],
+      factor_jets, root_jets, orbital_adjoint_jets);
+}
+
 std::size_t checkedProduct(std::size_t left, std::size_t right, const char* description)
 {
   if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left)
     throw std::length_error(description);
   return left * right;
+}
+
+void validateLiftedDeterminantLayout(const LiftedDeterminantLayout& layout)
+{
+  validateSpatialJetLayout(layout.matrices);
+  validateSpatialJetLayout(layout.roots);
+  if (layout.matrices.mode != SpatialJetMode::FULL_VGL ||
+      layout.roots.mode != SpatialJetMode::FULL_VGL)
+    throw std::invalid_argument("PsiFormer lifted determinant requires FULL_VGL layouts");
+  if (!haveMatchingSpatialPlanes(layout.matrices, layout.roots))
+    throw std::invalid_argument("PsiFormer lifted determinant matrix and root planes do not match");
+  if (layout.determinant_count == 0 || layout.matrix_size == 0)
+    throw std::invalid_argument("PsiFormer lifted determinant dimensions must be positive");
+  const std::size_t matrix_elements = checkedProduct(
+      layout.matrix_size, layout.matrix_size,
+      "PsiFormer lifted determinant matrix extent overflow");
+  const std::size_t expected_elements = checkedProduct(
+      layout.determinant_count, matrix_elements,
+      "PsiFormer lifted determinant channel extent overflow");
+  if (layout.matrices.element_count != expected_elements ||
+      layout.roots.element_count != 1)
+    throw std::invalid_argument("PsiFormer lifted determinant element counts are inconsistent");
+  (void)checkedProduct(layout.matrices.configuration_count,
+                       layout.determinant_count,
+                       "PsiFormer lifted determinant metadata extent overflow");
+  (void)checkedProduct(layout.matrices.configuration_count,
+                       expected_elements,
+                       "PsiFormer lifted determinant inverse extent overflow");
+  (void)checkedProduct(layout.matrices.configuration_count,
+                       layout.matrices.gradient_lanes,
+                       "PsiFormer lifted determinant gradient extent overflow");
+  (void)checkedProduct(layout.matrices.configuration_count,
+                       layout.matrices.laplacian_lanes,
+                       "PsiFormer lifted determinant Laplacian extent overflow");
+  const std::size_t scratch_per_configuration = checkedProduct(
+      std::size_t{3}, matrix_elements,
+      "PsiFormer lifted determinant scratch extent overflow");
+  (void)checkedProduct(layout.matrices.configuration_count,
+                       scratch_per_configuration,
+                       "PsiFormer lifted determinant batch scratch extent overflow");
+  if (layout.matrices.configuration_count >
+      std::numeric_limits<unsigned int>::max())
+    throw std::length_error(
+        "PsiFormer lifted determinant grid exceeds the CUDA/HIP x dimension");
 }
 
 } // namespace
@@ -321,6 +410,72 @@ Error launchDeterminantSpatialTraces(
       layout, factorization_metadata, combination_metadata, normalized_weights,
       inverses, matrix_gradients, matrix_laplacians, matrix_product_scratch,
       output_log_gradient, output_lap_ratio, output_lap_log, status);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+Error launchDeterminantFactorJets(
+    Stream stream,
+    const LiftedDeterminantLayout& layout,
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights,
+    const double* inverses,
+    const double* orbital_jets,
+    const double* determinant_log_gradient,
+    const double* determinant_log_laplacian,
+    double* factor_jets,
+    double* three_matrix_scratch,
+    device_determinant::DerivativeStatus* status)
+{
+  if (layout.matrices.configuration_count == 0)
+    return success;
+  validateLiftedDeterminantLayout(layout);
+  if (!factorization_metadata || !combination_metadata || !normalized_weights ||
+      !inverses || !orbital_jets || !determinant_log_gradient ||
+      !determinant_log_laplacian || !factor_jets || !three_matrix_scratch ||
+      !status)
+    throw std::invalid_argument("PsiFormer lifted determinant factor storage is null");
+
+  const unsigned int block_count = static_cast<unsigned int>(
+      (layout.matrices.configuration_count + determinant_block_size - 1) /
+      determinant_block_size);
+  determinantFactorJetsKernel<<<block_count, determinant_block_size, 0, stream>>>(
+      layout, factorization_metadata, combination_metadata, normalized_weights,
+      inverses, orbital_jets, determinant_log_gradient,
+      determinant_log_laplacian, factor_jets, three_matrix_scratch, status);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
+
+Error launchDeterminantJetReverse(
+    Stream stream,
+    const LiftedDeterminantLayout& layout,
+    const device_determinant::DerivativeStatus* factor_status,
+    const double* factor_jets,
+    const double* root_jets,
+    double* orbital_adjoint_jets,
+    device_determinant::DerivativeStatus* status)
+{
+  if (layout.matrices.configuration_count == 0)
+    return success;
+  validateLiftedDeterminantLayout(layout);
+  if (!factor_status || !factor_jets || !root_jets ||
+      !orbital_adjoint_jets || !status)
+    throw std::invalid_argument("PsiFormer lifted determinant reverse storage is null");
+
+  const unsigned int block_count = static_cast<unsigned int>(
+      (layout.matrices.configuration_count + determinant_block_size - 1) /
+      determinant_block_size);
+  determinantJetReverseKernel<<<block_count, determinant_block_size, 0, stream>>>(
+      layout, factor_status, factor_jets, root_jets, orbital_adjoint_jets,
+      status);
 #ifdef QMC_CUDA2HIP
   return hipPeekAtLastError();
 #else

@@ -40,6 +40,14 @@ int main()
           nullptr, qmcplusplus::psiformer::device_determinant::SpatialLayout{},
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
           nullptr, nullptr, nullptr, nullptr) == success;
+  const bool determinant_factor_jets_linked =
+      launchDeterminantFactorJets(
+          nullptr, LiftedDeterminantLayout{}, nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool determinant_jet_reverse_linked =
+      launchDeterminantJetReverse(
+          nullptr, LiftedDeterminantLayout{}, nullptr, nullptr, nullptr, nullptr,
+          nullptr) == success;
   const bool spatial_softmax_linked =
       launchSoftmaxJetRows(nullptr, qmcplusplus::psiformer::SoftmaxJetRowLayout{},
                            nullptr, nullptr) == success;
@@ -155,7 +163,8 @@ int main()
   const bool dense_weight_reverse_linked = dense_weight_reverse_entry != nullptr;
   return foundation_linked && attention_linked && determinant_linked &&
          determinant_combination_linked && determinant_reverse_linked &&
-         determinant_spatial_linked && spatial_softmax_linked &&
+         determinant_spatial_linked && determinant_factor_jets_linked &&
+         determinant_jet_reverse_linked && spatial_softmax_linked &&
          spatial_dense_linked && spatial_qkv_linked &&
          spatial_attention_linked && spatial_context_linked && open_feature_linked &&
          tanh_jet_linked && residual_jet_linked && cusp_jet_linked &&

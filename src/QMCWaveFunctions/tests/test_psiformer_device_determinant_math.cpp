@@ -555,6 +555,273 @@ TEST_CASE("PsiFormer determinant reverse and spatial traces match finite differe
   CHECK(unavailable_status == determinant::DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE);
 }
 
+TEST_CASE("PsiFormer lifted determinant factors match independent finite differences",
+          "[psiformer][device][determinant]")
+{
+  using qmcplusplus::psiformer::SpatialJetMode;
+  using qmcplusplus::psiformer::makeSpatialJetLayout;
+  constexpr std::size_t configurations = 2;
+  constexpr std::size_t channels = 2;
+  constexpr std::size_t matrix_size = 2;
+  constexpr std::size_t matrix_elements = 4;
+  constexpr std::size_t channel_elements = channels * matrix_elements;
+  constexpr std::size_t electrons = 1;
+  constexpr std::size_t gradient_lanes = 3;
+  const auto matrices_layout = makeSpatialJetLayout(
+      configurations, channel_elements, electrons, SpatialJetMode::FULL_VGL,
+      channel_elements + 3, (1 + gradient_lanes + electrons) *
+          (channel_elements + 3) + 5);
+  const auto roots_layout = makeSpatialJetLayout(
+      configurations, 1, electrons, SpatialJetMode::FULL_VGL, 2, 13);
+
+  const std::array<double, channels> coefficients{1.1, -0.35};
+  const std::array<double, configurations * channel_elements> base{
+      1.4, 0.2, -0.1, 1.1, 0.8, -0.3, 0.4, 1.2,
+      1.1, 0.25, 0.15, 0.95, 1.3, -0.2, 0.1, 0.85};
+  const std::array<double, gradient_lanes * channel_elements> gradient_pattern{
+      0.07, -0.03, 0.02, 0.05, -0.04, 0.06, 0.01, -0.02,
+      -0.02, 0.04, 0.03, -0.01, 0.05, -0.03, 0.02, 0.01,
+      0.01, 0.02, -0.04, 0.03, -0.03, 0.01, 0.04, -0.02};
+  const std::array<double, channel_elements> laplacian_pattern{
+      0.03, 0.01, -0.02, 0.04, -0.01, 0.02, 0.05, -0.03};
+  std::vector<double> orbital_jets(
+      qmcplusplus::psiformer::spatialJetSpanElements(matrices_layout), -71.0);
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      orbital_jets[matrices_layout.uncheckedValueOffset(configuration, element)] =
+          base[configuration * channel_elements + element];
+    for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+      for (std::size_t element = 0; element < channel_elements; ++element)
+        orbital_jets[matrices_layout.uncheckedGradientOffset(
+            configuration, lane, element)] = gradient_pattern[lane * channel_elements + element] *
+            (1.0 + 0.15 * configuration);
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      orbital_jets[matrices_layout.uncheckedLaplacianOffset(
+          configuration, 0, element)] = laplacian_pattern[element] *
+          (1.0 + 0.2 * configuration);
+  }
+
+  std::array<determinant::FactorizationMetadata, configurations * channels> factorization;
+  std::array<determinant::CombinationMetadata, configurations> combination;
+  std::array<double, configurations * channel_elements> lu{};
+  std::array<double, configurations * channel_elements> inverses{};
+  std::array<std::size_t, configurations * channels * matrix_size> permutations{};
+  std::array<double, configurations * channels * matrix_size> solve{};
+  std::array<double, configurations * channels> term_phase{};
+  std::array<double, configurations * channels> term_log_abs{};
+  std::array<double, configurations * channels> scaled_terms{};
+  std::array<double, configurations * channels> weights{};
+  std::array<double, configurations * gradient_lanes> determinant_gradient{};
+  std::array<double, configurations * electrons> determinant_lap_ratio{};
+  std::array<double, configurations * electrons> determinant_lap_log{};
+  std::array<double, configurations * matrix_elements> trace_scratch{};
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    for (std::size_t channel = 0; channel < channels; ++channel)
+    {
+      const std::size_t matrix = configuration * channels + channel;
+      const std::size_t begin = matrix * matrix_elements;
+      factorization[matrix] = determinant::factorizeScaledReal(
+          base.data() + begin, matrix_size, lu.data() + begin,
+          permutations.data() + matrix * matrix_size, true, inverses.data() + begin,
+          solve.data() + matrix * matrix_size);
+    }
+    const std::size_t channel_offset = configuration * channels;
+    combination[configuration] = determinant::combineChannelsReal(
+        factorization.data() + channel_offset, coefficients.data(), channels,
+        term_phase.data() + channel_offset, term_log_abs.data() + channel_offset,
+        scaled_terms.data() + channel_offset, weights.data() + channel_offset);
+
+    std::array<double, gradient_lanes * channel_elements> compact_gradients{};
+    std::array<double, channel_elements> compact_laplacians{};
+    for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+      for (std::size_t element = 0; element < channel_elements; ++element)
+        compact_gradients[lane * channel_elements + element] = orbital_jets[
+            matrices_layout.uncheckedGradientOffset(configuration, lane, element)];
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      compact_laplacians[element] = orbital_jets[
+          matrices_layout.uncheckedLaplacianOffset(configuration, 0, element)];
+    REQUIRE(determinant::combineSpatialTraces(
+        factorization.data() + channel_offset, combination[configuration],
+        weights.data() + channel_offset,
+        inverses.data() + configuration * channel_elements,
+        compact_gradients.data(), compact_laplacians.data(), channels, matrix_size,
+        gradient_lanes, electrons,
+        trace_scratch.data() + configuration * matrix_elements,
+        determinant_gradient.data() + configuration * gradient_lanes,
+        determinant_lap_ratio.data() + configuration,
+        determinant_lap_log.data() + configuration) ==
+        determinant::DerivativeStatus::AVAILABLE);
+  }
+
+  std::vector<double> factors(
+      qmcplusplus::psiformer::spatialJetSpanElements(matrices_layout), 91.0);
+  std::array<double, configurations * 3 * matrix_elements> factor_scratch{};
+  std::array<determinant::DerivativeStatus, configurations> status{};
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    const std::size_t channel_offset = configuration * channels;
+    status[configuration] = determinant::buildLiftedDeterminantFactors(
+        matrices_layout, configuration, factorization.data() + channel_offset,
+        combination[configuration], weights.data() + channel_offset,
+        inverses.data() + configuration * channel_elements, orbital_jets.data(),
+        determinant_gradient.data() + configuration * gradient_lanes,
+        determinant_lap_log.data() + configuration, channels, matrix_size,
+        factors.data(), factor_scratch.data() + configuration * 3 * matrix_elements);
+    REQUIRE(status[configuration] == determinant::DerivativeStatus::AVAILABLE);
+  }
+
+  const auto independent_factor = [&](const std::array<long double, channel_elements>& matrices,
+                                      std::size_t element) {
+    std::array<long double, channels> determinant_value{};
+    long double wave = 0.0L;
+    for (std::size_t channel = 0; channel < channels; ++channel)
+    {
+      const long double* matrix = matrices.data() + channel * matrix_elements;
+      determinant_value[channel] = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+      wave += static_cast<long double>(coefficients[channel]) * determinant_value[channel];
+    }
+    const std::size_t channel = element / matrix_elements;
+    const std::size_t entry = element % matrix_elements;
+    const long double* matrix = matrices.data() + channel * matrix_elements;
+    const std::array<long double, matrix_elements> cofactor{
+        matrix[3], -matrix[2], -matrix[1], matrix[0]};
+    return static_cast<long double>(coefficients[channel]) * cofactor[entry] / wave;
+  };
+
+  constexpr long double step = 2.0e-4L;
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+  {
+    std::array<long double, channel_elements> center{};
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      center[element] = base[configuration * channel_elements + element];
+    for (std::size_t element = 0; element < channel_elements; ++element)
+    {
+      const long double center_factor = independent_factor(center, element);
+      CHECK(factors[matrices_layout.uncheckedValueOffset(configuration, element)] ==
+            Catch::Approx(static_cast<double>(center_factor)).epsilon(2.0e-12).margin(2.0e-12));
+      long double laplacian = 0.0L;
+      for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+      {
+        std::array<long double, channel_elements> plus = center;
+        std::array<long double, channel_elements> minus = center;
+        for (std::size_t input = 0; input < channel_elements; ++input)
+        {
+          const long double gradient = orbital_jets[
+              matrices_layout.uncheckedGradientOffset(configuration, lane, input)];
+          const long double diagonal_second = orbital_jets[
+              matrices_layout.uncheckedLaplacianOffset(configuration, 0, input)] / 3.0L;
+          plus[input] += step * gradient + 0.5L * step * step * diagonal_second;
+          minus[input] -= step * gradient - 0.5L * step * step * diagonal_second;
+        }
+        const long double plus_factor = independent_factor(plus, element);
+        const long double minus_factor = independent_factor(minus, element);
+        const long double gradient = (plus_factor - minus_factor) / (2.0L * step);
+        laplacian += (plus_factor - 2.0L * center_factor + minus_factor) /
+            (step * step);
+        CHECK(factors[matrices_layout.uncheckedGradientOffset(configuration, lane, element)] ==
+              Catch::Approx(static_cast<double>(gradient)).epsilon(2.0e-7).margin(2.0e-8));
+      }
+      CHECK(factors[matrices_layout.uncheckedLaplacianOffset(configuration, 0, element)] ==
+            Catch::Approx(static_cast<double>(laplacian)).epsilon(3.0e-6).margin(3.0e-7));
+    }
+  }
+
+  // Padding proves canonical plane order, and rebuilding B=1 must not touch B=0.
+  for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    for (std::size_t plane = 0; plane < matrices_layout.plane_count; ++plane)
+      for (std::size_t pad = channel_elements; pad < matrices_layout.plane_stride; ++pad)
+      {
+        const std::size_t offset = configuration * matrices_layout.configuration_stride +
+            plane * matrices_layout.plane_stride + pad;
+        if (offset < factors.size())
+          CHECK(factors[offset] == 91.0);
+      }
+  const std::vector<double> before = factors;
+  status[1] = determinant::buildLiftedDeterminantFactors(
+      matrices_layout, 1, factorization.data() + channels, combination[1],
+      weights.data() + channels, inverses.data() + channel_elements,
+      orbital_jets.data(), determinant_gradient.data() + gradient_lanes,
+      determinant_lap_log.data() + 1, channels, matrix_size, factors.data(),
+      factor_scratch.data() + 3 * matrix_elements);
+  for (std::size_t plane = 0; plane < matrices_layout.plane_count; ++plane)
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      CHECK(factors[matrices_layout.uncheckedPlaneOffset(0, plane, element)] ==
+            before[matrices_layout.uncheckedPlaneOffset(0, plane, element)]);
+
+  std::vector<double> roots(qmcplusplus::psiformer::spatialJetSpanElements(roots_layout), -13.0);
+  roots[roots_layout.uncheckedValueOffset(0, 0)] = 0.7;
+  for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+    roots[roots_layout.uncheckedGradientOffset(0, lane, 0)] = 0.1 * (lane + 1);
+  roots[roots_layout.uncheckedLaplacianOffset(0, 0, 0)] = -0.4;
+  std::vector<double> adjoints(
+      qmcplusplus::psiformer::spatialJetSpanElements(matrices_layout), 37.0);
+  CHECK(determinant::reverseLiftedDeterminant(
+      matrices_layout, roots_layout, 0, status[0], factors.data(), roots.data(),
+      adjoints.data()) == determinant::DerivativeStatus::AVAILABLE);
+  for (std::size_t element = 0; element < channel_elements; ++element)
+  {
+    const double factor_value = factors[
+        matrices_layout.uncheckedValueOffset(0, element)];
+    double expected_value = 0.7 * factor_value;
+    for (std::size_t lane = 0; lane < gradient_lanes; ++lane)
+    {
+      const double root_gradient = 0.1 * (lane + 1);
+      const double factor_gradient = factors[
+          matrices_layout.uncheckedGradientOffset(0, lane, element)];
+      expected_value += root_gradient * factor_gradient;
+      CHECK(adjoints[matrices_layout.uncheckedGradientOffset(0, lane, element)] ==
+            Catch::Approx(root_gradient * factor_value - 0.8 * factor_gradient));
+    }
+    const double factor_laplacian = factors[
+        matrices_layout.uncheckedLaplacianOffset(0, 0, element)];
+    expected_value -= 0.4 * factor_laplacian;
+    CHECK(adjoints[matrices_layout.uncheckedValueOffset(0, element)] ==
+          Catch::Approx(expected_value));
+    CHECK(adjoints[matrices_layout.uncheckedLaplacianOffset(0, 0, element)] ==
+          Catch::Approx(-0.4 * factor_value));
+  }
+
+  // Unavailable and nonfinite paths clear only the requested logical configuration.
+  std::fill(factors.begin(), factors.end(), 19.0);
+  CHECK(determinant::buildLiftedDeterminantFactors(
+      matrices_layout, 0, factorization.data(), determinant::CombinationMetadata{},
+      weights.data(), inverses.data(), orbital_jets.data(), determinant_gradient.data(),
+      determinant_lap_log.data(), channels, matrix_size, factors.data(),
+      factor_scratch.data()) == determinant::DerivativeStatus::NODE);
+  for (std::size_t plane = 0; plane < matrices_layout.plane_count; ++plane)
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      CHECK(factors[matrices_layout.uncheckedPlaneOffset(0, plane, element)] == 0.0);
+  CHECK(factors[matrices_layout.uncheckedValueOffset(1, 0)] == 19.0);
+
+  std::vector<double> nonfinite_orbitals = orbital_jets;
+  nonfinite_orbitals[matrices_layout.uncheckedGradientOffset(0, 1, 2)] =
+      std::numeric_limits<double>::quiet_NaN();
+  std::fill(factors.begin(), factors.end(), 29.0);
+  CHECK(determinant::buildLiftedDeterminantFactors(
+      matrices_layout, 0, factorization.data(), combination[0], weights.data(),
+      inverses.data(), nonfinite_orbitals.data(), determinant_gradient.data(),
+      determinant_lap_log.data(), channels, matrix_size, factors.data(),
+      factor_scratch.data()) ==
+      determinant::DerivativeStatus::NONFINITE_INPUT_OR_RESULT);
+  for (std::size_t plane = 0; plane < matrices_layout.plane_count; ++plane)
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      CHECK(factors[matrices_layout.uncheckedPlaneOffset(0, plane, element)] == 0.0);
+  CHECK(factors[matrices_layout.uncheckedValueOffset(1, 0)] == 29.0);
+
+  std::fill(adjoints.begin(), adjoints.end(), 23.0);
+  CHECK(determinant::reverseLiftedDeterminant(
+      matrices_layout, roots_layout, 0,
+      determinant::DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE,
+      factors.data(), roots.data(), adjoints.data()) ==
+      determinant::DerivativeStatus::REQUIRED_INVERSE_UNAVAILABLE);
+  for (std::size_t plane = 0; plane < matrices_layout.plane_count; ++plane)
+    for (std::size_t element = 0; element < channel_elements; ++element)
+      CHECK(adjoints[matrices_layout.uncheckedPlaneOffset(0, plane, element)] == 0.0);
+  CHECK(adjoints[matrices_layout.uncheckedValueOffset(1, 0)] == 23.0);
+}
+
 int main(int argc, char* argv[])
 {
   return Catch::Session().run(argc, argv);

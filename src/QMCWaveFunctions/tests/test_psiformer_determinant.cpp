@@ -129,6 +129,23 @@ void testSingularChannelsAndExactNode()
   checkThrows([&] { workspace.fillLogAmplitudeMatrixAdjoints(adjoints.data()); },
               "reverse seed rejects an exact singular channel");
 
+  const std::array<double, 2> coefficients{0.0, 1.0};
+  const auto zero_coefficient = workspace.evaluate(matrices.data(), coefficients.data());
+  check(zero_coefficient.singular_channels == 1,
+        "zero-coefficient singular channel remains diagnostic");
+  check(zero_coefficient.all_required_inverses_available,
+        "zero-coefficient singular channel does not require an inverse");
+  check(workspace.channelWeight(0) == 0.0L && workspace.inverse(0) == nullptr,
+        "zero-coefficient singular channel has zero weight and no inverse");
+  workspace.fillLogAmplitudeMatrixAdjoints(adjoints.data());
+  for (std::size_t element = 0; element < 4; ++element)
+    check(adjoints[element] == 0.0,
+          "zero-coefficient singular channel has an exact zero reverse seed");
+  const std::array<double, 4> identity_adjoint{1.0, 0.0, 0.0, 1.0};
+  for (std::size_t element = 0; element < identity_adjoint.size(); ++element)
+    check(near(adjoints[4 + element], identity_adjoint[element]),
+          "regular contributing channel retains its direct reverse seed");
+
   const std::array<double, 8> all_singular{
       1.0, 2.0, 2.0, 4.0,
       0.0, 0.0, 0.0, 0.0};

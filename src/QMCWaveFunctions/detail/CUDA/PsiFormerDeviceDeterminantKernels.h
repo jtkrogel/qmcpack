@@ -20,6 +20,18 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/** Checked wrapper-facing layout for lifted determinant matrix jets. */
+struct LiftedDeterminantLayout
+{
+  SpatialJetLayout matrices;
+  SpatialJetLayout roots;
+  std::size_t determinant_count = 0;
+  std::size_t matrix_size       = 0;
+};
+
+static_assert(std::is_standard_layout_v<LiftedDeterminantLayout>);
+static_assert(std::is_trivially_copyable_v<LiftedDeterminantLayout>);
+
 Error launchDeterminantFactorization(
     Stream stream,
     const double* matrices,
@@ -73,6 +85,31 @@ Error launchDeterminantSpatialTraces(
     double* output_log_gradient,
     double* output_lap_ratio,
     double* output_lap_log,
+    device_determinant::DerivativeStatus* status);
+
+/** Build lifted determinant factor jets, one serial thread per configuration. */
+Error launchDeterminantFactorJets(
+    Stream stream,
+    const LiftedDeterminantLayout& layout,
+    const device_determinant::FactorizationMetadata* factorization_metadata,
+    const device_determinant::CombinationMetadata* combination_metadata,
+    const double* normalized_weights,
+    const double* inverses,
+    const double* orbital_jets,
+    const double* determinant_log_gradient,
+    const double* determinant_log_laplacian,
+    double* factor_jets,
+    double* three_matrix_scratch,
+    device_determinant::DerivativeStatus* status);
+
+/** Reverse lifted root jets through determinant factor jets. */
+Error launchDeterminantJetReverse(
+    Stream stream,
+    const LiftedDeterminantLayout& layout,
+    const device_determinant::DerivativeStatus* factor_status,
+    const double* factor_jets,
+    const double* root_jets,
+    double* orbital_adjoint_jets,
     device_determinant::DerivativeStatus* status);
 
 } // namespace qmcplusplus::psiformer::device
