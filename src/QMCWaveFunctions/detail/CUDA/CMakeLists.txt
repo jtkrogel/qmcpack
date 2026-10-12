@@ -17,7 +17,9 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceDerivativeKernels.cu
     PsiFormerDeviceDeterminantKernels.cu
     PsiFormerDevicePrecision.cu
-    PsiFormerDeviceSpatial.cu)
+    PsiFormerDeviceSpatial.cu
+    PsiFormerDeviceSpatialReverse.cu
+    PsiFormerDeviceOpenKineticReverse.cu)
 
 add_library(qmcwfs_cuda ${WFSSRCS_CUDA})
 if(QMC_CUDA2HIP)

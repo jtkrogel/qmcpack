@@ -577,6 +577,26 @@ add_unit_test(deterministic-unit_test_psiformer_device_spatial
 set_tests_properties(deterministic-unit_test_psiformer_device_spatial
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_device_spatial_reverse
+               test_psiformer_device_spatial_reverse.cpp)
+target_link_libraries(test_psiformer_device_spatial_reverse qmc_external_catch2)
+target_include_directories(test_psiformer_device_spatial_reverse PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_device_spatial_reverse
+              1 1 $<TARGET_FILE:test_psiformer_device_spatial_reverse>)
+set_tests_properties(deterministic-unit_test_psiformer_device_spatial_reverse
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_executable(test_psiformer_open_kinetic_reverse
+               test_psiformer_open_kinetic_reverse.cpp)
+target_link_libraries(test_psiformer_open_kinetic_reverse qmc_external_catch2)
+target_include_directories(test_psiformer_open_kinetic_reverse PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_open_kinetic_reverse
+              1 1 $<TARGET_FILE:test_psiformer_open_kinetic_reverse>)
+set_tests_properties(deterministic-unit_test_psiformer_open_kinetic_reverse
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_value_executor
                test_psiformer_value_executor.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp

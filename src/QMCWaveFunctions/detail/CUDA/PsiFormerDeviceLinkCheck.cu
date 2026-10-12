@@ -15,6 +15,8 @@
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDevicePrecision.h"
 #include "PsiFormerDeviceSpatial.h"
+#include "PsiFormerDeviceSpatialReverse.h"
+#include "PsiFormerDeviceOpenKineticReverse.h"
 
 int main()
 {
@@ -61,6 +63,42 @@ int main()
       launchAttentionContextJets(
           nullptr, qmcplusplus::psiformer::SpatialAttentionJetLayout{},
           nullptr, nullptr, nullptr) == success;
+  const bool spatial_product_reverse_linked =
+      launchElementwiseProductJetReverse(
+          nullptr, qmcplusplus::psiformer::SpatialElementwiseJetLayout{},
+          nullptr, nullptr, nullptr, 1.0, nullptr, nullptr) == success;
+  const bool spatial_tanh_reverse_linked =
+      launchTanhJetReverse(
+          nullptr, qmcplusplus::psiformer::SpatialElementwiseJetLayout{},
+          nullptr, nullptr, nullptr, nullptr) == success;
+  const bool spatial_softmax_reverse_linked =
+      launchSoftmaxJetReverse(
+          nullptr, qmcplusplus::psiformer::SoftmaxJetRowLayout{},
+          nullptr, nullptr, nullptr, nullptr) == success;
+  const bool spatial_context_reverse_linked =
+      launchAttentionContextJetReverse(
+          nullptr, qmcplusplus::psiformer::SpatialAttentionJetLayout{},
+          nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  const bool spatial_logit_reverse_linked =
+      launchAttentionLogitJetReverse(
+          nullptr, qmcplusplus::psiformer::SpatialAttentionJetLayout{},
+          nullptr, nullptr, nullptr, nullptr, nullptr) == success;
+  using DenseJetReverse = void (*)(
+      AcceleratorBlasHandle&, Stream,
+      const qmcplusplus::psiformer::SpatialDenseJetLayout&, const double*,
+      const double*, const double*, double*, double*, double*);
+  volatile DenseJetReverse spatial_dense_reverse_entry = &denseJetsReverse;
+  const bool spatial_dense_reverse_linked = spatial_dense_reverse_entry != nullptr;
+  const bool open_orbital_kinetic_reverse_linked =
+      launchOpenOrbitalKineticReverse(
+          nullptr, qmcplusplus::psiformer::OpenOrbitalKineticReverseLayout{},
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr) == success;
+  const bool open_cusp_kinetic_reverse_linked =
+      launchOpenCuspKineticReverse(
+          nullptr, qmcplusplus::psiformer::OpenCuspKineticReverseLayout{},
+          nullptr, 0.0, 0.0, nullptr, nullptr, nullptr) == success;
   const bool open_feature_linked =
       launchOpenFeatureJets(nullptr, qmcplusplus::psiformer::OpenFeatureJetLayout{},
                             nullptr, nullptr, nullptr, nullptr, nullptr) == success;
@@ -166,7 +204,11 @@ int main()
          determinant_spatial_linked && determinant_factor_jets_linked &&
          determinant_jet_reverse_linked && spatial_softmax_linked &&
          spatial_dense_linked && spatial_qkv_linked &&
-         spatial_attention_linked && spatial_context_linked && open_feature_linked &&
+         spatial_attention_linked && spatial_context_linked &&
+         spatial_product_reverse_linked && spatial_tanh_reverse_linked &&
+         spatial_softmax_reverse_linked && spatial_context_reverse_linked &&
+         spatial_logit_reverse_linked && spatial_dense_reverse_linked && open_feature_linked &&
+         open_orbital_kinetic_reverse_linked && open_cusp_kinetic_reverse_linked &&
          tanh_jet_linked && residual_jet_linked && cusp_jet_linked &&
          final_spatial_linked && open_orbital_linked && precision_conversion_linked &&
          fp32_dense_linked && fp32_qkv_linked && fp32_logits_linked &&
