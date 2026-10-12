@@ -43,6 +43,7 @@ set(WFBASE_SRCS
     ExampleHeComponent.cpp
     PsiFormer/PsiFormerAcceleratorPlanning.cpp
     PsiFormer/PsiFormerAcceleratorSchedule.cpp
+    PsiFormer/PsiFormerDerivativePlanning.cpp
     PsiFormer/PsiFormerExecutionPlan.cpp
     PsiFormer/PsiFormerMemoryPolicy.cpp
     PsiFormer/PsiFormerPrecisionExecution.cpp

@@ -497,6 +497,18 @@ add_unit_test(deterministic-unit_test_psiformer_device_math
 set_tests_properties(deterministic-unit_test_psiformer_device_math
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# The score-reverse scalar cores are host-callable and intentionally tested in
+# their own small executable so CPU-only builds retain this derivative oracle.
+add_executable(test_psiformer_device_derivative_math
+               test_psiformer_device_derivative_math.cpp)
+target_link_libraries(test_psiformer_device_derivative_math qmc_external_catch2)
+target_include_directories(test_psiformer_device_derivative_math PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_device_derivative_math
+              1 1 $<TARGET_FILE:test_psiformer_device_derivative_math>)
+set_tests_properties(deterministic-unit_test_psiformer_device_derivative_math
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_device_attention test_psiformer_device_attention.cpp)
 target_link_libraries(test_psiformer_device_attention qmc_external_catch2 platform_cpu_LA)
 target_include_directories(test_psiformer_device_attention PRIVATE
@@ -535,6 +547,17 @@ target_include_directories(test_psiformer_precision_orchestration PRIVATE
 add_unit_test(deterministic-unit_test_psiformer_precision_orchestration
               1 1 $<TARGET_FILE:test_psiformer_precision_orchestration>)
 set_tests_properties(deterministic-unit_test_psiformer_precision_orchestration
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+add_executable(test_psiformer_derivative_planning
+               test_psiformer_derivative_planning.cpp)
+target_link_libraries(test_psiformer_derivative_planning
+                      qmc_external_catch2 qmcwfs)
+target_include_directories(test_psiformer_derivative_planning PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_derivative_planning
+              1 1 $<TARGET_FILE:test_psiformer_derivative_planning>)
+set_tests_properties(deterministic-unit_test_psiformer_derivative_planning
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
 add_executable(test_psiformer_device_determinant_math
