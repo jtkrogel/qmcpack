@@ -408,6 +408,24 @@ public:
   /// Return the current checked lifecycle state.
   DerivativeSinkState state() const noexcept { return state_; }
 
+  /// Inspect the immutable descriptor of the active transaction, or nullptr otherwise.
+  const DerivativeStreamDescriptor* activeDescriptor() const noexcept
+  {
+    return state_ == DerivativeSinkState::ACTIVE ? descriptor_ : nullptr;
+  }
+
+  /// Inspect the immutable chunk plan of the active transaction, or nullptr otherwise.
+  const ParameterChunkPlan* activeChunkPlan() const noexcept
+  {
+    return state_ == DerivativeSinkState::ACTIVE ? chunk_plan_ : nullptr;
+  }
+
+  /// Return the active transaction's channel count, or zero otherwise.
+  std::size_t activeChannelCount() const noexcept
+  {
+    return state_ == DerivativeSinkState::ACTIVE ? channel_count_ : 0;
+  }
+
 protected:
   /// Prepare derived storage for a validated transaction.
   virtual void onBegin(const DerivativeStreamDescriptor&,
@@ -474,6 +492,12 @@ public:
 
   /// Return the current checked lifecycle state.
   DerivativeSinkState state() const noexcept { return state_; }
+
+  /// Inspect the immutable descriptor of the active transaction, or nullptr otherwise.
+  const DerivativeStreamDescriptor* activeDescriptor() const noexcept
+  {
+    return state_ == DerivativeSinkState::ACTIVE ? descriptor_ : nullptr;
+  }
 
 protected:
   /// Prepare derived storage for a validated JVP transaction.
