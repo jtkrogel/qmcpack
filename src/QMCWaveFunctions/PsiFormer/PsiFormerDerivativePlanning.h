@@ -351,6 +351,18 @@ PsiFormerECPTileLaunchRecord makePsiFormerECPTileLaunchRecord(
     const PsiFormerECPTileMetadata& metadata,
     std::size_t channel_count);
 
+/** Construct an ECP launch record after the owning preparation boundary validated plan.
+ *
+ * This path performs only bounded POD checks and arithmetic and allocates no memory.
+ * Passing a plan not previously accepted by validatePsiFormerDerivativePlan is a
+ * caller contract violation.
+ */
+PsiFormerECPTileLaunchRecord
+makePsiFormerECPTileLaunchRecordFromPrevalidatedPlan(
+    const PsiFormerDerivativePlan& plan,
+    const PsiFormerECPTileMetadata& metadata,
+    std::size_t channel_count);
+
 } // namespace qmcplusplus::psiformer
 
 #endif // QMCPLUSPLUS_PSIFORMER_DERIVATIVE_PLANNING_H

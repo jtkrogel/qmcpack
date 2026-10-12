@@ -75,6 +75,26 @@ struct DerivativeFiniteStatus
   std::size_t nonfinite_count = 0;
 };
 
+/** One outer-serial replacement-score fold with no Q-by-P storage.
+ *
+ * Coefficients and ratios are interleaved complex FP64.  The wrapper is called once
+ * per point in canonical order, so each accumulator scalar and sample weight sum has
+ * one launch owner and requires no atomics.
+ */
+struct ECPWeightedResponseLayout
+{
+  std::size_t parameter_count = 0;
+  std::size_t channel_count = 0;
+  std::size_t sample_count = 0;
+  std::size_t sample_index = 0;
+  std::size_t point_count = 0;
+  std::size_t point_index = 0;
+  std::size_t response_offset = 0;
+  std::size_t response_stride = 0;
+  std::size_t coefficient_channel_stride_complex = 0;
+  std::size_t accumulator_channel_stride_fp64 = 0;
+};
+
 /** Padded [configuration,determinant,row-electron,orbital] value layout. */
 struct OrbitalProductReverseLayout
 {
@@ -138,6 +158,8 @@ static_assert(std::is_standard_layout_v<DerivativeFiniteScanLayout>);
 static_assert(std::is_trivially_copyable_v<DerivativeFiniteScanLayout>);
 static_assert(std::is_standard_layout_v<DerivativeFiniteStatus>);
 static_assert(std::is_trivially_copyable_v<DerivativeFiniteStatus>);
+static_assert(std::is_standard_layout_v<ECPWeightedResponseLayout>);
+static_assert(std::is_trivially_copyable_v<ECPWeightedResponseLayout>);
 static_assert(std::is_standard_layout_v<OrbitalProductReverseLayout>);
 static_assert(std::is_trivially_copyable_v<OrbitalProductReverseLayout>);
 static_assert(std::is_standard_layout_v<EnvelopeParameterReverseLayout>);
@@ -169,6 +191,21 @@ Error launchRealToComplexAxpy(Stream stream,
                               double alpha_imag,
                               const double* source,
                               double* accumulator);
+
+/** Fold one complete weighted replacement response and update its sample sum.
+ *
+ * All point launches in one contraction must use the same ordered stream.  Every
+ * input/output buffer must cover the extents described by layout, and destructive
+ * outputs must be disjoint from each other and from all inputs.
+ */
+Error launchECPWeightedResponse(Stream stream,
+                                const ECPWeightedResponseLayout& layout,
+                                const double* bare_weights,
+                                const double* complete_ratios_interleaved,
+                                const double* coefficients_interleaved,
+                                const double* response,
+                                double* sample_weight_sums_interleaved,
+                                double* accumulators_interleaved);
 
 /** Produce deterministic caller-bounded partials of ``dot(response,direction)``.
  *

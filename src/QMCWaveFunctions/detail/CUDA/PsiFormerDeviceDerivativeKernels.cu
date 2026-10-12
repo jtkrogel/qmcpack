@@ -203,6 +203,46 @@ __global__ void realToComplexAxpyKernel(RealToComplexAxpyLayout layout,
   output[1] += alpha_imag * value;
 }
 
+__global__ void ecpWeightedResponseKernel(
+    ECPWeightedResponseLayout layout,
+    const double* bare_weights,
+    const double* complete_ratios,
+    const double* coefficients,
+    const double* response,
+    double* sample_weight_sums,
+    double* accumulators)
+{
+  const std::size_t parameter =
+      std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (parameter >= layout.parameter_count)
+    return;
+  const auto weight = device_derivative::ecpCompleteWeight(
+      bare_weights[layout.point_index],
+      {complete_ratios[2 * layout.point_index],
+       complete_ratios[2 * layout.point_index + 1]});
+  const double response_value =
+      response[layout.response_offset + parameter * layout.response_stride];
+  for (std::size_t channel = 0; channel < layout.channel_count; ++channel)
+  {
+    const std::size_t coefficient_index =
+        channel * layout.coefficient_channel_stride_complex +
+        layout.sample_index;
+    const auto alpha = device_derivative::complexProduct(
+        {coefficients[2 * coefficient_index],
+         coefficients[2 * coefficient_index + 1]},
+        weight);
+    double* output = accumulators +
+        channel * layout.accumulator_channel_stride_fp64 + 2 * parameter;
+    output[0] += alpha.real * response_value;
+    output[1] += alpha.imaginary * response_value;
+  }
+  if (parameter == 0)
+  {
+    sample_weight_sums[2 * layout.sample_index] += weight.real;
+    sample_weight_sums[2 * layout.sample_index + 1] += weight.imaginary;
+  }
+}
+
 __global__ void responseDotDirectionKernel(ResponseDotLayout layout,
                                            const double* response,
                                            const double* direction,
@@ -683,6 +723,66 @@ Error launchRealToComplexAxpy(Stream stream,
                               "PsiFormer real-to-complex AXPY grid exceeds the CUDA/HIP x dimension"),
                            derivative_block_size, 0, stream>>>(
       layout, alpha_real, alpha_imag, source, accumulator);
+  return peekAtLastError();
+}
+
+Error launchECPWeightedResponse(
+    Stream stream,
+    const ECPWeightedResponseLayout& layout,
+    const double* bare_weights,
+    const double* complete_ratios_interleaved,
+    const double* coefficients_interleaved,
+    const double* response,
+    double* sample_weight_sums_interleaved,
+    double* accumulators_interleaved)
+{
+  if (layout.parameter_count == 0)
+    return success;
+  const std::size_t complex_parameter_extent = checkedProduct(
+      2, layout.parameter_count,
+      "PsiFormer ECP accumulator extent overflow");
+  if (layout.channel_count == 0 || layout.channel_count > 3 ||
+      layout.sample_count == 0 || layout.sample_index >= layout.sample_count ||
+      layout.point_count == 0 || layout.point_index >= layout.point_count ||
+      layout.response_stride == 0 ||
+      layout.coefficient_channel_stride_complex < layout.sample_count ||
+      layout.accumulator_channel_stride_fp64 < complex_parameter_extent)
+    throw std::invalid_argument("PsiFormer ECP weighted-response layout is invalid");
+  validateStridedInterval(layout.parameter_count, layout.response_offset,
+                          layout.response_stride,
+                          "PsiFormer ECP response extent is invalid");
+  const std::size_t maximum_coefficient_index = checkedAdd(
+      checkedProduct(layout.channel_count - 1,
+                     layout.coefficient_channel_stride_complex,
+                     "PsiFormer ECP coefficient extent overflow"),
+      layout.sample_index, "PsiFormer ECP coefficient extent overflow");
+  const auto point_indices =
+      device_derivative::interleavedComplexIndex(layout.point_index);
+  const auto sample_indices =
+      device_derivative::interleavedComplexIndex(layout.sample_index);
+  const auto coefficient_indices =
+      device_derivative::interleavedComplexIndex(maximum_coefficient_index);
+  if (!point_indices.valid || !sample_indices.valid ||
+      !coefficient_indices.valid)
+    throw std::length_error(
+        "PsiFormer ECP interleaved complex scalar index overflow");
+  (void)checkedAdd(
+      checkedProduct(layout.channel_count - 1,
+                     layout.accumulator_channel_stride_fp64,
+                     "PsiFormer ECP accumulator extent overflow"),
+      complex_parameter_extent,
+      "PsiFormer ECP accumulator extent overflow");
+  if (!bare_weights || !complete_ratios_interleaved ||
+      !coefficients_interleaved || !response ||
+      !sample_weight_sums_interleaved || !accumulators_interleaved)
+    throw std::invalid_argument("PsiFormer ECP weighted-response storage is null");
+  ecpWeightedResponseKernel<<<blockCount(
+                                layout.parameter_count,
+                                "PsiFormer ECP weighted-response grid exceeds the CUDA/HIP x dimension"),
+                             derivative_block_size, 0, stream>>>(
+      layout, bare_weights, complete_ratios_interleaved,
+      coefficients_interleaved, response, sample_weight_sums_interleaved,
+      accumulators_interleaved);
   return peekAtLastError();
 }
 

@@ -45,6 +45,7 @@ set(WFBASE_SRCS
     PsiFormer/PsiFormerAcceleratorSchedule.cpp
     PsiFormer/PsiFormerDerivativeOrchestration.cpp
     PsiFormer/PsiFormerDerivativePlanning.cpp
+    PsiFormer/PsiFormerECPContraction.cpp
     PsiFormer/PsiFormerExecutionPlan.cpp
     PsiFormer/PsiFormerMemoryPolicy.cpp
     PsiFormer/PsiFormerPrecisionExecution.cpp

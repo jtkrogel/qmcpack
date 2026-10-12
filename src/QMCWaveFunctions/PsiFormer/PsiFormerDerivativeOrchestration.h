@@ -113,6 +113,18 @@ PsiFormerDerivativeCompletionToken makePsiFormerVJPCompletionToken(
     std::size_t channel_count,
     std::uint32_t status = 0);
 
+/** Construct a VJP token after the owning preparation boundary validated plan.
+ *
+ * This warmed path checks the POD request but does not rebuild vector-backed plan
+ * layouts and allocates no memory.
+ */
+PsiFormerDerivativeCompletionToken
+makePsiFormerVJPCompletionTokenFromPrevalidatedPlan(
+    const PsiFormerDerivativePlan& plan,
+    wftrain::DerivativeAdjoint adjoint,
+    std::size_t channel_count,
+    std::uint32_t status = 0);
+
 /// Construct a one-scalar score-JVP completion identity.
 PsiFormerDerivativeCompletionToken makePsiFormerJVPCompletionToken(
     const PsiFormerDerivativePlan& plan,

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <complex>
 #include <limits>
 #include <vector>
 
@@ -220,6 +221,38 @@ TEST_CASE("PsiFormer derivative finite helper classifies binary64 values",
   CHECK_FALSE(math::isFiniteBinary64(std::numeric_limits<double>::infinity()));
   CHECK_FALSE(math::isFiniteBinary64(-std::numeric_limits<double>::infinity()));
   CHECK_FALSE(math::isFiniteBinary64(std::numeric_limits<double>::quiet_NaN()));
+}
+
+TEST_CASE("PsiFormer ECP complete weight and coefficient product preserve complex parts",
+          "[psiformer][device][derivative][ecp]")
+{
+  const derivative::ComplexComponents ratio{-0.75, 1.25};
+  const auto weight = derivative::ecpCompleteWeight(2.5, ratio);
+  CHECK(weight.real == Catch::Approx(-1.875));
+  CHECK(weight.imaginary == Catch::Approx(3.125));
+  const auto alpha = derivative::complexProduct({0.5, -2.0}, weight);
+  const std::complex<double> expected =
+      std::complex<double>(0.5, -2.0) *
+      std::complex<double>(weight.real, weight.imaginary);
+  CHECK(alpha.real == Catch::Approx(expected.real()));
+  CHECK(alpha.imaginary == Catch::Approx(expected.imag()));
+}
+
+TEST_CASE("PsiFormer interleaved complex indices reject scalar overflow",
+          "[psiformer][device][derivative][ecp]")
+{
+  const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  const std::size_t last_valid = (maximum - std::size_t{1}) / std::size_t{2};
+  const auto zero = derivative::interleavedComplexIndex(0);
+  CHECK(zero.valid);
+  CHECK(zero.real == 0);
+  CHECK(zero.imaginary == 1);
+  const auto boundary = derivative::interleavedComplexIndex(last_valid);
+  CHECK(boundary.valid);
+  CHECK(boundary.real == maximum - 1);
+  CHECK(boundary.imaginary == maximum);
+  const auto overflow = derivative::interleavedComplexIndex(last_valid + 1);
+  CHECK_FALSE(overflow.valid);
 }
 
 // Keep this oracle executable independent of QMCPACK's accelerator-initializing

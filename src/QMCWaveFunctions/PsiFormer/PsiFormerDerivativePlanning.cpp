@@ -908,6 +908,16 @@ PsiFormerECPTileLaunchRecord makePsiFormerECPTileLaunchRecord(
     std::size_t channel_count)
 {
   validatePsiFormerDerivativePlan(plan);
+  return makePsiFormerECPTileLaunchRecordFromPrevalidatedPlan(
+      plan, metadata, channel_count);
+}
+
+PsiFormerECPTileLaunchRecord
+makePsiFormerECPTileLaunchRecordFromPrevalidatedPlan(
+    const PsiFormerDerivativePlan& plan,
+    const PsiFormerECPTileMetadata& metadata,
+    std::size_t channel_count)
+{
   if (metadata.grid_fingerprint == 0 || metadata.tile_fingerprint == 0)
     throw std::invalid_argument("PsiFormer ECP launch requires nonzero grid and tile fingerprints");
   if (metadata.parameter_version != plan.parameter_version)

@@ -19,6 +19,8 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceMath.h"
 
 #include <cmath>
+#include <cstddef>
+#include <limits>
 #include <type_traits>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -31,6 +33,53 @@
 
 namespace qmcplusplus::psiformer::device_derivative
 {
+
+struct ComplexComponents
+{
+  double real;
+  double imaginary;
+};
+
+static_assert(std::is_standard_layout_v<ComplexComponents>);
+static_assert(std::is_trivially_copyable_v<ComplexComponents>);
+
+struct InterleavedComplexIndex
+{
+  std::size_t real;
+  std::size_t imaginary;
+  bool valid;
+};
+
+static_assert(std::is_standard_layout_v<InterleavedComplexIndex>);
+static_assert(std::is_trivially_copyable_v<InterleavedComplexIndex>);
+
+/** Checked scalar indices for one interleaved complex logical index. */
+QMC_PF_DERIVATIVE_HOST_DEVICE QMC_PF_DERIVATIVE_FORCE_INLINE
+InterleavedComplexIndex interleavedComplexIndex(std::size_t logical_index) noexcept
+{
+  if (logical_index >
+      (std::numeric_limits<std::size_t>::max() - std::size_t{1}) /
+          std::size_t{2})
+    return {0, 0, false};
+  const std::size_t real = std::size_t{2} * logical_index;
+  return {real, real + std::size_t{1}, true};
+}
+
+/** Complex product used by the serial ECP response fold. */
+QMC_PF_DERIVATIVE_HOST_DEVICE QMC_PF_DERIVATIVE_FORCE_INLINE ComplexComponents
+complexProduct(ComplexComponents left, ComplexComponents right) noexcept
+{
+  return {left.real * right.real - left.imaginary * right.imaginary,
+          left.real * right.imaginary + left.imaginary * right.real};
+}
+
+/** Complete ordinary-locality weight: real bare quadrature weight times ALL ratio. */
+QMC_PF_DERIVATIVE_HOST_DEVICE QMC_PF_DERIVATIVE_FORCE_INLINE ComplexComponents
+ecpCompleteWeight(double bare_weight, ComplexComponents complete_ratio) noexcept
+{
+  return {bare_weight * complete_ratio.real,
+          bare_weight * complete_ratio.imaginary};
+}
 
 /** Reverse tanh from its retained forward output. */
 QMC_PF_DERIVATIVE_HOST_DEVICE QMC_PF_DERIVATIVE_FORCE_INLINE double tanhAdjointFromOutput(

@@ -154,6 +154,10 @@ int main()
   const bool derivative_axpy_linked =
       launchRealToComplexAxpy(nullptr, RealToComplexAxpyLayout{}, 0.0, 0.0,
                               nullptr, nullptr) == success;
+  const bool derivative_ecp_linked =
+      launchECPWeightedResponse(nullptr, ECPWeightedResponseLayout{}, nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr) ==
+      success;
   const bool derivative_dot_partials_linked =
       launchResponseDotDirectionPartials(nullptr, ResponseDotLayout{}, nullptr,
                                          nullptr, nullptr, nullptr) == success;
@@ -215,6 +219,7 @@ int main()
          fp32_context_linked && fp32_softmax_linked && fp32_tanh_linked &&
          fp32_residual_linked && fp64_to_fp32_linked && fp32_to_fp64_linked &&
          derivative_zero_linked && derivative_copy_linked && derivative_axpy_linked &&
+         derivative_ecp_linked &&
          derivative_dot_partials_linked && derivative_dot_finalize_linked &&
          derivative_dot_linked && derivative_tanh_reverse_linked &&
          derivative_context_reverse_linked && derivative_qk_reverse_linked &&

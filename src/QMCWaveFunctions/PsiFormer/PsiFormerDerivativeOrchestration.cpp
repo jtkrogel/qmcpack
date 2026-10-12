@@ -154,6 +154,17 @@ PsiFormerDerivativeCompletionToken makePsiFormerVJPCompletionToken(
     std::uint32_t status)
 {
   validatePsiFormerDerivativePlan(plan);
+  return makePsiFormerVJPCompletionTokenFromPrevalidatedPlan(
+      plan, adjoint, channel_count, status);
+}
+
+PsiFormerDerivativeCompletionToken
+makePsiFormerVJPCompletionTokenFromPrevalidatedPlan(
+    const PsiFormerDerivativePlan& plan,
+    wftrain::DerivativeAdjoint adjoint,
+    std::size_t channel_count,
+    std::uint32_t status)
+{
   if (adjoint != wftrain::DerivativeAdjoint::TRANSPOSE &&
       adjoint != wftrain::DerivativeAdjoint::HERMITIAN)
     throw std::invalid_argument("PsiFormer VJP completion has an invalid adjoint convention");
