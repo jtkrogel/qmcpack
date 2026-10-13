@@ -45,6 +45,7 @@ set(QMCDRIVERS
     WFOpt/GradientTest.cpp
     WFTrain/TrainingCapabilities.cpp
     WFTrain/AcceleratorTrainingPlan.cpp
+    WFTrain/AcceleratorCollectiveState.cpp
     WFTrain/QuantileClipping.cpp
     WFTrain/EnergyGradientAccumulator.cpp
     WFTrain/DistributedParameterReduction.cpp
