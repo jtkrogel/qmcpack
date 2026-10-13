@@ -367,16 +367,22 @@ public:
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size) const override;
 
+  /// Construct an O(B N_e + M + P) determinant-channel overlap batch.
+  std::unique_ptr<psiformer::DeterminantChannelBatch> makeDeterminantChannelBatch(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list) const override;
+
   /** Construct a bounded inline ordinary-locality ECP derivative consumer.
    *
-   * This 11C1 seam intentionally remains separate from the advertised streaming
-   * local-energy capability until a Hamiltonian owner supplies every live tile.
+   * Ordinary VJP callers retain only O(P)+O(B).  Directional local-energy
+   * actions may explicitly request one O(Q) immutable accepted-grid replay.
    */
   std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
   makeNonLocalECPDerivativeConsumer(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
-      std::size_t maximum_parameter_chunk_size) const;
+      std::size_t maximum_parameter_chunk_size,
+      bool capture_jvp_replay = false) const;
 
   /// Atomically publish one complete, version-matched native vector.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,

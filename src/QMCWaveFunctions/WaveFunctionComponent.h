@@ -50,6 +50,10 @@ namespace wftrain
 class StructuredParameterProvider;
 class StreamingDerivativeOperator;
 }
+namespace psiformer
+{
+class DeterminantChannelBatch;
+}
 /**@defgroup WaveFunctionComponent group
  * @brief Classes which constitute a many-body trial wave function
  *
@@ -221,6 +225,15 @@ public:
       std::size_t batch_ordinal,
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size) const;
+
+  /** Construct a determinant-resolved batch for bounded overlap objectives.
+   *
+   * Unsupported components fail closed.  The returned owner copies all positions
+   * needed after this call and remains bound to the current parameter version.
+   */
+  virtual std::unique_ptr<psiformer::DeterminantChannelBatch> makeDeterminantChannelBatch(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list) const;
 
   /** Register the component with the TWFFastDerivWrapper wrapper.  
    */

@@ -22,6 +22,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <memory>
+#include <string>
 #include <string_view>
 
 namespace qmcplusplus::wftrain
@@ -71,10 +74,93 @@ struct NonLocalECPDerivativeTile
   std::uint64_t grid_fingerprint = 0;
 };
 
+/** One immutable quadrature point retained for exact parameter-direction replay. */
+struct NonLocalECPReplayPoint
+{
+  std::size_t sample = 0;
+  std::size_t electron = 0;
+  std::array<double, 3> replacement_position{};
+  DerivativeValue bare_weight{};
+  DerivativeValue complete_ratio{};
+};
+
+/** Preserve one accepted virtual-particle segment and its flat point interval. */
+struct NonLocalECPReplaySegment
+{
+  std::size_t point_offset = 0;
+  std::size_t point_count = 0;
+  std::size_t sample = 0;
+  std::size_t electron = 0;
+  bool on_sphere = false;
+  std::size_t source_center = static_cast<std::size_t>(-1);
+};
+
+/** Preserve exact tile boundaries and opaque value-evaluation provenance.
+ *
+ * Evaluation stamps are retained for restart/audit identity.  Replay arithmetic
+ * uses the already accepted positions and complete ratios and never reevaluates
+ * the stamped TrialWaveFunction ratio path.
+ */
+struct NonLocalECPReplayTile
+{
+  std::size_t tile_ordinal = 0;
+  std::size_t point_offset = 0;
+  std::size_t point_count = 0;
+  std::size_t segment_offset = 0;
+  std::size_t segment_count = 0;
+  std::size_t stamp_offset = 0;
+  std::size_t stamp_count = 0;
+  std::uint64_t virtual_batch_fingerprint = 0;
+};
+
+/// Exact retained-storage accounting for one immutable accepted-grid replay.
+struct NonLocalECPReplayStorageDiagnostics
+{
+  std::size_t point_count = 0;
+  std::size_t segment_count = 0;
+  std::size_t tile_count = 0;
+  std::size_t evaluation_stamp_count = 0;
+  std::size_t reference_position_bytes = 0;
+  std::size_t point_bytes = 0;
+  std::size_t provenance_bytes = 0;
+  std::size_t retained_numeric_bytes = 0;
+  std::size_t storage_fingerprint = 0;
+};
+
+/** Immutable O(Q) record of one accepted ordinary-locality ECP traversal. */
+class NonLocalECPJVPReplay
+{
+public:
+  NonLocalECPJVPReplay() = default;
+  NonLocalECPJVPReplay(const NonLocalECPJVPReplay&) = delete;
+  NonLocalECPJVPReplay& operator=(const NonLocalECPJVPReplay&) = delete;
+  virtual ~NonLocalECPJVPReplay() = default;
+
+  virtual std::string_view providerId() const noexcept = 0;
+  virtual std::string_view schemaFingerprint() const noexcept = 0;
+  virtual std::size_t parameterVersion() const noexcept = 0;
+  virtual std::size_t batchOrdinal() const noexcept = 0;
+  virtual std::size_t sampleOffset() const noexcept = 0;
+  virtual std::size_t sampleCount() const noexcept = 0;
+  virtual std::size_t electronCount() const noexcept = 0;
+  virtual std::uint32_t localEnergyTermMask() const noexcept = 0;
+  virtual std::uint64_t gridFingerprint() const noexcept = 0;
+  virtual DerivativeArrayView<const double> referencePositions() const noexcept = 0;
+  virtual DerivativeArrayView<const NonLocalECPReplayPoint> points() const noexcept = 0;
+  virtual DerivativeArrayView<const NonLocalECPReplaySegment> segments() const noexcept = 0;
+  virtual DerivativeArrayView<const NonLocalECPReplayTile> tiles() const noexcept = 0;
+  virtual DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp>
+      evaluationStamps() const noexcept = 0;
+  virtual NonLocalECPReplayStorageDiagnostics storageDiagnostics() const noexcept = 0;
+};
+
 /** Consume live ECP tiles without a virtual-point-by-parameter staging matrix.
  *
  * Implementations own at most a fixed number of O(P) contraction vectors and
- * O(B) scalar reductions.  A begun transaction must finish with end() or abort().
+ * O(B) scalar reductions.  Implementations may optionally retain an O(Q)
+ * accepted-grid replay when explicitly requested by the factory; ordinary VJP
+ * consumers need not pay this cost.  A begun transaction must finish with
+ * end() or abort().
  */
 class NonLocalECPDerivativeConsumer
 {
@@ -107,6 +193,14 @@ public:
 
   /// Abandon partial arithmetic and poison the active sink without throwing.
   virtual void abort() noexcept = 0;
+
+  /** Transfer an explicitly requested completed accepted-grid replay once.
+   *
+   * The transaction is one-shot even after transfer; callers must construct a
+   * new consumer for another accepted grid.  Implementations reject this call
+   * when replay capture was not requested.
+   */
+  virtual std::unique_ptr<NonLocalECPJVPReplay> releaseJVPReplay() = 0;
 
   /// Return exact retained-storage diagnostics for bounded-memory tests.
   virtual StreamingDerivativeStorageDiagnostics storageDiagnostics() const = 0;

@@ -14,6 +14,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
@@ -1231,6 +1232,376 @@ bool isCoherentPhysicalValue(const PsiFormerSharedState& state,
 }
 } // namespace
 
+/** Own copied configurations and reusable scratch for overlap-channel evaluation. */
+class PsiFormerDeterminantChannelBatch final
+    : public psiformer::DeterminantChannelBatch
+{
+public:
+  PsiFormerDeterminantChannelBatch(
+      std::shared_ptr<PsiFormerSharedState> model_state,
+      std::shared_ptr<const wftrain::StructuredParameterSchema> schema,
+      std::size_t parameter_version,
+      std::size_t sample_count,
+      std::vector<double> positions)
+      : model_state_(std::move(model_state)),
+        schema_(std::move(schema)),
+        parameter_version_(parameter_version),
+        sample_count_(sample_count),
+        electron_count_(model_state_->execution_plan.modelShape().electrons()),
+        channel_count_(model_state_->execution_plan.modelShape().determinants),
+        positions_(std::move(positions)),
+        phases_(channel_count_),
+        log_abs_(channel_count_),
+        workspace_(model_state_->direct_score_executor.makeWorkspace())
+  {
+    const std::size_t expected_positions = checkedBatchMemoryMultiply(
+        checkedBatchMemoryMultiply(sample_count_, electron_count_,
+                                   "PsiFormer overlap sample positions"),
+        std::size_t{3}, "PsiFormer overlap Cartesian positions");
+    if (positions_.size() != expected_positions || channel_count_ == 0 ||
+        schema_->parameterCount() != model_state_->execution_plan.parameterCount() ||
+        workspace_->scoreSize() != schema_->parameterCount())
+      throw std::invalid_argument(
+          "PsiFormer determinant-channel batch has inconsistent shape or schema");
+    retained_numeric_bytes_ = checkedBatchMemoryAdd(
+        checkedBatchMemoryAdd(
+            checkedBatchMemoryMultiply(positions_.capacity(), sizeof(double),
+                                       "PsiFormer overlap position storage"),
+            checkedBatchMemoryMultiply(
+                checkedBatchMemoryAdd(phases_.capacity(), log_abs_.capacity(),
+                                      "PsiFormer overlap channel scratch"),
+                sizeof(double), "PsiFormer overlap channel storage"),
+            "PsiFormer overlap sample and channel storage"),
+        checkedBatchMemoryAdd(workspace_->vectorStorageBytes(),
+                              workspace_->scoreStorageBytes(),
+                              "PsiFormer overlap score workspace"),
+        "PsiFormer overlap retained storage");
+  }
+
+  const std::string& providerId() const noexcept override
+  {
+    return schema_->providerId();
+  }
+
+  const std::string& schemaFingerprint() const noexcept override
+  {
+    return schema_->fingerprint();
+  }
+
+  std::size_t parameterVersion() const noexcept override { return parameter_version_; }
+  std::size_t sampleCount() const noexcept override { return sample_count_; }
+  std::size_t channelCount() const noexcept override { return channel_count_; }
+  std::size_t parameterCount() const noexcept override { return schema_->parameterCount(); }
+
+  void evaluateAmplitudes(
+      std::size_t sample,
+      psiformer::RealSignedLogAmplitude* output,
+      std::size_t output_count) const override
+  {
+    if (sample >= sample_count_ || !output || output_count != channel_count_)
+      throw std::invalid_argument(
+          "PsiFormer determinant-channel amplitude request has invalid extent");
+    std::shared_lock state_lock(model_state_->mutex);
+    requireBoundVersion();
+    setWorkspacePositions(sample);
+    const pf::DirectChannelAmplitudeResult result =
+        model_state_->direct_score_executor.evaluateChannelAmplitudes(
+            *workspace_, phases_.data(), log_abs_.data(), channel_count_);
+    if (result.parameter_version != parameter_version_ ||
+        result.channel_count != channel_count_)
+      throw std::logic_error(
+          "PsiFormer determinant-channel amplitude result has the wrong identity");
+    for (std::size_t channel = 0; channel < channel_count_; ++channel)
+      output[channel] = {phases_[channel], log_abs_[channel]};
+  }
+
+  void evaluateWeightedScore(std::size_t sample,
+                             const double* channel_weights,
+                             std::size_t channel_count,
+                             double* output,
+                             std::size_t output_count) const override
+  {
+    if (sample >= sample_count_ || !channel_weights || channel_count != channel_count_ ||
+        !output || output_count != schema_->parameterCount())
+      throw std::invalid_argument(
+          "PsiFormer determinant-channel score request has invalid extent");
+    std::shared_lock state_lock(model_state_->mutex);
+    requireBoundVersion();
+    setWorkspacePositions(sample);
+    const pf::DirectWeightedChannelScoreResult result =
+        model_state_->direct_score_executor.evaluateWeightedChannelScore(
+            *workspace_, channel_weights, channel_count);
+    if (result.parameter_version != parameter_version_ ||
+        result.parameter_score.size != output_count)
+      throw std::logic_error(
+          "PsiFormer weighted-channel score result has the wrong identity");
+    std::copy(result.parameter_score.begin(), result.parameter_score.end(), output);
+  }
+
+  std::size_t retainedNumericBytes() const noexcept override
+  {
+    return retained_numeric_bytes_;
+  }
+
+private:
+  void setWorkspacePositions(std::size_t sample) const
+  {
+    const double* positions =
+        positions_.data() + sample * electron_count_ * std::size_t{3};
+    workspace_->setPositions(
+        pf::GeometryPositionView::interleaved(positions, electron_count_));
+  }
+
+  void requireBoundVersion() const
+  {
+    if (model_state_->model.p.version() != parameter_version_)
+      throw std::runtime_error(
+          "PsiFormer determinant-channel batch parameter version is stale");
+  }
+
+  std::shared_ptr<PsiFormerSharedState> model_state_;
+  std::shared_ptr<const wftrain::StructuredParameterSchema> schema_;
+  std::size_t parameter_version_ = 0;
+  std::size_t sample_count_ = 0;
+  std::size_t electron_count_ = 0;
+  std::size_t channel_count_ = 0;
+  std::vector<double> positions_;
+  mutable std::vector<double> phases_;
+  mutable std::vector<double> log_abs_;
+  mutable std::unique_ptr<pf::DirectScoreWorkspace> workspace_;
+  std::size_t retained_numeric_bytes_ = 0;
+};
+
+/** Own an exact accepted ordinary-locality ECP traversal for repeated JVP actions. */
+class PsiFormerNonLocalECPReplay final : public wftrain::NonLocalECPJVPReplay
+{
+public:
+  PsiFormerNonLocalECPReplay(
+      std::string provider_id,
+      std::string schema_fingerprint,
+      std::size_t parameter_version,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t sample_count,
+      std::size_t electron_count,
+      std::uint64_t grid_fingerprint,
+      std::vector<double> reference_positions,
+      std::vector<wftrain::NonLocalECPReplayPoint> points,
+      std::vector<wftrain::NonLocalECPReplaySegment> segments,
+      std::vector<wftrain::NonLocalECPReplayTile> tiles,
+      std::vector<WaveFunctionComponent::EvaluationStamp> evaluation_stamps)
+      : provider_id_(std::move(provider_id)),
+        schema_fingerprint_(std::move(schema_fingerprint)),
+        parameter_version_(parameter_version),
+        batch_ordinal_(batch_ordinal),
+        sample_offset_(sample_offset),
+        sample_count_(sample_count),
+        electron_count_(electron_count),
+        grid_fingerprint_(grid_fingerprint),
+        reference_positions_(std::move(reference_positions)),
+        points_(std::move(points)),
+        segments_(std::move(segments)),
+        tiles_(std::move(tiles)),
+        evaluation_stamps_(std::move(evaluation_stamps))
+  {
+    const std::size_t expected_positions = checkedBatchMemoryMultiply(
+        checkedBatchMemoryMultiply(sample_count_, electron_count_,
+                                   "PsiFormer ECP replay references"),
+        std::size_t{3}, "PsiFormer ECP replay Cartesian references");
+    if (provider_id_.empty() || schema_fingerprint_.empty() ||
+        grid_fingerprint_ == 0 || reference_positions_.size() != expected_positions)
+      throw std::invalid_argument("PsiFormer ECP replay identity or reference extent is invalid");
+
+    for (double coordinate : reference_positions_)
+      requireFinite(coordinate, "reference coordinate");
+    for (const auto& point : points_)
+    {
+      if (point.sample >= sample_count_ || point.electron >= electron_count_)
+        throw std::out_of_range("PsiFormer ECP replay point identity is out of range");
+      for (double coordinate : point.replacement_position)
+        requireFinite(coordinate, "replacement coordinate");
+      requireFinite(point.bare_weight, "bare weight");
+      requireFinite(point.complete_ratio, "complete ratio");
+      if (point.bare_weight.imag() != 0.0)
+        throw std::invalid_argument("PsiFormer ECP replay bare weight must be real");
+    }
+
+    std::size_t expected_point_offset = 0;
+    std::size_t expected_segment_offset = 0;
+    std::size_t expected_stamp_offset = 0;
+    for (std::size_t ordinal = 0; ordinal < tiles_.size(); ++ordinal)
+    {
+      const auto& tile = tiles_[ordinal];
+      if (tile.tile_ordinal != ordinal || tile.point_offset != expected_point_offset ||
+          tile.segment_offset != expected_segment_offset ||
+          tile.stamp_offset != expected_stamp_offset ||
+          tile.point_count > points_.size() - tile.point_offset ||
+          tile.segment_count > segments_.size() - tile.segment_offset ||
+          tile.stamp_count > evaluation_stamps_.size() - tile.stamp_offset ||
+          (tile.point_count != 0 && tile.stamp_count == 0) ||
+          tile.virtual_batch_fingerprint == 0)
+        throw std::invalid_argument("PsiFormer ECP replay tile provenance is noncanonical");
+
+      std::size_t tile_segment_points = 0;
+      for (std::size_t segment_index = tile.segment_offset;
+           segment_index < tile.segment_offset + tile.segment_count;
+           ++segment_index)
+      {
+        const auto& segment = segments_[segment_index];
+        if (segment.point_offset < tile.point_offset ||
+            segment.point_offset > tile.point_offset + tile.point_count ||
+            segment.point_count >
+                tile.point_offset + tile.point_count - segment.point_offset)
+          throw std::invalid_argument(
+              "PsiFormer ECP replay segment escapes its source tile");
+        tile_segment_points = checkedBatchMemoryAdd(
+            tile_segment_points, segment.point_count,
+            "PsiFormer ECP replay tile segment coverage");
+      }
+      if (tile_segment_points != tile.point_count)
+        throw std::invalid_argument(
+            "PsiFormer ECP replay tile segment coverage is incomplete");
+      expected_point_offset += tile.point_count;
+      expected_segment_offset += tile.segment_count;
+      expected_stamp_offset += tile.stamp_count;
+    }
+    if (expected_point_offset != points_.size() ||
+        expected_segment_offset != segments_.size() ||
+        expected_stamp_offset != evaluation_stamps_.size())
+      throw std::invalid_argument("PsiFormer ECP replay provenance is incomplete");
+
+    std::size_t expected_segment_point = 0;
+    for (const auto& segment : segments_)
+    {
+      if (segment.sample >= sample_count_ || segment.electron >= electron_count_ ||
+          segment.point_offset != expected_segment_point ||
+          segment.point_offset > points_.size() ||
+          segment.point_count > points_.size() - segment.point_offset)
+        throw std::invalid_argument("PsiFormer ECP replay segment is invalid");
+      for (std::size_t point = segment.point_offset;
+           point < segment.point_offset + segment.point_count; ++point)
+        if (points_[point].sample != segment.sample ||
+            points_[point].electron != segment.electron)
+          throw std::invalid_argument(
+              "PsiFormer ECP replay point disagrees with segment provenance");
+      expected_segment_point = checkedBatchMemoryAdd(
+          expected_segment_point, segment.point_count,
+          "PsiFormer ECP replay segment point coverage");
+    }
+    if (expected_segment_point != points_.size())
+      throw std::invalid_argument(
+          "PsiFormer ECP replay segments do not cover every point");
+    diagnostics_ = measureStorageDiagnostics();
+  }
+
+  std::string_view providerId() const noexcept override { return provider_id_; }
+  std::string_view schemaFingerprint() const noexcept override { return schema_fingerprint_; }
+  std::size_t parameterVersion() const noexcept override { return parameter_version_; }
+  std::size_t batchOrdinal() const noexcept override { return batch_ordinal_; }
+  std::size_t sampleOffset() const noexcept override { return sample_offset_; }
+  std::size_t sampleCount() const noexcept override { return sample_count_; }
+  std::size_t electronCount() const noexcept override { return electron_count_; }
+  std::uint32_t localEnergyTermMask() const noexcept override
+  {
+    return wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  }
+  std::uint64_t gridFingerprint() const noexcept override { return grid_fingerprint_; }
+  wftrain::DerivativeArrayView<const double> referencePositions() const noexcept override
+  {
+    return {reference_positions_.data(), reference_positions_.size()};
+  }
+  wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayPoint>
+  points() const noexcept override
+  {
+    return {points_.data(), points_.size()};
+  }
+  wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplaySegment>
+  segments() const noexcept override
+  {
+    return {segments_.data(), segments_.size()};
+  }
+  wftrain::DerivativeArrayView<const wftrain::NonLocalECPReplayTile>
+  tiles() const noexcept override
+  {
+    return {tiles_.data(), tiles_.size()};
+  }
+  wftrain::DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp>
+  evaluationStamps() const noexcept override
+  {
+    return {evaluation_stamps_.data(), evaluation_stamps_.size()};
+  }
+  wftrain::NonLocalECPReplayStorageDiagnostics storageDiagnostics() const noexcept override
+  {
+    return diagnostics_;
+  }
+
+private:
+  static void requireFinite(double value, const char* description)
+  {
+    if (!psiformer::determinant::isFiniteReal(value))
+      throw std::invalid_argument(std::string("PsiFormer ECP replay ") + description +
+                                  " must be finite");
+  }
+
+  static void requireFinite(wftrain::DerivativeValue value,
+                            const char* description)
+  {
+    requireFinite(value.real(), description);
+    requireFinite(value.imag(), description);
+  }
+
+  static void mixFingerprint(std::size_t& fingerprint, std::size_t value) noexcept
+  {
+    fingerprint ^= value + std::size_t{0x9e3779b9U} + (fingerprint << 6) +
+        (fingerprint >> 2);
+  }
+
+  wftrain::NonLocalECPReplayStorageDiagnostics measureStorageDiagnostics() const noexcept
+  {
+    wftrain::NonLocalECPReplayStorageDiagnostics result;
+    result.point_count = points_.size();
+    result.segment_count = segments_.size();
+    result.tile_count = tiles_.size();
+    result.evaluation_stamp_count = evaluation_stamps_.size();
+    result.reference_position_bytes = reference_positions_.capacity() * sizeof(double);
+    result.point_bytes = points_.capacity() * sizeof(wftrain::NonLocalECPReplayPoint);
+    result.provenance_bytes =
+        segments_.capacity() * sizeof(wftrain::NonLocalECPReplaySegment) +
+        tiles_.capacity() * sizeof(wftrain::NonLocalECPReplayTile) +
+        evaluation_stamps_.capacity() * sizeof(WaveFunctionComponent::EvaluationStamp);
+    result.retained_numeric_bytes = result.reference_position_bytes +
+        result.point_bytes + result.provenance_bytes;
+    std::size_t fingerprint = std::size_t{1469598103U};
+    mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(reference_positions_.data()));
+    mixFingerprint(fingerprint, reference_positions_.capacity());
+    mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(points_.data()));
+    mixFingerprint(fingerprint, points_.capacity());
+    mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(segments_.data()));
+    mixFingerprint(fingerprint, segments_.capacity());
+    mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(tiles_.data()));
+    mixFingerprint(fingerprint, tiles_.capacity());
+    mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(evaluation_stamps_.data()));
+    mixFingerprint(fingerprint, evaluation_stamps_.capacity());
+    result.storage_fingerprint = fingerprint == 0 ? 1 : fingerprint;
+    return result;
+  }
+
+  std::string provider_id_;
+  std::string schema_fingerprint_;
+  std::size_t parameter_version_ = 0;
+  std::size_t batch_ordinal_ = 0;
+  std::size_t sample_offset_ = 0;
+  std::size_t sample_count_ = 0;
+  std::size_t electron_count_ = 0;
+  std::uint64_t grid_fingerprint_ = 0;
+  std::vector<double> reference_positions_;
+  std::vector<wftrain::NonLocalECPReplayPoint> points_;
+  std::vector<wftrain::NonLocalECPReplaySegment> segments_;
+  std::vector<wftrain::NonLocalECPReplayTile> tiles_;
+  std::vector<WaveFunctionComponent::EvaluationStamp> evaluation_stamps_;
+  wftrain::NonLocalECPReplayStorageDiagnostics diagnostics_;
+};
+
 /** Apply bounded score and kinetic products without a sample-by-parameter matrix.
  *
  * The operator owns reusable direct score and kinetic tapes, three fixed complex
@@ -1277,7 +1648,9 @@ public:
         channel_accumulators_{makeParameterVector(schema_->parameterCount()),
                               makeParameterVector(schema_->parameterCount()),
                               makeParameterVector(schema_->parameterCount())},
-        sample_products_(makeSampleProductVector(sample_count_))
+        sample_products_(makeSampleProductVector(sample_count_)),
+        reference_score_products_(makeSampleProductVector(sample_count_)),
+        replay_weight_sums_(makeSampleProductVector(sample_count_))
   {
     const std::size_t expected_positions = checkedPositionCount(sample_count_, electron_count_);
     if (positions_.size() != expected_positions)
@@ -1319,6 +1692,8 @@ public:
     result.execution_domain        = wftrain::DerivativeExecutionDomain::HOST;
     result.local_energy_term_mask =
         wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+    if (ecp_replay_)
+      result.local_energy_term_mask |= ecp_replay_->localEnergyTermMask();
     result.maximum_vjp_channels              = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size          = 1;
@@ -1365,6 +1740,69 @@ public:
     return current;
   }
 
+  /// Bind one exact accepted-grid ECP replay before derivative products are used.
+  void bindNonLocalECPJVPReplay(
+      std::unique_ptr<wftrain::NonLocalECPJVPReplay> replay) override
+  {
+    if (!replay)
+      throw std::invalid_argument("PsiFormer cannot bind a null ECP JVP replay");
+    if (ecp_replay_)
+      throw std::logic_error("PsiFormer ECP JVP replay is already bound");
+    if (has_evaluated_.load(std::memory_order_acquire))
+      throw std::logic_error(
+          "PsiFormer ECP JVP replay must be bound before the first derivative action");
+    if (replay->providerId() != schema_->providerId() ||
+        replay->schemaFingerprint() != schema_->fingerprint() ||
+        replay->parameterVersion() != parameter_version_ ||
+        replay->batchOrdinal() != batch_ordinal_ ||
+        replay->sampleOffset() != sample_offset_ ||
+        replay->sampleCount() != sample_count_ ||
+        replay->electronCount() != electron_count_ ||
+        replay->localEnergyTermMask() !=
+            wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP) ||
+        replay->gridFingerprint() == 0)
+      throw std::invalid_argument("PsiFormer ECP JVP replay identity is incompatible");
+    const auto references = replay->referencePositions();
+    if (references.size() != positions_.size() ||
+        !std::equal(references.begin(), references.end(), positions_.begin()))
+      throw std::invalid_argument(
+          "PsiFormer ECP JVP replay references do not match the derivative batch");
+    const auto replay_points = replay->points();
+    const auto replay_segments = replay->segments();
+    const auto replay_tiles = replay->tiles();
+    const auto replay_stamps = replay->evaluationStamps();
+    const auto diagnostics = replay->storageDiagnostics();
+    if (diagnostics.point_count != replay_points.size() ||
+        diagnostics.segment_count != replay_segments.size() ||
+        diagnostics.tile_count != replay_tiles.size() ||
+        diagnostics.evaluation_stamp_count != replay_stamps.size() ||
+        diagnostics.storage_fingerprint == 0)
+      throw std::invalid_argument(
+          "PsiFormer ECP JVP replay diagnostics disagree with its retained traversal");
+    const auto current_storage = measureStorageDiagnostics();
+    checkedBatchMemoryAdd(
+        current_storage.retained_numeric_bytes,
+        diagnostics.retained_numeric_bytes,
+        "PsiFormer streaming retained storage with accepted-grid replay");
+    for (const auto& tile : replay_tiles)
+    {
+      if (tile.stamp_offset > replay_stamps.size() ||
+          tile.stamp_count > replay_stamps.size() - tile.stamp_offset)
+        throw std::invalid_argument(
+            "PsiFormer ECP JVP replay has an invalid stamp range");
+      bool matching_stamp = false;
+      for (std::size_t stamp = tile.stamp_offset;
+           stamp < tile.stamp_offset + tile.stamp_count; ++stamp)
+        matching_stamp = matching_stamp || replay_stamps[stamp].matches(
+            model_state_.get(), static_cast<std::uint64_t>(parameter_version_));
+      if (!matching_stamp)
+        throw std::invalid_argument(
+            "PsiFormer ECP JVP replay lacks bound value-evaluation provenance");
+    }
+    ecp_replay_ = std::move(replay);
+    storage_diagnostics_ = measureStorageDiagnostics();
+  }
+
 protected:
   /// Accumulate fused score/kinetic VJPs, then emit canonical bounded chunks.
   void evaluateVJPs(
@@ -1372,6 +1810,7 @@ protected:
       wftrain::DerivativeAdjoint adjoint,
       wftrain::ParameterReductionSink& sink) const override
   {
+    has_evaluated_.store(true, std::memory_order_release);
     {
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
@@ -1383,7 +1822,16 @@ protected:
       const bool needs_kinetic = std::any_of(
           channels.begin(), channels.end(), [](const auto& channel) {
             return channel.product ==
-                wftrain::DerivativeProduct::LOCAL_ENERGY_VJP;
+                    wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+                (channel.local_energy_term_mask & wftrain::localEnergyTermBit(
+                    wftrain::LocalEnergyTerm::KINETIC)) != 0;
+          });
+      const bool needs_ecp = std::any_of(
+          channels.begin(), channels.end(), [](const auto& channel) {
+            return channel.product ==
+                    wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+                (channel.local_energy_term_mask & wftrain::localEnergyTermBit(
+                    wftrain::LocalEnergyTerm::NONLOCAL_ECP)) != 0;
           });
 
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
@@ -1406,12 +1854,17 @@ protected:
           requireResultVersion(result);
           for (std::size_t channel = 0; channel < channels.size(); ++channel)
           {
-            const auto response = channels[channel].product ==
-                    wftrain::DerivativeProduct::LOCAL_ENERGY_VJP
-                ? result.kinetic_parameter_response
-                : result.parameter_score;
-            accumulateResponse(
-                channel, channels[channel].coefficients.values[sample], response);
+            if (channels[channel].product ==
+                wftrain::DerivativeProduct::SCORE_VJP)
+              accumulateResponse(channel,
+                                 channels[channel].coefficients.values[sample],
+                                 result.parameter_score);
+            else if ((channels[channel].local_energy_term_mask &
+                      wftrain::localEnergyTermBit(
+                          wftrain::LocalEnergyTerm::KINETIC)) != 0)
+              accumulateResponse(channel,
+                                 channels[channel].coefficients.values[sample],
+                                 result.kinetic_parameter_response);
           }
           const bool has_imaginary_drift = std::any_of(
               imaginary_drift,
@@ -1431,7 +1884,10 @@ protected:
                 : wftrain::DerivativeValue(0.0, 1.0);
             for (std::size_t channel = 0; channel < channels.size(); ++channel)
               if (channels[channel].product ==
-                  wftrain::DerivativeProduct::LOCAL_ENERGY_VJP)
+                      wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+                  (channels[channel].local_energy_term_mask &
+                   wftrain::localEnergyTermBit(
+                       wftrain::LocalEnergyTerm::KINETIC)) != 0)
                 accumulateResponse(
                     channel,
                     channels[channel].coefficients.values[sample] *
@@ -1446,11 +1902,15 @@ protected:
               model_state_->direct_score_executor.evaluate(*score_workspace_);
           requireResultVersion(score);
           for (std::size_t channel = 0; channel < channels.size(); ++channel)
-            accumulateResponse(
-                channel, channels[channel].coefficients.values[sample],
-                score.parameter_score);
+            if (channels[channel].product ==
+                wftrain::DerivativeProduct::SCORE_VJP)
+              accumulateResponse(
+                  channel, channels[channel].coefficients.values[sample],
+                  score.parameter_score);
         }
       }
+      if (needs_ecp)
+        accumulateECPReplayVJPs(channels);
     }
 
     // Never invoke caller-controlled sink code while holding the model lock.
@@ -1468,6 +1928,7 @@ protected:
   void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
                         wftrain::SampleProductSink& sink) const override
   {
+    has_evaluated_.store(true, std::memory_order_release);
     {
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
@@ -1497,17 +1958,27 @@ protected:
     }
   }
 
-  /// Contract the exact mass-weighted kinetic response with one parameter direction.
+  /// Contract exact kinetic and accepted-grid ECP responses with one direction.
   void evaluateLocalEnergyJVP(
       const wftrain::StructuredParameterVectorConstView& direction,
       std::uint32_t local_energy_term_mask,
       wftrain::SampleProductSink& sink) const override
   {
-    if (local_energy_term_mask !=
-        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC))
+    has_evaluated_.store(true, std::memory_order_release);
+    const std::uint32_t kinetic_mask =
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+    const std::uint32_t ecp_mask =
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+    if (local_energy_term_mask == 0 ||
+        (local_energy_term_mask & ~(kinetic_mask | ecp_mask)) != 0 ||
+        ((local_energy_term_mask & ecp_mask) != 0 && !ecp_replay_))
       throw std::invalid_argument(
-          "PsiFormer streaming local-energy JVP supports only the kinetic term");
+          "PsiFormer streaming local-energy JVP term coverage is unavailable");
 
+    std::fill(sample_products_.begin(), sample_products_.end(),
+              wftrain::DerivativeValue{});
+
+    if ((local_energy_term_mask & kinetic_mask) != 0)
     {
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
@@ -1529,7 +2000,6 @@ protected:
         requireResultVersion(result);
 
         wftrain::DerivativeValue& product = sample_products_[sample];
-        product                           = {};
         for (std::size_t parameter = 0;
              parameter < result.kinetic_parameter_response.size(); ++parameter)
           product += result.kinetic_parameter_response[parameter] *
@@ -1555,6 +2025,9 @@ protected:
         }
       }
     }
+
+    if ((local_energy_term_mask & ecp_mask) != 0)
+      accumulateECPReplayJVP(direction);
 
     // Emit only after every sample is complete and the shared model lock is released.
     for (std::size_t sample = 0; sample < sample_count_; ++sample)
@@ -1620,6 +2093,123 @@ private:
         positions_.data() + sample * electron_count_ * std::size_t{3};
     kinetic_workspace_->setPositions(
         pf::GeometryPositionView::interleaved(positions, electron_count_));
+  }
+
+  /// Copy one accepted replacement into the reusable score workspace.
+  void setReplayPointPositions(const wftrain::NonLocalECPReplayPoint& point) const
+  {
+    setScoreWorkspacePositions(point.sample);
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      score_workspace_->setPosition(point.electron, dimension,
+                                    point.replacement_position[dimension]);
+  }
+
+  /// Add the exact fixed-grid ratio derivative without drawing or rebuilding a grid.
+  void accumulateECPReplayJVP(
+      const wftrain::StructuredParameterVectorConstView& direction) const
+  {
+    if (!ecp_replay_)
+      throw std::logic_error("PsiFormer ECP JVP replay is not bound");
+    std::shared_lock state_lock(model_state_->mutex);
+    requireBoundVersion();
+    for (std::size_t sample = 0; sample < sample_count_; ++sample)
+    {
+      setScoreWorkspacePositions(sample);
+      const pf::DirectScoreResult score =
+          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      requireResultVersion(score);
+      wftrain::DerivativeValue product{};
+      for (std::size_t parameter = 0; parameter < score.parameter_score.size;
+           ++parameter)
+        product += score.parameter_score[parameter] * direction.values()[parameter];
+      requireFinite(product, "reference score JVP");
+      reference_score_products_[sample] = product;
+    }
+
+    for (const auto& point : ecp_replay_->points())
+    {
+      setReplayPointPositions(point);
+      const pf::DirectScoreResult score =
+          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      requireResultVersion(score);
+      wftrain::DerivativeValue virtual_product{};
+      for (std::size_t parameter = 0; parameter < score.parameter_score.size;
+           ++parameter)
+        virtual_product +=
+            score.parameter_score[parameter] * direction.values()[parameter];
+      const wftrain::DerivativeValue weight =
+          point.bare_weight * point.complete_ratio;
+      requireFinite(virtual_product, "virtual score JVP");
+      requireFinite(weight, "accepted-grid weight");
+      const wftrain::DerivativeValue contribution =
+          weight * (virtual_product - reference_score_products_[point.sample]);
+      requireFinite(contribution, "accepted-grid JVP contribution");
+      sample_products_[point.sample] += contribution;
+      requireFinite(sample_products_[point.sample],
+                    "accepted-grid sample JVP");
+    }
+  }
+
+  /// Add replayed ECP VJPs when the combined owner advertises ECP term coverage.
+  void accumulateECPReplayVJPs(
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel>
+          channels) const
+  {
+    if (!ecp_replay_)
+      throw std::logic_error("PsiFormer ECP VJP replay is not bound");
+    std::fill(replay_weight_sums_.begin(), replay_weight_sums_.end(),
+              wftrain::DerivativeValue{});
+    for (const auto& point : ecp_replay_->points())
+    {
+      setReplayPointPositions(point);
+      const pf::DirectScoreResult score =
+          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      requireResultVersion(score);
+      const wftrain::DerivativeValue weight =
+          point.bare_weight * point.complete_ratio;
+      requireFinite(weight, "accepted-grid VJP weight");
+      replay_weight_sums_[point.sample] += weight;
+      requireFinite(replay_weight_sums_[point.sample],
+                    "accepted-grid sample weight sum");
+      for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        if (channels[channel].product ==
+                wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+            (channels[channel].local_energy_term_mask &
+             wftrain::localEnergyTermBit(
+                 wftrain::LocalEnergyTerm::NONLOCAL_ECP)) != 0)
+          accumulateResponse(
+              channel,
+              channels[channel].coefficients.values[point.sample] * weight,
+              score.parameter_score);
+    }
+    for (std::size_t sample = 0; sample < sample_count_; ++sample)
+    {
+      setScoreWorkspacePositions(sample);
+      const pf::DirectScoreResult score =
+          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      requireResultVersion(score);
+      for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        if (channels[channel].product ==
+                wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+            (channels[channel].local_energy_term_mask &
+             wftrain::localEnergyTermBit(
+                 wftrain::LocalEnergyTerm::NONLOCAL_ECP)) != 0)
+          accumulateResponse(
+              channel,
+              -channels[channel].coefficients.values[sample] *
+                  replay_weight_sums_[sample],
+              score.parameter_score);
+    }
+  }
+
+  /// Reject non-finite replay arithmetic in fast-math builds.
+  static void requireFinite(wftrain::DerivativeValue value,
+                            const char* description)
+  {
+    if (!psiformer::determinant::isFiniteReal(value.real()) ||
+        !psiformer::determinant::isFiniteReal(value.imag()))
+      throw std::invalid_argument(std::string("PsiFormer ") + description +
+                                  " must be finite");
   }
 
   /// Fold one real canonical response into a complex coefficient channel.
@@ -1729,9 +2319,19 @@ private:
                               "PsiFormer streaming complex drift storage"),
         inverse_mass_bytes,
         "PsiFormer streaming sample auxiliary storage");
+    const std::size_t sample_product_elements = checkedBatchMemoryAdd(
+        checkedBatchMemoryAdd(sample_products_.capacity(),
+                              reference_score_products_.capacity(),
+                              "PsiFormer streaming JVP sample products"),
+        replay_weight_sums_.capacity(),
+        "PsiFormer streaming sample-product elements");
     const std::size_t sample_product_bytes = checkedBatchMemoryMultiply(
-        sample_products_.capacity(), sizeof(wftrain::DerivativeValue),
+        sample_product_elements,
+        sizeof(wftrain::DerivativeValue),
         "PsiFormer streaming sample-product capacity");
+    const std::size_t replay_bytes = ecp_replay_
+        ? ecp_replay_->storageDiagnostics().retained_numeric_bytes
+        : 0;
     const std::size_t workspace_bytes = checkedBatchMemoryAdd(
         score_workspace_->vectorStorageBytes(),
         kinetic_workspace_->vectorStorageBytes(),
@@ -1747,7 +2347,9 @@ private:
                                   "PsiFormer streaming evaluator and channels"),
             position_bytes, "PsiFormer streaming positions"),
         checkedBatchMemoryAdd(
-            auxiliary_bytes, sample_product_bytes,
+            checkedBatchMemoryAdd(auxiliary_bytes, replay_bytes,
+                                  "PsiFormer streaming ECP replay storage"),
+            sample_product_bytes,
             "PsiFormer streaming sample storage"),
         "PsiFormer streaming retained storage");
 
@@ -1776,6 +2378,15 @@ private:
     mixFingerprint(fingerprint,
                    reinterpret_cast<std::uintptr_t>(sample_products_.data()));
     mixFingerprint(fingerprint, sample_products_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(reference_score_products_.data()));
+    mixFingerprint(fingerprint, reference_score_products_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(replay_weight_sums_.data()));
+    mixFingerprint(fingerprint, replay_weight_sums_.capacity());
+    if (ecp_replay_)
+      mixFingerprint(fingerprint,
+                     ecp_replay_->storageDiagnostics().storage_fingerprint);
     if (fingerprint == 0)
       fingerprint = 1;
 
@@ -1811,15 +2422,19 @@ private:
                      MAXIMUM_VJP_CHANNELS>
       channel_accumulators_;
   mutable std::vector<wftrain::DerivativeValue> sample_products_;
+  mutable std::vector<wftrain::DerivativeValue> reference_score_products_;
+  mutable std::vector<wftrain::DerivativeValue> replay_weight_sums_;
+  std::unique_ptr<wftrain::NonLocalECPJVPReplay> ecp_replay_;
+  mutable std::atomic<bool> has_evaluated_{false};
   wftrain::StreamingDerivativeStorageDiagnostics storage_diagnostics_;
 };
 
-/** Contract live ordinary-locality ECP tiles directly into fixed parameter channels.
+/** Contract live ECP tiles and optionally freeze their traversal for exact replay.
  *
  * The consumer retains one direct score tape, three complex P-vectors, copied
  * reference positions, three B-sized coefficient rows, and one B-sized weight
- * sum.  No virtual-particle position, ratio, or parameter derivative survives
- * consume(), so retained storage is O(P)+O(B) and independent of Q.
+ * sum.  Only an explicitly requested JVP replay adds exact O(Q)
+ * positions/weights/provenance; neither mode constructs a Q-by-P object.
  */
 class PsiFormerNonLocalECPDerivativeConsumer final
     : public wftrain::NonLocalECPDerivativeConsumer
@@ -1834,10 +2449,12 @@ public:
       std::size_t parameter_version,
       std::size_t sample_count,
       std::vector<double> positions,
-      std::size_t maximum_parameter_chunk_size)
+      std::size_t maximum_parameter_chunk_size,
+      bool capture_jvp_replay)
       : model_state_(std::move(model_state)),
         schema_(std::move(schema)),
         parameter_version_(parameter_version),
+        capture_jvp_replay_(capture_jvp_replay),
         sample_count_(sample_count),
         electron_count_(model_state_->execution_plan.modelShape().electrons()),
         positions_(std::move(positions)),
@@ -1939,11 +2556,28 @@ public:
     std::fill(sample_weight_sums_.begin(), sample_weight_sums_.end(),
               wftrain::DerivativeValue{});
 
+    if (capture_jvp_replay_)
+    {
+      checkedBatchMemoryMultiply(context.expected_point_count,
+                                 sizeof(wftrain::NonLocalECPReplayPoint),
+                                 "PsiFormer ECP replay point bytes");
+      replay_points_.assign(context.expected_point_count, {});
+      replay_segments_.clear();
+      replay_segments_.reserve(context.expected_point_count);
+      replay_tiles_.clear();
+      replay_tiles_.reserve(context.expected_point_count);
+      replay_evaluation_stamps_.clear();
+      replay_evaluation_stamps_.reserve(context.expected_point_count);
+    }
+
     channel_count_             = channels.size();
     expected_tile_ordinal_     = 0;
     expected_point_count_      = context.expected_point_count;
     consumed_point_count_      = 0;
     grid_fingerprint_          = context.grid_fingerprint;
+    batch_ordinal_             = context.batch_ordinal;
+    sample_offset_             = context.sample_offset;
+    replay_released_           = false;
     stream_descriptor_         = {
         schema_->providerId(), schema_->fingerprint(), parameter_version_,
         wftrain::derivativeProductBit(
@@ -1998,6 +2632,13 @@ public:
         throw std::runtime_error(
             "PsiFormer ECP tile lacks the bound value-evaluation stamp");
 
+      const std::size_t segment_offset = replay_segments_.size();
+      const std::size_t stamp_offset = replay_evaluation_stamps_.size();
+      if (capture_jvp_replay_)
+        replay_evaluation_stamps_.insert(replay_evaluation_stamps_.end(),
+                                         tile.evaluation_stamps.begin(),
+                                         tile.evaluation_stamps.end());
+
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
       for (std::size_t segment_index = 0;
@@ -2011,6 +2652,13 @@ public:
           throw std::out_of_range(
               "PsiFormer ECP tile names an invalid walker or electron");
         const std::size_t sample = static_cast<std::size_t>(slice.walkerId());
+        if (capture_jvp_replay_)
+          replay_segments_.push_back({
+              consumed_point_count_ + slice.flatOffset(), slice.size(), sample,
+              static_cast<std::size_t>(slice.electronId()), slice.isOnSphere(),
+              slice.sourceCenterId() == VirtualParticleBatch::NO_SOURCE
+                  ? static_cast<std::size_t>(-1)
+                  : static_cast<std::size_t>(slice.sourceCenterId())});
         for (std::size_t local_point = 0; local_point < slice.size(); ++local_point)
         {
           const std::size_t point = slice.flatOffset() + local_point;
@@ -2028,6 +2676,23 @@ public:
           requireFinite(weight, "complete weight");
           sample_weight_sums_[sample] += weight;
 
+          if (capture_jvp_replay_)
+          {
+            wftrain::NonLocalECPReplayPoint& replay_point =
+                replay_points_[consumed_point_count_ + point];
+            replay_point.sample = sample;
+            replay_point.electron = static_cast<std::size_t>(slice.electronId());
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              replay_point.replacement_position[dimension] = static_cast<double>(
+                  slice.absolutePosition(local_point)[dimension]);
+            replay_point.bare_weight = {
+                static_cast<double>(std::real(bare)),
+                static_cast<double>(std::imag(bare))};
+            replay_point.complete_ratio = {
+                static_cast<double>(std::real(ratio)),
+                static_cast<double>(std::imag(ratio))};
+          }
+
           setVirtualPositions(sample, static_cast<std::size_t>(slice.electronId()),
                               slice.absolutePosition(local_point));
           const pf::DirectScoreResult score =
@@ -2041,6 +2706,12 @@ public:
                 score.parameter_score);
         }
       }
+      if (capture_jvp_replay_)
+        replay_tiles_.push_back({
+            tile.tile_ordinal, consumed_point_count_, tile.virtual_particles.size(),
+            segment_offset, replay_segments_.size() - segment_offset,
+            stamp_offset, replay_evaluation_stamps_.size() - stamp_offset,
+            tile.virtual_particles.fingerprint()});
       consumed_point_count_ = checkedBatchMemoryAdd(
           consumed_point_count_, tile.virtual_particles.size(),
           "PsiFormer ECP consumed point count");
@@ -2062,6 +2733,11 @@ public:
       if (consumed_point_count_ != expected_point_count_)
         throw std::logic_error(
             "PsiFormer ECP traversal ended before consuming every declared point");
+      if (capture_jvp_replay_ &&
+          (replay_points_.size() != expected_point_count_ ||
+           (expected_point_count_ != 0 && replay_tiles_.empty())))
+        throw std::logic_error(
+            "PsiFormer ECP replay did not capture the complete traversal");
       {
         std::shared_lock state_lock(model_state_->mutex);
         requireBoundVersion();
@@ -2111,6 +2787,24 @@ public:
       sink_->abort();
     sink_  = nullptr;
     state_ = State::POISONED;
+  }
+
+  /// Transfer the complete immutable accepted-grid replay exactly once.
+  std::unique_ptr<wftrain::NonLocalECPJVPReplay> releaseJVPReplay() override
+  {
+    if (state_ != State::COMPLETE)
+      throw std::logic_error("PsiFormer ECP replay requires a complete transaction");
+    if (!capture_jvp_replay_)
+      throw std::logic_error("PsiFormer ECP replay capture was not requested");
+    if (replay_released_)
+      throw std::logic_error("PsiFormer ECP replay was already released");
+    replay_released_ = true;
+    return std::make_unique<PsiFormerNonLocalECPReplay>(
+        schema_->providerId(), schema_->fingerprint(), parameter_version_,
+        batch_ordinal_, sample_offset_, sample_count_, electron_count_,
+        grid_fingerprint_, std::move(positions_), std::move(replay_points_),
+        std::move(replay_segments_), std::move(replay_tiles_),
+        std::move(replay_evaluation_stamps_));
   }
 
   /// Report the exact O(P)+O(B) retained capacities and live allocation identity.
@@ -2259,6 +2953,30 @@ private:
                                      sizeof(wftrain::DerivativeValue),
                                      "PsiFormer ECP coefficient capacity"),
           "PsiFormer ECP sample auxiliary storage");
+    const std::size_t replay_bytes = checkedBatchMemoryAdd(
+        checkedBatchMemoryAdd(
+            checkedBatchMemoryMultiply(
+                replay_points_.capacity(),
+                sizeof(wftrain::NonLocalECPReplayPoint),
+                "PsiFormer ECP replay point capacity"),
+            checkedBatchMemoryMultiply(
+                replay_segments_.capacity(),
+                sizeof(wftrain::NonLocalECPReplaySegment),
+                "PsiFormer ECP replay segment capacity"),
+            "PsiFormer ECP replay point and segment storage"),
+        checkedBatchMemoryAdd(
+            checkedBatchMemoryMultiply(
+                replay_tiles_.capacity(),
+                sizeof(wftrain::NonLocalECPReplayTile),
+                "PsiFormer ECP replay tile capacity"),
+            checkedBatchMemoryMultiply(
+                replay_evaluation_stamps_.capacity(),
+                sizeof(WaveFunctionComponent::EvaluationStamp),
+                "PsiFormer ECP replay stamp capacity"),
+            "PsiFormer ECP replay provenance storage"),
+        "PsiFormer ECP replay storage");
+    auxiliary_bytes = checkedBatchMemoryAdd(
+        auxiliary_bytes, replay_bytes, "PsiFormer ECP auxiliary and replay storage");
     const std::size_t workspace_bytes = score_workspace_->vectorStorageBytes();
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
         score_bytes, channel_bytes, "PsiFormer ECP parameter scratch");
@@ -2289,6 +3007,18 @@ private:
     mixFingerprint(fingerprint,
                    reinterpret_cast<std::uintptr_t>(sample_weight_sums_.data()));
     mixFingerprint(fingerprint, sample_weight_sums_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(replay_points_.data()));
+    mixFingerprint(fingerprint, replay_points_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(replay_segments_.data()));
+    mixFingerprint(fingerprint, replay_segments_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(replay_tiles_.data()));
+    mixFingerprint(fingerprint, replay_tiles_.capacity());
+    mixFingerprint(fingerprint,
+                   reinterpret_cast<std::uintptr_t>(replay_evaluation_stamps_.data()));
+    mixFingerprint(fingerprint, replay_evaluation_stamps_.capacity());
     if (fingerprint == 0)
       fingerprint = 1;
 
@@ -2300,6 +3030,9 @@ private:
   std::shared_ptr<PsiFormerSharedState> model_state_;
   std::shared_ptr<const wftrain::StructuredParameterSchema> schema_;
   std::size_t parameter_version_      = 0;
+  bool capture_jvp_replay_            = false;
+  std::size_t batch_ordinal_          = 0;
+  std::size_t sample_offset_          = 0;
   std::size_t sample_count_           = 0;
   std::size_t electron_count_         = 0;
   std::vector<double> positions_;
@@ -2310,6 +3043,10 @@ private:
   std::array<std::vector<wftrain::DerivativeValue>, MAXIMUM_CHANNELS>
       coefficients_;
   std::vector<wftrain::DerivativeValue> sample_weight_sums_;
+  std::vector<wftrain::NonLocalECPReplayPoint> replay_points_;
+  std::vector<wftrain::NonLocalECPReplaySegment> replay_segments_;
+  std::vector<wftrain::NonLocalECPReplayTile> replay_tiles_;
+  std::vector<WaveFunctionComponent::EvaluationStamp> replay_evaluation_stamps_;
   wftrain::DerivativeStreamDescriptor stream_descriptor_;
   wftrain::ParameterReductionSink* sink_ = nullptr;
   std::size_t channel_count_             = 0;
@@ -2318,6 +3055,7 @@ private:
   std::size_t consumed_point_count_      = 0;
   std::uint64_t grid_fingerprint_        = 0;
   State state_                           = State::IDLE;
+  bool replay_released_                  = false;
   wftrain::StreamingDerivativeStorageDiagnostics baseline_storage_;
 };
 
@@ -4845,12 +5583,83 @@ PsiFormerWF::makeStreamingDerivativeOperator(
       maximum_parameter_chunk_size);
 }
 
+// Prepare copied configurations and one reusable M-channel/P-score workspace.
+std::unique_ptr<psiformer::DeterminantChannelBatch>
+PsiFormerWF::makeDeterminantChannelBatch(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list) const
+{
+  if (this != &wfc_list.getLeader() || wfc_list.empty() ||
+      wfc_list.size() != p_list.size() || &wfc_list[0] != &wfc_list.getLeader() ||
+      &p_list[0] != &p_list.getLeader())
+    throw std::invalid_argument(
+        "PsiFormer determinant-channel factory requires matching nonempty leader-first batches");
+
+  std::shared_lock state_lock(model_state_->mutex);
+  if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
+    throw std::runtime_error(
+        "PsiFormer determinant-channel evaluation requires the direct score backend");
+  const psiformer::ModelShape& shape = model_state_->execution_plan.modelShape();
+  const std::size_t sample_count = wfc_list.size();
+  const std::size_t electron_count = shape.electrons();
+  const std::size_t position_count = checkedBatchMemoryMultiply(
+      checkedBatchMemoryMultiply(sample_count, electron_count,
+                                 "PsiFormer overlap sample positions"),
+      std::size_t{3}, "PsiFormer overlap Cartesian positions");
+  checkedBatchMemoryMultiply(position_count, sizeof(double),
+                             "PsiFormer overlap position bytes");
+  std::vector<double> positions(position_count);
+
+  for (std::size_t sample = 0; sample < sample_count; ++sample)
+  {
+    const auto* component = dynamic_cast<const PsiFormerWF*>(&wfc_list[sample]);
+    if (!component || component->model_state_.get() != model_state_.get() ||
+        component->structured_parameter_schema_->fingerprint() !=
+            structured_parameter_schema_->fingerprint())
+      throw std::invalid_argument(
+          "PsiFormer determinant-channel batch contains a foreign component");
+    const ParticleSet& particles = p_list[sample];
+    if (particles.isSpinor() || particles.getTotalNum() < 0 ||
+        static_cast<std::size_t>(particles.getTotalNum()) != electron_count ||
+        particles.R.size() != electron_count || particles.GroupID.size() != electron_count)
+      throw std::invalid_argument(
+          "PsiFormer determinant-channel batch has an incompatible electron extent");
+    validateRuntimeLattice(particles, model_state_->execution_plan.environment(),
+                           "PsiFormer determinant-channel sample");
+    if (particles.groups() != 2 ||
+        particles.groupsize(0) != static_cast<int>(shape.spin_up_electrons) ||
+        particles.groupsize(1) != static_cast<int>(shape.spin_down_electrons))
+      throw std::invalid_argument(
+          "PsiFormer determinant-channel sample has an incompatible spin partition");
+    for (std::size_t electron = 0; electron < electron_count; ++electron)
+    {
+      const int expected_group = electron < shape.spin_up_electrons ? 0 : 1;
+      if (particles.GroupID[electron] != expected_group)
+        throw std::invalid_argument(
+            "PsiFormer determinant-channel sample has noncanonical spin ordering");
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double coordinate = particles.R[electron][dimension];
+        if (!psiformer::determinant::isFiniteReal(coordinate))
+          throw std::invalid_argument(
+              "PsiFormer determinant-channel sample positions must be finite");
+        positions[(sample * electron_count + electron) * 3 + dimension] = coordinate;
+      }
+    }
+  }
+
+  return std::make_unique<PsiFormerDeterminantChannelBatch>(
+      model_state_, structured_parameter_schema_, model_state_->model.p.version(),
+      sample_count, std::move(positions));
+}
+
 // Prepare an O(P)+O(B) consumer for live ordinary-locality ECP quadrature tiles.
 std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
 PsiFormerWF::makeNonLocalECPDerivativeConsumer(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list,
-    std::size_t maximum_parameter_chunk_size) const
+    std::size_t maximum_parameter_chunk_size,
+    bool capture_jvp_replay) const
 {
   if (this != &wfc_list.getLeader())
     throw std::invalid_argument(
@@ -4915,7 +5724,8 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
   const std::size_t parameter_version = model_state_->model.p.version();
   return std::make_unique<PsiFormerNonLocalECPDerivativeConsumer>(
       model_state_, structured_parameter_schema_, parameter_version,
-      sample_count, std::move(positions), maximum_parameter_chunk_size);
+      sample_count, std::move(positions), maximum_parameter_chunk_size,
+      capture_jvp_replay);
 }
 
 wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const

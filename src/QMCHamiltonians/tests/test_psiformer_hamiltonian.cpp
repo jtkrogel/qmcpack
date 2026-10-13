@@ -10,6 +10,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Particle/ParticleSet.h"
@@ -105,6 +106,45 @@ protected:
 private:
   std::array<std::size_t, 2> selected_;
   std::array<wftrain::DerivativeValue, 2> result_{};
+};
+
+/** Collect one ordered scalar local-energy JVP value per walker. */
+class RecordingSampleSink final : public wftrain::SampleProductSink
+{
+public:
+  const std::vector<wftrain::DerivativeValue>& result() const
+  {
+    if (state() != wftrain::DerivativeSinkState::COMPLETE)
+      throw std::logic_error("recording sample sink has no completed result");
+    return result_;
+  }
+
+protected:
+  void onBegin(const wftrain::DerivativeStreamDescriptor& descriptor) override
+  {
+    sample_offset_ = descriptor.sample_offset;
+    result_.assign(descriptor.sample_count, wftrain::DerivativeValue{});
+  }
+
+  void consume(const wftrain::SampleProductTileConstView& tile) override
+  {
+    if (tile.values().size() != 1 ||
+        tile.descriptor().sample_offset < sample_offset_ ||
+        tile.descriptor().sample_offset - sample_offset_ >= result_.size())
+      throw std::invalid_argument("recording sample sink received a foreign tile");
+    result_[tile.descriptor().sample_offset - sample_offset_] = tile.values()[0];
+  }
+
+  void onAbort() noexcept override { result_.clear(); }
+  void onReset() noexcept override
+  {
+    sample_offset_ = 0;
+    result_.clear();
+  }
+
+private:
+  std::size_t sample_offset_ = 0;
+  std::vector<wftrain::DerivativeValue> result_;
 };
 
 /// Construct the two physical LiH nuclei represented by the generated fixture.
@@ -517,9 +557,10 @@ TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
   RefVectorWithLeader<WaveFunctionComponent> psiformer_components(
       psiformer_leader, {psiformer_leader, psiformer_clone});
   auto ecp_consumer = psiformer_leader.makeNonLocalECPDerivativeConsumer(
-      psiformer_components, particles, 257);
+      psiformer_components, particles, 257, true);
   const auto parameter_snapshot = psiformer_leader.snapshotParameters();
-  const std::vector<wftrain::DerivativeValue> objective_weights(walker_count, 1.0);
+  const std::vector<wftrain::DerivativeValue> objective_weights{
+      {0.625, 0.0}, {-0.375, 0.0}};
   const wftrain::CoefficientView objective_coefficients{
       psiformer_leader.parameterSchema().providerId(),
       psiformer_leader.parameterSchema().fingerprint(), parameter_snapshot.version,
@@ -563,16 +604,99 @@ TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
   CHECK(streaming_result.grid_fingerprint != 0);
   CHECK(ecp_capture.state() == wftrain::DerivativeSinkState::COMPLETE);
 
+  auto ecp_replay = ecp_consumer->releaseJVPReplay();
+  CHECK_THROWS_WITH(ecp_consumer->releaseJVPReplay(),
+                    Catch::Matchers::ContainsSubstring("already released"));
+  const auto replay_storage = ecp_replay->storageDiagnostics();
+  CHECK(ecp_replay->gridFingerprint() == streaming_result.grid_fingerprint);
+  CHECK(replay_storage.point_count > 0);
+  CHECK(replay_storage.point_count == ecp_replay->points().size());
+  CHECK(replay_storage.tile_count == ecp_replay->tiles().size());
+  CHECK(replay_storage.retained_numeric_bytes > 0);
+  CHECK(replay_storage.storage_fingerprint != 0);
+
   auto kinetic_derivative = psiformer_leader.makeStreamingDerivativeOperator(
       psiformer_components, particles, 0, 0, 257);
+  const std::uint32_t kinetic_mask =
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+  const std::uint32_t ecp_mask =
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  std::vector<wftrain::DerivativeValue> direction(
+      psiformer_leader.parameterSchema().parameterCount());
+  const std::array<double, 2> selected_direction{0.031, -0.017};
+  for (std::size_t parameter = 0; parameter < canonical_parameters.size(); ++parameter)
+    direction[canonical_parameters[parameter]] = selected_direction[parameter];
+  const wftrain::StructuredParameterVectorConstView direction_view(
+      psiformer_leader.parameterSchema(), parameter_snapshot.version,
+      {direction.data(), direction.size()});
+  CHECK_THROWS_AS(kinetic_derivative->bindNonLocalECPJVPReplay(nullptr),
+                  std::invalid_argument);
+  CHECK(kinetic_derivative->capabilities().local_energy_term_mask == kinetic_mask);
+  RecordingSampleSink unbound_ecp_capture;
+  CHECK_THROWS_AS(kinetic_derivative->applyLocalEnergyJVP(
+                      direction_view, ecp_mask, unbound_ecp_capture),
+                  std::runtime_error);
+  CHECK(unbound_ecp_capture.state() == wftrain::DerivativeSinkState::IDLE);
+
+  kinetic_derivative->bindNonLocalECPJVPReplay(std::move(ecp_replay));
+  CHECK(kinetic_derivative->capabilities().local_energy_term_mask ==
+        (kinetic_mask | ecp_mask));
   const wftrain::VJPCoefficientChannel kinetic_channel{
       "weighted_local_energy", wftrain::DerivativeProduct::LOCAL_ENERGY_VJP,
-      objective_coefficients,
-      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)};
+      objective_coefficients, kinetic_mask};
   SelectedParameterSink kinetic_capture(canonical_parameters);
   kinetic_derivative->applyVJPs({&kinetic_channel, 1},
                                 wftrain::DerivativeAdjoint::TRANSPOSE,
                                 kinetic_capture);
+  const std::size_t rng_calls_before_replayed_vjp =
+      grid_rng1.calls() + grid_rng2.calls();
+  SelectedParameterSink replay_ecp_capture(canonical_parameters);
+  kinetic_derivative->applyVJPs({&ecp_channel, 1},
+                                wftrain::DerivativeAdjoint::TRANSPOSE,
+                                replay_ecp_capture);
+  CHECK(grid_rng1.calls() + grid_rng2.calls() == rng_calls_before_replayed_vjp);
+  for (std::size_t parameter = 0; parameter < canonical_parameters.size(); ++parameter)
+    CHECK(std::abs(replay_ecp_capture.result()[parameter] -
+                   ecp_capture.result()[parameter]) <=
+          2e-10 * (1.0 + std::abs(ecp_capture.result()[parameter])));
+
+  const std::size_t rng_calls_before_replay = grid_rng1.calls() + grid_rng2.calls();
+  const auto warmed_storage = kinetic_derivative->storageDiagnostics();
+  RecordingSampleSink ecp_jvp_capture;
+  kinetic_derivative->applyLocalEnergyJVP(direction_view, ecp_mask,
+                                          ecp_jvp_capture);
+  RecordingSampleSink combined_jvp_capture;
+  kinetic_derivative->applyLocalEnergyJVP(direction_view,
+                                          kinetic_mask | ecp_mask,
+                                          combined_jvp_capture);
+  CHECK(grid_rng1.calls() + grid_rng2.calls() == rng_calls_before_replay);
+  CHECK(kinetic_derivative->storageDiagnostics().storage_fingerprint ==
+        warmed_storage.storage_fingerprint);
+  CHECK(kinetic_derivative->storageDiagnostics().retained_numeric_bytes ==
+        warmed_storage.retained_numeric_bytes);
+
+  wftrain::DerivativeValue ecp_duality_lhs{};
+  wftrain::DerivativeValue combined_duality_lhs{};
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    ecp_duality_lhs += objective_weights[walker] *
+        ecp_jvp_capture.result()[walker];
+    combined_duality_lhs += objective_weights[walker] *
+        combined_jvp_capture.result()[walker];
+  }
+  wftrain::DerivativeValue ecp_duality_rhs{};
+  wftrain::DerivativeValue combined_duality_rhs{};
+  for (std::size_t parameter = 0; parameter < canonical_parameters.size(); ++parameter)
+  {
+    ecp_duality_rhs += selected_direction[parameter] *
+        ecp_capture.result()[parameter];
+    combined_duality_rhs += selected_direction[parameter] *
+        (ecp_capture.result()[parameter] + kinetic_capture.result()[parameter]);
+  }
+  CHECK(std::abs(ecp_duality_lhs - ecp_duality_rhs) <=
+        3e-8 * (1.0 + std::abs(ecp_duality_rhs)));
+  CHECK(std::abs(combined_duality_lhs - combined_duality_rhs) <=
+        3e-8 * (1.0 + std::abs(combined_duality_rhs)));
 
   ParticleSet::mw_update(particles);
   TrialWaveFunction::mw_evaluateLog(wavefunctions, particles);
@@ -610,7 +734,8 @@ TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
   {
     ValueType expected_energy_response = 0.0;
     for (int walker = 0; walker < walker_count; ++walker)
-      expected_energy_response += batch_energy_derivatives[walker][parameter];
+      expected_energy_response += std::real(objective_weights[walker]) *
+          batch_energy_derivatives[walker][parameter];
     const auto composed_response = kinetic_capture.result()[parameter] +
         ecp_capture.result()[parameter];
     CHECK(std::abs(composed_response - expected_energy_response) <=
@@ -628,6 +753,31 @@ TEST_CASE("PsiFormer pseudopotential LiH through QMCHamiltonian",
       logs[walker] = wavefunctions[walker].getLogPsi();
     return QMCHamiltonian::mw_evaluate(hamiltonians, wavefunctions, particles);
   };
+
+  std::array<double, walker_count> directional_plus_logs;
+  std::array<double, walker_count> directional_minus_logs;
+  for (int parameter = 0; parameter < parameter_count; ++parameter)
+    active[parameter] += parameter_step * selected_direction[parameter];
+  wavefunction.resetParameters(active);
+  const std::vector<FullPrecReal> directional_plus_energies =
+      evaluate_batch(directional_plus_logs);
+  for (int parameter = 0; parameter < parameter_count; ++parameter)
+    active[parameter] -= 2.0 * parameter_step * selected_direction[parameter];
+  wavefunction.resetParameters(active);
+  const std::vector<FullPrecReal> directional_minus_energies =
+      evaluate_batch(directional_minus_logs);
+  for (int parameter = 0; parameter < parameter_count; ++parameter)
+    active[parameter] += parameter_step * selected_direction[parameter];
+  wavefunction.resetParameters(active);
+  for (int walker = 0; walker < walker_count; ++walker)
+  {
+    const double fixed_grid_directional_derivative =
+        (directional_plus_energies[walker] - directional_minus_energies[walker]) /
+        (2.0 * parameter_step);
+    CHECK(std::real(combined_jvp_capture.result()[walker]) ==
+          Catch::Approx(fixed_grid_directional_derivative)
+              .epsilon(8e-4).margin(8e-4));
+  }
 
   for (int parameter = 0; parameter < parameter_count; ++parameter)
   {

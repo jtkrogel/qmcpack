@@ -10,12 +10,14 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "Particle/ParticleSet.h"
 #include "Particle/VirtualParticleBatch.h"
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -698,6 +700,7 @@ TEST_CASE("Wavefunction components reject unsupported streaming derivative facto
   particle_list.push_back(particles);
   CHECK_THROWS(component.makeStreamingDerivativeOperator(
       components, particle_list, 0, 0, 8));
+  CHECK_THROWS(component.makeDeterminantChannelBatch(components, particle_list));
 
   BatchExecutionRequirements requirements;
   requirements.require(BatchExecutionMode::STREAMING_DERIVATIVE);
@@ -753,6 +756,42 @@ TEST_CASE("TrialWaveFunction constructs a provider-selected streaming owner",
           wavefunctions, particles, {}, 10, 25, 113);
   CHECK(sole->parameterSchema().providerId() == provider_id);
 
+  std::unique_ptr<psiformer::DeterminantChannelBatch> channel_batch =
+      TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+          wavefunctions, particles, provider_id);
+  CHECK(channel_batch->providerId() == provider_id);
+  CHECK(channel_batch->sampleCount() == 2);
+  CHECK(channel_batch->channelCount() > 1);
+  CHECK(channel_batch->parameterCount() ==
+        provider.front().get().parameterSchema().parameterCount());
+  CHECK(channel_batch->retainedNumericBytes() >
+        channel_batch->parameterCount() * sizeof(double));
+
+  std::vector<psiformer::RealSignedLogAmplitude> amplitudes(
+      channel_batch->channelCount());
+  channel_batch->evaluateAmplitudes(0, amplitudes.data(), amplitudes.size());
+  const auto copied_amplitudes = amplitudes;
+  electrons0.R[0] += ParticleSet::PosType{0.5, -0.25, 0.125};
+  electrons0.update();
+  channel_batch->evaluateAmplitudes(0, amplitudes.data(), amplitudes.size());
+  for (std::size_t channel = 0; channel < amplitudes.size(); ++channel)
+  {
+    CHECK(amplitudes[channel].phase == copied_amplitudes[channel].phase);
+    CHECK(amplitudes[channel].log_abs == copied_amplitudes[channel].log_abs);
+  }
+
+  std::vector<double> channel_weights(channel_batch->channelCount(), 0.0);
+  channel_weights.front() = 1.0;
+  std::vector<double> parameter_gradient(channel_batch->parameterCount());
+  channel_batch->evaluateWeightedScore(
+      1, channel_weights.data(), channel_weights.size(),
+      parameter_gradient.data(), parameter_gradient.size());
+  CHECK(std::all_of(parameter_gradient.begin(), parameter_gradient.end(),
+                    [](double value) { return std::isfinite(value); }));
+
+  CHECK_THROWS(TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+      wavefunctions, particles, "missing_provider"));
+
   // A rank with no local walkers still constructs the same schema/version owner
   // and can follow the distributed collective schedule with an empty contribution.
   RefVectorWithLeader<TrialWaveFunction> empty_wavefunctions(wavefunction0);
@@ -770,6 +809,13 @@ TEST_CASE("TrialWaveFunction constructs a provider-selected streaming owner",
   one_particle.push_back(electrons0);
   CHECK_THROWS(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
       wavefunctions, one_particle, provider_id, 9, 23, 113));
+
+  wftrain::StructuredParameterSnapshot updated =
+      provider.front().get().snapshotParameters();
+  updated.values.front() += 1.0e-7;
+  provider.front().get().publishParameters(updated, updated.version);
+  CHECK_THROWS(channel_batch->evaluateAmplitudes(
+      0, amplitudes.data(), amplitudes.size()));
 }
 
 TEST_CASE("PsiFormer contracts live ordinary-locality ECP tiles without dense staging",
@@ -904,6 +950,8 @@ TEST_CASE("PsiFormer contracts live ordinary-locality ECP tiles without dense st
   }
   consumer->end();
   REQUIRE(sink.results().size() == 1);
+  CHECK_THROWS_WITH(consumer->releaseJVPReplay(),
+                    Catch::Matchers::ContainsSubstring("capture was not requested"));
 
   // Independently assemble the virtual-minus-reference identity through the
   // established selected-parameter derivative interface.

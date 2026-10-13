@@ -31,6 +31,7 @@
 #include "TrialWaveFunction.h"
 #include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/TrialWaveFunctionMemoryPolicy.h"
 #include "Utilities/BatchResourcePreparation.h"
@@ -2488,6 +2489,70 @@ TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
   return component_list.getLeader().makeStreamingDerivativeOperator(
       component_list, p_list, batch_ordinal, sample_offset,
       maximum_parameter_chunk_size);
+}
+
+std::unique_ptr<psiformer::DeterminantChannelBatch>
+TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    std::string_view provider_id)
+{
+  if (wf_list.size() != p_list.size())
+    throw std::invalid_argument(
+        "Determinant-channel wavefunction and particle batches differ in size");
+  if (wf_list.empty() || &wf_list[0] != &wf_list.getLeader() ||
+      &p_list[0] != &p_list.getLeader())
+    throw std::invalid_argument(
+        "Determinant-channel batches must be nonempty and begin with their leaders");
+
+  TrialWaveFunction& leader = wf_list.getLeader();
+  std::set<std::string> provider_ids;
+  std::optional<std::size_t> selected_component;
+  for (std::size_t component_index = 0; component_index < leader.Z.size();
+       ++component_index)
+    if (wftrain::StructuredParameterProvider* provider =
+            leader.Z[component_index]->structuredParameterProvider())
+    {
+      const std::string& candidate_id = provider->parameterSchema().providerId();
+      if (!provider_ids.insert(candidate_id).second)
+        throw std::invalid_argument(
+            "Distinct structured parameter providers have duplicate identity " + candidate_id);
+      if (provider_id.empty() || candidate_id == provider_id)
+      {
+        if (selected_component)
+          throw std::invalid_argument(
+              "An empty structured provider identity requires exactly one provider");
+        selected_component = component_index;
+      }
+    }
+  if (!selected_component)
+    throw std::invalid_argument(
+        provider_id.empty()
+            ? "TrialWaveFunction has no structured determinant-channel provider"
+            : "TrialWaveFunction has no structured determinant-channel provider named " +
+                  std::string(provider_id));
+
+  const std::size_t component_index = *selected_component;
+  const std::string selected_id = leader.Z[component_index]
+                                      ->structuredParameterProvider()
+                                      ->parameterSchema()
+                                      .providerId();
+  for (std::size_t sample = 0; sample < wf_list.size(); ++sample)
+  {
+    TrialWaveFunction& wavefunction = wf_list[sample];
+    if (wavefunction.Z.size() != leader.Z.size())
+      throw std::invalid_argument(
+          "Determinant-channel clone batch has inconsistent component counts");
+    wftrain::StructuredParameterProvider* provider =
+        wavefunction.Z[component_index]->structuredParameterProvider();
+    if (!provider || provider->parameterSchema().providerId() != selected_id)
+      throw std::invalid_argument(
+          "Determinant-channel clone batch has inconsistent provider topology");
+  }
+
+  RefVectorWithLeader<WaveFunctionComponent> component_list =
+      extractWFCRefList(wf_list, static_cast<int>(component_index));
+  return component_list.getLeader().makeDeterminantChannelBatch(component_list, p_list);
 }
 
 void TrialWaveFunction::checkInVariables(OptVariables& active)

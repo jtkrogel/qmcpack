@@ -10,6 +10,7 @@
  */
 
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 
 #include <algorithm>
 #include <cmath>
@@ -102,6 +103,13 @@ std::size_t checkedSampleEnd(std::size_t offset, std::size_t count)
 }
 
 } // namespace
+
+void StreamingDerivativeOperator::bindNonLocalECPJVPReplay(
+    std::unique_ptr<NonLocalECPJVPReplay>)
+{
+  throw std::logic_error(
+      "Streaming derivative producer does not support accepted-grid ECP JVP replay");
+}
 
 ParameterChunkPlan::ParameterChunkPlan(const StructuredParameterSchema& schema,
                                        std::size_t parameter_version,

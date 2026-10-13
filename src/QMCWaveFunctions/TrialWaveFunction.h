@@ -53,6 +53,10 @@ namespace wftrain
 {
 class StructuredParameterProvider;
 }
+namespace psiformer
+{
+class DeterminantChannelBatch;
+}
 namespace testing
 {
 class TestTrialWaveFunction;
@@ -183,6 +187,13 @@ public:
       std::size_t batch_ordinal,
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size);
+
+  /** Select one structured provider and construct its determinant-channel batch. */
+  static std::unique_ptr<psiformer::DeterminantChannelBatch>
+  makeStructuredDeterminantChannelBatch(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::string_view provider_id);
 
   /** Check in an optimizable parameter
    * @param o aggregated list of optimizable variables
@@ -677,7 +688,7 @@ public:
 
   std::unique_ptr<TrialWaveFunction> makeClone(ParticleSet& tqp) const;
 
-  std::vector<std::unique_ptr<WaveFunctionComponent>> const& getOrbitals() { return Z; }
+  std::vector<std::unique_ptr<WaveFunctionComponent>> const& getOrbitals() const { return Z; }
 
   void evaluateRatiosAlltoOne(ParticleSet& P, std::vector<ValueType>& ratios);
 

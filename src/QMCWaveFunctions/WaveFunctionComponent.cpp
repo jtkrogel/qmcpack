@@ -17,6 +17,7 @@
 
 #include "WaveFunctionComponent.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 
 #include <algorithm>
 #include <limits>
@@ -59,6 +60,15 @@ WaveFunctionComponent::makeStreamingDerivativeOperator(
     std::size_t) const
 {
   throw std::runtime_error("Wavefunction component does not support streaming parameter derivatives");
+}
+
+std::unique_ptr<psiformer::DeterminantChannelBatch>
+WaveFunctionComponent::makeDeterminantChannelBatch(
+    const RefVectorWithLeader<WaveFunctionComponent>&,
+    const RefVectorWithLeader<ParticleSet>&) const
+{
+  throw std::runtime_error(
+      "Wavefunction component does not support determinant-channel derivatives");
 }
 
 WaveFunctionComponent::EvaluationStamp WaveFunctionComponent::EvaluationStamp::versioned(

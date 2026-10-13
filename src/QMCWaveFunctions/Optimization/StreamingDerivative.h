@@ -24,6 +24,7 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -31,6 +32,8 @@
 
 namespace qmcplusplus::wftrain
 {
+
+class NonLocalECPJVPReplay;
 
 /// Full-precision real scalar used for derivative reductions.
 using DerivativeReal = QMCTraits::FullPrecRealType;
@@ -619,6 +622,15 @@ public:
    * incorporated into the driver-wide budget before execution.
    */
   virtual StreamingDerivativeStorageDiagnostics storageDiagnostics() const { return {}; }
+
+  /** Bind one immutable accepted-grid nonlocal-ECP replay before first use.
+   *
+   * Providers without an exact replay implementation reject this optional
+   * extension.  A successful bind adds disjoint local-energy JVP term coverage;
+   * it must never regenerate stochastic Hamiltonian state during an action.
+   */
+  virtual void bindNonLocalECPJVPReplay(
+      std::unique_ptr<NonLocalECPJVPReplay> replay);
 
   /// Apply several independently weighted score/local-energy VJPs in one traversal.
   void applyVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
