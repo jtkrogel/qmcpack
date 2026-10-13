@@ -14,6 +14,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerFoldedDense.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
@@ -30,6 +31,44 @@ namespace spatial_jet = qmcplusplus::psiformer::spatial_jet;
 namespace open_spatial = qmcplusplus::psiformer::open_spatial;
 namespace determinant = qmcplusplus::psiformer::device_determinant;
 namespace open_orbital = qmcplusplus::psiformer::open_orbital;
+
+/// Constrain row folding with independent per-configuration/plane dense products.
+TEST_CASE("PsiFormer shared-weight spatial folding preserves every configuration and plane",
+          "[psiformer][device][spatial][folded]")
+{
+  for (std::size_t batch : {std::size_t(1), std::size_t(3), std::size_t(17)})
+    for (auto mode : {psiformer::SpatialJetMode::ACTIVE, psiformer::SpatialJetMode::FULL_VGL})
+    {
+      const auto jets = psiformer::makeSpatialDenseJetLayout(batch, 2, 4, 5, 2, mode);
+      const auto folded = psiformer::makeFoldedSpatialDenseLayout(jets);
+      REQUIRE(folded.rows == batch * jets.source.plane_count * 2);
+      const auto source_count = psiformer::spatialJetSpanElements(jets.source);
+      std::vector<double> source(source_count), weights(20);
+      for (std::size_t i = 0; i < source.size(); ++i) source[i] = double(i % 31) / 32;
+      for (std::size_t i = 0; i < weights.size(); ++i) weights[i] = double(i % 7) / 8;
+      for (std::size_t configuration = 0; configuration < batch; ++configuration)
+        for (std::size_t plane = 0; plane < jets.source.plane_count; ++plane)
+          for (std::size_t row = 0; row < jets.rows; ++row)
+            for (std::size_t output = 0; output < jets.output_width; ++output)
+            {
+              double separate = 0, combined = 0;
+              const std::size_t folded_row = (configuration * jets.source.plane_count + plane) * jets.rows + row;
+              for (std::size_t input = 0; input < jets.input_width; ++input)
+              {
+                separate += source[jets.source.uncheckedPlaneOffset(configuration, plane, row * 4 + input)] *
+                            weights[input * 5 + output];
+                combined += source[folded_row * folded.source_row_stride + input] *
+                            weights[input * folded.weight_row_stride + output];
+              }
+              CHECK(separate == combined);
+              CHECK(jets.target.uncheckedPlaneOffset(configuration, plane, row * 5 + output) ==
+                    folded_row * folded.target_row_stride + output);
+            }
+    }
+  const auto padded = psiformer::makeSpatialDenseJetLayout(
+      3, 2, 4, 5, 2, psiformer::SpatialJetMode::FULL_VGL, 4, 5, 5, 9, 11);
+  CHECK_THROWS_AS(psiformer::makeFoldedSpatialDenseLayout(padded), std::invalid_argument);
+}
 
 namespace
 {

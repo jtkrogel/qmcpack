@@ -23,6 +23,7 @@
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerFoldedDense.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <algorithm>
@@ -128,25 +129,24 @@ public:
     checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), nuclei_.data(),
                                        active_.data(), raw_.data(), open_status_.data()), "model feature VGL");
     checkOpen(batch_);
-    denseJetsForward(blas_, embedding_, raw_.data(), parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT), a_.data());
+    project(embedding_, raw_.data(), parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT), a_.data());
 
     // Remaining neural layers: four validated attention/residual/MLP blocks.
     for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
     {
-      projectQkvJetsForward(blas_, dense_, a_.data(),
-          parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, layer),
-          parameter(ParameterRole::ATTENTION_KEY_WEIGHT, layer),
-          parameter(ParameterRole::ATTENTION_VALUE_WEIGHT, layer), q_.data(), k_.data(), v_.data());
+      project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, layer), q_.data());
+      project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_KEY_WEIGHT, layer), k_.data());
+      project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_VALUE_WEIGHT, layer), v_.data());
       checkRuntime(launchAttentionJetWeights(stream, attention_, q_.data(), k_.data(),
                                              weights_.data(), jet_status_.data()), "model attention VGL");
       checkJets();
       checkRuntime(launchAttentionContextJets(stream, attention_, weights_.data(),
                                               v_.data(), context_.data()), "model attention context");
-      denseJetsForward(blas_, dense_, context_.data(), parameter(ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer), b_.data());
+      project(dense_, context_.data(), parameter(ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer), b_.data());
       residual(a_.data(), b_.data(), b_.data());
-      denseJetsForward(blas_, dense_, b_.data(), parameter(ParameterRole::UPDATE_HIDDEN_WEIGHT, layer), hidden_.data());
+      project(dense_, b_.data(), parameter(ParameterRole::UPDATE_HIDDEN_WEIGHT, layer), hidden_.data());
       activate(hidden_.data(), parameter(ParameterRole::UPDATE_HIDDEN_BIAS, layer));
-      denseJetsForward(blas_, dense_, hidden_.data(), parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer), projected_.data());
+      project(dense_, hidden_.data(), parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer), projected_.data());
       activate(projected_.data(), parameter(ParameterRole::UPDATE_OUTPUT_BIAS, layer));
       residual(b_.data(), projected_.data(), a_.data());
     }
@@ -207,6 +207,17 @@ private:
   /// Bind a canonical device parameter interval without hot-path string lookup.
   const double* parameter(ParameterRole role, std::size_t layer = NO_ATTENTION_BLOCK) const
   { return params_.data() + plan_.parameter(role, layer).begin; }
+
+  /** Fold contiguous configurations and derivative planes into one shared-weight GEMM.
+   * The same affine weight acts independently on every jet plane. No mathematical
+   * coupling crosses configurations; only the BLAS row dimension is enlarged.
+   */
+  void project(const SpatialDenseJetLayout& layout, const double* source,
+               const double* weight, double* target)
+  {
+    const auto folded = makeFoldedSpatialDenseLayout(layout);
+    denseForward(blas_, folded, source, weight, target);
+  }
 
   /// Check each stage before a later launch can overwrite its error diagnostics.
   void checkOpen(std::size_t count)
