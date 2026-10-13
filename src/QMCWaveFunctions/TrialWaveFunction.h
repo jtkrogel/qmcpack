@@ -35,6 +35,8 @@
 #include "Utilities/ResourceHandle.h"
 
 #include <cstdint>
+#include <memory>
+#include <string_view>
 
 /**@defgroup MBWfs Many-body wave function group
  * @brief Classes to handle many-body trial wave functions
@@ -166,6 +168,21 @@ public:
   /// Collect unique tensor-level providers without registering scalar variables.
   std::vector<std::reference_wrapper<wftrain::StructuredParameterProvider>>
       extractStructuredParameterProviders();
+
+  /** Construct one provider-selected derivative owner from an aggregate clone batch.
+   *
+   * An empty provider identity selects the sole structured provider.  This is the
+   * driver-facing seam: production code need not inspect component order or cast a
+   * concrete neural-wavefunction type.
+   */
+  static std::unique_ptr<wftrain::StreamingDerivativeOperator>
+  makeStructuredStreamingDerivativeOperator(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::string_view provider_id,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset,
+      std::size_t maximum_parameter_chunk_size);
 
   /** Check in an optimizable parameter
    * @param o aggregated list of optimizable variables

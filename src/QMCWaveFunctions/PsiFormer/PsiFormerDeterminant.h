@@ -501,6 +501,55 @@ public:
               matrix_adjoint);
   }
 
+  /** Fill a weighted sum of independent channel-log adjoints.
+   *
+   * Unlike fillLogAmplitudeMatrixAdjoints(), this operation does not differentiate
+   * the reduced determinant sum.  Channel k instead contributes
+   * ``weight[k] * d log|det(A_k)| / d A_k``.  A zero-weight singular channel is
+   * therefore harmless, while any weighted singular channel is rejected.
+   */
+  void fillWeightedChannelLogAmplitudeMatrixAdjoints(const double* weights,
+                                                      std::size_t weight_count,
+                                                      double* matrix_adjoint) const
+  {
+    if (!weights || !matrix_adjoint)
+      throw std::invalid_argument("PsiFormer weighted channel adjoint pointer is null");
+    if (weight_count != channels_)
+      throw std::invalid_argument("PsiFormer weighted channel adjoint count is incorrect");
+    if (!evaluated_)
+      throw std::logic_error("PsiFormer weighted channel adjoints requested before evaluation");
+
+    for (std::size_t channel = 0; channel < channels_; ++channel)
+    {
+      const double weight = weights[channel];
+      if (!isFiniteReal(weight))
+        throw std::invalid_argument("PsiFormer weighted channel adjoint is non-finite");
+      if (weight != 0.0 && !factorization_[channel].inverse_available)
+        throw std::domain_error(
+            "PsiFormer weighted channel adjoint requires a nonsingular channel");
+
+      const double* inverse = inverses_.data() + channel * matrix_elements_;
+      for (std::size_t row = 0; row < matrix_size_; ++row)
+        for (std::size_t column = 0; column < matrix_size_; ++column)
+          staged_matrix_adjoint_[channel * matrix_elements_ + row * matrix_size_ + column] =
+              weight == 0.0 ? 0.0 : detail::narrowFinite(
+                    static_cast<long double>(weight) *
+                        static_cast<long double>(inverse[column * matrix_size_ + row]),
+                    "PsiFormer weighted channel reverse seed overflowed");
+    }
+    std::copy(staged_matrix_adjoint_.begin(), staged_matrix_adjoint_.end(),
+              matrix_adjoint);
+  }
+
+  /// Return one independent channel determinant from the latest evaluation.
+  RealLogAmplitude channelAmplitude(std::size_t channel) const
+  {
+    checkChannel(channel);
+    if (!evaluated_)
+      throw std::logic_error("PsiFormer channel amplitude requested before evaluation");
+    return factorization_[channel].determinant;
+  }
+
   /// Return metadata from the most recent successful evaluation.
   const RealDeterminantResult& result() const
   {

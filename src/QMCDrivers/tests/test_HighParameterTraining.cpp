@@ -15,6 +15,7 @@
 
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
+#include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 
 #include <algorithm>
 #include <array>
@@ -100,7 +101,9 @@ public:
                        bool fail_after_first_chunk = false,
                        const EnergyGradientAccumulator* merge_source = nullptr,
                        std::uint32_t local_energy_term_mask =
-                           localEnergyTermBit(LocalEnergyTerm::KINETIC))
+                           localEnergyTermBit(LocalEnergyTerm::KINETIC),
+                       std::size_t batch_ordinal = 4,
+                       std::size_t sample_offset = 9)
       : schema_(schema),
         parameter_version_(parameter_version),
         scores_(std::move(scores)),
@@ -108,7 +111,9 @@ public:
         plan_(schema, parameter_version, 1),
         fail_after_first_chunk_(fail_after_first_chunk),
         merge_source_(merge_source),
-        local_energy_term_mask_(local_energy_term_mask)
+        local_energy_term_mask_(local_energy_term_mask),
+        batch_ordinal_(batch_ordinal),
+        sample_offset_(sample_offset)
   {}
 
   StreamingDerivativeCapabilities capabilities() const noexcept override
@@ -134,9 +139,9 @@ public:
 
   std::size_t parameterVersion() const noexcept override { return parameter_version_; }
 
-  std::size_t batchOrdinal() const noexcept override { return 4; }
+  std::size_t batchOrdinal() const noexcept override { return batch_ordinal_; }
 
-  std::size_t sampleOffset() const noexcept override { return 9; }
+  std::size_t sampleOffset() const noexcept override { return sample_offset_; }
 
   std::size_t sampleCount() const noexcept override { return scores_.size(); }
 
@@ -191,6 +196,8 @@ private:
   bool fail_after_first_chunk_;
   const EnergyGradientAccumulator* merge_source_;
   std::uint32_t local_energy_term_mask_;
+  std::size_t batch_ordinal_;
+  std::size_t sample_offset_;
 };
 
 /// Return the shared deterministic score rows for energy-objective tests.
@@ -532,6 +539,65 @@ TEST_CASE("Complete crowd-local energy-gradient contributions merge deterministi
   for (std::size_t parameter = 0; parameter < merged_result.gradient.size(); ++parameter)
     CHECK(merged_result.gradient[parameter] ==
           Catch::Approx(reference_result.gradient[parameter]));
+}
+
+TEST_CASE("Prepared live batches compose one bounded rank-local objective",
+          "[drivers][training][prepared]")
+{
+  ToyProvider provider;
+  const StructuredParameterSnapshot parameters = provider.snapshotParameters();
+  const ComplexRows scores = makeScores();
+  const ComplexRows responses = makeLocalEnergyDerivatives();
+
+  std::vector<PreparedEnergyGradientBatch> batches;
+  PreparedEnergyGradientBatch first;
+  first.derivative_operator = std::make_unique<ToyStreamingOperator>(
+      provider.parameterSchema(), parameters.version, ComplexRows{scores[0]},
+      ComplexRows{responses[0]}, false, nullptr,
+      localEnergyTermBit(LocalEnergyTerm::KINETIC), 0, 0);
+  first.weights = {1.0};
+  first.local_energies = {-1.0};
+  first.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  batches.push_back(std::move(first));
+
+  PreparedEnergyGradientBatch second;
+  second.derivative_operator = std::make_unique<ToyStreamingOperator>(
+      provider.parameterSchema(), parameters.version,
+      ComplexRows{scores[1], scores[2]},
+      ComplexRows{responses[1], responses[2]}, false, nullptr,
+      localEnergyTermBit(LocalEnergyTerm::KINETIC), 1, 1);
+  second.weights = {2.0, 1.0};
+  second.local_energies = {0.5, 2.0};
+  second.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  batches.push_back(std::move(second));
+
+  PreparedEnergyGradientProducer producer(std::move(batches));
+  CHECK(producer.capabilities().contains(TrainingCapability::SCORE_VJP));
+  CHECK(producer.capabilities().contains(TrainingCapability::LOCAL_ENERGY_VJP));
+  CHECK_FALSE(producer.capabilities().contains(TrainingCapability::SCORE_JVP));
+  const PreparedEnergyGradientStorageDiagnostics storage =
+      producer.storageDiagnostics();
+  CHECK(storage.batch_count == 2);
+  CHECK(storage.sample_count == 3);
+  CHECK(storage.sample_scalar_bytes ==
+        3 * (sizeof(DerivativeReal) + sizeof(DerivativeValue)));
+
+  EnergyGradientAccumulator accumulator(provider.parameterSchema(),
+                                         parameters.version);
+  producer.accumulate(parameters, accumulator);
+  accumulator.completeSingleParticipantReduction();
+  const EnergyGradientResult result = accumulator.finalize();
+  CHECK(result.sample_count == 3);
+  CHECK(result.weight_sum == Catch::Approx(4.0));
+  CHECK(result.mean_energy.real() == Catch::Approx(0.5));
+  REQUIRE(result.gradient.size() == 3);
+  CHECK(result.gradient[0] == Catch::Approx(-1.25));
+  CHECK(result.gradient[1] == Catch::Approx(3.2));
+  CHECK(result.gradient[2] == Catch::Approx(0.0));
+
+  EnergyGradientAccumulator reused(provider.parameterSchema(), parameters.version);
+  CHECK_THROWS_WITH(producer.accumulate(parameters, reused),
+                    "Prepared energy-gradient producer can be consumed only once");
 }
 
 TEST_CASE("Energy-gradient merge rejects invalid receiver lifecycle states",

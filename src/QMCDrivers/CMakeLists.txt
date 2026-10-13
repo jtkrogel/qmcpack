@@ -44,6 +44,8 @@ set(QMCDRIVERS
     WFOpt/GradientTestInput.cpp
     WFOpt/GradientTest.cpp
     WFTrain/TrainingCapabilities.cpp
+    WFTrain/WFTrainDriverInput.cpp
+    WFTrain/WFTrainBatched.cpp
     WFTrain/AcceleratorTrainingPlan.cpp
     WFTrain/AcceleratorCollectiveState.cpp
     WFTrain/AcceleratorCollectiveRecording.cpp
@@ -56,11 +58,13 @@ set(QMCDRIVERS
     WFTrain/OrbitalPretraining.cpp
     WFTrain/ParameterUpdateTransaction.cpp
     WFTrain/HighParameterTraining.cpp
+    WFTrain/PreparedEnergyGradientProducer.cpp
     WFTrain/TrainingCheckpoint.cpp
     WFTrain/FirstOrderOptimizer.cpp
     WFTrain/MatrixFreeOperator.cpp
     WFTrain/KrylovSolver.cpp
     WFTrain/MatrixFreeStochasticReconfiguration.cpp
+    WFTrain/MinimumStepStochasticReconfiguration.cpp
     WFTrain/MatrixFreeLinearMethod.cpp
     WFTrain/KFACPreconditioner.cpp
     WFTrain/PsiFormerKFAC.cpp
@@ -79,6 +83,7 @@ set(QMCDRIVERS
     VMC/VMCUpdatePbyP.cpp
     VMC/VMCUpdateAll.cpp
     VMC/VMCDriverInput.cpp
+    VMC/VMCBatchedSampling.cpp
     VMC/ElectronSubsetSelector.cpp
     VMC/SOVMCUpdatePbyP.cpp
     VMC/SOVMCUpdateAll.cpp

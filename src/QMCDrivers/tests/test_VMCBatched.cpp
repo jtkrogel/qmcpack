@@ -51,6 +51,11 @@ public:
     auto wavefunction_pool =
         MinimalWaveFunctionPool::make_diamondC_1x1x1(project_data_.getRuntimeOptions(), comm_, particle_pool);
     auto hamiltonian_pool = MinimalHamiltonianPool::make_hamWithEE(comm_, particle_pool, wavefunction_pool);
+
+    VMCDriverInput vmc_input;
+    vmc_input.readXML(node);
+    CHECK_NOTHROW(VMCBatchedSampling::validateMoveConfiguration(
+        vmc_input, *particle_pool.getParticleSet("e"), wavefunction_pool.getWaveFunction().value(), false));
   }
 
 private:

@@ -12,6 +12,9 @@
  * chain rule for the embedding, attention blocks, orbital/envelope construction,
  * determinant sum, and cusp.  The returned vector is d log|Psi| / d parameter in
  * the canonical imported-HDF5 order used by QMCPACK's optimizer registration.
+ * A channel-resolved route also returns each pre-sum determinant amplitude and
+ * reverses an arbitrary weighted sum of channel log amplitudes through the shared
+ * feature trunk and cusp in one pass.
  *
  * Immutable tensor offsets and execution semantics come from PsiFormerExecutionPlan;
  * all tape, adjoint, geometry, and output storage is clone-local.  The implemented
@@ -204,6 +207,22 @@ struct DirectScoreResult
   double sign   = 1.0;
   double logabs = 0.0;
   double value  = 0.0;
+  DirectParameterScoreView parameter_score;
+  std::size_t parameter_version = 0;
+};
+
+/** Describe caller-owned per-determinant signed/log channel amplitudes. */
+struct DirectChannelAmplitudeResult
+{
+  const double* phases = nullptr;
+  const double* log_abs = nullptr;
+  std::size_t channel_count = 0;
+  std::size_t parameter_version = 0;
+};
+
+/** Return one weighted sum of independent channel log-parameter scores. */
+struct DirectWeightedChannelScoreResult
+{
   DirectParameterScoreView parameter_score;
   std::size_t parameter_version = 0;
 };
@@ -501,6 +520,98 @@ public:
     return evaluateImpl(workspace, nullptr);
   }
 
+  /** Evaluate every pre-sum determinant channel in signed/log form.
+   *
+   * Each channel includes the common PsiFormer cusp.  Output storage remains owned
+   * by the caller, and the warmed evaluator performs no allocation.
+   */
+  DirectChannelAmplitudeResult evaluateChannelAmplitudes(
+      DirectScoreWorkspace& workspace,
+      double* phases,
+      double* log_abs,
+      std::size_t channel_count) const
+  {
+    validateWorkspaceAndParameters(workspace);
+    if (!phases || !log_abs)
+      throw std::invalid_argument("PsiFormer channel-amplitude output pointer is null");
+    if (channel_count != workspace.determinants_)
+      throw std::invalid_argument("PsiFormer channel-amplitude output count is incorrect");
+
+    const double* parameter_values = parameters_.flat_values().data();
+    workspace.geometry_.update(
+        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
+    buildEmbedding(parameter_values, workspace);
+    for (std::size_t block = 0; block < workspace.blocks_; ++block)
+      applyAttentionBlock(parameter_values, block, workspace);
+    buildOrbitals(parameter_values, workspace);
+    workspace.determinant_workspace_.evaluateValue(workspace.orbital_matrices_.data());
+    const double cusp = cuspValueAndReverse(parameter_values, workspace, 0.0);
+
+    // Validate all staged channel values before publishing any caller output.
+    for (std::size_t channel = 0; channel < channel_count; ++channel)
+    {
+      const auto amplitude = workspace.determinant_workspace_.channelAmplitude(channel);
+      workspace.matrix_adjoints_[channel] = amplitude.phase;
+      workspace.backflow_adjoints_[channel] =
+          amplitude.isZero() ? amplitude.log_abs : amplitude.log_abs + cusp;
+      if (!amplitude.isZero() &&
+          !is_finite_parameter_value(workspace.backflow_adjoints_[channel]))
+        throw std::overflow_error("PsiFormer channel log amplitude is non-finite");
+    }
+    std::copy_n(workspace.matrix_adjoints_.data(), channel_count, phases);
+    std::copy_n(workspace.backflow_adjoints_.data(), channel_count, log_abs);
+    workspace.observed_parameter_version_ = parameters_.version();
+    return {phases, log_abs, channel_count, workspace.observed_parameter_version_};
+  }
+
+  /** Reverse one weighted sum of independent determinant-channel log amplitudes.
+   *
+   * The determinant heads receive independent ``weight[k] * A_k^{-T}`` seeds,
+   * while the shared cusp and feature trunk are traversed once.  This computes
+   * ``sum_k weight[k] d log|Psi_k|/dp`` with one canonical P-sized result.
+   */
+  DirectWeightedChannelScoreResult evaluateWeightedChannelScore(
+      DirectScoreWorkspace& workspace,
+      const double* weights,
+      std::size_t weight_count) const
+  {
+    validateWorkspaceAndParameters(workspace);
+    if (!weights)
+      throw std::invalid_argument("PsiFormer weighted channel score pointer is null");
+    if (weight_count != workspace.determinants_)
+      throw std::invalid_argument("PsiFormer weighted channel score count is incorrect");
+    double cusp_seed = 0.0;
+    for (std::size_t channel = 0; channel < weight_count; ++channel)
+    {
+      if (!is_finite_parameter_value(weights[channel]))
+        throw std::invalid_argument("PsiFormer weighted channel score is non-finite");
+      cusp_seed += weights[channel];
+    }
+    if (!is_finite_parameter_value(cusp_seed))
+      throw std::overflow_error("PsiFormer weighted channel cusp seed overflowed");
+
+    const double* parameter_values = parameters_.flat_values().data();
+    std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
+    workspace.geometry_.update(
+        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
+    buildEmbedding(parameter_values, workspace);
+    for (std::size_t block = 0; block < workspace.blocks_; ++block)
+      applyAttentionBlock(parameter_values, block, workspace);
+    buildOrbitals(parameter_values, workspace);
+    workspace.determinant_workspace_.evaluate(workspace.orbital_matrices_.data());
+    workspace.determinant_workspace_.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+        weights, weight_count, workspace.matrix_adjoints_.data());
+    cuspValueAndReverse(parameter_values, workspace, cusp_seed);
+
+    reverseOrbitals(parameter_values, workspace);
+    for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
+      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace);
+    reverseEmbedding(workspace);
+    workspace.observed_parameter_version_ = parameters_.version();
+    return {{workspace.parameter_score_.data(), workspace.parameter_score_.size()},
+            workspace.observed_parameter_version_};
+  }
+
   /** Evaluate a score while streaming every supported affine layer boundary. */
   DirectScoreResult evaluateWithAffineObservations(
       DirectScoreWorkspace& workspace,
@@ -533,7 +644,7 @@ private:
     workspace.determinant_workspace_.fillLogAmplitudeMatrixAdjoints(
         workspace.matrix_adjoints_.data());
 
-    const double cusp   = cuspValueAndReverse(parameter_values, workspace);
+    const double cusp   = cuspValueAndReverse(parameter_values, workspace, 1.0);
     const double logabs = determinant_result.amplitude.log_abs + cusp;
     if (!is_finite_parameter_value(logabs))
       throw std::runtime_error("PsiFormer score executor produced a non-finite log wavefunction");
@@ -811,8 +922,10 @@ private:
     }
   }
 
-  /// Accumulate the analytic cusp value and its two scalar parameter derivatives.
-  double cuspValueAndReverse(const double* parameters, DirectScoreWorkspace& workspace) const
+  /// Accumulate the cusp value and a scaled reverse seed for its scalar parameters.
+  double cuspValueAndReverse(const double* parameters,
+                             DirectScoreWorkspace& workspace,
+                             double reverse_seed) const
   {
     const bool has_same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA);
     const double same_alpha = has_same_alpha
@@ -841,10 +954,10 @@ private:
       {
         if (!same_score)
           throw std::logic_error("PsiFormer score plan omitted a required same-spin cusp parameter");
-        same_score[0] += derivative;
+        same_score[0] += reverse_seed * derivative;
       }
       else
-        anti_score += derivative;
+        anti_score += reverse_seed * derivative;
     }
     return cusp;
   }

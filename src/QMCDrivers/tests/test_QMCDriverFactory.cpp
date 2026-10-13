@@ -29,6 +29,7 @@
 #include "QMCDrivers/VMC/VMC.h"
 #include "QMCDrivers/DMC/DMC.h"
 #include "QMCDrivers/VMC/VMCBatched.h"
+#include "QMCDrivers/WFTrain/WFTrainBatched.h"
 #include "QMCDrivers/DMC/DMCBatched.h"
 #include "EstimatorInputDelegates.h"
 
@@ -152,6 +153,40 @@ TEST_CASE("QMCDriverFactory create VMCBatched driver", "[qmcapp]")
     REQUIRE(qmc_driver != nullptr);
     REQUIRE_NOTHROW(dynamic_cast<VMCBatched&>(*qmc_driver));
     CHECK((qmc_driver->getDriverMode() & (1UL << QMCDriverNew::QMC_UPDATE_MODE)) == 0);
+  }
+}
+
+TEST_CASE("QMCDriverFactory creates the exact wf_train driver", "[qmcapp][wf_train]")
+{
+  using namespace testing;
+  Communicate* comm = OHMMS::Controller;
+
+  const std::string input = R"(
+    <qmc method="wf_train" move="pbyp">
+      <training objective="energy" optimizer="adam" parameter_chunk_size="1024"/>
+      <parameter name="crowds">1</parameter>
+      <parameter name="walkers_per_rank">1</parameter>
+      <parameter name="steps">1</parameter>
+      <parameter name="blocks">1</parameter>
+      <parameter name="timestep">0.01</parameter>
+      <parameter name="usedrift">no</parameter>
+    </qmc>)";
+
+  for (const ProjectData::DriverVersion version :
+       {ProjectData::DriverVersion::BATCH, ProjectData::DriverVersion::LEGACY})
+  {
+    ProjectData project("test", version);
+    QMCDriverFactory driver_factory(project);
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(input));
+    xmlNodePtr node = document.getRoot();
+    QMCDriverFactory::DriverAssemblyState assembly = driver_factory.readSection(node);
+    CHECK(assembly.new_run_type == QMCRunType::WF_TRAIN_BATCH);
+
+    auto driver = testing::createDriver(project.getRuntimeOptions(), comm, driver_factory, node, assembly);
+    REQUIRE(driver != nullptr);
+    CHECK_NOTHROW(dynamic_cast<WFTrainBatched&>(*driver));
+    CHECK(driver->getEngineName() == "WFTrainBatched");
   }
 }
 

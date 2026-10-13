@@ -501,6 +501,85 @@ void testReverseSeedFiniteDifferences()
   }
 }
 
+/// Validate independent weighted channel-log seeds, singular handling, and storage reuse.
+void testWeightedChannelReverseSeeds()
+{
+  std::array<double, 8> matrices{
+      1.2, 0.1, -0.2, 0.9,
+      0.6, -0.3, 0.4, 1.1};
+  const std::array<double, 2> weights{0.7, -1.2};
+  det::RealOpenDeterminantWorkspace workspace(2, 2);
+  const std::size_t fingerprint = workspace.storageFingerprint();
+  workspace.evaluate(matrices.data());
+  check(workspace.channelAmplitude(0).phase == 1.0,
+        "first independent channel amplitude phase");
+  check(workspace.channelAmplitude(1).phase == 1.0,
+        "second independent channel amplitude phase");
+
+  std::array<double, 8> adjoints{};
+  workspace.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+      weights.data(), weights.size(), adjoints.data());
+
+  constexpr double step = 2.0e-6;
+  for (std::size_t element = 0; element < matrices.size(); ++element)
+  {
+    const double original = matrices[element];
+    matrices[element] = original + step;
+    workspace.evaluate(matrices.data());
+    const double plus = weights[0] * workspace.channelAmplitude(0).log_abs +
+        weights[1] * workspace.channelAmplitude(1).log_abs;
+    matrices[element] = original - step;
+    workspace.evaluate(matrices.data());
+    const double minus = weights[0] * workspace.channelAmplitude(0).log_abs +
+        weights[1] * workspace.channelAmplitude(1).log_abs;
+    matrices[element] = original;
+    check(near(adjoints[element], (plus - minus) / (2.0 * step), 3.0e-9, 3.0e-9),
+          "weighted channel reverse finite-difference parity");
+  }
+
+  workspace.evaluate(matrices.data());
+  const std::array<double, 2> first_only{1.0, 0.0};
+  const std::array<double, 2> second_only{0.0, 1.0};
+  std::array<double, 8> first_adjoints{};
+  std::array<double, 8> second_adjoints{};
+  workspace.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+      first_only.data(), first_only.size(), first_adjoints.data());
+  workspace.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+      second_only.data(), second_only.size(), second_adjoints.data());
+  for (std::size_t element = 0; element < adjoints.size(); ++element)
+    check(near(adjoints[element], weights[0] * first_adjoints[element] +
+                                    weights[1] * second_adjoints[element]),
+          "weighted channel reverse aggregates independent seeds");
+  check(workspace.storageFingerprint() == fingerprint,
+        "weighted channel reverse preserves determinant storage");
+
+  const std::array<double, 8> one_singular{
+      1.0, 2.0, 2.0, 4.0,
+      1.0, 0.0, 0.0, 1.0};
+  workspace.evaluate(one_singular.data());
+  const std::array<double, 2> ignore_singular{0.0, 1.0};
+  workspace.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+      ignore_singular.data(), ignore_singular.size(), adjoints.data());
+  check(std::all_of(adjoints.begin(), adjoints.begin() + 4,
+                    [](double value) { return value == 0.0; }),
+        "zero-weight singular channel has exact zero adjoints");
+  const std::array<double, 2> use_singular{1.0, 0.0};
+  checkThrows(
+      [&] {
+        workspace.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+            use_singular.data(), use_singular.size(), adjoints.data());
+      },
+      "weighted singular channel is rejected");
+  const std::array<double, 2> invalid_weight{
+      0.0, std::numeric_limits<double>::quiet_NaN()};
+  checkThrows(
+      [&] {
+        workspace.fillWeightedChannelLogAmplitudeMatrixAdjoints(
+            invalid_weight.data(), invalid_weight.size(), adjoints.data());
+      },
+      "non-finite weighted channel seed is rejected");
+}
+
 /// Check larger matrices against a permutation oracle and audit allocation stability.
 void testFourByFourReferenceAndStorageStability()
 {
@@ -545,6 +624,7 @@ int main()
   testDerivativePublicationIsAtomic();
   testSpatialFiniteDifferences();
   testReverseSeedFiniteDifferences();
+  testWeightedChannelReverseSeeds();
   testFourByFourReferenceAndStorageStability();
 
   if (failures != 0)

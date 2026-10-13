@@ -17,20 +17,9 @@
 #include "Message/CommOperators.h"
 #include "TrialWaveFunction.h"
 #include "Utilities/RunTimeManager.h"
-#include "ParticleBase/RandomSeqGenerator.h"
 #include "Particle/MCSample.h"
-#include "Particle/MCMultiParticleMoves.h"
 #include "MemoryUsage.h"
-#include "QMCWaveFunctions/TWFGrads.hpp"
-#include "QMCDrivers/VMC/ElectronSubsetSelector.h"
-#include <PSdispatcher.h>
-#include <TWFdispatcher.h>
-#include <Hdispatcher.h>
-#include "TauParams.hpp"
 #include "WalkerLogManager.h"
-
-#include <cmath>
-#include <numeric>
 
 namespace qmcplusplus
 {
@@ -59,356 +48,6 @@ VMCBatched::VMCBatched(const ProjectData& project_data,
       collect_samples_(false)
 {}
 
-template<CoordsType CT>
-void VMCBatched::advanceWalkers(const StateForThread& sft,
-                                Crowd& crowd,
-                                QMCDriverNew::DriverTimers& timers,
-                                ContextForSteps& step_context,
-                                bool recompute,
-                                bool accumulate_this_step)
-{
-  if (crowd.size() == 0)
-    return;
-  const PSdispatcher ps_dispatcher(!sft.serializing_crowd_walkers);
-  const TWFdispatcher twf_dispatcher(!sft.serializing_crowd_walkers);
-  const Hdispatcher ham_dispatcher(!sft.serializing_crowd_walkers);
-  auto& walkers = crowd.get_walkers();
-  const RefVectorWithLeader<ParticleSet> walker_elecs(crowd.get_walker_elecs()[0], crowd.get_walker_elecs());
-  const RefVectorWithLeader<TrialWaveFunction> walker_twfs(crowd.get_walker_twfs()[0], crowd.get_walker_twfs());
-
-  // This is really a waste the resources can be acquired outside of the run steps loop in VMCD!
-  // I don't see an  easy way to measure the release without putting the weight of tons of timer_manager calls in
-  // ResourceCollectionTeamLock's constructor.
-  timers.resource_timer.start();
-  ResourceCollectionTeamLock<ParticleSet> pset_res_lock(crowd.getSharedResource().pset_res, walker_elecs);
-  ResourceCollectionTeamLock<TrialWaveFunction> twfs_res_lock(crowd.getSharedResource().twf_res, walker_twfs);
-  timers.resource_timer.stop();
-  if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD)
-    checkLogAndGL(crowd, "checkGL_after_load", sft.serializing_crowd_walkers);
-
-  {
-    ScopedTimer pbyp_local_timer(timers.movepbyp_timer);
-    const int num_walkers   = crowd.size();
-    auto& walker_leader     = walker_elecs.getLeader();
-    const int num_particles = walker_leader.getTotalNum();
-    const bool use_drift    = sft.vmcdrv_input.get_use_drift();
-
-    const VMCDriverInput::MoveKind move_kind = sft.vmcdrv_input.get_move_kind();
-
-    if (move_kind != VMCDriverInput::MoveKind::PBYP)
-    {
-      if constexpr (CT == CoordsType::POS_SPIN)
-        throw std::runtime_error("Collective VMC electron moves do not support spin coordinates.");
-      else
-      {
-        if (sft.serializing_crowd_walkers)
-          throw std::runtime_error("Collective VMC electron moves require crowd-level execution.");
-        if (!walker_twfs.getLeader().supportsMultiParticleMoves())
-          throw std::runtime_error(
-              "The requested collective VMC move is not supported by every wavefunction component.");
-
-        const int particles_per_move = move_kind == VMCDriverInput::MoveKind::ALL_ELECTRON
-            ? num_particles
-            : sft.vmcdrv_input.get_electrons_per_move();
-        if (particles_per_move <= 0 || particles_per_move > num_particles)
-          throw std::runtime_error("electrons_per_move exceeds the number of electrons in the simulation.");
-
-        ElectronSubsetSelector selector(num_particles, particles_per_move,
-                                        sft.vmcdrv_input.get_electron_selection());
-        std::vector<ParticleSet::PosType> gaussian_displacements(num_walkers * particles_per_move);
-        std::vector<ParticleSet::PosType> physical_displacements(num_walkers * particles_per_move);
-        std::vector<ParticleSet::PosType> proposed_positions(num_walkers * particles_per_move);
-        std::vector<ParticleSet::IndexType> selected_indices;
-        selected_indices.reserve(num_walkers * particles_per_move);
-        std::vector<ParticleSet::IndexType> all_electrons(num_particles);
-        std::iota(all_electrons.begin(), all_electrons.end(), ParticleSet::IndexType{0});
-        std::vector<std::size_t> walker_offsets(num_walkers + 1);
-        std::vector<TrialWaveFunction::LogValue> log_ratios(num_walkers);
-        std::vector<RealType> log_gf(num_walkers);
-        std::vector<RealType> log_gb(num_walkers);
-        std::vector<bool> accepted(num_walkers);
-
-        for (int sub_step = 0; sub_step < sft.qmcdrv_input.get_sub_steps(); ++sub_step)
-        {
-          makeGaussRandomWithEngine(gaussian_displacements, step_context.get_random_gen());
-          selected_indices.clear();
-          walker_offsets[0] = 0;
-
-          for (int iw = 0; iw < num_walkers; ++iw)
-          {
-            const std::vector<ParticleSet::IndexType>* selection = nullptr;
-            if (move_kind == VMCDriverInput::MoveKind::ALL_ELECTRON)
-              selection = &all_electrons;
-            else
-              selection = &selector.select(step_context.get_random_gen());
-
-            const ParticleSet& particles = walker_elecs[iw];
-            for (int local_index = 0; local_index < particles_per_move; ++local_index)
-            {
-              const int flat_index = iw * particles_per_move + local_index;
-              const int iat        = (*selection)[local_index];
-              const int group      = particles.getGroupID(iat);
-              const RealType tau_over_mass =
-                  sft.qmcdrv_input.get_tau() / walker_leader.get_mass_by_group()[group];
-
-              gaussian_displacements[flat_index] *= std::sqrt(tau_over_mass);
-              ParticleSet::PosType drift;
-              if (use_drift)
-                sft.drift_modifier.getDrift(tau_over_mass, particles.G[iat], drift);
-              else
-                drift = ParticleSet::PosType{};
-
-              physical_displacements[flat_index] = gaussian_displacements[flat_index] + drift;
-              proposed_positions[flat_index]      = particles.R[iat] + physical_displacements[flat_index];
-              selected_indices.push_back(iat);
-            }
-            walker_offsets[iw + 1] = selected_indices.size();
-          }
-
-          const MCMultiParticleMoves<CoordsType::POS> moves(walker_offsets, selected_indices, proposed_positions);
-          TrialWaveFunction::mw_evaluateMultiParticleMove(walker_twfs, walker_elecs, moves, log_ratios);
-
-          std::fill(log_gf.begin(), log_gf.end(), RealType{});
-          std::fill(log_gb.begin(), log_gb.end(), RealType{});
-          for (int iw = 0; iw < num_walkers; ++iw)
-          {
-            const auto move_slice     = moves.slice(iw);
-            const auto& proposed_grad = walker_twfs[iw].multiParticleProposalGradient();
-            for (int local_index = 0; local_index < particles_per_move; ++local_index)
-            {
-              const int flat_index = iw * particles_per_move + local_index;
-              const int iat        = move_slice.particleIndex(local_index);
-              const int group      = walker_elecs[iw].getGroupID(iat);
-              const RealType tau_over_mass =
-                  sft.qmcdrv_input.get_tau() / walker_leader.get_mass_by_group()[group];
-              ParticleSet::PosType reverse_drift;
-              if (use_drift)
-                sft.drift_modifier.getDrift(tau_over_mass, proposed_grad[iat], reverse_drift);
-              else
-                reverse_drift = ParticleSet::PosType{};
-
-              log_gf[iw] -= dot(gaussian_displacements[flat_index], gaussian_displacements[flat_index]) /
-                  (RealType{2} * tau_over_mass);
-              const ParticleSet::PosType reverse_residual = physical_displacements[flat_index] + reverse_drift;
-              log_gb[iw] -= dot(reverse_residual, reverse_residual) / (RealType{2} * tau_over_mass);
-            }
-          }
-
-          std::vector<bool> position_valid;
-          try
-          {
-            ParticleSet::mw_makeMoveSelectedParticles(walker_elecs, moves, position_valid);
-          }
-          catch (...)
-          {
-            // The wavefunction proposal exists before ParticleSet installs the
-            // trial coordinates. Unwind it if particle-side validation fails.
-            const std::vector<bool> reject_all(num_walkers, false);
-            TrialWaveFunction::mw_accept_rejectMultiParticleMove(walker_twfs, walker_elecs, moves, reject_all);
-            throw;
-          }
-          for (int iw = 0; iw < num_walkers; ++iw)
-          {
-            const auto move_slice = moves.slice(iw);
-            bool walker_valid     = true;
-            for (std::size_t local_index = 0; local_index < move_slice.size(); ++local_index)
-              walker_valid = walker_valid && position_valid[move_slice.flatOffset() + local_index];
-
-            const RealType log_acceptance =
-                RealType{2} * std::real(log_ratios[iw]) + log_gb[iw] - log_gf[iw];
-            accepted[iw] = walker_valid && std::isfinite(log_acceptance) &&
-                std::log(step_context.get_random_gen()()) < log_acceptance;
-            if (accepted[iw])
-              crowd.incAccept();
-            else
-              crowd.incReject();
-          }
-
-          TrialWaveFunction::mw_accept_rejectMultiParticleMove(walker_twfs, walker_elecs, moves, accepted);
-          ParticleSet::mw_accept_rejectMoveSelectedParticles(walker_elecs, accepted);
-        }
-      }
-    }
-    else
-    {
-      std::vector<bool> are_valid(num_walkers);
-      std::vector<TrialWaveFunction::PsiValue> ratios(num_walkers);
-      std::vector<RealType> log_gf(num_walkers);
-      std::vector<RealType> log_gb(num_walkers);
-      std::vector<RealType> prob(num_walkers);
-
-      // local list to handle accept/reject
-      std::vector<bool> isAccepted;
-      std::vector<std::reference_wrapper<TrialWaveFunction>> twf_accept_list, twf_reject_list;
-      isAccepted.reserve(num_walkers);
-
-      MCCoords<CT> drifts(num_walkers), drifts_reverse(num_walkers);
-      MCCoords<CT> walker_deltas(num_walkers * num_particles), deltas(num_walkers);
-      TWFGrads<CT> grads_now(num_walkers), grads_new(num_walkers);
-
-      for (int sub_step = 0; sub_step < sft.qmcdrv_input.get_sub_steps(); sub_step++)
-      {
-        //This generates an entire steps worth of deltas.
-        makeGaussRandomWithEngine(walker_deltas, step_context.get_random_gen());
-
-        // up and down electrons are "species" within qmpack
-        for (int ig = 0; ig < walker_leader.groups(); ++ig) //loop over species
-        {
-          TauParams<RealType, CT> taus(sft.qmcdrv_input.get_tau(), 1.0 / walker_leader.get_mass_by_group()[ig],
-                                       sft.qmcdrv_input.get_spin_mass());
-
-          twf_dispatcher.flex_prepareGroup(walker_twfs, walker_elecs, ig);
-
-          for (int iat = walker_leader.first(ig); iat < walker_leader.last(ig); ++iat)
-          {
-            //get deltas for this particle (iat) for all walkers
-            walker_deltas.getSubset(iat * num_walkers, num_walkers, deltas);
-            scaleBySqrtTau(taus, deltas);
-
-            if (use_drift)
-            {
-              twf_dispatcher.flex_evalGrad(walker_twfs, walker_elecs, iat, grads_now);
-              sft.drift_modifier.getDrifts(taus, grads_now, drifts);
-              drifts += deltas;
-            }
-            else
-              drifts = deltas;
-
-            ps_dispatcher.flex_makeMove(walker_elecs, iat, drifts, are_valid);
-
-            // This is inelegant
-            if (use_drift)
-            {
-              twf_dispatcher.flex_calcRatioGrad(walker_twfs, walker_elecs, iat, ratios, grads_new);
-
-              computeLogGreensFunction(deltas, taus, log_gf);
-
-              sft.drift_modifier.getDrifts(taus, grads_new, drifts_reverse);
-
-              drifts_reverse += drifts;
-
-              computeLogGreensFunction(drifts_reverse, taus, log_gb);
-            }
-            else
-              twf_dispatcher.flex_calcRatio(walker_twfs, walker_elecs, iat, ratios);
-
-            std::transform(ratios.begin(), ratios.end(), prob.begin(), [](auto ratio) { return std::norm(ratio); });
-
-            isAccepted.clear();
-
-            for (int i_accept = 0; i_accept < num_walkers; ++i_accept)
-              if (are_valid[i_accept] && prob[i_accept] >= std::numeric_limits<RealType>::epsilon() &&
-                  step_context.get_random_gen()() < prob[i_accept] * std::exp(log_gb[i_accept] - log_gf[i_accept]))
-              {
-                crowd.incAccept();
-                isAccepted.push_back(true);
-              }
-              else
-              {
-                crowd.incReject();
-                isAccepted.push_back(false);
-              }
-
-            twf_dispatcher.flex_accept_rejectMove(walker_twfs, walker_elecs, iat, isAccepted, true);
-
-            ps_dispatcher.flex_accept_rejectMove<CT>(walker_elecs, iat, isAccepted);
-          }
-        }
-        twf_dispatcher.flex_completeUpdates(walker_twfs);
-      }
-
-      ps_dispatcher.flex_donePbyP(walker_elecs);
-    }
-  }
-
-  {
-    ScopedTimer buffer_local_timer(timers.buffer_timer);
-    twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
-    if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_MOVES)
-      checkLogAndGL(crowd, "checkGL_after_moves", sft.serializing_crowd_walkers);
-    ps_dispatcher.flex_saveWalker(walker_elecs, walkers);
-  }
-
-  const RefVectorWithLeader<QMCHamiltonian> walker_hamiltonians(crowd.get_walker_hamiltonians()[0],
-                                                                crowd.get_walker_hamiltonians());
-  {
-    ScopedTimer hamiltonian_local_timer(timers.hamiltonian_timer);
-    ResourceCollectionTeamLock<QMCHamiltonian> hams_res_lock(crowd.getSharedResource().ham_res, walker_hamiltonians);
-    std::vector<QMCHamiltonian::FullPrecRealType> local_energies(
-        ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs));
-
-    auto resetSigNLocalEnergy = [](MCPWalker& walker, TrialWaveFunction& twf, auto& local_energy) {
-      walker.resetProperty(twf.getLogPsi(), twf.getPhase(), local_energy);
-    };
-    for (int iw = 0; iw < crowd.size(); ++iw)
-      resetSigNLocalEnergy(walkers[iw], walker_twfs[iw], local_energies[iw]);
-  }
-
-  {
-    ScopedTimer collectables_local_timer(timers.collectables_timer);
-    auto evaluateNonPhysicalHamiltonianElements = [](QMCHamiltonian& ham, TrialWaveFunction& psi, ParticleSet& pset,
-                                                     MCPWalker& walker) { ham.auxHevaluate(psi, pset, walker); };
-    for (int iw = 0; iw < crowd.size(); ++iw)
-      evaluateNonPhysicalHamiltonianElements(walker_hamiltonians[iw], walker_twfs[iw], walker_elecs[iw], walkers[iw]);
-
-    auto savePropertiesIntoWalker = [](QMCHamiltonian& ham, MCPWalker& walker) {
-      ham.saveProperty(walker.getPropertyBase());
-    };
-    for (int iw = 0; iw < crowd.size(); ++iw)
-      savePropertiesIntoWalker(walker_hamiltonians[iw], walkers[iw]);
-  }
-
-  if (accumulate_this_step)
-  {
-    ScopedTimer est_timer(timers.estimators_timer);
-    crowd.accumulate(step_context.get_random_gen());
-  }
-
-  // collect walker logs
-  crowd.collectStepWalkerLog(sft.global_step);
-
-  // TODO:
-  //  check if all moves failed
-}
-
-template void VMCBatched::advanceWalkers<CoordsType::POS>(const StateForThread& sft,
-                                                          Crowd& crowd,
-                                                          QMCDriverNew::DriverTimers& timers,
-                                                          ContextForSteps& step_context,
-                                                          bool recompute,
-                                                          bool accumulate_this_step);
-
-template void VMCBatched::advanceWalkers<CoordsType::POS_SPIN>(const StateForThread& sft,
-                                                               Crowd& crowd,
-                                                               QMCDriverNew::DriverTimers& timers,
-                                                               ContextForSteps& step_context,
-                                                               bool recompute,
-                                                               bool accumulate_this_step);
-
-/** Thread body for VMC step
- *
- */
-void VMCBatched::runVMCStep(int crowd_id,
-                            const StateForThread& sft,
-                            DriverTimers& timers,
-                            UPtrVector<ContextForSteps>& context_for_steps,
-                            UPtrVector<Crowd>& crowds)
-{
-  Crowd& crowd = *(crowds[crowd_id]);
-  crowd.setRNGForHamiltonian(context_for_steps[crowd_id]->get_random_gen());
-  const IndexType step = sft.step;
-  // Are we entering the the last step of a block to recompute at?
-  const bool recompute_this_step = (sft.is_recomputing_block && (step + 1) == sft.steps_per_block);
-  // For VMC we don't call this method for warmup steps.
-  const bool accumulate_this_step = (step % sft.qmcdrv_input.get_estimator_measurement_period() == 0);
-  const bool spin_move            = sft.population.get_golden_electrons().isSpinor();
-  if (spin_move)
-    advanceWalkers<CoordsType::POS_SPIN>(sft, crowd, timers, *context_for_steps[crowd_id], recompute_this_step,
-                                         accumulate_this_step);
-  else
-    advanceWalkers<CoordsType::POS>(sft, crowd, timers, *context_for_steps[crowd_id], recompute_this_step,
-                                    accumulate_this_step);
-}
 
 void VMCBatched::process(xmlNodePtr node)
 {
@@ -417,25 +56,8 @@ void VMCBatched::process(xmlNodePtr node)
 
   try
   {
-    if (vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP)
-    {
-      const ParticleSet& electrons = population_.get_golden_electrons();
-      const TrialWaveFunction& wavefunction = population_.get_golden_twf();
-      if (serializing_crowd_walkers_)
-        throw UniformCommunicateError(
-            "Collective VMC electron moves require multi-walker crowd execution.");
-      if (electrons.isSpinor())
-        throw UniformCommunicateError(
-            "Collective VMC electron moves do not yet support spin coordinates.");
-      if (!wavefunction.supportsMultiParticleMoves())
-        throw UniformCommunicateError(
-            "Every wavefunction component must support collective electron moves.");
-      if (vmcdriver_input_.get_move_kind() == VMCDriverInput::MoveKind::N_ELECTRON &&
-          vmcdriver_input_.get_electrons_per_move() >= electrons.getTotalNum())
-        throw UniformCommunicateError(
-            "n_electron VMC moves require electrons_per_move to be smaller than the electron count; "
-            "use move=\"alle\" for a full-system proposal.");
-    }
+    VMCBatchedSampling::validateMoveConfiguration(vmcdriver_input_, population_.get_golden_electrons(),
+                                                  population_.get_golden_twf(), serializing_crowd_walkers_);
 
     QMCDriverNew::AdjustedWalkerCounts awc =
         adjustGlobalWalkerCount(*myComm, walker_configs_ref_.getActiveWalkers(), qmcdriver_input_.get_total_walkers(),
@@ -493,6 +115,12 @@ void VMCBatched::run()
 
   StateForThread vmc_state(qmcdriver_input_, vmcdriver_input_, *drift_modifier_, population_, steps_per_block_,
                            serializing_crowd_walkers_);
+  VMCBatchedSampling::Timers sampling_timers{
+      timers_.resource_timer,     timers_.movepbyp_timer,    timers_.buffer_timer,
+      timers_.hamiltonian_timer,  timers_.collectables_timer, timers_.estimators_timer,
+      [this](Crowd& crowd, std::string_view location) {
+        checkLogAndGL(crowd, location, serializing_crowd_walkers_);
+      }};
 
   LoopTimer<> vmc_loop;
   RunTimeControl<> runtimeControl(run_time_manager, project_data_.getMaxCPUSeconds(), project_data_.getTitle(),
@@ -515,24 +143,10 @@ void VMCBatched::run()
   {
     // Run warm-up steps
     Timer warmup_timer;
-    auto runWarmupStep = [](int crowd_id, StateForThread& sft, DriverTimers& timers,
-                            UPtrVector<ContextForSteps>& context_for_steps, UPtrVector<Crowd>& crowds) {
-      Crowd& crowd                    = *(crowds[crowd_id]);
-      const bool recompute            = false;
-      const bool accumulate_this_step = false;
-      const bool spin_move            = sft.population.get_golden_electrons().isSpinor();
-      if (spin_move)
-        advanceWalkers<CoordsType::POS_SPIN>(sft, crowd, timers, *context_for_steps[crowd_id], recompute,
-                                             accumulate_this_step);
-      else
-        advanceWalkers<CoordsType::POS>(sft, crowd, timers, *context_for_steps[crowd_id], recompute,
-                                        accumulate_this_step);
-    };
-
     for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
     {
       ScopedTimer local_timer(timers_.run_steps_timer);
-      crowd_task(crowds_.size(), runWarmupStep, vmc_state, timers_, step_contexts_, crowds_);
+      crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, vmc_state, sampling_timers, rngs_, crowds_);
     }
 
     print_mem("VMCBatched after Warmup", app_log());
@@ -566,7 +180,7 @@ void VMCBatched::run()
         ScopedTimer local_timer(timers_.run_steps_timer);
         vmc_state.step        = step;
         vmc_state.global_step = global_step;
-        crowd_task(crowds_.size(), runVMCStep, vmc_state, timers_, step_contexts_, crowds_);
+        crowd_task(crowds_.size(), VMCBatchedSampling::runVMCStep, vmc_state, sampling_timers, rngs_, crowds_);
 
         if (collect_samples_)
         {

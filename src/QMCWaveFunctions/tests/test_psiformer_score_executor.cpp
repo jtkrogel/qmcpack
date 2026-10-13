@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <new>
 #include <numeric>
@@ -433,6 +434,155 @@ TEST_CASE("PsiFormer orbital MSE uses the direct tape and spin-sector normalizat
   CHECK(executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size()})
             .parameter_gradient[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] == 0.0);
   CHECK_THROWS_AS(executor.evaluateOrbitalMSE(*workspace, {target.data(), target.size() - 1}),
+                  std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer independent channel amplitudes and weighted score share one reverse",
+          "[wavefunction][psiformer][score][overlap]")
+{
+  GeneratedFiles files = generateFiles("unequal");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const qmcplusplus::psiformer::ModelShape shape{
+      model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+      model.dim, model.heads, model.blocks};
+  const auto plan =
+      qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
+  pf::DirectScoreExecutor executor(model, plan);
+  auto workspace = executor.makeWorkspace();
+  const pf::Tensor electrons = model.cfg.configuration(0);
+  workspace->setPositions(
+      pf::GeometryPositionView::interleaved(electrons.x.data(), model.ne));
+
+  std::vector<double> phases(model.ndet);
+  std::vector<double> log_abs(model.ndet);
+  const pf::DirectChannelAmplitudeResult amplitudes =
+      executor.evaluateChannelAmplitudes(*workspace, phases.data(), log_abs.data(),
+                                         phases.size());
+  REQUIRE(amplitudes.channel_count == model.ndet);
+  CHECK(amplitudes.phases == phases.data());
+  CHECK(amplitudes.log_abs == log_abs.data());
+  CHECK(amplitudes.parameter_version == model.p.version());
+  for (std::size_t channel = 0; channel < model.ndet; ++channel)
+  {
+    CHECK((phases[channel] == -1.0 || phases[channel] == 1.0));
+    CHECK(std::isfinite(log_abs[channel]));
+  }
+
+  // The analytic cusp is a common multiplicative factor of every determinant
+  // channel, so changing one cusp parameter must shift every channel log equally.
+  using qmcplusplus::psiformer::ParameterRole;
+  const std::vector<double> baseline_log_abs = log_abs;
+  const std::size_t anti_cusp =
+      plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin;
+  const double original_anti_cusp = model.p.flat_values()[anti_cusp];
+  model.p.set_flat_value(anti_cusp, original_anti_cusp + 1.0e-5);
+  executor.evaluateChannelAmplitudes(*workspace, phases.data(), log_abs.data(),
+                                     phases.size());
+  const double common_cusp_shift = log_abs[0] - baseline_log_abs[0];
+  for (std::size_t channel = 1; channel < model.ndet; ++channel)
+    checkClose(log_abs[channel] - baseline_log_abs[channel], common_cusp_shift,
+               2.0e-10, 2.0e-12);
+  model.p.set_flat_value(anti_cusp, original_anti_cusp);
+
+  std::vector<double> weights(model.ndet, 0.0);
+  weights[0] = 0.7;
+  weights[1] = -0.2;
+  weights[2] = 0.4;
+  const pf::DirectWeightedChannelScoreResult weighted =
+      executor.evaluateWeightedChannelScore(*workspace, weights.data(), weights.size());
+  REQUIRE(weighted.parameter_score.size == model.p.size());
+  CHECK(weighted.parameter_version == model.p.version());
+
+  const std::array<std::size_t, 7> checked_parameters{
+      plan.parameter(ParameterRole::CUSP_SAME_ALPHA).begin,
+      plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin,
+      plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).begin,
+      plan.parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, 0).begin,
+      plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT).begin,
+      plan.parameter(ParameterRole::ENVELOPE_PI_DOWN).begin,
+      plan.parameter(ParameterRole::ENVELOPE_ZETA_UP).begin};
+  std::array<double, checked_parameters.size()> analytic{};
+  for (std::size_t selected = 0; selected < checked_parameters.size(); ++selected)
+    analytic[selected] = weighted.parameter_score[checked_parameters[selected]];
+
+  auto weightedLogAmplitude = [&]() {
+    executor.evaluateChannelAmplitudes(*workspace, phases.data(), log_abs.data(),
+                                       phases.size());
+    double value = 0.0;
+    for (std::size_t channel = 0; channel < model.ndet; ++channel)
+      value += weights[channel] * log_abs[channel];
+    return value;
+  };
+
+  const double epsilon = 2.0e-6;
+  for (std::size_t selected = 0; selected < checked_parameters.size(); ++selected)
+  {
+    const std::size_t parameter = checked_parameters[selected];
+    const double original = model.p.flat_values()[parameter];
+    model.p.set_flat_value(parameter, original + epsilon);
+    const double plus = weightedLogAmplitude();
+    model.p.set_flat_value(parameter, original - epsilon);
+    const double minus = weightedLogAmplitude();
+    model.p.set_flat_value(parameter, original);
+    CHECK(analytic[selected] == Catch::Approx((plus - minus) / (2.0 * epsilon))
+                                    .epsilon(5.0e-5).margin(5.0e-7));
+  }
+
+  // Independent channel seeds must add linearly even though their feature trunk and
+  // cusp parameters are shared.  Check representative parameters across all roles.
+  std::vector<double> first_weight(model.ndet, 0.0);
+  std::vector<double> second_weight(model.ndet, 0.0);
+  first_weight[0]  = weights[0];
+  second_weight[1] = weights[1];
+  std::array<double, checked_parameters.size()> first_score{};
+  std::array<double, checked_parameters.size()> second_score{};
+  const auto first = executor.evaluateWeightedChannelScore(
+      *workspace, first_weight.data(), first_weight.size());
+  for (std::size_t selected = 0; selected < checked_parameters.size(); ++selected)
+    first_score[selected] = first.parameter_score[checked_parameters[selected]];
+  const auto second = executor.evaluateWeightedChannelScore(
+      *workspace, second_weight.data(), second_weight.size());
+  for (std::size_t selected = 0; selected < checked_parameters.size(); ++selected)
+    second_score[selected] = second.parameter_score[checked_parameters[selected]];
+
+  std::vector<double> first_two_weight(model.ndet, 0.0);
+  first_two_weight[0] = weights[0];
+  first_two_weight[1] = weights[1];
+  const auto first_two = executor.evaluateWeightedChannelScore(
+      *workspace, first_two_weight.data(), first_two_weight.size());
+  for (std::size_t selected = 0; selected < checked_parameters.size(); ++selected)
+    checkClose(first_two.parameter_score[checked_parameters[selected]],
+               first_score[selected] + second_score[selected], 2.0e-10, 2.0e-10);
+
+  // The channel-amplitude and weighted reverse routes must keep every warmed buffer
+  // stable and allocate no storage internally.
+  const std::size_t fingerprint = workspace->storageFingerprint();
+  const double* score_address = workspace->scoreData();
+  volatile double allocation_sink = first_two.parameter_score[checked_parameters[0]];
+  allocation_count.store(0, std::memory_order_relaxed);
+  count_allocations.store(true, std::memory_order_relaxed);
+  for (int repetition = 0; repetition < 3; ++repetition)
+  {
+    allocation_sink += executor.evaluateChannelAmplitudes(
+        *workspace, phases.data(), log_abs.data(), phases.size()).log_abs[0];
+    allocation_sink += executor.evaluateWeightedChannelScore(
+        *workspace, weights.data(), weights.size()).parameter_score[checked_parameters[1]];
+  }
+  count_allocations.store(false, std::memory_order_relaxed);
+  CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
+  CHECK(workspace->storageFingerprint() == fingerprint);
+  CHECK(workspace->scoreData() == score_address);
+  CHECK(std::isfinite(allocation_sink));
+
+  CHECK_THROWS_AS(executor.evaluateChannelAmplitudes(
+                      *workspace, phases.data(), log_abs.data(), phases.size() - 1),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(executor.evaluateWeightedChannelScore(
+                      *workspace, weights.data(), weights.size() - 1),
+                  std::invalid_argument);
+  weights[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(executor.evaluateWeightedChannelScore(
+                      *workspace, weights.data(), weights.size()),
                   std::invalid_argument);
 }
 

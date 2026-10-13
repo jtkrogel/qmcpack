@@ -17,6 +17,7 @@
 #include "QMCDrivers/WFTrain/HostStagedAcceleratorReduction.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include <algorithm>
@@ -870,6 +871,110 @@ TEST_CASE("Distributed streaming SR matches one global centered dense population
   CHECK_THROWS(covariance.apply(direction_view, {result.data(), result.size()}));
   fail_vjp = false;
   CHECK_NOTHROW(covariance.apply(direction_view, {result.data(), result.size()}));
+}
+
+TEST_CASE("Distributed minSR handles uneven and zero-sample ranks",
+          "[drivers][training][minsr][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const StructuredParameterSchema schema = makeSRSchema();
+  constexpr std::size_t version = 7;
+  const std::size_t local_count =
+      localSampleCount(communicator.rank(), communicator.size());
+  bool fail_jvp = false;
+  bool fail_vjp = false;
+  DistributedSRStreamingOperator stream(schema, version, communicator.rank(),
+                                         local_count, &fail_jvp, &fail_vjp);
+  std::vector<DerivativeReal> weights(local_count);
+  std::vector<DerivativeValue> energies(local_count);
+  for (std::size_t sample = 0; sample < local_count; ++sample)
+  {
+    const double identity = static_cast<double>(10 * communicator.rank() + sample + 1);
+    weights[sample] = 1.0 + 0.25 * sample;
+    energies[sample] = {-1.0 + 0.05 * identity, 0.0};
+  }
+  const ScoreCovarianceBatch batch{
+      &stream, {weights.data(), weights.size()},
+      {energies.data(), energies.size()}};
+  const DerivativeArrayView<const ScoreCovarianceBatch> local_batches =
+      local_count == 0
+      ? DerivativeArrayView<const ScoreCovarianceBatch>{}
+      : DerivativeArrayView<const ScoreCovarianceBatch>{&batch, 1};
+  ScoreCovarianceFactor factor(
+      schema, version, local_batches, ScoreSampleDomain::REAL,
+      DistributedParameterReduction(communicator, {1}));
+
+  DerivativeReal global_weight = 0.0;
+  DerivativeReal global_energy_sum = 0.0;
+  for (int rank = 0; rank < communicator.size(); ++rank)
+    for (std::size_t sample = 0; sample < localSampleCount(rank, communicator.size()); ++sample)
+    {
+      const double identity = static_cast<double>(10 * rank + sample + 1);
+      const double weight = 1.0 + 0.25 * sample;
+      global_weight += weight;
+      global_energy_sum += weight * (-1.0 + 0.05 * identity);
+    }
+  const double mean_energy = global_energy_sum / global_weight;
+
+  std::array<double, 4> covariance{};
+  std::array<double, 2> gradient{};
+  std::array<double, 2> mean_score{};
+  for (int rank = 0; rank < communicator.size(); ++rank)
+    for (std::size_t sample = 0; sample < localSampleCount(rank, communicator.size()); ++sample)
+    {
+      const double identity = static_cast<double>(10 * rank + sample + 1);
+      const double weight = 1.0 + 0.25 * sample;
+      mean_score[0] += weight * identity / global_weight;
+      mean_score[1] += weight * (1.0 - 0.1 * identity) / global_weight;
+    }
+  for (int rank = 0; rank < communicator.size(); ++rank)
+    for (std::size_t sample = 0; sample < localSampleCount(rank, communicator.size()); ++sample)
+    {
+      const double identity = static_cast<double>(10 * rank + sample + 1);
+      const double weight = 1.0 + 0.25 * sample;
+      const double q = weight / global_weight;
+      const std::array<double, 2> centered{
+          identity - mean_score[0], 1.0 - 0.1 * identity - mean_score[1]};
+      const double energy = -1.0 + 0.05 * identity;
+      for (std::size_t row = 0; row < 2; ++row)
+      {
+        gradient[row] += 2.0 * q * centered[row] * (energy - mean_energy);
+        for (std::size_t column = 0; column < 2; ++column)
+          covariance[2 * row + column] += q * centered[row] * centered[column];
+      }
+    }
+
+  const std::vector<DerivativeReal> streamed_gradient = factor.scoreCovarianceGradient();
+  CHECK(streamed_gradient[0] == Catch::Approx(gradient[0]).epsilon(1.0e-11).margin(1.0e-11));
+  CHECK(streamed_gradient[1] == Catch::Approx(gradient[1]).epsilon(1.0e-11).margin(1.0e-11));
+  const double damping = 0.2;
+  const double a00 = covariance[0] + damping;
+  const double a01 = covariance[1];
+  const double a10 = covariance[2];
+  const double a11 = covariance[3] + damping;
+  const double determinant = a00 * a11 - a01 * a10;
+  const std::array<double, 2> expected{
+      (a11 * gradient[0] - a01 * gradient[1]) / determinant,
+      (-a10 * gradient[0] + a00 * gradient[1]) / determinant};
+
+  MinimumStepSampleOperator sample_operator(factor, damping, 1.0);
+  KrylovSolverControl control;
+  control.relative_tolerance = 1.0e-11;
+  control.maximum_iterations = 30;
+  control.maximum_operator_applications = 31;
+  const auto solve = solveDistributedSamplePCG(
+      sample_operator, factor.residual(), control);
+  REQUIRE(solve.converged);
+  std::array<DerivativeValue, 2> direction{};
+  factor.applyAdjoint({solve.solution.data(), solve.solution.size()},
+                      {direction.data(), direction.size()});
+  CHECK(direction[0].real() == Catch::Approx(expected[0]).epsilon(1.0e-9).margin(1.0e-10));
+  CHECK(direction[1].real() == Catch::Approx(expected[1]).epsilon(1.0e-9).margin(1.0e-10));
+  CHECK(factor.localSampleVectorSize() == local_count);
+  std::size_t expected_global_count = 0;
+  for (int rank = 0; rank < communicator.size(); ++rank)
+    expected_global_count += localSampleCount(rank, communicator.size());
+  CHECK(factor.globalSampleVectorSize() == expected_global_count);
 }
 
 TEST_CASE("Distributed matrix-free vector failures precede data collectives",

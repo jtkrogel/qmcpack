@@ -17,6 +17,7 @@
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
 #include "psiformer_test_utils.h"
 
@@ -673,6 +674,72 @@ TEST_CASE("Wavefunction components reject unsupported streaming derivative facto
   CHECK(requirements.requires(BatchExecutionMode::STREAMING_DERIVATIVE));
   CHECK(static_cast<std::uint32_t>(BatchExecutionMode::STREAMING_DERIVATIVE) ==
         (1U << 14));
+}
+
+TEST_CASE("TrialWaveFunction constructs a provider-selected streaming owner",
+          "[wavefunction][psiformer][training][streaming][aggregate]")
+{
+  using namespace testing::psiformer;
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons0 = makeElectrons(simulation_cell);
+  ParticleSet electrons1 = makeElectrons(simulation_cell);
+  electrons1.R[1] += ParticleSet::PosType{-0.012, 0.008, 0.004};
+  electrons1.update();
+
+  RuntimeOptions runtime_options;
+  TrialWaveFunction wavefunction0(runtime_options, "aggregate_stream0");
+  wavefunction0.addComponent(std::make_unique<PsiFormerWF>(
+      "pf_aggregate_stream", files.parameters.string(),
+      files.configuration.string()));
+  std::unique_ptr<TrialWaveFunction> wavefunction1 =
+      wavefunction0.makeClone(electrons1);
+
+  wavefunction0.evaluateLog(electrons0);
+  wavefunction1->evaluateLog(electrons1);
+
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(wavefunction0);
+  wavefunctions.push_back(wavefunction0);
+  wavefunctions.push_back(*wavefunction1);
+  RefVectorWithLeader<ParticleSet> particles(electrons0);
+  particles.push_back(electrons0);
+  particles.push_back(electrons1);
+
+  auto provider = wavefunction0.extractStructuredParameterProviders();
+  REQUIRE(provider.size() == 1);
+  const std::string provider_id =
+      provider.front().get().parameterSchema().providerId();
+
+  std::unique_ptr<StreamingDerivativeOperator> selected =
+      TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+          wavefunctions, particles, provider_id, 9, 23, 113);
+  CHECK(selected->parameterSchema().providerId() == provider_id);
+  CHECK(selected->batchOrdinal() == 9);
+  CHECK(selected->sampleOffset() == 23);
+  CHECK(selected->sampleCount() == 2);
+
+  std::unique_ptr<StreamingDerivativeOperator> sole =
+      TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+          wavefunctions, particles, {}, 10, 25, 113);
+  CHECK(sole->parameterSchema().providerId() == provider_id);
+
+  // A rank with no local walkers still constructs the same schema/version owner
+  // and can follow the distributed collective schedule with an empty contribution.
+  RefVectorWithLeader<TrialWaveFunction> empty_wavefunctions(wavefunction0);
+  RefVectorWithLeader<ParticleSet> empty_particles(electrons0);
+  std::unique_ptr<StreamingDerivativeOperator> empty =
+      TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+          empty_wavefunctions, empty_particles, provider_id, 11, 27, 113);
+  CHECK(empty->sampleCount() == 0);
+  CHECK(empty->parameterSchema().providerId() == provider_id);
+
+  CHECK_THROWS(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+      wavefunctions, particles, "missing_provider", 9, 23, 113));
+
+  RefVectorWithLeader<ParticleSet> one_particle(electrons0);
+  one_particle.push_back(electrons0);
+  CHECK_THROWS(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+      wavefunctions, one_particle, provider_id, 9, 23, 113));
 }
 
 TEST_CASE("PsiFormer contracts live ordinary-locality ECP tiles without dense staging",

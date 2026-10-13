@@ -36,6 +36,8 @@
 #include "QMCDrivers/RMC/RMCFactory.h"
 #include "VMC/VMCDriverInput.h"
 #include "VMC/VMCBatched.h"
+#include "WFTrain/WFTrainBatched.h"
+#include "WFTrain/WFTrainDriverInput.h"
 #include "DMC/DMCDriverInput.h"
 #include "DMC/DMCBatched.h"
 #include "QMCDrivers/WFOpt/QMCFixedSampleLinearOptimize.h"
@@ -70,8 +72,8 @@ QMCDriverFactory::DriverAssemblyState QMCDriverFactory::readSection(xmlNodePtr c
   std::string append_tag("no");
   std::string profiling_tag("no");
   OhmmsAttributeSet aAttrib;
-  aAttrib.add(qmc_mode, "method",
-              {"", "vmc", "vmc_batch", "dmc", "dmc_batch", "csvmc", "rmc", "linear", "linear_batch", "wftest"});
+  aAttrib.add(qmc_mode, "method", {"", "vmc", "vmc_batch", "dmc", "dmc_batch", "csvmc", "rmc", "linear",
+                                    "linear_batch", "wf_train", "wftest"});
   aAttrib.add(update_mode, "move");
   aAttrib.add(append_tag, "append");
   aAttrib.add(profiling_tag, "profiling");
@@ -95,18 +97,23 @@ QMCDriverFactory::DriverAssemblyState QMCDriverFactory::readSection(xmlNodePtr c
   switch (project_data_.getDriverVersion())
   {
   case DV::BATCH:
-    if (qmc_mode.find("vmc") < nchars) // order matters here
+    if (qmc_mode == "wf_train")
+      das.new_run_type = QMCRunType::WF_TRAIN_BATCH;
+    else if (qmc_mode.find("vmc") < nchars) // order matters here
       das.new_run_type = QMCRunType::VMC_BATCH;
     else if (qmc_mode.find("dmc") < nchars) // order matters here
       das.new_run_type = QMCRunType::DMC_BATCH;
     else if (qmc_mode.find("linear") < nchars)
       das.new_run_type = QMCRunType::LINEAR_OPTIMIZE_BATCH;
     else
-      throw UniformCommunicateError("QMC mode unknown. Valid modes for batched drivers are : vmc, dmc, linear.");
+      throw UniformCommunicateError(
+          "QMC mode unknown. Valid modes for batched drivers are : vmc, dmc, linear, wf_train.");
     break;
   // Begin to separate driver version = batch input reading from the legacy input parsing
   case DV::LEGACY:
-    if (qmc_mode.find("linear_batch") < nchars) // order matters here
+    if (qmc_mode == "wf_train")
+      das.new_run_type = QMCRunType::WF_TRAIN_BATCH;
+    else if (qmc_mode.find("linear_batch") < nchars) // order matters here
       das.new_run_type = QMCRunType::LINEAR_OPTIMIZE_BATCH;
     else if (qmc_mode.find("linear") < nchars)
       das.new_run_type = QMCRunType::LINEAR_OPTIMIZE;
@@ -240,6 +247,37 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
                                        MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
                                        RandomNumberControl::getChildrenRefs(), qmc_system.getSampleStack(), comm);
 
+      new_driver->setUpdateMode(is_pbyp_move);
+    }
+    else if (das.new_run_type == QMCRunType::WF_TRAIN_BATCH)
+    {
+      app_summary() << "\n========================================"
+                       "\n  Reading wavefunction-training XML input section"
+                       "\n========================================"
+                    << std::endl;
+
+      QMCDriverInput qmcdriver_input;
+      VMCDriverInput vmcdriver_input;
+      WFTrainDriverInput training_input;
+      try
+      {
+        qmcdriver_input.readXML(cur);
+        vmcdriver_input.readXML(cur);
+        training_input.readXML(cur);
+      }
+      catch (const std::exception& error)
+      {
+        throw UniformCommunicateError(error.what());
+      }
+
+      const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
+      UPtr<EstimatorManagerNew> estimator_manager =
+          makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input());
+      new_driver = std::make_unique<WFTrainBatched>(
+          project_data_, std::move(qmcdriver_input), std::move(estimator_manager), std::move(vmcdriver_input),
+          std::move(training_input), qmc_system,
+          MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
+          RandomNumberControl::getChildrenRefs(), comm);
       new_driver->setUpdateMode(is_pbyp_move);
     }
     else if (das.new_run_type == QMCRunType::DMC)

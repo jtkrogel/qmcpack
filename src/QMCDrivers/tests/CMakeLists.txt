@@ -79,6 +79,7 @@ set(DRIVER_TEST_SRC
     test_QMCDriverInput.cpp
     test_QMCDriverNew.cpp
     test_VMCDriverInput.cpp
+    test_WFTrainDriverInput.cpp
     test_VMCBatched.cpp
     test_DMCBatched.cpp
     test_L2Diffusion.cpp
@@ -101,6 +102,7 @@ list(APPEND DRIVER_TEST_SRC test_LegacyWaveFunctionAdapter.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeOperator.cpp)
 list(APPEND DRIVER_TEST_SRC test_KrylovSolver.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeStochasticReconfiguration.cpp)
+list(APPEND DRIVER_TEST_SRC test_MinimumStepStochasticReconfiguration.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeLinearMethod.cpp)
 list(APPEND DRIVER_TEST_SRC test_KFACPreconditioner.cpp)
 add_executable(${UTEST_EXE} ${DRIVER_TEST_SRC})

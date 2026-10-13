@@ -15,6 +15,7 @@
 
 #include "QMCDrivers/QMCDriverNew.h"
 #include "QMCDrivers/VMC/VMCDriverInput.h"
+#include "QMCDrivers/VMC/VMCBatchedSampling.h"
 #include "QMCDrivers/MCPopulation.h"
 #include "QMCDrivers/GreenFunctionModifiers/DriftModifierBase.h"
 
@@ -37,39 +38,7 @@ public:
   using PosType           = QMCTraits::PosType;
   using ParticlePositions = PtclOnLatticeTraits::ParticlePos;
 
-  /** To avoid 10's of arguments to runVMCStep
-   *
-   *  There should be a division between const input to runVMCStep
-   *  And step to step state
-   */
-  struct StateForThread
-  {
-    const QMCDriverInput& qmcdrv_input;
-    const VMCDriverInput& vmcdrv_input;
-    const DriftModifierBase& drift_modifier;
-    const MCPopulation& population;
-    IndexType recalculate_properties_period;
-    const size_t steps_per_block;
-    IndexType step            = -1;
-    IndexType global_step     = -1;
-    bool is_recomputing_block = false;
-    /// if true, calculating walker one-by-one within a crowd
-    const bool serializing_crowd_walkers;
-
-    StateForThread(const QMCDriverInput& qmci,
-                   const VMCDriverInput& vmci,
-                   DriftModifierBase& drift_mod,
-                   MCPopulation& pop,
-                   const size_t steps_per_block,
-                   const bool serializing_crowd_walkers)
-        : qmcdrv_input(qmci),
-          vmcdrv_input(vmci),
-          drift_modifier(drift_mod),
-          population(pop),
-          steps_per_block(steps_per_block),
-          serializing_crowd_walkers(serializing_crowd_walkers)
-    {}
-  };
+  using StateForThread = VMCBatchedSampling::State;
 
 public:
   /// Constructor.
@@ -117,27 +86,6 @@ private:
   SampleStack& samples_;
   /// Sample collection flag
   bool collect_samples_;
-
-  /** Refactor of VMCUpdatePbyP in crowd context
-   *
-   *  MCWalkerConfiguration layer removed.
-   *  Obfuscation of state changes via buffer and MCWalkerconfiguration require this be tested well
-   */
-  template<CoordsType CT>
-  static void advanceWalkers(const StateForThread& sft,
-                             Crowd& crowd,
-                             DriverTimers& timers,
-                             ContextForSteps& move_context,
-                             bool recompute,
-                             bool accumulate_this_step);
-
-  // This is the task body executed at crowd scope
-  // it does not have access to object member variables by design
-  static void runVMCStep(int crowd_id,
-                         const StateForThread& sft,
-                         DriverTimers& timers,
-                         UPtrVector<ContextForSteps>& context_for_steps,
-                         UPtrVector<Crowd>& crowds);
 
   // create Rngs and StepContests
   void createStepContexts(int num_crowds);
