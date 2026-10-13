@@ -10,6 +10,7 @@
 
 #include "OhmmsData/Libxml2Doc.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
+#include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 
 #include <limits>
 #include <string>
@@ -169,6 +170,66 @@ TEST_CASE("WFTrainDriverInput accepts typed matrix-free optimizer controls",
   }
 }
 
+TEST_CASE("WFTrainDriverInput maps strict PII and MinPII controls",
+          "[drivers][wf_train][pii]")
+{
+  SECTION("explicit-shift PII")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"pii\" learning_rate=\"0.4\" "
+        "pii_shift_mode=\"explicit\" pii_explicit_tau=\"-1.25\" damping=\"0.02\" "
+        "damping_multiplier=\"3\" maximum_damping_retries=\"4\" maximum_update_norm=\"2\" "
+        "objective_tolerance=\"3e-10\" gmres_restart_length=\"17\" "
+        "krylov_relative_tolerance=\"2e-7\" krylov_absolute_tolerance=\"4e-12\" "
+        "krylov_maximum_iterations=\"31\" krylov_maximum_operator_applications=\"37\" "
+        "krylov_maximum_seconds=\"5\" krylov_stagnation_window=\"6\" "
+        "krylov_minimum_relative_improvement=\"8e-5\" krylov_curvature_tolerance=\"9e-13\" "
+        "krylov_imaginary_tolerance=\"16\"/></qmc>");
+    CHECK(input.getOptimizer() ==
+          WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION);
+    CHECK(input.getPIIShiftMode() == WFTrainDriverInput::PIIShiftMode::EXPLICIT);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "pii");
+    CHECK(wftrain::optimizerRequiresRealParameters(input.getOptimizer()));
+
+    const auto control = wftrain::makePIIUpdateControl(input);
+    CHECK(control.learning_rate == 0.4);
+    CHECK(control.shift_mode == wftrain::PIIShiftMode::EXPLICIT);
+    CHECK(control.explicit_shift == -1.25);
+    CHECK(control.energy_undershoot == 0.1);
+    CHECK(control.damping == 0.02);
+    CHECK(control.damping_multiplier == 3.0);
+    CHECK(control.maximum_damping_retries == 4);
+    CHECK(control.maximum_update_norm == 2.0);
+    CHECK(control.objective_tolerance == 3.0e-10);
+    CHECK(control.gmres.restart_length == 17);
+    CHECK(control.gmres.krylov.relative_tolerance == 2.0e-7);
+    CHECK(control.gmres.krylov.absolute_tolerance == 4.0e-12);
+    CHECK(control.gmres.krylov.maximum_iterations == 31);
+    CHECK(control.gmres.krylov.maximum_operator_applications == 37);
+    CHECK(control.gmres.krylov.maximum_seconds == 5.0);
+    CHECK(control.gmres.krylov.stagnation_window == 6);
+    CHECK(control.gmres.krylov.minimum_relative_improvement == 8.0e-5);
+    CHECK(control.gmres.krylov.curvature_tolerance == 9.0e-13);
+    CHECK(control.gmres.krylov.imaginary_tolerance == 16.0);
+  }
+
+  SECTION("mean-energy-shift MinPII defaults")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"minpii\" "
+        "pii_energy_undershoot=\"0.35\"/></qmc>");
+    CHECK(input.getOptimizer() ==
+          WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "minpii");
+    const auto control = wftrain::makePIIUpdateControl(input);
+    CHECK(control.learning_rate == 1.0);
+    CHECK(control.shift_mode == wftrain::PIIShiftMode::MEAN_ENERGY_MINUS_UNDERSHOOT);
+    CHECK(control.energy_undershoot == 0.35);
+    CHECK(control.maximum_damping_retries == 2);
+    CHECK(control.gmres.restart_length == 20);
+  }
+}
+
 TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers][wf_train]")
 {
   WFTrainDriverInput input;
@@ -222,6 +283,18 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
   rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_maximum_seconds=\"inf\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training maximum_retained_bytes=\"-1\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training provider=\"\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_shift_mode=\"fixed\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_shift_mode=\"explicit\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_explicit_tau=\"-1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_shift_mode=\"explicit\" "
+          "pii_explicit_tau=\"-1\" pii_energy_undershoot=\"0.1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" damping=\"0\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" maximum_damping_attempts=\"2\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" maximum_damping_retries=\"65\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" gmres_restart_length=\"0\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"minpii\" center_shift=\"1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"minpii\" adam_beta1=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" maximum_damping_retries=\"2\"/></qmc>");
 }
 
 } // namespace qmcplusplus

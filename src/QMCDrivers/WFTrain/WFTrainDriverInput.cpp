@@ -27,7 +27,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 36> allowed_attributes{
+constexpr std::array<std::string_view, 41> allowed_attributes{
     "objective", "optimizer", "parameter_chunk_size", "learning_rate", "adam_beta1",
     "adam_beta2", "epsilon", "damping", "damping_multiplier", "minimum_retry_damping",
     "maximum_damping_attempts", "maximum_update_norm", "maximum_metric_norm", "center_shift",
@@ -37,7 +37,9 @@ constexpr std::array<std::string_view, 36> allowed_attributes{
     "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
     "maximum_retained_bytes", "checkpoint_path", "restart_path", "provider",
     "teacher", "overlap_target", "overlap_weighting", "target_provenance",
-    "minimum_fidelity", "minimum_effective_samples"};
+    "minimum_fidelity", "minimum_effective_samples", "pii_shift_mode",
+    "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
+    "gmres_restart_length"};
 
 /** Return an XML attribute value without changing its spelling or whitespace. */
 std::string readAttribute(xmlNodePtr node, const char* name)
@@ -200,6 +202,11 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   maximum_metric_norm_              = 0.0;
   center_shift_                     = 1.0;
   objective_tolerance_              = 1.0e-9;
+  pii_shift_mode_                   = PIIShiftMode::MEAN_ENERGY_MINUS_UNDERSHOOT;
+  pii_explicit_tau_                 = 0.0;
+  pii_energy_undershoot_            = 0.1;
+  maximum_damping_retries_          = 2;
+  gmres_restart_length_             = 20;
   spring_history_decay_             = 0.99;
   spring_maximum_update_norm_squared_ = 0.0;
   krylov_relative_tolerance_         = 1.0e-8;
@@ -244,10 +251,18 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       optimizer_ = Optimizer::MINIMUM_STEP_SR;
     else if (optimizer == "spring")
       optimizer_ = Optimizer::SPRING;
+    else if (optimizer == "pii")
+      optimizer_ = Optimizer::PROJECTED_INVERSE_ITERATION;
+    else if (optimizer == "minpii")
+      optimizer_ = Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION;
     else
       throw UniformCommunicateError("WFTrainDriverInput: unsupported optimizer=\"" + optimizer +
-                                    "\"; supported optimizers are adam, sr, minsr, and spring");
+                                    "\"; supported optimizers are adam, sr, minsr, spring, pii, and minpii");
   }
+  const bool pii_optimizer = optimizer_ == Optimizer::PROJECTED_INVERSE_ITERATION ||
+      optimizer_ == Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION;
+  if (pii_optimizer && seen_attributes.find("learning_rate") == seen_attributes.end())
+    learning_rate_ = 1.0;
   if (seen_attributes.find("parameter_chunk_size") != seen_attributes.end())
     parameter_chunk_size_ = parsePositiveSize(readAttribute(training_node, "parameter_chunk_size"),
                                               "parameter_chunk_size");
@@ -296,6 +311,34 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (seen_attributes.find("objective_tolerance") != seen_attributes.end())
     objective_tolerance_ = parseNonnegativeReal(readAttribute(training_node, "objective_tolerance"),
                                                 "objective_tolerance");
+  if (seen_attributes.find("pii_shift_mode") != seen_attributes.end())
+  {
+    const std::string mode = readAttribute(training_node, "pii_shift_mode");
+    if (mode == "explicit")
+      pii_shift_mode_ = PIIShiftMode::EXPLICIT;
+    else if (mode == "mean_energy_minus_undershoot")
+      pii_shift_mode_ = PIIShiftMode::MEAN_ENERGY_MINUS_UNDERSHOOT;
+    else
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: pii_shift_mode must be explicit or mean_energy_minus_undershoot");
+  }
+  if (seen_attributes.find("pii_explicit_tau") != seen_attributes.end())
+    pii_explicit_tau_ = parseFiniteReal(readAttribute(training_node, "pii_explicit_tau"),
+                                        "pii_explicit_tau");
+  if (seen_attributes.find("pii_energy_undershoot") != seen_attributes.end())
+    pii_energy_undershoot_ = parseNonnegativeReal(
+        readAttribute(training_node, "pii_energy_undershoot"), "pii_energy_undershoot");
+  if (seen_attributes.find("maximum_damping_retries") != seen_attributes.end())
+  {
+    maximum_damping_retries_ = parseNonnegativeSize(
+        readAttribute(training_node, "maximum_damping_retries"), "maximum_damping_retries");
+    if (maximum_damping_retries_ > 64)
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: maximum_damping_retries must not exceed 64");
+  }
+  if (seen_attributes.find("gmres_restart_length") != seen_attributes.end())
+    gmres_restart_length_ = parsePositiveSize(
+        readAttribute(training_node, "gmres_restart_length"), "gmres_restart_length");
   if (seen_attributes.find("spring_history_decay") != seen_attributes.end())
     spring_history_decay_ = parseDecay(readAttribute(training_node, "spring_history_decay"),
                                        "spring_history_decay");
@@ -422,13 +465,20 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       "spring_history_decay", "spring_maximum_update_norm_squared", "krylov_relative_tolerance",
       "krylov_absolute_tolerance", "krylov_maximum_iterations", "krylov_maximum_operator_applications",
       "krylov_maximum_seconds", "krylov_stagnation_window", "krylov_minimum_relative_improvement",
-      "krylov_curvature_tolerance", "krylov_imaginary_tolerance"};
+      "krylov_curvature_tolerance", "krylov_imaginary_tolerance", "pii_shift_mode",
+      "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
+      "gmres_restart_length"};
   const std::initializer_list<std::string_view> sr_only_attributes = {
       "damping_multiplier", "minimum_retry_damping", "maximum_damping_attempts", "maximum_metric_norm"};
+  const std::initializer_list<std::string_view> sr_non_pii_attributes = {
+      "minimum_retry_damping", "maximum_damping_attempts", "maximum_metric_norm"};
   const std::initializer_list<std::string_view> minimum_step_attributes = {"center_shift",
                                                                            "objective_tolerance"};
   const std::initializer_list<std::string_view> spring_only_attributes = {
       "spring_history_decay", "spring_maximum_update_norm_squared"};
+  const std::initializer_list<std::string_view> pii_only_attributes = {
+      "pii_shift_mode", "pii_explicit_tau", "pii_energy_undershoot",
+      "maximum_damping_retries", "gmres_restart_length"};
   switch (optimizer_)
   {
   case Optimizer::ADAM:
@@ -438,20 +488,45 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     rejectAttributes(seen_attributes, adam_attributes, "sr");
     rejectAttributes(seen_attributes, minimum_step_attributes, "sr");
     rejectAttributes(seen_attributes, spring_only_attributes, "sr");
+    rejectAttributes(seen_attributes, pii_only_attributes, "sr");
     break;
   case Optimizer::MINIMUM_STEP_SR:
     rejectAttributes(seen_attributes, adam_attributes, "minsr");
     rejectAttributes(seen_attributes, sr_only_attributes, "minsr");
     rejectAttributes(seen_attributes, spring_only_attributes, "minsr");
+    rejectAttributes(seen_attributes, pii_only_attributes, "minsr");
     if (!(damping_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"minsr\" requires positive damping");
     break;
   case Optimizer::SPRING:
     rejectAttributes(seen_attributes, adam_attributes, "spring");
     rejectAttributes(seen_attributes, sr_only_attributes, "spring");
+    rejectAttributes(seen_attributes, pii_only_attributes, "spring");
     if (!(damping_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"spring\" requires positive damping");
     break;
+  case Optimizer::PROJECTED_INVERSE_ITERATION:
+  case Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION:
+  {
+    const std::string optimizer = optimizer_ == Optimizer::PROJECTED_INVERSE_ITERATION
+        ? "pii" : "minpii";
+    rejectAttributes(seen_attributes, adam_attributes, optimizer);
+    rejectAttributes(seen_attributes, sr_non_pii_attributes, optimizer);
+    rejectAttributes(seen_attributes, {"center_shift"}, optimizer);
+    rejectAttributes(seen_attributes, spring_only_attributes, optimizer);
+    if (!(damping_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"" + optimizer +
+                                    "\" requires positive damping");
+    if (pii_shift_mode_ == PIIShiftMode::EXPLICIT)
+    {
+      if (seen_attributes.find("pii_explicit_tau") == seen_attributes.end())
+        throw UniformCommunicateError("WFTrainDriverInput: pii_shift_mode=\"explicit\" requires pii_explicit_tau");
+      rejectAttributes(seen_attributes, {"pii_energy_undershoot"}, optimizer);
+    }
+    else
+      rejectAttributes(seen_attributes, {"pii_explicit_tau"}, optimizer);
+    break;
+  }
   }
   if (optimizer_ != Optimizer::ADAM && krylov_relative_tolerance_ == 0.0 &&
       krylov_absolute_tolerance_ == 0.0)

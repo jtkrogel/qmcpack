@@ -43,7 +43,15 @@ public:
     ADAM,
     STOCHASTIC_RECONFIGURATION,
     MINIMUM_STEP_SR,
-    SPRING
+    SPRING,
+    PROJECTED_INVERSE_ITERATION,
+    MINIMUM_PROJECTED_INVERSE_ITERATION
+  };
+
+  enum class PIIShiftMode
+  {
+    EXPLICIT,
+    MEAN_ENERGY_MINUS_UNDERSHOOT
   };
 
   /** Parse exactly one nested training section from a qmc driver node. */
@@ -64,6 +72,11 @@ public:
   double getMaximumMetricNorm() const noexcept { return maximum_metric_norm_; }
   double getCenterShift() const noexcept { return center_shift_; }
   double getObjectiveTolerance() const noexcept { return objective_tolerance_; }
+  PIIShiftMode getPIIShiftMode() const noexcept { return pii_shift_mode_; }
+  double getPIIExplicitTau() const noexcept { return pii_explicit_tau_; }
+  double getPIIEnergyUndershoot() const noexcept { return pii_energy_undershoot_; }
+  std::size_t getMaximumDampingRetries() const noexcept { return maximum_damping_retries_; }
+  std::size_t getGMRESRestartLength() const noexcept { return gmres_restart_length_; }
   double getSpringHistoryDecay() const noexcept { return spring_history_decay_; }
   double getSpringMaximumUpdateNormSquared() const noexcept { return spring_maximum_update_norm_squared_; }
   double getKrylovRelativeTolerance() const noexcept { return krylov_relative_tolerance_; }
@@ -108,6 +121,11 @@ private:
   double maximum_metric_norm_{0.0};
   double center_shift_{1.0};
   double objective_tolerance_{1.0e-9};
+  PIIShiftMode pii_shift_mode_{PIIShiftMode::MEAN_ENERGY_MINUS_UNDERSHOOT};
+  double pii_explicit_tau_{0.0};
+  double pii_energy_undershoot_{0.1};
+  std::size_t maximum_damping_retries_{2};
+  std::size_t gmres_restart_length_{20};
   double spring_history_decay_{0.99};
   double spring_maximum_update_norm_squared_{0.0};
   double krylov_relative_tolerance_{1.0e-8};

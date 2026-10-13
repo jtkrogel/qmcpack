@@ -24,6 +24,7 @@
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
+#include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
@@ -374,23 +375,6 @@ EnergyMoments energyMoments(
   return {moments[0], moments[1] / moments[0]};
 }
 
-/** Return the stable diagnostic name of one live optimizer. */
-const char* optimizerName(WFTrainDriverInput::Optimizer optimizer) noexcept
-{
-  switch (optimizer)
-  {
-  case WFTrainDriverInput::Optimizer::ADAM:
-    return "adam";
-  case WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION:
-    return "sr";
-  case WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR:
-    return "minsr";
-  case WFTrainDriverInput::Optimizer::SPRING:
-    return "spring";
-  }
-  return "unknown";
-}
-
 /// Extend the stable stage fingerprint with a trivially represented scalar.
 template<class T>
 void extendStageFingerprint(std::uint64_t& hash, const T& value) noexcept
@@ -455,6 +439,14 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, training.getMaximumMetricNorm());
   extendStageFingerprint(hash, training.getCenterShift());
   extendStageFingerprint(hash, training.getObjectiveTolerance());
+  const auto pii_shift_mode =
+      static_cast<std::underlying_type_t<WFTrainDriverInput::PIIShiftMode>>(
+          training.getPIIShiftMode());
+  extendStageFingerprint(hash, pii_shift_mode);
+  extendStageFingerprint(hash, training.getPIIExplicitTau());
+  extendStageFingerprint(hash, training.getPIIEnergyUndershoot());
+  extendStageFingerprint(hash, training.getMaximumDampingRetries());
+  extendStageFingerprint(hash, training.getGMRESRestartLength());
   extendStageFingerprint(hash, training.getSpringHistoryDecay());
   extendStageFingerprint(hash, training.getSpringMaximumUpdateNormSquared());
   extendStageFingerprint(hash, training.getKrylovRelativeTolerance());
@@ -1036,7 +1028,7 @@ void WFTrainBatched::run()
             applied_scale                = diagnostics->applied_scale;
           }
         }
-        else
+        else if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
         {
           iteration_result = runScoreFactorIteration(
               *selected_provider_, *parameters, factor, *spring_optimizer,
@@ -1049,6 +1041,52 @@ void WFTrainBatched::run()
             applied_scale                = diagnostics->applied_scale;
           }
         }
+        else if (optimizer_kind ==
+                     WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION ||
+                 optimizer_kind ==
+                     WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION)
+        {
+          const std::uint32_t kinetic_mask =
+              wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+          wftrain::ProjectedInverseIterationFactor pii_factor(factor, kinetic_mask);
+          const wftrain::PIIUpdateControl control =
+              wftrain::makePIIUpdateControl(training_input_);
+
+          if (optimizer_kind ==
+              WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION)
+          {
+            wftrain::ProjectedInverseIterationUpdateRule update_rule(
+                pii_factor, control);
+            iteration_result = runScoreFactorIteration(
+                *selected_provider_, *parameters, factor, update_rule,
+                training_state, reduction, cache_observer,
+                energy_moments.weight_sum, energy_moments.variance);
+            if (const auto& diagnostics = update_rule.lastDiagnostics())
+            {
+              krylov_iterations            = diagnostics->iterations;
+              krylov_operator_applications = diagnostics->operator_applications;
+              applied_scale                = diagnostics->applied_scale;
+            }
+          }
+          else
+          {
+            wftrain::MinimumProjectedInverseIterationUpdateRule update_rule(
+                pii_factor, control);
+            iteration_result = runScoreFactorIteration(
+                *selected_provider_, *parameters, factor, update_rule,
+                training_state, reduction, cache_observer,
+                energy_moments.weight_sum, energy_moments.variance);
+            if (const auto& diagnostics = update_rule.lastDiagnostics())
+            {
+              krylov_iterations            = diagnostics->iterations;
+              krylov_operator_applications = diagnostics->operator_applications;
+              applied_scale                = diagnostics->applied_scale;
+            }
+          }
+        }
+        else
+          throw std::logic_error(
+              "WFTrainBatched: unsupported optimizer reached score-factor execution");
       }
       }
     }
@@ -1101,7 +1139,7 @@ void WFTrainBatched::run()
                   << " gradient_norm " << gradientNorm(objective.gradient);
       }
       app_log() << " retained_bytes " << retained_numeric_bytes
-                << " optimizer " << optimizerName(training_input_.getOptimizer());
+                << " optimizer " << wftrain::optimizerName(training_input_.getOptimizer());
       if (krylov_iterations)
         app_log() << " krylov_iterations " << *krylov_iterations
                   << " krylov_operator_applications "

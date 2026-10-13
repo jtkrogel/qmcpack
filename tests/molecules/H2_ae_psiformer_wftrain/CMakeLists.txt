@@ -36,6 +36,22 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
                "WFTrain iteration 1 version 1 samples 1 overlap_loss")
   endif()
 
+  set(PII_TEST_NAME short-H2-ae-psiformer-wftrain-pii-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(
+    ${PII_TEST_NAME}
+    "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+    1
+    1
+    TEST_ADDED
+    wftrain_pii.xml)
+  if(TEST_ADDED)
+    set_property(
+      TEST ${PII_TEST_NAME}
+      PROPERTY PASS_REGULAR_EXPRESSION
+               "WFTrain iteration 1 version 2 samples 1 mean_energy.*optimizer minpii")
+  endif()
+
   # Exercise the production manifest/root/shard route in two processes launched
   # sequentially by CTest. The second process reconstructs its native population,
   # restores the exact post-update Markov state, and performs only update two.
