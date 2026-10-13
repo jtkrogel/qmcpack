@@ -148,7 +148,8 @@ void advanceReference(FirstOrderMethod method,
                       const std::vector<double>& gradient,
                       std::vector<double>& parameters,
                       std::vector<double>& first,
-                      std::vector<double>& second)
+                      std::vector<double>& second,
+                      std::vector<double>& maximum_second)
 {
   const std::array<double, 4> learning_rates{0.1, 0.1, 0.01, 0.0};
   for (std::size_t index = 0; index < 3; ++index)
@@ -168,12 +169,14 @@ void advanceReference(FirstOrderMethod method,
       direction = gradient[index] / (std::sqrt(second[index]) + options.epsilon);
       break;
     case FirstOrderMethod::ADAM:
+    case FirstOrderMethod::AMSGRAD:
       first[index] = options.adam_beta1 * first[index] +
           (1.0 - options.adam_beta1) * gradient[index];
       second[index] = options.adam_beta2 * second[index] +
           (1.0 - options.adam_beta2) * gradient[index] * gradient[index];
+      maximum_second[index] = std::max(maximum_second[index], second[index]);
       direction = (first[index] / (1.0 - std::pow(options.adam_beta1, iteration))) /
-          (std::sqrt(second[index] /
+          (std::sqrt((method == FirstOrderMethod::AMSGRAD ? maximum_second[index] : second[index]) /
                      (1.0 - std::pow(options.adam_beta2, iteration))) +
            options.epsilon);
       break;
@@ -184,12 +187,13 @@ void advanceReference(FirstOrderMethod method,
 
 /// Overwrite one checkpointed moment vector without updating its fingerprint.
 void overwriteFirstMoment(const std::filesystem::path& file,
-                          const std::array<double, 4>& values)
+                          const std::array<double, 4>& values,
+                          const char* dataset_path = "/wftrain_checkpoint/optimizer/first_moment")
 {
   const hid_t handle = H5Fopen(file.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
   const hid_t dataset =
       handle >= 0
-      ? H5Dopen2(handle, "/wftrain_checkpoint/optimizer/first_moment", H5P_DEFAULT)
+      ? H5Dopen2(handle, dataset_path, H5P_DEFAULT)
       : -1;
   if (handle < 0 || dataset < 0 ||
       H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT,
@@ -210,9 +214,9 @@ void overwriteFirstMoment(const std::filesystem::path& file,
 TEST_CASE("First-order optimizers match independent multistep references",
           "[drivers][training][optimizer]")
 {
-  const std::array<FirstOrderMethod, 4> methods{
+  const std::array<FirstOrderMethod, 5> methods{
       FirstOrderMethod::SGD, FirstOrderMethod::MOMENTUM_SGD,
-      FirstOrderMethod::RMSPROP, FirstOrderMethod::ADAM};
+      FirstOrderMethod::RMSPROP, FirstOrderMethod::ADAM, FirstOrderMethod::AMSGRAD};
   const std::array<std::vector<double>, 3> gradients{
       std::vector<double>{1.0, -2.0, 0.5, 101.0},
       std::vector<double>{-0.25, 0.75, -1.0, 102.0},
@@ -227,6 +231,7 @@ TEST_CASE("First-order optimizers match independent multistep references",
     std::vector<double> expected_parameters = parameters.values;
     std::vector<double> expected_first(4, 0.0);
     std::vector<double> expected_second(4, 0.0);
+    std::vector<double> expected_maximum_second(4, 0.0);
 
     for (std::size_t step = 0; step < gradients.size(); ++step)
     {
@@ -235,7 +240,7 @@ TEST_CASE("First-order optimizers match independent multistep references",
           optimizer.propose(provider.parameterSchema(), parameters, objective);
       CHECK(optimizer.hasLiveProposal());
       advanceReference(method, options, step + 1, gradients[step], expected_parameters,
-                       expected_first, expected_second);
+                       expected_first, expected_second, expected_maximum_second);
       REQUIRE(candidate.values.size() == expected_parameters.size());
       for (std::size_t index = 0; index < candidate.values.size(); ++index)
         CHECK(candidate.values[index] == Catch::Approx(expected_parameters[index]).epsilon(1e-12));
@@ -251,13 +256,15 @@ TEST_CASE("First-order optimizers match independent multistep references",
     CHECK(optimizer.acceptedUpdateCount() == gradients.size());
     const std::size_t expected_vectors =
         method == FirstOrderMethod::SGD ? 0
+        : method == FirstOrderMethod::AMSGRAD ? 3
         : method == FirstOrderMethod::ADAM ? 2
                                            : 1;
     CHECK(optimizer.retainedBytes() == expected_vectors * 4 * sizeof(double));
     if (!optimizer.firstMoment().empty())
     {
       CHECK(optimizer.firstMoment()[3] == 0.0);
-      if (method == FirstOrderMethod::MOMENTUM_SGD || method == FirstOrderMethod::ADAM)
+      if (method == FirstOrderMethod::MOMENTUM_SGD || method == FirstOrderMethod::ADAM ||
+          method == FirstOrderMethod::AMSGRAD)
         for (std::size_t index = 0; index < 3; ++index)
           CHECK(optimizer.firstMoment()[index] ==
                 Catch::Approx(expected_first[index]).epsilon(1e-12));
@@ -268,6 +275,15 @@ TEST_CASE("First-order optimizers match independent multistep references",
       for (std::size_t index = 0; index < 3; ++index)
         CHECK(optimizer.secondMoment()[index] ==
               Catch::Approx(expected_second[index]).epsilon(1e-12));
+    }
+    if (method == FirstOrderMethod::AMSGRAD)
+    {
+      CHECK(optimizer.maximumSecondMoment()[3] == 0.0);
+      for (std::size_t index = 0; index < 3; ++index)
+        CHECK(optimizer.maximumSecondMoment()[index] ==
+              Catch::Approx(expected_maximum_second[index]).epsilon(1e-12));
+      // The EMA decays independently even when the running maximum stays fixed.
+      CHECK(optimizer.secondMoment()[0] < optimizer.maximumSecondMoment()[0]);
     }
   }
 }
@@ -374,9 +390,9 @@ TEST_CASE("First-order optimizer proposal rejection preserves committed recurren
 TEST_CASE("First-order optimizer checkpoint exactly resumes every recurrence",
           "[drivers][training][optimizer][checkpoint]")
 {
-  const std::array<FirstOrderMethod, 4> methods{
+  const std::array<FirstOrderMethod, 5> methods{
       FirstOrderMethod::SGD, FirstOrderMethod::MOMENTUM_SGD,
-      FirstOrderMethod::RMSPROP, FirstOrderMethod::ADAM};
+      FirstOrderMethod::RMSPROP, FirstOrderMethod::ADAM, FirstOrderMethod::AMSGRAD};
   const std::array<std::vector<double>, 4> gradients{
       std::vector<double>{1.0, -2.0, 0.5, 0.0},
       std::vector<double>{-0.25, 0.75, -1.0, 0.0},
@@ -404,6 +420,13 @@ TEST_CASE("First-order optimizer checkpoint exactly resumes every recurrence",
     TrainingCheckpoint::saveAtomic(file, uninterrupted_provider,
                                    uninterrupted_coordinator, uninterrupted_stage,
                                    &uninterrupted_optimizer);
+    // Existing methods retain the original checkpoint payload without a new dataset.
+    const hid_t saved_handle = H5Fopen(file.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    REQUIRE(saved_handle >= 0);
+    const htri_t has_maximum = H5Lexists(saved_handle,
+        "/wftrain_checkpoint/optimizer/maximum_second_moment", H5P_DEFAULT);
+    H5Fclose(saved_handle);
+    CHECK(has_maximum == (method == FirstOrderMethod::AMSGRAD ? 1 : 0));
     for (std::size_t step = 2; step < gradients.size(); ++step)
       applyOptimizerStep(uninterrupted_provider, uninterrupted_optimizer, gradients[step],
                          uninterrupted_coordinator, uninterrupted_stage);
@@ -431,6 +454,7 @@ TEST_CASE("First-order optimizer checkpoint exactly resumes every recurrence",
       CHECK(actual[index] == Catch::Approx(expected[index]).epsilon(1e-13));
     CHECK(resumed_optimizer.firstMoment() == uninterrupted_optimizer.firstMoment());
     CHECK(resumed_optimizer.secondMoment() == uninterrupted_optimizer.secondMoment());
+    CHECK(resumed_optimizer.maximumSecondMoment() == uninterrupted_optimizer.maximumSecondMoment());
     CHECK(resumed_optimizer.acceptedUpdateCount() ==
           uninterrupted_optimizer.acceptedUpdateCount());
     CHECK(resumed_coordinator.completed_iterations ==
@@ -438,6 +462,129 @@ TEST_CASE("First-order optimizer checkpoint exactly resumes every recurrence",
     CHECK(resumed_stage.completed_stage_iterations ==
           uninterrupted_stage.completed_stage_iterations);
   }
+}
+
+TEST_CASE("AMSGrad rejection preserves both EMA and its independent maximum",
+          "[drivers][training][optimizer][amsgrad]")
+{
+  OptimizerToyProvider provider;
+  FirstOrderOptimizer optimizer(provider.parameterSchema(), makeOptions(FirstOrderMethod::AMSGRAD));
+  TrainingIterationState coordinator{0, 0, provider.parameterSchema().fingerprint()};
+  TrainingStageState stage{"optimization", 0, 0, "amsgrad-rejection-v1"};
+  applyOptimizerStep(provider, optimizer, {4.0, -2.0, 1.0, 0.0}, coordinator, stage);
+  applyOptimizerStep(provider, optimizer, {0.0, 0.0, 0.0, 0.0}, coordinator, stage);
+  CHECK(optimizer.secondMoment()[0] == 3.0);
+  CHECK(optimizer.maximumSecondMoment()[0] == 4.0);
+  const auto first_before = optimizer.firstMoment();
+  const auto second_before = optimizer.secondMoment();
+  const auto maximum_before = optimizer.maximumSecondMoment();
+  const auto fingerprint_before = optimizer.checkpointMetadata().state_fingerprint;
+  const auto parameters = provider.snapshotParameters();
+  const auto objective = makeObjective(provider, {100.0, -100.0, 100.0, 0.0});
+  const auto candidate = optimizer.propose(provider.parameterSchema(), parameters, objective);
+  CHECK(optimizer.firstMoment() == first_before);
+  CHECK(optimizer.secondMoment() == second_before);
+  CHECK(optimizer.maximumSecondMoment() == maximum_before);
+  provider.rejectNextPublish();
+  CHECK_THROWS(provider.publishParameters(candidate, parameters.version));
+  optimizer.proposalRejected();
+  CHECK(optimizer.acceptedUpdateCount() == 2);
+  CHECK(optimizer.checkpointMetadata().state_fingerprint == fingerprint_before);
+  const auto retry = optimizer.propose(provider.parameterSchema(), parameters, objective);
+  CHECK(retry.values == candidate.values);
+  optimizer.proposalRejected();
+  const auto overflow = makeObjective(provider, {std::numeric_limits<double>::max(), 0.0, 0.0, 0.0});
+  CHECK_THROWS(optimizer.propose(provider.parameterSchema(), parameters, overflow));
+  CHECK_FALSE(optimizer.hasLiveProposal());
+  CHECK(optimizer.firstMoment() == first_before);
+  CHECK(optimizer.secondMoment() == second_before);
+  CHECK(optimizer.maximumSecondMoment() == maximum_before);
+}
+
+TEST_CASE("AMSGrad validates and fingerprints its checkpoint maximum atomically",
+          "[drivers][training][optimizer][checkpoint][amsgrad]")
+{
+  const std::filesystem::path file = "wftrain_amsgrad_corrupt.h5";
+  OptimizerCheckpointCleanup cleanup(file);
+  OptimizerToyProvider source_provider;
+  FirstOrderOptimizer source_optimizer(source_provider.parameterSchema(), makeOptions(FirstOrderMethod::AMSGRAD));
+  TrainingIterationState source_coordinator{0, 0, source_provider.parameterSchema().fingerprint()};
+  TrainingStageState source_stage{"optimization", 1, 0, "amsgrad-corrupt-v1"};
+  applyOptimizerStep(source_provider, source_optimizer, {4.0, -2.0, 1.0, 0.0},
+                     source_coordinator, source_stage);
+  TrainingCheckpoint::saveAtomic(file, source_provider, source_coordinator, source_stage, &source_optimizer);
+  constexpr char maximum_path[] = "/wftrain_checkpoint/optimizer/maximum_second_moment";
+  std::string expected_error;
+  SECTION("maximum smaller than EMA")
+  {
+    overwriteFirstMoment(file, {3.0, 1.0, 0.25, 0.0}, maximum_path);
+    expected_error = "below its EMA";
+  }
+  SECTION("nonfinite maximum")
+  {
+    overwriteFirstMoment(file, {std::numeric_limits<double>::quiet_NaN(), 1.0, 0.25, 0.0}, maximum_path);
+    expected_error = "moments are invalid";
+  }
+  SECTION("negative maximum")
+  {
+    overwriteFirstMoment(file, {-1.0, 1.0, 0.25, 0.0}, maximum_path);
+    expected_error = "moments are invalid";
+  }
+  SECTION("frozen maximum")
+  {
+    overwriteFirstMoment(file, {4.0, 1.0, 0.25, 1.0}, maximum_path);
+    expected_error = "nonzero frozen maximum";
+  }
+  SECTION("finite tampering changes state fingerprint")
+  {
+    overwriteFirstMoment(file, {5.0, 1.0, 0.25, 0.0}, maximum_path);
+    expected_error = "state fingerprint mismatch";
+  }
+  SECTION("missing maximum")
+  {
+    const hid_t handle = H5Fopen(file.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    REQUIRE(handle >= 0);
+    const herr_t status = H5Ldelete(handle, maximum_path, H5P_DEFAULT);
+    H5Fclose(handle);
+    REQUIRE(status >= 0);
+    expected_error = "";
+  }
+  SECTION("wrong maximum shape")
+  {
+    const hid_t handle = H5Fopen(file.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    REQUIRE(handle >= 0);
+    REQUIRE(H5Ldelete(handle, maximum_path, H5P_DEFAULT) >= 0);
+    const hsize_t count = 3;
+    const hid_t space = H5Screate_simple(1, &count, nullptr);
+    const hid_t dataset = H5Dcreate2(handle, maximum_path, H5T_NATIVE_DOUBLE, space,
+                                    H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    const std::array<double, 3> values{4.0, 1.0, 0.25};
+    const herr_t status = dataset >= 0
+        ? H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data())
+        : -1;
+    if (dataset >= 0)
+      H5Dclose(dataset);
+    H5Sclose(space);
+    H5Fclose(handle);
+    REQUIRE(status >= 0);
+    expected_error = "moment shape mismatch";
+  }
+  OptimizerToyProvider target_provider;
+  FirstOrderOptimizer target_optimizer(target_provider.parameterSchema(), makeOptions(FirstOrderMethod::AMSGRAD));
+  TrainingIterationState target_coordinator{17, 0, target_provider.parameterSchema().fingerprint()};
+  TrainingStageState target_stage{"optimization", 8, 9, "amsgrad-corrupt-v1"};
+  const auto model_before = target_provider.snapshotParameters();
+  const auto fingerprint_before = target_optimizer.checkpointMetadata().state_fingerprint;
+  CHECK_THROWS_WITH(TrainingCheckpoint::restore(file, target_provider, target_coordinator,
+                                               target_stage, &target_optimizer),
+                    Catch::Matchers::ContainsSubstring(expected_error));
+  CHECK(target_provider.snapshotParameters().values == model_before.values);
+  CHECK(target_provider.snapshotParameters().version == model_before.version);
+  CHECK(target_optimizer.checkpointMetadata().state_fingerprint == fingerprint_before);
+  CHECK(target_optimizer.acceptedUpdateCount() == 0);
+  CHECK(target_coordinator.completed_iterations == 17);
+  CHECK(target_stage.stage_ordinal == 8);
+  CHECK(target_stage.completed_stage_iterations == 9);
 }
 
 TEST_CASE("First-order optimizer rejects corrupt checkpoint state atomically",
@@ -508,7 +655,8 @@ TEST_CASE("First-order optimizer retained state scales only with parameter count
            std::pair{FirstOrderMethod::SGD, std::size_t{0}},
            std::pair{FirstOrderMethod::MOMENTUM_SGD, std::size_t{1}},
            std::pair{FirstOrderMethod::RMSPROP, std::size_t{1}},
-           std::pair{FirstOrderMethod::ADAM, std::size_t{2}}})
+           std::pair{FirstOrderMethod::ADAM, std::size_t{2}},
+           std::pair{FirstOrderMethod::AMSGRAD, std::size_t{3}}})
   {
     FirstOrderOptimizerOptions options = makeOptions(method);
     options.learning_rates             = {{"all", 0.01}};

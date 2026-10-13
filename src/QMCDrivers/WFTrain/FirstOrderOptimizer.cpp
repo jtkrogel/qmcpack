@@ -86,6 +86,8 @@ const char* methodName(FirstOrderMethod method)
     return "rmsprop";
   case FirstOrderMethod::ADAM:
     return "adam";
+  case FirstOrderMethod::AMSGRAD:
+    return "amsgrad";
   }
   throw std::invalid_argument("Unknown first-order optimizer method");
 }
@@ -116,17 +118,20 @@ public:
   PreparedRestoreAction(FirstOrderOptimizer& owner,
                         std::uint64_t update_count,
                         std::vector<double> first_moment,
-                        std::vector<double> second_moment)
+                        std::vector<double> second_moment,
+                        std::vector<double> maximum_second_moment)
       : owner_(owner),
         update_count_(update_count),
         first_moment_(std::move(first_moment)),
-        second_moment_(std::move(second_moment))
+        second_moment_(std::move(second_moment)),
+        maximum_second_moment_(std::move(maximum_second_moment))
   {}
 
   void commit() noexcept override
   {
     owner_.first_moment_.swap(first_moment_);
     owner_.second_moment_.swap(second_moment_);
+    owner_.maximum_second_moment_.swap(maximum_second_moment_);
     owner_.accepted_update_count_ = update_count_;
   }
 
@@ -135,6 +140,7 @@ private:
   std::uint64_t update_count_;
   std::vector<double> first_moment_;
   std::vector<double> second_moment_;
+  std::vector<double> maximum_second_moment_;
 };
 
 FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema,
@@ -161,6 +167,7 @@ FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema
   case FirstOrderMethod::MOMENTUM_SGD:
   case FirstOrderMethod::RMSPROP:
   case FirstOrderMethod::ADAM:
+  case FirstOrderMethod::AMSGRAD:
     break;
   default:
     throw std::invalid_argument("Unknown first-order optimizer method");
@@ -214,8 +221,11 @@ FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema
     second_moment_.assign(parameter_count_, 0.0);
     break;
   case FirstOrderMethod::ADAM:
+  case FirstOrderMethod::AMSGRAD:
     first_moment_.assign(parameter_count_, 0.0);
     second_moment_.assign(parameter_count_, 0.0);
+    if (options_.method == FirstOrderMethod::AMSGRAD)
+      maximum_second_moment_.assign(parameter_count_, 0.0);
     break;
   }
 
@@ -236,6 +246,7 @@ FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema
     extendFingerprint(hash, &options_.epsilon, sizeof(double));
     break;
   case FirstOrderMethod::ADAM:
+  case FirstOrderMethod::AMSGRAD:
     extendFingerprint(hash, &options_.adam_beta1, sizeof(double));
     extendFingerprint(hash, &options_.adam_beta2, sizeof(double));
     extendFingerprint(hash, &options_.epsilon, sizeof(double));
@@ -285,11 +296,11 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
   StructuredParameterSnapshot candidate = parameters;
   const std::uint64_t next_iteration = accepted_update_count_ + 1;
   const double adam_first_correction =
-      options_.method == FirstOrderMethod::ADAM
+      options_.method == FirstOrderMethod::ADAM || options_.method == FirstOrderMethod::AMSGRAD
       ? oneMinusPower(options_.adam_beta1, next_iteration)
       : 1.0;
   const double adam_second_correction =
-      options_.method == FirstOrderMethod::ADAM
+      options_.method == FirstOrderMethod::ADAM || options_.method == FirstOrderMethod::AMSGRAD
       ? oneMinusPower(options_.adam_beta2, next_iteration)
       : 1.0;
 
@@ -317,6 +328,7 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
           break;
         }
         case FirstOrderMethod::ADAM:
+        case FirstOrderMethod::AMSGRAD:
         {
           const double next_first =
               options_.adam_beta1 * first_moment_[parameter] +
@@ -327,7 +339,10 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
           if (!isFiniteDouble(next_first) || !isFiniteDouble(next_second))
             throw std::overflow_error("Adam moment overflow");
           const double corrected_first  = next_first / adam_first_correction;
-          const double corrected_second = next_second / adam_second_correction;
+          const double denominator_second = options_.method == FirstOrderMethod::AMSGRAD
+              ? std::max(maximum_second_moment_[parameter], next_second)
+              : next_second;
+          const double corrected_second = denominator_second / adam_second_correction;
           direction = corrected_first / (std::sqrt(corrected_second) + options_.epsilon);
           break;
         }
@@ -364,10 +379,14 @@ void FirstOrderOptimizer::commitRecurrence(ParameterGradientView objective) noex
               (1.0 - options_.rms_decay) * gradient * gradient;
           break;
         case FirstOrderMethod::ADAM:
+        case FirstOrderMethod::AMSGRAD:
           first_moment_[parameter] = options_.adam_beta1 * first_moment_[parameter] +
               (1.0 - options_.adam_beta1) * gradient;
           second_moment_[parameter] = options_.adam_beta2 * second_moment_[parameter] +
               (1.0 - options_.adam_beta2) * gradient * gradient;
+          if (options_.method == FirstOrderMethod::AMSGRAD)
+            maximum_second_moment_[parameter] =
+                std::max(maximum_second_moment_[parameter], second_moment_[parameter]);
           break;
         }
       }
@@ -392,13 +411,15 @@ void FirstOrderOptimizer::proposalRejected() noexcept
 
 std::size_t FirstOrderOptimizer::retainedBytes() const noexcept
 {
-  return (first_moment_.capacity() + second_moment_.capacity()) * sizeof(double);
+  return (first_moment_.capacity() + second_moment_.capacity() +
+          maximum_second_moment_.capacity()) * sizeof(double);
 }
 
 std::string FirstOrderOptimizer::stateFingerprint(
     std::uint64_t update_count,
     const std::vector<double>& first_moment,
-    const std::vector<double>& second_moment) const
+    const std::vector<double>& second_moment,
+    const std::vector<double>& maximum_second_moment) const
 {
   std::uint64_t hash = UINT64_C(1469598103934665603);
   extendFingerprint(hash, &update_count, sizeof(update_count));
@@ -410,6 +431,14 @@ std::string FirstOrderOptimizer::stateFingerprint(
   extendFingerprint(hash, &second_size, sizeof(second_size));
   if (!second_moment.empty())
     extendFingerprint(hash, second_moment.data(), second_moment.size() * sizeof(double));
+  // Preserve the original byte stream for all existing optimizer checkpoints.
+  if (options_.method == FirstOrderMethod::AMSGRAD)
+  {
+    const std::uint64_t maximum_size = maximum_second_moment.size();
+    extendFingerprint(hash, &maximum_size, sizeof(maximum_size));
+    if (!maximum_second_moment.empty())
+      extendFingerprint(hash, maximum_second_moment.data(), maximum_second_moment.size() * sizeof(double));
+  }
   return formatFingerprint(hash);
 }
 
@@ -418,7 +447,7 @@ CheckpointContributorMetadata FirstOrderOptimizer::checkpointMetadata() const
   if (proposal_live_)
     throw std::logic_error("Cannot checkpoint a first-order optimizer with a live proposal");
   return {CONTRIBUTOR_ID, {1, 0, 0}, configuration_fingerprint_,
-          stateFingerprint(accepted_update_count_, first_moment_, second_moment_)};
+          stateFingerprint(accepted_update_count_, first_moment_, second_moment_, maximum_second_moment_)};
 }
 
 void FirstOrderOptimizer::writeCheckpointPayload(hdf_archive& archive) const
@@ -430,31 +459,43 @@ void FirstOrderOptimizer::writeCheckpointPayload(hdf_archive& archive) const
     archive.write(first_moment_, "first_moment");
   if (!second_moment_.empty())
     archive.write(second_moment_, "second_moment");
+  if (!maximum_second_moment_.empty())
+    archive.write(maximum_second_moment_, "maximum_second_moment");
 }
 
 void FirstOrderOptimizer::validateRestoredState(
     std::uint64_t update_count,
     const std::vector<double>& first_moment,
-    const std::vector<double>& second_moment) const
+    const std::vector<double>& second_moment,
+    const std::vector<double>& maximum_second_moment) const
 {
   const std::size_t expected_first =
       options_.method == FirstOrderMethod::MOMENTUM_SGD ||
-          options_.method == FirstOrderMethod::ADAM
+          options_.method == FirstOrderMethod::ADAM || options_.method == FirstOrderMethod::AMSGRAD
       ? parameter_count_
       : 0;
   const std::size_t expected_second =
-      options_.method == FirstOrderMethod::RMSPROP || options_.method == FirstOrderMethod::ADAM
+      options_.method == FirstOrderMethod::RMSPROP || options_.method == FirstOrderMethod::ADAM ||
+          options_.method == FirstOrderMethod::AMSGRAD
       ? parameter_count_
       : 0;
-  if (first_moment.size() != expected_first || second_moment.size() != expected_second)
+  const std::size_t expected_maximum =
+      options_.method == FirstOrderMethod::AMSGRAD ? parameter_count_ : 0;
+  if (first_moment.size() != expected_first || second_moment.size() != expected_second ||
+      maximum_second_moment.size() != expected_maximum)
     throw std::runtime_error("First-order optimizer checkpoint moment shape mismatch");
   if (update_count == std::numeric_limits<std::uint64_t>::max())
     throw std::runtime_error("First-order optimizer checkpoint update count is exhausted");
   if (!std::all_of(first_moment.begin(), first_moment.end(),
                    [](double value) { return isFiniteDouble(value); }) ||
       !std::all_of(second_moment.begin(), second_moment.end(),
+                   [](double value) { return isFiniteDouble(value) && value >= 0.0; }) ||
+      !std::all_of(maximum_second_moment.begin(), maximum_second_moment.end(),
                    [](double value) { return isFiniteDouble(value) && value >= 0.0; }))
     throw std::runtime_error("First-order optimizer checkpoint moments are invalid");
+  for (std::size_t parameter = 0; parameter < maximum_second_moment.size(); ++parameter)
+    if (maximum_second_moment[parameter] < second_moment[parameter])
+      throw std::runtime_error("AMSGrad checkpoint maximum second moment is below its EMA");
 
   // Frozen entries are never part of a recurrence and must stay canonical zero.
   for (const BlockUpdate& block : blocks_)
@@ -468,6 +509,9 @@ void FirstOrderOptimizer::validateRestoredState(
         if (!second_moment.empty() && second_moment[parameter] != 0.0)
           throw std::runtime_error(
               "First-order optimizer checkpoint has nonzero frozen second moment");
+        if (!maximum_second_moment.empty() && maximum_second_moment[parameter] != 0.0)
+          throw std::runtime_error(
+              "AMSGrad checkpoint has nonzero frozen maximum second moment");
       }
 }
 
@@ -486,18 +530,22 @@ FirstOrderOptimizer::prepareCheckpointRestore(
   std::uint64_t update_count = 0;
   std::vector<double> first_moment;
   std::vector<double> second_moment;
+  std::vector<double> maximum_second_moment;
   archive.read(update_count, "accepted_update_count");
   if (!first_moment_.empty())
     archive.read(first_moment, "first_moment");
   if (!second_moment_.empty())
     archive.read(second_moment, "second_moment");
-  validateRestoredState(update_count, first_moment, second_moment);
+  if (!maximum_second_moment_.empty())
+    archive.read(maximum_second_moment, "maximum_second_moment");
+  validateRestoredState(update_count, first_moment, second_moment, maximum_second_moment);
   if (saved_metadata.state_fingerprint !=
-      stateFingerprint(update_count, first_moment, second_moment))
+      stateFingerprint(update_count, first_moment, second_moment, maximum_second_moment))
     throw std::runtime_error("First-order optimizer checkpoint state fingerprint mismatch");
 
   return std::make_unique<PreparedRestoreAction>(
-      *this, update_count, std::move(first_moment), std::move(second_moment));
+      *this, update_count, std::move(first_moment), std::move(second_moment),
+      std::move(maximum_second_moment));
 }
 
 } // namespace qmcplusplus::wftrain

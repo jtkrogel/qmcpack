@@ -29,7 +29,8 @@ enum class FirstOrderMethod : std::uint8_t
   SGD,
   MOMENTUM_SGD,
   RMSPROP,
-  ADAM
+  ADAM,
+  AMSGRAD
 };
 
 /// Assign one positive constant learning rate to a structured update group.
@@ -51,10 +52,13 @@ struct FirstOrderOptimizerOptions
   double epsilon        = 1.0e-8;
 };
 
-/** Apply SGD, momentum SGD, RMSProp, or Adam to a structured real parameter vector.
+/** Apply SGD, momentum SGD, RMSProp, Adam, or AMSGrad to real parameters.
  *
  * Candidate construction is transactional: committed recurrence vectors change
  * only in proposalAccepted(), after the coordinator publishes model parameters.
+ * AMSGrad retains Adam's ordinary second-moment EMA v and an independent
+ * v_max = max(v_max, v). Its denominator is sqrt(v_max / (1-beta2^t)) + epsilon,
+ * and its numerator is m / (1-beta1^t), using accepted update count t.
  */
 class FirstOrderOptimizer final : public TrainingUpdateRule,
                                   public OptimizerCheckpointContributor
@@ -111,6 +115,9 @@ public:
   /// Expose the committed second moment for deterministic validation.
   const std::vector<double>& secondMoment() const noexcept { return second_moment_; }
 
+  /// Expose the independent AMSGrad running maximum of the second-moment EMA.
+  const std::vector<double>& maximumSecondMoment() const noexcept { return maximum_second_moment_; }
+
   /// Report whether one candidate currently awaits acceptance or rejection.
   bool hasLiveProposal() const noexcept { return proposal_live_; }
 
@@ -132,10 +139,12 @@ private:
   void commitRecurrence(ParameterGradientView objective) noexcept;
   void validateRestoredState(std::uint64_t update_count,
                              const std::vector<double>& first_moment,
-                             const std::vector<double>& second_moment) const;
+                             const std::vector<double>& second_moment,
+                             const std::vector<double>& maximum_second_moment) const;
   std::string stateFingerprint(std::uint64_t update_count,
                                const std::vector<double>& first_moment,
-                               const std::vector<double>& second_moment) const;
+                               const std::vector<double>& second_moment,
+                               const std::vector<double>& maximum_second_moment) const;
 
   FirstOrderOptimizerOptions options_;
   std::string provider_id_;
@@ -145,6 +154,7 @@ private:
   std::vector<BlockUpdate> blocks_;
   std::vector<double> first_moment_;
   std::vector<double> second_moment_;
+  std::vector<double> maximum_second_moment_;
   std::uint64_t accepted_update_count_ = 0;
   bool proposal_live_ = false;
 };
