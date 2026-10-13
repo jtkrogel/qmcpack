@@ -27,6 +27,7 @@
 #include "Numerics/OneDimCubicSpline.h"
 #include "NLPPJob.h"
 #include "NonLocalData.h"
+#include <cstdint>
 
 namespace qmcplusplus
 {
@@ -387,6 +388,9 @@ public:
   inline int getNchannel() const { return nchannel; }
   inline void setLmax(int Lmax) { lmax = Lmax; }
   inline int getLmax() const { return lmax; }
+
+  /// Hash the exact currently rotated quadrature coordinates.
+  std::uint64_t rotatedGridFingerprint() const noexcept;
 
   // copy sgridxyz_m to rrotsgrid_m without rotation. For testing only.
   friend void copyGridUnrotatedForTest(NonLocalECPComponent& nlpp);

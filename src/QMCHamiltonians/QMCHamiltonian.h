@@ -33,6 +33,7 @@
 #include "QMCDrivers/WalkerProperties.h"
 #include "QMCHamiltonians/OperatorBase.h"
 #include "QMCWaveFunctions/TWFFastDerivWrapper.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "Utilities/Resource.h"
 #if !defined(REMOVE_TRACEMANAGER)
 #include "Estimators/TraceManager.h"
@@ -64,6 +65,13 @@ public:
   using Walker_t         = OperatorBase::Walker_t;
   using WP               = WalkerProperties::Indexes;
   using ValueMatrix      = SPOSet::ValueMatrix;
+
+  /// Result of one coherent ordinary-locality energy/ECP-response traversal.
+  struct StreamingNonLocalECPResult
+  {
+    std::vector<FullPrecRealType> local_energies;
+    std::uint64_t grid_fingerprint = 0;
+  };
   enum
   {
     DIM = OHMMS_DIM
@@ -254,6 +262,20 @@ public:
       const RefVectorWithLeader<QMCHamiltonian>& ham_list,
       const RefVectorWithLeader<TrialWaveFunction>& wf_list,
       const RefVectorWithLeader<ParticleSet>& p_list);
+
+  /** Evaluate full physical energies and one isolated nonlocal-ECP VJP.
+   *
+   * Exactly one ordinary-locality scalar-relativistic NonLocalECPotential is
+   * traversed.  Its accepted quadrature grid supplies both its energy and VJP;
+   * every other physical Hamiltonian term follows its normal multiwalker path.
+   */
+  static StreamingNonLocalECPResult mw_evaluateWithStreamingNonLocalECPDerivatives(
+      const RefVectorWithLeader<QMCHamiltonian>& ham_list,
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      wftrain::NonLocalECPDerivativeConsumer& consumer,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      wftrain::ParameterReductionSink& sink);
 
   /** evaluate Local energy with Toperators updated.
    * @param P ParticleSEt

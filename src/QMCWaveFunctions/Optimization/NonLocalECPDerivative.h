@@ -84,6 +84,16 @@ public:
   NonLocalECPDerivativeConsumer& operator=(const NonLocalECPDerivativeConsumer&) = delete;
   virtual ~NonLocalECPDerivativeConsumer() = default;
 
+  /** Validate immutable identity and channel metadata before any grid draw.
+   *
+   * The preflight context deliberately has a zero grid fingerprint and point
+   * count; begin() later binds the accepted rotated traversal.
+   */
+  virtual void preflight(
+      const NonLocalECPDerivativeContext& context,
+      DerivativeArrayView<const VJPCoefficientChannel> channels,
+      const ParameterReductionSink& sink) const = 0;
+
   /// Begin one ordinary-locality transaction and activate its checked sink.
   virtual void begin(const NonLocalECPDerivativeContext& context,
                      DerivativeArrayView<const VJPCoefficientChannel> channels,

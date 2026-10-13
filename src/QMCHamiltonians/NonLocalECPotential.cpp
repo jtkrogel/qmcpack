@@ -47,6 +47,16 @@ std::size_t requiredDerivativeExtent(const OptVariables& optvars)
   }
   return required_extent;
 }
+
+/** Extend a stable FNV-1a fingerprint with one fixed-width integer. */
+void mixFingerprint(std::uint64_t& hash, std::uint64_t value) noexcept
+{
+  for (unsigned byte = 0; byte < sizeof(value); ++byte)
+  {
+    hash ^= (value >> (8 * byte)) & UINT64_C(0xff);
+    hash *= UINT64_C(1099511628211);
+  }
+}
 } // namespace
 
 struct NonLocalECPotential::NonLocalECPotentialMultiWalkerResource : public Resource
@@ -676,7 +686,7 @@ void NonLocalECPotential::mw_evaluateWithParameterDerivativesFlattenedVP(
   }
 }
 
-void NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
+std::uint64_t NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
     const RefVectorWithLeader<OperatorBase>& o_list,
     const RefVectorWithLeader<TrialWaveFunction>& wf_list,
     const RefVectorWithLeader<ParticleSet>& p_list,
@@ -736,6 +746,25 @@ void NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
       throw std::logic_error(
           "NonLocalECPotential streaming-derivative grid rotation requires a random-number generator.");
   }
+
+  // Bind the consumer and its coefficient rows before changing scratch state or
+  // consuming even one stochastic-grid draw.  The accepted point count and grid
+  // fingerprint are deliberately bound only by begin() after grid construction.
+  const auto& coefficient_identity = channels[0].coefficients;
+  wftrain::NonLocalECPDerivativeContext context;
+  context.provider_id          = coefficient_identity.provider_id;
+  context.schema_fingerprint   = coefficient_identity.schema_fingerprint;
+  context.parameter_version    = coefficient_identity.parameter_version;
+  context.batch_ordinal        = coefficient_identity.batch_ordinal;
+  context.sample_offset        = coefficient_identity.sample_offset;
+  context.sample_count         = walker_count;
+  context.expected_point_count = 0;
+  context.grid_fingerprint     = 0;
+  context.localization         = wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY;
+  context.uses_virtual_particles         = true;
+  context.scalar_relativistic            = true;
+  context.used_dense_derivative_fallback = false;
+  consumer.preflight(context, channels, sink);
 
   resource.staged_jobs.resize(walker_count);
   for (std::size_t walker = 0; walker < walker_count; ++walker)
@@ -828,23 +857,28 @@ void NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
     }
   resource.virtual_batch->seal();
 
+  // Bind the derivative transaction to both logical job order and the exact
+  // rotated quadrature coordinates used by every walker/component.  The batch
+  // fingerprint alone contains topology but intentionally omits coordinates.
   std::uint64_t grid_fingerprint = resource.virtual_batch->logicalFingerprint();
+  for (std::size_t walker = 0; walker < walker_count; ++walker)
+  {
+    const auto& potential = o_list.getCastedElement<NonLocalECPotential>(walker);
+    mixFingerprint(grid_fingerprint, walker);
+    mixFingerprint(grid_fingerprint, potential.PPset.size());
+    for (std::size_t component_index = 0;
+         component_index < potential.PPset.size(); ++component_index)
+    {
+      mixFingerprint(grid_fingerprint, component_index);
+      const auto& component = potential.PPset[component_index];
+      mixFingerprint(grid_fingerprint,
+                     component ? component->rotatedGridFingerprint() : 0);
+    }
+  }
   if (grid_fingerprint == 0)
     grid_fingerprint = 1;
-  const auto& coefficient_identity = channels[0].coefficients;
-  wftrain::NonLocalECPDerivativeContext context;
-  context.provider_id          = coefficient_identity.provider_id;
-  context.schema_fingerprint   = coefficient_identity.schema_fingerprint;
-  context.parameter_version    = coefficient_identity.parameter_version;
-  context.batch_ordinal        = coefficient_identity.batch_ordinal;
-  context.sample_offset        = coefficient_identity.sample_offset;
-  context.sample_count         = walker_count;
   context.expected_point_count = resource.virtual_batch->totalKnotCount();
   context.grid_fingerprint     = grid_fingerprint;
-  context.localization                   = wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY;
-  context.uses_virtual_particles         = true;
-  context.scalar_relativistic            = true;
-  context.used_dense_derivative_fallback = false;
 
   consumer.begin(context, channels, sink);
   try
@@ -902,6 +936,7 @@ void NonLocalECPotential::mw_evaluateWithStreamingParameterDerivatives(
       potential.nlpp_jobs[group].swap(resource.staged_jobs[walker][group]);
     potential.value_ = resource.staged_values[walker];
   }
+  return grid_fingerprint;
 }
 
 NonLocalECPotential::Return_t NonLocalECPotential::evaluateWithToperator(TrialWaveFunction& psi, ParticleSet& P)

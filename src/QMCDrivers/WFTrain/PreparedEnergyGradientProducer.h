@@ -15,12 +15,71 @@
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace qmcplusplus::wftrain
 {
+
+/** Own one isolated, sample-weighted local-energy response in canonical order. */
+struct PreparedAdditiveLocalEnergyVJP
+{
+  std::string provider_id;
+  std::string schema_fingerprint;
+  std::size_t parameter_version = 0;
+  std::size_t batch_ordinal     = 0;
+  std::size_t sample_offset     = 0;
+  std::size_t sample_count      = 0;
+  std::uint32_t local_energy_term_mask = 0;
+  std::vector<DerivativeValue> weighted_vjp;
+};
+
+/** Capture exactly one bounded local-energy channel without publishing partial data. */
+class PreparedLocalEnergyVJPCapture final : public ParameterReductionSink
+{
+public:
+  /// Bind the capture to one immutable parameter schema and model version.
+  PreparedLocalEnergyVJPCapture(const StructuredParameterSchema& schema,
+                                std::size_t parameter_version,
+                                std::uint32_t local_energy_term_mask);
+
+  /// Move the completed response into a prepared batch exactly once.
+  PreparedAdditiveLocalEnergyVJP release();
+
+  /// Hash fixed response storage and capacity for warmed-call allocation checks.
+  std::size_t storageFingerprint() const noexcept;
+
+  /// Return exact retained numeric bytes.
+  std::size_t retainedBytes() const noexcept
+  {
+    return staging_.capacity() * sizeof(DerivativeValue);
+  }
+
+protected:
+  void onBegin(const DerivativeStreamDescriptor& descriptor,
+               const ParameterChunkPlan& plan,
+               DerivativeArrayView<const VJPCoefficientChannel> channels) override;
+  void consume(std::size_t channel_ordinal,
+               const ParameterChunkConstView& chunk) override;
+  void onEnd() override;
+  void onAbort() noexcept override;
+  void onReset() noexcept override;
+
+private:
+  std::string provider_id_;
+  std::string schema_fingerprint_;
+  std::size_t parameter_version_ = 0;
+  std::uint32_t local_energy_term_mask_ = 0;
+  std::size_t batch_ordinal_ = 0;
+  std::size_t sample_offset_ = 0;
+  std::size_t sample_count_  = 0;
+  std::vector<DerivativeValue> staging_;
+  bool transaction_complete_ = false;
+  bool released_             = false;
+};
 
 /** Own one crowd's immutable samples and derivative operator for an iteration.
  *
@@ -33,7 +92,9 @@ struct PreparedEnergyGradientBatch
   std::unique_ptr<StreamingDerivativeOperator> derivative_operator;
   std::vector<DerivativeReal> weights;
   std::vector<DerivativeValue> local_energies;
+  /// Terms produced by derivative_operator; additive coverage must be disjoint.
   std::uint32_t local_energy_term_mask = 0;
+  std::optional<PreparedAdditiveLocalEnergyVJP> additive_local_energy_vjp;
 };
 
 /// Exact numeric storage retained by one prepared live-batch producer.

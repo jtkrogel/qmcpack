@@ -10,6 +10,7 @@
  */
 
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include <algorithm>
 #include <array>
@@ -25,13 +26,14 @@ namespace
 /// Report whether both parts of one contraction scalar are finite.
 bool isFinite(DerivativeValue value) noexcept
 {
-  return std::isfinite(value.real()) && std::isfinite(value.imag());
+  return isFiniteTrainingReal(value.real()) &&
+      isFiniteTrainingReal(value.imag());
 }
 
 /// Reject a non-finite real aggregate before it contaminates retained state.
 void requireFinite(DerivativeReal value, const char* description)
 {
-  if (!std::isfinite(value))
+  if (!isFiniteTrainingReal(value))
     throw std::invalid_argument(std::string("Non-finite ") + description +
                                 " in streaming energy-gradient reduction");
 }
@@ -224,6 +226,40 @@ void EnergyGradientAccumulator::addScalarSums(
     clipped_weighted_energy_sum_ = clipped_weighted_energy_sum;
   }
   scalar_sums_complete_ = true;
+}
+
+void EnergyGradientAccumulator::addLocalEnergyVJP(
+    DerivativeArrayView<const DerivativeValue> weighted_vjp,
+    std::uint32_t local_energy_term_mask)
+{
+  if (state() != DerivativeSinkState::COMPLETE || !derivative_complete_)
+    throw std::logic_error(
+        "Additive local-energy VJP requires a complete primary derivative stream");
+  const std::uint32_t known_terms =
+      localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  if (local_energy_term_mask == 0 ||
+      (local_energy_term_mask & ~known_terms) != 0)
+    throw std::invalid_argument(
+        "Additive local-energy VJP has an empty or unknown Hamiltonian-term mask");
+  if ((local_energy_term_mask_ & local_energy_term_mask) != 0)
+    throw std::invalid_argument(
+        "Additive local-energy VJP overlaps primary Hamiltonian-term coverage");
+  if (weighted_vjp.size() != weighted_energy_derivative_sum_.size() ||
+      (weighted_vjp.size() != 0 && weighted_vjp.data() == nullptr))
+    throw std::invalid_argument(
+        "Additive local-energy VJP does not match the parameter schema");
+
+  // Check both inputs and prospective sums before changing any retained state.
+  for (std::size_t parameter = 0; parameter < weighted_vjp.size(); ++parameter)
+  {
+    requireFinite(weighted_vjp[parameter], "additive local-energy contraction");
+    requireFinite(weighted_energy_derivative_sum_[parameter] + weighted_vjp[parameter],
+                  "composed local-energy contraction");
+  }
+  for (std::size_t parameter = 0; parameter < weighted_vjp.size(); ++parameter)
+    weighted_energy_derivative_sum_[parameter] += weighted_vjp[parameter];
+  local_energy_term_mask_ |= local_energy_term_mask;
 }
 
 void EnergyGradientAccumulator::requireUsableContribution() const

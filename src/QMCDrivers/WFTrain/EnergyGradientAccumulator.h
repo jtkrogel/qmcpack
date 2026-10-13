@@ -88,6 +88,15 @@ public:
                      DerivativeValue clipped_weighted_energy_sum = {},
                      std::size_t clipped_sample_count = 0);
 
+  /** Add one independently produced, already weighted local-energy VJP.
+   *
+   * The term mask must be disjoint from the response already delivered through
+   * the primary derivative stream.  Complete validation precedes mutation, so a
+   * rejected composition leaves the primary contribution usable.
+   */
+  void addLocalEnergyVJP(DerivativeArrayView<const DerivativeValue> weighted_vjp,
+                         std::uint32_t local_energy_term_mask);
+
   /// Merge one complete compatible partial result in deterministic caller order.
   void merge(const EnergyGradientAccumulator& other);
 

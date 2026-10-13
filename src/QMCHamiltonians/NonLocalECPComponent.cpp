@@ -21,6 +21,8 @@
 #include "type_traits/ConvertToReal.h"
 
 #include <stdexcept>
+#include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace qmcplusplus
@@ -43,6 +45,28 @@ NonLocalECPComponent::~NonLocalECPComponent()
 }
 
 void NonLocalECPComponent::set_randomize_grid(bool do_randomize_grid) { do_randomize_grid_ = do_randomize_grid; }
+
+std::uint64_t NonLocalECPComponent::rotatedGridFingerprint() const noexcept
+{
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  const auto mix = [&hash](std::uint64_t value) {
+    for (unsigned byte = 0; byte < sizeof(value); ++byte)
+    {
+      hash ^= (value >> (8 * byte)) & UINT64_C(0xff);
+      hash *= UINT64_C(1099511628211);
+    }
+  };
+  mix(static_cast<std::uint64_t>(rrotsgrid_m.size()));
+  for (const auto& point : rrotsgrid_m)
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      std::uint64_t bits;
+      const double coordinate = point[dimension];
+      std::memcpy(&bits, &coordinate, sizeof(bits));
+      mix(bits);
+    }
+  return hash == 0 ? UINT64_C(1) : hash;
+}
 
 void NonLocalECPComponent::add(int l, RadialPotentialType* pp)
 {

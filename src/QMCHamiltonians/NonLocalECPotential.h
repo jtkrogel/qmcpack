@@ -188,14 +188,21 @@ public:
    * weights, complete wavefunction ratios, and value-evaluation stamps are live.
    * This is the strict O(P)+O(B)+O(Qtile) route: it neither constructs the
    * legacy walker-by-parameter result nor retains virtual-particle descriptors.
+   * @return Fingerprint of the accepted job traversal and rotated grid coordinates.
    */
-  void mw_evaluateWithStreamingParameterDerivatives(
+  std::uint64_t mw_evaluateWithStreamingParameterDerivatives(
       const RefVectorWithLeader<OperatorBase>& o_list,
       const RefVectorWithLeader<TrialWaveFunction>& wf_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       wftrain::NonLocalECPDerivativeConsumer& consumer,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
       wftrain::ParameterReductionSink& sink) const;
+
+  /// Report whether determinant-locality or T-move determinant localization is enabled.
+  bool usesDLA() const noexcept { return use_DLA; }
+
+  /// Report whether the bounded virtual-particle execution path is available.
+  bool usesVirtualParticles() const noexcept { return static_cast<bool>(vp_); }
 
   /** Do nothing */
   bool put(xmlNodePtr cur) override { return true; }

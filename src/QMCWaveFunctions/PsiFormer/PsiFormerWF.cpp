@@ -1862,38 +1862,27 @@ public:
     baseline_storage_ = measureStorageDiagnostics();
   }
 
-  /// Validate the ordinary-locality transaction and activate its checked sink.
-  void begin(
+  /// Reject foreign identity, unsupported channels, and stale model state before RNG use.
+  void preflight(
       const wftrain::NonLocalECPDerivativeContext& context,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
-      wftrain::ParameterReductionSink& sink) override
+      const wftrain::ParameterReductionSink& sink) const override
   {
     if (state_ != State::IDLE)
       throw std::logic_error(
-          "PsiFormer ECP consumer can begin only once from the idle state");
+          "PsiFormer ECP consumer can preflight only from the idle state");
     if (context.provider_id != schema_->providerId() ||
         context.schema_fingerprint != schema_->fingerprint() ||
         context.parameter_version != parameter_version_ ||
         context.sample_count != sample_count_)
       throw std::invalid_argument(
           "PsiFormer ECP consumer context has a foreign schema, version, or batch");
-    if (context.grid_fingerprint == 0)
-      throw std::invalid_argument(
-          "PsiFormer ECP consumer requires a nonzero accepted-grid fingerprint");
     if (context.localization !=
-        wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY)
+            wftrain::NonLocalECPLocalization::ORDINARY_LOCALITY ||
+        !context.uses_virtual_particles || !context.scalar_relativistic ||
+        context.used_dense_derivative_fallback)
       throw std::invalid_argument(
-          "PsiFormer ECP consumer does not support localization mode " +
-          std::to_string(static_cast<int>(context.localization)));
-    if (!context.uses_virtual_particles)
-      throw std::invalid_argument(
-          "PsiFormer ECP consumer requires the virtual-particle path");
-    if (!context.scalar_relativistic)
-      throw std::invalid_argument(
-          "PsiFormer ECP consumer does not support spin-orbit ECPs");
-    if (context.used_dense_derivative_fallback)
-      throw std::invalid_argument(
-          "PsiFormer ECP consumer rejects dense derivative fallback data");
+          "PsiFormer ECP consumer requires bounded scalar ordinary locality");
     if (channels.empty() || channels.size() > MAXIMUM_CHANNELS)
       throw std::invalid_argument(
           "PsiFormer ECP consumer requires one to three coefficient channels");
@@ -1905,9 +1894,8 @@ public:
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
     }
-    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    for (const auto& input : channels)
     {
-      const auto& input = channels[channel];
       if (input.product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
           input.local_energy_term_mask != wftrain::localEnergyTermBit(
                                               wftrain::LocalEnergyTerm::NONLOCAL_ECP))
@@ -1922,9 +1910,26 @@ public:
         throw std::invalid_argument(
             "PsiFormer ECP coefficient channel has incompatible identity or extent");
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
+        requireFinite(input.coefficients.values[sample], "coefficient");
+    }
+  }
+
+  /// Validate the ordinary-locality transaction and activate its checked sink.
+  void begin(
+      const wftrain::NonLocalECPDerivativeContext& context,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      wftrain::ParameterReductionSink& sink) override
+  {
+    preflight(context, channels, sink);
+    if (context.grid_fingerprint == 0)
+      throw std::invalid_argument(
+          "PsiFormer ECP consumer requires a nonzero accepted-grid fingerprint");
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      const auto& input = channels[channel];
+      for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
         const auto coefficient = input.coefficients.values[sample];
-        requireFinite(coefficient, "coefficient");
         coefficients_[channel][sample] = coefficient;
       }
       std::fill(channel_accumulators_[channel].begin(),

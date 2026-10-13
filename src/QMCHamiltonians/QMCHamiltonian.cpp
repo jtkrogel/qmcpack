@@ -648,6 +648,103 @@ std::vector<QMCHamiltonian::FullPrecRealType> QMCHamiltonian::mw_evaluate(
   return local_energies;
 }
 
+QMCHamiltonian::StreamingNonLocalECPResult
+QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+    const RefVectorWithLeader<QMCHamiltonian>& ham_list,
+    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+    const RefVectorWithLeader<ParticleSet>& p_list,
+    wftrain::NonLocalECPDerivativeConsumer& consumer,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    wftrain::ParameterReductionSink& sink)
+{
+  if (wf_list.size() != ham_list.size() || p_list.size() != ham_list.size())
+    throw std::invalid_argument(
+        "Streaming nonlocal-ECP Hamiltonian lists have inconsistent sizes");
+  if (channels.size() != 1 ||
+      channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
+      channels[0].local_energy_term_mask !=
+          wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP))
+    throw std::invalid_argument(
+        "Streaming nonlocal-ECP Hamiltonian requires one isolated ECP VJP channel");
+  if (sink.state() != wftrain::DerivativeSinkState::IDLE)
+    throw std::invalid_argument(
+        "Streaming nonlocal-ECP Hamiltonian requires an idle response sink");
+
+  auto& leader = ham_list.getLeader();
+  std::size_t nonlocal_index = leader.H.size();
+  for (std::size_t operator_index = 0; operator_index < leader.H.size(); ++operator_index)
+  {
+    OperatorBase* component = leader.H[operator_index].get();
+    if (auto* nonlocal = dynamic_cast<NonLocalECPotential*>(component))
+    {
+      if (nonlocal_index != leader.H.size())
+        throw std::invalid_argument(
+            "Streaming nonlocal-ECP Hamiltonian supports exactly one nonlocal operator");
+      if (nonlocal->usesDLA() || !nonlocal->usesVirtualParticles())
+        throw std::invalid_argument(
+            "Streaming nonlocal-ECP Hamiltonian requires ordinary locality and virtual particles");
+      nonlocal_index = operator_index;
+    }
+    else if (component->isNonLocal())
+      throw std::invalid_argument(
+          "Streaming nonlocal-ECP Hamiltonian does not support this nonlocal operator");
+  }
+  if (nonlocal_index == leader.H.size())
+    throw std::invalid_argument(
+        "Streaming nonlocal-ECP Hamiltonian requires exactly one NonLocalECPotential");
+
+  // Validate every clone before rotating a grid or mutating a component value.
+  for (std::size_t walker = 0; walker < ham_list.size(); ++walker)
+  {
+    const QMCHamiltonian& hamiltonian = ham_list[walker];
+    if (hamiltonian.H.size() != leader.H.size() || p_list[walker].isSpinor())
+      throw std::invalid_argument(
+          "Streaming nonlocal-ECP Hamiltonian has incompatible topology or a spinor walker");
+    for (std::size_t operator_index = 0; operator_index < leader.H.size(); ++operator_index)
+      if (hamiltonian.H[operator_index]->getClassName() !=
+          leader.H[operator_index]->getClassName())
+        throw std::invalid_argument(
+            "Streaming nonlocal-ECP Hamiltonian clone topology does not match its leader");
+    const auto* nonlocal = dynamic_cast<const NonLocalECPotential*>(
+        hamiltonian.H[nonlocal_index].get());
+    if (!nonlocal || nonlocal->usesDLA() || !nonlocal->usesVirtualParticles())
+      throw std::invalid_argument(
+          "Streaming nonlocal-ECP Hamiltonian contains an unsupported clone");
+  }
+
+  ScopedTimer local_timer(leader.ham_timer_);
+  for (QMCHamiltonian& hamiltonian : ham_list)
+    hamiltonian.LocalEnergy = 0.0;
+
+  std::uint64_t grid_fingerprint = 0;
+  for (std::size_t operator_index = 0; operator_index < leader.H.size(); ++operator_index)
+  {
+    ScopedTimer operator_timer(leader.my_timers_[operator_index]);
+    const auto component_list = extract_HC_list(ham_list, operator_index);
+    if (operator_index == nonlocal_index)
+    {
+      auto& nonlocal = component_list.getCastedLeader<NonLocalECPotential>();
+      grid_fingerprint = nonlocal.mw_evaluateWithStreamingParameterDerivatives(
+          component_list, wf_list, p_list, consumer, channels, sink);
+    }
+    else
+      leader.H[operator_index]->mw_evaluate(component_list, wf_list, p_list);
+
+    for (std::size_t walker = 0; walker < ham_list.size(); ++walker)
+      updateComponent(component_list[walker], ham_list[walker], p_list[walker]);
+  }
+
+  StreamingNonLocalECPResult result;
+  result.local_energies.resize(ham_list.size());
+  for (std::size_t walker = 0; walker < ham_list.size(); ++walker)
+  {
+    updateKinetic(ham_list[walker], p_list[walker]);
+    result.local_energies[walker] = ham_list[walker].getLocalEnergy();
+  }
+  result.grid_fingerprint = grid_fingerprint;
+  return result;
+}
+
 QMCHamiltonian::FullPrecRealType QMCHamiltonian::evaluateValueAndDerivatives(TrialWaveFunction& psi,
                                                                              ParticleSet& P,
                                                                              const OptVariables& optvars,

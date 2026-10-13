@@ -600,6 +600,81 @@ TEST_CASE("Prepared live batches compose one bounded rank-local objective",
                     "Prepared energy-gradient producer can be consumed only once");
 }
 
+TEST_CASE("Prepared ECP response composes additively without term overlap",
+          "[drivers][training][prepared][ecp]")
+{
+  ToyProvider provider;
+  const StructuredParameterSnapshot parameters = provider.snapshotParameters();
+  const std::vector<DerivativeReal> weights{1.0, 2.0, 1.0};
+  const std::vector<DerivativeValue> energies{-1.0, 0.5, 2.0};
+  const std::vector<DerivativeValue> coefficient_values{1.0, 2.0, 1.0};
+  const std::uint32_t kinetic_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  const std::uint32_t ecp_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+
+  ToyStreamingOperator ecp_operator(
+      provider.parameterSchema(), parameters.version, makeScores(),
+      makeLocalEnergyDerivatives(), false, nullptr, ecp_mask, 0, 0);
+  const CoefficientView coefficients{
+      provider.parameterSchema().providerId(), provider.parameterSchema().fingerprint(),
+      parameters.version, 0, 0,
+      {coefficient_values.data(), coefficient_values.size()}};
+  const VJPCoefficientChannel ecp_channel{
+      EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+      DerivativeProduct::LOCAL_ENERGY_VJP, coefficients, ecp_mask};
+  PreparedLocalEnergyVJPCapture capture(
+      provider.parameterSchema(), parameters.version, ecp_mask);
+  const std::size_t capture_fingerprint = capture.storageFingerprint();
+  ecp_operator.applyVJPs({&ecp_channel, 1}, DerivativeAdjoint::TRANSPOSE, capture);
+  CHECK(capture.storageFingerprint() == capture_fingerprint);
+  CHECK(capture.state() == DerivativeSinkState::COMPLETE);
+
+  PreparedEnergyGradientBatch batch;
+  batch.derivative_operator = std::make_unique<ToyStreamingOperator>(
+      provider.parameterSchema(), parameters.version, makeScores(),
+      makeLocalEnergyDerivatives(), false, nullptr, kinetic_mask, 0, 0);
+  batch.weights = weights;
+  batch.local_energies = energies;
+  batch.local_energy_term_mask = kinetic_mask;
+  batch.additive_local_energy_vjp = capture.release();
+  std::vector<PreparedEnergyGradientBatch> prepared_batches;
+  prepared_batches.push_back(std::move(batch));
+  PreparedEnergyGradientProducer producer(std::move(prepared_batches));
+
+  EnergyGradientAccumulator accumulator(provider.parameterSchema(), parameters.version);
+  producer.accumulate(parameters, accumulator);
+  CHECK(accumulator.localEnergyTermMask() == (kinetic_mask | ecp_mask));
+  accumulator.completeSingleParticipantReduction();
+  const EnergyGradientResult result = accumulator.finalize();
+  REQUIRE(result.gradient.size() == 3);
+  CHECK(result.gradient[0] == Catch::Approx(-1.0));
+  CHECK(result.gradient[1] == Catch::Approx(3.4));
+  CHECK(result.gradient[2] == Catch::Approx(0.0));
+  CHECK(result.local_energy_term_mask == (kinetic_mask | ecp_mask));
+
+  // Both overlapping coverage and non-finite input fail before changing the
+  // already complete primary contribution.
+  EnergyGradientAccumulator primary(provider.parameterSchema(), parameters.version);
+  ToyStreamingOperator primary_operator(provider.parameterSchema(), parameters.version,
+                                         makeScores(), makeLocalEnergyDerivatives());
+  accumulateEnergyGradientBatch(
+      primary_operator, {weights.data(), weights.size()},
+      {energies.data(), energies.size()}, kinetic_mask, primary);
+  const std::vector<DerivativeValue> finite_additive{{0.5, 0.0}, {0.4, 0.0}, {0.0, 0.0}};
+  CHECK_THROWS_AS(primary.addLocalEnergyVJP(
+                      {finite_additive.data(), finite_additive.size()}, kinetic_mask),
+                  std::invalid_argument);
+  std::vector<DerivativeValue> nonfinite_additive = finite_additive;
+  nonfinite_additive[1] = {std::numeric_limits<double>::infinity(), 0.0};
+  CHECK_THROWS_AS(primary.addLocalEnergyVJP(
+                      {nonfinite_additive.data(), nonfinite_additive.size()}, ecp_mask),
+                  std::invalid_argument);
+  CHECK(primary.localEnergyTermMask() == kinetic_mask);
+  primary.completeSingleParticipantReduction();
+  const EnergyGradientResult primary_result = primary.finalize();
+  CHECK(primary_result.gradient[0] == Catch::Approx(-1.25));
+  CHECK(primary_result.gradient[1] == Catch::Approx(3.2));
+}
+
 TEST_CASE("Energy-gradient merge rejects invalid receiver lifecycle states",
           "[drivers][training]")
 {

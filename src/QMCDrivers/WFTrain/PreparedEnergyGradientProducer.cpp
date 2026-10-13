@@ -10,6 +10,7 @@
  */
 
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include <algorithm>
 #include <limits>
@@ -18,6 +19,116 @@
 
 namespace qmcplusplus::wftrain
 {
+namespace
+{
+
+/// Report whether both parts of one contraction scalar are finite.
+bool isFinite(DerivativeValue value) noexcept
+{
+  return isFiniteTrainingReal(value.real()) &&
+      isFiniteTrainingReal(value.imag());
+}
+
+} // namespace
+
+PreparedLocalEnergyVJPCapture::PreparedLocalEnergyVJPCapture(
+    const StructuredParameterSchema& schema,
+    std::size_t parameter_version,
+    std::uint32_t local_energy_term_mask)
+    : provider_id_(schema.providerId()),
+      schema_fingerprint_(schema.fingerprint()),
+      parameter_version_(parameter_version),
+      local_energy_term_mask_(local_energy_term_mask),
+      staging_(schema.parameterCount())
+{
+  const std::uint32_t known_terms =
+      localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  if (local_energy_term_mask_ == 0 ||
+      (local_energy_term_mask_ & ~known_terms) != 0)
+    throw std::invalid_argument(
+        "Prepared local-energy capture requires named Hamiltonian-term coverage");
+}
+
+void PreparedLocalEnergyVJPCapture::onBegin(
+    const DerivativeStreamDescriptor& descriptor,
+    const ParameterChunkPlan&,
+    DerivativeArrayView<const VJPCoefficientChannel> channels)
+{
+  if (released_)
+    throw std::logic_error("Prepared local-energy capture was already released");
+  if (descriptor.provider_id != provider_id_ ||
+      descriptor.schema_fingerprint != schema_fingerprint_ ||
+      descriptor.parameter_version != parameter_version_)
+    throw std::invalid_argument(
+        "Prepared local-energy capture does not match the parameter snapshot");
+  if (descriptor.adjoint != DerivativeAdjoint::TRANSPOSE || channels.size() != 1 ||
+      channels[0].product != DerivativeProduct::LOCAL_ENERGY_VJP ||
+      channels[0].local_energy_term_mask != local_energy_term_mask_)
+    throw std::invalid_argument(
+        "Prepared local-energy capture requires one exact transpose VJP channel");
+  std::fill(staging_.begin(), staging_.end(), DerivativeValue{});
+  batch_ordinal_       = descriptor.batch_ordinal;
+  sample_offset_       = descriptor.sample_offset;
+  sample_count_        = descriptor.sample_count;
+  transaction_complete_ = false;
+}
+
+void PreparedLocalEnergyVJPCapture::consume(
+    std::size_t channel_ordinal,
+    const ParameterChunkConstView& chunk)
+{
+  if (channel_ordinal != 0)
+    throw std::invalid_argument(
+        "Prepared local-energy capture received an unexpected channel");
+  const auto values = chunk.values();
+  for (DerivativeValue value : values)
+    if (!isFinite(value))
+      throw std::invalid_argument(
+          "Prepared local-energy capture received a non-finite contraction");
+  const std::size_t begin = chunk.descriptor().parameter_offset;
+  std::copy(values.begin(), values.end(), staging_.begin() + begin);
+}
+
+void PreparedLocalEnergyVJPCapture::onEnd()
+{
+  transaction_complete_ = true;
+}
+
+void PreparedLocalEnergyVJPCapture::onAbort() noexcept
+{
+  std::fill(staging_.begin(), staging_.end(), DerivativeValue{});
+  transaction_complete_ = false;
+}
+
+void PreparedLocalEnergyVJPCapture::onReset() noexcept
+{
+  onAbort();
+}
+
+PreparedAdditiveLocalEnergyVJP PreparedLocalEnergyVJPCapture::release()
+{
+  if (state() != DerivativeSinkState::COMPLETE || !transaction_complete_)
+    throw std::logic_error(
+        "Prepared local-energy capture is not complete");
+  if (released_)
+    throw std::logic_error(
+        "Prepared local-energy capture can be released only once");
+  released_ = true;
+  return {provider_id_, schema_fingerprint_, parameter_version_, batch_ordinal_,
+          sample_offset_, sample_count_, local_energy_term_mask_,
+          std::move(staging_)};
+}
+
+std::size_t PreparedLocalEnergyVJPCapture::storageFingerprint() const noexcept
+{
+  std::size_t hash = 1469598103934665603ULL;
+  hash ^= reinterpret_cast<std::uintptr_t>(staging_.data());
+  hash *= 1099511628211ULL;
+  hash ^= staging_.capacity();
+  return hash * 1099511628211ULL;
+}
+
 PreparedEnergyGradientProducer::PreparedEnergyGradientProducer(
     std::vector<PreparedEnergyGradientBatch> batches,
     std::optional<EnergyClippingTransform> clipping)
@@ -54,15 +165,44 @@ PreparedEnergyGradientProducer::PreparedEnergyGradientProducer(
       throw std::invalid_argument(
           "Prepared energy-gradient sample arrays do not match their derivative owner");
 
+    std::uint32_t complete_term_mask = batch.local_energy_term_mask;
+    if (batch.additive_local_energy_vjp)
+    {
+      const PreparedAdditiveLocalEnergyVJP& additive =
+          *batch.additive_local_energy_vjp;
+      if ((batch.local_energy_term_mask & additive.local_energy_term_mask) != 0)
+        throw std::invalid_argument(
+            "Prepared energy-gradient additive and primary term masks overlap");
+      const std::uint32_t known_terms =
+          localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+          localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+      if (additive.provider_id != derivative.parameterSchema().providerId() ||
+          additive.schema_fingerprint != derivative.parameterSchema().fingerprint() ||
+          additive.parameter_version != derivative.parameterVersion() ||
+          additive.batch_ordinal != derivative.batchOrdinal() ||
+          additive.sample_offset != derivative.sampleOffset() ||
+          additive.sample_count != derivative.sampleCount() ||
+          additive.local_energy_term_mask == 0 ||
+          (additive.local_energy_term_mask & ~known_terms) != 0 ||
+          additive.weighted_vjp.size() != derivative.parameterSchema().parameterCount())
+        throw std::invalid_argument(
+            "Prepared energy-gradient additive response has incompatible identity or extent");
+      for (DerivativeValue value : additive.weighted_vjp)
+        if (!isFinite(value))
+          throw std::invalid_argument(
+              "Prepared energy-gradient additive response is non-finite");
+      complete_term_mask |= additive.local_energy_term_mask;
+    }
+
     if (schema_fingerprint_.empty())
     {
       schema_fingerprint_        = derivative.parameterSchema().fingerprint();
       parameter_version_         = derivative.parameterVersion();
-      local_energy_term_mask_    = batch.local_energy_term_mask;
+      local_energy_term_mask_    = complete_term_mask;
     }
     else if (schema_fingerprint_ != derivative.parameterSchema().fingerprint() ||
              parameter_version_ != derivative.parameterVersion() ||
-             local_energy_term_mask_ != batch.local_energy_term_mask)
+             local_energy_term_mask_ != complete_term_mask)
       throw std::invalid_argument(
           "Prepared energy-gradient batches have inconsistent schema, version, or Hamiltonian coverage");
 
@@ -126,6 +266,11 @@ void PreparedEnergyGradientProducer::accumulate(
           {batch.local_energies.data(), batch.local_energies.size()},
           batch.local_energy_term_mask, accumulator, DerivativeAdjoint::TRANSPOSE,
           clipping);
+      if (batch.additive_local_energy_vjp)
+        accumulator.addLocalEnergyVJP(
+            {batch.additive_local_energy_vjp->weighted_vjp.data(),
+             batch.additive_local_energy_vjp->weighted_vjp.size()},
+            batch.additive_local_energy_vjp->local_energy_term_mask);
       first = false;
     }
     else
@@ -139,6 +284,11 @@ void PreparedEnergyGradientProducer::accumulate(
           {batch.local_energies.data(), batch.local_energies.size()},
           batch.local_energy_term_mask, partial, DerivativeAdjoint::TRANSPOSE,
           clipping);
+      if (batch.additive_local_energy_vjp)
+        partial.addLocalEnergyVJP(
+            {batch.additive_local_energy_vjp->weighted_vjp.data(),
+             batch.additive_local_energy_vjp->weighted_vjp.size()},
+            batch.additive_local_energy_vjp->local_energy_term_mask);
       accumulator.merge(partial);
     }
   }
@@ -158,6 +308,10 @@ PreparedEnergyGradientProducer::storageDiagnostics() const noexcept
     diagnostics.sample_scalar_bytes +=
         batch.weights.capacity() * sizeof(DerivativeReal) +
         batch.local_energies.capacity() * sizeof(DerivativeValue);
+    if (batch.additive_local_energy_vjp)
+      diagnostics.sample_scalar_bytes +=
+          batch.additive_local_energy_vjp->weighted_vjp.capacity() *
+          sizeof(DerivativeValue);
   }
   diagnostics.retained_numeric_bytes = diagnostics.derivative_owner_bytes +
       diagnostics.sample_scalar_bytes;
