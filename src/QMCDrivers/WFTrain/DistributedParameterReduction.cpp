@@ -32,6 +32,7 @@ namespace
 constexpr std::uint64_t protocol_version = 1;
 constexpr std::uint64_t energy_channel_contract = UINT64_C(0x454752414433); // "EGRAD3"
 constexpr std::uint64_t orbital_channel_contract = UINT64_C(0x4f52424752414431); // "ORBGRAD1"
+constexpr std::uint64_t overlap_channel_contract = UINT64_C(0x4f564c5047524431); // "OVLPGRD1"
 constexpr std::uint64_t parameter_vector_contract = UINT64_C(0x5056454353554d31); // "PVECSUM1"
 constexpr std::uint64_t weighted_sample_contract = UINT64_C(0x57534d4f4d454e31); // "WSMOMEN1"
 constexpr std::uint64_t accelerator_plan_contract = UINT64_C(0x414343504c414e31); // "ACCPLAN1"
@@ -383,6 +384,55 @@ void DistributedParameterReduction::preflightOrbital(
   const std::size_t mismatch_rank = firstMismatchingRank(records);
   if (mismatch_rank != records.size())
     throwMetadataMismatch("orbital preflight", mismatch_rank);
+}
+
+void DistributedParameterReduction::preflightDeterminantOverlap(
+    const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot* parameters,
+    std::uint64_t target_fingerprint,
+    std::uint64_t objective_fingerprint,
+    std::exception_ptr local_failure) const
+{
+  ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
+                                         : ConsensusReason::NONE;
+  const std::size_t maximum_mpi_chunk =
+      static_cast<std::size_t>(std::numeric_limits<int>::max());
+  if (reason == ConsensusReason::NONE &&
+      (policy_.maximum_chunk_size == 0 || policy_.maximum_chunk_size > maximum_mpi_chunk))
+    reason = ConsensusReason::INVALID_POLICY;
+  if (reason == ConsensusReason::NONE && !parameters)
+    reason = ConsensusReason::LOCAL_EXCEPTION;
+  if (reason == ConsensusReason::NONE &&
+      (parameters->schema_fingerprint != schema.fingerprint() ||
+       parameters->values.size() != schema.parameterCount()))
+    reason = ConsensusReason::LOCAL_EXCEPTION;
+  if (reason == ConsensusReason::NONE &&
+      !std::all_of(parameters->values.begin(), parameters->values.end(),
+                   isFiniteTrainingReal))
+    reason = ConsensusReason::NONFINITE_CONTRIBUTION;
+
+  const std::array<std::uint64_t, 12> local_record{
+      static_cast<std::uint64_t>(reason),
+      protocol_version,
+      hashString(schema.providerId()),
+      hashString(schema.fingerprint()),
+      parameters ? parameters->version : 0,
+      schema.parameterCount(),
+      target_fingerprint,
+      objective_fingerprint,
+      overlap_channel_contract,
+      policy_.maximum_chunk_size,
+      participantCount(),
+      parameters ? hashSnapshot(*parameters) : 0};
+  const auto records = gatherRecords(communicator_, local_record);
+  const std::size_t failed_rank = firstFailedRank(records);
+  if (failed_rank != records.size())
+    throwConsensusFailure("determinant-overlap preflight", failed_rank,
+                          static_cast<ConsensusReason>(records[failed_rank][0]),
+                          failed_rank == 0 ? local_failure : std::exception_ptr{}, records.size());
+  const std::size_t mismatch_rank = firstMismatchingRank(records);
+  if (mismatch_rank != records.size())
+    throwMetadataMismatch("determinant-overlap preflight", mismatch_rank);
 }
 
 void DistributedParameterReduction::reduce(

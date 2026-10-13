@@ -13,12 +13,14 @@
 #include "Message/CommOperators.h"
 #include "Message/UniformCommunicateError.h"
 #include "QMCDrivers/WalkerLogManager.h"
+#include "QMCDrivers/WFTrain/DeterminantOverlapObjective.h"
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
@@ -429,7 +431,8 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
                                           const QMCDriverInput& qmc,
                                           const VMCDriverInput& vmc,
                                           const wftrain::StructuredParameterSchema& schema,
-                                          std::size_t steps_per_block)
+                                          std::size_t steps_per_block,
+                                          std::uint64_t resolved_overlap_fingerprint)
 {
   std::uint64_t hash = UINT64_C(1469598103934665603);
   extendStageFingerprint(hash, schema.fingerprint());
@@ -463,6 +466,22 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, training.getKrylovMinimumRelativeImprovement());
   extendStageFingerprint(hash, training.getKrylovCurvatureTolerance());
   extendStageFingerprint(hash, training.getKrylovImaginaryTolerance());
+  if (training.getObjective() == WFTrainDriverInput::Objective::DETERMINANT_OVERLAP)
+  {
+    extendStageFingerprint(hash, training.getTeacherWaveFunction());
+    extendStageFingerprint(hash, training.getTargetProvenance());
+    const auto overlap_target =
+        static_cast<std::underlying_type_t<WFTrainDriverInput::OverlapTarget>>(
+            training.getOverlapTarget());
+    const auto overlap_weighting =
+        static_cast<std::underlying_type_t<WFTrainDriverInput::OverlapWeighting>>(
+            training.getOverlapWeighting());
+    extendStageFingerprint(hash, overlap_target);
+    extendStageFingerprint(hash, overlap_weighting);
+    extendStageFingerprint(hash, training.getMinimumFidelity());
+    extendStageFingerprint(hash, training.getMinimumEffectiveSamples());
+    extendStageFingerprint(hash, resolved_overlap_fingerprint);
+  }
   extendStageFingerprint(hash, qmc.get_tau());
   extendStageFingerprint(hash, qmc.get_spin_mass());
   extendStageFingerprint(hash, qmc.get_sub_steps());
@@ -491,6 +510,7 @@ WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
                                VMCDriverInput&& vmc_input,
                                WFTrainDriverInput&& training_input,
                                WalkerConfigurations& walker_configurations,
+                               TrialWaveFunction& student_prototype,
                                MCPopulation&& population,
                                const RefVector<RandomBase<FullPrecRealType>>& random_generators,
                                Communicate* communicator)
@@ -504,8 +524,11 @@ WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
                    communicator,
                    "WFTrainBatched"),
       vmcdriver_input_(std::move(vmc_input)),
-      training_input_(std::move(training_input))
+      training_input_(std::move(training_input)),
+      student_prototype_(student_prototype)
 {}
+
+WFTrainBatched::~WFTrainBatched() = default;
 
 void WFTrainBatched::process(xmlNodePtr node)
 {
@@ -519,9 +542,10 @@ void WFTrainBatched::process(xmlNodePtr node)
 
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
-    validateHamiltonianForTraining();
+    if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY)
+      validateHamiltonianForTraining();
 
-    const auto providers = population_.get_golden_twf().extractStructuredParameterProviders();
+    const auto providers = student_prototype_.extractStructuredParameterProviders();
     const std::string& requested_provider = training_input_.getProviderID();
     if (requested_provider.empty())
     {
@@ -554,8 +578,9 @@ void WFTrainBatched::process(xmlNodePtr node)
                                               qmcdriver_input_.get_max_blocks());
     initPopulationAndCrowds(walker_counts);
     createStepContexts(crowds_.size());
+    initializeDeterminantOverlap();
   }
-  catch (const UniformCommunicateError& error)
+  catch (const std::exception& error)
   {
     myComm->barrier_and_abort(error.what());
   }
@@ -616,10 +641,20 @@ void WFTrainBatched::run()
 
   wftrain::TrainingIterationState training_state{
       0, initial_parameters.version, selected_provider_->parameterSchema().fingerprint()};
+  const bool determinant_overlap =
+      training_input_.getObjective() ==
+      WFTrainDriverInput::Objective::DETERMINANT_OVERLAP;
+  if (determinant_overlap && !determinant_overlap_objective_)
+    throw UniformCommunicateError(
+        "WFTrainBatched: determinant-overlap state was not initialized by process()");
+  const std::uint64_t overlap_fingerprint = determinant_overlap
+      ? determinant_overlap_objective_->configurationFingerprint()
+      : 0;
   wftrain::TrainingStageState stage_state{
-      "all_electron_energy", 0, 0,
+      determinant_overlap ? "determinant_overlap" : "all_electron_energy", 0, 0,
       stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
-                                    selected_provider_->parameterSchema(), steps_per_block_)};
+                                    selected_provider_->parameterSchema(), steps_per_block_,
+                                    overlap_fingerprint)};
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;
@@ -700,7 +735,115 @@ void WFTrainBatched::run()
     std::optional<std::size_t> krylov_iterations;
     std::optional<std::size_t> krylov_operator_applications;
     std::optional<wftrain::DerivativeReal> applied_scale;
+    std::optional<wftrain::DeterminantOverlapObjectiveResult> overlap_diagnostics;
     {
+      if (determinant_overlap)
+      {
+        const auto& schema = selected_provider_->parameterSchema();
+        std::optional<wftrain::StructuredParameterSnapshot> parameters;
+        std::vector<std::unique_ptr<psiformer::DeterminantChannelBatch>> batch_owners;
+        std::vector<wftrain::DeterminantOverlapBatchView> overlap_batches;
+        std::exception_ptr preparation_failure;
+        try
+        {
+          parameters.emplace(selected_provider_->snapshotParameters());
+          if (parameters->schema_fingerprint != schema.fingerprint() ||
+              parameters->values.size() != schema.parameterCount())
+            throw std::logic_error(
+                "WFTrainBatched: structured provider returned an inconsistent snapshot");
+          if (training_state.completed_iterations != 0 &&
+              (training_state.schema_fingerprint != schema.fingerprint() ||
+               training_state.parameter_version != parameters->version))
+            throw std::logic_error(
+                "WFTrainBatched: training state does not match the parameter provider");
+          if (training_state.completed_iterations ==
+              std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("WFTrainBatched: training iteration count overflow");
+          if (overlap_student_twfs_.size() != crowds_.size())
+            throw std::logic_error(
+                "WFTrainBatched: student-clone crowd topology changed after initialization");
+
+          batch_owners.reserve(crowds_.size());
+          overlap_batches.reserve(crowds_.size());
+          for (std::size_t crowd_index = 0; crowd_index < crowds_.size(); ++crowd_index)
+          {
+            Crowd& crowd = *crowds_[crowd_index];
+            auto& students = overlap_student_twfs_[crowd_index];
+            const auto& teachers = crowd.get_walker_twfs();
+            const auto& electrons = crowd.get_walker_elecs();
+            if (students.size() != teachers.size() || students.size() != electrons.size())
+              throw std::logic_error(
+                  "WFTrainBatched: student and teacher crowd topology differs");
+            if (students.empty())
+              continue;
+
+            RefVectorWithLeader<TrialWaveFunction> student_batch(*students.front());
+            RefVectorWithLeader<ParticleSet> particle_batch(electrons[0]);
+            for (std::size_t sample = 0; sample < students.size(); ++sample)
+            {
+              student_batch.push_back(*students[sample]);
+              particle_batch.push_back(electrons[sample]);
+            }
+            batch_owners.push_back(
+                TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+                    student_batch, particle_batch, selected_provider_id_));
+
+            wftrain::DeterminantOverlapBatchView view;
+            view.student = batch_owners.back().get();
+            view.teachers.reserve(students.size());
+            view.electrons.reserve(students.size());
+            for (std::size_t sample = 0; sample < students.size(); ++sample)
+            {
+              view.teachers.emplace_back(teachers[sample]);
+              view.electrons.emplace_back(electrons[sample]);
+            }
+            overlap_batches.push_back(std::move(view));
+          }
+        }
+        catch (...)
+        {
+          preparation_failure = std::current_exception();
+        }
+
+        reduction.preflightDeterminantOverlap(
+            schema, parameters ? &*parameters : nullptr,
+            determinant_overlap_objective_->targetDescriptor().fingerprint(),
+            determinant_overlap_objective_->configurationFingerprint(),
+            preparation_failure);
+
+        wftrain::DeterminantOverlapObjectiveResult objective =
+            determinant_overlap_objective_->evaluate(*myComm, overlap_batches);
+        if (objective.parameter_version != parameters->version ||
+            objective.parameter_gradient.size() != schema.parameterCount() ||
+            objective.target_fingerprint !=
+                determinant_overlap_objective_->targetDescriptor().fingerprint() ||
+            objective.target_provenance != training_input_.getTargetProvenance())
+          throw UniformCommunicateError(
+              "WFTrainBatched: determinant-overlap objective returned inconsistent identity");
+        if (objective.retained_numeric_bytes >
+            std::numeric_limits<std::size_t>::max() - adam_optimizer->retainedBytes())
+          throw std::overflow_error(
+              "WFTrainBatched: determinant-overlap retained-byte count overflowed");
+        retained_numeric_bytes =
+            objective.retained_numeric_bytes + adam_optimizer->retainedBytes();
+        enforceMemoryBudget(*myComm, retained_numeric_bytes,
+                            training_input_.getMaximumRetainedBytes());
+
+        const wftrain::ParameterGradientView gradient{
+            schema.fingerprint(), parameters->version, wftrain::ReductionDomain::GLOBAL,
+            {objective.parameter_gradient.data(), objective.parameter_gradient.size()}};
+        const std::size_t committed_version = wftrain::completeParameterUpdate(
+            *selected_provider_, *parameters, gradient, *adam_optimizer, reduction);
+        ++training_state.completed_iterations;
+        training_state.parameter_version = committed_version;
+        training_state.schema_fingerprint = schema.fingerprint();
+        cache_observer.parametersPublished(committed_version);
+        iteration_result.completed_iteration = training_state.completed_iterations;
+        iteration_result.parameter_version = committed_version;
+        overlap_diagnostics.emplace(std::move(objective));
+      }
+      else
+      {
       std::vector<wftrain::PreparedEnergyGradientBatch> batches;
       std::exception_ptr preparation_failure;
       try
@@ -907,6 +1050,7 @@ void WFTrainBatched::run()
           }
         }
       }
+      }
     }
 
     // All derivative owners for the old version are gone before cache replacement.
@@ -920,15 +1064,43 @@ void WFTrainBatched::run()
 
     if (myComm->rank() == 0)
     {
-      const auto& objective = iteration_result.objective;
       app_log() << std::setprecision(12)
                 << "WFTrain iteration " << iteration_result.completed_iteration
-                << " version " << iteration_result.parameter_version
-                << " samples " << objective.sample_count
-                << " mean_energy " << std::real(objective.mean_energy)
-                << " variance " << objective.energy_variance
-                << " gradient_norm " << gradientNorm(objective.gradient)
-                << " retained_bytes " << retained_numeric_bytes
+                << " version " << iteration_result.parameter_version;
+      if (overlap_diagnostics)
+      {
+        double minimum_fidelity = 1.0;
+        double minimum_target_effective_samples =
+            std::numeric_limits<double>::infinity();
+        double minimum_student_effective_samples =
+            std::numeric_limits<double>::infinity();
+        for (const auto& channel : overlap_diagnostics->channels)
+        {
+          minimum_fidelity = std::min(minimum_fidelity, channel.fidelity);
+          minimum_target_effective_samples = std::min(
+              minimum_target_effective_samples, channel.target_effective_samples);
+          minimum_student_effective_samples = std::min(
+              minimum_student_effective_samples, channel.student_effective_samples);
+        }
+        app_log() << " samples " << overlap_diagnostics->sample_count
+                  << " overlap_loss " << overlap_diagnostics->loss
+                  << " minimum_fidelity " << minimum_fidelity
+                  << " minimum_target_effective_samples "
+                  << minimum_target_effective_samples
+                  << " minimum_student_effective_samples "
+                  << minimum_student_effective_samples
+                  << " gradient_norm "
+                  << gradientNorm(overlap_diagnostics->parameter_gradient);
+      }
+      else
+      {
+        const auto& objective = iteration_result.objective;
+        app_log() << " samples " << objective.sample_count
+                  << " mean_energy " << std::real(objective.mean_energy)
+                  << " variance " << objective.energy_variance
+                  << " gradient_norm " << gradientNorm(objective.gradient);
+      }
+      app_log() << " retained_bytes " << retained_numeric_bytes
                 << " optimizer " << optimizerName(training_input_.getOptimizer());
       if (krylov_iterations)
         app_log() << " krylov_iterations " << *krylov_iterations
@@ -1000,6 +1172,56 @@ void WFTrainBatched::createStepContexts(int num_crowds)
     step_contexts_[crowd] = std::make_unique<ContextForSteps>(rngs_[crowd]);
 }
 
+void WFTrainBatched::initializeDeterminantOverlap()
+{
+  if (training_input_.getObjective() !=
+      WFTrainDriverInput::Objective::DETERMINANT_OVERLAP)
+    return;
+  if (&student_prototype_ == &population_.get_golden_twf())
+    throw UniformCommunicateError(
+        "WFTrainBatched: determinant overlap requires a distinct frozen teacher wavefunction");
+
+  // Discover M through the generic TrialWaveFunction/component seam.  This works
+  // identically on a rank with no live walkers and avoids a concrete PsiFormer cast.
+  ParticleSet& golden_electrons = population_.get_golden_electrons();
+  auto probe_student = student_prototype_.makeClone(golden_electrons);
+  RefVectorWithLeader<TrialWaveFunction> probe_wavefunctions(*probe_student);
+  probe_wavefunctions.push_back(*probe_student);
+  RefVectorWithLeader<ParticleSet> probe_particles(golden_electrons);
+  probe_particles.push_back(golden_electrons);
+  auto probe_batch = TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+      probe_wavefunctions, probe_particles, selected_provider_id_);
+  const std::size_t channel_count = probe_batch->channelCount();
+
+  const auto target_mode =
+      training_input_.getOverlapTarget() ==
+          WFTrainDriverInput::OverlapTarget::GENERAL_FROZEN_TEACHER
+      ? psiformer::DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER
+      : psiformer::DeterminantOverlapTargetMode::TOP_COEFFICIENT_MULTIDETERMINANT;
+  auto target = psiformer::DeterminantOverlapTargetEvaluator::fromFrozenTeacher(
+      population_.get_golden_twf(), target_mode,
+      training_input_.getTargetProvenance(), channel_count);
+  std::vector<double> weights =
+      training_input_.getOverlapWeighting() == WFTrainDriverInput::OverlapWeighting::EQUAL
+      ? wftrain::makeEqualOverlapWeights(channel_count)
+      : wftrain::makeCoefficientSquaredOverlapWeights(target.descriptor());
+  psiformer::DeterminantOverlapPolicy policy;
+  policy.minimum_fidelity = training_input_.getMinimumFidelity();
+  policy.minimum_effective_samples = training_input_.getMinimumEffectiveSamples();
+  determinant_overlap_objective_ = std::make_unique<wftrain::DeterminantOverlapObjective>(
+      std::move(target), std::move(weights), policy);
+
+  overlap_student_twfs_.resize(crowds_.size());
+  for (std::size_t crowd_index = 0; crowd_index < crowds_.size(); ++crowd_index)
+  {
+    const auto& electrons = crowds_[crowd_index]->get_walker_elecs();
+    auto& students = overlap_student_twfs_[crowd_index];
+    students.reserve(electrons.size());
+    for (ParticleSet& particle_set : electrons)
+      students.push_back(student_prototype_.makeClone(particle_set));
+  }
+}
+
 void WFTrainBatched::validateHamiltonianForTraining()
 {
   QMCHamiltonian& hamiltonian = population_.get_golden_hamiltonian();
@@ -1027,6 +1249,20 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
 {
   // Publication modifies shared model state. Fence ranks before any clone evaluates it.
   myComm->barrier();
+
+  // Frozen-teacher sampling caches do not depend on student parameters.  The
+  // next determinant-channel owner reads the shared student model version while
+  // copying the current teacher configurations, so no ParticleSet G/L state is
+  // overwritten by evaluating a student TrialWaveFunction here.
+  if (training_input_.getObjective() ==
+      WFTrainDriverInput::Objective::DETERMINANT_OVERLAP)
+  {
+    if (myComm->rank() == 0)
+      app_log() << "WFTrain published determinant-overlap student version "
+                << parameter_version << " across " << crowds_.size()
+                << " crowd(s)" << std::endl;
+    return;
+  }
 
   std::exception_ptr refresh_failure;
   try

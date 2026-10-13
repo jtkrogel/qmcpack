@@ -59,6 +59,17 @@ struct DeterminantOverlapChannelDiagnostics
   double student_effective_samples = 0.0;
 };
 
+/** Serializable first-pass moments used by stable rank-wise reduction. */
+struct DeterminantOverlapMomentSnapshot
+{
+  std::vector<RealSignedLogAmplitude> cross;
+  std::vector<RealSignedLogAmplitude> target_square;
+  std::vector<RealSignedLogAmplitude> student_square;
+  std::vector<RealSignedLogAmplitude> target_absolute;
+  std::vector<RealSignedLogAmplitude> student_absolute;
+  std::size_t samples = 0;
+};
+
 namespace overlap_detail
 {
 
@@ -267,6 +278,64 @@ public:
       student_absolute_[channel].merge(other.student_absolute_[channel]);
     }
     samples_ += other.samples_;
+  }
+
+  /** Copy the O(M) collecting state for a stable external distributed reduction. */
+  DeterminantOverlapMomentSnapshot snapshotMoments() const
+  {
+    if (finalized_)
+      throw std::logic_error("PsiFormer overlap cannot snapshot finalized moments");
+    DeterminantOverlapMomentSnapshot result;
+    result.cross.resize(weights_.size());
+    result.target_square.resize(weights_.size());
+    result.student_square.resize(weights_.size());
+    result.target_absolute.resize(weights_.size());
+    result.student_absolute.resize(weights_.size());
+    result.samples = samples_;
+    for (std::size_t channel = 0; channel < weights_.size(); ++channel)
+    {
+      result.cross[channel]            = cross_[channel].value();
+      result.target_square[channel]    = target_square_[channel].value();
+      result.student_square[channel]   = student_square_[channel].value();
+      result.target_absolute[channel]  = target_absolute_[channel].value();
+      result.student_absolute[channel] = student_absolute_[channel].value();
+    }
+    return result;
+  }
+
+  /** Replace collecting state with a compatible globally reduced O(M) snapshot. */
+  void replaceMoments(const DeterminantOverlapMomentSnapshot& snapshot)
+  {
+    if (finalized_)
+      throw std::logic_error("PsiFormer overlap cannot replace finalized moments");
+    const auto require_extent = [this](const auto& values) {
+      return values.size() == weights_.size();
+    };
+    if (!require_extent(snapshot.cross) || !require_extent(snapshot.target_square) ||
+        !require_extent(snapshot.student_square) ||
+        !require_extent(snapshot.target_absolute) ||
+        !require_extent(snapshot.student_absolute))
+      throw std::invalid_argument("PsiFormer overlap moment snapshot has the wrong channel count");
+
+    reset();
+    for (std::size_t channel = 0; channel < weights_.size(); ++channel)
+    {
+      overlap_detail::validateAmplitude(snapshot.cross[channel], "cross moment");
+      overlap_detail::validateAmplitude(snapshot.target_square[channel], "target-square moment");
+      overlap_detail::validateAmplitude(snapshot.student_square[channel], "student-square moment");
+      overlap_detail::validateAmplitude(snapshot.target_absolute[channel], "target-absolute moment");
+      overlap_detail::validateAmplitude(snapshot.student_absolute[channel], "student-absolute moment");
+      cross_[channel].add(snapshot.cross[channel].phase, snapshot.cross[channel].log_abs);
+      target_square_[channel].add(snapshot.target_square[channel].phase,
+                                  snapshot.target_square[channel].log_abs);
+      student_square_[channel].add(snapshot.student_square[channel].phase,
+                                   snapshot.student_square[channel].log_abs);
+      target_absolute_[channel].add(snapshot.target_absolute[channel].phase,
+                                    snapshot.target_absolute[channel].log_abs);
+      student_absolute_[channel].add(snapshot.student_absolute[channel].phase,
+                                     snapshot.student_absolute[channel].log_abs);
+    }
+    samples_ = snapshot.samples;
   }
 
   /** Finalize first-pass statistics and return the weighted negative log fidelity. */

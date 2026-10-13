@@ -200,6 +200,9 @@ public:
   /// Return selected source CI ordinals, empty for repeated general targets.
   const std::vector<std::size_t>& sourceOrdinals() const noexcept { return source_ordinals_; }
 
+  /// Return the selected raw CI coefficients, empty for repeated general targets.
+  const std::vector<double>& selectedCoefficients() const noexcept { return selected_coefficients_; }
+
   /// Return the number of PsiFormer determinant channels.
   std::size_t channelCount() const noexcept { return channel_count_; }
 
@@ -217,6 +220,7 @@ private:
   std::string source_identity_;
   std::size_t channel_count_;
   std::vector<std::size_t> source_ordinals_;
+  std::vector<double> selected_coefficients_;
   std::uint64_t fingerprint_;
 };
 
@@ -229,6 +233,13 @@ private:
 class DeterminantOverlapTargetEvaluator
 {
 public:
+  /** Freeze a general or top-coefficient target directly from a named teacher. */
+  static DeterminantOverlapTargetEvaluator fromFrozenTeacher(
+      const TrialWaveFunction& teacher,
+      DeterminantOverlapTargetMode mode,
+      std::string source_identity,
+      std::size_t channel_count);
+
   /// Construct an allocation-stable evaluator for one immutable descriptor.
   explicit DeterminantOverlapTargetEvaluator(DeterminantOverlapTargetDescriptor descriptor);
 

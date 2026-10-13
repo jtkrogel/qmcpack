@@ -190,7 +190,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
 
     auto makeEstimatorManager =
         [&](const std::optional<EstimatorManagerInput>& global_emi,
-            const std::optional<EstimatorManagerInput>& driver_emi) -> UPtr<EstimatorManagerNew> {
+            const std::optional<EstimatorManagerInput>& driver_emi,
+            TrialWaveFunction& estimator_wavefunction) -> UPtr<EstimatorManagerNew> {
       // This is done so that the application level input structures reflect the actual input to the code.
       // While the actual simulation objects still take singular input structures at construction.
       auto makeEstimatorManagerInput = [](auto& global_emi, auto& local_emi) -> EstimatorManagerInput {
@@ -205,8 +206,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       };
 
       auto estimator_manager = std::make_unique<EstimatorManagerNew>(primaryH, comm);
-      estimator_manager->constructEstimators(makeEstimatorManagerInput(global_emi, driver_emi), qmc_system, primaryPsi,
-                                             primaryH, particle_pool.getPool());
+      estimator_manager->constructEstimators(makeEstimatorManagerInput(global_emi, driver_emi), qmc_system,
+                                             estimator_wavefunction, primaryH, particle_pool.getPool());
       return estimator_manager;
     };
 
@@ -242,7 +243,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       // known at this level PSPool down.
       new_driver =
           std::make_unique<VMCBatched>(project_data_, std::move(qmcdriver_input),
-                                       makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input()),
+                                       makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input(),
+                                                            primaryPsi),
                                        std::move(vmcdriver_input), qmc_system,
                                        MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
                                        RandomNumberControl::getChildrenRefs(), qmc_system.getSampleStack(), comm);
@@ -271,12 +273,21 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       }
 
       const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
-      UPtr<EstimatorManagerNew> estimator_manager =
-          makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input());
+      TrialWaveFunction& sampling_wavefunction =
+          training_input.getObjective() == WFTrainDriverInput::Objective::DETERMINANT_OVERLAP
+          ? getPsi(training_input.getTeacherWaveFunction())
+          : primaryPsi;
+      if (training_input.getObjective() ==
+              WFTrainDriverInput::Objective::DETERMINANT_OVERLAP &&
+          &sampling_wavefunction == &primaryPsi)
+        throw UniformCommunicateError(
+            "WFTrain determinant_overlap requires teacher to name a wavefunction distinct from the student");
+      UPtr<EstimatorManagerNew> estimator_manager = makeEstimatorManager(
+          emi, qmcdriver_input.get_estimator_manager_input(), sampling_wavefunction);
       new_driver = std::make_unique<WFTrainBatched>(
           project_data_, std::move(qmcdriver_input), std::move(estimator_manager), std::move(vmcdriver_input),
-          std::move(training_input), qmc_system,
-          MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
+          std::move(training_input), qmc_system, primaryPsi,
+          MCPopulation(comm->size(), comm->rank(), qmc_system, sampling_wavefunction, primaryH),
           RandomNumberControl::getChildrenRefs(), comm);
       new_driver->setUpdateMode(is_pbyp_move);
     }
@@ -314,7 +325,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
 
       new_driver =
           std::make_unique<DMCBatched>(project_data_, std::move(qmcdriver_input),
-                                       makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input()),
+                                       makeEstimatorManager(emi, qmcdriver_input.get_estimator_manager_input(),
+                                                            primaryPsi),
                                        std::move(dmcdriver_input), qmc_system,
                                        MCPopulation(comm->size(), comm->rank(), qmc_system, primaryPsi, primaryH),
                                        RandomNumberControl::getChildrenRefs(), comm);

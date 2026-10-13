@@ -56,6 +56,7 @@ set(QMCDRIVERS
     WFTrain/DistributedParameterReduction.cpp
     WFTrain/OrbitalPretrainingAccumulator.cpp
     WFTrain/OrbitalPretraining.cpp
+    WFTrain/DeterminantOverlapObjective.cpp
     WFTrain/ParameterUpdateTransaction.cpp
     WFTrain/HighParameterTraining.cpp
     WFTrain/PreparedEnergyGradientProducer.cpp

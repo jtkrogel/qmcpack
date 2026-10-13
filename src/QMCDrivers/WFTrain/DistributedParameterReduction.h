@@ -97,6 +97,13 @@ public:
                         std::uint64_t loss_fingerprint,
                         std::exception_ptr local_failure = {}) const;
 
+  /// Agree on student schema/snapshot and immutable determinant-overlap semantics.
+  void preflightDeterminantOverlap(const StructuredParameterSchema& schema,
+                                   const StructuredParameterSnapshot* parameters,
+                                   std::uint64_t target_fingerprint,
+                                   std::uint64_t objective_fingerprint,
+                                   std::exception_ptr local_failure = {}) const;
+
   /// Reduce one complete orbital objective, allowing zero-sample local ranks.
   void reduce(OrbitalPretrainingAccumulator& accumulator,
               std::exception_ptr local_failure = {}) const;

@@ -688,7 +688,12 @@ TEST_CASE("PsiFormer determinant overlap is two-pass stable and differentiable",
   auto accumulator = makeAccumulator(parameter, 0, teachers.size());
   const std::size_t fingerprint = accumulator.storageFingerprint();
   const std::size_t retained_bytes = accumulator.retainedScalarBytes();
+  const auto moment_snapshot = accumulator.snapshotMoments();
+  DeterminantOverlapAccumulator restored(
+      {objective_weights.begin(), objective_weights.end()});
+  restored.replaceMoments(moment_snapshot);
   const double loss = accumulator.finalize();
+  CHECK(restored.finalize() == Catch::Approx(loss).epsilon(2.0e-14));
   CHECK(loss > 0.0);
   CHECK(accumulator.sampleCount() == teachers.size());
   CHECK(accumulator.diagnostics()[0].fidelity <= 1.0);

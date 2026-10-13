@@ -369,17 +369,18 @@ DeterminantOverlapTargetDescriptor::DeterminantOverlapTargetDescriptor(
       source_identity_(std::move(source_identity)),
       channel_count_(channel_count),
       source_ordinals_(std::move(source_ordinals)),
+      selected_coefficients_(std::move(selected_coefficients)),
       fingerprint_(1469598103934665603ULL)
 {
   if (source_identity_.empty() || channel_count_ == 0)
     throw std::invalid_argument("PsiFormer overlap target requires a source identity and channels");
   if (mode_ == DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER)
   {
-    if (!source_ordinals_.empty() || !selected_coefficients.empty())
+    if (!source_ordinals_.empty() || !selected_coefficients_.empty())
       throw std::invalid_argument("General PsiFormer overlap target cannot select CI terms");
   }
   else if (source_ordinals_.size() != channel_count_ ||
-           selected_coefficients.size() != channel_count_)
+           selected_coefficients_.size() != channel_count_)
     throw std::invalid_argument("Paired PsiFormer overlap target has the wrong CI term count");
 
   hashUnsigned(fingerprint_, 1); // overlap-target serialization convention
@@ -388,11 +389,11 @@ DeterminantOverlapTargetDescriptor::DeterminantOverlapTargetDescriptor(
   hashUnsigned(fingerprint_, channel_count_);
   for (std::size_t channel = 0; channel < source_ordinals_.size(); ++channel)
   {
-    if (!isFiniteDouble(selected_coefficients[channel]) || selected_coefficients[channel] == 0.0)
+    if (!isFiniteDouble(selected_coefficients_[channel]) || selected_coefficients_[channel] == 0.0)
       throw std::invalid_argument("Paired PsiFormer overlap target coefficient must be finite and nonzero");
     hashUnsigned(fingerprint_, source_ordinals_[channel]);
     std::uint64_t coefficient_bits;
-    std::memcpy(&coefficient_bits, &selected_coefficients[channel], sizeof(coefficient_bits));
+    std::memcpy(&coefficient_bits, &selected_coefficients_[channel], sizeof(coefficient_bits));
     hashUnsigned(fingerprint_, coefficient_bits);
   }
 }
@@ -451,6 +452,40 @@ DeterminantOverlapTargetEvaluator::DeterminantOverlapTargetEvaluator(
 #if defined(QMC_COMPLEX)
   throw std::invalid_argument("PsiFormer determinant-overlap targets are real-only");
 #endif
+}
+
+DeterminantOverlapTargetEvaluator
+DeterminantOverlapTargetEvaluator::fromFrozenTeacher(
+    const TrialWaveFunction& teacher,
+    DeterminantOverlapTargetMode mode,
+    std::string source_identity,
+    std::size_t channel_count)
+{
+  if (mode == DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER)
+    return DeterminantOverlapTargetEvaluator(
+        DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher(
+            std::move(source_identity), channel_count));
+
+  const MultiSlaterDetTableMethod* multideterminant = nullptr;
+  std::size_t fermionic_components = 0;
+  for (const auto& component : teacher.getOrbitals())
+  {
+    fermionic_components += component->isFermionic() ? 1 : 0;
+    if (const auto* candidate =
+            dynamic_cast<const MultiSlaterDetTableMethod*>(component.get()))
+    {
+      if (multideterminant)
+        throw std::invalid_argument(
+            "Paired PsiFormer overlap teacher has multiple multideterminant components");
+      multideterminant = candidate;
+    }
+  }
+  if (!multideterminant || fermionic_components != 1)
+    throw std::invalid_argument(
+        "Paired PsiFormer overlap teacher requires one explicit multideterminant fermion component");
+  return DeterminantOverlapTargetEvaluator(
+      DeterminantOverlapTargetDescriptor::makeTopCoefficientMultideterminant(
+          *multideterminant, std::move(source_identity), channel_count));
 }
 
 void DeterminantOverlapTargetEvaluator::evaluate(TrialWaveFunction& frozen_teacher,

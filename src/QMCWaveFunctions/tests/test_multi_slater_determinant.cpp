@@ -133,6 +133,10 @@ void test_LiH_msd(const std::string& spo_xml_string,
           msd, "LiH-test-MSD", 2);
   REQUIRE(overlap_descriptor.sourceOrdinals().size() == 2);
   CHECK(overlap_descriptor.sourceOrdinals()[0] == 0);
+  REQUIRE(overlap_descriptor.selectedCoefficients().size() == 2);
+  for (std::size_t channel = 0; channel < 2; ++channel)
+    CHECK(overlap_descriptor.selectedCoefficients()[channel] ==
+          Catch::Approx(msd.get_C()[overlap_descriptor.sourceOrdinals()[channel]]));
   psiformer::DeterminantOverlapTargetEvaluator overlap_targets(overlap_descriptor);
   psiformer::RealSignedLogAmplitude teacher;
   std::array<psiformer::RealSignedLogAmplitude, 2> selected_targets;
