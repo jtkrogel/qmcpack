@@ -13,6 +13,7 @@
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include "Message/CommOperators.h"
+#include "Message/UniformCommunicateError.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,15 @@
 
 namespace qmcplusplus::wftrain
 {
+void DistributedParameterReduction::agreeCandidateAcceptance(bool accepted) const
+{
+  if (!communicator_) return;
+  int votes = accepted ? 1 : 0;
+  communicator_->allreduce(votes);
+  if (votes != 0 && votes != communicator_->size())
+    throw UniformCommunicateError("Training ranks disagree on candidate acceptance");
+}
+
 namespace
 {
 

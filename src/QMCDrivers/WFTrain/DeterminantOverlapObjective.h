@@ -50,6 +50,8 @@ struct DeterminantOverlapObjectiveResult
   std::vector<psiformer::DeterminantOverlapChannelDiagnostics> channels;
   std::vector<double> parameter_gradient;
   std::size_t retained_numeric_bytes = 0;
+  /// Delta-method sample contributions for paired candidate uncertainty estimates.
+  std::vector<double> sample_loss_influences;
 };
 
 /** Evaluate a normalized-overlap loss and gradient without B-by-M or M-by-P storage. */
@@ -68,7 +70,8 @@ public:
   /// Execute two deterministic passes over unchanged native walker configurations.
   DeterminantOverlapObjectiveResult evaluate(
       Communicate& communicator,
-      const std::vector<DeterminantOverlapBatchView>& batches) const;
+      const std::vector<DeterminantOverlapBatchView>& batches,
+      bool with_gradient = true) const;
 
   /// Return the immutable target mapping and provenance identity.
   const psiformer::DeterminantOverlapTargetDescriptor& targetDescriptor() const noexcept

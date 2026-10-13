@@ -20,6 +20,14 @@ namespace qmcplusplus
 class WFTrainDriverInput
 {
 public:
+  /// Select fixed scaling, correlated backtracking, or sampled endpoint expansion.
+  enum class LineSearch
+  {
+    OFF,
+    REFERENCE,
+    ENDPOINTS
+  };
+
   enum class Objective
   {
     ENERGY,
@@ -58,6 +66,14 @@ public:
   void readXML(xmlNodePtr qmc_node);
 
   Objective getObjective() const noexcept { return objective_; }
+  LineSearch getLineSearch() const noexcept { return line_search_; }
+  double getUpdateScale() const noexcept { return update_scale_; }
+  double getWeightDecay() const noexcept { return weight_decay_; }
+  double getLineSearchMinimumESSFraction() const noexcept { return line_search_minimum_ess_fraction_; }
+  double getLineSearchMaximumWeight() const noexcept { return line_search_maximum_weight_; }
+  double getLineSearchConfidence() const noexcept { return line_search_confidence_; }
+  std::size_t getLineSearchWarmupSteps() const noexcept { return line_search_warmup_steps_; }
+  std::size_t getLineSearchSamplingSteps() const noexcept { return line_search_sampling_steps_; }
   Optimizer getOptimizer() const noexcept { return optimizer_; }
   std::size_t getParameterChunkSize() const noexcept { return parameter_chunk_size_; }
   double getLearningRate() const noexcept { return learning_rate_; }
@@ -113,6 +129,14 @@ public:
   double getMinimumEffectiveSamples() const noexcept { return minimum_effective_samples_; }
 
 private:
+  LineSearch line_search_{LineSearch::OFF};
+  double update_scale_{1.0};
+  double weight_decay_{0.0};
+  double line_search_minimum_ess_fraction_{0.5};
+  double line_search_maximum_weight_{0.25};
+  double line_search_confidence_{2.0};
+  std::size_t line_search_warmup_steps_{10};
+  std::size_t line_search_sampling_steps_{10};
   Objective objective_{Objective::ENERGY};
   Optimizer optimizer_{Optimizer::ADAM};
   std::size_t parameter_chunk_size_{65536};

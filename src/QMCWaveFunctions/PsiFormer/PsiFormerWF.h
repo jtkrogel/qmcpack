@@ -359,6 +359,12 @@ public:
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
+  /// Rebuild a private model/executor state for speculative inference clones.
+  void isolateParameterState() override;
+
+  /// Select learned matrix weights by typed execution roles, excluding physical parameters.
+  std::vector<std::string> neuralWeightBlocks() const override;
+
   /// Construct an O(P)+O(B) score/kinetic-product provider bound to this model version.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeStreamingDerivativeOperator(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

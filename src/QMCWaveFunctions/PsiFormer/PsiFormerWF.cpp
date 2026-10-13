@@ -5728,6 +5728,47 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
       capture_jvp_replay);
 }
 
+void PsiFormerWF::isolateParameterState()
+{
+  requireNoPlannedProposalMutation("candidate model isolation");
+  auto original = model_state_;
+  std::shared_lock lock(original->mutex);
+  // Parameters' graph leaves are shared pointers: rebuilding the owning flat
+  // store also recreates leaves, preventing oracle trials from mutating live nodes.
+  pf::Parameters independent_parameters(original->model.p.flat_values(), original->model.p.layouts);
+  independent_parameters.parameter_version = original->model.p.version();
+  pf::PsiFormer independent_model(std::move(independent_parameters), original->model.cfg,
+      original->model.ndet, original->model.dim, original->model.heads, original->model.blocks);
+  model_state_ = std::make_shared<PsiFormerSharedState>(
+      std::move(independent_model), original->model_origin, original->initialization_profile,
+      original->initialization_seed, original->execution_plan.environment(),
+      original->twist_phase, original->accelerator_resolution);
+  invalidateParameterCaches(model_state_->model.p.version());
+}
+
+std::vector<std::string> PsiFormerWF::neuralWeightBlocks() const
+{
+  using Role = psiformer::ParameterRole;
+  std::vector<std::string> result;
+  for (const auto& tensor : model_state_->execution_plan.parameterTensors())
+    switch (tensor.role)
+    {
+    case Role::ELECTRON_EMBEDDING_WEIGHT:
+    case Role::ATTENTION_QUERY_WEIGHT:
+    case Role::ATTENTION_KEY_WEIGHT:
+    case Role::ATTENTION_VALUE_WEIGHT:
+    case Role::ATTENTION_OUTPUT_WEIGHT:
+    case Role::UPDATE_HIDDEN_WEIGHT:
+    case Role::UPDATE_OUTPUT_WEIGHT:
+    case Role::BACKFLOW_UP_WEIGHT:
+    case Role::BACKFLOW_DOWN_WEIGHT:
+      result.push_back(tensor.module + "/" + tensor.name);
+      break;
+    default: break;
+    }
+  return result;
+}
+
 wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const
 {
   std::shared_lock state_lock(model_state_->mutex);

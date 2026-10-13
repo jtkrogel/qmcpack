@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace qmcplusplus::wftrain
@@ -93,6 +94,13 @@ public:
   /// Copy one version-consistent parameter state.
   virtual StructuredParameterSnapshot snapshotParameters() const = 0;
 
+  /// Detach a speculative clone from shared production parameters before trial publication.
+  virtual void isolateParameterState()
+  { throw std::runtime_error("Provider does not support isolated candidate evaluation"); }
+
+  /// Return explicitly classified neural-network weight tensor identifiers for decay.
+  virtual std::vector<std::string> neuralWeightBlocks() const { return {}; }
+
   /** Atomically publish a complete candidate if the expected version matches.
    *
    * Returns the newly committed version.  Implementations must reject schema,
@@ -105,4 +113,3 @@ public:
 } // namespace qmcplusplus::wftrain
 
 #endif
-

@@ -90,6 +90,9 @@ public:
   void reduce(EnergyGradientAccumulator& accumulator,
               std::exception_ptr local_failure = {}) const;
 
+  /// Require identical publication/rejection decisions before entering commit collectives.
+  void agreeCandidateAcceptance(bool accepted) const;
+
   /// Agree on model and target identity before orbital-MSE production begins.
   void preflightOrbital(const StructuredParameterSchema& schema,
                         const StructuredParameterSnapshot* parameters,

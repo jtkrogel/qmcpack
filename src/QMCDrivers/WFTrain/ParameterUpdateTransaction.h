@@ -40,6 +40,9 @@ public:
 
   /// Discard a speculative proposal after any recoverable post-proposal failure.
   virtual void proposalRejected() noexcept {}
+
+  /// A selector may reject an update while returning the unchanged valid snapshot.
+  virtual bool candidateAccepted() const noexcept { return true; }
 };
 
 /// Refresh sampler-side value/drift caches after atomic parameter publication.

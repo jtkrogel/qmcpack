@@ -22,6 +22,8 @@
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
+#include "QMCDrivers/WFTrain/ProposalSelection.h"
+#include "QMCDrivers/WFTrain/NativeLineSearch.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
@@ -610,6 +612,14 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, optimizer);
   extendStageFingerprint(hash, training.getParameterChunkSize());
   extendStageFingerprint(hash, training.getLearningRate());
+  extendStageFingerprint(hash, static_cast<int>(training.getLineSearch()));
+  extendStageFingerprint(hash, training.getUpdateScale());
+  extendStageFingerprint(hash, training.getWeightDecay());
+  extendStageFingerprint(hash, training.getLineSearchMinimumESSFraction());
+  extendStageFingerprint(hash, training.getLineSearchMaximumWeight());
+  extendStageFingerprint(hash, training.getLineSearchConfidence());
+  extendStageFingerprint(hash, training.getLineSearchWarmupSteps());
+  extendStageFingerprint(hash, training.getLineSearchSamplingSteps());
   extendStageFingerprint(hash, training.getAdamBeta1());
   extendStageFingerprint(hash, training.getAdamBeta2());
   extendStageFingerprint(hash, training.getEpsilon());
@@ -891,6 +901,7 @@ void WFTrainBatched::run()
   myComm->barrier();
 
   int completed_blocks = 0;
+  std::size_t accepted_updates = 0;
   for (int block = static_cast<int>(stage_state.completed_stage_iterations);
        block < num_blocks; ++block)
   {
@@ -926,6 +937,95 @@ void WFTrainBatched::run()
     std::optional<std::size_t> krylov_operator_applications;
     std::optional<wftrain::DerivativeReal> applied_scale;
     std::optional<wftrain::DeterminantOverlapObjectiveResult> overlap_diagnostics;
+    double selected_alpha = 1.0;
+    double selected_displacement_norm = 0.0;
+    auto decorate = [&](wftrain::TrainingUpdateRule& optimizer) {
+      wftrain::ProposalSelectionControl control;
+      control.update_scale = training_input_.getUpdateScale();
+      control.weight_decay = training_input_.getWeightDecay();
+      control.maximum_update_norm = training_input_.getMaximumUpdateNorm();
+      if (control.weight_decay != 0.0)
+      {
+        control.decay_blocks = selected_provider_->neuralWeightBlocks();
+        if (control.decay_blocks.empty())
+          throw UniformCommunicateError("Selected provider has no typed nn_weights decay selection");
+      }
+      return std::make_unique<wftrain::SelectedUpdateRule>(optimizer, std::move(control),
+          [&](const auto& old, const auto& full) {
+            double norm = 0.0;
+            for (std::size_t i = 0; i < old.values.size(); ++i)
+              norm = std::hypot(norm, full.values[i] - old.values[i]);
+            double maximum_alpha = 2.0;
+            if (training_input_.getMaximumUpdateNorm() > 0.0 && norm > 0.0)
+              maximum_alpha = std::min(maximum_alpha, training_input_.getMaximumUpdateNorm() / norm);
+            if (training_input_.getMaximumMetricNorm() > 0.0)
+            {
+              std::vector<std::unique_ptr<wftrain::StreamingDerivativeOperator>> owners;
+              std::vector<std::vector<double>> weights;
+              std::vector<std::vector<wftrain::DerivativeValue>> energies;
+              std::vector<wftrain::ScoreCovarianceBatch> metric_batches;
+              for (auto& crowd : crowds_)
+                if (crowd->size())
+                {
+                  const auto& twfs = crowd->get_walker_twfs();
+                  const auto& elecs = crowd->get_walker_elecs();
+                  RefVectorWithLeader<TrialWaveFunction> wf_batch(twfs[0], twfs);
+                  RefVectorWithLeader<ParticleSet> p_batch(elecs[0], elecs);
+                  owners.push_back(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+                      wf_batch, p_batch, selected_provider_id_, owners.size(), 0,
+                      training_input_.getParameterChunkSize()));
+                  weights.emplace_back(crowd->size(), 1.0);
+                  energies.emplace_back(crowd->size(), 0.0);
+                  metric_batches.push_back({owners.back().get(),
+                      {weights.back().data(), weights.back().size()},
+                      {energies.back().data(), energies.back().size()}});
+                }
+              wftrain::ScoreCovarianceFactor factor(selected_provider_->parameterSchema(), old.version,
+                  {metric_batches.data(), metric_batches.size()}, wftrain::ScoreSampleDomain::REAL, reduction);
+              std::vector<wftrain::DerivativeValue> direction(old.values.size());
+              for (std::size_t i = 0; i < direction.size(); ++i)
+                direction[i] = full.values[i] - old.values[i];
+              std::vector<wftrain::DerivativeValue> product(factor.localSampleVectorSize());
+              factor.apply({selected_provider_->parameterSchema(), old.version,
+                            {direction.data(), direction.size()}}, {product.data(), product.size()});
+              double squared = 0.0;
+              for (auto value : product) squared += std::norm(value);
+              myComm->allreduce(squared);
+              if (squared > 0.0)
+                maximum_alpha = std::min(maximum_alpha, training_input_.getMaximumMetricNorm() / std::sqrt(squared));
+            }
+            if (training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF)
+            {
+              selected_alpha = (training_input_.getUpdateScale() == 0.0 &&
+                                training_input_.getWeightDecay() == 0.0)
+                  ? 0.0 : std::min(1.0, maximum_alpha);
+              selected_displacement_norm = selected_alpha * norm;
+              return selected_alpha;
+            }
+            std::vector<std::reference_wrapper<ParticleSet>> configurations;
+            std::vector<std::reference_wrapper<TrialWaveFunction>> teachers;
+            for (auto& crowd : crowds_)
+              for (std::size_t i = 0; i < crowd->size(); ++i)
+              {
+                configurations.emplace_back(crowd->get_walker_elecs()[i]);
+                teachers.emplace_back(crowd->get_walker_twfs()[i]);
+              }
+            selected_alpha = wftrain::selectNativeStep(training_input_, *myComm,
+                student_prototype_, population_.get_golden_hamiltonian(), selected_provider_id_,
+                configurations, teachers, rngs_[0], qmcdriver_input_.get_tau(), old, full,
+                determinant_overlap ? determinant_overlap_objective_.get() : nullptr, maximum_alpha,
+                [&](double alpha, double loss, double difference, double error,
+                    double ess, double weight, bool valid) {
+                  if (myComm->rank() == 0)
+                    app_log() << "WFTrain candidate alpha " << alpha << " loss " << loss
+                              << " loss_difference " << difference
+                              << " difference_error " << error << " ess " << ess
+                              << " maximum_weight " << weight << " valid " << valid << std::endl;
+                });
+            selected_displacement_norm = selected_alpha * norm;
+            return selected_alpha;
+          });
+    };
     {
       if (determinant_overlap)
       {
@@ -1023,7 +1123,7 @@ void WFTrainBatched::run()
             schema.fingerprint(), parameters->version, wftrain::ReductionDomain::GLOBAL,
             {objective.parameter_gradient.data(), objective.parameter_gradient.size()}};
         const std::size_t committed_version = wftrain::completeParameterUpdate(
-            *selected_provider_, *parameters, gradient, *adam_optimizer, reduction);
+            *selected_provider_, *parameters, gradient, *decorate(*adam_optimizer), reduction);
         ++training_state.completed_iterations;
         training_state.parameter_version = committed_version;
         training_state.schema_fingerprint = schema.fingerprint();
@@ -1112,7 +1212,7 @@ void WFTrainBatched::run()
           enforceMemoryBudget(*myComm, retained_numeric_bytes,
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
-                                                  *adam_optimizer, training_state,
+                                                  *decorate(*adam_optimizer), training_state,
                                                   &cache_observer);
         }
         else if (optimizer_kind ==
@@ -1165,7 +1265,7 @@ void WFTrainBatched::run()
           enforceMemoryBudget(*myComm, retained_numeric_bytes,
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
-                                                  *update_rule, training_state,
+                                                  *decorate(*update_rule), training_state,
                                                   &cache_observer);
           if (const auto& diagnostics = update_rule->lastDiagnostics())
           {
@@ -1236,7 +1336,7 @@ void WFTrainBatched::run()
             wftrain::MinimumStepSRUpdateRule update_rule(
                 factor, makeMinimumStepControl(training_input_));
             iteration_result = runScoreFactorIteration(
-                *selected_provider_, *parameters, factor, update_rule,
+                *selected_provider_, *parameters, factor, *decorate(update_rule),
                 training_state, reduction, cache_observer,
                 energy_moments.weight_sum, energy_moments.variance);
             if (const auto& diagnostics = update_rule.lastDiagnostics())
@@ -1249,7 +1349,7 @@ void WFTrainBatched::run()
           else if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
           {
             iteration_result = runScoreFactorIteration(
-                *selected_provider_, *parameters, factor, *spring_optimizer,
+                *selected_provider_, *parameters, factor, *decorate(*spring_optimizer),
                 training_state, reduction, cache_observer,
                 energy_moments.weight_sum, energy_moments.variance);
             if (const auto& diagnostics = spring_optimizer->lastDiagnostics())
@@ -1283,7 +1383,7 @@ void WFTrainBatched::run()
               wftrain::ProjectedInverseIterationUpdateRule update_rule(
                   pii_factor, control);
               iteration_result = runScoreFactorIteration(
-                  *selected_provider_, *parameters, factor, update_rule,
+                  *selected_provider_, *parameters, factor, *decorate(update_rule),
                   training_state, reduction, cache_observer,
                   energy_moments.weight_sum, energy_moments.variance);
               if (const auto& diagnostics = update_rule.lastDiagnostics())
@@ -1298,7 +1398,7 @@ void WFTrainBatched::run()
               wftrain::MinimumProjectedInverseIterationUpdateRule update_rule(
                   pii_factor, control);
               iteration_result = runScoreFactorIteration(
-                  *selected_provider_, *parameters, factor, update_rule,
+                  *selected_provider_, *parameters, factor, *decorate(update_rule),
                   training_state, reduction, cache_observer,
                   energy_moments.weight_sum, energy_moments.variance);
               if (const auto& diagnostics = update_rule.lastDiagnostics())
@@ -1321,7 +1421,13 @@ void WFTrainBatched::run()
         cache_observer.publishedVersion() != iteration_result.parameter_version)
       throw UniformCommunicateError(
           "WFTrainBatched: parameter publication did not arm the cache-refresh barrier");
-    refreshPublishedParameters(iteration_result.parameter_version);
+    if (selected_alpha != 0.0)
+    {
+      refreshPublishedParameters(iteration_result.parameter_version);
+      ++accepted_updates;
+    }
+    // Rejection leaves every live parameter/cache valid. In particular, avoid
+    // consuming production quadrature RNG merely to refresh the unchanged ECP state.
     cache_observer.clear();
     stage_state.completed_stage_iterations = iteration_result.completed_iteration;
 
@@ -1364,6 +1470,14 @@ void WFTrainBatched::run()
                   << " gradient_norm " << gradientNorm(objective.gradient);
       }
       app_log() << " retained_bytes " << retained_numeric_bytes
+                << " update_scale " << training_input_.getUpdateScale()
+                << " selected_alpha " << selected_alpha
+                << " effective_scale " << selected_alpha * training_input_.getUpdateScale()
+                << " weight_decay " << training_input_.getWeightDecay()
+                << " displacement_norm " << selected_displacement_norm
+                << " selection_reason " << (selected_alpha == 0.0 ? "rejected" :
+                    (training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::OFF
+                         ? "fixed_scale" : "reliable_improvement"))
                 << " optimizer " << wftrain::optimizerName(training_input_.getOptimizer());
       if (krylov_iterations)
         app_log() << " krylov_iterations " << *krylov_iterations
@@ -1411,7 +1525,8 @@ void WFTrainBatched::run()
 
   if (myComm->rank() == 0)
     app_log() << "WFTrain completed " << completed_blocks << " block(s) and "
-              << training_state.completed_iterations << " committed update(s)" << std::endl;
+              << accepted_updates << " committed update(s), "
+              << training_state.completed_iterations << " completed iteration(s)" << std::endl;
   print_mem("WFTrainBatched ends", app_log());
   wlog_manager.stopRun();
   estimator_manager_->stopDriverRun();

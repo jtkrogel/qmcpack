@@ -58,6 +58,8 @@ set(QMCDRIVERS
     WFTrain/OrbitalPretraining.cpp
     WFTrain/DeterminantOverlapObjective.cpp
     WFTrain/ParameterUpdateTransaction.cpp
+    WFTrain/ProposalSelection.cpp
+    WFTrain/NativeLineSearch.cpp
     WFTrain/HighParameterTraining.cpp
     WFTrain/PreparedEnergyGradientProducer.cpp
     WFTrain/TrainingCheckpoint.cpp

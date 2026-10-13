@@ -189,7 +189,8 @@ DeterminantOverlapObjective::DeterminantOverlapObjective(
 
 DeterminantOverlapObjectiveResult DeterminantOverlapObjective::evaluate(
     Communicate& communicator,
-    const std::vector<DeterminantOverlapBatchView>& batches) const
+    const std::vector<DeterminantOverlapBatchView>& batches,
+    bool with_gradient) const
 {
 #ifdef HAVE_MPI
   if (communicator.size() > 1)
@@ -368,8 +369,11 @@ DeterminantOverlapObjectiveResult DeterminantOverlapObjective::evaluate(
 
   // Recompute amplitudes and immediately contract M seeds through one P-vector reverse.
   std::vector<double> channel_weights(target_.descriptor().channelCount());
-  std::vector<double> sample_gradient(parameter_count);
-  std::vector<double> gradient(parameter_count, 0.0);
+  std::vector<double> sample_gradient(with_gradient ? parameter_count : 0);
+  std::vector<double> gradient(with_gradient ? parameter_count : 0, 0.0);
+  std::vector<double> influences;
+  if (!with_gradient)
+    influences.reserve(local_samples);
   std::size_t student_storage = 0;
   std::exception_ptr second_pass_failure;
   try
@@ -386,6 +390,28 @@ DeterminantOverlapObjectiveResult DeterminantOverlapObjective::evaluate(
         target_.evaluate(batch.teachers[sample], batch.electrons[sample], teacher,
                          targets.data(), targets.size());
         batch.student->evaluateAmplitudes(sample, students.data(), students.size());
+        if (!with_gradient)
+        {
+          // Ratios are normalized by global signed/log moments.  Their summed
+          // influence is zero; paired differences retain candidate correlations.
+          double influence = 0.0;
+          for (std::size_t k = 0; k < students.size(); ++k)
+          {
+            const auto normalized = [&](auto a, auto b, auto moment) {
+              if (a.isZero() || b.isZero()) return 0.0;
+              return a.phase * b.phase * moment.phase *
+                  std::exp(a.log_abs + b.log_abs - 2.0 * teacher.log_abs - moment.log_abs);
+            };
+            influence -= objective_weights_[k] *
+                (2.0 * normalized(targets[k], students[k], moments.cross[k]) -
+                 normalized(targets[k], targets[k], moments.target_square[k]) -
+                 normalized(students[k], students[k], moments.student_square[k]));
+          }
+          if (!psiformer::overlap_detail::isFinite(influence))
+            throw std::overflow_error("Nonfinite overlap loss influence");
+          influences.push_back(influence);
+          continue;
+        }
         accumulator.channelScoreWeights(teacher, targets.data(), students.data(),
                                         students.size(), channel_weights.data());
         batch.student->evaluateWeightedScore(sample, channel_weights.data(),
@@ -438,6 +464,7 @@ DeterminantOverlapObjectiveResult DeterminantOverlapObjective::evaluate(
   result.target_provenance      = target_.descriptor().sourceIdentity();
   result.channels               = accumulator.diagnostics();
   result.parameter_gradient     = std::move(gradient);
+  result.sample_loss_influences = std::move(influences);
   const auto checked_add = [](std::size_t left, std::size_t right) {
     if (left > std::numeric_limits<std::size_t>::max() - right)
       throw std::overflow_error("Determinant overlap retained-byte count overflowed");

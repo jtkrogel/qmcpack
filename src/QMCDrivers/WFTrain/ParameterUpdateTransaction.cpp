@@ -91,6 +91,23 @@ std::size_t completeParameterUpdate(
     throw;
   }
 
+  try
+  {
+    reduction.agreeCandidateAcceptance(update_rule.candidateAccepted());
+  }
+  catch (...)
+  {
+    update_rule.proposalRejected();
+    throw;
+  }
+  if (!update_rule.candidateAccepted())
+  {
+    if (candidate->values != parameters.values)
+      throw std::logic_error("Rejected training candidate changed parameters");
+    update_rule.proposalRejected();
+    return parameters.version;
+  }
+
   std::size_t local_committed_version = parameters.version;
   std::exception_ptr publication_failure;
   try

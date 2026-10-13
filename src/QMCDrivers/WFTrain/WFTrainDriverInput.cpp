@@ -27,7 +27,10 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 41> allowed_attributes{
+constexpr std::array<std::string_view, 50> allowed_attributes{
+    "line_search", "update_scale", "weight_decay", "weight_decay_scope",
+    "line_search_minimum_ess_fraction", "line_search_maximum_weight", "line_search_confidence",
+    "line_search_warmup_steps", "line_search_sampling_steps",
     "objective", "optimizer", "parameter_chunk_size", "learning_rate", "adam_beta1",
     "adam_beta2", "epsilon", "damping", "damping_multiplier", "minimum_retry_damping",
     "maximum_damping_attempts", "maximum_update_norm", "maximum_metric_norm", "center_shift",
@@ -188,6 +191,14 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   }
 
   objective_                        = Objective::ENERGY;
+  line_search_ = LineSearch::OFF;
+  update_scale_ = 1.0;
+  weight_decay_ = 0.0;
+  line_search_minimum_ess_fraction_ = 0.5;
+  line_search_maximum_weight_ = 0.25;
+  line_search_confidence_ = 2.0;
+  line_search_warmup_steps_ = 10;
+  line_search_sampling_steps_ = 10;
   optimizer_                        = Optimizer::ADAM;
   parameter_chunk_size_             = 65536;
   learning_rate_                    = 1.0e-3;
@@ -228,6 +239,36 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   target_provenance_.clear();
   minimum_fidelity_          = 1.0e-14;
   minimum_effective_samples_ = 1.0;
+
+  if (seen_attributes.count("line_search"))
+  {
+    const auto mode = readAttribute(training_node, "line_search");
+    if (mode == "off") line_search_ = LineSearch::OFF;
+    else if (mode == "reference") line_search_ = LineSearch::REFERENCE;
+    else if (mode == "endpoints") line_search_ = LineSearch::ENDPOINTS;
+    else throw UniformCommunicateError("line_search must be off, reference, or endpoints");
+  }
+  if (seen_attributes.count("weight_decay_scope") &&
+      readAttribute(training_node, "weight_decay_scope") != "nn_weights")
+    throw UniformCommunicateError("weight_decay_scope currently supports nn_weights only");
+  if (seen_attributes.count("update_scale"))
+    update_scale_ = parseNonnegativeReal(readAttribute(training_node, "update_scale"), "update_scale");
+  if (seen_attributes.count("weight_decay"))
+    weight_decay_ = parseNonnegativeReal(readAttribute(training_node, "weight_decay"), "weight_decay");
+  if (seen_attributes.count("line_search_minimum_ess_fraction"))
+    line_search_minimum_ess_fraction_ = parseNonnegativeReal(readAttribute(training_node, "line_search_minimum_ess_fraction"), "line_search_minimum_ess_fraction");
+  if (seen_attributes.count("line_search_maximum_weight"))
+    line_search_maximum_weight_ = parseNonnegativeReal(readAttribute(training_node, "line_search_maximum_weight"), "line_search_maximum_weight");
+  if (seen_attributes.count("line_search_confidence"))
+    line_search_confidence_ = parseNonnegativeReal(readAttribute(training_node, "line_search_confidence"), "line_search_confidence");
+  if (seen_attributes.count("line_search_warmup_steps"))
+    line_search_warmup_steps_ = parsePositiveSize(readAttribute(training_node, "line_search_warmup_steps"), "line_search_warmup_steps");
+  if (seen_attributes.count("line_search_sampling_steps"))
+    line_search_sampling_steps_ = parsePositiveSize(readAttribute(training_node, "line_search_sampling_steps"), "line_search_sampling_steps");
+  if (weight_decay_ >= 1.0 || line_search_minimum_ess_fraction_ > 1.0 ||
+      line_search_minimum_ess_fraction_ == 0.0 || line_search_maximum_weight_ > 1.0 ||
+      line_search_maximum_weight_ == 0.0)
+    throw UniformCommunicateError("Decay must lie in [0,1), and line-search weight guards in (0,1]");
 
   if (seen_attributes.find("objective") != seen_attributes.end())
   {
