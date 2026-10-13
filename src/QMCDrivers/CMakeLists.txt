@@ -59,6 +59,8 @@ set(QMCDRIVERS
     WFTrain/DeterminantOverlapObjective.cpp
     WFTrain/ParameterUpdateTransaction.cpp
     WFTrain/ProposalSelection.cpp
+    WFTrain/SampledLinearMethod.cpp
+    WFTrain/AcceleratedLinearMethod.cpp
     WFTrain/NativeLineSearch.cpp
     WFTrain/HighParameterTraining.cpp
     WFTrain/PreparedEnergyGradientProducer.cpp

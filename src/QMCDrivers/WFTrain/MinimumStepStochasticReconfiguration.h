@@ -127,6 +127,11 @@ public:
   DerivativeValue reduceSampleScalar(DerivativeValue local_value,
                                      std::exception_ptr local_failure = {}) const;
 
+  /// Reduce a raw derivative adjoint with the same participant policy as this factor.
+  ReductionDomain reduceParameterVector(DerivativeArrayView<DerivativeValue> values,
+                                       std::exception_ptr failure = {}) const
+  { return reduction_.reduceParameterVector(schema_, parameter_version_, values, failure); }
+
 private:
   friend class ProjectedInverseIterationFactor;
   struct BatchStorage;
