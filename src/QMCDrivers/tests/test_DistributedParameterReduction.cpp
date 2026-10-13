@@ -14,6 +14,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "Message/Communicate.h"
+#include "QMCDrivers/WFTrain/HostStagedAcceleratorReduction.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -33,6 +35,47 @@ namespace qmcplusplus::wftrain
 {
 namespace
 {
+
+/// Execute the abstract accelerator-copy protocol against ordinary host vectors.
+class HostMemoryCopyQueue final : public AcceleratorCollectiveCopyQueue
+{
+public:
+  void submitDeviceToHost(std::size_t,
+                          DerivativeValue* destination,
+                          const DerivativeValue* source,
+                          std::size_t count) override
+  {
+    if (fail_device_to_host_)
+      throw std::runtime_error("injected device-to-host failure");
+    std::memcpy(destination, source, count * sizeof(DerivativeValue));
+    ++device_to_host_submissions_;
+  }
+
+  void waitDeviceToHost(std::size_t) override { ++device_to_host_waits_; }
+
+  void submitHostToDevice(std::size_t,
+                          DerivativeValue* destination,
+                          const DerivativeValue* source,
+                          std::size_t count) override
+  {
+    if (fail_host_to_device_)
+      throw std::runtime_error("injected host-to-device failure");
+    std::memcpy(destination, source, count * sizeof(DerivativeValue));
+    ++host_to_device_submissions_;
+  }
+
+  void waitHostToDevice(std::size_t) override { ++host_to_device_waits_; }
+
+  void drainAfterFailure() noexcept override { ++drain_count_; }
+
+  bool fail_device_to_host_ = false;
+  bool fail_host_to_device_ = false;
+  std::size_t device_to_host_submissions_ = 0;
+  std::size_t device_to_host_waits_ = 0;
+  std::size_t host_to_device_submissions_ = 0;
+  std::size_t host_to_device_waits_ = 0;
+  std::size_t drain_count_ = 0;
+};
 
 /// Return an uneven partition containing an empty interior rank when possible.
 std::size_t localSampleCount(int rank, int size) noexcept
@@ -579,6 +622,123 @@ TEST_CASE("Distributed accelerator-plan preflight is fixed-record and retryable"
       reduction.preflightAcceleratorPlan(
           local, 5, 16, AcceleratorTransportRequest::DEVICE_MPI, 2),
       Catch::Matchers::ContainsSubstring("not available on every rank"));
+}
+
+TEST_CASE("Host-staged accelerator reduction matches complex global sums",
+          "[drivers][training][accelerator][host_staged][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const std::size_t rank = static_cast<std::size_t>(communicator.rank());
+  const std::size_t participants = static_cast<std::size_t>(communicator.size());
+  AcceleratorRankPlanInput local{
+      /*rank=*/rank,
+      /*participant_count=*/participants,
+      /*node_id=*/rank / 2,
+      /*device_id=*/rank % 2,
+      /*local_sample_count=*/rank == 1 ? 0 : rank + 1,
+      /*device_budget_bytes=*/std::size_t{4096},
+      /*base_required_device_bytes=*/128,
+      /*maximum_chunk_elements=*/2,
+      /*parameter_version=*/7,
+      /*model_fingerprint=*/101,
+      /*precision_fingerprint=*/202,
+      /*device_mpi_available=*/false};
+  DistributedParameterReduction preflight(communicator, {2});
+  const AcceleratorDistributedPlan plan = preflight.preflightAcceleratorPlan(
+      local, /*parameter_count=*/5, /*collective_element_bytes=*/sizeof(DerivativeValue),
+      AcceleratorTransportRequest::HOST_STAGED_MPI, /*buffer_slots=*/2);
+
+  std::array<std::vector<DerivativeValue>, 2> host_storage{
+      std::vector<DerivativeValue>(plan.chunk_elements),
+      std::vector<DerivativeValue>(plan.chunk_elements)};
+  const std::array<AcceleratorHostStagingSlot, 2> staging{{
+      {host_storage[0].data(), host_storage[0].size()},
+      {host_storage[1].data(), host_storage[1].size()}}};
+  HostMemoryCopyQueue queue;
+  HostStagedAcceleratorReduction reduction(communicator, plan, queue, staging);
+
+  const auto make_local_values = [&]() {
+    const double factor = participants > 1 && rank == 1 ? 0.0
+                                                         : static_cast<double>(rank + 1);
+    std::vector<DerivativeValue> values(5);
+    for (std::size_t parameter = 0; parameter < values.size(); ++parameter)
+      values[parameter] = factor * DerivativeValue{
+          static_cast<double>(parameter + 1), -0.125 * static_cast<double>(parameter + 1)};
+    return values;
+  };
+
+  double global_factor = 0.0;
+  for (std::size_t remote_rank = 0; remote_rank < participants; ++remote_rank)
+    if (!(participants > 1 && remote_rank == 1))
+      global_factor += static_cast<double>(remote_rank + 1);
+
+  std::vector<DerivativeValue> values = make_local_values();
+  reduction.reduceComplexVector(values.data(), values.size(), plan.fingerprint,
+                                plan.parameter_version);
+  for (std::size_t parameter = 0; parameter < values.size(); ++parameter)
+  {
+    CHECK(values[parameter].real() ==
+          Catch::Approx(global_factor * static_cast<double>(parameter + 1)));
+    CHECK(values[parameter].imag() ==
+          Catch::Approx(-0.125 * global_factor * static_cast<double>(parameter + 1)));
+  }
+  CHECK(queue.device_to_host_submissions_ == 3);
+  CHECK(queue.device_to_host_waits_ == 3);
+  CHECK(queue.host_to_device_submissions_ == 3);
+  CHECK(queue.host_to_device_waits_ == 3);
+  CHECK(reduction.state().iterationState() == AcceleratorCollectiveIterationState::IDLE);
+
+  // One rank-local copy error is converted to a uniform control-collective error
+  // before any participant enters the corresponding bulk parameter collective.
+  values = make_local_values();
+  queue.fail_device_to_host_ = rank == participants - 1;
+  CHECK_THROWS_WITH(reduction.reduceComplexVector(
+                        values.data(), values.size(), plan.fingerprint,
+                        plan.parameter_version),
+                    Catch::Matchers::ContainsSubstring(
+                        "device-to-host copy failed on rank " +
+                        std::to_string(participants - 1)));
+  CHECK(reduction.state().iterationState() == AcceleratorCollectiveIterationState::IDLE);
+  CHECK(queue.drain_count_ == 1);
+
+  // Reset rank-local data and the injected queue condition before a clean retry.
+  values = make_local_values();
+  queue.fail_device_to_host_ = false;
+  reduction.reduceComplexVector(values.data(), values.size(), plan.fingerprint,
+                                plan.parameter_version);
+  for (std::size_t parameter = 0; parameter < values.size(); ++parameter)
+    CHECK(values[parameter].real() ==
+          Catch::Approx(global_factor * static_cast<double>(parameter + 1)));
+}
+
+TEST_CASE("Host-staged accelerator reduction reports post-collective copy failure",
+          "[drivers][training][accelerator][host_staged][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const std::size_t rank = static_cast<std::size_t>(communicator.rank());
+  const std::size_t participants = static_cast<std::size_t>(communicator.size());
+  AcceleratorRankPlanInput local{
+      rank, participants, rank / 2, rank % 2, rank + 1, std::size_t{4096},
+      128, 2, 7, 101, 202, false};
+  DistributedParameterReduction preflight(communicator, {2});
+  const AcceleratorDistributedPlan plan = preflight.preflightAcceleratorPlan(
+      local, 5, sizeof(DerivativeValue), AcceleratorTransportRequest::HOST_STAGED_MPI, 1);
+
+  std::vector<DerivativeValue> staging_storage(plan.chunk_elements);
+  const std::array<AcceleratorHostStagingSlot, 2> staging{{
+      {staging_storage.data(), staging_storage.size()}, {nullptr, 0}}};
+  HostMemoryCopyQueue queue;
+  HostStagedAcceleratorReduction reduction(communicator, plan, queue, staging);
+  std::vector<DerivativeValue> values(5, DerivativeValue{static_cast<double>(rank + 1), 0.0});
+
+  queue.fail_host_to_device_ = rank == 0;
+  CHECK_THROWS_WITH(reduction.reduceComplexVector(
+                        values.data(), values.size(), plan.fingerprint,
+                        plan.parameter_version),
+                    Catch::Matchers::ContainsSubstring(
+                        "host-to-device copy failed on rank 0"));
+  CHECK(reduction.state().iterationState() == AcceleratorCollectiveIterationState::IDLE);
+  CHECK(queue.drain_count_ == 1);
 }
 
 TEST_CASE("Distributed matrix-free vectors are reduced once into replicated storage",
