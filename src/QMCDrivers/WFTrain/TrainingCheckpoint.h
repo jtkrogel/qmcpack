@@ -101,6 +101,30 @@ class TrainingCheckpoint
 public:
   static constexpr std::array<int, 3> FORMAT_VERSION{1, 0, 0};
 
+  /** Fully validated owning restore state whose live targets are still unchanged. */
+  class PreparedRestore
+  {
+  public:
+    ~PreparedRestore();
+    PreparedRestore(PreparedRestore&&) noexcept;
+    PreparedRestore& operator=(PreparedRestore&&) noexcept;
+
+    PreparedRestore(const PreparedRestore&)            = delete;
+    PreparedRestore& operator=(const PreparedRestore&) = delete;
+
+    /// Publish only the prepared model, retaining all other prepared state.
+    std::size_t publishModel();
+
+    /// Install driver and contributor state after distributed publication consensus.
+    void commitAfterPublication(std::size_t committed_version) noexcept;
+
+  private:
+    friend class TrainingCheckpoint;
+    struct Impl;
+    explicit PreparedRestore(std::unique_ptr<Impl> implementation);
+    std::unique_ptr<Impl> implementation_;
+  };
+
   /// Atomically replace destination with one complete post-iteration checkpoint.
   static void saveAtomic(const std::filesystem::path& destination,
                          const StructuredParameterProvider& provider,
@@ -120,6 +144,25 @@ public:
                       TrainingStageState& stage_state,
                       OptimizerCheckpointContributor* optimizer = nullptr,
                       SamplerCheckpointContributor* sampler = nullptr);
+
+  /** Validate and own a restore without changing any live target. */
+  static PreparedRestore prepareRestore(
+      const std::filesystem::path& source,
+      StructuredParameterProvider& provider,
+      TrainingIterationState& coordinator_state,
+      TrainingStageState& stage_state,
+      OptimizerCheckpointContributor* optimizer = nullptr,
+      SamplerCheckpointContributor* sampler = nullptr);
+
+  /// Atomically write one sampler-only rank shard.
+  static void saveSamplerShardAtomic(
+      const std::filesystem::path& destination,
+      const SamplerCheckpointContributor& sampler);
+
+  /// Validate one sampler-only shard and return its non-mutating prepared action.
+  static std::unique_ptr<SamplerCheckpointContributor::PreparedRestore>
+  prepareSamplerShardRestore(const std::filesystem::path& source,
+                             SamplerCheckpointContributor& sampler);
 };
 
 } // namespace wftrain

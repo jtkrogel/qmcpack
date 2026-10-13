@@ -773,4 +773,72 @@ TEST_CASE("Training checkpoint supports stateless and generation-qualified files
   CHECK(second_coordinator.completed_iterations == 1);
 }
 
+TEST_CASE("Training checkpoint exposes a non-mutating two-phase restore",
+          "[drivers][training][checkpoint]")
+{
+  const std::filesystem::path file = "wftrain_checkpoint_two_phase.h5";
+  CheckpointFileCleanup cleanup{file};
+  CheckpointToyProvider source_provider;
+  ToyOptimizerCheckpoint source_optimizer;
+  ToySamplerCheckpoint source_sampler;
+  TrainingIterationState source_coordinator;
+  TrainingStageState source_stage{"optimization", 4, 0, "two-phase-stage-v1"};
+  advanceToyTrajectory(source_provider, source_optimizer, source_sampler,
+                       source_coordinator, source_stage, 2);
+  TrainingCheckpoint::saveAtomic(file, source_provider, source_coordinator,
+                                 source_stage, &source_optimizer, &source_sampler);
+
+  CheckpointToyProvider target_provider;
+  ToyOptimizerCheckpoint target_optimizer({9.0, 8.0, 7.0}, 41);
+  ToySamplerCheckpoint target_sampler({9.0, 8.0, 7.0, 6.0, 5.0, 4.0}, 999, 31);
+  TrainingIterationState target_coordinator{71, 0, "live-sentinel"};
+  TrainingStageState target_stage{"optimization", 99, 88, "two-phase-stage-v1"};
+  const auto model_before       = target_provider.snapshotParameters();
+  const auto moments_before     = target_optimizer.moments();
+  const auto positions_before   = target_sampler.positions();
+
+  auto prepared = TrainingCheckpoint::prepareRestore(
+      file, target_provider, target_coordinator, target_stage,
+      &target_optimizer, &target_sampler);
+  CHECK(target_provider.snapshotParameters().values == model_before.values);
+  CHECK(target_coordinator.completed_iterations == 71);
+  CHECK(target_optimizer.moments() == moments_before);
+  CHECK(target_sampler.positions() == positions_before);
+
+  const std::size_t committed_version = prepared.publishModel();
+  CHECK(target_provider.snapshotParameters().values ==
+        source_provider.snapshotParameters().values);
+  CHECK(target_coordinator.completed_iterations == 71);
+  CHECK(target_optimizer.moments() == moments_before);
+  CHECK(target_sampler.positions() == positions_before);
+
+  prepared.commitAfterPublication(committed_version);
+  CHECK(target_coordinator.completed_iterations == 2);
+  CHECK(target_coordinator.parameter_version == committed_version);
+  CHECK(target_stage.completed_stage_iterations == 2);
+  CHECK(target_optimizer.moments() == source_optimizer.moments());
+  CHECK(target_sampler.positions() == source_sampler.positions());
+}
+
+TEST_CASE("Training checkpoint sampler shard prepares before commit",
+          "[drivers][training][checkpoint]")
+{
+  const std::filesystem::path file = "wftrain_sampler_shard.h5";
+  CheckpointFileCleanup cleanup{file};
+  ToySamplerCheckpoint source;
+  source.advance();
+  TrainingCheckpoint::saveSamplerShardAtomic(file, source);
+
+  ToySamplerCheckpoint target({9.0, 8.0, 7.0, 6.0, 5.0, 4.0}, 999, 31);
+  const auto positions_before = target.positions();
+  const auto rng_before       = target.rngState();
+  auto prepared = TrainingCheckpoint::prepareSamplerShardRestore(file, target);
+  CHECK(target.positions() == positions_before);
+  CHECK(target.rngState() == rng_before);
+  prepared->commit();
+  CHECK(target.positions() == source.positions());
+  CHECK(target.rngState() == source.rngState());
+  CHECK(target.sweeps() == source.sweeps());
+}
+
 } // namespace qmcplusplus::wftrain

@@ -11,6 +11,8 @@
 
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
+
 #include "io/hdf/hdf_archive.h"
 
 #include <algorithm>
@@ -33,6 +35,8 @@ namespace
 
 constexpr char ROOT_GROUP[]        = "wftrain_checkpoint";
 constexpr char COMPLETION_COOKIE[] = "wftrain-checkpoint-complete-v1";
+constexpr char SAMPLER_ROOT_GROUP[] = "wftrain_sampler_shard";
+constexpr char SAMPLER_COMPLETION_COOKIE[] = "wftrain-sampler-shard-complete-v1";
 
 /// Convert a platform-sized counter to the portable checkpoint representation.
 std::uint64_t checkedPersistedSize(std::size_t value)
@@ -87,8 +91,7 @@ void validateSaveState(const StructuredParameterSchema& schema,
   if (model.schema_fingerprint != schema.fingerprint() ||
       model.values.size() != schema.parameterCount())
     throw std::invalid_argument("Training checkpoint model snapshot does not match its schema");
-  if (!std::all_of(model.values.begin(), model.values.end(),
-                   [](double value) { return std::isfinite(value); }))
+  if (!std::all_of(model.values.begin(), model.values.end(), isFiniteTrainingReal))
     throw std::invalid_argument("Training checkpoint model contains non-finite parameters");
   if (coordinator.parameter_version != model.version ||
       coordinator.schema_fingerprint != schema.fingerprint())
@@ -184,6 +187,60 @@ void installDriverState(TrainingIterationState& coordinator,
 }
 
 } // namespace
+
+struct TrainingCheckpoint::PreparedRestore::Impl
+{
+  StructuredParameterProvider& provider;
+  TrainingIterationState& coordinator_target;
+  TrainingStageState& stage_target;
+  StructuredParameterSnapshot model;
+  std::size_t expected_runtime_version;
+  TrainingIterationState coordinator;
+  TrainingStageState stage;
+  std::unique_ptr<OptimizerCheckpointContributor::PreparedRestore> optimizer;
+  std::unique_ptr<SamplerCheckpointContributor::PreparedRestore> sampler;
+  bool model_published = false;
+  bool committed       = false;
+};
+
+TrainingCheckpoint::PreparedRestore::PreparedRestore(std::unique_ptr<Impl> implementation)
+    : implementation_(std::move(implementation))
+{}
+
+TrainingCheckpoint::PreparedRestore::~PreparedRestore() = default;
+
+TrainingCheckpoint::PreparedRestore::PreparedRestore(PreparedRestore&&) noexcept = default;
+
+TrainingCheckpoint::PreparedRestore& TrainingCheckpoint::PreparedRestore::operator=(
+    PreparedRestore&&) noexcept = default;
+
+std::size_t TrainingCheckpoint::PreparedRestore::publishModel()
+{
+  if (!implementation_)
+    throw std::logic_error("Training checkpoint prepared restore is empty");
+  if (implementation_->model_published)
+    throw std::logic_error("Training checkpoint model has already been published");
+  const std::size_t committed_version = implementation_->provider.publishParameters(
+      implementation_->model, implementation_->expected_runtime_version);
+  implementation_->model_published = true;
+  implementation_->coordinator.parameter_version = committed_version;
+  return committed_version;
+}
+
+void TrainingCheckpoint::PreparedRestore::commitAfterPublication(
+    std::size_t committed_version) noexcept
+{
+  if (!implementation_ || !implementation_->model_published || implementation_->committed ||
+      implementation_->coordinator.parameter_version != committed_version)
+    std::terminate();
+  installDriverState(implementation_->coordinator_target, implementation_->coordinator,
+                     implementation_->stage_target, implementation_->stage);
+  if (implementation_->optimizer)
+    implementation_->optimizer->commit();
+  if (implementation_->sampler)
+    implementation_->sampler->commit();
+  implementation_->committed = true;
+}
 
 void TrainingCheckpoint::saveAtomic(
     const std::filesystem::path& destination,
@@ -298,6 +355,20 @@ void TrainingCheckpoint::restore(const std::filesystem::path& source,
                                  OptimizerCheckpointContributor* optimizer,
                                  SamplerCheckpointContributor* sampler)
 {
+  PreparedRestore prepared = prepareRestore(source, provider, coordinator_state, stage_state,
+                                             optimizer, sampler);
+  const std::size_t committed_version = prepared.publishModel();
+  prepared.commitAfterPublication(committed_version);
+}
+
+TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
+    const std::filesystem::path& source,
+    StructuredParameterProvider& provider,
+    TrainingIterationState& coordinator_state,
+    TrainingStageState& stage_state,
+    OptimizerCheckpointContributor* optimizer,
+    SamplerCheckpointContributor* sampler)
+{
   const StructuredParameterSchema& schema = provider.parameterSchema();
   const StructuredParameterSnapshot runtime_model = provider.snapshotParameters();
   if (runtime_model.schema_fingerprint != schema.fingerprint() ||
@@ -351,8 +422,7 @@ void TrainingCheckpoint::restore(const std::filesystem::path& source,
   if (checkedRuntimeSize(parameter_count, "parameter count") != schema.parameterCount() ||
       saved_values.size() != schema.parameterCount())
     throw std::runtime_error("Training checkpoint model parameter count mismatch");
-  if (!std::all_of(saved_values.begin(), saved_values.end(),
-                   [](double value) { return std::isfinite(value); }))
+  if (!std::all_of(saved_values.begin(), saved_values.end(), isFiniteTrainingReal))
     throw std::runtime_error("Training checkpoint model contains non-finite parameters");
   if (saved_values_fingerprint != parameterFingerprint(saved_values))
     throw std::runtime_error("Training checkpoint model values fingerprint mismatch");
@@ -411,19 +481,94 @@ void TrainingCheckpoint::restore(const std::filesystem::path& source,
   archive.pop();
   archive.close();
 
-  StructuredParameterSnapshot restored_model{schema.fingerprint(), runtime_model.version,
-                                               std::move(saved_values)};
-  TrainingIterationState prepared_coordinator{
-      checkedRuntimeSize(completed_iterations, "completed iterations"),
-      runtime_model.version, schema.fingerprint()};
-  const std::size_t committed_version =
-      provider.publishParameters(restored_model, runtime_model.version);
-  prepared_coordinator.parameter_version = committed_version;
-  installDriverState(coordinator_state, prepared_coordinator, stage_state, prepared_stage);
-  if (prepared_optimizer)
-    prepared_optimizer->commit();
-  if (prepared_sampler)
-    prepared_sampler->commit();
+  auto implementation = std::make_unique<PreparedRestore::Impl>(PreparedRestore::Impl{
+      provider,
+      coordinator_state,
+      stage_state,
+      {schema.fingerprint(), runtime_model.version, std::move(saved_values)},
+      runtime_model.version,
+      {checkedRuntimeSize(completed_iterations, "completed iterations"),
+       runtime_model.version, schema.fingerprint()},
+      std::move(prepared_stage),
+      std::move(prepared_optimizer),
+      std::move(prepared_sampler)});
+  return PreparedRestore(std::move(implementation));
+}
+
+void TrainingCheckpoint::saveSamplerShardAtomic(
+    const std::filesystem::path& destination,
+    const SamplerCheckpointContributor& sampler)
+{
+  if (destination.empty())
+    throw std::invalid_argument("Training sampler-shard destination must not be empty");
+  const CheckpointContributorMetadata metadata = sampler.checkpointMetadata();
+  validateContributorMetadata(metadata, "sampler");
+
+  const std::filesystem::path temporary = temporaryPathFor(destination);
+  std::error_code cleanup_error;
+  bool owns_temporary = false;
+  try
+  {
+    hdf_archive archive;
+    if (!archive.create(temporary, H5F_ACC_EXCL))
+      throw std::runtime_error("Unable to create training sampler-shard temporary " +
+                               temporary.string());
+    owns_temporary = true;
+    archive.push(SAMPLER_ROOT_GROUP);
+    const std::vector<int> format_version(FORMAT_VERSION.begin(), FORMAT_VERSION.end());
+    archive.write(format_version, "format_version");
+    writeContributorMetadata(archive, metadata);
+    sampler.writeCheckpointPayload(archive);
+    archive.write(std::string(SAMPLER_COMPLETION_COOKIE), "completion_cookie");
+    archive.pop();
+    archive.flush();
+    archive.close();
+
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, destination, rename_error);
+    if (rename_error)
+      throw std::runtime_error("Unable to publish training sampler shard " +
+                               destination.string() + ": " + rename_error.message());
+    owns_temporary = false;
+  }
+  catch (...)
+  {
+    if (owns_temporary)
+      std::filesystem::remove(temporary, cleanup_error);
+    throw;
+  }
+}
+
+std::unique_ptr<SamplerCheckpointContributor::PreparedRestore>
+TrainingCheckpoint::prepareSamplerShardRestore(
+    const std::filesystem::path& source,
+    SamplerCheckpointContributor& sampler)
+{
+  hdf_archive archive;
+  if (!archive.open(source, H5F_ACC_RDONLY))
+    throw std::runtime_error("Unable to open training sampler shard " + source.string());
+  if (!archive.is_group(SAMPLER_ROOT_GROUP))
+    throw std::runtime_error("Training sampler shard is missing its root group");
+  archive.push(SAMPLER_ROOT_GROUP, false);
+
+  std::vector<int> format_version;
+  std::string completion_cookie;
+  archive.read(format_version, "format_version");
+  archive.read(completion_cookie, "completion_cookie");
+  if (format_version.size() != FORMAT_VERSION.size() ||
+      format_version[0] != FORMAT_VERSION[0])
+    throw std::runtime_error("Training sampler shard has an incompatible format version");
+  if (completion_cookie != SAMPLER_COMPLETION_COOKIE)
+    throw std::runtime_error("Training sampler shard is incomplete");
+
+  const CheckpointContributorMetadata saved = readContributorMetadata(archive, "sampler");
+  validateContributorIdentity(saved, sampler.checkpointMetadata(), "sampler");
+  auto prepared = sampler.prepareCheckpointRestore(archive, saved);
+  archive.pop();
+  archive.close();
+  if (!prepared)
+    throw std::runtime_error("Training sampler shard returned no prepared restore");
+  return prepared;
 }
 
 } // namespace qmcplusplus::wftrain

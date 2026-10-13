@@ -13,6 +13,7 @@
 #include "Message/CommOperators.h"
 #include "Message/UniformCommunicateError.h"
 #include "QMCDrivers/WalkerLogManager.h"
+#include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
@@ -20,19 +21,23 @@
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
+#include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Utilities/RunTimeManager.h"
 
 #include <cmath>
+#include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -384,6 +389,100 @@ const char* optimizerName(WFTrainDriverInput::Optimizer optimizer) noexcept
   return "unknown";
 }
 
+/// Extend the stable stage fingerprint with a trivially represented scalar.
+template<class T>
+void extendStageFingerprint(std::uint64_t& hash, const T& value) noexcept
+{
+  static_assert(std::is_trivially_copyable_v<T>);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+  for (std::size_t index = 0; index < sizeof(T); ++index)
+  {
+    hash ^= bytes[index];
+    hash *= UINT64_C(1099511628211);
+  }
+}
+
+/// Extend the stable stage fingerprint with an explicitly bounded string.
+void extendStageFingerprint(std::uint64_t& hash, std::string_view value) noexcept
+{
+  const std::size_t size = value.size();
+  extendStageFingerprint(hash, size);
+  for (const unsigned char byte : value)
+  {
+    hash ^= byte;
+    hash *= UINT64_C(1099511628211);
+  }
+}
+
+/// Route owned strings through the explicit byte/string overload.
+void extendStageFingerprint(std::uint64_t& hash, const std::string& value) noexcept
+{
+  extendStageFingerprint(hash, std::string_view(value));
+}
+
+/** Bind checkpoint continuation to training and Markov-chain semantics.
+ *
+ * Output cadence, memory ceilings, and the requested final block count are
+ * intentionally excluded so they may be changed for a resumed run.
+ */
+std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
+                                          const QMCDriverInput& qmc,
+                                          const VMCDriverInput& vmc,
+                                          const wftrain::StructuredParameterSchema& schema,
+                                          std::size_t steps_per_block)
+{
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  extendStageFingerprint(hash, schema.fingerprint());
+  const auto objective = static_cast<std::underlying_type_t<WFTrainDriverInput::Objective>>(
+      training.getObjective());
+  const auto optimizer = static_cast<std::underlying_type_t<WFTrainDriverInput::Optimizer>>(
+      training.getOptimizer());
+  extendStageFingerprint(hash, objective);
+  extendStageFingerprint(hash, optimizer);
+  extendStageFingerprint(hash, training.getParameterChunkSize());
+  extendStageFingerprint(hash, training.getLearningRate());
+  extendStageFingerprint(hash, training.getAdamBeta1());
+  extendStageFingerprint(hash, training.getAdamBeta2());
+  extendStageFingerprint(hash, training.getEpsilon());
+  extendStageFingerprint(hash, training.getDamping());
+  extendStageFingerprint(hash, training.getDampingMultiplier());
+  extendStageFingerprint(hash, training.getMinimumRetryDamping());
+  extendStageFingerprint(hash, training.getMaximumDampingAttempts());
+  extendStageFingerprint(hash, training.getMaximumUpdateNorm());
+  extendStageFingerprint(hash, training.getMaximumMetricNorm());
+  extendStageFingerprint(hash, training.getCenterShift());
+  extendStageFingerprint(hash, training.getObjectiveTolerance());
+  extendStageFingerprint(hash, training.getSpringHistoryDecay());
+  extendStageFingerprint(hash, training.getSpringMaximumUpdateNormSquared());
+  extendStageFingerprint(hash, training.getKrylovRelativeTolerance());
+  extendStageFingerprint(hash, training.getKrylovAbsoluteTolerance());
+  extendStageFingerprint(hash, training.getKrylovMaximumIterations());
+  extendStageFingerprint(hash, training.getKrylovMaximumOperatorApplications());
+  extendStageFingerprint(hash, training.getKrylovMaximumSeconds());
+  extendStageFingerprint(hash, training.getKrylovStagnationWindow());
+  extendStageFingerprint(hash, training.getKrylovMinimumRelativeImprovement());
+  extendStageFingerprint(hash, training.getKrylovCurvatureTolerance());
+  extendStageFingerprint(hash, training.getKrylovImaginaryTolerance());
+  extendStageFingerprint(hash, qmc.get_tau());
+  extendStageFingerprint(hash, qmc.get_spin_mass());
+  extendStageFingerprint(hash, qmc.get_sub_steps());
+  extendStageFingerprint(hash, qmc.get_warmup_steps());
+  extendStageFingerprint(hash, qmc.get_recalculate_properties_period());
+  extendStageFingerprint(hash, qmc.get_blocks_between_recompute());
+  extendStageFingerprint(hash, steps_per_block);
+  extendStageFingerprint(hash, vmc.get_use_drift());
+  const auto move_kind = static_cast<std::underlying_type_t<VMCDriverInput::MoveKind>>(
+      vmc.get_move_kind());
+  const auto selection = static_cast<std::underlying_type_t<VMCDriverInput::ElectronSelection>>(
+      vmc.get_electron_selection());
+  extendStageFingerprint(hash, move_kind);
+  extendStageFingerprint(hash, vmc.get_electrons_per_move());
+  extendStageFingerprint(hash, selection);
+  std::ostringstream text;
+  text << std::hex << std::setw(16) << std::setfill('0') << hash;
+  return text.str();
+}
+
 } // namespace
 
 WFTrainBatched::WFTrainBatched(const ProjectData& project_data,
@@ -418,9 +517,6 @@ void WFTrainBatched::process(xmlNodePtr node)
     VMCBatchedSampling::validateMoveConfiguration(vmcdriver_input_, population_.get_golden_electrons(),
                                                   population_.get_golden_twf(), serializing_crowd_walkers_);
 
-    if (!training_input_.getCheckpointPath().empty() || !training_input_.getRestartPath().empty())
-      throw UniformCommunicateError(
-          "WFTrainBatched: training checkpoint/restart is not enabled in the current energy route");
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
     validateHamiltonianForTraining();
@@ -498,19 +594,58 @@ void WFTrainBatched::run()
   wftrain::HighParameterTraining trainer(
       requirements, wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
       reduction);
+  const auto initial_parameters = selected_provider_->snapshotParameters();
+  if (initial_parameters.schema_fingerprint != selected_provider_->parameterSchema().fingerprint() ||
+      initial_parameters.values.size() != selected_provider_->parameterSchema().parameterCount())
+    throw UniformCommunicateError(
+        "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
   std::unique_ptr<wftrain::FirstOrderOptimizer> adam_optimizer;
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM)
     adam_optimizer = std::make_unique<wftrain::FirstOrderOptimizer>(
         selected_provider_->parameterSchema(),
         makeAdamOptions(selected_provider_->parameterSchema(), training_input_));
   std::unique_ptr<wftrain::SPRINGUpdateRule> spring_optimizer;
-  wftrain::TrainingIterationState training_state;
+  if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING)
+    spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(
+        selected_provider_->parameterSchema(), makeSPRINGControl(training_input_));
+  wftrain::OptimizerCheckpointContributor* optimizer_checkpoint = nullptr;
+  if (adam_optimizer)
+    optimizer_checkpoint = adam_optimizer.get();
+  else if (spring_optimizer)
+    optimizer_checkpoint = spring_optimizer.get();
+
+  wftrain::TrainingIterationState training_state{
+      0, initial_parameters.version, selected_provider_->parameterSchema().fingerprint()};
+  wftrain::TrainingStageState stage_state{
+      "all_electron_energy", 0, 0,
+      stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
+                                    selected_provider_->parameterSchema(), steps_per_block_)};
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;
   RunTimeControl<> runtime_control(run_time_manager, project_data_.getMaxCPUSeconds(),
                                    project_data_.getTitle(), myComm->rank() == 0);
   ParallelExecutor<> crowd_task;
+
+  int global_step = 0;
+  wftrain::WFTrainSamplerCheckpoint sampler_checkpoint(
+      population_, rngs_, global_step, static_cast<std::size_t>(myComm->size()),
+      static_cast<std::size_t>(myComm->rank()), crowds_.size());
+  const bool resumed = !training_input_.getRestartPath().empty();
+  if (resumed)
+  {
+    wftrain::DistributedTrainingCheckpoint::restore(
+        training_input_.getRestartPath(), *myComm, *selected_provider_, training_state,
+        stage_state, optimizer_checkpoint, sampler_checkpoint, sampler_checkpoint.topology());
+    if (stage_state.completed_stage_iterations != training_state.completed_iterations ||
+        stage_state.completed_stage_iterations > static_cast<std::size_t>(num_blocks))
+      throw UniformCommunicateError(
+          "WFTrainBatched: restored training progress is inconsistent with requested blocks");
+    if (myComm->rank() == 0)
+      app_log() << "WFTrain restored " << stage_state.completed_stage_iterations
+                << " completed update(s) from " << training_input_.getRestartPath()
+                << std::endl;
+  }
 
   {
     ScopedTimer initialization_timer(timers_.init_walkers_timer);
@@ -521,17 +656,18 @@ void WFTrainBatched::run()
   }
 
   ScopedTimer production_timer(timers_.production_timer);
-  for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
-  {
-    ScopedTimer step_timer(timers_.run_steps_timer);
-    crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
-               sampling_timers, rngs_, crowds_);
-  }
+  if (!resumed)
+    for (int step = 0; step < qmcdriver_input_.get_warmup_steps(); ++step)
+    {
+      ScopedTimer step_timer(timers_.run_steps_timer);
+      crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
+                 sampling_timers, rngs_, crowds_);
+    }
   myComm->barrier();
 
-  int global_step = 0;
   int completed_blocks = 0;
-  for (int block = 0; block < num_blocks; ++block)
+  for (int block = static_cast<int>(stage_state.completed_stage_iterations);
+       block < num_blocks; ++block)
   {
     ScopeGuard<LoopTimer<>> block_timer(training_loop);
     sampling_state.recalculate_properties_period =
@@ -729,11 +865,7 @@ void WFTrainBatched::run()
         std::optional<SPRINGFactorBindingGuard> spring_factor_binding;
         if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
         {
-          if (spring_optimizer)
-            spring_optimizer->bindFactor(factor);
-          else
-            spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(
-                factor, makeSPRINGControl(training_input_));
+          spring_optimizer->bindFactor(factor);
           spring_factor_binding.emplace(*spring_optimizer);
         }
         const auto factor_storage = factor.storageDiagnostics();
@@ -784,6 +916,7 @@ void WFTrainBatched::run()
           "WFTrainBatched: parameter publication did not arm the cache-refresh barrier");
     refreshPublishedParameters(iteration_result.parameter_version);
     cache_observer.clear();
+    stage_state.completed_stage_iterations = iteration_result.completed_iteration;
 
     if (myComm->rank() == 0)
     {
@@ -815,6 +948,23 @@ void WFTrainBatched::run()
     myComm->bcast(stop_requested);
     if (myComm->rank() == 0)
       app_log() << runtime_control.generateProgressMessage("WFTrainBatched", block, num_blocks);
+    const int checkpoint_period = qmcdriver_input_.get_check_point_period();
+    const bool periodic_checkpoint =
+        checkpoint_period > 0 && (block + 1) % checkpoint_period == 0;
+    const bool final_block = block + 1 == num_blocks;
+    if (!training_input_.getCheckpointPath().empty() &&
+        (periodic_checkpoint || final_block || stop_requested))
+    {
+      ScopedTimer checkpoint_timer(timers_.checkpoint_timer);
+      wftrain::DistributedTrainingCheckpoint::saveAtomic(
+          training_input_.getCheckpointPath(), *myComm, *selected_provider_,
+          training_state, stage_state, optimizer_checkpoint, sampler_checkpoint,
+          sampler_checkpoint.topology());
+      if (myComm->rank() == 0)
+        app_log() << "WFTrain checkpointed " << stage_state.completed_stage_iterations
+                  << " completed update(s) to " << training_input_.getCheckpointPath()
+                  << std::endl;
+    }
     if (stop_requested)
     {
       if (myComm->rank() == 0)

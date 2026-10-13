@@ -6,6 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include "OhmmsData/Libxml2Doc.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
@@ -72,17 +73,37 @@ TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_t
     const auto input = parseTrainingInput(
         "<qmc method=\"wf_train\"><training objective=\"energy\" optimizer=\"adam\" "
         "parameter_chunk_size=\"2048\" learning_rate=\"2e-4\" adam_beta1=\"0.8\" "
-        "adam_beta2=\"0.95\" epsilon=\"1e-7\" checkpoint_path=\"next.h5\" restart_path=\"previous.h5\" "
+        "adam_beta2=\"0.95\" epsilon=\"1e-7\" checkpoint_path=\"continue.h5\" restart_path=\"continue.h5\" "
         "provider=\"neural\"/></qmc>");
     CHECK(input.getParameterChunkSize() == 2048);
     CHECK(input.getLearningRate() == 2.0e-4);
     CHECK(input.getAdamBeta1() == 0.8);
     CHECK(input.getAdamBeta2() == 0.95);
     CHECK(input.getEpsilon() == 1.0e-7);
-    CHECK(input.getCheckpointPath() == "next.h5");
-    CHECK(input.getRestartPath() == "previous.h5");
+    CHECK(input.getCheckpointPath() == "continue.h5");
+    CHECK(input.getRestartPath() == "continue.h5");
     CHECK(input.getProviderID() == "neural");
   }
+}
+
+TEST_CASE("WFTrainDriverInput accepts strict determinant-overlap input",
+          "[drivers][wf_train][overlap]")
+{
+  const auto input = parseTrainingInput(
+      "<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
+      "optimizer=\"adam\" teacher=\"teacher_psi\" overlap_target=\"top_coefficients\" "
+      "overlap_weighting=\"coefficient_squared\" target_provenance=\"ci-hash-42\" "
+      "minimum_fidelity=\"1e-10\" minimum_effective_samples=\"3\"/></qmc>");
+  CHECK(input.getObjective() == WFTrainDriverInput::Objective::DETERMINANT_OVERLAP);
+  CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM);
+  CHECK(input.getTeacherWaveFunction() == "teacher_psi");
+  CHECK(input.getOverlapTarget() ==
+        WFTrainDriverInput::OverlapTarget::TOP_COEFFICIENT_MULTIDETERMINANT);
+  CHECK(input.getOverlapWeighting() ==
+        WFTrainDriverInput::OverlapWeighting::COEFFICIENT_SQUARED);
+  CHECK(input.getTargetProvenance() == "ci-hash-42");
+  CHECK(input.getMinimumFidelity() == Catch::Approx(1.0e-10));
+  CHECK(input.getMinimumEffectiveSamples() == Catch::Approx(3.0));
 }
 
 TEST_CASE("WFTrainDriverInput accepts typed matrix-free optimizer controls",
@@ -163,6 +184,13 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
   rejects("<qmc method=\"wf_train\"><training mystery=\"1\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training><optimizer/></training></qmc>");
   rejects("<qmc method=\"wf_train\"><training objective=\"overlap\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training teacher=\"teacher\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
+          "teacher=\"teacher\" target_provenance=\"x\" optimizer=\"sr\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
+          "teacher=\"teacher\" target_provenance=\"x\" "
+          "overlap_weighting=\"coefficient_squared\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"0\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"1k\"/></qmc>");
@@ -193,7 +221,6 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
   rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_maximum_seconds=\"-1\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_maximum_seconds=\"inf\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training maximum_retained_bytes=\"-1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training checkpoint_path=\"same.h5\" restart_path=\"same.h5\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training provider=\"\"/></qmc>");
 }
 

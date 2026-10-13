@@ -1605,12 +1605,10 @@ private:
   std::vector<DerivativeValue> history_;
 };
 
-SPRINGUpdateRule::SPRINGUpdateRule(const ScoreCovarianceFactor& factor,
+SPRINGUpdateRule::SPRINGUpdateRule(const StructuredParameterSchema& schema,
                                    SPRINGUpdateControl control)
-    : factor_(&factor), provider_id_(factor.parameterSchema().providerId()),
-      schema_fingerprint_(factor.parameterSchema().fingerprint()), control_(std::move(control)),
-      history_(factor.parameterSchema().parameterCount()),
-      pending_history_(factor.parameterSchema().parameterCount())
+    : schema_(schema), control_(std::move(control)),
+      history_(schema.parameterCount()), pending_history_(schema.parameterCount())
 {
   validateControl(control_.minimum_step);
   if (!isFiniteTrainingReal(control_.history_decay) ||
@@ -1619,7 +1617,7 @@ SPRINGUpdateRule::SPRINGUpdateRule(const ScoreCovarianceFactor& factor,
       control_.maximum_update_norm_squared < 0.0)
     throw std::invalid_argument("SPRING history controls are invalid");
   std::uint64_t hash = UINT64_C(1469598103934665603);
-  extendString(hash, factor.parameterSchema().fingerprint());
+  extendString(hash, schema.fingerprint());
   extendFingerprint(hash, &control_.minimum_step.learning_rate, sizeof(DerivativeReal));
   extendFingerprint(hash, &control_.minimum_step.damping, sizeof(DerivativeReal));
   extendFingerprint(hash, &control_.minimum_step.center_shift, sizeof(DerivativeReal));
@@ -1651,12 +1649,19 @@ SPRINGUpdateRule::SPRINGUpdateRule(const ScoreCovarianceFactor& factor,
   configuration_fingerprint_ = formatFingerprint(hash);
 }
 
+SPRINGUpdateRule::SPRINGUpdateRule(const ScoreCovarianceFactor& factor,
+                                   SPRINGUpdateControl control)
+    : SPRINGUpdateRule(factor.parameterSchema(), std::move(control))
+{
+  bindFactor(factor);
+}
+
 void SPRINGUpdateRule::bindFactor(const ScoreCovarianceFactor& factor)
 {
   if (proposal_live_)
     throw std::logic_error("Cannot rebind SPRING with a live proposal");
-  if (factor.parameterSchema().providerId() != provider_id_ ||
-      factor.parameterSchema().fingerprint() != schema_fingerprint_)
+  if (factor.parameterSchema().providerId() != schema_.providerId() ||
+      factor.parameterSchema().fingerprint() != schema_.fingerprint())
     throw std::invalid_argument("SPRING replacement factor schema mismatch");
   factor_ = &factor;
 }
@@ -1758,7 +1763,7 @@ void SPRINGUpdateRule::validateRestoredState(
       std::any_of(history.begin(), history.end(),
                   [](DerivativeValue value) { return value.imag() != 0.0; }))
     throw std::runtime_error("SPRING checkpoint state is invalid");
-  for (const ParameterBlockDescriptor& block : factor_->parameterSchema().blocks())
+  for (const ParameterBlockDescriptor& block : schema_.blocks())
     if (!block.trainable)
       for (std::size_t parameter = block.offset;
            parameter < block.offset + block.count; ++parameter)

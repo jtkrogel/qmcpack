@@ -37,6 +37,12 @@ public:
   virtual void save(std::vector<uint_type>& curstate) const = 0;
   virtual size_t state_size() const                         = 0;
   virtual std::unique_ptr<RandomBase<T>> makeClone() const  = 0;
+  /** Exchange already-validated concrete generator state without allocation.
+   *
+   * The caller must pass the same concrete generator type. This narrow seam is
+   * used to make distributed checkpoint commit nonthrowing after preparation.
+   */
+  virtual void swapState(RandomBase<T>& other) noexcept = 0;
   virtual RandomBase& operator=(const RandomBase& other) { return *this; }
 
 protected:

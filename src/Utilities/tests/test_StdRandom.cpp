@@ -96,4 +96,17 @@ TEST_CASE("StdRandom clone", "[utilities]")
   CHECK(rng3() == rng());
 }
 
+TEST_CASE("StdRandom swaps prepared state without loading", "[utilities][checkpoint]")
+{
+  StdRandom<double> live(17);
+  StdRandom<double> prepared(29);
+  auto live_reference     = live.makeClone();
+  auto prepared_reference = prepared.makeClone();
+
+  live.swapState(prepared);
+
+  CHECK(live() == (*prepared_reference)());
+  CHECK(prepared() == (*live_reference)());
+}
+
 } // namespace qmcplusplus

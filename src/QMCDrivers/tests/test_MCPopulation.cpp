@@ -14,11 +14,17 @@
 
 #include "OhmmsPETE/TinyVector.h"
 #include "QMCDrivers/MCPopulation.h"
+#include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCDrivers/tests/WalkerConsumer.h"
+#include "QMCHamiltonians/QMCHamiltonian.h"
 #include <MinimalParticlePool.h>
 #include <MinimalWaveFunctionPool.h>
 #include <MinimalHamiltonianPool.h>
 #include "Utilities/for_testing/NativeInitializerPrint.hpp"
+#include "Utilities/StdRandom.h"
+
+#include <filesystem>
 
 namespace qmcplusplus
 {
@@ -209,6 +215,63 @@ TEST_CASE("MCPopulation::fissionHighMultiplicityWalkers", "[particle][population
 
   for (auto& walker : walkers)
     CHECK(walker->Multiplicity == 1.0);
+}
+
+TEST_CASE("WFTrain sampler checkpoint restores live walkers and RNG",
+          "[particle][population][training][checkpoint]")
+{
+  using namespace testing;
+
+  RuntimeOptions runtime_options;
+  Communicate* comm = OHMMS::Controller;
+  auto particle_pool = MinimalParticlePool::make_diamondC_1x1x1(comm);
+  TrialWaveFunction wavefunction(runtime_options);
+  QMCHamiltonian hamiltonian;
+  WalkerConfigurations walker_confs;
+  MCPopulation population(comm->size(), comm->rank(), *particle_pool.getParticleSet("e"),
+                          wavefunction, hamiltonian);
+  population.createWalkers(2, walker_confs);
+
+  StdRandom<QMCTraits::FullPrecRealType> rng(73);
+  RefVector<RandomBase<QMCTraits::FullPrecRealType>> rngs;
+  rngs.emplace_back(rng);
+  int global_step = 19;
+  auto& walker = *population.get_walkers().front();
+  walker.R[0][0]  = 1.25;
+  walker.spins[0] = -0.75;
+  walker.Weight   = 2.5;
+  walker.Age      = 3;
+  const long walker_id = walker.getWalkerID();
+  auto expected_rng = rng.makeClone();
+
+  wftrain::WFTrainSamplerCheckpoint checkpoint(
+      population, rngs, global_step, static_cast<std::size_t>(comm->size()),
+      static_cast<std::size_t>(comm->rank()), 1);
+  const std::filesystem::path file = "wftrain_live_sampler_test.h5";
+  std::error_code cleanup_error;
+  std::filesystem::remove(file, cleanup_error);
+  wftrain::TrainingCheckpoint::saveSamplerShardAtomic(file, checkpoint);
+
+  walker.R[0][0]  = 9.0;
+  walker.spins[0] = 8.0;
+  walker.Weight   = 7.0;
+  walker.Age      = 6;
+  walker.setWalkerID(-99);
+  static_cast<void>(rng());
+  global_step = 99;
+  auto prepared = wftrain::TrainingCheckpoint::prepareSamplerShardRestore(file, checkpoint);
+  CHECK(walker.R[0][0] == 9.0);
+  CHECK(global_step == 99);
+  prepared->commit();
+
+  CHECK(walker.R[0][0] == 1.25);
+  CHECK(walker.spins[0] == -0.75);
+  CHECK(walker.Weight == 2.5);
+  CHECK(walker.Age == 3);
+  CHECK(walker.getWalkerID() == walker_id);
+  CHECK(global_step == 19);
+  CHECK(rng() == (*expected_rng)());
+  std::filesystem::remove(file, cleanup_error);
 }
 
 

@@ -12,6 +12,10 @@
 
 #include "FakeRandom.h"
 
+#include <exception>
+#include <type_traits>
+#include <utility>
+
 namespace qmcplusplus
 {
 template<class T>
@@ -27,6 +31,17 @@ template<class T>
 T FakeRandom<T>::operator()()
 {
   return m_val;
+}
+
+template<typename T>
+void FakeRandom<T>::swapState(RandomBase<T>& other) noexcept
+{
+  static_assert(std::is_nothrow_swappable_v<T>);
+  auto* typed_other = dynamic_cast<FakeRandom<T>*>(&other);
+  if (!typed_other)
+    std::terminate();
+  using std::swap;
+  swap(m_val, typed_other->m_val);
 }
 
 template<typename T>

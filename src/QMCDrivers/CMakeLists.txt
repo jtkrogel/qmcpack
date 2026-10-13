@@ -60,6 +60,8 @@ set(QMCDRIVERS
     WFTrain/HighParameterTraining.cpp
     WFTrain/PreparedEnergyGradientProducer.cpp
     WFTrain/TrainingCheckpoint.cpp
+    WFTrain/DistributedTrainingCheckpoint.cpp
+    WFTrain/WFTrainSamplerCheckpoint.cpp
     WFTrain/FirstOrderOptimizer.cpp
     WFTrain/MatrixFreeOperator.cpp
     WFTrain/KrylovSolver.cpp

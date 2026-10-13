@@ -22,7 +22,20 @@ class WFTrainDriverInput
 public:
   enum class Objective
   {
-    ENERGY
+    ENERGY,
+    DETERMINANT_OVERLAP
+  };
+
+  enum class OverlapTarget
+  {
+    GENERAL_FROZEN_TEACHER,
+    TOP_COEFFICIENT_MULTIDETERMINANT
+  };
+
+  enum class OverlapWeighting
+  {
+    EQUAL,
+    COEFFICIENT_SQUARED
   };
 
   enum class Optimizer
@@ -72,6 +85,12 @@ public:
   const std::string& getCheckpointPath() const noexcept { return checkpoint_path_; }
   const std::string& getRestartPath() const noexcept { return restart_path_; }
   const std::string& getProviderID() const noexcept { return provider_id_; }
+  const std::string& getTeacherWaveFunction() const noexcept { return teacher_wavefunction_; }
+  OverlapTarget getOverlapTarget() const noexcept { return overlap_target_; }
+  OverlapWeighting getOverlapWeighting() const noexcept { return overlap_weighting_; }
+  const std::string& getTargetProvenance() const noexcept { return target_provenance_; }
+  double getMinimumFidelity() const noexcept { return minimum_fidelity_; }
+  double getMinimumEffectiveSamples() const noexcept { return minimum_effective_samples_; }
 
 private:
   Objective objective_{Objective::ENERGY};
@@ -104,6 +123,12 @@ private:
   std::string checkpoint_path_;
   std::string restart_path_;
   std::string provider_id_;
+  std::string teacher_wavefunction_;
+  OverlapTarget overlap_target_{OverlapTarget::GENERAL_FROZEN_TEACHER};
+  OverlapWeighting overlap_weighting_{OverlapWeighting::EQUAL};
+  std::string target_provenance_;
+  double minimum_fidelity_{1.0e-14};
+  double minimum_effective_samples_{1.0};
 };
 
 } // namespace qmcplusplus

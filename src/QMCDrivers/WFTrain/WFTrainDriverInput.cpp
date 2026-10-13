@@ -27,7 +27,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 30> allowed_attributes{
+constexpr std::array<std::string_view, 36> allowed_attributes{
     "objective", "optimizer", "parameter_chunk_size", "learning_rate", "adam_beta1",
     "adam_beta2", "epsilon", "damping", "damping_multiplier", "minimum_retry_damping",
     "maximum_damping_attempts", "maximum_update_norm", "maximum_metric_norm", "center_shift",
@@ -35,7 +35,9 @@ constexpr std::array<std::string_view, 30> allowed_attributes{
     "krylov_relative_tolerance", "krylov_absolute_tolerance", "krylov_maximum_iterations",
     "krylov_maximum_operator_applications", "krylov_maximum_seconds", "krylov_stagnation_window",
     "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
-    "maximum_retained_bytes", "checkpoint_path", "restart_path", "provider"};
+    "maximum_retained_bytes", "checkpoint_path", "restart_path", "provider",
+    "teacher", "overlap_target", "overlap_weighting", "target_provenance",
+    "minimum_fidelity", "minimum_effective_samples"};
 
 /** Return an XML attribute value without changing its spelling or whitespace. */
 std::string readAttribute(xmlNodePtr node, const char* name)
@@ -213,13 +215,23 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   checkpoint_path_.clear();
   restart_path_.clear();
   provider_id_.clear();
+  teacher_wavefunction_.clear();
+  overlap_target_            = OverlapTarget::GENERAL_FROZEN_TEACHER;
+  overlap_weighting_         = OverlapWeighting::EQUAL;
+  target_provenance_.clear();
+  minimum_fidelity_          = 1.0e-14;
+  minimum_effective_samples_ = 1.0;
 
   if (seen_attributes.find("objective") != seen_attributes.end())
   {
     const std::string objective = readAttribute(training_node, "objective");
-    if (objective != "energy")
+    if (objective == "energy")
+      objective_ = Objective::ENERGY;
+    else if (objective == "determinant_overlap")
+      objective_ = Objective::DETERMINANT_OVERLAP;
+    else
       throw UniformCommunicateError("WFTrainDriverInput: unsupported objective=\"" + objective +
-                                    "\"; the initial driver supports exactly energy");
+                                    "\"; supported objectives are energy and determinant_overlap");
   }
   if (seen_attributes.find("optimizer") != seen_attributes.end())
   {
@@ -337,9 +349,71 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     if (provider_id_.empty())
       throw UniformCommunicateError("WFTrainDriverInput: provider must not be empty when specified");
   }
+  if (seen_attributes.find("teacher") != seen_attributes.end())
+  {
+    teacher_wavefunction_ = readAttribute(training_node, "teacher");
+    if (teacher_wavefunction_.empty())
+      throw UniformCommunicateError("WFTrainDriverInput: teacher must not be empty when specified");
+  }
+  if (seen_attributes.find("overlap_target") != seen_attributes.end())
+  {
+    const std::string target = readAttribute(training_node, "overlap_target");
+    if (target == "general")
+      overlap_target_ = OverlapTarget::GENERAL_FROZEN_TEACHER;
+    else if (target == "top_coefficients")
+      overlap_target_ = OverlapTarget::TOP_COEFFICIENT_MULTIDETERMINANT;
+    else
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: overlap_target must be general or top_coefficients");
+  }
+  if (seen_attributes.find("overlap_weighting") != seen_attributes.end())
+  {
+    const std::string weighting = readAttribute(training_node, "overlap_weighting");
+    if (weighting == "equal")
+      overlap_weighting_ = OverlapWeighting::EQUAL;
+    else if (weighting == "coefficient_squared")
+      overlap_weighting_ = OverlapWeighting::COEFFICIENT_SQUARED;
+    else
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: overlap_weighting must be equal or coefficient_squared");
+  }
+  if (seen_attributes.find("target_provenance") != seen_attributes.end())
+  {
+    target_provenance_ = readAttribute(training_node, "target_provenance");
+    if (target_provenance_.empty())
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: target_provenance must not be empty when specified");
+  }
+  if (seen_attributes.find("minimum_fidelity") != seen_attributes.end())
+  {
+    minimum_fidelity_ = parseFiniteReal(readAttribute(training_node, "minimum_fidelity"),
+                                        "minimum_fidelity");
+    if (minimum_fidelity_ < 0.0 || minimum_fidelity_ > 1.0)
+      throw UniformCommunicateError("WFTrainDriverInput: minimum_fidelity must lie in [0, 1]");
+  }
+  if (seen_attributes.find("minimum_effective_samples") != seen_attributes.end())
+    minimum_effective_samples_ = parseNonnegativeReal(
+        readAttribute(training_node, "minimum_effective_samples"),
+        "minimum_effective_samples");
 
-  if (!checkpoint_path_.empty() && checkpoint_path_ == restart_path_)
-    throw UniformCommunicateError("WFTrainDriverInput: checkpoint_path and restart_path must differ");
+  const std::initializer_list<std::string_view> overlap_attributes = {
+      "teacher", "overlap_target", "overlap_weighting", "target_provenance",
+      "minimum_fidelity", "minimum_effective_samples"};
+  if (objective_ == Objective::ENERGY)
+    rejectAttributes(seen_attributes, overlap_attributes, "energy objective");
+  else
+  {
+    if (teacher_wavefunction_.empty() || target_provenance_.empty())
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: determinant_overlap requires teacher and target_provenance");
+    if (optimizer_ != Optimizer::ADAM)
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: determinant_overlap currently requires optimizer=\"adam\"");
+    if (overlap_weighting_ == OverlapWeighting::COEFFICIENT_SQUARED &&
+        overlap_target_ != OverlapTarget::TOP_COEFFICIENT_MULTIDETERMINANT)
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: coefficient_squared weighting requires top_coefficients targets");
+  }
 
   const std::initializer_list<std::string_view> adam_attributes = {"adam_beta1", "adam_beta2", "epsilon"};
   const std::initializer_list<std::string_view> matrix_free_attributes = {

@@ -11,6 +11,10 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 #include "StdRandom.h"
+
+#include <exception>
+#include <type_traits>
+#include <utility>
 namespace qmcplusplus
 {
 template<typename T>
@@ -49,6 +53,21 @@ template<typename T>
 typename StdRandom<T>::result_type StdRandom<T>::operator()()
 {
   return distribution(engine);
+}
+
+template<typename T>
+void StdRandom<T>::swapState(RandomBase<T>& other) noexcept
+{
+  static_assert(std::is_nothrow_swappable_v<Engine>);
+  static_assert(std::is_nothrow_swappable_v<uniform_real_distribution_as_boost<T>>);
+  static_assert(std::is_nothrow_swappable_v<std::size_t>);
+  auto* typed_other = dynamic_cast<StdRandom<T>*>(&other);
+  if (!typed_other)
+    std::terminate();
+  using std::swap;
+  swap(engine, typed_other->engine);
+  swap(distribution, typed_other->distribution);
+  swap(stream_state_size, typed_other->stream_state_size);
 }
 
 template<typename T>

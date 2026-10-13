@@ -493,6 +493,10 @@ class SPRINGUpdateRule final : public TrainingUpdateRule,
                                public OptimizerCheckpointContributor
 {
 public:
+  /// Construct persistent history before a live sampled factor is available.
+  SPRINGUpdateRule(const StructuredParameterSchema& schema,
+                   SPRINGUpdateControl control = {});
+
   SPRINGUpdateRule(const ScoreCovarianceFactor& factor,
                    SPRINGUpdateControl control = {});
 
@@ -542,8 +546,7 @@ private:
                              const std::vector<DerivativeValue>& history) const;
 
   const ScoreCovarianceFactor* factor_ = nullptr;
-  std::string provider_id_;
-  std::string schema_fingerprint_;
+  StructuredParameterSchema schema_;
   SPRINGUpdateControl control_;
   std::string configuration_fingerprint_;
   std::vector<DerivativeValue> history_;
