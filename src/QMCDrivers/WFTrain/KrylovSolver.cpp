@@ -359,4 +359,347 @@ KrylovSolveResult solvePreconditionedConjugateGradient(
   }
 }
 
+KrylovSolveResult solveRestartedGMRES(
+    const MatrixFreeLinearOperator& linear_operator,
+    const StructuredParameterVectorConstView& right_hand_side,
+    const GMRESSolverControl& control,
+    const StructuredParameterVectorConstView* warm_start)
+{
+  validateControl(control.krylov);
+  if (control.restart_length == 0)
+    throw std::invalid_argument("Restarted GMRES requires a positive restart length");
+
+  const MatrixFreeOperatorDescriptor& descriptor = linear_operator.descriptor();
+  if (descriptor.reduction_domain != ReductionDomain::GLOBAL)
+    throw std::invalid_argument(
+        "Restarted GMRES requires a globally replicated operator action");
+  validateVectorIdentity(linear_operator, right_hand_side,
+                         "GMRES right-hand side");
+  if (warm_start)
+    validateVectorIdentity(linear_operator, *warm_start, "GMRES warm start");
+
+  const StructuredParameterSchema& schema = linear_operator.parameterSchema();
+  const std::size_t parameter_count       = descriptor.parameter_count;
+  const std::size_t restart_length =
+      std::min(control.restart_length, parameter_count);
+  if (restart_length == 0 ||
+      restart_length == std::numeric_limits<std::size_t>::max() ||
+      restart_length + 1 >
+          std::numeric_limits<std::size_t>::max() / parameter_count ||
+      restart_length >
+          std::numeric_limits<std::size_t>::max() / (restart_length + 1))
+    throw std::length_error("Restarted GMRES workspace extent overflows size_t");
+
+  KrylovSolveResult result;
+  result.solution.assign(parameter_count, DerivativeValue{});
+  std::vector<DerivativeValue> residual(parameter_count);
+  std::vector<DerivativeValue> action(parameter_count);
+  std::vector<DerivativeValue> basis(
+      (restart_length + 1) * parameter_count);
+  std::vector<DerivativeValue> hessenberg(
+      (restart_length + 1) * restart_length);
+  std::vector<DerivativeReal> rotations_cosine(restart_length);
+  std::vector<DerivativeValue> rotations_sine(restart_length);
+  std::vector<DerivativeValue> least_squares_rhs(restart_length + 1);
+  std::vector<DerivativeValue> coefficients(restart_length);
+
+  auto basisView = [&](std::size_t column) {
+    return DerivativeArrayView<DerivativeValue>{
+        basis.data() + column * parameter_count, parameter_count};
+  };
+  auto constBasisView = [&](std::size_t column) {
+    return DerivativeArrayView<const DerivativeValue>{
+        basis.data() + column * parameter_count, parameter_count};
+  };
+  auto hessenbergAt = [&](std::size_t row,
+                          std::size_t column) -> DerivativeValue& {
+    return hessenberg[column * (restart_length + 1) + row];
+  };
+
+  const Clock::time_point start = Clock::now();
+  try
+  {
+    copyParameterVector(schema, right_hand_side.values(), mutableView(residual));
+    const DerivativeReal right_hand_side_norm =
+        parameterVectorNorm(schema, right_hand_side.values());
+    result.initial_residual_norm = right_hand_side_norm;
+    result.final_residual_norm   = right_hand_side_norm;
+    if (right_hand_side_norm == 0.0)
+    {
+      finishResult(result, KrylovStopReason::ZERO_RIGHT_HAND_SIDE, start);
+      return result;
+    }
+
+    if (warm_start)
+    {
+      copyParameterVector(schema, warm_start->values(),
+                          mutableView(result.solution));
+      if (control.krylov.maximum_operator_applications == 0)
+      {
+        finishResult(result, KrylovStopReason::OPERATOR_APPLICATION_LIMIT, start);
+        return result;
+      }
+      if (control.krylov.maximum_seconds > 0.0 &&
+          elapsedSeconds(start) >= control.krylov.maximum_seconds)
+      {
+        finishResult(result, KrylovStopReason::TIME_LIMIT, start);
+        return result;
+      }
+      const StructuredParameterVectorConstView solution_view(
+          schema, descriptor.parameter_version, constView(result.solution));
+      linear_operator.apply(solution_view, mutableView(action));
+      ++result.operator_applications;
+      axpyParameterVector(schema, {-1.0, 0.0}, constView(action),
+                          mutableView(residual));
+    }
+
+    result.initial_residual_norm =
+        parameterVectorNorm(schema, constView(residual));
+    result.final_residual_norm = result.initial_residual_norm;
+    const DerivativeReal target = std::max(
+        control.krylov.absolute_tolerance,
+        control.krylov.relative_tolerance * right_hand_side_norm);
+    if (result.initial_residual_norm <= target)
+    {
+      finishResult(result, KrylovStopReason::CONVERGED, start);
+      return result;
+    }
+    if (control.krylov.maximum_iterations == 0)
+    {
+      finishResult(result, KrylovStopReason::ITERATION_LIMIT, start);
+      return result;
+    }
+
+    DerivativeReal best_residual = result.final_residual_norm;
+    std::size_t stagnant_iterations = 0;
+    while (true)
+    {
+      std::fill(hessenberg.begin(), hessenberg.end(), DerivativeValue{});
+      std::fill(rotations_cosine.begin(), rotations_cosine.end(),
+                DerivativeReal{});
+      std::fill(rotations_sine.begin(), rotations_sine.end(),
+                DerivativeValue{});
+      std::fill(least_squares_rhs.begin(), least_squares_rhs.end(),
+                DerivativeValue{});
+      std::fill(coefficients.begin(), coefficients.end(), DerivativeValue{});
+
+      const DerivativeReal cycle_residual = result.final_residual_norm;
+      DerivativeArrayView<DerivativeValue> first_basis = basisView(0);
+      for (std::size_t parameter = 0; parameter < parameter_count; ++parameter)
+        first_basis[parameter] = residual[parameter] / cycle_residual;
+      least_squares_rhs[0] = {cycle_residual, 0.0};
+
+      KrylovStopReason pending_reason = KrylovStopReason::BREAKDOWN;
+      bool have_pending_reason = false;
+      std::size_t arnoldi_columns = 0;
+      for (std::size_t column = 0; column < restart_length; ++column)
+      {
+        if (result.operator_applications >=
+            control.krylov.maximum_operator_applications)
+        {
+          pending_reason = KrylovStopReason::OPERATOR_APPLICATION_LIMIT;
+          have_pending_reason = true;
+          break;
+        }
+        if (control.krylov.maximum_seconds > 0.0 &&
+            elapsedSeconds(start) >= control.krylov.maximum_seconds)
+        {
+          pending_reason = KrylovStopReason::TIME_LIMIT;
+          have_pending_reason = true;
+          break;
+        }
+
+        const StructuredParameterVectorConstView basis_vector(
+            schema, descriptor.parameter_version, constBasisView(column));
+        linear_operator.apply(basis_vector, mutableView(action));
+        ++result.operator_applications;
+
+        // Two-pass modified Gram--Schmidt limits loss of orthogonality for the
+        // nonnormal operators that motivate this solver.
+        for (int pass = 0; pass < 2; ++pass)
+          for (std::size_t row = 0; row <= column; ++row)
+          {
+            const DerivativeValue projection = parameterVectorHermitianDot(
+                schema, constBasisView(row), constView(action));
+            hessenbergAt(row, column) += projection;
+            axpyParameterVector(schema, -projection, constBasisView(row),
+                                mutableView(action));
+          }
+        const DerivativeReal next_norm =
+            parameterVectorNorm(schema, constView(action));
+        hessenbergAt(column + 1, column) = {next_norm, 0.0};
+        if (next_norm > 0.0)
+        {
+          DerivativeArrayView<DerivativeValue> next_basis =
+              basisView(column + 1);
+          for (std::size_t parameter = 0; parameter < parameter_count;
+               ++parameter)
+            next_basis[parameter] = action[parameter] / next_norm;
+        }
+
+        for (std::size_t rotation = 0; rotation < column; ++rotation)
+        {
+          const DerivativeValue upper = hessenbergAt(rotation, column);
+          const DerivativeValue lower = hessenbergAt(rotation + 1, column);
+          hessenbergAt(rotation, column) =
+              rotations_cosine[rotation] * upper +
+              rotations_sine[rotation] * lower;
+          hessenbergAt(rotation + 1, column) =
+              -std::conj(rotations_sine[rotation]) * upper +
+              rotations_cosine[rotation] * lower;
+        }
+
+        const DerivativeValue diagonal = hessenbergAt(column, column);
+        const DerivativeValue subdiagonal =
+            hessenbergAt(column + 1, column);
+        const DerivativeReal diagonal_norm = std::abs(diagonal);
+        const DerivativeReal subdiagonal_norm = std::abs(subdiagonal);
+        const DerivativeReal rotation_norm =
+            std::hypot(diagonal_norm, subdiagonal_norm);
+        if (rotation_norm == 0.0)
+        {
+          pending_reason = KrylovStopReason::BREAKDOWN;
+          have_pending_reason = true;
+          break;
+        }
+        if (diagonal_norm == 0.0)
+        {
+          rotations_cosine[column] = 0.0;
+          rotations_sine[column] =
+              std::conj(subdiagonal) / subdiagonal_norm;
+          hessenbergAt(column, column) = {subdiagonal_norm, 0.0};
+        }
+        else
+        {
+          const DerivativeValue phase = diagonal / diagonal_norm;
+          rotations_cosine[column] = diagonal_norm / rotation_norm;
+          rotations_sine[column] =
+              phase * std::conj(subdiagonal) / rotation_norm;
+          hessenbergAt(column, column) = phase * rotation_norm;
+        }
+        hessenbergAt(column + 1, column) = {};
+
+        const DerivativeValue current_rhs = least_squares_rhs[column];
+        least_squares_rhs[column] =
+            rotations_cosine[column] * current_rhs;
+        least_squares_rhs[column + 1] =
+            -std::conj(rotations_sine[column]) * current_rhs;
+        ++result.iterations;
+        arnoldi_columns = column + 1;
+        result.final_residual_norm =
+            std::abs(least_squares_rhs[column + 1]);
+
+        if (result.final_residual_norm <= target)
+        {
+          pending_reason = KrylovStopReason::CONVERGED;
+          have_pending_reason = true;
+          break;
+        }
+        const DerivativeReal required_improvement =
+            control.krylov.minimum_relative_improvement * best_residual;
+        if (best_residual - result.final_residual_norm > required_improvement)
+        {
+          best_residual = result.final_residual_norm;
+          stagnant_iterations = 0;
+        }
+        else if (control.krylov.stagnation_window > 0 &&
+                 ++stagnant_iterations >= control.krylov.stagnation_window)
+        {
+          pending_reason = KrylovStopReason::STAGNATED;
+          have_pending_reason = true;
+          break;
+        }
+        if (next_norm == 0.0)
+        {
+          pending_reason = KrylovStopReason::BREAKDOWN;
+          have_pending_reason = true;
+          break;
+        }
+        if (result.iterations >= control.krylov.maximum_iterations)
+        {
+          pending_reason = KrylovStopReason::ITERATION_LIMIT;
+          have_pending_reason = true;
+          break;
+        }
+      }
+
+      if (arnoldi_columns == 0)
+      {
+        finishResult(result,
+                     have_pending_reason ? pending_reason
+                                         : KrylovStopReason::BREAKDOWN,
+                     start);
+        return result;
+      }
+
+      for (std::size_t reverse = arnoldi_columns; reverse > 0; --reverse)
+      {
+        const std::size_t row = reverse - 1;
+        DerivativeValue value = least_squares_rhs[row];
+        for (std::size_t column = row + 1; column < arnoldi_columns;
+             ++column)
+          value -= hessenbergAt(row, column) * coefficients[column];
+        const DerivativeValue diagonal = hessenbergAt(row, row);
+        const DerivativeReal threshold =
+            std::numeric_limits<DerivativeReal>::epsilon() *
+            std::max(DerivativeReal{1}, std::abs(value));
+        if (std::abs(diagonal) <= threshold)
+        {
+          finishResult(result, KrylovStopReason::BREAKDOWN, start);
+          return result;
+        }
+        coefficients[row] = value / diagonal;
+      }
+      for (std::size_t column = 0; column < arnoldi_columns; ++column)
+        axpyParameterVector(schema, coefficients[column], constBasisView(column),
+                            mutableView(result.solution));
+
+      if (have_pending_reason)
+      {
+        finishResult(result, pending_reason, start);
+        return result;
+      }
+      if (result.iterations >= control.krylov.maximum_iterations)
+      {
+        finishResult(result, KrylovStopReason::ITERATION_LIMIT, start);
+        return result;
+      }
+      if (result.operator_applications >=
+          control.krylov.maximum_operator_applications)
+      {
+        finishResult(result, KrylovStopReason::OPERATOR_APPLICATION_LIMIT, start);
+        return result;
+      }
+      if (control.krylov.maximum_seconds > 0.0 &&
+          elapsedSeconds(start) >= control.krylov.maximum_seconds)
+      {
+        finishResult(result, KrylovStopReason::TIME_LIMIT, start);
+        return result;
+      }
+
+      // Recompute the true residual at every restart. This prevents recursively
+      // accumulated Arnoldi residual estimates from crossing cycle boundaries.
+      const StructuredParameterVectorConstView solution_view(
+          schema, descriptor.parameter_version, constView(result.solution));
+      linear_operator.apply(solution_view, mutableView(action));
+      ++result.operator_applications;
+      copyParameterVector(schema, right_hand_side.values(), mutableView(residual));
+      axpyParameterVector(schema, {-1.0, 0.0}, constView(action),
+                          mutableView(residual));
+      result.final_residual_norm =
+          parameterVectorNorm(schema, constView(residual));
+      if (result.final_residual_norm <= target)
+      {
+        finishResult(result, KrylovStopReason::CONVERGED, start);
+        return result;
+      }
+    }
+  }
+  catch (const MatrixFreeNumericalError&)
+  {
+    finishResult(result, KrylovStopReason::NONFINITE_RESULT, start);
+    return result;
+  }
+}
+
 } // namespace qmcplusplus::wftrain

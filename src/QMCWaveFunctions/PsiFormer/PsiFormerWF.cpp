@@ -1307,6 +1307,8 @@ public:
     result.product_mask =
         wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_VJP) |
         wftrain::derivativeProductBit(wftrain::DerivativeProduct::SCORE_JVP) |
+        wftrain::derivativeProductBit(
+            wftrain::DerivativeProduct::LOCAL_ENERGY_JVP) |
         wftrain::derivativeProductBit(wftrain::DerivativeProduct::LOCAL_ENERGY_VJP);
     result.adjoint_mask =
         wftrain::derivativeAdjointBit(wftrain::DerivativeAdjoint::TRANSPOSE) |
@@ -1486,6 +1488,75 @@ protected:
     }
 
     // Emit only after the complete batch has been computed and the model unlocked.
+    for (std::size_t sample = 0; sample < sample_count_; ++sample)
+    {
+      const wftrain::SampleProductTileDescriptor descriptor{
+          schema_->providerId(), schema_->fingerprint(), parameter_version_,
+          batch_ordinal_, sample_offset_ + sample, 1, sample};
+      sink.add({descriptor, {sample_products_.data() + sample, 1}});
+    }
+  }
+
+  /// Contract the exact mass-weighted kinetic response with one parameter direction.
+  void evaluateLocalEnergyJVP(
+      const wftrain::StructuredParameterVectorConstView& direction,
+      std::uint32_t local_energy_term_mask,
+      wftrain::SampleProductSink& sink) const override
+  {
+    if (local_energy_term_mask !=
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC))
+      throw std::invalid_argument(
+          "PsiFormer streaming local-energy JVP supports only the kinetic term");
+
+    {
+      std::shared_lock state_lock(model_state_->mutex);
+      requireBoundVersion();
+      for (std::size_t sample = 0; sample < sample_count_; ++sample)
+      {
+        setKineticWorkspacePositions(sample);
+        const double* total_drift = total_log_gradients_real_.data() +
+            sample * electron_count_ * std::size_t{3};
+        const double* imaginary_drift =
+            total_log_gradients_imaginary_.data() +
+            sample * electron_count_ * std::size_t{3};
+        const double* inverse_mass =
+            inverse_masses_.data() + sample * electron_count_;
+        const pf::DirectKineticResultView result =
+            model_state_->direct_kinetic_executor.evaluate(
+                *kinetic_workspace_, total_drift,
+                electron_count_ * std::size_t{3}, inverse_mass,
+                electron_count_);
+        requireResultVersion(result);
+
+        wftrain::DerivativeValue& product = sample_products_[sample];
+        product                           = {};
+        for (std::size_t parameter = 0;
+             parameter < result.kinetic_parameter_response.size(); ++parameter)
+          product += result.kinetic_parameter_response[parameter] *
+              direction.values()[parameter];
+
+        const bool has_imaginary_drift = std::any_of(
+            imaginary_drift,
+            imaginary_drift + electron_count_ * std::size_t{3},
+            [](double value) { return value != 0.0; });
+        if (has_imaginary_drift)
+        {
+          const pf::DirectKineticConstView imaginary_response =
+              model_state_->direct_kinetic_executor
+                  .evaluateGradientParameterResponse(
+                      *kinetic_workspace_, imaginary_drift,
+                      electron_count_ * std::size_t{3}, inverse_mass,
+                      electron_count_);
+          for (std::size_t parameter = 0;
+               parameter < imaginary_response.size(); ++parameter)
+            product += wftrain::DerivativeValue(0.0,
+                                                imaginary_response[parameter]) *
+                direction.values()[parameter];
+        }
+      }
+    }
+
+    // Emit only after every sample is complete and the shared model lock is released.
     for (std::size_t sample = 0; sample < sample_count_; ++sample)
     {
       const wftrain::SampleProductTileDescriptor descriptor{

@@ -37,7 +37,8 @@ enum class TrainingCapability : std::uint8_t
   SHARED_MODEL_THREADING,
   DISTRIBUTED_REDUCTION,
   ORBITAL_MSE_VJP,
-  DEVICE_EXECUTION
+  DEVICE_EXECUTION,
+  LOCAL_ENERGY_JVP
 };
 
 /// Store a compact set of training capabilities and produce readable diagnostics.

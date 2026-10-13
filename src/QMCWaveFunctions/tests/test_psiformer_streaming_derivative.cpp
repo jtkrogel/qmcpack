@@ -420,6 +420,7 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
   CHECK(capability.supports(DerivativeProduct::SCORE_VJP));
   CHECK(capability.supports(DerivativeProduct::SCORE_JVP));
   CHECK(capability.supports(DerivativeProduct::LOCAL_ENERGY_VJP));
+  CHECK(capability.supports(DerivativeProduct::LOCAL_ENERGY_JVP));
   CHECK(capability.local_energy_term_mask ==
         wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC));
   CHECK(capability.maximum_vjp_channels == 3);
@@ -580,6 +581,28 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
     checkClose(jvp_sink.results()[sample], expected);
   }
 
+  RecordingSampleSink kinetic_jvp_sink;
+  op->applyLocalEnergyJVP(
+      direction_view,
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC),
+      kinetic_jvp_sink);
+  REQUIRE(kinetic_jvp_sink.results().size() == 2);
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    DerivativeValue expected{};
+    for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
+      expected += expected_kinetic[sample][parameter] *
+          selected_direction[parameter];
+    checkClose(kinetic_jvp_sink.results()[sample], expected);
+  }
+
+  RecordingSampleSink unsupported_jvp_sink;
+  CHECK_THROWS(op->applyLocalEnergyJVP(
+      direction_view,
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP),
+      unsupported_jvp_sink));
+  CHECK(unsupported_jvp_sink.state() == DerivativeSinkState::IDLE);
+
   // Verify the matrix-free duality identity using the first complex VJP channel.
   DerivativeValue direction_dot_vjp{};
   for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
@@ -640,6 +663,13 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
       {empty_direction.data(), empty_direction.size()});
   RecordingSampleSink empty_sample_sink;
   empty_op->applyScoreJVP(empty_direction_view, empty_sample_sink);
+  CHECK(empty_sample_sink.state() == DerivativeSinkState::COMPLETE);
+  CHECK(empty_sample_sink.results().empty());
+  empty_sample_sink.reset();
+  empty_op->applyLocalEnergyJVP(
+      empty_direction_view,
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC),
+      empty_sample_sink);
   CHECK(empty_sample_sink.state() == DerivativeSinkState::COMPLETE);
   CHECK(empty_sample_sink.results().empty());
   empty_op.reset();

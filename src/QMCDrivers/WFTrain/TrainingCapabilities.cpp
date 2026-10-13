@@ -49,7 +49,7 @@ std::vector<TrainingCapability> TrainingCapabilities::missing(
 {
   std::vector<TrainingCapability> result;
   for (std::uint8_t index = 0;
-       index <= static_cast<std::uint8_t>(TrainingCapability::DEVICE_EXECUTION); ++index)
+       index <= static_cast<std::uint8_t>(TrainingCapability::LOCAL_ENERGY_JVP); ++index)
   {
     const TrainingCapability capability = static_cast<TrainingCapability>(index);
     if (required.contains(capability) && !contains(capability))
@@ -76,6 +76,8 @@ const char* trainingCapabilityName(TrainingCapability capability) noexcept
     return "score_jvp";
   case TrainingCapability::LOCAL_ENERGY_VJP:
     return "local_energy_vjp";
+  case TrainingCapability::LOCAL_ENERGY_JVP:
+    return "local_energy_jvp";
   case TrainingCapability::NONLOCAL_ECP:
     return "nonlocal_ecp";
   case TrainingCapability::ALL_ELECTRON_MOVES:

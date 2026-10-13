@@ -47,7 +47,8 @@ enum class DerivativeProduct : std::uint32_t
 {
   SCORE_VJP        = UINT32_C(1) << 0,
   LOCAL_ENERGY_VJP = UINT32_C(1) << 1,
-  SCORE_JVP        = UINT32_C(1) << 2
+  SCORE_JVP        = UINT32_C(1) << 2,
+  LOCAL_ENERGY_JVP = UINT32_C(1) << 3
 };
 
 /// Select transpose or conjugate-transpose contraction of a complex derivative.
@@ -335,6 +336,8 @@ struct DerivativeStreamDescriptor
   std::size_t maximum_vjp_channels             = 0;
   std::size_t maximum_parameter_chunk_size     = 0;
   std::size_t maximum_sample_tile_size         = 0;
+  /// Hamiltonian terms covered by a local-energy product; zero otherwise.
+  std::uint32_t local_energy_term_mask          = 0;
 };
 
 /// Describe one bounded, ordered interval of JVP sample results.
@@ -625,6 +628,16 @@ public:
   /// Apply the score Jacobian to one schema/version-bound parameter direction.
   void applyScoreJVP(const StructuredParameterVectorConstView& direction, SampleProductSink& sink) const;
 
+  /** Apply selected local-energy Jacobian terms to one parameter direction.
+   *
+   * The requested term mask is checked against the producer's exact coverage before
+   * the sink transaction begins. Results use the same ordered sample interval as the
+   * score JVP and remain bounded one-dimensional tiles.
+   */
+  void applyLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
+                           std::uint32_t local_energy_term_mask,
+                           SampleProductSink& sink) const;
+
 protected:
   /// Emit chunk-major/channel-minor VJP results after common preflight succeeds.
   virtual void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
@@ -634,6 +647,15 @@ protected:
   /// Emit monotonically ordered bounded JVP sample tiles after common preflight succeeds.
   virtual void evaluateScoreJVP(const StructuredParameterVectorConstView& direction,
                                 SampleProductSink& sink) const = 0;
+
+  /** Emit bounded local-energy JVP tiles after common preflight succeeds.
+   *
+   * The compatibility default rejects evaluation. A producer may advertise
+   * LOCAL_ENERGY_JVP only when it overrides this method for every advertised term.
+   */
+  virtual void evaluateLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
+                                      std::uint32_t local_energy_term_mask,
+                                      SampleProductSink& sink) const;
 };
 
 } // namespace qmcplusplus::wftrain

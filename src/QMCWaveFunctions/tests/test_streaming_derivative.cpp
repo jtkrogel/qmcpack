@@ -273,7 +273,8 @@ public:
     StreamingDerivativeCapabilities result;
     result.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
         derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) |
-        derivativeProductBit(DerivativeProduct::SCORE_JVP);
+        derivativeProductBit(DerivativeProduct::SCORE_JVP) |
+        derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
     result.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) |
         derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
     result.parameter_scalar_domain      = parameter_domain_;
@@ -352,6 +353,32 @@ protected:
 
       const SampleProductTileDescriptor descriptor{schema_.providerId(), schema_.fingerprint(), PARAMETER_VERSION,
                                                    BATCH_ORDINAL, SAMPLE_OFFSET + sample_begin, count, ordinal};
+      sink.add({descriptor, {values.data(), values.size()}});
+    }
+  }
+
+  /// Multiply the dense local-energy oracle by a direction in bounded sample tiles.
+  void evaluateLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
+                              std::uint32_t,
+                              SampleProductSink& sink) const override
+  {
+    ++jvp_evaluation_count_;
+    for (std::size_t sample_begin = 0, ordinal = 0;
+         sample_begin < sample_count_; sample_begin += 2, ++ordinal)
+    {
+      const std::size_t count =
+          std::min<std::size_t>(2, sample_count_ - sample_begin);
+      ComplexVector values(count);
+      for (std::size_t local_sample = 0; local_sample < count; ++local_sample)
+        for (std::size_t parameter = 0;
+             parameter < direction.values().size(); ++parameter)
+          values[local_sample] +=
+              local_energy_[sample_begin + local_sample][parameter] *
+              direction.values()[parameter];
+
+      const SampleProductTileDescriptor descriptor{
+          schema_.providerId(), schema_.fingerprint(), PARAMETER_VERSION,
+          BATCH_ORDINAL, SAMPLE_OFFSET + sample_begin, count, ordinal};
       sink.add({descriptor, {values.data(), values.size()}});
     }
   }
@@ -454,6 +481,11 @@ TEST_CASE("Streaming derivative VJP and JVP match independent complex oracles", 
   RecordingSampleSink jvp_sink;
   op.applyScoreJVP(direction_view, jvp_sink);
   checkComplexVector(jvp_sink.result(), denseJVP(makeScoreJacobian(), direction));
+
+  RecordingSampleSink local_energy_jvp_sink;
+  op.applyLocalEnergyJVP(direction_view, energy_terms, local_energy_jvp_sink);
+  checkComplexVector(local_energy_jvp_sink.result(),
+                     denseJVP(makeLocalEnergyJacobian(), direction));
 }
 
 TEST_CASE("Streaming derivative sinks poison incomplete or invalid transactions", "[wavefunction][training]")
@@ -669,6 +701,24 @@ TEST_CASE("Streaming derivative preflight rejects unsafe direction and execution
   CHECK_THROWS_AS(direct_sample_sink.begin(direct_sample_descriptor), std::logic_error);
   CHECK(direct_sample_sink.state() == DerivativeSinkState::POISONED);
   CHECK(direct_sample_sink.beginCalls() == 0);
+
+  direct_sample_descriptor.execution_domain = DerivativeExecutionDomain::HOST;
+  direct_sample_descriptor.product_mask =
+      derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
+  direct_sample_descriptor.local_energy_term_mask = 0;
+  RecordingSampleSink missing_terms_sink;
+  CHECK_THROWS_AS(missing_terms_sink.begin(direct_sample_descriptor),
+                  std::logic_error);
+  CHECK(missing_terms_sink.state() == DerivativeSinkState::POISONED);
+
+  direct_sample_descriptor.product_mask =
+      derivativeProductBit(DerivativeProduct::SCORE_JVP);
+  direct_sample_descriptor.local_energy_term_mask =
+      localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  RecordingSampleSink score_terms_sink;
+  CHECK_THROWS_AS(score_terms_sink.begin(direct_sample_descriptor),
+                  std::logic_error);
+  CHECK(score_terms_sink.state() == DerivativeSinkState::POISONED);
 }
 
 TEST_CASE("Streaming derivative capacities bound storage and zero-sample transitions", "[wavefunction][training]")
@@ -711,6 +761,21 @@ TEST_CASE("Streaming derivative capacities bound storage and zero-sample transit
                   std::runtime_error);
   CHECK(untouched_sink.state() == DerivativeSinkState::IDLE);
 
+  ComplexVector kinetic_direction_values(
+      kinetic_only_op.parameterSchema().parameterCount(), {0.1, 0.0});
+  const StructuredParameterVectorConstView kinetic_direction(
+      kinetic_only_op.parameterSchema(), kinetic_only_op.parameterVersion(),
+      {kinetic_direction_values.data(), kinetic_direction_values.size()});
+  RecordingSampleSink missing_ecp_jvp_sink;
+  CHECK_THROWS_AS(
+      kinetic_only_op.applyLocalEnergyJVP(
+          kinetic_direction,
+          localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+              localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP),
+          missing_ecp_jvp_sink),
+      std::runtime_error);
+  CHECK(missing_ecp_jvp_sink.state() == DerivativeSinkState::IDLE);
+
   const DenseOracleOperator empty_op(0);
   const ComplexVector empty_coefficients;
   const std::array<VJPCoefficientChannel, 1> empty_channel{{
@@ -726,6 +791,12 @@ TEST_CASE("Streaming derivative capacities bound storage and zero-sample transit
                                                            {direction.data(), direction.size()});
   RecordingSampleSink empty_sample_sink;
   empty_op.applyScoreJVP(direction_view, empty_sample_sink);
+  CHECK(empty_sample_sink.state() == DerivativeSinkState::COMPLETE);
+  CHECK(empty_sample_sink.result().empty());
+  empty_sample_sink.reset();
+  empty_op.applyLocalEnergyJVP(
+      direction_view, DenseOracleOperator::allLocalEnergyTerms(),
+      empty_sample_sink);
   CHECK(empty_sample_sink.state() == DerivativeSinkState::COMPLETE);
   CHECK(empty_sample_sink.result().empty());
 

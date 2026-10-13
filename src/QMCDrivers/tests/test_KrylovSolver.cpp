@@ -114,6 +114,18 @@ KrylovSolveResult solve(const MatrixFreeLinearOperator& linear_operator,
                                                rhs_view, control);
 }
 
+/// Solve one test system with restarted GMRES from a plain owning right-hand side.
+KrylovSolveResult solveGMRES(const MatrixFreeLinearOperator& linear_operator,
+                             const std::vector<DerivativeValue>& rhs,
+                             GMRESSolverControl control = {})
+{
+  StructuredParameterVectorConstView rhs_view(
+      linear_operator.parameterSchema(),
+      linear_operator.descriptor().parameter_version,
+      {rhs.data(), rhs.size()});
+  return solveRestartedGMRES(linear_operator, rhs_view, control);
+}
+
 } // namespace
 
 TEST_CASE("Preconditioned CG matches a real dense SPD oracle", "[drivers][wftrain]")
@@ -279,6 +291,80 @@ TEST_CASE("Preconditioned CG rejects incompatible operator contracts", "[drivers
   CHECK(zero_rhs_from_warm.operator_applications == 0);
   CHECK(zero_rhs_from_warm.solution[0].real() == Catch::Approx(0.0).margin(1.0e-12));
   CHECK(zero_rhs_from_warm.solution[1].real() == Catch::Approx(0.0).margin(1.0e-12));
+}
+
+TEST_CASE("Restarted GMRES matches a dense nonnormal oracle",
+          "[drivers][wftrain][gmres]")
+{
+  const StructuredParameterSchema schema =
+      makeKrylovSchema("gmres_nonnormal", 3, ParameterScalarDomain::REAL64);
+  KrylovDenseOperator linear_operator(
+      schema, 9,
+      {{4.0, 0.0}, {1.0, 0.0}, {0.0, 0.0},
+       {0.0, 0.0}, {3.0, 0.0}, {1.0, 0.0},
+       {0.0, 0.0}, {0.0, 0.0}, {2.0, 0.0}},
+      false);
+  const std::vector<DerivativeValue> rhs{
+      {6.0, 0.0}, {9.0, 0.0}, {6.0, 0.0}};
+  GMRESSolverControl control;
+  control.restart_length = 2;
+  control.krylov.relative_tolerance = 1.0e-12;
+  control.krylov.maximum_iterations = 60;
+  control.krylov.maximum_operator_applications = 90;
+  const KrylovSolveResult result = solveGMRES(linear_operator, rhs, control);
+  REQUIRE(result.converged);
+  CHECK(result.stop_reason == KrylovStopReason::CONVERGED);
+  REQUIRE(result.solution.size() == 3);
+  CHECK(result.solution[0].real() == Catch::Approx(1.0).epsilon(1.0e-10));
+  CHECK(result.solution[1].real() == Catch::Approx(2.0).epsilon(1.0e-10));
+  CHECK(result.solution[2].real() == Catch::Approx(3.0).epsilon(1.0e-10));
+  CHECK(result.final_residual_norm <= 1.0e-10);
+  CHECK(result.iterations > control.restart_length);
+  CHECK(linear_operator.outputAddressStable());
+}
+
+TEST_CASE("Restarted GMRES obeys iteration and operator work limits",
+          "[drivers][wftrain][gmres]")
+{
+  const StructuredParameterSchema schema =
+      makeKrylovSchema("gmres_limits", 2, ParameterScalarDomain::REAL64);
+  const std::vector<DerivativeValue> rhs{{1.0, 0.0}, {1.0, 0.0}};
+  KrylovDenseOperator linear_operator(
+      schema, 3,
+      {{1.0, 0.0}, {8.0, 0.0}, {0.0, 0.0}, {2.0, 0.0}}, false);
+
+  GMRESSolverControl operator_limit;
+  operator_limit.restart_length = 1;
+  operator_limit.krylov.relative_tolerance = 1.0e-14;
+  operator_limit.krylov.maximum_iterations = 10;
+  operator_limit.krylov.maximum_operator_applications = 1;
+  const KrylovSolveResult operator_limited =
+      solveGMRES(linear_operator, rhs, operator_limit);
+  CHECK_FALSE(operator_limited.converged);
+  CHECK(operator_limited.stop_reason ==
+        KrylovStopReason::OPERATOR_APPLICATION_LIMIT);
+  CHECK(operator_limited.operator_applications == 1);
+  CHECK(operator_limited.iterations == 1);
+
+  GMRESSolverControl iteration_limit = operator_limit;
+  iteration_limit.krylov.maximum_iterations = 1;
+  iteration_limit.krylov.maximum_operator_applications = 10;
+  const KrylovSolveResult iteration_limited =
+      solveGMRES(linear_operator, rhs, iteration_limit);
+  CHECK_FALSE(iteration_limited.converged);
+  CHECK(iteration_limited.stop_reason == KrylovStopReason::ITERATION_LIMIT);
+  CHECK(iteration_limited.iterations == 1);
+
+  GMRESSolverControl invalid;
+  invalid.restart_length = 0;
+  CHECK_THROWS_AS(solveGMRES(linear_operator, rhs, invalid),
+                  std::invalid_argument);
+
+  KrylovDenseOperator local_operator(
+      schema, 3,
+      {{1.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}}, false,
+      ReductionDomain::RANK_LOCAL);
+  CHECK_THROWS_AS(solveGMRES(local_operator, rhs), std::invalid_argument);
 }
 
 } // namespace qmcplusplus::wftrain

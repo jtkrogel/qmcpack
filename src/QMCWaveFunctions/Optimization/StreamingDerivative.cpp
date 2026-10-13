@@ -69,9 +69,9 @@ void validateDirectionValues(const StructuredParameterSchema& schema,
     {
       const DerivativeValue value = values[block.offset + index];
       if (!isFinite(value))
-        throw std::invalid_argument("Score JVP direction contains a non-finite value");
+        throw std::invalid_argument("JVP direction contains a non-finite value");
       if (block.scalar_domain == ParameterScalarDomain::REAL64 && value.imag() != DerivativeReal{})
-        throw std::invalid_argument("Score JVP direction for real parameters has a nonzero imaginary part");
+        throw std::invalid_argument("JVP direction for real parameters has a nonzero imaginary part");
     }
 }
 
@@ -413,12 +413,24 @@ void SampleProductSink::begin(const DerivativeStreamDescriptor& descriptor)
     poisonAndThrow("Sample-product sink begin requires idle state");
   if (descriptor.provider_id.empty() || descriptor.schema_fingerprint.empty())
     poisonAndThrow("Sample-product stream identity must not be empty");
-  if (descriptor.product_mask != derivativeProductBit(DerivativeProduct::SCORE_JVP))
-    poisonAndThrow("Sample-product sink accepts only score JVP streams");
+  const bool score_jvp =
+      descriptor.product_mask == derivativeProductBit(DerivativeProduct::SCORE_JVP);
+  const bool local_energy_jvp = descriptor.product_mask ==
+      derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
+  constexpr std::uint32_t known_local_energy_terms =
+      localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+      localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  if (!score_jvp && !local_energy_jvp)
+    poisonAndThrow("Sample-product sink accepts only one JVP product");
+  if ((score_jvp && descriptor.local_energy_term_mask != 0) ||
+      (local_energy_jvp &&
+       (descriptor.local_energy_term_mask == 0 ||
+        (descriptor.local_energy_term_mask & ~known_local_energy_terms) != 0)))
+    poisonAndThrow("Sample-product stream has inconsistent local-energy term coverage");
   if (descriptor.execution_domain != DerivativeExecutionDomain::HOST)
     poisonAndThrow("Sample-product sinks currently accept host-accessible values only");
   if (descriptor.adjoint != DerivativeAdjoint::TRANSPOSE)
-    poisonAndThrow("Score JVP streams require the transpose direction convention");
+    poisonAndThrow("JVP streams require the transpose direction convention");
   if (descriptor.maximum_sample_tile_size == 0)
     poisonAndThrow("Sample-product stream tile capacity must be greater than zero");
   if (descriptor.sample_offset > std::numeric_limits<std::size_t>::max() - descriptor.sample_count)
@@ -691,7 +703,8 @@ void StreamingDerivativeOperator::applyScoreJVP(const StructuredParameterVectorC
                                         support.execution_domain,
                                         support.maximum_vjp_channels,
                                         support.maximum_parameter_chunk_size,
-                                        support.maximum_sample_tile_size};
+                                        support.maximum_sample_tile_size,
+                                        0};
 
   sink.begin(descriptor);
   try
@@ -710,6 +723,81 @@ void StreamingDerivativeOperator::applyScoreJVP(const StructuredParameterVectorC
       sink.abort();
     throw;
   }
+}
+
+void StreamingDerivativeOperator::applyLocalEnergyJVP(
+    const StructuredParameterVectorConstView& direction,
+    std::uint32_t local_energy_term_mask,
+    SampleProductSink& sink) const
+{
+  const StreamingDerivativeCapabilities support = capabilities();
+  const StructuredParameterSchema& schema        = parameterSchema();
+  if (support.execution_domain != DerivativeExecutionDomain::HOST)
+    throw std::runtime_error(
+        "Local-energy JVP requires a device-aware sink for device execution");
+  if (!support.supports(DerivativeProduct::LOCAL_ENERGY_JVP) ||
+      support.maximum_sample_tile_size == 0)
+    throw std::runtime_error(
+        "Streaming derivative producer does not support bounded local-energy JVP tiles");
+  if (local_energy_term_mask == 0 ||
+      !support.coversLocalEnergyTerms(local_energy_term_mask))
+    throw std::runtime_error(
+        "Streaming derivative producer lacks requested local-energy JVP term coverage");
+  for (const ParameterBlockDescriptor& block : schema.blocks())
+    if (block.scalar_domain != support.parameter_scalar_domain)
+      throw std::runtime_error(
+          "Local-energy JVP producer scalar domain is inconsistent with its parameter schema");
+  if (direction.providerId() != schema.providerId() ||
+      direction.schemaFingerprint() != schema.fingerprint() ||
+      direction.parameterVersion() != parameterVersion())
+    throw std::invalid_argument(
+        "Local-energy JVP direction does not match the producer schema and version");
+  validateDirectionValues(schema, direction.values());
+
+  DerivativeStreamDescriptor descriptor{
+      schema.providerId(),
+      schema.fingerprint(),
+      parameterVersion(),
+      derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP),
+      DerivativeAdjoint::TRANSPOSE,
+      support.parameter_scalar_domain,
+      support.result_scalar_domain,
+      batchOrdinal(),
+      sampleOffset(),
+      sampleCount(),
+      support.reduction_domain,
+      support.execution_domain,
+      support.maximum_vjp_channels,
+      support.maximum_parameter_chunk_size,
+      support.maximum_sample_tile_size,
+      local_energy_term_mask};
+
+  sink.begin(descriptor);
+  try
+  {
+    if (sampleCount() == 0)
+      sink.endEmptyBatch();
+    else
+    {
+      evaluateLocalEnergyJVP(direction, local_energy_term_mask, sink);
+      sink.end();
+    }
+  }
+  catch (...)
+  {
+    if (sink.state() == DerivativeSinkState::ACTIVE)
+      sink.abort();
+    throw;
+  }
+}
+
+void StreamingDerivativeOperator::evaluateLocalEnergyJVP(
+    const StructuredParameterVectorConstView&,
+    std::uint32_t,
+    SampleProductSink&) const
+{
+  throw std::logic_error(
+      "Streaming derivative producer advertised local-energy JVP without an implementation");
 }
 
 } // namespace qmcplusplus::wftrain
