@@ -27,7 +27,10 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 50> allowed_attributes{
+constexpr std::array<std::string_view, 59> allowed_attributes{
+    "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
+    "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
+    "lm_inner_relative_tolerance", "kfac_fallback_damping",
     "line_search", "update_scale", "weight_decay", "weight_decay_scope",
     "line_search_minimum_ess_fraction", "line_search_maximum_weight", "line_search_confidence",
     "line_search_warmup_steps", "line_search_sampling_steps",
@@ -191,6 +194,15 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   }
 
   objective_                        = Objective::ENERGY;
+  momentum_decay_ = 0.9;
+  rms_decay_ = 0.9;
+  lm_overlap_shift_ = 1.0e-4;
+  lm_normalization_xi_ = 0.5;
+  lm_maximum_subspace_dimension_ = 8;
+  lm_inner_iterations_ = 8;
+  lm_inner_restart_length_ = 4;
+  lm_inner_relative_tolerance_ = 0.1;
+  kfac_fallback_damping_ = 1.0e-3;
   line_search_ = LineSearch::OFF;
   update_scale_ = 1.0;
   weight_decay_ = 0.0;
@@ -239,6 +251,28 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   target_provenance_.clear();
   minimum_fidelity_          = 1.0e-14;
   minimum_effective_samples_ = 1.0;
+  if (seen_attributes.count("momentum_decay"))
+    momentum_decay_ = parseNonnegativeReal(readAttribute(training_node, "momentum_decay"), "momentum_decay");
+  if (seen_attributes.count("rms_decay"))
+    rms_decay_ = parseNonnegativeReal(readAttribute(training_node, "rms_decay"), "rms_decay");
+  if (seen_attributes.count("lm_overlap_shift"))
+    lm_overlap_shift_ = parseNonnegativeReal(readAttribute(training_node, "lm_overlap_shift"), "lm_overlap_shift");
+  if (seen_attributes.count("lm_normalization_xi"))
+    lm_normalization_xi_ = parseNonnegativeReal(readAttribute(training_node, "lm_normalization_xi"), "lm_normalization_xi");
+  if (seen_attributes.count("lm_maximum_subspace_dimension"))
+    lm_maximum_subspace_dimension_ = parsePositiveSize(readAttribute(training_node, "lm_maximum_subspace_dimension"), "lm_maximum_subspace_dimension");
+  if (seen_attributes.count("lm_inner_iterations"))
+    lm_inner_iterations_ = parsePositiveSize(readAttribute(training_node, "lm_inner_iterations"), "lm_inner_iterations");
+  if (seen_attributes.count("lm_inner_restart_length"))
+    lm_inner_restart_length_ = parsePositiveSize(readAttribute(training_node, "lm_inner_restart_length"), "lm_inner_restart_length");
+  if (seen_attributes.count("lm_inner_relative_tolerance"))
+    lm_inner_relative_tolerance_ = parseNonnegativeReal(readAttribute(training_node, "lm_inner_relative_tolerance"), "lm_inner_relative_tolerance");
+  if (seen_attributes.count("kfac_fallback_damping"))
+    kfac_fallback_damping_ = parseNonnegativeReal(readAttribute(training_node, "kfac_fallback_damping"), "kfac_fallback_damping");
+  if (momentum_decay_ >= 1.0 || rms_decay_ >= 1.0 || lm_normalization_xi_ > 1.0 ||
+      lm_overlap_shift_ <= 0.0 || lm_inner_relative_tolerance_ <= 0.0 ||
+      lm_maximum_subspace_dimension_ < 2 || kfac_fallback_damping_ <= 0.0)
+    throw UniformCommunicateError("Invalid first-order/LM/KFAC optimizer controls");
 
   if (seen_attributes.count("line_search"))
   {
@@ -286,6 +320,13 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     const std::string optimizer = readAttribute(training_node, "optimizer");
     if (optimizer == "adam")
       optimizer_ = Optimizer::ADAM;
+    else if (optimizer == "sgd") optimizer_ = Optimizer::SGD;
+    else if (optimizer == "momentum_sgd") optimizer_ = Optimizer::MOMENTUM_SGD;
+    else if (optimizer == "rmsprop") optimizer_ = Optimizer::RMSPROP;
+    else if (optimizer == "amsgrad") optimizer_ = Optimizer::AMSGRAD;
+    else if (optimizer == "lm") optimizer_ = Optimizer::LINEAR_METHOD;
+    else if (optimizer == "alm") optimizer_ = Optimizer::ACCELERATED_LINEAR_METHOD;
+    else if (optimizer == "kfac") optimizer_ = Optimizer::KFAC;
     else if (optimizer == "sr")
       optimizer_ = Optimizer::STOCHASTIC_RECONFIGURATION;
     else if (optimizer == "minsr")
@@ -298,10 +339,17 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       optimizer_ = Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION;
     else
       throw UniformCommunicateError("WFTrainDriverInput: unsupported optimizer=\"" + optimizer +
-                                    "\"; supported optimizers are adam, sr, minsr, spring, pii, and minpii");
+                                    "\"; supported optimizers are sgd, momentum_sgd, rmsprop, adam, amsgrad, sr, minsr, spring, pii, minpii, lm, alm, kfac");
   }
   const bool pii_optimizer = optimizer_ == Optimizer::PROJECTED_INVERSE_ITERATION ||
       optimizer_ == Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION;
+  const bool lm_optimizer = optimizer_ == Optimizer::LINEAR_METHOD ||
+      optimizer_ == Optimizer::ACCELERATED_LINEAR_METHOD;
+  const bool first_order = optimizer_ == Optimizer::ADAM || optimizer_ == Optimizer::AMSGRAD ||
+      optimizer_ == Optimizer::SGD || optimizer_ == Optimizer::MOMENTUM_SGD || optimizer_ == Optimizer::RMSPROP;
+  if (lm_optimizer && !seen_attributes.count("krylov_relative_tolerance"))
+    krylov_relative_tolerance_ = 1.0e-3;
+  if (lm_optimizer && !seen_attributes.count("learning_rate")) learning_rate_ = 1.0;
   if (pii_optimizer && seen_attributes.find("learning_rate") == seen_attributes.end())
     learning_rate_ = 1.0;
   if (seen_attributes.find("parameter_chunk_size") != seen_attributes.end())
@@ -490,9 +538,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     if (teacher_wavefunction_.empty() || target_provenance_.empty())
       throw UniformCommunicateError(
           "WFTrainDriverInput: determinant_overlap requires teacher and target_provenance");
-    if (optimizer_ != Optimizer::ADAM)
+    if (!first_order)
       throw UniformCommunicateError(
-          "WFTrainDriverInput: determinant_overlap currently requires optimizer=\"adam\"");
+          "WFTrainDriverInput: determinant_overlap requires a first-order optimizer");
     if (overlap_weighting_ == OverlapWeighting::COEFFICIENT_SQUARED &&
         overlap_target_ != OverlapTarget::TOP_COEFFICIENT_MULTIDETERMINANT)
       throw UniformCommunicateError(
@@ -522,8 +570,37 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       "maximum_damping_retries", "gmres_restart_length"};
   switch (optimizer_)
   {
+  case Optimizer::SGD:
+  case Optimizer::MOMENTUM_SGD:
+    rejectAttributes(seen_attributes, adam_attributes, "first-order");
+    [[fallthrough]];
+  case Optimizer::RMSPROP:
+    if (optimizer_ == Optimizer::RMSPROP)
+      rejectAttributes(seen_attributes, {"adam_beta1", "adam_beta2"}, "rmsprop");
+    [[fallthrough]];
+  case Optimizer::AMSGRAD:
   case Optimizer::ADAM:
-    rejectAttributes(seen_attributes, matrix_free_attributes, "adam");
+    rejectAttributes(seen_attributes, matrix_free_attributes, "first-order");
+    break;
+  case Optimizer::LINEAR_METHOD:
+  case Optimizer::ACCELERATED_LINEAR_METHOD:
+  case Optimizer::KFAC:
+    rejectAttributes(seen_attributes, adam_attributes, "lm/alm/kfac");
+    rejectAttributes(seen_attributes, spring_only_attributes, "lm/alm/kfac");
+    rejectAttributes(seen_attributes, pii_only_attributes, "lm/alm/kfac");
+    rejectAttributes(seen_attributes, sr_only_attributes, "lm/alm/kfac");
+    rejectAttributes(seen_attributes, minimum_step_attributes, "lm/alm/kfac");
+    // These solvers use residual/action/time limits, not the CG-specific
+    // stagnation, curvature or imaginary-part policy of the SR solver.
+    rejectAttributes(seen_attributes, {"krylov_stagnation_window",
+        "krylov_minimum_relative_improvement", "krylov_curvature_tolerance",
+        "krylov_imaginary_tolerance"}, "lm/alm/kfac");
+    if (optimizer_ == Optimizer::KFAC)
+      rejectAttributes(seen_attributes, {"krylov_relative_tolerance", "krylov_absolute_tolerance",
+          "krylov_maximum_iterations", "krylov_maximum_operator_applications",
+          "krylov_maximum_seconds"}, "kfac");
+    if (damping_ <= 0.0)
+      throw UniformCommunicateError("LM/ALM/KFAC require positive damping");
     break;
   case Optimizer::STOCHASTIC_RECONFIGURATION:
     rejectAttributes(seen_attributes, adam_attributes, "sr");
@@ -569,10 +646,23 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     break;
   }
   }
-  if (optimizer_ != Optimizer::ADAM && krylov_relative_tolerance_ == 0.0 &&
+  if (!first_order && krylov_relative_tolerance_ == 0.0 &&
       krylov_absolute_tolerance_ == 0.0)
     throw UniformCommunicateError(
         "WFTrainDriverInput: matrix-free optimization requires a positive Krylov tolerance");
+  if (optimizer_ != Optimizer::MOMENTUM_SGD)
+    rejectAttributes(seen_attributes, {"momentum_decay"}, "selected optimizer");
+  if (optimizer_ != Optimizer::RMSPROP)
+    rejectAttributes(seen_attributes, {"rms_decay"}, "selected optimizer");
+  if (!lm_optimizer)
+    rejectAttributes(seen_attributes, {"lm_overlap_shift", "lm_normalization_xi",
+        "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
+        "lm_inner_relative_tolerance"}, "selected optimizer");
+  else if (optimizer_ != Optimizer::ACCELERATED_LINEAR_METHOD)
+    rejectAttributes(seen_attributes, {"lm_inner_iterations", "lm_inner_restart_length",
+        "lm_inner_relative_tolerance"}, "lm");
+  if (optimizer_ != Optimizer::KFAC)
+    rejectAttributes(seen_attributes, {"kfac_fallback_damping"}, "selected optimizer");
 }
 
 } // namespace qmcplusplus

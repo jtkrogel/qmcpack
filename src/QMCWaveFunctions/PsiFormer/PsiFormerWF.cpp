@@ -17,6 +17,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
@@ -5767,6 +5768,170 @@ std::vector<std::string> PsiFormerWF::neuralWeightBlocks() const
     default: break;
     }
   return result;
+}
+
+namespace
+{
+/// Classify native affine roles against exact canonical schema intervals.
+std::vector<wftrain::AffineParameterBlock> nativeAffineParameterBlocks(
+    const psiformer::PsiFormerExecutionPlan& plan,
+    const wftrain::StructuredParameterSchema& schema)
+{
+  using Role = psiformer::ParameterRole;
+  if (schema.parameterCount() != plan.parameterCount())
+    throw std::invalid_argument("PsiFormer affine schema has the wrong parameter count");
+  const auto schema_block = [&](Role role, std::size_t attention_block) {
+    const auto& tensor = plan.parameter(role, attention_block);
+    for (std::size_t block = 0; block < schema.blocks().size(); ++block)
+    {
+      const auto& candidate = schema.blocks()[block];
+      if (candidate.id == tensor.module + "/" + tensor.name && candidate.offset == tensor.begin &&
+          candidate.count == tensor.size() && candidate.shape == tensor.shape &&
+          candidate.scalar_domain == wftrain::ParameterScalarDomain::REAL64)
+        return block;
+    }
+    throw std::invalid_argument("PsiFormer affine schema does not match its execution plan");
+  };
+  std::vector<wftrain::AffineParameterBlock> result;
+  const auto& shape = plan.modelShape();
+  result.reserve(3 + 6 * shape.attention_blocks);
+  const auto append = [&](Role role, std::size_t attention_block,
+                          std::size_t input_width, std::size_t output_width,
+                          Role bias_role = Role::COUNT) {
+    const auto weight = schema_block(role, attention_block);
+    auto bias = wftrain::NO_AFFINE_BIAS_BLOCK;
+    if (bias_role != Role::COUNT)
+    {
+      bias = schema_block(bias_role, attention_block);
+      if (schema.blocks()[weight].trainable != schema.blocks()[bias].trainable)
+        throw std::invalid_argument("PsiFormer affine weight and bias must share trainability");
+    }
+    if (!schema.blocks()[weight].trainable)
+      return;
+    std::string id = psiformer::parameterRoleName(role);
+    if (attention_block != psiformer::NO_ATTENTION_BLOCK)
+      id += "/block_" + std::to_string(attention_block);
+    result.push_back({std::move(id), weight, bias, input_width, output_width});
+  };
+  const auto width = shape.feature_dimension;
+  append(Role::ELECTRON_EMBEDDING_WEIGHT, psiformer::NO_ATTENTION_BLOCK,
+         4 * shape.nuclei + 1, width);
+  for (std::size_t block = 0; block < shape.attention_blocks; ++block)
+  {
+    for (Role role : {Role::ATTENTION_QUERY_WEIGHT, Role::ATTENTION_KEY_WEIGHT,
+                       Role::ATTENTION_VALUE_WEIGHT, Role::ATTENTION_OUTPUT_WEIGHT})
+      append(role, block, width, width);
+    append(Role::UPDATE_HIDDEN_WEIGHT, block, width, width, Role::UPDATE_HIDDEN_BIAS);
+    append(Role::UPDATE_OUTPUT_WEIGHT, block, width, width, Role::UPDATE_OUTPUT_BIAS);
+  }
+  append(Role::BACKFLOW_UP_WEIGHT, psiformer::NO_ATTENTION_BLOCK,
+         width, shape.determinants * shape.electrons());
+  append(Role::BACKFLOW_DOWN_WEIGHT, psiformer::NO_ATTENTION_BLOCK,
+         width, shape.determinants * shape.electrons());
+  return result;
+}
+
+/// Translate native typed observations to provider metadata ordinals.
+class NativeAffineScoreObserver final : public pf::DirectAffineObservationSink
+{
+public:
+  NativeAffineScoreObserver(const psiformer::PsiFormerExecutionPlan& plan,
+                           const wftrain::StructuredParameterSchema& schema,
+                           const std::vector<wftrain::AffineParameterBlock>& blocks,
+                           wftrain::AffineScoreObserver& observer)
+      : blocks_(blocks), observer_(observer)
+  {
+    bindings_.reserve(blocks.size());
+    for (std::size_t ordinal = 0; ordinal < blocks.size(); ++ordinal)
+    {
+      const auto& weight = schema.blocks()[blocks[ordinal].weight_block];
+      const auto& tensors = plan.parameterTensors();
+      const auto tensor = std::find_if(tensors.begin(), tensors.end(), [&](const auto& candidate) {
+        return candidate.begin == weight.offset && candidate.size() == weight.count &&
+            candidate.module + "/" + candidate.name == weight.id;
+      });
+      if (tensor == tensors.end())
+        throw std::logic_error("PsiFormer affine observation has no native tensor binding");
+      bindings_.push_back({tensor->role, tensor->attention_block, ordinal});
+    }
+  }
+
+  void observe(const pf::DirectAffineObservation& observation) override
+  {
+    const auto found = std::find_if(bindings_.begin(), bindings_.end(), [&](const auto& binding) {
+      return binding.role == observation.role && binding.attention_block == observation.attention_block;
+    });
+    // The native tape also emits frozen affine layers, which have no trainable boundary.
+    if (found == bindings_.end())
+      return;
+    const auto& block = blocks_[found->ordinal];
+    if (observation.input_width != block.input_width || observation.output_width != block.output_width)
+      throw std::logic_error("PsiFormer affine observation has incompatible widths");
+    observer_.observe({found->ordinal, observation.activations, observation.sensitivities, observation.row_count});
+  }
+
+private:
+  struct Binding
+  {
+    psiformer::ParameterRole role;
+    std::size_t attention_block;
+    std::size_t ordinal;
+  };
+  const std::vector<wftrain::AffineParameterBlock>& blocks_;
+  wftrain::AffineScoreObserver& observer_;
+  std::vector<Binding> bindings_;
+};
+} // namespace
+
+std::vector<wftrain::AffineParameterBlock> PsiFormerWF::affineParameterBlocks() const
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  return nativeAffineParameterBlocks(model_state_->execution_plan, *structured_parameter_schema_);
+}
+
+void PsiFormerWF::observeAffineScores(const ParticleSet& particles,
+                                     wftrain::AffineScoreObserver& observer,
+                                     std::vector<double>& score) const
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto& state = transaction.state();
+  if (state.direct_score_mode != DirectBackendMode::DIRECT)
+    throw std::runtime_error("PsiFormer affine observations require the direct score backend");
+  const auto& shape = state.execution_plan.modelShape();
+  const auto electrons = shape.electrons();
+  if (particles.R.getUnit() != PosUnit::Cartesian)
+    throw std::invalid_argument("PsiFormer affine observation positions must use Cartesian units");
+  if (particles.isSpinor() || particles.getTotalNum() < 0 ||
+      static_cast<std::size_t>(particles.getTotalNum()) != electrons ||
+      particles.R.size() != electrons || particles.GroupID.size() != electrons)
+    throw std::invalid_argument("PsiFormer affine observations require model-compatible POS-only samples");
+  validateRuntimeLattice(particles, state.execution_plan.environment(), "PsiFormer affine observation sample");
+  if (particles.groups() != 2 || particles.groupsize(0) != static_cast<int>(shape.spin_up_electrons) ||
+      particles.groupsize(1) != static_cast<int>(shape.spin_down_electrons))
+    throw std::invalid_argument("PsiFormer affine observation sample has an incompatible spin partition");
+  auto workspace = state.direct_score_executor.makeWorkspace();
+  for (std::size_t electron = 0; electron < electrons; ++electron)
+  {
+    if (particles.GroupID[electron] != (electron < shape.spin_up_electrons ? 0 : 1))
+      throw std::invalid_argument("PsiFormer affine observation sample has noncanonical spin ordering");
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double coordinate = particles.R[electron][dimension];
+      if (!psiformer::determinant::isFiniteReal(coordinate))
+        throw std::invalid_argument("PsiFormer affine observation sample positions must be finite");
+      workspace->setPosition(electron, dimension, coordinate);
+    }
+  }
+  const auto blocks = nativeAffineParameterBlocks(state.execution_plan, *structured_parameter_schema_);
+  NativeAffineScoreObserver sink(state.execution_plan, *structured_parameter_schema_, blocks, observer);
+  const auto result = state.direct_score_executor.evaluateWithAffineObservations(*workspace, sink);
+  if (result.parameter_version != transaction.parameterVersion() ||
+      result.parameter_score.size != structured_parameter_schema_->parameterCount())
+    throw std::logic_error("PsiFormer affine score result has an incompatible parameter identity");
+  if (!std::all_of(result.parameter_score.begin(), result.parameter_score.end(),
+                   [](double value) { return psiformer::determinant::isFiniteReal(value); }))
+    throw std::runtime_error("PsiFormer affine parameter score is non-finite");
+  score.assign(result.parameter_score.begin(), result.parameter_score.end());
 }
 
 wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const

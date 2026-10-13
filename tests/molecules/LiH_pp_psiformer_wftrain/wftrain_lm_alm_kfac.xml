@@ -1,0 +1,94 @@
+<?xml version="1.0"?>
+<simulation>
+  <project id="lih_pp_psiformer_wftrain_lm_alm_kfac" series="0">
+    <parameter name="driver_version">batch</parameter>
+  </project>
+  <random seed="91427"/>
+
+  <particleset name="ion0" size="2">
+    <group name="Li" size="1">
+      <parameter name="charge">1</parameter>
+      <parameter name="valence">1</parameter>
+      <parameter name="atomicnumber">3</parameter>
+      <attrib name="position" datatype="posArray">0.0 0.0 0.0</attrib>
+    </group>
+    <group name="H" size="1">
+      <parameter name="charge">1</parameter>
+      <parameter name="valence">1</parameter>
+      <parameter name="atomicnumber">1</parameter>
+      <attrib name="position" datatype="posArray">0.0 0.0 3.01392421</attrib>
+    </group>
+  </particleset>
+
+  <particleset name="e" random="yes" randomsrc="ion0">
+    <group name="u" size="1">
+      <parameter name="charge">-1</parameter>
+      <parameter name="mass">1</parameter>
+    </group>
+    <group name="d" size="1">
+      <parameter name="charge">-1</parameter>
+      <parameter name="mass">1</parameter>
+    </group>
+  </particleset>
+
+  <wavefunction name="psi0" target="e">
+    <psiformer name="pf" initialization="deepqmc_psiformer_v1"
+               initialization_seed="37" source="ion0" system="pseudopotential"
+               optimize="yes" optimize_scope="indices" optimize_indices="0"/>
+  </wavefunction>
+
+  <hamiltonian name="h0" type="generic" target="e">
+    <pairpot name="ElecElec" type="coulomb" source="e" target="e"/>
+    <pairpot name="IonIon" type="coulomb" source="ion0" target="ion0"/>
+    <pairpot name="PseudoPot" type="pseudo" source="ion0" wavefunction="psi0"
+             format="xml" algorithm="batched" DLA="no">
+      <pseudo elementType="H" href="H.BFD.xml"/>
+      <pseudo elementType="Li" href="Li.BFD.xml"/>
+    </pairpot>
+  </hamiltonian>
+
+  <qmc method="wf_train" move="pbyp" checkpoint="-1">
+    <training objective="energy" optimizer="lm" learning_rate="1e-12"
+              parameter_chunk_size="4096" damping="0.1" lm_overlap_shift="0.01"
+              maximum_update_norm="0.01" krylov_relative_tolerance="0.1"
+              krylov_maximum_iterations="30" krylov_maximum_operator_applications="100"/>
+    <parameter name="walkers_per_rank">2</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="blocks">1</parameter>
+    <parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">1e-4</parameter>
+    <parameter name="usedrift">no</parameter>
+  </qmc>
+
+  <qmc method="wf_train" move="pbyp" checkpoint="-1">
+    <training objective="energy" optimizer="alm" learning_rate="1e-12"
+              parameter_chunk_size="4096" damping="0.1" lm_overlap_shift="0.01"
+              maximum_update_norm="0.01" krylov_relative_tolerance="0.1"
+              krylov_maximum_iterations="30" krylov_maximum_operator_applications="100"
+              lm_inner_iterations="4" lm_inner_restart_length="4"
+              lm_inner_relative_tolerance="0.5"/>
+    <parameter name="walkers_per_rank">2</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="blocks">1</parameter>
+    <parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">1e-4</parameter>
+    <parameter name="usedrift">no</parameter>
+  </qmc>
+
+  <qmc method="wf_train" move="pbyp" checkpoint="-1">
+    <training objective="energy" optimizer="kfac" learning_rate="1e-12"
+              parameter_chunk_size="4096" damping="0.1" maximum_update_norm="0.01"/>
+    <parameter name="walkers_per_rank">2</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="blocks">1</parameter>
+    <parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">1e-4</parameter>
+    <parameter name="usedrift">no</parameter>
+  </qmc>
+</simulation>

@@ -19,6 +19,9 @@
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
+#include "QMCDrivers/WFTrain/SampledLinearMethod.h"
+#include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
+#include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
@@ -89,12 +92,76 @@ private:
   wftrain::SPRINGUpdateRule& optimizer_;
 };
 
-/** Build one Adam learning-rate entry for every trainable schema group. */
-wftrain::FirstOrderOptimizerOptions makeAdamOptions(const wftrain::StructuredParameterSchema& schema,
+/// Feed provider-owned affine rows into the generic KFAC factor accumulator.
+class LiveAffineObserver final : public wftrain::AffineScoreObserver
+{
+public:
+  explicit LiveAffineObserver(wftrain::KFACFactorAccumulator& accumulator) : accumulator_(accumulator) {}
+
+  void observe(const wftrain::AffineScoreObservation& observation) override
+  {
+    const auto& block = accumulator_.registry().affineBlocks().at(observation.affine_block);
+    if (observation.row_count > std::numeric_limits<std::size_t>::max() /
+            std::max(block.input_width, block.output_width))
+      throw std::overflow_error("Live KFAC observation extent overflow");
+    accumulator_.addObservation({observation.affine_block,
+        {observation.activations, observation.row_count * block.input_width},
+        {observation.sensitivities, observation.row_count * block.output_width},
+        observation.row_count});
+  }
+
+private:
+  wftrain::KFACFactorAccumulator& accumulator_;
+};
+
+/// Form a stateless Kronecker-preconditioned gradient proposal.
+class LiveKFACUpdateRule final : public wftrain::TrainingUpdateRule
+{
+public:
+  LiveKFACUpdateRule(const wftrain::KFACPreconditioner& inverse, double rate)
+      : inverse_(inverse), rate_(rate) {}
+
+  wftrain::StructuredParameterSnapshot propose(const wftrain::StructuredParameterSchema& schema,
+      const wftrain::StructuredParameterSnapshot& parameters, wftrain::ParameterGradientView objective) override
+  {
+    std::vector<wftrain::DerivativeValue> gradient(parameters.values.size()), direction(gradient.size());
+    for (std::size_t i = 0; i < gradient.size(); ++i) gradient[i] = objective.gradient[i];
+    inverse_.apply({schema, parameters.version, {gradient.data(), gradient.size()}},
+                   {direction.data(), direction.size()});
+    auto candidate = parameters;
+    for (std::size_t i = 0; i < direction.size(); ++i) candidate.values[i] -= rate_ * direction[i].real();
+    return candidate;
+  }
+
+private:
+  const wftrain::KFACPreconditioner& inverse_;
+  double rate_;
+};
+
+/// Identify the first-order family using the common live gradient producer.
+bool isFirstOrder(WFTrainDriverInput::Optimizer optimizer)
+{
+  using O = WFTrainDriverInput::Optimizer;
+  return optimizer == O::ADAM || optimizer == O::AMSGRAD || optimizer == O::SGD ||
+      optimizer == O::MOMENTUM_SGD || optimizer == O::RMSPROP;
+}
+
+/** Build a first-order learning-rate entry for every trainable schema group. */
+wftrain::FirstOrderOptimizerOptions makeFirstOrderOptions(const wftrain::StructuredParameterSchema& schema,
                                                     const WFTrainDriverInput& input)
 {
   wftrain::FirstOrderOptimizerOptions options;
   options.method     = wftrain::FirstOrderMethod::ADAM;
+  switch (input.getOptimizer())
+  {
+  case WFTrainDriverInput::Optimizer::SGD: options.method = wftrain::FirstOrderMethod::SGD; break;
+  case WFTrainDriverInput::Optimizer::MOMENTUM_SGD: options.method = wftrain::FirstOrderMethod::MOMENTUM_SGD; break;
+  case WFTrainDriverInput::Optimizer::RMSPROP: options.method = wftrain::FirstOrderMethod::RMSPROP; break;
+  case WFTrainDriverInput::Optimizer::AMSGRAD: options.method = wftrain::FirstOrderMethod::AMSGRAD; break;
+  default: break;
+  }
+  options.momentum_decay = input.getMomentumDecay();
+  options.rms_decay = input.getRMSDecay();
   options.adam_beta1 = input.getAdamBeta1();
   options.adam_beta2 = input.getAdamBeta2();
   options.epsilon    = input.getEpsilon();
@@ -612,6 +679,15 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, optimizer);
   extendStageFingerprint(hash, training.getParameterChunkSize());
   extendStageFingerprint(hash, training.getLearningRate());
+  extendStageFingerprint(hash, training.getMomentumDecay());
+  extendStageFingerprint(hash, training.getRMSDecay());
+  extendStageFingerprint(hash, training.getLMOverlapShift());
+  extendStageFingerprint(hash, training.getLMNormalizationXi());
+  extendStageFingerprint(hash, training.getLMMaximumSubspaceDimension());
+  extendStageFingerprint(hash, training.getLMInnerIterations());
+  extendStageFingerprint(hash, training.getLMInnerRestartLength());
+  extendStageFingerprint(hash, training.getLMInnerRelativeTolerance());
+  extendStageFingerprint(hash, training.getKFACFallbackDamping());
   extendStageFingerprint(hash, static_cast<int>(training.getLineSearch()));
   extendStageFingerprint(hash, training.getUpdateScale());
   extendStageFingerprint(hash, training.getWeightDecay());
@@ -814,18 +890,18 @@ void WFTrainBatched::run()
       initial_parameters.values.size() != selected_provider_->parameterSchema().parameterCount())
     throw UniformCommunicateError(
         "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
-  std::unique_ptr<wftrain::FirstOrderOptimizer> adam_optimizer;
-  if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM)
-    adam_optimizer = std::make_unique<wftrain::FirstOrderOptimizer>(
+  std::unique_ptr<wftrain::FirstOrderOptimizer> first_order_optimizer;
+  if (isFirstOrder(training_input_.getOptimizer()))
+    first_order_optimizer = std::make_unique<wftrain::FirstOrderOptimizer>(
         selected_provider_->parameterSchema(),
-        makeAdamOptions(selected_provider_->parameterSchema(), training_input_));
+        makeFirstOrderOptions(selected_provider_->parameterSchema(), training_input_));
   std::unique_ptr<wftrain::SPRINGUpdateRule> spring_optimizer;
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING)
     spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(
         selected_provider_->parameterSchema(), makeSPRINGControl(training_input_));
   wftrain::OptimizerCheckpointContributor* optimizer_checkpoint = nullptr;
-  if (adam_optimizer)
-    optimizer_checkpoint = adam_optimizer.get();
+  if (first_order_optimizer)
+    optimizer_checkpoint = first_order_optimizer.get();
   else if (spring_optimizer)
     optimizer_checkpoint = spring_optimizer.get();
 
@@ -1111,11 +1187,11 @@ void WFTrainBatched::run()
           throw UniformCommunicateError(
               "WFTrainBatched: determinant-overlap objective returned inconsistent identity");
         if (objective.retained_numeric_bytes >
-            std::numeric_limits<std::size_t>::max() - adam_optimizer->retainedBytes())
+            std::numeric_limits<std::size_t>::max() - first_order_optimizer->retainedBytes())
           throw std::overflow_error(
               "WFTrainBatched: determinant-overlap retained-byte count overflowed");
         retained_numeric_bytes =
-            objective.retained_numeric_bytes + adam_optimizer->retainedBytes();
+            objective.retained_numeric_bytes + first_order_optimizer->retainedBytes();
         enforceMemoryBudget(*myComm, retained_numeric_bytes,
                             training_input_.getMaximumRetainedBytes());
 
@@ -1123,7 +1199,7 @@ void WFTrainBatched::run()
             schema.fingerprint(), parameters->version, wftrain::ReductionDomain::GLOBAL,
             {objective.parameter_gradient.data(), objective.parameter_gradient.size()}};
         const std::size_t committed_version = wftrain::completeParameterUpdate(
-            *selected_provider_, *parameters, gradient, *decorate(*adam_optimizer), reduction);
+            *selected_provider_, *parameters, gradient, *decorate(*first_order_optimizer), reduction);
         ++training_state.completed_iterations;
         training_state.parameter_version = committed_version;
         training_state.schema_fingerprint = schema.fingerprint();
@@ -1136,6 +1212,8 @@ void WFTrainBatched::run()
       {
         const auto optimizer_kind = training_input_.getOptimizer();
         const bool capture_ecp_jvp_replay =
+            optimizer_kind == WFTrainDriverInput::Optimizer::LINEAR_METHOD ||
+            optimizer_kind == WFTrainDriverInput::Optimizer::ACCELERATED_LINEAR_METHOD ||
             optimizer_kind ==
                 WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION ||
             optimizer_kind ==
@@ -1175,16 +1253,16 @@ void WFTrainBatched::run()
               "WFTrainBatched: another rank failed while preparing a live training batch");
         }
 
-        if (optimizer_kind == WFTrainDriverInput::Optimizer::ADAM ||
+        if (isFirstOrder(optimizer_kind) ||
             optimizer_kind == WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
         {
           int empty_rank = batches.empty() ? 1 : 0;
           myComm->allreduce(empty_rank);
           if (empty_rank != 0)
             throw UniformCommunicateError(
-                "WFTrainBatched: Adam and parameter-space SR require at least one walker on every rank");
+                "WFTrainBatched: First-order methods and parameter-space SR require at least one walker on every rank");
         }
-        if (optimizer_kind == WFTrainDriverInput::Optimizer::ADAM)
+        if (isFirstOrder(optimizer_kind))
         {
           std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
           std::exception_ptr producer_failure;
@@ -1204,15 +1282,15 @@ void WFTrainBatched::run()
             if (producer_failure)
               std::rethrow_exception(producer_failure);
             throw UniformCommunicateError(
-                "WFTrainBatched: another rank failed while preparing the Adam objective");
+                "WFTrainBatched: another rank failed while preparing the first-order objective");
           }
           storage_diagnostics = producer->storageDiagnostics();
           retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-              adam_optimizer->retainedBytes();
+              first_order_optimizer->retainedBytes();
           enforceMemoryBudget(*myComm, retained_numeric_bytes,
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
-                                                  *decorate(*adam_optimizer), training_state,
+                                                  *decorate(*first_order_optimizer), training_state,
                                                   &cache_observer);
         }
         else if (optimizer_kind ==
@@ -1331,7 +1409,106 @@ void WFTrainBatched::run()
           const EnergyMoments energy_moments =
               energyMoments(*myComm, batches, factor.meanEnergy().real());
 
-          if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR)
+          if (optimizer_kind == WFTrainDriverInput::Optimizer::LINEAR_METHOD ||
+              optimizer_kind == WFTrainDriverInput::Optimizer::ACCELERATED_LINEAR_METHOD)
+          {
+            const bool accelerated = optimizer_kind == WFTrainDriverInput::Optimizer::ACCELERATED_LINEAR_METHOD;
+            const auto mask = completeLocalEnergyTermMask(batches, has_nonlocal_ecp);
+            wftrain::SampledLinearMethodOperator h(factor, {score_batches.data(), score_batches.size()},
+                mask, false, !accelerated, training_input_.getDamping());
+            wftrain::SampledLinearMethodOperator s(factor, {score_batches.data(), score_batches.size()},
+                mask, true, false, training_input_.getLMOverlapShift());
+            wftrain::IdentityPreconditioner preconditioner(schema, parameters->version);
+            wftrain::MatrixFreeLinearMethodControl lm_control;
+            lm_control.relative_residual_tolerance = training_input_.getKrylovRelativeTolerance();
+            lm_control.absolute_residual_tolerance = training_input_.getKrylovAbsoluteTolerance();
+            lm_control.maximum_iterations = training_input_.getKrylovMaximumIterations();
+            lm_control.maximum_operator_applications = training_input_.getKrylovMaximumOperatorApplications();
+            lm_control.maximum_seconds = training_input_.getKrylovMaximumSeconds();
+            lm_control.maximum_subspace_dimension = training_input_.getLMMaximumSubspaceDimension();
+            std::vector<wftrain::DerivativeValue> initial(schema.parameterCount() + 1);
+            initial[0] = 1.0;
+            retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+                checkedMemoryAdd(h.retainedBytes(), s.retainedBytes()));
+            const auto vectors = checkedMemoryAdd(checkedMemoryMultiply(9, lm_control.maximum_subspace_dimension),
+                checkedMemoryAdd(30, checkedMemoryMultiply(2, training_input_.getLMInnerRestartLength())));
+            retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+                checkedMemoryMultiply(checkedMemoryMultiply(vectors, initial.size()), sizeof(wftrain::DerivativeValue)));
+            enforceMemoryBudget(*myComm, retained_numeric_bytes, training_input_.getMaximumRetainedBytes());
+            wftrain::MatrixFreeLinearMethodResult result;
+            if (accelerated)
+            {
+              wftrain::AcceleratedLinearMethodControl control;
+              control.outer = lm_control;
+              control.inner_iterations = training_input_.getLMInnerIterations();
+              control.inner_restart_length = training_input_.getLMInnerRestartLength();
+              control.inner_relative_tolerance = training_input_.getLMInnerRelativeTolerance();
+              result = wftrain::solveAcceleratedMatrixFreeLinearMethod(h, s, preconditioner,
+                  {initial.data(), initial.size()}, control);
+            }
+            else
+              result = wftrain::solveSymmetrizedMatrixFreeLinearMethod(h, s, preconditioner,
+                  {initial.data(), initial.size()}, lm_control);
+            if (!result.converged)
+              throw UniformCommunicateError(std::string("Live LM solve failed: ") +
+                  wftrain::linearMethodStopReasonName(result.stop_reason));
+            krylov_iterations = result.iterations;
+            krylov_operator_applications = result.operator_applications;
+            applied_scale = training_input_.getLearningRate();
+            wftrain::LinearMethodUpdateRule update_rule(factor, std::move(result),
+                training_input_.getLearningRate(), training_input_.getLMNormalizationXi());
+            iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
+                *decorate(update_rule), training_state, reduction, cache_observer,
+                energy_moments.weight_sum, energy_moments.variance);
+          }
+          else if (optimizer_kind == WFTrainDriverInput::Optimizer::KFAC)
+          {
+            std::unique_ptr<wftrain::KFACFactorAccumulator> statistics;
+            std::exception_ptr observation_failure;
+            try
+            {
+              const auto metadata = selected_provider_->affineParameterBlocks();
+              if (metadata.empty()) throw std::invalid_argument("Provider lacks live KFAC affine observations");
+              std::vector<wftrain::KFACAffineBlockDescriptor> affine;
+              std::vector<bool> covered(schema.blocks().size(), false);
+              for (const auto& block : metadata)
+              {
+                affine.push_back({block.id, block.weight_block, block.bias_block,
+                                  block.input_width, block.output_width});
+                covered.at(block.weight_block) = true;
+                if (block.bias_block != wftrain::NO_AFFINE_BIAS_BLOCK) covered.at(block.bias_block) = true;
+              }
+              std::vector<std::size_t> fallback;
+              for (std::size_t i = 0; i < covered.size(); ++i)
+                if (schema.blocks()[i].trainable && !covered[i]) fallback.push_back(i);
+              statistics = std::make_unique<wftrain::KFACFactorAccumulator>(
+                  wftrain::KFACBlockRegistry(schema, std::move(affine), std::move(fallback)), parameters->version);
+              LiveAffineObserver observer(*statistics);
+              std::vector<double> score;
+              for (const auto& crowd : crowds_)
+                for (ParticleSet& particles : crowd->get_walker_elecs())
+                {
+                  statistics->beginSample(1.0);
+                  selected_provider_->observeAffineScores(particles, observer, score);
+                  statistics->addFallbackScores({score.data(), score.size()});
+                  statistics->endSample();
+                }
+            }
+            catch (...) { observation_failure = std::current_exception(); }
+            reduction.preflight(schema, &*parameters,
+                wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN, observation_failure);
+            wftrain::reduceKFACFactorStatistics(*statistics, myComm, training_input_.getParameterChunkSize());
+            wftrain::KFACPreconditioner inverse(*statistics,
+                {training_input_.getDamping(), training_input_.getKFACFallbackDamping()});
+            retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+                checkedMemoryAdd(statistics->retainedNumericBytes(), inverse.storageDiagnostics().retained_numeric_bytes));
+            enforceMemoryBudget(*myComm, retained_numeric_bytes, training_input_.getMaximumRetainedBytes());
+            LiveKFACUpdateRule update_rule(inverse, training_input_.getLearningRate());
+            iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
+                *decorate(update_rule), training_state, reduction, cache_observer,
+                energy_moments.weight_sum, energy_moments.variance);
+          }
+          else if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR)
           {
             wftrain::MinimumStepSRUpdateRule update_rule(
                 factor, makeMinimumStepControl(training_input_));

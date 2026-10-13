@@ -14,9 +14,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <stdexcept>
 #include <vector>
+
+namespace qmcplusplus
+{
+class ParticleSet;
+}
 
 namespace qmcplusplus::wftrain
 {
@@ -78,6 +84,35 @@ struct StructuredParameterSnapshot
   std::vector<double> values;
 };
 
+inline constexpr std::size_t NO_AFFINE_BIAS_BLOCK = std::numeric_limits<std::size_t>::max();
+
+/// Describe one trainable affine weight and optional bias in schema block order.
+struct AffineParameterBlock
+{
+  std::string id;
+  std::size_t weight_block = 0;
+  std::size_t bias_block = NO_AFFINE_BIAS_BLOCK;
+  std::size_t input_width = 0;
+  std::size_t output_width = 0;
+};
+
+/// Row-major activation and score-sensitivity views valid only during observe().
+struct AffineScoreObservation
+{
+  std::size_t affine_block = 0;
+  const double* activations = nullptr;
+  const double* sensitivities = nullptr;
+  std::size_t row_count = 0;
+};
+
+/// Consume transient affine rows without retaining a model tape.
+class AffineScoreObserver
+{
+public:
+  virtual ~AffineScoreObserver() = default;
+  virtual void observe(const AffineScoreObservation& observation) = 0;
+};
+
 /** Abstract synchronization boundary between a model and a training driver.
  *
  * Implementations copy values while holding their own lock and publish complete
@@ -100,6 +135,13 @@ public:
 
   /// Return explicitly classified neural-network weight tensor identifiers for decay.
   virtual std::vector<std::string> neuralWeightBlocks() const { return {}; }
+
+  /// Return supported trainable affine boundaries in stable observation order.
+  virtual std::vector<AffineParameterBlock> affineParameterBlocks() const { return {}; }
+
+  /// Stream affine rows and copy the canonical real parameter score for one sample.
+  virtual void observeAffineScores(const ParticleSet&, AffineScoreObserver&, std::vector<double>&) const
+  { throw std::runtime_error("Provider does not support affine score observations"); }
 
   /** Atomically publish a complete candidate if the expected version matches.
    *

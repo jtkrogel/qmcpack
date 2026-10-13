@@ -439,6 +439,98 @@ TMDLA, stochastic V1 move acceptance, spin-orbit ECPs, and force estimators are
 outside its timing workload. It is deliberately not registered with CTest and
 has no absolute timing threshold.
 
+Native streamed optimization
+----------------------------
+
+The batched ``wf_train`` driver accepts ``optimizer="sgd"``, ``momentum_sgd``,
+``rmsprop``, ``adam``, ``amsgrad``, ``sr``, ``minsr``, ``spring``, ``pii``,
+``minpii``, ``lm``, ``alm``, and ``kfac`` in its ``training`` child. Parameters
+remain real, even in a complex QMCPACK build. This route is distinct from the
+legacy optimization drivers. Initialize PsiFormer internally or load a compatible
+parameter export, set ``optimize="yes"``, and choose the active parameter scope.
+
+For example, a bounded accelerated linear-method step can be requested with:
+
+.. code-block:: xml
+
+  <qmc method="wf_train" move="pbyp" checkpoint="-1">
+    <training objective="energy" optimizer="alm" learning_rate="1"
+              damping="0.01" lm_overlap_shift="0.0001"
+              lm_maximum_subspace_dimension="8"
+              lm_inner_iterations="8" lm_inner_restart_length="4"
+              lm_inner_relative_tolerance="0.1"
+              krylov_relative_tolerance="0.001"
+              krylov_maximum_iterations="30"
+              krylov_maximum_operator_applications="100"
+              maximum_update_norm="0.01"/>
+    <parameter name="walkers_per_rank">16</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="blocks">2</parameter>
+    <parameter name="steps">1</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">0.01</parameter>
+    <parameter name="usedrift">no</parameter>
+  </qmc>
+
+The numerical choices above illustrate input syntax, not recommended production
+hyperparameters. Optimizer-specific attributes supplied to another method are
+rejected. All routes use the common publication, cache refresh, proposal scaling,
+typed weight decay, and optional line-search machinery; failed eigensolves do not
+publish parameters.
+
+First-order methods
+~~~~~~~~~~~~~~~~~~~
+
+``learning_rate`` defaults to 0.001. Momentum SGD adds ``momentum_decay`` (0.9);
+RMSprop adds ``rms_decay`` (0.9) and ``epsilon`` (1e-8). Adam and AMSGrad accept
+``adam_beta1`` (0.9), ``adam_beta2`` (0.999), and ``epsilon``. AMSGrad keeps the
+ordinary second-moment EMA and its elementwise running maximum separately, using
+the bias-corrected maximum in the denominator. Its maximum vector is checkpointed
+alongside the moments and accepted update count. Rejected proposals do not advance
+these recurrence states. All first-order methods can also optimize the existing
+``determinant_overlap`` objective.
+
+Sampled linear methods
+~~~~~~~~~~~~~~~~~~~~~~
+
+``lm`` preserves the existing symmetrized generalized eigensolver. ``alm`` is a
+separate nonsymmetric generalized Jacobi--Davidson route: it retains the raw
+finite-sample Hamiltonian orientation, chooses a real reference-connected Ritz
+root near the initial energy, and uses bounded restarted GMRES corrections.
+Both stream score and local-energy derivative products, avoiding dense
+sample-by-parameter and parameter-squared matrices. ECP products use the accepted
+quadrature replay shared by Hamiltonian JVP and VJP actions.
+
+Both default to ``learning_rate=1``, ``krylov_relative_tolerance=0.001``,
+``lm_overlap_shift=0.0001``, ``lm_maximum_subspace_dimension=8``, and
+``lm_normalization_xi=0.5``. ``damping`` shifts only the Hamiltonian tangent block;
+``lm_overlap_shift`` shifts only the overlap tangent block. Both must be positive.
+All active PsiFormer parameters are treated as nonlinear in the sampled-metric
+normalization; ``lm_normalization_xi=1`` disables that correction. ALM alone accepts
+``lm_inner_iterations=8``, ``lm_inner_restart_length=4``, and
+``lm_inner_relative_tolerance=0.1``. Inner and outer actions share the configured
+operator-application and wall-time bounds. Small projected matrices scale with
+the configured subspace bounds, not the number of parameters.
+
+Live KFAC
+~~~~~~~~~
+
+``kfac`` observes affine activations and score sensitivities through the selected
+provider, reduces their factors across ranks, and applies damped Kronecker
+inverses to the sampled energy gradient. Trainable parameters not belonging to
+an observed affine block use a diagonal fallback, controlled by
+``kfac_fallback_damping`` (0.001). ``damping`` (0.001) stabilizes the affine factors.
+The initial live route rebuilds factors each training block; it does not retain
+factor EMA or momentum history. Providers without affine observations fail
+explicitly. No Krylov controls are accepted because this update uses direct
+factor solves rather than an iterative solve.
+
+Qualification includes deterministic algebra/recurrence/input tests and very
+short internally initialized H2 execution and AMSGrad restart tests. These checks
+establish execution and numerical contracts, not optimization convergence or
+production performance. Trained LiH optimizer comparisons remain a separate
+qualification step.
+
 Validation coverage
 -------------------
 

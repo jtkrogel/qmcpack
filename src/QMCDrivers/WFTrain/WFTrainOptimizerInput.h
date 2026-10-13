@@ -22,6 +22,13 @@ inline std::string_view optimizerName(WFTrainDriverInput::Optimizer optimizer) n
 {
   switch (optimizer)
   {
+  case WFTrainDriverInput::Optimizer::SGD: return "sgd";
+  case WFTrainDriverInput::Optimizer::MOMENTUM_SGD: return "momentum_sgd";
+  case WFTrainDriverInput::Optimizer::RMSPROP: return "rmsprop";
+  case WFTrainDriverInput::Optimizer::AMSGRAD: return "amsgrad";
+  case WFTrainDriverInput::Optimizer::LINEAR_METHOD: return "lm";
+  case WFTrainDriverInput::Optimizer::ACCELERATED_LINEAR_METHOD: return "alm";
+  case WFTrainDriverInput::Optimizer::KFAC: return "kfac";
   case WFTrainDriverInput::Optimizer::ADAM:
     return "adam";
   case WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION:

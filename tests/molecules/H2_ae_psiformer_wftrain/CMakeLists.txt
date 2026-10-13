@@ -83,6 +83,72 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
                "WFTrain iteration 1 version 3 samples 2 mean_energy.*optimizer spring.*krylov_operator_applications [1-9]")
   endif()
 
+  set(FIRST_ORDER_TEST_NAME short-H2-ae-psiformer-wftrain-first-order-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(
+    ${FIRST_ORDER_TEST_NAME}
+    "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+    1
+    1
+    TEST_ADDED
+    wftrain_first_order.xml)
+  if(TEST_ADDED)
+    set_property(TEST ${FIRST_ORDER_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
+                 "WFTrain iteration 1 version 5 samples 2 mean_energy")
+  endif()
+
+  foreach(MATRIX_OPTIMIZER lm alm kfac)
+    set(MATRIX_OPTIMIZER_TEST_NAME short-H2-ae-psiformer-wftrain-${MATRIX_OPTIMIZER}-r1-t1)
+    set(TEST_ADDED FALSE)
+    run_qmc_app(
+      ${MATRIX_OPTIMIZER_TEST_NAME}
+      "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+      1
+      1
+      TEST_ADDED
+      wftrain_${MATRIX_OPTIMIZER}.xml)
+    if(TEST_ADDED)
+      set_property(TEST ${MATRIX_OPTIMIZER_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
+                   "WFTrain iteration 1 version 1 samples 2 mean_energy.*optimizer ${MATRIX_OPTIMIZER}")
+    endif()
+  endforeach()
+
+  set(AMSGRAD_CHECKPOINT_TEST_NAME short-H2-ae-psiformer-wftrain-amsgrad-checkpoint-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(
+    ${AMSGRAD_CHECKPOINT_TEST_NAME}
+    "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+    1
+    1
+    TEST_ADDED
+    wftrain_amsgrad_checkpoint.xml)
+  if(TEST_ADDED)
+    set_property(TEST ${AMSGRAD_CHECKPOINT_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
+                 "WFTrain checkpointed 1 completed update\\(s\\)")
+  endif()
+
+  set(AMSGRAD_RESTART_TEST_NAME short-H2-ae-psiformer-wftrain-amsgrad-restart-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(
+    ${AMSGRAD_RESTART_TEST_NAME}
+    "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+    1
+    1
+    TEST_ADDED
+    wftrain_amsgrad_restart.xml)
+  if(TEST_ADDED)
+    maybe_symlink(
+      "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain/wftrain_amsgrad_restart.xml"
+      "${CMAKE_CURRENT_BINARY_DIR}/${AMSGRAD_CHECKPOINT_TEST_NAME}/wftrain_amsgrad_restart.xml")
+    set_property(TEST ${AMSGRAD_RESTART_TEST_NAME} PROPERTY DEPENDS ${AMSGRAD_CHECKPOINT_TEST_NAME})
+    set_property(
+      TEST ${AMSGRAD_RESTART_TEST_NAME}
+      PROPERTY WORKING_DIRECTORY
+               "${CMAKE_CURRENT_BINARY_DIR}/${AMSGRAD_CHECKPOINT_TEST_NAME}")
+    set_property(TEST ${AMSGRAD_RESTART_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
+                 "WFTrain iteration 2 version 2")
+  endif()
+
   set(LIH_AE_TEST_NAME short-LiH-ae-psiformer-wftrain-adam-r1-t1)
   set(TEST_ADDED FALSE)
   run_qmc_app(

@@ -365,6 +365,14 @@ public:
   /// Select learned matrix weights by typed execution roles, excluding physical parameters.
   std::vector<std::string> neuralWeightBlocks() const override;
 
+  /// Expose native trainable affine boundaries without driver dependencies.
+  std::vector<wftrain::AffineParameterBlock> affineParameterBlocks() const override;
+
+  /// Stream one configuration's affine score rows through transient native scratch.
+  void observeAffineScores(const ParticleSet& particles,
+                           wftrain::AffineScoreObserver& observer,
+                           std::vector<double>& score) const override;
+
   /// Construct an O(P)+O(B) score/kinetic-product provider bound to this model version.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeStreamingDerivativeOperator(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

@@ -53,7 +53,14 @@ public:
     MINIMUM_STEP_SR,
     SPRING,
     PROJECTED_INVERSE_ITERATION,
-    MINIMUM_PROJECTED_INVERSE_ITERATION
+    MINIMUM_PROJECTED_INVERSE_ITERATION,
+    SGD,
+    MOMENTUM_SGD,
+    RMSPROP,
+    AMSGRAD,
+    LINEAR_METHOD,
+    ACCELERATED_LINEAR_METHOD,
+    KFAC
   };
 
   enum class PIIShiftMode
@@ -75,6 +82,15 @@ public:
   std::size_t getLineSearchWarmupSteps() const noexcept { return line_search_warmup_steps_; }
   std::size_t getLineSearchSamplingSteps() const noexcept { return line_search_sampling_steps_; }
   Optimizer getOptimizer() const noexcept { return optimizer_; }
+  double getMomentumDecay() const noexcept { return momentum_decay_; }
+  double getRMSDecay() const noexcept { return rms_decay_; }
+  double getLMOverlapShift() const noexcept { return lm_overlap_shift_; }
+  double getLMNormalizationXi() const noexcept { return lm_normalization_xi_; }
+  std::size_t getLMMaximumSubspaceDimension() const noexcept { return lm_maximum_subspace_dimension_; }
+  std::size_t getLMInnerIterations() const noexcept { return lm_inner_iterations_; }
+  std::size_t getLMInnerRestartLength() const noexcept { return lm_inner_restart_length_; }
+  double getLMInnerRelativeTolerance() const noexcept { return lm_inner_relative_tolerance_; }
+  double getKFACFallbackDamping() const noexcept { return kfac_fallback_damping_; }
   std::size_t getParameterChunkSize() const noexcept { return parameter_chunk_size_; }
   double getLearningRate() const noexcept { return learning_rate_; }
   double getAdamBeta1() const noexcept { return adam_beta1_; }
@@ -129,6 +145,15 @@ public:
   double getMinimumEffectiveSamples() const noexcept { return minimum_effective_samples_; }
 
 private:
+  double momentum_decay_{0.9};
+  double rms_decay_{0.9};
+  double lm_overlap_shift_{1.0e-4};
+  double lm_normalization_xi_{0.5};
+  std::size_t lm_maximum_subspace_dimension_{8};
+  std::size_t lm_inner_iterations_{8};
+  std::size_t lm_inner_restart_length_{4};
+  double lm_inner_relative_tolerance_{0.1};
+  double kfac_fallback_damping_{1.0e-3};
   LineSearch line_search_{LineSearch::OFF};
   double update_scale_{1.0};
   double weight_decay_{0.0};

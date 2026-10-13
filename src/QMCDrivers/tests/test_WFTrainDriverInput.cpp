@@ -230,6 +230,99 @@ TEST_CASE("WFTrainDriverInput maps strict PII and MinPII controls",
   }
 }
 
+TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and KFAC input",
+          "[drivers][wf_train][optimizers]")
+{
+  SECTION("SGD defaults and selection")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"sgd\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::SGD);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "sgd");
+    CHECK(input.getLearningRate() == 1.0e-3);
+    CHECK(input.getMomentumDecay() == 0.9);
+    CHECK(input.getRMSDecay() == 0.9);
+  }
+
+  SECTION("momentum SGD maps momentum_decay")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"momentum_sgd\" "
+        "learning_rate=\"0.03\" momentum_decay=\"0.75\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::MOMENTUM_SGD);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "momentum_sgd");
+    CHECK(input.getLearningRate() == 0.03);
+    CHECK(input.getMomentumDecay() == 0.75);
+  }
+
+  SECTION("RMSProp maps rms_decay")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"rmsprop\" "
+        "learning_rate=\"0.02\" rms_decay=\"0.8\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::RMSPROP);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "rmsprop");
+    CHECK(input.getLearningRate() == 0.02);
+    CHECK(input.getRMSDecay() == 0.8);
+  }
+
+  SECTION("AMSGrad accepts its Adam moment controls")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"amsgrad\" "
+        "learning_rate=\"0.01\" adam_beta1=\"0.8\" adam_beta2=\"0.95\" "
+        "epsilon=\"1e-7\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::AMSGRAD);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "amsgrad");
+    CHECK(input.getLearningRate() == 0.01);
+    CHECK(input.getAdamBeta1() == 0.8);
+    CHECK(input.getAdamBeta2() == 0.95);
+    CHECK(input.getEpsilon() == 1.0e-7);
+  }
+
+  SECTION("LM maps LM controls")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" "
+        "krylov_relative_tolerance=\"2e-6\" lm_overlap_shift=\"0.03\" "
+        "lm_normalization_xi=\"0.4\" lm_maximum_subspace_dimension=\"12\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::LINEAR_METHOD);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "lm");
+    CHECK(input.getLearningRate() == 1.0);
+    CHECK(input.getDamping() == 0.02);
+    CHECK(input.getKrylovRelativeTolerance() == 2.0e-6);
+    CHECK(input.getLMOverlapShift() == 0.03);
+    CHECK(input.getLMNormalizationXi() == 0.4);
+    CHECK(input.getLMMaximumSubspaceDimension() == 12);
+  }
+
+  SECTION("ALM maps iterative controls")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"alm\" damping=\"0.03\" "
+        "krylov_relative_tolerance=\"3e-6\" lm_inner_iterations=\"9\" "
+        "lm_inner_restart_length=\"5\" lm_inner_relative_tolerance=\"0.02\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ACCELERATED_LINEAR_METHOD);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "alm");
+    CHECK(input.getDamping() == 0.03);
+    CHECK(input.getKrylovRelativeTolerance() == 3.0e-6);
+    CHECK(input.getLMInnerIterations() == 9);
+    CHECK(input.getLMInnerRestartLength() == 5);
+    CHECK(input.getLMInnerRelativeTolerance() == 0.02);
+  }
+
+  SECTION("KFAC maps fallback damping")
+  {
+    const auto input = parseTrainingInput(
+        "<qmc method=\"wf_train\"><training optimizer=\"kfac\" damping=\"0.04\" "
+        "kfac_fallback_damping=\"0.006\"/></qmc>");
+    CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC);
+    CHECK(wftrain::optimizerName(input.getOptimizer()) == "kfac");
+    CHECK(input.getDamping() == 0.04);
+    CHECK(input.getKFACFallbackDamping() == 0.006);
+  }
+}
+
 TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers][wf_train]")
 {
   WFTrainDriverInput input;
@@ -252,7 +345,7 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
   rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
           "teacher=\"teacher\" target_provenance=\"x\" "
           "overlap_weighting=\"coefficient_squared\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"unknown\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"0\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"1k\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training learning_rate=\"0\"/></qmc>");
@@ -295,6 +388,25 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
   rejects("<qmc method=\"wf_train\"><training optimizer=\"minpii\" center_shift=\"1\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training optimizer=\"minpii\" adam_beta1=\"0.8\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" maximum_damping_retries=\"2\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"sgd\" adam_beta1=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"sgd\" momentum_decay=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"momentum_sgd\" rms_decay=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\" adam_beta1=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\" rms_decay=\"1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"amsgrad\" rms_decay=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"momentum_sgd\" momentum_decay=\"1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" "
+          "lm_overlap_shift=\"0\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" krylov_relative_tolerance=\"1e-6\" "
+          "lm_inner_iterations=\"3\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" krylov_relative_tolerance=\"1e-6\" "
+          "maximum_damping_attempts=\"2\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"alm\" damping=\"0.02\" krylov_relative_tolerance=\"1e-6\" "
+          "spring_history_decay=\"0.8\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"kfac\" damping=\"0.02\" "
+          "krylov_relative_tolerance=\"1e-6\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training optimizer=\"kfac\" damping=\"0.02\" "
+          "kfac_fallback_damping=\"0\"/></qmc>");
 }
 
 } // namespace qmcplusplus
