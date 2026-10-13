@@ -36,6 +36,10 @@ public:
   Objective getObjective() const noexcept { return objective_; }
   Optimizer getOptimizer() const noexcept { return optimizer_; }
   std::size_t getParameterChunkSize() const noexcept { return parameter_chunk_size_; }
+  double getLearningRate() const noexcept { return learning_rate_; }
+  double getAdamBeta1() const noexcept { return adam_beta1_; }
+  double getAdamBeta2() const noexcept { return adam_beta2_; }
+  double getEpsilon() const noexcept { return epsilon_; }
   const std::string& getCheckpointPath() const noexcept { return checkpoint_path_; }
   const std::string& getRestartPath() const noexcept { return restart_path_; }
   const std::string& getProviderID() const noexcept { return provider_id_; }
@@ -44,6 +48,10 @@ private:
   Objective objective_{Objective::ENERGY};
   Optimizer optimizer_{Optimizer::ADAM};
   std::size_t parameter_chunk_size_{65536};
+  double learning_rate_{1.0e-3};
+  double adam_beta1_{0.9};
+  double adam_beta2_{0.999};
+  double epsilon_{1.0e-8};
   std::string checkpoint_path_;
   std::string restart_path_;
   std::string provider_id_;

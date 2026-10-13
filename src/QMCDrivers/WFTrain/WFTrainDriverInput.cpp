@@ -13,6 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string_view>
 #include <unordered_set>
@@ -22,8 +26,9 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 6> allowed_attributes{
-    "objective", "optimizer", "parameter_chunk_size", "checkpoint_path", "restart_path", "provider"};
+constexpr std::array<std::string_view, 10> allowed_attributes{
+    "objective", "optimizer", "parameter_chunk_size", "learning_rate", "adam_beta1",
+    "adam_beta2", "epsilon", "checkpoint_path", "restart_path", "provider"};
 
 /** Return an XML attribute value without changing its spelling or whitespace. */
 std::string readAttribute(xmlNodePtr node, const char* name)
@@ -53,6 +58,35 @@ std::size_t parsePositiveSize(const std::string& text, const std::string& attrib
   }
   if (value == 0)
     throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must be positive");
+  return value;
+}
+
+/** Parse one finite floating-point value and reject trailing text. */
+double parseFiniteReal(const std::string& text, const std::string& attribute)
+{
+  if (text.empty())
+    throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must be a finite real number");
+
+  errno             = 0;
+  char* parse_end    = nullptr;
+  const double value = std::strtod(text.c_str(), &parse_end);
+  static_assert(sizeof(double) == sizeof(std::uint64_t));
+  static_assert(std::numeric_limits<double>::is_iec559);
+  std::uint64_t value_bits;
+  std::memcpy(&value_bits, &value, sizeof(value_bits));
+  constexpr std::uint64_t exponent_mask = UINT64_C(0x7ff0000000000000);
+  const bool is_finite = (value_bits & exponent_mask) != exponent_mask;
+  if (errno == ERANGE || parse_end != text.c_str() + text.size() || !is_finite)
+    throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must be a finite real number");
+  return value;
+}
+
+/** Parse a finite real constrained to the half-open unit interval. */
+double parseDecay(const std::string& text, const std::string& attribute)
+{
+  const double value = parseFiniteReal(text, attribute);
+  if (value < 0.0 || value >= 1.0)
+    throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must lie in [0, 1)");
   return value;
 }
 
@@ -107,6 +141,10 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   objective_            = Objective::ENERGY;
   optimizer_            = Optimizer::ADAM;
   parameter_chunk_size_ = 65536;
+  learning_rate_        = 1.0e-3;
+  adam_beta1_           = 0.9;
+  adam_beta2_           = 0.999;
+  epsilon_              = 1.0e-8;
   checkpoint_path_.clear();
   restart_path_.clear();
   provider_id_.clear();
@@ -128,6 +166,22 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (seen_attributes.find("parameter_chunk_size") != seen_attributes.end())
     parameter_chunk_size_ = parsePositiveSize(readAttribute(training_node, "parameter_chunk_size"),
                                               "parameter_chunk_size");
+  if (seen_attributes.find("learning_rate") != seen_attributes.end())
+  {
+    learning_rate_ = parseFiniteReal(readAttribute(training_node, "learning_rate"), "learning_rate");
+    if (!(learning_rate_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: learning_rate must be positive");
+  }
+  if (seen_attributes.find("adam_beta1") != seen_attributes.end())
+    adam_beta1_ = parseDecay(readAttribute(training_node, "adam_beta1"), "adam_beta1");
+  if (seen_attributes.find("adam_beta2") != seen_attributes.end())
+    adam_beta2_ = parseDecay(readAttribute(training_node, "adam_beta2"), "adam_beta2");
+  if (seen_attributes.find("epsilon") != seen_attributes.end())
+  {
+    epsilon_ = parseFiniteReal(readAttribute(training_node, "epsilon"), "epsilon");
+    if (!(epsilon_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: epsilon must be positive");
+  }
   if (seen_attributes.find("checkpoint_path") != seen_attributes.end())
     checkpoint_path_ = readAttribute(training_node, "checkpoint_path");
   if (seen_attributes.find("restart_path") != seen_attributes.end())

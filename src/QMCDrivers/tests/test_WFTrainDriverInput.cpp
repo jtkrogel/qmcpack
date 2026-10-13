@@ -38,6 +38,10 @@ TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_t
     CHECK(input.getObjective() == WFTrainDriverInput::Objective::ENERGY);
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM);
     CHECK(input.getParameterChunkSize() == 65536);
+    CHECK(input.getLearningRate() == 1.0e-3);
+    CHECK(input.getAdamBeta1() == 0.9);
+    CHECK(input.getAdamBeta2() == 0.999);
+    CHECK(input.getEpsilon() == 1.0e-8);
     CHECK(input.getCheckpointPath().empty());
     CHECK(input.getRestartPath().empty());
     CHECK(input.getProviderID().empty());
@@ -47,9 +51,14 @@ TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_t
   {
     const auto input = parseTrainingInput(
         "<qmc method=\"wf_train\"><training objective=\"energy\" optimizer=\"adam\" "
-        "parameter_chunk_size=\"2048\" checkpoint_path=\"next.h5\" restart_path=\"previous.h5\" "
+        "parameter_chunk_size=\"2048\" learning_rate=\"2e-4\" adam_beta1=\"0.8\" "
+        "adam_beta2=\"0.95\" epsilon=\"1e-7\" checkpoint_path=\"next.h5\" restart_path=\"previous.h5\" "
         "provider=\"neural\"/></qmc>");
     CHECK(input.getParameterChunkSize() == 2048);
+    CHECK(input.getLearningRate() == 2.0e-4);
+    CHECK(input.getAdamBeta1() == 0.8);
+    CHECK(input.getAdamBeta2() == 0.95);
+    CHECK(input.getEpsilon() == 1.0e-7);
     CHECK(input.getCheckpointPath() == "next.h5");
     CHECK(input.getRestartPath() == "previous.h5");
     CHECK(input.getProviderID() == "neural");
@@ -74,6 +83,12 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
   rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"0\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"1k\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training learning_rate=\"0\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training learning_rate=\"nan\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training learning_rate=\"inf\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training adam_beta1=\"1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training adam_beta2=\"-0.1\"/></qmc>");
+  rejects("<qmc method=\"wf_train\"><training epsilon=\"0\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training checkpoint_path=\"same.h5\" restart_path=\"same.h5\"/></qmc>");
   rejects("<qmc method=\"wf_train\"><training provider=\"\"/></qmc>");
 }

@@ -13,10 +13,17 @@
 #include "QMCDrivers/VMC/VMCDriverInput.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 
+#include <cstddef>
+
+namespace qmcplusplus::wftrain
+{
+class StructuredParameterProvider;
+}
+
 namespace qmcplusplus
 {
 
-/** Batched high-parameter wavefunction-training driver scaffold. */
+/** Batched high-parameter wavefunction-training driver. */
 class WFTrainBatched : public QMCDriverNew
 {
 public:
@@ -33,10 +40,10 @@ public:
   WFTrainBatched(const WFTrainBatched&)            = delete;
   WFTrainBatched& operator=(const WFTrainBatched&) = delete;
 
-  /** Validate the provider and establish the native VMC walker population. */
+  /** Validate the all-electron training contract and establish native walkers. */
   void process(xmlNodePtr node) override;
 
-  /** Fail closed until the production gradient/update stage is installed. */
+  /** Sample live walkers and publish one streamed Adam update per block. */
   void run() override;
 
 private:
@@ -45,6 +52,22 @@ private:
   VMCDriverInput vmcdriver_input_;
   WFTrainDriverInput training_input_;
   std::string selected_provider_id_;
+  wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
+
+  /// Per-crowd RNG contexts used by full initialization and post-update refreshes.
+  UPtrVector<ContextForSteps> step_contexts_;
+
+  /** Construct the reference view consumed by the shared full-refresh routine. */
+  RefVector<ContextForSteps> getContextForStepsRefs() const;
+
+  /** Allocate one stable RNG context for every initialized crowd. */
+  void createStepContexts(int num_crowds);
+
+  /** Reject Hamiltonians outside the first all-electron kinetic-energy route. */
+  void validateHamiltonianForTraining();
+
+  /** Refresh all crowd wavefunction, drift, and local-energy caches after publication. */
+  void refreshPublishedParameters(std::size_t parameter_version);
 };
 
 } // namespace qmcplusplus
