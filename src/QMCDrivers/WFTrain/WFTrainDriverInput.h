@@ -94,6 +94,13 @@ public:
   }
   double getKrylovCurvatureTolerance() const noexcept { return krylov_curvature_tolerance_; }
   double getKrylovImaginaryTolerance() const noexcept { return krylov_imaginary_tolerance_; }
+  /** Return the postconstruction ceiling for retained and optimizer workspace bytes.
+   *
+   * Component batch-memory policies remain responsible for rejecting unsafe clone
+   * and resource allocations before construction.  This driver-level ceiling is
+   * checked once exact live-owner capacities and conservative solver peaks are
+   * available; it is not a process-wide allocator limit.
+   */
   std::size_t getMaximumRetainedBytes() const noexcept { return maximum_retained_bytes_; }
   const std::string& getCheckpointPath() const noexcept { return checkpoint_path_; }
   const std::string& getRestartPath() const noexcept { return restart_path_; }

@@ -123,15 +123,16 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   RefVectorWithLeader<ParticleSet> electron_batch(electrons[0], electrons);
 
   wftrain::PreparedEnergyGradientBatch batch;
-  batch.derivative_operator = TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
-      twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
-      maximum_parameter_chunk_size);
   batch.weights.assign(walkers.size(), 1.0);
   batch.local_energy_term_mask =
       wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
 
   if (!has_nonlocal_ecp)
   {
+    batch.derivative_operator =
+        TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+            twf_batch, electron_batch, provider_id, batch_ordinal,
+            sample_offset, maximum_parameter_chunk_size);
     batch.local_energies.reserve(walkers.size());
     for (const auto& walker : walkers)
       batch.local_energies.emplace_back(
@@ -145,6 +146,23 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   const auto& hamiltonians = crowd.get_walker_hamiltonians();
   RefVectorWithLeader<QMCHamiltonian> hamiltonian_batch(
       hamiltonians[0], hamiltonians);
+
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(
+      crowd.getSharedResource().pset_res, electron_batch);
+  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(
+      crowd.getSharedResource().twf_res, twf_batch);
+  ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(
+      crowd.getSharedResource().ham_res, hamiltonian_batch);
+  ParticleSet::mw_update(electron_batch);
+  TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+
+  // Construct both derivative owners only after canonical value/VGL refresh so
+  // the kinetic tape and accepted-grid ECP response see identical reference
+  // coordinates, gradients, and parameter version.
+  batch.derivative_operator =
+      TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
+          twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
+          maximum_parameter_chunk_size);
   auto ecp_consumer =
       TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
           twf_batch, electron_batch, provider_id,
@@ -168,14 +186,6 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   wftrain::PreparedLocalEnergyVJPCapture ecp_capture(
       schema, parameter_version, ecp_mask);
 
-  ResourceCollectionTeamLock<ParticleSet> particle_lock(
-      crowd.getSharedResource().pset_res, electron_batch);
-  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(
-      crowd.getSharedResource().twf_res, twf_batch);
-  ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(
-      crowd.getSharedResource().ham_res, hamiltonian_batch);
-  ParticleSet::mw_update(electron_batch);
-  TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
   const auto ecp_result =
       QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
           hamiltonian_batch, twf_batch, electron_batch, *ecp_consumer,
@@ -401,6 +411,33 @@ std::size_t piiWorkspaceBytes(
   return checkedMemoryAdd(
       checkedMemoryMultiply(complex_values, sizeof(wftrain::DerivativeValue)),
       checkedMemoryMultiply(restart, sizeof(wftrain::DerivativeReal)));
+}
+
+/** Conservatively charge parameter-space SR solve and proposal transients. */
+std::size_t parameterSpaceSRWorkspaceBytes(std::size_t parameter_count)
+{
+  // PCG owns five P-vectors including its returned solution.  The update rule
+  // simultaneously retains the RHS, metric action, candidate, and transaction
+  // direction at its peak.
+  return checkedMemoryMultiply(
+      checkedMemoryMultiply(9, parameter_count),
+      sizeof(wftrain::DerivativeValue));
+}
+
+/** Conservatively charge minSR/SPRING sample-space solve transients. */
+std::size_t minimumStepWorkspaceBytes(
+    WFTrainDriverInput::Optimizer optimizer,
+    const wftrain::ScoreCovarianceFactor& factor)
+{
+  const std::size_t sample_values = checkedMemoryMultiply(
+      5, factor.localSampleVectorSize());
+  const std::size_t parameter_vectors =
+      optimizer == WFTrainDriverInput::Optimizer::SPRING ? 4 : 3;
+  const std::size_t parameter_values = checkedMemoryMultiply(
+      parameter_vectors, factor.parameterSchema().parameterCount());
+  return checkedMemoryMultiply(
+      checkedMemoryAdd(sample_values, parameter_values),
+      sizeof(wftrain::DerivativeValue));
 }
 
 /** Validate the score products before any rank enters a factor constructor collective. */
@@ -817,6 +854,11 @@ void WFTrainBatched::run()
   const bool resumed = !training_input_.getRestartPath().empty();
   if (resumed)
   {
+    if (myComm->rank() == 0)
+      app_log() << "WFTrain exact restart requires unchanged physical-system and "
+                   "Hamiltonian input; stage validation covers the parameter schema, "
+                   "training controls, and sampler topology."
+                << std::endl;
     wftrain::DistributedTrainingCheckpoint::restore(
         training_input_.getRestartPath(), *myComm, *selected_provider_, training_state,
         stage_state, optimizer_checkpoint, sampler_checkpoint, sampler_checkpoint.topology());
@@ -1113,8 +1155,13 @@ void WFTrainBatched::run()
           }
 
           storage_diagnostics = producer->storageDiagnostics();
-          retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-              covariance->storageDiagnostics().retained_numeric_bytes;
+          retained_numeric_bytes = checkedMemoryAdd(
+              storage_diagnostics.retained_numeric_bytes,
+              covariance->storageDiagnostics().retained_numeric_bytes);
+          retained_numeric_bytes = checkedMemoryAdd(
+              retained_numeric_bytes,
+              parameterSpaceSRWorkspaceBytes(
+                  selected_provider_->parameterSchema().parameterCount()));
           enforceMemoryBudget(*myComm, retained_numeric_bytes,
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
@@ -1168,10 +1215,17 @@ void WFTrainBatched::run()
             spring_factor_binding.emplace(*spring_optimizer);
           }
           const auto factor_storage = factor.storageDiagnostics();
-          retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-              factor_storage.retained_numeric_bytes;
+          retained_numeric_bytes = checkedMemoryAdd(
+              storage_diagnostics.retained_numeric_bytes,
+              factor_storage.retained_numeric_bytes);
           if (spring_optimizer)
-            retained_numeric_bytes += spring_optimizer->retainedBytes();
+            retained_numeric_bytes = checkedMemoryAdd(
+                retained_numeric_bytes, spring_optimizer->retainedBytes());
+          if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR ||
+              optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
+            retained_numeric_bytes = checkedMemoryAdd(
+                retained_numeric_bytes,
+                minimumStepWorkspaceBytes(optimizer_kind, factor));
           enforceMemoryBudget(*myComm, retained_numeric_bytes,
                               training_input_.getMaximumRetainedBytes());
           const EnergyMoments energy_moments =
