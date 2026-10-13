@@ -1025,6 +1025,34 @@ void MultiSlaterDetTableMethod::calcIndividualDetRatios(Vector<ValueType>& ratio
   }
 }
 
+WaveFunctionComponent::LogValue MultiSlaterDetTableMethod::getIndividualTermLogValue(
+    std::size_t ordinal) const
+{
+  if (csf_data_)
+    throw std::logic_error("Individual DETS terms are unavailable for a CSF expansion");
+  if (ordinal >= C->size())
+    throw std::out_of_range("Individual DETS term ordinal is out of range");
+  if ((*C)[ordinal] == ValueType{})
+    throw std::domain_error("Individual DETS term has a zero coefficient");
+  if (C2node->size() != Dets.size())
+    throw std::logic_error("Individual DETS term has inconsistent spin maps");
+
+  LogValue term = convertValueToLog((*C)[ordinal]);
+  for (std::size_t spin = 0; spin < Dets.size(); ++spin)
+  {
+    if ((*C2node)[spin].size() != C->size())
+      throw std::logic_error("Individual DETS term has an incomplete spin map");
+    const std::size_t ratio_index = (*C2node)[spin][ordinal];
+    const auto& ratios            = Dets[spin]->getRatiosToRefDet();
+    if (ratio_index >= ratios.size())
+      throw std::logic_error("Individual DETS term requires an unevaluated ratio table");
+    if (ratios[ratio_index] == ValueType{})
+      throw std::domain_error("Individual DETS term is at an exact determinant node");
+    term += Dets[spin]->getLogValueRefDet() + convertValueToLog(ratios[ratio_index]);
+  }
+  return term;
+}
+
 const std::vector<WaveFunctionComponent::ValueType>& MultiSlaterDetTableMethod::getLinearExpansionCoefs() const
 {
   // CI only for now

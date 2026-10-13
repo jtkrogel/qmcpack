@@ -12,6 +12,7 @@
 #include "Utilities/for_testing/Catch2Approx.h"
 
 #include <cstdio>
+#include <array>
 #include <string>
 #include <limits>
 #include "OhmmsData/Libxml2Doc.h"
@@ -24,6 +25,7 @@
 #include "Utilities/RuntimeOptions.h"
 #include <ResourceCollection.h>
 #include <Fermion/MultiSlaterDetTableMethod.h>
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 
 using std::string;
 
@@ -114,6 +116,38 @@ void test_LiH_msd(const std::string& spo_xml_string,
   msd.calcIndividualDetRatios(individual_det_ratios);
   CHECK(individual_det_ratios[0] == ValueApprox(-1.4357837882));
   CHECK(individual_det_ratios[3] == ValueApprox(-0.013650987));
+
+#if !defined(QMC_COMPLEX)
+  // CI terms are reconstructed directly from reference determinants and table
+  // ratios, so extraction remains valid even when the full MSD nearly cancels.
+  for (std::size_t ordinal : {std::size_t{0}, std::size_t{3}})
+  {
+    const LogValue term_log = msd.getIndividualTermLogValue(ordinal);
+    const ValueType term_over_msd = LogToValue<ValueType>::convert(term_log - msd.get_log_value());
+    CHECK(term_over_msd ==
+          ValueApprox(msd.get_C()[ordinal] * individual_det_ratios[ordinal]));
+  }
+
+  const auto overlap_descriptor =
+      psiformer::DeterminantOverlapTargetDescriptor::makeTopCoefficientMultideterminant(
+          msd, "LiH-test-MSD", 2);
+  REQUIRE(overlap_descriptor.sourceOrdinals().size() == 2);
+  CHECK(overlap_descriptor.sourceOrdinals()[0] == 0);
+  psiformer::DeterminantOverlapTargetEvaluator overlap_targets(overlap_descriptor);
+  psiformer::RealSignedLogAmplitude teacher;
+  std::array<psiformer::RealSignedLogAmplitude, 2> selected_targets;
+  overlap_targets.evaluate(twf, elec_, teacher, selected_targets.data(), selected_targets.size());
+  REQUIRE_FALSE(teacher.isZero());
+  for (std::size_t channel = 0; channel < selected_targets.size(); ++channel)
+  {
+    const std::size_t ordinal = overlap_descriptor.sourceOrdinals()[channel];
+    const double extracted_ratio = selected_targets[channel].phase * teacher.phase *
+        std::exp(selected_targets[channel].log_abs - teacher.log_abs);
+    msd.calcIndividualDetRatios(individual_det_ratios);
+    CHECK(extracted_ratio ==
+          Catch::Approx(msd.get_C()[ordinal] * individual_det_ratios[ordinal]).epsilon(2.0e-12));
+  }
+#endif
 
   twf.prepareGroup(elec_, 0);
   auto grad_old = twf.evalGrad(elec_, 1);

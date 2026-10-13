@@ -15,6 +15,7 @@
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantOverlap.h"
 #include "QMCDrivers/WFTrain/OrbitalPretrainingAccumulator.h"
 #include "psiformer_test_utils.h"
 
@@ -655,4 +656,137 @@ TEST_CASE("PsiFormer affine observations reconstruct every supported score block
       CHECK(maximum_bias_scaled_error < 2e-11);
     }
   }
+}
+
+TEST_CASE("PsiFormer determinant overlap is two-pass stable and differentiable",
+          "[wavefunction][psiformer][overlap]")
+{
+  using qmcplusplus::psiformer::DeterminantOverlapAccumulator;
+  using qmcplusplus::psiformer::RealSignedLogAmplitude;
+  const std::array<double, 2> objective_weights{0.7, 1.3};
+  const std::array<std::array<double, 2>, 5> features{{
+      {{-1.2, 0.4}}, {{-0.3, -0.8}}, {{0.2, 1.1}}, {{0.9, -0.1}}, {{1.4, 0.7}}}};
+  const std::array<RealSignedLogAmplitude, 5> teachers{{
+      {1.0, -0.7}, {-1.0, 0.2}, {1.0, 1.1}, {-1.0, -1.4}, {1.0, 0.5}}};
+
+  auto makeAccumulator = [&](double parameter, std::size_t begin, std::size_t end) {
+    DeterminantOverlapAccumulator accumulator(
+        {objective_weights.begin(), objective_weights.end()});
+    for (std::size_t sample = begin; sample < end; ++sample)
+    {
+      std::array<RealSignedLogAmplitude, 2> targets{teachers[sample], teachers[sample]};
+      std::array<RealSignedLogAmplitude, 2> students;
+      for (std::size_t channel = 0; channel < students.size(); ++channel)
+        students[channel] = {teachers[sample].phase,
+                             teachers[sample].log_abs + parameter * features[sample][channel]};
+      accumulator.addSample(teachers[sample], targets.data(), students.data(), students.size());
+    }
+    return accumulator;
+  };
+
+  constexpr double parameter = 0.37;
+  auto accumulator = makeAccumulator(parameter, 0, teachers.size());
+  const std::size_t fingerprint = accumulator.storageFingerprint();
+  const std::size_t retained_bytes = accumulator.retainedScalarBytes();
+  const double loss = accumulator.finalize();
+  CHECK(loss > 0.0);
+  CHECK(accumulator.sampleCount() == teachers.size());
+  CHECK(accumulator.diagnostics()[0].fidelity <= 1.0);
+
+  // Compare the signed-log streaming reduction with an explicit dense reference.
+  double dense_loss = 0.0;
+  for (std::size_t channel = 0; channel < objective_weights.size(); ++channel)
+  {
+    double cross = 0.0;
+    double student_square = 0.0;
+    for (const auto& sample_features : features)
+    {
+      const double ratio = std::exp(parameter * sample_features[channel]);
+      cross += ratio;
+      student_square += ratio * ratio;
+    }
+    const double fidelity = cross * cross /
+        (static_cast<double>(features.size()) * student_square);
+    dense_loss -= objective_weights[channel] * std::log(fidelity);
+  }
+  CHECK(loss == Catch::Approx(dense_loss).epsilon(2.0e-14));
+
+  double analytic = 0.0;
+  for (std::size_t sample = 0; sample < teachers.size(); ++sample)
+  {
+    std::array<RealSignedLogAmplitude, 2> targets{teachers[sample], teachers[sample]};
+    std::array<RealSignedLogAmplitude, 2> students;
+    for (std::size_t channel = 0; channel < students.size(); ++channel)
+      students[channel] = {teachers[sample].phase,
+                           teachers[sample].log_abs + parameter * features[sample][channel]};
+    std::array<double, 2> score_weights;
+    accumulator.channelScoreWeights(teachers[sample], targets.data(), students.data(),
+                                    students.size(), score_weights.data());
+    for (std::size_t channel = 0; channel < score_weights.size(); ++channel)
+      analytic += score_weights[channel] * features[sample][channel];
+  }
+
+  constexpr double epsilon = 1.0e-6;
+  auto plus = makeAccumulator(parameter + epsilon, 0, teachers.size());
+  auto minus = makeAccumulator(parameter - epsilon, 0, teachers.size());
+  const double finite_difference = (plus.finalize() - minus.finalize()) / (2.0 * epsilon);
+  CHECK(analytic == Catch::Approx(finite_difference).epsilon(2.0e-8).margin(2.0e-9));
+
+  // Independently accumulated rank-local moments merge to the dense first pass.
+  auto left = makeAccumulator(parameter, 0, 2);
+  auto right = makeAccumulator(parameter, 2, teachers.size());
+  left.merge(right);
+  CHECK(left.finalize() == Catch::Approx(loss).epsilon(2.0e-14));
+
+  // Reset and warmed two-pass reuse preserve every retained allocation.
+  std::array<double, 2> score_weights{};
+  allocation_count.store(0, std::memory_order_relaxed);
+  count_allocations.store(true, std::memory_order_relaxed);
+  accumulator.reset();
+  for (std::size_t sample = 0; sample < teachers.size(); ++sample)
+  {
+    std::array<RealSignedLogAmplitude, 2> targets{teachers[sample], teachers[sample]};
+    std::array<RealSignedLogAmplitude, 2> students;
+    for (std::size_t channel = 0; channel < students.size(); ++channel)
+      students[channel] = {teachers[sample].phase,
+                           teachers[sample].log_abs + parameter * features[sample][channel]};
+    accumulator.addSample(teachers[sample], targets.data(), students.data(), students.size());
+  }
+  accumulator.finalize();
+  std::array<RealSignedLogAmplitude, 2> final_targets{teachers.back(), teachers.back()};
+  std::array<RealSignedLogAmplitude, 2> final_students;
+  for (std::size_t channel = 0; channel < final_students.size(); ++channel)
+    final_students[channel] = {teachers.back().phase,
+                               teachers.back().log_abs + parameter * features.back()[channel]};
+  accumulator.channelScoreWeights(teachers.back(), final_targets.data(), final_students.data(),
+                                  final_students.size(), score_weights.data());
+  count_allocations.store(false, std::memory_order_relaxed);
+  CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
+  CHECK(accumulator.storageFingerprint() == fingerprint);
+  CHECK(accumulator.retainedScalarBytes() == retained_bytes);
+}
+
+TEST_CASE("PsiFormer determinant overlap rejects nodes cancellation and bad lifecycle",
+          "[wavefunction][psiformer][overlap]")
+{
+  using qmcplusplus::psiformer::DeterminantOverlapAccumulator;
+  using qmcplusplus::psiformer::RealSignedLogAmplitude;
+  DeterminantOverlapAccumulator accumulator({1.0});
+  const RealSignedLogAmplitude one{1.0, 0.0};
+  const RealSignedLogAmplitude zero{};
+  CHECK_THROWS_AS(accumulator.addSample(zero, &one, &one, 1), std::domain_error);
+  CHECK_THROWS_AS(accumulator.finalize(), std::domain_error);
+
+  accumulator.addSample(one, &one, &one, 1);
+  RealSignedLogAmplitude negative{-1.0, 0.0};
+  accumulator.addSample(one, &negative, &one, 1);
+  CHECK_THROWS_AS(accumulator.finalize(), std::domain_error);
+
+  DeterminantOverlapAccumulator valid({1.0});
+  valid.addSample(one, &one, &one, 1);
+  valid.finalize();
+  CHECK_THROWS_AS(valid.addSample(one, &one, &one, 1), std::logic_error);
+  double score_weight = 0.0;
+  CHECK_THROWS_AS(valid.channelScoreWeights(one, &one, &zero, 1, &score_weight),
+                  std::domain_error);
 }

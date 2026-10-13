@@ -15,6 +15,7 @@
 #include "QMCWaveFunctions/Fermion/MultiDiracDeterminant.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/TrialWaveFunction.h"
 
 #include <algorithm>
 #include <cmath>
@@ -83,6 +84,22 @@ double checkedRealValue(const Scalar& value, const char* description)
     throw std::invalid_argument(std::string("PsiFormer ") + description +
                                 " must be finite and real");
   return real_value;
+}
+
+/// Convert QMCPACK's complex-log convention to a real signed-log amplitude.
+RealSignedLogAmplitude checkedRealLogAmplitude(const WaveFunctionComponent::LogValue& value,
+                                               const char* description)
+{
+  const double log_abs = std::real(value);
+  const double angle   = std::imag(value);
+  if (!isFiniteDouble(log_abs) && log_abs != -std::numeric_limits<double>::infinity())
+    throw std::domain_error(std::string("PsiFormer ") + description + " log magnitude is invalid");
+  if (!isFiniteDouble(angle) || std::abs(std::sin(angle)) > 1.0e-12)
+    throw std::invalid_argument(std::string("PsiFormer ") + description +
+                                " is not a real signed wavefunction");
+  if (log_abs == -std::numeric_limits<double>::infinity())
+    return {};
+  return {std::cos(angle) < 0.0 ? -1.0 : 1.0, log_abs};
 }
 
 } // namespace
@@ -340,6 +357,148 @@ OrbitalTargetEvaluator OrbitalTargetEvaluator::fromMultideterminant(
       source.get_C2node(), configurations);
   return {std::move(descriptor), std::move(orbitals)};
 #endif
+}
+
+DeterminantOverlapTargetDescriptor::DeterminantOverlapTargetDescriptor(
+    DeterminantOverlapTargetMode mode,
+    std::string source_identity,
+    std::size_t channel_count,
+    std::vector<std::size_t> source_ordinals,
+    std::vector<double> selected_coefficients)
+    : mode_(mode),
+      source_identity_(std::move(source_identity)),
+      channel_count_(channel_count),
+      source_ordinals_(std::move(source_ordinals)),
+      fingerprint_(1469598103934665603ULL)
+{
+  if (source_identity_.empty() || channel_count_ == 0)
+    throw std::invalid_argument("PsiFormer overlap target requires a source identity and channels");
+  if (mode_ == DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER)
+  {
+    if (!source_ordinals_.empty() || !selected_coefficients.empty())
+      throw std::invalid_argument("General PsiFormer overlap target cannot select CI terms");
+  }
+  else if (source_ordinals_.size() != channel_count_ ||
+           selected_coefficients.size() != channel_count_)
+    throw std::invalid_argument("Paired PsiFormer overlap target has the wrong CI term count");
+
+  hashUnsigned(fingerprint_, 1); // overlap-target serialization convention
+  hashUnsigned(fingerprint_, static_cast<std::uint64_t>(mode_));
+  hashString(fingerprint_, source_identity_);
+  hashUnsigned(fingerprint_, channel_count_);
+  for (std::size_t channel = 0; channel < source_ordinals_.size(); ++channel)
+  {
+    if (!isFiniteDouble(selected_coefficients[channel]) || selected_coefficients[channel] == 0.0)
+      throw std::invalid_argument("Paired PsiFormer overlap target coefficient must be finite and nonzero");
+    hashUnsigned(fingerprint_, source_ordinals_[channel]);
+    std::uint64_t coefficient_bits;
+    std::memcpy(&coefficient_bits, &selected_coefficients[channel], sizeof(coefficient_bits));
+    hashUnsigned(fingerprint_, coefficient_bits);
+  }
+}
+
+DeterminantOverlapTargetDescriptor
+DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher(std::string source_identity,
+                                                             std::size_t determinant_count)
+{
+  return {DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER,
+          std::move(source_identity), determinant_count, {}, {}};
+}
+
+DeterminantOverlapTargetDescriptor
+DeterminantOverlapTargetDescriptor::makeTopCoefficientMultideterminant(
+    const MultiSlaterDetTableMethod& source,
+    std::string source_identity,
+    std::size_t determinant_count)
+{
+#if defined(QMC_COMPLEX)
+  throw std::invalid_argument("PsiFormer determinant-overlap targets are real-only");
+#else
+  if (source.hasCSFExpansion())
+    throw std::invalid_argument("PsiFormer determinant-overlap target requires explicit DETS");
+  std::vector<std::size_t> order(source.get_C().size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&source](std::size_t left, std::size_t right) {
+    return std::abs(source.get_C()[left]) > std::abs(source.get_C()[right]);
+  });
+
+  std::vector<std::size_t> ordinals;
+  std::vector<double> coefficients;
+  ordinals.reserve(determinant_count);
+  coefficients.reserve(determinant_count);
+  for (std::size_t ordinal : order)
+  {
+    const double coefficient = checkedRealValue(source.get_C()[ordinal], "overlap DETS coefficient");
+    if (coefficient == 0.0)
+      continue;
+    ordinals.push_back(ordinal);
+    coefficients.push_back(coefficient);
+    if (ordinals.size() == determinant_count)
+      break;
+  }
+  if (ordinals.size() != determinant_count)
+    throw std::invalid_argument("PsiFormer overlap target requests more channels than nonzero DETS terms");
+  return {DeterminantOverlapTargetMode::TOP_COEFFICIENT_MULTIDETERMINANT,
+          std::move(source_identity), determinant_count, std::move(ordinals),
+          std::move(coefficients)};
+#endif
+}
+
+DeterminantOverlapTargetEvaluator::DeterminantOverlapTargetEvaluator(
+    DeterminantOverlapTargetDescriptor descriptor)
+    : descriptor_(std::move(descriptor))
+{
+#if defined(QMC_COMPLEX)
+  throw std::invalid_argument("PsiFormer determinant-overlap targets are real-only");
+#endif
+}
+
+void DeterminantOverlapTargetEvaluator::evaluate(TrialWaveFunction& frozen_teacher,
+                                                 ParticleSet& electrons,
+                                                 RealSignedLogAmplitude& teacher,
+                                                 RealSignedLogAmplitude* targets,
+                                                 std::size_t target_count) const
+{
+  if (!targets || target_count != descriptor_.channelCount())
+    throw std::invalid_argument("PsiFormer overlap target output has the wrong channel count");
+
+  frozen_teacher.evaluateLog(electrons);
+  const WaveFunctionComponent::LogValue full_log(frozen_teacher.getLogPsi(), frozen_teacher.getPhase());
+  teacher = checkedRealLogAmplitude(full_log, "overlap teacher");
+  if (descriptor_.mode() == DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER)
+  {
+    std::fill_n(targets, target_count, teacher);
+    return;
+  }
+
+  const MultiSlaterDetTableMethod* msd = nullptr;
+  std::size_t fermionic_components = 0;
+  for (const auto& component : frozen_teacher.getOrbitals())
+  {
+    fermionic_components += component->isFermionic() ? 1 : 0;
+    if (const auto* candidate = dynamic_cast<const MultiSlaterDetTableMethod*>(component.get()))
+    {
+      if (msd)
+        throw std::invalid_argument(
+            "Paired PsiFormer overlap target requires exactly one multideterminant component");
+      msd = candidate;
+    }
+  }
+  if (!msd)
+    throw std::invalid_argument(
+        "Paired PsiFormer overlap target requires exactly one multideterminant component");
+  if (fermionic_components != 1)
+    throw std::invalid_argument("Paired PsiFormer overlap target cannot disambiguate multiple fermionic components");
+
+  // Keep every common component by replacing only the full MSD logarithm with
+  // the selected coefficient-weighted determinant term.
+  const auto common_log = full_log - msd->get_log_value();
+  for (std::size_t channel = 0; channel < target_count; ++channel)
+  {
+    const auto selected_log = msd->getIndividualTermLogValue(descriptor_.sourceOrdinals()[channel]);
+    targets[channel] = checkedRealLogAmplitude(common_log + selected_log,
+                                               "paired multideterminant target");
+  }
 }
 
 const std::vector<double>& OrbitalTargetEvaluator::evaluate(const ParticleSet& electrons)

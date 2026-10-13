@@ -131,6 +131,14 @@ public:
    */
   void calcIndividualDetRatios(Vector<ValueType>& ratios);
 
+  /** Return one coefficient-weighted CI determinant term in logarithmic form.
+   *
+   * evaluateLog() must have populated the reference determinants and their ratio
+   * tables first.  Unlike calcIndividualDetRatios(), this route never divides by
+   * the potentially cancelling full multideterminant expansion.
+   */
+  LogValue getIndividualTermLogValue(std::size_t ordinal) const;
+
   const std::vector<ValueType>& getLinearExpansionCoefs() const;
 
   void prepareGroup(ParticleSet& P, int ig) override;

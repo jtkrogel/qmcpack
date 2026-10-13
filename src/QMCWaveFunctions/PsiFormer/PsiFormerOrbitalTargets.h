@@ -17,6 +17,7 @@
 #define QMCPLUSPLUS_PSIFORMER_ORBITAL_TARGETS_H
 
 #include "Configuration.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantOverlap.h"
 #include "QMCWaveFunctions/SPOSet.h"
 
 #include <cstddef>
@@ -30,6 +31,7 @@ namespace qmcplusplus
 class MultiSlaterDetTableMethod;
 class ParticleSet;
 class SlaterDet;
+class TrialWaveFunction;
 
 namespace psiformer
 {
@@ -166,6 +168,82 @@ private:
   std::vector<SPOSet::ValueVector> orbital_scratch_;
   std::vector<double> coefficient_roots_;
   std::vector<double> target_matrices_;
+};
+
+/// Select whether overlap channels repeat a teacher or pair with selected CI terms.
+enum class DeterminantOverlapTargetMode
+{
+  GENERAL_FROZEN_TEACHER,
+  TOP_COEFFICIENT_MULTIDETERMINANT
+};
+
+/** Freeze the identity and channel mapping of a determinant-overlap teacher. */
+class DeterminantOverlapTargetDescriptor
+{
+public:
+  /// Repeat one arbitrary named frozen teacher for every student determinant.
+  static DeterminantOverlapTargetDescriptor makeGeneralFrozenTeacher(
+      std::string source_identity, std::size_t determinant_count);
+
+  /// Pair channels with stable descending-|c| nonzero terms of one DETS expansion.
+  static DeterminantOverlapTargetDescriptor makeTopCoefficientMultideterminant(
+      const MultiSlaterDetTableMethod& source,
+      std::string source_identity,
+      std::size_t determinant_count);
+
+  /// Return the target construction convention.
+  DeterminantOverlapTargetMode mode() const noexcept { return mode_; }
+
+  /// Return the stable externally supplied identity of the frozen teacher.
+  const std::string& sourceIdentity() const noexcept { return source_identity_; }
+
+  /// Return selected source CI ordinals, empty for repeated general targets.
+  const std::vector<std::size_t>& sourceOrdinals() const noexcept { return source_ordinals_; }
+
+  /// Return the number of PsiFormer determinant channels.
+  std::size_t channelCount() const noexcept { return channel_count_; }
+
+  /// Return a deterministic identity for checkpoint/restart validation.
+  std::uint64_t fingerprint() const noexcept { return fingerprint_; }
+
+private:
+  DeterminantOverlapTargetDescriptor(DeterminantOverlapTargetMode mode,
+                                     std::string source_identity,
+                                     std::size_t channel_count,
+                                     std::vector<std::size_t> source_ordinals,
+                                     std::vector<double> selected_coefficients);
+
+  DeterminantOverlapTargetMode mode_;
+  std::string source_identity_;
+  std::size_t channel_count_;
+  std::vector<std::size_t> source_ordinals_;
+  std::uint64_t fingerprint_;
+};
+
+/** Evaluate signed/log targets from an externally owned, frozen TrialWaveFunction.
+ *
+ * Ownership and name lookup remain driver concerns.  For selected multideterminant
+ * targets, every nonfermionic component (notably a common Jastrow) is retained by
+ * replacing only the teacher's full MSD component with one selected CI term.
+ */
+class DeterminantOverlapTargetEvaluator
+{
+public:
+  /// Construct an allocation-stable evaluator for one immutable descriptor.
+  explicit DeterminantOverlapTargetEvaluator(DeterminantOverlapTargetDescriptor descriptor);
+
+  /// Evaluate the full teacher and all target channels at one configuration.
+  void evaluate(TrialWaveFunction& frozen_teacher,
+                ParticleSet& electrons,
+                RealSignedLogAmplitude& teacher,
+                RealSignedLogAmplitude* targets,
+                std::size_t target_count) const;
+
+  /// Return the immutable target mapping and restart identity.
+  const DeterminantOverlapTargetDescriptor& descriptor() const noexcept { return descriptor_; }
+
+private:
+  DeterminantOverlapTargetDescriptor descriptor_;
 };
 
 } // namespace psiformer

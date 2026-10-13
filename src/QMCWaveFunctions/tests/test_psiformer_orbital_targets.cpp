@@ -186,4 +186,24 @@ TEST_CASE("PsiFormer down-only target signs the first global beta column",
 #endif
 }
 
+TEST_CASE("PsiFormer general overlap target has stable frozen-source identity",
+          "[wavefunction][psiformer][overlap]")
+{
+  const auto descriptor = DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher(
+      "frozen-trial-wavefunction", 4);
+  CHECK(descriptor.mode() == DeterminantOverlapTargetMode::GENERAL_FROZEN_TEACHER);
+  CHECK(descriptor.channelCount() == 4);
+  CHECK(descriptor.sourceOrdinals().empty());
+  CHECK(descriptor.fingerprint() ==
+        DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher(
+            "frozen-trial-wavefunction", 4).fingerprint());
+  CHECK(descriptor.fingerprint() !=
+        DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher(
+            "different-frozen-source", 4).fingerprint());
+  CHECK_THROWS_AS(DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher("", 4),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(DeterminantOverlapTargetDescriptor::makeGeneralFrozenTeacher("source", 0),
+                  std::invalid_argument);
+}
+
 } // namespace qmcplusplus::psiformer
