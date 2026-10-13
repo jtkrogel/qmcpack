@@ -120,15 +120,18 @@ std::size_t HostStagedAcceleratorReduction::consensus(
 [[noreturn]] void HostStagedAcceleratorReduction::failAndRecover(
     AcceleratorCollectiveFailure failure,
     std::size_t failing_rank,
-    const char* stage)
+  const char* stage)
 {
   state_.failIteration(failure);
-  copy_queue_.drainAfterFailure();
-  state_.recoverAfterExternalDrain();
+  const bool drained = copy_queue_.drainAfterFailure();
+  if (drained)
+    state_.recoverAfterExternalDrain();
 
   std::ostringstream message;
   message << "Host-staged accelerator reduction " << stage << " failed on rank "
           << failing_rank;
+  if (!drained)
+    message << "; external queue drain was not confirmed and the coordinator remains poisoned";
   throw std::runtime_error(message.str());
 }
 
@@ -212,8 +215,8 @@ void HostStagedAcceleratorReduction::reduceComplexVector(
     if (state_.iterationState() == AcceleratorCollectiveIterationState::ACTIVE)
     {
       state_.failIteration(AcceleratorCollectiveFailure::COLLECTIVE);
-      copy_queue_.drainAfterFailure();
-      state_.recoverAfterExternalDrain();
+      if (copy_queue_.drainAfterFailure())
+        state_.recoverAfterExternalDrain();
     }
     throw;
   }

@@ -123,6 +123,14 @@ endif()
 add_unit_test(${UTEST_NAME} 1 8 $<TARGET_FILE:${UTEST_EXE}>)
 set_tests_properties(${UTEST_NAME} PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+if(ENABLE_CUDA)
+  # Compile/link only: running this target is unnecessary and accelerator runtime
+  # availability is deliberately not assumed by the offline Task 28 harness.
+  add_executable(accelerator_collective_copy_link_check
+                 accelerator_collective_copy_link_check.cpp)
+  target_link_libraries(accelerator_collective_copy_link_check qmcdriver)
+endif()
+
 if(HAVE_MPI)
   set(UTEST_EXE test_quantile_clipping_mpi)
   add_executable(${UTEST_EXE} test_QuantileClipping.cpp)

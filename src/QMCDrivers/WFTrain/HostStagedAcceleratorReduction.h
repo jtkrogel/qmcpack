@@ -54,8 +54,8 @@ public:
                                   std::size_t count) = 0;
   virtual void waitHostToDevice(std::size_t slot) = 0;
 
-  /// Drain or cancel any submitted copy after a failed operation.
-  virtual void drainAfterFailure() noexcept = 0;
+  /// Drain/cancel submitted work and report whether buffer reuse is confirmed.
+  virtual bool drainAfterFailure() noexcept = 0;
 };
 
 /// Describe one caller-owned pinned-host complex128 staging interval.

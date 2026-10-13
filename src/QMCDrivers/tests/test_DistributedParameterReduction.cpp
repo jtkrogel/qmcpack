@@ -66,10 +66,15 @@ public:
 
   void waitHostToDevice(std::size_t) override { ++host_to_device_waits_; }
 
-  void drainAfterFailure() noexcept override { ++drain_count_; }
+  bool drainAfterFailure() noexcept override
+  {
+    ++drain_count_;
+    return drain_succeeds_;
+  }
 
   bool fail_device_to_host_ = false;
   bool fail_host_to_device_ = false;
+  bool drain_succeeds_ = true;
   std::size_t device_to_host_submissions_ = 0;
   std::size_t device_to_host_waits_ = 0;
   std::size_t host_to_device_submissions_ = 0;
@@ -732,12 +737,13 @@ TEST_CASE("Host-staged accelerator reduction reports post-collective copy failur
   std::vector<DerivativeValue> values(5, DerivativeValue{static_cast<double>(rank + 1), 0.0});
 
   queue.fail_host_to_device_ = rank == 0;
+  queue.drain_succeeds_ = false;
   CHECK_THROWS_WITH(reduction.reduceComplexVector(
                         values.data(), values.size(), plan.fingerprint,
                         plan.parameter_version),
                     Catch::Matchers::ContainsSubstring(
-                        "host-to-device copy failed on rank 0"));
-  CHECK(reduction.state().iterationState() == AcceleratorCollectiveIterationState::IDLE);
+                        "coordinator remains poisoned"));
+  CHECK(reduction.state().iterationState() == AcceleratorCollectiveIterationState::FAILED);
   CHECK(queue.drain_count_ == 1);
 }
 
