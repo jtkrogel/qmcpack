@@ -154,7 +154,9 @@ private:
  * Here O is the centered score factor owned by ScoreCovarianceFactor. Before sample
  * weighting, A*v is the derivative of (H psi)/psi: dE_L[v]+E_L*(score JVP).
  * In the stored convention B*v=sqrt(q)*dE_L[v]+(E_L-tau)*(O*v). The initial
- * implementation admits the all-electron kinetic derivative only.
+ * The term mask may name the all-electron kinetic contribution alone or the
+ * kinetic plus an ordinary-locality nonlocal-ECP replay captured on the same
+ * accepted quadrature grid as the stored local energies.
  */
 class ProjectedInverseIterationFactor
 {
@@ -172,6 +174,9 @@ public:
   {
     return local_energy_term_mask_;
   }
+
+  /// Return exact numeric storage retained directly by the shifted factor.
+  std::size_t retainedBytes() const noexcept;
 
   /// Apply the realified shifted local-energy factor (A-tau*O).
   void applyShifted(const StructuredParameterVectorConstView& direction,

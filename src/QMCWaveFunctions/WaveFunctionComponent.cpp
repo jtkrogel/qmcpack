@@ -16,6 +16,7 @@
 
 
 #include "WaveFunctionComponent.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 
@@ -60,6 +61,17 @@ WaveFunctionComponent::makeStreamingDerivativeOperator(
     std::size_t) const
 {
   throw std::runtime_error("Wavefunction component does not support streaming parameter derivatives");
+}
+
+std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
+WaveFunctionComponent::makeNonLocalECPDerivativeConsumer(
+    const RefVectorWithLeader<WaveFunctionComponent>&,
+    const RefVectorWithLeader<ParticleSet>&,
+    std::size_t,
+    bool) const
+{
+  throw std::runtime_error(
+      "Wavefunction component does not support nonlocal ECP parameter derivatives");
 }
 
 std::unique_ptr<psiformer::DeterminantChannelBatch>

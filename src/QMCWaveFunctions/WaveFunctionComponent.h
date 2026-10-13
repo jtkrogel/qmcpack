@@ -47,6 +47,7 @@ template<CoordsType CT>
 class MCMultiParticleMoves;
 namespace wftrain
 {
+class NonLocalECPDerivativeConsumer;
 class StructuredParameterProvider;
 class StreamingDerivativeOperator;
 }
@@ -225,6 +226,19 @@ public:
       std::size_t batch_ordinal,
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size) const;
+
+  /** Construct a bounded ordinary-locality ECP derivative consumer.
+   *
+   * Unsupported components fail closed.  Concrete providers copy any caller-owned
+   * sample data needed after this call and bind the returned consumer to the
+   * current parameter version.
+   */
+  virtual std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
+  makeNonLocalECPDerivativeConsumer(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::size_t maximum_parameter_chunk_size,
+      bool capture_jvp_replay = false) const;
 
   /** Construct a determinant-resolved batch for bounded overlap objectives.
    *

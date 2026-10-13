@@ -51,6 +51,7 @@ template<CoordsType CT>
 class MCMultiParticleMoves;
 namespace wftrain
 {
+class NonLocalECPDerivativeConsumer;
 class StructuredParameterProvider;
 }
 namespace psiformer
@@ -187,6 +188,15 @@ public:
       std::size_t batch_ordinal,
       std::size_t sample_offset,
       std::size_t maximum_parameter_chunk_size);
+
+  /** Select one structured provider and construct its nonlocal ECP consumer. */
+  static std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
+  makeStructuredNonLocalECPDerivativeConsumer(
+      const RefVectorWithLeader<TrialWaveFunction>& wf_list,
+      const RefVectorWithLeader<ParticleSet>& p_list,
+      std::string_view provider_id,
+      std::size_t maximum_parameter_chunk_size,
+      bool capture_jvp_replay = false);
 
   /** Select one structured provider and construct its determinant-channel batch. */
   static std::unique_ptr<psiformer::DeterminantChannelBatch>

@@ -15,6 +15,7 @@
 #include "QMCDrivers/WalkerLogManager.h"
 #include "QMCDrivers/WFTrain/DeterminantOverlapObjective.h"
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
@@ -23,8 +24,9 @@
 #include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
-#include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
+#include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
+#include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
@@ -110,7 +112,9 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     std::string_view provider_id,
     std::size_t batch_ordinal,
     std::size_t sample_offset,
-    std::size_t maximum_parameter_chunk_size)
+    std::size_t maximum_parameter_chunk_size,
+    bool has_nonlocal_ecp,
+    bool capture_ecp_jvp_replay)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -123,12 +127,95 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
       maximum_parameter_chunk_size);
   batch.weights.assign(walkers.size(), 1.0);
-  batch.local_energies.reserve(walkers.size());
-  for (const auto& walker : walkers)
-    batch.local_energies.emplace_back(walker.get().Properties(WalkerProperties::LOCALENERGY));
   batch.local_energy_term_mask =
       wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+
+  if (!has_nonlocal_ecp)
+  {
+    batch.local_energies.reserve(walkers.size());
+    for (const auto& walker : walkers)
+      batch.local_energies.emplace_back(
+          walker.get().Properties(WalkerProperties::LOCALENERGY));
+    return batch;
+  }
+
+  // The ordinary-locality ECP energy and its weighted parameter response must
+  // share one accepted stochastic quadrature grid.  Re-evaluate the complete
+  // local energy here and capture the isolated ECP VJP during that traversal.
+  const auto& hamiltonians = crowd.get_walker_hamiltonians();
+  RefVectorWithLeader<QMCHamiltonian> hamiltonian_batch(
+      hamiltonians[0], hamiltonians);
+  auto ecp_consumer =
+      TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
+          twf_batch, electron_batch, provider_id,
+          maximum_parameter_chunk_size, capture_ecp_jvp_replay);
+
+  const wftrain::StructuredParameterSchema& schema =
+      batch.derivative_operator->parameterSchema();
+  const std::size_t parameter_version =
+      batch.derivative_operator->parameterVersion();
+  std::vector<wftrain::DerivativeValue> ecp_coefficients(
+      walkers.size(), wftrain::DerivativeValue{1.0, 0.0});
+  const wftrain::CoefficientView coefficient_view{
+      schema.providerId(), schema.fingerprint(), parameter_version,
+      batch_ordinal, sample_offset,
+      {ecp_coefficients.data(), ecp_coefficients.size()}};
+  const std::uint32_t ecp_mask =
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  const wftrain::VJPCoefficientChannel ecp_channel{
+      wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+      wftrain::DerivativeProduct::LOCAL_ENERGY_VJP, coefficient_view, ecp_mask};
+  wftrain::PreparedLocalEnergyVJPCapture ecp_capture(
+      schema, parameter_version, ecp_mask);
+
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(
+      crowd.getSharedResource().pset_res, electron_batch);
+  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(
+      crowd.getSharedResource().twf_res, twf_batch);
+  ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(
+      crowd.getSharedResource().ham_res, hamiltonian_batch);
+  ParticleSet::mw_update(electron_batch);
+  TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+  const auto ecp_result =
+      QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+          hamiltonian_batch, twf_batch, electron_batch, *ecp_consumer,
+          {&ecp_channel, 1}, ecp_capture);
+  batch.local_energies.reserve(ecp_result.local_energies.size());
+  for (const auto energy : ecp_result.local_energies)
+    batch.local_energies.emplace_back(energy, 0.0);
+  batch.additive_local_energy_vjp.emplace(ecp_capture.release());
+
+  if (capture_ecp_jvp_replay)
+  {
+    auto replay = ecp_consumer->releaseJVPReplay();
+    if (replay->gridFingerprint() != ecp_result.grid_fingerprint)
+      throw std::logic_error(
+          "WFTrainBatched: accepted ECP replay grid identity changed before binding");
+    batch.derivative_operator->bindNonLocalECPJVPReplay(std::move(replay));
+  }
   return batch;
+}
+
+/** Validate and return the expected complete Hamiltonian-term mask. */
+std::uint32_t completeLocalEnergyTermMask(
+    const std::vector<wftrain::PreparedEnergyGradientBatch>& batches,
+    bool has_nonlocal_ecp)
+{
+  std::uint32_t expected_mask =
+      wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+  if (has_nonlocal_ecp)
+    expected_mask |=
+        wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  for (const auto& batch : batches)
+  {
+    std::uint32_t mask = batch.local_energy_term_mask;
+    if (batch.additive_local_energy_vjp)
+      mask |= batch.additive_local_energy_vjp->local_energy_term_mask;
+    if (mask != expected_mask)
+      throw std::invalid_argument(
+          "WFTrainBatched: prepared batches have inconsistent Hamiltonian-term coverage");
+  }
+  return expected_mask;
 }
 
 /** Return the Euclidean norm of a real parameter gradient. */
@@ -256,6 +343,64 @@ void enforceMemoryBudget(Communicate& communicator,
   if (budget_exceeded != 0)
     throw UniformCommunicateError(
         "WFTrainBatched: retained training storage exceeds maximum_retained_bytes on at least one rank");
+}
+
+/** Add byte extents without allowing accounting overflow to wrap the budget. */
+std::size_t checkedMemoryAdd(std::size_t lhs, std::size_t rhs)
+{
+  if (rhs > std::numeric_limits<std::size_t>::max() - lhs)
+    throw std::overflow_error("WFTrainBatched: training memory estimate overflowed");
+  return lhs + rhs;
+}
+
+/** Multiply byte extents without allowing accounting overflow to wrap the budget. */
+std::size_t checkedMemoryMultiply(std::size_t lhs, std::size_t rhs)
+{
+  if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs)
+    throw std::overflow_error("WFTrainBatched: training memory estimate overflowed");
+  return lhs * rhs;
+}
+
+/** Conservatively charge transient restarted-GMRES and proposal storage.
+ *
+ * This estimate intentionally overlaps some short-lived vectors.  A hard memory
+ * ceiling must fail before entering a solve rather than relying on allocator
+ * failure, and conservative O(mP) or O(mB_local+P) accounting is preferable to
+ * understating the peak.
+ */
+std::size_t piiWorkspaceBytes(
+    WFTrainDriverInput::Optimizer optimizer,
+    const wftrain::ScoreCovarianceFactor& factor,
+    std::size_t restart_length)
+{
+  const bool minimum = optimizer ==
+      WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION;
+  const std::size_t parameter_count = factor.parameterSchema().parameterCount();
+  const std::size_t local_extent =
+      minimum ? factor.localSampleVectorSize() : parameter_count;
+  const std::size_t global_extent =
+      minimum ? factor.globalSampleVectorSize() : parameter_count;
+  const std::size_t restart = std::min(restart_length, global_extent);
+  const std::size_t restart_plus_one = checkedMemoryAdd(restart, 1);
+
+  std::size_t complex_values =
+      checkedMemoryMultiply(restart_plus_one, local_extent);
+  complex_values = checkedMemoryAdd(
+      complex_values, checkedMemoryMultiply(restart_plus_one, restart));
+  complex_values = checkedMemoryAdd(
+      complex_values, checkedMemoryMultiply(3, local_extent));
+  complex_values = checkedMemoryAdd(
+      complex_values, checkedMemoryAdd(checkedMemoryMultiply(3, restart), 1));
+  complex_values = checkedMemoryAdd(
+      complex_values,
+      minimum
+          ? checkedMemoryAdd(checkedMemoryMultiply(2, local_extent),
+                             checkedMemoryMultiply(2, parameter_count))
+          : checkedMemoryAdd(checkedMemoryMultiply(3, parameter_count),
+                             factor.localSampleVectorSize()));
+  return checkedMemoryAdd(
+      checkedMemoryMultiply(complex_values, sizeof(wftrain::DerivativeValue)),
+      checkedMemoryMultiply(restart, sizeof(wftrain::DerivativeReal)));
 }
 
 /** Validate the score products before any rank enters a factor constructor collective. */
@@ -534,6 +679,12 @@ void WFTrainBatched::process(xmlNodePtr node)
 
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
+    if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
+        (!training_input_.getCheckpointPath().empty() ||
+         !training_input_.getRestartPath().empty()))
+      throw UniformCommunicateError(
+          "WFTrainBatched: exact checkpoint/restart is not yet supported for "
+          "stochastic nonlocal-ECP quadrature state");
     if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY)
       validateHamiltonianForTraining();
 
@@ -642,8 +793,13 @@ void WFTrainBatched::run()
   const std::uint64_t overlap_fingerprint = determinant_overlap
       ? determinant_overlap_objective_->configurationFingerprint()
       : 0;
+  const bool has_nonlocal_ecp =
+      population_.get_golden_hamiltonian().hasPhysicalNLPP();
   wftrain::TrainingStageState stage_state{
-      determinant_overlap ? "determinant_overlap" : "all_electron_energy", 0, 0,
+      determinant_overlap ? "determinant_overlap"
+                          : (has_nonlocal_ecp ? "pseudopotential_energy"
+                                              : "all_electron_energy"),
+      0, 0,
       stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
                                     selected_provider_->parameterSchema(), steps_per_block_,
                                     overlap_fingerprint)};
@@ -836,258 +992,273 @@ void WFTrainBatched::run()
       }
       else
       {
-      std::vector<wftrain::PreparedEnergyGradientBatch> batches;
-      std::exception_ptr preparation_failure;
-      try
-      {
-        batches.reserve(crowds_.size());
-        std::size_t sample_offset = 0;
-        std::size_t batch_ordinal = 0;
-        for (auto& crowd : crowds_)
-          if (crowd->size() != 0)
-          {
-            batches.push_back(prepareCrowdBatch(
-                *crowd, selected_provider_id_, batch_ordinal++, sample_offset,
-                training_input_.getParameterChunkSize()));
-            sample_offset += static_cast<std::size_t>(crowd->size());
-          }
-        storage_diagnostics = preparedStorageDiagnostics(batches);
-      }
-      catch (...)
-      {
-        preparation_failure = std::current_exception();
-      }
-
-      int preparation_failed = preparation_failure ? 1 : 0;
-      myComm->allreduce(preparation_failed);
-      if (preparation_failed != 0)
-      {
-        if (preparation_failure)
-          std::rethrow_exception(preparation_failure);
-        throw UniformCommunicateError(
-            "WFTrainBatched: another rank failed while preparing a live training batch");
-      }
-
-      const auto optimizer_kind = training_input_.getOptimizer();
-      if (optimizer_kind == WFTrainDriverInput::Optimizer::ADAM ||
-          optimizer_kind == WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
-      {
-        int empty_rank = batches.empty() ? 1 : 0;
-        myComm->allreduce(empty_rank);
-        if (empty_rank != 0)
-          throw UniformCommunicateError(
-              "WFTrainBatched: Adam and parameter-space SR require at least one walker on every rank");
-      }
-      if (optimizer_kind == WFTrainDriverInput::Optimizer::ADAM)
-      {
-        std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
-        std::exception_ptr producer_failure;
+        const auto optimizer_kind = training_input_.getOptimizer();
+        const bool capture_ecp_jvp_replay =
+            optimizer_kind ==
+                WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION ||
+            optimizer_kind ==
+                WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION;
+        const bool has_nonlocal_ecp =
+            population_.get_golden_hamiltonian().hasPhysicalNLPP();
+        std::vector<wftrain::PreparedEnergyGradientBatch> batches;
+        std::exception_ptr preparation_failure;
         try
         {
-          producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
-              std::move(batches));
+          batches.reserve(crowds_.size());
+          std::size_t sample_offset = 0;
+          std::size_t batch_ordinal = 0;
+          for (auto& crowd : crowds_)
+            if (crowd->size() != 0)
+            {
+              batches.push_back(prepareCrowdBatch(
+                  *crowd, selected_provider_id_, batch_ordinal++, sample_offset,
+                  training_input_.getParameterChunkSize(), has_nonlocal_ecp,
+                  capture_ecp_jvp_replay));
+              sample_offset += static_cast<std::size_t>(crowd->size());
+            }
+          storage_diagnostics = preparedStorageDiagnostics(batches);
         }
         catch (...)
         {
-          producer_failure = std::current_exception();
+          preparation_failure = std::current_exception();
         }
-        int producer_failed = producer_failure ? 1 : 0;
-        myComm->allreduce(producer_failed);
-        if (producer_failed != 0)
+
+        int preparation_failed = preparation_failure ? 1 : 0;
+        myComm->allreduce(preparation_failed);
+        if (preparation_failed != 0)
         {
-          if (producer_failure)
-            std::rethrow_exception(producer_failure);
+          if (preparation_failure)
+            std::rethrow_exception(preparation_failure);
           throw UniformCommunicateError(
-              "WFTrainBatched: another rank failed while preparing the Adam objective");
-        }
-        storage_diagnostics = producer->storageDiagnostics();
-        retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-            adam_optimizer->retainedBytes();
-        enforceMemoryBudget(*myComm, retained_numeric_bytes,
-                            training_input_.getMaximumRetainedBytes());
-        iteration_result = trainer.runIteration(*selected_provider_, *producer,
-                                                *adam_optimizer, training_state,
-                                                &cache_observer);
-      }
-      else if (optimizer_kind ==
-               WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
-      {
-        std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
-        std::vector<wftrain::StochasticReconfigurationBatch> sr_batches;
-        std::unique_ptr<wftrain::StochasticReconfigurationOperator> covariance;
-        std::unique_ptr<wftrain::IdentityPreconditioner> preconditioner;
-        std::unique_ptr<wftrain::StochasticReconfigurationUpdateRule> update_rule;
-        std::exception_ptr sr_preparation_failure;
-        try
-        {
-          producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
-              std::move(batches));
-          sr_batches = makeSRBatches(producer->batches());
-          const auto parameters = selected_provider_->snapshotParameters();
-          covariance = std::make_unique<wftrain::StochasticReconfigurationOperator>(
-              selected_provider_->parameterSchema(), parameters.version,
-              wftrain::DerivativeArrayView<const wftrain::StochasticReconfigurationBatch>(
-                  sr_batches.data(), sr_batches.size()),
-              reduction);
-          preconditioner = std::make_unique<wftrain::IdentityPreconditioner>(
-              selected_provider_->parameterSchema(), parameters.version);
-          update_rule = std::make_unique<wftrain::StochasticReconfigurationUpdateRule>(
-              *covariance, *preconditioner, makeSRControl(training_input_));
-        }
-        catch (...)
-        {
-          sr_preparation_failure = std::current_exception();
-        }
-        int sr_preparation_failed = sr_preparation_failure ? 1 : 0;
-        myComm->allreduce(sr_preparation_failed);
-        if (sr_preparation_failed != 0)
-        {
-          if (sr_preparation_failure)
-            std::rethrow_exception(sr_preparation_failure);
-          throw UniformCommunicateError(
-              "WFTrainBatched: another rank failed while preparing parameter-space SR");
+              "WFTrainBatched: another rank failed while preparing a live training batch");
         }
 
-        storage_diagnostics = producer->storageDiagnostics();
-        retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-            covariance->storageDiagnostics().retained_numeric_bytes;
-        enforceMemoryBudget(*myComm, retained_numeric_bytes,
-                            training_input_.getMaximumRetainedBytes());
-        iteration_result = trainer.runIteration(*selected_provider_, *producer,
-                                                *update_rule, training_state,
-                                                &cache_observer);
-        if (const auto& diagnostics = update_rule->lastDiagnostics())
+        if (optimizer_kind == WFTrainDriverInput::Optimizer::ADAM ||
+            optimizer_kind == WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
         {
-          krylov_iterations            = diagnostics->solve.iterations;
-          krylov_operator_applications = diagnostics->solve.operator_applications;
-          applied_scale                = diagnostics->applied_scale;
+          int empty_rank = batches.empty() ? 1 : 0;
+          myComm->allreduce(empty_rank);
+          if (empty_rank != 0)
+            throw UniformCommunicateError(
+                "WFTrainBatched: Adam and parameter-space SR require at least one walker on every rank");
         }
-      }
-      else
-      {
-        const auto& schema = selected_provider_->parameterSchema();
-        std::optional<wftrain::StructuredParameterSnapshot> parameters;
-        std::exception_ptr factor_preflight_failure;
-        try
+        if (optimizer_kind == WFTrainDriverInput::Optimizer::ADAM)
         {
-          parameters.emplace(selected_provider_->snapshotParameters());
-          if (parameters->schema_fingerprint != schema.fingerprint() ||
-              parameters->values.size() != schema.parameterCount())
-            throw std::logic_error(
-                "WFTrainBatched: structured provider returned an inconsistent snapshot");
-          if (training_state.completed_iterations != 0 &&
-              (training_state.schema_fingerprint != schema.fingerprint() ||
-               training_state.parameter_version != parameters->version))
-            throw std::logic_error(
-                "WFTrainBatched: training state does not match the parameter provider");
-          validateScoreBatches(schema, parameters->version, batches);
-        }
-        catch (...)
-        {
-          factor_preflight_failure = std::current_exception();
-        }
-        reduction.preflight(schema, parameters ? &*parameters : nullptr,
-                            wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
-                            factor_preflight_failure);
-
-        // The distributed sample-space factor deliberately accepts an empty local
-        // batch list; zero-walker ranks still execute every global reduction.
-        const auto score_batches = makeScoreBatches(batches);
-        wftrain::ScoreCovarianceFactor factor(
-            schema, parameters->version,
-            {score_batches.data(), score_batches.size()},
-            wftrain::ScoreSampleDomain::REAL, reduction);
-        std::optional<SPRINGFactorBindingGuard> spring_factor_binding;
-        if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
-        {
-          spring_optimizer->bindFactor(factor);
-          spring_factor_binding.emplace(*spring_optimizer);
-        }
-        const auto factor_storage = factor.storageDiagnostics();
-        retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
-            factor_storage.retained_numeric_bytes;
-        if (spring_optimizer)
-          retained_numeric_bytes += spring_optimizer->retainedBytes();
-        enforceMemoryBudget(*myComm, retained_numeric_bytes,
-                            training_input_.getMaximumRetainedBytes());
-        const EnergyMoments energy_moments =
-            energyMoments(*myComm, batches, factor.meanEnergy().real());
-
-        if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR)
-        {
-          wftrain::MinimumStepSRUpdateRule update_rule(
-              factor, makeMinimumStepControl(training_input_));
-          iteration_result = runScoreFactorIteration(
-              *selected_provider_, *parameters, factor, update_rule,
-              training_state, reduction, cache_observer,
-              energy_moments.weight_sum, energy_moments.variance);
-          if (const auto& diagnostics = update_rule.lastDiagnostics())
+          std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
+          std::exception_ptr producer_failure;
+          try
           {
-            krylov_iterations            = diagnostics->solve.iterations;
-            krylov_operator_applications = diagnostics->solve.operator_applications;
-            applied_scale                = diagnostics->applied_scale;
+            producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
+                std::move(batches));
           }
-        }
-        else if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
-        {
-          iteration_result = runScoreFactorIteration(
-              *selected_provider_, *parameters, factor, *spring_optimizer,
-              training_state, reduction, cache_observer,
-              energy_moments.weight_sum, energy_moments.variance);
-          if (const auto& diagnostics = spring_optimizer->lastDiagnostics())
+          catch (...)
           {
-            krylov_iterations            = diagnostics->solve.iterations;
-            krylov_operator_applications = diagnostics->solve.operator_applications;
-            applied_scale                = diagnostics->applied_scale;
+            producer_failure = std::current_exception();
           }
+          int producer_failed = producer_failure ? 1 : 0;
+          myComm->allreduce(producer_failed);
+          if (producer_failed != 0)
+          {
+            if (producer_failure)
+              std::rethrow_exception(producer_failure);
+            throw UniformCommunicateError(
+                "WFTrainBatched: another rank failed while preparing the Adam objective");
+          }
+          storage_diagnostics = producer->storageDiagnostics();
+          retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
+              adam_optimizer->retainedBytes();
+          enforceMemoryBudget(*myComm, retained_numeric_bytes,
+                              training_input_.getMaximumRetainedBytes());
+          iteration_result = trainer.runIteration(*selected_provider_, *producer,
+                                                  *adam_optimizer, training_state,
+                                                  &cache_observer);
         }
         else if (optimizer_kind ==
-                     WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION ||
-                 optimizer_kind ==
-                     WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION)
+                 WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
         {
-          const std::uint32_t kinetic_mask =
-              wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
-          wftrain::ProjectedInverseIterationFactor pii_factor(factor, kinetic_mask);
-          const wftrain::PIIUpdateControl control =
-              wftrain::makePIIUpdateControl(training_input_);
-
-          if (optimizer_kind ==
-              WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION)
+          std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
+          std::vector<wftrain::StochasticReconfigurationBatch> sr_batches;
+          std::unique_ptr<wftrain::StochasticReconfigurationOperator> covariance;
+          std::unique_ptr<wftrain::IdentityPreconditioner> preconditioner;
+          std::unique_ptr<wftrain::StochasticReconfigurationUpdateRule> update_rule;
+          std::exception_ptr sr_preparation_failure;
+          try
           {
-            wftrain::ProjectedInverseIterationUpdateRule update_rule(
-                pii_factor, control);
-            iteration_result = runScoreFactorIteration(
-                *selected_provider_, *parameters, factor, update_rule,
-                training_state, reduction, cache_observer,
-                energy_moments.weight_sum, energy_moments.variance);
-            if (const auto& diagnostics = update_rule.lastDiagnostics())
-            {
-              krylov_iterations            = diagnostics->iterations;
-              krylov_operator_applications = diagnostics->operator_applications;
-              applied_scale                = diagnostics->applied_scale;
-            }
+            producer = std::make_unique<wftrain::PreparedEnergyGradientProducer>(
+                std::move(batches));
+            sr_batches = makeSRBatches(producer->batches());
+            const auto parameters = selected_provider_->snapshotParameters();
+            covariance = std::make_unique<wftrain::StochasticReconfigurationOperator>(
+                selected_provider_->parameterSchema(), parameters.version,
+                wftrain::DerivativeArrayView<const wftrain::StochasticReconfigurationBatch>(
+                    sr_batches.data(), sr_batches.size()),
+                reduction);
+            preconditioner = std::make_unique<wftrain::IdentityPreconditioner>(
+                selected_provider_->parameterSchema(), parameters.version);
+            update_rule = std::make_unique<wftrain::StochasticReconfigurationUpdateRule>(
+                *covariance, *preconditioner, makeSRControl(training_input_));
           }
-          else
+          catch (...)
           {
-            wftrain::MinimumProjectedInverseIterationUpdateRule update_rule(
-                pii_factor, control);
-            iteration_result = runScoreFactorIteration(
-                *selected_provider_, *parameters, factor, update_rule,
-                training_state, reduction, cache_observer,
-                energy_moments.weight_sum, energy_moments.variance);
-            if (const auto& diagnostics = update_rule.lastDiagnostics())
-            {
-              krylov_iterations            = diagnostics->iterations;
-              krylov_operator_applications = diagnostics->operator_applications;
-              applied_scale                = diagnostics->applied_scale;
-            }
+            sr_preparation_failure = std::current_exception();
+          }
+          int sr_preparation_failed = sr_preparation_failure ? 1 : 0;
+          myComm->allreduce(sr_preparation_failed);
+          if (sr_preparation_failed != 0)
+          {
+            if (sr_preparation_failure)
+              std::rethrow_exception(sr_preparation_failure);
+            throw UniformCommunicateError(
+                "WFTrainBatched: another rank failed while preparing parameter-space SR");
+          }
+
+          storage_diagnostics = producer->storageDiagnostics();
+          retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
+              covariance->storageDiagnostics().retained_numeric_bytes;
+          enforceMemoryBudget(*myComm, retained_numeric_bytes,
+                              training_input_.getMaximumRetainedBytes());
+          iteration_result = trainer.runIteration(*selected_provider_, *producer,
+                                                  *update_rule, training_state,
+                                                  &cache_observer);
+          if (const auto& diagnostics = update_rule->lastDiagnostics())
+          {
+            krylov_iterations            = diagnostics->solve.iterations;
+            krylov_operator_applications = diagnostics->solve.operator_applications;
+            applied_scale                = diagnostics->applied_scale;
           }
         }
         else
-          throw std::logic_error(
-              "WFTrainBatched: unsupported optimizer reached score-factor execution");
-      }
+        {
+          const auto& schema = selected_provider_->parameterSchema();
+          std::optional<wftrain::StructuredParameterSnapshot> parameters;
+          std::exception_ptr factor_preflight_failure;
+          try
+          {
+            parameters.emplace(selected_provider_->snapshotParameters());
+            if (parameters->schema_fingerprint != schema.fingerprint() ||
+                parameters->values.size() != schema.parameterCount())
+              throw std::logic_error(
+                  "WFTrainBatched: structured provider returned an inconsistent snapshot");
+            if (training_state.completed_iterations != 0 &&
+                (training_state.schema_fingerprint != schema.fingerprint() ||
+                 training_state.parameter_version != parameters->version))
+              throw std::logic_error(
+                  "WFTrainBatched: training state does not match the parameter provider");
+            validateScoreBatches(schema, parameters->version, batches);
+          }
+          catch (...)
+          {
+            factor_preflight_failure = std::current_exception();
+          }
+          reduction.preflight(schema, parameters ? &*parameters : nullptr,
+                              wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+                              factor_preflight_failure);
+
+          // The distributed sample-space factor deliberately accepts an empty local
+          // batch list; zero-walker ranks still execute every global reduction.
+          const auto score_batches = makeScoreBatches(batches);
+          wftrain::ScoreCovarianceFactor factor(
+              schema, parameters->version,
+              {score_batches.data(), score_batches.size()},
+              wftrain::ScoreSampleDomain::REAL, reduction);
+          std::optional<SPRINGFactorBindingGuard> spring_factor_binding;
+          if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
+          {
+            spring_optimizer->bindFactor(factor);
+            spring_factor_binding.emplace(*spring_optimizer);
+          }
+          const auto factor_storage = factor.storageDiagnostics();
+          retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
+              factor_storage.retained_numeric_bytes;
+          if (spring_optimizer)
+            retained_numeric_bytes += spring_optimizer->retainedBytes();
+          enforceMemoryBudget(*myComm, retained_numeric_bytes,
+                              training_input_.getMaximumRetainedBytes());
+          const EnergyMoments energy_moments =
+              energyMoments(*myComm, batches, factor.meanEnergy().real());
+
+          if (optimizer_kind == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR)
+          {
+            wftrain::MinimumStepSRUpdateRule update_rule(
+                factor, makeMinimumStepControl(training_input_));
+            iteration_result = runScoreFactorIteration(
+                *selected_provider_, *parameters, factor, update_rule,
+                training_state, reduction, cache_observer,
+                energy_moments.weight_sum, energy_moments.variance);
+            if (const auto& diagnostics = update_rule.lastDiagnostics())
+            {
+              krylov_iterations            = diagnostics->solve.iterations;
+              krylov_operator_applications = diagnostics->solve.operator_applications;
+              applied_scale                = diagnostics->applied_scale;
+            }
+          }
+          else if (optimizer_kind == WFTrainDriverInput::Optimizer::SPRING)
+          {
+            iteration_result = runScoreFactorIteration(
+                *selected_provider_, *parameters, factor, *spring_optimizer,
+                training_state, reduction, cache_observer,
+                energy_moments.weight_sum, energy_moments.variance);
+            if (const auto& diagnostics = spring_optimizer->lastDiagnostics())
+            {
+              krylov_iterations            = diagnostics->solve.iterations;
+              krylov_operator_applications = diagnostics->solve.operator_applications;
+              applied_scale                = diagnostics->applied_scale;
+            }
+          }
+          else if (optimizer_kind ==
+                       WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION ||
+                   optimizer_kind ==
+                       WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION)
+          {
+            wftrain::ProjectedInverseIterationFactor pii_factor(
+                factor, completeLocalEnergyTermMask(batches, has_nonlocal_ecp));
+            const wftrain::PIIUpdateControl control =
+                wftrain::makePIIUpdateControl(training_input_);
+            retained_numeric_bytes = checkedMemoryAdd(
+                retained_numeric_bytes, pii_factor.retainedBytes());
+            retained_numeric_bytes = checkedMemoryAdd(
+                retained_numeric_bytes,
+                piiWorkspaceBytes(optimizer_kind, factor,
+                                  control.gmres.restart_length));
+            enforceMemoryBudget(*myComm, retained_numeric_bytes,
+                                training_input_.getMaximumRetainedBytes());
+
+            if (optimizer_kind ==
+                WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION)
+            {
+              wftrain::ProjectedInverseIterationUpdateRule update_rule(
+                  pii_factor, control);
+              iteration_result = runScoreFactorIteration(
+                  *selected_provider_, *parameters, factor, update_rule,
+                  training_state, reduction, cache_observer,
+                  energy_moments.weight_sum, energy_moments.variance);
+              if (const auto& diagnostics = update_rule.lastDiagnostics())
+              {
+                krylov_iterations            = diagnostics->iterations;
+                krylov_operator_applications = diagnostics->operator_applications;
+                applied_scale                = diagnostics->applied_scale;
+              }
+            }
+            else
+            {
+              wftrain::MinimumProjectedInverseIterationUpdateRule update_rule(
+                  pii_factor, control);
+              iteration_result = runScoreFactorIteration(
+                  *selected_provider_, *parameters, factor, update_rule,
+                  training_state, reduction, cache_observer,
+                  energy_moments.weight_sum, energy_moments.variance);
+              if (const auto& diagnostics = update_rule.lastDiagnostics())
+              {
+                krylov_iterations            = diagnostics->iterations;
+                krylov_operator_applications = diagnostics->operator_applications;
+                applied_scale                = diagnostics->applied_scale;
+              }
+            }
+          }
+          else
+            throw std::logic_error(
+                "WFTrainBatched: unsupported optimizer reached score-factor execution");
+        }
       }
     }
 
@@ -1263,24 +1434,44 @@ void WFTrainBatched::initializeDeterminantOverlap()
 void WFTrainBatched::validateHamiltonianForTraining()
 {
   QMCHamiltonian& hamiltonian = population_.get_golden_hamiltonian();
-  if (hamiltonian.hasPhysicalNLPP())
-    throw UniformCommunicateError(
-        "WFTrainBatched: nonlocal pseudopotentials are not supported by the initial all-electron route");
   if (hamiltonian.has_L2())
     throw UniformCommunicateError(
-        "WFTrainBatched: L2 Hamiltonian terms are not supported by the initial all-electron route");
+        "WFTrainBatched: L2 Hamiltonian terms are not supported by energy training");
 
+  std::size_t kinetic_count = 0;
+  std::size_t nonlocal_ecp_count = 0;
   for (int component = 0; component < hamiltonian.size(); ++component)
-    if (hamiltonian.getComponent(component)->getClassName().find("ECP") != std::string::npos)
+  {
+    OperatorBase* operator_component = hamiltonian.getComponent(component);
+    if (operator_component->getClassName() == "BareKineticEnergy")
+    {
+      ++kinetic_count;
+      continue;
+    }
+    if (auto* nonlocal_ecp =
+            dynamic_cast<NonLocalECPotential*>(operator_component))
+    {
+      ++nonlocal_ecp_count;
+      if (nonlocal_ecp->usesDLA() || !nonlocal_ecp->usesVirtualParticles())
+        throw UniformCommunicateError(
+            "WFTrainBatched: ECP training requires ordinary locality with "
+            "virtual-particle batching");
+      continue;
+    }
+    if (operator_component->isNonLocal())
       throw UniformCommunicateError(
-          "WFTrainBatched: ECP Hamiltonian terms are not supported by the initial all-electron route");
+          "WFTrainBatched: energy training encountered an unsupported nonlocal Hamiltonian term");
+    if (operator_component->dependsOnWaveFunction())
+      throw UniformCommunicateError(
+          "WFTrainBatched: energy training encountered an unsupported "
+          "wavefunction-dependent Hamiltonian term");
+  }
 
-  const RefVector<OperatorBase> dependent_components = hamiltonian.getTWFDependentComponents();
-  if (dependent_components.size() != 1 ||
-      dependent_components.front().get().getClassName() != "BareKineticEnergy")
+  if (kinetic_count != 1 || nonlocal_ecp_count > 1 ||
+      hamiltonian.hasPhysicalNLPP() != (nonlocal_ecp_count == 1))
     throw UniformCommunicateError(
-        "WFTrainBatched: the initial route requires BareKineticEnergy as its sole "
-        "wavefunction-dependent Hamiltonian term");
+        "WFTrainBatched: energy training requires one kinetic operator and "
+        "at most one consistently registered nonlocal ECP operator");
 }
 
 void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)

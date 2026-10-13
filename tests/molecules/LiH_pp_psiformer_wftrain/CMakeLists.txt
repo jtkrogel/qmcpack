@@ -1,0 +1,34 @@
+# These fixtures initialize both walkers and PsiFormer parameters internally.
+# Only the small repository BFD pseudopotential tables are linked into each test
+# directory; no orbital or trained-parameter state is required.
+if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  foreach(INPUT_NAME IN ITEMS wftrain_adam.xml wftrain_pii.xml)
+    if(INPUT_NAME STREQUAL "wftrain_adam.xml")
+      set(TEST_NAME short-LiH-pp-psiformer-wftrain-adam-r1-t1)
+      set(EXPECTED_PATTERN
+          "WFTrain iteration 1 version 1 samples 1 mean_energy.*optimizer adam")
+    else()
+      set(TEST_NAME short-LiH-pp-psiformer-wftrain-pii-r1-t1)
+      set(EXPECTED_PATTERN
+          "WFTrain iteration 1 version 1 samples 1 mean_energy.*optimizer pii")
+    endif()
+
+    set(TEST_ADDED FALSE)
+    run_qmc_app(
+      ${TEST_NAME}
+      "${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp_psiformer_wftrain"
+      1
+      1
+      TEST_ADDED
+      ${INPUT_NAME})
+    if(TEST_ADDED)
+      foreach(PP_FILE IN ITEMS Li.BFD.xml H.BFD.xml)
+        maybe_symlink(
+          "${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp/${PP_FILE}"
+          "${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME}/${PP_FILE}")
+      endforeach()
+      set_property(TEST ${TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
+                                             "${EXPECTED_PATTERN}")
+    endif()
+  endforeach()
+endif()

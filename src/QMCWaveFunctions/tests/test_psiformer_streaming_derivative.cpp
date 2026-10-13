@@ -700,6 +700,8 @@ TEST_CASE("Wavefunction components reject unsupported streaming derivative facto
   particle_list.push_back(particles);
   CHECK_THROWS(component.makeStreamingDerivativeOperator(
       components, particle_list, 0, 0, 8));
+  CHECK_THROWS(component.makeNonLocalECPDerivativeConsumer(
+      components, particle_list, 8));
   CHECK_THROWS(component.makeDeterminantChannelBatch(components, particle_list));
 
   BatchExecutionRequirements requirements;
@@ -756,6 +758,19 @@ TEST_CASE("TrialWaveFunction constructs a provider-selected streaming owner",
           wavefunctions, particles, {}, 10, 25, 113);
   CHECK(sole->parameterSchema().providerId() == provider_id);
 
+  std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> ecp_consumer =
+      TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
+          wavefunctions, particles, provider_id, 113);
+  const auto ecp_storage = ecp_consumer->storageDiagnostics();
+  CHECK(ecp_storage.sample_count == 2);
+  CHECK(ecp_storage.parameter_count ==
+        provider.front().get().parameterSchema().parameterCount());
+
+  std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> sole_ecp_consumer =
+      TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
+          wavefunctions, particles, {}, 113, true);
+  CHECK(sole_ecp_consumer->storageDiagnostics().sample_count == 2);
+
   std::unique_ptr<psiformer::DeterminantChannelBatch> channel_batch =
       TrialWaveFunction::makeStructuredDeterminantChannelBatch(
           wavefunctions, particles, provider_id);
@@ -804,11 +819,33 @@ TEST_CASE("TrialWaveFunction constructs a provider-selected streaming owner",
 
   CHECK_THROWS(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
       wavefunctions, particles, "missing_provider", 9, 23, 113));
+  CHECK_THROWS(TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
+      wavefunctions, particles, "missing_provider", 113));
 
   RefVectorWithLeader<ParticleSet> one_particle(electrons0);
   one_particle.push_back(electrons0);
   CHECK_THROWS(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
       wavefunctions, one_particle, provider_id, 9, 23, 113));
+  CHECK_THROWS(TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
+      wavefunctions, one_particle, provider_id, 113));
+
+  TrialWaveFunction multiple_providers(runtime_options,
+                                       "aggregate_multiple_ecp_providers");
+  multiple_providers.addComponent(std::make_unique<PsiFormerWF>(
+      "pf_aggregate_ecp_first", files.parameters.string(),
+      files.configuration.string()));
+  multiple_providers.addComponent(std::make_unique<PsiFormerWF>(
+      "pf_aggregate_ecp_second", files.parameters.string(),
+      files.configuration.string()));
+  RefVectorWithLeader<TrialWaveFunction> multiple_wavefunctions(
+      multiple_providers);
+  multiple_wavefunctions.push_back(multiple_providers);
+  RefVectorWithLeader<ParticleSet> multiple_particles(electrons0);
+  multiple_particles.push_back(electrons0);
+  CHECK_THROWS_WITH(
+      TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
+          multiple_wavefunctions, multiple_particles, {}, 113),
+      Catch::Matchers::ContainsSubstring("requires exactly one provider"));
 
   wftrain::StructuredParameterSnapshot updated =
       provider.front().get().snapshotParameters();

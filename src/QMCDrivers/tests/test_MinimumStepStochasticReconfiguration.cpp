@@ -154,8 +154,11 @@ class DensePIIDerivativeOperator final : public StreamingDerivativeOperator
 {
 public:
   DensePIIDerivativeOperator(const StructuredParameterSchema& schema,
-                             std::size_t version)
-      : schema_(schema), version_(version), plan_(schema_, version_, 2)
+                             std::size_t version,
+                             std::uint32_t local_energy_term_mask =
+                                 localEnergyTermBit(LocalEnergyTerm::KINETIC))
+      : schema_(schema), version_(version), plan_(schema_, version_, 2),
+        local_energy_term_mask_(local_energy_term_mask)
   {
     std::mt19937_64 generator(0x5eed1234ULL);
     std::uniform_real_distribution<DerivativeReal> distribution(-1.25, 1.25);
@@ -178,7 +181,7 @@ public:
     result.result_scalar_domain = ParameterScalarDomain::COMPLEX128;
     result.reduction_domain = ReductionDomain::CROWD_LOCAL;
     result.execution_domain = DerivativeExecutionDomain::HOST;
-    result.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+    result.local_energy_term_mask = local_energy_term_mask_;
     result.maximum_vjp_channels = 1;
     result.maximum_parameter_chunk_size = 2;
     result.maximum_sample_tile_size = sample_count;
@@ -222,7 +225,7 @@ protected:
                               std::uint32_t term_mask,
                               SampleProductSink& sink) const override
   {
-    if (term_mask != localEnergyTermBit(LocalEnergyTerm::KINETIC))
+    if (term_mask != local_energy_term_mask_)
       throw std::logic_error("Dense PII oracle received an unexpected term mask");
     emitProduct(local_energy_jacobian_, direction, sink);
   }
@@ -246,6 +249,7 @@ private:
   const StructuredParameterSchema& schema_;
   std::size_t version_;
   ParameterChunkPlan plan_;
+  std::uint32_t local_energy_term_mask_ = 0;
   std::array<std::array<DerivativeReal, 3>, sample_count> score_{};
   std::array<std::array<DerivativeReal, 3>, sample_count> local_energy_jacobian_{};
 };
@@ -623,6 +627,19 @@ TEST_CASE("PII and MinPII match dense nonsymmetric operators and solves",
   CHECK_THROWS_AS(ProjectedInverseIterationFactor(
                       score_factor, localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)),
                   std::invalid_argument);
+
+  const std::uint32_t kinetic_and_ecp =
+      kinetic | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  DensePIIDerivativeOperator ecp_derivative_operator(
+      schema, version, kinetic_and_ecp);
+  const ScoreCovarianceBatch ecp_batch{
+      &ecp_derivative_operator, {weights.data(), weights.size()},
+      {energies.data(), energies.size()}};
+  ScoreCovarianceFactor ecp_score_factor(
+      schema, version, DerivativeArrayView<const ScoreCovarianceBatch>{&ecp_batch, 1});
+  ProjectedInverseIterationFactor ecp_factor(ecp_score_factor, kinetic_and_ecp);
+  CHECK(ecp_factor.localEnergyTermMask() == kinetic_and_ecp);
+  CHECK(ecp_factor.retainedBytes() > 0);
 }
 
 TEST_CASE("PII update rules publish transactionally with shifts retries and trust bounds",

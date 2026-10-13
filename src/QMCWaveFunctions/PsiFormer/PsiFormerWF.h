@@ -382,7 +382,7 @@ public:
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       std::size_t maximum_parameter_chunk_size,
-      bool capture_jvp_replay = false) const;
+      bool capture_jvp_replay = false) const override;
 
   /// Atomically publish one complete, version-matched native vector.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,

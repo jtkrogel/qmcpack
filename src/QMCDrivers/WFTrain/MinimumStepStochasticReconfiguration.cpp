@@ -715,9 +715,12 @@ ProjectedInverseIterationFactor::ProjectedInverseIterationFactor(
       local_energy_products_(score_factor.localSampleVectorSize())
 {
   const std::uint32_t kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
-  if (local_energy_term_mask_ != kinetic)
+  const std::uint32_t kinetic_and_ecp =
+      kinetic | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  if (local_energy_term_mask_ != kinetic &&
+      local_energy_term_mask_ != kinetic_and_ecp)
     throw std::invalid_argument(
-        "PII currently requires kinetic-only all-electron local-energy derivatives");
+        "PII requires kinetic or kinetic-plus-nonlocal-ECP local-energy derivatives");
   if (score_factor_.sampleDomain() != ScoreSampleDomain::REAL)
     throw std::invalid_argument("PII currently requires a real sample-space factor");
 
@@ -733,8 +736,14 @@ ProjectedInverseIterationFactor::ProjectedInverseIterationFactor(
         capabilities.maximum_parameter_chunk_size == 0 ||
         capabilities.maximum_sample_tile_size == 0)
       throw std::invalid_argument(
-          "PII derivative batch lacks bounded kinetic local-energy products");
+          "PII derivative batch lacks the requested bounded local-energy products");
   }
+}
+
+std::size_t ProjectedInverseIterationFactor::retainedBytes() const noexcept
+{
+  return (projected_direction_.capacity() + score_products_.capacity() +
+          local_energy_products_.capacity()) * sizeof(DerivativeValue);
 }
 
 void ProjectedInverseIterationFactor::applyShifted(
