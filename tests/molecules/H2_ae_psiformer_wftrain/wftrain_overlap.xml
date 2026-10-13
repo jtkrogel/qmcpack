@@ -52,7 +52,7 @@
               teacher="teacher" target_provenance="internal-teacher-seed-31"
               overlap_target="general" overlap_weighting="equal"
               learning_rate="1e-10" parameter_chunk_size="4096"/>
-    <parameter name="walkers_per_rank">1</parameter>
+    <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
     <parameter name="steps">1</parameter>

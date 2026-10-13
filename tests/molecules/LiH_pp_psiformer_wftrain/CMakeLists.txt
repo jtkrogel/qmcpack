@@ -10,7 +10,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     else()
       set(TEST_NAME short-LiH-pp-psiformer-wftrain-pii-r1-t1)
       set(EXPECTED_PATTERN
-          "WFTrain iteration 1 version 1 samples 1 mean_energy.*optimizer pii")
+          "WFTrain iteration 1 version 2 samples 2 mean_energy.*optimizer minpii.*krylov_operator_applications [1-9]")
     endif()
 
     set(TEST_ADDED FALSE)

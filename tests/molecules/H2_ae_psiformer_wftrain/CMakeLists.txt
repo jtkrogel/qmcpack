@@ -33,7 +33,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${OVERLAP_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 1 samples 1 overlap_loss")
+               "WFTrain iteration 1 version 1 samples 2 overlap_loss")
   endif()
 
   set(PII_TEST_NAME short-H2-ae-psiformer-wftrain-pii-r1-t1)
@@ -49,7 +49,39 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${PII_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 2 samples 1 mean_energy.*optimizer minpii")
+               "WFTrain iteration 1 version 2 samples 2 mean_energy.*optimizer minpii.*krylov_operator_applications [1-9]")
+  endif()
+
+  set(OPTIMIZERS_TEST_NAME short-H2-ae-psiformer-wftrain-optimizers-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(
+    ${OPTIMIZERS_TEST_NAME}
+    "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+    1
+    1
+    TEST_ADDED
+    wftrain_optimizers.xml)
+  if(TEST_ADDED)
+    set_property(
+      TEST ${OPTIMIZERS_TEST_NAME}
+      PROPERTY PASS_REGULAR_EXPRESSION
+               "WFTrain iteration 1 version 3 samples 2 mean_energy.*optimizer spring.*krylov_operator_applications [1-9]")
+  endif()
+
+  set(LIH_AE_TEST_NAME short-LiH-ae-psiformer-wftrain-adam-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(
+    ${LIH_AE_TEST_NAME}
+    "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+    1
+    1
+    TEST_ADDED
+    wftrain_lih_ae_adam.xml)
+  if(TEST_ADDED)
+    set_property(
+      TEST ${LIH_AE_TEST_NAME}
+      PROPERTY PASS_REGULAR_EXPRESSION
+               "WFTrain iteration 1 version 1 samples 1 mean_energy [-+]?[0-9]")
   endif()
 
   # Exercise the production manifest/root/shard route in two processes launched
