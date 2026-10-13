@@ -36,10 +36,16 @@
     <constant name="IonIon" type="coulomb" source="ion0" target="ion0"/>
   </hamiltonian>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="lm" learning_rate="1e-10"
-              lm_overlap_shift="0.01" maximum_update_norm="0.01"
-              line_search="off" krylov_relative_tolerance="0.1"
-              krylov_maximum_iterations="30" krylov_maximum_operator_applications="100"/>
+    <training objective="energy" optimizer="lm">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+      <parameter name="lm_overlap_shift">0.01</parameter>
+      <parameter name="maximum_update_norm">0.01</parameter>
+      <parameter name="line_search">off</parameter>
+      <parameter name="krylov_relative_tolerance">0.1</parameter>
+      <parameter name="krylov_maximum_iterations">30</parameter>
+      <parameter name="krylov_maximum_operator_applications">100</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>

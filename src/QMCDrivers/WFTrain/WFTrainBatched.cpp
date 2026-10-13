@@ -56,6 +56,65 @@ namespace qmcplusplus
 namespace
 {
 
+/** Retain one crowd snapshot without retaining a samples-by-parameters matrix.
+ *
+ * Particle copies preserve positions, masses and total log gradients. Frozen
+ * teacher clones are needed only for overlap objectives; neural parameters remain
+ * shared and read-only until the iteration's update transaction.
+ */
+struct RetainedCrowdSamples
+{
+  std::size_t crowd_index = 0;
+  std::vector<std::unique_ptr<ParticleSet>> particles;
+  std::vector<std::unique_ptr<TrialWaveFunction>> teachers;
+  std::vector<double> local_energies;
+};
+
+/** Copy an observed population before later MC moves overwrite its positions. */
+RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool overlap)
+{
+  RetainedCrowdSamples result;
+  result.crowd_index = index;
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& wavefunctions = crowd.get_walker_twfs();
+  const auto& walkers = crowd.get_walkers();
+  for (std::size_t sample = 0; sample < crowd.size(); ++sample)
+  {
+    result.particles.push_back(std::make_unique<ParticleSet>(electrons[sample]));
+    result.particles.back()->update();
+    result.local_energies.push_back(walkers[sample].get().Properties(WalkerProperties::LOCALENERGY));
+    if (overlap)
+      result.teachers.push_back(wavefunctions[sample].get().makeClone(*result.particles.back()));
+  }
+  return result;
+}
+
+/** Replay a retained snapshot on resident clones and reconstruct coherent VGL.
+ * Iterating snapshots in collection order leaves the live chains at their final
+ * positions. No MC proposals or parameter publications occur during replay.
+ */
+void replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples)
+{
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& wavefunctions = crowd.get_walker_twfs();
+  const auto& walkers = crowd.get_walkers();
+  RefVectorWithLeader<ParticleSet> particle_batch(electrons[0], electrons);
+  RefVectorWithLeader<TrialWaveFunction> wavefunction_batch(wavefunctions[0], wavefunctions);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(crowd.getSharedResource().pset_res, particle_batch);
+  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, wavefunction_batch);
+  for (std::size_t sample = 0; sample < crowd.size(); ++sample)
+    electrons[sample].get().R = samples.particles[sample]->R;
+  ParticleSet::mw_update(particle_batch);
+  TrialWaveFunction::mw_evaluateLog(wavefunction_batch, particle_batch);
+  for (std::size_t sample = 0; sample < crowd.size(); ++sample)
+  {
+    electrons[sample].get().saveWalker(walkers[sample]);
+    walkers[sample].get().resetProperty(wavefunctions[sample].get().getLogPsi(),
+                                       wavefunctions[sample].get().getPhase(),
+                                       samples.local_energies[sample]);
+  }
+}
+
 /** Record publication without performing fallible work in the transaction callback. */
 class DirtyCacheObserver final : public wftrain::ParameterUpdateObserver
 {
@@ -749,6 +808,9 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, qmc.get_recalculate_properties_period());
   extendStageFingerprint(hash, qmc.get_blocks_between_recompute());
   extendStageFingerprint(hash, steps_per_block);
+  extendStageFingerprint(hash, qmc.get_max_blocks());
+  extendStageFingerprint(hash, training.getWarmupSteps());
+  // Iteration limit may be extended on restart; the sampling schedule may not.
   extendStageFingerprint(hash, vmc.get_use_drift());
   const auto move_kind = static_cast<std::underlying_type_t<VMCDriverInput::MoveKind>>(
       vmc.get_move_kind());
@@ -839,6 +901,13 @@ void WFTrainBatched::process(xmlNodePtr node)
         *myComm, walker_configs_ref_.getActiveWalkers(), qmcdriver_input_.get_total_walkers(),
         qmcdriver_input_.get_walkers_per_rank(), 1.0,
         determineNumCrowds(qmcdriver_input_.get_num_crowds(), rngs_.size()));
+    if (qmcdriver_input_.get_requested_samples() != 0)
+      throw UniformCommunicateError(
+          "WFTrainBatched: samples is unsupported; use walkers, blocks and steps per iteration");
+    if (training_input_.getIterations() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        training_input_.getIterations() > static_cast<std::size_t>(std::numeric_limits<int>::max()) /
+        static_cast<std::size_t>(std::max(1, qmcdriver_input_.get_max_blocks())))
+      throw UniformCommunicateError("WFTrainBatched: iterations times blocks exceeds the driver block range");
     steps_per_block_ = determineStepsPerBlock(walker_counts.global_walkers, qmcdriver_input_.get_requested_samples(),
                                               qmcdriver_input_.get_requested_steps(),
                                               qmcdriver_input_.get_max_blocks());
@@ -861,6 +930,7 @@ void WFTrainBatched::run()
     throw UniformCommunicateError("WFTrainBatched: process() must select a provider before run()");
 
   const IndexType num_blocks = qmcdriver_input_.get_max_blocks();
+  const int num_iterations = static_cast<int>(training_input_.getIterations());
   estimator_manager_->startDriverRun();
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
@@ -949,9 +1019,9 @@ void WFTrainBatched::run()
         training_input_.getRestartPath(), *myComm, *selected_provider_, training_state,
         stage_state, optimizer_checkpoint, sampler_checkpoint, sampler_checkpoint.topology());
     if (stage_state.completed_stage_iterations != training_state.completed_iterations ||
-        stage_state.completed_stage_iterations > static_cast<std::size_t>(num_blocks))
+        stage_state.completed_stage_iterations > static_cast<std::size_t>(num_iterations))
       throw UniformCommunicateError(
-          "WFTrainBatched: restored training progress is inconsistent with requested blocks");
+          "WFTrainBatched: restored training progress is inconsistent with requested iterations");
     if (myComm->rank() == 0)
       app_log() << "WFTrain restored " << stage_state.completed_stage_iterations
                 << " completed update(s) from " << training_input_.getRestartPath()
@@ -978,33 +1048,86 @@ void WFTrainBatched::run()
 
   int completed_blocks = 0;
   std::size_t accepted_updates = 0;
-  for (int block = static_cast<int>(stage_state.completed_stage_iterations);
-       block < num_blocks; ++block)
+  if (myComm->rank() == 0)
+    app_log() << "WFTrain sampling schedule: iterations " << num_iterations
+              << " blocks_per_iteration " << num_blocks << " steps_per_block " << steps_per_block_
+              << " substeps " << qmcdriver_input_.get_sub_steps()
+              << " iteration_warmupsteps " << training_input_.getWarmupSteps() << std::endl;
+
+  for (int iteration = static_cast<int>(stage_state.completed_stage_iterations);
+       iteration < num_iterations; ++iteration)
   {
-    ScopeGuard<LoopTimer<>> block_timer(training_loop);
-    sampling_state.recalculate_properties_period =
-        qmc_driver_mode_[QMC_UPDATE_MODE]
-        ? qmcdriver_input_.get_recalculate_properties_period()
-        : 0;
-    sampling_state.is_recomputing_block = qmcdriver_input_.get_blocks_between_recompute()
-        ? (1 + block) % qmcdriver_input_.get_blocks_between_recompute() == 0
-        : false;
-
-    estimator_manager_->startBlock(steps_per_block_);
-    for (auto& crowd : crowds_)
-      crowd->startBlock(steps_per_block_);
-
-    for (int step = 0; step < steps_per_block_; ++step, ++global_step)
+    ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
+    // This equilibration is separate from the initial qmc warmup. Warmup moves
+    // honor substeps but contribute neither retained samples nor scalar statistics.
+    for (std::size_t warmup = 0; warmup < training_input_.getWarmupSteps(); ++warmup)
     {
       ScopedTimer step_timer(timers_.run_steps_timer);
-      sampling_state.step        = step;
-      sampling_state.global_step = global_step;
-      crowd_task(crowds_.size(), VMCBatchedSampling::runVMCStep, sampling_state,
+      crowd_task(crowds_.size(), VMCBatchedSampling::runWarmupStep, sampling_state,
                  sampling_timers, rngs_, crowds_);
+      ++global_step;
     }
 
-    // Finalize estimator statistics while they still describe the sampled version.
-    endBlock();
+    std::vector<RetainedCrowdSamples> retained_samples;
+    std::size_t retained_configuration_bytes = 0;
+    for (int block = 0; block < num_blocks; ++block)
+    {
+      const int statistical_block = iteration * num_blocks + block;
+      if (myComm->rank() == 0)
+        app_log() << "WFTrain statistical block " << statistical_block
+                  << " iteration " << iteration + 1
+                  << " version " << training_state.parameter_version << std::endl;
+      sampling_state.recalculate_properties_period = qmc_driver_mode_[QMC_UPDATE_MODE]
+          ? qmcdriver_input_.get_recalculate_properties_period() : 0;
+      sampling_state.is_recomputing_block = qmcdriver_input_.get_blocks_between_recompute()
+          ? (1 + statistical_block) % qmcdriver_input_.get_blocks_between_recompute() == 0 : false;
+      estimator_manager_->startBlock(steps_per_block_);
+      for (auto& crowd : crowds_)
+        crowd->startBlock(steps_per_block_);
+      for (int step = 0; step < steps_per_block_; ++step, ++global_step)
+      {
+        ScopedTimer step_timer(timers_.run_steps_timer);
+        sampling_state.step = step;
+        sampling_state.global_step = global_step;
+        crowd_task(crowds_.size(), VMCBatchedSampling::runVMCStep, sampling_state,
+                   sampling_timers, rngs_, crowds_);
+        // Fail collectively before endBlock reductions if any rank cannot
+        // retain a snapshot. Charge copied numerical arrays, not allocator/RSS
+        // overhead or opaque teacher-clone caches, to the numeric storage budget.
+        std::exception_ptr retention_failure;
+        try
+        {
+          for (std::size_t crowd_index = 0; crowd_index < crowds_.size(); ++crowd_index)
+            if (crowds_[crowd_index]->size())
+            {
+              retained_samples.push_back(retainCrowdSamples(
+                  *crowds_[crowd_index], crowd_index, determinant_overlap));
+              const auto& snapshot = retained_samples.back();
+              retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
+                  checkedMemoryMultiply(snapshot.local_energies.capacity(), sizeof(double)));
+              for (const auto& particles : snapshot.particles)
+                retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
+                    checkedMemoryMultiply(particles->R.size(),
+                        sizeof(particles->R[0]) + sizeof(particles->G[0]) + sizeof(particles->L[0])));
+            }
+        }
+        catch (...) { retention_failure = std::current_exception(); }
+        int retention_failed = retention_failure ? 1 : 0;
+        myComm->allreduce(retention_failed);
+        if (retention_failed)
+        {
+          if (retention_failure)
+            std::rethrow_exception(retention_failure);
+          throw UniformCommunicateError("WFTrainBatched: another rank failed to retain iteration samples");
+        }
+        enforceMemoryBudget(*myComm, retained_configuration_bytes, training_input_.getMaximumRetainedBytes());
+      }
+      // Statistical rows refer only to this iteration's fixed parameter version.
+      endBlock();
+      wlog_manager.writeBuffers();
+      recordBlock(statistical_block);
+      ++completed_blocks;
+    }
 
     wftrain::TrainingIterationResult iteration_result;
     wftrain::PreparedEnergyGradientStorageDiagnostics storage_diagnostics;
@@ -1040,18 +1163,18 @@ void WFTrainBatched::run()
               std::vector<std::vector<double>> weights;
               std::vector<std::vector<wftrain::DerivativeValue>> energies;
               std::vector<wftrain::ScoreCovarianceBatch> metric_batches;
-              for (auto& crowd : crowds_)
-                if (crowd->size())
+              for (auto& samples : retained_samples)
                 {
-                  const auto& twfs = crowd->get_walker_twfs();
-                  const auto& elecs = crowd->get_walker_elecs();
+                  const auto& twfs = crowds_[samples.crowd_index]->get_walker_twfs();
                   RefVectorWithLeader<TrialWaveFunction> wf_batch(twfs[0], twfs);
-                  RefVectorWithLeader<ParticleSet> p_batch(elecs[0], elecs);
+                  RefVectorWithLeader<ParticleSet> p_batch(*samples.particles.front());
+                  for (auto& particles : samples.particles)
+                    p_batch.push_back(*particles);
                   owners.push_back(TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
                       wf_batch, p_batch, selected_provider_id_, owners.size(), 0,
                       training_input_.getParameterChunkSize()));
-                  weights.emplace_back(crowd->size(), 1.0);
-                  energies.emplace_back(crowd->size(), 0.0);
+                  weights.emplace_back(samples.particles.size(), 1.0);
+                  energies.emplace_back(samples.particles.size(), 0.0);
                   metric_batches.push_back({owners.back().get(),
                       {weights.back().data(), weights.back().size()},
                       {energies.back().data(), energies.back().size()}});
@@ -1080,15 +1203,22 @@ void WFTrainBatched::run()
             }
             std::vector<std::reference_wrapper<ParticleSet>> configurations;
             std::vector<std::reference_wrapper<TrialWaveFunction>> teachers;
-            for (auto& crowd : crowds_)
-              for (std::size_t i = 0; i < crowd->size(); ++i)
+            std::vector<std::size_t> chain_ids;
+            std::vector<std::size_t> crowd_chain_offsets(crowds_.size(), 0);
+            for (std::size_t crowd_index = 1; crowd_index < crowds_.size(); ++crowd_index)
+              crowd_chain_offsets[crowd_index] = crowd_chain_offsets[crowd_index - 1] +
+                  crowds_[crowd_index - 1]->size();
+            for (auto& samples : retained_samples)
+              for (std::size_t i = 0; i < samples.particles.size(); ++i)
               {
-                configurations.emplace_back(crowd->get_walker_elecs()[i]);
-                teachers.emplace_back(crowd->get_walker_twfs()[i]);
+                configurations.emplace_back(*samples.particles[i]);
+                chain_ids.push_back(crowd_chain_offsets[samples.crowd_index] + i);
+                teachers.emplace_back(determinant_overlap ? *samples.teachers[i]
+                    : crowds_[samples.crowd_index]->get_walker_twfs()[i].get());
               }
             selected_alpha = wftrain::selectNativeStep(training_input_, *myComm,
                 student_prototype_, population_.get_golden_hamiltonian(), selected_provider_id_,
-                configurations, teachers, rngs_[0], qmcdriver_input_.get_tau(), old, full,
+                configurations, chain_ids, teachers, rngs_[0], qmcdriver_input_.get_tau(), old, full,
                 determinant_overlap ? determinant_overlap_objective_.get() : nullptr, maximum_alpha,
                 [&](double alpha, double loss, double difference, double error,
                     double ess, double weight, bool valid) {
@@ -1129,26 +1259,17 @@ void WFTrainBatched::run()
             throw std::logic_error(
                 "WFTrainBatched: student-clone crowd topology changed after initialization");
 
-          batch_owners.reserve(crowds_.size());
-          overlap_batches.reserve(crowds_.size());
-          for (std::size_t crowd_index = 0; crowd_index < crowds_.size(); ++crowd_index)
+          batch_owners.reserve(retained_samples.size());
+          overlap_batches.reserve(retained_samples.size());
+          for (auto& samples : retained_samples)
           {
-            Crowd& crowd = *crowds_[crowd_index];
-            auto& students = overlap_student_twfs_[crowd_index];
-            const auto& teachers = crowd.get_walker_twfs();
-            const auto& electrons = crowd.get_walker_elecs();
-            if (students.size() != teachers.size() || students.size() != electrons.size())
-              throw std::logic_error(
-                  "WFTrainBatched: student and teacher crowd topology differs");
-            if (students.empty())
-              continue;
-
+            auto& students = overlap_student_twfs_[samples.crowd_index];
             RefVectorWithLeader<TrialWaveFunction> student_batch(*students.front());
-            RefVectorWithLeader<ParticleSet> particle_batch(electrons[0]);
+            RefVectorWithLeader<ParticleSet> particle_batch(*samples.particles.front());
             for (std::size_t sample = 0; sample < students.size(); ++sample)
             {
               student_batch.push_back(*students[sample]);
-              particle_batch.push_back(electrons[sample]);
+              particle_batch.push_back(*samples.particles[sample]);
             }
             batch_owners.push_back(
                 TrialWaveFunction::makeStructuredDeterminantChannelBatch(
@@ -1160,8 +1281,8 @@ void WFTrainBatched::run()
             view.electrons.reserve(students.size());
             for (std::size_t sample = 0; sample < students.size(); ++sample)
             {
-              view.teachers.emplace_back(teachers[sample]);
-              view.electrons.emplace_back(electrons[sample]);
+              view.teachers.emplace_back(*samples.teachers[sample]);
+              view.electrons.emplace_back(*samples.particles[sample]);
             }
             overlap_batches.push_back(std::move(view));
           }
@@ -1192,7 +1313,7 @@ void WFTrainBatched::run()
               "WFTrainBatched: determinant-overlap retained-byte count overflowed");
         retained_numeric_bytes =
             objective.retained_numeric_bytes + first_order_optimizer->retainedBytes();
-        enforceMemoryBudget(*myComm, retained_numeric_bytes,
+        enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
                             training_input_.getMaximumRetainedBytes());
 
         const wftrain::ParameterGradientView gradient{
@@ -1224,18 +1345,29 @@ void WFTrainBatched::run()
         std::exception_ptr preparation_failure;
         try
         {
-          batches.reserve(crowds_.size());
+          batches.reserve(retained_samples.size());
           std::size_t sample_offset = 0;
           std::size_t batch_ordinal = 0;
-          for (auto& crowd : crowds_)
-            if (crowd->size() != 0)
+          // Prepare immutable score/kinetic owners only after collection. ECP
+          // energies and responses are paired on their accepted replay grids.
+          for (auto& samples : retained_samples)
+          {
+            Crowd& crowd = *crowds_[samples.crowd_index];
+            replayCrowdSamples(crowd, samples);
+            batches.push_back(prepareCrowdBatch(
+                crowd, selected_provider_id_, batch_ordinal++, sample_offset,
+                training_input_.getParameterChunkSize(), has_nonlocal_ecp,
+                capture_ecp_jvp_replay));
+            for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
-              batches.push_back(prepareCrowdBatch(
-                  *crowd, selected_provider_id_, batch_ordinal++, sample_offset,
-                  training_input_.getParameterChunkSize(), has_nonlocal_ecp,
-                  capture_ecp_jvp_replay));
-              sample_offset += static_cast<std::size_t>(crowd->size());
+              crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);
+              crowd.get_walkers()[sample].get().resetProperty(
+                  crowd.get_walker_twfs()[sample].get().getLogPsi(),
+                  crowd.get_walker_twfs()[sample].get().getPhase(),
+                  batches.back().local_energies[sample].real());
             }
+            sample_offset += crowd.size();
+          }
           storage_diagnostics = preparedStorageDiagnostics(batches);
         }
         catch (...)
@@ -1287,7 +1419,7 @@ void WFTrainBatched::run()
           storage_diagnostics = producer->storageDiagnostics();
           retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
               first_order_optimizer->retainedBytes();
-          enforceMemoryBudget(*myComm, retained_numeric_bytes,
+          enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
                                                   *decorate(*first_order_optimizer), training_state,
@@ -1340,7 +1472,7 @@ void WFTrainBatched::run()
               retained_numeric_bytes,
               parameterSpaceSRWorkspaceBytes(
                   selected_provider_->parameterSchema().parameterCount()));
-          enforceMemoryBudget(*myComm, retained_numeric_bytes,
+          enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
                                                   *decorate(*update_rule), training_state,
@@ -1404,7 +1536,7 @@ void WFTrainBatched::run()
             retained_numeric_bytes = checkedMemoryAdd(
                 retained_numeric_bytes,
                 minimumStepWorkspaceBytes(optimizer_kind, factor));
-          enforceMemoryBudget(*myComm, retained_numeric_bytes,
+          enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
                               training_input_.getMaximumRetainedBytes());
           const EnergyMoments energy_moments =
               energyMoments(*myComm, batches, factor.meanEnergy().real());
@@ -1434,7 +1566,7 @@ void WFTrainBatched::run()
                 checkedMemoryAdd(30, checkedMemoryMultiply(2, training_input_.getLMInnerRestartLength())));
             retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
                 checkedMemoryMultiply(checkedMemoryMultiply(vectors, initial.size()), sizeof(wftrain::DerivativeValue)));
-            enforceMemoryBudget(*myComm, retained_numeric_bytes, training_input_.getMaximumRetainedBytes());
+            enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
             wftrain::MatrixFreeLinearMethodResult result;
             if (accelerated)
             {
@@ -1485,11 +1617,11 @@ void WFTrainBatched::run()
                   wftrain::KFACBlockRegistry(schema, std::move(affine), std::move(fallback)), parameters->version);
               LiveAffineObserver observer(*statistics);
               std::vector<double> score;
-              for (const auto& crowd : crowds_)
-                for (ParticleSet& particles : crowd->get_walker_elecs())
+              for (const auto& samples : retained_samples)
+                for (const auto& particles : samples.particles)
                 {
                   statistics->beginSample(1.0);
-                  selected_provider_->observeAffineScores(particles, observer, score);
+                  selected_provider_->observeAffineScores(*particles, observer, score);
                   statistics->addFallbackScores({score.data(), score.size()});
                   statistics->endSample();
                 }
@@ -1502,7 +1634,7 @@ void WFTrainBatched::run()
                 {training_input_.getDamping(), training_input_.getKFACFallbackDamping()});
             retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
                 checkedMemoryAdd(statistics->retainedNumericBytes(), inverse.storageDiagnostics().retained_numeric_bytes));
-            enforceMemoryBudget(*myComm, retained_numeric_bytes, training_input_.getMaximumRetainedBytes());
+            enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
             LiveKFACUpdateRule update_rule(inverse, training_input_.getLearningRate());
             iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
                 *decorate(update_rule), training_state, reduction, cache_observer,
@@ -1551,7 +1683,7 @@ void WFTrainBatched::run()
                 retained_numeric_bytes,
                 piiWorkspaceBytes(optimizer_kind, factor,
                                   control.gmres.restart_length));
-            enforceMemoryBudget(*myComm, retained_numeric_bytes,
+            enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
                                 training_input_.getMaximumRetainedBytes());
 
             if (optimizer_kind ==
@@ -1646,7 +1778,7 @@ void WFTrainBatched::run()
                   << " variance " << objective.energy_variance
                   << " gradient_norm " << gradientNorm(objective.gradient);
       }
-      app_log() << " retained_bytes " << retained_numeric_bytes
+      app_log() << " retained_bytes " << checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes)
                 << " update_scale " << training_input_.getUpdateScale()
                 << " selected_alpha " << selected_alpha
                 << " effective_scale " << selected_alpha * training_input_.getUpdateScale()
@@ -1664,20 +1796,18 @@ void WFTrainBatched::run()
       app_log() << std::endl;
     }
 
-    wlog_manager.writeBuffers();
-    recordBlock(block);
-    ++completed_blocks;
-
+    // Runtime and exact checkpoints are checked only at complete update boundaries.
     bool stop_requested = false;
     if (myComm->rank() == 0)
       stop_requested = runtime_control.checkStop(training_loop);
     myComm->bcast(stop_requested);
     if (myComm->rank() == 0)
-      app_log() << runtime_control.generateProgressMessage("WFTrainBatched", block, num_blocks);
+      app_log() << runtime_control.generateProgressMessage("WFTrainBatched", iteration, num_iterations);
     const int checkpoint_period = qmcdriver_input_.get_check_point_period();
     const bool periodic_checkpoint =
-        checkpoint_period > 0 && (block + 1) % checkpoint_period == 0;
-    const bool final_block = block + 1 == num_blocks;
+        checkpoint_period > 0 &&
+        ((iteration + 1) * num_blocks / checkpoint_period > iteration * num_blocks / checkpoint_period);
+    const bool final_block = iteration + 1 == num_iterations;
     if (!training_input_.getCheckpointPath().empty() &&
         (periodic_checkpoint || final_block || stop_requested))
     {
@@ -1694,7 +1824,7 @@ void WFTrainBatched::run()
     if (stop_requested)
     {
       if (myComm->rank() == 0)
-        app_log() << runtime_control.generateStopMessage("WFTrainBatched", block);
+        app_log() << runtime_control.generateStopMessage("WFTrainBatched", iteration);
       run_time_manager.markStop();
       break;
     }

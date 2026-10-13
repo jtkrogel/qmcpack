@@ -41,7 +41,10 @@
   </hamiltonian>
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="sgd" learning_rate="1e-10"/>
+    <training objective="energy" optimizer="sgd">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -52,7 +55,10 @@
     <parameter name="usedrift">no</parameter>
   </qmc>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="momentum_sgd" learning_rate="1e-10"/>
+    <training objective="energy" optimizer="momentum_sgd">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -63,7 +69,10 @@
     <parameter name="usedrift">no</parameter>
   </qmc>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="rmsprop" learning_rate="1e-10"/>
+    <training objective="energy" optimizer="rmsprop">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -74,7 +83,10 @@
     <parameter name="usedrift">no</parameter>
   </qmc>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="adam" learning_rate="1e-10"/>
+    <training objective="energy" optimizer="adam">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -85,7 +97,10 @@
     <parameter name="usedrift">no</parameter>
   </qmc>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="amsgrad" learning_rate="1e-10"/>
+    <training objective="energy" optimizer="amsgrad">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>

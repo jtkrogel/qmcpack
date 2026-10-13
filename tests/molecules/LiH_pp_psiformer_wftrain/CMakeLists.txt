@@ -2,6 +2,18 @@
 # Only the small repository BFD pseudopotential tables are linked into each test
 # directory; no orbital or trained-parameter state is required.
 if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  set(POOLED_TEST short-LiH-pp-psiformer-wftrain-pooled-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(${POOLED_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp_psiformer_wftrain"
+              1 1 TEST_ADDED wftrain_pooled.xml)
+  if(TEST_ADDED)
+    foreach(PP_FILE IN ITEMS Li.BFD.xml H.BFD.xml)
+      maybe_symlink("${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp/${PP_FILE}"
+                    "${CMAKE_CURRENT_BINARY_DIR}/${POOLED_TEST}/${PP_FILE}")
+    endforeach()
+    set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
+                 "WFTrain iteration 1 version 1 samples 4 mean_energy.*optimizer adam")
+  endif()
   set(SEARCH_TEST short-LiH-pp-psiformer-search-reference-r1-t1)
   set(TEST_ADDED FALSE)
   run_qmc_app(${SEARCH_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp_psiformer_wftrain"

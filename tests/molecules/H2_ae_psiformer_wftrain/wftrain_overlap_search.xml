@@ -48,12 +48,22 @@
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
     <qmcsystem wavefunction="student" hamiltonian="h0" source="ion0"/>
-    <training objective="determinant_overlap" optimizer="adam"
-              teacher="teacher" target_provenance="internal-teacher-seed-31"
-              overlap_target="general" overlap_weighting="equal"
-              learning_rate="1e-4" update_scale="0.5" weight_decay="1e-6"
-              line_search="reference" line_search_confidence="0" line_search_maximum_weight="1"
-              line_search_warmup_steps="2" line_search_sampling_steps="2" parameter_chunk_size="4096"/>
+    <training objective="determinant_overlap" optimizer="adam">
+      <parameter name="iterations">1</parameter>
+      <parameter name="teacher">teacher</parameter>
+      <parameter name="target_provenance">internal-teacher-seed-31</parameter>
+      <parameter name="overlap_target">general</parameter>
+      <parameter name="overlap_weighting">equal</parameter>
+      <parameter name="learning_rate">1e-4</parameter>
+      <parameter name="update_scale">0.5</parameter>
+      <parameter name="weight_decay">1e-6</parameter>
+      <parameter name="line_search">reference</parameter>
+      <parameter name="line_search_confidence">0</parameter>
+      <parameter name="line_search_maximum_weight">1</parameter>
+      <parameter name="line_search_warmup_steps">2</parameter>
+      <parameter name="line_search_sampling_steps">2</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+    </training>
     <parameter name="walkers_per_rank">4</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -64,4 +74,3 @@
     <parameter name="usedrift">no</parameter>
   </qmc>
 </simulation>
-

@@ -157,6 +157,7 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
                         TrialWaveFunction& prototype, QMCHamiltonian& hamiltonian,
                         const std::string& provider_id,
                         const std::vector<std::reference_wrapper<ParticleSet>>& configurations,
+                        const std::vector<std::size_t>& configuration_chain_ids,
                         const std::vector<std::reference_wrapper<TrialWaveFunction>>& teachers,
                         RandomBase<double>& production_rng, double timestep,
                         const StructuredParameterSnapshot& old,
@@ -173,8 +174,17 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
   auto rng = production_rng.makeClone();
   auto quadrature_rng = production_rng.makeClone();
   bool ready = true;
+  std::size_t local_chain_count = 0;
   try
   {
+    if (configuration_chain_ids.size() != configurations.size())
+      throw std::invalid_argument("Line-search configurations and chain identities differ in size");
+    for (const auto id : configuration_chain_ids)
+    {
+      if (id >= configurations.size())
+        throw std::invalid_argument("Line-search chain identity is outside the sample extent");
+      local_chain_count = std::max(local_chain_count, id + 1);
+    }
     if (!configurations.empty())
     {
       particles = std::make_unique<ParticleSet>(configurations.front().get());
@@ -201,7 +211,7 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
   for (std::size_t i = 0; i < configurations.size(); ++i)
   {
     positions.push_back(configurations[i].get().R);
-    clusters.push_back(i);
+    clusters.push_back(configuration_chain_ids[i]);
   }
   std::vector<double> reference_log, reference_energy;
   std::map<double, Assessment> assessments;
@@ -292,16 +302,22 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
         result.difference = candidate.loss - overlap_reference->loss;
         result.ess = candidate.sample_count;
         result.maximum_weight = 0.0;
-        double variance = 0.0;
+        // Repeated snapshots from one walker are not independent observations.
+        std::vector<double> influences(local_chain_count, 0.0);
         for (std::size_t i = 0; i < candidate.sample_loss_influences.size(); ++i)
         {
           const double delta = candidate.sample_loss_influences[i] -
               overlap_reference->sample_loss_influences[i];
-          variance += delta * delta;
+          influences[configuration_chain_ids[i]] += delta;
         }
+        double variance = 0.0;
+        for (double influence : influences)
+          variance += influence * influence;
+        std::size_t global_chain_count = local_chain_count;
+        comm.allreduce(global_chain_count);
         comm.allreduce(variance);
-        result.standard_error = candidate.sample_count > 1
-            ? std::sqrt(variance * candidate.sample_count / (candidate.sample_count - 1.0))
+        result.standard_error = global_chain_count > 1
+            ? std::sqrt(variance * global_chain_count / (global_chain_count - 1.0))
             : std::numeric_limits<double>::infinity();
         result.valid = isFiniteTrainingReal(result.loss) && isFiniteTrainingReal(result.standard_error);
         for (std::size_t k = 0; k < candidate.channels.size(); ++k)
@@ -328,7 +344,7 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
       {
         for (std::size_t i = 0; i < logs.size(); ++i)
           logs[i] = 2.0 * (logs[i] - reference_log[i]);
-        result = assessEnergy(comm, logs, energies, reference_energy, clusters, configurations.size());
+        result = assessEnergy(comm, logs, energies, reference_energy, clusters, local_chain_count);
       }
     }
     std::size_t count = positions.size();
@@ -369,7 +385,7 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
         {
           sampleEndpoint(*particles, *wavefunction, *rng, timestep, 1);
           positions.push_back(particles->R);
-          clusters.push_back(i);
+          clusters.push_back(configuration_chain_ids[i]);
         }
       }
     }

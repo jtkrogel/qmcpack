@@ -35,25 +35,41 @@
   </hamiltonian>
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="sr" learning_rate="1e-10" damping="1e-2"
-              krylov_maximum_iterations="4" krylov_maximum_operator_applications="6"/>
+    <training objective="energy" optimizer="sr">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+      <parameter name="damping">1e-2</parameter>
+      <parameter name="krylov_maximum_iterations">4</parameter>
+      <parameter name="krylov_maximum_operator_applications">6</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
     <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
     <parameter name="timestep">1e-4</parameter><parameter name="usedrift">no</parameter>
   </qmc>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="minsr" learning_rate="1e-10" damping="1e-2"
-              krylov_maximum_iterations="4" krylov_maximum_operator_applications="6"/>
+    <training objective="energy" optimizer="minsr">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+      <parameter name="damping">1e-2</parameter>
+      <parameter name="krylov_maximum_iterations">4</parameter>
+      <parameter name="krylov_maximum_operator_applications">6</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
     <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
     <parameter name="timestep">1e-4</parameter><parameter name="usedrift">no</parameter>
   </qmc>
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="spring" learning_rate="1e-10" damping="1e-2"
-              krylov_maximum_iterations="4" krylov_maximum_operator_applications="6"
-              spring_history_decay="0.99" spring_maximum_update_norm_squared="1e-4"/>
+    <training objective="energy" optimizer="spring">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+      <parameter name="damping">1e-2</parameter>
+      <parameter name="krylov_maximum_iterations">4</parameter>
+      <parameter name="krylov_maximum_operator_applications">6</parameter>
+      <parameter name="spring_history_decay">0.99</parameter>
+      <parameter name="spring_maximum_update_norm_squared">1e-4</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
     <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>

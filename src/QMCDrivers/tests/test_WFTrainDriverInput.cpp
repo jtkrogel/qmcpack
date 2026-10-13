@@ -36,7 +36,9 @@ TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_t
 {
   SECTION("defaults")
   {
-    const auto input = parseTrainingInput("<qmc method=\"wf_train\"><training/></qmc>");
+    const auto input = parseTrainingInput(R"(<qmc method="wf_train"><training></training></qmc>)");
+    CHECK(input.getIterations() == 1);
+    CHECK(input.getWarmupSteps() == 0);
     CHECK(input.getObjective() == WFTrainDriverInput::Objective::ENERGY);
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM);
     CHECK(input.getParameterChunkSize() == 65536);
@@ -69,13 +71,23 @@ TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_t
     CHECK(input.getProviderID().empty());
   }
 
-  SECTION("all attributes")
+  SECTION("scalar parameter children")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training objective=\"energy\" optimizer=\"adam\" "
-        "parameter_chunk_size=\"2048\" learning_rate=\"2e-4\" adam_beta1=\"0.8\" "
-        "adam_beta2=\"0.95\" epsilon=\"1e-7\" checkpoint_path=\"continue.h5\" restart_path=\"continue.h5\" "
-        "provider=\"neural\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training objective="energy" optimizer="adam">
+          <parameter name="parameter_chunk_size">2048</parameter>
+          <parameter name="learning_rate">2e-4</parameter>
+          <parameter name="adam_beta1">0.8</parameter>
+          <parameter name="adam_beta2">0.95</parameter>
+          <parameter name="epsilon">1e-7</parameter>
+          <parameter name="checkpoint_path">continue.h5</parameter>
+          <parameter name="restart_path">continue.h5</parameter>
+          <parameter name="provider">neural</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getParameterChunkSize() == 2048);
     CHECK(input.getLearningRate() == 2.0e-4);
     CHECK(input.getAdamBeta1() == 0.8);
@@ -91,10 +103,18 @@ TEST_CASE("WFTrainDriverInput accepts strict determinant-overlap input",
           "[drivers][wf_train][overlap]")
 {
   const auto input = parseTrainingInput(
-      "<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
-      "optimizer=\"adam\" teacher=\"teacher_psi\" overlap_target=\"top_coefficients\" "
-      "overlap_weighting=\"coefficient_squared\" target_provenance=\"ci-hash-42\" "
-      "minimum_fidelity=\"1e-10\" minimum_effective_samples=\"3\"/></qmc>");
+      R"(
+      <qmc method="wf_train">
+        <training objective="determinant_overlap" optimizer="adam">
+          <parameter name="teacher">teacher_psi</parameter>
+          <parameter name="overlap_target">top_coefficients</parameter>
+          <parameter name="overlap_weighting">coefficient_squared</parameter>
+          <parameter name="target_provenance">ci-hash-42</parameter>
+          <parameter name="minimum_fidelity">1e-10</parameter>
+          <parameter name="minimum_effective_samples">3</parameter>
+        </training>
+      </qmc>
+      )");
   CHECK(input.getObjective() == WFTrainDriverInput::Objective::DETERMINANT_OVERLAP);
   CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM);
   CHECK(input.getTeacherWaveFunction() == "teacher_psi");
@@ -113,15 +133,29 @@ TEST_CASE("WFTrainDriverInput accepts typed matrix-free optimizer controls",
   SECTION("parameter-space SR")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"sr\" learning_rate=\"0.02\" "
-        "damping=\"0\" damping_multiplier=\"4\" minimum_retry_damping=\"2e-7\" "
-        "maximum_damping_attempts=\"5\" maximum_update_norm=\"2\" "
-        "maximum_metric_norm=\"3\" krylov_relative_tolerance=\"2e-6\" "
-        "krylov_absolute_tolerance=\"3e-9\" krylov_maximum_iterations=\"40\" "
-        "krylov_maximum_operator_applications=\"44\" krylov_maximum_seconds=\"3\" "
-        "krylov_stagnation_window=\"7\" krylov_minimum_relative_improvement=\"5e-5\" "
-        "krylov_curvature_tolerance=\"6e-12\" krylov_imaginary_tolerance=\"32\" "
-        "maximum_retained_bytes=\"123456\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="sr">
+          <parameter name="learning_rate">0.02</parameter>
+          <parameter name="damping">0</parameter>
+          <parameter name="damping_multiplier">4</parameter>
+          <parameter name="minimum_retry_damping">2e-7</parameter>
+          <parameter name="maximum_damping_attempts">5</parameter>
+          <parameter name="maximum_update_norm">2</parameter>
+          <parameter name="maximum_metric_norm">3</parameter>
+          <parameter name="krylov_relative_tolerance">2e-6</parameter>
+          <parameter name="krylov_absolute_tolerance">3e-9</parameter>
+          <parameter name="krylov_maximum_iterations">40</parameter>
+          <parameter name="krylov_maximum_operator_applications">44</parameter>
+          <parameter name="krylov_maximum_seconds">3</parameter>
+          <parameter name="krylov_stagnation_window">7</parameter>
+          <parameter name="krylov_minimum_relative_improvement">5e-5</parameter>
+          <parameter name="krylov_curvature_tolerance">6e-12</parameter>
+          <parameter name="krylov_imaginary_tolerance">32</parameter>
+          <parameter name="maximum_retained_bytes">123456</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() ==
           WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION);
     CHECK(input.getLearningRate() == 0.02);
@@ -146,9 +180,16 @@ TEST_CASE("WFTrainDriverInput accepts typed matrix-free optimizer controls",
   SECTION("minSR")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"minsr\" damping=\"0.02\" "
-        "center_shift=\"0.5\" objective_tolerance=\"2e-8\" "
-        "maximum_update_norm=\"1.5\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="minsr">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="center_shift">0.5</parameter>
+          <parameter name="objective_tolerance">2e-8</parameter>
+          <parameter name="maximum_update_norm">1.5</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::MINIMUM_STEP_SR);
     CHECK(input.getDamping() == 0.02);
     CHECK(input.getCenterShift() == 0.5);
@@ -159,9 +200,16 @@ TEST_CASE("WFTrainDriverInput accepts typed matrix-free optimizer controls",
   SECTION("SPRING")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"spring\" damping=\"0.03\" "
-        "center_shift=\"0.25\" spring_history_decay=\"0.8\" "
-        "spring_maximum_update_norm_squared=\"4\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="spring">
+          <parameter name="damping">0.03</parameter>
+          <parameter name="center_shift">0.25</parameter>
+          <parameter name="spring_history_decay">0.8</parameter>
+          <parameter name="spring_maximum_update_norm_squared">4</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING);
     CHECK(input.getDamping() == 0.03);
     CHECK(input.getCenterShift() == 0.25);
@@ -176,15 +224,30 @@ TEST_CASE("WFTrainDriverInput maps strict PII and MinPII controls",
   SECTION("explicit-shift PII")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"pii\" learning_rate=\"0.4\" "
-        "pii_shift_mode=\"explicit\" pii_explicit_tau=\"-1.25\" damping=\"0.02\" "
-        "damping_multiplier=\"3\" maximum_damping_retries=\"4\" maximum_update_norm=\"2\" "
-        "objective_tolerance=\"3e-10\" gmres_restart_length=\"17\" "
-        "krylov_relative_tolerance=\"2e-7\" krylov_absolute_tolerance=\"4e-12\" "
-        "krylov_maximum_iterations=\"31\" krylov_maximum_operator_applications=\"37\" "
-        "krylov_maximum_seconds=\"5\" krylov_stagnation_window=\"6\" "
-        "krylov_minimum_relative_improvement=\"8e-5\" krylov_curvature_tolerance=\"9e-13\" "
-        "krylov_imaginary_tolerance=\"16\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="pii">
+          <parameter name="learning_rate">0.4</parameter>
+          <parameter name="pii_shift_mode">explicit</parameter>
+          <parameter name="pii_explicit_tau">-1.25</parameter>
+          <parameter name="damping">0.02</parameter>
+          <parameter name="damping_multiplier">3</parameter>
+          <parameter name="maximum_damping_retries">4</parameter>
+          <parameter name="maximum_update_norm">2</parameter>
+          <parameter name="objective_tolerance">3e-10</parameter>
+          <parameter name="gmres_restart_length">17</parameter>
+          <parameter name="krylov_relative_tolerance">2e-7</parameter>
+          <parameter name="krylov_absolute_tolerance">4e-12</parameter>
+          <parameter name="krylov_maximum_iterations">31</parameter>
+          <parameter name="krylov_maximum_operator_applications">37</parameter>
+          <parameter name="krylov_maximum_seconds">5</parameter>
+          <parameter name="krylov_stagnation_window">6</parameter>
+          <parameter name="krylov_minimum_relative_improvement">8e-5</parameter>
+          <parameter name="krylov_curvature_tolerance">9e-13</parameter>
+          <parameter name="krylov_imaginary_tolerance">16</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() ==
           WFTrainDriverInput::Optimizer::PROJECTED_INVERSE_ITERATION);
     CHECK(input.getPIIShiftMode() == WFTrainDriverInput::PIIShiftMode::EXPLICIT);
@@ -216,8 +279,13 @@ TEST_CASE("WFTrainDriverInput maps strict PII and MinPII controls",
   SECTION("mean-energy-shift MinPII defaults")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"minpii\" "
-        "pii_energy_undershoot=\"0.35\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="minpii">
+          <parameter name="pii_energy_undershoot">0.35</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() ==
           WFTrainDriverInput::Optimizer::MINIMUM_PROJECTED_INVERSE_ITERATION);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "minpii");
@@ -236,7 +304,7 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("SGD defaults and selection")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"sgd\"/></qmc>");
+        R"(<qmc method="wf_train"><training optimizer="sgd"></training></qmc>)");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::SGD);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "sgd");
     CHECK(input.getLearningRate() == 1.0e-3);
@@ -247,8 +315,14 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("momentum SGD maps momentum_decay")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"momentum_sgd\" "
-        "learning_rate=\"0.03\" momentum_decay=\"0.75\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="momentum_sgd">
+          <parameter name="learning_rate">0.03</parameter>
+          <parameter name="momentum_decay">0.75</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::MOMENTUM_SGD);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "momentum_sgd");
     CHECK(input.getLearningRate() == 0.03);
@@ -258,8 +332,14 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("RMSProp maps rms_decay")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"rmsprop\" "
-        "learning_rate=\"0.02\" rms_decay=\"0.8\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="rmsprop">
+          <parameter name="learning_rate">0.02</parameter>
+          <parameter name="rms_decay">0.8</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::RMSPROP);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "rmsprop");
     CHECK(input.getLearningRate() == 0.02);
@@ -269,9 +349,16 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("AMSGrad accepts its Adam moment controls")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"amsgrad\" "
-        "learning_rate=\"0.01\" adam_beta1=\"0.8\" adam_beta2=\"0.95\" "
-        "epsilon=\"1e-7\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="amsgrad">
+          <parameter name="learning_rate">0.01</parameter>
+          <parameter name="adam_beta1">0.8</parameter>
+          <parameter name="adam_beta2">0.95</parameter>
+          <parameter name="epsilon">1e-7</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::AMSGRAD);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "amsgrad");
     CHECK(input.getLearningRate() == 0.01);
@@ -283,9 +370,17 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("LM maps LM controls")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" "
-        "krylov_relative_tolerance=\"2e-6\" lm_overlap_shift=\"0.03\" "
-        "lm_normalization_xi=\"0.4\" lm_maximum_subspace_dimension=\"12\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="lm">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="krylov_relative_tolerance">2e-6</parameter>
+          <parameter name="lm_overlap_shift">0.03</parameter>
+          <parameter name="lm_normalization_xi">0.4</parameter>
+          <parameter name="lm_maximum_subspace_dimension">12</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::LINEAR_METHOD);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "lm");
     CHECK(input.getLearningRate() == 1.0);
@@ -299,9 +394,17 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("ALM maps iterative controls")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"alm\" damping=\"0.03\" "
-        "krylov_relative_tolerance=\"3e-6\" lm_inner_iterations=\"9\" "
-        "lm_inner_restart_length=\"5\" lm_inner_relative_tolerance=\"0.02\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="alm">
+          <parameter name="damping">0.03</parameter>
+          <parameter name="krylov_relative_tolerance">3e-6</parameter>
+          <parameter name="lm_inner_iterations">9</parameter>
+          <parameter name="lm_inner_restart_length">5</parameter>
+          <parameter name="lm_inner_relative_tolerance">0.02</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ACCELERATED_LINEAR_METHOD);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "alm");
     CHECK(input.getDamping() == 0.03);
@@ -314,8 +417,14 @@ TEST_CASE("WFTrainDriverInput accepts strict SGD, RMSProp, AMSGrad, LM, ALM, and
   SECTION("KFAC maps fallback damping")
   {
     const auto input = parseTrainingInput(
-        "<qmc method=\"wf_train\"><training optimizer=\"kfac\" damping=\"0.04\" "
-        "kfac_fallback_damping=\"0.006\"/></qmc>");
+        R"(
+      <qmc method="wf_train">
+        <training optimizer="kfac">
+          <parameter name="damping">0.04</parameter>
+          <parameter name="kfac_fallback_damping">0.006</parameter>
+        </training>
+      </qmc>
+      )");
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::KFAC);
     CHECK(wftrain::optimizerName(input.getOptimizer()) == "kfac");
     CHECK(input.getDamping() == 0.04);
@@ -333,80 +442,244 @@ TEST_CASE("WFTrainDriverInput rejects ambiguous or unsupported input", "[drivers
     CHECK_THROWS(input.readXML(document.getRoot()));
   };
 
-  rejects("<qmc method=\"wf_train\"/>");
-  rejects("<qmc method=\"wf_train\"><training/><training/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training mystery=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training><optimizer/></training></qmc>");
-  rejects("<qmc method=\"wf_train\"><training objective=\"overlap\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training teacher=\"teacher\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
-          "teacher=\"teacher\" target_provenance=\"x\" optimizer=\"sr\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training objective=\"determinant_overlap\" "
-          "teacher=\"teacher\" target_provenance=\"x\" "
-          "overlap_weighting=\"coefficient_squared\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"unknown\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training parameter_chunk_size=\"1k\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training learning_rate=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training learning_rate=\"nan\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training learning_rate=\"inf\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training adam_beta1=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training adam_beta2=\"-0.1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training epsilon=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training damping=\"1e-3\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" adam_beta1=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" center_shift=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"minsr\" damping=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"minsr\" damping=\"nan\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"minsr\" damping_multiplier=\"2\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"spring\" maximum_metric_norm=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"spring\" damping=\"-1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"spring\" spring_history_decay=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" damping_multiplier=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" minimum_retry_damping=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" maximum_damping_attempts=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" maximum_update_norm=\"-1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_relative_tolerance=\"0\" "
-          "krylov_absolute_tolerance=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_maximum_iterations=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" "
-          "krylov_maximum_operator_applications=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_maximum_seconds=\"-1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" krylov_maximum_seconds=\"inf\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training maximum_retained_bytes=\"-1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training provider=\"\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_shift_mode=\"fixed\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_shift_mode=\"explicit\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_explicit_tau=\"-1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" pii_shift_mode=\"explicit\" "
-          "pii_explicit_tau=\"-1\" pii_energy_undershoot=\"0.1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" damping=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" maximum_damping_attempts=\"2\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" maximum_damping_retries=\"65\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"pii\" gmres_restart_length=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"minpii\" center_shift=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"minpii\" adam_beta1=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sr\" maximum_damping_retries=\"2\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sgd\" adam_beta1=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"sgd\" momentum_decay=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"momentum_sgd\" rms_decay=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\" adam_beta1=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"rmsprop\" rms_decay=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"amsgrad\" rms_decay=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"momentum_sgd\" momentum_decay=\"1\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" "
-          "lm_overlap_shift=\"0\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" krylov_relative_tolerance=\"1e-6\" "
-          "lm_inner_iterations=\"3\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"lm\" damping=\"0.02\" krylov_relative_tolerance=\"1e-6\" "
-          "maximum_damping_attempts=\"2\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"alm\" damping=\"0.02\" krylov_relative_tolerance=\"1e-6\" "
-          "spring_history_decay=\"0.8\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"kfac\" damping=\"0.02\" "
-          "krylov_relative_tolerance=\"1e-6\"/></qmc>");
-  rejects("<qmc method=\"wf_train\"><training optimizer=\"kfac\" damping=\"0.02\" "
-          "kfac_fallback_damping=\"0\"/></qmc>");
+  rejects(R"(<qmc method="wf_train"/>)");
+  rejects(R"(<qmc method="wf_train"><training></training><training></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="mystery">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><optimizer/></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training objective="overlap"></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="teacher">teacher</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training objective="determinant_overlap"></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training objective="determinant_overlap" optimizer="sr">
+          <parameter name="teacher">teacher</parameter>
+          <parameter name="target_provenance">x</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training objective="determinant_overlap">
+          <parameter name="teacher">teacher</parameter>
+          <parameter name="target_provenance">x</parameter>
+          <parameter name="overlap_weighting">coefficient_squared</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training optimizer="unknown"></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="parameter_chunk_size">0</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="parameter_chunk_size">1k</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="learning_rate">0</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="learning_rate">nan</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="learning_rate">inf</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="adam_beta1">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="adam_beta2">-0.1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="epsilon">0</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="damping">1e-3</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="adam_beta1">0.8</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="center_shift">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="minsr"><parameter name="damping">0</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="minsr"><parameter name="damping">nan</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="minsr"><parameter name="damping_multiplier">2</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="spring"><parameter name="maximum_metric_norm">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="spring"><parameter name="damping">-1</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="spring">
+          <parameter name="spring_history_decay">1</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="damping_multiplier">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="minimum_retry_damping">0</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="sr">
+          <parameter name="maximum_damping_attempts">0</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="maximum_update_norm">-1</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="sr">
+          <parameter name="krylov_relative_tolerance">0</parameter>
+          <parameter name="krylov_absolute_tolerance">0</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="sr">
+          <parameter name="krylov_maximum_iterations">0</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="sr">
+          <parameter name="krylov_maximum_operator_applications">0</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="krylov_maximum_seconds">-1</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="sr">
+          <parameter name="krylov_maximum_seconds">inf</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="maximum_retained_bytes">-1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training><parameter name="provider"></parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="pii"><parameter name="pii_shift_mode">fixed</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="pii"><parameter name="pii_shift_mode">explicit</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="pii"><parameter name="pii_explicit_tau">-1</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="pii">
+          <parameter name="pii_shift_mode">explicit</parameter>
+          <parameter name="pii_explicit_tau">-1</parameter>
+          <parameter name="pii_energy_undershoot">0.1</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training optimizer="pii"><parameter name="damping">0</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="pii">
+          <parameter name="maximum_damping_attempts">2</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="pii">
+          <parameter name="maximum_damping_retries">65</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(<qmc method="wf_train"><training optimizer="pii"><parameter name="gmres_restart_length">0</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="minpii"><parameter name="center_shift">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="minpii"><parameter name="adam_beta1">0.8</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sr"><parameter name="maximum_damping_retries">2</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sgd"><parameter name="adam_beta1">0.8</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="sgd"><parameter name="momentum_decay">0.8</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="momentum_sgd"><parameter name="rms_decay">0.8</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="rmsprop"><parameter name="adam_beta1">0.8</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="rmsprop"><parameter name="rms_decay">1</parameter></training></qmc>)");
+  rejects(R"(<qmc method="wf_train"><training optimizer="amsgrad"><parameter name="rms_decay">0.8</parameter></training></qmc>)");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="momentum_sgd">
+          <parameter name="momentum_decay">1</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="lm">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="lm_overlap_shift">0</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="lm">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="krylov_relative_tolerance">1e-6</parameter>
+          <parameter name="lm_inner_iterations">3</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="lm">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="krylov_relative_tolerance">1e-6</parameter>
+          <parameter name="maximum_damping_attempts">2</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="alm">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="krylov_relative_tolerance">1e-6</parameter>
+          <parameter name="spring_history_decay">0.8</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="kfac">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="krylov_relative_tolerance">1e-6</parameter>
+        </training>
+      </qmc>
+      )");
+  rejects(R"(
+      <qmc method="wf_train">
+        <training optimizer="kfac">
+          <parameter name="damping">0.02</parameter>
+          <parameter name="kfac_fallback_damping">0</parameter>
+        </training>
+      </qmc>
+      )");
+}
+
+TEST_CASE("WFTrainDriverInput separates training iterations and warmup from sample blocks",
+          "[drivers][wf_train]")
+{
+  const auto input = parseTrainingInput(R"(
+    <qmc method="wf_train">
+      <parameter name="blocks">4</parameter>
+      <training objective="energy" optimizer="adam">
+        <!-- Indentation and scalar CDATA are accepted. -->
+        <parameter name="iterations">
+          100
+        </parameter>
+        <parameter name="warmupsteps"><![CDATA[ 2 ]]></parameter>
+        <parameter name="learning_rate"> 1e-5 </parameter>
+      </training>
+    </qmc>
+  )");
+  CHECK(input.getIterations() == 100);
+  CHECK(input.getWarmupSteps() == 2);
+  CHECK(input.getLearningRate() == 1e-5);
+
+  const auto defaults = parseTrainingInput(R"(<qmc><training/></qmc>)");
+  CHECK(defaults.getIterations() == 1);
+  CHECK(defaults.getWarmupSteps() == 0);
+}
+
+TEST_CASE("WFTrainDriverInput rejects obsolete attributes and malformed parameter children",
+          "[drivers][wf_train]")
+{
+  const std::string bad_inputs[] = {
+      R"(<qmc><training learning_rate="1e-3"/></qmc>)",
+      R"(<qmc><training iterations="2"/></qmc>)",
+      R"(<qmc><training><parameter name="objective">energy</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="optimizer">adam</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="iterations">0</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="iterations">-1</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="iterations">184467440737095516160</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="warmupsteps">-1</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="warmupsteps">1.5</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="warmupsteps">184467440737095516160</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="mystery">1</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="iterations">2</parameter><parameter name="iterations">3</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="learning_rate">  </parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="iterations" value="2">2</parameter></training></qmc>)",
+      R"(<qmc><training><parameter>2</parameter></training></qmc>)",
+      R"(<qmc><training><parameter name="iterations"><value>2</value></parameter></training></qmc>)",
+      R"(<qmc><training>unexpected text</training></qmc>)"};
+  for (const auto& xml : bad_inputs)
+  {
+    INFO(xml);
+    CHECK_THROWS(parseTrainingInput(xml));
+  }
 }
 
 } // namespace qmcplusplus

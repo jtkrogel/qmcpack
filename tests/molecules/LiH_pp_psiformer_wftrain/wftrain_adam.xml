@@ -48,8 +48,11 @@
   </hamiltonian>
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="adam" learning_rate="1e-10"
-              parameter_chunk_size="4096"/>
+    <training objective="energy" optimizer="adam">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+    </training>
     <parameter name="walkers_per_rank">1</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>

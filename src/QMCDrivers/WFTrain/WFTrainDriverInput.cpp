@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <limits>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace qmcplusplus
@@ -27,8 +28,8 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 59> allowed_attributes{
-    "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
+constexpr std::array<std::string_view, 61> allowed_controls{
+    "iterations", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
     "line_search", "update_scale", "weight_decay", "weight_decay_scope",
@@ -134,19 +135,31 @@ double parseNonnegativeReal(const std::string& text, const std::string& attribut
   return value;
 }
 
-/** Reject attributes that do not apply to the selected optimizer. */
-void rejectAttributes(const std::unordered_set<std::string>& seen_attributes,
+/** Reject controls that do not apply to the selected optimizer. */
+void rejectControls(const std::unordered_set<std::string>& seen_controls,
                       std::initializer_list<std::string_view> attributes,
                       const std::string& optimizer)
 {
   for (const std::string_view attribute : attributes)
-    if (seen_attributes.find(std::string(attribute)) != seen_attributes.end())
+    if (seen_controls.find(std::string(attribute)) != seen_controls.end())
       throw UniformCommunicateError("WFTrainDriverInput: " + std::string(attribute) +
                                     " is not valid for optimizer=\"" + optimizer + "\"");
 }
 
-/** Reject nested elements and non-whitespace text in the attribute-only section. */
-void validateElementContent(xmlNodePtr training_node)
+/** Remove XML indentation around a parameter value, preserving internal whitespace. */
+std::string trimParameterText(const std::string& text)
+{
+  const auto first = text.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos)
+    return {};
+  const auto last = text.find_last_not_of(" \t\r\n");
+  return text.substr(first, last - first + 1);
+}
+
+/** Read flat parameter children strictly, rejecting misspellings and ambiguous controls. */
+void readParameterChildren(xmlNodePtr training_node,
+                           std::unordered_map<std::string, std::string>& values,
+                           std::unordered_set<std::string>& seen_controls)
 {
   for (xmlNodePtr child = training_node->children; child != nullptr; child = child->next)
   {
@@ -154,11 +167,39 @@ void validateElementContent(xmlNodePtr training_node)
       continue;
     if (child->type == XML_TEXT_NODE || child->type == XML_CDATA_SECTION_NODE)
     {
-      const std::string text = castXMLCharToChar(child->content);
-      if (std::all_of(text.begin(), text.end(), [](unsigned char character) { return std::isspace(character); }))
+      if (trimParameterText(castXMLCharToChar(child->content)).empty())
         continue;
+      throw UniformCommunicateError("WFTrainDriverInput: unexpected text in training section");
     }
-    throw UniformCommunicateError("WFTrainDriverInput: nested training content is not supported");
+    if (child->type != XML_ELEMENT_NODE ||
+        std::string_view(castXMLCharToChar(child->name)) != "parameter")
+      throw UniformCommunicateError("WFTrainDriverInput: training children must be parameter elements");
+
+    // Each parameter has exactly one attribute, its name, and only scalar text.
+    for (xmlAttrPtr attribute = child->properties; attribute != nullptr; attribute = attribute->next)
+      if (std::string_view(castXMLCharToChar(attribute->name)) != "name" || attribute->ns != nullptr)
+        throw UniformCommunicateError("WFTrainDriverInput: training parameter accepts only a name attribute");
+    const std::string name = readAttribute(child, "name");
+    if (name == "objective" || name == "optimizer")
+      throw UniformCommunicateError("WFTrainDriverInput: " + name + " must remain a training attribute");
+    if (std::find(allowed_controls.begin(), allowed_controls.end(), name) == allowed_controls.end())
+      throw UniformCommunicateError("WFTrainDriverInput: unknown training parameter " + name);
+    if (!seen_controls.insert(name).second)
+      throw UniformCommunicateError("WFTrainDriverInput: duplicate training parameter " + name);
+
+    std::string text;
+    for (xmlNodePtr content = child->children; content != nullptr; content = content->next)
+    {
+      if (content->type == XML_COMMENT_NODE)
+        continue;
+      if (content->type != XML_TEXT_NODE && content->type != XML_CDATA_SECTION_NODE)
+        throw UniformCommunicateError("WFTrainDriverInput: nested content in parameter " + name);
+      text += castXMLCharToChar(content->content);
+    }
+    text = trimParameterText(text);
+    if (text.empty())
+      throw UniformCommunicateError("WFTrainDriverInput: empty training parameter " + name);
+    values.emplace(name, std::move(text));
   }
 }
 
@@ -181,18 +222,30 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (training_node == nullptr)
     throw UniformCommunicateError("WFTrainDriverInput: method=\"wf_train\" requires one training section");
 
-  validateElementContent(training_node);
-
-  std::unordered_set<std::string> seen_attributes;
+  std::unordered_set<std::string> seen_controls;
+  std::unordered_map<std::string, std::string> values;
   for (xmlAttrPtr attribute = training_node->properties; attribute != nullptr; attribute = attribute->next)
   {
     const std::string name = castXMLCharToChar(attribute->name);
-    if (std::find(allowed_attributes.begin(), allowed_attributes.end(), name) == allowed_attributes.end())
+    if (name != "objective" && name != "optimizer")
+    {
+      if (std::find(allowed_controls.begin(), allowed_controls.end(), name) != allowed_controls.end())
+        throw UniformCommunicateError("WFTrainDriverInput: obsolete training attribute " + name +
+                                      "; use <parameter name='" + name + "'>value</parameter>. "
+                                      "Set training iterations explicitly; blocks now count statistical sample blocks.");
       throw UniformCommunicateError("WFTrainDriverInput: unknown training attribute " + name);
-    if (!seen_attributes.insert(name).second)
-      throw UniformCommunicateError("WFTrainDriverInput: duplicate training attribute " + name);
+    }
+    if (attribute->ns != nullptr || !seen_controls.insert(name).second)
+      throw UniformCommunicateError("WFTrainDriverInput: duplicate or namespaced training attribute " + name);
+    values.emplace(name, readAttribute(training_node, name.c_str()));
   }
+  readParameterChildren(training_node, values, seen_controls);
 
+  // Common validation below treats scalar attributes and parameter values uniformly.
+  const auto readControl = [&values](const char* name) -> const std::string& { return values.at(name); };
+
+  iterations_ = 1;
+  warmup_steps_ = 0;
   objective_                        = Objective::ENERGY;
   momentum_decay_ = 0.9;
   rms_decay_ = 0.9;
@@ -251,62 +304,66 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   target_provenance_.clear();
   minimum_fidelity_          = 1.0e-14;
   minimum_effective_samples_ = 1.0;
-  if (seen_attributes.count("momentum_decay"))
-    momentum_decay_ = parseNonnegativeReal(readAttribute(training_node, "momentum_decay"), "momentum_decay");
-  if (seen_attributes.count("rms_decay"))
-    rms_decay_ = parseNonnegativeReal(readAttribute(training_node, "rms_decay"), "rms_decay");
-  if (seen_attributes.count("lm_overlap_shift"))
-    lm_overlap_shift_ = parseNonnegativeReal(readAttribute(training_node, "lm_overlap_shift"), "lm_overlap_shift");
-  if (seen_attributes.count("lm_normalization_xi"))
-    lm_normalization_xi_ = parseNonnegativeReal(readAttribute(training_node, "lm_normalization_xi"), "lm_normalization_xi");
-  if (seen_attributes.count("lm_maximum_subspace_dimension"))
-    lm_maximum_subspace_dimension_ = parsePositiveSize(readAttribute(training_node, "lm_maximum_subspace_dimension"), "lm_maximum_subspace_dimension");
-  if (seen_attributes.count("lm_inner_iterations"))
-    lm_inner_iterations_ = parsePositiveSize(readAttribute(training_node, "lm_inner_iterations"), "lm_inner_iterations");
-  if (seen_attributes.count("lm_inner_restart_length"))
-    lm_inner_restart_length_ = parsePositiveSize(readAttribute(training_node, "lm_inner_restart_length"), "lm_inner_restart_length");
-  if (seen_attributes.count("lm_inner_relative_tolerance"))
-    lm_inner_relative_tolerance_ = parseNonnegativeReal(readAttribute(training_node, "lm_inner_relative_tolerance"), "lm_inner_relative_tolerance");
-  if (seen_attributes.count("kfac_fallback_damping"))
-    kfac_fallback_damping_ = parseNonnegativeReal(readAttribute(training_node, "kfac_fallback_damping"), "kfac_fallback_damping");
+  if (seen_controls.count("iterations"))
+    iterations_ = parsePositiveSize(readControl("iterations"), "iterations");
+  if (seen_controls.count("warmupsteps"))
+    warmup_steps_ = parseNonnegativeSize(readControl("warmupsteps"), "warmupsteps");
+  if (seen_controls.count("momentum_decay"))
+    momentum_decay_ = parseNonnegativeReal(readControl("momentum_decay"), "momentum_decay");
+  if (seen_controls.count("rms_decay"))
+    rms_decay_ = parseNonnegativeReal(readControl("rms_decay"), "rms_decay");
+  if (seen_controls.count("lm_overlap_shift"))
+    lm_overlap_shift_ = parseNonnegativeReal(readControl("lm_overlap_shift"), "lm_overlap_shift");
+  if (seen_controls.count("lm_normalization_xi"))
+    lm_normalization_xi_ = parseNonnegativeReal(readControl("lm_normalization_xi"), "lm_normalization_xi");
+  if (seen_controls.count("lm_maximum_subspace_dimension"))
+    lm_maximum_subspace_dimension_ = parsePositiveSize(readControl("lm_maximum_subspace_dimension"), "lm_maximum_subspace_dimension");
+  if (seen_controls.count("lm_inner_iterations"))
+    lm_inner_iterations_ = parsePositiveSize(readControl("lm_inner_iterations"), "lm_inner_iterations");
+  if (seen_controls.count("lm_inner_restart_length"))
+    lm_inner_restart_length_ = parsePositiveSize(readControl("lm_inner_restart_length"), "lm_inner_restart_length");
+  if (seen_controls.count("lm_inner_relative_tolerance"))
+    lm_inner_relative_tolerance_ = parseNonnegativeReal(readControl("lm_inner_relative_tolerance"), "lm_inner_relative_tolerance");
+  if (seen_controls.count("kfac_fallback_damping"))
+    kfac_fallback_damping_ = parseNonnegativeReal(readControl("kfac_fallback_damping"), "kfac_fallback_damping");
   if (momentum_decay_ >= 1.0 || rms_decay_ >= 1.0 || lm_normalization_xi_ > 1.0 ||
       lm_overlap_shift_ <= 0.0 || lm_inner_relative_tolerance_ <= 0.0 ||
       lm_maximum_subspace_dimension_ < 2 || kfac_fallback_damping_ <= 0.0)
     throw UniformCommunicateError("Invalid first-order/LM/KFAC optimizer controls");
 
-  if (seen_attributes.count("line_search"))
+  if (seen_controls.count("line_search"))
   {
-    const auto mode = readAttribute(training_node, "line_search");
+    const auto mode = readControl("line_search");
     if (mode == "off") line_search_ = LineSearch::OFF;
     else if (mode == "reference") line_search_ = LineSearch::REFERENCE;
     else if (mode == "endpoints") line_search_ = LineSearch::ENDPOINTS;
     else throw UniformCommunicateError("line_search must be off, reference, or endpoints");
   }
-  if (seen_attributes.count("weight_decay_scope") &&
-      readAttribute(training_node, "weight_decay_scope") != "nn_weights")
+  if (seen_controls.count("weight_decay_scope") &&
+      readControl("weight_decay_scope") != "nn_weights")
     throw UniformCommunicateError("weight_decay_scope currently supports nn_weights only");
-  if (seen_attributes.count("update_scale"))
-    update_scale_ = parseNonnegativeReal(readAttribute(training_node, "update_scale"), "update_scale");
-  if (seen_attributes.count("weight_decay"))
-    weight_decay_ = parseNonnegativeReal(readAttribute(training_node, "weight_decay"), "weight_decay");
-  if (seen_attributes.count("line_search_minimum_ess_fraction"))
-    line_search_minimum_ess_fraction_ = parseNonnegativeReal(readAttribute(training_node, "line_search_minimum_ess_fraction"), "line_search_minimum_ess_fraction");
-  if (seen_attributes.count("line_search_maximum_weight"))
-    line_search_maximum_weight_ = parseNonnegativeReal(readAttribute(training_node, "line_search_maximum_weight"), "line_search_maximum_weight");
-  if (seen_attributes.count("line_search_confidence"))
-    line_search_confidence_ = parseNonnegativeReal(readAttribute(training_node, "line_search_confidence"), "line_search_confidence");
-  if (seen_attributes.count("line_search_warmup_steps"))
-    line_search_warmup_steps_ = parsePositiveSize(readAttribute(training_node, "line_search_warmup_steps"), "line_search_warmup_steps");
-  if (seen_attributes.count("line_search_sampling_steps"))
-    line_search_sampling_steps_ = parsePositiveSize(readAttribute(training_node, "line_search_sampling_steps"), "line_search_sampling_steps");
+  if (seen_controls.count("update_scale"))
+    update_scale_ = parseNonnegativeReal(readControl("update_scale"), "update_scale");
+  if (seen_controls.count("weight_decay"))
+    weight_decay_ = parseNonnegativeReal(readControl("weight_decay"), "weight_decay");
+  if (seen_controls.count("line_search_minimum_ess_fraction"))
+    line_search_minimum_ess_fraction_ = parseNonnegativeReal(readControl("line_search_minimum_ess_fraction"), "line_search_minimum_ess_fraction");
+  if (seen_controls.count("line_search_maximum_weight"))
+    line_search_maximum_weight_ = parseNonnegativeReal(readControl("line_search_maximum_weight"), "line_search_maximum_weight");
+  if (seen_controls.count("line_search_confidence"))
+    line_search_confidence_ = parseNonnegativeReal(readControl("line_search_confidence"), "line_search_confidence");
+  if (seen_controls.count("line_search_warmup_steps"))
+    line_search_warmup_steps_ = parsePositiveSize(readControl("line_search_warmup_steps"), "line_search_warmup_steps");
+  if (seen_controls.count("line_search_sampling_steps"))
+    line_search_sampling_steps_ = parsePositiveSize(readControl("line_search_sampling_steps"), "line_search_sampling_steps");
   if (weight_decay_ >= 1.0 || line_search_minimum_ess_fraction_ > 1.0 ||
       line_search_minimum_ess_fraction_ == 0.0 || line_search_maximum_weight_ > 1.0 ||
       line_search_maximum_weight_ == 0.0)
     throw UniformCommunicateError("Decay must lie in [0,1), and line-search weight guards in (0,1]");
 
-  if (seen_attributes.find("objective") != seen_attributes.end())
+  if (seen_controls.find("objective") != seen_controls.end())
   {
-    const std::string objective = readAttribute(training_node, "objective");
+    const std::string objective = readControl("objective");
     if (objective == "energy")
       objective_ = Objective::ENERGY;
     else if (objective == "determinant_overlap")
@@ -315,9 +372,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       throw UniformCommunicateError("WFTrainDriverInput: unsupported objective=\"" + objective +
                                     "\"; supported objectives are energy and determinant_overlap");
   }
-  if (seen_attributes.find("optimizer") != seen_attributes.end())
+  if (seen_controls.find("optimizer") != seen_controls.end())
   {
-    const std::string optimizer = readAttribute(training_node, "optimizer");
+    const std::string optimizer = readControl("optimizer");
     if (optimizer == "adam")
       optimizer_ = Optimizer::ADAM;
     else if (optimizer == "sgd") optimizer_ = Optimizer::SGD;
@@ -347,62 +404,62 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       optimizer_ == Optimizer::ACCELERATED_LINEAR_METHOD;
   const bool first_order = optimizer_ == Optimizer::ADAM || optimizer_ == Optimizer::AMSGRAD ||
       optimizer_ == Optimizer::SGD || optimizer_ == Optimizer::MOMENTUM_SGD || optimizer_ == Optimizer::RMSPROP;
-  if (lm_optimizer && !seen_attributes.count("krylov_relative_tolerance"))
+  if (lm_optimizer && !seen_controls.count("krylov_relative_tolerance"))
     krylov_relative_tolerance_ = 1.0e-3;
-  if (lm_optimizer && !seen_attributes.count("learning_rate")) learning_rate_ = 1.0;
-  if (pii_optimizer && seen_attributes.find("learning_rate") == seen_attributes.end())
+  if (lm_optimizer && !seen_controls.count("learning_rate")) learning_rate_ = 1.0;
+  if (pii_optimizer && seen_controls.find("learning_rate") == seen_controls.end())
     learning_rate_ = 1.0;
-  if (seen_attributes.find("parameter_chunk_size") != seen_attributes.end())
-    parameter_chunk_size_ = parsePositiveSize(readAttribute(training_node, "parameter_chunk_size"),
+  if (seen_controls.find("parameter_chunk_size") != seen_controls.end())
+    parameter_chunk_size_ = parsePositiveSize(readControl("parameter_chunk_size"),
                                               "parameter_chunk_size");
-  if (seen_attributes.find("learning_rate") != seen_attributes.end())
+  if (seen_controls.find("learning_rate") != seen_controls.end())
   {
-    learning_rate_ = parseFiniteReal(readAttribute(training_node, "learning_rate"), "learning_rate");
+    learning_rate_ = parseFiniteReal(readControl("learning_rate"), "learning_rate");
     if (!(learning_rate_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: learning_rate must be positive");
   }
-  if (seen_attributes.find("adam_beta1") != seen_attributes.end())
-    adam_beta1_ = parseDecay(readAttribute(training_node, "adam_beta1"), "adam_beta1");
-  if (seen_attributes.find("adam_beta2") != seen_attributes.end())
-    adam_beta2_ = parseDecay(readAttribute(training_node, "adam_beta2"), "adam_beta2");
-  if (seen_attributes.find("epsilon") != seen_attributes.end())
+  if (seen_controls.find("adam_beta1") != seen_controls.end())
+    adam_beta1_ = parseDecay(readControl("adam_beta1"), "adam_beta1");
+  if (seen_controls.find("adam_beta2") != seen_controls.end())
+    adam_beta2_ = parseDecay(readControl("adam_beta2"), "adam_beta2");
+  if (seen_controls.find("epsilon") != seen_controls.end())
   {
-    epsilon_ = parseFiniteReal(readAttribute(training_node, "epsilon"), "epsilon");
+    epsilon_ = parseFiniteReal(readControl("epsilon"), "epsilon");
     if (!(epsilon_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: epsilon must be positive");
   }
-  if (seen_attributes.find("damping") != seen_attributes.end())
-    damping_ = parseNonnegativeReal(readAttribute(training_node, "damping"), "damping");
-  if (seen_attributes.find("damping_multiplier") != seen_attributes.end())
+  if (seen_controls.find("damping") != seen_controls.end())
+    damping_ = parseNonnegativeReal(readControl("damping"), "damping");
+  if (seen_controls.find("damping_multiplier") != seen_controls.end())
   {
-    damping_multiplier_ = parseFiniteReal(readAttribute(training_node, "damping_multiplier"), "damping_multiplier");
+    damping_multiplier_ = parseFiniteReal(readControl("damping_multiplier"), "damping_multiplier");
     if (!(damping_multiplier_ > 1.0))
       throw UniformCommunicateError("WFTrainDriverInput: damping_multiplier must be greater than one");
   }
-  if (seen_attributes.find("minimum_retry_damping") != seen_attributes.end())
+  if (seen_controls.find("minimum_retry_damping") != seen_controls.end())
   {
-    minimum_retry_damping_ = parseFiniteReal(readAttribute(training_node, "minimum_retry_damping"),
+    minimum_retry_damping_ = parseFiniteReal(readControl("minimum_retry_damping"),
                                              "minimum_retry_damping");
     if (!(minimum_retry_damping_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: minimum_retry_damping must be positive");
   }
-  if (seen_attributes.find("maximum_damping_attempts") != seen_attributes.end())
-    maximum_damping_attempts_ = parsePositiveSize(readAttribute(training_node, "maximum_damping_attempts"),
+  if (seen_controls.find("maximum_damping_attempts") != seen_controls.end())
+    maximum_damping_attempts_ = parsePositiveSize(readControl("maximum_damping_attempts"),
                                                   "maximum_damping_attempts");
-  if (seen_attributes.find("maximum_update_norm") != seen_attributes.end())
-    maximum_update_norm_ = parseNonnegativeReal(readAttribute(training_node, "maximum_update_norm"),
+  if (seen_controls.find("maximum_update_norm") != seen_controls.end())
+    maximum_update_norm_ = parseNonnegativeReal(readControl("maximum_update_norm"),
                                                 "maximum_update_norm");
-  if (seen_attributes.find("maximum_metric_norm") != seen_attributes.end())
-    maximum_metric_norm_ = parseNonnegativeReal(readAttribute(training_node, "maximum_metric_norm"),
+  if (seen_controls.find("maximum_metric_norm") != seen_controls.end())
+    maximum_metric_norm_ = parseNonnegativeReal(readControl("maximum_metric_norm"),
                                                 "maximum_metric_norm");
-  if (seen_attributes.find("center_shift") != seen_attributes.end())
-    center_shift_ = parseNonnegativeReal(readAttribute(training_node, "center_shift"), "center_shift");
-  if (seen_attributes.find("objective_tolerance") != seen_attributes.end())
-    objective_tolerance_ = parseNonnegativeReal(readAttribute(training_node, "objective_tolerance"),
+  if (seen_controls.find("center_shift") != seen_controls.end())
+    center_shift_ = parseNonnegativeReal(readControl("center_shift"), "center_shift");
+  if (seen_controls.find("objective_tolerance") != seen_controls.end())
+    objective_tolerance_ = parseNonnegativeReal(readControl("objective_tolerance"),
                                                 "objective_tolerance");
-  if (seen_attributes.find("pii_shift_mode") != seen_attributes.end())
+  if (seen_controls.find("pii_shift_mode") != seen_controls.end())
   {
-    const std::string mode = readAttribute(training_node, "pii_shift_mode");
+    const std::string mode = readControl("pii_shift_mode");
     if (mode == "explicit")
       pii_shift_mode_ = PIIShiftMode::EXPLICIT;
     else if (mode == "mean_energy_minus_undershoot")
@@ -411,85 +468,85 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       throw UniformCommunicateError(
           "WFTrainDriverInput: pii_shift_mode must be explicit or mean_energy_minus_undershoot");
   }
-  if (seen_attributes.find("pii_explicit_tau") != seen_attributes.end())
-    pii_explicit_tau_ = parseFiniteReal(readAttribute(training_node, "pii_explicit_tau"),
+  if (seen_controls.find("pii_explicit_tau") != seen_controls.end())
+    pii_explicit_tau_ = parseFiniteReal(readControl("pii_explicit_tau"),
                                         "pii_explicit_tau");
-  if (seen_attributes.find("pii_energy_undershoot") != seen_attributes.end())
+  if (seen_controls.find("pii_energy_undershoot") != seen_controls.end())
     pii_energy_undershoot_ = parseNonnegativeReal(
-        readAttribute(training_node, "pii_energy_undershoot"), "pii_energy_undershoot");
-  if (seen_attributes.find("maximum_damping_retries") != seen_attributes.end())
+        readControl("pii_energy_undershoot"), "pii_energy_undershoot");
+  if (seen_controls.find("maximum_damping_retries") != seen_controls.end())
   {
     maximum_damping_retries_ = parseNonnegativeSize(
-        readAttribute(training_node, "maximum_damping_retries"), "maximum_damping_retries");
+        readControl("maximum_damping_retries"), "maximum_damping_retries");
     if (maximum_damping_retries_ > 64)
       throw UniformCommunicateError(
           "WFTrainDriverInput: maximum_damping_retries must not exceed 64");
   }
-  if (seen_attributes.find("gmres_restart_length") != seen_attributes.end())
+  if (seen_controls.find("gmres_restart_length") != seen_controls.end())
     gmres_restart_length_ = parsePositiveSize(
-        readAttribute(training_node, "gmres_restart_length"), "gmres_restart_length");
-  if (seen_attributes.find("spring_history_decay") != seen_attributes.end())
-    spring_history_decay_ = parseDecay(readAttribute(training_node, "spring_history_decay"),
+        readControl("gmres_restart_length"), "gmres_restart_length");
+  if (seen_controls.find("spring_history_decay") != seen_controls.end())
+    spring_history_decay_ = parseDecay(readControl("spring_history_decay"),
                                        "spring_history_decay");
-  if (seen_attributes.find("spring_maximum_update_norm_squared") != seen_attributes.end())
+  if (seen_controls.find("spring_maximum_update_norm_squared") != seen_controls.end())
     spring_maximum_update_norm_squared_ = parseNonnegativeReal(
-        readAttribute(training_node, "spring_maximum_update_norm_squared"),
+        readControl("spring_maximum_update_norm_squared"),
         "spring_maximum_update_norm_squared");
-  if (seen_attributes.find("krylov_relative_tolerance") != seen_attributes.end())
+  if (seen_controls.find("krylov_relative_tolerance") != seen_controls.end())
     krylov_relative_tolerance_ = parseNonnegativeReal(
-        readAttribute(training_node, "krylov_relative_tolerance"), "krylov_relative_tolerance");
-  if (seen_attributes.find("krylov_absolute_tolerance") != seen_attributes.end())
+        readControl("krylov_relative_tolerance"), "krylov_relative_tolerance");
+  if (seen_controls.find("krylov_absolute_tolerance") != seen_controls.end())
     krylov_absolute_tolerance_ = parseNonnegativeReal(
-        readAttribute(training_node, "krylov_absolute_tolerance"), "krylov_absolute_tolerance");
-  if (seen_attributes.find("krylov_maximum_iterations") != seen_attributes.end())
-    krylov_maximum_iterations_ = parsePositiveSize(readAttribute(training_node, "krylov_maximum_iterations"),
+        readControl("krylov_absolute_tolerance"), "krylov_absolute_tolerance");
+  if (seen_controls.find("krylov_maximum_iterations") != seen_controls.end())
+    krylov_maximum_iterations_ = parsePositiveSize(readControl("krylov_maximum_iterations"),
                                                    "krylov_maximum_iterations");
-  if (seen_attributes.find("krylov_maximum_operator_applications") != seen_attributes.end())
+  if (seen_controls.find("krylov_maximum_operator_applications") != seen_controls.end())
     krylov_maximum_operator_applications_ = parsePositiveSize(
-        readAttribute(training_node, "krylov_maximum_operator_applications"),
+        readControl("krylov_maximum_operator_applications"),
         "krylov_maximum_operator_applications");
-  if (seen_attributes.find("krylov_maximum_seconds") != seen_attributes.end())
-    krylov_maximum_seconds_ = parseNonnegativeReal(readAttribute(training_node, "krylov_maximum_seconds"),
+  if (seen_controls.find("krylov_maximum_seconds") != seen_controls.end())
+    krylov_maximum_seconds_ = parseNonnegativeReal(readControl("krylov_maximum_seconds"),
                                                    "krylov_maximum_seconds");
-  if (seen_attributes.find("krylov_stagnation_window") != seen_attributes.end())
-    krylov_stagnation_window_ = parseNonnegativeSize(readAttribute(training_node, "krylov_stagnation_window"),
+  if (seen_controls.find("krylov_stagnation_window") != seen_controls.end())
+    krylov_stagnation_window_ = parseNonnegativeSize(readControl("krylov_stagnation_window"),
                                                      "krylov_stagnation_window");
-  if (seen_attributes.find("krylov_minimum_relative_improvement") != seen_attributes.end())
+  if (seen_controls.find("krylov_minimum_relative_improvement") != seen_controls.end())
     krylov_minimum_relative_improvement_ = parseNonnegativeReal(
-        readAttribute(training_node, "krylov_minimum_relative_improvement"),
+        readControl("krylov_minimum_relative_improvement"),
         "krylov_minimum_relative_improvement");
-  if (seen_attributes.find("krylov_curvature_tolerance") != seen_attributes.end())
+  if (seen_controls.find("krylov_curvature_tolerance") != seen_controls.end())
     krylov_curvature_tolerance_ = parseNonnegativeReal(
-        readAttribute(training_node, "krylov_curvature_tolerance"), "krylov_curvature_tolerance");
-  if (seen_attributes.find("krylov_imaginary_tolerance") != seen_attributes.end())
+        readControl("krylov_curvature_tolerance"), "krylov_curvature_tolerance");
+  if (seen_controls.find("krylov_imaginary_tolerance") != seen_controls.end())
   {
     krylov_imaginary_tolerance_ = parseFiniteReal(
-        readAttribute(training_node, "krylov_imaginary_tolerance"), "krylov_imaginary_tolerance");
+        readControl("krylov_imaginary_tolerance"), "krylov_imaginary_tolerance");
     if (!(krylov_imaginary_tolerance_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: krylov_imaginary_tolerance must be positive");
   }
-  if (seen_attributes.find("maximum_retained_bytes") != seen_attributes.end())
-    maximum_retained_bytes_ = parseNonnegativeSize(readAttribute(training_node, "maximum_retained_bytes"),
+  if (seen_controls.find("maximum_retained_bytes") != seen_controls.end())
+    maximum_retained_bytes_ = parseNonnegativeSize(readControl("maximum_retained_bytes"),
                                                    "maximum_retained_bytes");
-  if (seen_attributes.find("checkpoint_path") != seen_attributes.end())
-    checkpoint_path_ = readAttribute(training_node, "checkpoint_path");
-  if (seen_attributes.find("restart_path") != seen_attributes.end())
-    restart_path_ = readAttribute(training_node, "restart_path");
-  if (seen_attributes.find("provider") != seen_attributes.end())
+  if (seen_controls.find("checkpoint_path") != seen_controls.end())
+    checkpoint_path_ = readControl("checkpoint_path");
+  if (seen_controls.find("restart_path") != seen_controls.end())
+    restart_path_ = readControl("restart_path");
+  if (seen_controls.find("provider") != seen_controls.end())
   {
-    provider_id_ = readAttribute(training_node, "provider");
+    provider_id_ = readControl("provider");
     if (provider_id_.empty())
       throw UniformCommunicateError("WFTrainDriverInput: provider must not be empty when specified");
   }
-  if (seen_attributes.find("teacher") != seen_attributes.end())
+  if (seen_controls.find("teacher") != seen_controls.end())
   {
-    teacher_wavefunction_ = readAttribute(training_node, "teacher");
+    teacher_wavefunction_ = readControl("teacher");
     if (teacher_wavefunction_.empty())
       throw UniformCommunicateError("WFTrainDriverInput: teacher must not be empty when specified");
   }
-  if (seen_attributes.find("overlap_target") != seen_attributes.end())
+  if (seen_controls.find("overlap_target") != seen_controls.end())
   {
-    const std::string target = readAttribute(training_node, "overlap_target");
+    const std::string target = readControl("overlap_target");
     if (target == "general")
       overlap_target_ = OverlapTarget::GENERAL_FROZEN_TEACHER;
     else if (target == "top_coefficients")
@@ -498,9 +555,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       throw UniformCommunicateError(
           "WFTrainDriverInput: overlap_target must be general or top_coefficients");
   }
-  if (seen_attributes.find("overlap_weighting") != seen_attributes.end())
+  if (seen_controls.find("overlap_weighting") != seen_controls.end())
   {
-    const std::string weighting = readAttribute(training_node, "overlap_weighting");
+    const std::string weighting = readControl("overlap_weighting");
     if (weighting == "equal")
       overlap_weighting_ = OverlapWeighting::EQUAL;
     else if (weighting == "coefficient_squared")
@@ -509,30 +566,30 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       throw UniformCommunicateError(
           "WFTrainDriverInput: overlap_weighting must be equal or coefficient_squared");
   }
-  if (seen_attributes.find("target_provenance") != seen_attributes.end())
+  if (seen_controls.find("target_provenance") != seen_controls.end())
   {
-    target_provenance_ = readAttribute(training_node, "target_provenance");
+    target_provenance_ = readControl("target_provenance");
     if (target_provenance_.empty())
       throw UniformCommunicateError(
           "WFTrainDriverInput: target_provenance must not be empty when specified");
   }
-  if (seen_attributes.find("minimum_fidelity") != seen_attributes.end())
+  if (seen_controls.find("minimum_fidelity") != seen_controls.end())
   {
-    minimum_fidelity_ = parseFiniteReal(readAttribute(training_node, "minimum_fidelity"),
+    minimum_fidelity_ = parseFiniteReal(readControl("minimum_fidelity"),
                                         "minimum_fidelity");
     if (minimum_fidelity_ < 0.0 || minimum_fidelity_ > 1.0)
       throw UniformCommunicateError("WFTrainDriverInput: minimum_fidelity must lie in [0, 1]");
   }
-  if (seen_attributes.find("minimum_effective_samples") != seen_attributes.end())
+  if (seen_controls.find("minimum_effective_samples") != seen_controls.end())
     minimum_effective_samples_ = parseNonnegativeReal(
-        readAttribute(training_node, "minimum_effective_samples"),
+        readControl("minimum_effective_samples"),
         "minimum_effective_samples");
 
   const std::initializer_list<std::string_view> overlap_attributes = {
       "teacher", "overlap_target", "overlap_weighting", "target_provenance",
       "minimum_fidelity", "minimum_effective_samples"};
   if (objective_ == Objective::ENERGY)
-    rejectAttributes(seen_attributes, overlap_attributes, "energy objective");
+    rejectControls(seen_controls, overlap_attributes, "energy objective");
   else
   {
     if (teacher_wavefunction_.empty() || target_provenance_.empty())
@@ -572,54 +629,54 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   {
   case Optimizer::SGD:
   case Optimizer::MOMENTUM_SGD:
-    rejectAttributes(seen_attributes, adam_attributes, "first-order");
+    rejectControls(seen_controls, adam_attributes, "first-order");
     [[fallthrough]];
   case Optimizer::RMSPROP:
     if (optimizer_ == Optimizer::RMSPROP)
-      rejectAttributes(seen_attributes, {"adam_beta1", "adam_beta2"}, "rmsprop");
+      rejectControls(seen_controls, {"adam_beta1", "adam_beta2"}, "rmsprop");
     [[fallthrough]];
   case Optimizer::AMSGRAD:
   case Optimizer::ADAM:
-    rejectAttributes(seen_attributes, matrix_free_attributes, "first-order");
+    rejectControls(seen_controls, matrix_free_attributes, "first-order");
     break;
   case Optimizer::LINEAR_METHOD:
   case Optimizer::ACCELERATED_LINEAR_METHOD:
   case Optimizer::KFAC:
-    rejectAttributes(seen_attributes, adam_attributes, "lm/alm/kfac");
-    rejectAttributes(seen_attributes, spring_only_attributes, "lm/alm/kfac");
-    rejectAttributes(seen_attributes, pii_only_attributes, "lm/alm/kfac");
-    rejectAttributes(seen_attributes, sr_only_attributes, "lm/alm/kfac");
-    rejectAttributes(seen_attributes, minimum_step_attributes, "lm/alm/kfac");
+    rejectControls(seen_controls, adam_attributes, "lm/alm/kfac");
+    rejectControls(seen_controls, spring_only_attributes, "lm/alm/kfac");
+    rejectControls(seen_controls, pii_only_attributes, "lm/alm/kfac");
+    rejectControls(seen_controls, sr_only_attributes, "lm/alm/kfac");
+    rejectControls(seen_controls, minimum_step_attributes, "lm/alm/kfac");
     // These solvers use residual/action/time limits, not the CG-specific
     // stagnation, curvature or imaginary-part policy of the SR solver.
-    rejectAttributes(seen_attributes, {"krylov_stagnation_window",
+    rejectControls(seen_controls, {"krylov_stagnation_window",
         "krylov_minimum_relative_improvement", "krylov_curvature_tolerance",
         "krylov_imaginary_tolerance"}, "lm/alm/kfac");
     if (optimizer_ == Optimizer::KFAC)
-      rejectAttributes(seen_attributes, {"krylov_relative_tolerance", "krylov_absolute_tolerance",
+      rejectControls(seen_controls, {"krylov_relative_tolerance", "krylov_absolute_tolerance",
           "krylov_maximum_iterations", "krylov_maximum_operator_applications",
           "krylov_maximum_seconds"}, "kfac");
     if (damping_ <= 0.0)
       throw UniformCommunicateError("LM/ALM/KFAC require positive damping");
     break;
   case Optimizer::STOCHASTIC_RECONFIGURATION:
-    rejectAttributes(seen_attributes, adam_attributes, "sr");
-    rejectAttributes(seen_attributes, minimum_step_attributes, "sr");
-    rejectAttributes(seen_attributes, spring_only_attributes, "sr");
-    rejectAttributes(seen_attributes, pii_only_attributes, "sr");
+    rejectControls(seen_controls, adam_attributes, "sr");
+    rejectControls(seen_controls, minimum_step_attributes, "sr");
+    rejectControls(seen_controls, spring_only_attributes, "sr");
+    rejectControls(seen_controls, pii_only_attributes, "sr");
     break;
   case Optimizer::MINIMUM_STEP_SR:
-    rejectAttributes(seen_attributes, adam_attributes, "minsr");
-    rejectAttributes(seen_attributes, sr_only_attributes, "minsr");
-    rejectAttributes(seen_attributes, spring_only_attributes, "minsr");
-    rejectAttributes(seen_attributes, pii_only_attributes, "minsr");
+    rejectControls(seen_controls, adam_attributes, "minsr");
+    rejectControls(seen_controls, sr_only_attributes, "minsr");
+    rejectControls(seen_controls, spring_only_attributes, "minsr");
+    rejectControls(seen_controls, pii_only_attributes, "minsr");
     if (!(damping_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"minsr\" requires positive damping");
     break;
   case Optimizer::SPRING:
-    rejectAttributes(seen_attributes, adam_attributes, "spring");
-    rejectAttributes(seen_attributes, sr_only_attributes, "spring");
-    rejectAttributes(seen_attributes, pii_only_attributes, "spring");
+    rejectControls(seen_controls, adam_attributes, "spring");
+    rejectControls(seen_controls, sr_only_attributes, "spring");
+    rejectControls(seen_controls, pii_only_attributes, "spring");
     if (!(damping_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"spring\" requires positive damping");
     break;
@@ -628,21 +685,21 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   {
     const std::string optimizer = optimizer_ == Optimizer::PROJECTED_INVERSE_ITERATION
         ? "pii" : "minpii";
-    rejectAttributes(seen_attributes, adam_attributes, optimizer);
-    rejectAttributes(seen_attributes, sr_non_pii_attributes, optimizer);
-    rejectAttributes(seen_attributes, {"center_shift"}, optimizer);
-    rejectAttributes(seen_attributes, spring_only_attributes, optimizer);
+    rejectControls(seen_controls, adam_attributes, optimizer);
+    rejectControls(seen_controls, sr_non_pii_attributes, optimizer);
+    rejectControls(seen_controls, {"center_shift"}, optimizer);
+    rejectControls(seen_controls, spring_only_attributes, optimizer);
     if (!(damping_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"" + optimizer +
                                     "\" requires positive damping");
     if (pii_shift_mode_ == PIIShiftMode::EXPLICIT)
     {
-      if (seen_attributes.find("pii_explicit_tau") == seen_attributes.end())
+      if (seen_controls.find("pii_explicit_tau") == seen_controls.end())
         throw UniformCommunicateError("WFTrainDriverInput: pii_shift_mode=\"explicit\" requires pii_explicit_tau");
-      rejectAttributes(seen_attributes, {"pii_energy_undershoot"}, optimizer);
+      rejectControls(seen_controls, {"pii_energy_undershoot"}, optimizer);
     }
     else
-      rejectAttributes(seen_attributes, {"pii_explicit_tau"}, optimizer);
+      rejectControls(seen_controls, {"pii_explicit_tau"}, optimizer);
     break;
   }
   }
@@ -651,18 +708,18 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     throw UniformCommunicateError(
         "WFTrainDriverInput: matrix-free optimization requires a positive Krylov tolerance");
   if (optimizer_ != Optimizer::MOMENTUM_SGD)
-    rejectAttributes(seen_attributes, {"momentum_decay"}, "selected optimizer");
+    rejectControls(seen_controls, {"momentum_decay"}, "selected optimizer");
   if (optimizer_ != Optimizer::RMSPROP)
-    rejectAttributes(seen_attributes, {"rms_decay"}, "selected optimizer");
+    rejectControls(seen_controls, {"rms_decay"}, "selected optimizer");
   if (!lm_optimizer)
-    rejectAttributes(seen_attributes, {"lm_overlap_shift", "lm_normalization_xi",
+    rejectControls(seen_controls, {"lm_overlap_shift", "lm_normalization_xi",
         "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
         "lm_inner_relative_tolerance"}, "selected optimizer");
   else if (optimizer_ != Optimizer::ACCELERATED_LINEAR_METHOD)
-    rejectAttributes(seen_attributes, {"lm_inner_iterations", "lm_inner_restart_length",
+    rejectControls(seen_controls, {"lm_inner_iterations", "lm_inner_restart_length",
         "lm_inner_relative_tolerance"}, "lm");
   if (optimizer_ != Optimizer::KFAC)
-    rejectAttributes(seen_attributes, {"kfac_fallback_damping"}, "selected optimizer");
+    rejectControls(seen_controls, {"kfac_fallback_damping"}, "selected optimizer");
 }
 
 } // namespace qmcplusplus

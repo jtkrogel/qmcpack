@@ -449,31 +449,78 @@ remain real, even in a complex QMCPACK build. This route is distinct from the
 legacy optimization drivers. Initialize PsiFormer internally or load a compatible
 parameter export, set ``optimize="yes"``, and choose the active parameter scope.
 
-For example, a bounded accelerated linear-method step can be requested with:
+For example, two bounded accelerated linear-method iterations can be requested with:
 
 .. code-block:: xml
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="alm" learning_rate="1"
-              damping="0.01" lm_overlap_shift="0.0001"
-              lm_maximum_subspace_dimension="8"
-              lm_inner_iterations="8" lm_inner_restart_length="4"
-              lm_inner_relative_tolerance="0.1"
-              krylov_relative_tolerance="0.001"
-              krylov_maximum_iterations="30"
-              krylov_maximum_operator_applications="100"
-              maximum_update_norm="0.01"/>
+    <training objective="energy" optimizer="alm">
+      <parameter name="iterations">2</parameter>
+      <parameter name="warmupsteps">0</parameter>
+      <parameter name="learning_rate">1</parameter>
+      <parameter name="damping">0.01</parameter>
+      <parameter name="lm_overlap_shift">0.0001</parameter>
+      <parameter name="lm_maximum_subspace_dimension">8</parameter>
+      <parameter name="lm_inner_iterations">8</parameter>
+      <parameter name="lm_inner_restart_length">4</parameter>
+      <parameter name="lm_inner_relative_tolerance">0.1</parameter>
+      <parameter name="krylov_relative_tolerance">0.001</parameter>
+      <parameter name="krylov_maximum_iterations">30</parameter>
+      <parameter name="krylov_maximum_operator_applications">100</parameter>
+      <parameter name="maximum_update_norm">0.01</parameter>
+    </training>
     <parameter name="walkers_per_rank">16</parameter>
     <parameter name="crowds">1</parameter>
-    <parameter name="blocks">2</parameter>
+    <parameter name="blocks">1</parameter>
     <parameter name="steps">1</parameter>
     <parameter name="substeps">1</parameter>
     <parameter name="timestep">0.01</parameter>
     <parameter name="usedrift">no</parameter>
   </qmc>
 
+Only ``objective`` and ``optimizer`` are training attributes; all other training
+controls are named ``parameter`` children. Obsolete scalar attributes are rejected
+with migration guidance rather than silently changing an existing run's meaning.
+``iterations`` defaults to one and counts optimizer-update attempts independently
+of statistical blocks. At fixed parameters, each iteration collects
+``walkers * blocks * steps`` configurations, then computes streamed derivative
+reductions and applies one update. ``steps`` defaults to one when omitted.
+``substeps`` counts MC advances between retained configurations: an all-particle
+move or a particle-by-particle sweep, according to the move mode. Intermediate
+substeps are not retained optimization samples.
+
+The ``qmc`` warmup is initial equilibration. The separate ``training``
+``warmupsteps`` defaults to zero and discards additional advances before every
+iteration, including the first; both warmups honor ``substeps``. Population
+positions continue across iterations. Statistical scalar blocks describe sampling
+at the current parameter version, not optimizer-update boundaries. Matrix-free
+solvers revisit the retained samples without storing a samples-by-parameters
+matrix. Line-search endpoint warmup and sampling remain separate controls.
+Repeated configurations from the same walker share a chain identity in the
+line-search uncertainty calculation; importance-weight ESS alone does not
+measure serial independence.
+
+Retained samples also require configuration storage and per-snapshot derivative
+workspaces; increasing blocks or steps increases memory and derivative work.
+The numeric storage budget includes copied position/gradient/Laplacian arrays,
+but is not a process-RSS ceiling and excludes opaque teacher-clone caches and
+allocator overhead. Workspace sharing across snapshots remains a later
+performance improvement. ``samples`` is rejected for this driver: specify
+walkers, blocks and steps instead.
+
+Exact training checkpoints are taken only after a complete iteration. A qmc
+checkpoint period counts statistical blocks; crossing its boundary schedules
+the training checkpoint at the end of the encompassing iteration.
+
+To migrate the earlier final-population behavior, move the old ``blocks`` count
+to training ``iterations``, set sampling ``blocks=1`` and ``steps=1``, and multiply
+the old ``substeps`` by the old ``steps``. This preserves production chain
+advancement and update sample counts as closely as possible, but changes scalar
+statistics by omitting intermediate energy measurements. Initial warmup may
+also advance farther if ``substeps`` is increased.
+
 The numerical choices above illustrate input syntax, not recommended production
-hyperparameters. Optimizer-specific attributes supplied to another method are
+hyperparameters. Optimizer-specific parameters supplied to another method are
 rejected. All routes use the common publication, cache refresh, proposal scaling,
 typed weight decay, and optional line-search machinery; failed eigensolves do not
 publish parameters.
@@ -520,7 +567,7 @@ provider, reduces their factors across ranks, and applies damped Kronecker
 inverses to the sampled energy gradient. Trainable parameters not belonging to
 an observed affine block use a diagonal fallback, controlled by
 ``kfac_fallback_damping`` (0.001). ``damping`` (0.001) stabilizes the affine factors.
-The initial live route rebuilds factors each training block; it does not retain
+The initial live route rebuilds factors each training iteration; it does not retain
 factor EMA or momentum history. Providers without affine observations fail
 explicitly. No Krylov controls are accepted because this update uses direct
 factor solves rather than an iterative solve.

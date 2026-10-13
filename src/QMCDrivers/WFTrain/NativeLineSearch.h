@@ -25,6 +25,7 @@ double selectNativeStep(
     TrialWaveFunction& prototype, QMCHamiltonian& hamiltonian,
     const std::string& provider_id,
     const std::vector<std::reference_wrapper<ParticleSet>>& configurations,
+    const std::vector<std::size_t>& configuration_chain_ids,
     const std::vector<std::reference_wrapper<TrialWaveFunction>>& teachers,
     RandomBase<double>& production_rng, double timestep,
     const StructuredParameterSnapshot& old_parameters,

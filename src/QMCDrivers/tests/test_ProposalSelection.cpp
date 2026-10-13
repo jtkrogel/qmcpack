@@ -105,11 +105,11 @@ TEST_CASE("Proposal expansion respects final displacement bound", "[drivers][tra
   CHECK(selection.displacementNorm() == Catch::Approx(1.0));
 }
 
-TEST_CASE("Line-search controls parse strictly with backwards compatible defaults", "[drivers][training][selection]")
+TEST_CASE("Line-search parameters parse strictly with unchanged numerical defaults", "[drivers][training][selection]")
 {
-  auto parse = [](const std::string& attributes) {
+  auto parse = [](const std::string& parameters) {
     Libxml2Document document;
-    REQUIRE(document.parseFromString("<qmc><training " + attributes + "/></qmc>"));
+    REQUIRE(document.parseFromString("<qmc><training>" + parameters + "</training></qmc>"));
     WFTrainDriverInput input;
     input.readXML(document.getRoot());
     return input;
@@ -118,19 +118,27 @@ TEST_CASE("Line-search controls parse strictly with backwards compatible default
   CHECK(defaults.getLineSearch() == WFTrainDriverInput::LineSearch::OFF);
   CHECK(defaults.getUpdateScale() == 1.0);
   CHECK(defaults.getWeightDecay() == 0.0);
-  const auto input = parse("line_search=\"endpoints\" update_scale=\"0.25\" weight_decay=\"0.001\" "
-                           "weight_decay_scope=\"nn_weights\" line_search_warmup_steps=\"3\" "
-                           "line_search_sampling_steps=\"4\"");
+  const auto input = parse(R"(
+    <parameter name="line_search">endpoints</parameter>
+    <parameter name="update_scale">0.25</parameter>
+    <parameter name="weight_decay">0.001</parameter>
+    <parameter name="weight_decay_scope">nn_weights</parameter>
+    <parameter name="line_search_warmup_steps">3</parameter>
+    <parameter name="line_search_sampling_steps">4</parameter>
+  )");
   CHECK(input.getLineSearch() == WFTrainDriverInput::LineSearch::ENDPOINTS);
   CHECK(input.getUpdateScale() == 0.25);
   CHECK(input.getWeightDecay() == 0.001);
   CHECK(input.getLineSearchWarmupSteps() == 3);
   CHECK(input.getLineSearchSamplingSteps() == 4);
-  for (const auto& invalid : {"line_search=\"unknown\"", "update_scale=\"-1\"",
-                              "weight_decay=\"1\"", "weight_decay_scope=\"all\"",
-                              "line_search_minimum_ess_fraction=\"0\"",
-                              "line_search_maximum_weight=\"2\"", "line_search_sampling_steps=\"0\""})
+  for (const auto& invalid : {
+           R"(<parameter name="line_search">unknown</parameter>)",
+           R"(<parameter name="update_scale">-1</parameter>)",
+           R"(<parameter name="weight_decay">1</parameter>)",
+           R"(<parameter name="weight_decay_scope">all</parameter>)",
+           R"(<parameter name="line_search_minimum_ess_fraction">0</parameter>)",
+           R"(<parameter name="line_search_maximum_weight">2</parameter>)",
+           R"(<parameter name="line_search_sampling_steps">0</parameter>)"})
     CHECK_THROWS(parse(invalid));
 }
 }
-

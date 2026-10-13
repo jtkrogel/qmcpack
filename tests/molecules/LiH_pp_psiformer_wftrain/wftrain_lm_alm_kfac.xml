@@ -48,10 +48,17 @@
   </hamiltonian>
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="lm" learning_rate="1e-12"
-              parameter_chunk_size="4096" damping="0.1" lm_overlap_shift="0.01"
-              maximum_update_norm="0.01" krylov_relative_tolerance="0.1"
-              krylov_maximum_iterations="30" krylov_maximum_operator_applications="100"/>
+    <training objective="energy" optimizer="lm">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-12</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+      <parameter name="damping">0.1</parameter>
+      <parameter name="lm_overlap_shift">0.01</parameter>
+      <parameter name="maximum_update_norm">0.01</parameter>
+      <parameter name="krylov_relative_tolerance">0.1</parameter>
+      <parameter name="krylov_maximum_iterations">30</parameter>
+      <parameter name="krylov_maximum_operator_applications">100</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -63,12 +70,20 @@
   </qmc>
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="alm" learning_rate="1e-12"
-              parameter_chunk_size="4096" damping="0.1" lm_overlap_shift="0.01"
-              maximum_update_norm="0.01" krylov_relative_tolerance="0.1"
-              krylov_maximum_iterations="30" krylov_maximum_operator_applications="100"
-              lm_inner_iterations="4" lm_inner_restart_length="4"
-              lm_inner_relative_tolerance="0.5"/>
+    <training objective="energy" optimizer="alm">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-12</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+      <parameter name="damping">0.1</parameter>
+      <parameter name="lm_overlap_shift">0.01</parameter>
+      <parameter name="maximum_update_norm">0.01</parameter>
+      <parameter name="krylov_relative_tolerance">0.1</parameter>
+      <parameter name="krylov_maximum_iterations">30</parameter>
+      <parameter name="krylov_maximum_operator_applications">100</parameter>
+      <parameter name="lm_inner_iterations">4</parameter>
+      <parameter name="lm_inner_restart_length">4</parameter>
+      <parameter name="lm_inner_relative_tolerance">0.5</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>
@@ -80,8 +95,13 @@
   </qmc>
 
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
-    <training objective="energy" optimizer="kfac" learning_rate="1e-12"
-              parameter_chunk_size="4096" damping="0.1" maximum_update_norm="0.01"/>
+    <training objective="energy" optimizer="kfac">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-12</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+      <parameter name="damping">0.1</parameter>
+      <parameter name="maximum_update_norm">0.01</parameter>
+    </training>
     <parameter name="walkers_per_rank">2</parameter>
     <parameter name="crowds">1</parameter>
     <parameter name="blocks">1</parameter>

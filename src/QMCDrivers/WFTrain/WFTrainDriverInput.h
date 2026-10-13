@@ -16,7 +16,7 @@
 namespace qmcplusplus
 {
 
-/** Strict, typed input for the high-parameter wavefunction-training driver. */
+/** Strict training input: objective/optimizer attributes and named scalar parameters. */
 class WFTrainDriverInput
 {
 public:
@@ -71,6 +71,12 @@ public:
 
   /** Parse exactly one nested training section from a qmc driver node. */
   void readXML(xmlNodePtr qmc_node);
+
+  /** Return optimizer updates, independent of statistical sample blocks. */
+  std::size_t getIterations() const noexcept { return iterations_; }
+
+  /** Return discarded MC advances before every iteration's sample collection. */
+  std::size_t getWarmupSteps() const noexcept { return warmup_steps_; }
 
   Objective getObjective() const noexcept { return objective_; }
   LineSearch getLineSearch() const noexcept { return line_search_; }
@@ -145,6 +151,8 @@ public:
   double getMinimumEffectiveSamples() const noexcept { return minimum_effective_samples_; }
 
 private:
+  std::size_t iterations_{1};
+  std::size_t warmup_steps_{0};
   double momentum_decay_{0.9};
   double rms_decay_{0.9};
   double lm_overlap_shift_{1.0e-4};

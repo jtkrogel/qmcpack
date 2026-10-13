@@ -4,6 +4,33 @@
 # emitted only after refresh succeeds, so its presence is the application-level
 # completion criterion.
 if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  foreach(POOLED_CASE optimizers search)
+    set(TEST_ADDED FALSE)
+    set(POOLED_TEST short-H2-psiformer-wftrain-pooled-${POOLED_CASE}-r1-t1)
+    run_qmc_app(${POOLED_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+                1 1 TEST_ADDED wftrain_pooled_${POOLED_CASE}.xml)
+    if(TEST_ADDED)
+      if(POOLED_CASE STREQUAL "optimizers")
+        set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
+                     "samples 8 mean_energy.*optimizer kfac")
+      else()
+        set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
+                     "WFTrain iteration 2.*samples 8 mean_energy")
+      endif()
+    endif()
+  endforeach()
+  # Independent iteration and sample counts: 2 walkers/rank * 2 blocks * 2 steps.
+  foreach(POOLED_RANKS 1 2)
+    set(POOLED_TEST short-H2-psiformer-wftrain-pooled-r${POOLED_RANKS}-t1)
+    set(TEST_ADDED FALSE)
+    run_qmc_app(${POOLED_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+                ${POOLED_RANKS} 1 TEST_ADDED wftrain_pooled.xml)
+    if(TEST_ADDED)
+      math(EXPR POOLED_SAMPLES "8 * ${POOLED_RANKS}")
+      set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
+                   "WFTrain iteration 2 version 2 samples ${POOLED_SAMPLES} mean_energy")
+    endif()
+  endforeach()
   foreach(SEARCH_CASE reference endpoints overlap_search rejected)
     foreach(SEARCH_RANKS 1 2)
       set(SEARCH_TEST short-H2-psiformer-search-${SEARCH_CASE}-r${SEARCH_RANKS}-t1)
