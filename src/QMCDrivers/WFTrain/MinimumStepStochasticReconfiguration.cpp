@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file MinimumStepStochasticReconfiguration.cpp
- * @brief Weighted score factorization, distributed sample PCG, minSR, and SPRING.
+ * @brief Weighted score products and matrix-free minSR, SPRING, PII, and MinPII.
  */
 
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
@@ -102,6 +102,54 @@ private:
   DerivativeArrayView<DerivativeValue> destination_;
 };
 
+/// Collect one exact term-masked local-energy JVP into preallocated storage.
+class LocalEnergyJVPCollector final : public SampleProductSink
+{
+public:
+  LocalEnergyJVPCollector(const StreamingDerivativeOperator& derivative_operator,
+                          std::uint32_t term_mask,
+                          DerivativeArrayView<DerivativeValue> destination)
+      : derivative_operator_(derivative_operator), term_mask_(term_mask),
+        destination_(destination)
+  {}
+
+protected:
+  void onBegin(const DerivativeStreamDescriptor& descriptor) override
+  {
+    if (descriptor.provider_id != derivative_operator_.parameterSchema().providerId() ||
+        descriptor.schema_fingerprint != derivative_operator_.parameterSchema().fingerprint() ||
+        descriptor.parameter_version != derivative_operator_.parameterVersion() ||
+        descriptor.product_mask != derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP) ||
+        descriptor.local_energy_term_mask != term_mask_ ||
+        descriptor.batch_ordinal != derivative_operator_.batchOrdinal() ||
+        descriptor.sample_offset != derivative_operator_.sampleOffset() ||
+        descriptor.sample_count != destination_.size())
+      throw std::invalid_argument("PII local-energy JVP stream identity mismatch");
+    const DerivativeReal sentinel = std::numeric_limits<DerivativeReal>::quiet_NaN();
+    std::fill(destination_.begin(), destination_.end(),
+              DerivativeValue{sentinel, sentinel});
+  }
+
+  void consume(const SampleProductTileConstView& tile) override
+  {
+    const std::size_t offset = tile.descriptor().sample_offset -
+        derivative_operator_.sampleOffset();
+    std::copy(tile.values().begin(), tile.values().end(), destination_.begin() + offset);
+  }
+
+  void onAbort() noexcept override
+  {
+    const DerivativeReal sentinel = std::numeric_limits<DerivativeReal>::quiet_NaN();
+    std::fill(destination_.begin(), destination_.end(),
+              DerivativeValue{sentinel, sentinel});
+  }
+
+private:
+  const StreamingDerivativeOperator& derivative_operator_;
+  std::uint32_t term_mask_;
+  DerivativeArrayView<DerivativeValue> destination_;
+};
+
 /// Accumulate one score VJP into a preallocated rank-local parameter vector.
 class ScoreVJPAccumulator final : public ParameterReductionSink
 {
@@ -162,6 +210,44 @@ void validateControl(const MinimumStepUpdateControl& control)
       !isFiniteTrainingReal(control.objective_tolerance) ||
       control.objective_tolerance < 0.0)
     throw std::invalid_argument("Minimum-step controls are invalid");
+}
+
+/// Validate bounded work, damping-retry, shift, and trust controls for PII.
+void validatePIIControl(const PIIUpdateControl& control)
+{
+  const KrylovSolverControl& krylov = control.gmres.krylov;
+  if (!isFiniteTrainingReal(control.learning_rate) || control.learning_rate <= 0.0 ||
+      !isFiniteTrainingReal(control.explicit_shift) ||
+      !isFiniteTrainingReal(control.energy_undershoot) || control.energy_undershoot < 0.0 ||
+      !isFiniteTrainingReal(control.damping) || control.damping <= 0.0 ||
+      !isFiniteTrainingReal(control.damping_multiplier) || control.damping_multiplier <= 1.0 ||
+      control.maximum_damping_retries > 64 ||
+      !isFiniteTrainingReal(control.maximum_update_norm) || control.maximum_update_norm < 0.0 ||
+      !isFiniteTrainingReal(control.objective_tolerance) || control.objective_tolerance < 0.0 ||
+      control.gmres.restart_length == 0 ||
+      !isFiniteTrainingReal(krylov.relative_tolerance) || krylov.relative_tolerance < 0.0 ||
+      !isFiniteTrainingReal(krylov.absolute_tolerance) || krylov.absolute_tolerance < 0.0 ||
+      (krylov.relative_tolerance == 0.0 && krylov.absolute_tolerance == 0.0) ||
+      !isFiniteTrainingReal(krylov.maximum_seconds) || krylov.maximum_seconds < 0.0 ||
+      !isFiniteTrainingReal(krylov.minimum_relative_improvement) ||
+      krylov.minimum_relative_improvement < 0.0 ||
+      !isFiniteTrainingReal(krylov.curvature_tolerance) ||
+      krylov.curvature_tolerance < 0.0 ||
+      !isFiniteTrainingReal(krylov.imaginary_tolerance) ||
+      krylov.imaginary_tolerance <= 0.0)
+    throw std::invalid_argument("PII controls are invalid");
+}
+
+/// Resolve the fixed or mean-energy shift for one PII proposal.
+DerivativeReal resolvePIIShift(const ScoreCovarianceFactor& factor,
+                               const PIIUpdateControl& control)
+{
+  const DerivativeReal shift = control.shift_mode == PIIShiftMode::EXPLICIT
+      ? control.explicit_shift
+      : factor.meanEnergy().real() - control.energy_undershoot;
+  if (!isFiniteTrainingReal(shift))
+    throw MatrixFreeNumericalError("PII shift is non-finite");
+  return shift;
 }
 
 /// Validate one update request and the score-covariance objective identity.
@@ -620,6 +706,126 @@ ScoreCovarianceStorageDiagnostics ScoreCovarianceFactor::storageDiagnostics() co
   return result;
 }
 
+ProjectedInverseIterationFactor::ProjectedInverseIterationFactor(
+    const ScoreCovarianceFactor& score_factor,
+    std::uint32_t local_energy_term_mask)
+    : score_factor_(score_factor), local_energy_term_mask_(local_energy_term_mask),
+      projected_direction_(score_factor.parameterSchema().parameterCount()),
+      score_products_(score_factor.localSampleVectorSize()),
+      local_energy_products_(score_factor.localSampleVectorSize())
+{
+  const std::uint32_t kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  if (local_energy_term_mask_ != kinetic)
+    throw std::invalid_argument(
+        "PII currently requires kinetic-only all-electron local-energy derivatives");
+  if (score_factor_.sampleDomain() != ScoreSampleDomain::REAL)
+    throw std::invalid_argument("PII currently requires a real sample-space factor");
+
+  for (const ScoreCovarianceFactor::BatchStorage& batch : score_factor_.batches_)
+  {
+    const StreamingDerivativeCapabilities capabilities =
+        batch.derivative_operator->capabilities();
+    if (!capabilities.supports(DerivativeProduct::LOCAL_ENERGY_JVP) ||
+        !capabilities.coversLocalEnergyTerms(local_energy_term_mask_) ||
+        capabilities.execution_domain != DerivativeExecutionDomain::HOST ||
+        capabilities.reduction_domain == ReductionDomain::GLOBAL ||
+        !capabilities.block_streaming || capabilities.maximum_vjp_channels == 0 ||
+        capabilities.maximum_parameter_chunk_size == 0 ||
+        capabilities.maximum_sample_tile_size == 0)
+      throw std::invalid_argument(
+          "PII derivative batch lacks bounded kinetic local-energy products");
+  }
+}
+
+void ProjectedInverseIterationFactor::applyShifted(
+    const StructuredParameterVectorConstView& direction,
+    DerivativeReal tau,
+    DerivativeArrayView<DerivativeValue> result) const
+{
+  score_factor_.validateParameterDirection(direction);
+  if (!isFiniteTrainingReal(tau) || result.size() != score_products_.size() ||
+      (!result.empty() && result.data() == nullptr))
+    throw std::invalid_argument("PII shifted-factor input is invalid");
+
+  std::copy(direction.values().begin(), direction.values().end(),
+            projected_direction_.begin());
+  for (const ParameterBlockDescriptor& block : score_factor_.schema_.blocks())
+    if (!block.trainable)
+      std::fill(projected_direction_.begin() + block.offset,
+                projected_direction_.begin() + block.offset + block.count,
+                DerivativeValue{});
+  const StructuredParameterVectorConstView projected(
+      score_factor_.schema_, score_factor_.parameter_version_,
+      constView(projected_direction_));
+
+  std::exception_ptr failure;
+  try
+  {
+    for (const ScoreCovarianceFactor::BatchStorage& batch : score_factor_.batches_)
+    {
+      DerivativeArrayView<DerivativeValue> batch_local_energy{
+          batch.sample_products.empty()
+              ? nullptr
+              : local_energy_products_.data() + batch.sample_vector_offset,
+          batch.sample_products.size()};
+      LocalEnergyJVPCollector sink(*batch.derivative_operator,
+                                   local_energy_term_mask_,
+                                   batch_local_energy);
+      batch.derivative_operator->applyLocalEnergyJVP(
+          projected, local_energy_term_mask_, sink);
+      if (std::any_of(batch_local_energy.begin(), batch_local_energy.end(),
+                      [](DerivativeValue value) {
+                        return !isFinite(value) || value.imag() != 0.0;
+                      }))
+        throw MatrixFreeNumericalError(
+            "Real PII factor produced a complex or non-finite local-energy JVP");
+    }
+  }
+  catch (...)
+  {
+    failure = std::current_exception();
+  }
+  // Reach a collective agreement on local producer failure before applying O,
+  // whose score centering itself performs collectives.
+  score_factor_.reduceSampleScalar({}, failure);
+
+  score_factor_.apply(projected, mutableView(score_products_));
+  for (const ScoreCovarianceFactor::BatchStorage& batch : score_factor_.batches_)
+    for (std::size_t sample = 0; sample < batch.weights.size(); ++sample)
+    {
+      const std::size_t index = batch.sample_vector_offset + sample;
+      const DerivativeReal local_energy_jvp =
+          batch.sqrt_normalized_weights[sample] * local_energy_products_[index].real();
+      result[index] = {local_energy_jvp +
+          (batch.local_energies[sample].real() - tau) * score_products_[index].real(),
+          0.0};
+    }
+}
+
+ProjectedInverseIterationOperator::ProjectedInverseIterationOperator(
+    const ProjectedInverseIterationFactor& factor,
+    DerivativeReal tau,
+    DerivativeReal damping)
+    : MatrixFreeLinearOperator(factor.scoreFactor().parameterSchema(),
+                               factor.scoreFactor().parameterVersion(),
+                               ReductionDomain::GLOBAL, false),
+      factor_(factor), tau_(tau), damping_(damping),
+      sample_scratch_(factor.scoreFactor().localSampleVectorSize())
+{
+  if (!isFiniteTrainingReal(tau_) || !isFiniteTrainingReal(damping_) || damping_ <= 0.0)
+    throw std::invalid_argument("Full PII shift or damping is invalid");
+}
+
+void ProjectedInverseIterationOperator::evaluate(
+    const StructuredParameterVectorConstView& direction,
+    DerivativeArrayView<DerivativeValue> result) const
+{
+  factor_.applyShifted(direction, tau_, mutableView(sample_scratch_));
+  factor_.scoreFactor().applyAdjoint(constView(sample_scratch_), result);
+  for (std::size_t parameter = 0; parameter < result.size(); ++parameter)
+    result[parameter] += damping_ * direction.values()[parameter];
+}
+
 DistributedSampleLinearOperator::DistributedSampleLinearOperator(
     const ScoreCovarianceFactor& factor,
     bool hermitian)
@@ -695,6 +901,33 @@ void MinimumStepSampleOperator::evaluate(
   for (std::size_t index = 0; index < result.size(); ++index)
     result[index] += damping_ * direction[index];
   factor().addCenterProjector(direction, center_shift_, result);
+}
+
+MinimumProjectedInverseIterationOperator::MinimumProjectedInverseIterationOperator(
+    const ProjectedInverseIterationFactor& factor,
+    DerivativeReal tau,
+    DerivativeReal damping)
+    : DistributedSampleLinearOperator(factor.scoreFactor(), false),
+      pii_factor_(factor), tau_(tau), damping_(damping),
+      parameter_scratch_(factor.scoreFactor().parameterSchema().parameterCount())
+{
+  if (!isFiniteTrainingReal(tau_) || !isFiniteTrainingReal(damping_) || damping_ <= 0.0)
+    throw std::invalid_argument("MinPII shift or damping is invalid");
+}
+
+void MinimumProjectedInverseIterationOperator::evaluate(
+    DerivativeArrayView<const DerivativeValue> direction,
+    DerivativeArrayView<DerivativeValue> result) const
+{
+  // The ordered product is B O^T, not O B^T: first lift the distributed
+  // sample vector through the score transpose, then apply the shifted PII factor.
+  factor().applyAdjoint(direction, mutableView(parameter_scratch_));
+  const StructuredParameterVectorConstView parameter_direction(
+      factor().parameterSchema(), factor().parameterVersion(),
+      constView(parameter_scratch_));
+  pii_factor_.applyShifted(parameter_direction, tau_, result);
+  for (std::size_t sample = 0; sample < result.size(); ++sample)
+    result[sample] += damping_ * direction[sample];
 }
 
 DistributedSampleKrylovResult solveDistributedSamplePCG(
@@ -856,6 +1089,450 @@ DistributedSampleKrylovResult solveDistributedSamplePCG(
   }
 }
 
+DistributedSampleKrylovResult solveDistributedSampleGMRES(
+    const DistributedSampleLinearOperator& linear_operator,
+    DerivativeArrayView<const DerivativeValue> right_hand_side,
+    const GMRESSolverControl& control,
+    DerivativeArrayView<const DerivativeValue> warm_start)
+{
+  const KrylovSolverControl& krylov = control.krylov;
+  if (right_hand_side.size() != linear_operator.descriptor().local_size ||
+      (!right_hand_side.empty() && right_hand_side.data() == nullptr) ||
+      (!warm_start.empty() &&
+       (warm_start.size() != right_hand_side.size() || warm_start.data() == nullptr)))
+    throw std::invalid_argument("Distributed sample GMRES vector extent mismatch");
+  if (control.restart_length == 0 ||
+      !isFiniteTrainingReal(krylov.relative_tolerance) || krylov.relative_tolerance < 0.0 ||
+      !isFiniteTrainingReal(krylov.absolute_tolerance) || krylov.absolute_tolerance < 0.0 ||
+      (krylov.relative_tolerance == 0.0 && krylov.absolute_tolerance == 0.0) ||
+      !isFiniteTrainingReal(krylov.maximum_seconds) || krylov.maximum_seconds < 0.0 ||
+      !isFiniteTrainingReal(krylov.minimum_relative_improvement) ||
+      krylov.minimum_relative_improvement < 0.0 ||
+      !isFiniteTrainingReal(krylov.curvature_tolerance) ||
+      krylov.curvature_tolerance < 0.0 ||
+      !isFiniteTrainingReal(krylov.imaginary_tolerance) ||
+      krylov.imaginary_tolerance <= 0.0)
+    throw std::invalid_argument("Distributed sample GMRES controls are invalid");
+
+  const std::size_t local_size = right_hand_side.size();
+  const std::size_t global_size = linear_operator.descriptor().global_size;
+  const std::size_t restart_length = std::min(control.restart_length, global_size);
+  if (restart_length == 0 || restart_length == std::numeric_limits<std::size_t>::max() ||
+      (local_size != 0 && restart_length + 1 >
+           std::numeric_limits<std::size_t>::max() / local_size) ||
+      restart_length > std::numeric_limits<std::size_t>::max() / (restart_length + 1))
+    throw std::length_error("Distributed sample GMRES workspace extent overflows size_t");
+
+  DistributedSampleKrylovResult result;
+  result.solution.assign(local_size, DerivativeValue{});
+  std::vector<DerivativeValue> residual(right_hand_side.begin(), right_hand_side.end());
+  std::vector<DerivativeValue> action(local_size);
+  std::vector<DerivativeValue> basis((restart_length + 1) * local_size);
+  std::vector<DerivativeValue> hessenberg((restart_length + 1) * restart_length);
+  std::vector<DerivativeReal> rotations_cosine(restart_length);
+  std::vector<DerivativeValue> rotations_sine(restart_length);
+  std::vector<DerivativeValue> least_squares_rhs(restart_length + 1);
+  std::vector<DerivativeValue> coefficients(restart_length);
+
+  auto basisView = [&](std::size_t column) {
+    return DerivativeArrayView<DerivativeValue>{
+        local_size == 0 ? nullptr : basis.data() + column * local_size, local_size};
+  };
+  auto constBasisView = [&](std::size_t column) {
+    return DerivativeArrayView<const DerivativeValue>{
+        local_size == 0 ? nullptr : basis.data() + column * local_size, local_size};
+  };
+  auto hessenbergAt = [&](std::size_t row, std::size_t column) -> DerivativeValue& {
+    return hessenberg[column * (restart_length + 1) + row];
+  };
+  const Clock::time_point start = Clock::now();
+  auto finish = [&](KrylovStopReason reason) {
+    result.stop_reason = reason;
+    result.converged = reason == KrylovStopReason::CONVERGED ||
+        reason == KrylovStopReason::ZERO_RIGHT_HAND_SIDE;
+    result.relative_residual_norm = result.initial_residual_norm == 0.0
+        ? 0.0 : result.final_residual_norm / result.initial_residual_norm;
+    result.elapsed_seconds = elapsedSeconds(start);
+  };
+
+  try
+  {
+    const DerivativeReal rhs_norm = linear_operator.norm(right_hand_side);
+    result.initial_residual_norm = rhs_norm;
+    result.final_residual_norm = rhs_norm;
+    if (rhs_norm == 0.0)
+    {
+      finish(KrylovStopReason::ZERO_RIGHT_HAND_SIDE);
+      return result;
+    }
+    if (!warm_start.empty())
+    {
+      std::copy(warm_start.begin(), warm_start.end(), result.solution.begin());
+      if (krylov.maximum_operator_applications == 0)
+      {
+        finish(KrylovStopReason::OPERATOR_APPLICATION_LIMIT);
+        return result;
+      }
+      linear_operator.apply(constView(result.solution), mutableView(action));
+      ++result.operator_applications;
+      for (std::size_t index = 0; index < local_size; ++index)
+        residual[index] -= action[index];
+      result.initial_residual_norm = linear_operator.norm(constView(residual));
+      result.final_residual_norm = result.initial_residual_norm;
+    }
+    const DerivativeReal target = std::max(
+        krylov.absolute_tolerance, krylov.relative_tolerance * rhs_norm);
+    if (result.final_residual_norm <= target)
+    {
+      finish(KrylovStopReason::CONVERGED);
+      return result;
+    }
+    if (krylov.maximum_iterations == 0)
+    {
+      finish(KrylovStopReason::ITERATION_LIMIT);
+      return result;
+    }
+
+    DerivativeReal best_residual = result.final_residual_norm;
+    std::size_t stagnant_iterations = 0;
+    while (true)
+    {
+      std::fill(hessenberg.begin(), hessenberg.end(), DerivativeValue{});
+      std::fill(rotations_cosine.begin(), rotations_cosine.end(), DerivativeReal{});
+      std::fill(rotations_sine.begin(), rotations_sine.end(), DerivativeValue{});
+      std::fill(least_squares_rhs.begin(), least_squares_rhs.end(), DerivativeValue{});
+      std::fill(coefficients.begin(), coefficients.end(), DerivativeValue{});
+
+      const DerivativeReal cycle_residual = result.final_residual_norm;
+      auto first_basis = basisView(0);
+      for (std::size_t index = 0; index < local_size; ++index)
+        first_basis[index] = residual[index] / cycle_residual;
+      least_squares_rhs[0] = {cycle_residual, 0.0};
+
+      KrylovStopReason pending_reason = KrylovStopReason::BREAKDOWN;
+      bool have_pending_reason = false;
+      std::size_t arnoldi_columns = 0;
+      for (std::size_t column = 0; column < restart_length; ++column)
+      {
+        if (result.operator_applications >= krylov.maximum_operator_applications)
+        {
+          pending_reason = KrylovStopReason::OPERATOR_APPLICATION_LIMIT;
+          have_pending_reason = true;
+          break;
+        }
+        if (krylov.maximum_seconds > 0.0 && elapsedSeconds(start) >= krylov.maximum_seconds)
+        {
+          pending_reason = KrylovStopReason::TIME_LIMIT;
+          have_pending_reason = true;
+          break;
+        }
+        linear_operator.apply(constBasisView(column), mutableView(action));
+        ++result.operator_applications;
+
+        for (int pass = 0; pass < 2; ++pass)
+          for (std::size_t row = 0; row <= column; ++row)
+          {
+            const DerivativeValue projection = linear_operator.hermitianDot(
+                constBasisView(row), constView(action));
+            hessenbergAt(row, column) += projection;
+            for (std::size_t index = 0; index < local_size; ++index)
+              action[index] -= projection * constBasisView(row)[index];
+          }
+        const DerivativeReal next_norm = linear_operator.norm(constView(action));
+        hessenbergAt(column + 1, column) = {next_norm, 0.0};
+        if (next_norm > 0.0)
+        {
+          auto next_basis = basisView(column + 1);
+          for (std::size_t index = 0; index < local_size; ++index)
+            next_basis[index] = action[index] / next_norm;
+        }
+
+        for (std::size_t rotation = 0; rotation < column; ++rotation)
+        {
+          const DerivativeValue upper = hessenbergAt(rotation, column);
+          const DerivativeValue lower = hessenbergAt(rotation + 1, column);
+          hessenbergAt(rotation, column) = rotations_cosine[rotation] * upper +
+              rotations_sine[rotation] * lower;
+          hessenbergAt(rotation + 1, column) =
+              -std::conj(rotations_sine[rotation]) * upper +
+              rotations_cosine[rotation] * lower;
+        }
+        const DerivativeValue diagonal = hessenbergAt(column, column);
+        const DerivativeValue subdiagonal = hessenbergAt(column + 1, column);
+        const DerivativeReal diagonal_norm = std::abs(diagonal);
+        const DerivativeReal subdiagonal_norm = std::abs(subdiagonal);
+        const DerivativeReal rotation_norm = std::hypot(diagonal_norm, subdiagonal_norm);
+        if (rotation_norm == 0.0)
+        {
+          pending_reason = KrylovStopReason::BREAKDOWN;
+          have_pending_reason = true;
+          break;
+        }
+        if (diagonal_norm == 0.0)
+        {
+          rotations_cosine[column] = 0.0;
+          rotations_sine[column] = std::conj(subdiagonal) / subdiagonal_norm;
+          hessenbergAt(column, column) = {subdiagonal_norm, 0.0};
+        }
+        else
+        {
+          const DerivativeValue phase = diagonal / diagonal_norm;
+          rotations_cosine[column] = diagonal_norm / rotation_norm;
+          rotations_sine[column] = phase * std::conj(subdiagonal) / rotation_norm;
+          hessenbergAt(column, column) = phase * rotation_norm;
+        }
+        hessenbergAt(column + 1, column) = {};
+        const DerivativeValue current_rhs = least_squares_rhs[column];
+        least_squares_rhs[column] = rotations_cosine[column] * current_rhs;
+        least_squares_rhs[column + 1] =
+            -std::conj(rotations_sine[column]) * current_rhs;
+        ++result.iterations;
+        arnoldi_columns = column + 1;
+        result.final_residual_norm = std::abs(least_squares_rhs[column + 1]);
+
+        if (result.final_residual_norm <= target)
+        {
+          pending_reason = KrylovStopReason::CONVERGED;
+          have_pending_reason = true;
+          break;
+        }
+        const DerivativeReal required_improvement =
+            krylov.minimum_relative_improvement * best_residual;
+        if (best_residual - result.final_residual_norm > required_improvement)
+        {
+          best_residual = result.final_residual_norm;
+          stagnant_iterations = 0;
+        }
+        else if (krylov.stagnation_window > 0 &&
+                 ++stagnant_iterations >= krylov.stagnation_window)
+        {
+          pending_reason = KrylovStopReason::STAGNATED;
+          have_pending_reason = true;
+          break;
+        }
+        if (next_norm == 0.0)
+        {
+          pending_reason = KrylovStopReason::BREAKDOWN;
+          have_pending_reason = true;
+          break;
+        }
+        if (result.iterations >= krylov.maximum_iterations)
+        {
+          pending_reason = KrylovStopReason::ITERATION_LIMIT;
+          have_pending_reason = true;
+          break;
+        }
+      }
+
+      if (arnoldi_columns == 0)
+      {
+        finish(have_pending_reason ? pending_reason : KrylovStopReason::BREAKDOWN);
+        return result;
+      }
+      for (std::size_t reverse = arnoldi_columns; reverse > 0; --reverse)
+      {
+        const std::size_t row = reverse - 1;
+        DerivativeValue value = least_squares_rhs[row];
+        for (std::size_t column = row + 1; column < arnoldi_columns; ++column)
+          value -= hessenbergAt(row, column) * coefficients[column];
+        const DerivativeValue diagonal = hessenbergAt(row, row);
+        const DerivativeReal threshold = std::numeric_limits<DerivativeReal>::epsilon() *
+            std::max(DerivativeReal{1}, std::abs(value));
+        if (std::abs(diagonal) <= threshold)
+        {
+          finish(KrylovStopReason::BREAKDOWN);
+          return result;
+        }
+        coefficients[row] = value / diagonal;
+      }
+      for (std::size_t column = 0; column < arnoldi_columns; ++column)
+        for (std::size_t index = 0; index < local_size; ++index)
+          result.solution[index] += coefficients[column] * constBasisView(column)[index];
+
+      if (have_pending_reason)
+      {
+        finish(pending_reason);
+        return result;
+      }
+      if (result.iterations >= krylov.maximum_iterations)
+      {
+        finish(KrylovStopReason::ITERATION_LIMIT);
+        return result;
+      }
+      if (result.operator_applications >= krylov.maximum_operator_applications)
+      {
+        finish(KrylovStopReason::OPERATOR_APPLICATION_LIMIT);
+        return result;
+      }
+      if (krylov.maximum_seconds > 0.0 && elapsedSeconds(start) >= krylov.maximum_seconds)
+      {
+        finish(KrylovStopReason::TIME_LIMIT);
+        return result;
+      }
+
+      linear_operator.apply(constView(result.solution), mutableView(action));
+      ++result.operator_applications;
+      std::copy(right_hand_side.begin(), right_hand_side.end(), residual.begin());
+      for (std::size_t index = 0; index < local_size; ++index)
+        residual[index] -= action[index];
+      result.final_residual_norm = linear_operator.norm(constView(residual));
+      if (result.final_residual_norm <= target)
+      {
+        finish(KrylovStopReason::CONVERGED);
+        return result;
+      }
+    }
+  }
+  catch (const MatrixFreeNumericalError&)
+  {
+    finish(KrylovStopReason::NONFINITE_RESULT);
+    return result;
+  }
+}
+
+ProjectedInverseIterationUpdateRule::ProjectedInverseIterationUpdateRule(
+    const ProjectedInverseIterationFactor& factor,
+    PIIUpdateControl control)
+    : factor_(factor), control_(std::move(control))
+{
+  validatePIIControl(control_);
+}
+
+StructuredParameterSnapshot ProjectedInverseIterationUpdateRule::propose(
+    const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot& parameters,
+    ParameterGradientView objective)
+{
+  validateUpdateInputs(factor_.scoreFactor(), proposal_live_, schema, parameters,
+                       objective, control_.objective_tolerance);
+  last_diagnostics_.reset();
+  const DerivativeReal tau = resolvePIIShift(factor_.scoreFactor(), control_);
+  std::vector<DerivativeValue> right_hand_side(schema.parameterCount());
+  for (std::size_t parameter = 0; parameter < right_hand_side.size(); ++parameter)
+    right_hand_side[parameter] = {0.5 * objective.gradient[parameter], 0.0};
+  const StructuredParameterVectorConstView rhs_view(
+      schema, parameters.version, constView(right_hand_side));
+
+  std::vector<DerivativeValue> direction;
+  DerivativeReal damping = control_.damping;
+  for (std::size_t attempt = 0; attempt <= control_.maximum_damping_retries; ++attempt)
+  {
+    ProjectedInverseIterationOperator linear_operator(factor_, tau, damping);
+    KrylovSolveResult solve = solveRestartedGMRES(
+        linear_operator, rhs_view, control_.gmres);
+    last_diagnostics_ = PIIUpdateDiagnostics{
+        false, tau, damping, attempt + 1, 0.0, 0.0, solve.stop_reason,
+        solve.iterations, solve.operator_applications, solve.final_residual_norm};
+    if (solve.converged)
+    {
+      direction = std::move(solve.solution);
+      break;
+    }
+    if (attempt == control_.maximum_damping_retries)
+      throw std::runtime_error(std::string("PII GMRES did not converge: ") +
+                               krylovStopReasonName(solve.stop_reason));
+    damping *= control_.damping_multiplier;
+    if (!isFiniteTrainingReal(damping))
+      throw MatrixFreeNumericalError("PII damping retry overflowed");
+  }
+
+  const DerivativeReal norm = parameterVectorNorm(schema, constView(direction));
+  DerivativeReal scale = control_.learning_rate;
+  if (control_.maximum_update_norm > 0.0 && norm > 0.0)
+    scale = std::min(scale, control_.maximum_update_norm / norm);
+  last_diagnostics_->direction_norm = norm;
+  last_diagnostics_->applied_scale = scale;
+  StructuredParameterSnapshot candidate =
+      formCandidate(schema, parameters, constView(direction), scale);
+  proposal_live_ = true;
+  return candidate;
+}
+
+void ProjectedInverseIterationUpdateRule::proposalAccepted(
+    const StructuredParameterSchema&,
+    const StructuredParameterSnapshot&,
+    ParameterGradientView) noexcept
+{
+  proposal_live_ = false;
+}
+
+void ProjectedInverseIterationUpdateRule::proposalRejected() noexcept
+{
+  proposal_live_ = false;
+}
+
+MinimumProjectedInverseIterationUpdateRule::MinimumProjectedInverseIterationUpdateRule(
+    const ProjectedInverseIterationFactor& factor,
+    PIIUpdateControl control)
+    : factor_(factor), control_(std::move(control))
+{
+  validatePIIControl(control_);
+}
+
+StructuredParameterSnapshot MinimumProjectedInverseIterationUpdateRule::propose(
+    const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot& parameters,
+    ParameterGradientView objective)
+{
+  validateUpdateInputs(factor_.scoreFactor(), proposal_live_, schema, parameters,
+                       objective, control_.objective_tolerance);
+  last_diagnostics_.reset();
+  const DerivativeReal tau = resolvePIIShift(factor_.scoreFactor(), control_);
+  std::vector<DerivativeValue> right_hand_side(
+      factor_.scoreFactor().residual().begin(), factor_.scoreFactor().residual().end());
+  for (DerivativeValue& value : right_hand_side)
+    value *= 0.5;
+
+  std::vector<DerivativeValue> sample_solution;
+  DerivativeReal damping = control_.damping;
+  for (std::size_t attempt = 0; attempt <= control_.maximum_damping_retries; ++attempt)
+  {
+    MinimumProjectedInverseIterationOperator linear_operator(factor_, tau, damping);
+    DistributedSampleKrylovResult solve = solveDistributedSampleGMRES(
+        linear_operator, constView(right_hand_side), control_.gmres);
+    last_diagnostics_ = PIIUpdateDiagnostics{
+        true, tau, damping, attempt + 1, 0.0, 0.0, solve.stop_reason,
+        solve.iterations, solve.operator_applications, solve.final_residual_norm};
+    if (solve.converged)
+    {
+      sample_solution = std::move(solve.solution);
+      break;
+    }
+    if (attempt == control_.maximum_damping_retries)
+      throw std::runtime_error(std::string("MinPII GMRES did not converge: ") +
+                               krylovStopReasonName(solve.stop_reason));
+    damping *= control_.damping_multiplier;
+    if (!isFiniteTrainingReal(damping))
+      throw MatrixFreeNumericalError("MinPII damping retry overflowed");
+  }
+
+  std::vector<DerivativeValue> direction(schema.parameterCount());
+  factor_.scoreFactor().applyAdjoint(constView(sample_solution), mutableView(direction));
+  const DerivativeReal norm = parameterVectorNorm(schema, constView(direction));
+  DerivativeReal scale = control_.learning_rate;
+  if (control_.maximum_update_norm > 0.0 && norm > 0.0)
+    scale = std::min(scale, control_.maximum_update_norm / norm);
+  last_diagnostics_->direction_norm = norm;
+  last_diagnostics_->applied_scale = scale;
+  StructuredParameterSnapshot candidate =
+      formCandidate(schema, parameters, constView(direction), scale);
+  proposal_live_ = true;
+  return candidate;
+}
+
+void MinimumProjectedInverseIterationUpdateRule::proposalAccepted(
+    const StructuredParameterSchema&,
+    const StructuredParameterSnapshot&,
+    ParameterGradientView) noexcept
+{
+  proposal_live_ = false;
+}
+
+void MinimumProjectedInverseIterationUpdateRule::proposalRejected() noexcept
+{
+  proposal_live_ = false;
+}
+
 MinimumStepSRUpdateRule::MinimumStepSRUpdateRule(
     const ScoreCovarianceFactor& factor,
     MinimumStepUpdateControl control)
@@ -930,7 +1607,8 @@ private:
 
 SPRINGUpdateRule::SPRINGUpdateRule(const ScoreCovarianceFactor& factor,
                                    SPRINGUpdateControl control)
-    : factor_(&factor), control_(std::move(control)),
+    : factor_(&factor), provider_id_(factor.parameterSchema().providerId()),
+      schema_fingerprint_(factor.parameterSchema().fingerprint()), control_(std::move(control)),
       history_(factor.parameterSchema().parameterCount()),
       pending_history_(factor.parameterSchema().parameterCount())
 {
@@ -977,10 +1655,16 @@ void SPRINGUpdateRule::bindFactor(const ScoreCovarianceFactor& factor)
 {
   if (proposal_live_)
     throw std::logic_error("Cannot rebind SPRING with a live proposal");
-  if (factor.parameterSchema().providerId() != factor_->parameterSchema().providerId() ||
-      factor.parameterSchema().fingerprint() != factor_->parameterSchema().fingerprint())
+  if (factor.parameterSchema().providerId() != provider_id_ ||
+      factor.parameterSchema().fingerprint() != schema_fingerprint_)
     throw std::invalid_argument("SPRING replacement factor schema mismatch");
   factor_ = &factor;
+}
+
+void SPRINGUpdateRule::unbindFactor() noexcept
+{
+  assert(!proposal_live_);
+  factor_ = nullptr;
 }
 
 StructuredParameterSnapshot SPRINGUpdateRule::propose(
@@ -988,6 +1672,8 @@ StructuredParameterSnapshot SPRINGUpdateRule::propose(
     const StructuredParameterSnapshot& parameters,
     ParameterGradientView objective)
 {
+  if (factor_ == nullptr)
+    throw std::logic_error("SPRING requires a bound score-covariance factor");
   validateUpdateInputs(*factor_, proposal_live_, schema, parameters, objective,
                        control_.minimum_step.objective_tolerance);
   if (accepted_update_count_ == std::numeric_limits<std::uint64_t>::max())

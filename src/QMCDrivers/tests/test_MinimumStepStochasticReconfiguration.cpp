@@ -16,7 +16,10 @@
 #include "io/hdf/hdf_archive.h"
 
 #include <array>
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <random>
 #include <vector>
 
 namespace qmcplusplus::wftrain
@@ -134,6 +137,153 @@ ParameterGradientView objectiveView(const StructuredParameterSchema& schema,
           {gradient.data(), gradient.size()}};
 }
 
+/// Construct a three-parameter schema for nonsymmetric PII dense oracles.
+StructuredParameterSchema makePIISchema()
+{
+  return {"pii/dense",
+          {{"weights", {3}, 0, 3, ParameterScalarDomain::REAL64, true,
+            "weights"}}};
+}
+
+/** Stream deterministic pseudorandom score and local-energy Jacobian rows.
+ *
+ * Distinct matrices make the shifted factor nonsymmetric with respect to the
+ * score factor, so a mistaken O*B^T MinPII action cannot pass by symmetry.
+ */
+class DensePIIDerivativeOperator final : public StreamingDerivativeOperator
+{
+public:
+  DensePIIDerivativeOperator(const StructuredParameterSchema& schema,
+                             std::size_t version)
+      : schema_(schema), version_(version), plan_(schema_, version_, 2)
+  {
+    std::mt19937_64 generator(0x5eed1234ULL);
+    std::uniform_real_distribution<DerivativeReal> distribution(-1.25, 1.25);
+    for (auto& row : score_)
+      for (DerivativeReal& value : row)
+        value = distribution(generator);
+    for (auto& row : local_energy_jacobian_)
+      for (DerivativeReal& value : row)
+        value = distribution(generator);
+  }
+
+  StreamingDerivativeCapabilities capabilities() const noexcept override
+  {
+    StreamingDerivativeCapabilities result;
+    result.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
+        derivativeProductBit(DerivativeProduct::SCORE_JVP) |
+        derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
+    result.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
+    result.parameter_scalar_domain = ParameterScalarDomain::REAL64;
+    result.result_scalar_domain = ParameterScalarDomain::COMPLEX128;
+    result.reduction_domain = ReductionDomain::CROWD_LOCAL;
+    result.execution_domain = DerivativeExecutionDomain::HOST;
+    result.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+    result.maximum_vjp_channels = 1;
+    result.maximum_parameter_chunk_size = 2;
+    result.maximum_sample_tile_size = sample_count;
+    result.block_streaming = true;
+    return result;
+  }
+
+  const StructuredParameterSchema& parameterSchema() const noexcept override { return schema_; }
+  std::size_t parameterVersion() const noexcept override { return version_; }
+  std::size_t batchOrdinal() const noexcept override { return 0; }
+  std::size_t sampleOffset() const noexcept override { return 0; }
+  std::size_t sampleCount() const noexcept override { return sample_count; }
+  const ParameterChunkPlan& parameterChunkPlan() const noexcept override { return plan_; }
+
+  const auto& score() const noexcept { return score_; }
+  const auto& localEnergyJacobian() const noexcept { return local_energy_jacobian_; }
+
+protected:
+  void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
+                    DerivativeAdjoint,
+                    ParameterReductionSink& sink) const override
+  {
+    for (const ParameterChunkDescriptor& chunk : plan_.chunks())
+    {
+      std::vector<DerivativeValue> values(chunk.count);
+      for (std::size_t local = 0; local < chunk.count; ++local)
+        for (std::size_t sample = 0; sample < sample_count; ++sample)
+          values[local] += channels[0].coefficients.values[sample] *
+              score_[sample][chunk.parameter_offset + local];
+      sink.add(0, {chunk, {values.data(), values.size()}});
+    }
+  }
+
+  void evaluateScoreJVP(const StructuredParameterVectorConstView& direction,
+                        SampleProductSink& sink) const override
+  {
+    emitProduct(score_, direction, sink);
+  }
+
+  void evaluateLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
+                              std::uint32_t term_mask,
+                              SampleProductSink& sink) const override
+  {
+    if (term_mask != localEnergyTermBit(LocalEnergyTerm::KINETIC))
+      throw std::logic_error("Dense PII oracle received an unexpected term mask");
+    emitProduct(local_energy_jacobian_, direction, sink);
+  }
+
+private:
+  void emitProduct(const std::array<std::array<DerivativeReal, 3>, 5>& matrix,
+                   const StructuredParameterVectorConstView& direction,
+                   SampleProductSink& sink) const
+  {
+    std::array<DerivativeValue, sample_count> products{};
+    for (std::size_t sample = 0; sample < sample_count; ++sample)
+      for (std::size_t parameter = 0; parameter < 3; ++parameter)
+        products[sample] += matrix[sample][parameter] * direction.values()[parameter];
+    const SampleProductTileDescriptor descriptor{
+        schema_.providerId(), schema_.fingerprint(), version_, 0, 0,
+        sample_count, 0};
+    sink.add({descriptor, {products.data(), products.size()}});
+  }
+
+  static constexpr std::size_t sample_count = 5;
+  const StructuredParameterSchema& schema_;
+  std::size_t version_;
+  ParameterChunkPlan plan_;
+  std::array<std::array<DerivativeReal, 3>, sample_count> score_{};
+  std::array<std::array<DerivativeReal, 3>, sample_count> local_energy_jacobian_{};
+};
+
+/// Solve one small dense real system by pivoted Gaussian elimination.
+std::vector<DerivativeReal> solveDense(std::vector<std::vector<DerivativeReal>> matrix,
+                                      std::vector<DerivativeReal> right_hand_side)
+{
+  const std::size_t size = matrix.size();
+  for (std::size_t column = 0; column < size; ++column)
+  {
+    std::size_t pivot = column;
+    for (std::size_t row = column + 1; row < size; ++row)
+      if (std::abs(matrix[row][column]) > std::abs(matrix[pivot][column]))
+        pivot = row;
+    REQUIRE(std::abs(matrix[pivot][column]) > 1.0e-13);
+    std::swap(matrix[pivot], matrix[column]);
+    std::swap(right_hand_side[pivot], right_hand_side[column]);
+    for (std::size_t row = column + 1; row < size; ++row)
+    {
+      const DerivativeReal multiplier = matrix[row][column] / matrix[column][column];
+      for (std::size_t entry = column; entry < size; ++entry)
+        matrix[row][entry] -= multiplier * matrix[column][entry];
+      right_hand_side[row] -= multiplier * right_hand_side[column];
+    }
+  }
+  std::vector<DerivativeReal> solution(size);
+  for (std::size_t reverse = size; reverse > 0; --reverse)
+  {
+    const std::size_t row = reverse - 1;
+    DerivativeReal value = right_hand_side[row];
+    for (std::size_t column = row + 1; column < size; ++column)
+      value -= matrix[row][column] * solution[column];
+    solution[row] = value / matrix[row][row];
+  }
+  return solution;
+}
+
 } // namespace
 
 TEST_CASE("Weighted score factor agrees with a dense centered oracle",
@@ -239,6 +389,7 @@ TEST_CASE("SPRING mu zero equals minSR and commits history transactionally",
   control.minimum_step.krylov.maximum_iterations = 20;
   control.minimum_step.krylov.maximum_operator_applications = 21;
   SPRINGUpdateRule spring(*factor, control);
+  CHECK(spring.retainedBytes() == 4 * sizeof(DerivativeValue));
   const StructuredParameterSnapshot candidate = spring.propose(
       schema, parameters, objective);
   CHECK(candidate.values[0] == Approx(0.3235294117647059).epsilon(1.0e-11));
@@ -252,6 +403,12 @@ TEST_CASE("SPRING mu zero equals minSR and commits history transactionally",
   CHECK(spring.acceptedUpdateCount() == 1);
   CHECK(spring.history()[0].real() == Approx(-1.6176470588235294).epsilon(1.0e-11));
   CHECK(spring.history()[1].real() == Approx(1.4705882352941178).epsilon(1.0e-11));
+
+  spring.unbindFactor();
+  CHECK_THROWS(spring.propose(schema, parameters, objective));
+  spring.bindFactor(*factor);
+  CHECK_NOTHROW(spring.propose(schema, parameters, objective));
+  spring.proposalRejected();
 }
 
 TEST_CASE("SPRING checkpoint payload restores committed history exactly",
@@ -305,6 +462,250 @@ TEST_CASE("SPRING checkpoint payload restores committed history exactly",
   CHECK(restored.history() == source.history());
   CHECK(restored.checkpointMetadata().state_fingerprint ==
         source.checkpointMetadata().state_fingerprint);
+}
+
+TEST_CASE("PII and MinPII match dense nonsymmetric operators and solves",
+          "[wftrain][pii][minpii]")
+{
+  const StructuredParameterSchema schema = makePIISchema();
+  constexpr std::size_t version = 9;
+  constexpr std::size_t samples = 5;
+  constexpr std::size_t parameters = 3;
+  const std::array<DerivativeReal, samples> weights{1.0, 2.0, 0.5, 3.0, 1.5};
+  const std::array<DerivativeValue, samples> energies{{
+      {-1.7, 0.0}, {-0.9, 0.0}, {0.4, 0.0}, {-2.1, 0.0}, {1.2, 0.0}}};
+  DensePIIDerivativeOperator derivative_operator(schema, version);
+  const ScoreCovarianceBatch batch{
+      &derivative_operator, {weights.data(), weights.size()},
+      {energies.data(), energies.size()}};
+  ScoreCovarianceFactor score_factor(
+      schema, version, DerivativeArrayView<const ScoreCovarianceBatch>{&batch, 1});
+  const std::uint32_t kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  ProjectedInverseIterationFactor factor(score_factor, kinetic);
+
+  constexpr DerivativeReal tau = -1.3;
+  constexpr DerivativeReal damping = 0.23;
+  const DerivativeReal weight_sum = 8.0;
+  std::array<DerivativeReal, parameters> mean_score{};
+  for (std::size_t sample = 0; sample < samples; ++sample)
+    for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+      mean_score[parameter] += weights[sample] *
+          derivative_operator.score()[sample][parameter] / weight_sum;
+  std::array<std::array<DerivativeReal, parameters>, samples> score{};
+  std::array<std::array<DerivativeReal, parameters>, samples> shifted{};
+  for (std::size_t sample = 0; sample < samples; ++sample)
+  {
+    const DerivativeReal sqrt_q = std::sqrt(weights[sample] / weight_sum);
+    for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+    {
+      score[sample][parameter] = sqrt_q *
+          (derivative_operator.score()[sample][parameter] - mean_score[parameter]);
+      // A*v is dE_L[v] + E_L*(centered score JVP); B=A-tau*O.
+      shifted[sample][parameter] = sqrt_q *
+          derivative_operator.localEnergyJacobian()[sample][parameter] +
+          (energies[sample].real() - tau) * score[sample][parameter];
+    }
+  }
+
+  const std::array<DerivativeValue, parameters> parameter_direction{{
+      {0.7, 0.0}, {-0.4, 0.0}, {1.1, 0.0}}};
+  const StructuredParameterVectorConstView parameter_view(
+      schema, version, {parameter_direction.data(), parameter_direction.size()});
+  std::array<DerivativeValue, samples> shifted_action{};
+  factor.applyShifted(parameter_view, tau,
+                      {shifted_action.data(), shifted_action.size()});
+  for (std::size_t sample = 0; sample < samples; ++sample)
+  {
+    DerivativeReal expected = 0.0;
+    for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+      expected += shifted[sample][parameter] * parameter_direction[parameter].real();
+    CHECK(shifted_action[sample].real() == Approx(expected).margin(2.0e-13));
+  }
+
+  ProjectedInverseIterationOperator full_operator(factor, tau, damping);
+  std::array<DerivativeValue, parameters> full_action{};
+  full_operator.apply(parameter_view, {full_action.data(), full_action.size()});
+  for (std::size_t row = 0; row < parameters; ++row)
+  {
+    DerivativeReal expected = damping * parameter_direction[row].real();
+    for (std::size_t sample = 0; sample < samples; ++sample)
+      for (std::size_t column = 0; column < parameters; ++column)
+        expected += score[sample][row] * shifted[sample][column] *
+            parameter_direction[column].real();
+    CHECK(full_action[row].real() == Approx(expected).margin(5.0e-13));
+  }
+
+  const std::array<DerivativeValue, samples> sample_direction{{
+      {0.3, 0.0}, {-0.8, 0.0}, {1.4, 0.0}, {0.2, 0.0}, {-0.6, 0.0}}};
+  MinimumProjectedInverseIterationOperator minimum_operator(factor, tau, damping);
+  std::array<DerivativeValue, samples> minimum_action{};
+  minimum_operator.apply({sample_direction.data(), sample_direction.size()},
+                         {minimum_action.data(), minimum_action.size()});
+  DerivativeReal rejected_orientation_difference = 0.0;
+  for (std::size_t row = 0; row < samples; ++row)
+  {
+    DerivativeReal expected = damping * sample_direction[row].real();
+    DerivativeReal rejected = damping * sample_direction[row].real();
+    for (std::size_t column = 0; column < samples; ++column)
+      for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+      {
+        expected += shifted[row][parameter] * score[column][parameter] *
+            sample_direction[column].real();
+        rejected += score[row][parameter] * shifted[column][parameter] *
+            sample_direction[column].real();
+      }
+    CHECK(minimum_action[row].real() == Approx(expected).margin(7.0e-13));
+    rejected_orientation_difference += std::abs(expected - rejected);
+  }
+  CHECK(rejected_orientation_difference > 0.1);
+
+  std::vector<std::vector<DerivativeReal>> full_matrix(
+      parameters, std::vector<DerivativeReal>(parameters));
+  for (std::size_t row = 0; row < parameters; ++row)
+    for (std::size_t column = 0; column < parameters; ++column)
+    {
+      full_matrix[row][column] = row == column ? damping : 0.0;
+      for (std::size_t sample = 0; sample < samples; ++sample)
+        full_matrix[row][column] += score[sample][row] * shifted[sample][column];
+    }
+  std::vector<std::vector<DerivativeReal>> minimum_matrix(
+      samples, std::vector<DerivativeReal>(samples));
+  for (std::size_t row = 0; row < samples; ++row)
+    for (std::size_t column = 0; column < samples; ++column)
+    {
+      minimum_matrix[row][column] = row == column ? damping : 0.0;
+      for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+        minimum_matrix[row][column] += shifted[row][parameter] * score[column][parameter];
+    }
+  std::vector<DerivativeReal> sample_rhs(samples);
+  for (std::size_t sample = 0; sample < samples; ++sample)
+    sample_rhs[sample] = 0.5 * score_factor.residual()[sample].real();
+  std::vector<DerivativeReal> parameter_rhs(parameters);
+  for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+    for (std::size_t sample = 0; sample < samples; ++sample)
+      parameter_rhs[parameter] += score[sample][parameter] * sample_rhs[sample];
+  const std::vector<DerivativeReal> dense_full = solveDense(full_matrix, parameter_rhs);
+  const std::vector<DerivativeReal> dense_sample = solveDense(minimum_matrix, sample_rhs);
+
+  GMRESSolverControl gmres;
+  gmres.restart_length = 5;
+  gmres.krylov.relative_tolerance = 1.0e-12;
+  gmres.krylov.maximum_iterations = 40;
+  gmres.krylov.maximum_operator_applications = 50;
+  std::vector<DerivativeValue> complex_parameter_rhs(parameters);
+  for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+    complex_parameter_rhs[parameter] = {parameter_rhs[parameter], 0.0};
+  const StructuredParameterVectorConstView rhs_view(
+      schema, version, {complex_parameter_rhs.data(), complex_parameter_rhs.size()});
+  const KrylovSolveResult full_solve = solveRestartedGMRES(
+      full_operator, rhs_view, gmres);
+  REQUIRE(full_solve.converged);
+  std::vector<DerivativeValue> complex_sample_rhs(samples);
+  for (std::size_t sample = 0; sample < samples; ++sample)
+    complex_sample_rhs[sample] = {sample_rhs[sample], 0.0};
+  const DistributedSampleKrylovResult sample_solve = solveDistributedSampleGMRES(
+      minimum_operator, {complex_sample_rhs.data(), complex_sample_rhs.size()}, gmres);
+  REQUIRE(sample_solve.converged);
+  std::array<DerivativeValue, parameters> pushed_sample_solution{};
+  score_factor.applyAdjoint({sample_solve.solution.data(), sample_solve.solution.size()},
+                            {pushed_sample_solution.data(), pushed_sample_solution.size()});
+  for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+  {
+    CHECK(full_solve.solution[parameter].real() ==
+          Approx(dense_full[parameter]).epsilon(2.0e-10));
+    CHECK(pushed_sample_solution[parameter].real() ==
+          Approx(dense_full[parameter]).epsilon(2.0e-10));
+  }
+  for (std::size_t sample = 0; sample < samples; ++sample)
+    CHECK(sample_solve.solution[sample].real() ==
+          Approx(dense_sample[sample]).epsilon(2.0e-10));
+
+  CHECK_THROWS_AS(ProjectedInverseIterationFactor(
+                      score_factor, localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)),
+                  std::invalid_argument);
+}
+
+TEST_CASE("PII update rules publish transactionally with shifts retries and trust bounds",
+          "[wftrain][pii][minpii][transaction]")
+{
+  const StructuredParameterSchema schema = makePIISchema();
+  constexpr std::size_t version = 9;
+  const std::array<DerivativeReal, 5> weights{1.0, 2.0, 0.5, 3.0, 1.5};
+  const std::array<DerivativeValue, 5> energies{{
+      {-1.7, 0.0}, {-0.9, 0.0}, {0.4, 0.0}, {-2.1, 0.0}, {1.2, 0.0}}};
+  DensePIIDerivativeOperator derivative_operator(schema, version);
+  const ScoreCovarianceBatch batch{
+      &derivative_operator, {weights.data(), weights.size()},
+      {energies.data(), energies.size()}};
+  ScoreCovarianceFactor score_factor(
+      schema, version, DerivativeArrayView<const ScoreCovarianceBatch>{&batch, 1});
+  ProjectedInverseIterationFactor factor(
+      score_factor, localEnergyTermBit(LocalEnergyTerm::KINETIC));
+  const std::vector<DerivativeReal> gradient = score_factor.scoreCovarianceGradient();
+  const ParameterGradientView objective{
+      schema.fingerprint(), version, ReductionDomain::GLOBAL,
+      {gradient.data(), gradient.size()}};
+  const StructuredParameterSnapshot parameters{
+      schema.fingerprint(), version, {0.25, -0.5, 0.75}};
+
+  PIIUpdateControl control;
+  control.shift_mode = PIIShiftMode::EXPLICIT;
+  control.explicit_shift = -1.3;
+  control.damping = 0.23;
+  control.learning_rate = 0.4;
+  control.maximum_update_norm = 0.03;
+  control.maximum_damping_retries = 1;
+  control.gmres.restart_length = 5;
+  control.gmres.krylov.relative_tolerance = 1.0e-12;
+  control.gmres.krylov.maximum_iterations = 40;
+  control.gmres.krylov.maximum_operator_applications = 50;
+  ProjectedInverseIterationUpdateRule full(factor, control);
+  MinimumProjectedInverseIterationUpdateRule minimum(factor, control);
+  const StructuredParameterSnapshot full_candidate =
+      full.propose(schema, parameters, objective);
+  const StructuredParameterSnapshot minimum_candidate =
+      minimum.propose(schema, parameters, objective);
+  REQUIRE(full.lastDiagnostics());
+  REQUIRE(minimum.lastDiagnostics());
+  CHECK(full.lastDiagnostics()->shift == Approx(-1.3));
+  CHECK_FALSE(full.lastDiagnostics()->minimum_sample_space);
+  CHECK(minimum.lastDiagnostics()->minimum_sample_space);
+  DerivativeReal displacement_norm_squared = 0.0;
+  for (std::size_t parameter = 0; parameter < 3; ++parameter)
+  {
+    CHECK(full_candidate.values[parameter] ==
+          Approx(minimum_candidate.values[parameter]).epsilon(3.0e-9));
+    displacement_norm_squared += std::pow(
+        full_candidate.values[parameter] - parameters.values[parameter], 2);
+  }
+  CHECK(std::sqrt(displacement_norm_squared) == Approx(0.03).epsilon(2.0e-10));
+  CHECK_THROWS_AS(full.propose(schema, parameters, objective), std::logic_error);
+  full.proposalRejected();
+  CHECK_FALSE(full.hasLiveProposal());
+  full.propose(schema, parameters, objective);
+  full.proposalAccepted(schema, parameters, objective);
+  CHECK_FALSE(full.hasLiveProposal());
+  minimum.proposalRejected();
+
+  PIIUpdateControl mean_shift_control = control;
+  mean_shift_control.shift_mode = PIIShiftMode::MEAN_ENERGY_MINUS_UNDERSHOOT;
+  mean_shift_control.energy_undershoot = 0.17;
+  mean_shift_control.maximum_update_norm = 0.0;
+  MinimumProjectedInverseIterationUpdateRule mean_shift(factor, mean_shift_control);
+  mean_shift.propose(schema, parameters, objective);
+  REQUIRE(mean_shift.lastDiagnostics());
+  CHECK(mean_shift.lastDiagnostics()->shift ==
+        Approx(score_factor.meanEnergy().real() - 0.17));
+  mean_shift.proposalRejected();
+
+  PIIUpdateControl failure_control = control;
+  failure_control.maximum_damping_retries = 2;
+  failure_control.gmres.krylov.maximum_iterations = 0;
+  ProjectedInverseIterationUpdateRule failed(factor, failure_control);
+  CHECK_THROWS(failed.propose(schema, parameters, objective));
+  REQUIRE(failed.lastDiagnostics());
+  CHECK(failed.lastDiagnostics()->attempts == 3);
+  CHECK_FALSE(failed.hasLiveProposal());
 }
 
 } // namespace qmcplusplus::wftrain

@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file MinimumStepStochasticReconfiguration.h
- * @brief Distributed sample-space minSR and transactional SPRING updates.
+ * @brief Matrix-free minSR, SPRING, PII, and MinPII update primitives.
  *
  * The score factor is represented only through streamed JVP/VJP products.  Sample
  * vectors remain rank local while parameter vectors remain globally replicated;
@@ -63,9 +63,9 @@ struct ScoreCovarianceStorageDiagnostics
   std::size_t retained_numeric_bytes = 0;
 };
 
-/** Matrix-free weighted centered score factor A and its real transpose.
+/** Matrix-free weighted centered score factor O and its real transpose.
  *
- * With q_i=w_i/sum(w), A maps a real parameter direction to
+ * With q_i=w_i/sum(w), O maps a real parameter direction to
  * sqrt(q_i)[J_i v - sum_j q_j J_j v].  COMPLEX_REALIFIED emits adjacent real and
  * imaginary sample coordinates.  applyAdjoint() implements the exact real transpose.
  */
@@ -104,11 +104,11 @@ public:
   /// Return the local score-covariance energy residual, including the factor of two.
   DerivativeArrayView<const DerivativeValue> residual() const noexcept;
 
-  /// Apply A to one complete parameter direction.
+  /// Apply O to one complete parameter direction.
   void apply(const StructuredParameterVectorConstView& direction,
              DerivativeArrayView<DerivativeValue> result) const;
 
-  /// Apply A^T to one rank-local realified sample vector and globally sum the result.
+  /// Apply O^T to one rank-local realified sample vector and globally sum the result.
   void applyAdjoint(DerivativeArrayView<const DerivativeValue> direction,
                     DerivativeArrayView<DerivativeValue> result) const;
 
@@ -128,6 +128,7 @@ public:
                                      std::exception_ptr local_failure = {}) const;
 
 private:
+  friend class ProjectedInverseIterationFactor;
   struct BatchStorage;
 
   void validateParameterDirection(const StructuredParameterVectorConstView& direction) const;
@@ -146,6 +147,66 @@ private:
   std::vector<DerivativeValue> residual_;
   mutable std::vector<DerivativeValue> projected_direction_;
   mutable std::vector<DerivativeValue> local_parameter_action_;
+};
+
+/** Weighted PII factor B=A-tau*O using exact score and local-energy products.
+ *
+ * Here O is the centered score factor owned by ScoreCovarianceFactor. Before sample
+ * weighting, A*v is the derivative of (H psi)/psi: dE_L[v]+E_L*(score JVP).
+ * In the stored convention B*v=sqrt(q)*dE_L[v]+(E_L-tau)*(O*v). The initial
+ * implementation admits the all-electron kinetic derivative only.
+ */
+class ProjectedInverseIterationFactor
+{
+public:
+  ProjectedInverseIterationFactor(
+      const ScoreCovarianceFactor& score_factor,
+      std::uint32_t local_energy_term_mask);
+
+  const ScoreCovarianceFactor& scoreFactor() const noexcept
+  {
+    return score_factor_;
+  }
+
+  std::uint32_t localEnergyTermMask() const noexcept
+  {
+    return local_energy_term_mask_;
+  }
+
+  /// Apply the realified shifted local-energy factor (A-tau*O).
+  void applyShifted(const StructuredParameterVectorConstView& direction,
+                    DerivativeReal tau,
+                    DerivativeArrayView<DerivativeValue> result) const;
+
+private:
+  const ScoreCovarianceFactor& score_factor_;
+  std::uint32_t local_energy_term_mask_ = 0;
+  mutable std::vector<DerivativeValue> projected_direction_;
+  mutable std::vector<DerivativeValue> score_products_;
+  mutable std::vector<DerivativeValue> local_energy_products_;
+};
+
+/** Full parameter-space PII action O^T(A-tau*O)+lambda*I. */
+class ProjectedInverseIterationOperator final : public MatrixFreeLinearOperator
+{
+public:
+  ProjectedInverseIterationOperator(
+      const ProjectedInverseIterationFactor& factor,
+      DerivativeReal tau,
+      DerivativeReal damping);
+
+  DerivativeReal shift() const noexcept { return tau_; }
+  DerivativeReal damping() const noexcept { return damping_; }
+
+protected:
+  void evaluate(const StructuredParameterVectorConstView& direction,
+                DerivativeArrayView<DerivativeValue> result) const override;
+
+private:
+  const ProjectedInverseIterationFactor& factor_;
+  DerivativeReal tau_ = 0.0;
+  DerivativeReal damping_ = 0.0;
+  mutable std::vector<DerivativeValue> sample_scratch_;
 };
 
 /// Checked descriptor for one distributed rank-local sample-space action.
@@ -215,6 +276,30 @@ private:
   mutable std::vector<DerivativeValue> parameter_scratch_;
 };
 
+/** MinPII sample action (A-tau*O)O^T+lambda*I. */
+class MinimumProjectedInverseIterationOperator final
+    : public DistributedSampleLinearOperator
+{
+public:
+  MinimumProjectedInverseIterationOperator(
+      const ProjectedInverseIterationFactor& factor,
+      DerivativeReal tau,
+      DerivativeReal damping);
+
+  DerivativeReal shift() const noexcept { return tau_; }
+  DerivativeReal damping() const noexcept { return damping_; }
+
+protected:
+  void evaluate(DerivativeArrayView<const DerivativeValue> direction,
+                DerivativeArrayView<DerivativeValue> result) const override;
+
+private:
+  const ProjectedInverseIterationFactor& pii_factor_;
+  DerivativeReal tau_ = 0.0;
+  DerivativeReal damping_ = 0.0;
+  mutable std::vector<DerivativeValue> parameter_scratch_;
+};
+
 /// Result of one bounded distributed sample-space PCG solve.
 struct DistributedSampleKrylovResult
 {
@@ -236,6 +321,112 @@ DistributedSampleKrylovResult solveDistributedSamplePCG(
     DerivativeArrayView<const DerivativeValue> right_hand_side,
     const KrylovSolverControl& control,
     DerivativeArrayView<const DerivativeValue> warm_start = {});
+
+/** Solve a nonsymmetric distributed sample-space system with restarted GMRES. */
+DistributedSampleKrylovResult solveDistributedSampleGMRES(
+    const DistributedSampleLinearOperator& linear_operator,
+    DerivativeArrayView<const DerivativeValue> right_hand_side,
+    const GMRESSolverControl& control,
+    DerivativeArrayView<const DerivativeValue> warm_start = {});
+
+/// Choose either a fixed shift or the measured mean energy minus an undershoot.
+enum class PIIShiftMode
+{
+  EXPLICIT,
+  MEAN_ENERGY_MINUS_UNDERSHOOT
+};
+
+/// Numerical, retry, and trust controls shared by PII and MinPII.
+struct PIIUpdateControl
+{
+  DerivativeReal learning_rate = 1.0;
+  PIIShiftMode shift_mode = PIIShiftMode::MEAN_ENERGY_MINUS_UNDERSHOOT;
+  DerivativeReal explicit_shift = 0.0;
+  DerivativeReal energy_undershoot = 0.1;
+  DerivativeReal damping = 1.0e-3;
+  DerivativeReal damping_multiplier = 10.0;
+  std::size_t maximum_damping_retries = 2;
+  DerivativeReal maximum_update_norm = 0.0;
+  DerivativeReal objective_tolerance = 1.0e-9;
+  GMRESSolverControl gmres;
+};
+
+/// Bounded diagnostics from the final PII or MinPII damping attempt.
+struct PIIUpdateDiagnostics
+{
+  bool minimum_sample_space = false;
+  DerivativeReal shift = 0.0;
+  DerivativeReal damping = 0.0;
+  std::size_t attempts = 0;
+  DerivativeReal direction_norm = 0.0;
+  DerivativeReal applied_scale = 0.0;
+  KrylovStopReason stop_reason = KrylovStopReason::BREAKDOWN;
+  std::size_t iterations = 0;
+  std::size_t operator_applications = 0;
+  DerivativeReal final_residual_norm = 0.0;
+};
+
+/** Transactional full parameter-space projected inverse-iteration update. */
+class ProjectedInverseIterationUpdateRule final : public TrainingUpdateRule
+{
+public:
+  ProjectedInverseIterationUpdateRule(
+      const ProjectedInverseIterationFactor& factor,
+      PIIUpdateControl control = {});
+
+  StructuredParameterSnapshot propose(
+      const StructuredParameterSchema& schema,
+      const StructuredParameterSnapshot& parameters,
+      ParameterGradientView objective) override;
+
+  void proposalAccepted(const StructuredParameterSchema&,
+                        const StructuredParameterSnapshot&,
+                        ParameterGradientView) noexcept override;
+  void proposalRejected() noexcept override;
+
+  bool hasLiveProposal() const noexcept { return proposal_live_; }
+  const std::optional<PIIUpdateDiagnostics>& lastDiagnostics() const noexcept
+  {
+    return last_diagnostics_;
+  }
+
+private:
+  const ProjectedInverseIterationFactor& factor_;
+  PIIUpdateControl control_;
+  std::optional<PIIUpdateDiagnostics> last_diagnostics_;
+  bool proposal_live_ = false;
+};
+
+/** Transactional sample-space minimum projected inverse-iteration update. */
+class MinimumProjectedInverseIterationUpdateRule final : public TrainingUpdateRule
+{
+public:
+  MinimumProjectedInverseIterationUpdateRule(
+      const ProjectedInverseIterationFactor& factor,
+      PIIUpdateControl control = {});
+
+  StructuredParameterSnapshot propose(
+      const StructuredParameterSchema& schema,
+      const StructuredParameterSnapshot& parameters,
+      ParameterGradientView objective) override;
+
+  void proposalAccepted(const StructuredParameterSchema&,
+                        const StructuredParameterSnapshot&,
+                        ParameterGradientView) noexcept override;
+  void proposalRejected() noexcept override;
+
+  bool hasLiveProposal() const noexcept { return proposal_live_; }
+  const std::optional<PIIUpdateDiagnostics>& lastDiagnostics() const noexcept
+  {
+    return last_diagnostics_;
+  }
+
+private:
+  const ProjectedInverseIterationFactor& factor_;
+  PIIUpdateControl control_;
+  std::optional<PIIUpdateDiagnostics> last_diagnostics_;
+  bool proposal_live_ = false;
+};
 
 /// Shared numerical controls for minSR and SPRING proposals.
 struct MinimumStepUpdateControl
@@ -308,6 +499,9 @@ public:
   /// Bind the next immutable sample factor without discarding committed history.
   void bindFactor(const ScoreCovarianceFactor& factor);
 
+  /// Drop a consumed factor before its version-bound derivative owners are destroyed.
+  void unbindFactor() noexcept;
+
   StructuredParameterSnapshot propose(
       const StructuredParameterSchema& schema,
       const StructuredParameterSnapshot& parameters,
@@ -327,6 +521,12 @@ public:
 
   std::uint64_t acceptedUpdateCount() const noexcept { return accepted_update_count_; }
   const std::vector<DerivativeValue>& history() const noexcept { return history_; }
+  /// Return exact numeric storage retained by committed and speculative histories.
+  std::size_t retainedBytes() const noexcept
+  {
+    return (history_.capacity() + pending_history_.capacity()) *
+        sizeof(DerivativeValue);
+  }
   bool hasLiveProposal() const noexcept { return proposal_live_; }
   const std::optional<MinimumStepUpdateDiagnostics>& lastDiagnostics() const noexcept
   {
@@ -342,6 +542,8 @@ private:
                              const std::vector<DerivativeValue>& history) const;
 
   const ScoreCovarianceFactor* factor_ = nullptr;
+  std::string provider_id_;
+  std::string schema_fingerprint_;
   SPRINGUpdateControl control_;
   std::string configuration_fingerprint_;
   std::vector<DerivativeValue> history_;

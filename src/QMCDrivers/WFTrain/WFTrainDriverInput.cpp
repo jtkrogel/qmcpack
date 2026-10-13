@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <string_view>
 #include <unordered_set>
@@ -26,9 +27,15 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 10> allowed_attributes{
+constexpr std::array<std::string_view, 30> allowed_attributes{
     "objective", "optimizer", "parameter_chunk_size", "learning_rate", "adam_beta1",
-    "adam_beta2", "epsilon", "checkpoint_path", "restart_path", "provider"};
+    "adam_beta2", "epsilon", "damping", "damping_multiplier", "minimum_retry_damping",
+    "maximum_damping_attempts", "maximum_update_norm", "maximum_metric_norm", "center_shift",
+    "objective_tolerance", "spring_history_decay", "spring_maximum_update_norm_squared",
+    "krylov_relative_tolerance", "krylov_absolute_tolerance", "krylov_maximum_iterations",
+    "krylov_maximum_operator_applications", "krylov_maximum_seconds", "krylov_stagnation_window",
+    "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
+    "maximum_retained_bytes", "checkpoint_path", "restart_path", "provider"};
 
 /** Return an XML attribute value without changing its spelling or whitespace. */
 std::string readAttribute(xmlNodePtr node, const char* name)
@@ -61,6 +68,24 @@ std::size_t parsePositiveSize(const std::string& text, const std::string& attrib
   return value;
 }
 
+/** Parse a nonnegative base-ten size while checking overflow. */
+std::size_t parseNonnegativeSize(const std::string& text, const std::string& attribute)
+{
+  if (text.empty() ||
+      !std::all_of(text.begin(), text.end(), [](unsigned char character) { return std::isdigit(character); }))
+    throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must be a nonnegative base-ten integer");
+
+  std::size_t value = 0;
+  for (const char digit : text)
+  {
+    const std::size_t numeric_digit = static_cast<std::size_t>(digit - '0');
+    if (value > (std::numeric_limits<std::size_t>::max() - numeric_digit) / 10)
+      throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " overflows size_t");
+    value = value * 10 + numeric_digit;
+  }
+  return value;
+}
+
 /** Parse one finite floating-point value and reject trailing text. */
 double parseFiniteReal(const std::string& text, const std::string& attribute)
 {
@@ -88,6 +113,26 @@ double parseDecay(const std::string& text, const std::string& attribute)
   if (value < 0.0 || value >= 1.0)
     throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must lie in [0, 1)");
   return value;
+}
+
+/** Parse a finite nonnegative real. */
+double parseNonnegativeReal(const std::string& text, const std::string& attribute)
+{
+  const double value = parseFiniteReal(text, attribute);
+  if (value < 0.0)
+    throw UniformCommunicateError("WFTrainDriverInput: " + attribute + " must be nonnegative");
+  return value;
+}
+
+/** Reject attributes that do not apply to the selected optimizer. */
+void rejectAttributes(const std::unordered_set<std::string>& seen_attributes,
+                      std::initializer_list<std::string_view> attributes,
+                      const std::string& optimizer)
+{
+  for (const std::string_view attribute : attributes)
+    if (seen_attributes.find(std::string(attribute)) != seen_attributes.end())
+      throw UniformCommunicateError("WFTrainDriverInput: " + std::string(attribute) +
+                                    " is not valid for optimizer=\"" + optimizer + "\"");
 }
 
 /** Reject nested elements and non-whitespace text in the attribute-only section. */
@@ -138,13 +183,33 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       throw UniformCommunicateError("WFTrainDriverInput: duplicate training attribute " + name);
   }
 
-  objective_            = Objective::ENERGY;
-  optimizer_            = Optimizer::ADAM;
-  parameter_chunk_size_ = 65536;
-  learning_rate_        = 1.0e-3;
-  adam_beta1_           = 0.9;
-  adam_beta2_           = 0.999;
-  epsilon_              = 1.0e-8;
+  objective_                        = Objective::ENERGY;
+  optimizer_                        = Optimizer::ADAM;
+  parameter_chunk_size_             = 65536;
+  learning_rate_                    = 1.0e-3;
+  adam_beta1_                       = 0.9;
+  adam_beta2_                       = 0.999;
+  epsilon_                          = 1.0e-8;
+  damping_                          = 1.0e-3;
+  damping_multiplier_               = 10.0;
+  minimum_retry_damping_            = 1.0e-8;
+  maximum_damping_attempts_         = 3;
+  maximum_update_norm_              = 0.0;
+  maximum_metric_norm_              = 0.0;
+  center_shift_                     = 1.0;
+  objective_tolerance_              = 1.0e-9;
+  spring_history_decay_             = 0.99;
+  spring_maximum_update_norm_squared_ = 0.0;
+  krylov_relative_tolerance_         = 1.0e-8;
+  krylov_absolute_tolerance_         = 0.0;
+  krylov_maximum_iterations_         = 100;
+  krylov_maximum_operator_applications_ = 101;
+  krylov_maximum_seconds_              = 0.0;
+  krylov_stagnation_window_            = 0;
+  krylov_minimum_relative_improvement_ = 1.0e-4;
+  krylov_curvature_tolerance_          = 0.0;
+  krylov_imaginary_tolerance_          = 64.0;
+  maximum_retained_bytes_              = 0;
   checkpoint_path_.clear();
   restart_path_.clear();
   provider_id_.clear();
@@ -159,9 +224,17 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (seen_attributes.find("optimizer") != seen_attributes.end())
   {
     const std::string optimizer = readAttribute(training_node, "optimizer");
-    if (optimizer != "adam")
+    if (optimizer == "adam")
+      optimizer_ = Optimizer::ADAM;
+    else if (optimizer == "sr")
+      optimizer_ = Optimizer::STOCHASTIC_RECONFIGURATION;
+    else if (optimizer == "minsr")
+      optimizer_ = Optimizer::MINIMUM_STEP_SR;
+    else if (optimizer == "spring")
+      optimizer_ = Optimizer::SPRING;
+    else
       throw UniformCommunicateError("WFTrainDriverInput: unsupported optimizer=\"" + optimizer +
-                                    "\"; the initial driver supports exactly adam");
+                                    "\"; supported optimizers are adam, sr, minsr, and spring");
   }
   if (seen_attributes.find("parameter_chunk_size") != seen_attributes.end())
     parameter_chunk_size_ = parsePositiveSize(readAttribute(training_node, "parameter_chunk_size"),
@@ -182,6 +255,78 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
     if (!(epsilon_ > 0.0))
       throw UniformCommunicateError("WFTrainDriverInput: epsilon must be positive");
   }
+  if (seen_attributes.find("damping") != seen_attributes.end())
+    damping_ = parseNonnegativeReal(readAttribute(training_node, "damping"), "damping");
+  if (seen_attributes.find("damping_multiplier") != seen_attributes.end())
+  {
+    damping_multiplier_ = parseFiniteReal(readAttribute(training_node, "damping_multiplier"), "damping_multiplier");
+    if (!(damping_multiplier_ > 1.0))
+      throw UniformCommunicateError("WFTrainDriverInput: damping_multiplier must be greater than one");
+  }
+  if (seen_attributes.find("minimum_retry_damping") != seen_attributes.end())
+  {
+    minimum_retry_damping_ = parseFiniteReal(readAttribute(training_node, "minimum_retry_damping"),
+                                             "minimum_retry_damping");
+    if (!(minimum_retry_damping_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: minimum_retry_damping must be positive");
+  }
+  if (seen_attributes.find("maximum_damping_attempts") != seen_attributes.end())
+    maximum_damping_attempts_ = parsePositiveSize(readAttribute(training_node, "maximum_damping_attempts"),
+                                                  "maximum_damping_attempts");
+  if (seen_attributes.find("maximum_update_norm") != seen_attributes.end())
+    maximum_update_norm_ = parseNonnegativeReal(readAttribute(training_node, "maximum_update_norm"),
+                                                "maximum_update_norm");
+  if (seen_attributes.find("maximum_metric_norm") != seen_attributes.end())
+    maximum_metric_norm_ = parseNonnegativeReal(readAttribute(training_node, "maximum_metric_norm"),
+                                                "maximum_metric_norm");
+  if (seen_attributes.find("center_shift") != seen_attributes.end())
+    center_shift_ = parseNonnegativeReal(readAttribute(training_node, "center_shift"), "center_shift");
+  if (seen_attributes.find("objective_tolerance") != seen_attributes.end())
+    objective_tolerance_ = parseNonnegativeReal(readAttribute(training_node, "objective_tolerance"),
+                                                "objective_tolerance");
+  if (seen_attributes.find("spring_history_decay") != seen_attributes.end())
+    spring_history_decay_ = parseDecay(readAttribute(training_node, "spring_history_decay"),
+                                       "spring_history_decay");
+  if (seen_attributes.find("spring_maximum_update_norm_squared") != seen_attributes.end())
+    spring_maximum_update_norm_squared_ = parseNonnegativeReal(
+        readAttribute(training_node, "spring_maximum_update_norm_squared"),
+        "spring_maximum_update_norm_squared");
+  if (seen_attributes.find("krylov_relative_tolerance") != seen_attributes.end())
+    krylov_relative_tolerance_ = parseNonnegativeReal(
+        readAttribute(training_node, "krylov_relative_tolerance"), "krylov_relative_tolerance");
+  if (seen_attributes.find("krylov_absolute_tolerance") != seen_attributes.end())
+    krylov_absolute_tolerance_ = parseNonnegativeReal(
+        readAttribute(training_node, "krylov_absolute_tolerance"), "krylov_absolute_tolerance");
+  if (seen_attributes.find("krylov_maximum_iterations") != seen_attributes.end())
+    krylov_maximum_iterations_ = parsePositiveSize(readAttribute(training_node, "krylov_maximum_iterations"),
+                                                   "krylov_maximum_iterations");
+  if (seen_attributes.find("krylov_maximum_operator_applications") != seen_attributes.end())
+    krylov_maximum_operator_applications_ = parsePositiveSize(
+        readAttribute(training_node, "krylov_maximum_operator_applications"),
+        "krylov_maximum_operator_applications");
+  if (seen_attributes.find("krylov_maximum_seconds") != seen_attributes.end())
+    krylov_maximum_seconds_ = parseNonnegativeReal(readAttribute(training_node, "krylov_maximum_seconds"),
+                                                   "krylov_maximum_seconds");
+  if (seen_attributes.find("krylov_stagnation_window") != seen_attributes.end())
+    krylov_stagnation_window_ = parseNonnegativeSize(readAttribute(training_node, "krylov_stagnation_window"),
+                                                     "krylov_stagnation_window");
+  if (seen_attributes.find("krylov_minimum_relative_improvement") != seen_attributes.end())
+    krylov_minimum_relative_improvement_ = parseNonnegativeReal(
+        readAttribute(training_node, "krylov_minimum_relative_improvement"),
+        "krylov_minimum_relative_improvement");
+  if (seen_attributes.find("krylov_curvature_tolerance") != seen_attributes.end())
+    krylov_curvature_tolerance_ = parseNonnegativeReal(
+        readAttribute(training_node, "krylov_curvature_tolerance"), "krylov_curvature_tolerance");
+  if (seen_attributes.find("krylov_imaginary_tolerance") != seen_attributes.end())
+  {
+    krylov_imaginary_tolerance_ = parseFiniteReal(
+        readAttribute(training_node, "krylov_imaginary_tolerance"), "krylov_imaginary_tolerance");
+    if (!(krylov_imaginary_tolerance_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: krylov_imaginary_tolerance must be positive");
+  }
+  if (seen_attributes.find("maximum_retained_bytes") != seen_attributes.end())
+    maximum_retained_bytes_ = parseNonnegativeSize(readAttribute(training_node, "maximum_retained_bytes"),
+                                                   "maximum_retained_bytes");
   if (seen_attributes.find("checkpoint_path") != seen_attributes.end())
     checkpoint_path_ = readAttribute(training_node, "checkpoint_path");
   if (seen_attributes.find("restart_path") != seen_attributes.end())
@@ -195,6 +340,49 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
 
   if (!checkpoint_path_.empty() && checkpoint_path_ == restart_path_)
     throw UniformCommunicateError("WFTrainDriverInput: checkpoint_path and restart_path must differ");
+
+  const std::initializer_list<std::string_view> adam_attributes = {"adam_beta1", "adam_beta2", "epsilon"};
+  const std::initializer_list<std::string_view> matrix_free_attributes = {
+      "damping", "damping_multiplier", "minimum_retry_damping", "maximum_damping_attempts",
+      "maximum_update_norm", "maximum_metric_norm", "center_shift", "objective_tolerance",
+      "spring_history_decay", "spring_maximum_update_norm_squared", "krylov_relative_tolerance",
+      "krylov_absolute_tolerance", "krylov_maximum_iterations", "krylov_maximum_operator_applications",
+      "krylov_maximum_seconds", "krylov_stagnation_window", "krylov_minimum_relative_improvement",
+      "krylov_curvature_tolerance", "krylov_imaginary_tolerance"};
+  const std::initializer_list<std::string_view> sr_only_attributes = {
+      "damping_multiplier", "minimum_retry_damping", "maximum_damping_attempts", "maximum_metric_norm"};
+  const std::initializer_list<std::string_view> minimum_step_attributes = {"center_shift",
+                                                                           "objective_tolerance"};
+  const std::initializer_list<std::string_view> spring_only_attributes = {
+      "spring_history_decay", "spring_maximum_update_norm_squared"};
+  switch (optimizer_)
+  {
+  case Optimizer::ADAM:
+    rejectAttributes(seen_attributes, matrix_free_attributes, "adam");
+    break;
+  case Optimizer::STOCHASTIC_RECONFIGURATION:
+    rejectAttributes(seen_attributes, adam_attributes, "sr");
+    rejectAttributes(seen_attributes, minimum_step_attributes, "sr");
+    rejectAttributes(seen_attributes, spring_only_attributes, "sr");
+    break;
+  case Optimizer::MINIMUM_STEP_SR:
+    rejectAttributes(seen_attributes, adam_attributes, "minsr");
+    rejectAttributes(seen_attributes, sr_only_attributes, "minsr");
+    rejectAttributes(seen_attributes, spring_only_attributes, "minsr");
+    if (!(damping_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"minsr\" requires positive damping");
+    break;
+  case Optimizer::SPRING:
+    rejectAttributes(seen_attributes, adam_attributes, "spring");
+    rejectAttributes(seen_attributes, sr_only_attributes, "spring");
+    if (!(damping_ > 0.0))
+      throw UniformCommunicateError("WFTrainDriverInput: optimizer=\"spring\" requires positive damping");
+    break;
+  }
+  if (optimizer_ != Optimizer::ADAM && krylov_relative_tolerance_ == 0.0 &&
+      krylov_absolute_tolerance_ == 0.0)
+    throw UniformCommunicateError(
+        "WFTrainDriverInput: matrix-free optimization requires a positive Krylov tolerance");
 }
 
 } // namespace qmcplusplus

@@ -43,7 +43,7 @@ public:
   /** Validate the all-electron training contract and establish native walkers. */
   void process(xmlNodePtr node) override;
 
-  /** Sample live walkers and publish one streamed Adam update per block. */
+  /** Sample live walkers and publish one selected bounded-memory update per block. */
   void run() override;
 
 private:
