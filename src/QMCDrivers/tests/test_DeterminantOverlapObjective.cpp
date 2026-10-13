@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "Message/Communicate.h"
+#include "Message/CommOperators.h"
 #include "Particle/ParticleSet.h"
 #include "QMCDrivers/WFTrain/DeterminantOverlapObjective.h"
 #include "QMCWaveFunctions/ConstantOrbital.h"
@@ -247,6 +248,16 @@ TEST_CASE("Determinant overlap applies two bounded passes on uneven MPI ranks",
   CHECK(result.channels.size() == 2);
   CHECK(student.amplitudeCalls() == 2 * sample_ids.size());
   CHECK(student.reverseCalls() == sample_ids.size());
+  const auto loss_only = objective.evaluate(communicator, batches, false);
+  CHECK(loss_only.loss == Approx(result.loss).margin(2.0e-13));
+  CHECK(loss_only.parameter_gradient.empty());
+  CHECK(loss_only.sample_loss_influences.size() == sample_ids.size());
+  CHECK(student.reverseCalls() == sample_ids.size());
+  double influence_sum = 0.0;
+  for (double influence : loss_only.sample_loss_influences)
+    influence_sum += influence;
+  communicator.allreduce(influence_sum);
+  CHECK(influence_sum == Approx(0.0).margin(2.0e-13));
 #endif
 }
 

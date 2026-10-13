@@ -4,6 +4,21 @@
 # emitted only after refresh succeeds, so its presence is the application-level
 # completion criterion.
 if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  foreach(SEARCH_CASE reference endpoints overlap_search rejected)
+    foreach(SEARCH_RANKS 1 2)
+      set(SEARCH_TEST short-H2-psiformer-search-${SEARCH_CASE}-r${SEARCH_RANKS}-t1)
+      set(TEST_ADDED FALSE)
+      run_qmc_app(${SEARCH_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+                  ${SEARCH_RANKS} 1 TEST_ADDED wftrain_${SEARCH_CASE}.xml)
+      if(TEST_ADDED)
+        if(SEARCH_CASE STREQUAL "rejected")
+          set_property(TEST ${SEARCH_TEST} PROPERTY PASS_REGULAR_EXPRESSION "WFTrain iteration 2 version 0")
+        else()
+          set_property(TEST ${SEARCH_TEST} PROPERTY PASS_REGULAR_EXPRESSION "selected_alpha")
+        endif()
+      endif()
+    endforeach()
+  endforeach()
   set(TEST_NAME short-H2-ae-psiformer-wftrain-r1-t1)
   set(TEST_ADDED FALSE)
   run_qmc_app(

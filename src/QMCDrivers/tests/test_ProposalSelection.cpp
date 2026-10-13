@@ -1,0 +1,136 @@
+//////////////////////////////////////////////////////////////////////////////////////
+// This file is distributed under the University of Illinois/NCSA Open Source License.
+// See LICENSE file in top directory for details.
+// Copyright (c) 2026 QMCPACK developers.
+//////////////////////////////////////////////////////////////////////////////////////
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include "QMCDrivers/WFTrain/ProposalSelection.h"
+#include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
+#include "OhmmsData/Libxml2Doc.h"
+
+namespace qmcplusplus::wftrain
+{
+namespace
+{
+/// Publish-counting provider for checking that rejection leaves the model untouched.
+class SelectionProvider final : public StructuredParameterProvider
+{
+public:
+  StructuredParameterSchema schema{"selection", {
+      {"weight", {2}, 0, 2, ParameterScalarDomain::REAL64, true, "weights"},
+      {"bias", {1}, 2, 1, ParameterScalarDomain::REAL64, true, "bias"},
+      {"fixed", {1}, 3, 1, ParameterScalarDomain::REAL64, false, "fixed"}}};
+  StructuredParameterSnapshot parameters{schema.fingerprint(), 0, {2, 4, 6, 8}};
+  const StructuredParameterSchema& parameterSchema() const noexcept override { return schema; }
+  StructuredParameterSnapshot snapshotParameters() const override { return parameters; }
+  std::size_t publishParameters(const StructuredParameterSnapshot& candidate, std::size_t version) override
+  {
+    REQUIRE(version == parameters.version);
+    parameters = candidate;
+    return ++parameters.version;
+  }
+};
+
+/// A deterministic direction and recurrence counters independent of the selector.
+class SelectionOptimizer final : public TrainingUpdateRule
+{
+public:
+  int accepted = 0;
+  int rejected = 0;
+  StructuredParameterSnapshot propose(const StructuredParameterSchema&,
+                                      const StructuredParameterSnapshot& old,
+                                      ParameterGradientView) override
+  {
+    auto result = old;
+    result.values[0] += 4;
+    result.values[1] -= 2;
+    result.values[2] += 1;
+    return result;
+  }
+  void proposalAccepted(const StructuredParameterSchema&, const StructuredParameterSnapshot&,
+                        ParameterGradientView) noexcept override { ++accepted; }
+  void proposalRejected() noexcept override { ++rejected; }
+};
+}
+
+TEST_CASE("Proposal scaling and decay preserve frozen and nonselected tensors", "[drivers][training][selection]")
+{
+  SelectionProvider provider;
+  SelectionOptimizer optimizer;
+  const std::vector<double> gradient(4, 0.0);
+  const ParameterGradientView objective{provider.schema.fingerprint(), 0, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  ProposalSelectionControl control;
+  control.update_scale = 0.5;
+  control.weight_decay = 0.1;
+  control.decay_blocks = {"weight", "fixed"};
+  SelectedUpdateRule selection(optimizer, control);
+  const auto old = provider.parameters;
+  CHECK(completeParameterUpdate(provider, old, objective, selection, {}) == 1);
+  CHECK(provider.parameters.values[0] == Catch::Approx(3.8));
+  CHECK(provider.parameters.values[1] == Catch::Approx(2.6));
+  CHECK(provider.parameters.values[2] == Catch::Approx(6.5));
+  CHECK(provider.parameters.values[3] == 8.0);
+  CHECK(optimizer.accepted == 1);
+  CHECK(optimizer.rejected == 0);
+}
+
+TEST_CASE("Line-search rejection preserves version parameters and recurrence", "[drivers][training][selection]")
+{
+  SelectionProvider provider;
+  SelectionOptimizer optimizer;
+  const std::vector<double> gradient(4, 0.0);
+  const ParameterGradientView objective{provider.schema.fingerprint(), 0, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  SelectedUpdateRule selection(optimizer, {}, [](const auto&, const auto&) { return 0.0; });
+  const auto old = provider.parameters;
+  CHECK(completeParameterUpdate(provider, old, objective, selection, {}) == 0);
+  CHECK(provider.parameters.values == old.values);
+  CHECK(optimizer.accepted == 0);
+  CHECK(optimizer.rejected == 1);
+}
+
+TEST_CASE("Proposal expansion respects final displacement bound", "[drivers][training][selection]")
+{
+  SelectionProvider provider;
+  SelectionOptimizer optimizer;
+  const std::vector<double> gradient(4, 0.0);
+  const ParameterGradientView objective{provider.schema.fingerprint(), 0, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  ProposalSelectionControl control;
+  control.maximum_update_norm = 1.0;
+  SelectedUpdateRule selection(optimizer, control, [](const auto&, const auto&) { return 2.0; });
+  selection.propose(provider.schema, provider.parameters, objective);
+  CHECK(selection.displacementNorm() == Catch::Approx(1.0));
+}
+
+TEST_CASE("Line-search controls parse strictly with backwards compatible defaults", "[drivers][training][selection]")
+{
+  auto parse = [](const std::string& attributes) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString("<qmc><training " + attributes + "/></qmc>"));
+    WFTrainDriverInput input;
+    input.readXML(document.getRoot());
+    return input;
+  };
+  const auto defaults = parse("");
+  CHECK(defaults.getLineSearch() == WFTrainDriverInput::LineSearch::OFF);
+  CHECK(defaults.getUpdateScale() == 1.0);
+  CHECK(defaults.getWeightDecay() == 0.0);
+  const auto input = parse("line_search=\"endpoints\" update_scale=\"0.25\" weight_decay=\"0.001\" "
+                           "weight_decay_scope=\"nn_weights\" line_search_warmup_steps=\"3\" "
+                           "line_search_sampling_steps=\"4\"");
+  CHECK(input.getLineSearch() == WFTrainDriverInput::LineSearch::ENDPOINTS);
+  CHECK(input.getUpdateScale() == 0.25);
+  CHECK(input.getWeightDecay() == 0.001);
+  CHECK(input.getLineSearchWarmupSteps() == 3);
+  CHECK(input.getLineSearchSamplingSteps() == 4);
+  for (const auto& invalid : {"line_search=\"unknown\"", "update_scale=\"-1\"",
+                              "weight_decay=\"1\"", "weight_decay_scope=\"all\"",
+                              "line_search_minimum_ess_fraction=\"0\"",
+                              "line_search_maximum_weight=\"2\"", "line_search_sampling_steps=\"0\""})
+    CHECK_THROWS(parse(invalid));
+}
+}
+

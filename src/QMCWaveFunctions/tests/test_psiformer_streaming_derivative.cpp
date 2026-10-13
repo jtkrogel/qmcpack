@@ -688,6 +688,52 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
   CHECK(stale_sink.state() == DerivativeSinkState::POISONED);
 }
 
+TEST_CASE("PsiFormer candidate clones isolate flat parameters and native graph leaves",
+          "[wavefunction][psiformer][training][selection]")
+{
+  using namespace testing::psiformer;
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell cell;
+  for (const char* backend : {"direct", "oracle"})
+  {
+    ScopedEnvironmentVariable value_backend("PSIFORMER_VALUE_BACKEND", backend);
+    ScopedEnvironmentVariable spatial_backend("PSIFORMER_SPATIAL_BACKEND", backend);
+    ParticleSet electrons = makeElectrons(cell);
+    PsiFormerWF component("candidate_isolation", files.parameters.string(),
+                          files.configuration.string());
+    const auto before = component.snapshotParameters();
+    electrons.G = QMCTraits::GradType{};
+    electrons.L = QMCTraits::ValueType{};
+    const auto reference = component.evaluateLog(electrons, electrons.G, electrons.L);
+    auto speculative = component.makeClone(electrons);
+    auto& provider = *speculative->structuredParameterProvider();
+    provider.isolateParameterState();
+    auto candidate = provider.snapshotParameters();
+    REQUIRE(candidate.schema_fingerprint == before.schema_fingerprint);
+    candidate.values[0] += 0.05;
+    provider.publishParameters(candidate, candidate.version);
+    electrons.G = QMCTraits::GradType{};
+    electrons.L = QMCTraits::ValueType{};
+    const auto proposed = speculative->evaluateLog(electrons, electrons.G, electrons.L);
+    CHECK(std::real(proposed) != Approx(std::real(reference)).margin(1.0e-12));
+    CHECK(component.snapshotParameters().values == before.values);
+    CHECK(component.snapshotParameters().version == before.version);
+    electrons.G = QMCTraits::GradType{};
+    electrons.L = QMCTraits::ValueType{};
+    const auto unchanged = component.evaluateLog(electrons, electrons.G, electrons.L);
+    CHECK(std::real(unchanged) == Approx(std::real(reference)).margin(1.0e-12));
+    // Typed weight selection excludes cusp and envelope tensors even though
+    // their schema entries remain trainable for ordinary optimization.
+    const auto decay_blocks = component.neuralWeightBlocks();
+    REQUIRE_FALSE(decay_blocks.empty());
+    for (const auto& id : decay_blocks)
+    {
+      CHECK(id.find("cusp") == std::string::npos);
+      CHECK(id.find("envelope") == std::string::npos);
+    }
+  }
+}
+
 TEST_CASE("Wavefunction components reject unsupported streaming derivative factories",
           "[wavefunction][training][streaming]")
 {
