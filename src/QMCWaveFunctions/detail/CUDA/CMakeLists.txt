@@ -53,3 +53,38 @@ else()
   set_target_properties(psiformer_device_link_check PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 target_link_libraries(psiformer_device_link_check PRIVATE psiformer_device)
+
+# Opt-in actual-device checks, deliberately not registered with offline CTest.
+# --host-check is safe on driverless hosts; ordinary execution requires hardware.
+add_executable(psiformer_device_runtime_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceRuntimeValidation.cu)
+if(QMC_CUDA2HIP)
+  set_source_files_properties(PsiFormerDeviceRuntimeValidation.cu PROPERTIES LANGUAGE HIP)
+else()
+  set_target_properties(psiformer_device_runtime_validation PROPERTIES
+                        CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(psiformer_device_runtime_validation PRIVATE psiformer_device)
+
+# Whole-model validation imports portable HDF5 data but remains independent of
+# the production QMC application and its intentionally disabled device policy.
+add_executable(psiformer_device_model_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceModelValidation.cu
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../../PsiFormer/PsiFormerGeometry.cpp)
+if(QMC_CUDA2HIP)
+  set_source_files_properties(PsiFormerDeviceModelValidation.cu PROPERTIES LANGUAGE HIP)
+else()
+  set_target_properties(psiformer_device_model_validation PROPERTIES
+                        CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA)
+
+# Correctness oracles must retain IEEE NaN/infinity semantics even when the
+# application's Release flags use fast-math. Library kernel policy is unchanged.
+foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation)
+  target_compile_options(${validation_target} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math>)
+endforeach()
