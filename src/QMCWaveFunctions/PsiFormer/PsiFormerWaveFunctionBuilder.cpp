@@ -9,6 +9,7 @@
  * @brief XML construction of the PsiFormer wavefunction component.
  */
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
+#include "DeviceManager.h"
 #include "Message/CommOperators.h"
 #include "OhmmsData/AttributeSet.h"
 #include "OhmmsData/XMLParsingString.h"
@@ -31,6 +32,55 @@ namespace qmcplusplus
 {
 namespace
 {
+/// Normalize the small backend token without locale-dependent comparisons.
+std::string normalizedAcceleratorRequest(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  return value;
+}
+
+/** Inspect only platform/runtime presence; no PsiFormer operation is production-ready yet.
+ *
+ * Operation coverage deliberately remains zero and runtime validation remains
+ * NOT_RUN until the complete numerical executor is connected and tested.
+ */
+psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
+{
+  const psiformer::PsiFormerCompiledAcceleratorSupport support =
+      psiformer::compiledPsiFormerAcceleratorSupport();
+  const bool usable_device = DeviceManager::getGlobal().getNumDevices() > 0;
+
+  psiformer::PsiFormerAcceleratorReadiness readiness;
+  readiness.cuda.compiled       = support.cuda;
+  readiness.cuda.usable_device = support.cuda && usable_device;
+  readiness.hip.compiled        = support.hip;
+  readiness.hip.usable_device  = support.hip && usable_device;
+  return readiness;
+}
+
+/** Resolve XML policy without querying a runtime for CPU or malformed requests. */
+psiformer::PsiFormerAcceleratorResolution resolveAcceleratorRequest(
+    const std::string& request,
+    const PsiFormerAcceleratorReadinessProvider* readiness_provider)
+{
+  const std::string normalized = normalizedAcceleratorRequest(request);
+  if (normalized.empty() || normalized == "no" || normalized == "cpu")
+    return psiformer::resolvePsiFormerAcceleratorRequest(normalized, {});
+
+  // Let the common resolver provide precise unsupported/invalid diagnostics
+  // without needlessly initializing or consulting any device runtime.
+  if (normalized != "auto" && normalized != "yes" && normalized != "cuda" &&
+      normalized != "hip")
+    return psiformer::resolvePsiFormerAcceleratorRequest(normalized, {});
+
+  const psiformer::PsiFormerAcceleratorReadiness readiness = readiness_provider
+      ? readiness_provider->inspect()
+      : inspectProductionAcceleratorReadiness();
+  return psiformer::resolvePsiFormerAcceleratorRequest(normalized, readiness);
+}
+
 /// Parse the conventional QMCPACK yes/no spellings used for XML attributes.
 bool parseOptimizationFlag(std::string value)
 {
@@ -113,7 +163,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 {
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
   std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
-  std::string optimize = "no", optimize_scope = "indices", optimize_indices;
+  std::string optimize = "no", optimize_scope = "indices", optimize_indices, gpu = "no";
   ParticleSet::PosType reduced_twist(0.0);
 
   // Both files use the compact export format consumed by PsiFormerNative.h.
@@ -132,12 +182,23 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(optimize, "optimize");
   attributes.add(optimize_scope, "optimize_scope");
   attributes.add(optimize_indices, "optimize_indices");
+  attributes.add(gpu, "gpu");
   attributes.put(cur);
 
   // OhmmsAttributeSet tokenizes std::string values at whitespace. Read this
   // list directly so both documented separators survive XML parsing.
   if (xmlHasProp(cur, BAD_CAST "optimize_indices") != nullptr)
     optimize_indices = getXMLAttributeValue(cur, "optimize_indices");
+
+  // Resolve before parsing mutable target metadata or opening either model
+  // file. Strict requests therefore fail without HDF5 or ParticleSet effects;
+  // auto records an explicit CPU fallback until numerical dispatch is ready.
+  const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
+      resolveAcceleratorRequest(gpu, accelerator_readiness_provider_);
+  if (accelerator_resolution.backend !=
+      psiformer::PsiFormerAcceleratorBackend::CPU)
+    throw std::runtime_error(
+        "PsiFormer accelerator execution is not available until complete numerical dispatch is connected");
 
   const bool internal_initialization = !initialization.empty();
   const bool has_parameter_path      = !parameters.empty();
@@ -303,17 +364,19 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     }
     component = std::make_unique<PsiFormerWF>(
         name, std::move(initialized), targetPtcl, *source_particles, optimization_enabled,
-        std::move(selected_indices), optimize_all, export_parameters, twist_array);
+        std::move(selected_indices), optimize_all, export_parameters, twist_array,
+        accelerator_resolution);
   }
   else if (periodic)
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, targetPtcl,
                                               *source_particles, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
-                                              export_parameters, twist_array);
+                                              export_parameters, twist_array,
+                                              accelerator_resolution);
   else
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
-                                              export_parameters);
+                                              export_parameters, accelerator_resolution);
 
   if (system != "auto")
     component->validateSystem(targetPtcl, *source_particles, system);

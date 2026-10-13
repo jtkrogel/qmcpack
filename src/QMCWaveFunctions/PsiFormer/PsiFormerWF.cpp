@@ -814,6 +814,42 @@ std::shared_ptr<const wftrain::StructuredParameterSchema> makeStructuredParamete
       "psiformer/" + component_name, std::move(blocks));
 }
 
+/** Validate the currently supported production route before model materialization.
+ *
+ * A CPU result is either an explicit request or one structurally valid automatic
+ * fallback. A ready accelerator result is rejected until numerical dispatch is
+ * complete, even if a caller forges such a resolution directly.
+ */
+psiformer::PsiFormerAcceleratorResolution validateCpuAcceleratorResolution(
+    psiformer::PsiFormerAcceleratorResolution resolution)
+{
+  using Backend = psiformer::PsiFormerAcceleratorBackend;
+  using Reason  = psiformer::PsiFormerAcceleratorResolutionReason;
+
+  if (resolution.backend != Backend::CPU)
+    throw std::invalid_argument(
+        "PsiFormer accelerator execution is not available until complete numerical dispatch is connected");
+
+  if (resolution.reason == Reason::CPU_REQUESTED)
+  {
+    if (resolution.readiness_records_consulted != 0 || resolution.fallback_count != 0)
+      throw std::invalid_argument("PsiFormer CPU accelerator resolution has inconsistent diagnostics");
+    return resolution;
+  }
+
+  const bool valid_fallback_reason =
+      resolution.reason == Reason::NOT_COMPILED ||
+      resolution.reason == Reason::NO_USABLE_DEVICE ||
+      resolution.reason == Reason::INCOMPLETE_OPERATION_COVERAGE ||
+      resolution.reason == Reason::RUNTIME_VALIDATION_NOT_RUN ||
+      resolution.reason == Reason::RUNTIME_VALIDATION_FAILED;
+  if (!valid_fallback_reason || resolution.fallback_count != 1 ||
+      resolution.readiness_records_consulted == 0 ||
+      resolution.readiness_records_consulted > 2)
+    throw std::invalid_argument("PsiFormer automatic CPU fallback has inconsistent diagnostics");
+  return resolution;
+}
+
 } // namespace
 
 /** Shared native model protected at the optimizer/evaluator synchronization
@@ -822,8 +858,14 @@ class PsiFormerSharedState
 {
 public:
   /// Load the model that all clones of one PsiFormer component will share.
-  PsiFormerSharedState(const std::string& parameters, const std::string& configuration)
-      : PsiFormerSharedState(pf::PsiFormer(parameters, configuration), "hdf5", "external_hdf5", 0, {}, {})
+  PsiFormerSharedState(
+      const std::string& parameters,
+      const std::string& configuration,
+      psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+      : PsiFormerSharedState([&]() {
+          validateCpuAcceleratorResolution(accelerator_resolution);
+          return pf::PsiFormer(parameters, configuration);
+        }(), "hdf5", "external_hdf5", 0, {}, {}, accelerator_resolution)
   {}
 
   /// Load and retarget a periodic import against explicit runtime particle sets.
@@ -831,34 +873,41 @@ public:
                        const std::string& configuration,
                        const ParticleSet& electrons,
                        const ParticleSet& ions,
-                       std::array<double, 3> reduced_twist)
+                       std::array<double, 3> reduced_twist,
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
       : PsiFormerSharedState([&]() {
+          validateCpuAcceleratorResolution(accelerator_resolution);
           validateMatchingLattices(electrons, ions);
           pf::PsiFormer model(parameters, configuration);
           const auto environment = makeExecutionEnvironment(electrons);
           retargetPeriodicNuclei(model, ions, environment);
           return model;
         }(), "hdf5", "external_hdf5", 0, makeExecutionEnvironment(electrons),
-            makeTwistPhase(electrons, reduced_twist))
+            makeTwistPhase(electrons, reduced_twist), accelerator_resolution)
   {}
 
   /// Materialize a fresh in-memory model and retain its reproducibility provenance.
   PsiFormerSharedState(psiformer::InitializedPsiFormerParameters initialized,
                        const ParticleSet& electrons,
                        const ParticleSet& ions,
-                       std::array<double, 3> reduced_twist)
-      : PsiFormerSharedState(makeInitializedNativeModel(std::move(initialized), electrons, ions),
-                             makeExecutionEnvironment(electrons),
-                             makeTwistPhase(electrons, reduced_twist))
+                       std::array<double, 3> reduced_twist,
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+      : PsiFormerSharedState([&]() {
+          validateCpuAcceleratorResolution(accelerator_resolution);
+          return makeInitializedNativeModel(std::move(initialized), electrons, ions);
+        }(), makeExecutionEnvironment(electrons),
+            makeTwistPhase(electrons, reduced_twist), accelerator_resolution)
   {}
 
   /// Take ownership of a converted initialized model without copying its flat parameters.
   PsiFormerSharedState(InitializedNativeModel initialized,
                        psiformer::ExecutionEnvironment environment,
-                       PsiFormerTwistPhase twist_phase)
+                       PsiFormerTwistPhase twist_phase,
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
       : PsiFormerSharedState(std::move(initialized.model), "internal",
                              std::move(initialized.profile), initialized.seed,
-                             std::move(environment), std::move(twist_phase))
+                             std::move(environment), std::move(twist_phase),
+                             accelerator_resolution)
   {}
 
   /// Complete shared executor construction for imported and internally initialized models.
@@ -867,8 +916,10 @@ public:
                        std::string profile,
                        std::uint64_t seed,
                        psiformer::ExecutionEnvironment environment,
-                       PsiFormerTwistPhase twist_phase)
-      : model(std::move(model_input)),
+                       PsiFormerTwistPhase twist_phase,
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+      : accelerator_resolution(validateCpuAcceleratorResolution(accelerator_resolution)),
+        model(std::move(model_input)),
         model_origin(std::move(origin)),
         initialization_profile(std::move(profile)),
         initialization_seed(seed),
@@ -923,6 +974,8 @@ public:
   /// Number of pending planned selected crowd transactions sharing this model.
   /// Each crowd checks in once, never once per lane.
   std::atomic<std::size_t> planned_selected_transaction_count{0};
+  /// Immutable resolved production route shared by every component clone.
+  const psiformer::PsiFormerAcceleratorResolution accelerator_resolution;
   pf::PsiFormer model;
   /// Whether the initial model came from the legacy HDF5 import or an internal initializer.
   const std::string model_origin;
@@ -3785,9 +3838,11 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          bool enable_optimization,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
-                         std::string optimized_parameter_export)
+                         std::string optimized_parameter_export,
+                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
     : PsiFormerWF(std::move(name),
-                  std::make_shared<PsiFormerSharedState>(parameters, configuration),
+                  std::make_shared<PsiFormerSharedState>(parameters, configuration,
+                                                         accelerator_resolution),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {}
@@ -3802,10 +3857,12 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
                          std::string optimized_parameter_export,
-                         std::array<double, 3> reduced_twist)
+                         std::array<double, 3> reduced_twist,
+                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
     : PsiFormerWF(std::move(name),
                   std::make_shared<PsiFormerSharedState>(parameters, configuration,
-                                                        electrons, ions, reduced_twist),
+                                                        electrons, ions, reduced_twist,
+                                                        accelerator_resolution),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {
@@ -3821,10 +3878,11 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
                          std::string optimized_parameter_export,
-                         std::array<double, 3> reduced_twist)
+                         std::array<double, 3> reduced_twist,
+                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
     : PsiFormerWF(std::move(name),
                   std::make_shared<PsiFormerSharedState>(std::move(initialized_parameters), electrons, ions,
-                                                        reduced_twist),
+                                                        reduced_twist, accelerator_resolution),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {
@@ -3917,6 +3975,14 @@ PsiFormerWF::PsiFormerWF(std::string name,
             << ", spatial_backend=" << directBackendModeName(model_state_->direct_spatial_mode)
             << ", score_backend=" << directBackendModeName(model_state_->direct_score_mode)
             << ", kinetic_backend=" << directBackendModeName(model_state_->direct_kinetic_mode)
+            << ", accelerator_backend="
+            << psiformer::psiFormerAcceleratorBackendName(
+                   model_state_->accelerator_resolution.backend)
+            << ", accelerator_reason="
+            << psiformer::psiFormerAcceleratorResolutionReasonName(
+                   model_state_->accelerator_resolution.reason)
+            << ", accelerator_fallbacks="
+            << model_state_->accelerator_resolution.fallback_count
             << std::endl;
   if (!selected_tensors.empty())
   {
@@ -6806,6 +6872,20 @@ PsiFormerWF::optimizationMetadataDiagnosticsForTesting() const
     if (optimization_metadata_->variables.where(local_index) >= 0)
       ++diagnostics.mapped_variable_count;
   return diagnostics;
+}
+
+// Expose only immutable route evidence and clone-family ownership to tests.
+testing::PsiFormerAcceleratorDiagnostics
+PsiFormerWF::acceleratorDiagnosticsForTesting() const noexcept
+{
+  const psiformer::PsiFormerAcceleratorResolution& resolution =
+      model_state_->accelerator_resolution;
+  return {resolution.backend,
+          resolution.reason,
+          resolution.readiness_records_consulted,
+          resolution.fallback_count,
+          model_state_.get(),
+          static_cast<std::size_t>(model_state_.use_count())};
 }
 
 // Register this object only when the input explicitly enabled optimization.

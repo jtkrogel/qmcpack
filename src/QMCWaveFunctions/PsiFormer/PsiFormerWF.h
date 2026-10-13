@@ -15,6 +15,7 @@
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "ResourceHandle.h"
 #include <array>
@@ -85,6 +86,17 @@ class PsiFormerOptimizationMetadata;
 
 namespace testing
 {
+/// Read-only accelerator-route evidence shared by one component clone family.
+struct PsiFormerAcceleratorDiagnostics
+{
+  psiformer::PsiFormerAcceleratorBackend backend;
+  psiformer::PsiFormerAcceleratorResolutionReason reason;
+  std::size_t readiness_records_consulted;
+  std::size_t fallback_count;
+  const void* shared_state_identity;
+  std::size_t shared_owner_count;
+};
+
 /** Describe clone-local native evaluator scratch without exposing implementation
  * workspace types through the public wavefunction interface. */
 struct PsiFormerWorkspaceDiagnostics
@@ -294,7 +306,8 @@ public:
               bool optimize = false,
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
-              std::string optimized_parameter_export = {});
+              std::string optimized_parameter_export = {},
+              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {});
 
   /// Load a periodic import and optionally apply a fixed reduced-twist outer phase.
   PsiFormerWF(std::string name,
@@ -306,7 +319,8 @@ public:
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
               std::string optimized_parameter_export = {},
-              std::array<double, 3> reduced_twist = {});
+              std::array<double, 3> reduced_twist = {},
+              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {});
 
   /** Construct a self-contained model from initialized parameters and QMCPACK
    * particle sets, optionally with a fixed reduced-twist outer phase. */
@@ -318,7 +332,8 @@ public:
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
               std::string optimized_parameter_export = {},
-              std::array<double, 3> reduced_twist = {});
+              std::array<double, 3> reduced_twist = {},
+              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {});
 
   /// Copy accepted state and optimizer mappings while dropping any in-flight proposal.
   PsiFormerWF(const PsiFormerWF& other);
@@ -1279,6 +1294,9 @@ private:
 
   /// Report shared optimizer metadata ownership and the empty inherited variable set.
   testing::PsiFormerOptimizationMetadataDiagnostics optimizationMetadataDiagnosticsForTesting() const;
+
+  /// Report immutable accelerator resolution and shared-state clone ownership.
+  testing::PsiFormerAcceleratorDiagnostics acceleratorDiagnosticsForTesting() const noexcept;
 
   /// Invalidate accepted/proposed caches and record the newly observed shared version.
   void invalidateParameterCaches(std::size_t parameter_version);

@@ -230,6 +230,13 @@ public:
     return component.optimizationMetadataDiagnosticsForTesting();
   }
 
+  /// Report immutable accelerator selection and shared-state identity.
+  static PsiFormerAcceleratorDiagnostics acceleratorDiagnostics(
+      const PsiFormerWF& component)
+  {
+    return component.acceleratorDiagnosticsForTesting();
+  }
+
   /// Report whether the component currently retains a nonempty participant view.
   static bool hasBatchExecutionPlan(const PsiFormerWF& component)
   {
@@ -1647,6 +1654,21 @@ OptVariables registerSelectedParameters(PsiFormerWF& component)
   return active;
 }
 
+/// Count builder readiness inspections while returning deterministic fake state.
+class CountingAcceleratorReadinessProvider final
+    : public PsiFormerAcceleratorReadinessProvider
+{
+public:
+  psiformer::PsiFormerAcceleratorReadiness readiness;
+  mutable std::size_t inspection_count = 0;
+
+  psiformer::PsiFormerAcceleratorReadiness inspect() const override
+  {
+    ++inspection_count;
+    return readiness;
+  }
+};
+
 /// Build a production-shape PsiFormer directly from XML and QMCPACK ParticleSets.
 std::unique_ptr<PsiFormerWF> buildInternalPsiFormer(PsiFormerWaveFunctionBuilder& builder,
                                                    const std::string& name,
@@ -1835,6 +1857,154 @@ TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "
   PsiFormerWaveFunctionBuilder spinor_builder(OHMMS::Controller, spinor_electrons, particle_sets);
   CHECK_THROWS_WITH(spinor_builder.buildComponent(fixed_document.getRoot()),
                     Catch::Matchers::ContainsSubstring("spinor"));
+}
+
+TEST_CASE("PsiFormer builder resolves accelerator policy before model construction",
+          "[wavefunction][psiformer][accelerator][builder]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap particle_sets;
+  auto ions = makeLiHIons(simulation_cell);
+  particle_sets.emplace(ions->getName(), std::move(ions));
+
+  CountingAcceleratorReadinessProvider provider;
+  provider.readiness.cuda = {
+      true, true, 0, psiformer::PsiFormerRuntimeValidation::NOT_RUN};
+  provider.readiness.hip = {
+      true, true, 0, psiformer::PsiFormerRuntimeValidation::NOT_RUN};
+  PsiFormerWaveFunctionBuilder builder(
+      OHMMS::Controller, electrons, particle_sets, &provider);
+
+  const auto build_with_gpu = [&](const std::string& suffix,
+                                  const std::string& gpu_attribute) {
+    std::ostringstream xml;
+    xml << "<psiformer name=\"pf_accelerator_" << suffix
+        << "\" parameters=\"" << files.parameters.string()
+        << "\" configuration=\"" << files.configuration.string() << "\"";
+    if (!gpu_attribute.empty())
+      xml << " gpu=\"" << gpu_attribute << "\"";
+    xml << "/>";
+    Libxml2Document document;
+    if (!document.parseFromString(xml.str()))
+      throw std::runtime_error("Unable to parse PsiFormer accelerator test XML");
+    std::unique_ptr<WaveFunctionComponent> base =
+        builder.buildComponent(document.getRoot());
+    auto* component = dynamic_cast<PsiFormerWF*>(base.release());
+    if (component == nullptr)
+      throw std::runtime_error("PsiFormer accelerator builder returned the wrong type");
+    return std::unique_ptr<PsiFormerWF>(component);
+  };
+
+  // Omitted and explicit CPU policies never inspect compiled/runtime state.
+  for (const auto& request :
+       std::vector<std::pair<std::string, std::string>>{{"absent", ""},
+                                                        {"no", "no"},
+                                                        {"cpu", "CPU"}})
+  {
+    const std::size_t before = provider.inspection_count;
+    std::unique_ptr<PsiFormerWF> component =
+        build_with_gpu(request.first, request.second);
+    CHECK(provider.inspection_count == before);
+    const auto diagnostics =
+        testing::TestPsiFormerWF::acceleratorDiagnostics(*component);
+    CHECK(diagnostics.backend == psiformer::PsiFormerAcceleratorBackend::CPU);
+    CHECK(diagnostics.reason ==
+          psiformer::PsiFormerAcceleratorResolutionReason::CPU_REQUESTED);
+    CHECK(diagnostics.readiness_records_consulted == 0);
+    CHECK(diagnostics.fallback_count == 0);
+  }
+
+  // Auto consults readiness once, records why it fell back, and remains CPU.
+  const std::size_t before_auto = provider.inspection_count;
+  std::unique_ptr<PsiFormerWF> automatic = build_with_gpu("auto", "auto");
+  CHECK(provider.inspection_count == before_auto + 1);
+  const auto automatic_diagnostics =
+      testing::TestPsiFormerWF::acceleratorDiagnostics(*automatic);
+  CHECK(automatic_diagnostics.backend ==
+        psiformer::PsiFormerAcceleratorBackend::CPU);
+  CHECK(automatic_diagnostics.reason ==
+        psiformer::PsiFormerAcceleratorResolutionReason::INCOMPLETE_OPERATION_COVERAGE);
+  CHECK(automatic_diagnostics.readiness_records_consulted == 2);
+  CHECK(automatic_diagnostics.fallback_count == 1);
+
+  std::unique_ptr<WaveFunctionComponent> clone_storage =
+      automatic->makeClone(electrons);
+  auto* clone = dynamic_cast<PsiFormerWF*>(clone_storage.get());
+  REQUIRE(clone != nullptr);
+  const auto clone_diagnostics =
+      testing::TestPsiFormerWF::acceleratorDiagnostics(*clone);
+  const auto shared_diagnostics =
+      testing::TestPsiFormerWF::acceleratorDiagnostics(*automatic);
+  CHECK(clone_diagnostics.shared_state_identity ==
+        shared_diagnostics.shared_state_identity);
+  CHECK(clone_diagnostics.shared_owner_count == 2);
+  CHECK(shared_diagnostics.shared_owner_count == 2);
+
+  // Strict and malformed requests fail before touching deliberately missing
+  // model files or adopting the supplied target twist.
+  const auto require_early_failure = [&](const std::string& gpu,
+                                         const std::string& expected_message) {
+    Libxml2Document document;
+    const std::string xml =
+        "<psiformer parameters=\"missing-parameters.h5\" "
+        "configuration=\"missing-configuration.h5\" gpu=\"" + gpu +
+        "\" twist=\"0.125 0 0\"/>";
+    REQUIRE(document.parseFromString(xml));
+    CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                      Catch::Matchers::ContainsSubstring(expected_message));
+    CHECK(electrons.getTwist()[0] == 0.0);
+    CHECK(electrons.getTwist()[1] == 0.0);
+    CHECK(electrons.getTwist()[2] == 0.0);
+  };
+
+  const std::size_t before_strict = provider.inspection_count;
+  for (const std::string request : {"yes", "cuda", "hip"})
+    require_early_failure(request, "incomplete end-to-end operation coverage");
+  CHECK(provider.inspection_count == before_strict + 3);
+
+  // Even a test provider cannot bypass the builder's final production guard.
+  provider.readiness.cuda.operation_coverage =
+      psiformer::allPsiFormerAcceleratorOperations();
+  provider.readiness.cuda.runtime_validation =
+      psiformer::PsiFormerRuntimeValidation::PASSED;
+  const std::size_t before_forged_ready = provider.inspection_count;
+  require_early_failure("cuda", "numerical dispatch");
+  CHECK(provider.inspection_count == before_forged_ready + 1);
+
+  const std::size_t before_invalid = provider.inspection_count;
+  require_early_failure("mystery", "gpu must be");
+  require_early_failure("sycl", "no production executor");
+  CHECK(provider.inspection_count == before_invalid);
+}
+
+TEST_CASE("PsiFormer direct constructors default to CPU and reject forged accelerator routes",
+          "[wavefunction][psiformer][accelerator][builder]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeLiHElectrons(simulation_cell);
+
+  PsiFormerWF direct(
+      "pf_direct_cpu", files.parameters.string(), files.configuration.string());
+  const auto diagnostics =
+      testing::TestPsiFormerWF::acceleratorDiagnostics(direct);
+  CHECK(diagnostics.backend == psiformer::PsiFormerAcceleratorBackend::CPU);
+  CHECK(diagnostics.reason ==
+        psiformer::PsiFormerAcceleratorResolutionReason::CPU_REQUESTED);
+  CHECK(diagnostics.readiness_records_consulted == 0);
+  CHECK(diagnostics.fallback_count == 0);
+
+  const psiformer::PsiFormerAcceleratorResolution forged{
+      psiformer::PsiFormerAcceleratorBackend::CUDA,
+      psiformer::PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY,
+      1,
+      0};
+  CHECK_THROWS_WITH(
+      PsiFormerWF("pf_forged", "missing-parameters.h5",
+                  "missing-configuration.h5", false, {}, false, {}, forged),
+      Catch::Matchers::ContainsSubstring("numerical dispatch"));
 }
 
 TEST_CASE("PsiFormer builder validates internal initialization XML", "[wavefunction][psiformer][initialization]")
