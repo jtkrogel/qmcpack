@@ -126,15 +126,17 @@ public:
   }
 
   /// Copy a bounded device interval into caller-owned host storage.
-  void download(T* destination, std::size_t count) const
+  void download(T* destination, std::size_t count, std::size_t source_offset = 0) const
   {
+    if (source_offset > capacity_ || count > capacity_ - source_offset)
+      throw std::length_error("PsiFormer device download interval exceeds capacity");
     validateTransfer(destination, count);
     if (count == 0)
       return;
 #ifdef QMC_CUDA2HIP
-    checkRuntime(hipMemcpy(destination, data_, checkedDeviceBytes<T>(count), hipMemcpyDeviceToHost), "hipMemcpy D2H");
+    checkRuntime(hipMemcpy(destination, data_ + source_offset, checkedDeviceBytes<T>(count), hipMemcpyDeviceToHost), "hipMemcpy D2H");
 #else
-    checkRuntime(cudaMemcpy(destination, data_, checkedDeviceBytes<T>(count), cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
+    checkRuntime(cudaMemcpy(destination, data_ + source_offset, checkedDeviceBytes<T>(count), cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
 #endif
   }
 

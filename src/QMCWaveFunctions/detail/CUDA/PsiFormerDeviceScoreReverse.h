@@ -152,6 +152,22 @@ public:
     response_.download(destination.data(), destination.size());
   }
 
+  /** Stream a completed canonical interval without replaying the reverse graph.
+   * Caller supplies bounded host storage; active-variable mapping remains the
+   * provider adapter's responsibility. Empty intervals permit a null destination.
+   */
+  void downloadResponseChunk(std::size_t begin, double* destination, std::size_t count) const
+  {
+    if (!ready_)
+      throw std::logic_error("GPU score has no completed response");
+    if (begin > response_.capacity() || count > response_.capacity() - begin)
+      throw std::out_of_range("GPU score chunk exceeds the canonical response");
+    response_.download(destination, count, begin);
+  }
+
+  /// Tag response chunks with the immutable model version used for this evaluator.
+  std::size_t parameterVersion() const noexcept { return model_->version(); }
+
   /// Account all explicitly owned numerical storage, not the shared model image.
   std::size_t deviceWorkspaceBytes() const
   {
