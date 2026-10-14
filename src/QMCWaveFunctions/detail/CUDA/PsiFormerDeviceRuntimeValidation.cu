@@ -439,6 +439,91 @@ void boundedResponses(Queue& queue)
     throw std::runtime_error("finite scan must locate exactly one bad element");
   std::cout << "PASS bounded_response_dot_finite_scan_ecp_contraction\n";
 }
+/// Check output-owned batched score leaves against independent scalar formulas.
+void batchedScoreLeaves(Queue& queue)
+{
+  constexpr std::size_t batch = 3;
+  const std::vector<double> weights{1.25, -0.5, 0.0};
+  auto device_weights = upload(weights);
+
+  // Deliberate stride padding and nonzero destinations catch indexing and += errors.
+  std::vector<double> distances(batch * 8, 99.0), adjoints(batch * 8, 88.0);
+  const std::vector<double> pi{0.7, -0.4, 77.0, 0.3, 0.9, 77.0};
+  const std::vector<double> zeta{0.8, -1.1, 77.0, -0.6, 1.4, 77.0};
+  std::vector<double> expected(20, 0.125);
+  for (std::size_t configuration = 0; configuration < batch; ++configuration)
+    for (std::size_t electron = 0; electron < 2; ++electron)
+    {
+      for (std::size_t nucleus = 0; nucleus < 2; ++nucleus)
+        distances[configuration * 8 + electron * 3 + nucleus] =
+            0.2 + 0.3 * configuration + 0.1 * electron + 0.15 * nucleus;
+      for (std::size_t orbital = 0; orbital < 2; ++orbital)
+        adjoints[configuration * 8 + electron * 3 + orbital] =
+            weights[configuration] * (0.4 + 0.1 * electron - 0.2 * orbital);
+    }
+  for (std::size_t orbital = 0; orbital < 2; ++orbital)
+    for (std::size_t nucleus = 0; nucleus < 2; ++nucleus)
+    {
+      const auto parameter = orbital * 3 + nucleus;
+      for (std::size_t configuration = 0; configuration < batch; ++configuration)
+        for (std::size_t electron = 0; electron < 2; ++electron)
+        {
+          const double radius = distances[configuration * 8 + electron * 3 + nucleus];
+          const double upstream = adjoints[configuration * 8 + electron * 3 + orbital];
+          const double exponential = std::exp(-std::abs(zeta[parameter]) * radius);
+          expected[2 + parameter] += upstream * exponential;
+          expected[12 + parameter] -= upstream * pi[parameter] * radius *
+              (zeta[parameter] > 0 ? 1.0 : -1.0) * exponential;
+        }
+    }
+  auto radii = upload(distances), upstream = upload(adjoints);
+  auto p = upload(pi), z = upload(zeta), response = upload(std::vector<double>(20, 0.125));
+  const EnvelopeParameterReverseLayout envelope{batch, 1, 2, 2, 0, 2,
+      3, 6, 8, 3, 8, 3, 6, 2, 12};
+  checkRuntime(launchEnvelopeParameterReverse(queue.getNative(), envelope, radii.data(),
+      p.data(), z.data(), upstream.data(), response.data()), "batched envelope scores");
+  queue.sync();
+  const auto actual = download(response);
+  for (std::size_t index = 0; index < expected.size(); ++index)
+    near(actual[index], expected[index], "batched envelope response/padding");
+
+  const std::vector<double> pair_distances{0.2, 0.7, 1.1, 99.0,
+      0.3, 0.8, 1.2, 99.0, 0.4, 0.9, 1.3, 99.0};
+  const std::vector<std::uint8_t> same_spin{1, 0, 0};
+  auto pair_radii = upload(pair_distances);
+  auto spin = upload(same_spin);
+  auto cusp_response = upload(std::vector<double>(5, 0.25));
+  std::vector<double> cusp_expected(5, 0.25);
+  for (std::size_t configuration = 0; configuration < batch; ++configuration)
+    for (std::size_t pair = 0; pair < 3; ++pair)
+    {
+      const bool same = same_spin[pair] != 0;
+      const double alpha = same ? 0.8 : 1.1;
+      const double factor = same ? 0.25 : 0.5;
+      const double radius = pair_distances[configuration * 4 + pair];
+      cusp_expected[same ? 1 : 3] -= weights[configuration] * factor * alpha *
+          (alpha + 2 * radius) / ((alpha + radius) * (alpha + radius));
+    }
+  CuspAlphaReverseLayout cusp{batch, 3, 4, 1, 3, true};
+  checkRuntime(launchCuspAlphaReverse(queue.getNative(), cusp, pair_radii.data(), spin.data(),
+      0.8, 1.1, cusp_response.data(), device_weights.data()), "weighted batched cusp scores");
+  queue.sync();
+  const auto actual_cusp = download(cusp_response);
+  for (std::size_t index = 0; index < cusp_expected.size(); ++index)
+    near(actual_cusp[index], cusp_expected[index], "weighted cusp response/padding");
+
+  // A missing same-spin parameter must not write its offset, even with same-spin pairs.
+  cusp.has_same_alpha = false;
+  auto opposite_only = upload(std::vector<double>(5, 0.25));
+  checkRuntime(launchCuspAlphaReverse(queue.getNative(), cusp, pair_radii.data(), spin.data(),
+      0.8, 1.1, opposite_only.data(), device_weights.data()), "opposite-only cusp scores");
+  queue.sync();
+  const auto opposite_result = download(opposite_only);
+  near(opposite_result[1], 0.25, "absent same-spin parameter unchanged");
+  near(opposite_result[3], cusp_expected[3], "opposite-only weighted response");
+  std::cout << "PASS bounded_batched_envelope_and_weighted_cusp_scores\n";
+}
+
 } // namespace
 
 /// Run host-only invariants or require an actual device for all numerical tests.
@@ -477,6 +562,7 @@ int main(int argc, char** argv)
     softmax(queue);
     determinants(queue);
     boundedResponses(queue);
+    batchedScoreLeaves(queue);
     queue.sync();
     std::cout << "PASS all implemented device component cases; full-model dispatch NOT_VALIDATED\n";
     return 0;

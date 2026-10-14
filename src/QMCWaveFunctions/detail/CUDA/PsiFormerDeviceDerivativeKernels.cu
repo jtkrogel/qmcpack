@@ -120,9 +120,9 @@ void validateOrbitalLayout(const OrbitalProductReverseLayout& layout)
 
 std::size_t validateEnvelopeLayout(const EnvelopeParameterReverseLayout& layout)
 {
-  if (layout.configuration_count != 1)
+  if (layout.configuration_count == 0)
     throw std::invalid_argument(
-        "PsiFormer envelope reverse requires one outer-serial configuration");
+        "PsiFormer envelope reverse requires a nonempty configuration tile");
   if (layout.determinant_count == 0 || layout.electron_count == 0 ||
       layout.nucleus_count == 0 ||
       layout.electron_begin >= layout.electron_end ||
@@ -556,17 +556,20 @@ __global__ void envelopeParameterReverseKernel(EnvelopeParameterReverseLayout la
       orbital_index * layout.parameter_orbital_stride + nucleus;
   double pi_sum = 0.0;
   double zeta_sum = 0.0;
-  for (std::size_t electron = layout.electron_begin; electron < layout.electron_end; ++electron)
-  {
-    const std::size_t distance_offset =
-        electron * layout.distance_electron_stride + nucleus;
-    const std::size_t matrix_offset = determinant * layout.matrix_determinant_stride +
-        electron * layout.matrix_row_stride + orbital_index;
-    const auto partials = device_derivative::envelopeValueAndPartials(
-        distances[distance_offset], pi[parameter], zeta[parameter]);
-    pi_sum += envelope_adjoint[matrix_offset] * partials.pi_partial;
-    zeta_sum += envelope_adjoint[matrix_offset] * partials.zeta_partial;
-  }
+  // One output owner folds the tile, avoiding atomics and B-by-P storage.
+  for (std::size_t configuration = 0; configuration < layout.configuration_count; ++configuration)
+    for (std::size_t electron = layout.electron_begin; electron < layout.electron_end; ++electron)
+    {
+      const std::size_t distance_offset = configuration * layout.distance_configuration_stride +
+          electron * layout.distance_electron_stride + nucleus;
+      const std::size_t matrix_offset = configuration * layout.matrix_configuration_stride +
+          determinant * layout.matrix_determinant_stride +
+          electron * layout.matrix_row_stride + orbital_index;
+      const auto partials = device_derivative::envelopeValueAndPartials(
+          distances[distance_offset], pi[parameter], zeta[parameter]);
+      pi_sum += envelope_adjoint[matrix_offset] * partials.pi_partial;
+      zeta_sum += envelope_adjoint[matrix_offset] * partials.zeta_partial;
+    }
   response[layout.pi_response_offset + parameter] += pi_sum;
   response[layout.zeta_response_offset + parameter] += zeta_sum;
 }
@@ -576,7 +579,8 @@ __global__ void cuspAlphaReverseKernel(CuspAlphaReverseLayout layout,
                                        const std::uint8_t* same_spin,
                                        double same_alpha,
                                        double opposite_alpha,
-                                       double* response)
+                                       double* response,
+                                       const double* configuration_weights)
 {
   const std::size_t categories = layout.has_same_alpha ? 2 : 1;
   const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -586,12 +590,16 @@ __global__ void cuspAlphaReverseKernel(CuspAlphaReverseLayout layout,
   const double alpha = select_same ? same_alpha : opposite_alpha;
   const double factor = select_same ? 0.25 : 0.5;
   double sum = 0.0;
-  for (std::size_t pair = 0; pair < layout.pair_count; ++pair)
+  // Spin-pair labels are geometry-independent and shared by all configurations.
+  // Each category owns its destination; signed weights need no atomic reduction.
+  for (std::size_t configuration = 0; configuration < layout.configuration_count; ++configuration)
   {
-    const bool pair_is_same = same_spin[pair] != 0;
-    if (pair_is_same == select_same)
-      sum += device_derivative::cuspValueAndAlphaPartial(
-          distances[pair], alpha, factor).alpha_partial;
+    const double weight = configuration_weights ? configuration_weights[configuration] : 1.0;
+    for (std::size_t pair = 0; pair < layout.pair_count; ++pair)
+      if ((same_spin[pair] != 0) == select_same)
+        sum += weight * device_derivative::cuspValueAndAlphaPartial(
+            distances[configuration * layout.distance_configuration_stride + pair],
+            alpha, factor).alpha_partial;
   }
   const std::size_t offset = select_same ? layout.same_response_offset
                                          : layout.opposite_response_offset;
@@ -1021,14 +1029,15 @@ Error launchCuspAlphaReverse(Stream stream,
                              const std::uint8_t* same_spin,
                              double same_alpha,
                              double opposite_alpha,
-                             double* response)
+                             double* response,
+                             const double* configuration_weights)
 {
   if (layout.configuration_count == 0 && layout.pair_count == 0 &&
       layout.distance_configuration_stride == 0 && !layout.has_same_alpha)
     return success;
-  if (layout.configuration_count != 1)
+  if (layout.configuration_count == 0)
     throw std::invalid_argument(
-        "PsiFormer cusp reverse requires one outer-serial configuration");
+        "PsiFormer cusp reverse requires a nonempty configuration tile");
   if (layout.pair_count == 0)
     return success;
   if (layout.distance_configuration_stride < layout.pair_count)
@@ -1055,7 +1064,7 @@ Error launchCuspAlphaReverse(Stream stream,
                              count,
                              "PsiFormer cusp reverse grid exceeds the CUDA/HIP x dimension"),
                           derivative_block_size, 0, stream>>>(
-      layout, distances, same_spin, same_alpha, opposite_alpha, response);
+      layout, distances, same_spin, same_alpha, opposite_alpha, response, configuration_weights);
   return peekAtLastError();
 }
 

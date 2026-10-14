@@ -106,11 +106,12 @@ struct OrbitalProductReverseLayout
   std::size_t configuration_stride      = 0;
 };
 
-/** Output-owned outer-serial ordinary envelope-parameter reverse layout.
+/** Output-owned bounded-batch ordinary envelope-parameter reverse layout.
  *
- * One call covers one configuration and one spin channel, selected by the
+ * One call covers a configuration tile and one spin channel, selected by the
  * half-open electron interval.  The response is exactly one canonical parameter
- * vector; configurations are intentionally serialized outside this leaf.
+ * vector; each parameter owner reduces configurations in increasing order.
+ * Sample weights must already be included in the envelope adjoint.
  * ``pi_response_offset`` and ``zeta_response_offset`` are independent canonical
  * offsets and are never derived from one another.
  */
@@ -133,10 +134,10 @@ struct EnvelopeParameterReverseLayout
   std::size_t zeta_response_offset         = 0;
 };
 
-/** Output-owned outer-serial ordinary cusp-alpha reverse layout.
+/** Output-owned bounded-batch ordinary cusp-alpha reverse layout.
  *
  * The response is exactly one canonical parameter vector; configurations are
- * intentionally serialized outside this leaf.
+ * reduced deterministically inside each alpha owner's thread.
  */
 struct CuspAlphaReverseLayout
 {
@@ -283,14 +284,18 @@ Error launchEnvelopeParameterReverse(Stream stream,
                                      const double* envelope_adjoint,
                                      double* response);
 
-/** Accumulate ordinary same/opposite-spin cusp-alpha response. */
+/** Accumulate ordinary same/opposite-spin cusp-alpha response.
+ * Optional configuration weights contract a tile directly into one response;
+ * a null weight pointer preserves the unweighted one-configuration API.
+ */
 Error launchCuspAlphaReverse(Stream stream,
                              const CuspAlphaReverseLayout& layout,
                              const double* distances,
                              const std::uint8_t* same_spin,
                              double same_alpha,
                              double opposite_alpha,
-                             double* response);
+                             double* response,
+                             const double* configuration_weights = nullptr);
 
 /** Scan a strided interval into deterministic caller-bounded status records. */
 Error launchDerivativeFiniteScan(Stream stream,
