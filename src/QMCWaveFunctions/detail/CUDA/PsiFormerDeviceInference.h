@@ -207,6 +207,10 @@ public:
     const double* determinant_log_laplacian;
     const double* cusp;
     const double* root;
+    const double* inverses;
+    const double* normalized_weights;
+    const device_determinant::FactorizationMetadata* factorizations;
+    const device_determinant::CombinationMetadata* combinations;
   };
 
   /// Validate the open-real model and prepare all storage before numerical launches.
@@ -482,7 +486,18 @@ public:
     (void)spatialBlockTape(0);
     return {orbitals_, cusp_, final_.output, positions_.data(), raw_.data(), a_.data(),
             orbital_jets_.data(), retained_backflow_.data(), retained_envelope_.data(),
-            det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), output_.data()};
+            det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), output_.data(), inverse_.data(),
+            normalized_.data(), factors_.data(), combinations_.data()};
+  }
+
+  /// Copy live full-spatial determinant admission records into prepared host storage.
+  void downloadSpatialFactorizations(std::vector<device_determinant::FactorizationMetadata>& destination) const
+  {
+    (void)spatialBlockTape(0);
+    const auto count = product(batch_, shape_.determinants);
+    if (destination.size() < count)
+      throw std::invalid_argument("Spatial factorization metadata destination is too small");
+    factors_.download(destination.data(), count);
   }
 
   /// Download retained full-spatial orbital product factors for numerical validation.

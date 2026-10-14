@@ -827,6 +827,51 @@ __global__ void logScoreParameterDirectionKernel(std::size_t batch, std::size_t 
   output[configuration] = sum;
 }
 
+/** Own one complete kinetic root seed, rejecting invalid inputs before publication. */
+__global__ void kineticRootAdjointsKernel(SpatialJetLayout layout, const double* forward_root,
+    const double* weights, const double* inverse_masses, const double* total_gradient,
+    std::size_t gradient_stride, double* output, OpenSpatialStatus* status)
+{
+  const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= layout.configuration_count)
+    return;
+  for (std::size_t plane = 0; plane < layout.plane_count; ++plane)
+    output[layout.uncheckedPlaneOffset(configuration, plane, 0)] = 0.0;
+  status[configuration] = OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  for (std::size_t plane = 0; plane < layout.plane_count; ++plane)
+    if (!device_math::isFiniteBinary64(forward_root[layout.uncheckedPlaneOffset(configuration, plane, 0)]))
+      return;
+  const double weight = weights[configuration];
+  if (!device_math::isFiniteBinary64(weight) ||
+      !device_math::isFiniteBinary64(forward_root[layout.uncheckedValueOffset(configuration, 0)]))
+    return;
+
+  // K=-1/2 sum_e m_e^-1 (lap_e logPsi + |grad_e logPsi|^2).
+  // The total drift, not just this component's drift, multiplies its gradient
+  // response when a product TrialWaveFunction contains other components.
+  for (std::size_t electron = 0; electron < layout.electron_count; ++electron)
+  {
+    const double mass = inverse_masses ? inverse_masses[electron] : 1.0;
+    if (!device_math::isFiniteBinary64(mass) || mass <= 0)
+      return;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const auto lane = 3 * electron + dimension;
+      const auto offset = layout.uncheckedGradientOffset(configuration, lane, 0);
+      const double drift = total_gradient ? total_gradient[configuration * gradient_stride + lane] : forward_root[offset];
+      const double seed = -weight * mass * drift;
+      if (!device_math::isFiniteBinary64(drift) || !device_math::isFiniteBinary64(seed))
+        return;
+      output[offset] = seed;
+    }
+    const double laplacian_seed = -0.5 * weight * mass;
+    if (!device_math::isFiniteBinary64(laplacian_seed))
+      return;
+    output[layout.uncheckedLaplacianOffset(configuration, electron, 0)] = laplacian_seed;
+  }
+  status[configuration] = OpenSpatialStatus::REGULAR;
+}
+
 __global__ void cuspAlphaReverseKernel(CuspAlphaReverseLayout layout,
                                        const double* distances,
                                        const std::uint8_t* same_spin,
@@ -1471,6 +1516,30 @@ Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::si
   logScoreParameterDirectionKernel<<<blockCount(batch, "Score direction grid too large"),
       derivative_block_size, 0, stream>>>(batch, ne, determinants, spin_up_count, positions,
       matrix_seeds, orbital_direction, same_alpha, opposite_alpha, same_alpha_direction, opposite_alpha_direction, score_direction);
+  return peekAtLastError();
+}
+
+Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& layout,
+    const double* forward_root, const double* weights, const double* inverse_masses,
+    const double* total_gradient, std::size_t gradient_stride,
+    double* root_adjoint, OpenSpatialStatus* status)
+{
+  if (layout.configuration_count == 0)
+    return success;
+  validateSpatialJetLayout(layout);
+  if (layout.mode != SpatialJetMode::FULL_VGL || layout.element_count != 1 ||
+      !forward_root || !weights || !root_adjoint || !status ||
+      (total_gradient ? gradient_stride < layout.gradient_lanes : gradient_stride != 0))
+    throw std::invalid_argument("Kinetic root adjoint layout/storage/drift stride is invalid");
+  for (const auto* source : {forward_root, weights, inverse_masses, total_gradient})
+    if (root_adjoint == source)
+      throw std::invalid_argument("Kinetic root adjoint destination aliases input");
+  if (total_gradient)
+    (void)checkedSpan(layout.configuration_count, gradient_stride, layout.gradient_lanes,
+                      "Total kinetic drift extent overflow");
+  kineticRootAdjointsKernel<<<blockCount(layout.configuration_count, "Kinetic root adjoint grid too large"),
+      derivative_block_size, 0, stream>>>(layout, forward_root, weights, inverse_masses,
+      total_gradient, gradient_stride, root_adjoint, status);
   return peekAtLastError();
 }
 

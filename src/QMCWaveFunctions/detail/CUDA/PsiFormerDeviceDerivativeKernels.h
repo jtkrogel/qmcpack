@@ -335,6 +335,17 @@ Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::si
     const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
     double same_alpha_direction, double opposite_alpha_direction, double* score_direction);
 
+/** Seed a weighted kinetic lifted reverse with full real-space root adjoints.
+ * Inverse masses are per electron (null means one); optional total drift is
+ * contiguous in lanes within a caller-specified configuration stride. Null total
+ * drift uses this component's root gradient. Destinations must not alias inputs.
+ */
+Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& root_layout,
+    const double* forward_root, const double* configuration_weights,
+    const double* inverse_masses, const double* total_log_gradient,
+    std::size_t total_gradient_configuration_stride, double* root_adjoint,
+    OpenSpatialStatus* status);
+
 /** Accumulate one spin channel's ordinary envelope pi/zeta response. */
 Error launchEnvelopeParameterReverse(Stream stream,
                                      const EnvelopeParameterReverseLayout& layout,

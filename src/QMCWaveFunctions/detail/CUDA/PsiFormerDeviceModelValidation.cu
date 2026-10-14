@@ -19,10 +19,12 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceNetworkReverse.h"
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
+#include "PsiFormerDeviceKineticReverse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
 
@@ -111,7 +113,8 @@ int main(int argc, char** argv)
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
-                                  "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64]");
+                                  "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
+                                  "[--kinetic-output CANONICAL_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
@@ -120,6 +123,7 @@ int main(int argc, char** argv)
     bool shape_supplied = false;
     std::string score_output;
     std::string jvp_output;
+    std::string kinetic_output;
     for (int argument = 4; argument < argc; ++argument)
     {
       const std::string option(argv[argument]);
@@ -129,6 +133,8 @@ int main(int argc, char** argv)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
         jvp_output = argv[++argument];
+      else if (option == "--kinetic-output" && kinetic_output.empty() && argument + 1 < argc)
+        kinetic_output = argv[++argument];
       else if (option == "--shape" && !shape_supplied && argument + 4 < argc)
       {
         std::size_t* dimensions[] = {&determinants, &width, &heads, &blocks};
@@ -147,7 +153,7 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
-    if (cpu_only && (!score_output.empty() || !jvp_output.empty()))
+    if (cpu_only && (!score_output.empty() || !jvp_output.empty() || !kinetic_output.empty()))
       throw std::invalid_argument("Canonical GPU score export is incompatible with --cpu-only");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
@@ -216,6 +222,137 @@ int main(int argc, char** argv)
     spatial_taped.downloadResults(phases, jets, ratios);
     verify();
     const auto spatial_head = spatial_taped.spatialHeadTape();
+    // Kinetic root seeds use signed sample contractions, optional physical masses
+    // and complete product-wavefunction drift, not an implicit PsiFormer-only drift.
+    std::vector<double> kinetic_weights(model.cfg.nconfig), inverse_masses(model.ne);
+    for (std::size_t configuration = 0; configuration < kinetic_weights.size(); ++configuration)
+      kinetic_weights[configuration] = configuration % 2 == 0 ? 0.7 : -0.25;
+    for (std::size_t electron = 0; electron < model.ne; ++electron)
+      inverse_masses[electron] = 1.0 + 0.1 * electron;
+    DeviceBuffer<double> kinetic_weight_buffer(kinetic_weights.size()), mass_buffer(inverse_masses.size());
+    DeviceBuffer<double> root_adjoint(spatialJetSpanElements(spatial_head.root_layout));
+    DeviceBuffer<OpenSpatialStatus> root_status(model.cfg.nconfig);
+    kinetic_weight_buffer.upload(kinetic_weights.data(), kinetic_weights.size());
+    mass_buffer.upload(inverse_masses.data(), inverse_masses.size());
+    std::vector<double> root_seeds(root_adjoint.capacity());
+    std::vector<OpenSpatialStatus> root_flags(model.cfg.nconfig);
+    checkRuntime(launchKineticRootAdjoints(queue.getNative(), spatial_head.root_layout, spatial_head.root,
+        kinetic_weight_buffer.data(), nullptr, nullptr, 0, root_adjoint.data(), root_status.data()), "unit-mass kinetic root seed");
+    queue.sync();
+    root_adjoint.download(root_seeds.data(), root_seeds.size());
+    root_status.download(root_flags.data(), root_flags.size());
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      if (root_flags[configuration] != OpenSpatialStatus::REGULAR)
+        throw std::runtime_error("Regular kinetic root seed failed");
+      near(root_seeds[spatial_head.root_layout.uncheckedValueOffset(configuration, 0)], 0, "kinetic value seed");
+      for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+      {
+        const auto offset = spatial_head.root_layout.uncheckedGradientOffset(configuration, lane, 0);
+        near(root_seeds[offset], -kinetic_weights[configuration] * jets[offset], "unit-mass total drift seed");
+      }
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+        near(root_seeds[spatial_head.root_layout.uncheckedLaplacianOffset(configuration, electron, 0)],
+             -0.5 * kinetic_weights[configuration], "unit-mass Laplacian seed");
+    }
+    const auto external_stride = 3 * model.ne + 2;
+    std::vector<double> external_drift(model.cfg.nconfig * external_stride, 999.0);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+      for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+        external_drift[configuration * external_stride + lane] =
+            jets[spatial_head.root_layout.uncheckedGradientOffset(configuration, lane, 0)] + 0.02 * (lane + 1);
+    DeviceBuffer<double> external_drift_buffer(external_drift.size());
+    external_drift_buffer.upload(external_drift.data(), external_drift.size());
+    checkRuntime(launchKineticRootAdjoints(queue.getNative(), spatial_head.root_layout, spatial_head.root,
+        kinetic_weight_buffer.data(), mass_buffer.data(), external_drift_buffer.data(), external_stride,
+        root_adjoint.data(), root_status.data()), "external-drift mass-weighted kinetic root seed");
+    queue.sync();
+    root_adjoint.download(root_seeds.data(), root_seeds.size());
+    root_status.download(root_flags.data(), root_flags.size());
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      if (root_flags[configuration] != OpenSpatialStatus::REGULAR)
+        throw std::runtime_error("Mass-weighted external kinetic drift seed failed");
+      for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+        near(root_seeds[spatial_head.root_layout.uncheckedGradientOffset(configuration, lane, 0)],
+             -kinetic_weights[configuration] * inverse_masses[lane / 3] *
+              external_drift[configuration * external_stride + lane], "external total drift seed");
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+        near(root_seeds[spatial_head.root_layout.uncheckedLaplacianOffset(configuration, electron, 0)],
+             -0.5 * kinetic_weights[configuration] * inverse_masses[electron], "inverse-mass Laplacian seed");
+    }
+    inverse_masses[0] = 0;
+    mass_buffer.upload(inverse_masses.data(), inverse_masses.size());
+    checkRuntime(launchKineticRootAdjoints(queue.getNative(), spatial_head.root_layout, spatial_head.root,
+        kinetic_weight_buffer.data(), mass_buffer.data(), nullptr, 0, root_adjoint.data(), root_status.data()), "invalid kinetic mass guard");
+    queue.sync();
+    root_status.download(root_flags.data(), root_flags.size());
+    for (auto flag : root_flags)
+      if (flag == OpenSpatialStatus::REGULAR)
+        throw std::runtime_error("Kinetic seed accepted a nonpositive inverse mass");
+    std::cout << "PASS kinetic root seeds: weights, masses, external total drift, padded stride, invalid-mass guard\n";
+    PreparedDeviceKineticReverse kinetic_reverse(image, model.cfg.nconfig, queue, handle);
+    kinetic_reverse.evaluate(spatial_taped, kinetic_weights);
+    std::vector<double> gpu_kinetic(plan.parameterCount()), cpu_kinetic(plan.parameterCount(), 0.0);
+    kinetic_reverse.downloadResponse(gpu_kinetic);
+    const auto kinetic_bytes = kinetic_reverse.deviceWorkspaceBytes();
+    bool invalid_kinetic_weights = false, stale_kinetic_rejected = false;
+    try { (void)kinetic_reverse.evaluate(spatial_taped, {}); }
+    catch (const std::invalid_argument&) { invalid_kinetic_weights = true; }
+    try { kinetic_reverse.downloadResponse(gpu_kinetic); }
+    catch (const std::logic_error&) { stale_kinetic_rejected = true; }
+    if (!invalid_kinetic_weights || !stale_kinetic_rejected)
+      throw std::runtime_error("Failed kinetic request exposed a stale response");
+    kinetic_reverse.evaluate(spatial_taped, kinetic_weights);
+    kinetic_reverse.downloadResponse(gpu_kinetic);
+    if (kinetic_reverse.deviceWorkspaceBytes() != kinetic_bytes)
+      throw std::runtime_error("Kinetic reverse allocated during reuse");
+    pf::DirectKineticExecutor kinetic_cpu(model, plan);
+    auto kinetic_workspace = kinetic_cpu.makeWorkspace();
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      kinetic_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + configuration * model.ne * 3, model.ne));
+      const auto response = kinetic_cpu.evaluate(*kinetic_workspace);
+      for (std::size_t parameter = 0; parameter < cpu_kinetic.size(); ++parameter)
+        cpu_kinetic[parameter] += kinetic_weights[configuration] * response.kinetic_parameter_response[parameter];
+    }
+    double kinetic_max_difference = 0;
+    for (std::size_t parameter = 0; parameter < cpu_kinetic.size(); ++parameter)
+    {
+      near(gpu_kinetic[parameter], cpu_kinetic[parameter], "full weighted kinetic parameter response");
+      kinetic_max_difference = std::max(kinetic_max_difference, std::abs(gpu_kinetic[parameter] - cpu_kinetic[parameter]));
+    }
+    std::cout << "PASS complete regular-channel kinetic reverse: CPU parity; max_abs_difference="
+              << kinetic_max_difference << '\n';
+    if (!kinetic_output.empty())
+    {
+      std::ofstream output(kinetic_output, std::ios::binary);
+      output.write(reinterpret_cast<const char*>(gpu_kinetic.data()), gpu_kinetic.size() * sizeof(double));
+      if (!output)
+        throw std::runtime_error("Kinetic canonical response export failed");
+    }
+    std::vector<double> external_contiguous(model.cfg.nconfig * 3 * model.ne);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+      std::copy_n(external_drift.data() + configuration * external_stride, 3 * model.ne,
+                   external_contiguous.data() + configuration * 3 * model.ne);
+    inverse_masses[0] = 1.0;
+    kinetic_reverse.evaluate(spatial_taped, kinetic_weights, inverse_masses, external_contiguous);
+    kinetic_reverse.downloadResponse(gpu_kinetic);
+    std::fill(cpu_kinetic.begin(), cpu_kinetic.end(), 0.0);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      kinetic_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + configuration * model.ne * 3, model.ne));
+      const auto response = kinetic_cpu.evaluate(*kinetic_workspace,
+          external_contiguous.data() + configuration * 3 * model.ne, 3 * model.ne,
+          inverse_masses.data(), inverse_masses.size());
+      for (std::size_t parameter = 0; parameter < cpu_kinetic.size(); ++parameter)
+        cpu_kinetic[parameter] += kinetic_weights[configuration] * response.kinetic_parameter_response[parameter];
+    }
+    for (std::size_t parameter = 0; parameter < cpu_kinetic.size(); ++parameter)
+      near(gpu_kinetic[parameter], cpu_kinetic[parameter], "mass/external-drift kinetic response CPU parity");
+    std::cout << "PASS full kinetic reverse: nonunit masses and external total-wavefunction drift\n";
     const auto& orbital_layout = spatial_head.orbital_layout.orbitals;
     const auto orbital_span = spatialJetSpanElements(orbital_layout);
     std::vector<double> spatial_backflow(orbital_span), spatial_envelope(orbital_span), spatial_orbitals(orbital_span);
