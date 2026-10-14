@@ -875,32 +875,57 @@ int main(int argc, char** argv)
         if (mixed_spatial.deviceWorkspaceBytes() != prepared_bytes)
           throw std::runtime_error("Mixed full-VGL reuse changed its prepared storage");
       }
-      // Rounding-aware finite differences supplement FP64 reference comparisons.
-      // h=1e-2 avoids dividing FP32-level log-amplitude noise by a microscopic h^2.
-      constexpr double h = 1e-2;
+      // Mixed finite differences need a same-step FP64 control: excessive h
+      // truncates curved trained states, while tiny h amplifies FP32 rounding.
       const auto full_cast_bytes = mixed_spatial.statistics().roundTripBytes();
       const double base_log = mixed_logs[0];
-      double finite_difference_laplacian = 0, finite_difference_gradient = 0;
-      for (std::size_t dimension = 0; dimension < 3; ++dimension)
-      {
-        auto displaced = model.cfg.electrons.x;
-        displaced[dimension] += h;
-        mixed_value.evaluate(displaced);
-        mixed_value.downloadResults(value_phases, value_logs, unused);
-        const double plus = value_logs[0];
-        displaced[dimension] -= 2 * h;
-        mixed_value.evaluate(displaced);
-        mixed_value.downloadResults(value_phases, value_logs, unused);
-        const double minus = value_logs[0];
-        finite_difference_laplacian += (plus + minus - 2 * base_log) / (h * h);
-        if (dimension == 0)
-          finite_difference_gradient = (plus - minus) / (2 * h);
-      }
       const auto& mixed_layout = mixed_spatial.resultLayout();
       const double jet_gradient = mixed_jets[mixed_layout.uncheckedGradientOffset(0, 0, 0)];
       const double jet_laplacian = mixed_jets[mixed_layout.uncheckedLaplacianOffset(0, 0, 0)];
-      compare(finite_difference_gradient, jet_gradient, 3e-2, "rounding-aware finite-difference gradient");
-      compare(finite_difference_laplacian, jet_laplacian, 1e-1, "rounding-aware finite-difference trace Laplacian");
+      PreparedDeviceInference fd_reference(image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
+      std::vector<double> fd_phases(model.cfg.nconfig), fd_logs(model.cfg.nconfig);
+      bool fd_control_admitted = false, mixed_fd_admitted = false;
+      for (const double h : {1e-2, 3e-3, 1e-3})
+      {
+        double mixed_laplacian_fd = 0, mixed_gradient_fd = 0, fp64_laplacian_fd = 0, fp64_gradient_fd = 0;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          auto displaced = model.cfg.electrons.x;
+          displaced[dimension] += h;
+          mixed_value.evaluate(displaced);
+          mixed_value.downloadResults(value_phases, value_logs, unused);
+          fd_reference.evaluate(displaced);
+          fd_reference.downloadResults(fd_phases, fd_logs, unused);
+          const double mixed_plus = value_logs[0], fp64_plus = fd_logs[0];
+          displaced[dimension] -= 2 * h;
+          mixed_value.evaluate(displaced);
+          mixed_value.downloadResults(value_phases, value_logs, unused);
+          fd_reference.evaluate(displaced);
+          fd_reference.downloadResults(fd_phases, fd_logs, unused);
+          const double mixed_minus = value_logs[0], fp64_minus = fd_logs[0];
+          mixed_laplacian_fd += (mixed_plus + mixed_minus - 2 * base_log) / (h * h);
+          fp64_laplacian_fd += (fp64_plus + fp64_minus - 2 * references[0].logabs) / (h * h);
+          if (dimension == 0)
+          {
+            mixed_gradient_fd = (mixed_plus - mixed_minus) / (2 * h);
+            fp64_gradient_fd = (fp64_plus - fp64_minus) / (2 * h);
+          }
+        }
+        const auto scaled = [](double x, double y) { return std::abs(x - y) / (1 + std::abs(y)); };
+        const bool controlled = scaled(fp64_gradient_fd, references[0].gradient[0]) <= 3e-2 &&
+                                scaled(fp64_laplacian_fd, references[0].lap_log[0]) <= 1e-1;
+        const bool mixed_admitted = scaled(mixed_gradient_fd, jet_gradient) <= 3e-2 &&
+                                    scaled(mixed_laplacian_fd, jet_laplacian) <= 1e-1;
+        std::cout << "Mixed FD control h=" << h << " gradient(mixedAD,mixedFD,fp64AD,fp64FD)="
+                  << jet_gradient << ',' << mixed_gradient_fd << ',' << references[0].gradient[0] << ','
+                  << fp64_gradient_fd << " laplacian=" << jet_laplacian << ',' << mixed_laplacian_fd << ','
+                  << references[0].lap_log[0] << ',' << fp64_laplacian_fd << " controlled=" << controlled
+                  << " mixed_admitted=" << mixed_admitted << '\n';
+        fd_control_admitted = fd_control_admitted || controlled;
+        mixed_fd_admitted = mixed_fd_admitted || (controlled && mixed_admitted);
+      }
+      if (!fd_control_admitted || !mixed_fd_admitted)
+        throw std::runtime_error("Mixed full-VGL finite-difference scan lacks a controlled admissible step");
       if (model.cfg.nconfig > 1)
       {
         const std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
