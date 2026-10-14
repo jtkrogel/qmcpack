@@ -64,6 +64,10 @@ __global__ void attentionSoftmaxKernel(AttentionForwardLayout layout, double* at
   }
   const double maximum = reduction[0];
 
+  // Every thread must consume the maximum before a faster thread reuses the
+  // shared reduction array for its exponential sum (including idle lanes).
+  __syncthreads();
+
   double local_sum = 0;
   for (std::size_t key = threadIdx.x; key < layout.rows; key += blockDim.x)
   {
@@ -153,6 +157,9 @@ __global__ void attentionSoftmaxFp32Kernel(BatchedAttentionForwardLayout layout,
   }
 
   const double maximum = reduction[0];
+  // FP32 normalization shares the same reduction scratch lifetime as FP64.
+  // Do not overwrite it until all participating threads have read the maximum.
+  __syncthreads();
   double local_sum = 0.0;
   for (std::size_t key = threadIdx.x; key < layout.attention.rows; key += blockDim.x)
   {

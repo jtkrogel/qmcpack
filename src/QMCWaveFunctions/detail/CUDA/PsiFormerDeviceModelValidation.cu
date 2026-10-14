@@ -101,13 +101,42 @@ int main(int argc, char** argv)
 {
   try
   {
-    if (argc != 4 && argc != 5)
-      throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT [--cpu-only]");
-    const bool cpu_only = argc == 5 && std::string(argv[4]) == "--cpu-only";
-    if (argc == 5 && !cpu_only) throw std::invalid_argument("Unknown validation option");
-    pf::PsiFormer model(argv[1], argv[2]);
+    if (argc < 4)
+      throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
+                                  "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS]");
+
+    // Explicit dimensions permit compact generated fixtures without changing
+    // the established DeepQMC profile used by existing invocation scripts.
+    bool cpu_only = false;
+    std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
+    bool shape_supplied = false;
+    for (int argument = 4; argument < argc; ++argument)
+    {
+      const std::string option(argv[argument]);
+      if (option == "--cpu-only" && !cpu_only)
+        cpu_only = true;
+      else if (option == "--shape" && !shape_supplied && argument + 4 < argc)
+      {
+        std::size_t* dimensions[] = {&determinants, &width, &heads, &blocks};
+        for (auto* dimension : dimensions)
+        {
+          const std::string token(argv[++argument]);
+          if (token.empty() || token.find_first_not_of("0123456789") != std::string::npos)
+            throw std::invalid_argument("Shape dimensions must be positive decimal integers");
+          std::size_t consumed = 0;
+          *dimension = std::stoull(token, &consumed);
+          if (*dimension == 0 || consumed != token.size())
+            throw std::invalid_argument("Shape dimensions must be positive decimal integers");
+        }
+        shape_supplied = true;
+      }
+      else
+        throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
+    }
+    pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
+                        determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
-                            model.ndet, model.dim, model.heads, 4};
+                            model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
     const auto references = cpuReferences(model, plan);
     writeReferences(argv[3], references);
