@@ -70,6 +70,8 @@ target_link_libraries(psiformer_device_runtime_validation PRIVATE psiformer_devi
 # the production QMC application and its intentionally disabled device policy.
 add_executable(psiformer_device_model_validation EXCLUDE_FROM_ALL
                PsiFormerDeviceModelValidation.cu
+               ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
+               ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
                ../../PsiFormer/PsiFormerExecutionPlan.cpp
                ../../PsiFormer/PsiFormerGeometry.cpp)
 if(QMC_CUDA2HIP)

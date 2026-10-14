@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "PsiFormerDeviceInference.h"
+#include "PsiFormerDeviceCrowdHooks.h"
 
 #include <fstream>
 #include <iostream>
@@ -261,6 +262,94 @@ int main(int argc, char** argv)
         throw std::runtime_error("Value-only graph did not preserve signed-log node semantics");
     std::cout << "Prepared device bytes: shared_model=" << image->deviceStorageBytes()
               << " value_workspace=" << value_bytes << " VGL_workspace=" << inference.deviceWorkspaceBytes() << '\n';
+
+    // Exercise real numerical hooks through production-shaped ownership/events.
+    // The standalone graph alone cannot constrain this provenance boundary.
+    const auto backend = PreparedDeviceCrowdHooks::backend();
+    const std::uint64_t layout_fingerprint = UINT64_C(0x5053494649585455);
+    PsiFormerAcceleratorSharedModel owner(backend, layout_fingerprint, image->version());
+    PsiFormerAcceleratorExecutor executor(backend, PreparedDeviceCrowdHooks::coverage());
+    PsiFormerAcceleratorCrowdState crowd(1);
+    PreparedDeviceCrowdHooks hooks(image, owner, 1);
+    executor.prepare(crowd, layout_fingerprint, model.cfg.nconfig, hooks);
+    executor.acquire(owner, crowd, hooks);
+    const auto value_mask = acceleratorOperationBit(PsiFormerAcceleratorOperation::VALUES);
+    hooks.bindRequest(model.cfg.electrons.x, value_mask, 1);
+    const auto pending_value = executor.evaluate(owner, crowd, value_mask, model.cfg.nconfig, 1, hooks);
+    bool early_result_rejected = false;
+    try { (void)hooks.jets(); }
+    catch (const std::logic_error&) { early_result_rejected = true; }
+    if (!early_result_rejected)
+      throw std::runtime_error("Numerical hooks exposed a result before its wait");
+    executor.wait(crowd, pending_value.result_generation, hooks);
+    for (std::size_t index = 0; index < references.size(); ++index)
+    {
+      near(hooks.phases()[index], references[index].sign, "hook value sign");
+      near(hooks.jets()[index], references[index].logabs, "hook value logabs");
+    }
+    const auto vgl_mask = value_mask | acceleratorOperationBit(PsiFormerAcceleratorOperation::VGL);
+    hooks.bindRequest(model.cfg.electrons.x, vgl_mask, 2);
+    const auto pending_vgl = executor.evaluate(owner, crowd, vgl_mask, model.cfg.nconfig, 2, hooks);
+    executor.wait(crowd, pending_vgl.result_generation, hooks);
+    const auto& hook_layout = hooks.resultLayout();
+    for (std::size_t index = 0; index < references.size(); ++index)
+    {
+      near(hooks.jets()[hook_layout.uncheckedValueOffset(index, 0)], references[index].logabs, "hook VGL logabs");
+      for (std::size_t lane = 0; lane < references[index].gradient.size(); ++lane)
+        near(hooks.jets()[hook_layout.uncheckedGradientOffset(index, lane, 0)],
+             references[index].gradient[lane], "hook VGL gradient");
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+        near(hooks.laplacianRatios()[index * model.ne + electron],
+             references[index].lap_ratio[electron], "hook VGL Laplacian");
+    }
+
+    // A numerical failure after launch must poison the control-plane crowd,
+    // synchronize recovery, and leave the same model image usable afterward.
+    auto invalid_positions = model.cfg.electrons.x;
+    invalid_positions[0] = std::numeric_limits<double>::quiet_NaN();
+    hooks.bindRequest(invalid_positions, value_mask, 3);
+    bool numerical_failure_rejected = false;
+    try { (void)executor.evaluate(owner, crowd, value_mask, model.cfg.nconfig, 3, hooks); }
+    catch (const std::runtime_error&) { numerical_failure_rejected = true; }
+    if (!numerical_failure_rejected || !crowd.poisoned())
+      throw std::runtime_error("Numerical crowd failure did not enter required poison state");
+    executor.recover(owner, crowd, hooks);
+    executor.prepare(crowd, layout_fingerprint, model.cfg.nconfig, hooks);
+    executor.acquire(owner, crowd, hooks);
+    hooks.bindRequest(model.cfg.electrons.x, value_mask, 4);
+    const auto recovered = executor.evaluate(owner, crowd, value_mask, model.cfg.nconfig, 4, hooks);
+    executor.wait(crowd, recovered.result_generation, hooks);
+    for (std::size_t index = 0; index < references.size(); ++index)
+      near(hooks.jets()[index], references[index].logabs, "recovered hook value");
+    if (hooks.numericalBatches() != 3)
+      throw std::runtime_error("Numerical hooks did not run exactly the three successful batches");
+    executor.release(owner, crowd, hooks);
+
+    // Two queues/crowds retain the same image but must not alias typed results.
+    PsiFormerAcceleratorCrowdState second_crowd(2);
+    PreparedDeviceCrowdHooks second_hooks(image, owner, 2);
+    executor.prepare(second_crowd, layout_fingerprint, model.cfg.nconfig, second_hooks);
+    executor.acquire(owner, crowd, hooks);
+    executor.acquire(owner, second_crowd, second_hooks);
+    auto reversed_positions = model.cfg.electrons.x;
+    for (std::size_t index = 0; index < model.cfg.nconfig; ++index)
+      std::copy_n(model.cfg.electrons.x.begin() + (model.cfg.nconfig - 1 - index) * 3 * model.ne,
+                  3 * model.ne, reversed_positions.begin() + index * 3 * model.ne);
+    hooks.bindRequest(model.cfg.electrons.x, value_mask, 5);
+    second_hooks.bindRequest(reversed_positions, value_mask, 6);
+    const auto first_result = executor.evaluate(owner, crowd, value_mask, model.cfg.nconfig, 5, hooks);
+    const auto second_result = executor.evaluate(owner, second_crowd, value_mask, model.cfg.nconfig, 6, second_hooks);
+    executor.wait(crowd, first_result.result_generation, hooks);
+    executor.wait(second_crowd, second_result.result_generation, second_hooks);
+    for (std::size_t index = 0; index < references.size(); ++index)
+    {
+      near(hooks.jets()[index], references[index].logabs, "first crowd isolated value");
+      near(second_hooks.jets()[index], references[references.size() - 1 - index].logabs,
+           "second crowd isolated value");
+    }
+    executor.release(owner, crowd, hooks);
+    executor.release(owner, second_crowd, second_hooks);
+    std::cout << "PASS numerical crowd hooks: typed value/VGL, provenance, wait visibility, failure/recovery, two crowds\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
               << "production dispatch and parameter reverse NOT_VALIDATED\n";

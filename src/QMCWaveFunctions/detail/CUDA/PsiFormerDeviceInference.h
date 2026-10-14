@@ -74,6 +74,13 @@ public:
     opposite_alpha_ = parameters[plan_.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin];
   }
 
+  // Execution workspaces retain references to immutable plan metadata, so the
+  // model image must stay at one address for its complete shared lifetime.
+  PreparedDeviceModel(const PreparedDeviceModel&) = delete;
+  PreparedDeviceModel& operator=(const PreparedDeviceModel&) = delete;
+  PreparedDeviceModel(PreparedDeviceModel&&) = delete;
+  PreparedDeviceModel& operator=(PreparedDeviceModel&&) = delete;
+
   /// Reject accidental cross-device reuse without changing the caller's device.
   void validateCurrentDevice() const
   {
