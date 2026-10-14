@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -103,6 +104,14 @@ public:
 
   /// Report genuine numerical submissions; ordinary CPU execution reports zero.
   virtual std::size_t numericalTileCount() const noexcept { return 0; }
+
+  /// Prepare a newer image before invoking the authoritative native commit.
+  /// Backends without publication support reject updates rather than use stale weights.
+  virtual void publishParameters(const std::vector<double>& values, std::size_t version,
+                                const std::function<void()>& commit_native) const
+  {
+    throw std::logic_error("Numerical tile backend does not support parameter publication");
+  }
 };
 
 /// Deterministic structural counters for the most recent completed evaluation.

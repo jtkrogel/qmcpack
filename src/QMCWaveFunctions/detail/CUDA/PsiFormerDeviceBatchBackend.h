@@ -9,7 +9,8 @@
  *
  * Include after the native value/spatial/batch executor definitions. Host batch
  * ownership, sparse coordinate materialization and atomic commit remain intact.
- * Parameter publication/training and device-aware hard plans are separate work.
+ * Publication preserves the native/device version barrier. Training product
+ * dispatch and device-aware hard plans have separate capability gates.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_BATCH_BACKEND_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_BATCH_BACKEND_H
@@ -50,7 +51,7 @@ public:
   std::unique_ptr<pf::DirectBatchTileBackendWorkspace> prepare(std::size_t capacity) const override
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
-    return std::make_unique<Context>(image_, owner_, capacity, nextIdentity());
+    return std::make_unique<Context>(this, image_, owner_, capacity, nextIdentity());
   }
 
   /// Return typed device products while leaving host publication to the caller.
@@ -58,8 +59,9 @@ public:
       pf::DirectBatchMode mode, const double* coordinates, std::size_t size,
       std::size_t parameter_version) const override
   {
+    std::lock_guard<std::mutex> lock(control_mutex_);
     auto* context = dynamic_cast<Context*>(&workspace);
-    if (!context || context->owner != this->image_.get() || !coordinates || size == 0 ||
+    if (!context || context->owner != this || !coordinates || size == 0 ||
         size > context->capacity || parameter_version != image_->version())
       throw std::invalid_argument("Device batch tile has foreign resources, wrong capacity or stale parameters");
     const bool spatial = mode != pf::DirectBatchMode::VALUE_ONLY;
@@ -76,7 +78,8 @@ public:
 
     // Lease transitions and submission use the existing non-atomic control plane.
     // This explicit correctness lock can be narrowed after asynchronous integration.
-    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (context->hooks.modelVersion() != image_->version())
+      context->hooks.rebindModel(image_);
     context->executor.acquire(owner_, context->crowd, context->hooks);
     try
     {
@@ -128,14 +131,78 @@ public:
     return numerical_tiles_.load(std::memory_order_relaxed);
   }
 
+  /// Upload privately, then commit native values and active control provenance.
+  /// The caller holds the model's exclusive lock throughout this transaction.
+  void publishParameters(const std::vector<double>& values, std::size_t version,
+                         const std::function<void()>& commit_native) const override
+  {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (!commit_native)
+      throw std::invalid_argument("Device publication requires an authoritative native commit");
+    auto candidate = image_->makeUpdatedImage(values, version);
+    publication_hooks_.candidate = &candidate;
+    publication_hooks_.commit_native = &commit_native;
+    try
+    {
+      owner_.stage(owner_.activeProvenance().layout_fingerprint, version, publication_hooks_);
+      owner_.complete(version, publication_hooks_);
+    }
+    catch (...)
+    {
+      if (owner_.publicationPending())
+        owner_.cancel(version, publication_hooks_);
+      publication_hooks_.candidate = nullptr;
+      publication_hooks_.commit_native = nullptr;
+      throw;
+    }
+    publication_hooks_.candidate = nullptr;
+    publication_hooks_.commit_native = nullptr;
+  }
+
 private:
+  /** Keep the publication hook identity stable across stage/complete/cancel.
+   * No native change occurs during stage. Completion invokes the prevalidated
+   * native update before the noexcept shared-image swap and owner transition.
+   */
+  struct PublicationHooks final : PsiFormerAcceleratorHooks
+  {
+    /// Borrow the backend's active image for its entire address-stable lifetime.
+    explicit PublicationHooks(std::shared_ptr<const PreparedDeviceModel>& active) : active(active) {}
+
+    /// Accept only this backend's prepared candidate and publication event kinds.
+    void submit(const PsiFormerAcceleratorEvent& event) override
+    {
+      if (!candidate || !*candidate || !commit_native || event.model_version != (*candidate)->version())
+        throw std::logic_error("Device publication event has no matching prepared candidate");
+      switch (event.kind)
+      {
+      case PsiFormerAcceleratorEventKind::MODEL_STAGE:
+        active->validateSuccessor(*candidate);
+        return;
+      case PsiFormerAcceleratorEventKind::MODEL_COMPLETE:
+        (*commit_native)();
+        active = *candidate;
+        return;
+      case PsiFormerAcceleratorEventKind::MODEL_CANCEL:
+        return;
+      default:
+        throw std::logic_error("Device publication hook received a crowd event");
+      }
+    }
+
+    std::shared_ptr<const PreparedDeviceModel>& active;
+    const std::shared_ptr<const PreparedDeviceModel>* candidate = nullptr;
+    const std::function<void()>* commit_native = nullptr;
+  };
+
   /** Own one address-stable numerical crowd, with preallocated host coordinates. */
   struct Context final : pf::DirectBatchTileBackendWorkspace
   {
     /// Construct a released, prepared crowd using its backend's shared owner.
-    Context(std::shared_ptr<const PreparedDeviceModel> image, const PsiFormerAcceleratorSharedModel& model,
+    Context(const PreparedDeviceBatchBackend* backend, std::shared_ptr<const PreparedDeviceModel> image,
+            const PsiFormerAcceleratorSharedModel& model,
             std::size_t capacity, std::uint64_t identity)
-        : owner(image.get()), capacity(capacity), executor(PreparedDeviceCrowdHooks::backend(),
+        : owner(backend), capacity(capacity), executor(PreparedDeviceCrowdHooks::backend(),
             PreparedDeviceCrowdHooks::coverage()), crowd(identity), hooks(image, model, identity)
     {
       positions.reserve(spatial_detail::checkedProduct(capacity,
@@ -144,7 +211,7 @@ private:
       executor.prepare(crowd, model.activeProvenance().layout_fingerprint, capacity, hooks);
     }
 
-    const PreparedDeviceModel* owner;
+    const PreparedDeviceBatchBackend* const owner;
     const std::size_t capacity;
     PsiFormerAcceleratorExecutor executor;
     PsiFormerAcceleratorCrowdState crowd;
@@ -169,7 +236,8 @@ private:
     return ++next_identity_;
   }
 
-  std::shared_ptr<const PreparedDeviceModel> image_;
+  mutable std::shared_ptr<const PreparedDeviceModel> image_;
+  mutable PublicationHooks publication_hooks_{image_};
   mutable std::mutex control_mutex_;
   mutable PsiFormerAcceleratorSharedModel owner_;
   mutable std::uint64_t next_identity_ = 0;

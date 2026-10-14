@@ -8,8 +8,8 @@
  * @brief Numerical CUDA/HIP value/VGL binding for the accelerator control plane.
  *
  * One exclusive crowd owns its queue, BLAS handle, prepared scratch and typed
- * results. Immutable parameters are shared. This synchronous correctness adapter
- * is not yet attached to PsiFormerWF and does not advertise training/publication.
+ * results. Immutable parameters are shared through the production tile backend.
+ * A released crowd can bind a published successor without rebuilding its scratch.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_CROWD_HOOKS_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_CROWD_HOOKS_H
@@ -52,6 +52,32 @@ public:
   PreparedDeviceCrowdHooks& operator=(const PreparedDeviceCrowdHooks&) = delete;
   PreparedDeviceCrowdHooks(PreparedDeviceCrowdHooks&&) = delete;
   PreparedDeviceCrowdHooks& operator=(PreparedDeviceCrowdHooks&&) = delete;
+
+  /// Retarget released scratch after the shared owner commits a newer image.
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> image)
+  {
+    if (acquired_ || recorded_ || source_ || failure_)
+      throw std::logic_error("Numerical crowd rebind requires released, completed resources");
+    image_->validateSuccessor(image);
+    const auto provenance = owner_.activeProvenance();
+    if (provenance.model_version != image->version() ||
+        provenance.layout_fingerprint != model_provenance_.layout_fingerprint)
+      throw std::logic_error("Numerical crowd successor does not match its published owner");
+
+    // Both graphs belong to the same metadata family. These host-only rebinds
+    // invalidate old products without reallocating any prepared device storage.
+    if (values_)
+      values_->rebindModel(image);
+    if (spatial_)
+      spatial_->rebindModel(image);
+    image_ = std::move(image);
+    model_provenance_ = provenance;
+    last_graph_ = nullptr;
+    ready_ = false;
+  }
+
+  /// Report the resident image version so a released context can catch up lazily.
+  std::size_t modelVersion() const noexcept { return image_->version(); }
 
   /// Return precisely the numerical operations implemented by this adapter.
   static constexpr PsiFormerAcceleratorOperationMask coverage() noexcept

@@ -1011,6 +1011,20 @@ public:
           "the molecular native oracle is not periodic");
   }
 
+  /// Publish under the caller's exclusive model lock, including restart/rollback.
+  /// Device upload and native validation precede the shared version transition.
+  void setParameterValues(const std::vector<double>& values)
+  {
+    auto& parameters = model.p;
+    if (parameters.version() == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("PsiFormer parameter version exhausted");
+    if (numerical_tile_backend)
+      numerical_tile_backend->publishParameters(values, parameters.version() + 1,
+                                                [&]() { parameters.set_flat_values(values); });
+    else
+      parameters.set_flat_values(values);
+  }
+
   mutable std::shared_mutex mutex;
   /// Factory lock is separate from the scratch execution lease and model lock.
   mutable std::mutex derivative_scratch_factory_mutex;
@@ -6074,7 +6088,7 @@ std::size_t PsiFormerWF::publishParameters(
     throw std::runtime_error("PsiFormer structured update rejected a stale parameter version");
 
   // set_flat_values validates every value before mutating the native leaves.
-  parameters.set_flat_values(candidate.values);
+  model_state_->setParameterValues(candidate.values);
   const std::size_t committed_version = parameters.version();
   invalidateParameterCaches(committed_version);
   return committed_version;
@@ -9495,7 +9509,7 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
     restore_validation_pending_ = false;
     const bool model_changed    = active_values != parameters.flat_values();
     if (model_changed)
-      parameters.set_flat_values(active_values);
+      model_state_->setParameterValues(active_values);
     const std::size_t parameter_version = parameters.version();
 
     for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
@@ -9542,7 +9556,18 @@ void PsiFormerWF::resetParametersExclusive(const OptVariables& active)
         model_changed || active_values[parameter] != parameters.flat_values()[active_flat_indices[parameter]];
 
   if (model_changed)
-    parameters.set_flat_values(active_flat_indices, active_values);
+  {
+    if (model_state_->numerical_tile_backend)
+    {
+      // A selected legacy update publishes one complete canonical device image.
+      auto complete_values = parameters.flat_values();
+      for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
+        complete_values[active_flat_indices[parameter]] = active_values[parameter];
+      model_state_->setParameterValues(complete_values);
+    }
+    else
+      parameters.set_flat_values(active_flat_indices, active_values);
+  }
   const std::size_t parameter_version = parameters.version();
 
   for (std::size_t parameter = 0; parameter < active_values.size(); ++parameter)
@@ -9731,7 +9756,7 @@ void PsiFormerWF::readVariationalParameters(hdf_archive& input)
     }
 
     if (flat_values != model.p.flat_values())
-      model.p.set_flat_values(flat_values);
+      model_state_->setParameterValues(flat_values);
     const std::size_t parameter_version = model.p.version();
 
     for (std::size_t local_index = 0;

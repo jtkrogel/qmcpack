@@ -1203,6 +1203,68 @@ int main(int argc, char** argv)
     near(sparse_result.logabs[0], references[0].logabs, "native sparse reference publication");
     near(sparse_result.logabs[1], references[0].logabs, "native sparse replacement publication");
     std::cout << "PASS native numerical tiles: values/VGL/active gradients/sparse replacements/tails\n";
+
+    // Exercise the same publication barrier used by structured updates, legacy
+    // resets and VP restore. Reuse existing crowds across failures and versions.
+    auto dormant_tile = backend_tiles->prepare(1);
+    const auto accepted_values = model.p.flat_values();
+    auto proposed_values = accepted_values;
+    proposed_values[0] += .003;
+    const auto accepted_version = model.p.version();
+    bool native_called = false;
+    bool publication_rejected = false;
+    try
+    {
+      backend_tiles->publishParameters(proposed_values, accepted_version + 1, [&]() {
+        native_called = true;
+        throw std::runtime_error("injected native validation failure");
+      });
+    }
+    catch (const std::runtime_error&) { publication_rejected = true; }
+    if (!native_called || !publication_rejected || model.p.version() != accepted_version)
+      throw std::runtime_error("Device publication failure changed the accepted native model");
+    const auto preserved_result = batch_executor.evaluateValues(*batch_workspace);
+    near(preserved_result.logabs[0], references[0].logabs, "failed publication preserves accepted device image");
+
+    auto invalid_values = proposed_values;
+    invalid_values[0] = std::numeric_limits<double>::quiet_NaN();
+    native_called = false;
+    publication_rejected = false;
+    try
+    {
+      backend_tiles->publishParameters(invalid_values, accepted_version + 1, [&]() { native_called = true; });
+    }
+    catch (const std::invalid_argument&) { publication_rejected = true; }
+    if (native_called || !publication_rejected)
+      throw std::runtime_error("Invalid candidate reached the native publication callback");
+
+    backend_tiles->publishParameters(proposed_values, accepted_version + 1,
+                                     [&]() { model.p.set_flat_values(proposed_values); });
+    auto changed_workspace = batch_value.makeWorkspace();
+    changed_workspace->setPositions(first_position);
+    const auto changed_value = batch_value.evaluate(*changed_workspace);
+    const auto changed_result = batch_executor.evaluateValues(*batch_workspace);
+    near(changed_result.logabs[0], changed_value.logabs, "published native/device parameter agreement");
+    backend_tiles->publishParameters(accepted_values, accepted_version + 2,
+                                     [&]() { model.p.set_flat_values(accepted_values); });
+    const auto restored_result = batch_executor.evaluateValues(*batch_workspace);
+    near(restored_result.logabs[0], references[0].logabs, "rollback publishes a newer image of accepted values");
+    const auto dormant_result = backend_tiles->evaluate(*dormant_tile, pf::DirectBatchMode::FULL_VGL,
+                                                       model.cfg.electrons.x.data(), 1, model.p.version());
+    near(dormant_result.logabs[0], references[0].logabs, "dormant context skips retired parameter versions");
+    for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+      near(dormant_result.gradient[lane * dormant_result.gradient_lane_stride], references[0].gradient[lane],
+           "rebound spatial scratch after rollback");
+    native_called = false;
+    publication_rejected = false;
+    try
+    {
+      backend_tiles->publishParameters(proposed_values, accepted_version + 1, [&]() { native_called = true; });
+    }
+    catch (const std::invalid_argument&) { publication_rejected = true; }
+    if (native_called || !publication_rejected)
+      throw std::runtime_error("Stale publication reached the native commit");
+    std::cout << "PASS production image publication: failed commit, invalid/stale candidate, reused/dormant crowds, rollback\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
               << "regular-channel score/kinetic/captured-grid response PASS; production training/Hamiltonian binding NOT_VALIDATED\n";

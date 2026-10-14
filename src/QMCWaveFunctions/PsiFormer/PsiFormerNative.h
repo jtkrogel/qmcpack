@@ -2110,12 +2110,26 @@ struct Parameters
                     [](double value) { return !is_finite_parameter_value(value); }))
       throw std::invalid_argument("PsiFormer flat parameter vector contains a non-finite value");
 
-    values = new_values;
+    if (parameter_version == std::numeric_limits<size_t>::max())
+      throw std::overflow_error("PsiFormer parameter version exhausted");
+
+    // Resolve allocating map keys and validate leaf extents before touching any
+    // authoritative value. The final copies cannot allocate or partially fail.
+    std::vector<NodePtr> parameter_nodes;
+    parameter_nodes.reserve(layouts.size());
     for (const Layout& layout : layouts)
     {
       NodePtr parameter_node = nodes.at({layout.module, layout.name});
-      std::copy(values.begin() + layout.begin, values.begin() + layout.end, parameter_node->value.x.begin());
+      if (layout.end > values.size() || layout.begin > layout.end ||
+          parameter_node->value.x.size() != layout.end - layout.begin)
+        throw std::logic_error("PsiFormer parameter leaf has an inconsistent flat extent");
+      parameter_nodes.push_back(std::move(parameter_node));
     }
+
+    std::copy(new_values.begin(), new_values.end(), values.begin());
+    for (size_t index = 0; index < layouts.size(); ++index)
+      std::copy(values.begin() + layouts[index].begin, values.begin() + layouts[index].end,
+                parameter_nodes[index]->value.x.begin());
     ++parameter_version;
   }
 
