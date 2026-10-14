@@ -109,18 +109,22 @@ int main(int argc, char** argv)
   {
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS]");
+                                  "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--score-output CANONICAL_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
     bool cpu_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
+    std::string score_output;
     for (int argument = 4; argument < argc; ++argument)
     {
       const std::string option(argv[argument]);
       if (option == "--cpu-only" && !cpu_only)
         cpu_only = true;
+      else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
+        score_output = argv[++argument];
       else if (option == "--shape" && !shape_supplied && argument + 4 < argc)
       {
         std::size_t* dimensions[] = {&determinants, &width, &heads, &blocks};
@@ -139,6 +143,8 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
+    if (cpu_only && !score_output.empty())
+      throw std::invalid_argument("Canonical GPU score export is incompatible with --cpu-only");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
@@ -404,6 +410,15 @@ int main(int argc, char** argv)
     }
     std::cout << "PASS full weighted canonical score VJP: CPU parity; parameters=" << cpu_score.size()
               << " max_abs_difference=" << score_max_difference << '\n';
+    if (!score_output.empty())
+    {
+      // Developer interchange on the qualified little-endian binary64 machines:
+      // canonical vector only, never a walker-by-parameter table.
+      std::ofstream output(score_output, std::ios::binary);
+      output.write(reinterpret_cast<const char*>(gpu_score.data()), gpu_score.size() * sizeof(double));
+      if (!output)
+        throw std::runtime_error("Canonical score output write failed");
+    }
     if (model.cfg.nconfig > 1)
     {
       std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
