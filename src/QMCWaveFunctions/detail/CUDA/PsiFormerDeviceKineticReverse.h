@@ -248,6 +248,16 @@ public:
   }
 
   /// Account owned device scratch; forward tape/model/vendor BLAS are separate.
+  /// Count retained host regularity/status storage for the lifted reverse.
+  std::size_t hostWorkspaceBytes() const
+  {
+    return checkedDeviceBytes<device_determinant::DerivativeStatus>(host_determinant_status_.capacity()) +
+        checkedDeviceBytes<OpenSpatialStatus>(host_open_status_.capacity()) +
+        checkedDeviceBytes<device_determinant::FactorizationMetadata>(host_factors_.capacity()) +
+        checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
+  }
+
+  /// Count prepared lifted device reverse and canonical response storage.
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = 0;

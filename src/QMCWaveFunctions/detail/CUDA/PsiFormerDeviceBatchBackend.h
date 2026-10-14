@@ -16,6 +16,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_BATCH_BACKEND_H
 
 #include "PsiFormerDeviceCrowdHooks.h"
+#include "PsiFormerDeviceProductSession.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
 
 #include <atomic>
@@ -52,6 +53,13 @@ public:
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
     return std::make_unique<Context>(this, image_, owner_, capacity, nextIdentity());
+  }
+
+  /// Prepare one exclusive product lane sharing this backend's publication owner.
+  std::unique_ptr<PreparedDeviceProductSession> prepareProductSession() const
+  {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    return std::make_unique<PreparedDeviceProductSession>(image_, owner_, control_mutex_, nextIdentity());
   }
 
   /// Return typed device products while leaving host publication to the caller.

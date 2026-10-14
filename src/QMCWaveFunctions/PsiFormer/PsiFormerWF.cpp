@@ -1678,19 +1678,35 @@ private:
 struct PsiFormerDerivativeScratch
 {
   PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters)
-      : score(state.direct_score_executor.makeWorkspace()),
-        kinetic(state.direct_kinetic_executor.makeWorkspace())
+      : score(state.numerical_tile_backend ? nullptr : state.direct_score_executor.makeWorkspace()),
+        kinetic(state.numerical_tile_backend ? nullptr : state.direct_kinetic_executor.makeWorkspace())
   {
     checkedBatchMemoryMultiply(parameters, sizeof(wftrain::DerivativeValue),
                                "PsiFormer shared derivative channels");
     for (auto& channel : channels)
       channel.resize(parameters);
+#ifdef ENABLE_CUDA
+    if (state.numerical_tile_backend)
+    {
+      const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+          state.numerical_tile_backend.get());
+      if (!backend)
+        throw std::logic_error("PsiFormer device products require the prepared numerical backend");
+      device_products = backend->prepareProductSession();
+      device_positions.resize(3 * state.execution_plan.modelShape().electrons());
+    }
+#endif
   }
 
   std::recursive_mutex execution_mutex;
   bool active = false;
   std::unique_ptr<pf::DirectScoreWorkspace> score;
   std::unique_ptr<pf::DirectKineticWorkspace> kinetic;
+#ifdef ENABLE_CUDA
+  std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products;
+  std::vector<double> device_positions;
+  bool reported_device_products = false;
+#endif
   std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
 };
 
@@ -1783,10 +1799,13 @@ public:
       throw std::invalid_argument(
           "PsiFormer streaming derivative received the wrong inverse-mass extent");
     if (schema_->parameterCount() != model_state_->execution_plan.parameterCount() ||
-        score_workspace_->scoreSize() != schema_->parameterCount() ||
-        kinetic_workspace_->scoreSize() != schema_->parameterCount() ||
-        kinetic_workspace_->kineticSize() != schema_->parameterCount())
+        (score_workspace_ && score_workspace_->scoreSize() != schema_->parameterCount()) ||
+        (kinetic_workspace_ && (kinetic_workspace_->scoreSize() != schema_->parameterCount() ||
+                               kinetic_workspace_->kineticSize() != schema_->parameterCount())))
       throw std::invalid_argument("PsiFormer streaming derivative schema does not match the execution plan");
+    if (hasDeviceProducts() && std::any_of(total_log_gradients_imaginary_.begin(),
+        total_log_gradients_imaginary_.end(), [](double value) { return value != 0.0; }))
+      throw std::invalid_argument("PsiFormer device kinetic products do not yet support imaginary total drift");
     checkedBatchMemoryAdd(sample_offset_, sample_count_,
                           "PsiFormer streaming derivative sample interval");
     initializeStorageDiagnostics();
@@ -1808,6 +1827,8 @@ public:
     result.parameter_scalar_domain = wftrain::ParameterScalarDomain::REAL64;
     result.result_scalar_domain    = wftrain::ParameterScalarDomain::COMPLEX128;
     result.reduction_domain        = wftrain::ReductionDomain::CROWD_LOCAL;
+    // This field describes sink-visible storage, not the kernel device. The
+    // compatibility lane downloads real responses and emits host complex chunks.
     result.execution_domain        = wftrain::DerivativeExecutionDomain::HOST;
     result.local_energy_term_mask =
         wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
@@ -1816,7 +1837,7 @@ public:
     result.maximum_vjp_channels              = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size          = 1;
-    result.fixed_parameter_scratch_vectors   = 3 + MAXIMUM_VJP_CHANNELS;
+    result.fixed_parameter_scratch_vectors   = (hasDeviceProducts() ? 7 : 3) + MAXIMUM_VJP_CHANNELS;
     result.block_streaming                   = true;
     return result;
   }
@@ -1966,11 +1987,7 @@ protected:
               sample * electron_count_ * std::size_t{3};
           const double* inverse_mass = inverse_masses_.data() +
               sample * electron_count_;
-          const pf::DirectKineticResultView result =
-              model_state_->direct_kinetic_executor.evaluate(
-                  *kinetic_workspace_, total_drift,
-                  electron_count_ * std::size_t{3}, inverse_mass,
-                  electron_count_);
+          const pf::DirectKineticResultView result = evaluateKineticResponse(total_drift, inverse_mass);
           requireResultVersion(result);
           for (std::size_t channel = 0; channel < channels.size(); ++channel)
           {
@@ -2018,8 +2035,7 @@ protected:
         else
         {
           setScoreWorkspacePositions(sample);
-          const pf::DirectScoreResult score =
-              model_state_->direct_score_executor.evaluate(*score_workspace_);
+          const pf::DirectScoreResult score = evaluateScoreResponse();
           requireResultVersion(score);
           for (std::size_t channel = 0; channel < channels.size(); ++channel)
             if (channels[channel].product ==
@@ -2056,8 +2072,7 @@ protected:
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
         setScoreWorkspacePositions(sample);
-        const pf::DirectScoreResult score =
-            model_state_->direct_score_executor.evaluate(*score_workspace_);
+        const pf::DirectScoreResult score = evaluateScoreResponse();
         requireResultVersion(score);
 
         wftrain::DerivativeValue& product = sample_products_[sample];
@@ -2114,11 +2129,7 @@ protected:
             sample * electron_count_ * std::size_t{3};
         const double* inverse_mass =
             inverse_masses_.data() + sample * electron_count_;
-        const pf::DirectKineticResultView result =
-            model_state_->direct_kinetic_executor.evaluate(
-                *kinetic_workspace_, total_drift,
-                electron_count_ * std::size_t{3}, inverse_mass,
-                electron_count_);
+        const pf::DirectKineticResultView result = evaluateKineticResponse(total_drift, inverse_mass);
         requireResultVersion(result);
 
         wftrain::DerivativeValue& product = sample_products_[sample];
@@ -2199,13 +2210,83 @@ private:
     return std::vector<wftrain::DerivativeValue>(sample_count);
   }
 
+  /// Keep vendor types private while reporting the selected numerical provider.
+  bool hasDeviceProducts() const noexcept
+  {
+#ifdef ENABLE_CUDA
+    return shared_scratch_->device_products != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  /// Evaluate a real canonical score through the selected, exclusively leased lane.
+  pf::DirectScoreResult evaluateScoreResponse() const
+  {
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      const auto& response = shared_scratch_->device_products->score(
+          shared_scratch_->device_positions.data(), parameter_version_);
+      reportDeviceProducts();
+      pf::DirectScoreResult result;
+      result.parameter_score = {response.data(), response.size()};
+      result.parameter_version = parameter_version_;
+      return result;
+    }
+#endif
+    return model_state_->direct_score_executor.evaluate(*score_workspace_);
+  }
+
+  /// Preserve complete drift and sample-specific masses in the device kinetic root.
+  pf::DirectKineticResultView evaluateKineticResponse(const double* drift, const double* masses) const
+  {
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      auto& session = *shared_scratch_->device_products;
+      const auto* positions = shared_scratch_->device_positions.data();
+      const auto& response = session.kinetic(positions, drift, masses, parameter_version_);
+      const auto& score = session.score(positions, parameter_version_);
+      reportDeviceProducts();
+      pf::DirectKineticResultView result;
+      result.parameter_score = {score.data(), score.size()};
+      result.kinetic_parameter_response = {response.data(), response.size()};
+      result.parameter_version = parameter_version_;
+      return result;
+    }
+#endif
+    return model_state_->direct_kinetic_executor.evaluate(*kinetic_workspace_, drift,
+        3 * electron_count_, masses, electron_count_);
+  }
+
+  /// Log real completed numerical work once, not merely device preparation.
+  void reportDeviceProducts() const
+  {
+#ifdef ENABLE_CUDA
+    if (!shared_scratch_->reported_device_products)
+    {
+      app_log() << "  PsiFormer numerical device parameter product completed: parameter_version="
+                << parameter_version_ << ", CPU derivative fallback=no" << std::endl;
+      shared_scratch_->reported_device_products = true;
+    }
+#endif
+  }
+
   /// Copy one packed configuration into the reusable score workspace.
   void setScoreWorkspacePositions(std::size_t sample) const
   {
     const double* positions =
         positions_.data() + sample * electron_count_ * std::size_t{3};
-    score_workspace_->setPositions(
-        pf::GeometryPositionView::interleaved(positions, electron_count_));
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      std::copy_n(positions, shared_scratch_->device_positions.size(),
+                  shared_scratch_->device_positions.begin());
+      return;
+    }
+#endif
+    score_workspace_->setPositions(pf::GeometryPositionView::interleaved(positions, electron_count_));
   }
 
   /// Copy one packed configuration into the reusable kinetic workspace.
@@ -2213,8 +2294,15 @@ private:
   {
     const double* positions =
         positions_.data() + sample * electron_count_ * std::size_t{3};
-    kinetic_workspace_->setPositions(
-        pf::GeometryPositionView::interleaved(positions, electron_count_));
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      std::copy_n(positions, shared_scratch_->device_positions.size(),
+                  shared_scratch_->device_positions.begin());
+      return;
+    }
+#endif
+    kinetic_workspace_->setPositions(pf::GeometryPositionView::interleaved(positions, electron_count_));
   }
 
   /// Copy one accepted replacement into the reusable score workspace.
@@ -2222,8 +2310,17 @@ private:
   {
     setScoreWorkspacePositions(point.sample);
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+#ifdef ENABLE_CUDA
+      if (hasDeviceProducts())
+      {
+        shared_scratch_->device_positions[3 * point.electron + dimension] = point.replacement_position[dimension];
+        continue;
+      }
+#endif
       score_workspace_->setPosition(point.electron, dimension,
                                     point.replacement_position[dimension]);
+    }
   }
 
   /// Add the exact fixed-grid ratio derivative without drawing or rebuilding a grid.
@@ -2237,8 +2334,7 @@ private:
     for (std::size_t sample = 0; sample < sample_count_; ++sample)
     {
       setScoreWorkspacePositions(sample);
-      const pf::DirectScoreResult score =
-          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      const pf::DirectScoreResult score = evaluateScoreResponse();
       requireResultVersion(score);
       wftrain::DerivativeValue product{};
       for (std::size_t parameter = 0; parameter < score.parameter_score.size;
@@ -2251,8 +2347,7 @@ private:
     for (const auto& point : ecp_replay_->points())
     {
       setReplayPointPositions(point);
-      const pf::DirectScoreResult score =
-          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      const pf::DirectScoreResult score = evaluateScoreResponse();
       requireResultVersion(score);
       wftrain::DerivativeValue virtual_product{};
       for (std::size_t parameter = 0; parameter < score.parameter_score.size;
@@ -2284,8 +2379,7 @@ private:
     for (const auto& point : ecp_replay_->points())
     {
       setReplayPointPositions(point);
-      const pf::DirectScoreResult score =
-          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      const pf::DirectScoreResult score = evaluateScoreResponse();
       requireResultVersion(score);
       const wftrain::DerivativeValue weight =
           point.bare_weight * point.complete_ratio;
@@ -2307,8 +2401,7 @@ private:
     for (std::size_t sample = 0; sample < sample_count_; ++sample)
     {
       setScoreWorkspacePositions(sample);
-      const pf::DirectScoreResult score =
-          model_state_->direct_score_executor.evaluate(*score_workspace_);
+      const pf::DirectScoreResult score = evaluateScoreResponse();
       requireResultVersion(score);
       for (std::size_t channel = 0; channel < channels.size(); ++channel)
         if (channels[channel].product ==
@@ -2404,16 +2497,19 @@ private:
   /// Re-measure every retained numeric owner for live warmed-call diagnostics.
   wftrain::StreamingDerivativeStorageDiagnostics measureStorageDiagnostics() const
   {
-    const std::size_t score_bytes = score_workspace_->scoreStorageBytes();
+    const std::size_t score_bytes = hasDeviceProducts()
+        ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(std::size_t{7}, schema_->parameterCount(),
+              "PsiFormer device product parameter vectors"), sizeof(double), "PsiFormer device parameter bytes")
+        : score_workspace_->scoreStorageBytes();
     const std::size_t kinetic_parameter_bytes =
-        kinetic_workspace_->parameterStorageBytes();
+        hasDeviceProducts() ? 0 : kinetic_workspace_->parameterStorageBytes();
     const std::size_t expected_kinetic_parameter_bytes =
         checkedBatchMemoryMultiply(
             checkedBatchMemoryMultiply(
                 std::size_t{2}, schema_->parameterCount(),
                 "PsiFormer streaming kinetic parameter vectors"),
             sizeof(double), "PsiFormer streaming kinetic parameter bytes");
-    if (kinetic_parameter_bytes != expected_kinetic_parameter_bytes)
+    if (!hasDeviceProducts() && kinetic_parameter_bytes != expected_kinetic_parameter_bytes)
       throw std::length_error(
           "PsiFormer streaming kinetic parameter storage is not exact");
     std::size_t channel_bytes     = 0;
@@ -2454,10 +2550,22 @@ private:
     const std::size_t replay_bytes = ecp_replay_
         ? ecp_replay_->storageDiagnostics().retained_numeric_bytes
         : 0;
-    const std::size_t workspace_bytes = checkedBatchMemoryAdd(
-        score_workspace_->vectorStorageBytes(),
-        kinetic_workspace_->vectorStorageBytes(),
-        "PsiFormer streaming evaluator workspaces");
+    std::size_t workspace_bytes = 0;
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      const auto& session = *shared_scratch_->device_products;
+      workspace_bytes = checkedBatchMemoryAdd(session.deviceWorkspaceBytes(), session.hostWorkspaceBytes(),
+                                               "PsiFormer device product host/device storage");
+      workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
+          checkedBatchMemoryMultiply(shared_scratch_->device_positions.capacity(), sizeof(double),
+                                      "PsiFormer device provider coordinate staging"),
+          "PsiFormer device provider scratch");
+    }
+    else
+#endif
+      workspace_bytes = checkedBatchMemoryAdd(score_workspace_->vectorStorageBytes(),
+          kinetic_workspace_->vectorStorageBytes(), "PsiFormer streaming evaluator workspaces");
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
         checkedBatchMemoryAdd(score_bytes, kinetic_parameter_bytes,
                               "PsiFormer streaming real parameter scratch"),
@@ -2476,9 +2584,18 @@ private:
         "PsiFormer streaming retained storage");
 
     std::size_t fingerprint = std::size_t{1469598103U};
-    mixFingerprint(fingerprint, score_workspace_->storageFingerprint());
+    if (score_workspace_)
+      mixFingerprint(fingerprint, score_workspace_->storageFingerprint());
     mixFingerprint(fingerprint, workspace_bytes);
-    mixFingerprint(fingerprint, kinetic_workspace_->storageFingerprint());
+    if (kinetic_workspace_)
+      mixFingerprint(fingerprint, kinetic_workspace_->storageFingerprint());
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_products.get()));
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_positions.data()));
+    }
+#endif
     mixFingerprint(fingerprint,
                    reinterpret_cast<std::uintptr_t>(positions_.data()));
     mixFingerprint(fingerprint, positions_.capacity());
@@ -2514,7 +2631,7 @@ private:
 
     return {schema_->parameterCount(),
             sample_count_,
-            3,
+            hasDeviceProducts() ? std::size_t{7} : std::size_t{3},
             MAXIMUM_VJP_CHANNELS,
             parameter_bytes,
             workspace_bytes,
@@ -2585,7 +2702,7 @@ public:
         electron_count_(model_state_->execution_plan.modelShape().electrons()),
         positions_(std::move(positions)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
-        score_workspace_(model_state_->direct_score_executor.makeWorkspace()),
+        score_workspace_(model_state_->numerical_tile_backend ? nullptr : model_state_->direct_score_executor.makeWorkspace()),
         channel_accumulators_{makeParameterVector(schema_->parameterCount()),
                               makeParameterVector(schema_->parameterCount()),
                               makeParameterVector(schema_->parameterCount())},
@@ -2599,9 +2716,20 @@ public:
                                    "PsiFormer ECP reference positions"),
         std::size_t{3}, "PsiFormer ECP Cartesian positions");
     if (positions_.size() != expected_positions ||
-        score_workspace_->scoreSize() != schema_->parameterCount())
+        (score_workspace_ && score_workspace_->scoreSize() != schema_->parameterCount()))
       throw std::invalid_argument(
           "PsiFormer ECP consumer has inconsistent model or reference extents");
+#ifdef ENABLE_CUDA
+    if (model_state_->numerical_tile_backend)
+    {
+      const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+          model_state_->numerical_tile_backend.get());
+      if (!backend)
+        throw std::logic_error("PsiFormer ECP products require the numerical device backend");
+      device_products_ = backend->prepareProductSession();
+      device_positions_.resize(3 * electron_count_);
+    }
+#endif
     baseline_storage_ = measureStorageDiagnostics();
   }
 
@@ -2821,8 +2949,7 @@ public:
 
           setVirtualPositions(sample, static_cast<std::size_t>(slice.electronId()),
                               slice.absolutePosition(local_point));
-          const pf::DirectScoreResult score =
-              model_state_->direct_score_executor.evaluate(*score_workspace_);
+          const pf::DirectScoreResult score = evaluateScoreResponse();
           if (score.parameter_version != parameter_version_)
             throw std::logic_error(
                 "PsiFormer ECP virtual score has the wrong parameter version");
@@ -2870,8 +2997,7 @@ public:
         for (std::size_t sample = 0; sample < sample_count_; ++sample)
         {
           setReferencePositions(sample);
-          const pf::DirectScoreResult score =
-              model_state_->direct_score_executor.evaluate(*score_workspace_);
+          const pf::DirectScoreResult score = evaluateScoreResponse();
           if (score.parameter_version != parameter_version_)
             throw std::logic_error(
                 "PsiFormer ECP reference score has the wrong parameter version");
@@ -3013,8 +3139,31 @@ private:
   {
     const double* positions =
         positions_.data() + sample * electron_count_ * std::size_t{3};
+#ifdef ENABLE_CUDA
+    if (device_products_)
+    {
+      std::copy_n(positions, device_positions_.size(), device_positions_.begin());
+      return;
+    }
+#endif
     score_workspace_->setPositions(
         pf::GeometryPositionView::interleaved(positions, electron_count_));
+  }
+
+  /// Use the actual accepted quadrature positions in a leased numerical score call.
+  pf::DirectScoreResult evaluateScoreResponse() const
+  {
+#ifdef ENABLE_CUDA
+    if (device_products_)
+    {
+      const auto& score = device_products_->score(device_positions_.data(), parameter_version_);
+      pf::DirectScoreResult result;
+      result.parameter_score = {score.data(), score.size()};
+      result.parameter_version = parameter_version_;
+      return result;
+    }
+#endif
+    return model_state_->direct_score_executor.evaluate(*score_workspace_);
   }
 
   /// Copy the reference and then overwrite exactly one electron position.
@@ -3029,6 +3178,13 @@ private:
       if (!psiformer::determinant::isFiniteReal(coordinate))
         throw std::invalid_argument(
             "PsiFormer ECP virtual position must be finite");
+#ifdef ENABLE_CUDA
+      if (device_products_)
+      {
+        device_positions_[3 * electron + dimension] = coordinate;
+        continue;
+      }
+#endif
       score_workspace_->setPosition(electron, dimension, coordinate);
     }
   }
@@ -3057,7 +3213,10 @@ private:
   wftrain::StreamingDerivativeStorageDiagnostics measureStorageDiagnostics() const
   {
     const std::size_t parameter_count = schema_->parameterCount();
-    const std::size_t score_bytes     = score_workspace_->scoreStorageBytes();
+    const std::size_t score_bytes = model_state_->numerical_tile_backend
+        ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(std::size_t{7}, parameter_count,
+            "PsiFormer ECP device parameter vectors"), sizeof(double), "PsiFormer ECP device parameter bytes")
+        : score_workspace_->scoreStorageBytes();
     std::size_t channel_bytes         = 0;
     for (const auto& channel : channel_accumulators_)
       channel_bytes = checkedBatchMemoryAdd(
@@ -3103,7 +3262,19 @@ private:
         "PsiFormer ECP replay storage");
     auxiliary_bytes = checkedBatchMemoryAdd(
         auxiliary_bytes, replay_bytes, "PsiFormer ECP auxiliary and replay storage");
-    const std::size_t workspace_bytes = score_workspace_->vectorStorageBytes();
+    std::size_t workspace_bytes = 0;
+#ifdef ENABLE_CUDA
+    if (device_products_)
+    {
+      workspace_bytes = checkedBatchMemoryAdd(device_products_->deviceWorkspaceBytes(),
+          device_products_->hostWorkspaceBytes(), "PsiFormer ECP device product storage");
+      workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
+          checkedBatchMemoryMultiply(device_positions_.capacity(), sizeof(double), "PsiFormer ECP device coordinates"),
+          "PsiFormer ECP device workspace");
+    }
+    else
+#endif
+      workspace_bytes = score_workspace_->vectorStorageBytes();
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
         score_bytes, channel_bytes, "PsiFormer ECP parameter scratch");
     const std::size_t retained_bytes = checkedBatchMemoryAdd(
@@ -3114,7 +3285,12 @@ private:
         "PsiFormer ECP retained storage");
 
     std::size_t fingerprint = std::size_t{1469598103U};
-    mixFingerprint(fingerprint, score_workspace_->storageFingerprint());
+    if (score_workspace_)
+      mixFingerprint(fingerprint, score_workspace_->storageFingerprint());
+#ifdef ENABLE_CUDA
+    if (device_products_)
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(device_products_.get()));
+#endif
     mixFingerprint(fingerprint,
                    reinterpret_cast<std::uintptr_t>(positions_.data()));
     mixFingerprint(fingerprint, positions_.capacity());
@@ -3148,7 +3324,7 @@ private:
     if (fingerprint == 0)
       fingerprint = 1;
 
-    return {parameter_count, sample_count_, 1, MAXIMUM_CHANNELS,
+    return {parameter_count, sample_count_, model_state_->numerical_tile_backend ? std::size_t{7} : std::size_t{1}, MAXIMUM_CHANNELS,
             parameter_bytes, workspace_bytes, position_bytes,
             auxiliary_bytes, 0, retained_bytes, 1, fingerprint};
   }
@@ -3164,6 +3340,10 @@ private:
   std::vector<double> positions_;
   wftrain::ParameterChunkPlan chunk_plan_;
   mutable std::unique_ptr<pf::DirectScoreWorkspace> score_workspace_;
+#ifdef ENABLE_CUDA
+  std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products_;
+  mutable std::vector<double> device_positions_;
+#endif
   mutable std::array<std::vector<wftrain::DerivativeValue>, MAXIMUM_CHANNELS>
       channel_accumulators_;
   std::array<std::vector<wftrain::DerivativeValue>, MAXIMUM_CHANNELS>
@@ -4845,8 +5025,10 @@ PsiFormerWF::PsiFormerWF(std::string name,
 {
   if (!enable_optimization && !selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
-  if (enable_optimization && model_state_->numerical_tile_backend)
-    throw std::invalid_argument("PsiFormer GPU optimization is not available until numerical score/response products are connected");
+  if (enable_optimization && model_state_->numerical_tile_backend &&
+      (model_state_->accelerator_resolution.validated_operations & psiformer::allPsiFormerAcceleratorOperations()) !=
+          psiformer::allPsiFormerAcceleratorOperations())
+    throw std::invalid_argument("PsiFormer GPU optimization requires validated products and parameter publication");
   if (optimize_all && !enable_optimization)
     throw std::invalid_argument("PsiFormer optimize_scope=all requires optimize=yes");
   if (optimize_all && !selected_flat_indices.empty())

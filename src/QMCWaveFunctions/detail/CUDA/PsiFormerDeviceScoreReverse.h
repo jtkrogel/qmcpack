@@ -177,7 +177,16 @@ public:
     ready_ = false;
   }
 
-  /// Account all explicitly owned numerical storage, not the shared model image.
+  /// Count host admission/status storage, including the shared trunk reverse.
+  std::size_t hostWorkspaceBytes() const
+  {
+    return network_.hostWorkspaceBytes() +
+        checkedDeviceBytes<device_determinant::DerivativeStatus>(host_status_.capacity()) +
+        checkedDeviceBytes<device_determinant::FactorizationMetadata>(host_factors_.capacity()) +
+        checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
+  }
+
+  /// Account explicitly owned device storage, excluding the shared model image.
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = network_.deviceWorkspaceBytes();

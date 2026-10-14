@@ -1207,6 +1207,40 @@ int main(int argc, char** argv)
     // Exercise the same publication barrier used by structured updates, legacy
     // resets and VP restore. Reuse existing crowds across failures and versions.
     auto dormant_tile = backend_tiles->prepare(1);
+    auto product_session = backend_tiles->prepareProductSession();
+    const auto session_bytes = product_session->deviceWorkspaceBytes();
+    const auto& session_score = product_session->score(model.cfg.electrons.x.data(), model.p.version());
+    cpu_score_workspace->setPositions(first_position);
+    const auto session_reference = cpu_score_executor.evaluate(*cpu_score_workspace);
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(session_score[parameter], session_reference.parameter_score[parameter], "leased score session CPU parity");
+    near(product_session->scoreJvp(model.cfg.electrons.x.data(), product_direction, model.p.version()),
+         cpu_products[0], "leased explicit JVP CPU parity");
+    bool stale_product_rejected = false;
+    try { product_session->score(model.cfg.electrons.x.data(), model.p.version() + 1); }
+    catch (const std::invalid_argument&) { stale_product_rejected = true; }
+    if (!stale_product_rejected || product_session->numericalProducts() != 2)
+      throw std::runtime_error("Product session stale request/counter contract failed");
+    const auto& session_kinetic = product_session->kinetic(model.cfg.electrons.x.data(),
+        external_contiguous.data(), inverse_masses.data(), model.p.version());
+    kinetic_workspace->setPositions(first_position);
+    const auto session_kinetic_reference = kinetic_cpu.evaluate(*kinetic_workspace,
+        external_contiguous.data(), 3 * model.ne, inverse_masses.data(), model.ne);
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(session_kinetic[parameter], session_kinetic_reference.kinetic_parameter_response[parameter],
+           "leased kinetic session total-drift/mass CPU parity");
+    std::vector<double> invalid_product_positions(model.cfg.electrons.x.begin(),
+        model.cfg.electrons.x.begin() + 3 * model.ne);
+    invalid_product_positions[0] = std::numeric_limits<double>::quiet_NaN();
+    bool failed_product_rejected = false;
+    try { product_session->score(invalid_product_positions.data(), model.p.version()); }
+    catch (const std::exception&) { failed_product_rejected = true; }
+    if (!failed_product_rejected)
+      throw std::runtime_error("Product session accepted nonfinite numerical input");
+    const auto& recovered_score = product_session->score(model.cfg.electrons.x.data(), model.p.version());
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(recovered_score[parameter], session_reference.parameter_score[parameter],
+           "leased product failure recovery preserves model and prepared scratch");
     const auto accepted_values = model.p.flat_values();
     auto proposed_values = accepted_values;
     proposed_values[0] += .003;
@@ -1245,6 +1279,11 @@ int main(int argc, char** argv)
     const auto changed_value = batch_value.evaluate(*changed_workspace);
     const auto changed_result = batch_executor.evaluateValues(*batch_workspace);
     near(changed_result.logabs[0], changed_value.logabs, "published native/device parameter agreement");
+    const auto& changed_score = product_session->score(model.cfg.electrons.x.data(), model.p.version());
+    const auto changed_score_reference = cpu_score_executor.evaluate(*cpu_score_workspace);
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(changed_score[parameter], changed_score_reference.parameter_score[parameter],
+           "leased product rebind CPU parity");
     backend_tiles->publishParameters(accepted_values, accepted_version + 2,
                                      [&]() { model.p.set_flat_values(accepted_values); });
     const auto restored_result = batch_executor.evaluateValues(*batch_workspace);
@@ -1265,6 +1304,9 @@ int main(int argc, char** argv)
     if (native_called || !publication_rejected)
       throw std::runtime_error("Stale publication reached the native commit");
     std::cout << "PASS production image publication: failed commit, invalid/stale candidate, reused/dormant crowds, rollback\n";
+    if (session_bytes != product_session->deviceWorkspaceBytes())
+      throw std::runtime_error("Product session reallocated prepared scratch");
+    std::cout << "PASS leased numerical product session: score/JVP, stale version, publication rebind, fixed scratch\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
               << "regular-channel score/kinetic/captured-grid response PASS; production training/Hamiltonian binding NOT_VALIDATED\n";

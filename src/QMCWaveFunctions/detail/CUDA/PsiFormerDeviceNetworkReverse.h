@@ -152,6 +152,13 @@ public:
   }
 
   /// Account the prepared numerical storage, excluding the shared model and BLAS.
+  /// Count host-side finite-scan storage retained by this reverse lane.
+  std::size_t hostWorkspaceBytes() const
+  {
+    return checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
+  }
+
+  /// Count prepared device adjoints, canonical response and finite-scan buffers.
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = 0;

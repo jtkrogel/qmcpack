@@ -54,7 +54,7 @@ psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
   psiformer::PsiFormerAcceleratorReadiness readiness;
   readiness.cuda.compiled       = support.cuda;
   readiness.cuda.usable_device = support.cuda && usable_device;
-  readiness.cuda.operation_coverage = psiformer::psiFormerAcceleratorInferenceOperations();
+  readiness.cuda.operation_coverage = psiformer::allPsiFormerAcceleratorOperations();
   readiness.cuda.runtime_validation = psiformer::PsiFormerRuntimeValidation::PASSED;
   readiness.hip.compiled        = support.hip;
   readiness.hip.usable_device  = support.hip && usable_device;

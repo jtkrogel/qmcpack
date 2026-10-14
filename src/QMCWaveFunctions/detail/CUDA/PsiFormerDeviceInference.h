@@ -654,6 +654,14 @@ public:
   }
 
   /// Account every explicitly owned device allocation, excluding shared images/BLAS.
+  /// Count retained host status arrays, separately from vendor allocations.
+  std::size_t hostWorkspaceBytes() const
+  {
+    return checkedDeviceBytes<OpenSpatialStatus>(host_status_.capacity()) +
+        checkedDeviceBytes<device_math::JetMathStatus>(host_jet_status_.capacity());
+  }
+
+  /// Count graph-owned device buffers, excluding the shared immutable image.
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = 0;

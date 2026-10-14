@@ -163,6 +163,15 @@ public:
   }
 
   /// Account prepared device scratch separately from the immutable model image.
+  /// Count host-side regularity and finite-result admission arrays.
+  std::size_t hostWorkspaceBytes() const
+  {
+    return checkedDeviceBytes<device_determinant::DerivativeStatus>(host_status_.capacity()) +
+        checkedDeviceBytes<device_determinant::FactorizationMetadata>(host_factors_.capacity()) +
+        checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
+  }
+
+  /// Count prepared device tangent, direction and admission buffers.
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = 0;
