@@ -18,6 +18,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_RESOURCES_H
 
 #include "PsiFormerDeviceRuntime.h"
+#include "PsiFormerDeviceMetrics.h"
 
 #include <limits>
 #include <stdexcept>
@@ -70,7 +71,8 @@ public:
 
   /// Transfer unique ownership without allocating or consulting the runtime.
   DeviceBuffer(DeviceBuffer&& other) noexcept
-      : data_(std::exchange(other.data_, nullptr)), capacity_(std::exchange(other.capacity_, 0))
+      : data_(std::exchange(other.data_, nullptr)), capacity_(std::exchange(other.capacity_, 0)),
+        device_ordinal_(std::exchange(other.device_ordinal_, -1)), metrics_(std::exchange(other.metrics_, nullptr))
   {}
 
   /// Release storage without throwing during exception unwinding.
@@ -79,10 +81,14 @@ public:
     if (data_)
     {
 #ifdef QMC_CUDA2HIP
-      (void)hipFree(data_);
+      const auto result = hipFree(data_);
 #else
-      (void)cudaFree(data_);
+      const auto result = cudaFree(data_);
 #endif
+      if (result == success)
+        metrics_->freed(capacity_ * sizeof(T));
+      else
+        metrics_->failedFree();
     }
   }
 
@@ -92,23 +98,43 @@ public:
     if (capacity <= capacity_)
       return;
     const std::size_t bytes = checkedDeviceBytes<T>(capacity);
+    int device_ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&device_ordinal), "hipGetDevice for buffer preparation");
+#else
+    checkRuntime(cudaGetDevice(&device_ordinal), "cudaGetDevice for buffer preparation");
+#endif
+    if (data_ && device_ordinal != device_ordinal_)
+      throw std::logic_error("PsiFormer device buffer cannot grow on a different owning device");
+    auto& metrics = deviceMemoryMetrics(device_ordinal);
     void* replacement = nullptr;
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipMalloc(&replacement, bytes), "hipMalloc");
 #else
     checkRuntime(cudaMalloc(&replacement, bytes), "cudaMalloc");
 #endif
+    metrics.allocated(bytes);
     // Publish new ownership only after allocation succeeds.
     T* previous = data_;
+    const auto previous_bytes = capacity_ * sizeof(T);
     data_       = static_cast<T*>(replacement);
     capacity_   = capacity;
+    device_ordinal_ = device_ordinal;
+    metrics_ = &metrics;
     if (previous)
     {
 #ifdef QMC_CUDA2HIP
-      checkRuntime(hipFree(previous), "hipFree after buffer growth");
+      const auto result = hipFree(previous);
 #else
-      checkRuntime(cudaFree(previous), "cudaFree after buffer growth");
+      const auto result = cudaFree(previous);
 #endif
+      if (result == success)
+        metrics.freed(previous_bytes);
+      else
+      {
+        metrics.failedFree();
+        checkRuntime(result, "free previous PsiFormer device buffer after growth");
+      }
     }
   }
 
@@ -123,6 +149,7 @@ public:
 #else
     checkRuntime(cudaMemcpy(data_, source, checkedDeviceBytes<T>(count), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
 #endif
+    metrics_->uploaded(checkedDeviceBytes<T>(count));
   }
 
   /// Copy a bounded device interval into caller-owned host storage.
@@ -138,6 +165,7 @@ public:
 #else
     checkRuntime(cudaMemcpy(destination, data_ + source_offset, checkedDeviceBytes<T>(count), cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
 #endif
+    metrics_->downloaded(checkedDeviceBytes<T>(count));
   }
 
   /// Expose the stable prepared pointer without allocation.
@@ -148,6 +176,9 @@ public:
 
   /// Report the allocated element capacity, not a logical tensor shape.
   std::size_t capacity() const noexcept { return capacity_; }
+
+  /// Identify the preparation-time owner without another runtime query.
+  int deviceOrdinal() const noexcept { return device_ordinal_; }
 
 private:
   /// Check destination bounds and null host pointers before any vendor call.
@@ -161,6 +192,8 @@ private:
 
   T* data_              = nullptr;
   std::size_t capacity_ = 0;
+  int device_ordinal_ = -1;
+  DeviceMemoryMetrics* metrics_ = nullptr;
 };
 
 } // namespace qmcplusplus::psiformer::device

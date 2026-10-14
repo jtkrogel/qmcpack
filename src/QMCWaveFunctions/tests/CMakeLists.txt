@@ -113,6 +113,7 @@ set(TRIALWF_SRC
     test_twf_fastderiv_raii.cpp
     test_TWFGrads.cpp
     test_virtual_particle_batch_dispatch.cpp
+    test_psiformer_device_metrics.cpp
     test_psiformer_accelerator_planning.cpp
     test_psiformer_accelerator_executor.cpp
     test_psiformer_accelerator_schedule.cpp
