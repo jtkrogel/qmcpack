@@ -22,6 +22,7 @@
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceNetworkReverse.h"
 #include "PsiFormerDeviceScoreReverse.h"
+#include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
 
@@ -110,7 +111,7 @@ int main(int argc, char** argv)
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
-                                  "[--score-output CANONICAL_F64]");
+                                  "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
@@ -118,6 +119,7 @@ int main(int argc, char** argv)
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
+    std::string jvp_output;
     for (int argument = 4; argument < argc; ++argument)
     {
       const std::string option(argv[argument]);
@@ -125,6 +127,8 @@ int main(int argc, char** argv)
         cpu_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
+      else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
+        jvp_output = argv[++argument];
       else if (option == "--shape" && !shape_supplied && argument + 4 < argc)
       {
         std::size_t* dimensions[] = {&determinants, &width, &heads, &blocks};
@@ -143,7 +147,7 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
-    if (cpu_only && !score_output.empty())
+    if (cpu_only && (!score_output.empty() || !jvp_output.empty()))
       throw std::invalid_argument("Canonical GPU score export is incompatible with --cpu-only");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
@@ -394,13 +398,35 @@ int main(int argc, char** argv)
       throw std::runtime_error("Score reverse allocated storage during reuse");
     pf::DirectScoreExecutor cpu_score_executor(model, plan);
     auto cpu_score_workspace = cpu_score_executor.makeWorkspace();
+    std::vector<double> product_direction(plan.parameterCount());
+    for (std::size_t parameter = 0; parameter < product_direction.size(); ++parameter)
+      product_direction[parameter] = (static_cast<int>(parameter % 11) - 5) * 0.01 / std::sqrt(product_direction.size());
+    PreparedDeviceScoreJvp score_jvp(image, model.cfg.nconfig, queue, handle);
+    score_jvp.evaluate(taped, product_direction);
+    std::vector<double> products(model.cfg.nconfig), cpu_products(model.cfg.nconfig, 0.0);
+    score_jvp.downloadProducts(products);
+    const auto jvp_bytes = score_jvp.deviceWorkspaceBytes();
+    bool invalid_direction_rejected = false, stale_jvp_rejected = false;
+    try { (void)score_jvp.evaluate(taped, {}); }
+    catch (const std::invalid_argument&) { invalid_direction_rejected = true; }
+    try { score_jvp.downloadProducts(products); }
+    catch (const std::logic_error&) { stale_jvp_rejected = true; }
+    if (!invalid_direction_rejected || !stale_jvp_rejected)
+      throw std::runtime_error("Failed JVP request exposed stale products");
+    score_jvp.evaluate(taped, product_direction);
+    score_jvp.downloadProducts(products);
+    if (score_jvp.deviceWorkspaceBytes() != jvp_bytes)
+      throw std::runtime_error("Score JVP allocated storage during reuse");
     for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
     {
       cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
           model.cfg.electrons.x.data() + configuration * model.ne * 3, model.ne));
       const auto score = cpu_score_executor.evaluate(*cpu_score_workspace);
       for (std::size_t parameter = 0; parameter < cpu_score.size(); ++parameter)
+      {
         cpu_score[parameter] += score_weights[configuration] * score.parameter_score[parameter];
+        cpu_products[configuration] += product_direction[parameter] * score.parameter_score[parameter];
+      }
     }
     double score_max_difference = 0;
     for (std::size_t parameter = 0; parameter < cpu_score.size(); ++parameter)
@@ -410,6 +436,43 @@ int main(int argc, char** argv)
     }
     std::cout << "PASS full weighted canonical score VJP: CPU parity; parameters=" << cpu_score.size()
               << " max_abs_difference=" << score_max_difference << '\n';
+    std::vector<double> chunk(std::min<std::size_t>(65536, gpu_score.size()));
+    for (std::size_t begin = 0; begin < gpu_score.size(); begin += chunk.size())
+    {
+      const auto count = std::min(chunk.size(), gpu_score.size() - begin);
+      score_reverse.downloadResponseChunk(begin, chunk.data(), count);
+      for (std::size_t index = 0; index < count; ++index)
+        near(chunk[index], gpu_score[begin + index], "streamed canonical score chunk");
+    }
+    score_reverse.downloadResponseChunk(gpu_score.size(), nullptr, 0);
+    bool invalid_chunk_rejected = false;
+    try { score_reverse.downloadResponseChunk(gpu_score.size(), chunk.data(), 1); }
+    catch (const std::out_of_range&) { invalid_chunk_rejected = true; }
+    if (!invalid_chunk_rejected || score_reverse.parameterVersion() != image->version())
+      throw std::runtime_error("GPU score chunk bounds/version contract failed");
+    double weighted_jvp = 0, vjp_dot_direction = 0, jvp_max_difference = 0;
+    for (std::size_t configuration = 0; configuration < products.size(); ++configuration)
+    {
+      near(products[configuration], cpu_products[configuration], "explicit parameter score JVP CPU parity");
+      if (std::abs(products[configuration] - cpu_products[configuration]) > 5e-10 * (1 + std::abs(cpu_products[configuration])))
+        throw std::runtime_error("Score JVP exceeds tight directional-product tolerance");
+      weighted_jvp += score_weights[configuration] * products[configuration];
+      jvp_max_difference = std::max(jvp_max_difference, std::abs(products[configuration] - cpu_products[configuration]));
+    }
+    for (std::size_t parameter = 0; parameter < gpu_score.size(); ++parameter)
+      vjp_dot_direction += gpu_score[parameter] * product_direction[parameter];
+    near(weighted_jvp, vjp_dot_direction, "JVP/VJP adjoint identity");
+    if (std::abs(weighted_jvp - vjp_dot_direction) > 5e-10 * (1 + std::abs(vjp_dot_direction)))
+      throw std::runtime_error("Score JVP/VJP adjoint identity exceeds tight tolerance");
+    std::cout << "PASS explicit parameter score JVP and adjoint identity: max_abs_difference="
+              << jvp_max_difference << '\n';
+    if (!jvp_output.empty())
+    {
+      std::ofstream output(jvp_output, std::ios::binary);
+      output.write(reinterpret_cast<const char*>(products.data()), products.size() * sizeof(double));
+      if (!output)
+        throw std::runtime_error("Score JVP output write failed");
+    }
     if (!score_output.empty())
     {
       // Developer interchange on the qualified little-endian binary64 machines:
@@ -426,13 +489,18 @@ int main(int argc, char** argv)
       const std::vector<double> prefix_seed(seed.begin(), seed.begin() + model.ne * model.dim);
       network_reverse.reverse(taped, prefix_seed);
       score_reverse.reverse(taped, {score_weights[0]});
+      score_jvp.evaluate(taped, product_direction);
+      std::vector<double> prefix_products(1);
+      score_jvp.downloadProducts(prefix_products);
+      near(prefix_products[0], cpu_products[0], "score JVP tail-prefix CPU parity");
       score_reverse.downloadResponse(gpu_score);
       cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(model.cfg.electrons.x.data(), model.ne));
       const auto prefix_score = cpu_score_executor.evaluate(*cpu_score_workspace);
       for (std::size_t parameter = 0; parameter < gpu_score.size(); ++parameter)
         near(gpu_score[parameter], score_weights[0] * prefix_score.parameter_score[parameter], "score tail-prefix CPU parity");
       if (taped.valueTapeBatchCount() != 1 || taped.deviceWorkspaceBytes() != tape_bytes ||
-          network_reverse.deviceWorkspaceBytes() != reverse_bytes || score_reverse.deviceWorkspaceBytes() != score_bytes)
+          network_reverse.deviceWorkspaceBytes() != reverse_bytes || score_reverse.deviceWorkspaceBytes() != score_bytes ||
+          score_jvp.deviceWorkspaceBytes() != jvp_bytes)
         throw std::runtime_error("Short score tape/reverse prefix changed prepared storage");
     }
 
@@ -512,6 +580,12 @@ int main(int argc, char** argv)
     catch (const std::runtime_error&) { undefined_node_score_rejected = true; }
     if (!undefined_node_score_rejected)
       throw std::runtime_error("GPU log score accepted an exact total node");
+    PreparedDeviceScoreJvp node_jvp(node_image, model.cfg.nconfig, queue, handle);
+    bool undefined_node_jvp_rejected = false;
+    try { (void)node_jvp.evaluate(node_tape, product_direction); }
+    catch (const std::runtime_error&) { undefined_node_jvp_rejected = true; }
+    if (!undefined_node_jvp_rejected)
+      throw std::runtime_error("GPU score JVP accepted an exact total node");
     auto mixed_parameters = canonical_parameters;
     // Zero only one determinant column: its cofactor derivative can be nonzero
     // even though its normalized determinant weight is zero. Inverse-only score
@@ -534,6 +608,12 @@ int main(int argc, char** argv)
     catch (const std::runtime_error&) { mixed_channel_rejected = true; }
     if (!mixed_channel_rejected)
       throw std::runtime_error("Inverse-only GPU score silently accepted a singular determinant channel");
+    PreparedDeviceScoreJvp mixed_jvp(mixed_image, model.cfg.nconfig, queue, handle);
+    bool mixed_jvp_rejected = false;
+    try { (void)mixed_jvp.evaluate(mixed_tape, product_direction); }
+    catch (const std::runtime_error&) { mixed_jvp_rejected = true; }
+    if (!mixed_jvp_rejected)
+      throw std::runtime_error("Inverse-only GPU JVP accepted a singular determinant channel");
     std::cout << "PASS score failure guards: total node and singular channel with nonzero total amplitude\n";
     PreparedDeviceInference nodes(node_image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
     nodes.evaluate(model.cfg.electrons.x);
@@ -687,7 +767,7 @@ int main(int argc, char** argv)
     std::cout << "PASS native numerical tiles: values/VGL/active gradients/sparse replacements/tails\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
-              << "regular-channel weighted score VJP PASS; production training/JVP/kinetic response NOT_VALIDATED\n";
+              << "regular-channel score JVP/VJP PASS; production training/kinetic response NOT_VALIDATED\n";
     return 0;
   }
   catch (const std::exception& error)

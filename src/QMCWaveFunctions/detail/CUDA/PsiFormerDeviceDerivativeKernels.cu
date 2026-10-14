@@ -651,6 +651,182 @@ __global__ void addParameterResponsesKernel(std::size_t count, const double* lef
     destination[index] = left[index] + right[index];
 }
 
+/** Own each ordinary tanh tangent without borrowing a coordinate-jet convention. */
+__global__ void biasTanhParameterDirectionKernel(BatchedValueLayout layout,
+    const double* tanh_value, const double* preactivation_direction,
+    const double* bias_direction, double* output_direction)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= layout.configuration_count * layout.rows * layout.width)
+    return;
+  const auto column = index % layout.width;
+  const auto row = (index / layout.width) % layout.rows;
+  const auto configuration = index / (layout.rows * layout.width);
+  const auto offset = configuration * layout.configuration_stride + row * layout.row_stride + column;
+  const double value = tanh_value[offset];
+  output_direction[offset] = (1 - value * value) *
+      (preactivation_direction[offset] + bias_direction[column]);
+}
+
+/** Calculate device feature offsets without calling host-only planning accessors. */
+__device__ std::size_t directionFeatureOffset(const BatchedAttentionForwardLayout& layout,
+    std::size_t configuration, std::size_t row, std::size_t head, std::size_t feature)
+{
+  return configuration * layout.feature_configuration_stride + row * layout.attention.feature_row_stride +
+      head * layout.attention.head_width + feature;
+}
+
+/** Calculate device probability offsets in the checked, pointer-free host layout. */
+__device__ std::size_t directionAttentionOffset(const BatchedAttentionForwardLayout& layout,
+    std::size_t configuration, std::size_t head, std::size_t row, std::size_t column)
+{
+  return configuration * layout.attention_configuration_stride + head * layout.attention.attention_head_stride +
+      row * layout.attention.attention_row_stride + column;
+}
+
+/** Form scaled Q/K dot-product tangents before the row-owned softmax derivative. */
+__global__ void attentionLogitDirectionKernel(BatchedAttentionForwardLayout layout,
+    const double* query, const double* key, const double* query_direction,
+    const double* key_direction, double* direction)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.attention.rows;
+  const auto heads = layout.attention.heads;
+  if (index >= layout.configuration_count * heads * ne * ne)
+    return;
+  const auto column = index % ne, row = (index / ne) % ne;
+  const auto head = (index / (ne * ne)) % heads;
+  const auto configuration = index / (heads * ne * ne);
+  double sum = 0;
+  for (std::size_t feature = 0; feature < layout.attention.head_width; ++feature)
+  {
+    const auto q = directionFeatureOffset(layout, configuration, row, head, feature);
+    const auto k = directionFeatureOffset(layout, configuration, column, head, feature);
+    sum += query_direction[q] * key[k] + query[q] * key_direction[k];
+  }
+  direction[directionAttentionOffset(layout, configuration, head, row, column)] =
+      sum / std::sqrt(static_cast<double>(layout.attention.head_width));
+}
+
+/** One thread owns a complete probability row, avoiding read/write reduction races. */
+__global__ void attentionProbabilityDirectionKernel(BatchedAttentionForwardLayout layout,
+    const double* probabilities, double* direction)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.attention.rows, heads = layout.attention.heads;
+  if (index >= layout.configuration_count * heads * ne)
+    return;
+  const auto row = index % ne, head = (index / ne) % heads;
+  const auto configuration = index / (heads * ne);
+  double mean = 0;
+  for (std::size_t column = 0; column < ne; ++column)
+  {
+    const auto offset = directionAttentionOffset(layout, configuration, head, row, column);
+    mean += probabilities[offset] * direction[offset];
+  }
+  for (std::size_t column = 0; column < ne; ++column)
+  {
+    const auto offset = directionAttentionOffset(layout, configuration, head, row, column);
+    direction[offset] = probabilities[offset] * (direction[offset] - mean);
+  }
+}
+
+/** Own each context tangent after all probability rows are complete on the stream. */
+__global__ void attentionContextDirectionKernel(BatchedAttentionForwardLayout layout,
+    const double* probabilities, const double* probability_direction, const double* value,
+    const double* value_direction, double* context_direction)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.attention.rows, width = layout.attention.heads * layout.attention.head_width;
+  if (index >= layout.configuration_count * ne * width)
+    return;
+  const auto feature = index % width, row = (index / width) % ne;
+  const auto configuration = index / (ne * width);
+  const auto head = feature / layout.attention.head_width;
+  double sum = 0;
+  for (std::size_t column = 0; column < ne; ++column)
+  {
+    const auto probability = directionAttentionOffset(layout, configuration, head, row, column);
+    const auto v = directionFeatureOffset(layout, configuration, column, head, feature % layout.attention.head_width);
+    sum += probability_direction[probability] * value[v] + probabilities[probability] * value_direction[v];
+  }
+  context_direction[directionFeatureOffset(layout, configuration, row, head, feature % layout.attention.head_width)] = sum;
+}
+
+/** Own a full-matrix orbital tangent with the same spin-row convention as forward. */
+__global__ void openOrbitalParameterDirectionKernel(OpenOrbitalJetLayout layout,
+    const double* features, const double* feature_direction, const double* positions,
+    const double* nuclei, OrbitalDirectionParameters parameters, OrbitalDirectionParameters direction,
+    const double* backflow, const double* envelope, double* output)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.features.electron_count, determinants = layout.determinant_count;
+  if (index >= layout.features.configuration_count * determinants * ne * ne)
+    return;
+  const auto orbital = index % ne, electron = (index / ne) % ne;
+  const auto determinant = (index / (ne * ne)) % determinants;
+  const auto configuration = index / (determinants * ne * ne);
+  const bool up = electron < layout.spin_up_count;
+  const auto* weight = up ? parameters.backflow_up : parameters.backflow_down;
+  const auto* weight_direction = up ? direction.backflow_up : direction.backflow_down;
+  const auto* pi = up ? parameters.pi_up : parameters.pi_down;
+  const auto* pi_direction = up ? direction.pi_up : direction.pi_down;
+  const auto* zeta = up ? parameters.zeta_up : parameters.zeta_down;
+  const auto* zeta_direction = up ? direction.zeta_up : direction.zeta_down;
+  double b_direction = 0, e_direction = 0;
+  for (std::size_t feature = 0; feature < layout.feature_width; ++feature)
+  {
+    const auto f = layout.features.uncheckedValueOffset(configuration, electron * layout.feature_row_stride + feature);
+    const auto p = open_orbital::weightOffset(layout, feature, determinant, orbital);
+    b_direction += feature_direction[f] * weight[p] + features[f] * weight_direction[p];
+  }
+  for (std::size_t nucleus = 0; nucleus < layout.nucleus_count; ++nucleus)
+  {
+    double squared = 0;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double displacement = positions[(configuration * ne + electron) * 3 + dimension] -
+          nuclei[nucleus * 3 + dimension];
+      squared += displacement * displacement;
+    }
+    const auto p = open_orbital::envelopeOffset(layout, determinant, orbital, nucleus);
+    const auto partials = device_derivative::envelopeValueAndPartials(std::sqrt(squared), pi[p], zeta[p]);
+    e_direction += pi_direction[p] * partials.pi_partial + zeta_direction[p] * partials.zeta_partial;
+  }
+  output[index] = b_direction * envelope[index] + backflow[index] * e_direction;
+}
+
+/** Reduce one configuration's determinant and cusp tangent to a scalar score JVP. */
+__global__ void logScoreParameterDirectionKernel(std::size_t batch, std::size_t ne,
+    std::size_t determinants, std::size_t spin_up_count, const double* positions,
+    const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
+    double same_direction, double opposite_direction, double* output)
+{
+  const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= batch)
+    return;
+  const auto span = determinants * ne * ne, origin = configuration * span;
+  double sum = 0;
+  for (std::size_t element = 0; element < span; ++element)
+    sum += matrix_seeds[origin + element] * orbital_direction[origin + element];
+  for (std::size_t first = 0; first < ne; ++first)
+    for (std::size_t second = first + 1; second < ne; ++second)
+    {
+      double squared = 0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        const double displacement = positions[(configuration * ne + first) * 3 + dimension] -
+            positions[(configuration * ne + second) * 3 + dimension];
+        squared += displacement * displacement;
+      }
+      const bool same = (first < spin_up_count) == (second < spin_up_count);
+      const double alpha_direction = same ? same_direction : opposite_direction;
+      sum += alpha_direction * device_derivative::cuspValueAndAlphaPartial(std::sqrt(squared),
+          same ? same_alpha : opposite_alpha, same ? 0.25 : 0.5).alpha_partial;
+    }
+  output[configuration] = sum;
+}
+
 __global__ void cuspAlphaReverseKernel(CuspAlphaReverseLayout layout,
                                        const double* distances,
                                        const std::uint8_t* same_spin,
@@ -1215,6 +1391,86 @@ Error launchDerivativeFiniteScan(Stream stream,
                                  status_count,
                                  "PsiFormer derivative finite-scan grid exceeds the CUDA/HIP x dimension"),
                               derivative_block_size, 0, stream>>>(layout, source, status);
+  return peekAtLastError();
+}
+
+Error launchBiasTanhParameterDirection(Stream stream, const BatchedValueLayout& layout,
+    const double* tanh_value, const double* preactivation_direction,
+    const double* bias_direction, double* output_direction)
+{
+  validateBatchedValueLayout(layout);
+  if (!tanh_value || !preactivation_direction || !bias_direction || !output_direction)
+    throw std::invalid_argument("Tanh parameter direction storage is null");
+  biasTanhParameterDirectionKernel<<<blockCount(layout.logicalElements(), "Tanh direction grid too large"),
+      derivative_block_size, 0, stream>>>(layout, tanh_value, preactivation_direction, bias_direction, output_direction);
+  return peekAtLastError();
+}
+
+Error launchAttentionParameterDirection(Stream stream, const BatchedAttentionForwardLayout& layout,
+    const double* query, const double* key, const double* value, const double* probabilities,
+    const double* query_direction, const double* key_direction, const double* value_direction,
+    double* probability_direction, double* context_direction)
+{
+  validateBatchedAttentionForwardLayout(layout);
+  if (!query || !key || !value || !probabilities || !query_direction || !key_direction || !value_direction ||
+      !probability_direction || !context_direction || probability_direction == context_direction ||
+      probability_direction == probabilities || context_direction == value || context_direction == value_direction)
+    throw std::invalid_argument("Attention parameter direction storage is null or destructively aliased");
+  const auto rows = checkedProduct(checkedProduct(layout.configuration_count, layout.attention.heads,
+      "Attention direction row overflow"), layout.attention.rows, "Attention direction row overflow");
+  const auto probabilities_count = checkedProduct(rows, layout.attention.rows, "Attention direction extent overflow");
+  const auto feature_count = checkedProduct(checkedProduct(layout.configuration_count, layout.attention.rows,
+      "Context direction row overflow"), layout.attention.featureWidth(), "Context direction extent overflow");
+  attentionLogitDirectionKernel<<<blockCount(probabilities_count, "Logit direction grid too large"),
+      derivative_block_size, 0, stream>>>(layout, query, key, query_direction, key_direction, probability_direction);
+  auto error = peekAtLastError();
+  if (error != success)
+    return error;
+  attentionProbabilityDirectionKernel<<<blockCount(rows, "Probability direction grid too large"),
+      derivative_block_size, 0, stream>>>(layout, probabilities, probability_direction);
+  error = peekAtLastError();
+  if (error != success)
+    return error;
+  attentionContextDirectionKernel<<<blockCount(feature_count, "Context direction grid too large"),
+      derivative_block_size, 0, stream>>>(layout, probabilities, probability_direction, value, value_direction, context_direction);
+  return peekAtLastError();
+}
+
+Error launchOpenOrbitalParameterDirection(Stream stream, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* feature_direction, const double* positions,
+    const double* nuclei, OrbitalDirectionParameters parameters, OrbitalDirectionParameters direction,
+    const double* retained_backflow, const double* retained_envelope, double* orbital_direction)
+{
+  validateOpenOrbitalJetLayout(layout);
+  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || layout.position_row_stride != 3 ||
+      layout.position_configuration_stride != 3 * layout.features.electron_count || layout.nucleus_row_stride != 3)
+    throw std::invalid_argument("Orbital parameter direction requires ordinary values and contiguous XYZ");
+  if (!features || !feature_direction || !positions || !nuclei || !retained_backflow || !retained_envelope || !orbital_direction)
+    throw std::invalid_argument("Orbital parameter direction storage is null");
+  for (const auto& pointers : {parameters, direction})
+    if ((layout.spin_up_count != 0 && (!pointers.backflow_up || !pointers.pi_up || !pointers.zeta_up)) ||
+        (layout.spin_up_count != layout.features.electron_count &&
+          (!pointers.backflow_down || !pointers.pi_down || !pointers.zeta_down)))
+      throw std::invalid_argument("Orbital parameter direction intervals are null");
+  openOrbitalParameterDirectionKernel<<<blockCount(openOrbitalElementCount(layout), "Orbital direction grid too large"),
+      derivative_block_size, 0, stream>>>(layout, features, feature_direction, positions, nuclei,
+      parameters, direction, retained_backflow, retained_envelope, orbital_direction);
+  return peekAtLastError();
+}
+
+Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::size_t ne,
+    std::size_t determinants, std::size_t spin_up_count, const double* positions,
+    const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
+    double same_alpha_direction, double opposite_alpha_direction, double* score_direction)
+{
+  if (batch == 0 || ne == 0 || determinants == 0 || spin_up_count > ne ||
+      !positions || !matrix_seeds || !orbital_direction || !score_direction)
+    throw std::invalid_argument("Log score parameter direction dimensions/storage are invalid");
+  (void)checkedProduct(checkedProduct(checkedProduct(batch, determinants, "Score direction batch overflow"),
+      ne, "Score direction matrix overflow"), ne, "Score direction matrix overflow");
+  logScoreParameterDirectionKernel<<<blockCount(batch, "Score direction grid too large"),
+      derivative_block_size, 0, stream>>>(batch, ne, determinants, spin_up_count, positions,
+      matrix_seeds, orbital_direction, same_alpha, opposite_alpha, same_alpha_direction, opposite_alpha_direction, score_direction);
   return peekAtLastError();
 }
 

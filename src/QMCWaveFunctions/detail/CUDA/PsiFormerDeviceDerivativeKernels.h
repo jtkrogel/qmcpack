@@ -18,6 +18,7 @@
 
 #include "PsiFormerDeviceRuntime.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAttention.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -296,6 +297,43 @@ Error launchScoreGeometry(Stream stream, std::size_t configuration_count,
 /// Add two contiguous canonical response vectors into a distinct destination.
 Error launchAddParameterResponses(Stream stream, std::size_t count,
     const double* left, const double* right, double* destination);
+
+/** Apply an ordinary parameter-direction tanh rule, including a bias tangent. */
+Error launchBiasTanhParameterDirection(Stream stream, const BatchedValueLayout& layout,
+    const double* tanh_value, const double* preactivation_direction,
+    const double* bias_direction, double* output_direction);
+
+/** Differentiate attention probabilities and context along one parameter direction.
+ * Buffers are ordinary values/tangents, never coordinate-jet planes. Probability
+ * directions are caller-owned scratch and used to form the context tangent.
+ */
+Error launchAttentionParameterDirection(Stream stream, const BatchedAttentionForwardLayout& layout,
+    const double* query, const double* key, const double* value, const double* probabilities,
+    const double* query_direction, const double* key_direction, const double* value_direction,
+    double* probability_direction, double* context_direction);
+
+/** Bind the six explicit spin-channel orbital parameter intervals. */
+struct OrbitalDirectionParameters
+{
+  const double* backflow_up;
+  const double* backflow_down;
+  const double* pi_up;
+  const double* pi_down;
+  const double* zeta_up;
+  const double* zeta_down;
+};
+
+/** Differentiate ordinary B*E orbitals along a parameter/feature direction. */
+Error launchOpenOrbitalParameterDirection(Stream stream, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* feature_direction, const double* positions,
+    const double* nuclei, OrbitalDirectionParameters parameters, OrbitalDirectionParameters direction,
+    const double* retained_backflow, const double* retained_envelope, double* orbital_direction);
+
+/** Contract regular determinant seeds with orbital tangents and add cusp tangents. */
+Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::size_t ne,
+    std::size_t determinants, std::size_t spin_up_count, const double* positions,
+    const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
+    double same_alpha_direction, double opposite_alpha_direction, double* score_direction);
 
 /** Accumulate one spin channel's ordinary envelope pi/zeta response. */
 Error launchEnvelopeParameterReverse(Stream stream,
