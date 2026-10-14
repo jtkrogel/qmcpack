@@ -56,7 +56,8 @@ Error launchAttentionJetWeights(
     const double* query,
     const double* key,
     double* attention,
-    device_math::JetMathStatus* row_status);
+    device_math::JetMathStatus* row_status,
+    double* retained_logits = nullptr);
 
 /** Form context jets from prepared attention probabilities and value jets. */
 Error launchAttentionContextJets(Stream stream,
@@ -78,7 +79,8 @@ Error launchBiasTanhJets(Stream stream,
                          const double* input,
                          const double* bias,
                          double* output,
-                         OpenSpatialStatus* status);
+                         OpenSpatialStatus* status,
+                         double* retained_preactivation = nullptr);
 
 Error launchResidualSpatialJets(Stream stream,
                                 const SpatialElementwiseJetLayout& layout,
@@ -110,8 +112,8 @@ Error launchFinalSpatialCombination(
     OpenSpatialStatus* status);
 
 /** Build orbital jets, optionally retaining ordinary B and E factors separately.
- * Retained buffers are paired, distinct, contiguous [configuration,D,N,N]; they
- * contain values only even when the primary output contains spatial jet planes.
+ * Retained buffers are paired, distinct, and use the complete orbital jet layout
+ * [configuration,plane,D,N,N], matching the requested value-only or full-VGL mode.
  */
 Error launchOpenOrbitalJets(Stream stream,
                             const OpenOrbitalJetLayout& layout,

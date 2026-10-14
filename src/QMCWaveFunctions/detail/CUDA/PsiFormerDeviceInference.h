@@ -137,21 +137,28 @@ private:
 class PreparedDeviceInference
 {
 public:
-  /** Retain one block's ordinary values for an explicit parameter reverse pass.
+  /** Retain one block's value or full-spatial jets for an explicit reverse pass.
    * Feature geometry/embedding stay separate in the graph's raw/input storage;
    * this tape contains only the remaining attention/residual/MLP intermediates.
    */
-  struct ValueBlockTape
+  struct RetainedBlockTape
   {
     DeviceBuffer<double> input, query, key, value, probabilities, context;
     DeviceBuffer<double> residual, hidden, projected;
+    DeviceBuffer<double> hidden_pre, projected_pre, logits;
 
     /// Reserve fixed-capacity value storage once, before any graph launch.
-    ValueBlockTape(std::size_t feature_count, std::size_t probability_count)
+    RetainedBlockTape(std::size_t feature_count, std::size_t probability_count, bool spatial)
     {
       for (auto* buffer : {&input, &query, &key, &value, &context, &residual, &hidden, &projected})
         buffer->reserve(feature_count);
       probabilities.reserve(probability_count);
+      if (spatial)
+      {
+        hidden_pre.reserve(feature_count);
+        projected_pre.reserve(feature_count);
+        logits.reserve(probability_count);
+      }
     }
 
     /// Account explicit tape storage separately from the shared parameter image.
@@ -159,7 +166,7 @@ public:
     {
       std::size_t bytes = 0;
       for (const auto* buffer : {&input, &query, &key, &value, &probabilities,
-          &context, &residual, &hidden, &projected})
+          &context, &residual, &hidden, &projected, &hidden_pre, &projected_pre, &logits})
         bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(buffer->capacity()),
                                            "Device value tape storage overflow");
       return bytes;
@@ -182,6 +189,26 @@ public:
     const device_determinant::CombinationMetadata* combinations;
   };
 
+  /** Borrow full-VGL head/root storage with explicit configuration/plane layouts.
+   * This is preparation for lifted reverse, not a complete kinetic-response API.
+   */
+  struct SpatialHeadTape
+  {
+    OpenOrbitalJetLayout orbital_layout;
+    OpenCuspJetLayout cusp_layout;
+    SpatialJetLayout root_layout;
+    const double* positions;
+    const double* raw_features;
+    const double* features;
+    const double* orbitals;
+    const double* backflow;
+    const double* envelope;
+    const double* determinant_log_gradient;
+    const double* determinant_log_laplacian;
+    const double* cusp;
+    const double* root;
+  };
+
   /// Validate the open-real model and prepare all storage before numerical launches.
   PreparedDeviceInference(const PsiFormerExecutionPlan& plan,
                           const std::vector<double>& parameters,
@@ -190,9 +217,10 @@ public:
                           compute::Queue<PlatformKind::CUDA>& queue,
                           AcceleratorBlasHandle& blas,
                           SpatialJetMode mode = SpatialJetMode::FULL_VGL,
-                          bool retain_score_tape = false)
+                          bool retain_score_tape = false,
+                          bool retain_spatial_tape = false)
       : PreparedDeviceInference(std::make_shared<PreparedDeviceModel>(plan, parameters, nuclei),
-                                batch_size, queue, blas, mode, retain_score_tape)
+                                batch_size, queue, blas, mode, retain_score_tape, retain_spatial_tape)
   {}
 
   /// Prepare independent scratch while retaining an already uploaded model image.
@@ -201,7 +229,8 @@ public:
                           compute::Queue<PlatformKind::CUDA>& queue,
                           AcceleratorBlasHandle& blas,
                           SpatialJetMode mode = SpatialJetMode::FULL_VGL,
-                          bool retain_score_tape = false)
+                          bool retain_score_tape = false,
+                          bool retain_spatial_tape = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode)
   {
@@ -210,6 +239,8 @@ public:
       throw std::invalid_argument("Prepared device inference supports value-only or full VGL");
     if (retain_score_tape && mode_ != SpatialJetMode::VALUE_ONLY)
       throw std::invalid_argument("Ordinary score tape requires a value-only graph");
+    if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
+      throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
     if (batch_ == 0 || environment.boundary != BoundaryCondition::OPEN ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
@@ -254,6 +285,18 @@ public:
     if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
       solve_.reserve(permutations_.capacity());
     factors_.reserve(product(batch_, shape_.determinants));
+    // Host admission copies complete POD records. Initialize their padding once
+    // so those transfers never read unwritten bytes; numerical fields are still
+    // set by the factorization kernel for every live determinant.
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemsetAsync(factors_.data(), 0,
+        checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
+        "factorization metadata storage initialization");
+#else
+    checkRuntime(cudaMemsetAsync(factors_.data(), 0,
+        checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
+        "factorization metadata storage initialization");
+#endif
     combinations_.reserve(batch_);
     for (DeviceBuffer<double>* buffer : {&term_phase_, &term_log_, &scaled_, &normalized_})
       buffer->reserve(factors_.capacity());
@@ -272,12 +315,12 @@ public:
     open_status_.reserve(status_count); host_status_.resize(status_count);
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
-    if (retain_score_tape)
+    if (retain_score_tape || retain_spatial_tape)
     {
-      retained_backflow_.reserve(matrices_.capacity());
-      retained_envelope_.reserve(matrices_.capacity());
+      retained_backflow_.reserve(spatialJetSpanElements(orbitals_.orbitals));
+      retained_envelope_.reserve(spatialJetSpanElements(orbitals_.orbitals));
       for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
-        value_tape_.push_back(std::make_unique<ValueBlockTape>(feature_elements, weights_.capacity()));
+        value_tape_.push_back(std::make_unique<RetainedBlockTape>(feature_elements, weights_.capacity(), retain_spatial_tape));
     }
   }
 
@@ -310,16 +353,20 @@ public:
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_KEY_WEIGHT, layer), k_.data());
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_VALUE_WEIGHT, layer), v_.data());
       checkRuntime(launchAttentionJetWeights(stream, attention_, q_.data(), k_.data(),
-                                             weights_.data(), jet_status_.data()), "model attention VGL");
+          weights_.data(), jet_status_.data(),
+          !value_tape_.empty() && mode_ == SpatialJetMode::FULL_VGL ? value_tape_[layer]->logits.data() : nullptr),
+          "model attention VGL");
       checkJets();
       checkRuntime(launchAttentionContextJets(stream, attention_, weights_.data(),
                                               v_.data(), context_.data()), "model attention context");
       project(dense_, context_.data(), parameter(ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer), b_.data());
       residual(a_.data(), b_.data(), b_.data());
       project(dense_, b_.data(), parameter(ParameterRole::UPDATE_HIDDEN_WEIGHT, layer), hidden_.data());
-      activate(hidden_.data(), parameter(ParameterRole::UPDATE_HIDDEN_BIAS, layer));
+      activate(hidden_.data(), parameter(ParameterRole::UPDATE_HIDDEN_BIAS, layer),
+          !value_tape_.empty() && mode_ == SpatialJetMode::FULL_VGL ? value_tape_[layer]->hidden_pre.data() : nullptr);
       project(dense_, hidden_.data(), parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer), projected_.data());
-      activate(projected_.data(), parameter(ParameterRole::UPDATE_OUTPUT_BIAS, layer));
+      activate(projected_.data(), parameter(ParameterRole::UPDATE_OUTPUT_BIAS, layer),
+          !value_tape_.empty() && mode_ == SpatialJetMode::FULL_VGL ? value_tape_[layer]->projected_pre.data() : nullptr);
       if (!value_tape_.empty())
       {
         // Capture before the next block overwrites shared scratch. Copies use the
@@ -390,6 +437,7 @@ public:
         det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), phase_.data(), output_.data(),
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
+    value_tape_valid_ = !value_tape_.empty();
   }
 
   /// Download signed-log amplitude, complete log-gradient/log-Laplacian jets and lap ratios.
@@ -413,11 +461,41 @@ public:
   std::size_t batchCapacity() const noexcept { return batch_capacity_; }
 
   /// Expose a completed tape only; callers retain the graph and its model lease.
-  const ValueBlockTape& valueBlockTape(std::size_t layer) const
+  const RetainedBlockTape& valueBlockTape(std::size_t layer) const
   {
-    if (!value_tape_valid_)
+    if (!value_tape_valid_ || mode_ != SpatialJetMode::VALUE_ONLY)
       throw std::logic_error("Device value tape is not available for a completed evaluation");
     return *value_tape_.at(layer);
+  }
+
+  /// Expose full-spatial block planes without allowing ordinary score interpretation.
+  const RetainedBlockTape& spatialBlockTape(std::size_t layer) const
+  {
+    if (!value_tape_valid_ || mode_ != SpatialJetMode::FULL_VGL)
+      throw std::logic_error("Device spatial tape is not available for a completed full-VGL evaluation");
+    return *value_tape_.at(layer);
+  }
+
+  /// Borrow completed full-spatial head/root data while retaining the model lease.
+  SpatialHeadTape spatialHeadTape() const
+  {
+    (void)spatialBlockTape(0);
+    return {orbitals_, cusp_, final_.output, positions_.data(), raw_.data(), a_.data(),
+            orbital_jets_.data(), retained_backflow_.data(), retained_envelope_.data(),
+            det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), output_.data()};
+  }
+
+  /// Download retained full-spatial orbital product factors for numerical validation.
+  void downloadSpatialOrbitalTape(std::vector<double>& backflow, std::vector<double>& envelope,
+                                  std::vector<double>& orbitals) const
+  {
+    (void)spatialBlockTape(0);
+    const auto count = spatialJetSpanElements(orbitals_.orbitals);
+    if (backflow.size() != count || envelope.size() != count || orbitals.size() != count)
+      throw std::invalid_argument("Spatial orbital tape destination extent mismatch");
+    retained_backflow_.download(backflow.data(), count);
+    retained_envelope_.download(envelope.data(), count);
+    orbital_jets_.download(orbitals.data(), count);
   }
 
   /// Report the live configuration prefix belonging to the completed tape.
@@ -568,10 +646,10 @@ private:
   }
 
   /// Apply a bias/tanh transformation in place with preallocated diagnostics.
-  void activate(double* values, const double* bias)
+  void activate(double* values, const double* bias, double* retained_preactivation = nullptr)
   {
     checkRuntime(launchBiasTanhJets(queue_.getNative(), elementwise_, values, bias, values,
-                                    open_status_.data()), "model bias/tanh");
+                                    open_status_.data(), retained_preactivation), "model bias/tanh");
     checkOpen(batch_ * ne_ * shape_.feature_dimension);
   }
 
@@ -619,7 +697,7 @@ private:
   DeviceBuffer<device_math::JetMathStatus> jet_status_;
   std::vector<OpenSpatialStatus> host_status_;
   std::vector<device_math::JetMathStatus> host_jet_status_;
-  std::vector<std::unique_ptr<ValueBlockTape>> value_tape_;
+  std::vector<std::unique_ptr<RetainedBlockTape>> value_tape_;
   DeviceBuffer<double> retained_backflow_, retained_envelope_;
   bool value_tape_valid_ = false;
 };

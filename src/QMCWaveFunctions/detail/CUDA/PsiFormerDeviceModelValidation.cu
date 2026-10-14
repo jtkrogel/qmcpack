@@ -207,6 +207,122 @@ int main(int argc, char** argv)
     inference.downloadResults(phases, jets, ratios);
     verify();
 
+    // Stage-6 preparation retains full spatial planes without exposing them as
+    // ordinary score values. Check B*E value/gradient/Laplacian product identities.
+    PreparedDeviceInference spatial_taped(image, model.cfg.nconfig, queue, handle,
+                                          SpatialJetMode::FULL_VGL, false, true);
+    const auto spatial_tape_bytes = spatial_taped.deviceWorkspaceBytes();
+    spatial_taped.evaluate(model.cfg.electrons.x);
+    spatial_taped.downloadResults(phases, jets, ratios);
+    verify();
+    const auto spatial_head = spatial_taped.spatialHeadTape();
+    const auto& orbital_layout = spatial_head.orbital_layout.orbitals;
+    const auto orbital_span = spatialJetSpanElements(orbital_layout);
+    std::vector<double> spatial_backflow(orbital_span), spatial_envelope(orbital_span), spatial_orbitals(orbital_span);
+    spatial_taped.downloadSpatialOrbitalTape(spatial_backflow, spatial_envelope, spatial_orbitals);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+      for (std::size_t element = 0; element < orbital_layout.element_count; ++element)
+      {
+        const auto value = orbital_layout.uncheckedValueOffset(configuration, element);
+        near(spatial_orbitals[value], spatial_backflow[value] * spatial_envelope[value], "retained spatial orbital product value");
+        for (std::size_t lane = 0; lane < orbital_layout.gradient_lanes; ++lane)
+        {
+          const auto gradient = orbital_layout.uncheckedGradientOffset(configuration, lane, element);
+          near(spatial_orbitals[gradient], spatial_backflow[gradient] * spatial_envelope[value] +
+               spatial_backflow[value] * spatial_envelope[gradient], "retained spatial orbital product gradient");
+        }
+        for (std::size_t electron = 0; electron < orbital_layout.laplacian_lanes; ++electron)
+        {
+          const auto laplacian = orbital_layout.uncheckedLaplacianOffset(configuration, electron, element);
+          double product = spatial_backflow[laplacian] * spatial_envelope[value] +
+              spatial_backflow[value] * spatial_envelope[laplacian];
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          {
+            const auto gradient = orbital_layout.uncheckedGradientOffset(configuration, 3 * electron + dimension, element);
+            product += 2 * spatial_backflow[gradient] * spatial_envelope[gradient];
+          }
+          near(spatial_orbitals[laplacian], product, "retained spatial orbital product Laplacian");
+        }
+      }
+    bool spatial_as_value_rejected = false;
+    const auto feature_layout = makeSpatialDenseJetLayout(model.cfg.nconfig, model.ne, model.dim,
+        model.dim, model.ne, SpatialJetMode::FULL_VGL).source;
+    for (std::size_t layer = 0; layer < model.blocks; ++layer)
+    {
+      const auto& tape = spatial_taped.spatialBlockTape(layer);
+      for (bool output_layer : {false, true})
+      {
+        const auto& pre_buffer = output_layer ? tape.projected_pre : tape.hidden_pre;
+        const auto& post_buffer = output_layer ? tape.projected : tape.hidden;
+        std::vector<double> pre(pre_buffer.capacity()), post(post_buffer.capacity());
+        pre_buffer.download(pre.data(), pre.size());
+        post_buffer.download(post.data(), post.size());
+        // Independent scalar tanh chain rules check biased preactivations and
+        // every retained first/contracted-second spatial derivative plane.
+        for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+          for (std::size_t element = 0; element < feature_layout.element_count; ++element)
+          {
+            const auto value = feature_layout.uncheckedValueOffset(configuration, element);
+            const double y = std::tanh(pre[value]), first = 1 - y * y, second = -2 * y * first;
+            near(post[value], y, "retained biased preactivation value");
+            for (std::size_t lane = 0; lane < feature_layout.gradient_lanes; ++lane)
+            {
+              const auto gradient = feature_layout.uncheckedGradientOffset(configuration, lane, element);
+              if (!device_math::isFiniteBinary64(post[gradient]) || !device_math::isFiniteBinary64(pre[gradient]) ||
+                  std::abs(post[gradient] - first * pre[gradient]) > 2e-7 * (1 + std::abs(first * pre[gradient])))
+              {
+                std::cerr.precision(17);
+                std::cerr << "Preactivation diagnostic layer=" << layer << " output=" << output_layer
+                          << " configuration=" << configuration << " element=" << element << " lane=" << lane
+                          << " pre_value=" << pre[value] << " post_value=" << post[value]
+                          << " pre_gradient=" << pre[gradient] << " post_gradient=" << post[gradient]
+                          << " expected=" << first * pre[gradient] << '\n';
+              }
+              near(post[gradient], first * pre[gradient], "retained preactivation gradient");
+            }
+            for (std::size_t electron = 0; electron < feature_layout.laplacian_lanes; ++electron)
+            {
+              const auto laplacian = feature_layout.uncheckedLaplacianOffset(configuration, electron, element);
+              double squared = 0;
+              for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              {
+                const auto gradient = feature_layout.uncheckedGradientOffset(configuration, 3 * electron + dimension, element);
+                squared += pre[gradient] * pre[gradient];
+              }
+              near(post[laplacian], first * pre[laplacian] + second * squared, "retained preactivation Laplacian");
+            }
+          }
+      }
+      const auto attention_layout = makeSpatialAttentionJetLayout(model.cfg.nconfig, model.ne,
+          model.heads, model.dim / model.heads, model.ne, SpatialJetMode::FULL_VGL);
+      std::vector<double> logits(tape.logits.capacity()), probabilities(tape.probabilities.capacity());
+      tape.logits.download(logits.data(), logits.size());
+      tape.probabilities.download(probabilities.data(), probabilities.size());
+      for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+        for (std::size_t head = 0; head < model.heads; ++head)
+          for (std::size_t row = 0; row < model.ne; ++row)
+          {
+            const auto origin = attention_layout.attention.uncheckedValueOffset(configuration,
+                head * model.ne * model.ne + row * model.ne);
+            double maximum = logits[origin], sum = 0;
+            for (std::size_t column = 0; column < model.ne; ++column)
+              maximum = std::max(maximum, logits[origin + column]);
+            for (std::size_t column = 0; column < model.ne; ++column)
+              sum += std::exp(logits[origin + column] - maximum);
+            for (std::size_t column = 0; column < model.ne; ++column)
+              near(probabilities[origin + column], std::exp(logits[origin + column] - maximum) / sum,
+                   "retained raw attention logits");
+          }
+    }
+    try { (void)spatial_taped.valueBlockTape(0); }
+    catch (const std::logic_error&) { spatial_as_value_rejected = true; }
+    if (!spatial_as_value_rejected)
+      throw std::runtime_error("Full-spatial tape was accepted as ordinary values");
+    spatial_taped.evaluate(model.cfg.electrons.x);
+    if (spatial_taped.deviceWorkspaceBytes() != spatial_tape_bytes)
+      throw std::runtime_error("Spatial tape allocated storage during reuse");
+    std::cout << "PASS retained full-VGL tape: CPU parity, orbital product rules, mode isolation, reuse\n";
+
     // Values must take the one-plane route, not secretly compute and discard VGL.
     PreparedDeviceInference values(image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
     if (values.modelImage().get() != inference.modelImage().get() || values.modelImage()->version() != 17 ||

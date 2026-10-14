@@ -133,6 +133,20 @@ __global__ void biasTanhJetsKernel(SpatialElementwiseJetLayout layout,
       layout, input, bias, configuration, element, output);
 }
 
+/** Add bias only to retained value planes; coordinate derivatives stay unchanged. */
+__global__ void retainedPreactivationBiasKernel(SpatialElementwiseJetLayout layout,
+    const double* bias, double* retained)
+{
+  const auto logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto per_configuration = layout.row_count * layout.row_width;
+  if (logical >= layout.jets.configuration_count * per_configuration)
+    return;
+  const auto configuration = logical / per_configuration;
+  const auto within = logical % per_configuration;
+  const auto element = (within / layout.row_width) * layout.row_stride + within % layout.row_width;
+  retained[layout.jets.uncheckedValueOffset(configuration, element)] += bias[within % layout.row_width];
+}
+
 __global__ void residualSpatialJetsKernel(SpatialElementwiseJetLayout layout,
                                           const double* left,
                                           const double* right,
@@ -315,7 +329,8 @@ Error launchAttentionJetWeights(
     const double* query,
     const double* key,
     double* attention,
-    device_math::JetMathStatus* row_status)
+    device_math::JetMathStatus* row_status,
+    double* retained_logits)
 {
   if (layout.features.configuration_count == 0 && layout.rows == 0 &&
       layout.heads == 0 && layout.head_width == 0)
@@ -334,6 +349,8 @@ Error launchAttentionJetWeights(
     throw std::length_error("PsiFormer attention jet grid exceeds the CUDA/HIP x dimension");
   if (!query || !key || !attention || !row_status)
     throw std::invalid_argument("PsiFormer attention jet storage is null");
+  if (retained_logits && (retained_logits == attention || retained_logits == query || retained_logits == key))
+    throw std::invalid_argument("Retained logit jets require a distinct destination");
 
   const unsigned int block_count = static_cast<unsigned int>(
       (entry_count + spatial_block_size - 1) / spatial_block_size);
@@ -346,6 +363,20 @@ Error launchAttentionJetWeights(
 #endif
   if (logit_error != success)
     return logit_error;
+  if (retained_logits)
+  {
+    // Copy before in-place softmax on the same ordered stream; lifted reverse
+    // needs raw logit planes, not reconstructed logarithms of probabilities.
+    const auto bytes = spatial_detail::checkedProduct(spatialJetSpanElements(layout.attention),
+        sizeof(double), "Retained attention logit bytes overflow");
+#ifdef QMC_CUDA2HIP
+    const auto copy_error = hipMemcpyAsync(retained_logits, attention, bytes, hipMemcpyDeviceToDevice, stream);
+#else
+    const auto copy_error = cudaMemcpyAsync(retained_logits, attention, bytes, cudaMemcpyDeviceToDevice, stream);
+#endif
+    if (copy_error != success)
+      return copy_error;
+  }
   return launchSoftmaxJetRows(
       stream, makeAttentionSoftmaxJetRowLayout(layout), attention, row_status);
 }
@@ -423,11 +454,15 @@ Error launchOpenFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
 
 Error launchBiasTanhJets(Stream stream, const SpatialElementwiseJetLayout& layout,
                          const double* input, const double* bias, double* output,
-                         OpenSpatialStatus* status)
+                         OpenSpatialStatus* status,
+                         double* retained_preactivation)
 {
   if (layout.jets.configuration_count == 0 && layout.row_count == 0 && layout.row_width == 0)
     return success;
   validateSpatialElementwiseJetLayout(layout);
+  if (retained_preactivation && (retained_preactivation == input || retained_preactivation == output ||
+                                retained_preactivation == bias))
+    throw std::invalid_argument("Retained preactivation jets require a distinct destination");
   if (!input || !bias || !output || !status)
     throw std::invalid_argument("PsiFormer tanh jet device storage is null");
   const std::size_t count = spatial_detail::checkedProduct(
@@ -437,6 +472,24 @@ Error launchBiasTanhJets(Stream stream, const SpatialElementwiseJetLayout& layou
       "PsiFormer tanh jet batch extent overflow");
   const unsigned int blocks = checkedSpatialBlockCount(
       count, "PsiFormer tanh jet grid exceeds device x dimension");
+  if (retained_preactivation)
+  {
+    // Snapshot in a separate ordered operation before any in-place nonlinear
+    // writes. This avoids coupling capture loads to the activation's aliasing.
+    const auto bytes = spatial_detail::checkedProduct(spatialJetSpanElements(layout.jets),
+        sizeof(double), "Retained preactivation bytes overflow");
+#ifdef QMC_CUDA2HIP
+    const auto copy_error = hipMemcpyAsync(retained_preactivation, input, bytes, hipMemcpyDeviceToDevice, stream);
+#else
+    const auto copy_error = cudaMemcpyAsync(retained_preactivation, input, bytes, cudaMemcpyDeviceToDevice, stream);
+#endif
+    if (copy_error != success)
+      return copy_error;
+    retainedPreactivationBiasKernel<<<blocks, spatial_block_size, 0, stream>>>(layout, bias, retained_preactivation);
+    const auto bias_error = peekSpatialLaunchError();
+    if (bias_error != success)
+      return bias_error;
+  }
   biasTanhJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
       layout, input, bias, output, status);
   return peekSpatialLaunchError();

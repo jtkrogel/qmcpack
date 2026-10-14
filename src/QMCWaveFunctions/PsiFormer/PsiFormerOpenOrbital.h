@@ -315,7 +315,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
   output[layout.orbitals.uncheckedValueOffset(configuration, element)] = value;
   // Parameter reverse needs the two product factors separately: division of the
   // orbital value by either factor would be invalid at a finite zero factor.
-  const auto retained_offset = configuration * layout.orbitals.element_count + element;
+  const auto retained_offset = layout.orbitals.uncheckedValueOffset(configuration, element);
   if (retained_backflow)
     retained_backflow[retained_offset] = backflow_value;
   if (retained_envelope)
@@ -334,6 +334,11 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
         ? envelope_gradient[dimension] : 0.0;
     const double gradient = backflow_gradient * envelope_value +
         backflow_value * envelope_first;
+    const auto retained_gradient = layout.orbitals.uncheckedGradientOffset(configuration, lane, element);
+    if (retained_backflow)
+      retained_backflow[retained_gradient] = backflow_gradient;
+    if (retained_envelope)
+      retained_envelope[retained_gradient] = envelope_first;
     if (!device_math::isFiniteBinary64(gradient))
       return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
     output[layout.orbitals.uncheckedGradientOffset(configuration, lane, element)] = gradient;
@@ -358,6 +363,11 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     const double laplacian = backflow_laplacian * envelope_value +
         2.0 * gradient_dot +
         (electron == row_electron ? backflow_value * envelope_laplacian : 0.0);
+    const auto retained_laplacian = layout.orbitals.uncheckedLaplacianOffset(configuration, electron, element);
+    if (retained_backflow)
+      retained_backflow[retained_laplacian] = backflow_laplacian;
+    if (retained_envelope)
+      retained_envelope[retained_laplacian] = electron == row_electron ? envelope_laplacian : 0.0;
     if (!device_math::isFiniteBinary64(laplacian))
       return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
     output[layout.orbitals.uncheckedLaplacianOffset(
