@@ -6,13 +6,13 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerDeviceInference.h
- * @brief Prepared FP64 open-real forward/VGL graph for opt-in hardware validation.
+ * @brief Prepared FP64 open-real forward/VGL graph and opt-in value reverse tape.
  *
  * This chains actual CUDA/HIP leaves for a complete imported model. It is not
- * attached to PsiFormerWF's production publication/crowd-resource protocols and
- * must not advertise production DEVICE capability. Parameters are immutable for
- * this instance. Per-stage synchronization deliberately favors diagnostic clarity;
- * performance tuning and production dispatch remain separate acceptance work.
+ * itself a publication owner: the production crowd adapter binds it to the
+ * control-plane lease and wait protocol. Parameters are immutable for this
+ * instance. Per-stage synchronization favors diagnostic clarity. Retaining a
+ * value tape supplies reverse intermediates, not a qualified score evaluator.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_INFERENCE_H
@@ -137,6 +137,35 @@ private:
 class PreparedDeviceInference
 {
 public:
+  /** Retain one block's ordinary values for an explicit parameter reverse pass.
+   * Feature geometry/embedding stay separate in the graph's raw/input storage;
+   * this tape contains only the remaining attention/residual/MLP intermediates.
+   */
+  struct ValueBlockTape
+  {
+    DeviceBuffer<double> input, query, key, value, probabilities, context;
+    DeviceBuffer<double> residual, hidden, projected;
+
+    /// Reserve fixed-capacity value storage once, before any graph launch.
+    ValueBlockTape(std::size_t feature_count, std::size_t probability_count)
+    {
+      for (auto* buffer : {&input, &query, &key, &value, &context, &residual, &hidden, &projected})
+        buffer->reserve(feature_count);
+      probabilities.reserve(probability_count);
+    }
+
+    /// Account explicit tape storage separately from the shared parameter image.
+    std::size_t storageBytes() const
+    {
+      std::size_t bytes = 0;
+      for (const auto* buffer : {&input, &query, &key, &value, &probabilities,
+          &context, &residual, &hidden, &projected})
+        bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(buffer->capacity()),
+                                           "Device value tape storage overflow");
+      return bytes;
+    }
+  };
+
   /// Validate the open-real model and prepare all storage before numerical launches.
   PreparedDeviceInference(const PsiFormerExecutionPlan& plan,
                           const std::vector<double>& parameters,
@@ -144,9 +173,10 @@ public:
                           std::size_t batch_size,
                           compute::Queue<PlatformKind::CUDA>& queue,
                           AcceleratorBlasHandle& blas,
-                          SpatialJetMode mode = SpatialJetMode::FULL_VGL)
+                          SpatialJetMode mode = SpatialJetMode::FULL_VGL,
+                          bool retain_score_tape = false)
       : PreparedDeviceInference(std::make_shared<PreparedDeviceModel>(plan, parameters, nuclei),
-                                batch_size, queue, blas, mode)
+                                batch_size, queue, blas, mode, retain_score_tape)
   {}
 
   /// Prepare independent scratch while retaining an already uploaded model image.
@@ -154,13 +184,16 @@ public:
                           std::size_t batch_size,
                           compute::Queue<PlatformKind::CUDA>& queue,
                           AcceleratorBlasHandle& blas,
-                          SpatialJetMode mode = SpatialJetMode::FULL_VGL)
+                          SpatialJetMode mode = SpatialJetMode::FULL_VGL,
+                          bool retain_score_tape = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode)
   {
     model_->validateCurrentDevice();
     if (mode_ != SpatialJetMode::FULL_VGL && mode_ != SpatialJetMode::VALUE_ONLY)
       throw std::invalid_argument("Prepared device inference supports value-only or full VGL");
+    if (retain_score_tape && mode_ != SpatialJetMode::VALUE_ONLY)
+      throw std::invalid_argument("Ordinary score tape requires a value-only graph");
     const auto& environment = plan_.environment();
     if (batch_ == 0 || environment.boundary != BoundaryCondition::OPEN ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
@@ -223,12 +256,16 @@ public:
     open_status_.reserve(status_count); host_status_.resize(status_count);
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
-
+    if (retain_score_tape)
+      for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
+        value_tape_.push_back(std::make_unique<ValueBlockTape>(feature_elements, weights_.capacity()));
   }
 
   /// Submit feature layers, remaining network layers, orbital/determinant and cusp VGL.
   void evaluate(const std::vector<double>& positions)
   {
+    // A failed replacement must never leave the preceding tape visible as current.
+    value_tape_valid_ = false;
     model_->validateCurrentDevice();
     const auto coordinates_per_configuration = product(ne_, 3);
     if (positions.empty() || positions.size() > positions_.capacity() ||
@@ -247,6 +284,8 @@ public:
     // Remaining neural layers: four validated attention/residual/MLP blocks.
     for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
     {
+      if (!value_tape_.empty())
+        copy(a_, 0, value_tape_[layer]->input, 0, spatialJetSpanElements(dense_.source));
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, layer), q_.data());
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_KEY_WEIGHT, layer), k_.data());
       project(dense_, a_.data(), parameter(ParameterRole::ATTENTION_VALUE_WEIGHT, layer), v_.data());
@@ -261,6 +300,21 @@ public:
       activate(hidden_.data(), parameter(ParameterRole::UPDATE_HIDDEN_BIAS, layer));
       project(dense_, hidden_.data(), parameter(ParameterRole::UPDATE_OUTPUT_WEIGHT, layer), projected_.data());
       activate(projected_.data(), parameter(ParameterRole::UPDATE_OUTPUT_BIAS, layer));
+      if (!value_tape_.empty())
+      {
+        // Capture before the next block overwrites shared scratch. Copies use the
+        // same stream, so reverse consumers observe the exact forward values.
+        auto& tape = *value_tape_[layer];
+        const auto count = spatialJetSpanElements(dense_.source);
+        copy(q_, 0, tape.query, 0, count);
+        copy(k_, 0, tape.key, 0, count);
+        copy(v_, 0, tape.value, 0, count);
+        copy(weights_, 0, tape.probabilities, 0, spatialJetSpanElements(attention_.attention));
+        copy(context_, 0, tape.context, 0, count);
+        copy(b_, 0, tape.residual, 0, count);
+        copy(hidden_, 0, tape.hidden, 0, count);
+        copy(projected_, 0, tape.projected, 0, count);
+      }
       residual(b_.data(), projected_.data(), a_.data());
     }
 
@@ -299,6 +353,7 @@ public:
       checkRuntime(launchFinalValueCombination(stream, batch_, combinations_.data(), cusp_jets_.data(),
           phase_.data(), output_.data(), open_status_.data()), "model final values");
       checkOpen(batch_);
+      value_tape_valid_ = !value_tape_.empty();
       return;
     }
     device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_, ne_};
@@ -334,6 +389,46 @@ public:
   /// Return prepared capacity independently of the most recent logical batch.
   std::size_t batchCapacity() const noexcept { return batch_capacity_; }
 
+  /// Expose a completed tape only; callers retain the graph and its model lease.
+  const ValueBlockTape& valueBlockTape(std::size_t layer) const
+  {
+    if (!value_tape_valid_)
+      throw std::logic_error("Device value tape is not available for a completed evaluation");
+    return *value_tape_.at(layer);
+  }
+
+  /// Report the live configuration prefix belonging to the completed tape.
+  std::size_t valueTapeBatchCount() const
+  {
+    (void)valueBlockTape(0);
+    return batch_;
+  }
+
+  /// Borrow geometry-derived feature values from the completed value-only tape.
+  const double* valueRawFeatures() const
+  {
+    (void)valueTapeBatchCount();
+    return raw_.data();
+  }
+
+  /// Borrow the final shared neural features before orbital/envelope construction.
+  const double* valueFinalFeatures() const
+  {
+    (void)valueTapeBatchCount();
+    return a_.data();
+  }
+
+  /// Download a completed final-feature tile into an exactly sized host destination.
+  void downloadValueFinalFeatures(std::vector<double>& destination) const
+  {
+    const auto count = spatial_detail::checkedProduct(valueTapeBatchCount(),
+        spatial_detail::checkedProduct(ne_, shape_.feature_dimension, "Value feature extent overflow"),
+        "Value feature tile overflow");
+    if (destination.size() != count)
+      throw std::invalid_argument("Value feature destination extent mismatch");
+    a_.download(destination.data(), count);
+  }
+
   /// Account every explicitly owned device allocation, excluding shared images/BLAS.
   std::size_t deviceWorkspaceBytes() const
   {
@@ -353,6 +448,8 @@ public:
     add(checkedDeviceBytes<device_determinant::DerivativeStatus>(det_status_.capacity()));
     add(checkedDeviceBytes<OpenSpatialStatus>(open_status_.capacity()));
     add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
+    for (const auto& tape : value_tape_)
+      add(tape->storageBytes());
     return bytes;
   }
 
@@ -471,6 +568,8 @@ private:
   DeviceBuffer<device_math::JetMathStatus> jet_status_;
   std::vector<OpenSpatialStatus> host_status_;
   std::vector<device_math::JetMathStatus> host_jet_status_;
+  std::vector<std::unique_ptr<ValueBlockTape>> value_tape_;
+  bool value_tape_valid_ = false;
 };
 
 } // namespace qmcplusplus::psiformer::device

@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "PsiFormerDeviceInference.h"
+#include "PsiFormerDeviceNetworkReverse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
 
@@ -212,6 +213,124 @@ int main(int argc, char** argv)
         near(value_phases[index], references[index].sign, "value-only sign");
         near(value_logs[index], references[index].logabs, "value-only logabs");
       }
+    }
+
+    // Score preparation retains only ordinary block values, not per-walker scores.
+    PreparedDeviceInference taped(image, model.cfg.nconfig, queue, handle,
+                                   SpatialJetMode::VALUE_ONLY, true);
+    const auto tape_bytes = taped.deviceWorkspaceBytes();
+    taped.evaluate(model.cfg.electrons.x);
+    taped.downloadResults(value_phases, value_logs, no_ratios);
+    const auto canonical_parameters = model.p.flat_values();
+    for (std::size_t layer = 0; layer < model.blocks; ++layer)
+    {
+      const auto& tape = taped.valueBlockTape(layer);
+      std::vector<double> input(tape.input.capacity()), query(tape.query.capacity());
+      std::vector<double> residual(tape.residual.capacity()), hidden(tape.hidden.capacity());
+      tape.input.download(input.data(), input.size());
+      tape.query.download(query.data(), query.size());
+      tape.residual.download(residual.data(), residual.size());
+      tape.hidden.download(hidden.data(), hidden.size());
+      const auto query_offset = plan.parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, layer).begin;
+      const auto hidden_offset = plan.parameter(ParameterRole::UPDATE_HIDDEN_WEIGHT, layer).begin;
+      const auto bias_offset = plan.parameter(ParameterRole::UPDATE_HIDDEN_BIAS, layer).begin;
+      // Independent first-electron dense/tanh formulas detect stale layer captures.
+      for (std::size_t column = 0; column < model.dim; ++column)
+      {
+        double expected_query = 0, expected_hidden = canonical_parameters[bias_offset + column];
+        for (std::size_t row = 0; row < model.dim; ++row)
+        {
+          expected_query += input[row] * canonical_parameters[query_offset + row * model.dim + column];
+          expected_hidden += residual[row] * canonical_parameters[hidden_offset + row * model.dim + column];
+        }
+        near(query[column], expected_query, "retained query tape");
+        near(hidden[column], std::tanh(expected_hidden), "retained hidden tape");
+      }
+    }
+    for (std::size_t index = 0; index < references.size(); ++index)
+      near(value_logs[index], references[index].logabs, "tape preserves values");
+    if (taped.valueTapeBatchCount() != model.cfg.nconfig || tape_bytes <= value_bytes)
+      throw std::runtime_error("Tape extent/storage accounting mismatch");
+    bool invalid_input_rejected = false, stale_tape_rejected = false;
+    try { taped.evaluate({}); }
+    catch (const std::invalid_argument&) { invalid_input_rejected = true; }
+    try { (void)taped.valueBlockTape(0); }
+    catch (const std::logic_error&) { stale_tape_rejected = true; }
+    if (!invalid_input_rejected || !stale_tape_rejected)
+      throw std::runtime_error("Failed evaluation exposed a stale value tape");
+    taped.evaluate(model.cfg.electrons.x);
+    if (taped.deviceWorkspaceBytes() != tape_bytes)
+      throw std::runtime_error("Tape allocated storage during reuse");
+    std::cout << "PASS retained value tape: layer captures, values, invalidation, stable storage\n";
+
+    // Contract the whole feature/attention/MLP reverse against an independent
+    // central difference of a seeded final-feature scalar objective.
+    std::vector<double> seed(model.cfg.nconfig * model.ne * model.dim);
+    for (std::size_t index = 0; index < seed.size(); ++index)
+      seed[index] = (static_cast<int>(index % 7) - 3) * 0.01;
+    PreparedDeviceNetworkReverse network_reverse(image, model.cfg.nconfig, queue, handle);
+    network_reverse.reverse(taped, seed);
+    std::vector<double> neural_response(plan.parameterCount()), direction(plan.parameterCount(), 0.0);
+    network_reverse.downloadResponse(neural_response);
+    const auto reverse_bytes = network_reverse.deviceWorkspaceBytes();
+    bool bad_seed_rejected = false, stale_response_rejected = false;
+    try { (void)network_reverse.reverse(taped, {}); }
+    catch (const std::invalid_argument&) { bad_seed_rejected = true; }
+    try { network_reverse.downloadResponse(neural_response); }
+    catch (const std::logic_error&) { stale_response_rejected = true; }
+    if (!bad_seed_rejected || !stale_response_rejected)
+      throw std::runtime_error("Failed network reverse exposed a stale response");
+    network_reverse.reverse(taped, seed);
+    network_reverse.downloadResponse(neural_response);
+    if (network_reverse.deviceWorkspaceBytes() != reverse_bytes)
+      throw std::runtime_error("Network reverse allocated storage during reuse");
+    const auto add_direction = [&](ParameterRole role, std::size_t layer) {
+      const auto& interval = plan.parameter(role, layer);
+      direction[interval.begin] += 0.3;
+      direction[interval.end - 1] -= 0.2;
+    };
+    add_direction(ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK);
+    for (std::size_t layer = 0; layer < model.blocks; ++layer)
+      for (auto role : {ParameterRole::ATTENTION_QUERY_WEIGHT, ParameterRole::ATTENTION_KEY_WEIGHT,
+                       ParameterRole::ATTENTION_VALUE_WEIGHT, ParameterRole::ATTENTION_OUTPUT_WEIGHT,
+                       ParameterRole::UPDATE_HIDDEN_WEIGHT, ParameterRole::UPDATE_HIDDEN_BIAS,
+                       ParameterRole::UPDATE_OUTPUT_WEIGHT, ParameterRole::UPDATE_OUTPUT_BIAS})
+        add_direction(role, layer);
+    double reverse_product = 0;
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+    {
+      if (!device_math::isFiniteBinary64(neural_response[parameter]))
+        throw std::runtime_error("Network reverse produced a nonfinite response");
+      reverse_product += direction[parameter] * neural_response[parameter];
+    }
+    const double delta = 1e-5;
+    double objectives[2]{};
+    for (std::size_t side = 0; side < 2; ++side)
+    {
+      auto shifted = canonical_parameters;
+      for (std::size_t parameter = 0; parameter < shifted.size(); ++parameter)
+        shifted[parameter] += (side == 0 ? -delta : delta) * direction[parameter];
+      auto shifted_image = std::make_shared<PreparedDeviceModel>(plan, shifted, model.cfg.nuclei.x, 17);
+      PreparedDeviceInference shifted_graph(shifted_image, model.cfg.nconfig, queue, handle,
+                                            SpatialJetMode::VALUE_ONLY, true);
+      shifted_graph.evaluate(model.cfg.electrons.x);
+      std::vector<double> features(seed.size());
+      shifted_graph.downloadValueFinalFeatures(features);
+      for (std::size_t index = 0; index < seed.size(); ++index)
+        objectives[side] += seed[index] * features[index];
+    }
+    near(reverse_product, (objectives[1] - objectives[0]) / (2 * delta),
+         "embedding/attention/MLP weighted reverse finite difference");
+    std::cout << "PASS neural trunk weighted VJP: canonical finite difference, no B-by-P matrix\n";
+    if (model.cfg.nconfig > 1)
+    {
+      std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+      taped.evaluate(prefix);
+      const std::vector<double> prefix_seed(seed.begin(), seed.begin() + model.ne * model.dim);
+      network_reverse.reverse(taped, prefix_seed);
+      if (taped.valueTapeBatchCount() != 1 || taped.deviceWorkspaceBytes() != tape_bytes ||
+          network_reverse.deviceWorkspaceBytes() != reverse_bytes)
+        throw std::runtime_error("Short score tape/reverse prefix changed prepared storage");
     }
 
     // A short live prefix must neither touch stale tail status nor resize scratch.
