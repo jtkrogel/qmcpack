@@ -675,6 +675,222 @@ int main(int argc, char** argv)
       }
     }
 
+    // This opt-in experiment changes only affine value products. It is never
+    // combined with unmatched VGL/reverse tapes or enabled by production XML.
+    {
+      PreparedDeviceMixedValueInference mixed_values(image, model.cfg.nconfig, queue, handle);
+      const auto prepared_bytes = mixed_values.deviceWorkspaceBytes();
+      double maximum_mixed_error = 0;
+      std::size_t reference_retries = 0;
+      for (int repeat = 0; repeat < 2; ++repeat)
+      {
+        mixed_values.evaluate(model.cfg.electrons.x);
+        mixed_values.downloadResults(value_phases, value_logs, no_ratios);
+        reference_retries += mixed_values.usedFp64Retry();
+        for (std::size_t sample = 0; sample < references.size(); ++sample)
+        {
+          near(value_phases[sample], references[sample].sign, "mixed value sign");
+          const auto difference = std::abs(value_logs[sample] - references[sample].logabs);
+          maximum_mixed_error = std::max(maximum_mixed_error, difference);
+          if (!device_math::isFiniteBinary64(value_logs[sample]) ||
+              difference > 5e-5 * (1 + std::abs(references[sample].logabs)))
+            throw std::runtime_error("Explicit mixed affine value exceeds its numerical test tolerance");
+          if (mixed_values.usedFp64Retry())
+            near(value_logs[sample], references[sample].logabs, "whole-graph FP64 retry value");
+        }
+        if (mixed_values.deviceWorkspaceBytes() != prepared_bytes ||
+            mixed_values.statistics().projections != 1 + 6 * model.blocks ||
+            mixed_values.statistics().roundTripBytes() == 0)
+          throw std::runtime_error("Mixed value graph lost stable storage or explicit affine cast accounting");
+      }
+      if (model.cfg.nconfig > 1)
+      {
+        const std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+        mixed_values.evaluate(prefix);
+        std::vector<double> one_phase(1), one_value(1);
+        mixed_values.downloadResults(one_phase, one_value, no_ratios);
+        if (std::abs(one_value[0] - references[0].logabs) > 5e-5 * (1 + std::abs(references[0].logabs)))
+          throw std::runtime_error("Mixed affine tail differs from the FP64 reference");
+      }
+
+      auto compute_parameters = std::make_shared<PreparedDeviceMixedDenseParameters>(image, queue);
+      auto adapter = std::make_shared<PreparedDeviceMixedValueDense>(compute_parameters,
+          model.cfg.nconfig * model.ne, queue, handle);
+      bool spatial_rejected = false, tape_rejected = false;
+      try { inference.setMixedValueDense(adapter); }
+      catch (const std::invalid_argument&) { spatial_rejected = true; }
+      PreparedDeviceInference tape_guard(image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY, true);
+      try { tape_guard.setMixedValueDense(adapter); }
+      catch (const std::invalid_argument&) { tape_rejected = true; }
+      if (!spatial_rejected || !tape_rejected)
+        throw std::runtime_error("Mixed affine adapter admitted unmatched VGL or reverse tapes");
+
+      // A finite but FP32-unrepresentable activation must request a whole graph
+      // retry, not let its deterministic zero placeholder become an accepted value.
+      const auto& embedding_tensor = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
+      const DenseForwardLayout cast_layout{1, embedding_tensor.shape[0], embedding_tensor.shape[1],
+          embedding_tensor.shape[0], embedding_tensor.shape[1], embedding_tensor.shape[1]};
+      std::vector<double> huge_input(cast_layout.sourceElements(), 1e100);
+      DeviceBuffer<double> input_buffer(huge_input.size()), output_buffer(cast_layout.targetElements());
+      input_buffer.upload(huge_input.data(), huge_input.size());
+      adapter->beginEvaluation(image);
+      adapter->project(cast_layout, input_buffer.data(), image->parameters() + embedding_tensor.begin, output_buffer.data());
+      bool cast_rejected = false;
+      try { adapter->finishEvaluation(); }
+      catch (const MixedPrecisionRetryRequired&) { cast_rejected = true; }
+      if (!cast_rejected || adapter->diagnostics().execution.nonfinite_count == 0)
+        throw std::runtime_error("Mixed affine casts hid a finite overflow hazard");
+
+      // Rebinding selects a separately admitted immutable cache. Versions and
+      // exact image pointers remain independent of shape-compatible tensors.
+      const auto successor_image = image->makeUpdatedImage(model.p.flat_values(), 18);
+      const auto successor_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(successor_image, queue);
+      const auto adapter_bytes = adapter->deviceWorkspaceBytes();
+      adapter->rebindParameters(successor_cache);
+      bool stale_image_rejected = false, older_cache_rejected = false;
+      try { adapter->beginEvaluation(image); }
+      catch (const std::invalid_argument&) { stale_image_rejected = true; }
+      try { adapter->rebindParameters(compute_parameters); }
+      catch (const std::invalid_argument&) { older_cache_rejected = true; }
+      adapter->beginEvaluation(successor_image);
+      adapter->cancelEvaluation();
+      if (!stale_image_rejected || !older_cache_rejected || adapter->deviceWorkspaceBytes() != adapter_bytes)
+        throw std::runtime_error("Mixed affine cache rebind lost identity guards or stable scratch");
+
+      // Parameter overflow is a preparation hazard. The complete FP64 graph is
+      // still well defined for this large finite first-layer query coefficient.
+      auto overflow_parameters = model.p.flat_values();
+      overflow_parameters[plan.parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, 0).begin] = 1e40;
+      const auto overflow_image = image->makeUpdatedImage(overflow_parameters, 18);
+      PreparedDeviceMixedValueInference fallback(overflow_image, model.cfg.nconfig, queue, handle);
+      PreparedDeviceInference full_precision(overflow_image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
+      fallback.evaluate(model.cfg.electrons.x);
+      full_precision.evaluate(model.cfg.electrons.x);
+      fallback.downloadResults(value_phases, value_logs, no_ratios);
+      std::vector<double> reference_phases(model.cfg.nconfig), reference_values(model.cfg.nconfig);
+      full_precision.downloadResults(reference_phases, reference_values, no_ratios);
+      if (!fallback.usedFp64Retry() || fallback.retryReason().empty())
+        throw std::runtime_error("Unsafe mixed parameter conversion did not explicitly select FP64");
+      for (std::size_t sample = 0; sample < references.size(); ++sample)
+      {
+        near(value_phases[sample], reference_phases[sample], "parameter-hazard whole FP64 sign");
+        near(value_logs[sample], reference_values[sample], "parameter-hazard whole FP64 value");
+      }
+
+      // Failed geometry invalidates the wrapper's previous result, and RAII must
+      // cancel the approximate adapter so the same prepared resource can recover.
+      auto invalid = model.cfg.electrons.x;
+      invalid.front() = std::numeric_limits<double>::quiet_NaN();
+      bool invalid_rejected = false, stale_rejected = false;
+      try { mixed_values.evaluate(invalid); }
+      catch (const InferenceStatusError&) { invalid_rejected = true; }
+      try { mixed_values.downloadResults(value_phases, value_logs, no_ratios); }
+      catch (const std::logic_error&) { stale_rejected = true; }
+      mixed_values.evaluate(model.cfg.electrons.x);
+      if (!invalid_rejected || !stale_rejected || mixed_values.deviceWorkspaceBytes() != prepared_bytes)
+        throw std::runtime_error("Mixed value failure/recovery exposed stale results or changed storage");
+      std::cout << "PASS explicit mixed affine values: max_abs_log_error=" << maximum_mixed_error
+                << " reference_retries=" << reference_retries << "/2 cast_bytes="
+                << mixed_values.statistics().roundTripBytes() << " workspace_bytes=" << prepared_bytes
+                << "; overflow fallback, VGL/tape guards, tails and recovery\n";
+    }
+
+    // Matched mixed spatial jets use FP32 affine products for every plane, not
+    // FP64 derivatives of a separately rounded value-only forward pass.
+    {
+      PreparedDeviceMixedInference mixed_spatial(image, model.cfg.nconfig, queue, handle, SpatialJetMode::FULL_VGL);
+      PreparedDeviceMixedInference mixed_value(image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
+      const auto prepared_bytes = mixed_spatial.deviceWorkspaceBytes();
+      std::vector<double> mixed_phases(model.cfg.nconfig), mixed_jets(spatialJetSpanElements(mixed_spatial.resultLayout())),
+          mixed_ratios(model.cfg.nconfig * model.ne), mixed_logs(model.cfg.nconfig), unused;
+      double maximum_value_difference = 0, maximum_gradient_scaled = 0, maximum_laplacian_scaled = 0,
+          maximum_kinetic_scaled = 0;
+      std::size_t fp64_retries = 0;
+      const auto compare = [](double actual, double expected, double budget, const char* description) {
+        if (!device_math::isFiniteBinary64(actual) ||
+            std::abs(actual - expected) > budget * (1 + std::abs(expected)))
+          throw std::runtime_error(std::string("Mixed full-VGL exceeds ") + description + " error budget");
+        return std::abs(actual - expected) / (1 + std::abs(expected));
+      };
+      for (int repeat = 0; repeat < 2; ++repeat)
+      {
+        mixed_spatial.evaluate(model.cfg.electrons.x);
+        mixed_spatial.downloadResults(mixed_phases, mixed_jets, mixed_ratios);
+        mixed_value.evaluate(model.cfg.electrons.x);
+        mixed_value.downloadResults(value_phases, mixed_logs, unused);
+        fp64_retries += mixed_spatial.usedFp64Retry();
+        const auto& mixed_layout = mixed_spatial.resultLayout();
+        for (std::size_t sample = 0; sample < references.size(); ++sample)
+        {
+          near(mixed_phases[sample], references[sample].sign, "matched mixed VGL sign");
+          const auto log_value = mixed_jets[mixed_layout.uncheckedValueOffset(sample, 0)];
+          compare(log_value, references[sample].logabs, 5e-5, "value");
+          compare(log_value, mixed_logs[sample], 5e-5, "value/VGL consistency");
+          maximum_value_difference = std::max(maximum_value_difference, std::abs(log_value - mixed_logs[sample]));
+          for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+            maximum_gradient_scaled = std::max(maximum_gradient_scaled,
+                compare(mixed_jets[mixed_layout.uncheckedGradientOffset(sample, lane, 0)],
+                        references[sample].gradient[lane], 5e-4, "gradient"));
+          double kinetic = 0;
+          for (std::size_t electron = 0; electron < model.ne; ++electron)
+          {
+            maximum_laplacian_scaled = std::max(maximum_laplacian_scaled,
+                compare(mixed_jets[mixed_layout.uncheckedLaplacianOffset(sample, electron, 0)],
+                        references[sample].lap_log[electron], 1e-3, "log Laplacian"));
+            maximum_laplacian_scaled = std::max(maximum_laplacian_scaled,
+                compare(mixed_ratios[sample * model.ne + electron], references[sample].lap_ratio[electron],
+                        1e-3, "Laplacian ratio"));
+            kinetic -= 0.5 * mixed_ratios[sample * model.ne + electron];
+          }
+          maximum_kinetic_scaled = std::max(maximum_kinetic_scaled,
+              compare(kinetic, references[sample].kinetic, 1e-3, "kinetic"));
+        }
+        if (mixed_spatial.deviceWorkspaceBytes() != prepared_bytes)
+          throw std::runtime_error("Mixed full-VGL reuse changed its prepared storage");
+      }
+      // Rounding-aware finite differences supplement FP64 reference comparisons.
+      // h=1e-2 avoids dividing FP32-level log-amplitude noise by a microscopic h^2.
+      constexpr double h = 1e-2;
+      const auto full_cast_bytes = mixed_spatial.statistics().roundTripBytes();
+      const double base_log = mixed_logs[0];
+      double finite_difference_laplacian = 0, finite_difference_gradient = 0;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      {
+        auto displaced = model.cfg.electrons.x;
+        displaced[dimension] += h;
+        mixed_value.evaluate(displaced);
+        mixed_value.downloadResults(value_phases, value_logs, unused);
+        const double plus = value_logs[0];
+        displaced[dimension] -= 2 * h;
+        mixed_value.evaluate(displaced);
+        mixed_value.downloadResults(value_phases, value_logs, unused);
+        const double minus = value_logs[0];
+        finite_difference_laplacian += (plus + minus - 2 * base_log) / (h * h);
+        if (dimension == 0)
+          finite_difference_gradient = (plus - minus) / (2 * h);
+      }
+      const auto& mixed_layout = mixed_spatial.resultLayout();
+      const double jet_gradient = mixed_jets[mixed_layout.uncheckedGradientOffset(0, 0, 0)];
+      const double jet_laplacian = mixed_jets[mixed_layout.uncheckedLaplacianOffset(0, 0, 0)];
+      compare(finite_difference_gradient, jet_gradient, 3e-2, "rounding-aware finite-difference gradient");
+      compare(finite_difference_laplacian, jet_laplacian, 1e-1, "rounding-aware finite-difference trace Laplacian");
+      if (model.cfg.nconfig > 1)
+      {
+        const std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+        mixed_spatial.evaluate(prefix);
+        std::vector<double> tail_phase(1), tail_jets(spatialJetSpanElements(mixed_spatial.resultLayout())), tail_ratios(model.ne);
+        mixed_spatial.downloadResults(tail_phase, tail_jets, tail_ratios);
+        compare(tail_jets[mixed_spatial.resultLayout().uncheckedGradientOffset(0, 0, 0)],
+                references[0].gradient[0], 5e-4, "tail gradient");
+      }
+      std::cout << "PASS matched mixed affine VGL: value_mode_difference=" << maximum_value_difference
+                << " gradient_scaled_error=" << maximum_gradient_scaled
+                << " laplacian_scaled_error=" << maximum_laplacian_scaled
+                << " kinetic_scaled_error=" << maximum_kinetic_scaled << " reference_retries=" << fp64_retries
+                << "/2 cast_bytes=" << full_cast_bytes
+                << " workspace_bytes=" << prepared_bytes << "; rounding-aware finite differences and tails\n";
+    }
+
     // Score preparation retains only ordinary block values, not per-walker scores.
     PreparedDeviceInference taped(image, model.cfg.nconfig, queue, handle,
                                    SpatialJetMode::VALUE_ONLY, true);
@@ -1260,6 +1476,14 @@ int main(int argc, char** argv)
     for (std::size_t index = 0; index < value_logs.size(); ++index)
       if (value_phases[index] != 0 || value_logs[index] != -HUGE_VAL)
         throw std::runtime_error("Value-only graph did not preserve signed-log node semantics");
+    PreparedDeviceMixedValueInference mixed_nodes(node_image, model.cfg.nconfig, queue, handle);
+    mixed_nodes.evaluate(model.cfg.electrons.x);
+    mixed_nodes.downloadResults(value_phases, value_logs, no_ratios);
+    if (!mixed_nodes.usedFp64Retry())
+      throw std::runtime_error("Mixed value conditioning did not retry an exact determinant node");
+    for (std::size_t index = 0; index < value_logs.size(); ++index)
+      if (value_phases[index] != 0 || value_logs[index] != -HUGE_VAL)
+        throw std::runtime_error("Whole-graph mixed retry did not preserve exact signed-log nodes");
     std::cout << "Prepared device bytes: shared_model=" << image->deviceStorageBytes()
               << " value_workspace=" << value_bytes << " VGL_workspace=" << inference.deviceWorkspaceBytes() << '\n';
 

@@ -6,7 +6,10 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerOpenOrbital.h
- * @brief Shared open-boundary PsiFormer backflow-envelope orbital jet core.
+ * @brief Shared real PsiFormer backflow-envelope orbital spatial-jet core.
+ *
+ * Null cell metadata preserves the open path. Periodic cells replace only radial
+ * envelope geometry and its Cartesian jets; the product/head algebra is shared.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_OPEN_ORBITAL_H
@@ -240,7 +243,8 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     std::size_t configuration, std::size_t active_electron,
     std::size_t determinant, std::size_t row_electron,
     std::size_t orbital, double* output,
-    double* retained_backflow = nullptr, double* retained_envelope = nullptr) noexcept
+    double* retained_backflow = nullptr, double* retained_envelope = nullptr,
+    const periodic_geometry::Cell* periodic_cell = nullptr) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
@@ -276,6 +280,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
   {
     const double* nucleus_position = nuclei + nucleus * layout.nucleus_row_stride;
     double displacement[3];
+    periodic_geometry::Pair periodic_pair;
     double radius_squared = 0.0;
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
     {
@@ -285,7 +290,13 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
       displacement[dimension] = electron_position[dimension] - nucleus_position[dimension];
       radius_squared += displacement[dimension] * displacement[dimension];
     }
-    const double radius = ::sqrt(radius_squared);
+    double radius = ::sqrt(radius_squared);
+    if (periodic_cell)
+    {
+      if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair))
+        return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+      radius = periodic_pair.radius;
+    }
     if (!(radius > 0.0) && layout.features.mode != SpatialJetMode::VALUE_ONLY)
       return OpenSpatialStatus::COALESCENCE;
     const std::size_t parameter = envelopeOffset(
@@ -304,8 +315,11 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
       const double radial_first = -decay * weighted;
       const double radial_second = decay * decay * weighted;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
-        envelope_gradient[dimension] += radial_first * displacement[dimension] / radius;
-      envelope_laplacian += radial_second + 2.0 * radial_first / radius;
+        envelope_gradient[dimension] += periodic_cell ? radial_first * periodic_pair.radius_gradient[dimension]
+                                                     : radial_first * displacement[dimension] / radius;
+      envelope_laplacian += periodic_cell ? radial_second * periodic_pair.radius_gradient_norm_squared +
+                                              radial_first * periodic_pair.radius_laplacian
+                                        : radial_second + 2.0 * radial_first / radius;
     }
   }
 

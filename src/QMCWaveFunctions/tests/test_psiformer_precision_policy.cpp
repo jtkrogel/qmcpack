@@ -27,7 +27,8 @@ TEST_CASE("PsiFormer precision policy names are strict and stable",
   for (const PsiFormerPrecisionPolicy policy : {
            PsiFormerPrecisionPolicy::FP64_REFERENCE,
            PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
-           PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE})
+           PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE,
+           PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS})
   {
     CHECK(parsePsiFormerPrecisionPolicy(psiFormerPrecisionPolicyName(policy)) == policy);
     CHECK(psiFormerPrecisionPolicyFingerprint(policy) != 0);
@@ -36,6 +37,28 @@ TEST_CASE("PsiFormer precision policy names are strict and stable",
         psiFormerPrecisionPolicyFingerprint(PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE));
   CHECK_THROWS_AS(parsePsiFormerPrecisionPolicy("mixed"), std::invalid_argument);
   CHECK_THROWS_AS(parsePsiFormerPrecisionPolicy("tf32"), std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer dense-only mixed policy preserves every FP64 island",
+          "[wavefunction][psiformer][precision]")
+{
+  constexpr auto policy = PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS;
+  CHECK(std::string(psiFormerPrecisionPolicyName(policy)) == "fp32_dense_fp64_islands");
+  CHECK(parsePsiFormerPrecisionPolicy("fp32_dense_fp64_islands") == policy);
+  for (std::uint8_t value = 0; value < static_cast<std::uint8_t>(PsiFormerArithmeticOperation::COUNT); ++value)
+  {
+    const auto operation = static_cast<PsiFormerArithmeticOperation>(value);
+    const auto rule = psiFormerPrecisionRule(policy, operation);
+    const auto precision = operation == PsiFormerArithmeticOperation::DENSE_PROJECTION
+        ? PsiFormerArithmeticPrecision::BINARY32 : PsiFormerArithmeticPrecision::BINARY64;
+    CHECK(rule.storage == precision);
+    CHECK(rule.compute == precision);
+    CHECK(rule.accumulation == precision);
+    CHECK_FALSE(rule.allow_fast_math);
+  }
+  CHECK_NOTHROW(validatePsiFormerPrecisionBackend(policy, PsiFormerAcceleratorBackend::CUDA));
+  CHECK_NOTHROW(validatePsiFormerPrecisionBackend(policy, PsiFormerAcceleratorBackend::HIP));
+  CHECK_THROWS_AS(validatePsiFormerPrecisionBackend(policy, PsiFormerAcceleratorBackend::CPU), std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer mixed policy lowers only audited operation classes",

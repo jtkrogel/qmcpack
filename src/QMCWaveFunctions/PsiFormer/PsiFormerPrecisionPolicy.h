@@ -31,7 +31,8 @@ enum class PsiFormerPrecisionPolicy : std::uint8_t
 {
   FP64_REFERENCE,
   FP32_COMPUTE_FP64_REDUCE,
-  TF32_DENSE_FP64_SENSITIVE
+  TF32_DENSE_FP64_SENSITIVE,
+  FP32_DENSE_FP64_ISLANDS
 };
 
 /// Identify operation classes whose precision is selected independently.
@@ -98,7 +99,9 @@ template<PsiFormerPrecisionPolicy Policy, PsiFormerArithmeticOperation Operation
 struct PsiFormerPrecisionTraits
 {
   static constexpr bool lower_value =
-      Policy != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+      Policy == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS
+      ? Operation == PsiFormerArithmeticOperation::DENSE_PROJECTION
+      : Policy != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       (detail::lower_precision_value_operation_v<Operation> ||
        Operation == PsiFormerArithmeticOperation::SOFTMAX_NORMALIZATION);
   static constexpr bool fp64_accumulation =
@@ -150,6 +153,22 @@ static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
 static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
                                  PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE,
                                  PsiFormerArithmeticOperation::OPTIMIZER_STATE>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS,
+                                 PsiFormerArithmeticOperation::DENSE_PROJECTION>::storage_type,
+                             float>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS,
+                                 PsiFormerArithmeticOperation::SOFTMAX_NORMALIZATION>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS,
+                                 PsiFormerArithmeticOperation::RESIDUAL_NONLINEAR>::storage_type,
+                             double>);
+static_assert(std::is_same_v<typename PsiFormerPrecisionTraits<
+                                 PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS,
+                                 PsiFormerArithmeticOperation::PARAMETER_REVERSE_DENSE>::storage_type,
                              double>);
 
 /// Record storage, multiply, and reduction precision for one operation class.

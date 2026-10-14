@@ -168,7 +168,8 @@ private:
         weights_.data(), head.backflow, head.envelope, seeds_.data(), up_.data(), down_.data(), envelope_.data()),
         "score orbital product reverse");
     checkRuntime(launchScoreGeometry(stream, count, ne, shape.nuclei, shape.spin_up_electrons,
-        head.positions, model_->nuclei(), ion_distances_.data(), pair_distances_.data(), same_spin_.data()),
+        head.positions, model_->nuclei(), ion_distances_.data(), pair_distances_.data(), same_spin_.data(),
+        model_->periodicCell()),
         "score geometry");
     zero(head_response_, head_response_.capacity());
     zero(feature_, multiply(multiply(count, ne), width));

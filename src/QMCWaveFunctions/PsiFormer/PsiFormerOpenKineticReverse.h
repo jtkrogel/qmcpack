@@ -6,12 +6,14 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerOpenKineticReverse.h
- * @brief Allocation-free lifted reverse of open-boundary orbital and cusp jets.
+ * @brief Allocation-free lifted reverse of real orbital and cusp spatial jets.
  *
  * These leaves cover exactly one FULL_VGL configuration.  All reductions have one
  * serial owner, all storage is caller owned, and successful parameter publication is
  * additive into one canonical response vector.  The six orbital response offsets are
- * independent: no block is located by arithmetic from another block.
+ * independent: no block is located by arithmetic from another block. An optional
+ * immutable torus cell selects periodic radial geometry; null preserves the
+ * original open-boundary arithmetic and all existing entry points.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_OPEN_KINETIC_REVERSE_H
@@ -351,7 +353,8 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
     double* envelope_adjoint,
     double* feature_adjoint,
     double* response,
-    OpenKineticReverseStatus* status) noexcept
+    OpenKineticReverseStatus* status,
+    const periodic_geometry::Cell* periodic_cell = nullptr) noexcept
 {
   if (isZeroWork(layout))
   {
@@ -507,7 +510,9 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
       }
   }
 
-  // Exact full-jet pi/zeta derivatives.  zeta==0 selects the zero subgradient.
+  // Exact full-jet pi/zeta derivatives. zeta==0 selects the zero subgradient.
+  // Periodic radial compositions require the general Cartesian gradient norm
+  // and trace; the Euclidean f''+2*f'/r shortcut applies only to the open branch.
   for (std::size_t row = 0; row < electrons; ++row)
   {
     const bool spin_up = row < layout.forward.spin_up_count;
@@ -534,6 +539,7 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
           const double* nucleus_position =
               nuclei + nucleus * layout.forward.nucleus_row_stride;
           double displacement[3];
+          periodic_geometry::Pair periodic_pair;
           double radius_squared = 0.0;
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
           {
@@ -546,7 +552,14 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
                 electron_position[dimension] - nucleus_position[dimension];
             radius_squared += displacement[dimension] * displacement[dimension];
           }
-          const double radius = ::sqrt(radius_squared);
+          double radius = ::sqrt(radius_squared);
+          if (periodic_cell)
+          {
+            if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, periodic_pair))
+              return failOrbital(layout, OpenKineticReverseStatus::NONFINITE_INPUT_OR_RESULT,
+                                 backflow_adjoint, envelope_adjoint, feature_adjoint, response, status);
+            radius = periodic_pair.radius;
+          }
           if (!(radius > 0.0))
             return failOrbital(layout, OpenKineticReverseStatus::COALESCENCE,
                                backflow_adjoint, envelope_adjoint, feature_adjoint,
@@ -575,7 +588,8 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
           {
             const std::size_t lane = 3 * row + dimension;
-            const double direction = displacement[dimension] / radius;
+            const double direction = periodic_cell ? periodic_pair.radius_gradient[dimension]
+                                                   : displacement[dimension] / radius;
             const double upstream = envelope_adjoint[
                 orbital_jets.uncheckedGradientOffset(0, lane, element)];
             pi_bar += upstream * pi_radial_first * direction;
@@ -584,9 +598,13 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
           const double laplacian_upstream = envelope_adjoint[
               orbital_jets.uncheckedLaplacianOffset(0, row, element)];
           pi_bar += laplacian_upstream *
-              (pi_radial_second + 2.0 * pi_radial_first / radius);
+              (periodic_cell ? pi_radial_second * periodic_pair.radius_gradient_norm_squared +
+                                   pi_radial_first * periodic_pair.radius_laplacian
+                             : pi_radial_second + 2.0 * pi_radial_first / radius);
           zeta_bar += laplacian_upstream *
-              (zeta_radial_second + 2.0 * zeta_radial_first / radius);
+              (periodic_cell ? zeta_radial_second * periodic_pair.radius_gradient_norm_squared +
+                                   zeta_radial_first * periodic_pair.radius_laplacian
+                             : zeta_radial_second + 2.0 * zeta_radial_first / radius);
           double& pi_destination = response[pi_offset + parameter];
           double& zeta_destination = response[zeta_offset + parameter];
           if (!finite(pi_bar) || !finite(zeta_bar) || !finite(pi_destination) ||
@@ -638,7 +656,8 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenCuspK
     double opposite_alpha,
     const double* cusp_adjoint,
     double* response,
-    OpenKineticReverseStatus* status) noexcept
+    OpenKineticReverseStatus* status,
+    const periodic_geometry::Cell* periodic_cell = nullptr) noexcept
 {
   if (isZeroWork(layout))
   {
@@ -673,6 +692,7 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenCuspK
       const double alpha = same_spin ? same_alpha : opposite_alpha;
       const double factor = same_spin ? 0.25 : 0.5;
       double displacement[3];
+      periodic_geometry::Pair periodic_pair;
       double radius_squared = 0.0;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
@@ -686,7 +706,15 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenCuspK
         displacement[dimension] = first_value - second_value;
         radius_squared += displacement[dimension] * displacement[dimension];
       }
-      const double radius = ::sqrt(radius_squared);
+      double radius = ::sqrt(radius_squared);
+      if (periodic_cell)
+      {
+        if (!periodic_geometry::evaluatePair(*periodic_cell,
+            positions + first * layout.forward.position_row_stride,
+            positions + second * layout.forward.position_row_stride, periodic_pair))
+          return failCusp(layout, OpenKineticReverseStatus::NONFINITE_INPUT_OR_RESULT, response, status);
+        radius = periodic_pair.radius;
+      }
       if (!(radius > 0.0))
         return failCusp(layout, OpenKineticReverseStatus::COALESCENCE,
                         response, status);
@@ -705,7 +733,8 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenCuspK
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
         const double directional =
-            radial_first_partial * displacement[dimension] / radius;
+            periodic_cell ? radial_first_partial * periodic_pair.radius_gradient[dimension]
+                          : radial_first_partial * displacement[dimension] / radius;
         contribution += cusp_adjoint[
             jets.uncheckedGradientOffset(0, 3 * first + dimension, 0)] * directional;
         contribution -= cusp_adjoint[
@@ -714,7 +743,9 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenCuspK
       contribution +=
           (cusp_adjoint[jets.uncheckedLaplacianOffset(0, first, 0)] +
            cusp_adjoint[jets.uncheckedLaplacianOffset(0, second, 0)]) *
-          (radial_second_partial + 2.0 * radial_first_partial / radius);
+          (periodic_cell ? radial_second_partial * periodic_pair.radius_gradient_norm_squared +
+                               radial_first_partial * periodic_pair.radius_laplacian
+                         : radial_second_partial + 2.0 * radial_first_partial / radius);
       if (!finite(contribution))
         return failCusp(layout, OpenKineticReverseStatus::NONFINITE_INPUT_OR_RESULT,
                         response, status);

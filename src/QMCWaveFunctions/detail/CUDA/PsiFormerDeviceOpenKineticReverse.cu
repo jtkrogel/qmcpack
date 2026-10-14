@@ -27,6 +27,8 @@ Error peekAtLastError()
 #endif
 }
 
+/// Specialize boundary geometry while retaining the single-owner reverse reduction.
+template<bool periodic>
 __global__ void openOrbitalKineticReverseKernel(
     OpenOrbitalKineticReverseLayout layout,
     const double* features,
@@ -45,15 +47,18 @@ __global__ void openOrbitalKineticReverseKernel(
     double* envelope_adjoint,
     double* feature_adjoint,
     double* response,
-    OpenKineticReverseStatus* status)
+    OpenKineticReverseStatus* status, periodic_geometry::Cell cell)
 {
   if (blockIdx.x == 0 && threadIdx.x == 0)
     open_kinetic_reverse::reverseOpenOrbitalKineticSerial(
         layout, features, positions, nuclei, backflow_up, backflow_down, pi_up,
         pi_down, zeta_up, zeta_down, backflow, envelope, orbital_adjoint,
-        backflow_adjoint, envelope_adjoint, feature_adjoint, response, status);
+        backflow_adjoint, envelope_adjoint, feature_adjoint, response, status,
+        periodic ? &cell : nullptr);
 }
 
+/// Reverse cusp alpha jets using the same prepared boundary policy as forward.
+template<bool periodic>
 __global__ void openCuspKineticReverseKernel(
     OpenCuspKineticReverseLayout layout,
     const double* positions,
@@ -61,12 +66,12 @@ __global__ void openCuspKineticReverseKernel(
     double opposite_alpha,
     const double* cusp_adjoint,
     double* response,
-    OpenKineticReverseStatus* status)
+    OpenKineticReverseStatus* status, periodic_geometry::Cell cell)
 {
   if (blockIdx.x == 0 && threadIdx.x == 0)
     open_kinetic_reverse::reverseOpenCuspKineticSerial(
         layout, positions, same_alpha, opposite_alpha, cusp_adjoint, response,
-        status);
+        status, periodic ? &cell : nullptr);
 }
 
 } // namespace
@@ -90,11 +95,13 @@ Error launchOpenOrbitalKineticReverse(
     double* envelope_adjoint,
     double* feature_adjoint,
     double* response,
-    OpenKineticReverseStatus* status)
+    OpenKineticReverseStatus* status, const periodic_geometry::Cell* periodic_cell)
 {
   validateOpenOrbitalKineticReverseLayout(layout);
   if (isZeroWork(layout))
     return success;
+  if (periodic_cell)
+    periodic_geometry::validateCell(*periodic_cell);
   if (!features || !positions || !nuclei || !backflow_up || !backflow_down ||
       !pi_up || !pi_down || !zeta_up || !zeta_down || !backflow || !envelope ||
       !orbital_adjoint || !backflow_adjoint || !envelope_adjoint ||
@@ -104,10 +111,16 @@ Error launchOpenOrbitalKineticReverse(
       features, positions, nuclei, backflow_up, backflow_down, pi_up, pi_down,
       zeta_up, zeta_down, backflow, envelope, orbital_adjoint, backflow_adjoint,
       envelope_adjoint, feature_adjoint, response, status);
-  openOrbitalKineticReverseKernel<<<1, 1, 0, stream>>>(
-      layout, features, positions, nuclei, backflow_up, backflow_down, pi_up,
-      pi_down, zeta_up, zeta_down, backflow, envelope, orbital_adjoint,
-      backflow_adjoint, envelope_adjoint, feature_adjoint, response, status);
+  if (periodic_cell)
+    openOrbitalKineticReverseKernel<true><<<1, 1, 0, stream>>>(
+        layout, features, positions, nuclei, backflow_up, backflow_down, pi_up,
+        pi_down, zeta_up, zeta_down, backflow, envelope, orbital_adjoint,
+        backflow_adjoint, envelope_adjoint, feature_adjoint, response, status, *periodic_cell);
+  else
+    openOrbitalKineticReverseKernel<false><<<1, 1, 0, stream>>>(
+        layout, features, positions, nuclei, backflow_up, backflow_down, pi_up,
+        pi_down, zeta_up, zeta_down, backflow, envelope, orbital_adjoint,
+        backflow_adjoint, envelope_adjoint, feature_adjoint, response, status, {});
   return peekAtLastError();
 }
 
@@ -119,18 +132,23 @@ Error launchOpenCuspKineticReverse(
     double opposite_alpha,
     const double* cusp_adjoint,
     double* response,
-    OpenKineticReverseStatus* status)
+    OpenKineticReverseStatus* status, const periodic_geometry::Cell* periodic_cell)
 {
   validateOpenCuspKineticReverseLayout(layout);
   if (isZeroWork(layout))
     return success;
+  if (periodic_cell)
+    periodic_geometry::validateCell(*periodic_cell);
   if (!positions || !cusp_adjoint || !response || !status)
     throw std::invalid_argument("PsiFormer open cusp kinetic reverse storage is null");
   validateOpenCuspKineticReverseNoAlias(
       positions, cusp_adjoint, response, status);
-  openCuspKineticReverseKernel<<<1, 1, 0, stream>>>(
-      layout, positions, same_alpha, opposite_alpha, cusp_adjoint, response,
-      status);
+  if (periodic_cell)
+    openCuspKineticReverseKernel<true><<<1, 1, 0, stream>>>(
+        layout, positions, same_alpha, opposite_alpha, cusp_adjoint, response, status, *periodic_cell);
+  else
+    openCuspKineticReverseKernel<false><<<1, 1, 0, stream>>>(
+        layout, positions, same_alpha, opposite_alpha, cusp_adjoint, response, status, {});
   return peekAtLastError();
 }
 

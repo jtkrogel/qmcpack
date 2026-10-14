@@ -23,13 +23,16 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--twist", help="Explicit fixed outer twist; requires a complex executable")
     args = parser.parse_args()
     results = {}
     for backend in ("cpu", "cuda"):
         directory = args.output / backend
         directory.mkdir(parents=True, exist_ok=True)
         tree = ET.parse(args.input)
-        tree.getroot().find("wavefunction/psiformer").set("gpu", backend)
+        tree.getroot().find(".//wavefunction/psiformer").set("gpu", backend)
+        if args.twist is not None:
+            tree.getroot().find(".//wavefunction/psiformer").set("twist", args.twist)
         tree.write(directory / "input.xml", encoding="unicode", xml_declaration=True)
         with (directory / "console.log").open("w") as log:
             completed = subprocess.run([str(args.binary.resolve()), "input.xml"], cwd=directory,

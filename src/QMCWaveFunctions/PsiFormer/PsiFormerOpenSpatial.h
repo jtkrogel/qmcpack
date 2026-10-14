@@ -6,7 +6,11 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerOpenSpatial.h
- * @brief Allocation-free open-boundary spatial jet cores shared by CPU/CUDA/HIP.
+ * @brief Allocation-free real spatial jet cores shared by CPU/CUDA/HIP.
+ *
+ * Existing open layouts and entry points remain source compatible. Optional
+ * immutable torus geometry provides periodic feature/cusp jets without changing
+ * the downstream neural jet algebra or introducing complex phase arithmetic.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_OPEN_SPATIAL_H
@@ -14,6 +18,7 @@
 
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceDeterminantMath.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialLayout.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicGeometry.h"
 
 #include <cmath>
 #include <cstddef>
@@ -83,13 +88,13 @@ static_assert(std::is_standard_layout_v<SpatialElementwiseJetLayout>);
 static_assert(std::is_trivially_copyable_v<FinalSpatialJetLayout>);
 static_assert(std::is_standard_layout_v<FinalSpatialJetLayout>);
 
-inline void validateOpenFeatureJetLayout(const OpenFeatureJetLayout& layout)
+inline void validateOpenFeatureJetLayout(const OpenFeatureJetLayout& layout, bool periodic = false)
 {
   validateSpatialJetLayout(layout.output);
   if (layout.nucleus_count == 0 || layout.spin_up_count > layout.output.electron_count)
     throw std::invalid_argument("PsiFormer open feature dimensions are invalid");
   const std::size_t expected_width = spatial_detail::checkedAdd(
-      spatial_detail::checkedProduct(4, layout.nucleus_count,
+      spatial_detail::checkedProduct(periodic ? 7 : 4, layout.nucleus_count,
                                      "PsiFormer open feature width overflow"),
       1, "PsiFormer open feature width overflow");
   if (layout.feature_width != expected_width ||
@@ -130,6 +135,31 @@ inline OpenFeatureJetLayout makeOpenFeatureJetLayout(
                                          : position_configuration_stride,
       nucleus_row_stride};
   validateOpenFeatureJetLayout(layout);
+  return layout;
+}
+
+/// Build the seven-component-per-nucleus torus feature layout, preserving jet strides.
+inline OpenFeatureJetLayout makePeriodicFeatureJetLayout(
+    std::size_t configuration_count, std::size_t electron_count,
+    std::size_t nucleus_count, std::size_t spin_up_count, SpatialJetMode mode,
+    std::size_t position_row_stride = 3,
+    std::size_t position_configuration_stride = 0,
+    std::size_t nucleus_row_stride = 3,
+    std::size_t plane_stride = 0, std::size_t output_configuration_stride = 0)
+{
+  const auto width = spatial_detail::checkedAdd(
+      spatial_detail::checkedProduct(7, nucleus_count, "PsiFormer periodic feature width overflow"),
+      1, "PsiFormer periodic feature width overflow");
+  const auto position_span = spatial_detail::checkedSpan(
+      electron_count, position_row_stride, 3, "PsiFormer periodic position extent overflow");
+  OpenFeatureJetLayout layout{
+      makeSpatialJetLayout(configuration_count,
+          spatial_detail::checkedProduct(electron_count, width, "PsiFormer periodic feature extent overflow"),
+          electron_count, mode, plane_stride, output_configuration_stride),
+      nucleus_count, width, spin_up_count, position_row_stride,
+      position_configuration_stride == 0 ? position_span : position_configuration_stride,
+      nucleus_row_stride};
+  validateOpenFeatureJetLayout(layout, true);
   return layout;
 }
 
@@ -280,7 +310,7 @@ QMC_PF_OPEN_HOST_DEVICE inline bool configurationIsFinite(
 QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfiguration(
     const OpenFeatureJetLayout& layout, const double* positions,
     const double* nuclei, std::size_t configuration, std::size_t active_electron,
-    double* output) noexcept
+    double* output, const periodic_geometry::Cell* periodic_cell = nullptr) noexcept
 {
   clearConfiguration(layout.output, configuration, output);
   if (active_electron >= layout.output.electron_count)
@@ -294,6 +324,58 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
     for (std::size_t nucleus = 0; nucleus < layout.nucleus_count; ++nucleus)
     {
       const double* nucleus_position = nuclei + nucleus * layout.nucleus_row_stride;
+      if (periodic_cell)
+      {
+        periodic_geometry::Pair pair;
+        if (!periodic_geometry::evaluatePair(*periodic_cell, electron_position, nucleus_position, pair))
+          return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+        if (pair.radius == 0 && layout.output.mode != SpatialJetMode::VALUE_ONLY)
+          return OpenSpatialStatus::COALESCENCE;
+        const auto radial = device_math::softenedRadial(pair.radius);
+        const std::size_t base = row + 7 * nucleus;
+        output[layout.output.uncheckedValueOffset(configuration, base)] = radial.log1p_radius;
+        const bool differentiated = layout.output.mode == SpatialJetMode::FULL_VGL ||
+            (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron);
+        for (std::size_t dimension = 0; dimension < 3 && differentiated; ++dimension)
+        {
+          const auto lane = layout.output.mode == SpatialJetMode::FULL_VGL ? 3 * electron + dimension : dimension;
+          output[layout.output.uncheckedGradientOffset(configuration, lane, base)] =
+              radial.log1p_first * pair.radius_gradient[dimension];
+        }
+        if (layout.output.mode == SpatialJetMode::FULL_VGL)
+          output[layout.output.uncheckedLaplacianOffset(configuration, electron, base)] =
+              radial.log1p_second * pair.radius_gradient_norm_squared + radial.log1p_first * pair.radius_laplacian;
+
+        // The q and complementary p vectors have distinct Cartesian jets, but
+        // share the same smooth radial multiplier and its chain rule.
+        for (std::size_t vector = 0; vector < 2; ++vector)
+          for (std::size_t component = 0; component < 3; ++component)
+          {
+            const double value = vector == 0 ? pair.displacement[component] : pair.complementary[component];
+            const double* jacobian = vector == 0 ? pair.jacobian[component] : pair.complementary_jacobian[component];
+            const double laplacian = vector == 0 ? pair.laplacian[component] : pair.complementary_laplacian[component];
+            const auto element = base + 1 + 3 * vector + component;
+            output[layout.output.uncheckedValueOffset(configuration, element)] = value * radial.log1p_over_radius;
+            double gradient_dot_radius = 0;
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            {
+              gradient_dot_radius += jacobian[dimension] * pair.radius_gradient[dimension];
+              if (differentiated)
+              {
+                const auto lane = layout.output.mode == SpatialJetMode::FULL_VGL ? 3 * electron + dimension : dimension;
+                output[layout.output.uncheckedGradientOffset(configuration, lane, element)] =
+                    jacobian[dimension] * radial.log1p_over_radius +
+                    value * radial.log1p_over_radius_first * pair.radius_gradient[dimension];
+              }
+            }
+            if (layout.output.mode == SpatialJetMode::FULL_VGL)
+              output[layout.output.uncheckedLaplacianOffset(configuration, electron, element)] =
+                  laplacian * radial.log1p_over_radius + 2 * radial.log1p_over_radius_first * gradient_dot_radius +
+                  value * (radial.log1p_over_radius_second * pair.radius_gradient_norm_squared +
+                           radial.log1p_over_radius_first * pair.radius_laplacian);
+          }
+        continue;
+      }
       double displacement[3];
       double radius_squared = 0.0;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
@@ -415,7 +497,8 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus residualJetElement(
 QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfiguration(
     const OpenCuspJetLayout& layout, const double* positions,
     std::size_t configuration, std::size_t active_electron,
-    double same_spin_alpha, double opposite_spin_alpha, double* output) noexcept
+    double same_spin_alpha, double opposite_spin_alpha, double* output,
+    const periodic_geometry::Cell* periodic_cell = nullptr) noexcept
 {
   clearConfiguration(layout.output, configuration, output);
   if (active_electron >= layout.output.electron_count ||
@@ -429,6 +512,7 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
     for (std::size_t second = first + 1; second < layout.output.electron_count; ++second)
     {
       double displacement[3];
+      periodic_geometry::Pair periodic_pair;
       double radius_squared = 0.0;
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
       {
@@ -440,7 +524,15 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
         displacement[dimension] = first_value - second_value;
         radius_squared += displacement[dimension] * displacement[dimension];
       }
-      const double radius = ::sqrt(radius_squared);
+      double radius = ::sqrt(radius_squared);
+      if (periodic_cell)
+      {
+        if (!periodic_geometry::evaluatePair(*periodic_cell,
+            configuration_positions + first * layout.position_row_stride,
+            configuration_positions + second * layout.position_row_stride, periodic_pair))
+          return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+        radius = periodic_pair.radius;
+      }
       if (!(radius > 0.0) && layout.output.mode != SpatialJetMode::VALUE_ONLY)
         return OpenSpatialStatus::COALESCENCE;
       const bool same_spin = (first < layout.spin_up_count) ==
@@ -463,11 +555,14 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
                 ? 3 * electron + dimension : dimension;
             const double sign = endpoint == 0 ? 1.0 : -1.0;
             output[layout.output.uncheckedGradientOffset(configuration, lane, 0)] +=
-                sign * radial_first * displacement[dimension] / radius;
+                periodic_cell ? sign * radial_first * periodic_pair.radius_gradient[dimension]
+                              : sign * radial_first * displacement[dimension] / radius;
           }
         if (layout.output.mode == SpatialJetMode::FULL_VGL)
           output[layout.output.uncheckedLaplacianOffset(configuration, electron, 0)] +=
-              radial_second + 2.0 * radial_first / radius;
+              periodic_cell ? radial_second * periodic_pair.radius_gradient_norm_squared +
+                                  radial_first * periodic_pair.radius_laplacian
+                            : radial_second + 2.0 * radial_first / radius;
       }
     }
   output[layout.output.uncheckedValueOffset(configuration, 0)] = value;

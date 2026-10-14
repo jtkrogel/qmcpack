@@ -129,6 +129,9 @@ public:
   /// Copy one version-consistent parameter state.
   virtual StructuredParameterSnapshot snapshotParameters() const = 0;
 
+  /// Identify actual numerical device products, not the memory domain of emitted chunks.
+  virtual bool usesAcceleratorParameterProducts() const noexcept { return false; }
+
   /// Detach a speculative clone from shared production parameters before trial publication.
   virtual void isolateParameterState()
   { throw std::runtime_error("Provider does not support isolated candidate evaluation"); }

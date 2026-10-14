@@ -1863,9 +1863,6 @@ public:
         (kinetic_workspace_ && (kinetic_workspace_->scoreSize() != schema_->parameterCount() ||
                                kinetic_workspace_->kineticSize() != schema_->parameterCount())))
       throw std::invalid_argument("PsiFormer streaming derivative schema does not match the execution plan");
-    if (hasDeviceProducts() && std::any_of(total_log_gradients_imaginary_.begin(),
-        total_log_gradients_imaginary_.end(), [](double value) { return value != 0.0; }))
-      throw std::invalid_argument("PsiFormer device kinetic products do not yet support imaginary total drift");
     checkedBatchMemoryAdd(sample_offset_, sample_count_,
                           "PsiFormer streaming derivative sample interval");
     initializeStorageDiagnostics();
@@ -2070,11 +2067,7 @@ protected:
           if (has_imaginary_drift)
           {
             const pf::DirectKineticConstView imaginary_response =
-                model_state_->direct_kinetic_executor
-                    .evaluateGradientParameterResponse(
-                        *kinetic_workspace_, imaginary_drift,
-                        electron_count_ * std::size_t{3}, inverse_mass,
-                        electron_count_);
+                evaluateGradientResponse(imaginary_drift, inverse_mass);
             const wftrain::DerivativeValue imaginary_unit =
                 adjoint == wftrain::DerivativeAdjoint::HERMITIAN
                 ? wftrain::DerivativeValue(0.0, -1.0)
@@ -2228,11 +2221,7 @@ protected:
         if (has_imaginary_drift)
         {
           const pf::DirectKineticConstView imaginary_response =
-              model_state_->direct_kinetic_executor
-                  .evaluateGradientParameterResponse(
-                      *kinetic_workspace_, imaginary_drift,
-                      electron_count_ * std::size_t{3}, inverse_mass,
-                      electron_count_);
+              evaluateGradientResponse(imaginary_drift, inverse_mass);
           for (std::size_t parameter = 0;
                parameter < imaginary_response.size(); ++parameter)
             product += wftrain::DerivativeValue(0.0,
@@ -2370,6 +2359,22 @@ private:
 #endif
     return model_state_->direct_kinetic_executor.evaluate(*kinetic_workspace_, drift,
         3 * electron_count_, masses, electron_count_);
+  }
+
+  /// Differentiate the gradient-only cross term for an imaginary complete drift.
+  pf::DirectKineticConstView evaluateGradientResponse(const double* drift, const double* masses) const
+  {
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      const auto& response = shared_scratch_->device_products->gradientResponse(
+          shared_scratch_->device_positions.data(), drift, masses, parameter_version_);
+      reportDeviceProducts();
+      return {response.data(), response.size()};
+    }
+#endif
+    return model_state_->direct_kinetic_executor.evaluateGradientParameterResponse(
+        *kinetic_workspace_, drift, 3 * electron_count_, masses, electron_count_);
   }
 
   /// Log real completed numerical work once, not merely device preparation.
@@ -5898,6 +5903,12 @@ void PsiFormerWF::prepareBatchExecutionClone(
 bool PsiFormerWF::isOptimizable() const
 {
   return optimization_metadata_->enabled;
+}
+
+// Distinguish actual device math from host pointers emitted by chunk sinks.
+bool PsiFormerWF::usesAcceleratorParameterProducts() const noexcept
+{
+  return model_state_->numerical_tile_backend != nullptr;
 }
 
 const wftrain::StructuredParameterSchema& PsiFormerWF::parameterSchema() const noexcept

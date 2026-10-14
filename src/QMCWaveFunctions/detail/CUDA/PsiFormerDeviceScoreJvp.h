@@ -163,10 +163,11 @@ public:
         width, shape.spin_up_electrons, SpatialJetMode::VALUE_ONLY);
     checkRuntime(launchOpenOrbitalParameterDirection(stream, orbital_layout, forward.valueFinalFeatures(),
         feature_.data(), head.positions, model_->nuclei(), orbitalParameters(model_->parameters()),
-        orbitalParameters(direction_.data()), head.backflow, head.envelope, orbital_.data()), "score JVP orbitals");
+        orbitalParameters(direction_.data()), head.backflow, head.envelope, orbital_.data(),
+        model_->periodicCell()), "score JVP orbitals");
     checkRuntime(launchLogScoreParameterDirection(stream, count, ne, shape.determinants, shape.spin_up_electrons,
         head.positions, seeds_.data(), orbital_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
-        same_alpha_direction_, opposite_alpha_direction_, products_.data()), "score JVP reduction");
+        same_alpha_direction_, opposite_alpha_direction_, products_.data(), model_->periodicCell()), "score JVP reduction");
     const DerivativeFiniteScanLayout finite{count, count, 1, 0, 1};
     checkRuntime(launchDerivativeFiniteScan(stream, finite, products_.data(), finite_status_.data()), "score JVP finite scan");
     queue_.sync();

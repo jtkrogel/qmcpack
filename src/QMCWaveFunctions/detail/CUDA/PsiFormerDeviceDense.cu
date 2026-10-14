@@ -11,6 +11,9 @@
 
 #include "PsiFormerDeviceDense.h"
 #include "PsiFormerDeviceBlasMathMode.h"
+#include "PsiFormerDeviceMixedValueDense.h"
+#include "PsiFormerDevicePrecision.h"
+#include "PsiFormerDeviceInference.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <cfloat>
@@ -271,7 +274,12 @@ __global__ void valueFp64ToFp32Kernel(BatchedValueLayout layout,
               1ULL);
     return;
   }
-  target[offset] = static_cast<float>(value);
+  const float converted = static_cast<float>(value);
+  target[offset] = converted;
+  if (value != 0.0 && converted == 0.0F)
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->conversion.underflow_to_zero_count), 1ULL);
+  else if (converted != 0.0F && fabs(static_cast<double>(converted)) < static_cast<double>(FLT_MIN))
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->conversion.subnormal_output_count), 1ULL);
 }
 
 /// Cross the explicit value-path type barrier while leaving padding untouched.
@@ -675,6 +683,298 @@ Error launchValueFp32ToFp64(Stream stream,
 #else
   return cudaPeekAtLastError();
 #endif
+}
+
+namespace
+{
+
+/// Check mixed scratch/traffic arithmetic before any allocation or launch.
+std::size_t mixedCheckedMultiply(std::size_t count, std::size_t width)
+{
+  if (width != 0 && count > std::numeric_limits<std::size_t>::max() / width)
+    throw std::overflow_error("PsiFormer mixed value extent overflow");
+  return count * width;
+}
+
+/// Check accumulation of mixed scratch/cast accounting values.
+std::size_t mixedCheckedAdd(std::size_t left, std::size_t right)
+{
+  if (left > std::numeric_limits<std::size_t>::max() - right)
+    throw std::overflow_error("PsiFormer mixed value accounting overflow");
+  return left + right;
+}
+
+/// Keep backflow/envelope construction and every derivative outside the FP32 cache.
+bool isMixedValueDenseWeight(ParameterRole role)
+{
+  switch (role)
+  {
+  case ParameterRole::ELECTRON_EMBEDDING_WEIGHT:
+  case ParameterRole::ATTENTION_QUERY_WEIGHT:
+  case ParameterRole::ATTENTION_KEY_WEIGHT:
+  case ParameterRole::ATTENTION_VALUE_WEIGHT:
+  case ParameterRole::ATTENTION_OUTPUT_WEIGHT:
+  case ParameterRole::UPDATE_HIDDEN_WEIGHT:
+  case ParameterRole::UPDATE_OUTPUT_WEIGHT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Zero complete records, including padding, on their owning ordered queue.
+void clearMixedDeviceStorage(Stream stream, void* data, std::size_t bytes)
+{
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipMemsetAsync(data, 0, bytes, stream), "PsiFormer mixed value storage initialization");
+#else
+  checkRuntime(cudaMemsetAsync(data, 0, bytes, stream), "PsiFormer mixed value storage initialization");
+#endif
+}
+
+/// This initial policy rejects subnormals/underflow instead of relying on vendor FTZ behavior.
+bool mixedConversionNeedsRetry(const PsiFormerParameterConversionDiagnostics& diagnostics)
+{
+  return diagnostics.hasPublicationHazard() || diagnostics.subnormal_output_count != 0 ||
+      diagnostics.underflow_to_zero_count != 0;
+}
+
+/** Screen approximate determinant heads more conservatively than FP64 solve admission. */
+__global__ void mixedValueConditioningKernel(const device_determinant::FactorizationMetadata* factors,
+    const device_determinant::CombinationMetadata* combinations, std::size_t configurations,
+    std::size_t determinants, PsiFormerDeviceNumericalDiagnostics* diagnostics)
+{
+  const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration >= configurations)
+    return;
+  // These conservative screening thresholds are not a forward-error bound.
+  // They keep this first approximate route away from readily detected nodes and
+  // nearly singular channels; full model-error qualification is still required.
+  constexpr double minimum_scaled_pivot = 1.0e-3;
+  constexpr double minimum_sum_fraction = 1.0e-3;
+  unsigned long long bad_pivots = 0;
+  for (std::size_t determinant = 0; determinant < determinants; ++determinant)
+  {
+    const auto& factor = factors[configuration * determinants + determinant];
+    if (factor.status != device_determinant::FactorizationStatus::REGULAR ||
+        !device_determinant::isFiniteBinary64(factor.minimum_scaled_pivot) ||
+        factor.minimum_scaled_pivot < minimum_scaled_pivot)
+      ++bad_pivots;
+  }
+  if (bad_pivots)
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.small_determinant_pivot_count), bad_pivots);
+  const auto& sum = combinations[configuration];
+  if (sum.status != device_determinant::CombinationStatus::REGULAR || sum.severe_cancellation ||
+      !device_determinant::isFiniteBinary64(sum.sum_abs_scaled) ||
+      !device_determinant::isFiniteBinary64(sum.abs_sum_scaled) ||
+      sum.abs_sum_scaled < minimum_sum_fraction * sum.sum_abs_scaled)
+    atomicAdd(reinterpret_cast<unsigned long long*>(&diagnostics->execution.severe_cancellation_count), 1ULL);
+}
+
+} // namespace
+
+PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
+    std::shared_ptr<const PreparedDeviceModel> model, compute::Queue<PlatformKind::CUDA>& queue)
+    : model_(std::move(model))
+{
+  if (!model_)
+    throw std::invalid_argument("Mixed dense parameters require an immutable canonical model");
+  model_->validateCurrentDevice();
+  const auto& environment = model_->plan().environment();
+  if (environment.boundary != BoundaryCondition::OPEN ||
+      environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL ||
+      environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+    throw std::invalid_argument("Mixed value affine projections currently support fixed-ion open-real models only");
+  const auto count = model_->plan().parameterCount();
+  weights_.reserve(count);
+  clearMixedDeviceStorage(queue.getNative(), weights_.data(), checkedDeviceBytes<float>(count));
+  DeviceBuffer<PsiFormerParameterConversionDiagnostics> diagnostics(1);
+  clearMixedDeviceStorage(queue.getNative(), diagnostics.data(), sizeof(PsiFormerParameterConversionDiagnostics));
+
+  // Convert typed affine matrices only. Their canonical offsets remain stable,
+  // while physical parameters and nonlinear biases continue using FP64 masters.
+  constexpr std::size_t tile_capacity = 65536;
+  constexpr std::size_t block_size = 128;
+  for (const auto& tensor : model_->plan().parameterTensors())
+    if (isMixedValueDenseWeight(tensor.role))
+      for (std::size_t begin = tensor.begin; begin < tensor.end;)
+      {
+        const auto tile_count = std::min(tile_capacity, tensor.end - begin);
+        const PsiFormerParameterConversionTile tile{begin, begin, tile_count,
+            {tile_count, block_size, tile_count / block_size + (tile_count % block_size != 0), tile_count % block_size}};
+        checkRuntime(launchFp64ToFp32ParameterConversion(queue.getNative(), tile,
+            model_->parameters(), count, weights_.data(), count, diagnostics.data()), "mixed affine weight conversion");
+        begin += tile_count;
+      }
+  queue.sync();
+  diagnostics.download(&conversion_, 1);
+  if (mixedConversionNeedsRetry(conversion_))
+    throw MixedPrecisionRetryRequired("Mixed affine parameter conversion requires whole-graph FP64 execution");
+}
+
+std::size_t PreparedDeviceMixedDenseParameters::deviceStorageBytes() const
+{
+  return checkedDeviceBytes<float>(weights_.capacity());
+}
+
+std::size_t MixedValueDenseStatistics::roundTripBytes() const
+{
+  return mixedCheckedMultiply(mixedCheckedAdd(input_cast_elements, output_cast_elements),
+                              sizeof(double) + sizeof(float));
+}
+
+PreparedDeviceMixedValueDense::PreparedDeviceMixedValueDense(
+    std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters, std::size_t maximum_rows,
+    compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas)
+    : parameters_(std::move(parameters)), queue_(queue), blas_(blas), maximum_rows_(maximum_rows)
+{
+  if (!parameters_ || maximum_rows_ == 0)
+    throw std::invalid_argument("Mixed value projections require immutable parameters and positive row capacity");
+  modelImage()->validateCurrentDevice();
+#ifdef QMC_CUDA2HIP
+  constexpr auto backend = PsiFormerAcceleratorBackend::HIP;
+#else
+  constexpr auto backend = PsiFormerAcceleratorBackend::CUDA;
+#endif
+  math_mode_ = makePsiFormerBlasMathModePlan(PsiFormerBackendMathMode::FP32_STRICT, backend);
+  const auto& plan = modelImage()->plan();
+  const auto width = plan.modelShape().feature_dimension;
+  const auto input_width = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
+  source_.reserve(mixedCheckedMultiply(maximum_rows_, std::max(input_width, width)));
+  target_.reserve(mixedCheckedMultiply(maximum_rows_, width));
+  device_diagnostics_.reserve(1);
+}
+
+void PreparedDeviceMixedValueDense::beginEvaluation(const std::shared_ptr<const PreparedDeviceModel>& image)
+{
+  if (active_)
+    throw std::logic_error("Mixed dense evaluation is already open");
+  if (!image || image.get() != modelImage().get())
+    throw std::invalid_argument("Mixed dense evaluation has a stale or foreign canonical image");
+  image->validateCurrentDevice();
+  diagnostics_ = {};
+  statistics_ = {};
+  clearMixedDeviceStorage(queue_.getNative(), device_diagnostics_.data(), sizeof(PsiFormerDeviceNumericalDiagnostics));
+  active_ = true;
+}
+
+void PreparedDeviceMixedValueDense::project(const DenseForwardLayout& layout,
+                                           const double* source, const double* weight, double* target)
+{
+  if (!active_)
+    throw std::logic_error("Mixed dense projection has no open evaluation");
+  try
+  {
+    validateDenseForwardLayout(layout);
+    if (!source || !weight || !target || layout.rows == 0 || layout.rows > maximum_rows_ ||
+        layout.source_row_stride != layout.input_width || layout.weight_row_stride != layout.output_width ||
+        layout.target_row_stride != layout.output_width || layout.sourceElements() > source_.capacity() ||
+        layout.targetElements() > target_.capacity())
+      throw std::invalid_argument("Mixed value projection requires compact rows within prepared capacity");
+
+    // Exact canonical pointers prevent using an FP32 shadow for a bias, physical
+    // parameter, wrong layer or mismatched tensor dimensions.
+    const ParameterTensorDescriptor* tensor = nullptr;
+    for (const auto& candidate : modelImage()->plan().parameterTensors())
+      if (isMixedValueDenseWeight(candidate.role) && weight == modelImage()->parameters() + candidate.begin)
+      {
+        tensor = &candidate;
+        break;
+      }
+    if (!tensor || tensor->shape.size() != 2 || tensor->shape[0] != layout.input_width ||
+        tensor->shape[1] != layout.output_width)
+      throw std::invalid_argument("Mixed dense weight is not a matching canonical affine matrix");
+    statistics_.projections = mixedCheckedAdd(statistics_.projections, 1);
+    statistics_.input_cast_elements = mixedCheckedAdd(statistics_.input_cast_elements,
+        mixedCheckedMultiply(layout.rows, layout.input_width));
+    statistics_.output_cast_elements = mixedCheckedAdd(statistics_.output_cast_elements,
+        mixedCheckedMultiply(layout.rows, layout.output_width));
+
+    // Each affine boundary explicitly round-trips through FP64. This is not a
+    // fully FP32-resident trunk, and the measured traffic must include both casts.
+    const auto input = makeBatchedValueLayout(1, layout.rows, layout.input_width);
+    const auto output = makeBatchedValueLayout(1, layout.rows, layout.output_width);
+    checkRuntime(launchValueFp64ToFp32(queue_.getNative(), input, source, source_.data(),
+        device_diagnostics_.data()), "mixed dense activation conversion");
+    denseForwardFp32(blas_, math_mode_, layout, source_.data(), parameters_->parameters() + tensor->begin, target_.data());
+    checkRuntime(launchValueFp32ToFp64(queue_.getNative(), output, target_.data(), target,
+        device_diagnostics_.data()), "mixed dense output promotion");
+  }
+  catch (...)
+  {
+    active_ = false;
+    throw;
+  }
+}
+
+void PreparedDeviceMixedValueDense::projectSpatial(const SpatialDenseJetLayout& layout,
+                                                   const double* source, const double* weight, double* target)
+{
+  if (layout.source.mode != SpatialJetMode::VALUE_ONLY && layout.source.mode != SpatialJetMode::FULL_VGL)
+    throw std::invalid_argument("Mixed affine spatial projection supports value-only or full VGL");
+  // Treat casts as identity maps in the standard mixed-AD convention. Every
+  // coordinate gradient/trace-Laplacian plane uses the same quantized weights
+  // and explicit FP32 product as the value plane, not an unmatched FP64 affine.
+  project(makeFoldedSpatialDenseLayout(layout), source, weight, target);
+}
+
+void PreparedDeviceMixedValueDense::finishEvaluation()
+{
+  if (!active_)
+    throw std::logic_error("Mixed dense admission has no open evaluation");
+  active_ = false;
+  queue_.sync();
+  device_diagnostics_.download(&diagnostics_, 1);
+  // Keep the device-leaf library independent of the host precision-policy object
+  // (some driver test targets link these leaves without that host implementation).
+  const auto& execution = diagnostics_.execution;
+  if (execution.nonfinite_count || execution.invalid_softmax_count || execution.small_determinant_pivot_count ||
+      execution.severe_cancellation_count || execution.extreme_ecp_ratio_count ||
+      mixedConversionNeedsRetry(diagnostics_.conversion))
+    throw MixedPrecisionRetryRequired("Mixed affine evaluation requires a complete requested-graph FP64 retry");
+}
+
+void PreparedDeviceMixedValueDense::checkValueConditioning(
+    const device_determinant::FactorizationMetadata* factors,
+    const device_determinant::CombinationMetadata* combinations,
+    std::size_t configurations, std::size_t determinants)
+{
+  if (!active_ || !factors || !combinations || configurations == 0 ||
+      configurations > maximum_rows_ || determinants != modelImage()->plan().modelShape().determinants)
+    throw std::invalid_argument("Mixed value conditioning requires a live matching determinant batch");
+  mixedValueConditioningKernel<<<valueBlockCount(configurations), value_block_size, 0, queue_.getNative()>>>(
+      factors, combinations, configurations, determinants, device_diagnostics_.data());
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipPeekAtLastError(), "mixed value conditioning admission");
+#else
+  checkRuntime(cudaPeekAtLastError(), "mixed value conditioning admission");
+#endif
+}
+
+void PreparedDeviceMixedValueDense::rebindParameters(
+    std::shared_ptr<const PreparedDeviceMixedDenseParameters> successor)
+{
+  if (active_)
+    throw std::logic_error("Cannot rebind mixed parameters during an open evaluation");
+  if (!successor)
+    throw std::invalid_argument("Mixed dense successor cache is null");
+  modelImage()->validateSuccessor(successor->modelImage());
+  parameters_ = std::move(successor);
+  diagnostics_ = {};
+  statistics_ = {};
+}
+
+const std::shared_ptr<const PreparedDeviceModel>& PreparedDeviceMixedValueDense::modelImage() const noexcept
+{
+  return parameters_->modelImage();
+}
+
+std::size_t PreparedDeviceMixedValueDense::deviceWorkspaceBytes() const
+{
+  return mixedCheckedAdd(mixedCheckedAdd(checkedDeviceBytes<float>(source_.capacity()),
+      checkedDeviceBytes<float>(target_.capacity())),
+      checkedDeviceBytes<PsiFormerDeviceNumericalDiagnostics>(device_diagnostics_.capacity()));
 }
 
 } // namespace qmcplusplus::psiformer::device

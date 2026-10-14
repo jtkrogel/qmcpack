@@ -19,6 +19,7 @@
 #include "PsiFormerDeviceRuntime.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAttention.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicGeometry.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -315,11 +316,13 @@ Error launchIndependentChannelSeeds(Stream stream, const OrbitalProductReverseLa
 
 /** Build contiguous electron-ion and unordered electron-pair radii for score heads.
  * Pair labels are shared across configurations; inputs use interleaved XYZ.
+ * A supplied cell selects the CPU-equivalent torus radius, not a minimum image.
  */
 Error launchScoreGeometry(Stream stream, std::size_t configuration_count,
     std::size_t electron_count, std::size_t nucleus_count, std::size_t spin_up_count,
     const double* positions, const double* nuclei, double* ion_distances,
-    double* pair_distances, std::uint8_t* same_spin);
+    double* pair_distances, std::uint8_t* same_spin,
+    const periodic_geometry::Cell* cell = nullptr);
 
 /// Add two contiguous canonical response vectors into a distinct destination.
 Error launchAddParameterResponses(Stream stream, std::size_t count,
@@ -350,28 +353,36 @@ struct OrbitalDirectionParameters
   const double* zeta_down;
 };
 
-/** Differentiate ordinary B*E orbitals along a parameter/feature direction. */
+/** Differentiate ordinary B*E orbitals along a parameter/feature direction.
+ * The compatibility name retains open defaults; a cell selects torus envelopes.
+ */
 Error launchOpenOrbitalParameterDirection(Stream stream, const OpenOrbitalJetLayout& layout,
     const double* features, const double* feature_direction, const double* positions,
     const double* nuclei, OrbitalDirectionParameters parameters, OrbitalDirectionParameters direction,
-    const double* retained_backflow, const double* retained_envelope, double* orbital_direction);
+    const double* retained_backflow, const double* retained_envelope, double* orbital_direction,
+    const periodic_geometry::Cell* cell = nullptr);
 
-/** Contract regular determinant seeds with orbital tangents and add cusp tangents. */
+/** Contract regular determinant seeds with orbital tangents and add cusp tangents.
+ * An optional fixed cell selects the same pair radius as the forward cusp.
+ */
 Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::size_t ne,
     std::size_t determinants, std::size_t spin_up_count, const double* positions,
     const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
-    double same_alpha_direction, double opposite_alpha_direction, double* score_direction);
+    double same_alpha_direction, double opposite_alpha_direction, double* score_direction,
+    const periodic_geometry::Cell* cell = nullptr);
 
 /** Seed a weighted kinetic lifted reverse with full real-space root adjoints.
  * Inverse masses are per electron (null means one); optional total drift is
  * contiguous in lanes within a caller-specified configuration stride. Null total
  * drift uses this component's root gradient. Destinations must not alias inputs.
+ * Gradient-only mode requires explicit drift and sets every Laplacian seed to
+ * zero, providing the imaginary kinetic response of a fixed complex outer phase.
  */
 Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& root_layout,
     const double* forward_root, const double* configuration_weights,
     const double* inverse_masses, const double* total_log_gradient,
     std::size_t total_gradient_configuration_stride, double* root_adjoint,
-    OpenSpatialStatus* status);
+    OpenSpatialStatus* status, bool gradient_only = false);
 
 /** Accumulate one spin channel's ordinary envelope pi/zeta response. */
 Error launchEnvelopeParameterReverse(Stream stream,

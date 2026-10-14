@@ -86,6 +86,23 @@ public:
     return kinetic_response_;
   }
 
+  /// Return the gradient-only kinetic response for an explicit total drift.
+  /// A fixed complex outer phase supplies its imaginary drift through this lane.
+  const std::vector<double>& gradientResponse(const double* positions, const double* total_drift,
+      const double* inverse_masses, std::size_t version)
+  {
+    if (!total_drift || !inverse_masses)
+      throw std::invalid_argument("Device gradient response requires total drift and inverse masses");
+    execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, positions, version, [&]() {
+      std::copy_n(total_drift, drift_.size(), drift_.begin());
+      std::copy_n(inverse_masses, masses_.size(), masses_.begin());
+      spatial_.evaluate(positions_);
+      kinetic_.evaluateGradientResponse(spatial_, weights_, masses_, drift_);
+      kinetic_.downloadResponse(kinetic_response_);
+    });
+    return kinetic_response_;
+  }
+
   /// Apply a real parameter direction without materializing a parameter score.
   double scoreJvp(const double* positions, const std::vector<double>& direction, std::size_t version)
   {

@@ -168,6 +168,20 @@ std::size_t countEvents(const std::vector<PsiFormerPrecisionRecordEvent>& events
 
 } // namespace
 
+TEST_CASE("PsiFormer broad precision recorder rejects the dense-only numerical policy",
+          "[psiformer][precision_orchestration]")
+{
+  const auto plan = makePsiFormerPrecisionExecutionPlan(
+      PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, PsiFormerBackendMathMode::FP32_STRICT,
+      PsiFormerAcceleratorBackend::CUDA, false, 10, 4, 3, 77, 5, true);
+  PsiFormerPrecisionRecordingOrchestrator recorder(plan, makeDescriptors(), makeDiagnosticBounds());
+  CHECK_THROWS_WITH(recorder.prepare(),
+                    Catch::Matchers::ContainsSubstring("dedicated prepared value adapter"));
+  CHECK_THROWS_AS(makePsiFormerPrecisionExecutionPlan(
+      PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, PsiFormerBackendMathMode::FP64_STRICT,
+      PsiFormerAcceleratorBackend::CUDA, false, 10, 4, 3, 77, 5, true), std::invalid_argument);
+}
+
 TEST_CASE("PsiFormer mixed descriptors require one exact padded interpretation",
           "[psiformer][precision_orchestration]")
 {

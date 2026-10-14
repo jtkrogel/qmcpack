@@ -111,6 +111,8 @@ const char* psiFormerPrecisionPolicyName(PsiFormerPrecisionPolicy policy) noexce
     return "fp32_compute_fp64_reduce";
   case PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE:
     return "tf32_dense_fp64_sensitive";
+  case PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS:
+    return "fp32_dense_fp64_islands";
   }
   return "unknown";
 }
@@ -137,8 +139,11 @@ PsiFormerPrecisionPolicy parsePsiFormerPrecisionPolicy(std::string_view value)
     return PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE;
   if (value == "tf32_dense_fp64_sensitive")
     return PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE;
+  if (value == "fp32_dense_fp64_islands")
+    return PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS;
   throw std::invalid_argument(
-      "PsiFormer precision must be fp64_reference, fp32_compute_fp64_reduce, or tf32_dense_fp64_sensitive");
+      "PsiFormer precision must be fp64_reference, fp32_compute_fp64_reduce, tf32_dense_fp64_sensitive, "
+      "or fp32_dense_fp64_islands");
 }
 
 PsiFormerPrecisionRule psiFormerPrecisionRule(PsiFormerPrecisionPolicy policy,
@@ -149,6 +154,17 @@ PsiFormerPrecisionRule psiFormerPrecisionRule(PsiFormerPrecisionPolicy policy,
 
   if (policy == PsiFormerPrecisionPolicy::FP64_REFERENCE)
     return {};
+
+  // This narrower experimental route lowers only explicit affine projections.
+  // Attention contractions, nonlinearities, orbital construction and every
+  // derivative/reduction stay binary64; do not inherit the broader FP32 policy.
+  if (policy == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
+  {
+    if (operation != PsiFormerArithmeticOperation::DENSE_PROJECTION)
+      return {};
+    return {PsiFormerArithmeticPrecision::BINARY32, PsiFormerArithmeticPrecision::BINARY32,
+            PsiFormerArithmeticPrecision::BINARY32, false, false};
+  }
 
   if (lowerPrecisionDenseOperation(operation))
   {

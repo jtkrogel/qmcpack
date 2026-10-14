@@ -117,6 +117,9 @@ void validateRecordingPlan(const PsiFormerPrecisionExecutionPlan& plan)
   if (plan.policy == PsiFormerPrecisionPolicy::FP64_REFERENCE)
     throw std::invalid_argument(
         "PsiFormer mixed recording orchestrator requires a mixed precision policy");
+  if (plan.policy == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
+    throw std::invalid_argument(
+        "PsiFormer dense-only FP32 values require the dedicated prepared value adapter, not the broad recorder");
   if (plan.fingerprint == 0 || plan.device_layout_fingerprint == 0 ||
       plan.arena.fingerprint == 0 || plan.conversion.fingerprint == 0)
     throw std::invalid_argument(

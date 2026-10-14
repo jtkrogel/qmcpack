@@ -79,10 +79,12 @@ public:
   /** Contract fixed-coordinate kinetic responses with finite signed sample weights.
    * Empty masses mean unit inverse masses; empty total drift uses this component.
    * Nonempty total drift must contain all configurations' complete 3N lanes.
+   * Gradient-only mode requires explicit drift and omits the Laplacian seed;
+   * use the named wrapper for a complex outer phase's imaginary cross term.
    */
   const double* evaluate(const PreparedDeviceInference& forward, const std::vector<double>& weights,
                          const std::vector<double>& inverse_masses = {},
-                         const std::vector<double>& total_gradient = {})
+                         const std::vector<double>& total_gradient = {}, bool gradient_only = false)
   {
     ready_ = false;
     model_->validateCurrentDevice();
@@ -92,7 +94,8 @@ public:
     const auto ne = shape.electrons(), width = shape.feature_dimension;
     if (forward.modelImage().get() != model_.get() || count > capacity_ || weights.size() != count ||
         (!inverse_masses.empty() && inverse_masses.size() != ne) ||
-        (!total_gradient.empty() && total_gradient.size() != count * 3 * ne))
+        (!total_gradient.empty() && total_gradient.size() != count * 3 * ne) ||
+        (gradient_only && total_gradient.empty()))
       throw std::invalid_argument("Kinetic reverse model, capacity or input extent mismatch");
     for (const auto* values : {&weights, &inverse_masses, &total_gradient})
       for (double value : *values)
@@ -124,7 +127,7 @@ public:
       checkRuntime(launchKineticRootAdjoints(stream, root_, head.root + root_offset, weights_.data() + configuration,
           inverse_masses.empty() ? nullptr : masses_.data(),
           total_gradient.empty() ? nullptr : total_gradient_.data() + configuration * 3 * ne,
-          total_gradient.empty() ? 0 : 3 * ne, root_adjoint_.data(), open_status_.data()), "kinetic root adjoint");
+          total_gradient.empty() ? 0 : 3 * ne, root_adjoint_.data(), open_status_.data(), gradient_only), "kinetic root adjoint");
       checkOpen();
       checkRuntime(launchDeterminantFactorJets(stream, determinant,
           head.factorizations + configuration * shape.determinants, head.combinations + configuration,
@@ -152,13 +155,15 @@ public:
           parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
           head.backflow + orbital_offset, head.envelope + orbital_offset, orbital_.data(),
-          backflow_.data(), envelope_.data(), feature_.data(), response_.data(), kinetic_status()), "kinetic orbital reverse");
+          backflow_.data(), envelope_.data(), feature_.data(), response_.data(), kinetic_status(),
+          model_->periodicCell()), "kinetic orbital reverse");
       checkKinetic();
       const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
       const OpenCuspKineticReverseLayout cusp_layout{cusp_, response_.capacity(), same ? same->begin : 0,
           offset(ParameterRole::CUSP_OPPOSITE_ALPHA), same != nullptr};
       checkRuntime(launchOpenCuspKineticReverse(stream, cusp_layout, head.positions + configuration * 3 * ne,
-          model_->sameAlpha(), model_->oppositeAlpha(), root_adjoint_.data(), response_.data(), kinetic_status()),
+          model_->sameAlpha(), model_->oppositeAlpha(), root_adjoint_.data(), response_.data(), kinetic_status(),
+          model_->periodicCell()),
           "kinetic cusp reverse");
       checkKinetic();
 
@@ -217,6 +222,17 @@ public:
         throw std::runtime_error("Kinetic parameter response is nonfinite");
     ready_ = true;
     return response_.data();
+  }
+
+  /** Contract -sum_e m_e^-1 drift_e dot d_theta grad_e log|Psi|.
+   * The explicit drift can be the imaginary total TrialWaveFunction drift.
+   * This reuses the same lifted reverse/storage, with no Laplacian seed.
+   */
+  const double* evaluateGradientResponse(const PreparedDeviceInference& forward,
+      const std::vector<double>& weights, const std::vector<double>& inverse_masses,
+      const std::vector<double>& total_gradient)
+  {
+    return evaluate(forward, weights, inverse_masses, total_gradient, true);
   }
 
   /// Download a completed canonical contraction without exposing stale responses.

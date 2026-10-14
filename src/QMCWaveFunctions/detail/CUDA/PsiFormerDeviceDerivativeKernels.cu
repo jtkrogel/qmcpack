@@ -633,10 +633,32 @@ __global__ void independentChannelSeedsKernel(OrbitalProductReverseLayout layout
   adjoint[index] = weight == 0.0 ? 0.0 : weight * inverses[channel * matrix_size + column * ne + row];
 }
 
+/// Use the selected physical pair radius for envelope and cusp parameter responses.
+template<bool Periodic>
+__device__ inline double parameterGeometryRadius(const double* target, const double* source,
+    const periodic_geometry::Cell& cell)
+{
+  if constexpr (Periodic)
+  {
+    periodic_geometry::Pair pair;
+    return periodic_geometry::evaluatePair(cell, target, source, pair)
+        ? pair.radius : __longlong_as_double(0x7ff8000000000000LL);
+  }
+  double squared = 0;
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+  {
+    const double displacement = target[dimension] - source[dimension];
+    squared += displacement * displacement;
+  }
+  return std::sqrt(squared);
+}
+
 /** Generate each independent radius once; no reductions or atomics are needed. */
+template<bool Periodic>
 __global__ void scoreGeometryKernel(std::size_t batch, std::size_t ne, std::size_t nuclei_count,
     std::size_t spin_up_count, const double* positions, const double* nuclei,
-    double* ion_distances, double* pair_distances, std::uint8_t* same_spin)
+    double* ion_distances, double* pair_distances, std::uint8_t* same_spin,
+    periodic_geometry::Cell cell)
 {
   const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < batch * ne * nuclei_count)
@@ -644,14 +666,8 @@ __global__ void scoreGeometryKernel(std::size_t batch, std::size_t ne, std::size
     const auto nucleus = index % nuclei_count;
     const auto electron = (index / nuclei_count) % ne;
     const auto configuration = index / (ne * nuclei_count);
-    double squared = 0;
-    for (std::size_t dimension = 0; dimension < 3; ++dimension)
-    {
-      const double displacement = positions[(configuration * ne + electron) * 3 + dimension] -
-          nuclei[nucleus * 3 + dimension];
-      squared += displacement * displacement;
-    }
-    ion_distances[index] = std::sqrt(squared);
+    ion_distances[index] = parameterGeometryRadius<Periodic>(
+        positions + (configuration * ne + electron) * 3, nuclei + nucleus * 3, cell);
   }
   const auto pairs = ne * (ne - 1) / 2;
   if (index < batch * pairs)
@@ -665,14 +681,8 @@ __global__ void scoreGeometryKernel(std::size_t batch, std::size_t ne, std::size
       ++first;
     }
     const auto second = first + pair + 1;
-    double squared = 0;
-    for (std::size_t dimension = 0; dimension < 3; ++dimension)
-    {
-      const double displacement = positions[(configuration * ne + first) * 3 + dimension] -
-          positions[(configuration * ne + second) * 3 + dimension];
-      squared += displacement * displacement;
-    }
-    pair_distances[index] = std::sqrt(squared);
+    pair_distances[index] = parameterGeometryRadius<Periodic>(positions + (configuration * ne + first) * 3,
+        positions + (configuration * ne + second) * 3, cell);
     if (configuration == 0)
       same_spin[index] = (first < spin_up_count) == (second < spin_up_count);
   }
@@ -790,10 +800,12 @@ __global__ void attentionContextDirectionKernel(BatchedAttentionForwardLayout la
 }
 
 /** Own a full-matrix orbital tangent with the same spin-row convention as forward. */
+template<bool Periodic>
 __global__ void openOrbitalParameterDirectionKernel(OpenOrbitalJetLayout layout,
     const double* features, const double* feature_direction, const double* positions,
     const double* nuclei, OrbitalDirectionParameters parameters, OrbitalDirectionParameters direction,
-    const double* backflow, const double* envelope, double* output)
+    const double* backflow, const double* envelope, double* output,
+    periodic_geometry::Cell cell)
 {
   const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto ne = layout.features.electron_count, determinants = layout.determinant_count;
@@ -818,25 +830,22 @@ __global__ void openOrbitalParameterDirectionKernel(OpenOrbitalJetLayout layout,
   }
   for (std::size_t nucleus = 0; nucleus < layout.nucleus_count; ++nucleus)
   {
-    double squared = 0;
-    for (std::size_t dimension = 0; dimension < 3; ++dimension)
-    {
-      const double displacement = positions[(configuration * ne + electron) * 3 + dimension] -
-          nuclei[nucleus * 3 + dimension];
-      squared += displacement * displacement;
-    }
+    const double radius = parameterGeometryRadius<Periodic>(positions + (configuration * ne + electron) * 3,
+        nuclei + nucleus * 3, cell);
     const auto p = open_orbital::envelopeOffset(layout, determinant, orbital, nucleus);
-    const auto partials = device_derivative::envelopeValueAndPartials(std::sqrt(squared), pi[p], zeta[p]);
+    const auto partials = device_derivative::envelopeValueAndPartials(radius, pi[p], zeta[p]);
     e_direction += pi_direction[p] * partials.pi_partial + zeta_direction[p] * partials.zeta_partial;
   }
   output[index] = b_direction * envelope[index] + backflow[index] * e_direction;
 }
 
 /** Reduce one configuration's determinant and cusp tangent to a scalar score JVP. */
+template<bool Periodic>
 __global__ void logScoreParameterDirectionKernel(std::size_t batch, std::size_t ne,
     std::size_t determinants, std::size_t spin_up_count, const double* positions,
     const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
-    double same_direction, double opposite_direction, double* output)
+    double same_direction, double opposite_direction, double* output,
+    periodic_geometry::Cell cell)
 {
   const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (configuration >= batch)
@@ -848,16 +857,11 @@ __global__ void logScoreParameterDirectionKernel(std::size_t batch, std::size_t 
   for (std::size_t first = 0; first < ne; ++first)
     for (std::size_t second = first + 1; second < ne; ++second)
     {
-      double squared = 0;
-      for (std::size_t dimension = 0; dimension < 3; ++dimension)
-      {
-        const double displacement = positions[(configuration * ne + first) * 3 + dimension] -
-            positions[(configuration * ne + second) * 3 + dimension];
-        squared += displacement * displacement;
-      }
+      const double radius = parameterGeometryRadius<Periodic>(positions + (configuration * ne + first) * 3,
+          positions + (configuration * ne + second) * 3, cell);
       const bool same = (first < spin_up_count) == (second < spin_up_count);
       const double alpha_direction = same ? same_direction : opposite_direction;
-      sum += alpha_direction * device_derivative::cuspValueAndAlphaPartial(std::sqrt(squared),
+      sum += alpha_direction * device_derivative::cuspValueAndAlphaPartial(radius,
           same ? same_alpha : opposite_alpha, same ? 0.25 : 0.5).alpha_partial;
     }
   output[configuration] = sum;
@@ -866,7 +870,7 @@ __global__ void logScoreParameterDirectionKernel(std::size_t batch, std::size_t 
 /** Own one complete kinetic root seed, rejecting invalid inputs before publication. */
 __global__ void kineticRootAdjointsKernel(SpatialJetLayout layout, const double* forward_root,
     const double* weights, const double* inverse_masses, const double* total_gradient,
-    std::size_t gradient_stride, double* output, OpenSpatialStatus* status)
+    std::size_t gradient_stride, double* output, OpenSpatialStatus* status, bool gradient_only)
 {
   const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (configuration >= layout.configuration_count)
@@ -900,7 +904,9 @@ __global__ void kineticRootAdjointsKernel(SpatialJetLayout layout, const double*
         return;
       output[offset] = seed;
     }
-    const double laplacian_seed = -0.5 * weight * mass;
+    // A fixed complex outer phase contributes only through the total imaginary
+    // drift. Its parameter response has no log-Laplacian derivative seed.
+    const double laplacian_seed = gradient_only ? 0.0 : -0.5 * weight * mass;
     if (!device_math::isFiniteBinary64(laplacian_seed))
       return;
     output[layout.uncheckedLaplacianOffset(configuration, electron, 0)] = laplacian_seed;
@@ -1437,8 +1443,11 @@ Error launchIndependentChannelSeeds(Stream stream, const OrbitalProductReverseLa
 
 Error launchScoreGeometry(Stream stream, std::size_t batch, std::size_t ne,
     std::size_t nuclei_count, std::size_t spin_up_count, const double* positions,
-    const double* nuclei, double* ion_distances, double* pair_distances, std::uint8_t* same_spin)
+    const double* nuclei, double* ion_distances, double* pair_distances, std::uint8_t* same_spin,
+    const periodic_geometry::Cell* cell)
 {
+  if (cell)
+    periodic_geometry::validateCell(*cell);
   if (batch == 0 || ne == 0 || nuclei_count == 0 || spin_up_count > ne)
     throw std::invalid_argument("Score geometry dimensions are invalid");
   const auto pairs = checkedProduct(ne, ne - 1, "Score pair count overflow") / 2;
@@ -1447,9 +1456,13 @@ Error launchScoreGeometry(Stream stream, std::size_t batch, std::size_t ne,
   const auto pair_count = checkedProduct(batch, pairs, "Score pair extent overflow");
   if (!positions || !nuclei || !ion_distances || (pairs != 0 && (!pair_distances || !same_spin)))
     throw std::invalid_argument("Score geometry storage is null");
-  scoreGeometryKernel<<<blockCount(ion_count > pair_count ? ion_count : pair_count,
-      "Score geometry grid too large"), derivative_block_size, 0, stream>>>(
-      batch, ne, nuclei_count, spin_up_count, positions, nuclei, ion_distances, pair_distances, same_spin);
+  const auto blocks = blockCount(ion_count > pair_count ? ion_count : pair_count, "Score geometry grid too large");
+  if (cell)
+    scoreGeometryKernel<true><<<blocks, derivative_block_size, 0, stream>>>(batch, ne, nuclei_count,
+        spin_up_count, positions, nuclei, ion_distances, pair_distances, same_spin, *cell);
+  else
+    scoreGeometryKernel<false><<<blocks, derivative_block_size, 0, stream>>>(batch, ne, nuclei_count,
+        spin_up_count, positions, nuclei, ion_distances, pair_distances, same_spin, periodic_geometry::Cell{});
   return peekAtLastError();
 }
 
@@ -1572,8 +1585,11 @@ Error launchAttentionParameterDirection(Stream stream, const BatchedAttentionFor
 Error launchOpenOrbitalParameterDirection(Stream stream, const OpenOrbitalJetLayout& layout,
     const double* features, const double* feature_direction, const double* positions,
     const double* nuclei, OrbitalDirectionParameters parameters, OrbitalDirectionParameters direction,
-    const double* retained_backflow, const double* retained_envelope, double* orbital_direction)
+    const double* retained_backflow, const double* retained_envelope, double* orbital_direction,
+    const periodic_geometry::Cell* cell)
 {
+  if (cell)
+    periodic_geometry::validateCell(*cell);
   validateOpenOrbitalJetLayout(layout);
   if (layout.features.mode != SpatialJetMode::VALUE_ONLY || layout.position_row_stride != 3 ||
       layout.position_configuration_stride != 3 * layout.features.electron_count || layout.nucleus_row_stride != 3)
@@ -1585,39 +1601,55 @@ Error launchOpenOrbitalParameterDirection(Stream stream, const OpenOrbitalJetLay
         (layout.spin_up_count != layout.features.electron_count &&
           (!pointers.backflow_down || !pointers.pi_down || !pointers.zeta_down)))
       throw std::invalid_argument("Orbital parameter direction intervals are null");
-  openOrbitalParameterDirectionKernel<<<blockCount(openOrbitalElementCount(layout), "Orbital direction grid too large"),
-      derivative_block_size, 0, stream>>>(layout, features, feature_direction, positions, nuclei,
-      parameters, direction, retained_backflow, retained_envelope, orbital_direction);
+  const auto blocks = blockCount(openOrbitalElementCount(layout), "Orbital direction grid too large");
+  if (cell)
+    openOrbitalParameterDirectionKernel<true><<<blocks, derivative_block_size, 0, stream>>>(layout,
+        features, feature_direction, positions, nuclei, parameters, direction, retained_backflow,
+        retained_envelope, orbital_direction, *cell);
+  else
+    openOrbitalParameterDirectionKernel<false><<<blocks, derivative_block_size, 0, stream>>>(layout,
+        features, feature_direction, positions, nuclei, parameters, direction, retained_backflow,
+        retained_envelope, orbital_direction, periodic_geometry::Cell{});
   return peekAtLastError();
 }
 
 Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::size_t ne,
     std::size_t determinants, std::size_t spin_up_count, const double* positions,
     const double* matrix_seeds, const double* orbital_direction, double same_alpha, double opposite_alpha,
-    double same_alpha_direction, double opposite_alpha_direction, double* score_direction)
+    double same_alpha_direction, double opposite_alpha_direction, double* score_direction,
+    const periodic_geometry::Cell* cell)
 {
+  if (cell)
+    periodic_geometry::validateCell(*cell);
   if (batch == 0 || ne == 0 || determinants == 0 || spin_up_count > ne ||
       !positions || !matrix_seeds || !orbital_direction || !score_direction)
     throw std::invalid_argument("Log score parameter direction dimensions/storage are invalid");
   (void)checkedProduct(checkedProduct(checkedProduct(batch, determinants, "Score direction batch overflow"),
       ne, "Score direction matrix overflow"), ne, "Score direction matrix overflow");
-  logScoreParameterDirectionKernel<<<blockCount(batch, "Score direction grid too large"),
-      derivative_block_size, 0, stream>>>(batch, ne, determinants, spin_up_count, positions,
-      matrix_seeds, orbital_direction, same_alpha, opposite_alpha, same_alpha_direction, opposite_alpha_direction, score_direction);
+  const auto blocks = blockCount(batch, "Score direction grid too large");
+  if (cell)
+    logScoreParameterDirectionKernel<true><<<blocks, derivative_block_size, 0, stream>>>(batch, ne,
+        determinants, spin_up_count, positions, matrix_seeds, orbital_direction, same_alpha, opposite_alpha,
+        same_alpha_direction, opposite_alpha_direction, score_direction, *cell);
+  else
+    logScoreParameterDirectionKernel<false><<<blocks, derivative_block_size, 0, stream>>>(batch, ne,
+        determinants, spin_up_count, positions, matrix_seeds, orbital_direction, same_alpha, opposite_alpha,
+        same_alpha_direction, opposite_alpha_direction, score_direction, periodic_geometry::Cell{});
   return peekAtLastError();
 }
 
 Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& layout,
     const double* forward_root, const double* weights, const double* inverse_masses,
     const double* total_gradient, std::size_t gradient_stride,
-    double* root_adjoint, OpenSpatialStatus* status)
+    double* root_adjoint, OpenSpatialStatus* status, bool gradient_only)
 {
   if (layout.configuration_count == 0)
     return success;
   validateSpatialJetLayout(layout);
   if (layout.mode != SpatialJetMode::FULL_VGL || layout.element_count != 1 ||
       !forward_root || !weights || !root_adjoint || !status ||
-      (total_gradient ? gradient_stride < layout.gradient_lanes : gradient_stride != 0))
+      (total_gradient ? gradient_stride < layout.gradient_lanes : gradient_stride != 0) ||
+      (gradient_only && !total_gradient))
     throw std::invalid_argument("Kinetic root adjoint layout/storage/drift stride is invalid");
   for (const auto* source : {forward_root, weights, inverse_masses, total_gradient})
     if (root_adjoint == source)
@@ -1627,7 +1659,7 @@ Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& layout,
                       "Total kinetic drift extent overflow");
   kineticRootAdjointsKernel<<<blockCount(layout.configuration_count, "Kinetic root adjoint grid too large"),
       derivative_block_size, 0, stream>>>(layout, forward_root, weights, inverse_masses,
-      total_gradient, gradient_stride, root_adjoint, status);
+      total_gradient, gradient_stride, root_adjoint, status, gradient_only);
   return peekAtLastError();
 }
 

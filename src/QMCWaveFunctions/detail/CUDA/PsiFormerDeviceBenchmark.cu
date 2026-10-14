@@ -32,6 +32,8 @@ struct BenchmarkOptions
 {
   std::size_t walkers = 3, repetitions = 5;
   std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
+  bool mixed_values = false;
+  bool mixed_vgl = false;
 };
 
 /// Read only explicit positive sizes; reject trailing/unknown command-line text.
@@ -53,12 +55,17 @@ int main(int argc, char** argv)
   {
     if (argc < 4)
       throw std::invalid_argument("Usage: benchmark parameters.h5 configurations.h5 report.csv "
-                                  "[--walkers N] [--repetitions R] [--shape D WIDTH HEADS BLOCKS]");
+                                  "[--walkers N] [--repetitions R] [--shape D WIDTH HEADS BLOCKS] "
+                                  "[--mixed-values] [--mixed-vgl]");
     BenchmarkOptions options;
     for (int argument = 4; argument < argc; ++argument)
     {
       const std::string flag(argv[argument]);
-      if (flag == "--walkers" && argument + 1 < argc)
+      if (flag == "--mixed-values")
+        options.mixed_values = true;
+      else if (flag == "--mixed-vgl")
+        options.mixed_vgl = true;
+      else if (flag == "--walkers" && argument + 1 < argc)
         options.walkers = readSize(argv[++argument]);
       else if (flag == "--repetitions" && argument + 1 < argc)
         options.repetitions = readSize(argv[++argument]);
@@ -101,6 +108,45 @@ int main(int argc, char** argv)
     PreparedDeviceKineticReverse kinetic(image, options.walkers, queue, blas);
     queue.sync();
     const double prepare_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - prepare_start).count();
+    // Extra precision caches/graphs are opt-in, and their complete cold cost is
+    // separate from the established all-FP64 benchmark pack preparation.
+    std::unique_ptr<PreparedDeviceMixedValueInference> mixed;
+    std::unique_ptr<PreparedDeviceMixedInference> mixed_spatial;
+    double mixed_prepare_seconds = 0;
+    std::size_t mixed_pack_bytes = 0, mixed_parameter_cache_bytes = 0, mixed_retry_calls = 0;
+    double mixed_vgl_prepare_seconds = 0;
+    std::size_t mixed_vgl_pack_bytes = 0, mixed_vgl_parameter_cache_bytes = 0;
+    if (options.mixed_values)
+    {
+      const auto mixed_start = std::chrono::steady_clock::now();
+      mixed = std::make_unique<PreparedDeviceMixedValueInference>(image, options.walkers, queue, blas);
+      queue.sync();
+      mixed_prepare_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mixed_start).count();
+      mixed_pack_bytes = mixed->deviceWorkspaceBytes();
+      // This cache preserves canonical offsets; sensitive entries are unused,
+      // but the complete reserved array must still be charged to device memory.
+      mixed_parameter_cache_bytes = mixed_pack_bytes == value.deviceWorkspaceBytes()
+          ? 0 : checkedDeviceBytes<float>(plan.parameterCount());
+      std::cout << "Mixed-value experiment: additional_pack_bytes=" << mixed_pack_bytes
+                << " parameter_cache_bytes=" << mixed_parameter_cache_bytes
+                << " cache_and_graph_prepare_seconds=" << mixed_prepare_seconds
+                << "; all rows' live_bytes include every prepared FP64/mixed graph" << '\n';
+    }
+    if (options.mixed_vgl)
+    {
+      const auto mixed_start = std::chrono::steady_clock::now();
+      mixed_spatial = std::make_unique<PreparedDeviceMixedInference>(
+          image, options.walkers, queue, blas, SpatialJetMode::FULL_VGL);
+      queue.sync();
+      mixed_vgl_prepare_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mixed_start).count();
+      mixed_vgl_pack_bytes = mixed_spatial->deviceWorkspaceBytes();
+      mixed_vgl_parameter_cache_bytes = mixed_vgl_pack_bytes == spatial.deviceWorkspaceBytes()
+          ? 0 : checkedDeviceBytes<float>(plan.parameterCount());
+      std::cout << "Matched mixed-VGL experiment: additional_pack_bytes=" << mixed_vgl_pack_bytes
+                << " parameter_cache_bytes=" << mixed_vgl_parameter_cache_bytes
+                << " cache_and_graph_prepare_seconds=" << mixed_vgl_prepare_seconds
+                << "; every spatial plane uses the selected affine precision" << '\n';
+    }
     int device_ordinal = -1;
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipGetDevice(&device_ordinal), "benchmark hipGetDevice");
@@ -122,10 +168,22 @@ int main(int argc, char** argv)
       value.evaluate(positions);
       value.downloadResults(phases, logs, empty_ratios);
     });
+    if (mixed)
+      operations.emplace_back("mixed_value", [&]() {
+        mixed->evaluate(positions);
+        mixed->downloadResults(phases, logs, empty_ratios);
+        mixed_retry_calls += mixed->usedFp64Retry();
+      });
     operations.emplace_back("vgl", [&]() {
       spatial.evaluate(positions);
       spatial.downloadResults(phases, jets, ratios);
     });
+    if (mixed_spatial)
+      operations.emplace_back("mixed_vgl", [&]() {
+        mixed_spatial->evaluate(positions);
+        mixed_spatial->downloadResults(phases, jets, ratios);
+        mixed_retry_calls += mixed_spatial->usedFp64Retry();
+      });
     operations.emplace_back("score_vjp", [&]() {
       value_tape.evaluate(positions);
       score.reverse(value_tape, weights);
@@ -152,12 +210,16 @@ int main(int argc, char** argv)
       throw std::runtime_error("Cannot open benchmark report");
     report << "operation,walkers,repetitions,prepare_seconds,min_seconds,median_seconds,"
               "allocation_calls,free_calls,live_bytes,peak_bytes,upload_calls,uploaded_bytes,"
-              "download_calls,downloaded_bytes\n";
+              "download_calls,downloaded_bytes,mixed_cache_and_graph_prepare_seconds,"
+              "mixed_pack_bytes,mixed_parameter_cache_bytes,mixed_retry_calls,"
+              "mixed_projections_per_eval,mixed_input_cast_elements_per_eval,"
+              "mixed_output_cast_elements_per_eval,mixed_cast_roundtrip_bytes_per_eval\n";
     report << std::setprecision(17);
     for (const auto& operation : operations)
     {
       operation.second();
       queue.sync();
+      mixed_retry_calls = 0;
       metrics.resetInterval();
       std::vector<double> timings;
       timings.reserve(options.repetitions);
@@ -179,10 +241,28 @@ int main(int argc, char** argv)
              << prepare_seconds << ',' << timings.front() << ',' << median << ',' << memory.allocation_calls << ','
              << memory.free_calls << ',' << memory.live_bytes << ',' << memory.peak_bytes << ','
              << memory.upload_calls << ',' << memory.uploaded_bytes << ','
-             << memory.download_calls << ',' << memory.downloaded_bytes << '\n';
+             << memory.download_calls << ',' << memory.downloaded_bytes;
+      const bool is_mixed = operation.first == "mixed_value" || operation.first == "mixed_vgl";
+      const auto* measured_mixed = operation.first == "mixed_vgl" ? mixed_spatial.get() : mixed.get();
+      if (is_mixed)
+      {
+        const auto& casts = measured_mixed->statistics();
+        report << ',' << (operation.first == "mixed_vgl" ? mixed_vgl_prepare_seconds : mixed_prepare_seconds)
+               << ',' << (operation.first == "mixed_vgl" ? mixed_vgl_pack_bytes : mixed_pack_bytes)
+               << ',' << (operation.first == "mixed_vgl" ? mixed_vgl_parameter_cache_bytes : mixed_parameter_cache_bytes)
+               << ',' << mixed_retry_calls << ',' << casts.projections << ',' << casts.input_cast_elements
+               << ',' << casts.output_cast_elements << ',' << casts.roundTripBytes();
+      }
+      else
+        report << ",0,0,0,0,0,0,0,0";
+      report << '\n';
       report.flush();
       std::cout << "PASS " << operation.first << ": walkers=" << options.walkers
                 << " median_seconds=" << median << " owned_allocations=0 live_device_bytes=" << memory.live_bytes << '\n';
+      if (is_mixed)
+        std::cout << "  explicit whole-graph FP64 retries=" << mixed_retry_calls << '/' << options.repetitions
+                  << " cast_roundtrip_bytes_per_eval=" << measured_mixed->statistics().roundTripBytes()
+                  << " last_retry_reason=" << measured_mixed->retryReason() << '\n';
     }
     return 0;
   }

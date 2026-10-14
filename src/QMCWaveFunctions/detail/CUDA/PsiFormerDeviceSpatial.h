@@ -74,6 +74,11 @@ Error launchOpenFeatureJets(Stream stream,
                             double* output,
                             OpenSpatialStatus* status);
 
+/// Build smooth-torus feature jets with seven inputs per nucleus plus spin.
+Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status);
+
 Error launchBiasTanhJets(Stream stream,
                          const SpatialElementwiseJetLayout& layout,
                          const double* input,
@@ -97,6 +102,12 @@ Error launchOpenCuspJets(Stream stream,
                          double opposite_spin_alpha,
                          double* output,
                          OpenSpatialStatus* status);
+
+/// Build periodic radial cusp jets, including the non-Euclidean radial trace rule.
+Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    double* output, OpenSpatialStatus* status);
 
 Error launchFinalSpatialCombination(
     Stream stream,
@@ -131,6 +142,15 @@ Error launchOpenOrbitalJets(Stream stream,
                             OpenSpatialStatus* status,
                             double* retained_backflow = nullptr,
                             double* retained_envelope = nullptr);
+
+/// Build real Gamma-periodic orbital jets and optional retained product factors.
+Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* features,
+    const double* positions, const double* nuclei, const double* backflow_up,
+    const double* backflow_down, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status,
+    double* retained_backflow = nullptr, double* retained_envelope = nullptr);
 
 } // namespace qmcplusplus::psiformer::device
 

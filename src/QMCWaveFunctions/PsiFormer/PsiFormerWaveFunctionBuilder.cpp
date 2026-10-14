@@ -66,8 +66,7 @@ psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
 psiformer::PsiFormerAcceleratorResolution resolveAcceleratorRequest(
     const std::string& request,
     const PsiFormerAcceleratorReadinessProvider* readiness_provider,
-    psiformer::PsiFormerAcceleratorOperationMask required_operations,
-    bool open_boundary)
+    psiformer::PsiFormerAcceleratorOperationMask required_operations)
 {
   const std::string normalized = normalizedAcceleratorRequest(request);
   if (normalized.empty() || normalized == "no" || normalized == "cpu")
@@ -82,11 +81,9 @@ psiformer::PsiFormerAcceleratorResolution resolveAcceleratorRequest(
   psiformer::PsiFormerAcceleratorReadiness readiness = readiness_provider
       ? readiness_provider->inspect()
       : inspectProductionAcceleratorReadiness();
-  if (!open_boundary)
-  {
-    readiness.cuda.operation_coverage = 0;
-    readiness.hip.operation_coverage = 0;
-  }
+  // Both open Euclidean and fully periodic torus real cores are implemented.
+  // Geometry metadata and fixed outer-twist ownership are validated below;
+  // arbitrary complex neural weights and partial periodicity remain unsupported.
   return psiformer::resolvePsiFormerAcceleratorRequest(normalized, readiness, required_operations);
 }
 
@@ -207,7 +204,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
       resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
           optimization_enabled ? psiformer::allPsiFormerAcceleratorOperations()
-                               : psiformer::psiFormerAcceleratorInferenceOperations(), !periodic);
+                               : psiformer::psiFormerAcceleratorInferenceOperations());
   if (accelerator_readiness_provider_ && accelerator_resolution.backend !=
       psiformer::PsiFormerAcceleratorBackend::CPU)
     throw std::runtime_error(

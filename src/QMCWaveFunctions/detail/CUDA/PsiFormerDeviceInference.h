@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerDeviceInference.h
- * @brief Prepared FP64 open-real forward/VGL graph and opt-in value reverse tape.
+ * @brief Prepared FP64 forward/VGL graph, optional mixed affine planes and reverse tapes.
  *
  * This chains actual CUDA/HIP leaves for a complete imported model. It is not
  * itself a publication owner: the production crowd adapter binds it to the
@@ -23,14 +23,17 @@
 #include "PsiFormerDeviceSpatial.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
+#include "PsiFormerDeviceMixedValueDense.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerFoldedDense.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPeriodicGeometry.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -124,11 +127,17 @@ public:
       : plan_(plan)
   {
     const auto& environment = plan_.environment();
-    if (environment.boundary != BoundaryCondition::OPEN ||
+    if ((environment.boundary != BoundaryCondition::OPEN && environment.boundary != BoundaryCondition::PERIODIC) ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
-      throw std::invalid_argument("Device model supports fixed-ion open-real FP64 models only");
+      throw std::invalid_argument("Device model supports fixed-ion real FP64 models only");
+    if (environment.boundary == BoundaryCondition::PERIODIC)
+    {
+      if (environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1)
+        throw std::invalid_argument("Periodic device metadata requires the torus-v1 feature policy");
+      periodic_cell_ = periodic_geometry::makeCell(environment.lattice_vectors, environment.periodic_axes);
+    }
     if (nuclei.size() != spatial_detail::checkedProduct(3, plan_.modelShape().nuclei, "Device nuclear extent overflow"))
       throw std::invalid_argument("Device nuclear extent mismatch");
     if (std::any_of(nuclei.begin(), nuclei.end(), [](double value) { return !device_math::isFiniteBinary64(value); }))
@@ -164,6 +173,10 @@ public:
   /// Return fixed-ion storage shared by all versions in this immutable family.
   const double* nuclei() const noexcept { return nuclei_.data(); }
 
+  /// Return immutable validated torus coefficients, or null for open geometry.
+  const periodic_geometry::Cell* periodicCell() const noexcept
+  { return periodic_cell_ ? &*periodic_cell_ : nullptr; }
+
   /// Account shared geometry once, separately from parameter-version allocations.
   std::size_t deviceStorageBytes() const { return checkedDeviceBytes<double>(nuclei_.capacity()); }
 
@@ -171,6 +184,7 @@ private:
   PsiFormerExecutionPlan plan_;
   int device_ = -1;
   DeviceBuffer<double> nuclei_;
+  std::optional<periodic_geometry::Cell> periodic_cell_;
 };
 
 /** Own one immutable canonical parameter image within a shared metadata family.
@@ -224,6 +238,9 @@ public:
 
   /// Return fixed-ion geometry stored once per shared image.
   const double* nuclei() const noexcept { return metadata_->nuclei(); }
+
+  /// Expose immutable torus geometry to periodic numerical leaves; open models return null.
+  const periodic_geometry::Cell* periodicCell() const noexcept { return metadata_->periodicCell(); }
 
   /// Supply the host scalar needed by the cusp launch, not a per-evaluation copy.
   double sameAlpha() const noexcept { return same_alpha_; }
@@ -384,14 +401,16 @@ public:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
-    if (batch_ == 0 || environment.boundary != BoundaryCondition::OPEN ||
+    if (batch_ == 0 ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
-      throw std::invalid_argument("Device inference validation supports fixed-ion open-real FP64 models only");
+      throw std::invalid_argument("Device inference supports fixed-ion real FP64 models only");
     ne_ = shape_.electrons();
     const std::size_t width = shape_.feature_dimension;
-    features_ = makeOpenFeatureJetLayout(batch_, ne_, shape_.nuclei, shape_.spin_up_electrons, mode_);
+    features_ = model_->periodicCell()
+        ? makePeriodicFeatureJetLayout(batch_, ne_, shape_.nuclei, shape_.spin_up_electrons, mode_)
+        : makeOpenFeatureJetLayout(batch_, ne_, shape_.nuclei, shape_.spin_up_electrons, mode_);
     const auto& embedding = plan_.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
     if (embedding.shape[0] != features_.feature_width)
       throw std::invalid_argument("Device inference feature contract mismatch");
@@ -485,10 +504,15 @@ public:
     positions_.upload(positions.data(), positions.size());
     const auto stream = queue_.getNative();
     resetStatusAdmission();
+    MixedValueAttempt mixed_attempt(mixed_dense_.get(), model_);
 
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
-    checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), model_->nuclei(),
-                                       active_.data(), raw_.data(), open_status_.data()), "model feature VGL");
+    if (const auto* cell = model_->periodicCell())
+      checkRuntime(launchPeriodicFeatureJets(stream, features_, *cell, positions_.data(), model_->nuclei(),
+          active_.data(), raw_.data(), open_status_.data()), "model periodic feature VGL");
+    else
+      checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), model_->nuclei(),
+          active_.data(), raw_.data(), open_status_.data()), "model open feature VGL");
     checkOpen(batch_);
     project(embedding_, raw_.data(), parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT), a_.data());
 
@@ -538,13 +562,22 @@ public:
     admitStatus();
 
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
-    checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
+    if (const auto* cell = model_->periodicCell())
+      checkRuntime(launchPeriodicOrbitalJets(stream, orbitals_, *cell, a_.data(), positions_.data(), model_->nuclei(),
+          parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
+          parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
+          parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
+          active_.data(), orbital_jets_.data(), open_status_.data(),
+          value_tape_.empty() ? nullptr : retained_backflow_.data(),
+          value_tape_.empty() ? nullptr : retained_envelope_.data()), "model periodic orbital VGL");
+    else
+      checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
         parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
         active_.data(), orbital_jets_.data(), open_status_.data(),
         value_tape_.empty() ? nullptr : retained_backflow_.data(),
-        value_tape_.empty() ? nullptr : retained_envelope_.data()), "model orbital VGL");
+          value_tape_.empty() ? nullptr : retained_envelope_.data()), "model open orbital VGL");
     checkOpen(product(batch_, matrices_per_configuration_));
 
     // Pack existing jet planes into the contiguous determinant ABI, without host math.
@@ -569,12 +602,14 @@ public:
     // output planes; nodal values remain defined even when log derivatives are not.
     if (mode_ == SpatialJetMode::VALUE_ONLY)
     {
-      checkRuntime(launchOpenCuspJets(stream, cusp_, positions_.data(), active_.data(),
-          model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()), "model cusp values");
+      evaluateCusp();
       checkOpen(batch_);
       checkRuntime(launchFinalValueCombination(stream, batch_, combinations_.data(), cusp_jets_.data(),
           phase_.data(), output_.data(), open_status_.data()), "model final values");
       checkOpen(batch_);
+      if (mixed_dense_)
+        mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
+      mixed_attempt.finish();
       value_tape_valid_ = !value_tape_.empty();
       result_valid_ = true;
       return;
@@ -583,13 +618,15 @@ public:
     checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
         normalized_.data(), inverse_.data(), gradients_.data(), laplacians_.data(), matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
-    checkRuntime(launchOpenCuspJets(stream, cusp_, positions_.data(), active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
-                                    cusp_jets_.data(), open_status_.data()), "model cusp VGL");
+    evaluateCusp();
     checkOpen(batch_);
     checkRuntime(launchFinalSpatialCombination(stream, final_, combinations_.data(), det_status_.data(),
         det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), phase_.data(), output_.data(),
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
+    if (mixed_dense_)
+      mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
+    mixed_attempt.finish();
     value_tape_valid_ = !value_tape_.empty();
     result_valid_ = true;
   }
@@ -604,6 +641,29 @@ public:
 
   /// Report the graph's preparation-time or explicitly selected diagnostic policy.
   InferenceStatusPolicy statusPolicy() const noexcept { return status_policy_; }
+
+  /** Opt into matched approximate affine value/VGL planes; reverse tapes remain rejected.
+   * Production dispatch never attaches this experimental numerical adapter implicitly. */
+  void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
+  {
+    if (adapter && (!value_tape_.empty() || plan_.environment().boundary != BoundaryCondition::OPEN))
+      throw std::invalid_argument("Mixed affine inference does not admit reverse tapes or periodic geometry");
+    if (adapter && adapter->modelImage().get() != model_.get())
+      throw std::invalid_argument("Mixed affine adapter has a stale or foreign parameter image");
+    if (adapter && adapter->maximumRows() < product(product(batch_capacity_, ne_), dense_.source.plane_count))
+      throw std::invalid_argument("Mixed affine adapter cannot hold every requested spatial plane");
+    mixed_dense_ = std::move(adapter);
+    value_tape_valid_ = false;
+    result_valid_ = false;
+  }
+
+  /// Retain strict value-only attachment for callers of the original experimental API.
+  void setMixedValueDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
+  {
+    if (adapter && mode_ != SpatialJetMode::VALUE_ONLY)
+      throw std::invalid_argument("Value-only mixed adapter cannot attach to a VGL graph");
+    setMixedDense(std::move(adapter));
+  }
 
   /// Download signed-log amplitude, complete log-gradient/log-Laplacian jets and lap ratios.
   void downloadResults(std::vector<double>& phases, std::vector<double>& jets, std::vector<double>& ratios) const
@@ -632,6 +692,8 @@ public:
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
   {
     model_->validateSuccessor(successor);
+    if (mixed_dense_ && mixed_dense_->modelImage().get() != successor.get())
+      throw std::invalid_argument("Rebind the prepared mixed affine cache before replacing its graph image");
     model_ = std::move(successor);
     value_tape_valid_ = false;
     result_valid_ = false;
@@ -795,6 +857,34 @@ public:
   }
 
 private:
+  /** Cancel adapter state on every graph exit, including an early physical failure. */
+  struct MixedValueAttempt
+  {
+    PreparedDeviceMixedValueDense* adapter;
+
+    /// Open the attempt only after graph geometry/capacity admission.
+    MixedValueAttempt(PreparedDeviceMixedValueDense* selected,
+                      const std::shared_ptr<const PreparedDeviceModel>& image) : adapter(selected)
+    {
+      if (adapter)
+        adapter->beginEvaluation(image);
+    }
+
+    /// Failed partial arithmetic cannot keep an adapter transaction open.
+    ~MixedValueAttempt()
+    {
+      if (adapter)
+        adapter->cancelEvaluation();
+    }
+
+    /// Admit numerical diagnostics before the owning graph publishes its value.
+    void finish()
+    {
+      if (adapter)
+        adapter->finishEvaluation();
+    }
+  };
+
   /// Restrict all launches to a compact live prefix without resizing any buffers.
   void setBatchCount(std::size_t count)
   {
@@ -826,11 +916,27 @@ private:
    * The same affine weight acts independently on every jet plane. No mathematical
    * coupling crosses configurations; only the BLAS row dimension is enlarged.
    */
+  /// Evaluate the same physical cusp geometry used by feature and orbital layers.
+  void evaluateCusp()
+  {
+    if (const auto* cell = model_->periodicCell())
+      checkRuntime(launchPeriodicCuspJets(queue_.getNative(), cusp_, *cell, positions_.data(), active_.data(),
+          model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
+          "model periodic cusp");
+    else
+      checkRuntime(launchOpenCuspJets(queue_.getNative(), cusp_, positions_.data(), active_.data(),
+          model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()),
+          "model open cusp");
+  }
+
+  /// Apply a prepared affine projection under the explicitly selected compute policy.
   void project(const SpatialDenseJetLayout& layout, const double* source,
                const double* weight, double* target)
   {
-    const auto folded = makeFoldedSpatialDenseLayout(layout);
-    denseForward(blas_, folded, source, weight, target);
+    if (mixed_dense_)
+      mixed_dense_->projectSpatial(layout, source, weight, target);
+    else
+      denseForward(blas_, makeFoldedSpatialDenseLayout(layout), source, weight, target);
   }
 
   /// Reset ordered sticky diagnostics for this attempt before any numerical launch.
@@ -957,6 +1063,7 @@ private:
   }
 
   std::shared_ptr<const PreparedDeviceModel> model_;
+  std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
   const PsiFormerExecutionPlan& plan_;
   ModelShape shape_;
   std::size_t batch_;
@@ -995,6 +1102,134 @@ private:
   bool result_valid_ = false;
   std::size_t evaluation_generation_ = 0;
 };
+
+/** Explicit matched approximate value/VGL with whole-request FP64 replay.
+ * Spatial planes follow the standard mixed-AD convention; reverse tapes remain unavailable. */
+class PreparedDeviceMixedInference
+{
+public:
+  /// Prepare both routes up front; parameter conversion hazards may select FP64-only operation.
+  PreparedDeviceMixedInference(std::shared_ptr<const PreparedDeviceModel> model, std::size_t capacity,
+                                    compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
+                                    SpatialJetMode mode = SpatialJetMode::VALUE_ONLY,
+                                    bool allow_fp64_retry = true)
+      : reference_(model, capacity, queue, blas, mode), allow_retry_(allow_fp64_retry)
+  {
+    try
+    {
+      parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(model, queue);
+      adapter_ = std::make_shared<PreparedDeviceMixedValueDense>(parameters_,
+          spatial_detail::checkedProduct(spatial_detail::checkedProduct(capacity,
+              model->plan().modelShape().electrons(), "Mixed row overflow"),
+              reference_.resultLayout().plane_count, "Mixed spatial row overflow"),
+          queue, blas);
+      approximate_ = std::make_unique<PreparedDeviceInference>(model, capacity, queue, blas, mode);
+      approximate_->setMixedDense(adapter_);
+    }
+    catch (const MixedPrecisionRetryRequired& error)
+    {
+      if (!allow_retry_)
+        throw;
+      preparation_retry_reason_ = error.what();
+    }
+  }
+
+  /// Preserve the original value-only retry-control constructor without an implicit mode conversion.
+  PreparedDeviceMixedInference(std::shared_ptr<const PreparedDeviceModel> model, std::size_t capacity,
+                                compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas,
+                                bool allow_fp64_retry)
+      : PreparedDeviceMixedInference(std::move(model), capacity, queue, blas,
+                                    SpatialJetMode::VALUE_ONLY, allow_fp64_retry)
+  {}
+
+  /// Admit a complete approximate request or replay the same coordinates wholly in FP64.
+  void evaluate(const std::vector<double>& positions)
+  {
+    selected_ = nullptr;
+    used_retry_ = false;
+    retry_reason_.clear();
+    if (approximate_)
+    {
+      try
+      {
+        approximate_->evaluate(positions);
+        selected_ = approximate_.get();
+        return;
+      }
+      catch (const MixedPrecisionRetryRequired& error)
+      {
+        if (!allow_retry_)
+          throw;
+        retry_reason_ = error.what();
+      }
+      catch (const InferenceStatusError& error)
+      {
+        // Geometry failure is not a precision issue. Later numerical failures
+        // may be mixed overflow; the reference replay must independently admit them.
+        if (!allow_retry_ || error.stage() == 0)
+          throw;
+        retry_reason_ = error.what();
+      }
+    }
+    else
+      retry_reason_ = preparation_retry_reason_;
+    used_retry_ = true;
+    reference_.evaluate(positions);
+    selected_ = &reference_;
+  }
+
+  /// Copy only a successfully admitted approximate or reference result.
+  void downloadResults(std::vector<double>& phases, std::vector<double>& values, std::vector<double>& ratios) const
+  {
+    if (!selected_)
+      throw std::logic_error("Mixed inference has no admitted result");
+    selected_->downloadResults(phases, values, ratios);
+  }
+
+  /// Return the live-prefix layout, using prepared reference metadata before the first result.
+  const SpatialJetLayout& resultLayout() const noexcept
+  { return selected_ ? selected_->resultLayout() : reference_.resultLayout(); }
+
+  /// Report a whole-graph retry explicitly rather than presenting it as mixed throughput.
+  bool usedFp64Retry() const noexcept { return used_retry_; }
+
+  /// Describe the last numerical or preparation hazard selecting the reference route.
+  const std::string& retryReason() const noexcept { return retry_reason_; }
+
+  /// Expose explicit affine cast traffic for the attempted mixed request.
+  const MixedValueDenseStatistics& statistics() const noexcept
+  { return adapter_ ? adapter_->statistics() : no_statistics_; }
+
+  /// Include both prepared graphs, FP32 scratch/cache and diagnostics, excluding the shared FP64 image.
+  std::size_t deviceWorkspaceBytes() const
+  {
+    std::size_t bytes = reference_.deviceWorkspaceBytes();
+    const auto add = [&](std::size_t amount) {
+      if (bytes > std::numeric_limits<std::size_t>::max() - amount)
+        throw std::overflow_error("Mixed value workspace byte count overflow");
+      bytes += amount;
+    };
+    if (approximate_) add(approximate_->deviceWorkspaceBytes());
+    if (adapter_) add(adapter_->deviceWorkspaceBytes());
+    if (parameters_) add(parameters_->deviceStorageBytes());
+    return bytes;
+  }
+
+private:
+  PreparedDeviceInference reference_;
+  std::shared_ptr<const PreparedDeviceMixedDenseParameters> parameters_;
+  std::shared_ptr<PreparedDeviceMixedValueDense> adapter_;
+  std::unique_ptr<PreparedDeviceInference> approximate_;
+  PreparedDeviceInference* selected_ = nullptr;
+  bool allow_retry_;
+  bool used_retry_ = false;
+  std::string preparation_retry_reason_;
+  std::string retry_reason_;
+  MixedValueDenseStatistics no_statistics_{};
+};
+
+/// Compatibility spelling retaining the original default value-only constructor.
+using PreparedDeviceMixedValueInference = PreparedDeviceMixedInference;
 
 } // namespace qmcplusplus::psiformer::device
 

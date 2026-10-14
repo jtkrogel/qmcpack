@@ -57,7 +57,8 @@ void validateMathMode(PsiFormerPrecisionPolicy policy, PsiFormerBackendMathMode 
   if (policy == PsiFormerPrecisionPolicy::FP64_REFERENCE &&
       mode != PsiFormerBackendMathMode::FP64_STRICT)
     throw std::invalid_argument("PsiFormer FP64 policy requires the strict FP64 math mode");
-  if (policy == PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE &&
+  if ((policy == PsiFormerPrecisionPolicy::FP32_COMPUTE_FP64_REDUCE ||
+       policy == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS) &&
       mode != PsiFormerBackendMathMode::FP32_STRICT)
     throw std::invalid_argument("PsiFormer FP32 policy requires the strict FP32 math mode");
   if (policy == PsiFormerPrecisionPolicy::TF32_DENSE_FP64_SENSITIVE &&

@@ -101,17 +101,21 @@ __global__ void attentionContextJetsKernel(SpatialAttentionJetLayout layout,
       context);
 }
 
-__global__ void openFeatureJetsKernel(OpenFeatureJetLayout layout,
+/// Specialize the immutable boundary policy without changing open arithmetic.
+template<bool periodic>
+__global__ void boundaryFeatureJetsKernel(OpenFeatureJetLayout layout,
                                       const double* positions,
                                       const double* nuclei,
                                       const std::size_t* active_electrons,
                                       double* output,
-                                      OpenSpatialStatus* status)
+                                      OpenSpatialStatus* status,
+                                      periodic_geometry::Cell cell)
 {
   const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (configuration < layout.output.configuration_count)
     status[configuration] = open_spatial::buildOpenFeatureJetsForConfiguration(
-        layout, positions, nuclei, configuration, active_electrons[configuration], output);
+        layout, positions, nuclei, configuration, active_electrons[configuration], output,
+        periodic ? &cell : nullptr);
 }
 
 __global__ void biasTanhJetsKernel(SpatialElementwiseJetLayout layout,
@@ -166,19 +170,22 @@ __global__ void residualSpatialJetsKernel(SpatialElementwiseJetLayout layout,
       layout, left, right, configuration, element, output);
 }
 
-__global__ void openCuspJetsKernel(OpenCuspJetLayout layout,
+/// Dispatch one configuration's radial cusp using the selected real geometry.
+template<bool periodic>
+__global__ void boundaryCuspJetsKernel(OpenCuspJetLayout layout,
                                    const double* positions,
                                    const std::size_t* active_electrons,
                                    double same_spin_alpha,
                                    double opposite_spin_alpha,
                                    double* output,
-                                   OpenSpatialStatus* status)
+                                   OpenSpatialStatus* status,
+                                   periodic_geometry::Cell cell)
 {
   const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (configuration < layout.output.configuration_count)
     status[configuration] = open_spatial::buildOpenCuspJetsForConfiguration(
         layout, positions, configuration, active_electrons[configuration],
-        same_spin_alpha, opposite_spin_alpha, output);
+        same_spin_alpha, opposite_spin_alpha, output, periodic ? &cell : nullptr);
 }
 
 __global__ void finalSpatialCombinationKernel(
@@ -201,7 +208,9 @@ __global__ void finalSpatialCombinationKernel(
         laplacian_ratio);
 }
 
-__global__ void openOrbitalJetsKernel(OpenOrbitalJetLayout layout,
+/// Preserve the same backflow-envelope product graph for both boundary policies.
+template<bool periodic>
+__global__ void boundaryOrbitalJetsKernel(OpenOrbitalJetLayout layout,
                                       const double* features,
                                       const double* positions,
                                       const double* nuclei,
@@ -215,7 +224,8 @@ __global__ void openOrbitalJetsKernel(OpenOrbitalJetLayout layout,
                                       double* output,
                                       OpenSpatialStatus* status,
                                       double* retained_backflow,
-                                      double* retained_envelope)
+                                      double* retained_envelope,
+                                      periodic_geometry::Cell cell)
 {
   const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t electron_count = layout.features.electron_count;
@@ -233,7 +243,7 @@ __global__ void openOrbitalJetsKernel(OpenOrbitalJetLayout layout,
       pi_up, pi_down, zeta_up, zeta_down, configuration,
       active_electrons[configuration], determinant,
       matrix_element / electron_count, matrix_element % electron_count, output,
-      retained_backflow, retained_envelope);
+      retained_backflow, retained_envelope, periodic ? &cell : nullptr);
 }
 
 } // namespace
@@ -447,8 +457,25 @@ Error launchOpenFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
     throw std::invalid_argument("PsiFormer open feature device storage is null");
   const unsigned int blocks = checkedSpatialBlockCount(
       layout.output.configuration_count, "PsiFormer open feature grid exceeds device x dimension");
-  openFeatureJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
-      layout, positions, nuclei, active_electrons, output, status);
+  boundaryFeatureJetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(
+      layout, positions, nuclei, active_electrons, output, status, {});
+  return peekSpatialLaunchError();
+}
+
+Error launchPeriodicFeatureJets(Stream stream, const OpenFeatureJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions, const double* nuclei,
+    const std::size_t* active_electrons, double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.nucleus_count == 0)
+    return success;
+  periodic_geometry::validateCell(cell);
+  validateOpenFeatureJetLayout(layout, true);
+  if (!positions || !nuclei || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer periodic feature device storage is null");
+  const auto blocks = checkedSpatialBlockCount(layout.output.configuration_count,
+      "PsiFormer periodic feature grid exceeds device x dimension");
+  boundaryFeatureJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
+      layout, positions, nuclei, active_electrons, output, status, cell);
   return peekSpatialLaunchError();
 }
 
@@ -528,9 +555,28 @@ Error launchOpenCuspJets(Stream stream, const OpenCuspJetLayout& layout,
     throw std::invalid_argument("PsiFormer cusp jet device storage is null");
   const unsigned int blocks = checkedSpatialBlockCount(
       layout.output.configuration_count, "PsiFormer cusp jet grid exceeds device x dimension");
-  openCuspJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+  boundaryCuspJetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(
       layout, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
-      output, status);
+      output, status, {});
+  return peekSpatialLaunchError();
+}
+
+Error launchPeriodicCuspJets(Stream stream, const OpenCuspJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* positions,
+    const std::size_t* active_electrons, double same_spin_alpha, double opposite_spin_alpha,
+    double* output, OpenSpatialStatus* status)
+{
+  if (layout.output.configuration_count == 0 && layout.output.electron_count == 0)
+    return success;
+  periodic_geometry::validateCell(cell);
+  validateOpenCuspJetLayout(layout);
+  if (!positions || !active_electrons || !output || !status)
+    throw std::invalid_argument("PsiFormer periodic cusp device storage is null");
+  const auto blocks = checkedSpatialBlockCount(layout.output.configuration_count,
+      "PsiFormer periodic cusp grid exceeds device x dimension");
+  boundaryCuspJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
+      layout, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
+      output, status, cell);
   return peekSpatialLaunchError();
 }
 
@@ -602,10 +648,41 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
   const std::size_t count = openOrbitalElementCount(layout);
   const unsigned int blocks = checkedSpatialBlockCount(
       count, "PsiFormer open orbital grid exceeds device x dimension");
-  openOrbitalJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
+  boundaryOrbitalJetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
-      retained_backflow, retained_envelope);
+      retained_backflow, retained_envelope, {});
+  return peekSpatialLaunchError();
+}
+
+Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
+    const periodic_geometry::Cell& cell, const double* features,
+    const double* positions, const double* nuclei, const double* backflow_up,
+    const double* backflow_down, const double* pi_up, const double* pi_down,
+    const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
+    double* output, OpenSpatialStatus* status, double* retained_backflow, double* retained_envelope)
+{
+  if (layout.features.configuration_count == 0 &&
+      layout.determinant_count == 0 && layout.features.electron_count == 0)
+    return success;
+  periodic_geometry::validateCell(cell);
+  validateOpenOrbitalJetLayout(layout);
+  if ((retained_backflow == nullptr) != (retained_envelope == nullptr) ||
+      (retained_backflow && (retained_backflow == retained_envelope ||
+                            retained_backflow == output || retained_envelope == output)))
+    throw std::invalid_argument("Retained orbital factors require distinct paired destinations");
+  const bool need_up = layout.spin_up_count != 0;
+  const bool need_down = layout.spin_up_count != layout.features.electron_count;
+  if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
+      (need_up && (!backflow_up || !pi_up || !zeta_up)) ||
+      (need_down && (!backflow_down || !pi_down || !zeta_down)))
+    throw std::invalid_argument("PsiFormer periodic orbital device storage is null");
+  const auto blocks = checkedSpatialBlockCount(openOrbitalElementCount(layout),
+      "PsiFormer periodic orbital grid exceeds device x dimension");
+  boundaryOrbitalJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
+      layout, features, positions, nuclei, backflow_up, backflow_down,
+      pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
+      retained_backflow, retained_envelope, cell);
   return peekSpatialLaunchError();
 }
 

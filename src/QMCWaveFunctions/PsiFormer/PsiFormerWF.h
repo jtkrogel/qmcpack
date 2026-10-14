@@ -356,6 +356,9 @@ public:
   /// Return native tensor metadata in canonical DeepQMC flat order.
   const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override;
 
+  /// Report the prepared numerical backend used for this clone family's products.
+  bool usesAcceleratorParameterProducts() const noexcept override;
+
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
