@@ -27,6 +27,26 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/** Compact first-failure record: 16-bit stage, 40-bit index, 8-bit typed status.
+ * All-one bits mean success; ordered launches and atomic minimum retain the earliest failure. */
+using InferenceStatusWord = unsigned long long;
+static_assert(sizeof(InferenceStatusWord) == 8, "Inference diagnostics require a 64-bit status word");
+
+/// Reject records whose stage/index cannot be represented without losing identity.
+constexpr std::size_t INFERENCE_STATUS_MAX_STAGE = 0xfffe;
+constexpr std::size_t INFERENCE_STATUS_MAX_INDEX = (UINT64_C(1) << 40) - 1;
+constexpr unsigned int INFERENCE_STATUS_JET_DOMAIN = 0x80;
+
+/** Aggregate spatial leaf statuses into one caller-owned sticky first-failure word. */
+Error launchAggregateOpenInferenceStatus(Stream stream, const OpenSpatialStatus* statuses,
+                                         std::size_t count, std::size_t stage,
+                                         InferenceStatusWord* sticky);
+
+/** Aggregate softmax leaf statuses without synchronizing or exposing a result. */
+Error launchAggregateJetInferenceStatus(Stream stream, const device_math::JetMathStatus* statuses,
+                                        std::size_t count, std::size_t stage,
+                                        InferenceStatusWord* sticky);
+
 /** A logical strided FP64 copy interval.  Offsets are measured in elements. */
 struct DerivativeVectorLayout
 {

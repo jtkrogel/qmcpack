@@ -56,26 +56,63 @@ public:
     host_finite_status_.resize(1);
   }
 
-  /** Produce d log|Psi_s|/dp dot direction for every live configuration.
-   * The ordinary forward tape and model are immutable for this complete call.
-   */
-  const double* evaluate(const PreparedDeviceInference& forward, const std::vector<double>& direction)
+  /// Upload one finite canonical direction for reuse across coordinate batches.
+  /// A failed replacement invalidates the previous direction and result.
+  void prepareDirection(const std::vector<double>& direction)
   {
-    ready_ = false;
+    clearPreparedDirection();
     model_->validateCurrentDevice();
-    const auto count = forward.valueTapeBatchCount();
-    const auto& shape = model_->plan().modelShape();
-    const auto ne = shape.electrons(), width = shape.feature_dimension;
-    if (forward.modelImage().get() != model_.get() || count > capacity_ || direction.size() != direction_.capacity())
-      throw std::invalid_argument("Score JVP model, capacity or direction extent mismatch");
+    if (direction.size() != direction_.capacity())
+      throw std::invalid_argument("Score JVP direction extent mismatch");
     for (double value : direction)
       if (!device_math::isFiniteBinary64(value))
         throw std::invalid_argument("Score JVP direction is nonfinite");
+
+    // The cusp reduction takes two host scalars; retain those only, not a second
+    // canonical host direction. All neural/head directions stay on the device.
+    const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
+    const auto opposite = model_->plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin;
+    direction_.upload(direction.data(), direction.size());
+    same_alpha_direction_ = same ? direction[same->begin] : 0.0;
+    opposite_alpha_direction_ = direction[opposite];
+    direction_ready_ = true;
+  }
+
+  /// Revoke a prepared direction without changing or reallocating its storage.
+  void clearPreparedDirection() noexcept
+  {
+    direction_ready_ = ready_ = false;
+    live_count_ = 0;
+  }
+
+  /** Produce d log|Psi_s|/dp dot direction for every live configuration.
+   * Compatibility entry point uploads the supplied direction for this call.
+   */
+  const double* evaluate(const PreparedDeviceInference& forward, const std::vector<double>& direction)
+  {
+    prepareDirection(direction);
+    return evaluatePrepared(forward);
+  }
+
+  /** Apply a previously uploaded direction to an immutable ordinary tape.
+   * Coordinate changes do not require another O(P) host-to-device transfer.
+   */
+  const double* evaluatePrepared(const PreparedDeviceInference& forward)
+  {
+    ready_ = false;
+    live_count_ = 0;
+    model_->validateCurrentDevice();
+    if (!direction_ready_)
+      throw std::logic_error("Score JVP has no prepared direction");
+    const auto count = forward.valueTapeBatchCount();
+    const auto& shape = model_->plan().modelShape();
+    const auto ne = shape.electrons(), width = shape.feature_dimension;
+    if (forward.modelImage().get() != model_.get() || count > capacity_)
+      throw std::invalid_argument("Score JVP model or capacity mismatch");
     forward.downloadValueFactorizations(host_factors_);
     for (std::size_t channel = 0; channel < count * shape.determinants; ++channel)
       if (!host_factors_[channel].inverse_available)
         throw std::runtime_error("GPU score JVP requires regular determinant channels; cofactor fallback unavailable");
-    direction_.upload(direction.data(), direction.size());
     const auto stream = queue_.getNative();
     const auto head = forward.valueHeadTape();
     checkRuntime(launchDeterminantMatrixReverseSeeds(stream, head.factorizations, head.combinations,
@@ -127,11 +164,9 @@ public:
     checkRuntime(launchOpenOrbitalParameterDirection(stream, orbital_layout, forward.valueFinalFeatures(),
         feature_.data(), head.positions, model_->nuclei(), orbitalParameters(model_->parameters()),
         orbitalParameters(direction_.data()), head.backflow, head.envelope, orbital_.data()), "score JVP orbitals");
-    const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
-    const auto opposite = model_->plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin;
     checkRuntime(launchLogScoreParameterDirection(stream, count, ne, shape.determinants, shape.spin_up_electrons,
         head.positions, seeds_.data(), orbital_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
-        same ? direction[same->begin] : 0.0, direction[opposite], products_.data()), "score JVP reduction");
+        same_alpha_direction_, opposite_alpha_direction_, products_.data()), "score JVP reduction");
     const DerivativeFiniteScanLayout finite{count, count, 1, 0, 1};
     checkRuntime(launchDerivativeFiniteScan(stream, finite, products_.data(), finite_status_.data()), "score JVP finite scan");
     queue_.sync();
@@ -158,8 +193,7 @@ public:
   {
     model_->validateSuccessor(successor);
     model_ = std::move(successor);
-    ready_ = false;
-    live_count_ = 0;
+    clearPreparedDirection();
   }
 
   /// Account prepared device scratch separately from the immutable model image.
@@ -234,7 +268,8 @@ private:
   std::vector<device_determinant::FactorizationMetadata> host_factors_;
   DeviceBuffer<DerivativeFiniteStatus> finite_status_;
   std::vector<DerivativeFiniteStatus> host_finite_status_;
-  bool ready_ = false;
+  double same_alpha_direction_ = 0.0, opposite_alpha_direction_ = 0.0;
+  bool ready_ = false, direction_ready_ = false;
 };
 
 } // namespace qmcplusplus::psiformer::device

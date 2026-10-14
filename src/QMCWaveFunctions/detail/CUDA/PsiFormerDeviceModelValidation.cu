@@ -236,6 +236,11 @@ int main(int argc, char** argv)
       if (!stale_score_after_rebind || !stale_jvp_after_rebind)
         throw std::runtime_error("Product rebind exposed old-image results");
       rebound.evaluate(one_position);
+      bool rebound_direction_rejected = false;
+      try { (void)rebound_jvp.evaluatePrepared(rebound); }
+      catch (const std::logic_error&) { rebound_direction_rejected = true; }
+      if (!rebound_direction_rejected)
+        throw std::runtime_error("Product rebind retained a direction from the previous image");
       rebound.downloadResults(phase, logabs, no_laplacians);
       pf::PsiFormer changed_model = model;
       changed_model.p.set_flat_values(changed);
@@ -306,6 +311,101 @@ int main(int argc, char** argv)
     inference.evaluate(model.cfg.electrons.x);
     inference.downloadResults(phases, jets, ratios);
     verify();
+
+    // Qualify both diagnostic policies independently of the environment default.
+    // Deferred neural failures may finish queued arithmetic, but can never expose
+    // a partial result/tape or erase the first failing stage's typed identity.
+    {
+      const auto original_policy = inference.statusPolicy();
+      const auto prepared_bytes = inference.deviceWorkspaceBytes();
+      auto huge_parameters = model.p.flat_values();
+      for (const auto role : {ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
+                              ParameterRole::ATTENTION_QUERY_WEIGHT, ParameterRole::ATTENTION_KEY_WEIGHT})
+      {
+        const auto& parameter = plan.parameter(role, role == ParameterRole::ELECTRON_EMBEDDING_WEIGHT
+            ? NO_ATTENTION_BLOCK : 0);
+        std::fill(huge_parameters.begin() + parameter.begin,
+                  huge_parameters.begin() + parameter.end, std::numeric_limits<double>::max());
+      }
+      const auto huge_image = image->makeUpdatedImage(huge_parameters, 18);
+      const auto recovered_image = huge_image->makeUpdatedImage(model.p.flat_values(), 19);
+      for (const auto policy : {InferenceStatusPolicy::SYNCHRONOUS_DEBUG, InferenceStatusPolicy::DEFERRED_NEURAL})
+      {
+        inference.setStatusPolicy(policy);
+        inference.evaluate(model.cfg.electrons.x);
+        inference.downloadResults(phases, jets, ratios);
+        verify();
+        if (inference.deviceWorkspaceBytes() != prepared_bytes)
+          throw std::runtime_error("Status policy selection changed prepared VGL storage");
+
+        PreparedDeviceInference retained(image, model.cfg.nconfig, queue, handle,
+            SpatialJetMode::VALUE_ONLY, true, false, policy);
+        retained.evaluate(model.cfg.electrons.x);
+        const auto retained_bytes = retained.deviceWorkspaceBytes();
+        std::vector<double> policy_phases(model.cfg.nconfig), policy_values(model.cfg.nconfig), no_spatial;
+        retained.downloadResults(policy_phases, policy_values, no_spatial);
+        for (std::size_t sample = 0; sample < model.cfg.nconfig; ++sample)
+          near(policy_values[sample], references[sample].logabs, "status-policy value parity");
+
+        auto invalid_geometry = model.cfg.electrons.x;
+        invalid_geometry.front() = std::numeric_limits<double>::quiet_NaN();
+        const auto invalid_generation = retained.evaluationGeneration() + 1;
+        bool geometry_rejected = false, stale_tape_rejected = false, stale_result_rejected = false;
+        try { retained.evaluate(invalid_geometry); }
+        catch (const InferenceStatusError& error)
+        {
+          geometry_rejected = error.domain() == InferenceStatusDomain::SPATIAL && error.stage() == 0 &&
+              error.spatialStatus() != OpenSpatialStatus::REGULAR && error.generation() == invalid_generation;
+        }
+        try { (void)retained.valueHeadTape(); }
+        catch (const std::logic_error&) { stale_tape_rejected = true; }
+        try { retained.downloadResults(policy_phases, policy_values, no_spatial); }
+        catch (const std::logic_error&) { stale_result_rejected = true; }
+        if (!geometry_rejected || !stale_tape_rejected || !stale_result_rejected)
+          throw std::runtime_error("Status policy lost immediate geometry admission or exposed a failed snapshot");
+        retained.evaluate(model.cfg.electrons.x);
+        retained.downloadResults(policy_phases, policy_values, no_spatial);
+        for (std::size_t sample = 0; sample < model.cfg.nconfig; ++sample)
+          near(policy_values[sample], references[sample].logabs, "status-policy geometry recovery");
+
+        // Finite parameters can still overflow the neural GEMMs. Both policies
+        // must report the first softmax failure, not a later head/node error.
+        retained.rebindModel(huge_image);
+        const auto neural_generation = retained.evaluationGeneration() + 1;
+        bool neural_rejected = false;
+        try { retained.evaluate(model.cfg.electrons.x); }
+        catch (const InferenceStatusError& error)
+        {
+          neural_rejected = error.domain() == InferenceStatusDomain::SOFTMAX && error.stage() == 1 &&
+              error.jetStatus() == device_math::JetMathStatus::NONFINITE_INPUT &&
+              error.generation() == neural_generation;
+        }
+        if (!neural_rejected)
+          throw std::runtime_error("Status policy did not preserve the first typed neural failure");
+        stale_tape_rejected = false;
+        stale_result_rejected = false;
+        try { (void)retained.valueHeadTape(); }
+        catch (const std::logic_error&) { stale_tape_rejected = true; }
+        try { retained.downloadResults(policy_phases, policy_values, no_spatial); }
+        catch (const std::logic_error&) { stale_result_rejected = true; }
+        if (!stale_tape_rejected || !stale_result_rejected)
+          throw std::runtime_error("Neural status failure exposed an earlier result or reverse tape");
+        retained.rebindModel(recovered_image);
+        retained.evaluate(model.cfg.electrons.x);
+        retained.downloadResults(policy_phases, policy_values, no_spatial);
+        for (std::size_t sample = 0; sample < model.cfg.nconfig; ++sample)
+          near(policy_values[sample], references[sample].logabs, "status-policy neural recovery");
+        if (retained.deviceWorkspaceBytes() != retained_bytes)
+          throw std::runtime_error("Status failure recovery changed prepared storage");
+      }
+      inference.setStatusPolicy(original_policy);
+      bool invalid_policy_rejected = false;
+      try { inference.setStatusPolicy(static_cast<InferenceStatusPolicy>(999)); }
+      catch (const std::invalid_argument&) { invalid_policy_rejected = true; }
+      if (!invalid_policy_rejected || inference.statusPolicy() != original_policy)
+        throw std::runtime_error("Invalid status policy changed graph configuration");
+      std::cout << "PASS status policies: value/VGL parity, typed first failure, stale snapshots, recovery, stable storage\n";
+    }
 
     // Stage-6 preparation retains full spatial planes without exposing them as
     // ordinary score values. Check B*E value/gradient/Laplacian product identities.
@@ -753,13 +853,28 @@ int main(int argc, char** argv)
     std::vector<double> products(model.cfg.nconfig), cpu_products(model.cfg.nconfig, 0.0);
     score_jvp.downloadProducts(products);
     const auto jvp_bytes = score_jvp.deviceWorkspaceBytes();
-    bool invalid_direction_rejected = false, stale_jvp_rejected = false;
+    bool invalid_direction_rejected = false, stale_jvp_rejected = false, invalid_prepared_rejected = false;
     try { (void)score_jvp.evaluate(taped, {}); }
     catch (const std::invalid_argument&) { invalid_direction_rejected = true; }
     try { score_jvp.downloadProducts(products); }
     catch (const std::logic_error&) { stale_jvp_rejected = true; }
-    if (!invalid_direction_rejected || !stale_jvp_rejected)
+    try { (void)score_jvp.evaluatePrepared(taped); }
+    catch (const std::logic_error&) { invalid_prepared_rejected = true; }
+    if (!invalid_direction_rejected || !stale_jvp_rejected || !invalid_prepared_rejected)
       throw std::runtime_error("Failed JVP request exposed stale products");
+
+    // A failed finite-value replacement must revoke the previous direction too.
+    score_jvp.prepareDirection(product_direction);
+    auto nonfinite_direction = product_direction;
+    nonfinite_direction[0] = std::numeric_limits<double>::quiet_NaN();
+    bool nonfinite_direction_rejected = false;
+    invalid_prepared_rejected = false;
+    try { score_jvp.prepareDirection(nonfinite_direction); }
+    catch (const std::invalid_argument&) { nonfinite_direction_rejected = true; }
+    try { (void)score_jvp.evaluatePrepared(taped); }
+    catch (const std::logic_error&) { invalid_prepared_rejected = true; }
+    if (!nonfinite_direction_rejected || !invalid_prepared_rejected)
+      throw std::runtime_error("Nonfinite replacement retained a prepared JVP direction");
     score_jvp.evaluate(taped, product_direction);
     score_jvp.downloadProducts(products);
     if (score_jvp.deviceWorkspaceBytes() != jvp_bytes)
@@ -813,6 +928,60 @@ int main(int argc, char** argv)
       throw std::runtime_error("Score JVP/VJP adjoint identity exceeds tight tolerance");
     std::cout << "PASS explicit parameter score JVP and adjoint identity: max_abs_difference="
               << jvp_max_difference << '\n';
+
+    // Reuse one uploaded direction at a second coordinate population. Snapshot
+    // only the tangent call: forward-coordinate uploads are intentionally outside
+    // this interval, so any H2D transfer here would be a direction regression.
+    {
+      int metrics_device = -1;
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipGetDevice(&metrics_device), "resident JVP metrics device");
+#else
+      checkRuntime(cudaGetDevice(&metrics_device), "resident JVP metrics device");
+#endif
+      auto& metrics = deviceMemoryMetrics(metrics_device);
+      score_jvp.prepareDirection(product_direction);
+      const auto before = metrics.snapshot();
+      score_jvp.evaluatePrepared(taped);
+      score_jvp.downloadProducts(products);
+      const auto after = metrics.snapshot();
+      if (before.upload_calls != after.upload_calls || before.uploaded_bytes != after.uploaded_bytes ||
+          before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls ||
+          before.live_bytes != after.live_bytes)
+        throw std::runtime_error("Prepared JVP uploaded a direction or changed device ownership");
+      for (std::size_t configuration = 0; configuration < products.size(); ++configuration)
+        near(products[configuration], cpu_products[configuration], "resident JVP original-coordinate parity");
+
+      auto shifted_positions = model.cfg.electrons.x;
+      for (std::size_t index = 0; index < shifted_positions.size(); ++index)
+        shifted_positions[index] += (index % 2 == 0 ? 0.0003 : -0.0002);
+      taped.evaluate(shifted_positions);
+      score_jvp.evaluatePrepared(taped);
+      std::vector<double> shifted_products(products.size());
+      score_jvp.downloadProducts(shifted_products);
+      for (std::size_t configuration = 0; configuration < products.size(); ++configuration)
+      {
+        cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+            shifted_positions.data() + configuration * model.ne * 3, model.ne));
+        const auto shifted_score = cpu_score_executor.evaluate(*cpu_score_workspace);
+        double expected_product = 0;
+        for (std::size_t parameter = 0; parameter < product_direction.size(); ++parameter)
+          expected_product += product_direction[parameter] * shifted_score.parameter_score[parameter];
+        near(shifted_products[configuration], expected_product, "resident JVP changed-coordinate CPU parity");
+      }
+      score_jvp.evaluate(taped, product_direction);
+      score_jvp.downloadProducts(products);
+      for (std::size_t configuration = 0; configuration < products.size(); ++configuration)
+        near(products[configuration], shifted_products[configuration], "resident and compatibility JVP parity");
+
+      // Preserve the original fixture/tape and exported products for later tests.
+      taped.evaluate(model.cfg.electrons.x);
+      score_jvp.evaluatePrepared(taped);
+      score_jvp.downloadProducts(products);
+      if (score_jvp.deviceWorkspaceBytes() != jvp_bytes)
+        throw std::runtime_error("Resident JVP coordinate reuse changed prepared storage");
+      std::cout << "PASS resident JVP: two coordinate populations, CPU/compatibility parity, no tangent uploads/allocations\n";
+    }
     if (!jvp_output.empty())
     {
       std::ofstream output(jvp_output, std::ios::binary);
@@ -1358,6 +1527,21 @@ int main(int argc, char** argv)
     catch (const std::invalid_argument&) { stale_product_rejected = true; }
     if (!stale_product_rejected || product_session->numericalProducts() != 2)
       throw std::runtime_error("Product session stale request/counter contract failed");
+    product_session->prepareScoreDirection(product_direction, model.p.version());
+    if (product_session->numericalProducts() != 2)
+      throw std::runtime_error("Direction preparation fabricated a numerical product");
+    near(product_session->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()),
+         cpu_products[0], "leased resident JVP CPU parity");
+    bool stale_direction_preparation_rejected = false, cleared_session_direction_rejected = false;
+    try { product_session->prepareScoreDirection(product_direction, model.p.version() + 1); }
+    catch (const std::invalid_argument&) { stale_direction_preparation_rejected = true; }
+    try { (void)product_session->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()); }
+    catch (const std::logic_error&) { cleared_session_direction_rejected = true; }
+    if (!stale_direction_preparation_rejected || !cleared_session_direction_rejected)
+      throw std::runtime_error("Failed session preparation retained an old direction");
+    product_session->prepareScoreDirection(product_direction, model.p.version());
+    near(product_session->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()),
+         cpu_products[0], "leased resident JVP recovery");
     const auto& session_kinetic = product_session->kinetic(model.cfg.electrons.x.data(),
         external_contiguous.data(), inverse_masses.data(), model.p.version());
     kinetic_workspace->setPositions(first_position);
@@ -1437,6 +1621,11 @@ int main(int argc, char** argv)
 
     backend_tiles->publishParameters(proposed_values, accepted_version + 1,
                                      [&]() { model.p.set_flat_values(proposed_values); });
+    bool published_direction_rejected = false;
+    try { (void)product_session->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()); }
+    catch (const std::logic_error&) { published_direction_rejected = true; }
+    if (!published_direction_rejected)
+      throw std::runtime_error("Session publication retained an old-image JVP direction");
     auto changed_workspace = batch_value.makeWorkspace();
     changed_workspace->setPositions(first_position);
     const auto changed_value = batch_value.evaluate(*changed_workspace);

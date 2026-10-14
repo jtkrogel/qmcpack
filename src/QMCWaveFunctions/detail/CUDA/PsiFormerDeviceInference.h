@@ -11,7 +11,8 @@
  * This chains actual CUDA/HIP leaves for a complete imported model. It is not
  * itself a publication owner: the production crowd adapter binds it to the
  * control-plane lease and wait protocol. Parameters are immutable for this
- * instance. Per-stage synchronization favors diagnostic clarity. Retaining a
+ * instance. A synchronous debug policy and guarded neural-stage aggregation
+ * preserve first-error identity without publishing failed results. Retaining a
  * value tape supplies reverse intermediates, not a qualified score evaluator.
  */
 
@@ -27,12 +28,89 @@
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <limits>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/// Choose eager diagnostics or defer only neural stages with defined failure outputs.
+enum class InferenceStatusPolicy
+{
+  SYNCHRONOUS_DEBUG,
+  DEFERRED_NEURAL
+};
+
+/// Identify the numerical enum domain stored in a compact first-failure record.
+enum class InferenceStatusDomain
+{
+  SPATIAL,
+  SOFTMAX
+};
+
+/** Preserve a failed stage's typed status, logical index and request generation. */
+class InferenceStatusError final : public std::runtime_error
+{
+public:
+  /// Decode one admitted device diagnostic without exposing any failed output.
+  InferenceStatusError(InferenceStatusWord word, std::size_t generation)
+      : std::runtime_error("Device inference " +
+            std::string((word & INFERENCE_STATUS_JET_DOMAIN) ? "softmax" : "spatial") +
+            " stage " + std::to_string(word >> 48) + " has nonregular status " +
+            std::to_string(word & 0x7f) + " at logical element " +
+            std::to_string((word >> 8) & INFERENCE_STATUS_MAX_INDEX) +
+            " (evaluation " + std::to_string(generation) + ")"),
+        word_(word), generation_(generation)
+  {}
+
+  /// Return the leaf enum family without conflating spatial and softmax status codes.
+  InferenceStatusDomain domain() const noexcept
+  { return word_ & INFERENCE_STATUS_JET_DOMAIN ? InferenceStatusDomain::SOFTMAX : InferenceStatusDomain::SPATIAL; }
+
+  /// Return the ordered diagnostic stage, including eager physical stages.
+  std::size_t stage() const noexcept { return word_ >> 48; }
+
+  /// Return the failing element/row in its stage's live logical prefix.
+  std::size_t element() const noexcept { return (word_ >> 8) & INFERENCE_STATUS_MAX_INDEX; }
+
+  /// Return the graph attempt to which this error belongs.
+  std::size_t generation() const noexcept { return generation_; }
+
+  /// Decode a spatial status only when that enum family was recorded.
+  OpenSpatialStatus spatialStatus() const
+  {
+    if (domain() != InferenceStatusDomain::SPATIAL)
+      throw std::logic_error("Requested spatial status from a softmax inference diagnostic");
+    return static_cast<OpenSpatialStatus>(word_ & 0x7f);
+  }
+
+  /// Decode a softmax status only when that enum family was recorded.
+  device_math::JetMathStatus jetStatus() const
+  {
+    if (domain() != InferenceStatusDomain::SOFTMAX)
+      throw std::logic_error("Requested softmax status from a spatial inference diagnostic");
+    return static_cast<device_math::JetMathStatus>(word_ & 0x7f);
+  }
+
+private:
+  InferenceStatusWord word_;
+  std::size_t generation_;
+};
+
+/** Read the explicit diagnostic override once during graph preparation. */
+inline InferenceStatusPolicy configuredInferenceStatusPolicy()
+{
+  const char* value = std::getenv("PSIFORMER_GPU_STATUS_CHECKS");
+  if (!value || std::string_view(value) == "synchronous")
+    return InferenceStatusPolicy::SYNCHRONOUS_DEBUG;
+  if (std::string_view(value) == "deferred")
+    return InferenceStatusPolicy::DEFERRED_NEURAL;
+  throw std::invalid_argument("PSIFORMER_GPU_STATUS_CHECKS must be synchronous or deferred");
+}
 
 /** Own immutable layout/fixed geometry independently of retiring parameter images.
  * Successor images share this family, keeping prepared plan references valid
@@ -279,9 +357,10 @@ public:
                           AcceleratorBlasHandle& blas,
                           SpatialJetMode mode = SpatialJetMode::FULL_VGL,
                           bool retain_score_tape = false,
-                          bool retain_spatial_tape = false)
+                          bool retain_spatial_tape = false,
+                          InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy())
       : PreparedDeviceInference(std::make_shared<PreparedDeviceModel>(plan, parameters, nuclei),
-                                batch_size, queue, blas, mode, retain_score_tape, retain_spatial_tape)
+                                batch_size, queue, blas, mode, retain_score_tape, retain_spatial_tape, status_policy)
   {}
 
   /// Prepare independent scratch while retaining an already uploaded model image.
@@ -291,11 +370,13 @@ public:
                           AcceleratorBlasHandle& blas,
                           SpatialJetMode mode = SpatialJetMode::FULL_VGL,
                           bool retain_score_tape = false,
-                          bool retain_spatial_tape = false)
+                          bool retain_spatial_tape = false,
+                          InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy())
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode)
   {
     model_->validateCurrentDevice();
+    setStatusPolicy(status_policy);
     if (mode_ != SpatialJetMode::FULL_VGL && mode_ != SpatialJetMode::VALUE_ONLY)
       throw std::invalid_argument("Prepared device inference supports value-only or full VGL");
     if (retain_score_tape && mode_ != SpatialJetMode::VALUE_ONLY)
@@ -376,6 +457,7 @@ public:
     open_status_.reserve(status_count); host_status_.resize(status_count);
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
+    sticky_status_.reserve(1);
     if (retain_score_tape || retain_spatial_tape)
     {
       retained_backflow_.reserve(spatialJetSpanElements(orbitals_.orbitals));
@@ -402,6 +484,7 @@ public:
     setBatchCount(positions.size() / coordinates_per_configuration);
     positions_.upload(positions.data(), positions.size());
     const auto stream = queue_.getNative();
+    resetStatusAdmission();
 
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
     checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), model_->nuclei(),
@@ -449,6 +532,10 @@ public:
       }
       residual(b_.data(), projected_.data(), a_.data());
     }
+
+    // Every deferred neural result is initialized, but may be numerically invalid.
+    // Admit the whole trunk before orbital construction or reverse-tape publication.
+    admitStatus();
 
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
     checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
@@ -506,6 +593,17 @@ public:
     value_tape_valid_ = !value_tape_.empty();
     result_valid_ = true;
   }
+
+  /// Select diagnostics between completed evaluations; numerical semantics are unchanged.
+  void setStatusPolicy(InferenceStatusPolicy policy)
+  {
+    if (policy != InferenceStatusPolicy::SYNCHRONOUS_DEBUG && policy != InferenceStatusPolicy::DEFERRED_NEURAL)
+      throw std::invalid_argument("Unknown device inference status policy");
+    status_policy_ = policy;
+  }
+
+  /// Report the graph's preparation-time or explicitly selected diagnostic policy.
+  InferenceStatusPolicy statusPolicy() const noexcept { return status_policy_; }
 
   /// Download signed-log amplitude, complete log-gradient/log-Laplacian jets and lap ratios.
   void downloadResults(std::vector<double>& phases, std::vector<double>& jets, std::vector<double>& ratios) const
@@ -689,6 +787,7 @@ public:
     add(checkedDeviceBytes<device_determinant::CombinationMetadata>(combinations_.capacity()));
     add(checkedDeviceBytes<device_determinant::DerivativeStatus>(det_status_.capacity()));
     add(checkedDeviceBytes<OpenSpatialStatus>(open_status_.capacity()));
+    add(checkedDeviceBytes<InferenceStatusWord>(sticky_status_.capacity()));
     add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
     for (const auto& tape : value_tape_)
       add(tape->storageBytes());
@@ -734,27 +833,92 @@ private:
     denseForward(blas_, folded, source, weight, target);
   }
 
-  /// Check each stage before a later launch can overwrite its error diagnostics.
-  void checkOpen(std::size_t count)
+  /// Reset ordered sticky diagnostics for this attempt before any numerical launch.
+  void resetStatusAdmission()
   {
+    status_stage_ = 0;
+    status_generation_ = evaluation_generation_;
+    status_pending_ = false;
+    if (status_policy_ == InferenceStatusPolicy::DEFERRED_NEURAL)
+    {
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipMemsetAsync(sticky_status_.data(), 0xff, sizeof(InferenceStatusWord), queue_.getNative()),
+                   "model sticky status initialization");
+#else
+      checkRuntime(cudaMemsetAsync(sticky_status_.data(), 0xff, sizeof(InferenceStatusWord), queue_.getNative()),
+                   "model sticky status initialization");
+#endif
+    }
+  }
+
+  /// Give every status-producing stage a representable monotonically ordered identity.
+  std::size_t nextStatusStage()
+  {
+    if (status_stage_ > INFERENCE_STATUS_MAX_STAGE)
+      throw std::length_error("Device inference status stage count exceeds compact diagnostics");
+    return status_stage_++;
+  }
+
+  /** Publish no numerical result until the current sticky status is admitted.
+   * Physical boundaries call this immediately; only defined in-place neural outputs defer it. */
+  void admitStatus()
+  {
+    if (status_policy_ != InferenceStatusPolicy::DEFERRED_NEURAL || !status_pending_)
+      return;
+    if (status_generation_ != evaluation_generation_)
+      throw std::logic_error("Device inference status belongs to a stale evaluation");
+    queue_.sync();
+    InferenceStatusWord word;
+    sticky_status_.download(&word, 1);
+    if (word != std::numeric_limits<InferenceStatusWord>::max())
+      throw InferenceStatusError(word, evaluation_generation_);
+    status_pending_ = false;
+  }
+
+  /// Preserve leaf diagnostics before a later launch overwrites its temporary status array.
+  void checkOpen(std::size_t count, bool defer_neural = false)
+  {
+    const auto stage = nextStatusStage();
+    if (count == 0 || count - 1 > INFERENCE_STATUS_MAX_INDEX)
+      throw std::length_error("Device inference spatial status count is not representable");
+    if (status_policy_ == InferenceStatusPolicy::DEFERRED_NEURAL)
+    {
+      checkRuntime(launchAggregateOpenInferenceStatus(queue_.getNative(), open_status_.data(), count,
+          stage, sticky_status_.data()), "model spatial status aggregation");
+      status_pending_ = true;
+      if (!defer_neural)
+        admitStatus();
+      return;
+    }
     queue_.sync();
     open_status_.download(host_status_.data(), count);
     for (std::size_t i = 0; i < count; ++i)
       if (host_status_[i] != OpenSpatialStatus::REGULAR)
-        throw std::runtime_error("Device inference stage has nonregular spatial status");
+        throw InferenceStatusError((InferenceStatusWord(stage) << 48) |
+            (InferenceStatusWord(i) << 8) | static_cast<unsigned int>(host_status_[i]), evaluation_generation_);
   }
 
-  /// Reject invalid softmax jets before using them as context weights.
+  /// Softmax mutates fully initialized logits in place, so failures may defer admission.
   void checkJets()
   {
-    queue_.sync();
+    const auto stage = nextStatusStage();
     const std::size_t count = product(batch_, product(shape_.attention_heads, ne_));
+    if (status_policy_ == InferenceStatusPolicy::DEFERRED_NEURAL)
+    {
+      checkRuntime(launchAggregateJetInferenceStatus(queue_.getNative(), jet_status_.data(), count,
+          stage, sticky_status_.data()), "model softmax status aggregation");
+      status_pending_ = true;
+      return;
+    }
+    queue_.sync();
     jet_status_.download(host_jet_status_.data(), count);
     for (std::size_t row = 0; row < count; ++row)
     {
       const auto status = host_jet_status_[row];
       if (status != device_math::JetMathStatus::REGULAR)
-        throw std::runtime_error("Device inference attention has nonregular jet status");
+        throw InferenceStatusError((InferenceStatusWord(stage) << 48) |
+            (InferenceStatusWord(row) << 8) | INFERENCE_STATUS_JET_DOMAIN |
+            static_cast<unsigned int>(status), evaluation_generation_);
     }
   }
 
@@ -763,15 +927,25 @@ private:
   {
     checkRuntime(launchBiasTanhJets(queue_.getNative(), elementwise_, values, bias, values,
                                     open_status_.data(), retained_preactivation), "model bias/tanh");
-    checkOpen(batch_ * ne_ * shape_.feature_dimension);
+    // GEMM initialized every plane before this in-place activation; early-return
+    // failures therefore leave defined storage for subsequent deferred kernels.
+    checkOpen(batch_ * ne_ * shape_.feature_dimension, true);
   }
 
   /// Apply a residual sum, permitting exact pointwise input/output aliasing.
   void residual(const double* left, const double* right, double* destination)
   {
+    // The attention residual aliases b_. The final MLP residual writes a_,
+    // which still contains this block's fully initialized input (embedding for
+    // block zero, preceding residual thereafter). Both cases therefore leave
+    // defined storage even when the leaf returns before writing every plane.
+    if (status_policy_ == InferenceStatusPolicy::DEFERRED_NEURAL &&
+        destination != left && destination != right && destination != a_.data())
+      throw std::logic_error("Deferred inference residual requires an initialized destination");
     checkRuntime(launchResidualSpatialJets(queue_.getNative(), elementwise_, left, right, destination,
                                            open_status_.data()), "model residual");
-    checkOpen(batch_ * ne_ * shape_.feature_dimension);
+    // Admission can defer only for the initialized destinations checked above.
+    checkOpen(batch_ * ne_ * shape_.feature_dimension, true);
   }
 
   /// Pack one contiguous jet interval into already prepared determinant storage.
@@ -807,9 +981,14 @@ private:
   DeviceBuffer<device_determinant::CombinationMetadata> combinations_;
   DeviceBuffer<device_determinant::DerivativeStatus> det_status_;
   DeviceBuffer<OpenSpatialStatus> open_status_;
+  DeviceBuffer<InferenceStatusWord> sticky_status_;
   DeviceBuffer<device_math::JetMathStatus> jet_status_;
   std::vector<OpenSpatialStatus> host_status_;
   std::vector<device_math::JetMathStatus> host_jet_status_;
+  InferenceStatusPolicy status_policy_ = InferenceStatusPolicy::SYNCHRONOUS_DEBUG;
+  std::size_t status_stage_ = 0;
+  std::size_t status_generation_ = 0;
+  bool status_pending_ = false;
   std::vector<std::unique_ptr<RetainedBlockTape>> value_tape_;
   DeviceBuffer<double> retained_backflow_, retained_envelope_;
   bool value_tape_valid_ = false;

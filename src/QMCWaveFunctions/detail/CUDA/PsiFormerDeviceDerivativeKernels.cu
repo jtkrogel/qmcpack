@@ -24,6 +24,26 @@ namespace
 
 constexpr unsigned int derivative_block_size = 128;
 
+/** Preserve the earliest failing logical stage/index across ordered graph launches. */
+template<typename Status, unsigned int Domain>
+__global__ void aggregateInferenceStatusKernel(const Status* statuses, std::size_t count,
+                                               std::size_t stage, InferenceStatusWord* sticky)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count)
+    return;
+  const auto code = static_cast<unsigned int>(statuses[index]);
+  if (code != 0)
+  {
+    // These enum domains fit in seven bits. Clamp an unexpected corrupt code
+    // instead of allowing its high bits to change stage/index ordering.
+    const auto diagnostic = Domain | (code < 0x80 ? code : 0x7f);
+    const auto key = (InferenceStatusWord(stage) << 48) |
+        (InferenceStatusWord(index) << 8) | diagnostic;
+    atomicMin(sticky, key);
+  }
+}
+
 std::size_t checkedAdd(std::size_t left, std::size_t right, const char* description)
 {
   if (right > std::numeric_limits<std::size_t>::max() - left)
@@ -948,7 +968,43 @@ __global__ void derivativeFiniteScanKernel(DerivativeFiniteScanLayout layout,
   status[piece] = {first, count};
 }
 
+/** Validate the compact ABI before any kernel can truncate an index or status stage. */
+void validateInferenceStatusAggregation(std::size_t count, std::size_t stage,
+                                        const void* statuses, const InferenceStatusWord* sticky)
+{
+  if (stage > INFERENCE_STATUS_MAX_STAGE || count - 1 > INFERENCE_STATUS_MAX_INDEX)
+    throw std::length_error("PsiFormer compact inference status identity exceeds its encoding");
+  if (!statuses || !sticky || statuses == static_cast<const void*>(sticky))
+    throw std::invalid_argument("PsiFormer compact inference status storage is null or aliased");
+}
+
 } // namespace
+
+Error launchAggregateOpenInferenceStatus(Stream stream, const OpenSpatialStatus* statuses,
+                                         std::size_t count, std::size_t stage,
+                                         InferenceStatusWord* sticky)
+{
+  if (count == 0)
+    return success;
+  validateInferenceStatusAggregation(count, stage, statuses, sticky);
+  aggregateInferenceStatusKernel<OpenSpatialStatus, 0><<<blockCount(count,
+      "PsiFormer spatial status aggregation grid exceeds the CUDA/HIP x dimension"),
+      derivative_block_size, 0, stream>>>(statuses, count, stage, sticky);
+  return peekAtLastError();
+}
+
+Error launchAggregateJetInferenceStatus(Stream stream, const device_math::JetMathStatus* statuses,
+                                        std::size_t count, std::size_t stage,
+                                        InferenceStatusWord* sticky)
+{
+  if (count == 0)
+    return success;
+  validateInferenceStatusAggregation(count, stage, statuses, sticky);
+  aggregateInferenceStatusKernel<device_math::JetMathStatus, INFERENCE_STATUS_JET_DOMAIN>
+      <<<blockCount(count, "PsiFormer softmax status aggregation grid exceeds the CUDA/HIP x dimension"),
+      derivative_block_size, 0, stream>>>(statuses, count, stage, sticky);
+  return peekAtLastError();
+}
 
 std::size_t responseDotPartialCount(const ResponseDotLayout& layout)
 {

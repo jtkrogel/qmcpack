@@ -97,6 +97,33 @@ public:
     return products_[0];
   }
 
+  /// Upload one direction while the crowd is released, without creating a fake
+  /// coordinate/result lease. The outer scratch lease spans all subsequent uses.
+  void prepareScoreDirection(const std::vector<double>& direction, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    ready_ = false;
+    jvp_.clearPreparedDirection();
+    if (crowd_.acquired() || crowd_.poisoned())
+      throw std::logic_error("Device score direction preparation requires a released, healthy crowd");
+    if (version != active_image_->version())
+      throw std::invalid_argument("Device score direction preparation has stale version");
+    rebind();
+    jvp_.prepareDirection(direction);
+  }
+
+  /// Apply the resident direction under the ordinary versioned product lease.
+  /// Publication invalidates the direction; callers must prepare it again.
+  double scoreJvpPrepared(const double* positions, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      values_.evaluate(positions_);
+      jvp_.evaluatePrepared(values_);
+      jvp_.downloadProducts(products_);
+    });
+    return products_[0];
+  }
+
   /// Return independent determinant amplitudes, including the common cusp.
   void channelAmplitudes(const double* positions, double* phases, double* logs,
                           std::size_t count, std::size_t version)

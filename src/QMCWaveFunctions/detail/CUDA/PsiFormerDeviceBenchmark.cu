@@ -116,6 +116,7 @@ int main(int argc, char** argv)
     std::vector<double> response(plan.parameterCount()), direction(plan.parameterCount()), products(options.walkers);
     for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
       direction[parameter] = (static_cast<int>(parameter % 11) - 5) * .01 / std::sqrt(direction.size());
+    jvp.prepareDirection(direction);
     std::vector<std::pair<std::string, std::function<void()>>> operations;
     operations.emplace_back("value", [&]() {
       value.evaluate(positions);
@@ -133,6 +134,11 @@ int main(int argc, char** argv)
     operations.emplace_back("score_jvp", [&]() {
       value_tape.evaluate(positions);
       jvp.evaluate(value_tape, direction);
+      jvp.downloadProducts(products);
+    });
+    operations.emplace_back("score_jvp_resident", [&]() {
+      value_tape.evaluate(positions);
+      jvp.evaluatePrepared(value_tape);
       jvp.downloadProducts(products);
     });
     operations.emplace_back("kinetic_vjp", [&]() {

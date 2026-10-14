@@ -1752,6 +1752,7 @@ struct PsiFormerDerivativeScratch
         throw std::logic_error("PsiFormer device products require the prepared numerical backend");
       device_products = backend->prepareProductSession();
       device_positions.resize(3 * state.execution_plan.modelShape().electrons());
+      device_direction.resize(parameters);
     }
 #endif
   }
@@ -1763,6 +1764,7 @@ struct PsiFormerDerivativeScratch
 #ifdef ENABLE_CUDA
   std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products;
   std::vector<double> device_positions;
+  std::vector<double> device_direction;
   bool reported_device_products = false;
 #endif
   std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
@@ -1895,7 +1897,7 @@ public:
     result.maximum_vjp_channels              = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size          = 1;
-    result.fixed_parameter_scratch_vectors   = (hasDeviceProducts() ? 7 : 3) + MAXIMUM_VJP_CHANNELS;
+    result.fixed_parameter_scratch_vectors   = (hasDeviceProducts() ? 8 : 3) + MAXIMUM_VJP_CHANNELS;
     result.block_streaming                   = true;
     return result;
   }
@@ -2118,7 +2120,7 @@ protected:
       }
   }
 
-  /// Contract one score at a time with the caller-owned direction and emit scalar tiles.
+  /// Contract scores with one direction; device execution retains the uploaded direction.
   void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
                         wftrain::SampleProductSink& sink) const override
   {
@@ -2127,18 +2129,41 @@ protected:
     {
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
-      for (std::size_t sample = 0; sample < sample_count_; ++sample)
+#ifdef ENABLE_CUDA
+      if (hasDeviceProducts())
       {
-        setScoreWorkspacePositions(sample);
-        const pf::DirectScoreResult score = evaluateScoreResponse();
-        requireResultVersion(score);
+        // Upload each real direction once for the whole retained population.
+        // A real model still supports algebraically complex optimizer vectors.
+        std::fill(sample_products_.begin(), sample_products_.end(), wftrain::DerivativeValue{});
+        for (unsigned component = 0; component < 2; ++component)
+        {
+          if (!prepareDeviceDirection(direction, component))
+            continue;
+          const wftrain::DerivativeValue factor = component == 0
+              ? wftrain::DerivativeValue(1.0, 0.0) : wftrain::DerivativeValue(0.0, 1.0);
+          for (std::size_t sample = 0; sample < sample_count_; ++sample)
+          {
+            setScoreWorkspacePositions(sample);
+            sample_products_[sample] += factor * evaluatePreparedDeviceJVP();
+          }
+        }
+      }
+      else
+#endif
+      {
+        for (std::size_t sample = 0; sample < sample_count_; ++sample)
+        {
+          setScoreWorkspacePositions(sample);
+          const pf::DirectScoreResult score = evaluateScoreResponse();
+          requireResultVersion(score);
 
-        wftrain::DerivativeValue& product = sample_products_[sample];
-        product                           = {};
-        for (std::size_t parameter = 0;
-             parameter < score.parameter_score.size; ++parameter)
-          product += score.parameter_score[parameter] *
-              direction.values()[parameter];
+          wftrain::DerivativeValue& product = sample_products_[sample];
+          product                           = {};
+          for (std::size_t parameter = 0;
+               parameter < score.parameter_score.size; ++parameter)
+            product += score.parameter_score[parameter] *
+                direction.values()[parameter];
+        }
       }
     }
 
@@ -2278,6 +2303,35 @@ private:
 #endif
   }
 
+#ifdef ENABLE_CUDA
+  /// Stage one algebraic component once; even a zero real direction admits the graph.
+  bool prepareDeviceDirection(const wftrain::StructuredParameterVectorConstView& direction,
+                              unsigned component) const
+  {
+    auto& values = shared_scratch_->device_direction;
+    bool nonzero = false;
+    for (std::size_t parameter = 0; parameter < values.size(); ++parameter)
+    {
+      values[parameter] = component == 0 ? direction.values()[parameter].real()
+                                         : direction.values()[parameter].imag();
+      nonzero = nonzero || values[parameter] != 0.0;
+    }
+    if (component != 0 && !nonzero)
+      return false;
+    shared_scratch_->device_products->prepareScoreDirection(values, parameter_version_);
+    return true;
+  }
+
+  /// Return only the scalar contraction, keeping the P-vector response off the host.
+  double evaluatePreparedDeviceJVP() const
+  {
+    const double result = shared_scratch_->device_products->scoreJvpPrepared(
+        shared_scratch_->device_positions.data(), parameter_version_);
+    reportDeviceProducts();
+    return result;
+  }
+#endif
+
   /// Evaluate a real canonical score through the selected, exclusively leased lane.
   pf::DirectScoreResult evaluateScoreResponse() const
   {
@@ -2389,6 +2443,36 @@ private:
       throw std::logic_error("PsiFormer ECP JVP replay is not bound");
     std::shared_lock state_lock(model_state_->mutex);
     requireBoundVersion();
+#ifdef ENABLE_CUDA
+    if (hasDeviceProducts())
+    {
+      // Replay exactly the accepted grid. Only scalar JVPs cross the device boundary.
+      for (unsigned component = 0; component < 2; ++component)
+      {
+        if (!prepareDeviceDirection(direction, component))
+          continue;
+        const wftrain::DerivativeValue factor = component == 0
+            ? wftrain::DerivativeValue(1.0, 0.0) : wftrain::DerivativeValue(0.0, 1.0);
+        for (std::size_t sample = 0; sample < sample_count_; ++sample)
+        {
+          setScoreWorkspacePositions(sample);
+          reference_score_products_[sample] = evaluatePreparedDeviceJVP();
+        }
+        for (const auto& point : ecp_replay_->points())
+        {
+          setReplayPointPositions(point);
+          const wftrain::DerivativeValue weight = point.bare_weight * point.complete_ratio;
+          requireFinite(weight, "accepted-grid weight");
+          const wftrain::DerivativeValue contribution = factor * weight *
+              (evaluatePreparedDeviceJVP() - reference_score_products_[point.sample]);
+          requireFinite(contribution, "accepted-grid JVP contribution");
+          sample_products_[point.sample] += contribution;
+          requireFinite(sample_products_[point.sample], "accepted-grid sample JVP");
+        }
+      }
+      return;
+    }
+#endif
     for (std::size_t sample = 0; sample < sample_count_; ++sample)
     {
       setScoreWorkspacePositions(sample);
@@ -2556,7 +2640,7 @@ private:
   wftrain::StreamingDerivativeStorageDiagnostics measureStorageDiagnostics() const
   {
     const std::size_t score_bytes = hasDeviceProducts()
-        ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(std::size_t{7}, schema_->parameterCount(),
+        ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(std::size_t{8}, schema_->parameterCount(),
               "PsiFormer device product parameter vectors"), sizeof(double), "PsiFormer device parameter bytes")
         : score_workspace_->scoreStorageBytes();
     const std::size_t kinetic_parameter_bytes =
@@ -2619,6 +2703,10 @@ private:
           checkedBatchMemoryMultiply(shared_scratch_->device_positions.capacity(), sizeof(double),
                                       "PsiFormer device provider coordinate staging"),
           "PsiFormer device provider scratch");
+      workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
+          checkedBatchMemoryMultiply(shared_scratch_->device_direction.capacity(), sizeof(double),
+                                      "PsiFormer device provider direction staging"),
+          "PsiFormer device provider scratch");
     }
     else
 #endif
@@ -2652,6 +2740,7 @@ private:
     {
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_products.get()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_positions.data()));
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_direction.data()));
     }
 #endif
     mixFingerprint(fingerprint,
@@ -2689,7 +2778,7 @@ private:
 
     return {schema_->parameterCount(),
             sample_count_,
-            hasDeviceProducts() ? std::size_t{7} : std::size_t{3},
+            hasDeviceProducts() ? std::size_t{8} : std::size_t{3},
             MAXIMUM_VJP_CHANNELS,
             parameter_bytes,
             workspace_bytes,
