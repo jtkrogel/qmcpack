@@ -275,6 +275,28 @@ Error launchOrbitalBbarEbar(Stream stream,
                             double* backflow_adjoint,
                             double* envelope_adjoint);
 
+/** Weight orbital seeds and pack spin-selected backflow adjoints for dense BLAS.
+ * Matrices are contiguous [B,D,N,N]; packed outputs are [B,N,D*N]. Both spin
+ * destinations are fully written, with zero rows for the opposite spin.
+ */
+Error launchWeightedOrbitalProductReverse(Stream stream,
+    const OrbitalProductReverseLayout& layout, std::size_t spin_up_count,
+    const double* configuration_weights, const double* backflow, const double* envelope,
+    const double* orbital_adjoint, double* up_adjoint, double* down_adjoint,
+    double* envelope_adjoint);
+
+/** Build contiguous electron-ion and unordered electron-pair radii for score heads.
+ * Pair labels are shared across configurations; inputs use interleaved XYZ.
+ */
+Error launchScoreGeometry(Stream stream, std::size_t configuration_count,
+    std::size_t electron_count, std::size_t nucleus_count, std::size_t spin_up_count,
+    const double* positions, const double* nuclei, double* ion_distances,
+    double* pair_distances, std::uint8_t* same_spin);
+
+/// Add two contiguous canonical response vectors into a distinct destination.
+Error launchAddParameterResponses(Stream stream, std::size_t count,
+    const double* left, const double* right, double* destination);
+
 /** Accumulate one spin channel's ordinary envelope pi/zeta response. */
 Error launchEnvelopeParameterReverse(Stream stream,
                                      const EnvelopeParameterReverseLayout& layout,

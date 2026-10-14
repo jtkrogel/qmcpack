@@ -574,6 +574,83 @@ __global__ void envelopeParameterReverseKernel(EnvelopeParameterReverseLayout la
   response[layout.zeta_response_offset + parameter] += zeta_sum;
 }
 
+/** Own one orbital cotangent and its unique packed/dense output positions. */
+__global__ void weightedOrbitalProductReverseKernel(OrbitalProductReverseLayout layout,
+    std::size_t spin_up_count, const double* weights, const double* backflow,
+    const double* envelope, const double* orbital_adjoint, double* up_adjoint,
+    double* down_adjoint, double* envelope_adjoint)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.electron_count;
+  const auto per_configuration = layout.determinant_count * ne * ne;
+  if (index >= layout.configuration_count * per_configuration)
+    return;
+  const auto configuration = index / per_configuration;
+  const auto orbital = index % ne;
+  const auto electron = (index / ne) % ne;
+  const auto determinant = (index / (ne * ne)) % layout.determinant_count;
+  const auto packed = ((configuration * ne + electron) * layout.determinant_count + determinant) * ne + orbital;
+  const double weighted = weights[configuration] * orbital_adjoint[index];
+  const double bbar = weighted * envelope[index];
+  up_adjoint[packed] = electron < spin_up_count ? bbar : 0.0;
+  down_adjoint[packed] = electron < spin_up_count ? 0.0 : bbar;
+  envelope_adjoint[index] = weighted * backflow[index];
+}
+
+/** Generate each independent radius once; no reductions or atomics are needed. */
+__global__ void scoreGeometryKernel(std::size_t batch, std::size_t ne, std::size_t nuclei_count,
+    std::size_t spin_up_count, const double* positions, const double* nuclei,
+    double* ion_distances, double* pair_distances, std::uint8_t* same_spin)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < batch * ne * nuclei_count)
+  {
+    const auto nucleus = index % nuclei_count;
+    const auto electron = (index / nuclei_count) % ne;
+    const auto configuration = index / (ne * nuclei_count);
+    double squared = 0;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double displacement = positions[(configuration * ne + electron) * 3 + dimension] -
+          nuclei[nucleus * 3 + dimension];
+      squared += displacement * displacement;
+    }
+    ion_distances[index] = std::sqrt(squared);
+  }
+  const auto pairs = ne * (ne - 1) / 2;
+  if (index < batch * pairs)
+  {
+    const auto configuration = index / pairs;
+    auto pair = index % pairs;
+    std::size_t first = 0;
+    while (pair >= ne - first - 1)
+    {
+      pair -= ne - first - 1;
+      ++first;
+    }
+    const auto second = first + pair + 1;
+    double squared = 0;
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double displacement = positions[(configuration * ne + first) * 3 + dimension] -
+          positions[(configuration * ne + second) * 3 + dimension];
+      squared += displacement * displacement;
+    }
+    pair_distances[index] = std::sqrt(squared);
+    if (configuration == 0)
+      same_spin[index] = (first < spin_up_count) == (second < spin_up_count);
+  }
+}
+
+/** Give each canonical parameter exactly one owner in the final response sum. */
+__global__ void addParameterResponsesKernel(std::size_t count, const double* left,
+    const double* right, double* destination)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < count)
+    destination[index] = left[index] + right[index];
+}
+
 __global__ void cuspAlphaReverseKernel(CuspAlphaReverseLayout layout,
                                        const double* distances,
                                        const std::uint8_t* same_spin,
@@ -1020,6 +1097,62 @@ Error launchEnvelopeParameterReverse(Stream stream,
                                      "PsiFormer envelope reverse grid exceeds the CUDA/HIP x dimension"),
                                   derivative_block_size, 0, stream>>>(
       layout, distances, pi, zeta, envelope_adjoint, response);
+  return peekAtLastError();
+}
+
+Error launchWeightedOrbitalProductReverse(Stream stream,
+    const OrbitalProductReverseLayout& layout, std::size_t spin_up_count,
+    const double* weights, const double* backflow, const double* envelope,
+    const double* orbital_adjoint, double* up_adjoint, double* down_adjoint,
+    double* envelope_adjoint)
+{
+  validateOrbitalLayout(layout);
+  const auto ne = layout.electron_count;
+  const auto matrix = checkedProduct(ne, ne, "Score orbital matrix overflow");
+  const auto per_configuration = checkedProduct(layout.determinant_count, matrix, "Score orbital batch overflow");
+  if (spin_up_count > ne || layout.row_stride != ne || layout.determinant_stride != matrix ||
+      layout.configuration_stride != per_configuration)
+    throw std::invalid_argument("Weighted orbital reverse requires contiguous matrices and valid spin count");
+  if (!weights || !backflow || !envelope || !orbital_adjoint || !up_adjoint || !down_adjoint || !envelope_adjoint ||
+      up_adjoint == down_adjoint || up_adjoint == envelope_adjoint || down_adjoint == envelope_adjoint)
+    throw std::invalid_argument("Weighted orbital reverse destinations are null or aliased");
+  for (const auto* destination : {up_adjoint, down_adjoint, envelope_adjoint})
+    if (destination == weights || destination == backflow || destination == envelope || destination == orbital_adjoint)
+      throw std::invalid_argument("Weighted orbital reverse input/output alias is unsupported");
+  const auto count = checkedProduct(layout.configuration_count, per_configuration, "Weighted orbital grid overflow");
+  weightedOrbitalProductReverseKernel<<<blockCount(count, "Weighted orbital grid too large"),
+      derivative_block_size, 0, stream>>>(layout, spin_up_count, weights, backflow, envelope,
+      orbital_adjoint, up_adjoint, down_adjoint, envelope_adjoint);
+  return peekAtLastError();
+}
+
+Error launchScoreGeometry(Stream stream, std::size_t batch, std::size_t ne,
+    std::size_t nuclei_count, std::size_t spin_up_count, const double* positions,
+    const double* nuclei, double* ion_distances, double* pair_distances, std::uint8_t* same_spin)
+{
+  if (batch == 0 || ne == 0 || nuclei_count == 0 || spin_up_count > ne)
+    throw std::invalid_argument("Score geometry dimensions are invalid");
+  const auto pairs = checkedProduct(ne, ne - 1, "Score pair count overflow") / 2;
+  const auto ion_count = checkedProduct(checkedProduct(batch, ne, "Score geometry extent overflow"),
+                                       nuclei_count, "Score ion extent overflow");
+  const auto pair_count = checkedProduct(batch, pairs, "Score pair extent overflow");
+  if (!positions || !nuclei || !ion_distances || (pairs != 0 && (!pair_distances || !same_spin)))
+    throw std::invalid_argument("Score geometry storage is null");
+  scoreGeometryKernel<<<blockCount(ion_count > pair_count ? ion_count : pair_count,
+      "Score geometry grid too large"), derivative_block_size, 0, stream>>>(
+      batch, ne, nuclei_count, spin_up_count, positions, nuclei, ion_distances, pair_distances, same_spin);
+  return peekAtLastError();
+}
+
+Error launchAddParameterResponses(Stream stream, std::size_t count,
+    const double* left, const double* right, double* destination)
+{
+  if (count == 0)
+    return success;
+  if (!left || !right || !destination || destination == left || destination == right)
+    throw std::invalid_argument("Parameter response sum requires distinct storage");
+  addParameterResponsesKernel<<<blockCount(count, "Parameter response grid too large"),
+      derivative_block_size, 0, stream>>>(count, left, right, destination);
   return peekAtLastError();
 }
 

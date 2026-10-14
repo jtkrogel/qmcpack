@@ -54,7 +54,8 @@ public:
    * The seed is [configuration,electron,feature]; sample weights are already
    * included. Results are complete after return and borrowed until the next call.
    */
-  const double* reverse(const PreparedDeviceInference& forward, const std::vector<double>& seed)
+  const double* reverse(const PreparedDeviceInference& forward, const std::vector<double>& seed,
+                        const double* device_seed = nullptr)
   {
     result_ready_ = false;
     model_->validateCurrentDevice();
@@ -62,12 +63,17 @@ public:
     const auto& shape = model_->plan().modelShape();
     const auto ne = shape.electrons(), width = shape.feature_dimension;
     const auto elements = multiply(multiply(count, ne), width);
-    if (forward.modelImage().get() != model_.get() || count > capacity_ || seed.size() != elements)
+    if (forward.modelImage().get() != model_.get() || count > capacity_ ||
+        (device_seed ? !seed.empty() : seed.size() != elements))
       throw std::invalid_argument("Network reverse model, capacity or seed extent mismatch");
     for (double value : seed)
       if (!device_math::isFiniteBinary64(value))
         throw std::invalid_argument("Network reverse seed is nonfinite");
-    upstream_.upload(seed.data(), seed.size());
+    if (device_seed)
+      checkRuntime(launchDerivativeCopy(queue_.getNative(), {elements, 0, 1, 0, 1}, device_seed,
+          upstream_.data()), "network device seed copy");
+    else
+      upstream_.upload(seed.data(), seed.size());
     zero(response_, response_.capacity());
     const DenseForwardLayout dense{count * ne, width, width, width, width, width};
     const BatchedValueLayout values{count, ne, width, width, ne * width};

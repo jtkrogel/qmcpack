@@ -442,6 +442,15 @@ public:
             matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(), combinations_.data()};
   }
 
+  /// Copy live determinant metadata into preallocated caller storage for admission.
+  void downloadValueFactorizations(std::vector<device_determinant::FactorizationMetadata>& destination) const
+  {
+    const auto count = product(valueTapeBatchCount(), shape_.determinants);
+    if (destination.size() < count)
+      throw std::invalid_argument("Factorization metadata destination is too small");
+    factors_.download(destination.data(), count);
+  }
+
   /// Download the separately retained product factors for regression validation.
   void downloadValueOrbitalFactors(std::vector<double>& backflow, std::vector<double>& envelope) const
   {

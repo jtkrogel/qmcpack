@@ -10,15 +10,18 @@
  *
  * CPU-only mode produces references without consulting a GPU. Device mode runs
  * the prepared graph and checks every stored configuration; no CPU fallback is
- * accepted. ECP potential/quadrature and parameter reverse are not claimed here.
+ * accepted. Ordinary weighted parameter reverse is checked for regular channels;
+ * production training, kinetic response and ECP parameter response are not claimed.
  */
 
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceNetworkReverse.h"
+#include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
 
@@ -363,14 +366,58 @@ int main(int argc, char** argv)
     near(reverse_product, (objectives[1] - objectives[0]) / (2 * delta),
          "embedding/attention/MLP weighted reverse finite difference");
     std::cout << "PASS neural trunk weighted VJP: canonical finite difference, no B-by-P matrix\n";
+    // Complete canonical score contraction against the independent CPU evaluator.
+    std::vector<double> score_weights(model.cfg.nconfig);
+    for (std::size_t configuration = 0; configuration < score_weights.size(); ++configuration)
+      score_weights[configuration] = configuration % 2 == 0 ? 0.7 : -0.25;
+    PreparedDeviceScoreReverse score_reverse(image, model.cfg.nconfig, queue, handle);
+    score_reverse.reverse(taped, score_weights);
+    std::vector<double> gpu_score(plan.parameterCount()), cpu_score(plan.parameterCount(), 0.0);
+    score_reverse.downloadResponse(gpu_score);
+    const auto score_bytes = score_reverse.deviceWorkspaceBytes();
+    bool bad_weights_rejected = false, stale_score_rejected = false;
+    try { (void)score_reverse.reverse(taped, {}); }
+    catch (const std::invalid_argument&) { bad_weights_rejected = true; }
+    try { score_reverse.downloadResponse(gpu_score); }
+    catch (const std::logic_error&) { stale_score_rejected = true; }
+    if (!bad_weights_rejected || !stale_score_rejected)
+      throw std::runtime_error("Failed score contraction exposed stale output");
+    score_reverse.reverse(taped, score_weights);
+    score_reverse.downloadResponse(gpu_score);
+    if (score_reverse.deviceWorkspaceBytes() != score_bytes)
+      throw std::runtime_error("Score reverse allocated storage during reuse");
+    pf::DirectScoreExecutor cpu_score_executor(model, plan);
+    auto cpu_score_workspace = cpu_score_executor.makeWorkspace();
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + configuration * model.ne * 3, model.ne));
+      const auto score = cpu_score_executor.evaluate(*cpu_score_workspace);
+      for (std::size_t parameter = 0; parameter < cpu_score.size(); ++parameter)
+        cpu_score[parameter] += score_weights[configuration] * score.parameter_score[parameter];
+    }
+    double score_max_difference = 0;
+    for (std::size_t parameter = 0; parameter < cpu_score.size(); ++parameter)
+    {
+      near(gpu_score[parameter], cpu_score[parameter], "full canonical weighted parameter score");
+      score_max_difference = std::max(score_max_difference, std::abs(gpu_score[parameter] - cpu_score[parameter]));
+    }
+    std::cout << "PASS full weighted canonical score VJP: CPU parity; parameters=" << cpu_score.size()
+              << " max_abs_difference=" << score_max_difference << '\n';
     if (model.cfg.nconfig > 1)
     {
       std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
       taped.evaluate(prefix);
       const std::vector<double> prefix_seed(seed.begin(), seed.begin() + model.ne * model.dim);
       network_reverse.reverse(taped, prefix_seed);
+      score_reverse.reverse(taped, {score_weights[0]});
+      score_reverse.downloadResponse(gpu_score);
+      cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(model.cfg.electrons.x.data(), model.ne));
+      const auto prefix_score = cpu_score_executor.evaluate(*cpu_score_workspace);
+      for (std::size_t parameter = 0; parameter < gpu_score.size(); ++parameter)
+        near(gpu_score[parameter], score_weights[0] * prefix_score.parameter_score[parameter], "score tail-prefix CPU parity");
       if (taped.valueTapeBatchCount() != 1 || taped.deviceWorkspaceBytes() != tape_bytes ||
-          network_reverse.deviceWorkspaceBytes() != reverse_bytes)
+          network_reverse.deviceWorkspaceBytes() != reverse_bytes || score_reverse.deviceWorkspaceBytes() != score_bytes)
         throw std::runtime_error("Short score tape/reverse prefix changed prepared storage");
     }
 
@@ -441,6 +488,38 @@ int main(int argc, char** argv)
                 node_parameters.begin() + interval.end, 0.0);
     }
     auto node_image = std::make_shared<PreparedDeviceModel>(plan, node_parameters, model.cfg.nuclei.x, 18);
+    PreparedDeviceInference node_tape(node_image, model.cfg.nconfig, queue, handle,
+                                      SpatialJetMode::VALUE_ONLY, true);
+    node_tape.evaluate(model.cfg.electrons.x);
+    PreparedDeviceScoreReverse node_score(node_image, model.cfg.nconfig, queue, handle);
+    bool undefined_node_score_rejected = false;
+    try { (void)node_score.reverse(node_tape, score_weights); }
+    catch (const std::runtime_error&) { undefined_node_score_rejected = true; }
+    if (!undefined_node_score_rejected)
+      throw std::runtime_error("GPU log score accepted an exact total node");
+    auto mixed_parameters = canonical_parameters;
+    // Zero only one determinant column: its cofactor derivative can be nonzero
+    // even though its normalized determinant weight is zero. Inverse-only score
+    // code must reject this rather than silently omit the channel contribution.
+    for (auto role : {ParameterRole::ENVELOPE_PI_UP, ParameterRole::ENVELOPE_PI_DOWN})
+    {
+      const auto begin = plan.parameter(role).begin;
+      std::fill_n(mixed_parameters.begin() + begin, shape.nuclei, 0.0);
+    }
+    auto mixed_image = std::make_shared<PreparedDeviceModel>(plan, mixed_parameters, model.cfg.nuclei.x, 19);
+    PreparedDeviceInference mixed_tape(mixed_image, model.cfg.nconfig, queue, handle,
+                                       SpatialJetMode::VALUE_ONLY, true);
+    mixed_tape.evaluate(model.cfg.electrons.x);
+    mixed_tape.downloadResults(value_phases, value_logs, no_ratios);
+    if (value_phases[0] == 0)
+      throw std::runtime_error("Mixed singular-channel fixture unexpectedly has a total node");
+    PreparedDeviceScoreReverse mixed_score(mixed_image, model.cfg.nconfig, queue, handle);
+    bool mixed_channel_rejected = false;
+    try { (void)mixed_score.reverse(mixed_tape, score_weights); }
+    catch (const std::runtime_error&) { mixed_channel_rejected = true; }
+    if (!mixed_channel_rejected)
+      throw std::runtime_error("Inverse-only GPU score silently accepted a singular determinant channel");
+    std::cout << "PASS score failure guards: total node and singular channel with nonzero total amplitude\n";
     PreparedDeviceInference nodes(node_image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
     nodes.evaluate(model.cfg.electrons.x);
     nodes.downloadResults(value_phases, value_logs, no_ratios);
@@ -593,7 +672,7 @@ int main(int argc, char** argv)
     std::cout << "PASS native numerical tiles: values/VGL/active gradients/sparse replacements/tails\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
-              << "production dispatch and parameter reverse NOT_VALIDATED\n";
+              << "regular-channel weighted score VJP PASS; production training/JVP/kinetic response NOT_VALIDATED\n";
     return 0;
   }
   catch (const std::exception& error)
