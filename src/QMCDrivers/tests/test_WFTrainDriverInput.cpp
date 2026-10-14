@@ -682,4 +682,17 @@ TEST_CASE("WFTrainDriverInput rejects obsolete attributes and malformed paramete
   }
 }
 
+TEST_CASE("WFTrainDriverInput distinguishes RSS and numeric storage guards", "[drivers][wf_train]")
+{
+  const auto defaults = parseTrainingInput("<qmc><training/></qmc>");
+  CHECK(defaults.getMaximumResidentBytes() == 0);
+  const auto guarded = parseTrainingInput(
+      "<qmc><training><parameter name='maximum_resident_bytes'>1073741824</parameter>"
+      "<parameter name='maximum_retained_bytes'>524288</parameter></training></qmc>");
+  CHECK(guarded.getMaximumResidentBytes() == 1073741824);
+  CHECK(guarded.getMaximumRetainedBytes() == 524288);
+  CHECK_THROWS(parseTrainingInput(
+      "<qmc><training><parameter name='maximum_resident_bytes'>-1</parameter></training></qmc>"));
+}
+
 } // namespace qmcplusplus

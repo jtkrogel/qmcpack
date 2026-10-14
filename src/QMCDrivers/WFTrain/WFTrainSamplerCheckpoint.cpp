@@ -13,6 +13,8 @@
 
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "io/hdf/hdf_archive.h"
+#include "QMCHamiltonians/NonLocalECPotential.h"
+#include "QMCHamiltonians/QMCHamiltonian.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -27,6 +29,19 @@ namespace
 {
 
 constexpr char CONTRIBUTOR_ID[] = "qmcpack.wftrain.rank_local_sampler";
+
+/** Enumerate persistent ECP components in stable walker/Hamiltonian order. */
+std::vector<NonLocalECPotential*> quadratureTargets(MCPopulation& population)
+{
+  std::vector<NonLocalECPotential*> targets;
+  for (auto& hamiltonian : population.get_hamiltonians())
+    for (int component = 0; component < hamiltonian->size(); ++component)
+      if (auto* potential = dynamic_cast<NonLocalECPotential*>(hamiltonian->getComponent(component)))
+        targets.push_back(potential);
+  return targets;
+}
+
+using QuadratureRestore = std::pair<NonLocalECPotential*, NonLocalECPotential::QuadratureState>;
 
 /// Extend one stable FNV-1a fingerprint with a raw byte range.
 void extendFingerprint(std::uint64_t& hash, const void* data, std::size_t bytes) noexcept
@@ -111,12 +126,23 @@ struct WFTrainSamplerCheckpoint::Snapshot
   std::vector<int> walker_integers;
   std::vector<std::uint64_t> rng_sizes;
   std::vector<std::uint64_t> rng_state;
+  std::vector<std::uint64_t> quadrature_layout;
+  std::vector<double> quadrature_coordinates;
   std::int64_t global_step = 0;
 
   std::string fingerprint() const
   {
-    return samplerFingerprint(positions, spins, walker_reals, walker_ids,
-                              walker_integers, rng_sizes, rng_state, global_step);
+    const auto base = samplerFingerprint(positions, spins, walker_reals, walker_ids,
+                                         walker_integers, rng_sizes, rng_state, global_step);
+    if (quadrature_layout.empty())
+      return base; // Preserve the existing all-electron contributor format.
+    std::uint64_t hash = UINT64_C(1469598103934665603);
+    extendFingerprint(hash, base.data(), base.size());
+    extendVectorFingerprint(hash, quadrature_layout);
+    extendVectorFingerprint(hash, quadrature_coordinates);
+    std::ostringstream text;
+    text << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return text.str();
   }
 };
 
@@ -136,6 +162,7 @@ public:
                          std::vector<std::int64_t> walker_ids,
                          std::vector<int> walker_integers,
                          std::vector<std::unique_ptr<WFTrainSamplerCheckpoint::RNG>> rng_state,
+                         std::vector<QuadratureRestore> quadrature,
                          int restored_global_step)
       : population_(population),
         random_generators_(random_generators),
@@ -146,6 +173,7 @@ public:
         walker_ids_(std::move(walker_ids)),
         walker_integers_(std::move(walker_integers)),
         rng_state_(std::move(rng_state)),
+        quadrature_(std::move(quadrature)),
         restored_global_step_(restored_global_step)
   {}
 
@@ -173,6 +201,8 @@ public:
     }
     for (std::size_t rng = 0; rng < rng_state_.size(); ++rng)
       random_generators_[rng].get().swapState(*rng_state_[rng]);
+    for (auto& [potential, state] : quadrature_)
+      potential->restoreQuadratureStateUnchecked(state);
     global_step_ = restored_global_step_;
   }
 
@@ -186,6 +216,7 @@ private:
   std::vector<std::int64_t> walker_ids_;
   std::vector<int> walker_integers_;
   std::vector<std::unique_ptr<WFTrainSamplerCheckpoint::RNG>> rng_state_;
+  std::vector<QuadratureRestore> quadrature_;
   int restored_global_step_;
 };
 
@@ -270,6 +301,15 @@ WFTrainSamplerCheckpoint::Snapshot WFTrainSamplerCheckpoint::capture() const
   if (global_step_ < 0)
     throw std::logic_error("WFTrain sampler global step must not be negative");
   snapshot.global_step = global_step_;
+  for (const auto* potential : quadratureTargets(population_))
+  {
+    const auto grid = potential->captureQuadratureState();
+    snapshot.quadrature_layout.push_back(persistedSize(grid.knots_per_species.size()));
+    for (const auto knots : grid.knots_per_species)
+      snapshot.quadrature_layout.push_back(persistedSize(knots));
+    snapshot.quadrature_coordinates.insert(snapshot.quadrature_coordinates.end(),
+                                           grid.coordinates.begin(), grid.coordinates.end());
+  }
   return snapshot;
 }
 
@@ -287,6 +327,9 @@ std::string WFTrainSamplerCheckpoint::configurationFingerprint() const
     const std::uint64_t persisted = persistedSize(size);
     extendFingerprint(hash, &persisted, sizeof(persisted));
   }
+  const auto snapshot = capture();
+  if (!snapshot.quadrature_layout.empty())
+    extendVectorFingerprint(hash, snapshot.quadrature_layout);
   std::ostringstream text;
   text << std::hex << std::setw(16) << std::setfill('0') << hash;
   return text.str();
@@ -295,7 +338,8 @@ std::string WFTrainSamplerCheckpoint::configurationFingerprint() const
 CheckpointContributorMetadata WFTrainSamplerCheckpoint::checkpointMetadata() const
 {
   const Snapshot snapshot = capture();
-  return {CONTRIBUTOR_ID, {1, 0, 0}, configurationFingerprint(), snapshot.fingerprint()};
+  return {CONTRIBUTOR_ID, {snapshot.quadrature_layout.empty() ? 1 : 2, 0, 0},
+          configurationFingerprint(), snapshot.fingerprint()};
 }
 
 void WFTrainSamplerCheckpoint::writeCheckpointPayload(hdf_archive& archive) const
@@ -314,6 +358,11 @@ void WFTrainSamplerCheckpoint::writeCheckpointPayload(hdf_archive& archive) cons
   archive.write(snapshot.rng_sizes, "rng_sizes");
   archive.write(snapshot.rng_state, "rng_state");
   archive.write(snapshot.global_step, "global_step");
+  if (!snapshot.quadrature_layout.empty())
+  {
+    archive.write(snapshot.quadrature_layout, "quadrature_layout");
+    archive.write(snapshot.quadrature_coordinates, "quadrature_coordinates");
+  }
 }
 
 std::unique_ptr<SamplerCheckpointContributor::PreparedRestore>
@@ -332,6 +381,12 @@ WFTrainSamplerCheckpoint::prepareCheckpointRestore(
   archive.read(restored.rng_sizes, "rng_sizes");
   archive.read(restored.rng_state, "rng_state");
   archive.read(restored.global_step, "global_step");
+  const auto targets = quadratureTargets(population_);
+  if (!targets.empty())
+  {
+    archive.read(restored.quadrature_layout, "quadrature_layout");
+    archive.read(restored.quadrature_coordinates, "quadrature_coordinates");
+  }
 
   if (topology.size() != 6 ||
       runtimeSize(topology[0], "participant count") != topology_.participant_count ||
@@ -402,11 +457,42 @@ WFTrainSamplerCheckpoint::prepareCheckpointRestore(
   if (restored.fingerprint() != saved_metadata.state_fingerprint)
     throw std::runtime_error("WFTrain sampler checkpoint state fingerprint mismatch");
 
+  // Prepare and validate every grid before any participant commits its restore.
+  std::vector<QuadratureRestore> prepared_grids;
+  std::size_t layout_offset = 0, coordinate_offset = 0;
+  for (auto* potential : targets)
+  {
+    if (layout_offset >= restored.quadrature_layout.size())
+      throw std::runtime_error("WFTrain sampler checkpoint has truncated ECP layout");
+    const auto species = runtimeSize(restored.quadrature_layout[layout_offset++], "ECP species");
+    if (species > restored.quadrature_layout.size() - layout_offset)
+      throw std::runtime_error("WFTrain sampler checkpoint has truncated ECP species");
+    NonLocalECPotential::QuadratureState grid;
+    std::size_t coordinate_count = 0;
+    for (std::size_t index = 0; index < species; ++index)
+    {
+      const auto knots = runtimeSize(restored.quadrature_layout[layout_offset++], "ECP knots");
+      const auto extent = checkedProduct(knots, OHMMS_DIM, "ECP Cartesian grid");
+      if (extent > restored.quadrature_coordinates.size() - coordinate_offset - coordinate_count)
+        throw std::runtime_error("WFTrain sampler checkpoint has truncated ECP coordinates");
+      coordinate_count += extent;
+      grid.knots_per_species.push_back(knots);
+    }
+    grid.coordinates.assign(restored.quadrature_coordinates.begin() + coordinate_offset,
+                            restored.quadrature_coordinates.begin() + coordinate_offset + coordinate_count);
+    coordinate_offset += coordinate_count;
+    potential->validateQuadratureState(grid);
+    prepared_grids.emplace_back(potential, std::move(grid));
+  }
+  if (layout_offset != restored.quadrature_layout.size() ||
+      coordinate_offset != restored.quadrature_coordinates.size())
+    throw std::runtime_error("WFTrain sampler checkpoint has trailing ECP grid data");
+
   return std::make_unique<PreparedSamplerRestore>(
       population_, random_generators_, global_step_, std::move(restored.positions),
       std::move(restored.spins), std::move(restored.walker_reals),
       std::move(restored.walker_ids), std::move(restored.walker_integers),
-      std::move(prepared_rngs), static_cast<int>(restored.global_step));
+      std::move(prepared_rngs), std::move(prepared_grids), static_cast<int>(restored.global_step));
 }
 
 } // namespace qmcplusplus::wftrain

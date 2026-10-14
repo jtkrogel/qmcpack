@@ -51,8 +51,10 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
   ReportEngine PRE(class_name_, "build");
 
   std::string tasking;
+  std::string print_parameters = "yes";
   OhmmsAttributeSet pAttrib;
   pAttrib.add(tasking, "tasking", {"no", "yes"});
+  pAttrib.add(print_parameters, "print_parameters", {"no", "yes"});
   pAttrib.put(cur);
 
   app_summary() << std::endl;
@@ -147,9 +149,14 @@ std::unique_ptr<TrialWaveFunction> WaveFunctionFactory::buildTWF(xmlNodePtr cur,
   }
 
   targetPsi->resetParameters(dummy);
-  app_log() << "  Wave function " << targetPsi->getName() << " parameters:" << std::endl;
-  std::ostringstream oss;
-  dummy.print(app_log(), 4 /* left padding spaces */, true);
+  if (print_parameters == "yes")
+  {
+    app_log() << "  Wave function " << targetPsi->getName() << " parameters:" << std::endl;
+    dummy.print(app_log(), 4 /* left padding spaces */, true);
+  }
+  else
+    app_log() << "  Wave function " << targetPsi->getName() << ": " << dummy.size()
+              << " parameters (listing suppressed)" << std::endl;
   app_log() << std::endl;
   targetPsi->storeSPOMap(sposet_builder_factory.exportSPOSets());
   return targetPsi;

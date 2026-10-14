@@ -854,6 +854,8 @@ psiformer::PsiFormerAcceleratorResolution validateCpuAcceleratorResolution(
 
 } // namespace
 
+struct PsiFormerDerivativeScratch;
+
 /** Shared native model protected at the optimizer/evaluator synchronization
  * boundary. Component clones retain only walker-local move state. */
 class PsiFormerSharedState
@@ -970,6 +972,9 @@ public:
   }
 
   mutable std::shared_mutex mutex;
+  /// Factory lock is separate from the scratch execution lease and model lock.
+  mutable std::mutex derivative_scratch_factory_mutex;
+  std::weak_ptr<PsiFormerDerivativeScratch> derivative_scratch;
   /// Number of pending planned one-electron crowd transactions sharing this model.
   /// Each crowd checks in once, never once per lane.
   std::atomic<std::size_t> planned_single_transaction_count{0};
@@ -1605,13 +1610,71 @@ private:
 
 /** Apply bounded score and kinetic products without a sample-by-parameter matrix.
  *
- * The operator owns reusable direct score and kinetic tapes, three fixed complex
- * contraction vectors, and packed copies of positions, complete TrialWaveFunction
- * drift, and inverse masses.  Its numeric storage is therefore O(P)+O(B Ne),
- * independent of sample history.  It is an independent memory owner: the training
- * driver must add storageDiagnostics().retained_numeric_bytes to its aggregate memory
- * budget before constructing the operator.
+ * Operators retain distinct positions, complete TrialWaveFunction drift and
+ * inverse masses, but lease the O(P) score/kinetic tapes and contraction vectors.
+ * Storage diagnostics include the shared bytes and an identity so aggregate
+ * owners count a lane once rather than once per retained snapshot.
  */
+/** Reusable O(P) execution scratch, independent of immutable retained samples.
+ * One exclusive lease serializes products sharing this lane; separate models and
+ * MPI processes have separate lanes. Scratch is released with its last owner.
+ */
+struct PsiFormerDerivativeScratch
+{
+  PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters)
+      : score(state.direct_score_executor.makeWorkspace()),
+        kinetic(state.direct_kinetic_executor.makeWorkspace())
+  {
+    checkedBatchMemoryMultiply(parameters, sizeof(wftrain::DerivativeValue),
+                               "PsiFormer shared derivative channels");
+    for (auto& channel : channels)
+      channel.resize(parameters);
+  }
+
+  std::recursive_mutex execution_mutex;
+  bool active = false;
+  std::unique_ptr<pf::DirectScoreWorkspace> score;
+  std::unique_ptr<pf::DirectKineticWorkspace> kinetic;
+  std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
+};
+
+/** Serialize competing calls, but reject re-entry from a sink callback.
+ * Recursive acquisition must fail rather than deadlock or overwrite the outer
+ * operation's still-live channels/sample products.
+ */
+class PsiFormerDerivativeLease
+{
+public:
+  explicit PsiFormerDerivativeLease(PsiFormerDerivativeScratch& scratch)
+      : lock_(scratch.execution_mutex), scratch_(scratch)
+  {
+    if (scratch_.active)
+      throw std::logic_error("PsiFormer shared derivative scratch cannot be re-entered");
+    scratch_.active = true;
+  }
+
+  ~PsiFormerDerivativeLease() { scratch_.active = false; }
+
+private:
+  std::unique_lock<std::recursive_mutex> lock_;
+  PsiFormerDerivativeScratch& scratch_;
+};
+
+/** Obtain the prepared lane without retaining scratch permanently on the model. */
+std::shared_ptr<PsiFormerDerivativeScratch> acquireDerivativeScratch(
+    PsiFormerSharedState& state, std::size_t parameters)
+{
+  std::lock_guard factory_lock(state.derivative_scratch_factory_mutex);
+  auto scratch = state.derivative_scratch.lock();
+  if (!scratch)
+  {
+    scratch = std::make_shared<PsiFormerDerivativeScratch>(state, parameters);
+    state.derivative_scratch = scratch;
+  }
+  return scratch;
+}
+
+/** Bind immutable samples to one model version and exclusively leased scratch. */
 class PsiFormerStreamingDerivativeOperator final : public wftrain::StreamingDerivativeOperator
 {
 public:
@@ -1644,11 +1707,10 @@ public:
         total_log_gradients_imaginary_(std::move(total_log_gradients_imaginary)),
         inverse_masses_(std::move(inverse_masses)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
-        score_workspace_(model_state_->direct_score_executor.makeWorkspace()),
-        kinetic_workspace_(model_state_->direct_kinetic_executor.makeWorkspace()),
-        channel_accumulators_{makeParameterVector(schema_->parameterCount()),
-                              makeParameterVector(schema_->parameterCount()),
-                              makeParameterVector(schema_->parameterCount())},
+        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount())),
+        score_workspace_(shared_scratch_->score),
+        kinetic_workspace_(shared_scratch_->kinetic),
+        channel_accumulators_(shared_scratch_->channels),
         sample_products_(makeSampleProductVector(sample_count_)),
         reference_score_products_(makeSampleProductVector(sample_count_)),
         replay_weight_sums_(makeSampleProductVector(sample_count_))
@@ -1811,6 +1873,7 @@ protected:
       wftrain::DerivativeAdjoint adjoint,
       wftrain::ParameterReductionSink& sink) const override
   {
+    PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
       std::shared_lock state_lock(model_state_->mutex);
@@ -1929,6 +1992,7 @@ protected:
   void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
                         wftrain::SampleProductSink& sink) const override
   {
+    PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
       std::shared_lock state_lock(model_state_->mutex);
@@ -1965,6 +2029,7 @@ protected:
       std::uint32_t local_energy_term_mask,
       wftrain::SampleProductSink& sink) const override
   {
+    PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     const std::uint32_t kinetic_mask =
         wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
@@ -2402,7 +2467,10 @@ private:
             sample_product_bytes,
             retained_bytes,
             1,
-            fingerprint};
+            fingerprint,
+            reinterpret_cast<std::uintptr_t>(shared_scratch_.get()),
+            checkedBatchMemoryAdd(workspace_bytes, channel_bytes,
+                                  "PsiFormer shared scratch retained bytes")};
   }
 
   std::shared_ptr<PsiFormerSharedState> model_state_;
@@ -2417,11 +2485,12 @@ private:
   std::vector<double> total_log_gradients_imaginary_;
   std::vector<double> inverse_masses_;
   wftrain::ParameterChunkPlan chunk_plan_;
-  mutable std::unique_ptr<pf::DirectScoreWorkspace> score_workspace_;
-  mutable std::unique_ptr<pf::DirectKineticWorkspace> kinetic_workspace_;
-  mutable std::array<std::vector<wftrain::DerivativeValue>,
+  std::shared_ptr<PsiFormerDerivativeScratch> shared_scratch_;
+  const std::unique_ptr<pf::DirectScoreWorkspace>& score_workspace_;
+  const std::unique_ptr<pf::DirectKineticWorkspace>& kinetic_workspace_;
+  std::array<std::vector<wftrain::DerivativeValue>,
                      MAXIMUM_VJP_CHANNELS>
-      channel_accumulators_;
+      &channel_accumulators_;
   mutable std::vector<wftrain::DerivativeValue> sample_products_;
   mutable std::vector<wftrain::DerivativeValue> reference_score_products_;
   mutable std::vector<wftrain::DerivativeValue> replay_weight_sums_;

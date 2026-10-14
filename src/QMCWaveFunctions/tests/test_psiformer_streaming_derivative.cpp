@@ -210,6 +210,27 @@ private:
   std::vector<DerivativeValue> results_;
 };
 
+/** Attempt a nested product while the outer sink still consumes leased scratch. */
+class ReentrantSampleSink final : public SampleProductSink
+{
+public:
+  ReentrantSampleSink(const StreamingDerivativeOperator& other,
+                      const wftrain::StructuredParameterVectorConstView& direction)
+      : other_(other), direction_(direction)
+  {}
+
+protected:
+  void consume(const SampleProductTileConstView&) override
+  {
+    RecordingSampleSink nested;
+    other_.applyScoreJVP(direction_, nested);
+  }
+
+private:
+  const StreamingDerivativeOperator& other_;
+  const wftrain::StructuredParameterVectorConstView& direction_;
+};
+
 /// Form coefficient metadata tied to one prepared provider and backing vector.
 CoefficientView coefficientsFor(const StreamingDerivativeOperator& op,
                                 const std::vector<DerivativeValue>& coefficients)
@@ -451,6 +472,14 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
   CHECK(storage.allocation_generation == 1);
   CHECK(storage.storage_fingerprint != 0);
 
+  // Concurrently retained sample owners share scratch, not their positions or
+  // sample products. Sharing remains valid when either owner is released first.
+  auto shared_sample = component.makeStreamingDerivativeOperator(
+      one_component, one_particle, 31, 17, 257);
+  CHECK(storage.shared_workspace_identity != 0);
+  CHECK(shared_sample->storageDiagnostics().shared_workspace_identity == storage.shared_workspace_identity);
+  CHECK(storage.shared_workspace_bytes > storage.parameter_scratch_bytes);
+
   // Existing selected-score evaluations provide a separate high-level oracle.
   std::vector<std::vector<DerivativeValue>> expected_scores(
       2, std::vector<DerivativeValue>(selected.size()));
@@ -606,6 +635,17 @@ TEST_CASE("PsiFormer streams bounded score and kinetic products",
   CHECK(unsupported_jvp_sink.state() == DerivativeSinkState::IDLE);
 
   // Verify the matrix-free duality identity using the first complex VJP channel.
+  RecordingSampleSink shared_jvp_sink;
+  shared_sample->applyScoreJVP(direction_view, shared_jvp_sink);
+  REQUIRE(shared_jvp_sink.results().size() == 1);
+  checkClose(shared_jvp_sink.results()[0], jvp_sink.results()[0]);
+  RecordingSampleSink repeated_jvp_sink;
+  ReentrantSampleSink reentrant_sink(*shared_sample, direction_view);
+  CHECK_THROWS(op->applyScoreJVP(direction_view, reentrant_sink));
+  // The failed nested lease must not poison the next ordinary operation.
+  op->applyScoreJVP(direction_view, repeated_jvp_sink);
+  for (std::size_t sample = 0; sample < 2; ++sample)
+    checkClose(repeated_jvp_sink.results()[sample], jvp_sink.results()[sample]);
   DerivativeValue direction_dot_vjp{};
   for (std::size_t parameter = 0; parameter < selected.size(); ++parameter)
     direction_dot_vjp += selected_direction[parameter] *

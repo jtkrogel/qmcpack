@@ -251,6 +251,19 @@ public:
                                    const RefVector<ContextForSteps>& step_context,
                                    const bool serializing_crowd_walkers);
 
+  /// Reconstruct restored VGL/energy caches without rotating accepted ECP grids.
+  static void initialLogEvaluationDeterministic(int crowd_id,
+                                               UPtrVector<Crowd>& crowds,
+                                               const RefVector<ContextForSteps>& step_context,
+                                               bool serializing_crowd_walkers);
+
+  /// Common initialization body; public wrappers preserve the four-argument crowd ABI.
+  static void initialLogEvaluationImpl(int crowd_id,
+                                       UPtrVector<Crowd>& crowds,
+                                       const RefVector<ContextForSteps>& step_context,
+                                       bool serializing_crowd_walkers,
+                                       bool deterministic_hamiltonian);
+
 
   /** should be set in input don't see a reason to set individually
    * @param pbyp if true, use particle-by-particle update

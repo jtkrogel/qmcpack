@@ -247,8 +247,27 @@ void QMCDriverNew::makeLocalWalkers(IndexType nwalkers, RealType reserve)
 
 void QMCDriverNew::initialLogEvaluation(int crowd_id,
                                         UPtrVector<Crowd>& crowds,
+                                        const RefVector<ContextForSteps>& contexts,
+                                        const bool serializing)
+{
+  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, false);
+}
+
+/** Preserve restored stochastic grid/RNG state while rebuilding derived caches. */
+void QMCDriverNew::initialLogEvaluationDeterministic(int crowd_id,
+                                                     UPtrVector<Crowd>& crowds,
+                                                     const RefVector<ContextForSteps>& contexts,
+                                                     const bool serializing)
+{
+  initialLogEvaluationImpl(crowd_id, crowds, contexts, serializing, true);
+}
+
+/** Initialize resident walker caches with either ordinary or fixed-grid energies. */
+void QMCDriverNew::initialLogEvaluationImpl(int crowd_id,
+                                        UPtrVector<Crowd>& crowds,
                                         const RefVector<ContextForSteps>& context_for_steps,
-                                        const bool serializing_crowd_walkers)
+                                        const bool serializing_crowd_walkers,
+                                        const bool deterministic_hamiltonian)
 {
   Crowd& crowd = *(crowds[crowd_id]);
   if (crowd.size() == 0)
@@ -281,8 +300,16 @@ void QMCDriverNew::initialLogEvaluation(int crowd_id,
   for (int iw = 0; iw < crowd.size(); ++iw)
     saveElecPosAndGLToWalkers(walker_elecs[iw], walkers[iw]);
 
-  std::vector<QMCHamiltonian::FullPrecRealType> local_energies(
-      ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs));
+  std::vector<QMCHamiltonian::FullPrecRealType> local_energies;
+  if (deterministic_hamiltonian)
+  {
+    local_energies.reserve(walkers.size());
+    for (int walker = 0; walker < crowd.size(); ++walker)
+      local_energies.push_back(walker_hamiltonians[walker].evaluateDeterministic(
+          walker_twfs[walker], walker_elecs[walker]));
+  }
+  else
+    local_energies = ham_dispatcher.flex_evaluate(walker_hamiltonians, walker_twfs, walker_elecs);
 
   // \todo rename these are sets not resets.
   auto resetSigNLocalEnergy = [](MCPWalker& walker, TrialWaveFunction& twf, auto local_energy) {

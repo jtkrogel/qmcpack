@@ -2,6 +2,56 @@
 # Only the small repository BFD pseudopotential tables are linked into each test
 # directory; no orbital or trained-parameter state is required.
 if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  foreach(ECP_CASE continuous checkpoint restart)
+    set(TEST_ADDED FALSE)
+    set(ECP_TEST short-LiH-pp-psiformer-ecp-${ECP_CASE}-r1-t1)
+    run_qmc_app(${ECP_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp_psiformer_wftrain"
+                1 1 TEST_ADDED wftrain_ecp_${ECP_CASE}.xml)
+    if(TEST_ADDED)
+      foreach(PP_FILE IN ITEMS Li.BFD.xml H.BFD.xml)
+        maybe_symlink("${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp/${PP_FILE}"
+                      "${CMAKE_CURRENT_BINARY_DIR}/${ECP_TEST}/${PP_FILE}")
+      endforeach()
+      set_property(TEST ${ECP_TEST} PROPERTY PASS_REGULAR_EXPRESSION "WFTrain checkpointed")
+      if(ECP_CASE STREQUAL "restart")
+        set(FIRST_TEST short-LiH-pp-psiformer-ecp-checkpoint-r1-t1)
+        maybe_symlink("${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp_psiformer_wftrain/wftrain_ecp_restart.xml"
+                      "${CMAKE_CURRENT_BINARY_DIR}/${FIRST_TEST}/wftrain_ecp_restart.xml")
+        set_property(TEST ${ECP_TEST} PROPERTY DEPENDS ${FIRST_TEST})
+        set_property(TEST ${ECP_TEST} PROPERTY WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${FIRST_TEST}")
+      endif()
+    endif()
+  endforeach()
+  find_program(PSIFORMER_H5DIFF h5diff)
+  find_program(PSIFORMER_H5DUMP h5dump)
+  if(TEST_ADDED AND PSIFORMER_H5DIFF AND PSIFORMER_H5DUMP AND Python3_EXECUTABLE)
+    add_test(NAME short-LiH-pp-psiformer-ecp-restart-equivalence
+             COMMAND ${Python3_EXECUTABLE}
+               "${CMAKE_CURRENT_SOURCE_DIR}/compare_ecp_restart.py"
+               "${CMAKE_CURRENT_BINARY_DIR}/short-LiH-pp-psiformer-ecp-continuous-r1-t1/ecp_continuous.manifest.h5"
+               "${CMAKE_CURRENT_BINARY_DIR}/short-LiH-pp-psiformer-ecp-checkpoint-r1-t1/ecp_resumed.manifest.h5"
+               --h5diff ${PSIFORMER_H5DIFF} --h5dump ${PSIFORMER_H5DUMP})
+    set_property(TEST short-LiH-pp-psiformer-ecp-restart-equivalence PROPERTY DEPENDS
+                 "short-LiH-pp-psiformer-ecp-continuous-r1-t1;short-LiH-pp-psiformer-ecp-restart-r1-t1")
+  endif()
+  if(Python3_EXECUTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(RSS_TEST short-LiH-pp-psiformer-rss-guard)
+    set(RSS_DIR "${CMAKE_CURRENT_BINARY_DIR}/${RSS_TEST}")
+    file(MAKE_DIRECTORY "${RSS_DIR}")
+    maybe_symlink("${CMAKE_CURRENT_SOURCE_DIR}/wftrain_rss_guard.xml" "${RSS_DIR}/wftrain_rss_guard.xml")
+    foreach(PP_FILE IN ITEMS Li.BFD.xml H.BFD.xml)
+      maybe_symlink("${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp/${PP_FILE}" "${RSS_DIR}/${PP_FILE}")
+    endforeach()
+    add_test(NAME ${RSS_TEST} COMMAND ${Python3_EXECUTABLE}
+             "${CMAKE_CURRENT_SOURCE_DIR}/check_rss_guard.py" $<TARGET_FILE:qmcpack>)
+    set_tests_properties(${RSS_TEST} PROPERTIES WORKING_DIRECTORY "${RSS_DIR}"
+                         ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+    add_test(NAME short-H2-psiformer-training-history
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_training_history.py"
+             "${qmcpack_BINARY_DIR}/tests/molecules/H2_ae_psiformer_wftrain/short-H2-psiformer-wftrain-pooled-r1-t1/h2_psiformer_pooled")
+    set_property(TEST short-H2-psiformer-training-history PROPERTY DEPENDS
+                 short-H2-psiformer-wftrain-pooled-r1-t1)
+  endif()
   set(POOLED_TEST short-LiH-pp-psiformer-wftrain-pooled-r1-t1)
   set(TEST_ADDED FALSE)
   run_qmc_app(${POOLED_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/LiH_pp_psiformer_wftrain"

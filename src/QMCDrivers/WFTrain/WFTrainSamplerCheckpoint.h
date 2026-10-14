@@ -37,8 +37,8 @@ struct SamplerShardTopology
 
 /** Persist the rank-local WFTrain Markov-chain state without model duplication.
  *
- * Wavefunction/Hamiltonian caches are intentionally omitted: the driver performs
- * a full initialLogEvaluation after committing the restored walkers and RNGs.
+ * Accepted ECP grids are persisted. Derived wavefunction/Hamiltonian caches are
+ * rebuilt deterministically after restoring walkers, quadrature grids and RNGs.
  */
 class WFTrainSamplerCheckpoint final : public SamplerCheckpointContributor
 {

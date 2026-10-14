@@ -164,6 +164,17 @@ public:
 
   void rotateQuadratureGrid(const TensorType& rmat);
 
+  /// Expose accepted coordinates for checkpoint capture without exposing mutation.
+  const std::vector<PosType>& rotatedGrid() const noexcept { return rrotsgrid_m; }
+
+  /// Copy previously validated coordinates into existing grid storage.
+  void restoreRotatedGridUnchecked(const double* coordinates) noexcept
+  {
+    for (auto& point : rrotsgrid_m)
+      for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+        point[dimension] = *coordinates++;
+  }
+
   /** Build one contiguous quadrature-knot range into caller-owned storage.
    *
    * The output vectors and scratch vectors must already be large enough.  A

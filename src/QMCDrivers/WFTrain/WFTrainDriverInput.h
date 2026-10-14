@@ -140,6 +140,8 @@ public:
    * available; it is not a process-wide allocator limit.
    */
   std::size_t getMaximumRetainedBytes() const noexcept { return maximum_retained_bytes_; }
+  /// Optional measured process-RSS guard; distinct from numeric workspace accounting.
+  std::size_t getMaximumResidentBytes() const noexcept { return maximum_resident_bytes_; }
   const std::string& getCheckpointPath() const noexcept { return checkpoint_path_; }
   const std::string& getRestartPath() const noexcept { return restart_path_; }
   const std::string& getProviderID() const noexcept { return provider_id_; }
@@ -202,6 +204,7 @@ private:
   double krylov_curvature_tolerance_{0.0};
   double krylov_imaginary_tolerance_{64.0};
   std::size_t maximum_retained_bytes_{0};
+  std::size_t maximum_resident_bytes_{0};
   std::string checkpoint_path_;
   std::string restart_path_;
   std::string provider_id_;

@@ -566,7 +566,8 @@ struct StreamingDerivativeCapabilities
  *
  * Metadata owned by schemas and chunk descriptors is deliberately excluded.  The
  * reported bytes cover every numeric buffer retained by the producer and therefore
- * provide the quantity that a future driver must add to its aggregate memory budget.
+ * provide the quantity for aggregate memory budgets. Shared workspace identities
+ * must be deduplicated when combining multiple producers that lease the same lane.
  */
 struct StreamingDerivativeStorageDiagnostics
 {
@@ -582,6 +583,9 @@ struct StreamingDerivativeStorageDiagnostics
   std::size_t retained_numeric_bytes          = 0;
   std::size_t allocation_generation           = 0;
   std::size_t storage_fingerprint              = 0;
+  /// Shared scratch is included above, but aggregate owners must count it once.
+  std::uintptr_t shared_workspace_identity     = 0;
+  std::size_t shared_workspace_bytes           = 0;
 };
 
 /** Common checked front end for bounded multi-channel VJP and score JVP kernels.

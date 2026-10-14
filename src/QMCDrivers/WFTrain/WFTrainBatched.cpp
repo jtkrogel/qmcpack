@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -50,6 +51,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace qmcplusplus
 {
@@ -456,8 +460,20 @@ wftrain::PreparedEnergyGradientStorageDiagnostics preparedStorageDiagnostics(
       throw std::invalid_argument(
           "WFTrainBatched: prepared batch has no derivative operator");
     result.sample_count += batch.weights.size();
-    result.derivative_owner_bytes +=
-        batch.derivative_operator->storageDiagnostics().retained_numeric_bytes;
+    const auto storage = batch.derivative_operator->storageDiagnostics();
+    result.derivative_owner_bytes += storage.retained_numeric_bytes;
+    if (storage.shared_workspace_identity)
+      for (const auto& previous : batches)
+      {
+        if (&previous == &batch)
+          break;
+        if (previous.derivative_operator->storageDiagnostics().shared_workspace_identity ==
+            storage.shared_workspace_identity)
+        {
+          result.derivative_owner_bytes -= storage.shared_workspace_bytes;
+          break;
+        }
+      }
     result.sample_scalar_bytes += batch.weights.capacity() * sizeof(wftrain::DerivativeReal) +
         batch.local_energies.capacity() * sizeof(wftrain::DerivativeValue);
     if (batch.additive_local_energy_vjp)
@@ -469,7 +485,36 @@ wftrain::PreparedEnergyGradientStorageDiagnostics preparedStorageDiagnostics(
   return result;
 }
 
-/** Reject a rank-local memory-budget violation on every rank before evaluation. */
+/** Measure process RSS including opaque heap owners; zero means unavailable. */
+std::size_t currentResidentBytes()
+{
+#ifdef __linux__
+  std::ifstream status("/proc/self/statm");
+  std::size_t virtual_pages = 0, resident_pages = 0;
+  const long page_bytes = sysconf(_SC_PAGESIZE);
+  if (status >> virtual_pages >> resident_pages && page_bytes > 0 &&
+      resident_pages <= std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(page_bytes))
+    return resident_pages * static_cast<std::size_t>(page_bytes);
+#endif
+  return 0;
+}
+
+/** Enforce a measured per-process boundary guard including opaque heap owners.
+ * It is not an allocator limit: transient peaks between checks can exceed it.
+ */
+void enforceResidentBudget(Communicate& communicator, std::size_t maximum_bytes)
+{
+  if (!maximum_bytes)
+    return;
+  const auto measured = currentResidentBytes();
+  int failed = measured == 0 || measured > maximum_bytes;
+  communicator.allreduce(failed);
+  if (failed)
+    throw UniformCommunicateError(
+        "WFTrainBatched: process RSS exceeds maximum_resident_bytes or cannot be measured");
+}
+
+/** Reject a rank-local numeric-budget violation before derivative evaluation. */
 void enforceMemoryBudget(Communicate& communicator,
                          std::size_t retained_bytes,
                          std::size_t maximum_retained_bytes)
@@ -864,12 +909,6 @@ void WFTrainBatched::process(xmlNodePtr node)
 
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
-    if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
-        (!training_input_.getCheckpointPath().empty() ||
-         !training_input_.getRestartPath().empty()))
-      throw UniformCommunicateError(
-          "WFTrainBatched: exact checkpoint/restart is not yet supported for "
-          "stochastic nonlocal-ECP quadrature state");
     if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY)
       validateHamiltonianForTraining();
 
@@ -1008,6 +1047,27 @@ void WFTrainBatched::run()
       population_, rngs_, global_step, static_cast<std::size_t>(myComm->size()),
       static_cast<std::size_t>(myComm->rank()), crowds_.size());
   const bool resumed = !training_input_.getRestartPath().empty();
+  // Scalar blocks remain statistical output. This separate history records one
+  // complete optimization attempt, including its sampled and published versions.
+  std::ofstream iteration_history;
+  bool history_failed = false;
+  if (myComm->rank() == 0)
+  {
+    const std::string history_path = get_root_name() + ".training.csv";
+    std::ifstream previous(history_path);
+    const bool has_header = resumed && previous.peek() != std::ifstream::traits_type::eof();
+    iteration_history.open(history_path, resumed ? std::ios::app : std::ios::trunc);
+    if (!has_header)
+      iteration_history << "iteration,sample_version,parameter_version,objective,optimizer,samples,"
+                           "mean_energy,variance,gradient_norm,overlap_loss,selected_alpha,committed,"
+                           "sampling_seconds,total_seconds,retained_numeric_bytes,resident_bytes,"
+                           "krylov_iterations,krylov_operator_applications\n";
+    iteration_history.flush();
+    history_failed = !iteration_history;
+  }
+  myComm->bcast(history_failed);
+  if (history_failed)
+    throw UniformCommunicateError("WFTrainBatched: cannot open iteration history");
   if (resumed)
   {
     if (myComm->rank() == 0)
@@ -1031,10 +1091,12 @@ void WFTrainBatched::run()
   {
     ScopedTimer initialization_timer(timers_.init_walkers_timer);
     auto step_context_refs = getContextForStepsRefs();
-    crowd_task(crowds_.size(), initialLogEvaluation, crowds_, step_context_refs,
+    const auto initialize = resumed ? initialLogEvaluationDeterministic : initialLogEvaluation;
+    crowd_task(crowds_.size(), initialize, crowds_, step_context_refs,
                serializing_crowd_walkers_);
     print_mem("WFTrainBatched after initialLogEvaluation", app_summary());
   }
+  enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
   ScopedTimer production_timer(timers_.production_timer);
   if (!resumed)
@@ -1058,6 +1120,8 @@ void WFTrainBatched::run()
        iteration < num_iterations; ++iteration)
   {
     ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
+    Timer iteration_wall;
+    const auto sample_version = training_state.parameter_version;
     // This equilibration is separate from the initial qmc warmup. Warmup moves
     // honor substeps but contribute neither retained samples nor scalar statistics.
     for (std::size_t warmup = 0; warmup < training_input_.getWarmupSteps(); ++warmup)
@@ -1121,6 +1185,7 @@ void WFTrainBatched::run()
           throw UniformCommunicateError("WFTrainBatched: another rank failed to retain iteration samples");
         }
         enforceMemoryBudget(*myComm, retained_configuration_bytes, training_input_.getMaximumRetainedBytes());
+        enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
       }
       // Statistical rows refer only to this iteration's fixed parameter version.
       endBlock();
@@ -1129,6 +1194,7 @@ void WFTrainBatched::run()
       ++completed_blocks;
     }
 
+    const double sampling_seconds = iteration_wall.elapsed();
     wftrain::TrainingIterationResult iteration_result;
     wftrain::PreparedEnergyGradientStorageDiagnostics storage_diagnostics;
     std::size_t retained_numeric_bytes = 0;
@@ -1369,6 +1435,7 @@ void WFTrainBatched::run()
             sample_offset += crowd.size();
           }
           storage_diagnostics = preparedStorageDiagnostics(batches);
+          // RSS covers ParticleSet/teacher caches that numeric diagnostics omit.
         }
         catch (...)
         {
@@ -1384,6 +1451,7 @@ void WFTrainBatched::run()
           throw UniformCommunicateError(
               "WFTrainBatched: another rank failed while preparing a live training batch");
         }
+        enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
         if (isFirstOrder(optimizer_kind) ||
             optimizer_kind == WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
@@ -1739,6 +1807,7 @@ void WFTrainBatched::run()
     // consuming production quadrature RNG merely to refresh the unchanged ECP state.
     cache_observer.clear();
     stage_state.completed_stage_iterations = iteration_result.completed_iteration;
+    enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
     if (myComm->rank() == 0)
     {
@@ -1797,6 +1866,37 @@ void WFTrainBatched::run()
     }
 
     // Runtime and exact checkpoints are checked only at complete update boundaries.
+    history_failed = false;
+    if (myComm->rank() == 0)
+    {
+      iteration_history << std::setprecision(17) << iteration_result.completed_iteration << ','
+                        << sample_version << ',' << iteration_result.parameter_version << ','
+                        << (determinant_overlap ? "determinant_overlap" : "energy") << ','
+                        << wftrain::optimizerName(training_input_.getOptimizer()) << ',';
+      if (overlap_diagnostics)
+        iteration_history << overlap_diagnostics->sample_count << ",,,,"
+                          << overlap_diagnostics->loss;
+      else
+        iteration_history << iteration_result.objective.sample_count << ','
+                          << std::real(iteration_result.objective.mean_energy) << ','
+                          << iteration_result.objective.energy_variance << ','
+                          << gradientNorm(iteration_result.objective.gradient) << ',';
+      iteration_history << ',' << selected_alpha << ',' << (selected_alpha != 0.0) << ','
+                        << sampling_seconds << ',' << iteration_wall.elapsed() << ','
+                        << checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes) << ','
+                        << currentResidentBytes() << ',';
+      if (krylov_iterations)
+        iteration_history << *krylov_iterations;
+      iteration_history << ',';
+      if (krylov_operator_applications)
+        iteration_history << *krylov_operator_applications;
+      iteration_history << '\n';
+      iteration_history.flush();
+      history_failed = !iteration_history;
+    }
+    myComm->bcast(history_failed);
+    if (history_failed)
+      throw UniformCommunicateError("WFTrainBatched: failed to write iteration history");
     bool stop_requested = false;
     if (myComm->rank() == 0)
       stop_requested = runtime_control.checkStop(training_loop);

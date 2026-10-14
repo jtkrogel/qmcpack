@@ -28,7 +28,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 61> allowed_controls{
+constexpr std::array<std::string_view, 62> allowed_controls{
     "iterations", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
@@ -42,7 +42,7 @@ constexpr std::array<std::string_view, 61> allowed_controls{
     "krylov_relative_tolerance", "krylov_absolute_tolerance", "krylov_maximum_iterations",
     "krylov_maximum_operator_applications", "krylov_maximum_seconds", "krylov_stagnation_window",
     "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
-    "maximum_retained_bytes", "checkpoint_path", "restart_path", "provider",
+    "maximum_retained_bytes", "maximum_resident_bytes", "checkpoint_path", "restart_path", "provider",
     "teacher", "overlap_target", "overlap_weighting", "target_provenance",
     "minimum_fidelity", "minimum_effective_samples", "pii_shift_mode",
     "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
@@ -295,6 +295,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   krylov_curvature_tolerance_          = 0.0;
   krylov_imaginary_tolerance_          = 64.0;
   maximum_retained_bytes_              = 0;
+  maximum_resident_bytes_              = 0;
   checkpoint_path_.clear();
   restart_path_.clear();
   provider_id_.clear();
@@ -528,6 +529,9 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (seen_controls.find("maximum_retained_bytes") != seen_controls.end())
     maximum_retained_bytes_ = parseNonnegativeSize(readControl("maximum_retained_bytes"),
                                                    "maximum_retained_bytes");
+  if (seen_controls.count("maximum_resident_bytes"))
+    maximum_resident_bytes_ = parseNonnegativeSize(readControl("maximum_resident_bytes"),
+                                                  "maximum_resident_bytes");
   if (seen_controls.find("checkpoint_path") != seen_controls.end())
     checkpoint_path_ = readControl("checkpoint_path");
   if (seen_controls.find("restart_path") != seen_controls.end())

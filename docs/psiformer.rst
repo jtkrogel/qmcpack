@@ -500,17 +500,49 @@ Repeated configurations from the same walker share a chain identity in the
 line-search uncertainty calculation; importance-weight ESS alone does not
 measure serial independence.
 
-Retained samples also require configuration storage and per-snapshot derivative
-workspaces; increasing blocks or steps increases memory and derivative work.
-The numeric storage budget includes copied position/gradient/Laplacian arrays,
-but is not a process-RSS ceiling and excludes opaque teacher-clone caches and
-allocator overhead. Workspace sharing across snapshots remains a later
-performance improvement. ``samples`` is rejected for this driver: specify
-walkers, blocks and steps instead.
+Retained snapshots keep distinct configurations, energies and ECP replay data,
+but share the large score/kinetic workspaces and parameter-channel buffers.
+An exclusive lease protects the current single execution lane per model; this
+is memory sharing, not an assertion of threaded derivative scaling. Numeric
+diagnostics count shared scratch once. Sample-local ECP responses and optimizer
+vectors remain separately owned. Increasing blocks/steps still increases sample
+storage and derivative work. ``samples`` is rejected: specify walkers, blocks
+and steps instead.
+
+``maximum_retained_bytes`` limits accounted numeric storage, including copied
+position/gradient/Laplacian arrays. It is not a process-RSS ceiling. The optional
+training parameter ``maximum_resident_bytes`` (default zero, disabled) instead
+checks measured per-rank resident memory at initialization, sample collection,
+derivative preparation and update boundaries. On Linux it includes opaque
+ParticleSet/teacher caches, model storage and allocator overhead. It is a
+boundary check, not an allocator or transient-peak limit; a requested guard
+fails explicitly if RSS cannot be measured. MPI ranks each apply their own limit.
+
+Every training section writes ``<project>.sNNN.training.csv`` with one row per
+optimizer attempt, independently of scalar statistical blocks. It records the
+sampled/published parameter versions, sample count, energy/variance/gradient
+norm or overlap loss, selected alpha, committed flag, sampling/full-iteration
+wall time, retained numeric bytes, rank-zero RSS and solver diagnostics.
+Full-iteration timing excludes the subsequent checkpoint write. Restart appends
+to an existing history for the same output root, or writes a fresh header when
+the output root changes.
+
+To suppress the potentially enormous startup parameter table while keeping
+other diagnostics, use ``<wavefunction ... print_parameters="no">``. The default
+is ``yes`` for compatibility; ``no`` prints the parameter count only.
 
 Exact training checkpoints are taken only after a complete iteration. A qmc
 checkpoint period counts statistical blocks; crossing its boundary schedules
 the training checkpoint at the end of the encompassing iteration.
+Ordinary-locality ECP training now persists each walker's accepted rotated
+quadrature grids alongside walker and RNG state. Restart validates the grid
+layout and finite unit-sphere coordinates, restores them transactionally, then
+reconstructs caches deterministically without consuming new random rotations.
+The sampler contributor uses payload version two for ECP state; legacy
+all-electron version-one payloads remain supported. Envelope and contributor
+format versions are separate. Physical-system/Hamiltonian inputs, rank/crowd
+topology and sampling controls must still match. A short uninterrupted-versus-
+restarted regression compares parameters, optimizer, sampler and grids exactly.
 
 To migrate the earlier final-population behavior, move the old ``blocks`` count
 to training ``iterations``, set sampling ``blocks=1`` and ``steps=1``, and multiply

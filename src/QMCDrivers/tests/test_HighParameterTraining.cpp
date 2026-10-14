@@ -147,7 +147,18 @@ public:
 
   const ParameterChunkPlan& parameterChunkPlan() const noexcept override { return plan_; }
 
+  /// Synthetic storage evidence exercises aggregate shared-owner accounting.
+  StreamingDerivativeStorageDiagnostics storageDiagnostics() const override { return storage_; }
+
+  void setSharedStorage(std::size_t owned)
+  {
+    storage_.shared_workspace_identity = 7;
+    storage_.shared_workspace_bytes = 100;
+    storage_.retained_numeric_bytes = owned + 100;
+  }
+
 protected:
+  StreamingDerivativeStorageDiagnostics storage_;
   void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
                     DerivativeAdjoint adjoint,
                     ParameterReductionSink& sink) const override
@@ -556,6 +567,7 @@ TEST_CASE("Prepared live batches compose one bounded rank-local objective",
       ComplexRows{responses[0]}, false, nullptr,
       localEnergyTermBit(LocalEnergyTerm::KINETIC), 0, 0);
   first.weights = {1.0};
+  dynamic_cast<ToyStreamingOperator&>(*first.derivative_operator).setSharedStorage(20);
   first.local_energies = {-1.0};
   first.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
   batches.push_back(std::move(first));
@@ -567,6 +579,7 @@ TEST_CASE("Prepared live batches compose one bounded rank-local objective",
       ComplexRows{responses[1], responses[2]}, false, nullptr,
       localEnergyTermBit(LocalEnergyTerm::KINETIC), 1, 1);
   second.weights = {2.0, 1.0};
+  dynamic_cast<ToyStreamingOperator&>(*second.derivative_operator).setSharedStorage(30);
   second.local_energies = {0.5, 2.0};
   second.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
   batches.push_back(std::move(second));
@@ -579,6 +592,7 @@ TEST_CASE("Prepared live batches compose one bounded rank-local objective",
       producer.storageDiagnostics();
   CHECK(storage.batch_count == 2);
   CHECK(storage.sample_count == 3);
+  CHECK(storage.derivative_owner_bytes == 150);
   CHECK(storage.sample_scalar_bytes ==
         3 * (sizeof(DerivativeReal) + sizeof(DerivativeValue)));
 

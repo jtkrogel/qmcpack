@@ -303,8 +303,21 @@ PreparedEnergyGradientProducer::storageDiagnostics() const noexcept
   for (const PreparedEnergyGradientBatch& batch : batches_)
   {
     diagnostics.sample_count += batch.weights.size();
-    diagnostics.derivative_owner_bytes +=
-        batch.derivative_operator->storageDiagnostics().retained_numeric_bytes;
+    const auto storage = batch.derivative_operator->storageDiagnostics();
+    diagnostics.derivative_owner_bytes += storage.retained_numeric_bytes;
+    // This allocation-free identity scan is safe inside the noexcept diagnostic.
+    if (storage.shared_workspace_identity)
+      for (const auto& previous : batches_)
+      {
+        if (&previous == &batch)
+          break;
+        if (previous.derivative_operator->storageDiagnostics().shared_workspace_identity ==
+            storage.shared_workspace_identity)
+        {
+          diagnostics.derivative_owner_bytes -= storage.shared_workspace_bytes;
+          break;
+        }
+      }
     diagnostics.sample_scalar_bytes +=
         batch.weights.capacity() * sizeof(DerivativeReal) +
         batch.local_energies.capacity() * sizeof(DerivativeValue);

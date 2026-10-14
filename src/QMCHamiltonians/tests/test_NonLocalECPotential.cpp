@@ -517,6 +517,20 @@ TEST_CASE("NonLocalECPotential", "[hamiltonian]")
   testing::TestNonLocalECPotential::copyGridUnrotatedForTest(nl_ecp);
   testing::TestNonLocalECPotential::copyGridUnrotatedForTest(nl_ecp2);
 
+  // Persistent checkpoint grids must retain exact coordinates and reject
+  // malformed layouts/non-finite data before entering an allocation-free commit.
+  const auto saved_grid = nl_ecp.captureQuadratureState();
+  CHECK_NOTHROW(nl_ecp.validateQuadratureState(saved_grid));
+  auto invalid_grid = saved_grid;
+  REQUIRE_FALSE(invalid_grid.coordinates.empty());
+  invalid_grid.coordinates[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(nl_ecp.validateQuadratureState(invalid_grid));
+  invalid_grid = saved_grid;
+  ++invalid_grid.knots_per_species[0];
+  CHECK_THROWS(nl_ecp.validateQuadratureState(invalid_grid));
+  nl_ecp.restoreQuadratureStateUnchecked(saved_grid);
+  CHECK(nl_ecp.captureQuadratureState().coordinates == saved_grid.coordinates);
+
   CHECK(!testing::TestNonLocalECPotential::didGridChange(nl_ecp));
 
   ListenerOption<Real> listener_opt{listeners, ion_listeners};

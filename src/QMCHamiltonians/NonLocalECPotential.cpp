@@ -18,6 +18,8 @@
 #include "NonLocalECPotential.h"
 
 #include <limits>
+#include <cstring>
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -260,6 +262,58 @@ NonLocalECPotential::Return_t NonLocalECPotential::evaluateDeterministic(TrialWa
 {
   evaluateImpl(psi, P, false, true);
   return value_;
+}
+
+/** Snapshot each species' rotated grid without touching its random generator. */
+NonLocalECPotential::QuadratureState NonLocalECPotential::captureQuadratureState() const
+{
+  QuadratureState result;
+  for (const auto& component : PPset)
+  {
+    result.knots_per_species.push_back(component ? component->rotatedGrid().size() : 0);
+    if (component)
+      for (const auto& point : component->rotatedGrid())
+        for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+          result.coordinates.push_back(point[dimension]);
+  }
+  return result;
+}
+
+/** Reject foreign layouts and invalid coordinates before noexcept publication. */
+void NonLocalECPotential::validateQuadratureState(const QuadratureState& state) const
+{
+  const auto expected = captureQuadratureState();
+  if (state.knots_per_species != expected.knots_per_species ||
+      state.coordinates.size() != expected.coordinates.size())
+    throw std::invalid_argument("Nonlocal ECP checkpoint quadrature layout mismatch");
+  for (std::size_t point = 0; point < state.coordinates.size(); point += OHMMS_DIM)
+  {
+    double squared_radius = 0.0;
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      const double coordinate = state.coordinates[point + dimension];
+      std::uint64_t bits;
+      std::memcpy(&bits, &coordinate, sizeof(bits));
+      if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) ||
+          std::abs(coordinate) > 2.0)
+        throw std::invalid_argument("Nonlocal ECP checkpoint has invalid quadrature coordinates");
+      squared_radius += coordinate * coordinate;
+    }
+    if (std::abs(squared_radius - 1.0) > 1e-6)
+      throw std::invalid_argument("Nonlocal ECP checkpoint grid is not on the unit sphere");
+  }
+}
+
+/** Restore accepted grids after validation; no rotations or allocations occur. */
+void NonLocalECPotential::restoreQuadratureStateUnchecked(const QuadratureState& state) noexcept
+{
+  std::size_t coordinate = 0;
+  for (auto& component : PPset)
+    if (component)
+    {
+      component->restoreRotatedGridUnchecked(state.coordinates.data() + coordinate);
+      coordinate += component->rotatedGrid().size() * OHMMS_DIM;
+    }
 }
 
 void NonLocalECPotential::mw_evaluate(const RefVectorWithLeader<OperatorBase>& o_list,

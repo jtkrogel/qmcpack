@@ -103,6 +103,22 @@ public:
 
   Return_t evaluate(TrialWaveFunction& psi, ParticleSet& P) override;
   Return_t evaluateDeterministic(TrialWaveFunction& psi, ParticleSet& P) override;
+
+  /** Exact rotated-grid payload, independent of transient energy/VP workspaces. */
+  struct QuadratureState
+  {
+    std::vector<std::size_t> knots_per_species;
+    std::vector<double> coordinates;
+  };
+
+  /// Capture accepted quadrature coordinates in species/knot/Cartesian order.
+  QuadratureState captureQuadratureState() const;
+
+  /// Validate shape and finite unit-sphere coordinates before a restore transaction.
+  void validateQuadratureState(const QuadratureState& state) const;
+
+  /// Commit an already validated payload using fixed-size writes only.
+  void restoreQuadratureStateUnchecked(const QuadratureState& state) noexcept;
   void mw_evaluate(const RefVectorWithLeader<OperatorBase>& o_list,
                    const RefVectorWithLeader<TrialWaveFunction>& wf_list,
                    const RefVectorWithLeader<ParticleSet>& p_list) const override;

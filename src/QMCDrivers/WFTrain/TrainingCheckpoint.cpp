@@ -516,7 +516,9 @@ void TrainingCheckpoint::saveSamplerShardAtomic(
     owns_temporary = true;
     archive.push(SAMPLER_ROOT_GROUP);
     const std::vector<int> format_version(FORMAT_VERSION.begin(), FORMAT_VERSION.end());
-    archive.write(format_version, "format_version");
+    // Contributor metadata has its own format_version. Keep envelope versioning
+    // separate so an ECP sampler payload can evolve without changing the envelope.
+    archive.write(format_version, "envelope_format_version");
     writeContributorMetadata(archive, metadata);
     sampler.writeCheckpointPayload(archive);
     archive.write(std::string(SAMPLER_COMPLETION_COOKIE), "completion_cookie");
@@ -553,7 +555,8 @@ TrainingCheckpoint::prepareSamplerShardRestore(
 
   std::vector<int> format_version;
   std::string completion_cookie;
-  archive.read(format_version, "format_version");
+  archive.read(format_version, archive.is_dataset("envelope_format_version")
+                                 ? "envelope_format_version" : "format_version");
   archive.read(completion_cookie, "completion_cookie");
   if (format_version.size() != FORMAT_VERSION.size() ||
       format_version[0] != FORMAT_VERSION[0])
