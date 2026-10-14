@@ -1024,6 +1024,38 @@ int main(int argc, char** argv)
     catch (const std::runtime_error&) { undefined_node_jvp_rejected = true; }
     if (!undefined_node_jvp_rejected)
       throw std::runtime_error("GPU score JVP accepted an exact total node");
+    // Raw orbital losses remain differentiable at singular determinant heads.
+    // Their cotangents bypass both determinant inverses and the common cusp.
+    std::vector<double> node_raw_seeds(model.cfg.nconfig * model.ndet * model.ne * model.ne);
+    for (std::size_t index = 0; index < node_raw_seeds.size(); ++index)
+    {
+      const auto electron = (index / model.ne) % model.ne;
+      const auto spin_size = electron < model.cfg.nup ? model.cfg.nup : model.cfg.ndown;
+      node_raw_seeds[index] = -2.0 / static_cast<double>(model.ndet * spin_size * model.ne);
+    }
+    node_score.reverseOrbitals(node_tape, node_raw_seeds);
+    std::vector<double> node_raw_response(plan.parameterCount()), node_raw_reference(plan.parameterCount(), 0.0);
+    node_score.downloadResponse(node_raw_response);
+    pf::PsiFormer node_native(pf::Parameters(node_parameters, model.p.layouts), model.cfg,
+                              model.ndet, model.dim, model.heads, model.blocks);
+    pf::DirectScoreExecutor node_cpu(node_native, plan);
+    auto node_cpu_workspace = node_cpu.makeWorkspace();
+    std::vector<double> node_target(model.ndet * model.ne * model.ne, 1.0);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      node_cpu_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + configuration * 3 * model.ne, model.ne));
+      const auto result = node_cpu.evaluateOrbitalMSE(*node_cpu_workspace, {node_target.data(), node_target.size()});
+      for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+        node_raw_reference[parameter] += result.parameter_gradient[parameter];
+    }
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(node_raw_response[parameter], node_raw_reference[parameter], "singular-head inverse-free orbital-MSE reverse");
+    std::vector<double> zero_channel_weights(model.cfg.nconfig * model.ndet, 0.0);
+    node_score.reverseChannels(node_tape, zero_channel_weights);
+    node_score.downloadResponse(node_raw_response);
+    if (std::any_of(node_raw_response.begin(), node_raw_response.end(), [](double value) { return value != 0.0; }))
+      throw std::runtime_error("Zero independent-channel objective has a nonzero derivative");
     auto mixed_parameters = canonical_parameters;
     // Zero only one determinant column: its cofactor derivative can be nonzero
     // even though its normalized determinant weight is zero. Inverse-only score
@@ -1206,6 +1238,111 @@ int main(int argc, char** argv)
 
     // Exercise the same publication barrier used by structured updates, legacy
     // resets and VP restore. Reuse existing crowds across failures and versions.
+    // Independent channel and raw-orbital objectives share the neural reverse,
+    // but must not inherit the normalized determinant-sum or cusp seed rules.
+    taped.evaluate(model.cfg.electrons.x);
+    std::vector<double> channel_coefficients(model.cfg.nconfig * model.ndet);
+    std::vector<double> channel_reference(plan.parameterCount(), 0.0), head_response(plan.parameterCount());
+    for (std::size_t index = 0; index < channel_coefficients.size(); ++index)
+      channel_coefficients[index] = .13 * (static_cast<int>(index % 5) - 2);
+    score_reverse.reverseChannels(taped, channel_coefficients);
+    score_reverse.downloadResponse(head_response);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + configuration * 3 * model.ne, model.ne));
+      const auto result = cpu_score_executor.evaluateWeightedChannelScore(*cpu_score_workspace,
+          channel_coefficients.data() + configuration * model.ndet, model.ndet);
+      for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+        channel_reference[parameter] += result.parameter_score[parameter];
+    }
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(head_response[parameter], channel_reference[parameter], "independent weighted channel score CPU parity");
+
+    const auto orbital_count = model.ndet * model.ne * model.ne;
+    std::vector<double> backflow(model.cfg.nconfig * orbital_count), envelope(backflow.size());
+    taped.downloadValueOrbitalFactors(backflow, envelope);
+    std::vector<double> raw_adjoints(backflow.size()), orbital_target(orbital_count);
+    std::fill(channel_reference.begin(), channel_reference.end(), 0.0);
+    for (std::size_t index = 0; index < orbital_count; ++index)
+      orbital_target[index] = .07 * (static_cast<int>(index % 7) - 3);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+    {
+      for (std::size_t index = 0; index < orbital_count; ++index)
+      {
+        const auto electron = (index / model.ne) % model.ne;
+        const auto spin_size = electron < model.cfg.nup ? model.cfg.nup : model.cfg.ndown;
+        const auto offset = configuration * orbital_count + index;
+        raw_adjoints[offset] = 2.0 * (backflow[offset] * envelope[offset] - orbital_target[index]) /
+            static_cast<double>(model.ndet * spin_size * model.ne);
+      }
+      cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + configuration * 3 * model.ne, model.ne));
+      const auto result = cpu_score_executor.evaluateOrbitalMSE(*cpu_score_workspace,
+          {orbital_target.data(), orbital_target.size()});
+      for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+        channel_reference[parameter] += result.parameter_gradient[parameter];
+    }
+    score_reverse.reverseOrbitals(taped, raw_adjoints);
+    score_reverse.downloadResponse(head_response);
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(head_response[parameter], channel_reference[parameter], "raw orbital-MSE gradient CPU parity");
+    if (head_response[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] != 0.0)
+      throw std::runtime_error("Raw orbital objective incorrectly differentiated the common cusp");
+    std::cout << "PASS independent determinant-channel and raw orbital-MSE head seeds: all-parameter CPU parity\n";
+    if (model.ndet % 2 == 0)
+    {
+      // Pair identical regular channels with an exact column sign reversal.
+      // Their sum is nodal, but each independent channel log score is defined.
+      auto cancelling_parameters = model.p.flat_values();
+      for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
+      {
+        const auto& interval = plan.parameter(role);
+        for (std::size_t feature = 0; feature < model.dim; ++feature)
+          for (std::size_t determinant = 0; determinant < model.ndet; ++determinant)
+            for (std::size_t orbital = 0; orbital < model.ne; ++orbital)
+            {
+              const auto source = interval.begin + feature * model.ndet * model.ne + orbital;
+              const auto destination = source + determinant * model.ne;
+              cancelling_parameters[destination] = canonical_parameters[source] *
+                  (determinant % 2 != 0 && orbital == 0 ? -1.0 : 1.0);
+            }
+      }
+      for (auto role : {ParameterRole::ENVELOPE_PI_UP, ParameterRole::ENVELOPE_PI_DOWN,
+                        ParameterRole::ENVELOPE_ZETA_UP, ParameterRole::ENVELOPE_ZETA_DOWN})
+      {
+        const auto& interval = plan.parameter(role);
+        const auto per_channel = (interval.end - interval.begin) / model.ndet;
+        for (std::size_t determinant = 0; determinant < model.ndet; ++determinant)
+          std::copy_n(canonical_parameters.data() + interval.begin, per_channel,
+                       cancelling_parameters.data() + interval.begin + determinant * per_channel);
+      }
+      auto cancelling_image = std::make_shared<PreparedDeviceModel>(plan, cancelling_parameters, model.cfg.nuclei.x, 28);
+      PreparedDeviceInference cancelling_tape(cancelling_image, 1, queue, handle, SpatialJetMode::VALUE_ONLY, true);
+      std::vector<double> first_coordinates(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+      cancelling_tape.evaluate(first_coordinates);
+      std::vector<double> cancelling_phase(1), cancelling_log(1), no_spatial_output;
+      cancelling_tape.downloadResults(cancelling_phase, cancelling_log, no_spatial_output);
+      if (cancelling_phase[0] != 0.0)
+        throw std::runtime_error("Independent-channel cancellation fixture is not an exact total node");
+      PreparedDeviceScoreReverse cancelling_reverse(cancelling_image, 1, queue, handle);
+      std::vector<double> select_channel(model.ndet, 0.0);
+      select_channel[0] = 1.0;
+      cancelling_reverse.reverseChannels(cancelling_tape, select_channel);
+      cancelling_reverse.downloadResponse(head_response);
+      pf::PsiFormer cancelling_native(pf::Parameters(cancelling_parameters, model.p.layouts), model.cfg,
+                                       model.ndet, model.dim, model.heads, model.blocks);
+      pf::DirectScoreExecutor cancelling_cpu(cancelling_native, plan);
+      auto cancelling_workspace = cancelling_cpu.makeWorkspace();
+      cancelling_workspace->setPositions(first_position);
+      const auto cancelling_reference = cancelling_cpu.evaluateWeightedChannelScore(*cancelling_workspace,
+          select_channel.data(), select_channel.size());
+      for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+        near(head_response[parameter], cancelling_reference.parameter_score[parameter],
+             "independent channel score at a total cancellation node");
+      std::cout << "PASS independent channel at exact determinant-sum node; raw orbital reverse at singular heads\n";
+    }
+
     auto dormant_tile = backend_tiles->prepare(1);
     auto product_session = backend_tiles->prepareProductSession();
     const auto session_bytes = product_session->deviceWorkspaceBytes();
@@ -1241,6 +1378,32 @@ int main(int argc, char** argv)
     for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
       near(recovered_score[parameter], session_reference.parameter_score[parameter],
            "leased product failure recovery preserves model and prepared scratch");
+    std::vector<double> device_channel_phases(model.ndet), device_channel_logs(model.ndet);
+    std::vector<double> cpu_channel_phases(model.ndet), cpu_channel_logs(model.ndet);
+    product_session->channelAmplitudes(model.cfg.electrons.x.data(), device_channel_phases.data(),
+                                       device_channel_logs.data(), model.ndet, model.p.version());
+    cpu_score_executor.evaluateChannelAmplitudes(*cpu_score_workspace, cpu_channel_phases.data(),
+                                                 cpu_channel_logs.data(), model.ndet);
+    for (std::size_t channel = 0; channel < model.ndet; ++channel)
+    {
+      near(device_channel_phases[channel], cpu_channel_phases[channel], "leased independent channel phase");
+      near(device_channel_logs[channel], cpu_channel_logs[channel], "leased independent channel log amplitude");
+    }
+    const auto& leased_channel_response = product_session->channelScore(model.cfg.electrons.x.data(),
+        channel_coefficients.data(), model.ndet, model.p.version());
+    const auto leased_channel_reference = cpu_score_executor.evaluateWeightedChannelScore(*cpu_score_workspace,
+        channel_coefficients.data(), model.ndet);
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(leased_channel_response[parameter], leased_channel_reference.parameter_score[parameter],
+           "leased independent channel response");
+    const auto leased_orbital_loss = product_session->orbitalMse(model.cfg.electrons.x.data(),
+        orbital_target.data(), orbital_target.size(), head_response.data(), head_response.size(), model.p.version());
+    const auto leased_orbital_reference = cpu_score_executor.evaluateOrbitalMSE(*cpu_score_workspace,
+        {orbital_target.data(), orbital_target.size()});
+    near(leased_orbital_loss, leased_orbital_reference.loss, "leased orbital-MSE loss");
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(head_response[parameter], leased_orbital_reference.parameter_gradient[parameter],
+           "leased orbital-MSE gradient");
     const auto accepted_values = model.p.flat_values();
     auto proposed_values = accepted_values;
     proposed_values[0] += .003;

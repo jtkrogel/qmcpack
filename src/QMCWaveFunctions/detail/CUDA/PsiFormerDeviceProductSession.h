@@ -46,7 +46,11 @@ public:
         positions_(3 * image_->plan().modelShape().electrons()),
         drift_(positions_.size()), masses_(image_->plan().modelShape().electrons()),
         score_response_(image_->plan().parameterCount()), kinetic_response_(score_response_.size()),
-        products_(1)
+        products_(1), channel_coefficients_(image_->plan().modelShape().determinants),
+        channel_phases_(channel_coefficients_.size()), channel_logs_(channel_coefficients_.size()),
+        factors_(channel_coefficients_.size()), cusp_(1),
+        orbital_backflow_(channel_coefficients_.size() * masses_.size() * masses_.size()),
+        orbital_envelope_(orbital_backflow_.size()), orbital_seeds_(orbital_backflow_.size())
   {
     executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, 1, *this);
   }
@@ -93,6 +97,78 @@ public:
     return products_[0];
   }
 
+  /// Return independent determinant amplitudes, including the common cusp.
+  void channelAmplitudes(const double* positions, double* phases, double* logs,
+                          std::size_t count, std::size_t version)
+  {
+    if (!phases || !logs || count != channel_phases_.size())
+      throw std::invalid_argument("Device channel amplitude output extent mismatch");
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      values_.evaluate(positions_);
+      values_.downloadValueFactorizations(factors_);
+      values_.downloadValueCusp(cusp_);
+      for (std::size_t channel = 0; channel < count; ++channel)
+      {
+        channel_phases_[channel] = factors_[channel].phase;
+        channel_logs_[channel] = factors_[channel].phase == 0.0 ? factors_[channel].log_abs
+                                                               : factors_[channel].log_abs + cusp_[0];
+        if (factors_[channel].phase != 0.0 && !device_math::isFiniteBinary64(channel_logs_[channel]))
+          throw std::runtime_error("Device channel amplitude is nonfinite");
+      }
+    });
+    std::copy(channel_phases_.begin(), channel_phases_.end(), phases);
+    std::copy(channel_logs_.begin(), channel_logs_.end(), logs);
+  }
+
+  /// Contract arbitrary finite independent-channel coefficients in one reverse.
+  const std::vector<double>& channelScore(const double* positions, const double* coefficients,
+                                          std::size_t count, std::size_t version)
+  {
+    if (!coefficients || count != channel_coefficients_.size())
+      throw std::invalid_argument("Device channel score coefficient extent mismatch");
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      std::copy_n(coefficients, count, channel_coefficients_.begin());
+      values_.evaluate(positions_);
+      score_.reverseChannels(values_, channel_coefficients_);
+      score_.downloadResponse(score_response_);
+    });
+    return score_response_;
+  }
+
+  /// Reverse the per-spin normalized raw-orbital MSE against a supplied teacher target.
+  /// Teacher construction is external; neither a determinant-sum nor cusp loss is added.
+  double orbitalMse(const double* positions, const double* target, std::size_t count,
+                    double* gradient, std::size_t parameter_count, std::size_t version)
+  {
+    if (!target || count != orbital_seeds_.size() || !gradient || parameter_count != score_response_.size())
+      throw std::invalid_argument("Device orbital-MSE target/gradient extent mismatch");
+    double loss = 0;
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      for (std::size_t index = 0; index < count; ++index)
+        if (!device_math::isFiniteBinary64(target[index]))
+          throw std::invalid_argument("Device orbital target is nonfinite");
+      values_.evaluate(positions_);
+      values_.downloadValueOrbitalFactors(orbital_backflow_, orbital_envelope_);
+      const auto& shape = image_->plan().modelShape();
+      const auto ne = shape.electrons();
+      for (std::size_t index = 0; index < count; ++index)
+      {
+        const auto electron = (index / ne) % ne;
+        const auto spin_size = electron < shape.spin_up_electrons ? shape.spin_up_electrons : shape.spin_down_electrons;
+        const double scale = 1.0 / static_cast<double>(shape.determinants * spin_size * ne);
+        const double residual = orbital_backflow_[index] * orbital_envelope_[index] - target[index];
+        orbital_seeds_[index] = 2.0 * scale * residual;
+        loss += scale * residual * residual;
+      }
+      if (!device_math::isFiniteBinary64(loss))
+        throw std::runtime_error("Device orbital-MSE loss is nonfinite");
+      score_.reverseOrbitals(values_, orbital_seeds_);
+      score_.downloadResponse(score_response_);
+    });
+    std::copy(score_response_.begin(), score_response_.end(), gradient);
+    return loss;
+  }
+
   /// Account allocated device scratch, excluding the shared immutable image.
   std::size_t deviceWorkspaceBytes() const
   {
@@ -112,12 +188,17 @@ public:
   {
     std::size_t bytes = 0;
     for (const auto* values : {&positions_, &drift_, &masses_, &score_response_,
-                               &kinetic_response_, &products_, &weights_})
+                               &kinetic_response_, &products_, &weights_, &channel_coefficients_,
+                               &channel_phases_, &channel_logs_, &cusp_, &orbital_backflow_,
+                               &orbital_envelope_, &orbital_seeds_})
       bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(values->capacity()),
                                          "Device product host staging overflow");
     for (auto amount : {values_.hostWorkspaceBytes(), spatial_.hostWorkspaceBytes(),
                         score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes(), kinetic_.hostWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product host status overflow");
+    bytes = spatial_detail::checkedAdd(bytes,
+        checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()),
+        "Device product channel factorization overflow");
     return bytes;
   }
 
@@ -284,6 +365,9 @@ private:
   PsiFormerAcceleratorCrowdState crowd_;
   const std::uint64_t identity_;
   std::vector<double> positions_, drift_, masses_, score_response_, kinetic_response_, products_;
+  std::vector<double> channel_coefficients_, channel_phases_, channel_logs_;
+  std::vector<device_determinant::FactorizationMetadata> factors_;
+  std::vector<double> cusp_, orbital_backflow_, orbital_envelope_, orbital_seeds_;
   const std::vector<double> weights_{1.0};
   const std::function<void()>* action_ = nullptr;
   std::exception_ptr failure_;

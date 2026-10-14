@@ -597,6 +597,22 @@ __global__ void weightedOrbitalProductReverseKernel(OrbitalProductReverseLayout 
   envelope_adjoint[index] = weighted * backflow[index];
 }
 
+/** Own one inverse-transpose element of an independently weighted channel. */
+__global__ void independentChannelSeedsKernel(OrbitalProductReverseLayout layout,
+    const double* coefficients, const double* inverses, double* adjoint)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto ne = layout.electron_count;
+  const auto matrix_size = ne * ne;
+  if (index >= layout.configuration_count * layout.determinant_count * matrix_size)
+    return;
+  const auto channel = index / matrix_size;
+  const auto row = (index / ne) % ne;
+  const auto column = index % ne;
+  const double weight = coefficients[channel];
+  adjoint[index] = weight == 0.0 ? 0.0 : weight * inverses[channel * matrix_size + column * ne + row];
+}
+
 /** Generate each independent radius once; no reductions or atomics are needed. */
 __global__ void scoreGeometryKernel(std::size_t batch, std::size_t ne, std::size_t nuclei_count,
     std::size_t spin_up_count, const double* positions, const double* nuclei,
@@ -1344,6 +1360,22 @@ Error launchWeightedOrbitalProductReverse(Stream stream,
   weightedOrbitalProductReverseKernel<<<blockCount(count, "Weighted orbital grid too large"),
       derivative_block_size, 0, stream>>>(layout, spin_up_count, weights, backflow, envelope,
       orbital_adjoint, up_adjoint, down_adjoint, envelope_adjoint);
+  return peekAtLastError();
+}
+
+Error launchIndependentChannelSeeds(Stream stream, const OrbitalProductReverseLayout& layout,
+    const double* coefficients, const double* inverses, double* adjoint)
+{
+  validateOrbitalLayout(layout);
+  const auto matrix = checkedProduct(layout.electron_count, layout.electron_count, "Channel seed matrix overflow");
+  const auto per_configuration = checkedProduct(layout.determinant_count, matrix, "Channel seed batch overflow");
+  if (layout.row_stride != layout.electron_count || layout.determinant_stride != matrix ||
+      layout.configuration_stride != per_configuration || !coefficients || !inverses || !adjoint ||
+      adjoint == coefficients || adjoint == inverses)
+    throw std::invalid_argument("Independent channel seeds require distinct contiguous inputs/output");
+  const auto count = checkedProduct(layout.configuration_count, per_configuration, "Channel seed grid overflow");
+  independentChannelSeedsKernel<<<blockCount(count, "Channel seed grid too large"), derivative_block_size, 0, stream>>>(
+      layout, coefficients, inverses, adjoint);
   return peekAtLastError();
 }
 

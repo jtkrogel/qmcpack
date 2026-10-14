@@ -45,6 +45,9 @@ public:
     pair_distances_.reserve(multiply(capacity_, pair_count_));
     same_spin_.reserve(pair_count_);
     weights_.reserve(capacity_);
+    channel_weights_.reserve(multiply(capacity_, shape.determinants));
+    unit_weights_.resize(capacity_, 1.0);
+    cusp_weights_.resize(capacity_);
     head_response_.reserve(model_->plan().parameterCount());
     response_.reserve(model_->plan().parameterCount());
     status_.reserve(capacity_);
@@ -62,6 +65,59 @@ public:
    */
   const double* reverse(const PreparedDeviceInference& forward, const std::vector<double>& weights)
   {
+    return reverseSeeded(forward, weights, nullptr, nullptr, nullptr);
+  }
+
+  /// Reverse independent determinant log amplitudes, rather than log of their sum.
+  const double* reverseChannels(const PreparedDeviceInference& forward, const std::vector<double>& coefficients)
+  {
+    ready_ = false;
+    const auto count = forward.valueTapeBatchCount();
+    const auto determinants = model_->plan().modelShape().determinants;
+    if (count > capacity_ || coefficients.size() != multiply(count, determinants))
+      throw std::invalid_argument("Independent channel coefficient extent mismatch");
+    unit_weights_.resize(count, 1.0);
+    cusp_weights_.resize(count);
+    for (std::size_t configuration = 0; configuration < count; ++configuration)
+    {
+      double sum = 0;
+      for (std::size_t determinant = 0; determinant < determinants; ++determinant)
+      {
+        const auto coefficient = coefficients[configuration * determinants + determinant];
+        if (!device_math::isFiniteBinary64(coefficient))
+          throw std::invalid_argument("Independent channel coefficient is nonfinite");
+        sum += coefficient;
+      }
+      if (!device_math::isFiniteBinary64(sum))
+        throw std::overflow_error("Independent channel cusp coefficient overflow");
+      cusp_weights_[configuration] = sum;
+    }
+    return reverseSeeded(forward, unit_weights_, &coefficients, nullptr, &cusp_weights_);
+  }
+
+  /// Reverse raw orbital cotangents without determinant inverses or cusp derivatives.
+  const double* reverseOrbitals(const PreparedDeviceInference& forward, const std::vector<double>& adjoints)
+  {
+    ready_ = false;
+    const auto count = forward.valueTapeBatchCount();
+    const auto& shape = model_->plan().modelShape();
+    const auto extent = multiply(multiply(count, shape.determinants), multiply(shape.electrons(), shape.electrons()));
+    if (count > capacity_ || adjoints.size() != extent)
+      throw std::invalid_argument("Raw orbital cotangent extent mismatch");
+    for (double value : adjoints)
+      if (!device_math::isFiniteBinary64(value))
+        throw std::invalid_argument("Raw orbital cotangent is nonfinite");
+    unit_weights_.resize(count, 1.0);
+    cusp_weights_.assign(count, 0.0);
+    return reverseSeeded(forward, unit_weights_, nullptr, &adjoints, &cusp_weights_);
+  }
+
+private:
+  /// Share the head/trunk reverse while preserving each objective's seed rules.
+  const double* reverseSeeded(const PreparedDeviceInference& forward, const std::vector<double>& weights,
+      const std::vector<double>* channels, const std::vector<double>* raw_seeds,
+      const std::vector<double>* cusp_weights)
+  {
     ready_ = false;
     model_->validateCurrentDevice();
     const auto count = forward.valueTapeBatchCount();
@@ -75,25 +131,39 @@ public:
 
     // Inverse seeds cannot represent singular-channel cofactor derivatives even
     // when the determinant sum is nonzero. Reject rather than silently drop them.
-    forward.downloadValueFactorizations(host_factors_);
-    for (std::size_t channel = 0; channel < count * determinants; ++channel)
-      if (!host_factors_[channel].inverse_available)
-        throw std::runtime_error("GPU score requires regular determinant channels; cofactor fallback unavailable");
+    if (!raw_seeds)
+    {
+      forward.downloadValueFactorizations(host_factors_);
+      for (std::size_t channel = 0; channel < count * determinants; ++channel)
+        if ((!channels || (*channels)[channel] != 0.0) && !host_factors_[channel].inverse_available)
+          throw std::runtime_error("GPU score requires regular selected determinant channels; cofactor fallback unavailable");
+    }
     const auto head = forward.valueHeadTape();
     const auto stream = queue_.getNative();
-    checkRuntime(launchDeterminantMatrixReverseSeeds(stream, head.factorizations, head.combinations,
-        head.normalized_weights, head.inverses, count, determinants, ne, seeds_.data(), status_.data()),
-        "score determinant seeds");
-    queue_.sync();
-    status_.download(host_status_.data(), count);
-    for (std::size_t configuration = 0; configuration < count; ++configuration)
-      if (host_status_[configuration] != device_determinant::DerivativeStatus::AVAILABLE)
-        throw std::runtime_error("GPU log score is undefined or nonfinite for this configuration");
+    const OrbitalProductReverseLayout orbital{count, determinants, ne, ne, ne * ne, determinants * ne * ne};
+    if (raw_seeds)
+      seeds_.upload(raw_seeds->data(), raw_seeds->size());
+    else if (channels)
+    {
+      channel_weights_.upload(channels->data(), channels->size());
+      checkRuntime(launchIndependentChannelSeeds(stream, orbital, channel_weights_.data(),
+          head.inverses, seeds_.data()), "independent determinant seeds");
+    }
+    else
+    {
+      checkRuntime(launchDeterminantMatrixReverseSeeds(stream, head.factorizations, head.combinations,
+          head.normalized_weights, head.inverses, count, determinants, ne, seeds_.data(), status_.data()),
+          "score determinant seeds");
+      queue_.sync();
+      status_.download(host_status_.data(), count);
+      for (std::size_t configuration = 0; configuration < count; ++configuration)
+        if (host_status_[configuration] != device_determinant::DerivativeStatus::AVAILABLE)
+          throw std::runtime_error("GPU log score is undefined or nonfinite for this configuration");
+    }
 
     // Output head: weighted matrix cotangents, spin-row packing, geometry and
     // orbital/envelope parameter contractions. No division by B or E is used.
     weights_.upload(weights.data(), count);
-    const OrbitalProductReverseLayout orbital{count, determinants, ne, ne, ne * ne, determinants * ne * ne};
     checkRuntime(launchWeightedOrbitalProductReverse(stream, orbital, shape.spin_up_electrons,
         weights_.data(), head.backflow, head.envelope, seeds_.data(), up_.data(), down_.data(), envelope_.data()),
         "score orbital product reverse");
@@ -119,6 +189,8 @@ public:
                     ParameterRole::ENVELOPE_PI_DOWN, ParameterRole::ENVELOPE_ZETA_DOWN);
     if (pair_count_ != 0)
     {
+      if (cusp_weights)
+        weights_.upload(cusp_weights->data(), count);
       const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
       const CuspAlphaReverseLayout cusp{count, pair_count_, pair_count_, same ? same->begin : 0,
           model_->plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin, same != nullptr};
@@ -142,6 +214,7 @@ public:
     return response_.data();
   }
 
+public:
   /// Download a completed canonical response, rejecting stale results after failure.
   void downloadResponse(std::vector<double>& destination) const
   {
@@ -180,7 +253,8 @@ public:
   /// Count host admission/status storage, including the shared trunk reverse.
   std::size_t hostWorkspaceBytes() const
   {
-    return network_.hostWorkspaceBytes() +
+    return network_.hostWorkspaceBytes() + checkedDeviceBytes<double>(unit_weights_.capacity()) +
+        checkedDeviceBytes<double>(cusp_weights_.capacity()) +
         checkedDeviceBytes<device_determinant::DerivativeStatus>(host_status_.capacity()) +
         checkedDeviceBytes<device_determinant::FactorizationMetadata>(host_factors_.capacity()) +
         checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
@@ -194,7 +268,7 @@ public:
       bytes = spatial_detail::checkedAdd(bytes, amount, "Score workspace storage overflow");
     };
     for (const auto* buffer : {&seeds_, &up_, &down_, &envelope_, &feature_, &ion_distances_,
-                              &pair_distances_, &weights_, &head_response_, &response_})
+                              &pair_distances_, &weights_, &channel_weights_, &head_response_, &response_})
       add(checkedDeviceBytes<double>(buffer->capacity()));
     add(checkedDeviceBytes<std::uint8_t>(same_spin_.capacity()));
     add(checkedDeviceBytes<device_determinant::DerivativeStatus>(status_.capacity()));
@@ -235,6 +309,8 @@ private:
   PreparedDeviceNetworkReverse network_;
   DeviceBuffer<double> seeds_, up_, down_, envelope_, feature_, ion_distances_, pair_distances_, weights_;
   DeviceBuffer<double> head_response_, response_;
+  DeviceBuffer<double> channel_weights_;
+  std::vector<double> unit_weights_, cusp_weights_;
   DeviceBuffer<std::uint8_t> same_spin_;
   DeviceBuffer<device_determinant::DerivativeStatus> status_;
   std::vector<device_determinant::DerivativeStatus> host_status_;

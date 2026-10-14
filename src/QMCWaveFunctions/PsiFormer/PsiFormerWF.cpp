@@ -1070,6 +1070,9 @@ public:
   const DirectBackendMode direct_score_mode;
   /// Development switch selecting direct, oracle, or compare kinetic behavior.
   const DirectBackendMode direct_kinetic_mode;
+  /// Pretraining has no retained streaming snapshot to keep its lane alive.
+  /// Cache one lane across orbital-loss calls; never one tape per walker/epoch.
+  std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
 };
 
 /** Optimizer metadata shared by every clone of one PsiFormer component.
@@ -1314,7 +1317,7 @@ public:
         positions_(std::move(positions)),
         phases_(channel_count_),
         log_abs_(channel_count_),
-        workspace_(model_state_->direct_score_executor.makeWorkspace())
+        workspace_(model_state_->numerical_tile_backend ? nullptr : model_state_->direct_score_executor.makeWorkspace())
   {
     const std::size_t expected_positions = checkedBatchMemoryMultiply(
         checkedBatchMemoryMultiply(sample_count_, electron_count_,
@@ -1322,9 +1325,29 @@ public:
         std::size_t{3}, "PsiFormer overlap Cartesian positions");
     if (positions_.size() != expected_positions || channel_count_ == 0 ||
         schema_->parameterCount() != model_state_->execution_plan.parameterCount() ||
-        workspace_->scoreSize() != schema_->parameterCount())
+        (workspace_ && workspace_->scoreSize() != schema_->parameterCount()))
       throw std::invalid_argument(
           "PsiFormer determinant-channel batch has inconsistent shape or schema");
+    std::size_t workspace_bytes = 0;
+#ifdef ENABLE_CUDA
+    if (model_state_->numerical_tile_backend)
+    {
+      const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+          model_state_->numerical_tile_backend.get());
+      if (!backend)
+        throw std::logic_error("PsiFormer independent channels require the numerical device backend");
+      device_products_ = backend->prepareProductSession();
+      device_positions_.resize(3 * electron_count_);
+      workspace_bytes = checkedBatchMemoryAdd(device_products_->deviceWorkspaceBytes(),
+          device_products_->hostWorkspaceBytes(), "PsiFormer overlap device scratch");
+      workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
+          checkedBatchMemoryMultiply(device_positions_.capacity(), sizeof(double), "PsiFormer overlap staging"),
+          "PsiFormer overlap device workspace");
+    }
+    else
+#endif
+      workspace_bytes = checkedBatchMemoryAdd(workspace_->vectorStorageBytes(), workspace_->scoreStorageBytes(),
+                                               "PsiFormer overlap score workspace");
     retained_numeric_bytes_ = checkedBatchMemoryAdd(
         checkedBatchMemoryAdd(
             checkedBatchMemoryMultiply(positions_.capacity(), sizeof(double),
@@ -1334,9 +1357,7 @@ public:
                                       "PsiFormer overlap channel scratch"),
                 sizeof(double), "PsiFormer overlap channel storage"),
             "PsiFormer overlap sample and channel storage"),
-        checkedBatchMemoryAdd(workspace_->vectorStorageBytes(),
-                              workspace_->scoreStorageBytes(),
-                              "PsiFormer overlap score workspace"),
+        workspace_bytes,
         "PsiFormer overlap retained storage");
   }
 
@@ -1366,6 +1387,16 @@ public:
     std::shared_lock state_lock(model_state_->mutex);
     requireBoundVersion();
     setWorkspacePositions(sample);
+#ifdef ENABLE_CUDA
+    if (device_products_)
+    {
+      device_products_->channelAmplitudes(device_positions_.data(), phases_.data(), log_abs_.data(),
+                                           channel_count_, parameter_version_);
+      for (std::size_t channel = 0; channel < channel_count_; ++channel)
+        output[channel] = {phases_[channel], log_abs_[channel]};
+      return;
+    }
+#endif
     const pf::DirectChannelAmplitudeResult result =
         model_state_->direct_score_executor.evaluateChannelAmplitudes(
             *workspace_, phases_.data(), log_abs_.data(), channel_count_);
@@ -1390,6 +1421,21 @@ public:
     std::shared_lock state_lock(model_state_->mutex);
     requireBoundVersion();
     setWorkspacePositions(sample);
+#ifdef ENABLE_CUDA
+    if (device_products_)
+    {
+      const auto& response = device_products_->channelScore(device_positions_.data(), channel_weights,
+                                                            channel_count_, parameter_version_);
+      std::copy(response.begin(), response.end(), output);
+      if (!reported_device_channels_)
+      {
+        app_log() << "  PsiFormer numerical device determinant-channel product completed: parameter_version="
+                  << parameter_version_ << ", CPU derivative fallback=no" << std::endl;
+        reported_device_channels_ = true;
+      }
+      return;
+    }
+#endif
     const pf::DirectWeightedChannelScoreResult result =
         model_state_->direct_score_executor.evaluateWeightedChannelScore(
             *workspace_, channel_weights, channel_count);
@@ -1410,6 +1456,13 @@ private:
   {
     const double* positions =
         positions_.data() + sample * electron_count_ * std::size_t{3};
+#ifdef ENABLE_CUDA
+    if (device_products_)
+    {
+      std::copy_n(positions, device_positions_.size(), device_positions_.begin());
+      return;
+    }
+#endif
     workspace_->setPositions(
         pf::GeometryPositionView::interleaved(positions, electron_count_));
   }
@@ -1431,6 +1484,11 @@ private:
   mutable std::vector<double> phases_;
   mutable std::vector<double> log_abs_;
   mutable std::unique_ptr<pf::DirectScoreWorkspace> workspace_;
+#ifdef ENABLE_CUDA
+  std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products_;
+  mutable std::vector<double> device_positions_;
+  mutable bool reported_device_channels_ = false;
+#endif
   std::size_t retained_numeric_bytes_ = 0;
 };
 
@@ -6249,6 +6307,69 @@ wftrain::StructuredParameterSnapshot PsiFormerWF::snapshotParameters() const
   const pf::Parameters& parameters = model_state_->model.p;
   return {structured_parameter_schema_->fingerprint(), parameters.version(),
           parameters.flat_values()};
+}
+
+// Evaluate one supplied conventional orbital target with a reusable CPU/GPU lane.
+double PsiFormerWF::evaluateOrbitalMSE(const ParticleSet& particles,
+                                     const std::vector<double>& target,
+                                     std::vector<double>& gradient,
+                                     std::size_t expected_version) const
+{
+  auto scratch = acquireDerivativeScratch(*model_state_, structured_parameter_schema_->parameterCount());
+  {
+    std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
+    model_state_->orbital_pretraining_scratch = scratch;
+  }
+  PsiFormerDerivativeLease scratch_lease(*scratch);
+  std::shared_lock state_lock(model_state_->mutex);
+  if (model_state_->model.p.version() != expected_version)
+    throw std::runtime_error("PsiFormer orbital-MSE target batch has a stale parameter version");
+  const auto& shape = model_state_->execution_plan.modelShape();
+  const auto ne = shape.electrons();
+  const auto orbital_count = checkedBatchMemoryMultiply(shape.determinants,
+      checkedBatchMemoryMultiply(ne, ne, "PsiFormer orbital-MSE target matrix"), "PsiFormer orbital-MSE target extent");
+  if (target.size() != orbital_count || gradient.size() != structured_parameter_schema_->parameterCount() ||
+      particles.isSpinor() || particles.R.size() != ne || particles.GroupID.size() != ne)
+    throw std::invalid_argument("PsiFormer orbital-MSE target, gradient or particle extent mismatch");
+  validateRuntimeLattice(particles, model_state_->execution_plan.environment(), "PsiFormer orbital-MSE sample");
+  for (std::size_t electron = 0; electron < ne; ++electron)
+  {
+    if (particles.GroupID[electron] != (electron < shape.spin_up_electrons ? 0 : 1))
+      throw std::invalid_argument("PsiFormer orbital-MSE sample has noncanonical spin ordering");
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    {
+      const double coordinate = particles.R[electron][dimension];
+      if (!psiformer::determinant::isFiniteReal(coordinate))
+        throw std::invalid_argument("PsiFormer orbital-MSE coordinates must be finite");
+#ifdef ENABLE_CUDA
+      if (scratch->device_products)
+      {
+        scratch->device_positions[3 * electron + dimension] = coordinate;
+        continue;
+      }
+#endif
+      scratch->score->setPosition(electron, dimension, coordinate);
+    }
+  }
+
+#ifdef ENABLE_CUDA
+  if (scratch->device_products)
+  {
+    const double loss = scratch->device_products->orbitalMse(scratch->device_positions.data(),
+        target.data(), target.size(), gradient.data(), gradient.size(), expected_version);
+    if (!scratch->reported_device_products)
+    {
+      app_log() << "  PsiFormer numerical device orbital-MSE product completed: parameter_version="
+                << expected_version << ", CPU derivative fallback=no" << std::endl;
+      scratch->reported_device_products = true;
+    }
+    return loss;
+  }
+#endif
+  const auto result = model_state_->direct_score_executor.evaluateOrbitalMSE(*scratch->score,
+      {target.data(), target.size()});
+  std::copy(result.parameter_gradient.begin(), result.parameter_gradient.end(), gradient.begin());
+  return result.loss;
 }
 
 std::size_t PsiFormerWF::publishParameters(

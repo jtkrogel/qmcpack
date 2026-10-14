@@ -286,6 +286,13 @@ Error launchWeightedOrbitalProductReverse(Stream stream,
     const double* orbital_adjoint, double* up_adjoint, double* down_adjoint,
     double* envelope_adjoint);
 
+/** Seed independent channel log derivatives as c[b,d] A[b,d]^{-T}.
+ * Zero coefficients write zero without reading an unavailable inverse. The
+ * caller admits every nonzero channel; determinant-sum nodes are irrelevant.
+ */
+Error launchIndependentChannelSeeds(Stream stream, const OrbitalProductReverseLayout& layout,
+    const double* coefficients, const double* inverses, double* orbital_adjoint);
+
 /** Build contiguous electron-ion and unordered electron-pair radii for score heads.
  * Pair labels are shared across configurations; inputs use interleaved XYZ.
  */

@@ -616,6 +616,15 @@ public:
             matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(), combinations_.data()};
   }
 
+  /// Download the common cusp without subtracting possibly nodal log amplitudes.
+  void downloadValueCusp(std::vector<double>& destination) const
+  {
+    const auto count = valueTapeBatchCount();
+    if (destination.size() != count)
+      throw std::invalid_argument("Value cusp destination extent mismatch");
+    cusp_jets_.download(destination.data(), count);
+  }
+
   /// Copy live determinant metadata into preallocated caller storage for admission.
   void downloadValueFactorizations(std::vector<device_determinant::FactorizationMetadata>& destination) const
   {

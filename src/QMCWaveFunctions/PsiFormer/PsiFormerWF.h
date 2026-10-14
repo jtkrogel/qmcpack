@@ -359,6 +359,13 @@ public:
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
+  /** Evaluate the spin-normalized raw orbital-MSE objective at fixed coordinates.
+   * The caller supplies canonical parameter-sized gradient storage and a bound version. */
+  double evaluateOrbitalMSE(const ParticleSet& particles,
+                           const std::vector<double>& target,
+                           std::vector<double>& gradient,
+                           std::size_t expected_version) const;
+
   /// Rebuild a private model/executor state for speculative inference clones.
   void isolateParameterState() override;
 
