@@ -22,6 +22,17 @@ namespace
 
 constexpr unsigned int spatial_block_size = 128;
 
+/// Finalize independent value requests without derivative storage or traces.
+__global__ void finalValueCombinationKernel(std::size_t configuration_count,
+    const device_determinant::CombinationMetadata* metadata,
+    const double* cusp, double* phase, double* logabs, OpenSpatialStatus* status)
+{
+  const std::size_t configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration < configuration_count)
+    status[configuration] = open_spatial::combineFinalValue(
+        metadata[configuration], cusp[configuration], phase[configuration], logabs[configuration]);
+}
+
 __global__ void softmaxJetRowsKernel(SoftmaxJetRowLayout layout,
                                      double* jets,
                                      device_math::JetMathStatus* row_status)
@@ -464,6 +475,22 @@ Error launchOpenCuspJets(Stream stream, const OpenCuspJetLayout& layout,
   openCuspJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
       layout, positions, active_electrons, same_spin_alpha, opposite_spin_alpha,
       output, status);
+  return peekSpatialLaunchError();
+}
+
+/// Launch the checked one-plane signed-log finalization path.
+Error launchFinalValueCombination(Stream stream, std::size_t configuration_count,
+    const device_determinant::CombinationMetadata* metadata,
+    const double* cusp, double* phase, double* logabs, OpenSpatialStatus* status)
+{
+  if (configuration_count == 0)
+    return success;
+  if (!metadata || !cusp || !phase || !logabs || !status)
+    throw std::invalid_argument("PsiFormer final value device storage is null");
+  const unsigned int blocks = checkedSpatialBlockCount(
+      configuration_count, "PsiFormer final value grid exceeds device x dimension");
+  finalValueCombinationKernel<<<blocks, spatial_block_size, 0, stream>>>(
+      configuration_count, metadata, cusp, phase, logabs, status);
   return peekSpatialLaunchError();
 }
 

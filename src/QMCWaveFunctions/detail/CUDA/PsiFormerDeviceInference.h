@@ -27,10 +27,98 @@
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 namespace qmcplusplus::psiformer::device
 {
+
+/** Own one immutable canonical model image shared by prepared crowd workspaces.
+ * Publication owns the image lifetime; each numerical workspace retains its
+ * image until all submitted work completes. The owning device stays current.
+ */
+class PreparedDeviceModel
+{
+public:
+  /// Upload a checked open-real parameter image at one explicit model version.
+  PreparedDeviceModel(const PsiFormerExecutionPlan& plan,
+                      const std::vector<double>& parameters,
+                      const std::vector<double>& nuclei,
+                      std::size_t version = 0)
+      : plan_(plan), version_(version)
+  {
+    const auto& environment = plan_.environment();
+    if (environment.boundary != BoundaryCondition::OPEN ||
+        environment.parameter_scalar_domain != ScalarDomain::REAL ||
+        environment.compute_scalar_domain != ScalarDomain::REAL ||
+        environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+      throw std::invalid_argument("Device model supports fixed-ion open-real FP64 models only");
+    if (parameters.size() != plan_.parameterCount() || nuclei.size() != 3 * plan_.modelShape().nuclei)
+      throw std::invalid_argument("Device model parameter/nuclear extent mismatch");
+    for (const auto* values : {&parameters, &nuclei})
+      if (std::any_of(values->begin(), values->end(), [](double value) {
+            return !device_math::isFiniteBinary64(value);
+          }))
+        throw std::invalid_argument("Device model image contains nonfinite values");
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&device_), "model device identity");
+#else
+    checkRuntime(cudaGetDevice(&device_), "model device identity");
+#endif
+    parameters_.reserve(parameters.size());
+    parameters_.upload(parameters.data(), parameters.size());
+    nuclei_.reserve(nuclei.size());
+    nuclei_.upload(nuclei.data(), nuclei.size());
+    if (const auto* same = plan_.optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
+      same_alpha_ = parameters[same->begin];
+    opposite_alpha_ = parameters[plan_.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin];
+  }
+
+  /// Reject accidental cross-device reuse without changing the caller's device.
+  void validateCurrentDevice() const
+  {
+    int current = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&current), "workspace device identity");
+#else
+    checkRuntime(cudaGetDevice(&current), "workspace device identity");
+#endif
+    if (current != device_)
+      throw std::invalid_argument("Device model belongs to a different current device");
+  }
+
+  /// Expose immutable model metadata and canonical uploaded intervals.
+  const PsiFormerExecutionPlan& plan() const noexcept { return plan_; }
+
+  /// Identify the parameter image without inferring publication from a pointer.
+  std::size_t version() const noexcept { return version_; }
+
+  /// Return shared parameter storage; callers cannot mutate it through this API.
+  const double* parameters() const noexcept { return parameters_.data(); }
+
+  /// Return fixed-ion geometry stored once per shared image.
+  const double* nuclei() const noexcept { return nuclei_.data(); }
+
+  /// Supply the host scalar needed by the cusp launch, not a per-evaluation copy.
+  double sameAlpha() const noexcept { return same_alpha_; }
+
+  /// Supply the opposite-spin cusp scalar for this exact model version.
+  double oppositeAlpha() const noexcept { return opposite_alpha_; }
+
+  /// Account canonical shared device storage once, separately from crowd scratch.
+  std::size_t deviceStorageBytes() const
+  {
+    return spatial_detail::checkedAdd(checkedDeviceBytes<double>(parameters_.capacity()),
+        checkedDeviceBytes<double>(nuclei_.capacity()), "Device model storage overflow");
+  }
+
+private:
+  PsiFormerExecutionPlan plan_;
+  std::size_t version_;
+  int device_ = -1;
+  double same_alpha_ = 1, opposite_alpha_ = 1;
+  DeviceBuffer<double> parameters_, nuclei_;
+};
 
 /** Preallocate one model image and a fixed-capacity configuration-major VGL graph.
  *
@@ -48,17 +136,30 @@ public:
                           const std::vector<double>& nuclei,
                           std::size_t batch_size,
                           compute::Queue<PlatformKind::CUDA>& queue,
-                          AcceleratorBlasHandle& blas)
-      : plan_(plan), shape_(plan.modelShape()), batch_(batch_size), queue_(queue), blas_(blas)
+                          AcceleratorBlasHandle& blas,
+                          SpatialJetMode mode = SpatialJetMode::FULL_VGL)
+      : PreparedDeviceInference(std::make_shared<PreparedDeviceModel>(plan, parameters, nuclei),
+                                batch_size, queue, blas, mode)
+  {}
+
+  /// Prepare independent scratch while retaining an already uploaded model image.
+  PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
+                          std::size_t batch_size,
+                          compute::Queue<PlatformKind::CUDA>& queue,
+                          AcceleratorBlasHandle& blas,
+                          SpatialJetMode mode = SpatialJetMode::FULL_VGL)
+      : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
+        batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode)
   {
+    model_->validateCurrentDevice();
+    if (mode_ != SpatialJetMode::FULL_VGL && mode_ != SpatialJetMode::VALUE_ONLY)
+      throw std::invalid_argument("Prepared device inference supports value-only or full VGL");
     const auto& environment = plan_.environment();
     if (batch_ == 0 || environment.boundary != BoundaryCondition::OPEN ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
       throw std::invalid_argument("Device inference validation supports fixed-ion open-real FP64 models only");
-    if (parameters.size() != plan_.parameterCount() || nuclei.size() != 3 * shape_.nuclei)
-      throw std::invalid_argument("Device inference parameter/nuclear extent mismatch");
     ne_ = shape_.electrons();
     const std::size_t width = shape_.feature_dimension;
     features_ = makeOpenFeatureJetLayout(batch_, ne_, shape_.nuclei, shape_.spin_up_electrons, mode_);
@@ -77,8 +178,6 @@ public:
     matrices_per_configuration_ = orbitals_.orbitals.element_count;
     gradient_lanes_ = dense_.source.gradient_lanes;
 
-    params_.reserve(parameters.size()); params_.upload(parameters.data(), parameters.size());
-    nuclei_.reserve(nuclei.size()); nuclei_.upload(nuclei.data(), nuclei.size());
     positions_.reserve(product(batch_, product(ne_, 3)));
     active_.reserve(batch_);
     const std::vector<std::size_t> zero_active(batch_, 0);
@@ -91,42 +190,49 @@ public:
     orbital_jets_.reserve(spatialJetSpanElements(orbitals_.orbitals));
     matrices_.reserve(product(batch_, matrices_per_configuration_));
     gradients_.reserve(product(matrices_.capacity(), gradient_lanes_));
-    laplacians_.reserve(product(matrices_.capacity(), ne_));
-    lu_.reserve(matrices_.capacity()); inverse_.reserve(matrices_.capacity());
+    laplacians_.reserve(product(matrices_.capacity(), orbitals_.orbitals.laplacian_lanes));
+    lu_.reserve(matrices_.capacity());
+    if (mode_ == SpatialJetMode::FULL_VGL)
+      inverse_.reserve(matrices_.capacity());
     permutations_.reserve(product(product(batch_, shape_.determinants), ne_));
-    solve_.reserve(permutations_.capacity());
+    if (mode_ == SpatialJetMode::FULL_VGL)
+      solve_.reserve(permutations_.capacity());
     factors_.reserve(product(batch_, shape_.determinants));
     combinations_.reserve(batch_);
     for (DeviceBuffer<double>* buffer : {&term_phase_, &term_log_, &scaled_, &normalized_})
       buffer->reserve(factors_.capacity());
-    matrix_product_.reserve(product(batch_, product(ne_, ne_)));
-    det_gradient_.reserve(product(batch_, gradient_lanes_));
-    det_lap_ratio_.reserve(product(batch_, ne_)); det_lap_log_.reserve(product(batch_, ne_));
-    det_status_.reserve(batch_);
+    if (mode_ == SpatialJetMode::FULL_VGL)
+    {
+      matrix_product_.reserve(product(batch_, product(ne_, ne_)));
+      det_gradient_.reserve(product(batch_, gradient_lanes_));
+      det_lap_ratio_.reserve(product(batch_, ne_));
+      det_lap_log_.reserve(product(batch_, ne_));
+      det_status_.reserve(batch_);
+    }
     cusp_jets_.reserve(spatialJetSpanElements(cusp_.output));
     phase_.reserve(batch_); output_.reserve(spatialJetSpanElements(final_.output));
-    lap_ratio_.reserve(product(batch_, ne_));
+    lap_ratio_.reserve(product(batch_, final_.output.laplacian_lanes));
     const auto status_count = std::max(product(batch_, product(ne_, width)), matrices_.capacity());
     open_status_.reserve(status_count); host_status_.resize(status_count);
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
 
-    same_alpha_ = 1;
-    if (const auto* same = plan_.optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
-      same_alpha_ = parameters[same->begin];
-    opposite_alpha_ = parameters[plan_.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin];
   }
 
   /// Submit feature layers, remaining network layers, orbital/determinant and cusp VGL.
   void evaluate(const std::vector<double>& positions)
   {
-    if (positions.size() != positions_.capacity())
-      throw std::invalid_argument("Device inference positions have wrong fixed batch extent");
+    model_->validateCurrentDevice();
+    const auto coordinates_per_configuration = product(ne_, 3);
+    if (positions.empty() || positions.size() > positions_.capacity() ||
+        positions.size() % coordinates_per_configuration != 0)
+      throw std::invalid_argument("Device inference positions exceed capacity or contain an incomplete configuration");
+    setBatchCount(positions.size() / coordinates_per_configuration);
     positions_.upload(positions.data(), positions.size());
     const auto stream = queue_.getNative();
 
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
-    checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), nuclei_.data(),
+    checkRuntime(launchOpenFeatureJets(stream, features_, positions_.data(), model_->nuclei(),
                                        active_.data(), raw_.data(), open_status_.data()), "model feature VGL");
     checkOpen(batch_);
     project(embedding_, raw_.data(), parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT), a_.data());
@@ -152,32 +258,47 @@ public:
     }
 
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
-    checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), nuclei_.data(),
+    checkRuntime(launchOpenOrbitalJets(stream, orbitals_, a_.data(), positions_.data(), model_->nuclei(),
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
         parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
         active_.data(), orbital_jets_.data(), open_status_.data()), "model orbital VGL");
-    checkOpen(matrices_.capacity());
+    checkOpen(product(batch_, matrices_per_configuration_));
 
     // Pack existing jet planes into the contiguous determinant ABI, without host math.
     for (std::size_t configuration = 0; configuration < batch_; ++configuration)
     {
       const auto origin = configuration * orbitals_.orbitals.configuration_stride;
       copy(orbital_jets_, origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
-      copy(orbital_jets_, origin + orbitals_.orbitals.plane_stride, gradients_,
-           configuration * gradient_lanes_ * matrices_per_configuration_, gradient_lanes_ * matrices_per_configuration_);
-      copy(orbital_jets_, origin + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, laplacians_,
-           configuration * ne_ * matrices_per_configuration_, ne_ * matrices_per_configuration_);
+      if (mode_ == SpatialJetMode::FULL_VGL)
+      {
+        copy(orbital_jets_, origin + orbitals_.orbitals.plane_stride, gradients_,
+             configuration * gradient_lanes_ * matrices_per_configuration_, gradient_lanes_ * matrices_per_configuration_);
+        copy(orbital_jets_, origin + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, laplacians_,
+             configuration * ne_ * matrices_per_configuration_, ne_ * matrices_per_configuration_);
+      }
     }
     checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
-        true, lu_.data(), inverse_.data(), permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+        mode_ == SpatialJetMode::FULL_VGL, lu_.data(), inverse_.data(), permutations_.data(), solve_.data(), factors_.data()), "model determinants");
     checkRuntime(launchDeterminantCombination(stream, factors_.data(), nullptr, batch_, shape_.determinants,
         term_phase_.data(), term_log_.data(), scaled_.data(), normalized_.data(), combinations_.data()), "model determinant sum");
+    // Value-only evaluation deliberately avoids inverse/traces and all spatial
+    // output planes; nodal values remain defined even when log derivatives are not.
+    if (mode_ == SpatialJetMode::VALUE_ONLY)
+    {
+      checkRuntime(launchOpenCuspJets(stream, cusp_, positions_.data(), active_.data(),
+          model_->sameAlpha(), model_->oppositeAlpha(), cusp_jets_.data(), open_status_.data()), "model cusp values");
+      checkOpen(batch_);
+      checkRuntime(launchFinalValueCombination(stream, batch_, combinations_.data(), cusp_jets_.data(),
+          phase_.data(), output_.data(), open_status_.data()), "model final values");
+      checkOpen(batch_);
+      return;
+    }
     device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_, ne_};
     checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
         normalized_.data(), inverse_.data(), gradients_.data(), laplacians_.data(), matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
-    checkRuntime(launchOpenCuspJets(stream, cusp_, positions_.data(), active_.data(), same_alpha_, opposite_alpha_,
+    checkRuntime(launchOpenCuspJets(stream, cusp_, positions_.data(), active_.data(), model_->sameAlpha(), model_->oppositeAlpha(),
                                     cusp_jets_.data(), open_status_.data()), "model cusp VGL");
     checkOpen(batch_);
     checkRuntime(launchFinalSpatialCombination(stream, final_, combinations_.data(), det_status_.data(),
@@ -189,7 +310,8 @@ public:
   /// Download signed-log amplitude, complete log-gradient/log-Laplacian jets and lap ratios.
   void downloadResults(std::vector<double>& phases, std::vector<double>& jets, std::vector<double>& ratios) const
   {
-    if (phases.size() != phase_.capacity() || jets.size() != output_.capacity() || ratios.size() != lap_ratio_.capacity())
+    if (phases.size() != batch_ || jets.size() != spatialJetSpanElements(final_.output) ||
+        ratios.size() != product(batch_, final_.output.laplacian_lanes))
       throw std::invalid_argument("Device inference result buffers have wrong extent");
     phase_.download(phases.data(), phases.size());
     output_.download(jets.data(), jets.size());
@@ -199,14 +321,61 @@ public:
   /// Expose the fixed output layout for result comparison, not internal scratch.
   const SpatialJetLayout& resultLayout() const noexcept { return final_.output; }
 
+  /// Expose identity/version ownership for publication binding and reuse tests.
+  const std::shared_ptr<const PreparedDeviceModel>& modelImage() const noexcept { return model_; }
+
+  /// Return prepared capacity independently of the most recent logical batch.
+  std::size_t batchCapacity() const noexcept { return batch_capacity_; }
+
+  /// Account every explicitly owned device allocation, excluding shared images/BLAS.
+  std::size_t deviceWorkspaceBytes() const
+  {
+    std::size_t bytes = 0;
+    auto add = [&](std::size_t amount) {
+      bytes = spatial_detail::checkedAdd(bytes, amount, "Device workspace storage overflow");
+    };
+    for (const auto* buffer : {&positions_, &raw_, &a_, &b_, &q_, &k_, &v_, &weights_, &context_,
+        &hidden_, &projected_, &orbital_jets_, &matrices_, &gradients_, &laplacians_, &lu_, &inverse_,
+        &solve_, &term_phase_, &term_log_, &scaled_, &normalized_, &matrix_product_, &det_gradient_,
+        &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_, &output_, &lap_ratio_})
+      add(checkedDeviceBytes<double>(buffer->capacity()));
+    add(checkedDeviceBytes<std::size_t>(active_.capacity()));
+    add(checkedDeviceBytes<std::size_t>(permutations_.capacity()));
+    add(checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()));
+    add(checkedDeviceBytes<device_determinant::CombinationMetadata>(combinations_.capacity()));
+    add(checkedDeviceBytes<device_determinant::DerivativeStatus>(det_status_.capacity()));
+    add(checkedDeviceBytes<OpenSpatialStatus>(open_status_.capacity()));
+    add(checkedDeviceBytes<device_math::JetMathStatus>(jet_status_.capacity()));
+    return bytes;
+  }
+
 private:
+  /// Restrict all launches to a compact live prefix without resizing any buffers.
+  void setBatchCount(std::size_t count)
+  {
+    batch_ = count;
+    for (auto* layout : {&features_.output, &embedding_.source, &embedding_.target,
+        &dense_.source, &dense_.target, &elementwise_.jets, &attention_.features,
+        &attention_.attention, &orbitals_.features, &orbitals_.orbitals,
+        &cusp_.output, &final_.output})
+      layout->configuration_count = count;
+  }
+
+  /// Reject a missing shared image before any dependent layout is constructed.
+  static const PsiFormerExecutionPlan& checkedPlan(const std::shared_ptr<const PreparedDeviceModel>& model)
+  {
+    if (!model)
+      throw std::invalid_argument("Prepared device inference requires a model image");
+    return model->plan();
+  }
+
   /// Keep multiplication overflow checks at preparation boundaries.
   static std::size_t product(std::size_t left, std::size_t right)
   { return spatial_detail::checkedProduct(left, right, "Device inference extent overflow"); }
 
   /// Bind a canonical device parameter interval without hot-path string lookup.
   const double* parameter(ParameterRole role, std::size_t layer = NO_ATTENTION_BLOCK) const
-  { return params_.data() + plan_.parameter(role, layer).begin; }
+  { return model_->parameters() + plan_.parameter(role, layer).begin; }
 
   /** Fold contiguous configurations and derivative planes into one shared-weight GEMM.
    * The same affine weight acts independently on every jet plane. No mathematical
@@ -233,10 +402,14 @@ private:
   void checkJets()
   {
     queue_.sync();
-    jet_status_.download(host_jet_status_.data(), host_jet_status_.size());
-    for (auto status : host_jet_status_)
+    const std::size_t count = product(batch_, product(shape_.attention_heads, ne_));
+    jet_status_.download(host_jet_status_.data(), count);
+    for (std::size_t row = 0; row < count; ++row)
+    {
+      const auto status = host_jet_status_[row];
       if (status != device_math::JetMathStatus::REGULAR)
         throw std::runtime_error("Device inference attention has nonregular jet status");
+    }
   }
 
   /// Apply a bias/tanh transformation in place with preallocated diagnostics.
@@ -263,12 +436,15 @@ private:
     checkRuntime(launchDerivativeCopy(queue_.getNative(), layout, source.data(), target.data()), "model jet packing");
   }
 
-  PsiFormerExecutionPlan plan_;
+  std::shared_ptr<const PreparedDeviceModel> model_;
+  const PsiFormerExecutionPlan& plan_;
   ModelShape shape_;
-  std::size_t batch_, ne_ = 0, gradient_lanes_ = 0, matrices_per_configuration_ = 0;
+  std::size_t batch_;
+  const std::size_t batch_capacity_;
+  std::size_t ne_ = 0, gradient_lanes_ = 0, matrices_per_configuration_ = 0;
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
-  const SpatialJetMode mode_ = SpatialJetMode::FULL_VGL;
+  const SpatialJetMode mode_;
   OpenFeatureJetLayout features_;
   SpatialDenseJetLayout embedding_, dense_;
   SpatialElementwiseJetLayout elementwise_;
@@ -276,8 +452,7 @@ private:
   OpenOrbitalJetLayout orbitals_;
   OpenCuspJetLayout cusp_;
   FinalSpatialJetLayout final_;
-  double same_alpha_ = 1, opposite_alpha_ = 1;
-  DeviceBuffer<double> params_, nuclei_, positions_, raw_, a_, b_, q_, k_, v_, weights_, context_, hidden_, projected_;
+  DeviceBuffer<double> positions_, raw_, a_, b_, q_, k_, v_, weights_, context_, hidden_, projected_;
   DeviceBuffer<double> orbital_jets_, matrices_, gradients_, laplacians_, lu_, inverse_, solve_;
   DeviceBuffer<double> term_phase_, term_log_, scaled_, normalized_, matrix_product_;
   DeviceBuffer<double> det_gradient_, det_lap_ratio_, det_lap_log_, cusp_jets_, phase_, output_, lap_ratio_;

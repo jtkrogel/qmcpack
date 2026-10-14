@@ -32,12 +32,60 @@ namespace open_spatial = qmcplusplus::psiformer::open_spatial;
 namespace determinant = qmcplusplus::psiformer::device_determinant;
 namespace open_orbital = qmcplusplus::psiformer::open_orbital;
 
+/// Constrain one-plane features/cusp and defined nodal values without derivatives.
+TEST_CASE("PsiFormer value-only spatial storage preserves values and guard lanes",
+          "[psiformer][device][spatial][value-only]")
+{
+  const auto mode = psiformer::SpatialJetMode::VALUE_ONLY;
+  const auto features = psiformer::makeOpenFeatureJetLayout(1, 2, 1, 1, mode);
+  REQUIRE(features.output.plane_count == 1);
+  CHECK(features.output.gradient_lanes == 0);
+  CHECK(features.output.laplacian_lanes == 0);
+  const auto span = psiformer::spatialJetSpanElements(features.output);
+  const std::array<double, 6> positions{0.4, 0.2, 0.3, -0.2, 0.6, 0.1};
+  const std::array<double, 3> nuclei{0, 0, 0};
+  std::vector<double> output(span + 2, 913.0);
+  CHECK(open_spatial::buildOpenFeatureJetsForConfiguration(features, positions.data(), nuclei.data(),
+                                       0, 0, output.data() + 1) == psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(output.front() == 913.0);
+  CHECK(output.back() == 913.0);
+  const auto full = psiformer::makeOpenFeatureJetLayout(1, 2, 1, 1, psiformer::SpatialJetMode::FULL_VGL);
+  std::vector<double> full_output(psiformer::spatialJetSpanElements(full.output));
+  REQUIRE(open_spatial::buildOpenFeatureJetsForConfiguration(full, positions.data(), nuclei.data(),
+                                         0, 0, full_output.data()) == psiformer::OpenSpatialStatus::REGULAR);
+  for (std::size_t element = 0; element < span; ++element)
+    CHECK(output[element + 1] == full_output[element]);
+
+  const auto cusp = psiformer::makeOpenCuspJetLayout(1, 2, 1, mode);
+  std::array<double, 3> cusp_output{913.0, 0, 913.0};
+  CHECK(open_spatial::buildOpenCuspJetsForConfiguration(cusp, positions.data(), 0, 0, 1., 1.,
+                                   cusp_output.data() + 1) == psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(cusp_output.front() == 913.0);
+  CHECK(cusp_output.back() == 913.0);
+
+  determinant::CombinationMetadata combined;
+  combined.status = determinant::CombinationStatus::REGULAR;
+  combined.phase = -1;
+  combined.log_abs = -3;
+  double phase = 0, logabs = 0;
+  CHECK(open_spatial::combineFinalValue(combined, 0.5, phase, logabs) == psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(phase == -1);
+  CHECK(logabs == -2.5);
+  combined.status = determinant::CombinationStatus::NODE;
+  CHECK(open_spatial::combineFinalValue(combined, 0.5, phase, logabs) == psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(phase == 0);
+  CHECK(logabs == -std::numeric_limits<double>::infinity());
+  CHECK(open_spatial::combineFinalValue(combined, std::numeric_limits<double>::quiet_NaN(), phase, logabs) ==
+        psiformer::OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT);
+}
+
 /// Constrain row folding with independent per-configuration/plane dense products.
 TEST_CASE("PsiFormer shared-weight spatial folding preserves every configuration and plane",
           "[psiformer][device][spatial][folded]")
 {
   for (std::size_t batch : {std::size_t(1), std::size_t(3), std::size_t(17)})
-    for (auto mode : {psiformer::SpatialJetMode::ACTIVE, psiformer::SpatialJetMode::FULL_VGL})
+    for (auto mode : {psiformer::SpatialJetMode::ACTIVE, psiformer::SpatialJetMode::FULL_VGL,
+                     psiformer::SpatialJetMode::VALUE_ONLY})
     {
       const auto jets = psiformer::makeSpatialDenseJetLayout(batch, 2, 4, 5, 2, mode);
       const auto folded = psiformer::makeFoldedSpatialDenseLayout(jets);

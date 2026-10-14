@@ -20,6 +20,11 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/** Return value-only signed-log results, including exact nodes, without inverses. */
+Error launchFinalValueCombination(Stream stream, std::size_t configuration_count,
+    const device_determinant::CombinationMetadata* determinant_metadata,
+    const double* cusp, double* phase, double* logabs, OpenSpatialStatus* status);
+
 /** Transform batched spatial-logit rows to softmax jets in place. */
 Error launchSoftmaxJetRows(Stream stream,
                            const SoftmaxJetRowLayout& layout,

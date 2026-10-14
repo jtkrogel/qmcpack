@@ -158,8 +158,9 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
-    PreparedDeviceInference inference(plan, model.p.flat_values(), model.cfg.nuclei.x,
-                                       model.cfg.nconfig, queue, handle);
+    // Distinct numerical workspaces share one immutable uploaded parameter image.
+    auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 17);
+    PreparedDeviceInference inference(image, model.cfg.nconfig, queue, handle);
     inference.evaluate(model.cfg.electrons.x);
     const auto& layout = inference.resultLayout();
     std::vector<double> phases(model.cfg.nconfig), jets(spatialJetSpanElements(layout)),
@@ -189,8 +190,80 @@ int main(int argc, char** argv)
     inference.evaluate(model.cfg.electrons.x);
     inference.downloadResults(phases, jets, ratios);
     verify();
+
+    // Values must take the one-plane route, not secretly compute and discard VGL.
+    PreparedDeviceInference values(image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
+    if (values.modelImage().get() != inference.modelImage().get() || values.modelImage()->version() != 17 ||
+        values.resultLayout().plane_count != 1 || values.resultLayout().gradient_lanes != 0 ||
+        values.resultLayout().laplacian_lanes != 0)
+      throw std::runtime_error("Value graph lost shared model identity or one-plane layout");
+    std::vector<double> value_phases(model.cfg.nconfig), value_logs(model.cfg.nconfig), no_ratios;
+    const auto value_bytes = values.deviceWorkspaceBytes();
+    if (value_bytes >= inference.deviceWorkspaceBytes())
+      throw std::runtime_error("Value-only workspace did not eliminate derivative storage");
+    for (int repeat = 0; repeat < 2; ++repeat)
+    {
+      values.evaluate(model.cfg.electrons.x);
+      values.downloadResults(value_phases, value_logs, no_ratios);
+      for (std::size_t index = 0; index < references.size(); ++index)
+      {
+        near(value_phases[index], references[index].sign, "value-only sign");
+        near(value_logs[index], references[index].logabs, "value-only logabs");
+      }
+    }
+
+    // A short live prefix must neither touch stale tail status nor resize scratch.
+    if (model.cfg.nconfig > 1)
+    {
+      std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+      std::vector<double> short_phases(1), short_logs(1);
+      values.evaluate(prefix);
+      values.downloadResults(short_phases, short_logs, no_ratios);
+      near(short_phases[0], references[0].sign, "tail value sign");
+      near(short_logs[0], references[0].logabs, "tail value logabs");
+      if (values.batchCapacity() != model.cfg.nconfig || values.deviceWorkspaceBytes() != value_bytes)
+        throw std::runtime_error("Short live batch changed prepared device storage");
+      values.evaluate(model.cfg.electrons.x);
+      values.downloadResults(value_phases, value_logs, no_ratios);
+      for (std::size_t index = 0; index < references.size(); ++index)
+        near(value_logs[index], references[index].logabs, "restored full batch logabs");
+
+      // VGL uses the same live-prefix protocol with derivative output strides.
+      inference.evaluate(prefix);
+      std::vector<double> short_jets(spatialJetSpanElements(inference.resultLayout())), short_ratios(model.ne);
+      inference.downloadResults(short_phases, short_jets, short_ratios);
+      const auto& short_layout = inference.resultLayout();
+      for (std::size_t lane = 0; lane < references[0].gradient.size(); ++lane)
+        near(short_jets[short_layout.uncheckedGradientOffset(0, lane, 0)], references[0].gradient[lane],
+             "tail VGL gradient");
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+        near(short_ratios[electron], references[0].lap_ratio[electron], "tail VGL Laplacian");
+      inference.evaluate(model.cfg.electrons.x);
+      inference.downloadResults(phases, jets, ratios);
+      verify();
+    }
+
+    // Zero orbital projections produce genuine determinant nodes. Their values
+    // are defined, even though an inverse-based log-VGL request would not be.
+    auto node_parameters = model.p.flat_values();
+    for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
+    {
+      const auto& interval = plan.parameter(role);
+      std::fill(node_parameters.begin() + interval.begin,
+                node_parameters.begin() + interval.end, 0.0);
+    }
+    auto node_image = std::make_shared<PreparedDeviceModel>(plan, node_parameters, model.cfg.nuclei.x, 18);
+    PreparedDeviceInference nodes(node_image, model.cfg.nconfig, queue, handle, SpatialJetMode::VALUE_ONLY);
+    nodes.evaluate(model.cfg.electrons.x);
+    nodes.downloadResults(value_phases, value_logs, no_ratios);
+    for (std::size_t index = 0; index < value_logs.size(); ++index)
+      if (value_phases[index] != 0 || value_logs[index] != -HUGE_VAL)
+        throw std::runtime_error("Value-only graph did not preserve signed-log node semantics");
+    std::cout << "Prepared device bytes: shared_model=" << image->deviceStorageBytes()
+              << " value_workspace=" << value_bytes << " VGL_workspace=" << inference.deviceWorkspaceBytes() << '\n';
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
-              << references.size() << "; production dispatch and parameter reverse NOT_VALIDATED\n";
+              << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
+              << "production dispatch and parameter reverse NOT_VALIDATED\n";
     return 0;
   }
   catch (const std::exception& error)

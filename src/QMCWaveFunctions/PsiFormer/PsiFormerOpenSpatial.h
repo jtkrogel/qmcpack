@@ -230,6 +230,32 @@ inline FinalSpatialJetLayout makeFinalSpatialJetLayout(
 namespace open_spatial
 {
 
+/** Combine a signed-log determinant sum and cusp without requiring derivatives.
+ * An exact node has phase zero and log amplitude -infinity, not an undefined
+ * derivative error. Nonfinite cusp or malformed regular metadata still fails.
+ */
+QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus combineFinalValue(
+    const device_determinant::CombinationMetadata& determinant,
+    double cusp, double& phase, double& logabs) noexcept
+{
+  phase = 0.0;
+  logabs = -HUGE_VAL;
+  if (!device_math::isFiniteBinary64(cusp))
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  if (determinant.status == device_determinant::CombinationStatus::NODE)
+    return OpenSpatialStatus::REGULAR;
+  if (determinant.status != device_determinant::CombinationStatus::REGULAR ||
+      !device_math::isFiniteBinary64(determinant.log_abs) ||
+      (determinant.phase != 1.0 && determinant.phase != -1.0))
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  const double combined = determinant.log_abs + cusp;
+  if (!device_math::isFiniteBinary64(combined))
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  phase = determinant.phase;
+  logabs = combined;
+  return OpenSpatialStatus::REGULAR;
+}
+
 QMC_PF_OPEN_HOST_DEVICE inline void clearConfiguration(const SpatialJetLayout& layout,
                                                    std::size_t configuration,
                                                    double* output) noexcept
@@ -289,7 +315,7 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
             displacement[component] * radial.log1p_over_radius;
 
       const bool differentiated = layout.output.mode == SpatialJetMode::FULL_VGL ||
-          electron == active_electron;
+          (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron);
       if (differentiated)
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
         {
@@ -429,7 +455,8 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
       for (std::size_t endpoint = 0; endpoint < 2; ++endpoint)
       {
         const std::size_t electron = endpoint == 0 ? first : second;
-        if (layout.output.mode == SpatialJetMode::FULL_VGL || electron == active_electron)
+        if (layout.output.mode == SpatialJetMode::FULL_VGL ||
+            (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron))
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
           {
             const std::size_t lane = layout.output.mode == SpatialJetMode::FULL_VGL

@@ -32,7 +32,8 @@ namespace qmcplusplus::psiformer
 enum class SpatialJetMode : std::uint8_t
 {
   ACTIVE,
-  FULL_VGL
+  FULL_VGL,
+  VALUE_ONLY
 };
 
 /** Canonical structure-of-arrays storage [configuration,plane,element].
@@ -174,6 +175,8 @@ inline void validateSpatialJetLayout(const SpatialJetLayout& layout)
   std::size_t expected_laplacian_lanes = 0;
   switch (layout.mode)
   {
+  case SpatialJetMode::VALUE_ONLY:
+    break;
   case SpatialJetMode::ACTIVE:
     expected_gradient_lanes = 3;
     break;
@@ -212,7 +215,9 @@ inline SpatialJetLayout makeSpatialJetLayout(std::size_t configuration_count,
 {
   std::size_t gradient_lanes = 3;
   std::size_t laplacian_lanes = 0;
-  if (mode == SpatialJetMode::FULL_VGL)
+  if (mode == SpatialJetMode::VALUE_ONLY)
+    gradient_lanes = 0;
+  else if (mode == SpatialJetMode::FULL_VGL)
   {
     gradient_lanes = spatial_detail::checkedProduct(
         3, electron_count, "PsiFormer spatial gradient-lane extent overflow");
