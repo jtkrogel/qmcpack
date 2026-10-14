@@ -11,7 +11,8 @@
  * CPU-only mode produces references without consulting a GPU. Device mode runs
  * the prepared graph and checks every stored configuration; no CPU fallback is
  * accepted. Ordinary weighted parameter reverse is checked for regular channels;
- * production training, kinetic response and ECP parameter response are not claimed.
+ * Numerical kinetic and synthetic captured-grid responses are also checked;
+ * production training/physical Hamiltonian binding are not claimed here.
  */
 
 #define PSIFORMER_LIBRARY
@@ -25,6 +26,7 @@
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
+#include "PsiFormerDeviceNonlocalResponse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
 
@@ -114,7 +116,7 @@ int main(int argc, char** argv)
       throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
-                                  "[--kinetic-output CANONICAL_F64]");
+                                  "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
@@ -124,6 +126,7 @@ int main(int argc, char** argv)
     std::string score_output;
     std::string jvp_output;
     std::string kinetic_output;
+    std::string nonlocal_output;
     for (int argument = 4; argument < argc; ++argument)
     {
       const std::string option(argv[argument]);
@@ -135,6 +138,8 @@ int main(int argc, char** argv)
         jvp_output = argv[++argument];
       else if (option == "--kinetic-output" && kinetic_output.empty() && argument + 1 < argc)
         kinetic_output = argv[++argument];
+      else if (option == "--nonlocal-output" && nonlocal_output.empty() && argument + 1 < argc)
+        nonlocal_output = argv[++argument];
       else if (option == "--shape" && !shape_supplied && argument + 4 < argc)
       {
         std::size_t* dimensions[] = {&determinants, &width, &heads, &blocks};
@@ -153,7 +158,7 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
-    if (cpu_only && (!score_output.empty() || !jvp_output.empty() || !kinetic_output.empty()))
+    if (cpu_only && (!score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Canonical GPU score export is incompatible with --cpu-only");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
@@ -735,6 +740,97 @@ int main(int argc, char** argv)
       if (!output)
         throw std::runtime_error("Canonical score output write failed");
     }
+    // A captured-grid nonlocal response uses COMPLETE bare*total-ratio weights.
+    // Split seven points into 4+3 to exercise streaming, tails and repeated bases.
+    constexpr std::size_t virtual_count = 7, virtual_capacity = 4;
+    std::vector<double> virtual_positions(virtual_count * model.ne * 3), complete_weights(virtual_count);
+    std::vector<std::size_t> references_for_virtual(virtual_count);
+    std::vector<double> bare_weights(virtual_count);
+    for (std::size_t point = 0; point < virtual_count; ++point)
+    {
+      const auto reference = (2 * point + 1) % model.cfg.nconfig;
+      references_for_virtual[point] = reference;
+      std::copy_n(model.cfg.electrons.x.data() + reference * model.ne * 3, model.ne * 3,
+                   virtual_positions.data() + point * model.ne * 3);
+      const auto electron = point % model.ne;
+      virtual_positions[(point * model.ne + electron) * 3] += 0.01 * (point + 1);
+      virtual_positions[(point * model.ne + electron) * 3 + 1] -= 0.02;
+      virtual_positions[(point * model.ne + electron) * 3 + 2] += 0.005;
+      bare_weights[point] = 0.03 * (static_cast<int>(point % 4) - 1.5);
+    }
+    PreparedDeviceInference virtual_forward(image, virtual_capacity, queue, handle, SpatialJetMode::VALUE_ONLY, true);
+    PreparedDeviceNonlocalResponse nonlocal_response(image, model.cfg.nconfig, virtual_capacity, queue, handle);
+    taped.evaluate(model.cfg.electrons.x);
+    taped.downloadResults(value_phases, value_logs, no_ratios);
+    nonlocal_response.begin(taped, score_weights);
+    std::vector<double> gpu_nonlocal(plan.parameterCount()), cpu_nonlocal(plan.parameterCount(), 0.0);
+    bool premature_nonlocal_rejected = false;
+    try { nonlocal_response.downloadResponse(gpu_nonlocal); }
+    catch (const std::logic_error&) { premature_nonlocal_rejected = true; }
+    if (!premature_nonlocal_rejected)
+      throw std::runtime_error("Nonlocal response exposed an unfinished transaction");
+    for (std::size_t first = 0; first < virtual_count; first += virtual_capacity)
+    {
+      const auto count = std::min(virtual_capacity, virtual_count - first);
+      std::vector<double> positions(virtual_positions.begin() + first * model.ne * 3,
+          virtual_positions.begin() + (first + count) * model.ne * 3);
+      virtual_forward.evaluate(positions);
+      std::vector<double> phases(count), logs(count), weights(count);
+      std::vector<std::size_t> reference_indices(references_for_virtual.begin() + first,
+                                               references_for_virtual.begin() + first + count);
+      virtual_forward.downloadResults(phases, logs, no_ratios);
+      for (std::size_t point = 0; point < count; ++point)
+      {
+        const auto reference = reference_indices[point];
+        weights[point] = bare_weights[first + point] * phases[point] / value_phases[reference] *
+            std::exp(logs[point] - value_logs[reference]);
+        complete_weights[first + point] = weights[point];
+      }
+      nonlocal_response.accumulateVirtualTile(virtual_forward, reference_indices, weights);
+    }
+    nonlocal_response.finish();
+    nonlocal_response.downloadResponse(gpu_nonlocal);
+    if (!nonlocal_output.empty())
+    {
+      std::ofstream output(nonlocal_output, std::ios::binary);
+      output.write(reinterpret_cast<const char*>(gpu_nonlocal.data()), gpu_nonlocal.size() * sizeof(double));
+      if (!output)
+        throw std::runtime_error("Nonlocal canonical response export failed");
+    }
+    for (std::size_t point = 0; point < virtual_count; ++point)
+    {
+      const auto reference = references_for_virtual[point];
+      const double weight = score_weights[reference] * complete_weights[point];
+      cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          virtual_positions.data() + point * model.ne * 3, model.ne));
+      const auto virtual_score = cpu_score_executor.evaluate(*cpu_score_workspace);
+      for (std::size_t parameter = 0; parameter < cpu_nonlocal.size(); ++parameter)
+        cpu_nonlocal[parameter] += weight * virtual_score.parameter_score[parameter];
+      cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+          model.cfg.electrons.x.data() + reference * model.ne * 3, model.ne));
+      const auto base_score = cpu_score_executor.evaluate(*cpu_score_workspace);
+      for (std::size_t parameter = 0; parameter < cpu_nonlocal.size(); ++parameter)
+        cpu_nonlocal[parameter] -= weight * base_score.parameter_score[parameter];
+    }
+    double nonlocal_max_difference = 0;
+    for (std::size_t parameter = 0; parameter < cpu_nonlocal.size(); ++parameter)
+    {
+      near(gpu_nonlocal[parameter], cpu_nonlocal[parameter], "captured nonlocal full-ratio parameter response");
+      nonlocal_max_difference = std::max(nonlocal_max_difference, std::abs(gpu_nonlocal[parameter] - cpu_nonlocal[parameter]));
+    }
+    nonlocal_response.begin(taped, score_weights);
+    taped.evaluate(model.cfg.electrons.x);
+    bool stale_nonlocal_base_rejected = false;
+    try { (void)nonlocal_response.finish(); }
+    catch (const std::logic_error&) { stale_nonlocal_base_rejected = true; }
+    bool stale_nonlocal_output_rejected = false;
+    try { nonlocal_response.downloadResponse(gpu_nonlocal); }
+    catch (const std::logic_error&) { stale_nonlocal_output_rejected = true; }
+    if (!stale_nonlocal_base_rejected || !stale_nonlocal_output_rejected)
+      throw std::runtime_error("Nonlocal response accepted a replaced base snapshot");
+    std::cout << "PASS captured-grid nonlocal response: CPU parity, 4+3 tiles, complete ratios, base generation guard; max_abs_difference="
+              << nonlocal_max_difference << '\n';
+
     if (model.cfg.nconfig > 1)
     {
       std::vector<double> prefix(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
@@ -1020,7 +1116,7 @@ int main(int argc, char** argv)
     std::cout << "PASS native numerical tiles: values/VGL/active gradients/sparse replacements/tails\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
-              << "regular-channel score JVP/VJP PASS; production training/kinetic response NOT_VALIDATED\n";
+              << "regular-channel score/kinetic/captured-grid response PASS; production training/Hamiltonian binding NOT_VALIDATED\n";
     return 0;
   }
   catch (const std::exception& error)

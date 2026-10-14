@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <vector>
 
 namespace qmcplusplus::psiformer::device
@@ -333,6 +334,9 @@ public:
   {
     // A failed replacement must never leave the preceding tape visible as current.
     value_tape_valid_ = false;
+    if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Device inference evaluation generation exhausted");
+    ++evaluation_generation_;
     model_->validateCurrentDevice();
     const auto coordinates_per_configuration = product(ne_, 3);
     if (positions.empty() || positions.size() > positions_.capacity() ||
@@ -463,6 +467,9 @@ public:
 
   /// Return prepared capacity independently of the most recent logical batch.
   std::size_t batchCapacity() const noexcept { return batch_capacity_; }
+
+  /// Identify attempted coordinate evaluations independently of immutable parameters.
+  std::size_t evaluationGeneration() const noexcept { return evaluation_generation_; }
 
   /// Expose a completed tape only; callers retain the graph and its model lease.
   const RetainedBlockTape& valueBlockTape(std::size_t layer) const
@@ -715,6 +722,7 @@ private:
   std::vector<std::unique_ptr<RetainedBlockTape>> value_tape_;
   DeviceBuffer<double> retained_backflow_, retained_envelope_;
   bool value_tape_valid_ = false;
+  std::size_t evaluation_generation_ = 0;
 };
 
 } // namespace qmcplusplus::psiformer::device
