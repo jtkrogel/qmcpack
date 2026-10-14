@@ -222,6 +222,47 @@ int main(int argc, char** argv)
     taped.evaluate(model.cfg.electrons.x);
     taped.downloadResults(value_phases, value_logs, no_ratios);
     const auto canonical_parameters = model.p.flat_values();
+    const auto matrix_count = model.cfg.nconfig * model.ndet * model.ne * model.ne;
+    std::vector<double> retained_backflow(matrix_count), retained_envelope(matrix_count);
+    std::vector<double> final_features(model.cfg.nconfig * model.ne * model.dim);
+    taped.downloadValueOrbitalFactors(retained_backflow, retained_envelope);
+    taped.downloadValueFinalFeatures(final_features);
+    for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+      for (std::size_t determinant = 0; determinant < model.ndet; ++determinant)
+        for (std::size_t electron = 0; electron < model.ne; ++electron)
+          for (std::size_t orbital = 0; orbital < model.ne; ++orbital)
+          {
+            const bool spin_up = electron < model.cfg.nup;
+            const auto backflow_offset = plan.parameter(spin_up ? ParameterRole::BACKFLOW_UP_WEIGHT :
+                                                                 ParameterRole::BACKFLOW_DOWN_WEIGHT).begin;
+            const auto pi_offset = plan.parameter(spin_up ? ParameterRole::ENVELOPE_PI_UP :
+                                                           ParameterRole::ENVELOPE_PI_DOWN).begin;
+            const auto zeta_offset = plan.parameter(spin_up ? ParameterRole::ENVELOPE_ZETA_UP :
+                                                             ParameterRole::ENVELOPE_ZETA_DOWN).begin;
+            double backflow = 0, envelope = 0;
+            for (std::size_t feature = 0; feature < model.dim; ++feature)
+              backflow += final_features[(configuration * model.ne + electron) * model.dim + feature] *
+                  canonical_parameters[backflow_offset + (feature * model.ndet + determinant) * model.ne + orbital];
+            for (std::size_t nucleus = 0; nucleus < shape.nuclei; ++nucleus)
+            {
+              double radius_squared = 0;
+              for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              {
+                const double displacement = model.cfg.electrons.x[(configuration * model.ne + electron) * 3 + dimension] -
+                    model.cfg.nuclei.x[nucleus * 3 + dimension];
+                radius_squared += displacement * displacement;
+              }
+              const auto parameter = (determinant * model.ne + orbital) * shape.nuclei + nucleus;
+              envelope += canonical_parameters[pi_offset + parameter] *
+                  std::exp(-std::abs(canonical_parameters[zeta_offset + parameter]) * std::sqrt(radius_squared));
+            }
+            const auto index = ((configuration * model.ndet + determinant) * model.ne + electron) * model.ne + orbital;
+            near(retained_backflow[index], backflow, "retained spin-conditioned backflow");
+            near(retained_envelope[index], envelope, "retained orbital envelope");
+          }
+    if (!taped.valueHeadTape().inverses)
+      throw std::runtime_error("Score tape did not prepare determinant inverse storage");
+    std::cout << "PASS retained orbital factors: independent spin/backflow/envelope formulas\n";
     for (std::size_t layer = 0; layer < model.blocks; ++layer)
     {
       const auto& tape = taped.valueBlockTape(layer);

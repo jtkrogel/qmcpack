@@ -166,6 +166,22 @@ public:
     }
   };
 
+  /** Borrow the ordinary orbital factors and determinant seed ingredients.
+   * A consumer must check factorization/combination status before using inverses;
+   * singular-channel fallback is not implicitly supplied by this view.
+   */
+  struct ValueHeadTape
+  {
+    const double* positions;
+    const double* backflow;
+    const double* envelope;
+    const double* matrices;
+    const double* inverses;
+    const double* normalized_weights;
+    const device_determinant::FactorizationMetadata* factorizations;
+    const device_determinant::CombinationMetadata* combinations;
+  };
+
   /// Validate the open-real model and prepare all storage before numerical launches.
   PreparedDeviceInference(const PsiFormerExecutionPlan& plan,
                           const std::vector<double>& parameters,
@@ -232,10 +248,10 @@ public:
     gradients_.reserve(product(matrices_.capacity(), gradient_lanes_));
     laplacians_.reserve(product(matrices_.capacity(), orbitals_.orbitals.laplacian_lanes));
     lu_.reserve(matrices_.capacity());
-    if (mode_ == SpatialJetMode::FULL_VGL)
+    if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
       inverse_.reserve(matrices_.capacity());
     permutations_.reserve(product(product(batch_, shape_.determinants), ne_));
-    if (mode_ == SpatialJetMode::FULL_VGL)
+    if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
       solve_.reserve(permutations_.capacity());
     factors_.reserve(product(batch_, shape_.determinants));
     combinations_.reserve(batch_);
@@ -257,8 +273,12 @@ public:
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
     if (retain_score_tape)
+    {
+      retained_backflow_.reserve(matrices_.capacity());
+      retained_envelope_.reserve(matrices_.capacity());
       for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
         value_tape_.push_back(std::make_unique<ValueBlockTape>(feature_elements, weights_.capacity()));
+    }
   }
 
   /// Submit feature layers, remaining network layers, orbital/determinant and cusp VGL.
@@ -323,7 +343,9 @@ public:
         parameter(ParameterRole::BACKFLOW_UP_WEIGHT), parameter(ParameterRole::BACKFLOW_DOWN_WEIGHT),
         parameter(ParameterRole::ENVELOPE_PI_UP), parameter(ParameterRole::ENVELOPE_PI_DOWN),
         parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
-        active_.data(), orbital_jets_.data(), open_status_.data()), "model orbital VGL");
+        active_.data(), orbital_jets_.data(), open_status_.data(),
+        value_tape_.empty() ? nullptr : retained_backflow_.data(),
+        value_tape_.empty() ? nullptr : retained_envelope_.data()), "model orbital VGL");
     checkOpen(product(batch_, matrices_per_configuration_));
 
     // Pack existing jet planes into the contiguous determinant ABI, without host math.
@@ -340,7 +362,8 @@ public:
       }
     }
     checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
-        mode_ == SpatialJetMode::FULL_VGL, lu_.data(), inverse_.data(), permutations_.data(), solve_.data(), factors_.data()), "model determinants");
+        mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
+        permutations_.data(), solve_.data(), factors_.data()), "model determinants");
     checkRuntime(launchDeterminantCombination(stream, factors_.data(), nullptr, batch_, shape_.determinants,
         term_phase_.data(), term_log_.data(), scaled_.data(), normalized_.data(), combinations_.data()), "model determinant sum");
     // Value-only evaluation deliberately avoids inverse/traces and all spatial
@@ -411,6 +434,24 @@ public:
     return raw_.data();
   }
 
+  /// Borrow completed orbital/determinant inputs while retaining the graph lease.
+  ValueHeadTape valueHeadTape() const
+  {
+    (void)valueTapeBatchCount();
+    return {positions_.data(), retained_backflow_.data(), retained_envelope_.data(),
+            matrices_.data(), inverse_.data(), normalized_.data(), factors_.data(), combinations_.data()};
+  }
+
+  /// Download the separately retained product factors for regression validation.
+  void downloadValueOrbitalFactors(std::vector<double>& backflow, std::vector<double>& envelope) const
+  {
+    const auto count = product(valueTapeBatchCount(), matrices_per_configuration_);
+    if (backflow.size() != count || envelope.size() != count)
+      throw std::invalid_argument("Retained orbital factor destination extent mismatch");
+    retained_backflow_.download(backflow.data(), count);
+    retained_envelope_.download(envelope.data(), count);
+  }
+
   /// Borrow the final shared neural features before orbital/envelope construction.
   const double* valueFinalFeatures() const
   {
@@ -439,7 +480,8 @@ public:
     for (const auto* buffer : {&positions_, &raw_, &a_, &b_, &q_, &k_, &v_, &weights_, &context_,
         &hidden_, &projected_, &orbital_jets_, &matrices_, &gradients_, &laplacians_, &lu_, &inverse_,
         &solve_, &term_phase_, &term_log_, &scaled_, &normalized_, &matrix_product_, &det_gradient_,
-        &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_, &output_, &lap_ratio_})
+        &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_, &output_, &lap_ratio_,
+        &retained_backflow_, &retained_envelope_})
       add(checkedDeviceBytes<double>(buffer->capacity()));
     add(checkedDeviceBytes<std::size_t>(active_.capacity()));
     add(checkedDeviceBytes<std::size_t>(permutations_.capacity()));
@@ -569,6 +611,7 @@ private:
   std::vector<OpenSpatialStatus> host_status_;
   std::vector<device_math::JetMathStatus> host_jet_status_;
   std::vector<std::unique_ptr<ValueBlockTape>> value_tape_;
+  DeviceBuffer<double> retained_backflow_, retained_envelope_;
   bool value_tape_valid_ = false;
 };
 

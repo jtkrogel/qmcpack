@@ -199,7 +199,9 @@ __global__ void openOrbitalJetsKernel(OpenOrbitalJetLayout layout,
                                       const double* zeta_down,
                                       const std::size_t* active_electrons,
                                       double* output,
-                                      OpenSpatialStatus* status)
+                                      OpenSpatialStatus* status,
+                                      double* retained_backflow,
+                                      double* retained_envelope)
 {
   const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t electron_count = layout.features.electron_count;
@@ -216,7 +218,8 @@ __global__ void openOrbitalJetsKernel(OpenOrbitalJetLayout layout,
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, configuration,
       active_electrons[configuration], determinant,
-      matrix_element / electron_count, matrix_element % electron_count, output);
+      matrix_element / electron_count, matrix_element % electron_count, output,
+      retained_backflow, retained_envelope);
 }
 
 } // namespace
@@ -525,12 +528,18 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
                             const double* pi_down, const double* zeta_up,
                             const double* zeta_down,
                             const std::size_t* active_electrons, double* output,
-                            OpenSpatialStatus* status)
+                            OpenSpatialStatus* status,
+                            double* retained_backflow,
+                            double* retained_envelope)
 {
   if (layout.features.configuration_count == 0 &&
       layout.determinant_count == 0 && layout.features.electron_count == 0)
     return success;
   validateOpenOrbitalJetLayout(layout);
+  if ((retained_backflow == nullptr) != (retained_envelope == nullptr) ||
+      (retained_backflow && (retained_backflow == retained_envelope ||
+                            retained_backflow == output || retained_envelope == output)))
+    throw std::invalid_argument("Retained orbital factors require distinct paired destinations");
   const bool need_up = layout.spin_up_count != 0;
   const bool need_down = layout.spin_up_count != layout.features.electron_count;
   if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
@@ -542,7 +551,8 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
       count, "PsiFormer open orbital grid exceeds device x dimension");
   openOrbitalJetsKernel<<<blocks, spatial_block_size, 0, stream>>>(
       layout, features, positions, nuclei, backflow_up, backflow_down,
-      pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status);
+      pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
+      retained_backflow, retained_envelope);
   return peekSpatialLaunchError();
 }
 

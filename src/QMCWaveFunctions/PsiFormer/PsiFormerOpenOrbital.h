@@ -239,7 +239,8 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     const double* zeta_up, const double* zeta_down,
     std::size_t configuration, std::size_t active_electron,
     std::size_t determinant, std::size_t row_electron,
-    std::size_t orbital, double* output) noexcept
+    std::size_t orbital, double* output,
+    double* retained_backflow = nullptr, double* retained_envelope = nullptr) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
@@ -312,6 +313,13 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
   if (!device_math::isFiniteBinary64(value))
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
   output[layout.orbitals.uncheckedValueOffset(configuration, element)] = value;
+  // Parameter reverse needs the two product factors separately: division of the
+  // orbital value by either factor would be invalid at a finite zero factor.
+  const auto retained_offset = configuration * layout.orbitals.element_count + element;
+  if (retained_backflow)
+    retained_backflow[retained_offset] = backflow_value;
+  if (retained_envelope)
+    retained_envelope[retained_offset] = envelope_value;
   for (std::size_t lane = 0; lane < layout.features.gradient_lanes; ++lane)
   {
     double backflow_gradient = 0.0;

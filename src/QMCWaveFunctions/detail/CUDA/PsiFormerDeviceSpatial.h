@@ -109,6 +109,10 @@ Error launchFinalSpatialCombination(
     double* laplacian_ratio,
     OpenSpatialStatus* status);
 
+/** Build orbital jets, optionally retaining ordinary B and E factors separately.
+ * Retained buffers are paired, distinct, contiguous [configuration,D,N,N]; they
+ * contain values only even when the primary output contains spatial jet planes.
+ */
 Error launchOpenOrbitalJets(Stream stream,
                             const OpenOrbitalJetLayout& layout,
                             const double* features,
@@ -122,7 +126,9 @@ Error launchOpenOrbitalJets(Stream stream,
                             const double* zeta_down,
                             const std::size_t* active_electrons,
                             double* output,
-                            OpenSpatialStatus* status);
+                            OpenSpatialStatus* status,
+                            double* retained_backflow = nullptr,
+                            double* retained_envelope = nullptr);
 
 } // namespace qmcplusplus::psiformer::device
 
