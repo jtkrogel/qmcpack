@@ -28,7 +28,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 62> allowed_controls{
+constexpr std::array<std::string_view, 63> allowed_controls{
     "iterations", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
@@ -43,7 +43,7 @@ constexpr std::array<std::string_view, 62> allowed_controls{
     "krylov_maximum_operator_applications", "krylov_maximum_seconds", "krylov_stagnation_window",
     "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
     "maximum_retained_bytes", "maximum_resident_bytes", "checkpoint_path", "restart_path", "provider",
-    "teacher", "overlap_target", "overlap_weighting", "target_provenance",
+    "teacher", "overlap_target", "overlap_weighting", "target_provenance", "orbital_target",
     "minimum_fidelity", "minimum_effective_samples", "pii_shift_mode",
     "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
     "gmres_restart_length"};
@@ -247,6 +247,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   iterations_ = 1;
   warmup_steps_ = 0;
   objective_                        = Objective::ENERGY;
+  orbital_target_                    = OrbitalTarget::SINGLE_REFERENCE;
   momentum_decay_ = 0.9;
   rms_decay_ = 0.9;
   lm_overlap_shift_ = 1.0e-4;
@@ -369,9 +370,11 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
       objective_ = Objective::ENERGY;
     else if (objective == "determinant_overlap")
       objective_ = Objective::DETERMINANT_OVERLAP;
+    else if (objective == "orbital_mse")
+      objective_ = Objective::ORBITAL_MSE;
     else
       throw UniformCommunicateError("WFTrainDriverInput: unsupported objective=\"" + objective +
-                                    "\"; supported objectives are energy and determinant_overlap");
+                                    "\"; supported objectives are energy, determinant_overlap and orbital_mse");
   }
   if (seen_controls.find("optimizer") != seen_controls.end())
   {
@@ -592,8 +595,35 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   const std::initializer_list<std::string_view> overlap_attributes = {
       "teacher", "overlap_target", "overlap_weighting", "target_provenance",
       "minimum_fidelity", "minimum_effective_samples"};
+  if (seen_controls.count("orbital_target"))
+  {
+    const std::string target = readControl("orbital_target");
+    if (target == "single_reference")
+      orbital_target_ = OrbitalTarget::SINGLE_REFERENCE;
+    else if (target == "top_coefficients")
+      orbital_target_ = OrbitalTarget::TOP_COEFFICIENT_MULTIDETERMINANT;
+    else
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: orbital_target must be single_reference or top_coefficients");
+  }
+  if (objective_ != Objective::ORBITAL_MSE)
+    rejectControls(seen_controls, {"orbital_target"}, "non-orbital objective");
   if (objective_ == Objective::ENERGY)
     rejectControls(seen_controls, overlap_attributes, "energy objective");
+  else if (objective_ == Objective::ORBITAL_MSE)
+  {
+    if (teacher_wavefunction_.empty() || target_provenance_.empty())
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: orbital_mse requires teacher and target_provenance");
+    if (!first_order)
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: orbital_mse requires a first-order optimizer");
+    if (line_search_ != LineSearch::OFF || maximum_metric_norm_ != 0.0)
+      throw UniformCommunicateError(
+          "WFTrainDriverInput: orbital_mse requires line_search=off and maximum_metric_norm=0");
+    rejectControls(seen_controls, {"overlap_target", "overlap_weighting", "minimum_fidelity",
+                                  "minimum_effective_samples"}, "orbital_mse objective");
+  }
   else
   {
     if (teacher_wavefunction_.empty() || target_provenance_.empty())

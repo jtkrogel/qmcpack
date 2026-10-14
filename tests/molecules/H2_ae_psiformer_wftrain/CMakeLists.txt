@@ -4,6 +4,16 @@
 # emitted only after refresh succeeds, so its presence is the application-level
 # completion criterion.
 if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  # Native neural parameters and inline conventional SPOs require no external data.
+  set(ORBITAL_TEST short-H2-ae-psiformer-orbital-mse-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(${ORBITAL_TEST} "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+              1 1 TEST_ADDED wftrain_orbital_mse.xml)
+  if(TEST_ADDED)
+    set_property(TEST ${ORBITAL_TEST} PROPERTY PASS_REGULAR_EXPRESSION
+                 "WFTrain iteration 2 version 2 samples 2 orbital_loss")
+  endif()
+
   foreach(POOLED_CASE optimizers search)
     set(TEST_ADDED FALSE)
     set(POOLED_TEST short-H2-psiformer-wftrain-pooled-${POOLED_CASE}-r1-t1)

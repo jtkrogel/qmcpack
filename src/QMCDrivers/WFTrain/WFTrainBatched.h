@@ -26,6 +26,11 @@ class StructuredParameterProvider;
 namespace qmcplusplus
 {
 
+namespace psiformer
+{
+class OrbitalTargetEvaluator;
+}
+
 /** Batched high-parameter wavefunction-training driver. */
 class WFTrainBatched : public QMCDriverNew
 {
@@ -64,6 +69,9 @@ private:
   std::vector<UPtrVector<TrialWaveFunction>> overlap_student_twfs_;
   std::unique_ptr<wftrain::DeterminantOverlapObjective> determinant_overlap_objective_;
 
+  /// Frozen conventional SPO targets, evaluated without the teacher's Jastrow factors.
+  std::unique_ptr<psiformer::OrbitalTargetEvaluator> orbital_target_;
+
   /// Per-crowd RNG contexts used by full initialization and post-update refreshes.
   UPtrVector<ContextForSteps> step_contexts_;
 
@@ -75,6 +83,9 @@ private:
 
   /** Clone the student onto every teacher configuration and freeze target semantics. */
   void initializeDeterminantOverlap();
+
+  /// Freeze occupied or top-coefficient conventional orbitals for orbital-MSE training.
+  void initializeOrbitalPretraining();
 
   /** Reject Hamiltonians outside the first all-electron kinetic-energy route. */
   void validateHamiltonianForTraining();

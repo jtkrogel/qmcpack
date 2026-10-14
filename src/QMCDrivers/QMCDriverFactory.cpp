@@ -274,14 +274,13 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
 
       const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
       TrialWaveFunction& sampling_wavefunction =
-          training_input.getObjective() == WFTrainDriverInput::Objective::DETERMINANT_OVERLAP
+          training_input.getObjective() != WFTrainDriverInput::Objective::ENERGY
           ? getPsi(training_input.getTeacherWaveFunction())
           : primaryPsi;
-      if (training_input.getObjective() ==
-              WFTrainDriverInput::Objective::DETERMINANT_OVERLAP &&
+      if (training_input.getObjective() != WFTrainDriverInput::Objective::ENERGY &&
           &sampling_wavefunction == &primaryPsi)
         throw UniformCommunicateError(
-            "WFTrain determinant_overlap requires teacher to name a wavefunction distinct from the student");
+            "WFTrain teacher objectives require a wavefunction distinct from the student");
       UPtr<EstimatorManagerNew> estimator_manager = makeEstimatorManager(
           emi, qmcdriver_input.get_estimator_manager_input(), sampling_wavefunction);
       new_driver = std::make_unique<WFTrainBatched>(

@@ -28,6 +28,7 @@
 #include "QMCDrivers/WFTrain/ProposalSelection.h"
 #include "QMCDrivers/WFTrain/NativeLineSearch.h"
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
+#include "QMCDrivers/WFTrain/OrbitalPretraining.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
@@ -35,6 +36,10 @@
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
+#include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
 
 #include <cmath>
@@ -92,6 +97,47 @@ RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool ov
   }
   return result;
 }
+
+/** Stream raw-orbital targets and VJPs without retaining a samples-by-parameters matrix.
+ * Frozen CPU SPO targets and the student's selected CPU/GPU backend share only positions. */
+class SampledOrbitalPretrainingProducer final : public wftrain::OrbitalPretrainingProducer
+{
+public:
+  SampledOrbitalPretrainingProducer(PsiFormerWF& student,
+                                    psiformer::OrbitalTargetEvaluator& target,
+                                    const std::vector<RetainedCrowdSamples>& samples)
+      : student_(student), target_(target), samples_(samples),
+        gradient_(student.parameterSchema().parameterCount())
+  {}
+
+  wftrain::TrainingCapabilities capabilities() const noexcept override
+  {
+    return {wftrain::TrainingCapability::REAL_PARAMETERS,
+            wftrain::TrainingCapability::ORBITAL_MSE_VJP};
+  }
+
+  void accumulate(const wftrain::StructuredParameterSnapshot& parameters,
+                  wftrain::OrbitalPretrainingAccumulator& accumulator) override
+  {
+    // One target matrix and one canonical gradient are reused for all retained samples.
+    for (const auto& crowd : samples_)
+      for (const auto& particles : crowd.particles)
+      {
+        const double loss = student_.evaluateOrbitalMSE(
+            *particles, target_.evaluate(*particles), gradient_, parameters.version);
+        accumulator.addSample(loss, parameters.version, {gradient_.data(), gradient_.size()});
+      }
+  }
+
+  /// Explicit producer scratch; the accumulator and result are charged separately.
+  std::size_t retainedBytes() const noexcept { return gradient_.capacity() * sizeof(double); }
+
+private:
+  PsiFormerWF& student_;
+  psiformer::OrbitalTargetEvaluator& target_;
+  const std::vector<RetainedCrowdSamples>& samples_;
+  std::vector<double> gradient_;
+};
 
 /** Replay a retained snapshot on resident clones and reconstruct coherent VGL.
  * Iterating snapshots in collection order leaves the live chains at their final
@@ -830,7 +876,7 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
   extendStageFingerprint(hash, training.getKrylovMinimumRelativeImprovement());
   extendStageFingerprint(hash, training.getKrylovCurvatureTolerance());
   extendStageFingerprint(hash, training.getKrylovImaginaryTolerance());
-  if (training.getObjective() == WFTrainDriverInput::Objective::DETERMINANT_OVERLAP)
+  if (training.getObjective() != WFTrainDriverInput::Objective::ENERGY)
   {
     extendStageFingerprint(hash, training.getTeacherWaveFunction());
     extendStageFingerprint(hash, training.getTargetProvenance());
@@ -845,6 +891,8 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
     extendStageFingerprint(hash, training.getMinimumFidelity());
     extendStageFingerprint(hash, training.getMinimumEffectiveSamples());
     extendStageFingerprint(hash, resolved_overlap_fingerprint);
+    if (training.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
+      extendStageFingerprint(hash, static_cast<int>(training.getOrbitalTarget()));
   }
   extendStageFingerprint(hash, qmc.get_tau());
   extendStageFingerprint(hash, qmc.get_spin_mass());
@@ -953,6 +1001,25 @@ void WFTrainBatched::process(xmlNodePtr node)
     initPopulationAndCrowds(walker_counts);
     createStepContexts(crowds_.size());
     initializeDeterminantOverlap();
+    // Target construction clones SPOs and may allocate differently on each rank.
+    // Agree on failure before any participant enters the training collectives.
+    std::exception_ptr target_failure;
+    try
+    {
+      initializeOrbitalPretraining();
+    }
+    catch (...)
+    {
+      target_failure = std::current_exception();
+    }
+    int target_failed = target_failure ? 1 : 0;
+    myComm->allreduce(target_failed);
+    if (target_failed)
+    {
+      if (target_failure)
+        std::rethrow_exception(target_failure);
+      throw UniformCommunicateError("WFTrainBatched: another rank failed to construct its orbital target");
+    }
   }
   catch (const std::exception& error)
   {
@@ -1019,16 +1086,19 @@ void WFTrainBatched::run()
   const bool determinant_overlap =
       training_input_.getObjective() ==
       WFTrainDriverInput::Objective::DETERMINANT_OVERLAP;
+  const bool orbital_mse = training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE;
+  if (orbital_mse && !orbital_target_)
+    throw UniformCommunicateError("WFTrainBatched: orbital target was not initialized by process()");
   if (determinant_overlap && !determinant_overlap_objective_)
     throw UniformCommunicateError(
         "WFTrainBatched: determinant-overlap state was not initialized by process()");
   const std::uint64_t overlap_fingerprint = determinant_overlap
       ? determinant_overlap_objective_->configurationFingerprint()
-      : 0;
+      : (orbital_mse ? orbital_target_->descriptor().fingerprint() : 0);
   const bool has_nonlocal_ecp =
       population_.get_golden_hamiltonian().hasPhysicalNLPP();
   wftrain::TrainingStageState stage_state{
-      determinant_overlap ? "determinant_overlap"
+      orbital_mse ? wftrain::OrbitalPretrainingCoordinator::STAGE_ID : determinant_overlap ? "determinant_overlap"
                           : (has_nonlocal_ecp ? "pseudopotential_energy"
                                               : "all_electron_energy"),
       0, 0,
@@ -1061,7 +1131,7 @@ void WFTrainBatched::run()
       iteration_history << "iteration,sample_version,parameter_version,objective,optimizer,samples,"
                            "mean_energy,variance,gradient_norm,overlap_loss,selected_alpha,committed,"
                            "sampling_seconds,total_seconds,retained_numeric_bytes,resident_bytes,"
-                           "krylov_iterations,krylov_operator_applications\n";
+                           "krylov_iterations,krylov_operator_applications,orbital_loss\n";
     iteration_history.flush();
     history_failed = !iteration_history;
   }
@@ -1202,6 +1272,7 @@ void WFTrainBatched::run()
     std::optional<std::size_t> krylov_operator_applications;
     std::optional<wftrain::DerivativeReal> applied_scale;
     std::optional<wftrain::DeterminantOverlapObjectiveResult> overlap_diagnostics;
+    std::optional<wftrain::OrbitalPretrainingResult> orbital_diagnostics;
     double selected_alpha = 1.0;
     double selected_displacement_norm = 0.0;
     auto decorate = [&](wftrain::TrainingUpdateRule& optimizer) {
@@ -1299,7 +1370,52 @@ void WFTrainBatched::run()
           });
     };
     {
-      if (determinant_overlap)
+      if (orbital_mse)
+      {
+        auto* student = dynamic_cast<PsiFormerWF*>(selected_provider_);
+        if (!student)
+          throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+        std::unique_ptr<SampledOrbitalPretrainingProducer> producer;
+        std::unique_ptr<wftrain::OrbitalPretrainingCoordinator> coordinator;
+        std::unique_ptr<wftrain::SelectedUpdateRule> update;
+        std::optional<wftrain::TrainingStageState> coordinator_stage;
+        std::optional<wftrain::StructuredParameterSnapshot> parameters;
+        std::exception_ptr preparation_failure;
+        try
+        {
+          parameters.emplace(selected_provider_->snapshotParameters());
+          producer = std::make_unique<SampledOrbitalPretrainingProducer>(
+              *student, *orbital_target_, retained_samples);
+          coordinator = std::make_unique<wftrain::OrbitalPretrainingCoordinator>(
+              orbital_target_->descriptor().fingerprint(), reduction);
+          coordinator_stage.emplace(coordinator->makeStageState(stage_state.stage_ordinal));
+          coordinator_stage->completed_stage_iterations = stage_state.completed_stage_iterations;
+          update = decorate(*first_order_optimizer);
+        }
+        catch (...)
+        {
+          preparation_failure = std::current_exception();
+        }
+        reduction.preflightOrbital(selected_provider_->parameterSchema(),
+            parameters ? &*parameters : nullptr, orbital_target_->descriptor().fingerprint(),
+            wftrain::OrbitalPretrainingCoordinator::LOSS_FINGERPRINT, preparation_failure);
+        // The outer checkpoint binds all driver controls; the coordinator independently
+        // validates its exact target/loss identity and owns failure-atomic publication.
+        retained_numeric_bytes = checkedMemoryAdd(first_order_optimizer->retainedBytes(),
+            checkedMemoryAdd(producer->retainedBytes(), orbital_target_->retainedScalarBytes()));
+        retained_numeric_bytes = checkedMemoryAdd(retained_numeric_bytes,
+            checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), 4 * sizeof(double)));
+        enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
+                            training_input_.getMaximumRetainedBytes());
+        parameters.reset();
+        auto result = coordinator->runIteration(*selected_provider_, *producer,
+            *update, training_state, *coordinator_stage, &cache_observer);
+        stage_state.completed_stage_iterations = coordinator_stage->completed_stage_iterations;
+        iteration_result.completed_iteration = result.completed_iteration;
+        iteration_result.parameter_version = result.parameter_version;
+        orbital_diagnostics.emplace(std::move(result.objective));
+      }
+      else if (determinant_overlap)
       {
         const auto& schema = selected_provider_->parameterSchema();
         std::optional<wftrain::StructuredParameterSnapshot> parameters;
@@ -1814,7 +1930,11 @@ void WFTrainBatched::run()
       app_log() << std::setprecision(12)
                 << "WFTrain iteration " << iteration_result.completed_iteration
                 << " version " << iteration_result.parameter_version;
-      if (overlap_diagnostics)
+      if (orbital_diagnostics)
+        app_log() << " samples " << orbital_diagnostics->sample_count
+                  << " orbital_loss " << orbital_diagnostics->mean_loss
+                  << " gradient_norm " << gradientNorm(orbital_diagnostics->gradient);
+      else if (overlap_diagnostics)
       {
         double minimum_fidelity = 1.0;
         double minimum_target_effective_samples =
@@ -1871,9 +1991,12 @@ void WFTrainBatched::run()
     {
       iteration_history << std::setprecision(17) << iteration_result.completed_iteration << ','
                         << sample_version << ',' << iteration_result.parameter_version << ','
-                        << (determinant_overlap ? "determinant_overlap" : "energy") << ','
+                        << (orbital_mse ? "orbital_mse" : determinant_overlap ? "determinant_overlap" : "energy") << ','
                         << wftrain::optimizerName(training_input_.getOptimizer()) << ',';
-      if (overlap_diagnostics)
+      if (orbital_diagnostics)
+        iteration_history << orbital_diagnostics->sample_count << ",,,"
+                          << gradientNorm(orbital_diagnostics->gradient) << ',';
+      else if (overlap_diagnostics)
         iteration_history << overlap_diagnostics->sample_count << ",,,,"
                           << overlap_diagnostics->loss;
       else
@@ -1890,6 +2013,9 @@ void WFTrainBatched::run()
       iteration_history << ',';
       if (krylov_operator_applications)
         iteration_history << *krylov_operator_applications;
+      iteration_history << ',';
+      if (orbital_diagnostics)
+        iteration_history << orbital_diagnostics->mean_loss;
       iteration_history << '\n';
       iteration_history.flush();
       history_failed = !iteration_history;
@@ -2007,6 +2133,61 @@ void WFTrainBatched::initializeDeterminantOverlap()
   }
 }
 
+/** Freeze a conventional determinant source independently of teacher Jastrow factors. */
+void WFTrainBatched::initializeOrbitalPretraining()
+{
+  if (training_input_.getObjective() != WFTrainDriverInput::Objective::ORBITAL_MSE)
+    return;
+  if (&student_prototype_ == &population_.get_golden_twf())
+    throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a distinct frozen teacher");
+  if (!dynamic_cast<PsiFormerWF*>(selected_provider_))
+    throw UniformCommunicateError("WFTrainBatched: orbital_mse requires a PsiFormer provider");
+
+  // Query channel count through the existing determinant-channel seam, without
+  // opening native tensor metadata or depending on an imported parameter file.
+  ParticleSet& electrons = population_.get_golden_electrons();
+  auto probe = student_prototype_.makeClone(electrons);
+  RefVectorWithLeader<TrialWaveFunction> wavefunctions(*probe);
+  wavefunctions.push_back(*probe);
+  RefVectorWithLeader<ParticleSet> particles(electrons);
+  particles.push_back(electrons);
+  const std::size_t count = TrialWaveFunction::makeStructuredDeterminantChannelBatch(
+      wavefunctions, particles, selected_provider_id_)->channelCount();
+
+  const SlaterDet* single = nullptr;
+  const MultiSlaterDetTableMethod* multi = nullptr;
+  std::size_t determinant_components = 0;
+  for (const auto& component : population_.get_golden_twf().getOrbitals())
+  {
+    if (auto* determinant = dynamic_cast<const SlaterDet*>(component.get()))
+    {
+      single = determinant;
+      ++determinant_components;
+    }
+    else if (auto* determinant = dynamic_cast<const MultiSlaterDetTableMethod*>(component.get()))
+    {
+      multi = determinant;
+      ++determinant_components;
+    }
+  }
+  if (determinant_components != 1)
+    throw UniformCommunicateError(
+        "WFTrainBatched: orbital_mse teacher must contain exactly one conventional determinant component");
+  const bool top = training_input_.getOrbitalTarget() ==
+      WFTrainDriverInput::OrbitalTarget::TOP_COEFFICIENT_MULTIDETERMINANT;
+  if (top && multi)
+    orbital_target_ = std::make_unique<psiformer::OrbitalTargetEvaluator>(
+        psiformer::OrbitalTargetEvaluator::fromMultideterminant(
+            *multi, training_input_.getTargetProvenance(), count));
+  else if (!top && single)
+    orbital_target_ = std::make_unique<psiformer::OrbitalTargetEvaluator>(
+        psiformer::OrbitalTargetEvaluator::fromSingleReference(
+            *single, training_input_.getTargetProvenance(), count));
+  else
+    throw UniformCommunicateError(
+        "WFTrainBatched: single_reference requires SlaterDet; top_coefficients requires MultiSlaterDetTableMethod");
+}
+
 void WFTrainBatched::validateHamiltonianForTraining()
 {
   QMCHamiltonian& hamiltonian = population_.get_golden_hamiltonian();
@@ -2059,11 +2240,10 @@ void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
   // next determinant-channel owner reads the shared student model version while
   // copying the current teacher configurations, so no ParticleSet G/L state is
   // overwritten by evaluating a student TrialWaveFunction here.
-  if (training_input_.getObjective() ==
-      WFTrainDriverInput::Objective::DETERMINANT_OVERLAP)
+  if (training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY)
   {
     if (myComm->rank() == 0)
-      app_log() << "WFTrain published determinant-overlap student version "
+      app_log() << "WFTrain published frozen-target student version "
                 << parameter_version << " across " << crowds_.size()
                 << " crowd(s)" << std::endl;
     return;

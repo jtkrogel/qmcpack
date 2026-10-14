@@ -32,6 +32,31 @@ WFTrainDriverInput parseTrainingInput(const std::string& xml)
 
 } // namespace
 
+TEST_CASE("WFTrainDriverInput accepts conventional orbital pretraining", "[drivers][wf_train]")
+{
+  const std::string controls = R"(
+    <parameter name="teacher">slater_teacher</parameter>
+    <parameter name="target_provenance">inline-gaussian-v1</parameter>)";
+  const auto parse = [&](const std::string& extra, const std::string& optimizer = "adam") {
+    return parseTrainingInput("<qmc method=\"wf_train\"><training objective=\"orbital_mse\" optimizer=\"" +
+        optimizer + "\">" + controls + extra + "</training></qmc>");
+  };
+  CHECK(parse("").getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE);
+  CHECK(parse("").getOrbitalTarget() == WFTrainDriverInput::OrbitalTarget::SINGLE_REFERENCE);
+  CHECK(parse("<parameter name=\"orbital_target\">top_coefficients</parameter>").getOrbitalTarget() ==
+        WFTrainDriverInput::OrbitalTarget::TOP_COEFFICIENT_MULTIDETERMINANT);
+  for (const std::string optimizer : {"sgd", "momentum_sgd", "rmsprop", "adam", "amsgrad"})
+    CHECK_NOTHROW(parse("", optimizer));
+  CHECK_THROWS(parse("", "sr"));
+  CHECK_THROWS(parse("<parameter name=\"line_search\">reference</parameter>"));
+  CHECK_THROWS(parse("<parameter name=\"maximum_metric_norm\">1</parameter>"));
+  CHECK_THROWS(parse("<parameter name=\"overlap_target\">general</parameter>"));
+  CHECK_THROWS(parse("<parameter name=\"orbital_target\">unsupported</parameter>"));
+  CHECK_THROWS(parseTrainingInput(R"(<qmc><training objective="orbital_mse"/></qmc>)"));
+  CHECK_THROWS(parseTrainingInput(R"(<qmc><training objective="energy">
+    <parameter name="orbital_target">single_reference</parameter></training></qmc>)"));
+}
+
 TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_train]")
 {
   SECTION("defaults")

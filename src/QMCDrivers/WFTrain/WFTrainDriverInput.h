@@ -31,7 +31,15 @@ public:
   enum class Objective
   {
     ENERGY,
-    DETERMINANT_OVERLAP
+    DETERMINANT_OVERLAP,
+    ORBITAL_MSE
+  };
+
+  /// Choose repeated occupied orbitals or the largest-coefficient CI terms.
+  enum class OrbitalTarget
+  {
+    SINGLE_REFERENCE,
+    TOP_COEFFICIENT_MULTIDETERMINANT
   };
 
   enum class OverlapTarget
@@ -79,6 +87,7 @@ public:
   std::size_t getWarmupSteps() const noexcept { return warmup_steps_; }
 
   Objective getObjective() const noexcept { return objective_; }
+  OrbitalTarget getOrbitalTarget() const noexcept { return orbital_target_; }
   LineSearch getLineSearch() const noexcept { return line_search_; }
   double getUpdateScale() const noexcept { return update_scale_; }
   double getWeightDecay() const noexcept { return weight_decay_; }
@@ -173,6 +182,7 @@ private:
   std::size_t line_search_warmup_steps_{10};
   std::size_t line_search_sampling_steps_{10};
   Objective objective_{Objective::ENERGY};
+  OrbitalTarget orbital_target_{OrbitalTarget::SINGLE_REFERENCE};
   Optimizer optimizer_{Optimizer::ADAM};
   std::size_t parameter_chunk_size_{65536};
   double learning_rate_{1.0e-3};
