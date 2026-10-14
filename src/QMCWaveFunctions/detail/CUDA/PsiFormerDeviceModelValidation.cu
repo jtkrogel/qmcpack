@@ -185,6 +185,95 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
+    // Successor images share fixed geometry/plan metadata, not old parameters.
+    // Rebinding keeps scratch stable and rejects stale results or foreign families.
+    {
+      auto original = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 30);
+      std::weak_ptr<const PreparedDeviceModel> old_image = original;
+      PreparedDeviceInference rebound(original, 1, queue, handle, SpatialJetMode::VALUE_ONLY, true);
+      const auto prepared_bytes = rebound.deviceWorkspaceBytes();
+      const auto* stable_plan = &rebound.modelImage()->plan();
+      std::vector<double> one_position(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+      rebound.evaluate(one_position);
+      PreparedDeviceScoreReverse rebound_score(original, 1, queue, handle);
+      PreparedDeviceScoreJvp rebound_jvp(original, 1, queue, handle);
+      PreparedDeviceKineticReverse rebound_kinetic(original, 1, queue, handle);
+      PreparedDeviceNonlocalResponse rebound_nonlocal(original, 1, 1, queue, handle);
+      const auto product_bytes = rebound_score.deviceWorkspaceBytes() + rebound_jvp.deviceWorkspaceBytes() +
+          rebound_kinetic.deviceWorkspaceBytes() + rebound_nonlocal.deviceWorkspaceBytes();
+      rebound_score.reverse(rebound, {1.0});
+      std::vector<double> rebound_direction(plan.parameterCount(), 0.0);
+      rebound_direction[0] = 1.0;
+      rebound_jvp.evaluate(rebound, rebound_direction);
+      auto changed = model.p.flat_values();
+      changed[plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).begin] += 0.003;
+      changed[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] += 0.01;
+      auto successor = original->makeUpdatedImage(changed, 31);
+      if (successor->metadataFamily().get() != original->metadataFamily().get() ||
+          successor->nuclei() != original->nuclei())
+        throw std::runtime_error("Successor duplicated fixed metadata/geometry");
+      rebound.rebindModel(successor);
+      rebound_score.rebindModel(successor);
+      rebound_jvp.rebindModel(successor);
+      rebound_kinetic.rebindModel(successor);
+      rebound_nonlocal.rebindModel(successor);
+      original.reset();
+      if (!old_image.expired() || &rebound.modelImage()->plan() != stable_plan ||
+          rebound.deviceWorkspaceBytes() != prepared_bytes)
+        throw std::runtime_error("Graph rebind retained retired parameters or changed prepared storage");
+      std::vector<double> phase(1), logabs(1), no_laplacians;
+      bool stale_image_result_rejected = false;
+      try { rebound.downloadResults(phase, logabs, no_laplacians); }
+      catch (const std::logic_error&) { stale_image_result_rejected = true; }
+      if (!stale_image_result_rejected)
+        throw std::runtime_error("Graph rebind exposed old-image results");
+      std::vector<double> rebound_response(plan.parameterCount()), rebound_products(1);
+      bool stale_score_after_rebind = false, stale_jvp_after_rebind = false;
+      try { rebound_score.downloadResponse(rebound_response); }
+      catch (const std::logic_error&) { stale_score_after_rebind = true; }
+      try { rebound_jvp.downloadProducts(rebound_products); }
+      catch (const std::logic_error&) { stale_jvp_after_rebind = true; }
+      if (!stale_score_after_rebind || !stale_jvp_after_rebind)
+        throw std::runtime_error("Product rebind exposed old-image results");
+      rebound.evaluate(one_position);
+      rebound.downloadResults(phase, logabs, no_laplacians);
+      pf::PsiFormer changed_model = model;
+      changed_model.p.set_flat_values(changed);
+      pf::DirectValueExecutor changed_value(changed_model, plan);
+      auto changed_workspace = changed_value.makeWorkspace();
+      changed_workspace->setPositions(pf::GeometryPositionView::interleaved(one_position.data(), model.ne));
+      const auto expected_changed = changed_value.evaluate(*changed_workspace);
+      near(phase[0], expected_changed.sign, "rebound image sign");
+      near(logabs[0], expected_changed.logabs, "rebound image value");
+      rebound_score.reverse(rebound, {1.0});
+      rebound_score.downloadResponse(rebound_response);
+      rebound_jvp.evaluate(rebound, rebound_direction);
+      rebound_jvp.downloadProducts(rebound_products);
+      pf::DirectScoreExecutor changed_score(changed_model, plan);
+      auto changed_score_workspace = changed_score.makeWorkspace();
+      changed_score_workspace->setPositions(pf::GeometryPositionView::interleaved(one_position.data(), model.ne));
+      const auto expected_score = changed_score.evaluate(*changed_score_workspace);
+      near(rebound_products[0], expected_score.parameter_score[0], "rebound JVP CPU parity");
+      for (std::size_t parameter = 0; parameter < rebound_response.size(); ++parameter)
+        near(rebound_response[parameter], expected_score.parameter_score[parameter], "rebound score CPU parity");
+      if (product_bytes != rebound_score.deviceWorkspaceBytes() + rebound_jvp.deviceWorkspaceBytes() +
+          rebound_kinetic.deviceWorkspaceBytes() + rebound_nonlocal.deviceWorkspaceBytes())
+        throw std::runtime_error("Product image rebind reallocated prepared scratch");
+      auto rollback = successor->makeUpdatedImage(model.p.flat_values(), 32);
+      rebound.rebindModel(rollback);
+      rebound.evaluate(one_position);
+      rebound.downloadResults(phase, logabs, no_laplacians);
+      near(logabs[0], references[0].logabs, "rebound rollback value");
+      auto foreign_family = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 33);
+      bool foreign_rebind_rejected = false, older_rebind_rejected = false;
+      try { rebound.rebindModel(foreign_family); }
+      catch (const std::invalid_argument&) { foreign_rebind_rejected = true; }
+      try { rebound.rebindModel(successor); }
+      catch (const std::invalid_argument&) { older_rebind_rejected = true; }
+      if (!foreign_rebind_rejected || !older_rebind_rejected || rebound.modelImage().get() != rollback.get())
+        throw std::runtime_error("Graph rebind accepted an incompatible/non-increasing image");
+      std::cout << "PASS immutable image successors: shared geometry, retired-image release, stable scratch, CPU parity, rollback\n";
+    }
     // Distinct numerical workspaces share one immutable uploaded parameter image.
     auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 17);
     PreparedDeviceInference inference(image, model.cfg.nconfig, queue, handle);

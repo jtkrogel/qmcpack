@@ -229,6 +229,14 @@ public:
     response_.download(destination.data(), destination.size());
   }
 
+  /// Rebind a fixed-layout successor without reallocating lifted scratch.
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    model_->validateSuccessor(successor);
+    model_ = std::move(successor);
+    ready_ = false;
+  }
+
   /// Stream a completed canonical interval without replaying the lifted reverse.
   void downloadResponseChunk(std::size_t begin, double* destination, std::size_t count) const
   {

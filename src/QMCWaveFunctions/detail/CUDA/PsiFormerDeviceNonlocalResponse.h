@@ -151,6 +151,18 @@ public:
     currentResponse().download(destination.data(), destination.size());
   }
 
+  /// Rebind only outside a captured-grid transaction; old results become unavailable.
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    if (open_)
+      throw std::logic_error("Cannot rebind an open nonlocal response transaction");
+    model_->validateSuccessor(successor);
+    score_.rebindModel(successor);
+    model_ = std::move(successor);
+    base_ = nullptr;
+    ready_ = false;
+  }
+
   /// Stream a canonical interval only after a successfully completed transaction.
   void downloadResponseChunk(std::size_t begin, double* destination, std::size_t count) const
   {

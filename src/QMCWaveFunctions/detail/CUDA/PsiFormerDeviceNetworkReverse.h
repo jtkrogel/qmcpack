@@ -143,6 +143,14 @@ public:
   /// Return canonical destination extent; non-trunk parameter entries stay zero.
   std::size_t parameterCount() const noexcept { return response_.capacity(); }
 
+  /// Rebind a compatible successor without reallocating adjoints or retaining old weights.
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    model_->validateSuccessor(successor);
+    model_ = std::move(successor);
+    result_ready_ = false;
+  }
+
   /// Account the prepared numerical storage, excluding the shared model and BLAS.
   std::size_t deviceWorkspaceBytes() const
   {

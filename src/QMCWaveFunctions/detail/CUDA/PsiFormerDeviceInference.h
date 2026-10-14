@@ -34,19 +34,16 @@
 namespace qmcplusplus::psiformer::device
 {
 
-/** Own one immutable canonical model image shared by prepared crowd workspaces.
- * Publication owns the image lifetime; each numerical workspace retains its
- * image until all submitted work completes. The owning device stays current.
+/** Own immutable layout/fixed geometry independently of retiring parameter images.
+ * Successor images share this family, keeping prepared plan references valid
+ * without retaining every previous O(P) parameter allocation.
  */
-class PreparedDeviceModel
+class PreparedDeviceModelMetadata
 {
 public:
-  /// Upload a checked open-real parameter image at one explicit model version.
-  PreparedDeviceModel(const PsiFormerExecutionPlan& plan,
-                      const std::vector<double>& parameters,
-                      const std::vector<double>& nuclei,
-                      std::size_t version = 0)
-      : plan_(plan), version_(version)
+  /// Validate and upload fixed geometry once for one layout/device family.
+  PreparedDeviceModelMetadata(const PsiFormerExecutionPlan& plan, const std::vector<double>& nuclei)
+      : plan_(plan)
   {
     const auto& environment = plan_.environment();
     if (environment.boundary != BoundaryCondition::OPEN ||
@@ -54,33 +51,21 @@ public:
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
       throw std::invalid_argument("Device model supports fixed-ion open-real FP64 models only");
-    if (parameters.size() != plan_.parameterCount() || nuclei.size() != 3 * plan_.modelShape().nuclei)
-      throw std::invalid_argument("Device model parameter/nuclear extent mismatch");
-    for (const auto* values : {&parameters, &nuclei})
-      if (std::any_of(values->begin(), values->end(), [](double value) {
-            return !device_math::isFiniteBinary64(value);
-          }))
-        throw std::invalid_argument("Device model image contains nonfinite values");
+    if (nuclei.size() != spatial_detail::checkedProduct(3, plan_.modelShape().nuclei, "Device nuclear extent overflow"))
+      throw std::invalid_argument("Device nuclear extent mismatch");
+    if (std::any_of(nuclei.begin(), nuclei.end(), [](double value) { return !device_math::isFiniteBinary64(value); }))
+      throw std::invalid_argument("Device fixed geometry contains nonfinite values");
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipGetDevice(&device_), "model device identity");
 #else
     checkRuntime(cudaGetDevice(&device_), "model device identity");
 #endif
-    parameters_.reserve(parameters.size());
-    parameters_.upload(parameters.data(), parameters.size());
     nuclei_.reserve(nuclei.size());
     nuclei_.upload(nuclei.data(), nuclei.size());
-    if (const auto* same = plan_.optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
-      same_alpha_ = parameters[same->begin];
-    opposite_alpha_ = parameters[plan_.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin];
   }
 
-  // Execution workspaces retain references to immutable plan metadata, so the
-  // model image must stay at one address for its complete shared lifetime.
-  PreparedDeviceModel(const PreparedDeviceModel&) = delete;
-  PreparedDeviceModel& operator=(const PreparedDeviceModel&) = delete;
-  PreparedDeviceModel(PreparedDeviceModel&&) = delete;
-  PreparedDeviceModel& operator=(PreparedDeviceModel&&) = delete;
+  PreparedDeviceModelMetadata(const PreparedDeviceModelMetadata&) = delete;
+  PreparedDeviceModelMetadata& operator=(const PreparedDeviceModelMetadata&) = delete;
 
   /// Reject accidental cross-device reuse without changing the caller's device.
   void validateCurrentDevice() const
@@ -98,6 +83,61 @@ public:
   /// Expose immutable model metadata and canonical uploaded intervals.
   const PsiFormerExecutionPlan& plan() const noexcept { return plan_; }
 
+  /// Return fixed-ion storage shared by all versions in this immutable family.
+  const double* nuclei() const noexcept { return nuclei_.data(); }
+
+  /// Account shared geometry once, separately from parameter-version allocations.
+  std::size_t deviceStorageBytes() const { return checkedDeviceBytes<double>(nuclei_.capacity()); }
+
+private:
+  PsiFormerExecutionPlan plan_;
+  int device_ = -1;
+  DeviceBuffer<double> nuclei_;
+};
+
+/** Own one immutable canonical parameter image within a shared metadata family.
+ * Workspaces retain an image through submitted work; successors share layout and
+ * fixed-ion storage but own independent parameter buffers and scalar caches.
+ */
+class PreparedDeviceModel
+{
+public:
+  /// Upload an initial checked open-real model and its fixed geometry metadata.
+  PreparedDeviceModel(const PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
+                      const std::vector<double>& nuclei, std::size_t version = 0)
+      : PreparedDeviceModel(std::make_shared<PreparedDeviceModelMetadata>(plan, nuclei), parameters, version)
+  {}
+
+  PreparedDeviceModel(const PreparedDeviceModel&) = delete;
+  PreparedDeviceModel& operator=(const PreparedDeviceModel&) = delete;
+  PreparedDeviceModel(PreparedDeviceModel&&) = delete;
+  PreparedDeviceModel& operator=(PreparedDeviceModel&&) = delete;
+
+  /// Validate current device ownership without switching the caller's device.
+  void validateCurrentDevice() const { metadata_->validateCurrentDevice(); }
+
+  /// Keep typed parameter/layout metadata independent of one parameter allocation.
+  const PsiFormerExecutionPlan& plan() const noexcept { return metadata_->plan(); }
+
+  /// Identify immutable layout/geometry compatibility without comparing pointers to weights.
+  const std::shared_ptr<const PreparedDeviceModelMetadata>& metadataFamily() const noexcept { return metadata_; }
+
+  /// Prepare a newer image without changing this model or uploading geometry again.
+  std::shared_ptr<const PreparedDeviceModel> makeUpdatedImage(const std::vector<double>& parameters,
+                                                            std::size_t version) const
+  {
+    if (version <= version_)
+      throw std::invalid_argument("Successor device model version must increase");
+    return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(metadata_, parameters, version));
+  }
+
+  /// Check a fixed-layout successor before any prepared graph changes ownership.
+  void validateSuccessor(const std::shared_ptr<const PreparedDeviceModel>& successor) const
+  {
+    if (!successor || successor->metadata_.get() != metadata_.get() || successor->version() <= version_)
+      throw std::invalid_argument("Device successor has incompatible metadata or a non-increasing version");
+  }
+
   /// Identify the parameter image without inferring publication from a pointer.
   std::size_t version() const noexcept { return version_; }
 
@@ -105,7 +145,7 @@ public:
   const double* parameters() const noexcept { return parameters_.data(); }
 
   /// Return fixed-ion geometry stored once per shared image.
-  const double* nuclei() const noexcept { return nuclei_.data(); }
+  const double* nuclei() const noexcept { return metadata_->nuclei(); }
 
   /// Supply the host scalar needed by the cusp launch, not a per-evaluation copy.
   double sameAlpha() const noexcept { return same_alpha_; }
@@ -117,15 +157,31 @@ public:
   std::size_t deviceStorageBytes() const
   {
     return spatial_detail::checkedAdd(checkedDeviceBytes<double>(parameters_.capacity()),
-        checkedDeviceBytes<double>(nuclei_.capacity()), "Device model storage overflow");
+        metadata_->deviceStorageBytes(), "Device model storage overflow");
   }
 
 private:
-  PsiFormerExecutionPlan plan_;
+  /// Upload only canonical parameters after the immutable family is established.
+  PreparedDeviceModel(std::shared_ptr<const PreparedDeviceModelMetadata> metadata,
+                      const std::vector<double>& parameters, std::size_t version)
+      : metadata_(std::move(metadata)), version_(version)
+  {
+    validateCurrentDevice();
+    if (parameters.size() != plan().parameterCount())
+      throw std::invalid_argument("Device model parameter extent mismatch");
+    if (std::any_of(parameters.begin(), parameters.end(), [](double value) { return !device_math::isFiniteBinary64(value); }))
+      throw std::invalid_argument("Device parameter image contains nonfinite values");
+    parameters_.reserve(parameters.size());
+    parameters_.upload(parameters.data(), parameters.size());
+    if (const auto* same = plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA))
+      same_alpha_ = parameters[same->begin];
+    opposite_alpha_ = parameters[plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin];
+  }
+
+  std::shared_ptr<const PreparedDeviceModelMetadata> metadata_;
   std::size_t version_;
-  int device_ = -1;
   double same_alpha_ = 1, opposite_alpha_ = 1;
-  DeviceBuffer<double> parameters_, nuclei_;
+  DeviceBuffer<double> parameters_;
 };
 
 /** Preallocate one model image and a fixed-capacity configuration-major VGL graph.
@@ -334,6 +390,7 @@ public:
   {
     // A failed replacement must never leave the preceding tape visible as current.
     value_tape_valid_ = false;
+    result_valid_ = false;
     if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Device inference evaluation generation exhausted");
     ++evaluation_generation_;
@@ -432,6 +489,7 @@ public:
           phase_.data(), output_.data(), open_status_.data()), "model final values");
       checkOpen(batch_);
       value_tape_valid_ = !value_tape_.empty();
+      result_valid_ = true;
       return;
     }
     device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_, ne_};
@@ -446,11 +504,14 @@ public:
         lap_ratio_.data(), open_status_.data()), "model final VGL");
     checkOpen(batch_);
     value_tape_valid_ = !value_tape_.empty();
+    result_valid_ = true;
   }
 
   /// Download signed-log amplitude, complete log-gradient/log-Laplacian jets and lap ratios.
   void downloadResults(std::vector<double>& phases, std::vector<double>& jets, std::vector<double>& ratios) const
   {
+    if (!result_valid_)
+      throw std::logic_error("Device inference has no completed result for the current image");
     if (phases.size() != batch_ || jets.size() != spatialJetSpanElements(final_.output) ||
         ratios.size() != product(batch_, final_.output.laplacian_lanes))
       throw std::invalid_argument("Device inference result buffers have wrong extent");
@@ -464,6 +525,19 @@ public:
 
   /// Expose identity/version ownership for publication binding and reuse tests.
   const std::shared_ptr<const PreparedDeviceModel>& modelImage() const noexcept { return model_; }
+
+  /** Rebind a newer immutable image without reallocating fixed-shape scratch.
+   * Caller must hold the owning publication/resource lease and have completed
+   * earlier work. Shared metadata identity preserves plan and geometry lifetime;
+   * this numerical primitive does not itself publish a control-plane version.
+   */
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    model_->validateSuccessor(successor);
+    model_ = std::move(successor);
+    value_tape_valid_ = false;
+    result_valid_ = false;
+  }
 
   /// Return prepared capacity independently of the most recent logical batch.
   std::size_t batchCapacity() const noexcept { return batch_capacity_; }
@@ -722,6 +796,7 @@ private:
   std::vector<std::unique_ptr<RetainedBlockTape>> value_tape_;
   DeviceBuffer<double> retained_backflow_, retained_envelope_;
   bool value_tape_valid_ = false;
+  bool result_valid_ = false;
   std::size_t evaluation_generation_ = 0;
 };
 

@@ -153,6 +153,15 @@ public:
     products_.download(destination.data(), destination.size());
   }
 
+  /// Rebind immutable weights while preserving prepared tangent/direction storage.
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    model_->validateSuccessor(successor);
+    model_ = std::move(successor);
+    ready_ = false;
+    live_count_ = 0;
+  }
+
   /// Account prepared device scratch separately from the immutable model image.
   std::size_t deviceWorkspaceBytes() const
   {

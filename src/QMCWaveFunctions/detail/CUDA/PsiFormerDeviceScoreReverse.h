@@ -168,6 +168,15 @@ public:
   /// Tag response chunks with the immutable model version used for this evaluator.
   std::size_t parameterVersion() const noexcept { return model_->version(); }
 
+  /// Rebind head/trunk to one compatible successor and invalidate prior responses.
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
+  {
+    model_->validateSuccessor(successor);
+    network_.rebindModel(successor);
+    model_ = std::move(successor);
+    ready_ = false;
+  }
+
   /// Account all explicitly owned numerical storage, not the shared model image.
   std::size_t deviceWorkspaceBytes() const
   {
