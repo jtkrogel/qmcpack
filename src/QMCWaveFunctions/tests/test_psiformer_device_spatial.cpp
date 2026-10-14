@@ -63,6 +63,22 @@ TEST_CASE("PsiFormer value-only spatial storage preserves values and guard lanes
   CHECK(cusp_output.front() == 913.0);
   CHECK(cusp_output.back() == 913.0);
 
+  // Values have finite radial limits where full spatial derivatives do not.
+  auto nuclear_coalescence = positions;
+  std::fill_n(nuclear_coalescence.begin(), 3, 0.0);
+  CHECK(open_spatial::buildOpenFeatureJetsForConfiguration(features, nuclear_coalescence.data(), nuclei.data(),
+      0, 0, output.data() + 1) == psiformer::OpenSpatialStatus::REGULAR);
+  for (std::size_t element = 0; element < 4; ++element) CHECK(output[element + 1] == 0);
+  CHECK(open_spatial::buildOpenFeatureJetsForConfiguration(full, nuclear_coalescence.data(), nuclei.data(),
+      0, 0, full_output.data()) == psiformer::OpenSpatialStatus::COALESCENCE);
+  auto opposite_spin_coalescence = positions;
+  std::copy_n(opposite_spin_coalescence.begin(), 3, opposite_spin_coalescence.begin() + 3);
+  CHECK(open_spatial::buildOpenCuspJetsForConfiguration(cusp, opposite_spin_coalescence.data(), 0, 0, 1., 1.,
+      cusp_output.data() + 1) == psiformer::OpenSpatialStatus::REGULAR);
+  CHECK(cusp_output[1] == -0.5);
+  CHECK(output.front() == 913.0);
+  CHECK(output.back() == 913.0);
+
   determinant::CombinationMetadata combined;
   combined.status = determinant::CombinationStatus::REGULAR;
   combined.phase = -1;

@@ -30,6 +30,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -56,6 +57,52 @@ enum class DirectBatchValueInput
 {
   DENSE_CONFIGURATIONS,
   SPARSE_REPLACEMENTS
+};
+
+/** Own backend-specific prepared tile resources without exposing vendor types. */
+class DirectBatchTileBackendWorkspace
+{
+public:
+  virtual ~DirectBatchTileBackendWorkspace() = default;
+};
+
+/** Describe completed strided tile outputs consumed by atomic host publication.
+ * Gradients contain all electron lanes; ACTIVE requests select three lanes.
+ * The backend retains storage until its next evaluation.
+ */
+struct DirectBatchTileResultView
+{
+  std::size_t size = 0, parameter_version = 0;
+  const double* sign = nullptr;
+  const double* logabs = nullptr;
+  std::size_t value_stride = 1;
+  const double* gradient = nullptr;
+  std::size_t gradient_configuration_stride = 0, gradient_lane_stride = 1;
+  const double* lap_log = nullptr;
+  std::size_t lap_log_configuration_stride = 0, lap_log_lane_stride = 1;
+  const double* lap_ratio = nullptr;
+  std::size_t lap_ratio_configuration_stride = 0;
+};
+
+/** Optional numerical tile delegate; CPU batching remains the default.
+ * Coordinate/replacement order and result ownership stay with the existing
+ * executor, rather than being reimplemented by each numerical backend.
+ */
+class DirectBatchTileBackend
+{
+public:
+  virtual ~DirectBatchTileBackend() = default;
+
+  /// Prepare exclusive resources outside evaluation, with a checked capacity.
+  virtual std::unique_ptr<DirectBatchTileBackendWorkspace> prepare(std::size_t capacity) const = 0;
+
+  /// Evaluate one coordinate tile at the caller's locked model version.
+  virtual DirectBatchTileResultView evaluate(DirectBatchTileBackendWorkspace& workspace,
+      DirectBatchMode mode, const double* coordinates, std::size_t size,
+      std::size_t parameter_version) const = 0;
+
+  /// Report genuine numerical submissions; ordinary CPU execution reports zero.
+  virtual std::size_t numericalTileCount() const noexcept { return 0; }
 };
 
 /// Deterministic structural counters for the most recent completed evaluation.
@@ -95,10 +142,12 @@ public:
   static constexpr std::size_t default_tile_capacity = 4;
 
   DirectBatchWorkspace(const DirectValueExecutor& value_executor,
-                       const DirectSpatialExecutor& spatial_executor)
+                       const DirectSpatialExecutor& spatial_executor,
+                       std::shared_ptr<const DirectBatchTileBackend> tile_backend = {})
       : value_executor_(&value_executor),
         spatial_executor_(&spatial_executor),
-        electron_count_(value_executor.layout()->electronCount())
+        electron_count_(value_executor.layout()->electronCount()),
+        tile_backend_(std::move(tile_backend))
   {
     if (value_executor.layout().get() != spatial_executor.layout().get() ||
         spatial_executor.valueExecutorIdentity() != &value_executor)
@@ -183,6 +232,8 @@ public:
    */
   void prepare(const DirectBatchCapacityPlan& plan)
   {
+    if (tile_backend_)
+      throw std::logic_error("Device tile workspace requires a device-aware capacity plan; CPU-only hard plans are unsupported");
     if (active_size_ != 0)
       throw std::logic_error(
           "PsiFormer batch capacity plans may be rebound only while idle");
@@ -1136,6 +1187,18 @@ private:
 
   void prepareScratch(DirectBatchMode mode, std::size_t capacity)
   {
+    if (tile_backend_)
+    {
+      if (capacity > backend_capacity_)
+      {
+        auto prepared = tile_backend_->prepare(capacity);
+        if (!prepared)
+          throw std::logic_error("Numerical tile backend returned no prepared resources");
+        backend_workspace_ = std::move(prepared);
+        backend_capacity_ = capacity;
+      }
+      return;
+    }
     switch (mode)
     {
     case DirectBatchMode::VALUE_ONLY:
@@ -1783,6 +1846,9 @@ private:
   // Logically fixed by the two executors.  This is assignable only so a completely
   // prepared staging workspace can be published with one noexcept move assignment.
   std::size_t electron_count_;
+  std::shared_ptr<const DirectBatchTileBackend> tile_backend_;
+  std::unique_ptr<DirectBatchTileBackendWorkspace> backend_workspace_;
+  std::size_t backend_capacity_ = 0;
   DirectBatchMode active_mode_ = DirectBatchMode::VALUE_ONLY;
   DirectBatchValueInput active_value_input_ =
       DirectBatchValueInput::DENSE_CONFIGURATIONS;
@@ -1848,8 +1914,10 @@ class DirectBatchExecutor
 {
 public:
   DirectBatchExecutor(const DirectValueExecutor& value_executor,
-                      const DirectSpatialExecutor& spatial_executor)
-      : value_executor_(value_executor), spatial_executor_(spatial_executor)
+                      const DirectSpatialExecutor& spatial_executor,
+                      std::shared_ptr<const DirectBatchTileBackend> tile_backend = {})
+      : value_executor_(value_executor), spatial_executor_(spatial_executor),
+        tile_backend_(std::move(tile_backend))
   {
     if (value_executor.layout().get() != spatial_executor.layout().get() ||
         spatial_executor.valueExecutorIdentity() != &value_executor)
@@ -1858,7 +1926,7 @@ public:
   }
 
   std::unique_ptr<DirectBatchWorkspace> makeWorkspace() const
-  { return std::make_unique<DirectBatchWorkspace>(value_executor_, spatial_executor_); }
+  { return std::make_unique<DirectBatchWorkspace>(value_executor_, spatial_executor_, tile_backend_); }
 
   /** Evaluate a true tiled value batch without invoking the scalar value executor. */
   DirectBatchValueResultView evaluateValues(DirectBatchWorkspace& workspace) const
@@ -1903,8 +1971,12 @@ public:
       else
         tile_positions = workspace.electron_positions_.data() +
             tile_begin * workspace.electron_count_ * 3;
-      evaluateValueTile(workspace, tile_begin, tile_size, tile_positions, parameters,
-                        parameter_version, statistics);
+      if (tile_backend_)
+        evaluateBackendTile(workspace, DirectBatchMode::VALUE_ONLY, tile_begin, tile_size,
+                            tile_positions, nullptr, parameter_version);
+      else
+        evaluateValueTile(workspace, tile_begin, tile_size, tile_positions, parameters,
+                          parameter_version, statistics);
     }
 
     if (value_executor_.parameters_.version() != parameter_version)
@@ -1962,7 +2034,8 @@ private:
   void requireWorkspace(const DirectBatchWorkspace& workspace) const
   {
     if (workspace.value_executor_ != &value_executor_ ||
-        workspace.spatial_executor_ != &spatial_executor_)
+        workspace.spatial_executor_ != &spatial_executor_ ||
+        workspace.tile_backend_.get() != tile_backend_.get())
       throw std::invalid_argument("PsiFormer batch workspace belongs to another executor");
   }
 
@@ -2572,14 +2645,20 @@ private:
       ++statistics.tiles_executed;
       statistics.max_tile_occupancy =
           std::max(statistics.max_tile_occupancy, tile_size);
-      buildSpatialNetworkTile(workspace, workspaces, tile_begin, tile_size,
-                              active_electrons, parameters, statistics);
-      buildSpatialOrbitalsTile(workspace, workspaces, tile_begin, tile_size,
-                               parameters, statistics);
-      for (std::size_t local = 0; local < tile_size; ++local)
-        finishSpatialConfiguration(workspace, *workspaces[local],
-                                   tile_begin + local, parameters,
-                                   parameter_version);
+      if (tile_backend_)
+        evaluateBackendTile(workspace, batch_mode, tile_begin, tile_size,
+            workspace.electron_positions_.data() + tile_begin * 3 * workspace.electron_count_,
+            active_electrons, parameter_version);
+      else
+      {
+        buildSpatialNetworkTile(workspace, workspaces, tile_begin, tile_size,
+                                active_electrons, parameters, statistics);
+        buildSpatialOrbitalsTile(workspace, workspaces, tile_begin, tile_size,
+                                 parameters, statistics);
+        for (std::size_t local = 0; local < tile_size; ++local)
+          finishSpatialConfiguration(workspace, *workspaces[local],
+                                     tile_begin + local, parameters, parameter_version);
+      }
     }
 
     if (spatial_executor_.parameters_.version() != parameter_version)
@@ -2814,6 +2893,84 @@ private:
     }
   }
 
+  /** Stage one numerical tile without changing accepted/published result rows.
+   * Sparse materialization and final commit remain in the ordinary executor.
+   * Any failed later tile therefore leaves the public output transaction intact.
+   */
+  void evaluateBackendTile(DirectBatchWorkspace& workspace, DirectBatchMode mode,
+      std::size_t begin, std::size_t size, const double* positions,
+      const std::size_t* active_electrons, std::size_t version) const
+  {
+    if (!workspace.backend_workspace_ || size > workspace.backend_capacity_)
+      throw std::logic_error("Numerical tile resources were not prepared for this request");
+    const auto result = tile_backend_->evaluate(*workspace.backend_workspace_, mode, positions, size, version);
+    if (result.size != size || result.parameter_version != version ||
+        !result.sign || !result.logabs || result.value_stride == 0)
+      throw std::logic_error("Numerical tile returned inconsistent values or model version");
+    const bool spatial = mode != DirectBatchMode::VALUE_ONLY;
+    const bool full = mode == DirectBatchMode::FULL_VGL;
+    const auto electrons = workspace.electron_count_;
+    const auto full_lanes = qmcplusplus::psiformer::batch::checkedProduct(3, electrons, "Numerical gradient extent overflow");
+    if (spatial && (!result.gradient || result.gradient_lane_stride == 0 ||
+        result.gradient_configuration_stride < qmcplusplus::psiformer::batch::checkedProduct(full_lanes, result.gradient_lane_stride,
+                                                                     "Numerical gradient stride overflow")))
+      throw std::logic_error("Numerical tile returned an invalid gradient layout");
+    if (full && (!result.lap_log || !result.lap_ratio || result.lap_log_lane_stride == 0 ||
+        result.lap_log_configuration_stride < qmcplusplus::psiformer::batch::checkedProduct(electrons, result.lap_log_lane_stride,
+                                                                    "Numerical Laplacian stride overflow") ||
+        result.lap_ratio_configuration_stride < electrons))
+      throw std::logic_error("Numerical tile returned an invalid Laplacian layout");
+
+    for (std::size_t local = 0; local < size; ++local)
+    {
+      const auto configuration = begin + local;
+      const double sign = result.sign[local];
+      const double logabs = result.logabs[local * result.value_stride];
+      const bool node = sign == 0 && isNegativeInfinity(logabs);
+      if (!node && ((sign != 1 && sign != -1) ||
+          !qmcplusplus::psiformer::determinant::isFiniteReal(logabs)))
+        throw std::runtime_error("Numerical tile returned an invalid signed-log value");
+      if (spatial && node)
+        throw std::runtime_error("Numerical spatial tile returned an undefined nodal log derivative");
+      storePendingValue(workspace, configuration, sign, logabs, node ? 0 : sign * std::exp(logabs), version);
+
+      if (spatial)
+      {
+        const auto lanes = full ? full_lanes : 3;
+        const auto first_lane = full ? 0 : 3 * active_electrons[configuration];
+        for (std::size_t lane = 0; lane < lanes; ++lane)
+        {
+          const double gradient = result.gradient[local * result.gradient_configuration_stride +
+              (first_lane + lane) * result.gradient_lane_stride];
+          if (!qmcplusplus::psiformer::determinant::isFiniteReal(gradient))
+            throw std::runtime_error("Numerical tile returned a nonfinite spatial gradient");
+          workspace.pending_gradient_[configuration * lanes + lane] = gradient;
+        }
+      }
+      if (full)
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          const double lap_log = result.lap_log[local * result.lap_log_configuration_stride +
+              electron * result.lap_log_lane_stride];
+          const double lap_ratio = result.lap_ratio[local * result.lap_ratio_configuration_stride + electron];
+          if (!qmcplusplus::psiformer::determinant::isFiniteReal(lap_log) ||
+              !qmcplusplus::psiformer::determinant::isFiniteReal(lap_ratio))
+            throw std::runtime_error("Numerical tile returned a nonfinite Laplacian");
+          workspace.pending_lap_log_[configuration * electrons + electron] = lap_log;
+          workspace.pending_lap_ratio_[configuration * electrons + electron] = lap_ratio;
+        }
+    }
+  }
+
+  /// Identify the signed-log node sentinel even under finite-math assumptions.
+  static bool isNegativeInfinity(double value) noexcept
+  {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits == UINT64_C(0xfff0000000000000);
+  }
+
   static void storePendingValue(DirectBatchWorkspace& workspace,
                                 std::size_t configuration,
                                 double sign,
@@ -2852,6 +3009,7 @@ private:
 
   const DirectValueExecutor& value_executor_;
   const DirectSpatialExecutor& spatial_executor_;
+  std::shared_ptr<const DirectBatchTileBackend> tile_backend_;
 };
 
 } // namespace pf

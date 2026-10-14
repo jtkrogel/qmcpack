@@ -22,6 +22,9 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceBatchBackend.h"
+#endif
 #include "Message/Communicate.h"
 #include "Particle/MCMultiParticleMoves.h"
 #include "Particle/VirtualParticleSet.h"
@@ -819,18 +822,25 @@ std::shared_ptr<const wftrain::StructuredParameterSchema> makeStructuredParamete
 /** Validate the currently supported production route before model materialization.
  *
  * A CPU result is either an explicit request or one structurally valid automatic
- * fallback. A ready accelerator result is rejected until numerical dispatch is
- * complete, even if a caller forges such a resolution directly.
+ * fallback. A device route needs explicit validated inference coverage and a
+ * matching compiled backend; bare forged readiness records remain insufficient.
  */
-psiformer::PsiFormerAcceleratorResolution validateCpuAcceleratorResolution(
+psiformer::PsiFormerAcceleratorResolution validateProductionAcceleratorResolution(
     psiformer::PsiFormerAcceleratorResolution resolution)
 {
   using Backend = psiformer::PsiFormerAcceleratorBackend;
   using Reason  = psiformer::PsiFormerAcceleratorResolutionReason;
 
   if (resolution.backend != Backend::CPU)
-    throw std::invalid_argument(
-        "PsiFormer accelerator execution is not available until complete numerical dispatch is connected");
+  {
+    const auto required = psiformer::psiFormerAcceleratorInferenceOperations();
+    if (resolution.reason != Reason::ACCELERATOR_READY || resolution.fallback_count != 0 ||
+        resolution.readiness_records_consulted == 0 || resolution.readiness_records_consulted > 2 ||
+        (resolution.validated_operations & required) != required ||
+        !psiformer::compiledPsiFormerAcceleratorSupport().supports(resolution.backend))
+      throw std::invalid_argument("PsiFormer numerical dispatch requires a compiled, coverage-validated accelerator resolution");
+    return resolution;
+  }
 
   if (resolution.reason == Reason::CPU_REQUESTED)
   {
@@ -856,6 +866,32 @@ psiformer::PsiFormerAcceleratorResolution validateCpuAcceleratorResolution(
 
 struct PsiFormerDerivativeScratch;
 
+/** Select numerical batch tiles only for an explicitly resolved device route.
+ * CPU models never construct vendor handles or upload parameter images.
+ */
+std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
+    const pf::PsiFormer& model, const psiformer::PsiFormerExecutionPlan& plan,
+    const psiformer::PsiFormerAcceleratorResolution& resolution)
+{
+  if (resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU)
+    return {};
+#ifdef ENABLE_CUDA
+  using namespace psiformer::device;
+  if (resolution.backend != PreparedDeviceCrowdHooks::backend())
+    throw std::invalid_argument("PsiFormer numerical tile request does not match the compiled device backend");
+  auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
+  const auto backend = resolution.backend;
+  const auto version = model.p.version();
+  return std::make_shared<PreparedDeviceBatchBackend>(std::move(image), [backend, version]() {
+    app_log() << "  PsiFormer numerical device tile completed: backend="
+              << psiformer::psiFormerAcceleratorBackendName(backend)
+              << ", parameter_version=" << version << ", CPU fallback=no" << std::endl;
+  });
+#else
+  throw std::invalid_argument("PsiFormer numerical device tiles are not compiled in this executable");
+#endif
+}
+
 /** Shared native model protected at the optimizer/evaluator synchronization
  * boundary. Component clones retain only walker-local move state. */
 class PsiFormerSharedState
@@ -867,7 +903,7 @@ public:
       const std::string& configuration,
       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
       : PsiFormerSharedState([&]() {
-          validateCpuAcceleratorResolution(accelerator_resolution);
+          validateProductionAcceleratorResolution(accelerator_resolution);
           return pf::PsiFormer(parameters, configuration);
         }(), "hdf5", "external_hdf5", 0, {}, {}, accelerator_resolution)
   {}
@@ -880,7 +916,7 @@ public:
                        std::array<double, 3> reduced_twist,
                        psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
       : PsiFormerSharedState([&]() {
-          validateCpuAcceleratorResolution(accelerator_resolution);
+          validateProductionAcceleratorResolution(accelerator_resolution);
           validateMatchingLattices(electrons, ions);
           pf::PsiFormer model(parameters, configuration);
           const auto environment = makeExecutionEnvironment(electrons);
@@ -897,7 +933,7 @@ public:
                        std::array<double, 3> reduced_twist,
                        psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
       : PsiFormerSharedState([&]() {
-          validateCpuAcceleratorResolution(accelerator_resolution);
+          validateProductionAcceleratorResolution(accelerator_resolution);
           return makeInitializedNativeModel(std::move(initialized), electrons, ions);
         }(), makeExecutionEnvironment(electrons),
             makeTwistPhase(electrons, reduced_twist), accelerator_resolution)
@@ -922,7 +958,7 @@ public:
                        psiformer::ExecutionEnvironment environment,
                        PsiFormerTwistPhase twist_phase,
                        psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
-      : accelerator_resolution(validateCpuAcceleratorResolution(accelerator_resolution)),
+      : accelerator_resolution(validateProductionAcceleratorResolution(accelerator_resolution)),
         model(std::move(model_input)),
         model_origin(std::move(origin)),
         initialization_profile(std::move(profile)),
@@ -944,7 +980,8 @@ public:
              /*attention_blocks=*/model.blocks}, std::move(environment))),
         direct_value_executor(model, execution_plan),
         direct_spatial_executor(model, direct_value_executor, execution_plan),
-        direct_batch_executor(direct_value_executor, direct_spatial_executor),
+        numerical_tile_backend(makePsiFormerNumericalTiles(model, execution_plan, this->accelerator_resolution)),
+        direct_batch_executor(direct_value_executor, direct_spatial_executor, numerical_tile_backend),
         direct_score_executor(model, execution_plan),
         direct_kinetic_executor(model, execution_plan),
         direct_value_mode(configuredDirectBackend("PSIFORMER_VALUE_BACKEND")),
@@ -952,6 +989,9 @@ public:
         direct_score_mode(configuredDirectBackend("PSIFORMER_SCORE_BACKEND")),
         direct_kinetic_mode(configuredDirectBackend("PSIFORMER_KINETIC_BACKEND"))
   {
+    if (numerical_tile_backend && (direct_value_mode != DirectBackendMode::DIRECT ||
+        direct_spatial_mode != DirectBackendMode::DIRECT))
+      throw std::invalid_argument("PsiFormer GPU inference requires direct value/spatial modes, not CPU oracle or compare modes");
     if (twist_phase.active() &&
         execution_plan.environment().boundary != psiformer::BoundaryCondition::PERIODIC)
       throw std::invalid_argument(
@@ -1000,6 +1040,8 @@ public:
   const pf::DirectValueExecutor direct_value_executor;
   /// Immutable direct trace-jet executor sharing the value parameter layout.
   const pf::DirectSpatialExecutor direct_spatial_executor;
+  /// Immutable numerical route; device scratch is owned by individual batch workspaces.
+  const std::shared_ptr<const pf::DirectBatchTileBackend> numerical_tile_backend;
   /// Direct configuration-major batch boundary shared by clone and crowd workspaces.
   const pf::DirectBatchExecutor direct_batch_executor;
   /// Immutable direct score executor sharing typed model metadata and parameters.
@@ -4789,6 +4831,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
 {
   if (!enable_optimization && !selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
+  if (enable_optimization && model_state_->numerical_tile_backend)
+    throw std::invalid_argument("PsiFormer GPU optimization is not available until numerical score/response products are connected");
   if (optimize_all && !enable_optimization)
     throw std::invalid_argument("PsiFormer optimize_scope=all requires optimize=yes");
   if (optimize_all && !selected_flat_indices.empty())
@@ -9778,6 +9822,39 @@ pf::Result PsiFormerWF::evaluatePositionsUnderRead(
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
 
+  if (state.numerical_tile_backend)
+  {
+    // Preserve the owning compatibility result without falling back to native
+    // CPU mathematics for an explicitly requested device evaluator.
+    pf::Result result;
+    if (purpose == EvaluationPurpose::VALUE_ONLY)
+    {
+      const auto values = evaluateDirectValuePositionsUnderRead(transaction, p, replaced_particle, replacement_position);
+      result.sign = values.sign;
+      result.logabs = values.logabs;
+      result.value = values.value;
+    }
+    else if (purpose == EvaluationPurpose::FULL_SPATIAL || purpose == EvaluationPurpose::ACTIVE_ELECTRON_GRADIENT)
+    {
+      const auto values = evaluateDirectSpatialPositionsUnderRead(transaction, p, replaced_particle,
+          replacement_position, purpose, active_gradient_particle);
+      result.sign = values.sign;
+      result.logabs = values.logabs;
+      result.value = values.value;
+      if (purpose == EvaluationPurpose::FULL_SPATIAL)
+      {
+        result.gradient.assign(values.gradient.data(), values.gradient.data() + values.gradient.size());
+        result.lap_log.assign(values.lap_log.data(), values.lap_log.data() + values.lap_log.size());
+        result.lap_ratio.assign(values.lap_ratio.data(), values.lap_ratio.data() + values.lap_ratio.size());
+      }
+      else
+        result.active_gradient.assign(values.gradient.data(), values.gradient.data() + values.gradient.size());
+    }
+    else
+      throw std::runtime_error("PsiFormer GPU parameter score/kinetic response is not implemented yet");
+    return result;
+  }
+
   // Value-only calls use clone-local fixed storage. Compare mode evaluates
   // both implementations and is intended for migration/debug validation.
   std::optional<pf::DirectValueResult> direct_result;
@@ -9991,6 +10068,21 @@ pf::DirectValueResult PsiFormerWF::evaluateDirectValuePositionsUnderRead(
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
 
+  if (transaction.state().numerical_tile_backend)
+  {
+    auto& batch = requireDirectBatchWorkspace();
+    batch.resize(pf::DirectBatchMode::VALUE_ONLY, 1);
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    {
+      const auto& position = electron == replaced_particle
+          ? (replacement_position ? *replacement_position : p.activeR(electron)) : p.R[electron];
+      for (int dimension = 0; dimension < 3; ++dimension)
+        batch.setPosition(0, electron, dimension, position[dimension]);
+    }
+    const auto result = transaction.state().direct_batch_executor.evaluateValues(batch);
+    return {result.sign[0], result.logabs[0], result.value[0], result.parameter_version[0]};
+  }
+
   pf::DirectValueWorkspace& workspace = requireDirectValueWorkspace();
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
   {
@@ -10024,6 +10116,26 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositionsUnderRead
   const pf::PsiFormer& model = transaction.model();
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
     throw std::runtime_error("PsiFormerWF electron count differs from exported model");
+
+  if (transaction.state().numerical_tile_backend)
+  {
+    auto& batch = requireDirectBatchWorkspace();
+    const bool full = purpose == EvaluationPurpose::FULL_SPATIAL;
+    batch.resize(full ? pf::DirectBatchMode::FULL_VGL : pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 1);
+    for (int electron = 0; electron < p.getTotalNum(); ++electron)
+    {
+      const auto& position = electron == replaced_particle
+          ? (replacement_position ? *replacement_position : p.activeR(electron)) : p.R[electron];
+      for (int dimension = 0; dimension < 3; ++dimension)
+        batch.setPosition(0, electron, dimension, position[dimension]);
+    }
+    const std::size_t active = static_cast<std::size_t>(active_gradient_particle);
+    const auto result = full ? transaction.state().direct_batch_executor.evaluateFull(batch)
+        : transaction.state().direct_batch_executor.evaluateActive(batch, &active);
+    return {result.sign[0], result.logabs[0], result.value[0], result.mode,
+            {result.gradient, result.gradient_stride}, {result.lap_log, result.laplacian_stride},
+            {result.lap_ratio, result.laplacian_stride}, result.parameter_version[0]};
+  }
 
   pf::DirectSpatialWorkspace& workspace = requireDirectSpatialWorkspace(purpose);
   for (int electron = 0; electron < p.getTotalNum(); ++electron)

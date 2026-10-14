@@ -305,7 +305,7 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
         radius_squared += displacement[dimension] * displacement[dimension];
       }
       const double radius = ::sqrt(radius_squared);
-      if (!(radius > 0.0))
+      if (!(radius > 0.0) && layout.output.mode != SpatialJetMode::VALUE_ONLY)
         return OpenSpatialStatus::COALESCENCE;
       const device_math::SoftenedRadial<double> radial = device_math::softenedRadial(radius);
       const std::size_t base = row + 4 * nucleus;
@@ -441,7 +441,7 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
         radius_squared += displacement[dimension] * displacement[dimension];
       }
       const double radius = ::sqrt(radius_squared);
-      if (!(radius > 0.0))
+      if (!(radius > 0.0) && layout.output.mode != SpatialJetMode::VALUE_ONLY)
         return OpenSpatialStatus::COALESCENCE;
       const bool same_spin = (first < layout.spin_up_count) ==
           (second < layout.spin_up_count);

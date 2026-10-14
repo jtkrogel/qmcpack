@@ -66,6 +66,15 @@ constexpr PsiFormerAcceleratorOperationMask acceleratorOperationBit(
   return static_cast<PsiFormerAcceleratorOperationMask>(operation);
 }
 
+/// Operations needed by fixed-parameter open-real VMC and virtual ECP evaluation.
+constexpr PsiFormerAcceleratorOperationMask psiFormerAcceleratorInferenceOperations() noexcept
+{
+  return acceleratorOperationBit(PsiFormerAcceleratorOperation::VALUES) |
+      acceleratorOperationBit(PsiFormerAcceleratorOperation::VGL) |
+      acceleratorOperationBit(PsiFormerAcceleratorOperation::GRADIENTS_AND_MOVES) |
+      acceleratorOperationBit(PsiFormerAcceleratorOperation::NONLOCAL_ECP);
+}
+
 /// Return operations valid within one coordinate-dependent evaluation submission.
 constexpr PsiFormerAcceleratorOperationMask psiFormerAcceleratorEvaluationOperations() noexcept
 {
@@ -126,6 +135,8 @@ struct PsiFormerAcceleratorResolution
       PsiFormerAcceleratorResolutionReason::CPU_REQUESTED;
   std::size_t readiness_records_consulted = 0;
   std::size_t fallback_count = 0;
+  /// Coverage inspected by resolution; not inferred from compiled leaf kernels.
+  PsiFormerAcceleratorOperationMask validated_operations = 0;
 
   /// Return whether an automatic request fell back to the CPU implementation.
   bool fellBackToCPU() const noexcept { return fallback_count != 0; }

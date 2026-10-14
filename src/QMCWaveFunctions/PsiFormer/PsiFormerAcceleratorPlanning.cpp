@@ -256,7 +256,7 @@ PsiFormerAcceleratorResolution resolvePsiFormerAcceleratorRequest(
       const PsiFormerAcceleratorResolutionReason reason = inspect(backend);
       ++consulted;
       if (reason == PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY)
-        return {backend, reason, consulted, 0};
+        return {backend, reason, consulted, 0, readinessFor(backend, readiness).operation_coverage};
       if (fallback_reason == PsiFormerAcceleratorResolutionReason::NOT_COMPILED ||
           reason != PsiFormerAcceleratorResolutionReason::NOT_COMPILED)
         fallback_reason = reason;
@@ -285,7 +285,7 @@ PsiFormerAcceleratorResolution resolvePsiFormerAcceleratorRequest(
   const PsiFormerAcceleratorResolutionReason reason = inspect(selected);
   if (reason != PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY)
     throwNotReady(selected, reason);
-  return {selected, reason, consulted, 0};
+  return {selected, reason, consulted, 0, readinessFor(selected, readiness).operation_coverage};
 }
 
 const char* psiFormerAcceleratorResolutionReasonName(

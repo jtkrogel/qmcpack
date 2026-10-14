@@ -41,10 +41,9 @@ std::string normalizedAcceleratorRequest(std::string value)
   return value;
 }
 
-/** Inspect only platform/runtime presence; no PsiFormer operation is production-ready yet.
- *
- * Operation coverage deliberately remains zero and runtime validation remains
- * NOT_RUN until the complete numerical executor is connected and tested.
+/** Inspect operation-specific fixed-parameter inference readiness.
+ * CUDA tiles have hardware parity/sanitizer evidence. HIP shares the code but
+ * remains unqualified until AMD runtime checks are performed.
  */
 psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
 {
@@ -55,15 +54,20 @@ psiformer::PsiFormerAcceleratorReadiness inspectProductionAcceleratorReadiness()
   psiformer::PsiFormerAcceleratorReadiness readiness;
   readiness.cuda.compiled       = support.cuda;
   readiness.cuda.usable_device = support.cuda && usable_device;
+  readiness.cuda.operation_coverage = psiformer::psiFormerAcceleratorInferenceOperations();
+  readiness.cuda.runtime_validation = psiformer::PsiFormerRuntimeValidation::PASSED;
   readiness.hip.compiled        = support.hip;
   readiness.hip.usable_device  = support.hip && usable_device;
+  readiness.hip.operation_coverage = psiformer::psiFormerAcceleratorInferenceOperations();
   return readiness;
 }
 
 /** Resolve XML policy without querying a runtime for CPU or malformed requests. */
 psiformer::PsiFormerAcceleratorResolution resolveAcceleratorRequest(
     const std::string& request,
-    const PsiFormerAcceleratorReadinessProvider* readiness_provider)
+    const PsiFormerAcceleratorReadinessProvider* readiness_provider,
+    psiformer::PsiFormerAcceleratorOperationMask required_operations,
+    bool open_boundary)
 {
   const std::string normalized = normalizedAcceleratorRequest(request);
   if (normalized.empty() || normalized == "no" || normalized == "cpu")
@@ -75,10 +79,15 @@ psiformer::PsiFormerAcceleratorResolution resolveAcceleratorRequest(
       normalized != "hip")
     return psiformer::resolvePsiFormerAcceleratorRequest(normalized, {});
 
-  const psiformer::PsiFormerAcceleratorReadiness readiness = readiness_provider
+  psiformer::PsiFormerAcceleratorReadiness readiness = readiness_provider
       ? readiness_provider->inspect()
       : inspectProductionAcceleratorReadiness();
-  return psiformer::resolvePsiFormerAcceleratorRequest(normalized, readiness);
+  if (!open_boundary)
+  {
+    readiness.cuda.operation_coverage = 0;
+    readiness.hip.operation_coverage = 0;
+  }
+  return psiformer::resolvePsiFormerAcceleratorRequest(normalized, readiness, required_operations);
 }
 
 /// Parse the conventional QMCPACK yes/no spellings used for XML attributes.
@@ -192,13 +201,17 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 
   // Resolve before parsing mutable target metadata or opening either model
   // file. Strict requests therefore fail without HDF5 or ParticleSet effects;
-  // auto records an explicit CPU fallback until numerical dispatch is ready.
+  // auto records an explicit CPU fallback for unsupported operations/geometries.
+  const bool optimization_enabled = parseOptimizationFlag(optimize);
+  const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
   const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
-      resolveAcceleratorRequest(gpu, accelerator_readiness_provider_);
-  if (accelerator_resolution.backend !=
+      resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
+          optimization_enabled ? psiformer::allPsiFormerAcceleratorOperations()
+                               : psiformer::psiFormerAcceleratorInferenceOperations(), !periodic);
+  if (accelerator_readiness_provider_ && accelerator_resolution.backend !=
       psiformer::PsiFormerAcceleratorBackend::CPU)
     throw std::runtime_error(
-        "PsiFormer accelerator execution is not available until complete numerical dispatch is connected");
+        "PsiFormer numerical dispatch cannot be enabled by an injected test readiness provider");
 
   const bool internal_initialization = !initialization.empty();
   const bool has_parameter_path      = !parameters.empty();
@@ -226,10 +239,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     throw std::invalid_argument("Unsupported PsiFormer initialization profile: " + initialization);
   const std::uint64_t initialization_seed = parseInitializationSeed(initialization_seed_text);
 
-  const bool optimization_enabled = parseOptimizationFlag(optimize);
   if (targetPtcl.isSpinor())
     throw std::invalid_argument("PsiFormer does not support spinor electron particle sets");
-  const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
   const auto& particle_twist = targetPtcl.getTwist();
   bool particle_twist_is_zero = true;
   for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)

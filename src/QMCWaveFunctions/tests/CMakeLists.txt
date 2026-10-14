@@ -636,9 +636,27 @@ add_executable(test_psiformer_batch_executor
                ../PsiFormer/PsiFormerGeometry.cpp)
 target_link_libraries(test_psiformer_batch_executor catch_main IO::HDF5 platform_LA)
 target_include_directories(test_psiformer_batch_executor PRIVATE "${qmcpack_SOURCE_DIR}/src")
+# Native reference tests include explicit infinities/NaNs; preserve their IEEE
+# assertions even when the production application's Release mode uses fast math.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
+  target_compile_options(test_psiformer_batch_executor PRIVATE -fno-fast-math)
+endif()
 add_unit_test(deterministic-unit_test_psiformer_batch_executor
               1 1 $<TARGET_FILE:test_psiformer_batch_executor>)
 set_tests_properties(deterministic-unit_test_psiformer_batch_executor
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# The inclusion-restricted native engine must occur in only one translation
+# unit per executable, so these publication tests use their own small target.
+add_executable(test_psiformer_numerical_tiles
+               test_psiformer_numerical_tiles.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_numerical_tiles catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_numerical_tiles PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_numerical_tiles
+              1 1 $<TARGET_FILE:test_psiformer_numerical_tiles>)
+set_tests_properties(deterministic-unit_test_psiformer_numerical_tiles
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
 # This standalone target compiles the bounded training sink directly: linking the

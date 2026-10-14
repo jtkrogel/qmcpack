@@ -285,7 +285,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
       radius_squared += displacement[dimension] * displacement[dimension];
     }
     const double radius = ::sqrt(radius_squared);
-    if (!(radius > 0.0))
+    if (!(radius > 0.0) && layout.features.mode != SpatialJetMode::VALUE_ONLY)
       return OpenSpatialStatus::COALESCENCE;
     const std::size_t parameter = envelopeOffset(
         layout, determinant, orbital, nucleus);
@@ -295,12 +295,17 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
         !device_math::isFiniteBinary64(decay))
       return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
     const double weighted = coefficient * ::exp(-decay * radius);
-    const double radial_first = -decay * weighted;
-    const double radial_second = decay * decay * weighted;
     envelope_value += weighted;
-    for (std::size_t dimension = 0; dimension < 3; ++dimension)
-      envelope_gradient[dimension] += radial_first * displacement[dimension] / radius;
-    envelope_laplacian += radial_second + 2.0 * radial_first / radius;
+    // Envelope values remain defined at nuclear coalescence. Spatial requests
+    // reject that nondifferentiable point above; value requests never divide by r.
+    if (layout.features.mode != SpatialJetMode::VALUE_ONLY)
+    {
+      const double radial_first = -decay * weighted;
+      const double radial_second = decay * decay * weighted;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        envelope_gradient[dimension] += radial_first * displacement[dimension] / radius;
+      envelope_laplacian += radial_second + 2.0 * radial_first / radius;
+    }
   }
 
   const double value = backflow_value * envelope_value;

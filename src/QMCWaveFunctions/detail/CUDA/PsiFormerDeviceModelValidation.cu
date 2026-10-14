@@ -19,6 +19,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceCrowdHooks.h"
+#include "PsiFormerDeviceBatchBackend.h"
 
 #include <fstream>
 #include <iostream>
@@ -246,6 +247,32 @@ int main(int argc, char** argv)
 
     // Zero orbital projections produce genuine determinant nodes. Their values
     // are defined, even though an inverse-based log-VGL request would not be.
+    // Nuclear and electron coalescences are valid value requests even though
+    // the corresponding log spatial derivatives are not generally defined.
+    pf::DirectValueExecutor coalescence_reference(model, plan);
+    auto coalescence_workspace = coalescence_reference.makeWorkspace();
+    for (bool nuclear : {true, false})
+    {
+      auto coalescence_positions = model.cfg.electrons.x;
+      if (nuclear)
+        std::copy_n(model.cfg.nuclei.x.begin(), 3, coalescence_positions.begin());
+      else
+        std::copy_n(coalescence_positions.begin(), 3, coalescence_positions.begin() + 3);
+      values.evaluate(coalescence_positions);
+      values.downloadResults(value_phases, value_logs, no_ratios);
+      coalescence_workspace->setPositions(pf::GeometryPositionView::interleaved(coalescence_positions.data(), model.ne));
+      const auto expected = coalescence_reference.evaluate(*coalescence_workspace);
+      if (expected.sign == 0)
+      {
+        if (value_phases[0] != 0 || value_logs[0] != -HUGE_VAL)
+          throw std::runtime_error("Value-only graph lost the same-spin coalescence node");
+      }
+      else
+      {
+        near(value_phases[0], expected.sign, "value coalescence sign");
+        near(value_logs[0], expected.logabs, "value coalescence logabs");
+      }
+    }
     auto node_parameters = model.p.flat_values();
     for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
     {
@@ -350,6 +377,60 @@ int main(int argc, char** argv)
     executor.release(owner, crowd, hooks);
     executor.release(owner, second_crowd, second_hooks);
     std::cout << "PASS numerical crowd hooks: typed value/VGL, provenance, wait visibility, failure/recovery, two crowds\n";
+
+    // Run the exact native batch-publication boundary used by PsiFormerWF.
+    // This catches stride, active-electron and sparse-input integration mistakes
+    // that raw graph/hook comparisons cannot detect.
+    pf::DirectValueExecutor batch_value(model, plan);
+    pf::DirectSpatialExecutor batch_spatial(model, batch_value, plan);
+    auto batch_image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
+    auto backend_tiles = std::make_shared<PreparedDeviceBatchBackend>(batch_image);
+    pf::DirectBatchExecutor batch_executor(batch_value, batch_spatial, backend_tiles);
+    auto batch_workspace = batch_executor.makeWorkspace();
+    batch_workspace->prepareTileCapacity(2);
+    for (auto mode : {pf::DirectBatchMode::VALUE_ONLY, pf::DirectBatchMode::FULL_VGL,
+                      pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT})
+    {
+      batch_workspace->resize(mode, model.cfg.nconfig);
+      for (std::size_t index = 0; index < model.cfg.nconfig; ++index)
+        batch_workspace->setPositions(index, pf::GeometryPositionView::interleaved(
+            model.cfg.electrons.x.data() + index * 3 * model.ne, model.ne));
+      if (mode == pf::DirectBatchMode::VALUE_ONLY)
+      {
+        const auto batch_result = batch_executor.evaluateValues(*batch_workspace);
+        for (std::size_t index = 0; index < references.size(); ++index)
+          near(batch_result.logabs[index], references[index].logabs, "native tile value publication");
+      }
+      else
+      {
+        std::vector<std::size_t> active(model.cfg.nconfig);
+        for (std::size_t index = 0; index < active.size(); ++index) active[index] = index % model.ne;
+        const auto batch_result = mode == pf::DirectBatchMode::FULL_VGL
+            ? batch_executor.evaluateFull(*batch_workspace) : batch_executor.evaluateActive(*batch_workspace, active.data());
+        for (std::size_t index = 0; index < references.size(); ++index)
+        {
+          near(batch_result.logabs[index], references[index].logabs, "native tile spatial publication");
+          for (std::size_t lane = 0; lane < batch_result.gradient_stride; ++lane)
+          {
+            const auto reference_lane = mode == pf::DirectBatchMode::FULL_VGL ? lane : 3 * active[index] + lane;
+            near(batch_result.gradient[index * batch_result.gradient_stride + lane],
+                 references[index].gradient[reference_lane], "native tile gradient publication");
+          }
+          if (mode == pf::DirectBatchMode::FULL_VGL)
+            for (std::size_t electron = 0; electron < model.ne; ++electron)
+              near(batch_result.lap_ratio[index * model.ne + electron], references[index].lap_ratio[electron],
+                   "native tile Laplacian publication");
+        }
+      }
+    }
+    batch_workspace->resizeSparseValues(1, 1);
+    const auto first_position = pf::GeometryPositionView::interleaved(model.cfg.electrons.x.data(), model.ne);
+    batch_workspace->setReferenceConfiguration(0, first_position);
+    batch_workspace->setVirtualReplacement(0, 0, 0, {first_position(0, 0), first_position(0, 1), first_position(0, 2)});
+    const auto sparse_result = batch_executor.evaluateValues(*batch_workspace);
+    near(sparse_result.logabs[0], references[0].logabs, "native sparse reference publication");
+    near(sparse_result.logabs[1], references[0].logabs, "native sparse replacement publication");
+    std::cout << "PASS native numerical tiles: values/VGL/active gradients/sparse replacements/tails\n";
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
               << "production dispatch and parameter reverse NOT_VALIDATED\n";
