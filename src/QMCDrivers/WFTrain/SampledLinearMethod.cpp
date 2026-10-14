@@ -91,7 +91,8 @@ SampledLinearMethodOperator::SampledLinearMethodOperator(const ScoreCovarianceFa
   adjoint_.resize(factor.parameterSchema().parameterCount());
   local_gradient_.resize(adjoint_.size());
   if (!overlap_)
-    h_factor_ = std::make_unique<ProjectedInverseIterationFactor>(factor, term_mask);
+    h_factor_ = std::make_unique<ProjectedInverseIterationFactor>(
+        factor, term_mask, HamiltonianSampleProjection::REAL_TANGENT);
 }
 
 std::size_t SampledLinearMethodOperator::retainedBytes() const noexcept
@@ -154,6 +155,16 @@ void SampledLinearMethodOperator::evaluate(DerivativeArrayView<const DerivativeV
           EnergyAdjointSink sink(local_gradient_);
           op.applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, sink);
           offset += count;
+        }
+        // This LM/ALM basis has real scores and real tangent coefficients. The
+        // corresponding Hamiltonian is Re(D^dagger H D), even when a fixed
+        // parameter-independent phase gives complex physical energy derivatives.
+        // Check both parts before projection; never hide an imaginary NaN.
+        for (auto& value : local_gradient_)
+        {
+          if (!isFiniteTrainingReal(value.real()) || !isFiniteTrainingReal(value.imag()))
+            throw MatrixFreeNumericalError("Sampled LM energy adjoint is non-finite");
+          value = {value.real(), 0.0};
         }
       }
       catch (...) { failure = std::current_exception(); }

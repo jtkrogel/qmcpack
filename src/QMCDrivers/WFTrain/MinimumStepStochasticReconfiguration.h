@@ -154,11 +154,18 @@ private:
   mutable std::vector<DerivativeValue> local_parameter_action_;
 };
 
+/** Select the Hamiltonian action's scalar restriction, never the producer's type. */
+enum class HamiltonianSampleProjection
+{
+  STRICT_REAL,  ///< Require the physical local-energy JVP itself to be real.
+  REAL_TANGENT  ///< Restrict H to real score/coefficient tangents, after finite checks.
+};
+
 /** Weighted PII factor B=A-tau*O using exact score and local-energy products.
  *
  * Here O is the centered score factor owned by ScoreCovarianceFactor. Before sample
  * weighting, A*v is the derivative of (H psi)/psi: dE_L[v]+E_L*(score JVP).
- * In the stored convention B*v=sqrt(q)*dE_L[v]+(E_L-tau)*(O*v). The initial
+ * In the stored convention B*v=sqrt(q)*dE_L[v]+(E_L-tau)*(O*v).
  * The term mask may name the all-electron kinetic contribution alone or the
  * kinetic plus an ordinary-locality nonlocal-ECP replay captured on the same
  * accepted quadrature grid as the stored local energies.
@@ -168,7 +175,8 @@ class ProjectedInverseIterationFactor
 public:
   ProjectedInverseIterationFactor(
       const ScoreCovarianceFactor& score_factor,
-      std::uint32_t local_energy_term_mask);
+      std::uint32_t local_energy_term_mask,
+      HamiltonianSampleProjection projection = HamiltonianSampleProjection::STRICT_REAL);
 
   const ScoreCovarianceFactor& scoreFactor() const noexcept
   {
@@ -183,7 +191,7 @@ public:
   /// Return exact numeric storage retained directly by the shifted factor.
   std::size_t retainedBytes() const noexcept;
 
-  /// Apply the realified shifted local-energy factor (A-tau*O).
+  /// Apply the real shifted factor, with explicit solver-local Hamiltonian projection.
   void applyShifted(const StructuredParameterVectorConstView& direction,
                     DerivativeReal tau,
                     DerivativeArrayView<DerivativeValue> result) const;
@@ -191,6 +199,7 @@ public:
 private:
   const ScoreCovarianceFactor& score_factor_;
   std::uint32_t local_energy_term_mask_ = 0;
+  HamiltonianSampleProjection projection_;
   mutable std::vector<DerivativeValue> projected_direction_;
   mutable std::vector<DerivativeValue> score_products_;
   mutable std::vector<DerivativeValue> local_energy_products_;

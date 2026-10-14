@@ -708,8 +708,8 @@ ScoreCovarianceStorageDiagnostics ScoreCovarianceFactor::storageDiagnostics() co
 
 ProjectedInverseIterationFactor::ProjectedInverseIterationFactor(
     const ScoreCovarianceFactor& score_factor,
-    std::uint32_t local_energy_term_mask)
-    : score_factor_(score_factor), local_energy_term_mask_(local_energy_term_mask),
+    std::uint32_t local_energy_term_mask, HamiltonianSampleProjection projection)
+    : score_factor_(score_factor), local_energy_term_mask_(local_energy_term_mask), projection_(projection),
       projected_direction_(score_factor.parameterSchema().parameterCount()),
       score_products_(score_factor.localSampleVectorSize()),
       local_energy_products_(score_factor.localSampleVectorSize())
@@ -723,6 +723,9 @@ ProjectedInverseIterationFactor::ProjectedInverseIterationFactor(
         "PII requires kinetic or kinetic-plus-nonlocal-ECP local-energy derivatives");
   if (score_factor_.sampleDomain() != ScoreSampleDomain::REAL)
     throw std::invalid_argument("PII currently requires a real sample-space factor");
+  if (projection_ != HamiltonianSampleProjection::STRICT_REAL &&
+      projection_ != HamiltonianSampleProjection::REAL_TANGENT)
+    throw std::invalid_argument("Unknown Hamiltonian sample projection");
 
   for (const ScoreCovarianceFactor::BatchStorage& batch : score_factor_.batches_)
   {
@@ -783,11 +786,12 @@ void ProjectedInverseIterationFactor::applyShifted(
       batch.derivative_operator->applyLocalEnergyJVP(
           projected, local_energy_term_mask_, sink);
       if (std::any_of(batch_local_energy.begin(), batch_local_energy.end(),
-                      [](DerivativeValue value) {
-                        return !isFinite(value) || value.imag() != 0.0;
+                      [this](DerivativeValue value) {
+                        return !isFinite(value) ||
+                            (projection_ == HamiltonianSampleProjection::STRICT_REAL && value.imag() != 0.0);
                       }))
         throw MatrixFreeNumericalError(
-            "Real PII factor produced a complex or non-finite local-energy JVP");
+            "Hamiltonian factor produced a non-finite or inadmissible complex local-energy JVP");
     }
   }
   catch (...)
@@ -803,6 +807,9 @@ void ProjectedInverseIterationFactor::applyShifted(
     for (std::size_t sample = 0; sample < batch.weights.size(); ++sample)
     {
       const std::size_t index = batch.sample_vector_offset + sample;
+      // REAL_TANGENT restricts the Hamiltonian bilinear form to real scores and
+      // coefficients: Re(D^dagger H D). The physical derivative remains complex;
+      // its imaginary part is admitted/checked above, not removed at the source.
       const DerivativeReal local_energy_jvp =
           batch.sqrt_normalized_weights[sample] * local_energy_products_[index].real();
       result[index] = {local_energy_jvp +

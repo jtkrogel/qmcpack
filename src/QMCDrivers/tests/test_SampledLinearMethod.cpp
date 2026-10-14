@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -19,15 +20,20 @@ using Row = std::array<double, 2>;
 constexpr std::uint32_t kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
 const std::array<Row, 4> scores{{{1, -1}, {2, 0.5}, {-0.5, 2}, {3, 1}}};
 const std::array<Row, 4> del{{{0.2, 1}, {-1, 0.3}, {0.7, -0.4}, {1.1, 2}}};
+const std::array<Row, 4> imaginary_del{{{0.9, -0.4}, {0.2, 1.3}, {-0.8, 0.6}, {0.7, -1.2}}};
 const std::array<double, 4> weights{{1, 2, 0, 3}};
 const std::array<DerivativeValue, 4> energies{{1, 3, -2, 2}};
 
 class ExactRows final : public StreamingDerivativeOperator
 {
 public:
-  ExactRows(const StructuredParameterSchema& schema, std::size_t ordinal)
-      : schema_(schema), ordinal_(ordinal), plan_(schema, 7, 1)
+  ExactRows(const StructuredParameterSchema& schema, std::size_t ordinal, bool complex_energy = false)
+      : schema_(schema), ordinal_(ordinal), plan_(schema, 7, 1), complex_energy_(complex_energy)
   {}
+  /// Poison only the physical derivative's imaginary part to test projection admission.
+  void setNonfiniteImaginaryEnergy(bool jvp, bool vjp) { bad_energy_jvp_ = jvp; bad_energy_vjp_ = vjp; }
+  /// A complex score is outside the real tangent factor's supported model class.
+  void setImaginaryScore() { imaginary_score_ = true; }
   const StructuredParameterSchema& parameterSchema() const noexcept override { return schema_; }
   std::size_t parameterVersion() const noexcept override { return 7; }
   std::size_t batchOrdinal() const noexcept override { return ordinal_; }
@@ -56,7 +62,7 @@ public:
   }
 protected:
   void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
-                    DerivativeAdjoint, ParameterReductionSink& sink) const override
+                    DerivativeAdjoint adjoint, ParameterReductionSink& sink) const override
   {
     for (const auto& chunk : plan_.chunks())
       for (std::size_t channel = 0; channel < channels.size(); ++channel)
@@ -64,29 +70,47 @@ protected:
         const auto& matrix = channels[channel].product == DerivativeProduct::SCORE_VJP ? scores : del;
         DerivativeValue value{};
         for (std::size_t i = 0; i < 2; ++i)
-          value += channels[channel].coefficients.values[i] * matrix[sampleOffset() + i][chunk.parameter_offset];
+        {
+          const auto sample = sampleOffset() + i, parameter = chunk.parameter_offset;
+          DerivativeValue entry{matrix[sample][parameter], 0.0};
+          if (channels[channel].product == DerivativeProduct::LOCAL_ENERGY_VJP)
+            entry.imag(bad_energy_vjp_ ? std::numeric_limits<double>::quiet_NaN() :
+                       (complex_energy_ ? imaginary_del[sample][parameter] : 0.0));
+          if (adjoint == DerivativeAdjoint::HERMITIAN)
+            entry = std::conj(entry);
+          value += channels[channel].coefficients.values[i] * entry;
+        }
         sink.add(channel, {chunk, {&value, 1}});
       }
   }
   void evaluateScoreJVP(const StructuredParameterVectorConstView& direction, SampleProductSink& sink) const override
   {
-    emit(scores, direction, sink);
+    emit(scores, direction, sink, false);
   }
   void evaluateLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
                               std::uint32_t mask, SampleProductSink& sink) const override
   {
     if (mask != kinetic)
       throw std::logic_error("Unexpected local-energy term mask in sampled LM oracle");
-    emit(del, direction, sink);
+    emit(del, direction, sink, true);
   }
 private:
   void emit(const std::array<Row, 4>& matrix, const StructuredParameterVectorConstView& direction,
-            SampleProductSink& sink) const
+            SampleProductSink& sink, bool energy) const
   {
     std::array<DerivativeValue, 2> result{};
     for (std::size_t i = 0; i < 2; ++i)
       for (std::size_t p = 0; p < 2; ++p)
-        result[i] += matrix[sampleOffset() + i][p] * direction.values()[p];
+      {
+        const auto sample = sampleOffset() + i;
+        DerivativeValue entry{matrix[sample][p], 0.0};
+        if (energy)
+          entry.imag(bad_energy_jvp_ ? std::numeric_limits<double>::quiet_NaN() :
+                     (complex_energy_ ? imaginary_del[sample][p] : 0.0));
+        else if (imaginary_score_)
+          entry.imag(0.5);
+        result[i] += entry * direction.values()[p];
+      }
     SampleProductTileDescriptor descriptor{schema_.providerId(), schema_.fingerprint(), 7,
                                             ordinal_, sampleOffset(), 2, 0};
     sink.add({descriptor, {result.data(), result.size()}});
@@ -94,10 +118,14 @@ private:
   const StructuredParameterSchema& schema_;
   std::size_t ordinal_;
   ParameterChunkPlan plan_;
+  bool complex_energy_ = false, bad_energy_jvp_ = false, bad_energy_vjp_ = false, imaginary_score_ = false;
 };
 
 struct Fixture
 {
+  explicit Fixture(bool complex_energy = false)
+      : first(schema, 0, complex_energy), second(schema, 1, complex_energy)
+  {}
   StructuredParameterSchema schema{"sampled_lm/test", {{"tangent", {2}, 0, 2, ParameterScalarDomain::REAL64, true, "tangent"}}};
   ExactRows first{schema, 0}, second{schema, 1};
   std::vector<ScoreCovarianceBatch> batches{
@@ -107,7 +135,7 @@ struct Fixture
 };
 
 // Compute the dense oracle directly from sample rows, independently of factor actions.
-std::array<double, 9> oracle(bool overlap, bool symmetric, double shift)
+std::array<double, 9> oracle(bool overlap, bool symmetric, double shift, bool complex_energy = false)
 {
   std::array<double, 9> matrix{};
   Row mean{};
@@ -117,11 +145,12 @@ std::array<double, 9> oracle(bool overlap, bool symmetric, double shift)
   for (std::size_t i = 0; i < 4; ++i)
   {
     const std::array<double, 3> d{{1, scores[i][0] - mean[0], scores[i][1] - mean[1]}};
-    const std::array<double, 3> l{{energies[i].real(), del[i][0] + energies[i].real() * d[1],
-                                  del[i][1] + energies[i].real() * d[2]}};
+    const std::array<DerivativeValue, 3> l{{energies[i],
+        DerivativeValue{del[i][0], complex_energy ? imaginary_del[i][0] : 0.0} + energies[i] * d[1],
+        DerivativeValue{del[i][1], complex_energy ? imaginary_del[i][1] : 0.0} + energies[i] * d[2]}};
     for (std::size_t r = 0; r < 3; ++r)
       for (std::size_t c = 0; c < 3; ++c)
-        matrix[3*r+c] += weights[i] / 6 * d[r] * (overlap ? d[c] : l[c]);
+        matrix[3*r+c] += (weights[i] / 6 * d[r] * (overlap ? DerivativeValue{d[c], 0.0} : l[c])).real();
   }
   if (symmetric && !overlap)
     for (std::size_t r = 0; r < 3; ++r)
@@ -258,6 +287,67 @@ TEST_CASE("Sampled LM rejects malformed nonowning batch views", "[drivers][wftra
   batches[0].derivative_operator = nullptr;
   CHECK_THROWS(SampledLinearMethodOperator(f.factor, {batches.data(), batches.size()},
                                          kinetic, true, false, 0.01));
+}
+
+TEST_CASE("Sampled LM explicitly restricts complex Hamiltonian products to a real tangent basis",
+          "[drivers][wftrain][linear_method][complex]")
+{
+  Fixture f(true);
+  const std::array<DerivativeValue, 2> tangent{{0.4, -0.7}};
+  const StructuredParameterVectorConstView view(f.schema, 7, {tangent.data(), tangent.size()});
+  Samples physical_products;
+  f.first.applyLocalEnergyJVP(view, kinetic, physical_products);
+  CHECK(std::abs(physical_products.values[0].imag()) > 0.1);
+  CHECK(std::abs(physical_products.values[1].imag()) > 0.1);
+
+  // The reusable PII factor retains its strict-real default. LM/ALM's explicit
+  // policy must not silently broaden other optimizers or the global reducer.
+  ProjectedInverseIterationFactor strict(f.factor, kinetic);
+  std::vector<DerivativeValue> sample_action(f.factor.localSampleVectorSize());
+  CHECK_THROWS(strict.applyShifted(view, 0.0, {sample_action.data(), sample_action.size()}));
+
+  for (bool symmetric : {false, true})
+  {
+    SampledLinearMethodOperator op(f.factor, {f.batches.data(), f.batches.size()},
+                                   kinetic, false, symmetric, 0.25);
+    const auto dense = oracle(false, symmetric, 0.25, true);
+    for (std::size_t column = 0; column < 3; ++column)
+    {
+      std::array<DerivativeValue, 3> direction{};
+      direction[column] = 1.0;
+      const auto result = applySampledAction(op, direction);
+      for (std::size_t row = 0; row < 3; ++row)
+      {
+        CHECK(result[row].real() == Catch::Approx(dense[3 * row + column]).margin(1e-12));
+        CHECK(result[row].imag() == 0.0);
+      }
+    }
+  }
+}
+
+TEST_CASE("Sampled LM real tangent projection rejects imaginary nonfinite data and complex scores",
+          "[drivers][wftrain][linear_method][complex]")
+{
+  const std::array<DerivativeValue, 3> direction{{0.7, -0.2, 0.9}};
+  for (bool bad_jvp : {false, true})
+  {
+    Fixture f(true);
+    f.first.setNonfiniteImaginaryEnergy(bad_jvp, !bad_jvp);
+    SampledLinearMethodOperator op(f.factor, {f.batches.data(), f.batches.size()}, kinetic, false, true, 0.0);
+    CHECK_THROWS(applySampledAction(op, direction));
+  }
+  Fixture complex_score;
+  complex_score.first.setImaginaryScore();
+  SampledLinearMethodOperator overlap(complex_score.factor,
+      {complex_score.batches.data(), complex_score.batches.size()}, kinetic, true, false, 0.0);
+  CHECK_THROWS(applySampledAction(overlap, direction));
+
+  Fixture f;
+  auto bad_energies = energies;
+  bad_energies[0] = {1.0, std::numeric_limits<double>::quiet_NaN()};
+  auto batches = f.batches;
+  batches[0].local_energies = {bad_energies.data(), 2};
+  CHECK_THROWS(SampledLinearMethodOperator(f.factor, {batches.data(), batches.size()}, kinetic, false, true, 0.0));
 }
 
 } // namespace qmcplusplus::wftrain
