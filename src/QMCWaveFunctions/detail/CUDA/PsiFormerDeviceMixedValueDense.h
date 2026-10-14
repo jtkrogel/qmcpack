@@ -43,7 +43,11 @@ class PreparedDeviceMixedDenseParameters
 public:
   /// Convert only typed embedding/attention/MLP matrices and admit diagnostics before use.
   PreparedDeviceMixedDenseParameters(std::shared_ptr<const PreparedDeviceModel> model,
-                                     compute::Queue<PlatformKind::CUDA>& queue);
+                                     compute::Queue<PlatformKind::CUDA>& queue,
+                                     bool allow_fp64_retry = false);
+
+  /// An inadmissible conversion remains versioned but may only execute through FP64 replay.
+  bool usable() const noexcept { return usable_; }
 
   /// Return the exact immutable canonical image represented by the compute copy.
   const std::shared_ptr<const PreparedDeviceModel>& modelImage() const noexcept { return model_; }
@@ -61,6 +65,7 @@ private:
   std::shared_ptr<const PreparedDeviceModel> model_;
   DeviceBuffer<float> weights_;
   PsiFormerParameterConversionDiagnostics conversion_{};
+  bool usable_ = true;
 };
 
 /** Logical cast traffic for one attempted value evaluation, not vendor memory traffic. */

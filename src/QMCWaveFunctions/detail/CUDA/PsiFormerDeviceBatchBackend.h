@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <functional>
+#include <iostream>
 #include <mutex>
 
 namespace qmcplusplus::psiformer::device
@@ -35,12 +36,21 @@ class PreparedDeviceBatchBackend final : public pf::DirectBatchTileBackend
 public:
   /// Bind one immutable parameter version and its canonical layout fingerprint.
   explicit PreparedDeviceBatchBackend(std::shared_ptr<const PreparedDeviceModel> image,
-                                      std::function<void()> first_dispatch_reporter = {})
+                                      std::function<void()> first_dispatch_reporter = {},
+                                      PsiFormerPrecisionPolicy precision = PsiFormerPrecisionPolicy::FP64_REFERENCE)
       : image_(checkedImage(std::move(image))),
         owner_(PreparedDeviceCrowdHooks::backend(),
                makePsiFormerDeviceLayout(image_->plan()).fingerprint, image_->version()),
         first_dispatch_reporter_(std::move(first_dispatch_reporter))
-  {}
+  {
+    if (precision == PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS)
+    {
+      preparation_queue_ = std::make_unique<compute::Queue<PlatformKind::CUDA>>();
+      mixed_parameters_ = std::make_shared<PreparedDeviceMixedDenseParameters>(image_, *preparation_queue_, true);
+    }
+    else if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
+      throw std::invalid_argument("Production GPU inference supports only FP64 or explicit FP32 dense/FP64 islands");
+  }
 
   // Contexts retain references to the owner/mutex, so this backend is address-stable.
   PreparedDeviceBatchBackend(const PreparedDeviceBatchBackend&) = delete;
@@ -52,13 +62,15 @@ public:
   std::unique_ptr<pf::DirectBatchTileBackendWorkspace> prepare(std::size_t capacity) const override
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
-    return std::make_unique<Context>(this, image_, owner_, capacity, nextIdentity());
+    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity());
   }
 
   /// Prepare one exclusive product lane sharing this backend's publication owner.
   std::unique_ptr<PreparedDeviceProductSession> prepareProductSession() const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
+    if (mixed_parameters_)
+      throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
     return std::make_unique<PreparedDeviceProductSession>(image_, owner_, control_mutex_, nextIdentity());
   }
 
@@ -87,7 +99,8 @@ public:
     // Lease transitions and submission use the existing non-atomic control plane.
     // This explicit correctness lock can be narrowed after asynchronous integration.
     if (context->hooks.modelVersion() != image_->version())
-      context->hooks.rebindModel(image_);
+      context->hooks.rebindModel(image_, mixed_parameters_);
+    const auto previous_mixed_retries = context->hooks.mixedRetries();
     context->executor.acquire(owner_, context->crowd, context->hooks);
     try
     {
@@ -130,6 +143,11 @@ public:
     }
     if (numerical_tiles_.fetch_add(1, std::memory_order_relaxed) == 0 && first_dispatch_reporter_)
       first_dispatch_reporter_();
+    if (mixed_parameters_ && (!mixed_reported_.exchange(true, std::memory_order_relaxed) ||
+                             context->hooks.mixedRetries() != previous_mixed_retries))
+      std::clog << "PsiFormer explicit mixed inference completed: mixed_batches=" << context->hooks.mixedBatches()
+                << ", whole_fp64_retries=" << context->hooks.mixedRetries()
+                << ", retry_reason=" << context->hooks.mixedRetryReason() << std::endl;
     return result;
   }
 
@@ -148,7 +166,10 @@ public:
     if (!commit_native)
       throw std::invalid_argument("Device publication requires an authoritative native commit");
     auto candidate = image_->makeUpdatedImage(values, version);
+    auto mixed_candidate = mixed_parameters_ ? std::make_shared<PreparedDeviceMixedDenseParameters>(
+        candidate, *preparation_queue_, true) : std::shared_ptr<PreparedDeviceMixedDenseParameters>{};
     publication_hooks_.candidate = &candidate;
+    publication_hooks_.mixed_candidate = &mixed_candidate;
     publication_hooks_.commit_native = &commit_native;
     try
     {
@@ -160,10 +181,12 @@ public:
       if (owner_.publicationPending())
         owner_.cancel(version, publication_hooks_);
       publication_hooks_.candidate = nullptr;
+      publication_hooks_.mixed_candidate = nullptr;
       publication_hooks_.commit_native = nullptr;
       throw;
     }
     publication_hooks_.candidate = nullptr;
+    publication_hooks_.mixed_candidate = nullptr;
     publication_hooks_.commit_native = nullptr;
   }
 
@@ -175,12 +198,14 @@ private:
   struct PublicationHooks final : PsiFormerAcceleratorHooks
   {
     /// Borrow the backend's active image for its entire address-stable lifetime.
-    explicit PublicationHooks(std::shared_ptr<const PreparedDeviceModel>& active) : active(active) {}
+    explicit PublicationHooks(std::shared_ptr<const PreparedDeviceModel>& active,
+                              std::shared_ptr<const PreparedDeviceMixedDenseParameters>& mixed)
+        : active(active), mixed(mixed) {}
 
     /// Accept only this backend's prepared candidate and publication event kinds.
     void submit(const PsiFormerAcceleratorEvent& event) override
     {
-      if (!candidate || !*candidate || !commit_native || event.model_version != (*candidate)->version())
+      if (!candidate || !*candidate || !mixed_candidate || !commit_native || event.model_version != (*candidate)->version())
         throw std::logic_error("Device publication event has no matching prepared candidate");
       switch (event.kind)
       {
@@ -190,6 +215,7 @@ private:
       case PsiFormerAcceleratorEventKind::MODEL_COMPLETE:
         (*commit_native)();
         active = *candidate;
+        mixed = *mixed_candidate;
         return;
       case PsiFormerAcceleratorEventKind::MODEL_CANCEL:
         return;
@@ -199,6 +225,8 @@ private:
     }
 
     std::shared_ptr<const PreparedDeviceModel>& active;
+    std::shared_ptr<const PreparedDeviceMixedDenseParameters>& mixed;
+    const std::shared_ptr<PreparedDeviceMixedDenseParameters>* mixed_candidate = nullptr;
     const std::shared_ptr<const PreparedDeviceModel>* candidate = nullptr;
     const std::function<void()>* commit_native = nullptr;
   };
@@ -208,10 +236,11 @@ private:
   {
     /// Construct a released, prepared crowd using its backend's shared owner.
     Context(const PreparedDeviceBatchBackend* backend, std::shared_ptr<const PreparedDeviceModel> image,
+            std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters,
             const PsiFormerAcceleratorSharedModel& model,
             std::size_t capacity, std::uint64_t identity)
         : owner(backend), capacity(capacity), executor(PreparedDeviceCrowdHooks::backend(),
-            PreparedDeviceCrowdHooks::coverage()), crowd(identity), hooks(image, model, identity)
+            PreparedDeviceCrowdHooks::coverage()), crowd(identity), hooks(image, model, identity, std::move(mixed_parameters))
     {
       positions.reserve(spatial_detail::checkedProduct(capacity,
           spatial_detail::checkedProduct(3, image->plan().modelShape().electrons(), "Device tile coordinates overflow"),
@@ -245,12 +274,15 @@ private:
   }
 
   mutable std::shared_ptr<const PreparedDeviceModel> image_;
-  mutable PublicationHooks publication_hooks_{image_};
+  mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
+  std::unique_ptr<compute::Queue<PlatformKind::CUDA>> preparation_queue_;
+  mutable PublicationHooks publication_hooks_{image_, mixed_parameters_};
   mutable std::mutex control_mutex_;
   mutable PsiFormerAcceleratorSharedModel owner_;
   mutable std::uint64_t next_identity_ = 0;
   const std::function<void()> first_dispatch_reporter_;
   mutable std::atomic<std::size_t> numerical_tiles_{0};
+  mutable std::atomic<bool> mixed_reported_{false};
 };
 
 } // namespace qmcplusplus::psiformer::device

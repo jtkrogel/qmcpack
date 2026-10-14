@@ -17,6 +17,7 @@
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionPolicy.h"
 #include "ResourceHandle.h"
 #include <array>
 #include <cstddef>
@@ -307,7 +308,8 @@ public:
               std::vector<std::size_t> selected_flat_indices = {},
               bool optimize_all = false,
               std::string optimized_parameter_export = {},
-              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {});
+              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {},
+              psiformer::PsiFormerPrecisionPolicy precision = psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE);
 
   /// Load a periodic import and optionally apply a fixed reduced-twist outer phase.
   PsiFormerWF(std::string name,
@@ -320,7 +322,8 @@ public:
               bool optimize_all = false,
               std::string optimized_parameter_export = {},
               std::array<double, 3> reduced_twist = {},
-              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {});
+              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {},
+              psiformer::PsiFormerPrecisionPolicy precision = psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE);
 
   /** Construct a self-contained model from initialized parameters and QMCPACK
    * particle sets, optionally with a fixed reduced-twist outer phase. */
@@ -333,7 +336,8 @@ public:
               bool optimize_all = false,
               std::string optimized_parameter_export = {},
               std::array<double, 3> reduced_twist = {},
-              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {});
+              psiformer::PsiFormerAcceleratorResolution accelerator_resolution = {},
+              psiformer::PsiFormerPrecisionPolicy precision = psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE);
 
   /// Copy accepted state and optimizer mappings while dropping any in-flight proposal.
   PsiFormerWF(const PsiFormerWF& other);

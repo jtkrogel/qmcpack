@@ -777,6 +777,33 @@ int main(int argc, char** argv)
         near(value_logs[sample], reference_values[sample], "parameter-hazard whole FP64 value");
       }
 
+      // Every weight converts finitely, but the embedding SGEMM overflows.
+      // Exercise production's same-graph replay, including errors detected by
+      // intermediate neural admission before finishEvaluation can run.
+      auto activation_parameters = model.p.flat_values();
+      std::fill(activation_parameters.begin() + embedding_tensor.begin,
+                activation_parameters.begin() + embedding_tensor.end, 3e38);
+      const auto activation_image = image->makeUpdatedImage(activation_parameters, 19);
+      const auto activation_cache = std::make_shared<PreparedDeviceMixedDenseParameters>(activation_image, queue);
+      auto activation_adapter = std::make_shared<PreparedDeviceMixedValueDense>(activation_cache,
+          model.cfg.nconfig * model.ne, queue, handle);
+      PreparedDeviceInference activation_graph(activation_image, model.cfg.nconfig, queue, handle,
+                                               SpatialJetMode::VALUE_ONLY);
+      PreparedDeviceInference activation_reference(activation_image, model.cfg.nconfig, queue, handle,
+                                                   SpatialJetMode::VALUE_ONLY);
+      activation_graph.setMixedDense(activation_adapter);
+      std::string activation_reason;
+      if (!activation_graph.evaluateWithFp64Retry(model.cfg.electrons.x, activation_reason) || activation_reason.empty())
+        throw std::runtime_error("Finite compute weights did not trigger complete activation-overflow FP64 retry");
+      activation_reference.evaluate(model.cfg.electrons.x);
+      activation_graph.downloadResults(value_phases, value_logs, no_ratios);
+      activation_reference.downloadResults(reference_phases, reference_values, no_ratios);
+      for (std::size_t sample = 0; sample < references.size(); ++sample)
+      {
+        near(value_phases[sample], reference_phases[sample], "activation-overflow whole FP64 sign");
+        near(value_logs[sample], reference_values[sample], "activation-overflow whole FP64 value");
+      }
+
       // Failed geometry invalidates the wrapper's previous result, and RAII must
       // cancel the approximate adapter so the same prepared resource can recover.
       auto invalid = model.cfg.electrons.x;
@@ -1574,6 +1601,63 @@ int main(int argc, char** argv)
     executor.release(owner, crowd, hooks);
     executor.release(owner, second_crowd, second_hooks);
     std::cout << "PASS numerical crowd hooks: typed value/VGL, provenance, wait visibility, failure/recovery, two crowds\n";
+
+    // Production mixed crowds share one compute image but retain exclusive
+    // scratch. Publication may skip versions for a dormant released crowd.
+    {
+      const auto accepted = model.p.flat_values();
+      const auto version = model.p.version();
+      auto mixed_image = std::make_shared<PreparedDeviceModel>(plan, accepted, model.cfg.nuclei.x, version);
+      PreparedDeviceBatchBackend mixed_backend(mixed_image, {}, PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS);
+      auto warm = mixed_backend.prepare(1), dormant = mixed_backend.prepare(1);
+      const auto evaluate_mixed = [&](pf::DirectBatchTileBackendWorkspace& crowd, std::size_t current_version) {
+        return mixed_backend.evaluate(crowd, pf::DirectBatchMode::FULL_VGL,
+                                      model.cfg.electrons.x.data(), 1, current_version);
+      };
+      const auto initial = evaluate_mixed(*warm, version).logabs[0];
+      bool rejected_product = false;
+      try { (void)mixed_backend.prepareProductSession(); }
+      catch (const std::invalid_argument&) { rejected_product = true; }
+      if (!rejected_product)
+        throw std::runtime_error("Mixed production backend admitted reverse products");
+      auto candidate = accepted;
+      candidate[0] += .003;
+      bool rejected_commit = false, committed = false;
+      try
+      {
+        mixed_backend.publishParameters(candidate, version + 1,
+            [] { throw std::runtime_error("injected mixed native commit rejection"); });
+      }
+      catch (const std::runtime_error&) { rejected_commit = true; }
+      near(evaluate_mixed(*warm, version).logabs[0], initial, "mixed rejected commit retains image/cache");
+      auto invalid = candidate;
+      invalid[0] = std::numeric_limits<double>::quiet_NaN();
+      bool rejected_candidate = false;
+      try { mixed_backend.publishParameters(invalid, version + 1, [&] { committed = true; }); }
+      catch (const std::invalid_argument&) { rejected_candidate = true; }
+      if (!rejected_commit || !rejected_candidate || committed)
+        throw std::runtime_error("Mixed rejected publication reached native commit or changed accepted pair");
+      mixed_backend.publishParameters(candidate, version + 1, [&] { committed = true; });
+      (void)evaluate_mixed(*warm, version + 1);
+      mixed_backend.publishParameters(accepted, version + 2, [] {});
+      near(evaluate_mixed(*warm, version + 2).logabs[0], initial, "mixed accepted rollback cache rebind");
+      near(evaluate_mixed(*dormant, version + 2).logabs[0], initial, "mixed dormant crowd skips versions");
+      int metrics_device = 0;
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipGetDevice(&metrics_device), "mixed residency device");
+#else
+      checkRuntime(cudaGetDevice(&metrics_device), "mixed residency device");
+#endif
+      auto& metrics = deviceMemoryMetrics(metrics_device);
+      const auto before = metrics.snapshot();
+      (void)evaluate_mixed(*warm, version + 2);
+      (void)evaluate_mixed(*dormant, version + 2);
+      const auto after = metrics.snapshot();
+      if (!committed || before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls ||
+          before.live_bytes != after.live_bytes)
+        throw std::runtime_error("Warmed mixed crowds reallocated compute images or private scratch");
+      std::cout << "PASS production mixed cache publication: two crowds, failed/invalid commit, skipped versions, zero warm allocations\n";
+    }
 
     // Run the exact native batch-publication boundary used by PsiFormerWF.
     // This catches stride, active-electron and sparse-input integration mistakes

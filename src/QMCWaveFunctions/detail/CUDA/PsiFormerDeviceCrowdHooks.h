@@ -34,8 +34,10 @@ public:
   /// Construct vendor handles without allocating per-walker model images.
   PreparedDeviceCrowdHooks(std::shared_ptr<const PreparedDeviceModel> image,
                           const PsiFormerAcceleratorSharedModel& owner,
-                          std::uint64_t crowd_identity)
-      : image_(std::move(image)), owner_(owner), crowd_identity_(crowd_identity), blas_(queue_)
+                          std::uint64_t crowd_identity,
+                          std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters = {})
+      : image_(std::move(image)), mixed_parameters_(std::move(mixed_parameters)),
+        owner_(owner), crowd_identity_(crowd_identity), blas_(queue_)
   {
     if (!image_ || crowd_identity_ == 0)
       throw std::invalid_argument("Numerical crowd hooks require an image and nonzero identity");
@@ -54,7 +56,8 @@ public:
   PreparedDeviceCrowdHooks& operator=(PreparedDeviceCrowdHooks&&) = delete;
 
   /// Retarget released scratch after the shared owner commits a newer image.
-  void rebindModel(std::shared_ptr<const PreparedDeviceModel> image)
+  void rebindModel(std::shared_ptr<const PreparedDeviceModel> image,
+                   std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters = {})
   {
     if (acquired_ || recorded_ || source_ || failure_)
       throw std::logic_error("Numerical crowd rebind requires released, completed resources");
@@ -64,6 +67,12 @@ public:
         provenance.layout_fingerprint != model_provenance_.layout_fingerprint)
       throw std::logic_error("Numerical crowd successor does not match its published owner");
 
+    if (mixed_dense_)
+    {
+      if (!mixed_parameters || mixed_parameters->modelImage().get() != image.get())
+        throw std::logic_error("Numerical crowd successor has no matching mixed parameter image");
+      mixed_dense_->rebindParameters(mixed_parameters);
+    }
     // Both graphs belong to the same metadata family. These host-only rebinds
     // invalidate old products without reallocating any prepared device storage.
     if (values_)
@@ -71,6 +80,7 @@ public:
     if (spatial_)
       spatial_->rebindModel(image);
     image_ = std::move(image);
+    mixed_parameters_ = std::move(mixed_parameters);
     model_provenance_ = provenance;
     last_graph_ = nullptr;
     ready_ = false;
@@ -164,7 +174,7 @@ public:
       {
         if (event.operation == PsiFormerAcceleratorOperation::VGL)
         {
-          spatial_->evaluate(positions_);
+          evaluateGraph(*spatial_);
           last_graph_ = spatial_.get();
           ++numerical_batches_;
         }
@@ -173,7 +183,7 @@ public:
           // A VGL request already supplies values; do not run two graphs.
           if ((request_operations_ & acceleratorOperationBit(PsiFormerAcceleratorOperation::VGL)) == 0)
           {
-            values_->evaluate(positions_);
+            evaluateGraph(*values_);
             last_graph_ = values_.get();
             ++numerical_batches_;
           }
@@ -243,7 +253,29 @@ public:
   /// Count real numerical batches, not recording-only events or CPU fallbacks.
   std::size_t numericalBatches() const noexcept { return numerical_batches_; }
 
+  /// Count actual approximate successes separately from complete FP64 numerical retries.
+  std::size_t mixedBatches() const noexcept { return mixed_batches_; }
+  std::size_t mixedRetries() const noexcept { return mixed_retries_; }
+  const std::string& mixedRetryReason() const noexcept { return mixed_retry_reason_; }
+
 private:
+  /// Preserve atomic result publication while applying the explicitly selected numerical policy.
+  void evaluateGraph(PreparedDeviceInference& graph)
+  {
+    const bool retried = graph.evaluateWithFp64Retry(positions_, mixed_retry_reason_);
+    if (mixed_dense_)
+    {
+      if (retried)
+        ++mixed_retries_;
+      else
+      {
+        if (mixed_dense_->statistics().projections == 0)
+          throw std::logic_error("Mixed inference completed without an affine projection");
+        ++mixed_batches_;
+      }
+    }
+  }
+
   /// Allocate all crowd scratch/staging before any request can borrow it.
   void prepare(std::size_t capacity)
   {
@@ -251,6 +283,16 @@ private:
       throw std::logic_error("Numerical crowd preparation requires released positive capacity");
     auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY);
     auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_);
+    if (mixed_parameters_)
+    {
+      const auto rows = spatial_detail::checkedProduct(
+          spatial_detail::checkedProduct(capacity, image_->plan().modelShape().electrons(),
+                                         "Mixed crowd electron rows overflow"),
+          spatial->resultLayout().plane_count, "Mixed crowd spatial rows overflow");
+      mixed_dense_ = std::make_shared<PreparedDeviceMixedValueDense>(mixed_parameters_, rows, queue_, blas_);
+      values->setMixedDense(mixed_dense_);
+      spatial->setMixedDense(mixed_dense_);
+    }
     std::vector<double> positions, phases, jets, ratios;
     positions.reserve(spatial_detail::checkedProduct(capacity, coordinatesPerConfiguration(),
                                                    "Numerical coordinate staging overflow"));
@@ -303,6 +345,10 @@ private:
   }
 
   std::shared_ptr<const PreparedDeviceModel> image_;
+  std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
+  std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
+  std::size_t mixed_batches_ = 0, mixed_retries_ = 0;
+  std::string mixed_retry_reason_;
   const PsiFormerAcceleratorSharedModel& owner_;
   const std::uint64_t crowd_identity_;
   PsiFormerAcceleratorModelProvenance model_provenance_;

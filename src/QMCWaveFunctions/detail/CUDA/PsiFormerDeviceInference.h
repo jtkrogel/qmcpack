@@ -642,6 +642,44 @@ public:
   /// Report the graph's preparation-time or explicitly selected diagnostic policy.
   InferenceStatusPolicy statusPolicy() const noexcept { return status_policy_; }
 
+  /** Evaluate once with explicit mixed arithmetic, replaying the same complete mode in FP64 on numerical rejection.
+   * Invalid geometry, stale ownership and vendor-runtime errors are never hidden by this retry path. */
+  bool evaluateWithFp64Retry(const std::vector<double>& positions, std::string& retry_reason)
+  {
+    retry_reason.clear();
+    try
+    {
+      evaluate(positions);
+      return false;
+    }
+    catch (const MixedPrecisionRetryRequired& error)
+    {
+      if (!mixed_dense_)
+        throw;
+      retry_reason = error.what();
+    }
+    catch (const InferenceStatusError& error)
+    {
+      if (!mixed_dense_ || error.stage() == 0)
+        throw;
+      retry_reason = error.what();
+    }
+    // Private pointer detachment avoids the public setter's result invalidation
+    // after replay. The guard restores policy on both success and reference failure.
+    auto adapter = std::move(mixed_dense_);
+    try
+    {
+      evaluate(positions);
+    }
+    catch (...)
+    {
+      mixed_dense_ = std::move(adapter);
+      throw;
+    }
+    mixed_dense_ = std::move(adapter);
+    return true;
+  }
+
   /** Opt into matched approximate affine value/VGL planes; reverse tapes remain rejected.
    * Production dispatch never attaches this experimental numerical adapter implicitly. */
   void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)

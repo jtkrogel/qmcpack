@@ -774,7 +774,8 @@ __global__ void mixedValueConditioningKernel(const device_determinant::Factoriza
 } // namespace
 
 PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
-    std::shared_ptr<const PreparedDeviceModel> model, compute::Queue<PlatformKind::CUDA>& queue)
+    std::shared_ptr<const PreparedDeviceModel> model, compute::Queue<PlatformKind::CUDA>& queue,
+    bool allow_fp64_retry)
     : model_(std::move(model))
 {
   if (!model_)
@@ -809,7 +810,8 @@ PreparedDeviceMixedDenseParameters::PreparedDeviceMixedDenseParameters(
       }
   queue.sync();
   diagnostics.download(&conversion_, 1);
-  if (mixedConversionNeedsRetry(conversion_))
+  usable_ = !mixedConversionNeedsRetry(conversion_);
+  if (!usable_ && !allow_fp64_retry)
     throw MixedPrecisionRetryRequired("Mixed affine parameter conversion requires whole-graph FP64 execution");
 }
 
@@ -855,6 +857,8 @@ void PreparedDeviceMixedValueDense::beginEvaluation(const std::shared_ptr<const 
   image->validateCurrentDevice();
   diagnostics_ = {};
   statistics_ = {};
+  if (!parameters_->usable())
+    throw MixedPrecisionRetryRequired("FP32 affine weight conversion rejected; executing complete graph in FP64");
   clearMixedDeviceStorage(queue_.getNative(), device_diagnostics_.data(), sizeof(PsiFormerDeviceNumericalDiagnostics));
   active_ = true;
 }

@@ -871,8 +871,14 @@ struct PsiFormerDerivativeScratch;
  */
 std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
     const pf::PsiFormer& model, const psiformer::PsiFormerExecutionPlan& plan,
-    const psiformer::PsiFormerAcceleratorResolution& resolution)
+    const psiformer::PsiFormerAcceleratorResolution& resolution,
+    psiformer::PsiFormerPrecisionPolicy precision)
 {
+  if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+      (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
+       resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU ||
+       plan.environment().boundary != psiformer::BoundaryCondition::OPEN))
+    throw std::invalid_argument("Explicit mixed PsiFormer precision requires an open-real GPU inference model");
   if (resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU)
     return {};
 #ifdef ENABLE_CUDA
@@ -886,7 +892,7 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
     app_log() << "  PsiFormer numerical device tile completed: backend="
               << psiformer::psiFormerAcceleratorBackendName(backend)
               << ", parameter_version=" << version << ", CPU fallback=no" << std::endl;
-  });
+  }, precision);
 #else
   throw std::invalid_argument("PsiFormer numerical device tiles are not compiled in this executable");
 #endif
@@ -901,11 +907,12 @@ public:
   PsiFormerSharedState(
       const std::string& parameters,
       const std::string& configuration,
-      psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+      psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+      psiformer::PsiFormerPrecisionPolicy precision)
       : PsiFormerSharedState([&]() {
           validateProductionAcceleratorResolution(accelerator_resolution);
           return pf::PsiFormer(parameters, configuration);
-        }(), "hdf5", "external_hdf5", 0, {}, {}, accelerator_resolution)
+        }(), "hdf5", "external_hdf5", 0, {}, {}, accelerator_resolution, precision)
   {}
 
   /// Load and retarget a periodic import against explicit runtime particle sets.
@@ -914,7 +921,8 @@ public:
                        const ParticleSet& electrons,
                        const ParticleSet& ions,
                        std::array<double, 3> reduced_twist,
-                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                       psiformer::PsiFormerPrecisionPolicy precision)
       : PsiFormerSharedState([&]() {
           validateProductionAcceleratorResolution(accelerator_resolution);
           validateMatchingLattices(electrons, ions);
@@ -923,7 +931,7 @@ public:
           retargetPeriodicNuclei(model, ions, environment);
           return model;
         }(), "hdf5", "external_hdf5", 0, makeExecutionEnvironment(electrons),
-            makeTwistPhase(electrons, reduced_twist), accelerator_resolution)
+            makeTwistPhase(electrons, reduced_twist), accelerator_resolution, precision)
   {}
 
   /// Materialize a fresh in-memory model and retain its reproducibility provenance.
@@ -931,23 +939,25 @@ public:
                        const ParticleSet& electrons,
                        const ParticleSet& ions,
                        std::array<double, 3> reduced_twist,
-                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                       psiformer::PsiFormerPrecisionPolicy precision)
       : PsiFormerSharedState([&]() {
           validateProductionAcceleratorResolution(accelerator_resolution);
           return makeInitializedNativeModel(std::move(initialized), electrons, ions);
         }(), makeExecutionEnvironment(electrons),
-            makeTwistPhase(electrons, reduced_twist), accelerator_resolution)
+            makeTwistPhase(electrons, reduced_twist), accelerator_resolution, precision)
   {}
 
   /// Take ownership of a converted initialized model without copying its flat parameters.
   PsiFormerSharedState(InitializedNativeModel initialized,
                        psiformer::ExecutionEnvironment environment,
                        PsiFormerTwistPhase twist_phase,
-                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                       psiformer::PsiFormerPrecisionPolicy precision)
       : PsiFormerSharedState(std::move(initialized.model), "internal",
                              std::move(initialized.profile), initialized.seed,
                              std::move(environment), std::move(twist_phase),
-                             accelerator_resolution)
+                             accelerator_resolution, precision)
   {}
 
   /// Complete shared executor construction for imported and internally initialized models.
@@ -957,8 +967,10 @@ public:
                        std::uint64_t seed,
                        psiformer::ExecutionEnvironment environment,
                        PsiFormerTwistPhase twist_phase,
-                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                       psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                       psiformer::PsiFormerPrecisionPolicy precision)
       : accelerator_resolution(validateProductionAcceleratorResolution(accelerator_resolution)),
+        precision(precision),
         model(std::move(model_input)),
         model_origin(std::move(origin)),
         initialization_profile(std::move(profile)),
@@ -980,7 +992,7 @@ public:
              /*attention_blocks=*/model.blocks}, std::move(environment))),
         direct_value_executor(model, execution_plan),
         direct_spatial_executor(model, direct_value_executor, execution_plan),
-        numerical_tile_backend(makePsiFormerNumericalTiles(model, execution_plan, this->accelerator_resolution)),
+        numerical_tile_backend(makePsiFormerNumericalTiles(model, execution_plan, this->accelerator_resolution, precision)),
         direct_batch_executor(direct_value_executor, direct_spatial_executor, numerical_tile_backend),
         direct_score_executor(model, execution_plan),
         direct_kinetic_executor(model, execution_plan),
@@ -1037,6 +1049,8 @@ public:
   std::atomic<std::size_t> planned_selected_transaction_count{0};
   /// Immutable resolved production route shared by every component clone.
   const psiformer::PsiFormerAcceleratorResolution accelerator_resolution;
+  /// Immutable numerical policy, preserved across clones and candidate isolation.
+  const psiformer::PsiFormerPrecisionPolicy precision;
   pf::PsiFormer model;
   /// Whether the initial model came from the legacy HDF5 import or an internal initializer.
   const std::string model_origin;
@@ -5111,10 +5125,11 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          std::vector<std::size_t> selected_flat_indices,
                          bool optimize_all,
                          std::string optimized_parameter_export,
-                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                         psiformer::PsiFormerPrecisionPolicy precision)
     : PsiFormerWF(std::move(name),
                   std::make_shared<PsiFormerSharedState>(parameters, configuration,
-                                                         accelerator_resolution),
+                                                         accelerator_resolution, precision),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {}
@@ -5130,11 +5145,12 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          bool optimize_all,
                          std::string optimized_parameter_export,
                          std::array<double, 3> reduced_twist,
-                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                         psiformer::PsiFormerPrecisionPolicy precision)
     : PsiFormerWF(std::move(name),
                   std::make_shared<PsiFormerSharedState>(parameters, configuration,
                                                         electrons, ions, reduced_twist,
-                                                        accelerator_resolution),
+                                                        accelerator_resolution, precision),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {
@@ -5151,10 +5167,11 @@ PsiFormerWF::PsiFormerWF(std::string name,
                          bool optimize_all,
                          std::string optimized_parameter_export,
                          std::array<double, 3> reduced_twist,
-                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution)
+                         psiformer::PsiFormerAcceleratorResolution accelerator_resolution,
+                         psiformer::PsiFormerPrecisionPolicy precision)
     : PsiFormerWF(std::move(name),
                   std::make_shared<PsiFormerSharedState>(std::move(initialized_parameters), electrons, ions,
-                                                        reduced_twist, accelerator_resolution),
+                                                        reduced_twist, accelerator_resolution, precision),
                   enable_optimization, std::move(selected_flat_indices), optimize_all,
                   std::move(optimized_parameter_export))
 {
@@ -5175,6 +5192,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
           makeStructuredParameterSchema(name, model_state_->model.p)),
       optimized_parameter_export_(std::move(optimized_parameter_export))
 {
+  if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && enable_optimization)
+    throw std::invalid_argument("Mixed PsiFormer precision is inference-only; optimize=yes is unsupported");
   if (!enable_optimization && !selected_flat_indices.empty())
     throw std::invalid_argument("PsiFormer optimize_indices requires optimize=yes");
   if (enable_optimization && model_state_->numerical_tile_backend &&
@@ -6210,7 +6229,7 @@ void PsiFormerWF::isolateParameterState()
   model_state_ = std::make_shared<PsiFormerSharedState>(
       std::move(independent_model), original->model_origin, original->initialization_profile,
       original->initialization_seed, original->execution_plan.environment(),
-      original->twist_phase, original->accelerator_resolution);
+      original->twist_phase, original->accelerator_resolution, original->precision);
   invalidateParameterCaches(model_state_->model.p.version());
 }
 

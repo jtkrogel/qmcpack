@@ -170,6 +170,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
   std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
   std::string optimize = "no", optimize_scope = "indices", optimize_indices, gpu = "no";
+  std::string precision_text = "fp64_reference";
   ParticleSet::PosType reduced_twist(0.0);
 
   // Both files use the compact export format consumed by PsiFormerNative.h.
@@ -189,6 +190,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(optimize_scope, "optimize_scope");
   attributes.add(optimize_indices, "optimize_indices");
   attributes.add(gpu, "gpu");
+  attributes.add(precision_text, "precision");
   attributes.put(cur);
 
   // OhmmsAttributeSet tokenizes std::string values at whitespace. Read this
@@ -200,6 +202,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   // file. Strict requests therefore fail without HDF5 or ParticleSet effects;
   // auto records an explicit CPU fallback for unsupported operations/geometries.
   const bool optimization_enabled = parseOptimizationFlag(optimize);
+  const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
   const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
       resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
@@ -257,6 +260,12 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   if (nonzero_twist && !periodic)
     throw std::invalid_argument("A nonzero PsiFormer twist requires a 3D bulk periodic cell");
+  if (precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+      (precision != psiformer::PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS ||
+       accelerator_resolution.backend == psiformer::PsiFormerAcceleratorBackend::CPU ||
+       optimization_enabled || periodic || nonzero_twist || !particle_twist_is_zero))
+    throw std::invalid_argument(
+        "precision=fp32_dense_fp64_islands requires open-real GPU inference, optimize=no and zero twist");
   if (has_explicit_twist)
   {
     constexpr double twist_tolerance = 128.0 * std::numeric_limits<double>::epsilon();
@@ -373,18 +382,18 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     component = std::make_unique<PsiFormerWF>(
         name, std::move(initialized), targetPtcl, *source_particles, optimization_enabled,
         std::move(selected_indices), optimize_all, export_parameters, twist_array,
-        accelerator_resolution);
+        accelerator_resolution, precision);
   }
   else if (periodic)
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, targetPtcl,
                                               *source_particles, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
                                               export_parameters, twist_array,
-                                              accelerator_resolution);
+                                              accelerator_resolution, precision);
   else
     component = std::make_unique<PsiFormerWF>(name, parameters, configuration, optimization_enabled,
                                               std::move(selected_indices), optimize_all,
-                                              export_parameters, accelerator_resolution);
+                                              export_parameters, accelerator_resolution, precision);
 
   if (system != "auto")
     component->validateSystem(targetPtcl, *source_particles, system);
