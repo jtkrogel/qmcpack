@@ -717,6 +717,38 @@ TEST_CASE("Host-staged accelerator reduction matches complex global sums",
           Catch::Approx(global_factor * static_cast<double>(parameter + 1)));
 }
 
+TEST_CASE("Host-staged accelerator reduction rejects nonfinite device contributions",
+          "[drivers][training][accelerator][host_staged][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  const auto rank = static_cast<std::size_t>(communicator.rank());
+  const auto participants = static_cast<std::size_t>(communicator.size());
+  AcceleratorRankPlanInput local{rank, participants, rank / 2, rank % 2, 1,
+      std::size_t{4096}, 128, 2, 7, 101, 202, false};
+  DistributedParameterReduction preflight(communicator, {2});
+  const auto plan = preflight.preflightAcceleratorPlan(local, 5, sizeof(DerivativeValue),
+      AcceleratorTransportRequest::HOST_STAGED_MPI, 2);
+  std::array<std::vector<DerivativeValue>, 2> storage{
+      std::vector<DerivativeValue>(plan.chunk_elements), std::vector<DerivativeValue>(plan.chunk_elements)};
+  const std::array<AcceleratorHostStagingSlot, 2> slots{{
+      {storage[0].data(), storage[0].size()}, {storage[1].data(), storage[1].size()}}};
+  HostMemoryCopyQueue queue;
+  HostStagedAcceleratorReduction reduction(communicator, plan, queue, slots);
+  std::vector<DerivativeValue> values(5, DerivativeValue(1, -0.5));
+
+  // Only the last rank injects a NaN, in the one-element final chunk. This
+  // exercises admission after earlier chunks have already completed reductions.
+  if (rank == participants - 1)
+    values.back() = DerivativeValue(std::numeric_limits<double>::quiet_NaN(), 0);
+  CHECK_THROWS(reduction.reduceComplexVector(values.data(), values.size(), plan.fingerprint,
+                                              plan.parameter_version));
+  CHECK(reduction.state().iterationState() == AcceleratorCollectiveIterationState::IDLE);
+  std::fill(values.begin(), values.end(), DerivativeValue(1, -0.5));
+  CHECK_NOTHROW(reduction.reduceComplexVector(values.data(), values.size(), plan.fingerprint,
+                                               plan.parameter_version));
+  CHECK(values.back().real() == Catch::Approx(static_cast<double>(participants)));
+}
+
 TEST_CASE("Host-staged accelerator reduction reports post-collective copy failure",
           "[drivers][training][accelerator][host_staged][mpi]")
 {

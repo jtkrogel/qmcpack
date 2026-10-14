@@ -10,6 +10,7 @@
  */
 
 #include "QMCDrivers/WFTrain/HostStagedAcceleratorReduction.h"
+#include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include "Message/CommOperators.h"
 #include "Message/Communicate.h"
@@ -33,7 +34,8 @@ constexpr std::uint64_t host_staged_contract = UINT64_C(0x4853544147454431); // 
 bool allFinite(const DerivativeValue* values, std::size_t count) noexcept
 {
   return std::all_of(values, values + count, [](DerivativeValue value) {
-    return std::isfinite(value.real()) && std::isfinite(value.imag());
+    // Release builds enable fast-math; std::isfinite may otherwise disappear.
+    return isFiniteTrainingReal(value.real()) && isFiniteTrainingReal(value.imag());
   });
 }
 

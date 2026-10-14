@@ -92,6 +92,7 @@ set(DRIVER_TEST_SRC
     test_WFOptDriverInput.cpp)
 list(APPEND DRIVER_TEST_SRC test_HighParameterTraining.cpp)
 list(APPEND DRIVER_TEST_SRC test_AcceleratorTrainingPlan.cpp)
+list(APPEND DRIVER_TEST_SRC test_AcceleratorRuntimePlacement.cpp)
 list(APPEND DRIVER_TEST_SRC test_AcceleratorCollectiveState.cpp)
 list(APPEND DRIVER_TEST_SRC test_AcceleratorCollectiveRecording.cpp)
 list(APPEND DRIVER_TEST_SRC test_QuantileClipping.cpp)
@@ -135,6 +136,10 @@ if(ENABLE_CUDA)
   add_executable(accelerator_collective_copy_link_check
                  accelerator_collective_copy_link_check.cpp)
   target_link_libraries(accelerator_collective_copy_link_check qmcdriver)
+  # Opt-in runtime validation: execute only with one MPI rank per physical GPU.
+  # Keep it separate from driverless/CPU tests and GPU-less default CI suites.
+  add_executable(psiformer_device_collective_validation test_AcceleratorDeviceCollective.cpp)
+  target_link_libraries(psiformer_device_collective_validation catch_main qmcdriver minimal_test_pools)
 endif()
 
 if(HAVE_MPI)

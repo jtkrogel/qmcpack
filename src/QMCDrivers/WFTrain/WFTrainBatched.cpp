@@ -18,6 +18,7 @@
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
+#include "QMCDrivers/WFTrain/AcceleratorRuntimePlacement.h"
 #include "QMCDrivers/WFTrain/MatrixFreeOperator.h"
 #include "QMCDrivers/WFTrain/SampledLinearMethod.h"
 #include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
@@ -983,6 +984,10 @@ void WFTrainBatched::process(xmlNodePtr node)
         throw UniformCommunicateError("WFTrainBatched: no structured parameter provider named " +
                                       requested_provider);
     }
+
+    // Visible device ordinals may differ under rank-local GPU masks. Agree on
+    // physical identities before sampling or entering optimizer collectives.
+    wftrain::agreeAcceleratorRuntimePlacement(*myComm, selected_provider_->usesAcceleratorParameterProducts());
 
     const AdjustedWalkerCounts walker_counts = adjustGlobalWalkerCount(
         *myComm, walker_configs_ref_.getActiveWalkers(), qmcdriver_input_.get_total_walkers(),
