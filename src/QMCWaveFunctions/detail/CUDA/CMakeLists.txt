@@ -16,6 +16,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceDense.cu
     PsiFormerDeviceDerivativeKernels.cu
     PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDeviceSpatialTraces.cu
     PsiFormerDevicePrecision.cu
     PsiFormerDeviceSpatial.cu
     PsiFormerDeviceSpatialReverse.cu
@@ -32,6 +33,13 @@ target_link_libraries(qmcwfs_cuda PRIVATE platform_LA)
 # unit.  CMake changes only the source language, so CUDA and HIP cannot drift into
 # separate mathematical implementations.
 add_library(psiformer_device STATIC ${PSIFORMER_DEVICE_SRCS})
+# Compensation requires rounded products/additions rather than reassociation.
+# Keep this leaf strict even when a parent Release policy enables fast math.
+set_property(SOURCE PsiFormerDeviceSpatialTraces.cu APPEND PROPERTY COMPILE_OPTIONS
+    $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math>)
 if(QMC_CUDA2HIP)
   set_source_files_properties(${PSIFORMER_DEVICE_SRCS} PROPERTIES LANGUAGE HIP)
 else()
@@ -108,9 +116,21 @@ else()
 endif()
 target_link_libraries(psiformer_device_benchmark PRIVATE psiformer_device IO::HDF5 platform_LA)
 
+# Standalone bounded trace algebra/performance check, independent of full VGL.
+add_executable(psiformer_device_spatial_trace_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceSpatialTraceValidation.cu
+               # The linked CUDA library also owns canonical-plan dense helpers.
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp)
+if(QMC_CUDA2HIP)
+  set_source_files_properties(PsiFormerDeviceSpatialTraceValidation.cu PROPERTIES LANGUAGE HIP)
+else()
+  set_target_properties(psiformer_device_spatial_trace_validation PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(psiformer_device_spatial_trace_validation PRIVATE psiformer_device Boost::boost)
+
 # Correctness oracles must retain IEEE NaN/infinity semantics even when the
 # application's Release flags use fast-math. Library kernel policy is unchanged.
-foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark)
+foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation)
   target_compile_options(${validation_target} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
