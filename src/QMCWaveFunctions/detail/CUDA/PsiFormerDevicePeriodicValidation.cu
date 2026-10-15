@@ -12,6 +12,11 @@
  * the original open-only native graph is deliberately not used as an oracle.
  */
 #define PSIFORMER_LIBRARY
+// Guard the scalar cores' SDK-free include contract before native/runtime headers.
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceMath.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceDeterminantMath.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerDeviceDerivativeMath.h"
+
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"

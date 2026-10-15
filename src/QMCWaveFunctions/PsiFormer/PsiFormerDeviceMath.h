@@ -20,7 +20,11 @@
 #include <cstddef>
 #include <cstdint>
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+// HIP's SDK defines __forceinline__; these scalar cores must also work before it.
+#if defined(__HIPCC__)
+#define QMC_PF_HOST_DEVICE __host__ __device__
+#define QMC_PF_FORCE_INLINE inline __attribute__((always_inline))
+#elif defined(__CUDACC__)
 #define QMC_PF_HOST_DEVICE __host__ __device__
 #define QMC_PF_FORCE_INLINE __forceinline__
 #else
