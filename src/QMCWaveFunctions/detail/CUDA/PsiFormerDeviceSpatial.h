@@ -129,9 +129,19 @@ Error launchFinalSpatialCombination(
     double* laplacian_ratio,
     OpenSpatialStatus* status);
 
+/** Project feature jets into an already admitted retained backflow destination.
+ * Uses existing strided dense GEMM adapters without packing or temporary storage.
+ * The caller binds the BLAS handle to the subsequent product-kernel stream.
+ */
+void projectOpenOrbitalJets(AcceleratorBlasHandle& handle, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* backflow_up, const double* backflow_down,
+    double* projected_backflow);
+
 /** Build orbital jets, optionally retaining ordinary B and E factors separately.
  * Retained buffers are paired, distinct, and use the complete orbital jet layout
  * [configuration,plane,D,N,N], matching the requested value-only or full-VGL mode.
+ * A non-null projected_backflow skips scalar feature contractions; it may equal
+ * retained_backflow, but must be distinct from output and retained_envelope.
  */
 Error launchOpenOrbitalJets(Stream stream,
                             const OpenOrbitalJetLayout& layout,
@@ -148,7 +158,8 @@ Error launchOpenOrbitalJets(Stream stream,
                             double* output,
                             OpenSpatialStatus* status,
                             double* retained_backflow = nullptr,
-                            double* retained_envelope = nullptr);
+                            double* retained_envelope = nullptr,
+                            const double* projected_backflow = nullptr);
 
 /// Build real Gamma-periodic orbital jets and optional retained product factors.
 Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
@@ -157,7 +168,8 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
     const double* backflow_down, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
     double* output, OpenSpatialStatus* status,
-    double* retained_backflow = nullptr, double* retained_envelope = nullptr);
+    double* retained_backflow = nullptr, double* retained_envelope = nullptr,
+    const double* projected_backflow = nullptr);
 
 } // namespace qmcplusplus::psiformer::device
 

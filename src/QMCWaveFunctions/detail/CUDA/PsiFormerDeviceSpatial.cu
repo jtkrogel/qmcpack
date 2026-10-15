@@ -10,6 +10,7 @@
  */
 
 #include "PsiFormerDeviceSpatial.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalProjection.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 
 #include <limits>
@@ -235,7 +236,8 @@ __global__ void boundaryOrbitalJetsKernel(OpenOrbitalJetLayout layout,
                                       OpenSpatialStatus* status,
                                       double* retained_backflow,
                                       double* retained_envelope,
-                                      periodic_geometry::Cell cell)
+                                      periodic_geometry::Cell cell,
+                                      const double* projected_backflow)
 {
   const std::size_t logical = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t electron_count = layout.features.electron_count;
@@ -253,7 +255,7 @@ __global__ void boundaryOrbitalJetsKernel(OpenOrbitalJetLayout layout,
       pi_up, pi_down, zeta_up, zeta_down, configuration,
       active_electrons[configuration], determinant,
       matrix_element / electron_count, matrix_element % electron_count, output,
-      retained_backflow, retained_envelope, periodic ? &cell : nullptr);
+      retained_backflow, retained_envelope, periodic ? &cell : nullptr, projected_backflow);
 }
 
 } // namespace
@@ -630,6 +632,25 @@ Error launchFinalSpatialCombination(
   return peekSpatialLaunchError();
 }
 
+// Reuse the retained factor allocation: each GEMM writes its logical tile only.
+void projectOpenOrbitalJets(AcceleratorBlasHandle& handle, const OpenOrbitalJetLayout& layout,
+    const double* features, const double* backflow_up, const double* backflow_down,
+    double* projected_backflow)
+{
+  validateOpenOrbitalJetLayout(layout);
+  if (!features || !projected_backflow || projected_backflow == features ||
+      projected_backflow == backflow_up || projected_backflow == backflow_down ||
+      (layout.spin_up_count != 0 && !backflow_up) ||
+      (layout.spin_up_count != layout.features.electron_count && !backflow_down))
+    throw std::invalid_argument("PsiFormer orbital projection requires distinct valid storage");
+
+  forEachOpenOrbitalProjection(layout, [&](const OpenOrbitalProjectionSlice& slice) {
+    const double* weight = slice.spin_up ? backflow_up : backflow_down;
+    denseForward(handle, slice.dense, features + slice.source_offset,
+        weight + slice.weight_offset, projected_backflow + slice.target_offset);
+  });
+}
+
 Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
                             const double* features, const double* positions,
                             const double* nuclei, const double* backflow_up,
@@ -639,7 +660,8 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
                             const std::size_t* active_electrons, double* output,
                             OpenSpatialStatus* status,
                             double* retained_backflow,
-                            double* retained_envelope)
+                            double* retained_envelope,
+                            const double* projected_backflow)
 {
   if (layout.features.configuration_count == 0 &&
       layout.determinant_count == 0 && layout.features.electron_count == 0)
@@ -649,6 +671,8 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
       (retained_backflow && (retained_backflow == retained_envelope ||
                             retained_backflow == output || retained_envelope == output)))
     throw std::invalid_argument("Retained orbital factors require distinct paired destinations");
+  if (projected_backflow && (projected_backflow == output || projected_backflow == retained_envelope))
+    throw std::invalid_argument("Projected backflow must be distinct from product and envelope storage");
   const bool need_up = layout.spin_up_count != 0;
   const bool need_down = layout.spin_up_count != layout.features.electron_count;
   if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
@@ -661,7 +685,7 @@ Error launchOpenOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layout,
   boundaryOrbitalJetsKernel<false><<<blocks, spatial_block_size, 0, stream>>>(
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
-      retained_backflow, retained_envelope, {});
+      retained_backflow, retained_envelope, {}, projected_backflow);
   return peekSpatialLaunchError();
 }
 
@@ -670,7 +694,8 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
     const double* positions, const double* nuclei, const double* backflow_up,
     const double* backflow_down, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, const std::size_t* active_electrons,
-    double* output, OpenSpatialStatus* status, double* retained_backflow, double* retained_envelope)
+    double* output, OpenSpatialStatus* status, double* retained_backflow, double* retained_envelope,
+    const double* projected_backflow)
 {
   if (layout.features.configuration_count == 0 &&
       layout.determinant_count == 0 && layout.features.electron_count == 0)
@@ -681,6 +706,8 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
       (retained_backflow && (retained_backflow == retained_envelope ||
                             retained_backflow == output || retained_envelope == output)))
     throw std::invalid_argument("Retained orbital factors require distinct paired destinations");
+  if (projected_backflow && (projected_backflow == output || projected_backflow == retained_envelope))
+    throw std::invalid_argument("Projected backflow must be distinct from product and envelope storage");
   const bool need_up = layout.spin_up_count != 0;
   const bool need_down = layout.spin_up_count != layout.features.electron_count;
   if (!features || !positions || !nuclei || !active_electrons || !output || !status ||
@@ -692,7 +719,7 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
   boundaryOrbitalJetsKernel<true><<<blocks, spatial_block_size, 0, stream>>>(
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
-      retained_backflow, retained_envelope, cell);
+      retained_backflow, retained_envelope, cell, projected_backflow);
   return peekSpatialLaunchError();
 }
 

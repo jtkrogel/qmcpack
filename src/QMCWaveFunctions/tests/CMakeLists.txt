@@ -521,6 +521,29 @@ add_unit_test(deterministic-unit_test_psiformer_device_attention
 set_tests_properties(deterministic-unit_test_psiformer_device_attention
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# Exercise the orbital slice scheduler through the real CPU BLAS adapter.
+add_executable(test_psiformer_orbital_projection test_psiformer_orbital_projection.cpp)
+target_link_libraries(test_psiformer_orbital_projection qmc_external_catch2 platform_cpu_LA)
+target_include_directories(test_psiformer_orbital_projection PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src"
+                           "${qmcpack_SOURCE_DIR}/src/Platforms")
+add_unit_test(deterministic-unit_test_psiformer_orbital_projection
+              1 1 $<TARGET_FILE:test_psiformer_orbital_projection>)
+set_tests_properties(deterministic-unit_test_psiformer_orbital_projection
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
+# This independent complex algebra executable supplies its own main and checks
+# exact nodes and IEEE nonfinite admission without the application libraries.
+add_executable(test_psiformer_complex_determinant test_psiformer_complex_determinant.cpp)
+target_compile_options(test_psiformer_complex_determinant PRIVATE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
+target_include_directories(test_psiformer_complex_determinant PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_complex_determinant
+              1 1 $<TARGET_FILE:test_psiformer_complex_determinant>)
+set_tests_properties(deterministic-unit_test_psiformer_complex_determinant
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_device_mixed_precision
                test_psiformer_device_mixed_precision.cpp)
 target_link_libraries(test_psiformer_device_mixed_precision qmc_external_catch2)
