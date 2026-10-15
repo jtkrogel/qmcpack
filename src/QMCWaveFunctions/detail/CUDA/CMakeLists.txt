@@ -17,6 +17,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceDerivativeKernels.cu
     PsiFormerDeviceCoordinateGradient.cu
     PsiFormerDeviceDeterminantKernels.cu
+    PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceSpatialTraces.cu
     PsiFormerDevicePrecision.cu
     PsiFormerDeviceSpatial.cu
@@ -36,7 +37,7 @@ target_link_libraries(qmcwfs_cuda PRIVATE platform_LA)
 add_library(psiformer_device STATIC ${PSIFORMER_DEVICE_SRCS})
 # Compensation requires rounded products/additions rather than reassociation.
 # Keep this leaf strict even when a parent Release policy enables fast math.
-set_property(SOURCE PsiFormerDeviceSpatialTraces.cu APPEND PROPERTY COMPILE_OPTIONS
+set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceLiftedDeterminantProducts.cu APPEND PROPERTY COMPILE_OPTIONS
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
@@ -129,9 +130,20 @@ else()
 endif()
 target_link_libraries(psiformer_device_spatial_trace_validation PRIVATE psiformer_device Boost::boost)
 
+# One bounded numerical owner, independent of the complete kinetic provider.
+add_executable(psiformer_device_lifted_products_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceLiftedDeterminantProductValidation.cu
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp)
+if(QMC_CUDA2HIP)
+  set_source_files_properties(PsiFormerDeviceLiftedDeterminantProductValidation.cu PROPERTIES LANGUAGE HIP)
+else()
+  set_target_properties(psiformer_device_lifted_products_validation PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(psiformer_device_lifted_products_validation PRIVATE psiformer_device)
+
 # Correctness oracles must retain IEEE NaN/infinity semantics even when the
 # application's Release flags use fast-math. Library kernel policy is unchanged.
-foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation)
+foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation psiformer_device_lifted_products_validation)
   target_compile_options(${validation_target} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
