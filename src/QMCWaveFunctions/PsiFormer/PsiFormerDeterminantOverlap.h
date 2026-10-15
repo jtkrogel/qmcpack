@@ -73,6 +73,14 @@ struct DeterminantOverlapMomentSnapshot
 namespace overlap_detail
 {
 
+/** Recognize the canonical zero log-magnitude under finite-math-only builds. */
+inline bool isNegativeInfinity(double value) noexcept
+{
+  std::uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits == UINT64_C(0xfff0000000000000);
+}
+
 /** Classify a binary64 value even in QMCPACK's finite-math-only release builds. */
 inline bool isFinite(double value) noexcept
 {
@@ -156,7 +164,7 @@ inline void validateAmplitude(RealSignedLogAmplitude amplitude, const char* desc
 {
   if (amplitude.phase == 0.0)
   {
-    if (amplitude.log_abs != -std::numeric_limits<double>::infinity())
+    if (!isNegativeInfinity(amplitude.log_abs))
       throw std::invalid_argument(std::string("PsiFormer overlap ") + description +
                                   " has a noncanonical zero");
     return;

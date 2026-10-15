@@ -780,6 +780,12 @@ TEST_CASE("PsiFormer determinant overlap rejects nodes cancellation and bad life
   const RealSignedLogAmplitude one{1.0, 0.0};
   const RealSignedLogAmplitude zero{};
   CHECK_THROWS_AS(accumulator.addSample(zero, &one, &one, 1), std::domain_error);
+  for (double malformed_log : {std::numeric_limits<double>::infinity(), 0.0,
+                               std::numeric_limits<double>::quiet_NaN()})
+  {
+    const RealSignedLogAmplitude malformed_zero{0.0, malformed_log};
+    CHECK_THROWS_AS(accumulator.addSample(malformed_zero, &one, &one, 1), std::invalid_argument);
+  }
   CHECK_THROWS_AS(accumulator.finalize(), std::domain_error);
 
   accumulator.addSample(one, &one, &one, 1);
