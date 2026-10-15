@@ -534,6 +534,7 @@ public:
 
 private:
   friend class PreparedDeviceTargetKinetic;
+  friend class PreparedDeviceMetropolis;
   friend class PreparedDeviceKineticReverse;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.

@@ -33,6 +33,8 @@ class PreparedDeviceInference;
 
 class PreparedDeviceCoordinates;
 
+class PreparedDeviceMetropolis;
+
 namespace coordinate_detail
 {
 /** Keep allocation and mutation synchronized without retaining parameter values. */
@@ -202,6 +204,7 @@ public:
 
 private:
   friend class PreparedDeviceModel;
+  friend class PreparedDeviceMetropolis;
 
   /// Bind trusted physical/layout metadata through the model's named preparation.
   PreparedDeviceCoordinates(std::shared_ptr<const PreparedDeviceModelMetadata> family,

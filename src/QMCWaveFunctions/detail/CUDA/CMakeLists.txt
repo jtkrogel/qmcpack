@@ -16,6 +16,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceDense.cu
     PsiFormerDeviceDerivativeKernels.cu
     PsiFormerDeviceCoordinateGradient.cu
+    PsiFormerDeviceMetropolisKernels.cu
     PsiFormerDeviceDeterminantKernels.cu
     PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceSpatialTraces.cu
@@ -35,9 +36,11 @@ target_link_libraries(qmcwfs_cuda PRIVATE platform_LA)
 # unit.  CMake changes only the source language, so CUDA and HIP cannot drift into
 # separate mathematical implementations.
 add_library(psiformer_device STATIC ${PSIFORMER_DEVICE_SRCS})
-# Compensation requires rounded products/additions rather than reassociation.
+# Compensation and injected proposal parity require rounded products/additions,
+# not reassociation or fused coordinate updates.
 # Keep this leaf strict even when a parent Release policy enables fast math.
-set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceLiftedDeterminantProducts.cu APPEND PROPERTY COMPILE_OPTIONS
+set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceLiftedDeterminantProducts.cu
+    PsiFormerDeviceMetropolisKernels.cu APPEND PROPERTY COMPILE_OPTIONS
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>

@@ -36,6 +36,7 @@
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include "PsiFormerDeviceKineticContractionValidation.h"
 #include "PsiFormerDeviceCoordinatesValidation.h"
+#include "PsiFormerDeviceMetropolisValidation.h"
 
 #include <fstream>
 #include <iostream>
@@ -129,7 +130,7 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] "
+                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--metropolis-only] "
                                   "[--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
@@ -140,6 +141,7 @@ int main(int argc, char** argv)
     bool coordinate_only = false;
     bool device_coordinates_only = false;
     bool target_kinetic_spot = false;
+    bool metropolis_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -157,6 +159,8 @@ int main(int argc, char** argv)
         device_coordinates_only = true;
       else if (option == "--target-kinetic-spot" && !target_kinetic_spot)
         target_kinetic_spot = true;
+      else if (option == "--metropolis-only" && !metropolis_only)
+        metropolis_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -188,9 +192,12 @@ int main(int argc, char** argv)
     if (coordinate_only && (cpu_only || !score_output.empty() || !jvp_output.empty() ||
         !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Coordinate-only validation cannot request CPU-only or parameter exports");
-    if (target_kinetic_spot && (cpu_only || coordinate_only || device_coordinates_only ||
+    if (target_kinetic_spot && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
         !score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("TARGET kinetic spot cannot request other modes or exports");
+    if (metropolis_only && (cpu_only || coordinate_only || device_coordinates_only || target_kinetic_spot ||
+        !score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
+      throw std::invalid_argument("Metropolis-only validation cannot request other modes or exports");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
@@ -224,8 +231,9 @@ int main(int argc, char** argv)
         throw std::runtime_error("Cannot write TARGET kinetic spot output");
       return 0;
     }
-    const auto references = cpuReferences(model, plan, coordinate_only ? 3 : 0);
-    writeReferences(argv[3], references);
+    const auto references = metropolis_only ? std::vector<Reference>{} : cpuReferences(model, plan, coordinate_only ? 3 : 0);
+    if (!metropolis_only)
+      writeReferences(argv[3], references);
     if (cpu_only)
     {
       std::cout << "PASS CPU direct VGL/native oracle; GPU model validation NOT_RUN\n";
@@ -244,6 +252,17 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
+    if (metropolis_only)
+    {
+      // No broad CPU/GPU reference matrix or production sampler is constructed here.
+      const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+      validateDeviceMetropolis(model, image, queue, handle);
+      std::ofstream output(argv[3]);
+      output << "PASS injected numerical Metropolis; costs/transfers in stdout; XML/RNG/Hamiltonian not integrated\n";
+      if (!output)
+        throw std::runtime_error("Cannot save injected Metropolis qualification result");
+      return 0;
+    }
     if (device_coordinates_only)
     {
       // Qualify only the typed source contract, without the broad model matrix.
