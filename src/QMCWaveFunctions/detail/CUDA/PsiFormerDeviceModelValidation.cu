@@ -32,6 +32,7 @@
 #include "PsiFormerDeviceNonlocalResponse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
+#include "PsiFormerDeviceTargetCostValidation.h"
 #include "PsiFormerDeviceKineticContractionValidation.h"
 
 #include <fstream>
@@ -118,8 +119,14 @@ int main(int argc, char** argv)
 {
   try
   {
+    // Keep metadata qualification before fixtures and every device/runtime query.
+    if (argc == 2 && std::string(argv[1]) == "--target-cost-check")
+    {
+      validateTargetCosts();
+      return 0;
+    }
     if (argc < 4)
-      throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
+      throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
                                   "[--cpu-only] [--coordinate-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
