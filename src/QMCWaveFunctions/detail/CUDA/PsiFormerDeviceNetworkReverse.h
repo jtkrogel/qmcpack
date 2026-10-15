@@ -9,8 +9,9 @@
  *
  * This is a numerical building block, not a complete log-wavefunction score
  * provider. Orbital, envelope, determinant and cusp seeds belong to the caller.
- * One O(P) destination contracts all seeded configurations without a B-by-P
- * Jacobian. Model/tape lifetimes are retained; stream/BLAS ownership is external.
+ * Parameter mode contracts into one O(P) destination without a B-by-P Jacobian.
+ * Raw-input mode omits that destination and all parameter-adjoint contractions.
+ * Model/tape lifetimes are retained; stream/BLAS ownership is external.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_NETWORK_REVERSE_H
@@ -22,6 +23,26 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/// Select the destination before allocating the reverse owner.
+enum class NetworkReverseOutput
+{
+  PARAMETER_SCORE,
+  RAW_FEATURE_ADJOINT_ONLY
+};
+
+/** Completed [configuration,electron,raw feature] device cotangents.
+ * The view is borrowed until the next reverse request or model rebind. Its
+ * layout describes the live batch, independently of the prepared capacity.
+ * Consumers match model version and evaluation generation to their coordinates.
+ */
+struct RawFeatureAdjointView
+{
+  const double* data;
+  BatchedValueLayout layout;
+  std::size_t model_version;
+  std::size_t evaluation_generation;
+};
+
 /** Own fixed-capacity adjoints for one explicit neural-trunk reverse operation. */
 class PreparedDeviceNetworkReverse
 {
@@ -30,8 +51,9 @@ public:
   PreparedDeviceNetworkReverse(std::shared_ptr<const PreparedDeviceModel> model,
                                std::size_t capacity,
                                compute::Queue<PlatformKind::CUDA>& queue,
-                               AcceleratorBlasHandle& blas)
-      : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas)
+                               AcceleratorBlasHandle& blas,
+                               NetworkReverseOutput output = NetworkReverseOutput::PARAMETER_SCORE)
+      : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas), output_(output)
   {
     if (!model_ || capacity_ == 0)
       throw std::invalid_argument("Network reverse requires a model and nonzero capacity");
@@ -43,9 +65,18 @@ public:
       buffer->reserve(features);
     probability_.reserve(multiply(multiply(multiply(capacity_, shape.attention_heads),
                                             shape.electrons()), shape.electrons()));
-    response_.reserve(model_->plan().parameterCount());
-    finite_layout_ = {response_.capacity(), 4096,
-        response_.capacity() / 4096 + (response_.capacity() % 4096 != 0), 0, 1};
+    if (output_ == NetworkReverseOutput::PARAMETER_SCORE)
+      response_.reserve(model_->plan().parameterCount());
+    else if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
+    {
+      const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
+      raw_feature_.reserve(multiply(multiply(capacity_, shape.electrons()), embedding.shape[0]));
+    }
+    else
+      throw std::invalid_argument("Network reverse output selection is invalid");
+    const auto destination_capacity = response_.capacity() + raw_feature_.capacity();
+    finite_layout_ = {destination_capacity, 4096,
+        destination_capacity / 4096 + (destination_capacity % 4096 != 0), 0, 1};
     finite_status_.reserve(finite_layout_.status_capacity);
     host_finite_status_.resize(finite_layout_.status_capacity);
   }
@@ -56,6 +87,29 @@ public:
    */
   const double* reverse(const PreparedDeviceInference& forward, const std::vector<double>& seed,
                         const double* device_seed = nullptr)
+  {
+    result_ready_ = false;
+    if (output_ != NetworkReverseOutput::PARAMETER_SCORE)
+      throw std::logic_error("Parameter response requested from raw-feature-only network reverse");
+    reverseImpl(forward, seed, device_seed);
+    return response_.data();
+  }
+
+  /// Reverse the seeded trunk into raw inputs without computing parameter adjoints.
+  RawFeatureAdjointView reverseRawFeatures(const PreparedDeviceInference& forward,
+      const std::vector<double>& seed, const double* device_seed = nullptr)
+  {
+    result_ready_ = false;
+    if (output_ != NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
+      throw std::logic_error("Raw feature adjoints requested from parameter-score network reverse");
+    reverseImpl(forward, seed, device_seed);
+    return rawFeatureAdjoints();
+  }
+
+private:
+  /// Execute the shared input-adjoint algebra and admit only the selected output.
+  void reverseImpl(const PreparedDeviceInference& forward, const std::vector<double>& seed,
+                   const double* device_seed)
   {
     result_ready_ = false;
     model_->validateCurrentDevice();
@@ -74,7 +128,8 @@ public:
           upstream_.data()), "network device seed copy");
     else
       upstream_.upload(seed.data(), seed.size());
-    zero(response_, response_.capacity());
+    if (output_ == NetworkReverseOutput::PARAMETER_SCORE)
+      zero(response_, response_.capacity());
     const DenseForwardLayout dense{count * ne, width, width, width, width, width};
     const BatchedValueLayout values{count, ne, width, width, ne * width};
     const BatchedAttentionForwardLayout attention{count,
@@ -121,27 +176,68 @@ public:
       copy(input_, upstream_, elements);
     }
 
-    // Feature-layer parameter reverse stops at geometry: ions/electrons are fixed
-    // inputs to this parameter product, not optimization variables.
+    // Parameter score stops at geometry; raw-only mode instead applies the final
+    // embedding transpose into its separately bounded input-adjoint destination.
     const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
     const DenseForwardLayout feature_dense{count * ne, embedding.shape[0], width,
                                           embedding.shape[0], width, width};
     weightReverse(feature_dense, forward.valueRawFeatures(), upstream_.data(),
                   ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK);
+    const double* result = response_.data();
+    auto scan = finite_layout_;
+    if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
+    {
+      const auto raw_elements = multiply(multiply(count, ne), embedding.shape[0]);
+      zero(raw_feature_, raw_elements);
+      accumulateDenseInputAdjoint(blas_, feature_dense, upstream_.data(),
+          parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK), raw_feature_.data());
+      result = raw_feature_.data();
+      scan.element_count = raw_elements;
+      scan.status_capacity = raw_elements / scan.elements_per_status +
+          (raw_elements % scan.elements_per_status != 0);
+    }
+
     // Reject invalid contractions before publishing the borrowed accumulator.
-    checkRuntime(launchDerivativeFiniteScan(stream, finite_layout_, response_.data(),
+    checkRuntime(launchDerivativeFiniteScan(stream, scan, result,
         finite_status_.data()), "network response finite scan");
     queue_.sync();
-    finite_status_.download(host_finite_status_.data(), host_finite_status_.size());
-    for (const auto& status : host_finite_status_)
-      if (status.nonfinite_count != 0)
-        throw std::runtime_error("Network reverse produced a nonfinite canonical response");
+    finite_status_.download(host_finite_status_.data(), scan.status_capacity);
+    for (std::size_t index = 0; index < scan.status_capacity; ++index)
+      if (host_finite_status_[index].nonfinite_count != 0)
+        throw std::runtime_error("Network reverse produced a nonfinite selected output");
+    result_count_ = count;
+    result_model_version_ = model_->version();
+    result_evaluation_generation_ = forward.evaluationGeneration();
     result_ready_ = true;
-    return response_.data();
   }
 
-  /// Return canonical destination extent; non-trunk parameter entries stay zero.
+public:
+  /// Return canonical destination extent, zero in raw-feature-only preparation.
   std::size_t parameterCount() const noexcept { return response_.capacity(); }
+
+  /// Return the preparation's output contract without exposing incomplete data.
+  NetworkReverseOutput output() const noexcept { return output_; }
+
+  /// Return the live raw-feature view only after successful finite admission.
+  RawFeatureAdjointView rawFeatureAdjoints() const
+  {
+    if (output_ != NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY || !result_ready_)
+      throw std::logic_error("Network reverse has no completed raw feature adjoints");
+    const auto ne = model_->plan().modelShape().electrons();
+    const auto width = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
+    return {raw_feature_.data(), {result_count_, ne, width, width, ne * width},
+        result_model_version_, result_evaluation_generation_};
+  }
+
+  /// Copy only the completed live raw-input cotangents for numerical validation.
+  void downloadRawFeatureAdjoints(std::vector<double>& destination) const
+  {
+    const auto view = rawFeatureAdjoints();
+    const auto elements = multiply(view.layout.configuration_count, view.layout.configuration_stride);
+    if (destination.size() != elements)
+      throw std::invalid_argument("Network raw feature destination extent mismatch");
+    raw_feature_.download(destination.data(), destination.size());
+  }
 
   /// Rebind a compatible successor without reallocating adjoints or retaining old weights.
   void rebindModel(std::shared_ptr<const PreparedDeviceModel> successor)
@@ -158,12 +254,12 @@ public:
     return checkedDeviceBytes<DerivativeFiniteStatus>(host_finite_status_.capacity());
   }
 
-  /// Count prepared device adjoints, canonical response and finite-scan buffers.
+  /// Count prepared device adjoints, selected output and finite-scan buffers.
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = 0;
     for (const auto* buffer : {&upstream_, &residual_, &tanh_, &hidden_, &input_, &context_,
-                              &query_, &key_, &value_, &probability_, &discard_, &response_})
+                              &query_, &key_, &value_, &probability_, &discard_, &response_, &raw_feature_})
       bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(buffer->capacity()),
                                          "Network reverse storage overflow");
     return spatial_detail::checkedAdd(bytes,
@@ -174,6 +270,8 @@ public:
   /// Copy the completed canonical accumulator for numerical validation/host adapters.
   void downloadResponse(std::vector<double>& destination) const
   {
+    if (output_ != NetworkReverseOutput::PARAMETER_SCORE)
+      throw std::logic_error("Raw-feature-only network reverse has no parameter response");
     if (!result_ready_)
       throw std::logic_error("Network reverse has no completed response");
     if (destination.size() != response_.capacity())
@@ -202,6 +300,8 @@ private:
   void weightReverse(const DenseForwardLayout& layout, const double* source, const double* adjoint,
                      ParameterRole role, std::size_t layer)
   {
+    if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
+      return;
     accumulateDenseWeightAdjoint(blas_, layout, source, adjoint,
         response_.data() + model_->plan().parameter(role, layer).begin);
   }
@@ -210,6 +310,8 @@ private:
   void biasReverse(const DenseForwardLayout& layout, const double* adjoint,
                    ParameterRole role, std::size_t layer)
   {
+    if (output_ == NetworkReverseOutput::RAW_FEATURE_ADJOINT_ONLY)
+      return;
     checkRuntime(launchDenseBiasAdjoint(queue_.getNative(), layout, adjoint,
         response_.data() + model_->plan().parameter(role, layer).begin), "network bias reverse");
   }
@@ -218,12 +320,16 @@ private:
   std::size_t capacity_;
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
+  const NetworkReverseOutput output_;
   DeviceBuffer<double> upstream_, residual_, tanh_, hidden_, input_, context_;
-  DeviceBuffer<double> query_, key_, value_, probability_, discard_, response_;
+  DeviceBuffer<double> query_, key_, value_, probability_, discard_, response_, raw_feature_;
   DerivativeFiniteScanLayout finite_layout_;
   DeviceBuffer<DerivativeFiniteStatus> finite_status_;
   std::vector<DerivativeFiniteStatus> host_finite_status_;
   bool result_ready_ = false;
+  std::size_t result_count_ = 0;
+  std::size_t result_model_version_ = 0;
+  std::size_t result_evaluation_generation_ = 0;
 };
 
 } // namespace qmcplusplus::psiformer::device

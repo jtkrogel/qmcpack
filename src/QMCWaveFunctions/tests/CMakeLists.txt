@@ -521,6 +521,18 @@ add_unit_test(deterministic-unit_test_psiformer_device_attention
 set_tests_properties(deterministic-unit_test_psiformer_device_attention
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# The coordinate transpose oracle checks IEEE failures and supplies its own main.
+add_executable(test_psiformer_feature_coordinate_reverse test_psiformer_feature_coordinate_reverse.cpp)
+target_link_libraries(test_psiformer_feature_coordinate_reverse qmc_external_catch2)
+target_compile_options(test_psiformer_feature_coordinate_reverse PRIVATE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
+target_include_directories(test_psiformer_feature_coordinate_reverse PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_feature_coordinate_reverse
+              1 1 $<TARGET_FILE:test_psiformer_feature_coordinate_reverse>)
+set_tests_properties(deterministic-unit_test_psiformer_feature_coordinate_reverse
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 # Exercise the orbital slice scheduler through the real CPU BLAS adapter.
 add_executable(test_psiformer_orbital_projection test_psiformer_orbital_projection.cpp)
 target_link_libraries(test_psiformer_orbital_projection qmc_external_catch2 platform_cpu_LA)

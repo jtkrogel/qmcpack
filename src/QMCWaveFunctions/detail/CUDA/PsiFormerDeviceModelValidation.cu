@@ -23,6 +23,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceNetworkReverse.h"
+#include "PsiFormerDeviceRawFeatureReverseValidation.h"
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
@@ -1533,6 +1534,10 @@ int main(int argc, char** argv)
     near(reverse_product, (objectives[1] - objectives[0]) / (2 * delta),
          "embedding/attention/MLP weighted reverse finite difference");
     std::cout << "PASS neural trunk weighted VJP: canonical finite difference, no B-by-P matrix\n";
+    validateRawFeatureNetworkReverse(image, taped, queue, handle,
+        model.cfg.electrons.x, model.cfg.nuclei.x, seed);
+    std::cout << "PASS raw-feature-only trunk VJP: bounded input adjoints, no P response, coordinate-direction difference\n";
+
     // Complete canonical score contraction against the independent CPU evaluator.
     std::vector<double> score_weights(model.cfg.nconfig);
     for (std::size_t configuration = 0; configuration < score_weights.size(); ++configuration)
