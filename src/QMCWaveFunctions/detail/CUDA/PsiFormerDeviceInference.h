@@ -30,6 +30,7 @@
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <limits>
@@ -47,6 +48,100 @@ enum class InferenceStatusPolicy
   SYNCHRONOUS_DEBUG,
   DEFERRED_NEURAL
 };
+
+/** Explicit numerical-only target preparation; all-zero keeps the reference graph.
+ * Budgets charge this graph's device storage and a deterministic scalar-work
+ * proxy. Shared model images/vendor storage and total runtime need separate admission.
+ */
+struct TargetVglPreparation
+{
+  std::size_t max_targets = 0;
+  std::size_t device_workspace_budget_bytes = 0;
+  std::size_t scalar_work_budget = 0;
+};
+
+struct TargetVglCost
+{
+  std::size_t device_workspace_bytes = 0;
+  std::size_t host_workspace_bytes = 0;
+  std::size_t charged_scalar_work_units = 0;
+  std::size_t tile_count = 0;
+};
+
+/** Count every non-retained target graph buffer before its first device reserve.
+ * Work proxy: 3*B*D*Ne^4 plus 4*B*D*T*Ne^3 for repeated factor/inverse work.
+ * Compensated inner sums have several operations/site; this is not a FLOP bound.
+ */
+inline TargetVglCost estimateTargetVglCost(const PsiFormerExecutionPlan& plan, std::size_t batch,
+                                          std::size_t targets)
+{
+  const auto& shape = plan.modelShape();
+  const auto ne = shape.electrons(), dets = shape.determinants, width = shape.feature_dimension;
+  if (batch == 0 || targets == 0 || targets > ne)
+    throw std::invalid_argument("Target VGL preparation requires positive batch and targets within physical Ne");
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Target VGL cost product overflow");
+  };
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Target VGL cost sum overflow");
+  };
+  const auto planes = add(1, mul(4, targets)), full_planes = add(1, mul(4, ne));
+  const auto matrices = mul(batch, mul(dets, mul(ne, ne)));
+  const auto features = mul(batch, mul(planes, mul(ne, width)));
+  const auto attention = mul(batch, mul(planes, mul(shape.attention_heads, mul(ne, ne))));
+  const auto raw = mul(batch, mul(planes,
+      mul(ne, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0])));
+  std::size_t doubles = 0;
+  for (const auto count : {mul(batch, mul(3, ne)), raw, mul(8, features), attention,
+      mul(planes, matrices), mul(3, matrices), mul(batch, mul(dets, ne)), mul(4, mul(batch, dets)),
+      mul(batch, mul(ne, ne)), mul(batch, mul(3, targets)), mul(2, mul(batch, targets)),
+      mul(batch, planes), batch, mul(batch, planes), mul(batch, targets),
+      batch, mul(batch, full_planes), mul(batch, ne)})
+    doubles = add(doubles, count);
+  TargetVglCost cost;
+  cost.device_workspace_bytes = checkedDeviceBytes<double>(doubles);
+  const auto bytes = [&](std::size_t amount) {
+    cost.device_workspace_bytes = add(cost.device_workspace_bytes, amount);
+  };
+  bytes(checkedDeviceBytes<std::size_t>(batch));
+  bytes(checkedDeviceBytes<std::size_t>(mul(batch, mul(dets, ne))));
+  bytes(checkedDeviceBytes<device_determinant::FactorizationMetadata>(mul(batch, dets)));
+  bytes(checkedDeviceBytes<device_determinant::CombinationMetadata>(batch));
+  bytes(checkedDeviceBytes<device_determinant::DerivativeStatus>(batch));
+  const auto open_status = std::max(mul(batch, mul(ne, width)), matrices);
+  const auto jet_status = mul(batch, mul(shape.attention_heads, ne));
+  bytes(checkedDeviceBytes<OpenSpatialStatus>(open_status));
+  bytes(checkedDeviceBytes<device_math::JetMathStatus>(jet_status));
+  bytes(checkedDeviceBytes<InferenceStatusWord>(1));
+  cost.host_workspace_bytes = add(checkedDeviceBytes<OpenSpatialStatus>(open_status),
+      checkedDeviceBytes<device_math::JetMathStatus>(jet_status));
+  cost.host_workspace_bytes = add(cost.host_workspace_bytes, checkedDeviceBytes<double>(mul(4, batch)));
+  cost.host_workspace_bytes = add(cost.host_workspace_bytes,
+      checkedDeviceBytes<device_determinant::CombinationMetadata>(batch));
+  cost.tile_count = ne / targets + (ne % targets != 0);
+  const auto cube = mul(ne, mul(ne, ne)), bd = mul(batch, dets);
+  cost.charged_scalar_work_units = add(mul(3, mul(bd, mul(ne, cube))),
+      mul(4, mul(bd, mul(cost.tile_count, cube))));
+  return cost;
+}
+
+/** Conservative cross-tile base admission, not a reference accuracy tolerance.
+ * A different sign, severe sum cancellation or a nonmatching rounded base cannot
+ * be assembled into one physical root; callers may retry an admitted full graph.
+ */
+inline void admitTargetVglBase(double phase, double logabs, double reference_phase, double reference_logabs,
+                              const device_determinant::CombinationMetadata& combination)
+{
+  if (!device_math::isFiniteBinary64(phase) || !device_math::isFiniteBinary64(logabs) ||
+      !device_math::isFiniteBinary64(reference_phase) || !device_math::isFiniteBinary64(reference_logabs) ||
+      (phase != 1.0 && phase != -1.0) || phase != reference_phase || combination.severe_cancellation ||
+      combination.status != device_determinant::CombinationStatus::REGULAR)
+    throw std::runtime_error("Target VGL tiles have an unavailable or inconsistent base value/phase");
+  const double bound = 256 * std::numeric_limits<double>::epsilon() *
+      (1 + std::max(std::abs(logabs), std::abs(reference_logabs)));
+  if (std::abs(logabs - reference_logabs) > bound)
+    throw std::runtime_error("Target VGL tiles disagree on the rounded log amplitude");
+}
 
 /// Identify the numerical enum domain stored in a compact first-failure record.
 enum class InferenceStatusDomain
@@ -375,9 +470,11 @@ public:
                           SpatialJetMode mode = SpatialJetMode::FULL_VGL,
                           bool retain_score_tape = false,
                           bool retain_spatial_tape = false,
-                          InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy())
+                          InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy(),
+                          TargetVglPreparation target_preparation = {})
       : PreparedDeviceInference(std::make_shared<PreparedDeviceModel>(plan, parameters, nuclei),
-                                batch_size, queue, blas, mode, retain_score_tape, retain_spatial_tape, status_policy)
+                                batch_size, queue, blas, mode, retain_score_tape, retain_spatial_tape,
+                                status_policy, target_preparation)
   {}
 
   /// Prepare independent scratch while retaining an already uploaded model image.
@@ -388,9 +485,11 @@ public:
                           SpatialJetMode mode = SpatialJetMode::FULL_VGL,
                           bool retain_score_tape = false,
                           bool retain_spatial_tape = false,
-                          InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy())
+                          InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy(),
+                          TargetVglPreparation target_preparation = {})
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
-        batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode)
+        batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
+        target_preparation_(target_preparation)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -407,6 +506,24 @@ public:
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
       throw std::invalid_argument("Device inference supports fixed-ion real FP64 models only");
     ne_ = shape_.electrons();
+    // Only the all-zero option is the legacy full graph. A malformed explicit
+    // request must not silently bypass budgets and allocate full-Ne scratch.
+    if (target_preparation_.max_targets == 0)
+    {
+      if (target_preparation_.device_workspace_budget_bytes != 0 || target_preparation_.scalar_work_budget != 0)
+        throw std::invalid_argument("Target VGL budgets require an explicit positive target capacity");
+    }
+    else
+    {
+      if (mode_ != SpatialJetMode::FULL_VGL || retain_score_tape || retain_spatial_tape)
+        throw std::invalid_argument("Target VGL requires an FP64 non-retained full-VGL graph");
+      if (target_preparation_.device_workspace_budget_bytes == 0 || target_preparation_.scalar_work_budget == 0)
+        throw std::invalid_argument("Target VGL requires positive workspace and whole-request work budgets");
+      target_cost_ = estimateTargetVglCost(plan_, batch_capacity_, target_preparation_.max_targets);
+      if (target_cost_.device_workspace_bytes > target_preparation_.device_workspace_budget_bytes ||
+          target_cost_.charged_scalar_work_units > target_preparation_.scalar_work_budget)
+        throw std::length_error("Target VGL preparation exceeds its explicit workspace or scalar-work budget");
+    }
     const std::size_t width = shape_.feature_dimension;
     features_ = model_->periodicCell()
         ? makePeriodicFeatureJetLayout(batch_, ne_, shape_.nuclei, shape_.spin_up_electrons, mode_)
@@ -423,8 +540,11 @@ public:
                                          width, shape_.spin_up_electrons, mode_);
     cusp_ = makeOpenCuspJetLayout(batch_, ne_, shape_.spin_up_electrons, mode_);
     final_ = makeFinalSpatialJetLayout(batch_, ne_, mode_);
+    result_layout_ = final_.output;
     matrices_per_configuration_ = orbitals_.orbitals.element_count;
     gradient_lanes_ = dense_.source.gradient_lanes;
+    if (target_preparation_.max_targets)
+      setTargetRange(0, target_preparation_.max_targets);
 
     positions_.reserve(product(batch_, product(ne_, 3)));
     active_.reserve(batch_);
@@ -463,8 +583,8 @@ public:
     {
       matrix_product_.reserve(product(batch_, product(ne_, ne_)));
       det_gradient_.reserve(product(batch_, gradient_lanes_));
-      det_lap_ratio_.reserve(product(batch_, ne_));
-      det_lap_log_.reserve(product(batch_, ne_));
+      det_lap_ratio_.reserve(product(batch_, final_.output.laplacian_lanes));
+      det_lap_log_.reserve(product(batch_, final_.output.laplacian_lanes));
       det_status_.reserve(batch_);
     }
     cusp_jets_.reserve(spatialJetSpanElements(cusp_.output));
@@ -475,6 +595,20 @@ public:
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
     sticky_status_.reserve(1);
+    if (target_preparation_.max_targets)
+    {
+      full_phase_.reserve(batch_);
+      full_output_.reserve(spatialJetSpanElements(result_layout_));
+      full_lap_ratio_.reserve(product(batch_, ne_));
+      tile_phase_.resize(batch_); tile_log_.resize(batch_);
+      canonical_phase_.resize(batch_); canonical_log_.resize(batch_);
+      host_combinations_.resize(batch_);
+      // Keep the pre-allocation accounting an executable invariant. Model image
+      // and vendor storage are deliberately not charged to this owned workspace.
+      if (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
+          hostWorkspaceBytes() != target_cost_.host_workspace_bytes)
+        throw std::logic_error("Target VGL prepared storage disagrees with pre-allocation accounting");
+    }
     if (retain_score_tape || retain_spatial_tape)
     {
       retained_backflow_.reserve(spatialJetSpanElements(orbitals_.orbitals));
@@ -490,6 +624,7 @@ public:
     // A failed replacement must never leave the preceding tape visible as current.
     value_tape_valid_ = false;
     result_valid_ = false;
+    admitted_target_tiles_ = 0;
     if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("Device inference evaluation generation exhausted");
     ++evaluation_generation_;
@@ -500,6 +635,35 @@ public:
       throw std::invalid_argument("Device inference positions exceed capacity or contain an incomplete configuration");
     setBatchCount(positions.size() / coordinates_per_configuration);
     positions_.upload(positions.data(), positions.size());
+    if (target_preparation_.max_targets)
+    {
+      for (std::size_t begin = 0; begin < ne_;)
+      {
+        const auto count = std::min(target_preparation_.max_targets, ne_ - begin);
+        // Fresh compact logical prefixes reuse the max-K allocation. Tail planes
+        // and configuration strides must shrink together for folded GEMM.
+        setTargetRange(begin, count);
+        evaluatePreparedTile();
+        admitTileBase(begin == 0);
+        checkRuntime(launchScatterSpatialTargets(queue_.getNative(), final_.output, result_layout_,
+            phase_.data(), output_.data(), lap_ratio_.data(), full_phase_.data(), full_output_.data(),
+            full_lap_ratio_.data()), "model target VGL scatter");
+        ++admitted_target_tiles_;
+        begin += count;
+      }
+      queue_.sync();
+    }
+    else
+      evaluatePreparedTile();
+    // No tile, base check or scatter failure may expose a partial physical root.
+    value_tape_valid_ = !value_tape_.empty();
+    result_valid_ = true;
+  }
+
+private:
+  /// Execute one admitted shape against the geometry uploaded by the logical request.
+  void evaluatePreparedTile()
+  {
     const auto stream = queue_.getNative();
     resetStatusAdmission();
     MixedValueAttempt mixed_attempt(mixed_dense_.get(), model_);
@@ -603,11 +767,10 @@ public:
       if (mixed_dense_)
         mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
       mixed_attempt.finish();
-      value_tape_valid_ = !value_tape_.empty();
-      result_valid_ = true;
       return;
     }
-    device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_, ne_,
+    device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_,
+        final_.output.laplacian_lanes,
         orbitals_.orbitals.configuration_stride, orbitals_.orbitals.configuration_stride};
     // These layouts use packed D*Ne*Ne planes. The view starts at the first
     // requested derivative plane, and its stride skips the remaining jet planes.
@@ -624,10 +787,9 @@ public:
     if (mixed_dense_)
       mixed_dense_->checkValueConditioning(factors_.data(), combinations_.data(), batch_, shape_.determinants);
     mixed_attempt.finish();
-    value_tape_valid_ = !value_tape_.empty();
-    result_valid_ = true;
   }
 
+public:
   /// Select diagnostics between completed evaluations; numerical semantics are unchanged.
   void setStatusPolicy(InferenceStatusPolicy policy)
   {
@@ -681,6 +843,8 @@ public:
    * Production dispatch never attaches this experimental numerical adapter implicitly. */
   void setMixedDense(std::shared_ptr<PreparedDeviceMixedValueDense> adapter)
   {
+    if (adapter && target_preparation_.max_targets)
+      throw std::invalid_argument("Target VGL does not admit mixed affine arithmetic");
     if (adapter && (!value_tape_.empty() || plan_.environment().boundary != BoundaryCondition::OPEN))
       throw std::invalid_argument("Mixed affine inference does not admit reverse tapes or periodic geometry");
     if (adapter && adapter->modelImage().get() != model_.get())
@@ -705,16 +869,23 @@ public:
   {
     if (!result_valid_)
       throw std::logic_error("Device inference has no completed result for the current image");
-    if (phases.size() != batch_ || jets.size() != spatialJetSpanElements(final_.output) ||
-        ratios.size() != product(batch_, final_.output.laplacian_lanes))
+    if (phases.size() != batch_ || jets.size() != spatialJetSpanElements(result_layout_) ||
+        ratios.size() != product(batch_, result_layout_.laplacian_lanes))
       throw std::invalid_argument("Device inference result buffers have wrong extent");
-    phase_.download(phases.data(), phases.size());
-    output_.download(jets.data(), jets.size());
-    lap_ratio_.download(ratios.data(), ratios.size());
+    (target_preparation_.max_targets ? full_phase_ : phase_).download(phases.data(), phases.size());
+    (target_preparation_.max_targets ? full_output_ : output_).download(jets.data(), jets.size());
+    (target_preparation_.max_targets ? full_lap_ratio_ : lap_ratio_).download(ratios.data(), ratios.size());
   }
 
   /// Expose the fixed output layout for result comparison, not internal scratch.
-  const SpatialJetLayout& resultLayout() const noexcept { return final_.output; }
+  const SpatialJetLayout& resultLayout() const noexcept { return result_layout_; }
+
+  /// Report immutable explicit target preparation and its admitted capacity costs.
+  const TargetVglPreparation& targetVglPreparation() const noexcept { return target_preparation_; }
+  const TargetVglCost& targetVglCost() const noexcept { return target_cost_; }
+
+  /// Diagnose partial progress without making its numerical buffers public.
+  std::size_t admittedTargetTiles() const noexcept { return admitted_target_tiles_; }
 
   /// Expose identity/version ownership for publication binding and reuse tests.
   const std::shared_ptr<const PreparedDeviceModel>& modelImage() const noexcept { return model_; }
@@ -862,7 +1033,10 @@ public:
   std::size_t hostWorkspaceBytes() const
   {
     return checkedDeviceBytes<OpenSpatialStatus>(host_status_.capacity()) +
-        checkedDeviceBytes<device_math::JetMathStatus>(host_jet_status_.capacity());
+        checkedDeviceBytes<device_math::JetMathStatus>(host_jet_status_.capacity()) +
+        checkedDeviceBytes<double>(tile_phase_.capacity() + tile_log_.capacity() +
+            canonical_phase_.capacity() + canonical_log_.capacity()) +
+        checkedDeviceBytes<device_determinant::CombinationMetadata>(host_combinations_.capacity());
   }
 
   /// Count graph-owned device buffers, excluding the shared immutable image.
@@ -876,7 +1050,7 @@ public:
         &hidden_, &projected_, &orbital_jets_, &matrices_, &lu_, &inverse_,
         &solve_, &term_phase_, &term_log_, &scaled_, &normalized_, &matrix_product_, &det_gradient_,
         &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_, &output_, &lap_ratio_,
-        &retained_backflow_, &retained_envelope_})
+        &retained_backflow_, &retained_envelope_, &full_phase_, &full_output_, &full_lap_ratio_})
       add(checkedDeviceBytes<double>(buffer->capacity()));
     add(checkedDeviceBytes<std::size_t>(active_.capacity()));
     add(checkedDeviceBytes<std::size_t>(permutations_.capacity()));
@@ -929,6 +1103,39 @@ private:
         &attention_.attention, &orbitals_.features, &orbitals_.orbitals,
         &cusp_.output, &final_.output})
       layout->configuration_count = count;
+    result_layout_.configuration_count = count;
+  }
+
+  /// Select physical targets while all intermediate tensors use compact local planes.
+  void setTargetRange(std::size_t begin, std::size_t count)
+  {
+    for (auto* layout : {&features_.output, &embedding_.source, &embedding_.target,
+        &dense_.source, &dense_.target, &elementwise_.jets, &attention_.features,
+        &attention_.attention, &orbitals_.features, &orbitals_.orbitals,
+        &cusp_.output, &final_.output})
+      *layout = withSpatialTargetRange(*layout, begin, count);
+    gradient_lanes_ = dense_.source.gradient_lanes;
+    final_.determinant_gradient_configuration_stride = gradient_lanes_;
+    final_.determinant_laplacian_configuration_stride = count;
+    final_.laplacian_ratio_configuration_stride = count;
+  }
+
+  /// Admit every tile's base before scattering or resetting its sticky status.
+  void admitTileBase(bool first)
+  {
+    phase_.download(tile_phase_.data(), batch_);
+    combinations_.download(host_combinations_.data(), batch_);
+    for (std::size_t configuration = 0; configuration < batch_; ++configuration)
+    {
+      output_.download(&tile_log_[configuration], 1, final_.output.uncheckedValueOffset(configuration, 0));
+      if (first)
+      {
+        canonical_phase_[configuration] = tile_phase_[configuration];
+        canonical_log_[configuration] = tile_log_[configuration];
+      }
+      admitTargetVglBase(tile_phase_[configuration], tile_log_[configuration],
+          canonical_phase_[configuration], canonical_log_[configuration], host_combinations_[configuration]);
+    }
   }
 
   /// Reject a missing shared image before any dependent layout is constructed.
@@ -1107,6 +1314,9 @@ private:
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
   const SpatialJetMode mode_;
+  const TargetVglPreparation target_preparation_;
+  TargetVglCost target_cost_;
+  std::size_t admitted_target_tiles_ = 0;
   OpenFeatureJetLayout features_;
   SpatialDenseJetLayout embedding_, dense_;
   SpatialElementwiseJetLayout elementwise_;
@@ -1114,6 +1324,7 @@ private:
   OpenOrbitalJetLayout orbitals_;
   OpenCuspJetLayout cusp_;
   FinalSpatialJetLayout final_;
+  SpatialJetLayout result_layout_;
   DeviceBuffer<double> positions_, raw_, a_, b_, q_, k_, v_, weights_, context_, hidden_, projected_;
   DeviceBuffer<double> orbital_jets_, matrices_, lu_, inverse_, solve_;
   DeviceBuffer<double> term_phase_, term_log_, scaled_, normalized_, matrix_product_;
@@ -1133,6 +1344,9 @@ private:
   bool status_pending_ = false;
   std::vector<std::unique_ptr<RetainedBlockTape>> value_tape_;
   DeviceBuffer<double> retained_backflow_, retained_envelope_;
+  DeviceBuffer<double> full_phase_, full_output_, full_lap_ratio_;
+  std::vector<double> tile_phase_, tile_log_, canonical_phase_, canonical_log_;
+  std::vector<device_determinant::CombinationMetadata> host_combinations_;
   bool value_tape_valid_ = false;
   bool result_valid_ = false;
   std::size_t evaluation_generation_ = 0;

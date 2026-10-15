@@ -312,6 +312,321 @@ int main(int argc, char** argv)
     inference.downloadResults(phases, jets, ratios);
     verify();
 
+    // Explicit non-retained target tiling must preserve one physical result and
+    // one geometry upload/generation while keeping max-K scratch stable.
+    {
+      constexpr std::size_t capacity = 3;
+      std::vector<double> target_positions;
+      for (std::size_t sample = 0; sample < capacity; ++sample)
+      {
+        const auto first = model.cfg.electrons.x.begin() + (sample % references.size()) * 3 * model.ne;
+        target_positions.insert(target_positions.end(), first, first + 3 * model.ne);
+      }
+      int ordinal = 0;
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipGetDevice(&ordinal), "target VGL metrics device");
+#else
+      checkRuntime(cudaGetDevice(&ordinal), "target VGL metrics device");
+#endif
+      auto& metrics = deviceMemoryMetrics(ordinal);
+      const auto policy = InferenceStatusPolicy::DEFERRED_NEURAL;
+      const auto admitted = [&](std::size_t count) {
+        const auto cost = estimateTargetVglCost(plan, capacity, count);
+        return TargetVglPreparation{count, cost.device_workspace_bytes, cost.charged_scalar_work_units};
+      };
+      const auto expect_invalid = [&](TargetVglPreparation preparation, SpatialJetMode mode,
+                                      bool score_tape, bool spatial_tape) {
+        const auto before = metrics.snapshot();
+        bool rejected = false;
+        try { PreparedDeviceInference graph(image, capacity, queue, handle, mode,
+                                             score_tape, spatial_tape, policy, preparation); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        catch (const std::length_error&) { rejected = true; }
+        const auto after = metrics.snapshot();
+        if (!rejected || before.allocation_calls != after.allocation_calls || before.live_bytes != after.live_bytes)
+          throw std::runtime_error("Target VGL invalid preparation allocated device scratch or was admitted");
+      };
+      auto options = admitted(1);
+      auto insufficient = options;
+      --insufficient.device_workspace_budget_bytes;
+      expect_invalid(insufficient, SpatialJetMode::FULL_VGL, false, false);
+      insufficient = options;
+      --insufficient.scalar_work_budget;
+      expect_invalid(insufficient, SpatialJetMode::FULL_VGL, false, false);
+      expect_invalid({0, 1, 1}, SpatialJetMode::FULL_VGL, false, false);
+      expect_invalid({1, 0, options.scalar_work_budget}, SpatialJetMode::FULL_VGL, false, false);
+      expect_invalid({1, options.device_workspace_budget_bytes, 0}, SpatialJetMode::FULL_VGL, false, false);
+      expect_invalid({model.ne + 1, options.device_workspace_budget_bytes, options.scalar_work_budget},
+                     SpatialJetMode::FULL_VGL, false, false);
+      expect_invalid(options, SpatialJetMode::VALUE_ONLY, false, false);
+      expect_invalid(options, SpatialJetMode::FULL_VGL, false, true);
+      expect_invalid(options, SpatialJetMode::VALUE_ONLY, true, false);
+      bool overflow_rejected = false;
+      try { (void)estimateTargetVglCost(plan, std::numeric_limits<std::size_t>::max(), 1); }
+      catch (const std::length_error&) { overflow_rejected = true; }
+      if (!overflow_rejected)
+        throw std::runtime_error("Target VGL preparation cost overflow was admitted");
+
+      device_determinant::CombinationMetadata combination;
+      combination.status = device_determinant::CombinationStatus::REGULAR;
+      admitTargetVglBase(1, -10, 1, -10, combination);
+      const auto expect_bad_base = [&](double phase, double logabs,
+                                        device_determinant::CombinationMetadata metadata) {
+        bool rejected = false;
+        try { admitTargetVglBase(phase, logabs, 1, -10, metadata); }
+        catch (const std::runtime_error&) { rejected = true; }
+        if (!rejected)
+          throw std::runtime_error("Target VGL inconsistent/cancelling base was admitted");
+      };
+      expect_bad_base(-1, -10, combination);
+      expect_bad_base(1, -9, combination);
+      expect_bad_base(1, std::numeric_limits<double>::infinity(), combination);
+      combination.severe_cancellation = true;
+      expect_bad_base(1, -10, combination);
+
+      PreparedDeviceInference full_target_reference(image, capacity, queue, handle);
+      std::size_t smallest_target_bytes = 0;
+      for (const auto target_count : {std::size_t{1}, std::min<std::size_t>(2, model.ne),
+                                     std::min<std::size_t>(3, model.ne), model.ne})
+      {
+        PreparedDeviceInference target_graph(image, capacity, queue, handle, SpatialJetMode::FULL_VGL,
+                                              false, false, policy, admitted(target_count));
+        const auto prepared_bytes = target_graph.deviceWorkspaceBytes();
+        const auto cost = estimateTargetVglCost(plan, capacity, target_count);
+        if (prepared_bytes != cost.device_workspace_bytes ||
+            target_graph.hostWorkspaceBytes() != cost.host_workspace_bytes ||
+            target_graph.targetVglCost().tile_count != cost.tile_count)
+          throw std::runtime_error("Target VGL exact pre-allocation cost disagrees with prepared storage");
+        if (target_count == 1)
+          smallest_target_bytes = prepared_bytes;
+        for (const std::size_t count : {capacity, std::size_t{1}, std::size_t{2}, capacity})
+        {
+          const std::vector<double> prefix(target_positions.begin(), target_positions.begin() + count * 3 * model.ne);
+          const auto before = metrics.snapshot();
+          const auto generation = target_graph.evaluationGeneration();
+          target_graph.evaluate(prefix);
+          const auto after = metrics.snapshot();
+          if (after.upload_calls != before.upload_calls + 1 ||
+              after.uploaded_bytes != before.uploaded_bytes + checkedDeviceBytes<double>(prefix.size()) ||
+              after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
+              after.live_bytes != before.live_bytes || target_graph.evaluationGeneration() != generation + 1 ||
+              target_graph.admittedTargetTiles() != cost.tile_count ||
+              target_graph.deviceWorkspaceBytes() != prepared_bytes)
+            throw std::runtime_error("Target VGL request lost one-upload/generation or stable preparation");
+          const auto& target_layout = target_graph.resultLayout();
+          if (!hasCompleteSpatialTargets(target_layout) || target_layout.configuration_count != count)
+            throw std::runtime_error("Target VGL exposed a local rather than physical result layout");
+          std::vector<double> target_phase(count), target_jets(spatialJetSpanElements(target_layout)),
+              target_ratios(count * model.ne);
+          target_graph.downloadResults(target_phase, target_jets, target_ratios);
+          for (std::size_t sample = 0; sample < count; ++sample)
+          {
+            const auto& reference = references[sample % references.size()];
+            near(target_phase[sample], reference.sign, "target VGL physical phase");
+            near(target_jets[target_layout.uncheckedValueOffset(sample, 0)], reference.logabs,
+                "target VGL physical log amplitude");
+            for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+              near(target_jets[target_layout.uncheckedGradientOffset(sample, lane, 0)], reference.gradient[lane],
+                  "target VGL physical gradient");
+            for (std::size_t electron = 0; electron < model.ne; ++electron)
+            {
+              near(target_jets[target_layout.uncheckedLaplacianOffset(sample, electron, 0)],
+                  reference.lap_log[electron], "target VGL physical log Laplacian");
+              near(target_ratios[sample * model.ne + electron], reference.lap_ratio[electron],
+                  "target VGL physical Laplacian ratio");
+            }
+          }
+        }
+        bool reverse_rejected = false;
+        try { (void)target_graph.spatialHeadTape(); }
+        catch (const std::logic_error&) { reverse_rejected = true; }
+        if (!reverse_rejected)
+          throw std::runtime_error("Target VGL exposed an unsupported retained spatial tape");
+        auto compute_parameters = std::make_shared<PreparedDeviceMixedDenseParameters>(image, queue);
+        auto adapter = std::make_shared<PreparedDeviceMixedValueDense>(compute_parameters,
+            capacity * model.ne * (1 + 4 * target_count), queue, handle);
+        bool mixed_rejected = false;
+        try { target_graph.setMixedDense(adapter); }
+        catch (const std::invalid_argument&) { mixed_rejected = true; }
+        if (!mixed_rejected)
+          throw std::runtime_error("Target VGL admitted unsupported mixed arithmetic");
+        const auto successor = image->makeUpdatedImage(model.p.flat_values(), 18);
+        target_graph.rebindModel(successor);
+        bool stale_rejected = false;
+        std::vector<double> stale_phase(capacity), stale_jets(spatialJetSpanElements(target_graph.resultLayout())),
+            stale_ratios(capacity * model.ne);
+        try { target_graph.downloadResults(stale_phase, stale_jets, stale_ratios); }
+        catch (const std::logic_error&) { stale_rejected = true; }
+        if (!stale_rejected)
+          throw std::runtime_error("Target VGL publication rebind exposed an earlier result");
+        target_graph.evaluate(target_positions);
+        target_graph.downloadResults(stale_phase, stale_jets, stale_ratios);
+      }
+      if (model.ne > 1 && smallest_target_bytes >= full_target_reference.deviceWorkspaceBytes())
+        throw std::runtime_error("Target VGL K1 did not reduce non-retained graph workspace");
+      std::cout << "PASS explicit target VGL: K1/2/3/Ne, B3/1/2/3, complete CPU VGL parity, "
+                   "budgets before allocation, one upload/generation, fixed storage, rebind/reverse/mixed guards; "
+                << "full_device_bytes=" << full_target_reference.deviceWorkspaceBytes()
+                << "; K1_device_bytes=" << smallest_target_bytes << '\n';
+    }
+
+    {
+      // Reuse this compact architecture with a periodic embedding. Rebuild each
+      // canonical tensor interval independently: resizing embedding shifts every
+      // following parameter offset, so a raw whole-vector copy would be invalid.
+      ExecutionEnvironment environment = plan.environment();
+      environment.boundary = BoundaryCondition::PERIODIC;
+      environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+      environment.lattice_vectors = {{{4.0, 0.4, -0.2}, {0.7, 5.0, 0.3}, {-0.1, 0.8, 6.0}}};
+      environment.periodic_axes = {true, true, true};
+      const auto original_parameters = model.p.flat_values();
+      std::vector<double> periodic_parameters;
+      std::vector<pf::Layout> periodic_layouts;
+      for (const auto& tensor : plan.parameterTensors())
+      {
+        auto tensor_shape = tensor.shape;
+        if (tensor.role == ParameterRole::ELECTRON_EMBEDDING_WEIGHT)
+          tensor_shape[0] = 7 * shape.nuclei + 1;
+        std::size_t count = 1;
+        for (const auto extent : tensor_shape)
+          count = spatial_detail::checkedProduct(count, extent, "Periodic target fixture extent overflow");
+        const auto begin = periodic_parameters.size();
+        for (std::size_t index = 0; index < count; ++index)
+          periodic_parameters.push_back(original_parameters[tensor.begin + index % (tensor.end - tensor.begin)]);
+        periodic_layouts.push_back({tensor.module, tensor.name, tensor_shape, begin, periodic_parameters.size()});
+      }
+      pf::PsiFormer periodic_model(pf::Parameters(std::move(periodic_parameters), std::move(periodic_layouts)),
+                                  model.cfg, model.ndet, model.dim, model.heads, model.blocks);
+      const auto periodic_plan = PsiFormerExecutionPlan::fromParameters(periodic_model.p, shape, environment);
+      pf::DirectValueExecutor periodic_value(periodic_model, periodic_plan);
+      pf::DirectSpatialExecutor periodic_spatial(periodic_model, periodic_value, periodic_plan);
+      auto cpu_workspace = periodic_spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+      const auto periodic_image = std::make_shared<PreparedDeviceModel>(periodic_plan,
+          periodic_model.p.flat_values(), model.cfg.nuclei.x, 0);
+      std::vector<double> positions;
+      for (std::size_t sample = 0; sample < 3; ++sample)
+        positions.insert(positions.end(), model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+      positions[3 * model.ne] += 0.031;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        positions[6 * model.ne + dimension] += environment.lattice_vectors[0][dimension] -
+            2 * environment.lattice_vectors[2][dimension];
+      for (const auto target_count : {std::size_t{1}, std::min<std::size_t>(3, model.ne)})
+      {
+        const auto cost = estimateTargetVglCost(periodic_plan, 3, target_count);
+        PreparedDeviceInference target(periodic_image, 3, queue, handle, SpatialJetMode::FULL_VGL, false, false,
+            InferenceStatusPolicy::DEFERRED_NEURAL,
+            {target_count, cost.device_workspace_bytes, cost.charged_scalar_work_units});
+        const auto bytes = target.deviceWorkspaceBytes();
+        for (const std::size_t count : {std::size_t{3}, std::size_t{1}, std::size_t{2}, std::size_t{3}})
+        {
+          const std::vector<double> prefix(positions.begin(), positions.begin() + count * 3 * model.ne);
+          target.evaluate(prefix);
+          const auto& target_layout = target.resultLayout();
+          std::vector<double> target_phase(count), target_jets(spatialJetSpanElements(target_layout)),
+              target_ratios(count * model.ne);
+          target.downloadResults(target_phase, target_jets, target_ratios);
+          for (std::size_t sample = 0; sample < count; ++sample)
+          {
+            cpu_workspace->setPositions(pf::GeometryPositionView::interleaved(prefix.data() + sample * 3 * model.ne,
+                                                                              model.ne));
+            const auto reference = periodic_spatial.evaluateFull(*cpu_workspace);
+            near(target_phase[sample], reference.sign, "periodic target phase");
+            near(target_jets[target_layout.uncheckedValueOffset(sample, 0)], reference.logabs,
+                 "periodic target log amplitude");
+            for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+              near(target_jets[target_layout.uncheckedGradientOffset(sample, lane, 0)], reference.gradient[lane],
+                   "periodic target gradient");
+            for (std::size_t electron = 0; electron < model.ne; ++electron)
+            {
+              near(target_jets[target_layout.uncheckedLaplacianOffset(sample, electron, 0)], reference.lap_log[electron],
+                   "periodic target log Laplacian");
+              near(target_ratios[sample * model.ne + electron], reference.lap_ratio[electron],
+                   "periodic target Laplacian ratio");
+            }
+          }
+          if (count == 3)
+            for (std::size_t plane = 0; plane < target_layout.plane_count; ++plane)
+              near(target_jets[target_layout.uncheckedPlaneOffset(2, plane, 0)],
+                   target_jets[target_layout.uncheckedPlaneOffset(0, plane, 0)], "periodic target image invariance");
+          if (target.deviceWorkspaceBytes() != bytes || target.admittedTargetTiles() != cost.tile_count)
+            throw std::runtime_error("Periodic target VGL reuse changed prepared storage or target coverage");
+        }
+      }
+      std::cout << "PASS skew-periodic target VGL: K1/3, compact tails, B3/1/2/3 reuse, "
+                   "complete independent CPU parity and integer-image invariance\n";
+    }
+
+    if (model.ne > 1)
+    {
+      // Make only the final physical electron's radial Laplacian overflow in
+      // embedding. Its ordinary feature remains finite and is masked from the
+      // orbital head; earlier targets therefore complete real scatter work.
+      auto late_parameters = model.p.flat_values();
+      const auto& embedding = plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
+      for (std::size_t input = 0; input < embedding.shape[0]; ++input)
+        late_parameters[embedding.begin + input * model.dim] = input == 0 ? 1e160 : 0;
+      for (std::size_t layer = 0; layer < model.blocks; ++layer)
+        for (const auto role : {ParameterRole::ATTENTION_QUERY_WEIGHT, ParameterRole::ATTENTION_KEY_WEIGHT,
+            ParameterRole::ATTENTION_VALUE_WEIGHT, ParameterRole::ATTENTION_OUTPUT_WEIGHT,
+            ParameterRole::UPDATE_HIDDEN_WEIGHT, ParameterRole::UPDATE_HIDDEN_BIAS,
+            ParameterRole::UPDATE_OUTPUT_WEIGHT, ParameterRole::UPDATE_OUTPUT_BIAS})
+        {
+          const auto& tensor = plan.parameter(role, layer);
+          std::fill(late_parameters.begin() + tensor.begin, late_parameters.begin() + tensor.end, 0);
+        }
+      for (const auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
+      {
+        const auto& tensor = plan.parameter(role);
+        std::fill(late_parameters.begin() + tensor.begin,
+                  late_parameters.begin() + tensor.begin + tensor.shape[1], 0);
+      }
+      auto nuclei = model.cfg.nuclei.x;
+      std::fill(nuclei.begin(), nuclei.begin() + 3, 0);
+      const auto late_image = std::make_shared<PreparedDeviceModel>(plan, late_parameters, nuclei, 20);
+      const auto cost = estimateTargetVglCost(plan, 1, 1);
+      const TargetVglPreparation preparation{1, cost.device_workspace_bytes, cost.charged_scalar_work_units};
+      std::vector<double> late_positions(3 * model.ne);
+      for (std::size_t electron = 0; electron < model.ne; ++electron)
+      {
+        late_positions[3 * electron] = 0.4 + 0.3 * electron;
+        late_positions[3 * electron + 1] = -0.25 + 0.13 * electron;
+        late_positions[3 * electron + 2] = 0.2 + 0.07 * electron;
+      }
+      late_positions[3 * (model.ne - 1)] = 1e-150;
+      late_positions[3 * (model.ne - 1) + 1] = late_positions[3 * (model.ne - 1) + 2] = 0;
+      for (const auto policy : {InferenceStatusPolicy::SYNCHRONOUS_DEBUG, InferenceStatusPolicy::DEFERRED_NEURAL})
+      {
+        PreparedDeviceInference late_graph(late_image, 1, queue, handle, SpatialJetMode::FULL_VGL,
+                                           false, false, policy, preparation);
+        const auto generation = late_graph.evaluationGeneration() + 1;
+        bool late_rejected = false;
+        try { late_graph.evaluate(late_positions); }
+        catch (const InferenceStatusError& error)
+        {
+          late_rejected = error.generation() == generation;
+        }
+        if (!late_rejected || late_graph.admittedTargetTiles() != model.ne - 1 ||
+            late_graph.evaluationGeneration() != generation)
+          throw std::runtime_error("Target VGL did not reject the last target after admitted earlier tiles");
+        std::vector<double> late_phase(1), late_jets(spatialJetSpanElements(late_graph.resultLayout())),
+            late_ratios(model.ne);
+        bool partial_rejected = false;
+        try { late_graph.downloadResults(late_phase, late_jets, late_ratios); }
+        catch (const std::logic_error&) { partial_rejected = true; }
+        if (!partial_rejected)
+          throw std::runtime_error("Target VGL exposed partial output after a late tile failure");
+        auto recovered_positions = late_positions;
+        recovered_positions[3 * (model.ne - 1)] = 0.2;
+        const auto bytes = late_graph.deviceWorkspaceBytes();
+        late_graph.evaluate(recovered_positions);
+        late_graph.downloadResults(late_phase, late_jets, late_ratios);
+        if (late_graph.admittedTargetTiles() != model.ne || late_graph.deviceWorkspaceBytes() != bytes)
+          throw std::runtime_error("Target VGL late failure recovery changed prepared storage");
+      }
+      std::cout << "PASS target VGL late-tile failure: earlier real scatters, no partial publication, "
+                   "one generation, both status policies, recovery\n";
+    }
+
     // Qualify both diagnostic policies independently of the environment default.
     // Deferred neural failures may finish queued arithmetic, but can never expose
     // a partial result/tape or erase the first failing stage's typed identity.
