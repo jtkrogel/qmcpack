@@ -759,6 +759,19 @@ add_unit_test(deterministic-unit_test_psiformer_spatial_executor
               1 1 $<TARGET_FILE:test_psiformer_spatial_executor>)
 set_tests_properties(deterministic-unit_test_psiformer_spatial_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_spatial_trunk
+               test_psiformer_spatial_trunk.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_spatial_trunk catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_spatial_trunk PRIVATE "${qmcpack_SOURCE_DIR}/src")
+target_compile_options(test_psiformer_spatial_trunk PRIVATE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
+add_unit_test(deterministic-unit_test_psiformer_spatial_trunk
+              1 1 $<TARGET_FILE:test_psiformer_spatial_trunk>)
+set_tests_properties(deterministic-unit_test_psiformer_spatial_trunk
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 # This standalone suite deliberately avoids model/HDF5 fixtures so adversarial
 # determinant arithmetic remains inexpensive enough for ordinary deterministic CI.
 add_executable(test_psiformer_determinant test_psiformer_determinant.cpp)

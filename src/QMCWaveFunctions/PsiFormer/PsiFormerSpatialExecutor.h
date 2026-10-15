@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerSpatialExecutor.h
- * @brief Allocation-free direct spatial derivatives for molecular PsiFormer models.
+ * @brief Shared real open/periodic spatial trunk and guarded complete real evaluator.
  *
  * The executor propagates Cartesian gradients and per-electron Laplacian traces
  * directly through the embedding, attention, orbital, determinant, and cusp layers.
@@ -14,9 +14,10 @@
  * lanes and Ne Laplacian lanes, while an active-electron evaluation stores only three
  * first-derivative lanes.  All storage is allocated with the clone-local workspace.
  *
- * Geometry remains real and open-boundary.  Results use sign/log-magnitude form so a
- * future complex phase policy can be added without changing the spatial-output API;
- * periodic and complex numerical kernels are intentionally not implemented here.
+ * Real geometry supports both open and periodic policies. Full real preparation
+ * retains the existing orbital/determinant/output arrays; explicit trunk-only
+ * preparation exposes borrowed real feature/cusp jets without a real head. This
+ * seam does not advertise a complex spatial wavefunction or public XML capability.
  */
 
 //////////////////////////////////////////////////////////////////////////////////////
@@ -125,21 +126,21 @@ struct DirectSpatialJetBuffer
   std::vector<double> laplacian;
 };
 
-/** Own all mutable storage for one direct spatial evaluator clone.
+/** Own shared real geometry/trunk jets and cusp scratch, without real head storage.
  *
  * FULL_VGL workspaces carry a 3-vector gradient and scalar Laplacian for every
  * differentiating electron.  ACTIVE_ELECTRON_GRADIENT workspaces omit every
  * second-derivative allocation and can be reused for any active electron.
  */
-class DirectSpatialWorkspace
+class DirectSpatialTrunkWorkspace
 {
 public:
-  /// Allocate fixed geometry, forward-jet, determinant, and output buffers.
-  DirectSpatialWorkspace(const DirectValueParameterLayout& layout,
+  /// Prepare only real spatial trunk buffers for FULL or ACTIVE differentiation.
+  DirectSpatialTrunkWorkspace(const DirectValueParameterLayout& layout,
                          GeometryPositionView nuclei,
                          DirectSpatialMode mode,
                          GeometryBoundary boundary = {})
-      : mode_(mode),
+      : layout_identity_(&layout), mode_(mode),
         gradient_lanes_(mode == DirectSpatialMode::FULL_VGL ? 3 * layout.electronCount() : 3),
         laplacian_lanes_(mode == DirectSpatialMode::FULL_VGL ? layout.electronCount() : 0),
         electron_positions_(3 * layout.electronCount()),
@@ -154,25 +155,32 @@ public:
                    gradient_lanes_, laplacian_lanes_),
         attended_(layout.electronCount() * layout.featureWidth(), gradient_lanes_, laplacian_lanes_),
         hidden_(layout.electronCount() * layout.featureWidth(), gradient_lanes_, laplacian_lanes_),
-        orbital_matrices_(layout.determinantCount() * layout.electronCount() * layout.electronCount(),
-                          gradient_lanes_, laplacian_lanes_),
-        determinant_workspace_(layout.determinantCount(), layout.electronCount(),
-                               gradient_lanes_, laplacian_lanes_),
         scalar_gradient_scratch_(gradient_lanes_),
-        scalar_laplacian_scratch_(laplacian_lanes_),
-        output_gradient_(gradient_lanes_),
-        output_lap_log_(laplacian_lanes_),
-        output_lap_ratio_(laplacian_lanes_)
-  {}
+        scalar_laplacian_scratch_(laplacian_lanes_)
+  {
+    if (mode != DirectSpatialMode::FULL_VGL && mode != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
+      throw std::invalid_argument("Unknown PsiFormer spatial trunk mode");
+  }
 
-  DirectSpatialWorkspace(const DirectSpatialWorkspace&) = delete;
-  DirectSpatialWorkspace& operator=(const DirectSpatialWorkspace&) = delete;
-  DirectSpatialWorkspace(DirectSpatialWorkspace&&) = default;
-  DirectSpatialWorkspace& operator=(DirectSpatialWorkspace&&) = default;
+  /// Prepared mutable jets cannot be shared by copying.
+  DirectSpatialTrunkWorkspace(const DirectSpatialTrunkWorkspace&) = delete;
+
+  /// Preserve exclusive clone-local buffer ownership.
+  DirectSpatialTrunkWorkspace& operator=(const DirectSpatialTrunkWorkspace&) = delete;
+
+  /// Transfer the complete real trunk preparation.
+  DirectSpatialTrunkWorkspace(DirectSpatialTrunkWorkspace&&) = default;
+
+  /// Transfer ownership together with the immutable layout identity.
+  DirectSpatialTrunkWorkspace& operator=(DirectSpatialTrunkWorkspace&&) = default;
+
+  /// Support safe deletion of a complete workspace through its public trunk base.
+  virtual ~DirectSpatialTrunkWorkspace() = default;
 
   /// Copy a complete interleaved configuration into fixed input storage.
   void setPositions(GeometryPositionView positions)
   {
+    invalidateResult();
     if (positions.size() != geometry_.electronCount())
       throw std::invalid_argument("PsiFormer spatial workspace received the wrong electron count");
     for (std::size_t electron = 0; electron < positions.size(); ++electron)
@@ -183,6 +191,7 @@ public:
   /// Overwrite one Cartesian coordinate without changing workspace capacity.
   void setPosition(std::size_t electron, std::size_t dimension, double value)
   {
+    invalidateResult();
     if (electron >= geometry_.electronCount() || dimension >= 3)
       throw std::out_of_range("PsiFormer spatial workspace coordinate index is out of range");
     electron_positions_[3 * electron + dimension] = value;
@@ -193,6 +202,9 @@ public:
 
   /// Return the parameter version used by the most recent completed evaluation.
   std::size_t observedParameterVersion() const noexcept { return observed_parameter_version_; }
+
+  /// Every edit or attempted evaluation expires the preceding borrowed trunk view.
+  std::size_t evaluationGeneration() const noexcept { return evaluation_generation_; }
 
   /** Hash every backing address and capacity for a no-growth regression check.
    *
@@ -244,55 +256,21 @@ public:
     mix_jet(attention_);
     mix_jet(attended_);
     mix_jet(hidden_);
-    mix_jet(orbital_matrices_);
-    hash ^= determinant_workspace_.storageFingerprint();
-    hash *= 1099511628211ULL;
     mix(scalar_gradient_scratch_);
     mix(scalar_laplacian_scratch_);
-    mix(output_gradient_);
-    mix(output_lap_log_);
-    mix(output_lap_ratio_);
     return hash;
   }
 
   /// Report overlap with any retained spatial-workspace allocation.
   bool overlapsStorage(const void* data, std::size_t bytes) const noexcept
   {
-    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
-    if (bytes == 0)
-      return false;
-    if (data == nullptr || begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
-      return true;
-    const std::uintptr_t end = begin + bytes;
-    const auto overlaps = [begin, end](const auto& values) noexcept {
-      using Element = typename std::decay_t<decltype(values)>::value_type;
-      if (values.capacity() == 0)
-        return false;
-      if (values.capacity() > std::numeric_limits<std::size_t>::max() / sizeof(Element))
-        return true;
-      const std::size_t storage_bytes = values.capacity() * sizeof(Element);
-      const std::uintptr_t storage_begin =
-          reinterpret_cast<std::uintptr_t>(values.data());
-      if (values.data() == nullptr ||
-          storage_begin > std::numeric_limits<std::uintptr_t>::max() - storage_bytes)
-        return true;
-      const std::uintptr_t storage_end = storage_begin + storage_bytes;
-      return begin < storage_end && storage_begin < end;
-    };
-    const auto overlaps_jet = [&overlaps](const DirectSpatialJetBuffer& values) noexcept {
-      return overlaps(values.value) || overlaps(values.gradient) ||
-          overlaps(values.laplacian);
-    };
-    return overlaps(electron_positions_) || geometry_.overlapsStorage(data, bytes) ||
-        overlaps_jet(raw_features_) || overlaps_jet(features_a_) ||
-        overlaps_jet(features_b_) || overlaps_jet(query_) ||
-        overlaps_jet(key_) || overlaps_jet(projected_value_) ||
-        overlaps_jet(attention_) || overlaps_jet(attended_) ||
-        overlaps_jet(hidden_) || overlaps_jet(orbital_matrices_) ||
-        determinant_workspace_.overlapsStorage(data, bytes) ||
-        overlaps(scalar_gradient_scratch_) ||
-        overlaps(scalar_laplacian_scratch_) || overlaps(output_gradient_) ||
-        overlaps(output_lap_log_) || overlaps(output_lap_ratio_);
+    return overlapsVector(electron_positions_, data, bytes) || geometry_.overlapsStorage(data, bytes) ||
+        overlapsJet(raw_features_, data, bytes) || overlapsJet(features_a_, data, bytes) ||
+        overlapsJet(features_b_, data, bytes) || overlapsJet(query_, data, bytes) ||
+        overlapsJet(key_, data, bytes) || overlapsJet(projected_value_, data, bytes) ||
+        overlapsJet(attention_, data, bytes) || overlapsJet(attended_, data, bytes) ||
+        overlapsJet(hidden_, data, bytes) || overlapsVector(scalar_gradient_scratch_, data, bytes) ||
+        overlapsVector(scalar_laplacian_scratch_, data, bytes);
   }
 
   /// Return bytes reserved by every workspace buffer, including geometry tables.
@@ -321,15 +299,9 @@ public:
     add_jet(attention_);
     add_jet(attended_);
     add_jet(hidden_);
-    add_jet(orbital_matrices_);
     add(scalar_gradient_scratch_);
     add(scalar_laplacian_scratch_);
-    add(output_gradient_);
-    add(output_lap_log_);
-    add(output_lap_ratio_);
     addStorageBytes(bytes, geometry_.storageBytes(),
-                    "PsiFormer spatial storage bytes overflowed");
-    addStorageBytes(bytes, determinant_workspace_.storageBytes(),
                     "PsiFormer spatial storage bytes overflowed");
     return bytes;
   }
@@ -345,21 +317,60 @@ public:
   /// Return the checked constructor-time requirement for this fixed model shape.
   std::size_t requiredStorageBytes() const
   {
-    const std::size_t electrons = geometry_.electronCount();
-    const std::size_t electron_square = checkedStorageProduct(
-        electrons, electrons, "PsiFormer spatial shape overflowed");
-    return spatialWorkspaceStorageRequirement(
-        {electrons, geometry_.nucleusCount(), determinant_workspace_.channels(),
-         features_a_.value.size() / electrons,
-         attention_.value.size() / electron_square,
-         raw_features_.value.size() / electrons, 0, 0},
-        mode_ == DirectSpatialMode::FULL_VGL);
+    std::size_t bytes = geometryStorageRequirement(geometry_.electronCount(), geometry_.nucleusCount());
+    auto add = [&bytes](const std::vector<double>& buffer) {
+      addStorageBytes(bytes, checkedStorageBytes<double>(buffer.size(), "PsiFormer trunk jet bytes overflow"),
+                      "PsiFormer trunk jet bytes overflow");
+    };
+    add(electron_positions_);
+    add(scalar_gradient_scratch_);
+    add(scalar_laplacian_scratch_);
+    for (const auto* jet : {&raw_features_, &features_a_, &features_b_, &query_, &key_,
+                           &projected_value_, &attention_, &attended_, &hidden_})
+      for (const auto* buffer : {&jet->value, &jet->gradient, &jet->laplacian})
+        add(*buffer);
+    return bytes;
   }
 
-private:
+protected:
   friend class DirectSpatialExecutor;
   friend class DirectBatchExecutor;
 
+  /// Invalidate publication before any mutation, including a failed request.
+  void invalidateResult()
+  {
+    observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+    if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("PsiFormer spatial trunk generation exhausted");
+    ++evaluation_generation_;
+  }
+
+  /// Preserve fail-closed overlap checks for both shared trunk and derived head buffers.
+  static bool overlapsVector(const std::vector<double>& values, const void* data, std::size_t bytes) noexcept
+  {
+    if (!bytes)
+      return false;
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data);
+    if (!data || begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+      return true;
+    if (!values.capacity())
+      return false;
+    if (values.capacity() > std::numeric_limits<std::size_t>::max() / sizeof(double))
+      return true;
+    const auto storage = reinterpret_cast<std::uintptr_t>(values.data());
+    const std::size_t size = values.capacity() * sizeof(double);
+    return !values.data() || storage > std::numeric_limits<std::uintptr_t>::max() - size ||
+        (begin < storage + size && storage < begin + bytes);
+  }
+
+  /// Check the three separately allocated value/gradient/Laplacian planes.
+  static bool overlapsJet(const DirectSpatialJetBuffer& jet, const void* data, std::size_t bytes) noexcept
+  {
+    return overlapsVector(jet.value, data, bytes) || overlapsVector(jet.gradient, data, bytes) ||
+        overlapsVector(jet.laplacian, data, bytes);
+  }
+
+  const DirectValueParameterLayout* layout_identity_;
   DirectSpatialMode mode_;
   std::size_t gradient_lanes_;
   std::size_t laplacian_lanes_;
@@ -375,14 +386,112 @@ private:
   DirectSpatialJetBuffer attention_;
   DirectSpatialJetBuffer attended_;
   DirectSpatialJetBuffer hidden_;
-  DirectSpatialJetBuffer orbital_matrices_;
-  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_workspace_;
   std::vector<double> scalar_gradient_scratch_;
   std::vector<double> scalar_laplacian_scratch_;
-  std::vector<double> output_gradient_;
-  std::vector<double> output_lap_log_;
-  std::vector<double> output_lap_ratio_;
   std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+  std::size_t evaluation_generation_ = 0;
+};
+
+/** Retain the complete legacy real orbital/determinant/output buffers over the trunk. */
+class DirectSpatialWorkspace : public DirectSpatialTrunkWorkspace
+{
+public:
+  /// Require full real preparation before reserving any real head buffers.
+  DirectSpatialWorkspace(const DirectValueParameterLayout& layout, GeometryPositionView nuclei,
+      DirectSpatialMode mode, GeometryBoundary boundary = {})
+      : DirectSpatialTrunkWorkspace(requireFullLayout(layout), nuclei, mode, boundary),
+        orbital_matrices_(layout.determinantCount() * layout.electronCount() * layout.electronCount(),
+                          gradient_lanes_, laplacian_lanes_),
+        determinant_workspace_(layout.determinantCount(), layout.electronCount(), gradient_lanes_, laplacian_lanes_),
+        output_gradient_(gradient_lanes_), output_lap_log_(laplacian_lanes_), output_lap_ratio_(laplacian_lanes_)
+  {}
+
+  /// Complete real workspaces remain exclusively owned.
+  DirectSpatialWorkspace(const DirectSpatialWorkspace&) = delete;
+
+  /// Prevent sharing mutable head scratch through assignment.
+  DirectSpatialWorkspace& operator=(const DirectSpatialWorkspace&) = delete;
+
+  /// Transfer all prepared real buffers together.
+  DirectSpatialWorkspace(DirectSpatialWorkspace&&) = default;
+
+  /// Transfer the complete real preparation.
+  DirectSpatialWorkspace& operator=(DirectSpatialWorkspace&&) = default;
+
+  /// Include head/output allocations in the process-local storage identity.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = DirectSpatialTrunkWorkspace::storageFingerprint();
+    for (const auto* buffer : {&orbital_matrices_.value, &orbital_matrices_.gradient, &orbital_matrices_.laplacian,
+                              &output_gradient_, &output_lap_log_, &output_lap_ratio_})
+      qmcplusplus::psiformer::determinant::detail::mixStorage(hash, *buffer);
+    hash ^= determinant_workspace_.storageFingerprint();
+    hash *= 1099511628211ULL;
+    return hash;
+  }
+
+  /// Preserve complete real-head overlap detection used by existing consumers.
+  bool overlapsStorage(const void* data, std::size_t bytes) const noexcept
+  {
+    return DirectSpatialTrunkWorkspace::overlapsStorage(data, bytes) || overlapsJet(orbital_matrices_, data, bytes) ||
+        determinant_workspace_.overlapsStorage(data, bytes) || overlapsVector(output_gradient_, data, bytes) ||
+        overlapsVector(output_lap_log_, data, bytes) || overlapsVector(output_lap_ratio_, data, bytes);
+  }
+
+  /// Preserve the exact inclusive numeric storage total of the legacy full preparation.
+  std::size_t vectorStorageBytes() const
+  {
+    std::size_t bytes = DirectSpatialTrunkWorkspace::vectorStorageBytes();
+    for (const auto* buffer : {&orbital_matrices_.value, &orbital_matrices_.gradient, &orbital_matrices_.laplacian,
+                              &output_gradient_, &output_lap_log_, &output_lap_ratio_})
+      addStorageBytes(bytes, checkedStorageBytes<double>(buffer->capacity(), "PsiFormer spatial bytes overflow"),
+                      "PsiFormer spatial bytes overflow");
+    addStorageBytes(bytes, determinant_workspace_.storageBytes(), "PsiFormer spatial bytes overflow");
+    return bytes;
+  }
+
+  /// Keep the independent complete spatial storage estimator unchanged.
+  std::size_t requiredStorageBytes() const
+  {
+    const std::size_t n = geometry_.electronCount();
+    return spatialWorkspaceStorageRequirement({n, geometry_.nucleusCount(), determinant_workspace_.channels(),
+        features_a_.value.size() / n, attention_.value.size() / checkedStorageProduct(n, n,
+        "PsiFormer spatial shape overflowed"), raw_features_.value.size() / n, 0, 0},
+        mode_ == DirectSpatialMode::FULL_VGL);
+  }
+
+private:
+  friend class DirectSpatialExecutor;
+  friend class DirectBatchExecutor;
+
+  /// Reject a trunk-only parameter layout before constructing the base allocations.
+  static const DirectValueParameterLayout& requireFullLayout(const DirectValueParameterLayout& layout)
+  {
+    if (layout.preparation() != DirectValuePreparation::REAL_WAVEFUNCTION)
+      throw std::invalid_argument("PsiFormer real spatial workspace requires full real preparation");
+    return layout;
+  }
+
+  DirectSpatialJetBuffer orbital_matrices_;
+  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_workspace_;
+  std::vector<double> output_gradient_, output_lap_log_, output_lap_ratio_;
+};
+
+/** Borrow real feature/cusp jets until the next workspace edit or evaluation.
+ * Match layout identity, current parameter version and evaluation generation before
+ * reusing the view. Geometry and positions refer to the same physical configuration.
+ */
+struct DirectSpatialTrunkResultView
+{
+  const DirectSpatialJetBuffer* features;
+  std::size_t electron_count, feature_width;
+  DirectSpatialMode mode;
+  std::size_t active_electron;
+  double cusp;
+  DirectConstDoubleView cusp_gradient, cusp_laplacian;
+  const PsiFormerGeometryCache* geometry;
+  const double* packed_positions;
+  std::size_t parameter_version, evaluation_generation;
 };
 
 /** Return direct spatial outputs as non-owning views into a reusable workspace. */
@@ -406,14 +515,19 @@ public:
   DirectSpatialExecutor(const PsiFormer& model,
                         const DirectValueExecutor& value_executor,
                         const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
-                        DirectOrbitalProjection orbital_projection = DirectOrbitalProjection::SCALAR)
+                        DirectOrbitalProjection orbital_projection = DirectOrbitalProjection::SCALAR,
+                        DirectValuePreparation preparation = DirectValuePreparation::REAL_WAVEFUNCTION)
       : parameters_(model.p),
-        layout_(value_executor.layout()),
+        layout_(preparation == DirectValuePreparation::REAL_TRUNK_ONLY ?
+                    value_executor.trunkLayout() : value_executor.layout()),
         nuclei_(model.cfg.nuclei.x),
         boundary_(directGeometryBoundary(plan.environment())),
         value_executor_identity_(&value_executor),
-        orbital_projection_(orbital_projection)
+        orbital_projection_(orbital_projection), preparation_(preparation)
   {
+    if (preparation != DirectValuePreparation::REAL_WAVEFUNCTION &&
+        preparation != DirectValuePreparation::REAL_TRUNK_ONLY)
+      throw std::invalid_argument("Unknown PsiFormer spatial preparation profile");
     if (layout_->parameterCount() != plan.parameterCount() ||
         layout_->electronCount() != plan.modelShape().electrons())
       throw std::invalid_argument("PsiFormer spatial executor received an incompatible value layout");
@@ -440,13 +554,48 @@ public:
   /// Construct one clone-local workspace for a fixed spatial output family.
   std::unique_ptr<DirectSpatialWorkspace> makeWorkspace(DirectSpatialMode mode) const
   {
+    requireRealWavefunction();
     return std::make_unique<DirectSpatialWorkspace>(
         *layout_, GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()), mode, boundary_);
   }
 
   /// Expose the immutable descriptor identity used to bind batch executors safely.
-  const std::shared_ptr<const DirectValueParameterLayout>& layout() const noexcept
-  { return layout_; }
+  const std::shared_ptr<const DirectValueParameterLayout>& layout() const
+  {
+    requireRealWavefunction();
+    return layout_;
+  }
+
+  /// Expose immutable real trunk metadata through an explicit mixed-head-aware seam.
+  const std::shared_ptr<const DirectValueParameterLayout>& trunkLayout() const noexcept { return layout_; }
+
+  /// Prepare FULL or ACTIVE real jets without legacy orbital/determinant allocations.
+  std::unique_ptr<DirectSpatialTrunkWorkspace> makeTrunkWorkspace(DirectSpatialMode mode) const
+  {
+    return std::make_unique<DirectSpatialTrunkWorkspace>(*layout_,
+        GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()), mode, boundary_);
+  }
+
+  /// Publish all physical-electron feature/cusp jets after complete real trunk success.
+  DirectSpatialTrunkResultView evaluateTrunkFull(DirectSpatialTrunkWorkspace& workspace) const
+  {
+    workspace.invalidateResult();
+    if (workspace.mode_ != DirectSpatialMode::FULL_VGL)
+      throw std::invalid_argument("PsiFormer full trunk requires a FULL_VGL workspace");
+    workspace.active_electron_ = 0;
+    return evaluateTrunkImpl(workspace);
+  }
+
+  /// Publish only one physical electron's three first-derivative lanes.
+  DirectSpatialTrunkResultView evaluateTrunkActive(DirectSpatialTrunkWorkspace& workspace,
+                                                 std::size_t active_electron) const
+  {
+    workspace.invalidateResult();
+    if (workspace.mode_ != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT || active_electron >= layout_->electronCount())
+      throw std::invalid_argument("PsiFormer active trunk request has invalid mode or physical electron");
+    workspace.active_electron_ = active_electron;
+    return evaluateTrunkImpl(workspace);
+  }
 
   /// Return the exact value executor whose immutable model state is shared here.
   const DirectValueExecutor* valueExecutorIdentity() const noexcept
@@ -455,6 +604,8 @@ public:
   /// Evaluate complete log-gradient and per-electron log-Laplacian data.
   DirectSpatialResultView evaluateFull(DirectSpatialWorkspace& workspace) const
   {
+    workspace.invalidateResult();
+    requireRealWavefunction();
     if (workspace.mode_ != DirectSpatialMode::FULL_VGL)
       throw std::invalid_argument("PsiFormer full VGL requires a FULL_VGL workspace");
     workspace.active_electron_ = 0;
@@ -465,6 +616,8 @@ public:
   DirectSpatialResultView evaluateActive(DirectSpatialWorkspace& workspace,
                                          std::size_t active_electron) const
   {
+    workspace.invalidateResult();
+    requireRealWavefunction();
     if (workspace.mode_ != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
       throw std::invalid_argument("PsiFormer active gradient requires an active-gradient workspace");
     if (active_electron >= layout_->electronCount())
@@ -476,6 +629,52 @@ public:
 private:
   friend class DirectBatchExecutor;
 
+  /// Keep complete real head consumers closed to explicitly trunk-only preparation.
+  void requireRealWavefunction() const
+  {
+    if (preparation_ != DirectValuePreparation::REAL_WAVEFUNCTION)
+      throw std::invalid_argument("PsiFormer real spatial consumer cannot use trunk-only preparation");
+  }
+
+  /// Run the same embedding/attention loop for either real head or borrowed trunk jets.
+  void buildTrunk(const double* parameters, DirectSpatialTrunkWorkspace& workspace) const
+  {
+    buildEmbedding(parameters, workspace);
+    for (const auto& layer : layout_->layers_)
+      applyAttentionBlock(parameters, layer, workspace);
+  }
+
+  /// Bind identity/geometry and publish only finite real feature/cusp jets.
+  DirectSpatialTrunkResultView evaluateTrunkImpl(DirectSpatialTrunkWorkspace& workspace) const
+  {
+    layout_->validateParameterStore(parameters_);
+    const auto& boundary = workspace.geometry_.boundary();
+    if (workspace.layout_identity_ != layout_.get() || workspace.geometry_.electronCount() != layout_->electronCount() ||
+        workspace.geometry_.nucleusCount() != layout_->nucleusCount() || boundary.kind != boundary_.kind ||
+        boundary.lattice_vectors != boundary_.lattice_vectors || boundary.periodic_axes != boundary_.periodic_axes)
+      throw std::invalid_argument("PsiFormer spatial trunk workspace has a different identity or geometry");
+    for (std::size_t nucleus = 0; nucleus < layout_->nucleusCount(); ++nucleus)
+      for (std::size_t dim = 0; dim < 3; ++dim)
+        if (workspace.geometry_.nuclei()[nucleus][dim] != nuclei_[3 * nucleus + dim])
+          throw std::invalid_argument("PsiFormer spatial trunk workspace has different nuclei");
+    const double* parameters = parameters_.flat_values().data();
+    refreshGeometry(workspace);
+    buildTrunk(parameters, workspace);
+    const double cusp = accumulateCusp(parameters, workspace);
+    if (!is_finite_parameter_value(cusp))
+      throw std::runtime_error("PsiFormer spatial trunk cusp is nonfinite");
+    for (const auto* buffer : {&workspace.features_a_.value, &workspace.features_a_.gradient,
+        &workspace.features_a_.laplacian, &workspace.scalar_gradient_scratch_, &workspace.scalar_laplacian_scratch_})
+      for (double value : *buffer)
+        if (!is_finite_parameter_value(value))
+          throw std::runtime_error("PsiFormer spatial trunk jets are nonfinite");
+    workspace.observed_parameter_version_ = parameters_.version();
+    return {&workspace.features_a_, layout_->electronCount(), layout_->featureWidth(), workspace.mode_,
+        workspace.active_electron_, cusp, {workspace.scalar_gradient_scratch_.data(), workspace.gradient_lanes_},
+        {workspace.scalar_laplacian_scratch_.data(), workspace.laplacian_lanes_}, &workspace.geometry_,
+        workspace.electron_positions_.data(), workspace.observed_parameter_version_, workspace.evaluation_generation_};
+  }
+
   /// Return the beginning of one pre-resolved immutable parameter interval.
   static const double* tensor(const double* parameters,
                               const DirectParameterTensor& descriptor) noexcept
@@ -484,14 +683,14 @@ private:
   }
 
   /// Return the physical electron associated with one Cartesian gradient lane.
-  static std::size_t laneElectron(const DirectSpatialWorkspace& workspace,
+  static std::size_t laneElectron(const DirectSpatialTrunkWorkspace& workspace,
                                   std::size_t lane) noexcept
   {
     return workspace.mode_ == DirectSpatialMode::FULL_VGL ? lane / 3 : workspace.active_electron_;
   }
 
   /// Return the x/y/z component associated with one Cartesian gradient lane.
-  static std::size_t laneDimension(const DirectSpatialWorkspace& workspace,
+  static std::size_t laneDimension(const DirectSpatialTrunkWorkspace& workspace,
                                    std::size_t lane) noexcept
   {
     return workspace.mode_ == DirectSpatialMode::FULL_VGL ? lane % 3 : lane;
@@ -517,18 +716,18 @@ private:
   DirectSpatialResultView evaluateImpl(DirectSpatialWorkspace& workspace) const;
 
   /// Refresh fixed-size open-boundary pair tables from the current input positions.
-  void refreshGeometry(DirectSpatialWorkspace& workspace) const;
+  void refreshGeometry(DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Build analytic electron-nucleus features and their spatial derivatives.
-  void buildEmbedding(const double* parameters, DirectSpatialWorkspace& workspace) const;
+  void buildEmbedding(const double* parameters, DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Populate the embedding input jet without applying its shared dense projection.
-  void buildEmbeddingFeatures(DirectSpatialWorkspace& workspace) const;
+  void buildEmbeddingFeatures(DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Apply one attention/residual block to value, gradient, and Laplacian lanes.
   void applyAttentionBlock(const double* parameters,
                            const DirectValueParameterLayout::DirectAttentionLayer& layer,
-                           DirectSpatialWorkspace& workspace) const;
+                           DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Form determinant orbital matrices including spatial derivative products.
   void buildOrbitalMatrices(const double* parameters, DirectSpatialWorkspace& workspace) const;
@@ -537,7 +736,7 @@ private:
   void projectBackflowMatrices(const double* parameters, DirectSpatialWorkspace& workspace) const;
 
   /// Add analytic electron-electron cusp value and spatial derivatives in place.
-  double accumulateCusp(const double* parameters, DirectSpatialWorkspace& workspace) const;
+  double accumulateCusp(const double* parameters, DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Apply one row-major dense layer independently to every derivative lane.
   static void denseJet(const DirectSpatialJetBuffer& source,
@@ -569,10 +768,10 @@ private:
                              std::size_t laplacian_lanes);
 
   /// Build stable softmax attention values and derivative traces.
-  void buildAttentionWeights(DirectSpatialWorkspace& workspace) const;
+  void buildAttentionWeights(DirectSpatialTrunkWorkspace& workspace) const;
 
   /// Contract attention weights with value heads using spatial product rules.
-  void buildAttentionContext(DirectSpatialWorkspace& workspace) const;
+  void buildAttentionContext(DirectSpatialTrunkWorkspace& workspace) const;
 
   const Parameters& parameters_;
   std::shared_ptr<const DirectValueParameterLayout> layout_;
@@ -580,9 +779,10 @@ private:
   GeometryBoundary boundary_;
   const DirectValueExecutor* value_executor_identity_;
   DirectOrbitalProjection orbital_projection_;
+  DirectValuePreparation preparation_;
 };
 
-inline void DirectSpatialExecutor::refreshGeometry(DirectSpatialWorkspace& workspace) const
+inline void DirectSpatialExecutor::refreshGeometry(DirectSpatialTrunkWorkspace& workspace) const
 {
   workspace.geometry_.update(
       GeometryPositionView::interleaved(workspace.electron_positions_.data(), layout_->electronCount()));
@@ -706,7 +906,7 @@ inline void DirectSpatialExecutor::denseQKVJet(const DirectSpatialJetBuffer& sou
 }
 
 inline void DirectSpatialExecutor::buildEmbeddingFeatures(
-    DirectSpatialWorkspace& workspace) const
+    DirectSpatialTrunkWorkspace& workspace) const
 {
   DirectSpatialJetBuffer& raw       = workspace.raw_features_;
   const GeometryPairTable& pairs    = workspace.geometry_.electronNucleusPairs();
@@ -812,7 +1012,7 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
 
 inline void DirectSpatialExecutor::buildEmbedding(
     const double* parameters,
-    DirectSpatialWorkspace& workspace) const
+    DirectSpatialTrunkWorkspace& workspace) const
 {
   buildEmbeddingFeatures(workspace);
   denseJet(workspace.raw_features_, tensor(parameters, layout_->embedding_), nullptr,
@@ -851,7 +1051,7 @@ inline void DirectSpatialExecutor::tanhJetInPlace(DirectSpatialJetBuffer& buffer
   }
 }
 
-inline void DirectSpatialExecutor::buildAttentionWeights(DirectSpatialWorkspace& workspace) const
+inline void DirectSpatialExecutor::buildAttentionWeights(DirectSpatialTrunkWorkspace& workspace) const
 {
   DirectSpatialJetBuffer& attention = workspace.attention_;
   const DirectSpatialJetBuffer& query = workspace.query_;
@@ -989,7 +1189,7 @@ inline void DirectSpatialExecutor::buildAttentionWeights(DirectSpatialWorkspace&
     }
 }
 
-inline void DirectSpatialExecutor::buildAttentionContext(DirectSpatialWorkspace& workspace) const
+inline void DirectSpatialExecutor::buildAttentionContext(DirectSpatialTrunkWorkspace& workspace) const
 {
   DirectSpatialJetBuffer& output        = workspace.attended_;
   const DirectSpatialJetBuffer& weights = workspace.attention_;
@@ -1035,7 +1235,7 @@ inline void DirectSpatialExecutor::buildAttentionContext(DirectSpatialWorkspace&
 inline void DirectSpatialExecutor::applyAttentionBlock(
     const double* parameters,
     const DirectValueParameterLayout::DirectAttentionLayer& layer,
-    DirectSpatialWorkspace& workspace) const
+    DirectSpatialTrunkWorkspace& workspace) const
 {
   const std::size_t electron_count = layout_->electronCount();
   const std::size_t feature_width  = layout_->featureWidth();
@@ -1229,7 +1429,7 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
 }
 
 inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
-                                                    DirectSpatialWorkspace& workspace) const
+                                                    DirectSpatialTrunkWorkspace& workspace) const
 {
   std::fill(workspace.scalar_gradient_scratch_.begin(), workspace.scalar_gradient_scratch_.end(), 0.0);
   std::fill(workspace.scalar_laplacian_scratch_.begin(), workspace.scalar_laplacian_scratch_.end(), 0.0);
@@ -1294,9 +1494,7 @@ inline DirectSpatialResultView DirectSpatialExecutor::evaluateImpl(
 
   const double* parameter_values = parameters_.flat_values().data();
   refreshGeometry(workspace);
-  buildEmbedding(parameter_values, workspace);
-  for (std::size_t layer = 0; layer < layout_->layers_.size(); ++layer)
-    applyAttentionBlock(parameter_values, layout_->layers_[layer], workspace);
+  buildTrunk(parameter_values, workspace);
   buildOrbitalMatrices(parameter_values, workspace);
   namespace determinant = qmcplusplus::psiformer::determinant;
   const determinant::RealDeterminantResult determinant_result =
