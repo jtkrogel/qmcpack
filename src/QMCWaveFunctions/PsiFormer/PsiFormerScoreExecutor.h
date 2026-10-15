@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerScoreExecutor.h
- * @brief Direct allocation-free parameter-score evaluator for real molecular PsiFormer.
+ * @brief Shared real open/periodic score tape and guarded complete real score evaluator.
  *
  * The evaluator records a compact forward tape and explicitly applies the reverse
  * chain rule for the embedding, attention blocks, orbital/envelope construction,
@@ -18,10 +18,9 @@
  *
  * Immutable tensor offsets and execution semantics come from PsiFormerExecutionPlan;
  * all tape, adjoint, geometry, and output storage is clone-local.  The implemented
- * kernels are deliberately real/open-boundary/fixed-nucleus only.  Plan scalar-domain,
- * adjoint-convention, and boundary metadata remain explicit so later complex and
- * periodic specializations can replace algebra and geometry policies without changing
- * parameter identity or the public score contract.
+ * neural kernels are real/fixed-nucleus; explicit head-free preparation can expose
+ * a real open/periodic tape for complex composition without admitting a complex
+ * public wavefunction, score or optimizer capability.
  */
 
 //////////////////////////////////////////////////////////////////////////////////////
@@ -244,6 +243,9 @@ struct DirectOrbitalMSEResult
   std::size_t parameter_version = 0;
 };
 
+/// Stable executor identity binds each new head-free tape to its originating owner.
+class DirectScoreExecutor;
+
 /**
  * Own the forward tape, reverse adjoints, geometry cache, and score for one clone.
  *
@@ -251,14 +253,15 @@ struct DirectOrbitalMSEResult
  * This makes a warmed-up call allocation-free and prevents mutable scratch from
  * being shared between QMCPACK walker/crowd clones.
  */
-class DirectScoreWorkspace
+class DirectScoreTrunkWorkspace
 {
 public:
   /// Allocate the exact tape and reverse storage required by one execution plan.
-  DirectScoreWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
-                       GeometryPositionView nuclei,
-                       GeometryBoundary boundary = {})
-      : electrons_(plan.modelShape().electrons()),
+  DirectScoreTrunkWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                            GeometryPositionView nuclei,
+                            GeometryBoundary boundary = {},
+                            const DirectScoreExecutor* owner = nullptr)
+      : owner_(owner), electrons_(plan.modelShape().electrons()),
         nuclei_(plan.modelShape().nuclei),
         determinants_(plan.modelShape().determinants),
         width_(plan.modelShape().feature_dimension),
@@ -281,10 +284,6 @@ public:
         residuals_(blocks_ * feature_elements_),
         hidden_(blocks_ * feature_elements_),
         updates_(blocks_ * feature_elements_),
-        orbital_matrices_(orbital_elements_),
-        determinant_workspace_(determinants_, electrons_),
-        matrix_adjoints_(orbital_elements_),
-        backflow_adjoints_(electrons_ * determinants_ * electrons_),
         parameter_score_(plan.parameterCount()),
         feature_adjoint_a_(feature_elements_),
         feature_adjoint_b_(feature_elements_),
@@ -301,14 +300,40 @@ public:
       throw std::invalid_argument("PsiFormer score workspace received inconsistent attention dimensions");
   }
 
-  DirectScoreWorkspace(const DirectScoreWorkspace&) = delete;
-  DirectScoreWorkspace& operator=(const DirectScoreWorkspace&) = delete;
-  DirectScoreWorkspace(DirectScoreWorkspace&&) = default;
-  DirectScoreWorkspace& operator=(DirectScoreWorkspace&&) = default;
+  /// Prepared mutable tape/adjoints cannot be copied across clones.
+  DirectScoreTrunkWorkspace(const DirectScoreTrunkWorkspace&) = delete;
+
+  /// Preserve exclusive numerical buffer ownership.
+  DirectScoreTrunkWorkspace& operator=(const DirectScoreTrunkWorkspace&) = delete;
+
+  /// Moving transfers preparation but invalidates old borrowed workspace-address views.
+  DirectScoreTrunkWorkspace(DirectScoreTrunkWorkspace&&) = default;
+
+  /// Assignment similarly invalidates every old borrowed tape/result.
+  DirectScoreTrunkWorkspace& operator=(DirectScoreTrunkWorkspace&&) = default;
+
+  /// Polymorphic ownership keeps derived full-score storage destruction safe.
+  virtual ~DirectScoreTrunkWorkspace() = default;
+
+  /// Return the forward tape stamp, unaffected by successful reverse passes.
+  std::size_t forwardGeneration() const noexcept { return forward_generation_; }
+
+  /// Return the separate reverse result stamp, including rejected reverse requests.
+  std::size_t resultGeneration() const noexcept { return reverse_generation_; }
+
+  /// Expose a completed reverse scratch result until any next request invalidates it.
+  DirectParameterScoreView trunkParameterScore() const
+  {
+    if (!reverse_valid_)
+      throw std::logic_error("PsiFormer trunk reverse result unavailable");
+    return {parameter_score_.data(), parameter_score_.size()};
+  }
 
   /// Copy a complete interleaved electron configuration into fixed workspace storage.
   void setPositions(GeometryPositionView positions)
   {
+    if (owner_)
+      invalidateTape();
     if (positions.size() != electrons_)
       throw std::invalid_argument("PsiFormer score workspace received the wrong electron count");
     for (std::size_t electron = 0; electron < electrons_; ++electron)
@@ -319,6 +344,8 @@ public:
   /// Overwrite one Cartesian coordinate without changing any buffer capacity.
   void setPosition(std::size_t electron, std::size_t dimension, double coordinate)
   {
+    if (owner_)
+      invalidateTape();
     if (electron >= electrons_ || dimension >= 3)
       throw std::out_of_range("PsiFormer score workspace coordinate index is out of range");
     electron_positions_[3 * electron + dimension] = coordinate;
@@ -353,16 +380,13 @@ public:
     for (const auto* buffer : {
              &electron_positions_, &raw_features_, &features_, &queries_,
              &keys_, &values_, &attention_weights_, &contexts_, &residuals_,
-             &hidden_, &updates_, &orbital_matrices_, &matrix_adjoints_,
-             &backflow_adjoints_,
+             &hidden_, &updates_,
              &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
              &query_adjoint_, &key_adjoint_, &value_adjoint_,
              &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
              &hidden_adjoint_, &update_adjoint_})
       mix(*buffer);
     hash ^= geometry_.storageFingerprint();
-    hash *= 1099511628211ULL;
-    hash ^= determinant_workspace_.storageFingerprint();
     hash *= 1099511628211ULL;
     return hash;
   }
@@ -381,16 +405,13 @@ public:
     for (const auto* buffer : {
              &electron_positions_, &raw_features_, &features_, &queries_,
              &keys_, &values_, &attention_weights_, &contexts_, &residuals_,
-             &hidden_, &updates_, &orbital_matrices_, &matrix_adjoints_,
-             &backflow_adjoints_,
+             &hidden_, &updates_,
              &parameter_score_, &feature_adjoint_a_, &feature_adjoint_b_,
              &query_adjoint_, &key_adjoint_, &value_adjoint_,
              &attention_adjoint_, &context_adjoint_, &residual_adjoint_,
              &hidden_adjoint_, &update_adjoint_})
       add(*buffer);
     addStorageBytes(bytes, geometry_.storageBytes(),
-                    "PsiFormer score storage bytes overflowed");
-    addStorageBytes(bytes, determinant_workspace_.storageBytes(),
                     "PsiFormer score storage bytes overflowed");
     return bytes;
   }
@@ -402,13 +423,41 @@ public:
   /// Return the checked constructor-time requirement for this fixed model shape.
   std::size_t requiredStorageBytes() const
   {
-    return scoreWorkspaceStorageRequirement(
+    const std::size_t complete = scoreWorkspaceStorageRequirement(
         {electrons_, nuclei_, determinants_, width_, heads_, input_width_,
          blocks_, parameter_score_.size()});
+    return complete - headStorageBytes();
   }
 
-private:
+protected:
   friend class DirectScoreExecutor;
+
+  /// Count exactly the existing full-score head allocations omitted by this base.
+  std::size_t headStorageBytes() const
+  {
+    return checkedStorageBytes<double>(3 * orbital_elements_, "score head bytes overflow") +
+        determinantStorageRequirement(determinants_, electrons_);
+  }
+
+  /// Reject old borrowed tape/result views before any new input or forward request.
+  void invalidateTape()
+  {
+    tape_valid_ = reverse_valid_ = false;
+    observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+    if (forward_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("PsiFormer score forward generation exhausted");
+    ++forward_generation_;
+  }
+
+  /// Failed reverse attempts cannot expose the previous score publication.
+  void invalidateReverse()
+  {
+    reverse_valid_ = false;
+    observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+    if (reverse_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("PsiFormer score reverse generation exhausted");
+    ++reverse_generation_;
+  }
 
   /// Return the feature matrix entering the requested block (or final matrix).
   double* features(std::size_t boundary) { return features_.data() + boundary * feature_elements_; }
@@ -431,6 +480,10 @@ private:
     return buffer.data() + block * block_size;
   }
 
+  const DirectScoreExecutor* owner_;
+  std::size_t forward_generation_ = 0, reverse_generation_ = 0;
+  std::size_t tape_parameter_version_ = std::numeric_limits<std::size_t>::max();
+  bool tape_valid_ = false, reverse_valid_ = false;
   std::size_t electrons_;
   std::size_t nuclei_;
   std::size_t determinants_;
@@ -455,10 +508,6 @@ private:
   std::vector<double> residuals_;
   std::vector<double> hidden_;
   std::vector<double> updates_;
-  std::vector<double> orbital_matrices_;
-  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_workspace_;
-  std::vector<double> matrix_adjoints_;
-  std::vector<double> backflow_adjoints_;
   std::vector<double> parameter_score_;
 
   std::vector<double> feature_adjoint_a_;
@@ -474,14 +523,87 @@ private:
   std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
 };
 
-/** Evaluate log|Psi| and its full canonical parameter score by a taped reverse pass. */
+/// Legacy complete real score storage adds only real orbital/determinant head buffers.
+class DirectScoreWorkspace : public DirectScoreTrunkWorkspace
+{
+public:
+  /// Preserve every default real allocation and its inclusive accounting.
+  DirectScoreWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                       GeometryPositionView nuclei, GeometryBoundary boundary = {})
+      : DirectScoreTrunkWorkspace(plan, nuclei, boundary),
+        orbital_matrices_(orbital_elements_), determinant_workspace_(determinants_, electrons_),
+        matrix_adjoints_(orbital_elements_), backflow_adjoints_(orbital_elements_)
+  {}
+
+  /// Include legacy head allocations in warmed allocation fingerprints.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = DirectScoreTrunkWorkspace::storageFingerprint();
+    for (const auto* buffer : {&orbital_matrices_, &matrix_adjoints_, &backflow_adjoints_})
+    {
+      hash ^= reinterpret_cast<std::uintptr_t>(buffer->data());
+      hash *= 1099511628211ULL;
+      hash ^= buffer->capacity();
+      hash *= 1099511628211ULL;
+    }
+    return hash ^ determinant_workspace_.storageFingerprint();
+  }
+
+  /// Include the complete real head without changing the shared trunk's buffer sizes.
+  std::size_t vectorStorageBytes() const
+  {
+    return DirectScoreTrunkWorkspace::vectorStorageBytes() +
+        checkedStorageBytes<double>(orbital_matrices_.capacity() + matrix_adjoints_.capacity() +
+            backflow_adjoints_.capacity(), "score head bytes overflow") + determinant_workspace_.storageBytes();
+  }
+
+  /// Preserve the independent exact legacy complete-workspace requirement.
+  std::size_t requiredStorageBytes() const
+  {
+    return scoreWorkspaceStorageRequirement({electrons_, nuclei_, determinants_, width_, heads_,
+        input_width_, blocks_, parameter_score_.size()});
+  }
+
+private:
+  friend class DirectScoreExecutor;
+  std::vector<double> orbital_matrices_;
+  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_workspace_;
+  std::vector<double> matrix_adjoints_, backflow_adjoints_;
+};
+
+/// Explicit head-free preparation never changes the default real-wavefunction admission.
+enum class DirectScorePreparation { REAL_WAVEFUNCTION, REAL_TRUNK_ONLY };
+
+/// Borrow immutable forward features and geometry until any next input/forward request.
+struct DirectScoreTrunkResultView
+{
+  const DirectScoreTrunkWorkspace* workspace = nullptr;
+  const double* features = nullptr;
+  std::size_t feature_count = 0;
+  const PsiFormerGeometryCache* geometry = nullptr;
+  const double* packed_positions = nullptr;
+  std::size_t parameter_version = 0, forward_generation = 0;
+};
+
+/// Borrow one real cotangent response until the next attempted reverse/forward request.
+struct DirectScoreTrunkReverseResult
+{
+  DirectParameterScoreView parameter_score;
+  std::size_t parameter_version = 0, forward_generation = 0, result_generation = 0;
+};
+
+/** Evaluate complete real scores or expose a head-free real taped reverse seam.
+ * Moving this executor invalidates its owner-bound trunk workspaces; copy-created
+ * executors have independent identities. Complete real default behavior is unchanged.
+ */
 class DirectScoreExecutor
 {
 public:
   /// Reuse an execution plan shared by the owning PsiFormer wavefunction state.
   DirectScoreExecutor(const PsiFormer& model,
-                      const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
-      : parameters_(model.p),
+                      const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                      DirectScorePreparation preparation = DirectScorePreparation::REAL_WAVEFUNCTION)
+      : preparation_(preparation), parameters_(model.p),
         plan_(plan),
         nuclei_(model.cfg.nuclei.x),
         spin_up_electrons_(model.cfg.nup),
@@ -496,7 +618,10 @@ public:
       throw std::invalid_argument("PsiFormer score execution plan does not match the imported model");
     if (plan_.environment().parameter_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
         plan_.environment().compute_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
-        plan_.environment().amplitude_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL ||
+        (preparation_ == DirectScorePreparation::REAL_WAVEFUNCTION &&
+         plan_.environment().amplitude_scalar_domain != qmcplusplus::psiformer::ScalarDomain::REAL) ||
+        (preparation_ != DirectScorePreparation::REAL_WAVEFUNCTION &&
+         preparation_ != DirectScorePreparation::REAL_TRUNK_ONLY) ||
         !plan_.environment().fixed_nuclei)
       throw std::invalid_argument("Direct PsiFormer score supports only real, fixed-nucleus models");
   }
@@ -504,8 +629,83 @@ public:
   /// Construct independently mutable tape and adjoint storage for one clone.
   std::unique_ptr<DirectScoreWorkspace> makeWorkspace() const
   {
+    requireFullProfile();
     return std::make_unique<DirectScoreWorkspace>(
         plan_, GeometryPositionView::interleaved(nuclei_.data(), plan_.modelShape().nuclei), boundary_);
+  }
+
+  /// Prepare one owner-bound real tape without real orbital/determinant head buffers.
+  std::unique_ptr<DirectScoreTrunkWorkspace> makeTrunkWorkspace() const
+  {
+    return std::make_unique<DirectScoreTrunkWorkspace>(plan_,
+        GeometryPositionView::interleaved(nuclei_.data(), plan_.modelShape().nuclei), boundary_, this);
+  }
+
+  /// Publish one immutable tape; any failed new request invalidates the previous tape.
+  DirectScoreTrunkResultView evaluateTrunk(DirectScoreTrunkWorkspace& workspace) const
+  {
+    workspace.invalidateTape();
+    validateTrunkOwner(workspace);
+    buildTrunk(parameters_.flat_values().data(), workspace);
+    for (const auto* buffer : {&workspace.raw_features_, &workspace.features_, &workspace.queries_,
+             &workspace.keys_, &workspace.values_, &workspace.attention_weights_, &workspace.contexts_,
+             &workspace.residuals_, &workspace.hidden_, &workspace.updates_})
+      for (double value : *buffer)
+        if (!is_finite_parameter_value(value))
+          throw std::overflow_error("PsiFormer score trunk produced a nonfinite tape");
+    workspace.tape_parameter_version_ = parameters_.version();
+    workspace.observed_parameter_version_ = parameters_.version();
+    workspace.tape_valid_ = true;
+    return {&workspace, workspace.features(workspace.blocks_), workspace.feature_elements_,
+            &workspace.geometry_, workspace.electron_positions_.data(),
+            parameters_.version(), workspace.forward_generation_};
+  }
+
+  /** Reverse a real feature cotangent over the same immutable forward tape.
+   * Each pass clears the one P-sized scratch and all adjoints. Forward buffers are
+   * read-only throughout; a failed reverse invalidates only reverse publication,
+   * so a corrected seed may reuse the same current tape. Stale parameters require
+   * a fresh forward call. Seeds may not alias the reusable reverse score scratch.
+   */
+  DirectScoreTrunkReverseResult reverseTrunk(DirectScoreTrunkWorkspace& workspace,
+      const DirectScoreTrunkResultView& tape, const double* seed, std::size_t seed_count) const
+  {
+    workspace.invalidateReverse();
+    validateTrunkOwner(workspace);
+    if (!workspace.tape_valid_ || tape.workspace != &workspace ||
+        tape.forward_generation != workspace.forward_generation_ ||
+        tape.parameter_version != parameters_.version() ||
+        tape.parameter_version != workspace.tape_parameter_version_ ||
+        tape.features != workspace.features(workspace.blocks_) ||
+        tape.feature_count != workspace.feature_elements_)
+      throw std::invalid_argument("PsiFormer score reverse requires the current owner-bound tape");
+    if (!seed || seed_count != workspace.feature_elements_)
+      throw std::invalid_argument("PsiFormer score feature cotangent extent disagrees");
+    const auto seed_begin = reinterpret_cast<std::uintptr_t>(seed);
+    const auto score_begin = reinterpret_cast<std::uintptr_t>(workspace.parameter_score_.data());
+    if (seed_begin < score_begin + workspace.parameter_score_.size() * sizeof(double) &&
+        score_begin < seed_begin + seed_count * sizeof(double))
+      throw std::invalid_argument("PsiFormer score feature cotangent aliases reverse output");
+    for (std::size_t i = 0; i < seed_count; ++i)
+      if (!is_finite_parameter_value(seed[i]))
+        throw std::invalid_argument("PsiFormer score feature cotangent is nonfinite");
+    for (auto* buffer : {&workspace.parameter_score_, &workspace.feature_adjoint_a_,
+             &workspace.feature_adjoint_b_, &workspace.query_adjoint_, &workspace.key_adjoint_,
+             &workspace.value_adjoint_, &workspace.attention_adjoint_, &workspace.context_adjoint_,
+             &workspace.residual_adjoint_, &workspace.hidden_adjoint_, &workspace.update_adjoint_})
+      std::fill(buffer->begin(), buffer->end(), 0.0);
+    std::copy_n(seed, seed_count, workspace.feature_adjoint_a_.data());
+    reverseFeatures(parameters_.flat_values().data(), workspace);
+    // Reverse helpers swap only adjoint buffers, never any immutable forward tape.
+    if (workspace.blocks_ % 2)
+      workspace.feature_adjoint_a_.swap(workspace.feature_adjoint_b_);
+    for (double value : workspace.parameter_score_)
+      if (!is_finite_parameter_value(value))
+        throw std::overflow_error("PsiFormer score trunk reverse produced a nonfinite response");
+    workspace.observed_parameter_version_ = parameters_.version();
+    workspace.reverse_valid_ = true;
+    return {{workspace.parameter_score_.data(), workspace.parameter_score_.size()},
+            parameters_.version(), workspace.forward_generation_, workspace.reverse_generation_};
   }
 
   /// Return immutable typed execution metadata shared by all workspaces.
@@ -531,6 +731,7 @@ public:
       double* log_abs,
       std::size_t channel_count) const
   {
+    requireFullProfile();
     validateWorkspaceAndParameters(workspace);
     if (!phases || !log_abs)
       throw std::invalid_argument("PsiFormer channel-amplitude output pointer is null");
@@ -538,11 +739,7 @@ public:
       throw std::invalid_argument("PsiFormer channel-amplitude output count is incorrect");
 
     const double* parameter_values = parameters_.flat_values().data();
-    workspace.geometry_.update(
-        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
-    buildEmbedding(parameter_values, workspace);
-    for (std::size_t block = 0; block < workspace.blocks_; ++block)
-      applyAttentionBlock(parameter_values, block, workspace);
+    buildTrunk(parameter_values, workspace);
     buildOrbitals(parameter_values, workspace);
     workspace.determinant_workspace_.evaluateValue(workspace.orbital_matrices_.data());
     const double cusp = cuspValueAndReverse(parameter_values, workspace, 0.0);
@@ -575,6 +772,7 @@ public:
       const double* weights,
       std::size_t weight_count) const
   {
+    requireFullProfile();
     validateWorkspaceAndParameters(workspace);
     if (!weights)
       throw std::invalid_argument("PsiFormer weighted channel score pointer is null");
@@ -592,11 +790,7 @@ public:
 
     const double* parameter_values = parameters_.flat_values().data();
     std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
-    workspace.geometry_.update(
-        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
-    buildEmbedding(parameter_values, workspace);
-    for (std::size_t block = 0; block < workspace.blocks_; ++block)
-      applyAttentionBlock(parameter_values, block, workspace);
+    buildTrunk(parameter_values, workspace);
     buildOrbitals(parameter_values, workspace);
     workspace.determinant_workspace_.evaluate(workspace.orbital_matrices_.data());
     workspace.determinant_workspace_.fillWeightedChannelLogAmplitudeMatrixAdjoints(
@@ -604,9 +798,7 @@ public:
     cuspValueAndReverse(parameter_values, workspace, cusp_seed);
 
     reverseOrbitals(parameter_values, workspace);
-    for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
-      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace);
-    reverseEmbedding(workspace);
+    reverseFeatures(parameter_values, workspace);
     workspace.observed_parameter_version_ = parameters_.version();
     return {{workspace.parameter_score_.data(), workspace.parameter_score_.size()},
             workspace.observed_parameter_version_};
@@ -625,15 +817,12 @@ private:
   DirectScoreResult evaluateImpl(DirectScoreWorkspace& workspace,
                                  DirectAffineObservationSink* observer) const
   {
+    requireFullProfile();
     validateWorkspaceAndParameters(workspace);
     const double* parameter_values = parameters_.flat_values().data();
     std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
 
-    workspace.geometry_.update(
-        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
-    buildEmbedding(parameter_values, workspace);
-    for (std::size_t block = 0; block < workspace.blocks_; ++block)
-      applyAttentionBlock(parameter_values, block, workspace);
+    buildTrunk(parameter_values, workspace);
     buildOrbitals(parameter_values, workspace);
 
     namespace determinant = qmcplusplus::psiformer::determinant;
@@ -650,9 +839,7 @@ private:
       throw std::runtime_error("PsiFormer score executor produced a non-finite log wavefunction");
 
     reverseOrbitals(parameter_values, workspace, observer);
-    for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
-      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace, observer);
-    reverseEmbedding(workspace);
+    reverseFeatures(parameter_values, workspace, observer);
     if (observer)
       observer->observe({ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
                          qmcplusplus::psiformer::NO_ATTENTION_BLOCK,
@@ -694,6 +881,7 @@ public:
   DirectOrbitalMSEResult evaluateOrbitalMSE(DirectScoreWorkspace& workspace,
                                             DirectOrbitalMSEArguments arguments) const
   {
+    requireFullProfile();
     validateWorkspaceAndParameters(workspace);
     if (arguments.target_size != workspace.orbital_elements_ ||
         (arguments.target_size != 0 && !arguments.target))
@@ -701,11 +889,7 @@ public:
 
     const double* parameter_values = parameters_.flat_values().data();
     std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
-    workspace.geometry_.update(
-        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
-    buildEmbedding(parameter_values, workspace);
-    for (std::size_t block = 0; block < workspace.blocks_; ++block)
-      applyAttentionBlock(parameter_values, block, workspace);
+    buildTrunk(parameter_values, workspace);
     buildOrbitals(parameter_values, workspace);
 
     const std::size_t up_elements =
@@ -735,9 +919,7 @@ public:
         }
 
     reverseOrbitals(parameter_values, workspace);
-    for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
-      reverseAttentionBlock(parameter_values, reverse_index - 1, workspace);
-    reverseEmbedding(workspace);
+    reverseFeatures(parameter_values, workspace);
 
     workspace.observed_parameter_version_ = parameters_.version();
     const double loss = up_loss + down_loss;
@@ -754,6 +936,46 @@ public:
 private:
   using ParameterRole = qmcplusplus::psiformer::ParameterRole;
   using ParameterTensorDescriptor = qmcplusplus::psiformer::ParameterTensorDescriptor;
+
+  /// Complete real-head entry points remain unavailable for explicit head-free owners.
+  void requireFullProfile() const
+  {
+    if (preparation_ != DirectScorePreparation::REAL_WAVEFUNCTION)
+      throw std::logic_error("PsiFormer trunk-only score owner cannot evaluate a real head");
+  }
+
+  /// New borrowed tape admission is identity-bound rather than merely shape-compatible.
+  void validateTrunkOwner(const DirectScoreTrunkWorkspace& workspace) const
+  {
+    const auto& boundary = workspace.geometry_.boundary();
+    if (workspace.owner_ != this || nuclei_.size() != 3 * workspace.nuclei_ || boundary.kind != boundary_.kind ||
+        boundary.lattice_vectors != boundary_.lattice_vectors || boundary.periodic_axes != boundary_.periodic_axes)
+      throw std::invalid_argument("PsiFormer score trunk workspace belongs to another executor");
+    validateWorkspaceAndParameters(workspace);
+    for (std::size_t nucleus = 0; nucleus < workspace.nuclei_; ++nucleus)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (workspace.geometry_.nuclei()[nucleus][dimension] != nuclei_[3 * nucleus + dimension])
+          throw std::invalid_argument("PsiFormer score trunk workspace has different nuclei");
+  }
+
+  /// Share the exact real geometry, embedding and attention forward loop with legacy paths.
+  void buildTrunk(const double* parameters, DirectScoreTrunkWorkspace& workspace) const
+  {
+    workspace.geometry_.update(
+        GeometryPositionView::interleaved(workspace.electron_positions_.data(), workspace.electrons_));
+    buildEmbedding(parameters, workspace);
+    for (std::size_t block = 0; block < workspace.blocks_; ++block)
+      applyAttentionBlock(parameters, block, workspace);
+  }
+
+  /// Shared reverse loop reads immutable NN buffers and writes only real adjoint scratch.
+  void reverseFeatures(const double* parameters, DirectScoreTrunkWorkspace& workspace,
+                       DirectAffineObservationSink* observer = nullptr) const
+  {
+    for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
+      reverseAttentionBlock(parameters, reverse_index - 1, workspace, observer);
+    reverseEmbedding(workspace);
+  }
 
   /// Map supported execution-plan boundaries to the geometry policy explicitly.
   static GeometryBoundary mappedBoundary(
@@ -774,7 +996,7 @@ private:
   }
 
   /// Return writable canonical score storage for one typed parameter tensor.
-  double* score(DirectScoreWorkspace& workspace,
+  double* score(DirectScoreTrunkWorkspace& workspace,
                 ParameterRole role,
                 std::size_t block = qmcplusplus::psiformer::NO_ATTENTION_BLOCK) const
   {
@@ -782,7 +1004,7 @@ private:
   }
 
   /// Reject a workspace from a different shape or a mutated parameter layout.
-  void validateWorkspaceAndParameters(const DirectScoreWorkspace& workspace) const
+  void validateWorkspaceAndParameters(const DirectScoreTrunkWorkspace& workspace) const
   {
     const auto& shape = plan_.modelShape();
     if (workspace.electrons_ != shape.electrons() || workspace.nuclei_ != shape.nuclei ||
@@ -798,7 +1020,7 @@ private:
   }
 
   /// Form electron-nucleus features and the first learned embedding matrix.
-  void buildEmbedding(const double* parameters, DirectScoreWorkspace& workspace) const
+  void buildEmbedding(const double* parameters, DirectScoreTrunkWorkspace& workspace) const
   {
     const GeometryPairTable& pairs = workspace.geometry_.electronNucleusPairs();
     const auto& displacements      = pairs.displacements();
@@ -833,11 +1055,11 @@ private:
   /// Evaluate one attention/residual block and retain precisely the reverse tape.
   void applyAttentionBlock(const double* parameters,
                            std::size_t block,
-                           DirectScoreWorkspace& workspace) const
+                           DirectScoreTrunkWorkspace& workspace) const
   {
-    double* query = DirectScoreWorkspace::blockBuffer(workspace.queries_, block, workspace.feature_elements_);
-    double* key   = DirectScoreWorkspace::blockBuffer(workspace.keys_, block, workspace.feature_elements_);
-    double* value = DirectScoreWorkspace::blockBuffer(workspace.values_, block, workspace.feature_elements_);
+    double* query = DirectScoreTrunkWorkspace::blockBuffer(workspace.queries_, block, workspace.feature_elements_);
+    double* key   = DirectScoreTrunkWorkspace::blockBuffer(workspace.keys_, block, workspace.feature_elements_);
+    double* value = DirectScoreTrunkWorkspace::blockBuffer(workspace.values_, block, workspace.feature_elements_);
     const double* input = workspace.features(block);
     qmcplusplus::psiformer::direct::denseForward(
         input, parameter(parameters, ParameterRole::ATTENTION_QUERY_WEIGHT, block), nullptr,
@@ -850,21 +1072,21 @@ private:
         workspace.electrons_, workspace.width_, workspace.width_, value);
 
     double* attention =
-        DirectScoreWorkspace::blockBuffer(workspace.attention_weights_, block, workspace.attention_elements_);
-    double* context = DirectScoreWorkspace::blockBuffer(workspace.contexts_, block, workspace.feature_elements_);
+        DirectScoreTrunkWorkspace::blockBuffer(workspace.attention_weights_, block, workspace.attention_elements_);
+    double* context = DirectScoreTrunkWorkspace::blockBuffer(workspace.contexts_, block, workspace.feature_elements_);
     qmcplusplus::psiformer::direct::attentionWeightsForward(
         query, key, workspace.electrons_, workspace.heads_, workspace.head_width_, attention);
     qmcplusplus::psiformer::direct::attentionContextForward(
         attention, value, workspace.electrons_, workspace.heads_, workspace.head_width_, context);
 
-    double* residual = DirectScoreWorkspace::blockBuffer(workspace.residuals_, block, workspace.feature_elements_);
+    double* residual = DirectScoreTrunkWorkspace::blockBuffer(workspace.residuals_, block, workspace.feature_elements_);
     qmcplusplus::psiformer::direct::denseForward(
         context, parameter(parameters, ParameterRole::ATTENTION_OUTPUT_WEIGHT, block), nullptr,
         workspace.electrons_, workspace.width_, workspace.width_, residual);
     for (std::size_t element = 0; element < workspace.feature_elements_; ++element)
       residual[element] += input[element];
 
-    double* hidden = DirectScoreWorkspace::blockBuffer(workspace.hidden_, block, workspace.feature_elements_);
+    double* hidden = DirectScoreTrunkWorkspace::blockBuffer(workspace.hidden_, block, workspace.feature_elements_);
     qmcplusplus::psiformer::direct::denseForward(
         residual, parameter(parameters, ParameterRole::UPDATE_HIDDEN_WEIGHT, block),
         parameter(parameters, ParameterRole::UPDATE_HIDDEN_BIAS, block), workspace.electrons_,
@@ -872,7 +1094,7 @@ private:
     for (std::size_t element = 0; element < workspace.feature_elements_; ++element)
       hidden[element] = std::tanh(hidden[element]);
 
-    double* update = DirectScoreWorkspace::blockBuffer(workspace.updates_, block, workspace.feature_elements_);
+    double* update = DirectScoreTrunkWorkspace::blockBuffer(workspace.updates_, block, workspace.feature_elements_);
     qmcplusplus::psiformer::direct::denseForward(
         hidden, parameter(parameters, ParameterRole::UPDATE_OUTPUT_WEIGHT, block),
         parameter(parameters, ParameterRole::UPDATE_OUTPUT_BIAS, block), workspace.electrons_,
@@ -1054,25 +1276,25 @@ private:
   /// Reverse one attention/residual block into its input and eight parameter tensors.
   void reverseAttentionBlock(const double* parameters,
                              std::size_t block,
-                             DirectScoreWorkspace& workspace,
+                             DirectScoreTrunkWorkspace& workspace,
                              DirectAffineObservationSink* observer = nullptr) const
   {
     const double* input = workspace.features(block);
-    const double* query = DirectScoreWorkspace::blockBuffer(workspace.queries_, block,
+    const double* query = DirectScoreTrunkWorkspace::blockBuffer(workspace.queries_, block,
                                                              workspace.feature_elements_);
-    const double* key = DirectScoreWorkspace::blockBuffer(workspace.keys_, block,
+    const double* key = DirectScoreTrunkWorkspace::blockBuffer(workspace.keys_, block,
                                                            workspace.feature_elements_);
-    const double* value = DirectScoreWorkspace::blockBuffer(workspace.values_, block,
+    const double* value = DirectScoreTrunkWorkspace::blockBuffer(workspace.values_, block,
                                                              workspace.feature_elements_);
-    const double* attention = DirectScoreWorkspace::blockBuffer(
+    const double* attention = DirectScoreTrunkWorkspace::blockBuffer(
         workspace.attention_weights_, block, workspace.attention_elements_);
-    const double* context = DirectScoreWorkspace::blockBuffer(workspace.contexts_, block,
+    const double* context = DirectScoreTrunkWorkspace::blockBuffer(workspace.contexts_, block,
                                                                workspace.feature_elements_);
-    const double* residual = DirectScoreWorkspace::blockBuffer(workspace.residuals_, block,
+    const double* residual = DirectScoreTrunkWorkspace::blockBuffer(workspace.residuals_, block,
                                                                 workspace.feature_elements_);
-    const double* hidden = DirectScoreWorkspace::blockBuffer(workspace.hidden_, block,
+    const double* hidden = DirectScoreTrunkWorkspace::blockBuffer(workspace.hidden_, block,
                                                               workspace.feature_elements_);
-    const double* update = DirectScoreWorkspace::blockBuffer(workspace.updates_, block,
+    const double* update = DirectScoreTrunkWorkspace::blockBuffer(workspace.updates_, block,
                                                               workspace.feature_elements_);
 
     // Reverse the output tanh and two dense MLP layers, retaining the residual seed.
@@ -1163,7 +1385,7 @@ private:
   }
 
   /// Finish the reverse pass with the raw-feature embedding weight gradient.
-  void reverseEmbedding(DirectScoreWorkspace& workspace) const
+  void reverseEmbedding(DirectScoreTrunkWorkspace& workspace) const
   {
     double* embedding_score = score(workspace, ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
     for (std::size_t electron = 0; electron < workspace.electrons_; ++electron)
@@ -1174,6 +1396,7 @@ private:
               workspace.feature_adjoint_a_[electron * workspace.width_ + output];
   }
 
+  const DirectScorePreparation preparation_;
   const Parameters& parameters_;
   const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan_;
   std::vector<double> nuclei_;
