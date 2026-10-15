@@ -8,8 +8,8 @@
  * @brief Exclusive, versioned device parameter products using real control leases.
  *
  * Include after the native executor definitions, like DeviceBatchBackend.h.
- * One configuration is replayed at a time into fixed scratch. This bounded
- * compatibility lane avoids B-by-P storage; it is not a batched training claim.
+ * Score tapes may prepare up to four configurations; other product roots remain
+ * single-configuration. Weighted score tiles avoid B-by-P storage.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_PRODUCT_SESSION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_PRODUCT_SESSION_H
@@ -60,11 +60,13 @@ public:
   PreparedDeviceProductSession(const std::shared_ptr<const PreparedDeviceModel>& active_image,
                                PsiFormerAcceleratorSharedModel& owner,
                                std::mutex& control_mutex, std::uint64_t identity,
-                               ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC)
+                               ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
+                               std::size_t score_capacity = 1)
       : active_image_(active_image), image_(active_image), owner_(owner), mutex_(control_mutex),
         profile_(validatedProfile(profile)),
-        blas_(queue_), values_(image_, 1, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
-        score_(image_, 1, queue_, blas_), jvp_(image_, 1, queue_, blas_),
+        score_capacity_(admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
+        blas_(queue_), values_(image_, score_capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
+        score_(image_, score_capacity_, queue_, blas_), jvp_(image_, 1, queue_, blas_),
         kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC
             ? std::make_unique<KineticWorkspace>(image_, queue_, blas_) : nullptr),
         executor_(compiledBackend(), coverage(profile_)), crowd_(identity), identity_(identity),
@@ -78,7 +80,11 @@ public:
         orbital_backflow_(channel_coefficients_.size() * masses_.size() * masses_.size()),
         orbital_envelope_(orbital_backflow_.size()), orbital_seeds_(orbital_backflow_.size())
   {
-    executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, 1, *this);
+    // Logical single-root sizes stay 3Ne even when position capacity admits tiles.
+    positions_.reserve(spatial_detail::checkedProduct(positions_.size(), score_capacity_,
+        "Device score tile position extent overflow"));
+    tile_weights_.reserve(score_capacity_);
+    executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, score_capacity_, *this);
   }
 
   // Prepared graphs borrow this address-stable session's queue and BLAS handle.
@@ -87,6 +93,26 @@ public:
 
   /// Report the immutable capabilities selected before any numerical request.
   ProductSessionProfile profile() const noexcept { return profile_; }
+
+  /// Immutable prepared capacity; capability reads need no lazy-owner access.
+  std::size_t scoreCapacity() const noexcept { return score_capacity_; }
+
+  /// Capacity4 is qualified only for this small-model envelope. Larger models
+  /// retain capacity1; this policy is not a claim that their full kinetic tape
+  /// fits. In particular, never multiply 100--300-electron head/attention storage
+  /// by four merely because a caller requested the small-system optimization.
+  static std::size_t admittedScoreCapacity(const ModelShape& shape, std::size_t requested)
+  {
+    const auto capacity = validatedScoreCapacity(requested);
+    return shape.spin_up_electrons <= 4 && shape.spin_down_electrons <= 4 && shape.electrons() <= 4 &&
+        shape.determinants <= 16 && shape.feature_dimension <= 256 &&
+        shape.attention_heads <= 4 && shape.attention_blocks <= 4 && shape.nuclei <= 2 ? capacity : 1;
+  }
+
+  /// Completed weighted tile counters are diagnostic, not admission state.
+  std::size_t weightedScoreTiles() const noexcept { return weighted_score_tiles_; }
+
+  std::size_t weightedScoreConfigurations() const noexcept { return weighted_score_configurations_; }
 
   /// Return a canonical real score, valid until this session's next score call.
   const std::vector<double>& score(const double* positions, std::size_t version)
@@ -145,6 +171,27 @@ public:
       const double* response = score_.reverse(values_, weights_);
       score_contraction_->accumulate(response, coefficients, channels);
     });
+  }
+
+  /// One batched forward/reverse contracts real sample weights directly to P.
+  /// The outer C1 transaction spans all tiles and admits the final sum together.
+  void accumulateWeightedScoreTile(const double* positions, const double* weights,
+                                    std::size_t count, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      if (!weights || !score_contraction_)
+        throw std::invalid_argument("Weighted score tile requires weights and a prepared contraction");
+      tile_weights_.resize(count);
+      std::copy_n(weights, count, tile_weights_.begin());
+      // reverse() validates every finite signed weight and every determinant,
+      // including configurations with zero weight. It returns a weighted sum.
+      values_.evaluate(positions_);
+      const double* response = score_.reverse(values_, tile_weights_);
+      const std::complex<double> unit(1, 0);
+      score_contraction_->accumulate(response, &unit, 1);
+    }, count);
+    ++weighted_score_tiles_;
+    weighted_score_configurations_ += count;
   }
 
   /// Admit the complete finite sum before exposing any channel to the host.
@@ -368,7 +415,7 @@ public:
     for (const auto* values : {&positions_, &drift_, &masses_, &score_response_,
                                &kinetic_response_, &products_, &weights_, &channel_coefficients_,
                                &channel_phases_, &channel_logs_, &cusp_, &orbital_backflow_,
-                               &orbital_envelope_, &orbital_seeds_})
+                               &orbital_envelope_, &orbital_seeds_, &tile_weights_})
       bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(values->capacity()),
                                          "Device product host staging overflow");
     for (auto amount : {values_.hostWorkspaceBytes(), score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes()})
@@ -395,6 +442,14 @@ private:
     if (profile != ProductSessionProfile::SCORE_ONLY && profile != ProductSessionProfile::SCORE_AND_KINETIC)
       throw std::invalid_argument("Unknown device product preparation profile");
     return profile;
+  }
+
+  /// Keep tiling bounded and reject capacity before numerical allocation.
+  static std::size_t validatedScoreCapacity(std::size_t capacity)
+  {
+    if (capacity == 0 || capacity > 4)
+      throw std::invalid_argument("Device score tile capacity must be between one and four");
+    return capacity;
   }
 
   /// Missing roots are a preparation contract error, before any product event.
@@ -464,14 +519,14 @@ private:
 
   /// Preserve provenance and failure recovery around one synchronous product.
   void execute(PsiFormerAcceleratorOperation operation, const double* positions,
-                std::size_t version, const std::function<void()>& action)
+                std::size_t version, const std::function<void()>& action, std::size_t count = 1)
   {
     std::lock_guard lock(mutex_);
     ready_ = false;
-    if (!positions || version != active_image_->version())
+    if (!positions || version != active_image_->version() || count == 0 || count > score_capacity_)
     {
       invalidateScoreContraction();
-      throw std::invalid_argument("Device parameter product has missing coordinates or stale version");
+      throw std::invalid_argument("Device parameter product has missing coordinates, stale version or invalid tile count");
     }
     if (coordinate_generation_ == std::numeric_limits<std::size_t>::max())
     {
@@ -479,6 +534,8 @@ private:
       throw std::overflow_error("Device product coordinate generation exhausted");
     }
     rebind();
+    request_count_ = count;
+    positions_.resize(count * 3 * masses_.size());
     std::copy_n(positions, positions_.size(), positions_.begin());
     ++coordinate_generation_;
     action_ = &action;
@@ -487,7 +544,7 @@ private:
     {
       executor_.acquire(owner_, crowd_, *this);
       const auto pending = executor_.evaluate(owner_, crowd_, acceleratorOperationBit(operation),
-                                               1, coordinate_generation_, *this);
+                                               request_count_, coordinate_generation_, *this);
       executor_.wait(crowd_, pending.result_generation, *this);
       (void)crowd_.completedResult(pending.result_generation, coordinate_generation_);
       executor_.release(owner_, crowd_, *this);
@@ -500,7 +557,7 @@ private:
       if (crowd_.poisoned())
       {
         executor_.recover(owner_, crowd_, *this);
-        executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, 1, *this);
+        executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, score_capacity_, *this);
       }
       else if (crowd_.acquired())
         executor_.release(owner_, crowd_, *this);
@@ -518,8 +575,8 @@ private:
       throw std::logic_error("Device product event has foreign routing");
     if (event.kind == PsiFormerAcceleratorEventKind::CROWD_PREPARE)
     {
-      if (event.item_count != 1)
-        throw std::logic_error("Device product lane requires one prepared configuration");
+      if (event.item_count != score_capacity_)
+        throw std::logic_error("Device product lane has the wrong prepared score capacity");
       resource_generation_ = event.resource_generation;
       return;
     }
@@ -543,7 +600,7 @@ private:
     case PsiFormerAcceleratorEventKind::MODEL_WAIT:
       return;
     case PsiFormerAcceleratorEventKind::INPUT_UPLOAD:
-      if (event.coordinate_generation != coordinate_generation_ || event.item_count != 1 ||
+      if (event.coordinate_generation != coordinate_generation_ || event.item_count != request_count_ ||
           event.acquisition_generation != acquisition_generation_)
         throw std::logic_error("Device product upload has stale coordinates/acquisition");
       result_generation_ = event.result_generation;
@@ -581,7 +638,7 @@ private:
   void validateResult(const PsiFormerAcceleratorEvent& event) const
   {
     if (event.coordinate_generation != coordinate_generation_ || event.result_generation != result_generation_ ||
-        event.acquisition_generation != acquisition_generation_ || event.item_count != 1)
+        event.acquisition_generation != acquisition_generation_ || event.item_count != request_count_)
       throw std::logic_error("Device product event has stale result provenance");
   }
 
@@ -590,6 +647,7 @@ private:
   PsiFormerAcceleratorSharedModel& owner_;
   std::mutex& mutex_;
   const ProductSessionProfile profile_;
+  const std::size_t score_capacity_;
   compute::Queue<PlatformKind::CUDA> queue_;
   AcceleratorBlasHandle blas_;
   PreparedDeviceInference values_;
@@ -608,12 +666,15 @@ private:
   std::vector<double> channel_coefficients_, channel_phases_, channel_logs_;
   std::vector<device_determinant::FactorizationMetadata> factors_;
   std::vector<double> cusp_, orbital_backflow_, orbital_envelope_, orbital_seeds_;
+  std::vector<double> tile_weights_;
   const std::vector<double> weights_{1.0};
   const std::function<void()>* action_ = nullptr;
   std::exception_ptr failure_;
   PsiFormerAcceleratorOperation operation_ = PsiFormerAcceleratorOperation::PARAMETER_SCORE;
   std::size_t resource_generation_ = 0, acquisition_generation_ = 0;
   std::size_t coordinate_generation_ = 0, result_generation_ = 0, numerical_products_ = 0;
+  std::size_t request_count_ = 1;
+  std::atomic<std::size_t> weighted_score_tiles_{0}, weighted_score_configurations_{0};
   bool recorded_ = false, ready_ = false;
 };
 

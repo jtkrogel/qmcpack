@@ -1750,7 +1750,8 @@ private:
  */
 struct PsiFormerDerivativeScratch
 {
-  PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters)
+  PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters,
+                             std::size_t score_capacity = 1)
       : score(state.numerical_tile_backend ? nullptr : state.direct_score_executor.makeWorkspace()),
         kinetic(state.numerical_tile_backend ? nullptr : state.direct_kinetic_executor.makeWorkspace())
   {
@@ -1765,7 +1766,8 @@ struct PsiFormerDerivativeScratch
           state.numerical_tile_backend.get());
       if (!backend)
         throw std::logic_error("PsiFormer device products require the prepared numerical backend");
-      device_products = backend->prepareProductSession();
+      device_products = backend->prepareProductSession(
+          psiformer::device::ProductSessionProfile::SCORE_AND_KINETIC, score_capacity);
       device_positions.resize(3 * state.execution_plan.modelShape().electrons());
       device_direction.resize(parameters);
     }
@@ -1782,6 +1784,7 @@ struct PsiFormerDerivativeScratch
   std::vector<double> device_direction;
   bool reported_device_products = false;
   bool reported_device_score_contraction = false;
+  bool reported_device_score_tiles = false;
 #endif
   std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
 };
@@ -1810,13 +1813,13 @@ private:
 
 /** Obtain the prepared lane without retaining scratch permanently on the model. */
 std::shared_ptr<PsiFormerDerivativeScratch> acquireDerivativeScratch(
-    PsiFormerSharedState& state, std::size_t parameters)
+    PsiFormerSharedState& state, std::size_t parameters, std::size_t score_capacity = 1)
 {
   std::lock_guard factory_lock(state.derivative_scratch_factory_mutex);
   auto scratch = state.derivative_scratch.lock();
   if (!scratch)
   {
-    scratch = std::make_shared<PsiFormerDerivativeScratch>(state, parameters);
+    scratch = std::make_shared<PsiFormerDerivativeScratch>(state, parameters, score_capacity);
     state.derivative_scratch = scratch;
   }
   return scratch;
@@ -1855,7 +1858,9 @@ public:
         total_log_gradients_imaginary_(std::move(total_log_gradients_imaginary)),
         inverse_masses_(std::move(inverse_masses)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
-        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount())),
+        // A retained pretraining capacity1 lane remains serial; never duplicate
+        // its P-sized resources or grow it implicitly during an evaluation.
+        shared_scratch_(acquireDerivativeScratch(*model_state_, schema_->parameterCount(), 4)),
         score_workspace_(shared_scratch_->score),
         kinetic_workspace_(shared_scratch_->kinetic),
         channel_accumulators_(shared_scratch_->channels),
@@ -1909,7 +1914,7 @@ public:
       result.local_energy_term_mask |= ecp_replay_->localEnergyTermMask();
     result.maximum_vjp_channels              = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
-    result.maximum_sample_tile_size          = 1;
+    result.maximum_sample_tile_size          = deviceScoreCapacity();
     result.fixed_parameter_scratch_vectors   =
         (hasDeviceProducts() ? 8 + 2 * deviceScoreContractionCapacity() : 3) + MAXIMUM_VJP_CHANNELS;
     result.block_streaming                   = true;
@@ -2062,6 +2067,16 @@ protected:
       // 16*C*P. Admit optional storage only above that transfer break-even.
       const bool resident_scores = hasDeviceProducts() && !needs_kinetic &&
           score_channel_count != 0 && sample_count_ > 2 * score_channel_count;
+      // The existing weighted reverse contracts one real channel. Exact API
+      // coefficients determine eligibility; real parameters do not imply real
+      // optimizer coefficients. Finite coefficients were admitted by applyVJPs.
+      const bool batched_scores = resident_scores && channels.size() == 1 &&
+          !needs_ecp && deviceScoreCapacity() > 1 &&
+          std::all_of(channels[0].coefficients.values.begin(), channels[0].coefficients.values.end(),
+                      [](const auto& coefficient) { return coefficient.imag() == 0.0; });
+      std::size_t completed_score_tiles = 0;
+      std::size_t final_score_tile_count = 0;
+      std::size_t weighted_configurations = 0;
       if (resident_scores)
       {
         auto& session = *shared_scratch_->device_products;
@@ -2072,6 +2087,28 @@ protected:
       }
 #endif
 
+#ifdef ENABLE_CUDA
+      if (batched_scores)
+      {
+        std::array<double, 4> weights{};
+        const auto capacity = deviceScoreCapacity();
+        const auto before_tiles = shared_scratch_->device_products->weightedScoreTiles();
+        const auto before_configurations = shared_scratch_->device_products->weightedScoreConfigurations();
+        for (std::size_t offset = 0; offset < sample_count_; offset += capacity)
+        {
+          const auto count = std::min(capacity, sample_count_ - offset);
+          for (std::size_t sample = 0; sample < count; ++sample)
+            weights[sample] = channels[0].coefficients.values[offset + sample].real();
+          shared_scratch_->device_products->accumulateWeightedScoreTile(
+              positions_.data() + offset * 3 * electron_count_, weights.data(), count, parameter_version_);
+          final_score_tile_count = count;
+        }
+        completed_score_tiles = shared_scratch_->device_products->weightedScoreTiles() - before_tiles;
+        weighted_configurations = shared_scratch_->device_products->weightedScoreConfigurations() - before_configurations;
+        reportDeviceProducts();
+      }
+      else
+#endif
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
         if (needs_kinetic)
@@ -2169,6 +2206,15 @@ protected:
                     << ", channels=" << score_channel_count << ", canonical_parameters=" << schema_->parameterCount()
                     << ", parameter_version=" << parameter_version_ << std::endl;
           shared_scratch_->reported_device_score_contraction = true;
+        }
+        if (batched_scores && !shared_scratch_->reported_device_score_tiles)
+        {
+          app_log() << "  PsiFormer batched score contraction completed: configurations=" << sample_count_
+                    << ", prepared_capacity=" << deviceScoreCapacity() << ", weighted_tiles=" << completed_score_tiles
+                    << ", weighted_configurations=" << weighted_configurations
+                    << ", final_tile_count=" << final_score_tile_count << ", channels=1, parameter_version="
+                    << parameter_version_ << std::endl;
+          shared_scratch_->reported_device_score_tiles = true;
         }
       }
 #endif
@@ -2373,6 +2419,15 @@ private:
     return hasDeviceProducts() ? shared_scratch_->device_products->scoreContractionCapacity() : 0;
 #else
     return 0;
+#endif
+  }
+
+  std::size_t deviceScoreCapacity() const noexcept
+  {
+#ifdef ENABLE_CUDA
+    return hasDeviceProducts() ? shared_scratch_->device_products->scoreCapacity() : 1;
+#else
+    return 1;
 #endif
   }
 

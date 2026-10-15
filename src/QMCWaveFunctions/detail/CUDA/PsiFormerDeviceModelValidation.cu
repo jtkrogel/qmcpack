@@ -1843,6 +1843,18 @@ int main(int argc, char** argv)
         near(head_response[parameter], cancelling_reference.parameter_score[parameter],
              "independent channel score at a total cancellation node");
       std::cout << "PASS independent channel at exact determinant-sum node; raw orbital reverse at singular heads\n";
+      PreparedDeviceBatchBackend cancelling_backend(cancelling_image);
+      auto zero_node_lane = cancelling_backend.prepareProductSession(ProductSessionProfile::SCORE_ONLY, 4);
+      zero_node_lane->prepareScoreContractions(1, cancelling_image->version());
+      zero_node_lane->beginScoreContraction(1, cancelling_image->version());
+      const double zero_nodal_weight = 0;
+      bool zero_node_rejected = false;
+      try { zero_node_lane->accumulateWeightedScoreTile(first_coordinates.data(), &zero_nodal_weight,
+          1, cancelling_image->version()); }
+      catch (const std::runtime_error&) { zero_node_rejected = true; }
+      if (!zero_node_rejected)
+        throw std::runtime_error("Zero-weight score tile bypassed total-node admission");
+      std::cout << "PASS weighted score tile rejects an exact total node even at zero coefficient\n";
     }
 
     auto dormant_tile = backend_tiles->prepare(1);
@@ -2183,6 +2195,149 @@ int main(int argc, char** argv)
         throw std::runtime_error("Score contraction admitted a nonfinite complex sum");
       std::cout << "PASS resident serial score contractions: complex channels/CPU parity, exact downloads, "
                    "warmed reuse, failure/stale/publication invalidation, finite-sum admission\n";
+    }
+    if (PreparedDeviceProductSession::admittedScoreCapacity(shape, 4) == 4)
+    {
+      using Complex = std::complex<double>;
+      auto single_lane = backend_tiles->prepareProductSession(ProductSessionProfile::SCORE_AND_KINETIC, 1);
+      auto tiled_lane = backend_tiles->prepareProductSession(ProductSessionProfile::SCORE_AND_KINETIC, 4);
+      if (single_lane->scoreCapacity() != 1 || tiled_lane->scoreCapacity() != 4)
+        throw std::runtime_error("Explicit score tile preparation lost its immutable capacity");
+      for (const auto electrons : {std::size_t{100}, std::size_t{200}, std::size_t{300}})
+      {
+        auto large_shape = shape;
+        large_shape.spin_up_electrons = electrons / 2;
+        large_shape.spin_down_electrons = electrons - electrons / 2;
+        if (PreparedDeviceProductSession::admittedScoreCapacity(large_shape, 4) != 1)
+          throw std::runtime_error("Large-electron model bypassed score tile qualification admission");
+      }
+      auto large_width_shape = shape;
+      large_width_shape.feature_dimension = 1024;
+      auto large_head_shape = shape;
+      large_head_shape.determinants = 64;
+      if (PreparedDeviceProductSession::admittedScoreCapacity(large_width_shape, 4) != 1 ||
+          PreparedDeviceProductSession::admittedScoreCapacity(large_head_shape, 4) != 1)
+        throw std::runtime_error("Unqualified large model bypassed bounded score capacity admission");
+      std::cout << "Score tile preparation: capacity1_device_bytes=" << single_lane->deviceWorkspaceBytes()
+                << " capacity4_device_bytes=" << tiled_lane->deviceWorkspaceBytes()
+                << " additional_device_bytes=" << tiled_lane->deviceWorkspaceBytes() - single_lane->deviceWorkspaceBytes()
+                << " additional_host_bytes=" << tiled_lane->hostWorkspaceBytes() - single_lane->hostWorkspaceBytes() << '\n';
+      tiled_lane->prepareScoreContractions(1, model.p.version());
+      const auto fixed_bytes = tiled_lane->deviceWorkspaceBytes();
+      std::vector<Complex> output(plan.parameterCount());
+      std::vector<double> expected(plan.parameterCount());
+      // These populations cover full/tail tiles and repeated 4->1->3->4 counts.
+      for (const auto population : {std::size_t{1}, std::size_t{4}, std::size_t{5}, std::size_t{7},
+                                    std::size_t{4}, std::size_t{1}, std::size_t{3}, std::size_t{4}})
+      {
+        std::vector<double> coordinates(population * 3 * model.ne), weights(population);
+        std::fill(expected.begin(), expected.end(), 0.0);
+        for (std::size_t sample = 0; sample < population; ++sample)
+        {
+          const double* position = model.cfg.electrons.x.data() + (sample % model.cfg.nconfig) * 3 * model.ne;
+          std::copy_n(position, 3 * model.ne, coordinates.data() + sample * 3 * model.ne);
+          weights[sample] = .17 * (static_cast<int>(sample % 3) - 1);
+          cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(position, model.ne));
+          const auto reference = cpu_score_executor.evaluate(*cpu_score_workspace);
+          for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+            expected[parameter] += weights[sample] * reference.parameter_score[parameter];
+        }
+        auto run_tiles = [&]() {
+          tiled_lane->beginScoreContraction(1, model.p.version());
+          for (std::size_t offset = 0; offset < population; offset += 4)
+            tiled_lane->accumulateWeightedScoreTile(coordinates.data() + offset * 3 * model.ne,
+                weights.data() + offset, std::min(std::size_t{4}, population - offset), model.p.version());
+          tiled_lane->finishScoreContraction(model.p.version());
+          tiled_lane->downloadScoreContraction(0, output.data(), output.size(), model.p.version());
+        };
+        run_tiles();
+        int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+        checkRuntime(hipGetDevice(&ordinal), "weighted score tile metrics device");
+#else
+        checkRuntime(cudaGetDevice(&ordinal), "weighted score tile metrics device");
+#endif
+        auto& metrics = deviceMemoryMetrics(ordinal);
+        const auto before = metrics.snapshot();
+        const auto before_tiles = tiled_lane->weightedScoreTiles();
+        const auto before_configurations = tiled_lane->weightedScoreConfigurations();
+        run_tiles();
+        const auto after = metrics.snapshot();
+        if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
+            tiled_lane->deviceWorkspaceBytes() != fixed_bytes ||
+            tiled_lane->weightedScoreTiles() - before_tiles != (population + 3) / 4 ||
+            tiled_lane->weightedScoreConfigurations() - before_configurations != population)
+          throw std::runtime_error("Weighted score tiles changed prepared capacity or execution counts");
+        for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+        {
+          near(output[parameter].real(), expected[parameter], "weighted score full/tail CPU parity");
+          near(output[parameter].imag(), 0, "weighted real score tile imaginary response");
+        }
+      }
+      // Ordinary roots must reset the larger value tape to one live configuration.
+      cpu_score_workspace->setPositions(first_position);
+      const auto single_reference = cpu_score_executor.evaluate(*cpu_score_workspace);
+      const auto& single_score = tiled_lane->score(model.cfg.electrons.x.data(), model.p.version());
+      for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+        near(single_score[parameter], single_reference.parameter_score[parameter], "single score after weighted tiles");
+      double jvp_reference = 0;
+      for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+        jvp_reference += single_reference.parameter_score[parameter] * product_direction[parameter];
+      near(tiled_lane->scoreJvp(model.cfg.electrons.x.data(), product_direction, model.p.version()),
+           jvp_reference, "single JVP after weighted tiles");
+      const auto channel_reference = cpu_score_executor.evaluateWeightedChannelScore(*cpu_score_workspace,
+          channel_coefficients.data(), model.ndet);
+      const auto& single_channel = tiled_lane->channelScore(model.cfg.electrons.x.data(),
+          channel_coefficients.data(), model.ndet, model.p.version());
+      for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+        near(single_channel[parameter], channel_reference.parameter_score[parameter], "single channel after weighted tiles");
+      kinetic_workspace->setPositions(first_position);
+      const auto kinetic_reference = kinetic_cpu.evaluate(*kinetic_workspace, external_contiguous.data(),
+          3 * model.ne, inverse_masses.data(), model.ne);
+      const auto& single_kinetic = tiled_lane->kinetic(model.cfg.electrons.x.data(), external_contiguous.data(),
+          inverse_masses.data(), model.p.version());
+      for (std::size_t parameter = 0; parameter < expected.size(); ++parameter)
+        near(single_kinetic[parameter], kinetic_reference.kinetic_parameter_response[parameter],
+             "single kinetic drift extent after weighted tiles");
+
+      auto expect_missing = [&]() {
+        bool rejected = false;
+        try { tiled_lane->downloadScoreContraction(0, output.data(), output.size(), model.p.version()); }
+        catch (const std::exception&) { rejected = true; }
+        if (!rejected)
+          throw std::runtime_error("Failed weighted tile retained a completed contraction");
+      };
+      const double zero_weight = 0;
+      tiled_lane->beginScoreContraction(1, model.p.version());
+      bool zero_invalid_rejected = false;
+      try { tiled_lane->accumulateWeightedScoreTile(invalid_product_positions.data(), &zero_weight, 1, model.p.version()); }
+      catch (const std::exception&) { zero_invalid_rejected = true; }
+      if (!zero_invalid_rejected)
+        throw std::runtime_error("Zero-weight tile bypassed geometry admission");
+      expect_missing();
+      const double nonfinite_weight = std::numeric_limits<double>::quiet_NaN();
+      tiled_lane->beginScoreContraction(1, model.p.version());
+      bool nonfinite_rejected = false;
+      try { tiled_lane->accumulateWeightedScoreTile(model.cfg.electrons.x.data(), &nonfinite_weight, 1, model.p.version()); }
+      catch (const std::exception&) { nonfinite_rejected = true; }
+      if (!nonfinite_rejected)
+        throw std::runtime_error("Weighted tile accepted a nonfinite coefficient");
+      expect_missing();
+      tiled_lane->beginScoreContraction(1, model.p.version());
+      tiled_lane->accumulateWeightedScoreTile(model.cfg.electrons.x.data(), &zero_weight, 1, model.p.version());
+      tiled_lane->finishScoreContraction(model.p.version());
+      backend_tiles->publishParameters(accepted_values, model.p.version() + 1,
+                                       [&]() { model.p.set_flat_values(accepted_values); });
+      expect_missing();
+      tiled_lane->beginScoreContraction(1, model.p.version());
+      tiled_lane->accumulateWeightedScoreTile(model.cfg.electrons.x.data(), &zero_weight, 1, model.p.version());
+      tiled_lane->finishScoreContraction(model.p.version());
+      tiled_lane->downloadScoreContraction(0, output.data(), output.size(), model.p.version());
+      for (const auto value : output)
+        near(std::abs(value), 0, "weighted tile zero-coefficient recovery after publication");
+      std::cout << "PASS true weighted score tiles: signed/zero CPU parity B1/4/5/7, tails4/1/3/4, "
+                   "exact tile counts, zero warm allocations, single score/JVP/channel/kinetic reset, "
+                   "failure/publication recovery\n";
     }
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
