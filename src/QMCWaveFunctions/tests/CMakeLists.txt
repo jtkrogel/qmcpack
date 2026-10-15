@@ -732,6 +732,26 @@ add_unit_test(deterministic-unit_test_psiformer_complex_score
 set_tests_properties(deterministic-unit_test_psiformer_complex_score
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+if(QMC_COMPLEX)
+  # Native-free public component tests link the existing sole native owner TU.
+  add_executable(test_psiformer_complex_wf test_psiformer_complex_wf.cpp)
+  target_link_libraries(test_psiformer_complex_wf
+                        catch_main qmcwfs platform_LA platform_runtime utilities_for_test
+                        container_testing minimal_particle_pool IO::HDF5)
+  if(USE_OBJECT_TARGET)
+    target_link_libraries(test_psiformer_complex_wf
+                          qmcutil qmcparticle qmcparticle_omptarget qmcwfs_omptarget
+                          platform_omptarget_LA)
+  endif()
+  target_include_directories(test_psiformer_complex_wf PRIVATE "${qmcpack_SOURCE_DIR}/src")
+  target_compile_options(test_psiformer_complex_wf PRIVATE
+                         $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
+  add_unit_test(deterministic-unit_test_psiformer_complex_wf
+                1 1 $<TARGET_FILE:test_psiformer_complex_wf>)
+  set_tests_properties(deterministic-unit_test_psiformer_complex_wf
+                       PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+endif()
+
 add_executable(test_psiformer_batch_executor
                test_psiformer_batch_executor.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp

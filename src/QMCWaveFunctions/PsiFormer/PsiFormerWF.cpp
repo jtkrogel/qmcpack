@@ -9,6 +9,7 @@
  * @brief QMCPACK integration for the native PsiFormer evaluator.
  */
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #define PSIFORMER_LIBRARY
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
@@ -22,6 +23,10 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexValueExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexSpatialExecutor.h"
+#endif
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceBatchBackend.h"
 #endif
@@ -17478,5 +17483,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWF::makeClone(ParticleSet& parti
   clone->bound_particle_set_ = &particles;
   return clone;
 }
+
+// The explicit complex sibling shares this Native.h-owning TU, not a second native object.
+#define QMC_PSIFORMER_COMPLEX_WF_IMPL_OWNER_TU
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWFImpl.h"
+#undef QMC_PSIFORMER_COMPLEX_WF_IMPL_OWNER_TU
 
 } // namespace qmcplusplus
