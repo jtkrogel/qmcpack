@@ -272,8 +272,17 @@ void GeometryPairTable::updatePair(std::size_t pair_index,
   displacement_laplacians_[pair_index]              = displacement_laplacian;
   complementary_displacement_laplacians_[pair_index] = complementary_displacement_laplacian;
   distances_[pair_index]                            = distance;
-  inverse_distances_[pair_index] =
-      distance == 0 ? std::numeric_limits<GeometryReal>::infinity() : 1 / distance;
+  if (distance == 0)
+  {
+    // Finite-math optimization can replace a floating infinity sentinel with
+    // the largest finite value. Preserve the established binary64 contract by
+    // writing its object representation directly; nonzero arithmetic is unchanged.
+    static_assert(sizeof(GeometryReal) == sizeof(std::uint64_t));
+    const std::uint64_t infinity_bits = 0x7ff0000000000000ULL;
+    std::memcpy(&inverse_distances_[pair_index], &infinity_bits, sizeof(infinity_bits));
+  }
+  else
+    inverse_distances_[pair_index] = 1 / distance;
   distance_gradients_[pair_index]                   = distance_gradient;
   distance_gradient_norms_squared_[pair_index]      = distance_gradient_norm_squared;
   distance_laplacians_[pair_index]                  = distance_laplacian;
