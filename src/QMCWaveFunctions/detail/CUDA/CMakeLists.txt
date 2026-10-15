@@ -17,6 +17,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceDerivativeKernels.cu
     PsiFormerDeviceCoordinateGradient.cu
     PsiFormerDeviceMetropolisKernels.cu
+    PsiFormerDeviceAdamKernels.cu
     PsiFormerDeviceDeterminantKernels.cu
     PsiFormerDeviceLiftedDeterminantProducts.cu
     PsiFormerDeviceSpatialTraces.cu
@@ -40,7 +41,7 @@ add_library(psiformer_device STATIC ${PSIFORMER_DEVICE_SRCS})
 # not reassociation or fused coordinate updates.
 # Keep this leaf strict even when a parent Release policy enables fast math.
 set_property(SOURCE PsiFormerDeviceSpatialTraces.cu PsiFormerDeviceLiftedDeterminantProducts.cu
-    PsiFormerDeviceMetropolisKernels.cu APPEND PROPERTY COMPILE_OPTIONS
+    PsiFormerDeviceMetropolisKernels.cu PsiFormerDeviceAdamKernels.cu APPEND PROPERTY COMPILE_OPTIONS
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>

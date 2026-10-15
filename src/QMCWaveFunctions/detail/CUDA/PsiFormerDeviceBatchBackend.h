@@ -161,6 +161,9 @@ public:
   /// Report the explicit per-crowd sampler admission limit; zero preserves host moves.
   std::size_t metropolisBudget() const noexcept { return preparation_.metropolis_workspace_budget_bytes; }
 
+  /// Report the independent explicit per-optimizer/rank real Adam limit.
+  std::size_t adamBudget() const noexcept { return preparation_.adam_workspace_budget_bytes; }
+
   /** Borrow the existing VALUE graph for native-engine drift-free substeps.
    * The caller holds its native model read transaction and acquired host crowd.
    * Draw callbacks must not reenter the backend. Returned coordinates are only
@@ -395,6 +398,8 @@ private:
   static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
       PsiFormerPrecisionPolicy precision, DeviceExecutionPreparation preparation)
   {
+    if (preparation.adam_workspace_budget_bytes && precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
+      throw std::invalid_argument("Explicit device Adam requires FP64 reference precision");
     if (preparation.metropolis_workspace_budget_bytes &&
         (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE ||
          plan.environment().boundary != BoundaryCondition::OPEN))

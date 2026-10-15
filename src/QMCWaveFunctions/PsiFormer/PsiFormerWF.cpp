@@ -907,15 +907,29 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
   const auto retained_coordinates = positive("PSIFORMER_GPU_RETAINED_COORDINATE_BYTES");
   const auto metropolis = positive("PSIFORMER_GPU_METROPOLIS_BYTES");
+  const auto adam = [&]() -> std::size_t {
+    const char* value = std::getenv("PSIFORMER_GPU_ADAM_BYTES");
+    if (!value || !*value)
+      return 0;
+    bool enabled = false;
+    for (const char* digit = value; *digit; ++digit)
+    {
+      if (*digit < '0' || *digit > '9')
+        throw std::invalid_argument("PSIFORMER_GPU_ADAM_BYTES must be a base-10 byte limit or zero/off");
+      enabled = enabled || *digit != '0';
+    }
+    return enabled ? positive("PSIFORMER_GPU_ADAM_BYTES") : 0;
+  }();
   if (lifted && !kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
   if ((vgl || kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
-  if ((vgl || kinetic || retained_coordinates || metropolis) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+  if ((vgl || kinetic || retained_coordinates || metropolis || adam) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
     throw std::invalid_argument("GPU target/retained-coordinate preparation requires FP64 reference precision");
   psiformer::device::DeviceExecutionPreparation preparation;
   preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
   preparation.metropolis_workspace_budget_bytes = metropolis;
+  preparation.adam_workspace_budget_bytes = adam;
   if (metropolis && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
     throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open drift-free sampling");
   if (vgl)
@@ -928,6 +942,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
             << ", per_owner_workspace_limit_bytes=" << bytes << ", per_request_scalar_work_limit=" << work
             << ", per_provider_retained_coordinate_limit_bytes=" << retained_coordinates
             << ", per_crowd_metropolis_limit_bytes=" << metropolis
+            << ", per_optimizer_adam_limit_bytes=" << adam
             << ", aggregate_process_budget=no" << std::endl;
   return preparation;
 }
@@ -11578,8 +11593,24 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLogUnderRead(
   return scatter(result.sign, result.logabs, result.gradient, result.lap_log);
 }
 
-// Evaluate all accepted crowd configurations under one parameter read lock and
-// scatter complete spatial outputs directly into caller-owned accumulators.
+/// Expose only the resolved budget; CPU never reads GPU optimizer controls.
+std::size_t PsiFormerWF::deviceAdamBudget() const
+{
+#ifdef ENABLE_CUDA
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  if (backend && backend->adamBudget())
+  {
+#ifdef QMC_COMPLEX
+    throw std::invalid_argument("Explicit device Adam currently requires real parameters/build");
+#else
+    return backend->adamBudget();
+#endif
+  }
+#endif
+  return 0;
+}
+
 /// Query only the resolved GPU profile; CPU never reads GPU sampler controls.
 bool PsiFormerWF::deviceDriftFreeSamplingEnabled() const
 {
@@ -11652,6 +11683,8 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceDriftFree(
 #endif
 }
 
+// Evaluate all accepted crowd configurations under one parameter read lock and
+// scatter complete spatial outputs directly into caller-owned accumulators.
 void PsiFormerWF::mw_evaluateLog(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list,

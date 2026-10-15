@@ -453,6 +453,9 @@ public:
   /// Query the explicitly enabled resolved GPU sampler, rejecting hard-plan overlap.
   bool deviceDriftFreeSamplingEnabled() const;
 
+  /// Query the GPU-only per-optimizer Adam budget without exposing a model image.
+  std::size_t deviceAdamBudget() const;
+
   /// Advance injected native-engine substeps; host full VGL must follow before use.
   std::pair<std::size_t, std::size_t> mw_advanceDeviceDriftFree(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

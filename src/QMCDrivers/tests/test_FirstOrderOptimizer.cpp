@@ -14,8 +14,13 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
+#include "QMCDrivers/WFTrain/ProposalSelection.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceAdam.h"
+#endif
 
 #include <hdf5.h>
+#include "io/hdf/hdf_archive.h"
 
 #include <algorithm>
 #include <array>
@@ -664,5 +669,135 @@ TEST_CASE("First-order optimizer retained state scales only with parameter count
     CHECK(optimizer.retainedBytes() == vectors * parameter_count * sizeof(double));
   }
 }
+
+#ifdef ENABLE_CUDA
+TEST_CASE("Device Adam preserves production selection, accepted moments and checkpoints",
+          "[drivers][training][optimizer][device_adam]")
+{
+  using namespace psiformer::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != success || !devices)
+    SKIP("No usable HIP device for real Adam recurrence");
+  checkRuntime(hipGetDevice(&ordinal), "Adam validation device");
+#else
+  if (cudaGetDeviceCount(&devices) != success || !devices)
+    SKIP("No usable CUDA device for real Adam recurrence");
+  checkRuntime(cudaGetDevice(&ordinal), "Adam validation device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  const auto bytes = estimateAdamBytes(4, 3);
+  REQUIRE(bytes == 296);
+  for (const double beta : {.5, 0.0, 1.0 - 1.e-12})
+  {
+    OptimizerToyProvider cpu_provider, gpu_provider;
+    auto options = makeOptions(FirstOrderMethod::ADAM);
+    options.adam_beta1 = beta;
+    options.adam_beta2 = beta == 0 ? 0 : std::max(beta, .75);
+    FirstOrderOptimizer cpu(cpu_provider.parameterSchema(), options), gpu(gpu_provider.parameterSchema(), options);
+    const auto before = metrics.snapshot();
+    CHECK_THROWS_AS(gpu.prepareDeviceAdam(bytes - 1), std::length_error);
+    CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+    gpu.prepareDeviceAdam(bytes);
+    CHECK(metrics.snapshot().live_bytes - before.live_bytes == bytes);
+    CHECK(gpu.retainedBytes() == cpu.retainedBytes() + bytes);
+    ProposalSelectionControl control{.37, .03, .05, {"dense"}};
+    const auto selector = [](const auto&, const auto&) { return .7; };
+    // Exercise the unchanged combined scale/decay/norm/alpha production order.
+    for (const auto& gradient : {std::vector<double>{1, -2, .5, 9},
+                                 std::vector<double>{-.25, .75, -1, 9}})
+    {
+      const auto cpu_parameters = cpu_provider.snapshotParameters(), gpu_parameters = gpu_provider.snapshotParameters();
+      const auto cpu_objective = makeObjective(cpu_provider, gradient), gpu_objective = makeObjective(gpu_provider, gradient);
+      SelectedUpdateRule cpu_selection(cpu, control, selector), gpu_selection(gpu, control, selector);
+      completeParameterUpdate(cpu_provider, cpu_parameters, cpu_objective.parameterGradient(), cpu_selection, {});
+      const auto warm_before = metrics.snapshot();
+      completeParameterUpdate(gpu_provider, gpu_parameters, gpu_objective.parameterGradient(), gpu_selection, {});
+      const auto warm_after = metrics.snapshot();
+      if (gpu.acceptedUpdateCount() == 2)
+      {
+        CHECK(warm_after.allocation_calls == warm_before.allocation_calls);
+        CHECK(warm_after.free_calls == warm_before.free_calls);
+        CHECK(warm_after.upload_calls - warm_before.upload_calls == 2);
+        CHECK(warm_after.uploaded_bytes - warm_before.uploaded_bytes == 8 * 8);
+        CHECK(warm_after.downloaded_bytes - warm_before.downloaded_bytes == 4 * 8 + 8);
+      }
+      if (gpu.acceptedUpdateCount() == 1)
+        CHECK_FALSE(gpu.checkpointMetadata().state_fingerprint.empty());
+      else
+      {
+        // Payload itself must synchronize, even without a preceding metadata call.
+        const std::filesystem::path payload_path = "wftrain_device_adam_payload.h5";
+        OptimizerCheckpointCleanup payload_cleanup(payload_path);
+        hdf_archive archive;
+        REQUIRE(archive.create(payload_path.string()));
+        gpu.writeCheckpointPayload(archive);
+        archive.close();
+        REQUIRE(archive.open(payload_path.string(), H5F_ACC_RDONLY));
+        std::vector<double> saved_first, saved_second;
+        archive.read(saved_first, "first_moment");
+        archive.read(saved_second, "second_moment");
+        for (std::size_t i = 0; i < 4; ++i)
+        {
+          CHECK(saved_first[i] == Catch::Approx(cpu.firstMoment()[i]).margin(2.e-13));
+          CHECK(saved_second[i] == Catch::Approx(cpu.secondMoment()[i]).margin(2.e-13));
+        }
+      }
+      for (std::size_t i = 0; i < 4; ++i)
+      {
+        CHECK(gpu_provider.snapshotParameters().values[i] == Catch::Approx(cpu_provider.snapshotParameters().values[i]).margin(2.e-13));
+        CHECK(gpu.firstMoment()[i] == Catch::Approx(cpu.firstMoment()[i]).margin(2.e-13));
+        CHECK(gpu.secondMoment()[i] == Catch::Approx(cpu.secondMoment()[i]).margin(2.e-13));
+      }
+      CHECK(gpu.firstMoment()[3] == 0);
+      CHECK(gpu.secondMoment()[3] == 0);
+    }
+    // Publication failure and alpha-zero rejection may never flip device moments.
+    const auto parameters = gpu_provider.snapshotParameters();
+    const auto objective = makeObjective(gpu_provider, {.4, -.3, .2, 9});
+    const auto first = gpu.firstMoment(), second = gpu.secondMoment();
+    const auto count = gpu.acceptedUpdateCount();
+    SelectedUpdateRule reject(gpu, {}, [](const auto&, const auto&) { return 0.0; });
+    CHECK(completeParameterUpdate(gpu_provider, parameters, objective.parameterGradient(), reject, {}) == parameters.version);
+    CHECK(gpu.acceptedUpdateCount() == count);
+    CHECK(gpu.firstMoment() == first);
+    gpu_provider.rejectNextPublish();
+    CHECK_THROWS(completeParameterUpdate(gpu_provider, parameters, objective.parameterGradient(), gpu, {}));
+    CHECK_FALSE(gpu.hasLiveProposal());
+    CHECK(gpu.acceptedUpdateCount() == count);
+    CHECK(gpu.firstMoment() == first);
+    CHECK(gpu.secondMoment() == second);
+    auto bad = objective;
+    bad.gradient[0] = std::numeric_limits<double>::max();
+    CHECK_THROWS_AS(gpu.propose(gpu_provider.parameterSchema(), parameters, bad), std::overflow_error);
+    gpu.proposalRejected();
+    CHECK(gpu.firstMoment() == first);
+
+    // Existing checkpoint format/fingerprint must serialize authoritative mirrors.
+    const std::filesystem::path path = "wftrain_device_adam_restart.h5";
+    OptimizerCheckpointCleanup cleanup(path);
+    TrainingIterationState coordinator{2, parameters.version, gpu_provider.parameterSchema().fingerprint()};
+    TrainingStageState stage{"optimization", 1, 2, "device-adam-stage-v1"};
+    TrainingCheckpoint::saveAtomic(path, gpu_provider, coordinator, stage, &gpu);
+    OptimizerToyProvider restored_provider;
+    FirstOrderOptimizer restored(restored_provider.parameterSchema(), options);
+    restored.prepareDeviceAdam(bytes);
+    TrainingIterationState restored_coordinator{0, 0, restored_provider.parameterSchema().fingerprint()};
+    TrainingStageState restored_stage{"optimization", 1, 0, "device-adam-stage-v1"};
+    const auto restore_before = metrics.snapshot();
+    TrainingCheckpoint::restore(path, restored_provider, restored_coordinator, restored_stage, &restored);
+    CHECK(metrics.snapshot().upload_calls == restore_before.upload_calls);
+    CHECK(restored.firstMoment() == first);
+    CHECK(restored.secondMoment() == second);
+    CHECK(restored.checkpointMetadata().state_fingerprint == gpu.checkpointMetadata().state_fingerprint);
+    const auto restored_objective = makeObjective(restored_provider, {.4, -.3, .2, 9});
+    const auto expected = gpu.propose(gpu_provider.parameterSchema(), parameters, objective);
+    const auto resumed = restored.propose(restored_provider.parameterSchema(), restored_provider.snapshotParameters(), restored_objective);
+    CHECK(resumed.values == expected.values);
+    gpu.proposalRejected();
+    restored.proposalRejected();
+  }
+}
+#endif
 
 } // namespace qmcplusplus::wftrain

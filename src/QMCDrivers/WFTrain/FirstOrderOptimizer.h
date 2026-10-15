@@ -20,6 +20,12 @@
 #include <string>
 #include <vector>
 
+namespace qmcplusplus::psiformer::device
+{
+/// Optional real-Adam recurrence owner; never a parameter publication authority.
+class PreparedDeviceAdam;
+}
+
 namespace qmcplusplus::wftrain
 {
 
@@ -67,6 +73,12 @@ public:
   FirstOrderOptimizer(const StructuredParameterSchema& schema,
                       FirstOrderOptimizerOptions options);
 
+  /// Destroy optional device scratch where its implementation is complete.
+  ~FirstOrderOptimizer() override;
+
+  /// Admit optional real-Adam scratch once; zero preserves the CPU recurrence.
+  void prepareDeviceAdam(std::size_t device_budget_bytes);
+
   StructuredParameterSnapshot propose(
       const StructuredParameterSchema& schema,
       const StructuredParameterSnapshot& parameters,
@@ -106,14 +118,14 @@ public:
   /// Return the number of successfully published optimizer updates.
   std::uint64_t acceptedUpdateCount() const noexcept { return accepted_update_count_; }
 
-  /// Return numeric recurrence storage retained by this optimizer.
+  /// Return host mirrors plus owned device recurrence bytes, counted once.
   std::size_t retainedBytes() const noexcept;
 
   /// Expose the committed first moment for deterministic validation.
-  const std::vector<double>& firstMoment() const noexcept { return first_moment_; }
+  const std::vector<double>& firstMoment() const;
 
   /// Expose the committed second moment for deterministic validation.
-  const std::vector<double>& secondMoment() const noexcept { return second_moment_; }
+  const std::vector<double>& secondMoment() const;
 
   /// Expose the independent AMSGrad running maximum of the second-moment EMA.
   const std::vector<double>& maximumSecondMoment() const noexcept { return maximum_second_moment_; }
@@ -132,6 +144,9 @@ private:
   };
 
   class PreparedRestoreAction;
+
+  /// Refresh checked host mirrors before inspection/fingerprint/payload, never commit.
+  void synchronizeMoments() const;
 
   void validateInputs(const StructuredParameterSchema& schema,
                       const StructuredParameterSnapshot& parameters,
@@ -152,11 +167,15 @@ private:
   std::string configuration_fingerprint_;
   std::size_t parameter_count_ = 0;
   std::vector<BlockUpdate> blocks_;
-  std::vector<double> first_moment_;
-  std::vector<double> second_moment_;
+  mutable std::vector<double> first_moment_;
+  mutable std::vector<double> second_moment_;
   std::vector<double> maximum_second_moment_;
   std::uint64_t accepted_update_count_ = 0;
   bool proposal_live_ = false;
+  mutable bool moment_mirrors_stale_ = false;
+#ifdef ENABLE_CUDA
+  std::unique_ptr<psiformer::device::PreparedDeviceAdam> device_adam_;
+#endif
 };
 
 } // namespace qmcplusplus::wftrain

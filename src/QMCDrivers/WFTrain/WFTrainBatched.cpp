@@ -44,6 +44,7 @@
 #include "Utilities/RunTimeManager.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -1072,10 +1073,29 @@ void WFTrainBatched::run()
     throw UniformCommunicateError(
         "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
   std::unique_ptr<wftrain::FirstOrderOptimizer> first_order_optimizer;
+  const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+  if (!device_provider && selected_provider_->usesAcceleratorParameterProducts())
+    if (const char* value = std::getenv("PSIFORMER_GPU_ADAM_BYTES"))
+    {
+      bool enabled = false;
+      for (const char* digit = value; *digit; ++digit)
+      {
+        if (*digit < '0' || *digit > '9')
+          throw UniformCommunicateError("PSIFORMER_GPU_ADAM_BYTES must be a base-10 byte limit or zero/off");
+        enabled = enabled || *digit != '0';
+      }
+      if (enabled)
+        throw UniformCommunicateError("Explicit GPU Adam requires a selected PsiFormer provider");
+    }
+  const auto device_adam_budget = device_provider ? device_provider->deviceAdamBudget() : 0;
+  if (device_adam_budget && training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM)
+    throw UniformCommunicateError("Explicit GPU Adam budget requires the selected real Adam optimizer");
   if (isFirstOrder(training_input_.getOptimizer()))
     first_order_optimizer = std::make_unique<wftrain::FirstOrderOptimizer>(
         selected_provider_->parameterSchema(),
         makeFirstOrderOptions(selected_provider_->parameterSchema(), training_input_));
+  if (device_adam_budget)
+    first_order_optimizer->prepareDeviceAdam(device_adam_budget);
   std::unique_ptr<wftrain::SPRINGUpdateRule> spring_optimizer;
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING)
     spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(

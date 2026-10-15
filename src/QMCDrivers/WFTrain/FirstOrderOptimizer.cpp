@@ -12,12 +12,16 @@
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 
 #include "io/hdf/hdf_archive.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceAdam.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <set>
@@ -133,6 +137,11 @@ public:
     owner_.second_moment_.swap(second_moment_);
     owner_.maximum_second_moment_.swap(maximum_second_moment_);
     owner_.accepted_update_count_ = update_count_;
+    owner_.moment_mirrors_stale_ = false;
+#ifdef ENABLE_CUDA
+    if (owner_.device_adam_)
+      owner_.device_adam_->invalidateSeed();
+#endif
   }
 
 private:
@@ -260,6 +269,56 @@ FirstOrderOptimizer::FirstOrderOptimizer(const StructuredParameterSchema& schema
   configuration_fingerprint_ = formatFingerprint(hash);
 }
 
+/// Preserve old CPU destruction while allowing the optional owner to stay opaque.
+FirstOrderOptimizer::~FirstOrderOptimizer() = default;
+
+/// Prepare only the approved method; compact blocks retain existing resolved rates.
+void FirstOrderOptimizer::prepareDeviceAdam(std::size_t device_budget_bytes)
+{
+  if (!device_budget_bytes)
+    return;
+#ifdef ENABLE_CUDA
+  if (options_.method != FirstOrderMethod::ADAM || proposal_live_ || device_adam_)
+    throw std::invalid_argument("Explicit device Adam needs a fresh real-Adam optimizer");
+  std::vector<psiformer::device::AdamBlock> blocks;
+  blocks.reserve(blocks_.size());
+  for (const auto& block : blocks_)
+    blocks.push_back({block.offset, block.count, block.learning_rate, block.trainable ? 1u : 0u});
+  const auto bytes = psiformer::device::estimateAdamBytes(parameter_count_, blocks.size());
+  if (bytes > std::numeric_limits<std::size_t>::max() - retainedBytes())
+    throw std::overflow_error("Device Adam combined host/device retained bytes overflow");
+  device_adam_ = psiformer::device::PreparedDeviceAdam::prepare(parameter_count_, blocks, device_budget_bytes);
+#else
+  throw std::invalid_argument("Explicit device Adam is not compiled");
+#endif
+}
+
+/// Download only authoritative committed moments; failed copies leave mirrors stale.
+void FirstOrderOptimizer::synchronizeMoments() const
+{
+#ifdef ENABLE_CUDA
+  if (device_adam_ && moment_mirrors_stale_)
+  {
+    device_adam_->download(first_moment_, second_moment_);
+    moment_mirrors_stale_ = false;
+  }
+#endif
+}
+
+/// Inspect committed first moments, with explicit checked synchronization if needed.
+const std::vector<double>& FirstOrderOptimizer::firstMoment() const
+{
+  synchronizeMoments();
+  return first_moment_;
+}
+
+/// Inspect committed second moments, with explicit checked synchronization if needed.
+const std::vector<double>& FirstOrderOptimizer::secondMoment() const
+{
+  synchronizeMoments();
+  return second_moment_;
+}
+
 void FirstOrderOptimizer::validateInputs(const StructuredParameterSchema& schema,
                                          const StructuredParameterSnapshot& parameters,
                                          ParameterGradientView objective) const
@@ -303,6 +362,24 @@ StructuredParameterSnapshot FirstOrderOptimizer::propose(
       options_.method == FirstOrderMethod::ADAM || options_.method == FirstOrderMethod::AMSGRAD
       ? oneMinusPower(options_.adam_beta2, next_iteration)
       : 1.0;
+
+#ifdef ENABLE_CUDA
+  if (device_adam_)
+  {
+    if (!device_adam_->seeded())
+      device_adam_->seed(first_moment_, second_moment_);
+    device_adam_->propose(parameters.values, objective.gradient.data(), options_.adam_beta1,
+        options_.adam_beta2, adam_first_correction, adam_second_correction, options_.epsilon, candidate.values);
+    proposal_live_ = true;
+    std::clog << "WFTrain device Adam recurrence completed: parameters=" << parameter_count_
+              << ", accepted_updates_before=" << accepted_update_count_
+              << ", owner_device_bytes=" << device_adam_->deviceBytes()
+              << ", host_mirror_bytes=" << sizeof(double) * (first_moment_.capacity() + second_moment_.capacity())
+              << ", global_gradient=host_upload, old_parameters=host_upload, raw_candidate=host_download"
+              << ", selection_and_publication=host, fully_resident=no\n";
+    return candidate;
+  }
+#endif
 
   for (const BlockUpdate& block : blocks_)
     if (block.trainable)
@@ -399,20 +476,37 @@ void FirstOrderOptimizer::proposalAccepted(const StructuredParameterSchema& sche
   assert(proposal_live_);
   assert(schema.fingerprint() == schema_fingerprint_);
   assert(parameters.version == objective.parameter_version);
-  commitRecurrence(objective);
+#ifdef ENABLE_CUDA
+  if (device_adam_)
+  {
+    device_adam_->accept();
+    moment_mirrors_stale_ = true;
+  }
+  else
+#endif
+    commitRecurrence(objective);
   ++accepted_update_count_;
   proposal_live_ = false;
 }
 
 void FirstOrderOptimizer::proposalRejected() noexcept
 {
+#ifdef ENABLE_CUDA
+  if (device_adam_)
+    device_adam_->reject();
+#endif
   proposal_live_ = false;
 }
 
 std::size_t FirstOrderOptimizer::retainedBytes() const noexcept
 {
-  return (first_moment_.capacity() + second_moment_.capacity() +
-          maximum_second_moment_.capacity()) * sizeof(double);
+  const auto host = (first_moment_.capacity() + second_moment_.capacity() +
+                    maximum_second_moment_.capacity()) * sizeof(double);
+#ifdef ENABLE_CUDA
+  return host + (device_adam_ ? device_adam_->deviceBytes() : 0);
+#else
+  return host;
+#endif
 }
 
 std::string FirstOrderOptimizer::stateFingerprint(
@@ -446,6 +540,7 @@ CheckpointContributorMetadata FirstOrderOptimizer::checkpointMetadata() const
 {
   if (proposal_live_)
     throw std::logic_error("Cannot checkpoint a first-order optimizer with a live proposal");
+  synchronizeMoments();
   return {CONTRIBUTOR_ID, {1, 0, 0}, configuration_fingerprint_,
           stateFingerprint(accepted_update_count_, first_moment_, second_moment_, maximum_second_moment_)};
 }
@@ -454,6 +549,7 @@ void FirstOrderOptimizer::writeCheckpointPayload(hdf_archive& archive) const
 {
   if (proposal_live_)
     throw std::logic_error("Cannot checkpoint a first-order optimizer with a live proposal");
+  synchronizeMoments();
   archive.write(accepted_update_count_, "accepted_update_count");
   if (!first_moment_.empty())
     archive.write(first_moment_, "first_moment");
