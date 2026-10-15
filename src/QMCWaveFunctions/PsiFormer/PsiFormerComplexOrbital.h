@@ -59,6 +59,18 @@ struct ComplexOrbitalHeadParameters
   ComplexOrbitalSpinParameters up, down;
 };
 
+/** Borrow compact separate real planes without repacking the neural feature jets.
+ * Values are [configuration,element], gradients [configuration,lane,element],
+ * and Laplacians [configuration,target,element], with the prepared layout's lanes.
+ */
+struct ComplexOrbitalFeatureJetView
+{
+  const double* values = nullptr;
+  const double* gradients = nullptr;
+  const double* laplacians = nullptr;
+  std::size_t value_count = 0, gradient_count = 0, laplacian_count = 0;
+};
+
 /** Prepared bounded head algebra for A=E*(h Wr+br+i(h Wi+bi))*exp(iG.r_row).
  *
  * Features contain packed [physical row,feature] elements. Real envelopes and
@@ -113,8 +125,38 @@ public:
       const double* positions, std::size_t position_count,
       const ComplexOrbitalHeadParameters& parameters, std::size_t active_electron = 0)
   {
+    evaluateImpl(features, feature_count, nullptr, envelopes, envelope_count,
+                 positions, position_count, parameters, active_electron);
+  }
+
+  /// Consume separate real trunk buffers directly; no additional feature storage is owned.
+  void evaluate(const ComplexOrbitalFeatureJetView& features,
+      const double* envelopes, std::size_t envelope_count,
+      const double* positions, std::size_t position_count,
+      const ComplexOrbitalHeadParameters& parameters, std::size_t active_electron = 0)
+  {
+    evaluateImpl(nullptr, 0, &features, envelopes, envelope_count,
+                 positions, position_count, parameters, active_electron);
+  }
+
+private:
+  /// Validate either feature representation, then share the exact projection/product loops.
+  void evaluateImpl(const double* features, std::size_t feature_count,
+      const ComplexOrbitalFeatureJetView* split,
+      const double* envelopes, std::size_t envelope_count,
+      const double* positions, std::size_t position_count,
+      const ComplexOrbitalHeadParameters& parameters, std::size_t active_electron)
+  {
     valid_ = false;
-    validateInput(features, feature_count, spatialJetSpanElements(features_));
+    if (split)
+    {
+      const std::size_t count = multiply(features_.configuration_count, features_.element_count);
+      validateInput(split->values, split->value_count, count);
+      validateInput(split->gradients, split->gradient_count, multiply(count, features_.gradient_lanes));
+      validateInput(split->laplacians, split->laplacian_count, multiply(count, features_.laplacian_lanes));
+    }
+    else
+      validateInput(features, feature_count, spatialJetSpanElements(features_));
     validateInput(envelopes, envelope_count, spatialJetSpanElements(envelopes_));
     validateInput(positions, position_count, multiply(multiply(features_.configuration_count,
         descriptor_.electrons), 3));
@@ -131,13 +173,14 @@ public:
           for (std::size_t orbital = 0; orbital < columns(spin); ++orbital)
           {
             const std::size_t element = matrixElement(d, row, orbital);
-            project(features, p, configuration, d, row, orbital, element);
+            project(features, split, p, configuration, d, row, orbital, element);
             compose(envelopes, positions, configuration, d, row, orbital, element, active_electron);
           }
         }
     valid_ = true;
   }
 
+public:
   /** Real head-parameter JVP with feature and envelope jets held fixed.
    * Linearity permits the same projection using delta-W/delta-bias. This does not
    * claim envelope-parameter response or a real-trunk reverse implementation.
@@ -279,7 +322,8 @@ private:
   }
 
   /// Form the paired affine projection on every supplied real spatial plane.
-  void project(const double* input, const ComplexOrbitalSpinParameters& p,
+  void project(const double* input, const ComplexOrbitalFeatureJetView* split,
+      const ComplexOrbitalSpinParameters& p,
       std::size_t configuration, std::size_t d, std::size_t row,
       std::size_t orbital, std::size_t element)
   {
@@ -293,12 +337,27 @@ private:
       for (std::size_t feature = 0; feature < descriptor_.feature_width; ++feature)
       {
         const std::size_t parameter = feature * count + index;
-        value += static_cast<long double>(input[features_.uncheckedPlaneOffset(configuration,
-            plane, row * descriptor_.feature_width + feature)]) *
+        value += static_cast<long double>(featureValue(input, split, configuration,
+            plane, row * descriptor_.feature_width + feature)) *
             W{p.real_weights[parameter], p.imaginary_weights[parameter]};
       }
       projected_[output_.uncheckedPlaneOffset(configuration, plane, element)] = narrow(value);
     }
+  }
+
+  /// Read one prepared spatial plane from packed or compact split real storage.
+  double featureValue(const double* packed, const ComplexOrbitalFeatureJetView* split,
+      std::size_t configuration, std::size_t plane, std::size_t element) const
+  {
+    if (!split)
+      return packed[features_.uncheckedPlaneOffset(configuration, plane, element)];
+    if (plane == 0)
+      return split->values[configuration * features_.element_count + element];
+    if (plane <= features_.gradient_lanes)
+      return split->gradients[(configuration * features_.gradient_lanes + plane - 1) *
+          features_.element_count + element];
+    return split->laplacians[(configuration * features_.laplacian_lanes +
+        plane - 1 - features_.gradient_lanes) * features_.element_count + element];
   }
 
   /// Return one stored reciprocal G; no common twist is accepted or added here.
