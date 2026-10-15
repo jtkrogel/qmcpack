@@ -103,6 +103,27 @@ public:
   /// Immutable prepared capacity; capability reads need no lazy-owner access.
   std::size_t scoreCapacity() const noexcept { return score_capacity_; }
 
+  /// Return the explicit per-provider coordinate limit; zero retains host input.
+  std::size_t retainedCoordinateBudget() const noexcept
+  { return preparation_.retained_coordinate_workspace_budget_bytes; }
+
+  /// Prepare/upload the complete sample population once, even above tile capacity.
+  /// The returned owner retains its metadata family, never an old P image.
+  std::unique_ptr<PreparedDeviceCoordinates> prepareSampleCoordinates(const std::vector<double>& positions,
+                                                                    std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    validateContractionControl(version);
+    if (!retainedCoordinateBudget())
+      throw std::logic_error("Retained device sample coordinates were not explicitly admitted");
+    const auto stride = 3 * masses_.size();
+    if (positions.empty() || positions.size() % stride != 0)
+      throw std::invalid_argument("Retained sample coordinates have an incomplete population");
+    auto source = image_->prepareCoordinates(positions.size() / stride, retainedCoordinateBudget());
+    source->upload(positions);
+    return source;
+  }
+
   /// Identify the actually owned kinetic route without allocating or upgrading it.
   std::size_t kineticTargetCapacity() const noexcept
   { return target_kinetic_ ? preparation_.kinetic.max_targets : 0; }
@@ -145,6 +166,18 @@ public:
       score_.reverse(values_, weights_);
       score_.downloadResponse(score_response_);
     });
+    return score_response_;
+  }
+
+  /// Evaluate one retained sample without another coordinate host upload.
+  const std::vector<double>& scoreDeviceCoordinates(const PackedDeviceCoordinatesView& positions,
+                                                   std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
+      values_.evaluateDeviceCoordinates(positions);
+      score_.reverse(values_, weights_);
+      score_.downloadResponse(score_response_);
+    }, 1, &positions);
     return score_response_;
   }
 
@@ -196,6 +229,18 @@ public:
     });
   }
 
+  /// Fold all algebraic score channels for one retained sample into existing sums.
+  void accumulateScoreContractionDeviceCoordinates(const PackedDeviceCoordinatesView& positions,
+      const std::complex<double>* coefficients, std::size_t channels, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
+      if (!score_contraction_)
+        throw std::logic_error("Device score contraction was not prepared");
+      values_.evaluateDeviceCoordinates(positions);
+      score_contraction_->accumulate(score_.reverse(values_, weights_), coefficients, channels);
+    }, 1, &positions);
+  }
+
   /// One batched forward/reverse contracts real sample weights directly to P.
   /// The outer C1 transaction spans all tiles and admits the final sum together.
   void accumulateWeightedScoreTile(const double* positions, const double* weights,
@@ -213,6 +258,25 @@ public:
       const std::complex<double> unit(1, 0);
       score_contraction_->accumulate(response, &unit, 1);
     }, count);
+    ++weighted_score_tiles_;
+    weighted_score_configurations_ += count;
+  }
+
+  /// Contract signed real sample weights from one retained full/tail tile.
+  void accumulateWeightedScoreTileDeviceCoordinates(const PackedDeviceCoordinatesView& positions,
+                                                     const double* weights, std::size_t version)
+  {
+    const auto count = positions.batchCount();
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
+      if (!weights || !score_contraction_)
+        throw std::invalid_argument("Weighted score tile requires weights and a prepared contraction");
+      tile_weights_.resize(count);
+      std::copy_n(weights, count, tile_weights_.begin());
+      values_.evaluateDeviceCoordinates(positions);
+      const double* response = score_.reverse(values_, tile_weights_);
+      const std::complex<double> unit(1, 0);
+      score_contraction_->accumulate(response, &unit, 1);
+    }, count, &positions);
     ++weighted_score_tiles_;
     weighted_score_configurations_ += count;
   }
@@ -419,6 +483,27 @@ public:
         products_.resize(count);
         jvp_.downloadProducts(products_);
       }, count);
+    }
+    catch (...)
+    {
+      products_.clear();
+      throw;
+    }
+    return products_;
+  }
+
+  /// Apply the resident direction to a retained tile, publishing no failed tail.
+  const std::vector<double>& scoreJvpPreparedTileDeviceCoordinates(const PackedDeviceCoordinatesView& positions,
+                                                                  std::size_t version)
+  {
+    try
+    {
+      execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, nullptr, version, [&]() {
+        values_.evaluateDeviceCoordinates(positions);
+        jvp_.evaluatePrepared(values_);
+        products_.resize(positions.batchCount());
+        jvp_.downloadProducts(products_);
+      }, positions.batchCount(), &positions);
     }
     catch (...)
     {
@@ -648,11 +733,13 @@ private:
 
   /// Preserve provenance and failure recovery around one synchronous product.
   void execute(PsiFormerAcceleratorOperation operation, const double* positions,
-                std::size_t version, const std::function<void()>& action, std::size_t count = 1)
+                std::size_t version, const std::function<void()>& action, std::size_t count = 1,
+                const PackedDeviceCoordinatesView* device_input = nullptr)
   {
     std::lock_guard lock(mutex_);
     ready_ = false;
-    if (!positions || version != active_image_->version() || count == 0 || count > score_capacity_)
+    if ((!positions && !device_input) || version != active_image_->version() || count == 0 || count > score_capacity_ ||
+        (device_input && (device_input->batchCount() != count || device_input->physicalElectrons() != masses_.size())))
     {
       invalidateScoreContraction();
       throw std::invalid_argument("Device parameter product has missing coordinates, stale version or invalid tile count");
@@ -664,8 +751,13 @@ private:
     }
     rebind();
     request_count_ = count;
-    positions_.resize(count * 3 * masses_.size());
-    std::copy_n(positions, positions_.size(), positions_.begin());
+    // Typed actions borrow their view synchronously; no source pointer survives
+    // this call. Host callers retain their original bounded staging path.
+    if (!device_input)
+    {
+      positions_.resize(count * 3 * masses_.size());
+      std::copy_n(positions, positions_.size(), positions_.begin());
+    }
     ++coordinate_generation_;
     action_ = &action;
     operation_ = operation;

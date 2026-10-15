@@ -868,8 +868,9 @@ struct PsiFormerDerivativeScratch;
 
 #ifdef ENABLE_CUDA
 /** Read each developer GPU control once at shared-backend construction.
- * These explicit limits apply to each target owner/logical request. They do not
- * change batch_memory or admit the aggregate process, images or vendor reserves.
+ * Target limits apply to each owner/logical request; retained-coordinate limits
+ * apply to each provider. Neither changes batch_memory or admits aggregate
+ * process storage, shared images or vendor reserves.
  */
 psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     const psiformer::PsiFormerExecutionPlan& plan, psiformer::PsiFormerPrecisionPolicy precision)
@@ -899,13 +900,15 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   const auto lifted = positive("PSIFORMER_GPU_LIFTED_CHANNELS");
   const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
   const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
+  const auto retained_coordinates = positive("PSIFORMER_GPU_RETAINED_COORDINATE_BYTES");
   if (lifted && !kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
   if ((vgl || kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
-  if ((vgl || kinetic) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
-    throw std::invalid_argument("GPU target preparation requires FP64 reference precision");
+  if ((vgl || kinetic || retained_coordinates) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+    throw std::invalid_argument("GPU target/retained-coordinate preparation requires FP64 reference precision");
   psiformer::device::DeviceExecutionPreparation preparation;
+  preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
   if (vgl)
     preparation.vgl = {vgl, bytes, work};
   if (kinetic)
@@ -914,6 +917,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   app_log() << "  PsiFormer GPU target preparation: vgl_targets=" << vgl << ", kinetic_targets=" << kinetic
             << ", lifted_channel_slots=" << lifted
             << ", per_owner_workspace_limit_bytes=" << bytes << ", per_request_scalar_work_limit=" << work
+            << ", per_provider_retained_coordinate_limit_bytes=" << retained_coordinates
             << ", aggregate_process_budget=no" << std::endl;
   return preparation;
 }
@@ -1942,6 +1946,27 @@ public:
       throw std::invalid_argument("PsiFormer streaming derivative schema does not match the execution plan");
     checkedBatchMemoryAdd(sample_offset_, sample_count_,
                           "PsiFormer streaming derivative sample interval");
+#ifdef ENABLE_CUDA
+    // Immutable samples belong to this operator, not its shared derivative lane.
+    // Empty operators need no allocation/upload. Enabled admission failures throw;
+    // they must not silently return to coordinate host uploads.
+    if (hasDeviceProducts() && shared_scratch_->device_products->retainedCoordinateBudget() && sample_count_ != 0)
+    {
+      std::lock_guard scratch_lock(shared_scratch_->execution_mutex);
+      auto& session = *shared_scratch_->device_products;
+      const auto before = session.transferSnapshot();
+      retained_coordinates_ = session.prepareSampleCoordinates(positions_, parameter_version_);
+      const auto after = session.transferSnapshot();
+      app_log() << "  PsiFormer retained device sample coordinates: configurations=" << sample_count_
+                << ", host_position_bytes=" << checkedBatchMemoryMultiply(positions_.capacity(), sizeof(double),
+                    "PsiFormer retained host coordinate bytes")
+                << ", device_position_bytes=" << retained_coordinates_->deviceWorkspaceBytes()
+                << ", per_provider_limit_bytes=" << session.retainedCoordinateBudget()
+                << ", measured_upload_calls=" << after.upload_calls - before.upload_calls
+                << ", measured_uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
+                << ", transfer_counter_scope=device_wide, aggregate_process_budget=no" << std::endl;
+    }
+#endif
     initializeStorageDiagnostics();
   }
 
@@ -2134,6 +2159,8 @@ protected:
       const bool resident_kinetic = hasDeviceProducts() && needs_kinetic &&
           device_channel_count != 0 && sample_count_ > 2 * device_channel_count;
       const bool resident_products = resident_scores || resident_kinetic;
+      // Mixed kinetic/ECP requests retain their existing host coordinate boundary.
+      const bool retained_score_input = retained_coordinates_ && !needs_kinetic && !needs_ecp;
       const auto& contracted_channels = resident_kinetic ? device_channels : score_channels;
       const auto contracted_count = resident_kinetic ? device_channel_count : score_channel_count;
       psiformer::device::DeviceMemorySnapshot transfer_before;
@@ -2170,8 +2197,13 @@ protected:
           const auto count = std::min(capacity, sample_count_ - offset);
           for (std::size_t sample = 0; sample < count; ++sample)
             weights[sample] = channels[0].coefficients.values[offset + sample].real();
-          shared_scratch_->device_products->accumulateWeightedScoreTile(
-              positions_.data() + offset * 3 * electron_count_, weights.data(), count, parameter_version_);
+          auto& session = *shared_scratch_->device_products;
+          if (retained_score_input)
+            session.accumulateWeightedScoreTileDeviceCoordinates(retained_coordinates_->view(offset, count),
+                weights.data(), parameter_version_);
+          else
+            session.accumulateWeightedScoreTile(positions_.data() + offset * 3 * electron_count_,
+                weights.data(), count, parameter_version_);
           final_score_tile_count = count;
         }
         completed_score_tiles = shared_scratch_->device_products->weightedScoreTiles() - before_tiles;
@@ -2262,22 +2294,33 @@ protected:
         }
         else
         {
-          setScoreWorkspacePositions(sample);
+#ifdef ENABLE_CUDA
+          if (!retained_score_input)
+#endif
+            setScoreWorkspacePositions(sample);
 #ifdef ENABLE_CUDA
           if (resident_scores)
           {
             std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> coefficients{};
             for (std::size_t score_channel = 0; score_channel < score_channel_count; ++score_channel)
               coefficients[score_channel] = channels[score_channels[score_channel]].coefficients.values[sample];
-            shared_scratch_->device_products->accumulateScoreContraction(
-                shared_scratch_->device_positions.data(), coefficients.data(),
-                score_channel_count, parameter_version_);
+            auto& session = *shared_scratch_->device_products;
+            if (retained_score_input)
+              session.accumulateScoreContractionDeviceCoordinates(retained_coordinates_->view(sample, 1),
+                  coefficients.data(), score_channel_count, parameter_version_);
+            else
+              session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
+                  score_channel_count, parameter_version_);
             reportDeviceProducts();
           }
           else
 #endif
           {
-            const pf::DirectScoreResult score = evaluateScoreResponse();
+            const pf::DirectScoreResult score =
+#ifdef ENABLE_CUDA
+                retained_score_input ? evaluateRetainedScoreResponse(sample) :
+#endif
+                evaluateScoreResponse();
             requireResultVersion(score);
             for (std::size_t channel = 0; channel < channels.size(); ++channel)
               if (channels[channel].product ==
@@ -2368,8 +2411,10 @@ protected:
           for (std::size_t offset = 0; offset < sample_count_; offset += capacity)
           {
             const auto count = std::min(capacity, sample_count_ - offset);
-            const auto& products = shared_scratch_->device_products->scoreJvpPreparedTile(
-                positions_.data() + offset * 3 * electron_count_, count, parameter_version_);
+            auto& session = *shared_scratch_->device_products;
+            const auto& products = retained_coordinates_
+                ? session.scoreJvpPreparedTileDeviceCoordinates(retained_coordinates_->view(offset, count), parameter_version_)
+                : session.scoreJvpPreparedTile(positions_.data() + offset * 3 * electron_count_, count, parameter_version_);
             for (std::size_t sample = 0; sample < count; ++sample)
               sample_products_[offset + sample] += factor * products[sample];
             ++completed_tiles;
@@ -2383,6 +2428,7 @@ protected:
           app_log() << "  PsiFormer device score JVP tiles: configurations=" << sample_count_
                     << ", prepared_capacity=" << capacity << ", completed_tiles=" << completed_tiles
                     << ", final_tile_count=" << final_count << ", direction_uploads=" << components
+                    << ", retained_coordinate_input=" << (retained_coordinates_ ? "device" : "host")
                     << ", parameter_version=" << parameter_version_ << ", CPU derivative fallback=no" << std::endl;
           shared_scratch_->reported_device_jvp_tiles = true;
         }
@@ -2591,6 +2637,18 @@ private:
     const double result = shared_scratch_->device_products->scoreJvpPrepared(
         shared_scratch_->device_positions.data(), parameter_version_);
     reportDeviceProducts();
+    return result;
+  }
+
+  /// Keep retained score inputs separate from host-modified ECP/kinetic workspaces.
+  pf::DirectScoreResult evaluateRetainedScoreResponse(std::size_t sample) const
+  {
+    const auto& response = shared_scratch_->device_products->scoreDeviceCoordinates(
+        retained_coordinates_->view(sample, 1), parameter_version_);
+    reportDeviceProducts();
+    pf::DirectScoreResult result;
+    result.parameter_score = {response.data(), response.size()};
+    result.parameter_version = parameter_version_;
     return result;
   }
 #endif
@@ -2947,6 +3005,11 @@ private:
     const std::size_t position_bytes = checkedBatchMemoryMultiply(
         positions_.capacity(), sizeof(double),
         "PsiFormer streaming position capacity");
+    std::size_t device_position_bytes = 0;
+#ifdef ENABLE_CUDA
+    if (retained_coordinates_)
+      device_position_bytes = retained_coordinates_->deviceWorkspaceBytes();
+#endif
     const std::size_t gradient_bytes = checkedBatchMemoryMultiply(
         total_log_gradients_real_.capacity(), sizeof(double),
         "PsiFormer streaming real total-drift capacity");
@@ -3003,7 +3066,8 @@ private:
         checkedBatchMemoryAdd(
             checkedBatchMemoryAdd(workspace_bytes, channel_bytes,
                                   "PsiFormer streaming evaluator and channels"),
-            position_bytes, "PsiFormer streaming positions"),
+            checkedBatchMemoryAdd(position_bytes, device_position_bytes, "PsiFormer host/device sample positions"),
+            "PsiFormer streaming positions"),
         checkedBatchMemoryAdd(
             checkedBatchMemoryAdd(auxiliary_bytes, replay_bytes,
                                   "PsiFormer streaming ECP replay storage"),
@@ -3015,6 +3079,11 @@ private:
     if (score_workspace_)
       mixFingerprint(fingerprint, score_workspace_->storageFingerprint());
     mixFingerprint(fingerprint, workspace_bytes);
+    mixFingerprint(fingerprint, device_position_bytes);
+#ifdef ENABLE_CUDA
+    if (retained_coordinates_)
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(retained_coordinates_->view(0, sample_count_).sourceIdentity()));
+#endif
     if (kinetic_workspace_)
       mixFingerprint(fingerprint, kinetic_workspace_->storageFingerprint());
 #ifdef ENABLE_CUDA
@@ -3072,7 +3141,8 @@ private:
             fingerprint,
             reinterpret_cast<std::uintptr_t>(shared_scratch_.get()),
             checkedBatchMemoryAdd(workspace_bytes, channel_bytes,
-                                  "PsiFormer shared scratch retained bytes")};
+                                  "PsiFormer shared scratch retained bytes"),
+            device_position_bytes};
   }
 
   std::shared_ptr<PsiFormerSharedState> model_state_;
@@ -3083,6 +3153,9 @@ private:
   std::size_t sample_count_      = 0;
   std::size_t electron_count_    = 0;
   std::vector<double> positions_;
+#ifdef ENABLE_CUDA
+  std::unique_ptr<psiformer::device::PreparedDeviceCoordinates> retained_coordinates_;
+#endif
   std::vector<double> total_log_gradients_real_;
   std::vector<double> total_log_gradients_imaginary_;
   std::vector<double> inverse_masses_;

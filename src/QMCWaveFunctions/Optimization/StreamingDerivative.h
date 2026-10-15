@@ -577,6 +577,7 @@ struct StreamingDerivativeStorageDiagnostics
   std::size_t complex_parameter_vectors       = 0;
   std::size_t parameter_scratch_bytes         = 0;
   std::size_t evaluator_workspace_bytes       = 0;
+  /// Host sample positions retained for CPU products and accepted-grid ECP replay.
   std::size_t sample_position_bytes           = 0;
   std::size_t sample_auxiliary_bytes           = 0;
   std::size_t sample_product_bytes            = 0;
@@ -586,6 +587,8 @@ struct StreamingDerivativeStorageDiagnostics
   /// Shared scratch is included above, but aggregate owners must count it once.
   std::uintptr_t shared_workspace_identity     = 0;
   std::size_t shared_workspace_bytes           = 0;
+  /// Independent per-provider device coordinates; included in retained bytes once.
+  std::size_t device_sample_position_bytes      = 0;
 };
 
 /** Common checked front end for bounded multi-channel VJP and score JVP kernels.

@@ -23,6 +23,8 @@ struct DeviceExecutionPreparation
 {
   TargetVglPreparation vgl;
   TargetKineticPreparation kinetic;
+  /// Optional per-provider immutable sample-coordinate owner, not an aggregate cap.
+  std::size_t retained_coordinate_workspace_budget_bytes = 0;
 };
 
 /// Reject partial profiles and impossible per-owner limits before graph reserves.

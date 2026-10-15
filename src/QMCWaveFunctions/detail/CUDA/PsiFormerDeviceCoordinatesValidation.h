@@ -8,6 +8,7 @@
 
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceScoreReverse.h"
+#include "PsiFormerDeviceBatchBackend.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -209,6 +210,172 @@ void validateDeviceCoordinates(Model& model, const std::shared_ptr<const Prepare
             << maximum_error << " measured_D2D_calls=" << measured_copies << " measured_D2D_bytes="
             << measured_copy_bytes << " coordinate_H2D_reuse_calls=0 transfer_counter_scope=device_wide "
             << "foreign_device_check=" << (device_count > 1 ? "PASS" : "NOT_RUN_single_device") << '\n';
+}
+
+/// Compare host compatibility and retained score-only replays with measured transfers.
+template<class Model>
+void validateRetainedCoordinateReplays(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image)
+{
+  if (PreparedDeviceProductSession::admittedScoreCapacity(image->plan().modelShape(), 4) != 4)
+    return;
+  using Complex = std::complex<double>;
+  const auto stride = 3 * image->plan().modelShape().electrons(), parameters = image->plan().parameterCount();
+  std::vector<double> positions(7 * stride), direction(parameters), imaginary_direction(parameters), weights(7);
+  for (std::size_t sample = 0; sample < 7; ++sample)
+  {
+    std::copy_n(model.cfg.electrons.x.data() + (sample % model.cfg.nconfig) * stride, stride,
+                positions.data() + sample * stride);
+    weights[sample] = .2 * (static_cast<int>(sample % 3) - 1);
+  }
+  for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+  {
+    direction[parameter] = .003 * (static_cast<int>(parameter % 7) - 3);
+    imaginary_direction[parameter] = -.2 * direction[parameter];
+  }
+  DeviceExecutionPreparation preparation;
+  preparation.retained_coordinate_workspace_budget_bytes = checkedDeviceBytes<double>(positions.size());
+  PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation);
+  auto session = backend.prepareProductSession(ProductSessionProfile::SCORE_ONLY, 4);
+  session->prepareScoreContractions(3, image->version());
+  const auto before_source = session->transferSnapshot();
+  auto source = session->prepareSampleCoordinates(positions, image->version());
+  const auto after_source = session->transferSnapshot();
+  if (after_source.upload_calls - before_source.upload_calls != 1 ||
+      after_source.uploaded_bytes - before_source.uploaded_bytes != positions.size() * sizeof(double) ||
+      after_source.live_bytes - before_source.live_bytes != source->deviceWorkspaceBytes())
+    throw std::runtime_error("Retained operator did not prepare exactly one whole-population upload");
+  const auto fixed_bytes = session->deviceWorkspaceBytes(), fixed_host_bytes = session->hostWorkspaceBytes();
+  std::vector<Complex> expected(3 * parameters), actual(expected.size()), expected_jvp(7), actual_jvp(7);
+  double maximum_error = 0;
+  std::size_t saved_coordinate_bytes = 0, measured_copies = 0;
+  // Exact complex coefficients are already in the caller's selected adjoint convention.
+  const auto coefficients = [](std::size_t sample) {
+    return std::array<Complex, 3>{Complex(.1 * (sample + 1), -.03 * sample),
+        sample % 3 == 0 ? Complex{} : Complex(-.07 * sample, .11), Complex(.02, -.09 * (sample + 1))};
+  };
+  // Measure the same numerical contraction twice, differing only in input source.
+  const auto run_vjp = [&](bool retained, bool weighted, std::size_t population, std::vector<Complex>& output) {
+    const auto channels = weighted ? std::size_t{1} : std::size_t{3};
+    session->beginScoreContraction(channels, image->version());
+    if (weighted)
+      for (std::size_t offset = 0; offset < population; offset += 4)
+      {
+        const auto count = std::min(std::size_t{4}, population - offset);
+        if (retained)
+          session->accumulateWeightedScoreTileDeviceCoordinates(source->view(offset, count), weights.data() + offset, image->version());
+        else
+          session->accumulateWeightedScoreTile(positions.data() + offset * stride, weights.data() + offset, count, image->version());
+      }
+    else
+      for (std::size_t sample = 0; sample < population; ++sample)
+      {
+        const auto values = coefficients(sample);
+        if (retained)
+          session->accumulateScoreContractionDeviceCoordinates(source->view(sample, 1), values.data(), channels, image->version());
+        else
+          session->accumulateScoreContraction(positions.data() + sample * stride, values.data(), channels, image->version());
+      }
+    session->finishScoreContraction(image->version());
+    for (std::size_t channel = 0; channel < channels; ++channel)
+      session->downloadScoreContraction(channel, output.data() + channel * parameters, parameters, image->version());
+  };
+  // Keep the one canonical direction resident throughout all tiles of each component.
+  const auto run_jvp = [&](bool retained, std::size_t population, std::vector<Complex>& output) {
+    std::fill(output.begin(), output.end(), Complex{});
+    for (unsigned component = 0; component < 2; ++component)
+    {
+      session->prepareScoreDirection(component == 0 ? direction : imaginary_direction, image->version());
+      for (std::size_t offset = 0; offset < population; offset += 4)
+      {
+        const auto count = std::min(std::size_t{4}, population - offset);
+        const auto& products = retained
+            ? session->scoreJvpPreparedTileDeviceCoordinates(source->view(offset, count), image->version())
+            : session->scoreJvpPreparedTile(positions.data() + offset * stride, count, image->version());
+        for (std::size_t sample = 0; sample < count; ++sample)
+          output[offset + sample] += (component == 0 ? Complex(1, 0) : Complex(0, 1)) * products[sample];
+      }
+    }
+  };
+  // Check complete scalar/P output vectors without assuming identical reduction order.
+  const auto compare = [&](const std::vector<Complex>& lhs, const std::vector<Complex>& rhs, std::size_t count) {
+    for (std::size_t index = 0; index < count; ++index)
+    {
+      const auto error = std::abs(lhs[index] - rhs[index]);
+      if (!device_math::isFiniteBinary64(error) || error > 1.e-10 * (1 + std::abs(rhs[index])))
+        throw std::runtime_error("Retained coordinate score replay parity failed");
+      maximum_error = std::max(maximum_error, error);
+    }
+  };
+  // Compare transfer intervals at this serial validation point, not across crowds.
+  const auto measure = [&](const auto& operation, std::size_t copy_count, std::size_t coordinate_bytes) {
+    const auto before = session->transferSnapshot();
+    operation(false);
+    const auto middle = session->transferSnapshot();
+    operation(true);
+    const auto after = session->transferSnapshot();
+    if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
+        session->deviceWorkspaceBytes() != fixed_bytes || session->hostWorkspaceBytes() != fixed_host_bytes ||
+        middle.uploaded_bytes - before.uploaded_bytes != after.uploaded_bytes - middle.uploaded_bytes + coordinate_bytes ||
+        middle.upload_calls - before.upload_calls != after.upload_calls - middle.upload_calls + copy_count ||
+        after.device_copy_calls - middle.device_copy_calls != copy_count ||
+        after.device_copied_bytes - middle.device_copied_bytes != coordinate_bytes)
+      throw std::runtime_error("Retained score replay lost exact coordinate transfers or warmed storage");
+    saved_coordinate_bytes += (middle.uploaded_bytes - before.uploaded_bytes) -
+        (after.uploaded_bytes - middle.uploaded_bytes);
+    measured_copies += after.device_copy_calls - middle.device_copy_calls;
+  };
+  for (const auto population : {std::size_t{1}, std::size_t{4}, std::size_t{5}, std::size_t{7}})
+  {
+    for (bool weighted : {false, true})
+    {
+      const auto channels = weighted ? std::size_t{1} : std::size_t{3};
+      measure([&](bool retained) { run_vjp(retained, weighted, population, retained ? actual : expected); },
+          weighted ? (population + 3) / 4 : population, population * stride * sizeof(double));
+      compare(actual, expected, channels * parameters);
+    }
+    measure([&](bool retained) { run_jvp(retained, population, retained ? actual_jvp : expected_jvp); },
+        2 * ((population + 3) / 4), 2 * population * stride * sizeof(double));
+    compare(actual_jvp, expected_jvp, population);
+  }
+  const auto& host_single = session->score(positions.data(), image->version());
+  std::vector<double> single_reference(host_single);
+  const auto& device_single = session->scoreDeviceCoordinates(source->view(0, 1), image->version());
+  for (std::size_t parameter = 0; parameter < parameters; ++parameter)
+    if (std::abs(device_single[parameter] - single_reference[parameter]) > 1.e-10 * (1 + std::abs(single_reference[parameter])))
+      throw std::runtime_error("Retained singleton score replay parity failed");
+
+  // A late stale source invalidates all earlier accumulated channels, not just its tile.
+  session->beginScoreContraction(3, image->version());
+  const auto values = coefficients(0);
+  session->accumulateScoreContractionDeviceCoordinates(source->view(0, 1), values.data(), 3, image->version());
+  const auto stale = source->view(1, 1);
+  source->upload(positions); // Failure injection only; normal operators never mutate their source.
+  bool rejected = false, missing = false;
+  try { session->accumulateScoreContractionDeviceCoordinates(stale, values.data(), 3, image->version()); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  try { session->finishScoreContraction(image->version()); }
+  catch (const std::exception&) { missing = true; }
+  if (!rejected || !missing)
+    throw std::runtime_error("Late retained source failure published a partial score contraction");
+  session->prepareScoreDirection(direction, image->version());
+  const auto& borrowed = session->scoreJvpPreparedTileDeviceCoordinates(source->view(0, 1), image->version());
+  rejected = false;
+  try { session->scoreJvpPreparedTileDeviceCoordinates(stale, image->version()); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected || !borrowed.empty())
+    throw std::runtime_error("Failed retained JVP kept prior scalar products");
+  backend.publishParameters(model.p.flat_values(), image->version() + 1, []() {});
+  rejected = false;
+  try { session->scoreDeviceCoordinates(source->view(0, 1), image->version()); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected)
+    throw std::runtime_error("Retained source bypassed stale parameter-version admission");
+  session->prepareScoreDirection(direction, image->version() + 1);
+  session->scoreJvpPreparedTileDeviceCoordinates(source->view(0, 1), image->version() + 1);
+  std::cout << "PASS retained operator coordinates: wholeB7 upload once, score-only VJP/JVP B1/4/5/7 "
+               "tails, signed complex channels, singleton, failure/stale/successor reuse, zero warmed allocations; "
+            << "max_abs_error=" << maximum_error << " measured_coordinate_H2D_bytes_saved=" << saved_coordinate_bytes
+            << " measured_D2D_calls=" << measured_copies << " transfer_counter_scope=device_wide\n";
 }
 } // namespace qmcplusplus::psiformer::device
 #endif

@@ -249,6 +249,7 @@ int main(int argc, char** argv)
       // Qualify only the typed source contract, without the broad model matrix.
       const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
       validateDeviceCoordinates(model, image, queue, handle);
+      validateRetainedCoordinateReplays(model, image);
       return 0;
     }
     if (coordinate_only)
@@ -1012,6 +1013,7 @@ int main(int argc, char** argv)
     validateTargetKinetic(model, plan, image, queue, handle);
     validateKineticContractions(model, plan, image);
     validateDeviceCoordinates(model, image, queue, handle);
+    validateRetainedCoordinateReplays(model, image);
     {
       const auto targets = std::min(std::size_t(3), model.ne);
       const auto vgl_cost = estimateTargetVglCost(plan, 2, targets);
