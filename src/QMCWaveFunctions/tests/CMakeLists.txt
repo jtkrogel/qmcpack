@@ -680,6 +680,19 @@ add_unit_test(deterministic-unit_test_psiformer_value_executor
               1 1 $<TARGET_FILE:test_psiformer_value_executor>)
 set_tests_properties(deterministic-unit_test_psiformer_value_executor PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+add_executable(test_psiformer_value_trunk
+               test_psiformer_value_trunk.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_value_trunk catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_value_trunk PRIVATE "${qmcpack_SOURCE_DIR}/src")
+target_compile_options(test_psiformer_value_trunk PRIVATE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
+add_unit_test(deterministic-unit_test_psiformer_value_trunk
+              1 1 $<TARGET_FILE:test_psiformer_value_trunk>)
+set_tests_properties(deterministic-unit_test_psiformer_value_trunk
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_batch_executor
                test_psiformer_batch_executor.cpp
                ../PsiFormer/PsiFormerExecutionPlan.cpp

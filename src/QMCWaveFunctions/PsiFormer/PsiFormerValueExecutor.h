@@ -6,7 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 /** @file PsiFormerValueExecutor.h
- * @brief Allocation-free direct value-only evaluator for molecular PsiFormer models.
+ * @brief Shared real open/periodic value trunk and guarded complete real evaluator.
  *
  * This executor is the optimized inference counterpart to PsiFormerNative.h.  The
  * native evaluator remains the derivative-capable oracle; this file evaluates only
@@ -14,12 +14,10 @@
  * kernels.  Parameter names and tensor shapes are resolved once at construction,
  * while all mutable scratch storage belongs to a clone-local workspace.
  *
- * Geometry is kept in the real-valued PsiFormerGeometryCache and the constructor
- * accepts its boundary descriptor.  Only open molecular boundaries and real-valued
- * wavefunctions are implemented.  Keeping geometry/boundary handling outside the
- * algebra kernels, and keeping the result in sign/log-magnitude form, provides the
- * intended seams for later periodic displacement and complex phase policies without
- * claiming support for either here.
+ * Real geometry and neural loops support open and periodic policies. Complete
+ * real-wavefunction preparation retains its existing head and determinant contract;
+ * explicit trunk-only preparation exposes borrowed real features for later complex
+ * composition without allocating a real head or advertising a complex wavefunction.
  */
 
 //////////////////////////////////////////////////////////////////////////////////////
@@ -69,14 +67,23 @@ struct DirectParameterTensor
   std::size_t size  = 0;
 };
 
+/// A real trunk can feed a complex head without admitting the legacy real head.
+enum class DirectValuePreparation
+{
+  REAL_WAVEFUNCTION,
+  REAL_TRUNK_ONLY
+};
+
 /// Hold all parameter intervals and fixed dimensions required by direct inference.
 class DirectValueParameterLayout
 {
 public:
   /// Copy hot-path intervals from the shared, fully validated execution plan.
   DirectValueParameterLayout(const PsiFormer& model,
-                             const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
+                             const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                             DirectValuePreparation preparation = DirectValuePreparation::REAL_WAVEFUNCTION)
       : parameter_count_(plan.parameterCount()),
+        preparation_(preparation),
         electron_count_(plan.modelShape().electrons()),
         spin_up_count_(plan.modelShape().spin_up_electrons),
         spin_down_count_(plan.modelShape().spin_down_electrons),
@@ -99,10 +106,16 @@ public:
     using qmcplusplus::psiformer::ParameterRole;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan.environment();
-    if (environment.head_representation != HeadRepresentation::REAL ||
-        environment.parameter_scalar_domain != ScalarDomain::REAL ||
+    if (preparation_ != DirectValuePreparation::REAL_WAVEFUNCTION &&
+        preparation_ != DirectValuePreparation::REAL_TRUNK_ONLY)
+      throw std::invalid_argument("Unknown PsiFormer direct value preparation profile");
+    if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
-        environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+        !environment.fixed_nuclei)
+      throw std::invalid_argument("PsiFormer direct trunk execution requires fixed ions and real parameters/trunk");
+    if (preparation_ == DirectValuePreparation::REAL_WAVEFUNCTION &&
+        (environment.head_representation != HeadRepresentation::REAL ||
+         environment.amplitude_scalar_domain != ScalarDomain::REAL))
       throw std::invalid_argument("PsiFormer direct value execution supports only fixed-ion real models");
 
     anti_alpha_ = interval(plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA));
@@ -138,6 +151,10 @@ public:
   }
 
   std::size_t parameterCount() const noexcept { return parameter_count_; }
+
+  /// Keep real wavefunction consumers separate from explicitly prepared real trunks.
+  DirectValuePreparation preparation() const noexcept { return preparation_; }
+
   std::size_t electronCount() const noexcept { return electron_count_; }
   std::size_t spinUpCount() const noexcept { return spin_up_count_; }
   std::size_t spinDownCount() const noexcept { return spin_down_count_; }
@@ -174,6 +191,7 @@ private:
   }
 
   std::size_t parameter_count_;
+  DirectValuePreparation preparation_;
   std::size_t electron_count_;
   std::size_t spin_up_count_;
   std::size_t spin_down_count_;
@@ -196,20 +214,21 @@ private:
   std::vector<DirectAttentionLayer> layers_;
 };
 
-/** Own every mutable buffer used by one evaluator clone.
+/** Own only real geometry and neural trunk buffers for one evaluator clone.
  *
  * Vector sizes never change after construction.  A workspace is intentionally not
  * shared between walkers or threads; only the immutable layout and parameter store
  * are shared.
  */
-class DirectValueWorkspace
+class DirectValueTrunkWorkspace
 {
 public:
-  /// Allocate fixed-size geometry and algebra buffers for one model shape.
-  DirectValueWorkspace(const DirectValueParameterLayout& layout,
+  /// Allocate the shared real trunk without any orbital or determinant storage.
+  DirectValueTrunkWorkspace(const DirectValueParameterLayout& layout,
                        GeometryPositionView nuclei,
                        GeometryBoundary boundary = {})
-      : electron_positions_(3 * layout.electronCount()),
+      : layout_identity_(&layout),
+        electron_positions_(3 * layout.electronCount()),
         geometry_(layout.electronCount(), nuclei, boundary),
         raw_features_(layout.electronCount() * layout.inputWidth()),
         features_a_(layout.electronCount() * layout.featureWidth()),
@@ -219,19 +238,28 @@ public:
         value_(layout.electronCount() * layout.featureWidth()),
         attention_(layout.headCount() * layout.electronCount() * layout.electronCount()),
         attended_(layout.electronCount() * layout.featureWidth()),
-        hidden_(layout.electronCount() * layout.featureWidth()),
-        orbital_matrices_(layout.determinantCount() * layout.electronCount() * layout.electronCount()),
-        determinant_workspace_(layout.determinantCount(), layout.electronCount())
+        hidden_(layout.electronCount() * layout.featureWidth())
   {}
 
-  DirectValueWorkspace(const DirectValueWorkspace&) = delete;
-  DirectValueWorkspace& operator=(const DirectValueWorkspace&) = delete;
-  DirectValueWorkspace(DirectValueWorkspace&&) = default;
-  DirectValueWorkspace& operator=(DirectValueWorkspace&&) = default;
+  /// Mutable trunk buffers are exclusively owned by one walker/clone.
+  DirectValueTrunkWorkspace(const DirectValueTrunkWorkspace&) = delete;
+
+  /// Prevent accidental sharing of mutable trunk scratch.
+  DirectValueTrunkWorkspace& operator=(const DirectValueTrunkWorkspace&) = delete;
+
+  /// Transfer prepared real trunk buffers without growing them.
+  DirectValueTrunkWorkspace(DirectValueTrunkWorkspace&&) = default;
+
+  /// Transfer exclusive ownership of all shared forward scratch.
+  DirectValueTrunkWorkspace& operator=(DirectValueTrunkWorkspace&&) = default;
+
+  /// Safely destroy a complete workspace retained through its public trunk base.
+  virtual ~DirectValueTrunkWorkspace() = default;
 
   /// Overwrite one Cartesian input coordinate without changing workspace capacity.
   void setPosition(std::size_t electron, std::size_t dimension, double value)
   {
+    invalidateResult();
     if (electron >= geometry_.electronCount() || dimension >= 3)
       throw std::out_of_range("PsiFormer direct workspace coordinate index is out of range");
     electron_positions_[3 * electron + dimension] = value;
@@ -240,6 +268,7 @@ public:
   /// Copy a complete interleaved configuration into the fixed input buffer.
   void setPositions(GeometryPositionView positions)
   {
+    invalidateResult();
     if (positions.size() != geometry_.electronCount())
       throw std::invalid_argument("PsiFormer direct workspace received the wrong electron count");
     for (std::size_t electron = 0; electron < positions.size(); ++electron)
@@ -249,6 +278,9 @@ public:
 
   /// Return the parameter version used by the most recent completed evaluation.
   std::size_t observedParameterVersion() const noexcept { return observed_parameter_version_; }
+
+  /// Borrowed trunk views expire on every input edit or evaluation, even a failed one.
+  std::size_t evaluationGeneration() const noexcept { return evaluation_generation_; }
 
   /** Hash every backing address and capacity for warmed-call stability tests.
    *
@@ -274,13 +306,10 @@ public:
     mix(attention_);
     mix(attended_);
     mix(hidden_);
-    mix(orbital_matrices_);
-    hash ^= determinant_workspace_.storageFingerprint();
-    hash *= 1099511628211ULL;
     return hash;
   }
 
-  /// Return bytes reserved by all numeric buffers, including geometry and determinants.
+  /// Return owned numeric trunk bytes, including geometry but excluding all head storage.
   std::size_t vectorStorageBytes() const
   {
     std::size_t bytes = 0;
@@ -301,10 +330,7 @@ public:
     add(attention_);
     add(attended_);
     add(hidden_);
-    add(orbital_matrices_);
     addStorageBytes(bytes, geometry_.storageBytes(),
-                    "PsiFormer value storage bytes overflowed");
-    addStorageBytes(bytes, determinant_workspace_.storageBytes(),
                     "PsiFormer value storage bytes overflowed");
     return bytes;
   }
@@ -316,19 +342,27 @@ public:
   /// Return the checked constructor-time requirement for this fixed model shape.
   std::size_t requiredStorageBytes() const
   {
-    const std::size_t electrons = geometry_.electronCount();
-    const std::size_t electron_square = checkedStorageProduct(
-        electrons, electrons, "PsiFormer value shape overflowed");
-    return valueWorkspaceStorageRequirement(
-        {electrons, geometry_.nucleusCount(), determinant_workspace_.channels(),
-         features_a_.size() / electrons,
-         attention_.size() / electron_square,
-         raw_features_.size() / electrons, 0, 0});
+    std::size_t bytes = geometryStorageRequirement(geometry_.electronCount(), geometry_.nucleusCount());
+    for (const auto* buffer : {&electron_positions_, &raw_features_, &features_a_, &features_b_,
+                              &query_, &key_, &value_, &attention_, &attended_, &hidden_})
+      addStorageBytes(bytes, checkedStorageBytes<double>(buffer->size(), "PsiFormer trunk storage overflowed"),
+                      "PsiFormer trunk storage overflowed");
+    return bytes;
   }
 
-private:
+protected:
   friend class DirectValueExecutor;
 
+  /// Invalidate publication before mutation; generations distinguish same-version runs.
+  void invalidateResult()
+  {
+    observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+    if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("PsiFormer value trunk generation exhausted");
+    ++evaluation_generation_;
+  }
+
+  const DirectValueParameterLayout* layout_identity_;
   std::vector<double> electron_positions_;
   PsiFormerGeometryCache geometry_;
   std::vector<double> raw_features_;
@@ -340,9 +374,101 @@ private:
   std::vector<double> attention_;
   std::vector<double> attended_;
   std::vector<double> hidden_;
+  std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+  std::size_t evaluation_generation_ = 0;
+};
+
+/** Extend the real trunk with the unchanged complete real value-head buffers.
+ * The default real evaluator retains its exact storage/math contract; complex
+ * consumers prepare DirectValueTrunkWorkspace instead of allocating these leaves.
+ */
+class DirectValueWorkspace : public DirectValueTrunkWorkspace
+{
+public:
+  /// Admit only the full real preparation before allocating any real head storage.
+  DirectValueWorkspace(const DirectValueParameterLayout& layout, GeometryPositionView nuclei,
+                       GeometryBoundary boundary = {})
+      : DirectValueTrunkWorkspace(requireFullLayout(layout), nuclei, boundary),
+        orbital_matrices_(layout.determinantCount() * layout.electronCount() * layout.electronCount()),
+        determinant_workspace_(layout.determinantCount(), layout.electronCount())
+  {}
+
+  /// Preserve exclusive clone-local scratch ownership.
+  DirectValueWorkspace(const DirectValueWorkspace&) = delete;
+
+  /// Complete workspaces cannot share mutable real head buffers by copying.
+  DirectValueWorkspace& operator=(const DirectValueWorkspace&) = delete;
+
+  /// Transfer both shared trunk and complete real head allocations.
+  DirectValueWorkspace(DirectValueWorkspace&&) = default;
+
+  /// Transfer the entire complete real evaluator workspace.
+  DirectValueWorkspace& operator=(DirectValueWorkspace&&) = default;
+
+  /// Append real orbital/determinant allocations to the legacy fingerprint order.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = DirectValueTrunkWorkspace::storageFingerprint();
+    qmcplusplus::psiformer::determinant::detail::mixStorage(hash, orbital_matrices_);
+    hash ^= determinant_workspace_.storageFingerprint();
+    hash *= 1099511628211ULL;
+    return hash;
+  }
+
+  /// Preserve inclusive legacy byte accounting with the real head present.
+  std::size_t vectorStorageBytes() const
+  {
+    std::size_t bytes = DirectValueTrunkWorkspace::vectorStorageBytes();
+    addStorageBytes(bytes, checkedStorageBytes<double>(orbital_matrices_.capacity(),
+                    "PsiFormer value storage bytes overflowed"), "PsiFormer value storage bytes overflowed");
+    addStorageBytes(bytes, determinant_workspace_.storageBytes(), "PsiFormer value storage bytes overflowed");
+    return bytes;
+  }
+
+  /// Retain the original independent complete-value workspace requirement.
+  std::size_t requiredStorageBytes() const
+  {
+    const std::size_t electrons = geometry_.electronCount();
+    const std::size_t electron_square = checkedStorageProduct(electrons, electrons,
+                                                             "PsiFormer value shape overflowed");
+    return valueWorkspaceStorageRequirement(
+        {electrons, geometry_.nucleusCount(), determinant_workspace_.channels(),
+         features_a_.size() / electrons, attention_.size() / electron_square,
+         raw_features_.size() / electrons, 0, 0});
+  }
+
+private:
+  friend class DirectValueExecutor;
+
+  /// Reject a trunk-only layout before the base constructor allocates scratch.
+  static const DirectValueParameterLayout& requireFullLayout(const DirectValueParameterLayout& layout)
+  {
+    if (layout.preparation() != DirectValuePreparation::REAL_WAVEFUNCTION)
+      throw std::invalid_argument("PsiFormer real value workspace requires full real preparation");
+    return layout;
+  }
+
   std::vector<double> orbital_matrices_;
   qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_workspace_;
-  std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+};
+
+/** Borrow a completed shared real trunk until its workspace is edited or evaluated.
+ * Geometry and positions are supplied for the subsequent real envelope/cusp stage;
+ * the common outer twist remains outside this numerical seam. The parameter
+ * version must match the parameter store and workspace, and the evaluation
+ * generation must match the workspace. A failed request invalidates the view just
+ * as a successful next evaluation does.
+ */
+struct DirectValueTrunkResultView
+{
+  const double* features;
+  std::size_t electron_count;
+  std::size_t feature_width;
+  std::size_t parameter_version;
+  std::size_t evaluation_generation;
+  double cusp;
+  const PsiFormerGeometryCache* geometry;
+  GeometryPositionView positions;
 };
 
 /** Return the real molecular wavefunction in sign/log-magnitude representation.
@@ -381,9 +507,10 @@ class DirectValueExecutor
 public:
   /// Resolve immutable descriptors and retain the versioned parameter value store.
   DirectValueExecutor(const PsiFormer& model,
-                      const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
+                      const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                      DirectValuePreparation preparation = DirectValuePreparation::REAL_WAVEFUNCTION)
       : parameters_(model.p),
-        layout_(std::make_shared<const DirectValueParameterLayout>(model, plan)),
+        layout_(std::make_shared<const DirectValueParameterLayout>(model, plan, preparation)),
         nuclei_(model.cfg.nuclei.x),
         boundary_(directGeometryBoundary(plan.environment()))
   {}
@@ -391,12 +518,26 @@ public:
   /// Construct one independently mutable workspace suitable for a component clone.
   std::unique_ptr<DirectValueWorkspace> makeWorkspace() const
   {
+    requireRealWavefunction();
     return std::make_unique<DirectValueWorkspace>(
         *layout_, GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()), boundary_);
   }
 
   /// Expose immutable descriptors for diagnostics and clone-workspace construction.
-  const std::shared_ptr<const DirectValueParameterLayout>& layout() const noexcept { return layout_; }
+  const std::shared_ptr<const DirectValueParameterLayout>& layout() const
+  {
+    requireRealWavefunction();
+    return layout_;
+  }
+
+  /// Expose real trunk descriptors only through an explicit mixed-head-aware seam.
+  const std::shared_ptr<const DirectValueParameterLayout>& trunkLayout() const noexcept { return layout_; }
+
+  /// Prepare real neural buffers without real orbital or determinant allocations.
+  std::unique_ptr<DirectValueTrunkWorkspace> makeTrunkWorkspace() const
+  {
+    return std::make_unique<DirectValueTrunkWorkspace>(*layout_, nuclearPositions(), boundary_);
+  }
 
   /// Return the immutable parameter-store identity used to bind companion executors.
   const Parameters* parameterStoreIdentity() const noexcept { return &parameters_; }
@@ -408,13 +549,38 @@ public:
   /// Expose the validated geometry policy used by direct batch scratch.
   const GeometryBoundary& boundary() const noexcept { return boundary_; }
 
+  /** Evaluate shared real geometry/trunk/cusp and publish a borrowed feature view.
+   * Same-spin coalescence does not invalidate a feature representation; determinant
+   * node admission belongs to the subsequent head. Failure invalidates the observed
+   * parameter version, and all returned references expire at the next workspace edit.
+   */
+  DirectValueTrunkResultView evaluateTrunk(DirectValueTrunkWorkspace& workspace) const
+  {
+    workspace.invalidateResult();
+    if (workspace.layout_identity_ != layout_.get())
+      throw std::invalid_argument("PsiFormer real trunk workspace belongs to a different executor layout");
+    validateTrunkWorkspace(workspace);
+    const double* parameter_values = parameters_.flat_values().data();
+    refreshGeometry(workspace);
+    buildTrunk(parameter_values, workspace);
+    const double cusp = cuspValue(parameter_values, workspace);
+    if (!is_finite_parameter_value(cusp))
+      throw std::runtime_error("PsiFormer real trunk produced a non-finite cusp");
+    for (double feature : workspace.features_a_)
+      if (!is_finite_parameter_value(feature))
+        throw std::runtime_error("PsiFormer real trunk produced a non-finite feature");
+    workspace.observed_parameter_version_ = parameters_.version();
+    return {workspace.features_a_.data(), layout_->electronCount(), layout_->featureWidth(),
+            workspace.observed_parameter_version_, workspace.evaluation_generation_, cusp, &workspace.geometry_,
+            GeometryPositionView::interleaved(workspace.electron_positions_.data(), layout_->electronCount())};
+  }
+
   /// Evaluate sign and log|psi| without allocating or building differentiation nodes.
   DirectValueResult evaluate(DirectValueWorkspace& workspace) const
   {
-    layout_->validateParameterStore(parameters_);
-    if (workspace.geometry_.electronCount() != layout_->electronCount() ||
-        workspace.geometry_.nucleusCount() != layout_->nucleusCount())
-      throw std::invalid_argument("PsiFormer direct workspace belongs to a different model shape");
+    workspace.invalidateResult();
+    requireRealWavefunction();
+    validateTrunkWorkspace(workspace);
 
     const double* parameter_values = parameters_.flat_values().data();
     refreshGeometry(workspace);
@@ -422,9 +588,7 @@ public:
     // lattice images, are an exact fermionic node.
     if (hasExactSameSpinCoalescence(workspace))
       return exactNodeResult(workspace);
-    buildEmbedding(parameter_values, workspace);
-    for (std::size_t layer = 0; layer < layout_->layers_.size(); ++layer)
-      applyAttentionBlock(parameter_values, layout_->layers_[layer], workspace);
+    buildTrunk(parameter_values, workspace);
     buildOrbitalMatrices(parameter_values, workspace);
 
     namespace determinant = qmcplusplus::psiformer::determinant;
@@ -454,8 +618,35 @@ public:
 private:
   friend class DirectBatchExecutor;
 
+  /// Keep every legacy real-head consumer closed to explicitly trunk-only layouts.
+  void requireRealWavefunction() const
+  {
+    if (layout_->preparation() != DirectValuePreparation::REAL_WAVEFUNCTION)
+      throw std::invalid_argument("PsiFormer real wavefunction consumer cannot use trunk-only preparation");
+  }
+
+  /// Check parameter generation layout and real trunk shape before unchecked kernels.
+  void validateTrunkWorkspace(const DirectValueTrunkWorkspace& workspace) const
+  {
+    layout_->validateParameterStore(parameters_);
+    if (workspace.geometry_.electronCount() != layout_->electronCount() ||
+        workspace.geometry_.nucleusCount() != layout_->nucleusCount() ||
+        workspace.raw_features_.size() != layout_->electronCount() * layout_->inputWidth() ||
+        workspace.features_a_.size() != layout_->electronCount() * layout_->featureWidth() ||
+        workspace.attention_.size() != layout_->headCount() * layout_->electronCount() * layout_->electronCount())
+      throw std::invalid_argument("PsiFormer direct workspace belongs to a different model shape");
+  }
+
+  /// Run the single shared embedding/attention implementation before either head.
+  void buildTrunk(const double* parameters, DirectValueTrunkWorkspace& workspace) const
+  {
+    buildEmbedding(parameters, workspace);
+    for (const auto& layer : layout_->layers_)
+      applyAttentionBlock(parameters, layer, workspace);
+  }
+
   /// Return true when two same-spin electrons have zero boundary-aware separation.
-  bool hasExactSameSpinCoalescence(const DirectValueWorkspace& workspace) const noexcept
+  bool hasExactSameSpinCoalescence(const DirectValueTrunkWorkspace& workspace) const noexcept
   {
     const auto& identities = workspace.geometry_.electronPairs();
     const auto& distances  = workspace.geometry_.electronElectronPairs().distances();
@@ -484,7 +675,7 @@ private:
   }
 
   /// Refresh all open-boundary pair tables from the workspace input positions.
-  void refreshGeometry(DirectValueWorkspace& workspace) const
+  void refreshGeometry(DirectValueTrunkWorkspace& workspace) const
   {
     workspace.geometry_.update(
         GeometryPositionView::interleaved(workspace.electron_positions_.data(), layout_->electronCount()));
@@ -519,7 +710,7 @@ private:
   }
 
   /// Form stable row-wise softmax(Q*K^T/sqrt(head_width)) in the attention buffer.
-  void buildAttentionWeights(DirectValueWorkspace& workspace) const
+  void buildAttentionWeights(DirectValueTrunkWorkspace& workspace) const
   {
     qmcplusplus::psiformer::dense::attentionWeightsReal(
         workspace.query_.data(), layout_->featureWidth(), workspace.key_.data(),
@@ -528,7 +719,7 @@ private:
   }
 
   /// Contract softmax attention with projected values into electron-major features.
-  void buildAttentionContext(DirectValueWorkspace& workspace) const
+  void buildAttentionContext(DirectValueTrunkWorkspace& workspace) const
   {
     qmcplusplus::psiformer::dense::attentionContextReal(
         workspace.attention_.data(), workspace.value_.data(), layout_->featureWidth(),
@@ -537,7 +728,7 @@ private:
   }
 
   /// Build electron-nucleus radial/directional features and apply the embedding matrix.
-  void buildEmbedding(const double* parameters, DirectValueWorkspace& workspace) const
+  void buildEmbedding(const double* parameters, DirectValueTrunkWorkspace& workspace) const
   {
     const GeometryPairTable& pairs = workspace.geometry_.electronNucleusPairs();
     const auto& displacements      = pairs.displacements();
@@ -575,7 +766,7 @@ private:
   /// Apply one direct multi-head-attention and two-layer residual MLP block.
   void applyAttentionBlock(const double* parameters,
                            const DirectValueParameterLayout::DirectAttentionLayer& layer,
-                           DirectValueWorkspace& workspace) const
+                           DirectValueTrunkWorkspace& workspace) const
   {
     const std::size_t ne    = layout_->electronCount();
     const std::size_t width = layout_->featureWidth();
@@ -640,7 +831,7 @@ private:
   }
 
   /// Accumulate same- and opposite-spin analytic electron-electron cusp terms.
-  double cuspValue(const double* parameters, const DirectValueWorkspace& workspace) const
+  double cuspValue(const double* parameters, const DirectValueTrunkWorkspace& workspace) const
   {
     const double same_alpha = layout_->same_alpha_.size == 0
         ? 1.0
