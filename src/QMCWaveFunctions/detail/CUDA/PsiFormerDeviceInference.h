@@ -437,8 +437,6 @@ public:
     weights_.reserve(spatialJetSpanElements(attention_.attention));
     orbital_jets_.reserve(spatialJetSpanElements(orbitals_.orbitals));
     matrices_.reserve(product(batch_, matrices_per_configuration_));
-    gradients_.reserve(product(matrices_.capacity(), gradient_lanes_));
-    laplacians_.reserve(product(matrices_.capacity(), orbitals_.orbitals.laplacian_lanes));
     lu_.reserve(matrices_.capacity());
     if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
       inverse_.reserve(matrices_.capacity());
@@ -580,18 +578,13 @@ public:
           value_tape_.empty() ? nullptr : retained_envelope_.data()), "model open orbital VGL");
     checkOpen(product(batch_, matrices_per_configuration_));
 
-    // Pack existing jet planes into the contiguous determinant ABI, without host math.
+    // Only values need compact packing for factorization and the score-head ABI.
+    // Spatial traces borrow the existing orbital planes with a configuration stride,
+    // avoiding a second B*4Ne*D*Ne^2 derivative tensor and two copies per configuration.
     for (std::size_t configuration = 0; configuration < batch_; ++configuration)
     {
       const auto origin = configuration * orbitals_.orbitals.configuration_stride;
       copy(orbital_jets_, origin, matrices_, configuration * matrices_per_configuration_, matrices_per_configuration_);
-      if (mode_ == SpatialJetMode::FULL_VGL)
-      {
-        copy(orbital_jets_, origin + orbitals_.orbitals.plane_stride, gradients_,
-             configuration * gradient_lanes_ * matrices_per_configuration_, gradient_lanes_ * matrices_per_configuration_);
-        copy(orbital_jets_, origin + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, laplacians_,
-             configuration * ne_ * matrices_per_configuration_, ne_ * matrices_per_configuration_);
-      }
     }
     checkRuntime(launchDeterminantFactorization(stream, matrices_.data(), batch_, shape_.determinants, ne_,
         mode_ == SpatialJetMode::FULL_VGL || !value_tape_.empty(), lu_.data(), inverse_.data(),
@@ -614,9 +607,13 @@ public:
       result_valid_ = true;
       return;
     }
-    device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_, ne_};
+    device_determinant::SpatialLayout determinant_layout{batch_, shape_.determinants, ne_, gradient_lanes_, ne_,
+        orbitals_.orbitals.configuration_stride, orbitals_.orbitals.configuration_stride};
+    // These layouts use packed D*Ne*Ne planes. The view starts at the first
+    // requested derivative plane, and its stride skips the remaining jet planes.
     checkRuntime(launchDeterminantSpatialTraces(stream, determinant_layout, factors_.data(), combinations_.data(),
-        normalized_.data(), inverse_.data(), gradients_.data(), laplacians_.data(), matrix_product_.data(),
+        normalized_.data(), inverse_.data(), orbital_jets_.data() + orbitals_.orbitals.plane_stride,
+        orbital_jets_.data() + (1 + gradient_lanes_) * orbitals_.orbitals.plane_stride, matrix_product_.data(),
         det_gradient_.data(), det_lap_ratio_.data(), det_lap_log_.data(), det_status_.data()), "model determinant spatial traces");
     evaluateCusp();
     checkOpen(batch_);
@@ -876,7 +873,7 @@ public:
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device workspace storage overflow");
     };
     for (const auto* buffer : {&positions_, &raw_, &a_, &b_, &q_, &k_, &v_, &weights_, &context_,
-        &hidden_, &projected_, &orbital_jets_, &matrices_, &gradients_, &laplacians_, &lu_, &inverse_,
+        &hidden_, &projected_, &orbital_jets_, &matrices_, &lu_, &inverse_,
         &solve_, &term_phase_, &term_log_, &scaled_, &normalized_, &matrix_product_, &det_gradient_,
         &det_lap_ratio_, &det_lap_log_, &cusp_jets_, &phase_, &output_, &lap_ratio_,
         &retained_backflow_, &retained_envelope_})
@@ -1118,7 +1115,7 @@ private:
   OpenCuspJetLayout cusp_;
   FinalSpatialJetLayout final_;
   DeviceBuffer<double> positions_, raw_, a_, b_, q_, k_, v_, weights_, context_, hidden_, projected_;
-  DeviceBuffer<double> orbital_jets_, matrices_, gradients_, laplacians_, lu_, inverse_, solve_;
+  DeviceBuffer<double> orbital_jets_, matrices_, lu_, inverse_, solve_;
   DeviceBuffer<double> term_phase_, term_log_, scaled_, normalized_, matrix_product_;
   DeviceBuffer<double> det_gradient_, det_lap_ratio_, det_lap_log_, cusp_jets_, phase_, output_, lap_ratio_;
   DeviceBuffer<std::size_t> active_, permutations_;

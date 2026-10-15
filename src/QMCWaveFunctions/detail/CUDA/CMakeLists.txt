@@ -57,7 +57,9 @@ target_link_libraries(psiformer_device_link_check PRIVATE psiformer_device)
 # Opt-in actual-device checks, deliberately not registered with offline CTest.
 # --host-check is safe on driverless hosts; ordinary execution requires hardware.
 add_executable(psiformer_device_runtime_validation EXCLUDE_FROM_ALL
-               PsiFormerDeviceRuntimeValidation.cu)
+               PsiFormerDeviceRuntimeValidation.cu
+               # Dense mixed-affine helpers also reference canonical plan intervals.
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp)
 if(QMC_CUDA2HIP)
   set_source_files_properties(PsiFormerDeviceRuntimeValidation.cu PROPERTIES LANGUAGE HIP)
 else()

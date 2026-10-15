@@ -110,8 +110,8 @@ __global__ void determinantSpatialTracesKernel(
   const std::size_t channel_elements = layout.determinant_count * matrix_elements;
   const std::size_t channel_offset   = configuration * layout.determinant_count;
   const std::size_t matrix_offset    = configuration * channel_elements;
-  const std::size_t gradient_offset  = configuration * layout.gradient_lanes * channel_elements;
-  const std::size_t laplacian_offset = configuration * layout.electron_count * channel_elements;
+  const std::size_t gradient_offset  = configuration * layout.gradient_configuration_stride;
+  const std::size_t laplacian_offset = configuration * layout.laplacian_configuration_stride;
   status[configuration] = device_determinant::combineSpatialTraces(
       factorization_metadata + channel_offset, combination_metadata[configuration],
       normalized_weights + channel_offset, inverses + matrix_offset,
@@ -378,19 +378,10 @@ Error launchDeterminantSpatialTraces(
   const std::size_t metadata_elements = checkedProduct(
       layout.configuration_count, layout.determinant_count,
       "PsiFormer determinant spatial metadata extent overflow");
-  const std::size_t gradient_configuration_elements = checkedProduct(
-      layout.gradient_lanes, channel_elements,
-      "PsiFormer determinant spatial gradient configuration extent overflow");
-  const std::size_t laplacian_configuration_elements = checkedProduct(
-      layout.electron_count, channel_elements,
-      "PsiFormer determinant spatial Laplacian configuration extent overflow");
   (void)metadata_elements;
   (void)checkedProduct(layout.configuration_count, channel_elements,
                        "PsiFormer determinant spatial inverse extent overflow");
-  (void)checkedProduct(layout.configuration_count, gradient_configuration_elements,
-                       "PsiFormer determinant spatial gradient extent overflow");
-  (void)checkedProduct(layout.configuration_count, laplacian_configuration_elements,
-                       "PsiFormer determinant spatial Laplacian extent overflow");
+  layout = device_determinant::resolveSpatialConfigurationStrides(layout);
   (void)checkedProduct(layout.configuration_count, matrix_elements,
                        "PsiFormer determinant spatial scratch extent overflow");
   if (layout.configuration_count > std::numeric_limits<unsigned int>::max())

@@ -822,6 +822,56 @@ TEST_CASE("PsiFormer lifted determinant factors match independent finite differe
   CHECK(adjoints[matrices_layout.uncheckedValueOffset(1, 0)] == 23.0);
 }
 
+TEST_CASE("PsiFormer determinant derivative configuration views", "[psiformer][determinant][device_math]")
+{
+  const determinant::SpatialLayout packed{3, 2, 2, 6, 2};
+  const auto resolved = determinant::resolveSpatialConfigurationStrides(packed);
+  CHECK(resolved.gradient_configuration_stride == 48);
+  CHECK(resolved.laplacian_configuration_stride == 16);
+
+  auto padded = packed;
+  padded.gradient_configuration_stride = 79;
+  padded.laplacian_configuration_stride = 31;
+  const auto views = determinant::resolveSpatialConfigurationStrides(padded);
+  CHECK(views.gradient_configuration_stride == 79);
+  CHECK(views.laplacian_configuration_stride == 31);
+  CHECK(views.configuration_count == 3);
+
+  auto invalid = packed;
+  invalid.gradient_configuration_stride = 47;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::invalid_argument);
+  invalid = packed;
+  invalid.laplacian_configuration_stride = 15;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::invalid_argument);
+
+  // Reject both multiplication and final-span addition overflow. With one
+  // configuration no stride is traversed, so even a large gap is admissible.
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  invalid = packed;
+  invalid.gradient_configuration_stride = maximum / 2 + 1;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::length_error);
+  invalid = packed;
+  invalid.configuration_count = 2;
+  invalid.gradient_configuration_stride = maximum - 47;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::length_error);
+  invalid = packed;
+  invalid.laplacian_configuration_stride = maximum / 2 + 1;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::length_error);
+  invalid = packed;
+  invalid.configuration_count = 2;
+  invalid.laplacian_configuration_stride = maximum - 15;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::length_error);
+  invalid.configuration_count = 1;
+  CHECK_NOTHROW(determinant::resolveSpatialConfigurationStrides(invalid));
+
+  invalid = packed;
+  invalid.matrix_size = maximum;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::length_error);
+  invalid = packed;
+  invalid.gradient_lanes = maximum;
+  CHECK_THROWS_AS(determinant::resolveSpatialConfigurationStrides(invalid), std::length_error);
+}
+
 int main(int argc, char* argv[])
 {
   return Catch::Session().run(argc, argv);

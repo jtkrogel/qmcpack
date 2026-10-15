@@ -106,10 +106,46 @@ struct SpatialLayout
   std::size_t matrix_size         = 0;
   std::size_t gradient_lanes      = 0;
   std::size_t electron_count      = 0;
+  // Zero preserves the legacy packed ABI. Nonzero strides permit borrowing
+  // complete tightly packed derivative planes from a larger orbital jet tensor.
+  std::size_t gradient_configuration_stride = 0;
+  std::size_t laplacian_configuration_stride = 0;
 };
 
 static_assert(std::is_standard_layout_v<SpatialLayout>);
 static_assert(std::is_trivially_copyable_v<SpatialLayout>);
+
+/** Resolve legacy strides and admit each derivative view before device indexing.
+ * Planes within a configuration remain packed [lane,D,N,N]; only the gap
+ * between configurations can vary. A zero live span never dereferences a view.
+ */
+inline SpatialLayout resolveSpatialConfigurationStrides(SpatialLayout layout)
+{
+  const auto matrix_elements = spatial_detail::checkedProduct(layout.matrix_size, layout.matrix_size,
+      "PsiFormer determinant spatial matrix extent overflow");
+  const auto channel_elements = spatial_detail::checkedProduct(layout.determinant_count, matrix_elements,
+      "PsiFormer determinant spatial channel extent overflow");
+  const auto gradient_span = spatial_detail::checkedProduct(layout.gradient_lanes, channel_elements,
+      "PsiFormer determinant spatial gradient configuration extent overflow");
+  const auto laplacian_span = spatial_detail::checkedProduct(layout.electron_count, channel_elements,
+      "PsiFormer determinant spatial Laplacian configuration extent overflow");
+  if (layout.gradient_configuration_stride == 0)
+    layout.gradient_configuration_stride = gradient_span;
+  if (layout.laplacian_configuration_stride == 0)
+    layout.laplacian_configuration_stride = laplacian_span;
+  if (layout.gradient_configuration_stride < gradient_span ||
+      layout.laplacian_configuration_stride < laplacian_span)
+    throw std::invalid_argument("PsiFormer determinant spatial configuration stride is too small");
+  if (gradient_span != 0)
+    (void)spatial_detail::checkedSpan(layout.configuration_count,
+        layout.gradient_configuration_stride, gradient_span,
+        "PsiFormer determinant spatial gradient view extent overflow");
+  if (laplacian_span != 0)
+    (void)spatial_detail::checkedSpan(layout.configuration_count,
+        layout.laplacian_configuration_stride, laplacian_span,
+        "PsiFormer determinant spatial Laplacian view extent overflow");
+  return layout;
+}
 
 static_assert(sizeof(double) == sizeof(std::uint64_t));
 static_assert(std::numeric_limits<double>::is_iec559);

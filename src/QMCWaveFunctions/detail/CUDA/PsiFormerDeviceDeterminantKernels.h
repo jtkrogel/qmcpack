@@ -71,7 +71,10 @@ Error launchDeterminantMatrixReverseSeeds(
     double* reverse_seeds,
     device_determinant::DerivativeStatus* status);
 
-/** Evaluate canonical [B,lane,D,N,N] determinant spatial trace planes. */
+/** Evaluate packed derivative planes with optional configuration strides.
+ * Gradient/Laplacian pointers may borrow orbital jet planes directly; zero
+ * layout strides retain the canonical contiguous derivative-buffer ABI.
+ */
 Error launchDeterminantSpatialTraces(
     Stream stream,
     device_determinant::SpatialLayout layout,

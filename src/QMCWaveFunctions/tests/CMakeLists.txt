@@ -587,6 +587,9 @@ set_tests_properties(deterministic-unit_test_psiformer_ecp_contraction
 add_executable(test_psiformer_device_determinant_math
                test_psiformer_device_determinant_math.cpp)
 target_link_libraries(test_psiformer_device_determinant_math qmc_external_catch2)
+# This numerical oracle checks exact nodes and IEEE infinity/NaN diagnostics.
+target_compile_options(test_psiformer_device_determinant_math PRIVATE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
 target_include_directories(test_psiformer_device_determinant_math PRIVATE "${qmcpack_SOURCE_DIR}/src")
 add_unit_test(deterministic-unit_test_psiformer_device_determinant_math
               1 1 $<TARGET_FILE:test_psiformer_device_determinant_math>)

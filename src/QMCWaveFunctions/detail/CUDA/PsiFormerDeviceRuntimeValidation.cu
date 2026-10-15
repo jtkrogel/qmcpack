@@ -369,6 +369,112 @@ void determinants(Queue& queue)
     near(actual_roots[configuration].log_abs, std::log(std::abs(psi)), "combined log");
     near(weights[configuration * channels] + weights[configuration * channels + 1], 1.0, "normalized channels");
   }
+  // Independent 2x2 polynomial derivatives cover both the legacy contiguous
+  // ABI and separate padded configuration views, including a partial live batch.
+  constexpr std::size_t electrons = 2, lanes = 6, channel_elements = 8;
+  for (const bool padded : {false, true})
+  {
+    const std::size_t gradient_stride = padded ? 79 : lanes * channel_elements;
+    const std::size_t laplacian_stride = padded ? 31 : electrons * channel_elements;
+    std::vector<double> gradients(configurations * gradient_stride,
+        std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> laplacians(configurations * laplacian_stride,
+        std::numeric_limits<double>::quiet_NaN());
+    for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+    {
+      for (std::size_t lane = 0; lane < lanes; ++lane)
+        for (std::size_t element = 0; element < channel_elements; ++element)
+          gradients[configuration * gradient_stride + lane * channel_elements + element] =
+              0.017 * (1 + configuration) * (1 + lane) * (static_cast<int>(element % 5) - 2);
+      for (std::size_t electron = 0; electron < electrons; ++electron)
+        for (std::size_t element = 0; element < channel_elements; ++element)
+          laplacians[configuration * laplacian_stride + electron * channel_elements + element] =
+              0.011 * (1 + configuration) * (1 + electron) * (static_cast<int>(element % 3) - 1);
+    }
+    auto gradient = upload(gradients), laplacian = upload(laplacians);
+    DeviceBuffer<double> product(configurations * size * size);
+    DeviceBuffer<double> log_gradient(configurations * lanes), lap_ratio(configurations * electrons),
+        lap_log(configurations * electrons);
+    DeviceBuffer<device_determinant::DerivativeStatus> status(configurations);
+    for (const std::size_t live : {configurations, std::size_t{1}, std::size_t{2}, configurations})
+    {
+      const std::vector<double> gradient_marker(configurations * lanes, 19.0);
+      const std::vector<double> laplacian_marker(configurations * electrons, 19.0);
+      log_gradient.upload(gradient_marker.data(), gradient_marker.size());
+      lap_ratio.upload(laplacian_marker.data(), laplacian_marker.size());
+      lap_log.upload(laplacian_marker.data(), laplacian_marker.size());
+      device_determinant::SpatialLayout layout{live, channels, size, lanes, electrons,
+          padded ? gradient_stride : 0, padded ? laplacian_stride : 0};
+      checkRuntime(launchDeterminantSpatialTraces(queue.getNative(), layout, factors.data(), roots.data(),
+          normalized.data(), inverse.data(), gradient.data(), laplacian.data(), product.data(),
+          log_gradient.data(), lap_ratio.data(), lap_log.data(), status.data()), "strided determinant traces");
+      queue.sync();
+      const auto result_gradient = download(log_gradient), result_ratio = download(lap_ratio),
+          result_log = download(lap_log);
+      const auto result_status = download(status);
+      for (std::size_t configuration = 0; configuration < configurations; ++configuration)
+      {
+        if (configuration >= live)
+        {
+          for (std::size_t lane = 0; lane < lanes; ++lane)
+            near(result_gradient[configuration * lanes + lane], 19.0, "spatial gradient inactive tail");
+          for (std::size_t electron = 0; electron < electrons; ++electron)
+          {
+            near(result_ratio[configuration * electrons + electron], 19.0, "spatial ratio inactive tail");
+            near(result_log[configuration * electrons + electron], 19.0, "spatial log inactive tail");
+          }
+          continue;
+        }
+        if (result_status[configuration] != device_determinant::DerivativeStatus::AVAILABLE)
+          throw std::runtime_error("strided determinant trace availability");
+        double psi = 0.0;
+        for (std::size_t channel = 0; channel < channels; ++channel)
+        {
+          const double* matrix = matrices.data() + configuration * channel_elements + 4 * channel;
+          psi += coefficients[channel] * (matrix[0] * matrix[3] - matrix[1] * matrix[2]);
+        }
+        for (std::size_t electron = 0; electron < electrons; ++electron)
+        {
+          double psi_laplacian = 0.0, gradient_square = 0.0;
+          for (std::size_t channel = 0; channel < channels; ++channel)
+          {
+            const double* matrix = matrices.data() + configuration * channel_elements + 4 * channel;
+            const double* lap = laplacians.data() + configuration * laplacian_stride +
+                electron * channel_elements + 4 * channel;
+            double channel_laplacian = lap[0] * matrix[3] + matrix[0] * lap[3] -
+                lap[1] * matrix[2] - matrix[1] * lap[2];
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            {
+              const double* g = gradients.data() + configuration * gradient_stride +
+                  (3 * electron + dimension) * channel_elements + 4 * channel;
+              channel_laplacian += 2 * (g[0] * g[3] - g[1] * g[2]);
+            }
+            psi_laplacian += coefficients[channel] * channel_laplacian;
+          }
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          {
+            const auto lane = 3 * electron + dimension;
+            double psi_gradient = 0.0;
+            for (std::size_t channel = 0; channel < channels; ++channel)
+            {
+              const double* matrix = matrices.data() + configuration * channel_elements + 4 * channel;
+              const double* g = gradients.data() + configuration * gradient_stride + lane * channel_elements + 4 * channel;
+              psi_gradient += coefficients[channel] *
+                  (g[0] * matrix[3] + matrix[0] * g[3] - g[1] * matrix[2] - matrix[1] * g[2]);
+            }
+            const double expected_gradient = psi_gradient / psi;
+            near(result_gradient[configuration * lanes + lane], expected_gradient, "strided determinant log gradient");
+            gradient_square += expected_gradient * expected_gradient;
+          }
+          near(result_ratio[configuration * electrons + electron], psi_laplacian / psi, "strided determinant ratio");
+          near(result_log[configuration * electrons + electron], psi_laplacian / psi - gradient_square,
+              "strided determinant log Laplacian");
+        }
+      }
+    }
+  }
+  std::cout << "PASS determinant_spatial_views contiguous padded_independent_strides live_tails\n";
+
   // Reuse allocations to test singular and nonfinite statuses separately.
   matrices[0] = 1; matrices[1] = 2; matrices[2] = 2; matrices[3] = 4;
   matrices[4] = std::numeric_limits<double>::quiet_NaN();
