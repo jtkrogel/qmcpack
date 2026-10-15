@@ -1848,6 +1848,21 @@ int main(int argc, char** argv)
     auto dormant_tile = backend_tiles->prepare(1);
     auto product_session = backend_tiles->prepareProductSession();
     const auto session_bytes = product_session->deviceWorkspaceBytes();
+    auto score_only_session = backend_tiles->prepareProductSession(ProductSessionProfile::SCORE_ONLY);
+    const auto score_only_bytes = score_only_session->deviceWorkspaceBytes();
+    const auto score_only_host_bytes = score_only_session->hostWorkspaceBytes();
+    if (product_session->profile() != ProductSessionProfile::SCORE_AND_KINETIC ||
+        score_only_session->profile() != ProductSessionProfile::SCORE_ONLY ||
+        score_only_bytes >= session_bytes || score_only_host_bytes >= product_session->hostWorkspaceBytes())
+      throw std::runtime_error("Product session preparation profile/memory contract failed");
+    if (session_bytes - score_only_bytes < checkedDeviceBytes<double>(plan.parameterCount()) ||
+        product_session->hostWorkspaceBytes() - score_only_host_bytes < checkedDeviceBytes<double>(plan.parameterCount()))
+      throw std::runtime_error("Score-only profile retained canonical kinetic response storage");
+    std::cout << "PASS product session profiles: full_device_bytes=" << session_bytes
+              << " score_only_device_bytes=" << score_only_bytes
+              << " saved_device_bytes=" << session_bytes - score_only_bytes
+              << " full_host_bytes=" << product_session->hostWorkspaceBytes()
+              << " score_only_host_bytes=" << score_only_host_bytes << '\n';
     const auto& session_score = product_session->score(model.cfg.electrons.x.data(), model.p.version());
     cpu_score_workspace->setPositions(first_position);
     const auto session_reference = cpu_score_executor.evaluate(*cpu_score_workspace);
@@ -1855,6 +1870,29 @@ int main(int argc, char** argv)
       near(session_score[parameter], session_reference.parameter_score[parameter], "leased score session CPU parity");
     near(product_session->scoreJvp(model.cfg.electrons.x.data(), product_direction, model.p.version()),
          cpu_products[0], "leased explicit JVP CPU parity");
+    const auto& score_only_score = score_only_session->score(model.cfg.electrons.x.data(), model.p.version());
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(score_only_score[parameter], session_reference.parameter_score[parameter],
+           "score-only session canonical score CPU parity");
+    near(score_only_session->scoreJvp(model.cfg.electrons.x.data(), product_direction, model.p.version()),
+         cpu_products[0], "score-only session explicit JVP CPU parity");
+    score_only_session->prepareScoreDirection(product_direction, model.p.version());
+    const auto before_unsupported_kinetic = score_only_session->numericalProducts();
+    bool unsupported_kinetic_rejected = false, unsupported_gradient_rejected = false;
+    try { (void)score_only_session->kinetic(model.cfg.electrons.x.data(),
+        external_contiguous.data(), inverse_masses.data(), model.p.version()); }
+    catch (const std::logic_error&) { unsupported_kinetic_rejected = true; }
+    try { (void)score_only_session->gradientResponse(model.cfg.electrons.x.data(),
+        external_contiguous.data(), inverse_masses.data(), model.p.version()); }
+    catch (const std::logic_error&) { unsupported_gradient_rejected = true; }
+    if (!unsupported_kinetic_rejected || !unsupported_gradient_rejected ||
+        score_only_session->numericalProducts() != before_unsupported_kinetic ||
+        score_only_session->deviceWorkspaceBytes() != score_only_bytes ||
+        score_only_session->hostWorkspaceBytes() != score_only_host_bytes)
+      throw std::runtime_error("Score-only session kinetic rejection changed products or prepared storage");
+    near(score_only_session->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()),
+         cpu_products[0], "score-only unsupported kinetic preserves prepared direction");
+
     bool stale_product_rejected = false;
     try { product_session->score(model.cfg.electrons.x.data(), model.p.version() + 1); }
     catch (const std::invalid_argument&) { stale_product_rejected = true; }
@@ -1913,6 +1951,19 @@ int main(int argc, char** argv)
     for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
       near(leased_channel_response[parameter], leased_channel_reference.parameter_score[parameter],
            "leased independent channel response");
+    score_only_session->channelAmplitudes(model.cfg.electrons.x.data(), device_channel_phases.data(),
+                                          device_channel_logs.data(), model.ndet, model.p.version());
+    for (std::size_t channel = 0; channel < model.ndet; ++channel)
+    {
+      near(device_channel_phases[channel], cpu_channel_phases[channel], "score-only independent channel phase");
+      near(device_channel_logs[channel], cpu_channel_logs[channel], "score-only independent channel log amplitude");
+    }
+    const auto& score_only_channel_response = score_only_session->channelScore(model.cfg.electrons.x.data(),
+        channel_coefficients.data(), model.ndet, model.p.version());
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(score_only_channel_response[parameter], leased_channel_reference.parameter_score[parameter],
+           "score-only independent channel response");
+
     const auto leased_orbital_loss = product_session->orbitalMse(model.cfg.electrons.x.data(),
         orbital_target.data(), orbital_target.size(), head_response.data(), head_response.size(), model.p.version());
     const auto leased_orbital_reference = cpu_score_executor.evaluateOrbitalMSE(*cpu_score_workspace,
@@ -1959,6 +2010,12 @@ int main(int argc, char** argv)
     catch (const std::logic_error&) { published_direction_rejected = true; }
     if (!published_direction_rejected)
       throw std::runtime_error("Session publication retained an old-image JVP direction");
+    bool score_only_published_direction_rejected = false;
+    try { (void)score_only_session->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()); }
+    catch (const std::logic_error&) { score_only_published_direction_rejected = true; }
+    if (!score_only_published_direction_rejected)
+      throw std::runtime_error("Score-only publication retained an old-image direction");
+
     auto changed_workspace = batch_value.makeWorkspace();
     changed_workspace->setPositions(first_position);
     const auto changed_value = batch_value.evaluate(*changed_workspace);
@@ -1969,6 +2026,15 @@ int main(int argc, char** argv)
     for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
       near(changed_score[parameter], changed_score_reference.parameter_score[parameter],
            "leased product rebind CPU parity");
+    const auto& changed_score_only = score_only_session->score(model.cfg.electrons.x.data(), model.p.version());
+    for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+      near(changed_score_only[parameter], changed_score_reference.parameter_score[parameter],
+           "score-only session rebind CPU parity");
+    if (score_only_session->profile() != ProductSessionProfile::SCORE_ONLY ||
+        score_only_session->deviceWorkspaceBytes() != score_only_bytes ||
+        score_only_session->hostWorkspaceBytes() != score_only_host_bytes)
+      throw std::runtime_error("Score-only rebind changed immutable profile or prepared scratch");
+
     backend_tiles->publishParameters(accepted_values, accepted_version + 2,
                                      [&]() { model.p.set_flat_values(accepted_values); });
     const auto restored_result = batch_executor.evaluateValues(*batch_workspace);

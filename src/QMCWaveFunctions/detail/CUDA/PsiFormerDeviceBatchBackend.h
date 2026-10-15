@@ -65,13 +65,14 @@ public:
     return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity());
   }
 
-  /// Prepare one exclusive product lane sharing this backend's publication owner.
-  std::unique_ptr<PreparedDeviceProductSession> prepareProductSession() const
+  /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
+  std::unique_ptr<PreparedDeviceProductSession> prepareProductSession(
+      ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
     if (mixed_parameters_)
       throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
-    return std::make_unique<PreparedDeviceProductSession>(image_, owner_, control_mutex_, nextIdentity());
+    return std::make_unique<PreparedDeviceProductSession>(image_, owner_, control_mutex_, nextIdentity(), profile);
   }
 
   /// Return typed device products while leaving host publication to the caller.

@@ -29,26 +29,49 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/** Fix the numerical roots and their scratch at an explicit preparation boundary. */
+enum class ProductSessionProfile
+{
+  SCORE_ONLY,
+  SCORE_AND_KINETIC
+};
+
 /** Lease one prepared numerical derivative lane, sharing its backend's image.
  * The backend must outlive the session; the model owner and mutex are borrowed.
  * An outer provider scratch lease rejects callback re-entry and serializes use.
  */
 class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
 {
+  /** Keep the lifted forward/reverse pair absent from a score-only lane. */
+  struct KineticWorkspace
+  {
+    PreparedDeviceInference spatial;
+    PreparedDeviceKineticReverse reverse;
+
+    KineticWorkspace(const std::shared_ptr<const PreparedDeviceModel>& image,
+        compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas)
+        : spatial(image, 1, queue, blas, SpatialJetMode::FULL_VGL, false, true),
+          reverse(image, 1, queue, blas)
+    {}
+  };
+
 public:
   /// Allocate scratch once while the owning backend's control mutex is held.
   PreparedDeviceProductSession(const std::shared_ptr<const PreparedDeviceModel>& active_image,
                                PsiFormerAcceleratorSharedModel& owner,
-                               std::mutex& control_mutex, std::uint64_t identity)
+                               std::mutex& control_mutex, std::uint64_t identity,
+                               ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC)
       : active_image_(active_image), image_(active_image), owner_(owner), mutex_(control_mutex),
+        profile_(validatedProfile(profile)),
         blas_(queue_), values_(image_, 1, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
-        spatial_(image_, 1, queue_, blas_, SpatialJetMode::FULL_VGL, false, true),
         score_(image_, 1, queue_, blas_), jvp_(image_, 1, queue_, blas_),
-        kinetic_(image_, 1, queue_, blas_),
-        executor_(compiledBackend(), coverage()), crowd_(identity), identity_(identity),
+        kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC
+            ? std::make_unique<KineticWorkspace>(image_, queue_, blas_) : nullptr),
+        executor_(compiledBackend(), coverage(profile_)), crowd_(identity), identity_(identity),
         positions_(3 * image_->plan().modelShape().electrons()),
         drift_(positions_.size()), masses_(image_->plan().modelShape().electrons()),
-        score_response_(image_->plan().parameterCount()), kinetic_response_(score_response_.size()),
+        score_response_(image_->plan().parameterCount()),
+        kinetic_response_(kinetic_ ? score_response_.size() : 0),
         products_(1), channel_coefficients_(image_->plan().modelShape().determinants),
         channel_phases_(channel_coefficients_.size()), channel_logs_(channel_coefficients_.size()),
         factors_(channel_coefficients_.size()), cusp_(1),
@@ -61,6 +84,9 @@ public:
   // Prepared graphs borrow this address-stable session's queue and BLAS handle.
   PreparedDeviceProductSession(const PreparedDeviceProductSession&) = delete;
   PreparedDeviceProductSession& operator=(const PreparedDeviceProductSession&) = delete;
+
+  /// Report the immutable capabilities selected before any numerical request.
+  ProductSessionProfile profile() const noexcept { return profile_; }
 
   /// Return a canonical real score, valid until this session's next score call.
   const std::vector<double>& score(const double* positions, std::size_t version)
@@ -173,14 +199,15 @@ public:
   const std::vector<double>& kinetic(const double* positions, const double* total_drift,
                                      const double* inverse_masses, std::size_t version)
   {
+    requireKinetic();
     if (!total_drift || !inverse_masses)
       throw std::invalid_argument("Device kinetic session requires total drift and inverse masses");
     execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, positions, version, [&]() {
       std::copy_n(total_drift, drift_.size(), drift_.begin());
       std::copy_n(inverse_masses, masses_.size(), masses_.begin());
-      spatial_.evaluate(positions_);
-      kinetic_.evaluate(spatial_, weights_, masses_, drift_);
-      kinetic_.downloadResponse(kinetic_response_);
+      kinetic_->spatial.evaluate(positions_);
+      kinetic_->reverse.evaluate(kinetic_->spatial, weights_, masses_, drift_);
+      kinetic_->reverse.downloadResponse(kinetic_response_);
     });
     return kinetic_response_;
   }
@@ -190,14 +217,15 @@ public:
   const std::vector<double>& gradientResponse(const double* positions, const double* total_drift,
       const double* inverse_masses, std::size_t version)
   {
+    requireKinetic();
     if (!total_drift || !inverse_masses)
       throw std::invalid_argument("Device gradient response requires total drift and inverse masses");
     execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, positions, version, [&]() {
       std::copy_n(total_drift, drift_.size(), drift_.begin());
       std::copy_n(inverse_masses, masses_.size(), masses_.begin());
-      spatial_.evaluate(positions_);
-      kinetic_.evaluateGradientResponse(spatial_, weights_, masses_, drift_);
-      kinetic_.downloadResponse(kinetic_response_);
+      kinetic_->spatial.evaluate(positions_);
+      kinetic_->reverse.evaluateGradientResponse(kinetic_->spatial, weights_, masses_, drift_);
+      kinetic_->reverse.downloadResponse(kinetic_response_);
     });
     return kinetic_response_;
   }
@@ -316,10 +344,15 @@ public:
   std::size_t deviceWorkspaceBytes() const
   {
     std::size_t bytes = 0;
-    for (auto amount : {values_.deviceWorkspaceBytes(), spatial_.deviceWorkspaceBytes(),
-                        score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes(),
-                        kinetic_.deviceWorkspaceBytes()})
+    for (auto amount : {values_.deviceWorkspaceBytes(), score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product session byte overflow");
+    if (kinetic_)
+    {
+      bytes = spatial_detail::checkedAdd(bytes, kinetic_->spatial.deviceWorkspaceBytes(),
+          "Device product spatial workspace overflow");
+      bytes = spatial_detail::checkedAdd(bytes, kinetic_->reverse.deviceWorkspaceBytes(),
+          "Device product kinetic workspace overflow");
+    }
     bytes = spatial_detail::checkedAdd(bytes, contraction_device_bytes_.load(std::memory_order_acquire),
                                        "Device product contraction byte overflow");
     return bytes;
@@ -338,9 +371,15 @@ public:
                                &orbital_envelope_, &orbital_seeds_})
       bytes = spatial_detail::checkedAdd(bytes, checkedDeviceBytes<double>(values->capacity()),
                                          "Device product host staging overflow");
-    for (auto amount : {values_.hostWorkspaceBytes(), spatial_.hostWorkspaceBytes(),
-                        score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes(), kinetic_.hostWorkspaceBytes()})
+    for (auto amount : {values_.hostWorkspaceBytes(), score_.hostWorkspaceBytes(), jvp_.hostWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product host status overflow");
+    if (kinetic_)
+    {
+      bytes = spatial_detail::checkedAdd(bytes, kinetic_->spatial.hostWorkspaceBytes(),
+          "Device product spatial host status overflow");
+      bytes = spatial_detail::checkedAdd(bytes, kinetic_->reverse.hostWorkspaceBytes(),
+          "Device product kinetic host status overflow");
+    }
     bytes = spatial_detail::checkedAdd(bytes,
         checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()),
         "Device product channel factorization overflow");
@@ -350,6 +389,22 @@ public:
   }
 
 private:
+  /// Reject an invalid profile before allocating its numerical workspaces.
+  static ProductSessionProfile validatedProfile(ProductSessionProfile profile)
+  {
+    if (profile != ProductSessionProfile::SCORE_ONLY && profile != ProductSessionProfile::SCORE_AND_KINETIC)
+      throw std::invalid_argument("Unknown device product preparation profile");
+    return profile;
+  }
+
+  /// Missing roots are a preparation contract error, before any product event.
+  /// A rejected request cannot allocate scratch or invalidate a prepared direction.
+  void requireKinetic() const
+  {
+    if (!kinetic_)
+      throw std::logic_error("Device product session was prepared for score products only");
+  }
+
   /// A failed/rebound lane can never publish an earlier partial or completed sum.
   void invalidateScoreContraction() noexcept
   {
@@ -380,8 +435,10 @@ private:
   }
 
   /// Advertise only the product roots actually submitted by this session.
-  static constexpr PsiFormerAcceleratorOperationMask coverage() noexcept
+  static constexpr PsiFormerAcceleratorOperationMask coverage(ProductSessionProfile profile) noexcept
   {
+    if (profile == ProductSessionProfile::SCORE_ONLY)
+      return acceleratorOperationBit(PsiFormerAcceleratorOperation::PARAMETER_SCORE);
     return acceleratorOperationBit(PsiFormerAcceleratorOperation::PARAMETER_SCORE) |
         acceleratorOperationBit(PsiFormerAcceleratorOperation::KINETIC_RESPONSE);
   }
@@ -394,10 +451,13 @@ private:
     invalidateScoreContraction();
     image_->validateSuccessor(active_image_);
     values_.rebindModel(active_image_);
-    spatial_.rebindModel(active_image_);
     score_.rebindModel(active_image_);
     jvp_.rebindModel(active_image_);
-    kinetic_.rebindModel(active_image_);
+    if (kinetic_)
+    {
+      kinetic_->spatial.rebindModel(active_image_);
+      kinetic_->reverse.rebindModel(active_image_);
+    }
     image_ = active_image_;
     ready_ = false;
   }
@@ -529,12 +589,13 @@ private:
   std::shared_ptr<const PreparedDeviceModel> image_;
   PsiFormerAcceleratorSharedModel& owner_;
   std::mutex& mutex_;
+  const ProductSessionProfile profile_;
   compute::Queue<PlatformKind::CUDA> queue_;
   AcceleratorBlasHandle blas_;
-  PreparedDeviceInference values_, spatial_;
+  PreparedDeviceInference values_;
   PreparedDeviceScoreReverse score_;
   PreparedDeviceScoreJvp jvp_;
-  PreparedDeviceKineticReverse kinetic_;
+  std::unique_ptr<KineticWorkspace> kinetic_;
   std::unique_ptr<PreparedDeviceScoreContraction> score_contraction_;
   // Publish metadata without exposing a concurrently replaced lazy owner.
   // Provider diagnostics hold the outer scratch mutex for a coherent snapshot.

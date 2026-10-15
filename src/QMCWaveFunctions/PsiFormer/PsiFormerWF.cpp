@@ -1350,7 +1350,8 @@ public:
           model_state_->numerical_tile_backend.get());
       if (!backend)
         throw std::logic_error("PsiFormer independent channels require the numerical device backend");
-      device_products_ = backend->prepareProductSession();
+      device_products_ = backend->prepareProductSession(
+          psiformer::device::ProductSessionProfile::SCORE_ONLY);
       device_positions_.resize(3 * electron_count_);
       workspace_bytes = checkedBatchMemoryAdd(device_products_->deviceWorkspaceBytes(),
           device_products_->hostWorkspaceBytes(), "PsiFormer overlap device scratch");
@@ -2972,7 +2973,8 @@ public:
           model_state_->numerical_tile_backend.get());
       if (!backend)
         throw std::logic_error("PsiFormer ECP products require the numerical device backend");
-      device_products_ = backend->prepareProductSession();
+      device_products_ = backend->prepareProductSession(
+          psiformer::device::ProductSessionProfile::SCORE_ONLY);
       device_positions_.resize(3 * electron_count_);
     }
 #endif
