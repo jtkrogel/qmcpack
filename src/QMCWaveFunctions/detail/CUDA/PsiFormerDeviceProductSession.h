@@ -106,6 +106,19 @@ public:
   std::size_t kineticTargetCapacity() const noexcept
   { return target_kinetic_ ? preparation_.kinetic.max_targets : 0; }
 
+  /// Snapshot device-wide counters, including other crowds and scalar status traffic.
+  DeviceMemorySnapshot transferSnapshot() const
+  {
+    image_->validateCurrentDevice();
+    int device = -1;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipGetDevice(&device), "product transfer metrics device");
+#else
+    checkRuntime(cudaGetDevice(&device), "product transfer metrics device");
+#endif
+    return deviceMemoryMetrics(device).snapshot();
+  }
+
   /// Capacity4 is qualified only for this small-model envelope. Larger models
   /// retain capacity1; this policy is not a claim that their full kinetic tape
   /// fits. In particular, never multiply 100--300-electron head/attention storage
@@ -201,6 +214,61 @@ public:
     }, count);
     ++weighted_score_tiles_;
     weighted_score_configurations_ += count;
+  }
+
+  /** Fold one sample's score and kinetic roots into the existing complex sums.
+   * Coefficients already encode the caller's transpose/Hermitian convention.
+   * Every device P response is consumed on this queue before its owner is reused;
+   * no response-sized host transfer or additional P temporary is needed.
+   * Any failed root invalidates the entire existing contraction transaction.
+   */
+  void accumulateKineticContraction(const double* positions, const double* total_drift,
+      const double* imaginary_drift, const double* inverse_masses,
+      const std::complex<double>* score_coefficients, const std::complex<double>* kinetic_coefficients,
+      const std::complex<double>* imaginary_coefficients, std::size_t channels, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, positions, version, [&]() {
+      requireKinetic();
+      if (!total_drift || !imaginary_drift || !inverse_masses ||
+          !score_coefficients || !kinetic_coefficients || !imaginary_coefficients)
+        throw std::invalid_argument("Resident kinetic contraction requires complete physical inputs and coefficients");
+      if (!score_contraction_ || channels == 0 || channels > 3)
+        throw std::invalid_argument("Resident kinetic contraction requires prepared bounded channels");
+      for (const auto* coefficients : {score_coefficients, kinetic_coefficients, imaginary_coefficients})
+        for (std::size_t channel = 0; channel < channels; ++channel)
+          if (!device_math::isFiniteBinary64(coefficients[channel].real()) ||
+              !device_math::isFiniteBinary64(coefficients[channel].imag()))
+            throw std::invalid_argument("Resident kinetic contraction coefficient is nonfinite");
+      std::copy_n(total_drift, drift_.size(), drift_.begin());
+      std::copy_n(inverse_masses, masses_.size(), masses_.begin());
+
+      // Ordinary score is evaluated once, independently of kinetic target tiles.
+      values_.evaluate(positions_);
+      const double* response = score_.reverse(values_, weights_);
+      score_contraction_->accumulate(response, score_coefficients, channels);
+      if (target_kinetic_)
+        response = target_kinetic_->evaluate(positions_, weights_, masses_, drift_);
+      else
+      {
+        kinetic_->spatial.evaluate(positions_);
+        response = kinetic_->reverse.evaluate(kinetic_->spatial, weights_, masses_, drift_);
+      }
+      score_contraction_->accumulate(response, kinetic_coefficients, channels);
+
+      // The same physical drift convention supplies the optional imaginary cross
+      // term. The fixed outer phase has no parameter-dependent Laplacian seed.
+      const bool imaginary = imaginary_drift && std::any_of(imaginary_drift,
+          imaginary_drift + drift_.size(), [](double value) { return value != 0.0; });
+      if (imaginary)
+      {
+        std::copy_n(imaginary_drift, drift_.size(), drift_.begin());
+        if (target_kinetic_)
+          response = target_kinetic_->evaluateGradientResponse(positions_, weights_, masses_, drift_);
+        else
+          response = kinetic_->reverse.evaluateGradientResponse(kinetic_->spatial, weights_, masses_, drift_);
+        score_contraction_->accumulate(response, imaginary_coefficients, channels);
+      }
+    });
   }
 
   /// Admit the complete finite sum before exposing any channel to the host.

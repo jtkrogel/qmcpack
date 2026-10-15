@@ -31,6 +31,7 @@
 #include "PsiFormerDeviceNonlocalResponse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
+#include "PsiFormerDeviceKineticContractionValidation.h"
 
 #include <fstream>
 #include <iostream>
@@ -934,6 +935,7 @@ int main(int argc, char** argv)
       near(gpu_kinetic[parameter], cpu_kinetic[parameter], "mass/external-drift kinetic response CPU parity");
     std::cout << "PASS full kinetic reverse: nonunit masses and external total-wavefunction drift\n";
     validateTargetKinetic(model, plan, image, queue, handle);
+    validateKineticContractions(model, plan, image);
     {
       const auto targets = std::min(std::size_t(3), model.ne);
       const auto vgl_cost = estimateTargetVglCost(plan, 2, targets);

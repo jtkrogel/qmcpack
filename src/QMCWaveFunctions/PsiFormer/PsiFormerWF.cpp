@@ -2111,13 +2111,27 @@ protected:
 #ifdef ENABLE_CUDA
       std::array<std::size_t, MAXIMUM_VJP_CHANNELS> score_channels{};
       std::size_t score_channel_count = 0;
+      std::array<std::size_t, MAXIMUM_VJP_CHANNELS> device_channels{};
+      std::size_t device_channel_count = 0;
       for (std::size_t channel = 0; channel < channels.size(); ++channel)
+      {
         if (channels[channel].product == wftrain::DerivativeProduct::SCORE_VJP)
           score_channels[score_channel_count++] = channel;
+        if (channels[channel].product == wftrain::DerivativeProduct::SCORE_VJP ||
+            (channels[channel].product == wftrain::DerivativeProduct::LOCAL_ENERGY_VJP &&
+             (channels[channel].local_energy_term_mask & wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)) != 0))
+          device_channels[device_channel_count++] = channel;
+      }
       // Real per-sample downloads cost 8*B*P; complex contracted outputs cost
       // 16*C*P. Admit optional storage only above that transfer break-even.
       const bool resident_scores = hasDeviceProducts() && !needs_kinetic &&
           score_channel_count != 0 && sample_count_ > 2 * score_channel_count;
+      const bool resident_kinetic = hasDeviceProducts() && needs_kinetic &&
+          device_channel_count != 0 && sample_count_ > 2 * device_channel_count;
+      const bool resident_products = resident_scores || resident_kinetic;
+      const auto& contracted_channels = resident_kinetic ? device_channels : score_channels;
+      const auto contracted_count = resident_kinetic ? device_channel_count : score_channel_count;
+      psiformer::device::DeviceMemorySnapshot transfer_before;
       // The existing weighted reverse contracts one real channel. Exact API
       // coefficients determine eligibility; real parameters do not imply real
       // optimizer coefficients. Finite coefficients were admitted by applyVJPs.
@@ -2128,13 +2142,14 @@ protected:
       std::size_t completed_score_tiles = 0;
       std::size_t final_score_tile_count = 0;
       std::size_t weighted_configurations = 0;
-      if (resident_scores)
+      if (resident_products)
       {
         auto& session = *shared_scratch_->device_products;
+        transfer_before = session.transferSnapshot();
         // Explicit cold preparation may grow capacity. Repeated requests with
         // the same admitted channel count reuse it without allocation.
-        session.prepareScoreContractions(score_channel_count, parameter_version_);
-        session.beginScoreContraction(score_channel_count, parameter_version_);
+        session.prepareScoreContractions(contracted_count, parameter_version_);
+        session.beginScoreContraction(contracted_count, parameter_version_);
       }
 #endif
 
@@ -2172,6 +2187,33 @@ protected:
               sample * electron_count_ * std::size_t{3};
           const double* inverse_mass = inverse_masses_.data() +
               sample * electron_count_;
+#ifdef ENABLE_CUDA
+          if (resident_kinetic)
+          {
+            std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> score_coefficients{},
+                kinetic_coefficients{}, imaginary_coefficients{};
+            const wftrain::DerivativeValue imaginary_unit = adjoint == wftrain::DerivativeAdjoint::HERMITIAN
+                ? wftrain::DerivativeValue(0.0, -1.0) : wftrain::DerivativeValue(0.0, 1.0);
+            for (std::size_t slot = 0; slot < contracted_count; ++slot)
+            {
+              const auto& channel = channels[contracted_channels[slot]];
+              const auto coefficient = channel.coefficients.values[sample];
+              if (channel.product == wftrain::DerivativeProduct::SCORE_VJP)
+                score_coefficients[slot] = coefficient;
+              else
+              {
+                kinetic_coefficients[slot] = coefficient;
+                imaginary_coefficients[slot] = coefficient * imaginary_unit;
+              }
+            }
+            shared_scratch_->device_products->accumulateKineticContraction(
+                shared_scratch_->device_positions.data(), total_drift, imaginary_drift, inverse_mass,
+                score_coefficients.data(), kinetic_coefficients.data(), imaginary_coefficients.data(),
+                contracted_count, parameter_version_);
+            reportDeviceProducts();
+            continue;
+          }
+#endif
           const pf::DirectKineticResultView result = evaluateKineticResponse(total_drift, inverse_mass);
           requireResultVersion(result);
           for (std::size_t channel = 0; channel < channels.size(); ++channel)
@@ -2242,16 +2284,26 @@ protected:
         }
       }
 #ifdef ENABLE_CUDA
-      if (resident_scores)
+      if (resident_products)
       {
         auto& session = *shared_scratch_->device_products;
         session.finishScoreContraction(parameter_version_);
-        for (std::size_t score_channel = 0; score_channel < score_channel_count; ++score_channel)
+        for (std::size_t slot = 0; slot < contracted_count; ++slot)
         {
-          auto& destination = channel_accumulators_[score_channels[score_channel]];
-          session.downloadScoreContraction(score_channel, destination.data(), destination.size(), parameter_version_);
+          auto& destination = channel_accumulators_[contracted_channels[slot]];
+          session.downloadScoreContraction(slot, destination.data(), destination.size(), parameter_version_);
         }
-        if (!shared_scratch_->reported_device_score_contraction)
+        if (resident_kinetic)
+        {
+          const auto transfer_after = session.transferSnapshot();
+          app_log() << "  PsiFormer resident score/kinetic contraction completed: configurations=" << sample_count_
+                    << ", channels=" << contracted_count << ", canonical_parameters=" << schema_->parameterCount()
+                    << ", parameter_version=" << parameter_version_
+                    << ", measured_download_calls=" << transfer_after.download_calls - transfer_before.download_calls
+                    << ", measured_downloaded_bytes=" << transfer_after.downloaded_bytes - transfer_before.downloaded_bytes
+                    << ", status_transfers_included=yes, transfer_counter_scope=device_wide" << std::endl;
+        }
+        if (resident_scores && !shared_scratch_->reported_device_score_contraction)
         {
           app_log() << "  PsiFormer resident score contraction completed: configurations=" << sample_count_
                     << ", channels=" << score_channel_count << ", canonical_parameters=" << schema_->parameterCount()
