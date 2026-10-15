@@ -2678,8 +2678,13 @@ int main(int argc, char** argv)
     if (PreparedDeviceProductSession::admittedScoreCapacity(shape, 4) == 4)
     {
       using Complex = std::complex<double>;
+      const auto before_lanes = product_session->transferSnapshot();
       auto single_lane = backend_tiles->prepareProductSession(ProductSessionProfile::SCORE_AND_KINETIC, 1);
       auto tiled_lane = backend_tiles->prepareProductSession(ProductSessionProfile::SCORE_AND_KINETIC, 4);
+      const auto after_lanes = tiled_lane->transferSnapshot();
+      if (after_lanes.live_bytes - before_lanes.live_bytes !=
+          single_lane->deviceWorkspaceBytes() + tiled_lane->deviceWorkspaceBytes())
+        throw std::runtime_error("Score/JVP session accounting differs from actual owned buffers");
       if (single_lane->scoreCapacity() != 1 || tiled_lane->scoreCapacity() != 4)
         throw std::runtime_error("Explicit score tile preparation lost its immutable capacity");
       for (const auto electrons : {std::size_t{100}, std::size_t{200}, std::size_t{300}})
@@ -2753,6 +2758,92 @@ int main(int argc, char** argv)
           near(output[parameter].imag(), 0, "weighted real score tile imaginary response");
         }
       }
+      // A single resident direction serves every full/tail tile and algebraic component.
+      const auto fixed_host_bytes = tiled_lane->hostWorkspaceBytes();
+      const auto imaginary_direction = [&]() {
+        auto result = product_direction;
+        for (std::size_t parameter = 0; parameter < result.size(); ++parameter)
+          result[parameter] *= parameter % 2 == 0 ? -.3 : .2;
+        return result;
+      }();
+      double maximum_jvp_error = 0;
+      std::size_t measured_direction_uploads = 0;
+      for (const auto population : {std::size_t{1}, std::size_t{4}, std::size_t{5}, std::size_t{7},
+                                    std::size_t{4}, std::size_t{1}, std::size_t{3}, std::size_t{4}})
+      {
+        std::vector<double> coordinates(population * 3 * model.ne);
+        std::vector<Complex> reference(population), products(population);
+        for (std::size_t sample = 0; sample < population; ++sample)
+        {
+          const auto* position = model.cfg.electrons.x.data() + (sample % model.cfg.nconfig) * 3 * model.ne;
+          std::copy_n(position, 3 * model.ne, coordinates.data() + sample * 3 * model.ne);
+          cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(position, model.ne));
+          const auto response = cpu_score_executor.evaluate(*cpu_score_workspace);
+          for (std::size_t parameter = 0; parameter < product_direction.size(); ++parameter)
+            reference[sample] += response.parameter_score[parameter] *
+                Complex(product_direction[parameter], imaginary_direction[parameter]);
+        }
+        const auto before = tiled_lane->transferSnapshot();
+        const auto before_products = tiled_lane->numericalProducts();
+        for (unsigned component = 0; component < 2; ++component)
+        {
+          const auto before_direction = tiled_lane->transferSnapshot();
+          tiled_lane->prepareScoreDirection(component == 0 ? product_direction : imaginary_direction, model.p.version());
+          const auto after_direction = tiled_lane->transferSnapshot();
+          if (after_direction.upload_calls - before_direction.upload_calls != 1 ||
+              after_direction.uploaded_bytes - before_direction.uploaded_bytes != product_direction.size() * sizeof(double))
+            throw std::runtime_error("Prepared JVP did not upload exactly one canonical direction");
+          ++measured_direction_uploads;
+          for (std::size_t offset = 0; offset < population; offset += 4)
+          {
+            const auto count = std::min(std::size_t{4}, population - offset);
+            const auto& tile = tiled_lane->scoreJvpPreparedTile(
+                coordinates.data() + offset * 3 * model.ne, count, model.p.version());
+            if (tile.size() != count)
+              throw std::runtime_error("Prepared JVP exposed capacity instead of live tail count");
+            for (std::size_t sample = 0; sample < count; ++sample)
+              products[offset + sample] += (component == 0 ? Complex(1, 0) : Complex(0, 1)) * tile[sample];
+          }
+        }
+        const auto after = tiled_lane->transferSnapshot();
+        if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
+            tiled_lane->deviceWorkspaceBytes() != fixed_bytes || tiled_lane->hostWorkspaceBytes() != fixed_host_bytes ||
+            tiled_lane->numericalProducts() - before_products != 2 * ((population + 3) / 4))
+          throw std::runtime_error("Prepared JVP tiles changed allocation, accounting or execution counts");
+        for (std::size_t sample = 0; sample < population; ++sample)
+        {
+          maximum_jvp_error = std::max(maximum_jvp_error, std::abs(products[sample] - reference[sample]));
+          near(products[sample].real(), reference[sample].real(), "tiled JVP real CPU dot parity");
+          near(products[sample].imag(), reference[sample].imag(), "tiled JVP imaginary CPU dot parity");
+        }
+      }
+
+      // Failure and stale calls publish no scalar tail; recovery reuses the direction.
+      tiled_lane->prepareScoreDirection(product_direction, model.p.version());
+      const auto& ephemeral_products = tiled_lane->scoreJvpPreparedTile(model.cfg.electrons.x.data(), 1, model.p.version());
+      auto expect_failed_jvp = [&](const double* positions, std::size_t count, std::size_t version) {
+        bool rejected = false;
+        try { tiled_lane->scoreJvpPreparedTile(positions, count, version); }
+        catch (const std::exception&) { rejected = true; }
+        if (!rejected || !ephemeral_products.empty())
+          throw std::runtime_error("Failed JVP tile retained published products");
+      };
+      expect_failed_jvp(model.cfg.electrons.x.data(), 0, model.p.version());
+      expect_failed_jvp(model.cfg.electrons.x.data(), 5, model.p.version());
+      expect_failed_jvp(model.cfg.electrons.x.data(), 1, model.p.version() + 1);
+      std::vector<double> invalid_jvp_tile(2 * 3 * model.ne);
+      std::copy_n(model.cfg.electrons.x.data(), 3 * model.ne, invalid_jvp_tile.data());
+      std::copy_n(invalid_product_positions.data(), 3 * model.ne, invalid_jvp_tile.data() + 3 * model.ne);
+      expect_failed_jvp(invalid_jvp_tile.data(), 2, model.p.version());
+      tiled_lane->prepareScoreDirection(product_direction, model.p.version());
+      near(tiled_lane->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()),
+           single_lane->scoreJvp(model.cfg.electrons.x.data(), product_direction, model.p.version()),
+           "prepared singleton JVP recovery");
+      std::cout << "PASS prepared score JVP tiles: populations1/4/5/7, tails4/1/3/4, signed complex CPU dot parity, "
+                   "exact owned bytes, zero warmed allocations, atomic failure/stale recovery; max_abs_error="
+                << maximum_jvp_error << " measured_direction_uploads=" << measured_direction_uploads
+                << " transfer_counter_scope=device_wide\n";
+
       // Ordinary roots must reset the larger value tape to one live configuration.
       cpu_score_workspace->setPositions(first_position);
       const auto single_reference = cpu_score_executor.evaluate(*cpu_score_workspace);
@@ -2808,6 +2899,11 @@ int main(int argc, char** argv)
       backend_tiles->publishParameters(accepted_values, model.p.version() + 1,
                                        [&]() { model.p.set_flat_values(accepted_values); });
       expect_missing();
+      expect_failed_jvp(model.cfg.electrons.x.data(), 1, model.p.version());
+      tiled_lane->prepareScoreDirection(product_direction, model.p.version());
+      near(tiled_lane->scoreJvpPrepared(model.cfg.electrons.x.data(), model.p.version()),
+           single_lane->scoreJvp(model.cfg.electrons.x.data(), product_direction, model.p.version()),
+           "prepared tiled JVP publication rebind");
       tiled_lane->beginScoreContraction(1, model.p.version());
       tiled_lane->accumulateWeightedScoreTile(model.cfg.electrons.x.data(), &zero_weight, 1, model.p.version());
       tiled_lane->finishScoreContraction(model.p.version());

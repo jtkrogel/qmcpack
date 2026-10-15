@@ -69,7 +69,7 @@ public:
         score_capacity_(admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
         preparation_(validatedPreparation(image_->plan(), preparation)),
         blas_(queue_), values_(image_, score_capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
-        score_(image_, score_capacity_, queue_, blas_), jvp_(image_, 1, queue_, blas_),
+        score_(image_, score_capacity_, queue_, blas_), jvp_(image_, score_capacity_, queue_, blas_),
         kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC && preparation_.kinetic.max_targets == 0
             ? std::make_unique<KineticWorkspace>(image_, queue_, blas_) : nullptr),
         target_kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC && preparation_.kinetic.max_targets != 0
@@ -89,6 +89,7 @@ public:
     positions_.reserve(spatial_detail::checkedProduct(positions_.size(), score_capacity_,
         "Device score tile position extent overflow"));
     tile_weights_.reserve(score_capacity_);
+    products_.reserve(score_capacity_);
     executor_.prepare(crowd_, owner_.activeProvenance().layout_fingerprint, score_capacity_, *this);
   }
 
@@ -376,6 +377,7 @@ public:
     execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
       values_.evaluate(positions_);
       jvp_.evaluate(values_, direction);
+      products_.resize(1);
       jvp_.downloadProducts(products_);
     });
     return products_[0];
@@ -400,12 +402,30 @@ public:
   /// Publication invalidates the direction; callers must prepare it again.
   double scoreJvpPrepared(const double* positions, std::size_t version)
   {
-    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
-      values_.evaluate(positions_);
-      jvp_.evaluatePrepared(values_);
-      jvp_.downloadProducts(products_);
-    });
-    return products_[0];
+    return scoreJvpPreparedTile(positions, 1, version)[0];
+  }
+
+  /// Apply one resident direction to a live tile, including a short tail.
+  /// Consume the returned scalars immediately; the next request invalidates them.
+  /// A failed tile exposes no partial products and keeps the prepared capacity.
+  const std::vector<double>& scoreJvpPreparedTile(const double* positions, std::size_t count,
+                                                 std::size_t version)
+  {
+    try
+    {
+      execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+        values_.evaluate(positions_);
+        jvp_.evaluatePrepared(values_);
+        products_.resize(count);
+        jvp_.downloadProducts(products_);
+      }, count);
+    }
+    catch (...)
+    {
+      products_.clear();
+      throw;
+    }
+    return products_;
   }
 
   /// Return independent determinant amplitudes, including the common cusp.

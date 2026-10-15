@@ -1836,6 +1836,7 @@ struct PsiFormerDerivativeScratch
   bool reported_device_products = false;
   bool reported_device_score_contraction = false;
   bool reported_device_score_tiles = false;
+  bool reported_device_jvp_tiles = false;
 #endif
   std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
 };
@@ -2351,17 +2352,35 @@ protected:
         // Upload each real direction once for the whole retained population.
         // A real model still supports algebraically complex optimizer vectors.
         std::fill(sample_products_.begin(), sample_products_.end(), wftrain::DerivativeValue{});
+        const auto capacity = deviceScoreCapacity();
+        std::size_t completed_tiles = 0, components = 0, final_count = 0;
         for (unsigned component = 0; component < 2; ++component)
         {
           if (!prepareDeviceDirection(direction, component))
             continue;
+          ++components;
           const wftrain::DerivativeValue factor = component == 0
               ? wftrain::DerivativeValue(1.0, 0.0) : wftrain::DerivativeValue(0.0, 1.0);
-          for (std::size_t sample = 0; sample < sample_count_; ++sample)
+          for (std::size_t offset = 0; offset < sample_count_; offset += capacity)
           {
-            setScoreWorkspacePositions(sample);
-            sample_products_[sample] += factor * evaluatePreparedDeviceJVP();
+            const auto count = std::min(capacity, sample_count_ - offset);
+            const auto& products = shared_scratch_->device_products->scoreJvpPreparedTile(
+                positions_.data() + offset * 3 * electron_count_, count, parameter_version_);
+            for (std::size_t sample = 0; sample < count; ++sample)
+              sample_products_[offset + sample] += factor * products[sample];
+            ++completed_tiles;
+            final_count = count;
           }
+        }
+        if (completed_tiles != 0)
+          reportDeviceProducts();
+        if (completed_tiles != 0 && !shared_scratch_->reported_device_jvp_tiles)
+        {
+          app_log() << "  PsiFormer device score JVP tiles: configurations=" << sample_count_
+                    << ", prepared_capacity=" << capacity << ", completed_tiles=" << completed_tiles
+                    << ", final_tile_count=" << final_count << ", direction_uploads=" << components
+                    << ", parameter_version=" << parameter_version_ << ", CPU derivative fallback=no" << std::endl;
+          shared_scratch_->reported_device_jvp_tiles = true;
         }
       }
       else
