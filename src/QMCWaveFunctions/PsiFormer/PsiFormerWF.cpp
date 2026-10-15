@@ -906,14 +906,18 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
   const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
   const auto retained_coordinates = positive("PSIFORMER_GPU_RETAINED_COORDINATE_BYTES");
+  const auto metropolis = positive("PSIFORMER_GPU_METROPOLIS_BYTES");
   if (lifted && !kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
   if ((vgl || kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
-  if ((vgl || kinetic || retained_coordinates) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+  if ((vgl || kinetic || retained_coordinates || metropolis) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
     throw std::invalid_argument("GPU target/retained-coordinate preparation requires FP64 reference precision");
   psiformer::device::DeviceExecutionPreparation preparation;
   preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
+  preparation.metropolis_workspace_budget_bytes = metropolis;
+  if (metropolis && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
+    throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open drift-free sampling");
   if (vgl)
     preparation.vgl = {vgl, bytes, work};
   if (kinetic)
@@ -923,6 +927,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
             << ", lifted_channel_slots=" << lifted
             << ", per_owner_workspace_limit_bytes=" << bytes << ", per_request_scalar_work_limit=" << work
             << ", per_provider_retained_coordinate_limit_bytes=" << retained_coordinates
+            << ", per_crowd_metropolis_limit_bytes=" << metropolis
             << ", aggregate_process_budget=no" << std::endl;
   return preparation;
 }
@@ -11575,6 +11580,78 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLogUnderRead(
 
 // Evaluate all accepted crowd configurations under one parameter read lock and
 // scatter complete spatial outputs directly into caller-owned accumulators.
+/// Query only the resolved GPU profile; CPU never reads GPU sampler controls.
+bool PsiFormerWF::deviceDriftFreeSamplingEnabled() const
+{
+#ifdef ENABLE_CUDA
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  if (backend && backend->metropolisBudget())
+  {
+    if (batch_execution_plan_)
+      throw std::invalid_argument("Explicit device sampling does not support a hard batch memory plan");
+#ifdef QMC_COMPLEX
+    throw std::invalid_argument("Explicit device sampling currently requires a real build");
+#else
+    return true;
+#endif
+  }
+#endif
+  return false;
+}
+
+/// Keep sampler graph/model leases inside the native acquired crowd boundary.
+std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceDriftFree(
+    const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+    const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
+    const std::function<void(std::vector<double>&)>& gaussian_draw,
+    const std::function<double()>& uniform_draw) const
+{
+#ifdef ENABLE_CUDA
+  if (!deviceDriftFreeSamplingEnabled() || wfc_list.size() != p_list.size() || wfc_list.empty())
+    throw std::invalid_argument("Device sampling needs an enabled, nonempty homogeneous crowd");
+  auto& resource = requireMultiWalkerResource(wfc_list);
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto ne = transaction.state().execution_plan.modelShape().electrons();
+  const auto extent = psiformer::spatial_detail::checkedProduct(wfc_list.size(),
+      psiformer::spatial_detail::checkedProduct(3, ne, "Sampling physical stride overflow"),
+      "Sampling physical population overflow");
+  std::vector<double> positions(extent), masses(ne), accepted(extent);
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+  {
+    const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
+    component.requireNoSelectedParticleProposal("device drift-free sampling");
+    if (component.model_state_.get() != model_state_.get() || component.batch_execution_plan_ ||
+        p_list[walker].getTotalNum() != ne || p_list[walker].isSpinor() || p_list[walker].getActivePtcl() != -1)
+      throw std::invalid_argument("Device sampling received incompatible crowd components or particles");
+    for (std::size_t electron = 0; electron < ne; ++electron)
+    {
+      const double inverse_mass = 1.0 / p_list[walker].get_mass_by_group()[p_list[walker].getGroupID(electron)];
+      if (walker && masses[electron] != inverse_mass)
+        throw std::invalid_argument("Device sampling crowd physical masses disagree");
+      masses[electron] = inverse_mass;
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        positions[(walker * ne + electron) * 3 + dimension] = p_list[walker].R[electron][dimension];
+    }
+  }
+  auto& batch = *resource.batch_workspace;
+  batch.resize(pf::DirectBatchMode::FULL_VGL, wfc_list.size());
+  const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(
+      *transaction.state().numerical_tile_backend);
+  const auto counts = backend.advanceMetropolis(batch.numericalSamplingWorkspace(), positions, masses, tau,
+      substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted);
+  // All device work succeeded. Derived host caches remain intentionally stale
+  // until the driver's immediate ParticleSet update and full TWF evaluateLog.
+  for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
+    for (std::size_t electron = 0; electron < ne; ++electron)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        p_list[walker].R[electron][dimension] = accepted[(walker * ne + electron) * 3 + dimension];
+  return counts;
+#else
+  throw std::logic_error("Device drift-free sampling is not compiled");
+#endif
+}
+
 void PsiFormerWF::mw_evaluateLog(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list,

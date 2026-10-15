@@ -85,6 +85,7 @@ target_link_libraries(psiformer_device_runtime_validation PRIVATE psiformer_devi
 # the production QMC application and its intentionally disabled device policy.
 add_executable(psiformer_device_model_validation EXCLUDE_FROM_ALL
                PsiFormerDeviceModelValidation.cu
+               ../../../Utilities/StdRandom.cpp
                ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
                ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
                ../../PsiFormer/PsiFormerExecutionPlan.cpp
@@ -95,7 +96,15 @@ else()
   set_target_properties(psiformer_device_model_validation PROPERTIES
                         CUDA_SEPARABLE_COMPILATION ON)
 endif()
-target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA)
+target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio)
+target_include_directories(psiformer_device_model_validation PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src/Containers"
+                           "${qmcpack_SOURCE_DIR}/src/Particle")
+if(NOT QMC_CUDA2HIP AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+  # Native RNG headers transitively include mpi3's annotated host/device lambda.
+  target_compile_options(psiformer_device_model_validation PRIVATE
+                         $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+endif()
 
 # Self-contained generated periodic fixture: no trained checkpoint data required.
 add_executable(psiformer_device_periodic_validation EXCLUDE_FROM_ALL

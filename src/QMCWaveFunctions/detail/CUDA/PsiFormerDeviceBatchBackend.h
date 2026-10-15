@@ -17,6 +17,7 @@
 
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceProductSession.h"
+#include "PsiFormerDeviceMetropolis.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerBatchExecutor.h"
 
 #include <atomic>
@@ -119,6 +120,7 @@ public:
     {
       if (context->crowd.poisoned())
       {
+        context->sampler.reset();
         context->executor.recover(owner_, context->crowd, context->hooks);
         context->executor.prepare(context->crowd, owner_.activeProvenance().layout_fingerprint,
                                   context->capacity, context->hooks);
@@ -154,6 +156,120 @@ public:
                 << ", whole_fp64_retries=" << context->hooks.mixedRetries()
                 << ", retry_reason=" << context->hooks.mixedRetryReason() << std::endl;
     return result;
+  }
+
+  /// Report the explicit per-crowd sampler admission limit; zero preserves host moves.
+  std::size_t metropolisBudget() const noexcept { return preparation_.metropolis_workspace_budget_bytes; }
+
+  /** Borrow the existing VALUE graph for native-engine drift-free substeps.
+   * The caller holds its native model read transaction and acquired host crowd.
+   * Draw callbacks must not reenter the backend. Returned coordinates are only
+   * materialized after every substep resolves; failures abort, never fall back.
+   */
+  std::pair<std::size_t, std::size_t> advanceMetropolis(pf::DirectBatchTileBackendWorkspace& workspace,
+      const std::vector<double>& positions, const std::vector<double>& inverse_mass, double tau,
+      std::size_t substeps, std::size_t version,
+      const std::function<void(std::vector<double>&)>& gaussian_draw,
+      const std::function<double()>& uniform_draw, std::vector<double>& accepted_positions,
+      const std::function<void(const std::vector<std::uint32_t>&)>& validation_mask_observer = {}) const
+  {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    auto* context = dynamic_cast<Context*>(&workspace);
+    const auto ne = image_->plan().modelShape().electrons();
+    if (!context || context->owner != this || !metropolisBudget() || mixed_parameters_ ||
+        positions.empty() || positions.size() % (3 * ne) || inverse_mass.size() != ne ||
+        !substeps || !gaussian_draw || !uniform_draw || version != image_->version() ||
+        !device_math::isFiniteBinary64(tau) || tau <= 0)
+      throw std::invalid_argument("Device sampling requires its explicit real/open FP64 crowd profile and current image");
+    const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne);
+    if (cost.device_bytes > metropolisBudget())
+      throw std::length_error("Device sampling exceeds its explicit standalone per-crowd budget before draws");
+    (void)spatial_detail::checkedProduct(cost.population, substeps, "Device sampling counter overflow");
+    for (const auto value : positions)
+      if (!device_math::isFiniteBinary64(value))
+        throw std::invalid_argument("Device sampling host coordinates are nonfinite");
+    for (const auto value : inverse_mass)
+      if (!device_math::isFiniteBinary64(value) || value <= 0)
+        throw std::invalid_argument("Device sampling inverse mass must be finite and positive");
+    if (accepted_positions.size() != positions.size())
+      throw std::invalid_argument("Device sampling accepted export must be pre-sized");
+
+    // Context replacement destroys its sampler first; rebind retains graph storage.
+    if (context->hooks.modelVersion() != image_->version())
+      context->hooks.rebindModel(image_);
+    const bool reseed = !context->sampler || context->sampler_positions != positions ||
+        context->sampler_masses != inverse_mass;
+    context->sampler_gaussian.resize(positions.size());
+    context->sampler_uniforms.resize(cost.population);
+    std::size_t accepts = 0, uniform_draws = 0;
+    try
+    {
+      context->executor.acquire(owner_, context->crowd, context->hooks);
+      if (reseed)
+      {
+        // Release a stale owner before replacement: no transient double-owner peak.
+        context->sampler.reset();
+        context->sampler_positions = positions;
+        context->sampler_masses = inverse_mass;
+        context->sampler = PreparedDeviceMetropolis::prepare(*context->hooks.values_, context->hooks.queue_,
+            positions, inverse_mass, metropolisBudget());
+        context->sampler_version = version;
+      }
+      else if (context->sampler_version != version)
+      {
+        context->sampler->refreshAccepted(version);
+        context->sampler_version = version;
+      }
+
+      // Preserve native Gaussian flattening and conditional walker-order uniforms.
+      for (std::size_t step = 0; step < substeps; ++step)
+      {
+        gaussian_draw(context->sampler_gaussian);
+        const auto token = context->sampler->propose(context->sampler_gaussian, tau, version);
+        const auto& eligible = context->sampler->eligibility(token);
+        for (std::size_t walker = 0; walker < cost.population; ++walker)
+          if (eligible[walker] & METROPOLIS_ELIGIBLE)
+          {
+            context->sampler_uniforms[walker] = uniform_draw();
+            ++uniform_draws;
+          }
+        const auto& mask = context->sampler->resolve(token, context->sampler_uniforms);
+        for (const auto value : mask)
+          accepts += (value & METROPOLIS_ACCEPTED) != 0;
+        if (validation_mask_observer)
+          validation_mask_observer(mask);
+      }
+      context->sampler->exportAccepted(accepted_positions);
+      std::copy(accepted_positions.begin(), accepted_positions.end(), context->sampler_positions.begin());
+      context->executor.release(owner_, context->crowd, context->hooks);
+    }
+    catch (...)
+    {
+      // Earlier substeps/RNG draws are not rolled back; the caller must abort.
+      context->sampler.reset();
+      if (context->crowd.poisoned())
+      {
+        context->executor.recover(owner_, context->crowd, context->hooks);
+        context->executor.prepare(context->crowd, owner_.activeProvenance().layout_fingerprint,
+                                  context->capacity, context->hooks);
+      }
+      else if (context->crowd.acquired())
+        context->executor.release(owner_, context->crowd, context->hooks);
+      throw;
+    }
+    std::clog << "PsiFormer device sampling completed: B=" << cost.population << ", Ne=" << ne
+              << ", VALUE_capacity=" << context->capacity << ", substeps=" << substeps
+              << ", parameter_version=" << version << ", per_crowd_budget_bytes=" << metropolisBudget()
+              << ", sampler_device_bytes=" << cost.device_bytes << ", owner_host_mask_bytes=" << cost.host_bytes
+              << ", host_scratch_bytes=" << sizeof(double) * (context->sampler_positions.capacity() +
+                    context->sampler_gaussian.capacity() + context->sampler_uniforms.capacity() +
+                    context->sampler_masses.capacity())
+              << ", bridge_host_staging_bytes=" << sizeof(double) * (positions.capacity() +
+                    inverse_mass.capacity() + accepted_positions.capacity())
+              << ", borrowed_VALUE_graph_bytes=" << context->hooks.values_->deviceWorkspaceBytes()
+              << ", uniform_draws=" << uniform_draws << ", accepts=" << accepts
+              << ", host_VGL_boundary=outer_step, RNG=host_native, Hamiltonian=host, CPU_fallback=no\n";
+    return {accepts, cost.population * substeps - accepts};
   }
 
   /// Count completed GPU tiles across all crowds sharing this numerical backend.
@@ -259,6 +375,10 @@ private:
     PsiFormerAcceleratorExecutor executor;
     PsiFormerAcceleratorCrowdState crowd;
     PreparedDeviceCrowdHooks hooks;
+    // Declared after hooks: sampler must die before its borrowed graph/queue.
+    std::unique_ptr<PreparedDeviceMetropolis> sampler;
+    std::vector<double> sampler_positions, sampler_gaussian, sampler_uniforms, sampler_masses;
+    std::size_t sampler_version = 0;
     std::vector<double> positions;
     std::size_t coordinate_generation = 0;
   };
@@ -275,6 +395,10 @@ private:
   static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
       PsiFormerPrecisionPolicy precision, DeviceExecutionPreparation preparation)
   {
+    if (preparation.metropolis_workspace_budget_bytes &&
+        (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+         plan.environment().boundary != BoundaryCondition::OPEN))
+      throw std::invalid_argument("Explicit device sampling requires real/open FP64 preparation");
     if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
         (preparation.vgl.max_targets || preparation.kinetic.max_targets))
       throw std::invalid_argument("Mixed precision does not support explicit GPU target preparation");

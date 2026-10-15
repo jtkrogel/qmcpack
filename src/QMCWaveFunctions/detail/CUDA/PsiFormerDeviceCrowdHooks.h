@@ -267,6 +267,9 @@ public:
   const std::string& mixedRetryReason() const noexcept { return mixed_retry_reason_; }
 
 private:
+  // The named sampler borrows this crowd's existing VALUE graph under its lease.
+  friend class PreparedDeviceBatchBackend;
+
   /// Preserve atomic result publication while applying the explicitly selected numerical policy.
   void evaluateGraph(PreparedDeviceInference& graph)
   {

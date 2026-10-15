@@ -22,8 +22,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pf
@@ -447,6 +449,16 @@ public:
   LogValue evaluateLog(const ParticleSet& particles,
                        ParticleSet::ParticleGradient& gradient,
                        ParticleSet::ParticleLaplacian& laplacian) override;
+
+  /// Query the explicitly enabled resolved GPU sampler, rejecting hard-plan overlap.
+  bool deviceDriftFreeSamplingEnabled() const;
+
+  /// Advance injected native-engine substeps; host full VGL must follow before use.
+  std::pair<std::size_t, std::size_t> mw_advanceDeviceDriftFree(
+      const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
+      const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
+      const std::function<void(std::vector<double>&)>& gaussian_draw,
+      const std::function<double()>& uniform_draw) const;
 
   /// Evaluate complete VGL data through one direct crowd batch boundary.
   void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

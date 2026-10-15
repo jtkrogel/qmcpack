@@ -6,11 +6,132 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_DEVICE_METROPOLIS_VALIDATION_H
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_METROPOLIS_VALIDATION_H
 #include "PsiFormerDeviceMetropolis.h"
+#include "PsiFormerDeviceBatchBackend.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
+#include "Particle/ParticleBase/RandomSeqGenerator.h"
+#include "Utilities/RandomGenerator.h"
 #include <iostream>
+#include <sstream>
 
 namespace qmcplusplus::psiformer::device
 {
+/// Compare the production adapter's masks/draw mapping with copied native engines.
+template<class Model>
+void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image)
+{
+  const auto ne = image->plan().modelShape().electrons(), stride = 3 * ne;
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "Native sampler validation device");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "Native sampler validation device");
+#endif
+  auto& metrics = deviceMemoryMetrics(ordinal);
+  for (const auto population : {std::size_t{1}, std::size_t{5}})
+  {
+    std::vector<double> positions(population * stride), masses(ne, 1), exported(positions.size());
+    for (std::size_t walker = 0; walker < population; ++walker)
+      std::copy_n(model.cfg.electrons.x.data() + (walker % model.cfg.nconfig) * stride, stride,
+                  positions.data() + walker * stride);
+    for (std::size_t electron = 0; electron < ne; ++electron)
+      masses[electron] = .8 + .13 * electron;
+    const auto cost = estimateMetropolisCost(population, ne);
+    DeviceExecutionPreparation preparation;
+    preparation.metropolis_workspace_budget_bytes = cost.device_bytes - 1;
+    PreparedDeviceBatchBackend under_budget(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation);
+    auto rejected_workspace = under_budget.prepare(2);
+    std::size_t draw_calls = 0;
+    const auto gaussian_probe = [&](std::vector<double>&) { ++draw_calls; };
+    const auto uniform_probe = [&]() { ++draw_calls; return .5; };
+    bool rejected = false;
+    const auto rejected_before = metrics.snapshot();
+    try
+    {
+      under_budget.advanceMetropolis(*rejected_workspace, positions, masses, .02, 2, image->version(),
+                                    gaussian_probe, uniform_probe, exported);
+    }
+    catch (const std::length_error&) { rejected = true; }
+    if (!rejected || draw_calls || metrics.snapshot().allocation_calls != rejected_before.allocation_calls)
+      throw std::runtime_error("Production sampler budget rejection consumed native draws");
+    preparation.metropolis_workspace_budget_bytes = cost.device_bytes;
+    PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation);
+    auto workspace = backend.prepare(2);
+    Model reference(model);
+    auto cpu = std::make_unique<pf::DirectValueExecutor>(reference, image->plan());
+    auto cpu_workspace = cpu->makeWorkspace();
+    auto expected_positions = positions;
+    std::vector<double> expected_proposal(positions.size());
+    std::vector<std::uint32_t> expected_mask(population);
+    RandomGenerator cpu_rng(413), gpu_rng(cpu_rng);
+    std::size_t cpu_calls = 0, gpu_calls = 0, compared_masks = 0;
+    auto cpu_draw = [&]() { ++cpu_calls; return cpu_rng(); };
+    auto gpu_draw = [&]() { ++gpu_calls; return gpu_rng(); };
+    const double tau = .02;
+    const auto gaussian = [&](std::vector<double>& actual) {
+      std::vector<TinyVector<double, 3>> native_gaussian(population * ne);
+      makeGaussRandomWithEngine(native_gaussian, cpu_draw);
+      makeGaussRandomWithEngine(actual, gpu_draw);
+      for (std::size_t coordinate = 0; coordinate < actual.size(); ++coordinate)
+      {
+        if (actual[coordinate] != native_gaussian[coordinate / 3][coordinate % 3])
+          throw std::runtime_error("Production sampler changed native Gaussian flattening");
+        expected_proposal[coordinate] = expected_positions[coordinate] +
+            std::sqrt(tau * masses[(coordinate / 3) % ne]) * actual[coordinate];
+      }
+      for (std::size_t walker = 0; walker < population; ++walker)
+      {
+        cpu_workspace->setPositions(pf::GeometryPositionView::interleaved(expected_positions.data() + walker * stride, ne));
+        const auto old_value = cpu->evaluate(*cpu_workspace);
+        cpu_workspace->setPositions(pf::GeometryPositionView::interleaved(expected_proposal.data() + walker * stride, ne));
+        const auto proposed = cpu->evaluate(*cpu_workspace);
+        const double alpha = 2 * (proposed.logabs - old_value.logabs);
+        bool take = false;
+        if (proposed.sign != 0 && device_math::isFiniteBinary64(alpha))
+        {
+          const auto u = cpu_draw();
+          take = u == 0 || std::log(u) < alpha;
+        }
+        expected_mask[walker] = take ? METROPOLIS_ACCEPTED : 0;
+        if (take)
+          std::copy_n(expected_proposal.data() + walker * stride, stride, expected_positions.data() + walker * stride);
+      }
+    };
+    const auto observe = [&](const std::vector<std::uint32_t>& actual) {
+      std::ostringstream cpu_state, gpu_state;
+      cpu_rng.write(cpu_state);
+      gpu_rng.write(gpu_state);
+      if (actual != expected_mask || cpu_calls != gpu_calls || cpu_state.str() != gpu_state.str())
+        throw std::runtime_error("Production sampler masks/draws/final native engine differ");
+      ++compared_masks;
+    };
+    // Cold seed, then warm replay with persistent positions and the same graph.
+    for (std::size_t request = 0; request < 2; ++request)
+    {
+      const auto before = metrics.snapshot();
+      backend.advanceMetropolis(*workspace, positions, masses, tau, 2, image->version(), gaussian, gpu_draw, exported, observe);
+      const auto after = metrics.snapshot();
+      if (request && (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls))
+        throw std::runtime_error("Production sampler warm replay allocated device storage");
+      for (std::size_t coordinate = 0; coordinate < positions.size(); ++coordinate)
+        if (std::abs(exported[coordinate] - expected_positions[coordinate]) > 2.e-14)
+          throw std::runtime_error("Production sampler accepted physical coordinates differ");
+      positions = exported;
+    }
+    auto values = reference.p.flat_values();
+    values[image->plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] += .02;
+    backend.publishParameters(values, image->version() + 1, [&]() { reference.p.set_flat_values(values); });
+    cpu = std::make_unique<pf::DirectValueExecutor>(reference, image->plan());
+    cpu_workspace = cpu->makeWorkspace();
+    backend.advanceMetropolis(*workspace, positions, masses, tau, 2, image->version() + 1,
+                             gaussian, gpu_draw, exported, observe);
+    if (compared_masks != 6)
+      throw std::runtime_error("Production sampler did not qualify every substep mask");
+    std::cout << "PASS native-engine sampler adapter: B=" << population
+              << " VALUE_capacity=2 substeps=2 requests=3 masks=" << compared_masks
+              << " native_draws=" << gpu_calls << " final_engine=identical successor_refresh=yes\n";
+  }
+}
+
 /// Qualify the numerical owner with injected draws, not a new production sampler.
 template<class Model>
 void validateDeviceMetropolis(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image,
@@ -258,6 +379,7 @@ void validateDeviceMetropolis(Model& model, const std::shared_ptr<const Prepared
             << " measured_D2D_calls=" << total_copies << " measured_draw_H2D_bytes=" << total_upload_bytes
             << " measured_status_mask_D2H_bytes=" << total_download_bytes
             << " transfer_counter_scope=device_wide; XML/RNG/Hamiltonian NOT_INTEGRATED\n";
+  validateNativeMetropolisAdapter(model, image);
 }
 } // namespace qmcplusplus::psiformer::device
 #endif

@@ -169,6 +169,14 @@ public:
   DirectBatchWorkspace(DirectBatchWorkspace&&) noexcept = default;
   DirectBatchWorkspace& operator=(DirectBatchWorkspace&&) noexcept = default;
 
+  /// Borrow the existing numerical crowd for its named, exclusive sampler adapter.
+  DirectBatchTileBackendWorkspace& numericalSamplingWorkspace()
+  {
+    if (!backend_workspace_)
+      throw std::logic_error("Prepare ordinary numerical batch storage before sampling");
+    return *backend_workspace_;
+  }
+
   /** Select a nonzero execution tile capacity and prepare the current request.
    * Scratch remains grow-only, while a smaller selection takes effect immediately.
    */

@@ -18,6 +18,7 @@
 #include "QMCDrivers/VMC/ElectronSubsetSelector.h"
 #include "QMCDrivers/VMC/VMCDriverInput.h"
 #include "QMCWaveFunctions/TWFGrads.hpp"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "TauParams.hpp"
 #include <Hdispatcher.h>
 #include <PSdispatcher.h>
@@ -33,6 +34,19 @@ using MCPWalker = MCPopulation::MCPWalker;
 
 namespace
 {
+
+/// Discover the one explicit PsiFormer-only route without changing default moves.
+const PsiFormerWF* deviceSamplingComponent(const TrialWaveFunction& wavefunction)
+{
+  const PsiFormerWF* selected = nullptr;
+  for (const auto& orbital : wavefunction.getOrbitals())
+    if (const auto* component = dynamic_cast<const PsiFormerWF*>(orbital.get());
+        component && component->deviceDriftFreeSamplingEnabled())
+      selected = component;
+  if (selected && wavefunction.getOrbitals().size() != 1)
+    throw UniformCommunicateError("Explicit device sampling requires exactly one PsiFormer wavefunction factor.");
+  return selected;
+}
 
 /** Scale proposed coordinate displacements by the species time steps. */
 template<typename RT, CoordsType CT>
@@ -71,6 +85,10 @@ void VMCBatchedSampling::validateMoveConfiguration(const VMCDriverInput& input,
                                                    const TrialWaveFunction& wavefunction,
                                                    bool serializing_crowd_walkers)
 {
+  if (deviceSamplingComponent(wavefunction) &&
+      (input.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON || input.get_use_drift() ||
+       electrons.isSpinor() || serializing_crowd_walkers))
+    throw UniformCommunicateError("Explicit device sampling requires move=alle, usedrift=no, POS and batched crowds.");
   if (input.get_move_kind() == VMCDriverInput::MoveKind::PBYP)
     return;
   if (serializing_crowd_walkers)
@@ -113,6 +131,8 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
   if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_LOAD)
     timers.check_log_and_gl(crowd, "checkGL_after_load");
 
+  bool device_moves_completed = false;
+
   {
     ScopedTimer pbyp_local_timer(timers.move);
     const int num_walkers   = crowd.size();
@@ -122,7 +142,29 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
     const VMCDriverInput::MoveKind move_kind = sft.vmcdrv_input.get_move_kind();
 
-    if (move_kind != VMCDriverInput::MoveKind::PBYP)
+    if (const auto* sampler = deviceSamplingComponent(walker_twfs.getLeader()))
+    {
+      validateMoveConfiguration(sft.vmcdrv_input, walker_leader, walker_twfs.getLeader(),
+                                sft.serializing_crowd_walkers);
+      RefVector<WaveFunctionComponent> components;
+      for (const TrialWaveFunction& wavefunction : walker_twfs)
+      {
+        if (!deviceSamplingComponent(wavefunction))
+          throw UniformCommunicateError("Explicit device sampling crowd contains a disabled or foreign factor.");
+        components.push_back(*wavefunction.getOrbitals()[0]);
+      }
+      const RefVectorWithLeader<WaveFunctionComponent> component_list(components[0], components);
+      const auto counts = sampler->mw_advanceDeviceDriftFree(component_list, walker_elecs,
+          sft.qmcdrv_input.get_tau(), sft.qmcdrv_input.get_sub_steps(),
+          [&](std::vector<double>& gaussian) { makeGaussRandomWithEngine(gaussian, random_generator); },
+          [&]() { return random_generator(); });
+      for (std::size_t count = 0; count < counts.first; ++count)
+        crowd.incAccept();
+      for (std::size_t count = 0; count < counts.second; ++count)
+        crowd.incReject();
+      device_moves_completed = true;
+    }
+    else if (move_kind != VMCDriverInput::MoveKind::PBYP)
     {
       if constexpr (CT == CoordsType::POS_SPIN)
         throw std::runtime_error("Collective VMC electron moves do not support spin coordinates.");
@@ -350,7 +392,15 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
 
   {
     ScopedTimer buffer_local_timer(timers.buffer);
-    twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
+    if (device_moves_completed)
+    {
+      // All substeps used only VALUE; restore canonical host state exactly once
+      // at the unchanged every-outer-step Hamiltonian/sample boundary.
+      ps_dispatcher.flex_update(walker_elecs);
+      twf_dispatcher.flex_evaluateLog(walker_twfs, walker_elecs);
+    }
+    else
+      twf_dispatcher.flex_evaluateGL(walker_twfs, walker_elecs, recompute);
     if (sft.qmcdrv_input.get_debug_checks() & DriverDebugChecks::CHECKGL_AFTER_MOVES)
       timers.check_log_and_gl(crowd, "checkGL_after_moves");
     ps_dispatcher.flex_saveWalker(walker_elecs, walkers);
