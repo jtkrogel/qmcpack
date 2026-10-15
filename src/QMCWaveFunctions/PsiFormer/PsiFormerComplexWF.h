@@ -102,11 +102,59 @@ public:
    */
   CoulombObservation observeCoulombEnergy(const ParticleSet&, FullPrecRealType same_sample_potential) const;
 
+  /// Identify the fixed ion source for final-system Coulomb admission, not a movable source API.
+  const ParticleSet& sourceParticles() const;
+
+  /// Identify this clone's actual bound target, not a shared model's original target.
+  const ParticleSet& targetParticles() const;
+
+  /// Reject source-force fallbacks that would otherwise silently return zero.
+  GradType evalGradSource(ParticleSet&, ParticleSet&, int) override;
+
+  /// Reject mixed source/electron derivatives without fabricating products.
+  GradType evalGradSource(ParticleSet&, ParticleSet&, int,
+      TinyVector<ParticleSet::ParticleGradient, OHMMS_DIM>&,
+      TinyVector<ParticleSet::ParticleLaplacian, OHMMS_DIM>&) override;
+
+  /// Reject Hessians rather than use the base abort fallback.
+  void evaluateHessian(ParticleSet&, HessVector&) override;
+
+  /// Spinor requests cannot silently become positional gradients.
+  GradType evalGradWithSpin(ParticleSet&, int, ComplexType&) override;
+
+  /// Spinor proposal requests cannot silently become positional proposals.
+  PsiValue ratioGradWithSpin(ParticleSet&, int, GradType&, ComplexType&) override;
+
+  /// The scalar proposal API does not implement all-to-one virtual geometry.
+  void evaluateRatiosAlltoOne(ParticleSet&, std::vector<ValueType>&) override;
+
+  /// ECP/virtual ratios require a separately qualified complex path.
+  void evaluateRatios(const VirtualParticleSet&, std::vector<ValueType>&) override;
+
+  /// Derivative ratios are not implied by internal complex score availability.
+  void evaluateDerivRatios(const VirtualParticleSet&, const OptVariables&,
+                          std::vector<ValueType>&, Matrix<ValueType>&) override;
+
+  /// Reject weighted virtual derivatives before the base compatibility matrix allocates.
+  void evaluateDerivRatiosWeighted(const VirtualParticleSet&, const OptVariables&,
+                                 const std::vector<ValueType>&, ParameterDerivativeView) override;
+
+  /// Explicit aggregate planning is unqualified, not zero-cost accounting.
+  BatchMemoryContribution estimateBatchExecutionMemory(const BatchExecutionPlanningContext&) const override;
+
+  /// Reject prospective nonempty plans before any publication.
+  void validateBatchExecutionPlanBinding(const BatchExecutionParticipantPlan&) const override;
+
+  /// Ordinary unplanned CPU preparation remains a no-op.
+  void prepareBatchExecutionClone(const BatchExecutionParticipantPlan&) override;
+
   /// Complex score availability alone does not qualify public kinetic optimization.
   void evaluateDerivatives(ParticleSet&, const OptVariables&, Vector<ValueType>&, Vector<ValueType>&) override;
 
 private:
   struct Impl;
+  /// Keep explicit unsupported-operation diagnostics independent of legacy fallbacks.
+  [[noreturn]] static void rejectUnsupported(const char* operation);
   /// Internal clone entry point retains immutable model ownership and the explicit numeric cap.
   PsiFormerComplexWF(std::string name, std::unique_ptr<Impl>);
   std::unique_ptr<Impl> impl_;

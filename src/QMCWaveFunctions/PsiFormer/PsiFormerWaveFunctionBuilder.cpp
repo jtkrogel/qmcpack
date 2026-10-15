@@ -16,6 +16,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 
 #include <algorithm>
 #include <array>
@@ -130,6 +131,39 @@ std::uint64_t parseInitializationSeed(const std::string& value)
   return seed;
 }
 
+/// Parse a mandatory exact byte cap, excluding zero and the conventional unlimited sentinel.
+std::size_t parseCloneNumericLimit(const std::string& text)
+{
+  std::size_t bytes = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), bytes);
+  if (error != std::errc{} || end != text.data() + text.size() || !bytes ||
+      bytes == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Complex PsiFormer requires positive finite max_clone_numeric_bytes in exact bytes");
+  return bytes;
+}
+
+/// Reject effective ECP charges presented as physically all-electron source metadata.
+void validateComplexCoulombSource(const ParticleSet& ions)
+{
+  const auto& species = ions.getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  if (charge < 0)
+    throw std::invalid_argument("Complex PsiFormer all-electron source requires ionic charges");
+  for (int group = 0; group < species.size(); ++group)
+  {
+    const double z = species(charge, group);
+    if (!psiformer::determinant::isFiniteReal(z) || z <= 0 || z != std::floor(z))
+      throw std::invalid_argument("Complex PsiFormer all-electron charges must be positive atomic numbers");
+    for (const char* name : {"atomicnumber", "valence"})
+    {
+      const int attribute = species.findAttribute(name);
+      if (attribute >= 0 && (!psiformer::determinant::isFiniteReal(species(attribute, group)) ||
+                            species(attribute, group) != z))
+        throw std::invalid_argument("Complex PsiFormer all-electron charge/atomicnumber/valence mismatch");
+    }
+  }
+}
+
 /// Parse exactly three finite reduced-twist components from one XML attribute.
 std::array<double, 3> parseReducedTwist(const std::string& value)
 {
@@ -198,12 +232,39 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (xmlHasProp(cur, BAD_CAST "optimize_indices") != nullptr)
     optimize_indices = getXMLAttributeValue(cur, "optimize_indices");
 
+  const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1;
+  [[maybe_unused]] std::size_t clone_numeric_limit = 0;
+#ifndef QMC_COMPLEX
+  if (complex_profile)
+    throw std::invalid_argument("psiformer_complex_periodic_v1 requires a complex QMCPACK build");
+#endif
+#ifdef MIXED_PRECISION
+  if (complex_profile)
+    throw std::invalid_argument("psiformer_complex_periodic_v1 requires a full-precision QMCPACK build");
+#endif
+
   // Resolve before parsing mutable target metadata or opening either model
   // file. Strict requests therefore fail without HDF5 or ParticleSet effects;
   // auto records an explicit CPU fallback for unsupported operations/geometries.
   const bool optimization_enabled = parseOptimizationFlag(optimize);
   const auto precision = psiformer::parsePsiFormerPrecisionPolicy(precision_text);
   const bool periodic = targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_OPEN;
+  if (complex_profile)
+  {
+    // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
+    const auto request = normalizedAcceleratorRequest(gpu);
+    if ((request != "no" && request != "cpu") || optimization_enabled ||
+        precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+      throw std::invalid_argument("Complex PsiFormer requires CPU, optimize=no and fp64_reference");
+    if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
+        feature_policy != "periodic_torus_v1" || system != "all_electron" ||
+        !xmlHasProp(cur, BAD_CAST "source") || !parameters.empty() || !configuration.empty() ||
+        !export_parameters.empty() || !optimize_indices.empty() || optimize_scope != "indices")
+      throw std::invalid_argument("Complex PsiFormer requires explicit periodic all-electron native inference metadata");
+    clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
+  }
+  else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes"))
+    throw std::invalid_argument("max_clone_numeric_bytes belongs only to psiformer_complex_periodic_v1");
   const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
       resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
           optimization_enabled ? psiformer::allPsiFormerAcceleratorOperations()
@@ -235,7 +296,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (!internal_initialization && has_initialization_seed)
     throw std::invalid_argument(
         "PsiFormer initialization_seed requires internal initialization");
-  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1)
+  if (internal_initialization && initialization != psiformer::DEEPQMC_PSIFORMER_V1 && !complex_profile)
     throw std::invalid_argument("Unsupported PsiFormer initialization profile: " + initialization);
   const std::uint64_t initialization_seed = parseInitializationSeed(initialization_seed_text);
 
@@ -334,6 +395,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       throw std::invalid_argument("PsiFormer source particle set not found: " + source);
     source_particles = source_particle_set->second.get();
   }
+  if (complex_profile)
+    validateComplexCoulombSource(*source_particles);
 
   std::unique_ptr<PsiFormerWF> component;
   const std::array<double, 3> twist_array{
@@ -353,6 +416,11 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         /*attention_heads=*/4,
         /*attention_blocks=*/4};
     psiformer::ExecutionEnvironment environment;
+    if (complex_profile)
+    {
+      environment.head_representation = psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX;
+      environment.amplitude_scalar_domain = psiformer::ScalarDomain::COMPLEX;
+    }
     if (periodic)
     {
       environment.boundary = psiformer::BoundaryCondition::PERIODIC;
@@ -379,6 +447,21 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       myComm->bcast(initialized.values.data() + broadcast_offset, count);
       broadcast_offset += static_cast<std::size_t>(count);
     }
+#ifdef QMC_COMPLEX
+    if (complex_profile)
+    {
+      auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
+                                                         *source_particles, clone_numeric_limit, twist_array);
+      const auto storage = complex->numericStorage();
+      app_log() << "  Complex PsiFormer CPU numeric bytes per clone: required=" << storage.required_bytes
+                << " allocated=" << storage.allocated_bytes << " cap=" << storage.limit_bytes
+                << "; excludes shared model, object/allocator overhead, ParticleSet, WFBuffer and aggregate clones; "
+                << "not adaptive large-system qualification" << std::endl;
+      if (adopt_explicit_twist)
+        targetPtcl.setTwist(reduced_twist);
+      return complex;
+    }
+#endif
     component = std::make_unique<PsiFormerWF>(
         name, std::move(initialized), targetPtcl, *source_particles, optimization_enabled,
         std::move(selected_indices), optimize_all, export_parameters, twist_array,

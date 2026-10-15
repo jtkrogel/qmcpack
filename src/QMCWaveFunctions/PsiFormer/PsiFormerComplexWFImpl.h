@@ -37,7 +37,8 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Retain initializer provenance and construct only qualified complex inference owners.
-    Model(InitializedNativeModel initialized, const ParticleSet& electrons, std::array<double, 3> reduced)
+    Model(InitializedNativeModel initialized, const ParticleSet& electrons, const ParticleSet& ions,
+          std::array<double, 3> reduced)
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
           environment(environmentFor(electrons)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
@@ -45,7 +46,7 @@ struct PsiFormerComplexWF::Impl
               {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
                model.dim, model.heads, model.blocks}, environment)), value(model, plan), spatial(model, plan),
           identity(persistentModelIdentity(model, "internal", profile, seed, environment,
-                                           reduced_twist, cartesian_twist))
+                                           reduced_twist, cartesian_twist)), source(&ions)
     {}
 
     pf::PsiFormer model;
@@ -57,6 +58,7 @@ struct PsiFormerComplexWF::Impl
     const pf::DirectComplexValueExecutor value;
     const pf::DirectComplexSpatialExecutor spatial;
     const std::uint64_t identity;
+    const ParticleSet* const source;
   };
 
   /// Validate the explicit initializer profile before consuming its canonical storage.
@@ -72,7 +74,7 @@ struct PsiFormerComplexWF::Impl
   /// Prepare distinct VALUE/FULL/ACTIVE scratch; there is no real head or score tape.
   Impl(psiformer::InitializedPsiFormerParameters initialized, const ParticleSet& electrons,
        const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
-      : Impl(std::make_shared<const Model>(materialize(std::move(initialized), electrons, ions), electrons, reduced),
+      : Impl(std::make_shared<const Model>(materialize(std::move(initialized), electrons, ions), electrons, ions, reduced),
              electrons, limit)
   {}
 
@@ -610,6 +612,96 @@ PsiFormerComplexWF::CoulombObservation PsiFormerComplexWF::observeCoulombEnergy(
   if (!isFiniteWavefunctionValue(kinetic) || !isFiniteWavefunctionValue(local_energy))
     throw std::overflow_error("Complex PsiFormer Coulomb observation overflow");
   return {kinetic, local_energy, potential};
+}
+
+/// Expose the immutable fixed-source identity solely for final-system admission.
+const ParticleSet& PsiFormerComplexWF::sourceParticles() const { return *impl_->state->source; }
+
+/// Each clone binds its own actual target independently of the shared immutable model.
+const ParticleSet& PsiFormerComplexWF::targetParticles() const { return *impl_->particles; }
+
+/// Every unsupported path fails explicitly before touching caller products or legacy fallback storage.
+void PsiFormerComplexWF::rejectUnsupported(const char* operation)
+{
+  throw std::logic_error(std::string("Complex PsiFormer CPU inference does not support ") + operation);
+}
+
+/// Return no fictitious source-force derivative.
+PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGradSource(ParticleSet&, ParticleSet&, int)
+{
+  rejectUnsupported("source gradients");
+}
+
+/// Mixed source/electron response remains unqualified.
+PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGradSource(ParticleSet&, ParticleSet&, int,
+    TinyVector<ParticleSet::ParticleGradient, OHMMS_DIM>&,
+    TinyVector<ParticleSet::ParticleLaplacian, OHMMS_DIM>&)
+{
+  rejectUnsupported("mixed source derivatives");
+}
+
+/// Hessian requests fail descriptively rather than abort.
+void PsiFormerComplexWF::evaluateHessian(ParticleSet&, HessVector&)
+{
+  rejectUnsupported("Hessians");
+}
+
+/// A spinor request must not silently use the positional gradient.
+PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGradWithSpin(ParticleSet&, int, ComplexType&)
+{
+  rejectUnsupported("spin gradients");
+}
+
+/// A spinor request must not silently publish a positional proposal.
+PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGradWithSpin(ParticleSet&, int, GradType&, ComplexType&)
+{
+  rejectUnsupported("spin proposal gradients");
+}
+
+/// All-to-one geometry cannot reuse one selected ParticleSet proposal.
+void PsiFormerComplexWF::evaluateRatiosAlltoOne(ParticleSet&, std::vector<ValueType>&)
+{
+  rejectUnsupported("all-to-one ratios");
+}
+
+/// Virtual/ECP geometry has no public complex qualification.
+void PsiFormerComplexWF::evaluateRatios(const VirtualParticleSet&, std::vector<ValueType>&)
+{
+  rejectUnsupported("virtual/ECP ratios");
+}
+
+/// Internal score does not qualify virtual parameter response.
+void PsiFormerComplexWF::evaluateDerivRatios(const VirtualParticleSet&, const OptVariables&,
+    std::vector<ValueType>&, Matrix<ValueType>&)
+{
+  rejectUnsupported("virtual derivatives");
+}
+
+/// Reject before allocating the base compatibility derivative matrix.
+void PsiFormerComplexWF::evaluateDerivRatiosWeighted(const VirtualParticleSet&, const OptVariables&,
+    const std::vector<ValueType>&, ParameterDerivativeView)
+{
+  rejectUnsupported("weighted virtual derivatives");
+}
+
+/// Per-clone exact admission is not aggregate planned-memory qualification.
+BatchMemoryContribution PsiFormerComplexWF::estimateBatchExecutionMemory(const BatchExecutionPlanningContext&) const
+{
+  rejectUnsupported("explicit batch memory planning");
+}
+
+/// Only the ordinary unplanned execution contract is admitted.
+void PsiFormerComplexWF::validateBatchExecutionPlanBinding(const BatchExecutionParticipantPlan& plan) const
+{
+  if (plan)
+    rejectUnsupported("batch plan binding");
+}
+
+/// Preparation may be a no-op only for an empty participant plan.
+void PsiFormerComplexWF::prepareBatchExecutionClone(const BatchExecutionParticipantPlan& plan)
+{
+  if (plan)
+    rejectUnsupported("planned clone preparation");
 }
 
 /// Public optimization requires complete complex kinetic response, not only a score.

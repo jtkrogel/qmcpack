@@ -15,6 +15,10 @@
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Utilities/RuntimeOptions.h"
+#include "OhmmsData/Libxml2Doc.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
+#include "QMCHamiltonians/HamiltonianFactory.h"
+#include "Particle/VirtualParticleSet.h"
 #include "psiformer_test_utils.h"
 #include <algorithm>
 #include <complex>
@@ -30,6 +34,29 @@ namespace ps = psiformer;
 namespace fixture = testing::psiformer;
 using C = std::complex<double>;
 constexpr std::size_t clone_cap = 8 * 1024 * 1024;
+
+/// Count any forbidden device-readiness inspection made by profile admission.
+class AdmissionReadiness final : public PsiFormerAcceleratorReadinessProvider
+{
+public:
+  /// A rejected GPU request must never reach this seam.
+  psiformer::PsiFormerAcceleratorReadiness inspect() const override { ++calls; return {}; }
+  mutable int calls = 0;
+};
+
+/// Fixed production initializer profile; omitted GPU/optimizer/precision use their CPU-safe defaults.
+std::string complexXml(const std::string& extra = "", const std::string& cap = "16777216")
+{
+  return "<psiformer source='ion0' system='all_electron' feature_policy='periodic_torus_v1' "
+         "initialization='psiformer_complex_periodic_v1' initialization_seed='17' " +
+         (cap.empty() ? "" : "max_clone_numeric_bytes='" + cap + "' ") + extra + "/>";
+}
+
+/// The real production periodic Hamiltonian, not a molecular inverse-distance substitute.
+const std::string coulombTerms =
+    "<pairpot name='ee' type='coulomb' source='e' target='e' gpu='no'/>"
+    "<pairpot name='ei' type='coulomb' source='ion0' target='e'/>"
+    "<pairpot name='ii' type='coulomb' source='ion0' target='ion0' gpu='no'/>";
 
 /// Small descriptor fixture exercises the same numerical owners without another Native TU.
 /// This is not a new public XML architecture; initializer production dimensions stay fixed.
@@ -349,6 +376,8 @@ TEST_CASE("PsiFormer complex clone admits exact numeric bytes and independent sc
   auto cloned = component.makeClone(clone_particles);
   auto* clone = dynamic_cast<PsiFormerComplexWF*>(cloned.get());
   REQUIRE(clone != nullptr);
+  CHECK(&clone->targetParticles() == &clone_particles);
+  CHECK(&component.targetParticles() == &p);
   CHECK(clone->getName() == component.getName());
   const auto clone_storage = clone->numericStorage();
   CHECK(clone_storage.required_bytes == storage.required_bytes);
@@ -565,5 +594,119 @@ TEST_CASE("PsiFormer complex Coulomb observation retains mass-weighted imaginary
   p.getSpeciesSet()(mass, 1) = 0;
   p.resetGroups();
   CHECK_THROWS(component.observeCoulombEnergy(p, potential));
+}
+
+TEST_CASE("PsiFormer paired XML rejects unsafe requests before target or device mutation",
+          "[wavefunction][psiformer][complex_wf][complex_admission]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  pool.emplace("ion0", std::make_unique<ParticleSet>(ions(simulation_cell)));
+  AdmissionReadiness readiness;
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, pool, &readiness);
+  auto build = [&](const std::string& xml) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(xml));
+    return builder.buildComponent(document.getRoot());
+  };
+  for (const char* request : {"gpu='auto'", "gpu='cuda'", "optimize='yes'",
+                             "precision='fp32_dense_fp64_islands'"})
+    CHECK_THROWS(build(complexXml(request)));
+  CHECK_THROWS(build(complexXml("", "")));
+  CHECK_THROWS(build(complexXml("", "0")));
+  CHECK_THROWS(build(complexXml("twist='0.17 -0.11 0.07'", "1")));
+  CHECK(readiness.calls == 0);
+  for (int d = 0; d < 3; ++d)
+    CHECK(p.getTwist()[d] == 0);
+  auto& source = *pool.at("ion0");
+  const int valence = source.getSpeciesSet().findAttribute("valence");
+  source.getSpeciesSet()(valence, 0) = 2;
+  CHECK_THROWS(build(complexXml())); // ECP effective charges cannot masquerade as AE metadata
+}
+
+TEST_CASE("PsiFormer paired XML observes the same production Coulomb Hamiltonian sample",
+          "[wavefunction][psiformer][complex_wf][complex_admission]")
+{
+  auto lattice = cell();
+  lattice.LR_dim_cutoff = 15;
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  auto p = electrons(simulation_cell);
+  const int charge = p.getSpeciesSet().addAttribute("charge");
+  p.getSpeciesSet()(charge, 0) = p.getSpeciesSet()(charge, 1) = -1;
+  p.resetGroups();
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  pool.emplace("ion0", std::make_unique<ParticleSet>(ions(simulation_cell)));
+  auto& source = *pool.at("ion0");
+  source.createSK();
+  p.createSK();
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, p, pool);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString(complexXml("twist='0.17 -0.11 0.07'")));
+  auto base = builder.buildComponent(document.getRoot());
+  auto* component = dynamic_cast<PsiFormerComplexWF*>(base.get());
+  REQUIRE(component != nullptr);
+  CHECK(&component->sourceParticles() == &source);
+  CHECK(component->numericStorage().required_bytes == component->numericStorage().allocated_bytes);
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  trial.addComponent(std::move(base));
+  auto makeHamiltonian = [&](const std::string& xml) {
+    Libxml2Document input;
+    REQUIRE(input.parseFromString(xml));
+    HamiltonianFactory factory("complex_coulomb", p, pool, OptionalRef<TrialWaveFunction>(trial), OHMMS::Controller);
+    if (!factory.put(input.getRoot()))
+      throw std::runtime_error("Hamiltonian construction returned false");
+    return factory.releaseHamiltonian();
+  };
+  CHECK_THROWS(makeHamiltonian("<hamiltonian default='no'>" + coulombTerms + "</hamiltonian>"));
+  CHECK_THROWS(makeHamiltonian("<hamiltonian><pairpot type='pseudo' source='ion0'/></hamiltonian>"));
+  CHECK_THROWS(makeHamiltonian("<hamiltonian><pairpot type='coulomb' source='other'/></hamiltonian>"));
+  auto hamiltonian = makeHamiltonian("<hamiltonian>" + coulombTerms + "</hamiltonian>");
+  source.update();
+  p.update();
+  // One exact configuration is used for BOTH the production Ewald/Coulomb traversal and helper.
+  trial.evaluateLog(p);
+  const auto real_energy = hamiltonian->evaluate(trial, p);
+  const auto potential = hamiltonian->getLocalPotential();
+  const auto complete = component->observeCoulombEnergy(p, potential);
+  CHECK(complete.local_energy.real() == Approx(real_energy).epsilon(2e-11));
+  close(complete.local_energy - complete.kinetic, C{potential});
+  C independent{};
+  for (int e = 0; e < 4; ++e)
+  {
+    C ratio = p.L[e];
+    for (int d = 0; d < 3; ++d)
+      ratio += p.G[e][d] * p.G[e][d];
+    independent -= .5 * ratio;
+  }
+  close(complete.local_energy, independent + potential);
+  CHECK(std::abs(complete.local_energy.imag()) > 1e-8);
+  trial.addComponent(component->makeClone(p));
+  CHECK_THROWS(makeHamiltonian("<hamiltonian>" + coulombTerms + "</hamiltonian>"));
+}
+
+TEST_CASE("PsiFormer public inference rejects unsafe inherited fallback APIs",
+          "[wavefunction][psiformer][complex_wf][complex_admission]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF component("reject", parameters(), p, source, clone_cap);
+  WaveFunctionComponent::ComplexType spin{.2, -.1};
+  WaveFunctionComponent::GradType gradient(C{.3, .4});
+  WaveFunctionComponent::HessVector hessian;
+  std::vector<WaveFunctionComponent::ValueType> ratios(1, C{.7, -.2});
+  VirtualParticleSet virtuals(p);
+  CHECK_THROWS(component.evalGradSource(p, source, 0));
+  CHECK_THROWS(component.evaluateHessian(p, hessian));
+  CHECK_THROWS(component.evalGradWithSpin(p, 0, spin));
+  CHECK_THROWS(component.ratioGradWithSpin(p, 0, gradient, spin));
+  CHECK_THROWS(component.evaluateRatiosAlltoOne(p, ratios));
+  CHECK_THROWS(component.evaluateRatios(virtuals, ratios));
+  close(spin, C{.2, -.1});
+  close(gradient[0], C{.3, .4});
+  close(ratios[0], C{.7, -.2});
 }
 } // namespace qmcplusplus

@@ -55,6 +55,9 @@ public:
 
   std::string getClassName() const override;
 
+  /// Identify the target whose masses were captured when this kinetic operator was constructed.
+  const ParticleSet& getTargetPSet() const noexcept { return ps_; }
+
 #if !defined(REMOVE_TRACEMANAGER)
   void contributeParticleQuantities() override;
   void checkoutParticleQuantities(TraceManager& tm) override;

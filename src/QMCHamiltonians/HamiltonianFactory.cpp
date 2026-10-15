@@ -50,6 +50,13 @@
 #endif
 #include "QMCHamiltonians/SkPot.h"
 #include "OhmmsData/AttributeSet.h"
+#include <algorithm>
+#include <array>
+#include <stdexcept>
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#endif
 
 namespace qmcplusplus
 {
@@ -97,6 +104,56 @@ bool HamiltonianFactory::build(xmlNodePtr cur)
   OhmmsAttributeSet hAttrib;
   hAttrib.add(defaultKE, "default");
   hAttrib.put(cur);
+#ifdef QMC_COMPLEX
+  // This first public profile is one complete CPU Coulomb ansatz, not a generic capability registry.
+  const PsiFormerComplexWF* complex = nullptr;
+  if (psi_optional_)
+    for (const auto& component : psi_optional_->get().getOrbitals())
+      if (auto candidate = dynamic_cast<const PsiFormerComplexWF*>(component.get()))
+        complex = candidate;
+  if (complex)
+  {
+    if (psi_optional_->get().getOrbitals().size() != 1 || defaultKE != "yes")
+      throw std::invalid_argument("Complex PsiFormer requires a sole component and ordinary bare kinetic energy");
+    const auto& source = complex->sourceParticles();
+    std::array<bool, 3> seen{};
+    processChildren(cur, [&](const std::string& kind, xmlNodePtr element) {
+      if (element->type != XML_ELEMENT_NODE)
+        return; // formatted XML text/comments are not Hamiltonian operators
+      if (kind != "pairpot" || getXMLAttributeValue(element, "type") != "coulomb")
+        throw std::invalid_argument("Complex PsiFormer admits only three physical periodic Coulomb pair terms");
+      // Mirror CoulombPotentialFactory defaults, including e/e when source/target are omitted.
+      std::string from = targetPtcl.getName(), to = targetPtcl.getName();
+      std::string pbc = "yes", forces = "no", gpu = "no";
+      bool physical = true;
+      OhmmsAttributeSet pair;
+      pair.add(from, "source");
+      pair.add(to, "target");
+      pair.add(pbc, "pbc");
+      pair.add(physical, "physical");
+      pair.add(forces, "forces");
+      pair.add(gpu, "gpu");
+      pair.put(element);
+      if (!physical || pbc != "yes" || forces != "no" || (gpu != "no" && gpu != "cpu"))
+        throw std::invalid_argument("Complex PsiFormer requires physical periodic CPU Coulomb without forces");
+      std::size_t term = 3;
+      if (from == targetPtcl.getName() && to == targetPtcl.getName())
+        term = 0;
+      else if (from == source.getName() && (to == targetPtcl.getName() || to == source.getName()))
+      {
+        const auto found = ptclPool.find(from);
+        if (found == ptclPool.end() || found->second.get() != &source)
+          throw std::invalid_argument("Complex PsiFormer Coulomb source differs from its fixed ion source");
+        term = to == targetPtcl.getName() ? 1 : 2;
+      }
+      if (term == 3 || seen[term])
+        throw std::invalid_argument("Complex PsiFormer Coulomb source pair is unqualified or duplicated");
+      seen[term] = true;
+    });
+    if (!std::all_of(seen.begin(), seen.end(), [](bool present) { return present; }))
+      throw std::invalid_argument("Complex PsiFormer requires e/e, ion/e and ion/ion periodic Coulomb terms");
+  }
+#endif
   // KineticEnergy must be the first element in the hamiltonian array.
   if (defaultKE != "no")
     targetH->addOperator(std::make_unique<BareKineticEnergy>(targetPtcl), "Kinetic");

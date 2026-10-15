@@ -49,9 +49,76 @@
 #include "Estimators/EstimatorManagerNew.h"
 #include "Message/UniformCommunicateError.h"
 #include "RandomNumberControl.h"
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCHamiltonians/CoulombPBCAA.h"
+#include "QMCHamiltonians/CoulombPBCAB.h"
+#include <array>
+#include <typeinfo>
+#endif
 
 namespace qmcplusplus
 {
+#ifdef QMC_COMPLEX
+namespace
+{
+/// Find the explicit profile in the actual selected wavefunction, never an inferred pool default.
+const PsiFormerComplexWF* selectedComplexProfile(const TrialWaveFunction& psi)
+{
+  for (const auto& component : psi.getOrbitals())
+    if (auto complex = dynamic_cast<const PsiFormerComplexWF*>(component.get()))
+      return complex;
+  return nullptr;
+}
+
+/// Validate concrete selected objects before estimators/drivers/clones; store no admission pointer/token.
+void requireSelectedComplexCoulombSystem(const TrialWaveFunction& psi, const QMCHamiltonian& ham,
+                                        const ParticleSet& target)
+{
+  const auto* complex = selectedComplexProfile(psi);
+  if (!complex)
+    return;
+  auto reject = []() { throw UniformCommunicateError(
+      "Complex PsiFormer selected-system admission requires a sole component, CPU bare kinetic and "
+      "three physical periodic Coulomb terms bound to its actual target/source"); };
+  if (psi.getOrbitals().size() != 1 || &complex->targetParticles() != &target ||
+      ham.size() != 4 || ham.total_size() != 4)
+    reject();
+  const auto* kinetic = dynamic_cast<const BareKineticEnergy*>(ham.getComponent(0));
+  if (!kinetic || typeid(*kinetic) != typeid(BareKineticEnergy) || &kinetic->getTargetPSet() != &target)
+    reject();
+  std::array<int, 3> counts{};
+  for (int i = 1; i < ham.size(); ++i)
+  {
+    const auto* op = ham.getComponent(i);
+    if (const auto* aa = dynamic_cast<const CoulombPBCAA*>(op))
+    {
+      if (typeid(*aa) != typeid(CoulombPBCAA) || aa->ComputeForces || aa->quasi2d || aa->usesOffload())
+        reject();
+      if (&aa->Ps == &target && aa->is_active)
+        ++counts[0];
+      else if (&aa->Ps == &complex->sourceParticles() && !aa->is_active)
+        ++counts[1];
+      else
+        reject();
+    }
+    else if (const auto* ab = dynamic_cast<const CoulombPBCAB*>(op))
+    {
+      if (typeid(*ab) != typeid(CoulombPBCAB) || ab->ComputeForces || &ab->Peln != &target ||
+          &ab->getSourcePSet() != &complex->sourceParticles())
+        reject();
+      ++counts[2];
+    }
+    else
+      reject();
+  }
+  if (counts != std::array<int, 3>{1, 1, 1})
+    reject();
+}
+} // namespace
+#endif
+
 QMCDriverFactory::QMCDriverFactory(const ProjectData& project_data) : project_data_(project_data) {}
 
 /** Read the xml defining the driver for this QMC section
@@ -175,6 +242,10 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     for (const auto& name_pair : PsiHamNamePairReader::readMultiplePairs(cur))
     {
       multi_psi.emplace_back(&getPsi(name_pair.first));
+#ifdef QMC_COMPLEX
+      if (selectedComplexProfile(*multi_psi.back()))
+        throw UniformCommunicateError("Complex PsiFormer selected-system admission does not support CSVMC");
+#endif
       multi_ham.emplace_back(&getHam(name_pair.second));
     }
     new_driver = std::make_unique<CSVMC>(project_data_, qmc_system, std::move(multi_psi), std::move(multi_ham), comm);
@@ -187,6 +258,9 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryPsi = getPsi(one_pair ? one_pair->first : "");
     // get primaryH
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
+#ifdef QMC_COMPLEX
+    requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system);
+#endif
 
     auto makeEstimatorManager =
         [&](const std::optional<EstimatorManagerInput>& global_emi,

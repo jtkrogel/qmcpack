@@ -481,4 +481,18 @@ TEST_CASE("PsiFormer kinetic response supports a genuinely complex total drift",
 }
 #endif
 
+#ifndef QMC_COMPLEX
+TEST_CASE("PsiFormer paired profile explicitly rejects a real build", "[psiformer][complex_admission]")
+{
+  const SimulationCell simulation_cell;
+  ParticleSet electrons = makeMassTaggedElectrons(simulation_cell, 1, 1);
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, electrons, pool);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<psiformer initialization='psiformer_complex_periodic_v1' gpu='auto'/>"));
+  CHECK_THROWS_WITH(builder.buildComponent(document.getRoot()),
+                    Catch::Matchers::ContainsSubstring("requires a complex QMCPACK build"));
+}
+#endif
+
 } // namespace qmcplusplus

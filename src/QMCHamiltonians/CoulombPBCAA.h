@@ -114,6 +114,9 @@ struct CoulombPBCAA : public OperatorDependsOnlyOnParticleSet, public ForceBase
 
   std::string getClassName() const override { return "CoulombPBCAA"; }
 
+  /// Expose the immutable execution choice for strict CPU selected-system admission.
+  bool usesOffload() const noexcept { return use_offload_; }
+
   /** evaluate just one walker
    *
    *  This is still called for batch AA IonIon
