@@ -871,6 +871,51 @@ psiformer::PsiFormerAcceleratorResolution validateProductionAcceleratorResolutio
 
 struct PsiFormerDerivativeScratch;
 
+/// Describe an explicitly bounded CPU numerical owner, independently of output storage.
+struct CpuTargetVGLPreparation
+{
+  std::size_t targets = 0, owner_budget = 0, owner_bytes = 0;
+};
+
+/// Read CPU controls only on the resolved CPU route; admit before clone buffers exist.
+CpuTargetVGLPreparation configuredCpuTargetVGL(
+    const psiformer::PsiFormerAcceleratorResolution& resolution,
+    const psiformer::PsiFormerExecutionPlan& plan, const pf::DirectValueParameterLayout& layout)
+{
+  if (resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU)
+    return {};
+  const auto positive = [](const char* name) -> std::size_t {
+    const char* value = std::getenv(name);
+    if (!value)
+      return 0;
+    std::size_t result = 0;
+    for (const char* digit = value; *digit; ++digit)
+    {
+      if (*digit < '0' || *digit > '9' ||
+          result > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+        throw std::invalid_argument(std::string(name) + " must be a positive base-10 size_t");
+      result = 10 * result + (*digit - '0');
+    }
+    if (result == 0 || result == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument(std::string(name) + " must be positive and finite");
+    return result;
+  };
+  CpuTargetVGLPreparation result;
+  result.targets = positive("PSIFORMER_CPU_VGL_TARGETS");
+  result.owner_budget = positive("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE");
+  if (!result.targets && !result.owner_budget)
+    return result;
+  if (!result.targets || !result.owner_budget)
+    throw std::invalid_argument("PsiFormer CPU target VGL requires both targets and owner bytes per clone");
+  const auto& shape = plan.modelShape();
+  result.owner_bytes = pf::targetSpatialWorkspaceStorageRequirement(
+      {shape.electrons(), shape.nuclei, shape.determinants, shape.feature_dimension,
+       shape.attention_heads, layout.inputWidth(), 0, 0}, result.targets);
+  if (result.owner_bytes > result.owner_budget)
+    throw std::length_error("PsiFormer CPU target VGL owner exceeds its per-clone byte cap");
+  return result;
+}
+
 #ifdef ENABLE_CUDA
 /** Read each developer GPU control once at shared-backend construction.
  * Target limits apply to each owner/logical request; retained-coordinate limits
@@ -1083,8 +1128,12 @@ public:
         direct_value_mode(configuredDirectBackend("PSIFORMER_VALUE_BACKEND")),
         direct_spatial_mode(configuredDirectBackend("PSIFORMER_SPATIAL_BACKEND")),
         direct_score_mode(configuredDirectBackend("PSIFORMER_SCORE_BACKEND")),
-        direct_kinetic_mode(configuredDirectBackend("PSIFORMER_KINETIC_BACKEND"))
+        direct_kinetic_mode(configuredDirectBackend("PSIFORMER_KINETIC_BACKEND")),
+        cpu_target_vgl(configuredCpuTargetVGL(this->accelerator_resolution, execution_plan,
+                                            *direct_value_executor.layout()))
   {
+    if (cpu_target_vgl.targets && direct_spatial_mode != DirectBackendMode::DIRECT)
+      throw std::invalid_argument("PsiFormer CPU target VGL requires the direct spatial backend");
     if (numerical_tile_backend && (direct_value_mode != DirectBackendMode::DIRECT ||
         direct_spatial_mode != DirectBackendMode::DIRECT))
       throw std::invalid_argument("PsiFormer GPU inference requires direct value/spatial modes, not CPU oracle or compare modes");
@@ -1168,6 +1217,8 @@ public:
   const DirectBackendMode direct_score_mode;
   /// Development switch selecting direct, oracle, or compare kinetic behavior.
   const DirectBackendMode direct_kinetic_mode;
+  /// Per-clone target numerical payload only; other products/owners are excluded.
+  const CpuTargetVGLPreparation cpu_target_vgl;
   /// Pretraining has no retained streaming snapshot to keep its lane alive.
   /// Cache one lane across orbital-loss calls; never one tape per walker/epoch.
   std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
@@ -4046,6 +4097,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
       const BatchResourcePreparationContext& context) const override
   {
     context.validate();
+    if (context.plan && model_state->cpu_target_vgl.targets)
+      throw std::invalid_argument("PsiFormer CPU target VGL does not support planned crowd resources");
     if (!context.plan)
       return;
     if (prepared_plan)
@@ -4162,6 +4215,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
   RatioArenaKind ratio_arena_kind = RatioArenaKind::NONE;
   /// Shared gradient publication staging for active and full spatial calls.
   std::vector<GradType> staged_gradients;
+  /// Report CPU target crowd multiplicity once, without claiming an aggregate cap.
+  bool cpu_target_vgl_reported = false;
   /// Byte-addressable flags retaining accepted spatial products during recompute.
   std::vector<unsigned char> preservation_flags;
   /// Per-configuration active-electron indices consumed by the native batch API.
@@ -5454,6 +5509,42 @@ bool isFiniteWavefunctionValue(const T& value) noexcept
              static_cast<double>(std::imag(value)));
 }
 
+/// Stream complete physical target slices into an output sink without a full tape.
+template<class Sink>
+pf::DirectValueResult streamCpuTargetVGL(const pf::DirectSpatialExecutor& executor,
+    pf::DirectSpatialWorkspace& workspace, std::size_t max_targets, std::size_t version,
+    const ParticleSet& particles, int replaced_particle, const ParticleSet::PosType* replacement,
+    Sink&& sink)
+{
+  const std::size_t n = executor.layout()->electronCount();
+  if (static_cast<std::size_t>(particles.getTotalNum()) != n || replaced_particle < -1 ||
+      (replaced_particle >= 0 && static_cast<std::size_t>(replaced_particle) >= n))
+    throw std::invalid_argument("PsiFormer CPU target VGL received incompatible physical positions");
+  for (std::size_t e = 0; e < n; ++e)
+  {
+    const auto& position = static_cast<int>(e) == replaced_particle
+        ? (replacement ? *replacement : particles.activeR(e)) : particles.R[e];
+    for (std::size_t d = 0; d < 3; ++d)
+      workspace.setPosition(e, d, position[d]);
+  }
+  pf::DirectValueResult value;
+  for (std::size_t begin = 0; begin < n; begin += max_targets)
+  {
+    const std::size_t count = std::min(max_targets, n - begin);
+    const auto tile = executor.evaluateTarget(workspace, begin, count);
+    if (tile.parameter_version != version || tile.target_begin != begin || tile.target_count != count ||
+        tile.gradient.size() != 3 * count || tile.lap_log.size() != count || tile.lap_ratio.size() != count ||
+        tile.evaluation_generation != workspace.evaluationGeneration())
+      throw std::logic_error("PsiFormer CPU target VGL returned inconsistent provenance");
+    if (begin == 0)
+      value = {tile.sign, tile.logabs, tile.value, tile.parameter_version};
+    else if (tile.sign != value.sign || tile.logabs != value.logabs || tile.value != value.value)
+      throw std::logic_error("PsiFormer CPU target VGL tiles disagree on the complete value");
+    sink(tile);
+  }
+  return value;
+}
+
 /// Require the unit electron masses assumed by the native kinetic-response formula.
 void requireUnitElectronMasses(const ParticleSet& particles)
 {
@@ -5554,6 +5645,8 @@ PsiFormerWF::PsiFormerWF(std::string name,
           makeStructuredParameterSchema(name, model_state_->model.p)),
       optimized_parameter_export_(std::move(optimized_parameter_export))
 {
+  if (model_state_->cpu_target_vgl.targets && enable_optimization)
+    throw std::invalid_argument("PsiFormer CPU target VGL is inference-only and requires optimize=no");
   if (model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE && enable_optimization)
     throw std::invalid_argument("Mixed PsiFormer precision is inference-only; optimize=yes is unsupported");
   if (!enable_optimization && !selected_flat_indices.empty())
@@ -5656,6 +5749,12 @@ PsiFormerWF::PsiFormerWF(std::string name,
     }
     app_log() << std::endl;
   }
+  if (model_state_->cpu_target_vgl.targets)
+    app_log() << "    CPU target VGL: maxK=" << model_state_->cpu_target_vgl.targets
+              << ", numerical_owner_bytes_per_clone=" << model_state_->cpu_target_vgl.owner_bytes
+              << ", owner_cap_bytes_per_clone=" << model_state_->cpu_target_vgl.owner_budget
+              << "; excludes typed G/L outputs, VALUE/ACTIVE/ECP/score/kinetic owners, model and allocator overhead"
+              << "; no aggregate feasibility claim" << std::endl;
   if (!optimized_parameter_export_.empty())
     app_log() << "    DeepQMC parameter export destination: " << optimized_parameter_export_ << std::endl;
 }
@@ -5880,6 +5979,8 @@ bool PsiFormerWF::hasPreparedBatchExecutionClone(
 void PsiFormerWF::validateBatchExecutionPlanBinding(
     const BatchExecutionParticipantPlan& participant_plan) const
 {
+  if (participant_plan && model_state_->cpu_target_vgl.targets)
+    throw std::invalid_argument("PsiFormer CPU target VGL does not support explicit batch plans");
   const bool changes_binding = !batch_execution_plan_.sameBinding(participant_plan);
   if (changes_binding && has_proposal_)
     throw std::logic_error(
@@ -6034,6 +6135,8 @@ void PsiFormerWF::bindBatchExecutionPlan(
 void PsiFormerWF::prepareBatchExecutionClone(
     const BatchExecutionParticipantPlan& participant_plan)
 {
+  if (model_state_->cpu_target_vgl.targets)
+    throw std::invalid_argument("PsiFormer CPU target VGL does not support planned clone storage");
   if (!participant_plan ||
       !batch_execution_plan_.sameBinding(participant_plan))
     throw std::logic_error(
@@ -8285,7 +8388,11 @@ testing::PsiFormerWorkspaceDiagnostics PsiFormerWF::directWorkspaceDiagnosticsFo
   if (direct_value_workspace_)
     diagnostics.value_bytes = direct_value_workspace_->vectorStorageBytes();
   if (direct_full_spatial_workspace_)
+  {
     diagnostics.full_spatial_bytes = direct_full_spatial_workspace_->vectorStorageBytes();
+    diagnostics.full_spatial_is_target = direct_full_spatial_workspace_->mode() == pf::DirectSpatialMode::TARGET_VGL;
+    diagnostics.full_spatial_fingerprint = direct_full_spatial_workspace_->storageFingerprint();
+  }
   if (direct_active_spatial_workspace_)
     diagnostics.active_spatial_bytes = direct_active_spatial_workspace_->vectorStorageBytes();
   if (direct_batch_workspace_)
@@ -10664,6 +10771,27 @@ pf::Result PsiFormerWF::evaluatePositionsUnderRead(
     return result;
   }
 
+  // Compatibility outputs are O(N) owning products, outside the numerical-owner cap.
+  if (purpose == EvaluationPurpose::FULL_SPATIAL && state.cpu_target_vgl.targets)
+  {
+    pf::Result result;
+    result.gradient.resize(3 * model.ne);
+    result.lap_log.resize(model.ne);
+    result.lap_ratio.resize(model.ne);
+    auto& workspace = requireDirectSpatialWorkspace(purpose);
+    const auto value = streamCpuTargetVGL(state.direct_spatial_executor, workspace,
+        state.cpu_target_vgl.targets, transaction.parameterVersion(), p, replaced_particle, replacement_position,
+        [&](const pf::DirectSpatialResultView& tile) {
+          std::copy(tile.gradient.begin(), tile.gradient.end(), result.gradient.begin() + 3 * tile.target_begin);
+          std::copy(tile.lap_log.begin(), tile.lap_log.end(), result.lap_log.begin() + tile.target_begin);
+          std::copy(tile.lap_ratio.begin(), tile.lap_ratio.end(), result.lap_ratio.begin() + tile.target_begin);
+        });
+    result.sign = value.sign;
+    result.logabs = value.logabs;
+    result.value = value.value;
+    return result;
+  }
+
   // Value-only calls use clone-local fixed storage. Compare mode evaluates
   // both implementations and is intended for migration/debug validation.
   std::optional<pf::DirectValueResult> direct_result;
@@ -10921,6 +11049,8 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositionsUnderRead
   if (purpose != EvaluationPurpose::FULL_SPATIAL &&
       purpose != EvaluationPurpose::ACTIVE_ELECTRON_GRADIENT)
     throw std::logic_error("PsiFormer direct spatial adapter received a non-spatial request");
+  if (purpose == EvaluationPurpose::FULL_SPATIAL && transaction.state().cpu_target_vgl.targets)
+    throw std::logic_error("PsiFormer CPU target FULL requires an output sink, not a borrowed full view");
 
   const pf::PsiFormer& model = transaction.model();
   if (static_cast<std::size_t>(p.getTotalNum()) != model.ne)
@@ -10986,8 +11116,10 @@ pf::DirectSpatialWorkspace& PsiFormerWF::requireDirectSpatialWorkspace(Evaluatio
   {
   case EvaluationPurpose::FULL_SPATIAL:
     if (!direct_full_spatial_workspace_)
-      direct_full_spatial_workspace_ = model_state_->direct_spatial_executor.makeWorkspace(
-          pf::DirectSpatialMode::FULL_VGL);
+      direct_full_spatial_workspace_ = model_state_->cpu_target_vgl.targets
+          ? model_state_->direct_spatial_executor.makeTargetWorkspace(model_state_->cpu_target_vgl.targets,
+                model_state_->cpu_target_vgl.owner_budget)
+          : model_state_->direct_spatial_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
     return *direct_full_spatial_workspace_;
   case EvaluationPurpose::ACTIVE_ELECTRON_GRADIENT:
     if (!direct_active_spatial_workspace_)
@@ -11009,6 +11141,79 @@ pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
   if (!direct_batch_workspace_)
     direct_batch_workspace_ = model_state_->direct_batch_executor.makeWorkspace();
   return *direct_batch_workspace_;
+}
+
+// Stage physical G/L in existing proposal products while keeping accepted state untouched.
+void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles)
+{
+  if (&transaction.state() != model_state_.get() || !model_state_->cpu_target_vgl.targets || has_proposal_)
+    throw std::logic_error("PsiFormer CPU target FULL requires its own model and no pending proposal");
+  auto& workspace = requireDirectSpatialWorkspace(EvaluationPurpose::FULL_SPATIAL);
+  resizeProposedSpatialStorage(model_state_->model.ne);
+  const auto value = streamCpuTargetVGL(model_state_->direct_spatial_executor, workspace,
+      model_state_->cpu_target_vgl.targets, transaction.parameterVersion(), particles, -1, nullptr,
+      [&](const pf::DirectSpatialResultView& tile) {
+        for (std::size_t t = 0; t < tile.target_count; ++t)
+        {
+          for (std::size_t d = 0; d < 3; ++d)
+            proposed_gradient_[tile.target_begin + t][d] =
+                makePhysicalGradient(transaction.state(), tile.gradient[3 * t + d], d);
+          proposed_laplacian_[tile.target_begin + t] = static_cast<ValueType>(tile.lap_log[t]);
+        }
+      });
+  proposed_sign_ = value.sign;
+  proposed_log_value_ = makePhysicalLogValue(transaction.state(), value.sign, value.logabs,
+                                           twistPhaseAngle(transaction.state(), particles));
+  proposed_configuration_identity_ = configurationIdentity(particles);
+  proposed_parameter_version_ = transaction.parameterVersion();
+}
+
+// Dry-run every caller addition and exclude aliases that could invalidate that proof.
+void PsiFormerWF::validateCpuTargetFullVGLPublication(const ParticleSet::ParticleGradient& gradients,
+    const ParticleSet::ParticleLaplacian& laplacians) const
+{
+  const std::size_t n = model_state_->model.ne;
+  if (gradients.size() != n || laplacians.size() != n || accepted_gradient_.size() != n ||
+      accepted_laplacian_.size() != n || proposed_gradient_.size() != n || proposed_laplacian_.size() != n)
+    throw std::invalid_argument("PsiFormer CPU target FULL publication has incompatible output shapes");
+  const auto g = checkedMemoryRange(gradients.data(), n, "PsiFormer target gradient range overflow");
+  const auto l = checkedMemoryRange(laplacians.data(), n, "PsiFormer target Laplacian range overflow");
+  for (const auto owned : {checkedMemoryRange(accepted_gradient_.data(), n, "PsiFormer target range overflow"),
+       checkedMemoryRange(accepted_laplacian_.data(), n, "PsiFormer target range overflow"),
+       checkedMemoryRange(proposed_gradient_.data(), n, "PsiFormer target range overflow"),
+       checkedMemoryRange(proposed_laplacian_.data(), n, "PsiFormer target range overflow")})
+    if (memoryRangesOverlap(g, owned) || memoryRangesOverlap(l, owned))
+      throw std::invalid_argument("PsiFormer CPU target FULL outputs alias retained products");
+  if (memoryRangesOverlap(g, l) || !isFiniteWavefunctionValue(proposed_log_value_))
+    throw std::invalid_argument("PsiFormer CPU target FULL outputs overlap or have a nonfinite log value");
+  for (std::size_t e = 0; e < n; ++e)
+  {
+    for (std::size_t d = 0; d < 3; ++d)
+      if (!isFiniteWavefunctionValue(ValueType(gradients[e][d] + proposed_gradient_[e][d])))
+        throw std::overflow_error("PsiFormer CPU target FULL gradient addition is nonfinite");
+    if (!isFiniteWavefunctionValue(ValueType(laplacians[e] + proposed_laplacian_[e])))
+      throw std::overflow_error("PsiFormer CPU target FULL Laplacian addition is nonfinite");
+  }
+}
+
+// Promote only completely staged and validated products; every array already has its final size.
+void PsiFormerWF::publishCpuTargetFullVGL(ParticleSet::ParticleGradient& gradients,
+    ParticleSet::ParticleLaplacian& laplacians) noexcept
+{
+  for (std::size_t e = 0; e < accepted_gradient_.size(); ++e)
+  {
+    accepted_gradient_[e] = proposed_gradient_[e];
+    accepted_laplacian_[e] = proposed_laplacian_[e];
+    gradients[e] += accepted_gradient_[e];
+    laplacians[e] += accepted_laplacian_[e];
+  }
+  current_sign_ = proposed_sign_;
+  log_value_ = proposed_log_value_;
+  accepted_configuration_identity_ = proposed_configuration_identity_;
+  accepted_parameter_version_ = proposed_parameter_version_;
+  accepted_state_requirement_ = AcceptedStateRequirement::FULL_SPATIAL;
+  accepted_value_valid_ = true;
+  clearProposalState();
 }
 
 // Fingerprint exact scalar VALUE input provenance without touching prepared scratch.
@@ -11537,6 +11742,8 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLog(const ParticleSet& p,
 {
   requireUnplannedScalarEvaluation("evaluateLog");
   requireNoSelectedParticleProposal("evaluateLog");
+  if (model_state_->cpu_target_vgl.targets && has_proposal_)
+    throw std::logic_error("PsiFormer CPU target FULL cannot overwrite a pending proposal");
   PsiFormerReadTransaction transaction(*model_state_);
   synchronizeParameterVersion(transaction.parameterVersion());
   return evaluateLogUnderRead(transaction, p, g, l);
@@ -11551,6 +11758,13 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLogUnderRead(
   if (g.size() != static_cast<std::size_t>(p.getTotalNum()) ||
       l.size() != static_cast<std::size_t>(p.getTotalNum()))
     throw std::invalid_argument("PsiFormer evaluateLog output arrays have the wrong size");
+  if (transaction.state().cpu_target_vgl.targets)
+  {
+    stageCpuTargetFullVGL(transaction, p);
+    validateCpuTargetFullVGLPublication(g, l);
+    publishCpuTargetFullVGL(g, l);
+    return log_value_;
+  }
 
   // Keep the scatter independent of result ownership.  Production direct mode
   // passes workspace-backed views; oracle and compare retain pf::Result.
@@ -11712,11 +11926,53 @@ void PsiFormerWF::mw_evaluateLog(
       auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
       wfc_list.getCastedElement<PsiFormerWF>(walker).requireNoSelectedParticleProposal(
           "mw_evaluateLog");
+      if (transaction.state().cpu_target_vgl.targets && component.has_proposal_)
+        throw std::logic_error("PsiFormer CPU target FULL cannot overwrite a pending crowd proposal");
       component.synchronizeParameterVersion(parameter_version);
       if (gradient_list[walker].get().size() != electrons ||
           laplacian_list[walker].get().size() != electrons)
         throw std::invalid_argument("PsiFormer mw_evaluateLog output arrays have the wrong size");
       component.resizeAcceptedSpatialStorage(electrons);
+    }
+
+    if (transaction.state().cpu_target_vgl.targets)
+    {
+      // The resource batch remains free of FULL tapes; every clone owns one target tape.
+      const auto owner_bytes = pf::checkedStorageProduct(wfc_list.size(),
+          transaction.state().cpu_target_vgl.owner_bytes, "PsiFormer CPU target crowd byte extent overflow");
+      if (!resource.cpu_target_vgl_reported)
+      {
+        app_log() << "    CPU target VGL crowd: live_clones=" << wfc_list.size()
+                  << ", W*target_owner_bytes=" << owner_bytes
+                  << "; owner cap is per clone, not an aggregate feasibility claim"
+                  << "; typed G/L outputs and other lazy owners are excluded" << std::endl;
+        resource.cpu_target_vgl_reported = true;
+      }
+      // Exclude shared output lanes before dry-running additive publication.
+      for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+        for (std::size_t prior = 0; prior < lane; ++prior)
+        {
+          const auto g = checkedMemoryRange(gradient_list[lane].get().data(), electrons,
+                                             "PsiFormer CPU target crowd range overflow");
+          const auto l = checkedMemoryRange(laplacian_list[lane].get().data(), electrons,
+                                             "PsiFormer CPU target crowd range overflow");
+          const auto pg = checkedMemoryRange(gradient_list[prior].get().data(), electrons,
+                                              "PsiFormer CPU target crowd range overflow");
+          const auto pl = checkedMemoryRange(laplacian_list[prior].get().data(), electrons,
+                                              "PsiFormer CPU target crowd range overflow");
+          if (memoryRangesOverlap(g, pg) || memoryRangesOverlap(g, pl) ||
+              memoryRangesOverlap(l, pg) || memoryRangesOverlap(l, pl))
+            throw std::invalid_argument("PsiFormer CPU target crowd outputs overlap between walkers");
+        }
+      for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+        wfc_list.getCastedElement<PsiFormerWF>(lane).stageCpuTargetFullVGL(transaction, p_list[lane]);
+      for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+        wfc_list.getCastedElement<PsiFormerWF>(lane).validateCpuTargetFullVGLPublication(
+            gradient_list[lane].get(), laplacian_list[lane].get());
+      for (std::size_t lane = 0; lane < wfc_list.size(); ++lane)
+        wfc_list.getCastedElement<PsiFormerWF>(lane).publishCpuTargetFullVGL(
+            gradient_list[lane].get(), laplacian_list[lane].get());
+      return;
     }
 
     // Preserve oracle and compare validation while binding the complete crowd to
@@ -12114,6 +12370,10 @@ void PsiFormerWF::mw_evaluateGL(
     bool) const
 { mw_evaluateLog(wfc_list, p_list, gradient_list, laplacian_list); }
 
+// Advertise PBYP-only CPU target inference before the driver draws selected moves.
+bool PsiFormerWF::supportsMultiParticleMoves() const noexcept
+{ return model_state_->cpu_target_vgl.targets == 0; }
+
 // Evaluate complete selected-electron proposals without modifying accepted ParticleSets.
 void PsiFormerWF::mw_evaluateMultiParticleMove(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
@@ -12123,6 +12383,8 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
     const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
 {
+  if (model_state_->cpu_target_vgl.targets)
+    throw std::logic_error("PsiFormer CPU target VGL supports PBYP inference, not selected-electron proposals");
   const std::size_t walker_count = wfc_list.size();
   if (!batch_execution_plan_)
   {
@@ -12941,6 +13203,8 @@ void PsiFormerWF::mw_accept_rejectMultiParticleMove(
     const MCMultiParticleMoves<CoordsType::POS>& moves,
     const std::vector<bool>& accepted) const
 {
+  if (model_state_->cpu_target_vgl.targets)
+    throw std::logic_error("PsiFormer CPU target VGL does not support selected-electron resolution");
   const std::size_t walker_count = wfc_list.size();
   if (!batch_execution_plan_)
   {

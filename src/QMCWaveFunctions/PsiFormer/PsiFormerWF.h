@@ -111,6 +111,8 @@ struct PsiFormerWorkspaceDiagnostics
   bool owns_score_workspace          = false;
   bool owns_kinetic_workspace        = false;
   bool has_prepared_clone_plan       = false;
+  bool full_spatial_is_target        = false;
+  std::size_t full_spatial_fingerprint = 0;
 
   std::size_t value_bytes                       = 0;
   std::size_t full_spatial_bytes                = 0;
@@ -476,8 +478,8 @@ public:
                      const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list,
                      bool from_scratch) const override;
 
-  /// PsiFormer can evaluate one atomic selected-electron proposal per walker.
-  bool supportsMultiParticleMoves() const noexcept override { return true; }
+  /// Selected-electron proposals are unavailable with CPU target PBYP inference.
+  bool supportsMultiParticleMoves() const noexcept override;
 
   /// Evaluate complete proposed VGL state from descriptor-owned absolute positions.
   void mw_evaluateMultiParticleMove(
@@ -1079,6 +1081,17 @@ private:
       EvaluationPurpose purpose,
       int active_gradient_particle);
 
+  /// Stage a complete target FULL product without publishing accepted state.
+  void stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles);
+
+  /// Prove all additive outputs are finite before a scalar or crowd publication.
+  void validateCpuTargetFullVGLPublication(const ParticleSet::ParticleGradient& gradients,
+                                         const ParticleSet::ParticleLaplacian& laplacians) const;
+
+  /// Publish previously validated target products with no allocation or failure.
+  void publishCpuTargetFullVGL(ParticleSet::ParticleGradient& gradients,
+                              ParticleSet::ParticleLaplacian& laplacians) noexcept;
+
   /// Validate one homogeneous clone crowd and return its exclusively acquired resource.
   PsiFormerMultiWalkerResource& requireMultiWalkerResource(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const;
@@ -1477,7 +1490,7 @@ private:
   std::unique_ptr<pf::DirectKineticWorkspace> direct_kinetic_workspace_;
   /// Lazily sized complete TrialWaveFunction drift used only by scalar calls.
   std::vector<double> direct_total_log_gradient_;
-  /// Lazily present full-gradient and trace-Laplacian storage owned by this clone.
+  /// Exclusive FULL or bounded TARGET storage selected once for this clone family.
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_full_spatial_workspace_;
   /// Lazily present first-order-only storage reused for active-electron gradients.
   std::unique_ptr<pf::DirectSpatialWorkspace> direct_active_spatial_workspace_;

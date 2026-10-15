@@ -19,6 +19,7 @@
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
@@ -215,6 +216,11 @@ public:
   {
     return component.directWorkspaceDiagnosticsForTesting();
   }
+
+  /// Inspect the existing acquired crowd owner without exposing its implementation.
+  static PsiFormerCrowdWorkspaceDiagnostics crowdWorkspaceDiagnostics(
+      const PsiFormerWF& component, const RefVectorWithLeader<WaveFunctionComponent>& components)
+  { return component.crowdWorkspaceDiagnosticsForTesting(components); }
 
   static std::array<std::size_t, 2> directKineticWorkspaceOwnership(
       const PsiFormerWF& leader,
@@ -987,7 +993,7 @@ public:
   {
     if (const char* previous = std::getenv(name_.c_str()))
       previous_ = previous;
-    if (setenv(name_.c_str(), value, 1) != 0)
+    if ((value ? setenv(name_.c_str(), value, 1) : unsetenv(name_.c_str())) != 0)
       throw std::runtime_error(
           "Unable to set PsiFormer test environment variable");
   }
@@ -2882,6 +2888,239 @@ TEST_CASE("PsiFormer clone-local evaluator workspaces are allocated on demand",
     check_empty(crowd_component0);
     check_empty(crowd_component1);
   }
+}
+
+TEST_CASE("PsiFormer CPU target FULL scalar products preserve inference lifecycle",
+          "[wavefunction][psiformer][cpu_target_binding]")
+{
+  ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
+  bool periodic = false;
+  SECTION("open PBYP") {}
+  SECTION("skew periodic and fixed phase when complex") { periodic = true; }
+  Lattice lattice;
+  if (periodic)
+  {
+    lattice.R = {8.0, 0.0, 0.0, 0.6, 7.4, 0.0, -0.3, 0.5, 8.5};
+    lattice.BoxBConds = {true, true, true};
+    lattice.reset();
+  }
+  const SimulationCell simulation_cell(lattice);
+  auto files = generateFiles("lih", 4, periodic ? 7 : 4);
+  auto electrons = makeLiHElectrons(simulation_cell);
+  auto reference_electrons = makeLiHElectrons(simulation_cell);
+  auto ions = makeLiHIons(simulation_cell);
+  std::array<double, 3> twist{};
+#ifdef QMC_COMPLEX
+  if (periodic)
+    twist = {{0.17, -0.11, 0.07}};
+#endif
+  PsiFormerWF reference("pf_cpu_full_reference", files.parameters.string(), files.configuration.string(),
+      reference_electrons, *ions, false, {}, false, {}, twist);
+  reference_electrons.G = ValueType(0);
+  reference_electrons.L = ValueType(0);
+  const auto expected_log = reference.evaluateLog(reference_electrons, reference_electrons.G, reference_electrons.L);
+  ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "3");
+  ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
+  PsiFormerWF target("pf_cpu_target", files.parameters.string(), files.configuration.string(),
+      electrons, *ions, false, {}, false, {}, twist);
+  CHECK_FALSE(target.supportsMultiParticleMoves());
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(target).ownedWorkspaceCount() == 0);
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  CHECK(std::abs(target.evaluateLog(electrons, electrons.G, electrons.L) - expected_log) < 2e-11);
+  const auto check_products = [&]() {
+    for (int e = 0; e < electrons.getTotalNum(); ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        CHECK(std::abs(electrons.G[e][d] - reference_electrons.G[e][d]) < 2e-10);
+      CHECK(std::abs(electrons.L[e] - reference_electrons.L[e]) < 2e-10);
+    }
+  };
+  check_products();
+  const auto warm = testing::TestPsiFormerWF::directWorkspaceDiagnostics(target);
+  CHECK(warm.full_spatial_is_target);
+  CHECK(warm.full_spatial_bytes < testing::TestPsiFormerWF::directWorkspaceDiagnostics(reference).full_spatial_bytes);
+  auto clone_electrons = makeLiHElectrons(simulation_cell);
+  auto clone = target.makeClone(clone_electrons);
+  auto& typed_clone = dynamic_cast<PsiFormerWF&>(*clone);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(typed_clone).ownedWorkspaceCount() == 0);
+  CHECK_FALSE(typed_clone.supportsMultiParticleMoves());
+  clone_electrons.G = ValueType(0);
+  clone_electrons.L = ValueType(0);
+  CHECK(std::abs(clone->evaluateLog(clone_electrons, clone_electrons.G, clone_electrons.L) - expected_log) < 2e-11);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(typed_clone).full_spatial_fingerprint !=
+        warm.full_spatial_fingerprint);
+
+  const auto active = target.evalGrad(electrons, 0);
+  const auto expected_active = reference.evalGrad(reference_electrons, 0);
+  for (int d = 0; d < 3; ++d)
+    CHECK(std::abs(active[d] - expected_active[d]) < 2e-11);
+  electrons.makeMove(0, ParticleSet::SingleParticlePos{0.01, -0.02, 0.015});
+  reference_electrons.makeMove(0, ParticleSet::SingleParticlePos{0.01, -0.02, 0.015});
+  CHECK(std::abs(target.ratio(electrons, 0) - reference.ratio(reference_electrons, 0)) < 2e-11);
+  const auto pending = testing::TestPsiFormerWF::scalarStateSnapshot(target);
+  CHECK_THROWS_AS(target.evaluateLog(electrons, electrons.G, electrons.L), std::logic_error);
+  CHECK(testing::TestPsiFormerWF::scalarStateMatches(target, pending));
+  target.restore(0);
+  reference.restore(0);
+  electrons.rejectMove(0);
+  reference_electrons.rejectMove(0);
+
+  PsiFormerWF::WFBufferType buffer;
+  target.registerData(electrons, buffer);
+  buffer.allocate();
+  buffer.zero();
+  buffer.rewind();
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  target.updateBuffer(electrons, buffer, true);
+  const auto cached = testing::TestPsiFormerWF::scalarStateSnapshot(target);
+  testing::TestPsiFormerWF::poisonAcceptedStateForRestore(target);
+  buffer.rewind();
+  target.copyFromBuffer(electrons, buffer);
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(target, cached));
+  const auto next_version = testing::TestPsiFormerWF::advanceParameterVersion(target);
+  electrons.G = ValueType(0);
+  electrons.L = ValueType(0);
+  target.evaluateLog(electrons, electrons.G, electrons.L);
+  CHECK(testing::TestPsiFormerWF::scalarStateSnapshot(target).accepted_parameter_version == next_version);
+  check_products();
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(target).full_spatial_fingerprint == warm.full_spatial_fingerprint);
+
+  const auto stable = testing::TestPsiFormerWF::scalarStateSnapshot(target);
+  electrons.L[3] = ValueType(std::numeric_limits<double>::infinity());
+  CHECK_THROWS_AS(target.evaluateLog(electrons, electrons.G, electrons.L), std::overflow_error);
+  CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(target, stable));
+  CHECK(testing::TestPsiFormerWF::scalarStateSnapshot(target).log_value == stable.log_value);
+  CHECK(sameScalarBits(electrons.L[3], ValueType(std::numeric_limits<double>::infinity())));
+}
+
+TEST_CASE("PsiFormer CPU target FULL crowd publication is atomic",
+          "[wavefunction][psiformer][cpu_target_binding]")
+{
+  ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
+  auto files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  auto p0 = makeLiHElectrons(simulation_cell);
+  auto p1 = makeLiHElectrons(simulation_cell);
+  p1.R[0][0] += 0.013;
+  p1.update();
+  PsiFormerWF reference("pf_cpu_target_reference", files.parameters.string(), files.configuration.string());
+  std::array<ParticleSet::ParticleGradient, 2> expected_g{
+      ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> expected_l{
+      ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  for (int w = 0; w < 2; ++w)
+  {
+    expected_g[w] = ValueType(0);
+    expected_l[w] = ValueType(0);
+    reference.evaluateLog(w == 0 ? p0 : p1, expected_g[w], expected_l[w]);
+  }
+  ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "3");
+  ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", "1000000000");
+  PsiFormerWF leader("pf_cpu_target_crowd", files.parameters.string(), files.configuration.string());
+  auto clone = leader.makeClone(p1);
+  auto& follower = dynamic_cast<PsiFormerWF&>(*clone);
+  RefVectorWithLeader<WaveFunctionComponent> components(leader, {leader, follower});
+  RefVectorWithLeader<ParticleSet> particles(p0, {p0, p1});
+  std::array<ParticleSet::ParticleGradient, 2> g{ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+  std::array<ParticleSet::ParticleLaplacian, 2> l{ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+  RefVector<ParticleSet::ParticleGradient> gradients{g[0], g[1]};
+  RefVector<ParticleSet::ParticleLaplacian> laplacians{l[0], l[1]};
+  ResourceCollection resource_template("cpu_target_crowd");
+  leader.createResource(resource_template);
+  ResourceCollection resource(resource_template);
+  ResourceCollectionTeamLock<WaveFunctionComponent> lock(resource, components);
+  for (int w = 0; w < 2; ++w) { g[w] = ValueType(0); l[w] = ValueType(0); }
+  CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).batch_bytes == 0);
+  leader.mw_evaluateLog(components, particles, gradients, laplacians);
+  const auto check_products = [&]() {
+    for (int w = 0; w < 2; ++w)
+      for (int e = 0; e < 4; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          CHECK(std::abs(g[w][e][d] - expected_g[w][e][d]) < 2e-11);
+        CHECK(std::abs(l[w][e] - expected_l[w][e]) < 2e-11);
+      }
+  };
+  check_products();
+  const auto s0 = testing::TestPsiFormerWF::scalarStateSnapshot(leader);
+  const auto s1 = testing::TestPsiFormerWF::scalarStateSnapshot(follower);
+  const auto d0 = testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader);
+  const auto d1 = testing::TestPsiFormerWF::directWorkspaceDiagnostics(follower);
+  const auto check_accepted = [&]() {
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(leader, s0));
+    CHECK(testing::TestPsiFormerWF::acceptedSpatialStateMatches(follower, s1));
+    CHECK(testing::TestPsiFormerWF::scalarStateSnapshot(leader).log_value == s0.log_value);
+    CHECK(testing::TestPsiFormerWF::scalarStateSnapshot(follower).log_value == s1.log_value);
+  };
+  const auto position = p1.R[3];
+  p1.R[3] = p1.R[2]; // The second walker fails after the first one has staged all tiles.
+  CHECK_THROWS(leader.mw_evaluateLog(components, particles, gradients, laplacians));
+  check_accepted();
+  check_products();
+  p1.R[3] = position;
+  l[1][3] = ValueType(std::numeric_limits<double>::infinity());
+  CHECK_THROWS_AS(leader.mw_evaluateLog(components, particles, gradients, laplacians), std::overflow_error);
+  check_accepted();
+  CHECK(sameScalarBits(l[1][3], ValueType(std::numeric_limits<double>::infinity())));
+  for (int w = 0; w < 2; ++w) { g[w] = ValueType(0); l[w] = ValueType(0); }
+  leader.mw_evaluateLog(components, particles, gradients, laplacians);
+  check_products();
+  CHECK(testing::TestPsiFormerWF::crowdWorkspaceDiagnostics(leader, components).batch_bytes == 0);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(leader).full_spatial_fingerprint == d0.full_spatial_fingerprint);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(follower).full_spatial_fingerprint == d1.full_spatial_fingerprint);
+}
+
+TEST_CASE("PsiFormer CPU target profile rejects unadmitted configurations before owner allocation",
+          "[wavefunction][psiformer][cpu_target_binding]")
+{
+  ScopedEnvironmentVariable clear_targets("PSIFORMER_CPU_VGL_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", nullptr);
+  auto files = generateFiles("lih");
+  const auto make_component = [&]() {
+    return std::make_unique<PsiFormerWF>("pf_cpu_target_admission", files.parameters.string(), files.configuration.string());
+  };
+  {
+    ScopedEnvironmentVariable partial("PSIFORMER_CPU_VGL_TARGETS", "3");
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  const std::size_t owner_bytes = pf::targetSpatialWorkspaceStorageRequirement({4, 2, 16, 256, 4, 9, 0, 0}, 3);
+  const std::string exact_bytes = std::to_string(owner_bytes);
+  ScopedEnvironmentVariable budget("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", exact_bytes.c_str());
+  CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  for (const char* invalid : {"", "0", "-1", "bad", "5", "999999999999999999999999999"})
+  {
+    ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", invalid);
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  ScopedEnvironmentVariable targets("PSIFORMER_CPU_VGL_TARGETS", "3");
+  auto exact = make_component(); // Independent checked estimator admits the fixture's exact payload.
+  const SimulationCell simulation_cell;
+  auto particles = makeLiHElectrons(simulation_cell);
+  particles.G = ValueType(0);
+  particles.L = ValueType(0);
+  exact->evaluateLog(particles, particles.G, particles.L);
+  CHECK(testing::TestPsiFormerWF::directWorkspaceDiagnostics(*exact).full_spatial_bytes == owner_bytes);
+  {
+    const std::string insufficient_bytes = std::to_string(owner_bytes - 1);
+    ScopedEnvironmentVariable insufficient("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", insufficient_bytes.c_str());
+    CHECK_THROWS_AS(make_component(), std::length_error);
+  }
+  for (const auto& invalid : {std::string("0"), std::to_string(std::numeric_limits<std::size_t>::max())})
+  {
+    ScopedEnvironmentVariable cap("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE", invalid.c_str());
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  CHECK_THROWS_AS(PsiFormerWF("pf_cpu_target_optimization", files.parameters.string(), files.configuration.string(),
+                            true, {0}), std::invalid_argument);
+  BatchExecutionRequirements requirements;
+  exact->contributeBatchExecutionRequirements(requirements);
+  const auto plan = makeClonePreparationTestPlan(*exact, requirements, "cpu-target", "cpu-target-hard-plan");
+  const auto participant = makeBatchExecutionParticipantPlan(plan, "cpu-target");
+  CHECK_THROWS_AS(exact->validateBatchExecutionPlanBinding(participant), std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
