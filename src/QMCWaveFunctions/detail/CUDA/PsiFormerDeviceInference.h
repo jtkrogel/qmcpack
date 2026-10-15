@@ -125,6 +125,30 @@ inline TargetVglCost estimateTargetVglCost(const PsiFormerExecutionPlan& plan, s
   return cost;
 }
 
+/** Retained target tapes add two orbital factors and each layer's lifted tape.
+ * This private-owner estimate does not relax the public non-retained VGL contract.
+ */
+inline TargetVglCost estimateRetainedTargetForwardCost(const PsiFormerExecutionPlan& plan,
+                                                       std::size_t targets)
+{
+  auto cost = estimateTargetVglCost(plan, 1, targets);
+  const auto& shape = plan.modelShape();
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Retained target forward extent overflow");
+  };
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Retained target forward storage overflow");
+  };
+  const auto ne = shape.electrons(), planes = add(1, mul(4, targets));
+  const auto features = mul(planes, mul(ne, shape.feature_dimension));
+  const auto attention = mul(planes, mul(shape.attention_heads, mul(ne, ne)));
+  const auto orbitals = mul(planes, mul(shape.determinants, mul(ne, ne)));
+  const auto retained = add(mul(2, orbitals),
+      mul(shape.attention_blocks, add(mul(10, features), mul(2, attention))));
+  cost.device_workspace_bytes = add(cost.device_workspace_bytes, checkedDeviceBytes<double>(retained));
+  return cost;
+}
+
 /** Conservative cross-tile base admission, not a reference accuracy tolerance.
  * A different sign, severe sum cancellation or a nonmatching rounded base cannot
  * be assembled into one physical root; callers may retry an admitted full graph.
@@ -487,9 +511,25 @@ public:
                           bool retain_spatial_tape = false,
                           InferenceStatusPolicy status_policy = configuredInferenceStatusPolicy(),
                           TargetVglPreparation target_preparation = {})
+      : PreparedDeviceInference(std::move(model), batch_size, queue, blas, mode,
+          retain_score_tape, retain_spatial_tape, status_policy, target_preparation, false)
+  {}
+
+private:
+  friend class PreparedDeviceTargetKinetic;
+  friend class PreparedDeviceKineticReverse;
+
+  /// Only the target kinetic owner may prepare partial retained spatial tapes.
+  PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
+                          std::size_t batch_size,
+                          compute::Queue<PlatformKind::CUDA>& queue,
+                          AcceleratorBlasHandle& blas,
+                          SpatialJetMode mode, bool retain_score_tape, bool retain_spatial_tape,
+                          InferenceStatusPolicy status_policy,
+                          TargetVglPreparation target_preparation, bool retained_targets)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
-        target_preparation_(target_preparation)
+        target_preparation_(target_preparation), retained_targets_(retained_targets)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -515,11 +555,16 @@ public:
     }
     else
     {
-      if (mode_ != SpatialJetMode::FULL_VGL || retain_score_tape || retain_spatial_tape)
+      if (mode_ != SpatialJetMode::FULL_VGL || retain_score_tape ||
+          (retain_spatial_tape && !retained_targets_))
         throw std::invalid_argument("Target VGL requires an FP64 non-retained full-VGL graph");
       if (target_preparation_.device_workspace_budget_bytes == 0 || target_preparation_.scalar_work_budget == 0)
         throw std::invalid_argument("Target VGL requires positive workspace and whole-request work budgets");
-      target_cost_ = estimateTargetVglCost(plan_, batch_capacity_, target_preparation_.max_targets);
+      if (retained_targets_ && (batch_capacity_ != 1 || !retain_spatial_tape))
+        throw std::invalid_argument("Retained targets require one configuration and spatial tapes");
+      target_cost_ = retained_targets_
+          ? estimateRetainedTargetForwardCost(plan_, target_preparation_.max_targets)
+          : estimateTargetVglCost(plan_, batch_capacity_, target_preparation_.max_targets);
       if (target_cost_.device_workspace_bytes > target_preparation_.device_workspace_budget_bytes ||
           target_cost_.charged_scalar_work_units > target_preparation_.scalar_work_budget)
         throw std::length_error("Target VGL preparation exceeds its explicit workspace or scalar-work budget");
@@ -605,8 +650,8 @@ public:
       host_combinations_.resize(batch_);
       // Keep the pre-allocation accounting an executable invariant. Model image
       // and vendor storage are deliberately not charged to this owned workspace.
-      if (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
-          hostWorkspaceBytes() != target_cost_.host_workspace_bytes)
+      if (!retained_targets_ && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
+          hostWorkspaceBytes() != target_cost_.host_workspace_bytes))
         throw std::logic_error("Target VGL prepared storage disagrees with pre-allocation accounting");
     }
     if (retain_score_tape || retain_spatial_tape)
@@ -616,11 +661,17 @@ public:
       for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
         value_tape_.push_back(std::make_unique<RetainedBlockTape>(feature_elements, weights_.capacity(), retain_spatial_tape));
     }
+    if (retained_targets_ && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
+        hostWorkspaceBytes() != target_cost_.host_workspace_bytes))
+      throw std::logic_error("Retained target forward storage disagrees with pre-allocation accounting");
   }
 
+public:
   /// Submit feature layers, remaining network layers, orbital/determinant and cusp VGL.
   void evaluate(const std::vector<double>& positions)
   {
+    if (retained_targets_)
+      throw std::logic_error("Retained target graphs require their private immediate reverse consumer");
     // A failed replacement must never leave the preceding tape visible as current.
     value_tape_valid_ = false;
     result_valid_ = false;
@@ -661,6 +712,65 @@ public:
   }
 
 private:
+  /** A borrow valid only during the current tile's immediate reverse callback. */
+  struct SpatialTargetTapeView
+  {
+    const PreparedDeviceInference* owner;
+    const PreparedDeviceModel* image;
+    std::size_t generation;
+    std::size_t ordinal;
+    SpatialHeadTape head;
+  };
+
+  /// Reject saved views after another tile, request, failure or model rebind.
+  void validateTargetTape(const SpatialTargetTapeView& view) const
+  {
+    if (!retained_targets_ || !target_tape_valid_ || view.owner != this || view.image != model_.get() ||
+        view.generation != evaluation_generation_ || view.ordinal != admitted_target_tiles_ ||
+        view.head.root_layout.target_electron_begin != final_.output.target_electron_begin ||
+        view.head.root_layout.laplacian_lanes != final_.output.laplacian_lanes)
+      throw std::logic_error("Retained target tape view is stale or belongs to another request");
+  }
+
+  /// Upload once and consume each retained tile before reusing its max-K storage.
+  template<class Consumer>
+  void evaluateRetainedTargets(const std::vector<double>& positions, Consumer&& consume)
+  {
+    value_tape_valid_ = result_valid_ = target_tape_valid_ = false;
+    admitted_target_tiles_ = 0;
+    if (!retained_targets_ || positions.size() != product(3, ne_))
+      throw std::invalid_argument("Retained target request requires one complete physical configuration");
+    if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Retained target evaluation generation exhausted");
+    ++evaluation_generation_;
+    model_->validateCurrentDevice();
+    positions_.upload(positions.data(), positions.size());
+    try
+    {
+      for (std::size_t begin = 0; begin < ne_;)
+      {
+        const auto count = std::min(target_preparation_.max_targets, ne_ - begin);
+        setTargetRange(begin, count);
+        evaluatePreparedTile();
+        admitTileBase(begin == 0);
+        const SpatialHeadTape head{orbitals_, cusp_, final_.output, positions_.data(), raw_.data(), a_.data(),
+            orbital_jets_.data(), retained_backflow_.data(), retained_envelope_.data(),
+            det_gradient_.data(), det_lap_log_.data(), cusp_jets_.data(), output_.data(), inverse_.data(),
+            normalized_.data(), factors_.data(), combinations_.data()};
+        target_tape_valid_ = true;
+        consume(SpatialTargetTapeView{this, model_.get(), evaluation_generation_, admitted_target_tiles_, head});
+        target_tape_valid_ = false;
+        ++admitted_target_tiles_;
+        begin += count;
+      }
+    }
+    catch (...)
+    {
+      target_tape_valid_ = false;
+      throw;
+    }
+  }
+
   /// Execute one admitted shape against the geometry uploaded by the logical request.
   void evaluatePreparedTile()
   {
@@ -903,6 +1013,7 @@ public:
     model_ = std::move(successor);
     value_tape_valid_ = false;
     result_valid_ = false;
+    target_tape_valid_ = false;
   }
 
   /// Return prepared capacity independently of the most recent logical batch.
@@ -922,7 +1033,7 @@ public:
   /// Expose full-spatial block planes without allowing ordinary score interpretation.
   const RetainedBlockTape& spatialBlockTape(std::size_t layer) const
   {
-    if (!value_tape_valid_ || mode_ != SpatialJetMode::FULL_VGL)
+    if (retained_targets_ || !value_tape_valid_ || mode_ != SpatialJetMode::FULL_VGL)
       throw std::logic_error("Device spatial tape is not available for a completed full-VGL evaluation");
     return *value_tape_.at(layer);
   }
@@ -1315,6 +1426,8 @@ private:
   AcceleratorBlasHandle& blas_;
   const SpatialJetMode mode_;
   const TargetVglPreparation target_preparation_;
+  const bool retained_targets_;
+  bool target_tape_valid_ = false;
   TargetVglCost target_cost_;
   std::size_t admitted_target_tiles_ = 0;
   OpenFeatureJetLayout features_;

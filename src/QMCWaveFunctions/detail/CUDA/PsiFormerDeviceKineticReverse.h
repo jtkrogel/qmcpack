@@ -24,6 +24,50 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/// Exact persistent scratch/response bytes for one compact retained reverse.
+struct TargetKineticReverseCost
+{
+  std::size_t device_workspace_bytes = 0;
+  std::size_t host_workspace_bytes = 0;
+};
+
+/// Count the one-configuration max-K reverse before reserving any of its buffers.
+inline TargetKineticReverseCost estimateTargetKineticReverseCost(const PsiFormerExecutionPlan& plan,
+                                                                 std::size_t targets)
+{
+  const auto& shape = plan.modelShape();
+  const auto ne = shape.electrons(), width = shape.feature_dimension, parameters = plan.parameterCount();
+  if (targets == 0 || targets > ne)
+    throw std::invalid_argument("Target kinetic reverse capacity is outside physical Ne");
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Target kinetic reverse extent overflow");
+  };
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Target kinetic reverse storage overflow");
+  };
+  const auto planes = add(1, mul(4, targets));
+  const auto features = mul(planes, mul(ne, width));
+  const auto attention = mul(planes, mul(shape.attention_heads, mul(ne, ne)));
+  const auto orbitals = mul(planes, mul(shape.determinants, mul(ne, ne)));
+  std::size_t doubles = 0;
+  for (auto count : {mul(9, features), mul(2, attention), mul(4, orbitals), mul(3, mul(ne, ne)),
+       planes, parameters, width, std::size_t(1), ne, mul(3, ne)})
+    doubles = add(doubles, count);
+  const auto finite_blocks = parameters / 4096 + (parameters % 4096 != 0);
+  TargetKineticReverseCost cost;
+  cost.device_workspace_bytes = checkedDeviceBytes<double>(doubles);
+  for (auto bytes : {checkedDeviceBytes<device_determinant::DerivativeStatus>(2),
+       checkedDeviceBytes<OpenSpatialStatus>(1), checkedDeviceBytes<OpenKineticReverseStatus>(1),
+       checkedDeviceBytes<DerivativeFiniteStatus>(finite_blocks)})
+    cost.device_workspace_bytes = add(cost.device_workspace_bytes, bytes);
+  for (auto bytes : {checkedDeviceBytes<device_determinant::DerivativeStatus>(1),
+       checkedDeviceBytes<OpenSpatialStatus>(1),
+       checkedDeviceBytes<device_determinant::FactorizationMetadata>(shape.determinants),
+       checkedDeviceBytes<DerivativeFiniteStatus>(finite_blocks)})
+    cost.host_workspace_bytes = add(cost.host_workspace_bytes, bytes);
+  return cost;
+}
+
 /** Own one lifted reverse workspace, independent of walker-by-parameter matrices. */
 class PreparedDeviceKineticReverse
 {
@@ -33,6 +77,17 @@ public:
                                std::size_t capacity,
                                compute::Queue<PlatformKind::CUDA>& queue,
                                AcceleratorBlasHandle& blas)
+      : PreparedDeviceKineticReverse(std::move(model), capacity, queue, blas, 0)
+  {}
+
+private:
+  friend class PreparedDeviceTargetKinetic;
+
+  /// A separate named owner selects max-K before any reverse reserve.
+  PreparedDeviceKineticReverse(std::shared_ptr<const PreparedDeviceModel> model,
+                               std::size_t capacity,
+                               compute::Queue<PlatformKind::CUDA>& queue,
+                               AcceleratorBlasHandle& blas, std::size_t max_targets)
       : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas)
   {
     if (!model_ || capacity_ == 0)
@@ -48,6 +103,8 @@ public:
                                         shape.spin_up_electrons, SpatialJetMode::FULL_VGL);
     cusp_ = makeOpenCuspJetLayout(1, ne, shape.spin_up_electrons, SpatialJetMode::FULL_VGL);
     root_ = makeFinalSpatialJetLayout(1, ne, SpatialJetMode::FULL_VGL).output;
+    if (max_targets)
+      setTargetRange(0, max_targets);
     const auto features = spatialJetSpanElements(dense_.source);
     for (auto* buffer : {&feature_, &residual_, &pre_, &hidden_, &input_, &context_, &query_, &key_, &value_})
       buffer->reserve(features);
@@ -76,6 +133,7 @@ public:
     host_finite_status_.resize(finite_layout_.status_capacity);
   }
 
+public:
   /** Contract fixed-coordinate kinetic responses with finite signed sample weights.
    * Empty masses mean unit inverse masses; empty total drift uses this component.
    * Nonempty total drift must contain all configurations' complete 3N lanes.
@@ -87,12 +145,25 @@ public:
                          const std::vector<double>& total_gradient = {}, bool gradient_only = false)
   {
     ready_ = false;
-    model_->validateCurrentDevice();
     const auto head = forward.spatialHeadTape();
     const auto count = head.orbital_layout.features.configuration_count;
+    if (forward.modelImage().get() != model_.get())
+      throw std::invalid_argument("Kinetic reverse model image differs from its forward tape");
+    beginRequest(weights, inverse_masses, total_gradient, gradient_only, count);
+    accumulateHead(forward, head);
+    return finishRequest();
+  }
+
+private:
+  /// Upload complete physical coefficients and zero the canonical P sum once.
+  void beginRequest(const std::vector<double>& weights, const std::vector<double>& inverse_masses,
+                    const std::vector<double>& total_gradient, bool gradient_only, std::size_t count)
+  {
+    ready_ = false;
+    model_->validateCurrentDevice();
     const auto& shape = model_->plan().modelShape();
-    const auto ne = shape.electrons(), width = shape.feature_dimension;
-    if (forward.modelImage().get() != model_.get() || count > capacity_ || weights.size() != count ||
+    const auto ne = shape.electrons();
+    if (count == 0 || count > capacity_ || weights.size() != count ||
         (!inverse_masses.empty() && inverse_masses.size() != ne) ||
         (!total_gradient.empty() && total_gradient.size() != count * 3 * ne) ||
         (gradient_only && total_gradient.empty()))
@@ -104,16 +175,37 @@ public:
     for (double mass : inverse_masses)
       if (mass <= 0)
         throw std::invalid_argument("Kinetic reverse inverse masses must be positive");
-    forward.downloadSpatialFactorizations(host_factors_);
-    for (std::size_t channel = 0; channel < count * shape.determinants; ++channel)
-      if (!host_factors_[channel].inverse_available)
-        throw std::runtime_error("Kinetic reverse requires regular determinant channels; cofactor fallback unavailable");
     weights_.upload(weights.data(), count);
     if (!inverse_masses.empty())
       masses_.upload(inverse_masses.data(), ne);
     if (!total_gradient.empty())
       total_gradient_.upload(total_gradient.data(), total_gradient.size());
     zero(response_);
+    use_masses_ = !inverse_masses.empty();
+    use_drift_ = !total_gradient.empty();
+    gradient_only_ = gradient_only;
+  }
+
+  /// Consume a checked short-lived retained target view without publishing P.
+  void accumulateTarget(const PreparedDeviceInference::SpatialTargetTapeView& view)
+  {
+    view.owner->validateTargetTape(view);
+    if (view.image != model_.get())
+      throw std::invalid_argument("Kinetic target reverse model image differs");
+    setTargetRange(view.head.root_layout.target_electron_begin, view.head.root_layout.laplacian_lanes);
+    accumulateHead(*view.owner, view.head);
+  }
+
+  /// Reverse one completed full tape or one immediately borrowed target tile.
+  void accumulateHead(const PreparedDeviceInference& forward, const PreparedDeviceInference::SpatialHeadTape& head)
+  {
+    const auto& shape = model_->plan().modelShape();
+    const auto ne = shape.electrons(), width = shape.feature_dimension;
+    const auto count = head.orbital_layout.features.configuration_count;
+    forward.factors_.download(host_factors_.data(), count * shape.determinants);
+    for (std::size_t channel = 0; channel < count * shape.determinants; ++channel)
+      if (!host_factors_[channel].inverse_available)
+        throw std::runtime_error("Kinetic reverse requires regular determinant channels; cofactor fallback unavailable");
     const auto stream = queue_.getNative();
     const LiftedDeterminantLayout determinant{orbitals_.orbitals, root_, shape.determinants, ne};
 
@@ -125,16 +217,16 @@ public:
       const auto feature_offset = configuration * head.orbital_layout.features.configuration_stride;
       const auto root_offset = configuration * head.root_layout.configuration_stride;
       checkRuntime(launchKineticRootAdjoints(stream, root_, head.root + root_offset, weights_.data() + configuration,
-          inverse_masses.empty() ? nullptr : masses_.data(),
-          total_gradient.empty() ? nullptr : total_gradient_.data() + configuration * 3 * ne,
-          total_gradient.empty() ? 0 : 3 * ne, root_adjoint_.data(), open_status_.data(), gradient_only), "kinetic root adjoint");
+          use_masses_ ? masses_.data() : nullptr,
+          use_drift_ ? total_gradient_.data() + configuration * 3 * ne : nullptr,
+          use_drift_ ? 3 * ne : 0, root_adjoint_.data(), open_status_.data(), gradient_only_), "kinetic root adjoint");
       checkOpen();
       checkRuntime(launchDeterminantFactorJets(stream, determinant,
           head.factorizations + configuration * shape.determinants, head.combinations + configuration,
           head.normalized_weights + configuration * shape.determinants,
           head.inverses + configuration * shape.determinants * ne * ne, head.orbitals + orbital_offset,
-          head.determinant_log_gradient + configuration * 3 * ne,
-          head.determinant_log_laplacian + configuration * ne, factor_.data(), matrix_scratch_.data(),
+          head.determinant_log_gradient + configuration * root_.gradient_lanes,
+          head.determinant_log_laplacian + configuration * root_.laplacian_lanes, factor_.data(), matrix_scratch_.data(),
           determinant_status_.data()), "kinetic determinant factor jets");
       checkDeterminant(determinant_status_);
       checkRuntime(launchDeterminantJetReverse(stream, determinant, determinant_status_.data(), factor_.data(),
@@ -170,7 +262,7 @@ public:
       // Remaining neural layers reverse all value/gradient/Laplacian cotangents.
       for (std::size_t layer = shape.attention_blocks; layer-- > 0;)
       {
-        const auto& tape = forward.spatialBlockTape(layer);
+        const auto& tape = *forward.value_tape_.at(layer);
         const auto attention_offset = configuration * attention_.attention.configuration_stride;
         const auto at = [&](const DeviceBuffer<double>& buffer) { return buffer.data() + feature_offset; };
         copy(feature_, residual_);
@@ -218,7 +310,12 @@ public:
           head.raw_features + configuration * embedding_layout.source.configuration_stride, feature_.data(),
           response_.data() + embedding.begin);
     }
-    checkRuntime(launchDerivativeFiniteScan(stream, finite_layout_, response_.data(), finite_status_.data()), "kinetic finite scan");
+  }
+
+  /// Admit the final complete P sum only after all target tiles have succeeded.
+  const double* finishRequest()
+  {
+    checkRuntime(launchDerivativeFiniteScan(queue_.getNative(), finite_layout_, response_.data(), finite_status_.data()), "kinetic finite scan");
     queue_.sync();
     finite_status_.download(host_finite_status_.data(), host_finite_status_.size());
     for (const auto& status : host_finite_status_)
@@ -228,6 +325,7 @@ public:
     return response_.data();
   }
 
+public:
   /** Contract -sum_e m_e^-1 drift_e dot d_theta grad_e log|Psi|.
    * The explicit drift can be the imaginary total TrialWaveFunction drift.
    * This reuses the same lifted reverse/storage, with no Laplacian seed.
@@ -297,6 +395,29 @@ public:
   }
 
 private:
+  /// Retarget physical matrix layouts while retaining compact local jet planes.
+  void setTargetRange(std::size_t begin, std::size_t count)
+  {
+    for (auto* layout : {&dense_.source, &dense_.target, &elementwise_.jets,
+        &attention_.features, &attention_.attention, &orbitals_.features,
+        &orbitals_.orbitals, &cusp_.output, &root_})
+      *layout = withSpatialTargetRange(*layout, begin, count);
+  }
+
+  /// Return the current live span; unused maximum-K tail planes stay untouched.
+  std::size_t liveSpan(const DeviceBuffer<double>& buffer) const
+  {
+    for (const auto* feature : {&feature_, &residual_, &pre_, &hidden_, &input_, &context_, &query_, &key_, &value_})
+      if (&buffer == feature)
+        return spatialJetSpanElements(dense_.source);
+    if (&buffer == &probability_ || &buffer == &logit_)
+      return spatialJetSpanElements(attention_.attention);
+    for (const auto* orbital : {&factor_, &orbital_, &backflow_, &envelope_})
+      if (&buffer == orbital)
+        return spatialJetSpanElements(orbitals_.orbitals);
+    return buffer.capacity();
+  }
+
   /// Check storage multiplication before allocating prepared scratch.
   static std::size_t multiply(std::size_t left, std::size_t right)
   { return spatial_detail::checkedProduct(left, right, "Kinetic reverse extent overflow"); }
@@ -311,11 +432,11 @@ private:
 
   /// Clear a prepared logical adjoint before an accumulating lifted leaf.
   void zero(DeviceBuffer<double>& buffer)
-  { checkRuntime(launchDerivativeZero(queue_.getNative(), {buffer.capacity(), 0, 1, 0, 1}, buffer.data()), "kinetic zero"); }
+  { checkRuntime(launchDerivativeZero(queue_.getNative(), {liveSpan(buffer), 0, 1, 0, 1}, buffer.data()), "kinetic zero"); }
 
   /// Copy complete single-configuration feature jets between prepared buffers.
   void copy(const DeviceBuffer<double>& source, DeviceBuffer<double>& destination)
-  { checkRuntime(launchDerivativeCopy(queue_.getNative(), {source.capacity(), 0, 1, 0, 1}, source.data(), destination.data()), "kinetic jet copy"); }
+  { checkRuntime(launchDerivativeCopy(queue_.getNative(), {liveSpan(source), 0, 1, 0, 1}, source.data(), destination.data()), "kinetic jet copy"); }
 
   /// Reverse dense jet planes; projections without bias use bounded dummy storage.
   void denseReverse(const double* source, const DeviceBuffer<double>& target, DeviceBuffer<double>& input,
@@ -389,6 +510,7 @@ private:
   DeviceBuffer<DerivativeFiniteStatus> finite_status_;
   std::vector<DerivativeFiniteStatus> host_finite_status_;
   bool ready_ = false;
+  bool use_masses_ = false, use_drift_ = false, gradient_only_ = false;
 };
 
 } // namespace qmcplusplus::psiformer::device

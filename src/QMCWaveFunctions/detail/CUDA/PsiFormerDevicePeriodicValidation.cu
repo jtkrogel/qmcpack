@@ -22,6 +22,7 @@
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
+#include "PsiFormerDeviceTargetKineticValidation.h"
 
 #include <iostream>
 #include <numeric>
@@ -171,6 +172,7 @@ void validate()
     near(jets[layout.uncheckedPlaneOffset(2, plane, 0)], jets[layout.uncheckedPlaneOffset(0, plane, 0)], "integer-image VGL");
 
   PreparedDeviceScoreReverse reverse(image, 3, queue, blas);
+  validateTargetKinetic(model, plan, image, queue, blas);
   PreparedDeviceScoreJvp jvp(image, 3, queue, blas);
   PreparedDeviceKineticReverse kinetic(image, 3, queue, blas);
   std::vector<double> response(direction.size()), products(3);

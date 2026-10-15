@@ -26,6 +26,7 @@
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
+#include "PsiFormerDeviceTargetKineticValidation.h"
 #include "PsiFormerDeviceNonlocalResponse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
@@ -931,6 +932,7 @@ int main(int argc, char** argv)
     for (std::size_t parameter = 0; parameter < cpu_kinetic.size(); ++parameter)
       near(gpu_kinetic[parameter], cpu_kinetic[parameter], "mass/external-drift kinetic response CPU parity");
     std::cout << "PASS full kinetic reverse: nonunit masses and external total-wavefunction drift\n";
+    validateTargetKinetic(model, plan, image, queue, handle);
     const auto& orbital_layout = spatial_head.orbital_layout.orbitals;
     const auto orbital_span = spatialJetSpanElements(orbital_layout);
     std::vector<double> spatial_backflow(orbital_span), spatial_envelope(orbital_span), spatial_orbitals(orbital_span);
