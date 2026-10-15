@@ -34,6 +34,7 @@
 #include "PsiFormerDeviceBatchBackend.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
 #include "PsiFormerDeviceKineticContractionValidation.h"
+#include "PsiFormerDeviceCoordinatesValidation.h"
 
 #include <fstream>
 #include <iostream>
@@ -127,7 +128,7 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
@@ -135,6 +136,7 @@ int main(int argc, char** argv)
     // the established DeepQMC profile used by existing invocation scripts.
     bool cpu_only = false;
     bool coordinate_only = false;
+    bool device_coordinates_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -148,6 +150,8 @@ int main(int argc, char** argv)
         cpu_only = true;
       else if (option == "--coordinate-only" && !coordinate_only)
         coordinate_only = true;
+      else if (option == "--device-coordinates-only" && !device_coordinates_only)
+        device_coordinates_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -204,6 +208,13 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
+    if (device_coordinates_only)
+    {
+      // Qualify only the typed source contract, without the broad model matrix.
+      const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+      validateDeviceCoordinates(model, image, queue, handle);
+      return 0;
+    }
     if (coordinate_only)
     {
       // Exit before constructing any score/kinetic owners or parameter traces.
@@ -964,6 +975,7 @@ int main(int argc, char** argv)
     std::cout << "PASS full kinetic reverse: nonunit masses and external total-wavefunction drift\n";
     validateTargetKinetic(model, plan, image, queue, handle);
     validateKineticContractions(model, plan, image);
+    validateDeviceCoordinates(model, image, queue, handle);
     {
       const auto targets = std::min(std::size_t(3), model.ne);
       const auto vgl_cost = estimateTargetVglCost(plan, 2, targets);

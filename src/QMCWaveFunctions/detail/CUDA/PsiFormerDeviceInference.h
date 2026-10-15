@@ -20,6 +20,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_INFERENCE_H
 
 #include "PsiFormerDeviceResources.h"
+#include "PsiFormerDeviceCoordinates.h"
 #include "PsiFormerDeviceSpatial.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
@@ -332,6 +333,22 @@ public:
 
   /// Identify immutable layout/geometry compatibility without comparing pointers to weights.
   const std::shared_ptr<const PreparedDeviceModelMetadata>& metadataFamily() const noexcept { return metadata_; }
+
+  /// Admit exact coordinate bytes before allocating any state or device storage.
+  /// The per-owner budget excludes shared metadata and every inference workspace.
+  std::unique_ptr<PreparedDeviceCoordinates> prepareCoordinates(std::size_t capacity,
+                                                               std::size_t workspace_budget_bytes) const
+  {
+    validateCurrentDevice();
+    const auto ne = plan().modelShape().electrons();
+    if (capacity == 0 || ne == 0 || ne > std::numeric_limits<std::size_t>::max() / 3 / capacity)
+      throw std::invalid_argument("Device coordinate preparation extent is invalid or overflows");
+    const auto bytes = checkedDeviceBytes<double>(3 * ne * capacity);
+    if (bytes > workspace_budget_bytes)
+      throw std::length_error("Device coordinate owner exceeds its workspace byte budget");
+    return std::unique_ptr<PreparedDeviceCoordinates>(
+        new PreparedDeviceCoordinates(metadata_, ne, capacity));
+  }
 
   /// Prepare a newer image without changing this model or uploading geometry again.
   std::shared_ptr<const PreparedDeviceModel> makeUpdatedImage(const std::vector<double>& parameters,
@@ -670,22 +687,44 @@ public:
   /// Submit feature layers, remaining network layers, orbital/determinant and cusp VGL.
   void evaluate(const std::vector<double>& positions)
   {
-    if (retained_targets_)
-      throw std::logic_error("Retained target graphs require their private immediate reverse consumer");
-    // A failed replacement must never leave the preceding tape visible as current.
-    value_tape_valid_ = false;
-    result_valid_ = false;
-    admitted_target_tiles_ = 0;
-    if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
-      throw std::overflow_error("Device inference evaluation generation exhausted");
-    ++evaluation_generation_;
-    model_->validateCurrentDevice();
+    beginCoordinateEvaluation();
     const auto coordinates_per_configuration = product(ne_, 3);
     if (positions.empty() || positions.size() > positions_.capacity() ||
         positions.size() % coordinates_per_configuration != 0)
       throw std::invalid_argument("Device inference positions exceed capacity or contain an incomplete configuration");
     setBatchCount(positions.size() / coordinates_per_configuration);
     positions_.upload(positions.data(), positions.size());
+    evaluateOwnedCoordinates();
+  }
+
+  /// Consume a checked device population without a coordinate host upload.
+  void evaluateDeviceCoordinates(const PackedDeviceCoordinatesView& positions)
+  {
+    beginCoordinateEvaluation();
+    positions.copyTo(positions_, queue_, model_->metadataFamily(), ne_);
+    setBatchCount(positions.batchCount());
+    evaluateOwnedCoordinates();
+  }
+
+private:
+  /// Revoke every previous output before validating or copying replacement input.
+  void beginCoordinateEvaluation()
+  {
+    value_tape_valid_ = false;
+    result_valid_ = false;
+    target_tape_valid_ = false;
+    admitted_target_tiles_ = 0;
+    if (retained_targets_)
+      throw std::logic_error("Retained target graphs require their private immediate reverse consumer");
+    if (evaluation_generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Device inference evaluation generation exhausted");
+    ++evaluation_generation_;
+    model_->validateCurrentDevice();
+  }
+
+  /// Run the unchanged ordinary/target graph body over inference-owned coordinates.
+  void evaluateOwnedCoordinates()
+  {
     if (target_preparation_.max_targets)
     {
       for (std::size_t begin = 0; begin < ne_;)

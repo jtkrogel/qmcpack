@@ -31,6 +31,7 @@ struct DeviceMemorySnapshot
   std::size_t live_bytes = 0, peak_bytes = 0;
   std::size_t upload_calls = 0, uploaded_bytes = 0;
   std::size_t download_calls = 0, downloaded_bytes = 0;
+  std::size_t device_copy_calls = 0, device_copied_bytes = 0;
 };
 
 /** Count buffer ownership independently of scalar type and execution crowd. */
@@ -71,6 +72,13 @@ public:
     downloaded_bytes_.fetch_add(bytes, std::memory_order_relaxed);
   }
 
+  /// Count a completed explicit D2D transfer, excluding kernel memory traffic.
+  void copied(std::size_t bytes) noexcept
+  {
+    device_copy_calls_.fetch_add(1, std::memory_order_relaxed);
+    device_copied_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+
   /// Read scalar counters without modifying allocation or stream state.
   DeviceMemorySnapshot snapshot() const noexcept
   {
@@ -78,7 +86,8 @@ public:
             failed_frees_.load(std::memory_order_relaxed), live_bytes_.load(std::memory_order_relaxed),
             peak_bytes_.load(std::memory_order_relaxed), upload_calls_.load(std::memory_order_relaxed),
             uploaded_bytes_.load(std::memory_order_relaxed), download_calls_.load(std::memory_order_relaxed),
-            downloaded_bytes_.load(std::memory_order_relaxed)};
+            downloaded_bytes_.load(std::memory_order_relaxed), device_copy_calls_.load(std::memory_order_relaxed),
+            device_copied_bytes_.load(std::memory_order_relaxed)};
   }
 
   /// Start a quiescent measurement interval without forgetting resident images.
@@ -91,6 +100,8 @@ public:
     uploaded_bytes_.store(0, std::memory_order_relaxed);
     download_calls_.store(0, std::memory_order_relaxed);
     downloaded_bytes_.store(0, std::memory_order_relaxed);
+    device_copy_calls_.store(0, std::memory_order_relaxed);
+    device_copied_bytes_.store(0, std::memory_order_relaxed);
     peak_bytes_.store(live_bytes_.load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
 
@@ -99,6 +110,7 @@ private:
   std::atomic<std::size_t> live_bytes_{0}, peak_bytes_{0};
   std::atomic<std::size_t> upload_calls_{0}, uploaded_bytes_{0};
   std::atomic<std::size_t> download_calls_{0}, downloaded_bytes_{0};
+  std::atomic<std::size_t> device_copy_calls_{0}, device_copied_bytes_{0};
 };
 
 /** Resolve an address-stable metrics owner during buffer preparation only.
