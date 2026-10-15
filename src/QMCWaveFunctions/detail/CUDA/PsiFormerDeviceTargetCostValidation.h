@@ -73,12 +73,12 @@ inline PsiFormerExecutionPlan makeTargetCostPlan(std::size_t electrons, bool per
 
 /// Check feasibility through the production descriptor seam without an owner.
 inline bool admitTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targets,
-                             std::size_t bytes, bool kinetic)
+                             std::size_t bytes, bool kinetic, std::size_t slots = 0)
 {
   const auto work = std::numeric_limits<std::size_t>::max();
   DeviceExecutionPreparation preparation;
   if (kinetic)
-    preparation.kinetic = {targets, bytes, work};
+    preparation.kinetic = {targets, bytes, work, slots};
   else
     preparation.vgl = {targets, bytes, work};
   try
@@ -119,6 +119,20 @@ inline void validateTargetCosts()
       {
         const auto vgl = estimateTargetVglCost(plan, 1, targets);
         const auto kinetic = estimateTargetKineticCost(plan, targets);
+        // Optional products replace exactly three matrices, never a second graph.
+        for (std::size_t slots : {std::size_t(1), std::size_t(2), std::size_t(16)})
+        {
+          const auto products = planLiftedDeterminantProducts(ne, slots, std::numeric_limits<std::size_t>::max());
+          const auto gemm = estimateTargetKineticCost(plan, targets, slots);
+          const auto expected = spatial_detail::checkedAdd(
+              kinetic.device_workspace_bytes - checkedDeviceBytes<double>(3 * ne * ne),
+              products.device_workspace_bytes, "Lifted target cost fixture overflow");
+          if (gemm.device_workspace_bytes != expected || gemm.host_workspace_bytes != kinetic.host_workspace_bytes ||
+              gemm.charged_scalar_work_units != kinetic.charged_scalar_work_units ||
+              !admitTargetCost(plan, targets, expected, true, slots) ||
+              admitTargetCost(plan, targets, expected - 1, true, slots))
+            throw std::runtime_error("Lifted target cost replacement or exact-byte admission failed");
+        }
         if (vgl.device_workspace_bytes <= previous_vgl || kinetic.device_workspace_bytes <= previous_kinetic ||
             kinetic.tile_count != ne / targets + (ne % targets != 0))
           throw std::runtime_error("Target cost capacity monotonicity or tile coverage failed");
@@ -149,6 +163,15 @@ inline void validateTargetCosts()
       catch (const std::length_error&) { overflow = true; }
       if (!invalid_range || !overflow)
         throw std::runtime_error("Target cost invalid-range or checked-overflow guard failed");
+      bool invalid_slots = false, missing_targets = false;
+      try { (void)estimateTargetKineticCost(plan, 1, 17); }
+      catch (const std::invalid_argument&) { invalid_slots = true; }
+      DeviceExecutionPreparation invalid;
+      invalid.kinetic.lifted_channel_slots = 1;
+      try { validateDeviceExecutionPreparation(plan, invalid); }
+      catch (const std::invalid_argument&) { missing_targets = true; }
+      if (!invalid_slots || !missing_targets)
+        throw std::runtime_error("Lifted target channel capacity/admission guard failed");
     }
   const auto after = deviceMemoryMetrics(0).snapshot();
   if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||

@@ -29,6 +29,7 @@
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
 #include "PsiFormerDeviceTargetKineticValidation.h"
+#include "PsiFormerDeviceTargetKineticSpotValidation.h"
 #include "PsiFormerDeviceNonlocalResponse.h"
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
@@ -128,7 +129,8 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] "
+                                  "[--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
@@ -137,6 +139,7 @@ int main(int argc, char** argv)
     bool cpu_only = false;
     bool coordinate_only = false;
     bool device_coordinates_only = false;
+    bool target_kinetic_spot = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -152,6 +155,8 @@ int main(int argc, char** argv)
         coordinate_only = true;
       else if (option == "--device-coordinates-only" && !device_coordinates_only)
         device_coordinates_only = true;
+      else if (option == "--target-kinetic-spot" && !target_kinetic_spot)
+        target_kinetic_spot = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -183,11 +188,42 @@ int main(int argc, char** argv)
     if (coordinate_only && (cpu_only || !score_output.empty() || !jvp_output.empty() ||
         !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Coordinate-only validation cannot request CPU-only or parameter exports");
+    if (target_kinetic_spot && (cpu_only || coordinate_only || device_coordinates_only ||
+        !score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
+      throw std::invalid_argument("TARGET kinetic spot cannot request other modes or exports");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
+    if (target_kinetic_spot)
+    {
+      // Branch before CPU references, broad validation owners or parameter traces.
+      int device_count = 0;
+#ifdef QMC_CUDA2HIP
+      const auto discovered = hipGetDeviceCount(&device_count);
+#else
+      const auto discovered = cudaGetDeviceCount(&device_count);
+#endif
+      if (discovered != success || device_count == 0)
+      {
+        std::cerr << "NOT_RUN: no usable GPU for TARGET kinetic spot; exit 77\n";
+        return 77;
+      }
+      if (model.cfg.electrons.x.size() < 3 * model.ne)
+        throw std::invalid_argument("TARGET kinetic spot requires one complete configuration");
+      qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+      AcceleratorBlasHandle handle(queue);
+      const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+      const std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * model.ne);
+      std::ofstream output(argv[3]);
+      if (!output)
+        throw std::runtime_error("Cannot open TARGET kinetic spot output");
+      validateTargetKineticSpot(image, positions, queue, handle, output);
+      if (!output)
+        throw std::runtime_error("Cannot write TARGET kinetic spot output");
+      return 0;
+    }
     const auto references = cpuReferences(model, plan, coordinate_only ? 3 : 0);
     writeReferences(argv[3], references);
     if (cpu_only)

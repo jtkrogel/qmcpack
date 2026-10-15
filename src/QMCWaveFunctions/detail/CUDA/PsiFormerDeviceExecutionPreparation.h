@@ -37,6 +37,8 @@ inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& pla
       preparation.vgl.scalar_work_budget);
   validate(preparation.kinetic.max_targets, preparation.kinetic.device_workspace_budget_bytes,
       preparation.kinetic.scalar_work_budget);
+  if (preparation.kinetic.lifted_channel_slots && !preparation.kinetic.max_targets)
+    throw std::invalid_argument("Lifted GEMM channels require explicit kinetic targets");
   if (preparation.vgl.max_targets)
   {
     const auto cost = estimateTargetVglCost(plan, vgl_capacity, preparation.vgl.max_targets);
@@ -46,7 +48,8 @@ inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& pla
   }
   if (preparation.kinetic.max_targets)
   {
-    const auto cost = estimateTargetKineticCost(plan, preparation.kinetic.max_targets);
+    const auto cost = estimateTargetKineticCost(plan, preparation.kinetic.max_targets,
+        preparation.kinetic.lifted_channel_slots);
     if (cost.device_workspace_bytes > preparation.kinetic.device_workspace_budget_bytes ||
         cost.charged_scalar_work_units > preparation.kinetic.scalar_work_budget)
       throw std::length_error("Device target kinetic exceeds its per-owner workspace/request work limit");

@@ -71,6 +71,10 @@ public:
   device_determinant::DerivativeStatus evaluate(const LiftedDeterminantProductInputs& input,
       double* factor_jets);
 
+  /// Borrow the last evaluation's device status until the next call or destruction.
+  /// Consume only after evaluate returns; construction alone publishes no status.
+  const device_determinant::DerivativeStatus* completedStatusData() const noexcept { return status_.data(); }
+
   /// Expose the exact admitted extents and owned numerical storage descriptor.
   const LiftedDeterminantProductPlan& workspacePlan() const noexcept { return plan_; }
 

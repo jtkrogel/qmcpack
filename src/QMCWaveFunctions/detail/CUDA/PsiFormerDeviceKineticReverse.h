@@ -8,9 +8,10 @@
  * @brief Bounded, explicitly contracted lifted reverse of real kinetic energy.
  *
  * Uses retained full-VGL jets, one O(P) accumulator and one-configuration
- * scratch. Configurations accumulate in deterministic order through existing
- * serial lifted leaves. This is a correctness-first numerical route, not a
- * batched performance or production-training claim. Coulomb potentials have
+ * scratch. Configurations accumulate in deterministic order. Explicit retained
+ * TARGET preparation can select GEMM determinant factors; default factors and
+ * the other lifted leaves remain serial. This is not a complete batched
+ * performance or production-training claim. Coulomb potentials have
  * zero parameter response at fixed geometry; nonlocal ECP response is separate.
  */
 
@@ -20,6 +21,7 @@
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceSpatialReverse.h"
 #include "PsiFormerDeviceOpenKineticReverse.h"
+#include "PsiFormerDeviceLiftedDeterminantProducts.h"
 
 namespace qmcplusplus::psiformer::device
 {
@@ -33,7 +35,8 @@ struct TargetKineticReverseCost
 
 /// Count the one-configuration max-K reverse before reserving any of its buffers.
 inline TargetKineticReverseCost estimateTargetKineticReverseCost(const PsiFormerExecutionPlan& plan,
-                                                                 std::size_t targets)
+                                                                 std::size_t targets,
+                                                                 std::size_t lifted_channel_slots = 0)
 {
   const auto& shape = plan.modelShape();
   const auto ne = shape.electrons(), width = shape.feature_dimension, parameters = plan.parameterCount();
@@ -60,6 +63,14 @@ inline TargetKineticReverseCost estimateTargetKineticReverseCost(const PsiFormer
        checkedDeviceBytes<OpenSpatialStatus>(1), checkedDeviceBytes<OpenKineticReverseStatus>(1),
        checkedDeviceBytes<DerivativeFiniteStatus>(finite_blocks)})
     cost.device_workspace_bytes = add(cost.device_workspace_bytes, bytes);
+  // Replace, rather than supplement, the reference's three matrix temporaries.
+  if (lifted_channel_slots)
+  {
+    const auto products = planLiftedDeterminantProducts(ne, lifted_channel_slots,
+        std::numeric_limits<std::size_t>::max());
+    cost.device_workspace_bytes -= checkedDeviceBytes<double>(mul(3, mul(ne, ne)));
+    cost.device_workspace_bytes = add(cost.device_workspace_bytes, products.device_workspace_bytes);
+  }
   for (auto bytes : {checkedDeviceBytes<device_determinant::DerivativeStatus>(1),
        checkedDeviceBytes<OpenSpatialStatus>(1),
        checkedDeviceBytes<device_determinant::FactorizationMetadata>(shape.determinants),
@@ -87,7 +98,8 @@ private:
   PreparedDeviceKineticReverse(std::shared_ptr<const PreparedDeviceModel> model,
                                std::size_t capacity,
                                compute::Queue<PlatformKind::CUDA>& queue,
-                               AcceleratorBlasHandle& blas, std::size_t max_targets)
+                               AcceleratorBlasHandle& blas, std::size_t max_targets,
+                               std::size_t lifted_channel_slots = 0)
       : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas)
   {
     if (!model_ || capacity_ == 0)
@@ -113,7 +125,16 @@ private:
     const auto matrices = spatialJetSpanElements(orbitals_.orbitals);
     for (auto* buffer : {&factor_, &orbital_, &backflow_, &envelope_})
       buffer->reserve(matrices);
-    matrix_scratch_.reserve(multiply(3, multiply(ne, ne)));
+    // The optional target backend owns its matrix products; never retain both.
+    if (lifted_channel_slots)
+    {
+      const auto products = planLiftedDeterminantProducts(ne, lifted_channel_slots,
+          std::numeric_limits<std::size_t>::max());
+      lifted_products_ = std::make_unique<PreparedDeviceLiftedDeterminantProducts>(ne, lifted_channel_slots,
+          products.device_workspace_bytes, queue_, blas_);
+    }
+    else
+      matrix_scratch_.reserve(multiply(3, multiply(ne, ne)));
     root_adjoint_.reserve(spatialJetSpanElements(root_));
     response_.reserve(model_->plan().parameterCount());
     dummy_bias_.reserve(width);
@@ -221,15 +242,31 @@ private:
           use_drift_ ? total_gradient_.data() + configuration * 3 * ne : nullptr,
           use_drift_ ? 3 * ne : 0, root_adjoint_.data(), open_status_.data(), gradient_only_), "kinetic root adjoint");
       checkOpen();
-      checkRuntime(launchDeterminantFactorJets(stream, determinant,
-          head.factorizations + configuration * shape.determinants, head.combinations + configuration,
-          head.normalized_weights + configuration * shape.determinants,
-          head.inverses + configuration * shape.determinants * ne * ne, head.orbitals + orbital_offset,
-          head.determinant_log_gradient + configuration * root_.gradient_lanes,
-          head.determinant_log_laplacian + configuration * root_.laplacian_lanes, factor_.data(), matrix_scratch_.data(),
-          determinant_status_.data()), "kinetic determinant factor jets");
-      checkDeterminant(determinant_status_);
-      checkRuntime(launchDeterminantJetReverse(stream, determinant, determinant_status_.data(), factor_.data(),
+      const device_determinant::DerivativeStatus* factor_status = determinant_status_.data();
+      if (lifted_products_)
+      {
+        const LiftedDeterminantProductInputs input{determinant,
+            head.factorizations + configuration * shape.determinants, head.combinations + configuration,
+            head.normalized_weights + configuration * shape.determinants,
+            head.inverses + configuration * shape.determinants * ne * ne, head.orbitals + orbital_offset,
+            head.determinant_log_gradient + configuration * root_.gradient_lanes,
+            head.determinant_log_laplacian + configuration * root_.laplacian_lanes};
+        if (lifted_products_->evaluate(input, factor_.data()) != device_determinant::DerivativeStatus::AVAILABLE)
+          throw std::runtime_error("Kinetic determinant response is unavailable");
+        factor_status = lifted_products_->completedStatusData();
+      }
+      else
+      {
+        checkRuntime(launchDeterminantFactorJets(stream, determinant,
+            head.factorizations + configuration * shape.determinants, head.combinations + configuration,
+            head.normalized_weights + configuration * shape.determinants,
+            head.inverses + configuration * shape.determinants * ne * ne, head.orbitals + orbital_offset,
+            head.determinant_log_gradient + configuration * root_.gradient_lanes,
+            head.determinant_log_laplacian + configuration * root_.laplacian_lanes, factor_.data(), matrix_scratch_.data(),
+            determinant_status_.data()), "kinetic determinant factor jets");
+        checkDeterminant(determinant_status_);
+      }
+      checkRuntime(launchDeterminantJetReverse(stream, determinant, factor_status, factor_.data(),
           root_adjoint_.data(), orbital_.data(), reverse_status_.data()), "kinetic determinant reverse");
       checkDeterminant(reverse_status_);
 
@@ -391,6 +428,8 @@ public:
     add(checkedDeviceBytes<OpenSpatialStatus>(open_status_.capacity()));
     add(checkedDeviceBytes<OpenKineticReverseStatus>(kinetic_status_.capacity()));
     add(checkedDeviceBytes<DerivativeFiniteStatus>(finite_status_.capacity()));
+    if (lifted_products_)
+      add(lifted_products_->deviceWorkspaceBytes());
     return bytes;
   }
 
@@ -490,6 +529,7 @@ private:
   std::size_t capacity_;
   compute::Queue<PlatformKind::CUDA>& queue_;
   AcceleratorBlasHandle& blas_;
+  std::unique_ptr<PreparedDeviceLiftedDeterminantProducts> lifted_products_;
   SpatialDenseJetLayout dense_;
   SpatialElementwiseJetLayout elementwise_;
   SpatialAttentionJetLayout attention_;

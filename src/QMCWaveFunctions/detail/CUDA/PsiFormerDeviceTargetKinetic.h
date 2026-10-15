@@ -26,6 +26,8 @@ struct TargetKineticPreparation
   std::size_t max_targets = 0;
   std::size_t device_workspace_budget_bytes = 0;
   std::size_t scalar_work_budget = 0;
+  // Zero preserves reference factors; 1..16 explicitly admits GEMM channel scratch.
+  std::size_t lifted_channel_slots = 0;
 };
 
 /// Predicted persistent host/device storage and complete-request scalar work.
@@ -39,13 +41,15 @@ struct TargetKineticCost
 
 /** Exact persistent forward/reverse buffers, excluding shared images and vendors.
  * Work proxy counts 26*D*Ne^4 + 4*D*ceil(Ne/K)*Ne^3 scalar contraction sites;
- * it is a reproducible admission limit, not a FLOP or elapsed-time prediction.
+ * it remains conservative for optional GEMM products: a reproducible admission
+ * limit, not a backend FLOP or elapsed-time prediction.
  */
 inline TargetKineticCost estimateTargetKineticCost(const PsiFormerExecutionPlan& plan,
-                                                   std::size_t targets)
+                                                   std::size_t targets,
+                                                   std::size_t lifted_channel_slots = 0)
 {
   const auto forward = estimateRetainedTargetForwardCost(plan, targets);
-  const auto reverse = estimateTargetKineticReverseCost(plan, targets);
+  const auto reverse = estimateTargetKineticReverseCost(plan, targets, lifted_channel_slots);
   const auto add = [](std::size_t a, std::size_t b) {
     return spatial_detail::checkedAdd(a, b, "Target kinetic storage/work overflow");
   };
@@ -172,7 +176,8 @@ private:
         preparation.scalar_work_budget == 0)
       throw std::invalid_argument("Target kinetic requires a model and positive explicit capacities/budgets");
     model->validateCurrentDevice();
-    const auto cost = estimateTargetKineticCost(model->plan(), preparation.max_targets);
+    const auto cost = estimateTargetKineticCost(model->plan(), preparation.max_targets,
+        preparation.lifted_channel_slots);
     if (cost.device_workspace_bytes > preparation.device_workspace_budget_bytes ||
         cost.charged_scalar_work_units > preparation.scalar_work_budget)
       throw std::length_error("Target kinetic exceeds its combined owned-device or whole-request work budget");
@@ -187,7 +192,7 @@ private:
       : preparation_(preparation), cost_(cost),
         forward_(model, 1, queue, blas, SpatialJetMode::FULL_VGL, false, true, policy,
             TargetVglPreparation{preparation.max_targets, cost.device_workspace_bytes, cost.charged_scalar_work_units}, true),
-        reverse_(std::move(model), 1, queue, blas, preparation.max_targets)
+        reverse_(std::move(model), 1, queue, blas, preparation.max_targets, preparation.lifted_channel_slots)
   {
     if (deviceWorkspaceBytes() != cost_.device_workspace_bytes || hostWorkspaceBytes() != cost_.host_workspace_bytes)
       throw std::logic_error("Target kinetic combined storage differs from its pre-allocation estimate");

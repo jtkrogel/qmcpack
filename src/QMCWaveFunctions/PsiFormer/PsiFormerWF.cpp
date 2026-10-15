@@ -896,8 +896,11 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   };
   const auto vgl = positive("PSIFORMER_GPU_VGL_TARGETS");
   const auto kinetic = positive("PSIFORMER_GPU_KINETIC_TARGETS");
+  const auto lifted = positive("PSIFORMER_GPU_LIFTED_CHANNELS");
   const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
   const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
+  if (lifted && !kinetic)
+    throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
   if ((vgl || kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
   if ((vgl || kinetic) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
@@ -906,9 +909,10 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   if (vgl)
     preparation.vgl = {vgl, bytes, work};
   if (kinetic)
-    preparation.kinetic = {kinetic, bytes, work};
+    preparation.kinetic = {kinetic, bytes, work, lifted};
   psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
   app_log() << "  PsiFormer GPU target preparation: vgl_targets=" << vgl << ", kinetic_targets=" << kinetic
+            << ", lifted_channel_slots=" << lifted
             << ", per_owner_workspace_limit_bytes=" << bytes << ", per_request_scalar_work_limit=" << work
             << ", aggregate_process_budget=no" << std::endl;
   return preparation;
