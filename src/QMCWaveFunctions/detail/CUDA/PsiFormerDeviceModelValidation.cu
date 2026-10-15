@@ -790,6 +790,75 @@ int main(int argc, char** argv)
         near(root_seeds[spatial_head.root_layout.uncheckedLaplacianOffset(configuration, electron, 0)],
              -0.5 * kinetic_weights[configuration] * inverse_masses[electron], "inverse-mass Laplacian seed");
     }
+    // Compact roots retain physical mass/drift indexing, including validation
+    // outside this tile. The unused full-capacity tail must remain untouched.
+    if (model.ne > 1)
+    {
+      const auto local_root = withSpatialTargetRange(spatial_head.root_layout, 1, 1);
+      const auto live_span = spatialJetSpanElements(local_root);
+      std::vector<double> compact_root(root_seeds.size(), std::numeric_limits<double>::quiet_NaN());
+      std::vector<double> compact_seeds(root_seeds.size(), -817.25);
+      for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+      {
+        compact_root[local_root.uncheckedValueOffset(configuration, 0)] = 0.0;
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          compact_root[local_root.uncheckedGradientOffset(configuration, dimension, 0)] =
+              jets[spatial_head.root_layout.uncheckedGradientOffset(configuration, 3 + dimension, 0)];
+        compact_root[local_root.uncheckedLaplacianOffset(configuration, 0, 0)] =
+            jets[spatial_head.root_layout.uncheckedLaplacianOffset(configuration, 1, 0)];
+      }
+      DeviceBuffer<double> compact_input(compact_root.size());
+      compact_input.upload(compact_root.data(), compact_root.size());
+      for (bool gradient_only : {false, true})
+      {
+        root_adjoint.upload(compact_seeds.data(), compact_seeds.size());
+        checkRuntime(launchKineticRootAdjoints(queue.getNative(), local_root, compact_input.data(),
+            kinetic_weight_buffer.data(), mass_buffer.data(), external_drift_buffer.data(), external_stride,
+            root_adjoint.data(), root_status.data(), gradient_only), "mapped compact kinetic root seed");
+        queue.sync();
+        root_adjoint.download(root_seeds.data(), root_seeds.size());
+        root_status.download(root_flags.data(), root_flags.size());
+        for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+        {
+          if (root_flags[configuration] != OpenSpatialStatus::REGULAR)
+            throw std::runtime_error("Compact kinetic root seed rejected regular physical inputs");
+          near(root_seeds[local_root.uncheckedValueOffset(configuration, 0)], 0, "compact value seed");
+          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            near(root_seeds[local_root.uncheckedGradientOffset(configuration, dimension, 0)],
+                -kinetic_weights[configuration] * inverse_masses[1] *
+                    external_drift[configuration * external_stride + 3 + dimension], "mapped compact drift seed");
+          near(root_seeds[local_root.uncheckedLaplacianOffset(configuration, 0, 0)],
+              gradient_only ? 0.0 : -0.5 * kinetic_weights[configuration] * inverse_masses[1],
+              "mapped compact Laplacian seed");
+        }
+        for (std::size_t index = live_span; index < root_seeds.size(); ++index)
+          near(root_seeds[index], -817.25, "compact root unused tail");
+      }
+      // Electron zero lies outside [1,2); either invalid physical coefficient
+      // must invalidate the tile rather than escape validation until a later tile.
+      for (bool bad_mass : {true, false})
+      {
+        inverse_masses[0] = bad_mass ? 0.0 : 1.0;
+        mass_buffer.upload(inverse_masses.data(), inverse_masses.size());
+        if (!bad_mass)
+        {
+          auto invalid_drift = external_drift;
+          for (std::size_t configuration = 0; configuration < model.cfg.nconfig; ++configuration)
+            invalid_drift[configuration * external_stride] = std::numeric_limits<double>::quiet_NaN();
+          external_drift_buffer.upload(invalid_drift.data(), invalid_drift.size());
+        }
+        checkRuntime(launchKineticRootAdjoints(queue.getNative(), local_root, compact_input.data(),
+            kinetic_weight_buffer.data(), mass_buffer.data(), external_drift_buffer.data(), external_stride,
+            root_adjoint.data(), root_status.data()), "compact root outside-tile coefficient guard");
+        queue.sync();
+        root_status.download(root_flags.data(), root_flags.size());
+        for (auto flag : root_flags)
+          if (flag == OpenSpatialStatus::REGULAR)
+            throw std::runtime_error("Compact kinetic root accepted invalid coefficients outside its tile");
+      }
+      external_drift_buffer.upload(external_drift.data(), external_drift.size());
+      std::cout << "PASS compact kinetic root: physical mass/drift, gradient-only, poisoned tail, outside-tile guards\n";
+    }
     inverse_masses[0] = 0;
     mass_buffer.upload(inverse_masses.data(), inverse_masses.size());
     checkRuntime(launchKineticRootAdjoints(queue.getNative(), spatial_head.root_layout, spatial_head.root,

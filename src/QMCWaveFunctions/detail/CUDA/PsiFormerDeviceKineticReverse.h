@@ -209,7 +209,11 @@ public:
       // Feature-layer reverse stops at fixed physical inputs. Fold all spatial
       // planes for the embedding weight response without allocating raw adjoints.
       const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
-      const auto embedding_layout = makeSpatialDenseJetLayout(1, ne, embedding.shape[0], width, ne, SpatialJetMode::FULL_VGL);
+      auto embedding_layout = makeSpatialDenseJetLayout(1, ne, embedding.shape[0], width, ne, SpatialJetMode::FULL_VGL);
+      embedding_layout.source = withSpatialTargetRange(embedding_layout.source,
+          head.root_layout.target_electron_begin, head.root_layout.laplacian_lanes);
+      embedding_layout.target = withSpatialTargetRange(embedding_layout.target,
+          head.root_layout.target_electron_begin, head.root_layout.laplacian_lanes);
       accumulateDenseWeightAdjoint(blas_, makeFoldedSpatialDenseLayout(embedding_layout),
           head.raw_features + configuration * embedding_layout.source.configuration_stride, feature_.data(),
           response_.data() + embedding.begin);

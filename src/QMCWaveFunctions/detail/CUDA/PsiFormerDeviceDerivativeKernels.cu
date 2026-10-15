@@ -889,16 +889,27 @@ __global__ void kineticRootAdjointsKernel(SpatialJetLayout layout, const double*
   // K=-1/2 sum_e m_e^-1 (lap_e logPsi + |grad_e logPsi|^2).
   // The total drift, not just this component's drift, multiplies its gradient
   // response when a product TrialWaveFunction contains other components.
+  // Validate the complete physical coefficient inputs even for a partial tile.
   for (std::size_t electron = 0; electron < layout.electron_count; ++electron)
   {
     const double mass = inverse_masses ? inverse_masses[electron] : 1.0;
     if (!device_math::isFiniteBinary64(mass) || mass <= 0)
       return;
+    if (total_gradient)
+      for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        if (!device_math::isFiniteBinary64(total_gradient[configuration * gradient_stride + 3 * electron + dimension]))
+          return;
+  }
+  for (std::size_t local = 0; local < layout.laplacian_lanes; ++local)
+  {
+    const auto electron = layout.physicalTargetElectron(local);
+    const double mass = inverse_masses ? inverse_masses[electron] : 1.0;
     for (std::size_t dimension = 0; dimension < 3; ++dimension)
     {
-      const auto lane = 3 * electron + dimension;
+      const auto lane = 3 * local + dimension;
       const auto offset = layout.uncheckedGradientOffset(configuration, lane, 0);
-      const double drift = total_gradient ? total_gradient[configuration * gradient_stride + lane] : forward_root[offset];
+      const double drift = total_gradient ? total_gradient[configuration * gradient_stride + 3 * electron + dimension]
+                                          : forward_root[offset];
       const double seed = -weight * mass * drift;
       if (!device_math::isFiniteBinary64(drift) || !device_math::isFiniteBinary64(seed))
         return;
@@ -909,7 +920,7 @@ __global__ void kineticRootAdjointsKernel(SpatialJetLayout layout, const double*
     const double laplacian_seed = gradient_only ? 0.0 : -0.5 * weight * mass;
     if (!device_math::isFiniteBinary64(laplacian_seed))
       return;
-    output[layout.uncheckedLaplacianOffset(configuration, electron, 0)] = laplacian_seed;
+    output[layout.uncheckedLaplacianOffset(configuration, local, 0)] = laplacian_seed;
   }
   status[configuration] = OpenSpatialStatus::REGULAR;
 }
@@ -1646,16 +1657,18 @@ Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& layout,
   if (layout.configuration_count == 0)
     return success;
   validateSpatialJetLayout(layout);
-  if (!hasCompleteSpatialTargets(layout) || layout.element_count != 1 ||
+  const auto physical_gradient_lanes = checkedProduct(3, layout.electron_count,
+      "Physical kinetic drift extent overflow");
+  if (layout.mode != SpatialJetMode::FULL_VGL || layout.element_count != 1 ||
       !forward_root || !weights || !root_adjoint || !status ||
-      (total_gradient ? gradient_stride < layout.gradient_lanes : gradient_stride != 0) ||
+      (total_gradient ? gradient_stride < physical_gradient_lanes : gradient_stride != 0) ||
       (gradient_only && !total_gradient))
     throw std::invalid_argument("Kinetic root adjoint layout/storage/drift stride is invalid");
   for (const auto* source : {forward_root, weights, inverse_masses, total_gradient})
     if (root_adjoint == source)
       throw std::invalid_argument("Kinetic root adjoint destination aliases input");
   if (total_gradient)
-    (void)checkedSpan(layout.configuration_count, gradient_stride, layout.gradient_lanes,
+    (void)checkedSpan(layout.configuration_count, gradient_stride, physical_gradient_lanes,
                       "Total kinetic drift extent overflow");
   kineticRootAdjointsKernel<<<blockCount(layout.configuration_count, "Kinetic root adjoint grid too large"),
       derivative_block_size, 0, stream>>>(layout, forward_root, weights, inverse_masses,

@@ -136,9 +136,7 @@ inline void validateOpenOrbitalKineticReverseLayout(
   if (layout.forward.features.configuration_count != 1 ||
       layout.forward.orbitals.configuration_count != 1 ||
       layout.forward.features.mode != SpatialJetMode::FULL_VGL ||
-      layout.forward.orbitals.mode != SpatialJetMode::FULL_VGL ||
-      !hasCompleteSpatialTargets(layout.forward.features) ||
-      !hasCompleteSpatialTargets(layout.forward.orbitals))
+      layout.forward.orbitals.mode != SpatialJetMode::FULL_VGL)
     throw std::invalid_argument(
         "PsiFormer open orbital kinetic reverse requires one FULL_VGL configuration");
 
@@ -178,7 +176,7 @@ inline void validateOpenCuspKineticReverseLayout(
     return;
   validateOpenCuspJetLayout(layout.forward);
   if (layout.forward.output.configuration_count != 1 ||
-      !hasCompleteSpatialTargets(layout.forward.output))
+      layout.forward.output.mode != SpatialJetMode::FULL_VGL)
     throw std::invalid_argument(
         "PsiFormer open cusp kinetic reverse requires one FULL_VGL configuration");
   if (layout.opposite_response_offset >= layout.response_count ||
@@ -587,26 +585,32 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenOrbit
               orbital_jets.uncheckedValueOffset(0, element)] * decay;
           double zeta_bar = envelope_adjoint[
               orbital_jets.uncheckedValueOffset(0, element)] * zeta_value_partial;
-          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          // Value cotangents span every physical row on each tile. Only the
+          // row-local derivative terms use the compact target interval.
+          if (orbital_jets.containsTargetElectron(row))
           {
-            const std::size_t lane = 3 * row + dimension;
-            const double direction = periodic_cell ? periodic_pair.radius_gradient[dimension]
-                                                   : displacement[dimension] / radius;
-            const double upstream = envelope_adjoint[
-                orbital_jets.uncheckedGradientOffset(0, lane, element)];
-            pi_bar += upstream * pi_radial_first * direction;
-            zeta_bar += upstream * zeta_radial_first * direction;
+            const std::size_t local_row = row - orbital_jets.target_electron_begin;
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            {
+              const std::size_t lane = 3 * local_row + dimension;
+              const double direction = periodic_cell ? periodic_pair.radius_gradient[dimension]
+                                                     : displacement[dimension] / radius;
+              const double upstream = envelope_adjoint[
+                  orbital_jets.uncheckedGradientOffset(0, lane, element)];
+              pi_bar += upstream * pi_radial_first * direction;
+              zeta_bar += upstream * zeta_radial_first * direction;
+            }
+            const double laplacian_upstream = envelope_adjoint[
+                orbital_jets.uncheckedLaplacianOffset(0, local_row, element)];
+            pi_bar += laplacian_upstream *
+                (periodic_cell ? pi_radial_second * periodic_pair.radius_gradient_norm_squared +
+                                     pi_radial_first * periodic_pair.radius_laplacian
+                               : pi_radial_second + 2.0 * pi_radial_first / radius);
+            zeta_bar += laplacian_upstream *
+                (periodic_cell ? zeta_radial_second * periodic_pair.radius_gradient_norm_squared +
+                                     zeta_radial_first * periodic_pair.radius_laplacian
+                               : zeta_radial_second + 2.0 * zeta_radial_first / radius);
           }
-          const double laplacian_upstream = envelope_adjoint[
-              orbital_jets.uncheckedLaplacianOffset(0, row, element)];
-          pi_bar += laplacian_upstream *
-              (periodic_cell ? pi_radial_second * periodic_pair.radius_gradient_norm_squared +
-                                   pi_radial_first * periodic_pair.radius_laplacian
-                             : pi_radial_second + 2.0 * pi_radial_first / radius);
-          zeta_bar += laplacian_upstream *
-              (periodic_cell ? zeta_radial_second * periodic_pair.radius_gradient_norm_squared +
-                                   zeta_radial_first * periodic_pair.radius_laplacian
-                             : zeta_radial_second + 2.0 * zeta_radial_first / radius);
           double& pi_destination = response[pi_offset + parameter];
           double& zeta_destination = response[zeta_offset + parameter];
           if (!finite(pi_bar) || !finite(zeta_bar) || !finite(pi_destination) ||
@@ -737,14 +741,22 @@ QMC_PF_OPEN_REVERSE_HOST_DEVICE inline OpenKineticReverseStatus reverseOpenCuspK
         const double directional =
             periodic_cell ? radial_first_partial * periodic_pair.radius_gradient[dimension]
                           : radial_first_partial * displacement[dimension] / radius;
-        contribution += cusp_adjoint[
-            jets.uncheckedGradientOffset(0, 3 * first + dimension, 0)] * directional;
-        contribution -= cusp_adjoint[
-            jets.uncheckedGradientOffset(0, 3 * second + dimension, 0)] * directional;
+        if (jets.containsTargetElectron(first))
+          contribution += cusp_adjoint[jets.uncheckedGradientOffset(
+              0, 3 * (first - jets.target_electron_begin) + dimension, 0)] * directional;
+        if (jets.containsTargetElectron(second))
+          contribution -= cusp_adjoint[jets.uncheckedGradientOffset(
+              0, 3 * (second - jets.target_electron_begin) + dimension, 0)] * directional;
       }
-      contribution +=
-          (cusp_adjoint[jets.uncheckedLaplacianOffset(0, first, 0)] +
-           cusp_adjoint[jets.uncheckedLaplacianOffset(0, second, 0)]) *
+      // Each endpoint owns a local trace lane only when this tile contains it.
+      double laplacian_adjoint = 0.0;
+      if (jets.containsTargetElectron(first))
+        laplacian_adjoint += cusp_adjoint[jets.uncheckedLaplacianOffset(
+            0, first - jets.target_electron_begin, 0)];
+      if (jets.containsTargetElectron(second))
+        laplacian_adjoint += cusp_adjoint[jets.uncheckedLaplacianOffset(
+            0, second - jets.target_electron_begin, 0)];
+      contribution += laplacian_adjoint *
           (periodic_cell ? radial_second_partial * periodic_pair.radius_gradient_norm_squared +
                                radial_first_partial * periodic_pair.radius_laplacian
                          : radial_second_partial + 2.0 * radial_first_partial / radius);

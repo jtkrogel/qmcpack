@@ -482,6 +482,128 @@ TEST_CASE("PsiFormer open orbital lifted reverse matches independent long-double
               layout.forward.orbitals.uncheckedPlaneOffset(0, plane, 2)] == canary);
 }
 
+TEST_CASE("PsiFormer compact orbital reverse preserves nonlocal envelope values",
+          "[psiformer][device][kinetic][open][target]")
+{
+  const auto full_layout = makeOrbitalLayout();
+  const auto& full = full_layout.forward.orbitals;
+  std::vector<double> features(pf::spatialJetSpanElements(full_layout.forward.features), canary);
+  fillFeatures(full_layout, features);
+  const std::vector<double> positions{0.7, -0.2, 0.5, 91.0, -0.4, 0.8, 1.1, 92.0, 93.0};
+  const std::vector<double> nuclei{0.1, 0.2, -0.3, 94.0};
+  std::vector<double> weights(pf::openOrbitalBackflowSpan(full_layout.forward), 0.3);
+  std::vector<double> pi(pf::openOrbitalEnvelopeSpan(full_layout.forward), 0.8);
+  std::vector<double> zeta(pi.size(), -0.7);
+  std::vector<double> backflow(pf::spatialJetSpanElements(full), canary), envelope(backflow.size(), canary);
+  buildRetainedJets(full_layout, features, positions, nuclei, weights, weights,
+                    pi, pi, zeta, zeta, backflow, envelope);
+
+  for (std::size_t begin = 0; begin < 2; ++begin)
+  {
+    auto local_layout = full_layout;
+    local_layout.forward.features = pf::withSpatialTargetRange(full_layout.forward.features, begin, 1);
+    local_layout.forward.orbitals = pf::withSpatialTargetRange(full, begin, 1);
+    pf::validateOpenOrbitalKineticReverseLayout(local_layout);
+    const auto& local = local_layout.forward.orbitals;
+    const auto physical_plane = [&](std::size_t plane) {
+      if (plane == 0)
+        return std::size_t(0);
+      if (plane <= 3)
+        return plane + 3 * begin;
+      return 1 + full.gradient_lanes + begin;
+    };
+    const auto compact = [&](const std::vector<double>& source, const pf::SpatialJetLayout& from,
+                             const pf::SpatialJetLayout& to) {
+      // Poison capacity beyond the live span to expose any full-Ne reverse loop.
+      std::vector<double> result(source.size(), std::numeric_limits<double>::quiet_NaN());
+      for (std::size_t plane = 0; plane < to.plane_count; ++plane)
+        for (std::size_t element = 0; element < to.element_count; ++element)
+          result[to.uncheckedPlaneOffset(0, plane, element)] =
+              source[from.uncheckedPlaneOffset(0, physical_plane(plane), element)];
+      return result;
+    };
+    auto local_features = compact(features, full_layout.forward.features, local_layout.forward.features);
+    auto local_backflow = compact(backflow, full, local);
+    auto local_envelope = compact(envelope, full, local);
+    std::vector<double> adjoint(backflow.size(), 0.0);
+    for (std::size_t plane = 1; plane < local.plane_count; ++plane)
+      for (std::size_t row = 0; row < 2; ++row)
+        for (std::size_t orbital = 0; orbital < 2; ++orbital)
+          adjoint[full.uncheckedPlaneOffset(0, physical_plane(plane),
+              pf::open_orbital::outputElement(full_layout.forward, 0, row, orbital))] = 0.2 + 0.1 * plane;
+    auto local_adjoint = compact(adjoint, full, local);
+    std::vector<double> full_response(full_layout.response_count, 0.0), local_response(full_response.size(), 0.0);
+    const auto run = [&](const auto& layout, const auto& x, const auto& b, const auto& e,
+                         const auto& upstream, auto& response) {
+      std::vector<double> bbar(backflow.size(), canary), ebar(backflow.size(), canary);
+      std::vector<double> xbar(features.size(), canary);
+      pf::OpenKineticReverseStatus status{};
+      CHECK(reverse::reverseOpenOrbitalKineticSerial(layout, x.data(), positions.data(), nuclei.data(),
+          weights.data(), weights.data(), pi.data(), pi.data(), zeta.data(), zeta.data(),
+          b.data(), e.data(), upstream.data(), bbar.data(), ebar.data(), xbar.data(), response.data(), &status) ==
+          pf::OpenKineticReverseStatus::REGULAR);
+      const auto live = pf::spatialJetSpanElements(layout.forward.orbitals);
+      for (std::size_t index = live; index < bbar.size(); ++index)
+      {
+        CHECK(bbar[index] == canary);
+        CHECK(ebar[index] == canary);
+      }
+    };
+    run(full_layout, features, backflow, envelope, adjoint, full_response);
+    run(local_layout, local_features, local_backflow, local_envelope, local_adjoint, local_response);
+    for (std::size_t parameter = 0; parameter < full_response.size(); ++parameter)
+      checkClose(local_response[parameter], full_response[parameter]);
+    // The row outside this target has nonlocal backflow derivatives and therefore
+    // contributes envelope VALUE cotangents despite a zero root VALUE seed.
+    const auto outside_pi = begin == 0 ? full_layout.envelope_pi_down_response_offset
+                                      : full_layout.envelope_pi_up_response_offset;
+    CHECK(std::abs(local_response[outside_pi]) > 1e-8);
+  }
+}
+
+TEST_CASE("PsiFormer compact cusp reverse maps independent physical endpoints",
+          "[psiformer][device][kinetic][open][target]")
+{
+  pf::OpenCuspKineticReverseLayout full_layout{};
+  full_layout.forward = pf::makeOpenCuspJetLayout(1, 5, 2, pf::SpatialJetMode::FULL_VGL);
+  full_layout.response_count = 2;
+  full_layout.same_response_offset = 0;
+  full_layout.opposite_response_offset = 1;
+  full_layout.has_same_alpha = true;
+  const auto& full = full_layout.forward.output;
+  const std::vector<double> positions{0.2, -0.4, 0.7, 1.1, 0.3, -0.2, -0.6, 0.8, 1.4,
+                                      0.9, -0.7, 0.1, -0.3, 1.7, -0.9};
+  for (std::size_t capacity : {std::size_t(1), std::size_t(2), std::size_t(5)})
+    for (std::size_t begin = 0; begin < 5; begin += capacity)
+    {
+      const auto count = std::min(capacity, 5 - begin);
+      auto layout = full_layout;
+      layout.forward.output = pf::withSpatialTargetRange(full, begin, count);
+      pf::validateOpenCuspKineticReverseLayout(layout);
+      const auto& local = layout.forward.output;
+      std::vector<double> full_adjoint(pf::spatialJetSpanElements(full), 0.0);
+      std::vector<double> local_adjoint(full_adjoint.size(), std::numeric_limits<double>::quiet_NaN());
+      local_adjoint[0] = full_adjoint[0] = 0.31;
+      for (std::size_t electron = 0; electron < count; ++electron)
+      {
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          local_adjoint[local.uncheckedGradientOffset(0, 3 * electron + dimension, 0)] =
+              full_adjoint[full.uncheckedGradientOffset(0, 3 * (begin + electron) + dimension, 0)] =
+                  0.07 * (1 + 3 * (begin + electron) + dimension);
+        local_adjoint[local.uncheckedLaplacianOffset(0, electron, 0)] =
+            full_adjoint[full.uncheckedLaplacianOffset(0, begin + electron, 0)] = -0.2 * (1 + begin + electron);
+      }
+      std::array<double, 2> reference{}, actual{};
+      pf::OpenKineticReverseStatus status{};
+      REQUIRE(reverse::reverseOpenCuspKineticSerial(full_layout, positions.data(), 0.9, 1.3,
+          full_adjoint.data(), reference.data(), &status) == pf::OpenKineticReverseStatus::REGULAR);
+      REQUIRE(reverse::reverseOpenCuspKineticSerial(layout, positions.data(), 0.9, 1.3,
+          local_adjoint.data(), actual.data(), &status) == pf::OpenKineticReverseStatus::REGULAR);
+      checkClose(actual[0], reference[0]);
+      checkClose(actual[1], reference[1]);
+    }
+}
+
 TEST_CASE("PsiFormer open cusp lifted alpha reverse matches long-double FD",
           "[psiformer][device][kinetic][open]")
 {

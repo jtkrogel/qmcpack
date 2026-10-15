@@ -371,10 +371,11 @@ Error launchLogScoreParameterDirection(Stream stream, std::size_t batch, std::si
     double same_alpha_direction, double opposite_alpha_direction, double* score_direction,
     const periodic_geometry::Cell* cell = nullptr);
 
-/** Seed a weighted kinetic lifted reverse with full real-space root adjoints.
+/** Seed a weighted kinetic lifted reverse with mapped real-space root adjoints.
  * Inverse masses are per electron (null means one); optional total drift is
- * contiguous in lanes within a caller-specified configuration stride. Null total
- * drift uses this component's root gradient. Destinations must not alias inputs.
+ * contiguous in physical 3Ne lanes within a caller-specified configuration stride,
+ * including for a compact target root. All physical coefficients are validated.
+ * Null total drift uses this component's root gradient. Destinations must not alias inputs.
  * Gradient-only mode requires explicit drift and sets every Laplacian seed to
  * zero, providing the imaginary kinetic response of a fixed complex outer phase.
  */
