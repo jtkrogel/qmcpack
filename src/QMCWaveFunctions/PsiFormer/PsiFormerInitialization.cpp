@@ -43,6 +43,7 @@ struct TensorSpecification
   double mean;
   double distribution_standard_deviation;
   double expected_standard_deviation;
+  HeadTensorComponent head_component = HeadTensorComponent::REAL;
 };
 
 /**
@@ -175,16 +176,16 @@ std::uint64_t tensorSeed(const std::string& profile,
 }
 
 /// Enforce the architecture fixed by the versioned v1 profile before allocating.
-void validateProfileShape(const ModelShape& model)
+void validateProfileShape(const ModelShape& model, const std::string& profile)
 {
   if (model.spin_up_electrons == 0 || model.spin_down_electrons == 0)
-    throw std::invalid_argument("deepqmc_psiformer_v1 requires positive spin-up and spin-down populations");
+    throw std::invalid_argument(profile + " requires positive spin-up and spin-down populations");
   if (model.nuclei == 0)
-    throw std::invalid_argument("deepqmc_psiformer_v1 requires at least one nucleus");
+    throw std::invalid_argument(profile + " requires at least one nucleus");
   if (model.determinants != PROFILE_DETERMINANTS || model.feature_dimension != PROFILE_FEATURE_DIMENSION ||
       model.attention_heads != PROFILE_ATTENTION_HEADS || model.attention_blocks != PROFILE_ATTENTION_BLOCKS)
     throw std::invalid_argument(
-        "deepqmc_psiformer_v1 requires determinants=16, feature_dimension=256, attention_heads=4, "
+        profile + " requires determinants=16, feature_dimension=256, attention_heads=4, "
         "attention_blocks=4");
 
   checkedAdd(model.spin_up_electrons, model.spin_down_electrons, "electron count");
@@ -202,10 +203,11 @@ void appendSpecification(std::vector<TensorSpecification>& tensors,
                          InitializationLaw law,
                          double mean,
                          double distribution_standard_deviation,
-                         double expected_standard_deviation)
+                         double expected_standard_deviation,
+                         HeadTensorComponent component = HeadTensorComponent::REAL)
 {
   tensors.push_back({std::move(module), std::move(name), std::move(shape), role, attention_block, law, mean,
-                     distribution_standard_deviation, expected_standard_deviation});
+                     distribution_standard_deviation, expected_standard_deviation, component});
 }
 
 /// Build every DeepQMC-compatible leaf and put it in portable export order.
@@ -221,12 +223,16 @@ std::vector<TensorSpecification> makeTensorSpecifications(
       checkedAdd(checkedMultiply(channels_per_nucleus, model.nuclei, "embedding input width"), 1,
                  "embedding input width");
   const double feature_sigma = 1.0 / std::sqrt(static_cast<double>(model.feature_dimension));
+  const bool paired_head = environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX;
+  // Each independent Cartesian head receives half of the legacy projection variance.
+  const double head_sigma = paired_head ? feature_sigma / std::sqrt(2.0) : feature_sigma;
   const double embedding_sigma = 1.0 / std::sqrt(static_cast<double>(input_width));
   const std::string prefix = "neural_network_wave_function/~/";
 
   std::vector<TensorSpecification> tensors;
   const bool has_same_spin_pair = model.spin_up_electrons > 1 || model.spin_down_electrons > 1;
-  tensors.reserve(8 + static_cast<std::size_t>(has_same_spin_pair) + 8 * model.attention_blocks);
+  tensors.reserve(8 + static_cast<std::size_t>(has_same_spin_pair) + 8 * model.attention_blocks +
+                  (paired_head ? 2 : 0));
 
   appendSpecification(tensors, prefix + "electronic_cusp_asymptotic", "anti_alpha", {},
                       ParameterRole::CUSP_OPPOSITE_ALPHA, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
@@ -246,10 +252,19 @@ std::vector<TensorSpecification> makeTensorSpecifications(
                       ParameterRole::ENVELOPE_ZETA_UP, NO_ATTENTION_BLOCK, InitializationLaw::CONSTANT, 1, 0, 0);
   appendSpecification(tensors, prefix + "omni_net/~/Backflow/~/mlp/linear_0", "w",
                       {model.feature_dimension, channels}, ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK,
-                      InitializationLaw::NORMAL, 0, feature_sigma, feature_sigma);
+                      InitializationLaw::NORMAL, 0, head_sigma, head_sigma);
   appendSpecification(tensors, prefix + "omni_net/~/Backflow_1/~/mlp/linear_0", "w",
                       {model.feature_dimension, channels}, ParameterRole::BACKFLOW_DOWN_WEIGHT, NO_ATTENTION_BLOCK,
-                      InitializationLaw::NORMAL, 0, feature_sigma, feature_sigma);
+                      InitializationLaw::NORMAL, 0, head_sigma, head_sigma);
+  if (paired_head)
+  {
+    appendSpecification(tensors, prefix + "omni_net/~/Backflow/~/mlp/linear_0", "w_imag",
+                        {model.feature_dimension, channels}, ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK,
+                        InitializationLaw::NORMAL, 0, head_sigma, head_sigma, HeadTensorComponent::IMAG);
+    appendSpecification(tensors, prefix + "omni_net/~/Backflow_1/~/mlp/linear_0", "w_imag",
+                        {model.feature_dimension, channels}, ParameterRole::BACKFLOW_DOWN_WEIGHT, NO_ATTENTION_BLOCK,
+                        InitializationLaw::NORMAL, 0, head_sigma, head_sigma, HeadTensorComponent::IMAG);
+  }
   appendSpecification(tensors, prefix + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w",
                       {input_width, model.feature_dimension}, ParameterRole::ELECTRON_EMBEDDING_WEIGHT,
                       NO_ATTENTION_BLOCK, InitializationLaw::TRUNCATED_NORMAL, 0, embedding_sigma,
@@ -328,7 +343,8 @@ TensorInitializationDiagnostic makeDiagnostic(const TensorSpecification& tensor,
           static_cast<double>(mean),
           standard_deviation,
           minimum,
-          maximum};
+          maximum,
+          tensor.head_component};
 }
 
 } // namespace
@@ -339,9 +355,24 @@ InitializedPsiFormerParameters initializePsiFormerParameters(const ModelShape& m
                                                              const std::string& profile,
                                                              ExecutionEnvironment environment)
 {
-  if (profile != DEEPQMC_PSIFORMER_V1)
+  if (profile != DEEPQMC_PSIFORMER_V1 && profile != PSIFORMER_COMPLEX_PERIODIC_V1)
     throw std::invalid_argument("Unknown PsiFormer initialization profile: " + profile);
-  validateProfileShape(model_shape);
+  const bool paired_profile = profile == PSIFORMER_COMPLEX_PERIODIC_V1;
+  if (paired_profile)
+  {
+    if (environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
+        environment.boundary != BoundaryCondition::PERIODIC ||
+        environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1 ||
+        !std::all_of(environment.periodic_axes.begin(), environment.periodic_axes.end(),
+                     [](bool periodic) { return periodic; }) ||
+        environment.parameter_scalar_domain != ScalarDomain::REAL ||
+        environment.compute_scalar_domain != ScalarDomain::REAL ||
+        environment.amplitude_scalar_domain != ScalarDomain::COMPLEX || !environment.fixed_nuclei)
+      throw std::invalid_argument("psiformer_complex_periodic_v1 requires explicit paired-real periodic metadata");
+  }
+  else if (environment.head_representation != HeadRepresentation::REAL)
+    throw std::invalid_argument("deepqmc_psiformer_v1 requires the legacy real head representation");
+  validateProfileShape(model_shape, profile);
 
   const std::vector<TensorSpecification> specifications =
       makeTensorSpecifications(model_shape, environment);

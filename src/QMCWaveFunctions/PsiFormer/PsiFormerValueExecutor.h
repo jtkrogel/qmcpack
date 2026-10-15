@@ -95,10 +95,12 @@ public:
       throw std::invalid_argument("PsiFormer direct evaluator received inconsistent model dimensions");
 
     using qmcplusplus::psiformer::BoundaryCondition;
+    using qmcplusplus::psiformer::HeadRepresentation;
     using qmcplusplus::psiformer::ParameterRole;
     using qmcplusplus::psiformer::ScalarDomain;
     const auto& environment = plan.environment();
-    if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
+    if (environment.head_representation != HeadRepresentation::REAL ||
+        environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
         environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
       throw std::invalid_argument("PsiFormer direct value execution supports only fixed-ion real models");

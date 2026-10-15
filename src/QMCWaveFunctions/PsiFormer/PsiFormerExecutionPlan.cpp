@@ -74,8 +74,16 @@ std::optional<std::size_t> attentionBlock(const std::string& module)
   return block;
 }
 
-/// Translate one string-keyed layout record into an architecture-level role.
-std::pair<ParameterRole, std::size_t> classifyParameter(const ParameterLayoutInput& layout)
+/// Classify one leaf while retaining the unchanged legacy role and block identities.
+struct ClassifiedParameter
+{
+  ParameterRole role;
+  std::size_t block;
+  HeadTensorComponent component = HeadTensorComponent::REAL;
+};
+
+/// Translate one string-keyed layout record into a role, block and head component.
+ClassifiedParameter classifyParameter(const ParameterLayoutInput& layout)
 {
   if (endsWith(layout.module, "/electron_embedding/linear") && layout.name == "w")
     return {ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK};
@@ -83,6 +91,10 @@ std::pair<ParameterRole, std::size_t> classifyParameter(const ParameterLayoutInp
     return {ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK};
   if (endsWith(layout.module, "/Backflow_1/~/mlp/linear_0") && layout.name == "w")
     return {ParameterRole::BACKFLOW_DOWN_WEIGHT, NO_ATTENTION_BLOCK};
+  if (endsWith(layout.module, "/Backflow/~/mlp/linear_0") && layout.name == "w_imag")
+    return {ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG};
+  if (endsWith(layout.module, "/Backflow_1/~/mlp/linear_0") && layout.name == "w_imag")
+    return {ParameterRole::BACKFLOW_DOWN_WEIGHT, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG};
   if (endsWith(layout.module, "/exponential_envelopes"))
   {
     if (layout.name == "pi_up")
@@ -209,14 +221,27 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
                      [](bool periodic) { return periodic; }))
       throw std::invalid_argument("Real Gamma PsiFormer currently supports only 3D bulk periodic cells");
   }
+  if (environment_.head_representation != HeadRepresentation::REAL &&
+      environment_.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX)
+    throw std::invalid_argument("Unknown PsiFormer orbital head representation");
+  const bool paired_head = environment_.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX;
+  if (paired_head && (environment_.boundary != BoundaryCondition::PERIODIC ||
+                     environment_.parameter_scalar_domain != ScalarDomain::REAL ||
+                     environment_.compute_scalar_domain != ScalarDomain::REAL ||
+                     environment_.amplitude_scalar_domain != ScalarDomain::COMPLEX))
+    throw std::invalid_argument("Paired-real PsiFormer heads require periodic real parameters/trunk and complex amplitude metadata");
   const auto require_supported_scalar_domain = [&support](ScalarDomain domain, const char* description) {
+    if (domain != ScalarDomain::REAL && domain != ScalarDomain::COMPLEX)
+      throw std::invalid_argument(std::string("Unknown PsiFormer ") + description + " scalar domain");
     if ((domain == ScalarDomain::REAL && !support.real_scalars) ||
         (domain == ScalarDomain::COMPLEX && !support.complex_scalars))
       throw std::invalid_argument(std::string("Requested PsiFormer ") + description + " scalar domain is not implemented");
   };
   require_supported_scalar_domain(environment_.parameter_scalar_domain, "parameter");
   require_supported_scalar_domain(environment_.compute_scalar_domain, "compute");
-  require_supported_scalar_domain(environment_.amplitude_scalar_domain, "amplitude");
+  // This is schema admission only. Runtime capability reporting remains real-only.
+  if (!paired_head)
+    require_supported_scalar_domain(environment_.amplitude_scalar_domain, "amplitude");
   if (environment_.fixed_nuclei ? !support.fixed_nuclei : !support.moving_nuclei)
     throw std::invalid_argument("Requested PsiFormer nuclear-motion policy is not implemented");
 
@@ -231,6 +256,8 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
 
   const std::size_t lookup_stride = model_shape_.attention_blocks + 1;
   descriptor_lookup_.assign(PARAMETER_ROLE_COUNT * lookup_stride, NO_ATTENTION_BLOCK);
+  if (paired_head)
+    imaginary_head_lookup_.assign(2, NO_ATTENTION_BLOCK);
   std::size_t expected_begin = 0;
   parameter_tensors_.reserve(parameter_layouts.size());
   for (ParameterLayoutInput& layout : parameter_layouts)
@@ -240,20 +267,26 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
     if (shapeProduct(layout.shape) != layout.end - layout.begin)
       throw std::invalid_argument("PsiFormer parameter tensor shape does not match its flat interval");
 
-    const auto [role, block] = classifyParameter(layout);
+    const auto [role, block, component] = classifyParameter(layout);
+    if (component == HeadTensorComponent::IMAG && !paired_head)
+      throw std::invalid_argument("Imaginary PsiFormer head tensors require paired-real head metadata");
     if (block != NO_ATTENTION_BLOCK && block >= model_shape_.attention_blocks)
       throw std::invalid_argument("PsiFormer parameter references an out-of-range attention block");
     const std::vector<std::size_t> expected_shape = expectedShape(role, model_shape_, environment_);
     if (layout.shape != expected_shape)
       throwShapeMismatch(layout, role, expected_shape);
     const std::size_t block_slot = block == NO_ATTENTION_BLOCK ? 0 : block + 1;
-    const std::size_t lookup_slot = static_cast<std::size_t>(role) * lookup_stride + block_slot;
-    if (descriptor_lookup_[lookup_slot] != NO_ATTENTION_BLOCK)
+    const std::size_t lookup_slot = component == HeadTensorComponent::IMAG ?
+        (role == ParameterRole::BACKFLOW_UP_WEIGHT ? 0 : 1) :
+        static_cast<std::size_t>(role) * lookup_stride + block_slot;
+    auto& lookup = component == HeadTensorComponent::IMAG ? imaginary_head_lookup_ : descriptor_lookup_;
+    if (lookup[lookup_slot] != NO_ATTENTION_BLOCK)
       throw std::invalid_argument(std::string("Duplicate PsiFormer parameter role ") + parameterRoleName(role));
 
-    descriptor_lookup_[lookup_slot] = parameter_tensors_.size();
+    lookup[lookup_slot] = parameter_tensors_.size();
     parameter_tensors_.push_back(
-        {role, block, std::move(layout.module), std::move(layout.name), std::move(layout.shape), layout.begin, layout.end});
+        {role, block, std::move(layout.module), std::move(layout.name), std::move(layout.shape),
+         layout.begin, layout.end, component});
     expected_begin = layout.end;
   }
   parameter_count_ = expected_begin;
@@ -293,8 +326,14 @@ PsiFormerExecutionPlan::PsiFormerExecutionPlan(ModelShape model_shape,
     throw std::invalid_argument(
         "PsiFormer parameter export is missing same-spin cusp alpha for a populated same-spin pair");
 
+  if (paired_head)
+    for (ParameterRole role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
+      if (!hasParameter(role, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG))
+        throw std::invalid_argument(std::string("PsiFormer paired-real export is missing imaginary head ") +
+                                    parameterRoleName(role));
+
   const std::size_t expected_tensor_count = 8 + 8 * model_shape_.attention_blocks +
-      (hasParameter(ParameterRole::CUSP_SAME_ALPHA) ? 1 : 0);
+      (hasParameter(ParameterRole::CUSP_SAME_ALPHA) ? 1 : 0) + (paired_head ? 2 : 0);
   if (parameter_tensors_.size() != expected_tensor_count)
     throw std::invalid_argument("PsiFormer parameter export does not contain the complete architecture layout");
 }
@@ -318,27 +357,40 @@ AdjointConvention PsiFormerExecutionPlan::adjointConvention() const
 }
 
 // Resolve typed parameter metadata without performing string lookup in an evaluation.
-const ParameterTensorDescriptor& PsiFormerExecutionPlan::parameter(ParameterRole role, std::size_t block) const
+const ParameterTensorDescriptor& PsiFormerExecutionPlan::parameter(
+    ParameterRole role, std::size_t block, HeadTensorComponent component) const
 {
-  const ParameterTensorDescriptor* descriptor = optionalParameter(role, block);
+  const ParameterTensorDescriptor* descriptor = optionalParameter(role, block, component);
   if (!descriptor)
     throw std::out_of_range(std::string("PsiFormer parameter role is absent: ") + parameterRoleName(role));
   return *descriptor;
 }
 
 // Report whether a typed role is represented without forcing optional roles to exist.
-bool PsiFormerExecutionPlan::hasParameter(ParameterRole role, std::size_t block) const
+bool PsiFormerExecutionPlan::hasParameter(ParameterRole role, std::size_t block, HeadTensorComponent component) const
 {
-  return optionalParameter(role, block) != nullptr;
+  return optionalParameter(role, block, component) != nullptr;
 }
 
 // Resolve a typed role while preserving the absence of architecture-dependent leaves.
 const ParameterTensorDescriptor* PsiFormerExecutionPlan::optionalParameter(ParameterRole role,
-                                                                            std::size_t block) const
+    std::size_t block, HeadTensorComponent component) const
 {
   const std::size_t role_index = static_cast<std::size_t>(role);
   if (role_index >= PARAMETER_ROLE_COUNT || (block != NO_ATTENTION_BLOCK && block >= model_shape_.attention_blocks))
     throw std::out_of_range("PsiFormer parameter role lookup is out of range");
+  if (component != HeadTensorComponent::REAL && component != HeadTensorComponent::IMAG)
+    throw std::out_of_range("PsiFormer head tensor component is unknown");
+  if (component == HeadTensorComponent::IMAG)
+  {
+    if ((role != ParameterRole::BACKFLOW_UP_WEIGHT && role != ParameterRole::BACKFLOW_DOWN_WEIGHT) ||
+        block != NO_ATTENTION_BLOCK)
+      throw std::invalid_argument("Imaginary PsiFormer components are restricted to global backflow heads");
+    if (imaginary_head_lookup_.empty())
+      return nullptr;
+    const std::size_t index = imaginary_head_lookup_[role == ParameterRole::BACKFLOW_UP_WEIGHT ? 0 : 1];
+    return index == NO_ATTENTION_BLOCK ? nullptr : &parameter_tensors_[index];
+  }
   const std::size_t lookup_stride = model_shape_.attention_blocks + 1;
   const std::size_t block_slot = block == NO_ATTENTION_BLOCK ? 0 : block + 1;
   const std::size_t descriptor_index = descriptor_lookup_[role_index * lookup_stride + block_slot];

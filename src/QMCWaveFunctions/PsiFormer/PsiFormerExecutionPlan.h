@@ -15,7 +15,8 @@
  *
  * Boundary and scalar-domain choices are represented explicitly.  Open and
  * real Gamma-point periodic fixed-nucleus models are supported; genuinely
- * complex scalar domains remain reserved for the twist implementation.
+ * Paired-real complex heads have explicit metadata admission; this does not
+ * advertise an executable complex wavefunction or change the real trunk domain.
  */
 
 #ifndef QMCPLUSPLUS_PSIFORMER_EXECUTION_PLAN_H
@@ -58,6 +59,20 @@ enum class ParameterRole
 };
 
 inline constexpr std::size_t PARAMETER_ROLE_COUNT = static_cast<std::size_t>(ParameterRole::COUNT);
+
+/// Select the orbital projection representation independently of the real trunk.
+enum class HeadRepresentation
+{
+  REAL,
+  PAIRED_REAL_COMPLEX
+};
+
+/// Distinguish the two real leaves of a complex head without adding legacy roles.
+enum class HeadTensorComponent
+{
+  REAL,
+  IMAG
+};
 
 /// Select the displacement policy expected by geometry-producing kernels.
 enum class BoundaryCondition
@@ -113,6 +128,9 @@ struct ExecutionEnvironment
   ScalarDomain compute_scalar_domain   = ScalarDomain::REAL;
   ScalarDomain amplitude_scalar_domain = ScalarDomain::REAL;
   bool fixed_nuclei                     = true;
+  // PAIRED_REAL_COMPLEX currently describes full, reciprocal-phase-free heads
+  // only. Public execution admission remains a separate adapter capability gate.
+  HeadRepresentation head_representation = HeadRepresentation::REAL;
 };
 
 /** Advertise implemented and reserved evaluator capabilities. */
@@ -149,6 +167,7 @@ struct ParameterTensorDescriptor
 
   /// Return the number of scalar values in this tensor's flat interval.
   std::size_t size() const { return end - begin; }
+  HeadTensorComponent head_component = HeadTensorComponent::REAL;
 };
 
 /**
@@ -205,22 +224,27 @@ public:
 
   /// Resolve one unique typed descriptor, optionally within an attention block.
   const ParameterTensorDescriptor& parameter(ParameterRole role,
-                                             std::size_t attention_block = NO_ATTENTION_BLOCK) const;
+      std::size_t attention_block = NO_ATTENTION_BLOCK,
+      HeadTensorComponent component = HeadTensorComponent::REAL) const;
 
   /// Return whether the plan contains one typed descriptor.
   bool hasParameter(ParameterRole role,
-                    std::size_t attention_block = NO_ATTENTION_BLOCK) const;
+      std::size_t attention_block = NO_ATTENTION_BLOCK,
+      HeadTensorComponent component = HeadTensorComponent::REAL) const;
 
   /// Resolve an optional typed descriptor, returning null when the role is absent.
   const ParameterTensorDescriptor* optionalParameter(
       ParameterRole role,
-      std::size_t attention_block = NO_ATTENTION_BLOCK) const;
+      std::size_t attention_block = NO_ATTENTION_BLOCK,
+      HeadTensorComponent component = HeadTensorComponent::REAL) const;
 
 private:
   ModelShape model_shape_;
   ExecutionEnvironment environment_;
   std::vector<ParameterTensorDescriptor> parameter_tensors_;
   std::vector<std::size_t> descriptor_lookup_;
+  // Exactly two global head slots, allocated only for a paired-real profile.
+  std::vector<std::size_t> imaginary_head_lookup_;
   std::size_t parameter_count_ = 0;
 };
 

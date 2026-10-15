@@ -31,6 +31,9 @@ namespace qmcplusplus::psiformer
 /// Stable name of the first internally constructible DeepQMC-compatible profile.
 inline constexpr char DEEPQMC_PSIFORMER_V1[] = "deepqmc_psiformer_v1";
 
+/// Full complex periodic heads with real trunk/parameters and no inner phases.
+inline constexpr char PSIFORMER_COMPLEX_PERIODIC_V1[] = "psiformer_complex_periodic_v1";
+
 /// Stable name of the integer generator and Gaussian transform used by v1.
 inline constexpr char PSIFORMER_INITIALIZATION_RNG_V1[] = "splitmix64_box_muller_v1";
 
@@ -58,6 +61,7 @@ struct TensorInitializationDiagnostic
   double observed_standard_deviation     = 0;
   double observed_minimum                = 0;
   double observed_maximum                = 0;
+  HeadTensorComponent head_component = HeadTensorComponent::REAL;
 };
 
 /** Aggregate diagnostics for one complete model initialization. */
@@ -94,6 +98,11 @@ struct InitializedPsiFormerParameters
  * ``deepqmc_psiformer_v1`` fixes the production architecture to 16 full
  * determinants, width 256, four attention heads, and four attention blocks.
  * Electron spin populations and the number of nuclei remain system dependent.
+ * ``psiformer_complex_periodic_v1`` keeps those dimensions and real geometry/trunk,
+ * adding two real imaginary-head tensors. Both Cartesian head components have
+ * sigma=1/sqrt(2*feature_dimension), preserving the legacy mean-square complex
+ * projection scale. It requires explicit matching paired-real periodic metadata;
+ * initializing parameters does not advertise public complex execution support.
  */
 InitializedPsiFormerParameters initializePsiFormerParameters(
     const ModelShape& model_shape,

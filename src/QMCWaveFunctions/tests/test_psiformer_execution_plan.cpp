@@ -57,7 +57,8 @@ void appendLayout(std::vector<ParameterLayoutInput>& layouts,
 }
 
 /// Construct all string-keyed layouts emitted for the test architecture.
-TestParameterStore makeParameterStore(ModelShape model = testModelShape(), bool include_same_alpha = true)
+TestParameterStore makeParameterStore(ModelShape model = testModelShape(), bool include_same_alpha = true,
+                                     bool periodic = false)
 {
   const std::size_t electrons = model.electrons();
   const std::string prefix = "neural_network_wave_function/~/";
@@ -79,7 +80,7 @@ TestParameterStore makeParameterStore(ModelShape model = testModelShape(), bool 
   appendLayout(store.layouts, prefix + "omni_net/~/Backflow_1/~/mlp/linear_0", "w",
                {model.feature_dimension, model.determinants * electrons});
   appendLayout(store.layouts, prefix + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w",
-               {4 * model.nuclei + 1, model.feature_dimension});
+               {(periodic ? 7 : 4) * model.nuclei + 1, model.feature_dimension});
 
   for (std::size_t block = 0; block < model.attention_blocks; ++block)
   {
@@ -102,6 +103,31 @@ TestParameterStore makeParameterStore(ModelShape model = testModelShape(), bool 
   return store;
 }
 
+/// Metadata-only paired head environment, without claiming a public complex executor.
+ExecutionEnvironment pairedEnvironment()
+{
+  ExecutionEnvironment environment;
+  environment.boundary = BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.periodic_axes = {true, true, true};
+  environment.lattice_vectors = {{{8, 0, 0}, {0, 8, 0}, {0, 0, 8}}};
+  environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+  environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+  return environment;
+}
+
+/// Append only the explicitly named imaginary real-valued head leaves.
+void appendImaginaryHeads(TestParameterStore& store, bool include_down = true)
+{
+  const ModelShape model = testModelShape();
+  const std::string prefix = "neural_network_wave_function/~/omni_net/~/";
+  appendLayout(store.layouts, prefix + "Backflow/~/mlp/linear_0", "w_imag",
+               {model.feature_dimension, model.determinants * model.electrons()});
+  if (include_down)
+    appendLayout(store.layouts, prefix + "Backflow_1/~/mlp/linear_0", "w_imag",
+                 {model.feature_dimension, model.determinants * model.electrons()});
+}
+
 } // namespace
 
 TEST_CASE("PsiFormer execution plan types imported parameter layouts", "[wavefunction][psiformer]")
@@ -114,6 +140,14 @@ TEST_CASE("PsiFormer execution plan types imported parameter layouts", "[wavefun
   REQUIRE(plan.parameterCount() == store.layouts.back().end);
   CHECK(plan.adjointConvention() == AdjointConvention::TRANSPOSE);
   CHECK(plan.environment().boundary == BoundaryCondition::OPEN);
+  CHECK(plan.environment().head_representation == HeadRepresentation::REAL);
+  CHECK(PARAMETER_ROLE_COUNT == 17);
+  CHECK(static_cast<std::size_t>(ParameterRole::BACKFLOW_UP_WEIGHT) == 9);
+  CHECK(static_cast<std::size_t>(ParameterRole::BACKFLOW_DOWN_WEIGHT) == 10);
+  CHECK(static_cast<std::size_t>(ParameterRole::CUSP_OPPOSITE_ALPHA) == 16);
+  CHECK(plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT).head_component == HeadTensorComponent::REAL);
+  CHECK(plan.optionalParameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK,
+                               HeadTensorComponent::IMAG) == nullptr);
 
   const ParameterTensorDescriptor& query = plan.parameter(ParameterRole::ATTENTION_QUERY_WEIGHT, 0);
   CHECK(query.attention_block == 0);
@@ -194,6 +228,58 @@ TEST_CASE("PsiFormer execution plan supports a canonical optional same-spin cusp
   TestParameterStore missing_required = makeParameterStore(same_pair_shape, false);
   CHECK_THROWS_WITH(PsiFormerExecutionPlan::fromParameters(missing_required, same_pair_shape),
                     Catch::Matchers::ContainsSubstring("same-spin cusp alpha"));
+}
+
+TEST_CASE("PsiFormer paired-real head metadata preserves legacy roles and explicit components",
+          "[wavefunction][psiformer]")
+{
+  const ExecutionEnvironment environment = pairedEnvironment();
+  TestParameterStore store = makeParameterStore(testModelShape(), true, true);
+  appendImaginaryHeads(store);
+  const PsiFormerExecutionPlan plan = PsiFormerExecutionPlan::fromParameters(store, testModelShape(), environment);
+  CHECK(plan.parameterTensors().size() == 27);
+  CHECK(plan.environment().compute_scalar_domain == ScalarDomain::REAL);
+  CHECK(plan.environment().parameter_scalar_domain == ScalarDomain::REAL);
+  CHECK(plan.environment().amplitude_scalar_domain == ScalarDomain::COMPLEX);
+  CHECK_FALSE(PsiFormerExecutionPlan::capabilities().complex_scalars);
+  const auto& real = plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT);
+  const auto& imaginary = plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK,
+                                         HeadTensorComponent::IMAG);
+  CHECK(real.name == "w");
+  CHECK(real.head_component == HeadTensorComponent::REAL);
+  CHECK(imaginary.name == "w_imag");
+  CHECK(imaginary.role == real.role);
+  CHECK(imaginary.head_component == HeadTensorComponent::IMAG);
+  CHECK(imaginary.shape == real.shape);
+  CHECK(imaginary.begin != real.begin);
+  CHECK_THROWS_AS(plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT, NO_ATTENTION_BLOCK,
+                                  static_cast<HeadTensorComponent>(99)), std::out_of_range);
+  CHECK_THROWS_AS(plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT, NO_ATTENTION_BLOCK,
+                                  HeadTensorComponent::IMAG), std::invalid_argument);
+  CHECK_THROWS_AS(plan.parameter(ParameterRole::BACKFLOW_UP_WEIGHT, 0, HeadTensorComponent::IMAG),
+                  std::invalid_argument);
+
+  TestParameterStore missing = makeParameterStore(testModelShape(), true, true);
+  appendImaginaryHeads(missing, false);
+  CHECK_THROWS_WITH(PsiFormerExecutionPlan::fromParameters(missing, testModelShape(), environment),
+                    Catch::Matchers::ContainsSubstring("missing imaginary head"));
+  ExecutionEnvironment legacy = environment;
+  legacy.head_representation = HeadRepresentation::REAL;
+  legacy.amplitude_scalar_domain = ScalarDomain::REAL;
+  CHECK_THROWS_WITH(PsiFormerExecutionPlan::fromParameters(store, testModelShape(), legacy),
+                    Catch::Matchers::ContainsSubstring("require paired-real head metadata"));
+  ExecutionEnvironment invalid = environment;
+  invalid.head_representation = static_cast<HeadRepresentation>(99);
+  CHECK_THROWS_AS(PsiFormerExecutionPlan::fromParameters(store, testModelShape(), invalid), std::invalid_argument);
+  invalid = environment;
+  invalid.amplitude_scalar_domain = ScalarDomain::REAL;
+  CHECK_THROWS_AS(PsiFormerExecutionPlan::fromParameters(store, testModelShape(), invalid), std::invalid_argument);
+  invalid = environment;
+  invalid.compute_scalar_domain = ScalarDomain::COMPLEX;
+  CHECK_THROWS_AS(PsiFormerExecutionPlan::fromParameters(store, testModelShape(), invalid), std::invalid_argument);
+  store.layouts.back().module = "neural_network_wave_function/~/electron_embedding/linear";
+  CHECK_THROWS_WITH(PsiFormerExecutionPlan::fromParameters(store, testModelShape(), environment),
+                    Catch::Matchers::ContainsSubstring("Unrecognized PsiFormer parameter tensor"));
 }
 
 TEST_CASE("PsiFormer workspace grows only at explicit preparation boundaries", "[wavefunction][psiformer]")

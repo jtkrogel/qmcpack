@@ -41,11 +41,13 @@ ModelShape lithiumHydrideShape()
 /// Resolve one tensor diagnostic by typed role and optional attention block.
 const TensorInitializationDiagnostic& diagnostic(const InitializationDiagnostics& diagnostics,
                                                  ParameterRole role,
-                                                 std::size_t block = NO_ATTENTION_BLOCK)
+                                                 std::size_t block = NO_ATTENTION_BLOCK,
+                                                 HeadTensorComponent component = HeadTensorComponent::REAL)
 {
   const auto match = std::find_if(diagnostics.tensors.begin(), diagnostics.tensors.end(),
-                                  [role, block](const TensorInitializationDiagnostic& candidate) {
-                                    return candidate.role == role && candidate.attention_block == block;
+                                  [role, block, component](const TensorInitializationDiagnostic& candidate) {
+                                    return candidate.role == role && candidate.attention_block == block &&
+                                        candidate.head_component == component;
                                   });
   if (match == diagnostics.tensors.end())
     throw std::runtime_error("Missing initialization diagnostic");
@@ -63,6 +65,51 @@ void checkConstant(const InitializedPsiFormerParameters& initialized,
     REQUIRE(initialized.values[index] == expected);
 }
 
+/// Reproduce the native real parameter store's stable layout-only fingerprint.
+std::uint64_t layoutFingerprint(const InitializedPsiFormerParameters& initialized)
+{
+  std::uint64_t hash = 14695981039346656037ULL;
+  auto mix_byte = [&hash](std::uint8_t byte) {
+    hash ^= byte;
+    hash *= 1099511628211ULL;
+  };
+  auto mix_integer = [&mix_byte](std::uint64_t value) {
+    for (int byte = 0; byte < 8; ++byte)
+      mix_byte(static_cast<std::uint8_t>(value >> (8 * byte)));
+  };
+  auto mix_string = [&mix_byte, &mix_integer](const std::string& value) {
+    mix_integer(value.size());
+    for (unsigned char character : value)
+      mix_byte(character);
+  };
+  mix_integer(initialized.layouts.size());
+  mix_integer(initialized.values.size());
+  for (const auto& layout : initialized.layouts)
+  {
+    mix_string(layout.module);
+    mix_string(layout.name);
+    mix_integer(layout.shape.size());
+    for (std::size_t extent : layout.shape)
+      mix_integer(extent);
+    mix_integer(layout.begin);
+    mix_integer(layout.end);
+  }
+  return hash;
+}
+
+/// Require explicit complex periodic metadata while keeping parameter/trunk domains real.
+ExecutionEnvironment pairedPeriodicEnvironment()
+{
+  ExecutionEnvironment environment;
+  environment.boundary = BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.periodic_axes = {true, true, true};
+  environment.lattice_vectors = {{{8, 0, 0}, {0, 8, 0}, {0, 0, 8}}};
+  environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+  environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
+  return environment;
+}
+
 } // namespace
 
 TEST_CASE("PsiFormer v1 initialization constructs the canonical DeepQMC layout",
@@ -74,6 +121,7 @@ TEST_CASE("PsiFormer v1 initialization constructs the canonical DeepQMC layout",
 
   CHECK(initialized.profile == DEEPQMC_PSIFORMER_V1);
   CHECK(initialized.seed == 17);
+  CHECK(layoutFingerprint(initialized) == UINT64_C(0xcc53a03cb09d6fea));
   REQUIRE(initialized.layouts.size() == 41);
   CHECK(initialized.values.size() == 1610498);
   CHECK(plan.parameterCount() == initialized.values.size());
@@ -214,6 +262,62 @@ TEST_CASE("PsiFormer v1 initialization matches DeepQMC role-specific scales",
   CHECK(bias.expected_standard_deviation == Catch::Approx(0.0625));
   CHECK(std::abs(bias.observed_mean) < 0.02);
   CHECK(bias.observed_standard_deviation == Catch::Approx(0.0625).margin(0.012));
+}
+
+TEST_CASE("PsiFormer complex periodic initialization uses independent normalized real head components",
+          "[wavefunction][psiformer][initialization]")
+{
+  const auto environment = pairedPeriodicEnvironment();
+  const auto initialized = initializePsiFormerParameters(lithiumHydrideShape(), 73,
+      PSIFORMER_COMPLEX_PERIODIC_V1, environment);
+  const auto repeated = initializePsiFormerParameters(lithiumHydrideShape(), 73,
+      PSIFORMER_COMPLEX_PERIODIC_V1, environment);
+  const PsiFormerExecutionPlan plan(initialized.model_shape, initialized.layouts, environment);
+  CHECK(initialized.profile == PSIFORMER_COMPLEX_PERIODIC_V1);
+  CHECK(initialized.values == repeated.values);
+  CHECK(initialized.layouts.size() == 43);
+  CHECK(initialized.values.size() == 1644802);
+  CHECK(initialized.diagnostics.constant_parameter_count == 514);
+  CHECK(initialized.diagnostics.random_parameter_count == 1644288);
+  CHECK(PARAMETER_ROLE_COUNT == 17);
+  CHECK_FALSE(PsiFormerExecutionPlan::capabilities().complex_scalars);
+  for (ParameterRole role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
+  {
+    const auto& real = plan.parameter(role);
+    const auto& imaginary = plan.parameter(role, NO_ATTENTION_BLOCK, HeadTensorComponent::IMAG);
+    const double sigma = 1.0 / std::sqrt(512.0);
+    const auto& real_diagnostic = diagnostic(initialized.diagnostics, role);
+    const auto& imaginary_diagnostic = diagnostic(initialized.diagnostics, role, NO_ATTENTION_BLOCK,
+                                                   HeadTensorComponent::IMAG);
+    CHECK(real_diagnostic.law == InitializationLaw::NORMAL);
+    CHECK(imaginary_diagnostic.law == InitializationLaw::NORMAL);
+    CHECK(real_diagnostic.distribution_standard_deviation == Catch::Approx(sigma));
+    CHECK(imaginary_diagnostic.distribution_standard_deviation == Catch::Approx(sigma));
+    CHECK(real_diagnostic.observed_standard_deviation == Catch::Approx(sigma).margin(.001));
+    CHECK(imaginary_diagnostic.observed_standard_deviation == Catch::Approx(sigma).margin(.001));
+    CHECK(real.shape == std::vector<std::size_t>{256, 64});
+    CHECK(imaginary.shape == real.shape);
+    CHECK_FALSE(std::equal(initialized.values.begin() + real.begin, initialized.values.begin() + real.end,
+                           initialized.values.begin() + imaginary.begin));
+    long double cross = 0, square = 0;
+    for (std::size_t i = 0; i < real.size(); ++i)
+    {
+      const long double r = initialized.values[real.begin + i];
+      cross += r * initialized.values[imaginary.begin + i];
+      square += r * r;
+    }
+    CHECK(std::abs(cross / square) < .05L);
+  }
+  // Two component variances recover the original head's variance; the real trunk
+  // keeps its established per-role scale and is not duplicated or rescaled.
+  CHECK(diagnostic(initialized.diagnostics, ParameterRole::ATTENTION_QUERY_WEIGHT, 0).
+          distribution_standard_deviation == Catch::Approx(.0625));
+  checkConstant(initialized, plan, ParameterRole::ENVELOPE_PI_UP, 1);
+  checkConstant(initialized, plan, ParameterRole::CUSP_OPPOSITE_ALPHA, 1);
+  CHECK_THROWS_AS(initializePsiFormerParameters(lithiumHydrideShape(), 73,
+      PSIFORMER_COMPLEX_PERIODIC_V1), std::invalid_argument);
+  CHECK_THROWS_AS(initializePsiFormerParameters(lithiumHydrideShape(), 73,
+      DEEPQMC_PSIFORMER_V1, environment), std::invalid_argument);
 }
 
 TEST_CASE("PsiFormer v1 initialization rejects unsupported profiles and shapes",
