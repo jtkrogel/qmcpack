@@ -202,6 +202,14 @@ public:
     return result_.data();
   }
 
+  /// Borrow true paired affine jets before envelope/phase multiplication, even at E=0.
+  const C* affineProjectionData() const
+  {
+    if (!valid_)
+      throw std::logic_error("complex orbital affine projection unavailable");
+    return projected_.data();
+  }
+
   /// Count explicitly owned numeric buffers and copied reciprocal momentum storage.
   std::size_t storageBytes() const
   {

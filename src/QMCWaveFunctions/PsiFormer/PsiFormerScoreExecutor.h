@@ -200,6 +200,37 @@ private:
   }
 };
 
+/** Shared real cusp value and scaled real parameter reverse, preserving legacy order. */
+inline double realCuspValueAndReverse(const PsiFormerGeometryCache& geometry,
+    std::size_t spin_up_electrons, double same_alpha, double anti_alpha,
+    double* same_score, double& anti_score, double reverse_seed)
+{
+  const auto& pairs       = geometry.electronPairs();
+  const auto& distances   = geometry.electronElectronPairs().distances();
+  double cusp             = 0.0;
+  for (std::size_t pair_index = 0; pair_index < pairs.size(); ++pair_index)
+  {
+    const ElectronPair pair = pairs[pair_index];
+    const bool same_spin = (pair.first < spin_up_electrons) == (pair.second < spin_up_electrons);
+    const double alpha   = same_spin ? same_alpha : anti_alpha;
+    const double factor  = same_spin ? 0.25 : 0.5;
+    const double radius  = distances[pair_index];
+    const double denominator = alpha + radius;
+    cusp -= factor * alpha * alpha / denominator;
+    const double derivative = -factor * alpha * (alpha + 2.0 * radius) /
+        (denominator * denominator);
+    if (same_spin)
+    {
+      if (!same_score)
+        throw std::logic_error("PsiFormer score plan omitted a required same-spin cusp parameter");
+      same_score[0] += reverse_seed * derivative;
+    }
+    else
+      anti_score += reverse_seed * derivative;
+  }
+  return cusp;
+}
+
 /** Return the wavefunction value and its canonical log-parameter score. */
 struct DirectScoreResult
 {
@@ -1158,30 +1189,8 @@ private:
         ? score(workspace, ParameterRole::CUSP_SAME_ALPHA)
         : nullptr;
     double& anti_score      = score(workspace, ParameterRole::CUSP_OPPOSITE_ALPHA)[0];
-    const auto& pairs       = workspace.geometry_.electronPairs();
-    const auto& distances   = workspace.geometry_.electronElectronPairs().distances();
-    double cusp             = 0.0;
-    for (std::size_t pair_index = 0; pair_index < pairs.size(); ++pair_index)
-    {
-      const ElectronPair pair = pairs[pair_index];
-      const bool same_spin = (pair.first < spin_up_electrons_) == (pair.second < spin_up_electrons_);
-      const double alpha   = same_spin ? same_alpha : anti_alpha;
-      const double factor  = same_spin ? 0.25 : 0.5;
-      const double radius  = distances[pair_index];
-      const double denominator = alpha + radius;
-      cusp -= factor * alpha * alpha / denominator;
-      const double derivative = -factor * alpha * (alpha + 2.0 * radius) /
-          (denominator * denominator);
-      if (same_spin)
-      {
-        if (!same_score)
-          throw std::logic_error("PsiFormer score plan omitted a required same-spin cusp parameter");
-        same_score[0] += reverse_seed * derivative;
-      }
-      else
-        anti_score += reverse_seed * derivative;
-    }
-    return cusp;
+    return realCuspValueAndReverse(workspace.geometry_, spin_up_electrons_, same_alpha,
+        anti_alpha, same_score, anti_score, reverse_seed);
   }
 
   /// Seed determinant adjoints and reverse orbitals, backflow, and envelopes.
