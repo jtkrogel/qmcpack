@@ -544,6 +544,17 @@ add_unit_test(deterministic-unit_test_psiformer_complex_determinant
 set_tests_properties(deterministic-unit_test_psiformer_complex_determinant
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# Complex head math consumes shared real feature/envelope jets, without qmcwfs.
+add_executable(test_psiformer_complex_orbital test_psiformer_complex_orbital.cpp)
+target_compile_options(test_psiformer_complex_orbital PRIVATE
+                       $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-fast-math>)
+target_include_directories(test_psiformer_complex_orbital PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_complex_orbital
+              1 1 $<TARGET_FILE:test_psiformer_complex_orbital>)
+set_tests_properties(deterministic-unit_test_psiformer_complex_orbital
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 add_executable(test_psiformer_device_mixed_precision
                test_psiformer_device_mixed_precision.cpp)
 target_link_libraries(test_psiformer_device_mixed_precision qmc_external_catch2)
