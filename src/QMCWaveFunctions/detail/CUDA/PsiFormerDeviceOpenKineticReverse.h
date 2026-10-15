@@ -20,8 +20,11 @@ namespace qmcplusplus::psiformer::device
 
 /** Reverse one retained open orbital FULL_VGL tape.
  *
- * Exactly one device thread owns the complete reduction and its six canonical
- * response tensors.  The call allocates no storage and uses no atomics.
+ * Null parallel_failure preserves the single-thread reference. An admitted
+ * uint32 word selects unique-writer parallel contractions, with only integer
+ * fault atomics and no numerical scratch. The call allocates no storage.
+ * Mixed-invalid inputs deterministically prefer nonfinite over coalescence;
+ * regular forward admission excludes such ambiguous production inputs.
  */
 Error launchOpenOrbitalKineticReverse(
     Stream stream,
@@ -43,7 +46,8 @@ Error launchOpenOrbitalKineticReverse(
     double* feature_adjoint,
     double* response,
     OpenKineticReverseStatus* status,
-    const periodic_geometry::Cell* periodic_cell = nullptr);
+    const periodic_geometry::Cell* periodic_cell = nullptr,
+    unsigned int* parallel_failure = nullptr);
 
 /** Reverse one complete open cusp FULL_VGL adjoint into alpha responses. */
 Error launchOpenCuspKineticReverse(

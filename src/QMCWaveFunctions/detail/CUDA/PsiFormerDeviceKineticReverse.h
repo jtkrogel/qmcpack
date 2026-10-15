@@ -70,6 +70,7 @@ inline TargetKineticReverseCost estimateTargetKineticReverseCost(const PsiFormer
         std::numeric_limits<std::size_t>::max());
     cost.device_workspace_bytes -= checkedDeviceBytes<double>(mul(3, mul(ne, ne)));
     cost.device_workspace_bytes = add(cost.device_workspace_bytes, products.device_workspace_bytes);
+    cost.device_workspace_bytes = add(cost.device_workspace_bytes, checkedDeviceBytes<unsigned int>(1));
   }
   for (auto bytes : {checkedDeviceBytes<device_determinant::DerivativeStatus>(1),
        checkedDeviceBytes<OpenSpatialStatus>(1),
@@ -132,6 +133,7 @@ private:
           std::numeric_limits<std::size_t>::max());
       lifted_products_ = std::make_unique<PreparedDeviceLiftedDeterminantProducts>(ne, lifted_channel_slots,
           products.device_workspace_bytes, queue_, blas_);
+      orbital_failure_.reserve(1);
     }
     else
       matrix_scratch_.reserve(multiply(3, multiply(ne, ne)));
@@ -285,7 +287,7 @@ private:
           parameter(ParameterRole::ENVELOPE_ZETA_UP), parameter(ParameterRole::ENVELOPE_ZETA_DOWN),
           head.backflow + orbital_offset, head.envelope + orbital_offset, orbital_.data(),
           backflow_.data(), envelope_.data(), feature_.data(), response_.data(), kinetic_status(),
-          model_->periodicCell()), "kinetic orbital reverse");
+          model_->periodicCell(), lifted_products_ ? orbital_failure_.data() : nullptr), "kinetic orbital reverse");
       checkKinetic();
       const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
       const OpenCuspKineticReverseLayout cusp_layout{cusp_, response_.capacity(), same ? same->begin : 0,
@@ -430,6 +432,7 @@ public:
     add(checkedDeviceBytes<DerivativeFiniteStatus>(finite_status_.capacity()));
     if (lifted_products_)
       add(lifted_products_->deviceWorkspaceBytes());
+    add(checkedDeviceBytes<unsigned int>(orbital_failure_.capacity()));
     return bytes;
   }
 
@@ -540,6 +543,7 @@ private:
   DeviceBuffer<double> factor_, orbital_, backflow_, envelope_, matrix_scratch_, root_adjoint_, response_, dummy_bias_;
   DeviceBuffer<double> weights_, masses_, total_gradient_;
   DeviceBuffer<device_determinant::DerivativeStatus> determinant_status_, reverse_status_;
+  DeviceBuffer<unsigned int> orbital_failure_;
   DeviceBuffer<OpenSpatialStatus> open_status_;
   DeviceBuffer<OpenKineticReverseStatus> kinetic_status_;
   std::vector<device_determinant::DerivativeStatus> host_determinant_status_;

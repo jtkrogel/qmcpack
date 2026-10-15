@@ -11,6 +11,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_TARGET_KINETIC_VALIDATION_H
 
 #include "PsiFormerDeviceTargetKinetic.h"
+#include "PsiFormerDeviceOrbitalReverseValidation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
 
 #include <iostream>
@@ -25,6 +26,7 @@ inline void validateTargetKinetic(pf::PsiFormer& model, const PsiFormerExecution
     compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas)
 {
   const auto ne = plan.modelShape().electrons(), parameters = plan.parameterCount();
+  validateParallelOrbitalReverse(queue, image->periodicCell());
   const std::vector<double> positions(model.cfg.electrons.x.begin(), model.cfg.electrons.x.begin() + 3 * ne);
   std::vector<double> masses(ne), drift(3 * ne), imaginary_drift(3 * ne);
   for (std::size_t electron = 0; electron < ne; ++electron)

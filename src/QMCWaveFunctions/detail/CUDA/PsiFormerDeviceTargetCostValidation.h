@@ -126,7 +126,8 @@ inline void validateTargetCosts()
           const auto gemm = estimateTargetKineticCost(plan, targets, slots);
           const auto expected = spatial_detail::checkedAdd(
               kinetic.device_workspace_bytes - checkedDeviceBytes<double>(3 * ne * ne),
-              products.device_workspace_bytes, "Lifted target cost fixture overflow");
+              spatial_detail::checkedAdd(products.device_workspace_bytes, checkedDeviceBytes<unsigned int>(1),
+                  "Parallel orbital fault storage overflow"), "Lifted target cost fixture overflow");
           if (gemm.device_workspace_bytes != expected || gemm.host_workspace_bytes != kinetic.host_workspace_bytes ||
               gemm.charged_scalar_work_units != kinetic.charged_scalar_work_units ||
               !admitTargetCost(plan, targets, expected, true, slots) ||
