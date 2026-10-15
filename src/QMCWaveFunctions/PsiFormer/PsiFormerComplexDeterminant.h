@@ -258,6 +258,31 @@ public:
     return result_;
   }
 
+  /// Count every explicitly owned vector; value-only calls still reserve inverse scratch.
+  std::size_t storageBytes() const
+  {
+    std::size_t bytes = 0;
+    auto add = [&bytes](const auto& buffer) {
+      using Element = typename std::decay_t<decltype(buffer)>::value_type;
+      bytes = sum(bytes, product(buffer.capacity(), sizeof(Element)));
+    };
+    add(lu_);
+    add(inverse_);
+    add(permutation_);
+    add(block_amplitude_);
+    add(available_);
+    add(terms_);
+    add(scaled_terms_);
+    add(weights_);
+    add(solve_);
+    add(matrix_product_);
+    add(gradient_);
+    add(lap_ratio_);
+    add(lap_log_);
+    add(adjoint_);
+    return bytes;
+  }
+
   /// Allocation identity permits warmed no-growth checks without a global allocator.
   std::size_t storageFingerprint() const noexcept
   {

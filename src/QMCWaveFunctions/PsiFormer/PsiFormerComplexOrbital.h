@@ -159,6 +159,17 @@ public:
     return result_.data();
   }
 
+  /// Count explicitly owned numeric buffers and copied reciprocal momentum storage.
+  std::size_t storageBytes() const
+  {
+    std::size_t bytes = multiply(projected_.capacity(), sizeof(C));
+    bytes = spatial_detail::checkedAdd(bytes, multiply(result_.capacity(), sizeof(C)),
+                                       "complex head storage bytes overflow");
+    return spatial_detail::checkedAdd(bytes,
+        multiply(descriptor_.reciprocal_momenta.capacity(), sizeof(std::array<double, 3>)),
+        "complex head storage bytes overflow");
+  }
+
   /// Fingerprint prepared allocation identities for warmed no-growth checks.
   std::size_t storageFingerprint() const noexcept
   {

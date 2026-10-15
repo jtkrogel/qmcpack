@@ -74,6 +74,16 @@ enum class DirectValuePreparation
   REAL_TRUNK_ONLY
 };
 
+/// Share the existing real atom-centred envelope expression without changing its order.
+inline double realOrbitalEnvelopeValue(const double* radii, const double* pi,
+                                      const double* zeta, std::size_t nucleus_count)
+{
+  double value = 0;
+  for (std::size_t nucleus = 0; nucleus < nucleus_count; ++nucleus)
+    value += pi[nucleus] * std::exp(-std::abs(zeta[nucleus] * radii[nucleus]));
+  return value;
+}
+
 /// Hold all parameter intervals and fixed dimensions required by direct inference.
 class DirectValueParameterLayout
 {
@@ -469,6 +479,7 @@ struct DirectValueTrunkResultView
   double cusp;
   const PsiFormerGeometryCache* geometry;
   GeometryPositionView positions;
+  const double* packed_positions;
 };
 
 /** Return the real molecular wavefunction in sign/log-magnitude representation.
@@ -572,7 +583,8 @@ public:
     workspace.observed_parameter_version_ = parameters_.version();
     return {workspace.features_a_.data(), layout_->electronCount(), layout_->featureWidth(),
             workspace.observed_parameter_version_, workspace.evaluation_generation_, cusp, &workspace.geometry_,
-            GeometryPositionView::interleaved(workspace.electron_positions_.data(), layout_->electronCount())};
+            GeometryPositionView::interleaved(workspace.electron_positions_.data(), layout_->electronCount()),
+            workspace.electron_positions_.data()};
   }
 
   /// Evaluate sign and log|psi| without allocating or building differentiation nodes.
@@ -817,13 +829,8 @@ private:
           for (std::size_t feature = 0; feature < width; ++feature)
             backflow_value += features[feature] * backflow[feature * ndet * ne + channel];
 
-          double envelope_value = 0;
-          for (std::size_t nucleus = 0; nucleus < na; ++nucleus)
-          {
-            const std::size_t parameter = channel * na + nucleus;
-            const double radius         = distances[electron * na + nucleus];
-            envelope_value += pi[parameter] * std::exp(-std::abs(zeta[parameter] * radius));
-          }
+          const double envelope_value = realOrbitalEnvelopeValue(
+              distances.data() + electron * na, pi + channel * na, zeta + channel * na, na);
           workspace.orbital_matrices_[(determinant * ne + electron) * ne + orbital] =
               backflow_value * envelope_value;
         }
