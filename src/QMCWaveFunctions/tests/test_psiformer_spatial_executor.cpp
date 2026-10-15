@@ -323,6 +323,61 @@ TEST_CASE("PsiFormer periodic spatial evaluation is image invariant and matches 
   checkClose(reference_lap_log[0], finite_laplacian, 8e-4, 8e-4);
 }
 
+TEST_CASE("PsiFormer direct spatial GEMM head matches scalar without extra storage",
+          "[wavefunction][psiformer][orbital_projection]")
+{
+  std::string system = "lih";
+  SECTION("LiH four electrons") {}
+  SECTION("OH seven electrons and unequal spins") { system = "oh"; }
+  GeneratedFiles files = generateFiles(system);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(
+      model.p, {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+                model.dim, model.heads, model.blocks});
+  pf::DirectValueExecutor value_executor(model, plan);
+  pf::DirectSpatialExecutor scalar(model, value_executor, plan);
+  pf::DirectSpatialExecutor gemm(model, value_executor, plan, pf::DirectOrbitalProjection::GEMM);
+  const auto positions = model.cfg.configuration(0);
+  const auto position_view = pf::GeometryPositionView::interleaved(positions.x.data(), model.ne);
+
+  const auto compare = [](const pf::DirectSpatialResultView& actual, const pf::DirectSpatialResultView& expected) {
+    CHECK(actual.sign == expected.sign);
+    checkClose(actual.logabs, expected.logabs);
+    checkClose(actual.value, expected.value);
+    REQUIRE(actual.gradient.size() == expected.gradient.size());
+    for (std::size_t i = 0; i < actual.gradient.size(); ++i)
+      checkClose(actual.gradient[i], expected.gradient[i], 2e-7, 2e-7);
+    REQUIRE(actual.lap_log.size() == expected.lap_log.size());
+    REQUIRE(actual.lap_ratio.size() == expected.lap_ratio.size());
+    for (std::size_t i = 0; i < actual.lap_log.size(); ++i)
+    {
+      checkClose(actual.lap_log[i], expected.lap_log[i], 2e-7, 2e-7);
+      checkClose(actual.lap_ratio[i], expected.lap_ratio[i], 2e-7, 2e-7);
+    }
+  };
+
+  // Each executor prepares precisely the same owner; GEMM only changes how its
+  // existing orbital vectors are filled and then consumed by the product rule.
+  for (const auto mode : {pf::DirectSpatialMode::FULL_VGL, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT})
+  {
+    auto reference = scalar.makeWorkspace(mode);
+    auto projected = gemm.makeWorkspace(mode);
+    reference->setPositions(position_view);
+    projected->setPositions(position_view);
+    const auto storage = projected->storageFingerprint();
+    const auto bytes = projected->vectorStorageBytes();
+    CHECK(bytes == reference->vectorStorageBytes());
+    CHECK(bytes == projected->requiredStorageBytes());
+    if (mode == pf::DirectSpatialMode::FULL_VGL)
+      compare(gemm.evaluateFull(*projected), scalar.evaluateFull(*reference));
+    else
+      for (const std::size_t electron : {std::size_t(0), model.ne - 1})
+        compare(gemm.evaluateActive(*projected, electron), scalar.evaluateActive(*reference, electron));
+    CHECK(projected->storageFingerprint() == storage);
+    CHECK(projected->vectorStorageBytes() == bytes);
+  }
+}
+
 TEST_CASE("PsiFormer direct spatial request validation", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");

@@ -33,6 +33,9 @@
 #ifndef QMCPLUSPLUS_PSIFORMER_SPATIAL_EXECUTOR_H
 #define QMCPLUSPLUS_PSIFORMER_SPATIAL_EXECUTOR_H
 
+#include "PsiFormerDenseKernels.h"
+#include "PsiFormerOrbitalProjection.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -51,6 +54,13 @@ enum class DirectSpatialMode
 {
   ACTIVE_ELECTRON_GRADIENT,
   FULL_VGL
+};
+
+/// Explicit developer selection; preserve the scalar head until paired timings.
+enum class DirectOrbitalProjection
+{
+  SCALAR,
+  GEMM
 };
 
 /// Provide a non-owning read-only view whose lifetime is tied to its workspace.
@@ -395,12 +405,14 @@ public:
   /// Resolve immutable parameter descriptors and retain the versioned value store.
   DirectSpatialExecutor(const PsiFormer& model,
                         const DirectValueExecutor& value_executor,
-                        const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
+                        const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                        DirectOrbitalProjection orbital_projection = DirectOrbitalProjection::SCALAR)
       : parameters_(model.p),
         layout_(value_executor.layout()),
         nuclei_(model.cfg.nuclei.x),
         boundary_(directGeometryBoundary(plan.environment())),
-        value_executor_identity_(&value_executor)
+        value_executor_identity_(&value_executor),
+        orbital_projection_(orbital_projection)
   {
     if (layout_->parameterCount() != plan.parameterCount() ||
         layout_->electronCount() != plan.modelShape().electrons())
@@ -521,6 +533,9 @@ private:
   /// Form determinant orbital matrices including spatial derivative products.
   void buildOrbitalMatrices(const double* parameters, DirectSpatialWorkspace& workspace) const;
 
+  /// Project directly into the existing orbital value/gradient/Laplacian vectors.
+  void projectBackflowMatrices(const double* parameters, DirectSpatialWorkspace& workspace) const;
+
   /// Add analytic electron-electron cusp value and spatial derivatives in place.
   double accumulateCusp(const double* parameters, DirectSpatialWorkspace& workspace) const;
 
@@ -564,6 +579,7 @@ private:
   std::vector<double> nuclei_;
   GeometryBoundary boundary_;
   const DirectValueExecutor* value_executor_identity_;
+  DirectOrbitalProjection orbital_projection_;
 };
 
 inline void DirectSpatialExecutor::refreshGeometry(DirectSpatialWorkspace& workspace) const
@@ -1058,6 +1074,46 @@ inline void DirectSpatialExecutor::applyAttentionBlock(
   std::swap(workspace.features_a_, workspace.features_b_);
 }
 
+// Each source plane and destination plane live in separate prepared vectors.
+// The value-only descriptor supplies the same spin/channel slice schedule for
+// every plane, without treating the vectors as one contiguous allocation.
+inline void DirectSpatialExecutor::projectBackflowMatrices(const double* parameters,
+                                                           DirectSpatialWorkspace& workspace) const
+{
+  namespace p = qmcplusplus::psiformer;
+  const auto projection = p::makeOpenOrbitalJetLayout(1, layout_->determinantCount(),
+      layout_->electronCount(), layout_->nucleusCount(), layout_->featureWidth(),
+      layout_->spinUpCount(), p::SpatialJetMode::VALUE_ONLY);
+  const auto& source = workspace.features_a_;
+  auto& target = workspace.orbital_matrices_;
+  const double* up = tensor(parameters, layout_->backflow_up_);
+  const double* down = tensor(parameters, layout_->backflow_down_);
+
+  // Reuse the row-major BLAS ABI with padded weight rows and D-major outputs.
+  p::forEachOpenOrbitalProjection(projection, [&](const p::OpenOrbitalProjectionSlice& slice) {
+    const auto& d = slice.dense;
+    const auto dimension = [](std::size_t extent) {
+      return p::dense::checkedBlasDimension(extent, "PsiFormer orbital projection exceeds BLAS integer ABI");
+    };
+    const int rows = dimension(d.rows), input = dimension(d.input_width), output = dimension(d.output_width);
+    const int source_stride = dimension(d.source_row_stride);
+    const int weight_stride = dimension(d.weight_row_stride), target_stride = dimension(d.target_row_stride);
+    const double* weight = (slice.spin_up ? up : down) + slice.weight_offset;
+    const auto apply = [&](const double* input_plane, double* output_plane) {
+      BLAS::gemm('N', 'N', output, rows, input, 1.0, weight, weight_stride,
+          input_plane + slice.source_offset, source_stride, 0.0,
+          output_plane + slice.target_offset, target_stride);
+    };
+    apply(source.value.data(), target.value.data());
+    for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+      apply(source.gradient.data() + lane * source.value.size(),
+          target.gradient.data() + lane * target.value.size());
+    for (std::size_t lane = 0; lane < workspace.laplacian_lanes_; ++lane)
+      apply(source.laplacian.data() + lane * source.value.size(),
+          target.laplacian.data() + lane * target.value.size());
+  });
+}
+
 inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters,
                                                         DirectSpatialWorkspace& workspace) const
 {
@@ -1073,6 +1129,9 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
   const std::size_t determinant_count = layout_->determinantCount();
   const std::size_t feature_width     = layout_->featureWidth();
   orbitals.clear();
+  const bool projected = orbital_projection_ == DirectOrbitalProjection::GEMM;
+  if (projected)
+    projectBackflowMatrices(parameters, workspace);
 
   for (std::size_t row_electron = 0; row_electron < electron_count; ++row_electron)
   {
@@ -1088,8 +1147,8 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
         const std::size_t channel = determinant * electron_count + orbital;
         const std::size_t matrix_element =
             (determinant * electron_count + row_electron) * electron_count + orbital;
-        double backflow_value = 0;
-        for (std::size_t feature = 0; feature < feature_width; ++feature)
+        double backflow_value = projected ? orbitals.value[matrix_element] : 0.0;
+        for (std::size_t feature = 0; !projected && feature < feature_width; ++feature)
           backflow_value += features.value[feature_begin + feature] *
               backflow[feature * determinant_count * electron_count + channel];
 
@@ -1124,23 +1183,14 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
                 radial_first * distance_laplacians[pair];
         }
 
-        orbitals.value[matrix_element] = backflow_value * envelope_value;
-        for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
-        {
-          double backflow_gradient = 0;
-          for (std::size_t feature = 0; feature < feature_width; ++feature)
-            backflow_gradient += features.gradient[gradientIndex(features, lane, feature_begin + feature)] *
-                backflow[feature * determinant_count * electron_count + channel];
-          orbitals.gradient[gradientIndex(orbitals, lane, matrix_element)] =
-              backflow_gradient * envelope_value +
-              backflow_value * workspace.scalar_gradient_scratch_[lane];
-        }
-
+        // Consume all projected gradients in the Laplacian product before the
+        // gradient loop overwrites them. Only the existing buffers are needed.
         for (std::size_t electron = 0; electron < workspace.laplacian_lanes_; ++electron)
         {
-          double backflow_laplacian = 0;
+          double backflow_laplacian = projected
+              ? orbitals.laplacian[laplacianIndex(orbitals, electron, matrix_element)] : 0.0;
           double gradient_dot       = 0;
-          for (std::size_t feature = 0; feature < feature_width; ++feature)
+          for (std::size_t feature = 0; !projected && feature < feature_width; ++feature)
           {
             const double weight = backflow[feature * determinant_count * electron_count + channel];
             backflow_laplacian +=
@@ -1151,10 +1201,29 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
                                                 feature_begin + feature)] *
                   weight * workspace.scalar_gradient_scratch_[3 * electron + dimension];
           }
+          if (projected)
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+              gradient_dot += orbitals.gradient[
+                  gradientIndex(orbitals, 3 * electron + dimension, matrix_element)] *
+                  workspace.scalar_gradient_scratch_[3 * electron + dimension];
           orbitals.laplacian[laplacianIndex(orbitals, electron, matrix_element)] =
               backflow_laplacian * envelope_value + 2.0 * gradient_dot +
               backflow_value * workspace.scalar_laplacian_scratch_[electron];
         }
+
+        // The affine value stays local until all derivative product terms finish.
+        for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+        {
+          double backflow_gradient = projected
+              ? orbitals.gradient[gradientIndex(orbitals, lane, matrix_element)] : 0.0;
+          for (std::size_t feature = 0; !projected && feature < feature_width; ++feature)
+            backflow_gradient += features.gradient[gradientIndex(features, lane, feature_begin + feature)] *
+                backflow[feature * determinant_count * electron_count + channel];
+          orbitals.gradient[gradientIndex(orbitals, lane, matrix_element)] =
+              backflow_gradient * envelope_value +
+              backflow_value * workspace.scalar_gradient_scratch_[lane];
+        }
+        orbitals.value[matrix_element] = backflow_value * envelope_value;
       }
   }
 }

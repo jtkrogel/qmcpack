@@ -65,6 +65,8 @@ struct Options
   std::size_t configuration_limit    = 0;
   std::size_t kinetic_configurations = 1;
   std::size_t active_electron        = 0;
+  pf::DirectOrbitalProjection orbital_projection = pf::DirectOrbitalProjection::SCALAR;
+  bool spatial_only = false;
   std::vector<std::size_t> batch_sizes{1, 2, 4, 8, 16};
   std::vector<std::size_t> tile_sizes{1, 2, 4, 8};
 };
@@ -111,6 +113,7 @@ struct ModeSummary
                " [--configuration-limit N] [--kinetic-configurations N]"
                " [--active-electron N] [--batch-sizes 1,2,4]"
                " [--tile-sizes 1,2,4]"
+               " [--orbital-projection scalar|gemm] [--spatial-only true|false]"
                " [--output FILE.json]\n";
   std::exit(EXIT_FAILURE);
 }
@@ -160,6 +163,19 @@ Options parseOptions(int argc, char** argv)
         options.kinetic_configurations = std::stoull(value);
       else if (option == "--active-electron")
         options.active_electron = std::stoull(value);
+      else if (option == "--orbital-projection")
+      {
+        if (value != "scalar" && value != "gemm")
+          throw std::invalid_argument("expected scalar or gemm");
+        options.orbital_projection = value == "gemm"
+            ? pf::DirectOrbitalProjection::GEMM : pf::DirectOrbitalProjection::SCALAR;
+      }
+      else if (option == "--spatial-only")
+      {
+        if (value != "true" && value != "false")
+          throw std::invalid_argument("expected true or false");
+        options.spatial_only = value == "true";
+      }
       else if (option == "--batch-sizes")
         options.batch_sizes = parseBatchSizes(value);
       else if (option == "--tile-sizes")
@@ -458,6 +474,9 @@ void writeReport(std::ostream& output,
          << "  \"available_configuration_count\":" << model.cfg.nconfig << ",\n"
          << "  \"repeats\":" << options.repeats << ",\n"
          << "  \"active_electron\":" << options.active_electron << ",\n"
+         << "  \"direct_spatial_orbital_projection\":"
+         << jsonString(options.orbital_projection == pf::DirectOrbitalProjection::GEMM ? "gemm" : "scalar") << ",\n"
+         << "  \"spatial_only\":" << (options.spatial_only ? "true" : "false") << ",\n"
          << "  \"batch_sizes\":[";
   for (std::size_t index = 0; index < options.batch_sizes.size(); ++index)
   {
@@ -518,15 +537,17 @@ int main(int argc, char** argv)
     const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p, shape);
 
     pf::DirectValueExecutor value_executor(model, plan);
-    pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan);
+    pf::DirectSpatialExecutor spatial_executor(model, value_executor, plan, options.orbital_projection);
     pf::DirectBatchExecutor batch_executor(value_executor, spatial_executor);
     pf::DirectScoreExecutor score_executor(model, plan);
     pf::DirectKineticExecutor kinetic_executor(model, plan);
     auto value_workspace   = value_executor.makeWorkspace();
     auto full_workspace    = spatial_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
     auto active_workspace  = spatial_executor.makeWorkspace(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
-    auto score_workspace   = score_executor.makeWorkspace();
-    auto kinetic_workspace = kinetic_executor.makeWorkspace();
+    auto score_workspace = options.spatial_only ? std::unique_ptr<pf::DirectScoreWorkspace>{}
+                                              : score_executor.makeWorkspace();
+    auto kinetic_workspace = options.spatial_only ? std::unique_ptr<pf::DirectKineticWorkspace>{}
+                                                : kinetic_executor.makeWorkspace();
 
     const double setup_seconds = elapsedSeconds(setup_start);
     const double baseline_peak_mib = peakResidentMiB();
@@ -561,13 +582,26 @@ int main(int argc, char** argv)
                                          pf::ParameterDerivativeRequest::LOG_AND_KINETIC);
 
     std::vector<ModeSummary> modes;
+    const auto publish_report = [&]() {
+      if (options.output_path.empty())
+        writeReport(std::cout, options, model, setup_seconds, baseline_peak_mib, modes);
+      else
+      {
+        std::ofstream output(options.output_path);
+        if (!output)
+          throw std::runtime_error("could not open benchmark output " + options.output_path);
+        writeReport(output, options, model, setup_seconds, baseline_peak_mib, modes);
+        std::cerr << "Wrote " << options.output_path << '\n';
+      }
+    };
     auto add_pair = [&](ModeSummary direct, ModeSummary oracle, double tolerance) {
       validatePair(direct, oracle, tolerance);
       modes.push_back(std::move(direct));
       modes.push_back(std::move(oracle));
     };
 
-    add_pair(
+    if (!options.spatial_only)
+      add_pair(
         benchmarkMode("value", "direct", 1, configuration_count,
                       value_workspace->vectorStorageBytes(), 3 * sizeof(double), options.repeats,
                       [&](std::size_t configuration) {
@@ -623,6 +657,13 @@ int main(int argc, char** argv)
                             configurations[configuration % configuration_count], active_request));
                       }),
         2.0e-7);
+
+    // Spatial-only paired timing never evaluates a parameter trace or batches.
+    if (options.spatial_only)
+    {
+      publish_report();
+      return EXIT_SUCCESS;
+    }
 
     add_pair(
         benchmarkMode("score", "direct", 1, configuration_count,
@@ -771,16 +812,7 @@ int main(int argc, char** argv)
           modes.push_back(std::move(pack_and_execute));
         }
 
-    if (options.output_path.empty())
-      writeReport(std::cout, options, model, setup_seconds, baseline_peak_mib, modes);
-    else
-    {
-      std::ofstream output(options.output_path);
-      if (!output)
-        throw std::runtime_error("could not open benchmark output " + options.output_path);
-      writeReport(output, options, model, setup_seconds, baseline_peak_mib, modes);
-      std::cerr << "Wrote " << options.output_path << '\n';
-    }
+    publish_report();
     return EXIT_SUCCESS;
   }
   catch (const std::exception& error)

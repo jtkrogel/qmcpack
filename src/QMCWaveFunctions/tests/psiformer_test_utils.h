@@ -122,7 +122,7 @@ inline std::vector<Leaf> makeLayout(std::size_t electron_count,
 inline std::vector<double> makeParameters(const std::string& system, const std::vector<Leaf>& leaves)
 {
   const std::size_t electron_count = system == "lih" ? 4 :
-      (system == "lih_pair" ? 8 : (system == "unequal" ? 3 : 2));
+      (system == "lih_pair" ? 8 : (system == "oh" ? 7 : (system == "unequal" ? 3 : 2)));
   SplitMix64 random(PARAMETER_RECIPE_SEED + electron_count);
   std::vector<double> values;
   for (const Leaf& leaf : leaves)
@@ -157,7 +157,7 @@ struct Geometry
   std::size_t nup;
 };
 
-/// Construct all-electron LiH, a separated LiH pair, or two-electron pseudo-LiH geometry.
+/// Construct deterministic LiH variants, unequal spins, or seven-electron valence OH.
 inline Geometry makeGeometry(const std::string& system)
 {
   Geometry geometry;
@@ -168,6 +168,15 @@ inline Geometry makeGeometry(const std::string& system)
     geometry.charges = {3, 1};
     centers          = {0, 1, 0, 1};
     geometry.nup     = 2;
+  }
+  else if (system == "oh")
+  {
+    // Generated seven-electron valence geometry, independent of trained OH
+    // checkpoints. Existing geometry recipes and their random seeds are intact.
+    geometry.nuclei = {0, 0, 0, 1.82, 0.05, -0.02};
+    geometry.charges = {6, 1};
+    centers          = {0, 0, 0, 1, 0, 0, 1};
+    geometry.nup     = 4;
   }
   else if (system == "lih_pair")
   {
