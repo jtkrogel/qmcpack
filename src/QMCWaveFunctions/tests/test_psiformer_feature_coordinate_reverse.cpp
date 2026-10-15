@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerFeatureCoordinateReverse.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerCoordinateGradientLeaf.h"
 
 #include <array>
 #include <cmath>
@@ -114,6 +115,28 @@ TEST_CASE("PsiFormer raw feature coordinate transpose matches forward jets and d
       bars.data(), 0, 0, guarded, boundary) == p::OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT);
   for (const double element : guarded)
     CHECK(element == 913);
+}
+
+TEST_CASE("PsiFormer direct envelope coordinate leaf preserves an exact zero factor",
+          "[psiformer][coordinate_reverse]")
+{
+  // Equal radii and opposite coefficients make E exactly zero, but the two
+  // nuclear radius gradients have opposite signs and hence do not cancel.
+  const auto orbital = p::makeOpenOrbitalJetLayout(1, 1, 1, 2, 1, 1, p::SpatialJetMode::FULL_VGL);
+  const auto raw = p::makeOpenFeatureJetLayout(1, 1, 2, 1, p::SpatialJetMode::VALUE_ONLY);
+  const double positions[]{0, 0, 0}, nuclei[]{-1, 0, 0, 1, 0, 0};
+  const double pi[]{1, -1}, zeta[]{0.8, 0.8}, weight[]{1}, features[]{1, 0, 0, 0, 0};
+  double jets[5]{};
+  REQUIRE(p::open_orbital::buildElement(orbital, features, positions, nuclei, weight, weight,
+      pi, pi, zeta, zeta, 0, 0, 0, 0, 0, jets) == p::OpenSpatialStatus::REGULAR);
+  CHECK(jets[0] == 0.0);
+  const double raw_bar[9]{}, envelope_bar[]{1, 0, 0, 0, 0};
+  double result[3]{};
+  REQUIRE(p::coordinate_gradient::finishElectron(orbital, raw, positions, nuclei,
+      raw_bar, envelope_bar, pi, pi, zeta, zeta, 1, 1, 0, 0, result) == p::OpenSpatialStatus::REGULAR);
+  CHECK(result[0] == Approx(-1.6 * std::exp(-0.8)).margin(3e-15));
+  for (std::size_t dimension = 0; dimension < 3; ++dimension)
+    CHECK(result[dimension] == Approx(jets[orbital.orbitals.uncheckedGradientOffset(0, dimension, 0)]).margin(3e-15));
 }
 
 // Keep the geometry oracle independent of the application wavefunction library.

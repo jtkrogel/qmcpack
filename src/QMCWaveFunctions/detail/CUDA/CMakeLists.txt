@@ -15,6 +15,7 @@ set(PSIFORMER_DEVICE_SRCS
     PsiFormerDeviceKernels.cu
     PsiFormerDeviceDense.cu
     PsiFormerDeviceDerivativeKernels.cu
+    PsiFormerDeviceCoordinateGradient.cu
     PsiFormerDeviceDeterminantKernels.cu
     PsiFormerDeviceSpatialTraces.cu
     PsiFormerDevicePrecision.cu

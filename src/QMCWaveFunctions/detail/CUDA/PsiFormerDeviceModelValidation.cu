@@ -24,6 +24,7 @@
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceNetworkReverse.h"
 #include "PsiFormerDeviceRawFeatureReverseValidation.h"
+#include "PsiFormerDeviceCoordinateGradientValidation.h"
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceKineticReverse.h"
@@ -57,13 +58,15 @@ struct Reference
 };
 
 /// Evaluate all configurations with the current direct CPU path and check one native oracle.
-std::vector<Reference> cpuReferences(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan)
+std::vector<Reference> cpuReferences(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
+                                   std::size_t limit = 0)
 {
   pf::DirectValueExecutor value(model, plan);
   pf::DirectSpatialExecutor spatial(model, value, plan);
   auto workspace = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
   std::vector<Reference> result;
-  for (std::size_t index = 0; index < model.cfg.nconfig; ++index)
+  const auto count = limit == 0 ? model.cfg.nconfig : std::min(limit, model.cfg.nconfig);
+  for (std::size_t index = 0; index < count; ++index)
   {
     auto positions = model.cfg.configuration(index);
     workspace->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
@@ -117,13 +120,14 @@ int main(int argc, char** argv)
   {
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
+                                  "[--cpu-only] [--coordinate-only] [--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
 
     // Explicit dimensions permit compact generated fixtures without changing
     // the established DeepQMC profile used by existing invocation scripts.
     bool cpu_only = false;
+    bool coordinate_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -135,6 +139,8 @@ int main(int argc, char** argv)
       const std::string option(argv[argument]);
       if (option == "--cpu-only" && !cpu_only)
         cpu_only = true;
+      else if (option == "--coordinate-only" && !coordinate_only)
+        coordinate_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -163,12 +169,15 @@ int main(int argc, char** argv)
     }
     if (cpu_only && (!score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Canonical GPU score export is incompatible with --cpu-only");
+    if (coordinate_only && (cpu_only || !score_output.empty() || !jvp_output.empty() ||
+        !kinetic_output.empty() || !nonlocal_output.empty()))
+      throw std::invalid_argument("Coordinate-only validation cannot request CPU-only or parameter exports");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
-    const auto references = cpuReferences(model, plan);
+    const auto references = cpuReferences(model, plan, coordinate_only ? 3 : 0);
     writeReferences(argv[3], references);
     if (cpu_only)
     {
@@ -188,6 +197,16 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
+    if (coordinate_only)
+    {
+      // Exit before constructing any score/kinetic owners or parameter traces.
+      const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+      const std::vector<double> prefix(model.cfg.electrons.x.begin(),
+          model.cfg.electrons.x.begin() + references.size() * model.ne * 3);
+      validateCoordinateGradient(image, model, prefix, queue, handle, true);
+      std::cout << "PASS coordinate-only trained-checkpoint spot: independent CPU all-coordinate parity\n";
+      return 0;
+    }
     // Successor images share fixed geometry/plan metadata, not old parameters.
     // Rebinding keeps scratch stable and rejects stale results or foreign families.
     {
@@ -555,6 +574,8 @@ int main(int argc, char** argv)
             throw std::runtime_error("Periodic target VGL reuse changed prepared storage or target coverage");
         }
       }
+      validateCoordinateGradient(periodic_image, periodic_model, positions, queue, handle);
+      std::cout << "PASS complete skew-periodic coordinate gradient: CPU full VGL, FD, lifecycle, exact storage\n";
       std::cout << "PASS skew-periodic target VGL: K1/3, compact tails, B3/1/2/3 reuse, "
                    "complete independent CPU parity and integer-image invariance\n";
     }
@@ -1539,6 +1560,8 @@ int main(int argc, char** argv)
     validateRawFeatureNetworkReverse(image, taped, queue, handle,
         model.cfg.electrons.x, model.cfg.nuclei.x, seed);
     std::cout << "PASS raw-feature-only trunk VJP: bounded input adjoints, no P response, coordinate-direction difference\n";
+    validateCoordinateGradient(image, model, model.cfg.electrons.x, queue, handle);
+    std::cout << "PASS complete open coordinate gradient: CPU full VGL, FD, lifecycle, exact storage\n";
 
     // Complete canonical score contraction against the independent CPU evaluator.
     std::vector<double> score_weights(model.cfg.nconfig);
