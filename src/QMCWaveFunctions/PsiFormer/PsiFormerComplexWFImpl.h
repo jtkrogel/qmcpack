@@ -129,6 +129,140 @@ struct PsiFormerComplexWF::Impl
     return {numeric_required, bytes, numeric_limit, fingerprint};
   }
 
+  /// Revoke all accepted/proposed publications without reallocating scratch.
+  void invalidate() noexcept { pending = accepted_valid = own_full_valid = false; }
+
+  /// Persistence and energy observation never consume an unresolved particle proposal.
+  void requireIdle(const ParticleSet& p) const
+  {
+    validate(p);
+    if (pending || p.getActivePtcl() >= 0)
+      throw std::logic_error("Complex PsiFormer persistence/observation requires no pending move");
+  }
+
+  /// Own spatial products are usable only at the accepted configuration and parameter version.
+  bool fullMatches(const ParticleSet& p) const
+  {
+    return accepted_valid && own_full_valid && accepted_key == configurationIdentity(p) &&
+        accepted_version == state->model.p.version();
+  }
+
+  /// Scalar-only schema: eight limb-pair integers, eleven physical scalars, G/L and checksum limbs.
+  std::size_t recordScalars() const
+  {
+    return pf::checkedStorageSum(29, pf::checkedStorageProduct(8, state->model.ne,
+        "complex record extent overflow"), "complex record extent overflow");
+  }
+
+  /// Check PooledMemory's independently allocated scalar region before any get/put.
+  void requireRecordExtent(WFBufferType& buffer) const
+  {
+    static_assert(sizeof(*buffer.Scalar_ptr) == sizeof(double));
+    const auto base = reinterpret_cast<std::uintptr_t>(buffer.data());
+    const auto scalar = reinterpret_cast<std::uintptr_t>(buffer.Scalar_ptr);
+    if (!buffer.Scalar_ptr || scalar < base || scalar - base > buffer.size() ||
+        buffer.current() > scalar - base)
+      throw std::out_of_range("Complex PsiFormer walker scalar region is not allocated");
+    const auto available = (buffer.size() - (scalar - base)) / sizeof(*buffer.Scalar_ptr);
+    if (buffer.current_scalar() > available || recordScalars() > available - buffer.current_scalar())
+      throw std::out_of_range("Complex PsiFormer walker record exceeds the allocated scalar region");
+  }
+
+  /// Identify exact stored binary64 contents, excluding the final checksum itself.
+  std::uint64_t recordFingerprint(const WFBufferType& buffer, std::size_t start) const
+  {
+    std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+    for (std::size_t i = 0; i < recordScalars() - 2; ++i)
+      mixPersistentDouble(hash, buffer.Scalar_ptr[start + i]);
+    return hash;
+  }
+
+  /// Write only a coherent FULL record, never caller totals or partial accepted jets.
+  void putRecord(WFBufferType& buffer, const LogValue& physical_log) const
+  {
+    requireRecordExtent(buffer);
+    const auto start = buffer.current_scalar();
+    for (auto integer : std::array<std::uint64_t, 8>{record_magic, 1, state->identity,
+        accepted_version, accepted_key, state->model.ne, recordScalars(), 1})
+      putPersistentInteger(buffer, integer);
+    auto put = [&buffer](double scalar) { buffer.put(scalar); };
+    for (double scalar : {accepted.log_abs, accepted.phase.real(), accepted.phase.imag(),
+                          physical_log.real(), physical_log.imag()})
+      put(scalar);
+    for (const auto* twist : {&state->reduced_twist, &state->cartesian_twist})
+      for (double scalar : *twist)
+        put(scalar);
+    for (std::size_t e = 0; e < state->model.ne; ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        for (double scalar : {own_gradient[e][d].real(), own_gradient[e][d].imag()})
+          put(scalar);
+      for (double scalar : {own_laplacian[e].real(), own_laplacian[e].imag()})
+        put(scalar);
+    }
+    putPersistentInteger(buffer, recordFingerprint(buffer, start));
+  }
+
+  /// Read only after checksum and provenance admission; publish no accepted state here.
+  bool getRecord(const ParticleSet& p, WFBufferType& buffer, Amplitude& amplitude, LogValue& physical_log)
+  {
+    requireRecordExtent(buffer);
+    const auto start = buffer.current_scalar();
+    const auto end = start + recordScalars();
+    bool zero = true;
+    for (std::size_t i = start; i < end; ++i)
+      zero = zero && psiformer::determinant::isFiniteReal(buffer.Scalar_ptr[i]) && buffer.Scalar_ptr[i] == 0;
+    if (zero)
+    {
+      buffer.rewind(buffer.current(), end); // fresh driver sentinel is consumed, never accepted
+      return false;
+    }
+    // Admit content integrity before decoding provenance or mutating any owned products.
+    buffer.rewind(buffer.current(), end - 2);
+    const auto checksum = getPersistentInteger(buffer, "complex checksum");
+    if (checksum != recordFingerprint(buffer, start))
+      throw std::runtime_error("Complex PsiFormer walker record checksum mismatch");
+    buffer.rewind(buffer.current(), start);
+    for (auto expected : std::array<std::uint64_t, 8>{record_magic, 1, state->identity,
+        state->model.p.version(), configurationIdentity(p), state->model.ne, recordScalars(), 1})
+      if (getPersistentInteger(buffer, "complex provenance") != expected)
+        throw std::runtime_error("Complex PsiFormer walker provenance or FULL extent mismatch");
+    auto get = [&buffer]() { double scalar; buffer.get(scalar); return scalar; };
+    amplitude.log_abs = get();
+    const double phase_real = get(), phase_imaginary = get();
+    amplitude.phase = {phase_real, phase_imaginary};
+    const double log_real = get(), log_imaginary = get();
+    physical_log = {log_real, log_imaginary};
+    for (const auto* twist : {&state->reduced_twist, &state->cartesian_twist})
+      for (double expected : *twist)
+      {
+        const double stored = get();
+        if (!psiformer::determinant::isFiniteReal(stored) || stored != expected)
+          throw std::runtime_error("Complex PsiFormer walker twist mismatch");
+      }
+    if (!psiformer::determinant::isFiniteReal(amplitude.log_abs) ||
+        !isFiniteWavefunctionValue(amplitude.phase) || std::abs(std::abs(amplitude.phase) - 1) > 1e-12 ||
+        !isFiniteWavefunctionValue(physical_log) || physical_log.real() != amplitude.log_abs ||
+        std::abs(std::exp(C{0, physical_log.imag() - physicalLog(amplitude, p).imag()}) - C{1}) > 1e-12)
+      throw std::runtime_error("Complex PsiFormer walker amplitude is not finite/coherent");
+    for (std::size_t e = 0; e < state->model.ne; ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+      {
+        const double real = get(), imaginary = get();
+        own_gradient[e][d] = makePsiFormerScalar<ValueType>(real, imaginary);
+        if (!isFiniteWavefunctionValue(own_gradient[e][d]))
+          throw std::runtime_error("Complex PsiFormer walker gradient is nonfinite");
+      }
+      const double real = get(), imaginary = get();
+      own_laplacian[e] = makePsiFormerScalar<ValueType>(real, imaginary);
+      if (!isFiniteWavefunctionValue(own_laplacian[e]))
+        throw std::runtime_error("Complex PsiFormer walker Laplacian is nonfinite");
+    }
+    buffer.rewind(buffer.current(), end);
+    return true;
+  }
+
   /// Bind scalar requests to the target's identity, shape and immutable feature cell.
   void validate(const ParticleSet& p, int electron = -1, bool proposal = false) const
   {
@@ -228,7 +362,8 @@ struct PsiFormerComplexWF::Impl
   std::uint64_t accepted_key = 0, proposed_key = 0;
   std::size_t accepted_version = 0, proposed_version = 0;
   int proposed_particle = -1;
-  bool accepted_valid = false, pending = false;
+  bool accepted_valid = false, pending = false, own_full_valid = false;
+  static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
 };
 
 /// Construct only the explicit paired profile; the XML builder remains unchanged in this slice.
@@ -255,7 +390,7 @@ bool PsiFormerComplexWF::isMultiDet() const { return impl_->state->model.ndet > 
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& p,
     ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l)
 {
-  impl_->pending = impl_->accepted_valid = false;
+  impl_->invalidate();
   impl_->validate(p);
   if (g.size() != static_cast<std::size_t>(p.getTotalNum()) || l.size() != g.size())
     throw std::invalid_argument("Complex PsiFormer full scatter shape mismatch");
@@ -290,6 +425,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& 
   impl_->accepted_key = configurationIdentity(p);
   impl_->accepted_version = result.parameter_version;
   impl_->accepted_valid = true;
+  impl_->own_full_valid = true;
   return log_value_ = physical;
 }
 
@@ -354,6 +490,7 @@ void PsiFormerComplexWF::acceptMove(ParticleSet& p, int electron, bool)
       impl_->proposed_version != impl_->state->model.p.version())
     throw std::logic_error("Complex PsiFormer accept does not match its cached proposal");
   impl_->accepted = impl_->proposed;
+  impl_->own_full_valid = false; // VALUE/ACTIVE accepted state is never a FULL persistence/energy cache
   impl_->accepted_key = impl_->proposed_key;
   impl_->accepted_version = impl_->proposed_version;
   impl_->accepted_valid = true;
@@ -375,22 +512,104 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerComplexWF::makeClone(ParticleSet
       std::make_unique<Impl>(impl_->state, particles, impl_->numeric_limit)));
 }
 
-/// Do not register a misleading legacy real-sign walker record.
-void PsiFormerComplexWF::registerData(ParticleSet&, WFBufferType&)
+/// Register scalar extents only; the standard caller allocates and zero-initializes the shared pool.
+void PsiFormerComplexWF::registerData(ParticleSet& p, WFBufferType& buffer)
 {
-  throw std::logic_error("Complex PsiFormer walker persistence is not yet admitted");
+  try
+  {
+    impl_->requireIdle(p);
+    pf::checkedStorageSum(buffer.current_scalar(), impl_->recordScalars(), "complex record cursor overflow");
+    double placeholder = 0;
+    for (std::size_t scalar = 0; scalar < impl_->recordScalars(); ++scalar)
+      buffer.add(placeholder);
+  }
+  catch (...) { impl_->invalidate(); throw; }
 }
 
-/// Fail closed rather than claim a qualified persistent accepted FULL state.
-PsiFormerComplexWF::LogValue PsiFormerComplexWF::updateBuffer(ParticleSet&, WFBufferType&, bool)
+/// Persist only own complete products, adding them to caller totals exactly once.
+PsiFormerComplexWF::LogValue PsiFormerComplexWF::updateBuffer(ParticleSet& p, WFBufferType& buffer, bool from_scratch)
 {
-  throw std::logic_error("Complex PsiFormer walker persistence is not yet admitted");
+  try
+  {
+    impl_->requireIdle(p);
+    impl_->requireRecordExtent(buffer);
+    if (from_scratch || !impl_->fullMatches(p))
+      evaluateLog(p, p.G, p.L);
+    else
+    {
+      if (p.G.size() != impl_->own_gradient.size() || p.L.size() != impl_->own_laplacian.size())
+        throw std::invalid_argument("Complex PsiFormer walker scatter extent mismatch");
+      // Validate every addition before publishing any caller product.
+      for (std::size_t e = 0; e < impl_->own_gradient.size(); ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          if (!isFiniteWavefunctionValue(p.G[e][d] + impl_->own_gradient[e][d]))
+            throw std::overflow_error("Complex PsiFormer walker gradient scatter overflow");
+        if (!isFiniteWavefunctionValue(p.L[e] + impl_->own_laplacian[e]))
+          throw std::overflow_error("Complex PsiFormer walker Laplacian scatter overflow");
+      }
+      for (std::size_t e = 0; e < impl_->own_gradient.size(); ++e)
+      {
+        p.G[e] += impl_->own_gradient[e];
+        p.L[e] += impl_->own_laplacian[e];
+      }
+    }
+    impl_->putRecord(buffer, log_value_);
+    return log_value_;
+  }
+  catch (...) { impl_->invalidate(); throw; }
 }
 
-/// Reject unqualified walker restoration before touching component state.
-void PsiFormerComplexWF::copyFromBuffer(ParticleSet&, WFBufferType&)
+/// Validate all record content before accepted publication; failures revoke every cache.
+void PsiFormerComplexWF::copyFromBuffer(ParticleSet& p, WFBufferType& buffer)
 {
-  throw std::logic_error("Complex PsiFormer walker persistence is not yet admitted");
+  const bool pending = impl_->pending;
+  impl_->invalidate();
+  impl_->requireIdle(p);
+  if (pending)
+    throw std::logic_error("Complex PsiFormer cannot restore over a pending proposal");
+  Impl::Amplitude amplitude;
+  LogValue physical;
+  if (!impl_->getRecord(p, buffer, amplitude, physical))
+    return;
+  impl_->accepted = amplitude;
+  impl_->accepted_key = configurationIdentity(p);
+  impl_->accepted_version = impl_->state->model.p.version();
+  impl_->accepted_valid = impl_->own_full_valid = true;
+  log_value_ = physical;
+}
+
+/// Observe the complete complex kinetic energy with actual masses and ordinary, not Hermitian, squares.
+PsiFormerComplexWF::CoulombObservation PsiFormerComplexWF::observeCoulombEnergy(
+    const ParticleSet& p, FullPrecRealType potential) const
+{
+  impl_->requireIdle(p);
+  if (!impl_->fullMatches(p))
+    throw std::logic_error("Complex PsiFormer Coulomb observation requires current FULL own products");
+  if (!psiformer::determinant::isFiniteReal(potential))
+    throw std::invalid_argument("Complex PsiFormer Coulomb potential must be finite and from this sample");
+  LogValue kinetic{};
+  const auto& masses = p.get_mass_by_group();
+  if (masses.size() != static_cast<std::size_t>(p.groups()))
+    throw std::invalid_argument("Complex PsiFormer target mass extent mismatch");
+  for (int group = 0; group < p.groups(); ++group)
+  {
+    const double mass = masses[group];
+    if (!psiformer::determinant::isFiniteReal(mass) || mass <= 0)
+      throw std::invalid_argument("Complex PsiFormer target mass must be positive and finite");
+    const double inverse_mass = 1.0 / mass;
+    for (int e = p.first(group); e < p.last(group); ++e)
+    {
+      LogValue ratio = impl_->own_laplacian[e];
+      for (int d = 0; d < 3; ++d)
+        ratio += LogValue(impl_->own_gradient[e][d]) * LogValue(impl_->own_gradient[e][d]);
+      kinetic -= .5 * inverse_mass * ratio;
+    }
+  }
+  const LogValue local_energy = kinetic + potential; // caller guarantees Coulomb V belongs to this sample
+  if (!isFiniteWavefunctionValue(kinetic) || !isFiniteWavefunctionValue(local_energy))
+    throw std::overflow_error("Complex PsiFormer Coulomb observation overflow");
+  return {kinetic, local_energy, potential};
 }
 
 /// Public optimization requires complete complex kinetic response, not only a score.

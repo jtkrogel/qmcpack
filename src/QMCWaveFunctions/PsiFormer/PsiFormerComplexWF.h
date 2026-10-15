@@ -80,14 +80,27 @@ public:
   /// Report exact preparation; this is not an aggregate budget or adaptive large-system qualification.
   NumericStorage numericStorage() const;
 
-  /// Fail closed until the explicit complex walker record is qualified.
+  /// Reserve an explicit complex scalar record; caller allocates the shared walker buffer.
   void registerData(ParticleSet&, WFBufferType&) override;
 
-  /// Do not reuse the legacy real-sign persistence record.
+  /// Add own physical G/L to caller totals, refreshing FULL when necessary, and persist them.
   LogValue updateBuffer(ParticleSet&, WFBufferType&, bool from_scratch = false) override;
 
-  /// Reject restoration of unqualified real or complex buffer data.
+  /// Restore only complete matching complex records; failed reads revoke accepted caches.
   void copyFromBuffer(ParticleSet&, WFBufferType&) override;
+
+  /// Complete complex Coulomb observations retain imaginary kinetic/local-energy parts.
+  struct CoulombObservation
+  {
+    LogValue kinetic, local_energy;
+    FullPrecRealType potential;
+  };
+
+  /** Require current FULL own physical G/L and actual target masses.
+   * Caller must supply the real Coulomb potential for this exact configuration and
+   * Hamiltonian sample; finiteness alone cannot prove that identity. Not a training API.
+   */
+  CoulombObservation observeCoulombEnergy(const ParticleSet&, FullPrecRealType same_sample_potential) const;
 
   /// Complex score availability alone does not qualify public kinetic optimization.
   void evaluateDerivatives(ParticleSet&, const OptVariables&, Vector<ValueType>&, Vector<ValueType>&) override;

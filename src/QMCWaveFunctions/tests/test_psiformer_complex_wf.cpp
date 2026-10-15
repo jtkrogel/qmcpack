@@ -12,6 +12,9 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "Utilities/RuntimeOptions.h"
 #include "psiformer_test_utils.h"
 #include <algorithm>
 #include <complex>
@@ -385,5 +388,182 @@ TEST_CASE("PsiFormer complex clone admits exact numeric bytes and independent sc
   CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
   CHECK(component.numericStorage().fingerprint == storage.fingerprint);
   CHECK(clone->numericStorage().fingerprint == clone_storage.fingerprint);
+}
+
+TEST_CASE("PsiFormer complex walker record roundtrips only matching FULL own products",
+          "[wavefunction][psiformer][complex_wf]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto branch_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF component("buffer", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  const auto storage = component.numericStorage();
+  WaveFunctionComponent::WFBufferType buffer;
+  // Prefixes exercise the independent bulk/scalar cursors used by the real walker contract.
+  std::array<double, 2> bulk_prefix{};
+  double scalar_prefix = 0;
+  buffer.add(bulk_prefix.data(), bulk_prefix.data() + bulk_prefix.size());
+  buffer.add(scalar_prefix);
+  const auto bulk_start = buffer.current(), scalar_start = buffer.current_scalar();
+  component.registerData(p, buffer);
+  const auto bulk_end = buffer.current(), scalar_end = buffer.current_scalar();
+  CHECK(bulk_end == bulk_start);
+  CHECK(scalar_end - scalar_start == 29 + 8 * 4);
+  buffer.allocate();
+  buffer.rewind(bulk_start, scalar_start);
+  component.copyFromBuffer(p, buffer); // freshly allocated zero sentinel is invalid, not accepted
+  CHECK(buffer.current_scalar() == scalar_end);
+  CHECK_THROWS(component.observeCoulombEnergy(p, -2.7));
+  const C gradient_sentinel{.12, -.04}, laplacian_sentinel{-.31, .07};
+  p.G = gradient_sentinel;
+  p.L = laplacian_sentinel;
+  buffer.rewind(bulk_start, scalar_start);
+  const auto initial_log = component.updateBuffer(p, buffer, true);
+  const auto initial_g = p.G;
+  const auto initial_l = p.L;
+  const auto energy = component.observeCoulombEnergy(p, -2.7);
+  auto branch_base = component.makeClone(branch_p);
+  auto& branch = dynamic_cast<PsiFormerComplexWF&>(*branch_base);
+  const auto branch_storage = branch.numericStorage();
+  branch_p.G = gradient_sentinel;
+  branch_p.L = laplacian_sentinel;
+  buffer.rewind(bulk_start, scalar_start);
+  branch.copyFromBuffer(branch_p, buffer);
+  for (int e = 0; e < 4; ++e)
+  {
+    close(branch_p.L[e], laplacian_sentinel); // restoration does not scatter caller totals
+    for (int d = 0; d < 3; ++d)
+      close(branch_p.G[e][d], gradient_sentinel);
+  }
+  close(branch.observeCoulombEnergy(branch_p, -2.7).local_energy, energy.local_energy);
+  buffer.rewind(bulk_start, scalar_start);
+  close(branch.updateBuffer(branch_p, buffer), initial_log);
+  for (int e = 0; e < 4; ++e)
+  {
+    close(branch_p.L[e], initial_l[e]);
+    for (int d = 0; d < 3; ++d)
+      close(branch_p.G[e][d], initial_g[e][d]);
+  }
+
+  // Corruption, foreign model/twist and moved configurations never publish accepted caches.
+  for (auto offset : {std::size_t{0}, std::size_t{18}, scalar_end - scalar_start - 3})
+  {
+    auto corrupt = buffer;
+    corrupt.Scalar_ptr[scalar_start + offset] += .125;
+    corrupt.rewind(bulk_start, scalar_start);
+    CHECK_THROWS(branch.copyFromBuffer(branch_p, corrupt));
+    CHECK_THROWS(branch.observeCoulombEnergy(branch_p, -2.7));
+    buffer.rewind(bulk_start, scalar_start);
+    branch.copyFromBuffer(branch_p, buffer);
+  }
+  auto foreign_parameters = parameters();
+  foreign_parameters.values.front() += .001;
+  PsiFormerComplexWF foreign("foreign", std::move(foreign_parameters), branch_p, source,
+                             clone_cap, {.17, -.11, .07});
+  buffer.rewind(bulk_start, scalar_start);
+  CHECK_THROWS(foreign.copyFromBuffer(branch_p, buffer));
+  PsiFormerComplexWF wrong_twist("twist", parameters(), branch_p, source, clone_cap);
+  buffer.rewind(bulk_start, scalar_start);
+  CHECK_THROWS(wrong_twist.copyFromBuffer(branch_p, buffer));
+  const auto saved_position = branch_p.R[0];
+  branch_p.R[0][0] += .125;
+  branch_p.update();
+  buffer.rewind(bulk_start, scalar_start);
+  CHECK_THROWS(branch.copyFromBuffer(branch_p, buffer));
+  branch_p.R[0] = saved_position;
+  branch_p.update();
+  WaveFunctionComponent::WFBufferType insufficient;
+  insufficient.add(scalar_prefix);
+  insufficient.allocate();
+  insufficient.rewind();
+  CHECK_THROWS(branch.copyFromBuffer(branch_p, insufficient));
+  buffer.rewind(bulk_start, scalar_start);
+  branch.copyFromBuffer(branch_p, buffer);
+
+  // VALUE and ACTIVE accepts retain scalar validity, but require a new FULL observation/record.
+  for (bool active : {false, true})
+  {
+    branch_p.makeMove(2, ParticleSet::PosType{.007, -.011, .013});
+    WaveFunctionComponent::GradType gradient{};
+    if (active)
+      branch.ratioGrad(branch_p, 2, gradient);
+    else
+      branch.ratio(branch_p, 2);
+    CHECK_THROWS(branch.observeCoulombEnergy(branch_p, -2.7));
+    branch.acceptMove(branch_p, 2);
+    branch_p.acceptMove(2);
+    CHECK_THROWS(branch.observeCoulombEnergy(branch_p, -2.7));
+    branch_p.G = 0;
+    branch_p.L = 0;
+    buffer.rewind(bulk_start, scalar_start);
+    branch.updateBuffer(branch_p, buffer);
+    CHECK_NOTHROW(branch.observeCoulombEnergy(branch_p, -2.7));
+  }
+  branch_p.makeMove(0, ParticleSet::PosType{.01, .02, -.01});
+  branch.ratio(branch_p, 0);
+  buffer.rewind(bulk_start, scalar_start);
+  CHECK_THROWS(branch.updateBuffer(branch_p, buffer));
+  CHECK_THROWS(branch.acceptMove(branch_p, 0));
+  branch_p.rejectMove(0);
+  evaluate(branch, branch_p);
+  CHECK(branch.numericStorage().fingerprint == branch_storage.fingerprint);
+  CHECK(branch.numericStorage().allocated_bytes == branch_storage.allocated_bytes);
+  CHECK(component.numericStorage().fingerprint == storage.fingerprint);
+  CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
+}
+
+TEST_CASE("PsiFormer complex Coulomb observation retains mass-weighted imaginary energy",
+          "[wavefunction][psiformer][complex_wf]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto gamma_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  for (auto* target : {&p, &gamma_p})
+  {
+    const int mass = target->getSpeciesSet().addAttribute("mass");
+    target->getSpeciesSet()(mass, 0) = .7;
+    target->getSpeciesSet()(mass, 1) = 2.3;
+    target->resetGroups();
+  }
+  PsiFormerComplexWF component("energy", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  PsiFormerComplexWF gamma("gamma", parameters(), gamma_p, source, clone_cap);
+  evaluate(component, p);
+  evaluate(gamma, gamma_p);
+  // Synthetic same-sample V isolates this helper; periodic Coulomb production is gated at XML integration.
+  constexpr double potential = -2.7;
+  const auto observation = component.observeCoulombEnergy(p, potential);
+  C independent{}, twist_change{};
+  for (int e = 0; e < 4; ++e)
+  {
+    const double inverse_mass = 1.0 / (e < 2 ? .7 : 2.3);
+    C ratio = p.L[e];
+    for (int d = 0; d < 3; ++d)
+    {
+      ratio += p.G[e][d] * p.G[e][d];
+      const C delta = p.G[e][d] - gamma_p.G[e][d];
+      close(C{delta.real()}, C{});
+      const double k = delta.imag();
+      twist_change += inverse_mass * (.5 * k * k - C{0, k} * gamma_p.G[e][d]);
+    }
+    independent -= .5 * inverse_mass * ratio;
+  }
+  close(observation.kinetic, independent);
+  close(observation.local_energy, independent + potential);
+  close(observation.kinetic - gamma.observeCoulombEnergy(gamma_p, potential).kinetic, twist_change);
+  CHECK(std::abs(observation.kinetic.imag()) > 1e-6);
+  RuntimeOptions options;
+  TrialWaveFunction unused(options);
+  BareKineticEnergy production_kinetic(p);
+  CHECK(observation.kinetic.real() == Approx(production_kinetic.evaluate(unused, p)).epsilon(2e-12));
+  p.G = C{100, 200};
+  p.L = C{300, -400};
+  close(component.observeCoulombEnergy(p, potential).local_energy, observation.local_energy);
+  CHECK_THROWS(component.observeCoulombEnergy(p, std::numeric_limits<double>::quiet_NaN()));
+  const int mass = p.getSpeciesSet().addAttribute("mass");
+  p.getSpeciesSet()(mass, 1) = 0;
+  p.resetGroups();
+  CHECK_THROWS(component.observeCoulombEnergy(p, potential));
 }
 } // namespace qmcplusplus

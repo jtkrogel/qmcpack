@@ -736,7 +736,7 @@ if(QMC_COMPLEX)
   # Native-free public component tests link the existing sole native owner TU.
   add_executable(test_psiformer_complex_wf test_psiformer_complex_wf.cpp)
   target_link_libraries(test_psiformer_complex_wf
-                        catch_main qmcwfs platform_LA platform_runtime utilities_for_test
+                        catch_main qmcham qmcwfs platform_LA platform_runtime utilities_for_test
                         container_testing minimal_particle_pool IO::HDF5)
   if(USE_OBJECT_TARGET)
     target_link_libraries(test_psiformer_complex_wf
