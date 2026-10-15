@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerSpatialJetKernels.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOpenOrbital.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerOpenKineticReverse.h"
 
 #include <algorithm>
 #include <array>
@@ -1070,6 +1071,162 @@ TEST_CASE("PsiFormer open orbital jets match active and full finite differences"
   CHECK_THROWS_AS(psiformer::makeOpenOrbitalJetLayout(
                       1, 1, 2, 1, 2, 3, psiformer::SpatialJetMode::ACTIVE),
                   std::invalid_argument);
+}
+
+TEST_CASE("PsiFormer target intervals preserve physical geometry and orbital jets",
+          "[psiformer][device][spatial][targets]")
+{
+  constexpr std::size_t batch = 3, ne = 5, nuclei_count = 2, determinants = 2, width = 3;
+  const auto mode = psiformer::SpatialJetMode::FULL_VGL;
+  const auto cell = psiformer::periodic_geometry::makeCell(
+      {{{5.1, .2, .1}, {.4, 4.8, .3}, {.2, .5, 5.3}}}, {{true, true, true}});
+  const std::array<double, 6> nuclei{.1, -.2, .3, 1.1, .8, -.4};
+  std::vector<double> positions(batch * ne * 3);
+  for (std::size_t b = 0; b < batch; ++b)
+    for (std::size_t e = 0; e < ne; ++e)
+      for (std::size_t d = 0; d < 3; ++d)
+        positions[(b * ne + e) * 3 + d] = .27 + .31 * e + .13 * b + .17 * d;
+
+  auto compare = [&](const auto& full, const auto& tile, const auto& all, const auto& part) {
+    REQUIRE(tile.electron_count == ne);
+    REQUIRE(tile.gradient_lanes == 3 * tile.laplacian_lanes);
+    for (std::size_t b = 0; b < batch; ++b)
+      for (std::size_t element = 0; element < full.element_count; ++element)
+      {
+        CHECK(part[tile.uncheckedValueOffset(b, element)] == all[full.uncheckedValueOffset(b, element)]);
+        for (std::size_t local = 0; local < tile.laplacian_lanes; ++local)
+        {
+          const auto physical = tile.physicalTargetElectron(local);
+          for (std::size_t d = 0; d < 3; ++d)
+            CHECK(part[tile.uncheckedGradientOffset(b, 3 * local + d, element)] ==
+                  all[full.uncheckedGradientOffset(b, 3 * physical + d, element)]);
+          CHECK(part[tile.uncheckedLaplacianOffset(b, local, element)] ==
+                all[full.uncheckedLaplacianOffset(b, physical, element)]);
+        }
+      }
+  };
+
+  // Nonzero starts, a final one-electron tail, K=1 and the complete legacy range.
+  for (const auto interval : {std::pair<std::size_t, std::size_t>{0, 2}, {2, 2}, {4, 1}, {1, 1}, {0, ne}})
+    for (const bool periodic : {false, true})
+    {
+      auto full = periodic ? psiformer::makePeriodicFeatureJetLayout(batch, ne, nuclei_count, 2, mode)
+                           : psiformer::makeOpenFeatureJetLayout(batch, ne, nuclei_count, 2, mode);
+      auto tile = full;
+      tile.output = psiformer::withSpatialTargetRange(full.output, interval.first, interval.second);
+      REQUIRE(tile.output.configuration_stride == tile.output.plane_count * tile.output.plane_stride);
+      std::vector<double> all(psiformer::spatialJetSpanElements(full.output));
+      std::vector<double> part(psiformer::spatialJetSpanElements(tile.output) + 1, 791.0);
+      for (std::size_t b = 0; b < batch; ++b)
+      {
+        REQUIRE(open_spatial::buildOpenFeatureJetsForConfiguration(full, positions.data(), nuclei.data(), b, 0,
+            all.data(), periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+        REQUIRE(open_spatial::buildOpenFeatureJetsForConfiguration(tile, positions.data(), nuclei.data(), b, 0,
+            part.data(), periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+      }
+      compare(full.output, tile.output, all, part);
+      CHECK(part.back() == 791.0);
+
+      const auto full_cusp = psiformer::makeOpenCuspJetLayout(batch, ne, 2, mode);
+      auto tile_cusp = full_cusp;
+      tile_cusp.output = psiformer::withSpatialTargetRange(full_cusp.output, interval.first, interval.second);
+      std::vector<double> cusp(psiformer::spatialJetSpanElements(full_cusp.output));
+      std::vector<double> local_cusp(psiformer::spatialJetSpanElements(tile_cusp.output) + 1, 791.0);
+      for (std::size_t b = 0; b < batch; ++b)
+      {
+        REQUIRE(open_spatial::buildOpenCuspJetsForConfiguration(full_cusp, positions.data(), b, 0, .8, 1.1,
+            cusp.data(), periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+        REQUIRE(open_spatial::buildOpenCuspJetsForConfiguration(tile_cusp, positions.data(), b, 0, .8, 1.1,
+            local_cusp.data(), periodic ? &cell : nullptr) == psiformer::OpenSpatialStatus::REGULAR);
+      }
+      compare(full_cusp.output, tile_cusp.output, cusp, local_cusp);
+      CHECK(local_cusp.back() == 791.0);
+
+      const auto orbital = psiformer::makeOpenOrbitalJetLayout(batch, determinants, ne, nuclei_count, width, 2, mode);
+      auto target = orbital;
+      target.features = psiformer::withSpatialTargetRange(orbital.features, interval.first, interval.second);
+      target.orbitals = psiformer::withSpatialTargetRange(orbital.orbitals, interval.first, interval.second);
+      psiformer::validateOpenOrbitalJetLayout(target);
+      // Arbitrary nonlocal feature jets exercise derivatives for rows outside the
+      // target interval as well as physical envelope/gradient-dot endpoint terms.
+      std::vector<double> feature(psiformer::spatialJetSpanElements(orbital.features));
+      std::vector<double> local_feature(psiformer::spatialJetSpanElements(target.features));
+      for (std::size_t i = 0; i < feature.size(); ++i) feature[i] = .003 * (static_cast<int>(i % 29) - 14);
+      for (std::size_t b = 0; b < batch; ++b)
+        for (std::size_t e = 0; e < orbital.features.element_count; ++e)
+        {
+          local_feature[target.features.uncheckedValueOffset(b, e)] = feature[orbital.features.uncheckedValueOffset(b, e)];
+          for (std::size_t k = 0; k < interval.second; ++k)
+          {
+            for (std::size_t d = 0; d < 3; ++d)
+              local_feature[target.features.uncheckedGradientOffset(b, 3 * k + d, e)] =
+                  feature[orbital.features.uncheckedGradientOffset(b, 3 * (interval.first + k) + d, e)];
+            local_feature[target.features.uncheckedLaplacianOffset(b, k, e)] =
+                feature[orbital.features.uncheckedLaplacianOffset(b, interval.first + k, e)];
+          }
+        }
+      std::vector<double> weights(width * determinants * ne, .17), pi(determinants * ne * nuclei_count, .4);
+      std::vector<double> zeta(pi.size(), -.7), orbitals(psiformer::spatialJetSpanElements(orbital.orbitals));
+      std::vector<double> local_orbitals(psiformer::spatialJetSpanElements(target.orbitals) + 1, 791.0);
+      for (std::size_t b = 0; b < batch; ++b)
+        for (std::size_t det = 0; det < determinants; ++det)
+          for (std::size_t row = 0; row < ne; ++row)
+            for (std::size_t col = 0; col < ne; ++col)
+            {
+              REQUIRE(open_orbital::buildElement(orbital, feature.data(), positions.data(), nuclei.data(),
+                  weights.data(), weights.data(), pi.data(), pi.data(), zeta.data(), zeta.data(),
+                  b, 0, det, row, col, orbitals.data(), nullptr, nullptr, periodic ? &cell : nullptr) ==
+                  psiformer::OpenSpatialStatus::REGULAR);
+              REQUIRE(open_orbital::buildElement(target, local_feature.data(), positions.data(), nuclei.data(),
+                  weights.data(), weights.data(), pi.data(), pi.data(), zeta.data(), zeta.data(),
+                  b, 0, det, row, col, local_orbitals.data(), nullptr, nullptr, periodic ? &cell : nullptr) ==
+                  psiformer::OpenSpatialStatus::REGULAR);
+            }
+      compare(orbital.orbitals, target.orbitals, orbitals, local_orbitals);
+      CHECK(local_orbitals.back() == 791.0);
+    }
+
+  const auto compact = psiformer::makeSpatialTargetJetLayout(3, 7, 300, 299, 1);
+  CHECK(compact.plane_count == 5);
+  CHECK(psiformer::spatialJetSpanElements(compact) == 3 * 5 * 7);
+  CHECK_THROWS_AS(psiformer::makeSpatialTargetJetLayout(1, 1, 5, 4, 2), std::invalid_argument);
+  CHECK_THROWS_AS(psiformer::makeSpatialTargetJetLayout(1, 1, 5, 0, 0), std::invalid_argument);
+  CHECK_THROWS_AS(psiformer::makeSpatialTargetJetLayout(1, 1, 5,
+      std::numeric_limits<std::size_t>::max(), 1), std::invalid_argument);
+  CHECK_THROWS_AS(psiformer::makeSpatialTargetJetLayout(1, std::numeric_limits<std::size_t>::max(), 5, 0, 1),
+      std::length_error);
+  auto mismatch = compact;
+  mismatch.target_electron_begin = 298;
+  CHECK_FALSE(psiformer::haveMatchingSpatialPlanes(compact, mismatch));
+
+  auto dense_tail = psiformer::makeSpatialDenseJetLayout(batch, ne, width, width, ne, mode);
+  dense_tail.source = psiformer::withSpatialTargetRange(dense_tail.source, 4, 1);
+  dense_tail.target = psiformer::withSpatialTargetRange(dense_tail.target, 4, 1);
+  CHECK(psiformer::makeFoldedSpatialDenseLayout(dense_tail).rows == batch * 5 * ne);
+
+  // Existing physical reverse APIs must reject this newly valid local layout.
+  psiformer::OpenOrbitalKineticReverseLayout reverse{};
+  reverse.forward = psiformer::makeOpenOrbitalJetLayout(1, determinants, ne, nuclei_count, width, 2, mode);
+  reverse.response_count = 1024;
+  reverse.backflow_up_response_offset = 0;
+  reverse.backflow_down_response_offset = 100;
+  reverse.envelope_pi_up_response_offset = 200;
+  reverse.envelope_pi_down_response_offset = 300;
+  reverse.envelope_zeta_up_response_offset = 400;
+  reverse.envelope_zeta_down_response_offset = 500;
+  CHECK_NOTHROW(psiformer::validateOpenOrbitalKineticReverseLayout(reverse));
+  reverse.forward.features = psiformer::withSpatialTargetRange(reverse.forward.features, 1, 1);
+  reverse.forward.orbitals = psiformer::withSpatialTargetRange(reverse.forward.orbitals, 1, 1);
+  CHECK_THROWS_AS(psiformer::validateOpenOrbitalKineticReverseLayout(reverse), std::invalid_argument);
+  psiformer::OpenCuspKineticReverseLayout cusp_reverse{};
+  cusp_reverse.forward = psiformer::makeOpenCuspJetLayout(1, ne, 2, mode);
+  cusp_reverse.response_count = 1024;
+  cusp_reverse.same_response_offset = 0;
+  cusp_reverse.opposite_response_offset = 1;
+  cusp_reverse.has_same_alpha = true;
+  CHECK_NOTHROW(psiformer::validateOpenCuspKineticReverseLayout(cusp_reverse));
+  cusp_reverse.forward.output = psiformer::withSpatialTargetRange(cusp_reverse.forward.output, 1, 1);
+  CHECK_THROWS_AS(psiformer::validateOpenCuspKineticReverseLayout(cusp_reverse), std::invalid_argument);
 }
 
 int main(int argc, char* argv[])

@@ -20,6 +20,13 @@
 namespace qmcplusplus::psiformer::device
 {
 
+/** Scatter one admitted local target root into separate complete VGL outputs.
+ * Does not mark a request complete; the owner must admit all tiles first.
+ */
+Error launchScatterSpatialTargets(Stream stream, const SpatialJetLayout& source, const SpatialJetLayout& target,
+    const double* source_phase, const double* source_jets, const double* source_ratios,
+    double* target_phase, double* target_jets, double* target_ratios);
+
 /** Return value-only signed-log results, including exact nodes, without inverses. */
 Error launchFinalValueCombination(Stream stream, std::size_t configuration_count,
     const device_determinant::CombinationMetadata* determinant_metadata,

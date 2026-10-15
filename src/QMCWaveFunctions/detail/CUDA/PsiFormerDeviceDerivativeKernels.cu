@@ -1646,7 +1646,7 @@ Error launchKineticRootAdjoints(Stream stream, const SpatialJetLayout& layout,
   if (layout.configuration_count == 0)
     return success;
   validateSpatialJetLayout(layout);
-  if (layout.mode != SpatialJetMode::FULL_VGL || layout.element_count != 1 ||
+  if (!hasCompleteSpatialTargets(layout) || layout.element_count != 1 ||
       !forward_root || !weights || !root_adjoint || !status ||
       (total_gradient ? gradient_stride < layout.gradient_lanes : gradient_stride != 0) ||
       (gradient_only && !total_gradient))

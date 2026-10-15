@@ -342,7 +342,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
           configuration, lane, feature_begin + feature)] *
           backflow[weightOffset(layout, feature, determinant, orbital)];
     const std::size_t lane_electron = layout.features.mode == SpatialJetMode::ACTIVE
-        ? active_electron : lane / 3;
+        ? active_electron : layout.features.physicalTargetElectron(lane / 3);
     const std::size_t dimension = lane % 3;
     const double envelope_first = lane_electron == row_electron
         ? envelope_gradient[dimension] : 0.0;
@@ -360,6 +360,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
 
   for (std::size_t electron = 0; electron < layout.features.laplacian_lanes; ++electron)
   {
+    const bool envelope_target = layout.features.physicalTargetElectron(electron) == row_electron;
     double backflow_laplacian = 0.0;
     double gradient_dot = 0.0;
     for (std::size_t feature = 0; feature < layout.feature_width; ++feature)
@@ -368,7 +369,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
           layout, feature, determinant, orbital)];
       backflow_laplacian += features[layout.features.uncheckedLaplacianOffset(
           configuration, electron, feature_begin + feature)] * weight;
-      if (electron == row_electron)
+      if (envelope_target)
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           gradient_dot += features[layout.features.uncheckedGradientOffset(
               configuration, 3 * electron + dimension,
@@ -376,12 +377,12 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     }
     const double laplacian = backflow_laplacian * envelope_value +
         2.0 * gradient_dot +
-        (electron == row_electron ? backflow_value * envelope_laplacian : 0.0);
+        (envelope_target ? backflow_value * envelope_laplacian : 0.0);
     const auto retained_laplacian = layout.orbitals.uncheckedLaplacianOffset(configuration, electron, element);
     if (retained_backflow)
       retained_backflow[retained_laplacian] = backflow_laplacian;
     if (retained_envelope)
-      retained_envelope[retained_laplacian] = electron == row_electron ? envelope_laplacian : 0.0;
+      retained_envelope[retained_laplacian] = envelope_target ? envelope_laplacian : 0.0;
     if (!device_math::isFiniteBinary64(laplacian))
       return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
     output[layout.orbitals.uncheckedLaplacianOffset(

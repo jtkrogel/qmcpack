@@ -52,6 +52,19 @@ struct SpatialJetLayout
   std::size_t plane_stride        = 0;
   std::size_t configuration_stride = 0;
   SpatialJetMode mode             = SpatialJetMode::ACTIVE;
+  // FULL_VGL differentiates this contiguous physical-electron interval;
+  // laplacian_lanes is its count. Physical geometry/matrix dimensions stay Ne.
+  std::size_t target_electron_begin = 0;
+
+  QMC_PF_SPATIAL_HOST_DEVICE bool containsTargetElectron(std::size_t electron) const noexcept
+  {
+    return electron >= target_electron_begin && electron - target_electron_begin < laplacian_lanes;
+  }
+
+  QMC_PF_SPATIAL_HOST_DEVICE std::size_t physicalTargetElectron(std::size_t local) const noexcept
+  {
+    return target_electron_begin + local;
+  }
 
   QMC_PF_SPATIAL_HOST_DEVICE std::size_t uncheckedPlaneOffset(
       std::size_t configuration, std::size_t plane,
@@ -181,13 +194,18 @@ inline void validateSpatialJetLayout(const SpatialJetLayout& layout)
     expected_gradient_lanes = 3;
     break;
   case SpatialJetMode::FULL_VGL:
+    if (layout.laplacian_lanes == 0 || layout.laplacian_lanes > layout.electron_count ||
+        layout.target_electron_begin > layout.electron_count - layout.laplacian_lanes)
+      throw std::invalid_argument("PsiFormer spatial target interval exceeds physical electrons");
     expected_gradient_lanes = spatial_detail::checkedProduct(
-        3, layout.electron_count, "PsiFormer spatial gradient-lane extent overflow");
-    expected_laplacian_lanes = layout.electron_count;
+        3, layout.laplacian_lanes, "PsiFormer spatial gradient-lane extent overflow");
+    expected_laplacian_lanes = layout.laplacian_lanes;
     break;
   default:
     throw std::invalid_argument("PsiFormer spatial layout mode is invalid");
   }
+  if (layout.mode != SpatialJetMode::FULL_VGL && layout.target_electron_begin != 0)
+    throw std::invalid_argument("PsiFormer target intervals require FULL_VGL mode");
   const std::size_t expected_plane_count = spatial_detail::checkedAdd(
       spatial_detail::checkedAdd(1, expected_gradient_lanes,
                                  "PsiFormer spatial plane count overflow"),
@@ -250,7 +268,68 @@ inline bool haveMatchingSpatialPlanes(const SpatialJetLayout& left,
       left.electron_count == right.electron_count &&
       left.gradient_lanes == right.gradient_lanes &&
       left.laplacian_lanes == right.laplacian_lanes &&
-      left.plane_count == right.plane_count && left.mode == right.mode;
+      left.plane_count == right.plane_count && left.mode == right.mode &&
+      left.target_electron_begin == right.target_electron_begin;
+}
+
+/** Construct compact target jets directly, before any device storage allocation.
+ * Derivative triples/Laplacians are local to [begin,begin+count); matrix and
+ * geometry dimensions still use physical_electrons. Zero count is not a sentinel.
+ */
+inline SpatialJetLayout makeSpatialTargetJetLayout(std::size_t configurations,
+    std::size_t elements, std::size_t physical_electrons, std::size_t begin,
+    std::size_t count, std::size_t plane_stride = 0, std::size_t configuration_stride = 0)
+{
+  if (count == 0 || count > physical_electrons || begin > physical_electrons - count)
+    throw std::invalid_argument("PsiFormer spatial target interval exceeds physical electrons");
+  const auto gradients = spatial_detail::checkedProduct(3, count, "PsiFormer target gradient extent overflow");
+  const auto planes = spatial_detail::checkedAdd(1,
+      spatial_detail::checkedAdd(gradients, count, "PsiFormer target plane count overflow"),
+      "PsiFormer target plane count overflow");
+  const auto stride = plane_stride == 0 ? elements : plane_stride;
+  const auto span = spatial_detail::checkedSpan(planes, stride, elements,
+      "PsiFormer target configuration extent overflow");
+  SpatialJetLayout layout{configurations, elements, physical_electrons, gradients, count,
+      planes, stride, configuration_stride == 0 ? span : configuration_stride,
+      SpatialJetMode::FULL_VGL, begin};
+  validateSpatialJetLayout(layout);
+  return layout;
+}
+
+/** Retarget pure layout metadata with compact logical strides, not storage.
+ * Call before reserving buffers, or for a fresh live prefix in maximum-K storage.
+ * Folded GEMMs require compact configuration strides even for a smaller tail.
+ */
+inline SpatialJetLayout withSpatialTargetRange(const SpatialJetLayout& layout,
+    std::size_t begin, std::size_t count)
+{
+  validateSpatialJetLayout(layout);
+  if (layout.mode != SpatialJetMode::FULL_VGL)
+    throw std::invalid_argument("PsiFormer spatial target ranges require FULL_VGL mode");
+  return makeSpatialTargetJetLayout(layout.configuration_count, layout.element_count,
+      layout.electron_count, begin, count, layout.plane_stride);
+}
+
+/// Physical reverse APIs remain complete-range until their separate tiled gate.
+inline bool hasCompleteSpatialTargets(const SpatialJetLayout& layout) noexcept
+{
+  return layout.mode == SpatialJetMode::FULL_VGL && layout.target_electron_begin == 0 &&
+      layout.laplacian_lanes == layout.electron_count;
+}
+
+/// Admit one local target root into a separate, complete physical-electron root.
+inline void validateSpatialTargetScatter(const SpatialJetLayout& source, const SpatialJetLayout& target)
+{
+  validateSpatialJetLayout(source);
+  validateSpatialJetLayout(target);
+  if (source.mode != SpatialJetMode::FULL_VGL || !hasCompleteSpatialTargets(target) ||
+      source.element_count != 1 || target.element_count != 1 ||
+      source.configuration_count != target.configuration_count || source.electron_count != target.electron_count)
+    throw std::invalid_argument("PsiFormer spatial target scatter requires matching local/full roots");
+  (void)spatial_detail::checkedProduct(source.configuration_count, source.laplacian_lanes,
+      "PsiFormer target ratio extent overflow");
+  (void)spatial_detail::checkedProduct(target.configuration_count, target.laplacian_lanes,
+      "PsiFormer complete ratio extent overflow");
 }
 
 inline void validateSpatialDenseJetLayout(const SpatialDenseJetLayout& layout)

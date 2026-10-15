@@ -22,6 +22,16 @@ namespace
 
 constexpr unsigned int spatial_block_size = 128;
 
+__global__ void scatterSpatialTargetsKernel(SpatialJetLayout source, SpatialJetLayout target,
+    const double* source_phase, const double* source_jets, const double* source_ratios,
+    double* target_phase, double* target_jets, double* target_ratios)
+{
+  const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (configuration < source.configuration_count)
+    open_spatial::scatterSpatialTargetsForConfiguration(source, target, configuration,
+        source_phase, source_jets, source_ratios, target_phase, target_jets, target_ratios);
+}
+
 /// Finalize independent value requests without derivative storage or traces.
 __global__ void finalValueCombinationKernel(std::size_t configuration_count,
     const device_determinant::CombinationMetadata* metadata,
@@ -683,6 +693,26 @@ Error launchPeriodicOrbitalJets(Stream stream, const OpenOrbitalJetLayout& layou
       layout, features, positions, nuclei, backflow_up, backflow_down,
       pi_up, pi_down, zeta_up, zeta_down, active_electrons, output, status,
       retained_backflow, retained_envelope, cell);
+  return peekSpatialLaunchError();
+}
+
+Error launchScatterSpatialTargets(Stream stream, const SpatialJetLayout& source, const SpatialJetLayout& target,
+    const double* source_phase, const double* source_jets, const double* source_ratios,
+    double* target_phase, double* target_jets, double* target_ratios)
+{
+  validateSpatialTargetScatter(source, target);
+  if (!source_phase || !source_jets || !source_ratios || !target_phase || !target_jets || !target_ratios)
+    throw std::invalid_argument("PsiFormer target scatter storage is null");
+  for (const auto* input : {source_phase, source_jets, source_ratios})
+    for (const auto* output : {target_phase, target_jets, target_ratios})
+      if (input == output)
+        throw std::invalid_argument("PsiFormer target scatter requires separate output storage");
+  if (target_phase == target_jets || target_phase == target_ratios || target_jets == target_ratios)
+    throw std::invalid_argument("PsiFormer target scatter output destinations alias");
+  const auto blocks = checkedSpatialBlockCount(source.configuration_count,
+      "PsiFormer target scatter grid exceeds device x dimension");
+  scatterSpatialTargetsKernel<<<blocks, spatial_block_size, 0, stream>>>(source, target,
+      source_phase, source_jets, source_ratios, target_phase, target_jets, target_ratios);
   return peekSpatialLaunchError();
 }
 

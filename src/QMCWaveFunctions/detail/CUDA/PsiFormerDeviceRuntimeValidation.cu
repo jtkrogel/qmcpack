@@ -320,6 +320,116 @@ void softmax(Queue& queue)
   std::cout << "PASS attention_softmax multiple_heads padded_rows extreme_logits\n";
 }
 
+/// Exercise physical-Ne/local-target kernels and complete-output scatter on GPU.
+void targetRangePrimitives(Queue& queue)
+{
+  constexpr std::size_t batch = 3, ne = 5, dets = 2;
+  const auto mode = SpatialJetMode::FULL_VGL;
+  const auto cell = periodic_geometry::makeCell(
+      {{{5.1, .2, .1}, {.4, 4.8, .3}, {.2, .5, 5.3}}}, {{true, true, true}});
+  std::vector<double> positions(batch * ne * 3);
+  for (std::size_t i = 0; i < positions.size(); ++i) positions[i] = .21 + .037 * i;
+  const std::vector<double> nuclei{.1, -.2, .3};
+  auto coordinates = upload(positions), ions = upload(nuclei);
+  auto active = upload(std::vector<std::size_t>(batch, 0));
+  DeviceBuffer<OpenSpatialStatus> status(batch * dets * ne * ne);
+  auto admit = [&](std::size_t count) {
+    queue.sync();
+    std::vector<OpenSpatialStatus> codes(count);
+    status.download(codes.data(), count);
+    for (auto code : codes)
+      if (code != OpenSpatialStatus::REGULAR) throw std::runtime_error("target primitive status");
+  };
+  auto compare = [&](const SpatialJetLayout& full, const SpatialJetLayout& local,
+                     const std::vector<double>& all, const std::vector<double>& part) {
+    for (std::size_t b = 0; b < batch; ++b)
+      for (std::size_t e = 0; e < full.element_count; ++e)
+      {
+        near(part[local.uncheckedValueOffset(b, e)], all[full.uncheckedValueOffset(b, e)], "target value");
+        for (std::size_t k = 0; k < local.laplacian_lanes; ++k)
+        {
+          const auto physical = local.physicalTargetElectron(k);
+          for (std::size_t d = 0; d < 3; ++d)
+            near(part[local.uncheckedGradientOffset(b, 3 * k + d, e)],
+                all[full.uncheckedGradientOffset(b, 3 * physical + d, e)], "target gradient");
+          near(part[local.uncheckedLaplacianOffset(b, k, e)],
+              all[full.uncheckedLaplacianOffset(b, physical, e)], "target Laplacian");
+        }
+      }
+  };
+  for (const bool periodic : {false, true})
+  {
+    const auto features = periodic ? makePeriodicFeatureJetLayout(batch, ne, 1, 2, mode)
+                                   : makeOpenFeatureJetLayout(batch, ne, 1, 2, mode);
+    const auto cusp = makeOpenCuspJetLayout(batch, ne, 2, mode);
+    const auto orbitals = makeOpenOrbitalJetLayout(batch, dets, ne, 1, features.feature_width, 2, mode);
+    auto weights = upload(std::vector<double>(features.feature_width * dets * ne, .17));
+    auto pi = upload(std::vector<double>(dets * ne, .4)), zeta = upload(std::vector<double>(dets * ne, -.7));
+    DeviceBuffer<double> full_features(spatialJetSpanElements(features.output));
+    DeviceBuffer<double> full_cusp(spatialJetSpanElements(cusp.output));
+    DeviceBuffer<double> full_orbitals(spatialJetSpanElements(orbitals.orbitals));
+    auto run_features = [&](const OpenFeatureJetLayout& layout, double* output) {
+      checkRuntime(periodic ? launchPeriodicFeatureJets(queue.getNative(), layout, cell, coordinates.data(),
+          ions.data(), active.data(), output, status.data()) : launchOpenFeatureJets(queue.getNative(), layout,
+          coordinates.data(), ions.data(), active.data(), output, status.data()), "target feature jets");
+      admit(batch);
+    };
+    auto run_cusp = [&](const OpenCuspJetLayout& layout, double* output) {
+      checkRuntime(periodic ? launchPeriodicCuspJets(queue.getNative(), layout, cell, coordinates.data(),
+          active.data(), .8, 1.1, output, status.data()) : launchOpenCuspJets(queue.getNative(), layout,
+          coordinates.data(), active.data(), .8, 1.1, output, status.data()), "target cusp jets");
+      admit(batch);
+    };
+    auto run_orbitals = [&](const OpenOrbitalJetLayout& layout, const double* source, double* output) {
+      checkRuntime(periodic ? launchPeriodicOrbitalJets(queue.getNative(), layout, cell, source, coordinates.data(),
+          ions.data(), weights.data(), weights.data(), pi.data(), pi.data(), zeta.data(), zeta.data(), active.data(),
+          output, status.data()) : launchOpenOrbitalJets(queue.getNative(), layout, source, coordinates.data(),
+          ions.data(), weights.data(), weights.data(), pi.data(), pi.data(), zeta.data(), zeta.data(), active.data(),
+          output, status.data()), "target orbital jets");
+      admit(batch * dets * ne * ne);
+    };
+    run_features(features, full_features.data()); run_cusp(cusp, full_cusp.data());
+    run_orbitals(orbitals, full_features.data(), full_orbitals.data());
+    const auto all_features = download(full_features), all_cusp = download(full_cusp), all_orbitals = download(full_orbitals);
+    DeviceBuffer<double> local_features(spatialJetSpanElements(withSpatialTargetRange(features.output, 0, 2)));
+    DeviceBuffer<double> local_cusp(spatialJetSpanElements(withSpatialTargetRange(cusp.output, 0, 2)));
+    DeviceBuffer<double> local_orbitals(spatialJetSpanElements(withSpatialTargetRange(orbitals.orbitals, 0, 2)));
+    const auto destination = makeSpatialJetLayout(batch, 1, ne, mode, 2, (1 + 4 * ne) * 2 + 7);
+    auto assembled = upload(std::vector<double>(spatialJetSpanElements(destination) + 1, 97.0));
+    auto phases = upload(std::vector<double>(batch, 97.0)), ratios = upload(std::vector<double>(batch * ne, 97.0));
+    auto local_phases = upload(std::vector<double>(batch, -1.0));
+    DeviceBuffer<double> local_ratios(batch * 2);
+    for (std::size_t begin = 0; begin < ne; begin += 2)
+    {
+      const auto count = std::min(std::size_t{2}, ne - begin);
+      auto feature_tile = features; feature_tile.output = withSpatialTargetRange(features.output, begin, count);
+      auto cusp_tile = cusp; cusp_tile.output = withSpatialTargetRange(cusp.output, begin, count);
+      auto orbital_tile = orbitals;
+      orbital_tile.features = withSpatialTargetRange(orbitals.features, begin, count);
+      orbital_tile.orbitals = withSpatialTargetRange(orbitals.orbitals, begin, count);
+      run_features(feature_tile, local_features.data()); run_cusp(cusp_tile, local_cusp.data());
+      run_orbitals(orbital_tile, local_features.data(), local_orbitals.data());
+      compare(features.output, feature_tile.output, all_features, download(local_features));
+      compare(cusp.output, cusp_tile.output, all_cusp, download(local_cusp));
+      compare(orbitals.orbitals, orbital_tile.orbitals, all_orbitals, download(local_orbitals));
+      std::vector<double> tile_ratios(batch * count), tile_phases(batch, begin == 0 ? -1.0 : 1.0);
+      for (std::size_t b = 0; b < batch; ++b)
+        for (std::size_t k = 0; k < count; ++k) tile_ratios[b * count + k] = 1.2 + .1 * (b * ne + begin + k);
+      local_ratios.upload(tile_ratios.data(), tile_ratios.size());
+      local_phases.upload(tile_phases.data(), tile_phases.size());
+      checkRuntime(launchScatterSpatialTargets(queue.getNative(), cusp_tile.output, destination, local_phases.data(),
+          local_cusp.data(), local_ratios.data(), phases.data(), assembled.data(), ratios.data()), "target root scatter");
+    }
+    queue.sync();
+    const auto result = download(assembled), result_ratios = download(ratios), result_phases = download(phases);
+    compare(cusp.output, destination, all_cusp, result);
+    for (std::size_t b = 0; b < batch; ++b) near(result_phases[b], -1.0, "first-tile canonical phase");
+    for (std::size_t i = 0; i < result_ratios.size(); ++i) near(result_ratios[i], 1.2 + .1 * i, "target ratio mapping");
+    near(result.back(), 97.0, "target scatter trailing guard");
+  }
+  std::cout << "PASS target range GPU primitives: physical Ne5, B3, D2, open/skew periodic, nonzero starts/tail, scatter\n";
+}
+
 /// Compare factorization, inverse and signed determinant combinations with 2x2 algebra.
 void determinants(Queue& queue)
 {
@@ -663,6 +773,7 @@ int main(int argc, char** argv)
     AcceleratorBlasHandle handle(queue);
     features(queue);
     featureVGL(queue);
+    targetRangePrimitives(queue);
     nonlinearJets(queue);
     denseAndReverse(queue, handle);
     softmax(queue);

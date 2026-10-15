@@ -260,6 +260,35 @@ inline FinalSpatialJetLayout makeFinalSpatialJetLayout(
 namespace open_spatial
 {
 
+/** Scatter an admitted local root without publishing any incomplete request.
+ * The owner validates descriptors/storage and controls the overall transaction.
+ * Only the first begin-zero tile supplies canonical value/phase. Ratios are
+ * packed [configuration,target]; root jets retain their explicit SoA strides.
+ */
+QMC_PF_OPEN_HOST_DEVICE inline void scatterSpatialTargetsForConfiguration(
+    const SpatialJetLayout& source, const SpatialJetLayout& target, std::size_t configuration,
+    const double* source_phase, const double* source_jets, const double* source_ratios,
+    double* target_phase, double* target_jets, double* target_ratios) noexcept
+{
+  if (source.target_electron_begin == 0)
+  {
+    target_phase[configuration] = source_phase[configuration];
+    target_jets[target.uncheckedValueOffset(configuration, 0)] =
+        source_jets[source.uncheckedValueOffset(configuration, 0)];
+  }
+  for (std::size_t local = 0; local < source.laplacian_lanes; ++local)
+  {
+    const auto physical = source.physicalTargetElectron(local);
+    for (std::size_t dimension = 0; dimension < 3; ++dimension)
+      target_jets[target.uncheckedGradientOffset(configuration, 3 * physical + dimension, 0)] =
+          source_jets[source.uncheckedGradientOffset(configuration, 3 * local + dimension, 0)];
+    target_jets[target.uncheckedLaplacianOffset(configuration, physical, 0)] =
+        source_jets[source.uncheckedLaplacianOffset(configuration, local, 0)];
+    target_ratios[configuration * target.laplacian_lanes + physical] =
+        source_ratios[configuration * source.laplacian_lanes + local];
+  }
+}
+
 /** Combine a signed-log determinant sum and cusp without requiring derivatives.
  * An exact node has phase zero and log amplitude -infinity, not an undefined
  * derivative error. Nonfinite cusp or malformed regular metadata still fails.
@@ -334,16 +363,19 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
         const auto radial = device_math::softenedRadial(pair.radius);
         const std::size_t base = row + 7 * nucleus;
         output[layout.output.uncheckedValueOffset(configuration, base)] = radial.log1p_radius;
-        const bool differentiated = layout.output.mode == SpatialJetMode::FULL_VGL ||
+        const bool differentiated = (layout.output.mode == SpatialJetMode::FULL_VGL &&
+            layout.output.containsTargetElectron(electron)) ||
             (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron);
         for (std::size_t dimension = 0; dimension < 3 && differentiated; ++dimension)
         {
-          const auto lane = layout.output.mode == SpatialJetMode::FULL_VGL ? 3 * electron + dimension : dimension;
+          const auto lane = layout.output.mode == SpatialJetMode::FULL_VGL
+              ? 3 * (electron - layout.output.target_electron_begin) + dimension : dimension;
           output[layout.output.uncheckedGradientOffset(configuration, lane, base)] =
               radial.log1p_first * pair.radius_gradient[dimension];
         }
-        if (layout.output.mode == SpatialJetMode::FULL_VGL)
-          output[layout.output.uncheckedLaplacianOffset(configuration, electron, base)] =
+        if (layout.output.mode == SpatialJetMode::FULL_VGL && differentiated)
+          output[layout.output.uncheckedLaplacianOffset(configuration,
+              electron - layout.output.target_electron_begin, base)] =
               radial.log1p_second * pair.radius_gradient_norm_squared + radial.log1p_first * pair.radius_laplacian;
 
         // The q and complementary p vectors have distinct Cartesian jets, but
@@ -362,14 +394,16 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
               gradient_dot_radius += jacobian[dimension] * pair.radius_gradient[dimension];
               if (differentiated)
               {
-                const auto lane = layout.output.mode == SpatialJetMode::FULL_VGL ? 3 * electron + dimension : dimension;
+                const auto lane = layout.output.mode == SpatialJetMode::FULL_VGL
+                    ? 3 * (electron - layout.output.target_electron_begin) + dimension : dimension;
                 output[layout.output.uncheckedGradientOffset(configuration, lane, element)] =
                     jacobian[dimension] * radial.log1p_over_radius +
                     value * radial.log1p_over_radius_first * pair.radius_gradient[dimension];
               }
             }
-            if (layout.output.mode == SpatialJetMode::FULL_VGL)
-              output[layout.output.uncheckedLaplacianOffset(configuration, electron, element)] =
+            if (layout.output.mode == SpatialJetMode::FULL_VGL && differentiated)
+              output[layout.output.uncheckedLaplacianOffset(configuration,
+                  electron - layout.output.target_electron_begin, element)] =
                   laplacian * radial.log1p_over_radius + 2 * radial.log1p_over_radius_first * gradient_dot_radius +
                   value * (radial.log1p_over_radius_second * pair.radius_gradient_norm_squared +
                            radial.log1p_over_radius_first * pair.radius_laplacian);
@@ -396,13 +430,14 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
         output[layout.output.uncheckedValueOffset(configuration, base + 1 + component)] =
             displacement[component] * radial.log1p_over_radius;
 
-      const bool differentiated = layout.output.mode == SpatialJetMode::FULL_VGL ||
+      const bool differentiated = (layout.output.mode == SpatialJetMode::FULL_VGL &&
+          layout.output.containsTargetElectron(electron)) ||
           (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron);
       if (differentiated)
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
         {
           const std::size_t lane = layout.output.mode == SpatialJetMode::FULL_VGL
-              ? 3 * electron + dimension : dimension;
+              ? 3 * (electron - layout.output.target_electron_begin) + dimension : dimension;
           const double direction = displacement[dimension] / radius;
           output[layout.output.uncheckedGradientOffset(configuration, lane, base)] =
               radial.log1p_first * direction;
@@ -412,13 +447,14 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenFeatureJetsForConfigur
                 (component == dimension ? radial.log1p_over_radius : 0.0) +
                 displacement[component] * radial.log1p_over_radius_first * direction;
         }
-      if (layout.output.mode == SpatialJetMode::FULL_VGL)
+      if (layout.output.mode == SpatialJetMode::FULL_VGL && differentiated)
       {
-        output[layout.output.uncheckedLaplacianOffset(configuration, electron, base)] =
+        output[layout.output.uncheckedLaplacianOffset(configuration,
+            electron - layout.output.target_electron_begin, base)] =
             radial.log1p_second + 2.0 * radial.log1p_first / radius;
         for (std::size_t component = 0; component < 3; ++component)
           output[layout.output.uncheckedLaplacianOffset(
-              configuration, electron, base + 1 + component)] =
+              configuration, electron - layout.output.target_electron_begin, base + 1 + component)] =
               2.0 * radial.log1p_over_radius_first * displacement[component] / radius +
               displacement[component] *
                   (radial.log1p_over_radius_second +
@@ -547,19 +583,22 @@ QMC_PF_OPEN_HOST_DEVICE inline OpenSpatialStatus buildOpenCuspJetsForConfigurati
       for (std::size_t endpoint = 0; endpoint < 2; ++endpoint)
       {
         const std::size_t electron = endpoint == 0 ? first : second;
-        if (layout.output.mode == SpatialJetMode::FULL_VGL ||
-            (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron))
+        const bool differentiated = (layout.output.mode == SpatialJetMode::FULL_VGL &&
+            layout.output.containsTargetElectron(electron)) ||
+            (layout.output.mode == SpatialJetMode::ACTIVE && electron == active_electron);
+        if (differentiated)
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
           {
             const std::size_t lane = layout.output.mode == SpatialJetMode::FULL_VGL
-                ? 3 * electron + dimension : dimension;
+                ? 3 * (electron - layout.output.target_electron_begin) + dimension : dimension;
             const double sign = endpoint == 0 ? 1.0 : -1.0;
             output[layout.output.uncheckedGradientOffset(configuration, lane, 0)] +=
                 periodic_cell ? sign * radial_first * periodic_pair.radius_gradient[dimension]
                               : sign * radial_first * displacement[dimension] / radius;
           }
-        if (layout.output.mode == SpatialJetMode::FULL_VGL)
-          output[layout.output.uncheckedLaplacianOffset(configuration, electron, 0)] +=
+        if (layout.output.mode == SpatialJetMode::FULL_VGL && differentiated)
+          output[layout.output.uncheckedLaplacianOffset(configuration,
+              electron - layout.output.target_electron_begin, 0)] +=
               periodic_cell ? radial_second * periodic_pair.radius_gradient_norm_squared +
                                   radial_first * periodic_pair.radius_laplacian
                             : radial_second + 2.0 * radial_first / radius;

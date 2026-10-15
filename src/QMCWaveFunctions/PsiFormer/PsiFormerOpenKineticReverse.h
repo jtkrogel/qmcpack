@@ -136,7 +136,9 @@ inline void validateOpenOrbitalKineticReverseLayout(
   if (layout.forward.features.configuration_count != 1 ||
       layout.forward.orbitals.configuration_count != 1 ||
       layout.forward.features.mode != SpatialJetMode::FULL_VGL ||
-      layout.forward.orbitals.mode != SpatialJetMode::FULL_VGL)
+      layout.forward.orbitals.mode != SpatialJetMode::FULL_VGL ||
+      !hasCompleteSpatialTargets(layout.forward.features) ||
+      !hasCompleteSpatialTargets(layout.forward.orbitals))
     throw std::invalid_argument(
         "PsiFormer open orbital kinetic reverse requires one FULL_VGL configuration");
 
@@ -176,7 +178,7 @@ inline void validateOpenCuspKineticReverseLayout(
     return;
   validateOpenCuspJetLayout(layout.forward);
   if (layout.forward.output.configuration_count != 1 ||
-      layout.forward.output.mode != SpatialJetMode::FULL_VGL)
+      !hasCompleteSpatialTargets(layout.forward.output))
     throw std::invalid_argument(
         "PsiFormer open cusp kinetic reverse requires one FULL_VGL configuration");
   if (layout.opposite_response_offset >= layout.response_count ||
