@@ -728,13 +728,9 @@ inline std::size_t valueWorkspaceStorageRequirement(const PsiFormerStorageShape&
 
 /// Estimate one spatial workspace, including geometry and determinant storage.
 inline std::size_t spatialWorkspaceStorageRequirement(const PsiFormerStorageShape& shape,
-                                                      bool full_vgl)
+                                                      std::size_t gradient_lanes,
+                                                      std::size_t laplacian_lanes)
 {
-  const std::size_t gradient_lanes = full_vgl
-      ? checkedStorageProduct(3, shape.electrons,
-                              "PsiFormer spatial gradient extent overflowed")
-      : 3;
-  const std::size_t laplacian_lanes = full_vgl ? shape.electrons : 0;
   const std::size_t planes = checkedStorageSum(
       1, checkedStorageSum(gradient_lanes, laplacian_lanes,
                            "PsiFormer spatial plane extent overflowed"),
@@ -782,6 +778,26 @@ inline std::size_t spatialWorkspaceStorageRequirement(const PsiFormerStorageShap
                              gradient_lanes, laplacian_lanes),
                   "PsiFormer spatial workspace bytes overflowed");
   return bytes;
+}
+
+/// Preserve the legacy FULL/ACTIVE inclusive storage requirements.
+inline std::size_t spatialWorkspaceStorageRequirement(const PsiFormerStorageShape& shape,
+                                                      bool full_vgl)
+{
+  return spatialWorkspaceStorageRequirement(shape,
+      full_vgl ? checkedStorageProduct(3, shape.electrons,
+          "PsiFormer spatial gradient extent overflowed") : 3,
+      full_vgl ? shape.electrons : 0);
+}
+
+/// Size a target owner without changing its physical geometry or determinant.
+inline std::size_t targetSpatialWorkspaceStorageRequirement(const PsiFormerStorageShape& shape,
+                                                            std::size_t max_targets)
+{
+  if (max_targets == 0 || max_targets > shape.electrons)
+    throw std::invalid_argument("PsiFormer target capacity must be positive and at most Ne");
+  return spatialWorkspaceStorageRequirement(shape,
+      checkedStorageProduct(3, max_targets, "PsiFormer target gradient extent overflowed"), max_targets);
 }
 
 /// Estimate the compact forward/reverse parameter-score tape inclusively.

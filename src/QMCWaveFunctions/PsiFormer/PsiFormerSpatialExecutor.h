@@ -12,7 +12,8 @@
  * directly through the embedding, attention, orbital, determinant, and cusp layers.
  * It never forms an electron Hessian: a full evaluation stores 3*Ne first-derivative
  * lanes and Ne Laplacian lanes, while an active-electron evaluation stores only three
- * first-derivative lanes.  All storage is allocated with the clone-local workspace.
+ * first-derivative lanes. Explicit target VGL reserves 3*maxK/maxK derivative lanes
+ * over the complete physical configuration. All storage is clone-local and fixed.
  *
  * Real geometry supports both open and periodic policies. Full real preparation
  * retains the existing orbital/determinant/output arrays; explicit trunk-only
@@ -50,11 +51,12 @@
 namespace pf
 {
 
-/// Select either the three-lane active-electron path or complete molecular VGL.
+/// Select active gradients, full VGL, or explicitly bounded target VGL.
 enum class DirectSpatialMode
 {
   ACTIVE_ELECTRON_GRADIENT,
-  FULL_VGL
+  FULL_VGL,
+  TARGET_VGL
 };
 
 /// Explicit developer selection; preserve the scalar head until paired timings.
@@ -140,9 +142,22 @@ public:
                          GeometryPositionView nuclei,
                          DirectSpatialMode mode,
                          GeometryBoundary boundary = {})
+      : DirectSpatialTrunkWorkspace(requireLegacyMode(layout, mode), nuclei, mode, boundary, 0)
+  {}
+
+protected:
+  /// Allocate fixed derivative capacity after the caller validates its preparation.
+  DirectSpatialTrunkWorkspace(const DirectValueParameterLayout& layout,
+                         GeometryPositionView nuclei,
+                         DirectSpatialMode mode,
+                         GeometryBoundary boundary,
+                         std::size_t max_targets)
       : layout_identity_(&layout), mode_(mode),
-        gradient_lanes_(mode == DirectSpatialMode::FULL_VGL ? 3 * layout.electronCount() : 3),
-        laplacian_lanes_(mode == DirectSpatialMode::FULL_VGL ? layout.electronCount() : 0),
+        target_capacity_(mode == DirectSpatialMode::TARGET_VGL ? max_targets :
+            (mode == DirectSpatialMode::FULL_VGL ? layout.electronCount() : 1)),
+        target_count_(target_capacity_),
+        gradient_lanes_(3 * target_capacity_),
+        laplacian_lanes_(mode == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT ? 0 : target_capacity_),
         electron_positions_(3 * layout.electronCount()),
         geometry_(layout.electronCount(), nuclei, boundary),
         raw_features_(layout.electronCount() * layout.inputWidth(), gradient_lanes_, laplacian_lanes_),
@@ -157,11 +172,9 @@ public:
         hidden_(layout.electronCount() * layout.featureWidth(), gradient_lanes_, laplacian_lanes_),
         scalar_gradient_scratch_(gradient_lanes_),
         scalar_laplacian_scratch_(laplacian_lanes_)
-  {
-    if (mode != DirectSpatialMode::FULL_VGL && mode != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
-      throw std::invalid_argument("Unknown PsiFormer spatial trunk mode");
-  }
+  {}
 
+public:
   /// Prepared mutable jets cannot be shared by copying.
   DirectSpatialTrunkWorkspace(const DirectSpatialTrunkWorkspace&) = delete;
 
@@ -336,6 +349,15 @@ protected:
   friend class DirectSpatialExecutor;
   friend class DirectBatchExecutor;
 
+  /// Close the legacy and public trunk constructors before any numeric allocation.
+  static const DirectValueParameterLayout& requireLegacyMode(const DirectValueParameterLayout& layout,
+                                                            DirectSpatialMode mode)
+  {
+    if (mode != DirectSpatialMode::FULL_VGL && mode != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
+      throw std::invalid_argument("PsiFormer spatial mode requires explicit target preparation");
+    return layout;
+  }
+
   /// Invalidate publication before any mutation, including a failed request.
   void invalidateResult()
   {
@@ -372,6 +394,9 @@ protected:
 
   const DirectValueParameterLayout* layout_identity_;
   DirectSpatialMode mode_;
+  std::size_t target_capacity_;
+  std::size_t target_begin_ = 0;
+  std::size_t target_count_;
   std::size_t gradient_lanes_;
   std::size_t laplacian_lanes_;
   std::size_t active_electron_ = 0;
@@ -405,6 +430,32 @@ public:
         determinant_workspace_(layout.determinantCount(), layout.electronCount(), gradient_lanes_, laplacian_lanes_),
         output_gradient_(gradient_lanes_), output_lap_log_(laplacian_lanes_), output_lap_ratio_(laplacian_lanes_)
   {}
+
+  /// Admit the complete fixed target payload before the base allocates any buffers.
+  DirectSpatialWorkspace(const DirectValueParameterLayout& layout, GeometryPositionView nuclei,
+      std::size_t max_targets, std::size_t byte_budget, GeometryBoundary boundary = {})
+      : DirectSpatialTrunkWorkspace(admitTargetLayout(layout, nuclei, max_targets, byte_budget), nuclei,
+            DirectSpatialMode::TARGET_VGL, boundary, max_targets),
+        orbital_matrices_(layout.determinantCount() * layout.electronCount() * layout.electronCount(),
+                          gradient_lanes_, laplacian_lanes_),
+        determinant_workspace_(layout.determinantCount(), layout.electronCount(), gradient_lanes_, laplacian_lanes_),
+        output_gradient_(gradient_lanes_), output_lap_log_(laplacian_lanes_), output_lap_ratio_(laplacian_lanes_)
+  {}
+
+  /// Select live physical targets without resizing any prepared derivative plane.
+  void setTargetRange(std::size_t begin, std::size_t count)
+  {
+    invalidateResult();
+    if (mode_ != DirectSpatialMode::TARGET_VGL)
+      throw std::invalid_argument("PsiFormer target range requires a target workspace");
+    if (count == 0 || count > target_capacity_ || begin >= geometry_.electronCount() ||
+        count > geometry_.electronCount() - begin)
+      throw std::out_of_range("PsiFormer target range exceeds prepared capacity or physical electrons");
+    target_begin_ = begin;
+    target_count_ = count;
+    gradient_lanes_ = 3 * count;
+    laplacian_lanes_ = count;
+  }
 
   /// Complete real workspaces remain exclusively owned.
   DirectSpatialWorkspace(const DirectSpatialWorkspace&) = delete;
@@ -450,14 +501,14 @@ public:
     return bytes;
   }
 
-  /// Keep the independent complete spatial storage estimator unchanged.
+  /// Report reserved capacity independently of the current live target range.
   std::size_t requiredStorageBytes() const
   {
     const std::size_t n = geometry_.electronCount();
     return spatialWorkspaceStorageRequirement({n, geometry_.nucleusCount(), determinant_workspace_.channels(),
         features_a_.value.size() / n, attention_.value.size() / checkedStorageProduct(n, n,
         "PsiFormer spatial shape overflowed"), raw_features_.value.size() / n, 0, 0},
-        mode_ == DirectSpatialMode::FULL_VGL);
+        3 * target_capacity_, mode_ == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT ? 0 : target_capacity_);
   }
 
 private:
@@ -469,6 +520,23 @@ private:
   {
     if (layout.preparation() != DirectValuePreparation::REAL_WAVEFUNCTION)
       throw std::invalid_argument("PsiFormer real spatial workspace requires full real preparation");
+    return layout;
+  }
+
+  /// Check exact numeric payload and a positive finite cap before base construction.
+  static const DirectValueParameterLayout& admitTargetLayout(const DirectValueParameterLayout& layout,
+      GeometryPositionView nuclei, std::size_t max_targets, std::size_t byte_budget)
+  {
+    requireFullLayout(layout);
+    if (nuclei.size() != layout.nucleusCount())
+      throw std::invalid_argument("PsiFormer target workspace received the wrong nucleus count");
+    if (byte_budget == 0 || byte_budget == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("PsiFormer target byte budget must be positive and finite");
+    const std::size_t bytes = targetSpatialWorkspaceStorageRequirement(
+        {layout.electronCount(), layout.nucleusCount(), layout.determinantCount(), layout.featureWidth(),
+         layout.headCount(), layout.inputWidth(), 0, 0}, max_targets);
+    if (bytes > byte_budget)
+      throw std::length_error("PsiFormer target workspace exceeds its byte budget");
     return layout;
   }
 
@@ -494,7 +562,9 @@ struct DirectSpatialTrunkResultView
   std::size_t parameter_version, evaluation_generation;
 };
 
-/** Return direct spatial outputs as non-owning views into a reusable workspace. */
+/** Borrow spatial outputs until the next edit/evaluation; match parameter version
+ * and evaluation generation before reuse. Target ranges name physical electrons.
+ */
 struct DirectSpatialResultView
 {
   double sign   = 1;
@@ -505,6 +575,8 @@ struct DirectSpatialResultView
   DirectConstDoubleView lap_log;
   DirectConstDoubleView lap_ratio;
   std::size_t parameter_version = 0;
+  std::size_t target_begin = 0, target_count = 0;
+  std::size_t evaluation_generation = 0;
 };
 
 /** Evaluate real PsiFormer spatial observables with boundary-aware direct kernels. */
@@ -559,6 +631,16 @@ public:
         *layout_, GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()), mode, boundary_);
   }
 
+  /// Prepare a bounded real owner with all physical rows and only target derivative planes.
+  std::unique_ptr<DirectSpatialWorkspace> makeTargetWorkspace(std::size_t max_targets,
+                                                           std::size_t byte_budget) const
+  {
+    requireRealWavefunction();
+    return std::make_unique<DirectSpatialWorkspace>(*layout_,
+        GeometryPositionView::interleaved(nuclei_.data(), layout_->nucleusCount()),
+        max_targets, byte_budget, boundary_);
+  }
+
   /// Expose the immutable descriptor identity used to bind batch executors safely.
   const std::shared_ptr<const DirectValueParameterLayout>& layout() const
   {
@@ -609,6 +691,15 @@ public:
     if (workspace.mode_ != DirectSpatialMode::FULL_VGL)
       throw std::invalid_argument("PsiFormer full VGL requires a FULL_VGL workspace");
     workspace.active_electron_ = 0;
+    return evaluateImpl(workspace);
+  }
+
+  /// Evaluate one admitted physical target interval using the existing complete algebra.
+  DirectSpatialResultView evaluateTarget(DirectSpatialWorkspace& workspace,
+                                        std::size_t begin, std::size_t count) const
+  {
+    workspace.setTargetRange(begin, count);
+    requireRealWavefunction();
     return evaluateImpl(workspace);
   }
 
@@ -686,14 +777,15 @@ private:
   static std::size_t laneElectron(const DirectSpatialTrunkWorkspace& workspace,
                                   std::size_t lane) noexcept
   {
-    return workspace.mode_ == DirectSpatialMode::FULL_VGL ? lane / 3 : workspace.active_electron_;
+    return workspace.mode_ == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT ? workspace.active_electron_ :
+        workspace.target_begin_ + lane / 3;
   }
 
   /// Return the x/y/z component associated with one Cartesian gradient lane.
   static std::size_t laneDimension(const DirectSpatialTrunkWorkspace& workspace,
                                    std::size_t lane) noexcept
   {
-    return workspace.mode_ == DirectSpatialMode::FULL_VGL ? lane % 3 : lane;
+    return workspace.mode_ == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT ? lane : lane % 3;
   }
 
   /// Index one lane-major gradient element.
@@ -972,9 +1064,11 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
         }
       }
 
-      if (workspace.mode_ == DirectSpatialMode::FULL_VGL)
+      if (electron >= workspace.target_begin_ &&
+          electron - workspace.target_begin_ < workspace.laplacian_lanes_)
       {
-        raw.laplacian[laplacianIndex(raw, electron, radial_element)] =
+        const std::size_t target = electron - workspace.target_begin_;
+        raw.laplacian[laplacianIndex(raw, target, radial_element)] =
             radial.log1p_second * distance_gradient_norms[pair] +
             radial.log1p_first * distance_laplacians[pair];
         for (std::size_t component = 0; component < 3; ++component)
@@ -993,12 +1087,12 @@ inline void DirectSpatialExecutor::buildEmbeddingFeatures(
           const double radial_trace =
               radial.log1p_over_radius_second * distance_gradient_norms[pair] +
               radial.log1p_over_radius_first * distance_laplacians[pair];
-          raw.laplacian[laplacianIndex(raw, electron, radial_element + 1 + component)] =
+          raw.laplacian[laplacianIndex(raw, target, radial_element + 1 + component)] =
               displacement_laplacians[pair][component] * radial.log1p_over_radius +
               2 * radial.log1p_over_radius_first * displacement_gradient_dot_radius_gradient +
               displacement[component] * radial_trace;
           if (periodic)
-            raw.laplacian[laplacianIndex(raw, electron, radial_element + 4 + component)] =
+            raw.laplacian[laplacianIndex(raw, target, radial_element + 4 + component)] =
                 complementary_laplacians[pair][component] * radial.log1p_over_radius +
                 2 * radial.log1p_over_radius_first * complementary_gradient_dot_radius_gradient +
                 complementary[pair][component] * radial_trace;
@@ -1251,9 +1345,9 @@ inline void DirectSpatialExecutor::applyAttentionBlock(
            workspace.features_b_);
   for (std::size_t element = 0; element < workspace.features_b_.value.size(); ++element)
     workspace.features_b_.value[element] += workspace.features_a_.value[element];
-  for (std::size_t element = 0; element < workspace.features_b_.gradient.size(); ++element)
+  for (std::size_t element = 0; element < workspace.gradient_lanes_ * workspace.features_b_.value.size(); ++element)
     workspace.features_b_.gradient[element] += workspace.features_a_.gradient[element];
-  for (std::size_t element = 0; element < workspace.features_b_.laplacian.size(); ++element)
+  for (std::size_t element = 0; element < workspace.laplacian_lanes_ * workspace.features_b_.value.size(); ++element)
     workspace.features_b_.laplacian[element] += workspace.features_a_.laplacian[element];
 
   denseJet(workspace.features_b_, tensor(parameters, layer.mlp_weight_0),
@@ -1267,9 +1361,9 @@ inline void DirectSpatialExecutor::applyAttentionBlock(
 
   for (std::size_t element = 0; element < workspace.features_b_.value.size(); ++element)
     workspace.features_b_.value[element] += workspace.attended_.value[element];
-  for (std::size_t element = 0; element < workspace.features_b_.gradient.size(); ++element)
+  for (std::size_t element = 0; element < workspace.gradient_lanes_ * workspace.features_b_.value.size(); ++element)
     workspace.features_b_.gradient[element] += workspace.attended_.gradient[element];
-  for (std::size_t element = 0; element < workspace.features_b_.laplacian.size(); ++element)
+  for (std::size_t element = 0; element < workspace.laplacian_lanes_ * workspace.features_b_.value.size(); ++element)
     workspace.features_b_.laplacian[element] += workspace.attended_.laplacian[element];
   std::swap(workspace.features_a_, workspace.features_b_);
 }
@@ -1377,8 +1471,9 @@ inline void DirectSpatialExecutor::buildOrbitalMatrices(const double* parameters
               workspace.scalar_gradient_scratch_[lane] +=
                   radial_first * distance_gradients[pair][dimension];
             }
-          if (workspace.mode_ == DirectSpatialMode::FULL_VGL)
-            workspace.scalar_laplacian_scratch_[row_electron] +=
+          if (row_electron >= workspace.target_begin_ &&
+              row_electron - workspace.target_begin_ < workspace.laplacian_lanes_)
+            workspace.scalar_laplacian_scratch_[row_electron - workspace.target_begin_] +=
                 radial_second * distance_gradient_norms[pair] +
                 radial_first * distance_laplacians[pair];
         }
@@ -1472,13 +1567,15 @@ inline double DirectSpatialExecutor::accumulateCusp(const double* parameters,
       workspace.scalar_gradient_scratch_[lane] += incidence_sign * radial_first *
           distance_gradients[pair_index][dimension];
     }
-    if (workspace.mode_ == DirectSpatialMode::FULL_VGL)
+    if (workspace.laplacian_lanes_ != 0)
     {
       const double pair_laplacian =
           radial_second * distance_gradient_norms[pair_index] +
           radial_first * distance_laplacians[pair_index];
-      workspace.scalar_laplacian_scratch_[pair.first] += pair_laplacian;
-      workspace.scalar_laplacian_scratch_[pair.second] += pair_laplacian;
+      for (const std::size_t electron : {pair.first, pair.second})
+        if (electron >= workspace.target_begin_ &&
+            electron - workspace.target_begin_ < workspace.laplacian_lanes_)
+          workspace.scalar_laplacian_scratch_[electron - workspace.target_begin_] += pair_laplacian;
     }
   }
   return cusp_value;
@@ -1527,11 +1624,11 @@ inline DirectSpatialResultView DirectSpatialExecutor::evaluateImpl(
   const double logabs = determinant_result.amplitude.log_abs + cusp_value;
   if (!is_finite_parameter_value(logabs))
     throw std::runtime_error("PsiFormer spatial evaluator produced a non-finite log amplitude");
-  for (double component : workspace.output_gradient_)
-    if (!is_finite_parameter_value(component))
+  for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+    if (!is_finite_parameter_value(workspace.output_gradient_[lane]))
       throw std::runtime_error("PsiFormer spatial evaluator produced a non-finite gradient");
-  for (double component : workspace.output_lap_log_)
-    if (!is_finite_parameter_value(component))
+  for (std::size_t target = 0; target < workspace.laplacian_lanes_; ++target)
+    if (!is_finite_parameter_value(workspace.output_lap_log_[target]))
       throw std::runtime_error("PsiFormer spatial evaluator produced a non-finite Laplacian");
 
   workspace.observed_parameter_version_ = parameters_.version();
@@ -1540,10 +1637,12 @@ inline DirectSpatialResultView DirectSpatialExecutor::evaluateImpl(
           logabs,
           determinant::realValue(determinant_result.amplitude, cusp_value),
           workspace.mode_,
-          {workspace.output_gradient_.data(), workspace.output_gradient_.size()},
-          {workspace.output_lap_log_.data(), workspace.output_lap_log_.size()},
-          {workspace.output_lap_ratio_.data(), workspace.output_lap_ratio_.size()},
-          workspace.observed_parameter_version_};
+          {workspace.output_gradient_.data(), workspace.gradient_lanes_},
+          {workspace.output_lap_log_.data(), workspace.laplacian_lanes_},
+          {workspace.output_lap_ratio_.data(), workspace.laplacian_lanes_},
+          workspace.observed_parameter_version_,
+          workspace.mode_ == DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT ? workspace.active_electron_ :
+              workspace.target_begin_, workspace.target_count_, workspace.evaluation_generation_};
 }
 
 } // namespace pf

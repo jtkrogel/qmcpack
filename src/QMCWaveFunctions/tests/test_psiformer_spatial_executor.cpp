@@ -17,6 +17,7 @@
 #include "psiformer_test_utils.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -415,4 +416,151 @@ TEST_CASE("PsiFormer direct spatial request validation", "[wavefunction][psiform
     checkClose(changed.gradient[coordinate], changed_oracle.gradient[coordinate]);
   for (std::size_t electron = 0; electron < changed.lap_log.size(); ++electron)
     checkClose(changed.lap_log[electron], changed_oracle.lap_log[electron], 3e-7, 3e-7);
+}
+
+TEST_CASE("PsiFormer target spatial owners match independent FULL slices without growth",
+          "[wavefunction][psiformer][target_spatial]")
+{
+  std::string system = "lih";
+  bool periodic = false;
+  SECTION("open LiH") {}
+  SECTION("open OH unequal spins") { system = "oh"; }
+  SECTION("skew periodic OH unequal spins") { system = "oh"; periodic = true; }
+  GeneratedFiles files = generateFiles(system, 4, periodic ? 7 : 4);
+  pf::PsiFormer model(files.parameters, files.configuration);
+  qmcplusplus::psiformer::ExecutionEnvironment environment;
+  if (periodic)
+  {
+    environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+    environment.geometry_feature_policy = qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    environment.lattice_vectors = {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+    environment.periodic_axes = {{true, true, true}};
+  }
+  const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p,
+      {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
+       model.dim, model.heads, model.blocks}, environment);
+  pf::DirectValueExecutor value(model, plan);
+  pf::DirectSpatialExecutor full_executor(model, value, plan);
+  auto full = full_executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  auto positions = model.cfg.configuration(0).x;
+  const auto view = pf::GeometryPositionView::interleaved(positions.data(), model.ne);
+  full->setPositions(view);
+  const auto reference = full_executor.evaluateFull(*full);
+  const std::vector<double> gradient(reference.gradient.begin(), reference.gradient.end());
+  const std::vector<double> lap_log(reference.lap_log.begin(), reference.lap_log.end());
+  const std::vector<double> lap_ratio(reference.lap_ratio.begin(), reference.lap_ratio.end());
+  const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet,
+      model.dim, model.heads, (periodic ? 7 : 4) * model.cfg.nuclei.shape[0] + 1, 0, 0};
+
+  for (const auto projection : {pf::DirectOrbitalProjection::SCALAR, pf::DirectOrbitalProjection::GEMM})
+  {
+    pf::DirectSpatialExecutor executor(model, value, plan, projection);
+    for (const std::size_t capacity : {std::size_t{1}, std::size_t{3}, model.ne})
+    {
+      const auto bytes = pf::targetSpatialWorkspaceStorageRequirement(shape, capacity);
+      auto target = executor.makeTargetWorkspace(capacity, bytes);
+      CHECK(target->requiredStorageBytes() == bytes);
+      CHECK(target->vectorStorageBytes() == bytes);
+      target->setPositions(view);
+      const auto fingerprint = target->storageFingerprint();
+      const auto check_range = [&](std::size_t begin, std::size_t count) {
+        const auto result = executor.evaluateTarget(*target, begin, count);
+        CHECK(result.mode == pf::DirectSpatialMode::TARGET_VGL);
+        CHECK(result.target_begin == begin);
+        CHECK(result.target_count == count);
+        CHECK(result.evaluation_generation == target->evaluationGeneration());
+        CHECK(result.parameter_version == model.p.version());
+        REQUIRE(result.gradient.size() == 3 * count);
+        REQUIRE(result.lap_log.size() == count);
+        REQUIRE(result.lap_ratio.size() == count);
+        CHECK(result.sign == reference.sign);
+        checkClose(result.logabs, reference.logabs);
+        checkClose(result.value, reference.value);
+        for (std::size_t t = 0; t < count; ++t)
+        {
+          for (std::size_t d = 0; d < 3; ++d)
+            checkClose(result.gradient[3 * t + d], gradient[3 * (begin + t) + d], 2e-11, 2e-11);
+          checkClose(result.lap_log[t], lap_log[begin + t], 2e-11, 2e-11);
+          checkClose(result.lap_ratio[t], lap_ratio[begin + t], 2e-11, 2e-11);
+        }
+        CHECK(target->requiredStorageBytes() == bytes);
+        CHECK(target->vectorStorageBytes() == bytes);
+        CHECK(target->storageFingerprint() == fingerprint);
+      };
+      for (std::size_t begin = 0; begin < model.ne; begin += capacity)
+        check_range(begin, std::min(capacity, model.ne - begin));
+      check_range(1, std::min(capacity, model.ne - 1));
+      check_range(0, capacity); // Restore a full live prefix after a short tail.
+      if (periodic)
+      {
+        auto image = positions;
+        for (std::size_t d = 0; d < 3; ++d)
+          image[d] += environment.lattice_vectors[1][d] - environment.lattice_vectors[2][d];
+        target->setPositions(pf::GeometryPositionView::interleaved(image.data(), model.ne));
+        check_range(0, capacity);
+      }
+    }
+  }
+}
+
+TEST_CASE("PsiFormer target spatial admission and lifecycle fail closed",
+          "[wavefunction][psiformer][target_spatial]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  pf::PsiFormer model(files.parameters, files.configuration);
+  const auto plan = makePlan(model);
+  pf::DirectValueExecutor value(model, plan);
+  pf::DirectSpatialExecutor executor(model, value, plan);
+  const auto positions = model.cfg.configuration(0);
+  const auto view = pf::GeometryPositionView::interleaved(positions.x.data(), model.ne);
+  const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet,
+      model.dim, model.heads, 4 * model.cfg.nuclei.shape[0] + 1, 0, 0};
+  const auto bytes = pf::targetSpatialWorkspaceStorageRequirement(shape, 3);
+  CHECK_THROWS_AS(executor.makeWorkspace(pf::DirectSpatialMode::TARGET_VGL), std::invalid_argument);
+  CHECK_THROWS_AS(executor.makeTrunkWorkspace(pf::DirectSpatialMode::TARGET_VGL), std::invalid_argument);
+  CHECK_THROWS_AS(executor.makeTargetWorkspace(0, bytes), std::invalid_argument);
+  CHECK_THROWS_AS(executor.makeTargetWorkspace(model.ne + 1, bytes), std::invalid_argument);
+  CHECK_THROWS_AS(executor.makeTargetWorkspace(3, 0), std::invalid_argument);
+  CHECK_THROWS_AS(executor.makeTargetWorkspace(3, std::numeric_limits<std::size_t>::max()), std::invalid_argument);
+  // Structural preallocation check: admitTargetLayout runs as the base constructor
+  // argument, before geometry or vectors; this exception test adds boundary coverage.
+  CHECK_THROWS_AS(executor.makeTargetWorkspace(3, bytes - 1), std::length_error);
+  CHECK_THROWS_AS(pf::DirectSpatialWorkspace(*executor.layout(),
+      pf::GeometryPositionView::interleaved(model.cfg.nuclei.x.data(), model.cfg.nuclei.shape[0]), 3, bytes - 1),
+                  std::length_error);
+  auto target = executor.makeTargetWorkspace(3, bytes);
+  target->setPositions(view);
+  const auto fingerprint = target->storageFingerprint();
+  const auto first = executor.evaluateTarget(*target, 1, 2);
+  CHECK_THROWS_AS(executor.evaluateTarget(*target, model.ne, 1), std::out_of_range);
+  CHECK(target->evaluationGeneration() > first.evaluation_generation);
+  CHECK(target->observedParameterVersion() == std::numeric_limits<std::size_t>::max());
+  CHECK_THROWS_AS(target->setTargetRange(0, 0), std::out_of_range);
+  CHECK_THROWS_AS(target->setTargetRange(0, 4), std::out_of_range);
+  CHECK_THROWS_AS(target->setTargetRange(model.ne - 1, 2), std::out_of_range);
+  CHECK_THROWS_AS(target->setTargetRange(std::numeric_limits<std::size_t>::max(), 1), std::out_of_range);
+  CHECK_THROWS_AS(executor.evaluateFull(*target), std::invalid_argument);
+  CHECK_THROWS_AS(executor.evaluateActive(*target, 0), std::invalid_argument);
+  CHECK_THROWS_AS(executor.evaluateTrunkFull(*target), std::invalid_argument);
+  auto full = executor.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  full->setPositions(view);
+  CHECK_THROWS_AS(executor.evaluateTarget(*full, 0, 1), std::invalid_argument);
+  target->setPosition(0, 0, positions.x[0]);
+  CHECK(target->observedParameterVersion() == std::numeric_limits<std::size_t>::max());
+  model.p.set_flat_value(127, model.p.flat_values()[127] + 1e-3);
+  const auto changed = executor.evaluateTarget(*target, 1, 2);
+  const auto reference = executor.evaluateFull(*full);
+  CHECK(changed.parameter_version == model.p.version());
+  for (std::size_t lane = 0; lane < changed.gradient.size(); ++lane)
+    checkClose(changed.gradient[lane], reference.gradient[3 + lane]);
+  for (std::size_t t = 0; t < changed.lap_log.size(); ++t)
+    checkClose(changed.lap_log[t], reference.lap_log[1 + t]);
+  // Zero orbital projections produce an exact determinant node before cusp use.
+  for (std::size_t parameter = 0; parameter < model.p.flat_values().size(); ++parameter)
+    model.p.set_flat_value(parameter, 0.0);
+  CHECK_THROWS_AS(executor.evaluateTarget(*target, 0, 3), std::domain_error);
+  CHECK(target->observedParameterVersion() == std::numeric_limits<std::size_t>::max());
+  CHECK(target->evaluationGeneration() > changed.evaluation_generation);
+  CHECK(target->storageFingerprint() == fingerprint);
+  CHECK(target->requiredStorageBytes() == bytes);
 }
