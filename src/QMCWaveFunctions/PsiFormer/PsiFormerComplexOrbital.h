@@ -211,6 +211,13 @@ public:
   }
 
   /// Count explicitly owned numeric buffers and copied reciprocal momentum storage.
+  static std::size_t storageRequirement(const SpatialJetLayout& output, std::size_t momentum_count = 0)
+  {
+    return spatial_detail::checkedAdd(multiply(multiply(2, spatialJetSpanElements(output)), sizeof(C)),
+        multiply(momentum_count, sizeof(std::array<double, 3>)), "complex head storage bytes overflow");
+  }
+
+  /// Count live vector capacities rather than shared parameter storage.
   std::size_t storageBytes() const
   {
     std::size_t bytes = multiply(projected_.capacity(), sizeof(C));

@@ -29,6 +29,7 @@ public:
   /// Consume one explicit paired profile and bind immutable geometry to the target.
   PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
                      const ParticleSet& electrons, const ParticleSet& ions,
+                     std::size_t maximum_clone_numeric_bytes,
                      std::array<double, 3> reduced_twist = {});
 
   /// Destroy the Native-free PIMPL in its sole native implementation translation unit.
@@ -67,8 +68,17 @@ public:
   /// Discard only the matching pending proposal.
   void restore(int) override;
 
-  /// Clone/persistence admission belongs to the next separately qualified slice.
+  /// Share immutable parameters, but prepare independent scratch and no accepted/proposal state.
   std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet&) const override;
+
+  /// Per-clone numeric buffers only: excludes shared model, allocator overhead, ParticleSet and WFBuffer.
+  struct NumericStorage
+  {
+    std::size_t required_bytes, allocated_bytes, limit_bytes, fingerprint;
+  };
+
+  /// Report exact preparation; this is not an aggregate budget or adaptive large-system qualification.
+  NumericStorage numericStorage() const;
 
   /// Fail closed until the explicit complex walker record is qualified.
   void registerData(ParticleSet&, WFBufferType&) override;
@@ -84,6 +94,8 @@ public:
 
 private:
   struct Impl;
+  /// Internal clone entry point retains immutable model ownership and the explicit numeric cap.
+  PsiFormerComplexWF(std::string name, std::unique_ptr<Impl>);
   std::unique_ptr<Impl> impl_;
 };
 #endif

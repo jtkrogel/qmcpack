@@ -65,6 +65,24 @@ class ComplexDeterminantWorkspace
   };
 
 public:
+  /// Exact vector-element requirement without allocating factors or derivative buffers.
+  static std::size_t storageRequirement(std::size_t channels, std::size_t first_size,
+      std::size_t second_size = 0, std::size_t gradient_lanes = 0, std::size_t laplacian_lanes = 0)
+  {
+    if (!channels || (laplacian_lanes && gradient_lanes != product(3, laplacian_lanes)))
+      throw std::invalid_argument("invalid complex determinant workspace dimensions");
+    const auto first_square = product(first_size, first_size);
+    const auto second_square = product(second_size, second_size);
+    const auto matrices = product(channels, sum(first_square, second_square));
+    std::size_t bytes = product(sizeof(Complex),
+        sum(product(3, matrices), sum(gradient_lanes, product(2, laplacian_lanes))));
+    bytes = sum(bytes, product(sizeof(std::size_t), product(channels, sum(first_size, second_size))));
+    bytes = sum(bytes, product(sizeof(ComplexLogAmplitude), product(3, channels)));
+    bytes = sum(bytes, product(sizeof(unsigned char), product(2, channels)));
+    return sum(bytes, product(sizeof(Wide), sum(product(2, channels),
+        sum(std::max(first_size, second_size), std::max(first_square, second_square)))));
+  }
+
   /// Reserve factorization and requested derivative scratch before evaluation.
   ComplexDeterminantWorkspace(std::size_t channels, std::size_t first_size,
                               std::size_t second_size = 0, std::size_t gradient_lanes = 0,

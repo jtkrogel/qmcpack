@@ -71,12 +71,63 @@ struct PsiFormerComplexWF::Impl
 
   /// Prepare distinct VALUE/FULL/ACTIVE scratch; there is no real head or score tape.
   Impl(psiformer::InitializedPsiFormerParameters initialized, const ParticleSet& electrons,
-       const ParticleSet& ions, std::array<double, 3> reduced)
-      : state(std::make_shared<const Model>(materialize(std::move(initialized), electrons, ions), electrons, reduced)),
-        particles(&electrons), value(state->value.makeWorkspace()),
-        full(state->spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL)),
-        active(state->spatial.makeWorkspace(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT))
+       const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
+      : Impl(std::make_shared<const Model>(materialize(std::move(initialized), electrons, ions), electrons, reduced),
+             electrons, limit)
   {}
+
+  /// Check the full requirement before allocating any clone-local numerical buffers.
+  Impl(std::shared_ptr<const Model> shared, const ParticleSet& electrons, std::size_t limit)
+      : state(std::move(shared)), particles(&electrons), numeric_limit(limit)
+  {
+    using namespace psiformer;
+    using pf::addStorageBytes;
+    using pf::checkedStorageBytes;
+    validate(electrons);
+    if (!limit || limit == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Complex PsiFormer requires a positive finite per-clone numeric byte cap");
+    const auto& model = state->model;
+    const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
+        state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size()};
+    numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);
+    for (auto mode : {pf::DirectSpatialMode::FULL_VGL, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT})
+      addStorageBytes(numeric_required, pf::DirectComplexSpatialWorkspace::storageRequirement(shape, mode),
+                      "complex clone bytes overflow");
+    addStorageBytes(numeric_required, checkedStorageBytes<GradType>(model.ne, "complex own gradient bytes overflow"),
+                    "complex clone bytes overflow");
+    addStorageBytes(numeric_required, checkedStorageBytes<ValueType>(model.ne, "complex own Laplacian bytes overflow"),
+                    "complex clone bytes overflow");
+    if (numeric_required > numeric_limit)
+      throw std::length_error("Complex PsiFormer full clone numeric requirement exceeds its per-clone byte cap");
+    value = state->value.makeWorkspace();
+    full = state->spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+    active = state->spatial.makeWorkspace(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
+    own_gradient.resize(model.ne);
+    own_laplacian.resize(model.ne);
+    if (numericStorage().allocated_bytes != numeric_required)
+      throw std::logic_error("Complex PsiFormer numeric capacity differs from its admitted exact requirement");
+  }
+
+  /// Sum live capacities and allocation identities, excluding immutable shared model storage.
+  NumericStorage numericStorage() const
+  {
+    using namespace psiformer;
+    using pf::addStorageBytes;
+    using pf::checkedStorageBytes;
+    std::size_t bytes = value->vectorStorageBytes();
+    addStorageBytes(bytes, full->vectorStorageBytes(), "complex clone bytes overflow");
+    addStorageBytes(bytes, active->vectorStorageBytes(), "complex clone bytes overflow");
+    addStorageBytes(bytes, checkedStorageBytes<GradType>(own_gradient.capacity(), "complex own gradient bytes overflow"),
+                    "complex clone bytes overflow");
+    addStorageBytes(bytes, checkedStorageBytes<ValueType>(own_laplacian.capacity(), "complex own Laplacian bytes overflow"),
+                    "complex clone bytes overflow");
+    std::size_t fingerprint = value->storageFingerprint();
+    for (auto next : {full->storageFingerprint(), active->storageFingerprint()})
+      fingerprint = (fingerprint ^ next) * 1099511628211ULL;
+    determinant::detail::mixStorage(fingerprint, own_gradient);
+    determinant::detail::mixStorage(fingerprint, own_laplacian);
+    return {numeric_required, bytes, numeric_limit, fingerprint};
+  }
 
   /// Bind scalar requests to the target's identity, shape and immutable feature cell.
   void validate(const ParticleSet& p, int electron = -1, bool proposal = false) const
@@ -169,6 +220,9 @@ struct PsiFormerComplexWF::Impl
   const ParticleSet* particles;
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
   std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
+  std::vector<GradType> own_gradient;
+  std::vector<ValueType> own_laplacian;
+  std::size_t numeric_required = 0, numeric_limit;
   Amplitude accepted, proposed;
   LogValue proposed_log{};
   std::uint64_t accepted_key = 0, proposed_key = 0;
@@ -179,9 +233,17 @@ struct PsiFormerComplexWF::Impl
 
 /// Construct only the explicit paired profile; the XML builder remains unchanged in this slice.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
-    const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced)
-    : WaveFunctionComponent(name), impl_(std::make_unique<Impl>(std::move(initialized), electrons, ions, reduced))
+    const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
+    : WaveFunctionComponent(name), impl_(std::make_unique<Impl>(std::move(initialized), electrons, ions, limit, reduced))
 {}
+
+/// A clone shares only immutable model ownership and starts with invalid evaluation caches.
+PsiFormerComplexWF::PsiFormerComplexWF(std::string name, std::unique_ptr<Impl> impl)
+    : WaveFunctionComponent(name), impl_(std::move(impl))
+{}
+
+/// Expose honest per-clone numeric admission rather than the legacy batch-budget policy.
+PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const { return impl_->numericStorage(); }
 
 /// Destroy native numerical state only in the sole owner TU.
 PsiFormerComplexWF::~PsiFormerComplexWF() = default;
@@ -200,22 +262,29 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& 
   impl_->positions(*impl_->full, p);
   const auto result = impl_->state->spatial.evaluateFull(*impl_->full);
   const LogValue physical = impl_->physicalLog(result.amplitude, p);
+  // Stage this component's own products separately from any caller accumulation.
+  for (int electron = 0; electron < p.getTotalNum(); ++electron)
+  {
+    for (int dimension = 0; dimension < 3; ++dimension)
+      impl_->own_gradient[electron][dimension] =
+          impl_->physicalGradient(result.gradient[3 * electron + dimension], dimension);
+    impl_->own_laplacian[electron] = makePsiFormerScalar<ValueType>(result.laplacian_log[electron].real(),
+                                                                 result.laplacian_log[electron].imag());
+  }
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
   {
     for (int dimension = 0; dimension < 3; ++dimension)
       if (!isFiniteWavefunctionValue(g[electron][dimension] +
-          impl_->physicalGradient(result.gradient[3 * electron + dimension], dimension)))
+          impl_->own_gradient[electron][dimension]))
         throw std::overflow_error("Complex PsiFormer gradient scatter overflow");
-    if (!isFiniteWavefunctionValue(l[electron] + makePsiFormerScalar<ValueType>(
-        result.laplacian_log[electron].real(), result.laplacian_log[electron].imag())))
+    if (!isFiniteWavefunctionValue(l[electron] + impl_->own_laplacian[electron]))
       throw std::overflow_error("Complex PsiFormer Laplacian scatter overflow");
   }
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
   {
     for (int dimension = 0; dimension < 3; ++dimension)
-      g[electron][dimension] += impl_->physicalGradient(result.gradient[3 * electron + dimension], dimension);
-    l[electron] += makePsiFormerScalar<ValueType>(result.laplacian_log[electron].real(),
-                                               result.laplacian_log[electron].imag());
+      g[electron][dimension] += impl_->own_gradient[electron][dimension];
+    l[electron] += impl_->own_laplacian[electron];
   }
   impl_->accepted = result.amplitude;
   impl_->accepted_key = configurationIdentity(p);
@@ -299,10 +368,11 @@ void PsiFormerComplexWF::restore(int electron)
   impl_->pending = false;
 }
 
-/// Clone state is deliberately unavailable until the separate clone/persistence cut.
-std::unique_ptr<WaveFunctionComponent> PsiFormerComplexWF::makeClone(ParticleSet&) const
+/// Clone immutable provenance, but never accepted state, pending moves or numerical allocations.
+std::unique_ptr<WaveFunctionComponent> PsiFormerComplexWF::makeClone(ParticleSet& particles) const
 {
-  throw std::logic_error("Complex PsiFormer clone contract is not yet admitted");
+  return std::unique_ptr<WaveFunctionComponent>(new PsiFormerComplexWF(getName(),
+      std::make_unique<Impl>(impl_->state, particles, impl_->numeric_limit)));
 }
 
 /// Do not register a misleading legacy real-sign walker record.

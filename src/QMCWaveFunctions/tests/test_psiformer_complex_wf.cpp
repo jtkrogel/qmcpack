@@ -15,6 +15,7 @@
 #include "psiformer_test_utils.h"
 #include <algorithm>
 #include <complex>
+#include <limits>
 #include <tuple>
 #include <vector>
 
@@ -25,6 +26,7 @@ namespace
 namespace ps = psiformer;
 namespace fixture = testing::psiformer;
 using C = std::complex<double>;
+constexpr std::size_t clone_cap = 8 * 1024 * 1024;
 
 /// Small descriptor fixture exercises the same numerical owners without another Native TU.
 /// This is not a new public XML architecture; initializer production dimensions stay fixed.
@@ -153,7 +155,7 @@ TEST_CASE("PsiFormer explicit complex scalar sibling specializes to the legacy r
   auto complex_particles = electrons(simulation_cell);
   auto real_particles = electrons(simulation_cell);
   auto source = ions(simulation_cell);
-  PsiFormerComplexWF complex("complex", parameters(true, true), complex_particles, source);
+  PsiFormerComplexWF complex("complex", parameters(true, true), complex_particles, source, clone_cap);
   PsiFormerWF real("real", parameters(false), real_particles, source);
   const auto actual = evaluate(complex, complex_particles);
   const auto expected = evaluate(real, real_particles);
@@ -187,8 +189,8 @@ TEST_CASE("PsiFormer complex scalar sibling applies one outer phase and physical
   auto source = ions(simulation_cell);
   const ParticleSet::PosType reduced{.17, -.11, .07};
   const auto k = lattice.k_cart(reduced);
-  PsiFormerComplexWF gamma("gamma", parameters(), gamma_particles, source);
-  PsiFormerComplexWF twisted("twisted", parameters(), twisted_particles, source, {.17, -.11, .07});
+  PsiFormerComplexWF gamma("gamma", parameters(), gamma_particles, source, clone_cap);
+  PsiFormerComplexWF twisted("twisted", parameters(), twisted_particles, source, clone_cap, {.17, -.11, .07});
   const auto gamma_log = evaluate(gamma, gamma_particles);
   const auto twisted_log = evaluate(twisted, twisted_particles);
   double angle = 0;
@@ -254,7 +256,7 @@ TEST_CASE("PsiFormer complex scalar move state commits only matching finite prop
   const SimulationCell simulation_cell(cell());
   auto p = electrons(simulation_cell);
   auto source = ions(simulation_cell);
-  PsiFormerComplexWF component("moves", parameters(), p, source, {.17, -.11, .07});
+  PsiFormerComplexWF component("moves", parameters(), p, source, clone_cap, {.17, -.11, .07});
   const ParticleSet::PosType displacement{.02, -.01, .03};
   p.makeMove(0, displacement);
   CHECK_THROWS(component.ratio(p, 0));
@@ -314,6 +316,74 @@ TEST_CASE("PsiFormer complex scalar move state commits only matching finite prop
   for (int dimension = 0; dimension < 3; ++dimension)
     close(untouched[dimension], C{.1, -.2});
   p.rejectMove(0);
-  CHECK_THROWS(component.makeClone(p));
+  CHECK(component.makeClone(p) != nullptr);
+}
+
+TEST_CASE("PsiFormer complex clone admits exact numeric bytes and independent scratch",
+          "[wavefunction][psiformer][complex_wf]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto clone_particles = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  CHECK_THROWS_AS(PsiFormerComplexWF("zero", parameters(), p, source, 0), std::invalid_argument);
+  CHECK_THROWS_AS(PsiFormerComplexWF("unlimited", parameters(), p, source,
+      std::numeric_limits<std::size_t>::max()), std::invalid_argument);
+  PsiFormerComplexWF component("source", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  const auto storage = component.numericStorage();
+  REQUIRE(storage.required_bytes > 0);
+  CHECK(storage.required_bytes == storage.allocated_bytes);
+  CHECK(storage.limit_bytes == clone_cap);
+  CHECK_THROWS_AS(PsiFormerComplexWF("short", parameters(), p, source, storage.required_bytes - 1),
+                  std::length_error);
+  PsiFormerComplexWF exact("exact", parameters(), p, source, storage.required_bytes);
+  CHECK(exact.numericStorage().allocated_bytes == storage.required_bytes);
+
+  const auto original_log = evaluate(component, p);
+  const auto original_g = p.G;
+  p.makeMove(0, ParticleSet::PosType{.031, -.021, .012});
+  const auto original_ratio = component.ratio(p, 0);
+  auto cloned = component.makeClone(clone_particles);
+  auto* clone = dynamic_cast<PsiFormerComplexWF*>(cloned.get());
+  REQUIRE(clone != nullptr);
+  CHECK(clone->getName() == component.getName());
+  const auto clone_storage = clone->numericStorage();
+  CHECK(clone_storage.required_bytes == storage.required_bytes);
+  CHECK(clone_storage.allocated_bytes == storage.allocated_bytes);
+  CHECK(clone_storage.limit_bytes == clone_cap);
+  CHECK(clone_storage.fingerprint != storage.fingerprint);
+  clone_particles.makeMove(0, ParticleSet::PosType{.021, .011, -.013});
+  CHECK_THROWS(clone->ratio(clone_particles, 0)); // accepted/pending state is never cloned
+  clone_particles.rejectMove(0);
+  close(std::exp(evaluate(*clone, clone_particles) - original_log), C{1});
+  for (int electron = 0; electron < 4; ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      close(clone_particles.G[electron][dimension], original_g[electron][dimension]);
+
+  // Evaluating and moving the clone cannot invalidate the source's pending proposal.
+  clone_particles.makeMove(2, ParticleSet::PosType{-.017, .025, .014});
+  WaveFunctionComponent::GradType gradient{};
+  clone->ratioGrad(clone_particles, 2, gradient);
+  clone->acceptMove(clone_particles, 2);
+  clone_particles.acceptMove(2);
+  const auto clone_log = clone->get_log_value();
+  close(std::exp(evaluate(*clone, clone_particles) - clone_log), C{1});
+  component.acceptMove(p, 0);
+  p.acceptMove(0);
+  close(std::exp(evaluate(component, p) - original_log), original_ratio);
+  CHECK_THROWS(component.evaluateLog(clone_particles, clone_particles.G, clone_particles.L));
+  evaluate(component, p); // a foreign-target failure revokes publication and remains recoverable
+  for (int repeat = 0; repeat < 2; ++repeat)
+  {
+    evaluate(component, p);
+    component.evalGrad(p, 1);
+    p.makeMove(3, ParticleSet::PosType{.005, .004, -.003});
+    component.ratio(p, 3);
+    component.restore(3);
+    p.rejectMove(3);
+  }
+  CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
+  CHECK(component.numericStorage().fingerprint == storage.fingerprint);
+  CHECK(clone->numericStorage().fingerprint == clone_storage.fingerprint);
 }
 } // namespace qmcplusplus

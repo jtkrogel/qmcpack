@@ -37,6 +37,33 @@ class DirectComplexSpatialWorkspace
 {
   using C = qmcplusplus::psiformer::determinant::Complex;
 public:
+  /// Replace omitted real output/algebra by exact mixed-domain requirements before allocation.
+  static std::size_t storageRequirement(const PsiFormerStorageShape& shape,
+                                       DirectSpatialMode mode)
+  {
+    using namespace qmcplusplus::psiformer;
+    if (mode != DirectSpatialMode::FULL_VGL && mode != DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT)
+      throw std::invalid_argument("invalid complex spatial storage mode");
+    const auto orbitals = checkedStorageProduct(shape.determinants,
+        checkedStorageProduct(shape.electrons, shape.electrons, "complex matrix extent overflow"),
+        "complex orbital extent overflow");
+    const auto jets = layout(orbitals, shape.electrons, mode);
+    const auto outputs = checkedStorageSum(jets.gradient_lanes,
+        checkedStorageProduct(2, jets.laplacian_lanes, "complex output extent overflow"),
+        "complex output extent overflow");
+    std::size_t bytes = spatialWorkspaceStorageRequirement(shape, mode == DirectSpatialMode::FULL_VGL) -
+        determinantStorageRequirement(shape.determinants, shape.electrons,
+            jets.gradient_lanes, jets.laplacian_lanes) -
+        checkedStorageBytes<double>(outputs, "real output bytes overflow");
+    // The omitted real orbital jets and the explicit real envelope jets have identical extents.
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(jets), "complex spatial bytes overflow");
+    addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(shape.determinants,
+        shape.electrons, 0, jets.gradient_lanes, jets.laplacian_lanes), "complex spatial bytes overflow");
+    addStorageBytes(bytes, checkedStorageBytes<C>(outputs, "complex output bytes overflow"),
+                    "complex spatial bytes overflow");
+    return bytes;
+  }
+
   /// Mutable prepared clones cannot share ownership by copying.
   DirectComplexSpatialWorkspace(const DirectComplexSpatialWorkspace&) = delete;
 

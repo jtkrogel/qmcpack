@@ -40,6 +40,22 @@ class DirectComplexValueExecutor;
 class DirectComplexValueWorkspace
 {
 public:
+  /// Replace the real head by equal-sized envelopes and mixed-domain algebra, without allocation.
+  static std::size_t storageRequirement(const PsiFormerStorageShape& shape)
+  {
+    using namespace qmcplusplus::psiformer;
+    const auto orbitals = checkedStorageProduct(shape.determinants,
+        checkedStorageProduct(shape.electrons, shape.electrons, "complex matrix extent overflow"),
+        "complex orbital extent overflow");
+    const auto layout = makeSpatialJetLayout(1, orbitals, shape.electrons, SpatialJetMode::VALUE_ONLY);
+    std::size_t bytes = valueWorkspaceStorageRequirement(shape) -
+        determinantStorageRequirement(shape.determinants, shape.electrons);
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout), "complex value bytes overflow");
+    addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
+        shape.determinants, shape.electrons), "complex value bytes overflow");
+    return bytes;
+  }
+
   /// Mutable prepared buffers cannot be shared by copying.
   DirectComplexValueWorkspace(const DirectComplexValueWorkspace&) = delete;
 
