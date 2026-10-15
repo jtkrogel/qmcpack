@@ -15,10 +15,13 @@
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
+#include "PsiFormerDeviceScoreContraction.h"
 #include "PsiFormerDeviceKineticReverse.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <complex>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -34,6 +37,7 @@ struct BenchmarkOptions
   std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
   bool mixed_values = false;
   bool mixed_vgl = false;
+  bool serial_score_contractions = false;
 };
 
 /// Read only explicit positive sizes; reject trailing/unknown command-line text.
@@ -56,7 +60,7 @@ int main(int argc, char** argv)
     if (argc < 4)
       throw std::invalid_argument("Usage: benchmark parameters.h5 configurations.h5 report.csv "
                                   "[--walkers N] [--repetitions R] [--shape D WIDTH HEADS BLOCKS] "
-                                  "[--mixed-values] [--mixed-vgl]");
+                                  "[--mixed-values] [--mixed-vgl] [--serial-score-contractions]");
     BenchmarkOptions options;
     for (int argument = 4; argument < argc; ++argument)
     {
@@ -65,6 +69,8 @@ int main(int argc, char** argv)
         options.mixed_values = true;
       else if (flag == "--mixed-vgl")
         options.mixed_vgl = true;
+      else if (flag == "--serial-score-contractions")
+        options.serial_score_contractions = true;
       else if (flag == "--walkers" && argument + 1 < argc)
         options.walkers = readSize(argv[++argument]);
       else if (flag == "--repetitions" && argument + 1 < argc)
@@ -163,6 +169,74 @@ int main(int argc, char** argv)
     for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
       direction[parameter] = (static_cast<int>(parameter % 11) - 5) * .01 / std::sqrt(direction.size());
     jvp.prepareDirection(direction);
+
+    // Optional production-shaped comparison: identical serial forward/reverse
+    // work, either B real response downloads or C complex contracted downloads.
+    // The established score_vjp row above/below is already a batched reverse and
+    // must not be presented as the former production host-contraction baseline.
+    std::unique_ptr<PreparedDeviceInference> serial_tape;
+    std::unique_ptr<PreparedDeviceScoreReverse> serial_reverse;
+    std::unique_ptr<PreparedDeviceScoreContraction> serial_contraction;
+    std::vector<double> serial_positions(3 * native.ne), serial_unit_weight(1, 1.0);
+    std::array<std::vector<std::complex<double>>, 2> serial_sums;
+    if (options.serial_score_contractions)
+    {
+      const auto serial_start = std::chrono::steady_clock::now();
+      serial_tape = std::make_unique<PreparedDeviceInference>(image, 1, queue, blas, SpatialJetMode::VALUE_ONLY, true);
+      serial_reverse = std::make_unique<PreparedDeviceScoreReverse>(image, 1, queue, blas);
+      serial_contraction = std::make_unique<PreparedDeviceScoreContraction>(plan.parameterCount(), 2, queue);
+      for (auto& sums : serial_sums)
+        sums.resize(plan.parameterCount());
+      queue.sync();
+      std::cout << "Serial-score comparison: additional_pack_bytes="
+                << serial_tape->deviceWorkspaceBytes() + serial_reverse->deviceWorkspaceBytes() +
+                    serial_contraction->deviceWorkspaceBytes()
+                << " contraction_pack_bytes=" << serial_contraction->deviceWorkspaceBytes()
+                << " cold_prepare_seconds="
+                << std::chrono::duration<double>(std::chrono::steady_clock::now() - serial_start).count()
+                << "; all rows' live_bytes include this optional pack; C=1/2 complex channels" << '\n';
+    }
+    auto serial_score_vjp = [&](bool resident, std::size_t channels) {
+      if (resident)
+        serial_contraction->begin(channels);
+      else
+        for (std::size_t channel = 0; channel < channels; ++channel)
+          std::fill(serial_sums[channel].begin(), serial_sums[channel].end(), std::complex<double>{});
+      for (std::size_t sample = 0; sample < options.walkers; ++sample)
+      {
+        std::copy_n(positions.data() + sample * 3 * native.ne, serial_positions.size(), serial_positions.begin());
+        serial_tape->evaluate(serial_positions);
+        const double* device_response = serial_reverse->reverse(*serial_tape, serial_unit_weight);
+        const std::array<std::complex<double>, 2> coefficients{{
+            {weights[sample], .125 * weights[sample]}, {-.7 * weights[sample], .21 * weights[sample]}}};
+        if (resident)
+          serial_contraction->accumulate(device_response, coefficients.data(), channels);
+        else
+        {
+          serial_reverse->downloadResponse(response);
+          for (std::size_t channel = 0; channel < channels; ++channel)
+            for (std::size_t parameter = 0; parameter < response.size(); ++parameter)
+              serial_sums[channel][parameter] += coefficients[channel] * response[parameter];
+        }
+      }
+      if (resident)
+      {
+        serial_contraction->finish();
+        for (std::size_t channel = 0; channel < channels; ++channel)
+          serial_contraction->download(channel, serial_sums[channel].data(), serial_sums[channel].size());
+      }
+    };
+    if (serial_contraction)
+    {
+      serial_score_vjp(false, 2);
+      const auto host_reference = serial_sums;
+      serial_score_vjp(true, 2);
+      for (std::size_t channel = 0; channel < 2; ++channel)
+        for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+          if (std::abs(serial_sums[channel][parameter] - host_reference[channel][parameter]) >
+              1.e-9 * std::max(1.0, std::abs(host_reference[channel][parameter])))
+            throw std::runtime_error("Serial resident/host score contraction parity failed");
+    }
     std::vector<std::pair<std::string, std::function<void()>>> operations;
     operations.emplace_back("value", [&]() {
       value.evaluate(positions);
@@ -189,6 +263,14 @@ int main(int argc, char** argv)
       score.reverse(value_tape, weights);
       score.downloadResponse(response);
     });
+    if (serial_contraction)
+      for (const auto channels : {std::size_t{1}, std::size_t{2}})
+      {
+        operations.emplace_back("serial_score_vjp_host_c" + std::to_string(channels),
+                                 [&, channels]() { serial_score_vjp(false, channels); });
+        operations.emplace_back("serial_score_vjp_resident_c" + std::to_string(channels),
+                                 [&, channels]() { serial_score_vjp(true, channels); });
+      }
     operations.emplace_back("score_jvp", [&]() {
       value_tape.evaluate(positions);
       jvp.evaluate(value_tape, direction);

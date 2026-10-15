@@ -1992,6 +1992,132 @@ int main(int argc, char** argv)
     if (session_bytes != product_session->deviceWorkspaceBytes())
       throw std::runtime_error("Product session reallocated prepared scratch");
     std::cout << "PASS leased numerical product session: score/JVP, stale version, publication rebind, fixed scratch\n";
+    {
+      // Production uses one real reverse per configuration, retaining only C
+      // complex sums. Exercise the same leases with genuinely complex weights.
+      using Complex = std::complex<double>;
+      std::array<std::vector<Complex>, 2> contracted, expected;
+      for (auto* collection : {&contracted, &expected})
+        for (auto& channel : *collection)
+          channel.resize(plan.parameterCount());
+      product_session->prepareScoreContractions(2, model.p.version());
+      bool empty_begin_rejected = false;
+      try { product_session->beginScoreContraction(0, model.p.version()); }
+      catch (const std::invalid_argument&) { empty_begin_rejected = true; }
+      if (!empty_begin_rejected)
+        throw std::runtime_error("Score contraction accepted an empty channel count");
+      const auto prepared_bytes = product_session->deviceWorkspaceBytes();
+      const auto contraction_version = model.p.version();
+      auto run_contraction = [&]() {
+        product_session->beginScoreContraction(2, contraction_version);
+        for (std::size_t sample = 0; sample < model.cfg.nconfig; ++sample)
+        {
+          const std::array<Complex, 2> coefficients{{Complex(.17 * (sample + 1), -.11),
+              sample == 0 ? Complex{} : Complex(-.23, .09 * sample)}};
+          const double* coordinates = model.cfg.electrons.x.data() + sample * 3 * model.ne;
+          product_session->accumulateScoreContraction(coordinates, coefficients.data(), 2, contraction_version);
+        }
+        product_session->finishScoreContraction(contraction_version);
+      };
+      for (std::size_t sample = 0; sample < model.cfg.nconfig; ++sample)
+      {
+        cpu_score_workspace->setPositions(pf::GeometryPositionView::interleaved(
+            model.cfg.electrons.x.data() + sample * 3 * model.ne, model.ne));
+        const auto reference = cpu_score_executor.evaluate(*cpu_score_workspace);
+        const std::array<Complex, 2> coefficients{{Complex(.17 * (sample + 1), -.11),
+            sample == 0 ? Complex{} : Complex(-.23, .09 * sample)}};
+        for (std::size_t channel = 0; channel < 2; ++channel)
+          for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+            expected[channel][parameter] += coefficients[channel] * reference.parameter_score[parameter];
+      }
+      run_contraction();
+      int contraction_device = -1;
+#ifdef QMC_CUDA2HIP
+      checkRuntime(hipGetDevice(&contraction_device), "score contraction metrics device");
+#else
+      checkRuntime(cudaGetDevice(&contraction_device), "score contraction metrics device");
+#endif
+      auto& contraction_metrics = deviceMemoryMetrics(contraction_device);
+      const auto before_reuse = contraction_metrics.snapshot();
+      run_contraction();
+      const auto before_download = contraction_metrics.snapshot();
+      for (std::size_t channel = 0; channel < 2; ++channel)
+      {
+        product_session->downloadScoreContraction(channel, contracted[channel].data(),
+            contracted[channel].size(), contraction_version);
+        for (std::size_t parameter = 0; parameter < plan.parameterCount(); ++parameter)
+        {
+          near(contracted[channel][parameter].real(), expected[channel][parameter].real(),
+               "resident complex score contraction real CPU parity");
+          near(contracted[channel][parameter].imag(), expected[channel][parameter].imag(),
+               "resident complex score contraction imaginary CPU parity");
+        }
+      }
+      const auto after_download = contraction_metrics.snapshot();
+      if (after_download.allocation_calls != before_reuse.allocation_calls ||
+          after_download.free_calls != before_reuse.free_calls ||
+          after_download.download_calls - before_download.download_calls != 2 ||
+          after_download.downloaded_bytes - before_download.downloaded_bytes != 4 * plan.parameterCount() * sizeof(double) ||
+          product_session->deviceWorkspaceBytes() != prepared_bytes)
+        throw std::runtime_error("Resident score contraction warmed allocation/download contract failed");
+
+      auto expect_no_contraction = [&]() {
+        bool rejected = false;
+        try { product_session->downloadScoreContraction(0, contracted[0].data(), contracted[0].size(), model.p.version()); }
+        catch (const std::exception&) { rejected = true; }
+        if (!rejected)
+          throw std::runtime_error("Failed or unfinished score contraction exposed a result");
+      };
+      product_session->beginScoreContraction(2, contraction_version);
+      expect_no_contraction();
+      run_contraction();
+      bool stale_finish_rejected = false;
+      try { product_session->finishScoreContraction(contraction_version + 1); }
+      catch (const std::exception&) { stale_finish_rejected = true; }
+      if (!stale_finish_rejected)
+        throw std::runtime_error("Score contraction accepted stale finalization");
+      expect_no_contraction();
+      product_session->beginScoreContraction(2, contraction_version);
+      // Even zero coefficients must admit every geometry and score channel.
+      const std::array<Complex, 2> unit_coefficients{};
+      bool invalid_contraction_rejected = false;
+      try { product_session->accumulateScoreContraction(invalid_product_positions.data(),
+          unit_coefficients.data(), 2, contraction_version); }
+      catch (const std::exception&) { invalid_contraction_rejected = true; }
+      if (!invalid_contraction_rejected)
+        throw std::runtime_error("Score contraction accepted nonfinite geometry");
+      expect_no_contraction();
+      product_session->beginScoreContraction(2, contraction_version);
+      const std::array<Complex, 2> invalid_coefficients{{Complex(1, 0),
+          Complex(0, std::numeric_limits<double>::quiet_NaN())}};
+      bool invalid_coefficient_rejected = false;
+      try { product_session->accumulateScoreContraction(model.cfg.electrons.x.data(),
+          invalid_coefficients.data(), 2, contraction_version); }
+      catch (const std::invalid_argument&) { invalid_coefficient_rejected = true; }
+      if (!invalid_coefficient_rejected)
+        throw std::runtime_error("Score contraction accepted a nonfinite algebraic coefficient");
+      expect_no_contraction();
+      run_contraction();
+      backend_tiles->publishParameters(accepted_values, contraction_version + 1,
+                                       [&]() { model.p.set_flat_values(accepted_values); });
+      expect_no_contraction();
+
+      // Finite responses and coefficients can overflow only after contraction.
+      PreparedDeviceScoreContraction overflow_contraction(1, 1, queue);
+      DeviceBuffer<double> overflow_response(1);
+      const double maximum = std::numeric_limits<double>::max();
+      overflow_response.upload(&maximum, 1);
+      const Complex double_coefficient(2, 0);
+      overflow_contraction.begin(1);
+      overflow_contraction.accumulate(overflow_response.data(), &double_coefficient, 1);
+      bool overflow_rejected = false;
+      try { overflow_contraction.finish(); }
+      catch (const std::runtime_error&) { overflow_rejected = true; }
+      if (!overflow_rejected)
+        throw std::runtime_error("Score contraction admitted a nonfinite complex sum");
+      std::cout << "PASS resident serial score contractions: complex channels/CPU parity, exact downloads, "
+                   "warmed reuse, failure/stale/publication invalidation, finite-sum admission\n";
+    }
     std::cout << "PASS actual-device full-model FP64 value/gradient/Laplacian/kinetic/reuse; configurations="
               << references.size() << "; shared-image/value-only/reuse/nodes/tails PASS; "
               << "regular-channel score/kinetic/captured-grid response PASS; production training/Hamiltonian binding NOT_VALIDATED\n";

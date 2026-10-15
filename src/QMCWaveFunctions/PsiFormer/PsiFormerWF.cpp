@@ -1780,6 +1780,7 @@ struct PsiFormerDerivativeScratch
   std::vector<double> device_positions;
   std::vector<double> device_direction;
   bool reported_device_products = false;
+  bool reported_device_score_contraction = false;
 #endif
   std::array<std::vector<wftrain::DerivativeValue>, 3> channels;
 };
@@ -1899,7 +1900,7 @@ public:
     result.result_scalar_domain    = wftrain::ParameterScalarDomain::COMPLEX128;
     result.reduction_domain        = wftrain::ReductionDomain::CROWD_LOCAL;
     // This field describes sink-visible storage, not the kernel device. The
-    // compatibility lane downloads real responses and emits host complex chunks.
+    // Numerical products emit host complex chunks after their device contractions.
     result.execution_domain        = wftrain::DerivativeExecutionDomain::HOST;
     result.local_energy_term_mask =
         wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
@@ -1908,7 +1909,8 @@ public:
     result.maximum_vjp_channels              = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size      = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size          = 1;
-    result.fixed_parameter_scratch_vectors   = (hasDeviceProducts() ? 8 : 3) + MAXIMUM_VJP_CHANNELS;
+    result.fixed_parameter_scratch_vectors   =
+        (hasDeviceProducts() ? 8 + 2 * deviceScoreContractionCapacity() : 3) + MAXIMUM_VJP_CHANNELS;
     result.block_streaming                   = true;
     return result;
   }
@@ -1940,14 +1942,17 @@ public:
   /// Return exact prepared numeric bytes and allocation-identity evidence.
   wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
   {
+    // Optional contraction preparation can grow shared scratch on another
+    // retained provider. Snapshot its bytes/capacity under the same outer lease.
+    std::lock_guard scratch_lock(shared_scratch_->execution_mutex);
     wftrain::StreamingDerivativeStorageDiagnostics current =
         measureStorageDiagnostics();
     if (storage_diagnostics_.storage_fingerprint != 0 &&
         current.storage_fingerprint !=
             storage_diagnostics_.storage_fingerprint)
-      current.allocation_generation = checkedBatchMemoryAdd(
+      current.allocation_generation = std::max(current.allocation_generation, checkedBatchMemoryAdd(
           storage_diagnostics_.allocation_generation, std::size_t{1},
-          "PsiFormer streaming allocation generation");
+          "PsiFormer streaming allocation generation"));
     return current;
   }
 
@@ -2046,6 +2051,26 @@ protected:
                     wftrain::LocalEnergyTerm::NONLOCAL_ECP)) != 0;
           });
 
+#ifdef ENABLE_CUDA
+      std::array<std::size_t, MAXIMUM_VJP_CHANNELS> score_channels{};
+      std::size_t score_channel_count = 0;
+      for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        if (channels[channel].product == wftrain::DerivativeProduct::SCORE_VJP)
+          score_channels[score_channel_count++] = channel;
+      // Real per-sample downloads cost 8*B*P; complex contracted outputs cost
+      // 16*C*P. Admit optional storage only above that transfer break-even.
+      const bool resident_scores = hasDeviceProducts() && !needs_kinetic &&
+          score_channel_count != 0 && sample_count_ > 2 * score_channel_count;
+      if (resident_scores)
+      {
+        auto& session = *shared_scratch_->device_products;
+        // Explicit cold preparation may grow capacity. Repeated requests with
+        // the same admitted channel count reuse it without allocation.
+        session.prepareScoreContractions(score_channel_count, parameter_version_);
+        session.beginScoreContraction(score_channel_count, parameter_version_);
+      }
+#endif
+
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
       {
         if (needs_kinetic)
@@ -2102,16 +2127,50 @@ protected:
         else
         {
           setScoreWorkspacePositions(sample);
-          const pf::DirectScoreResult score = evaluateScoreResponse();
-          requireResultVersion(score);
-          for (std::size_t channel = 0; channel < channels.size(); ++channel)
-            if (channels[channel].product ==
-                wftrain::DerivativeProduct::SCORE_VJP)
-              accumulateResponse(
-                  channel, channels[channel].coefficients.values[sample],
-                  score.parameter_score);
+#ifdef ENABLE_CUDA
+          if (resident_scores)
+          {
+            std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> coefficients{};
+            for (std::size_t score_channel = 0; score_channel < score_channel_count; ++score_channel)
+              coefficients[score_channel] = channels[score_channels[score_channel]].coefficients.values[sample];
+            shared_scratch_->device_products->accumulateScoreContraction(
+                shared_scratch_->device_positions.data(), coefficients.data(),
+                score_channel_count, parameter_version_);
+            reportDeviceProducts();
+          }
+          else
+#endif
+          {
+            const pf::DirectScoreResult score = evaluateScoreResponse();
+            requireResultVersion(score);
+            for (std::size_t channel = 0; channel < channels.size(); ++channel)
+              if (channels[channel].product ==
+                  wftrain::DerivativeProduct::SCORE_VJP)
+                accumulateResponse(
+                    channel, channels[channel].coefficients.values[sample],
+                    score.parameter_score);
+          }
         }
       }
+#ifdef ENABLE_CUDA
+      if (resident_scores)
+      {
+        auto& session = *shared_scratch_->device_products;
+        session.finishScoreContraction(parameter_version_);
+        for (std::size_t score_channel = 0; score_channel < score_channel_count; ++score_channel)
+        {
+          auto& destination = channel_accumulators_[score_channels[score_channel]];
+          session.downloadScoreContraction(score_channel, destination.data(), destination.size(), parameter_version_);
+        }
+        if (!shared_scratch_->reported_device_score_contraction)
+        {
+          app_log() << "  PsiFormer resident score contraction completed: configurations=" << sample_count_
+                    << ", channels=" << score_channel_count << ", canonical_parameters=" << schema_->parameterCount()
+                    << ", parameter_version=" << parameter_version_ << std::endl;
+          shared_scratch_->reported_device_score_contraction = true;
+        }
+      }
+#endif
       if (needs_ecp)
         accumulateECPReplayVJPs(channels);
     }
@@ -2303,6 +2362,25 @@ private:
     return shared_scratch_->device_products != nullptr;
 #else
     return false;
+#endif
+  }
+
+  /// Optional preparation changes the live O(P) scratch bound explicitly.
+  std::size_t deviceScoreContractionCapacity() const noexcept
+  {
+#ifdef ENABLE_CUDA
+    return hasDeviceProducts() ? shared_scratch_->device_products->scoreContractionCapacity() : 0;
+#else
+    return 0;
+#endif
+  }
+
+  std::size_t deviceScoreContractionGeneration() const noexcept
+  {
+#ifdef ENABLE_CUDA
+    return hasDeviceProducts() ? shared_scratch_->device_products->scoreContractionGeneration() : 0;
+#else
+    return 0;
 #endif
   }
 
@@ -2658,8 +2736,10 @@ private:
   /// Re-measure every retained numeric owner for live warmed-call diagnostics.
   wftrain::StreamingDerivativeStorageDiagnostics measureStorageDiagnostics() const
   {
+    std::lock_guard scratch_lock(shared_scratch_->execution_mutex);
     const std::size_t score_bytes = hasDeviceProducts()
-        ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(std::size_t{8}, schema_->parameterCount(),
+        ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(
+              std::size_t{8} + 2 * deviceScoreContractionCapacity(), schema_->parameterCount(),
               "PsiFormer device product parameter vectors"), sizeof(double), "PsiFormer device parameter bytes")
         : score_workspace_->scoreStorageBytes();
     const std::size_t kinetic_parameter_bytes =
@@ -2797,7 +2877,7 @@ private:
 
     return {schema_->parameterCount(),
             sample_count_,
-            hasDeviceProducts() ? std::size_t{8} : std::size_t{3},
+            hasDeviceProducts() ? std::size_t{8} + 2 * deviceScoreContractionCapacity() : std::size_t{3},
             MAXIMUM_VJP_CHANNELS,
             parameter_bytes,
             workspace_bytes,
@@ -2805,7 +2885,7 @@ private:
             auxiliary_bytes,
             sample_product_bytes,
             retained_bytes,
-            1,
+            1 + deviceScoreContractionGeneration(),
             fingerprint,
             reinterpret_cast<std::uintptr_t>(shared_scratch_.get()),
             checkedBatchMemoryAdd(workspace_bytes, channel_bytes,

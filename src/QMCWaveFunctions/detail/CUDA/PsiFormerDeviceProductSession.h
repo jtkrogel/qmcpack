@@ -16,11 +16,14 @@
 
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
+#include "PsiFormerDeviceScoreContraction.h"
 #include "PsiFormerDeviceKineticReverse.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
 #include <exception>
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 
 namespace qmcplusplus::psiformer::device
@@ -68,6 +71,102 @@ public:
       score_.downloadResponse(score_response_);
     });
     return score_response_;
+  }
+
+  /// Explicit cold preparation for the actual admitted score-channel count.
+  /// Host/kinetic compatibility callers never need this optional O(CP) storage.
+  void prepareScoreContractions(std::size_t channels, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    invalidateScoreContraction();
+    validateContractionControl(version);
+    if (channels == 0 || channels > 3)
+      throw std::invalid_argument("Device score contraction supports one to three channels");
+    if (!score_contraction_ || score_contraction_->channelCapacity() < channels)
+    {
+      // A previous incomplete transaction may still have ordered AXPYs queued.
+      // Growth is an explicit phase boundary, so drain before replacing storage.
+      queue_.sync();
+      auto prepared = std::make_unique<PreparedDeviceScoreContraction>(
+          image_->plan().parameterCount(), channels, queue_);
+      score_contraction_ = std::move(prepared);
+      contraction_device_bytes_.store(score_contraction_->deviceWorkspaceBytes(), std::memory_order_release);
+      contraction_host_bytes_.store(score_contraction_->hostWorkspaceBytes(), std::memory_order_release);
+      contraction_capacity_.store(channels, std::memory_order_release);
+      contraction_generation_.fetch_add(1, std::memory_order_release);
+    }
+  }
+
+  /// Start a versioned contraction under the caller's outer exclusive scratch lease.
+  void beginScoreContraction(std::size_t channels, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    invalidateScoreContraction();
+    validateContractionControl(version);
+    if (!score_contraction_)
+      throw std::logic_error("Device score contraction was not prepared");
+    score_contraction_->begin(channels);
+  }
+
+  /// Keep one sample's canonical score resident and fold all algebraic channels.
+  void accumulateScoreContraction(const double* positions, const std::complex<double>* coefficients,
+                                  std::size_t channels, std::size_t version)
+  {
+    execute(PsiFormerAcceleratorOperation::PARAMETER_SCORE, positions, version, [&]() {
+      if (!score_contraction_)
+        throw std::logic_error("Device score contraction was not prepared");
+      values_.evaluate(positions_);
+      const double* response = score_.reverse(values_, weights_);
+      score_contraction_->accumulate(response, coefficients, channels);
+    });
+  }
+
+  /// Admit the complete finite sum before exposing any channel to the host.
+  void finishScoreContraction(std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    try
+    {
+      validateContractionControl(version);
+      if (!score_contraction_)
+        throw std::logic_error("Device score contraction was not prepared");
+      score_contraction_->finish();
+    }
+    catch (...)
+    {
+      invalidateScoreContraction();
+      throw;
+    }
+  }
+
+  /// Transfer one canonical complex P-vector after all channels have been admitted.
+  void downloadScoreContraction(std::size_t channel, std::complex<double>* destination,
+                                 std::size_t count, std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    try
+    {
+      validateContractionControl(version);
+      if (!score_contraction_)
+        throw std::logic_error("Device score contraction was not prepared");
+      score_contraction_->download(channel, destination, count);
+    }
+    catch (...)
+    {
+      invalidateScoreContraction();
+      throw;
+    }
+  }
+
+  std::size_t scoreContractionCapacity() const noexcept
+  {
+    // Capability admission may run before the outer scratch lease is acquired.
+    return contraction_capacity_.load(std::memory_order_acquire);
+  }
+
+  std::size_t scoreContractionGeneration() const noexcept
+  {
+    return contraction_generation_.load(std::memory_order_acquire);
   }
 
   /// Return the complete real kinetic parameter response with caller's total drift.
@@ -221,6 +320,8 @@ public:
                         score_.deviceWorkspaceBytes(), jvp_.deviceWorkspaceBytes(),
                         kinetic_.deviceWorkspaceBytes()})
       bytes = spatial_detail::checkedAdd(bytes, amount, "Device product session byte overflow");
+    bytes = spatial_detail::checkedAdd(bytes, contraction_device_bytes_.load(std::memory_order_acquire),
+                                       "Device product contraction byte overflow");
     return bytes;
   }
 
@@ -243,10 +344,31 @@ public:
     bytes = spatial_detail::checkedAdd(bytes,
         checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()),
         "Device product channel factorization overflow");
+    bytes = spatial_detail::checkedAdd(bytes, contraction_host_bytes_.load(std::memory_order_acquire),
+                                       "Device product contraction host byte overflow");
     return bytes;
   }
 
 private:
+  /// A failed/rebound lane can never publish an earlier partial or completed sum.
+  void invalidateScoreContraction() noexcept
+  {
+    if (score_contraction_)
+      score_contraction_->invalidate();
+  }
+
+  /// Preparation/finalization do not fabricate coordinate/result executor events.
+  void validateContractionControl(std::size_t version)
+  {
+    if (crowd_.acquired() || crowd_.poisoned() || version != active_image_->version())
+    {
+      invalidateScoreContraction();
+      throw std::invalid_argument("Device score contraction requires a released healthy crowd and current version");
+    }
+    active_image_->validateCurrentDevice();
+    rebind();
+  }
+
   /// Match the vendor compiled into the shared kernel translation units.
   static constexpr PsiFormerAcceleratorBackend compiledBackend() noexcept
   {
@@ -269,6 +391,7 @@ private:
   {
     if (image_.get() == active_image_.get())
       return;
+    invalidateScoreContraction();
     image_->validateSuccessor(active_image_);
     values_.rebindModel(active_image_);
     spatial_.rebindModel(active_image_);
@@ -286,9 +409,15 @@ private:
     std::lock_guard lock(mutex_);
     ready_ = false;
     if (!positions || version != active_image_->version())
+    {
+      invalidateScoreContraction();
       throw std::invalid_argument("Device parameter product has missing coordinates or stale version");
+    }
     if (coordinate_generation_ == std::numeric_limits<std::size_t>::max())
+    {
+      invalidateScoreContraction();
       throw std::overflow_error("Device product coordinate generation exhausted");
+    }
     rebind();
     std::copy_n(positions, positions_.size(), positions_.begin());
     ++coordinate_generation_;
@@ -307,6 +436,7 @@ private:
     }
     catch (...)
     {
+      invalidateScoreContraction();
       if (crowd_.poisoned())
       {
         executor_.recover(owner_, crowd_, *this);
@@ -405,6 +535,11 @@ private:
   PreparedDeviceScoreReverse score_;
   PreparedDeviceScoreJvp jvp_;
   PreparedDeviceKineticReverse kinetic_;
+  std::unique_ptr<PreparedDeviceScoreContraction> score_contraction_;
+  // Publish metadata without exposing a concurrently replaced lazy owner.
+  // Provider diagnostics hold the outer scratch mutex for a coherent snapshot.
+  std::atomic<std::size_t> contraction_capacity_{0}, contraction_device_bytes_{0}, contraction_host_bytes_{0};
+  std::atomic<std::size_t> contraction_generation_{0};
   PsiFormerAcceleratorExecutor executor_;
   PsiFormerAcceleratorCrowdState crowd_;
   const std::uint64_t identity_;
