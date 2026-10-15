@@ -933,6 +933,62 @@ int main(int argc, char** argv)
       near(gpu_kinetic[parameter], cpu_kinetic[parameter], "mass/external-drift kinetic response CPU parity");
     std::cout << "PASS full kinetic reverse: nonunit masses and external total-wavefunction drift\n";
     validateTargetKinetic(model, plan, image, queue, handle);
+    {
+      const auto targets = std::min(std::size_t(3), model.ne);
+      const auto vgl_cost = estimateTargetVglCost(plan, 2, targets);
+      const auto kinetic_cost = estimateTargetKineticCost(plan, targets);
+      const DeviceExecutionPreparation preparation{
+          {targets, vgl_cost.device_workspace_bytes, vgl_cost.charged_scalar_work_units},
+          {targets, kinetic_cost.device_workspace_bytes, kinetic_cost.charged_scalar_work_units}};
+      PreparedDeviceBatchBackend targeted(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation);
+      auto target_session = targeted.prepareProductSession();
+      auto score_session = targeted.prepareProductSession(ProductSessionProfile::SCORE_ONLY);
+      const auto bytes = target_session->deviceWorkspaceBytes();
+      if (target_session->kineticTargetCapacity() != targets || score_session->kineticTargetCapacity() != 0 ||
+          bytes != score_session->deviceWorkspaceBytes() + kinetic_cost.device_workspace_bytes)
+        throw std::runtime_error("Target product session retained an extra full kinetic graph");
+      kinetic_workspace->setPositions(pf::GeometryPositionView::interleaved(model.cfg.electrons.x.data(), model.ne));
+      const auto expected = kinetic_cpu.evaluate(*kinetic_workspace, external_contiguous.data(), 3 * model.ne,
+          inverse_masses.data(), inverse_masses.size());
+      const auto& actual = target_session->kinetic(model.cfg.electrons.x.data(), external_contiguous.data(),
+          inverse_masses.data(), image->version());
+      for (std::size_t parameter = 0; parameter < actual.size(); ++parameter)
+        near(actual[parameter], expected.kinetic_parameter_response[parameter], "target product real kinetic CPU parity");
+      (void)target_session->score(model.cfg.electrons.x.data(), image->version());
+      if (target_session->numericalProducts() != 2)
+        throw std::runtime_error("Target kinetic repeated the separate ordinary score operation");
+      const auto expected_imaginary = kinetic_cpu.evaluateGradientParameterResponse(*kinetic_workspace,
+          external_contiguous.data(), 3 * model.ne, inverse_masses.data(), inverse_masses.size());
+      const auto& actual_imaginary = target_session->gradientResponse(model.cfg.electrons.x.data(),
+          external_contiguous.data(), inverse_masses.data(), image->version());
+      for (std::size_t parameter = 0; parameter < actual_imaginary.size(); ++parameter)
+        near(actual_imaginary[parameter], expected_imaginary[parameter], "target product imaginary kinetic CPU parity");
+      auto crowd = targeted.prepare(2);
+      const auto result = targeted.evaluate(*crowd, pf::DirectBatchMode::FULL_VGL,
+          model.cfg.electrons.x.data(), 2, image->version());
+      for (std::size_t sample = 0; sample < 2; ++sample)
+      {
+        near(result.logabs[sample * result.value_stride], references[sample].logabs, "target production crowd VGL value");
+        for (std::size_t lane = 0; lane < 3 * model.ne; ++lane)
+          near(result.gradient[sample * result.gradient_configuration_stride + lane * result.gradient_lane_stride],
+              references[sample].gradient[lane], "target production crowd VGL gradient");
+      }
+      targeted.publishParameters(model.p.flat_values(), image->version() + 1, []() {});
+      (void)target_session->kinetic(model.cfg.electrons.x.data(), external_contiguous.data(),
+          inverse_masses.data(), image->version() + 1);
+      (void)targeted.evaluate(*crowd, pf::DirectBatchMode::FULL_VGL,
+          model.cfg.electrons.x.data(), 1, image->version() + 1);
+      if (target_session->deviceWorkspaceBytes() != bytes)
+        throw std::runtime_error("Target product publication changed prepared capacity");
+      bool mixed_rejected = false;
+      try { PreparedDeviceBatchBackend mixed_target(image, {}, PsiFormerPrecisionPolicy::FP32_DENSE_FP64_ISLANDS, preparation); }
+      catch (const std::invalid_argument&) { mixed_rejected = true; }
+      if (!mixed_rejected)
+        throw std::runtime_error("Mixed production backend admitted explicit targets");
+      std::cout << "PASS target production owners: retained kinetic exclusively replaces full graph, "
+                   "score once separately, real/imaginary CPU parity, non-retained crowd VGL, "
+                   "publication rebind and mixed-target rejection; K=" << targets << '\n';
+    }
     const auto& orbital_layout = spatial_head.orbital_layout.orbitals;
     const auto orbital_span = spatialJetSpanElements(orbital_layout);
     std::vector<double> spatial_backflow(orbital_span), spatial_envelope(orbital_span), spatial_orbitals(orbital_span);

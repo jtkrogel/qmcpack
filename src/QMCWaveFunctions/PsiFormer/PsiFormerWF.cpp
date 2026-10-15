@@ -866,6 +866,55 @@ psiformer::PsiFormerAcceleratorResolution validateProductionAcceleratorResolutio
 
 struct PsiFormerDerivativeScratch;
 
+#ifdef ENABLE_CUDA
+/** Read each developer GPU control once at shared-backend construction.
+ * These explicit limits apply to each target owner/logical request. They do not
+ * change batch_memory or admit the aggregate process, images or vendor reserves.
+ */
+psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
+    const psiformer::PsiFormerExecutionPlan& plan, psiformer::PsiFormerPrecisionPolicy precision)
+{
+  const auto positive = [](const char* name) -> std::size_t {
+    const char* value = std::getenv(name);
+    if (!value)
+      return 0;
+    std::size_t result = 0;
+    if (*value == '\0')
+      throw std::invalid_argument(std::string(name) + " must be a positive base-10 integer when set");
+    for (const char* digit = value; *digit; ++digit)
+    {
+      if (*digit < '0' || *digit > '9')
+        throw std::invalid_argument(std::string(name) + " must be a positive base-10 integer when set");
+      const auto number = static_cast<std::size_t>(*digit - '0');
+      if (result > (std::numeric_limits<std::size_t>::max() - number) / 10)
+        throw std::invalid_argument(std::string(name) + " exceeds size_t capacity");
+      result = 10 * result + number;
+    }
+    if (result == 0)
+      throw std::invalid_argument(std::string(name) + " must be positive when set");
+    return result;
+  };
+  const auto vgl = positive("PSIFORMER_GPU_VGL_TARGETS");
+  const auto kinetic = positive("PSIFORMER_GPU_KINETIC_TARGETS");
+  const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
+  const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
+  if ((vgl || kinetic) ? (!bytes || !work) : (bytes || work))
+    throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
+  if ((vgl || kinetic) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+    throw std::invalid_argument("GPU target preparation requires FP64 reference precision");
+  psiformer::device::DeviceExecutionPreparation preparation;
+  if (vgl)
+    preparation.vgl = {vgl, bytes, work};
+  if (kinetic)
+    preparation.kinetic = {kinetic, bytes, work};
+  psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
+  app_log() << "  PsiFormer GPU target preparation: vgl_targets=" << vgl << ", kinetic_targets=" << kinetic
+            << ", per_owner_workspace_limit_bytes=" << bytes << ", per_request_scalar_work_limit=" << work
+            << ", aggregate_process_budget=no" << std::endl;
+  return preparation;
+}
+#endif
+
 /** Select numerical batch tiles only for an explicitly resolved device route.
  * CPU models never construct vendor handles or upload parameter images.
  */
@@ -885,14 +934,16 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
   using namespace psiformer::device;
   if (resolution.backend != PreparedDeviceCrowdHooks::backend())
     throw std::invalid_argument("PsiFormer numerical tile request does not match the compiled device backend");
+  const auto preparation = configuredGpuTargetPreparation(plan, precision);
   auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
   const auto backend = resolution.backend;
   const auto version = model.p.version();
-  return std::make_shared<PreparedDeviceBatchBackend>(std::move(image), [backend, version]() {
+  return std::make_shared<PreparedDeviceBatchBackend>(std::move(image), [backend, version, preparation]() {
     app_log() << "  PsiFormer numerical device tile completed: backend="
               << psiformer::psiFormerAcceleratorBackendName(backend)
-              << ", parameter_version=" << version << ", CPU fallback=no" << std::endl;
-  }, precision);
+              << ", parameter_version=" << version << ", vgl_targets=" << preparation.vgl.max_targets
+              << ", CPU fallback=no" << std::endl;
+  }, precision, preparation);
 #else
   throw std::invalid_argument("PsiFormer numerical device tiles are not compiled in this executable");
 #endif
@@ -2532,7 +2583,8 @@ private:
     if (!shared_scratch_->reported_device_products)
     {
       app_log() << "  PsiFormer numerical device parameter product completed: parameter_version="
-                << parameter_version_ << ", CPU derivative fallback=no" << std::endl;
+                << parameter_version_ << ", kinetic_targets=" << shared_scratch_->device_products->kineticTargetCapacity()
+                << ", CPU derivative fallback=no" << std::endl;
       shared_scratch_->reported_device_products = true;
     }
 #endif

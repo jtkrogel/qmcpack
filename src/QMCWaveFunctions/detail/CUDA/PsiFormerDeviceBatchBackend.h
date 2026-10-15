@@ -37,8 +37,10 @@ public:
   /// Bind one immutable parameter version and its canonical layout fingerprint.
   explicit PreparedDeviceBatchBackend(std::shared_ptr<const PreparedDeviceModel> image,
                                       std::function<void()> first_dispatch_reporter = {},
-                                      PsiFormerPrecisionPolicy precision = PsiFormerPrecisionPolicy::FP64_REFERENCE)
+                                      PsiFormerPrecisionPolicy precision = PsiFormerPrecisionPolicy::FP64_REFERENCE,
+                                      DeviceExecutionPreparation preparation = {})
       : image_(checkedImage(std::move(image))),
+        preparation_(validatedPreparation(image_->plan(), precision, preparation)),
         owner_(PreparedDeviceCrowdHooks::backend(),
                makePsiFormerDeviceLayout(image_->plan()).fingerprint, image_->version()),
         first_dispatch_reporter_(std::move(first_dispatch_reporter))
@@ -62,7 +64,7 @@ public:
   std::unique_ptr<pf::DirectBatchTileBackendWorkspace> prepare(std::size_t capacity) const override
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
-    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity());
+    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(), preparation_.vgl);
   }
 
   /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
@@ -74,7 +76,7 @@ public:
     if (mixed_parameters_)
       throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
     return std::make_unique<PreparedDeviceProductSession>(
-        image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity);
+        image_, owner_, control_mutex_, nextIdentity(), profile, score_capacity, preparation_);
   }
 
   /// Return typed device products while leaving host publication to the caller.
@@ -241,9 +243,10 @@ private:
     Context(const PreparedDeviceBatchBackend* backend, std::shared_ptr<const PreparedDeviceModel> image,
             std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters,
             const PsiFormerAcceleratorSharedModel& model,
-            std::size_t capacity, std::uint64_t identity)
+            std::size_t capacity, std::uint64_t identity, TargetVglPreparation target_preparation)
         : owner(backend), capacity(capacity), executor(PreparedDeviceCrowdHooks::backend(),
-            PreparedDeviceCrowdHooks::coverage()), crowd(identity), hooks(image, model, identity, std::move(mixed_parameters))
+            PreparedDeviceCrowdHooks::coverage()), crowd(identity),
+          hooks(image, model, identity, std::move(mixed_parameters), target_preparation)
     {
       positions.reserve(spatial_detail::checkedProduct(capacity,
           spatial_detail::checkedProduct(3, image->plan().modelShape().electrons(), "Device tile coordinates overflow"),
@@ -268,6 +271,17 @@ private:
     return image;
   }
 
+  /// Reject mixed targets and incomplete/over-budget profiles before graph reserve.
+  static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
+      PsiFormerPrecisionPolicy precision, DeviceExecutionPreparation preparation)
+  {
+    if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
+        (preparation.vgl.max_targets || preparation.kinetic.max_targets))
+      throw std::invalid_argument("Mixed precision does not support explicit GPU target preparation");
+    validateDeviceExecutionPreparation(plan, preparation);
+    return preparation;
+  }
+
   /// Allocate distinct crowd routing identities only during preparation.
   std::uint64_t nextIdentity() const
   {
@@ -277,6 +291,7 @@ private:
   }
 
   mutable std::shared_ptr<const PreparedDeviceModel> image_;
+  const DeviceExecutionPreparation preparation_;
   mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   std::unique_ptr<compute::Queue<PlatformKind::CUDA>> preparation_queue_;
   mutable PublicationHooks publication_hooks_{image_, mixed_parameters_};

@@ -15,6 +15,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_CROWD_HOOKS_H
 
 #include "PsiFormerDeviceInference.h"
+#include "PsiFormerDeviceExecutionPreparation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
 #include <exception>
@@ -35,13 +36,17 @@ public:
   PreparedDeviceCrowdHooks(std::shared_ptr<const PreparedDeviceModel> image,
                           const PsiFormerAcceleratorSharedModel& owner,
                           std::uint64_t crowd_identity,
-                          std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters = {})
+                          std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters = {},
+                          TargetVglPreparation target_preparation = {})
       : image_(std::move(image)), mixed_parameters_(std::move(mixed_parameters)),
-        owner_(owner), crowd_identity_(crowd_identity), blas_(queue_)
+        target_preparation_(target_preparation), owner_(owner), crowd_identity_(crowd_identity), blas_(queue_)
   {
     if (!image_ || crowd_identity_ == 0)
       throw std::invalid_argument("Numerical crowd hooks require an image and nonzero identity");
     image_->validateCurrentDevice();
+    validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}});
+    if (mixed_parameters_ && target_preparation_.max_targets)
+      throw std::invalid_argument("Mixed precision does not support target VGL preparation");
     const auto provenance = owner_.activeProvenance();
     if (provenance.backend != backend() || provenance.model_version != image_->version())
       throw std::invalid_argument("Numerical crowd model/backend does not match active provenance");
@@ -253,6 +258,9 @@ public:
   /// Count real numerical batches, not recording-only events or CPU fallbacks.
   std::size_t numericalBatches() const noexcept { return numerical_batches_; }
 
+  /// Identify the spatial graph prepared from the explicit target profile.
+  std::size_t vglTargetCapacity() const noexcept { return target_preparation_.max_targets; }
+
   /// Count actual approximate successes separately from complete FP64 numerical retries.
   std::size_t mixedBatches() const noexcept { return mixed_batches_; }
   std::size_t mixedRetries() const noexcept { return mixed_retries_; }
@@ -281,8 +289,10 @@ private:
   {
     if (acquired_ || capacity == 0)
       throw std::logic_error("Numerical crowd preparation requires released positive capacity");
+    validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}}, capacity);
     auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY);
-    auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_);
+    auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
+        SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), target_preparation_);
     if (mixed_parameters_)
     {
       const auto rows = spatial_detail::checkedProduct(
@@ -346,6 +356,7 @@ private:
 
   std::shared_ptr<const PreparedDeviceModel> image_;
   std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
+  const TargetVglPreparation target_preparation_;
   std::shared_ptr<PreparedDeviceMixedValueDense> mixed_dense_;
   std::size_t mixed_batches_ = 0, mixed_retries_ = 0;
   std::string mixed_retry_reason_;

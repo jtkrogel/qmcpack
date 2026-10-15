@@ -18,6 +18,7 @@
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceScoreContraction.h"
 #include "PsiFormerDeviceKineticReverse.h"
+#include "PsiFormerDeviceExecutionPreparation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
 
 #include <exception>
@@ -61,19 +62,23 @@ public:
                                PsiFormerAcceleratorSharedModel& owner,
                                std::mutex& control_mutex, std::uint64_t identity,
                                ProductSessionProfile profile = ProductSessionProfile::SCORE_AND_KINETIC,
-                               std::size_t score_capacity = 1)
+                               std::size_t score_capacity = 1,
+                               DeviceExecutionPreparation preparation = {})
       : active_image_(active_image), image_(active_image), owner_(owner), mutex_(control_mutex),
         profile_(validatedProfile(profile)),
         score_capacity_(admittedScoreCapacity(image_->plan().modelShape(), score_capacity)),
+        preparation_(validatedPreparation(image_->plan(), preparation)),
         blas_(queue_), values_(image_, score_capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true),
         score_(image_, score_capacity_, queue_, blas_), jvp_(image_, 1, queue_, blas_),
-        kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC
+        kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC && preparation_.kinetic.max_targets == 0
             ? std::make_unique<KineticWorkspace>(image_, queue_, blas_) : nullptr),
+        target_kinetic_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC && preparation_.kinetic.max_targets != 0
+            ? std::make_unique<PreparedDeviceTargetKinetic>(image_, preparation_.kinetic, queue_, blas_) : nullptr),
         executor_(compiledBackend(), coverage(profile_)), crowd_(identity), identity_(identity),
         positions_(3 * image_->plan().modelShape().electrons()),
         drift_(positions_.size()), masses_(image_->plan().modelShape().electrons()),
         score_response_(image_->plan().parameterCount()),
-        kinetic_response_(kinetic_ ? score_response_.size() : 0),
+        kinetic_response_(profile_ == ProductSessionProfile::SCORE_AND_KINETIC ? score_response_.size() : 0),
         products_(1), channel_coefficients_(image_->plan().modelShape().determinants),
         channel_phases_(channel_coefficients_.size()), channel_logs_(channel_coefficients_.size()),
         factors_(channel_coefficients_.size()), cusp_(1),
@@ -96,6 +101,10 @@ public:
 
   /// Immutable prepared capacity; capability reads need no lazy-owner access.
   std::size_t scoreCapacity() const noexcept { return score_capacity_; }
+
+  /// Identify the actually owned kinetic route without allocating or upgrading it.
+  std::size_t kineticTargetCapacity() const noexcept
+  { return target_kinetic_ ? preparation_.kinetic.max_targets : 0; }
 
   /// Capacity4 is qualified only for this small-model envelope. Larger models
   /// retain capacity1; this policy is not a claim that their full kinetic tape
@@ -252,9 +261,17 @@ public:
     execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, positions, version, [&]() {
       std::copy_n(total_drift, drift_.size(), drift_.begin());
       std::copy_n(inverse_masses, masses_.size(), masses_.begin());
-      kinetic_->spatial.evaluate(positions_);
-      kinetic_->reverse.evaluate(kinetic_->spatial, weights_, masses_, drift_);
-      kinetic_->reverse.downloadResponse(kinetic_response_);
+      if (target_kinetic_)
+      {
+        target_kinetic_->evaluate(positions_, weights_, masses_, drift_);
+        target_kinetic_->downloadResponse(kinetic_response_);
+      }
+      else
+      {
+        kinetic_->spatial.evaluate(positions_);
+        kinetic_->reverse.evaluate(kinetic_->spatial, weights_, masses_, drift_);
+        kinetic_->reverse.downloadResponse(kinetic_response_);
+      }
     });
     return kinetic_response_;
   }
@@ -270,9 +287,17 @@ public:
     execute(PsiFormerAcceleratorOperation::KINETIC_RESPONSE, positions, version, [&]() {
       std::copy_n(total_drift, drift_.size(), drift_.begin());
       std::copy_n(inverse_masses, masses_.size(), masses_.begin());
-      kinetic_->spatial.evaluate(positions_);
-      kinetic_->reverse.evaluateGradientResponse(kinetic_->spatial, weights_, masses_, drift_);
-      kinetic_->reverse.downloadResponse(kinetic_response_);
+      if (target_kinetic_)
+      {
+        target_kinetic_->evaluateGradientResponse(positions_, weights_, masses_, drift_);
+        target_kinetic_->downloadResponse(kinetic_response_);
+      }
+      else
+      {
+        kinetic_->spatial.evaluate(positions_);
+        kinetic_->reverse.evaluateGradientResponse(kinetic_->spatial, weights_, masses_, drift_);
+        kinetic_->reverse.downloadResponse(kinetic_response_);
+      }
     });
     return kinetic_response_;
   }
@@ -400,6 +425,9 @@ public:
       bytes = spatial_detail::checkedAdd(bytes, kinetic_->reverse.deviceWorkspaceBytes(),
           "Device product kinetic workspace overflow");
     }
+    if (target_kinetic_)
+      bytes = spatial_detail::checkedAdd(bytes, target_kinetic_->deviceWorkspaceBytes(),
+          "Device product target kinetic workspace overflow");
     bytes = spatial_detail::checkedAdd(bytes, contraction_device_bytes_.load(std::memory_order_acquire),
                                        "Device product contraction byte overflow");
     return bytes;
@@ -427,6 +455,9 @@ public:
       bytes = spatial_detail::checkedAdd(bytes, kinetic_->reverse.hostWorkspaceBytes(),
           "Device product kinetic host status overflow");
     }
+    if (target_kinetic_)
+      bytes = spatial_detail::checkedAdd(bytes, target_kinetic_->hostWorkspaceBytes(),
+          "Device product target kinetic host status overflow");
     bytes = spatial_detail::checkedAdd(bytes,
         checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()),
         "Device product channel factorization overflow");
@@ -436,6 +467,14 @@ public:
   }
 
 private:
+  /// Validate explicit per-owner settings before any numerical graph allocation.
+  static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
+                                                           DeviceExecutionPreparation preparation)
+  {
+    validateDeviceExecutionPreparation(plan, preparation);
+    return preparation;
+  }
+
   /// Reject an invalid profile before allocating its numerical workspaces.
   static ProductSessionProfile validatedProfile(ProductSessionProfile profile)
   {
@@ -456,7 +495,7 @@ private:
   /// A rejected request cannot allocate scratch or invalidate a prepared direction.
   void requireKinetic() const
   {
-    if (!kinetic_)
+    if (!kinetic_ && !target_kinetic_)
       throw std::logic_error("Device product session was prepared for score products only");
   }
 
@@ -513,6 +552,8 @@ private:
       kinetic_->spatial.rebindModel(active_image_);
       kinetic_->reverse.rebindModel(active_image_);
     }
+    if (target_kinetic_)
+      target_kinetic_->rebindModel(active_image_);
     image_ = active_image_;
     ready_ = false;
   }
@@ -648,12 +689,14 @@ private:
   std::mutex& mutex_;
   const ProductSessionProfile profile_;
   const std::size_t score_capacity_;
+  const DeviceExecutionPreparation preparation_;
   compute::Queue<PlatformKind::CUDA> queue_;
   AcceleratorBlasHandle blas_;
   PreparedDeviceInference values_;
   PreparedDeviceScoreReverse score_;
   PreparedDeviceScoreJvp jvp_;
   std::unique_ptr<KineticWorkspace> kinetic_;
+  std::unique_ptr<PreparedDeviceTargetKinetic> target_kinetic_;
   std::unique_ptr<PreparedDeviceScoreContraction> score_contraction_;
   // Publish metadata without exposing a concurrently replaced lazy owner.
   // Provider diagnostics hold the outer scratch mutex for a coherent snapshot.
