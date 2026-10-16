@@ -92,6 +92,114 @@ inline bool admitTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targ
   }
 }
 
+/// Exercise bounded work/memory selection and actual-B admission without numeric owners.
+inline void validateTargetSelectionCosts()
+{
+  const auto before = deviceMemoryMetrics(0).snapshot(); // Pure host counters, no runtime query.
+  const auto invalid = [](auto&& operation) {
+    try { operation(); }
+    catch (const std::invalid_argument&) { return; }
+    throw std::runtime_error("Target selection accepted invalid metadata");
+  };
+  const auto infeasible = [](auto&& operation) {
+    try { operation(); }
+    catch (const std::length_error&) { return; }
+    throw std::runtime_error("Target selection accepted infeasible metadata");
+  };
+  if (parseDeviceTargetSelection(nullptr) != std::make_pair(false, false) ||
+      parseDeviceTargetSelection("off") != std::make_pair(false, false) ||
+      parseDeviceTargetSelection("both") != std::make_pair(true, true) ||
+      parseDeviceTargetSelection("vgl") != std::make_pair(true, false) ||
+      parseDeviceTargetSelection("kinetic") != std::make_pair(false, true))
+    throw std::runtime_error("Target selection policy parsing changed");
+  invalid([&] { (void)parseDeviceTargetSelection(""); });
+  invalid([&] { (void)parseDeviceTargetSelection("fastest"); });
+  std::vector<std::size_t> visited;
+  const auto synthetic = [&](std::size_t k) {
+    visited.push_back(k);
+    return TargetVglCost{k, k, 100 - k, 1};
+  };
+  if (selectDeviceTargetCapacity(7, 99, 99, synthetic) != 7 || visited != std::vector<std::size_t>{1, 2, 4, 7})
+    throw std::runtime_error("Target selection candidate filtering or deterministic rank changed");
+  visited.clear();
+  if (selectDeviceTargetCapacity(4, 99, 99, synthetic) != 4 || visited != std::vector<std::size_t>{1, 2, 4})
+    throw std::runtime_error("Target selection duplicated the full target interval");
+  if (selectDeviceTargetCapacity(7, 100, 10, [](std::size_t k) {
+        return TargetVglCost{k == 2 ? std::size_t(1) : std::size_t(2), k == 2 ? std::size_t(99) : 0, 5, 1};
+      }) != 2 ||
+      selectDeviceTargetCapacity(7, 100, 10, [](std::size_t k) {
+        return TargetVglCost{10, k == 4 ? std::size_t(1) : std::size_t(2), 5, 1};
+      }) != 4 ||
+      selectDeviceTargetCapacity(7, 100, 10, [](std::size_t) {
+        return TargetVglCost{10, 2, 5, 1};
+      }) != 1)
+    throw std::runtime_error("Target selection work tie did not rank by device bytes, host bytes, then K");
+  if (selectDeviceTargetCapacity(7, 99, 99, [](std::size_t k) {
+        if (k == 2)
+          throw std::length_error("Synthetic single-candidate extent overflow");
+        return TargetVglCost{10, 0, 100 - k, 1};
+      }) != 7)
+    throw std::runtime_error("Target selection failed to skip one overflowing candidate while another fits");
+  for (const auto limit : {std::size_t(0), std::numeric_limits<std::size_t>::max()})
+  {
+    invalid([&] { (void)selectDeviceTargetCapacity(4, limit, 99, synthetic); });
+    invalid([&] { (void)selectDeviceTargetCapacity(4, 99, limit, synthetic); });
+  }
+  infeasible([&] { (void)selectDeviceTargetCapacity(4, 99, 99, [](std::size_t) -> TargetVglCost {
+    throw std::length_error("Synthetic checked extent overflow");
+  }); });
+  invalid([&] { (void)selectDeviceTargetCapacity(4, 99, 99, [](std::size_t) -> TargetVglCost {
+    throw std::invalid_argument("Synthetic structural mismatch");
+  }); });
+  for (bool periodic : {false, true})
+    for (const std::size_t n : {std::size_t(100), std::size_t(200), std::size_t(300)})
+    {
+      const auto plan = makeTargetCostPlan(n, periodic);
+      const auto vgl = estimateTargetVglCost(plan, 1, 32);
+      const auto kinetic = estimateTargetKineticCost(plan, 32);
+      DeviceExecutionPreparation request;
+      request.select_vgl_targets = request.select_kinetic_targets = true;
+      request.vgl = {0, vgl.device_workspace_bytes, estimateTargetVglCost(plan, 1, 1).charged_scalar_work_units};
+      request.kinetic = {0, kinetic.device_workspace_bytes, estimateTargetKineticCost(plan, 1).charged_scalar_work_units, 0};
+      const auto selected = resolveDeviceTargetSelection(plan, request);
+      const auto repeat = resolveDeviceTargetSelection(plan, selected);
+      if (selected.vgl.max_targets != 32 || selected.kinetic.max_targets != 32 ||
+          repeat.vgl.max_targets != 32 || repeat.kinetic.max_targets != 32)
+        throw std::runtime_error("Target selection missed a feasible moderate tile or was nondeterministic");
+      validateDeviceExecutionPreparation(plan, selected);
+      const auto full_vgl = estimateTargetVglCost(plan, 1, n);
+      const auto full_kinetic = estimateTargetKineticCost(plan, n);
+      request.vgl = {0, full_vgl.device_workspace_bytes, full_vgl.charged_scalar_work_units};
+      request.kinetic = {0, full_kinetic.device_workspace_bytes, full_kinetic.charged_scalar_work_units, 0};
+      const auto complete = resolveDeviceTargetSelection(plan, request);
+      if (complete.vgl.max_targets != n || complete.kinetic.max_targets != n)
+        throw std::runtime_error("Target selection rejected exact full-interval budgets");
+      --request.vgl.scalar_work_budget; // No K has less work than the complete interval.
+      infeasible([&] { (void)resolveDeviceTargetSelection(plan, request); });
+      request.select_kinetic_targets = false;
+      request.kinetic = {};
+      const auto minimum = estimateTargetVglCost(plan, 1, 1);
+      request.vgl = {0, minimum.device_workspace_bytes, minimum.charged_scalar_work_units};
+      const auto one = resolveDeviceTargetSelection(plan, request);
+      if (one.vgl.max_targets != 1)
+        throw std::runtime_error("Target selection failed exact minimum-owner admission");
+      infeasible([&] { (void)resolveDeviceTargetSelection(plan, one, 2); });
+      --request.vgl.device_workspace_budget_bytes;
+      infeasible([&] { (void)resolveDeviceTargetSelection(plan, request); });
+      request.select_vgl_targets = false;
+      request.vgl = {3, 1, 1};
+      if (resolveDeviceTargetSelection(plan, request, 0).vgl.max_targets != 3)
+        throw std::runtime_error("Unset selector changed an explicit noncandidate K");
+    }
+  const auto after = deviceMemoryMetrics(0).snapshot();
+  if (after.allocation_calls != before.allocation_calls || after.free_calls != before.free_calls ||
+      after.live_bytes != before.live_bytes || after.upload_calls != before.upload_calls ||
+      after.download_calls != before.download_calls)
+    throw std::runtime_error("Metadata selection touched a numeric device owner");
+  std::cout << "# PASS deterministic_work_memory_v1 metadata_selection; Ne=100,200,300; "
+               "capacity_trap=guarded; no_numeric_owners\n";
+}
+
 /** Emit CSV predictions and exercise per-owner byte boundaries with no GPU calls.
  * SIZE_MAX work limits isolate memory feasibility; quartic scalar-reference work
  * is still reported and is not a production runtime/throughput qualification.
@@ -99,6 +207,7 @@ inline bool admitTargetCost(const PsiFormerExecutionPlan& plan, std::size_t targ
 inline void validateTargetCosts()
 {
   const auto before = deviceMemoryMetrics(0).snapshot(); // Pure host counters; no device query.
+  validateTargetSelectionCosts();
   constexpr std::size_t gib = std::size_t{1024} * 1024 * 1024;
   const auto budget40 = spatial_detail::checkedProduct(40, gib, "40GiB cost budget overflow");
   const auto budget80 = spatial_detail::checkedProduct(80, gib, "80GiB cost budget overflow");

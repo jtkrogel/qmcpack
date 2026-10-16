@@ -34,6 +34,7 @@
 #include "PsiFormerDeviceCrowdHooks.h"
 #include "PsiFormerDeviceBatchBackend.h"
 #include "PsiFormerDeviceTargetCostValidation.h"
+#include "PsiFormerDeviceTargetSelectionValidation.h"
 #include "PsiFormerDeviceKineticContractionValidation.h"
 #include "PsiFormerDeviceCoordinatesValidation.h"
 #include "PsiFormerDeviceMetropolisValidation.h"
@@ -128,9 +129,14 @@ int main(int argc, char** argv)
       validateTargetCosts();
       return 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--target-selection-check")
+    {
+      validateTargetSelectionCosts();
+      return 0;
+    }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--metropolis-only] "
+                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--target-selection-spot] [--metropolis-only] "
                                   "[--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
@@ -141,6 +147,7 @@ int main(int argc, char** argv)
     bool coordinate_only = false;
     bool device_coordinates_only = false;
     bool target_kinetic_spot = false;
+    bool target_selection_spot = false;
     bool metropolis_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
@@ -159,6 +166,8 @@ int main(int argc, char** argv)
         device_coordinates_only = true;
       else if (option == "--target-kinetic-spot" && !target_kinetic_spot)
         target_kinetic_spot = true;
+      else if (option == "--target-selection-spot" && !target_selection_spot)
+        target_selection_spot = true;
       else if (option == "--metropolis-only" && !metropolis_only)
         metropolis_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
@@ -192,10 +201,12 @@ int main(int argc, char** argv)
     if (coordinate_only && (cpu_only || !score_output.empty() || !jvp_output.empty() ||
         !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Coordinate-only validation cannot request CPU-only or parameter exports");
-    if (target_kinetic_spot && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
+    if (target_selection_spot && target_kinetic_spot)
+      throw std::invalid_argument("Target selection spot cannot request another target spot mode");
+    if ((target_kinetic_spot || target_selection_spot) && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
         !score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("TARGET kinetic spot cannot request other modes or exports");
-    if (metropolis_only && (cpu_only || coordinate_only || device_coordinates_only || target_kinetic_spot ||
+    if (metropolis_only && (cpu_only || coordinate_only || device_coordinates_only || target_kinetic_spot || target_selection_spot ||
         !score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Metropolis-only validation cannot request other modes or exports");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
@@ -203,7 +214,7 @@ int main(int argc, char** argv)
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
-    if (target_kinetic_spot)
+    if (target_kinetic_spot || target_selection_spot)
     {
       // Branch before CPU references, broad validation owners or parameter traces.
       int device_count = 0;
@@ -226,7 +237,10 @@ int main(int argc, char** argv)
       std::ofstream output(argv[3]);
       if (!output)
         throw std::runtime_error("Cannot open TARGET kinetic spot output");
-      validateTargetKineticSpot(image, positions, queue, handle, output);
+      if (target_selection_spot)
+        validateTargetSelectionNumerics(image, positions, queue, handle, output);
+      else
+        validateTargetKineticSpot(image, positions, queue, handle, output);
       if (!output)
         throw std::runtime_error("Cannot write TARGET kinetic spot output");
       return 0;

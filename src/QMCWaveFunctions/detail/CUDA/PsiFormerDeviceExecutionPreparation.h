@@ -12,6 +12,13 @@
 
 #include "PsiFormerDeviceTargetKinetic.h"
 
+#include <array>
+#include <limits>
+#include <ostream>
+#include <string_view>
+#include <tuple>
+#include <utility>
+
 namespace qmcplusplus::psiformer::device
 {
 
@@ -29,7 +36,107 @@ struct DeviceExecutionPreparation
   std::size_t metropolis_workspace_budget_bytes = 0;
   /// Optional per-rank optimizer recurrence scratch; not provider/crowd storage.
   std::size_t adam_workspace_budget_bytes = 0;
+  /// Opt-in work/memory selection; resolved VGL is reselected for each actual B.
+  bool select_vgl_targets = false, select_kinetic_targets = false;
 };
+
+/// Parse a selection request without reading environment or changing explicit defaults.
+inline std::pair<bool, bool> parseDeviceTargetSelection(const char* value)
+{
+  if (!value || std::string_view(value) == "off")
+    return {false, false};
+  const std::string_view policy(value);
+  if (policy == "vgl" || policy == "kinetic" || policy == "both")
+    return {policy != "kinetic", policy != "vgl"};
+  throw std::invalid_argument("PSIFORMER_GPU_TARGET_SELECTION must be off, vgl, kinetic or both");
+}
+
+/// Choose only among ten bounded K candidates using exact owner bytes and a work proxy.
+template<class Estimate>
+inline std::size_t selectDeviceTargetCapacity(std::size_t electrons, std::size_t bytes,
+                                             std::size_t work, Estimate&& estimate)
+{
+  if (!electrons || !bytes || !work || bytes == std::numeric_limits<std::size_t>::max() ||
+      work == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("GPU target selection needs positive finite owner/request limits");
+  const std::array<std::size_t, 10> candidates{1, 2, 4, 8, 16, 32, 64, 128, 256, electrons};
+  std::size_t selected = 0, previous = 0;
+  std::tuple<std::size_t, std::size_t, std::size_t, std::size_t> best;
+  for (const std::size_t k : candidates)
+  {
+    if (k > electrons || k == previous)
+      continue;
+    previous = k;
+    try
+    {
+      const auto cost = estimate(k);
+      if (cost.device_workspace_bytes > bytes || cost.charged_scalar_work_units > work)
+        continue;
+      const auto rank = std::make_tuple(cost.charged_scalar_work_units,
+          cost.device_workspace_bytes, cost.host_workspace_bytes, k);
+      if (!selected || rank < best)
+      {
+        selected = k;
+        best = rank;
+      }
+    }
+    catch (const std::length_error&)
+    {
+      // Checked extent/work overflow makes this candidate infeasible, never wrapped.
+    }
+  }
+  if (!selected)
+    throw std::length_error("No GPU target candidate fits the per-owner/request limits");
+  return selected;
+}
+
+/// Resolve selected families using actual VGL capacity; kinetic owners are always B=1.
+inline DeviceExecutionPreparation resolveDeviceTargetSelection(const PsiFormerExecutionPlan& plan,
+    DeviceExecutionPreparation preparation, std::size_t vgl_capacity = 1)
+{
+  if (!preparation.select_vgl_targets && !preparation.select_kinetic_targets)
+    return preparation;
+  const auto& environment = plan.environment();
+  if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
+      environment.compute_scalar_domain != ScalarDomain::REAL ||
+      environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei ||
+      (environment.boundary != BoundaryCondition::OPEN && environment.boundary != BoundaryCondition::PERIODIC) ||
+      (environment.boundary == BoundaryCondition::PERIODIC &&
+       environment.geometry_feature_policy != GeometryFeaturePolicy::PERIODIC_TORUS_V1))
+    throw std::invalid_argument("GPU target selection requires qualified fixed-ion real target geometry");
+  const auto ne = plan.modelShape().electrons();
+  if (preparation.select_vgl_targets)
+    preparation.vgl.max_targets = selectDeviceTargetCapacity(ne, preparation.vgl.device_workspace_budget_bytes,
+        preparation.vgl.scalar_work_budget, [&](std::size_t k) { return estimateTargetVglCost(plan, vgl_capacity, k); });
+  if (preparation.select_kinetic_targets)
+    preparation.kinetic.max_targets = selectDeviceTargetCapacity(ne, preparation.kinetic.device_workspace_budget_bytes,
+        preparation.kinetic.scalar_work_budget, [&](std::size_t k) {
+          return estimateTargetKineticCost(plan, k, preparation.kinetic.lifted_channel_slots);
+        });
+  return preparation;
+}
+
+/// Report one metadata-ranked owner; neither the work proxy nor byte cap predicts total runtime/fit.
+template<class Cost>
+inline void reportDeviceTargetSelection(std::ostream& out, const char* operation,
+    const PsiFormerExecutionPlan& plan, std::size_t batch, std::size_t targets, const Cost& cost,
+    std::size_t bytes, std::size_t work)
+{
+  const auto n = plan.modelShape().electrons();
+  std::size_t candidates = 0;
+  for (std::size_t k = 1; k <= 256; k *= 2)
+    candidates += k <= n;
+  candidates += n > 256 || (n & (n - 1)) != 0;
+  out << "  PsiFormer GPU target selection: policy=deterministic_work_memory_v1, operation=" << operation
+      << ", boundary=" << (plan.environment().boundary == BoundaryCondition::OPEN ? "open" : "periodic")
+      << ", Ne=" << n << ", B=" << batch << ", candidates=" << candidates << ", selected_K=" << targets
+      << ", tiles=" << cost.tile_count << ", owner_device_bytes=" << cost.device_workspace_bytes
+      << ", separate_host_bytes=" << cost.host_workspace_bytes << ", scalar_contraction_sites=" << cost.charged_scalar_work_units
+      << ", owner_device_byte_limit=" << bytes << ", request_work_limit=" << work
+      << "; excludes images, VALUE graph, other crowds, score/JVP/solver/ECP/teacher products,"
+         " retained coordinates, sampler/Adam, vendor and allocator reserves"
+      << "; calibrated_fastest=no; aggregate_process_fit=no\n";
+}
 
 /// Reject partial profiles and impossible per-owner limits before graph reserves.
 inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& plan,

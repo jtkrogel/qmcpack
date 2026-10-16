@@ -65,7 +65,13 @@ public:
   std::unique_ptr<pf::DirectBatchTileBackendWorkspace> prepare(std::size_t capacity) const override
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
-    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(), preparation_.vgl);
+    // B=1 startup admission cannot authorize a later larger numerical owner.
+    const auto preparation = resolveDeviceTargetSelection(image_->plan(), preparation_, capacity);
+    if (preparation_.select_vgl_targets)
+      reportDeviceTargetSelection(std::cout, "VGL_actual_owner", image_->plan(), capacity,
+          preparation.vgl.max_targets, estimateTargetVglCost(image_->plan(), capacity, preparation.vgl.max_targets),
+          preparation.vgl.device_workspace_budget_bytes, preparation.vgl.scalar_work_budget);
+    return std::make_unique<Context>(this, image_, mixed_parameters_, owner_, capacity, nextIdentity(), preparation.vgl);
   }
 
   /// Prepare one exclusive, fixed-profile lane sharing this backend's publication owner.
@@ -405,8 +411,10 @@ private:
          plan.environment().boundary != BoundaryCondition::OPEN))
       throw std::invalid_argument("Explicit device sampling requires real/open FP64 preparation");
     if (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE &&
-        (preparation.vgl.max_targets || preparation.kinetic.max_targets))
+        (preparation.vgl.max_targets || preparation.kinetic.max_targets ||
+         preparation.select_vgl_targets || preparation.select_kinetic_targets))
       throw std::invalid_argument("Mixed precision does not support explicit GPU target preparation");
+    preparation = resolveDeviceTargetSelection(plan, preparation);
     validateDeviceExecutionPreparation(plan, preparation);
     return preparation;
   }

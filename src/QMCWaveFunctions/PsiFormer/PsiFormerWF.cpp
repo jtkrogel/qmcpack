@@ -925,6 +925,8 @@ CpuTargetVGLPreparation configuredCpuTargetVGL(
 psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     const psiformer::PsiFormerExecutionPlan& plan, psiformer::PsiFormerPrecisionPolicy precision)
 {
+  const auto [select_vgl, select_kinetic] = psiformer::device::parseDeviceTargetSelection(
+      std::getenv("PSIFORMER_GPU_TARGET_SELECTION"));
   const auto positive = [](const char* name) -> std::size_t {
     const char* value = std::getenv(name);
     if (!value)
@@ -965,24 +967,40 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
     }
     return enabled ? positive("PSIFORMER_GPU_ADAM_BYTES") : 0;
   }();
-  if (lifted && !kinetic)
+  if ((select_vgl && vgl) || (select_kinetic && kinetic))
+    throw std::invalid_argument("GPU target selection cannot override explicit targets for the same family");
+  if (lifted && !kinetic && !select_kinetic)
     throw std::invalid_argument("PSIFORMER_GPU_LIFTED_CHANNELS requires PSIFORMER_GPU_KINETIC_TARGETS");
-  if ((vgl || kinetic) ? (!bytes || !work) : (bytes || work))
+  if ((vgl || kinetic || select_vgl || select_kinetic) ? (!bytes || !work) : (bytes || work))
     throw std::invalid_argument("GPU target settings require targets and both per-owner workspace/request work limits");
-  if ((vgl || kinetic || retained_coordinates || metropolis || adam) && precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
+  if ((vgl || kinetic || select_vgl || select_kinetic || retained_coordinates || metropolis || adam) &&
+      precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
     throw std::invalid_argument("GPU target/retained-coordinate preparation requires FP64 reference precision");
   psiformer::device::DeviceExecutionPreparation preparation;
   preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
   preparation.metropolis_workspace_budget_bytes = metropolis;
   preparation.adam_workspace_budget_bytes = adam;
+  preparation.select_vgl_targets = select_vgl;
+  preparation.select_kinetic_targets = select_kinetic;
   if (metropolis && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
     throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open drift-free sampling");
-  if (vgl)
+  if (vgl || select_vgl)
     preparation.vgl = {vgl, bytes, work};
-  if (kinetic)
+  if (kinetic || select_kinetic)
     preparation.kinetic = {kinetic, bytes, work, lifted};
+  preparation = psiformer::device::resolveDeviceTargetSelection(plan, preparation);
   psiformer::device::validateDeviceExecutionPreparation(plan, preparation);
-  app_log() << "  PsiFormer GPU target preparation: vgl_targets=" << vgl << ", kinetic_targets=" << kinetic
+  if (select_vgl)
+    psiformer::device::reportDeviceTargetSelection(app_log(), "VGL_B1_preflight", plan, 1,
+        preparation.vgl.max_targets, psiformer::device::estimateTargetVglCost(plan, 1, preparation.vgl.max_targets),
+        bytes, work);
+  if (select_kinetic)
+    psiformer::device::reportDeviceTargetSelection(app_log(), "KINETIC", plan, 1,
+        preparation.kinetic.max_targets, psiformer::device::estimateTargetKineticCost(plan,
+            preparation.kinetic.max_targets, lifted), bytes, work);
+  app_log() << "  PsiFormer GPU target preparation: "
+            << (select_vgl ? "vgl_B1_preflight_targets=" : "vgl_targets=") << preparation.vgl.max_targets
+            << ", kinetic_targets=" << preparation.kinetic.max_targets
             << ", lifted_channel_slots=" << lifted
             << ", per_owner_workspace_limit_bytes=" << bytes << ", per_request_scalar_work_limit=" << work
             << ", per_provider_retained_coordinate_limit_bytes=" << retained_coordinates
@@ -1019,7 +1037,9 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
   return std::make_shared<PreparedDeviceBatchBackend>(std::move(image), [backend, version, preparation]() {
     app_log() << "  PsiFormer numerical device tile completed: backend="
               << psiformer::psiFormerAcceleratorBackendName(backend)
-              << ", parameter_version=" << version << ", vgl_targets=" << preparation.vgl.max_targets
+              << ", parameter_version=" << version
+              << (preparation.select_vgl_targets ? ", vgl_B1_preflight_targets=" : ", vgl_targets=")
+              << preparation.vgl.max_targets
               << ", CPU fallback=no" << std::endl;
   }, precision, preparation);
 #else
