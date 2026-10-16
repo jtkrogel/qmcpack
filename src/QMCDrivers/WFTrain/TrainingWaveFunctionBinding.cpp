@@ -617,6 +617,8 @@ void TrainingWaveFunctionBinding::importModel(const std::filesystem::path& path)
 {
   std::optional<StructuredParameterSnapshot> candidate;
   ConventionalOrbitalFrame frame;
+  std::uint64_t local_fingerprint = UINT64_C(14695981039346656037);
+  std::vector<std::uint64_t> fingerprints;
   std::exception_ptr failure;
   try
   {
@@ -628,6 +630,38 @@ void TrainingWaveFunctionBinding::importModel(const std::filesystem::path& path)
     // One artifact read owns both active coordinates and the complete frame;
     // never reopen a pathname to combine potentially different generations.
     candidate.emplace(readModelState(path, orbital_rotations_ ? &frame : nullptr));
+    // A rank-local pathname need not denote the same file on every machine.
+    // Reuse canonical double-bit fingerprints and the existing model/manifest
+    // text-fold convention, only at this cold import boundary.
+    auto mix = [&](const std::string& text) {
+      for (unsigned char byte : text)
+      {
+        local_fingerprint ^= byte;
+        local_fingerprint *= UINT64_C(1099511628211);
+      }
+      local_fingerprint ^= 0;
+      local_fingerprint *= UINT64_C(1099511628211);
+    };
+    mix(modelIdentity());
+    mix(parameterSchema().fingerprint());
+    mix(std::to_string(candidate->version));
+    mix(TrainingCheckpoint::valuesFingerprint(candidate->values));
+    if (orbital_rotations_)
+    {
+      mix(std::to_string(frame.source_version));
+      for (int alias : frame.determinant_aliases)
+        mix(std::to_string(alias));
+      for (const auto& orbital : frame.orbitals)
+      {
+        mix(orbital.name);
+        mix(std::to_string(orbital.rows));
+        mix(std::to_string(orbital.columns));
+        mix(TrainingCheckpoint::valuesFingerprint(orbital.full_rotation));
+        mix(TrainingCheckpoint::valuesFingerprint(orbital.accepted_coefficients));
+        mix(TrainingCheckpoint::valuesFingerprint(orbital.reference_coefficients));
+      }
+    }
+    fingerprints.resize(communicator_.size());
   }
   catch (...) { failure = std::current_exception(); }
   int failed = failure ? 1 : 0;
@@ -638,6 +672,10 @@ void TrainingWaveFunctionBinding::importModel(const std::filesystem::path& path)
       std::rethrow_exception(failure);
     throw std::runtime_error("Another rank failed to prepare conventional model import");
   }
+  communicator_.allgather(&local_fingerprint, fingerprints.data(), 1);
+  if (!std::all_of(fingerprints.begin(), fingerprints.end(),
+                   [local_fingerprint](std::uint64_t value) { return value == local_fingerprint; }))
+    throw std::runtime_error("Conventional imported model contents disagree across MPI ranks");
   if (orbital_rotations_)
     publishOrbitalFrame(*candidate, candidate->version, frame);
   else

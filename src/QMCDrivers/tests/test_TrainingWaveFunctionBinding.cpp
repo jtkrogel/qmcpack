@@ -163,6 +163,30 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
     CHECK(second_loader.snapshotParameters().values == before.values);
     CHECK(second_loader.snapshotParameters().version == before.version);
     CHECK(second->getOrbitals()[0].get() == component);
+    if (comm.size() > 1)
+    {
+      // Each artifact is valid locally, but identical-looking rank-local paths
+      // may contain different active coordinates. Reject before any rank adopts.
+      const auto divergent = std::filesystem::path(file.string() + ".divergent.h5");
+      Cleanup cleanup_divergent{divergent};
+      std::filesystem::copy_file(file, divergent);
+      if (comm.rank() == 0)
+      {
+        hdf_archive output;
+        REQUIRE(output.open(divergent, H5F_ACC_RDWR));
+        output.push("conventional_wavefunction", false);
+        auto values = before.values;
+        values[0] += 0.001;
+        output.write(values, "parameters");
+      }
+      error.clear();
+      try { second_loader.importModel(divergent); }
+      catch (const std::runtime_error& failure) { error = failure.what(); }
+      CHECK(error.find("contents disagree across MPI ranks") != std::string::npos);
+      CHECK(second_loader.snapshotParameters().values == before.values);
+      CHECK(second_loader.snapshotParameters().version == before.version);
+      CHECK(second->getOrbitals()[0].get() == component);
+    }
   }
   {
     hdf_archive output;
