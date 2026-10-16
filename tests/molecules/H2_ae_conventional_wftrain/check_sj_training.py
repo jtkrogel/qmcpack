@@ -395,12 +395,18 @@ def main():
         split = run("imported_split", iterations=1, parameter_file=exported)
         resumed = run("imported_resumed", parameter_file=exported,
                       restart=split / "sj.s000.last_checkpoint.h5")
+        for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
+            assert history(trained)[-1][name] == history(resumed)[0][name], name
         final = sorted((trained / "sj.s000.training").rglob("*.parameters.h5"))[-1]
         restored = sorted((resumed / "sj.s000.training").rglob("*.parameters.h5"))[-1]
         lhs, rhs = datasets(final), datasets(restored)
         assert lhs.keys() == rhs.keys()
         for name in lhs:
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"initialized restart: {name}")
+        final_bundle = final.parent / (final.name[:-len(".parameters.h5")] + ".checkpoint")
+        restored_bundle = restored.parent / (restored.name[:-len(".parameters.h5")] + ".checkpoint")
+        for pattern in ("*.state.h5", "*.rank_*.h5"):
+            compare_archives(final_bundle, restored_bundle, pattern)
         # A second import still uses ORIGINAL inline XML and original registration
         # identity, rather than a rewritten XML whose baseline masks a loader bug.
         second_vmc = run("reimported_vmc", vmc=True, parameter_file=final)
