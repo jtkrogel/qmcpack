@@ -651,6 +651,13 @@ MatrixFreeLinearMethodResult solveSymmetrizedMatrixFreeLinearMethod(
       const std::size_t dimension = basis.vectors.size();
       std::vector<DerivativeReal> projected_h(dimension * dimension);
       std::vector<DerivativeReal> projected_s(dimension * dimension);
+      std::vector<DerivativeReal> basis_norms(dimension), h_norms(dimension), s_norms(dimension);
+      for (std::size_t column = 0; column < dimension; ++column)
+      {
+        basis_norms[column] = augmentedNorm(constView(basis.vectors[column]));
+        h_norms[column] = augmentedNorm(constView(basis.hamiltonian_images[column]));
+        s_norms[column] = augmentedNorm(constView(basis.overlap_images[column]));
+      }
       for (std::size_t row = 0; row < dimension; ++row)
         for (std::size_t column = 0; column < dimension; ++column)
         {
@@ -660,12 +667,8 @@ MatrixFreeLinearMethodResult solveSymmetrizedMatrixFreeLinearMethod(
           const DerivativeValue s_value = augmentedDot(
               constView(basis.vectors[row]),
               constView(basis.overlap_images[column]));
-          const DerivativeReal h_scale =
-              augmentedNorm(constView(basis.vectors[row])) *
-              augmentedNorm(constView(basis.hamiltonian_images[column]));
-          const DerivativeReal s_scale =
-              augmentedNorm(constView(basis.vectors[row])) *
-              augmentedNorm(constView(basis.overlap_images[column]));
+          const DerivativeReal h_scale = basis_norms[row] * h_norms[column];
+          const DerivativeReal s_scale = basis_norms[row] * s_norms[column];
           if (!contractionIsReal(h_value, h_scale, control.hermitian_tolerance,
                                  augmented_size) ||
               !contractionIsReal(s_value, s_scale, control.hermitian_tolerance,
@@ -684,17 +687,13 @@ MatrixFreeLinearMethodResult solveSymmetrizedMatrixFreeLinearMethod(
         {
           if (!projectedPairIsHermitian(projected_h[row * dimension + column],
                                         projected_h[column * dimension + row],
-                                        augmentedNorm(constView(basis.vectors[row])) *
-                                            augmentedNorm(constView(basis.hamiltonian_images[column])),
-                                        augmentedNorm(constView(basis.vectors[column])) *
-                                            augmentedNorm(constView(basis.hamiltonian_images[row])),
+                                        basis_norms[row] * h_norms[column],
+                                        basis_norms[column] * h_norms[row],
                                         control.hermitian_tolerance, augmented_size) ||
               !projectedPairIsHermitian(projected_s[row * dimension + column],
                                         projected_s[column * dimension + row],
-                                        augmentedNorm(constView(basis.vectors[row])) *
-                                            augmentedNorm(constView(basis.overlap_images[column])),
-                                        augmentedNorm(constView(basis.vectors[column])) *
-                                            augmentedNorm(constView(basis.overlap_images[row])),
+                                        basis_norms[row] * s_norms[column],
+                                        basis_norms[column] * s_norms[row],
                                         control.hermitian_tolerance, augmented_size))
           {
             finishResult(result, LinearMethodStopReason::NON_HERMITIAN_ACTION, start);
