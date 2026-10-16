@@ -17,6 +17,7 @@
 #define QMCPLUSPLUS_LEGACY_WAVEFUNCTION_ADAPTER_H
 
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
+#include "QMCWaveFunctions/Optimization/NonLocalECPDerivative.h"
 #include "QMCWaveFunctions/VariableSet.h"
 #include "type_traits/template_types.hpp"
 
@@ -101,6 +102,17 @@ public:
   void installSnapshot(TrialWaveFunction& evaluator,
                        ParticleSet& particles,
                        const StructuredParameterSnapshot& snapshot) const;
+
+  /** Capture one accepted ordinary-locality grid without parameter contractions.
+   * Real CPU fixed-Slater/J1/J2 only, with active Jastrows and fixed orbitals.
+   * The supplied sink stays idle. Energy and replay must come from the same
+   * streaming Hamiltonian traversal. No parameter rows are retained per grid.
+   */
+  std::unique_ptr<NonLocalECPDerivativeConsumer> makeNonLocalECPDerivativeConsumer(
+      std::shared_ptr<LegacyWaveFunctionReplay> replay,
+      std::shared_ptr<const StructuredParameterSnapshot> snapshot,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset) const;
 
   /** Share one iteration snapshot and one bounded replay worker across block views.
    * All operators from this adapter lease the same scratch workspace. Actions are

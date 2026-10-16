@@ -13,6 +13,7 @@
 
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/Fermion/SlaterDet.h"
 
 #include <algorithm>
 #include <array>
@@ -234,6 +235,268 @@ void validateMasses(const ParticleSet& particles)
     throw std::invalid_argument("Legacy adapter supports only initialized unit electron masses");
 }
 
+DerivativeValue asDerivativeValue(QMCTraits::ValueType value) noexcept;
+
+/// Reject profiles for which a zero virtual ratio need not have zero derivative.
+void validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
+{
+#ifdef QMC_COMPLEX
+  throw std::invalid_argument("Legacy ECP products require a real CPU build");
+#endif
+  if (sample.particles.isSpinor() ||
+      sample.particles.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
+    throw std::invalid_argument("Legacy ECP products require CPU scalar electron coordinates");
+  std::size_t slaters = 0;
+  for (const auto& component : sample.wavefunction.getOrbitals())
+    if (const auto* slater = dynamic_cast<const SlaterDet*>(component.get()))
+    {
+      ++slaters;
+      if (slater->isOptimizable())
+        throw std::invalid_argument("Legacy ECP products require fixed Slater orbitals");
+      for (int determinant = 0; determinant < slater->getNumDets(); ++determinant)
+        if (slater->getPhi(determinant).isOptimizable() || slater->getPhi(determinant).isOMPoffload())
+          throw std::invalid_argument("Legacy ECP products reject active or offloaded orbitals");
+    }
+    else if (component->getClassName() != "J1OrbitalSoA" && component->getClassName() != "TwoBodyJastrow")
+      throw std::invalid_argument("Legacy ECP products admit only fixed Slater and J1/J2 components");
+  if (slaters != 1)
+    throw std::invalid_argument("Legacy ECP products require exactly one fixed Slater component");
+}
+
+/// Check finite inputs without permitting fast-math to remove the check.
+void requireFiniteECP(DerivativeValue value)
+{
+  if (!isFiniteDouble(value.real()) || !isFiniteDouble(value.imag()))
+    throw std::invalid_argument("Legacy ECP replay contains a nonfinite value");
+}
+
+/// Validate complete canonical coverage, including legal empty stamp lists.
+void validateECPRecord(const NonLocalECPJVPReplay& record)
+{
+  if (!record.gridFingerprint() || record.referencePositions().size() !=
+      checkedMultiply(checkedMultiply(record.sampleCount(), record.electronCount(), "ECP references"), 3,
+                      "ECP Cartesian references"))
+    throw std::invalid_argument("Legacy ECP replay grid or reference extent is invalid");
+  for (double coordinate : record.referencePositions())
+    requireFiniteECP({coordinate, 0});
+  const auto points = record.points();
+  const auto segments = record.segments();
+  std::size_t next_point = 0, next_segment = 0, next_stamp = 0;
+  for (const auto& tile : record.tiles())
+  {
+    if (tile.tile_ordinal != &tile - record.tiles().data() || !tile.virtual_batch_fingerprint ||
+        tile.point_offset != next_point || tile.segment_offset != next_segment || tile.stamp_offset != next_stamp ||
+        tile.point_count > points.size() - next_point || tile.segment_count > segments.size() - next_segment ||
+        tile.stamp_count > record.evaluationStamps().size() - next_stamp)
+      throw std::invalid_argument("Legacy ECP replay has invalid tile provenance");
+    const auto tile_end = next_point + tile.point_count;
+    for (std::size_t i = next_segment; i < next_segment + tile.segment_count; ++i)
+    {
+      const auto& segment = segments[i];
+      if (segment.point_offset != next_point || segment.point_count > tile_end - next_point ||
+          segment.sample >= record.sampleCount() || segment.electron >= record.electronCount())
+        throw std::invalid_argument("Legacy ECP replay has invalid segment coverage");
+      for (std::size_t p = next_point; p < next_point + segment.point_count; ++p)
+        if (points[p].sample != segment.sample || points[p].electron != segment.electron)
+          throw std::invalid_argument("Legacy ECP point disagrees with its segment");
+      next_point += segment.point_count;
+    }
+    if (next_point != tile_end)
+      throw std::invalid_argument("Legacy ECP replay tile coverage is incomplete");
+    next_segment += tile.segment_count;
+    next_stamp += tile.stamp_count;
+  }
+  if (next_point != points.size() || next_segment != segments.size() ||
+      next_stamp != record.evaluationStamps().size())
+    throw std::invalid_argument("Legacy ECP replay coverage is incomplete");
+  for (const auto& point : points)
+  {
+    for (double coordinate : point.replacement_position) requireFiniteECP({coordinate, 0});
+    requireFiniteECP(point.bare_weight);
+    requireFiniteECP(point.complete_ratio);
+    requireFiniteECP(point.bare_weight * point.complete_ratio);
+    if (point.bare_weight.imag() != 0 || point.complete_ratio.imag() != 0)
+      throw std::invalid_argument("Legacy ECP replay requires real weights and ratios");
+  }
+}
+
+/** Own accepted grid data only; never retain parameter-sized buffers per block. */
+class LegacyECPRecord final : public NonLocalECPJVPReplay
+{
+public:
+  std::string provider, schema;
+  std::size_t version = 0, batch = 0, offset = 0, samples = 0, electrons = 0;
+  std::uint64_t grid = 0;
+  std::vector<double> references;
+  std::vector<NonLocalECPReplayPoint> point_data;
+  std::vector<NonLocalECPReplaySegment> segment_data;
+  std::vector<NonLocalECPReplayTile> tile_data;
+  std::vector<WaveFunctionComponent::EvaluationStamp> stamps;
+
+  std::string_view providerId() const noexcept override { return provider; }
+  std::string_view schemaFingerprint() const noexcept override { return schema; }
+  std::size_t parameterVersion() const noexcept override { return version; }
+  std::size_t batchOrdinal() const noexcept override { return batch; }
+  std::size_t sampleOffset() const noexcept override { return offset; }
+  std::size_t sampleCount() const noexcept override { return samples; }
+  std::size_t electronCount() const noexcept override { return electrons; }
+  std::uint32_t localEnergyTermMask() const noexcept override { return localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP); }
+  std::uint64_t gridFingerprint() const noexcept override { return grid; }
+  DerivativeArrayView<const double> referencePositions() const noexcept override { return {references.data(), references.size()}; }
+  DerivativeArrayView<const NonLocalECPReplayPoint> points() const noexcept override { return {point_data.data(), point_data.size()}; }
+  DerivativeArrayView<const NonLocalECPReplaySegment> segments() const noexcept override { return {segment_data.data(), segment_data.size()}; }
+  DerivativeArrayView<const NonLocalECPReplayTile> tiles() const noexcept override { return {tile_data.data(), tile_data.size()}; }
+  DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp> evaluationStamps() const noexcept override
+  { return {stamps.data(), stamps.size()}; }
+
+  NonLocalECPReplayStorageDiagnostics storageDiagnostics() const noexcept override
+  {
+    NonLocalECPReplayStorageDiagnostics result;
+    result.point_count = point_data.size();
+    result.segment_count = segment_data.size();
+    result.tile_count = tile_data.size();
+    result.evaluation_stamp_count = stamps.size();
+    result.reference_position_bytes = references.capacity() * sizeof(double);
+    result.point_bytes = point_data.capacity() * sizeof(NonLocalECPReplayPoint);
+    result.provenance_bytes = segment_data.capacity() * sizeof(NonLocalECPReplaySegment) +
+        tile_data.capacity() * sizeof(NonLocalECPReplayTile) + stamps.capacity() * sizeof(WaveFunctionComponent::EvaluationStamp);
+    result.retained_numeric_bytes = result.reference_position_bytes + result.point_bytes + result.provenance_bytes;
+    result.storage_fingerprint = reinterpret_cast<std::size_t>(references.data()) ^
+        reinterpret_cast<std::size_t>(point_data.data()) ^ reinterpret_cast<std::size_t>(segment_data.data()) ^
+        reinterpret_cast<std::size_t>(tile_data.data()) ^ reinterpret_cast<std::size_t>(stamps.data());
+    return result;
+  }
+};
+
+/** Capture the exact live energy traversal; the supplied parameter sink stays idle. */
+class LegacyECPCapture final : public NonLocalECPDerivativeConsumer
+{
+public:
+  explicit LegacyECPCapture(std::unique_ptr<LegacyECPRecord> record) : record_(std::move(record)) {}
+
+  void preflight(const NonLocalECPDerivativeContext& context,
+                 DerivativeArrayView<const VJPCoefficientChannel> channels,
+                 const ParameterReductionSink& sink) const override
+  {
+    if (state_ != State::IDLE || !record_)
+      throw std::logic_error("Legacy ECP capture is a one-shot transaction");
+    if (context.provider_id != record_->provider || context.schema_fingerprint != record_->schema ||
+        context.parameter_version != record_->version || context.batch_ordinal != record_->batch ||
+        context.sample_offset != record_->offset || context.sample_count != record_->samples ||
+        context.localization != NonLocalECPLocalization::ORDINARY_LOCALITY || !context.uses_virtual_particles ||
+        !context.scalar_relativistic || context.used_dense_derivative_fallback)
+      throw std::invalid_argument("Legacy ECP capture requires matching scalar ordinary-locality context");
+    if (channels.empty() || channels.size() > MAXIMUM_VJP_CHANNELS || sink.state() != DerivativeSinkState::IDLE)
+      throw std::invalid_argument("Legacy ECP capture requires bounded channels and an idle sink");
+    for (const auto& channel : channels)
+    {
+      const auto& coefficients = channel.coefficients;
+      if (channel.product != DerivativeProduct::LOCAL_ENERGY_VJP ||
+          channel.local_energy_term_mask != localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP) ||
+          coefficients.provider_id != record_->provider || coefficients.schema_fingerprint != record_->schema ||
+          coefficients.parameter_version != record_->version || coefficients.batch_ordinal != record_->batch ||
+          coefficients.sample_offset != record_->offset || coefficients.values.size() != record_->samples)
+        throw std::invalid_argument("Legacy ECP capture channel identity is incompatible");
+      for (const auto& coefficient : coefficients.values) requireFiniteECP(coefficient);
+    }
+  }
+
+  void begin(const NonLocalECPDerivativeContext& context,
+             DerivativeArrayView<const VJPCoefficientChannel> channels, ParameterReductionSink& sink) override
+  {
+    preflight(context, channels, sink);
+    if (!context.grid_fingerprint)
+      throw std::invalid_argument("Legacy ECP capture requires an accepted grid fingerprint");
+    checkedMultiply(context.expected_point_count, sizeof(NonLocalECPReplayPoint), "Legacy ECP capture points");
+    record_->point_data.reserve(context.expected_point_count);
+    expected_points_ = context.expected_point_count;
+    record_->grid = context.grid_fingerprint;
+    state_ = State::ACTIVE;
+  }
+
+  void consume(const NonLocalECPDerivativeTile& tile) override
+  {
+    try
+    {
+      if (state_ != State::ACTIVE || tile.grid_fingerprint != record_->grid ||
+          tile.tile_ordinal != record_->tile_data.size() || tile.virtual_particles.walkerCount() != record_->samples ||
+          tile.bare_weights.size() != tile.virtual_particles.size() ||
+          tile.complete_ratios.size() != tile.virtual_particles.size() ||
+          tile.virtual_particles.size() > expected_points_ - record_->point_data.size())
+        throw std::invalid_argument("Legacy ECP capture tile identity or extent is invalid");
+      const auto point_offset = record_->point_data.size();
+      const auto segment_offset = record_->segment_data.size();
+      const auto stamp_offset = record_->stamps.size();
+      for (std::size_t i = 0; i < tile.virtual_particles.segmentCount(); ++i)
+      {
+        const auto slice = tile.virtual_particles.slice(i);
+        if (slice.walkerId() < 0 || static_cast<std::size_t>(slice.walkerId()) >= record_->samples ||
+            slice.electronId() < 0 || static_cast<std::size_t>(slice.electronId()) >= record_->electrons)
+          throw std::invalid_argument("Legacy ECP capture segment index is invalid");
+        record_->segment_data.push_back({point_offset + slice.flatOffset(), slice.size(),
+            static_cast<std::size_t>(slice.walkerId()), static_cast<std::size_t>(slice.electronId()), slice.isOnSphere(),
+            slice.sourceCenterId() == VirtualParticleBatch::NO_SOURCE ? static_cast<std::size_t>(-1) :
+                static_cast<std::size_t>(slice.sourceCenterId())});
+        for (std::size_t p = 0; p < slice.size(); ++p)
+        {
+          NonLocalECPReplayPoint point;
+          point.sample = slice.walkerId();
+          point.electron = slice.electronId();
+          for (int dimension = 0; dimension < 3; ++dimension)
+            point.replacement_position[dimension] = slice.absolutePosition(p)[dimension];
+          point.bare_weight = asDerivativeValue(tile.bare_weights[slice.flatOffset() + p]);
+          point.complete_ratio = asDerivativeValue(tile.complete_ratios[slice.flatOffset() + p]);
+          record_->point_data.push_back(point);
+        }
+      }
+      record_->stamps.insert(record_->stamps.end(), tile.evaluation_stamps.begin(), tile.evaluation_stamps.end());
+      record_->tile_data.push_back({tile.tile_ordinal, point_offset, tile.virtual_particles.size(), segment_offset,
+          record_->segment_data.size() - segment_offset, stamp_offset, tile.evaluation_stamps.size(),
+          tile.virtual_particles.fingerprint()});
+      validateECPRecord(*record_);
+    }
+    catch (...) { abort(); throw; }
+  }
+
+  void end() override
+  {
+    if (state_ != State::ACTIVE || record_->point_data.size() != expected_points_)
+    { abort(); throw std::logic_error("Legacy ECP capture traversal is incomplete"); }
+    validateECPRecord(*record_);
+    state_ = State::COMPLETE;
+  }
+
+  void abort() noexcept override { state_ = State::POISONED; }
+
+  std::unique_ptr<NonLocalECPJVPReplay> releaseJVPReplay() override
+  {
+    if (state_ != State::COMPLETE || !record_)
+      throw std::logic_error("Legacy ECP capture has no completed unreleased replay");
+    return std::move(record_);
+  }
+
+  StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
+  {
+    StreamingDerivativeStorageDiagnostics result;
+    if (record_)
+    {
+      const auto storage = record_->storageDiagnostics();
+      result.sample_count = record_->samples;
+      result.sample_position_bytes = storage.reference_position_bytes;
+      result.sample_auxiliary_bytes = storage.point_bytes + storage.provenance_bytes;
+      result.retained_numeric_bytes = storage.retained_numeric_bytes;
+      result.storage_fingerprint = storage.storage_fingerprint;
+    }
+    return result;
+  }
+
+private:
+  enum class State { IDLE, ACTIVE, COMPLETE, POISONED };
+  State state_ = State::IDLE;
+  std::unique_ptr<LegacyECPRecord> record_;
+  std::size_t expected_points_ = 0;
+};
+
 class ReferenceReplay final : public LegacyWaveFunctionReplay
 {
 public:
@@ -303,7 +566,8 @@ public:
     result.result_scalar_domain          = ParameterScalarDomain::COMPLEX128;
     result.reduction_domain              = ReductionDomain::CROWD_LOCAL;
     result.execution_domain              = DerivativeExecutionDomain::HOST;
-    result.local_energy_term_mask        = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+    result.local_energy_term_mask        = localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+        (ecp_replay_ ? localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP) : 0);
     result.maximum_vjp_channels          = MAXIMUM_VJP_CHANNELS;
     result.maximum_parameter_chunk_size  = chunk_plan_.maximumChunkSize();
     result.maximum_sample_tile_size      = 1;
@@ -319,10 +583,46 @@ public:
   std::size_t sampleCount() const noexcept override { return replay_->sampleCount(); }
   const ParameterChunkPlan& parameterChunkPlan() const noexcept override { return chunk_plan_; }
 
+  /// Bind only a complete grid captured at this immutable model and sample state.
+  void bindNonLocalECPJVPReplay(std::unique_ptr<NonLocalECPJVPReplay> replay) override
+  {
+    std::lock_guard lock(workspace_->mutex);
+    if (ecp_replay_ || !replay || replay->providerId() != schema_->providerId() ||
+        replay->schemaFingerprint() != schema_->fingerprint() || replay->parameterVersion() != parameter_version_ ||
+        replay->batchOrdinal() != batch_ordinal_ || replay->sampleOffset() != sample_offset_ ||
+        replay->sampleCount() != sampleCount() ||
+        replay->localEnergyTermMask() != localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))
+      throw std::invalid_argument("Legacy ECP replay has incompatible identity or was already bound");
+    validateECPRecord(*replay);
+    for (std::size_t sample = 0; sample < sampleCount(); ++sample)
+    {
+      auto state = replay_->prepareSample(sample);
+      validateECPProfile(state);
+      if (replay->electronCount() != state.particles.getTotalNum())
+        throw std::invalid_argument("Legacy ECP replay electron extent differs from private evaluator");
+      for (std::size_t electron = 0; electron < replay->electronCount(); ++electron)
+        for (int dimension = 0; dimension < 3; ++dimension)
+          if (state.particles.R[electron][dimension] !=
+              replay->referencePositions()[(sample * replay->electronCount() + electron) * 3 + dimension])
+            throw std::invalid_argument("Legacy ECP replay reference coordinates differ from private evaluator");
+    }
+    ecp_replay_ = std::move(replay);
+  }
+
   /// Report the exact numeric buffers retained by the compatibility operator.
   StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
   {
-    return storage_diagnostics_;
+    auto result = storage_diagnostics_;
+    if (ecp_replay_)
+    {
+      const auto grid = ecp_replay_->storageDiagnostics();
+      result.sample_position_bytes = grid.reference_position_bytes;
+      result.sample_auxiliary_bytes = grid.point_bytes + grid.provenance_bytes;
+      result.retained_numeric_bytes = checkedAdd(result.retained_numeric_bytes, grid.retained_numeric_bytes,
+                                                "Legacy ECP retained bytes");
+      result.storage_fingerprint ^= grid.storage_fingerprint;
+    }
+    return result;
   }
 
 protected:
@@ -343,12 +643,27 @@ protected:
         {
           DerivativeValue derivative = channels[channel].product == DerivativeProduct::SCORE_VJP
               ? asDerivativeValue(workspace_->score_row[parameter])
-              : asDerivativeValue(workspace_->kinetic_row[parameter]);
+              : ((channels[channel].local_energy_term_mask & localEnergyTermBit(LocalEnergyTerm::KINETIC))
+                     ? asDerivativeValue(workspace_->kinetic_row[parameter]) : DerivativeValue{});
           if (adjoint == DerivativeAdjoint::HERMITIAN)
             derivative = std::conj(derivative);
           workspace_->channels[channel][parameter] +=
               derivative * channels[channel].coefficients.values[sample];
         }
+      if (ecp_replay_)
+      {
+        DerivativeValue weight_sum{};
+        for (const auto& point : ecp_replay_->points())
+          if (point.sample == sample) weight_sum += point.bare_weight * point.complete_ratio;
+        // Subtract the reference score before reusing its row at virtual points.
+        accumulateECPRow(channels, adjoint, sample, -weight_sum);
+        for (const auto& point : ecp_replay_->points())
+          if (point.sample == sample && point.complete_ratio != DerivativeValue{})
+          {
+            evaluateRows(sample, &point);
+            accumulateECPRow(channels, adjoint, sample, point.bare_weight * point.complete_ratio);
+          }
+      }
     }
 
     for (const ParameterChunkDescriptor& chunk : chunk_plan_.chunks())
@@ -362,28 +677,43 @@ protected:
   void evaluateScoreJVP(const StructuredParameterVectorConstView& direction,
                         SampleProductSink& sink) const override
   {
-    evaluateJVP(direction, sink, false);
+    evaluateJVP(direction, sink, 0);
   }
 
   void evaluateLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
-                              std::uint32_t,
+                              std::uint32_t mask,
                               SampleProductSink& sink) const override
   {
-    evaluateJVP(direction, sink, true);
+    evaluateJVP(direction, sink, mask);
   }
 
 private:
   void evaluateJVP(const StructuredParameterVectorConstView& direction,
-                    SampleProductSink& sink, bool kinetic) const
+                    SampleProductSink& sink, std::uint32_t mask) const
   {
     std::lock_guard lock(workspace_->mutex);
     for (std::size_t sample = 0; sample < sampleCount(); ++sample)
     {
       evaluateRows(sample);
-      DerivativeValue product{};
+      DerivativeValue product{}, reference{};
       for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
-        product += asDerivativeValue(kinetic ? workspace_->kinetic_row[parameter] : workspace_->score_row[parameter]) *
-            direction.values()[parameter];
+      {
+        reference += asDerivativeValue(workspace_->score_row[parameter]) * direction.values()[parameter];
+        if (mask & localEnergyTermBit(LocalEnergyTerm::KINETIC))
+          product += asDerivativeValue(workspace_->kinetic_row[parameter]) * direction.values()[parameter];
+      }
+      if (mask == 0) product = reference;
+      if (mask & localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))
+        for (const auto& point : ecp_replay_->points())
+          if (point.sample == sample && point.complete_ratio != DerivativeValue{})
+          {
+            evaluateRows(sample, &point);
+            DerivativeValue replacement{};
+            for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
+              replacement += asDerivativeValue(workspace_->score_row[parameter]) * direction.values()[parameter];
+            product += point.bare_weight * point.complete_ratio * (replacement - reference);
+          }
+      requireFiniteECP(product);
       const SampleProductTileDescriptor descriptor{schema_->providerId(),
                                                    schema_->fingerprint(),
                                                    parameter_version_,
@@ -396,15 +726,38 @@ private:
   }
 
   /// Reuse the two legacy full-P rows for one evaluator configuration.
-  void evaluateRows(std::size_t sample) const
+  void evaluateRows(std::size_t sample, const NonLocalECPReplayPoint* point = nullptr) const
   {
     auto state = replay_->prepareSample(sample);
+    if (point)
+    {
+      for (int dimension = 0; dimension < 3; ++dimension)
+        state.particles.R[point->electron][dimension] = point->replacement_position[dimension];
+      state.particles.update();
+    }
     validateMasses(state.particles);
     resetEvaluator(state.wavefunction, *active_, snapshot_->values);
     state.wavefunction.evaluateLog(state.particles);
     workspace_->score_row   = QMCTraits::ValueType{};
     workspace_->kinetic_row = QMCTraits::ValueType{};
     state.wavefunction.evaluateDerivatives(state.particles, *active_, workspace_->score_row, workspace_->kinetic_row);
+  }
+
+  /// Contract only explicitly requested ECP channels into the existing P buffers.
+  void accumulateECPRow(DerivativeArrayView<const VJPCoefficientChannel> channels,
+                        DerivativeAdjoint adjoint, std::size_t sample, DerivativeValue weight) const
+  {
+    requireFiniteECP(weight);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+      if (channels[channel].product == DerivativeProduct::LOCAL_ENERGY_VJP &&
+          (channels[channel].local_energy_term_mask & localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)))
+        for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
+        {
+          auto derivative = weight * asDerivativeValue(workspace_->score_row[parameter]);
+          requireFiniteECP(derivative);
+          if (adjoint == DerivativeAdjoint::HERMITIAN) derivative = std::conj(derivative);
+          workspace_->channels[channel][parameter] += derivative * channels[channel].coefficients.values[sample];
+        }
   }
 
   /// Capture the retained-buffer byte count after all construction allocations.
@@ -442,6 +795,7 @@ private:
   std::shared_ptr<const StructuredParameterSchema> schema_;
   std::shared_ptr<const optimize::VariableSet> active_;
   std::shared_ptr<const StructuredParameterSnapshot> snapshot_;
+  std::unique_ptr<NonLocalECPJVPReplay> ecp_replay_;
   std::size_t parameter_version_ = 0;
   std::shared_ptr<LegacyWaveFunctionReplay> replay_;
   std::shared_ptr<LegacyDerivativeWorkspace> workspace_;
@@ -583,6 +937,50 @@ std::unique_ptr<StreamingDerivativeOperator> LegacyWaveFunctionAdapter::makeDeri
       schema_, registration_template_, std::move(snapshot), std::move(replay), workspace_, batch_ordinal, sample_offset,
       std::min(options_.maximum_parameter_chunk_size, schema_->parameterCount()),
       options_.maximum_derivative_scratch_bytes);
+}
+
+std::unique_ptr<NonLocalECPDerivativeConsumer> LegacyWaveFunctionAdapter::makeNonLocalECPDerivativeConsumer(
+    std::shared_ptr<LegacyWaveFunctionReplay> replay,
+    std::shared_ptr<const StructuredParameterSnapshot> snapshot,
+    std::size_t batch_ordinal,
+    std::size_t sample_offset) const
+{
+  if (!replay || !snapshot)
+    throw std::invalid_argument("Legacy ECP capture requires replay and snapshot");
+  validateSnapshot(*snapshot, *schema_);
+  checkedAdd(sample_offset, replay->sampleCount(), "Legacy ECP sample interval");
+  auto record = std::make_unique<LegacyECPRecord>();
+  record->provider = schema_->providerId();
+  record->schema = schema_->fingerprint();
+  record->version = snapshot->version;
+  record->batch = batch_ordinal;
+  record->offset = sample_offset;
+  record->samples = replay->sampleCount();
+  std::lock_guard lock(workspace_->mutex);
+  for (std::size_t sample = 0; sample < replay->sampleCount(); ++sample)
+  {
+    auto state = replay->prepareSample(sample);
+    validateECPProfile(state);
+    validateMasses(state.particles);
+    if (sample == 0)
+    {
+      record->electrons = state.particles.getTotalNum();
+      record->references.reserve(checkedMultiply(checkedMultiply(record->samples, record->electrons,
+                                                                "Legacy ECP references"), 3,
+                                                 "Legacy ECP Cartesian references"));
+    }
+    if (record->electrons != state.particles.getTotalNum())
+      throw std::invalid_argument("Legacy ECP capture requires equal electron extents");
+    // Registration checking excludes active variables outside the admitted Jastrows.
+    validateEvaluatorRegistration(state.wavefunction, *registration_template_);
+    for (const auto& position : state.particles.R)
+      for (int dimension = 0; dimension < 3; ++dimension)
+      {
+        requireFiniteECP({position[dimension], 0});
+        record->references.push_back(position[dimension]);
+      }
+  }
+  return std::make_unique<LegacyECPCapture>(std::move(record));
 }
 
 } // namespace qmcplusplus::wftrain
