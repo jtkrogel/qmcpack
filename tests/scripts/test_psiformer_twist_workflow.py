@@ -181,6 +181,22 @@ class IndependentTwistWorkflow(unittest.TestCase):
         with patch.object(Path, 'read_bytes', side_effect=AssertionError('unbounded file read')):
             self.assertEqual(workflow.sha256(path), hashlib.sha256(payload).hexdigest())
 
+    def test_parameter_checkpoint_warmstart_rejected_before_any_launch(self):
+        """Weight-only native checkpoints must not escape initialized-only provenance checks."""
+        imported = self.base / 'warmstart.xml'
+        for checkpoint in ('missing-native-state.h5', ''):
+            imported.write_text(XML.replace(
+                'source="ion0"\ninitialization=',
+                f'source="ion0" parameter_checkpoint="{checkpoint}"\ninitialization='))
+            # Put the invalid input last: all inputs must pass before even the
+            # first otherwise-valid twist can start or create an output attempt.
+            self.manifest['twists'][1]['input'] = 'warmstart.xml'
+            with self.subTest(checkpoint=checkpoint), patch.object(workflow.subprocess, 'run') as launch:
+                with self.assertRaisesRegex(ValueError, 'parameter_checkpoint'):
+                    self.launch()
+                launch.assert_not_called()
+                self.assertFalse(self.output.exists())
+
     def test_timeout_preserves_directly_streamed_partial_log(self):
         """A killed subprocess leaves diagnostic output on disk, never buffered in a PIPE."""
         self.binary.write_text('#!/usr/bin/env python3\nimport time\nprint("partial-before-timeout", flush=True)\ntime.sleep(10)\n')

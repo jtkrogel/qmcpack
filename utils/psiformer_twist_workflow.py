@@ -90,8 +90,12 @@ def prepare(entry, base):
             len(list(waves[0])) != 1 or waves[0][0].tag != 'psiformer'):
         raise ValueError("Expected one self-contained system and sole PsiFormer component")
     system, head = systems[0], waves[0][0]
-    if {'parameters', 'configuration', 'export_parameters'}.intersection(key.lower() for key in head.attrib):
-        raise ValueError("Only initialized self-contained heads without parameter/configuration/export paths are admitted")
+    # Native weight-only warmstarts are external dependencies too. This wrapper
+    # admits initialized heads only, so reject them rather than omit provenance.
+    if {'parameters', 'configuration', 'export_parameters', 'parameter_checkpoint'}.intersection(
+            key.lower() for key in head.attrib):
+        raise ValueError("Only initialized self-contained heads without parameter/configuration/export paths "
+                         "or parameter_checkpoint warmstarts are admitted")
     hamiltonians = system.findall('hamiltonian')
     if (len(hamiltonians) != 1 or len(list(hamiltonians[0])) != 3 or
             any(node.tag != 'pairpot' or node.get('type') != 'coulomb' or
