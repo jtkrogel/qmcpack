@@ -183,6 +183,7 @@ class FixedGaussianComponent final : public WaveFunctionComponent
 public:
   explicit FixedGaussianComponent(double strength) : WaveFunctionComponent("fixed_gaussian"), strength_(strength) {}
   std::string getClassName() const override { return "FixedGaussianComponent"; }
+  void evaluateDerivatives(ParticleSet&, const OptVariables&, Vector<ValueType>&, Vector<ValueType>&) override {}
   LogValue evaluateLog(const ParticleSet& particles, ParticleSet::ParticleGradient& gradients,
                        ParticleSet::ParticleLaplacian& laplacians) override
   {
