@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Independent fixed-N twists: fresh ordinary XML jobs and weighted VMC energies.
 
-This first cut never resumes/reuses an attempt or imports a checkpoint. Two-block
-smokes are execution checks, not MC precision or twist-grid convergence evidence.
+Explicit CPU restart snapshots one complete selected family; attempts are never
+reused. Two-block smokes are execution checks, not MC/grid convergence evidence.
 """
 import argparse
 import hashlib
@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -195,14 +196,66 @@ def measure(path, discard, simstats):
             'scalar_file': str(path), 'scalar_sha256': sha256(path)}
 
 
-def run_workflow(manifest_path, binary, output, timeout=300):
+def checkpoint_family(manifest, expected):
+    """Read one explicitly selected complete generation, never model arrays or a glob-latest guess."""
+    import h5py  # Existing optional training dependency; initialized-only workflows remain stdlib-only.
+
+    def text(dataset):
+        """Decode the existing one-element HDF string representation."""
+        return dataset[()].item().decode().rstrip('\0')
+
+    manifest = manifest.resolve()
+    if sha256(manifest) != expected.get(manifest.name):
+        raise ValueError("Checkpoint manifest hash mismatch")
+    with h5py.File(manifest, 'r') as archive:
+        group = archive['wftrain_distributed_manifest']
+        count = int(group['participant_count'][()])
+        if (list(group['format_version'][()]) != [1, 0, 0] or count <= 0 or count > len(expected)-2 or
+                text(group['completion_cookie']) != 'wftrain-distributed-manifest-complete-v1' or
+                group['participant_count'].dtype.kind not in 'iu' or group['rank_topology'].shape != (5*count,)):
+            raise ValueError("Incomplete or incompatible distributed checkpoint manifest")
+        root, prefix = text(group['root_envelope_filename']), text(group['sampler_shard_prefix'])
+    names = [manifest.name, root] + [f'{prefix}.rank-{rank:08d}.h5' for rank in range(count)]
+    paths = [manifest.parent/name for name in names]
+    if (len(set(names)) != len(names) or any(not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', name) for name in names) or
+            any(path.resolve().parent != manifest.parent or sha256(path) != expected.get(path.name) for path in paths)):
+        raise ValueError("Missing/corrupt/foreign checkpoint family or unsafe selected path")
+    with h5py.File(manifest.parent/root, 'r') as archive:
+        coordinator = archive['wftrain_checkpoint/coordinator/completed_iterations']
+        stage = archive['wftrain_checkpoint/stage/completed_stage_iterations']
+        if (coordinator.dtype.kind not in 'iu' or stage.dtype.kind not in 'iu' or
+                coordinator.shape != () or stage.shape != ()):
+            raise ValueError("Checkpoint progress must be integer metadata")
+        completed, stage_completed = int(coordinator[()]), int(stage[()])
+        stage_identity = text(archive['wftrain_checkpoint/stage/configuration_fingerprint'])
+        if completed < 0 or completed != stage_completed:
+            raise ValueError("Checkpoint completed counts disagree")
+    return {'manifest': str(manifest), 'completed_iterations': completed, 'stage_identity': stage_identity,
+            'sha256': {path.name: expected[path.name] for path in paths}}
+
+
+def snapshot_family(family, destination):
+    """Copy selected bytes, not hardlinks; validate the entire private disk snapshot before execution."""
+    source = Path(family['manifest'])
+    validated = checkpoint_family(source, family['sha256'])
+    if validated != family:
+        raise ValueError("Recorded checkpoint progress/identity changed")
+    destination.mkdir()
+    for name in family['sha256']:
+        shutil.copyfile(source.parent/name, destination/name)
+    return checkpoint_family(destination/source.name, family['sha256'])
+
+
+def run_workflow(manifest_path, binary, output, timeout=300, restart_result=None, iterations=None):
     """Launch fresh serial independent jobs; failed/partial attempts are never reused."""
     manifest_path, binary, output = manifest_path.resolve(), binary.resolve(), output.resolve()
     manifest = json.loads(manifest_path.read_text())
     if (set(manifest) != {'version', 'independent_streams', 'twists'} or
             manifest['version'] != 1 or manifest['independent_streams'] is not True):
-        raise ValueError("Expected v1 explicitly independent twists; restart/reuse/covariance modes are not admitted")
+        raise ValueError("Expected v1 explicitly independent twists; unknown manifest/correlated-sampling modes are not admitted")
     entries = [prepare(entry, manifest_path.parent) for entry in manifest['twists']]
+    if any(entry['measurement_series'] == 1 for entry in entries):
+        import h5py  # Fail dependency readiness before launching any training job.
     if not entries or any(
             len({tuple(entry[field]) if field == 'fractional_twist' else entry[field]
                  for entry in entries}) != len(entries) for field in ('id', 'seed', 'fractional_twist')):
@@ -215,14 +268,39 @@ def run_workflow(manifest_path, binary, output, timeout=300):
         raise ValueError("Twist weight sum must be positive")
     simstats = load_statistics()
     binary_hash = sha256(binary)
+    prior = None
+    if restart_result is not None:
+        prior_bytes = restart_result.resolve().read_bytes()
+        prior = json.loads(prior_bytes)
+        if (prior['status'] != 'complete' or prior.get('restart_supported') is not True or
+                prior['manifest_sha256'] != sha256(manifest_path) or
+                prior['binary_sha256'] != binary_hash or len(prior['twists']) != len(entries) or
+                type(iterations) is not int or iterations < 0):
+            raise ValueError("Restart requires complete matching workflow/grid/binary and iteration target")
+        for entry, old in zip(entries, prior['twists']):
+            keys = ('id', 'seed', 'fractional_twist', 'input_sha256', 'physical_sha256',
+                    'initialization_profile', 'initialization_seed', 'weight', 'measurement_series', 'discard_blocks')
+            head = entry['xml'].find('.//psiformer')
+            if (any(entry[key] != old[key] for key in keys) or entry['measurement_series'] != 1 or
+                    head.get('gpu', 'no').lower() not in ('no', 'cpu') or
+                    entry['initialization_profile'] != 'psiformer_complex_periodic_v1' or
+                    'checkpoint_family' not in old or iterations < old['checkpoint_family']['completed_iterations'] or
+                    old['checkpoint_family']['stage_identity'] != old.get('checkpoint_stage_identity')):
+                raise ValueError("Foreign/ineligible twist family or target below completed iterations")
+    elif iterations is not None:
+        raise ValueError("Iteration override is only admitted with explicit workflow restart")
     output.mkdir(parents=True, exist_ok=True)
     attempt = Path(tempfile.mkdtemp(prefix='attempt_', dir=output))
     (attempt / 'manifest.json').write_bytes(manifest_path.read_bytes())
-    result = {'version': 1, 'status': 'incomplete', 'restart_supported': False,
+    result = {'version': 1, 'status': 'incomplete',
+              'restart_supported': all(entry['measurement_series'] == 1 for entry in entries),
               'independent_streams': True, 'manifest_sha256': sha256(manifest_path),
               'binary': str(binary), 'binary_sha256': binary_hash,
               'phase_convention': 'kappa=2*pi*A_inverse*t; XML lattice rows A; no fractional wrapping',
               'scope': 'raw fixed-N Ewald VMC energies; no grid-convergence/finite-size/precision claim', 'twists': []}
+    if prior is not None:
+        result['restart_parent'] = {'result': str(restart_result.resolve()),
+                                    'sha256': hashlib.sha256(prior_bytes).hexdigest(), 'target_iterations': iterations}
     for entry in entries:
         root = entry.pop('xml')
         directory = attempt / entry['id']
@@ -232,12 +310,24 @@ def run_workflow(manifest_path, binary, output, timeout=300):
             raise ValueError("Source input changed after preparation")
         (directory / 'source.xml').write_bytes(original)
         xml = directory / 'input.xml'
+        if prior is not None:
+            family = snapshot_family(prior['twists'][len(result['twists'])]['checkpoint_family'], directory/'restart_family')
+            training = root.find('qmc/training')
+            if not any(p.get('name', '').lower() == 'iterations' for p in training.findall('parameter')):
+                ET.SubElement(training, 'parameter', name='iterations')
+            parameter(training, 'iterations').text = str(iterations)
+            ET.SubElement(training, 'parameter', name='restart_path').text = family['manifest']
+            entry['checkpoint_family'] = family
         ET.ElementTree(root).write(xml, encoding='unicode', xml_declaration=True)
         entry.update(normalized_weight=entry['weight']/total, generated_input=str(xml),
                      generated_input_sha256=sha256(xml))
         # Record intent before launch: failure leaves raw XML/logs, never an apparently complete result.
         result['twists'].append(entry)
         (attempt / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
+    # ALL source identities and selected family snapshots are checked before ANY subprocess starts.
+    for index, entry in enumerate(entries):
+        xml = Path(entry['generated_input'])
+        directory = xml.parent
         # Stream console directly to disk: timeout/failure retains partial logs without unbounded PIPE storage.
         with (directory / 'qmcpack.log').open('w') as console:
             try:
@@ -249,9 +339,17 @@ def run_workflow(manifest_path, binary, output, timeout=300):
             raise RuntimeError(f"Twist {entry['id']} failed ({completed.returncode}); evidence {directory}")
         scalar = directory / f"{entry['id']}.s{entry['measurement_series']:03d}.scalar.dat"
         entry.update(measure(scalar, entry['discard_blocks'], simstats))
-        # Checkpoints are evidence only: the next slice must validate the entire distributed family.
+        # Raw artifact hashes retain provenance; admission selects ONLY the actual complete named family.
         entry['checkpoint_artifact_sha256'] = {
             p.name: sha256(p) for p in sorted(directory.glob('checkpoint.manifest.h5*')) if p.is_file()}
+        if entry['measurement_series'] == 1 and entry['checkpoint_artifact_sha256']:
+            entry['checkpoint_family'] = checkpoint_family(directory/'checkpoint.manifest.h5', entry['checkpoint_artifact_sha256'])
+        if entry['measurement_series'] == 1 and ('checkpoint_family' not in entry or
+                (prior is not None and (entry['checkpoint_family']['completed_iterations'] != iterations or
+                 entry['checkpoint_family']['stage_identity'] != prior['twists'][index]['checkpoint_stage_identity']))):
+            raise ValueError("Missing checkpoint family or unexpected completed target")
+        if entry['measurement_series'] == 1:
+            entry['checkpoint_stage_identity'] = entry['checkpoint_family']['stage_identity']
     result.update(
         status='complete',
         mean_energy_hartree=math.fsum(e['normalized_weight']*e['mean_energy_hartree'] for e in entries),
@@ -262,13 +360,16 @@ def run_workflow(manifest_path, binary, output, timeout=300):
 
 
 def main():
-    """Expose only fresh prepare/launch/aggregate; no implicit complete-attempt adoption."""
+    """Expose fresh launches and explicit bounded CPU family restart, never implicit attempt reuse."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('manifest', type=Path)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--restart-result', type=Path)
+    parser.add_argument('--iterations', type=int)
     args = parser.parse_args()
-    print(run_workflow(args.manifest, args.binary, args.output))
+    print(run_workflow(args.manifest, args.binary, args.output,
+                       restart_result=args.restart_result, iterations=args.iterations))
 
 
 if __name__ == '__main__':

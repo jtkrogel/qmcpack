@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 from pathlib import Path
@@ -223,6 +224,158 @@ class IndependentTwistWorkflow(unittest.TestCase):
         scalar.write_text('# index LocalEnergy\n0 nan\n1 1\n')
         with self.assertRaisesRegex(ValueError, 'Nonfinite'):
             workflow.measure(scalar, 0, workflow.load_statistics())
+
+
+def create_family(directory, count=1, completed=1, generation='one'):
+    """Write tiny selected-family metadata only; production C++ still validates real model/sampler payloads."""
+    import h5py
+    directory = Path(directory)
+    directory.mkdir(exist_ok=True)
+    manifest = directory/'checkpoint.manifest.h5'
+    prefix = f'checkpoint.manifest.h5.generation-{generation}'
+    with h5py.File(manifest, 'w') as archive:
+        group = archive.create_group('wftrain_distributed_manifest')
+        group['format_version'] = [1, 0, 0]
+        group['participant_count'] = count
+        group['rank_topology'] = [1, 1, 1, 1, 1]*count
+        group['completion_cookie'] = [b'wftrain-distributed-manifest-complete-v1']
+        group['generation'] = [generation.encode()]
+        group['root_envelope_filename'] = [(prefix+'.root.h5').encode()]
+        group['sampler_shard_prefix'] = [(prefix+'.sampler').encode()]
+    with h5py.File(directory/(prefix+'.root.h5'), 'w') as archive:
+        archive['wftrain_checkpoint/coordinator/completed_iterations'] = completed
+        archive['wftrain_checkpoint/stage/completed_stage_iterations'] = completed
+        archive['wftrain_checkpoint/stage/configuration_fingerprint'] = [('identity-'+directory.name).encode()]
+    for rank in range(count):
+        (directory/f'{prefix}.sampler.rank-{rank:08d}.h5').write_bytes(b'tiny synthetic sampler payload')
+    return manifest
+
+
+class SafeTwistRestart(unittest.TestCase):
+    """Exercise complete selected families and real process-shaped restart flow without neural runtime."""
+
+    launch = IndependentTwistWorkflow.launch
+
+    def setUp(self):
+        """Add a qualified-shaped CPU training stage and fake family publisher to existing tiny input."""
+        IndependentTwistWorkflow.setUp(self)
+        training = '<qmc method="wf_train"><training objective="energy" optimizer="adam"><parameter name="iterations">1</parameter><parameter name="maximum_retained_bytes">10000</parameter><parameter name="checkpoint_path">ignored.h5</parameter></training></qmc>'
+        self.source.write_text(XML.replace('<qmc method="vmc_batch">', training+'<qmc method="vmc_batch">'))
+        for entry in self.manifest['twists']:
+            entry['measurement_series'] = 1
+        self.binary.write_text(FAKE+inspect.getsource(create_family)+'''
+import h5py
+with (Path(__file__).parent/'launches').open('a') as stream:
+    stream.write(project+'\\n')
+training = root.find('qmc/training')
+controls = {p.get('name'): p.text for p in training.findall('parameter')}
+target = int(controls.get('iterations', '1'))
+old = -1
+if 'restart_path' in controls:
+    for name in ('gamma', 'nonzero'):
+        assert (Path.cwd().parent/name/'restart_family/checkpoint.manifest.h5').is_file()
+    with h5py.File(controls['restart_path']) as f:
+        filename = f['wftrain_distributed_manifest/root_envelope_filename'][()].item().decode()
+    with h5py.File(Path(controls['restart_path']).parent/filename) as f:
+        old = int(f['wftrain_checkpoint/coordinator/completed_iterations'][()])
+if target > old:
+    create_family(Path.cwd(), completed=target, generation=str(target))
+''')
+
+    def resume(self, prior, iterations=1):
+        """Consume one explicit prior complete workflow result with unchanged manifest/binary."""
+        return workflow.run_workflow(self.base/'twists.json', self.binary, self.output,
+                                     restart_result=prior, iterations=iterations)
+
+    def test_equal_target_snapshots_before_all_launches_and_extended_target(self):
+        """Equal target reuses private input families; later updates select new published families."""
+        prior, first = self.launch()
+        original_hashes = [entry['checkpoint_family']['sha256'] for entry in first['twists']]
+        resumed = self.resume(prior)
+        second = json.loads(resumed.read_text())
+        self.assertTrue(second['restart_supported'])
+        self.assertEqual(second['restart_parent']['sha256'], workflow.sha256(prior))
+        for index, entry in enumerate(second['twists']):
+            self.assertEqual(Path(entry['checkpoint_family']['manifest']).parent.name, 'restart_family')
+            self.assertEqual(entry['checkpoint_family']['sha256'], original_hashes[index])
+            self.assertEqual(entry['checkpoint_artifact_sha256'], {})
+            self.assertEqual(workflow.checkpoint_family(Path(first['twists'][index]['checkpoint_family']['manifest']), original_hashes[index])['sha256'], original_hashes[index])
+        extended = json.loads(self.resume(resumed, iterations=2).read_text())
+        for entry in extended['twists']:
+            self.assertNotEqual(Path(entry['checkpoint_family']['manifest']).parent.name, 'restart_family')
+            self.assertEqual(entry['checkpoint_family']['completed_iterations'], 2)
+
+    def test_reject_corrupt_last_family_before_any_subprocess(self):
+        """A valid first family cannot launch before a later family's complete snapshot admission."""
+        prior, result = self.launch()
+        launches = (self.base/'launches').read_bytes()
+        family = result['twists'][1]['checkpoint_family']
+        root = next(name for name in family['sha256'] if name.endswith('.root.h5'))
+        (Path(family['manifest']).parent/root).write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):
+            self.resume(prior)
+        self.assertEqual((self.base/'launches').read_bytes(), launches)
+
+    def test_default_iteration_control_can_restore_without_other_override(self):
+        """An initially omitted default limit may become explicit only as the requested restart target."""
+        self.source.write_text(self.source.read_text().replace('<parameter name="iterations">1</parameter>', ''))
+        prior, _ = self.launch()
+        resumed = json.loads(self.resume(prior).read_text())
+        for entry in resumed['twists']:
+            root = workflow.ET.parse(entry['generated_input']).getroot()
+            self.assertEqual(workflow.parameter(root.find('qmc/training'), 'iterations').text, '1')
+
+    def test_reject_foreign_partial_target_template_and_ineligible_result(self):
+        """All prior workflow identity/admission failures precede process launch."""
+        prior, original = self.launch()
+        launches = (self.base/'launches').read_bytes()
+        for mutate in (lambda r: r.update(status='incomplete'), lambda r: r.update(binary_sha256='foreign'),
+                       lambda r: r['twists'][0].update(seed=99),
+                       lambda r: r['twists'][0].update(initialization_profile='deepqmc_psiformer_v1'),
+                       lambda r: r['twists'][0].update(input_sha256='foreign'),
+                       lambda r: r['twists'][0].update(checkpoint_family=r['twists'][1]['checkpoint_family'])):
+            result = copy.deepcopy(original)
+            mutate(result)
+            prior.write_text(json.dumps(result))
+            with self.subTest(result=result), self.assertRaises(ValueError):
+                self.resume(prior)
+        prior.write_text(json.dumps(original))
+        with self.assertRaisesRegex(ValueError, 'target below'):
+            self.resume(prior, iterations=0)
+        self.assertEqual((self.base/'launches').read_bytes(), launches)
+
+    def test_selected_multirank_family_paths_missing_progress_and_copy(self):
+        """Select exact named shards, reject traversal/missing data, and copy without sharing inodes."""
+        import h5py
+        manifest = create_family(self.base/'family', count=2)
+        hashes = {p.name: workflow.sha256(p) for p in manifest.parent.iterdir()}
+        family = workflow.checkpoint_family(manifest, hashes)
+        self.assertEqual(len(family['sha256']), 4)
+        snapshot = workflow.snapshot_family(family, self.base/'snapshot')
+        self.assertEqual(snapshot['sha256'], hashes)
+        for name in hashes:
+            self.assertNotEqual((manifest.parent/name).stat().st_ino, (self.base/'snapshot'/name).stat().st_ino)
+        shard = next(path for path in (self.base/'snapshot').iterdir() if 'rank-00000001' in path.name)
+        shard.unlink()
+        with self.assertRaises(OSError):
+            workflow.checkpoint_family(Path(snapshot['manifest']), hashes)
+        with h5py.File(manifest.parent/next(name for name in hashes if name.endswith('.root.h5')), 'r+') as archive:
+            archive['wftrain_checkpoint/stage/completed_stage_iterations'][()] = 2
+        progress_hashes = {p.name: workflow.sha256(p) for p in manifest.parent.iterdir()}
+        with self.assertRaisesRegex(ValueError, 'counts disagree'):
+            workflow.checkpoint_family(manifest, progress_hashes)
+        with h5py.File(manifest, 'r+') as archive:
+            del archive['wftrain_distributed_manifest/root_envelope_filename']
+            archive['wftrain_distributed_manifest/root_envelope_filename'] = [b'../foreign.root.h5']
+        hashes[manifest.name] = workflow.sha256(manifest)
+        with self.assertRaisesRegex(ValueError, 'unsafe'):
+            workflow.checkpoint_family(manifest, hashes)
+        manifest = create_family(manifest.parent, count=2)
+        with h5py.File(manifest, 'r+') as archive:
+            archive['wftrain_distributed_manifest/completion_cookie'][0] = b'incomplete'
+        hashes = {p.name: workflow.sha256(p) for p in manifest.parent.iterdir()}
+        with self.assertRaisesRegex(ValueError, 'Incomplete'):
+            workflow.checkpoint_family(manifest, hashes)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,13 @@ add_test(NAME deterministic-psiformer-independent-twist-workflow-unit
 set_tests_properties(deterministic-psiformer-independent-twist-workflow-unit PROPERTIES
                      TIMEOUT 30 LABELS "deterministic;psiformer;cpu;workflow")
 if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION)
+  add_test(NAME deterministic-LiH-psiformer-cpu-twist-workflow-restart
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_twist_workflow_restart.py
+                   --binary $<TARGET_FILE:qmcpack>
+                   --output ${CMAKE_CURRENT_BINARY_DIR}/twist_workflow_restart)
+  set_tests_properties(deterministic-LiH-psiformer-cpu-twist-workflow-restart PROPERTIES
+                       ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1"
+                       TIMEOUT 180 LABELS "deterministic;psiformer;cpu;periodic;complex;workflow;wftrain")
   add_test(NAME deterministic-LiH-psiformer-cpu-independent-twists
            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/utils/psiformer_twist_workflow.py
                    ${CMAKE_CURRENT_SOURCE_DIR}/independent_twists.json

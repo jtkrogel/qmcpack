@@ -1,5 +1,5 @@
-Independent-twist prepare/launch/aggregate (first cut)
-====================================================
+Independent-twist launches and explicit CPU family restart
+========================================================
 
 ``python3 utils/psiformer_twist_workflow.py MANIFEST --binary QMCPACK --output DIRECTORY``
 executes one ordinary XML per fixed twist, serially, in a fresh ``attempt_*``
@@ -42,13 +42,33 @@ directly to disk, and file hashes are computed in bounded chunks. Input XML is
 parsed and identified from the same bytes; imported head paths and external-file
 attributes are rejected even for optional real Gamma.
 
-This slice DOES NOT support restart, imported walkers/parameters, checkpoint
-family consumption or automatic completed-attempt reuse. Every launch is fresh;
-failed/partial attempts stay marked incomplete and cannot become an aggregate.
-Recorded checkpoint filenames/hashes are provenance ONLY, not validated restart
-admission. CPU trained-state restore followed by VMC has a separate tiny actual
-handoff qualification; safe per-family workflow restart is a later bounded cut.
-GPU checkpoint import/training is unavailable. Stage7 as a whole is not complete.
+Every launch still uses a fresh attempt; failed/partial attempts cannot become an
+aggregate. Explicit ``--restart-result PRIOR/result.json --iterations N`` is
+available ONLY when every prior entry is paired CPU training followed by VMC.
+The prior result must be complete and match the exact manifest/grid, binary,
+template hashes, physical metadata, profile, initialization/RNG seeds and selected
+root stage identity. No caller-supplied checkpoint filename, real-Gamma/GPU or
+initialized-only restart, imported parameter XML or automatic attempt reuse.
+
+The existing lazy ``h5py`` training dependency reads only small selected manifest/
+progress metadata. One named manifest selects its root envelope and ALL rank
+shards, never the latest filename glob. All hashes must match prior provenance.
+The selected family is COPIED, not hardlinked, into each fresh private
+``restart_family`` directory and verified BEFORE ANY subprocess starts. This
+uses explicit additional DISK space for the complete model/sampler payloads;
+hashing/copying is bounded-memory, not process-RSS admission. Source families are
+untouched. Production C++ remains authoritative for complete schema/physical
+stage/optimizer/sampler topology validation before parameter publication.
+
+Only the target iteration limit may increase; other training/sampler controls
+remain unchanged. Equal completed target restores with zero optimizer work then
+measures through following VMC; no new checkpoint is expected, so the private
+input snapshot is recorded as its effective reusable family. Increased target
+records the newly published selected family. Root/stage progress counts must
+agree, and requested N cannot be below completed count. Result records parent
+result hash and per-entry stage/family identities. GPU checkpoint import/training
+remains unavailable. Stage7 convergence/symmetry/scientific qualification is not
+implied by tiny execution and restart gates.
 
 Examples use existing tiny LiH inputs, no DFT/ECP or large-system assets. Numeric
 caps are per ordinary job and are not process-RSS/adaptive100--300-electron or
