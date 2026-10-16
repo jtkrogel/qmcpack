@@ -6,6 +6,7 @@
 #define QMCPLUSPLUS_TRAINING_WAVEFUNCTION_BINDING_H
 
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
+#include "TrainingCheckpoint.h"
 #include <filesystem>
 #include <utility>
 
@@ -36,7 +37,7 @@ struct ConventionalOrbitalFrame
  * readiness and no-throw component swaps. Post-commit live cache refresh remains
  * a fatal boundary: it cannot roll back arbitrary legacy evaluations.
  */
-class TrainingWaveFunctionBinding final : public StructuredParameterProvider
+class TrainingWaveFunctionBinding final : public StructuredParameterProvider, public ModelCheckpointContributor
 {
 public:
   TrainingWaveFunctionBinding(TrialWaveFunction& prototype, ParticleSet& particles,
@@ -66,6 +67,9 @@ public:
   void writeOrbitalFrame(hdf_archive&) const;
   ConventionalOrbitalFrame readOrbitalFrame(hdf_archive&, std::size_t source_version,
                                             const StructuredParameterSnapshot&) const;
+  void writeModelCheckpointPayload(hdf_archive&) const override;
+  std::unique_ptr<ModelCheckpointContributor::PreparedRestore> prepareModelCheckpointRestore(
+      hdf_archive&, std::size_t source_version, const StructuredParameterSnapshot&) override;
 
 private:
   TrialWaveFunction& prototype_;

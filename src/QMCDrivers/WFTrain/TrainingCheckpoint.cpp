@@ -12,7 +12,6 @@
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
-#include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 
 #include "io/hdf/hdf_archive.h"
 
@@ -23,7 +22,6 @@
 #include <cstdint>
 #include <iomanip>
 #include <limits>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -281,7 +279,7 @@ struct TrainingCheckpoint::PreparedRestore::Impl
   TrainingStageState stage;
   std::unique_ptr<OptimizerCheckpointContributor::PreparedRestore> optimizer;
   std::unique_ptr<SamplerCheckpointContributor::PreparedRestore> sampler;
-  std::optional<ConventionalOrbitalFrame> orbital_frame;
+  std::unique_ptr<ModelCheckpointContributor::PreparedRestore> complete_model;
   bool model_published = false;
   bool committed       = false;
 };
@@ -305,9 +303,9 @@ std::size_t TrainingCheckpoint::PreparedRestore::publishModel()
     throw std::logic_error("Training checkpoint model has already been published");
   // Conventional rotations are path dependent: publish the complete saved
   // frame, not merely the optimizer's active coordinate vector.
-  const std::size_t committed_version = implementation_->orbital_frame
-      ? dynamic_cast<TrainingWaveFunctionBinding&>(implementation_->provider).publishOrbitalFrame(
-          implementation_->model, implementation_->expected_runtime_version, *implementation_->orbital_frame)
+  const std::size_t committed_version = implementation_->complete_model
+      ? implementation_->complete_model->publishModel(
+          implementation_->model, implementation_->expected_runtime_version)
       : implementation_->provider.publishParameters(
           implementation_->model, implementation_->expected_runtime_version);
   implementation_->model_published = true;
@@ -383,8 +381,8 @@ void TrainingCheckpoint::saveAtomic(
     archive.write(model.values, "values");
     archive.write(parameterFingerprint(model.values), "values_fingerprint");
     archive.pop();
-    if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
-      conventional->writeOrbitalFrame(archive);
+    if (const auto* complete_model = dynamic_cast<const ModelCheckpointContributor*>(&provider))
+      complete_model->writeModelCheckpointPayload(archive);
 
     archive.push("coordinator");
     archive.write(checkedPersistedSize(coordinator_state.completed_iterations),
@@ -482,13 +480,9 @@ TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
     throw std::runtime_error("Training checkpoint contributor presence does not match restore request");
 
   auto saved = readModelAndCoordinator(archive, schema);
-  std::optional<ConventionalOrbitalFrame> orbital_frame;
-  if (auto* conventional = dynamic_cast<TrainingWaveFunctionBinding*>(&provider))
-  {
-    auto frame = conventional->readOrbitalFrame(archive, saved.model.version, saved.model);
-    if (conventional->hasOrbitalRotations())
-      orbital_frame.emplace(std::move(frame));
-  }
+  std::unique_ptr<ModelCheckpointContributor::PreparedRestore> complete_model;
+  if (auto* contributor = dynamic_cast<ModelCheckpointContributor*>(&provider))
+    complete_model = contributor->prepareModelCheckpointRestore(archive, saved.model.version, saved.model);
 
   archive.push("stage", false);
   TrainingStageState prepared_stage;
@@ -545,7 +539,7 @@ TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
       std::move(prepared_stage),
       std::move(prepared_optimizer),
       std::move(prepared_sampler),
-      std::move(orbital_frame)});
+      std::move(complete_model)});
   return PreparedRestore(std::move(implementation));
 }
 

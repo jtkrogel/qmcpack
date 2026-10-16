@@ -45,6 +45,26 @@ struct CheckpointContributorMetadata
   std::string state_fingerprint;
 };
 
+/** Optional complete-model payload beyond canonical optimization coordinates.
+ * Kept abstract so wavefunction-only checkpoint users need not link a driver.
+ * Preparation owns and validates cold state without modifying live objects.
+ */
+class ModelCheckpointContributor
+{
+public:
+  class PreparedRestore
+  {
+  public:
+    virtual ~PreparedRestore() = default;
+    virtual std::size_t publishModel(const StructuredParameterSnapshot&, std::size_t expected_version) = 0;
+  };
+  virtual ~ModelCheckpointContributor() = default;
+  virtual void writeModelCheckpointPayload(hdf_archive&) const = 0;
+  /// A null result means the model needs only its canonical parameter snapshot.
+  virtual std::unique_ptr<PreparedRestore> prepareModelCheckpointRestore(
+      hdf_archive&, std::size_t source_version, const StructuredParameterSnapshot&) = 0;
+};
+
 /** Optional owner of optimizer recurrence state.
  *
  * Restore first builds an owning prepared action. Its final commit must only

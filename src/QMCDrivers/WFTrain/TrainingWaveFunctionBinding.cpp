@@ -532,6 +532,35 @@ void TrainingWaveFunctionBinding::writeOrbitalFrame(hdf_archive& archive) const
   archive.pop();
 }
 
+void TrainingWaveFunctionBinding::writeModelCheckpointPayload(hdf_archive& archive) const
+{
+  writeOrbitalFrame(archive);
+}
+
+std::unique_ptr<ModelCheckpointContributor::PreparedRestore>
+TrainingWaveFunctionBinding::prepareModelCheckpointRestore(
+    hdf_archive& archive, std::size_t source_version, const StructuredParameterSnapshot& candidate)
+{
+  auto frame = readOrbitalFrame(archive, source_version, candidate);
+  if (!orbital_rotations_)
+    return {};
+  class PreparedFrame final : public ModelCheckpointContributor::PreparedRestore
+  {
+  public:
+    PreparedFrame(TrainingWaveFunctionBinding& binding, ConventionalOrbitalFrame frame)
+        : binding_(binding), frame_(std::move(frame))
+    {}
+    std::size_t publishModel(const StructuredParameterSnapshot& candidate, std::size_t expected_version) override
+    {
+      return binding_.publishOrbitalFrame(candidate, expected_version, frame_);
+    }
+  private:
+    TrainingWaveFunctionBinding& binding_;
+    ConventionalOrbitalFrame frame_;
+  };
+  return std::make_unique<PreparedFrame>(*this, std::move(frame));
+}
+
 ConventionalOrbitalFrame TrainingWaveFunctionBinding::readOrbitalFrame(
     hdf_archive& archive, std::size_t source_version,
     const StructuredParameterSnapshot& candidate) const
