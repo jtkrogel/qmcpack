@@ -1336,7 +1336,7 @@ void WFTrainBatched::process(xmlNodePtr node)
            optimizer != O::PROJECTED_INVERSE_ITERATION &&
            optimizer != O::MINIMUM_PROJECTED_INVERSE_ITERATION) ||
           population_.get_golden_hamiltonian().hasPhysicalNLPP())
-        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY optimizers with fixed-Slater J1/J2");
+        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY optimizers with fixed-orbital Jastrow/CI parameters");
       if (!training_input_.getLegacyMaximumParameters() || !training_input_.getLegacyDerivativeScratchBytes())
         throw UniformCommunicateError("Conventional training requires positive legacy_maximum_parameters and legacy_derivative_scratch_bytes");
       if (training_input_.getWeightDecay() != 0)

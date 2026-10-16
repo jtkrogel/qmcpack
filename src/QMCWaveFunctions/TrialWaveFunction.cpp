@@ -3332,8 +3332,9 @@ std::vector<std::size_t> TrialWaveFunction::validatePreparedJastrowActivation(
     // Coefficient-only multideterminants retain their live object/Phi/cache
     // identities; the binding separately validates and adopts prepared CI banks.
     if (dynamic_cast<const MultiSlaterDetTableMethod*>(Z[i].get())) continue;
-    if (Z[i]->isOptimizable() && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow")
-      throw std::invalid_argument("Conventional training currently admits only fixed-Slater J1/J2 parameters");
+    if (Z[i]->isOptimizable() && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow" &&
+        kind != "JeeIOrbitalSoA")
+      throw std::invalid_argument("Conventional training currently admits fixed-orbital J1/J2/J3 and CI parameters");
     if (Z[i]->isOptimizable()) component_indices.push_back(i);
   }
   return component_indices;
