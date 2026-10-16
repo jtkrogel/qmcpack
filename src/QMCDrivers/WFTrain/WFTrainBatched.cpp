@@ -24,6 +24,8 @@
 #include "QMCDrivers/WFTrain/AcceleratedLinearMethod.h"
 #include "QMCDrivers/WFTrain/KFACPreconditioner.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/KrylovPcgControl.h"
+#include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/ParameterUpdateTransaction.h"
 #include "QMCDrivers/WFTrain/ProposalSelection.h"
@@ -459,6 +461,36 @@ struct ResidentEnergyDiagnostics
   double mean = 0, variance = 0, gradient_norm = 0;
 };
 
+/// Check the actual selected operators both before sampling and before a resident update.
+void validateResidentCoulomb(QMCHamiltonian& hamiltonian)
+{
+  if (hamiltonian.size() < 2)
+    throw UniformCommunicateError("Resident ENERGY requires an actual Coulomb Hamiltonian");
+  std::size_t kinetic_count = 0;
+  for (int term = 0; term < hamiltonian.size(); ++term)
+  {
+    const auto name = hamiltonian.getComponent(term)->getClassName();
+    if (name == "BareKineticEnergy")
+      ++kinetic_count;
+    else if (name != "CoulombPotential")
+      throw UniformCommunicateError("Resident ENERGY supports only the actual selected open Coulomb Hamiltonian");
+  }
+  if (kinetic_count != 1)
+    throw UniformCommunicateError("Resident ENERGY requires exactly one physical kinetic operator");
+}
+
+/// Compare the same undamped host/resident diagnostics without changing the CSV schema.
+void logSRDiagnostics(const char* route, const wftrain::KrylovSolveDiagnostics& solve,
+    double direction_norm, double metric_norm, double damping, double scale)
+{
+  const auto precision = app_log().precision();
+  app_log() << std::setprecision(17) << "SR diagnostics route=" << route << " direction_norm=" << direction_norm
+            << " metric_norm=" << metric_norm << " damping=" << damping << " applied_scale=" << scale
+            << " residual_norm=" << solve.final_residual_norm << " relative_residual=" << solve.relative_residual_norm
+            << " stop=" << wftrain::krylovStopReasonName(solve.stop_reason) << std::endl;
+  app_log().precision(precision);
+}
+
 /** Return the Euclidean norm of a real parameter gradient. */
 double gradientNorm(const std::vector<wftrain::DerivativeReal>& gradient)
 {
@@ -872,12 +904,14 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
                                           std::size_t steps_per_block,
                                           std::uint64_t resolved_overlap_fingerprint,
                                           const std::string& complex_physical_identity = {},
-                                          bool resident_energy_adam = false)
+                                          bool resident_energy_adam = false, bool resident_energy_sr = false)
 {
   std::uint64_t hash = UINT64_C(1469598103934665603);
   extendStageFingerprint(hash, schema.fingerprint());
   if (resident_energy_adam)
     extendStageFingerprint(hash, std::string("resident-energy-c3-adam-v1"));
+  if (resident_energy_sr)
+    extendStageFingerprint(hash, std::string("resident-energy-c3-sr-v1"));
   if (!complex_physical_identity.empty())
     extendStageFingerprint(hash, complex_physical_identity);
   const auto objective = static_cast<std::underlying_type_t<WFTrainDriverInput::Objective>>(
@@ -1084,33 +1118,34 @@ void WFTrainBatched::process(xmlNodePtr node)
     initPopulationAndCrowds(walker_counts);
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
-    if (resident_adam_budget_)
+    resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
+    if (resident_sr_budget_.first)
+    {
+      if (resident_adam_budget_ || device_provider->deviceAdamBudget() ||
+          training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION ||
+          !wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0 ||
+          !wftrain::isFiniteTrainingReal(training_input_.getLearningRate()) || training_input_.getLearningRate() <= 0 ||
+          training_input_.getMaximumDampingAttempts() != 1)
+        throw UniformCommunicateError("Resident ENERGY SR requires exclusive fixed positive damping/LR and one attempt");
+      wftrain::krylov_detail::validateControl(makeKrylovControl(training_input_));
+    }
+    if (resident_adam_budget_ || resident_sr_budget_.first)
     {
       if (myComm->size() != 1 || crowds_.size() != 1 || crowds_.front()->size() < 7 ||
           qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1 ||
           student_prototype_.getOrbitals().size() != 1 ||
           training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
-          training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM ||
+          (resident_adam_budget_ && training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM) ||
           training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
           training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
           training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
-          !device_provider->deviceAdamBudget())
-        throw UniformCommunicateError("Resident ENERGY Adam requires sole real/open/FP64 GPU Adam, rank/crowd/blocks/steps=1, B>=7, fixed unmodified step and both caps");
-      auto& hamiltonian = population_.get_golden_hamiltonian();
-      if (hamiltonian.size() < 2)
-        throw UniformCommunicateError("Resident ENERGY Adam requires an actual Coulomb Hamiltonian");
-      std::size_t kinetic_count = 0;
-      for (int term = 0; term < hamiltonian.size(); ++term)
-      {
-        const auto name = hamiltonian.getComponent(term)->getClassName();
-        if (name == "BareKineticEnergy")
-          ++kinetic_count;
-        else if (name != "CoulombPotential")
-          throw UniformCommunicateError("Resident ENERGY Adam supports only the actual selected open Coulomb Hamiltonian");
-      }
-      if (kinetic_count != 1)
-        throw UniformCommunicateError("Resident ENERGY Adam requires exactly one physical kinetic operator");
-      resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
+          (resident_adam_budget_ && !device_provider->deviceAdamBudget()))
+        throw UniformCommunicateError("Resident ENERGY requires sole real/open/FP64 GPU, rank/crowd/blocks/steps=1, B>=7, fixed unmodified step and explicit caps");
+      validateResidentCoulomb(population_.get_golden_hamiltonian());
+      if (resident_adam_budget_)
+        resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
+      else
+        resident_sr_incremental_bytes_ = device_provider->prepareResidentEnergySR(crowds_.front()->size(), resident_sr_budget_);
     }
     // ContextForSteps only borrows an RNG reference; all MC draws follow admission.
     createStepContexts(crowds_.size());
@@ -1151,6 +1186,7 @@ void WFTrainBatched::run()
 
   const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
+  const auto resident_sr_budget = resident_sr_budget_;
   const IndexType num_blocks = qmcdriver_input_.get_max_blocks();
   const int num_iterations = static_cast<int>(training_input_.getIterations());
   bool complex_training = false;
@@ -1310,7 +1346,7 @@ void WFTrainBatched::run()
       0, 0,
       stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
                                     selected_provider_->parameterSchema(), steps_per_block_,
-                                    overlap_fingerprint, complex_physical_identity, resident_adam_budget != 0)};
+                                    overlap_fingerprint, complex_physical_identity, resident_adam_budget != 0, resident_sr_budget.first != 0)};
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;
@@ -1787,11 +1823,13 @@ void WFTrainBatched::run()
             throw UniformCommunicateError(
                 "WFTrainBatched: First-order methods and parameter-space SR require at least one walker on every rank");
         }
-        if (resident_adam_budget)
+        if (resident_adam_budget || resident_sr_budget.first)
         {
+          validateResidentCoulomb(population_.get_golden_hamiltonian());
           const auto parameters = selected_provider_->snapshotParameters();
           const auto& schema = selected_provider_->parameterSchema();
-          if (batches.size() != 1 || batches[0].weights.size() < 7 || batches[0].additive_local_energy_vjp ||
+          if (student_prototype_.getOrbitals().size() != 1 || batches.size() != 1 || batches[0].weights.size() < 7 ||
+              (resident_sr_budget.first && batches[0].weights.size() != crowds_.front()->size()) || batches[0].additive_local_energy_vjp ||
               batches[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
               training_state.schema_fingerprint != schema.fingerprint() || training_state.parameter_version != parameters.version ||
               training_state.completed_iterations == std::numeric_limits<std::size_t>::max())
@@ -1817,11 +1855,28 @@ void WFTrainBatched::run()
               !wftrain::isFiniteTrainingReal(resident_diagnostics->variance))
             throw std::invalid_argument("Resident ENERGY scalar diagnostics are nonfinite");
           storage_diagnostics = preparedStorageDiagnostics(batches);
-          retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes, first_order_optimizer->retainedBytes());
+          retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes,
+              resident_adam_budget ? first_order_optimizer->retainedBytes() : resident_sr_incremental_bytes_);
           enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
           try
           {
-            const auto candidate = first_order_optimizer->proposeResidentAdam(schema, parameters,
+            wftrain::StructuredParameterSnapshot candidate;
+            if (resident_sr_budget.first)
+            {
+              candidate = parameters;
+              const auto diagnostics = device_provider->consumeResidentEnergySR(*batch.derivative_operator,
+                  {channels.data(), channels.size()}, batch.weights, parameters.values, coefficients.weight_sum,
+                  resident_diagnostics->mean, training_input_.getDamping(), training_input_.getLearningRate(),
+                  makeKrylovControl(training_input_), resident_sr_budget, candidate.values);
+              resident_diagnostics->gradient_norm = diagnostics.gradient_norm;
+              krylov_iterations = diagnostics.solve.iterations;
+              krylov_operator_applications = diagnostics.solve.operator_applications;
+              applied_scale = 1.0;
+              logSRDiagnostics("resident", diagnostics.solve, diagnostics.direction_norm,
+                  diagnostics.metric_norm, training_input_.getDamping(), 1.0);
+            }
+            else
+              candidate = first_order_optimizer->proposeResidentAdam(schema, parameters,
                 [&](auto& adam, double b1, double b2, double c1, double c2, double epsilon, auto& values) {
                   return device_provider->consumeResidentEnergyAdam(*batch.derivative_operator,
                       {channels.data(), channels.size()}, adam, parameters.values, coefficients.weight_sum,
@@ -1837,10 +1892,12 @@ void WFTrainBatched::run()
           }
           catch (...)
           {
-            first_order_optimizer->proposalRejected();
+            if (resident_adam_budget)
+              first_order_optimizer->proposalRejected();
             throw;
           }
-          first_order_optimizer->acceptResidentAdam();
+          if (resident_adam_budget)
+            first_order_optimizer->acceptResidentAdam();
           training_state.completed_iterations = pending.completed_iterations;
           training_state.parameter_version = pending.parameter_version;
           training_state.schema_fingerprint.swap(pending.schema_fingerprint);
@@ -1937,6 +1994,8 @@ void WFTrainBatched::run()
             krylov_iterations            = diagnostics->solve.iterations;
             krylov_operator_applications = diagnostics->solve.operator_applications;
             applied_scale                = diagnostics->applied_scale;
+            logSRDiagnostics("host", diagnostics->solve, diagnostics->direction_norm,
+                diagnostics->metric_norm, diagnostics->damping, diagnostics->applied_scale);
           }
         }
         else

@@ -29,6 +29,7 @@
 #include <vector>
 
 namespace qmcplusplus::psiformer::device { class PreparedDeviceAdam; }
+namespace qmcplusplus::wftrain { struct KrylovSolverControl; struct ResidentEnergySRDiagnostics; }
 
 namespace pf
 {
@@ -465,6 +466,19 @@ public:
 
   /// Explicit numerical bridge cap; CPU profiles do not read its control.
   std::size_t residentEnergyAdamBudget() const;
+
+  /// Complete named SR numeric caps (device, host); CPU never reads these controls.
+  std::pair<std::size_t, std::size_t> residentEnergySRBudget() const;
+
+  /// Admit full C0 payload and anchor C3; return only the incremental aggregate peak.
+  std::size_t prepareResidentEnergySR(std::size_t population, std::pair<std::size_t, std::size_t> budget) const;
+
+  /// Consume one immutable physical batch; only an owning host candidate crosses leases.
+  wftrain::ResidentEnergySRDiagnostics consumeResidentEnergySR(const wftrain::StreamingDerivativeOperator& derivative,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      const std::vector<double>& weights, const std::vector<double>& parameters, double weight, double energy,
+      double damping, double learning_rate, const wftrain::KrylovSolverControl& control,
+      std::pair<std::size_t, std::size_t> budget, std::vector<double>& candidate) const;
 
   /// Retain one shared lane and admit C3; return separately charged norm bytes.
   std::size_t prepareResidentEnergyAdam(std::size_t budget) const;

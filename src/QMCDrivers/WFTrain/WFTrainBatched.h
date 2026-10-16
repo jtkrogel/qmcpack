@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace qmcplusplus::wftrain
@@ -66,6 +67,9 @@ private:
   wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
   /// Resolved once during pre-draw process admission, never re-read mid-run.
   std::size_t resident_adam_budget_ = 0, resident_norm_bytes_ = 0;
+  /// Complete SR cap pair and incremental peak, resolved before sampling.
+  std::pair<std::size_t, std::size_t> resident_sr_budget_{0, 0};
+  std::size_t resident_sr_incremental_bytes_ = 0;
 
   /// Student clones aligned one-for-one with the frozen-teacher crowd ParticleSets.
   std::vector<UPtrVector<TrialWaveFunction>> overlap_student_twfs_;

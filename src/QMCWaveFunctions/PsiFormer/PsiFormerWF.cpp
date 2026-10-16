@@ -17,6 +17,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
+#include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
@@ -31,6 +32,7 @@
 #endif
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceBatchBackend.h"
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDevicePcg.h"
 #ifdef QMC_COMPLEX
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
 #endif
@@ -1252,7 +1254,7 @@ public:
   /// Cache one lane across orbital-loss calls; never one tape per walker/epoch.
   std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
   /// Explicit resident ENERGY keeps one existing lane/tapes alive across iterations.
-  std::shared_ptr<PsiFormerDerivativeScratch> resident_energy_adam_scratch;
+  std::shared_ptr<PsiFormerDerivativeScratch> resident_energy_scratch;
 };
 
 /** Optimizer metadata shared by every clone of one PsiFormer component.
@@ -11912,7 +11914,7 @@ std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
             << ", C3 status host bytes=" << c3 - 48 * p << ", norm host bytes=" << norm
             << "; cap covers C3+norm device payload ONLY; existing Adam, model/tapes, host compatibility/canonical/coefficients, sampling, vendor and checkpoints excluded" << std::endl;
   std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
-  model_state_->resident_energy_adam_scratch = std::move(scratch);
+  model_state_->resident_energy_scratch = std::move(scratch);
   return norm;
 #else
   throw std::invalid_argument("Resident ENERGY Adam requires a real GPU build");
@@ -11929,7 +11931,7 @@ double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivative
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
   const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
   if (!source || source->model_state_.get() != model_state_.get() ||
-      source->shared_scratch_ != model_state_->resident_energy_adam_scratch || derivative.sampleCount() < 7)
+      source->shared_scratch_ != model_state_->resident_energy_scratch || derivative.sampleCount() < 7)
     throw std::invalid_argument("Resident ENERGY requires this provider's current prepared batch");
   (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
   if (channels.size() != 3 || channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
@@ -11956,6 +11958,132 @@ double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivative
   return norm;
 #else
   throw std::invalid_argument("Resident ENERGY Adam requires a real GPU build");
+#endif
+}
+
+/// Resolve both explicit SR caps together; CPU never parses GPU-only controls.
+std::pair<std::size_t, std::size_t> PsiFormerWF::residentEnergySRBudget() const
+{
+#ifdef ENABLE_CUDA
+  if (!model_state_->numerical_tile_backend)
+    return {0, 0};
+  const char* device = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES");
+  const char* host = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES");
+  if (!device && !host)
+    return {0, 0};
+  const auto parse = [](const char* value) {
+    std::size_t bytes = 0;
+    if (!value)
+      throw std::invalid_argument("Resident ENERGY SR requires both explicit caps");
+    for (const char* digit = value; *digit; ++digit)
+    {
+      if (*digit < '0' || *digit > '9' || bytes > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+        throw std::invalid_argument("Resident ENERGY SR cap must be positive finite decimal bytes");
+      bytes = 10 * bytes + (*digit - '0');
+    }
+    if (!bytes || bytes == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Resident ENERGY SR cap must be positive finite decimal bytes");
+    return bytes;
+  };
+  return {parse(device), parse(host)};
+#else
+  return {0, 0};
+#endif
+}
+
+/// Admit complete C0 payload before optional C3; exclude the shared C3 once in aggregate sums.
+std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
+    std::pair<std::size_t, std::size_t> budget) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  using Owner = psiformer::device::PreparedDevicePcg;
+  std::shared_ptr<PsiFormerDerivativeScratch> scratch;
+  std::size_t incremental = 0, c3 = 0;
+  {
+    std::shared_lock state_lock(model_state_->mutex);
+    const auto& environment = model_state_->execution_plan.environment();
+    if (!model_state_->numerical_tile_backend || model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+        environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL || environment.boundary != psiformer::BoundaryCondition::OPEN ||
+        std::any_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool axis) { return axis; }))
+      throw std::invalid_argument("Resident ENERGY SR requires ordinary real/open/FP64 GPU products");
+    std::size_t frozen = 0;
+    for (const auto& block : structured_parameter_schema_->blocks())
+      if (!block.trainable)
+        ++frozen;
+    const auto p = structured_parameter_schema_->parameterCount();
+    const auto cost = Owner::energyRequiredBytes(p, population, model_state_->execution_plan.modelShape().electrons(), 3, frozen);
+    if (!budget.first || !budget.second || budget.first == std::numeric_limits<std::size_t>::max() ||
+        budget.second == std::numeric_limits<std::size_t>::max() || cost.device_bytes > budget.first || cost.host_bytes > budget.second)
+      throw std::length_error("Resident ENERGY SR complete numeric payload exceeds explicit device/host caps");
+    c3 = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(p, 3);
+    const auto shared = checkedBatchMemoryAdd(c3, c3 - 48 * p, "Resident ENERGY SR shared C3");
+    incremental = checkedBatchMemoryAdd(cost.device_bytes, cost.host_bytes, "Resident ENERGY SR payload") - shared;
+    scratch = acquireDerivativeScratch(*model_state_, p, 4);
+    app_log() << "Resident ENERGY SR admitted device_bytes=" << cost.device_bytes << " host_bytes=" << cost.host_bytes
+              << " shared_c3_bytes=" << shared << " incremental_peak_bytes=" << incremental
+              << "; named caps exclude existing model/tapes/compatibility/source/coefficients/sampling/vendor/checkpoints" << std::endl;
+  }
+  PsiFormerDerivativeLease lease(*scratch); // Never wait execution while holding Model read.
+  std::shared_lock state_lock(model_state_->mutex);
+  scratch->device_products->prepareScoreContractions(3, model_state_->model.p.version(), c3);
+  std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
+  model_state_->resident_energy_scratch = std::move(scratch);
+  return incremental;
+#else
+  throw std::invalid_argument("Resident ENERGY SR requires a real GPU build");
+#endif
+}
+
+/// Bind sampled positions/weights to one immutable C0 owner, under the physical producer leases.
+wftrain::ResidentEnergySRDiagnostics PsiFormerWF::consumeResidentEnergySR(
+    const wftrain::StreamingDerivativeOperator& derivative,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    const std::vector<double>& weights, const std::vector<double>& parameters, double weight, double energy,
+    double damping, double learning_rate, const wftrain::KrylovSolverControl& control,
+    std::pair<std::size_t, std::size_t> budget, std::vector<double>& candidate) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
+  if (!source || source->model_state_.get() != model_state_.get() || source->shared_scratch_ != model_state_->resident_energy_scratch ||
+      derivative.sampleCount() < 7 || weights.size() != derivative.sampleCount())
+    throw std::invalid_argument("Resident ENERGY SR requires this provider's current immutable physical batch");
+  (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
+  if (channels.size() != 3 || channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
+      channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+      channels[1].product != wftrain::DerivativeProduct::SCORE_VJP || channels[2].product != wftrain::DerivativeProduct::SCORE_VJP)
+    throw std::invalid_argument("Resident ENERGY SR requires ordered physical T/EO/O channels");
+  std::vector<psiformer::device::PreparedDevicePcg::FrozenInterval> frozen;
+  for (const auto& block : structured_parameter_schema_->blocks())
+    if (!block.trainable)
+      frozen.emplace_back(block.offset, block.count);
+  wftrain::ResidentEnergySRDiagnostics diagnostics;
+  source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
+    auto& session = *source->shared_scratch_->device_products;
+    const auto cold = session.transferSnapshot();
+    auto owner = psiformer::device::PreparedDevicePcg::prepareEnergy(session, source->positions_, weights, frozen,
+        derivative.parameterVersion(), damping, budget.first, budget.second); // Cold PER UPDATE, completed C3 preserved.
+    const auto before = session.transferSnapshot();
+    app_log() << "Resident ENERGY SR cold owner device_bytes=" << owner->cost().device_bytes
+              << " host_bytes=" << owner->cost().host_bytes << " P=" << parameters.size()
+              << " B=" << weights.size() << " frozen_intervals=" << frozen.size()
+              << " uploaded_bytes=" << before.uploaded_bytes - cold.uploaded_bytes
+              << " downloaded_bytes=" << before.downloaded_bytes - cold.downloaded_bytes
+              << " allocation_calls=" << before.allocation_calls - cold.allocation_calls << std::endl;
+    const auto result = owner->consumeEnergy(derivative.parameterVersion(), generation, parameters, weight, energy,
+        learning_rate, control, candidate);
+    const auto after = session.transferSnapshot();
+    app_log() << "Resident ENERGY SR terminal uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
+              << " downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes
+              << " allocation_calls=" << after.allocation_calls - before.allocation_calls
+              << " free_calls=" << after.free_calls - before.free_calls
+              << "; scope=device_wide cold_owner_producer_checkpoint_excluded=yes" << std::endl;
+    if (!result.candidate_ready || !result.solve.converged)
+      throw std::runtime_error(std::string("Resident ENERGY SR did not converge: ") + wftrain::krylovStopReasonName(result.solve.stop_reason));
+    diagnostics = {result.solve, result.gradient_norm, result.direction_norm, result.metric_norm};
+  });
+  return diagnostics;
+#else
+  throw std::invalid_argument("Resident ENERGY SR requires a real GPU build");
 #endif
 }
 
