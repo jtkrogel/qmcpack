@@ -170,6 +170,7 @@ struct PsiFormerComplexWF::Impl
       pf::addStorageBytes(doubles, pf::checkedStorageProduct(4,
           pf::checkedStorageProduct(samples, dimensions.electrons, message), message), message);
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(doubles, message), message);
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<C>(samples, message), message);
       return bytes;
     }
 
@@ -221,17 +222,18 @@ struct PsiFormerComplexWF::Impl
         std::size_t ordinal, std::size_t offset, std::size_t samples, std::size_t chunk)
         : state(std::move(model)), lane(std::move(scratch)), version(state->model.p.version()),
           ordinal(ordinal), offset(offset), samples(samples), chunks(*state->schema, version, chunk),
-          positions(3 * samples * state->model.ne), inverse_masses(samples * state->model.ne)
+          positions(3 * samples * state->model.ne), inverse_masses(samples * state->model.ne), sample_products(samples)
     {}
 
-    /// Advertise only ordinary-transpose, complete kinetic and score VJPs over real parameters.
+    /// Real tangents have complex score products; both adjoints cover score AND complete kinetic VJPs.
     wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
     {
       using namespace wftrain;
       StreamingDerivativeCapabilities c;
       c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
-          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
-      c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE);
+          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) | derivativeProductBit(DerivativeProduct::SCORE_JVP);
+      c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) |
+          derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
       c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
       c.maximum_vjp_channels = 3;
       c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
@@ -272,18 +274,21 @@ struct PsiFormerComplexWF::Impl
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
       d.sample_auxiliary_bytes = inverse_masses.capacity() * sizeof(double);
-      d.retained_numeric_bytes = d.shared_workspace_bytes + d.sample_position_bytes + d.sample_auxiliary_bytes;
+      d.sample_product_bytes = sample_products.capacity() * sizeof(C);
+      d.retained_numeric_bytes = d.shared_workspace_bytes + d.sample_position_bytes + d.sample_auxiliary_bytes +
+          d.sample_product_bytes;
       d.shared_workspace_identity = reinterpret_cast<std::uintptr_t>(lane.get());
       d.allocation_generation = 1;
       d.storage_fingerprint = lane->fingerprint();
       psiformer::determinant::detail::mixStorage(d.storage_fingerprint, positions);
       psiformer::determinant::detail::mixStorage(d.storage_fingerprint, inverse_masses);
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, sample_products);
       return d;
     }
 
     /// Traverse each sample once per requested qualified owner, never once per parameter chunk.
     void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
-        wftrain::DerivativeAdjoint, wftrain::ParameterReductionSink& sink) const override
+        wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink& sink) const override
     {
       using namespace wftrain;
       std::unique_lock execution(lane->execution_mutex);
@@ -319,7 +324,8 @@ struct PsiFormerComplexWF::Impl
             const auto* response = requested[channel].product == DerivativeProduct::SCORE_VJP ? score : kinetic;
             const C coefficient = requested[channel].coefficients.values[sample];
             for (std::size_t parameter = 0; parameter < p; ++parameter)
-              lane->channels[channel][parameter] += coefficient * response[parameter];
+              lane->channels[channel][parameter] += coefficient *
+                  (adjoint == DerivativeAdjoint::HERMITIAN ? std::conj(response[parameter]) : response[parameter]);
           }
         }
         for (std::size_t channel = 0; channel < requested.size(); ++channel)
@@ -334,16 +340,43 @@ struct PsiFormerComplexWF::Impl
             sink.add(channel, {chunk, {lane->channels[channel].data() + chunk.parameter_offset, chunk.count}});
     }
 
-    /// A VJP-only numerical milestone must not fall back to a dense Jacobian JVP.
-    void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView&,
-        wftrain::SampleProductSink&) const override
-    { throw std::logic_error("Complex PsiFormer score JVP is not qualified"); }
+    /// Contract qualified complex scores with a validated REAL tangent on one version-coherent transaction.
+    void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
+        wftrain::SampleProductSink& sink) const override
+    {
+      std::unique_lock execution(lane->execution_mutex);
+      {
+        std::shared_lock read(state->mutex);
+        if (version != state->model.p.version() || state->pending_proposals.load(std::memory_order_relaxed))
+          throw std::logic_error("Complex PsiFormer score JVP snapshot is stale or family has a pending move");
+        const auto n = state->model.ne;
+        for (std::size_t sample = 0; sample < samples; ++sample)
+        {
+          lane->score_work->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 3 * sample * n, n));
+          const auto score = lane->score.evaluate(*lane->score_work);
+          C product{};
+          for (std::size_t parameter = 0; parameter < score.parameter_count; ++parameter)
+            product += score.parameter_score[parameter] * direction.values()[parameter].real();
+          if (!psiformer::determinant::isFiniteComplex(product))
+            throw std::runtime_error("Complex PsiFormer score JVP is nonfinite");
+          sample_products[sample] = product;
+        }
+      }
+      // Complete all numerical work before callbacks; only the lane lease spans emission.
+      for (std::size_t sample = 0; sample < samples; ++sample)
+      {
+        const wftrain::SampleProductTileDescriptor tile{state->schema->providerId(), state->schema->fingerprint(),
+            version, ordinal, offset + sample, 1, sample};
+        sink.add({tile, {sample_products.data() + sample, 1}});
+      }
+    }
 
     const std::shared_ptr<Model> state;
     const std::shared_ptr<DerivativeLane> lane;
     const std::size_t version, ordinal, offset, samples;
     const wftrain::ParameterChunkPlan chunks;
     std::vector<double> positions, inverse_masses;
+    mutable std::vector<C> sample_products;
   };
 
   /// Validate the explicit initializer profile before consuming its canonical storage.

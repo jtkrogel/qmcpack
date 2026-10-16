@@ -316,6 +316,50 @@ TEST_CASE("Streaming SR applies a two-sided frozen-parameter projection",
   CHECK(result[2] == DerivativeValue{});
 }
 
+TEST_CASE("Streaming SR real tangents retain imaginary score covariance",
+          "[drivers][wftrain][sr][complex_real_tangent]")
+{
+  const auto schema = makeSRSchema("sr/real_tangent", 2, ParameterScalarDomain::REAL64);
+  // These opposite complex rows give G=[[2,1],[1,5]], NOT density-only [[1,2],[2,4]].
+  const std::vector<std::vector<DerivativeValue>> rows{
+      {{1, 1}, {2, -1}}, {{-1, -1}, {-2, 1}}};
+  ScoreRowStreamingOperator stream(schema, 3, 0, 0, rows);
+  const std::vector<DerivativeReal> weights{1, 1};
+  const StochasticReconfigurationBatch batch{&stream, {weights.data(), weights.size()}};
+  StochasticReconfigurationOperator covariance(schema, 3, {&batch, 1});
+  const double metric[2][2]{{2, 1}, {1, 5}};
+  for (std::size_t column = 0; column < 2; ++column)
+  {
+    std::vector<DerivativeValue> basis(2), action(2);
+    basis[column] = 1;
+    covariance.apply({schema, 3, {basis.data(), basis.size()}}, {action.data(), action.size()});
+    for (std::size_t row = 0; row < 2; ++row)
+      checkClose(action[row], metric[row][column]);
+  }
+  CHECK(metric[0][1] == metric[1][0]);
+  CHECK(metric[0][0] * metric[1][1] - metric[0][1] * metric[1][0] > 0);
+  IdentityPreconditioner preconditioner(schema, 3);
+  StochasticReconfigurationUpdateControl control;
+  control.learning_rate = .2;
+  control.initial_damping = .3;
+  control.maximum_damping_attempts = 1;
+  control.krylov.relative_tolerance = 1e-12;
+  control.krylov.maximum_iterations = 4;
+  control.krylov.maximum_operator_applications = 8;
+  StochasticReconfigurationUpdateRule update(covariance, preconditioner, control);
+  const StructuredParameterSnapshot parameters{schema.fingerprint(), 3, {.2, -.1}};
+  const std::vector<DerivativeReal> gradient{1, -.4};
+  const ParameterGradientView objective{schema.fingerprint(), 3, ReductionDomain::GLOBAL,
+      {gradient.data(), gradient.size()}};
+  const auto candidate = update.propose(schema, parameters, objective);
+  // Independent dense inversion of [[2.3,1],[1,5.3]], applied to the REAL force.
+  const double determinant = 2.3 * 5.3 - 1;
+  checkClose(candidate.values[0], .2 - .2 * (5.3 + .4) / determinant);
+  checkClose(candidate.values[1], -.1 - .2 * (-1 - .4 * 2.3) / determinant);
+  REQUIRE(update.lastDiagnostics());
+  CHECK(update.lastDiagnostics()->solve.converged);
+}
+
 TEST_CASE("Streaming SR preserves complex Hermitian covariance algebra",
           "[drivers][wftrain][sr]")
 {

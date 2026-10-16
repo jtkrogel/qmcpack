@@ -16,6 +16,7 @@
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
+#include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Utilities/RuntimeOptions.h"
 #include "OhmmsData/Libxml2Doc.h"
@@ -28,6 +29,7 @@
 #endif
 #include <algorithm>
 #include <complex>
+#include <functional>
 #include <limits>
 #include <tuple>
 #include <vector>
@@ -916,6 +918,33 @@ public:
               values[channel].begin() + chunk.descriptor().parameter_offset);
   }
 };
+
+/// Test-only sample collector supports abort injection and callbacks that require an unlocked model.
+class ComplexSampleSink final : public wftrain::SampleProductSink
+{
+public:
+  std::vector<C> values;
+  bool fail_next = false;
+  std::function<void()> callback;
+
+  /// Prepare one scalar per sample, never a score matrix.
+  void onBegin(const wftrain::DerivativeStreamDescriptor& descriptor) override
+  { values.assign(descriptor.sample_count, C{}); }
+
+  /// Observe checked tiles only after the producer has completed and released its model read transaction.
+  void consume(const wftrain::SampleProductTileConstView& tile) override
+  {
+    if (fail_next)
+    {
+      fail_next = false;
+      throw std::runtime_error("injected complex sample sink failure");
+    }
+    if (callback)
+      callback();
+    const auto offset = tile.descriptor().sample_offset - activeDescriptor()->sample_offset;
+    std::copy(tile.values().begin(), tile.values().end(), values.begin() + offset);
+  }
+};
 } // namespace
 
 TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic contractions",
@@ -943,7 +972,7 @@ TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic co
   particles.push_back(clone_p);
   const auto bytes = component.streamingDerivativeRequiredBytes(2);
   const auto lane_bytes = component.streamingDerivativeRequiredBytes(0);
-  CHECK(bytes == lane_bytes + 4 * 2 * 4 * sizeof(double));
+  CHECK(bytes == lane_bytes + 4 * 2 * 4 * sizeof(double) + 2 * sizeof(C));
   for (const auto cap : {std::size_t{0}, bytes - 1, std::numeric_limits<std::size_t>::max()})
     CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 5, cap));
   CHECK_THROWS(component.makeStreamingDerivativeOperator(components, particles, 7, 11, 5));
@@ -954,7 +983,9 @@ TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic co
   CHECK(diagnostic.real_parameter_vectors == 2);
   CHECK(diagnostic.complex_parameter_vectors == 5);
   CHECK(stream->capabilities().maximum_vjp_channels == 3);
-  CHECK_FALSE(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
+  CHECK(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
+  CHECK(stream->capabilities().supports(DerivativeAdjoint::HERMITIAN));
+  CHECK(diagnostic.sample_product_bytes == 2 * sizeof(C));
   CHECK(component.structuredParameterProvider() == &component);
   const auto& schema = stream->parameterSchema();
   std::array<std::vector<C>, 3> coefficients{{{{.3, -.2}, {-.4, .1}},
@@ -1105,6 +1136,167 @@ TEST_CASE("PsiFormer complex stream physical finite differences and concrete fac
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
   CHECK(component.structuredParameterProvider() == &component);
 }
+
+TEST_CASE("PsiFormer complex real-tangent score products preserve phase and both adjoints",
+          "[wavefunction][psiformer][complex_wf][complex_score_products]")
+{
+  using namespace wftrain;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  clone_p.R[1][2] += .037;
+  clone_p.update();
+  PsiFormerComplexWF component("products", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  auto base_clone = component.makeClone(clone_p);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base_clone);
+  const auto original = component.snapshotParameters();
+  const auto& schema = component.parameterSchema();
+  std::vector<C> direction(schema.parameterCount());
+  std::size_t block_index = 0;
+  for (const auto& block : schema.blocks())
+    direction[block.offset] = (++block_index % 2) ? .08 : -.05;
+  const std::array<C, 2> reference{evaluate(component, p), evaluate(clone, clone_p)};
+  std::array<std::array<C, 2>, 2> perturbed;
+  const double epsilon = 2e-5;
+  for (std::size_t sign = 0; sign < 2; ++sign)
+  {
+    auto candidate = component.snapshotParameters();
+    candidate.values = original.values;
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+      candidate.values[parameter] += (sign == 0 ? epsilon : -epsilon) * direction[parameter].real();
+    component.publishParameters(candidate, candidate.version);
+    perturbed[sign] = {evaluate(component, p), evaluate(clone, clone_p)};
+  }
+  auto restored = component.snapshotParameters();
+  restored.values = original.values;
+  component.publishParameters(restored, restored.version);
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  components.push_back(clone);
+  RefVectorWithLeader<ParticleSet> particles(p);
+  particles.push_back(p);
+  particles.push_back(clone_p);
+  const auto bytes = component.streamingDerivativeRequiredBytes(2);
+  auto stream = component.makeBudgetedStreamingDerivativeOperator(components, particles, 3, 7, 5, bytes);
+  const auto storage = stream->storageDiagnostics();
+  const StructuredParameterVectorConstView tangent(schema, stream->parameterVersion(),
+      {direction.data(), direction.size()});
+  ComplexSampleSink samples;
+  stream->applyScoreJVP(tangent, samples);
+  for (std::size_t sample = 0; sample < 2; ++sample)
+    close(samples.values[sample], (std::exp(perturbed[0][sample] - reference[sample]) -
+        std::exp(perturbed[1][sample] - reference[sample])) / (2 * epsilon), 3e-6);
+
+  // Compare the actual neural streaming covariance on a two-direction REAL tangent subspace.
+  std::vector<C> phase_direction(direction.size());
+  for (const auto& block : schema.blocks())
+    if (block.id.find("/w_imag") != std::string::npos)
+      phase_direction[block.offset] = .6;
+  ComplexSampleSink phase_products;
+  stream->applyScoreJVP({schema, stream->parameterVersion(), {phase_direction.data(), phase_direction.size()}},
+                        phase_products);
+  const std::array<double, 2> weights{.4, 1.3};
+  const StochasticReconfigurationBatch batch{stream.get(), {weights.data(), weights.size()}};
+  StochasticReconfigurationOperator covariance(schema, stream->parameterVersion(), {&batch, 1});
+  CHECK(covariance.storageDiagnostics().retained_numeric_bytes ==
+        2 * direction.size() * sizeof(C) + 2 * (sizeof(double) + sizeof(C)));
+  const std::array<const std::vector<C>*, 2> directions{&direction, &phase_direction};
+  const std::array<const std::vector<C>*, 2> products{&samples.values, &phase_products.values};
+  std::array<C, 2> means{};
+  for (std::size_t row = 0; row < 2; ++row)
+    for (std::size_t sample = 0; sample < 2; ++sample)
+      means[row] += weights[sample] * (*products[row])[sample] / 1.7;
+  for (std::size_t column = 0; column < 2; ++column)
+  {
+    std::vector<C> action(direction.size());
+    covariance.apply({schema, stream->parameterVersion(), {directions[column]->data(), direction.size()}},
+                     {action.data(), action.size()});
+    for (std::size_t row = 0; row < 2; ++row)
+    {
+      double dense = 0, actual = 0;
+      for (std::size_t sample = 0; sample < 2; ++sample)
+        dense += weights[sample] * std::real(std::conj((*products[row])[sample] - means[row]) *
+            ((*products[column])[sample] - means[column])) / 1.7;
+      for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+        actual += (*directions[row])[parameter].real() * action[parameter].real();
+      CHECK(actual == Approx(dense).margin(2e-10));
+    }
+  }
+
+  std::array<C, 2> coefficients{{{.3, -.2}, {-.4, .1}}};
+  std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP,
+        {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 3, 7, {coefficients.data(), 2}}, 0},
+      {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP,
+        {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 3, 7, {coefficients.data(), 2}},
+        localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  ComplexStreamingSink transpose, hermitian, conjugated;
+  stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, transpose);
+  stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::HERMITIAN, hermitian);
+  C transpose_dot{}, hermitian_dot{}, transpose_sample_dot{}, hermitian_sample_dot{};
+  for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+  {
+    transpose_dot += direction[parameter].real() * transpose.values[0][parameter];
+    hermitian_dot += direction[parameter].real() * hermitian.values[0][parameter];
+  }
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    transpose_sample_dot += coefficients[sample] * samples.values[sample];
+    hermitian_sample_dot += coefficients[sample] * std::conj(samples.values[sample]);
+  }
+  close(transpose_dot, transpose_sample_dot);
+  close(hermitian_dot, hermitian_sample_dot);
+  for (auto& value : coefficients)
+    value = std::conj(value);
+  stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, conjugated);
+  // Global HERMITIAN capability also covers complete kinetic responses, not only the score metric.
+  for (std::size_t channel = 0; channel < 2; ++channel)
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+      close(hermitian.values[channel][parameter], std::conj(conjugated.values[channel][parameter]));
+  CHECK(stream->storageDiagnostics().retained_numeric_bytes == bytes);
+  CHECK(stream->storageDiagnostics().storage_fingerprint == storage.storage_fingerprint);
+  samples.reset();
+  const C first = direction[0];
+  direction[0] = {0, 1};
+  CHECK_THROWS(stream->applyScoreJVP(tangent, samples));
+  CHECK(samples.state() == DerivativeSinkState::IDLE);
+  direction[0] = first;
+  samples.fail_next = true;
+  CHECK_THROWS(stream->applyScoreJVP(tangent, samples));
+  CHECK(samples.state() == DerivativeSinkState::POISONED);
+  samples.reset();
+  CHECK_NOTHROW(stream->applyScoreJVP(tangent, samples));
+  samples.reset();
+  bool published = false;
+  samples.callback = [&] {
+    if (!published)
+    {
+      // Taking an exclusive publication lease here proves callbacks are outside the model read lock.
+      const auto snapshot = component.snapshotParameters();
+      component.publishParameters(snapshot, snapshot.version);
+      published = true;
+    }
+  };
+  CHECK_NOTHROW(stream->applyScoreJVP(tangent, samples));
+  CHECK(published);
+  samples.callback = {};
+  samples.reset();
+  CHECK_THROWS(stream->applyScoreJVP(tangent, samples));
+  CHECK(samples.state() == DerivativeSinkState::POISONED);
+  auto fresh = component.makeBudgetedStreamingDerivativeOperator(components, particles, 3, 7, 5, bytes);
+  const StructuredParameterVectorConstView fresh_tangent(schema, fresh->parameterVersion(),
+      {direction.data(), direction.size()});
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, ParticleSet::PosType{.007, -.011, .013});
+  clone.ratio(clone_p, 0);
+  samples.reset();
+  CHECK_THROWS(fresh->applyScoreJVP(fresh_tangent, samples));
+  clone.restore(0);
+  clone_p.rejectMove(0);
+  samples.reset();
+  CHECK_NOTHROW(fresh->applyScoreJVP(fresh_tangent, samples));
+}
+
 #ifdef ENABLE_CUDA
 TEST_CASE("PsiFormer complex GPU inference shares one capped lane without CPU tapes",
           "[wavefunction][psiformer][complex_gpu_inference]")

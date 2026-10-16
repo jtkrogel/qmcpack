@@ -26,7 +26,7 @@ CPU learned-phase first-order gate
 The separate training checker generates short actual XML from these fixed-position
 inputs: Gamma Adam and nonzero-twist plainSGD, with scalar optimize=no unchanged.
 Both use the same-sample complete complex Coulomb energy and PATHWISE gradient;
-no SR/JVP/metric/line-search/ECP/GPU training support is inferred. A mandatory
+sample-space/LM/KFAC/line-search/ECP/GPU training support is not inferred. A mandatory
 positive finite maximum_retained_bytes admits exact named derivative/config/batch/
 optimizer storage plus a documented conservative first-order scratch allowance
 BEFORE those owners allocate. It is not a process-peak/RSS or adaptive large-Ne cap.
@@ -38,3 +38,12 @@ unsupported optimizer. Stable physical checkpoint identity excludes parameter
 values/version and pointer addresses. The Native-free complex_training unit case
 checks the complete normalized fixed-sample reweighted objective by finite
 differences, with actual periodic Coulomb H, unequal masses and nonzero outer k.
+
+The separate twisted SR variant binds ONLY the existing positively damped
+parameter-space matrix-free SR, with the same complete PATHWISE force. Complex
+score JVP/Hermitian VJP contractions retain both real and imaginary score
+covariance: the REAL parameter metric is Re Cov(conj(O),O), not density-only.
+It runs two tiny updates with bounded PCG and checks actual imaginary-head change.
+Early admission additionally charges exact covariance arrays plus the existing
+conservative SR solve allowance. No minimum/sample-space SR, trust-norm selection,
+local-energy JVP, new optimizer or GPU training capability is implied.

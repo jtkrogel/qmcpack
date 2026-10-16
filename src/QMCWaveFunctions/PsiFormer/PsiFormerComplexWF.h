@@ -5,7 +5,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexWF.h
  * @brief Native-free paired-head inference sibling with explicit CPU or serialized GPU numerics.
- * CPU first-order structured training is explicit; GPU optimization remains closed.
+ * CPU structured training is explicit; GPU optimization remains closed.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
@@ -46,7 +46,7 @@ public:
   /// Report the explicitly qualified component rather than impersonating the real adapter.
   std::string getClassName() const override { return "PsiFormerComplexWF"; }
 
-  /// Only the CPU sibling participates in qualified structured first-order training.
+  /// Only the CPU sibling participates in qualified structured training.
   wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override
   { return gpuInferenceEnabled() ? nullptr : this; }
 
@@ -63,7 +63,7 @@ public:
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;
 
-  /// Exact two-tape lane plus immutable sample storage, not the inference clone budget.
+  /// Exact two-tape lane plus immutable samples/JVP output, not the inference clone budget.
   std::size_t streamingDerivativeRequiredBytes(std::size_t sample_count) const;
 
   /// Explicit capped numerical binding; the unbudgeted factory remains closed.

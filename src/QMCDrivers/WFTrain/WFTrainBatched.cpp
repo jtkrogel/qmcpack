@@ -1014,13 +1014,16 @@ void WFTrainBatched::process(xmlNodePtr node)
         const auto cap = training_input_.getMaximumRetainedBytes();
         if (complex->gpuInferenceEnabled() || student_prototype_.getOrbitals().size() != 1 ||
             training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
-            (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD) ||
+            (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD &&
+             training_input_.getOptimizer() != O::STOCHASTIC_RECONFIGURATION) ||
+            (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION && training_input_.getDamping() <= 0) ||
             training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
             training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
             training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
-          throw UniformCommunicateError("WFTrainBatched: paired training requires sole CPU ENERGY Adam/plainSGD, "
-              "unclipped fixed step, no metric/selection controls, and positive finite maximum_retained_bytes");
+          throw UniformCommunicateError("WFTrainBatched: paired training requires sole CPU ENERGY Adam/plainSGD "
+              "or positively damped parameter-space SR, unclipped fixed step, no norm/selection controls, "
+              "and positive finite maximum_retained_bytes");
       }
 #endif
     if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY)
@@ -1143,8 +1146,17 @@ void WFTrainBatched::run()
       allowance = checkedMemoryAdd(checkedMemoryMultiply(p,
           12 * sizeof(double) + 3 * sizeof(wftrain::DerivativeValue)),
           checkedMemoryMultiply(checkedMemoryMultiply(2, largest_batch), sizeof(wftrain::DerivativeValue)));
+      std::size_t covariance_bytes = 0;
+      if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
+      {
+        // Existing real-tangent covariance retains two complex P-vectors and copied weights/JVP samples.
+        covariance_bytes = checkedMemoryAdd(checkedMemoryMultiply(checkedMemoryMultiply(2, p),
+            sizeof(wftrain::DerivativeValue)), checkedMemoryMultiply(samples,
+            sizeof(wftrain::DerivativeReal) + sizeof(wftrain::DerivativeValue)));
+        allowance = checkedMemoryAdd(allowance, parameterSpaceSRWorkspaceBytes(p));
+      }
       prospective = checkedMemoryAdd(checkedMemoryAdd(complex_expected_prepared_bytes, configuration_bytes),
-          checkedMemoryAdd(optimizer_bytes, allowance));
+          checkedMemoryAdd(covariance_bytes, checkedMemoryAdd(optimizer_bytes, allowance)));
       complex_physical_identity = complex->trainingConfigurationFingerprint();
     }
     catch (...) { budget_failure = std::current_exception(); }
@@ -1158,7 +1170,7 @@ void WFTrainBatched::run()
     }
     enforceMemoryBudget(*myComm, prospective, training_input_.getMaximumRetainedBytes());
     app_log() << "WFTrain paired CPU prospective named numeric bytes plus allowance=" << prospective
-              << ", conservative first-order allowance=" << allowance
+              << ", conservative snapshot/solve allowance=" << allowance
               << "; excludes shared model, inference clones, opaque ParticleSet caches, allocator/RSS" << std::endl;
   }
 #endif

@@ -22,14 +22,31 @@ def text(dataset):
     return value.decode().rstrip("\x00") if isinstance(value, bytes) else str(value)
 
 
+def envelope(path):
+    """Read canonical values and completed-update identity from one existing envelope."""
+    with h5py.File(path, "r") as archive:
+        root = archive["wftrain_checkpoint"]
+        return (root["model/values"][()].copy(),
+                int(np.asarray(root["coordinator/completed_iterations"][()]).item()))
+
+
 def checkpoint(directory):
     """Read only the root envelope selected by the atomically published manifest."""
     with h5py.File(directory / "checkpoint.manifest.h5", "r") as archive:
         filename = text(archive["wftrain_distributed_manifest/root_envelope_filename"])
-    with h5py.File(directory / filename, "r") as archive:
-        root = archive["wftrain_checkpoint"]
-        return (root["model/values"][()].copy(),
-                int(np.asarray(root["coordinator/completed_iterations"][()]).item()))
+    return envelope(directory / filename)
+
+
+def imaginary_update(first, second):
+    """Assert the FROZEN v1 fixture layout before inspecting its explicit imaginary-head offsets."""
+    # NOT archived block metadata: D16,N4,F256,Na2,4layers. Canonical cusp/envelopes precede w,w_imag.
+    expected_size = 2 + 4 * 64 * 2 + 4 * 256 * 64 + 15 * 256 + 4 * (6 * 256 * 256 + 2 * 256)
+    if first.size != expected_size or second.size != expected_size:
+        raise RuntimeError("Frozen v1 fixture layout changed; imaginary-head offsets need explicit requalification")
+    head, prefix = 256 * 16 * 4, 2 + 4 * (16 * 4) * 2
+    imaginary = np.r_[prefix + head:prefix + 2 * head, prefix + 3 * head:prefix + 4 * head]
+    if not np.isfinite(first).all() or not np.isfinite(second).all() or not np.any(second[imaginary] != first[imaginary]):
+        raise RuntimeError("Missing finite canonical imaginary-head update")
 
 
 def input_xml(source, directory, optimizer, iterations, restart=None, cap=2147483648, wrong_twist=False):
@@ -46,9 +63,12 @@ def input_xml(source, directory, optimizer, iterations, restart=None, cap=214748
                 "maximum_retained_bytes": cap, "checkpoint_path": "checkpoint.manifest.h5"}
     if restart is not None:
         controls["restart_path"] = str(restart.resolve())
+    if optimizer == "sr":
+        controls.update(damping="0.1", maximum_damping_attempts=1, krylov_relative_tolerance="1e-6",
+                        krylov_maximum_iterations=8, krylov_maximum_operator_applications=12)
     for name, value in controls.items():
         ET.SubElement(training, "parameter", name=name).text = str(value)
-    for name, value in {"walkers_per_rank": 1, "crowds": 1, "blocks": 2 if optimizer == "sgd" else 1, "steps": 1,
+    for name, value in {"walkers_per_rank": 1, "crowds": 1, "blocks": 1 if optimizer == "adam" else 2, "steps": 1,
                         "warmupsteps": 0, "substeps": 1, "timestep": "1e-8", "usedrift": "no"}.items():
         ET.SubElement(qmc, "parameter", name=name).text = str(value)
     directory.mkdir()
@@ -87,11 +107,26 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--optimizer", choices=("adam", "sgd"), required=True)
+    parser.add_argument("--optimizer", choices=("adam", "sgd", "sr"), required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="training_", dir=args.output.resolve()))
     binary, source = args.binary.resolve(), args.input.resolve()
+    if args.optimizer == "sr":
+        sr_input = input_xml(source, work / "sr", "sr", 2)
+        run(binary, sr_input)
+        saved = {iteration: values for values, iteration in
+                 (envelope(path) for path in sr_input.parent.glob("checkpoint.manifest.h5*.root.h5"))}
+        if set(saved) != {1, 2}:
+            raise RuntimeError("Expected two completed bounded SR updates")
+        imaginary_update(saved[1], saved[2])
+        history = next(sr_input.parent.glob("complex_cpu_training*.training.csv"))
+        with history.open() as stream:
+            for row in csv.DictReader(stream):
+                if not 0 < int(row["krylov_iterations"]) <= 8 or not 0 < int(row["krylov_operator_applications"]) <= 12:
+                    raise RuntimeError("SR did not use the bounded converged matrix-free solve")
+        print(f"PASS sr: complete pathwise CPU updates, real-tangent metric, imaginary-head change; evidence {work}")
+        return
     first_input = input_xml(source, work / "first", args.optimizer, 1)
     run(binary, first_input)
     first, iterations = checkpoint(first_input.parent)
@@ -125,15 +160,7 @@ def main():
     second, iterations = checkpoint(resumed.parent)
     if iterations != 2 or not np.isfinite(second).all():
         raise RuntimeError("Continuation did not publish its second complete update")
-    # FROZEN v1 FIXTURE OFFSETS, not archived block metadata: D16,N4,F256,Na2,4layers.
-    # Initialization.cpp's canonical cusp2/envelope4*64*2 precedes up/down w,w_imag.
-    expected_size = 2 + 4 * 64 * 2 + 4 * 256 * 64 + 15 * 256 + 4 * (6 * 256 * 256 + 2 * 256)
-    if first.size != expected_size or second.size != expected_size:
-        raise RuntimeError("Frozen v1 fixture layout changed; imaginary-head offsets need explicit requalification")
-    head, prefix = 256 * 16 * 4, 2 + 4 * (16 * 4) * 2
-    imaginary = np.r_[prefix + head:prefix + 2 * head, prefix + 3 * head:prefix + 4 * head]
-    if second.size <= imaginary[-1] or not np.any(second[imaginary] != first[imaginary]):
-        raise RuntimeError("No actual canonical imaginary-head parameter changed")
+    imaginary_update(first, second)
     if args.optimizer == "adam":
         continuous = input_xml(source, work / "continuous", args.optimizer, 2)
         run(binary, continuous)
