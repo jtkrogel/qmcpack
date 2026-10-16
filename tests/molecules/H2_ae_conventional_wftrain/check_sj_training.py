@@ -43,6 +43,10 @@ def main():
     parser.add_argument("fixture", type=Path, nargs="?", default=Path(__file__).with_name("wftrain_sj.xml"))
     parser.add_argument("--restart", action="store_true", help="also require split-run exact continuation")
     parser.add_argument("--preflight", action="store_true", help="also check unsupported model/optimizer rejection")
+    parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
+                        help="second representative optimizer in the main workflow")
+    parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
+                        help="optionally express a paired DETS fixture as one-determinant CSFs")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--ranks", type=int, default=1)
     parser.add_argument("--mpiexec", default="mpirun")
@@ -70,6 +74,20 @@ def main():
         directory = work / label
         directory.mkdir()
         tree = ET.parse(fixture)
+        if args.ci_representation == "csf":
+            expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
+            assert expansion is not None and expansion.get("type") == "DETS", fixture
+            expansion.set("type", "CSF")
+            for old, new in (("nc0", "nca"), ("nc1", "ncb"), ("ne0", "nea"), ("ne1", "neb")):
+                expansion.set(new, expansion.attrib.pop(old))
+            for ordinal, node in enumerate(list(expansion)):
+                alpha, beta = node.get("occ0"), node.get("occ1")
+                csf = ET.Element("csf", id=node.get("id"), coeff=node.get("coeff"),
+                                 occ="".join(str(int(a) + int(b)) for a, b in zip(alpha, beta)),
+                                 exctLvl="0" if ordinal == 0 else "2")
+                ET.SubElement(csf, "det", coeff="1", alpha=alpha, beta=beta)
+                expansion.remove(node)
+                expansion.append(csf)
         tree.find("project").set("id", "sj")
         qmc = tree.find("qmc")
         training = qmc.find("training")
@@ -126,7 +144,10 @@ def main():
             assert float(data[0][header.index("BlockWeight")]) == 2 * args.ranks, path
         models = sorted((directory / "sj.s000.training").rglob("*.parameters.h5"))
         assert len(models) == expected_rows, (directory, models)
-        initial = [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
+        determinant_list = tree.find("wavefunction/determinantset/multideterminant/detlist")
+        linear_nodes = [] if determinant_list is None else list(determinant_list)
+        initial = [float(node.get("coeff")) for node in linear_nodes[1:]]
+        initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    for value in node.text.split()]
         previous = np.asarray(initial)
         fixed = tree.find(".//sposet/coefficient")
@@ -134,7 +155,13 @@ def main():
             with h5py.File(model, "r") as handle:
                 group = handle["conventional_wavefunction"]
                 parameters = np.asarray(group["parameters"][()]).reshape(-1)
-                assert parameters.size == 8 and np.isfinite(parameters).all(), model
+                assert parameters.size == len(initial) and np.isfinite(parameters).all(), model
+                if linear_nodes:
+                    assert parameters.size == len(initial) and parameters.size > len(linear_nodes) - 1
+                    names = [value.decode() if isinstance(value, bytes) else str(value)
+                             for value in np.asarray(group["variable_names"][()]).reshape(-1)]
+                    assert linear_nodes[0].get("id") not in names, model
+                    assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
                 elif restart is None:
@@ -150,6 +177,9 @@ def main():
                 assert coefficients.attrib == fixed.attrib, model
                 assert coefficients.text.split() == fixed.text.split(), model
                 assert all(node.get("optimize") == "no" for node in exported.findall(".//sposet")), model
+                if linear_nodes:
+                    exported_list = exported.find(".//multideterminant/detlist")
+                    assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
         return directory
 
     if args.family_screen:
@@ -212,10 +242,17 @@ def main():
 
     adam = run("adam")
     if args.profile_only:
-        print(f"PASS: bounded SJ Adam/inference {args.ranks} MPI x {args.threads} OpenMP; accepted model export")
+        print(f"PASS: bounded conventional Adam/inference {args.ranks} MPI x {args.threads} OpenMP; accepted model export")
         return
     off = run("adam_no_inference", inference=False)
-    sgd = run("sgd", optimizer="sgd")
+    def companion_controls(tree):
+        if args.companion_optimizer == "sr":
+            limits = {"damping": "0.01", "krylov_maximum_iterations": "32",
+                      "krylov_maximum_operator_applications": "128", "krylov_maximum_seconds": "10",
+                      "krylov_relative_tolerance": "1e-8", "maximum_damping_attempts": "1"}
+            for name, value in limits.items():
+                ET.SubElement(tree.find("qmc/training"), "parameter", name=name).text = value
+    run(args.companion_optimizer, optimizer=args.companion_optimizer, mutate=companion_controls)
     for lhs, rhs in zip(history(adam), history(off)):
         for name in ("iteration", "samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert lhs[name] == rhs[name], (name, lhs[name], rhs[name])
@@ -245,7 +282,7 @@ def main():
             spo.find("coefficient").set("size", "2")
             spo.find("coefficient").text = "0.55 0.55  0.55 -0.55"
         run("reject_active_spo", reject="only fixed-Slater J1/J2 parameters", mutate=enable_orbitals)
-    completed = "Adam/SGD SJ updates, interval inference, frozen Slater, exact inference isolation"
+    completed = f"Adam/{args.companion_optimizer} conventional updates, interval inference, frozen SPO/reference, exact inference isolation"
     if args.restart:
         completed += ", exact split restart"
     if args.preflight:
