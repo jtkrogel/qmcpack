@@ -1349,7 +1349,7 @@ void WFTrainBatched::process(xmlNodePtr node)
       const auto single_determinants = student_prototype_.findSD();
       const auto multideterminants = student_prototype_.findMSD();
       if (single_determinants.size() + multideterminants.size() != 1)
-        throw UniformCommunicateError("Conventional training requires one fixed-orbital single or multideterminant component");
+        throw UniformCommunicateError("Conventional training requires one single-Slater or fixed-orbital multideterminant component");
       if (!multideterminants.empty() &&
           (population_.get_golden_electrons().groups() != 2 || multideterminants[0].get().getDetSize() != 2))
         throw UniformCommunicateError("Conventional coefficient training currently requires two collinear spin groups");
@@ -1358,8 +1358,6 @@ void WFTrainBatched::process(xmlNodePtr node)
           wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
-      if (conventional_binding_->hasOrbitalRotations())
-        throw UniformCommunicateError("Conventional CPU orbital publication awaits the bounded product and live-frame qualification gates");
       const auto& variables = conventional_binding_->adapter().registrationVariables();
       const bool nonlinear_update = optimizer == O::LINEAR_METHOD || optimizer == O::ACCELERATED_LINEAR_METHOD ||
           optimizer == O::PROJECTED_INVERSE_ITERATION || optimizer == O::MINIMUM_PROJECTED_INVERSE_ITERATION;
