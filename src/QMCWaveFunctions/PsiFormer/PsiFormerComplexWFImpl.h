@@ -143,6 +143,9 @@ struct PsiFormerComplexWF::Impl
 
   /// A weak family reference shares scratch without extending its lifetime or creating a cycle.
   struct DerivativeLane;
+#ifdef ENABLE_CUDA
+  struct GpuDerivativeLane;
+#endif
 
   /// Stable shared ownership keeps metadata/executors fixed while canonical values mutate under mutex.
   struct Model
@@ -200,7 +203,186 @@ struct PsiFormerComplexWF::Impl
     std::atomic<std::size_t> pending_proposals{0};
     std::mutex derivative_factory_mutex;
     std::weak_ptr<DerivativeLane> derivative_lane;
+#ifdef ENABLE_CUDA
+    std::weak_ptr<GpuDerivativeLane> gpu_derivative_lane;
+#endif
   };
+
+  /// Fixed ions are part of the captured derivative problem, not an unchecked caller convention.
+  static void validateDerivativeSource(const Model& s)
+  {
+    validateRuntimeLattice(*s.source, s.environment, "Complex PsiFormer derivative source");
+    if (s.source->getTotalNum() != static_cast<int>(s.model.cfg.nuclei.shape[0]) ||
+        s.source->R.size() != s.model.cfg.nuclei.shape[0] || s.source->GroupID.size() != s.source->R.size())
+      throw std::invalid_argument("Complex PsiFormer derivative fixed-source extent mismatch");
+    const auto& species = s.source->getSpeciesSet();
+    const int charge = species.findAttribute("charge");
+    if (charge < 0)
+      throw std::invalid_argument("Complex PsiFormer derivative fixed-source charges are missing");
+    for (int atom = 0; atom < s.source->getTotalNum(); ++atom)
+    {
+      if (s.source->GroupID[atom] < 0 || s.source->GroupID[atom] >= s.source->groups() ||
+          !psiformer::determinant::isFiniteReal(species(charge, s.source->GroupID[atom])) ||
+          species(charge, s.source->GroupID[atom]) != s.model.cfg.charges.x[atom])
+        throw std::invalid_argument("Complex PsiFormer derivative fixed-source charge changed");
+      for (int d = 0; d < 3; ++d)
+        if (!psiformer::determinant::isFiniteReal(s.source->R[atom][d]) ||
+            s.source->R[atom][d] != s.model.cfg.nuclei.x[3 * atom + d])
+          throw std::invalid_argument("Complex PsiFormer derivative fixed-source configuration changed");
+    }
+  }
+
+#ifdef ENABLE_CUDA
+  /// One weakly shared immutable-image derivative lane; ownership keeps borrowed queue/BLAS alive.
+  struct GpuDerivativeLane
+  {
+    using Products = psiformer::device::PreparedDeviceComplexProducts;
+
+    /// Aggregate R(S) permits S>maxB; a single operator is separately restricted to B<=maxB.
+    static PsiFormerComplexWF::GpuDerivativeRequirements required(const Model& state, std::size_t samples,
+        std::size_t maximum_samples, std::size_t targets, std::size_t chunk)
+    {
+      const auto cost = psiformer::device::estimateComplexProductsCost(state.plan, targets, maximum_samples, 3, chunk);
+      const char* message = "Complex GPU derivative bytes overflow";
+      std::size_t host = cost.host_bytes;
+      pf::addStorageBytes(host, pf::checkedStorageBytes<C>(maximum_samples, message), message);
+      pf::addStorageBytes(host, pf::checkedStorageBytes<double>(pf::checkedStorageProduct(4,
+          pf::checkedStorageProduct(samples, state.model.ne, message), message), message), message);
+      auto total = host;
+      pf::addStorageBytes(total, cost.device_bytes, message); // Generic diagnostics sum both domains.
+      return {cost.device_bytes, host, cost.matrix_work};
+    }
+
+    /// Allocate only after both domains and maximum request work have been admitted.
+    GpuDerivativeLane(std::shared_ptr<Model> model, std::size_t maximum_samples, std::size_t targets,
+        std::size_t chunk, const PsiFormerComplexWF::GpuDerivativeRequirements& budget)
+        : state(std::move(model)), maximum_samples(maximum_samples), targets(targets), chunk(chunk),
+          products(Products::prepare(state->gpu->image, targets, maximum_samples, 3, chunk,
+              state->gpu->queue, state->gpu->blas, budget.device_bytes,
+              budget.host_bytes - maximum_samples * sizeof(C), budget.matrix_work)),
+          zeros(maximum_samples), channels(3)
+    {}
+
+    const std::shared_ptr<Model> state;
+    const std::size_t maximum_samples, targets, chunk;
+    const std::unique_ptr<Products> products;
+    const std::vector<C> zeros;
+    std::vector<Products::Channel> channels;
+    std::mutex execution_mutex;
+  };
+
+  /// Immutable HOST samples with no CPU tapes; numerical output remains leased through sink callbacks.
+  struct GpuDerivativeStream final : wftrain::StreamingDerivativeOperator
+  {
+    /// Preserve captured version/schema and bounded snapshot ownership.
+    GpuDerivativeStream(std::shared_ptr<GpuDerivativeLane> scratch, std::size_t ordinal,
+        std::size_t offset, std::size_t samples)
+        : lane(std::move(scratch)), version(lane->state->model.p.version()), ordinal(ordinal), offset(offset),
+          samples(samples), chunks(*lane->state->schema, version, lane->chunk),
+          positions(3 * samples * lane->state->model.ne), inverse_masses(samples * lane->state->model.ne)
+    {}
+
+    /// Only ordinary TRANSPOSE VJPs are qualified; real tangents and HOST complex outputs remain explicit.
+    wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
+    {
+      using namespace wftrain;
+      StreamingDerivativeCapabilities c;
+      c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
+          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
+      c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE);
+      c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+      c.maximum_vjp_channels = 3;
+      c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
+      c.maximum_sample_tile_size = 1;
+      c.fixed_parameter_scratch_vectors = 11; // 2 real P + 8 complex P + bounded conversion chunk.
+      c.block_streaming = true;
+      return c;
+    }
+
+    /// Schema storage is shared with the immutable image's model family.
+    const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override { return *lane->state->schema; }
+
+    /// Requests must use the captured runtime version, not a checkpoint's historical version.
+    std::size_t parameterVersion() const noexcept override { return version; }
+
+    /// Preserve the actual caller batch identity.
+    std::size_t batchOrdinal() const noexcept override { return ordinal; }
+
+    /// Preserve the immutable sample interval origin.
+    std::size_t sampleOffset() const noexcept override { return offset; }
+
+    /// Every prepared operator has a nonempty bounded sample snapshot.
+    std::size_t sampleCount() const noexcept override { return samples; }
+
+    /// Emit canonical block-respecting chunks, never a B by P matrix.
+    const wftrain::ParameterChunkPlan& parameterChunkPlan() const noexcept override { return chunks; }
+
+    /// Sum both domains; aggregate callers deduplicate the shared identity and charge snapshots separately.
+    wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
+    {
+      wftrain::StreamingDerivativeStorageDiagnostics d;
+      const auto& cost = lane->products->cost();
+      d.parameter_count = cost.parameters;
+      d.sample_count = samples;
+      d.real_parameter_vectors = 2;
+      d.complex_parameter_vectors = 8;
+      d.parameter_scratch_bytes = 144 * cost.parameters + 16 * cost.chunk;
+      d.shared_workspace_bytes = cost.device_bytes + cost.host_bytes + lane->zeros.capacity() * sizeof(C);
+      d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
+      d.sample_position_bytes = positions.capacity() * sizeof(double);
+      d.sample_auxiliary_bytes = inverse_masses.capacity() * sizeof(double);
+      d.retained_numeric_bytes = d.shared_workspace_bytes + d.sample_position_bytes + d.sample_auxiliary_bytes;
+      d.shared_workspace_identity = reinterpret_cast<std::uintptr_t>(lane.get());
+      d.allocation_generation = 1;
+      d.storage_fingerprint = lane->products->storageFingerprint();
+      for (const auto* storage : {&positions, &inverse_masses})
+        psiformer::determinant::detail::mixStorage(d.storage_fingerprint, *storage);
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, lane->zeros);
+      return d;
+    }
+
+    /// The interface requires this hook; JVP remains unsupported and absent from capabilities.
+    void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView&,
+        wftrain::SampleProductSink&) const override
+    {
+      throw std::logic_error("Immutable GPU analysis supports only TRANSPOSE VJPs, not score JVP");
+    }
+
+    /// Lease execution before model read; release GPU/model locks BEFORE any caller callback.
+    void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
+        wftrain::DerivativeAdjoint, wftrain::ParameterReductionSink& sink) const override
+    {
+      using namespace wftrain;
+      std::unique_lock execution(lane->execution_mutex);
+      const C* output;
+      {
+        std::unique_lock gpu(lane->state->gpu->mutex);
+        std::shared_lock read(lane->state->mutex);
+        if (version != lane->state->model.p.version() || lane->state->pending_proposals.load(std::memory_order_relaxed))
+          throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
+        validateDerivativeSource(*lane->state);
+        for (auto& channel : lane->channels)
+          channel = {GpuDerivativeLane::Products::Role::SCORE, lane->zeros.data(), samples};
+        for (std::size_t c = 0; c < requested.size(); ++c)
+          lane->channels[c] = {requested[c].product == DerivativeProduct::SCORE_VJP ?
+              GpuDerivativeLane::Products::Role::SCORE : GpuDerivativeLane::Products::Role::KINETIC,
+              requested[c].coefficients.values.data(), samples};
+        lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels);
+        const auto result = lane->products->resultView();
+        lane->products->validate(result);
+        output = result.data;
+      }
+      for (const auto& chunk : chunks.chunks())
+        for (std::size_t c = 0; c < requested.size(); ++c)
+          sink.add(c, {chunk, {output + c * parameterSchema().parameterCount() + chunk.parameter_offset, chunk.count}});
+    }
+
+    const std::shared_ptr<GpuDerivativeLane> lane;
+    const std::size_t version, ordinal, offset, samples;
+    const wftrain::ParameterChunkPlan chunks;
+    std::vector<double> positions, inverse_masses;
+  };
+#endif
 
   /// One leased score tape, one complete kinetic tape, and three fixed complex contractions.
   struct DerivativeLane
@@ -956,21 +1138,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
   if (state->pending_proposals.load(std::memory_order_relaxed))
     throw std::logic_error("Complex PsiFormer derivative preparation requires an idle model family");
   impl_->requireIdle(*impl_->particles);
-  validateRuntimeLattice(*state->source, state->environment, "Complex PsiFormer derivative source");
-  if (state->source->getTotalNum() != static_cast<int>(state->model.cfg.nuclei.shape[0]))
-    throw std::invalid_argument("Complex PsiFormer derivative fixed-source extent mismatch");
-  const auto& species = state->source->getSpeciesSet();
-  const int charge = species.findAttribute("charge");
-  if (charge < 0)
-    throw std::invalid_argument("Complex PsiFormer derivative fixed-source charges are missing");
-  for (int atom = 0; atom < state->source->getTotalNum(); ++atom)
-  {
-    if (species(charge, state->source->GroupID[atom]) != state->model.cfg.charges.x[atom])
-      throw std::invalid_argument("Complex PsiFormer derivative fixed-source charge changed");
-    for (int d = 0; d < 3; ++d)
-      if (state->source->R[atom][d] != state->model.cfg.nuclei.x[3 * atom + d])
-        throw std::invalid_argument("Complex PsiFormer derivative fixed-source configuration changed");
-  }
+  Impl::validateDerivativeSource(*state);
   // No clone, schema, physical mass or coordinate failure may follow numerical lane allocation.
   for (std::size_t sample = 0; sample < samples; ++sample)
   {
@@ -1013,6 +1181,103 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     throw std::logic_error("Complex PsiFormer derivative numeric capacity differs from exact admission");
   state->derivative_lane = lane;
   return result;
+}
+
+/// Checked additional two-domain ownership; generic GPU discovery stays closed.
+PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeRequirements(
+    std::size_t samples, std::size_t maximum_samples, std::size_t targets, std::size_t chunk) const
+{
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    std::shared_lock read(impl_->state->mutex);
+    return Impl::GpuDerivativeLane::required(*impl_->state, samples, maximum_samples, targets, chunk);
+  }
+#endif
+  throw std::logic_error("Explicit GPU derivatives require an immutable GPU inference profile");
+}
+
+/// Admit the actual SOLE TrialWF batch before allocating any derivative numerical ownership.
+std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBudgetedGpuDerivativeOperator(
+    const RefVectorWithLeader<TrialWaveFunction>& wavefunctions,
+    const RefVectorWithLeader<ParticleSet>& particles, std::size_t ordinal, std::size_t offset,
+    std::size_t maximum_samples, std::size_t targets, std::size_t chunk,
+    std::size_t device_cap, std::size_t host_cap, std::size_t work_cap) const
+{
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    const auto state = impl_->state;
+    const auto samples = particles.size(), n = state->model.ne;
+    const auto required = Impl::GpuDerivativeLane::required(*state, samples, maximum_samples, targets, chunk);
+    for (const auto cap : {device_cap, host_cap, work_cap})
+      if (!cap || cap == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("Complex GPU derivatives require positive finite device/host/work caps");
+    if (required.device_bytes > device_cap || required.host_bytes > host_cap || required.matrix_work > work_cap)
+      throw std::length_error("Complex GPU derivatives exceed device/host/work admission before allocation");
+    if (!samples || samples > maximum_samples || wavefunctions.size() != samples ||
+        &particles.getLeader() != impl_->particles || offset > std::numeric_limits<std::size_t>::max() - samples ||
+        wavefunctions.getLeader().getOrbitals().size() != 1 ||
+        wavefunctions.getLeader().getOrbitals()[0].get() != this)
+      throw std::invalid_argument("Complex GPU derivative sole TrialWF leader/extent mismatch");
+    // Never wait on GPU execution while holding the model lock; inference uses the same image/queue.
+    std::unique_lock gpu(state->gpu->mutex);
+    std::shared_lock read(state->mutex);
+    if (state->pending_proposals.load(std::memory_order_relaxed))
+      throw std::logic_error("Complex GPU derivative preparation requires an idle model family");
+    Impl::validateDerivativeSource(*state);
+    for (std::size_t sample = 0; sample < samples; ++sample)
+    {
+      const auto& orbitals = wavefunctions[sample].getOrbitals();
+      const auto* component = orbitals.size() == 1 ? dynamic_cast<const PsiFormerComplexWF*>(orbitals[0].get()) : nullptr;
+      if (!component || component->impl_->state != state || &component->parameterSchema() != state->schema.get())
+        throw std::invalid_argument("Complex GPU derivatives require actual sole same-family TrialWF clones");
+      component->impl_->requireIdle(particles[sample]);
+      const auto& p = particles[sample];
+      if (p.isSpinor() || p.R.size() != n || p.spins.size() != n || p.GroupID.size() != n)
+        throw std::invalid_argument("Complex GPU derivatives require nonspinor physical arrays of extent Ne");
+      const auto& masses = p.get_mass_by_group();
+      if (masses.size() != static_cast<std::size_t>(p.groups()))
+        throw std::invalid_argument("Complex GPU derivative mass extent mismatch");
+      for (const auto mass : masses)
+        if (!psiformer::determinant::isFiniteReal(mass) || mass <= 0 ||
+            !psiformer::determinant::isFiniteReal(1.0 / mass))
+          throw std::invalid_argument("Complex GPU derivatives require positive finite physical masses");
+      for (std::size_t electron = 0; electron < n; ++electron)
+      {
+        if (!psiformer::determinant::isFiniteReal(p.spins[electron]) ||
+            p.GroupID[electron] != (electron < state->model.cfg.nup ? 0 : 1))
+          throw std::invalid_argument("Complex GPU derivative physical spin/group data are invalid");
+        for (int d = 0; d < 3; ++d)
+          if (!psiformer::determinant::isFiniteReal(p.R[electron][d]))
+            throw std::invalid_argument("Complex GPU derivative sample coordinate is nonfinite");
+      }
+    }
+    std::lock_guard preparation(state->derivative_factory_mutex);
+    auto lane = state->gpu_derivative_lane.lock();
+    if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets || lane->chunk != chunk))
+      throw std::invalid_argument("Complex GPU derivative live lane profile mismatch");
+    if (!lane)
+      lane = std::make_shared<Impl::GpuDerivativeLane>(state, maximum_samples, targets, chunk,
+          Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk));
+    auto result = std::make_unique<Impl::GpuDerivativeStream>(lane, ordinal, offset, samples);
+    for (std::size_t sample = 0; sample < samples; ++sample)
+    {
+      const auto& p = particles[sample];
+      for (int group = 0; group < p.groups(); ++group)
+        for (int electron = p.first(group); electron < p.last(group); ++electron)
+          result->inverse_masses[sample * n + electron] = 1.0 / p.get_mass_by_group()[group];
+      for (std::size_t electron = 0; electron < n; ++electron)
+        for (int d = 0; d < 3; ++d)
+          result->positions[3 * (sample * n + electron) + d] = p.R[electron][d];
+    }
+    if (result->storageDiagnostics().retained_numeric_bytes != required.device_bytes + required.host_bytes)
+      throw std::logic_error("Complex GPU derivative numeric capacity differs from exact admission");
+    state->gpu_derivative_lane = lane;
+    return result;
+  }
+#endif
+  throw std::logic_error("Explicit GPU derivatives require an immutable GPU inference profile");
 }
 
 /// Destroy native numerical state only in the sole owner TU.

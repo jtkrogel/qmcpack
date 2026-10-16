@@ -30,6 +30,7 @@
 #endif
 #include <algorithm>
 #include <complex>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -950,6 +951,7 @@ class ComplexStreamingSink final : public wftrain::ParameterReductionSink
 public:
   std::vector<std::vector<C>> values;
   bool fail_next = false;
+  std::function<void()> callback;
 
   /// Allocate only test oracle storage after common request preflight.
   void onBegin(const wftrain::DerivativeStreamDescriptor&, const wftrain::ParameterChunkPlan& plan,
@@ -969,6 +971,8 @@ public:
       fail_next = false;
       throw std::runtime_error("injected complex stream sink failure");
     }
+    if (callback)
+      callback();
     std::copy(chunk.values().begin(), chunk.values().end(),
               values[channel].begin() + chunk.descriptor().parameter_offset);
   }
@@ -1832,4 +1836,210 @@ TEST_CASE("PsiFormer CPU pathwise gradient differentiates the complete reweighte
   PsiFormerComplexWF wrong_twist("pathwise", parameters(), other_p, source, clone_cap, {.18, -.11, .07});
   CHECK(wrong_twist.trainingConfigurationFingerprint() != identity);
 }
+#ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical products",
+          "[wavefunction][psiformer][complex_gpu_derivatives]")
+{
+  using namespace wftrain;
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  {
+    WARN("NOT_RUN: GPU derivative binding requires an available HIP device");
+    return;
+  }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  {
+    WARN("NOT_RUN: GPU derivative binding requires an available CUDA device");
+    return;
+  }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  for (auto* target : {&p, &clone_p})
+  {
+    const int mass = target->getSpeciesSet().findAttribute("mass");
+    target->getSpeciesSet()(mass, 0) = .7;
+    target->getSpeciesSet()(mass, 1) = 1.9;
+    target->resetGroups();
+  }
+  clone_p.R[1][2] += .037;
+  clone_p.update();
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  const std::array<double, 3> twist{.17, -.11, .07};
+  auto owner = std::make_unique<PsiFormerComplexWF>("analysis", parameters(), p, source, clone_cap, twist,
+                                                  64 * 1024 * 1024);
+  auto& component = *owner;
+  trial.addComponent(std::move(owner));
+  auto clone_trial = trial.makeClone(clone_p);
+  RefVectorWithLeader<TrialWaveFunction> trials(trial);
+  trials.push_back(trial);
+  trials.push_back(*clone_trial);
+  RefVectorWithLeader<ParticleSet> particles(p);
+  particles.push_back(p);
+  particles.push_back(clone_p);
+  const auto r0 = component.gpuDerivativeRequirements(0, 2, 3, 7);
+  const auto r2 = component.gpuDerivativeRequirements(2, 2, 3, 7);
+  std::printf("GPU derivative admission R0_device=%zu R0_host=%zu R2_device=%zu R2_host=%zu matrix_work=%zu\n",
+      r0.device_bytes, r0.host_bytes, r2.device_bytes, r2.host_bytes, r2.matrix_work);
+  CHECK(r2.device_bytes == r0.device_bytes);
+  CHECK(r2.host_bytes == r0.host_bytes + 32 * 2 * 4);
+  CHECK(component.gpuDerivativeRequirements(4, 2, 3, 7).host_bytes == r0.host_bytes + 32 * 4 * 4);
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto before = metrics.snapshot();
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes - 1, r2.host_bytes, r2.matrix_work));
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes - 1, r2.matrix_work));
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work - 1));
+  const auto mass = p.getSpeciesSet().findAttribute("mass");
+  p.getSpeciesSet()(mass, 0) = 0;
+  p.resetGroups();
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  p.getSpeciesSet()(mass, 0) = .7;
+  p.resetGroups();
+  p.setSpinor(true);
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  p.setSpinor(false);
+  const auto last_spin = p.spins[3];
+  p.spins.resize(3);
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  p.spins.resize(4);
+  p.spins[3] = last_spin;
+  const auto spin = p.spins[0];
+  p.spins[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  p.spins[0] = spin;
+  const int charge = source.getSpeciesSet().findAttribute("charge");
+  const auto source_charge = source.getSpeciesSet()(charge, 0);
+  const auto source_coordinate = source.R[0][0];
+  for (int field = 0; field < 2; ++field)
+  {
+    auto& scalar = field ? source.R[0][0] : source.getSpeciesSet()(charge, 0);
+    scalar = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+        r2.device_bytes, r2.host_bytes, r2.matrix_work));
+    scalar = field ? source_coordinate : source_charge;
+  }
+  CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+  auto stream = component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work);
+  const auto diagnostic = stream->storageDiagnostics();
+  CHECK(diagnostic.retained_numeric_bytes == r2.device_bytes + r2.host_bytes);
+  CHECK(diagnostic.parameter_scratch_bytes == 144 * component.parameterSchema().parameterCount() + 16 * 7);
+  CHECK(diagnostic.evaluator_workspace_bytes + diagnostic.parameter_scratch_bytes == diagnostic.shared_workspace_bytes);
+  CHECK(diagnostic.shared_workspace_bytes == r0.device_bytes + r0.host_bytes);
+  CHECK_FALSE(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
+  CHECK_FALSE(stream->capabilities().supports(DerivativeAdjoint::HERMITIAN));
+  CHECK(component.structuredParameterProvider() == nullptr);
+  const auto snapshot = component.snapshotParameters();
+  CHECK_THROWS(component.publishParameters(snapshot, snapshot.version));
+
+  // The independently qualified CPU two-tape owner supplies complete complex rows, not Re-only forces.
+  PsiFormerComplexWF cpu("analysis", parameters(), p, source, clone_cap, twist);
+  auto cpu_clone = cpu.makeClone(clone_p);
+  RefVectorWithLeader<WaveFunctionComponent> components(cpu);
+  components.push_back(cpu);
+  components.push_back(*cpu_clone);
+  auto oracle = cpu.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 7,
+      cpu.streamingDerivativeRequiredBytes(2));
+  CHECK_THROWS(cpu.gpuDerivativeRequirements(2, 2, 3, 7));
+  const auto& schema = stream->parameterSchema();
+  std::array<std::vector<C>, 3> coefficients{{{{.3, -.2}, {-.4, .1}},
+      {{.7, .15}, {.2, -.35}}, {{-.6, .4}, {.8, -.1}}}};
+  std::array<VJPCoefficientChannel, 3> channels;
+  for (std::size_t c = 0; c < channels.size(); ++c)
+    channels[c] = {c == 0 ? "score0" : c == 1 ? "kinetic" : "score2",
+        c == 1 ? DerivativeProduct::LOCAL_ENERGY_VJP : DerivativeProduct::SCORE_VJP,
+        {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 7, 11,
+          {coefficients[c].data(), 2}}, c == 1 ? localEnergyTermBit(LocalEnergyTerm::KINETIC) : 0};
+  ComplexStreamingSink expected, actual;
+  oracle->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
+  // Live coordinates may change after capture; callbacks may safely re-enter ordinary GPU inference.
+  p.R[0][0] += .019;
+  p.update();
+  bool callback_ran = false;
+  actual.callback = [&] {
+    if (!callback_ran)
+    {
+      callback_ran = true;
+      evaluate(component, p);
+    }
+  };
+  const auto warm = metrics.snapshot();
+  stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  CHECK(callback_ran);
+  for (std::size_t c = 0; c < 3; ++c)
+    for (std::size_t parameter = 0; parameter < schema.parameterCount(); ++parameter)
+      close(actual.values[c][parameter], expected.values[c][parameter], 3e-9);
+  actual.reset();
+  stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::TRANSPOSE, actual);
+  for (std::size_t parameter = 0; parameter < schema.parameterCount(); ++parameter)
+    close(actual.values[0][parameter], expected.values[0][parameter], 3e-9);
+  CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+  CHECK(metrics.snapshot().free_calls == warm.free_calls);
+  CHECK(stream->storageDiagnostics().storage_fingerprint == diagnostic.storage_fingerprint);
+  auto second = component.makeBudgetedGpuDerivativeOperator(trials, particles, 8, 13, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work);
+  CHECK(second->storageDiagnostics().shared_workspace_identity == diagnostic.shared_workspace_identity);
+  CHECK(second->storageDiagnostics().retained_numeric_bytes + diagnostic.retained_numeric_bytes -
+      diagnostic.shared_workspace_bytes == r0.device_bytes + r0.host_bytes + 32 * 4 * 4);
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 2, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  actual.reset();
+  actual.fail_next = true;
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  CHECK(actual.state() == DerivativeSinkState::POISONED);
+  actual.reset();
+  CHECK_NOTHROW(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  actual.reset();
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::HERMITIAN, actual));
+  CHECK(actual.state() == DerivativeSinkState::IDLE);
+  channels[1].local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  channels[1].local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  ++channels[0].coefficients.parameter_version;
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  --channels[0].coefficients.parameter_version;
+  const auto finite_coefficient = coefficients[0][1];
+  coefficients[0][1] = {std::numeric_limits<double>::infinity(), 0};
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  coefficients[0][1] = finite_coefficient;
+  const auto source_position = source.R[0];
+  source.R[0][0] += .01;
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  source.R[0] = source_position;
+  for (int field = 0; field < 2; ++field)
+  {
+    auto& scalar = field ? source.R[0][0] : source.getSpeciesSet()(charge, 0);
+    scalar = std::numeric_limits<double>::quiet_NaN();
+    actual.reset();
+    CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+    scalar = field ? source_coordinate : source_charge;
+  }
+  actual.reset();
+  p.makeMove(0, ParticleSet::PosType{.01, 0, 0});
+  component.ratio(p, 0);
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  component.restore(0);
+  p.rejectMove(0);
+  actual.reset();
+  CHECK_NOTHROW(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  trial.addComponent(component.makeClone(p));
+  CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+}
+#endif
 } // namespace qmcplusplus

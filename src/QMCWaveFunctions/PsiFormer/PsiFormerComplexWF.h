@@ -18,6 +18,7 @@
 
 namespace qmcplusplus
 {
+class TrialWaveFunction;
 namespace psiformer
 {
 struct InitializedPsiFormerParameters;
@@ -73,6 +74,23 @@ public:
       const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal,
       std::size_t sample_offset, std::size_t maximum_parameter_chunk_size,
       std::size_t maximum_numeric_bytes) const;
+
+  /// Additional derivative ownership only; excludes admitted inference/image/vendor and caller coefficients.
+  struct GpuDerivativeRequirements
+  {
+    std::size_t device_bytes, host_bytes, matrix_work;
+  };
+
+  /// Aggregate R(S), including S>maxB: one shared lane plus HOST snapshots; individual operators require B<=maxB.
+  GpuDerivativeRequirements gpuDerivativeRequirements(std::size_t sample_count,
+      std::size_t maximum_batch_samples, std::size_t targets, std::size_t chunk) const;
+
+  /// Immutable analysis only: actual sole TrialWF clones, TRANSPOSE SCORE/complete physical dK, no training discovery.
+  std::unique_ptr<wftrain::StreamingDerivativeOperator> makeBudgetedGpuDerivativeOperator(
+      const RefVectorWithLeader<TrialWaveFunction>& wavefunctions,
+      const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal, std::size_t sample_offset,
+      std::size_t maximum_batch_samples, std::size_t targets, std::size_t chunk,
+      std::size_t maximum_device_bytes, std::size_t maximum_host_bytes, std::size_t maximum_matrix_work) const;
 
   /// This component supplies the complete antisymmetric fermionic ansatz.
   bool isFermionic() const override { return true; }

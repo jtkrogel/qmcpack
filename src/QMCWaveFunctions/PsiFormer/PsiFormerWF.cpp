@@ -37,8 +37,10 @@
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDevicePcg.h"
 #ifdef QMC_COMPLEX
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexProducts.h"
 #endif
 #endif
+#include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Message/Communicate.h"
 #include "Particle/MCMultiParticleMoves.h"
 #include "Particle/VirtualParticleSet.h"
