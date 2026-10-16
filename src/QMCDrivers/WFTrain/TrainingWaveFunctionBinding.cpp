@@ -10,6 +10,7 @@
 #include "Particle/ParticleSet.h"
 #include "Particle/DistanceTable.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "io/hdf/hdf_archive.h"
 #include <exception>
@@ -97,12 +98,18 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
       adapter_("conventional", prototype, options)
 {
   prototype.validatePreparedJastrowActivation(prototype);
+  multideterminant_ = !prototype.findMSD().empty();
+  const auto& variables = adapter_.registrationVariables();
+  for (std::size_t i = 0; i < variables.size(); ++i)
+    if (variables.where(i) >= 0 &&
+        (variables.getType(i) == optimize::SPO_P || variables.getType(i) == optimize::BACKFLOW_P))
+      throw std::invalid_argument("Conventional coefficient training requires frozen orbitals and no backflow");
   if (auto* node = prototype.getNode())
   {
     external_assets_ = hasExternalAssets(node);
     std::set<std::string> definitions, references;
     collectSPOBindings(node, definitions, references);
-    inline_spos_ = prototype.findSD().empty() || !definitions.empty();
+    inline_spos_ = (prototype.findSD().empty() && !multideterminant_) || !definitions.empty();
     for (const auto& reference : references)
       inline_spos_ = inline_spos_ && definitions.count(reference) != 0;
     xmlBufferPtr xml = xmlBufferCreate();
@@ -177,11 +184,18 @@ void TrainingWaveFunctionBinding::attachLive(TrialWaveFunction& wf, ParticleSet&
 std::unique_ptr<TrialWaveFunction> TrainingWaveFunctionBinding::makeCandidate(
     ParticleSet& particles, const StructuredParameterSnapshot& snapshot) const
 {
+  auto candidate = makePrivateClone(particles);
+  adapter_.installSnapshot(*candidate, particles, snapshot);
+  return candidate;
+}
+std::unique_ptr<TrialWaveFunction> TrainingWaveFunctionBinding::makePrivateClone(ParticleSet& particles) const
+{
   const int tables = particles.getNumDistTables();
   auto candidate = prototype_.makeClone(particles);
   if (particles.getNumDistTables() != tables)
     throw std::logic_error("Conventional candidate changed distance-table topology");
-  adapter_.installSnapshot(*candidate, particles, snapshot);
+  for (auto& determinant : candidate->findMSD())
+    determinant.get().isolateOptimizationState();
   return candidate;
 }
 std::size_t TrainingWaveFunctionBinding::publishParameters(
@@ -189,6 +203,8 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
 {
   std::vector<std::unique_ptr<TrialWaveFunction>> prepared;
   std::vector<std::vector<std::size_t>> component_indices;
+  using CoefficientBank = std::pair<MultiSlaterDetTableMethod*, const MultiSlaterDetTableMethod*>;
+  std::vector<std::vector<CoefficientBank>> coefficient_banks;
   std::optional<StructuredParameterSnapshot> detached;
   std::exception_ptr failure;
   try
@@ -202,6 +218,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
     detached.emplace(candidate);
     prepared.reserve(live_.size());
     component_indices.reserve(live_.size());
+    coefficient_banks.reserve(live_.size());
     for (const auto& [wf, particles] : live_)
     {
       // Only sampled walker configurations are numerical admission points. The
@@ -225,8 +242,23 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
       auto replacement = wf->makeClone(*particles);
       if (particles->getNumDistTables() != tables)
         throw std::logic_error("Conventional replacement changed live distance-table topology");
+      for (auto& determinant : replacement->findMSD())
+        determinant.get().isolateOptimizationState();
       adapter_.resetPrivateParameters(*replacement, candidate);
       component_indices.push_back(wf->validatePreparedJastrowActivation(*replacement));
+      // Keep MSD/Phi/C2node/cache identities live. Every accepted clone adopts
+      // the same immutable canonical coefficient bank after collective readiness.
+      const auto canonical = (prepared.empty() ? *replacement : *prepared.front()).findMSD();
+      const auto targets = wf->findMSD();
+      if (canonical.size() != targets.size())
+        throw std::logic_error("Conventional coefficient-bank topology mismatch");
+      coefficient_banks.emplace_back();
+      coefficient_banks.back().reserve(targets.size());
+      for (std::size_t i = 0; i < targets.size(); ++i)
+      {
+        targets[i].get().validatePreparedCoefficientState(canonical[i].get());
+        coefficient_banks.back().emplace_back(&targets[i].get(), &canonical[i].get());
+      }
       prepared.push_back(std::move(replacement));
     }
   }
@@ -243,7 +275,11 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
   // The driver must immediately refresh live value/VGL caches.
   const auto version = adapter_.commitPreparedParameters(std::move(*detached));
   for (std::size_t i = 0; i < live_.size(); ++i)
+  {
     live_[i].first->activatePreparedJastrows(*prepared[i], component_indices[i]);
+    for (const auto& [target, bank] : coefficient_banks[i])
+      target->adoptPreparedCoefficientState(*bank);
+  }
   return version;
 }
 
@@ -279,7 +315,8 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   output.write(indices, "active_indices");
   output.write(fixed_values, "registration_values");
   output.write(definition_, "wavefunction_xml");
-  output.write(std::string("conventional-fixed-slater-j1-j2-v1"), "completion_cookie");
+  output.write(std::string(multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
+                                           : "conventional-fixed-slater-j1-j2-v1"), "completion_cookie");
   output.pop();
   output.flush();
 }
@@ -306,7 +343,9 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
   input.read(types, "variable_types");
   input.read(indices, "active_indices");
   input.read(values, "registration_values");
-  if (version != std::vector<int>{1, 0, 0} || cookie != "conventional-fixed-slater-j1-j2-v1" ||
+  const std::string expected_cookie = multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
+                                                       : "conventional-fixed-slater-j1-j2-v1";
+  if (version != std::vector<int>{1, 0, 0} || cookie != expected_cookie ||
       fingerprint != parameterSchema().fingerprint() || provider != parameterSchema().providerId() ||
       definition != definition_ || identity != modelIdentity() || physical != physical_definition_)
     throw std::runtime_error("Conventional model export identity mismatch");
@@ -355,7 +394,7 @@ std::string TrainingWaveFunctionBinding::modelIdentity() const
     mix(value.str());
   }
   std::ostringstream identity;
-  identity << "conventional-inline-sj-v1:" << std::hex << hash;
+  identity << (multideterminant_ ? "conventional-inline-mdj-v1:" : "conventional-inline-sj-v1:") << std::hex << hash;
   return identity.str();
 }
 }

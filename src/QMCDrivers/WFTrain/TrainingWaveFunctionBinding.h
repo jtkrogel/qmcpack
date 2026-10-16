@@ -15,7 +15,7 @@ namespace qmcplusplus
 class QMCHamiltonian;
 namespace wftrain
 {
-/** Driver-owned CPU binding for the first fixed-Slater J1/J2 training profile.
+/** Driver-owned CPU binding for fixed-orbital conventional J1/J2 training.
  * All fallible model resets occur in private objects, followed by collective
  * readiness and no-throw component swaps. Post-commit live cache refresh remains
  * a fatal boundary: it cannot roll back arbitrary legacy evaluations.
@@ -33,6 +33,8 @@ public:
   /// Prepare candidate validation against every current population configuration.
   void setHamiltonian(QMCHamiltonian& hamiltonian);
   std::unique_ptr<TrialWaveFunction> makeCandidate(ParticleSet&, const StructuredParameterSnapshot&) const;
+  /// Clone and detach mutable CI banks before any variable registration/reset.
+  std::unique_ptr<TrialWaveFunction> makePrivateClone(ParticleSet&) const;
   LegacyWaveFunctionAdapter& adapter() noexcept { return adapter_; }
   void exportModel(const std::filesystem::path&) const;
   StructuredParameterSnapshot readModel(const std::filesystem::path&) const;
@@ -49,6 +51,7 @@ private:
   std::string definition_;
   bool external_assets_ = false;
   bool inline_spos_ = true;
+  bool multideterminant_ = false;
   std::string physical_definition_;
 };
 }

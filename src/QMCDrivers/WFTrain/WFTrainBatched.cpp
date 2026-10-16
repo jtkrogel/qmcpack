@@ -98,8 +98,8 @@ struct ConventionalReplayWorker
 {
   std::unique_ptr<ParticleSet> particles;
   std::unique_ptr<TrialWaveFunction> wavefunction;
-  ConventionalReplayWorker(TrialWaveFunction& prototype, const ParticleSet& source)
-      : particles(std::make_unique<ParticleSet>(source)), wavefunction(prototype.makeClone(*particles))
+  ConventionalReplayWorker(const wftrain::TrainingWaveFunctionBinding& binding, const ParticleSet& source)
+      : particles(std::make_unique<ParticleSet>(source)), wavefunction(binding.makePrivateClone(*particles))
   {}
 };
 
@@ -2212,7 +2212,7 @@ void WFTrainBatched::run()
           if (conventional_binding_)
           {
             conventional_worker = std::make_shared<ConventionalReplayWorker>(
-                student_prototype_, population_.get_golden_electrons());
+                *conventional_binding_, population_.get_golden_electrons());
             conventional_parameters = std::make_shared<const wftrain::StructuredParameterSnapshot>(
                 selected_provider_->snapshotParameters());
           }
