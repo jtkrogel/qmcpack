@@ -31,7 +31,7 @@ public:
   std::size_t publishParameters(const StructuredParameterSnapshot&, std::size_t expected_version) override;
   void attachLive(TrialWaveFunction&, ParticleSet&);
   /// Prepare candidate validation against every current population configuration.
-  void setHamiltonian(QMCHamiltonian& hamiltonian) noexcept { hamiltonian_ = &hamiltonian; }
+  void setHamiltonian(QMCHamiltonian& hamiltonian);
   std::unique_ptr<TrialWaveFunction> makeCandidate(ParticleSet&, const StructuredParameterSnapshot&) const;
   LegacyWaveFunctionAdapter& adapter() noexcept { return adapter_; }
   void exportModel(const std::filesystem::path&) const;
@@ -41,12 +41,15 @@ public:
 
 private:
   TrialWaveFunction& prototype_;
+  ParticleSet& prototype_particles_;
   Communicate& communicator_;
   LegacyWaveFunctionAdapter adapter_;
   QMCHamiltonian* hamiltonian_ = nullptr;
   std::vector<std::pair<TrialWaveFunction*, ParticleSet*>> live_;
   std::string definition_;
   bool external_assets_ = false;
+  bool inline_spos_ = true;
+  std::string physical_definition_;
 };
 }
 }

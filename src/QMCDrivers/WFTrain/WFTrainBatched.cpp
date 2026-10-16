@@ -1332,6 +1332,8 @@ void WFTrainBatched::process(xmlNodePtr node)
         throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY Adam/plain SGD with fixed-Slater J1/J2");
       if (!training_input_.getLegacyMaximumParameters() || !training_input_.getLegacyDerivativeScratchBytes())
         throw UniformCommunicateError("Conventional training requires positive legacy_maximum_parameters and legacy_derivative_scratch_bytes");
+      if (training_input_.getWeightDecay() != 0)
+        throw UniformCommunicateError("Conventional training has no neural-weight decay blocks; weight_decay must be zero");
       if (population_.get_golden_electrons().getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
         throw UniformCommunicateError("Conventional training currently requires CPU particle coordinates");
 #ifdef QMC_COMPLEX
