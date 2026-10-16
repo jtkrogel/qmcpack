@@ -34,6 +34,8 @@ struct DeviceExecutionPreparation
   std::size_t retained_coordinate_workspace_budget_bytes = 0;
   /// Optional standalone per-crowd injected-native-draw sampler owner, not an aggregate cap.
   std::size_t metropolis_workspace_budget_bytes = 0;
+  /// Explicit drift additions only: retained VALUE delta, reverse and Green buffer.
+  std::size_t metropolis_drift_budget_bytes = 0;
   /// Optional per-rank optimizer recurrence scratch; not provider/crowd storage.
   std::size_t adam_workspace_budget_bytes = 0;
   /// Opt-in work/memory selection; resolved VGL is reselected for each actual B.

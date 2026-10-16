@@ -25,12 +25,13 @@ inline bool metropolisLogComparison(double log_uniform, double log_acceptance) n
 /// Generate all coordinates without touching the accepted source.
 Error launchMetropolisProposal(Stream stream, std::size_t population, std::size_t electrons,
     const double* accepted, const double* gaussian, const double* inverse_mass, double tau,
-    double* proposed, std::uint64_t* status);
+    double* proposed, std::uint64_t* status, bool physical_displacement = false);
 
-/// Consume one admitted VALUE microtile before the graph is reused.
+/// Consume a VALUE microtile; optional loggb/loggf arrays require offset=0, seed=false and extent=2*count.
 Error launchMetropolisStageValues(Stream stream, std::size_t count, std::size_t offset, bool seed,
     const double* phase, const double* logabs, const double* accepted_log,
-    double* staged_phase, double* staged_log, double* log_acceptance, std::uint32_t* mask, std::uint64_t* status);
+    double* staged_phase, double* staged_log, double* log_acceptance, std::uint32_t* mask, std::uint64_t* status,
+    const double* green_correction = nullptr);
 
 /// Merge rejections into staging; accepted coordinates/cache remain read-only.
 Error launchMetropolisResolve(Stream stream, std::size_t population, std::size_t electrons,

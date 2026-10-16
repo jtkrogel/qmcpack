@@ -453,17 +453,21 @@ public:
                        ParticleSet::ParticleLaplacian& laplacian) override;
 
   /// Query the explicitly enabled resolved GPU sampler, rejecting hard-plan overlap.
-  bool deviceDriftFreeSamplingEnabled() const;
+  bool deviceSamplingEnabled() const;
+
+  /// Require the native usedrift flag to match the explicitly prepared drift profile.
+  bool deviceSamplingUsesDrift() const;
 
   /// Query the GPU-only per-optimizer Adam budget without exposing a model image.
   std::size_t deviceAdamBudget() const;
 
   /// Advance injected native-engine substeps; host full VGL must follow before use.
-  std::pair<std::size_t, std::size_t> mw_advanceDeviceDriftFree(
+  std::pair<std::size_t, std::size_t> mw_advanceDeviceSampling(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
       const std::function<void(std::vector<double>&)>& gaussian_draw,
-      const std::function<double()>& uniform_draw) const;
+      const std::function<double()>& uniform_draw, bool use_drift,
+      const std::function<void(double, const double*, double*)>& drift) const;
 
   /// Evaluate complete VGL data through one direct crowd batch boundary.
   void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,

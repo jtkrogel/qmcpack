@@ -41,7 +41,7 @@ const PsiFormerWF* deviceSamplingComponent(const TrialWaveFunction& wavefunction
   const PsiFormerWF* selected = nullptr;
   for (const auto& orbital : wavefunction.getOrbitals())
     if (const auto* component = dynamic_cast<const PsiFormerWF*>(orbital.get());
-        component && component->deviceDriftFreeSamplingEnabled())
+        component && component->deviceSamplingEnabled())
       selected = component;
   if (selected && wavefunction.getOrbitals().size() != 1)
     throw UniformCommunicateError("Explicit device sampling requires exactly one PsiFormer wavefunction factor.");
@@ -85,10 +85,11 @@ void VMCBatchedSampling::validateMoveConfiguration(const VMCDriverInput& input,
                                                    const TrialWaveFunction& wavefunction,
                                                    bool serializing_crowd_walkers)
 {
-  if (deviceSamplingComponent(wavefunction) &&
-      (input.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON || input.get_use_drift() ||
+  if (const auto* sampler = deviceSamplingComponent(wavefunction); sampler &&
+      (input.get_move_kind() != VMCDriverInput::MoveKind::ALL_ELECTRON ||
+       input.get_use_drift() != sampler->deviceSamplingUsesDrift() ||
        electrons.isSpinor() || serializing_crowd_walkers))
-    throw UniformCommunicateError("Explicit device sampling requires move=alle, usedrift=no, POS and batched crowds.");
+    throw UniformCommunicateError("Explicit device sampling requires move=alle, matching usedrift profile, POS and batched crowds.");
   if (input.get_move_kind() == VMCDriverInput::MoveKind::PBYP)
     return;
   if (serializing_crowd_walkers)
@@ -154,10 +155,19 @@ void VMCBatchedSampling::advanceWalkers(const State& sft,
         components.push_back(*wavefunction.getOrbitals()[0]);
       }
       const RefVectorWithLeader<WaveFunctionComponent> component_list(components[0], components);
-      const auto counts = sampler->mw_advanceDeviceDriftFree(component_list, walker_elecs,
+      const auto counts = sampler->mw_advanceDeviceSampling(component_list, walker_elecs,
           sft.qmcdrv_input.get_tau(), sft.qmcdrv_input.get_sub_steps(),
           [&](std::vector<double>& gaussian) { makeGaussRandomWithEngine(gaussian, random_generator); },
-          [&]() { return random_generator(); });
+          [&]() { return random_generator(); }, use_drift,
+          [&](double variance, const double* gradient, double* result) {
+            ParticleSet::PosType drift;
+            QMCTraits::GradType native_gradient;
+            for (std::size_t d = 0; d < 3; ++d)
+              native_gradient[d] = gradient[d];
+            sft.drift_modifier.getDrift(variance, native_gradient, drift);
+            for (std::size_t d = 0; d < 3; ++d)
+              result[d] = drift[d];
+          });
       for (std::size_t count = 0; count < counts.first; ++count)
         crowd.incAccept();
       for (std::size_t count = 0; count < counts.second; ++count)

@@ -4,7 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerDeviceMetropolis.h
- * @brief Injected-draw, real/open drift-free whole-system Metropolis state.
+ * @brief Injected-draw real/open whole-system Metropolis, with opt-in native host drift.
  * The borrowed VALUE graph and queue MUST outlive this noncopyable owner. Callers
  * hold their existing model/crowd execution lease, exclude competing graph work
  * and publication during a request, and keep the owning device current. This is
@@ -15,9 +15,37 @@
 
 #include "PsiFormerDeviceInference.h"
 #include "PsiFormerDeviceMetropolisKernels.h"
+#include "PsiFormerDeviceCoordinateGradient.h"
+
+#include <functional>
 
 namespace qmcplusplus::psiformer::device
 {
+/// Borrow the native configured host drift policy; arguments are variance, G, drift.
+using NativeDriftCallback = std::function<void(double, const double*, double*)>;
+
+/// Drift additions charge retained VALUE, no-P reverse and device Green correction.
+inline CoordinateGradientCost estimateMetropolisDriftCost(const PsiFormerExecutionPlan& plan,
+    std::size_t capacity, std::size_t population)
+{
+  auto cost = estimateCoordinateGradientCost(plan, capacity);
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Metropolis drift byte overflow");
+  };
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Metropolis drift extent overflow");
+  };
+  if (!population)
+    throw std::invalid_argument("Metropolis drift requires a population");
+  cost.device_workspace_bytes = add(cost.device_workspace_bytes,
+      add(estimateRetainedValueIncrementBytes(plan, capacity), checkedDeviceBytes<double>(mul(2, population))));
+  // Two population G caches, displacement, microtile G scratch, masses and Green sums.
+  cost.host_workspace_bytes = add(cost.host_workspace_bytes, checkedDeviceBytes<double>(add(
+      mul(add(mul(3, population), capacity), mul(3, plan.modelShape().electrons())),
+      add(mul(3, population), plan.modelShape().electrons()))));
+  return cost;
+}
+
 /// Exact standalone numeric storage; borrowed graph/model/vendor bytes are excluded.
 struct MetropolisCost
 {
@@ -99,6 +127,42 @@ public:
     return std::unique_ptr<PreparedDeviceMetropolis>(new PreparedDeviceMetropolis(graph, queue, cost, positions, inverse_mass));
   }
 
+  /// Admit additions before reverse/cache allocation; caller already admitted the VALUE upgrade.
+  static std::unique_ptr<PreparedDeviceMetropolis> prepareDrift(PreparedDeviceInference& graph,
+      compute::Queue<PlatformKind::CUDA>& queue, const std::vector<double>& positions,
+      const std::vector<double>& inverse_mass, std::size_t owner_budget, std::size_t drift_budget,
+      NativeDriftCallback drift)
+  {
+    const auto cost = estimateMetropolisDriftCost(graph.plan_, graph.batch_capacity_,
+        positions.size() / (3 * graph.plan_.modelShape().electrons()));
+    if (!drift || !drift_budget || drift_budget == std::numeric_limits<std::size_t>::max() ||
+        !graph.retained_backflow_.capacity())
+      throw std::invalid_argument("Explicit drift needs a native policy, finite cap and retained VALUE graph");
+    if (cost.device_workspace_bytes > drift_budget)
+      throw std::length_error("Metropolis drift additions exceed per-crowd device budget");
+    auto result = prepare(graph, queue, positions, inverse_mass, owner_budget);
+    result->gradient_ = PreparedDeviceCoordinateGradient::prepare(graph.model_, graph.batch_capacity_, queue, graph.blas_,
+        estimateCoordinateGradientCost(graph.plan_, graph.batch_capacity_).device_workspace_bytes);
+    result->gradient_version_ = graph.model_->version();
+    result->drift_ = std::move(drift);
+    result->drift_masses_ = inverse_mass;
+    for (auto* buffer : {&result->accepted_gradient_, &result->staged_gradient_, &result->displacement_})
+      buffer->resize(positions.size());
+    result->gradient_scratch_.resize(graph.batch_capacity_ * 3 * graph.plan_.modelShape().electrons());
+    result->forward_green_.resize(result->cost_.population);
+    result->host_green_.resize(2 * result->cost_.population);
+    result->green_.reserve(2 * result->cost_.population);
+    auto host_bytes = result->gradient_->hostWorkspaceBytes();
+    for (const auto* buffer : {&result->accepted_gradient_, &result->staged_gradient_, &result->displacement_,
+        &result->gradient_scratch_, &result->drift_masses_, &result->forward_green_, &result->host_green_})
+      host_bytes = spatial_detail::checkedAdd(host_bytes, checkedDeviceBytes<double>(buffer->capacity()),
+                                             "Metropolis drift host capacity overflow");
+    if (host_bytes != cost.host_workspace_bytes)
+      throw std::logic_error("Metropolis drift host capacities differ from exact preparation accounting");
+    result->refreshAccepted(graph.model_->version());
+    return result;
+  }
+
   /// Preserve borrowed references and source identity by forbidding copies.
   PreparedDeviceMetropolis(const PreparedDeviceMetropolis&) = delete;
 
@@ -108,6 +172,15 @@ public:
   /// Report checked standalone allocation and host-mask capacities.
   const MetropolisCost& cost() const noexcept { return cost_; }
 
+  /// Bind only the current request's native callback; never retain an older caller closure for use.
+  void bindNativeDriftPolicy(NativeDriftCallback drift)
+  {
+    std::lock_guard lock(mutex_);
+    if (!gradient_ || !drift || pending_)
+      throw std::invalid_argument("Native drift policy requires a prepared coordinate reverse owner");
+    drift_ = std::move(drift);
+  }
+
   /// Recompute accepted values after an explicitly rebound parameter image.
   /// Coordinates survive a failed refresh, but no old cache is current afterward.
   void refreshAccepted(std::size_t version)
@@ -116,8 +189,15 @@ public:
     abortPending();
     cache_valid_ = false;
     validateGraph(version);
+    if (gradient_ && gradient_version_ != version)
+    {
+      gradient_->rebindModel(graph_.model_);
+      gradient_version_ = version;
+    }
     stageValues(*accepted_, true);
     std::swap(accepted_cache_, staged_cache_);
+    if (gradient_)
+      accepted_gradient_.swap(staged_gradient_);
     cache_version_ = version;
     cache_generation_ = accepted_->state_->generation;
     cache_valid_ = true;
@@ -139,19 +219,32 @@ public:
         throw std::invalid_argument("Device Metropolis Gaussian draw is nonfinite");
     try
     {
-      gaussian_.upload(gaussian.data(), gaussian.size());
+      if (gradient_)
+        formDisplacement(gaussian, tau);
+      gaussian_.upload(gradient_ ? displacement_.data() : gaussian.data(), gaussian.size());
       {
         std::scoped_lock sources(accepted_->state_->mutex, proposed_->state_->mutex);
         beginMutation(*proposed_->state_);
         resetStatus();
         checkRuntime(launchMetropolisProposal(queue_.getNative(), cost_.population, cost_.electrons,
             accepted_->state_->positions.data(), gaussian_.data(), inverse_mass_.data(), tau,
-            proposed_->state_->positions.data(), status_.data()), "Metropolis proposal");
+            proposed_->state_->positions.data(), status_.data(), bool(gradient_)), "Metropolis proposal");
         admitStatus();
         proposed_->state_->live = cost_.population;
         proposed_->state_->ready = true;
       }
       stageValues(*proposed_, false);
+      if (gradient_)
+      {
+        formGreenCorrection(tau);
+        green_.upload(host_green_.data(), host_green_.size());
+        resetStatus();
+        checkRuntime(launchMetropolisStageValues(queue_.getNative(), cost_.population, 0, false,
+            staged_cache_->phase.data(), staged_cache_->logabs.data(), accepted_cache_->logabs.data(),
+            staged_cache_->phase.data(), staged_cache_->logabs.data(), log_acceptance_.data(), mask_.data(),
+            status_.data(), green_.data()), "Metropolis native Green correction");
+        admitStatus();
+      }
       mask_.download(host_mask_.data(), cost_.population);
       pending_ = true;
       MetropolisProposal token;
@@ -203,6 +296,11 @@ public:
       admitStatus();
       mask_.download(host_mask_.data(), cost_.population);
       // No fallible numerical work follows this publication boundary.
+      if (gradient_)
+        for (std::size_t walker = 0; walker < cost_.population; ++walker)
+          if (host_mask_[walker] & METROPOLIS_ACCEPTED)
+            std::copy_n(staged_gradient_.data() + walker * 3 * cost_.electrons, 3 * cost_.electrons,
+                        accepted_gradient_.data() + walker * 3 * cost_.electrons);
       accepted_->state_->ready = false;
       ++accepted_->state_->generation;
       proposed_->state_->ready = true;
@@ -256,6 +354,51 @@ public:
   }
 
 private:
+  /// Apply the native host policy and retain forward Green sums in physical electron order.
+  void formDisplacement(const std::vector<double>& gaussian, double tau)
+  {
+    std::fill(forward_green_.begin(), forward_green_.end(), 0);
+    for (std::size_t walker = 0; walker < cost_.population; ++walker)
+      for (std::size_t electron = 0; electron < cost_.electrons; ++electron)
+      {
+        const auto index = (walker * cost_.electrons + electron) * 3;
+        const double variance = tau * drift_masses_[electron];
+        if (!device_math::isFiniteBinary64(variance) || variance <= 0)
+          throw std::invalid_argument("Metropolis drift variance is not finite and positive");
+        double drift[3], g[3];
+        drift_(variance, accepted_gradient_.data() + index, drift);
+        for (std::size_t d = 0; d < 3; ++d)
+        {
+          g[d] = std::sqrt(variance) * gaussian[index + d];
+          displacement_[index + d] = g[d] + drift[d];
+        }
+        forward_green_[walker] -= (g[0]*g[0] + g[1]*g[1] + g[2]*g[2]) / (2 * variance);
+      }
+  }
+
+  /// Reverse native Green sum uses D+d_proposed, never a reimplemented drift limiter.
+  void formGreenCorrection(double tau)
+  {
+    for (std::size_t walker = 0; walker < cost_.population; ++walker)
+    {
+      double backward = 0;
+      for (std::size_t electron = 0; electron < cost_.electrons; ++electron)
+      {
+        const auto index = (walker * cost_.electrons + electron) * 3;
+        const double variance = tau * drift_masses_[electron];
+        double drift[3], residual[3];
+        drift_(variance, staged_gradient_.data() + index, drift);
+        for (std::size_t d = 0; d < 3; ++d)
+          residual[d] = displacement_[index + d] + drift[d];
+        backward -= (residual[0]*residual[0] + residual[1]*residual[1] + residual[2]*residual[2]) / (2 * variance);
+      }
+      host_green_[walker] = backward;
+      host_green_[cost_.population + walker] = forward_green_[walker];
+      if (!device_math::isFiniteBinary64(backward) || !device_math::isFiniteBinary64(forward_green_[walker]))
+        throw std::runtime_error("Metropolis native Green correction is nonfinite");
+    }
+  }
+
   /// Allocate only after full admission; seed cache work is cold, not a hidden proposal.
   PreparedDeviceMetropolis(PreparedDeviceInference& graph, compute::Queue<PlatformKind::CUDA>& queue,
       MetropolisCost cost, const std::vector<double>& positions, const std::vector<double>& inverse_mass)
@@ -352,6 +495,14 @@ private:
     {
       const auto count = std::min(graph_.batch_capacity_, cost_.population - offset);
       graph_.evaluateDeviceCoordinates(source.view(offset, count));
+      if (gradient_)
+      {
+        gradient_->reverse(graph_); // Any unavailable channel aborts; no node isolation/fallback.
+        gradient_scratch_.resize(count * 3 * cost_.electrons);
+        gradient_->downloadGradient(gradient_scratch_);
+        std::copy(gradient_scratch_.begin(), gradient_scratch_.end(),
+                  staged_gradient_.begin() + offset * 3 * cost_.electrons);
+      }
       if (!graph_.result_valid_ || graph_.batch_ != count)
         throw std::logic_error("Metropolis VALUE microtile did not publish its complete live result");
       checkRuntime(launchMetropolisStageValues(queue_.getNative(), count, offset, seed,
@@ -370,6 +521,12 @@ private:
   DeviceBuffer<std::uint32_t> mask_;
   DeviceBuffer<std::uint64_t> status_;
   std::vector<std::uint32_t> host_mask_;
+  std::unique_ptr<PreparedDeviceCoordinateGradient> gradient_;
+  NativeDriftCallback drift_;
+  std::size_t gradient_version_ = 0;
+  DeviceBuffer<double> green_;
+  std::vector<double> accepted_gradient_, staged_gradient_, gradient_scratch_, displacement_, drift_masses_;
+  std::vector<double> forward_green_, host_green_;
   mutable std::mutex mutex_;
   std::size_t cache_version_ = 0, cache_generation_ = 0;
   bool cache_valid_ = false, pending_ = false;

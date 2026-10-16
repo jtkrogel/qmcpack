@@ -80,6 +80,8 @@ public:
     }
     // Both graphs belong to the same metadata family. These host-only rebinds
     // invalidate old products without reallocating any prepared device storage.
+    // A failed retained-VALUE upgrade may leave values_ absent; a sampler retry
+    // rebuilds it using the newly rebound image before attempting acquisition.
     if (values_)
       values_->rebindModel(image);
     if (spatial_)
@@ -177,6 +179,8 @@ public:
       // must know that earlier work exists before it enters poison/recovery.
       try
       {
+        if (!values_ || !spatial_)
+          throw std::logic_error("Numerical dispatch has incomplete graphs after failed preparation; rebuild before retry");
         if (event.operation == PsiFormerAcceleratorOperation::VGL)
         {
           evaluateGraph(*spatial_);
@@ -287,13 +291,28 @@ private:
     }
   }
 
+  /// Upgrade only the existing VALUE graph after the backend admits all drift additions.
+  void retainValueTape()
+  {
+    if (retain_values_)
+      return;
+    if (acquired_ || mixed_parameters_)
+      throw std::logic_error("Drift VALUE upgrade needs released FP64 resources");
+    last_graph_ = nullptr;
+    ready_ = false;
+    values_.reset(); // Never overlap ordinary and retained VALUE graphs.
+    values_ = std::make_unique<PreparedDeviceInference>(image_, capacity_, queue_, blas_, SpatialJetMode::VALUE_ONLY, true);
+    retain_values_ = true;
+  }
+
   /// Allocate all crowd scratch/staging before any request can borrow it.
   void prepare(std::size_t capacity)
   {
     if (acquired_ || capacity == 0)
       throw std::logic_error("Numerical crowd preparation requires released positive capacity");
     validateDeviceExecutionPreparation(image_->plan(), {target_preparation_, {}}, capacity);
-    auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY);
+    auto values = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_, SpatialJetMode::VALUE_ONLY,
+        retain_values_);
     auto spatial = std::make_unique<PreparedDeviceInference>(image_, capacity, queue_, blas_,
         SpatialJetMode::FULL_VGL, false, false, configuredInferenceStatusPolicy(), target_preparation_);
     if (mixed_parameters_)
@@ -369,6 +388,7 @@ private:
   compute::Queue<PlatformKind::CUDA> queue_;
   AcceleratorBlasHandle blas_;
   std::unique_ptr<PreparedDeviceInference> values_, spatial_;
+  bool retain_values_ = false;
   PreparedDeviceInference* last_graph_ = nullptr;
   std::vector<double> positions_, phases_, jets_, ratios_;
   const std::vector<double>* source_ = nullptr;

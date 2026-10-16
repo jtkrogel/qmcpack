@@ -89,6 +89,7 @@ target_link_libraries(psiformer_device_runtime_validation PRIVATE psiformer_devi
 # the production QMC application and its intentionally disabled device policy.
 add_executable(psiformer_device_model_validation EXCLUDE_FROM_ALL
                PsiFormerDeviceModelValidation.cu
+               ../../../QMCDrivers/GreenFunctionModifiers/DriftModifierUNR.cpp
                ../../../Utilities/StdRandom.cpp
                ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
                ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
@@ -103,6 +104,7 @@ endif()
 target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio)
 target_include_directories(psiformer_device_model_validation PRIVATE
                            "${qmcpack_SOURCE_DIR}/src/Containers"
+                           "${qmcpack_SOURCE_DIR}/src/QMCDrivers"
                            "${qmcpack_SOURCE_DIR}/src/Particle")
 if(NOT QMC_CUDA2HIP AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
   # Native RNG headers transitively include mpi3's annotated host/device lambda.

@@ -8,6 +8,7 @@
 #include "PsiFormerDeviceMetropolis.h"
 #include "PsiFormerDeviceBatchBackend.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerValueExecutor.h"
+#include "QMCDrivers/GreenFunctionModifiers/DriftModifierUNR.h"
 #include "Particle/ParticleBase/RandomSeqGenerator.h"
 #include "Utilities/RandomGenerator.h"
 #include <iostream>
@@ -17,7 +18,8 @@ namespace qmcplusplus::psiformer::device
 {
 /// Compare the production adapter's masks/draw mapping with copied native engines.
 template<class Model>
-void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image)
+void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const PreparedDeviceModel>& image,
+                                     bool use_drift = false)
 {
   const auto ne = image->plan().modelShape().electrons(), stride = 3 * ne;
   int ordinal = -1;
@@ -27,6 +29,25 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
   checkRuntime(cudaGetDevice(&ordinal), "Native sampler validation device");
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
+  DriftModifierUNR policy(.37); // Exercise the actual nondefault native limiter, not a copied formula.
+  const NativeDriftCallback drift = [&](double variance, const double* gradient, double* result) {
+    DriftModifierUNR::GradType g;
+    DriftModifierUNR::PosType d;
+    for (std::size_t xyz = 0; xyz < 3; ++xyz)
+      g[xyz] = gradient[xyz];
+    policy.getDrift(variance, g, d);
+    for (std::size_t xyz = 0; xyz < 3; ++xyz)
+      result[xyz] = d[xyz];
+  };
+  for (const double scale : {0., 1.e-20, 100.})
+  {
+    const double g[3]{scale, -scale, scale};
+    double d[3];
+    drift(.02, g, d);
+    for (const auto value : d)
+      if (!device_math::isFiniteBinary64(value) || (scale == 0 && value != 0))
+        throw std::runtime_error("Native UNR zero/small/large-gradient callback failed");
+  }
   for (const auto population : {std::size_t{1}, std::size_t{5}})
   {
     std::vector<double> positions(population * stride), masses(ne, 1), exported(positions.size());
@@ -37,7 +58,9 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
       masses[electron] = .8 + .13 * electron;
     const auto cost = estimateMetropolisCost(population, ne);
     DeviceExecutionPreparation preparation;
-    preparation.metropolis_workspace_budget_bytes = cost.device_bytes - 1;
+    const auto drift_cost = estimateMetropolisDriftCost(image->plan(), 2, population);
+    preparation.metropolis_workspace_budget_bytes = cost.device_bytes - !use_drift;
+    preparation.metropolis_drift_budget_bytes = use_drift ? drift_cost.device_workspace_bytes - 1 : 0;
     PreparedDeviceBatchBackend under_budget(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation);
     auto rejected_workspace = under_budget.prepare(2);
     std::size_t draw_calls = 0;
@@ -48,22 +71,30 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
     try
     {
       under_budget.advanceMetropolis(*rejected_workspace, positions, masses, .02, 2, image->version(),
-                                    gaussian_probe, uniform_probe, exported);
+                                    gaussian_probe, uniform_probe, exported, {}, use_drift, drift);
     }
     catch (const std::length_error&) { rejected = true; }
     if (!rejected || draw_calls || metrics.snapshot().allocation_calls != rejected_before.allocation_calls)
       throw std::runtime_error("Production sampler budget rejection consumed native draws");
     preparation.metropolis_workspace_budget_bytes = cost.device_bytes;
+    preparation.metropolis_drift_budget_bytes = use_drift ? drift_cost.device_workspace_bytes : 0;
     PreparedDeviceBatchBackend backend(image, {}, PsiFormerPrecisionPolicy::FP64_REFERENCE, preparation);
     auto workspace = backend.prepare(2);
     Model reference(model);
     auto cpu = std::make_unique<pf::DirectValueExecutor>(reference, image->plan());
     auto cpu_workspace = cpu->makeWorkspace();
+    const auto gradient_at = [&](const double* coordinates) {
+      pf::DirectSpatialExecutor spatial(reference, *cpu, image->plan());
+      auto workspace = spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+      workspace->setPositions(pf::GeometryPositionView::interleaved(coordinates, ne));
+      const auto result = spatial.evaluateFull(*workspace);
+      return std::vector<double>(result.gradient.data(), result.gradient.data() + stride);
+    };
     auto expected_positions = positions;
     std::vector<double> expected_proposal(positions.size());
     std::vector<std::uint32_t> expected_mask(population);
     RandomGenerator cpu_rng(413), gpu_rng(cpu_rng);
-    std::size_t cpu_calls = 0, gpu_calls = 0, compared_masks = 0;
+    std::size_t cpu_calls = 0, gpu_calls = 0, compared_masks = 0, accepted_masks = 0, rejected_masks = 0;
     auto cpu_draw = [&]() { ++cpu_calls; return cpu_rng(); };
     auto gpu_draw = [&]() { ++gpu_calls; return gpu_rng(); };
     const double tau = .02;
@@ -71,12 +102,26 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
       std::vector<TinyVector<double, 3>> native_gaussian(population * ne);
       makeGaussRandomWithEngine(native_gaussian, cpu_draw);
       makeGaussRandomWithEngine(actual, gpu_draw);
+      std::vector<double> old_gradient(positions.size()), displacement(positions.size());
+      if (use_drift)
+        for (std::size_t walker = 0; walker < population; ++walker)
+        {
+          const auto g = gradient_at(expected_positions.data() + walker * stride);
+          std::copy(g.begin(), g.end(), old_gradient.begin() + walker * stride);
+        }
       for (std::size_t coordinate = 0; coordinate < actual.size(); ++coordinate)
       {
         if (actual[coordinate] != native_gaussian[coordinate / 3][coordinate % 3])
           throw std::runtime_error("Production sampler changed native Gaussian flattening");
-        expected_proposal[coordinate] = expected_positions[coordinate] +
-            std::sqrt(tau * masses[(coordinate / 3) % ne]) * actual[coordinate];
+        displacement[coordinate] = std::sqrt(tau * masses[(coordinate / 3) % ne]) * actual[coordinate];
+        if (use_drift)
+        {
+          const auto begin = coordinate / 3 * 3;
+          double d[3];
+          drift(tau * masses[(coordinate / 3) % ne], old_gradient.data() + begin, d);
+          displacement[coordinate] += d[coordinate % 3];
+        }
+        expected_proposal[coordinate] = expected_positions[coordinate] + displacement[coordinate];
       }
       for (std::size_t walker = 0; walker < population; ++walker)
       {
@@ -84,7 +129,28 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
         const auto old_value = cpu->evaluate(*cpu_workspace);
         cpu_workspace->setPositions(pf::GeometryPositionView::interleaved(expected_proposal.data() + walker * stride, ne));
         const auto proposed = cpu->evaluate(*cpu_workspace);
-        const double alpha = 2 * (proposed.logabs - old_value.logabs);
+        double gf = 0, gb = 0;
+        if (use_drift)
+        {
+          const auto g = gradient_at(expected_proposal.data() + walker * stride);
+          for (std::size_t electron = 0; electron < ne; ++electron)
+          {
+            const auto index = walker * stride + electron * 3;
+            const double variance = tau * masses[electron];
+            TinyVector<double, 3> reverse, gaussian_displacement;
+            double d[3];
+            drift(variance, g.data() + electron * 3, d);
+            for (std::size_t xyz = 0; xyz < 3; ++xyz)
+            {
+              gaussian_displacement[xyz] = std::sqrt(variance) * actual[index + xyz];
+              reverse[xyz] = displacement[index + xyz] + d[xyz];
+            }
+            gf -= dot(gaussian_displacement, gaussian_displacement) / (2 * variance);
+            gb -= dot(reverse, reverse) / (2 * variance);
+          }
+        }
+        const double alpha = use_drift ? 2 * (proposed.logabs - old_value.logabs) + gb - gf
+                                       : 2 * (proposed.logabs - old_value.logabs);
         bool take = false;
         if (proposed.sign != 0 && device_math::isFiniteBinary64(alpha))
         {
@@ -102,16 +168,22 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
       gpu_rng.write(gpu_state);
       if (actual != expected_mask || cpu_calls != gpu_calls || cpu_state.str() != gpu_state.str())
         throw std::runtime_error("Production sampler masks/draws/final native engine differ");
+      for (const auto mask : actual)
+        (mask & METROPOLIS_ACCEPTED ? accepted_masks : rejected_masks)++;
       ++compared_masks;
     };
     // Cold seed, then warm replay with persistent positions and the same graph.
     for (std::size_t request = 0; request < 2; ++request)
     {
       const auto before = metrics.snapshot();
-      backend.advanceMetropolis(*workspace, positions, masses, tau, 2, image->version(), gaussian, gpu_draw, exported, observe);
+      backend.advanceMetropolis(*workspace, positions, masses, tau, 2, image->version(), gaussian, gpu_draw, exported,
+                                observe, use_drift, drift);
       const auto after = metrics.snapshot();
       if (request && (before.allocation_calls != after.allocation_calls || before.free_calls != after.free_calls))
         throw std::runtime_error("Production sampler warm replay allocated device storage");
+      if (!request && after.live_bytes - before.live_bytes != cost.device_bytes +
+          (use_drift ? drift_cost.device_workspace_bytes : 0))
+        throw std::runtime_error("Production sampler exact admission disagrees with actual allocation delta");
       for (std::size_t coordinate = 0; coordinate < positions.size(); ++coordinate)
         if (std::abs(exported[coordinate] - expected_positions[coordinate]) > 2.e-14)
           throw std::runtime_error("Production sampler accepted physical coordinates differ");
@@ -123,10 +195,53 @@ void validateNativeMetropolisAdapter(Model& model, const std::shared_ptr<const P
     cpu = std::make_unique<pf::DirectValueExecutor>(reference, image->plan());
     cpu_workspace = cpu->makeWorkspace();
     backend.advanceMetropolis(*workspace, positions, masses, tau, 2, image->version() + 1,
-                             gaussian, gpu_draw, exported, observe);
-    if (compared_masks != 6)
+                             gaussian, gpu_draw, exported, observe, use_drift, drift);
+    if (use_drift)
+    {
+      // Recreate derived device caches from accepted host coordinates, retaining native RNG state.
+      positions = exported;
+      workspace.reset();
+      workspace = backend.prepare(2);
+      backend.advanceMetropolis(*workspace, positions, masses, tau, 2, image->version() + 1,
+                                gaussian, gpu_draw, exported, observe, true, drift);
+    }
+    if (compared_masks != (use_drift ? 8 : 6))
       throw std::runtime_error("Production sampler did not qualify every substep mask");
+    if (use_drift)
+    {
+      // A late native-policy failure must not publish caller coordinates or draw uniforms.
+      const auto saved = exported;
+      std::size_t policy_calls = 0;
+      draw_calls = 0;
+      const auto zeros = [&](std::vector<double>& g) { ++draw_calls; std::fill(g.begin(), g.end(), 0); };
+      const NativeDriftCallback failing_policy = [&](double variance, const double* g, double* d) {
+        if (++policy_calls > population * ne)
+          throw std::runtime_error("Injected late native drift failure");
+        drift(variance, g, d);
+      };
+      bool failed = false;
+      try { backend.advanceMetropolis(*workspace, positions, masses, tau, 1, image->version() + 1,
+          zeros, uniform_probe, exported, {}, true, failing_policy); }
+      catch (const std::runtime_error&) { failed = true; }
+      if (!failed || exported != saved || draw_calls != 1)
+        throw std::runtime_error("Drift failure partially published or consumed uniforms");
+
+      // An unavailable seed gradient fails before any native Gaussian/uniform draw.
+      auto coalesced = positions;
+      std::copy_n(model.cfg.nuclei.x.data(), 3, coalesced.data());
+      draw_calls = 0;
+      failed = false;
+      try { backend.advanceMetropolis(*workspace, coalesced, masses, tau, 1, image->version() + 1,
+          zeros, uniform_probe, exported, {}, true, drift); }
+      catch (const std::runtime_error&) { failed = true; }
+      if (!failed || draw_calls || exported != saved)
+        throw std::runtime_error("Unavailable seed gradient was not a before-draw failclosed rejection");
+      backend.advanceMetropolis(*workspace, positions, masses, tau, 1, image->version() + 1,
+                                zeros, uniform_probe, exported, {}, true, drift);
+    }
     std::cout << "PASS native-engine sampler adapter: B=" << population
+              << " usedrift=" << use_drift << " drift_UNR_a=.37"
+              << " accepted=" << accepted_masks << " rejected=" << rejected_masks
               << " VALUE_capacity=2 substeps=2 requests=3 masks=" << compared_masks
               << " native_draws=" << gpu_calls << " final_engine=identical successor_refresh=yes\n";
   }
@@ -380,6 +495,7 @@ void validateDeviceMetropolis(Model& model, const std::shared_ptr<const Prepared
             << " measured_status_mask_D2H_bytes=" << total_download_bytes
             << " transfer_counter_scope=device_wide; XML/RNG/Hamiltonian NOT_INTEGRATED\n";
   validateNativeMetropolisAdapter(model, image);
+  validateNativeMetropolisAdapter(model, image, true);
 }
 } // namespace qmcplusplus::psiformer::device
 #endif

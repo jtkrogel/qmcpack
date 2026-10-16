@@ -21,13 +21,13 @@ __device__ void fail(std::uint64_t* status, std::size_t index, unsigned code)
 
 /// Apply the drift-free species-mass diffusion law to one packed coordinate.
 __global__ void propose(std::size_t count, std::size_t ne, const double* accepted, const double* gaussian,
-    const double* inverse_mass, double tau, double* proposed, std::uint64_t* status)
+    const double* inverse_mass, double tau, double* proposed, std::uint64_t* status, bool physical_displacement)
 {
   const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count)
     return;
   const double variance = tau * inverse_mass[(index / 3) % ne];
-  const double result = accepted[index] + sqrt(variance) * gaussian[index];
+  const double result = accepted[index] + (physical_displacement ? gaussian[index] : sqrt(variance) * gaussian[index]);
   proposed[index] = result;
   if (!device_math::isFiniteBinary64(variance) || variance <= 0 || !device_math::isFiniteBinary64(result))
     fail(status, index, 1);
@@ -36,7 +36,7 @@ __global__ void propose(std::size_t count, std::size_t ne, const double* accepte
 /// Treat exact nodes per walker; other invalid VALUE outputs are fatal admission errors.
 __global__ void stage(std::size_t count, std::size_t offset, bool seed, const double* phase,
     const double* logabs, const double* accepted_log, double* staged_phase, double* staged_log,
-    double* log_acceptance, std::uint32_t* mask, std::uint64_t* status)
+    double* log_acceptance, std::uint32_t* mask, std::uint64_t* status, const double* green_correction)
 {
   const auto local = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (local >= count)
@@ -66,7 +66,11 @@ __global__ void stage(std::size_t count, std::size_t offset, bool seed, const do
   }
   if (!seed)
   {
-    const double acceptance = 2 * (value - accepted_log[walker]);
+    const double acceptance = green_correction ? 2 * (value - accepted_log[walker]) + green_correction[walker] -
+                                                   green_correction[count + walker]
+                                              : 2 * (value - accepted_log[walker]);
+    if (green_correction && !device_math::isFiniteBinary64(acceptance))
+      fail(status, walker, 5);
     log_acceptance[walker] = acceptance;
     // Native collective VMC consumes uniforms only for finite log acceptance.
     if (device_math::isFiniteBinary64(acceptance))
@@ -127,26 +131,30 @@ Error launched()
 /// Launch checked coordinate staging, never an accepted-state update.
 Error launchMetropolisProposal(Stream stream, std::size_t population, std::size_t electrons,
     const double* accepted, const double* gaussian, const double* inverse_mass, double tau,
-    double* proposed, std::uint64_t* status)
+    double* proposed, std::uint64_t* status, bool physical_displacement)
 {
   if (!population || !electrons || population > std::numeric_limits<std::size_t>::max() / 3 / electrons ||
       !accepted || !gaussian || !inverse_mass || !proposed || !status)
     throw std::invalid_argument("Metropolis proposal has invalid extent or device storage");
   const auto count = population * electrons * 3;
-  propose<<<blocks(count), 128, 0, stream>>>(count, electrons, accepted, gaussian, inverse_mass, tau, proposed, status);
+  propose<<<blocks(count), 128, 0, stream>>>(count, electrons, accepted, gaussian, inverse_mass, tau, proposed, status,
+      physical_displacement);
   return launched();
 }
 
 /// Launch immediate VALUE consumption with explicit full-population destination offset.
 Error launchMetropolisStageValues(Stream stream, std::size_t count, std::size_t offset, bool seed,
     const double* phase, const double* logabs, const double* accepted_log,
-    double* staged_phase, double* staged_log, double* log_acceptance, std::uint32_t* mask, std::uint64_t* status)
+    double* staged_phase, double* staged_log, double* log_acceptance, std::uint32_t* mask, std::uint64_t* status,
+    const double* green_correction)
 {
+  if (green_correction && (offset != 0 || seed))
+    throw std::invalid_argument("Metropolis Green correction requires a whole-population non-seed stage");
   if (offset > std::numeric_limits<std::size_t>::max() - count || !phase || !logabs || !accepted_log ||
       !staged_phase || !staged_log || !log_acceptance || !mask || !status)
     throw std::invalid_argument("Metropolis VALUE staging has invalid extent or device storage");
   stage<<<blocks(count), 128, 0, stream>>>(count, offset, seed, phase, logabs, accepted_log,
-      staged_phase, staged_log, log_acceptance, mask, status);
+      staged_phase, staged_log, log_acceptance, mask, status, green_correction);
   return launched();
 }
 

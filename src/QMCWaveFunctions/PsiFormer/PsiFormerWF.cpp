@@ -954,6 +954,9 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
   const auto retained_coordinates = positive("PSIFORMER_GPU_RETAINED_COORDINATE_BYTES");
   const auto metropolis = positive("PSIFORMER_GPU_METROPOLIS_BYTES");
+  const auto metropolis_drift = positive("PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES");
+  if (metropolis_drift && !metropolis)
+    throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES requires PSIFORMER_GPU_METROPOLIS_BYTES");
   const auto adam = [&]() -> std::size_t {
     const char* value = std::getenv("PSIFORMER_GPU_ADAM_BYTES");
     if (!value || !*value)
@@ -979,11 +982,12 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   psiformer::device::DeviceExecutionPreparation preparation;
   preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
   preparation.metropolis_workspace_budget_bytes = metropolis;
+  preparation.metropolis_drift_budget_bytes = metropolis_drift;
   preparation.adam_workspace_budget_bytes = adam;
   preparation.select_vgl_targets = select_vgl;
   preparation.select_kinetic_targets = select_kinetic;
   if (metropolis && plan.environment().boundary != psiformer::BoundaryCondition::OPEN)
-    throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open drift-free sampling");
+    throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_BYTES requires real/open sampling");
   if (vgl || select_vgl)
     preparation.vgl = {vgl, bytes, work};
   if (kinetic || select_kinetic)
@@ -11846,7 +11850,7 @@ std::size_t PsiFormerWF::deviceAdamBudget() const
 }
 
 /// Query only the resolved GPU profile; CPU never reads GPU sampler controls.
-bool PsiFormerWF::deviceDriftFreeSamplingEnabled() const
+bool PsiFormerWF::deviceSamplingEnabled() const
 {
 #ifdef ENABLE_CUDA
   const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
@@ -11865,15 +11869,29 @@ bool PsiFormerWF::deviceDriftFreeSamplingEnabled() const
   return false;
 }
 
-/// Keep sampler graph/model leases inside the native acquired crowd boundary.
-std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceDriftFree(
+/// Report only the resolved GPU drift profile; CPU never reads GPU environment controls.
+bool PsiFormerWF::deviceSamplingUsesDrift() const
+{
+#ifdef ENABLE_CUDA
+  const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
+      model_state_->numerical_tile_backend.get());
+  return backend && backend->metropolisDriftBudget();
+#else
+  return false;
+#endif
+}
+
+/// Pass the actual driver drift flag and configured native callback into the leased bridge.
+std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceSampling(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list, double tau, std::size_t substeps,
     const std::function<void(std::vector<double>&)>& gaussian_draw,
-    const std::function<double()>& uniform_draw) const
+    const std::function<double()>& uniform_draw, bool use_drift,
+    const std::function<void(double, const double*, double*)>& drift) const
 {
 #ifdef ENABLE_CUDA
-  if (!deviceDriftFreeSamplingEnabled() || wfc_list.size() != p_list.size() || wfc_list.empty())
+  if (!deviceSamplingEnabled() || wfc_list.size() != p_list.size() || wfc_list.empty() ||
+      use_drift != deviceSamplingUsesDrift() || (use_drift && !drift))
     throw std::invalid_argument("Device sampling needs an enabled, nonempty homogeneous crowd");
   auto& resource = requireMultiWalkerResource(wfc_list);
   PsiFormerReadTransaction transaction(*model_state_);
@@ -11885,7 +11903,7 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceDriftFree(
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
   {
     const auto& component = wfc_list.getCastedElement<PsiFormerWF>(walker);
-    component.requireNoSelectedParticleProposal("device drift-free sampling");
+    component.requireNoSelectedParticleProposal("device sampling");
     if (component.model_state_.get() != model_state_.get() || component.batch_execution_plan_ ||
         p_list[walker].getTotalNum() != ne || p_list[walker].isSpinor() || p_list[walker].getActivePtcl() != -1)
       throw std::invalid_argument("Device sampling received incompatible crowd components or particles");
@@ -11904,7 +11922,7 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceDriftFree(
   const auto& backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend&>(
       *transaction.state().numerical_tile_backend);
   const auto counts = backend.advanceMetropolis(batch.numericalSamplingWorkspace(), positions, masses, tau,
-      substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted);
+      substeps, transaction.parameterVersion(), gaussian_draw, uniform_draw, accepted, {}, use_drift, drift);
   // All device work succeeded. Derived host caches remain intentionally stale
   // until the driver's immediate ParticleSet update and full TWF evaluateLog.
   for (std::size_t walker = 0; walker < wfc_list.size(); ++walker)
@@ -11913,7 +11931,7 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::mw_advanceDeviceDriftFree(
         p_list[walker].R[electron][dimension] = accepted[(walker * ne + electron) * 3 + dimension];
   return counts;
 #else
-  throw std::logic_error("Device drift-free sampling is not compiled");
+  throw std::logic_error("Device sampling is not compiled");
 #endif
 }
 

@@ -167,10 +167,13 @@ public:
   /// Report the explicit per-crowd sampler admission limit; zero preserves host moves.
   std::size_t metropolisBudget() const noexcept { return preparation_.metropolis_workspace_budget_bytes; }
 
+  /// An explicit additions cap is also the opt-in drift profile discriminator.
+  std::size_t metropolisDriftBudget() const noexcept { return preparation_.metropolis_drift_budget_bytes; }
+
   /// Report the independent explicit per-optimizer/rank real Adam limit.
   std::size_t adamBudget() const noexcept { return preparation_.adam_workspace_budget_bytes; }
 
-  /** Borrow the existing VALUE graph for native-engine drift-free substeps.
+  /** Borrow the existing VALUE graph for native-engine whole-system substeps.
    * The caller holds its native model read transaction and acquired host crowd.
    * Draw callbacks must not reenter the backend. Returned coordinates are only
    * materialized after every substep resolves; failures abort, never fall back.
@@ -180,7 +183,8 @@ public:
       std::size_t substeps, std::size_t version,
       const std::function<void(std::vector<double>&)>& gaussian_draw,
       const std::function<double()>& uniform_draw, std::vector<double>& accepted_positions,
-      const std::function<void(const std::vector<std::uint32_t>&)>& validation_mask_observer = {}) const
+      const std::function<void(const std::vector<std::uint32_t>&)>& validation_mask_observer = {},
+      bool use_drift = false, NativeDriftCallback drift = {}) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
     auto* context = dynamic_cast<Context*>(&workspace);
@@ -190,9 +194,15 @@ public:
         !substeps || !gaussian_draw || !uniform_draw || version != image_->version() ||
         !device_math::isFiniteBinary64(tau) || tau <= 0)
       throw std::invalid_argument("Device sampling requires its explicit real/open FP64 crowd profile and current image");
+    if (use_drift != bool(metropolisDriftBudget()) || (use_drift && !drift))
+      throw std::invalid_argument("Device sampling usedrift must match its explicit additions cap and native policy");
     const auto cost = estimateMetropolisCost(positions.size() / (3 * ne), ne);
     if (cost.device_bytes > metropolisBudget())
       throw std::length_error("Device sampling exceeds its explicit standalone per-crowd budget before draws");
+    const auto drift_cost = use_drift ? estimateMetropolisDriftCost(image_->plan(), context->capacity, cost.population)
+                                    : CoordinateGradientCost{};
+    if (drift_cost.device_workspace_bytes > metropolisDriftBudget())
+      throw std::length_error("Device drift additions exceed per-crowd budget before VALUE upgrade and draws");
     (void)spatial_detail::checkedProduct(cost.population, substeps, "Device sampling counter overflow");
     for (const auto value : positions)
       if (!device_math::isFiniteBinary64(value))
@@ -206,6 +216,11 @@ public:
     // Context replacement destroys its sampler first; rebind retains graph storage.
     if (context->hooks.modelVersion() != image_->version())
       context->hooks.rebindModel(image_);
+    if (use_drift && !context->hooks.retain_values_)
+    {
+      context->sampler.reset(); // Revoke every borrower before deleting the ordinary VALUE graph.
+      context->hooks.retainValueTape();
+    }
     const bool reseed = !context->sampler || context->sampler_positions != positions ||
         context->sampler_masses != inverse_mass;
     context->sampler_gaussian.resize(positions.size());
@@ -220,8 +235,11 @@ public:
         context->sampler.reset();
         context->sampler_positions = positions;
         context->sampler_masses = inverse_mass;
-        context->sampler = PreparedDeviceMetropolis::prepare(*context->hooks.values_, context->hooks.queue_,
-            positions, inverse_mass, metropolisBudget());
+        context->sampler = use_drift
+            ? PreparedDeviceMetropolis::prepareDrift(*context->hooks.values_, context->hooks.queue_,
+                positions, inverse_mass, metropolisBudget(), metropolisDriftBudget(), drift)
+            : PreparedDeviceMetropolis::prepare(*context->hooks.values_, context->hooks.queue_,
+                positions, inverse_mass, metropolisBudget());
         context->sampler_version = version;
       }
       else if (context->sampler_version != version)
@@ -231,6 +249,8 @@ public:
       }
 
       // Preserve native Gaussian flattening and conditional walker-order uniforms.
+      if (use_drift)
+        context->sampler->bindNativeDriftPolicy(drift);
       for (std::size_t step = 0; step < substeps; ++step)
       {
         gaussian_draw(context->sampler_gaussian);
@@ -267,6 +287,16 @@ public:
       throw;
     }
     std::clog << "PsiFormer device sampling completed: B=" << cost.population << ", Ne=" << ne
+              << ", usedrift=" << (use_drift ? "yes" : "no")
+              << ", drift_additions_device_bytes=" << drift_cost.device_workspace_bytes
+              << ", drift_additions_host_bytes=" << drift_cost.host_workspace_bytes
+              << ", drift_accepted_host_G_bytes=" << (use_drift ? checkedDeviceBytes<double>(cost.coordinates) : 0)
+              << ", drift_staged_host_G_bytes=" << (use_drift ? checkedDeviceBytes<double>(cost.coordinates) : 0)
+              << ", drift_host_microtile_G_bytes=" << (use_drift ? checkedDeviceBytes<double>(context->capacity * 3 * ne) : 0)
+              << ", drift_host_displacement_bytes=" << (use_drift ? checkedDeviceBytes<double>(cost.coordinates) : 0)
+              << ", drift_host_Green_bytes=" << (use_drift ? checkedDeviceBytes<double>(3 * cost.population) : 0)
+              << ", drift_additions_budget_bytes=" << metropolisDriftBudget()
+              << ", drift_policy=" << (use_drift ? "native_host_callback_failclosed" : "none")
               << ", VALUE_capacity=" << context->capacity << ", substeps=" << substeps
               << ", parameter_version=" << version << ", per_crowd_budget_bytes=" << metropolisBudget()
               << ", sampler_device_bytes=" << cost.device_bytes << ", owner_host_mask_bytes=" << cost.host_bytes
@@ -404,6 +434,9 @@ private:
   static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
       PsiFormerPrecisionPolicy precision, DeviceExecutionPreparation preparation)
   {
+    if (preparation.metropolis_drift_budget_bytes && (!preparation.metropolis_workspace_budget_bytes ||
+        preparation.metropolis_drift_budget_bytes == std::numeric_limits<std::size_t>::max()))
+      throw std::invalid_argument("Explicit device drift requires sampler preparation and a finite additions cap");
     if (preparation.adam_workspace_budget_bytes && precision != PsiFormerPrecisionPolicy::FP64_REFERENCE)
       throw std::invalid_argument("Explicit device Adam requires FP64 reference precision");
     if (preparation.metropolis_workspace_budget_bytes &&
