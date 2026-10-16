@@ -42,6 +42,7 @@
 #include "type_traits/ConvertToReal.h"
 #include "NaNguard.h"
 #include "Fermion/SlaterDet.h"
+#include "RotatedSPOs.h"
 #include "Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/TWFFastDerivWrapper.h"
 
@@ -3332,6 +3333,24 @@ std::vector<std::size_t> TrialWaveFunction::validatePreparedJastrowActivation(
     // Coefficient-only multideterminants retain their live object/Phi/cache
     // identities; the binding separately validates and adopts prepared CI banks.
     if (dynamic_cast<const MultiSlaterDetTableMethod*>(Z[i].get())) continue;
+    // Qualified orbital rotations retain determinant/SPO identities. The
+    // driver stages/adopts their private coefficient and rotation-state banks.
+    if (auto* slater = dynamic_cast<const SlaterDet*>(Z[i].get()))
+    {
+      const auto& candidate = dynamic_cast<const SlaterDet&>(*prepared.Z[i]);
+      if (slater->getNumDets() != candidate.getNumDets())
+        throw std::logic_error("Conventional orbital activation changed determinant topology");
+      for (int determinant = 0; determinant < slater->getNumDets(); ++determinant)
+        if (slater->getPhi(determinant).isOptimizable())
+        {
+          const auto* rotation = dynamic_cast<const RotatedSPOs*>(&slater->getPhi(determinant));
+          const auto* staged = dynamic_cast<const RotatedSPOs*>(&candidate.getPhi(determinant));
+          if (!rotation || !staged)
+            throw std::invalid_argument("Conventional orbital training requires CPU LCAO RotatedSPOs");
+          rotation->validatePreparedRotationState(*staged);
+        }
+      continue;
+    }
     if (Z[i]->isOptimizable() && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow" &&
         kind != "JeeIOrbitalSoA")
       throw std::invalid_argument("Conventional training currently admits fixed-orbital J1/J2/J3 and CI parameters");

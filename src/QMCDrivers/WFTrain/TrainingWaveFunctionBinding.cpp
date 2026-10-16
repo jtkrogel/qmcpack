@@ -11,9 +11,13 @@
 #include "Particle/DistanceTable.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
+#include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/RotatedSPOs.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "io/hdf/hdf_archive.h"
 #include <exception>
+#include <algorithm>
 #include <cstdint>
 #include <iomanip>
 #include <limits>
@@ -27,6 +31,52 @@ namespace qmcplusplus::wftrain
 {
 namespace
 {
+struct RotationLayout
+{
+  std::vector<RotatedSPOs*> unique;
+  std::vector<int> aliases;
+};
+
+/// Follow determinant references, not the prototype's factory SPO map: clones
+/// own remapped SPOs and may share one wrapper between both spin determinants.
+RotationLayout rotationLayout(const TrialWaveFunction& wavefunction)
+{
+  RotationLayout result;
+  std::set<std::string> names;
+  for (auto& slater : wavefunction.findSD())
+    for (int determinant = 0; determinant < slater.get().getNumDets(); ++determinant)
+    {
+      auto* rotated = dynamic_cast<RotatedSPOs*>(&slater.get().getPhi(determinant));
+      if (!rotated)
+      {
+        result.aliases.push_back(-1);
+        continue;
+      }
+      auto found = std::find(result.unique.begin(), result.unique.end(), rotated);
+      if (found == result.unique.end())
+      {
+        if (rotated->SPOSet::getName().empty() || !names.insert(rotated->SPOSet::getName()).second)
+          throw std::invalid_argument("Conventional orbital frames require unique nonempty SPO names");
+        found = result.unique.insert(result.unique.end(), rotated);
+      }
+      result.aliases.push_back(static_cast<int>(found - result.unique.begin()));
+    }
+  return result;
+}
+
+std::vector<double> realValues(const QMCTraits::ValueType* values, std::size_t count)
+{
+  std::vector<double> result(count);
+  for (std::size_t i = 0; i < count; ++i)
+    result[i] = std::real(values[i]);
+  return result;
+}
+
+std::vector<QMCTraits::ValueType> orbitalValues(const std::vector<double>& values)
+{
+  return {values.begin(), values.end()};
+}
+
 /// Reject external fixed-model inputs until their content identity is qualified.
 bool hasExternalAssets(xmlNodePtr first)
 {
@@ -124,13 +174,20 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
 {
   prototype.validatePreparedJastrowActivation(prototype);
   multideterminant_ = !prototype.findMSD().empty();
+  const auto rotations = rotationLayout(prototype);
+  orbital_rotations_ = !rotations.unique.empty();
+  if (orbital_rotations_ && (multideterminant_ || prototype.findSD().size() != 1))
+    throw std::invalid_argument("Conventional orbital training requires one single-Slater component");
+  for (const auto* rotated : rotations.unique)
+    rotated->validatePreparedRotationState(*rotated);
   for (auto& determinant : prototype.findMSD())
     determinant.get().validatePreparedCoefficientState(determinant.get());
   const auto& variables = adapter_.registrationVariables();
   for (std::size_t i = 0; i < variables.size(); ++i)
     if (variables.where(i) >= 0 &&
-        (variables.getType(i) == optimize::SPO_P || variables.getType(i) == optimize::BACKFLOW_P))
-      throw std::invalid_argument("Conventional coefficient training requires frozen orbitals and no backflow");
+        (variables.getType(i) == optimize::BACKFLOW_P ||
+         (variables.getType(i) == optimize::SPO_P && !orbital_rotations_)))
+      throw std::invalid_argument("Conventional training requires qualified CPU LCAO rotations and no backflow");
   if (auto* node = prototype.getNode())
   {
     external_assets_ = hasExternalAssets(node);
@@ -225,15 +282,33 @@ std::unique_ptr<TrialWaveFunction> TrainingWaveFunctionBinding::makePrivateClone
     throw std::logic_error("Conventional candidate changed distance-table topology");
   for (auto& determinant : candidate->findMSD())
     determinant.get().isolateOptimizationState();
+  for (auto* rotated : rotationLayout(*candidate).unique)
+    rotated->isolateOptimizationState();
   return candidate;
 }
 std::size_t TrainingWaveFunctionBinding::publishParameters(
     const StructuredParameterSnapshot& candidate, std::size_t expected_version)
 {
+  return publishPrepared(candidate, expected_version, nullptr);
+}
+
+std::size_t TrainingWaveFunctionBinding::publishOrbitalFrame(
+    const StructuredParameterSnapshot& candidate, std::size_t expected_version,
+    const ConventionalOrbitalFrame& frame)
+{
+  return publishPrepared(candidate, expected_version, &frame);
+}
+
+std::size_t TrainingWaveFunctionBinding::publishPrepared(
+    const StructuredParameterSnapshot& candidate, std::size_t expected_version,
+    const ConventionalOrbitalFrame* frame)
+{
   std::vector<std::unique_ptr<TrialWaveFunction>> prepared;
   std::vector<std::vector<std::size_t>> component_indices;
   using CoefficientBank = std::pair<MultiSlaterDetTableMethod*, const MultiSlaterDetTableMethod*>;
   std::vector<std::vector<CoefficientBank>> coefficient_banks;
+  struct RotationBank { RotatedSPOs* target; RotatedSPOs* prepared; const RotatedSPOs* canonical; };
+  std::vector<std::vector<RotationBank>> rotation_banks;
   std::optional<StructuredParameterSnapshot> detached;
   std::exception_ptr failure;
   try
@@ -248,6 +323,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
     prepared.reserve(live_.size());
     component_indices.reserve(live_.size());
     coefficient_banks.reserve(live_.size());
+    rotation_banks.reserve(live_.size());
     for (const auto& [wf, particles] : live_)
     {
       // Only sampled walker configurations are numerical admission points. The
@@ -256,7 +332,10 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
       {
         ParticleSet validation_particles(*particles);
         validation_particles.update();
-        auto validation = makeCandidate(validation_particles, candidate);
+        auto validation = makePrivateClone(validation_particles);
+        if (frame)
+          restorePrivateOrbitalFrame(*validation, *frame, candidate);
+        adapter_.installSnapshot(*validation, validation_particles, candidate);
         if (!isFiniteTrainingReal(validation->getLogPsi()))
           throw std::runtime_error("Nonfinite conventional candidate wavefunction");
         if (hamiltonian_)
@@ -273,6 +352,10 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
         throw std::logic_error("Conventional replacement changed live distance-table topology");
       for (auto& determinant : replacement->findMSD())
         determinant.get().isolateOptimizationState();
+      for (auto* rotated : rotationLayout(*replacement).unique)
+        rotated->isolateOptimizationState();
+      if (frame)
+        restorePrivateOrbitalFrame(*replacement, *frame, candidate);
       adapter_.resetPrivateParameters(*replacement, candidate);
       component_indices.push_back(wf->validatePreparedJastrowActivation(*replacement));
       // Keep MSD/Phi/C2node/cache identities live. Every accepted clone adopts
@@ -287,6 +370,21 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
       {
         targets[i].get().validatePreparedCoefficientState(canonical[i].get());
         coefficient_banks.back().emplace_back(&targets[i].get(), &canonical[i].get());
+      }
+      const auto target_rotations = rotationLayout(*wf);
+      const auto prepared_rotations = rotationLayout(*replacement);
+      const auto canonical_rotations = rotationLayout(prepared.empty() ? *replacement : *prepared.front());
+      if (target_rotations.aliases != prepared_rotations.aliases ||
+          target_rotations.aliases != canonical_rotations.aliases)
+        throw std::logic_error("Conventional orbital alias topology changed");
+      rotation_banks.emplace_back();
+      rotation_banks.back().reserve(target_rotations.unique.size());
+      for (std::size_t i = 0; i < target_rotations.unique.size(); ++i)
+      {
+        target_rotations.unique[i]->validatePreparedRotationState(*prepared_rotations.unique[i]);
+        target_rotations.unique[i]->validatePreparedRotationState(*canonical_rotations.unique[i]);
+        rotation_banks.back().push_back(
+            {target_rotations.unique[i], prepared_rotations.unique[i], canonical_rotations.unique[i]});
       }
       prepared.push_back(std::move(replacement));
     }
@@ -308,6 +406,8 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
     live_[i].first->activatePreparedJastrows(*prepared[i], component_indices[i]);
     for (const auto& [target, bank] : coefficient_banks[i])
       target->adoptPreparedCoefficientState(*bank);
+    for (const auto& bank : rotation_banks[i])
+      bank.target->adoptPreparedRotationState(*bank.prepared, *bank.canonical);
   }
   return version;
 }
@@ -344,8 +444,10 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   output.write(indices, "active_indices");
   output.write(fixed_values, "registration_values");
   output.write(definition_, "wavefunction_xml");
-  output.write(std::string(multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
-                                           : "conventional-fixed-slater-j1-j2-v1"), "completion_cookie");
+  writeOrbitalFrame(output);
+  output.write(std::string(orbital_rotations_ ? "conventional-rotated-lcao-sj-v1"
+                          : multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
+                                             : "conventional-fixed-slater-j1-j2-v1"), "completion_cookie");
   output.pop();
   output.flush();
 }
@@ -372,8 +474,9 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
   input.read(types, "variable_types");
   input.read(indices, "active_indices");
   input.read(values, "registration_values");
-  const std::string expected_cookie = multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
-                                                       : "conventional-fixed-slater-j1-j2-v1";
+  const std::string expected_cookie = orbital_rotations_ ? "conventional-rotated-lcao-sj-v1"
+                                     : multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
+                                                        : "conventional-fixed-slater-j1-j2-v1";
   if (version != std::vector<int>{1, 0, 0} || cookie != expected_cookie ||
       fingerprint != parameterSchema().fingerprint() || provider != parameterSchema().providerId() ||
       definition != definition_ || identity != modelIdentity() || physical != physical_definition_)
@@ -387,7 +490,137 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
         indices[i] != variables.where(i) || values[i] != std::real(variables[i]))
       throw std::runtime_error("Conventional model export registration mismatch");
   validateTrainingCandidate(parameterSchema(), snapshotParameters(), result);
+  // Model exports also carry physical orbital state; active-only readback must
+  // still validate the complete frame rather than silently ignoring it.
+  if (orbital_rotations_)
+  {
+    std::uint64_t source_version;
+    input.push("orbital_frame", false);
+    input.read(source_version, "source_version");
+    input.pop();
+    readOrbitalFrame(input, source_version, result);
+  }
   return result;
+}
+
+void TrainingWaveFunctionBinding::writeOrbitalFrame(hdf_archive& archive) const
+{
+  if (!orbital_rotations_)
+    return;
+  const auto layout = rotationLayout(prototype_);
+  archive.push("orbital_frame");
+  archive.write(std::vector<int>{1, 0, 0}, "format_version");
+  archive.write(static_cast<std::uint64_t>(snapshotParameters().version), "source_version");
+  archive.write(layout.aliases, "determinant_aliases");
+  archive.write(static_cast<std::uint64_t>(layout.unique.size()), "orbital_count");
+  for (std::size_t i = 0; i < layout.unique.size(); ++i)
+  {
+    const auto& rotated = *layout.unique[i];
+    const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(*rotated.Phi_);
+    const auto& reference = lcao.originalRotationCoefficients();
+    archive.push("spo_" + std::to_string(i));
+    archive.write(rotated.SPOSet::getName(), "name");
+    archive.write(std::vector<std::uint64_t>{lcao.C->rows(), lcao.C->cols()}, "shape");
+    const auto& full = rotated.fullRotationCoordinates();
+    archive.write(realValues(full.data(), full.size()), "full_rotation");
+    archive.write(realValues(lcao.C->data(), lcao.C->size()), "accepted_coefficients");
+    archive.write(realValues(reference.data(), reference.size()), "reference_coefficients");
+    archive.pop();
+  }
+  archive.pop();
+}
+
+ConventionalOrbitalFrame TrainingWaveFunctionBinding::readOrbitalFrame(
+    hdf_archive& archive, std::size_t source_version,
+    const StructuredParameterSnapshot& candidate) const
+{
+  ConventionalOrbitalFrame frame;
+  frame.source_version = source_version;
+  if (!orbital_rotations_)
+  {
+    if (archive.is_group("orbital_frame"))
+      throw std::runtime_error("Unexpected conventional orbital frame");
+    return frame;
+  }
+  const auto layout = rotationLayout(prototype_);
+  archive.push("orbital_frame", false);
+  std::vector<int> version;
+  std::uint64_t saved_version = 0, count = 0;
+  archive.read(version, "format_version");
+  archive.read(saved_version, "source_version");
+  archive.read(count, "orbital_count");
+  archive.read(frame.determinant_aliases, "determinant_aliases");
+  if (version != std::vector<int>{1, 0, 0} || saved_version != source_version ||
+      count != layout.unique.size() || frame.determinant_aliases != layout.aliases)
+    throw std::runtime_error("Conventional orbital frame version or alias identity mismatch");
+  frame.orbitals.resize(layout.unique.size());
+  for (std::size_t i = 0; i < frame.orbitals.size(); ++i)
+  {
+    auto& orbital = frame.orbitals[i];
+    std::vector<std::uint64_t> shape;
+    const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(*layout.unique[i]->Phi_);
+    const auto& reference = lcao.originalRotationCoefficients();
+    archive.push("spo_" + std::to_string(i), false);
+    archive.read(orbital.name, "name");
+    archive.read(shape, "shape");
+    archive.read(orbital.full_rotation, "full_rotation");
+    archive.read(orbital.accepted_coefficients, "accepted_coefficients");
+    archive.read(orbital.reference_coefficients, "reference_coefficients");
+    archive.pop();
+    if (orbital.name != layout.unique[i]->SPOSet::getName() ||
+        shape != std::vector<std::uint64_t>{lcao.C->rows(), lcao.C->cols()} ||
+        orbital.full_rotation.size() != layout.unique[i]->fullRotationCoordinates().size() ||
+        orbital.accepted_coefficients.size() != lcao.C->size() ||
+        orbital.reference_coefficients != realValues(reference.data(), reference.size()))
+      throw std::runtime_error("Conventional orbital frame shape or reference identity mismatch");
+    orbital.rows = shape[0];
+    orbital.columns = shape[1];
+    for (const auto* values : {&orbital.full_rotation, &orbital.accepted_coefficients,
+                               &orbital.reference_coefficients})
+      for (double value : *values)
+        if (!isFiniteTrainingReal(value))
+          throw std::runtime_error("Nonfinite conventional orbital frame");
+  }
+  archive.pop();
+  // Validate the saved C against the complete rotation in an isolated evaluator.
+  // No accepted object, population coordinates or RNG state changes here.
+  ParticleSet particles(prototype_particles_);
+  auto validation = makePrivateClone(particles);
+  restorePrivateOrbitalFrame(*validation, frame, candidate);
+  return frame;
+}
+
+void TrainingWaveFunctionBinding::restorePrivateOrbitalFrame(
+    TrialWaveFunction& wavefunction, const ConventionalOrbitalFrame& frame,
+    const StructuredParameterSnapshot& candidate) const
+{
+  const auto layout = rotationLayout(wavefunction);
+  if (frame.determinant_aliases != layout.aliases || frame.orbitals.size() != layout.unique.size())
+    throw std::runtime_error("Conventional orbital restore alias layout mismatch");
+  auto active = adapter_.registrationVariables();
+  for (std::size_t i = 0; i < active.size(); ++i)
+    if (active.where(i) >= 0)
+      active[i] = candidate.values.at(active.where(i));
+  for (std::size_t i = 0; i < layout.unique.size(); ++i)
+  {
+    auto& rotated = *layout.unique[i];
+    const auto& saved = frame.orbitals[i];
+    auto& lcao = dynamic_cast<LCAOrbitalSet&>(*rotated.Phi_);
+    if (saved.name != rotated.SPOSet::getName() || saved.rows != lcao.C->rows() || saved.columns != lcao.C->cols())
+      throw std::runtime_error("Conventional orbital restore SPO identity mismatch");
+    // Establish registration/checkOut before restoring the wrapper's active
+    // values; all rotation and coefficient operations remain private.
+    rotated.checkOutVariables(active);
+    rotated.restoreFullRotationState(orbitalValues(saved.full_rotation), active);
+    LCAOrbitalSet::OffloadValueMatrix accepted(saved.rows, saved.columns);
+    LCAOrbitalSet::OffloadValueMatrix reference(saved.rows, saved.columns);
+    if (saved.accepted_coefficients.size() != accepted.size() ||
+        saved.reference_coefficients.size() != reference.size())
+      throw std::runtime_error("Conventional orbital restore coefficient extent mismatch");
+    std::copy(saved.accepted_coefficients.begin(), saved.accepted_coefficients.end(), accepted.data());
+    std::copy(saved.reference_coefficients.begin(), saved.reference_coefficients.end(), reference.data());
+    lcao.restorePreparedRotationCoefficients(accepted, reference);
+  }
 }
 
 std::string TrainingWaveFunctionBinding::modelIdentity() const

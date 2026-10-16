@@ -699,7 +699,7 @@ public:
 
   std::unique_ptr<TrialWaveFunction> makeClone(ParticleSet& tqp) const;
 
-  /// Admit an idle, matching fixed-orbital J1/J2/J3 replacement before collective publication.
+  /// Validate idle matching Jastrows and qualified CI/orbital banks before publication.
   std::vector<std::size_t> validatePreparedJastrowActivation(const TrialWaveFunction& prepared) const;
   /// Swap only admitted Jastrows. Full value/VGL refresh is mandatory immediately afterward.
   void activatePreparedJastrows(TrialWaveFunction& prepared,

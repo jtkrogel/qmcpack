@@ -1358,6 +1358,8 @@ void WFTrainBatched::process(xmlNodePtr node)
           wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
+      if (conventional_binding_->hasOrbitalRotations())
+        throw UniformCommunicateError("Conventional CPU orbital publication awaits the bounded product and live-frame qualification gates");
       const auto& variables = conventional_binding_->adapter().registrationVariables();
       const bool nonlinear_update = optimizer == O::LINEAR_METHOD || optimizer == O::ACCELERATED_LINEAR_METHOD ||
           optimizer == O::PROJECTED_INVERSE_ITERATION || optimizer == O::MINIMUM_PROJECTED_INVERSE_ITERATION;

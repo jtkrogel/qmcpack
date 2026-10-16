@@ -112,7 +112,8 @@ public:
     PreparedRestore(const PreparedRestore&)            = delete;
     PreparedRestore& operator=(const PreparedRestore&) = delete;
 
-    /// Publish only the prepared model, retaining all other prepared state.
+    /// Publish the prepared model (including a conventional orbital frame when
+    /// present), retaining all other prepared state until publication consensus.
     std::size_t publishModel();
 
     /// Install driver and contributor state after distributed publication consensus.
