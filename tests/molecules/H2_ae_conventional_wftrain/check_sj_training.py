@@ -420,7 +420,7 @@ def main():
         with h5py.File(missing, "r+") as handle:
             del handle["conventional_wavefunction/parameters"]
         run("reject_missing_import_parameters", parameter_file=missing, vmc=True,
-            reject="Conventional model export")
+            reject="Conventional artifact has an invalid or oversized required field: parameters")
         run("reject_unsupported_import_driver", parameter_file=exported, vmc=True,
             mutate=lambda tree: tree.find("qmc").set("method", "dmc"),
             reject="parameter_file supports only CPU batched VMC and WFTrain")
