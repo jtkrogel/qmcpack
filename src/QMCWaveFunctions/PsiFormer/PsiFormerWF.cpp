@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
+#include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 #include <cstdio>
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"

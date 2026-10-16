@@ -28,11 +28,12 @@ struct InitializedPsiFormerParameters;
 class PsiFormerComplexWF final : public WaveFunctionComponent, public wftrain::StructuredParameterProvider
 {
 public:
-  /// Consume one explicit paired profile and bind immutable geometry to the target.
+  /// Bind current geometry; optional exact native root supplies parameters only, not restart state.
   PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
                      const ParticleSet& electrons, const ParticleSet& ions,
                      std::size_t maximum_clone_numeric_bytes,
-                     std::array<double, 3> reduced_twist = {}, std::size_t maximum_gpu_numeric_bytes = 0);
+                     std::array<double, 3> reduced_twist = {}, std::size_t maximum_gpu_numeric_bytes = 0,
+                     const std::string& parameter_checkpoint = {});
 
   /// Destroy the Native-free PIMPL in its sole native implementation translation unit.
   ~PsiFormerComplexWF() override;

@@ -80,6 +80,81 @@ std::string parameterFingerprint(const std::vector<double>& values)
   return text.str();
 }
 
+/// Open a native ROOT envelope and validate its mandatory completion metadata.
+std::vector<int> openCheckpointRoot(hdf_archive& archive, const std::filesystem::path& source)
+{
+  if (!archive.open(source, H5F_ACC_RDONLY))
+    throw std::runtime_error("Unable to open training checkpoint " + source.string());
+  if (!archive.is_group(ROOT_GROUP))
+    throw std::runtime_error("Training checkpoint is missing its root group");
+  archive.push(ROOT_GROUP, false);
+
+  std::vector<int> format_version;
+  std::vector<int> contributor_presence;
+  std::string completion_cookie;
+  archive.read(format_version, "format_version");
+  archive.read(contributor_presence, "contributor_presence");
+  archive.read(completion_cookie, "completion_cookie");
+  if (format_version.size() != TrainingCheckpoint::FORMAT_VERSION.size() ||
+      format_version[0] != TrainingCheckpoint::FORMAT_VERSION[0])
+    throw std::runtime_error("Training checkpoint has an incompatible format version");
+  if (contributor_presence.size() != 2 ||
+      (contributor_presence[0] != 0 && contributor_presence[0] != 1) ||
+      (contributor_presence[1] != 0 && contributor_presence[1] != 1))
+    throw std::runtime_error("Training checkpoint contributor presence has invalid shape or values");
+  if (completion_cookie != COMPLETION_COOKIE)
+    throw std::runtime_error("Training checkpoint is incomplete");
+  return contributor_presence;
+}
+
+/// Mandatory canonical payload and progress, still owned and never published.
+struct ReadModelState
+{
+  StructuredParameterSnapshot model;
+  std::size_t completed_iterations;
+};
+
+/// Share exact model/coordinator validation between full restore and warmstart.
+ReadModelState readModelAndCoordinator(hdf_archive& archive, const StructuredParameterSchema& schema)
+{
+  archive.push("model", false);
+  std::string saved_provider_id;
+  std::string saved_schema_fingerprint;
+  std::string saved_values_fingerprint;
+  std::uint64_t saved_model_version = 0;
+  std::uint64_t parameter_count = 0;
+  std::vector<double> saved_values;
+  archive.read(saved_provider_id, "provider_id");
+  archive.read(saved_schema_fingerprint, "schema_fingerprint");
+  archive.read(saved_model_version, "source_parameter_version");
+  archive.read(parameter_count, "parameter_count");
+  archive.read(saved_values, "values");
+  archive.read(saved_values_fingerprint, "values_fingerprint");
+  archive.pop();
+  if (saved_provider_id != schema.providerId())
+    throw std::runtime_error("Training checkpoint model provider identity mismatch");
+  if (saved_schema_fingerprint != schema.fingerprint())
+    throw std::runtime_error("Training checkpoint model schema mismatch");
+  if (checkedRuntimeSize(parameter_count, "parameter count") != schema.parameterCount() ||
+      saved_values.size() != schema.parameterCount())
+    throw std::runtime_error("Training checkpoint model parameter count mismatch");
+  if (!std::all_of(saved_values.begin(), saved_values.end(), isFiniteTrainingReal))
+    throw std::runtime_error("Training checkpoint model contains non-finite parameters");
+  if (saved_values_fingerprint != parameterFingerprint(saved_values))
+    throw std::runtime_error("Training checkpoint model values fingerprint mismatch");
+
+  archive.push("coordinator", false);
+  std::uint64_t completed_iterations = 0;
+  std::uint64_t coordinator_source_version = 0;
+  archive.read(completed_iterations, "completed_iterations");
+  archive.read(coordinator_source_version, "source_parameter_version");
+  archive.pop();
+  if (coordinator_source_version != saved_model_version)
+    throw std::runtime_error("Training checkpoint model and coordinator source versions disagree");
+  return {{schema.fingerprint(), checkedRuntimeSize(saved_model_version, "model source version"),
+           std::move(saved_values)}, checkedRuntimeSize(completed_iterations, "completed iterations")};
+}
+
 /// Reject incomplete or internally inconsistent mandatory checkpoint state.
 void validateSaveState(const StructuredParameterSchema& schema,
                        const StructuredParameterSnapshot& model,
@@ -361,6 +436,16 @@ void TrainingCheckpoint::restore(const std::filesystem::path& source,
   prepared.commitAfterPublication(committed_version);
 }
 
+/// Return owning canonical weights only; caller deliberately supplies new physics.
+StructuredParameterSnapshot TrainingCheckpoint::readModelParameters(
+    const std::filesystem::path& source, const StructuredParameterSchema& expected_schema)
+{
+  hdf_archive archive;
+  (void)openCheckpointRoot(archive, source);
+  auto saved = readModelAndCoordinator(archive, expected_schema);
+  return std::move(saved.model);
+}
+
 TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
     const std::filesystem::path& source,
     StructuredParameterProvider& provider,
@@ -376,66 +461,12 @@ TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
     throw std::logic_error("Training checkpoint target provider returned an invalid snapshot");
 
   hdf_archive archive;
-  if (!archive.open(source, H5F_ACC_RDONLY))
-    throw std::runtime_error("Unable to open training checkpoint " + source.string());
-  if (!archive.is_group(ROOT_GROUP))
-    throw std::runtime_error("Training checkpoint is missing its root group");
-  archive.push(ROOT_GROUP, false);
-
-  std::vector<int> format_version;
-  std::vector<int> contributor_presence;
-  std::string completion_cookie;
-  archive.read(format_version, "format_version");
-  archive.read(contributor_presence, "contributor_presence");
-  archive.read(completion_cookie, "completion_cookie");
-  if (format_version.size() != FORMAT_VERSION.size() ||
-      format_version[0] != FORMAT_VERSION[0])
-    throw std::runtime_error("Training checkpoint has an incompatible format version");
-  if (contributor_presence.size() != 2 ||
-      (contributor_presence[0] != 0 && contributor_presence[0] != 1) ||
-      (contributor_presence[1] != 0 && contributor_presence[1] != 1))
-    throw std::runtime_error("Training checkpoint contributor presence has invalid shape or values");
-  if (completion_cookie != COMPLETION_COOKIE)
-    throw std::runtime_error("Training checkpoint is incomplete");
+  const auto contributor_presence = openCheckpointRoot(archive, source);
   if ((contributor_presence[0] != 0) != (optimizer != nullptr) ||
       (contributor_presence[1] != 0) != (sampler != nullptr))
     throw std::runtime_error("Training checkpoint contributor presence does not match restore request");
 
-  archive.push("model", false);
-  std::string saved_provider_id;
-  std::string saved_schema_fingerprint;
-  std::string saved_values_fingerprint;
-  std::uint64_t saved_model_version = 0;
-  std::uint64_t parameter_count     = 0;
-  std::vector<double> saved_values;
-  archive.read(saved_provider_id, "provider_id");
-  archive.read(saved_schema_fingerprint, "schema_fingerprint");
-  archive.read(saved_model_version, "source_parameter_version");
-  archive.read(parameter_count, "parameter_count");
-  archive.read(saved_values, "values");
-  archive.read(saved_values_fingerprint, "values_fingerprint");
-  archive.pop();
-  if (saved_provider_id != schema.providerId())
-    throw std::runtime_error("Training checkpoint model provider identity mismatch");
-  if (saved_schema_fingerprint != schema.fingerprint())
-    throw std::runtime_error("Training checkpoint model schema mismatch");
-  if (checkedRuntimeSize(parameter_count, "parameter count") != schema.parameterCount() ||
-      saved_values.size() != schema.parameterCount())
-    throw std::runtime_error("Training checkpoint model parameter count mismatch");
-  if (!std::all_of(saved_values.begin(), saved_values.end(), isFiniteTrainingReal))
-    throw std::runtime_error("Training checkpoint model contains non-finite parameters");
-  if (saved_values_fingerprint != parameterFingerprint(saved_values))
-    throw std::runtime_error("Training checkpoint model values fingerprint mismatch");
-
-  archive.push("coordinator", false);
-  std::uint64_t completed_iterations       = 0;
-  std::uint64_t coordinator_source_version = 0;
-  archive.read(completed_iterations, "completed_iterations");
-  archive.read(coordinator_source_version, "source_parameter_version");
-  archive.pop();
-  if (coordinator_source_version != saved_model_version)
-    throw std::runtime_error(
-        "Training checkpoint model and coordinator source versions disagree");
+  auto saved = readModelAndCoordinator(archive, schema);
 
   archive.push("stage", false);
   TrainingStageState prepared_stage;
@@ -485,9 +516,9 @@ TrainingCheckpoint::PreparedRestore TrainingCheckpoint::prepareRestore(
       provider,
       coordinator_state,
       stage_state,
-      {schema.fingerprint(), runtime_model.version, std::move(saved_values)},
+      {schema.fingerprint(), runtime_model.version, std::move(saved.model.values)},
       runtime_model.version,
-      {checkedRuntimeSize(completed_iterations, "completed iterations"),
+      {saved.completed_iterations,
        runtime_model.version, schema.fingerprint()},
       std::move(prepared_stage),
       std::move(prepared_optimizer),

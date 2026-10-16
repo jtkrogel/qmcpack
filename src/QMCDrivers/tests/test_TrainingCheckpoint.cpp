@@ -841,4 +841,97 @@ TEST_CASE("Training checkpoint sampler shard prepares before commit",
   CHECK(target.sweeps() == source.sweeps());
 }
 
+TEST_CASE("Training checkpoint reads canonical warmstart without restoring state",
+          "[drivers][training][checkpoint][parameter_warmstart]")
+{
+  const std::filesystem::path valid = "wftrain_parameter_warmstart_valid.h5";
+  const std::filesystem::path damaged = "wftrain_parameter_warmstart_damaged.h5";
+  CheckpointFileCleanup cleanup{valid, damaged};
+  CheckpointToyProvider source;
+  ToyOptimizerCheckpoint optimizer;
+  ToySamplerCheckpoint sampler;
+  TrainingIterationState coordinator;
+  TrainingStageState stage{"saved-training-stage", 3, 0, "saved-physics-and-controls"};
+  advanceToyTrajectory(source, optimizer, sampler, coordinator, stage, 2);
+  TrainingCheckpoint::saveAtomic(valid, source, coordinator, stage, &optimizer, &sampler);
+  const auto before = source.snapshotParameters();
+  const auto original_size = std::filesystem::file_size(valid);
+  const auto original_time = std::filesystem::last_write_time(valid);
+  copyCheckpoint(valid, damaged);
+
+  SECTION("owning snapshot does not publish or restore optional contributors")
+  {
+    auto imported = TrainingCheckpoint::readModelParameters(valid, source.parameterSchema());
+    CHECK(imported.schema_fingerprint == before.schema_fingerprint);
+    CHECK(imported.version == before.version);
+    CHECK(imported.values == before.values);
+    imported.values[0] += 1;
+    CHECK(source.snapshotParameters().values == before.values);
+    CHECK(source.snapshotParameters().version == before.version);
+    CHECK(std::filesystem::file_size(valid) == original_size);
+    CHECK(std::filesystem::last_write_time(valid) == original_time);
+    // Full restart still requires the saved contributor roles and stage match.
+    CHECK_THROWS(TrainingCheckpoint::prepareRestore(valid, source, coordinator, stage));
+    CHECK(source.snapshotParameters().values == before.values);
+    CHECK(source.snapshotParameters().version == before.version);
+  }
+
+  SECTION("exact provider and canonical schema required")
+  {
+    CheckpointToyProvider other_provider("checkpoint/other");
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(valid, other_provider.parameterSchema()));
+    CheckpointToyProvider other_schema("checkpoint/toy", true);
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(valid, other_schema.parameterSchema()));
+  }
+
+  SECTION("missing completion cookie")
+  {
+    deleteHDFLink(damaged, "/wftrain_checkpoint/completion_cookie");
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("incompatible native format")
+  {
+    overwriteFormatMajor(damaged, 2);
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("canonical parameter count mismatch")
+  {
+    overwriteUint64(damaged, "/wftrain_checkpoint/model/parameter_count", 4);
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("canonical values extent mismatch")
+  {
+    replaceDoubleVector(damaged, "model", "values", {1, 2});
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("nonfinite canonical value")
+  {
+    overwriteDoubleVector(damaged, "/wftrain_checkpoint/model/values",
+                          {1, std::numeric_limits<double>::quiet_NaN(), 3});
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("finite canonical values with stale fingerprint")
+  {
+    overwriteDoubleVector(damaged, "/wftrain_checkpoint/model/values", {1, 2, 3});
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("missing source version cannot default to zero")
+  {
+    deleteHDFLink(damaged, "/wftrain_checkpoint/model/source_parameter_version");
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+
+  SECTION("coordinator and model source versions disagree")
+  {
+    overwriteUint64(damaged, "/wftrain_checkpoint/coordinator/source_parameter_version", 99);
+    CHECK_THROWS(TrainingCheckpoint::readModelParameters(damaged, source.parameterSchema()));
+  }
+}
+
 } // namespace qmcplusplus::wftrain

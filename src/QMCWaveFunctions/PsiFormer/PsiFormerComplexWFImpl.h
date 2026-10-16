@@ -435,14 +435,27 @@ struct PsiFormerComplexWF::Impl
     mutable std::vector<C> sample_products;
   };
 
-  /// Validate the explicit initializer profile before consuming its canonical storage.
+  /// Override initializer values before parameter-dependent identity or device image construction.
   static InitializedNativeModel materialize(psiformer::InitializedPsiFormerParameters initialized,
-      const ParticleSet& electrons, const ParticleSet& ions)
+      const ParticleSet& electrons, const ParticleSet& ions, const std::string& component_name,
+      const std::string& parameter_checkpoint)
   {
     if (initialized.profile != psiformer::PSIFORMER_COMPLEX_PERIODIC_V1)
       throw std::invalid_argument("Complex PsiFormer inference requires explicit paired initialization");
     validateMatchingLattices(electrons, ions);
-    return makeInitializedNativeModel(std::move(initialized), electrons, ions);
+    auto native = makeInitializedNativeModel(std::move(initialized), electrons, ions);
+    if (!parameter_checkpoint.empty())
+    {
+      const auto schema = makeStructuredParameterSchema(component_name, native.model.p);
+      const auto saved = wftrain::TrainingCheckpoint::readModelParameters(parameter_checkpoint, *schema);
+      native.model.p.set_flat_values(saved.values);
+      app_log() << "Complex PsiFormer PARAMETER-ONLY WARMSTART: root=" << parameter_checkpoint
+                << " provider=" << schema->providerId() << " schema=" << saved.schema_fingerprint
+                << " saved_version=" << saved.version << " runtime_version=" << native.model.p.version()
+                << "; CURRENT XML physics applies; optimizer/progress/walkers/RNG NOT restored; "
+                << "temporary host parameter I/O excluded from numeric-owner caps" << std::endl;
+    }
+    return native;
   }
 
   /// Admit clone G/L before the shared GPU image can be constructed.
@@ -462,8 +475,9 @@ struct PsiFormerComplexWF::Impl
   /// Prepare only the selected CPU or GPU numerical profile.
   Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
        const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
-       std::size_t gpu_limit)
-      : Impl(std::make_shared<Model>(component_name, materialize(std::move(initialized), electrons, ions),
+       std::size_t gpu_limit, const std::string& parameter_checkpoint)
+      : Impl(std::make_shared<Model>(component_name,
+                                   materialize(std::move(initialized), electrons, ions, component_name, parameter_checkpoint),
                                    electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit)),
              electrons, limit)
   {}
@@ -857,10 +871,14 @@ struct PsiFormerComplexWF::Impl
 /// Construct the explicit paired CPU or strictly capped shared-GPU inference profile.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
     const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
-    std::size_t gpu_limit)
+    std::size_t gpu_limit, const std::string& parameter_checkpoint)
     : WaveFunctionComponent(name),
-      impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced, gpu_limit))
-{}
+      impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced,
+                                 gpu_limit, parameter_checkpoint))
+{
+  if (!parameter_checkpoint.empty())
+    app_log() << "Complex PsiFormer imported model identity=" << impl_->state->identity << std::endl;
+}
 
 /// A clone shares versioned model ownership and starts with invalid evaluation caches.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, std::unique_ptr<Impl> impl)

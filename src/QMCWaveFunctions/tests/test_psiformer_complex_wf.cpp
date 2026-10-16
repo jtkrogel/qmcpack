@@ -17,6 +17,7 @@
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Utilities/RuntimeOptions.h"
 #include "OhmmsData/Libxml2Doc.h"
@@ -30,9 +31,13 @@
 #include <algorithm>
 #include <complex>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <system_error>
 #include <tuple>
 #include <vector>
 
@@ -672,6 +677,8 @@ TEST_CASE("PsiFormer paired XML rejects unsafe requests before target or device 
     CHECK_THROWS(build(complexXml(request)));
   CHECK_THROWS(build(complexXml("", "")));
   CHECK_THROWS(build(complexXml("", "0")));
+  CHECK_THROWS(build(complexXml("parameter_checkpoint=''")));
+  CHECK_THROWS(build("<psiformer initialization='deepqmc_psiformer_v1' parameter_checkpoint='unused.root.h5'/>"));
   CHECK_THROWS(build(complexXml("twist='0.17 -0.11 0.07'", "1")));
   CHECK(readiness.calls == 0);
   for (int d = 0; d < 3; ++d)
@@ -1601,6 +1608,102 @@ TEST_CASE("PsiFormer explicit paired GPU target lane preserves admission and clo
   }
 }
 #endif
+
+TEST_CASE("PsiFormer paired parameter warmstart precedes identity and immutable GPU image",
+          "[wavefunction][psiformer][complex_wf][complex_parameter_warmstart]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto original_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  PsiFormerComplexWF original("warm", initialized, original_p, source, clone_cap);
+  auto candidate = original.snapshotParameters();
+  candidate.values[0] += .015;
+  for (const auto& block : original.parameterSchema().blocks())
+    if (block.id.find("/w_imag") != std::string::npos)
+      candidate.values[block.offset] -= .012;
+  const auto version = original.publishParameters(candidate, candidate.version);
+  const auto expected = original.snapshotParameters();
+  const std::filesystem::path root = "psiformer_paired_parameter_warmstart.root.h5";
+  // Delete only this test-owned native root, including on an assertion exception.
+  struct Cleanup
+  {
+    std::filesystem::path path;
+    ~Cleanup()
+    {
+      std::error_code error;
+      std::filesystem::remove(path, error);
+    }
+  } cleanup{root};
+  wftrain::TrainingIterationState progress{2, version, original.parameterSchema().fingerprint()};
+  wftrain::TrainingStageState stage{"old-training-stage", 0, 2, "old-physics-not-restored"};
+  wftrain::TrainingCheckpoint::saveAtomic(root, original, progress, stage);
+  const auto read_bytes = [&] {
+    std::ifstream input(root, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  };
+  const auto source_bytes = read_bytes();
+  REQUIRE_FALSE(source_bytes.empty());
+  for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+  {
+    auto cpu_p = electrons(simulation_cell), reference_p = electrons(simulation_cell);
+    auto changed = initialized;
+    changed.values = expected.values;
+    PsiFormerComplexWF reference("warm", changed, reference_p, source, clone_cap, twist);
+    PsiFormerComplexWF cpu("warm", initialized, cpu_p, source, clone_cap, twist, 0, root.string());
+    CHECK(cpu.snapshotParameters().values == expected.values);
+    close(evaluate(cpu, cpu_p), evaluate(reference, reference_p));
+    for (int e = 0; e < 4; ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        close(cpu_p.G[e][d], reference_p.G[e][d]);
+      close(cpu_p.L[e], reference_p.L[e]);
+    }
+#ifdef ENABLE_CUDA
+    const std::size_t gpu_cap = 64 * 1024 * 1024;
+    int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+    const bool available = hipGetDeviceCount(&devices) == hipSuccess && devices > 0;
+    if (available)
+      REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+    const bool available = cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0;
+    if (available)
+      REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+    if (!available)
+    {
+      WARN("NOT_RUN: warmstart GPU parity requires an available device");
+      continue;
+    }
+    ScopedComplexGpuControls controls;
+    auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+    auto gpu_p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+    const auto before_reject = metrics.snapshot();
+    CHECK_THROWS_AS(PsiFormerComplexWF("foreign", initialized, gpu_p, source, clone_cap,
+                                     twist, gpu_cap, root.string()), std::runtime_error);
+    CHECK(metrics.snapshot().allocation_calls == before_reject.allocation_calls);
+    PsiFormerComplexWF gpu("warm", initialized, gpu_p, source, clone_cap, twist, gpu_cap, root.string());
+    CHECK(gpu.snapshotParameters().values == expected.values);
+    CHECK(gpu.structuredParameterProvider() == nullptr);
+    auto base = gpu.makeClone(clone_p);
+    auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base);
+    CHECK(clone.numericStorage().shared_image_identity == gpu.numericStorage().shared_image_identity);
+    CHECK(gpu.numericStorage().allocated_bytes == cpu_p.G.size() * sizeof(WaveFunctionComponent::GradType) +
+          cpu_p.L.size() * sizeof(WaveFunctionComponent::ValueType));
+    close(evaluate(gpu, gpu_p), cpu.get_log_value());
+    close(evaluate(clone, clone_p), cpu.get_log_value());
+    for (int e = 0; e < 4; ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        close(gpu_p.G[e][d], cpu_p.G[e][d]);
+      close(gpu_p.L[e], cpu_p.L[e]);
+    }
+    CHECK_THROWS(gpu.publishParameters(expected, expected.version));
+#endif
+  }
+  CHECK(read_bytes() == source_bytes);
+}
 
 TEST_CASE("PsiFormer CPU pathwise gradient differentiates the complete reweighted finite objective",
           "[wavefunction][psiformer][complex_wf][complex_training]")

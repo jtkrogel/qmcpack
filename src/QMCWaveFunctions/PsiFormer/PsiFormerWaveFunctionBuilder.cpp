@@ -203,6 +203,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 {
   std::string name = "psiformer", parameters, configuration, source = "ion0", system = "auto";
   std::string export_parameters, initialization, initialization_seed_text = "0", feature_policy;
+  std::string parameter_checkpoint;
   std::string optimize = "no", optimize_scope = "indices", optimize_indices, gpu = "no";
   std::string precision_text = "fp64_reference";
   ParticleSet::PosType reduced_twist(0.0);
@@ -215,6 +216,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   attributes.add(parameters, "parameters");
   attributes.add(configuration, "configuration");
   attributes.add(initialization, "initialization");
+  attributes.add(parameter_checkpoint, "parameter_checkpoint");
   attributes.add(initialization_seed_text, "initialization_seed");
   attributes.add(feature_policy, "feature_policy");
   attributes.add(source, "source");
@@ -233,6 +235,13 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     optimize_indices = getXMLAttributeValue(cur, "optimize_indices");
 
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1;
+  // This exact native ROOT is a value override, never manifest discovery or a restart request.
+  if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
+  {
+    parameter_checkpoint = getXMLAttributeValue(cur, "parameter_checkpoint");
+    if (!complex_profile || parameter_checkpoint.empty())
+      throw std::invalid_argument("parameter_checkpoint requires an exact native root and explicit paired initialization");
+  }
   [[maybe_unused]] std::size_t clone_numeric_limit = 0;
   [[maybe_unused]] std::size_t gpu_numeric_limit = 0;
 #ifndef QMC_COMPLEX
@@ -457,7 +466,8 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     if (complex_profile)
     {
       auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
-                                                         *source_particles, clone_numeric_limit, twist_array, gpu_numeric_limit);
+                                                         *source_particles, clone_numeric_limit, twist_array,
+                                                         gpu_numeric_limit, parameter_checkpoint);
       const auto storage = complex->numericStorage();
       app_log() << (gpu_numeric_limit ? "  Complex PsiFormer GPU host G/L bytes per clone: required="
                                      : "  Complex PsiFormer CPU numeric bytes per clone: required=") << storage.required_bytes

@@ -133,6 +133,16 @@ public:
                          const OptimizerCheckpointContributor* optimizer = nullptr,
                          const SamplerCheckpointContributor* sampler = nullptr);
 
+  /** Read canonical parameters from one exact root envelope without publication.
+   *
+   * Validates mandatory model metadata against expected_schema. The returned
+   * version is source provenance only; no optimizer, stage, sampler or RNG state
+   * is restored. Current input physics defines the new wavefunction.
+   */
+  static StructuredParameterSnapshot readModelParameters(
+      const std::filesystem::path& source,
+      const StructuredParameterSchema& expected_schema);
+
   /** Restore a complete checkpoint while preserving failure atomicity.
    *
    * stage_state supplies the expected stage/configuration identity. Saved
