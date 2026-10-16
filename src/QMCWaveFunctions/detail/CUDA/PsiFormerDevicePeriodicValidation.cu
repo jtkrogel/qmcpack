@@ -51,7 +51,9 @@ void near(double actual, double expected, const char* quantity, double tolerance
 pf::Parameters smallParameters(const ExecutionEnvironment& environment)
 {
   const ModelShape production{2, 2, 2, 16, 256, 4, 4};
-  const auto initialized = initializePsiFormerParameters(production, 1729, DEEPQMC_PSIFORMER_V1, environment);
+  const auto profile = environment.head_representation == HeadRepresentation::PAIRED_REAL_COMPLEX
+      ? PSIFORMER_COMPLEX_PERIODIC_V1 : DEEPQMC_PSIFORMER_V1;
+  const auto initialized = initializePsiFormerParameters(production, 1729, profile, environment);
   const PsiFormerExecutionPlan production_plan(production, initialized.layouts, environment);
   std::vector<pf::Layout> layouts;
   std::vector<double> values;
@@ -247,11 +249,15 @@ void validate()
 }
 } // namespace
 
+#include "PsiFormerDeviceComplexValueValidation.h"
+
 /// Return a standard unavailable-runtime status without disguising CPU-only work.
-int main()
+int main(int argc, char** argv)
 {
   try
   {
+    if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -263,7 +269,10 @@ int main()
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    validate();
+    if (argc == 2)
+      validateComplexValue();
+    else
+      validate();
     return 0;
   }
   catch (const std::exception& error)

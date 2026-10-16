@@ -244,13 +244,25 @@ class PreparedDeviceModelMetadata
 public:
   /// Validate and upload fixed geometry once for one layout/device family.
   PreparedDeviceModelMetadata(const PsiFormerExecutionPlan& plan, const std::vector<double>& nuclei)
+      : PreparedDeviceModelMetadata(plan, nuclei, false)
+  {}
+
+private:
+  friend class PreparedDeviceModel;
+
+  /// A named numerical paired-value factory alone admits complex amplitude metadata.
+  PreparedDeviceModelMetadata(const PsiFormerExecutionPlan& plan, const std::vector<double>& nuclei, bool paired_value)
       : plan_(plan)
   {
     const auto& environment = plan_.environment();
+    if (paired_value && (environment.boundary != BoundaryCondition::PERIODIC ||
+        environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
+        environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
+      throw std::invalid_argument("Numerical paired VALUE needs periodic paired-real complex amplitude metadata");
     if ((environment.boundary != BoundaryCondition::OPEN && environment.boundary != BoundaryCondition::PERIODIC) ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
-        environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+        (environment.amplitude_scalar_domain != ScalarDomain::REAL && !paired_value) || !environment.fixed_nuclei)
       throw std::invalid_argument("Device model supports fixed-ion real FP64 models only");
     if (environment.boundary == BoundaryCondition::PERIODIC)
     {
@@ -271,6 +283,7 @@ public:
     nuclei_.upload(nuclei.data(), nuclei.size());
   }
 
+public:
   PreparedDeviceModelMetadata(const PreparedDeviceModelMetadata&) = delete;
   PreparedDeviceModelMetadata& operator=(const PreparedDeviceModelMetadata&) = delete;
 
@@ -314,6 +327,15 @@ private:
 class PreparedDeviceModel
 {
 public:
+  /// Prepare one canonical numerical paired-VALUE image, without public GPU admission.
+  static std::shared_ptr<const PreparedDeviceModel> preparePairedComplexValue(
+      const PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
+      const std::vector<double>& nuclei, std::size_t version = 0)
+  {
+    auto family = std::shared_ptr<PreparedDeviceModelMetadata>(new PreparedDeviceModelMetadata(plan, nuclei, true));
+    return std::shared_ptr<const PreparedDeviceModel>(new PreparedDeviceModel(std::move(family), parameters, version));
+  }
+
   /// Upload an initial checked open-real model and its fixed geometry metadata.
   PreparedDeviceModel(const PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
                       const std::vector<double>& nuclei, std::size_t version = 0)
@@ -424,6 +446,9 @@ private:
  */
 class PreparedDeviceInference
 {
+  /// Forward-declare the private lifetime guard used by the real head completion.
+  struct MixedValueAttempt;
+
 public:
   /** Retain one block's value or full-spatial jets for an explicit reverse pass.
    * Feature geometry/embedding stay separate in the graph's raw/input storage;
@@ -536,6 +561,7 @@ private:
   friend class PreparedDeviceTargetKinetic;
   friend class PreparedDeviceMetropolis;
   friend class PreparedDeviceKineticReverse;
+  friend class PreparedDeviceComplexValue;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -544,7 +570,7 @@ private:
                           AcceleratorBlasHandle& blas,
                           SpatialJetMode mode, bool retain_score_tape, bool retain_spatial_tape,
                           InferenceStatusPolicy status_policy,
-                          TargetVglPreparation target_preparation, bool retained_targets)
+                          TargetVglPreparation target_preparation, bool retained_targets, bool real_trunk_only = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
         target_preparation_(target_preparation), retained_targets_(retained_targets)
@@ -558,10 +584,15 @@ private:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
+    if (real_trunk_only && (mode_ != SpatialJetMode::VALUE_ONLY || retain_score_tape || retain_spatial_tape ||
+        retained_targets_ || target_preparation_.max_targets || environment.boundary != BoundaryCondition::PERIODIC ||
+        environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
+        environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
+      throw std::invalid_argument("Private real trunk preparation requires the numerical paired VALUE profile");
     if (batch_ == 0 ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
-        environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+        (environment.amplitude_scalar_domain != ScalarDomain::REAL && !real_trunk_only) || !environment.fixed_nuclei)
       throw std::invalid_argument("Device inference supports fixed-ion real FP64 models only");
     ne_ = shape_.electrons();
     // Only the all-zero option is the legacy full graph. A malformed explicit
@@ -618,30 +649,33 @@ private:
     for (DeviceBuffer<double>* buffer : {&a_, &b_, &q_, &k_, &v_, &context_, &hidden_, &projected_})
       buffer->reserve(feature_elements);
     weights_.reserve(spatialJetSpanElements(attention_.attention));
-    orbital_jets_.reserve(spatialJetSpanElements(orbitals_.orbitals));
-    matrices_.reserve(product(batch_, matrices_per_configuration_));
-    lu_.reserve(matrices_.capacity());
-    if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
-      inverse_.reserve(matrices_.capacity());
-    permutations_.reserve(product(product(batch_, shape_.determinants), ne_));
-    if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
-      solve_.reserve(permutations_.capacity());
-    factors_.reserve(product(batch_, shape_.determinants));
-    // Host admission copies complete POD records. Initialize their padding once
-    // so those transfers never read unwritten bytes; numerical fields are still
-    // set by the factorization kernel for every live determinant.
+    if (!real_trunk_only)
+    {
+      orbital_jets_.reserve(spatialJetSpanElements(orbitals_.orbitals));
+      matrices_.reserve(product(batch_, matrices_per_configuration_));
+      lu_.reserve(matrices_.capacity());
+      if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
+        inverse_.reserve(matrices_.capacity());
+      permutations_.reserve(product(product(batch_, shape_.determinants), ne_));
+      if (mode_ == SpatialJetMode::FULL_VGL || retain_score_tape)
+        solve_.reserve(permutations_.capacity());
+      factors_.reserve(product(batch_, shape_.determinants));
+      // Host admission copies complete POD records. Initialize their padding once
+      // so those transfers never read unwritten bytes; numerical fields are still
+      // set by the factorization kernel for every live determinant.
 #ifdef QMC_CUDA2HIP
-    checkRuntime(hipMemsetAsync(factors_.data(), 0,
-        checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
-        "factorization metadata storage initialization");
+      checkRuntime(hipMemsetAsync(factors_.data(), 0,
+          checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
+          "factorization metadata storage initialization");
 #else
-    checkRuntime(cudaMemsetAsync(factors_.data(), 0,
-        checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
-        "factorization metadata storage initialization");
+      checkRuntime(cudaMemsetAsync(factors_.data(), 0,
+          checkedDeviceBytes<device_determinant::FactorizationMetadata>(factors_.capacity()), queue_.getNative()),
+          "factorization metadata storage initialization");
 #endif
-    combinations_.reserve(batch_);
-    for (DeviceBuffer<double>* buffer : {&term_phase_, &term_log_, &scaled_, &normalized_})
-      buffer->reserve(factors_.capacity());
+      combinations_.reserve(batch_);
+      for (DeviceBuffer<double>* buffer : {&term_phase_, &term_log_, &scaled_, &normalized_})
+        buffer->reserve(factors_.capacity());
+    }
     if (mode_ == SpatialJetMode::FULL_VGL)
     {
       matrix_product_.reserve(product(batch_, product(ne_, ne_)));
@@ -651,8 +685,11 @@ private:
       det_status_.reserve(batch_);
     }
     cusp_jets_.reserve(spatialJetSpanElements(cusp_.output));
-    phase_.reserve(batch_); output_.reserve(spatialJetSpanElements(final_.output));
-    lap_ratio_.reserve(product(batch_, final_.output.laplacian_lanes));
+    if (!real_trunk_only)
+    {
+      phase_.reserve(batch_); output_.reserve(spatialJetSpanElements(final_.output));
+      lap_ratio_.reserve(product(batch_, final_.output.laplacian_lanes));
+    }
     const auto status_count = std::max(product(batch_, product(ne_, width)), matrices_.capacity());
     open_status_.reserve(status_count); host_status_.resize(status_count);
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
@@ -814,9 +851,16 @@ private:
   /// Execute one admitted shape against the geometry uploaded by the logical request.
   void evaluatePreparedTile()
   {
-    const auto stream = queue_.getNative();
     resetStatusAdmission();
     MixedValueAttempt mixed_attempt(mixed_dense_.get(), model_);
+    evaluatePreparedTrunk();
+    finishPreparedTile(mixed_attempt);
+  }
+
+  /// Shared real prefix in its original order; no head or determinant publication.
+  void evaluatePreparedTrunk()
+  {
+    const auto stream = queue_.getNative();
 
     // Feature layers: physical radial/Cartesian jets followed by electron embedding.
     if (const auto* cell = model_->periodicCell())
@@ -872,7 +916,12 @@ private:
     // Every deferred neural result is initialized, but may be numerically invalid.
     // Admit the whole trunk before orbital construction or reverse-tape publication.
     admitStatus();
+  }
 
+  /// Complete the unchanged real head after the shared neural prefix is admitted.
+  void finishPreparedTile(MixedValueAttempt& mixed_attempt)
+  {
+    const auto stream = queue_.getNative();
     // Spin-conditioned orbitals and learned exponential envelopes remain device-side.
     if (const auto* cell = model_->periodicCell())
       checkRuntime(launchPeriodicOrbitalJets(stream, orbitals_, *cell, a_.data(), positions_.data(), model_->nuclei(),

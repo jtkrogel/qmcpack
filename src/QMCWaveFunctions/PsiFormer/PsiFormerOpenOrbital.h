@@ -245,7 +245,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     std::size_t orbital, double* output,
     double* retained_backflow = nullptr, double* retained_envelope = nullptr,
     const periodic_geometry::Cell* periodic_cell = nullptr,
-    const double* projected_backflow = nullptr) noexcept
+    const double* projected_backflow = nullptr, bool value_envelope_only = false) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
@@ -253,15 +253,17 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     output[layout.orbitals.uncheckedPlaneOffset(configuration, plane, element)] = 0.0;
   if (active_electron >= layout.features.electron_count)
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
+  if (value_envelope_only && layout.features.mode != SpatialJetMode::VALUE_ONLY)
+    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
 
   const bool spin_up = row_electron < layout.spin_up_count;
   const double* backflow = spin_up ? backflow_up : backflow_down;
   const double* pi       = spin_up ? pi_up : pi_down;
   const double* zeta     = spin_up ? zeta_up : zeta_down;
-  double backflow_value  = projected_backflow
-      ? projected_backflow[layout.orbitals.uncheckedValueOffset(configuration, element)] : 0.0;
+  double backflow_value  = value_envelope_only ? 1.0 : (projected_backflow
+      ? projected_backflow[layout.orbitals.uncheckedValueOffset(configuration, element)] : 0.0);
   const std::size_t feature_begin = row_electron * layout.feature_row_stride;
-  for (std::size_t feature = 0; !projected_backflow && feature < layout.feature_width; ++feature)
+  for (std::size_t feature = 0; !value_envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
   {
     const double feature_value = features[layout.features.uncheckedValueOffset(
         configuration, feature_begin + feature)];
