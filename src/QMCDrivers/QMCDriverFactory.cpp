@@ -50,6 +50,7 @@
 #include "Estimators/EstimatorInputDelegates.h"
 #include "Estimators/EstimatorManagerNew.h"
 #include "Message/UniformCommunicateError.h"
+#include "Message/CommOperators.h"
 #include "RandomNumberControl.h"
 #ifdef QMC_COMPLEX
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
