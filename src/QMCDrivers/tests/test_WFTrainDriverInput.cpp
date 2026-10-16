@@ -11,6 +11,7 @@
 #include "OhmmsData/Libxml2Doc.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
+#include "QMCDrivers/WFTrain/WFTrainInferenceInput.h"
 
 #include <array>
 #include <limits>
@@ -32,6 +33,57 @@ WFTrainDriverInput parseTrainingInput(const std::string& xml)
 }
 
 } // namespace
+
+TEST_CASE("WFTrain inference uses native VMC inputs and completed-attempt cadence", "[drivers][wf_train]")
+{
+  const auto parse = [](const std::string& xml) {
+    Libxml2Document document;
+    REQUIRE(document.parseFromString("<qmc>" + xml + "</qmc>"));
+    WFTrainInferenceInput input;
+    input.readXML(document.getRoot());
+    return input;
+  };
+  CHECK_FALSE(parse("").enabled);
+  CHECK_FALSE(parse("").due(1000, true));
+  const auto defaults = parse("<inference/>");
+  CHECK(defaults.interval == 1000);
+  CHECK_FALSE(defaults.last);
+  CHECK_FALSE(defaults.due(0, true));
+  CHECK_FALSE(defaults.due(999, false));
+  CHECK(defaults.due(1000, false));
+  const auto interval = parse("<inference interval=\"2\"/>");
+  CHECK_FALSE(interval.due(1, false));
+  CHECK(interval.due(2, false));
+  CHECK_FALSE(interval.due(3, true));
+  const auto last = parse("<inference interval=\"2\" last=\"yes\"/>");
+  CHECK(last.due(2, true));
+  CHECK(last.due(3, true));
+  const auto sampling = parse(R"(<inference interval="2" last="no" move="pbyp">
+    <parameter name="walkers_per_rank">3</parameter><parameter name="crowds">2</parameter>
+    <parameter name="blocks">4</parameter><parameter name="steps">5</parameter>
+    <parameter name="warmupsteps">6</parameter><parameter name="substeps">7</parameter>
+    <parameter name="timestep">0.125</parameter><parameter name="usedrift">yes</parameter>
+    </inference>)");
+  CHECK(sampling.sampling.get_walkers_per_rank() == 3);
+  CHECK(sampling.sampling.get_num_crowds() == 2);
+  CHECK(sampling.sampling.get_max_blocks() == 4);
+  CHECK(sampling.sampling.get_requested_steps() == 5);
+  CHECK(sampling.sampling.get_warmup_steps() == 6);
+  CHECK(sampling.sampling.get_sub_steps() == 7);
+  CHECK(sampling.sampling.get_tau() == 0.125);
+  CHECK(sampling.vmc.get_use_drift());
+  for (const std::string invalid : {
+      "<inference/><inference/>", "<inference interval=\"0\"/>", "<inference interval=\"-1\"/>",
+      "<inference interval=\"184467440737095516160\"/>", "<inference last=\"true\"/>",
+      "<inference mystery=\"1\"/>", "<inference><parameter name=\"mystery\">1</parameter></inference>",
+      "<inference><parameter name=\"steps\">bad</parameter></inference>",
+      "<inference><parameter name=\"estimator_period\">0</parameter></inference>",
+      "<inference><parameter name=\"usedrift\">maybe</parameter></inference>",
+      "<inference><parameter name=\"steps\">1</parameter><parameter name=\"steps\">2</parameter></inference>",
+      "<inference><parameter name=\"tau\">1</parameter><parameter name=\"timestep\">2</parameter></inference>"})
+    CHECK_THROWS(parse(invalid));
+  CHECK_NOTHROW(parse("<inference><estimators><unknown/></estimators></inference>"));
+}
 
 TEST_CASE("WFTrainDriverInput accepts conventional orbital pretraining", "[drivers][wf_train]")
 {

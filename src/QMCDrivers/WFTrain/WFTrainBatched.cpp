@@ -35,6 +35,7 @@
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
+#include "QMCDrivers/WFTrain/WFTrainInference.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
@@ -1160,6 +1161,20 @@ void WFTrainBatched::process(xmlNodePtr node)
 
   try
   {
+    inference_input_.readXML(node);
+    if (inference_input_.enabled)
+    {
+      inference_timer_ = &createGlobalTimer("WFTrain::inference", timer_level_medium);
+      // Read only: deriving a separate domain never advances production RNGs.
+      std::vector<RandomBase<FullPrecRealType>::uint_type> initial_state;
+      rngs_[0].get().save(initial_state);
+      inference_seed_ = UINT64_C(14695981039346656037);
+      for (const auto word : initial_state)
+      {
+        inference_seed_ ^= word;
+        inference_seed_ *= UINT64_C(1099511628211);
+      }
+    }
     VMCBatchedSampling::validateMoveConfiguration(vmcdriver_input_, population_.get_golden_electrons(),
                                                   population_.get_golden_twf(), serializing_crowd_walkers_);
 
@@ -1608,6 +1623,8 @@ void WFTrainBatched::run()
         }
       };
       reject_future(training_directory);
+      if (inference_input_.enabled)
+        reject_future(get_root_name() + ".inference");
       const auto parent = std::filesystem::path(get_root_name()).parent_path();
       reject_future(parent.empty() ? std::filesystem::path(".") : parent);
       std::filesystem::create_directories(training_directory);
@@ -2633,6 +2650,23 @@ void WFTrainBatched::run()
     const bool periodic_checkpoint =
         training_state.completed_iterations % training_input_.getCheckpointInterval() == 0;
     const bool final_block = iteration + 1 == num_iterations;
+    if (inference_input_.due(training_state.completed_iterations, final_block))
+    {
+      if (stop_requested)
+      {
+        if (myComm->rank() == 0)
+          app_log() << "WFTrain inference iteration " << iteration << " parameter_version "
+                    << iteration_result.parameter_version << " complete no skipped runtime_stop" << std::endl;
+      }
+      else
+      {
+        if (!runInference(static_cast<std::size_t>(iteration), iteration_result.parameter_version))
+          stop_requested = true;
+        if (myComm->rank() == 0)
+          stop_requested = stop_requested || runtime_control.checkStop(training_loop);
+        myComm->bcast(stop_requested);
+      }
+    }
     if (periodic_checkpoint || final_block || stop_requested)
     {
       ScopedTimer checkpoint_timer(timers_.checkpoint_timer);
@@ -2662,6 +2696,60 @@ void WFTrainBatched::run()
   wlog_manager.stopRun();
   estimator_manager_->stopDriverRun();
   finalize(completed_blocks, false, false);
+}
+
+bool WFTrainBatched::runInference(std::size_t iteration, std::size_t parameter_version)
+{
+  NativeTimerScope phase(*inference_timer_);
+  Timer elapsed;
+  const auto directory = std::filesystem::path(get_root_name() + ".inference");
+  std::ostringstream name;
+  name << std::filesystem::path(get_root_name()).filename().string() << ".i"
+       << std::setw(7) << std::setfill('0') << iteration;
+  const std::string prefix = (directory / name.str()).string();
+  bool failed = false;
+  if (myComm->rank() == 0)
+    try
+    {
+      std::filesystem::create_directories(directory);
+      if (std::filesystem::exists(prefix + ".scalar.dat"))
+        throw std::runtime_error("inference scalar already exists");
+    }
+    catch (const std::exception& error)
+    {
+      app_error() << "WFTrain inference output: " << error.what() << std::endl;
+      failed = true;
+    }
+  myComm->bcast(failed);
+  if (failed)
+    throw UniformCommunicateError("WFTrain inference: conflicting or inaccessible scalar output");
+
+  auto electrons = std::make_unique<ParticleSet>(population_.get_golden_electrons());
+  auto wavefunction = student_prototype_.makeClone(*electrons);
+  auto hamiltonian = population_.get_golden_hamiltonian().makeClone(*electrons, *wavefunction);
+  WalkerConfigurations configurations;
+  MCPopulation population(myComm->size(), myComm->rank(), *electrons, *wavefunction, *hamiltonian);
+  UPtrVector<RandomBase<FullPrecRealType>> generators;
+  RefVector<RandomBase<FullPrecRealType>> refs;
+  auto mix = [](std::uint64_t value) {
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+  };
+  const auto seed = mix(inference_seed_ ^ UINT64_C(0x696e666572656e63) ^ mix(iteration) ^
+                        mix(static_cast<std::uint64_t>(myComm->rank())));
+  for (std::size_t crowd = 0; crowd < rngs_.size(); ++crowd)
+  {
+    generators.push_back(std::make_unique<RandomGenerator>(mix(seed ^ mix(crowd + 1))));
+    refs.push_back(*generators.back());
+  }
+  WFTrainInference inference(project_data_, inference_input_, configurations, std::move(population), refs,
+                             myComm, prefix, iteration, parameter_version);
+  inference.process(nullptr);
+  inference.run();
+  if (myComm->rank() == 0)
+    app_log() << "WFTrain inference iteration " << iteration << " inference_seconds " << elapsed.elapsed() << std::endl;
+  return inference.complete();
 }
 
 RefVector<QMCDriverNew::ContextForSteps> WFTrainBatched::getContextForStepsRefs() const

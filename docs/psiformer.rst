@@ -546,6 +546,45 @@ To suppress the potentially enormous startup parameter table while keeping
 other diagnostics, use ``<wavefunction ... print_parameters="no">``. The default
 is ``yes`` for compatibility; ``no`` prints the parameter count only.
 
+Optional interval inference evaluates the accepted parameters after a complete
+optimizer attempt using the native VMC sampler in a separate population. Add a
+sibling of ``training`` inside ``qmc``::
+
+  <inference interval="1000" last="no" move="pbyp">
+    <parameter name="walkers_per_rank">8</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="warmupsteps">10</parameter>
+    <parameter name="blocks">4</parameter>
+    <parameter name="steps">10</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">0.01</parameter>
+    <parameter name="usedrift">yes</parameter>
+  </inference>
+
+Absent ``inference`` disables this work and its output. ``interval`` is a positive
+outer-attempt count (default 1000): interval 2 runs after indices 1, 3, and so on,
+including attempts whose update was rejected. ``last="yes"`` additionally runs on
+the final completed attempt unless already due; its default is ``no``. This
+cadence is independent of checkpoint cadence. Sampling parameters and move modes
+have the same meanings and defaults as native VMC; inference uses its own walker
+and crowd controls. Fresh ParticleSet, wavefunction/Hamiltonian clones and RNGs
+isolate inference from subsequent training walkers, optimizer state and random
+draws. Seeds derive deterministically from a read-only copy of the initial run
+RNG state, cumulative attempt index, rank and an inference domain.
+
+Inference writes only ``R.inference/R.i0000001.scalar.dat``, with regular VMC
+blocks and a comment recording the attempt index, accepted ``parameter_version``,
+completed/requested blocks and completion status. Supplemental estimators are
+ignored with a warning; every physical Hamiltonian term remains present.
+No training-history row or iteration increment is added for an inference block.
+Inference timing is logged separately and recorded by the medium-level native
+``WFTrain::inference`` timer; the existing history's iteration timing excludes
+subsequent inference and checkpoint work, while the runtime budget includes both.
+A runtime/STOP request can skip inference or leave an explicitly incomplete
+scalar file; the completed training attempt is still checkpointed. Exceptions
+prevent checkpoint/latest publication. Inference files are not restart inputs,
+and existing future inference files follow the training collision policy.
+
 Exact training checkpoints are taken only after a complete iteration. The training
 parameter ``checkpoint_interval`` (positive integer, default 1000) counts outer
 attempts independently of the qmc block checkpoint period. Thus interval 1000

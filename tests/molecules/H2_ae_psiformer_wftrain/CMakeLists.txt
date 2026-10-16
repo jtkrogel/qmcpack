@@ -4,6 +4,18 @@
 # emitted only after refresh succeeds, so its presence is the application-level
 # completion criterion.
 if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
+  if(Python3_EXECUTABLE)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                    RESULT_VARIABLE PSIFORMER_INFERENCE_PYTHON_MODULES
+                    OUTPUT_QUIET ERROR_QUIET)
+    if(PSIFORMER_INFERENCE_PYTHON_MODULES EQUAL 0)
+      add_test(NAME short-H2-ae-psiformer-wftrain-interval-inference
+               COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_interval_inference.py"
+                       $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_checkpoint.xml")
+      set_tests_properties(short-H2-ae-psiformer-wftrain-interval-inference
+                           PROPERTIES TIMEOUT 180 PROCESSORS 1)
+    endif()
+  endif()
   # Native neural parameters and inline conventional SPOs require no external data.
   set(ORBITAL_TEST short-H2-ae-psiformer-orbital-mse-r1-t1)
   set(TEST_ADDED FALSE)

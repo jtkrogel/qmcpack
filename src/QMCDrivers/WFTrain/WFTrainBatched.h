@@ -12,9 +12,11 @@
 #include "QMCDrivers/VMC/VMCBatchedSampling.h"
 #include "QMCDrivers/VMC/VMCDriverInput.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
+#include "QMCDrivers/WFTrain/WFTrainInferenceInput.h"
 #include "QMCDrivers/WFTrain/TrainingTimers.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -66,6 +68,9 @@ private:
 
   VMCDriverInput vmcdriver_input_;
   WFTrainDriverInput training_input_;
+  WFTrainInferenceInput inference_input_;
+  std::uint64_t inference_seed_ = 0;
+  NewTimer* inference_timer_ = nullptr;
   TrialWaveFunction& student_prototype_;
   std::string selected_provider_id_;
   wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
@@ -106,6 +111,9 @@ private:
 
   /** Refresh all crowd wavefunction, drift, and local-energy caches after publication. */
   void refreshPublishedParameters(std::size_t parameter_version);
+
+  /** Sample accepted parameters in a fresh isolated native VMC population. */
+  bool runInference(std::size_t iteration, std::size_t parameter_version);
 };
 
 } // namespace qmcplusplus
