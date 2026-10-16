@@ -35,11 +35,13 @@
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "SimulationCell.h"
+#include "io/hdf/hdf_archive.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -1019,6 +1021,106 @@ TEST_CASE("Legacy orbital products preserve cumulative private rotation history"
   CHECK_THROWS_AS(restored_lcao.restorePreparedRotationCoefficients(corrupt, original), std::invalid_argument);
   restored_lcao.C->data()[0] = makeValue(std::numeric_limits<double>::quiet_NaN());
   CHECK_THROWS_AS(restored_lcao.restorePreparedRotationCoefficients(accepted_coefficients, original), std::invalid_argument);
+
+  // Live publication and cold checkpoint restoration must carry the complete
+  // physical orbital frame, even when identical active theta has another history.
+  source->storeXMLNode(definition.getRoot());
+  TrainingWaveFunctionBinding binding(*source, particles, adapterOptions(), *OHMMS::Controller);
+  QMCHamiltonian hamiltonian;
+  hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  binding.setHamiltonian(hamiltonian);
+  ParticleSet live_particles(particles);
+  auto live_clone = source->makeClone(live_particles);
+  live_particles.update();
+  binding.attachLive(*live_clone, live_particles);
+  auto& clone_rotation = rotation(*live_clone);
+  auto* clone_phi = clone_rotation.Phi_.get();
+  const auto positions = particles.R;
+  const auto initial_live = binding.snapshotParameters();
+  auto invalid_live = initial_live;
+  if (OHMMS::Controller->rank() == 0)
+    invalid_live.values[0] = std::numeric_limits<double>::quiet_NaN();
+  auto* previous_bank = live_lcao.C.get();
+  CHECK_THROWS(binding.publishParameters(invalid_live, initial_live.version));
+  CHECK(binding.snapshotParameters().values == initial_live.values);
+  CHECK(live_lcao.C.get() == previous_bank);
+  for (int step = 0; step < 2; ++step)
+  {
+    auto next = binding.snapshotParameters();
+    next.values[step] += step == 0 ? 0.025 : -0.035;
+    next.values[2] += 0.0002;
+    CHECK(binding.publishParameters(next, next.version) == next.version + 1);
+    CHECK(live_rotation.Phi_.get() == fixed_phi);
+    CHECK(clone_rotation.Phi_.get() == clone_phi);
+    CHECK(live_lcao.C == lcao(clone_rotation).C);
+    CHECK(live_rotation.fullRotationCoordinates() == clone_rotation.fullRotationCoordinates());
+    source->evaluateLog(particles);
+    live_clone->evaluateLog(live_particles);
+    CHECK(source->getLogPsi() == live_clone->getLogPsi());
+    checkClose(kineticEnergy(particles), kineticEnergy(live_particles));
+  }
+  const auto saved = binding.snapshotParameters();
+  const auto saved_full = live_rotation.fullRotationCoordinates();
+  const LCAOrbitalSet::OffloadValueMatrix saved_coefficients(*live_lcao.C);
+  const auto checkpoint = std::filesystem::temp_directory_path() /
+      ("legacy_orbital_frame_" + std::to_string(OHMMS::Controller->rank()) + "_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".h5");
+  FileCleanup cleanup(checkpoint);
+  TrainingIterationState coordinator{2, saved.version, binding.parameterSchema().fingerprint()};
+  TrainingStageState stage{"orbital", 0, 2, binding.modelIdentity()};
+  TrainingCheckpoint::saveAtomic(checkpoint, binding, coordinator, stage);
+
+  ParticleSet cold_particles(sibling_particles);
+  auto cold = make_private(*sibling, cold_particles, accepted);
+  cold->storeXMLNode(definition.getRoot());
+  TrainingWaveFunctionBinding cold_binding(*cold, cold_particles, adapterOptions(), *OHMMS::Controller);
+  QMCHamiltonian cold_hamiltonian;
+  cold_hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(cold_particles), "Kinetic");
+  cold_binding.setHamiltonian(cold_hamiltonian);
+  REQUIRE(cold_binding.modelIdentity() == binding.modelIdentity());
+  TrainingIterationState cold_coordinator;
+  TrainingStageState cold_stage{"orbital", 0, 0, stage.configuration_fingerprint};
+  TrainingCheckpoint::restore(checkpoint, cold_binding, cold_coordinator, cold_stage);
+  CHECK(cold_binding.snapshotParameters().values == saved.values);
+  CHECK(cold_coordinator.completed_iterations == 2);
+  CHECK(cold_stage.completed_stage_iterations == 2);
+  auto& cold_rotation = rotation(*cold);
+  auto& cold_lcao = lcao(cold_rotation);
+  CHECK(cold_rotation.fullRotationCoordinates() == saved_full);
+  for (std::size_t i = 0; i < saved_coefficients.size(); ++i)
+    CHECK(cold_lcao.C->data()[i] == saved_coefficients.data()[i]);
+  cold->evaluateLog(cold_particles);
+  CHECK(cold->getLogPsi() == source->getLogPsi());
+  checkClose(kineticEnergy(cold_particles), kineticEnergy(particles));
+  const auto before_failure = cold_binding.snapshotParameters();
+  const auto* before_failure_bank = cold_lcao.C.get();
+  {
+    hdf_archive archive;
+    REQUIRE(archive.open(checkpoint, H5F_ACC_RDWR));
+    archive.push("wftrain_checkpoint", false);
+    archive.push("orbital_frame", false);
+    archive.push("spo_0", false);
+    std::vector<double> coefficients;
+    REQUIRE(archive.readEntry(coefficients, "accepted_coefficients"));
+    coefficients[0] += 0.1;
+    archive.write(coefficients, "accepted_coefficients");
+  }
+  CHECK_THROWS(TrainingCheckpoint::prepareRestore(checkpoint, cold_binding, cold_coordinator, cold_stage));
+  CHECK(cold_binding.snapshotParameters().version == before_failure.version);
+  CHECK(cold_lcao.C.get() == before_failure_bank);
+  TrainingCheckpoint::saveAtomic(checkpoint, binding, coordinator, stage);
+  {
+    hdf_archive archive;
+    REQUIRE(archive.open(checkpoint, H5F_ACC_RDWR));
+    REQUIRE(H5Ldelete(archive.getFileID(), "/wftrain_checkpoint/orbital_frame/spo_0/full_rotation", H5P_DEFAULT) >= 0);
+  }
+  CHECK_THROWS(TrainingCheckpoint::prepareRestore(checkpoint, cold_binding, cold_coordinator, cold_stage));
+  CHECK(cold_binding.snapshotParameters().values == before_failure.values);
+  CHECK(cold_binding.snapshotParameters().version == before_failure.version);
+  CHECK(cold_lcao.C.get() == before_failure_bank);
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      CHECK(particles.R[electron][dimension] == positions[electron][dimension]);
 }
 
 TEST_CASE("Legacy polynomial J3 products include full-gradient cross terms and isolated aliases",
