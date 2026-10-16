@@ -150,6 +150,30 @@ inline TargetVglCost estimateRetainedTargetForwardCost(const PsiFormerExecutionP
   return cost;
 }
 
+/** Extra device bytes for retaining an ordinary real-amplitude FP64 VALUE graph.
+ * Includes inverse/solve storage and the value-only layer/head tapes. Host
+ * workspace is unchanged; shared model/vendor allocations are not charged.
+ */
+inline std::size_t estimateRetainedValueIncrementBytes(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  if (batch == 0)
+    throw std::invalid_argument("Retained value preparation requires positive batch");
+  if (plan.environment().amplitude_scalar_domain != ScalarDomain::REAL)
+    throw std::invalid_argument("Retained value increment requires ordinary real amplitude metadata");
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Retained value extent overflow");
+  };
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Retained value storage overflow");
+  };
+  const auto& s = plan.modelShape();
+  const auto ne = s.electrons(), rows = mul(batch, ne);
+  const auto matrices = mul(mul(rows, s.determinants), ne);
+  const auto layers = mul(s.attention_blocks, add(mul(8, mul(rows, s.feature_dimension)),
+      mul(mul(rows, s.attention_heads), ne)));
+  return checkedDeviceBytes<double>(add(add(mul(3, matrices), mul(rows, s.determinants)), layers));
+}
+
 /** Conservative cross-tile base admission, not a reference accuracy tolerance.
  * A different sign, severe sum cancellation or a nonmatching rounded base cannot
  * be assembled into one physical root; callers may retry an admitted full graph.

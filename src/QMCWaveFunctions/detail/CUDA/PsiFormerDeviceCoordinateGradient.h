@@ -14,6 +14,8 @@
 #include "PsiFormerDeviceNetworkReverse.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerCoordinateGradientLeaf.h"
 
+#include <limits>
+
 namespace qmcplusplus::psiformer::device
 {
 
@@ -36,6 +38,49 @@ struct CoordinateGradientView
   std::size_t model_version, evaluation_generation;
 };
 
+/// Separate fixed-capacity reverse device and host payload requirements.
+struct CoordinateGradientCost
+{
+  std::size_t device_workspace_bytes = 0;
+  std::size_t host_workspace_bytes = 0;
+};
+
+/** Exact fixed-capacity no-P reverse payload, excluding its borrowed forward.
+ * Count owned numeric/status buffers only, not model images, vendor storage,
+ * allocator overhead, caller coordinates or caller gradient copies.
+ */
+inline CoordinateGradientCost estimateCoordinateGradientCost(const PsiFormerExecutionPlan& plan,
+                                                             std::size_t capacity)
+{
+  if (capacity == 0)
+    throw std::invalid_argument("Coordinate gradient preparation requires positive capacity");
+  const auto mul = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedProduct(a, b, "Coordinate gradient cost extent overflow");
+  };
+  const auto add = [](std::size_t a, std::size_t b) {
+    return spatial_detail::checkedAdd(a, b, "Coordinate gradient cost storage overflow");
+  };
+  const auto chunks = [](std::size_t n) { return n / 4096 + (n % 4096 != 0); };
+  const auto& s = plan.modelShape();
+  const auto ne = s.electrons(), rows = mul(capacity, ne);
+  const auto raw = mul(rows, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]);
+  const auto coordinates = mul(rows, 3);
+  std::size_t doubles = 0;
+  for (const auto count : {mul(11, mul(rows, s.feature_dimension)),
+      mul(mul(rows, s.attention_heads), ne), raw, mul(4, mul(mul(rows, s.determinants), ne)),
+      coordinates, capacity})
+    doubles = add(doubles, count);
+  const auto finite = checkedDeviceBytes<DerivativeFiniteStatus>(add(chunks(raw), chunks(coordinates)));
+  const auto status = add(checkedDeviceBytes<device_determinant::DerivativeStatus>(capacity),
+      checkedDeviceBytes<OpenSpatialStatus>(rows));
+  CoordinateGradientCost cost;
+  cost.device_workspace_bytes = add(checkedDeviceBytes<double>(doubles), add(finite, status));
+  cost.host_workspace_bytes = add(add(checkedDeviceBytes<double>(capacity),
+      checkedDeviceBytes<device_determinant::FactorizationMetadata>(mul(capacity, s.determinants))),
+      add(finite, status));
+  return cost;
+}
+
 /** Own only reverse storage; borrow one completed retained value forward.
  * The caller must keep the source object alive through every result access until
  * the next reverse/rebind or owner destruction: this pointer is not shared ownership.
@@ -45,6 +90,27 @@ struct CoordinateGradientView
 class PreparedDeviceCoordinateGradient
 {
 public:
+  /// Admit this reverse owner's device payload before constructing any buffers.
+  /// The retained VALUE graph and host payload remain separately reported costs.
+  static std::unique_ptr<PreparedDeviceCoordinateGradient> prepare(
+      std::shared_ptr<const PreparedDeviceModel> model, std::size_t capacity,
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, std::size_t device_budget_bytes)
+  {
+    if (!model || device_budget_bytes == 0 || device_budget_bytes == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Coordinate gradient requires a model and positive finite device byte budget");
+    model->validateCurrentDevice();
+    if (model->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL)
+      throw std::invalid_argument("Coordinate gradient requires real amplitude metadata");
+    const auto cost = estimateCoordinateGradientCost(model->plan(), capacity);
+    if (cost.device_workspace_bytes > device_budget_bytes)
+      throw std::length_error("Coordinate gradient reverse owner exceeds device byte budget");
+    auto owner = std::make_unique<PreparedDeviceCoordinateGradient>(std::move(model), capacity, queue, blas);
+    if (owner->deviceWorkspaceBytes() != cost.device_workspace_bytes ||
+        owner->hostWorkspaceBytes() != cost.host_workspace_bytes)
+      throw std::logic_error("Coordinate gradient storage disagrees with pre-allocation accounting");
+    return owner;
+  }
+
   /// Prepare fixed capacities independently of the caller's forward allocation.
   PreparedDeviceCoordinateGradient(std::shared_ptr<const PreparedDeviceModel> model, std::size_t capacity,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas)

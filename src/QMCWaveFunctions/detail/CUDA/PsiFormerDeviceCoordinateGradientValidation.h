@@ -41,10 +41,6 @@ inline void validateCoordinateGradient(std::shared_ptr<const PreparedDeviceModel
 #endif
   auto& metrics = deviceMemoryMetrics(ordinal);
   PreparedDeviceInference forward(image, count, queue, blas, SpatialJetMode::VALUE_ONLY, true);
-  const auto before_prepare = metrics.snapshot();
-  PreparedDeviceCoordinateGradient gradient(image, count, queue, blas);
-  const auto after_prepare = metrics.snapshot();
-  const auto bytes = gradient.deviceWorkspaceBytes(), host_bytes = gradient.hostWorkspaceBytes();
   const auto raw_width = image->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
   const auto chunks = [](std::size_t elements) { return elements / 4096 + (elements % 4096 != 0); };
   const auto rows = count * ne;
@@ -57,6 +53,52 @@ inline void validateCoordinateGradient(std::shared_ptr<const PreparedDeviceModel
       sizeof(device_determinant::FactorizationMetadata) * count * s.determinants +
       sizeof(device_determinant::DerivativeStatus) * count + sizeof(OpenSpatialStatus) * rows +
       sizeof(DerivativeFiniteStatus) * (chunks(rows * raw_width) + chunks(rows * 3));
+  const auto cost = estimateCoordinateGradientCost(image->plan(), count);
+  if (cost.device_workspace_bytes != expected_bytes || cost.host_workspace_bytes != expected_host_bytes)
+    throw std::runtime_error("Coordinate reverse estimator differs from independent buffer count");
+
+  // Rejections must precede all device reservations, including the network owner.
+  const auto before_reject = metrics.snapshot();
+  const auto reject = [&](std::size_t capacity, std::size_t budget, bool overflow) {
+    bool rejected = false;
+    try { (void)PreparedDeviceCoordinateGradient::prepare(image, capacity, queue, blas, budget); }
+    catch (const std::length_error&) { rejected = overflow; }
+    catch (const std::invalid_argument&) { rejected = !overflow; }
+    if (!rejected)
+      throw std::runtime_error("Coordinate gradient invalid preparation was not rejected");
+  };
+  reject(count, expected_bytes - 1, true);
+  reject(count, 0, false);
+  reject(count, std::numeric_limits<std::size_t>::max(), false);
+  reject(0, expected_bytes, false);
+  reject(std::numeric_limits<std::size_t>::max(), expected_bytes, true);
+  if (metrics.snapshot().allocation_calls != before_reject.allocation_calls)
+    throw std::runtime_error("Coordinate gradient rejected preparation allocated device storage");
+
+  // VALUE retention differs from spatial retention: eight features and one
+  // attention tape per layer, inverse/solve storage, and two head factors.
+  const auto retained_increment = estimateRetainedValueIncrementBytes(image->plan(), count);
+  const auto expected_increment = sizeof(double) * (3 * count * s.determinants * ne * ne +
+      count * s.determinants * ne + s.attention_blocks *
+      (8 * rows * s.feature_dimension + count * s.attention_heads * ne * ne));
+  {
+    PreparedDeviceInference ordinary(image, count, queue, blas, SpatialJetMode::VALUE_ONLY);
+    if (retained_increment != expected_increment ||
+        forward.deviceWorkspaceBytes() - ordinary.deviceWorkspaceBytes() != retained_increment ||
+        forward.hostWorkspaceBytes() != ordinary.hostWorkspaceBytes())
+      throw std::runtime_error("Retained VALUE increment differs from actual fixed capacities");
+  }
+  bool retained_overflow = false;
+  try { (void)estimateRetainedValueIncrementBytes(image->plan(), std::numeric_limits<std::size_t>::max()); }
+  catch (const std::length_error&) { retained_overflow = true; }
+  if (!retained_overflow)
+    throw std::runtime_error("Retained VALUE extent overflow was not rejected");
+
+  const auto before_prepare = metrics.snapshot();
+  auto admitted = PreparedDeviceCoordinateGradient::prepare(image, count, queue, blas, expected_bytes);
+  auto& gradient = *admitted;
+  const auto after_prepare = metrics.snapshot();
+  const auto bytes = gradient.deviceWorkspaceBytes(), host_bytes = gradient.hostWorkspaceBytes();
   if (bytes != expected_bytes || host_bytes != expected_host_bytes ||
       after_prepare.live_bytes - before_prepare.live_bytes != bytes)
     throw std::runtime_error("Coordinate reverse storage differs from exact owner allocation accounting");
@@ -105,6 +147,7 @@ inline void validateCoordinateGradient(std::shared_ptr<const PreparedDeviceModel
   const auto report = [&]() {
     std::cout << "Coordinate gradient capacity: B=" << count << " predicted_reverse_device_bytes=" << expected_bytes
               << " actual_reverse_device_bytes=" << bytes << " reverse_host_bytes=" << host_bytes
+              << " retained_value_device_increment_bytes=" << retained_increment
               << " borrowed_forward_device_bytes=" << gradient.borrowedForwardDeviceBytes()
               << " borrowed_forward_host_bytes=" << gradient.borrowedForwardHostBytes()
               << " max_abs_gradient_error=" << max_abs_gradient_error

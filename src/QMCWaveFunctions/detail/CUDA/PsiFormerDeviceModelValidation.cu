@@ -291,8 +291,9 @@ int main(int argc, char** argv)
       const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
       const std::vector<double> prefix(model.cfg.electrons.x.begin(),
           model.cfg.electrons.x.begin() + references.size() * model.ne * 3);
-      validateCoordinateGradient(image, model, prefix, queue, handle, true);
-      std::cout << "PASS coordinate-only trained-checkpoint spot: independent CPU all-coordinate parity\n";
+      // Include no-P admission and lifecycle contracts, not only the warmed spot.
+      validateCoordinateGradient(image, model, prefix, queue, handle, false);
+      std::cout << "PASS coordinate-only: independent CPU parity and no-P owner contracts\n";
       return 0;
     }
     // Successor images share fixed geometry/plan metadata, not old parameters.
