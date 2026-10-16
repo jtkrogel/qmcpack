@@ -99,6 +99,8 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
 {
   prototype.validatePreparedJastrowActivation(prototype);
   multideterminant_ = !prototype.findMSD().empty();
+  for (auto& determinant : prototype.findMSD())
+    determinant.get().validatePreparedCoefficientState(determinant.get());
   const auto& variables = adapter_.registrationVariables();
   for (std::size_t i = 0; i < variables.size(); ++i)
     if (variables.where(i) >= 0 &&

@@ -1416,17 +1416,24 @@ void WFTrainBatched::process(xmlNodePtr node)
 #ifdef QMC_COMPLEX
       throw UniformCommunicateError("Conventional training currently requires a real CPU build");
 #endif
-      if (student_prototype_.findSD().empty() || !student_prototype_.findMSD().empty())
-        throw UniformCommunicateError("Conventional training currently requires a fixed single Slater determinant");
+      const auto single_determinants = student_prototype_.findSD();
+      const auto multideterminants = student_prototype_.findMSD();
+      if (single_determinants.size() + multideterminants.size() != 1)
+        throw UniformCommunicateError("Conventional training requires one fixed-orbital single or multideterminant component");
+      if (!multideterminants.empty() &&
+          (population_.get_golden_electrons().groups() != 2 || multideterminants[0].get().getDetSize() != 2))
+        throw UniformCommunicateError("Conventional coefficient training currently requires two collinear spin groups");
       conventional_binding_ = std::make_unique<wftrain::TrainingWaveFunctionBinding>(
           student_prototype_, population_.get_golden_electrons(),
           wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
       const auto& variables = conventional_binding_->adapter().registrationVariables();
+      const bool nonlinear_update = optimizer == O::LINEAR_METHOD || optimizer == O::ACCELERATED_LINEAR_METHOD ||
+          optimizer == O::PROJECTED_INVERSE_ITERATION || optimizer == O::MINIMUM_PROJECTED_INVERSE_ITERATION;
       for (std::size_t variable = 0; variable < variables.size(); ++variable)
-        if (variables.where(variable) >= 0 && variables.getType(variable) == optimize::LINEAR_P)
-          throw UniformCommunicateError("Conventional optimizer admission currently requires nonlinear Jastrow coordinates; CI update normalization is not yet qualified");
+        if (nonlinear_update && variables.where(variable) >= 0 && variables.getType(variable) == optimize::LINEAR_P)
+          throw UniformCommunicateError("Conventional LM/ALM/PII updates currently require nonlinear coordinates; CI update normalization is not yet qualified");
       // Fail before population initialization/sampling for unqualified fixed assets.
       conventional_binding_->modelIdentity();
       providers.emplace_back(*conventional_binding_);
