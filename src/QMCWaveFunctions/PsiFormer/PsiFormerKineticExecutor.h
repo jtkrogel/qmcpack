@@ -148,6 +148,14 @@ public:
   DirectKineticTrunkWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
                               GeometryPositionView nuclei,
                               GeometryBoundary boundary = {})
+      : DirectKineticTrunkWorkspace(plan, nuclei, boundary, 0)
+  {}
+
+protected:
+  /// Only admitted complete-owner construction selects compact derivative capacity.
+  DirectKineticTrunkWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                              GeometryPositionView nuclei, GeometryBoundary boundary,
+                              std::size_t maximum_targets)
       : electrons_(plan.modelShape().electrons()),
         nuclei_(plan.modelShape().nuclei),
         determinants_(plan.modelShape().determinants),
@@ -156,8 +164,9 @@ public:
         blocks_(plan.modelShape().attention_blocks),
         head_width_(width_ / heads_),
         input_width_(plan.parameter(qmcplusplus::psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]),
-        gradient_lanes_(3 * electrons_),
-        laplacian_lanes_(electrons_),
+        gradient_lanes_(3 * (maximum_targets ? maximum_targets : electrons_)),
+        laplacian_lanes_(maximum_targets ? maximum_targets : electrons_),
+        target_capacity_(maximum_targets),
         feature_elements_(electrons_ * width_),
         attention_elements_(heads_ * electrons_ * electrons_),
         orbital_elements_(determinants_ * electrons_ * electrons_),
@@ -222,6 +231,7 @@ public:
     }
   }
 
+public:
   /// Prevent copying the large clone-local tape.
   DirectKineticTrunkWorkspace(const DirectKineticTrunkWorkspace&) = delete;
 
@@ -411,6 +421,7 @@ protected:
   std::size_t input_width_;
   std::size_t gradient_lanes_;
   std::size_t laplacian_lanes_;
+  std::size_t target_capacity_ = 0, target_begin_ = 0;
   std::size_t feature_elements_;
   std::size_t attention_elements_;
   std::size_t orbital_elements_;
@@ -462,6 +473,10 @@ protected:
   std::size_t reverse_generation_ = 0;
   bool reverse_valid_ = false;
   std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+
+  /// Primal values visit all rows; only derivative endpoints use compact physical targets.
+  bool containsTarget(std::size_t electron) const noexcept
+  { return electron >= target_begin_ && electron - target_begin_ < laplacian_lanes_; }
 };
 
 /** Complete legacy real head and determinant storage, absent from the trunk-only tape. */
@@ -471,7 +486,14 @@ public:
   /// Allocate the unchanged complete real numerical buffers.
   DirectKineticWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
                          GeometryPositionView nuclei, GeometryBoundary boundary = {})
-      : DirectKineticTrunkWorkspace(plan, nuclei, boundary),
+      : DirectKineticWorkspace(plan, nuclei, boundary, 0)
+  {}
+
+private:
+  /// Factory admission precedes every compact numeric allocation; FULL delegates unchanged.
+  DirectKineticWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                         GeometryPositionView nuclei, GeometryBoundary boundary, std::size_t maximum_targets)
+      : DirectKineticTrunkWorkspace(plan, nuclei, boundary, maximum_targets),
         orbitals_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
         backflows_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
         envelopes_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
@@ -492,6 +514,7 @@ public:
         matrix_scratch_c_(electrons_ * electrons_)
   {}
 
+public:
   /// Return the complete canonical kinetic-response backing storage.
   const double* kineticData() const noexcept { return kinetic_parameter_response_.data(); }
 
@@ -557,7 +580,7 @@ public:
   std::size_t requiredStorageBytes() const
   {
     return kineticWorkspaceStorageRequirement(
-        {electrons_, nuclei_, determinants_, width_, heads_, input_width_, blocks_, parameter_score_.size()});
+        {electrons_, nuclei_, determinants_, width_, heads_, input_width_, blocks_, parameter_score_.size()}, target_capacity_);
   }
 
 private:
@@ -580,6 +603,7 @@ private:
   std::vector<double> matrix_scratch_a_;
   std::vector<double> matrix_scratch_b_;
   std::vector<double> matrix_scratch_c_;
+  bool target_gradient_only_ = false;
 };
 
 /// Select complete legacy real evaluation or a head-free numerical trunk.
@@ -639,6 +663,41 @@ public:
       throw std::logic_error("Trunk-only kinetic executor cannot construct a real head");
     return std::make_unique<DirectKineticWorkspace>(
         plan_, GeometryPositionView::interleaved(nuclei_.data(), plan_.modelShape().nuclei), boundary_);
+  }
+
+  /// Admit complete compact kinetic storage before any numeric tape allocation.
+  std::unique_ptr<DirectKineticWorkspace> makeTargetWorkspace(std::size_t maximum_targets, std::size_t byte_cap) const
+  {
+    if (preparation_ != DirectKineticPreparation::REAL_WAVEFUNCTION)
+      throw std::logic_error("Trunk-only kinetic executor cannot construct a real target head");
+    const auto& s = plan_.modelShape();
+    const auto bytes = targetKineticWorkspaceStorageRequirement({s.electrons(), s.nuclei, s.determinants,
+        s.feature_dimension, s.attention_heads, plan_.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
+        s.attention_blocks, plan_.parameterCount()}, maximum_targets);
+    if (!byte_cap || byte_cap == std::numeric_limits<std::size_t>::max() || bytes > byte_cap)
+      throw std::length_error("PsiFormer target kinetic owner exceeds its explicit numeric cap");
+    auto result = std::unique_ptr<DirectKineticWorkspace>(new DirectKineticWorkspace(plan_,
+        GeometryPositionView::interleaved(nuclei_.data(), s.nuclei), boundary_, maximum_targets));
+    result->owner_ = this;
+    return result;
+  }
+
+  /// Publish only complete canonical target responses; no full-Ne coordinate outputs are implied.
+  DirectKineticResultView evaluateTargets(DirectKineticWorkspace& workspace, const double* total_log_gradient = nullptr,
+      std::size_t gradient_size = 0, const double* inverse_masses = nullptr, std::size_t mass_count = 0) const;
+
+  /// Reuse response storage for the imaginary total-drift cross term with NO Laplacian root.
+  DirectKineticConstView evaluateTargetGradientParameterResponse(DirectKineticWorkspace& workspace,
+      const double* total_log_gradient, std::size_t gradient_size, const double* inverse_masses = nullptr,
+      std::size_t mass_count = 0) const;
+
+  /// Reject failed/mutated/stale requests before exposing complete target parameter publication.
+  DirectKineticConstView targetParameterResponse(const DirectKineticWorkspace& workspace) const
+  {
+    if (workspace.owner_ != this || !workspace.target_capacity_ || !workspace.reverse_valid_ ||
+        workspace.observed_parameter_version_ != parameters_.version())
+      throw std::logic_error("PsiFormer target kinetic response is stale or unavailable");
+    return {workspace.kinetic_parameter_response_.data(), workspace.kinetic_parameter_response_.size()};
   }
 
   /// Count the executor's copied fixed-ion numerical metadata, separate from tape buffers.
@@ -894,7 +953,11 @@ private:
   /// Run a complete lifted reverse for the currently seeded root adjoint.
   void reverse(const double* parameters,
                DirectKineticWorkspace& workspace,
-               std::vector<double>& destination) const;
+               std::vector<double>& destination, bool preserve = false) const;
+
+  /// Common unchanged ordered FULL algebra, with mapped derivative lanes only for explicit target owners.
+  DirectKineticResultView evaluateTile(DirectKineticWorkspace& workspace, const double* drift,
+      std::size_t gradient_size, const double* masses, std::size_t mass_count) const;
 
   /// Multiply two square row-major matrices into caller-owned scratch.
   static void matrixProduct(const double* left,
@@ -1257,10 +1320,13 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
           raw.value[radial_element + 4 + component] =
               complementary[pair][component] * radial.log1p_over_radius;
 
+      if (!workspace.containsTarget(electron))
+        continue;
+      const std::size_t local_electron = electron - workspace.target_begin_;
       for (std::size_t derivative_dimension = 0; derivative_dimension < 3;
            ++derivative_dimension)
       {
-        const std::size_t lane = 3 * electron + derivative_dimension;
+        const std::size_t lane = 3 * local_electron + derivative_dimension;
         const double radius_gradient = distance_gradients[pair][derivative_dimension];
         raw.gradient[gradientIndex(raw, lane, radial_element)] =
             radial.log1p_first * radius_gradient;
@@ -1278,7 +1344,7 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
         }
       }
 
-      raw.laplacian[laplacianIndex(raw, electron, radial_element)] =
+      raw.laplacian[laplacianIndex(raw, local_electron, radial_element)] =
           radial.log1p_second * distance_gradient_norms[pair] +
           radial.log1p_first * distance_laplacians[pair];
       for (std::size_t component = 0; component < 3; ++component)
@@ -1297,12 +1363,12 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
         const double radial_trace =
             radial.log1p_over_radius_second * distance_gradient_norms[pair] +
             radial.log1p_over_radius_first * distance_laplacians[pair];
-        raw.laplacian[laplacianIndex(raw, electron, radial_element + 1 + component)] =
+        raw.laplacian[laplacianIndex(raw, local_electron, radial_element + 1 + component)] =
             displacement_laplacians[pair][component] * radial.log1p_over_radius +
             2 * radial.log1p_over_radius_first * displacement_gradient_dot_radius_gradient +
             displacement[component] * radial_trace;
         if (periodic)
-          raw.laplacian[laplacianIndex(raw, electron, radial_element + 4 + component)] =
+          raw.laplacian[laplacianIndex(raw, local_electron, radial_element + 4 + component)] =
               complementary_laplacians[pair][component] * radial.log1p_over_radius +
               2 * radial.log1p_over_radius_first * complementary_gradient_dot_radius_gradient +
               complementary[pair][component] * radial_trace;
@@ -1578,13 +1644,16 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
           const double radial_first   = -decay_rate * weighted_value;
           const double radial_second  = decay_rate * decay_rate * weighted_value;
           envelopes.value[matrix_element] += weighted_value;
+          if (!workspace.containsTarget(electron))
+            continue;
+          const std::size_t local_electron = electron - workspace.target_begin_;
           for (std::size_t dimension = 0; dimension < 3; ++dimension)
           {
-            const std::size_t lane = 3 * electron + dimension;
+            const std::size_t lane = 3 * local_electron + dimension;
             envelopes.gradient[gradientIndex(envelopes, lane, matrix_element)] +=
                 radial_first * distance_gradients[pair][dimension];
           }
-          envelopes.laplacian[laplacianIndex(envelopes, electron, matrix_element)] +=
+          envelopes.laplacian[laplacianIndex(envelopes, local_electron, matrix_element)] +=
               radial_second * distance_gradient_norms[pair] +
               radial_first * distance_laplacians[pair];
         }
@@ -1637,14 +1706,18 @@ inline double DirectKineticExecutor::buildCusp(const double* parameters,
     {
       const double component =
           radial_first * distance_gradients[pair_index][dimension];
-      workspace.cusp_gradient_[3 * pair.first + dimension] += component;
-      workspace.cusp_gradient_[3 * pair.second + dimension] -= component;
+      if (workspace.containsTarget(pair.first))
+        workspace.cusp_gradient_[3 * (pair.first - workspace.target_begin_) + dimension] += component;
+      if (workspace.containsTarget(pair.second))
+        workspace.cusp_gradient_[3 * (pair.second - workspace.target_begin_) + dimension] -= component;
     }
     const double pair_laplacian =
         radial_second * distance_gradient_norms[pair_index] +
         radial_first * distance_laplacians[pair_index];
-    workspace.cusp_laplacian_[pair.first] += pair_laplacian;
-    workspace.cusp_laplacian_[pair.second] += pair_laplacian;
+    if (workspace.containsTarget(pair.first))
+      workspace.cusp_laplacian_[pair.first - workspace.target_begin_] += pair_laplacian;
+    if (workspace.containsTarget(pair.second))
+      workspace.cusp_laplacian_[pair.second - workspace.target_begin_] += pair_laplacian;
   }
   return value;
 }
@@ -1946,23 +2019,27 @@ inline void DirectKineticExecutor::reverseOrbitals(
           double pi_contribution = workspace.envelope_adjoint_.value[matrix_element] * decay;
           double zeta_contribution =
               workspace.envelope_adjoint_.value[matrix_element] * zeta_value;
-          for (std::size_t dimension = 0; dimension < 3; ++dimension)
+          if (workspace.containsTarget(electron))
           {
-            const std::size_t lane = 3 * electron + dimension;
-            const double radial_gradient = distance_gradients[pair][dimension];
-            const double upstream = workspace.envelope_adjoint_.gradient[
-                gradientIndex(workspace.envelope_adjoint_, lane, matrix_element)];
-            pi_contribution += upstream * pi_gradient_radial * radial_gradient;
-            zeta_contribution += upstream * zeta_gradient_radial * radial_gradient;
+            const std::size_t local_electron = electron - workspace.target_begin_;
+            for (std::size_t dimension = 0; dimension < 3; ++dimension)
+            {
+              const std::size_t lane = 3 * local_electron + dimension;
+              const double radial_gradient = distance_gradients[pair][dimension];
+              const double upstream = workspace.envelope_adjoint_.gradient[
+                  gradientIndex(workspace.envelope_adjoint_, lane, matrix_element)];
+              pi_contribution += upstream * pi_gradient_radial * radial_gradient;
+              zeta_contribution += upstream * zeta_gradient_radial * radial_gradient;
+            }
+            const double laplacian_upstream = workspace.envelope_adjoint_.laplacian[
+                laplacianIndex(workspace.envelope_adjoint_, local_electron, matrix_element)];
+            pi_contribution += laplacian_upstream *
+                (pi_radial_second * distance_gradient_norms[pair] +
+                 pi_gradient_radial * distance_laplacians[pair]);
+            zeta_contribution += laplacian_upstream *
+                (zeta_radial_second * distance_gradient_norms[pair] +
+                 zeta_gradient_radial * distance_laplacians[pair]);
           }
-          const double laplacian_upstream = workspace.envelope_adjoint_.laplacian[
-              laplacianIndex(workspace.envelope_adjoint_, electron, matrix_element)];
-          pi_contribution += laplacian_upstream *
-              (pi_radial_second * distance_gradient_norms[pair] +
-               pi_gradient_radial * distance_laplacians[pair]);
-          zeta_contribution += laplacian_upstream *
-              (zeta_radial_second * distance_gradient_norms[pair] +
-               zeta_gradient_radial * distance_laplacians[pair]);
           pi_response[parameter_index] += pi_contribution;
           zeta_response[parameter_index] += zeta_contribution;
         }
@@ -2017,12 +2094,14 @@ inline void DirectKineticExecutor::reverseCusp(
     {
       const double directional = radial_first_derivative *
           distance_gradients[pair_index][dimension];
-      contribution += workspace.root_adjoint_.gradient[3 * pair.first + dimension] * directional;
-      contribution -= workspace.root_adjoint_.gradient[3 * pair.second + dimension] * directional;
+      if (workspace.containsTarget(pair.first))
+        contribution += workspace.root_adjoint_.gradient[3 * (pair.first - workspace.target_begin_) + dimension] * directional;
+      if (workspace.containsTarget(pair.second))
+        contribution -= workspace.root_adjoint_.gradient[3 * (pair.second - workspace.target_begin_) + dimension] * directional;
     }
     contribution +=
-        (workspace.root_adjoint_.laplacian[pair.first] +
-         workspace.root_adjoint_.laplacian[pair.second]) *
+        ((workspace.containsTarget(pair.first) ? workspace.root_adjoint_.laplacian[pair.first - workspace.target_begin_] : 0.0) +
+         (workspace.containsTarget(pair.second) ? workspace.root_adjoint_.laplacian[pair.second - workspace.target_begin_] : 0.0)) *
         (radial_second_derivative * distance_gradient_norms[pair_index] +
          radial_first_derivative * distance_laplacians[pair_index]);
     if (same_spin)
@@ -2384,15 +2463,19 @@ inline void DirectKineticExecutor::reverseEmbedding(
 /// Execute one complete root-seeded lifted reverse into a canonical response.
 inline void DirectKineticExecutor::reverse(const double* parameters,
                                            DirectKineticWorkspace& workspace,
-                                           std::vector<double>& destination) const
+                                           std::vector<double>& destination, bool preserve) const
 {
-  std::fill(destination.begin(), destination.end(), 0.0);
+  if (!preserve)
+    std::fill(destination.begin(), destination.end(), 0.0);
   reverseDeterminant(workspace);
   reverseOrbitals(parameters, workspace, destination);
   for (std::size_t reverse_index = workspace.blocks_; reverse_index > 0; --reverse_index)
     reverseAttentionBlock(parameters, reverse_index - 1, workspace, destination);
   reverseEmbedding(workspace, destination);
   reverseCusp(parameters, workspace, destination);
+  // Target requests run a variable number of passes; retain canonical ping-pong ownership.
+  if (workspace.target_capacity_ && workspace.blocks_ % 2)
+    std::swap(workspace.feature_adjoint_a_, workspace.feature_adjoint_b_);
 }
 
 /// Evaluate the shared forward tape, score reverse, and kinetic-response reverse.
@@ -2413,8 +2496,18 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
     const double* inverse_masses,
     std::size_t inverse_mass_count) const
 {
+  if (workspace.target_capacity_)
+    throw std::invalid_argument("Compact kinetic owners require evaluateTargets");
+  return evaluateTile(workspace, total_log_gradient, total_log_gradient_size, inverse_masses, inverse_mass_count);
+}
+
+/// Retain the FULL operation order while compact requests map physical root coefficients.
+inline DirectKineticResultView DirectKineticExecutor::evaluateTile(
+    DirectKineticWorkspace& workspace, const double* total_log_gradient, std::size_t total_log_gradient_size,
+    const double* inverse_masses, std::size_t inverse_mass_count) const
+{
   validateWorkspace(workspace);
-  if ((total_log_gradient && total_log_gradient_size != workspace.gradient_lanes_) ||
+  if ((total_log_gradient && total_log_gradient_size != 3 * workspace.electrons_) ||
       (!total_log_gradient && total_log_gradient_size != 0))
     throw std::invalid_argument("PsiFormer total TrialWaveFunction drift has the wrong size");
   if (total_log_gradient)
@@ -2422,7 +2515,7 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
       if (!is_finite_parameter_value(total_log_gradient[lane]))
         throw std::invalid_argument(
             "PsiFormer total TrialWaveFunction drift must be finite");
-  if ((inverse_masses && inverse_mass_count != workspace.laplacian_lanes_) ||
+  if ((inverse_masses && inverse_mass_count != workspace.electrons_) ||
       (!inverse_masses && inverse_mass_count != 0))
     throw std::invalid_argument("PsiFormer inverse-mass view has the wrong size");
   if (inverse_masses)
@@ -2471,11 +2564,11 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
   const double logabs = determinant_result.amplitude.log_abs + cusp_value;
   if (!is_finite_parameter_value(logabs))
     throw std::runtime_error("PsiFormer kinetic executor produced a non-finite log amplitude");
-  for (double value : workspace.output_gradient_)
-    if (!is_finite_parameter_value(value))
+  for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
+    if (!is_finite_parameter_value(workspace.output_gradient_[lane]))
       throw std::runtime_error("PsiFormer kinetic executor produced a non-finite drift");
-  for (double value : workspace.output_lap_log_)
-    if (!is_finite_parameter_value(value))
+  for (std::size_t lane = 0; lane < workspace.laplacian_lanes_; ++lane)
+    if (!is_finite_parameter_value(workspace.output_lap_log_[lane]))
       throw std::runtime_error("PsiFormer kinetic executor produced a non-finite Laplacian");
 
   // Coordinate jets of B=d log(det-sum)/dA are the determinant-specific factors
@@ -2484,23 +2577,25 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
 
   workspace.root_adjoint_.clear();
   workspace.root_adjoint_.value[0] = 1.0;
-  reverse(parameter_values, workspace, workspace.parameter_score_);
+  if (!workspace.target_capacity_ || (!workspace.target_begin_ && !workspace.target_gradient_only_))
+    reverse(parameter_values, workspace, workspace.parameter_score_);
 
   workspace.root_adjoint_.clear();
   const double* drift = total_log_gradient ? total_log_gradient
                                            : workspace.output_gradient_.data();
   for (std::size_t lane = 0; lane < workspace.gradient_lanes_; ++lane)
   {
-    const std::size_t electron = lane / 3;
+    const std::size_t electron = workspace.target_begin_ + lane / 3;
     const double inverse_mass = inverse_masses ? inverse_masses[electron] : 1.0;
-    workspace.root_adjoint_.gradient[lane] = -inverse_mass * drift[lane];
+    workspace.root_adjoint_.gradient[lane] = -inverse_mass * drift[total_log_gradient ? 3 * workspace.target_begin_ + lane : lane];
   }
   for (std::size_t electron = 0; electron < workspace.laplacian_lanes_; ++electron)
   {
-    const double inverse_mass = inverse_masses ? inverse_masses[electron] : 1.0;
-    workspace.root_adjoint_.laplacian[electron] = -0.5 * inverse_mass;
+    const double inverse_mass = inverse_masses ? inverse_masses[workspace.target_begin_ + electron] : 1.0;
+    workspace.root_adjoint_.laplacian[electron] = workspace.target_gradient_only_ ? 0.0 : -0.5 * inverse_mass;
   }
-  reverse(parameter_values, workspace, workspace.kinetic_parameter_response_);
+  reverse(parameter_values, workspace, workspace.kinetic_parameter_response_,
+          workspace.target_capacity_ && workspace.target_begin_ != 0);
 
   for (double value : workspace.parameter_score_)
     if (!is_finite_parameter_value(value))
@@ -2524,6 +2619,48 @@ inline DirectKineticResultView DirectKineticExecutor::evaluate(
           workspace.observed_parameter_version_};
 }
 
+/// Stream complete physical targets into one P accumulator and publish only at the end.
+inline DirectKineticResultView DirectKineticExecutor::evaluateTargets(DirectKineticWorkspace& workspace,
+    const double* drift, std::size_t gradient_size, const double* masses, std::size_t mass_count) const
+{
+  workspace.reverse_valid_ = false;
+  if (workspace.owner_ != this || !workspace.target_capacity_)
+    throw std::invalid_argument("Target kinetic request requires its prepared owner");
+  workspace.target_gradient_only_ = false;
+  DirectKineticResultView result;
+  for (std::size_t begin = 0; begin < workspace.electrons_; begin += workspace.target_capacity_)
+  {
+    workspace.target_begin_ = begin;
+    workspace.laplacian_lanes_ = std::min(workspace.target_capacity_, workspace.electrons_ - begin);
+    workspace.gradient_lanes_ = 3 * workspace.laplacian_lanes_;
+    result = evaluateTile(workspace, drift, gradient_size, masses, mass_count);
+  }
+  workspace.reverse_valid_ = true;
+  result.gradient = result.lap_log = result.lap_ratio = {}; // Last-tile jets are not full-Ne outputs.
+  return result;
+}
+
+/// Consume imaginary TOTAL drift without seeding another Laplacian or allocating another P vector.
+inline DirectKineticConstView DirectKineticExecutor::evaluateTargetGradientParameterResponse(
+    DirectKineticWorkspace& workspace, const double* drift, std::size_t gradient_size,
+    const double* masses, std::size_t mass_count) const
+{
+  (void)targetParameterResponse(workspace);
+  workspace.reverse_valid_ = false;
+  if (!drift)
+    throw std::invalid_argument("Target gradient-only kinetic request requires complete drift");
+  workspace.target_gradient_only_ = true;
+  for (std::size_t begin = 0; begin < workspace.electrons_; begin += workspace.target_capacity_)
+  {
+    workspace.target_begin_ = begin;
+    workspace.laplacian_lanes_ = std::min(workspace.target_capacity_, workspace.electrons_ - begin);
+    workspace.gradient_lanes_ = 3 * workspace.laplacian_lanes_;
+    (void)evaluateTile(workspace, drift, gradient_size, masses, mass_count);
+  }
+  workspace.reverse_valid_ = true;
+  return targetParameterResponse(workspace);
+}
+
 /// Apply a gradient-only reverse to the forward tape retained by the latest evaluation.
 inline DirectKineticConstView DirectKineticExecutor::evaluateGradientParameterResponse(
     DirectKineticWorkspace& workspace,
@@ -2533,6 +2670,8 @@ inline DirectKineticConstView DirectKineticExecutor::evaluateGradientParameterRe
     std::size_t inverse_mass_count) const
 {
   validateWorkspace(workspace);
+  if (workspace.target_capacity_)
+    throw std::invalid_argument("Compact owners require the target gradient-only entry point");
   if (workspace.observed_parameter_version_ != parameters_.version())
     throw std::logic_error(
         "PsiFormer gradient-only kinetic reverse requires a current forward tape");
@@ -2571,6 +2710,8 @@ inline DirectKineticConstView DirectKineticExecutor::evaluateGradientParameterRe
 inline DirectKineticTrunkResultView DirectKineticExecutor::evaluateTrunk(
     DirectKineticTrunkWorkspace& workspace) const
 {
+  if (workspace.target_capacity_)
+    throw std::invalid_argument("Compact kinetic owners cannot expose a FULL trunk ticket");
   workspace.forward_valid_ = false;
   workspace.reverse_valid_ = false;
   ++workspace.reverse_generation_;
@@ -2607,6 +2748,8 @@ inline DirectKineticConstView DirectKineticExecutor::reverseTrunk(
     DirectKineticTrunkWorkspace& workspace, const DirectKineticTrunkResultView& ticket,
     const DirectTraceJetBuffer& feature_seeds, const DirectTraceJetBuffer& cusp_seeds) const
 {
+  if (workspace.target_capacity_)
+    throw std::invalid_argument("Compact kinetic owners cannot consume a FULL trunk ticket");
   workspace.reverse_valid_ = false;
   ++workspace.reverse_generation_;
   std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);

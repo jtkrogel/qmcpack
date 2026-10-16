@@ -467,6 +467,135 @@ TEST_CASE("PsiFormer exact graph-free score and kinetic response LiH",
   validateSystem("lih", lihGolden(), true);
 }
 
+TEST_CASE("PsiFormer compact kinetic targets preserve complete parameter responses",
+          "[wavefunction][psiformer][kinetic][target]")
+{
+  using qmcplusplus::psiformer::ParameterRole;
+  for (bool periodic : {false, true})
+  {
+    CAPTURE(periodic);
+    auto files = generateFiles("lih", 1, periodic ? 7 : 4);
+    pf::PsiFormer model(pf::Parameters(files.parameters), pf::ConfigData(files.configuration), 16, 256, 4, 1);
+    qmcplusplus::psiformer::ExecutionEnvironment environment;
+    if (periodic)
+    {
+      environment.boundary = qmcplusplus::psiformer::BoundaryCondition::PERIODIC;
+      environment.geometry_feature_policy = qmcplusplus::psiformer::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+      environment.lattice_vectors = {{{8.0, 0.0, 0.0}, {0.6, 7.4, 0.0}, {-0.3, 0.5, 8.5}}};
+      environment.periodic_axes = {{true, true, true}};
+    }
+    const auto plan = qmcplusplus::psiformer::PsiFormerExecutionPlan::fromParameters(model.p,
+        {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads, model.blocks}, environment);
+    const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim,
+        model.heads, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, plan.parameterCount()};
+    pf::DirectKineticExecutor executor(model, plan);
+    auto full = executor.makeWorkspace();
+    const auto positions = model.cfg.configuration(0);
+    full->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+    const auto initial = executor.evaluate(*full);
+    std::vector<double> drift(3 * model.ne), imaginary(drift.size()), extra(drift.size()), masses(model.ne);
+    for (std::size_t i = 0; i < drift.size(); ++i)
+    {
+      extra[i] = 0.013 * (int(i % 5) - 2);
+      drift[i] = initial.gradient[i] + extra[i];
+      imaginary[i] = 0.017 * (int(i % 7) - 3);
+    }
+    for (std::size_t i = 0; i < model.ne; ++i) masses[i] = 0.55 + 0.17 * i;
+    const auto baseline = executor.evaluate(*full, drift.data(), drift.size(), masses.data(), masses.size());
+    const std::vector<double> score(baseline.parameter_score.begin(), baseline.parameter_score.end());
+    const std::vector<double> response(baseline.kinetic_parameter_response.begin(), baseline.kinetic_parameter_response.end());
+    const auto imaginary_view = executor.evaluateGradientParameterResponse(*full, imaginary.data(), imaginary.size(), masses.data(), masses.size());
+    const std::vector<double> imaginary_response(imaginary_view.begin(), imaginary_view.end());
+    REQUIRE_THROWS_AS(executor.makeTargetWorkspace(0, 1), std::invalid_argument);
+    REQUIRE_THROWS_AS(executor.makeTargetWorkspace(model.ne + 1, 1), std::invalid_argument);
+    auto huge_shape = shape;
+    huge_shape.parameter_count = std::numeric_limits<std::size_t>::max();
+    REQUIRE_THROWS(pf::targetKineticWorkspaceStorageRequirement(huge_shape, 1));
+    for (std::size_t k : {std::size_t(1), std::size_t(3), model.ne})
+    {
+      CAPTURE(k);
+      const auto bytes = pf::targetKineticWorkspaceStorageRequirement(shape, k);
+      REQUIRE_THROWS_AS(executor.makeTargetWorkspace(k, bytes - 1), std::length_error);
+      auto target = executor.makeTargetWorkspace(k, bytes);
+      REQUIRE(target->vectorStorageBytes() == bytes);
+      REQUIRE(target->requiredStorageBytes() == bytes);
+      CHECK((k == model.ne || bytes < full->vectorStorageBytes()));
+      target->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+      REQUIRE_THROWS(executor.targetParameterResponse(*target));
+      REQUIRE_THROWS(executor.evaluate(*target));
+      const auto fingerprint = target->storageFingerprint();
+      const auto result = executor.evaluateTargets(*target, drift.data(), drift.size(), masses.data(), masses.size());
+      CHECK(result.gradient.empty()); CHECK(result.lap_log.empty()); CHECK(result.lap_ratio.empty());
+      checkClose(result.logabs, baseline.logabs, 2e-11, 2e-11);
+      const auto generation = target->resultGeneration();
+      const pf::DirectTraceJetBuffer empty_seed;
+      REQUIRE_THROWS_AS(executor.evaluateTrunk(*target), std::invalid_argument);
+      REQUIRE_THROWS_AS(executor.reverseTrunk(*target, {}, empty_seed, empty_seed), std::invalid_argument);
+      CHECK(target->resultGeneration() == generation);
+      REQUIRE(executor.targetParameterResponse(*target).size() == plan.parameterCount());
+      for (std::size_t i = 0; i < plan.parameterCount(); ++i)
+      {
+        checkClose(result.parameter_score[i], score[i], 2e-10, 2e-10); // Score is NOT summed once per K tile.
+        checkClose(result.kinetic_parameter_response[i], response[i], 2e-10, 2e-10);
+      }
+      const auto cross = executor.evaluateTargetGradientParameterResponse(*target, imaginary.data(), imaginary.size(), masses.data(), masses.size());
+      for (std::size_t i = 0; i < plan.parameterCount(); ++i)
+        checkClose(cross[i], imaginary_response[i], 2e-10, 2e-10); // Ordinary i*cross, no extra Laplacian/conjugation.
+      allocation_count.store(0, std::memory_order_relaxed);
+      count_allocations.store(true, std::memory_order_relaxed);
+      volatile double sink = executor.evaluateTargets(*target, drift.data(), drift.size(), masses.data(), masses.size()).kinetic_parameter_response[0];
+      sink += executor.evaluateTargetGradientParameterResponse(*target, imaginary.data(), imaginary.size(), masses.data(), masses.size())[0];
+      count_allocations.store(false, std::memory_order_relaxed);
+      CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
+      CHECK(target->storageFingerprint() == fingerprint);
+      CHECK(std::isfinite(sink));
+      target->setPosition(0, 0, positions.x[0]);
+      REQUIRE_THROWS(executor.targetParameterResponse(*target));
+      REQUIRE_THROWS(executor.evaluateTargetGradientParameterResponse(*target, imaginary.data(), imaginary.size()));
+      auto invalid_masses = masses;
+      invalid_masses.back() = 0;
+      REQUIRE_THROWS(executor.evaluateTargets(*target, drift.data(), drift.size(), invalid_masses.data(), invalid_masses.size()));
+      REQUIRE_THROWS(executor.targetParameterResponse(*target));
+      auto overflowing_drift = drift;
+      overflowing_drift.back() = 1e20;
+      invalid_masses = masses; invalid_masses.back() = 1e300;
+      REQUIRE_THROWS(executor.evaluateTargets(*target, overflowing_drift.data(), overflowing_drift.size(), invalid_masses.data(), invalid_masses.size()));
+      REQUIRE_THROWS(executor.targetParameterResponse(*target)); // K1/K3 fail only after earlier physical targets completed.
+      (void)executor.evaluateTargets(*target, drift.data(), drift.size(), masses.data(), masses.size());
+      REQUIRE(executor.targetParameterResponse(*target).size() == plan.parameterCount());
+      CHECK(target->storageFingerprint() == fingerprint);
+      std::cout << "CPU target kinetic periodic=" << periodic << " K=" << k << " bytes=" << bytes
+                << " full_bytes=" << full->vectorStorageBytes() << " warmed_allocations=0\n";
+    }
+
+    // Selected independent parameter FD uses the original mass-weighted mixed kinetic observable.
+    auto target = executor.makeTargetWorkspace(3, pf::targetKineticWorkspaceStorageRequirement(shape, 3));
+    target->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
+    constexpr double step = 2e-5;
+    for (auto parameter : {plan.parameter(ParameterRole::ENVELOPE_PI_UP).begin,
+                           plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin})
+    {
+      const double original = model.p.flat_values()[parameter];
+      (void)executor.evaluateTargets(*target, drift.data(), drift.size(), masses.data(), masses.size());
+      model.p.set_flat_value(parameter, original + step);
+      REQUIRE_THROWS(executor.targetParameterResponse(*target));
+      const double plus = massWeightedMixedKinetic(executor.evaluate(*full), extra, masses);
+      model.p.set_flat_value(parameter, original - step);
+      const double minus = massWeightedMixedKinetic(executor.evaluate(*full), extra, masses);
+      model.p.set_flat_value(parameter, original);
+      checkClose(response[parameter], (plus - minus) / (2 * step), 2e-4, 2e-4);
+    }
+    // Zero envelope coefficient/absolute-zeta subgradient and cusp factor stay on existing algebra.
+    model.p.set_flat_value(plan.parameter(ParameterRole::ENVELOPE_PI_UP).begin, 0);
+    model.p.set_flat_value(plan.parameter(ParameterRole::ENVELOPE_ZETA_UP).begin, 0);
+    model.p.set_flat_value(plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin, 0);
+    const auto zero_full = executor.evaluate(*full, drift.data(), drift.size(), masses.data(), masses.size());
+    const auto zero_target = executor.evaluateTargets(*target, drift.data(), drift.size(), masses.data(), masses.size());
+    for (std::size_t i = 0; i < plan.parameterCount(); ++i)
+      checkClose(zero_target.kinetic_parameter_response[i], zero_full.kinetic_parameter_response[i], 2e-10, 2e-10);
+  }
+}
+
 TEST_CASE("PsiFormer exact graph-free score and kinetic response separated pair",
           "[wavefunction][psiformer][kinetic]")
 {

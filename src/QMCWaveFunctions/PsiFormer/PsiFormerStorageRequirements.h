@@ -878,11 +878,14 @@ inline std::size_t traceJetStorageRequirement(std::size_t values,
 }
 
 /// Estimate the fixed exact kinetic-response tape, including geometry and factors.
-inline std::size_t kineticWorkspaceStorageRequirement(const PsiFormerStorageShape& shape)
+inline std::size_t kineticWorkspaceStorageRequirement(const PsiFormerStorageShape& shape,
+                                                      std::size_t target_capacity = 0)
 {
+  const std::size_t laplacian_lanes = target_capacity ? target_capacity : shape.electrons;
+  if (laplacian_lanes > shape.electrons)
+    throw std::invalid_argument("PsiFormer kinetic targets exceed physical electrons");
   const std::size_t gradient_lanes = checkedStorageProduct(
-      3, shape.electrons, "PsiFormer kinetic gradient extent overflowed");
-  const std::size_t laplacian_lanes = shape.electrons;
+      3, laplacian_lanes, "PsiFormer kinetic gradient extent overflowed");
   const std::size_t feature = checkedStorageProduct(
       shape.electrons, shape.feature_width,
       "PsiFormer kinetic feature extent overflowed");
@@ -983,6 +986,15 @@ inline std::size_t kineticWorkspaceStorageRequirement(const PsiFormerStorageShap
                              gradient_lanes, laplacian_lanes),
                   "PsiFormer kinetic workspace bytes overflowed");
   return bytes;
+}
+
+/// Admit an explicitly compact kinetic owner, retaining the existing two realP vectors.
+inline std::size_t targetKineticWorkspaceStorageRequirement(const PsiFormerStorageShape& shape,
+                                                            std::size_t maximum_targets)
+{
+  if (!maximum_targets || maximum_targets > shape.electrons)
+    throw std::invalid_argument("PsiFormer kinetic target capacity must be in [1,Ne]");
+  return kineticWorkspaceStorageRequirement(shape, maximum_targets);
 }
 
 /// Count only the retained real NN/cusp tape and one real parameter scratch vector.
