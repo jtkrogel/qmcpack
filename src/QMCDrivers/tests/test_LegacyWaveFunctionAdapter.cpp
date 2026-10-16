@@ -1364,6 +1364,46 @@ TEST_CASE("Legacy orbital products preserve cumulative private rotation history"
   TrainingStageState stage{"orbital", 0, 2, binding.modelIdentity()};
   TrainingCheckpoint::saveAtomic(checkpoint, binding, coordinator, stage);
 
+  // Standalone artifacts must recover the same noncommuting physical frame,
+  // not merely its active vector, at identical coordinates without sampler state.
+  const auto model = std::filesystem::path(checkpoint.string() + ".parameters.h5");
+  FileCleanup model_cleanup(model);
+  binding.exportModel(model);
+  ParticleSet imported_particles(sibling_particles);
+  auto imported = make_private(*sibling, imported_particles, accepted);
+  imported->storeXMLNode(definition.getRoot());
+  TrainingWaveFunctionBinding imported_binding(*imported, imported_particles, adapterOptions(), *OHMMS::Controller);
+  QMCHamiltonian imported_hamiltonian;
+  imported_hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(imported_particles), "Kinetic");
+  imported_binding.setHamiltonian(imported_hamiltonian);
+  auto& imported_rotation = rotation(*imported);
+  auto* imported_phi = imported_rotation.Phi_.get();
+  imported_binding.importModel(model);
+  CHECK(imported_binding.snapshotParameters().values == saved.values);
+  CHECK(imported_binding.modelIdentity() == binding.modelIdentity());
+  CHECK(imported_rotation.Phi_.get() == imported_phi);
+  CHECK(imported_rotation.fullRotationCoordinates() == saved_full);
+  for (std::size_t i = 0; i < saved_coefficients.size(); ++i)
+    CHECK(lcao(imported_rotation).C->data()[i] == saved_coefficients.data()[i]);
+  imported->evaluateLog(imported_particles);
+  CHECK(imported->getLogPsi() == source->getLogPsi());
+  checkClose(kineticEnergy(imported_particles), kineticEnergy(particles));
+  for (std::size_t electron = 0; electron < particles.R.size(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      CHECK(imported_particles.R[electron][dimension] == particles.R[electron][dimension]);
+  const auto imported_before_failure = imported_binding.snapshotParameters();
+  const auto* imported_bank = lcao(imported_rotation).C.get();
+  {
+    hdf_archive archive;
+    REQUIRE(archive.open(model, H5F_ACC_RDWR));
+    REQUIRE(H5Ldelete(archive.getFileID(), "/conventional_wavefunction/orbital_frame/spo_0/full_rotation",
+                     H5P_DEFAULT) >= 0);
+  }
+  CHECK_THROWS(imported_binding.importModel(model));
+  CHECK(imported_binding.snapshotParameters().version == imported_before_failure.version);
+  CHECK(imported_binding.snapshotParameters().values == imported_before_failure.values);
+  CHECK(lcao(imported_rotation).C.get() == imported_bank);
+
   ParticleSet cold_particles(sibling_particles);
   auto cold = make_private(*sibling, cold_particles, accepted);
   cold->storeXMLNode(definition.getRoot());
