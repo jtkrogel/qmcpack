@@ -119,6 +119,20 @@ public:
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.
   LogValue evaluateLog(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&) override;
 
+  /// Opt-in dense GPU VALUE/FULL tiles; scalar/B1 and CPU routes retain base behavior.
+  void mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const RefVector<ParticleSet::ParticleGradient>&,
+      const RefVector<ParticleSet::ParticleLaplacian>&) const override;
+  void mw_evaluateGL(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const RefVector<ParticleSet::ParticleGradient>&,
+      const RefVector<ParticleSet::ParticleLaplacian>&, bool fromscratch) const override;
+  void mw_calcRatio(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, int electron, std::vector<PsiValue>&) const override;
+
+  void createResource(ResourceCollection&) const override;
+  void acquireResource(ResourceCollection&, const RefVectorWithLeader<WaveFunctionComponent>&) const override;
+  void releaseResource(ResourceCollection&, const RefVectorWithLeader<WaveFunctionComponent>&) const override;
+
   /// Evaluate the value-only active replacement without committing it.
   PsiValue ratio(ParticleSet&, int) override;
 

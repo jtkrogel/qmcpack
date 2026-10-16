@@ -24,6 +24,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCHamiltonians/HamiltonianFactory.h"
 #include "Particle/VirtualParticleSet.h"
+#include "Utilities/ResourceCollection.h"
 #include "psiformer_test_utils.h"
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
@@ -92,7 +93,8 @@ public:
       "PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET", "PSIFORMER_GPU_TARGET_SELECTION", "PSIFORMER_GPU_KINETIC_TARGETS",
       "PSIFORMER_GPU_LIFTED_CHANNELS", "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
       "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES",
-      "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE"};
+      "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE",
+      "PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS"};
   std::vector<std::optional<std::string>> saved;
 };
 #endif
@@ -181,12 +183,12 @@ Lattice cell()
 }
 
 /// Construct the compact all-electron LiH electron set from the existing fixture recipe.
-ParticleSet electrons(const SimulationCell& simulation_cell)
+ParticleSet electrons(const SimulationCell& simulation_cell, int up = 2, int down = 2)
 {
   const auto geometry = fixture::makeGeometry("lih");
   ParticleSet result(simulation_cell);
   result.setName("e");
-  result.create({2, 2});
+  result.create({up, down});
   auto& species = result.getSpeciesSet();
   species.addSpecies("u");
   species.addSpecies("d");
@@ -2337,6 +2339,193 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
         targets, required.device_bytes, required.host_bytes, derivative.device_bytes, single_generation);
   }
   CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+}
+#endif
+
+#ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cache transactions",
+          "[wavefunction][psiformer][complex_gpu_dense]")
+{
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  {
+    WARN("NOT_RUN: paired dense inference requires an available HIP device");
+    return;
+  }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  {
+    WARN("NOT_RUN: paired dense inference requires an available CUDA device");
+    return;
+  }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  if (!dev::configuredDeviceMemoryAdmission().limit_bytes)
+  {
+    WARN("NOT_RUN: paired dense inference test requires explicit native aggregate device admission");
+    return;
+  }
+  ScopedComplexGpuControls controls;
+  controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto outside = metrics.snapshot();
+  const auto lattice = cell();
+  const SimulationCell simulation_cell(lattice);
+  for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+  {
+    const auto cartesian_twist = lattice.k_cart(ParticleSet::PosType{twist[0], twist[1], twist[2]});
+    auto p0 = electrons(simulation_cell, 3, 1), p1 = electrons(simulation_cell, 3, 1), p2 = electrons(simulation_cell, 3, 1);
+    auto source = ions(simulation_cell);
+    p1.R[0][0] += .11;
+    p2.R[3][1] -= .09;
+    p1.update();
+    p2.update();
+    auto initialized = parameters();
+    initialized.model_shape.spin_up_electrons = 3;
+    initialized.model_shape.spin_down_electrons = 1;
+    ps::ExecutionEnvironment environment;
+    environment.boundary = ps::BoundaryCondition::PERIODIC;
+    environment.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    environment.periodic_axes = {true, true, true};
+    environment.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    environment.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)
+        environment.lattice_vectors[i][j] = simulation_cell.getLattice().R(i, j);
+    const auto plan = ps::PsiFormerExecutionPlan::fromParameters(initialized, initialized.model_shape, environment);
+    const auto owner_bytes = dev::estimateComplexValueCost(plan, 2).device_bytes + dev::estimateComplexSpatialCost(plan, 2).device_bytes;
+    const auto before_rejection = metrics.snapshot();
+    CHECK_THROWS_AS(PsiFormerComplexWF("pf", initialized, p0, source, clone_cap, twist, owner_bytes - 1), std::length_error);
+    CHECK(metrics.snapshot().allocation_calls == before_rejection.allocation_calls);
+    controls.target(1, owner_bytes, 1000000000);
+    CHECK_THROWS_AS(PsiFormerComplexWF("pf", initialized, p0, source, clone_cap, twist, owner_bytes), std::invalid_argument);
+    for (const auto* name : {"PSIFORMER_GPU_VGL_TARGETS", "PSIFORMER_GPU_TARGET_WORKSPACE_BYTES", "PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET"})
+      ::unsetenv(name);
+
+    PsiFormerComplexWF gpu("pf", initialized, p0, source, clone_cap, twist, owner_bytes);
+    PsiFormerComplexWF cpu("pf", initialized, p0, source, clone_cap, twist);
+    auto gpu1 = gpu.makeClone(p1), gpu2 = gpu.makeClone(p2);
+    auto cpu1 = cpu.makeClone(p1), cpu2 = cpu.makeClone(p2);
+    std::array<ParticleSet*, 3> particles{&p0, &p1, &p2};
+    std::array<WaveFunctionComponent*, 3> references{&cpu, cpu1.get(), cpu2.get()};
+    std::array<WaveFunctionComponent*, 3> components{&gpu, gpu1.get(), gpu2.get()};
+    RefVectorWithLeader<WaveFunctionComponent> team(gpu, {gpu, *gpu1, *gpu2});
+    RefVectorWithLeader<ParticleSet> targets(p0, {p0, p1, p2});
+    RefVector<ParticleSet::ParticleGradient> gradients{p0.G, p1.G, p2.G};
+    RefVector<ParticleSet::ParticleLaplacian> laplacians{p0.L, p1.L, p2.L};
+    ResourceCollection resource("paired dense test");
+    gpu.createResource(resource);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lease(resource, team);
+    const auto refresh = [&] {
+      for (auto* p : particles) { p->G = 0; p->L = 0; }
+      gpu.mw_evaluateGL(team, targets, gradients, laplacians, true);
+      double learned_phase_gradient = 0;
+      for (std::size_t walker = 0; walker < 3; ++walker)
+      {
+        ParticleSet::ParticleGradient expected_g(4);
+        ParticleSet::ParticleLaplacian expected_l(4);
+        expected_g = 0;
+        expected_l = 0;
+        const auto expected = references[walker]->evaluateLog(*particles[walker], expected_g, expected_l);
+        const auto actual = components[walker]->get_log_value();
+        CHECK(actual.real() == Catch::Approx(expected.real()).margin(2e-9));
+        close(std::exp(C{0, actual.imag()}), std::exp(C{0, expected.imag()}), 2e-9);
+        for (std::size_t e = 0; e < 4; ++e)
+        {
+          close(particles[walker]->L[e], expected_l[e], 2e-8);
+          for (int d = 0; d < 3; ++d)
+          {
+            close(particles[walker]->G[e][d], expected_g[e][d], 2e-8);
+            learned_phase_gradient = std::max(learned_phase_gradient,
+                std::abs(expected_g[e][d].imag() - cartesian_twist[d]));
+          }
+        }
+      }
+      CHECK(learned_phase_gradient > 1e-6);
+    };
+    refresh();
+    const auto warm = metrics.snapshot();
+    refresh();
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    const auto scalar_gradient = gpu.evalGrad(p0, 0);
+    for (int d = 0; d < 3; ++d)
+      close(scalar_gradient[d], p0.G[0][d], 2e-8);
+    CHECK_THROWS_AS(gpu.gpuDerivativeRequirements(1, 1, 1, 1), std::logic_error);
+
+    auto aliases = gradients;
+    aliases[2] = std::ref(p0.G);
+    CHECK_THROWS_AS(gpu.mw_evaluateLog(team, targets, aliases, laplacians), std::invalid_argument);
+    RefVectorWithLeader<WaveFunctionComponent> wrong_order(gpu, {gpu, *gpu2, *gpu1});
+    CHECK_THROWS_AS(gpu.mw_evaluateLog(wrong_order, targets, gradients, laplacians), std::invalid_argument);
+    std::array<C, 3> previous_logs;
+    std::array<ParticleSet::ParticleGradient, 3> previous_g{p0.G, p1.G, p2.G};
+    std::array<ParticleSet::ParticleLaplacian, 3> previous_l{p0.L, p1.L, p2.L};
+    for (std::size_t i = 0; i < 3; ++i)
+      previous_logs[i] = components[i]->get_log_value();
+    const auto saved_position = p2.R[1][0];
+    p2.R[1][0] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS(gpu.mw_evaluateLog(team, targets, gradients, laplacians));
+    p2.R[1][0] = saved_position;
+    for (std::size_t walker = 0; walker < 3; ++walker)
+    {
+      CHECK(components[walker]->get_log_value() == previous_logs[walker]);
+      CHECK_NOTHROW(static_cast<PsiFormerComplexWF*>(components[walker])->observeCoulombEnergy(*particles[walker], 0));
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        CHECK(particles[walker]->L[e] == previous_l[walker][e]);
+        for (int d = 0; d < 3; ++d)
+          CHECK(particles[walker]->G[e][d] == previous_g[walker][e][d]);
+      }
+    }
+    std::array<C, 3> expected_ratios;
+    for (std::size_t walker = 0; walker < 3; ++walker)
+    {
+      particles[walker]->makeMove(0, ParticleSet::PosType{.013, -.007, .011});
+      expected_ratios[walker] = references[walker]->ratio(*particles[walker], 0);
+    }
+    std::vector<C> ratios(3, C{9, 7});
+    gpu.mw_calcRatio(team, targets, 0, ratios);
+    for (std::size_t i = 0; i < 3; ++i)
+      close(ratios[i], expected_ratios[i], 2e-9);
+    ratios.assign(3, C{9, 7});
+    p2.R[1][0] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS(gpu.mw_calcRatio(team, targets, 0, ratios));
+    p2.R[1][0] = saved_position;
+    for (const auto ratio : ratios)
+      CHECK(ratio == (C{9, 7}));
+    for (std::size_t walker = 0; walker < 3; ++walker)
+      if (walker != 1)
+      {
+        references[walker]->acceptMove(*particles[walker], 0);
+        components[walker]->acceptMove(*particles[walker], 0);
+        particles[walker]->acceptMove(0);
+      }
+      else
+      {
+        references[walker]->restore(0);
+        components[walker]->restore(0);
+        particles[walker]->rejectMove(0);
+      }
+    refresh();
+    const auto publication = gpu.gpuParameterPublicationRequirements();
+    auto candidate = gpu.snapshotParameters();
+    candidate.values[plan.parameter(ps::ParameterRole::BACKFLOW_UP_WEIGHT, ps::NO_ATTENTION_BLOCK,
+        ps::HeadTensorComponent::IMAG).begin] += .01;
+    controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "7");
+    CHECK(gpu.publishBudgetedGpuParameters(candidate, candidate.version, publication.device_bytes, publication.host_bytes) == candidate.version + 1);
+    CHECK(cpu.publishParameters(candidate, candidate.version) == candidate.version + 1);
+    CHECK_THROWS(gpu.observeCoulombEnergy(p0, 0));
+    CHECK(gpu.gpuParameterPublicationRequirements().device_bytes == publication.device_bytes);
+    CHECK_THROWS(gpu.publishBudgetedGpuParameters(candidate, candidate.version, publication.device_bytes, publication.host_bytes));
+    refresh();
+    controls.set("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY", "2");
+  }
+  CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+  CHECK(metrics.snapshot().failed_frees == outside.failed_frees);
 }
 #endif
 } // namespace qmcplusplus

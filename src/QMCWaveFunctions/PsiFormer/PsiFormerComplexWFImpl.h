@@ -23,11 +23,30 @@ struct PsiFormerComplexWF::Impl
   using Amplitude = psiformer::determinant::ComplexLogAmplitude;
 
 #ifdef ENABLE_CUDA
-  /** One model-shared B=1 lane; lock through conversion and caller/cache publication.
+  /** One model-shared bounded lane; lock through conversion and caller publication.
    * Numeric owners share one immutable image. No borrowed GPU output escapes a call.
    */
   struct GpuLane
   {
+    static std::size_t configuredCapacity()
+    {
+      const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY");
+      if (!value)
+        return 1;
+      std::size_t result = 0;
+      if (!*value)
+        throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY must be a positive finite decimal integer");
+      for (const char* digit = value; *digit; ++digit)
+      {
+        if (*digit < '0' || *digit > '9' ||
+            result > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+          throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY must be a positive finite decimal integer");
+        result = 10 * result + (*digit - '0');
+      }
+      if (!result || result == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY must be a positive finite decimal integer");
+      return result;
+    }
     /// Paired inference admits explicit forward VGL only; the legacy REAL selector is not applicable.
     static psiformer::device::TargetVglPreparation configuredPreparation()
     {
@@ -73,23 +92,29 @@ struct PsiFormerComplexWF::Impl
     /// Check the complete owner sum before allocating the image or either graph.
     static std::unique_ptr<GpuLane> prepare(const psiformer::PsiFormerExecutionPlan& plan,
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
-        std::size_t limit)
+        std::size_t limit, std::size_t capacity)
     {
       psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
-      return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation());
+      return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation(), capacity);
     }
 
     /// Successors preserve the admitted family profile without reading mutable process controls again.
     static std::unique_ptr<GpuLane> prepareFrozen(const psiformer::PsiFormerExecutionPlan& plan,
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
-        std::size_t limit, psiformer::device::TargetVglPreparation preparation)
+        std::size_t limit, psiformer::device::TargetVglPreparation preparation, std::size_t capacity = 1)
     {
       using namespace psiformer::device;
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
-      const auto value = estimateComplexValueCost(plan, 1);
+      if (!capacity || capacity == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("Complex GPU tile capacity must be positive and finite");
+      if (capacity > 1 && preparation.max_targets)
+        throw std::invalid_argument("Dense complex GPU tiles do not support the B1 target-K profile");
+      if (capacity > 1 && !configuredDeviceMemoryAdmission().limit_bytes)
+        throw std::invalid_argument("Dense complex GPU tiles require native aggregate device admission");
+      const auto value = estimateComplexValueCost(plan, capacity);
       const auto spatial = preparation.max_targets
-          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets) : estimateComplexSpatialCost(plan, 1);
+          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets) : estimateComplexSpatialCost(plan, capacity);
       const auto work = preparation.max_targets
           ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets).charged_scalar_work_units : 0;
       if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
@@ -102,25 +127,35 @@ struct PsiFormerComplexWF::Impl
       constexpr auto staging_per_electron = 3 * sizeof(double) + 5 * sizeof(cuDoubleComplex) + 4 * sizeof(C);
       const auto host = psiformer::spatial_detail::checkedAdd(
           psiformer::spatial_detail::checkedAdd(value.host_bytes, spatial.host_bytes, "Complex GPU host bytes overflow"),
-          psiformer::spatial_detail::checkedAdd(sizeof(ComplexValueResult),
-              psiformer::spatial_detail::checkedProduct(staging_per_electron, plan.modelShape().electrons(), "Complex GPU staging overflow"),
+          psiformer::spatial_detail::checkedAdd(
+              psiformer::spatial_detail::checkedProduct(sizeof(ComplexValueResult), capacity, "Complex GPU amplitude staging overflow"),
+              psiformer::spatial_detail::checkedProduct(staging_per_electron,
+                  psiformer::spatial_detail::checkedProduct(capacity, plan.modelShape().electrons(), "Complex GPU staging overflow"),
+                  "Complex GPU staging overflow"),
               "Complex GPU staging overflow"), "Complex GPU host bytes overflow");
+      if (capacity > 1)
+        app_log() << "  Complex PsiFormer dense GPU preflight: tile_capacity=" << capacity
+                  << ", value_device_bytes=" << value.device_bytes << ", full_vgl_device_bytes=" << spatial.device_bytes
+                  << ", host_numeric_bytes=" << host << "; before_allocation=yes; lane_serialized=yes"
+                  << "; image_and_vendor_bytes_excluded=yes" << std::endl;
       return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
-                                                preparation, work, bytes, host));
+                                                preparation, work, bytes, host, capacity));
     }
 
     /// Prepare fixed host staging and two qualified numeric owners, never a CPU tape.
     GpuLane(const psiformer::PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
         const std::vector<double>& nuclei, std::size_t version,
         psiformer::device::ComplexValueCost value_cost, psiformer::device::ComplexSpatialCost spatial_cost,
-        psiformer::device::TargetVglPreparation preparation, std::size_t work, std::size_t bytes, std::size_t host)
-        : blas(queue), image(psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version)),
-          value(psiformer::device::PreparedDeviceComplexValue::prepare(image, 1, queue, blas, value_cost.device_bytes)),
+        psiformer::device::TargetVglPreparation preparation, std::size_t work, std::size_t bytes, std::size_t host,
+        std::size_t capacity)
+        : capacity(capacity), electrons(plan.modelShape().electrons()), blas(queue),
+          image(psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version)),
+          value(psiformer::device::PreparedDeviceComplexValue::prepare(image, capacity, queue, blas, value_cost.device_bytes)),
           full(preparation.max_targets
               ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation)
-              : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, spatial_cost.device_bytes)),
-          positions(3 * plan.modelShape().electrons()), amplitude(1), gradient(positions.size()),
-          laplacian(plan.modelShape().electrons()), ratio(laplacian.size()), converted(4 * laplacian.size()),
+              : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, capacity, queue, blas, spatial_cost.device_bytes)),
+          positions(3 * electrons * capacity), amplitude(capacity), gradient(positions.size()),
+          laplacian(electrons * capacity), ratio(laplacian.size()), converted(4 * laplacian.size()),
           device_bytes(bytes), host_bytes(host), preparation(preparation)
     {
       const auto actual_host = value_cost.host_bytes + spatial_cost.host_bytes +
@@ -133,11 +168,26 @@ struct PsiFormerComplexWF::Impl
         throw std::logic_error("Complex GPU owner capacities differ from checked preparation");
       app_log() << "  Complex PsiFormer GPU inference prepared: mode="
                 << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
+                << ", tile_capacity=" << capacity
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
                 << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
                 << "; shared_image_and_vendor_bytes_excluded=yes" << std::endl;
     }
 
+    /// Shrink only live prefixes; all capacities were admitted at the cold boundary.
+    void resizeLive(std::size_t count)
+    {
+      if (!count || count > capacity)
+        throw std::invalid_argument("Complex GPU live tile exceeds its frozen capacity");
+      positions.resize(3 * electrons * count);
+      amplitude.resize(count);
+      gradient.resize(3 * electrons * count);
+      laplacian.resize(electrons * count);
+      ratio.resize(electrons * count);
+      converted.resize(4 * electrons * count);
+    }
+
+    const std::size_t capacity, electrons;
     compute::Queue<PlatformKind::CUDA> queue;
     psiformer::device::AcceleratorBlasHandle blas;
     std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
@@ -149,6 +199,7 @@ struct PsiFormerComplexWF::Impl
     std::vector<C> converted;
     const std::size_t device_bytes, host_bytes;
     const psiformer::device::TargetVglPreparation preparation;
+    std::size_t dense_value_calls = 0, dense_vgl_calls = 0;
     std::mutex mutex;
   };
 #endif
@@ -162,6 +213,14 @@ struct PsiFormerComplexWF::Impl
   /// Stable shared ownership keeps metadata/executors fixed while canonical values mutate under mutex.
   struct Model
   {
+    static std::size_t requestedCapacity(std::size_t gpu_limit)
+    {
+#ifdef ENABLE_CUDA
+      return gpu_limit ? GpuLane::configuredCapacity() : 1;
+#else
+      return 1;
+#endif
+    }
     /// Preserve paired metadata rather than recreating a default-real environment.
     static psiformer::ExecutionEnvironment environmentFor(const ParticleSet& electrons)
     {
@@ -184,12 +243,13 @@ struct PsiFormerComplexWF::Impl
                model.dim, model.heads, model.blocks}, environment)), value(model, plan), spatial(model, plan),
           identity(persistentModelIdentity(model, "internal", profile, seed, environment,
                                            reduced_twist, cartesian_twist)), source(&ions),
-          schema(makeStructuredParameterSchema(component_name, model.p)), gpu_limit(gpu_limit)
+          schema(makeStructuredParameterSchema(component_name, model.p)), gpu_limit(gpu_limit),
+          gpu_capacity(requestedCapacity(gpu_limit))
     {
       if (gpu_limit)
       {
 #ifdef ENABLE_CUDA
-        gpu = GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit);
+        gpu = GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit, gpu_capacity);
 #else
         throw std::invalid_argument("Complex GPU inference is not compiled");
 #endif
@@ -208,6 +268,8 @@ struct PsiFormerComplexWF::Impl
     const ParticleSet* const source;
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
     const std::size_t gpu_limit;
+    const std::size_t gpu_capacity;
+    std::atomic<bool> dense_team_acquired{false};
 #ifdef ENABLE_CUDA
     std::shared_ptr<GpuLane> gpu;
 #endif
@@ -218,6 +280,61 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
     std::weak_ptr<GpuDerivativeLane> gpu_derivative_lane;
 #endif
+  };
+
+  /** HOST-only transaction staging for one native acquired crowd.
+   * No immutable image or GPU scratch is duplicated; every tile borrows GpuLane.
+   */
+  struct MultiWalkerResource final : Resource
+  {
+    explicit MultiWalkerResource(std::shared_ptr<Model> state)
+        : Resource("PsiFormerComplexMultiWalkerResource"), state(std::move(state)) {}
+    std::unique_ptr<Resource> makeClone() const override
+    { return std::make_unique<MultiWalkerResource>(state); }
+    void validateBatchResourcePreparation(const BatchResourcePreparationContext& context) const override
+    {
+      if (context.plan)
+        throw std::invalid_argument("Dense complex GPU resources do not admit a legacy batch_memory plan");
+    }
+    void prepareTeam(const RefVectorWithLeader<WaveFunctionComponent>& list)
+    {
+      const auto n = state->model.ne;
+      const auto elements = psiformer::spatial_detail::checkedProduct(list.size(), n, "Complex crowd staging overflow");
+      components.resize(list.size());
+      amplitude.resize(list.size());
+      logs.resize(list.size());
+      ratios.resize(list.size());
+      keys.resize(list.size());
+      gradient.resize(elements);
+      laplacian.resize(elements);
+      for (std::size_t i = 0; i < list.size(); ++i)
+        components[i] = &static_cast<PsiFormerComplexWF&>(list[i]);
+    }
+    std::size_t hostNumericBytes() const
+    {
+      std::size_t bytes = 0;
+      const auto add = [&](std::size_t count, std::size_t width) {
+        pf::addStorageBytes(bytes, pf::checkedStorageProduct(count, width, "Complex crowd HOST bytes overflow"),
+                            "Complex crowd HOST bytes overflow");
+      };
+      add(components.capacity(), sizeof(PsiFormerComplexWF*));
+      add(amplitude.capacity(), sizeof(Amplitude));
+      add(logs.capacity(), sizeof(LogValue));
+      add(ratios.capacity(), sizeof(PsiValue));
+      add(keys.capacity(), sizeof(std::uint64_t));
+      add(gradient.capacity(), sizeof(GradType));
+      add(laplacian.capacity(), sizeof(ValueType));
+      return bytes;
+    }
+    std::shared_ptr<Model> state;
+    std::vector<PsiFormerComplexWF*> components;
+    std::vector<Amplitude> amplitude;
+    std::vector<LogValue> logs;
+    std::vector<PsiValue> ratios;
+    std::vector<std::uint64_t> keys;
+    std::vector<GradType> gradient;
+    std::vector<ValueType> laplacian;
+    std::size_t reported_host_bytes = 0;
   };
 
   /// Fixed ions are part of the captured derivative problem, not an unchecked caller convention.
@@ -937,6 +1054,103 @@ struct PsiFormerComplexWF::Impl
             replacement == electron ? p.activeR(electron)[dimension] : p.R[electron][dimension]);
   }
 
+  bool denseEnabled() const noexcept { return state->gpu_capacity > 1; }
+
+  /// Match the exact native loan before reading or mutating transaction scratch.
+  MultiWalkerResource& requireDenseTeam(const RefVectorWithLeader<WaveFunctionComponent>& components,
+      const RefVectorWithLeader<ParticleSet>& targets, int electron = -1)
+  {
+    const auto* leader = dynamic_cast<const PsiFormerComplexWF*>(&components.getLeader());
+    if (!leader || leader->impl_.get() != this || !multiwalker || components.empty() ||
+        components.size() != targets.size() || &components[0] != leader)
+      throw std::logic_error("Dense complex GPU call requires its acquired native leader/team");
+    auto& resource = multiwalker.getResource();
+    if (resource.state != state || resource.components.size() != components.size())
+      throw std::invalid_argument("Dense complex GPU crowd has foreign resource ownership or extent");
+    for (std::size_t i = 0; i < components.size(); ++i)
+    {
+      auto* component = dynamic_cast<PsiFormerComplexWF*>(&components[i]);
+      if (!component || component != resource.components[i] || component->impl_->state != state ||
+          component->impl_->acquired_leader != leader || component->impl_->acquired_lane != i)
+        throw std::invalid_argument("Dense complex GPU call changed its acquired model or lane order");
+      component->impl_->validate(targets[i], electron, electron >= 0);
+    }
+    return resource;
+  }
+
+  /// Run actual dense numerical prefixes; no caller/cache state changes here.
+  void stageDense(MultiWalkerResource& resource, const RefVectorWithLeader<ParticleSet>& targets,
+      bool spatial, int replacement = -1)
+  {
+#ifdef ENABLE_CUDA
+    auto& lane = *state->gpu;
+    std::unique_lock lease(lane.mutex);
+    lane.image->validateCurrentDevice();
+    if (lane.image->version() != state->model.p.version() || lane.capacity != state->gpu_capacity)
+      throw std::logic_error("Dense complex GPU image version/capacity is stale");
+    const auto n = state->model.ne;
+    std::size_t dense_tiles = 0, tail = 0;
+    for (std::size_t begin = 0; begin < targets.size();)
+    {
+      const auto count = std::min(lane.capacity, targets.size() - begin);
+      lane.resizeLive(count);
+      for (std::size_t local = 0; local < count; ++local)
+        for (std::size_t e = 0; e < n; ++e)
+          for (int d = 0; d < 3; ++d)
+            lane.positions[(local * n + e) * 3 + d] = replacement == static_cast<int>(e)
+                ? targets[begin + local].activeR(e)[d] : targets[begin + local].R[e][d];
+      {
+        NativeTimerScope timer(phase_timers.gpu_evaluate);
+        if (spatial)
+          lane.full->evaluate(lane.positions);
+        else
+          lane.value->evaluate(lane.positions);
+      }
+      {
+        NativeTimerScope timer(phase_timers.gpu_download);
+        if (spatial)
+          lane.full->download(lane.full->resultView(), lane.amplitude, lane.gradient, lane.laplacian, lane.ratio);
+        else
+          lane.value->download(lane.value->resultView(), lane.amplitude);
+      }
+      for (std::size_t local = 0; local < count; ++local)
+      {
+        const auto walker = begin + local;
+        const auto& component = *resource.components[walker]->impl_;
+        const auto& amplitude = lane.amplitude[local];
+        resource.amplitude[walker] = {{amplitude.phase.x, amplitude.phase.y}, amplitude.log_abs};
+        resource.logs[walker] = component.physicalLog(resource.amplitude[walker], targets[walker], replacement);
+        resource.keys[walker] = configurationIdentity(targets[walker], replacement);
+        if (spatial)
+          for (std::size_t e = 0; e < n; ++e)
+          {
+            for (int d = 0; d < 3; ++d)
+            {
+              const auto& gradient = lane.gradient[(local * n + e) * 3 + d];
+              resource.gradient[walker * n + e][d] = component.physicalGradient({gradient.x, gradient.y}, d);
+            }
+            const auto& laplacian = lane.laplacian[local * n + e];
+            const auto converted = makePsiFormerScalar<ValueType>(laplacian.x, laplacian.y);
+            if (!isFiniteWavefunctionValue(converted))
+              throw std::overflow_error("Dense complex GPU Laplacian conversion overflow");
+            resource.laplacian[walker * n + e] = converted;
+          }
+      }
+      dense_tiles += count > 1;
+      tail = count;
+      begin += count;
+    }
+    auto& calls = spatial ? lane.dense_vgl_calls : lane.dense_value_calls;
+    if (dense_tiles && calls++ == 0)
+      app_log() << "  Complex PsiFormer numerical dense tile completed: operation=" << (spatial ? "FULL_VGL" : "VALUE")
+                << ", walkers=" << targets.size() << ", tile_capacity=" << lane.capacity
+                << ", dense_tiles=" << dense_tiles << ", last_tile_count=" << tail
+                << ", parameter_version=" << lane.image->version() << "; lane_serialized=yes; CPU_fallback=no" << std::endl;
+#else
+    throw std::logic_error("Dense complex GPU inference is not compiled");
+#endif
+  }
+
   /// Common core view keeps a GPU operation locked until its scalar caller publishes copies.
   struct CoreResult : pf::DirectComplexSpatialResult
   {
@@ -953,6 +1167,7 @@ struct PsiFormerComplexWF::Impl
     {
       auto& lane = *state->gpu;
       result.lease = std::unique_lock(lane.mutex);
+      lane.resizeLive(1);
       for (int e = 0; e < p.getTotalNum(); ++e)
         for (int d = 0; d < 3; ++d)
           lane.positions[e * 3 + d] = replacement == e ? p.activeR(e)[d] : p.R[e][d];
@@ -1080,6 +1295,10 @@ struct PsiFormerComplexWF::Impl
   std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
   std::vector<GradType> own_gradient;
   std::vector<ValueType> own_laplacian;
+  ResourceHandle<MultiWalkerResource> multiwalker;
+  const PsiFormerComplexWF* acquired_leader = nullptr;
+  std::size_t acquired_lane = 0, resource_cursor = 0;
+  const ResourceCollection* resource_collection = nullptr;
   std::size_t numeric_required = 0, numeric_limit;
   Amplitude accepted, proposed;
   LogValue proposed_log{};
@@ -1240,6 +1459,8 @@ PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeR
   if (gpuInferenceEnabled())
   {
     std::shared_lock read(impl_->state->mutex);
+    if (impl_->state->gpu->capacity != 1)
+      throw std::logic_error("Dense complex inference tiles do not support GPU derivatives or training");
     return Impl::GpuDerivativeLane::required(*impl_->state, samples, maximum_samples, targets, chunk);
   }
 #endif
@@ -1258,6 +1479,11 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
   if (gpuInferenceEnabled())
   {
     const auto state = impl_->state;
+    {
+      std::shared_lock read(state->mutex);
+      if (state->gpu->capacity != 1)
+        throw std::logic_error("Dense complex inference tiles do not support GPU derivatives or training");
+    }
     const auto samples = particles.size(), n = state->model.ne;
     const auto required = Impl::GpuDerivativeLane::required(*state, samples, maximum_samples, targets, chunk);
     for (const auto cap : {device_cap, host_cap, work_cap})
@@ -1462,7 +1688,7 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
     // One independent cold generation, with no old P image retained by its metadata.
     const auto next_version = expected_version + 1;
     std::shared_ptr<Impl::GpuLane> successor = Impl::GpuLane::prepareFrozen(state->plan, candidate.values,
-        state->model.cfg.nuclei.x, next_version, state->gpu_limit, captured->preparation);
+        state->model.cfg.nuclei.x, next_version, state->gpu_limit, captured->preparation, captured->capacity);
     if (successor->device_bytes + successor->image->deviceStorageBytes() != required.device_bytes ||
         successor->host_bytes != required.host_bytes || successor->image->version() != next_version)
       throw std::logic_error("Complex GPU successor capacities/version differ from admitted generation");
@@ -1484,6 +1710,206 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
   }
 #endif
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
+}
+
+void PsiFormerComplexWF::createResource(ResourceCollection& collection) const
+{
+  if (impl_->denseEnabled())
+    collection.addResource(std::make_unique<Impl::MultiWalkerResource>(impl_->state));
+}
+
+void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
+    const RefVectorWithLeader<WaveFunctionComponent>& components) const
+{
+  if (!impl_->denseEnabled())
+    return;
+  NativeTimerScope timer(impl_->phase_timers.resource);
+  if (&components.getLeader() != this || components.empty() || &components[0] != this || impl_->multiwalker)
+    throw std::logic_error("Dense complex GPU acquisition requires its idle native leader");
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    const auto* component = dynamic_cast<const PsiFormerComplexWF*>(&components[i]);
+    if (!component || component->impl_->state != impl_->state)
+      throw std::invalid_argument("Dense complex GPU acquisition requires same-model component clones");
+    for (std::size_t prior = 0; prior < i; ++prior)
+      if (&components[i] == &components[prior])
+        throw std::invalid_argument("Dense complex GPU acquisition contains a duplicate clone");
+  }
+  if (collection.getBatchResourcePreparationProvenance().state != BatchResourcePreparationState::UNPREPARED)
+    throw std::invalid_argument("Dense complex GPU acquisition does not support legacy batch_memory resources");
+  bool idle = false;
+  if (!impl_->state->dense_team_acquired.compare_exchange_strong(idle, true))
+    throw std::logic_error("Dense complex GPU inference currently supports one acquired crowd per model");
+  const auto cursor = collection.getCursor();
+  ResourceHandle<Impl::MultiWalkerResource> candidate;
+  try
+  {
+    for (std::size_t i = 0; i < components.size(); ++i)
+      if (static_cast<PsiFormerComplexWF&>(components[i]).impl_->acquired_leader)
+        throw std::logic_error("Dense complex GPU clone already belongs to an acquired crowd");
+    candidate = collection.lendResource<Impl::MultiWalkerResource>();
+    if (candidate.getResource().state != impl_->state)
+      throw std::invalid_argument("Dense complex GPU resource belongs to another model family");
+    candidate.getResource().prepareTeam(components);
+    auto& resource = candidate.getResource();
+    const auto host_bytes = resource.hostNumericBytes();
+    if (resource.reported_host_bytes != host_bytes)
+    {
+      app_log() << "  Complex PsiFormer crowd transaction: walkers=" << components.size()
+                << ", retained_host_numeric_bytes=" << host_bytes
+                << "; excludes clones, image, vendor and allocator metadata; aggregate_HOST_bound=no" << std::endl;
+      resource.reported_host_bytes = host_bytes;
+    }
+  }
+  catch (...)
+  {
+    if (candidate)
+    {
+      collection.rewind(cursor);
+      collection.takebackResource(candidate);
+      collection.rewind(cursor);
+    }
+    impl_->state->dense_team_acquired.store(false);
+    throw;
+  }
+  impl_->multiwalker = std::move(candidate);
+  impl_->resource_collection = &collection;
+  impl_->resource_cursor = cursor;
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    auto& clone = *static_cast<PsiFormerComplexWF&>(components[i]).impl_;
+    clone.acquired_leader = this;
+    clone.acquired_lane = i;
+  }
+}
+
+void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
+    const RefVectorWithLeader<WaveFunctionComponent>& components) const
+{
+  if (!impl_->denseEnabled())
+    return;
+  if (&components.getLeader() != this || !impl_->multiwalker || impl_->resource_collection != &collection ||
+      collection.getCursor() != impl_->resource_cursor)
+    throw std::logic_error("Dense complex GPU release requires its original resource loan and cursor");
+  auto& resource = impl_->multiwalker.getResource();
+  if (components.size() != resource.components.size())
+    throw std::invalid_argument("Dense complex GPU release changed the acquired crowd extent");
+  for (std::size_t i = 0; i < components.size(); ++i)
+    if (&components[i] != resource.components[i] || resource.components[i]->impl_->acquired_leader != this ||
+        resource.components[i]->impl_->acquired_lane != i)
+      throw std::invalid_argument("Dense complex GPU release changed its acquired lane order");
+  collection.takebackResource(impl_->multiwalker);
+  for (auto* component : resource.components)
+  {
+    component->impl_->acquired_leader = nullptr;
+    component->impl_->acquired_lane = 0;
+  }
+  resource.components.clear();
+  impl_->resource_collection = nullptr;
+  impl_->resource_cursor = 0;
+  impl_->state->dense_team_acquired.store(false);
+}
+
+/// Validate every output and tile before the nonthrowing whole-crowd scatter.
+void PsiFormerComplexWF::mw_evaluateLog(const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& targets, const RefVector<ParticleSet::ParticleGradient>& gradients,
+    const RefVector<ParticleSet::ParticleLaplacian>& laplacians) const
+{
+  if (!impl_->denseEnabled())
+  {
+    WaveFunctionComponent::mw_evaluateLog(components, targets, gradients, laplacians);
+    return;
+  }
+  NativeTimerScope timer(impl_->phase_timers.batch_vgl);
+  if (components.empty())
+    return;
+  std::shared_lock read(impl_->state->mutex);
+  auto& resource = impl_->requireDenseTeam(components, targets);
+  const auto n = impl_->state->model.ne;
+  if (gradients.size() != components.size() || laplacians.size() != components.size())
+    throw std::invalid_argument("Dense complex GPU full scatter list sizes differ");
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    if (gradients[i].get().size() != n || laplacians[i].get().size() != n)
+      throw std::invalid_argument("Dense complex GPU full scatter has a wrong electron extent");
+    const auto g = checkedMemoryRange(gradients[i].get().data(), n, "Complex gradient output range overflow");
+    const auto l = checkedMemoryRange(laplacians[i].get().data(), n, "Complex Laplacian output range overflow");
+    if (memoryRangesOverlap(g, l))
+      throw std::invalid_argument("Dense complex GPU gradient and Laplacian outputs overlap");
+    for (std::size_t prior = 0; prior < i; ++prior)
+    {
+      const auto pg = checkedMemoryRange(gradients[prior].get().data(), n, "Complex gradient output range overflow");
+      const auto pl = checkedMemoryRange(laplacians[prior].get().data(), n, "Complex Laplacian output range overflow");
+      if (memoryRangesOverlap(g, pg) || memoryRangesOverlap(g, pl) || memoryRangesOverlap(l, pg) || memoryRangesOverlap(l, pl))
+        throw std::invalid_argument("Dense complex GPU walker outputs overlap");
+    }
+  }
+  impl_->stageDense(resource, targets, true);
+  for (std::size_t i = 0; i < components.size(); ++i)
+    for (std::size_t e = 0; e < n; ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        if (!isFiniteWavefunctionValue(gradients[i].get()[e][d] + resource.gradient[i * n + e][d]))
+          throw std::overflow_error("Dense complex GPU gradient scatter overflow");
+      if (!isFiniteWavefunctionValue(laplacians[i].get()[e] + resource.laplacian[i * n + e]))
+        throw std::overflow_error("Dense complex GPU Laplacian scatter overflow");
+    }
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    auto& component = *resource.components[i];
+    auto& clone = *component.impl_;
+    clone.invalidate();
+    for (std::size_t e = 0; e < n; ++e)
+    {
+      clone.own_gradient[e] = resource.gradient[i * n + e];
+      clone.own_laplacian[e] = resource.laplacian[i * n + e];
+      gradients[i].get()[e] += clone.own_gradient[e];
+      laplacians[i].get()[e] += clone.own_laplacian[e];
+    }
+    clone.accepted = resource.amplitude[i];
+    clone.accepted_key = resource.keys[i];
+    clone.accepted_version = impl_->state->model.p.version();
+    clone.accepted_valid = clone.own_full_valid = true;
+    component.log_value_ = resource.logs[i];
+  }
+}
+
+void PsiFormerComplexWF::mw_evaluateGL(const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& targets, const RefVector<ParticleSet::ParticleGradient>& gradients,
+    const RefVector<ParticleSet::ParticleLaplacian>& laplacians, bool fromscratch) const
+{
+  if (!impl_->denseEnabled())
+    WaveFunctionComponent::mw_evaluateGL(components, targets, gradients, laplacians, fromscratch);
+  else
+    mw_evaluateLog(components, targets, gradients, laplacians);
+}
+
+/// Dense VALUE consumes active replacements; proposal caches commit only after all tails validate.
+void PsiFormerComplexWF::mw_calcRatio(const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& targets, int electron, std::vector<PsiValue>& ratios) const
+{
+  if (!impl_->denseEnabled())
+  {
+    WaveFunctionComponent::mw_calcRatio(components, targets, electron, ratios);
+    return;
+  }
+  NativeTimerScope timer(impl_->phase_timers.batch_value);
+  if (components.empty())
+    return;
+  std::shared_lock read(impl_->state->mutex);
+  auto& resource = impl_->requireDenseTeam(components, targets, electron);
+  if (electron < 0 || ratios.size() != components.size())
+    throw std::invalid_argument("Dense complex GPU ratio output/electron extent mismatch");
+  impl_->stageDense(resource, targets, false, electron);
+  for (std::size_t i = 0; i < components.size(); ++i)
+    resource.ratios[i] = resource.components[i]->impl_->formRatio(resource.amplitude[i], targets[i], electron);
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    auto& clone = *resource.components[i]->impl_;
+    clone.discardPending();
+    clone.cache(resource.amplitude[i], resource.logs[i], targets[i], electron);
+    ratios[i] = resource.ratios[i];
+  }
 }
 
 /// Validate complete scatter before publishing any accepted amplitude or caller G/L.
