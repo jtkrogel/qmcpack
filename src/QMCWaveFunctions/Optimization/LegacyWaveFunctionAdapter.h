@@ -33,6 +33,28 @@ class TrialWaveFunction;
 
 namespace wftrain
 {
+struct LegacyDerivativeWorkspace;
+
+/// A bounded, exclusively owned evaluator loaded with one frozen sample.
+struct LegacyWaveFunctionReplaySample
+{
+  TrialWaveFunction& wavefunction;
+  ParticleSet& particles;
+};
+
+/** Replay sample coordinates into private evaluator state, independent of blocks.
+ * prepareSample must restore all configuration-dependent state, including distance
+ * tables. sampleCount must remain constant for the lifetime of every view.
+ * The adapter installs its immutable parameter snapshot and full VGL. Replay
+ * workers may be shared only among views from the same adapter/workspace lane.
+ */
+class LegacyWaveFunctionReplay
+{
+public:
+  virtual ~LegacyWaveFunctionReplay() = default;
+  virtual std::size_t sampleCount() const noexcept = 0;
+  virtual LegacyWaveFunctionReplaySample prepareSample(std::size_t index) = 0;
+};
 
 /// Hard resource limits required for every legacy compatibility adapter.
 struct LegacyWaveFunctionAdapterOptions
@@ -62,6 +84,36 @@ public:
   std::size_t publishParameters(const StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;
 
+  /** Activate a prevalidated, privately prepared snapshot without allocation.
+   * The binding must establish exclusive publication, matching schema/extent,
+   * finite values, candidate.version == current version, and no version overflow
+   * before collective readiness. This is the no-fail half of that transaction.
+   */
+  std::size_t commitPreparedParameters(StructuredParameterSnapshot&& candidate) noexcept;
+
+  const optimize::VariableSet& registrationVariables() const noexcept { return *registration_template_; }
+
+  /// Reset only caller-owned private component state; do not evaluate or mutate particles.
+  void resetPrivateParameters(TrialWaveFunction& evaluator,
+                              const StructuredParameterSnapshot& snapshot) const;
+
+  /// Install a matching snapshot and recompute complete VGL in private evaluator state.
+  void installSnapshot(TrialWaveFunction& evaluator,
+                       ParticleSet& particles,
+                       const StructuredParameterSnapshot& snapshot) const;
+
+  /** Share one iteration snapshot and one bounded replay worker across block views.
+   * All operators from this adapter lease the same scratch workspace. Actions are
+   * serialized; retained block views do not allocate additional parameter rows.
+   * The binding owns/accounts the shared iteration snapshot and replay worker;
+   * storageDiagnostics reports the shared derivative workspace once by identity.
+   */
+  std::unique_ptr<StreamingDerivativeOperator> makeDerivativeOperator(
+      std::shared_ptr<LegacyWaveFunctionReplay> replay,
+      std::shared_ptr<const StructuredParameterSnapshot> snapshot,
+      std::size_t batch_ordinal,
+      std::size_t sample_offset) const;
+
   /** Bind one immutable snapshot to an exclusive evaluator per sample.
    *
    * The caller must keep every evaluator and particle set alive and must not use or
@@ -80,6 +132,7 @@ private:
   // full legacy registration table in addition to its derivative scratch rows.
   std::shared_ptr<const optimize::VariableSet> registration_template_;
   LegacyWaveFunctionAdapterOptions options_;
+  std::shared_ptr<LegacyDerivativeWorkspace> workspace_;
 
   mutable std::mutex state_mutex_;
   std::size_t parameter_version_ = 0;

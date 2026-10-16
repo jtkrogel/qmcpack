@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -28,6 +29,20 @@
 
 namespace qmcplusplus::wftrain
 {
+/// One shared lane per adapter, independent of the number of retained block views.
+struct LegacyDerivativeWorkspace
+{
+  explicit LegacyDerivativeWorkspace(std::size_t count)
+      : score_row(count), kinetic_row(count),
+        channels{std::vector<DerivativeValue>(count), std::vector<DerivativeValue>(count),
+                 std::vector<DerivativeValue>(count)}
+  {}
+  std::mutex mutex;
+  Vector<QMCTraits::ValueType> score_row;
+  Vector<QMCTraits::ValueType> kinetic_row;
+  std::array<std::vector<DerivativeValue>, 3> channels;
+};
+
 namespace
 {
 
@@ -188,9 +203,8 @@ optimize::VariableSet validateEvaluatorRegistration(TrialWaveFunction& evaluator
   return actual;
 }
 
-/// Install one detached snapshot in a disposable evaluator and recompute its state.
-void prepareEvaluator(TrialWaveFunction& evaluator,
-                      ParticleSet& particles,
+/// Install one detached snapshot in private component state without touching particles.
+void resetEvaluator(TrialWaveFunction& evaluator,
                       const optimize::VariableSet& expected,
                       const std::vector<double>& values)
 {
@@ -203,8 +217,38 @@ void prepareEvaluator(TrialWaveFunction& evaluator,
   }
   evaluator.checkOutVariables(active);
   evaluator.resetParameters(active);
-  evaluator.evaluateLog(particles);
 }
+
+void validateSnapshot(const StructuredParameterSnapshot& snapshot, const StructuredParameterSchema& schema)
+{
+  if (snapshot.schema_fingerprint != schema.fingerprint() || snapshot.values.size() != schema.parameterCount())
+    throw std::invalid_argument("Legacy adapter snapshot schema or parameter extent does not match");
+  if (std::any_of(snapshot.values.begin(), snapshot.values.end(), [](double value) { return !isFiniteDouble(value); }))
+    throw std::invalid_argument("Legacy adapter snapshot contains a non-finite value");
+}
+
+void validateMasses(const ParticleSet& particles)
+{
+  const auto& masses = particles.get_mass_by_group();
+  if (masses.size() == 0 || std::any_of(masses.begin(), masses.end(), [](auto mass) { return mass != 1.0; }))
+    throw std::invalid_argument("Legacy adapter supports only initialized unit electron masses");
+}
+
+class ReferenceReplay final : public LegacyWaveFunctionReplay
+{
+public:
+  ReferenceReplay(const RefVector<TrialWaveFunction>& evaluators, const RefVector<ParticleSet>& particles)
+      : evaluators_(evaluators), particles_(particles)
+  {}
+  std::size_t sampleCount() const noexcept override { return evaluators_.size(); }
+  LegacyWaveFunctionReplaySample prepareSample(std::size_t sample) override
+  {
+    return {evaluators_[sample], particles_[sample]};
+  }
+private:
+  RefVector<TrialWaveFunction> evaluators_;
+  RefVector<ParticleSet> particles_;
+};
 
 /// Convert either real- or complex-build wavefunction scalars without projection.
 DerivativeValue asDerivativeValue(QMCTraits::ValueType value) noexcept
@@ -214,41 +258,35 @@ DerivativeValue asDerivativeValue(QMCTraits::ValueType value) noexcept
 
 /** Contract scalar legacy derivative rows immediately into bounded accumulators.
  *
- * Evaluators and particles are nonowning and exclusive for this operator's lifetime.
- * The only full-P storage is two legacy rows and three complex accumulators.
+ * The replay worker is exclusive to one adapter lane. All retained views share
+ * the two legacy rows and three complex accumulators, plus an iteration snapshot.
  */
 class LegacyStreamingDerivativeOperator final : public StreamingDerivativeOperator
 {
 public:
   LegacyStreamingDerivativeOperator(std::shared_ptr<const StructuredParameterSchema> schema,
                                     std::shared_ptr<const optimize::VariableSet> active,
-                                    StructuredParameterSnapshot snapshot,
-                                    const RefVector<TrialWaveFunction>& evaluators,
-                                    const RefVector<ParticleSet>& particle_sets,
+                                    std::shared_ptr<const StructuredParameterSnapshot> snapshot,
+                                    std::shared_ptr<LegacyWaveFunctionReplay> replay,
+                                    std::shared_ptr<LegacyDerivativeWorkspace> workspace,
                                     std::size_t batch_ordinal,
                                     std::size_t sample_offset,
                                     std::size_t maximum_chunk_size,
                                     std::size_t maximum_scratch_bytes)
       : schema_(std::move(schema)),
         active_(std::move(active)),
-        parameter_version_(snapshot.version),
-        evaluators_(evaluators),
-        particle_sets_(particle_sets),
+        snapshot_(std::move(snapshot)),
+        parameter_version_(snapshot_->version),
+        replay_(std::move(replay)),
+        workspace_(std::move(workspace)),
         batch_ordinal_(batch_ordinal),
         sample_offset_(sample_offset),
-        chunk_plan_(*schema_, parameter_version_, maximum_chunk_size),
-        score_row_(schema_->parameterCount()),
-        kinetic_row_(schema_->parameterCount()),
-        channel_accumulators_{std::vector<DerivativeValue>(schema_->parameterCount()),
-                              std::vector<DerivativeValue>(schema_->parameterCount()),
-                              std::vector<DerivativeValue>(schema_->parameterCount())}
+        chunk_plan_(*schema_, parameter_version_, maximum_chunk_size)
   {
     // Measure allocator capacities before invoking any fallible legacy callback.
     initializeStorageDiagnostics();
     if (storage_diagnostics_.retained_numeric_bytes > maximum_scratch_bytes)
       throw std::length_error("Legacy adapter allocated derivative scratch beyond its mandatory byte ceiling");
-    for (std::size_t sample = 0; sample < evaluators_.size(); ++sample)
-      prepareEvaluator(evaluators_[sample], particle_sets_[sample], *active_, snapshot.values);
   }
 
   /// Advertise only the bounded host products implemented by the scalar bridge.
@@ -257,7 +295,8 @@ public:
     StreamingDerivativeCapabilities result;
     result.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
         derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) |
-        derivativeProductBit(DerivativeProduct::SCORE_JVP);
+        derivativeProductBit(DerivativeProduct::SCORE_JVP) |
+        derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
     result.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) |
         derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
     result.parameter_scalar_domain       = ParameterScalarDomain::REAL64;
@@ -277,7 +316,7 @@ public:
   std::size_t parameterVersion() const noexcept override { return parameter_version_; }
   std::size_t batchOrdinal() const noexcept override { return batch_ordinal_; }
   std::size_t sampleOffset() const noexcept override { return sample_offset_; }
-  std::size_t sampleCount() const noexcept override { return evaluators_.size(); }
+  std::size_t sampleCount() const noexcept override { return replay_->sampleCount(); }
   const ParameterChunkPlan& parameterChunkPlan() const noexcept override { return chunk_plan_; }
 
   /// Report the exact numeric buffers retained by the compatibility operator.
@@ -292,21 +331,22 @@ protected:
                     DerivativeAdjoint adjoint,
                     ParameterReductionSink& sink) const override
   {
+    std::lock_guard lock(workspace_->mutex);
     for (std::size_t channel = 0; channel < channels.size(); ++channel)
-      std::fill(channel_accumulators_[channel].begin(), channel_accumulators_[channel].end(), DerivativeValue{});
+      std::fill(workspace_->channels[channel].begin(), workspace_->channels[channel].end(), DerivativeValue{});
 
-    for (std::size_t sample = 0; sample < evaluators_.size(); ++sample)
+    for (std::size_t sample = 0; sample < sampleCount(); ++sample)
     {
       evaluateRows(sample);
       for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
         for (std::size_t channel = 0; channel < channels.size(); ++channel)
         {
           DerivativeValue derivative = channels[channel].product == DerivativeProduct::SCORE_VJP
-              ? asDerivativeValue(score_row_[parameter])
-              : asDerivativeValue(kinetic_row_[parameter]);
+              ? asDerivativeValue(workspace_->score_row[parameter])
+              : asDerivativeValue(workspace_->kinetic_row[parameter]);
           if (adjoint == DerivativeAdjoint::HERMITIAN)
             derivative = std::conj(derivative);
-          channel_accumulators_[channel][parameter] +=
+          workspace_->channels[channel][parameter] +=
               derivative * channels[channel].coefficients.values[sample];
         }
     }
@@ -315,19 +355,35 @@ protected:
       for (std::size_t channel = 0; channel < channels.size(); ++channel)
         sink.add(channel,
                  {chunk,
-                  {channel_accumulators_[channel].data() + chunk.parameter_offset, chunk.count}});
+                  {workspace_->channels[channel].data() + chunk.parameter_offset, chunk.count}});
   }
 
   /// Evaluate and emit one scalar score-direction product per sample.
   void evaluateScoreJVP(const StructuredParameterVectorConstView& direction,
                         SampleProductSink& sink) const override
   {
-    for (std::size_t sample = 0; sample < evaluators_.size(); ++sample)
+    evaluateJVP(direction, sink, false);
+  }
+
+  void evaluateLocalEnergyJVP(const StructuredParameterVectorConstView& direction,
+                              std::uint32_t,
+                              SampleProductSink& sink) const override
+  {
+    evaluateJVP(direction, sink, true);
+  }
+
+private:
+  void evaluateJVP(const StructuredParameterVectorConstView& direction,
+                    SampleProductSink& sink, bool kinetic) const
+  {
+    std::lock_guard lock(workspace_->mutex);
+    for (std::size_t sample = 0; sample < sampleCount(); ++sample)
     {
       evaluateRows(sample);
       DerivativeValue product{};
       for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
-        product += asDerivativeValue(score_row_[parameter]) * direction.values()[parameter];
+        product += asDerivativeValue(kinetic ? workspace_->kinetic_row[parameter] : workspace_->score_row[parameter]) *
+            direction.values()[parameter];
       const SampleProductTileDescriptor descriptor{schema_->providerId(),
                                                    schema_->fingerprint(),
                                                    parameter_version_,
@@ -339,57 +395,59 @@ protected:
     }
   }
 
-private:
   /// Reuse the two legacy full-P rows for one evaluator configuration.
   void evaluateRows(std::size_t sample) const
   {
-    score_row_   = QMCTraits::ValueType{};
-    kinetic_row_ = QMCTraits::ValueType{};
-    evaluators_[sample].get().evaluateDerivatives(
-        particle_sets_[sample].get(), *active_, score_row_, kinetic_row_);
+    auto state = replay_->prepareSample(sample);
+    validateMasses(state.particles);
+    resetEvaluator(state.wavefunction, *active_, snapshot_->values);
+    state.wavefunction.evaluateLog(state.particles);
+    workspace_->score_row   = QMCTraits::ValueType{};
+    workspace_->kinetic_row = QMCTraits::ValueType{};
+    state.wavefunction.evaluateDerivatives(state.particles, *active_, workspace_->score_row, workspace_->kinetic_row);
   }
 
   /// Capture the retained-buffer byte count after all construction allocations.
   void initializeStorageDiagnostics()
   {
     storage_diagnostics_.parameter_count = schema_->parameterCount();
-    storage_diagnostics_.sample_count    = evaluators_.size();
+    storage_diagnostics_.sample_count    = sampleCount();
 #ifdef QMC_COMPLEX
     storage_diagnostics_.complex_parameter_vectors = 2 + MAXIMUM_VJP_CHANNELS;
 #else
     storage_diagnostics_.real_parameter_vectors    = 2;
     storage_diagnostics_.complex_parameter_vectors = MAXIMUM_VJP_CHANNELS;
 #endif
-    const std::size_t legacy_row_entries = checkedAdd(score_row_.capacity(), kinetic_row_.capacity(),
+    const std::size_t legacy_row_entries = checkedAdd(workspace_->score_row.capacity(), workspace_->kinetic_row.capacity(),
                                                       "Legacy derivative row capacity");
     const std::size_t legacy_row_bytes = checkedMultiply(
         legacy_row_entries, sizeof(QMCTraits::ValueType), "Legacy derivative row capacity bytes");
     std::size_t channel_entries = 0;
-    for (const auto& channel : channel_accumulators_)
+    for (const auto& channel : workspace_->channels)
       channel_entries = checkedAdd(channel_entries, channel.capacity(), "Legacy derivative channel capacity");
     const std::size_t channel_bytes = checkedMultiply(
         channel_entries, sizeof(DerivativeValue), "Legacy derivative channel capacity bytes");
     storage_diagnostics_.parameter_scratch_bytes = checkedAdd(
         legacy_row_bytes, channel_bytes, "Legacy retained derivative scratch");
     storage_diagnostics_.retained_numeric_bytes  = storage_diagnostics_.parameter_scratch_bytes;
-    std::size_t fingerprint = reinterpret_cast<std::size_t>(score_row_.data());
-    fingerprint ^= reinterpret_cast<std::size_t>(kinetic_row_.data()) + std::size_t{0x9e3779b9U};
-    for (const auto& channel : channel_accumulators_)
+    storage_diagnostics_.shared_workspace_identity = reinterpret_cast<std::uintptr_t>(workspace_.get());
+    storage_diagnostics_.shared_workspace_bytes = storage_diagnostics_.parameter_scratch_bytes;
+    std::size_t fingerprint = reinterpret_cast<std::size_t>(workspace_->score_row.data());
+    fingerprint ^= reinterpret_cast<std::size_t>(workspace_->kinetic_row.data()) + std::size_t{0x9e3779b9U};
+    for (const auto& channel : workspace_->channels)
       fingerprint ^= reinterpret_cast<std::size_t>(channel.data()) + (fingerprint << 6) + (fingerprint >> 2);
     storage_diagnostics_.storage_fingerprint = fingerprint == 0 ? 1 : fingerprint;
   }
 
   std::shared_ptr<const StructuredParameterSchema> schema_;
   std::shared_ptr<const optimize::VariableSet> active_;
+  std::shared_ptr<const StructuredParameterSnapshot> snapshot_;
   std::size_t parameter_version_ = 0;
-  RefVector<TrialWaveFunction> evaluators_;
-  RefVector<ParticleSet> particle_sets_;
+  std::shared_ptr<LegacyWaveFunctionReplay> replay_;
+  std::shared_ptr<LegacyDerivativeWorkspace> workspace_;
   std::size_t batch_ordinal_ = 0;
   std::size_t sample_offset_ = 0;
   ParameterChunkPlan chunk_plan_;
-  mutable Vector<QMCTraits::ValueType> score_row_;
-  mutable Vector<QMCTraits::ValueType> kinetic_row_;
-  mutable std::array<std::vector<DerivativeValue>, MAXIMUM_VJP_CHANNELS> channel_accumulators_;
   StreamingDerivativeStorageDiagnostics storage_diagnostics_;
 };
 
@@ -430,6 +488,7 @@ LegacyWaveFunctionAdapter::LegacyWaveFunctionAdapter(std::string provider_id,
   registration_template_ =
       std::make_shared<const optimize::VariableSet>(std::move(registration_template));
   schema_ = std::make_shared<const StructuredParameterSchema>(std::move(provider_id), blocks);
+  workspace_ = std::make_shared<LegacyDerivativeWorkspace>(parameter_count);
 }
 
 StructuredParameterSnapshot LegacyWaveFunctionAdapter::snapshotParameters() const
@@ -460,6 +519,16 @@ std::size_t LegacyWaveFunctionAdapter::publishParameters(const StructuredParamet
   return ++parameter_version_;
 }
 
+std::size_t LegacyWaveFunctionAdapter::commitPreparedParameters(StructuredParameterSnapshot&& candidate) noexcept
+{
+  std::lock_guard lock(state_mutex_);
+  assert(candidate.schema_fingerprint == schema_->fingerprint());
+  assert(candidate.values.size() == schema_->parameterCount());
+  assert(candidate.version == parameter_version_ && parameter_version_ < std::numeric_limits<std::size_t>::max());
+  parameter_values_.swap(candidate.values);
+  return ++parameter_version_;
+}
+
 std::unique_ptr<StreamingDerivativeOperator> LegacyWaveFunctionAdapter::makeDerivativeOperator(
     const RefVector<TrialWaveFunction>& evaluators,
     const RefVector<ParticleSet>& particle_sets,
@@ -475,16 +544,43 @@ std::unique_ptr<StreamingDerivativeOperator> LegacyWaveFunctionAdapter::makeDeri
   if (schema_->parameterCount() > options_.maximum_parameter_count ||
       requiredScratchBytes(schema_->parameterCount()) > options_.maximum_derivative_scratch_bytes)
     throw std::length_error("Legacy adapter derivative request exceeds configured resource ceilings");
-  for (const ParticleSet& particles : particle_sets)
-  {
-    const auto& masses = particles.get_mass_by_group();
-    if (masses.size() == 0 || std::any_of(masses.begin(), masses.end(), [](auto mass) { return mass != 1.0; }))
-      throw std::invalid_argument("Legacy adapter supports only initialized unit electron masses");
-  }
+  auto snapshot = std::make_shared<const StructuredParameterSnapshot>(snapshotParameters());
+  // Preserve eager validation for the original exclusive-reference API.
+  for (std::size_t sample = 0; sample < evaluators.size(); ++sample)
+    installSnapshot(evaluators[sample], particle_sets[sample], *snapshot);
+  return makeDerivativeOperator(std::make_shared<ReferenceReplay>(evaluators, particle_sets),
+                                std::move(snapshot), batch_ordinal, sample_offset);
+}
 
-  const StructuredParameterSnapshot snapshot = snapshotParameters();
+void LegacyWaveFunctionAdapter::resetPrivateParameters(TrialWaveFunction& evaluator,
+                                                       const StructuredParameterSnapshot& snapshot) const
+{
+  validateSnapshot(snapshot, *schema_);
+  resetEvaluator(evaluator, *registration_template_, snapshot.values);
+}
+
+void LegacyWaveFunctionAdapter::installSnapshot(TrialWaveFunction& evaluator,
+                                               ParticleSet& particles,
+                                               const StructuredParameterSnapshot& snapshot) const
+{
+  validateMasses(particles);
+  resetPrivateParameters(evaluator, snapshot);
+  evaluator.evaluateLog(particles);
+}
+
+std::unique_ptr<StreamingDerivativeOperator> LegacyWaveFunctionAdapter::makeDerivativeOperator(
+    std::shared_ptr<LegacyWaveFunctionReplay> replay,
+    std::shared_ptr<const StructuredParameterSnapshot> snapshot,
+    std::size_t batch_ordinal,
+    std::size_t sample_offset) const
+{
+  if (!replay || !snapshot)
+    throw std::invalid_argument("Legacy adapter replay and snapshot must not be null");
+  validateSnapshot(*snapshot, *schema_);
+  if (sample_offset > std::numeric_limits<std::size_t>::max() - replay->sampleCount())
+    throw std::overflow_error("Legacy adapter sample interval overflow");
   return std::make_unique<LegacyStreamingDerivativeOperator>(
-      schema_, registration_template_, snapshot, evaluators, particle_sets, batch_ordinal, sample_offset,
+      schema_, registration_template_, std::move(snapshot), std::move(replay), workspace_, batch_ordinal, sample_offset,
       std::min(options_.maximum_parameter_chunk_size, schema_->parameterCount()),
       options_.maximum_derivative_scratch_bytes);
 }

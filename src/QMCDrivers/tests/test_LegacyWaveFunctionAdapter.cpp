@@ -177,6 +177,43 @@ private:
   std::shared_ptr<std::atomic<std::size_t>> derivative_calls_;
 };
 
+/// Fixed Gaussian supplies nonzero total-gradient cross terms to production J2.
+class FixedGaussianComponent final : public WaveFunctionComponent
+{
+public:
+  explicit FixedGaussianComponent(double strength) : WaveFunctionComponent("fixed_gaussian"), strength_(strength) {}
+  std::string getClassName() const override { return "FixedGaussianComponent"; }
+  LogValue evaluateLog(const ParticleSet& particles, ParticleSet::ParticleGradient& gradients,
+                       ParticleSet::ParticleLaplacian& laplacians) override
+  {
+    double value = 0.0;
+    for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+    {
+      for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      {
+        const double coordinate = particles.R[electron][dimension];
+        value -= strength_ * coordinate * coordinate;
+        gradients[electron][dimension] -= 2.0 * strength_ * coordinate;
+      }
+      laplacians[electron] -= 2.0 * strength_ * OHMMS_DIM;
+    }
+    log_value_ = LogValue{value, 0.0};
+    return log_value_;
+  }
+  void acceptMove(ParticleSet&, int, bool) override {}
+  void restore(int) override {}
+  PsiValue ratio(ParticleSet&, int) override { return PsiValue{1}; }
+  void registerData(ParticleSet&, WFBufferType&) override {}
+  LogValue updateBuffer(ParticleSet&, WFBufferType&, bool) override { return log_value_; }
+  void copyFromBuffer(ParticleSet&, WFBufferType&) override {}
+  std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet&) const override
+  {
+    return std::make_unique<FixedGaussianComponent>(strength_);
+  }
+private:
+  double strength_;
+};
+
 /// Build one conventional aggregate around the legacy component.
 std::unique_ptr<TrialWaveFunction> makeWaveFunction(
     std::array<double, 3> parameters,
@@ -227,7 +264,8 @@ ParticleSet makeTwoSpeciesParticles(const SimulationCell& cell)
 /// Construct a real QMCPACK two-body B-spline Jastrow with four active coefficients.
 std::unique_ptr<TrialWaveFunction> makeBsplineJ2WaveFunction(
     ParticleSet& particles,
-    const std::array<double, 4>& parameters)
+    const std::array<double, 4>& parameters,
+    double fixed_gaussian = 0.0)
 {
   using Functor = BsplineFunctor<QMCTraits::RealType>;
   using J2      = TwoBodyJastrow<Functor>;
@@ -244,9 +282,47 @@ std::unique_ptr<TrialWaveFunction> makeBsplineJ2WaveFunction(
   auto jastrow = std::make_unique<J2>("adapter_j2", particles, false);
   jastrow->addFunc(0, 1, std::move(functor));
   auto wavefunction = std::make_unique<TrialWaveFunction>(RuntimeOptions{}, "legacy_j2_test");
+  if (fixed_gaussian != 0.0)
+    wavefunction->addComponent(std::make_unique<FixedGaussianComponent>(fixed_gaussian));
   wavefunction->addComponent(std::move(jastrow));
   return wavefunction;
 }
+
+DerivativeValue kineticEnergy(const ParticleSet& particles)
+{
+  DerivativeValue energy{};
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+  {
+    energy -= 0.5 * derivativeValue(particles.L[electron]);
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      const auto gradient = derivativeValue(particles.G[electron][dimension]);
+      energy -= 0.5 * gradient * gradient;
+    }
+  }
+  return energy;
+}
+
+/// Reuse a single private evaluator for any number of frozen sample views.
+class ShiftedLegacyReplay final : public LegacyWaveFunctionReplay
+{
+public:
+  ShiftedLegacyReplay(TrialWaveFunction& wavefunction, ParticleSet& particles, std::vector<double> shifts)
+      : wavefunction_(wavefunction), particles_(particles), shifts_(std::move(shifts))
+  {}
+  std::size_t sampleCount() const noexcept override { return shifts_.size(); }
+  LegacyWaveFunctionReplaySample prepareSample(std::size_t index) override
+  {
+    particles_.R[0] = {0.2 + shifts_.at(index), -0.3, 0.4};
+    particles_.R[1] = {-0.5, 0.1 + shifts_.at(index), 0.7};
+    particles_.update();
+    return {wavefunction_, particles_};
+  }
+private:
+  TrialWaveFunction& wavefunction_;
+  ParticleSet& particles_;
+  std::vector<double> shifts_;
+};
 
 /// Required nonzero ceilings for the small deterministic fixture.
 LegacyWaveFunctionAdapterOptions adapterOptions()
@@ -415,6 +491,13 @@ TEST_CASE("Legacy adapter publishes detached structured state atomically",
   CHECK(adapter.snapshotParameters().values == candidate.values);
   CHECK_THROWS(adapter.publishParameters(candidate, before.version));
   CHECK(adapter.snapshotParameters().values == candidate.values);
+  auto prepared = adapter.snapshotParameters();
+  prepared.values = {0.8, -0.2, 0.3};
+  const auto accepted_values = prepared.values;
+  CHECK(adapter.commitPreparedParameters(std::move(prepared)) == 2);
+  CHECK(adapter.snapshotParameters().values == accepted_values);
+  CHECK(prepared.values == candidate.values);
+  CHECK(*calls == 0);
 }
 
 TEST_CASE("Legacy adapter VJPs and JVP match direct conventional derivative rows",
@@ -474,6 +557,17 @@ TEST_CASE("Legacy adapter VJPs and JVP match direct conventional derivative rows
     for (std::size_t parameter = 0; parameter < 3; ++parameter)
       expected += row[parameter] * direction[parameter];
     checkClose(jvp_sink.result()[sample], expected);
+  }
+  RecordingSampleSink kinetic_jvp;
+  op->applyLocalEnergyJVP(direction_view, localEnergyTermBit(LocalEnergyTerm::KINETIC), kinetic_jvp);
+  REQUIRE(kinetic_jvp.result().size() == 2);
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    const auto& row = sample == 0 ? kinetic0 : kinetic1;
+    DerivativeValue expected{};
+    for (std::size_t parameter = 0; parameter < 3; ++parameter)
+      expected += row[parameter] * direction[parameter];
+    checkClose(kinetic_jvp.result()[sample], expected);
   }
 
   // Validate the high-level energy objective against a dense test-only formula.
@@ -607,6 +701,120 @@ TEST_CASE("Legacy adapter binds a production two-body B-spline Jastrow",
     CHECK(active[static_cast<int>(parameter)] == Catch::Approx(published.values[parameter]));
   }
   CHECK(observed_nonzero_score);
+}
+
+TEST_CASE("Legacy production J2 products match energy finite differences and duality",
+          "[drivers][training][legacy_adapter][jastrow]")
+{
+  const SimulationCell cell;
+  auto particles = makeTwoSpeciesParticles(cell);
+  auto wavefunction = makeBsplineJ2WaveFunction(particles, {0.12, -0.08, 0.04, -0.01}, 0.37);
+  particles.update();
+  LegacyWaveFunctionAdapter adapter("legacy/j2_fd", *wavefunction, adapterOptions());
+  const auto snapshot = adapter.snapshotParameters();
+  auto op = adapter.makeDerivativeOperator(RefVector<TrialWaveFunction>{*wavefunction},
+                                            RefVector<ParticleSet>{particles}, 4, 7);
+  const std::vector<DerivativeValue> coefficients{{0.7, -0.2}};
+  const std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, coefficients), 0},
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, coefficients),
+       localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  RecordingParameterSink transpose;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, transpose);
+  std::vector<DerivativeValue> direction{0.3, -0.2, 0.5, 0.1};
+  StructuredParameterVectorConstView view(adapter.parameterSchema(), snapshot.version,
+                                           {direction.data(), direction.size()});
+  RecordingSampleSink score, energy;
+  op->applyScoreJVP(view, score);
+  op->applyLocalEnergyJVP(view, localEnergyTermBit(LocalEnergyTerm::KINETIC), energy);
+  for (std::size_t channel = 0; channel < channels.size(); ++channel)
+  {
+    DerivativeValue contraction{};
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+      contraction += transpose.result()[channel][parameter] * direction[parameter];
+    checkClose(contraction, coefficients[0] * (channel == 0 ? score.result()[0] : energy.result()[0]));
+  }
+  RecordingParameterSink hermitian;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::HERMITIAN, hermitian);
+  for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+  {
+    const double epsilon = 1e-5;
+    auto plus = snapshot, minus = snapshot;
+    plus.values[parameter] += epsilon;
+    minus.values[parameter] -= epsilon;
+    adapter.installSnapshot(*wavefunction, particles, plus);
+    const double plus_log = std::real(wavefunction->getLogPsi());
+    const auto plus_energy = kineticEnergy(particles);
+    adapter.installSnapshot(*wavefunction, particles, minus);
+    const double minus_log = std::real(wavefunction->getLogPsi());
+    const auto minus_energy = kineticEnergy(particles);
+    const auto score_fd = (plus_log - minus_log) / (2.0 * epsilon);
+    const auto energy_fd = (plus_energy - minus_energy) / (2.0 * epsilon);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      const auto finite_difference = channel == 0 ? DerivativeValue{score_fd} : energy_fd;
+      const auto actual = transpose.result()[channel][parameter] / coefficients[0];
+      CHECK(actual.real() == Catch::Approx(finite_difference.real()).epsilon(2e-7).margin(2e-9));
+      CHECK(actual.imag() == Catch::Approx(finite_difference.imag()).margin(2e-9));
+      checkClose(hermitian.result()[channel][parameter], std::conj(actual) * coefficients[0]);
+    }
+  }
+  // Repeated actions reinstall their immutable snapshot after arbitrary private probes.
+  RecordingSampleSink repeated;
+  op->applyLocalEnergyJVP(view, localEnergyTermBit(LocalEnergyTerm::KINETIC), repeated);
+  checkClose(repeated.result()[0], energy.result()[0]);
+}
+
+TEST_CASE("Legacy replay block views share bounded parameter workspace and immutable state",
+          "[drivers][training][legacy_adapter][memory]")
+{
+  const SimulationCell cell;
+  auto particles = makeParticles(cell, 0.0);
+  auto calls = std::make_shared<std::atomic<std::size_t>>(0);
+  auto wavefunction = makeWaveFunction({0.2, -0.1, 0.05}, calls);
+  LegacyWaveFunctionAdapter adapter("legacy/replay", *wavefunction, adapterOptions());
+  auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
+  auto replay = std::make_shared<ShiftedLegacyReplay>(*wavefunction, particles,
+                                                      std::vector<double>{0.0, 0.2, -0.1});
+  std::vector<std::unique_ptr<StreamingDerivativeOperator>> blocks;
+  for (std::size_t block = 0; block < 12; ++block)
+    blocks.push_back(adapter.makeDerivativeOperator(replay, snapshot, block, 3 * block));
+  REQUIRE(snapshot.use_count() == 13);
+  const auto first = blocks.front()->storageDiagnostics();
+  CHECK(first.shared_workspace_identity != 0);
+  CHECK(first.shared_workspace_bytes == first.parameter_scratch_bytes);
+  for (const auto& block : blocks)
+  {
+    const auto storage = block->storageDiagnostics();
+    CHECK(storage.shared_workspace_identity == first.shared_workspace_identity);
+    CHECK(storage.storage_fingerprint == first.storage_fingerprint);
+    CHECK(storage.parameter_scratch_bytes == first.parameter_scratch_bytes);
+  }
+  auto candidate = *snapshot;
+  candidate.values = {0.7, 0.6, 0.5};
+  adapter.publishParameters(candidate, candidate.version);
+  const std::vector<DerivativeValue> direction{0.2, -0.4, 0.7};
+  StructuredParameterVectorConstView view(adapter.parameterSchema(), snapshot->version,
+                                           {direction.data(), direction.size()});
+  for (const auto& block : blocks)
+  {
+    RecordingSampleSink sink;
+    block->applyLocalEnergyJVP(view, localEnergyTermBit(LocalEnergyTerm::KINETIC), sink);
+    REQUIRE(sink.result().size() == replay->sampleCount());
+    for (std::size_t sample = 0; sample < replay->sampleCount(); ++sample)
+    {
+      replay->prepareSample(sample);
+      const auto row = LegacyJastrowComponent::kineticOracle(particles, snapshot->values);
+      DerivativeValue expected{};
+      for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+        expected += row[parameter] * direction[parameter];
+      checkClose(sink.result()[sample], expected);
+    }
+  }
+  auto invalid = std::make_shared<StructuredParameterSnapshot>(*snapshot);
+  invalid->values[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(adapter.makeDerivativeOperator(replay, invalid, 0, 0), std::invalid_argument);
+  CHECK_THROWS_AS(adapter.makeDerivativeOperator({}, snapshot, 0, 0), std::invalid_argument);
 }
 
 TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoint restore",
