@@ -341,7 +341,7 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
       if (const auto* ewald = dynamic_cast<const CoulombPBCAA*>(component))
       {
         if (ewald->usesOffload() || ewald->ewaldModelDefinition().empty() || !ewald->is_active ||
-            ewald->ComputeForces || ewald->PtclRefName != prototype_particles_.getName())
+            ewald->ComputeForces || &ewald->Ps != &prototype_particles_)
           throw std::runtime_error("Conventional periodic training requires CPU active 3D Ewald CoulombPBCAA");
         identity << "periodic_ewald:" << component->getName() << ':' << ewald->ewaldModelDefinition() << ';';
         ++periodic_coulomb;

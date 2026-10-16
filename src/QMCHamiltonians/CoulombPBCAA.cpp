@@ -490,7 +490,8 @@ void CoulombPBCAA::initBreakup(ParticleSet& ref_pset)
     const auto& lattice = ref_pset.getLattice();
     std::ostringstream definition;
     definition << std::hexfloat << "CoulombPBCAA:3d-uniform-neutralizing-background+self-v1;source="
-               << PtclRefName << ";active=" << is_active << ";forces=" << ComputeForces
+               << ref_pset.getName() << ";distance_table=" << PtclRefName
+               << ";active=" << is_active << ";forces=" << ComputeForces
                << ";handler=EwaldHandler3D;sigma=" << ewald->Sigma
                << ";volume=" << ewald->Volume << ";rc=" << ewald->get_rc()
                << ";kc=" << ewald->get_kc() << ";shells=" << ewald->MaxKshell
