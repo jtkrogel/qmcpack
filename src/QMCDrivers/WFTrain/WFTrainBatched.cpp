@@ -383,7 +383,8 @@ wftrain::FirstOrderOptimizerOptions makeFirstOrderOptions(const wftrain::Structu
 
 #ifdef QMC_COMPLEX
 /// Narrow driver authority: no parameter copy/lane and no change to generic GPU component discovery.
-class ComplexGpuTrainingProvider final : public wftrain::StructuredParameterProvider
+class ComplexGpuTrainingProvider final : public wftrain::StructuredParameterProvider,
+                                         public wftrain::PreparedParameterPublicationContributor
 {
 public:
   /// Publication receives only the exact admitted successor-generation caps, not derivative ownership.
@@ -415,7 +416,31 @@ public:
     return component_.publishBudgetedGpuParameters(candidate, version, device_, host_);
   }
 
+  /// Resolve the component-owned successor before the shared transaction admits commit.
+  std::unique_ptr<wftrain::PreparedParameterPublication> prepareParameterPublication(
+      const wftrain::StructuredParameterSnapshot& candidate, std::size_t version) override
+  {
+    auto publication = component_.prepareBudgetedGpuParameterPublication(candidate, version, device_, host_);
+    if (!publication)
+      throw std::logic_error("Paired GPU component returned no prepared publication");
+    return std::make_unique<PreparedPublication>(std::move(publication));
+  }
+
 private:
+  /// Layering-only owner: component code has no dependency on the driver protocol.
+  class PreparedPublication final : public wftrain::PreparedParameterPublication
+  {
+  public:
+    explicit PreparedPublication(std::unique_ptr<PsiFormerComplexWF::PreparedGpuParameterPublication> publication)
+        : publication_(std::move(publication))
+    {}
+
+    std::size_t commit() noexcept override { return publication_->commit(); }
+
+  private:
+    std::unique_ptr<PsiFormerComplexWF::PreparedGpuParameterPublication> publication_;
+  };
+
   PsiFormerComplexWF& component_;
   const std::size_t device_, host_;
 };
@@ -1624,7 +1649,8 @@ void WFTrainBatched::run()
         app_log() << "WFTrain paired GPU admitted additional device=" << device << " HOST=" << host
                   << " derivative=" << derivative_bytes << " successor=" << successor_bytes
                   << " K=" << limits.kinetic_targets << " matrix_work=" << r.matrix_work
-                  << "; excludes prepared inference generation, native/image HOST and vendor storage" << std::endl;
+                  << "; successor HOST includes one native candidate vector; excludes prepared inference generation, "
+                     "native/image model HOST and vendor storage" << std::endl;
       }
       else
         derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
