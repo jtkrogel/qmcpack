@@ -410,6 +410,12 @@ public:
     return true;
   }
 
+  /// Preserve the model's typed weight selection, including imaginary head matrices.
+  std::vector<std::string> neuralWeightBlocks() const override
+  {
+    return component_.neuralWeightBlocks();
+  }
+
   /// Reuse the qualified old-version transaction and complete new-generation publication.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate, std::size_t version) override
   {
@@ -1394,12 +1400,17 @@ void WFTrainBatched::process(xmlNodePtr node)
             (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
              (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
             training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
-            training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
-            training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
+            (!complex->gpuInferenceEnabled() &&
+             (training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
+              training_input_.getMaximumUpdateNorm() != 0)) || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
           throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
-              "or positively damped parameter-space SR, unclipped fixed step, no norm/selection controls, "
+              "or positively damped parameter-space SR, no metric-norm/selection controls, "
+              "shared scale/shrinkage/Euclidean bounds are GPU-only, "
               "and positive finite maximum_retained_bytes");
+        if (complex->gpuInferenceEnabled() && training_input_.getWeightDecay() != 0 &&
+            complex->neuralWeightBlocks().empty())
+          throw UniformCommunicateError("WFTrainBatched: paired GPU shrinkage requires typed nn_weights metadata");
       }
 #endif
     if (training_input_.getComplexGpuTraining().enabled())

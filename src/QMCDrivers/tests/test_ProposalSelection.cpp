@@ -6,8 +6,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include "QMCDrivers/WFTrain/ProposalSelection.h"
+#include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 #include "OhmmsData/Libxml2Doc.h"
+#include <cmath>
 
 namespace qmcplusplus::wftrain
 {
@@ -103,6 +105,94 @@ TEST_CASE("Proposal expansion respects final displacement bound", "[drivers][tra
   SelectedUpdateRule selection(optimizer, control, [](const auto&, const auto&) { return 2.0; });
   selection.propose(provider.schema, provider.parameters, objective);
   CHECK(selection.displacementNorm() == Catch::Approx(1.0));
+}
+
+TEST_CASE("Host Adam controls match explicit scaled shrunk and bounded displacement",
+          "[drivers][training][selection][host_controls]")
+{
+  SelectionProvider provider;
+  FirstOrderOptimizerOptions options;
+  options.learning_rates = {{"weights", 0.2}, {"bias", 0.1}};
+  options.adam_beta1 = 0.8;
+  options.adam_beta2 = 0.9;
+  options.epsilon = 1e-4;
+  FirstOrderOptimizer optimizer(provider.schema, options);
+  const std::vector<double> gradient{0.3, -0.4, 0.7, 0.0};
+  const ParameterGradientView objective{provider.schema.fingerprint(), 0, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  const auto old = provider.parameters;
+  ProposalSelectionControl control;
+  control.update_scale = 0.25;
+  control.weight_decay = 0.1;
+  control.decay_blocks = {"weight"};
+  control.maximum_update_norm = 0.12;
+
+  // First Adam step has bias-corrected m=g and v=g^2. This oracle does not
+  // obtain its raw direction or ordering from SelectedUpdateRule.
+  const std::vector<double> rates{0.2, 0.2, 0.1, 0.0};
+  std::vector<double> delta(4, 0.0);
+  double combined_norm = 0.0;
+  for (std::size_t i = 0; i < 3; ++i)
+  {
+    delta[i] = control.update_scale * (-rates[i] * gradient[i] / (std::abs(gradient[i]) + options.epsilon));
+    if (i < 2)
+      delta[i] -= control.weight_decay * old.values[i];
+    combined_norm = std::hypot(combined_norm, delta[i]);
+  }
+  REQUIRE(combined_norm > control.maximum_update_norm);
+  SelectedUpdateRule selection(optimizer, control);
+  CHECK(completeParameterUpdate(provider, old, objective, selection, {}) == 1);
+  double applied_norm = 0.0;
+  for (std::size_t i = 0; i < old.values.size(); ++i)
+  {
+    const double displacement = delta[i] * control.maximum_update_norm / combined_norm;
+    CHECK(provider.parameters.values[i] == Catch::Approx(old.values[i] + displacement));
+    applied_norm = std::hypot(applied_norm, provider.parameters.values[i] - old.values[i]);
+    CHECK(optimizer.firstMoment()[i] == Catch::Approx((1 - options.adam_beta1) * gradient[i]));
+    CHECK(optimizer.secondMoment()[i] == Catch::Approx((1 - options.adam_beta2) * gradient[i] * gradient[i]));
+  }
+  CHECK(applied_norm == Catch::Approx(control.maximum_update_norm));
+  CHECK(provider.parameters.values[3] == old.values[3]);
+  CHECK(optimizer.acceptedUpdateCount() == 1);
+  CHECK_FALSE(optimizer.hasLiveProposal());
+}
+
+TEST_CASE("Host zero-scale off-selection rejects without committing Adam moments",
+          "[drivers][training][selection][host_controls]")
+{
+  SelectionProvider provider;
+  FirstOrderOptimizerOptions options;
+  options.learning_rates = {{"weights", 0.2}, {"bias", 0.1}};
+  FirstOrderOptimizer optimizer(provider.schema, options);
+  const std::vector<double> gradient{0.3, -0.4, 0.7, 0.0};
+  const ParameterGradientView objective{provider.schema.fingerprint(), 0, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  const auto old = provider.parameters;
+  const auto old_first = optimizer.firstMoment();
+  const auto old_second = optimizer.secondMoment();
+  ProposalSelectionControl control;
+  control.update_scale = 0.0;
+  // Match the driver's line_search=off zero-scale/no-decay rejection policy.
+  SelectedUpdateRule zero_step(optimizer, control, [](const auto&, const auto&) { return 0.0; });
+  CHECK(completeParameterUpdate(provider, old, objective, zero_step, {}) == 0);
+  CHECK(provider.parameters.values == old.values);
+  CHECK(provider.parameters.version == old.version);
+  CHECK(optimizer.firstMoment() == old_first);
+  CHECK(optimizer.secondMoment() == old_second);
+  CHECK(optimizer.acceptedUpdateCount() == 0);
+  CHECK_FALSE(optimizer.hasLiveProposal());
+
+  // With shrinkage requested, scale zero suppresses only the optimizer step.
+  control.weight_decay = 0.1;
+  control.decay_blocks = {"weight"};
+  SelectedUpdateRule shrink_only(optimizer, control, [](const auto&, const auto&) { return 1.0; });
+  CHECK(completeParameterUpdate(provider, old, objective, shrink_only, {}) == 1);
+  CHECK(provider.parameters.values[0] == Catch::Approx(0.9 * old.values[0]));
+  CHECK(provider.parameters.values[1] == Catch::Approx(0.9 * old.values[1]));
+  CHECK(provider.parameters.values[2] == old.values[2]);
+  CHECK(provider.parameters.values[3] == old.values[3]);
+  CHECK(optimizer.acceptedUpdateCount() == 1);
+  CHECK_FALSE(optimizer.hasLiveProposal());
 }
 
 TEST_CASE("Line-search parameters parse strictly with unchanged numerical defaults", "[drivers][training][selection]")
