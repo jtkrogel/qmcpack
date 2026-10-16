@@ -33,6 +33,17 @@ accepted versions, changed active parameters, and frozen Slater export. It does
 not replace the full inference-isolation/restart suite or establish arbitrary
 MPI layouts. Later MDJ/orbital/ECP qualification remains separate.
 
+``wftrain_sj_j3.xml`` appends the standard PolynomialFunctor3D/JeeIOrbitalSoA
+three-body Jastrow: isize=esize=2 gives8independent coefficients in one default
+functor shared by all spin pairs. J1/J2/J3 jointly expose16active coefficients.
+The half-cutoff is3bohr so both electrons initially contribute around both ions.
+Use the same checker with that XML and ``--companion-optimizer sr --restart``.
+The bridge's mandatory scratch limit covers its two derivative rows and three
+channel vectors. J3 also retains internal P*Ne gradient/laplacian and functor
+derivative caches per private replay worker; those opaque caches are explicitly
+outside that bridge-only limit. Their worker count is bounded independently of
+sampled blocks; the fixture does not claim a complete process RSS ceiling.
+
 ``--optimizer-screen`` selects six additional nonlinear-Jastrow methods:
 momentum_sgd, rmsprop, amsgrad, sr, minsr and spring. Each uses two updates and
 four samples/update, with interval inference. Matrix-free methods explicitly
