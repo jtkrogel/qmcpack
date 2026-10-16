@@ -69,6 +69,25 @@ struct TargetVglCost
   std::size_t tile_count = 0;
 };
 
+/// Count only the B1 max-K real prefix: no real head, retained tapes or responseP.
+inline TargetVglCost estimateHeadFreeTargetPrefixCost(const PsiFormerExecutionPlan& plan, std::size_t targets)
+{
+  const auto& s = plan.modelShape();
+  const auto n = s.electrons(), f = s.feature_dimension;
+  if (!targets || targets > n)
+    throw std::invalid_argument("Head-free target prefix requires K within physical Ne");
+  const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Target prefix extent overflow"); };
+  const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Target prefix bytes overflow"); };
+  const auto planes = add(1, mul(4, targets)), u = mul(n, f), nn = mul(n, n);
+  const auto raw = mul(n, plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0]);
+  const auto host = add(mul(u, sizeof(OpenSpatialStatus)), mul(mul(s.attention_heads, n), sizeof(device_math::JetMathStatus)));
+  const auto bytes = add(mul(8, add(mul(3, n), mul(planes, add(add(raw, mul(8, u)), add(mul(s.attention_heads, nn), 1))))),
+      add(host, add(sizeof(std::size_t), sizeof(InferenceStatusWord))));
+  const auto tiles = n / targets + (n % targets != 0);
+  const auto work = add(mul(3, mul(s.determinants, mul(nn, nn))), mul(4, mul(s.determinants, mul(tiles, mul(nn, n)))));
+  return {bytes, host, work, tiles};
+}
+
 /** Count every non-retained target graph buffer before its first device reserve.
  * Work proxy: 3*B*D*Ne^4 plus 4*B*D*T*Ne^3 for repeated factor/inverse work.
  * Compensated inner sums have several operations/site; this is not a FLOP bound.
@@ -587,6 +606,7 @@ private:
   friend class PreparedDeviceKineticReverse;
   friend class PreparedDeviceComplexValue;
   friend class PreparedDeviceComplexSpatial;
+  friend struct ComplexSpatialTargetValidationAccess;
   friend class PreparedDeviceComplexScore;
   friend class PreparedDeviceKineticTrunk;
   friend struct KineticTrunkValidationAccess;
@@ -613,12 +633,13 @@ private:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
+    const bool head_free_targets = real_trunk_only && target_preparation_.max_targets;
     if (kinetic_trunk_only && (!real_trunk_only || batch_size != 1 || !retain_spatial_tape ||
         retain_score_tape || retained_targets || !target_preparation.max_targets ||
         target_preparation.max_targets > shape_.electrons()))
       throw std::invalid_argument("Private kinetic trunk requires one explicitly bounded retained spatial graph");
     if (real_trunk_only && !kinetic_trunk_only && (retain_spatial_tape ||
-        retained_targets_ || target_preparation_.max_targets || environment.boundary != BoundaryCondition::PERIODIC ||
+        retained_targets_ || environment.boundary != BoundaryCondition::PERIODIC ||
         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
       throw std::invalid_argument("Private real trunk preparation requires the numerical paired profile");
@@ -634,6 +655,16 @@ private:
     {
       if (target_preparation_.device_workspace_budget_bytes != 0 || target_preparation_.scalar_work_budget != 0)
         throw std::invalid_argument("Target VGL budgets require an explicit positive target capacity");
+    }
+    else if (head_free_targets && !kinetic_trunk_only)
+    {
+      if (batch_size != 1 || mode_ != SpatialJetMode::FULL_VGL || retain_score_tape || retain_spatial_tape ||
+          !target_preparation_.device_workspace_budget_bytes || !target_preparation_.scalar_work_budget)
+        throw std::invalid_argument("Private forward target prefix requires B1/FULL, no tapes and positive caps");
+      target_cost_ = estimateHeadFreeTargetPrefixCost(plan_, target_preparation_.max_targets);
+      if (target_cost_.device_workspace_bytes > target_preparation_.device_workspace_budget_bytes ||
+          target_cost_.charged_scalar_work_units > target_preparation_.scalar_work_budget)
+        throw std::length_error("Private forward target prefix exceeds byte/work caps");
     }
     else if (!kinetic_trunk_only)
     {
@@ -728,7 +759,7 @@ private:
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
     sticky_status_.reserve(1);
-    if (target_preparation_.max_targets && !kinetic_trunk_only)
+    if (target_preparation_.max_targets && !head_free_targets)
     {
       full_phase_.reserve(batch_);
       full_output_.reserve(spatialJetSpanElements(result_layout_));
@@ -755,6 +786,9 @@ private:
     if (retained_targets_ && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
         hostWorkspaceBytes() != target_cost_.host_workspace_bytes))
       throw std::logic_error("Retained target forward storage disagrees with pre-allocation accounting");
+    if (head_free_targets && !kinetic_trunk_only && (deviceWorkspaceBytes() != target_cost_.device_workspace_bytes ||
+        hostWorkspaceBytes() != target_cost_.host_workspace_bytes))
+      throw std::logic_error("Head-free target prefix differs from exact preflight");
   }
 
 public:

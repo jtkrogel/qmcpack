@@ -26,7 +26,7 @@ namespace qmcplusplus::psiformer::device
  * Names/shapes match the small generated integration fixture; only this vector
  * of roughly forty tensor descriptors is allocated at the large physical shape.
  */
-inline PsiFormerExecutionPlan makeTargetCostPlan(std::size_t electrons, bool periodic)
+inline PsiFormerExecutionPlan makeTargetCostPlan(std::size_t electrons, bool periodic, bool paired = false)
 {
   const ModelShape shape{electrons / 2, electrons - electrons / 2, electrons / 5, 16, 256, 4, 4};
   ExecutionEnvironment environment;
@@ -36,6 +36,11 @@ inline PsiFormerExecutionPlan makeTargetCostPlan(std::size_t electrons, bool per
     environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
     environment.periodic_axes = {true, true, true};
     environment.lattice_vectors = {{{8, 0, 0}, {0, 8, 0}, {0, 0, 8}}};
+  }
+  if (paired)
+  {
+    environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
+    environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
   }
   std::vector<ParameterLayoutInput> layouts;
   const auto append = [&](std::string module, std::string name, std::vector<std::size_t> dimensions) {
@@ -53,7 +58,11 @@ inline PsiFormerExecutionPlan makeTargetCostPlan(std::size_t electrons, bool per
   for (const auto* name : {"pi_down", "pi_up", "zetas_down", "zetas_up"})
     append(prefix + "exponential_envelopes", name, {channels, shape.nuclei});
   for (const auto* backflow : {"Backflow", "Backflow_1"})
+  {
     append(prefix + "omni_net/~/" + backflow + "/~/mlp/linear_0", "w", {shape.feature_dimension, channels});
+    if (paired)
+      append(prefix + "omni_net/~/" + backflow + "/~/mlp/linear_0", "w_imag", {shape.feature_dimension, channels});
+  }
   append(prefix + "omni_net/~/electron_gnn/~/electron_embedding/linear", "w",
       {(periodic ? 7 : 4) * shape.nuclei + 1, shape.feature_dimension});
   for (std::size_t block = 0; block < shape.attention_blocks; ++block)
