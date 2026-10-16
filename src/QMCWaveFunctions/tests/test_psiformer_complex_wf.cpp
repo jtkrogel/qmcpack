@@ -20,6 +20,9 @@
 #include "QMCHamiltonians/HamiltonianFactory.h"
 #include "Particle/VirtualParticleSet.h"
 #include "psiformer_test_utils.h"
+#ifdef ENABLE_CUDA
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
+#endif
 #include <algorithm>
 #include <complex>
 #include <limits>
@@ -610,7 +613,8 @@ TEST_CASE("PsiFormer paired XML rejects unsafe requests before target or device 
     REQUIRE(document.parseFromString(xml));
     return builder.buildComponent(document.getRoot());
   };
-  for (const char* request : {"gpu='auto'", "gpu='cuda'", "optimize='yes'",
+  for (const char* request : {"gpu='auto'", "gpu='cuda'", "gpu='cuda' max_gpu_numeric_bytes='0'",
+                             "max_gpu_numeric_bytes='1024'", "optimize='yes'",
                              "precision='fp32_dense_fp64_islands'"})
     CHECK_THROWS(build(complexXml(request)));
   CHECK_THROWS(build(complexXml("", "")));
@@ -1098,4 +1102,139 @@ TEST_CASE("PsiFormer complex stream physical finite differences and concrete fac
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
   CHECK(component.structuredParameterProvider() == nullptr);
 }
+#ifdef ENABLE_CUDA
+TEST_CASE("PsiFormer complex GPU inference shares one capped lane without CPU tapes",
+          "[wavefunction][psiformer][complex_gpu_inference]")
+{
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  {
+    WARN("NOT_RUN: complex GPU inference requires an available HIP device");
+    return;
+  }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  {
+    WARN("NOT_RUN: complex GPU inference requires an available CUDA device");
+    return;
+  }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto lattice = cell();
+  const SimulationCell simulation_cell(lattice);
+  for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+  {
+    auto cpu_p = electrons(simulation_cell), gpu_p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+    auto source = ions(simulation_cell);
+    const auto initialized = parameters();
+    ps::ExecutionEnvironment env;
+    env.boundary = ps::BoundaryCondition::PERIODIC;
+    env.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    env.periodic_axes = {true, true, true};
+    env.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    env.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    for (int a = 0; a < 3; ++a)
+      for (int d = 0; d < 3; ++d)
+        env.lattice_vectors[a][d] = lattice.R(a, d);
+    const auto plan = ps::PsiFormerExecutionPlan::fromParameters(initialized, initialized.model_shape, env);
+    const auto exact = dev::estimateComplexValueCost(plan, 1).device_bytes +
+                       dev::estimateComplexSpatialCost(plan, 1).device_bytes;
+    const auto before_reject = metrics.snapshot();
+    CHECK_THROWS_AS(PsiFormerComplexWF("short", initialized, gpu_p, source, clone_cap, twist, exact - 1), std::length_error);
+    CHECK_THROWS_AS(PsiFormerComplexWF("shortGL", initialized, gpu_p, source, 1, twist, exact), std::length_error);
+    CHECK_THROWS_AS(PsiFormerComplexWF("unlimited", initialized, gpu_p, source, clone_cap, twist,
+        std::numeric_limits<std::size_t>::max()), std::invalid_argument);
+    CHECK(metrics.snapshot().allocation_calls == before_reject.allocation_calls);
+    PsiFormerComplexWF cpu("cpu", initialized, cpu_p, source, clone_cap, twist);
+    const auto before = metrics.snapshot();
+    PsiFormerComplexWF gpu("gpu", initialized, gpu_p, source, clone_cap, twist, exact);
+    REQUIRE(gpu.gpuInferenceEnabled());
+    const auto storage = gpu.numericStorage();
+    CHECK(storage.shared_gpu_bytes == exact);
+    CHECK(metrics.snapshot().live_bytes - before.live_bytes == exact + storage.shared_image_bytes);
+    CHECK(storage.allocated_bytes == 4 * (sizeof(WaveFunctionComponent::GradType) + sizeof(WaveFunctionComponent::ValueType)));
+    CHECK(storage.required_bytes == storage.allocated_bytes); // no CPU VALUE/FULL/ACTIVE tapes
+    const auto cold_clone = metrics.snapshot();
+    auto base = gpu.makeClone(clone_p);
+    auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base);
+    CHECK(metrics.snapshot().allocation_calls == cold_clone.allocation_calls);
+    CHECK(clone.numericStorage().shared_image_identity == storage.shared_image_identity);
+    CHECK(clone.numericStorage().allocated_bytes == storage.allocated_bytes);
+    clone_p.makeMove(0, ParticleSet::PosType{.01, 0, 0});
+    CHECK_THROWS(clone.ratio(clone_p, 0)); // cold clones never inherit accepted scalar state
+    clone_p.rejectMove(0);
+    const auto warm = metrics.snapshot();
+    for (int repeat = 0; repeat < 2; ++repeat)
+    {
+      close(evaluate(gpu, gpu_p), evaluate(cpu, cpu_p));
+      close(evaluate(clone, clone_p), cpu.get_log_value());
+      for (int e = 0; e < 4; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          close(gpu_p.G[e][d], cpu_p.G[e][d]);
+        close(gpu_p.L[e], cpu_p.L[e]);
+      }
+      for (int e : {0, 2})
+      {
+        const auto accepted = cpu.evalGrad(cpu_p, e), actual = gpu.evalGrad(gpu_p, e);
+        for (int d = 0; d < 3; ++d)
+          close(actual[d], accepted[d]);
+        const ParticleSet::PosType delta{.013, -.017, .011};
+        cpu_p.makeMove(e, delta);
+        gpu_p.makeMove(e, delta);
+        WaveFunctionComponent::GradType cpu_g{}, gpu_g{};
+        close(gpu.ratio(gpu_p, e), cpu.ratio(cpu_p, e));
+        close(gpu.ratioGrad(gpu_p, e, gpu_g), cpu.ratioGrad(cpu_p, e, cpu_g));
+        for (int d = 0; d < 3; ++d)
+          close(gpu_g[d], cpu_g[d]);
+        if (repeat)
+        {
+          gpu.acceptMove(gpu_p, e); cpu.acceptMove(cpu_p, e);
+          gpu_p.acceptMove(e); cpu_p.acceptMove(e);
+        }
+        else
+        {
+          gpu.restore(e); cpu.restore(e);
+          gpu_p.rejectMove(e); cpu_p.rejectMove(e);
+        }
+      }
+    }
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    CHECK(gpu.numericStorage().fingerprint == storage.fingerprint);
+    const auto snapshot = gpu.snapshotParameters();
+    CHECK_THROWS_AS(gpu.publishParameters(snapshot, snapshot.version), std::logic_error);
+    CHECK(gpu.snapshotParameters().values == snapshot.values);
+    CHECK(gpu.structuredParameterProvider() == nullptr);
+    CHECK_THROWS_AS(gpu.streamingDerivativeRequiredBytes(1), std::logic_error);
+    RefVectorWithLeader<WaveFunctionComponent> components(gpu);
+    components.push_back(gpu);
+    RefVectorWithLeader<ParticleSet> particles(gpu_p);
+    particles.push_back(gpu_p);
+    CHECK_THROWS_AS(gpu.makeBudgetedStreamingDerivativeOperator(components, particles, 0, 0, 1, clone_cap),
+                    std::logic_error);
+    CHECK(gpu.numericStorage().fingerprint == storage.fingerprint);
+    WaveFunctionComponent::WFBufferType buffer;
+    gpu.registerData(gpu_p, buffer);
+    buffer.allocate();
+    buffer.rewind();
+    gpu.updateBuffer(gpu_p, buffer, true);
+    const auto log = gpu.get_log_value();
+    buffer.rewind();
+    gpu.copyFromBuffer(gpu_p, buffer);
+    close(gpu.get_log_value(), log);
+    const auto original = gpu_p.R[0];
+    gpu_p.R[0] = source.R[0];
+    gpu_p.update();
+    CHECK_THROWS(evaluate(gpu, gpu_p)); // unavailable FULL gradients abort; no CPU fallback
+    gpu_p.R[0] = original;
+    gpu_p.update();
+    CHECK_NOTHROW(evaluate(gpu, gpu_p));
+  }
+}
+#endif
 } // namespace qmcplusplus

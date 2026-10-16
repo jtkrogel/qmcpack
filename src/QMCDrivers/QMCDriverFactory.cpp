@@ -260,6 +260,9 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
 #ifdef QMC_COMPLEX
     requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system);
+    if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
+        das.new_run_type != QMCRunType::VMC_BATCH)
+      throw UniformCommunicateError("Complex GPU inference requires CPU-sampled PBYP VMC_BATCH");
 #endif
 
     auto makeEstimatorManager =
@@ -311,6 +314,11 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       }
 
       const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
+#ifdef QMC_COMPLEX
+      if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
+          !is_pbyp_move)
+        throw UniformCommunicateError("Complex GPU inference requires parsed PBYP VMC_BATCH moves");
+#endif
 
       // I don't like that QMCDriverFactory is unpacking the driver input here, ideally only the driver should need to
       // depend on the content and implementation of the input.  This seems to be to be a bigger deal that passing the

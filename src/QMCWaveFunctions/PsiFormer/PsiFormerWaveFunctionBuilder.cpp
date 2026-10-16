@@ -132,13 +132,13 @@ std::uint64_t parseInitializationSeed(const std::string& value)
 }
 
 /// Parse a mandatory exact byte cap, excluding zero and the conventional unlimited sentinel.
-std::size_t parseCloneNumericLimit(const std::string& text)
+std::size_t parseCloneNumericLimit(const std::string& text, const char* name = "max_clone_numeric_bytes")
 {
   std::size_t bytes = 0;
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), bytes);
   if (error != std::errc{} || end != text.data() + text.size() || !bytes ||
       bytes == std::numeric_limits<std::size_t>::max())
-    throw std::invalid_argument("Complex PsiFormer requires positive finite max_clone_numeric_bytes in exact bytes");
+    throw std::invalid_argument(std::string("Complex PsiFormer requires positive finite ") + name + " in exact bytes");
   return bytes;
 }
 
@@ -234,6 +234,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
 
   const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1;
   [[maybe_unused]] std::size_t clone_numeric_limit = 0;
+  [[maybe_unused]] std::size_t gpu_numeric_limit = 0;
 #ifndef QMC_COMPLEX
   if (complex_profile)
     throw std::invalid_argument("psiformer_complex_periodic_v1 requires a complex QMCPACK build");
@@ -253,18 +254,23 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   {
     // Fail before readiness inspection, model I/O, parameter preparation or target-twist mutation.
     const auto request = normalizedAcceleratorRequest(gpu);
-    if ((request != "no" && request != "cpu") || optimization_enabled ||
+    const bool explicit_gpu = request == "cuda" || request == "hip";
+    if ((!explicit_gpu && request != "no" && request != "cpu") || optimization_enabled ||
         precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
-      throw std::invalid_argument("Complex PsiFormer requires CPU, optimize=no and fp64_reference");
+      throw std::invalid_argument("Complex PsiFormer requires CPU or strict cuda/hip, optimize=no and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
         feature_policy != "periodic_torus_v1" || system != "all_electron" ||
         !xmlHasProp(cur, BAD_CAST "source") || !parameters.empty() || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() || optimize_scope != "indices")
       throw std::invalid_argument("Complex PsiFormer requires explicit periodic all-electron native inference metadata");
     clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
+    if (explicit_gpu)
+      gpu_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_gpu_numeric_bytes"), "max_gpu_numeric_bytes");
+    else if (xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes"))
+      throw std::invalid_argument("max_gpu_numeric_bytes requires the explicit complex GPU profile");
   }
-  else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes"))
-    throw std::invalid_argument("max_clone_numeric_bytes belongs only to psiformer_complex_periodic_v1");
+  else if (xmlHasProp(cur, BAD_CAST "max_clone_numeric_bytes") || xmlHasProp(cur, BAD_CAST "max_gpu_numeric_bytes"))
+    throw std::invalid_argument("Complex numeric caps belong only to psiformer_complex_periodic_v1");
   const psiformer::PsiFormerAcceleratorResolution accelerator_resolution =
       resolveAcceleratorRequest(gpu, accelerator_readiness_provider_,
           optimization_enabled ? psiformer::allPsiFormerAcceleratorOperations()
@@ -451,12 +457,19 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
     if (complex_profile)
     {
       auto complex = std::make_unique<PsiFormerComplexWF>(name, std::move(initialized), targetPtcl,
-                                                         *source_particles, clone_numeric_limit, twist_array);
+                                                         *source_particles, clone_numeric_limit, twist_array, gpu_numeric_limit);
       const auto storage = complex->numericStorage();
-      app_log() << "  Complex PsiFormer CPU numeric bytes per clone: required=" << storage.required_bytes
+      app_log() << (gpu_numeric_limit ? "  Complex PsiFormer GPU host G/L bytes per clone: required="
+                                     : "  Complex PsiFormer CPU numeric bytes per clone: required=") << storage.required_bytes
                 << " allocated=" << storage.allocated_bytes << " cap=" << storage.limit_bytes
                 << "; excludes shared model, object/allocator overhead, ParticleSet, WFBuffer and aggregate clones; "
                 << "not adaptive large-system qualification" << std::endl;
+      if (gpu_numeric_limit)
+        app_log() << "  Complex PsiFormer serialized B=1 GPU lane: device_bytes=" << storage.shared_gpu_bytes
+                  << " cap=" << gpu_numeric_limit << " host_bytes=" << storage.shared_gpu_host_bytes
+                  << " shared_image_bytes=" << storage.shared_image_bytes
+                  << "; one model-shared image/lane, per-operation mutex, base mw scalar loops; CPU tapes=0, "
+                  << "sampling/Hamiltonian=CPU, no batching/TARGET/aggregate-fit claim" << std::endl;
       if (adopt_explicit_twist)
         targetPtcl.setTwist(reduced_twist);
       return complex;

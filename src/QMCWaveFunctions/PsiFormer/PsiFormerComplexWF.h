@@ -4,7 +4,7 @@
 // Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexWF.h
- * @brief Native-free declaration of the explicit CPU paired-head inference sibling.
+ * @brief Native-free paired-head inference sibling with explicit CPU or serialized GPU numerics.
  * Structured provider/state is prepared, but live training discovery remains closed.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
@@ -24,7 +24,7 @@ struct InitializedPsiFormerParameters;
 }
 
 #ifdef QMC_COMPLEX
-/// CPU full/G-free inference with prepared structured state; live training discovery remains closed.
+/// Full/G-free inference with prepared structured state; GPU training discovery remains closed.
 class PsiFormerComplexWF final : public WaveFunctionComponent, public wftrain::StructuredParameterProvider
 {
 public:
@@ -32,7 +32,7 @@ public:
   PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
                      const ParticleSet& electrons, const ParticleSet& ions,
                      std::size_t maximum_clone_numeric_bytes,
-                     std::array<double, 3> reduced_twist = {});
+                     std::array<double, 3> reduced_twist = {}, std::size_t maximum_gpu_numeric_bytes = 0);
 
   /// Destroy the Native-free PIMPL in its sole native implementation translation unit.
   ~PsiFormerComplexWF() override;
@@ -75,6 +75,9 @@ public:
   /// Report the prepared determinant expansion's actual extent.
   bool isMultiDet() const override;
 
+  /// Strict inference-only B=1 GPU profile; CPU sampling/Hamiltonian remain authoritative.
+  bool gpuInferenceEnabled() const noexcept;
+
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.
   LogValue evaluateLog(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&) override;
 
@@ -100,6 +103,8 @@ public:
   struct NumericStorage
   {
     std::size_t required_bytes, allocated_bytes, limit_bytes, fingerprint;
+    std::size_t shared_gpu_bytes = 0, shared_gpu_host_bytes = 0, shared_image_bytes = 0;
+    const void* shared_image_identity = nullptr;
   };
 
   /// Report exact preparation; this is not an aggregate budget or adaptive large-system qualification.

@@ -31,6 +31,9 @@
 #endif
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceBatchBackend.h"
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
+#endif
 #endif
 #include "Message/Communicate.h"
 #include "Particle/MCMultiParticleMoves.h"

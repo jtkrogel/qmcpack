@@ -22,6 +22,69 @@ struct PsiFormerComplexWF::Impl
   using C = psiformer::determinant::Complex;
   using Amplitude = psiformer::determinant::ComplexLogAmplitude;
 
+#ifdef ENABLE_CUDA
+  /** One model-shared B=1 lane; lock through conversion and caller/cache publication.
+   * Numeric owners share one immutable image. No borrowed GPU output escapes a call.
+   */
+  struct GpuLane
+  {
+    /// Check the complete owner sum before allocating the image or either graph.
+    static std::unique_ptr<GpuLane> prepare(const psiformer::PsiFormerExecutionPlan& plan,
+        const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
+        std::size_t limit)
+    {
+      using namespace psiformer::device;
+      if (!limit || limit == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
+      const auto value = estimateComplexValueCost(plan, 1);
+      const auto spatial = estimateComplexSpatialCost(plan, 1);
+      const auto bytes = psiformer::spatial_detail::checkedAdd(value.device_bytes, spatial.device_bytes,
+                                                             "Complex GPU lane bytes overflow");
+      if (bytes > limit)
+        throw std::length_error("Complex GPU VALUE+FULL lane exceeds its explicit device byte cap");
+      constexpr auto staging_per_electron = 3 * sizeof(double) + 5 * sizeof(cuDoubleComplex) + 4 * sizeof(C);
+      const auto host = psiformer::spatial_detail::checkedAdd(
+          psiformer::spatial_detail::checkedAdd(value.host_bytes, spatial.host_bytes, "Complex GPU host bytes overflow"),
+          psiformer::spatial_detail::checkedAdd(sizeof(ComplexValueResult),
+              psiformer::spatial_detail::checkedProduct(staging_per_electron, plan.modelShape().electrons(), "Complex GPU staging overflow"),
+              "Complex GPU staging overflow"), "Complex GPU host bytes overflow");
+      return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial, bytes, host));
+    }
+
+    /// Prepare fixed host staging and two qualified numeric owners, never a CPU tape.
+    GpuLane(const psiformer::PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
+        const std::vector<double>& nuclei, std::size_t version,
+        psiformer::device::ComplexValueCost value_cost, psiformer::device::ComplexSpatialCost spatial_cost,
+        std::size_t bytes, std::size_t host)
+        : blas(queue), image(psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version)),
+          value(psiformer::device::PreparedDeviceComplexValue::prepare(image, 1, queue, blas, value_cost.device_bytes)),
+          full(psiformer::device::PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, spatial_cost.device_bytes)),
+          positions(3 * plan.modelShape().electrons()), amplitude(1), gradient(positions.size()),
+          laplacian(plan.modelShape().electrons()), ratio(laplacian.size()), converted(4 * laplacian.size()),
+          device_bytes(bytes), host_bytes(host)
+    {
+      const auto actual_host = value_cost.host_bytes + spatial_cost.host_bytes +
+              sizeof(double) * positions.capacity() + sizeof(psiformer::device::ComplexValueResult) * amplitude.capacity() +
+              sizeof(cuDoubleComplex) * (gradient.capacity() + laplacian.capacity() + ratio.capacity()) +
+              sizeof(C) * converted.capacity();
+      if (actual_host != host_bytes)
+        throw std::logic_error("Complex GPU host capacities differ from checked preparation");
+    }
+
+    compute::Queue<PlatformKind::CUDA> queue;
+    psiformer::device::AcceleratorBlasHandle blas;
+    std::shared_ptr<const psiformer::device::PreparedDeviceModel> image;
+    std::unique_ptr<psiformer::device::PreparedDeviceComplexValue> value;
+    std::unique_ptr<psiformer::device::PreparedDeviceComplexSpatial> full;
+    std::vector<double> positions;
+    std::vector<psiformer::device::ComplexValueResult> amplitude;
+    std::vector<cuDoubleComplex> gradient, laplacian, ratio;
+    std::vector<C> converted;
+    const std::size_t device_bytes, host_bytes;
+    std::mutex mutex;
+  };
+#endif
+
   /// A weak family reference shares scratch without extending its lifetime or creating a cycle.
   struct DerivativeLane;
 
@@ -41,7 +104,7 @@ struct PsiFormerComplexWF::Impl
 
     /// Retain initializer provenance and construct only qualified complex inference owners.
     Model(const std::string& component_name, InitializedNativeModel initialized,
-          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced)
+          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced, std::size_t gpu_limit)
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
           environment(environmentFor(electrons)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
@@ -50,8 +113,17 @@ struct PsiFormerComplexWF::Impl
                model.dim, model.heads, model.blocks}, environment)), value(model, plan), spatial(model, plan),
           identity(persistentModelIdentity(model, "internal", profile, seed, environment,
                                            reduced_twist, cartesian_twist)), source(&ions),
-          schema(makeStructuredParameterSchema(component_name, model.p))
-    {}
+          schema(makeStructuredParameterSchema(component_name, model.p)), gpu_limit(gpu_limit)
+    {
+      if (gpu_limit)
+      {
+#ifdef ENABLE_CUDA
+        gpu = GpuLane::prepare(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version(), gpu_limit);
+#else
+        throw std::invalid_argument("Complex GPU inference is not compiled");
+#endif
+      }
+    }
 
     pf::PsiFormer model;
     const std::string profile;
@@ -64,6 +136,10 @@ struct PsiFormerComplexWF::Impl
     const std::uint64_t identity;
     const ParticleSet* const source;
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
+    const std::size_t gpu_limit;
+#ifdef ENABLE_CUDA
+    std::unique_ptr<GpuLane> gpu;
+#endif
     mutable std::shared_mutex mutex;
     std::atomic<std::size_t> pending_proposals{0};
     std::mutex derivative_factory_mutex;
@@ -280,11 +356,26 @@ struct PsiFormerComplexWF::Impl
     return makeInitializedNativeModel(std::move(initialized), electrons, ions);
   }
 
-  /// Prepare distinct VALUE/FULL/ACTIVE scratch; there is no real head or score tape.
+  /// Admit clone G/L before the shared GPU image can be constructed.
+  static std::size_t admitGpuClone(const ParticleSet& electrons, std::size_t limit, std::size_t gpu_limit)
+  {
+    if (gpu_limit && (!limit || limit == std::numeric_limits<std::size_t>::max() ||
+        gpu_limit == std::numeric_limits<std::size_t>::max()))
+      throw std::invalid_argument("Complex GPU inference requires positive finite clone and shared-lane caps");
+    if (gpu_limit && pf::checkedStorageSum(
+        pf::checkedStorageBytes<GradType>(electrons.getTotalNum(), "Complex clone G overflow"),
+        pf::checkedStorageBytes<ValueType>(electrons.getTotalNum(), "Complex clone L overflow"),
+        "Complex clone G/L overflow") > limit)
+      throw std::length_error("Complex GPU clone G/L exceeds its cap before device preparation");
+    return gpu_limit;
+  }
+
+  /// Prepare only the selected CPU or GPU numerical profile.
   Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
-       const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
+       const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
+       std::size_t gpu_limit)
       : Impl(std::make_shared<Model>(component_name, materialize(std::move(initialized), electrons, ions),
-                                   electrons, ions, reduced),
+                                   electrons, ions, reduced, admitGpuClone(electrons, limit, gpu_limit)),
              electrons, limit)
   {}
 
@@ -301,19 +392,25 @@ struct PsiFormerComplexWF::Impl
     const auto& model = state->model;
     const pf::PsiFormerStorageShape shape{model.ne, model.cfg.nuclei.shape[0], model.ndet, model.dim, model.heads,
         state->plan.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0], model.blocks, model.p.size()};
-    numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);
-    for (auto mode : {pf::DirectSpatialMode::FULL_VGL, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT})
-      addStorageBytes(numeric_required, pf::DirectComplexSpatialWorkspace::storageRequirement(shape, mode),
-                      "complex clone bytes overflow");
+    if (!state->gpu_limit)
+    {
+      numeric_required = pf::DirectComplexValueWorkspace::storageRequirement(shape);
+      for (auto mode : {pf::DirectSpatialMode::FULL_VGL, pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT})
+        addStorageBytes(numeric_required, pf::DirectComplexSpatialWorkspace::storageRequirement(shape, mode),
+                        "complex clone bytes overflow");
+    }
     addStorageBytes(numeric_required, checkedStorageBytes<GradType>(model.ne, "complex own gradient bytes overflow"),
                     "complex clone bytes overflow");
     addStorageBytes(numeric_required, checkedStorageBytes<ValueType>(model.ne, "complex own Laplacian bytes overflow"),
                     "complex clone bytes overflow");
     if (numeric_required > numeric_limit)
       throw std::length_error("Complex PsiFormer full clone numeric requirement exceeds its per-clone byte cap");
-    value = state->value.makeWorkspace();
-    full = state->spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
-    active = state->spatial.makeWorkspace(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
+    if (!state->gpu_limit)
+    {
+      value = state->value.makeWorkspace();
+      full = state->spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+      active = state->spatial.makeWorkspace(pf::DirectSpatialMode::ACTIVE_ELECTRON_GRADIENT);
+    }
     own_gradient.resize(model.ne);
     own_laplacian.resize(model.ne);
     if (numericStorage().allocated_bytes != numeric_required)
@@ -326,19 +423,37 @@ struct PsiFormerComplexWF::Impl
     using namespace psiformer;
     using pf::addStorageBytes;
     using pf::checkedStorageBytes;
-    std::size_t bytes = value->vectorStorageBytes();
-    addStorageBytes(bytes, full->vectorStorageBytes(), "complex clone bytes overflow");
-    addStorageBytes(bytes, active->vectorStorageBytes(), "complex clone bytes overflow");
+    std::size_t bytes = 0;
+    if (value)
+    {
+      bytes = value->vectorStorageBytes();
+      addStorageBytes(bytes, full->vectorStorageBytes(), "complex clone bytes overflow");
+      addStorageBytes(bytes, active->vectorStorageBytes(), "complex clone bytes overflow");
+    }
     addStorageBytes(bytes, checkedStorageBytes<GradType>(own_gradient.capacity(), "complex own gradient bytes overflow"),
                     "complex clone bytes overflow");
     addStorageBytes(bytes, checkedStorageBytes<ValueType>(own_laplacian.capacity(), "complex own Laplacian bytes overflow"),
                     "complex clone bytes overflow");
-    std::size_t fingerprint = value->storageFingerprint();
-    for (auto next : {full->storageFingerprint(), active->storageFingerprint()})
-      fingerprint = (fingerprint ^ next) * 1099511628211ULL;
+    std::size_t fingerprint = 0;
+    if (value)
+    {
+      fingerprint = value->storageFingerprint();
+      for (auto next : {full->storageFingerprint(), active->storageFingerprint()})
+        fingerprint = (fingerprint ^ next) * 1099511628211ULL;
+    }
     determinant::detail::mixStorage(fingerprint, own_gradient);
     determinant::detail::mixStorage(fingerprint, own_laplacian);
-    return {numeric_required, bytes, numeric_limit, fingerprint};
+    NumericStorage result{numeric_required, bytes, numeric_limit, fingerprint};
+#ifdef ENABLE_CUDA
+    if (state->gpu)
+    {
+      result.shared_gpu_bytes = state->gpu->device_bytes;
+      result.shared_gpu_host_bytes = state->gpu->host_bytes;
+      result.shared_image_bytes = state->gpu->image->deviceStorageBytes();
+      result.shared_image_identity = state->gpu->image.get();
+    }
+#endif
+    return result;
   }
 
   /// Release exactly this clone's family proposal count under its caller's read transaction.
@@ -512,6 +627,62 @@ struct PsiFormerComplexWF::Impl
             replacement == electron ? p.activeR(electron)[dimension] : p.R[electron][dimension]);
   }
 
+  /// Common core view keeps a GPU operation locked until its scalar caller publishes copies.
+  struct CoreResult : pf::DirectComplexSpatialResult
+  {
+    std::unique_lock<std::mutex> lease;
+  };
+
+  /// Route VALUE/FULL/ACTIVE without duplicating physical twist, ratio or cache algebra.
+  CoreResult core(const ParticleSet& p, bool spatial, int replacement = -1, int electron = -1)
+  {
+    CoreResult result;
+#ifdef ENABLE_CUDA
+    if (state->gpu)
+    {
+      auto& lane = *state->gpu;
+      result.lease = std::unique_lock(lane.mutex);
+      for (int e = 0; e < p.getTotalNum(); ++e)
+        for (int d = 0; d < 3; ++d)
+          lane.positions[e * 3 + d] = replacement == e ? p.activeR(e)[d] : p.R[e][d];
+      if (spatial)
+      {
+        lane.full->evaluate(lane.positions);
+        lane.full->download(lane.full->resultView(), lane.amplitude, lane.gradient, lane.laplacian, lane.ratio);
+        for (std::size_t i = 0; i < lane.gradient.size(); ++i)
+          lane.converted[i] = {lane.gradient[i].x, lane.gradient[i].y};
+        for (std::size_t i = 0; i < lane.laplacian.size(); ++i)
+          lane.converted[lane.gradient.size() + i] = {lane.laplacian[i].x, lane.laplacian[i].y};
+        result.gradient = lane.converted.data() + (electron < 0 ? 0 : 3 * electron);
+        result.laplacian_log = lane.converted.data() + lane.gradient.size();
+      }
+      else
+      {
+        lane.value->evaluate(lane.positions);
+        lane.value->download(lane.value->resultView(), lane.amplitude);
+      }
+      result.amplitude = {{lane.amplitude[0].phase.x, lane.amplitude[0].phase.y}, lane.amplitude[0].log_abs};
+      result.parameter_version = lane.image->version();
+      return result;
+    }
+#endif
+    if (spatial)
+    {
+      auto& workspace = electron < 0 ? *full : *active;
+      positions(workspace, p, replacement);
+      static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
+          ? state->spatial.evaluateFull(workspace) : state->spatial.evaluateActive(workspace, electron);
+    }
+    else
+    {
+      positions(*value, p, replacement);
+      const auto evaluated = state->value.evaluate(*value);
+      result.amplitude = evaluated.amplitude;
+      result.parameter_version = evaluated.parameter_version;
+    }
+    return result;
+  }
+
   /// Apply the sole common outer phase at the adapter boundary, never inside an orbital head.
   double angle(const ParticleSet& p, int replacement = -1) const
   {
@@ -594,11 +765,12 @@ struct PsiFormerComplexWF::Impl
   static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
 };
 
-/// Construct only the explicit paired profile; the XML builder remains unchanged in this slice.
+/// Construct the explicit paired CPU or strictly capped shared-GPU inference profile.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
-    const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
+    const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced,
+    std::size_t gpu_limit)
     : WaveFunctionComponent(name),
-      impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced))
+      impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced, gpu_limit))
 {}
 
 /// A clone shares versioned model ownership and starts with invalid evaluation caches.
@@ -616,6 +788,8 @@ PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const
 /// Preflight an independent derivative budget without constructing either retained tape.
 std::size_t PsiFormerComplexWF::streamingDerivativeRequiredBytes(std::size_t samples) const
 {
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex GPU inference does not expose CPU derivative storage");
   std::shared_lock read(impl_->state->mutex);
   return Impl::DerivativeLane::required(*impl_->state, samples);
 }
@@ -626,6 +800,8 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     const RefVectorWithLeader<ParticleSet>& particles, std::size_t ordinal, std::size_t offset,
     std::size_t chunk, std::size_t maximum_bytes) const
 {
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex GPU inference does not prepare CPU derivative lanes");
   const auto state = impl_->state;
   std::shared_lock read(state->mutex);
   const auto samples = particles.size(), n = state->model.ne;
@@ -711,6 +887,9 @@ bool PsiFormerComplexWF::isMultiDet() const
   return impl_->state->model.ndet > 1;
 }
 
+/// The profile is immutable for the complete shared model lifetime.
+bool PsiFormerComplexWF::gpuInferenceEnabled() const noexcept { return impl_->state->gpu_limit != 0; }
+
 /// Immutable schema ownership is stable across every clone and publication; no read lock is needed.
 const wftrain::StructuredParameterSchema& PsiFormerComplexWF::parameterSchema() const noexcept
 {
@@ -729,6 +908,8 @@ wftrain::StructuredParameterSnapshot PsiFormerComplexWF::snapshotParameters() co
 std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                                 std::size_t expected_version)
 {
+  if (gpuInferenceEnabled())
+    throw std::logic_error("Complex GPU inference image is immutable; parameter publication is unqualified");
   if (candidate.schema_fingerprint != parameterSchema().fingerprint() ||
       candidate.values.size() != parameterSchema().parameterCount() || candidate.version != expected_version)
     throw std::invalid_argument("Complex PsiFormer publication schema, extent or source version mismatch");
@@ -767,8 +948,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLogLocked(const Particl
   impl_->validate(p);
   if (g.size() != static_cast<std::size_t>(p.getTotalNum()) || l.size() != g.size())
     throw std::invalid_argument("Complex PsiFormer full scatter shape mismatch");
-  impl_->positions(*impl_->full, p);
-  const auto result = impl_->state->spatial.evaluateFull(*impl_->full);
+  const auto result = impl_->core(p, true);
   const LogValue physical = impl_->physicalLog(result.amplitude, p);
   // Stage this component's own products separately from any caller accumulation.
   for (int electron = 0; electron < p.getTotalNum(); ++electron)
@@ -808,8 +988,7 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratio(ParticleSet& p, int elect
   std::shared_lock read(impl_->state->mutex);
   impl_->discardPending();
   impl_->validate(p, electron, true);
-  impl_->positions(*impl_->value, p, electron);
-  const auto result = impl_->state->value.evaluate(*impl_->value);
+  const auto result = impl_->core(p, false, electron);
   const PsiValue ratio = impl_->formRatio(result.amplitude, p, electron);
   const LogValue physical = impl_->physicalLog(result.amplitude, p, electron);
   impl_->cache(result.amplitude, physical, p, electron);
@@ -823,8 +1002,7 @@ PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGrad(ParticleSet& p, int el
   impl_->validate(p, electron);
   if (electron < 0)
     throw std::invalid_argument("Complex PsiFormer gradient electron is negative");
-  impl_->positions(*impl_->active, p);
-  const auto result = impl_->state->spatial.evaluateActive(*impl_->active, electron);
+  const auto result = impl_->core(p, true, -1, electron);
   GradType gradient;
   for (int dimension = 0; dimension < 3; ++dimension)
     gradient[dimension] = impl_->physicalGradient(result.gradient[dimension], dimension);
@@ -837,8 +1015,7 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGrad(ParticleSet& p, int e
   std::shared_lock read(impl_->state->mutex);
   impl_->discardPending();
   impl_->validate(p, electron, true);
-  impl_->positions(*impl_->active, p, electron);
-  const auto result = impl_->state->spatial.evaluateActive(*impl_->active, electron);
+  const auto result = impl_->core(p, true, electron, electron);
   const PsiValue ratio = impl_->formRatio(result.amplitude, p, electron);
   const LogValue physical = impl_->physicalLog(result.amplitude, p, electron);
   GradType staged = gradient;
