@@ -76,6 +76,7 @@ def main():
         text = (directory / "run.log").read_text()
         if reject:
             assert result.returncode != 0, (directory, text[-4000:])
+            assert reject in text, (directory, reject, text[-4000:])
             assert not list(directory.glob("*.training/*/*.state.h5")), directory
             return directory
         assert result.returncode == 0, (directory, text[-6000:])
@@ -147,8 +148,8 @@ def main():
         for name in lhs:
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"restart model: {name}")
     if args.preflight:
-        run("reject_kfac", optimizer="kfac", reject=True)
-        run("reject_zero_cap", reject=True, mutate=lambda tree: setattr(
+        run("reject_kfac", optimizer="kfac", reject="requires all-electron ENERGY Adam/plain SGD")
+        run("reject_zero_cap", reject="legacy_maximum_parameters must be positive", mutate=lambda tree: setattr(
             tree.find("qmc/training/parameter[@name='legacy_maximum_parameters']"), "text", "0"))
 
         def enable_orbitals(tree):
@@ -157,8 +158,13 @@ def main():
             spo.set("size", "2")
             spo.find("coefficient").set("size", "2")
             spo.find("coefficient").text = "0.55 0.55  0.55 -0.55"
-        run("reject_active_spo", reject=True, mutate=enable_orbitals)
-    print("PASS: Adam/SGD conventional SJ updates, interval inference and exact inference isolation")
+        run("reject_active_spo", reject="only fixed-Slater J1/J2 parameters", mutate=enable_orbitals)
+    completed = "Adam/SGD SJ updates, interval inference, frozen Slater, exact inference isolation"
+    if args.restart:
+        completed += ", exact split restart"
+    if args.preflight:
+        completed += ", expected preflight diagnostics"
+    print("PASS: " + completed)
 
 
 if __name__ == "__main__":
