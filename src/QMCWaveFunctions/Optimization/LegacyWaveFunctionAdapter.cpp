@@ -281,7 +281,9 @@ void validateECPRecord(const NonLocalECPJVPReplay& record)
     requireFiniteECP({coordinate, 0});
   const auto points = record.points();
   const auto segments = record.segments();
-  std::size_t next_point = 0, next_segment = 0, next_stamp = 0;
+  std::size_t next_point = 0;
+  std::size_t next_segment = 0;
+  std::size_t next_stamp = 0;
   for (const auto& tile : record.tiles())
   {
     if (tile.tile_ordinal != &tile - record.tiles().data() || !tile.virtual_batch_fingerprint ||
@@ -311,7 +313,8 @@ void validateECPRecord(const NonLocalECPJVPReplay& record)
     throw std::invalid_argument("Legacy ECP replay coverage is incomplete");
   for (const auto& point : points)
   {
-    for (double coordinate : point.replacement_position) requireFiniteECP({coordinate, 0});
+    for (double coordinate : point.replacement_position)
+      requireFiniteECP({coordinate, 0});
     requireFiniteECP(point.bare_weight);
     requireFiniteECP(point.complete_ratio);
     requireFiniteECP(point.bare_weight * point.complete_ratio);
@@ -324,8 +327,13 @@ void validateECPRecord(const NonLocalECPJVPReplay& record)
 class LegacyECPRecord final : public NonLocalECPJVPReplay
 {
 public:
-  std::string provider, schema;
-  std::size_t version = 0, batch = 0, offset = 0, samples = 0, electrons = 0;
+  std::string provider;
+  std::string schema;
+  std::size_t version = 0;
+  std::size_t batch = 0;
+  std::size_t offset = 0;
+  std::size_t samples = 0;
+  std::size_t electrons = 0;
   std::uint64_t grid = 0;
   std::vector<double> references;
   std::vector<NonLocalECPReplayPoint> point_data;
@@ -333,22 +341,55 @@ public:
   std::vector<NonLocalECPReplayTile> tile_data;
   std::vector<WaveFunctionComponent::EvaluationStamp> stamps;
 
+  /// Expose immutable model, batch and accepted-grid identity to product binding.
   std::string_view providerId() const noexcept override { return provider; }
-  std::string_view schemaFingerprint() const noexcept override { return schema; }
-  std::size_t parameterVersion() const noexcept override { return version; }
-  std::size_t batchOrdinal() const noexcept override { return batch; }
-  std::size_t sampleOffset() const noexcept override { return offset; }
-  std::size_t sampleCount() const noexcept override { return samples; }
-  std::size_t electronCount() const noexcept override { return electrons; }
-  std::uint32_t localEnergyTermMask() const noexcept override { return localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP); }
-  std::uint64_t gridFingerprint() const noexcept override { return grid; }
-  DerivativeArrayView<const double> referencePositions() const noexcept override { return {references.data(), references.size()}; }
-  DerivativeArrayView<const NonLocalECPReplayPoint> points() const noexcept override { return {point_data.data(), point_data.size()}; }
-  DerivativeArrayView<const NonLocalECPReplaySegment> segments() const noexcept override { return {segment_data.data(), segment_data.size()}; }
-  DerivativeArrayView<const NonLocalECPReplayTile> tiles() const noexcept override { return {tile_data.data(), tile_data.size()}; }
-  DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp> evaluationStamps() const noexcept override
-  { return {stamps.data(), stamps.size()}; }
 
+  std::string_view schemaFingerprint() const noexcept override { return schema; }
+
+  std::size_t parameterVersion() const noexcept override { return version; }
+
+  std::size_t batchOrdinal() const noexcept override { return batch; }
+
+  std::size_t sampleOffset() const noexcept override { return offset; }
+
+  std::size_t sampleCount() const noexcept override { return samples; }
+
+  std::size_t electronCount() const noexcept override { return electrons; }
+
+  std::uint32_t localEnergyTermMask() const noexcept override
+  {
+    return localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  }
+
+  std::uint64_t gridFingerprint() const noexcept override { return grid; }
+
+  /// Return nonowning views whose lifetime is the accepted record's lifetime.
+  DerivativeArrayView<const double> referencePositions() const noexcept override
+  {
+    return {references.data(), references.size()};
+  }
+
+  DerivativeArrayView<const NonLocalECPReplayPoint> points() const noexcept override
+  {
+    return {point_data.data(), point_data.size()};
+  }
+
+  DerivativeArrayView<const NonLocalECPReplaySegment> segments() const noexcept override
+  {
+    return {segment_data.data(), segment_data.size()};
+  }
+
+  DerivativeArrayView<const NonLocalECPReplayTile> tiles() const noexcept override
+  {
+    return {tile_data.data(), tile_data.size()};
+  }
+
+  DerivativeArrayView<const WaveFunctionComponent::EvaluationStamp> evaluationStamps() const noexcept override
+  {
+    return {stamps.data(), stamps.size()};
+  }
+
+  /// Account allocated reference, grid and provenance capacities without P rows.
   NonLocalECPReplayStorageDiagnostics storageDiagnostics() const noexcept override
   {
     NonLocalECPReplayStorageDiagnostics result;
@@ -359,7 +400,8 @@ public:
     result.reference_position_bytes = references.capacity() * sizeof(double);
     result.point_bytes = point_data.capacity() * sizeof(NonLocalECPReplayPoint);
     result.provenance_bytes = segment_data.capacity() * sizeof(NonLocalECPReplaySegment) +
-        tile_data.capacity() * sizeof(NonLocalECPReplayTile) + stamps.capacity() * sizeof(WaveFunctionComponent::EvaluationStamp);
+        tile_data.capacity() * sizeof(NonLocalECPReplayTile) +
+        stamps.capacity() * sizeof(WaveFunctionComponent::EvaluationStamp);
     result.retained_numeric_bytes = result.reference_position_bytes + result.point_bytes + result.provenance_bytes;
     result.storage_fingerprint = reinterpret_cast<std::size_t>(references.data()) ^
         reinterpret_cast<std::size_t>(point_data.data()) ^ reinterpret_cast<std::size_t>(segment_data.data()) ^
@@ -372,8 +414,10 @@ public:
 class LegacyECPCapture final : public NonLocalECPDerivativeConsumer
 {
 public:
+  /// Take the private reference configurations before any quadrature RNG use.
   explicit LegacyECPCapture(std::unique_ptr<LegacyECPRecord> record) : record_(std::move(record)) {}
 
+  /// Reject incompatible requests without mutating state or activating the sink.
   void preflight(const NonLocalECPDerivativeContext& context,
                  DerivativeArrayView<const VJPCoefficientChannel> channels,
                  const ParameterReductionSink& sink) const override
@@ -397,10 +441,12 @@ public:
           coefficients.parameter_version != record_->version || coefficients.batch_ordinal != record_->batch ||
           coefficients.sample_offset != record_->offset || coefficients.values.size() != record_->samples)
         throw std::invalid_argument("Legacy ECP capture channel identity is incompatible");
-      for (const auto& coefficient : coefficients.values) requireFiniteECP(coefficient);
+      for (const auto& coefficient : coefficients.values)
+        requireFiniteECP(coefficient);
     }
   }
 
+  /// Bind one accepted traversal and reserve only point-sized capture storage.
   void begin(const NonLocalECPDerivativeContext& context,
              DerivativeArrayView<const VJPCoefficientChannel> channels, ParameterReductionSink& sink) override
   {
@@ -414,6 +460,7 @@ public:
     state_ = State::ACTIVE;
   }
 
+  /// Copy one transient tile before its Hamiltonian backing storage is reused.
   void consume(const NonLocalECPDerivativeTile& tile) override
   {
     try
@@ -457,7 +504,8 @@ public:
       for (std::size_t p = point_offset; p < record_->point_data.size(); ++p)
       {
         const auto& point = record_->point_data[p];
-        for (double coordinate : point.replacement_position) requireFiniteECP({coordinate, 0});
+        for (double coordinate : point.replacement_position)
+          requireFiniteECP({coordinate, 0});
         requireFiniteECP(point.bare_weight);
         requireFiniteECP(point.complete_ratio);
         requireFiniteECP(point.bare_weight * point.complete_ratio);
@@ -465,19 +513,29 @@ public:
           throw std::invalid_argument("Legacy ECP capture requires real weights and ratios");
       }
     }
-    catch (...) { abort(); throw; }
+    catch (...)
+    {
+      abort();
+      throw;
+    }
   }
 
+  /// Audit complete coverage once, after the final incremental tile check.
   void end() override
   {
     if (state_ != State::ACTIVE || record_->point_data.size() != expected_points_)
-    { abort(); throw std::logic_error("Legacy ECP capture traversal is incomplete"); }
+    {
+      abort();
+      throw std::logic_error("Legacy ECP capture traversal is incomplete");
+    }
     validateECPRecord(*record_);
     state_ = State::COMPLETE;
   }
 
+  /// Poison partial capture without publishing or changing the idle sink.
   void abort() noexcept override { state_ = State::POISONED; }
 
+  /// Transfer complete accepted-grid ownership exactly once.
   std::unique_ptr<NonLocalECPJVPReplay> releaseJVPReplay() override
   {
     if (state_ != State::COMPLETE || !record_)
@@ -485,6 +543,7 @@ public:
     return std::move(record_);
   }
 
+  /// Report capture-only storage separately from the adapter's shared P workspace.
   StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
   {
     StreamingDerivativeStorageDiagnostics result;
@@ -501,7 +560,13 @@ public:
   }
 
 private:
-  enum class State { IDLE, ACTIVE, COMPLETE, POISONED };
+  enum class State
+  {
+    IDLE,
+    ACTIVE,
+    COMPLETE,
+    POISONED
+  };
   State state_ = State::IDLE;
   std::unique_ptr<LegacyECPRecord> record_;
   std::size_t expected_points_ = 0;
@@ -619,8 +684,10 @@ public:
     // Index segment ownership once: each action visits only its sample's knots.
     std::vector<std::size_t> offsets(sampleCount() + 1, 0);
     std::vector<std::size_t> indices(replay->segments().size());
-    for (const auto& segment : replay->segments()) ++offsets[segment.sample + 1];
-    for (std::size_t sample = 1; sample < offsets.size(); ++sample) offsets[sample] += offsets[sample - 1];
+    for (const auto& segment : replay->segments())
+      ++offsets[segment.sample + 1];
+    for (std::size_t sample = 1; sample < offsets.size(); ++sample)
+      offsets[sample] += offsets[sample - 1];
     auto cursor = offsets;
     for (std::size_t segment = 0; segment < replay->segments().size(); ++segment)
       indices[cursor[replay->segments()[segment].sample]++] = segment;
@@ -778,7 +845,8 @@ private:
   }
 
   /// Indexed traversal is O(owned segments + owned points), not O(samples*Q).
-  template<class Action> void forEachECPPoint(std::size_t sample, Action action) const
+  template<class Action>
+  void forEachECPPoint(std::size_t sample, Action action) const
   {
     for (std::size_t index = ecp_segment_offsets_[sample]; index < ecp_segment_offsets_[sample + 1]; ++index)
     {
