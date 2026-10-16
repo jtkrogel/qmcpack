@@ -16,6 +16,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -680,6 +683,21 @@ MatrixFreeLinearMethodResult solveSymmetrizedMatrixFreeLinearMethod(
                                         projected_s[column * dimension + row],
                                         control.hermitian_tolerance, augmented_size))
           {
+            // Temporary bounded task46 failure provenance; no solver/control change.
+            if (const auto* path = std::getenv("QMC_WFTRAIN_LM_PROBE"); path && augmented_size <= 17)
+            {
+              std::ofstream probe(std::string(path) + ".failure");
+              probe << std::setprecision(17) << "pair " << result.iterations << ' ' << dimension << ' '
+                    << row << ' ' << column << ' ' << projected_h[row * dimension + column] << ' '
+                    << projected_h[column * dimension + row] << ' ' << projected_s[row * dimension + column]
+                    << ' ' << projected_s[column * dimension + row] << '\n';
+              for (std::size_t i = 0; i < dimension; ++i)
+                for (std::size_t j = 0; j < augmented_size; ++j)
+                  probe << "basis " << i << ' ' << j << ' ' << basis.vectors[i][j].real() << ' '
+                        << basis.vectors[i][j].imag() << ' ' << basis.hamiltonian_images[i][j].real() << ' '
+                        << basis.hamiltonian_images[i][j].imag() << ' ' << basis.overlap_images[i][j].real()
+                        << ' ' << basis.overlap_images[i][j].imag() << '\n';
+            }
             finishResult(result, LinearMethodStopReason::NON_HERMITIAN_ACTION, start);
             return result;
           }
