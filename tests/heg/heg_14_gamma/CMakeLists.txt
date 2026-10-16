@@ -2,6 +2,20 @@
 # Homogeneous electron gas (HEG) tests
 #
 
+# One qualified real CPU Gamma model, including immutable Ewald identity and
+# complete model reuse; no external orbital asset or optimizer/backend matrix.
+if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EXECUTABLE)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                  RESULT_VARIABLE CONVENTIONAL_HEG_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
+  if(CONVENTIONAL_HEG_PYTHON_MODULES EQUAL 0)
+    add_test(NAME short-heg14-gamma-conventional-wftrain
+             COMMAND ${Python3_EXECUTABLE}
+                     "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_conventional_wftrain/check_sj_training.py"
+                     $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_heg.xml" --periodic-heg)
+    set_tests_properties(short-heg14-gamma-conventional-wftrain PROPERTIES TIMEOUT 300 PROCESSORS 1)
+  endif()
+endif()
+
 #
 # Tests for HEG with 14 electrons at the gamma point and various wavefunctions
 # See tests/heg/heg_14_gamma/README for full details
