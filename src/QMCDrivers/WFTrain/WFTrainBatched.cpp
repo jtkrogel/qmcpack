@@ -2978,8 +2978,16 @@ void WFTrainBatched::run()
     if (periodic_checkpoint || final_block || stop_requested)
     {
       ScopedTimer checkpoint_timer(timers_.checkpoint_timer);
+      const wftrain::StructuredParameterProvider* artifact_provider = selected_provider_;
+#ifdef QMC_COMPLEX
+      // The wrapper delegates the same canonical schema/state/version. Only CONST
+      // bundle save/export uses the model owner; training and restore keep the
+      // wrapper's explicit budgeted publication authority.
+      if (complex_gpu_provider_)
+        artifact_provider = complex_training_component_;
+#endif
       wftrain::DistributedTrainingCheckpoint::saveIterationBundle(
-          get_root_name(), static_cast<std::size_t>(iteration), *myComm, *selected_provider_,
+          get_root_name(), static_cast<std::size_t>(iteration), *myComm, *artifact_provider,
           training_state, stage_state, optimizer_checkpoint, sampler_checkpoint,
           sampler_checkpoint.topology());
       if (myComm->rank() == 0)
