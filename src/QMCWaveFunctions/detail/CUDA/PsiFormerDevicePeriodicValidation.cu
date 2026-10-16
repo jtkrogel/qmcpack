@@ -252,6 +252,7 @@ void validate()
 #include "PsiFormerDeviceComplexValueValidation.h"
 #include "PsiFormerDeviceComplexSpatialValidation.h"
 #include "PsiFormerDeviceComplexScoreValidation.h"
+#include "PsiFormerDeviceComplexKineticValidation.h"
 #include "PsiFormerDeviceKineticTrunkValidation.h"
 
 /// Exercise physical K ranges on the existing skew-periodic real and paired fixtures.
@@ -283,8 +284,8 @@ int main(int argc, char** argv)
   try
   {
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
-        std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only]");
+        std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -296,7 +297,9 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--kinetic-trunk-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--complex-kinetic-leaves-only")
+      validateComplexKineticLeaves();
+    else if (argc == 2 && std::string_view(argv[1]) == "--kinetic-trunk-only")
       validateKineticTrunkPeriodic();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-score-only")
       validateComplexScore();
