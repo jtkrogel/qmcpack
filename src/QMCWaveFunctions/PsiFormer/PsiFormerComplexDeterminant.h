@@ -127,6 +127,7 @@ public:
                                     bool prepare_inverses = true)
   {
     evaluated_ = false;
+    spatial_evaluated_ = false;
     if (elements_ && !matrices)
       throw std::invalid_argument("null complex determinant matrices");
     double shift = -std::numeric_limits<double>::infinity();
@@ -199,6 +200,7 @@ public:
       const Complex* coefficients = nullptr)
   {
     evaluated_ = false;
+    spatial_evaluated_ = false;
     if (gradient_lanes > gradient_capacity_ || laplacian_lanes > laplacian_capacity_ ||
         (laplacian_lanes && gradient_lanes != product(3, laplacian_lanes)) ||
         (gradient_lanes && (!gradients || !output_gradient)) ||
@@ -240,6 +242,7 @@ public:
       lap_ratio_[e] = narrow(total.value());
       lap_log_[e] = narrow(total.value() - squared_gradient);
     }
+    spatial_evaluated_ = gradient_lanes == gradient_capacity_ && laplacian_lanes == laplacian_capacity_;
     std::copy_n(gradient_.data(), gradient_lanes, output_gradient);
     std::copy_n(lap_log_.data(), laplacian_lanes, output_lap_log);
     std::copy_n(lap_ratio_.data(), laplacian_lanes, output_lap_ratio);
@@ -266,6 +269,93 @@ public:
                 narrow(weights_[c] * Wide(inverse_[offset + j * n + i]));
       }
     std::copy(adjoint_.begin(), adjoint_.end(), output);
+  }
+
+  /** Reverse a FULL gradient/log-Laplacian root into ordinary complex orbital jets.
+   * Cached spatial evaluation supplies normalized-mixture weight derivatives.
+   * Caller owns [1+4N,D*N*N] output and three N*N scratch matrices; no allocation.
+   */
+  void fillSpatialRootMatrixAdjoints(const Complex* gradients, const Complex* laplacians,
+      const Complex* gradient_root, const Complex* laplacian_root,
+      Complex* output, std::size_t output_count, Wide* scratch, std::size_t scratch_count)
+  {
+    requireDerivatives();
+    const std::size_t n = sizes_[0], square = product(n, n), batch = lu_.size();
+    const std::size_t planes = sum(1, product(4, n)), count = product(planes, batch);
+    if (!spatial_evaluated_ || sizes_[1] || gradient_capacity_ != product(3, n) ||
+        laplacian_capacity_ != n || output_count != count || scratch_count != product(3, square) ||
+        !gradients || !laplacians || !gradient_root || !laplacian_root || !output || !scratch)
+      throw std::invalid_argument("complex FULL matrix root views require a current spatial evaluation");
+    validate(gradients, product(3 * n, batch));
+    validate(laplacians, product(n, batch));
+    validate(gradient_root, 3 * n);
+    validate(laplacian_root, n);
+    std::fill_n(output, count, Complex{});
+    Wide* a = scratch;
+    Wide* b = a + square;
+    Wide* c = b + square;
+    const auto multiply = [n](const auto* left, const auto* right, Wide* result) {
+      std::fill_n(result, n * n, Wide{});
+      for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t k = 0; k < n; ++k)
+          for (std::size_t j = 0; j < n; ++j)
+            result[i * n + j] += Wide(left[i * n + k]) * Wide(right[k * n + j]);
+    };
+    const auto trace = [n](const Wide* matrix) {
+      Wide value{};
+      for (std::size_t i = 0; i < n; ++i)
+        value += matrix[i * n + i];
+      return value;
+    };
+    for (std::size_t channel = 0; channel < channels_; ++channel)
+    {
+      // Admission above examines ALL required inverses before a weight can underflow.
+      const Wide weight = weights_[channel];
+      if (weight == Wide{})
+        continue;
+      const std::size_t begin = channel * square;
+      const Complex* inverse = inverse_.data() + begin;
+      for (std::size_t electron = 0; electron < n; ++electron)
+      {
+        Wide alpha = -Wide(lap_log_[electron]);
+        const Wide lambda_l(laplacian_root[electron]);
+        for (std::size_t dimension = 0; dimension < 3; ++dimension)
+        {
+          const std::size_t lane = 3 * electron + dimension;
+          multiply(inverse, gradients + lane * batch + begin, a);
+          const Wide delta = trace(a) - Wide(gradient_[lane]);
+          alpha += delta * delta;
+          for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t j = 0; j < n; ++j)
+              alpha -= a[i * n + j] * a[j * n + i];
+          multiply(a, inverse, b);
+          multiply(a, b, c);
+          for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t j = 0; j < n; ++j)
+            {
+              const std::size_t element = begin + i * n + j, transpose = j * n + i;
+              const Wide m = weight * Wide(inverse[transpose]);
+              const Wide mc = weight * (delta * Wide(inverse[transpose]) - b[transpose]);
+              output[element] += narrow(Wide(gradient_root[lane]) * mc +
+                  2.0L * lambda_l * weight * (c[transpose] - delta * b[transpose]));
+              output[(1 + lane) * batch + element] =
+                  narrow(Wide(gradient_root[lane]) * m + 2.0L * lambda_l * mc);
+            }
+        }
+        multiply(inverse, laplacians + electron * batch + begin, a);
+        alpha += trace(a);
+        multiply(a, inverse, b);
+        for (std::size_t i = 0; i < n; ++i)
+          for (std::size_t j = 0; j < n; ++j)
+          {
+            const std::size_t element = begin + i * n + j, transpose = j * n + i;
+            output[element] += narrow(lambda_l * weight * (alpha * Wide(inverse[transpose]) - b[transpose]));
+            output[(1 + 3 * n + electron) * batch + element] =
+                narrow(lambda_l * weight * Wide(inverse[transpose]));
+          }
+      }
+    }
+    validate(output, count);
   }
 
   /// Expose only a completed value or compound spatial evaluation.
@@ -362,7 +452,9 @@ private:
     if (result_.amplitude.isZero() || !result_.all_required_inverses_available)
     {
       evaluated_ = false;
-      throw std::domain_error("complex determinant derivatives unavailable at node or singular channel");
+      throw std::domain_error(result_.amplitude.isZero() ?
+          "complex determinant derivatives unavailable at total wavefunction node" :
+          "complex determinant derivatives unavailable: required channel inverse missing");
     }
   }
 
@@ -498,7 +590,7 @@ private:
   std::vector<Wide> scaled_terms_, weights_, solve_, matrix_product_;
   std::vector<Complex> gradient_, lap_ratio_, lap_log_, adjoint_;
   ComplexDeterminantResult result_;
-  bool evaluated_ = false;
+  bool evaluated_ = false, spatial_evaluated_ = false;
 };
 } // namespace qmcplusplus::psiformer::determinant
 #endif

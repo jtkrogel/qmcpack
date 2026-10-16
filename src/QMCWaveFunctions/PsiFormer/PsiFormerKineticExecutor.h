@@ -2600,6 +2600,8 @@ inline DirectKineticConstView DirectKineticExecutor::reverseTrunk(
   std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
   if (workspace.owner_ != this || !workspace.forward_valid_ || ticket.workspace != &workspace ||
       ticket.features != &workspace.features_.back() ||
+      ticket.geometry != &workspace.geometry_ ||
+      ticket.packed_positions != workspace.electron_positions_.data() ||
       ticket.forward_generation != workspace.forward_generation_ ||
       ticket.parameter_version != parameters_.version() ||
       workspace.observed_parameter_version_ != parameters_.version() ||

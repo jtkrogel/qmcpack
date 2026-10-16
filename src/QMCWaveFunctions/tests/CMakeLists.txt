@@ -864,6 +864,18 @@ add_unit_test(deterministic-unit_test_psiformer_kinetic_trunk
 set_tests_properties(deterministic-unit_test_psiformer_kinetic_trunk
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# The complex kinetic numerical owner uses a single native-owning test translation unit.
+add_executable(test_psiformer_complex_kinetic
+               test_psiformer_complex_kinetic.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_complex_kinetic catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_complex_kinetic PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_complex_kinetic
+              1 1 $<TARGET_FILE:test_psiformer_complex_kinetic>)
+set_tests_properties(deterministic-unit_test_psiformer_complex_kinetic
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 # Keep the replaceable global allocation operators isolated from the broad
 # TrialWaveFunction binary while exercising the real public component boundary.
 add_executable(test_psiformer_adapter_sinks test_psiformer_adapter_sinks.cpp)

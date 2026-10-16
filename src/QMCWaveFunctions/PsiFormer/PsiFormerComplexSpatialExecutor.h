@@ -16,6 +16,55 @@
 
 namespace pf
 {
+/// Share explicit physical-row radial envelope jets across spatial and kinetic owners.
+inline void fillRealOrbitalEnvelopeJets(const PsiFormerGeometryCache& geometry,
+  const qmcplusplus::psiformer::SpatialJetLayout& orbitals, std::size_t spin_up,
+  std::size_t nuclei, const double* p, const std::array<DirectParameterTensor, 2>& pi,
+  const std::array<DirectParameterTensor, 2>& zeta, std::size_t active, double* output)
+{
+  std::fill_n(output, qmcplusplus::psiformer::spatialJetSpanElements(orbitals), 0.0);
+  const auto& pairs = geometry.electronNucleusPairs();
+  const std::size_t n = orbitals.electron_count;
+  for (std::size_t row = 0; row < n; ++row)
+    for (std::size_t channel = 0; channel < orbitals.element_count / n; ++channel)
+    {
+      const std::size_t spin = row < spin_up ? 0 : 1;
+      const std::size_t element = (channel / n * n + row) * n + channel % n;
+      for (std::size_t atom = 0; atom < nuclei; ++atom)
+      {
+        const std::size_t pair = row * nuclei + atom, parameter = channel * nuclei + atom;
+        const double radius = pairs.distances()[pair];
+        if (radius == 0)
+          throw std::runtime_error("PsiFormer complex spatial undefined at electron-nucleus coalescence");
+        const double decay = std::abs(p[zeta[spin].begin + parameter]);
+        const double weighted = p[pi[spin].begin + parameter] * std::exp(-decay * radius);
+        const double first = -decay * weighted;
+        output[element] += weighted;
+        for (std::size_t lane = 0; lane < orbitals.gradient_lanes; ++lane)
+          if ((orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL ? lane / 3 : active) == row)
+            output[orbitals.uncheckedPlaneOffset(0, 1 + lane, element)] +=
+                first * pairs.distanceGradients()[pair][lane % 3];
+        if (orbitals.mode == qmcplusplus::psiformer::SpatialJetMode::FULL_VGL)
+          output[orbitals.uncheckedPlaneOffset(0, 1 + orbitals.gradient_lanes + row, element)] +=
+              decay * decay * weighted * pairs.distanceGradientNormsSquared()[pair] +
+              first * pairs.distanceLaplacians()[pair];
+      }
+    }
+}
+
+/// Return value/first/second radial derivatives with respect to pi or real zeta.
+inline std::array<double, 3> realOrbitalEnvelopeParameterJet(
+    double radius, double pi, double zeta, bool zeta_direction)
+{
+  const double decay = std::abs(zeta), exponential = std::exp(-decay * radius);
+  if (!zeta_direction)
+    return {exponential, -decay * exponential, decay * decay * exponential};
+  const double sign = zeta > 0 ? 1.0 : (zeta < 0 ? -1.0 : 0.0);
+  const double weight = sign * pi * exponential;
+  return {-radius * weight, (decay * radius - 1) * weight,
+          (2 * decay - decay * decay * radius) * weight};
+}
+
 /// Borrowed complete physical core derivatives; invalidated by any next workspace request.
 struct DirectComplexSpatialResult
 {
@@ -261,40 +310,6 @@ private:
     return {descriptor.begin, descriptor.size()};
   }
 
-  /// Build explicit radial envelope jets in physical row/target ordering.
-  void envelopes(DirectComplexSpatialWorkspace& w, const DirectSpatialTrunkResultView& t,
-                 const double* p, std::size_t active) const
-  {
-    std::fill(w.envelopes_.begin(), w.envelopes_.end(), 0.0);
-    const auto& pairs = t.geometry->electronNucleusPairs();
-    const std::size_t n = descriptor_.electrons, nuclei = metadata_.trunkLayout()->nucleusCount();
-    for (std::size_t row = 0; row < n; ++row)
-      for (std::size_t channel = 0; channel < descriptor_.determinants * n; ++channel)
-      {
-        const std::size_t spin = row < descriptor_.spin_up ? 0 : 1;
-        const std::size_t element = (channel / n * n + row) * n + channel % n;
-        for (std::size_t atom = 0; atom < nuclei; ++atom)
-        {
-          const std::size_t pair = row * nuclei + atom, parameter = channel * nuclei + atom;
-          const double radius = pairs.distances()[pair];
-          if (radius == 0)
-            throw std::runtime_error("PsiFormer complex spatial undefined at electron-nucleus coalescence");
-          const double decay = std::abs(p[zeta_[spin].begin + parameter]);
-          const double weighted = p[pi_[spin].begin + parameter] * std::exp(-decay * radius);
-          const double first = -decay * weighted;
-          w.envelopes_[element] += weighted;
-          for (std::size_t lane = 0; lane < w.features_.gradient_lanes; ++lane)
-            if ((w.mode_ == DirectSpatialMode::FULL_VGL ? lane / 3 : active) == row)
-              w.envelopes_[w.orbitals_.uncheckedPlaneOffset(0, 1 + lane, element)] +=
-                  first * pairs.distanceGradients()[pair][lane % 3];
-          if (w.mode_ == DirectSpatialMode::FULL_VGL)
-            w.envelopes_[w.orbitals_.uncheckedPlaneOffset(0, 1 + w.features_.gradient_lanes + row, element)] +=
-                decay * decay * weighted * pairs.distanceGradientNormsSquared()[pair] +
-                first * pairs.distanceLaplacians()[pair];
-        }
-      }
-  }
-
   /// Compose shared real trunk, split-feature complex head and strict analytic reduction.
   DirectComplexSpatialResult evaluate(DirectComplexSpatialWorkspace& w, DirectSpatialMode mode,
                                       std::size_t active) const
@@ -306,7 +321,8 @@ private:
     const auto t = mode == DirectSpatialMode::FULL_VGL ? trunk_.evaluateTrunkFull(*w.trunk_) :
                                                       trunk_.evaluateTrunkActive(*w.trunk_, active);
     const double* p = parameters_.flat_values().data();
-    envelopes(w, t, p, active);
+    fillRealOrbitalEnvelopeJets(*t.geometry, w.orbitals_, descriptor_.spin_up,
+        metadata_.trunkLayout()->nucleusCount(), p, pi_, zeta_, active, w.envelopes_.data());
     ComplexOrbitalHeadParameters heads;
     heads.up = {p + real_[0].begin, p + imaginary_[0].begin, nullptr, nullptr, real_[0].size, 0};
     heads.down = {p + real_[1].begin, p + imaginary_[1].begin, nullptr, nullptr, real_[1].size, 0};
