@@ -1,0 +1,95 @@
+<?xml version="1.0"?>
+<simulation>
+  <project id="h2_conventional_sj" series="0">
+    <parameter name="driver_version">batch</parameter>
+  </project>
+  <random seed="81357"/>
+  <!-- H2_ae/h2.ptcl.xml geometry; H4_ae/H4.wfs.xml hydrogen STO-3G basis.
+       The fixed bonding SPO uses both atomic functions. Only J1/J2 are active. -->
+  <particleset name="ion0" size="2">
+    <group name="H">
+      <parameter name="charge">1</parameter>
+      <parameter name="valence">1</parameter>
+      <parameter name="atomicnumber">1</parameter>
+    </group>
+    <attrib name="position" datatype="posArray">0 0 -0.9448629939  0 0 0.9448629939</attrib>
+  </particleset>
+  <particleset name="e">
+    <group name="u" size="1">
+      <parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">0.52261545687 0.46234802699 -1.2355134293</attrib>
+    </group>
+    <group name="d" size="1">
+      <parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">0.64451072699 0.13453681375 1.3161796485</attrib>
+    </group>
+  </particleset>
+  <wavefunction name="psi0" target="e" print_parameters="no">
+    <sposet_collection type="MolecularOrbital" name="LCAOBSet" transform="yes" source="ion0">
+      <basisset name="LCAOBSet">
+        <atomicBasisSet name="Gaussian" angular="cartesian" type="Gaussian" elementType="H" normalized="no">
+          <grid type="log" ri="1.e-6" rf="1.e2" npts="1001"/>
+          <basisGroup rid="H00" n="0" l="0" type="Gaussian">
+            <radfunc exponent="3.4252509" contraction="0.154328967295"/>
+            <radfunc exponent="0.6239137" contraction="0.535328142282"/>
+            <radfunc exponent="0.1688554" contraction="0.444634542185"/>
+          </basisGroup>
+        </atomicBasisSet>
+      </basisset>
+      <sposet name="bonding" basisset="LCAOBSet" size="1" optimize="no">
+        <occupation mode="ground"/>
+        <coefficient size="1" id="fixed_bonding">0.55 0.55</coefficient>
+      </sposet>
+    </sposet_collection>
+    <determinantset>
+      <slaterdeterminant>
+        <determinant sposet="bonding" size="1"/>
+        <determinant sposet="bonding" size="1"/>
+      </slaterdeterminant>
+    </determinantset>
+    <jastrow name="J2" type="Two-Body" function="Bspline" print="yes">
+      <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+        <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+      </correlation>
+    </jastrow>
+    <jastrow name="J1" type="One-Body" function="Bspline" source="ion0" print="yes">
+      <correlation rcut="4" size="4" cusp="1" elementType="H">
+        <coefficients id="eH" type="Array" optimize="yes">0.02 -0.01 0.01 -0.005</coefficients>
+      </correlation>
+    </jastrow>
+  </wavefunction>
+  <hamiltonian name="h0" type="generic" target="e">
+    <pairpot name="ElecElec" type="coulomb" source="e" target="e"/>
+    <pairpot name="IonElec" type="coulomb" source="ion0" target="e"/>
+    <constant name="IonIon" type="coulomb" source="ion0" target="ion0"/>
+  </hamiltonian>
+  <qmc method="wf_train" move="pbyp" checkpoint="1">
+    <training objective="energy" optimizer="adam">
+      <parameter name="iterations">2</parameter>
+      <parameter name="learning_rate">0.0001</parameter>
+      <parameter name="parameter_chunk_size">4</parameter>
+      <parameter name="legacy_maximum_parameters">64</parameter>
+      <parameter name="legacy_derivative_scratch_bytes">65536</parameter>
+      <parameter name="checkpoint_interval">1</parameter>
+      <parameter name="line_search">off</parameter>
+    </training>
+    <parameter name="walkers_per_rank">2</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="blocks">2</parameter>
+    <parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">0.0001</parameter>
+    <parameter name="usedrift">no</parameter>
+    <inference interval="1" last="yes" move="pbyp">
+      <parameter name="walkers_per_rank">2</parameter>
+      <parameter name="crowds">1</parameter>
+      <parameter name="blocks">1</parameter>
+      <parameter name="steps">1</parameter>
+      <parameter name="warmupsteps">0</parameter>
+      <parameter name="substeps">1</parameter>
+      <parameter name="timestep">0.0001</parameter>
+      <parameter name="usedrift">no</parameter>
+    </inference>
+  </qmc>
+</simulation>
