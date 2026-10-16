@@ -60,3 +60,30 @@ uses32inner iterations/restart9. PII/minPII use GMRES restart16 and no damping r
 The checker records every committed/rejected decision in family_results.csv,
 checks accepted/rejected exported state and version consistency, and retains
 failures rather than altering the numerical algorithm or forcing acceptance.
+Standalone conventional model import
+------------------------------------
+
+``<wavefunction ... parameter_file="RI.parameters.h5">`` initializes an already
+defined inline conventional model for real CPU batched VMC or ENERGY WFTrain.
+The selected Hamiltonian and actual parsed PP content must match the export.
+Qualified SJ/MDJ/J3, single-Slater orbital and restricted ECP profiles retain
+their existing admission limits; this attribute does not expand those profiles.
+Loading is deferred until physical-system selection, before population clones
+and resources. ``--dryrun`` does not validate the deferred artifact.
+
+The loader is bounded to 65536 active variables, 4 MiB derivative scratch and
+256-coordinate chunks; these are initialization-loader limits, not universal
+optimizer limits. The original inline XML/registration identity stays immutable.
+Active parameters and complete accepted orbital state are imported, but electron
+coordinates, sampler/RNG, optimizer state and iteration counters are not.
+The attribute applies once per selected wavefunction; later sections must use
+the same selected Hamiltonian. Exact WFTrain restart may follow initialization
+and remains authoritative for all checkpoint state.
+
+``check_sj_training.py qmcpack fixture.xml --model-import`` selects a bounded
+workflow: export a model, compare imported ordinary-VMC physical scalar traces
+against explicit accepted-state XML, train from the artifact, re-export/import
+against the original definition, and require exact initialized split restart.
+It also rejects a missing required dataset, unsupported driver and (for ECP)
+changed physical PP bytes. This is deterministic energy-trace evidence, not a
+native gradient oracle or convergence benchmark.

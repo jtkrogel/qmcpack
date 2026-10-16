@@ -4,6 +4,7 @@ import argparse
 import csv
 import math
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -81,12 +82,54 @@ def check_orbital_frame(group, tree, parameters, row, model):
     return active, full
 
 
+def apply_model_reference(tree, model):
+    """Construct a test-only explicit physical model, without the import path."""
+    with h5py.File(model, "r") as handle:
+        group = handle["conventional_wavefunction"]
+        names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
+        indices = np.asarray(group["active_indices"][()]).reshape(-1)
+        parameters = np.asarray(group["parameters"][()]).reshape(-1)
+        active = {name: parameters[int(index)] for name, index in zip(names, indices) if index >= 0}
+        for coefficients in tree.findall("wavefunction/jastrow/correlation/coefficients"):
+            values = coefficients.text.split()
+            coefficients.text = " ".join(str(active.get(f"{coefficients.get('id')}_{i}", float(value)))
+                                         for i, value in enumerate(values))
+        for node in tree.findall(".//multideterminant/detlist/*"):
+            if node.get("id") in active:
+                node.set("coeff", str(active[node.get("id")]))
+        wrapper = tree.find(".//rotated_sposet")
+        if wrapper is not None:
+            # Remove the coordinate wrapper entirely: the independent VMC oracle
+            # starts from exact accepted C, not an exp(active) reconstruction.
+            spo = wrapper.find("sposet")
+            spo.set("name", wrapper.get("name"))
+            spo.find("coefficient").text = " ".join(str(value) for value in np.asarray(
+                group["orbital_frame/spo_0/accepted_coefficients"][()]).reshape(-1))
+            collection = tree.find("wavefunction/sposet_collection")
+            collection.remove(wrapper)
+            collection.append(spo)
+
+
+def vmc_physical_trace(directory):
+    """Read deterministic scalar energy/weight traces, excluding elapsed CPU."""
+    path = directory / "sj.s000.scalar.dat"
+    header = next(line.split()[1:] for line in path.read_text().splitlines() if line.startswith("#"))
+    data = np.loadtxt(path, ndmin=2)
+    selected = [i for i, name in enumerate(header) if name not in ("BlockCPU", "index")]
+    assert selected and "LocalEnergy" in header, path
+    result = data[:, selected]
+    assert np.isfinite(result).all(), path
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
     parser.add_argument("fixture", type=Path, nargs="?", default=Path(__file__).with_name("wftrain_sj.xml"))
     parser.add_argument("--restart", action="store_true", help="also require split-run exact continuation")
     parser.add_argument("--preflight", action="store_true", help="also check unsupported model/optimizer rejection")
+    parser.add_argument("--model-import", action="store_true",
+                        help="export/import ordinary VMC, fresh training, re-export and exact restart")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -110,13 +153,16 @@ def main():
         parser.error("select one of --profile-only, --optimizer-screen, --family-screen")
     if args.family_method and not args.family_screen:
         parser.error("--family-method requires --family-screen")
+    if args.model_import and any((args.profile_only, args.optimizer_screen, args.family_screen,
+                                  args.restart, args.preflight)):
+        parser.error("--model-import selects its own bounded workflow")
     executable = args.executable.resolve()
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
 
     def run(label, *, optimizer="adam", inference=True, iterations=2, restart=None, mutate=None, reject=False,
-            samples_per_rank=4, require_committed=True):
+            samples_per_rank=4, require_committed=True, parameter_file=None, vmc=False, reference_file=None):
         directory = work / label
         directory.mkdir()
         tree = ET.parse(fixture)
@@ -158,6 +204,16 @@ def main():
             qmc.remove(qmc.find("inference"))
         if restart is not None:
             ET.SubElement(training, "parameter", name="restart_path").text = str(restart)
+        if parameter_file is not None:
+            tree.find("wavefunction").set("parameter_file", str(parameter_file.resolve()))
+        if reference_file is not None:
+            apply_model_reference(tree, reference_file)
+        if vmc:
+            qmc.set("method", "vmc")
+            qmc.remove(training)
+            if qmc.find("inference") is not None:
+                qmc.remove(qmc.find("inference"))
+            qmc.find("parameter[@name='blocks']").text = "2"
         if mutate:
             mutate(tree)
         # Only the explicit qualified rotation wrapper may unfreeze orbitals.
@@ -181,6 +237,10 @@ def main():
             assert not list(directory.glob("*.training/*/*.state.h5")), directory
             return directory
         assert result.returncode == 0, (directory, text[-6000:])
+        if vmc:
+            vmc_physical_trace(directory)
+            assert not list(directory.glob("*.training")), directory
+            return directory
         rows = history(directory)
         expected_rows = iterations if restart is None else 1
         assert len(rows) == expected_rows, (directory, rows)
@@ -215,7 +275,8 @@ def main():
             initial += [0.0, 0.0]
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    for value in node.text.split()]
-        previous = np.asarray(initial)
+        previous = (np.asarray(initial) if parameter_file is None else
+                    datasets(parameter_file)["conventional_wavefunction/parameters"].reshape(-1))
         fixed = tree.find(".//sposet/coefficient")
         orbital_history = []
         for model, row in zip(models, rows):
@@ -325,6 +386,50 @@ def main():
         return
 
     adam = run("adam")
+    if args.model_import:
+        exported = sorted((adam / "sj.s000.training").rglob("*.parameters.h5"))[-1]
+        imported_vmc = run("imported_vmc", vmc=True, parameter_file=exported)
+        explicit_vmc = run("explicit_vmc", vmc=True, reference_file=exported)
+        np.testing.assert_array_equal(vmc_physical_trace(imported_vmc), vmc_physical_trace(explicit_vmc))
+        trained = run("imported_training", parameter_file=exported)
+        split = run("imported_split", iterations=1, parameter_file=exported)
+        resumed = run("imported_resumed", parameter_file=exported,
+                      restart=split / "sj.s000.last_checkpoint.h5")
+        final = sorted((trained / "sj.s000.training").rglob("*.parameters.h5"))[-1]
+        restored = sorted((resumed / "sj.s000.training").rglob("*.parameters.h5"))[-1]
+        lhs, rhs = datasets(final), datasets(restored)
+        assert lhs.keys() == rhs.keys()
+        for name in lhs:
+            np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"initialized restart: {name}")
+        # A second import still uses ORIGINAL inline XML and original registration
+        # identity, rather than a rewritten XML whose baseline masks a loader bug.
+        second_vmc = run("reimported_vmc", vmc=True, parameter_file=final)
+        second_reference = run("reexport_reference_vmc", vmc=True, reference_file=final)
+        np.testing.assert_array_equal(vmc_physical_trace(second_vmc), vmc_physical_trace(second_reference))
+        for name in ("model_identity", "registration_values", "wavefunction_xml", "physical_definition"):
+            np.testing.assert_array_equal(datasets(exported)["conventional_wavefunction/" + name],
+                                          lhs["conventional_wavefunction/" + name])
+        missing = work / "missing-parameters.h5"
+        shutil.copyfile(exported, missing)
+        with h5py.File(missing, "r+") as handle:
+            del handle["conventional_wavefunction/parameters"]
+        run("reject_missing_import_parameters", parameter_file=missing, vmc=True,
+            reject="Conventional model export")
+        run("reject_unsupported_import_driver", parameter_file=exported, vmc=True,
+            mutate=lambda tree: tree.find("qmc").set("method", "dmc"),
+            reject="parameter_file supports only CPU batched VMC and WFTrain")
+        if ET.parse(fixture).find("hamiltonian/pairpot/pseudo") is not None:
+            source = (fixture.parent / ET.parse(fixture).find("hamiltonian/pairpot/pseudo").get("href")).resolve()
+            original = source.read_bytes()
+            changed = work / "changed-import-pseudopotential.xml"
+            changed.write_bytes(original + b"\n<!-- imported model PP identity regression -->\n")
+            run("reject_changed_import_pp", parameter_file=exported, vmc=True,
+                mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)),
+                reject="Conventional model export identity mismatch")
+            assert source.read_bytes() == original
+        print("PASS: conventional model import physical VMC reference, fresh training/re-export/re-import, "
+              "exact initialized split restart and malformed/unsupported import rejection")
+        return
     if args.profile_only:
         print(f"PASS: bounded conventional Adam/inference {args.ranks} MPI x {args.threads} OpenMP; accepted model export")
         return
