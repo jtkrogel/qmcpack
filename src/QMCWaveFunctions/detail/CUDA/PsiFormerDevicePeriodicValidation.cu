@@ -254,6 +254,7 @@ void validate()
 #include "PsiFormerDeviceComplexScoreValidation.h"
 #include "PsiFormerDeviceComplexKineticValidation.h"
 #include "PsiFormerDeviceComplexKineticOwnerValidation.h"
+#include "PsiFormerDeviceComplexProductsValidation.h"
 #include "PsiFormerDeviceComplexSpatialTargetValidation.h"
 #include "PsiFormerDeviceKineticTrunkValidation.h"
 
@@ -292,8 +293,8 @@ int main(int argc, char** argv)
     }
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
         std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only" && std::string_view(argv[1]) != "--complex-kinetic-leaves-only" && std::string_view(argv[1]) != "--complex-kinetic-only" &&
-        std::string_view(argv[1]) != "--complex-spatial-target-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check]");
+        std::string_view(argv[1]) != "--complex-spatial-target-only" && std::string_view(argv[1]) != "--complex-products-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only|--complex-kinetic-leaves-only|--complex-kinetic-only|--complex-spatial-target-only|--complex-spatial-target-cost-check|--complex-products-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -307,6 +308,8 @@ int main(int argc, char** argv)
     }
     if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-target-only")
       validateComplexSpatialTargets();
+    else if (argc == 2 && std::string_view(argv[1]) == "--complex-products-only")
+      validateComplexProducts();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-kinetic-only")
       validateComplexKineticOwner();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-kinetic-leaves-only")
