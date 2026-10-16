@@ -584,7 +584,7 @@ def main():
         if args.periodic_heg:
             for label, name, value in (("cell", "rs", "5.1"), ("cutoff", "LR_dim_cutoff", "7")):
                 def change_periodic_identity(tree, name=name, value=value):
-                    tree.find(f"simulationcell/parameter[@name='{name}']").text = value
+                    tree.find(f".//simulationcell/parameter[@name='{name}']").text = value
                 run(f"reject_changed_{label}_import", parameter_file=exported, vmc=True,
                     mutate=change_periodic_identity, reject="Conventional model export identity mismatch")
                 run(f"reject_changed_{label}_restart", restart=adam / "sj.s000.last_checkpoint.h5", iterations=3,

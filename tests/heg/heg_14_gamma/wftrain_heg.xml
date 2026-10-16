@@ -6,12 +6,14 @@
   <random seed="81357"/>
   <!-- Existing heg_14_gamma rs=5 closed-shell FreeOrbital/J2 model.
        Explicit 3D Ewald; no orbital file, ions, backflow or optimized SPO. -->
+  <qmcsystem>
   <simulationcell>
     <parameter name="rs" condition="14">5</parameter>
     <parameter name="bconds">p p p</parameter>
     <parameter name="LR_dim_cutoff">6</parameter>
     <parameter name="LR_handler">ewald</parameter>
   </simulationcell>
+  </qmcsystem>
   <particleset name="e" random="yes">
     <group name="u" size="7">
       <parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
