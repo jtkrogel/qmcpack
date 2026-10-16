@@ -940,11 +940,14 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   particles.createResource(p_resources);
   source->createResource(w_resources);
   ham.createResource(h_resources);
-  ResourceCollectionTeamLock<ParticleSet> p_lock(p_resources, p_list);
-  ResourceCollectionTeamLock<TrialWaveFunction> w_lock(w_resources, wf_list);
-  ResourceCollectionTeamLock<QMCHamiltonian> h_lock(h_resources, h_list);
-  const auto accepted = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
-      h_list, wf_list, p_list, *consumer, {&channel, 1}, idle_sink);
+  QMCHamiltonian::StreamingNonLocalECPResult accepted;
+  {
+    ResourceCollectionTeamLock<ParticleSet> p_lock(p_resources, p_list);
+    ResourceCollectionTeamLock<TrialWaveFunction> w_lock(w_resources, wf_list);
+    ResourceCollectionTeamLock<QMCHamiltonian> h_lock(h_resources, h_list);
+    accepted = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+        h_list, wf_list, p_list, *consumer, {&channel, 1}, idle_sink);
+  } // Release resources before the FD oracle creates independent private clones.
   CHECK(idle_sink.state() == DerivativeSinkState::IDLE);
   auto grid = consumer->releaseJVPReplay();
   REQUIRE(grid);
