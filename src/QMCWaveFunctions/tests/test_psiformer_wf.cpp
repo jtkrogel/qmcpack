@@ -293,6 +293,15 @@ public:
     component.clearProposalState();
   }
 
+  /// Remove FULL or require restore validation without changing cached numerical payloads.
+  static void makeReplayCacheIneligible(PsiFormerWF& component, bool restore_pending)
+  {
+    if (restore_pending)
+      component.restore_validation_pending_ = true;
+    else
+      component.accepted_state_requirement_ = PsiFormerWF::AcceptedStateRequirement::VALUE_ONLY;
+  }
+
   /// Inject or clear the late allocation failure used by the preparation test.
   static void failClonePreparationBeforePublish(PsiFormerWF& component,
                                                 bool enabled)
@@ -2887,6 +2896,124 @@ TEST_CASE("PsiFormer clone-local evaluator workspaces are allocated on demand",
         components, particles, gradient_list, laplacian_list);
     check_empty(crowd_component0);
     check_empty(crowd_component1);
+  }
+}
+
+TEST_CASE("PsiFormer retained ENERGY replay requires exact current FULL cache evidence",
+          "[wavefunction][psiformer][replay_elision]")
+{
+  auto files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  auto live = makeLiHElectrons(simulation_cell);
+  auto ions = makeLiHIons(simulation_cell);
+  PsiFormerWF component("pf_replay", files.parameters.string(), files.configuration.string(), live, *ions);
+  live.G = ValueType(0);
+  live.L = ValueType(0);
+  const auto log = component.evaluateLog(live, live.G, live.L);
+  ParticleSet saved(live);
+  saved.update();
+  const auto version = component.parameterVersion();
+  double expected_log = std::real(log), expected_phase = std::imag(log);
+  auto expected_version = version;
+  REQUIRE(component.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase));
+  bool local_result_checked = false;
+
+  SECTION("repeat observation is read-only")
+  {
+    const auto state = testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    const auto workspace = testing::TestPsiFormerWF::directWorkspaceDiagnostics(component);
+    for (int repeat = 0; repeat < 3; ++repeat)
+      CHECK(component.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase));
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(component, state));
+    checkScalarWorkspaceStorage(testing::TestPsiFormerWF::directWorkspaceDiagnostics(component), workspace);
+    local_result_checked = true;
+  }
+  SECTION("wrong capture version") { ++expected_version; }
+  SECTION("model-wide planned single transaction is active")
+  {
+    REQUIRE(testing::TestPsiFormerWF::registerPlannedSingleTransaction(component));
+    const auto state = testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    const auto counts = testing::TestPsiFormerWF::plannedProposalCounts(component);
+    const bool reusable = component.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase);
+    const auto after_counts = testing::TestPsiFormerWF::plannedProposalCounts(component);
+    const bool unchanged = testing::TestPsiFormerWF::scalarStateMatches(component, state);
+    testing::TestPsiFormerWF::unregisterPlannedSingleTransaction(component);
+    CHECK_FALSE(reusable);
+    CHECK(after_counts == counts);
+    CHECK(unchanged);
+    CHECK(component.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase));
+    local_result_checked = true;
+  }
+  SECTION("model-wide planned selected transaction is active")
+  {
+    REQUIRE(testing::TestPsiFormerWF::registerPlannedSelectedTransaction(component));
+    const auto state = testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    const auto counts = testing::TestPsiFormerWF::plannedProposalCounts(component);
+    const bool reusable = component.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase);
+    const auto after_counts = testing::TestPsiFormerWF::plannedProposalCounts(component);
+    const bool unchanged = testing::TestPsiFormerWF::scalarStateMatches(component, state);
+    testing::TestPsiFormerWF::unregisterPlannedSelectedTransaction(component);
+    CHECK_FALSE(reusable);
+    CHECK(after_counts == counts);
+    CHECK(unchanged);
+    CHECK(component.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase));
+    local_result_checked = true;
+  }
+  SECTION("current model publication invalidates old accepted version")
+  {
+    expected_version = testing::TestPsiFormerWF::advanceParameterVersion(component);
+  }
+  SECTION("live coordinates changed") { live.R[0][0] += 0.01; }
+  SECTION("saved coordinates changed") { saved.R[0][0] += 0.01; }
+  SECTION("live spins changed") { live.spins[0] += 0.01; }
+  SECTION("saved spins changed") { saved.spins[0] += 0.01; }
+  SECTION("live gradient changed") { live.G[0][0] += ValueType(0.01); }
+  SECTION("saved gradient changed") { saved.G[0][0] += ValueType(0.01); }
+  SECTION("live Laplacian changed") { live.L[0] += ValueType(0.01); }
+  SECTION("saved Laplacian changed") { saved.L[0] += ValueType(0.01); }
+  SECTION("accepted cache alone changed")
+  {
+    testing::TestPsiFormerWF::setAcceptedGradientElement(component, 0, 0, live.G[0][0] + ValueType(0.01));
+  }
+  SECTION("particle groups changed") { saved.GroupID[0] = 1; }
+  SECTION("charges changed") { saved.Z[0] += 0.01; }
+  SECTION("mass changed")
+  {
+    auto& species = saved.getSpeciesSet();
+    species(species.getAttribute("mass"), 0) = 2;
+    saved.resetGroups();
+  }
+  SECTION("spinor layout changed") { saved.setSpinor(true); }
+  SECTION("scalar proposal pending") { testing::TestPsiFormerWF::markScalarProposalPending(component, 0); }
+  SECTION("selected proposal pending") { testing::TestPsiFormerWF::markSelectedProposalPending(component); }
+  SECTION("FULL is unavailable") { testing::TestPsiFormerWF::makeReplayCacheIneligible(component, false); }
+  SECTION("ACTIVE-only clone has no FULL cache")
+  {
+    PsiFormerWF active("pf_replay_active", files.parameters.string(), files.configuration.string(), live, *ions);
+    active.evalGrad(live, 0);
+    CHECK_FALSE(active.canReuseFullSpatialReplay(live, saved, version, expected_log, expected_phase));
+    local_result_checked = true;
+  }
+  SECTION("restore validation pending") { testing::TestPsiFormerWF::makeReplayCacheIneligible(component, true); }
+  SECTION("captured log changed") { expected_log += 0.01; }
+  SECTION("captured phase changed") { expected_phase += 0.01; }
+  SECTION("nonfinite log") { expected_log = std::numeric_limits<double>::infinity(); }
+  SECTION("nonfinite phase") { expected_phase = std::numeric_limits<double>::quiet_NaN(); }
+  SECTION("nonfinite live gradient") { live.G[0][0] = ValueType(std::numeric_limits<double>::infinity()); }
+  SECTION("nonfinite saved Laplacian") { saved.L[0] = ValueType(std::numeric_limits<double>::quiet_NaN()); }
+  SECTION("nonfinite spins") { live.spins[0] = std::numeric_limits<double>::quiet_NaN(); }
+  SECTION("nonfinite saved coordinates") { saved.R[0][0] = std::numeric_limits<double>::quiet_NaN(); }
+  SECTION("nonfinite saved spins") { saved.spins[0] = std::numeric_limits<double>::quiet_NaN(); }
+  SECTION("nonfinite accepted gradient")
+  {
+    testing::TestPsiFormerWF::setAcceptedGradientElement(component, 0, 0,
+        ValueType(std::numeric_limits<double>::quiet_NaN()));
+  }
+  if (!local_result_checked)
+  {
+    const auto state = testing::TestPsiFormerWF::scalarStateSnapshot(component);
+    CHECK_FALSE(component.canReuseFullSpatialReplay(live, saved, expected_version, expected_log, expected_phase));
+    CHECK(testing::TestPsiFormerWF::scalarStateMatches(component, state));
   }
 }
 

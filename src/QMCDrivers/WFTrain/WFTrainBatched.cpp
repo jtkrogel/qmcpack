@@ -46,6 +46,7 @@
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -82,24 +83,34 @@ struct RetainedCrowdSamples
   std::vector<std::unique_ptr<ParticleSet>> particles;
   std::vector<std::unique_ptr<TrialWaveFunction>> teachers;
   std::vector<double> local_energies;
+  /// Optional current-version/value evidence only for the admitted resident single snapshot.
+  std::optional<std::size_t> replay_version;
+  std::vector<std::array<double, 2>> replay_log_phase;
 };
 
 /** Copy an observed population before later MC moves overwrite its positions. */
 RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool overlap,
-                                       bool exact_energy_capacity = false)
+                                       bool exact_energy_capacity = false,
+                                       std::optional<std::size_t> replay_version = std::nullopt)
 {
   RetainedCrowdSamples result;
   result.crowd_index = index;
+  result.replay_version = replay_version;
   const auto& electrons = crowd.get_walker_elecs();
   const auto& wavefunctions = crowd.get_walker_twfs();
   const auto& walkers = crowd.get_walkers();
   if (exact_energy_capacity)
     result.local_energies.reserve(crowd.size());
+  if (replay_version)
+    result.replay_log_phase.reserve(crowd.size());
   for (std::size_t sample = 0; sample < crowd.size(); ++sample)
   {
     result.particles.push_back(std::make_unique<ParticleSet>(electrons[sample]));
     result.particles.back()->update();
     result.local_energies.push_back(walkers[sample].get().Properties(WalkerProperties::LOCALENERGY));
+    if (replay_version)
+      result.replay_log_phase.push_back({walkers[sample].get().Properties(WalkerProperties::LOGPSI),
+                                         walkers[sample].get().Properties(WalkerProperties::SIGN)});
     if (overlap)
       result.teachers.push_back(wavefunctions[sample].get().makeClone(*result.particles.back()));
   }
@@ -150,8 +161,10 @@ private:
 /** Replay a retained snapshot on resident clones and reconstruct coherent VGL.
  * Iterating snapshots in collection order leaves the live chains at their final
  * positions. No MC proposals or parameter publications occur during replay.
+ * An exact current resident snapshot may reuse FULL; all cheap replay operations remain.
  */
-void replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples)
+void replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples,
+                       std::optional<std::size_t> reuse_version = std::nullopt)
 {
   const auto& electrons = crowd.get_walker_elecs();
   const auto& wavefunctions = crowd.get_walker_twfs();
@@ -160,10 +173,53 @@ void replayCrowdSamples(Crowd& crowd, const RetainedCrowdSamples& samples)
   RefVectorWithLeader<TrialWaveFunction> wavefunction_batch(wavefunctions[0], wavefunctions);
   ResourceCollectionTeamLock<ParticleSet> particle_lock(crowd.getSharedResource().pset_res, particle_batch);
   ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, wavefunction_batch);
+  // Only the admitted resident single snapshot can still be the live chain.
+  bool reuse_full = reuse_version && samples.replay_version == reuse_version &&
+      samples.particles.size() == crowd.size() && samples.local_energies.size() == crowd.size() &&
+      samples.replay_log_phase.size() == crowd.size();
+  for (std::size_t sample = 0; reuse_full && sample < crowd.size(); ++sample)
+  {
+    const auto& live = electrons[sample].get();
+    const auto& saved = *samples.particles[sample];
+    reuse_full = live.R.size() == saved.R.size() && live.spins.size() == live.R.size() &&
+        live.spins.size() == saved.spins.size();
+    for (std::size_t electron = 0; reuse_full && electron < live.R.size(); ++electron)
+    {
+      reuse_full = wftrain::isFiniteTrainingReal(live.spins[electron]) &&
+          wftrain::isFiniteTrainingReal(saved.spins[electron]) && live.spins[electron] == saved.spins[electron];
+      for (int dimension = 0; reuse_full && dimension < OHMMS_DIM; ++dimension)
+        reuse_full = wftrain::isFiniteTrainingReal(live.R[electron][dimension]) &&
+            wftrain::isFiniteTrainingReal(saved.R[electron][dimension]) &&
+            live.R[electron][dimension] == saved.R[electron][dimension];
+    }
+  }
   for (std::size_t sample = 0; sample < crowd.size(); ++sample)
     electrons[sample].get().R = samples.particles[sample]->R;
   ParticleSet::mw_update(particle_batch);
-  TrialWaveFunction::mw_evaluateLog(wavefunction_batch, particle_batch);
+  for (std::size_t sample = 0; reuse_full && sample < crowd.size(); ++sample)
+  {
+    const auto& twf = wavefunctions[sample].get();
+    const auto& orbitals = twf.getOrbitals();
+    const auto* component = orbitals.size() == 1 ? dynamic_cast<const PsiFormerWF*>(orbitals.front().get()) : nullptr;
+    const auto& captured = samples.replay_log_phase[sample];
+    reuse_full = component && wftrain::isFiniteTrainingReal(captured[0]) && wftrain::isFiniteTrainingReal(captured[1]) &&
+        wftrain::isFiniteTrainingReal(twf.getLogPsi()) && wftrain::isFiniteTrainingReal(twf.getPhase()) &&
+        wftrain::isFiniteTrainingReal(walkers[sample].get().Properties(WalkerProperties::LOGPSI)) &&
+        wftrain::isFiniteTrainingReal(walkers[sample].get().Properties(WalkerProperties::SIGN)) &&
+        twf.getLogPsi() == captured[0] && twf.getPhase() == captured[1] &&
+        walkers[sample].get().Properties(WalkerProperties::LOGPSI) == captured[0] &&
+        walkers[sample].get().Properties(WalkerProperties::SIGN) == captured[1] &&
+        wftrain::isFiniteTrainingReal(samples.local_energies[sample]) &&
+        wftrain::isFiniteTrainingReal(walkers[sample].get().Properties(WalkerProperties::LOCALENERGY)) &&
+        walkers[sample].get().Properties(WalkerProperties::LOCALENERGY) == samples.local_energies[sample] &&
+        component->canReuseFullSpatialReplay(electrons[sample], *samples.particles[sample],
+                                             *reuse_version, captured[0], captured[1]);
+  }
+  if (!reuse_full)
+    TrialWaveFunction::mw_evaluateLog(wavefunction_batch, particle_batch);
+  if (reuse_version)
+    app_log() << "Resident ENERGY replay full_elided=" << reuse_full
+              << " full_evaluations=" << !reuse_full << " version=" << *reuse_version << std::endl;
   for (std::size_t sample = 0; sample < crowd.size(); ++sample)
   {
     electrons[sample].get().saveWalker(walkers[sample]);
@@ -1487,8 +1543,14 @@ void WFTrainBatched::run()
             if (crowds_[crowd_index]->size())
             {
               retained_samples.push_back(retainCrowdSamples(
-                  *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training));
+                  *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training,
+                  (resident_adam_budget || resident_sr_budget.first)
+                      ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt));
               const auto& snapshot = retained_samples.back();
+              if (snapshot.replay_version)
+                retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
+                    checkedMemoryAdd(sizeof(*snapshot.replay_version), checkedMemoryMultiply(
+                        snapshot.replay_log_phase.capacity(), sizeof(snapshot.replay_log_phase[0]))));
               retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
                   checkedMemoryMultiply(snapshot.local_energies.capacity(), sizeof(double)));
               for (const auto& particles : snapshot.particles)
@@ -1788,7 +1850,11 @@ void WFTrainBatched::run()
           for (auto& samples : retained_samples)
           {
             Crowd& crowd = *crowds_[samples.crowd_index];
-            replayCrowdSamples(crowd, samples);
+            const bool resident_single_snapshot = (resident_adam_budget || resident_sr_budget.first) &&
+                !complex_training && !has_nonlocal_ecp && retained_samples.size() == 1 && crowds_.size() == 1 &&
+                num_blocks == 1 && steps_per_block_ == 1;
+            replayCrowdSamples(crowd, samples, resident_single_snapshot
+                ? std::optional<std::size_t>(training_state.parameter_version) : std::nullopt);
             batches.push_back(prepareCrowdBatch(
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,

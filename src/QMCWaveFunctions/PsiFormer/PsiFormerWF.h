@@ -370,6 +370,13 @@ public:
   /// Report the prepared numerical backend used for this clone family's products.
   bool usesAcceleratorParameterProducts() const noexcept override;
 
+  /// Prove exact current FULL cache reuse for a sole-factor retained ENERGY replay.
+  bool canReuseFullSpatialReplay(const ParticleSet& live,
+                                const ParticleSet& saved,
+                                std::size_t expected_version,
+                                double expected_log,
+                                double expected_phase) const;
+
   /// Copy the complete native vector under the shared model lock.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 

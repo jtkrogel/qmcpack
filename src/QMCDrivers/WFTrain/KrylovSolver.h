@@ -104,7 +104,33 @@ KrylovSolveResult solveRestartedGMRES(
     const StructuredParameterVectorConstView* warm_start = nullptr);
 
 /// Return the stable diagnostic name of one Krylov stop reason.
-const char* krylovStopReasonName(KrylovStopReason reason) noexcept;
+inline const char* krylovStopReasonName(KrylovStopReason reason) noexcept
+{
+  switch (reason)
+  {
+  case KrylovStopReason::CONVERGED:
+    return "converged";
+  case KrylovStopReason::ZERO_RIGHT_HAND_SIDE:
+    return "zero_right_hand_side";
+  case KrylovStopReason::ITERATION_LIMIT:
+    return "iteration_limit";
+  case KrylovStopReason::OPERATOR_APPLICATION_LIMIT:
+    return "operator_application_limit";
+  case KrylovStopReason::TIME_LIMIT:
+    return "time_limit";
+  case KrylovStopReason::STAGNATED:
+    return "stagnated";
+  case KrylovStopReason::NON_POSITIVE_CURVATURE:
+    return "non_positive_curvature";
+  case KrylovStopReason::NON_HERMITIAN_ACTION:
+    return "non_hermitian_action";
+  case KrylovStopReason::NONFINITE_RESULT:
+    return "nonfinite_result";
+  case KrylovStopReason::BREAKDOWN:
+    return "breakdown";
+  }
+  return "unknown";
+}
 
 } // namespace qmcplusplus::wftrain
 

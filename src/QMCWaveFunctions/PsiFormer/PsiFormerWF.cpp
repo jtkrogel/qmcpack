@@ -9229,6 +9229,65 @@ bool PsiFormerWF::acceptedStateMatches(const ParticleSet& particles,
       static_cast<std::uint64_t>(accepted_state_requirement_) >= static_cast<std::uint64_t>(requirement);
 }
 
+// Validate replay equality without evaluating, synchronizing, or publishing any state.
+bool PsiFormerWF::canReuseFullSpatialReplay(const ParticleSet& live,
+                                           const ParticleSet& saved,
+                                           std::size_t expected_version,
+                                           double expected_log,
+                                           double expected_phase) const
+{
+  PsiFormerReadTransaction transaction(*model_state_);
+  const auto count = static_cast<std::size_t>(live.getTotalNum());
+  if (live.R.size() != count || saved.R.size() != count ||
+      live.GroupID.size() != count || saved.GroupID.size() != count)
+    return false;
+  if (transaction.parameterVersion() != expected_version || observed_parameter_version_ != expected_version ||
+      has_proposal_ || proposal_origin_ != ProposalOrigin::NONE || restore_validation_pending_ ||
+      model_state_->planned_single_transaction_count.load(std::memory_order_acquire) != 0 ||
+      model_state_->planned_selected_transaction_count.load(std::memory_order_acquire) != 0 ||
+      !acceptedStateMatches(live, expected_version, AcceptedStateRequirement::FULL_SPATIAL) ||
+      !isCoherentPhysicalValue(transaction.state(), current_sign_, log_value_, live) ||
+      !walkerBufferScalarIsFinite(expected_log) || !walkerBufferScalarIsFinite(expected_phase) ||
+      std::real(log_value_) != expected_log || std::imag(log_value_) != expected_phase ||
+      live.isSpinor() || saved.isSpinor() || live.getTotalNum() != saved.getTotalNum() ||
+      live.groups() != saved.groups() || live.isSameMass() != saved.isSameMass() ||
+      live.get_mass_by_group().size() != saved.get_mass_by_group().size() ||
+      live.G.size() != count || saved.G.size() != count || live.L.size() != count || saved.L.size() != count ||
+      live.spins.size() != count || saved.spins.size() != count ||
+      live.Z.size() != count || saved.Z.size() != count ||
+      accepted_gradient_.size() != count || accepted_laplacian_.size() != count)
+    return false;
+  for (int group = 0; group < live.groups(); ++group)
+    if (live.first(group) != saved.first(group) || live.last(group) != saved.last(group))
+      return false;
+  for (std::size_t group = 0; group < live.get_mass_by_group().size(); ++group)
+    if (!walkerBufferScalarIsFinite(live.get_mass_by_group()[group]) ||
+        !walkerBufferScalarIsFinite(saved.get_mass_by_group()[group]) ||
+        live.get_mass_by_group()[group] != saved.get_mass_by_group()[group])
+      return false;
+  for (std::size_t electron = 0; electron < count; ++electron)
+  {
+    if (!walkerBufferScalarIsFinite(live.spins[electron]) || !walkerBufferScalarIsFinite(saved.spins[electron]) ||
+        live.spins[electron] != saved.spins[electron] || live.GroupID[electron] != saved.GroupID[electron] ||
+        !walkerBufferScalarIsFinite(live.Z[electron]) || !walkerBufferScalarIsFinite(saved.Z[electron]) ||
+        live.Z[electron] != saved.Z[electron] || !walkerBufferScalarIsFinite(live.L[electron]) ||
+        !walkerBufferScalarIsFinite(saved.L[electron]) || !walkerBufferScalarIsFinite(accepted_laplacian_[electron]) ||
+        live.L[electron] != saved.L[electron] || live.L[electron] != accepted_laplacian_[electron])
+      return false;
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+      if (!walkerBufferScalarIsFinite(live.R[electron][dimension]) ||
+          !walkerBufferScalarIsFinite(saved.R[electron][dimension]) ||
+          live.R[electron][dimension] != saved.R[electron][dimension] ||
+          !walkerBufferScalarIsFinite(live.G[electron][dimension]) ||
+          !walkerBufferScalarIsFinite(saved.G[electron][dimension]) ||
+          !walkerBufferScalarIsFinite(accepted_gradient_[electron][dimension]) ||
+          live.G[electron][dimension] != saved.G[electron][dimension] ||
+          live.G[electron][dimension] != accepted_gradient_[electron][dimension])
+        return false;
+  }
+  return true;
+}
+
 // Accumulate only this component's persisted derivatives into the TWF totals.
 void PsiFormerWF::accumulateAcceptedSpatial(ParticleSet::ParticleGradient& gradient,
                                             ParticleSet::ParticleLaplacian& laplacian) const
