@@ -11,6 +11,9 @@
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCHamiltonians/QMCHamiltonian.h"
+#include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCHamiltonians/CoulombPotential.h"
 #include "SimulationCell.h"
 #include "io/hdf/hdf_archive.h"
 #include <chrono>
@@ -114,5 +117,31 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   external->storeXMLNode(external_definition.getRoot());
   TrainingWaveFunctionBinding external_binding(*external, particles, {256, 65536, 16}, comm);
   CHECK_THROWS(external_binding.modelIdentity());
+  Libxml2Document global_spo_definition;
+  REQUIRE(global_spo_definition.parseFromString("<wavefunction><determinant sposet='global_spo'/></wavefunction>"));
+  auto global_spo = prototype.makeClone(particles);
+  global_spo->storeXMLNode(global_spo_definition.getRoot());
+  TrainingWaveFunctionBinding global_spo_binding(*global_spo, particles, {256, 65536, 16}, comm);
+  CHECK_THROWS(global_spo_binding.modelIdentity());
+
+  ParticleSet ions(cell);
+  ions.setName("ion0");
+  ions.create({1});
+  ions.R[0] = {0.0, 0.0, 1.5};
+  auto& ion_species = ions.getSpeciesSet();
+  ion_species.addSpecies("H");
+  ion_species(ion_species.addAttribute("charge"), 0) = 1.0;
+  ions.resetGroups();
+  QMCHamiltonian hamiltonian;
+  hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  hamiltonian.addOperator(std::make_unique<CoulombPotential>(ions, particles, true), "IonElec");
+  binding.setHamiltonian(hamiltonian);
+  const auto physics = binding.modelIdentity();
+  particles.R[0][0] += 0.2;
+  binding.setHamiltonian(hamiltonian);
+  CHECK(binding.modelIdentity() == physics); // Electron coordinates are sampler state.
+  ions.R[0][0] += 0.2;
+  binding.setHamiltonian(hamiltonian);
+  CHECK(binding.modelIdentity() != physics);
 }
 }

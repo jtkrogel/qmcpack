@@ -1326,10 +1326,14 @@ void WFTrainBatched::process(xmlNodePtr node)
     if (providers.empty() && !complex_training_component_)
     {
       using O = WFTrainDriverInput::Optimizer;
+      const auto optimizer = training_input_.getOptimizer();
+      if (optimizer == O::KFAC)
+        throw UniformCommunicateError("Conventional-only training has no affine observations required by KFAC");
       if (training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
-          (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD) ||
+          (!isFirstOrder(optimizer) && optimizer != O::STOCHASTIC_RECONFIGURATION &&
+           optimizer != O::MINIMUM_STEP_SR && optimizer != O::SPRING) ||
           population_.get_golden_hamiltonian().hasPhysicalNLPP())
-        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY Adam/plain SGD with fixed-Slater J1/J2");
+        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY first-order/SR/minSR/SPRING with fixed-Slater J1/J2");
       if (!training_input_.getLegacyMaximumParameters() || !training_input_.getLegacyDerivativeScratchBytes())
         throw UniformCommunicateError("Conventional training requires positive legacy_maximum_parameters and legacy_derivative_scratch_bytes");
       if (training_input_.getWeightDecay() != 0)
@@ -2249,10 +2253,9 @@ void WFTrainBatched::run()
           {
             const auto snapshot_bytes = checkedMemoryMultiply(
                 conventional_parameters->values.capacity(), sizeof(double));
-            storage_diagnostics.derivative_owner_bytes = checkedMemoryAdd(
-                storage_diagnostics.derivative_owner_bytes, snapshot_bytes);
-            storage_diagnostics.retained_numeric_bytes = checkedMemoryAdd(
-                storage_diagnostics.retained_numeric_bytes, snapshot_bytes);
+            // This outer shared owner survives producer/factor construction;
+            // charge it once alongside other retained outer-owner allocations.
+            retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes, snapshot_bytes);
           }
           if (complex_training && storage_diagnostics.retained_numeric_bytes != complex_expected_prepared_bytes)
             throw std::logic_error("WFTrainBatched: paired prepared capacity differs from exact preallocation admission");
