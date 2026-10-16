@@ -8,5 +8,10 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
                      $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_sj.xml"
                      --restart --preflight)
     set_tests_properties(short-H2-ae-conventional-wftrain-sj PROPERTIES TIMEOUT 300 PROCESSORS 1)
+    add_test(NAME short-H2-ae-conventional-wftrain-j3
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_sj_training.py"
+                     $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_sj_j3.xml"
+                     --companion-optimizer sr --restart)
+    set_tests_properties(short-H2-ae-conventional-wftrain-j3 PROPERTIES TIMEOUT 300 PROCESSORS 1)
   endif()
 endif()
