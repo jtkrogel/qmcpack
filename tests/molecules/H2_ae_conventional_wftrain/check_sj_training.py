@@ -382,8 +382,15 @@ def main():
                     serialized = serialized.decode()
                 exported = ET.fromstring(serialized)
                 coefficients = exported.find(".//sposet/coefficient")
-                assert coefficients.attrib == fixed.attrib, model
-                assert coefficients.text.split() == fixed.text.split(), model
+                if fixed is None:
+                    assert args.periodic_heg and coefficients is None, model
+                    def fixed_spo_definition(node):
+                        return [(child.tag, child.attrib, (child.text or "").split()) for child in node.iter()]
+                    assert fixed_spo_definition(exported.find("sposet_collection")) == fixed_spo_definition(
+                        tree.find("wavefunction/sposet_collection")), model
+                else:
+                    assert coefficients.attrib == fixed.attrib, model
+                    assert coefficients.text.split() == fixed.text.split(), model
                 if orbital_model:
                     assert exported.find(".//rotated_sposet").attrib == tree.find(".//rotated_sposet").attrib
                     assert not exported.findall(".//sposet[@optimize='yes']"), model
