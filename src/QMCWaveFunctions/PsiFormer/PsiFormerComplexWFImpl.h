@@ -28,6 +28,46 @@ struct PsiFormerComplexWF::Impl
    */
   struct GpuLane
   {
+    /// Paired inference admits explicit forward VGL only; the legacy REAL selector is not applicable.
+    static psiformer::device::TargetVglPreparation configuredPreparation()
+    {
+      const auto selection = psiformer::device::parseDeviceTargetSelection(
+          std::getenv("PSIFORMER_GPU_TARGET_SELECTION"));
+      if (selection.first || selection.second)
+        throw std::invalid_argument("Complex GPU inference requires explicit VGL targets, not automatic selection");
+      for (const char* name : {"PSIFORMER_GPU_KINETIC_TARGETS", "PSIFORMER_GPU_LIFTED_CHANNELS",
+          "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
+          "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES",
+          "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES"})
+        if (std::getenv(name))
+          throw std::invalid_argument(std::string("Complex GPU inference does not support ") + name);
+      // Keep the existing decimal-positive convention, but reject SIZE_MAX as an unbounded paired cap.
+      const auto positive = [](const char* name) -> std::size_t {
+        const char* value = std::getenv(name);
+        if (!value)
+          return 0;
+        std::size_t result = 0;
+        if (!*value)
+          throw std::invalid_argument(std::string(name) + " requires a positive finite decimal integer");
+        for (const char* digit = value; *digit; ++digit)
+        {
+          if (*digit < '0' || *digit > '9' ||
+              result > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+            throw std::invalid_argument(std::string(name) + " requires a positive finite decimal integer");
+          result = result * 10 + (*digit - '0');
+        }
+        if (!result || result == std::numeric_limits<std::size_t>::max())
+          throw std::invalid_argument(std::string(name) + " requires a positive finite decimal integer");
+        return result;
+      };
+      const auto targets = positive("PSIFORMER_GPU_VGL_TARGETS");
+      const auto bytes = positive("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES");
+      const auto work = positive("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET");
+      if (targets ? (!bytes || !work) : (bytes || work))
+        throw std::invalid_argument("Complex GPU VGL targets require explicit K and both byte/work limits");
+      return {targets, bytes, work};
+    }
+
     /// Check the complete owner sum before allocating the image or either graph.
     static std::unique_ptr<GpuLane> prepare(const psiformer::PsiFormerExecutionPlan& plan,
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
@@ -36,29 +76,39 @@ struct PsiFormerComplexWF::Impl
       using namespace psiformer::device;
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
+      const auto preparation = configuredPreparation();
       const auto value = estimateComplexValueCost(plan, 1);
-      const auto spatial = estimateComplexSpatialCost(plan, 1);
+      const auto spatial = preparation.max_targets
+          ? estimateComplexSpatialTargetCost(plan, preparation.max_targets) : estimateComplexSpatialCost(plan, 1);
+      const auto work = preparation.max_targets
+          ? estimateHeadFreeTargetPrefixCost(plan, preparation.max_targets).charged_scalar_work_units : 0;
+      if (preparation.max_targets && (spatial.device_bytes > preparation.device_workspace_budget_bytes ||
+                                     work > preparation.scalar_work_budget))
+        throw std::length_error("Complex GPU target VGL exceeds its explicit owner byte/work limits");
       const auto bytes = psiformer::spatial_detail::checkedAdd(value.device_bytes, spatial.device_bytes,
                                                              "Complex GPU lane bytes overflow");
       if (bytes > limit)
-        throw std::length_error("Complex GPU VALUE+FULL lane exceeds its explicit device byte cap");
+        throw std::length_error("Complex GPU VALUE+spatial lane exceeds its explicit device byte cap");
       constexpr auto staging_per_electron = 3 * sizeof(double) + 5 * sizeof(cuDoubleComplex) + 4 * sizeof(C);
       const auto host = psiformer::spatial_detail::checkedAdd(
           psiformer::spatial_detail::checkedAdd(value.host_bytes, spatial.host_bytes, "Complex GPU host bytes overflow"),
           psiformer::spatial_detail::checkedAdd(sizeof(ComplexValueResult),
               psiformer::spatial_detail::checkedProduct(staging_per_electron, plan.modelShape().electrons(), "Complex GPU staging overflow"),
               "Complex GPU staging overflow"), "Complex GPU host bytes overflow");
-      return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial, bytes, host));
+      return std::unique_ptr<GpuLane>(new GpuLane(plan, parameters, nuclei, version, value, spatial,
+                                                preparation, work, bytes, host));
     }
 
     /// Prepare fixed host staging and two qualified numeric owners, never a CPU tape.
     GpuLane(const psiformer::PsiFormerExecutionPlan& plan, const std::vector<double>& parameters,
         const std::vector<double>& nuclei, std::size_t version,
         psiformer::device::ComplexValueCost value_cost, psiformer::device::ComplexSpatialCost spatial_cost,
-        std::size_t bytes, std::size_t host)
+        psiformer::device::TargetVglPreparation preparation, std::size_t work, std::size_t bytes, std::size_t host)
         : blas(queue), image(psiformer::device::PreparedDeviceModel::preparePairedComplexValue(plan, parameters, nuclei, version)),
           value(psiformer::device::PreparedDeviceComplexValue::prepare(image, 1, queue, blas, value_cost.device_bytes)),
-          full(psiformer::device::PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, spatial_cost.device_bytes)),
+          full(preparation.max_targets
+              ? psiformer::device::PreparedDeviceComplexSpatial::prepare(image, queue, blas, preparation)
+              : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, spatial_cost.device_bytes)),
           positions(3 * plan.modelShape().electrons()), amplitude(1), gradient(positions.size()),
           laplacian(plan.modelShape().electrons()), ratio(laplacian.size()), converted(4 * laplacian.size()),
           device_bytes(bytes), host_bytes(host)
@@ -69,6 +119,11 @@ struct PsiFormerComplexWF::Impl
               sizeof(C) * converted.capacity();
       if (actual_host != host_bytes)
         throw std::logic_error("Complex GPU host capacities differ from checked preparation");
+      app_log() << "  Complex PsiFormer GPU inference prepared: mode="
+                << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
+                << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
+                << ", shared_host_numeric_bytes=" << host << ", request_scalar_work=" << work
+                << "; shared_image_and_vendor_bytes_excluded=yes" << std::endl;
     }
 
     compute::Queue<PlatformKind::CUDA> queue;

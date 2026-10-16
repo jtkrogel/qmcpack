@@ -1,10 +1,23 @@
-# CPU-only profile qualification: no CUDA/HIP launcher, runtime device or trained assets.
+# CPU checks need no device; explicit paired GPU target checks use the existing resource launcher.
 add_test(NAME deterministic-psiformer-independent-twist-workflow-unit
          COMMAND ${Python3_EXECUTABLE}
                  ${PROJECT_SOURCE_DIR}/tests/scripts/test_psiformer_twist_workflow.py)
 set_tests_properties(deterministic-psiformer-independent-twist-workflow-unit PROPERTIES
                      TIMEOUT 30 LABELS "deterministic;psiformer;cpu;workflow")
 if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION)
+  if(ENABLE_CUDA AND NOT QMC_CUDA2HIP)
+    foreach(variant complex_gamma complex_twist)
+      set(test_name deterministic-LiH-paired-${variant}-gpu-target-xml)
+      add_test(NAME ${test_name}
+               COMMAND ${QMC_GPU_TEST_LAUNCHER} ${Python3_EXECUTABLE}
+                       ${CMAKE_CURRENT_SOURCE_DIR}/check_gpu_target_xml.py
+                       --binary $<TARGET_FILE:qmcpack> --input ${CMAKE_CURRENT_SOURCE_DIR}/${variant}.xml
+                       --output ${CMAKE_CURRENT_BINARY_DIR}/gpu_target_${variant})
+      SET_TEST_GPU_RESOURCES(${test_name})
+      set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1"
+                           TIMEOUT 300 LABELS "deterministic;psiformer;gpu;periodic;complex")
+    endforeach()
+  endif()
   add_test(NAME deterministic-LiH-psiformer-cpu-twist-workflow-restart
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_twist_workflow_restart.py
                    --binary $<TARGET_FILE:qmcpack>

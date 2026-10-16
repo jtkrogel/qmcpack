@@ -29,8 +29,10 @@
 #endif
 #include <algorithm>
 #include <complex>
+#include <cstdlib>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -42,6 +44,51 @@ namespace ps = psiformer;
 namespace fixture = testing::psiformer;
 using C = std::complex<double>;
 constexpr std::size_t clone_cap = 8 * 1024 * 1024;
+
+#ifdef ENABLE_CUDA
+/// Keep per-test process controls isolated, including restoration of preexisting developer settings.
+class ScopedComplexGpuControls
+{
+public:
+  /// Save and clear only the explicitly consumed paired inference controls.
+  ScopedComplexGpuControls()
+  {
+    for (const auto* name : names)
+    {
+      const char* value = std::getenv(name);
+      saved.emplace_back(value ? std::optional<std::string>(value) : std::nullopt);
+      ::unsetenv(name);
+    }
+  }
+
+  /// Restore the caller's environment even when a Catch assertion aborts a section.
+  ~ScopedComplexGpuControls()
+  {
+    for (std::size_t i = 0; i < saved.size(); ++i)
+      if (saved[i])
+        ::setenv(names[i], saved[i]->c_str(), 1);
+      else
+        ::unsetenv(names[i]);
+  }
+
+  /// Set one strict decimal or policy spelling before constructing a shared model.
+  void set(const char* name, const std::string& value) { REQUIRE(::setenv(name, value.c_str(), 1) == 0); }
+
+  /// Select the exact target profile without invoking the legacy REAL automatic planner.
+  void target(std::size_t k, std::size_t bytes, std::size_t work)
+  {
+    set("PSIFORMER_GPU_VGL_TARGETS", std::to_string(k));
+    set("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES", std::to_string(bytes));
+    set("PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET", std::to_string(work));
+  }
+
+  const std::vector<const char*> names{"PSIFORMER_GPU_VGL_TARGETS", "PSIFORMER_GPU_TARGET_WORKSPACE_BYTES",
+      "PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET", "PSIFORMER_GPU_TARGET_SELECTION", "PSIFORMER_GPU_KINETIC_TARGETS",
+      "PSIFORMER_GPU_LIFTED_CHANNELS", "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
+      "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES"};
+  std::vector<std::optional<std::string>> saved;
+};
+#endif
 
 /// Count any forbidden device-readiness inspection made by profile admission.
 class AdmissionReadiness final : public PsiFormerAcceleratorReadinessProvider
@@ -1429,6 +1476,125 @@ TEST_CASE("PsiFormer complex GPU inference shares one capped lane without CPU ta
     gpu_p.R[0] = original;
     gpu_p.update();
     CHECK_NOTHROW(evaluate(gpu, gpu_p));
+  }
+}
+
+TEST_CASE("PsiFormer explicit paired GPU target lane preserves admission and clone ownership",
+          "[wavefunction][psiformer][complex_gpu_target_inference]")
+{
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  {
+    WARN("NOT_RUN: paired GPU target binding requires an available HIP device");
+    return;
+  }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  {
+    WARN("NOT_RUN: paired GPU target binding requires an available CUDA device");
+    return;
+  }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto lattice = cell();
+  const SimulationCell simulation_cell(lattice);
+  for (const auto twist : {std::array<double, 3>{}, std::array<double, 3>{.17, -.11, .07}})
+  {
+    auto cpu_p = electrons(simulation_cell), gpu_p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+    auto source = ions(simulation_cell);
+    const auto initialized = parameters();
+    ps::ExecutionEnvironment env;
+    env.boundary = ps::BoundaryCondition::PERIODIC;
+    env.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    env.periodic_axes = {true, true, true};
+    env.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    env.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    for (int a = 0; a < 3; ++a)
+      for (int d = 0; d < 3; ++d)
+        env.lattice_vectors[a][d] = lattice.R(a, d);
+    const auto plan = ps::PsiFormerExecutionPlan::fromParameters(initialized, initialized.model_shape, env);
+    const auto value_cost = dev::estimateComplexValueCost(plan, 1);
+    const auto spatial_cost = dev::estimateComplexSpatialTargetCost(plan, 3);
+    const auto work = dev::estimateHeadFreeTargetPrefixCost(plan, 3).charged_scalar_work_units;
+    const auto exact = value_cost.device_bytes + spatial_cost.device_bytes;
+
+    // Controls unsupported by this forward-only lane fail before image/owner allocation; CPU is isolated.
+    for (const char* name : {"PSIFORMER_GPU_KINETIC_TARGETS", "PSIFORMER_GPU_LIFTED_CHANNELS",
+        "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
+        "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES"})
+    {
+      controls.set(name, "1");
+      const auto before = metrics.snapshot();
+      CHECK_THROWS_AS(PsiFormerComplexWF("unsupported", initialized, gpu_p, source, clone_cap, twist, exact), std::invalid_argument);
+      CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+      ::unsetenv(name);
+    }
+    controls.set("PSIFORMER_GPU_TARGET_SELECTION", "vgl");
+    CHECK_NOTHROW(PsiFormerComplexWF("cpuIsolated", initialized, cpu_p, source, clone_cap, twist));
+    const auto before_reject = metrics.snapshot();
+    CHECK_THROWS_AS(PsiFormerComplexWF("selection", initialized, gpu_p, source, clone_cap, twist, exact), std::invalid_argument);
+    CHECK(metrics.snapshot().allocation_calls == before_reject.allocation_calls);
+    controls.set("PSIFORMER_GPU_TARGET_SELECTION", "off");
+    controls.target(3, spatial_cost.device_bytes, work);
+    CHECK_THROWS_AS(PsiFormerComplexWF("sumCap", initialized, gpu_p, source, clone_cap, twist, exact-1), std::length_error);
+    controls.target(3, spatial_cost.device_bytes-1, work);
+    CHECK_THROWS_AS(PsiFormerComplexWF("ownerCap", initialized, gpu_p, source, clone_cap, twist, exact), std::length_error);
+    controls.target(3, spatial_cost.device_bytes, work-1);
+    CHECK_THROWS_AS(PsiFormerComplexWF("workCap", initialized, gpu_p, source, clone_cap, twist, exact), std::length_error);
+    controls.target(3, spatial_cost.device_bytes, work);
+    for (const auto* spelling : {"0", "", "3x"})
+    {
+      controls.set("PSIFORMER_GPU_VGL_TARGETS", spelling);
+      CHECK_THROWS_AS(PsiFormerComplexWF("malformed", initialized, gpu_p, source, clone_cap, twist, exact), std::invalid_argument);
+    }
+    controls.target(3, spatial_cost.device_bytes, work);
+    controls.set("PSIFORMER_GPU_TARGET_WORKSPACE_BYTES", std::to_string(std::numeric_limits<std::size_t>::max()));
+    CHECK_THROWS_AS(PsiFormerComplexWF("unbounded", initialized, gpu_p, source, clone_cap, twist, exact), std::invalid_argument);
+    CHECK(metrics.snapshot().allocation_calls == before_reject.allocation_calls);
+
+    controls.target(3, spatial_cost.device_bytes, work);
+    PsiFormerComplexWF cpu("cpu", initialized, cpu_p, source, clone_cap, twist);
+    const auto before = metrics.snapshot();
+    PsiFormerComplexWF gpu("gpu", initialized, gpu_p, source, clone_cap, twist, exact);
+    const auto storage = gpu.numericStorage();
+    CHECK(storage.shared_gpu_bytes == exact);
+    CHECK(storage.shared_gpu_host_bytes == value_cost.host_bytes + spatial_cost.host_bytes +
+          sizeof(dev::ComplexValueResult) + 4*(3*sizeof(double)+5*sizeof(cuDoubleComplex)+4*sizeof(C)));
+    CHECK(metrics.snapshot().live_bytes-before.live_bytes == exact+storage.shared_image_bytes);
+    CHECK(storage.allocated_bytes == 4*(sizeof(WaveFunctionComponent::GradType)+sizeof(WaveFunctionComponent::ValueType)));
+    const auto before_clone = metrics.snapshot();
+    auto clone = gpu.makeClone(clone_p);
+    auto& cloned = dynamic_cast<PsiFormerComplexWF&>(*clone);
+    CHECK(cloned.numericStorage().shared_image_identity == storage.shared_image_identity);
+    CHECK(metrics.snapshot().allocation_calls == before_clone.allocation_calls);
+    const auto warm = metrics.snapshot();
+    for (int repeat = 0; repeat < 2; ++repeat)
+    {
+      close(evaluate(gpu, gpu_p), evaluate(cpu, cpu_p));
+      close(evaluate(cloned, clone_p), cpu.get_log_value());
+      for (int e = 0; e < 4; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+          close(gpu_p.G[e][d], cpu_p.G[e][d]);
+        close(gpu_p.L[e], cpu_p.L[e]);
+      }
+      cpu_p.makeMove(3, ParticleSet::PosType{.013, -.017, .011});
+      gpu_p.makeMove(3, ParticleSet::PosType{.013, -.017, .011});
+      WaveFunctionComponent::GradType cpu_g{}, gpu_g{};
+      close(gpu.ratioGrad(gpu_p, 3, gpu_g), cpu.ratioGrad(cpu_p, 3, cpu_g));
+      for (int d = 0; d < 3; ++d)
+        close(gpu_g[d], cpu_g[d]);
+      gpu.restore(3); cpu.restore(3);
+      gpu_p.rejectMove(3); cpu_p.rejectMove(3);
+    }
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    CHECK(gpu.numericStorage().fingerprint == storage.fingerprint);
   }
 }
 #endif
