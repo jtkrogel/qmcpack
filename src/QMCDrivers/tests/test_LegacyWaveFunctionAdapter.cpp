@@ -826,7 +826,7 @@ TEST_CASE("Legacy replay block views share bounded parameter workspace and immut
 }
 
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
-          "[drivers][training][legacy_adapter][multideterminant]")
+          "[drivers][training][legacy_adapter][multideterminant][conventional_binding][mpi]")
 {
   // Hydrogen STO-3G and orbital coefficients from tests/molecules/H4_ae/H4.wfs.xml.
   // Two CSFs/DETS keep this oracle small; the second coefficient is exactly zero.
