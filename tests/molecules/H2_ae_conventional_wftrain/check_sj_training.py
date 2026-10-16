@@ -147,6 +147,8 @@ def main():
                         help="export/import ordinary VMC, fresh training, re-export and exact restart")
     parser.add_argument("--old-new", action="store_true",
                         help="bounded original batched OneShiftOnly versus new Adam integration comparison")
+    parser.add_argument("--periodic-heg", action="store_true",
+                        help="bounded HEG14 Gamma Adam/SR, full model import/restart and periodic identity negatives")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -180,7 +182,12 @@ def main():
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
-    deadline = time.monotonic() + 300 if args.old_new else None
+    if args.periodic_heg:
+        assert args.ranks == 1 and args.threads == 1, "first HEG qualification is bounded 1 MPI x 1 OpenMP"
+        assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
+                        args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
+        args.model_import = True
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg else None
 
     def launch(directory):
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
@@ -226,6 +233,8 @@ def main():
             legacy_vp=None, legacy_reference=None):
         directory = work / label
         directory.mkdir()
+        if args.periodic_heg:
+            samples_per_rank = 8
         tree = ET.parse(fixture)
         # Recipes run in fresh evidence directories, not beside their PP asset.
         # Keep the tracked source untouched; scientific identity uses its bytes.
@@ -361,6 +370,11 @@ def main():
                     assert Path(pseudo.get("href")).read_bytes().decode() in physical, model
                     assert "rule=2;local_channel=1;" in physical and "knots=4;" in physical, model
                     assert pseudo.get("href") in text_value(group["ecp_source_report"][()]), model
+                if args.periodic_heg:
+                    physical = text_value(group["physical_definition"][()])
+                    assert "handler=EwaldHandler3D;" in physical, model
+                    assert "3d-uniform-neutralizing-background+self-v1" in physical, model
+                    assert parameters.size == 10
                 serialized = group["wavefunction_xml"][()]
                 if isinstance(serialized, np.ndarray):
                     serialized = serialized.reshape(-1)[0]
@@ -444,6 +458,14 @@ def main():
         return
 
     adam = run("adam", samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
+    if args.periodic_heg:
+        def sr_controls(tree):
+            limits = {"damping": "0.01", "krylov_maximum_iterations": "32",
+                      "krylov_maximum_operator_applications": "128", "krylov_maximum_seconds": "10",
+                      "krylov_relative_tolerance": "1e-8", "maximum_damping_attempts": "1"}
+            for name, value in limits.items():
+                ET.SubElement(tree.find("qmc/training"), "parameter", name=name).text = value
+        run("sr", optimizer="sr", mutate=sr_controls)
     if args.old_new:
         old_fixture = fixture.with_name("linear_sj.xml")
         old_tree = ET.parse(old_fixture)
@@ -552,6 +574,15 @@ def main():
         run("reject_unsupported_import_driver", parameter_file=exported, vmc=True,
             mutate=lambda tree: tree.find("qmc").set("method", "dmc"),
             reject="parameter_file supports only CPU batched VMC and WFTrain")
+        if args.periodic_heg:
+            for label, name, value in (("cell", "rs", "5.1"), ("cutoff", "LR_dim_cutoff", "7")):
+                def change_periodic_identity(tree, name=name, value=value):
+                    tree.find(f"simulationcell/parameter[@name='{name}']").text = value
+                run(f"reject_changed_{label}_import", parameter_file=exported, vmc=True,
+                    mutate=change_periodic_identity, reject="Conventional model export identity mismatch")
+                run(f"reject_changed_{label}_restart", restart=adam / "sj.s000.last_checkpoint.h5", iterations=3,
+                    mutate=change_periodic_identity,
+                    reject="Training checkpoint stage identity or configuration mismatch")
         if ET.parse(fixture).find("hamiltonian/pairpot/pseudo") is not None:
             source = (fixture.parent / ET.parse(fixture).find("hamiltonian/pairpot/pseudo").get("href")).resolve()
             original = source.read_bytes()
@@ -561,6 +592,8 @@ def main():
                 mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)),
                 reject="Conventional model export identity mismatch")
             assert source.read_bytes() == original
+        if args.periodic_heg:
+            print("PASS: real Gamma HEG14 Adam/SR, 8 samples/update, actual Ewald identity and changed cell/cutoff rejection")
         print("PASS: conventional model import physical VMC reference, fresh training/re-export/re-import, "
               "exact initialized split restart and malformed/unsupported import rejection")
         return
