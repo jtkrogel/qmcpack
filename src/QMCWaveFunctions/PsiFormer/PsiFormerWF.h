@@ -419,13 +419,17 @@ public:
    *
    * Ordinary VJP callers retain only O(P)+O(B).  Directional local-energy
    * actions may explicitly request one O(Q) immutable accepted-grid replay.
+   * replay_only requires capture_jvp_replay and records that grid without any
+   * P-sized workspace or contraction. Coefficients are validated for identity;
+   * the supplied sink remains IDLE and publishes no derivative result.
    */
   std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer>
   makeNonLocalECPDerivativeConsumer(
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       std::size_t maximum_parameter_chunk_size,
-      bool capture_jvp_replay = false) const override;
+      bool capture_jvp_replay = false,
+      bool replay_only = false) const override;
 
   /// Atomically publish one complete, version-matched native vector.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,

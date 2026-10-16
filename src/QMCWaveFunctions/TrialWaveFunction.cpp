@@ -2498,7 +2498,8 @@ TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
     const RefVectorWithLeader<ParticleSet>& p_list,
     std::string_view provider_id,
     std::size_t maximum_parameter_chunk_size,
-    bool capture_jvp_replay)
+    bool capture_jvp_replay,
+    bool replay_only)
 {
   if (wf_list.size() != p_list.size())
     throw std::invalid_argument(
@@ -2560,7 +2561,7 @@ TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
       extractWFCRefList(wf_list, static_cast<int>(component_index));
   return component_list.getLeader().makeNonLocalECPDerivativeConsumer(
       component_list, p_list, maximum_parameter_chunk_size,
-      capture_jvp_replay);
+      capture_jvp_replay, replay_only);
 }
 
 std::unique_ptr<psiformer::DeterminantChannelBatch>

@@ -68,6 +68,7 @@ WaveFunctionComponent::makeNonLocalECPDerivativeConsumer(
     const RefVectorWithLeader<WaveFunctionComponent>&,
     const RefVectorWithLeader<ParticleSet>&,
     std::size_t,
+    bool,
     bool) const
 {
   throw std::runtime_error(

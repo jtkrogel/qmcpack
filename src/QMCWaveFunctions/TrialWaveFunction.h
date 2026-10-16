@@ -196,7 +196,8 @@ public:
       const RefVectorWithLeader<ParticleSet>& p_list,
       std::string_view provider_id,
       std::size_t maximum_parameter_chunk_size,
-      bool capture_jvp_replay = false);
+      bool capture_jvp_replay = false,
+      bool replay_only = false);
 
   /** Select one structured provider and construct its determinant-channel batch. */
   static std::unique_ptr<psiformer::DeterminantChannelBatch>

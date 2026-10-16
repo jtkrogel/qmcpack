@@ -47,6 +47,7 @@
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "Utilities/RunTimeManager.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -65,6 +66,7 @@
 #include <utility>
 #include <vector>
 #ifdef __linux__
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -390,6 +392,28 @@ private:
 };
 #endif
 
+/** Replay capture must never publish a parameter response. */
+class ReplayOnlyECPSink final : public wftrain::ParameterReductionSink
+{
+  void consume(std::size_t, const wftrain::ParameterChunkConstView&) override
+  {
+    throw std::logic_error("WFTrainBatched: replay-only ECP capture emitted a derivative");
+  }
+};
+
+/** Flush allocation intent before entering an owner/factory; no MPI here. */
+void logTrainingAllocation(const char* owner, std::size_t samples, std::size_t parameters,
+                           std::optional<std::size_t> planned_numeric_bytes = std::nullopt)
+{
+  app_log() << "WFTrain allocation before owner=" << owner << " scope=rank0_local"
+            << " samples=" << samples << " parameters=" << parameters << " planned_numeric_bytes=";
+  if (planned_numeric_bytes)
+    app_log() << *planned_numeric_bytes;
+  else
+    app_log() << "unknown";
+  app_log() << " (numeric_intent_not_RSS_or_peak)" << std::endl;
+}
+
 /** Copy live crowd metadata and bind it to a version-checked derivative owner. */
 wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     Crowd& crowd,
@@ -500,10 +524,22 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       TrialWaveFunction::makeStructuredStreamingDerivativeOperator(
           twf_batch, electron_batch, provider_id, batch_ordinal, sample_offset,
           maximum_parameter_chunk_size);
+  bool bounded_cpu_replay = false;
+  for (const auto& component : twfs[0].get().getOrbitals())
+    if (const auto* psiformer = dynamic_cast<const PsiFormerWF*>(component.get()))
+      if (psiformer->parameterSchema().providerId() == provider_id)
+        bounded_cpu_replay = !psiformer->usesAcceleratorParameterProducts();
+  logTrainingAllocation("accepted_ecp_grid_consumer", walkers.size(),
+      batch.derivative_operator->parameterSchema().parameterCount());
+  app_log() << "WFTrain ECP capture batch=" << batch_ordinal << " sample_offset=" << sample_offset
+            << " replay_only=" << bounded_cpu_replay
+            << " planned_parameter_workspace_bytes=" << (bounded_cpu_replay ? "0" : "provider_defined")
+            << " planned_grid_bytes=unknown_until_accepted_traversal" << std::endl;
   auto ecp_consumer =
       TrialWaveFunction::makeStructuredNonLocalECPDerivativeConsumer(
           twf_batch, electron_batch, provider_id,
-          maximum_parameter_chunk_size, capture_ecp_jvp_replay);
+          maximum_parameter_chunk_size, capture_ecp_jvp_replay || bounded_cpu_replay,
+          bounded_cpu_replay);
 
   const wftrain::StructuredParameterSchema& schema =
       batch.derivative_operator->parameterSchema();
@@ -520,25 +556,36 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   const wftrain::VJPCoefficientChannel ecp_channel{
       wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
       wftrain::DerivativeProduct::LOCAL_ENERGY_VJP, coefficient_view, ecp_mask};
-  wftrain::PreparedLocalEnergyVJPCapture ecp_capture(
-      schema, parameter_version, ecp_mask);
+  // CPU preparation retains accepted grids, never one P-vector per snapshot.
+  // Arbitrary weighted/clipped VJPs and JVPs later reuse the streaming owner's
+  // shared scratch on this same grid. Existing accelerator behavior is unchanged.
+  std::unique_ptr<wftrain::PreparedLocalEnergyVJPCapture> ecp_capture;
+  ReplayOnlyECPSink replay_sink;
+  if (!bounded_cpu_replay)
+    ecp_capture = std::make_unique<wftrain::PreparedLocalEnergyVJPCapture>(
+        schema, parameter_version, ecp_mask);
+  wftrain::ParameterReductionSink& ecp_sink = bounded_cpu_replay
+      ? static_cast<wftrain::ParameterReductionSink&>(replay_sink) : *ecp_capture;
 
   const auto ecp_result =
       QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
           hamiltonian_batch, twf_batch, electron_batch, *ecp_consumer,
-          {&ecp_channel, 1}, ecp_capture);
+          {&ecp_channel, 1}, ecp_sink);
   batch.local_energies.reserve(ecp_result.local_energies.size());
   for (const auto energy : ecp_result.local_energies)
     batch.local_energies.emplace_back(energy, 0.0);
-  batch.additive_local_energy_vjp.emplace(ecp_capture.release());
+  if (ecp_capture)
+    batch.additive_local_energy_vjp.emplace(ecp_capture->release());
 
-  if (capture_ecp_jvp_replay)
+  if (capture_ecp_jvp_replay || bounded_cpu_replay)
   {
     auto replay = ecp_consumer->releaseJVPReplay();
     if (replay->gridFingerprint() != ecp_result.grid_fingerprint)
       throw std::logic_error(
           "WFTrainBatched: accepted ECP replay grid identity changed before binding");
     batch.derivative_operator->bindNonLocalECPJVPReplay(std::move(replay));
+    if (bounded_cpu_replay)
+      batch.local_energy_term_mask |= ecp_mask;
   }
   return batch;
 }
@@ -739,6 +786,35 @@ std::size_t currentResidentBytes()
     return resident_pages * static_cast<std::size_t>(page_bytes);
 #endif
   return 0;
+}
+
+/** Collective phase snapshots, not a continuous job peak or numeric owner count. */
+void logTrainingMemoryPhase(Communicate& communicator, std::size_t iteration, const char* phase)
+{
+  double local[2]{static_cast<double>(currentResidentBytes()), 0};
+#ifdef __linux__
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0)
+    local[1] = static_cast<double>(usage.ru_maxrss) * 1024;
+#endif
+  std::vector<double> ranks(2 * communicator.size());
+  communicator.allgather(local, ranks.data(), 2);
+  if (communicator.rank() == 0)
+  {
+    double sum = 0, maximum = 0, high_water_sum = 0, high_water_max = 0;
+    for (int rank = 0; rank < communicator.size(); ++rank)
+    {
+      sum += ranks[2 * rank];
+      maximum = std::max(maximum, ranks[2 * rank]);
+      high_water_sum += ranks[2 * rank + 1];
+      high_water_max = std::max(high_water_max, ranks[2 * rank + 1]);
+    }
+    app_log() << "WFTrain memory iteration=" << iteration << " phase=" << phase
+              << " ranks=" << communicator.size() << " rank0_rss_bytes=" << local[0]
+              << " sum_current_rss_bytes=" << sum << " max_current_rss_bytes=" << maximum
+              << " sum_rank_high_water_bytes=" << high_water_sum
+              << " max_rank_high_water_bytes=" << high_water_max << std::endl;
+  }
 }
 
 /** Enforce a measured per-process boundary guard including opaque heap owners.
@@ -1466,6 +1542,8 @@ void WFTrainBatched::run()
       requirements, complex_training ? wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
                                     : wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
       reduction);
+  logTrainingAllocation("initial_parameter_snapshot", 0, selected_provider_->parameterSchema().parameterCount(),
+      checkedMemoryMultiply(selected_provider_->parameterSchema().parameterCount(), sizeof(double)));
   const auto initial_parameters = selected_provider_->snapshotParameters();
   if (initial_parameters.schema_fingerprint != selected_provider_->parameterSchema().fingerprint() ||
       initial_parameters.values.size() != selected_provider_->parameterSchema().parameterCount())
@@ -1680,6 +1758,11 @@ void WFTrainBatched::run()
     ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
     Timer iteration_wall;
     const auto sample_version = training_state.parameter_version;
+    logTrainingMemoryPhase(*myComm, iteration, "before_sampling");
+    app_log() << "WFTrain allocation before owner=retained_sample_snapshots iteration=" << iteration
+              << " scope=rank0_local blocks=" << num_blocks << " steps_per_block=" << steps_per_block_
+              << " crowds=" << crowds_.size() << " parameters=" << selected_provider_->parameterSchema().parameterCount()
+              << " planned_numeric_bytes=unknown (sample_coordinates_and_scalar_metadata)" << std::endl;
     std::ostringstream iteration_name;
     iteration_name << std::filesystem::path(get_root_name()).filename().string()
                    << ".i" << std::setfill('0') << std::setw(7) << iteration;
@@ -1777,6 +1860,9 @@ void WFTrainBatched::run()
     if (scalar_write_failed)
       throw UniformCommunicateError("WFTrainBatched: failed to write scalar iteration output");
     const double sampling_seconds = iteration_wall.elapsed();
+    logTrainingMemoryPhase(*myComm, iteration, "after_sampling_before_preparation");
+    logTrainingAllocation("prepared_derivative_owners_and_shared_workspace", retained_samples.size(),
+        selected_provider_->parameterSchema().parameterCount());
     wftrain::TrainingIterationResult iteration_result;
     std::optional<ResidentEnergyDiagnostics> resident_diagnostics;
     wftrain::PreparedEnergyGradientStorageDiagnostics storage_diagnostics;
@@ -2091,6 +2177,10 @@ void WFTrainBatched::run()
               "WFTrainBatched: another rank failed while preparing a live training batch");
         }
         enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
+
+        logTrainingMemoryPhase(*myComm, iteration, "after_preparation_before_update");
+        logTrainingAllocation("optimizer_reductions_and_proposal", storage_diagnostics.sample_count,
+            selected_provider_->parameterSchema().parameterCount());
 
         if (isFirstOrder(optimizer_kind) ||
             optimizer_kind == WFTrainDriverInput::Optimizer::STOCHASTIC_RECONFIGURATION)
@@ -2535,6 +2625,7 @@ void WFTrainBatched::run()
     // consuming production quadrature RNG merely to refresh the unchanged ECP state.
     cache_observer.clear();
     stage_state.completed_stage_iterations = iteration_result.completed_iteration;
+    logTrainingMemoryPhase(*myComm, iteration, "after_update");
     enforceResidentBudget(*myComm, training_input_.getMaximumResidentBytes());
 
     if (myComm->rank() == 0)

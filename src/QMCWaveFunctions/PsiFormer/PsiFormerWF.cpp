@@ -3406,24 +3406,28 @@ public:
       std::size_t sample_count,
       std::vector<double> positions,
       std::size_t maximum_parameter_chunk_size,
-      bool capture_jvp_replay)
+      bool capture_jvp_replay,
+      bool replay_only)
       : model_state_(std::move(model_state)),
         schema_(std::move(schema)),
         parameter_version_(parameter_version),
         capture_jvp_replay_(capture_jvp_replay),
+        replay_only_(replay_only),
         sample_count_(sample_count),
         electron_count_(model_state_->execution_plan.modelShape().electrons()),
         positions_(std::move(positions)),
         chunk_plan_(*schema_, parameter_version_, maximum_parameter_chunk_size),
-        score_workspace_(model_state_->numerical_tile_backend ? nullptr : model_state_->direct_score_executor.makeWorkspace()),
-        channel_accumulators_{makeParameterVector(schema_->parameterCount()),
-                              makeParameterVector(schema_->parameterCount()),
-                              makeParameterVector(schema_->parameterCount())},
+        score_workspace_(replay_only_ || model_state_->numerical_tile_backend ? nullptr : model_state_->direct_score_executor.makeWorkspace()),
+        channel_accumulators_{makeParameterVector(replay_only_ ? 0 : schema_->parameterCount()),
+                              makeParameterVector(replay_only_ ? 0 : schema_->parameterCount()),
+                              makeParameterVector(replay_only_ ? 0 : schema_->parameterCount())},
         coefficients_{makeSampleVector(sample_count_),
                       makeSampleVector(sample_count_),
                       makeSampleVector(sample_count_)},
         sample_weight_sums_(makeSampleVector(sample_count_))
   {
+    if (replay_only_ && !capture_jvp_replay_)
+      throw std::invalid_argument("PsiFormer replay-only ECP consumer requires replay capture");
     const std::size_t expected_positions = checkedBatchMemoryMultiply(
         checkedBatchMemoryMultiply(sample_count_, electron_count_,
                                    "PsiFormer ECP reference positions"),
@@ -3433,7 +3437,7 @@ public:
       throw std::invalid_argument(
           "PsiFormer ECP consumer has inconsistent model or reference extents");
 #ifdef ENABLE_CUDA
-    if (model_state_->numerical_tile_backend)
+    if (model_state_->numerical_tile_backend && !replay_only_)
     {
       const auto* backend = dynamic_cast<const psiformer::device::PreparedDeviceBatchBackend*>(
           model_state_->numerical_tile_backend.get());
@@ -3509,7 +3513,7 @@ public:
     if (context.grid_fingerprint == 0)
       throw std::invalid_argument(
           "PsiFormer ECP consumer requires a nonzero accepted-grid fingerprint");
-    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    for (std::size_t channel = 0; !replay_only_ && channel < channels.size(); ++channel)
     {
       const auto& input = channels[channel];
       for (std::size_t sample = 0; sample < sample_count_; ++sample)
@@ -3560,7 +3564,10 @@ public:
     sink_ = &sink;
     try
     {
-      sink_->begin(stream_descriptor_, chunk_plan_, channels);
+      // Replay-only preparation validates the grid but performs no derivative
+      // contraction and leaves the supplied response sink idle.
+      if (!replay_only_)
+        sink_->begin(stream_descriptor_, chunk_plan_, channels);
       state_ = State::ACTIVE;
     }
     catch (...)
@@ -3661,6 +3668,8 @@ public:
                 static_cast<double>(std::imag(ratio))};
           }
 
+          if (replay_only_)
+            continue;
           setVirtualPositions(sample, static_cast<std::size_t>(slice.electronId()),
                               slice.absolutePosition(local_point));
           const pf::DirectScoreResult score = evaluateScoreResponse();
@@ -3708,7 +3717,7 @@ public:
       {
         std::shared_lock state_lock(model_state_->mutex);
         requireBoundVersion();
-        for (std::size_t sample = 0; sample < sample_count_; ++sample)
+        for (std::size_t sample = 0; !replay_only_ && sample < sample_count_; ++sample)
         {
           setReferencePositions(sample);
           const pf::DirectScoreResult score = evaluateScoreResponse();
@@ -3723,7 +3732,9 @@ public:
         }
       }
 
-      if (sample_count_ == 0)
+      if (replay_only_)
+      {} // Only releaseJVPReplay publishes this transaction's compact result.
+      else if (sample_count_ == 0)
         sink_->endEmptyBatch();
       else
       {
@@ -3927,7 +3938,7 @@ private:
   wftrain::StreamingDerivativeStorageDiagnostics measureStorageDiagnostics() const
   {
     const std::size_t parameter_count = schema_->parameterCount();
-    const std::size_t score_bytes = model_state_->numerical_tile_backend
+    const std::size_t score_bytes = replay_only_ ? 0 : model_state_->numerical_tile_backend
         ? checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(std::size_t{7}, parameter_count,
             "PsiFormer ECP device parameter vectors"), sizeof(double), "PsiFormer ECP device parameter bytes")
         : score_workspace_->scoreStorageBytes();
@@ -3988,7 +3999,7 @@ private:
     }
     else
 #endif
-      workspace_bytes = score_workspace_->vectorStorageBytes();
+      workspace_bytes = score_workspace_ ? score_workspace_->vectorStorageBytes() : 0;
     const std::size_t parameter_bytes = checkedBatchMemoryAdd(
         score_bytes, channel_bytes, "PsiFormer ECP parameter scratch");
     const std::size_t retained_bytes = checkedBatchMemoryAdd(
@@ -4047,6 +4058,7 @@ private:
   std::shared_ptr<const wftrain::StructuredParameterSchema> schema_;
   std::size_t parameter_version_      = 0;
   bool capture_jvp_replay_            = false;
+  bool replay_only_                   = false;
   std::size_t batch_ordinal_          = 0;
   std::size_t sample_offset_          = 0;
   std::size_t sample_count_           = 0;
@@ -6760,7 +6772,8 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
     const RefVectorWithLeader<ParticleSet>& p_list,
     std::size_t maximum_parameter_chunk_size,
-    bool capture_jvp_replay) const
+    bool capture_jvp_replay,
+    bool replay_only) const
 {
   if (this != &wfc_list.getLeader())
     throw std::invalid_argument(
@@ -6826,7 +6839,7 @@ PsiFormerWF::makeNonLocalECPDerivativeConsumer(
   return std::make_unique<PsiFormerNonLocalECPDerivativeConsumer>(
       model_state_, structured_parameter_schema_, parameter_version,
       sample_count, std::move(positions), maximum_parameter_chunk_size,
-      capture_jvp_replay);
+      capture_jvp_replay, replay_only);
 }
 
 void PsiFormerWF::isolateParameterState()

@@ -238,7 +238,8 @@ public:
       const RefVectorWithLeader<WaveFunctionComponent>& wfc_list,
       const RefVectorWithLeader<ParticleSet>& p_list,
       std::size_t maximum_parameter_chunk_size,
-      bool capture_jvp_replay = false) const;
+      bool capture_jvp_replay = false,
+      bool replay_only = false) const;
 
   /** Construct a determinant-resolved batch for bounded overlap objectives.
    *

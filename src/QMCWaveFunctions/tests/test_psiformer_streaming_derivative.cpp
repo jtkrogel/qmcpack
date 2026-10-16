@@ -1143,7 +1143,7 @@ TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
     std::vector<DerivativeValue> score, kinetic, complete;
     wftrain::StreamingDerivativeStorageDiagnostics storage;
   };
-  const auto run = [&](std::size_t k) {
+  const auto run = [&](std::size_t k, bool replay_only = false) {
     const auto bytes = k ? pf::targetKineticWorkspaceStorageRequirement(shape, k) : 0;
     const auto k_text = std::to_string(k), cap_text = std::to_string(bytes);
     ScopedEnvironmentVariable targets("PSIFORMER_CPU_KINETIC_TARGETS", k ? k_text.c_str() : nullptr);
@@ -1184,7 +1184,13 @@ TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
     const auto kinetic_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
     const auto ecp_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
     // Capture the actual accepted value-grid stamps and complete companion ratios.
-    auto consumer = component.makeNonLocalECPDerivativeConsumer(components, particles, 257, true);
+    CHECK_THROWS(component.makeNonLocalECPDerivativeConsumer(components, particles, 257, false, true));
+    auto consumer = component.makeNonLocalECPDerivativeConsumer(components, particles, 257, true, replay_only);
+    if (replay_only)
+    {
+      CHECK(consumer->storageDiagnostics().parameter_scratch_bytes == 0);
+      CHECK(consumer->storageDiagnostics().evaluator_workspace_bytes == 0);
+    }
     wftrain::NonLocalECPDerivativeContext context;
     context.provider_id = op->parameterSchema().providerId(); context.schema_fingerprint = op->parameterSchema().fingerprint();
     context.parameter_version = op->parameterVersion(); context.batch_ordinal = 71; context.sample_offset = 23;
@@ -1215,12 +1221,76 @@ TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
     consumer->consume({batch, {bare.data(), bare.size()}, {ratios.data(), ratios.size()},
         {stamps.data(), stamps.size()}, 0, context.grid_fingerprint});
     consumer->end();
-    op->bindNonLocalECPJVPReplay(consumer->releaseJVPReplay());
+    if (replay_only)
+      CHECK(capture_sink.state() == DerivativeSinkState::IDLE);
+    auto replay = consumer->releaseJVPReplay();
+    CHECK(replay->gridFingerprint() == context.grid_fingerprint);
+    CHECK(replay->points().size() == 2);
+    CHECK(replay->points()[0].complete_ratio == DerivativeValue(ratios[0]));
+    CHECK(replay->points()[1].complete_ratio == DerivativeValue(ratios[1]));
+    op->bindNonLocalECPJVPReplay(std::move(replay));
+    SelectedParameterSink replay_ecp(selected);
+    op->applyVJPs({ecp_channels.data(), ecp_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, replay_ecp);
+    if (!replay_only)
+      for (std::size_t i = 0; i < selected.size(); ++i)
+        checkClose(replay_ecp.results()[0][i], capture_sink.results()[0][i]);
+    // Partition the same two accepted samples into separate statistical batches.
+    // Coefficients remain attached to their samples, including complex/nonuniform
+    // weights; replay cannot be replaced by an unweighted sum of P-vectors.
+    std::vector<DerivativeValue> partitioned_ecp(selected.size());
+    for (std::size_t sample = 0; sample < 2; ++sample)
+    {
+      WaveFunctionComponent& member = sample ? static_cast<WaveFunctionComponent&>(clone) : component;
+      ParticleSet& electron = sample ? e1 : e0;
+      RefVectorWithLeader<WaveFunctionComponent> one_component(member, {member});
+      RefVectorWithLeader<ParticleSet> one_particle(electron, {electron});
+      // The factory must be invoked on this partition's leader.
+      auto& leader = sample ? clone : component;
+      auto partition = leader.makeStreamingDerivativeOperator(one_component, one_particle, 200 + sample, sample, 257);
+      auto capture = leader.makeNonLocalECPDerivativeConsumer(one_component, one_particle, 257, true, true);
+      auto one_context = context;
+      one_context.batch_ordinal = 200 + sample;
+      one_context.sample_offset = sample;
+      one_context.sample_count = 1;
+      one_context.expected_point_count = 1;
+      const std::vector<DerivativeValue> coefficient{a[sample]};
+      const VJPCoefficientChannel channel{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+          coefficientsFor(*partition, coefficient), ecp_mask};
+      SelectedParameterSink idle_sink(selected);
+      capture->begin(one_context, {&channel, 1}, idle_sink);
+      const std::vector<std::size_t> one_offsets{0, 1};
+      const std::vector<VirtualParticleBatch::Segment> one_segments{{0, static_cast<int>(sample)}};
+      const std::vector<ParticleSet::PosType> one_points{points[sample]};
+      const VirtualParticleBatch one_grid(1, one_offsets, one_segments, one_points);
+      capture->consume({one_grid, {bare.data() + sample, 1}, {ratios.data() + sample, 1},
+          {stamps.data(), stamps.size()}, 0, context.grid_fingerprint});
+      capture->end();
+      CHECK(idle_sink.state() == DerivativeSinkState::IDLE);
+      CHECK(capture->storageDiagnostics().parameter_scratch_bytes == 0);
+      partition->bindNonLocalECPJVPReplay(capture->releaseJVPReplay());
+      SelectedParameterSink weighted(selected);
+      partition->applyVJPs({&channel, 1}, wftrain::DerivativeAdjoint::TRANSPOSE, weighted);
+      for (std::size_t i = 0; i < selected.size(); ++i)
+        partitioned_ecp[i] += weighted.results()[0][i];
+    }
+    for (std::size_t i = 0; i < selected.size(); ++i)
+      checkClose(partitioned_ecp[i], replay_ecp.results()[0][i]);
     Snapshot result;
     result.storage = op->storageDiagnostics();
     const auto& storage = result.storage;
     auto shared = component.makeStreamingDerivativeOperator(components, particles, 72, 25, 257);
     CHECK(shared->storageDiagnostics().shared_workspace_identity == storage.shared_workspace_identity);
+    // Retaining 256 statistical snapshots adds only sample owners. Every
+    // parameter workspace belongs to the same bounded execution scratch.
+    std::vector<std::unique_ptr<wftrain::StreamingDerivativeOperator>> snapshots;
+    for (std::size_t block = 0; block < 256; ++block)
+    {
+      snapshots.push_back(component.makeStreamingDerivativeOperator(components, particles, 100 + block, 2 * block, 257));
+      const auto retained = snapshots.back()->storageDiagnostics();
+      CHECK(retained.shared_workspace_identity == storage.shared_workspace_identity);
+      CHECK(retained.parameter_scratch_bytes == storage.parameter_scratch_bytes);
+      CHECK(retained.retained_numeric_bytes - retained.shared_workspace_bytes < p * sizeof(DerivativeValue));
+    }
     const std::vector<VJPCoefficientChannel> channels{
         {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, a), 0},
         {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, c), kinetic_mask},
@@ -1261,7 +1331,7 @@ TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
   const auto full = run(0);
   for (std::size_t k : {std::size_t(1), std::size_t(3)})
   {
-    const auto target = run(k);
+    const auto target = run(k, true);
     for (std::size_t channel = 0; channel < full.transpose.size(); ++channel)
       for (std::size_t i = 0; i < full.transpose[channel].size(); ++i)
       {
