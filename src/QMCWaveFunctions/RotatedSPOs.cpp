@@ -28,6 +28,7 @@ namespace qmcplusplus
 {
 namespace
 {
+/// Reject non-finite rotation payloads even in builds using fast-math.
 bool finiteRotationCoordinate(QMCTraits::ValueType value)
 {
   const auto finite = [](double scalar) {

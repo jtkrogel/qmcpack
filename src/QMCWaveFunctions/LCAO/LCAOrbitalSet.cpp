@@ -27,6 +27,7 @@ namespace qmcplusplus
 {
 namespace
 {
+/// Check serialized/restored coefficients without assuming fast-math finiteness.
 bool finiteRotationCoefficient(QMCTraits::ValueType value)
 {
   const auto finite = [](double scalar) {
@@ -237,7 +238,8 @@ void LCAOrbitalSet::restorePreparedRotationCoefficients(const OffloadValueMatrix
     throw std::invalid_argument("Restored LCAO rotation coefficients have incompatible structure");
   for (std::size_t i = 0; i < accepted.size(); ++i)
   {
-    if (!finiteRotationCoefficient(accepted.data()[i]) || !finiteRotationCoefficient(original.data()[i]))
+    if (!finiteRotationCoefficient(accepted.data()[i]) || !finiteRotationCoefficient(original.data()[i]) ||
+        !finiteRotationCoefficient(C->data()[i]))
       throw std::invalid_argument("Restored LCAO rotation coefficients contain a non-finite value");
     if (original.data()[i] != C_copy->data()[i])
       throw std::invalid_argument("Restored LCAO rotation coefficients changed the original reference bank");
