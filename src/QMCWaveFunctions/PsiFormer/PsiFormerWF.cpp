@@ -18,6 +18,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCDrivers/WFTrain/ResidentEnergySRDiagnostics.h"
+#include <cstdio>
 #include "QMCWaveFunctions/PsiFormer/PsiFormerScoreExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAffineObservation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerKineticExecutor.h"
@@ -1255,6 +1256,12 @@ public:
   std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
   /// Explicit resident ENERGY keeps one existing lane/tapes alive across iterations.
   std::shared_ptr<PsiFormerDerivativeScratch> resident_energy_scratch;
+#ifdef ENABLE_CUDA
+  /// Optimizer workspace dies BEFORE its anchored Session; source diagnostics exclude it.
+  std::unique_ptr<psiformer::device::PreparedDevicePcg> resident_energy_sr_workspace;
+#endif
+  bool resident_energy_sr_reuse = false;
+  bool resident_energy_sr_workspace_started = false;
 };
 
 /** Optimizer metadata shared by every clone of one PsiFormer component.
@@ -11970,7 +11977,11 @@ std::pair<std::size_t, std::size_t> PsiFormerWF::residentEnergySRBudget() const
   const char* device = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES");
   const char* host = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES");
   if (!device && !host)
+  {
+    if (const char* reuse = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE"); reuse && std::string(reuse) != "off")
+      throw std::invalid_argument("Resident ENERGY SR reuse=on requires both caps; reuse must be on or off");
     return {0, 0};
+  }
   const auto parse = [](const char* value) {
     std::size_t bytes = 0;
     if (!value)
@@ -11997,6 +12008,10 @@ std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
 {
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
   using Owner = psiformer::device::PreparedDevicePcg;
+  const char* reuse_control = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE");
+  const bool reuse = reuse_control && std::string(reuse_control) == "on";
+  if (reuse_control && !reuse && std::string(reuse_control) != "off")
+    throw std::invalid_argument("PSIFORMER_GPU_RESIDENT_ENERGY_SR_REUSE must be on or off");
   std::shared_ptr<PsiFormerDerivativeScratch> scratch;
   std::size_t incremental = 0, c3 = 0;
   {
@@ -12025,6 +12040,11 @@ std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
   }
   PsiFormerDerivativeLease lease(*scratch); // Never wait execution while holding Model read.
   std::shared_lock state_lock(model_state_->mutex);
+  model_state_->resident_energy_sr_workspace.reset(); // Explicit stage boundary, never runtime retry.
+  model_state_->resident_energy_sr_workspace_started = false;
+  model_state_->resident_energy_sr_reuse = reuse;
+  if (reuse)
+    app_log() << "Resident ENERGY SR reuse=on: persistent workspace overlaps successor image publication; aggregate peak may increase beyond named caps" << std::endl;
   scratch->device_products->prepareScoreContractions(3, model_state_->model.p.version(), c3);
   std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
   model_state_->resident_energy_scratch = std::move(scratch);
@@ -12034,7 +12054,36 @@ std::size_t PsiFormerWF::prepareResidentEnergySR(std::size_t population,
 #endif
 }
 
-/// Bind sampled positions/weights to one immutable C0 owner, under the physical producer leases.
+/// End-run cleanup waits execution without Model read, after all iteration leases unwind.
+void PsiFormerWF::releaseResidentEnergySRWorkspace() const noexcept
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  try
+  {
+    std::shared_ptr<PsiFormerDerivativeScratch> scratch;
+    {
+      std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
+      scratch = model_state_->resident_energy_scratch;
+    }
+    if (!scratch)
+      return;
+    std::lock_guard execution_lock(scratch->execution_mutex);
+    if (!model_state_->resident_energy_sr_workspace)
+      return;
+    const auto before = scratch->device_products->transferSnapshot();
+    model_state_->resident_energy_sr_workspace.reset();
+    const auto after = scratch->device_products->transferSnapshot();
+    app_log() << "Resident ENERGY SR workspace release cached_owner=1 free_calls=" << after.free_calls - before.free_calls
+              << " allocation_calls=" << after.allocation_calls - before.allocation_calls << std::endl;
+  }
+  catch (...)
+  {
+    std::fputs("Resident ENERGY SR workspace release_failed\n", stderr);
+  }
+#endif
+}
+
+/// Bind sampled positions/weights to the qualified ENERGY owner, under producer leases.
 wftrain::ResidentEnergySRDiagnostics PsiFormerWF::consumeResidentEnergySR(
     const wftrain::StreamingDerivativeOperator& derivative,
     wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
@@ -12060,17 +12109,38 @@ wftrain::ResidentEnergySRDiagnostics PsiFormerWF::consumeResidentEnergySR(
   source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
     auto& session = *source->shared_scratch_->device_products;
     const auto cold = session.transferSnapshot();
-    auto owner = psiformer::device::PreparedDevicePcg::prepareEnergy(session, source->positions_, weights, frozen,
-        derivative.parameterVersion(), damping, budget.first, budget.second); // Cold PER UPDATE, completed C3 preserved.
+    using Owner = psiformer::device::PreparedDevicePcg;
+    const bool reuse = model_state_->resident_energy_sr_reuse;
+    const bool prepared = !reuse || !model_state_->resident_energy_sr_workspace;
+    std::unique_ptr<Owner> ordinary;
+    if (!reuse)
+      ordinary = Owner::prepareEnergy(session, source->positions_, weights, frozen,
+          derivative.parameterVersion(), damping, budget.first, budget.second);
+    else if (!model_state_->resident_energy_sr_workspace)
+    {
+      if (model_state_->resident_energy_sr_workspace_started)
+        throw std::logic_error("Retained ENERGY SR cold preparation failed; explicit stage preparation required");
+      model_state_->resident_energy_sr_workspace_started = true;
+      model_state_->resident_energy_sr_workspace = Owner::prepareRetainedEnergy(session, source->positions_, weights, frozen,
+          derivative.parameterVersion(), damping, budget.first, budget.second);
+    }
+    auto* owner = reuse ? model_state_->resident_energy_sr_workspace.get() : ordinary.get();
     const auto before = session.transferSnapshot();
-    app_log() << "Resident ENERGY SR cold owner device_bytes=" << owner->cost().device_bytes
+    if (reuse)
+      app_log() << "Resident ENERGY SR workspace cold_preparation=" << static_cast<int>(prepared)
+                << " storage_reused=" << static_cast<int>(!prepared) << " ";
+    else
+      app_log() << "Resident ENERGY SR cold owner ";
+    app_log() << "device_bytes=" << owner->cost().device_bytes
               << " host_bytes=" << owner->cost().host_bytes << " P=" << parameters.size()
               << " B=" << weights.size() << " frozen_intervals=" << frozen.size()
               << " uploaded_bytes=" << before.uploaded_bytes - cold.uploaded_bytes
               << " downloaded_bytes=" << before.downloaded_bytes - cold.downloaded_bytes
               << " allocation_calls=" << before.allocation_calls - cold.allocation_calls << std::endl;
-    const auto result = owner->consumeEnergy(derivative.parameterVersion(), generation, parameters, weight, energy,
-        learning_rate, control, candidate);
+    const auto result = reuse ? owner->consumeRetainedEnergy(source->positions_, weights, frozen,
+        derivative.parameterVersion(), generation, parameters, weight, energy, damping, learning_rate, control,
+        budget.first, budget.second, candidate) : owner->consumeEnergy(derivative.parameterVersion(), generation,
+        parameters, weight, energy, learning_rate, control, candidate);
     const auto after = session.transferSnapshot();
     app_log() << "Resident ENERGY SR terminal uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
               << " downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes

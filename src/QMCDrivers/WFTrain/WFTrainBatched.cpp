@@ -1187,6 +1187,16 @@ void WFTrainBatched::run()
   const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
   const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
   const auto resident_sr_budget = resident_sr_budget_;
+  /// Destroy after iteration sources/leases, on normal and exceptional run exit.
+  struct ResidentSRRelease
+  {
+    const PsiFormerWF* provider;
+    ~ResidentSRRelease() noexcept
+    {
+      if (provider)
+        provider->releaseResidentEnergySRWorkspace();
+    }
+  } resident_sr_release{resident_sr_budget.first ? device_provider : nullptr};
   const IndexType num_blocks = qmcdriver_input_.get_max_blocks();
   const int num_iterations = static_cast<int>(training_input_.getIterations());
   bool complex_training = false;

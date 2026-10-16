@@ -234,6 +234,12 @@ private:
   Cost allocatedBytesUnderControl()
   {
     validate();
+    return countAllocatedBytesUnderControl();
+  }
+
+  /// Capacity inspection needs no bound image or runtime call; retained storage stays fixed.
+  Cost countAllocatedBytesUnderControl() const
+  {
     return {add(mul(8, add(direction_.capacity(), action_.capacity())),
                 add(mul(sizeof(DerivativeFiniteStatus), status_.capacity()), session_.score_contraction_->deviceWorkspaceBytes())),
         add(mul(8, add(positions_.capacity(), add(weights_.capacity(), products_.capacity()))),
@@ -276,6 +282,8 @@ private:
   /// Publication/device changes invalidate the entire stamped fixed population.
   void validate()
   {
+    if (!image_)
+      throw std::logic_error("Device SR metric workspace is detached; bind a new retained ENERGY batch");
     session_.validateContractionControl(image_->version());
     if (session_.image_.get() != image_.get() || session_.scoreContractionCapacity() != contraction_capacity_)
       throw std::invalid_argument("Device SR metric image or fixed contraction capacity is stale");

@@ -10,6 +10,7 @@
 #include "PsiFormerDeviceSrMetric.h"
 #include "QMCDrivers/WFTrain/KrylovPcgControl.h"
 #include "QMCDrivers/WFTrain/SrMetricNumerics.h"
+#include <algorithm>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -98,6 +99,29 @@ public:
   {
     std::lock_guard lock(session.mutex_);
     return prepareUnderControl(session, positions, weights, frozen, version, damping, device_cap, host_cap, true);
+  }
+
+  /// Retain exact storage, not an image: the first supplied population is real, never dummy.
+  static std::unique_ptr<PreparedDevicePcg> prepareRetainedEnergy(PreparedDeviceProductSession& session,
+      const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version, double damping,
+      std::size_t device_cap, std::size_t host_cap)
+  {
+    std::lock_guard lock(session.mutex_);
+    try
+    {
+      auto owner = prepareUnderControl(session, positions, weights, frozen, version, damping, device_cap, host_cap, true);
+      owner->retained_ = true;
+      owner->retained_device_cap_ = device_cap;
+      owner->retained_host_cap_ = host_cap;
+      owner->retireUnderControl();
+      return owner;
+    }
+    catch (...)
+    {
+      session.invalidateScoreContraction();
+      throw;
+    }
   }
 
 private:
@@ -194,6 +218,44 @@ public:
       const wftrain::KrylovSolverControl& control, std::vector<double>& candidate)
   {
     std::lock_guard lock(session_.mutex_);
+    return consumeEnergyUnderControl(version, generation, parameters, weight, energy, learning_rate, control, candidate);
+  }
+
+  /// Bind/consume/retire under one lock; neither failure nor publication may pin old P.
+  EnergyResult consumeRetainedEnergy(const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version, std::size_t generation,
+      const std::vector<double>& parameters, double weight, double energy, double damping, double learning_rate,
+      const wftrain::KrylovSolverControl& control, std::size_t device_cap, std::size_t host_cap,
+      std::vector<double>& candidate)
+  {
+    std::lock_guard lock(session_.mutex_);
+    if (!retained_)
+      throw std::invalid_argument("Retained ENERGY consume requires its explicit retained factory");
+    Retirement retirement{*this};
+    try
+    {
+      bindEnergyUnderControl(positions, weights, frozen, version, damping, device_cap, host_cap);
+      const auto result = consumeEnergyUnderControl(version, generation, parameters, weight, energy, learning_rate, control, candidate);
+      if (!result.solve.converged || !result.candidate_ready)
+        failed_ = true;
+      else
+        consumed_ = true;
+      return result;
+    }
+    catch (...)
+    {
+      failed_ = true;
+      session_.invalidateScoreContraction();
+      throw;
+    }
+  }
+
+private:
+  /// Preserve the ordinary ENERGY body/order while its two explicit wrappers own the lock.
+  EnergyResult consumeEnergyUnderControl(std::size_t version, std::size_t generation,
+      const std::vector<double>& parameters, double weight, double energy, double learning_rate,
+      const wftrain::KrylovSolverControl& control, std::vector<double>& candidate)
+  {
     rhs_ready_ = iterate_ready_ = false;
     try
     {
@@ -272,6 +334,7 @@ public:
     }
   }
 
+public:
   /// Explicit diagnostic inspection also permits nonconverged x; not a candidate API.
   void downloadIterate(const IterateReceipt& iterate, std::vector<double>& output)
   {
@@ -298,8 +361,19 @@ public:
   Cost allocatedBytes()
   {
     std::lock_guard lock(session_.mutex_);
-    validate();
-    auto actual = metric_->allocatedBytesUnderControl();
+    // A detached retained owner permits capacity inspection, never numerical/image access.
+    Cost actual;
+    if (retained_ && !metric_->image_)
+    {
+      if (failed_)
+        throw std::logic_error("Device PCG owner failed; re-prepare before further use");
+      actual = metric_->countAllocatedBytesUnderControl();
+    }
+    else
+    {
+      validate();
+      actual = metric_->allocatedBytesUnderControl();
+    }
     for (const auto* buffer : {&x_, &r_, &z_, &p_, &rhs_, &partials_, &dot_})
       actual.device_bytes = Metric::add(actual.device_bytes, checkedDeviceBytes<double>(buffer->capacity()));
     for (const auto* buffer : {&partial_status_, &finite_status_, &dot_status_})
@@ -318,7 +392,9 @@ private:
   PreparedDevicePcg(PreparedDeviceProductSession& session, std::unique_ptr<Metric> metric, double damping, Cost cost, bool energy)
       : session_(session), metric_(std::move(metric)), damping_(damping), cost_(cost),
         parameters_(metric_->image_->plan().parameterCount()),
-        q_(parameters_ / 4096 + (parameters_ % 4096 != 0)), host_status_(q_)
+        q_(parameters_ / 4096 + (parameters_ % 4096 != 0)),
+        electrons_(metric_->image_->plan().modelShape().electrons()), score_capacity_(session.score_capacity_),
+        host_status_(q_), binding_version_(metric_->image_->version())
   {
     for (auto* buffer : {&x_, &r_, &z_, &p_, &rhs_})
       buffer->reserve(parameters_);
@@ -352,6 +428,63 @@ private:
     if (failed_)
       throw std::logic_error("Device PCG owner failed; re-prepare before further use");
     metric_->validate();
+  }
+
+  /// Scope cleanup never waits/rebinds/launches: Session still owns any bound image.
+  void retireUnderControl() noexcept
+  {
+    rhs_ready_ = iterate_ready_ = false;
+    metric_->input_ready_ = metric_->action_ready_ = false;
+    metric_->image_.reset();
+  }
+
+  /// Destroy before unlocking, including failed bind/preflight/consume; never mask an error.
+  struct Retirement
+  {
+    PreparedDevicePcg& owner;
+    ~Retirement() noexcept
+    {
+      owner.session_.invalidateScoreContraction();
+      owner.retireUnderControl();
+    }
+  };
+
+  /// Only the producer may have caught up the healthy fixed-layout Session, BEFORE C3.
+  void bindEnergyUnderControl(const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version, double damping,
+      std::size_t device_cap, std::size_t host_cap)
+  {
+    if (!retained_ || failed_ || metric_->image_ || session_.image_.get() != session_.active_image_.get() ||
+        version != session_.image_->version() || damping != damping_ ||
+        (consumed_ && (binding_version_ == std::numeric_limits<std::size_t>::max() || version != binding_version_ + 1)) ||
+        (!consumed_ && version != binding_version_) ||
+        session_.image_->plan().parameterCount() != parameters_ ||
+        session_.image_->plan().modelShape().electrons() != electrons_ || session_.score_capacity_ != score_capacity_ ||
+        session_.scoreContractionCapacity() != 3 || metric_->contraction_capacity_ != 3 ||
+        positions.size() != metric_->positions_.size() || weights.size() != metric_->weights_.size() || frozen != metric_->frozen_)
+      throw std::invalid_argument("Retained ENERGY SR requires its healthy detached fixed-shape successor batch");
+    session_.validateContractionControl(version); // Already-current image means NO catch-up/C3 invalidation.
+    const auto required = energyRequiredBytes(parameters_, weights.size(), electrons_, 3, frozen.size());
+    if (device_cap != retained_device_cap_ || host_cap != retained_host_cap_ ||
+        required.device_bytes > device_cap || required.host_bytes > host_cap)
+      throw std::length_error("Retained ENERGY SR requires unchanged complete device/host caps");
+    double total = 0;
+    for (double w : weights)
+    {
+      if (!device_math::isFiniteBinary64(w) || w < 0)
+        throw std::invalid_argument("Retained ENERGY SR weights must be finite nonnegative");
+      total += w;
+    }
+    if (!(total > 0) || !device_math::isFiniteBinary64(total))
+      throw std::invalid_argument("Retained ENERGY SR requires finite positive total weight");
+    for (double coordinate : positions)
+      if (!device_math::isFiniteBinary64(coordinate))
+        throw std::invalid_argument("Retained ENERGY SR coordinates must be finite");
+    std::copy(positions.begin(), positions.end(), metric_->positions_.begin());
+    std::copy(weights.begin(), weights.end(), metric_->weights_.begin());
+    metric_->weight_ = total;
+    metric_->image_ = session_.image_; // Same Session's qualified validateSuccessor proves schema/layout stability.
+    binding_version_ = version;
   }
 
   /// Resolve only fixed canonical slots; no host view ever receives this pointer.
@@ -461,7 +594,7 @@ private:
   std::unique_ptr<Metric> metric_;
   double damping_;
   Cost cost_;
-  const std::size_t parameters_, q_;
+  const std::size_t parameters_, q_, electrons_, score_capacity_;
   DeviceBuffer<double> x_, r_, z_, p_, rhs_, partials_, dot_;
   DeviceBuffer<double> energy_partials_;
   DeviceBuffer<std::uint64_t> energy_status_;
@@ -472,6 +605,8 @@ private:
   double host_dot_ = 0;
   DerivativeFiniteStatus host_dot_status_{};
   std::size_t rhs_generation_ = 0, iterate_generation_ = 0;
+  std::size_t binding_version_, retained_device_cap_ = 0, retained_host_cap_ = 0;
+  bool retained_ = false, consumed_ = false;
   bool rhs_ready_ = false, iterate_ready_ = false, failed_ = false;
 };
 } // namespace qmcplusplus::psiformer::device

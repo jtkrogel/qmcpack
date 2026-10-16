@@ -473,6 +473,9 @@ public:
   /// Admit full C0 payload and anchor C3; return only the incremental aggregate peak.
   std::size_t prepareResidentEnergySR(std::size_t population, std::pair<std::size_t, std::size_t> budget) const;
 
+  /// End only this phase's optional optimizer cache, never its shared ENERGY tapes.
+  void releaseResidentEnergySRWorkspace() const noexcept;
+
   /// Consume one immutable physical batch; only an owning host candidate crosses leases.
   wftrain::ResidentEnergySRDiagnostics consumeResidentEnergySR(const wftrain::StreamingDerivativeOperator& derivative,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
