@@ -85,7 +85,8 @@ public:
   const std::vector<const char*> names{"PSIFORMER_GPU_VGL_TARGETS", "PSIFORMER_GPU_TARGET_WORKSPACE_BYTES",
       "PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET", "PSIFORMER_GPU_TARGET_SELECTION", "PSIFORMER_GPU_KINETIC_TARGETS",
       "PSIFORMER_GPU_LIFTED_CHANNELS", "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
-      "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES"};
+      "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES",
+      "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES"};
   std::vector<std::optional<std::string>> saved;
 };
 #endif
@@ -1526,9 +1527,11 @@ TEST_CASE("PsiFormer explicit paired GPU target lane preserves admission and clo
     // Controls unsupported by this forward-only lane fail before image/owner allocation; CPU is isolated.
     for (const char* name : {"PSIFORMER_GPU_KINETIC_TARGETS", "PSIFORMER_GPU_LIFTED_CHANNELS",
         "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
-        "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES"})
+        "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES",
+        "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES"})
     {
       controls.set(name, "1");
+      CHECK_NOTHROW(PsiFormerComplexWF("cpuIsolated", initialized, cpu_p, source, clone_cap, twist));
       const auto before = metrics.snapshot();
       CHECK_THROWS_AS(PsiFormerComplexWF("unsupported", initialized, gpu_p, source, clone_cap, twist, exact), std::invalid_argument);
       CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);

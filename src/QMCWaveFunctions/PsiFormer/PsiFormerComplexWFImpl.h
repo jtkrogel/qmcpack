@@ -38,7 +38,8 @@ struct PsiFormerComplexWF::Impl
       for (const char* name : {"PSIFORMER_GPU_KINETIC_TARGETS", "PSIFORMER_GPU_LIFTED_CHANNELS",
           "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
           "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES",
-          "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES"})
+          "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES",
+          "PSIFORMER_GPU_RESIDENT_ENERGY_SR_HOST_BYTES"})
         if (std::getenv(name))
           throw std::invalid_argument(std::string("Complex GPU inference does not support ") + name);
       // Keep the existing decimal-positive convention, but reject SIZE_MAX as an unbounded paired cap.
