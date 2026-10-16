@@ -268,6 +268,13 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       // estimator/population construction can clone or acquire model resources.
       if (das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
         throw UniformCommunicateError("wavefunction parameter_file supports only CPU batched VMC and WFTrain");
+      if (das.new_run_type == QMCRunType::WF_TRAIN_BATCH)
+      {
+        WFTrainDriverInput input;
+        input.readXML(cur);
+        if (input.getObjective() != WFTrainDriverInput::Objective::ENERGY)
+          throw UniformCommunicateError("wavefunction parameter_file supports conventional ENERGY training only");
+      }
       if (!primaryPsi.extractStructuredParameterProviders().empty() || qmc_system.isSpinor() ||
           qmc_system.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
         throw UniformCommunicateError("wavefunction parameter_file requires a qualified conventional CPU model");
@@ -286,6 +293,13 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
         std::exception_ptr preparation_failure;
         try
         {
+          optimize::VariableSet registration;
+          primaryPsi.checkInVariables(registration);
+          registration.resetIndex();
+          if (registration.size_of_active() > limits.maximum_parameter_count)
+            throw UniformCommunicateError("Conventional parameter_file loader requires " +
+                std::to_string(registration.size_of_active()) + " active parameters; loader limit is " +
+                std::to_string(limits.maximum_parameter_count));
           binding = std::make_unique<wftrain::TrainingWaveFunctionBinding>(primaryPsi, qmc_system, limits, *comm);
           binding->setHamiltonian(primaryH);
         }
