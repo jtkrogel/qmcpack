@@ -48,6 +48,7 @@ struct PsiFormerComplexWF::Impl
         throw std::invalid_argument("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY must be a positive finite decimal integer");
       return result;
     }
+
     /// Paired inference admits explicit forward VGL only; the legacy REAL selector is not applicable.
     static psiformer::device::TargetVglPreparation configuredPreparation()
     {
@@ -223,6 +224,7 @@ struct PsiFormerComplexWF::Impl
       return 1;
 #endif
     }
+
     /// Preserve paired metadata rather than recreating a default-real environment.
     static psiformer::ExecutionEnvironment environmentFor(const ParticleSet& electrons)
     {
@@ -289,15 +291,21 @@ struct PsiFormerComplexWF::Impl
    */
   struct MultiWalkerResource final : Resource
   {
+    /// Anchor an empty transaction resource to its immutable model family.
     explicit MultiWalkerResource(std::shared_ptr<Model> state)
         : Resource("PsiFormerComplexMultiWalkerResource"), state(std::move(state)) {}
+
+    /// Clone only the model anchor; each acquired crowd prepares independent HOST staging.
     std::unique_ptr<Resource> makeClone() const override
     { return std::make_unique<MultiWalkerResource>(state); }
+
+    /// Reject legacy real-adapter preparation metadata rather than silently ignoring it.
     void validateBatchResourcePreparation(const BatchResourcePreparationContext& context) const override
     {
       if (context.plan)
         throw std::invalid_argument("Dense complex GPU resources do not admit a legacy batch_memory plan");
     }
+
     /// Log attempted logical HOST ownership before any cold vector growth can fail.
     void prepareTeam(const RefVectorWithLeader<WaveFunctionComponent>& list)
     {
@@ -327,6 +335,8 @@ struct PsiFormerComplexWF::Impl
       for (std::size_t i = 0; i < list.size(); ++i)
         components[i] = &static_cast<PsiFormerComplexWF&>(list[i]);
     }
+
+    /// Count retained logical numeric HOST capacities without claiming a process-memory bound.
     std::size_t hostNumericBytes() const
     {
       std::size_t bytes = 0;
@@ -343,6 +353,7 @@ struct PsiFormerComplexWF::Impl
       add(laplacian.capacity(), sizeof(ValueType));
       return bytes;
     }
+
     std::shared_ptr<Model> state;
     std::vector<PsiFormerComplexWF*> components;
     std::vector<Amplitude> amplitude;
@@ -1734,12 +1745,14 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
 }
 
+/// Register empty HOST transaction staging only for the opt-in dense profile.
 void PsiFormerComplexWF::createResource(ResourceCollection& collection) const
 {
   if (impl_->denseEnabled())
     collection.addResource(std::make_unique<Impl::MultiWalkerResource>(impl_->state));
 }
 
+/// Transactionally acquire one compatible native crowd and preserve its exact lane order.
 void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
     const RefVectorWithLeader<WaveFunctionComponent>& components) const
 {
@@ -1805,6 +1818,7 @@ void PsiFormerComplexWF::acquireResource(ResourceCollection& collection,
   }
 }
 
+/// Return the original resource loan before revoking the crowd's acquisition markers.
 void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
     const RefVectorWithLeader<WaveFunctionComponent>& components) const
 {
