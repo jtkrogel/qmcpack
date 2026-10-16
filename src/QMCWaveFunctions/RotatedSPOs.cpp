@@ -16,9 +16,29 @@
 #include "CPU/BLAS.hpp"
 #include "io/hdf/hdf_archive.h"
 #include "type_traits/complex_help.hpp"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace qmcplusplus
 {
+namespace
+{
+bool finiteRotationCoordinate(QMCTraits::ValueType value)
+{
+  const auto finite = [](double scalar) {
+    static_assert(sizeof(double) == sizeof(std::uint64_t) && std::numeric_limits<double>::is_iec559);
+    std::uint64_t bits;
+    std::memcpy(&bits, &scalar, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  };
+  return finite(std::real(value)) && finite(std::imag(value));
+}
+}
 RotatedSPOs::RotatedSPOs(const std::string& my_name, std::unique_ptr<SPOSet>&& spos)
     : SPOSet(my_name, spos->getOrbitalSetSize()),
       OptimizableObject(my_name),
@@ -116,12 +136,20 @@ void RotatedSPOs::resetParametersExclusive(const OptVariables& active)
   //allows us to work with both real and complex since
   //active and myVars are stored as only reals
   auto* delta_param_data_alias = (RealType*)delta_param.data();
+  bool changed = false;
   for (int i = 0; i < myVars.size(); i++)
   {
     int loc                   = myVars.where(i);
+    if (loc < 0)
+      continue;
     delta_param_data_alias[i] = active[loc] - myVars[i];
+    changed = changed || delta_param_data_alias[i] != RealType{};
     myVars[i]                 = active[loc];
   }
+  // Replay at the same active coordinates must preserve the accepted physical
+  // matrix/full history exactly, without another floating-point exp/log cycle.
+  if (!changed)
+    return;
 
   std::vector<ValueType> old_param(m_full_rot_inds_.size());
   std::copy_n(myVarsFull_.data(), myVarsFull_.size(), old_param.data());
@@ -1569,7 +1597,77 @@ std::unique_ptr<SPOSet> RotatedSPOs::makeClone() const
   myclone->m_full_rot_inds_ = this->m_full_rot_inds_;
   myclone->myVars           = this->myVars;
   myclone->myVarsFull_      = this->myVarsFull_;
+  myclone->nel_major_       = this->nel_major_;
   return myclone;
+}
+
+void RotatedSPOs::isolateOptimizationState()
+{
+  auto* lcao = dynamic_cast<LCAOrbitalSet*>(Phi_.get());
+  if (!lcao)
+    throw std::invalid_argument("Private orbital rotations currently require an LCAO SPO");
+  lcao->isolateOptimizationState();
+}
+
+void RotatedSPOs::validatePreparedRotationState(const RotatedSPOs& prepared) const
+{
+  const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(Phi_.get());
+  const auto* private_lcao = dynamic_cast<const LCAOrbitalSet*>(prepared.Phi_.get());
+  if (!lcao || !private_lcao || SPOSet::getName() != prepared.SPOSet::getName() ||
+      OrbitalSetSize != prepared.OrbitalSetSize || nel_major_ != prepared.nel_major_ ||
+      m_act_rot_inds_ != prepared.m_act_rot_inds_ || m_full_rot_inds_ != prepared.m_full_rot_inds_ ||
+      params_supplied_ != prepared.params_supplied_ || params_ != prepared.params_ ||
+      myVars.size() != prepared.myVars.size() ||
+      myVars.Index.size() != myVars.size() || prepared.myVars.Index.size() != prepared.myVars.size() ||
+      myVarsFull_.size() != m_full_rot_inds_.size() || prepared.myVarsFull_.size() != myVarsFull_.size())
+    throw std::invalid_argument("Prepared orbital rotation wrapper has incompatible fixed structure");
+  for (std::size_t i = 0; i < myVars.size(); ++i)
+    if (myVars.name(i) != prepared.myVars.name(i) || myVars.getType(i) != prepared.myVars.getType(i) ||
+        (myVars.where(i) < 0) != (prepared.myVars.where(i) < 0) ||
+        !finiteRotationCoordinate(prepared.myVars[i]))
+      throw std::invalid_argument("Prepared orbital rotation wrapper changed its active coordinate layout");
+  for (const auto coordinate : prepared.myVarsFull_)
+    if (!finiteRotationCoordinate(coordinate))
+      throw std::invalid_argument("Prepared orbital rotation wrapper contains non-finite full coordinates");
+  lcao->validatePreparedRotationState(*private_lcao);
+}
+
+void RotatedSPOs::adoptPreparedRotationState(RotatedSPOs& prepared, const RotatedSPOs& canonical_bank) noexcept
+{
+  static_assert(std::is_nothrow_swappable_v<OptVariables>);
+  static_cast<LCAOrbitalSet&>(*Phi_).adoptPreparedRotationState(
+      static_cast<const LCAOrbitalSet&>(*canonical_bank.Phi_));
+  std::swap(myVars, prepared.myVars);
+  myVarsFull_.swap(prepared.myVarsFull_);
+}
+
+void RotatedSPOs::restoreFullRotationState(const std::vector<ValueType>& full,
+                                         const OptVariables& expected_active)
+{
+  if (!dynamic_cast<LCAOrbitalSet*>(Phi_.get()) || full.size() != m_full_rot_inds_.size() ||
+      myVars.Index.size() != myVars.size())
+    throw std::invalid_argument("Restored orbital full coordinates have incompatible structure");
+  for (const auto coordinate : full)
+    if (!finiteRotationCoordinate(coordinate))
+      throw std::invalid_argument("Restored orbital full coordinates contain a non-finite value");
+  auto coordinates = full;
+  OptVariables variables(myVars);
+  for (std::size_t i = 0; i < myVars.size(); ++i)
+  {
+    const auto entry = expected_active.find(myVars.name(i));
+    if (entry == expected_active.end())
+      throw std::invalid_argument("Restored orbital state is missing an active coordinate name");
+    const auto location = std::distance(expected_active.begin(), entry);
+    if (expected_active.getType(location) != myVars.getType(i) ||
+        expected_active.Index.size() != expected_active.size() ||
+        expected_active.where(location) != myVars.where(i) || !finiteRotationCoordinate(entry->second) ||
+        (myVars.where(i) < 0 && entry->second != myVars[i]))
+      throw std::invalid_argument("Restored orbital state changed the active coordinate layout");
+    variables[i] = entry->second;
+  }
+  applyFullRotation(coordinates, true);
+  myVars = std::move(variables);
+  myVarsFull_.swap(coordinates);
 }
 
 void RotatedSPOs::mw_evaluateDetRatios(const RefVectorWithLeader<SPOSet>& spo_list,

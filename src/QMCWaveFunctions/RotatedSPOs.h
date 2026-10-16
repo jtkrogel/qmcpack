@@ -124,6 +124,17 @@ public:
 
   std::unique_ptr<SPOSet> makeClone() const override;
 
+  /// Detach mutable LCAO coefficient banks in an optimization-private clone.
+  void isolateOptimizationState();
+  void validatePreparedRotationState(const RotatedSPOs& prepared) const;
+  /** No-fail activation after validation: retain wrapper/Phi identities, swap
+   * private per-target coordinates, and share the canonical coefficient bank.
+   */
+  void adoptPreparedRotationState(RotatedSPOs& prepared, const RotatedSPOs& canonical_bank) noexcept;
+  const std::vector<ValueType>& fullRotationCoordinates() const noexcept { return myVarsFull_; }
+  /// Private evaluator only; install complete history and matching active values without a delta.
+  void restoreFullRotationState(const std::vector<ValueType>& full, const OptVariables& expected_active);
+
   // myG_temp (myL_temp) is the Gradient (Laplacian) value of of the Determinant part of the wfn
   // myG_J is the Gradient of the all other parts of the wavefunction (typically just the Jastrow).
   //       It represents \frac{\nabla\psi_{J}}{\psi_{J}}

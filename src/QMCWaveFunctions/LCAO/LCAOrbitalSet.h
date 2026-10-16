@@ -65,6 +65,16 @@ public:
 
   std::unique_ptr<SPOSet> makeClone() const final;
 
+  /// Detach both mutable rotation coefficient matrices in an optimization-private clone.
+  void isolateOptimizationState();
+  void validatePreparedRotationState(const LCAOrbitalSet& prepared) const;
+  /// Copy only two prevalidated shared coefficient-bank pointers; retain AO/SPO identity.
+  void adoptPreparedRotationState(const LCAOrbitalSet& prepared) noexcept;
+  const OffloadValueMatrix& originalRotationCoefficients() const;
+  /// Restore exact accepted coefficients in a private evaluator after full-coordinate validation.
+  void restorePreparedRotationCoefficients(const OffloadValueMatrix& accepted,
+                                            const OffloadValueMatrix& original);
+
   void storeParamsBeforeRotation() final { C_copy = std::make_shared<OffloadValueMatrix>(*C); }
 
   void applyRotation(const ValueMatrix& rot_mat, bool use_stored_copy) final;

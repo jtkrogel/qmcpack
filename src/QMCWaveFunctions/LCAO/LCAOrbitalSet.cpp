@@ -16,9 +16,28 @@
 #include "OMPTarget/ompBLAS.hpp"
 #include <ResourceCollection.h>
 #include <AccelBLAS.hpp>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <algorithm>
+#include <cmath>
 
 namespace qmcplusplus
 {
+namespace
+{
+bool finiteRotationCoefficient(QMCTraits::ValueType value)
+{
+  const auto finite = [](double scalar) {
+    static_assert(sizeof(double) == sizeof(std::uint64_t) && std::numeric_limits<double>::is_iec559);
+    std::uint64_t bits;
+    std::memcpy(&bits, &scalar, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  };
+  return finite(std::real(value)) && finite(std::imag(value));
+}
+}
 
 struct LCAOrbitalSet::LCAOMultiWalkerMem : public Resource
 {
@@ -164,6 +183,82 @@ RefVectorWithLeader<typename LCAOrbitalSet::basis_type> LCAOrbitalSet::extractBa
   return basis_list;
 }
 std::unique_ptr<SPOSet> LCAOrbitalSet::makeClone() const { return std::make_unique<LCAOrbitalSet>(*this); }
+
+void LCAOrbitalSet::isolateOptimizationState()
+{
+  if (useOMPoffload_ || Identity || !C || !C_copy)
+    throw std::invalid_argument("Private orbital rotations require CPU LCAO coefficients and an original rotation bank");
+  auto coefficients = std::make_shared<OffloadValueMatrix>(*C);
+  auto original = std::make_shared<OffloadValueMatrix>(*C_copy);
+  C.swap(coefficients);
+  C_copy.swap(original);
+}
+
+const LCAOrbitalSet::OffloadValueMatrix& LCAOrbitalSet::originalRotationCoefficients() const
+{
+  if (!C_copy)
+    throw std::invalid_argument("LCAO has no original rotation coefficients");
+  return *C_copy;
+}
+
+void LCAOrbitalSet::validatePreparedRotationState(const LCAOrbitalSet& prepared) const
+{
+  if (useOMPoffload_ || prepared.useOMPoffload_ || Identity || prepared.Identity ||
+      !C || !C_copy || !prepared.C || !prepared.C_copy ||
+      BasisSetSize != prepared.BasisSetSize || OrbitalSetSize != prepared.OrbitalSetSize ||
+      C->rows() != OrbitalSetSize || C->cols() != BasisSetSize ||
+      prepared.C->rows() != C->rows() || prepared.C->cols() != C->cols() ||
+      C_copy->rows() != C->rows() || C_copy->cols() != C->cols() ||
+      prepared.C_copy->rows() != C->rows() || prepared.C_copy->cols() != C->cols())
+    throw std::invalid_argument("Prepared CPU LCAO rotation bank has incompatible structure");
+  for (std::size_t i = 0; i < C->size(); ++i)
+  {
+    if (!finiteRotationCoefficient(prepared.C->data()[i]) ||
+        !finiteRotationCoefficient(C_copy->data()[i]) ||
+        !finiteRotationCoefficient(prepared.C_copy->data()[i]))
+      throw std::invalid_argument("Prepared LCAO rotation bank contains a non-finite coefficient");
+    if (C_copy->data()[i] != prepared.C_copy->data()[i])
+      throw std::invalid_argument("Prepared LCAO rotation bank changed original reference coefficients");
+  }
+}
+
+void LCAOrbitalSet::adoptPreparedRotationState(const LCAOrbitalSet& prepared) noexcept
+{
+  C = prepared.C;
+  C_copy = prepared.C_copy;
+}
+
+void LCAOrbitalSet::restorePreparedRotationCoefficients(const OffloadValueMatrix& accepted,
+                                                       const OffloadValueMatrix& original)
+{
+  if (useOMPoffload_ || Identity || !C || !C_copy ||
+      accepted.rows() != C->rows() || accepted.cols() != C->cols() ||
+      original.rows() != C_copy->rows() || original.cols() != C_copy->cols())
+    throw std::invalid_argument("Restored LCAO rotation coefficients have incompatible structure");
+  for (std::size_t i = 0; i < accepted.size(); ++i)
+  {
+    if (!finiteRotationCoefficient(accepted.data()[i]) || !finiteRotationCoefficient(original.data()[i]))
+      throw std::invalid_argument("Restored LCAO rotation coefficients contain a non-finite value");
+    if (original.data()[i] != C_copy->data()[i])
+      throw std::invalid_argument("Restored LCAO rotation coefficients changed the original reference bank");
+  }
+  // C was reconstructed from the saved full coordinates by the private wrapper.
+  // Keep the exact saved product, but reject a different physical orbital bank.
+  // Account for dense exp/log and product roundoff using matrix extent and the
+  // immutable coefficient scale; this is not a user solver tolerance.
+  long double scale = 1.0L;
+  for (std::size_t i = 0; i < original.size(); ++i)
+    scale = std::max({scale, std::abs(static_cast<long double>(std::real(original.data()[i]))),
+                      std::abs(static_cast<long double>(std::imag(original.data()[i])))});
+  const long double roundoff = 128.0L * std::numeric_limits<RealType>::epsilon() *
+      static_cast<long double>(OrbitalSetSize) * OrbitalSetSize * scale;
+  for (std::size_t i = 0; i < accepted.size(); ++i)
+    if (std::abs(static_cast<long double>(std::real(accepted.data()[i])) - std::real(C->data()[i])) > roundoff ||
+        std::abs(static_cast<long double>(std::imag(accepted.data()[i])) - std::imag(C->data()[i])) > roundoff)
+      throw std::invalid_argument("Restored LCAO coefficients disagree with full rotation coordinates");
+  auto coefficients = std::make_shared<OffloadValueMatrix>(accepted);
+  C.swap(coefficients);
+}
 
 void LCAOrbitalSet::evaluateValue(const ParticleSet& P, int iat, ValueVector& psi)
 {
