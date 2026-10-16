@@ -886,6 +886,25 @@ struct CpuTargetVGLPreparation
   std::size_t targets = 0, owner_budget = 0, owner_bytes = 0;
 };
 
+/// Parse only explicit CPU target controls; unset is off, present values must be positive/finite.
+std::size_t positiveCpuTargetControl(const char* name)
+{
+  const char* value = std::getenv(name);
+  if (!value)
+    return 0;
+  std::size_t result = 0;
+  for (const char* digit = value; *digit; ++digit)
+  {
+    if (*digit < '0' || *digit > '9' ||
+        result > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+      throw std::invalid_argument(std::string(name) + " must be a positive base-10 size_t");
+    result = 10 * result + (*digit - '0');
+  }
+  if (result == 0 || result == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument(std::string(name) + " must be positive and finite");
+  return result;
+}
+
 /// Read CPU controls only on the resolved CPU route; admit before clone buffers exist.
 CpuTargetVGLPreparation configuredCpuTargetVGL(
     const psiformer::PsiFormerAcceleratorResolution& resolution,
@@ -893,25 +912,9 @@ CpuTargetVGLPreparation configuredCpuTargetVGL(
 {
   if (resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU)
     return {};
-  const auto positive = [](const char* name) -> std::size_t {
-    const char* value = std::getenv(name);
-    if (!value)
-      return 0;
-    std::size_t result = 0;
-    for (const char* digit = value; *digit; ++digit)
-    {
-      if (*digit < '0' || *digit > '9' ||
-          result > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
-        throw std::invalid_argument(std::string(name) + " must be a positive base-10 size_t");
-      result = 10 * result + (*digit - '0');
-    }
-    if (result == 0 || result == std::numeric_limits<std::size_t>::max())
-      throw std::invalid_argument(std::string(name) + " must be positive and finite");
-    return result;
-  };
   CpuTargetVGLPreparation result;
-  result.targets = positive("PSIFORMER_CPU_VGL_TARGETS");
-  result.owner_budget = positive("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE");
+  result.targets = positiveCpuTargetControl("PSIFORMER_CPU_VGL_TARGETS");
+  result.owner_budget = positiveCpuTargetControl("PSIFORMER_CPU_TARGET_VGL_OWNER_BYTES_PER_CLONE");
   if (!result.targets && !result.owner_budget)
     return result;
   if (!result.targets || !result.owner_budget)
@@ -922,6 +925,34 @@ CpuTargetVGLPreparation configuredCpuTargetVGL(
        shape.attention_heads, layout.inputWidth(), 0, 0}, result.targets);
   if (result.owner_bytes > result.owner_budget)
     throw std::length_error("PsiFormer CPU target VGL owner exceeds its per-clone byte cap");
+  return result;
+}
+
+/// Bound one shared CPU derivative tape, independently of objective and inference storage.
+struct CpuTargetKineticPreparation
+{
+  std::size_t targets = 0, owner_budget = 0, owner_bytes = 0;
+};
+
+/// Read the CPU streaming-product profile once and admit its exact owner before allocation.
+CpuTargetKineticPreparation configuredCpuTargetKinetic(
+    const psiformer::PsiFormerAcceleratorResolution& resolution,
+    const psiformer::PsiFormerExecutionPlan& plan, const pf::DirectValueParameterLayout& layout)
+{
+  if (resolution.backend != psiformer::PsiFormerAcceleratorBackend::CPU)
+    return {};
+  CpuTargetKineticPreparation result;
+  result.targets = positiveCpuTargetControl("PSIFORMER_CPU_KINETIC_TARGETS");
+  result.owner_budget = positiveCpuTargetControl("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE");
+  if (!result.targets && !result.owner_budget)
+    return result;
+  if (!result.targets || !result.owner_budget)
+    throw std::invalid_argument("PsiFormer CPU target kinetic requires both targets and per-lane owner bytes");
+  const auto& s = plan.modelShape();
+  result.owner_bytes = pf::targetKineticWorkspaceStorageRequirement({s.electrons(), s.nuclei, s.determinants,
+      s.feature_dimension, s.attention_heads, layout.inputWidth(), s.attention_blocks, plan.parameterCount()}, result.targets);
+  if (result.owner_bytes > result.owner_budget)
+    throw std::length_error("PsiFormer CPU target kinetic owner exceeds its per-lane byte cap");
   return result;
 }
 
@@ -1163,8 +1194,13 @@ public:
         direct_score_mode(configuredDirectBackend("PSIFORMER_SCORE_BACKEND")),
         direct_kinetic_mode(configuredDirectBackend("PSIFORMER_KINETIC_BACKEND")),
         cpu_target_vgl(configuredCpuTargetVGL(this->accelerator_resolution, execution_plan,
-                                            *direct_value_executor.layout()))
+                                            *direct_value_executor.layout())),
+        cpu_target_kinetic(configuredCpuTargetKinetic(this->accelerator_resolution, execution_plan,
+                                                    *direct_value_executor.layout()))
   {
+    if (cpu_target_kinetic.targets &&
+        (direct_score_mode != DirectBackendMode::DIRECT || direct_kinetic_mode != DirectBackendMode::DIRECT))
+      throw std::invalid_argument("PsiFormer CPU target streaming products require DIRECT score/kinetic backends");
     if (cpu_target_vgl.targets && direct_spatial_mode != DirectBackendMode::DIRECT)
       throw std::invalid_argument("PsiFormer CPU target VGL requires the direct spatial backend");
     if (numerical_tile_backend && (direct_value_mode != DirectBackendMode::DIRECT ||
@@ -1252,6 +1288,8 @@ public:
   const DirectBackendMode direct_kinetic_mode;
   /// Per-clone target numerical payload only; other products/owners are excluded.
   const CpuTargetVGLPreparation cpu_target_vgl;
+  /// Objective-independent streaming SCORE/LOCAL_ENERGY preparation, per shared execution lane.
+  const CpuTargetKineticPreparation cpu_target_kinetic;
   /// Pretraining has no retained streaming snapshot to keep its lane alive.
   /// Cache one lane across orbital-loss calls; never one tape per walker/epoch.
   std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
@@ -1929,8 +1967,12 @@ struct PsiFormerDerivativeScratch
   PsiFormerDerivativeScratch(PsiFormerSharedState& state, std::size_t parameters,
                              std::size_t score_capacity = 1)
       : score(state.numerical_tile_backend ? nullptr : state.direct_score_executor.makeWorkspace()),
-        kinetic(state.numerical_tile_backend ? nullptr : state.direct_kinetic_executor.makeWorkspace())
+        kinetic(state.numerical_tile_backend ? nullptr : state.cpu_target_kinetic.targets
+            ? state.direct_kinetic_executor.makeTargetWorkspace(state.cpu_target_kinetic.targets, state.cpu_target_kinetic.owner_budget)
+            : state.direct_kinetic_executor.makeWorkspace())
   {
+    if (state.cpu_target_kinetic.targets && (!kinetic || kinetic->vectorStorageBytes() != state.cpu_target_kinetic.owner_bytes))
+      throw std::logic_error("PsiFormer CPU target kinetic owner differs from admitted numeric bytes");
     checkedBatchMemoryMultiply(parameters, sizeof(wftrain::DerivativeValue),
                                "PsiFormer shared derivative channels");
     for (auto& channel : channels)
@@ -1954,6 +1996,7 @@ struct PsiFormerDerivativeScratch
   bool active = false;
   std::unique_ptr<pf::DirectScoreWorkspace> score;
   std::unique_ptr<pf::DirectKineticWorkspace> kinetic;
+  bool reported_cpu_target_products = false;
 #ifdef ENABLE_CUDA
   std::unique_ptr<psiformer::device::PreparedDeviceProductSession> device_products;
   std::vector<double> device_positions;
@@ -2826,6 +2869,20 @@ private:
       return result;
     }
 #endif
+    if (model_state_->cpu_target_kinetic.targets)
+    {
+      const auto result = model_state_->direct_kinetic_executor.evaluateTargets(*kinetic_workspace_, drift,
+          3 * electron_count_, masses, electron_count_);
+      if (!shared_scratch_->reported_cpu_target_products)
+      {
+        app_log() << "  PsiFormer CPU target streaming kinetic completed: maxK=" << model_state_->cpu_target_kinetic.targets
+                  << ", canonical_parameters=" << schema_->parameterCount() << ", parameter_version=" << parameter_version_
+                  << ", numerical_owner_bytes_per_shared_lane=" << kinetic_workspace_->vectorStorageBytes()
+                  << ", objective_independent=yes; ECP coverage follows existing request/replay masks" << std::endl;
+        shared_scratch_->reported_cpu_target_products = true;
+      }
+      return result;
+    }
     return model_state_->direct_kinetic_executor.evaluate(*kinetic_workspace_, drift,
         3 * electron_count_, masses, electron_count_);
   }
@@ -2842,6 +2899,9 @@ private:
       return {response.data(), response.size()};
     }
 #endif
+    if (model_state_->cpu_target_kinetic.targets)
+      return model_state_->direct_kinetic_executor.evaluateTargetGradientParameterResponse(
+          *kinetic_workspace_, drift, 3 * electron_count_, masses, electron_count_);
     return model_state_->direct_kinetic_executor.evaluateGradientParameterResponse(
         *kinetic_workspace_, drift, 3 * electron_count_, masses, electron_count_);
   }
@@ -4331,6 +4391,8 @@ struct PsiFormerWF::PsiFormerMultiWalkerResource : public Resource
    * contract. */
   pf::DirectKineticWorkspace& requireKineticWorkspace()
   {
+    if (model_state->cpu_target_kinetic.targets)
+      throw std::invalid_argument("CPU target kinetic profile supports streaming products, not legacy/planned crowd derivatives");
     if (expected_plan || prepared_plan)
     {
       if (!prepared_plan || !kinetic_workspace)
@@ -5027,6 +5089,8 @@ private:
     }
     if (crowd_plan.kinetic_workspace_bytes != 0)
     {
+      if (model_state->cpu_target_kinetic.targets)
+        throw std::invalid_argument("CPU target kinetic profile does not admit a planned FULL kinetic tape");
       kinetic_workspace = model_state->direct_kinetic_executor.makeWorkspace();
       if (kinetic_workspace->vectorStorageBytes() !=
           crowd_plan.kinetic_workspace_bytes)
@@ -5816,6 +5880,12 @@ PsiFormerWF::PsiFormerWF(std::string name,
               << ", owner_cap_bytes_per_clone=" << model_state_->cpu_target_vgl.owner_budget
               << "; excludes typed G/L outputs, VALUE/ACTIVE/ECP/score/kinetic owners, model and allocator overhead"
               << "; no aggregate feasibility claim" << std::endl;
+  if (model_state_->cpu_target_kinetic.targets)
+    app_log() << "    CPU target streaming products: maxK=" << model_state_->cpu_target_kinetic.targets
+              << ", numerical_kinetic_owner_bytes_per_shared_lane=" << model_state_->cpu_target_kinetic.owner_bytes
+              << ", owner_cap_bytes_per_lane=" << model_state_->cpu_target_kinetic.owner_budget
+              << "; objective-independent SCORE/LOCAL_ENERGY; inference unchanged; excludes score/channel/sample/ECP/model/allocator storage"
+              << "; no aggregate feasibility claim" << std::endl;
   if (!optimized_parameter_export_.empty())
     app_log() << "    DeepQMC parameter export destination: " << optimized_parameter_export_ << std::endl;
 }
@@ -6064,6 +6134,8 @@ void PsiFormerWF::validateBatchExecutionPlanBinding(
         "Cannot rebind a PsiFormer batch execution plan while its resource is acquired");
 
   const BatchExecutionPlan& plan = participant_plan.plan();
+  if (model_state_->cpu_target_kinetic.targets && plan.requirements().requires(BatchExecutionMode::KINETIC))
+    throw std::invalid_argument("CPU target kinetic profile supports streaming products, not planned FULL kinetic derivatives");
   const BatchMemoryParticipantEvidence& evidence = participant_plan.evidence();
   if (evidence.participant_id.empty())
     throw std::invalid_argument(
@@ -11802,6 +11874,8 @@ pf::DirectScoreWorkspace& PsiFormerWF::requireDirectScoreWorkspace()
 // Lazily allocate the much larger kinetic tape only for an actual scalar reverse call.
 pf::DirectKineticWorkspace& PsiFormerWF::requireDirectKineticWorkspace()
 {
+  if (model_state_->cpu_target_kinetic.targets)
+    throw std::invalid_argument("CPU target kinetic profile supports streaming products, not scalar FULL kinetic derivatives");
   requireUnplannedScalarDerivative("kinetic-parameter evaluation");
   if (!optimization_metadata_->enabled)
     throw std::logic_error("PsiFormer direct kinetic workspace requires an optimizable component");

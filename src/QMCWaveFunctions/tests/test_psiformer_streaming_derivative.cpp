@@ -18,6 +18,7 @@
 #include "Particle/VirtualParticleSet.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -59,7 +60,7 @@ public:
   {
     if (const char* previous = std::getenv(name_.c_str()))
       previous_ = previous;
-    if (setenv(name_.c_str(), value, 1) != 0)
+    if ((value ? setenv(name_.c_str(), value, 1) : unsetenv(name_.c_str())) != 0)
       throw std::runtime_error("failed to set PsiFormer test environment");
   }
 
@@ -1121,6 +1122,162 @@ TEST_CASE("PsiFormer contracts live ordinary-locality ECP tiles without dense st
   CHECK(warmed.retained_numeric_bytes == active_storage.retained_numeric_bytes);
   CHECK(warmed.storage_fingerprint == active_storage.storage_fingerprint);
   CHECK(warmed.allocation_generation == active_storage.allocation_generation);
+}
+
+TEST_CASE("PsiFormer CPU target streaming preserves complete ECP products",
+          "[wavefunction][psiformer][training][streaming][target][ecp]")
+{
+  using namespace testing::psiformer;
+  ScopedEnvironmentVariable clear_k("PSIFORMER_CPU_KINETIC_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_cap("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE", nullptr);
+  auto files = generateFiles("lih");
+  std::size_t p = 0;
+  {
+    PsiFormerWF probe("pf_target_stream", files.parameters.string(), files.configuration.string());
+    p = probe.parameterSchema().parameterCount();
+  }
+  const pf::PsiFormerStorageShape shape{4, 2, 16, 256, 4, 9, 4, p};
+  struct Snapshot
+  {
+    std::vector<std::vector<DerivativeValue>> transpose, hermitian;
+    std::vector<DerivativeValue> score, kinetic, complete;
+    wftrain::StreamingDerivativeStorageDiagnostics storage;
+  };
+  const auto run = [&](std::size_t k) {
+    const auto bytes = k ? pf::targetKineticWorkspaceStorageRequirement(shape, k) : 0;
+    const auto k_text = std::to_string(k), cap_text = std::to_string(bytes);
+    ScopedEnvironmentVariable targets("PSIFORMER_CPU_KINETIC_TARGETS", k ? k_text.c_str() : nullptr);
+    ScopedEnvironmentVariable cap("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE", k ? cap_text.c_str() : nullptr);
+    const SimulationCell cell;
+    auto e0 = makeElectrons(cell), e1 = makeElectrons(cell);
+    e1.R[1] += ParticleSet::PosType{0.009, -0.004, 0.006}; e1.update();
+    for (auto* e : {&e0, &e1})
+    {
+      const int mass = e->getSpeciesSet().getAttribute("mass");
+      e->getSpeciesSet()(mass, 0) = 0.7; e->getSpeciesSet()(mass, 1) = 1.3;
+      e->resetGroups();
+    }
+    const std::vector<std::size_t> selected{0, 1, 127, 2047};
+    PsiFormerWF component("pf_target_stream", files.parameters.string(), files.configuration.string(), true, selected);
+    PsiFormerWF clone(component);
+    const auto companion = [](int electron, int dimension) -> QMCTraits::ValueType {
+      const double real = 0.007 * (electron + 1) * (dimension % 2 ? -1 : 1);
+#ifdef QMC_COMPLEX
+      return {real, 0.005 * (dimension + 1) * (electron % 2 ? -0.4 : 1)};
+#else
+      return real;
+#endif
+    };
+    for (std::size_t s = 0; s < 2; ++s)
+    {
+      auto& e = s ? e1 : e0;
+      auto& c = s ? clone : component;
+      e.G = QMCTraits::GradType{}; e.L = QMCTraits::ValueType{};
+      c.evaluateLog(e, e.G, e.L);
+      for (int electron = 0; electron < e.getTotalNum(); ++electron)
+        for (int d = 0; d < 3; ++d) e.G[electron][d] += companion(electron, d);
+    }
+    RefVectorWithLeader<WaveFunctionComponent> components(component, {component, clone});
+    RefVectorWithLeader<ParticleSet> particles(e0, {e0, e1});
+    auto op = component.makeStreamingDerivativeOperator(components, particles, 71, 23, 257);
+    const std::vector<DerivativeValue> a{{0.7, -0.2}, {-0.3, 0.4}}, c{{-0.1, 0.3}, {0.6, -0.2}};
+    const auto kinetic_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+    const auto ecp_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+    // Capture the actual accepted value-grid stamps and complete companion ratios.
+    auto consumer = component.makeNonLocalECPDerivativeConsumer(components, particles, 257, true);
+    wftrain::NonLocalECPDerivativeContext context;
+    context.provider_id = op->parameterSchema().providerId(); context.schema_fingerprint = op->parameterSchema().fingerprint();
+    context.parameter_version = op->parameterVersion(); context.batch_ordinal = 71; context.sample_offset = 23;
+    context.sample_count = 2; context.expected_point_count = 2; context.grid_fingerprint = UINT64_C(0x731934d1);
+    const std::vector<VJPCoefficientChannel> ecp_channels{{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+        coefficientsFor(*op, a), ecp_mask}};
+    SelectedParameterSink capture_sink(selected);
+    consumer->begin(context, {ecp_channels.data(), ecp_channels.size()}, capture_sink);
+    VirtualParticleSet v0(e0), v1(e1);
+    RefVectorWithLeader<VirtualParticleSet> virtuals(v0, {v0, v1});
+    ResourceCollection resource_template("target_ecp_template"); component.createResource(resource_template);
+    ResourceCollection resources(resource_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+    const std::vector<std::size_t> offsets{0, 1, 2};
+    const std::vector<VirtualParticleBatch::Segment> segments{{0, 0}, {1, 1}};
+    const std::vector<ParticleSet::PosType> points{e0.R[0] + ParticleSet::PosType{0.012, -0.006, 0.004},
+                                                e1.R[1] + ParticleSet::PosType{-0.008, 0.011, 0.003}};
+    const VirtualParticleBatch batch(2, offsets, segments, points);
+    std::vector<QMCTraits::ValueType> ratios(2), bare{QMCTraits::ValueType(0.21), QMCTraits::ValueType(-0.13)};
+    const auto stamp = component.mw_evaluateVirtualRatios(components, particles, virtuals, batch, ratios);
+    for (std::size_t s = 0; s < 2; ++s)
+    {
+      QMCTraits::ValueType exponent{};
+      for (int d = 0; d < 3; ++d) exponent += companion(s, d) * (points[s][d] - particles[s].R[s][d]);
+      ratios[s] *= std::exp(exponent);
+    }
+    const std::vector<WaveFunctionComponent::EvaluationStamp> stamps{stamp};
+    consumer->consume({batch, {bare.data(), bare.size()}, {ratios.data(), ratios.size()},
+        {stamps.data(), stamps.size()}, 0, context.grid_fingerprint});
+    consumer->end();
+    op->bindNonLocalECPJVPReplay(consumer->releaseJVPReplay());
+    Snapshot result;
+    result.storage = op->storageDiagnostics();
+    const auto& storage = result.storage;
+    auto shared = component.makeStreamingDerivativeOperator(components, particles, 72, 25, 257);
+    CHECK(shared->storageDiagnostics().shared_workspace_identity == storage.shared_workspace_identity);
+    const std::vector<VJPCoefficientChannel> channels{
+        {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, a), 0},
+        {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, c), kinetic_mask},
+        {"complete", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, a), kinetic_mask | ecp_mask}};
+    SelectedParameterSink score_only(selected), transpose(selected), hermitian(selected);
+    op->applyVJPs({channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, score_only);
+    op->applyVJPs({channels.data(), channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, transpose);
+    op->applyVJPs({channels.data(), channels.size()}, wftrain::DerivativeAdjoint::HERMITIAN, hermitian);
+    result.transpose = transpose.results(); result.hermitian = hermitian.results();
+    for (std::size_t i = 0; i < selected.size(); ++i) checkClose(score_only.results()[0][i], result.transpose[0][i]);
+    std::vector<DerivativeValue> direction(p);
+    for (std::size_t i = 0; i < selected.size(); ++i) direction[selected[i]] = {0.01 * (i + 1), -0.003 * i};
+    const auto reject_complex_direction = [&]() {
+      const wftrain::StructuredParameterVectorConstView invalid(op->parameterSchema(), op->parameterVersion(),
+          {direction.data(), direction.size()});
+      RecordingSampleSink rejected;
+      op->applyScoreJVP(invalid, rejected);
+    };
+    CHECK_THROWS_WITH(reject_complex_direction(), Catch::Matchers::ContainsSubstring("nonzero imaginary part"));
+    for (std::size_t i : selected) direction[i] = {direction[i].real(), 0.0};
+    const wftrain::StructuredParameterVectorConstView view(op->parameterSchema(), op->parameterVersion(), {direction.data(), direction.size()});
+    RecordingSampleSink score_jvp, kinetic_jvp, complete_jvp;
+    op->applyScoreJVP(view, score_jvp);
+    op->applyLocalEnergyJVP(view, kinetic_mask, kinetic_jvp);
+    op->applyLocalEnergyJVP(view, kinetic_mask | ecp_mask, complete_jvp);
+    result.score = score_jvp.results(); result.kinetic = kinetic_jvp.results(); result.complete = complete_jvp.results();
+    CHECK(std::abs(result.complete[0] - result.kinetic[0]) + std::abs(result.complete[1] - result.kinetic[1]) > 1e-14);
+    const auto warmed = op->storageDiagnostics();
+    CHECK(warmed.retained_numeric_bytes == storage.retained_numeric_bytes);
+    CHECK(warmed.storage_fingerprint == storage.storage_fingerprint);
+    CHECK(warmed.allocation_generation == storage.allocation_generation);
+    SelectedParameterSink failed(selected); failed.armConsumeFailure();
+    CHECK_THROWS(op->applyVJPs({channels.data(), channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, failed));
+    CHECK(failed.state() == DerivativeSinkState::POISONED); CHECK(failed.consumedRecords() == 0);
+    CHECK_THROWS(failed.results());
+    return result;
+  };
+  const auto full = run(0);
+  for (std::size_t k : {std::size_t(1), std::size_t(3)})
+  {
+    const auto target = run(k);
+    for (std::size_t channel = 0; channel < full.transpose.size(); ++channel)
+      for (std::size_t i = 0; i < full.transpose[channel].size(); ++i)
+      {
+        checkClose(target.transpose[channel][i], full.transpose[channel][i]);
+        checkClose(target.hermitian[channel][i], full.hermitian[channel][i]);
+      }
+    for (std::size_t s = 0; s < 2; ++s)
+    {
+      checkClose(target.score[s], full.score[s]); checkClose(target.kinetic[s], full.kinetic[s]); checkClose(target.complete[s], full.complete[s]);
+    }
+    const auto delta = pf::kineticWorkspaceStorageRequirement(shape) - pf::targetKineticWorkspaceStorageRequirement(shape, k);
+    CHECK(full.storage.evaluator_workspace_bytes - target.storage.evaluator_workspace_bytes == delta);
+    CHECK(full.storage.shared_workspace_bytes - target.storage.shared_workspace_bytes == delta);
+    CHECK(full.storage.retained_numeric_bytes - target.storage.retained_numeric_bytes == delta);
+    CHECK(full.storage.parameter_scratch_bytes == target.storage.parameter_scratch_bytes);
+  }
 }
 
 } // namespace qmcplusplus

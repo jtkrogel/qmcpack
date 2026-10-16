@@ -3250,6 +3250,81 @@ TEST_CASE("PsiFormer CPU target profile rejects unadmitted configurations before
   CHECK_THROWS_AS(exact->validateBatchExecutionPlanBinding(participant), std::invalid_argument);
 }
 
+TEST_CASE("PsiFormer CPU target streaming profile admits exact owner and rejects legacy tapes",
+          "[wavefunction][psiformer][streaming][target]")
+{
+  ScopedEnvironmentVariable clear_k("PSIFORMER_CPU_KINETIC_TARGETS", nullptr);
+  ScopedEnvironmentVariable clear_cap("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE", nullptr);
+  auto files = generateFiles("lih");
+  const auto make_component = [&]() {
+    return std::make_unique<PsiFormerWF>("pf_target_stream_admission", files.parameters.string(),
+        files.configuration.string(), true, std::vector<std::size_t>{0, 127});
+  };
+  auto baseline = make_component();
+  const auto bytes = pf::targetKineticWorkspaceStorageRequirement(
+      {4, 2, 16, 256, 4, 9, 4, baseline->parameterSchema().parameterCount()}, 3);
+  const auto text = std::to_string(bytes);
+  {
+    ScopedEnvironmentVariable partial("PSIFORMER_CPU_KINETIC_TARGETS", "3");
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  ScopedEnvironmentVariable cap("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE", text.c_str());
+  CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  for (const char* invalid : {"", "0", "-1", "bad", "5", "999999999999999999999999999"})
+  {
+    ScopedEnvironmentVariable k("PSIFORMER_CPU_KINETIC_TARGETS", invalid);
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  ScopedEnvironmentVariable k("PSIFORMER_CPU_KINETIC_TARGETS", "3");
+  {
+    const auto small = std::to_string(bytes - 1);
+    ScopedEnvironmentVariable insufficient("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE", small.c_str());
+    CHECK_THROWS_AS(make_component(), std::length_error);
+  }
+  for (const auto& invalid : {std::string("0"), std::to_string(std::numeric_limits<std::size_t>::max())})
+  {
+    ScopedEnvironmentVariable bad("PSIFORMER_CPU_TARGET_KINETIC_OWNER_BYTES_PER_LANE", invalid.c_str());
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  {
+    ScopedEnvironmentVariable compare("PSIFORMER_KINETIC_BACKEND", "compare");
+    CHECK_THROWS_AS(make_component(), std::invalid_argument);
+  }
+  auto component = make_component();
+  const SimulationCell cell;
+  auto e0 = makeLiHElectrons(cell), e1 = makeLiHElectrons(cell);
+  auto active = registerSelectedParameters(*component);
+  auto clone_storage = component->makeClone(e1);
+  auto& clone = dynamic_cast<PsiFormerWF&>(*clone_storage);
+  clone.checkOutVariables(active);
+  e0.G = ValueType{}; e0.L = ValueType{}; e1.G = ValueType{}; e1.L = ValueType{};
+  component->evaluateLog(e0, e0.G, e0.L); clone.evaluateLog(e1, e1.G, e1.L); // Ordinary FULL inference remains admitted.
+  Vector<ValueType> score(active.size()), kinetic(active.size());
+  score = ValueType{}; kinetic = ValueType{};
+  CHECK_THROWS_WITH(component->evaluateDerivatives(e0, active, score, kinetic),
+      Catch::Matchers::ContainsSubstring("CPU target kinetic profile"));
+  CHECK_FALSE(testing::TestPsiFormerWF::directWorkspaceDiagnostics(*component).owns_kinetic_workspace);
+  RefVectorWithLeader<WaveFunctionComponent> components(*component, {*component, clone});
+  RefVectorWithLeader<ParticleSet> particles(e0, {e0, e1});
+  {
+    ResourceCollection resource_template("target_unsupported_crowd"); component->createResource(resource_template);
+    ResourceCollection resources(resource_template);
+    ResourceCollectionTeamLock<WaveFunctionComponent> lock(resources, components);
+    RecordArray<ValueType> scores(2, active.size()), kinetics(2, active.size());
+    std::fill(scores.begin(), scores.end(), ValueType{}); std::fill(kinetics.begin(), kinetics.end(), ValueType{});
+    CHECK_THROWS_WITH(component->mw_evaluateParameterDerivatives(components, particles, active, scores, kinetics),
+        Catch::Matchers::ContainsSubstring("CPU target kinetic profile"));
+    CHECK(testing::TestPsiFormerWF::directKineticWorkspaceOwnership(*component, components) == std::array<std::size_t, 2>{0, 0});
+  }
+  BatchExecutionRequirements requirements;
+  component->contributeBatchExecutionRequirements(requirements);
+  requirements.require(BatchExecutionMode::KINETIC);
+  const auto plan = makeClonePreparationTestPlan(*component, requirements, "target-kinetic", "target-kinetic-unadmitted-plan");
+  const auto participant = makeBatchExecutionParticipantPlan(plan, "target-kinetic");
+  CHECK_THROWS_WITH(component->validateBatchExecutionPlanBinding(participant),
+      Catch::Matchers::ContainsSubstring("CPU target kinetic profile"));
+}
+
 TEST_CASE("PsiFormer exposes fail-closed batch planning hooks",
           "[wavefunction][psiformer][batch_memory]")
 {
