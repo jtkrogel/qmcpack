@@ -5,12 +5,16 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "Message/Communicate.h"
+#include "OhmmsData/Libxml2Doc.h"
 #include "Particle/ParticleSet.h"
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "SimulationCell.h"
+#include "io/hdf/hdf_archive.h"
+#include <chrono>
+#include <filesystem>
 #include <limits>
 
 namespace qmcplusplus::wftrain
@@ -45,6 +49,9 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   const RuntimeOptions runtime;
   TrialWaveFunction prototype(runtime, "binding_test");
   prototype.addComponent(std::move(j2));
+  Libxml2Document definition;
+  REQUIRE(definition.parseFromString("<wavefunction name='binding_test'><fixed coefficient='0.4'/></wavefunction>"));
+  prototype.storeXMLNode(definition.getRoot());
   particles.update();
   ParticleSet clone_particles(particles);
   auto clone = prototype.makeClone(clone_particles);
@@ -81,5 +88,31 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   next.values[1] -= 0.03;
   CHECK(binding.publishParameters(next, next.version) == next.version + 1);
   CHECK_THROWS(binding.publishParameters(candidate, old.version));
+  const auto file = std::filesystem::temp_directory_path() /
+      ("conventional_binding_" + std::to_string(comm.rank()) + "_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".h5");
+  struct Cleanup
+  {
+    std::filesystem::path path;
+    ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
+  } cleanup{file};
+  binding.exportModel(file);
+  CHECK(binding.readModel(file).values == binding.snapshotParameters().values);
+  {
+    hdf_archive output;
+    REQUIRE(output.open(file, H5F_ACC_RDWR));
+    output.push("conventional_wavefunction", false);
+    std::string xml;
+    output.read(xml, "wavefunction_xml");
+    xml[0] = '!';
+    output.write(xml, "wavefunction_xml");
+  }
+  CHECK_THROWS(binding.readModel(file));
+  Libxml2Document external_definition;
+  REQUIRE(external_definition.parseFromString("<wavefunction><sposet_builder href='unqualified.h5'/></wavefunction>"));
+  auto external = prototype.makeClone(particles);
+  external->storeXMLNode(external_definition.getRoot());
+  TrainingWaveFunctionBinding external_binding(*external, particles, {256, 65536, 16}, comm);
+  CHECK_THROWS(external_binding.modelIdentity());
 }
 }
