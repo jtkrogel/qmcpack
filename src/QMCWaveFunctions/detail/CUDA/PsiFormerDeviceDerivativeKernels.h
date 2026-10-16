@@ -207,6 +207,22 @@ Error launchDerivativeCopy(Stream stream,
                            const double* source,
                            double* destination);
 
+/** In-place real scale; only the destination interval of layout is used.
+ * Raw borrowed launch: caller owns device/capacity/lifetime and must finite-scan
+ * ALL inputs before mutation and outputs before publication. No allocation/sync.
+ * Alpha must be finite even for an empty no-op interval.
+ */
+Error launchDerivativeScale(Stream stream, const DerivativeVectorLayout& layout,
+                            double alpha, double* destination);
+
+/** Real y += alpha*x with separately rounded product/add (no FMA range widening).
+ * Same logical span is allowed; other overlapping bounding byte spans reject,
+ * including strided bounding overlaps. Caller finite-admits all input/output
+ * lanes and owns allocation extents/current device, as for scale above.
+ */
+Error launchDerivativeAxpy(Stream stream, const DerivativeVectorLayout& layout,
+                           double alpha, const double* source, double* destination);
+
 /// Accumulate ``(alpha_real+i*alpha_imag)*source`` into interleaved complex storage.
 Error launchRealToComplexAxpy(Stream stream,
                               const RealToComplexAxpyLayout& layout,

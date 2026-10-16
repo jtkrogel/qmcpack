@@ -19,6 +19,7 @@
 #include "PsiFormerDeviceDense.h"
 #include "PsiFormerDeviceSpatial.h"
 #include "PsiFormerDeviceDerivativeKernels.h"
+#include "PsiFormerDeviceRealVectorValidation.h"
 #include "PsiFormerDeviceDeterminantKernels.h"
 #include "Platforms/CUDA/AccelBLAS_CUDA.hpp"
 
@@ -753,8 +754,9 @@ int main(int argc, char** argv)
       std::cout << "PASS host-only ownership checks; GPU numerical tests NOT_RUN\n";
       return 0;
     }
-    if (argc != 1)
-      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check]");
+    const bool vectors_only = argc == 2 && std::string(argv[1]) == "--real-vectors-only";
+    if (argc != 1 && !vectors_only)
+      throw std::invalid_argument("Usage: psiformer_device_runtime_validation [--host-check|--real-vectors-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -770,6 +772,11 @@ int main(int argc, char** argv)
     }
     std::cout << "Actual-device FP64 validation backend=" << backend << " visible_devices=" << count << "\n";
     Queue queue;
+    if (vectors_only)
+    {
+      validateDerivativeRealVectors(queue);
+      return 0;
+    }
     AcceleratorBlasHandle handle(queue);
     features(queue);
     featureVGL(queue);
@@ -780,6 +787,7 @@ int main(int argc, char** argv)
     determinants(queue);
     boundedResponses(queue);
     batchedScoreLeaves(queue);
+    validateDerivativeRealVectors(queue);
     queue.sync();
     std::cout << "PASS all implemented device component cases; full-model dispatch NOT_VALIDATED\n";
     return 0;

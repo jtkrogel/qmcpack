@@ -16,6 +16,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -96,6 +97,16 @@ void validateStridedInterval(std::size_t count,
   if (stride == 0)
     throw std::invalid_argument(description);
   (void)checkedAdd(offset, checkedProduct(count - 1, stride, description), description);
+}
+
+/// Bound raw addressed bytes without dereferencing; capacity/device remain caller-owned.
+std::pair<std::size_t, std::size_t> vectorByteSpan(const double* pointer, std::size_t count,
+    std::size_t offset, std::size_t stride)
+{
+  const char* error = "PsiFormer real vector byte/address extent overflow";
+  const auto begin = checkedAdd(reinterpret_cast<std::uintptr_t>(pointer), checkedProduct(offset, sizeof(double), error), error);
+  const auto bytes = checkedProduct(checkedSpan(count, stride, 1, error), sizeof(double), error);
+  return {begin, checkedAdd(begin, bytes, error)};
 }
 
 std::size_t checkedPieceCount(std::size_t count,
@@ -206,6 +217,27 @@ __global__ void derivativeCopyKernel(DerivativeVectorLayout layout,
   if (index < layout.element_count)
     destination[layout.destination_offset + index * layout.destination_stride] =
         source[layout.source_offset + index * layout.source_stride];
+}
+
+/// Each strided destination has one owner; no reduction or hidden finite admission.
+__global__ void derivativeScaleKernel(DerivativeVectorLayout layout, double alpha, double* destination)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < layout.element_count)
+    destination[layout.destination_offset + index * layout.destination_stride] *= alpha;
+}
+
+/// Volatile FP64 materialization prohibits multiply-add contraction on CUDA and HIP.
+__global__ void derivativeAxpyKernel(DerivativeVectorLayout layout, double alpha,
+    const double* source, double* destination)
+{
+  const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= layout.element_count)
+    return;
+  const auto target = layout.destination_offset + index * layout.destination_stride;
+  // An overflowing product remains nonfinite even if a fused cancellation could fit.
+  volatile double product = alpha * source[layout.source_offset + index * layout.source_stride];
+  destination[target] = destination[target] + product;
 }
 
 __global__ void realToComplexAxpyKernel(RealToComplexAxpyLayout layout,
@@ -1085,6 +1117,53 @@ Error launchDerivativeCopy(Stream stream,
   derivativeCopyKernel<<<blockCount(layout.element_count,
                                     "PsiFormer derivative copy grid exceeds the CUDA/HIP x dimension"),
                          derivative_block_size, 0, stream>>>(layout, source, destination);
+  return peekAtLastError();
+}
+
+/// Validate scalar and addressed destination before the allocation-free in-place launch.
+Error launchDerivativeScale(Stream stream, const DerivativeVectorLayout& layout, double alpha, double* destination)
+{
+  if (!device_math::isFiniteBinary64(alpha))
+    throw std::invalid_argument("PsiFormer real scale factor must be finite");
+  if (!layout.element_count)
+    return success;
+  validateStridedInterval(layout.element_count, layout.destination_offset, layout.destination_stride,
+      "PsiFormer real scale destination extent is invalid");
+  if (!destination)
+    throw std::invalid_argument("PsiFormer real scale destination is null");
+  (void)vectorByteSpan(destination, layout.element_count, layout.destination_offset, layout.destination_stride);
+  const auto blocks = blockCount(layout.element_count, "PsiFormer real scale grid exceeds CUDA/HIP x dimension");
+  if (blocks > static_cast<unsigned int>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer real scale grid exceeds portable INT_MAX x dimension");
+  derivativeScaleKernel<<<blocks,
+      derivative_block_size, 0, stream>>>(layout, alpha, destination);
+  return peekAtLastError();
+}
+
+/// Exact same-index alias is safe; all other overlapping addressed bounds fail closed.
+Error launchDerivativeAxpy(Stream stream, const DerivativeVectorLayout& layout, double alpha,
+    const double* source, double* destination)
+{
+  if (!device_math::isFiniteBinary64(alpha))
+    throw std::invalid_argument("PsiFormer real AXPY factor must be finite");
+  if (!layout.element_count)
+    return success;
+  validateStridedInterval(layout.element_count, layout.source_offset, layout.source_stride,
+      "PsiFormer real AXPY source extent is invalid");
+  validateStridedInterval(layout.element_count, layout.destination_offset, layout.destination_stride,
+      "PsiFormer real AXPY destination extent is invalid");
+  if (!source || !destination)
+    throw std::invalid_argument("PsiFormer real AXPY storage is null");
+  const auto x = vectorByteSpan(source, layout.element_count, layout.source_offset, layout.source_stride);
+  const auto y = vectorByteSpan(destination, layout.element_count, layout.destination_offset, layout.destination_stride);
+  const bool same = x.first == y.first && (layout.element_count == 1 || layout.source_stride == layout.destination_stride);
+  if (!same && x.first < y.second && y.first < x.second)
+    throw std::invalid_argument("PsiFormer real AXPY partially overlapping spans are unsupported");
+  const auto blocks = blockCount(layout.element_count, "PsiFormer real AXPY grid exceeds CUDA/HIP x dimension");
+  if (blocks > static_cast<unsigned int>(std::numeric_limits<int>::max()))
+    throw std::length_error("PsiFormer real AXPY grid exceeds portable INT_MAX x dimension");
+  derivativeAxpyKernel<<<blocks,
+      derivative_block_size, 0, stream>>>(layout, alpha, source, destination);
   return peekAtLastError();
 }
 
