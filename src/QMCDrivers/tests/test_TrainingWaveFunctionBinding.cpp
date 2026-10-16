@@ -132,6 +132,14 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   TrainingWaveFunctionBinding global_spo_binding(*global_spo, particles, {256, 65536, 16}, comm);
   global_spo_binding.setHamiltonian(sampling_hamiltonian);
   CHECK_THROWS(global_spo_binding.modelIdentity());
+  Libxml2Document global_md_spo_definition;
+  REQUIRE(global_md_spo_definition.parseFromString(
+      "<wavefunction><sposet name='unrelated'/><multideterminant spo_0='global' spo_1='global'/></wavefunction>"));
+  auto global_md_spo = prototype.makeClone(particles);
+  global_md_spo->storeXMLNode(global_md_spo_definition.getRoot());
+  TrainingWaveFunctionBinding global_md_spo_binding(*global_md_spo, particles, {256, 65536, 16}, comm);
+  global_md_spo_binding.setHamiltonian(sampling_hamiltonian);
+  CHECK_THROWS(global_md_spo_binding.modelIdentity());
 
   ParticleSet ions(cell);
   ions.setName("ion0");

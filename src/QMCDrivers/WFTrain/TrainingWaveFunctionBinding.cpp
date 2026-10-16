@@ -27,45 +27,67 @@ namespace qmcplusplus::wftrain
 {
 namespace
 {
+/// Reject external fixed-model inputs until their content identity is qualified.
 bool hasExternalAssets(xmlNodePtr first)
 {
   for (auto* node = first; node; node = node->next)
   {
+    if (node->type != XML_ELEMENT_NODE)
+      continue;
     for (auto* attribute = node->properties; attribute; attribute = attribute->next)
     {
       const std::string name(reinterpret_cast<const char*>(attribute->name));
       if (name == "href" || name == "src" || name == "file" || name == "filename")
         return true;
     }
-    if (hasExternalAssets(node->children)) return true;
+    if (hasExternalAssets(node->children))
+      return true;
   }
   return false;
 }
 
+/// Copy one XML attribute without retaining storage owned by libxml.
+std::string attributeText(xmlNodePtr node, const char* name)
+{
+  xmlChar* raw = xmlGetProp(node, reinterpret_cast<const xmlChar*>(name));
+  if (!raw)
+    return {};
+  const std::string value(reinterpret_cast<const char*>(raw));
+  xmlFree(raw);
+  return value;
+}
+
+/// Resolve supported single-/multideterminant SPO names inside the captured model.
 void collectSPOBindings(xmlNodePtr first, std::set<std::string>& definitions, std::set<std::string>& references)
 {
   for (auto* node = first; node; node = node->next)
   {
-    if (node->type != XML_ELEMENT_NODE) continue;
-    auto attribute = [&](const char* name) {
-      xmlChar* raw = xmlGetProp(node, reinterpret_cast<const xmlChar*>(name));
-      std::string value;
-      if (raw) { value = reinterpret_cast<const char*>(raw); xmlFree(raw); }
-      return value;
-    };
-    if (std::string(reinterpret_cast<const char*>(node->name)) == "sposet")
+    if (node->type != XML_ELEMENT_NODE)
+      continue;
+    const std::string kind(reinterpret_cast<const char*>(node->name));
+    if (kind == "sposet")
     {
-      const auto name = attribute("name");
-      if (!name.empty()) definitions.insert(name);
+      const auto name = attributeText(node, "name");
+      if (!name.empty())
+        definitions.insert(name);
     }
-    const auto reference = attribute("sposet");
-    if (!reference.empty()) references.insert(reference);
-    else if (std::string(reinterpret_cast<const char*>(node->name)) == "determinant")
+    bool has_reference = false;
+    for (const auto* attribute : {"sposet", "spo_0", "spo_1", "spo_up", "spo_dn"})
+    {
+      const auto reference = attributeText(node, attribute);
+      if (!reference.empty())
+      {
+        references.insert(reference);
+        has_reference = true;
+      }
+    }
+    if (!has_reference && (kind == "determinant" || kind == "multideterminant"))
       references.insert(""); // Implicit/global SPO lookup is not a qualified inline definition.
     collectSPOBindings(node->children, definitions, references);
   }
 }
 
+/// Capture fixed schema/lattice and, only for stationary sources, coordinates.
 std::string particleIdentity(const ParticleSet& particles, bool positions)
 {
   std::ostringstream out;
@@ -81,17 +103,20 @@ std::string particleIdentity(const ParticleSet& particles, bool positions)
   {
     out << '|' << particles.GroupID[i];
     if (positions)
-      for (int d = 0; d < OHMMS_DIM; ++d) out << ':' << particles.R[i][d];
+      for (int d = 0; d < OHMMS_DIM; ++d)
+        out << ':' << particles.R[i][d];
   }
   const auto& lattice = particles.getLattice();
   for (int i = 0; i < OHMMS_DIM; ++i)
   {
     out << "|bc=" << lattice.BoxBConds[i];
-    for (int j = 0; j < OHMMS_DIM; ++j) out << ':' << lattice.R(i, j);
+    for (int j = 0; j < OHMMS_DIM; ++j)
+      out << ':' << lattice.R(i, j);
   }
   return out.str();
 }
 }
+
 TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prototype, ParticleSet& particles,
     LegacyWaveFunctionAdapterOptions options, Communicate& communicator)
     : prototype_(prototype), prototype_particles_(particles), communicator_(communicator),
@@ -124,7 +149,9 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
   }
   attachLive(prototype, particles);
 }
+
 TrainingWaveFunctionBinding::~TrainingWaveFunctionBinding() = default;
+
 void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
 {
   std::map<std::string, std::string> particles;
