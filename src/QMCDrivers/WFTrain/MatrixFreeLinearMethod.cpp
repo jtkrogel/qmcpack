@@ -16,9 +16,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <fstream>
-#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -215,9 +212,18 @@ bool contractionIsReal(DerivativeValue value,
 /// Compare projected transposed entries with a scale-aware floating-point bound.
 bool projectedPairIsHermitian(DerivativeReal left,
                               DerivativeReal right,
+                              DerivativeReal left_action_scale,
+                              DerivativeReal right_action_scale,
                               DerivativeReal tolerance_multiplier,
                               std::size_t parameter_count) noexcept
 {
+  // Each projected entry is a dot product v_i^dagger A v_j. Its roundoff
+  // depends on the vector/action norms, even when the resulting entry nearly
+  // cancels. S-normalized vectors can have large Euclidean norms near weak
+  // overlap directions; scaling only by the final entries rejects valid actions.
+  const DerivativeReal action_scale = left_action_scale + right_action_scale;
+  if (!isFiniteTrainingReal(action_scale) || action_scale < 0.0)
+    return false;
   const DerivativeReal accumulated_roundoff =
       static_cast<DerivativeReal>(parameter_count) *
       std::numeric_limits<DerivativeReal>::epsilon();
@@ -225,7 +231,7 @@ bool projectedPairIsHermitian(DerivativeReal left,
       ? accumulated_roundoff / (1.0 - accumulated_roundoff)
       : 1.0;
   const DerivativeReal tolerance = tolerance_multiplier * gamma *
-      std::max({DerivativeReal{1}, std::abs(left), std::abs(right)});
+      std::max({DerivativeReal{1}, std::abs(left), std::abs(right), action_scale});
   return std::abs(left - right) <= tolerance;
 }
 
@@ -678,26 +684,19 @@ MatrixFreeLinearMethodResult solveSymmetrizedMatrixFreeLinearMethod(
         {
           if (!projectedPairIsHermitian(projected_h[row * dimension + column],
                                         projected_h[column * dimension + row],
+                                        augmentedNorm(constView(basis.vectors[row])) *
+                                            augmentedNorm(constView(basis.hamiltonian_images[column])),
+                                        augmentedNorm(constView(basis.vectors[column])) *
+                                            augmentedNorm(constView(basis.hamiltonian_images[row])),
                                         control.hermitian_tolerance, augmented_size) ||
               !projectedPairIsHermitian(projected_s[row * dimension + column],
                                         projected_s[column * dimension + row],
+                                        augmentedNorm(constView(basis.vectors[row])) *
+                                            augmentedNorm(constView(basis.overlap_images[column])),
+                                        augmentedNorm(constView(basis.vectors[column])) *
+                                            augmentedNorm(constView(basis.overlap_images[row])),
                                         control.hermitian_tolerance, augmented_size))
           {
-            // Temporary bounded task46 failure provenance; no solver/control change.
-            if (const auto* path = std::getenv("QMC_WFTRAIN_LM_PROBE"); path && augmented_size <= 17)
-            {
-              std::ofstream probe(std::string(path) + ".failure");
-              probe << std::setprecision(17) << "pair " << result.iterations << ' ' << dimension << ' '
-                    << row << ' ' << column << ' ' << projected_h[row * dimension + column] << ' '
-                    << projected_h[column * dimension + row] << ' ' << projected_s[row * dimension + column]
-                    << ' ' << projected_s[column * dimension + row] << '\n';
-              for (std::size_t i = 0; i < dimension; ++i)
-                for (std::size_t j = 0; j < augmented_size; ++j)
-                  probe << "basis " << i << ' ' << j << ' ' << basis.vectors[i][j].real() << ' '
-                        << basis.vectors[i][j].imag() << ' ' << basis.hamiltonian_images[i][j].real() << ' '
-                        << basis.hamiltonian_images[i][j].imag() << ' ' << basis.overlap_images[i][j].real()
-                        << ' ' << basis.overlap_images[i][j].imag() << '\n';
-            }
             finishResult(result, LinearMethodStopReason::NON_HERMITIAN_ACTION, start);
             return result;
           }

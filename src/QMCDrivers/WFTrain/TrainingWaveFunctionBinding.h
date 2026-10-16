@@ -15,7 +15,7 @@ namespace qmcplusplus
 class QMCHamiltonian;
 namespace wftrain
 {
-/** Driver-owned CPU binding for fixed-orbital conventional J1/J2 training.
+/** Driver-owned CPU binding for fixed-orbital SJ/MDJ with J1/J2 and CI coordinates.
  * All fallible model resets occur in private objects, followed by collective
  * readiness and no-throw component swaps. Post-commit live cache refresh remains
  * a fatal boundary: it cannot roll back arbitrary legacy evaluations.

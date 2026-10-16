@@ -159,6 +159,35 @@ TEST_CASE("Symmetrized matrix-free LM matches an analytic generalized eigenpair"
   CHECK(result.peak_parameter_vectors <= 8 + 3 * control.maximum_subspace_dimension);
 }
 
+TEST_CASE("Symmetrized LM distinguishes weak-overlap roundoff from material asymmetry",
+          "[drivers][wftrain][linear_method]")
+{
+  const auto schema = makeLMSchema("lm/weak-overlap", 2, ParameterScalarDomain::REAL64);
+  DenseAugmentedOperator overlap(schema, 0, {1.0, 0.0, 0.0, 0.0, 1e-4, 0.0, 0.0, 0.0, 1e-4});
+  IdentityPreconditioner preconditioner(schema, 0);
+  MatrixFreeLinearMethodControl control;
+  control.relative_residual_tolerance = 1e-10;
+  control.maximum_iterations = 16;
+  control.maximum_subspace_dimension = 3;
+  // A ~1e-15 action backward error is amplified by S-normalization. The
+  // Hermiticity gate must use action norms, while still rejecting a real defect.
+  for (const double defect : {1e-15, 1e-5})
+  {
+    INFO("action defect=" << defect);
+    DenseAugmentedOperator hamiltonian(schema, 0,
+        {-1.0, 0.003, 0.002, 0.003, 0.02, 0.003 + defect, 0.002, 0.003, 0.03});
+    const auto result = solveDenseLM(hamiltonian, overlap, preconditioner, control);
+    INFO("stop=" << linearMethodStopReasonName(result.stop_reason));
+    if (defect == 1e-15)
+    {
+      CHECK(result.converged);
+      CHECK(result.eigenvalue == Catch::Approx(-1.00052902).margin(1e-8));
+    }
+    else
+      CHECK(result.stop_reason == LinearMethodStopReason::NON_HERMITIAN_ACTION);
+  }
+}
+
 TEST_CASE("Symmetrized matrix-free LM restarts within its configured storage bound",
           "[drivers][wftrain][linear_method]")
 {
