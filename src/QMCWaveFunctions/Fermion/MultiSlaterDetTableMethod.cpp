@@ -102,6 +102,16 @@ std::unique_ptr<WaveFunctionComponent> MultiSlaterDetTableMethod::makeClone(Part
   return clone;
 }
 
+void MultiSlaterDetTableMethod::isolateOptimizationState()
+{
+  auto private_coefficients = C ? std::make_shared<std::vector<ValueType>>(*C) : nullptr;
+  auto private_variables    = myVars ? std::make_shared<OptVariables>(*myVars) : nullptr;
+  auto private_csf          = csf_data_ ? std::make_shared<CSFData>(*csf_data_) : nullptr;
+  C.swap(private_coefficients);
+  myVars.swap(private_variables);
+  csf_data_.swap(private_csf);
+}
+
 /** Compute VGL of this MultiSlaterDetTableMethod
  *
  * THis is introduced to remove redundant code in

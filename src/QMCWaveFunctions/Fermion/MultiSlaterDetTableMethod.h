@@ -226,6 +226,13 @@ public:
                        const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const override;
 
   std::unique_ptr<WaveFunctionComponent> makeClone(ParticleSet& tqp) const override;
+
+  /** Detach mutable CI/CSF state in an optimization-private clone.
+   * Call before registration or parameter reset. Ordinary sampling clones retain
+   * their existing sharing behavior; determinant mappings remain immutable/shared.
+   * All fallible copies finish before any ownership changes are activated.
+   */
+  void isolateOptimizationState();
   void evaluateDerivatives(ParticleSet& P,
                            const OptVariables& optvars,
                            Vector<ValueType>& dlogpsi,

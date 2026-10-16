@@ -14,6 +14,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "Particle/ParticleSet.h"
+#include "Particle/ParticleSetPool.h"
+#include "OhmmsData/Libxml2Doc.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
@@ -22,6 +24,8 @@
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "QMCWaveFunctions/WaveFunctionFactory.h"
+#include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "SimulationCell.h"
 
@@ -816,6 +820,168 @@ TEST_CASE("Legacy replay block views share bounded parameter workspace and immut
   invalid->values[0] = std::numeric_limits<double>::quiet_NaN();
   CHECK_THROWS_AS(adapter.makeDerivativeOperator(replay, invalid, 0, 0), std::invalid_argument);
   CHECK_THROWS_AS(adapter.makeDerivativeOperator({}, snapshot, 0, 0), std::invalid_argument);
+}
+
+TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
+          "[drivers][training][legacy_adapter][multideterminant]")
+{
+  // Hydrogen STO-3G and orbital coefficients from tests/molecules/H4_ae/H4.wfs.xml.
+  // Two CSFs/DETS keep this oracle small; the second coefficient is exactly zero.
+  for (bool csf : {false, true})
+  {
+    CAPTURE(csf);
+    ParticleSetPool pool(OHMMS::Controller);
+    auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+    auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+    auto& ions = *ion_owner;
+    auto& electrons = *electron_owner;
+    ions.setName("ion0");
+    ions.create({4});
+    auto& ion_species = ions.getSpeciesSet();
+    const int hydrogen = ion_species.addSpecies("H");
+    const int charge = ion_species.addAttribute("charge");
+    ion_species(charge, hydrogen) = 1.0;
+    ions.R[0] = {0, 0, -1.5};
+    ions.R[1] = {0, 0, -0.5};
+    ions.R[2] = {0, 0, 0.5};
+    ions.R[3] = {0, 0, 1.5};
+    ions.resetGroups();
+    electrons.setName("e");
+    electrons.create({2, 2});
+    auto& species = electrons.getSpeciesSet();
+    const int up = species.addSpecies("u"), down = species.addSpecies("d");
+    const int mass = species.addAttribute("mass");
+    species(mass, up) = species(mass, down) = 1.0;
+    electrons.resetGroups();
+    electrons.R[0] = {0.3, 0.2, -1.1};
+    electrons.R[1] = {-0.2, 0.4, 0.8};
+    electrons.R[2] = {0.1, -0.3, -0.4};
+    electrons.R[3] = {-0.4, -0.2, 1.3};
+    pool.addParticleSet(std::move(ion_owner));
+    pool.addParticleSet(std::move(electron_owner));
+    const std::string expansion = csf ? R"(
+      <detlist size="2" type="CSF" nca="0" ncb="0" nea="2" neb="2" nstates="3" cutoff="0">
+        <csf id="CI0" coeff="0.6" occ="220" exctLvl="0"><det coeff="1" alpha="110" beta="110"/></csf>
+        <csf id="CI1" coeff="0" occ="202" exctLvl="2"><det coeff="1" alpha="101" beta="101"/></csf>
+      </detlist>)" : R"(
+      <detlist size="2" type="DETS" nc0="0" nc1="0" ne0="2" ne1="2" nstates="3" cutoff="0">
+        <ci id="CI0" coeff="0.6" occ0="110" occ1="110"/>
+        <ci id="CI1" coeff="0" occ0="101" occ1="101"/>
+      </detlist>)";
+    const std::string xml = std::string{R"(
+    <wavefunction name="psi0" target="e">
+      <sposet_collection type="MolecularOrbital" name="LCAOBSet" transform="yes" source="ion0">
+        <basisset name="LCAOBSet">
+          <atomicBasisSet name="Gaussian" angular="cartesian" type="Gaussian" elementType="H" normalized="no">
+            <grid type="log" ri="1.e-6" rf="1.e2" npts="1001"/>
+            <basisGroup rid="H00" n="0" l="0" type="Gaussian">
+              <radfunc exponent="3.4252509" contraction="0.154328967295"/>
+              <radfunc exponent="0.6239137" contraction="0.535328142282"/>
+              <radfunc exponent="0.1688554" contraction="0.444634542185"/>
+            </basisGroup>
+          </atomicBasisSet>
+        </basisset>
+        <sposet name="spo" basisset="LCAOBSet" size="3" optimize="no">
+          <occupation mode="ground"/>
+          <coefficient size="4" id="fixed_orbitals">
+             0.504668 0.450114 0.358423 0.126449
+            -0.240452 -0.320413 0.466777 0.703549
+             0.088008 -0.504842 0.807522 -0.719301
+             1.033235 -0.877213 -0.390492 0.212318
+          </coefficient>
+        </sposet>
+      </sposet_collection>
+      <determinantset>
+        <multideterminant optimize="yes" spo_0="spo" spo_1="spo" algorithm="precomputed_table_method">)"} +
+        expansion + R"(</multideterminant>
+      </determinantset>
+      <jastrow name="J2" type="Two-Body" function="Bspline">
+        <correlation rcut="4" size="4" speciesA="u" speciesB="u">
+          <coefficients id="uu" type="Array" optimize="yes">0.04 -0.02 0.01 -0.005</coefficients>
+        </correlation>
+        <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+          <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+        </correlation>
+      </jastrow>
+    </wavefunction>)";
+    Libxml2Document document;
+    REQUIRE(document.parseFromString(xml));
+    WaveFunctionFactory factory(electrons, pool.getPool(), OHMMS::Controller);
+    auto source = factory.buildTWF(document.getRoot(), RuntimeOptions{});
+    REQUIRE(source);
+    ions.update();
+    electrons.update();
+    source->evaluateLog(electrons);
+    ParticleSet private_particles(electrons), sibling_particles(electrons);
+    auto evaluator = source->makeClone(private_particles);
+    auto sibling = source->makeClone(sibling_particles);
+    auto& source_msd = source->findMSD()[0].get();
+    auto& private_msd = evaluator->findMSD()[0].get();
+    auto& sibling_msd = sibling->findMSD()[0].get();
+    REQUIRE(source_msd.get_C().size() == 2);
+    CHECK(source_msd.get_C().data() == private_msd.get_C().data());
+    private_msd.isolateOptimizationState();
+    CHECK(source_msd.get_C().data() != private_msd.get_C().data());
+    CHECK(source_msd.get_C().data() == sibling_msd.get_C().data());
+    LegacyWaveFunctionAdapter adapter("legacy/mdj", *source, adapterOptions());
+    auto snapshot = adapter.snapshotParameters();
+    REQUIRE(snapshot.values.size() == 9);
+    REQUIRE(adapter.parameterSchema().blocks()[0].update_group == "legacy_linear");
+    REQUIRE(snapshot.values[0] == 0.0);
+    const auto original_coefficients = source_msd.get_C();
+    for (double coefficient : {0.0, -0.17})
+    {
+      CAPTURE(coefficient);
+      auto candidate = snapshot;
+      candidate.values[0] = coefficient;
+      adapter.installSnapshot(*evaluator, private_particles, candidate);
+      CHECK(private_msd.get_C()[0] == original_coefficients[0]);
+      CHECK(private_msd.get_C()[1] == makeValue(coefficient));
+      CHECK(source_msd.get_C() == original_coefficients);
+      CHECK(sibling_msd.get_C() == original_coefficients);
+      auto op = adapter.makeDerivativeOperator(
+          std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles, std::vector<double>{0.0}),
+          std::make_shared<const StructuredParameterSnapshot>(candidate), 0, 0);
+      // Use the original four-electron configuration; the two-electron shift
+      // replay also updates distance tables and leaves electrons 2 and 3 fixed.
+      const std::vector<DerivativeValue> unit{1.0};
+      const std::array<VJPCoefficientChannel, 2> channels{{
+          {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0},
+          {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit),
+           localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+      RecordingParameterSink rows;
+      op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+      for (std::size_t parameter = 0; parameter < candidate.values.size(); ++parameter)
+      {
+        CAPTURE(parameter);
+        const double epsilon = 1e-5;
+        auto plus = candidate, minus = candidate;
+        plus.values[parameter] += epsilon;
+        minus.values[parameter] -= epsilon;
+        adapter.installSnapshot(*evaluator, private_particles, plus);
+        const double plus_log = evaluator->getLogPsi();
+        const auto plus_energy = kineticEnergy(private_particles);
+        adapter.installSnapshot(*evaluator, private_particles, minus);
+        const double minus_log = evaluator->getLogPsi();
+        const auto minus_energy = kineticEnergy(private_particles);
+        const DerivativeValue score_fd{(plus_log - minus_log) / (2.0 * epsilon)};
+        const auto energy_fd = (plus_energy - minus_energy) / (2.0 * epsilon);
+        for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        {
+          const auto expected = channel == 0 ? score_fd : energy_fd;
+          CHECK(rows.result()[channel][parameter].real() ==
+                Catch::Approx(expected.real()).epsilon(2e-6).margin(2e-8));
+          CHECK(rows.result()[channel][parameter].imag() == Catch::Approx(expected.imag()).margin(2e-8));
+        }
+      }
+      CHECK(source_msd.get_C() == original_coefficients);
+      CHECK(sibling_msd.get_C() == original_coefficients);
+    }
+    optimize::VariableSet source_variables;
+    source->checkInVariables(source_variables);
+    source_variables.resetIndex();
+    CHECK(source_variables[0] == snapshot.values[0]);
+  }
 }
 
 TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoint restore",
