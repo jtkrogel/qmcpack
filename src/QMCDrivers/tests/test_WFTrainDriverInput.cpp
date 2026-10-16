@@ -12,6 +12,7 @@
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 
+#include <array>
 #include <limits>
 #include <string>
 
@@ -718,6 +719,79 @@ TEST_CASE("WFTrainDriverInput distinguishes RSS and numeric storage guards", "[d
   CHECK(guarded.getMaximumRetainedBytes() == 524288);
   CHECK_THROWS(parseTrainingInput(
       "<qmc><training><parameter name='maximum_resident_bytes'>-1</parameter></training></qmc>"));
+}
+
+TEST_CASE("WFTrainDriverInput validates complete bounded complex GPU opt-in",
+          "[drivers][wf_train][complex_gpu_training_input]")
+{
+  const std::array<std::string, 4> names{"complex_gpu_device_bytes", "complex_gpu_host_bytes",
+      "complex_gpu_kinetic_targets", "complex_gpu_maximum_matrix_work"};
+  const std::array<std::string, 4> values{"8192", "4096", "3", "777"};
+  const auto controls = [&](unsigned mask, int invalid = -1, const std::string& spelling = "") {
+    std::string result;
+    for (std::size_t i = 0; i < names.size(); ++i)
+      if (mask & (1U << i))
+        result += "<parameter name='" + names[i] + "'>" +
+            (static_cast<int>(i) == invalid ? spelling : values[i]) + "</parameter>";
+    return result;
+  };
+  const auto parse = [&](const std::string& extra) {
+    return parseTrainingInput("<qmc><training objective='energy' optimizer='adam'>" + extra + "</training></qmc>");
+  };
+  const auto check_disabled = [](const WFTrainDriverInput& input) {
+    const auto& gpu = input.getComplexGpuTraining();
+    CHECK_FALSE(gpu.enabled());
+    CHECK(gpu.device_bytes == 0);
+    CHECK(gpu.host_bytes == 0);
+    CHECK(gpu.kinetic_targets == 0);
+    CHECK(gpu.maximum_matrix_work == 0);
+  };
+
+  const auto defaults = parse("");
+  check_disabled(defaults);
+  CHECK(defaults.getObjective() == WFTrainDriverInput::Objective::ENERGY);
+  CHECK(defaults.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM);
+  CHECK(defaults.getLearningRate() == 1e-3);
+  CHECK(defaults.getMaximumRetainedBytes() == 0);
+  const auto input = parse(controls(15));
+  const auto& gpu = input.getComplexGpuTraining();
+  CHECK(gpu.enabled());
+  CHECK(gpu.device_bytes == 8192);
+  CHECK(gpu.host_bytes == 4096);
+  CHECK(gpu.kinetic_targets == 3);
+  CHECK(gpu.maximum_matrix_work == 777);
+  CHECK(input.getLearningRate() == defaults.getLearningRate());
+  CHECK(input.getDamping() == defaults.getDamping());
+  CHECK(input.getMaximumRetainedBytes() == defaults.getMaximumRetainedBytes());
+
+  // Every nonempty proper subset fails, and each bad field is isolated among three valid controls.
+  for (unsigned mask = 1; mask < 15; ++mask)
+  {
+    INFO("control mask=" << mask);
+    CHECK_THROWS(parse(controls(mask)));
+  }
+  const auto largest = std::to_string(std::numeric_limits<std::size_t>::max());
+  for (int field = 0; field < 4; ++field)
+    for (const auto& invalid : {std::string("0"), std::string("-1"), std::string("1x"), std::string("1.5"),
+             std::string(""), std::string("nan"), largest, largest + "0"})
+    {
+      INFO(names[field] << "='" << invalid << "'");
+      CHECK_THROWS(parse(controls(15, field, invalid)));
+    }
+  CHECK_THROWS(parse(controls(15) + "<parameter name='complex_gpu_host_bytes'>4096</parameter>"));
+
+  auto reused = parse(controls(15) + "<parameter name='learning_rate'>0.0007</parameter>"
+      "<parameter name='maximum_retained_bytes'>524288</parameter>");
+  CHECK(reused.getLearningRate() == 0.0007);
+  CHECK(reused.getMaximumRetainedBytes() == 524288);
+  Libxml2Document second;
+  REQUIRE(second.parseFromString("<qmc><training/></qmc>"));
+  reused.readXML(second.getRoot());
+  check_disabled(reused);
+  CHECK(reused.getLearningRate() == defaults.getLearningRate());
+  CHECK(reused.getMaximumRetainedBytes() == defaults.getMaximumRetainedBytes());
+  CHECK(reused.getParameterChunkSize() == defaults.getParameterChunkSize());
+  CHECK(reused.getOptimizer() == defaults.getOptimizer());
 }
 
 } // namespace qmcplusplus

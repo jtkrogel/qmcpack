@@ -26,6 +26,7 @@ class StructuredParameterProvider;
 
 namespace qmcplusplus
 {
+class PsiFormerComplexWF;
 
 namespace psiformer
 {
@@ -65,6 +66,10 @@ private:
   TrialWaveFunction& student_prototype_;
   std::string selected_provider_id_;
   wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
+  /// Driver-only opt-in authority; generic GPU component discovery/publication remains closed.
+  std::unique_ptr<wftrain::StructuredParameterProvider> complex_gpu_provider_;
+  /// Actual numerical component remains distinct from its driver-owned provider adapter.
+  PsiFormerComplexWF* complex_training_component_ = nullptr;
   /// Resolved once during pre-draw process admission, never re-read mid-run.
   std::size_t resident_adam_budget_ = 0, resident_norm_bytes_ = 0;
   /// Complete SR cap pair and incremental peak, resolved before sampling.

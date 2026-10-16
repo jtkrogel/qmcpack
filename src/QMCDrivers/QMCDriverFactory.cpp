@@ -261,8 +261,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
 #ifdef QMC_COMPLEX
     requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system);
     if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
-        das.new_run_type != QMCRunType::VMC_BATCH)
-      throw UniformCommunicateError("Complex GPU inference requires CPU-sampled PBYP VMC_BATCH");
+        das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
+      throw UniformCommunicateError("Complex GPU requires PBYP VMC_BATCH or explicitly admitted WF_TRAIN_BATCH");
 #endif
 
     auto makeEstimatorManager =

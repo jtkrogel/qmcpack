@@ -1093,7 +1093,15 @@ std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
   std::shared_lock read(impl_->state->mutex);
   const auto& s = *impl_->state;
   std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
-  mixPersistentString(hash, "cpu_complex_pathwise_coulomb_v1");
+#ifdef ENABLE_CUDA
+  if (s.gpu)
+  {
+    mixPersistentString(hash, "gpu_complex_pathwise_coulomb_v1");
+    mixPersistentInteger(hash, s.gpu->preparation.max_targets); // Frozen inference FULL(0)/target-K profile.
+  }
+  else
+#endif
+    mixPersistentString(hash, "cpu_complex_pathwise_coulomb_v1");
   mixPersistentString(hash, s.profile);
   mixPersistentInteger(hash, s.seed);
   mixPersistentString(hash, s.schema->fingerprint());

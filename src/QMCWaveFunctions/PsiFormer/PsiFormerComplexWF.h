@@ -5,7 +5,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexWF.h
  * @brief Native-free paired-head inference sibling with explicit CPU or serialized GPU numerics.
- * CPU structured training is explicit; GPU optimization remains closed.
+ * CPU structured training and a separately capped hybrid GPU driver are explicit.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
@@ -48,7 +48,7 @@ public:
   /// Report the explicitly qualified component rather than impersonating the real adapter.
   std::string getClassName() const override { return "PsiFormerComplexWF"; }
 
-  /// Only the CPU sibling participates in qualified structured training.
+  /// Only the CPU sibling participates in generic structured-provider discovery.
   wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override
   { return gpuInferenceEnabled() ? nullptr : this; }
 
@@ -74,7 +74,7 @@ public:
   /// Exact image plus frozen VALUE/SPATIAL owners and HOST staging, not an aggregate transition-peak cap.
   GpuParameterPublicationRequirements gpuParameterPublicationRequirements() const;
 
-  /// Explicit expert publication only; generic GPU discovery/publication and GPU training remain closed.
+  /// Explicit expert/opt-in hybrid-driver publication; generic GPU discovery/publication remains closed.
   std::size_t publishBudgetedGpuParameters(const wftrain::StructuredParameterSnapshot& candidate,
       std::size_t expected_version, std::size_t additional_device_cap, std::size_t additional_host_cap);
 
@@ -98,7 +98,7 @@ public:
   GpuDerivativeRequirements gpuDerivativeRequirements(std::size_t sample_count,
       std::size_t maximum_batch_samples, std::size_t targets, std::size_t chunk) const;
 
-  /// Immutable analysis only: actual sole TrialWF clones, TRANSPOSE SCORE/complete physical dK, no training discovery.
+  /// Immutable sample products for explicit analysis/hybrid driver: sole TrialWF, TRANSPOSE SCORE/physical dK.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeBudgetedGpuDerivativeOperator(
       const RefVectorWithLeader<TrialWaveFunction>& wavefunctions,
       const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal, std::size_t sample_offset,
@@ -111,7 +111,7 @@ public:
   /// Report the prepared determinant expansion's actual extent.
   bool isMultiDet() const override;
 
-  /// Strict inference-only B=1 GPU profile; CPU sampling/Hamiltonian remain authoritative.
+  /// Prepared B=1 GPU inference profile; separately admitted hybrid training retains CPU sampling/Hamiltonian.
   bool gpuInferenceEnabled() const noexcept;
 
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.

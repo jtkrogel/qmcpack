@@ -2095,6 +2095,8 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
                                                      twist, 64 * 1024 * 1024);
     auto& gpu = *owner;
     trial.addComponent(std::move(owner));
+    const auto physical_identity = gpu.trainingConfigurationFingerprint();
+    CHECK(physical_identity != cpu.trainingConfigurationFingerprint());
     auto clone_owner = gpu.makeClone(clone_p);
     auto& clone = dynamic_cast<PsiFormerComplexWF&>(*clone_owner);
     RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial});
@@ -2106,6 +2108,8 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
     CHECK(metrics.snapshot().live_bytes - outside.live_bytes == required.device_bytes);
     CHECK_THROWS(cpu.gpuParameterPublicationRequirements());
     const auto refresh = [&]() {
+      CHECK(gpu.trainingConfigurationFingerprint() == physical_identity);
+      CHECK(clone.trainingConfigurationFingerprint() == physical_identity);
       close(evaluate(gpu, p), evaluate(cpu, cpu_p));
       close(evaluate(clone, clone_p), cpu.get_log_value());
       for (int e = 0; e < 4; ++e)

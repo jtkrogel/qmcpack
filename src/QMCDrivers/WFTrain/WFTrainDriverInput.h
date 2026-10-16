@@ -149,6 +149,17 @@ public:
    * available; it is not a process-wide allocator limit.
    */
   std::size_t getMaximumRetainedBytes() const noexcept { return maximum_retained_bytes_; }
+
+  /// Explicit additional derivative/successor-generation caps; all absent keeps GPU training closed.
+  struct ComplexGpuTraining
+  {
+    std::size_t device_bytes = 0, host_bytes = 0, kinetic_targets = 0, maximum_matrix_work = 0;
+    /// All four validated fields are either absent or enabled together.
+    bool enabled() const noexcept { return device_bytes != 0; }
+  };
+
+  /// Resource policy is immutable during a training stage, not a process-peak budget.
+  const ComplexGpuTraining& getComplexGpuTraining() const noexcept { return complex_gpu_training_; }
   /// Optional measured process-RSS guard; distinct from numeric workspace accounting.
   std::size_t getMaximumResidentBytes() const noexcept { return maximum_resident_bytes_; }
   const std::string& getCheckpointPath() const noexcept { return checkpoint_path_; }
@@ -214,6 +225,7 @@ private:
   double krylov_curvature_tolerance_{0.0};
   double krylov_imaginary_tolerance_{64.0};
   std::size_t maximum_retained_bytes_{0};
+  ComplexGpuTraining complex_gpu_training_;
   std::size_t maximum_resident_bytes_{0};
   std::string checkpoint_path_;
   std::string restart_path_;

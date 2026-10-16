@@ -348,6 +348,46 @@ wftrain::FirstOrderOptimizerOptions makeFirstOrderOptions(const wftrain::Structu
   return options;
 }
 
+#ifdef QMC_COMPLEX
+/// Narrow driver authority: no parameter copy/lane and no change to generic GPU component discovery.
+class ComplexGpuTrainingProvider final : public wftrain::StructuredParameterProvider
+{
+public:
+  /// Publication receives only the exact admitted successor-generation caps, not derivative ownership.
+  ComplexGpuTrainingProvider(PsiFormerComplexWF& component, std::size_t device, std::size_t host)
+      : component_(component), device_(device), host_(host)
+  {}
+
+  /// Keep the actual component's canonical REAL schema and lifetime.
+  const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override
+  {
+    return component_.parameterSchema();
+  }
+
+  /// Snapshot the same atomic model used by actual walker clones.
+  wftrain::StructuredParameterSnapshot snapshotParameters() const override
+  {
+    return component_.snapshotParameters();
+  }
+
+  /// Numerical products run on GPU even though completed complex chunks are emitted on HOST.
+  bool usesAcceleratorParameterProducts() const noexcept override
+  {
+    return true;
+  }
+
+  /// Reuse the qualified old-version transaction and complete new-generation publication.
+  std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate, std::size_t version) override
+  {
+    return component_.publishBudgetedGpuParameters(candidate, version, device_, host_);
+  }
+
+private:
+  PsiFormerComplexWF& component_;
+  const std::size_t device_, host_;
+};
+#endif
+
 /** Copy live crowd metadata and bind it to a version-checked derivative owner. */
 wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     Crowd& crowd,
@@ -357,7 +397,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     std::size_t maximum_parameter_chunk_size,
     bool has_nonlocal_ecp,
     bool capture_ecp_jvp_replay,
-    bool complex_training = false)
+    bool complex_training = false,
+    const WFTrainDriverInput::ComplexGpuTraining* gpu_training = nullptr)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -384,9 +425,9 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     auto componentAt = [&](std::size_t sample) -> PsiFormerComplexWF& {
       const auto& components = twfs[sample].get().getOrbitals();
       auto* component = components.size() == 1 ? dynamic_cast<PsiFormerComplexWF*>(components[0].get()) : nullptr;
-      if (!component || component->gpuInferenceEnabled() ||
+      if (!component || component->gpuInferenceEnabled() != (gpu_training != nullptr) ||
           component->parameterSchema().providerId() != provider_id)
-        throw std::invalid_argument("WFTrainBatched: paired CPU batch lost its sole component/provider binding");
+        throw std::invalid_argument("WFTrainBatched: paired batch lost its sole component/provider/mode binding");
       return *component;
     };
     auto& leader = componentAt(0);
@@ -402,9 +443,21 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       // The actual admitted same-sample Coulomb H supplies V; REAL walker properties are reporting only.
       batch.local_energies.push_back(component.observeCoulombEnergy(p, hamiltonian.getLocalPotential()).local_energy);
     }
-    const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
-    batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
-        component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+    if (gpu_training)
+    {
+      const auto chunk = std::min(maximum_parameter_chunk_size, leader.parameterSchema().parameterCount());
+      const auto required = leader.gpuDerivativeRequirements(
+          walkers.size(), walkers.size(), gpu_training->kinetic_targets, chunk);
+      batch.derivative_operator = leader.makeBudgetedGpuDerivativeOperator(twf_batch, electron_batch,
+          batch_ordinal, sample_offset, walkers.size(), gpu_training->kinetic_targets, chunk,
+          required.device_bytes, required.host_bytes, gpu_training->maximum_matrix_work);
+    }
+    else
+    {
+      const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
+      batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
+          component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+    }
     return batch;
   }
 #endif
@@ -968,6 +1021,11 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
     extendStageFingerprint(hash, std::string("resident-energy-c3-adam-v1"));
   if (resident_energy_sr)
     extendStageFingerprint(hash, std::string("resident-energy-c3-sr-v1"));
+  if (training.getComplexGpuTraining().enabled())
+  {
+    extendStageFingerprint(hash, std::string("paired-gpu-pathwise-first-order-v1"));
+    extendStageFingerprint(hash, training.getComplexGpuTraining().kinetic_targets);
+  }
   if (!complex_physical_identity.empty())
     extendStageFingerprint(hash, complex_physical_identity);
   const auto objective = static_cast<std::underlying_type_t<WFTrainDriverInput::Objective>>(
@@ -1108,11 +1166,18 @@ void WFTrainBatched::process(xmlNodePtr node)
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
 #ifdef QMC_COMPLEX
     for (const auto& orbital : student_prototype_.getOrbitals())
-      if (const auto* complex = dynamic_cast<const PsiFormerComplexWF*>(orbital.get()))
+      if (auto* complex = dynamic_cast<PsiFormerComplexWF*>(orbital.get()))
       {
+        complex_training_component_ = complex;
         using O = WFTrainDriverInput::Optimizer;
         const auto cap = training_input_.getMaximumRetainedBytes();
-        if (complex->gpuInferenceEnabled() || student_prototype_.getOrbitals().size() != 1 ||
+        if (complex->gpuInferenceEnabled() &&
+            (!training_input_.getComplexGpuTraining().enabled() || myComm->size() != 1 ||
+             vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
+             (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD)))
+          throw UniformCommunicateError(
+              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY Adam/plainSGD");
+        if (student_prototype_.getOrbitals().size() != 1 ||
             training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
             (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD &&
              training_input_.getOptimizer() != O::STOCHASTIC_RECONFIGURATION) ||
@@ -1121,15 +1186,31 @@ void WFTrainBatched::process(xmlNodePtr node)
             training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
             training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
             !cap || cap == std::numeric_limits<std::size_t>::max())
-          throw UniformCommunicateError("WFTrainBatched: paired training requires sole CPU ENERGY Adam/plainSGD "
+          throw UniformCommunicateError("WFTrainBatched: paired training requires sole ENERGY Adam/plainSGD "
               "or positively damped parameter-space SR, unclipped fixed step, no norm/selection controls, "
               "and positive finite maximum_retained_bytes");
       }
 #endif
+    if (training_input_.getComplexGpuTraining().enabled())
+    {
+#ifdef QMC_COMPLEX
+      if (!complex_training_component_ || !complex_training_component_->gpuInferenceEnabled())
+#endif
+        throw UniformCommunicateError("WFTrainBatched: complex GPU controls require a sole paired GPU profile");
+    }
     if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY)
       validateHamiltonianForTraining();
 
-    const auto providers = student_prototype_.extractStructuredParameterProviders();
+    auto providers = student_prototype_.extractStructuredParameterProviders();
+#ifdef QMC_COMPLEX
+    if (complex_training_component_ && complex_training_component_->gpuInferenceEnabled())
+    {
+      const auto q = complex_training_component_->gpuParameterPublicationRequirements();
+      complex_gpu_provider_ = std::make_unique<ComplexGpuTrainingProvider>(*complex_training_component_,
+                                                                         q.device_bytes, q.host_bytes);
+      providers.emplace_back(*complex_gpu_provider_);
+    }
+#endif
     const std::string& requested_provider = training_input_.getProviderID();
     if (requested_provider.empty())
     {
@@ -1172,6 +1253,9 @@ void WFTrainBatched::process(xmlNodePtr node)
                                               qmcdriver_input_.get_requested_steps(),
                                               qmcdriver_input_.get_max_blocks());
     initPopulationAndCrowds(walker_counts);
+    if (complex_gpu_provider_ &&
+        (crowds_.size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
+      throw UniformCommunicateError("WFTrainBatched: paired GPU requires actual crowd1/blocks1/steps1 before sampling");
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
     resident_sr_budget_ = device_provider ? device_provider->residentEnergySRBudget() : std::pair<std::size_t, std::size_t>{0, 0};
@@ -1259,7 +1343,7 @@ void WFTrainBatched::run()
   std::size_t complex_expected_prepared_bytes = 0;
   std::string complex_physical_identity;
 #ifdef QMC_COMPLEX
-  if (const auto* complex = dynamic_cast<const PsiFormerComplexWF*>(selected_provider_))
+  if (const auto* complex = complex_training_component_)
   {
     complex_training = true;
     std::exception_ptr budget_failure;
@@ -1281,7 +1365,28 @@ void WFTrainBatched::run()
       const auto n = static_cast<std::size_t>(target.getTotalNum());
       const auto p = selected_provider_->parameterSchema().parameterCount();
       // R(S) counts the weak-shared family lane ONCE and all disjoint immutable coordinates/masses.
-      complex_expected_prepared_bytes = checkedMemoryAdd(complex->streamingDerivativeRequiredBytes(samples),
+      std::size_t derivative_bytes = 0, successor_bytes = 0;
+      if (complex_gpu_provider_)
+      {
+        const auto& limits = training_input_.getComplexGpuTraining();
+        const auto r = complex->gpuDerivativeRequirements(samples, largest_batch, limits.kinetic_targets,
+            std::min(p, training_input_.getParameterChunkSize()));
+        const auto q = complex->gpuParameterPublicationRequirements();
+        const auto device = checkedMemoryAdd(r.device_bytes, q.device_bytes);
+        const auto host = checkedMemoryAdd(r.host_bytes, q.host_bytes);
+        if (device > limits.device_bytes || host > limits.host_bytes || r.matrix_work > limits.maximum_matrix_work)
+          throw std::length_error(
+              "WFTrainBatched: paired GPU derivative+successor device/HOST/work cap exceeded before sampling");
+        derivative_bytes = checkedMemoryAdd(r.device_bytes, r.host_bytes);
+        successor_bytes = checkedMemoryAdd(q.device_bytes, q.host_bytes);
+        app_log() << "WFTrain paired GPU admitted additional device=" << device << " HOST=" << host
+                  << " derivative=" << derivative_bytes << " successor=" << successor_bytes
+                  << " K=" << limits.kinetic_targets << " matrix_work=" << r.matrix_work
+                  << "; excludes prepared inference generation, native/image HOST and vendor storage" << std::endl;
+      }
+      else
+        derivative_bytes = complex->streamingDerivativeRequiredBytes(samples);
+      complex_expected_prepared_bytes = checkedMemoryAdd(derivative_bytes,
           checkedMemoryMultiply(samples, sizeof(wftrain::DerivativeReal) + sizeof(wftrain::DerivativeValue)));
       const auto configuration_bytes = checkedMemoryMultiply(samples, checkedMemoryAdd(sizeof(double),
           checkedMemoryMultiply(n, sizeof(target.R[0]) + sizeof(target.G[0]) + sizeof(target.L[0]))));
@@ -1302,6 +1407,7 @@ void WFTrainBatched::run()
       }
       prospective = checkedMemoryAdd(checkedMemoryAdd(complex_expected_prepared_bytes, configuration_bytes),
           checkedMemoryAdd(covariance_bytes, checkedMemoryAdd(optimizer_bytes, allowance)));
+      prospective = checkedMemoryAdd(prospective, successor_bytes);
       complex_physical_identity = complex->trainingConfigurationFingerprint();
     }
     catch (...) { budget_failure = std::current_exception(); }
@@ -1314,7 +1420,8 @@ void WFTrainBatched::run()
       throw UniformCommunicateError("WFTrainBatched: another rank failed paired training preallocation admission");
     }
     enforceMemoryBudget(*myComm, prospective, training_input_.getMaximumRetainedBytes());
-    app_log() << "WFTrain paired CPU prospective named numeric bytes plus allowance=" << prospective
+    app_log() << "WFTrain paired " << (complex_gpu_provider_ ? "GPU" : "CPU")
+              << " prospective named numeric bytes plus allowance=" << prospective
               << ", conservative snapshot/solve allowance=" << allowance
               << "; excludes shared model, inference clones, opaque ParticleSet caches, allocator/RSS" << std::endl;
   }
@@ -1858,7 +1965,8 @@ void WFTrainBatched::run()
             batches.push_back(prepareCrowdBatch(
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,
-                capture_ecp_jvp_replay, complex_training));
+                capture_ecp_jvp_replay, complex_training,
+                complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);

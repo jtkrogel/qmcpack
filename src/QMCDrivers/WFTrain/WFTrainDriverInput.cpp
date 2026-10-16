@@ -28,7 +28,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 63> allowed_controls{
+constexpr std::array<std::string_view, 67> allowed_controls{
     "iterations", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
@@ -43,6 +43,7 @@ constexpr std::array<std::string_view, 63> allowed_controls{
     "krylov_maximum_operator_applications", "krylov_maximum_seconds", "krylov_stagnation_window",
     "krylov_minimum_relative_improvement", "krylov_curvature_tolerance", "krylov_imaginary_tolerance",
     "maximum_retained_bytes", "maximum_resident_bytes", "checkpoint_path", "restart_path", "provider",
+    "complex_gpu_device_bytes", "complex_gpu_host_bytes", "complex_gpu_kinetic_targets", "complex_gpu_maximum_matrix_work",
     "teacher", "overlap_target", "overlap_weighting", "target_provenance", "orbital_target",
     "minimum_fidelity", "minimum_effective_samples", "pii_shift_mode",
     "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
@@ -296,6 +297,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   krylov_curvature_tolerance_          = 0.0;
   krylov_imaginary_tolerance_          = 64.0;
   maximum_retained_bytes_              = 0;
+  complex_gpu_training_                = {};
   maximum_resident_bytes_              = 0;
   checkpoint_path_.clear();
   restart_path_.clear();
@@ -535,6 +537,22 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (seen_controls.count("maximum_resident_bytes"))
     maximum_resident_bytes_ = parseNonnegativeSize(readControl("maximum_resident_bytes"),
                                                   "maximum_resident_bytes");
+  // These four controls form one opt-in contract; zero/SIZE_MAX never mean unlimited.
+  const std::array<const char*, 4> gpu_names{"complex_gpu_device_bytes", "complex_gpu_host_bytes",
+      "complex_gpu_kinetic_targets", "complex_gpu_maximum_matrix_work"};
+  const std::array<std::size_t*, 4> gpu_values{&complex_gpu_training_.device_bytes, &complex_gpu_training_.host_bytes,
+      &complex_gpu_training_.kinetic_targets, &complex_gpu_training_.maximum_matrix_work};
+  std::size_t gpu_present = 0;
+  for (std::size_t i = 0; i < gpu_names.size(); ++i)
+    if (seen_controls.count(gpu_names[i]))
+    {
+      ++gpu_present;
+      *gpu_values[i] = parsePositiveSize(readControl(gpu_names[i]), gpu_names[i]);
+      if (*gpu_values[i] == std::numeric_limits<std::size_t>::max())
+        throw UniformCommunicateError("WFTrainDriverInput: complex GPU controls require finite positive limits");
+    }
+  if (gpu_present && gpu_present != gpu_names.size())
+    throw UniformCommunicateError("WFTrainDriverInput: all four complex GPU controls are required together");
   if (seen_controls.find("checkpoint_path") != seen_controls.end())
     checkpoint_path_ = readControl("checkpoint_path");
   if (seen_controls.find("restart_path") != seen_controls.end())
