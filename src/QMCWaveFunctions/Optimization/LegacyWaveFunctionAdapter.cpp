@@ -453,7 +453,17 @@ public:
       record_->tile_data.push_back({tile.tile_ordinal, point_offset, tile.virtual_particles.size(), segment_offset,
           record_->segment_data.size() - segment_offset, stamp_offset, tile.evaluation_stamps.size(),
           tile.virtual_particles.fingerprint()});
-      validateECPRecord(*record_);
+      // Validate only this new tile here; end/bind perform the complete audit.
+      for (std::size_t p = point_offset; p < record_->point_data.size(); ++p)
+      {
+        const auto& point = record_->point_data[p];
+        for (double coordinate : point.replacement_position) requireFiniteECP({coordinate, 0});
+        requireFiniteECP(point.bare_weight);
+        requireFiniteECP(point.complete_ratio);
+        requireFiniteECP(point.bare_weight * point.complete_ratio);
+        if (point.bare_weight.imag() != 0 || point.complete_ratio.imag() != 0)
+          throw std::invalid_argument("Legacy ECP capture requires real weights and ratios");
+      }
     }
     catch (...) { abort(); throw; }
   }
@@ -606,6 +616,16 @@ public:
               replay->referencePositions()[(sample * replay->electronCount() + electron) * 3 + dimension])
             throw std::invalid_argument("Legacy ECP replay reference coordinates differ from private evaluator");
     }
+    // Index segment ownership once: each action visits only its sample's knots.
+    std::vector<std::size_t> offsets(sampleCount() + 1, 0);
+    std::vector<std::size_t> indices(replay->segments().size());
+    for (const auto& segment : replay->segments()) ++offsets[segment.sample + 1];
+    for (std::size_t sample = 1; sample < offsets.size(); ++sample) offsets[sample] += offsets[sample - 1];
+    auto cursor = offsets;
+    for (std::size_t segment = 0; segment < replay->segments().size(); ++segment)
+      indices[cursor[replay->segments()[segment].sample]++] = segment;
+    ecp_segment_offsets_ = std::move(offsets);
+    ecp_segment_indices_ = std::move(indices);
     ecp_replay_ = std::move(replay);
   }
 
@@ -620,7 +640,13 @@ public:
       result.sample_auxiliary_bytes = grid.point_bytes + grid.provenance_bytes;
       result.retained_numeric_bytes = checkedAdd(result.retained_numeric_bytes, grid.retained_numeric_bytes,
                                                 "Legacy ECP retained bytes");
+      const auto index_bytes = checkedMultiply(checkedAdd(ecp_segment_offsets_.capacity(), ecp_segment_indices_.capacity(),
+          "Legacy ECP segment indices"), sizeof(std::size_t), "Legacy ECP segment index bytes");
+      result.sample_auxiliary_bytes = checkedAdd(result.sample_auxiliary_bytes, index_bytes, "Legacy ECP auxiliary bytes");
+      result.retained_numeric_bytes = checkedAdd(result.retained_numeric_bytes, index_bytes, "Legacy ECP retained indices");
       result.storage_fingerprint ^= grid.storage_fingerprint;
+      result.storage_fingerprint ^= reinterpret_cast<std::size_t>(ecp_segment_offsets_.data()) ^
+          reinterpret_cast<std::size_t>(ecp_segment_indices_.data());
     }
     return result;
   }
@@ -634,6 +660,10 @@ protected:
     std::lock_guard lock(workspace_->mutex);
     for (std::size_t channel = 0; channel < channels.size(); ++channel)
       std::fill(workspace_->channels[channel].begin(), workspace_->channels[channel].end(), DerivativeValue{});
+    const bool requested_ecp = std::any_of(channels.begin(), channels.end(), [](const auto& channel) {
+      return channel.product == DerivativeProduct::LOCAL_ENERGY_VJP &&
+          (channel.local_energy_term_mask & localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP));
+    });
 
     for (std::size_t sample = 0; sample < sampleCount(); ++sample)
     {
@@ -650,19 +680,19 @@ protected:
           workspace_->channels[channel][parameter] +=
               derivative * channels[channel].coefficients.values[sample];
         }
-      if (ecp_replay_)
+      if (requested_ecp)
       {
         DerivativeValue weight_sum{};
-        for (const auto& point : ecp_replay_->points())
-          if (point.sample == sample) weight_sum += point.bare_weight * point.complete_ratio;
+        forEachECPPoint(sample, [&](const auto& point) { weight_sum += point.bare_weight * point.complete_ratio; });
         // Subtract the reference score before reusing its row at virtual points.
         accumulateECPRow(channels, adjoint, sample, -weight_sum);
-        for (const auto& point : ecp_replay_->points())
-          if (point.sample == sample && point.complete_ratio != DerivativeValue{})
+        forEachECPPoint(sample, [&](const auto& point) {
+          if (point.complete_ratio != DerivativeValue{})
           {
             evaluateRows(sample, &point);
             accumulateECPRow(channels, adjoint, sample, point.bare_weight * point.complete_ratio);
           }
+        });
       }
     }
 
@@ -704,8 +734,8 @@ private:
       }
       if (mask == 0) product = reference;
       if (mask & localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))
-        for (const auto& point : ecp_replay_->points())
-          if (point.sample == sample && point.complete_ratio != DerivativeValue{})
+        forEachECPPoint(sample, [&](const auto& point) {
+          if (point.complete_ratio != DerivativeValue{})
           {
             evaluateRows(sample, &point);
             DerivativeValue replacement{};
@@ -713,6 +743,7 @@ private:
               replacement += asDerivativeValue(workspace_->score_row[parameter]) * direction.values()[parameter];
             product += point.bare_weight * point.complete_ratio * (replacement - reference);
           }
+        });
       requireFiniteECP(product);
       const SampleProductTileDescriptor descriptor{schema_->providerId(),
                                                    schema_->fingerprint(),
@@ -740,7 +771,21 @@ private:
     state.wavefunction.evaluateLog(state.particles);
     workspace_->score_row   = QMCTraits::ValueType{};
     workspace_->kinetic_row = QMCTraits::ValueType{};
-    state.wavefunction.evaluateDerivatives(state.particles, *active_, workspace_->score_row, workspace_->kinetic_row);
+    if (point)
+      state.wavefunction.evaluateDerivativesWF(state.particles, *active_, workspace_->score_row);
+    else
+      state.wavefunction.evaluateDerivatives(state.particles, *active_, workspace_->score_row, workspace_->kinetic_row);
+  }
+
+  /// Indexed traversal is O(owned segments + owned points), not O(samples*Q).
+  template<class Action> void forEachECPPoint(std::size_t sample, Action action) const
+  {
+    for (std::size_t index = ecp_segment_offsets_[sample]; index < ecp_segment_offsets_[sample + 1]; ++index)
+    {
+      const auto& segment = ecp_replay_->segments()[ecp_segment_indices_[index]];
+      for (std::size_t p = segment.point_offset; p < segment.point_offset + segment.point_count; ++p)
+        action(ecp_replay_->points()[p]);
+    }
   }
 
   /// Contract only explicitly requested ECP channels into the existing P buffers.
@@ -796,6 +841,7 @@ private:
   std::shared_ptr<const optimize::VariableSet> active_;
   std::shared_ptr<const StructuredParameterSnapshot> snapshot_;
   std::unique_ptr<NonLocalECPJVPReplay> ecp_replay_;
+  std::vector<std::size_t> ecp_segment_offsets_, ecp_segment_indices_;
   std::size_t parameter_version_ = 0;
   std::shared_ptr<LegacyWaveFunctionReplay> replay_;
   std::shared_ptr<LegacyDerivativeWorkspace> workspace_;
