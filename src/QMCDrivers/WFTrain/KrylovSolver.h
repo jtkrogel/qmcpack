@@ -49,12 +49,8 @@ struct KrylovSolverControl
   DerivativeReal imaginary_tolerance = 64.0;
 };
 
-/** Complete candidate and diagnostics from one bounded Krylov solve.
- *
- * A nonconverged candidate is returned for diagnostics or an explicit caller retry,
- * but the stop reason must be checked before any parameter publication.
- */
-struct KrylovSolveResult
+/// Scalar-only outcome of one bounded Krylov solve, independent of vector storage.
+struct KrylovSolveDiagnostics
 {
   KrylovStopReason stop_reason = KrylovStopReason::BREAKDOWN;
   bool converged = false;
@@ -65,6 +61,13 @@ struct KrylovSolveResult
   DerivativeReal relative_residual_norm = 0.0;
   DerivativeReal last_curvature = 0.0;
   double elapsed_seconds = 0.0;
+};
+
+/** Owning host candidate and diagnostics from one bounded Krylov solve.
+ * A nonconverged candidate is diagnostic only until the caller checks its stop reason.
+ */
+struct KrylovSolveResult : KrylovSolveDiagnostics
+{
   std::vector<DerivativeValue> solution;
 };
 
