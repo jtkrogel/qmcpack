@@ -146,6 +146,20 @@ public:
 
   void releaseResource(ResourceCollection&, const RefVectorWithLeader<WaveFunctionComponent>&) const override;
 
+  /// Only opt-in dense GPU families admit native selected/all-electron transactions.
+  bool supportsMultiParticleMoves() const noexcept override;
+
+  /// Add complete proposed physical G/L; retain pure FULL products until whole-mask resolution.
+  void mw_evaluateMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const MCMultiParticleMoves<CoordsType::POS>&,
+      std::vector<LogValue>&, const RefVector<ParticleSet::ParticleGradient>&,
+      const RefVector<ParticleSet::ParticleLaplacian>&) const override;
+
+  /// Commit matching installed accepted coordinates, or discard rejected proposals before installation.
+  void mw_accept_rejectMultiParticleMove(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, const MCMultiParticleMoves<CoordsType::POS>&,
+      const std::vector<bool>&) const override;
+
   /// Evaluate the value-only active replacement without committing it.
   PsiValue ratio(ParticleSet&, int) override;
 

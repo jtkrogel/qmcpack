@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "Utilities/for_testing/Catch2Approx.h"
 #include "Particle/ParticleSet.h"
+#include "Particle/MCMultiParticleMoves.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
@@ -2407,6 +2408,8 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
 
     PsiFormerComplexWF gpu("pf", initialized, p0, source, clone_cap, twist, owner_bytes);
     PsiFormerComplexWF cpu("pf", initialized, p0, source, clone_cap, twist);
+    CHECK(gpu.supportsMultiParticleMoves());
+    CHECK_FALSE(cpu.supportsMultiParticleMoves());
     auto gpu1 = gpu.makeClone(p1), gpu2 = gpu.makeClone(p2);
     auto cpu1 = cpu.makeClone(p1), cpu2 = cpu.makeClone(p2);
     std::array<ParticleSet*, 3> particles{&p0, &p1, &p2};
@@ -2631,6 +2634,146 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
         CHECK_NOTHROW(static_cast<PsiFormerComplexWF*>(components[walker])->observeCoulombEnergy(*particles[walker], 0));
       }
     refresh();
+    // Collective descriptors mix a selected slice, an empty identity slice and a full-system tail.
+    using Moves = MCMultiParticleMoves<CoordsType::POS>;
+    std::vector<ParticleSet::IndexType> selected_indices{0, 3, 0, 1, 2, 3};
+    std::vector<ParticleSet::PosType> selected_positions;
+    for (std::size_t i = 0; i < selected_indices.size(); ++i)
+      selected_positions.push_back(particles[i < 2 ? 0 : 2]->R[selected_indices[i]] +
+          ParticleSet::PosType{.004 * (i + 1), -.003, .002});
+    const Moves moves({0, 2, 2, 6}, selected_indices, selected_positions);
+    std::array<ParticleSet::ParticleGradient, 3> proposed_g{ParticleSet::ParticleGradient(4),
+        ParticleSet::ParticleGradient(4), ParticleSet::ParticleGradient(4)};
+    std::array<ParticleSet::ParticleLaplacian, 3> proposed_l{ParticleSet::ParticleLaplacian(4),
+        ParticleSet::ParticleLaplacian(4), ParticleSet::ParticleLaplacian(4)};
+    RefVector<ParticleSet::ParticleGradient> collective_g{proposed_g[0], proposed_g[1], proposed_g[2]};
+    RefVector<ParticleSet::ParticleLaplacian> collective_l{proposed_l[0], proposed_l[1], proposed_l[2]};
+    std::array<ParticleSet::ParticleGradient, 3> oracle_g = proposed_g;
+    std::array<ParticleSet::ParticleLaplacian, 3> oracle_l = proposed_l;
+    std::array<C, 3> oracle_logs, oracle_kinetic, initial_logs;
+    const std::array<decltype(p0.R), 3> initial_positions{p0.R, p1.R, p2.R};
+    for (std::size_t walker = 0; walker < 3; ++walker)
+    {
+      initial_logs[walker] = components[walker]->get_log_value();
+      auto proposed = electrons(simulation_cell, 3, 1);
+      proposed.R = particles[walker]->R;
+      const auto slice = moves.slice(walker);
+      for (std::size_t selected = 0; selected < slice.size(); ++selected)
+        proposed.R[slice.particleIndex(selected)] = slice.proposedPosition(selected);
+      proposed.update();
+      auto oracle = references[walker]->makeClone(proposed);
+      oracle_logs[walker] = evaluate(*oracle, proposed);
+      oracle_g[walker] = proposed.G;
+      oracle_l[walker] = proposed.L;
+      oracle_kinetic[walker] = static_cast<PsiFormerComplexWF&>(*oracle).observeCoulombEnergy(proposed, 0).kinetic;
+    }
+    std::vector<C> log_ratios(3, C{9, 7});
+    const auto initialize_collective_outputs = [&] {
+      log_ratios.assign(3, C{9, 7});
+      for (std::size_t i = 0; i < 3; ++i) { proposed_g[i] = additive; proposed_l[i] = additive; }
+    };
+    const auto collective_before = metrics.snapshot();
+    initialize_collective_outputs();
+    auto accepted_alias = collective_g;
+    accepted_alias[2] = std::ref(p0.G);
+    CHECK_THROWS_AS(gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, accepted_alias, collective_l),
+                    std::invalid_argument);
+    gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, collective_g, collective_l);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      close(std::exp(log_ratios[i]), std::exp(oracle_logs[i] - initial_logs[i]), 2e-9);
+      CHECK(components[i]->get_log_value() == initial_logs[i]);
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        close(proposed_l[i][e], oracle_l[i][e] + additive, 2e-8);
+        for (int d = 0; d < 3; ++d)
+          close(proposed_g[i][e][d], oracle_g[i][e][d] + additive, 2e-8);
+      }
+    }
+    close(std::exp(log_ratios[1]), C{1}, 2e-9); // empty slice is a valid identity proposal
+    const std::vector<bool> reject_all(3, false);
+    CHECK_NOTHROW(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, reject_all));
+    CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, reject_all)); // exactly once
+    for (std::size_t i = 0; i < 3; ++i)
+      CHECK_NOTHROW(static_cast<PsiFormerComplexWF*>(components[i])->observeCoulombEnergy(*particles[i], 0));
+    // A late additive-output failure publishes neither outputs nor pending state.
+    initialize_collective_outputs();
+    proposed_l[2][3] = C{std::numeric_limits<double>::infinity(), 0};
+    CHECK_THROWS_AS(gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, collective_g, collective_l),
+                    std::overflow_error);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      CHECK(log_ratios[i] == (C{9, 7}));
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        if (i != 2 || e != 3) CHECK(proposed_l[i][e] == additive);
+        for (int d = 0; d < 3; ++d) CHECK(proposed_g[i][e][d] == additive);
+      }
+    }
+    initialize_collective_outputs();
+    gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, collective_g, collective_l);
+    WaveFunctionComponent::WFBufferType collective_buffer;
+    CHECK_THROWS(gpu.registerData(p0, collective_buffer));
+    CHECK_THROWS(gpu.updateBuffer(p0, collective_buffer, true));
+    CHECK_THROWS(gpu.copyFromBuffer(p0, collective_buffer));
+    CHECK_THROWS(gpu.ratio(p0, 0));
+    CHECK_THROWS(gpu.ratioGrad(p0, 0, accepted_gradients[0]));
+    CHECK_THROWS(gpu.evalGrad(p0, 0));
+    CHECK_THROWS(gpu.acceptMove(p0, 0));
+    CHECK_THROWS(gpu.restore(0));
+    CHECK_THROWS(gpu.evaluateLog(p0, p0.G, p0.L));
+    CHECK_THROWS(gpu.mw_evaluateLog(team, targets, gradients, laplacians));
+    CHECK_THROWS(gpu.mw_evalGrad(team, targets, 0, accepted_gradients));
+    CHECK_THROWS(gpu.mw_calcRatio(team, targets, 0, ratios));
+    CHECK_THROWS(gpu.mw_ratioGrad(team, targets, 0, ratios, proposed_gradients));
+    CHECK_THROWS(gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, collective_g, collective_l));
+    auto pending_snapshot = gpu.snapshotParameters();
+    const auto pending_requirements = gpu.gpuParameterPublicationRequirements();
+    CHECK_THROWS(gpu.publishBudgetedGpuParameters(pending_snapshot, pending_snapshot.version,
+        pending_requirements.device_bytes, pending_requirements.host_bytes));
+    auto wrong_positions = selected_positions;
+    wrong_positions[0][0] += .001;
+    const Moves wrong_moves({0, 2, 2, 6}, selected_indices, wrong_positions);
+    CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, wrong_moves, reject_all));
+    CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>(2, false)));
+    CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, std::vector<bool>(3, true)));
+    ResourceCollection wrong_resource("foreign collective loan");
+    CHECK_THROWS(gpu.releaseResource(wrong_resource, team));
+    for (std::size_t walker = 0; walker < 3; ++walker)
+    {
+      const auto slice = moves.slice(walker);
+      for (std::size_t selected = 0; selected < slice.size(); ++selected)
+        particles[walker]->R[slice.particleIndex(selected)] = slice.proposedPosition(selected);
+      particles[walker]->update(); // caller installs actual absolute proposals
+    }
+    const std::vector<bool> accept_mask{true, false, true};
+    p2.R[0][0] += .001;
+    CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, accept_mask));
+    CHECK(components[0]->get_log_value() == initial_logs[0]); // no partial first-lane commit
+    // Restore exact bits, rather than relying on floating-point add/subtract cancellation.
+    p2.R[0] = selected_positions[2];
+    gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, accept_mask);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      if (!accept_mask[i]) { particles[i]->R = initial_positions[i]; particles[i]->update(); }
+      CHECK(components[i]->get_log_value().real() == Catch::Approx(oracle_logs[i].real()).margin(2e-9));
+      close(std::exp(C{0, components[i]->get_log_value().imag()}), std::exp(C{0, oracle_logs[i].imag()}), 2e-9);
+      close(static_cast<PsiFormerComplexWF*>(components[i])->observeCoulombEnergy(*particles[i], 0).kinetic,
+            oracle_kinetic[i], 2e-8);
+    }
+    CHECK(metrics.snapshot().allocation_calls == collective_before.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == collective_before.free_calls);
+    refresh();
+    initialize_collective_outputs();
+    gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, collective_g, collective_l);
+    resource.rewind(0);
+    CHECK_NOTHROW(gpu.releaseResource(resource, team)); // unresolved valid loan discards component markers only
+    for (std::size_t i = 0; i < 3; ++i)
+      CHECK_NOTHROW(static_cast<PsiFormerComplexWF*>(components[i])->observeCoulombEnergy(*particles[i], 0));
+    resource.rewind(0);
+    gpu.acquireResource(resource, team);
+    CHECK_THROWS(gpu.mw_accept_rejectMultiParticleMove(team, targets, moves, reject_all));
+    refresh();
     const auto publication = gpu.gpuParameterPublicationRequirements();
     auto candidate = gpu.snapshotParameters();
     candidate.values[plan.parameter(ps::ParameterRole::BACKFLOW_UP_WEIGHT, ps::NO_ATTENTION_BLOCK,
@@ -2639,6 +2782,9 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
     CHECK(gpu.publishBudgetedGpuParameters(candidate, candidate.version, publication.device_bytes, publication.host_bytes) == candidate.version + 1);
     CHECK(cpu.publishParameters(candidate, candidate.version) == candidate.version + 1);
     CHECK_THROWS(gpu.observeCoulombEnergy(p0, 0));
+    initialize_collective_outputs();
+    CHECK_THROWS(gpu.mw_evaluateMultiParticleMove(team, targets, moves, log_ratios, collective_g, collective_l));
+    for (const auto value : log_ratios) CHECK(value == (C{9, 7}));
     CHECK(gpu.gpuParameterPublicationRequirements().device_bytes == publication.device_bytes);
     CHECK_THROWS(gpu.publishBudgetedGpuParameters(candidate, candidate.version, publication.device_bytes, publication.host_bytes));
     refresh();

@@ -201,7 +201,8 @@ struct PsiFormerComplexWF::Impl
     std::vector<C> converted;
     const std::size_t device_bytes, host_bytes;
     const psiformer::device::TargetVglPreparation preparation;
-    std::size_t dense_value_calls = 0, dense_vgl_calls = 0, dense_ratio_grad_calls = 0, dense_eval_grad_calls = 0;
+    std::size_t dense_value_calls = 0, dense_vgl_calls = 0, dense_ratio_grad_calls = 0, dense_eval_grad_calls = 0,
+        dense_collective_calls = 0;
     std::mutex mutex;
   };
 #endif
@@ -363,6 +364,9 @@ struct PsiFormerComplexWF::Impl
     std::vector<GradType> gradient;
     std::vector<ValueType> laplacian;
     std::size_t reported_host_bytes = 0;
+    bool collective_pending = false;
+    std::size_t collective_version = 0;
+    std::uint64_t collective_descriptor = 0;
   };
 
   /// Fixed ions are part of the captured derivative problem, not an unchecked caller convention.
@@ -919,6 +923,14 @@ struct PsiFormerComplexWF::Impl
       pending = false;
       state->pending_proposals.fetch_sub(1, std::memory_order_relaxed);
     }
+    collective_pending = false;
+  }
+
+  /// Mixed entrypoints must not revoke a collectively retained FULL transaction.
+  void requireNoCollective() const
+  {
+    if (collective_pending)
+      throw std::logic_error("Complex PsiFormer requires collective resolution before mixed PBYP/evaluate/persistence calls");
   }
 
   /// Revoke all accepted/proposed publications without reallocating scratch.
@@ -1087,7 +1099,7 @@ struct PsiFormerComplexWF::Impl
 
   /// Match the exact native loan before reading or mutating transaction scratch.
   MultiWalkerResource& requireDenseTeam(const RefVectorWithLeader<WaveFunctionComponent>& components,
-      const RefVectorWithLeader<ParticleSet>& targets, int electron = -1)
+      const RefVectorWithLeader<ParticleSet>& targets, int electron = -1, bool collective_resolution = false)
   {
     const auto* leader = dynamic_cast<const PsiFormerComplexWF*>(&components.getLeader());
     if (!leader || leader->impl_.get() != this || !multiwalker || components.empty() ||
@@ -1096,6 +1108,8 @@ struct PsiFormerComplexWF::Impl
     auto& resource = multiwalker.getResource();
     if (resource.state != state || resource.components.size() != components.size())
       throw std::invalid_argument("Dense complex GPU crowd has foreign resource ownership or extent");
+    if (resource.collective_pending && !collective_resolution)
+      throw std::logic_error("Dense complex GPU staging is frozen until collective resolution");
     for (std::size_t i = 0; i < components.size(); ++i)
     {
       auto* component = dynamic_cast<PsiFormerComplexWF*>(&components[i]);
@@ -1109,7 +1123,8 @@ struct PsiFormerComplexWF::Impl
 
   /// Run actual dense numerical prefixes; no caller/cache state changes here.
   void stageDense(MultiWalkerResource& resource, const RefVectorWithLeader<ParticleSet>& targets,
-      bool spatial, int replacement = -1, bool accepted_gradient = false)
+      bool spatial, int replacement = -1, bool accepted_gradient = false,
+      const MCMultiParticleMoves<CoordsType::POS>* collective = nullptr)
   {
 #ifdef ENABLE_CUDA
     auto& lane = *state->gpu;
@@ -1124,10 +1139,21 @@ struct PsiFormerComplexWF::Impl
       const auto count = std::min(lane.capacity, targets.size() - begin);
       lane.resizeLive(count);
       for (std::size_t local = 0; local < count; ++local)
+      {
+        std::optional<MCMultiParticleMoves<CoordsType::POS>::Slice> slice;
+        if (collective)
+          slice.emplace(collective->slice(begin + local));
+        std::size_t selected = 0;
         for (std::size_t e = 0; e < n; ++e)
+        {
+          const bool replaced = slice && selected < slice->size() &&
+              static_cast<std::size_t>(slice->particleIndex(selected)) == e;
+          const auto& position = replaced ? slice->proposedPosition(selected++) :
+              (replacement == static_cast<int>(e) ? targets[begin + local].activeR(e) : targets[begin + local].R[e]);
           for (int d = 0; d < 3; ++d)
-            lane.positions[(local * n + e) * 3 + d] = replacement == static_cast<int>(e)
-                ? targets[begin + local].activeR(e)[d] : targets[begin + local].R[e][d];
+            lane.positions[(local * n + e) * 3 + d] = position[d];
+        }
+      }
       {
         NativeTimerScope timer(phase_timers.gpu_evaluate);
         if (spatial)
@@ -1148,8 +1174,11 @@ struct PsiFormerComplexWF::Impl
         const auto& component = *resource.components[walker]->impl_;
         const auto& amplitude = lane.amplitude[local];
         resource.amplitude[walker] = {{amplitude.phase.x, amplitude.phase.y}, amplitude.log_abs};
-        resource.logs[walker] = component.physicalLog(resource.amplitude[walker], targets[walker], replacement);
-        resource.keys[walker] = configurationIdentity(targets[walker], replacement);
+        resource.logs[walker] = collective
+            ? component.physicalLog(resource.amplitude[walker], targets[walker], collective->slice(walker))
+            : component.physicalLog(resource.amplitude[walker], targets[walker], replacement);
+        resource.keys[walker] = collective ? configurationIdentity(targets[walker], collective->slice(walker))
+                                          : configurationIdentity(targets[walker], replacement);
         if (spatial)
           for (std::size_t e = 0; e < n; ++e)
           {
@@ -1170,12 +1199,12 @@ struct PsiFormerComplexWF::Impl
       begin += count;
     }
     const bool proposed_gradient = spatial && replacement >= 0;
-    auto& calls = spatial ? (proposed_gradient ? lane.dense_ratio_grad_calls :
-        (accepted_gradient ? lane.dense_eval_grad_calls : lane.dense_vgl_calls)) : lane.dense_value_calls;
+    auto& calls = collective ? lane.dense_collective_calls : (spatial ? (proposed_gradient ? lane.dense_ratio_grad_calls :
+        (accepted_gradient ? lane.dense_eval_grad_calls : lane.dense_vgl_calls)) : lane.dense_value_calls);
     if (dense_tiles && calls++ == 0)
       app_log() << "  Complex PsiFormer numerical dense tile completed: operation="
-                << (spatial ? (proposed_gradient ? "RATIO_GRAD_FULL" :
-                    (accepted_gradient ? "ACCEPTED_GRAD_FULL" : "FULL_VGL")) : "VALUE")
+                << (collective ? "COLLECTIVE_FULL" : (spatial ? (proposed_gradient ? "RATIO_GRAD_FULL" :
+                    (accepted_gradient ? "ACCEPTED_GRAD_FULL" : "FULL_VGL")) : "VALUE"))
                 << ", walkers=" << targets.size() << ", tile_capacity=" << lane.capacity
                 << ", dense_tiles=" << dense_tiles << ", last_tile_count=" << tail
                 << ", parameter_version=" << lane.image->version() << "; lane_serialized=yes; CPU_fallback=no" << std::endl;
@@ -1278,6 +1307,21 @@ struct PsiFormerComplexWF::Impl
     return result;
   }
 
+  /// Apply the moved-coordinate outer phase once for the complete selected configuration.
+  LogValue physicalLog(const Amplitude& amplitude, const ParticleSet& p,
+      const MCMultiParticleMoves<CoordsType::POS>::Slice& moves) const
+  {
+    double phase = angle(p);
+    for (std::size_t selected = 0; selected < moves.size(); ++selected)
+      for (int d = 0; d < 3; ++d)
+        phase += state->cartesian_twist[d] *
+            (moves.proposedPosition(selected)[d] - p.R[moves.particleIndex(selected)][d]);
+    const LogValue result{amplitude.log_abs, std::arg(amplitude.phase) + phase};
+    if (amplitude.isZero() || !isFiniteWavefunctionValue(result))
+      throw std::overflow_error("Complex PsiFormer collective logarithm is undefined or nonfinite");
+    return result;
+  }
+
   /// Add i*k to logarithmic gradients; logarithmic Laplacians receive no outer-phase term.
   ValueType physicalGradient(C core, std::size_t dimension) const
   {
@@ -1338,7 +1382,7 @@ struct PsiFormerComplexWF::Impl
   std::uint64_t accepted_key = 0, proposed_key = 0;
   std::size_t accepted_version = 0, proposed_version = 0;
   int proposed_particle = -1;
-  bool accepted_valid = false, pending = false, own_full_valid = false;
+  bool accepted_valid = false, pending = false, own_full_valid = false, collective_pending = false;
   static constexpr std::uint64_t record_magic = UINT64_C(0x5053435746303031); // PSCWF001
 };
 
@@ -1824,6 +1868,7 @@ void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
 {
   if (!impl_->denseEnabled())
     return;
+  std::shared_lock read(impl_->state->mutex);
   if (&components.getLeader() != this || !impl_->multiwalker || impl_->resource_collection != &collection ||
       collection.getCursor() != impl_->resource_cursor)
     throw std::logic_error("Dense complex GPU release requires its original resource loan and cursor");
@@ -1834,6 +1879,14 @@ void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
     if (&components[i] != resource.components[i] || resource.components[i]->impl_->acquired_leader != this ||
         resource.components[i]->impl_->acquired_lane != i)
       throw std::invalid_argument("Dense complex GPU release changed its acquired lane order");
+  // Valid-loan RAII cleanup revokes only component proposals, never ParticleSet coordinates.
+  if (resource.collective_pending)
+  {
+    for (auto* component : resource.components)
+      component->impl_->discardPending();
+    resource.collective_pending = false;
+    resource.collective_descriptor = 0;
+  }
   collection.takebackResource(impl_->multiwalker);
   for (auto* component : resource.components)
   {
@@ -1844,6 +1897,144 @@ void PsiFormerComplexWF::releaseResource(ResourceCollection& collection,
   impl_->resource_collection = nullptr;
   impl_->resource_cursor = 0;
   impl_->state->dense_team_acquired.store(false);
+}
+
+/// Collective support is explicit dense GPU inference only; CPU/defaultB1 stay closed.
+bool PsiFormerComplexWF::supportsMultiParticleMoves() const noexcept
+{
+  return impl_->denseEnabled();
+}
+
+/// Retain pure FULL products until a matching collective resolution, with all-output atomicity.
+void PsiFormerComplexWF::mw_evaluateMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& components, const RefVectorWithLeader<ParticleSet>& targets,
+    const MCMultiParticleMoves<CoordsType::POS>& moves, std::vector<LogValue>& log_ratios,
+    const RefVector<ParticleSet::ParticleGradient>& gradients,
+    const RefVector<ParticleSet::ParticleLaplacian>& laplacians) const
+{
+  if (!supportsMultiParticleMoves())
+    throw std::logic_error("Complex collective proposals require opt-in dense GPU inference");
+  NativeTimerScope timer(impl_->phase_timers.batch_vgl);
+  std::shared_lock read(impl_->state->mutex);
+  auto& resource = impl_->requireDenseTeam(components, targets);
+  moves.validateFor(targets);
+  const auto n = impl_->state->model.ne, walkers = components.size();
+  if (log_ratios.size() != walkers || gradients.size() != walkers || laplacians.size() != walkers)
+    throw std::invalid_argument("Complex collective proposal output extents differ");
+  const auto log_range = checkedMemoryRange(log_ratios.data(), walkers, "Complex collective log output range overflow");
+  for (std::size_t i = 0; i < walkers; ++i)
+  {
+    const auto& clone = *resource.components[i]->impl_;
+    if (clone.pending || targets[i].getActivePtcl() >= 0 || !clone.accepted_valid || clone.accepted.isZero() ||
+        clone.accepted_version != impl_->state->model.p.version() || clone.accepted_key != configurationIdentity(targets[i]))
+      throw std::logic_error("Complex collective proposal requires current idle accepted amplitudes");
+    if (gradients[i].get().size() != n || laplacians[i].get().size() != n)
+      throw std::invalid_argument("Complex collective proposal spatial output extent differs");
+    const auto g = checkedMemoryRange(gradients[i].get().data(), n, "Complex collective gradient range overflow");
+    const auto l = checkedMemoryRange(laplacians[i].get().data(), n, "Complex collective Laplacian range overflow");
+    if (memoryRangesOverlap(g, l) || memoryRangesOverlap(g, log_range) || memoryRangesOverlap(l, log_range))
+      throw std::invalid_argument("Complex collective proposal outputs overlap");
+    for (std::size_t target = 0; target < walkers; ++target)
+    {
+      const auto accepted_g = checkedMemoryRange(targets[target].G.data(), targets[target].G.size(),
+          "Complex accepted gradient range overflow");
+      const auto accepted_l = checkedMemoryRange(targets[target].L.data(), targets[target].L.size(),
+          "Complex accepted Laplacian range overflow");
+      if (memoryRangesOverlap(g, accepted_g) || memoryRangesOverlap(g, accepted_l) ||
+          memoryRangesOverlap(l, accepted_g) || memoryRangesOverlap(l, accepted_l) ||
+          memoryRangesOverlap(log_range, accepted_g) || memoryRangesOverlap(log_range, accepted_l))
+        throw std::invalid_argument("Complex collective outputs alias accepted ParticleSet products");
+    }
+    for (std::size_t prior = 0; prior < i; ++prior)
+    {
+      const auto pg = checkedMemoryRange(gradients[prior].get().data(), n, "Complex collective gradient range overflow");
+      const auto pl = checkedMemoryRange(laplacians[prior].get().data(), n, "Complex collective Laplacian range overflow");
+      if (memoryRangesOverlap(g, pg) || memoryRangesOverlap(g, pl) || memoryRangesOverlap(l, pg) || memoryRangesOverlap(l, pl))
+        throw std::invalid_argument("Complex collective proposal walker outputs overlap");
+    }
+  }
+  impl_->stageDense(resource, targets, true, -1, false, &moves);
+  for (std::size_t i = 0; i < walkers; ++i)
+  {
+    if (!isFiniteWavefunctionValue(resource.logs[i] - resource.components[i]->log_value_))
+      throw std::overflow_error("Complex collective physical log ratio overflow");
+    for (std::size_t e = 0; e < n; ++e)
+    {
+      for (int d = 0; d < 3; ++d)
+        if (!isFiniteWavefunctionValue(gradients[i].get()[e][d] + resource.gradient[i * n + e][d]))
+          throw std::overflow_error("Complex collective gradient scatter overflow");
+      if (!isFiniteWavefunctionValue(laplacians[i].get()[e] + resource.laplacian[i * n + e]))
+        throw std::overflow_error("Complex collective Laplacian scatter overflow");
+    }
+  }
+  // Every failure point precedes publication; retain the unmodified proposed G/L buffer.
+  for (std::size_t i = 0; i < walkers; ++i)
+  {
+    auto& component = *resource.components[i];
+    auto& clone = *component.impl_;
+    log_ratios[i] = resource.logs[i] - component.log_value_;
+    for (std::size_t e = 0; e < n; ++e)
+    {
+      gradients[i].get()[e] += resource.gradient[i * n + e];
+      laplacians[i].get()[e] += resource.laplacian[i * n + e];
+    }
+    clone.proposed = resource.amplitude[i];
+    clone.proposed_log = resource.logs[i];
+    clone.proposed_key = resource.keys[i];
+    clone.proposed_particle = -1;
+    clone.proposed_version = impl_->state->model.p.version();
+    clone.pending = clone.collective_pending = true;
+    impl_->state->pending_proposals.fetch_add(1, std::memory_order_relaxed);
+  }
+  resource.collective_version = impl_->state->model.p.version();
+  resource.collective_descriptor = moves.fingerprint();
+  resource.collective_pending = true;
+}
+
+/// Validate the whole mask and every receipt before committing accepted FULL or discarding proposals.
+void PsiFormerComplexWF::mw_accept_rejectMultiParticleMove(
+    const RefVectorWithLeader<WaveFunctionComponent>& components, const RefVectorWithLeader<ParticleSet>& targets,
+    const MCMultiParticleMoves<CoordsType::POS>& moves, const std::vector<bool>& accepted) const
+{
+  if (!supportsMultiParticleMoves())
+    throw std::logic_error("Complex collective resolution requires opt-in dense GPU inference");
+  std::shared_lock read(impl_->state->mutex);
+  auto& resource = impl_->requireDenseTeam(components, targets, -1, /*collective_resolution=*/true);
+  moves.validateFor(targets);
+  if (!resource.collective_pending || accepted.size() != components.size() ||
+      resource.collective_descriptor != moves.fingerprint() || resource.collective_version != impl_->state->model.p.version())
+    throw std::logic_error("Complex collective resolution has a stale or mismatched descriptor/mask/version");
+  const auto n = impl_->state->model.ne;
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    const auto& clone = *resource.components[i]->impl_;
+    if (!clone.pending || !clone.collective_pending || clone.proposed_particle != -1 ||
+        clone.proposed_version != resource.collective_version || clone.proposed_key != resource.keys[i] ||
+        clone.own_gradient.size() != n || clone.own_laplacian.size() != n ||
+        (accepted[i] && clone.proposed_key != configurationIdentity(targets[i])))
+      throw std::logic_error("Complex collective resolution has incoherent products or accepted coordinates");
+  }
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    auto& component = *resource.components[i];
+    auto& clone = *component.impl_;
+    if (accepted[i])
+    {
+      for (std::size_t e = 0; e < n; ++e)
+      {
+        clone.own_gradient[e] = resource.gradient[i * n + e];
+        clone.own_laplacian[e] = resource.laplacian[i * n + e];
+      }
+      clone.accepted = clone.proposed;
+      clone.accepted_key = clone.proposed_key;
+      clone.accepted_version = clone.proposed_version;
+      clone.accepted_valid = clone.own_full_valid = true;
+      component.log_value_ = clone.proposed_log;
+    }
+    clone.discardPending();
+  }
+  resource.collective_pending = false;
+  resource.collective_descriptor = 0;
 }
 
 /// Validate every output and tile before the nonthrowing whole-crowd scatter.
@@ -2028,6 +2219,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& 
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLogLocked(const ParticleSet& p,
     ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l)
 {
+  impl_->requireNoCollective();
   impl_->invalidate();
   impl_->validate(p);
   if (g.size() != static_cast<std::size_t>(p.getTotalNum()) || l.size() != g.size())
@@ -2070,6 +2262,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLogLocked(const Particl
 PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratio(ParticleSet& p, int electron)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   impl_->discardPending();
   impl_->validate(p, electron, true);
   const auto result = impl_->core(p, false, electron);
@@ -2083,6 +2276,7 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratio(ParticleSet& p, int elect
 PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGrad(ParticleSet& p, int electron)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   impl_->validate(p, electron);
   if (electron < 0)
     throw std::invalid_argument("Complex PsiFormer gradient electron is negative");
@@ -2097,6 +2291,7 @@ PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGrad(ParticleSet& p, int el
 PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGrad(ParticleSet& p, int electron, GradType& gradient)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   impl_->discardPending();
   impl_->validate(p, electron, true);
   const auto result = impl_->core(p, true, electron, electron);
@@ -2118,6 +2313,7 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGrad(ParticleSet& p, int e
 void PsiFormerComplexWF::acceptMove(ParticleSet& p, int electron, bool)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   const bool pending = impl_->pending;
   impl_->discardPending();
   impl_->validate(p, electron, true);
@@ -2139,6 +2335,7 @@ void PsiFormerComplexWF::acceptMove(ParticleSet& p, int electron, bool)
 void PsiFormerComplexWF::restore(int electron)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   const bool pending = impl_->pending;
   const int proposed_particle = impl_->proposed_particle;
   impl_->discardPending();
@@ -2158,6 +2355,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerComplexWF::makeClone(ParticleSet
 void PsiFormerComplexWF::registerData(ParticleSet& p, WFBufferType& buffer)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   try
   {
     impl_->requireIdle(p);
@@ -2173,6 +2371,7 @@ void PsiFormerComplexWF::registerData(ParticleSet& p, WFBufferType& buffer)
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::updateBuffer(ParticleSet& p, WFBufferType& buffer, bool from_scratch)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   try
   {
     impl_->requireIdle(p);
@@ -2208,6 +2407,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::updateBuffer(ParticleSet& p, WF
 void PsiFormerComplexWF::copyFromBuffer(ParticleSet& p, WFBufferType& buffer)
 {
   std::shared_lock read(impl_->state->mutex);
+  impl_->requireNoCollective();
   const bool pending = impl_->pending;
   impl_->invalidate();
   impl_->requireIdle(p);
