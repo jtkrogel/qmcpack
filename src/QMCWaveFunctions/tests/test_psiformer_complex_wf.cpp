@@ -1956,7 +1956,7 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
 #endif
   ScopedComplexGpuControls controls;
   const SimulationCell simulation_cell(cell());
-  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  auto p = electrons(simulation_cell, 3, 1), clone_p = electrons(simulation_cell, 3, 1);
   auto source = ions(simulation_cell);
   for (auto* target : {&p, &clone_p})
   {
@@ -1970,7 +1970,10 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   RuntimeOptions options;
   TrialWaveFunction trial(options);
   const std::array<double, 3> twist{.17, -.11, .07};
-  auto owner = std::make_unique<PsiFormerComplexWF>("analysis", parameters(), p, source, clone_cap, twist,
+  auto initialized = parameters();
+  initialized.model_shape.spin_up_electrons = 3;
+  initialized.model_shape.spin_down_electrons = 1;
+  auto owner = std::make_unique<PsiFormerComplexWF>("analysis", initialized, p, source, clone_cap, twist,
                                                   64 * 1024 * 1024);
   auto& component = *owner;
   trial.addComponent(std::move(owner));
@@ -2034,17 +2037,17 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
       r2.device_bytes, r2.host_bytes, r2.matrix_work);
   const auto diagnostic = stream->storageDiagnostics();
   CHECK(diagnostic.retained_numeric_bytes == r2.device_bytes + r2.host_bytes);
-  CHECK(diagnostic.parameter_scratch_bytes == 144 * component.parameterSchema().parameterCount() + 16 * 7);
+  CHECK(diagnostic.parameter_scratch_bytes == 160 * component.parameterSchema().parameterCount() + 16 * 7);
   CHECK(diagnostic.evaluator_workspace_bytes + diagnostic.parameter_scratch_bytes == diagnostic.shared_workspace_bytes);
   CHECK(diagnostic.shared_workspace_bytes == r0.device_bytes + r0.host_bytes);
-  CHECK_FALSE(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
-  CHECK_FALSE(stream->capabilities().supports(DerivativeAdjoint::HERMITIAN));
+  CHECK(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
+  CHECK(stream->capabilities().supports(DerivativeAdjoint::HERMITIAN));
   CHECK(component.structuredParameterProvider() == nullptr);
   const auto snapshot = component.snapshotParameters();
   CHECK_THROWS(component.publishParameters(snapshot, snapshot.version));
 
   // The independently qualified CPU two-tape owner supplies complete complex rows, not Re-only forces.
-  PsiFormerComplexWF cpu("analysis", parameters(), p, source, clone_cap, twist);
+  PsiFormerComplexWF cpu("analysis", initialized, p, source, clone_cap, twist);
   auto cpu_clone = cpu.makeClone(clone_p);
   RefVectorWithLeader<WaveFunctionComponent> components(cpu);
   components.push_back(cpu);
@@ -2053,6 +2056,108 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
       cpu.streamingDerivativeRequiredBytes(2));
   CHECK_THROWS(cpu.gpuDerivativeRequirements(2, 2, 3, 7));
   const auto& schema = stream->parameterSchema();
+  const std::array<double, 2> weights{.4, 1.3};
+  std::array<C, 2> energies;
+  evaluate(cpu, p);
+  evaluate(*cpu_clone, clone_p);
+  energies[0] = cpu.observeCoulombEnergy(p, -1.3).local_energy;
+  energies[1] = static_cast<PsiFormerComplexWF&>(*cpu_clone).observeCoulombEnergy(clone_p, .7).local_energy;
+  CHECK(std::abs(energies[0].imag()) + std::abs(energies[1].imag()) > 1e-8);
+  // Compare the actual complete PATHWISE producer, including dEL=dK, not a score-only shortcut.
+  const auto complete_force = [&](std::unique_ptr<StreamingDerivativeOperator> derivative) {
+    PreparedEnergyGradientBatch batch;
+    batch.derivative_operator = std::move(derivative);
+    batch.weights.assign(weights.begin(), weights.end());
+    batch.local_energies.assign(energies.begin(), energies.end());
+    batch.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+    std::vector<PreparedEnergyGradientBatch> batches;
+    batches.push_back(std::move(batch));
+    PreparedEnergyGradientProducer producer(std::move(batches));
+    EnergyGradientAccumulator accumulator(schema, snapshot.version, EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY);
+    producer.accumulate(snapshot, accumulator);
+    DistributedParameterReduction reduction(*OHMMS::Controller);
+    reduction.reduce(accumulator);
+    return accumulator.finalize().gradient;
+  };
+  const auto cpu_force = complete_force(cpu.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 7,
+      cpu.streamingDerivativeRequiredBytes(2)));
+  const auto gpu_force = complete_force(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
+      r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  for (std::size_t i = 0; i < schema.parameterCount(); ++i)
+    CHECK(gpu_force[i] == Catch::Approx(cpu_force[i]).margin(3e-9));
+  std::vector<C> direction(schema.parameterCount()), phase_direction(schema.parameterCount());
+  std::size_t direction_block = 0;
+  for (const auto& block : schema.blocks())
+  {
+    direction[block.offset] = (++direction_block % 2) ? .08 : -.05;
+    if (block.id.find("/w_imag") != std::string::npos)
+      phase_direction[block.offset] = .6;
+  }
+  ComplexSampleSink cpu_jvp, gpu_jvp;
+  bool jvp_callback_ran = false;
+  gpu_jvp.callback = [&] {
+    if (!jvp_callback_ran) { jvp_callback_ran = true; evaluate(component, p); }
+  };
+  const auto check_jvp = [&](const std::vector<C>& values) {
+    cpu_jvp.reset(); gpu_jvp.reset();
+    const StructuredParameterVectorConstView tangent(schema, snapshot.version, {values.data(), values.size()});
+    oracle->applyScoreJVP(tangent, cpu_jvp);
+    stream->applyScoreJVP(tangent, gpu_jvp);
+    for (std::size_t i = 0; i < 2; ++i) close(gpu_jvp.values[i], cpu_jvp.values[i], 3e-9);
+  };
+  check_jvp(std::vector<C>(direction.size()));
+  for (const auto value : gpu_jvp.values) CHECK(value == C{});
+  check_jvp(direction);
+  check_jvp(phase_direction);
+  CHECK(jvp_callback_ran);
+  CHECK(std::abs(gpu_jvp.values[0].imag()) + std::abs(gpu_jvp.values[1].imag()) > 1e-8);
+  // The unchanged host SR operator consumes these REAL-tangent GPU products.
+  const StochasticReconfigurationBatch gpu_batch{stream.get(), {weights.data(), weights.size()}};
+  const StochasticReconfigurationBatch cpu_batch{oracle.get(), {weights.data(), weights.size()}};
+  StochasticReconfigurationOperator gpu_metric(schema, snapshot.version, {&gpu_batch, 1});
+  StochasticReconfigurationOperator cpu_metric(schema, snapshot.version, {&cpu_batch, 1});
+  const std::array<const std::vector<C>*, 2> directions{&direction, &phase_direction};
+  std::array<std::vector<C>, 2> actions{std::vector<C>(direction.size()), std::vector<C>(direction.size())};
+  for (std::size_t column = 0; column < 2; ++column)
+  {
+    std::vector<C> expected_action(direction.size());
+    const StructuredParameterVectorConstView tangent(schema, snapshot.version, {directions[column]->data(), direction.size()});
+    gpu_metric.apply(tangent, {actions[column].data(), direction.size()});
+    cpu_metric.apply(tangent, {expected_action.data(), direction.size()});
+    double damped_quadratic = 0;
+    for (std::size_t i = 0; i < direction.size(); ++i)
+    {
+      close(actions[column][i], expected_action[i], 3e-9);
+      damped_quadratic += (*directions[column])[i].real() * actions[column][i].real() +
+          .1 * std::norm((*directions[column])[i]);
+    }
+    CHECK(damped_quadratic > 0);
+  }
+  double left = 0, right = 0;
+  for (std::size_t i = 0; i < direction.size(); ++i)
+  {
+    left += direction[i].real() * actions[1][i].real();
+    right += phase_direction[i].real() * actions[0][i].real();
+  }
+  CHECK(left == Catch::Approx(right).margin(3e-9));
+  IdentityPreconditioner preconditioner(schema, snapshot.version);
+  StochasticReconfigurationUpdateControl sr_control;
+  sr_control.learning_rate = 1e-4;
+  sr_control.initial_damping = .1;
+  sr_control.maximum_damping_attempts = 1;
+  sr_control.krylov.relative_tolerance = 1e-7;
+  sr_control.krylov.maximum_iterations = 6;
+  sr_control.krylov.maximum_operator_applications = 10;
+  StochasticReconfigurationUpdateRule gpu_update(gpu_metric, preconditioner, sr_control);
+  StochasticReconfigurationUpdateRule cpu_update(cpu_metric, preconditioner, sr_control);
+  const ParameterGradientView gpu_objective{schema.fingerprint(), snapshot.version, ReductionDomain::GLOBAL,
+      {gpu_force.data(), gpu_force.size()}};
+  const ParameterGradientView cpu_objective{schema.fingerprint(), snapshot.version, ReductionDomain::GLOBAL,
+      {cpu_force.data(), cpu_force.size()}};
+  const auto gpu_sr = gpu_update.propose(schema, snapshot, gpu_objective);
+  const auto cpu_sr = cpu_update.propose(schema, snapshot, cpu_objective);
+  for (std::size_t i = 0; i < direction.size(); ++i)
+    CHECK(gpu_sr.values[i] == Catch::Approx(cpu_sr.values[i]).margin(3e-9));
   std::array<std::vector<C>, 3> coefficients{{{{.3, -.2}, {-.4, .1}},
       {{.7, .15}, {.2, -.35}}, {{-.6, .4}, {.8, -.1}}}};
   std::array<VJPCoefficientChannel, 3> channels;
@@ -2087,6 +2192,11 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
   CHECK(metrics.snapshot().free_calls == warm.free_calls);
   CHECK(stream->storageDiagnostics().storage_fingerprint == diagnostic.storage_fingerprint);
+  gpu_jvp.reset();
+  gpu_jvp.fail_next = true;
+  CHECK_THROWS(stream->applyScoreJVP({schema, snapshot.version, {direction.data(), direction.size()}}, gpu_jvp));
+  CHECK(gpu_jvp.state() == DerivativeSinkState::POISONED);
+  check_jvp(direction);
   auto second = component.makeBudgetedGpuDerivativeOperator(trials, particles, 8, 13, 2, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work);
   CHECK(second->storageDiagnostics().shared_workspace_identity == diagnostic.shared_workspace_identity);
@@ -2101,8 +2211,19 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   actual.reset();
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
   actual.reset();
-  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::HERMITIAN, actual));
-  CHECK(actual.state() == DerivativeSinkState::IDLE);
+  ComplexStreamingSink expected_hermitian;
+  oracle->applyVJPs({channels.data(), 3}, DerivativeAdjoint::HERMITIAN, expected_hermitian);
+  stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::HERMITIAN, actual);
+  for (std::size_t c = 0; c < 3; ++c)
+    for (std::size_t i = 0; i < schema.parameterCount(); ++i)
+      close(actual.values[c][i], expected_hermitian.values[c][i], 3e-9);
+  C sample_dot{}, parameter_dot{};
+  for (std::size_t sample = 0; sample < 2; ++sample)
+    sample_dot += std::conj(coefficients[0][sample]) * gpu_jvp.values[sample];
+  for (std::size_t i = 0; i < direction.size(); ++i)
+    parameter_dot += std::conj(actual.values[0][i]) * direction[i].real();
+  close(sample_dot, parameter_dot, 3e-9);
+  actual.reset();
   channels[1].local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
   CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
   channels[1].local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
@@ -2129,6 +2250,8 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   p.makeMove(0, ParticleSet::PosType{.01, 0, 0});
   component.ratio(p, 0);
   CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  gpu_jvp.reset();
+  CHECK_THROWS(stream->applyScoreJVP({schema, snapshot.version, {direction.data(), direction.size()}}, gpu_jvp));
   component.restore(0);
   p.rejectMove(0);
   actual.reset();
@@ -2136,6 +2259,17 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   trial.addComponent(component.makeClone(p));
   CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
+  const auto publication = component.gpuParameterPublicationRequirements();
+  CHECK(component.publishBudgetedGpuParameters(gpu_sr, snapshot.version, publication.device_bytes, publication.host_bytes)
+      == snapshot.version + 1);
+  CHECK(cpu.publishParameters(cpu_sr, snapshot.version) == snapshot.version + 1);
+  gpu_update.proposalAccepted(schema, snapshot, gpu_objective);
+  cpu_update.proposalAccepted(schema, snapshot, cpu_objective);
+  CHECK_FALSE(gpu_update.hasLiveProposal());
+  gpu_jvp.reset();
+  CHECK_THROWS(stream->applyScoreJVP({schema, snapshot.version, {direction.data(), direction.size()}}, gpu_jvp));
+  actual.reset();
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 1}, DerivativeAdjoint::HERMITIAN, actual));
 }
 
 TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete generations atomically",

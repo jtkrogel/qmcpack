@@ -32,8 +32,11 @@ void validateComplexProducts()
   environment.lattice_vectors = {{{4.0, 0.4, -0.2}, {0.7, 5.0, 0.3}, {-0.1, 0.8, 6.0}}};
   environment.head_representation = HeadRepresentation::PAIRED_REAL_COMPLEX;
   environment.amplitude_scalar_domain = ScalarDomain::COMPLEX;
-  const ModelShape shape{2, 2, 2, 4, 16, 2, 2};
-  pf::PsiFormer model(smallParameters(environment), configurations(environment), 4, 16, 2, 2);
+  const ModelShape shape{3, 1, 2, 4, 16, 2, 2};
+  auto configuration = configurations(environment);
+  configuration.nup = 3;
+  configuration.ndown = 1;
+  pf::PsiFormer model(smallParameters(environment), configuration, 4, 16, 2, 2);
   const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
   auto parameters = model.p.flat_values();
   for (auto role : {ParameterRole::BACKFLOW_UP_WEIGHT, ParameterRole::BACKFLOW_DOWN_WEIGHT})
@@ -84,7 +87,7 @@ void validateComplexProducts()
   std::array<std::vector<C>, c> coefficients{{{{.7, -.2}, {-.4, .3}}, {{.8, .1}, {-.3, -.4}}, {{-.2, .5}, {.6, -.1}}}};
   std::vector<Owner::Channel> channels{{Owner::Role::SCORE, coefficients[0].data(), b},
       {Owner::Role::KINETIC, coefficients[1].data(), b}, {Owner::Role::SCORE, coefficients[2].data(), b}};
-  std::vector<C> expected(c * p);
+  std::vector<C> expected(c * p), expected_hermitian(c * p);
   for (std::size_t sample = 0; sample < b; ++sample)
   {
     const auto view = pf::GeometryPositionView::interleaved(positions.data() + 12 * sample, 4);
@@ -94,19 +97,26 @@ void validateComplexProducts()
     const auto kinetic = cpu_kinetic.evaluate(*kinetic_work, masses.data() + 4 * sample, 4);
     for (std::size_t channel = 0; channel < c; ++channel)
       for (std::size_t i = 0; i < p; ++i)
-        expected[channel * p + i] += coefficients[channel][sample] *
-            (channels[channel].role == Owner::Role::SCORE ? score.parameter_score[i] : kinetic.parameter_response[i]);
+      {
+        const auto response = channels[channel].role == Owner::Role::SCORE ? score.parameter_score[i] : kinetic.parameter_response[i];
+        expected[channel * p + i] += coefficients[channel][sample] * response;
+        expected_hermitian[channel * p + i] += coefficients[channel][sample] * std::conj(response);
+      }
   }
   // Independent numerical-owner transfer baseline excludes all explicit canonical downloads.
   auto score = PreparedDeviceComplexScore::prepare(image, queue, blas, cost.score.device_bytes);
   auto kinetic = PreparedDeviceComplexKinetic::prepare(image, targets, queue, blas,
       cost.kinetic.device_bytes, cost.kinetic.matrix_work);
   const auto baseline_start = metrics.snapshot();
+  std::size_t score_downloads = 0, score_uploads = 0;
   for (std::size_t sample = 0; sample < b; ++sample)
   {
     std::copy_n(positions.data() + sample * 12, 12, one_position.data());
     std::copy_n(masses.data() + sample * 4, 4, one_mass.data());
+    const auto score_before = metrics.snapshot();
     score->evaluate(one_position);
+    score_downloads += metrics.snapshot().downloaded_bytes - score_before.downloaded_bytes;
+    score_uploads += metrics.snapshot().uploaded_bytes - score_before.uploaded_bytes;
     kinetic->evaluate(one_position, one_mass, kappa);
   }
   const auto baseline_download = metrics.snapshot().downloaded_bytes - baseline_start.downloaded_bytes;
@@ -166,6 +176,57 @@ void validateComplexProducts()
   coefficients[0][0] = saved_coefficient;
   owner->evaluate(positions, masses, kappa, channels);
   owner->validate(owner->resultView());
+  owner->evaluate(positions, masses, kappa, channels, true);
+  const auto hermitian = owner->resultView();
+  for (std::size_t i = 0; i < expected_hermitian.size(); ++i)
+    require(std::abs(hermitian.data[i] - expected_hermitian[i]) <= 3e-9 * (1 + std::abs(expected_hermitian[i])),
+        "Complex products Hermitian CPU allP mismatch");
+  std::vector<C> direction(p), expected_jvp(b);
+  for (std::size_t i = 0; i < p; ++i) direction[i] = .005 * std::sin(double(i + 1));
+  for (std::size_t attempt = 0; attempt < 3; ++attempt)
+  {
+    if (attempt == 1) direction.back() += .017;
+    if (attempt == 2) std::fill(direction.begin(), direction.end(), C{});
+    for (std::size_t sample = 0; sample < b; ++sample)
+    {
+      score_work->setPositions(pf::GeometryPositionView::interleaved(positions.data() + 12 * sample, 4));
+      const auto row = cpu_score.evaluate(*score_work);
+      expected_jvp[sample] = C{};
+      for (std::size_t i = 0; i < p; ++i) expected_jvp[sample] += row.parameter_score[i] * direction[i].real();
+    }
+    const auto dot_before = metrics.snapshot();
+    owner->evaluateScoreJVP(positions, direction.data(), direction.size());
+    const auto result = owner->scoreJvpView();
+    owner->validate(result);
+    fails([&] { owner->validate(hermitian); });
+    require(result.samples == b, "Complex JVP sample extent differs");
+    for (std::size_t sample = 0; sample < b; ++sample)
+      require(std::abs(result.data[sample] - expected_jvp[sample]) <= 3e-9 * (1 + std::abs(expected_jvp[sample])),
+          "Complex full-score/device-dot JVP differs from CPU score dot");
+    require(metrics.snapshot().uploaded_bytes - dot_before.uploaded_bytes == score_uploads + 8 * p,
+        "Complex JVP did not upload exactly one realP direction per request");
+    require(metrics.snapshot().downloaded_bytes - dot_before.downloaded_bytes ==
+        score_downloads + b * (16 + 2 * sizeof(DerivativeFiniteStatus)), "Complex JVP transferred canonicalP instead of scalar/status results");
+  }
+  const auto dot_receipt = owner->scoreJvpView();
+  auto foreign_dot = dot_receipt;
+  foreign_dot.owner = nullptr;
+  fails([&] { owner->validate(foreign_dot); });
+  std::vector<double> tail_positions(positions.begin(), positions.begin() + 12);
+  owner->evaluateScoreJVP(tail_positions, direction.data(), direction.size());
+  require(owner->scoreJvpView().samples == 1, "Complex JVP bounded sample tail differs");
+  fails([&] { owner->validate(dot_receipt); });
+  const auto bad_direction = metrics.snapshot();
+  direction.back() = C{0, .01};
+  fails([&] { owner->evaluateScoreJVP(positions, direction.data(), direction.size()); });
+  fails([&] { (void)owner->scoreJvpView(); });
+  direction.back() = C{std::numeric_limits<double>::quiet_NaN(), 0};
+  fails([&] { owner->evaluateScoreJVP(positions, direction.data(), direction.size()); });
+  require(metrics.snapshot().uploaded_bytes == bad_direction.uploaded_bytes &&
+      metrics.snapshot().downloaded_bytes == bad_direction.downloaded_bytes, "Complex JVP invalid final direction launched");
+  direction.back() = C{};
+  require(owner->storageFingerprint() == fingerprint && metrics.snapshot().allocation_calls == warm.allocation_calls &&
+      metrics.snapshot().free_calls == warm.free_calls, "Complex JVP warm owner allocated or changed storage");
   // Required inverse admission cannot be bypassed by all-zero coefficients.
   auto nodal = parameters;
   for (auto part : {HeadTensorComponent::REAL, HeadTensorComponent::IMAG})
@@ -178,10 +239,13 @@ void validateComplexProducts()
   for (auto& row : coefficients) std::fill(row.begin(), row.end(), C{});
   fails([&] { node->evaluate(positions, masses, kappa, channels); });
   fails([&] { (void)node->resultView(); });
+  fails([&] { node->evaluateScoreJVP(positions, direction.data(), direction.size()); });
+  fails([&] { (void)node->scoreJvpView(); });
   std::cout << "PASS complex products B=" << b << " channels=" << c << " P=" << p
             << " K=" << targets << " chunk=" << chunk << " max_cpu_allP=" << maximum
             << " device_bytes=" << cost.device_bytes << " host_bytes=" << cost.host_bytes
             << " request_matrix_work=" << cost.matrix_work << " final_canonical_D2H=" << 16 * c * p
-            << " warm_allocations=0 whole_batch_preflight=1 ordinary_transpose=1\n";
+            << " score_dot_scalar_work=" << cost.score_dot_scalar_work
+            << " warm_allocations=0 whole_batch_preflight=1 ordinary_transpose=1 hermitian=1 full_score_device_dot=1\n";
 }
 #endif

@@ -445,19 +445,19 @@ struct PsiFormerComplexWF::Impl
           positions(3 * samples * lane->state->model.ne), inverse_masses(samples * lane->state->model.ne)
     {}
 
-    /// Only ordinary TRANSPOSE VJPs are qualified; real tangents and HOST complex outputs remain explicit.
+    /// Numerical full-score/device-dot JVP and both adjoints retain REAL tangents/HOST complex outputs.
     wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
     {
       using namespace wftrain;
       StreamingDerivativeCapabilities c;
       c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
-          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
-      c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE);
+          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) | derivativeProductBit(DerivativeProduct::SCORE_JVP);
+      c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) | derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
       c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
       c.maximum_vjp_channels = 3;
       c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
       c.maximum_sample_tile_size = 1;
-      c.fixed_parameter_scratch_vectors = 11; // 2 real P + 8 complex P + bounded conversion chunk.
+      c.fixed_parameter_scratch_vectors = 13; // 4 real P + 8 complex P + bounded conversion chunk.
       c.block_streaming = true;
       return c;
     }
@@ -487,9 +487,9 @@ struct PsiFormerComplexWF::Impl
       const auto& cost = lane->products->cost();
       d.parameter_count = cost.parameters;
       d.sample_count = samples;
-      d.real_parameter_vectors = 2;
+      d.real_parameter_vectors = 4;
       d.complex_parameter_vectors = 8;
-      d.parameter_scratch_bytes = 144 * cost.parameters + 16 * cost.chunk;
+      d.parameter_scratch_bytes = 160 * cost.parameters + 16 * cost.chunk;
       d.shared_workspace_bytes = cost.device_bytes + cost.host_bytes + lane->zeros.capacity() * sizeof(C);
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
@@ -504,16 +504,40 @@ struct PsiFormerComplexWF::Impl
       return d;
     }
 
-    /// The interface requires this hook; JVP remains unsupported and absent from capabilities.
-    void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView&,
-        wftrain::SampleProductSink&) const override
+    /// Contract the GPU canonical score with one REAL direction; only O(B) scalar products return.
+    void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
+        wftrain::SampleProductSink& sink) const override
     {
-      throw std::logic_error("Immutable GPU analysis supports only TRANSPOSE VJPs, not score JVP");
+      NativeTimerScope timer(phase_timers.score_jvp);
+      std::unique_lock execution(lane->execution_mutex);
+      const C* output;
+      {
+        std::shared_lock read(lane->state->mutex);
+        if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
+            lane->state->pending_proposals.load(std::memory_order_relaxed))
+          throw std::logic_error("Complex GPU score JVP snapshot is stale or family has a pending move");
+        std::unique_lock gpu(lane->generation->mutex);
+        validateDerivativeSource(*lane->state);
+        {
+          NativeTimerScope host_timer(phase_timers.gpu_call);
+          lane->products->evaluateScoreJVP(positions, direction.values().data(), direction.values().size());
+        }
+        const auto result = lane->products->scoreJvpView();
+        lane->products->validate(result);
+        output = result.data;
+      }
+      // Callback code never runs under model/GPU locks; the numerical lane remains leased.
+      for (std::size_t sample = 0; sample < samples; ++sample)
+      {
+        const wftrain::SampleProductTileDescriptor tile{lane->state->schema->providerId(), lane->state->schema->fingerprint(),
+            version, ordinal, offset + sample, 1, sample};
+        sink.add({tile, {output + sample, 1}});
+      }
     }
 
     /// Lease execution before model read; release GPU/model locks BEFORE any caller callback.
     void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
-        wftrain::DerivativeAdjoint, wftrain::ParameterReductionSink& sink) const override
+        wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink& sink) const override
     {
       NativeTimerScope timer(phase_timers.parameter_vjp);
       using namespace wftrain;
@@ -534,7 +558,8 @@ struct PsiFormerComplexWF::Impl
               requested[c].coefficients.values.data(), samples};
         {
           NativeTimerScope host_timer(phase_timers.gpu_call);
-          lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels);
+          lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels,
+              adjoint == DerivativeAdjoint::HERMITIAN);
         }
         const auto result = lane->products->resultView();
         lane->products->validate(result);
