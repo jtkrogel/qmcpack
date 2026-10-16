@@ -44,7 +44,17 @@ def main():
     parser.add_argument("--restart", action="store_true", help="also require split-run exact continuation")
     parser.add_argument("--preflight", action="store_true", help="also check unsupported model/optimizer rejection")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--ranks", type=int, default=1)
+    parser.add_argument("--mpiexec", default="mpirun")
+    parser.add_argument("--profile-only", action="store_true", help="one bounded Adam/inference case for MPI/OpenMP")
+    parser.add_argument("--optimizer-screen", action="store_true", help="six bounded nonlinear SJ optimizer cases")
     args = parser.parse_args()
+    if args.threads <= 0 or args.ranks <= 0:
+        parser.error("--threads and --ranks must be positive")
+    if (args.profile_only or args.optimizer_screen) and (args.restart or args.preflight):
+        parser.error("profile/screen options select their cases; omit --restart/--preflight")
+    if args.profile_only and args.optimizer_screen:
+        parser.error("select --profile-only or --optimizer-screen")
     executable = args.executable.resolve()
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
@@ -70,8 +80,11 @@ def main():
             assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
         tree.write(directory / "run.xml")
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
+        command = [str(executable), "run.xml"]
+        if args.ranks > 1:
+            command = [args.mpiexec, "-np", str(args.ranks)] + command
         with (directory / "run.log").open("w") as log:
-            result = subprocess.run([str(executable), "run.xml"], cwd=directory, env=environment,
+            result = subprocess.run(command, cwd=directory, env=environment,
                                     stdout=log, stderr=subprocess.STDOUT, timeout=180)
         text = (directory / "run.log").read_text()
         if reject:
@@ -85,7 +98,7 @@ def main():
         assert len(rows) == expected_rows, (directory, rows)
         for row in rows:
             assert row["committed"] == "1", (directory, row)
-            assert int(row["samples"]) == 4, (directory, row)
+            assert int(row["samples"]) == 4 * args.ranks, (directory, row)
             assert all(math.isfinite(float(row[name])) for name in ("mean_energy", "variance", "gradient_norm")), row
             assert float(row["gradient_norm"]) > 0, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + 1, row
@@ -101,7 +114,7 @@ def main():
             data = [line.split() for line in scalar.splitlines() if line.strip() and not line.startswith("#")]
             assert len(data) == 1, path
             header = next(line.split()[1:] for line in scalar.splitlines() if line.startswith("#") and "BlockWeight" in line)
-            assert float(data[0][header.index("BlockWeight")]) == 2, path
+            assert float(data[0][header.index("BlockWeight")]) == 2 * args.ranks, path
         models = sorted((directory / "sj.s000.training").rglob("*.parameters.h5"))
         assert len(models) == expected_rows, (directory, models)
         initial = [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
@@ -127,7 +140,30 @@ def main():
                 assert all(node.get("optimize") == "no" for node in exported.findall(".//sposet")), model
         return directory
 
+    if args.optimizer_screen:
+        for optimizer in ("momentum_sgd", "rmsprop", "amsgrad", "sr", "minsr", "spring"):
+            def controls(tree):
+                if optimizer in ("sr", "minsr", "spring"):
+                    training = tree.find("qmc/training")
+                    limits = {"damping": "0.01", "krylov_maximum_iterations": "32",
+                              "krylov_maximum_operator_applications": "128", "krylov_maximum_seconds": "10",
+                              "krylov_relative_tolerance": "1e-8"}
+                    if optimizer == "sr":
+                        limits["maximum_damping_attempts"] = "1"
+                    for name, value in limits.items():
+                        ET.SubElement(training, "parameter", name=name).text = value
+            directory = run(optimizer, optimizer=optimizer, mutate=controls)
+            for row in history(directory):
+                for name, maximum in (("krylov_iterations", 32), ("krylov_operator_applications", 128)):
+                    if row.get(name):
+                        assert int(row[name]) <= maximum, (optimizer, row)
+        print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
+        return
+
     adam = run("adam")
+    if args.profile_only:
+        print(f"PASS: bounded SJ Adam/inference {args.ranks} MPI x {args.threads} OpenMP; accepted model export")
+        return
     off = run("adam_no_inference", inference=False)
     sgd = run("sgd", optimizer="sgd")
     for lhs, rhs in zip(history(adam), history(off)):
@@ -148,7 +184,7 @@ def main():
         for name in lhs:
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"restart model: {name}")
     if args.preflight:
-        run("reject_kfac", optimizer="kfac", reject="requires all-electron ENERGY Adam/plain SGD")
+        run("reject_kfac", optimizer="kfac", reject="no affine observations required by KFAC")
         run("reject_zero_cap", reject="legacy_maximum_parameters must be positive", mutate=lambda tree: setattr(
             tree.find("qmc/training/parameter[@name='legacy_maximum_parameters']"), "text", "0"))
 

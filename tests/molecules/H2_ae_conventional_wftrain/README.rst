@@ -27,5 +27,16 @@ retained in the system temporary directory, including on failure.
 
 The application tests require a real double-precision CPU build plus Python
 h5py/numpy. The checker defaults to one OpenMP thread; ``--threads`` can exercise
-a bounded OpenMP profile. MPI and later MDJ/orbital/ECP qualification are separate
-gates; this fixture does not establish those capabilities.
+a bounded OpenMP profile. ``--ranks 2 --threads 2 --profile-only`` runs a single
+Adam/inference case under mpirun and checks the declared global sample weights,
+accepted versions, changed active parameters, and frozen Slater export. It does
+not replace the full inference-isolation/restart suite or establish arbitrary
+MPI layouts. Later MDJ/orbital/ECP qualification remains separate.
+
+``--optimizer-screen`` selects six additional nonlinear-Jastrow methods:
+momentum_sgd, rmsprop, amsgrad, sr, minsr and spring. Each uses two updates and
+four samples/update, with interval inference. Matrix-free methods explicitly
+bound Krylov iterations32, operator applications128 and solve seconds10, with
+damping0.01; SR admits one damping attempt. The screen checks finite committed
+updates and exported physical state, and does not establish convergence or
+performance. It reuses the same single tiny real CPU fixture.
