@@ -245,6 +245,57 @@ WaveFunctionComponent::LogValue evaluate(WaveFunctionComponent& component, Parti
 }
 } // namespace
 
+TEST_CASE("PsiFormer paired neural weights preserve phase head roles and exclude nonweights",
+          "[wavefunction][psiformer][complex_wf][complex_weight_blocks]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const auto initialized = parameters();
+  PsiFormerComplexWF component("weights", initialized, p, source, clone_cap, {.17, -.11, .07});
+  std::vector<std::string> expected;
+  std::size_t imaginary_count = 0;
+  for (const auto& leaf : initialized.layouts)
+    if (leaf.name == "w" || leaf.name == "w_imag")
+    {
+      expected.push_back(leaf.module + "/" + leaf.name);
+      imaginary_count += leaf.name == "w_imag";
+    }
+  REQUIRE(expected.size() == 17);
+  REQUIRE(imaginary_count == 2);
+  const auto weights = component.neuralWeightBlocks();
+  CHECK(weights == expected);
+  for (const auto& block : component.parameterSchema().blocks())
+  {
+    const auto leaf = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+        [&](const auto& item) { return item.module + "/" + item.name == block.id; });
+    REQUIRE(leaf != initialized.layouts.end());
+    const bool selected = std::find(weights.begin(), weights.end(), block.id) != weights.end();
+    CHECK(selected == (leaf->name == "w" || leaf->name == "w_imag"));
+    if (selected)
+    {
+      CHECK(block.offset == leaf->begin);
+      CHECK(block.count == leaf->end - leaf->begin);
+    }
+  }
+  evaluate(component, p);
+  bool learned_phase_gradient = false;
+  for (const auto& gradient : p.G)
+    for (int d = 0; d < 3; ++d)
+      learned_phase_gradient |= std::abs(gradient[d].imag()) > 1e-8;
+  CHECK(learned_phase_gradient);
+  auto clone = component.makeClone(clone_p);
+  CHECK(dynamic_cast<PsiFormerComplexWF&>(*clone).neuralWeightBlocks() == weights);
+  auto candidate = component.snapshotParameters();
+  const auto imaginary = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+      [](const auto& leaf) { return leaf.name == "w_imag"; });
+  REQUIRE(imaginary != initialized.layouts.end());
+  candidate.values[imaginary->begin] += .01;
+  CHECK(component.publishParameters(candidate, candidate.version) == candidate.version + 1);
+  CHECK(component.neuralWeightBlocks() == weights);
+  CHECK(dynamic_cast<PsiFormerComplexWF&>(*clone).neuralWeightBlocks() == weights);
+}
+
 TEST_CASE("PsiFormer standalone paired model preserves complex inference without configuration",
           "[wavefunction][psiformer][complex_wf][model_file]")
 {
@@ -2050,6 +2101,7 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
 
   // The independently qualified CPU two-tape owner supplies complete complex rows, not Re-only forces.
   PsiFormerComplexWF cpu("analysis", initialized, p, source, clone_cap, twist);
+  CHECK(component.neuralWeightBlocks() == cpu.neuralWeightBlocks());
   auto cpu_clone = cpu.makeClone(clone_p);
   RefVectorWithLeader<WaveFunctionComponent> components(cpu);
   components.push_back(cpu);

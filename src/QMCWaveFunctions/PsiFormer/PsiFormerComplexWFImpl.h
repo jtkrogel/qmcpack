@@ -1724,6 +1724,30 @@ const wftrain::StructuredParameterSchema& PsiFormerComplexWF::parameterSchema() 
   return *impl_->state->schema;
 }
 
+/// Immutable typed roles select canonical weights, never names masquerading as policy.
+std::vector<std::string> PsiFormerComplexWF::neuralWeightBlocks() const
+{
+  using Role = psiformer::ParameterRole;
+  std::vector<std::string> result;
+  for (const auto& tensor : impl_->state->plan.parameterTensors())
+    switch (tensor.role)
+    {
+    case Role::ELECTRON_EMBEDDING_WEIGHT:
+    case Role::ATTENTION_QUERY_WEIGHT:
+    case Role::ATTENTION_KEY_WEIGHT:
+    case Role::ATTENTION_VALUE_WEIGHT:
+    case Role::ATTENTION_OUTPUT_WEIGHT:
+    case Role::UPDATE_HIDDEN_WEIGHT:
+    case Role::UPDATE_OUTPUT_WEIGHT:
+    case Role::BACKFLOW_UP_WEIGHT:
+    case Role::BACKFLOW_DOWN_WEIGHT:
+      result.push_back(tensor.module + "/" + tensor.name);
+      break;
+    default: break;
+    }
+  return result;
+}
+
 /// Copy canonical values and their exact version in one read transaction.
 wftrain::StructuredParameterSnapshot PsiFormerComplexWF::snapshotParameters() const
 {

@@ -60,6 +60,9 @@ public:
   /// Return immutable canonical REAL64 tensors, including distinct w and w_imag blocks.
   const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override;
 
+  /// Select typed neural weights, including imaginary backflow heads, for decoupled shrink.
+  std::vector<std::string> neuralWeightBlocks() const override;
+
   /// Copy one version-coherent complete canonical vector under a shared read transaction.
   wftrain::StructuredParameterSnapshot snapshotParameters() const override;
 
