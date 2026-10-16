@@ -200,7 +200,7 @@ struct PsiFormerComplexWF::Impl
     std::vector<C> converted;
     const std::size_t device_bytes, host_bytes;
     const psiformer::device::TargetVglPreparation preparation;
-    std::size_t dense_value_calls = 0, dense_vgl_calls = 0;
+    std::size_t dense_value_calls = 0, dense_vgl_calls = 0, dense_ratio_grad_calls = 0;
     std::mutex mutex;
   };
 #endif
@@ -1158,9 +1158,11 @@ struct PsiFormerComplexWF::Impl
       tail = count;
       begin += count;
     }
-    auto& calls = spatial ? lane.dense_vgl_calls : lane.dense_value_calls;
+    const bool proposed_gradient = spatial && replacement >= 0;
+    auto& calls = spatial ? (proposed_gradient ? lane.dense_ratio_grad_calls : lane.dense_vgl_calls) : lane.dense_value_calls;
     if (dense_tiles && calls++ == 0)
-      app_log() << "  Complex PsiFormer numerical dense tile completed: operation=" << (spatial ? "FULL_VGL" : "VALUE")
+      app_log() << "  Complex PsiFormer numerical dense tile completed: operation="
+                << (spatial ? (proposed_gradient ? "RATIO_GRAD_FULL" : "FULL_VGL") : "VALUE")
                 << ", walkers=" << targets.size() << ", tile_capacity=" << lane.capacity
                 << ", dense_tiles=" << dense_tiles << ", last_tile_count=" << tail
                 << ", parameter_version=" << lane.image->version() << "; lane_serialized=yes; CPU_fallback=no" << std::endl;
@@ -1927,6 +1929,51 @@ void PsiFormerComplexWF::mw_calcRatio(const RefVectorWithLeader<WaveFunctionComp
     clone.discardPending();
     clone.cache(resource.amplitude[i], resource.logs[i], targets[i], electron);
     ratios[i] = resource.ratios[i];
+  }
+}
+
+/// Dense proposed FULL products preserve every output and pending cache until all tails validate.
+void PsiFormerComplexWF::mw_ratioGrad(const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& targets, int electron, std::vector<PsiValue>& ratios,
+    std::vector<GradType>& gradients) const
+{
+  if (!impl_->denseEnabled())
+  {
+    WaveFunctionComponent::mw_ratioGrad(components, targets, electron, ratios, gradients);
+    return;
+  }
+  NativeTimerScope timer(impl_->phase_timers.batch_vgl);
+  if (components.empty())
+    return;
+  std::shared_lock read(impl_->state->mutex);
+  auto& resource = impl_->requireDenseTeam(components, targets, electron);
+  if (electron < 0 || ratios.size() != components.size() || gradients.size() != components.size())
+    throw std::invalid_argument("Dense complex GPU ratio/gradient output/electron extent mismatch");
+  const auto r = checkedMemoryRange(ratios.data(), ratios.size(), "Complex ratio output range overflow");
+  const auto g = checkedMemoryRange(gradients.data(), gradients.size(), "Complex proposed gradient output range overflow");
+  if (memoryRangesOverlap(r, g))
+    throw std::invalid_argument("Dense complex GPU ratio and proposed gradient outputs overlap");
+  impl_->stageDense(resource, targets, true, electron);
+  const auto n = impl_->state->model.ne;
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    resource.ratios[i] = resource.components[i]->impl_->formRatio(resource.amplitude[i], targets[i], electron);
+    // Reuse the moved row of the FULL transaction buffer for additive output staging.
+    auto& staged = resource.gradient[i * n + electron];
+    for (int d = 0; d < 3; ++d)
+    {
+      staged[d] += gradients[i][d];
+      if (!isFiniteWavefunctionValue(staged[d]))
+        throw std::overflow_error("Dense complex GPU proposed gradient scatter overflow");
+    }
+  }
+  for (std::size_t i = 0; i < components.size(); ++i)
+  {
+    auto& clone = *resource.components[i]->impl_;
+    clone.discardPending();
+    clone.cache(resource.amplitude[i], resource.logs[i], targets[i], electron);
+    ratios[i] = resource.ratios[i];
+    gradients[i] = resource.gradient[i * n + electron];
   }
 }
 

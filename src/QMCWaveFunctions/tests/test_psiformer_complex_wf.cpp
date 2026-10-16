@@ -2511,6 +2511,77 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
         particles[walker]->rejectMove(0);
       }
     refresh();
+    // Proposed FULL gradients batch through the same T2 owner, including the tail.
+    // A separate CPU clone at the complete proposed configuration is the oracle.
+    using Grad = WaveFunctionComponent::GradType;
+    const C additive{.21, -.13};
+    std::vector<Grad> proposed_gradients(3, Grad(additive));
+    std::array<Grad, 3> expected_gradients;
+    for (std::size_t walker = 0; walker < 3; ++walker)
+    {
+      particles[walker]->makeMove(3, ParticleSet::PosType{-.009, .012, -.005});
+      expected_gradients[walker] = Grad(additive);
+      expected_ratios[walker] = references[walker]->ratioGrad(*particles[walker], 3, expected_gradients[walker]);
+      auto proposed_particles = electrons(simulation_cell, 3, 1);
+      proposed_particles.R = particles[walker]->R;
+      proposed_particles.R[3] = particles[walker]->activeR(3);
+      proposed_particles.update();
+      auto oracle = references[walker]->makeClone(proposed_particles);
+      evaluate(*oracle, proposed_particles);
+      for (int d = 0; d < 3; ++d)
+        close(expected_gradients[walker][d], proposed_particles.G[3][d] + additive, 2e-8);
+    }
+    ratios.assign(3, C{9, 7});
+    const auto before_ratio_grad = metrics.snapshot();
+    gpu.mw_ratioGrad(team, targets, 3, ratios, proposed_gradients);
+    CHECK(metrics.snapshot().allocation_calls == before_ratio_grad.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == before_ratio_grad.free_calls);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      close(ratios[i], expected_ratios[i], 2e-9);
+      for (int d = 0; d < 3; ++d)
+        close(proposed_gradients[i][d], expected_gradients[i][d], 2e-8);
+    }
+    ratios.assign(3, C{9, 7});
+    proposed_gradients.assign(3, Grad(additive));
+    const std::array<C, 3> before_failure_logs{
+        components[0]->get_log_value(), components[1]->get_log_value(), components[2]->get_log_value()};
+    p2.R[1][0] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS(gpu.mw_ratioGrad(team, targets, 3, ratios, proposed_gradients));
+    p2.R[1][0] = saved_position;
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      CHECK(ratios[i] == (C{9, 7}));
+      CHECK(components[i]->get_log_value() == before_failure_logs[i]);
+      for (int d = 0; d < 3; ++d)
+        CHECK(proposed_gradients[i][d] == additive);
+    }
+    // A late caller-output validation failure must also preserve prior proposals.
+    proposed_gradients[2][2] = C{std::numeric_limits<double>::infinity(), 0};
+    const auto invalid_gradients = proposed_gradients;
+    CHECK_THROWS_AS(gpu.mw_ratioGrad(team, targets, 3, ratios, proposed_gradients), std::overflow_error);
+    for (std::size_t i = 0; i < 3; ++i)
+      for (int d = 0; d < 3; ++d)
+        CHECK(proposed_gradients[i][d] == invalid_gradients[i][d]);
+    for (const auto ratio : ratios)
+      CHECK(ratio == (C{9, 7}));
+    std::vector<Grad> wrong_extent(2);
+    CHECK_THROWS_AS(gpu.mw_ratioGrad(team, targets, 3, ratios, wrong_extent), std::invalid_argument);
+    for (std::size_t walker = 0; walker < 3; ++walker)
+      if (walker != 1)
+      {
+        references[walker]->acceptMove(*particles[walker], 3);
+        components[walker]->acceptMove(*particles[walker], 3);
+        particles[walker]->acceptMove(3);
+        CHECK_THROWS(static_cast<PsiFormerComplexWF*>(components[walker])->observeCoulombEnergy(*particles[walker], 0));
+      }
+      else
+      {
+        references[walker]->restore(3);
+        components[walker]->restore(3);
+        particles[walker]->rejectMove(3);
+      }
+    refresh();
     const auto publication = gpu.gpuParameterPublicationRequirements();
     auto candidate = gpu.snapshotParameters();
     candidate.values[plan.parameter(ps::ParameterRole::BACKFLOW_UP_WEIGHT, ps::NO_ATTENTION_BLOCK,

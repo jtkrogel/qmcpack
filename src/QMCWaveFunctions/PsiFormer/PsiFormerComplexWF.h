@@ -113,7 +113,7 @@ public:
   /// Report the prepared determinant expansion's actual extent.
   bool isMultiDet() const override;
 
-  /// Prepared B=1 GPU inference profile; separately admitted hybrid training retains CPU sampling/Hamiltonian.
+  /// Prepared GPU inference profile; opt-in dense teams remain serialized and inference-only.
   bool gpuInferenceEnabled() const noexcept;
 
   /// Add full physical logarithmic G/L and publish the accepted scalar amplitude.
@@ -128,6 +128,10 @@ public:
       const RefVector<ParticleSet::ParticleLaplacian>&, bool fromscratch) const override;
   void mw_calcRatio(const RefVectorWithLeader<WaveFunctionComponent>&,
       const RefVectorWithLeader<ParticleSet>&, int electron, std::vector<PsiValue>&) const override;
+  /// Dense proposed FULL gradients; accepted mw_evalGrad intentionally retains scalar dispatch.
+  void mw_ratioGrad(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, int electron, std::vector<PsiValue>&,
+      std::vector<GradType>&) const override;
 
   void createResource(ResourceCollection&) const override;
   void acquireResource(ResourceCollection&, const RefVectorWithLeader<WaveFunctionComponent>&) const override;
