@@ -121,6 +121,76 @@ private:
   const RetainedCrowdSamples& samples_;
 };
 
+// Temporary bounded task46 diagnostic; removed after the LM action diagnosis.
+class LMProbeSink final : public wftrain::SampleProductSink
+{
+public:
+  LMProbeSink(std::size_t offset, std::vector<wftrain::DerivativeValue>& values) : offset_(offset), values_(values) {}
+protected:
+  void consume(const wftrain::SampleProductTileConstView& tile) override
+  {
+    std::copy(tile.values().begin(), tile.values().end(),
+              values_.begin() + tile.descriptor().sample_offset - offset_);
+  }
+private:
+  std::size_t offset_;
+  std::vector<wftrain::DerivativeValue>& values_;
+};
+
+void probeNativeLM(const wftrain::StructuredParameterSchema& schema,
+                   const std::vector<wftrain::ScoreCovarianceBatch>& batches,
+                   const wftrain::SampledLinearMethodOperator& h,
+                   const wftrain::SampledLinearMethodOperator& s,
+                   Communicate& comm)
+{
+  const auto* path = std::getenv("QMC_WFTRAIN_LM_PROBE");
+  if (!path) return;
+  std::size_t samples = 0;
+  for (const auto& batch : batches) samples += batch.weights.size();
+  const auto p = schema.parameterCount();
+  if (comm.size() != 1 || p > 16 || samples > 64)
+    throw std::runtime_error("Temporary LM probe requires rank1/P<=16/samples<=64");
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("Cannot write temporary LM probe");
+  out << std::setprecision(17);
+  std::size_t sample_offset = 0;
+  for (const auto& batch : batches)
+  {
+    const auto& op = *batch.derivative_operator;
+    for (std::size_t i = 0; i < batch.weights.size(); ++i)
+      out << "sample " << sample_offset + i << ' ' << batch.weights[i] << ' ' << batch.local_energies[i].real() << '\n';
+    for (std::size_t column = 0; column < p; ++column)
+    {
+      std::vector<wftrain::DerivativeValue> direction(p), values(batch.weights.size());
+      direction[column] = 1.0;
+      const wftrain::StructuredParameterVectorConstView view(schema, op.parameterVersion(),
+          {direction.data(), direction.size()});
+      LMProbeSink score(op.sampleOffset(), values);
+      op.applyScoreJVP(view, score);
+      for (std::size_t i = 0; i < values.size(); ++i)
+        out << "score " << sample_offset + i << ' ' << column << ' ' << values[i].real() << ' ' << values[i].imag() << '\n';
+      LMProbeSink energy(op.sampleOffset(), values);
+      op.applyLocalEnergyJVP(view, wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC), energy);
+      for (std::size_t i = 0; i < values.size(); ++i)
+        out << "del " << sample_offset + i << ' ' << column << ' ' << values[i].real() << ' ' << values[i].imag() << '\n';
+    }
+    sample_offset += batch.weights.size();
+  }
+  for (std::size_t column = 0; column <= p; ++column)
+  {
+    std::vector<wftrain::DerivativeValue> direction(p + 1), image(p + 1);
+    direction[column] = 1.0;
+    for (int repeat = 0; repeat < 2; ++repeat)
+      for (const auto* op : {&h, &s})
+      {
+        op->apply({direction.data(), direction.size()}, {image.data(), image.size()});
+        for (std::size_t row = 0; row <= p; ++row)
+          out << (op == &h ? "H" : "S") << repeat << ' ' << row << ' ' << column << ' '
+              << image[row].real() << ' ' << image[row].imag() << '\n';
+      }
+  }
+}
+
 /** Copy an observed population before later MC moves overwrite its positions. */
 RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool overlap,
                                        bool exact_energy_capacity = false,
@@ -2560,6 +2630,7 @@ void WFTrainBatched::run()
                 checkedMemoryMultiply(checkedMemoryMultiply(vectors, initial.size()), sizeof(wftrain::DerivativeValue)));
             enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
             wftrain::MatrixFreeLinearMethodResult result;
+            probeNativeLM(schema, score_batches, h, s, *myComm);
             if (accelerated)
             {
               wftrain::AcceleratedLinearMethodControl control;
