@@ -109,6 +109,62 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   binding.exportModel(file);
   CHECK(binding.readModel(file).values == binding.snapshotParameters().values);
   {
+    // The original registration baseline must survive import, a new training
+    // binding and re-export; active optimizer coordinates are not that baseline.
+    ParticleSet imported_particles(particles);
+    auto imported = prototype.makeClone(imported_particles);
+    imported->storeXMLNode(definition.getRoot());
+    CHECK(imported->conventionalRegistrationIdentity() == prototype.conventionalRegistrationIdentity());
+    TrainingWaveFunctionBinding loader(*imported, imported_particles, {256, 65536, 16}, comm);
+    loader.setHamiltonian(sampling_hamiltonian);
+    auto reset = loader.snapshotParameters();
+    reset.values = old.values;
+    loader.publishParameters(reset, reset.version);
+    loader.importModel(file);
+    CHECK(loader.snapshotParameters().values == binding.snapshotParameters().values);
+    particles.update();
+    imported_particles.update();
+    prototype.evaluateLog(particles);
+    imported->evaluateLog(imported_particles);
+    CHECK(imported->getLogPsi() == Catch::Approx(prototype.getLogPsi()));
+    BareKineticEnergy source_kinetic(particles), imported_kinetic(imported_particles);
+    CHECK(imported_kinetic.evaluate(*imported, imported_particles) ==
+          Catch::Approx(source_kinetic.evaluate(prototype, particles)));
+    TrainingWaveFunctionBinding fresh_training(*imported, imported_particles, {256, 65536, 16}, comm);
+    fresh_training.setHamiltonian(sampling_hamiltonian);
+    CHECK(fresh_training.modelIdentity() == binding.modelIdentity());
+    const auto reexport = std::filesystem::path(file.string() + ".reexport.h5");
+    Cleanup cleanup_reexport{reexport};
+    fresh_training.exportModel(reexport);
+    ParticleSet second_particles(particles);
+    auto second = prototype.makeClone(second_particles);
+    second->storeXMLNode(definition.getRoot());
+    TrainingWaveFunctionBinding second_loader(*second, second_particles, {256, 65536, 16}, comm);
+    second_loader.setHamiltonian(sampling_hamiltonian);
+    second_loader.importModel(reexport);
+    CHECK(second_loader.snapshotParameters().values == binding.snapshotParameters().values);
+
+    const auto malformed = std::filesystem::path(file.string() + ".malformed.h5");
+    Cleanup cleanup_malformed{malformed};
+    std::filesystem::copy_file(file, malformed);
+    {
+      hdf_archive output;
+      REQUIRE(output.open(malformed, H5F_ACC_RDWR));
+      output.push("conventional_wavefunction", false);
+      REQUIRE(H5Ldelete(output.top(), "parameters", H5P_DEFAULT) >= 0);
+      output.write(std::vector<double>(old.values.size() + 1, 0.0), "parameters");
+    }
+    const auto before = second_loader.snapshotParameters();
+    const auto* component = second->getOrbitals()[0].get();
+    std::string error;
+    try { second_loader.importModel(malformed); }
+    catch (const std::runtime_error& failure) { error = failure.what(); }
+    CHECK(error.find("invalid or oversized required field: parameters") != std::string::npos);
+    CHECK(second_loader.snapshotParameters().values == before.values);
+    CHECK(second_loader.snapshotParameters().version == before.version);
+    CHECK(second->getOrbitals()[0].get() == component);
+  }
+  {
     hdf_archive output;
     REQUIRE(output.open(file, H5F_ACC_RDWR));
     output.push("conventional_wavefunction", false);
