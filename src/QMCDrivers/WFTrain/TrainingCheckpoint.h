@@ -143,6 +143,9 @@ public:
       const std::filesystem::path& source,
       const StructuredParameterSchema& expected_schema);
 
+  /// Exact canonical double bit-pattern fingerprint shared by model-only exports.
+  static std::string valuesFingerprint(const std::vector<double>& values);
+
   /** Restore a complete checkpoint while preserving failure atomicity.
    *
    * stage_state supplies the expected stage/configuration identity. Saved

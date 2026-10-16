@@ -263,6 +263,11 @@ void installDriverState(TrainingIterationState& coordinator,
 
 } // namespace
 
+std::string TrainingCheckpoint::valuesFingerprint(const std::vector<double>& values)
+{
+  return parameterFingerprint(values);
+}
+
 struct TrainingCheckpoint::PreparedRestore::Impl
 {
   StructuredParameterProvider& provider;

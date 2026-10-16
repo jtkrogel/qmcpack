@@ -54,6 +54,8 @@ public:
 
   /// Stable physical restart identity, independent of parameter values/version and runtime addresses.
   std::string trainingConfigurationFingerprint() const;
+  /// Export paired weights and immutable physical metadata without sampler state.
+  void exportModel(const std::string& path) const;
 
   /// Return immutable canonical REAL64 tensors, including distinct w and w_imag blocks.
   const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override;

@@ -1338,6 +1338,14 @@ PsiFormerComplexWF::~PsiFormerComplexWF()
 }
 
 /// Report the actual complete determinant expansion.
+void PsiFormerComplexWF::exportModel(const std::string& path) const
+{
+  std::shared_lock lock(impl_->state->mutex);
+  const auto& state = *impl_->state;
+  writeStandaloneModel(path, state.model, state.environment, state.profile, state.seed,
+                       "all_electron", state.reduced_twist);
+}
+
 bool PsiFormerComplexWF::isMultiDet() const
 {
   std::shared_lock read(impl_->state->mutex);

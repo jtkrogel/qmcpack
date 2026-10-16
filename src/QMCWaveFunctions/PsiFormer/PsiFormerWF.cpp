@@ -14,6 +14,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerNative.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerExecutionPlan.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerMemoryPolicy.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminantChannelBatch.h"
 #include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
@@ -10875,6 +10876,144 @@ std::size_t PsiFormerWF::parameterVersion() const
 }
 
 // Write a standalone flat parameter file without exposing mutable native storage.
+namespace
+{
+void writeStandaloneModel(const std::string& path, const pf::PsiFormer& model,
+                          const psiformer::ExecutionEnvironment& environment,
+                          const std::string& profile, std::uint64_t seed,
+                          const std::string& system, const std::array<double, 3>& twist)
+{
+  model.p.write(path);
+  hdf_archive output;
+  if (!output.open(path, H5F_ACC_RDWR))
+    throw std::runtime_error("Unable to append PsiFormer model metadata");
+  output.push("psiformer_model");
+  output.write(std::vector<int>{1, 0, 0}, "format_version");
+  output.write(std::string("fp64_reference"), "precision");
+  output.write(std::vector<std::uint64_t>{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
+      model.ndet, model.dim, model.heads, model.blocks}, "shape");
+  output.write(profile, "profile");
+  output.write(seed, "seed");
+  output.write(system, "system");
+  output.write(static_cast<int>(environment.head_representation == psiformer::HeadRepresentation::PAIRED_REAL_COMPLEX), "paired_complex");
+  output.write(static_cast<int>(environment.boundary == psiformer::BoundaryCondition::PERIODIC), "periodic");
+  output.write(std::string(environment.boundary == psiformer::BoundaryCondition::PERIODIC ?
+      "periodic_torus_v1" : "open_euclidean_v1"), "feature_policy");
+  std::vector<double> lattice;
+  for (const auto& row : environment.lattice_vectors)
+    lattice.insert(lattice.end(), row.begin(), row.end());
+  output.write(lattice, "lattice");
+  output.write(std::vector<double>(twist.begin(), twist.end()), "twist");
+  output.write(model.cfg.nuclei.x, "nuclear_positions");
+  output.write(model.cfg.charges.x, "nuclear_charges");
+  output.write(model.p.layout_fingerprint(), "layout_fingerprint");
+  output.write(wftrain::TrainingCheckpoint::valuesFingerprint(model.p.flat_values()), "values_fingerprint");
+  output.write(static_cast<std::uint64_t>(model.p.version()), "parameter_version");
+  output.write(std::string("postdecision"), "parameter_timing");
+  output.write(std::string("psiformer-model-complete-v1"), "completion_cookie");
+  output.pop();
+  output.flush();
+}
+}
+
+psiformer::PsiFormerModelFile psiformer::readPsiFormerModelFile(const std::string& path)
+{
+  hdf_archive input;
+  if (!input.open(path, H5F_ACC_RDONLY) || !input.is_group("psiformer_model"))
+    throw std::runtime_error("PsiFormer parameters-only import requires standalone model metadata");
+  input.push("psiformer_model", false);
+  std::vector<int> version;
+  std::vector<std::uint64_t> shape;
+  std::vector<double> twist;
+  std::string precision, cookie, layout, feature, values_fingerprint;
+  std::uint64_t parameter_version;
+  int paired = -1, periodic = -1;
+  PsiFormerModelFile result;
+  input.read(version, "format_version");
+  input.read(shape, "shape");
+  input.read(precision, "precision");
+  input.read(cookie, "completion_cookie");
+  input.read(layout, "layout_fingerprint");
+  input.read(values_fingerprint, "values_fingerprint");
+  input.read(parameter_version, "parameter_version");
+  input.read(feature, "feature_policy");
+  input.read(paired, "paired_complex");
+  input.read(periodic, "periodic");
+  input.read(result.parameters.profile, "profile");
+  input.read(result.parameters.seed, "seed");
+  input.read(result.system, "system");
+  input.read(twist, "twist");
+  if (version != std::vector<int>{1, 0, 0} || shape.size() != 7 ||
+      std::any_of(shape.begin(), shape.end(), [](auto n) { return n == 0 || n > std::numeric_limits<std::size_t>::max(); }) ||
+      precision != "fp64_reference" || cookie != "psiformer-model-complete-v1" ||
+      (paired != 0 && paired != 1) || (periodic != 0 && periodic != 1) || twist.size() != 3 ||
+      feature != (periodic ? "periodic_torus_v1" : "open_euclidean_v1") ||
+      (paired && (!periodic || result.parameters.profile != PSIFORMER_COMPLEX_PERIODIC_V1)) ||
+      (!paired && result.parameters.profile != DEEPQMC_PSIFORMER_V1 && result.parameters.profile != "external_hdf5") ||
+      (result.system != "all_electron" && result.system != "pseudopotential"))
+    throw std::runtime_error("Incompatible or incomplete standalone PsiFormer model metadata");
+  result.paired_complex = paired;
+  result.periodic = periodic;
+  std::copy(twist.begin(), twist.end(), result.twist.begin());
+  result.parameters.model_shape = {shape[0], shape[1], shape[2], shape[3], shape[4], shape[5], shape[6]};
+  pf::Parameters parameters(path);
+  if (parameters.layout_fingerprint() != layout ||
+      wftrain::TrainingCheckpoint::valuesFingerprint(parameters.flat_values()) != values_fingerprint)
+    throw std::runtime_error("Standalone PsiFormer model layout fingerprint mismatch");
+  result.parameters.values = parameters.flat_values();
+  for (const auto& tensor : parameters.layouts)
+    result.parameters.layouts.push_back({tensor.module, tensor.name, tensor.shape, tensor.begin, tensor.end});
+  return result;
+}
+
+void psiformer::validatePsiFormerModelFile(const PsiFormerModelFile& model, const std::string& path,
+    const ParticleSet& electrons, const ParticleSet& ions, const std::string& system,
+    const std::array<double, 3>& twist)
+{
+  const auto& shape = model.parameters.model_shape;
+  if (system != model.system || electrons.groups() != 2 ||
+      electrons.groupsize(0) != shape.spin_up_electrons || electrons.groupsize(1) != shape.spin_down_electrons ||
+      ions.getTotalNum() != shape.nuclei || model.periodic != (electrons.getLattice().getSuperCellEnum() == SUPERCELL_BULK) ||
+      model.twist != twist)
+    throw std::invalid_argument("Standalone PsiFormer model disagrees with XML system/spins/boundary/twist");
+  hdf_archive input;
+  if (!input.open(path, H5F_ACC_RDONLY))
+    throw std::runtime_error("Unable to reopen standalone PsiFormer metadata");
+  input.push("psiformer_model", false);
+  std::vector<double> positions, charges, lattice;
+  input.read(positions, "nuclear_positions");
+  input.read(charges, "nuclear_charges");
+  input.read(lattice, "lattice");
+  if (positions.size() != 3 * shape.nuclei || charges.size() != shape.nuclei || lattice.size() != 9)
+    throw std::invalid_argument("Standalone PsiFormer physical metadata is incomplete");
+  const auto& species = ions.getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  if (charge < 0)
+    throw std::invalid_argument("Standalone PsiFormer XML ions require charges");
+  for (std::size_t atom = 0; atom < shape.nuclei; ++atom)
+  {
+    if (charges[atom] != species(charge, ions.GroupID[atom]))
+      throw std::invalid_argument("Standalone PsiFormer ionic charges differ from XML");
+    for (int d = 0; d < 3; ++d)
+      if (positions[3 * atom + d] != ions.R[atom][d])
+        throw std::invalid_argument("Standalone PsiFormer ordered ionic geometry differs from XML");
+  }
+  if (model.periodic)
+    for (int a = 0; a < 3; ++a)
+      for (int d = 0; d < 3; ++d)
+        if (lattice[3 * a + d] != electrons.getLattice().R(a, d) ||
+            lattice[3 * a + d] != ions.getLattice().R(a, d))
+          throw std::invalid_argument("Standalone PsiFormer lattice differs from XML");
+}
+
+void PsiFormerWF::exportModel(const std::string& path) const
+{
+  std::shared_lock state_lock(model_state_->mutex);
+  writeStandaloneModel(path, model_state_->model, model_state_->execution_plan.environment(),
+      model_state_->initialization_profile, model_state_->initialization_seed, system_kind_,
+      model_state_->twist_phase.reduced);
+}
+
 void PsiFormerWF::exportParameters(const std::string& path) const
 {
   std::shared_lock state_lock(model_state_->mutex);

@@ -39,7 +39,7 @@
       <parameter name="iterations">1</parameter>
       <parameter name="learning_rate">1e-10</parameter>
       <parameter name="parameter_chunk_size">4096</parameter>
-      <parameter name="checkpoint_path">amsgrad_training.manifest.h5</parameter>
+      <parameter name="checkpoint_interval">1000</parameter>
     </training>
     <parameter name="walkers_per_rank">1</parameter>
     <parameter name="crowds">1</parameter>

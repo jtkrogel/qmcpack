@@ -16,9 +16,12 @@ def manifest_string(manifest, dataset, h5dump):
 
 def envelopes(manifest, h5dump):
     """Resolve the committed root envelope and rank-zero sampler shard."""
+    output = subprocess.check_output(
+        [h5dump, "-d", "/wftrain_latest_checkpoint/manifest_relative_path", str(manifest)], text=True)
+    manifest = manifest.parent / re.findall(r'"([^"]+)"', output)[-1]
     root = manifest_string(manifest, "root_envelope_filename", h5dump)
     prefix = manifest_string(manifest, "sampler_shard_prefix", h5dump)
-    return manifest.parent / root, manifest.parent / (prefix + ".rank-00000000.h5")
+    return manifest.parent / root, manifest.parent / (prefix + ".rank_000000.h5")
 
 
 def main():
@@ -35,7 +38,7 @@ def main():
     histories = []
     for manifest in [args.continuous, args.resumed]:
         name = "lih_pp_ecp_continuous" if manifest == args.continuous else "lih_pp_ecp_restart"
-        with (manifest.parent / (name + ".s000.training.csv")).open() as stream:
+        with (manifest.parent / (name + ".s000.training_info.csv")).open() as stream:
             histories.append(list(csv.DictReader(stream)))
     original, resumed = histories[0][-1], histories[1][-1]
     for field in ["iteration", "sample_version", "parameter_version", "samples", "mean_energy",

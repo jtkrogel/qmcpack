@@ -14,6 +14,11 @@
 #include "Message/CommOperators.h"
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
 #include "io/hdf/hdf_archive.h"
+#include "Particle/ParticleSet.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
+#include "../../QMCWaveFunctions/tests/psiformer_test_utils.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -144,6 +149,144 @@ SamplerShardTopology toyTopology(Communicate& communicator)
 }
 
 } // namespace
+
+TEST_CASE("Distributed iteration bundles preserve immutable archives and latest resolution",
+          "[drivers][training][checkpoint][mpi][iteration_bundle]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  namespace fixture = qmcplusplus::testing::psiformer;
+  const auto geometry = fixture::makeGeometry("lih");
+  const SimulationCell cell;
+  ParticleSet electrons(cell), ions(cell);
+  electrons.create({2, 2});
+  ions.create({1, 1});
+  electrons.getSpeciesSet().addSpecies("u");
+  electrons.getSpeciesSet().addSpecies("d");
+  auto& species = ions.getSpeciesSet();
+  species.addSpecies("Li");
+  species.addSpecies("H");
+  const int charge = species.addAttribute("charge");
+  species(charge, 0) = 3;
+  species(charge, 1) = 1;
+  electrons.resetGroups();
+  ions.resetGroups();
+  for (int atom = 0; atom < 2; ++atom)
+    for (int d = 0; d < 3; ++d)
+      ions.R[atom][d] = geometry.nuclei[3 * atom + d];
+  for (int e = 0; e < 4; ++e)
+    for (int d = 0; d < 3; ++d)
+      electrons.R[e][d] = geometry.electrons[3 * e + d];
+  auto leaves = fixture::makeLayout(4, 2, true, 2, 4);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256 || extent == 64)
+        extent = 8;
+  psiformer::InitializedPsiFormerParameters initialized;
+  initialized.model_shape = {2, 2, 2, 2, 8, 2, 2};
+  initialized.profile = psiformer::DEEPQMC_PSIFORMER_V1;
+  initialized.values = fixture::makeParameters("lih", leaves);
+  std::size_t offset = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto end = offset + fixture::product(leaf.shape);
+    initialized.layouts.push_back({leaf.module, leaf.name, leaf.shape, offset, end});
+    offset = end;
+  }
+  PsiFormerWF provider("bundle", initialized, electrons, ions);
+  provider.validateSystem(electrons, ions, "all_electron");
+  std::string token;
+  if (communicator.rank() == 0)
+    token = std::to_string(::getpid());
+  communicator.bcast(token);
+  const std::filesystem::path project = "wftrain_bundle_test_" + token + ".s000";
+  const auto training = std::filesystem::path(project.string() + ".training");
+  const auto latest = std::filesystem::path(project.string() + ".last_checkpoint.h5");
+  const auto root = project.string() + ".i0000000";
+  const auto bundle = training / (root + ".checkpoint");
+  const auto manifest = bundle / (root + ".manifest.h5");
+  TrainingIterationState state{1, provider.snapshotParameters().version, provider.parameterSchema().fingerprint()};
+  TrainingStageState stage{"energy", 0, 1, "bundle-test-v1"};
+  DistributedToySampler sampler(communicator.rank(), communicator.size());
+  const auto topology = toyTopology(communicator);
+  DistributedTrainingCheckpoint::saveIterationBundle(project, 0, communicator, provider, state, stage,
+                                                     nullptr, sampler, topology);
+  CHECK(std::filesystem::exists(manifest));
+  CHECK(std::filesystem::exists(bundle / (root + ".state.h5")));
+  const auto exported = psiformer::readPsiFormerModelFile((training / (root + ".parameters.h5")).string());
+  CHECK(exported.parameters.values == provider.snapshotParameters().values);
+  CHECK_THROWS(DistributedTrainingCheckpoint::saveIterationBundle(project, 0, communicator, provider,
+      state, stage, nullptr, sampler, topology));
+  // Parameter-only exports are deliberately unnecessary for an exact restart.
+  if (communicator.rank() == 0)
+  {
+    std::filesystem::remove(training / (root + ".parameters.h5"));
+    std::filesystem::create_symlink(std::filesystem::absolute(latest), training / "latest_alias.h5");
+  }
+  communicator.barrier();
+  const auto saved = provider.snapshotParameters().values;
+  for (const auto& source : {latest, bundle, manifest, bundle / "", training / "latest_alias.h5"})
+  {
+    auto changed = provider.snapshotParameters();
+    changed.values[0] += .125;
+    provider.publishParameters(changed, changed.version);
+    sampler.advance();
+    state.completed_iterations = 5;
+    DistributedTrainingCheckpoint::restore(source, communicator, provider, state, stage, nullptr, sampler, topology);
+    CHECK(provider.snapshotParameters().values == saved);
+    CHECK(state.completed_iterations == 1);
+    CHECK(sampler.value() == static_cast<std::uint64_t>(100 + communicator.rank()));
+  }
+  // One failed local shard prevents latest advancement on every rank.
+  state.completed_iterations = 2;
+  state.parameter_version = provider.snapshotParameters().version;
+  sampler.failWrites(communicator.rank() == communicator.size() - 1);
+  CHECK_THROWS(DistributedTrainingCheckpoint::saveIterationBundle(project, 1, communicator, provider,
+      state, stage, nullptr, sampler, topology));
+  sampler.failWrites(false);
+  DistributedTrainingCheckpoint::restore(latest, communicator, provider, state, stage, nullptr, sampler, topology);
+  CHECK(state.completed_iterations == 1);
+  auto changed_topology = topology;
+  ++changed_topology.walker_count;
+  CHECK_THROWS(DistributedTrainingCheckpoint::restore(latest, communicator, provider, state, stage,
+      nullptr, sampler, changed_topology));
+  const auto unsafe = std::filesystem::path(project.string() + ".unsafe_index.h5");
+  if (communicator.rank() == 0)
+  {
+    hdf_archive index;
+    REQUIRE(index.create(unsafe));
+    index.push("wftrain_latest_checkpoint");
+    index.write(std::vector<int>{1, 0, 0}, "format_version");
+    index.write(std::string("../outside.manifest.h5"), "manifest_relative_path");
+    index.write(std::string("wftrain-latest-complete-v1"), "completion_cookie");
+  }
+  communicator.barrier();
+  CHECK_THROWS(DistributedTrainingCheckpoint::restore(unsafe, communicator, provider, state, stage,
+      nullptr, sampler, topology));
+  const auto shard = bundle / (root + ".rank_000000.h5");
+  if (communicator.rank() == 0)
+    std::filesystem::rename(shard, shard.string() + ".missing");
+  communicator.barrier();
+  CHECK_THROWS(DistributedTrainingCheckpoint::restore(latest, communicator, provider, state, stage,
+      nullptr, sampler, topology));
+  communicator.barrier();
+  const auto envelope = bundle / (root + ".state.h5");
+  if (communicator.rank() == 0)
+  {
+    std::filesystem::rename(shard.string() + ".missing", shard);
+    std::filesystem::rename(envelope, envelope.string() + ".missing");
+  }
+  communicator.barrier();
+  CHECK_THROWS(DistributedTrainingCheckpoint::restore(latest, communicator, provider, state, stage,
+      nullptr, sampler, topology));
+  communicator.barrier();
+  if (communicator.rank() == 0)
+  {
+    std::filesystem::remove_all(training);
+    std::filesystem::remove(latest);
+    std::filesystem::remove(unsafe);
+  }
+  communicator.barrier();
+}
 
 TEST_CASE("Distributed training checkpoint continues and preserves published generation",
           "[drivers][training][checkpoint][mpi]")

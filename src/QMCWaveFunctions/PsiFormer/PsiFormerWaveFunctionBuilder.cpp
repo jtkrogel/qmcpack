@@ -15,6 +15,7 @@
 #include "OhmmsData/XMLParsingString.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerDeterminant.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -234,12 +236,17 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (xmlHasProp(cur, BAD_CAST "optimize_indices") != nullptr)
     optimize_indices = getXMLAttributeValue(cur, "optimize_indices");
 
-  const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1;
+  const bool direct_model = !parameters.empty() && configuration.empty() && initialization.empty();
+  std::optional<psiformer::PsiFormerModelFile> imported_model;
+  if (direct_model)
+    imported_model.emplace(psiformer::readPsiFormerModelFile(parameters));
+  const bool complex_profile = initialization == psiformer::PSIFORMER_COMPLEX_PERIODIC_V1 ||
+      (imported_model && imported_model->paired_complex);
   // This exact native ROOT is a value override, never manifest discovery or a restart request.
   if (xmlHasProp(cur, BAD_CAST "parameter_checkpoint"))
   {
     parameter_checkpoint = getXMLAttributeValue(cur, "parameter_checkpoint");
-    if (!complex_profile || parameter_checkpoint.empty())
+    if (!complex_profile || direct_model || parameter_checkpoint.empty())
       throw std::invalid_argument("parameter_checkpoint requires an exact native root and explicit paired initialization");
   }
   [[maybe_unused]] std::size_t clone_numeric_limit = 0;
@@ -269,7 +276,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
       throw std::invalid_argument("Complex PsiFormer requires CPU or strict cuda/hip, optimize=no and fp64_reference");
     if (targetPtcl.getLattice().getSuperCellEnum() != SUPERCELL_BULK ||
         feature_policy != "periodic_torus_v1" || system != "all_electron" ||
-        !xmlHasProp(cur, BAD_CAST "source") || !parameters.empty() || !configuration.empty() ||
+        !xmlHasProp(cur, BAD_CAST "source") || (!direct_model && !parameters.empty()) || !configuration.empty() ||
         !export_parameters.empty() || !optimize_indices.empty() || optimize_scope != "indices")
       throw std::invalid_argument("Complex PsiFormer requires explicit periodic all-electron native inference metadata");
     clone_numeric_limit = parseCloneNumericLimit(getXMLAttributeValue(cur, "max_clone_numeric_bytes"));
@@ -305,7 +312,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   if (internal_initialization && (has_parameter_path || has_configuration_path))
     throw std::invalid_argument(
         "PsiFormer internal initialization cannot be combined with parameters or configuration paths");
-  if (!internal_initialization && (!has_parameter_path || !has_configuration_path))
+  if (!internal_initialization && !direct_model && (!has_parameter_path || !has_configuration_path))
     throw std::runtime_error(
         "psiformer requires parameters and configuration HDF5 paths, or initialization");
   if (!internal_initialization && has_initialization_seed)
@@ -379,10 +386,10 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   }
   if (system != "auto" && system != "all_electron" && system != "pseudopotential")
     throw std::invalid_argument("PsiFormer system must be auto, all_electron, or pseudopotential");
-  if (internal_initialization && system == "auto")
+  if ((internal_initialization || direct_model) && system == "auto")
     throw std::invalid_argument(
         "Internally initialized PsiFormer requires explicit system=all_electron or system=pseudopotential");
-  if (internal_initialization && !has_explicit_source)
+  if ((internal_initialization || direct_model) && !has_explicit_source)
     throw std::invalid_argument("Internally initialized PsiFormer requires an explicit source particle set");
   if (periodic && !has_explicit_source)
     throw std::invalid_argument("Periodic PsiFormer requires an explicit ordered source particle set");
@@ -416,7 +423,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
   std::unique_ptr<PsiFormerWF> component;
   const std::array<double, 3> twist_array{
       reduced_twist[0], reduced_twist[1], reduced_twist[2]};
-  if (internal_initialization)
+  if (internal_initialization || direct_model)
   {
     if (targetPtcl.groups() != 2 || targetPtcl.groupsize(0) <= 0 || targetPtcl.groupsize(1) <= 0)
       throw std::invalid_argument(
@@ -445,9 +452,12 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerWaveFunctionBuilder::buildCompon
         for (std::size_t dimension = 0; dimension < 3; ++dimension)
           environment.lattice_vectors[axis][dimension] = targetPtcl.getLattice().R(axis, dimension);
     }
-    psiformer::InitializedPsiFormerParameters initialized =
-        psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization,
-                                                 environment);
+    if (direct_model)
+      psiformer::validatePsiFormerModelFile(*imported_model, parameters, targetPtcl, *source_particles,
+                                            system, twist_array);
+    psiformer::InitializedPsiFormerParameters initialized = direct_model
+        ? std::move(imported_model->parameters)
+        : psiformer::initializePsiFormerParameters(shape, initialization_seed, initialization, environment);
 
     // All ranks must evaluate exactly the same model even when platform math
     // libraries round the Gaussian transform differently.  Communicate's

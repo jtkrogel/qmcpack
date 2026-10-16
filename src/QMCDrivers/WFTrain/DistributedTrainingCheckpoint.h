@@ -33,6 +33,17 @@ class DistributedTrainingCheckpoint
 public:
   static constexpr std::array<int, 3> FORMAT_VERSION{1, 0, 0};
 
+  /// Publish immutable iteration parameters/bundle, then atomically advance latest index.
+  static void saveIterationBundle(const std::filesystem::path& project_root,
+                         std::size_t iteration_index,
+                         Communicate& communicator,
+                         const StructuredParameterProvider& provider,
+                         const TrainingIterationState& coordinator_state,
+                         const TrainingStageState& stage_state,
+                         const OptimizerCheckpointContributor* optimizer,
+                         const SamplerCheckpointContributor& sampler,
+                         const SamplerShardTopology& topology);
+
   static void saveAtomic(const std::filesystem::path& manifest,
                          Communicate& communicator,
                          const StructuredParameterProvider& provider,

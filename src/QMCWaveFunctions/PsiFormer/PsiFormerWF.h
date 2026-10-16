@@ -454,6 +454,8 @@ public:
 
   /// Export current parameters in the flat DeepQMC-compatible HDF5 format.
   void exportParameters(const std::string& path) const;
+  /// Export a self-contained model accepted by the parameters-only XML path.
+  void exportModel(const std::string& path) const;
 
   /// Validate electron spins and ionic geometry/effective charges against the export.
   void validateSystem(const ParticleSet& electrons, const ParticleSet& ions, const std::string& system_kind);

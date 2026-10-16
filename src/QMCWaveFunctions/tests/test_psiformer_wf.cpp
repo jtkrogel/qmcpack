@@ -1780,6 +1780,46 @@ void checkComponentSnapshot(const ComponentSnapshot& actual, const ComponentSnap
 
 } // namespace
 
+TEST_CASE("PsiFormer standalone model imports without a configuration file",
+          "[wavefunction][psiformer][model_file]")
+{
+  GeneratedFiles files = generateFiles("lih");
+  const SimulationCell simulation_cell;
+  ParticleSet particles = makeLiHElectrons(simulation_cell);
+  WaveFunctionComponentBuilder::PSetMap sources;
+  auto ions = makeLiHIons(simulation_cell);
+  auto* source = ions.get();
+  sources.emplace(ions->getName(), std::move(ions));
+  PsiFormerWF original("pf", files.parameters.string(), files.configuration.string(), true, {0, 5});
+  original.validateSystem(particles, *source, "all_electron");
+  const auto expected = evaluateComponent(original, particles, registerSelectedParameters(original));
+  const auto model_path = files.parameters.string() + ".standalone.h5";
+  original.exportModel(model_path);
+  // The direct import cannot accidentally depend on either legacy input file.
+  std::filesystem::remove(files.configuration);
+  std::filesystem::remove(files.parameters);
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<psiformer name='pf' parameters='" + model_path +
+      "' source='ion0' system='all_electron' optimize='yes' optimize_indices='0,5'/>"));
+  auto loaded = builder.buildComponent(document.getRoot());
+  auto* real = dynamic_cast<PsiFormerWF*>(loaded.get());
+  REQUIRE(real != nullptr);
+  CHECK(real->snapshotParameters().values == original.snapshotParameters().values);
+  checkComponentSnapshot(evaluateComponent(*real, particles, registerSelectedParameters(*real)), expected);
+  source->R[0][0] += .1;
+  CHECK_THROWS(builder.buildComponent(document.getRoot()));
+  source->R[0][0] -= .1;
+  {
+    hdf_archive damaged;
+    REQUIRE(damaged.open(model_path, H5F_ACC_RDWR));
+    damaged.push("psiformer_model", false);
+    damaged.write(std::string("fp32"), "precision");
+  }
+  CHECK_THROWS(builder.buildComponent(document.getRoot()));
+  std::filesystem::remove(model_path);
+}
+
 TEST_CASE("PsiFormer builder is fixed by default and parses selected indices", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");

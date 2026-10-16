@@ -13,6 +13,9 @@
 
 #include "Message/CommOperators.h"
 #include "io/hdf/hdf_archive.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerModelFile.h"
 
 #include <algorithm>
 #include <atomic>
@@ -36,6 +39,47 @@ namespace
 constexpr char MANIFEST_ROOT[]       = "wftrain_distributed_manifest";
 constexpr char MANIFEST_COOKIE[]     = "wftrain-distributed-manifest-complete-v1";
 constexpr std::size_t TOPOLOGY_FIELDS = 5;
+constexpr char INDEX_ROOT[] = "wftrain_latest_checkpoint";
+
+std::string bundleRankSuffix(std::size_t rank)
+{
+  std::ostringstream text;
+  text << ".rank_" << std::setw(6) << std::setfill('0') << rank << ".h5";
+  return text.str();
+}
+
+std::filesystem::path resolveManifest(const std::filesystem::path& requested)
+{
+  // Resolve aliases before interpreting relative payloads; this also accepts directory trailing slashes.
+  const auto source = std::filesystem::canonical(requested);
+  if (std::filesystem::is_directory(source))
+  {
+    const auto name = source.filename().string();
+    const std::string suffix = ".checkpoint";
+    if (name.size() <= suffix.size() || name.substr(name.size() - suffix.size()) != suffix)
+      throw std::runtime_error("Training bundle directory must end in .checkpoint");
+    return source / (name.substr(0, name.size() - suffix.size()) + ".manifest.h5");
+  }
+  hdf_archive input;
+  if (!input.open(source, H5F_ACC_RDONLY))
+    throw std::runtime_error("Unable to open training checkpoint " + source.string());
+  if (!input.is_group(INDEX_ROOT))
+    return source;
+  input.push(INDEX_ROOT, false);
+  std::vector<int> version;
+  std::string relative, cookie;
+  input.read(version, "format_version");
+  input.read(relative, "manifest_relative_path");
+  input.read(cookie, "completion_cookie");
+  const std::filesystem::path path(relative);
+  if (version != std::vector<int>{1, 0, 0} || cookie != "wftrain-latest-complete-v1" ||
+      path.empty() || path.is_absolute() || path.lexically_normal() != path)
+    throw std::runtime_error("Invalid training latest checkpoint index");
+  for (const auto& component : path)
+    if (component == ".." || component == ".")
+      throw std::runtime_error("Unsafe training latest checkpoint relative path");
+  return source.parent_path() / path;
+}
 
 /// Return a generation token created once on rank zero and shared verbatim.
 std::string makeGenerationToken(Communicate& communicator)
@@ -270,6 +314,96 @@ Manifest readManifest(const std::filesystem::path& source)
 
 } // namespace
 
+void DistributedTrainingCheckpoint::saveIterationBundle(
+    const std::filesystem::path& project_root, std::size_t iteration_index,
+    Communicate& communicator, const StructuredParameterProvider& provider,
+    const TrainingIterationState& coordinator_state, const TrainingStageState& stage_state,
+    const OptimizerCheckpointContributor* optimizer, const SamplerCheckpointContributor& sampler,
+    const SamplerShardTopology& topology)
+{
+  std::ostringstream identifier;
+  identifier << project_root.filename().string() << ".i" << std::setw(7) << std::setfill('0') << iteration_index;
+  const std::string root = identifier.str();
+  const auto parent = project_root.parent_path() / (project_root.filename().string() + ".training");
+  const auto destination = parent / (root + ".checkpoint");
+  const auto parameters = parent / (root + ".parameters.h5");
+  const auto generation = makeGenerationToken(communicator);
+  const auto staging = parent / (root + ".checkpoint.tmp." + generation);
+  const auto temporary_parameters = parent / (root + ".parameters.tmp." + generation + ".h5");
+  std::array<std::uint64_t, TOPOLOGY_FIELDS> local{};
+  std::vector<std::uint64_t> gathered;
+  std::exception_ptr failure;
+  try
+  {
+    if (project_root.empty())
+      throw std::invalid_argument("Training project root is empty");
+    local = prepareLocalTopology(communicator, topology);
+    gathered.resize(TOPOLOGY_FIELDS * static_cast<std::size_t>(communicator.size()));
+    if (std::filesystem::exists(destination) || std::filesystem::exists(parameters))
+      throw std::runtime_error("Refusing to overwrite archived training iteration " + root);
+    if (communicator.rank() == 0)
+    {
+      std::filesystem::create_directories(parent);
+      if (!std::filesystem::create_directory(staging))
+        throw std::runtime_error("Unable to create training bundle staging directory");
+    }
+  }
+  catch (...) { failure = std::current_exception(); }
+  requireCollectiveSuccess(communicator, failure, "bundle preflight");
+  gatherTopology(communicator, local, gathered);
+  failure = nullptr;
+  try
+  {
+    TrainingCheckpoint::saveSamplerShardAtomic(staging / (root + bundleRankSuffix(communicator.rank())), sampler);
+    if (communicator.rank() == 0)
+    {
+      TrainingCheckpoint::saveAtomic(staging / (root + ".state.h5"), provider, coordinator_state,
+                                     stage_state, optimizer, nullptr);
+      if (const auto* real = dynamic_cast<const PsiFormerWF*>(&provider))
+        real->exportModel(temporary_parameters.string());
+#ifdef QMC_COMPLEX
+      else if (const auto* paired = dynamic_cast<const PsiFormerComplexWF*>(&provider))
+        paired->exportModel(temporary_parameters.string());
+#endif
+      else
+        throw std::runtime_error("Training bundle model export requires a PsiFormer provider");
+      const auto saved = TrainingCheckpoint::readModelParameters(staging / (root + ".state.h5"),
+                                                                provider.parameterSchema());
+      const auto exported = psiformer::readPsiFormerModelFile(temporary_parameters.string());
+      if (saved.values != exported.parameters.values || provider.snapshotParameters().version != saved.version)
+        throw std::runtime_error("Training model export and checkpoint generations disagree");
+    }
+  }
+  catch (...) { failure = std::current_exception(); }
+  requireCollectiveSuccess(communicator, failure, "bundle payload save");
+  failure = nullptr;
+  if (communicator.rank() == 0)
+    try
+    {
+      writeManifest(staging / (root + ".manifest.h5"), communicator.size(), "iteration-bundle-v1:" + root,
+                    root + ".state.h5", root, gathered);
+      std::filesystem::rename(temporary_parameters, parameters);
+      std::filesystem::rename(staging, destination);
+      const auto index = project_root.string() + ".last_checkpoint.h5";
+      const auto temporary = manifestTemporary(index);
+      hdf_archive output;
+      if (!output.create(temporary, H5F_ACC_EXCL))
+        throw std::runtime_error("Unable to create latest checkpoint index");
+      output.push(INDEX_ROOT);
+      output.write(std::vector<int>{1, 0, 0}, "format_version");
+      output.write((std::filesystem::path(project_root.filename().string() + ".training") /
+          destination.filename() / (root + ".manifest.h5")).generic_string(), "manifest_relative_path");
+      output.write(persistedSize(iteration_index), "iteration_index");
+      output.write(std::string("wftrain-latest-complete-v1"), "completion_cookie");
+      output.pop();
+      output.flush();
+      output.close();
+      std::filesystem::rename(temporary, index);
+    }
+    catch (...) { failure = std::current_exception(); }
+  requireCollectiveSuccess(communicator, failure, "bundle publication");
+}
+
 void DistributedTrainingCheckpoint::saveAtomic(
     const std::filesystem::path& manifest,
     Communicate& communicator,
@@ -346,7 +480,7 @@ void DistributedTrainingCheckpoint::saveAtomic(
 }
 
 void DistributedTrainingCheckpoint::restore(
-    const std::filesystem::path& manifest_path,
+    const std::filesystem::path& source,
     Communicate& communicator,
     StructuredParameterProvider& provider,
     TrainingIterationState& coordinator_state,
@@ -355,6 +489,7 @@ void DistributedTrainingCheckpoint::restore(
     SamplerCheckpointContributor& sampler,
     const SamplerShardTopology& topology)
 {
+  std::filesystem::path manifest_path;
   std::optional<Manifest> manifest;
   std::array<std::uint64_t, TOPOLOGY_FIELDS> local_topology{};
   std::vector<std::uint64_t> live_topology;
@@ -365,6 +500,7 @@ void DistributedTrainingCheckpoint::restore(
   std::exception_ptr prepare_failure;
   try
   {
+    manifest_path = resolveManifest(source);
     manifest.emplace(readManifest(manifest_path));
     local_topology = prepareLocalTopology(communicator, topology);
     live_topology.resize(TOPOLOGY_FIELDS * static_cast<std::size_t>(communicator.size()));
@@ -396,7 +532,9 @@ void DistributedTrainingCheckpoint::restore(
           "Distributed checkpoint requires the identical MPI/crowd/walker/RNG topology");
     const auto root_path = manifest_path.parent_path() / manifest->root_filename;
     const auto shard_path = manifest_path.parent_path() /
-        (manifest->shard_prefix + rankSuffix(static_cast<std::size_t>(communicator.rank())));
+        (manifest->shard_prefix + (manifest->generation.rfind("iteration-bundle-v1:", 0) == 0
+          ? bundleRankSuffix(static_cast<std::size_t>(communicator.rank()))
+          : rankSuffix(static_cast<std::size_t>(communicator.rank()))));
     prepared_root.emplace(TrainingCheckpoint::prepareRestore(
         root_path, provider, coordinator_state, stage_state, optimizer, nullptr));
     prepared_sampler = TrainingCheckpoint::prepareSamplerShardRestore(shard_path, sampler);

@@ -50,8 +50,7 @@
   <qmc method="wf_train" move="pbyp" checkpoint="-1">
     <training objective="energy" optimizer="adam">
       <parameter name="iterations">2</parameter>
-      <parameter name="checkpoint_path">ecp_resumed.manifest.h5</parameter>
-      <parameter name="restart_path">ecp_first.manifest.h5</parameter>
+      <parameter name="restart_path">lih_pp_ecp_checkpoint.s000.training/lih_pp_ecp_checkpoint.s000.i0000000.checkpoint/lih_pp_ecp_checkpoint.s000.i0000000.manifest.h5</parameter>
       <parameter name="learning_rate">1e-10</parameter>
       <parameter name="parameter_chunk_size">4096</parameter>
     </training>

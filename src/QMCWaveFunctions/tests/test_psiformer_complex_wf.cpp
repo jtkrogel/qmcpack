@@ -240,6 +240,99 @@ WaveFunctionComponent::LogValue evaluate(WaveFunctionComponent& component, Parti
 }
 } // namespace
 
+TEST_CASE("PsiFormer standalone paired model preserves complex inference without configuration",
+          "[wavefunction][psiformer][complex_wf][model_file]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto particles = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const std::array<double, 3> twist{.125, -.25, .0625};
+  PsiFormerComplexWF original("psiformer", parameters(), particles, source, clone_cap, twist);
+  const auto value = evaluate(original, particles);
+  const auto gradient = particles.G;
+  const auto laplacian = particles.L;
+  const auto path = "psiformer_paired_standalone." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  original.exportModel(path);
+  WaveFunctionComponentBuilder::PSetMap sources;
+  sources.emplace("ion0", std::make_unique<ParticleSet>(source));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<psiformer parameters='" + path +
+      "' source='ion0' system='all_electron' feature_policy='periodic_torus_v1' "
+      "twist='0.125 -0.25 0.0625' max_clone_numeric_bytes='8388608'/>"));
+  auto loaded = builder.buildComponent(document.getRoot());
+  auto* paired = dynamic_cast<PsiFormerComplexWF*>(loaded.get());
+  REQUIRE(paired != nullptr);
+  CHECK(paired->snapshotParameters().values == original.snapshotParameters().values);
+  close(evaluate(*paired, particles), value);
+  for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+  {
+    for (int d = 0; d < 3; ++d)
+      close(particles.G[electron][d], gradient[electron][d]);
+    close(particles.L[electron], laplacian[electron]);
+  }
+  class Sink final : public wftrain::SampleProductSink
+  {
+  public:
+    C value{};
+    void onBegin(const wftrain::DerivativeStreamDescriptor&) override { value = 0; }
+    void consume(const wftrain::SampleProductTileConstView& tile) override { value = tile.values()[0]; }
+  };
+  std::vector<C> direction(original.parameterSchema().parameterCount());
+  direction[0] = .3;
+  for (const auto& block : original.parameterSchema().blocks())
+    if (block.id.find("/w_imag") != std::string::npos)
+      direction[block.offset] = .2;
+  auto product = [&](PsiFormerComplexWF& component) {
+    RefVectorWithLeader<WaveFunctionComponent> components(component);
+    components.push_back(component);
+    RefVectorWithLeader<ParticleSet> particle_refs(particles);
+    particle_refs.push_back(particles);
+    auto stream = component.makeBudgetedStreamingDerivativeOperator(components, particle_refs, 0, 0, 7,
+        component.streamingDerivativeRequiredBytes(1));
+    Sink sink;
+    stream->applyScoreJVP({component.parameterSchema(), stream->parameterVersion(),
+        {direction.data(), direction.size()}}, sink);
+    return sink.value;
+  };
+  close(product(*paired), product(original));
+  Libxml2Document wrong_twist;
+  REQUIRE(wrong_twist.parseFromString("<psiformer parameters='" + path +
+      "' source='ion0' system='all_electron' feature_policy='periodic_torus_v1' "
+      "twist='0 0 0' max_clone_numeric_bytes='8388608'/>"));
+  CHECK_THROWS(builder.buildComponent(wrong_twist.getRoot()));
+  Libxml2Document conflicting_sources;
+  REQUIRE(conflicting_sources.parseFromString("<psiformer parameters='" + path +
+      "' parameter_checkpoint='missing.root.h5' source='ion0' system='all_electron' "
+      "feature_policy='periodic_torus_v1' twist='0.125 -0.25 0.0625' max_clone_numeric_bytes='8388608'/>"));
+  CHECK_THROWS_AS(builder.buildComponent(conflicting_sources.getRoot()), std::invalid_argument);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("PsiFormer standalone native real Gamma remains a real model in a complex build",
+          "[wavefunction][psiformer][complex_wf][model_file]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto particles = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerWF original("psiformer", parameters(false), particles, source);
+  original.validateSystem(particles, source, "all_electron");
+  const auto value = evaluate(original, particles);
+  const auto path = "psiformer_real_gamma_standalone." + std::to_string(OHMMS::Controller->rank()) + ".h5";
+  original.exportModel(path);
+  WaveFunctionComponentBuilder::PSetMap sources;
+  sources.emplace("ion0", std::make_unique<ParticleSet>(source));
+  PsiFormerWaveFunctionBuilder builder(OHMMS::Controller, particles, sources);
+  Libxml2Document document;
+  REQUIRE(document.parseFromString("<psiformer parameters='" + path +
+      "' source='ion0' system='all_electron' feature_policy='periodic_torus_v1'/>"));
+  auto loaded = builder.buildComponent(document.getRoot());
+  REQUIRE(dynamic_cast<PsiFormerWF*>(loaded.get()) != nullptr);
+  CHECK(dynamic_cast<PsiFormerComplexWF*>(loaded.get()) == nullptr);
+  close(evaluate(*loaded, particles), value);
+  std::filesystem::remove(path);
+}
+
 TEST_CASE("PsiFormer explicit complex scalar sibling specializes to the legacy real component",
           "[wavefunction][psiformer][complex_wf]")
 {
