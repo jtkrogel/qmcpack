@@ -1357,14 +1357,17 @@ void WFTrainBatched::process(xmlNodePtr node)
         if (complex->gpuInferenceEnabled() &&
             (!training_input_.getComplexGpuTraining().enabled() || myComm->size() != 1 ||
              vmcdriver_input_.get_move_kind() != VMCDriverInput::MoveKind::PBYP ||
-             (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD)))
+             (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD &&
+              training_input_.getOptimizer() != O::STOCHASTIC_RECONFIGURATION)))
           throw UniformCommunicateError(
-              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY Adam/plainSGD");
+              "WFTrainBatched: paired GPU requires explicit caps, MPI1, PBYP ENERGY Adam/plainSGD "
+              "or positively damped host-controlled SR");
         if (student_prototype_.getOrbitals().size() != 1 ||
             training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
             (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD &&
              training_input_.getOptimizer() != O::STOCHASTIC_RECONFIGURATION) ||
-            (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION && training_input_.getDamping() <= 0) ||
+            (training_input_.getOptimizer() == O::STOCHASTIC_RECONFIGURATION &&
+             (!wftrain::isFiniteTrainingReal(training_input_.getDamping()) || training_input_.getDamping() <= 0)) ||
             training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
             training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
             training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
