@@ -188,6 +188,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
     const StructuredParameterSnapshot& candidate, std::size_t expected_version)
 {
   std::vector<std::unique_ptr<TrialWaveFunction>> prepared;
+  std::vector<std::vector<std::size_t>> component_indices;
   std::optional<StructuredParameterSnapshot> detached;
   std::exception_ptr failure;
   try
@@ -200,6 +201,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
       throw std::overflow_error("Conventional parameter version overflow");
     detached.emplace(candidate);
     prepared.reserve(live_.size());
+    component_indices.reserve(live_.size());
     for (const auto& [wf, particles] : live_)
     {
       // Only sampled walker configurations are numerical admission points. The
@@ -224,7 +226,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
       if (particles->getNumDistTables() != tables)
         throw std::logic_error("Conventional replacement changed live distance-table topology");
       adapter_.resetPrivateParameters(*replacement, candidate);
-      wf->validatePreparedJastrowActivation(*replacement);
+      component_indices.push_back(wf->validatePreparedJastrowActivation(*replacement));
       prepared.push_back(std::move(replacement));
     }
   }
@@ -241,7 +243,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
   // The driver must immediately refresh live value/VGL caches.
   const auto version = adapter_.commitPreparedParameters(std::move(*detached));
   for (std::size_t i = 0; i < live_.size(); ++i)
-    live_[i].first->activatePreparedJastrows(*prepared[i]);
+    live_[i].first->activatePreparedJastrows(*prepared[i], component_indices[i]);
   return version;
 }
 

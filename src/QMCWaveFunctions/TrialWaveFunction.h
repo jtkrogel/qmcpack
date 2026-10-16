@@ -700,9 +700,10 @@ public:
   std::unique_ptr<TrialWaveFunction> makeClone(ParticleSet& tqp) const;
 
   /// Admit an idle, matching fixed-Slater J1/J2 replacement before collective publication.
-  void validatePreparedJastrowActivation(const TrialWaveFunction& prepared) const;
+  std::vector<std::size_t> validatePreparedJastrowActivation(const TrialWaveFunction& prepared) const;
   /// Swap only admitted Jastrows. Full value/VGL refresh is mandatory immediately afterward.
-  void activatePreparedJastrows(TrialWaveFunction& prepared) noexcept;
+  void activatePreparedJastrows(TrialWaveFunction& prepared,
+                               const std::vector<std::size_t>& component_indices) noexcept;
 
   std::vector<std::unique_ptr<WaveFunctionComponent>> const& getOrbitals() const { return Z; }
 

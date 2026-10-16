@@ -3312,7 +3312,8 @@ std::unique_ptr<TrialWaveFunction> TrialWaveFunction::makeClone(ParticleSet& tqp
   return myclone;
 }
 
-void TrialWaveFunction::validatePreparedJastrowActivation(const TrialWaveFunction& prepared) const
+std::vector<std::size_t> TrialWaveFunction::validatePreparedJastrowActivation(
+    const TrialWaveFunction& prepared) const
 {
   auto idle = [](const TrialWaveFunction& wf) {
     return !wf.resource_acquired_ && !wf.acquired_resource_collection_ &&
@@ -3320,6 +3321,8 @@ void TrialWaveFunction::validatePreparedJastrowActivation(const TrialWaveFunctio
   };
   if (!idle(*this) || !idle(prepared) || Z.size() != prepared.Z.size())
     throw std::logic_error("Conventional Jastrow activation requires idle matching wavefunctions without plans or fast wrappers");
+  std::vector<std::size_t> component_indices;
+  component_indices.reserve(Z.size());
   for (std::size_t i = 0; i < Z.size(); ++i)
   {
     const auto kind = Z[i]->getClassName();
@@ -3328,17 +3331,19 @@ void TrialWaveFunction::validatePreparedJastrowActivation(const TrialWaveFunctio
       throw std::logic_error("Conventional Jastrow activation changed component topology");
     if (Z[i]->isOptimizable() && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow")
       throw std::invalid_argument("Conventional training currently admits only fixed-Slater J1/J2 parameters");
+    if (Z[i]->isOptimizable()) component_indices.push_back(i);
   }
+  return component_indices;
 }
 
-void TrialWaveFunction::activatePreparedJastrows(TrialWaveFunction& prepared) noexcept
+void TrialWaveFunction::activatePreparedJastrows(TrialWaveFunction& prepared,
+    const std::vector<std::size_t>& component_indices) noexcept
 {
   // Validation and all allocations precede consensus. Fixed Slater/SPO objects,
   // timers and Hamiltonian references retain their identities. This deliberately
   // does not claim failure-atomic refresh of particle/walker caches.
-  for (std::size_t i = 0; i < Z.size(); ++i)
-    if (Z[i]->isOptimizable())
-      Z[i].swap(prepared.Z[i]);
+  for (const auto i : component_indices)
+    Z[i].swap(prepared.Z[i]);
 }
 
 /** evaluate derivatives of KE wrt optimizable varibles
