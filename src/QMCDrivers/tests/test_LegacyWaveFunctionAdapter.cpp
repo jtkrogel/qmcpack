@@ -948,6 +948,7 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
     accepted = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
         h_list, wf_list, p_list, *consumer, {&channel, 1}, idle_sink);
   } // Release resources before the FD oracle creates independent private clones.
+  const auto rng_before_actions = rng;
   CHECK(idle_sink.state() == DerivativeSinkState::IDLE);
   auto grid = consumer->releaseJVPReplay();
   REQUIRE(grid);
@@ -1006,7 +1007,6 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
     checkClose(hermitian.result()[0][parameter], std::conj(transpose.result()[0][parameter]));
     expected_direction += direction[parameter] * transpose.result()[0][parameter];
   }
-  const auto rng_before_actions = rng;
   StructuredParameterVectorConstView vector(adapter.parameterSchema(), snapshot->version,
                                             {direction.data(), direction.size()});
   RecordingSampleSink first, second;
@@ -1021,7 +1021,15 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
       CHECK(particles.R[electron][dimension] == initial_positions[electron][dimension]);
   for (int dimension = 0; dimension < 3; ++dimension)
     CHECK(ions.R[0][dimension] == initial_ions[0][dimension]);
+  source->evaluateLog(particles);
   CHECK(source->getLogPsi() == initial_log);
+  OptVariables live_parameters;
+  source->checkInVariables(live_parameters);
+  live_parameters.resetIndex();
+  REQUIRE(live_parameters.size_of_active() == snapshot->values.size());
+  for (std::size_t i = 0; i < live_parameters.size(); ++i)
+    if (live_parameters.where(i) >= 0)
+      CHECK(live_parameters[i] == snapshot->values[live_parameters.where(i)]);
   CHECK(adapter.snapshotParameters().values == snapshot->values);
 
   const VJPCoefficientChannel score_only{"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0};
