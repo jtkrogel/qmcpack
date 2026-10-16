@@ -33,6 +33,8 @@ struct ConventionalOrbitalFrame
 /** Driver-owned CPU binding for SJ/MDJ with J1/J2/J3 and CI coordinates.
  * Single-Slater CPU LCAO rotations use complete accepted coefficient/rotation
  * frames; their active coordinates alone are not a physical model checkpoint.
+ * The periodic slice is restricted to real Gamma HEG14 FreeOrbital/J2 with
+ * actual CPU 3D Ewald identity; other periodic and external-asset models fail.
  * All fallible model resets occur in private objects, followed by collective
  * readiness and no-throw component swaps. Post-commit live cache refresh remains
  * a fatal boundary: it cannot roll back arbitrary legacy evaluations.

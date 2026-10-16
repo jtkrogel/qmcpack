@@ -117,6 +117,10 @@ struct CoulombPBCAA : public OperatorDependsOnlyOnParticleSet, public ForceBase
   /// Expose the immutable execution choice for strict CPU selected-system admission.
   bool usesOffload() const noexcept { return use_offload_; }
 
+  /// Exact constructed 3D Ewald settings and neutralizing-background convention.
+  /// Empty for other breakup handlers; this does not consult mutable globals.
+  const std::string& ewaldModelDefinition() const noexcept { return ewald_model_definition_; }
+
   /** evaluate just one walker
    *
    *  This is still called for batch AA IonIon
@@ -218,6 +222,7 @@ private:
 
   /// if true use offload
   const bool use_offload_;
+  std::string ewald_model_definition_;
   /// AA table ID
   const int d_aa_ID;
   /// Timer for long range

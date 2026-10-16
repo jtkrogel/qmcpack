@@ -29,6 +29,9 @@ public:
 
   std::string getClassName() const override { return "FreeOrbital"; }
 
+  /// Actual immutable reciprocal vectors, used to qualify a Gamma periodic model.
+  const std::vector<PosType>& kVectors() const noexcept { return kvecs; }
+
   // phi[i][j] is phi_j(r_i), i.e. electron i in orbital j
   //  i \in [first, last)
   void evaluate_notranspose(const ParticleSet& P,

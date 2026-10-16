@@ -14,8 +14,10 @@
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
+#include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCHamiltonians/NonLocalECPotential.h"
+#include "QMCHamiltonians/CoulombPBCAA.h"
 #include "io/hdf/hdf_archive.h"
 #include <exception>
 #include <algorithm>
@@ -262,6 +264,44 @@ TrainingWaveFunctionBinding::~TrainingWaveFunctionBinding() = default;
 void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
 {
   const bool nonlocal_ecp = hamiltonian.hasPhysicalNLPP();
+  const auto& lattice = prototype_particles_.getLattice();
+  const bool periodic = lattice.BoxBConds[0] || lattice.BoxBConds[1] || lattice.BoxBConds[2];
+  if (periodic)
+  {
+#ifdef QMC_COMPLEX
+    throw std::runtime_error("Conventional periodic training currently requires real Gamma orbitals");
+#else
+    // This first periodic slice is the existing closed-shell HEG14 model,
+    // not blanket admission of arbitrary periodic wavefunctions/operators.
+    if (!lattice.BoxBConds[0] || !lattice.BoxBConds[1] || !lattice.BoxBConds[2] || lattice.ndim != 3 ||
+        nonlocal_ecp || multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1 ||
+        prototype_particles_.groups() != 2 || prototype_particles_.groupsize(0) != 7 ||
+        prototype_particles_.groupsize(1) != 7)
+      throw std::runtime_error("Conventional periodic training requires the real Gamma HEG14 fixed-Slater/J2 profile");
+    for (const auto& component : prototype_.getOrbitals())
+      if (component->getClassName() != "SlaterDet" && component->getClassName() != "TwoBodyJastrow")
+        throw std::runtime_error("Conventional periodic training admits only fixed FreeOrbital Slater and J2");
+    const auto& slater = prototype_.findSD().front().get();
+    if (slater.getNumDets() != 2)
+      throw std::runtime_error("Conventional periodic training requires two HEG14 spin determinants");
+    constexpr double two_pi = 6.283185307179586476925286766559;
+    for (int determinant = 0; determinant < slater.getNumDets(); ++determinant)
+    {
+      const auto* free = dynamic_cast<const FreeOrbital*>(&slater.getPhi(determinant));
+      if (!free || free->getOrbitalSetSize() != 7 || free->isOptimizable())
+        throw std::runtime_error("Conventional periodic training requires fixed Gamma FreeOrbital SPOs");
+      for (const auto& k : free->kVectors())
+        for (int translation = 0; translation < OHMMS_DIM; ++translation)
+        {
+          double phase = 0;
+          for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+            phase += k[dimension] * lattice.R(translation, dimension) / two_pi;
+          if (!isFiniteTrainingReal(phase) || std::abs(phase - std::round(phase)) > 1e-10)
+            throw std::runtime_error("Conventional periodic FreeOrbital vectors are not Gamma reciprocal vectors");
+        }
+    }
+#endif
+  }
   if (nonlocal_ecp)
   {
     const auto& provenance = hamiltonian.ecpModelProvenance();
@@ -286,16 +326,31 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     if (!inserted && entry->second != identity)
       throw std::runtime_error("Conventional physical identity has ambiguous particle-set names");
   }
-  for (int d = 0; d < OHMMS_DIM; ++d)
-    if (prototype_particles_.getLattice().BoxBConds[d])
-      throw std::runtime_error("Conventional first training profile currently requires open boundaries");
+  if (periodic && particles.size() != 1)
+    throw std::runtime_error("Conventional periodic HEG profile cannot contain ionic sources");
   std::ostringstream identity;
+  int periodic_coulomb = 0, periodic_kinetic = 0;
   for (const auto& [name, definition] : particles)
     identity << name.size() << ':' << name << ':' << definition.size() << ':' << definition << ';';
   for (int i = 0; i < hamiltonian.size(); ++i)
   {
     const auto* component = hamiltonian.getComponent(i);
     const auto kind = component->getClassName();
+    if (periodic)
+    {
+      if (const auto* ewald = dynamic_cast<const CoulombPBCAA*>(component))
+      {
+        if (ewald->usesOffload() || ewald->ewaldModelDefinition().empty() || !ewald->is_active ||
+            ewald->ComputeForces || ewald->PtclRefName != prototype_particles_.getName())
+          throw std::runtime_error("Conventional periodic training requires CPU active 3D Ewald CoulombPBCAA");
+        identity << "periodic_ewald:" << component->getName() << ':' << ewald->ewaldModelDefinition() << ';';
+        ++periodic_coulomb;
+        continue;
+      }
+      if (kind != "BareKineticEnergy")
+        throw std::runtime_error("Conventional periodic training requires kinetic plus 3D Ewald CoulombPBCAA only");
+      ++periodic_kinetic;
+    }
     if (kind != "BareKineticEnergy" && kind != "CoulombPotential" &&
         !(nonlocal_ecp && (kind == "LocalECPotential" || kind == "NonLocalECPotential")))
       throw std::runtime_error("Conventional first training profile requires kinetic plus open Coulomb operators");
@@ -317,6 +372,8 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     }
     identity << kind << ':' << component->getName() << ':' << description.str() << ';';
   }
+  if (periodic && (periodic_coulomb != 1 || periodic_kinetic != 1))
+    throw std::runtime_error("Conventional periodic training requires exactly one kinetic and one Ewald operator");
   if (nonlocal_ecp)
   {
     const auto& scientific = hamiltonian.ecpModelProvenance()->scientific_definition;

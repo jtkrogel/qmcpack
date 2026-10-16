@@ -19,6 +19,9 @@
 #include <cstdint>
 #include <numeric>
 #include "EwaldRef.h"
+#include "LongRange/EwaldHandler3D.h"
+#include <iomanip>
+#include <sstream>
 #include "Particle/DistanceTable.h"
 #include "Utilities/ProgressReportEngine.h"
 #include <ResourceCollection.h>
@@ -478,6 +481,26 @@ void CoulombPBCAA::initBreakup(ParticleSet& ref_pset)
     rVs = LRCoulombSingleton::createSpline4RbyVs(lr_aa_.get(), myRcut, myGrid);
 
   rVs_offload = std::make_shared<const OffloadSpline>(*rVs);
+
+  // Capture the built handler, including the self/background kernel, once.
+  // A later singleton policy change must not relabel this physical operator.
+  ewald_model_definition_.clear();
+  if (const auto* ewald = dynamic_cast<const EwaldHandler3D*>(lr_aa_.get()))
+  {
+    const auto& lattice = ref_pset.getLattice();
+    std::ostringstream definition;
+    definition << std::hexfloat << "CoulombPBCAA:3d-uniform-neutralizing-background+self-v1;source="
+               << PtclRefName << ";active=" << is_active << ";forces=" << ComputeForces
+               << ";handler=EwaldHandler3D;sigma=" << ewald->Sigma
+               << ";volume=" << ewald->Volume << ";rc=" << ewald->get_rc()
+               << ";kc=" << ewald->get_kc() << ";shells=" << ewald->MaxKshell
+               << ";lr_dim_cutoff=" << lattice.LR_dim_cutoff << ";lr_rc=" << lattice.LR_rc
+               << ";lr_kc=" << lattice.LR_kc << ";lr_tol=" << lattice.LR_tol
+               << ";ndim=" << lattice.ndim << ";grid=" << ng
+               << ";self_kernel=" << ewald->evaluateLR_r0()
+               << ";background_kernel=" << ewald->evaluateSR_k0() << ";constant=" << myConst;
+    ewald_model_definition_ = definition.str();
+  }
 
   if (ComputeForces)
   {

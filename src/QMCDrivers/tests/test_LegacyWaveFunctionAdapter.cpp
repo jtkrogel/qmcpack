@@ -26,6 +26,8 @@
 #include "QMCHamiltonians/ECPComponentBuilder.h"
 #include "QMCHamiltonians/NonLocalECPComponent.h"
 #include "QMCHamiltonians/LocalECPotential.h"
+#include "QMCHamiltonians/CoulombPBCAA.h"
+#include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 #include "ResourceCollection.h"
 #include "Utilities/StdRandom.h"
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
@@ -1455,6 +1457,210 @@ TEST_CASE("Legacy orbital products preserve cumulative private rotation history"
   for (int electron = 0; electron < particles.getTotalNum(); ++electron)
     for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
       CHECK(particles.R[electron][dimension] == positions[electron][dimension]);
+}
+
+TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald energy derivatives",
+          "[drivers][training][legacy_adapter][periodic_heg]")
+{
+#ifdef QMC_COMPLEX
+  SKIP("This gate qualifies only real Gamma FreeOrbital/J2");
+#endif
+  // Isolate test-global breakup selection without changing production singleton
+  // semantics. Existing operators retain their own immutable built handlers.
+  struct RestoreBreakup
+  {
+    decltype(LRCoulombSingleton::CoulombHandler) energy = std::move(LRCoulombSingleton::CoulombHandler);
+    decltype(LRCoulombSingleton::CoulombDerivHandler) derivative = std::move(LRCoulombSingleton::CoulombDerivHandler);
+    LRCoulombSingleton::lr_type kind = LRCoulombSingleton::this_lr_type;
+    ~RestoreBreakup()
+    {
+      LRCoulombSingleton::CoulombHandler = std::move(energy);
+      LRCoulombSingleton::CoulombDerivHandler = std::move(derivative);
+      LRCoulombSingleton::this_lr_type = kind;
+    }
+  } restore_breakup;
+  struct HEG
+  {
+    ParticleSetPool pool{OHMMS::Controller};
+    Libxml2Document cell, definition;
+    ParticleSet* particles;
+    std::unique_ptr<TrialWaveFunction> wavefunction;
+    QMCHamiltonian hamiltonian;
+    CoulombPBCAA* coulomb;
+    HEG(const std::string& rs, const std::string& cutoff)
+    {
+      LRCoulombSingleton::CoulombHandler.reset();
+      LRCoulombSingleton::CoulombDerivHandler.reset();
+      const std::string xml = "<simulationcell><parameter name='rs' condition='14'>" + rs +
+          "</parameter><parameter name='bconds'>p p p</parameter><parameter name='LR_dim_cutoff'>" + cutoff +
+          "</parameter><parameter name='LR_handler'>ewald</parameter></simulationcell>";
+      REQUIRE(cell.parseFromString(xml));
+      REQUIRE(pool.readSimulationCellXML(cell.getRoot()));
+      auto owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+      particles = owner.get();
+      particles->setName("e");
+      particles->create({7, 7});
+      auto& species = particles->getSpeciesSet();
+      const int u = species.addSpecies("u"), d = species.addSpecies("d");
+      const int charge = species.addAttribute("charge"), mass = species.addAttribute("mass");
+      species(charge, u) = species(charge, d) = -1;
+      species(mass, u) = species(mass, d) = 1;
+      particles->resetGroups();
+      const double length = particles->getLattice().R(0, 0);
+      for (int i = 0; i < 14; ++i)
+        particles->R[i] = {length * std::fmod(0.137 + i * 0.217 + i * i * 0.037, 1.0),
+                           length * std::fmod(0.231 + i * 0.371 + i * i * 0.017, 1.0),
+                           length * std::fmod(0.317 + i * 0.127 + i * i * 0.053, 1.0)};
+      // Exercise a close pair straddling a periodic cell face.
+      particles->R[0] = {0.01 * length, 0.21 * length, 0.31 * length};
+      particles->R[7] = {0.99 * length, 0.22 * length, 0.33 * length};
+      particles->createSK();
+      pool.addParticleSet(std::move(owner));
+      // Existing heg_14_gamma/heg.sj.wfs.xml physical model and coefficients.
+      REQUIRE(definition.parseFromString(R"(
+        <wavefunction name="psi0" target="e">
+          <sposet_collection type="free"><sposet name="spo-ud" size="7" optimize="no"/></sposet_collection>
+          <determinantset><slaterdeterminant>
+            <determinant sposet="spo-ud"/><determinant sposet="spo-ud"/>
+          </slaterdeterminant></determinantset>
+          <jastrow name="J2" type="Two-Body" function="Bspline" optimize="yes">
+            <correlation speciesA="u" speciesB="u" size="5">
+              <coefficients id="uu" type="Array" optimize="yes">1.082858193 0.6653279375 0.4358910287 0.2243616172 0.1102948764</coefficients>
+            </correlation>
+            <correlation speciesA="u" speciesB="d" size="5">
+              <coefficients id="ud" type="Array" optimize="yes">1.696171854 1.047722154 0.6275148566 0.3175982878 0.1446706214</coefficients>
+            </correlation>
+          </jastrow>
+        </wavefunction>)"));
+      WaveFunctionFactory factory(*particles, pool.getPool(), OHMMS::Controller);
+      wavefunction = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+      REQUIRE(wavefunction);
+      wavefunction->storeXMLNode(definition.getRoot());
+      hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(*particles), "Kinetic");
+      auto ewald = std::make_unique<CoulombPBCAA>(*particles, true, false, false);
+      coulomb = ewald.get();
+      hamiltonian.addOperator(std::move(ewald), "ElecElec");
+      hamiltonian.addObservables(*particles);
+      particles->update();
+      wavefunction->evaluateLog(*particles);
+    }
+  } model("5", "6");
+  auto& particles = *model.particles;
+  auto& source = *model.wavefunction;
+  TrainingWaveFunctionBinding binding(source, particles, adapterOptions(), *OHMMS::Controller);
+  binding.setHamiltonian(model.hamiltonian);
+  const auto identity = binding.modelIdentity();
+  const auto snapshot = binding.snapshotParameters();
+  REQUIRE(snapshot.values.size() == 10);
+  const auto original_positions = particles.R;
+  const auto original_log = source.getLogPsi();
+  const auto original_kinetic = kineticEnergy(particles);
+  const auto original_potential = model.coulomb->evaluate(particles);
+  const auto definition = model.coulomb->ewaldModelDefinition();
+  CHECK(definition.find("handler=EwaldHandler3D;") != std::string::npos);
+  CHECK(definition.find("neutralizing-background+self-v1") != std::string::npos);
+  LRCoulombSingleton::this_lr_type = LRCoulombSingleton::ESLER;
+  CHECK(model.coulomb->ewaldModelDefinition() == definition);
+
+  // A genuine periodic SPO has periodic nonconstant values, gradients AND
+  // Laplacians, not merely a periodic pair potential around open orbitals.
+  auto& spo = source.findSD().front().get().getPhi();
+  SPOSet::ValueVector values(7), laplacians(7), shifted_values(7), shifted_laplacians(7);
+  SPOSet::GradVector gradients(7), shifted_gradients(7);
+  spo.evaluateVGL(particles, 0, values, gradients, laplacians);
+  CHECK(std::abs(values[1] - values[2]) > 1e-4);
+  for (int axis = 0; axis < OHMMS_DIM; ++axis)
+  {
+    for (int d = 0; d < OHMMS_DIM; ++d)
+      particles.R[0][d] += particles.getLattice().R(axis, d);
+    particles.update();
+    spo.evaluateVGL(particles, 0, shifted_values, shifted_gradients, shifted_laplacians);
+    for (int orbital = 0; orbital < 7; ++orbital)
+    {
+      checkClose(derivativeValue(values[orbital]), derivativeValue(shifted_values[orbital]));
+      checkClose(derivativeValue(laplacians[orbital]), derivativeValue(shifted_laplacians[orbital]));
+      for (int d = 0; d < OHMMS_DIM; ++d)
+        checkClose(derivativeValue(gradients[orbital][d]), derivativeValue(shifted_gradients[orbital][d]));
+    }
+    source.evaluateLog(particles);
+    CHECK(source.getLogPsi() == Catch::Approx(original_log).margin(1e-10));
+    checkClose(kineticEnergy(particles), original_kinetic);
+    CHECK(model.coulomb->evaluate(particles) == Catch::Approx(original_potential).margin(1e-10));
+    particles.R = original_positions;
+    particles.update();
+  }
+  source.evaluateLog(particles);
+  ParticleSet private_particles(particles);
+  auto evaluator = binding.makePrivateClone(private_particles);
+  private_particles.update();
+  auto& adapter = binding.adapter();
+  auto op = adapter.makeDerivativeOperator(RefVector<TrialWaveFunction>{*evaluator},
+                                            RefVector<ParticleSet>{private_particles}, 0, 0);
+  const std::vector<DerivativeValue> coefficient{{0.7, -0.2}};
+  const std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, coefficient), 0},
+      {"total_energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, coefficient),
+       localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  // Ewald has no J2 parameter dependence: its derivative is zero, but the FD
+  // oracle below evaluates the complete physical kinetic+Ewald local energy.
+  RecordingParameterSink transpose, hermitian;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, transpose);
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::HERMITIAN, hermitian);
+  std::vector<DerivativeValue> direction(10);
+  for (std::size_t p = 0; p < direction.size(); ++p)
+    direction[p] = 0.03 * (static_cast<int>(p % 5) - 2);
+  StructuredParameterVectorConstView vector(adapter.parameterSchema(), snapshot.version,
+                                           {direction.data(), direction.size()});
+  RecordingSampleSink score_jvp, energy_jvp;
+  op->applyScoreJVP(vector, score_jvp);
+  op->applyLocalEnergyJVP(vector, localEnergyTermBit(LocalEnergyTerm::KINETIC), energy_jvp);
+  for (std::size_t channel = 0; channel < channels.size(); ++channel)
+  {
+    DerivativeValue contraction{};
+    for (std::size_t p = 0; p < direction.size(); ++p)
+      contraction += transpose.result()[channel][p] * direction[p];
+    checkClose(contraction, coefficient[0] * (channel == 0 ? score_jvp.result()[0] : energy_jvp.result()[0]));
+  }
+  const auto probe = [&](const StructuredParameterSnapshot& point) {
+    ParticleSet probe_particles(particles);
+    auto probe_wavefunction = binding.makePrivateClone(probe_particles);
+    probe_particles.update();
+    adapter.installSnapshot(*probe_wavefunction, probe_particles, point);
+    return std::array<DerivativeValue, 2>{DerivativeValue{probe_wavefunction->getLogPsi()},
+        kineticEnergy(probe_particles) + DerivativeValue{model.coulomb->evaluate(probe_particles)}};
+  };
+  for (std::size_t p = 0; p < snapshot.values.size(); ++p)
+  {
+    CAPTURE(p);
+    constexpr double epsilon = 1e-5;
+    auto plus = snapshot, minus = snapshot;
+    plus.values[p] += epsilon;
+    minus.values[p] -= epsilon;
+    const auto positive = probe(plus), negative = probe(minus);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      const auto fd = (positive[channel] - negative[channel]) / (2 * epsilon);
+      const auto actual = transpose.result()[channel][p] / coefficient[0];
+      CHECK(actual.real() == Catch::Approx(fd.real()).epsilon(2e-6).margin(2e-8));
+      CHECK(actual.imag() == Catch::Approx(fd.imag()).margin(2e-8));
+      checkClose(hermitian.result()[channel][p], std::conj(actual) * coefficient[0]);
+    }
+  }
+  CHECK(binding.snapshotParameters().values == snapshot.values);
+  source.evaluateLog(particles);
+  CHECK(source.getLogPsi() == original_log);
+  CHECK(&source.findSD().front().get().getPhi() == &spo);
+  CHECK(op->storageDiagnostics().shared_workspace_bytes <= adapterOptions().maximum_derivative_scratch_bytes);
+
+  HEG changed_cutoff("5", "7"), changed_cell("5.1", "6");
+  TrainingWaveFunctionBinding cutoff_binding(*changed_cutoff.wavefunction, *changed_cutoff.particles,
+                                               adapterOptions(), *OHMMS::Controller);
+  cutoff_binding.setHamiltonian(changed_cutoff.hamiltonian);
+  TrainingWaveFunctionBinding cell_binding(*changed_cell.wavefunction, *changed_cell.particles,
+                                             adapterOptions(), *OHMMS::Controller);
+  cell_binding.setHamiltonian(changed_cell.hamiltonian);
+  CHECK(cutoff_binding.modelIdentity() != identity);
+  CHECK(cell_binding.modelIdentity() != identity);
 }
 
 TEST_CASE("Legacy polynomial J3 products include full-gradient cross terms and isolated aliases",
