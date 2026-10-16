@@ -20,6 +20,9 @@
 #include "QMCDrivers/WFTrain/FirstOrderOptimizer.h"
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/TrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
+#include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCHamiltonians/QMCHamiltonian.h"
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
@@ -1003,6 +1006,77 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     CHECK(source_msd.get_C()[1] == makeValue(-0.23));
     MultiSlaterDetTableMethod incompatible(electrons, {}, false);
     CHECK_THROWS_AS(source_msd.validatePreparedCoefficientState(incompatible), std::invalid_argument);
+
+    // Fixed-sample live binding gate: publish CI/J2 together without replacing
+    // the MSD, determinants, SPOs or immutable occupation maps.
+    TrainingWaveFunctionBinding binding(*source, electrons, adapterOptions(), *OHMMS::Controller);
+    QMCHamiltonian hamiltonian;
+    hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(electrons), "Kinetic");
+    binding.setHamiltonian(hamiltonian);
+    binding.attachLive(*sibling, sibling_particles);
+    const auto source_positions = electrons.R;
+    const auto sibling_positions = sibling_particles.R;
+    const std::array<const SPOSet*, 2> source_spos{source_msd.getDet(0).getPhi(), source_msd.getDet(1).getPhi()};
+    const std::array<const SPOSet*, 2> sibling_spos{sibling_msd.getDet(0).getPhi(), sibling_msd.getDet(1).getPhi()};
+    const auto* sibling_map = &sibling_msd.get_C2node();
+    const auto initial_bank = binding.snapshotParameters();
+    auto invalid_bank = initial_bank;
+    if (OHMMS::Controller->rank() == 0)
+      invalid_bank.values[0] = std::numeric_limits<double>::quiet_NaN();
+    const auto* rejected_coefficients = source_msd.get_C().data();
+    const auto* rejected_jastrow = source->getOrbitals().back().get();
+    CHECK_THROWS(binding.publishParameters(invalid_bank, initial_bank.version));
+    CHECK(binding.snapshotParameters().values == initial_bank.values);
+    CHECK(binding.snapshotParameters().version == initial_bank.version);
+    CHECK(source_msd.get_C().data() == rejected_coefficients);
+    CHECK(sibling_msd.get_C().data() == rejected_coefficients);
+    CHECK(source->getOrbitals().back().get() == rejected_jastrow);
+    for (int update = 0; update < 2; ++update)
+    {
+      auto next = binding.snapshotParameters();
+      next.values[0] += 0.03 * (update + 1);
+      next.values[1] += 0.001 * (update + 1);
+      const auto previous_version = next.version;
+      CHECK(binding.publishParameters(next, previous_version) == previous_version + 1);
+      CHECK(binding.snapshotParameters().values == next.values);
+      CHECK(&source->findMSD()[0].get() == &source_msd);
+      CHECK(&sibling->findMSD()[0].get() == &sibling_msd);
+      CHECK(&source_msd.get_C2node() == occupation_map);
+      CHECK(&sibling_msd.get_C2node() == sibling_map);
+      CHECK(&source_msd.get_C() == &sibling_msd.get_C());
+      CHECK(source_msd.get_C()[0] == original_coefficients[0]);
+      CHECK(source_msd.get_C()[1] == makeValue(next.values[0]));
+      for (int spin = 0; spin < 2; ++spin)
+      {
+        CHECK(source_msd.getDet(spin).getPhi() == source_spos[spin]);
+        CHECK(sibling_msd.getDet(spin).getPhi() == sibling_spos[spin]);
+      }
+      optimize::VariableSet live_variables, clone_variables;
+      source->checkInVariables(live_variables);
+      sibling->checkInVariables(clone_variables);
+      live_variables.resetIndex();
+      clone_variables.resetIndex();
+      for (std::size_t index = 0; index < next.values.size(); ++index)
+      {
+        CHECK(live_variables[index] == Catch::Approx(next.values[index]));
+        CHECK(clone_variables[index] == Catch::Approx(next.values[index]));
+      }
+      ParticleSet oracle_particles(electrons);
+      oracle_particles.update();
+      auto oracle = binding.makeCandidate(oracle_particles, next);
+      source->evaluateLog(electrons);
+      sibling->evaluateLog(sibling_particles);
+      CHECK(source->getLogPsi() == Catch::Approx(oracle->getLogPsi()).margin(1e-12));
+      CHECK(sibling->getLogPsi() == Catch::Approx(oracle->getLogPsi()).margin(1e-12));
+      checkClose(kineticEnergy(electrons), kineticEnergy(oracle_particles));
+      checkClose(kineticEnergy(sibling_particles), kineticEnergy(oracle_particles));
+      for (int electron = 0; electron < electrons.getTotalNum(); ++electron)
+        for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+        {
+          CHECK(electrons.R[electron][dimension] == source_positions[electron][dimension]);
+          CHECK(sibling_particles.R[electron][dimension] == sibling_positions[electron][dimension]);
+        }
+    }
   }
 }
 
