@@ -925,6 +925,9 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
   ham.addOperator(std::move(local), "LocalECP");
   ham.addOperator(std::move(nonlocal), "NonLocalECP");
+  // Full Hamiltonian evaluation publishes each component through registered
+  // observable/property slots, unlike direct isolated-operator evaluations.
+  ham.addObservables(particles);
   StdRandom<QMCTraits::FullPrecRealType> rng(1931);
   nonlocal_ptr->setRandomGenerator(&rng);
   RefVectorWithLeader<ParticleSet> p_list(particles, {particles});
