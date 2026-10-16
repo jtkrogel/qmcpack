@@ -852,6 +852,18 @@ add_unit_test(deterministic-unit_test_psiformer_kinetic_executor
 set_tests_properties(deterministic-unit_test_psiformer_kinetic_executor
                      PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
 
+# Isolate the native-owning retained kinetic trunk test from qmcwfs.
+add_executable(test_psiformer_kinetic_trunk
+               test_psiformer_kinetic_trunk.cpp
+               ../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(test_psiformer_kinetic_trunk catch_main IO::HDF5 platform_LA)
+target_include_directories(test_psiformer_kinetic_trunk PRIVATE "${qmcpack_SOURCE_DIR}/src")
+add_unit_test(deterministic-unit_test_psiformer_kinetic_trunk
+              1 1 $<TARGET_FILE:test_psiformer_kinetic_trunk>)
+set_tests_properties(deterministic-unit_test_psiformer_kinetic_trunk
+                     PROPERTIES WORKING_DIRECTORY ${UTEST_DIR})
+
 # Keep the replaceable global allocation operators isolated from the broad
 # TrialWaveFunction binary while exercising the real public component boundary.
 add_executable(test_psiformer_adapter_sinks test_psiformer_adapter_sinks.cpp)

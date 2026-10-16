@@ -21,10 +21,9 @@
  *
  * exactly, without finite differences and without forming an electron Hessian.
  * Mutable tape and determinant factors are clone-local and fixed-size after workspace
- * construction.  The numerical implementation is deliberately real, open-boundary,
- * fixed-ion, and non-spinor.  Sign/log-magnitude results and explicit transpose
- * products preserve the API seam at which a later complex phase and adjoint convention
- * can be introduced.
+ * construction. The shared trunk supports real open/periodic fixed-ion, non-spinor
+ * jets. Complete real evaluation remains guarded; an explicit head-free numerical
+ * seam admits paired-head metadata without claiming public complex optimization.
  */
 
 // PsiFormerNative.h currently contains non-inline definitions and must be included by
@@ -141,14 +140,14 @@ struct DirectKineticResultView
   std::size_t parameter_version = 0;
 };
 
-/** Clone-local, preallocated forward and lifted-reverse tape. */
-class DirectKineticWorkspace
+/** Clone-local, preallocated real FULL NN/cusp tape, with no orbital or determinant storage. */
+class DirectKineticTrunkWorkspace
 {
 public:
   /// Allocate one clone-local fixed-capacity forward and reverse tape.
-  DirectKineticWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
-                         GeometryPositionView nuclei,
-                         GeometryBoundary boundary = {})
+  DirectKineticTrunkWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                              GeometryPositionView nuclei,
+                              GeometryBoundary boundary = {})
       : electrons_(plan.modelShape().electrons()),
         nuclei_(plan.modelShape().nuclei),
         determinants_(plan.modelShape().determinants),
@@ -165,14 +164,6 @@ public:
         electron_positions_(3 * electrons_),
         geometry_(electrons_, nuclei, boundary),
         raw_features_(electrons_ * input_width_, gradient_lanes_, laplacian_lanes_),
-        orbitals_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
-        backflows_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
-        envelopes_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
-        determinant_(determinants_, electrons_, gradient_lanes_, laplacian_lanes_),
-        determinant_factor_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
-        orbital_adjoint_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
-        backflow_adjoint_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
-        envelope_adjoint_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
         feature_adjoint_a_(feature_elements_, gradient_lanes_, laplacian_lanes_),
         feature_adjoint_b_(feature_elements_, gradient_lanes_, laplacian_lanes_),
         query_adjoint_(feature_elements_, gradient_lanes_, laplacian_lanes_),
@@ -193,19 +184,9 @@ public:
         row_sum_adjoint_(1, gradient_lanes_, laplacian_lanes_),
         row_reciprocal_adjoint_(1, gradient_lanes_, laplacian_lanes_),
         root_adjoint_(1, gradient_lanes_, laplacian_lanes_),
-        determinant_gradient_(gradient_lanes_),
-        determinant_lap_log_(laplacian_lanes_),
-        determinant_lap_ratio_(laplacian_lanes_),
         cusp_gradient_(gradient_lanes_),
         cusp_laplacian_(laplacian_lanes_),
-        output_gradient_(gradient_lanes_),
-        output_lap_log_(laplacian_lanes_),
-        output_lap_ratio_(laplacian_lanes_),
-        parameter_score_(plan.parameterCount()),
-        kinetic_parameter_response_(plan.parameterCount()),
-        matrix_scratch_a_(electrons_ * electrons_),
-        matrix_scratch_b_(electrons_ * electrons_),
-        matrix_scratch_c_(electrons_ * electrons_)
+        parameter_score_(plan.parameterCount())
   {
     if (electrons_ == 0 || nuclei_ == 0 || determinants_ == 0 || width_ == 0 ||
         heads_ == 0 || width_ % heads_ != 0)
@@ -242,20 +223,22 @@ public:
   }
 
   /// Prevent copying the large clone-local tape.
-  DirectKineticWorkspace(const DirectKineticWorkspace&) = delete;
+  DirectKineticTrunkWorkspace(const DirectKineticTrunkWorkspace&) = delete;
 
   /// Prevent copy assignment of the large clone-local tape.
-  DirectKineticWorkspace& operator=(const DirectKineticWorkspace&) = delete;
+  DirectKineticTrunkWorkspace& operator=(const DirectKineticTrunkWorkspace&) = delete;
 
   /// Move a workspace while retaining all backing allocations.
-  DirectKineticWorkspace(DirectKineticWorkspace&&) = default;
+  DirectKineticTrunkWorkspace(DirectKineticTrunkWorkspace&&) = default;
 
   /// Move-assign a workspace while retaining all backing allocations.
-  DirectKineticWorkspace& operator=(DirectKineticWorkspace&&) = default;
+  DirectKineticTrunkWorkspace& operator=(DirectKineticTrunkWorkspace&&) = default;
 
   /// Replace every electron coordinate from an interleaved geometry view.
   void setPositions(GeometryPositionView positions)
   {
+    forward_valid_ = false;
+    reverse_valid_ = false;
     if (positions.size() != electrons_)
       throw std::invalid_argument("PsiFormer kinetic workspace received the wrong electron count");
     for (std::size_t electron = 0; electron < electrons_; ++electron)
@@ -266,6 +249,8 @@ public:
   /// Replace one Cartesian electron coordinate.
   void setPosition(std::size_t electron, std::size_t dimension, double coordinate)
   {
+    forward_valid_ = false;
+    reverse_valid_ = false;
     if (electron >= electrons_ || dimension >= 3)
       throw std::out_of_range("PsiFormer kinetic coordinate index is out of range");
     electron_positions_[3 * electron + dimension] = coordinate;
@@ -277,31 +262,24 @@ public:
   /// Return the stable backing address of the canonical score vector.
   const double* scoreData() const noexcept { return parameter_score_.data(); }
 
-  /// Return the stable backing address of the canonical kinetic-response vector.
-  const double* kineticData() const noexcept { return kinetic_parameter_response_.data(); }
+  /// Return the reverse scratch only after successful publication; callers must match model version.
+  DirectKineticConstView trunkParameterResponse() const
+  {
+    if (!reverse_valid_)
+      throw std::logic_error("PsiFormer kinetic trunk response is not valid");
+    return {parameter_score_.data(), parameter_score_.size()};
+  }
+
+  /// Distinguish consecutive reverse publications without invalidating the forward ticket.
+  std::size_t resultGeneration() const noexcept { return reverse_generation_; }
 
   /// Return the fixed number of canonical score components.
   std::size_t scoreSize() const noexcept { return parameter_score_.size(); }
 
-  /// Return the fixed number of canonical kinetic-response components.
-  std::size_t kineticSize() const noexcept
-  {
-    return kinetic_parameter_response_.size();
-  }
-
-  /// Return bytes retained by the two canonical parameter-response vectors.
+  /// Return bytes retained by the single canonical reverse scratch vector.
   std::size_t parameterStorageBytes() const
   {
-    std::size_t bytes = checkedStorageBytes<double>(
-        parameter_score_.capacity(),
-        "PsiFormer kinetic score-vector bytes overflowed");
-    addStorageBytes(
-        bytes,
-        checkedStorageBytes<double>(
-            kinetic_parameter_response_.capacity(),
-            "PsiFormer kinetic response-vector bytes overflowed"),
-        "PsiFormer kinetic parameter-vector bytes overflowed");
-    return bytes;
+    return checkedStorageBytes<double>(parameter_score_.capacity(), "PsiFormer trunk parameter bytes overflowed");
   }
 
   /// Hash every explicit backing allocation for warmed-call stability tests.
@@ -338,10 +316,7 @@ public:
     mix_tape(hidden_);
     mix_tape(update_pre_);
     mix_tape(updates_);
-    for (const DirectTraceJetBuffer* jet : {&orbitals_, &backflows_, &envelopes_,
-                                            &determinant_factor_, &orbital_adjoint_,
-                                            &backflow_adjoint_, &envelope_adjoint_,
-                                            &feature_adjoint_a_, &feature_adjoint_b_,
+    for (const DirectTraceJetBuffer* jet : {&feature_adjoint_a_, &feature_adjoint_b_,
                                             &query_adjoint_, &key_adjoint_, &value_adjoint_,
                                             &logit_adjoint_, &attention_adjoint_,
                                             &context_adjoint_, &residual_adjoint_,
@@ -351,20 +326,14 @@ public:
                                             &row_sum_, &row_reciprocal_, &row_sum_adjoint_,
                                             &row_reciprocal_adjoint_, &root_adjoint_})
       mix_jet(*jet);
-    for (const auto* buffer : {&determinant_gradient_, &determinant_lap_log_,
-                               &determinant_lap_ratio_, &cusp_gradient_, &cusp_laplacian_,
-                               &output_gradient_, &output_lap_log_, &output_lap_ratio_,
-                               &parameter_score_, &kinetic_parameter_response_,
-                               &matrix_scratch_a_, &matrix_scratch_b_, &matrix_scratch_c_})
+    for (const auto* buffer : {&cusp_gradient_, &cusp_laplacian_, &parameter_score_})
       mix(*buffer);
     hash ^= geometry_.storageFingerprint();
-    hash *= 1099511628211ULL;
-    hash ^= determinant_.storageFingerprint();
     hash *= 1099511628211ULL;
     return hash;
   }
 
-  /// Bytes reserved by the complete tape, geometry, and determinant workspace.
+  /// Bytes retained by the head-free real NN/cusp tape and parameter scratch.
   std::size_t vectorStorageBytes() const
   {
     std::size_t bytes = 0;
@@ -400,10 +369,7 @@ public:
     add_tape(hidden_);
     add_tape(update_pre_);
     add_tape(updates_);
-    for (const DirectTraceJetBuffer* jet : {&orbitals_, &backflows_, &envelopes_,
-                                            &determinant_factor_, &orbital_adjoint_,
-                                            &backflow_adjoint_, &envelope_adjoint_,
-                                            &feature_adjoint_a_, &feature_adjoint_b_,
+    for (const DirectTraceJetBuffer* jet : {&feature_adjoint_a_, &feature_adjoint_b_,
                                             &query_adjoint_, &key_adjoint_, &value_adjoint_,
                                             &logit_adjoint_, &attention_adjoint_,
                                             &context_adjoint_, &residual_adjoint_,
@@ -413,15 +379,9 @@ public:
                                             &row_sum_, &row_reciprocal_, &row_sum_adjoint_,
                                             &row_reciprocal_adjoint_, &root_adjoint_})
       add_jet(*jet);
-    for (const auto* buffer : {&determinant_gradient_, &determinant_lap_log_,
-                               &determinant_lap_ratio_, &cusp_gradient_, &cusp_laplacian_,
-                               &output_gradient_, &output_lap_log_, &output_lap_ratio_,
-                               &parameter_score_, &kinetic_parameter_response_,
-                               &matrix_scratch_a_, &matrix_scratch_b_, &matrix_scratch_c_})
+    for (const auto* buffer : {&cusp_gradient_, &cusp_laplacian_, &parameter_score_})
       add(*buffer);
     addStorageBytes(bytes, geometry_.storageBytes(),
-                    "PsiFormer kinetic storage bytes overflowed");
-    addStorageBytes(bytes, determinant_.storageBytes(),
                     "PsiFormer kinetic storage bytes overflowed");
     return bytes;
   }
@@ -433,12 +393,12 @@ public:
   /// Return the checked constructor-time requirement for this fixed model shape.
   std::size_t requiredStorageBytes() const
   {
-    return kineticWorkspaceStorageRequirement(
+    return kineticTrunkWorkspaceStorageRequirement(
         {electrons_, nuclei_, determinants_, width_, heads_, input_width_,
          blocks_, parameter_score_.size()});
   }
 
-private:
+protected:
   friend class DirectKineticExecutor;
 
   std::size_t electrons_;
@@ -470,15 +430,6 @@ private:
   std::vector<DirectTraceJetBuffer> hidden_;
   std::vector<DirectTraceJetBuffer> update_pre_;
   std::vector<DirectTraceJetBuffer> updates_;
-  DirectTraceJetBuffer orbitals_;
-  DirectTraceJetBuffer backflows_;
-  DirectTraceJetBuffer envelopes_;
-
-  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_;
-  DirectTraceJetBuffer determinant_factor_;
-  DirectTraceJetBuffer orbital_adjoint_;
-  DirectTraceJetBuffer backflow_adjoint_;
-  DirectTraceJetBuffer envelope_adjoint_;
 
   DirectTraceJetBuffer feature_adjoint_a_;
   DirectTraceJetBuffer feature_adjoint_b_;
@@ -502,20 +453,152 @@ private:
   DirectTraceJetBuffer row_reciprocal_adjoint_;
   DirectTraceJetBuffer root_adjoint_;
 
+  std::vector<double> cusp_gradient_;
+  std::vector<double> cusp_laplacian_;
+  std::vector<double> parameter_score_;
+  const void* owner_ = nullptr;
+  std::size_t forward_generation_ = 0;
+  bool forward_valid_ = false;
+  std::size_t reverse_generation_ = 0;
+  bool reverse_valid_ = false;
+  std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+};
+
+/** Complete legacy real head and determinant storage, absent from the trunk-only tape. */
+class DirectKineticWorkspace : public DirectKineticTrunkWorkspace
+{
+public:
+  /// Allocate the unchanged complete real numerical buffers.
+  DirectKineticWorkspace(const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                         GeometryPositionView nuclei, GeometryBoundary boundary = {})
+      : DirectKineticTrunkWorkspace(plan, nuclei, boundary),
+        orbitals_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        backflows_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        envelopes_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        determinant_(determinants_, electrons_, gradient_lanes_, laplacian_lanes_),
+        determinant_factor_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        orbital_adjoint_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        backflow_adjoint_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        envelope_adjoint_(orbital_elements_, gradient_lanes_, laplacian_lanes_),
+        determinant_gradient_(gradient_lanes_),
+        determinant_lap_log_(laplacian_lanes_),
+        determinant_lap_ratio_(laplacian_lanes_),
+        output_gradient_(gradient_lanes_),
+        output_lap_log_(laplacian_lanes_),
+        output_lap_ratio_(laplacian_lanes_),
+        kinetic_parameter_response_(plan.parameterCount()),
+        matrix_scratch_a_(electrons_ * electrons_),
+        matrix_scratch_b_(electrons_ * electrons_),
+        matrix_scratch_c_(electrons_ * electrons_)
+  {}
+
+  /// Return the complete canonical kinetic-response backing storage.
+  const double* kineticData() const noexcept { return kinetic_parameter_response_.data(); }
+
+  /// Return the complete canonical response extent.
+  std::size_t kineticSize() const noexcept { return kinetic_parameter_response_.size(); }
+
+  /// Count both legacy real parameter vectors.
+  std::size_t parameterStorageBytes() const
+  {
+    std::size_t bytes = DirectKineticTrunkWorkspace::parameterStorageBytes();
+    addStorageBytes(bytes,
+                    checkedStorageBytes<double>(kinetic_parameter_response_.capacity(),
+                                                "PsiFormer kinetic parameter bytes overflowed"),
+                    "PsiFormer kinetic parameter bytes overflowed");
+    return bytes;
+  }
+
+  /// Include every complete-head backing allocation in the stability fingerprint.
+  std::size_t storageFingerprint() const noexcept
+  {
+    std::size_t hash = DirectKineticTrunkWorkspace::storageFingerprint();
+    auto mix = [&hash](const auto& buffer) {
+      hash ^= reinterpret_cast<std::uintptr_t>(buffer.data());
+      hash *= 1099511628211ULL;
+      hash ^= buffer.capacity();
+      hash *= 1099511628211ULL;
+    };
+    for (const auto* jet : {&orbitals_, &backflows_, &envelopes_, &determinant_factor_,
+                            &orbital_adjoint_, &backflow_adjoint_, &envelope_adjoint_})
+    {
+      mix(jet->value);
+      mix(jet->gradient);
+      mix(jet->laplacian);
+    }
+    for (const auto* buffer : {&determinant_gradient_, &determinant_lap_log_, &determinant_lap_ratio_,
+                               &output_gradient_, &output_lap_log_, &output_lap_ratio_,
+                               &kinetic_parameter_response_, &matrix_scratch_a_,
+                               &matrix_scratch_b_, &matrix_scratch_c_})
+      mix(*buffer);
+    return (hash ^ determinant_.storageFingerprint()) * 1099511628211ULL;
+  }
+
+  /// Count the unchanged inclusive complete workspace.
+  std::size_t vectorStorageBytes() const
+  {
+    std::size_t bytes = DirectKineticTrunkWorkspace::vectorStorageBytes();
+    for (const auto* jet : {&orbitals_, &backflows_, &envelopes_, &determinant_factor_,
+                            &orbital_adjoint_, &backflow_adjoint_, &envelope_adjoint_})
+      for (const auto* buffer : {&jet->value, &jet->gradient, &jet->laplacian})
+        addStorageBytes(bytes, checkedStorageBytes<double>(buffer->capacity(), "PsiFormer kinetic bytes overflowed"),
+                        "PsiFormer kinetic bytes overflowed");
+    for (const auto* buffer : {&determinant_gradient_, &determinant_lap_log_, &determinant_lap_ratio_,
+                               &output_gradient_, &output_lap_log_, &output_lap_ratio_,
+                               &kinetic_parameter_response_, &matrix_scratch_a_,
+                               &matrix_scratch_b_, &matrix_scratch_c_})
+      addStorageBytes(bytes, checkedStorageBytes<double>(buffer->capacity(), "PsiFormer kinetic bytes overflowed"),
+                      "PsiFormer kinetic bytes overflowed");
+    addStorageBytes(bytes, determinant_.storageBytes(), "PsiFormer kinetic bytes overflowed");
+    return bytes;
+  }
+
+  /// Return the original inclusive constructor-time requirement.
+  std::size_t requiredStorageBytes() const
+  {
+    return kineticWorkspaceStorageRequirement(
+        {electrons_, nuclei_, determinants_, width_, heads_, input_width_, blocks_, parameter_score_.size()});
+  }
+
+private:
+  friend class DirectKineticExecutor;
+  DirectTraceJetBuffer orbitals_;
+  DirectTraceJetBuffer backflows_;
+  DirectTraceJetBuffer envelopes_;
+  qmcplusplus::psiformer::determinant::RealOpenDeterminantWorkspace determinant_;
+  DirectTraceJetBuffer determinant_factor_;
+  DirectTraceJetBuffer orbital_adjoint_;
+  DirectTraceJetBuffer backflow_adjoint_;
+  DirectTraceJetBuffer envelope_adjoint_;
   std::vector<double> determinant_gradient_;
   std::vector<double> determinant_lap_log_;
   std::vector<double> determinant_lap_ratio_;
-  std::vector<double> cusp_gradient_;
-  std::vector<double> cusp_laplacian_;
   std::vector<double> output_gradient_;
   std::vector<double> output_lap_log_;
   std::vector<double> output_lap_ratio_;
-  std::vector<double> parameter_score_;
   std::vector<double> kinetic_parameter_response_;
   std::vector<double> matrix_scratch_a_;
   std::vector<double> matrix_scratch_b_;
   std::vector<double> matrix_scratch_c_;
-  std::size_t observed_parameter_version_ = std::numeric_limits<std::size_t>::max();
+};
+
+/// Select complete legacy real evaluation or a head-free numerical trunk.
+enum class DirectKineticPreparation { REAL_WAVEFUNCTION, REAL_TRUNK_ONLY };
+
+/** Borrow one immutable FULL feature/cusp tape until the next forward request or coordinate edit.
+ * Reverse requests preserve this ticket; parameter changes invalidate it.
+ */
+struct DirectKineticTrunkResultView
+{
+  const DirectTraceJetBuffer* features = nullptr;
+  double cusp_value = 0.0;
+  DirectKineticConstView cusp_gradient;
+  DirectKineticConstView cusp_laplacian;
+  const PsiFormerGeometryCache* geometry = nullptr;
+  const double* packed_positions = nullptr;
+  const void* workspace = nullptr;
+  std::size_t parameter_version = 0;
+  std::size_t forward_generation = 0;
 };
 
 /** Exact direct trace-jet forward plus lifted parameter reverse. */
@@ -524,12 +607,14 @@ class DirectKineticExecutor
 public:
   /// Bind immutable model metadata, parameters, and fixed nuclear positions.
   DirectKineticExecutor(const PsiFormer& model,
-                        const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan)
+                        const qmcplusplus::psiformer::PsiFormerExecutionPlan& plan,
+                        DirectKineticPreparation preparation = DirectKineticPreparation::REAL_WAVEFUNCTION)
       : parameters_(model.p),
         plan_(plan),
         nuclei_(model.cfg.nuclei.x),
         spin_up_electrons_(model.cfg.nup),
-        boundary_(mappedBoundary(plan.environment()))
+        boundary_(mappedBoundary(plan.environment())),
+        preparation_(preparation)
   {
     const auto& shape = plan_.modelShape();
     if (plan_.parameterCount() != parameters_.size() || shape.electrons() != model.ne ||
@@ -541,7 +626,8 @@ public:
     const auto& environment = plan_.environment();
     if (environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
-        environment.amplitude_scalar_domain != ScalarDomain::REAL || !environment.fixed_nuclei)
+        (preparation_ == DirectKineticPreparation::REAL_WAVEFUNCTION &&
+         environment.amplitude_scalar_domain != ScalarDomain::REAL) || !environment.fixed_nuclei)
       throw std::invalid_argument(
           "Direct PsiFormer kinetic response supports only real, fixed-ion models");
   }
@@ -549,9 +635,40 @@ public:
   /// Allocate one independent fixed-capacity workspace for a component clone.
   std::unique_ptr<DirectKineticWorkspace> makeWorkspace() const
   {
+    if (preparation_ != DirectKineticPreparation::REAL_WAVEFUNCTION)
+      throw std::logic_error("Trunk-only kinetic executor cannot construct a real head");
     return std::make_unique<DirectKineticWorkspace>(
         plan_, GeometryPositionView::interleaved(nuclei_.data(), plan_.modelShape().nuclei), boundary_);
   }
+
+  /// Admit a positive exact per-tape numeric budget before allocating trunk scratch.
+  std::unique_ptr<DirectKineticTrunkWorkspace> makeTrunkWorkspace(std::size_t maximum_bytes) const
+  {
+    const auto& shape = plan_.modelShape();
+    const std::size_t input = plan_.parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0];
+    const std::size_t required = kineticTrunkWorkspaceStorageRequirement(
+        {shape.electrons(), shape.nuclei, shape.determinants, shape.feature_dimension,
+         shape.attention_heads, input, shape.attention_blocks, plan_.parameterCount()});
+    if (maximum_bytes == 0 || maximum_bytes == std::numeric_limits<std::size_t>::max() ||
+        required > maximum_bytes)
+      throw std::invalid_argument("PsiFormer kinetic trunk numeric budget exceeded");
+    auto workspace = std::make_unique<DirectKineticTrunkWorkspace>(
+        plan_, GeometryPositionView::interleaved(nuclei_.data(), shape.nuclei), boundary_);
+    workspace->owner_ = this;
+    return workspace;
+  }
+
+  /// Build a new immutable real FULL tape; any failed request revokes the previous ticket.
+  DirectKineticTrunkResultView evaluateTrunk(DirectKineticTrunkWorkspace& workspace) const;
+
+  /** Reverse caller-owned feature/cusp seeds without changing the forward tape.
+   * Returned parameter scratch is borrowed until the next forward/reverse request.
+   * Moving the executor invalidates existing owner-bound trunk workspaces.
+   */
+  DirectKineticConstView reverseTrunk(DirectKineticTrunkWorkspace& workspace,
+                                     const DirectKineticTrunkResultView& ticket,
+                                     const DirectTraceJetBuffer& feature_seeds,
+                                     const DirectTraceJetBuffer& cusp_seeds) const;
 
   /** Evaluate score and kinetic response.
    *
@@ -705,27 +822,27 @@ private:
   void validateWorkspace(const DirectKineticWorkspace& workspace) const;
 
   /// Build electron-nucleus input features and the first embedded feature tensor.
-  void buildEmbedding(const double* parameters, DirectKineticWorkspace& workspace) const;
+  void buildEmbedding(const double* parameters, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Build scaled query-key logits for one attention block.
-  void buildAttentionLogits(std::size_t block, DirectKineticWorkspace& workspace) const;
+  void buildAttentionLogits(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Normalize one block's attention rows with stable trace-jet softmax.
-  void softmaxForward(std::size_t block, DirectKineticWorkspace& workspace) const;
+  void softmaxForward(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Contract attention probabilities with value features.
-  void buildAttentionContext(std::size_t block, DirectKineticWorkspace& workspace) const;
+  void buildAttentionContext(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Evaluate one complete attention/update/residual block.
   void applyAttentionBlock(const double* parameters,
                            std::size_t block,
-                           DirectKineticWorkspace& workspace) const;
+                           DirectKineticTrunkWorkspace& workspace) const;
 
   /// Build backflow, envelope, and determinant-orbital trace jets.
   void buildOrbitals(const double* parameters, DirectKineticWorkspace& workspace) const;
 
   /// Build the analytic electron-pair cusp value and coordinate traces.
-  double buildCusp(const double* parameters, DirectKineticWorkspace& workspace) const;
+  double buildCusp(const double* parameters, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Build coordinate jets of d log|sum det|/dA from cached determinant factors.
   void buildDeterminantFactors(DirectKineticWorkspace& workspace) const;
@@ -739,27 +856,27 @@ private:
                        std::vector<double>& destination) const;
 
   /// Reverse stable row softmax by replaying one fixed-size row sub-tape.
-  void softmaxReverse(std::size_t block, DirectKineticWorkspace& workspace) const;
+  void softmaxReverse(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Reverse query-key logits into query and key trace jets.
-  void reverseAttentionLogits(std::size_t block, DirectKineticWorkspace& workspace) const;
+  void reverseAttentionLogits(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Reverse attention-value contraction into probabilities and values.
-  void reverseAttentionContext(std::size_t block, DirectKineticWorkspace& workspace) const;
+  void reverseAttentionContext(std::size_t block, DirectKineticTrunkWorkspace& workspace) const;
 
   /// Reverse one attention/update/residual block into its input and parameters.
   void reverseAttentionBlock(const double* parameters,
                              std::size_t block,
-                             DirectKineticWorkspace& workspace,
+                             DirectKineticTrunkWorkspace& workspace,
                              std::vector<double>& destination) const;
 
   /// Reverse the initial feature embedding into its weight response.
-  void reverseEmbedding(DirectKineticWorkspace& workspace,
+  void reverseEmbedding(DirectKineticTrunkWorkspace& workspace,
                         std::vector<double>& destination) const;
 
   /// Reverse the analytic cusp into its two scalar parameter responses.
   void reverseCusp(const double* parameters,
-                   DirectKineticWorkspace& workspace,
+                   DirectKineticTrunkWorkspace& workspace,
                    std::vector<double>& destination) const;
 
   /// Run a complete lifted reverse for the currently seeded root adjoint.
@@ -783,6 +900,7 @@ private:
   std::vector<double> nuclei_;
   std::size_t spin_up_electrons_;
   GeometryBoundary boundary_;
+  DirectKineticPreparation preparation_;
 };
 
 /// Accumulate one complete trace jet into another fixed-size trace jet.
@@ -1069,6 +1187,8 @@ inline void DirectKineticExecutor::productReverseElement(
 inline void DirectKineticExecutor::validateWorkspace(
     const DirectKineticWorkspace& workspace) const
 {
+  if (preparation_ != DirectKineticPreparation::REAL_WAVEFUNCTION)
+    throw std::logic_error("Trunk-only kinetic executor cannot evaluate a real head");
   const auto& shape = plan_.modelShape();
   if (workspace.electrons_ != shape.electrons() || workspace.nuclei_ != shape.nuclei ||
       workspace.determinants_ != shape.determinants ||
@@ -1084,7 +1204,7 @@ inline void DirectKineticExecutor::validateWorkspace(
 
 /// Populate raw molecular features and their learned embedding.
 inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
-                                                  DirectKineticWorkspace& workspace) const
+                                                  DirectKineticTrunkWorkspace& workspace) const
 {
   DirectTraceJetBuffer& raw = workspace.raw_features_;
   raw.clear();
@@ -1189,7 +1309,7 @@ inline void DirectKineticExecutor::buildEmbedding(const double* parameters,
 /// Form one block's scaled query-key products.
 inline void DirectKineticExecutor::buildAttentionLogits(
     std::size_t block,
-    DirectKineticWorkspace& workspace) const
+    DirectKineticTrunkWorkspace& workspace) const
 {
   DirectTraceJetBuffer& logits = workspace.logits_[block];
   const DirectTraceJetBuffer& query = workspace.queries_[block];
@@ -1220,7 +1340,7 @@ inline void DirectKineticExecutor::buildAttentionLogits(
 
 /// Evaluate stable row softmax on primal and contracted derivative planes.
 inline void DirectKineticExecutor::softmaxForward(std::size_t block,
-                                                  DirectKineticWorkspace& workspace) const
+                                                  DirectKineticTrunkWorkspace& workspace) const
 {
   const DirectTraceJetBuffer& logits = workspace.logits_[block];
   DirectTraceJetBuffer& probabilities = workspace.attention_[block];
@@ -1307,7 +1427,7 @@ inline void DirectKineticExecutor::softmaxForward(std::size_t block,
 /// Contract one block's attention probabilities and value features.
 inline void DirectKineticExecutor::buildAttentionContext(
     std::size_t block,
-    DirectKineticWorkspace& workspace) const
+    DirectKineticTrunkWorkspace& workspace) const
 {
   const DirectTraceJetBuffer& probabilities = workspace.attention_[block];
   const DirectTraceJetBuffer& values        = workspace.values_[block];
@@ -1339,7 +1459,7 @@ inline void DirectKineticExecutor::buildAttentionContext(
 inline void DirectKineticExecutor::applyAttentionBlock(
     const double* parameters,
     std::size_t block,
-    DirectKineticWorkspace& workspace) const
+    DirectKineticTrunkWorkspace& workspace) const
 {
   const DirectTraceJetBuffer& input = workspace.features_[block];
   denseForward(input, parameter(parameters, ParameterRole::ATTENTION_QUERY_WEIGHT, block),
@@ -1466,7 +1586,7 @@ inline void DirectKineticExecutor::buildOrbitals(const double* parameters,
 
 /// Evaluate the pair cusp value, gradient lanes, and electron traces.
 inline double DirectKineticExecutor::buildCusp(const double* parameters,
-                                               DirectKineticWorkspace& workspace) const
+                                               DirectKineticTrunkWorkspace& workspace) const
 {
   std::fill(workspace.cusp_gradient_.begin(), workspace.cusp_gradient_.end(), 0.0);
   std::fill(workspace.cusp_laplacian_.begin(), workspace.cusp_laplacian_.end(), 0.0);
@@ -1841,7 +1961,7 @@ inline void DirectKineticExecutor::reverseOrbitals(
 /// Reverse the analytic cusp trace jet into same/opposite-spin parameters.
 inline void DirectKineticExecutor::reverseCusp(
     const double* parameters,
-    DirectKineticWorkspace& workspace,
+    DirectKineticTrunkWorkspace& workspace,
     std::vector<double>& destination) const
 {
   const bool has_same_alpha = plan_.hasParameter(ParameterRole::CUSP_SAME_ALPHA);
@@ -1908,7 +2028,7 @@ inline void DirectKineticExecutor::reverseCusp(
 /// Reverse attention-value contraction for one block.
 inline void DirectKineticExecutor::reverseAttentionContext(
     std::size_t block,
-    DirectKineticWorkspace& workspace) const
+    DirectKineticTrunkWorkspace& workspace) const
 {
   workspace.attention_adjoint_.clear();
   workspace.value_adjoint_.clear();
@@ -1939,7 +2059,7 @@ inline void DirectKineticExecutor::reverseAttentionContext(
 
 /// Reverse stable row softmax through a reusable fixed-size row tape.
 inline void DirectKineticExecutor::softmaxReverse(std::size_t block,
-                                                  DirectKineticWorkspace& workspace) const
+                                                  DirectKineticTrunkWorkspace& workspace) const
 {
   const DirectTraceJetBuffer& logits = workspace.logits_[block];
   workspace.logit_adjoint_.clear();
@@ -2116,7 +2236,7 @@ inline void DirectKineticExecutor::softmaxReverse(std::size_t block,
 /// Reverse scaled query-key products for one attention block.
 inline void DirectKineticExecutor::reverseAttentionLogits(
     std::size_t block,
-    DirectKineticWorkspace& workspace) const
+    DirectKineticTrunkWorkspace& workspace) const
 {
   workspace.query_adjoint_.clear();
   workspace.key_adjoint_.clear();
@@ -2150,7 +2270,7 @@ inline void DirectKineticExecutor::reverseAttentionLogits(
 inline void DirectKineticExecutor::reverseAttentionBlock(
     const double* parameters,
     std::size_t block,
-    DirectKineticWorkspace& workspace,
+    DirectKineticTrunkWorkspace& workspace,
     std::vector<double>& destination) const
 {
   const DirectTraceJetBuffer& input = workspace.features_[block];
@@ -2213,7 +2333,7 @@ inline void DirectKineticExecutor::reverseAttentionBlock(
 
 /// Reverse the initial learned electron embedding.
 inline void DirectKineticExecutor::reverseEmbedding(
-    DirectKineticWorkspace& workspace,
+    DirectKineticTrunkWorkspace& workspace,
     std::vector<double>& destination) const
 {
   double* embedding_response =
@@ -2433,6 +2553,106 @@ inline DirectKineticConstView DirectKineticExecutor::evaluateGradientParameterRe
       throw std::runtime_error(
           "PsiFormer gradient-only kinetic response is non-finite");
   return {workspace.parameter_score_.data(), workspace.parameter_score_.size()};
+}
+
+/// Publish a forward ticket only after every retained feature and cusp plane is finite.
+inline DirectKineticTrunkResultView DirectKineticExecutor::evaluateTrunk(
+    DirectKineticTrunkWorkspace& workspace) const
+{
+  workspace.forward_valid_ = false;
+  workspace.reverse_valid_ = false;
+  ++workspace.reverse_generation_;
+  std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
+  ++workspace.forward_generation_;
+  if (workspace.owner_ != this || parameters_.size() != plan_.parameterCount())
+    throw std::invalid_argument("PsiFormer kinetic trunk workspace owner or parameter extent mismatch");
+  workspace.geometry_.update(GeometryPositionView::interleaved(
+      workspace.electron_positions_.data(), workspace.electrons_));
+  const double* parameters = parameters_.flat_values().data();
+  buildEmbedding(parameters, workspace);
+  for (std::size_t block = 0; block < workspace.blocks_; ++block)
+    applyAttentionBlock(parameters, block, workspace);
+  const double cusp = buildCusp(parameters, workspace);
+  for (const auto* plane : {&workspace.features_.back().value, &workspace.features_.back().gradient,
+                            &workspace.features_.back().laplacian, &workspace.cusp_gradient_,
+                            &workspace.cusp_laplacian_})
+    for (double value : *plane)
+      if (!is_finite_parameter_value(value))
+        throw std::runtime_error("PsiFormer kinetic trunk produced a non-finite jet");
+  if (!is_finite_parameter_value(cusp))
+    throw std::runtime_error("PsiFormer kinetic trunk produced a non-finite cusp");
+  workspace.observed_parameter_version_ = parameters_.version();
+  workspace.forward_valid_ = true;
+  return {&workspace.features_.back(), cusp,
+          {workspace.cusp_gradient_.data(), workspace.cusp_gradient_.size()},
+          {workspace.cusp_laplacian_.data(), workspace.cusp_laplacian_.size()},
+          &workspace.geometry_, workspace.electron_positions_.data(),
+          &workspace, parameters_.version(), workspace.forward_generation_};
+}
+
+/// Consume two caller-owned seed jets and preserve all forward values and backing identities.
+inline DirectKineticConstView DirectKineticExecutor::reverseTrunk(
+    DirectKineticTrunkWorkspace& workspace, const DirectKineticTrunkResultView& ticket,
+    const DirectTraceJetBuffer& feature_seeds, const DirectTraceJetBuffer& cusp_seeds) const
+{
+  workspace.reverse_valid_ = false;
+  ++workspace.reverse_generation_;
+  std::fill(workspace.parameter_score_.begin(), workspace.parameter_score_.end(), 0.0);
+  if (workspace.owner_ != this || !workspace.forward_valid_ || ticket.workspace != &workspace ||
+      ticket.features != &workspace.features_.back() ||
+      ticket.forward_generation != workspace.forward_generation_ ||
+      ticket.parameter_version != parameters_.version() ||
+      workspace.observed_parameter_version_ != parameters_.version() ||
+      parameters_.size() != plan_.parameterCount())
+    throw std::invalid_argument("PsiFormer kinetic trunk reverse requires a current owner/version ticket");
+
+  // Seeds must be caller-owned: clearing adjoints must not destroy an aliased seed plane.
+  const auto validate = [](const DirectTraceJetBuffer& seed, const DirectTraceJetBuffer& shape) {
+    if (seed.value.size() != shape.value.size() || seed.gradient.size() != shape.gradient.size() ||
+        seed.laplacian.size() != shape.laplacian.size())
+      throw std::invalid_argument("PsiFormer kinetic trunk seed extent mismatch");
+    for (const auto* plane : {&seed.value, &seed.gradient, &seed.laplacian})
+      for (double value : *plane)
+        if (!is_finite_parameter_value(value))
+          throw std::invalid_argument("PsiFormer kinetic trunk seeds must be finite");
+  };
+  validate(feature_seeds, workspace.features_.back());
+  validate(cusp_seeds, workspace.root_adjoint_);
+  if (&feature_seeds == &workspace.feature_adjoint_a_ ||
+      &feature_seeds == &workspace.feature_adjoint_b_ || &cusp_seeds == &workspace.root_adjoint_)
+    throw std::invalid_argument("PsiFormer kinetic trunk seeds must not alias adjoints");
+
+  // Every pass starts from zero scratch; the immutable Q/K/V and attention tape is only read.
+  for (auto* jet : {&workspace.feature_adjoint_a_, &workspace.feature_adjoint_b_,
+                    &workspace.query_adjoint_, &workspace.key_adjoint_, &workspace.value_adjoint_,
+                    &workspace.logit_adjoint_, &workspace.attention_adjoint_,
+                    &workspace.context_adjoint_, &workspace.residual_adjoint_,
+                    &workspace.hidden_adjoint_, &workspace.hidden_pre_adjoint_,
+                    &workspace.update_adjoint_, &workspace.update_pre_adjoint_,
+                    &workspace.row_exponential_, &workspace.row_exponential_adjoint_,
+                    &workspace.row_sum_, &workspace.row_reciprocal_, &workspace.row_sum_adjoint_,
+                    &workspace.row_reciprocal_adjoint_, &workspace.root_adjoint_})
+    jet->clear();
+  const auto copy = [](const DirectTraceJetBuffer& source, DirectTraceJetBuffer& destination) {
+    std::copy(source.value.begin(), source.value.end(), destination.value.begin());
+    std::copy(source.gradient.begin(), source.gradient.end(), destination.gradient.begin());
+    std::copy(source.laplacian.begin(), source.laplacian.end(), destination.laplacian.begin());
+  };
+  copy(feature_seeds, workspace.feature_adjoint_a_);
+  copy(cusp_seeds, workspace.root_adjoint_);
+  const double* parameters = parameters_.flat_values().data();
+  for (std::size_t block = workspace.blocks_; block-- > 0;)
+    reverseAttentionBlock(parameters, block, workspace, workspace.parameter_score_);
+  reverseEmbedding(workspace, workspace.parameter_score_);
+  reverseCusp(parameters, workspace, workspace.parameter_score_);
+  // Restore stable ping-pong buffer identities even with an odd number of attention blocks.
+  if (workspace.blocks_ % 2 != 0)
+    std::swap(workspace.feature_adjoint_a_, workspace.feature_adjoint_b_);
+  for (double value : workspace.parameter_score_)
+    if (!is_finite_parameter_value(value))
+      throw std::runtime_error("PsiFormer kinetic trunk reverse produced a non-finite response");
+  workspace.reverse_valid_ = true;
+  return workspace.trunkParameterResponse();
 }
 
 } // namespace pf

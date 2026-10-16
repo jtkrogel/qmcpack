@@ -985,6 +985,27 @@ inline std::size_t kineticWorkspaceStorageRequirement(const PsiFormerStorageShap
   return bytes;
 }
 
+/// Count only the retained real NN/cusp tape and one real parameter scratch vector.
+inline std::size_t kineticTrunkWorkspaceStorageRequirement(const PsiFormerStorageShape& shape)
+{
+  const char* message = "PsiFormer kinetic trunk storage extent overflowed";
+  const std::size_t square = checkedStorageProduct(shape.electrons, shape.electrons, message);
+  const std::size_t gradients = checkedStorageProduct(3, shape.electrons, message);
+  const std::size_t orbitals = checkedStorageProduct(shape.determinants, square, message);
+  std::size_t removed = checkedStorageProduct(
+      7, traceJetStorageRequirement(orbitals, gradients, shape.electrons), message);
+  addStorageBytes(removed, determinantStorageRequirement(
+      shape.determinants, shape.electrons, gradients, shape.electrons), message);
+  std::size_t plain = checkedStorageProduct(10, shape.electrons, message);
+  addStorageBytes(plain, shape.parameter_count, message);
+  addStorageBytes(plain, checkedStorageProduct(3, square, message), message);
+  addStorageBytes(removed, checkedStorageBytes<double>(plain, message), message);
+  const std::size_t complete = kineticWorkspaceStorageRequirement(shape);
+  if (removed > complete)
+    throw std::logic_error("PsiFormer kinetic trunk accounting underflow");
+  return complete - removed;
+}
+
 /// Return the packed dense-kernel arena elements required by one spatial tile.
 inline std::size_t spatialPackedElements(const PsiFormerStorageShape& shape,
                                          std::size_t tile,
