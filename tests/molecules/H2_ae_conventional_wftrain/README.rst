@@ -87,3 +87,24 @@ against the original definition, and require exact initialized split restart.
 It also rejects a missing required dataset, unsupported driver and (for ECP)
 changed physical PP bytes. This is deterministic energy-trace evidence, not a
 native gradient oracle or convergence benchmark.
+
+Bounded original/new CPU comparison
+-----------------------------------
+
+``check_sj_training.py qmcpack wftrain_compare.xml --old-new`` compares two
+iterations of the original native batched ``linear/OneShiftOnly`` route
+(``linear_sj.xml``) with new ``wf_train/Adam``. Both full inline recipes use the
+same H2 fixed-SPO/J1/J2 model, eight active coordinates, four walkers and 32
+observed samples per update. Actual native counts are checked, not inferred from
+the old ``samples`` setting. Only the first single-rank/one-thread CPU profile is
+qualified here; each application has a 180-second cap within 300 seconds total.
+
+Both routes must produce finite physical output and changed active states while
+retaining fixed orbitals. Each final native export (old VP HDF/new RI HDF) is
+loaded in fresh ordinary VMC and compared against an explicit full-precision
+accepted-parameter XML reference with the same seed. Old printed XML is checked
+at its serialization precision. The evidence directory retains generated full
+inputs, logs, executable/input hashes, source, elapsed time and GNU-time
+per-process maximum RSS; the latter is not an aggregate memory bound. Different
+algorithms need not yield equal updates, better energies, or equal-quality
+timings. This short integration check does not rank convergence or efficiency.

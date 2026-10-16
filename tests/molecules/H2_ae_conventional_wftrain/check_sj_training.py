@@ -2,12 +2,17 @@
 """Bounded native SJ update/inference regression; retain all evidence in a temp dir."""
 import argparse
 import csv
+import hashlib
+import json
 import math
 import os
 import shutil
+import signal
+import re
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 import h5py
@@ -110,6 +115,16 @@ def apply_model_reference(tree, model):
             collection.append(spo)
 
 
+def apply_legacy_reference(tree, vp_file):
+    """Map legacy full-precision VP coordinates into a separate XML oracle."""
+    saved = datasets(vp_file)
+    names = [text_value(name) for name in saved["name_value_lists/parameter_names"].reshape(-1)]
+    values = saved["name_value_lists/parameter_values"].reshape(-1)
+    active = dict(zip(names, values))
+    for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
+        node.text = " ".join(str(active[f"{node.get('id')}_{i}"]) for i in range(len(node.text.split())))
+
+
 def vmc_physical_trace(directory):
     """Read deterministic scalar energy/weight traces, excluding elapsed CPU."""
     path = directory / "sj.s000.scalar.dat"
@@ -130,6 +145,8 @@ def main():
     parser.add_argument("--preflight", action="store_true", help="also check unsupported model/optimizer rejection")
     parser.add_argument("--model-import", action="store_true",
                         help="export/import ordinary VMC, fresh training, re-export and exact restart")
+    parser.add_argument("--old-new", action="store_true",
+                        help="bounded original batched OneShiftOnly versus new Adam integration comparison")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -156,13 +173,57 @@ def main():
     if args.model_import and any((args.profile_only, args.optimizer_screen, args.family_screen,
                                   args.restart, args.preflight)):
         parser.error("--model-import selects its own bounded workflow")
+    if args.old_new and (args.ranks != 1 or any((args.model_import, args.profile_only, args.optimizer_screen,
+                                               args.family_screen, args.restart, args.preflight))):
+        parser.error("--old-new selects its own single-rank bounded workflow")
     executable = args.executable.resolve()
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
+    deadline = time.monotonic() + 300 if args.old_new else None
+
+    def launch(directory):
+        environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
+        command = [str(executable), "run.xml"]
+        if args.ranks > 1:
+            command = [args.mpiexec, "-np", str(args.ranks)] + command
+        if args.old_new:
+            command = ["/usr/bin/time", "-v", "-o", "resource_time.txt"] + command
+        timeout = 180 if deadline is None else min(180, deadline - time.monotonic())
+        assert timeout > 0, (directory, "whole-checker 300s cap reached")
+        started = time.monotonic()
+        with (directory / "run.log").open("w") as log:
+            process = subprocess.Popen(command, cwd=directory, env=environment, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # GNU time is a parent of QMCPACK: stop this explicitly owned
+                # group, not just the wrapper while leaving the application live.
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                last = (directory / "run.log").read_text()[-2000:]
+                raise AssertionError((directory, "process/whole-checker time cap; last native output", last))
+        result = subprocess.CompletedProcess(command, code)
+        text = (directory / "run.log").read_text()
+        if args.old_new:
+            source = re.search(r"Last git commit:\s*(\S+)", text)
+            (directory / "execution.json").write_text(json.dumps({
+                "elapsed_seconds": time.monotonic() - started, "exit_code": result.returncode,
+                "native_source": source.group(1) if source else "unreported", "command": command,
+                "environment": {name: environment.get(name) for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS")},
+                "input_sha256": hashlib.sha256((directory / "run.xml").read_bytes()).hexdigest(),
+                "memory_scope": "resource_time.txt per-process maxRSS, not aggregate peak"
+            }, indent=2) + "\n")
+        return result, text
 
     def run(label, *, optimizer="adam", inference=True, iterations=2, restart=None, mutate=None, reject=False,
-            samples_per_rank=4, require_committed=True, parameter_file=None, vmc=False, reference_file=None):
+            samples_per_rank=4, require_committed=True, parameter_file=None, vmc=False, reference_file=None,
+            legacy_vp=None, legacy_reference=None):
         directory = work / label
         directory.mkdir()
         tree = ET.parse(fixture)
@@ -208,6 +269,10 @@ def main():
             tree.find("wavefunction").set("parameter_file", str(parameter_file.resolve()))
         if reference_file is not None:
             apply_model_reference(tree, reference_file)
+        if legacy_vp is not None:
+            ET.SubElement(tree.find("wavefunction"), "override_variational_parameters", href=str(legacy_vp))
+        if legacy_reference is not None:
+            apply_legacy_reference(tree, legacy_reference)
         if vmc:
             qmc.set("method", "vmc")
             qmc.remove(training)
@@ -223,14 +288,7 @@ def main():
             else:
                 assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
         tree.write(directory / "run.xml")
-        environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
-        command = [str(executable), "run.xml"]
-        if args.ranks > 1:
-            command = [args.mpiexec, "-np", str(args.ranks)] + command
-        with (directory / "run.log").open("w") as log:
-            result = subprocess.run(command, cwd=directory, env=environment,
-                                    stdout=log, stderr=subprocess.STDOUT, timeout=180)
-        text = (directory / "run.log").read_text()
+        result, text = launch(directory)
         if reject:
             assert result.returncode != 0, (directory, text[-4000:])
             assert reject in text, (directory, reject, text[-4000:])
@@ -385,7 +443,77 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("adam")
+    adam = run("adam", samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
+    if args.old_new:
+        old_fixture = fixture.with_name("linear_sj.xml")
+        old_tree = ET.parse(old_fixture)
+        new_tree = ET.parse(fixture)
+        for tag in ("random", "wavefunction", "hamiltonian"):
+            assert ET.tostring(old_tree.find(tag)) == ET.tostring(new_tree.find(tag)), tag
+        assert [ET.tostring(node) for node in old_tree.findall("particleset")] == [
+            ET.tostring(node) for node in new_tree.findall("particleset")]
+        original = work / "original_linear"
+        original.mkdir()
+        old_tree.find("project").set("id", "sj")
+        old_tree.write(original / "run.xml")
+        result, text = launch(original)
+        assert result.returncode == 0, (original, text[-6000:])
+        assert "Building overlap and Hamiltonian matrices" in text and "Solving eigenvalue problem" in text
+        observed = [int(value) for value in re.findall(r"samples per rank\s*=\s*(\d+)", text)]
+        assert observed and all(value == 32 for value in observed), (original, observed)
+        optimized = sorted(original.glob("sj.s*.opt.xml"))
+        assert len(optimized) == 2, (original, optimized)
+        initial = {f"{node.get('id')}_{i}": float(value)
+                   for node in old_tree.findall("wavefunction/jastrow/correlation/coefficients")
+                   for i, value in enumerate(node.text.split())}
+        assert len(initial) == 8
+        previous = initial
+        old_samples = []
+        for xml in optimized:
+            vp = xml.with_name(xml.name.replace(".opt.xml", ".vp.h5"))
+            values = datasets(vp)
+            names = [text_value(name) for name in values["name_value_lists/parameter_names"].reshape(-1)]
+            active = dict(zip(names, values["name_value_lists/parameter_values"].reshape(-1)))
+            assert active.keys() == initial.keys() and all(math.isfinite(value) for value in active.values()), vp
+            assert any(active[name] != previous[name] for name in active), vp
+            previous = active
+            serialized = ET.parse(xml)
+            for node in serialized.findall("wavefunction/jastrow/correlation/coefficients"):
+                np.testing.assert_allclose([float(value) for value in node.text.split()],
+                    [active[f"{node.get('id')}_{i}"] for i in range(len(node.text.split()))],
+                    rtol=5e-9, atol=5e-10, err_msg="legacy printed XML precision")
+            fixed = old_tree.find(".//sposet/coefficient")
+            retained = serialized.find(".//sposet/coefficient")
+            assert retained is not None and retained.attrib == fixed.attrib
+            np.testing.assert_array_equal([float(value) for value in retained.text.split()],
+                                          [float(value) for value in fixed.text.split()])
+            scalar = xml.with_name(xml.name.replace(".opt.xml", ".scalar.dat"))
+            header = next(line.split()[1:] for line in scalar.read_text().splitlines() if line.startswith("#"))
+            data = np.loadtxt(scalar, ndmin=2)
+            assert data.shape[0] == 8 and np.isfinite(data).all(), scalar
+            old_samples.append(int(data[:, header.index("BlockWeight")].sum()))
+        assert old_samples == [32, 32], old_samples
+        old_final = optimized[-1].with_name(optimized[-1].name.replace(".opt.xml", ".vp.h5"))
+        old_loaded = run("old_export_vmc", vmc=True, legacy_vp=old_final)
+        old_reference = run("old_explicit_vmc", vmc=True, legacy_reference=old_final)
+        np.testing.assert_array_equal(vmc_physical_trace(old_loaded), vmc_physical_trace(old_reference))
+        new_final = sorted((adam / "sj.s000.training").rglob("*.parameters.h5"))[-1]
+        new_loaded = run("new_export_vmc", vmc=True, parameter_file=new_final)
+        new_reference = run("new_explicit_vmc", vmc=True, reference_file=new_final)
+        np.testing.assert_array_equal(vmc_physical_trace(new_loaded), vmc_physical_trace(new_reference))
+        digest = hashlib.sha256()
+        with executable.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        (work / "comparison.json").write_text(json.dumps({
+            "executable_sha256": digest.hexdigest(), "original": "batched linear OneShiftOnly",
+            "new": "WFTrain Adam", "active_parameters": 8, "updates_each": 2,
+            "old_observed_samples_each": old_samples, "new_observed_samples_each": [int(row["samples"]) for row in history(adam)],
+            "initial_ansatz_equal": True, "reusable_exports_equal_to_explicit_physical_reference": True,
+            "scope": "finite changed states and reusable inference; no equal updates/convergence/equal-quality timing claim"
+        }, indent=2) + "\n")
+        print("PASS: original OneShiftOnly/new Adam finite changed states, observed samples and reusable native VMC exports")
+        return
     if args.model_import:
         exported = sorted((adam / "sj.s000.training").rglob("*.parameters.h5"))[-1]
         imported_vmc = run("imported_vmc", vmc=True, parameter_file=exported)
