@@ -23,6 +23,7 @@
  */
 
 #include "QMCDriverFactory.h"
+#include <exception>
 #include <queue>
 #include "QMCDrivers/MCPopulation.h"
 #include "Utilities/qmc_common.h"
@@ -38,6 +39,7 @@
 #include "VMC/VMCBatched.h"
 #include "WFTrain/WFTrainBatched.h"
 #include "WFTrain/WFTrainDriverInput.h"
+#include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "DMC/DMCDriverInput.h"
 #include "DMC/DMCBatched.h"
 #include "QMCDrivers/WFOpt/QMCFixedSampleLinearOptimize.h"
@@ -242,6 +244,8 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     for (const auto& name_pair : PsiHamNamePairReader::readMultiplePairs(cur))
     {
       multi_psi.emplace_back(&getPsi(name_pair.first));
+      if (wavefunction_pool.getParameterFileRequest(multi_psi.back()->getName()))
+        throw UniformCommunicateError("wavefunction parameter_file does not support CSVMC or multiple selected systems");
 #ifdef QMC_COMPLEX
       if (selectedComplexProfile(*multi_psi.back()))
         throw UniformCommunicateError("Complex PsiFormer selected-system admission does not support CSVMC");
@@ -258,6 +262,49 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
     auto& primaryPsi = getPsi(one_pair ? one_pair->first : "");
     // get primaryH
     auto& primaryH = getHam(one_pair ? one_pair->second : "");
+    if (const auto* request = wavefunction_pool.getParameterFileRequest(primaryPsi.getName()))
+    {
+      // Defer loading until physical/PP identity exists, but finish before any
+      // estimator/population construction can clone or acquire model resources.
+      if (das.new_run_type != QMCRunType::VMC_BATCH && das.new_run_type != QMCRunType::WF_TRAIN_BATCH)
+        throw UniformCommunicateError("wavefunction parameter_file supports only CPU batched VMC and WFTrain");
+      if (!primaryPsi.extractStructuredParameterProviders().empty() || qmc_system.isSpinor() ||
+          qmc_system.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
+        throw UniformCommunicateError("wavefunction parameter_file requires a qualified conventional CPU model");
+#ifdef QMC_COMPLEX
+      throw UniformCommunicateError("wavefunction parameter_file currently requires a real CPU build");
+#endif
+      if (particle_pool.getParticleSet(request->target) != &qmc_system)
+        throw UniformCommunicateError("wavefunction parameter_file selected a different electron target");
+      if (request->imported_hamiltonian && request->imported_hamiltonian != &primaryH)
+        throw UniformCommunicateError("wavefunction parameter_file cannot reuse an imported model with another Hamiltonian");
+      if (!request->imported_hamiltonian)
+      {
+        // Fixed inference-loader ceilings avoid adding optimizer controls to VMC.
+        const wftrain::LegacyWaveFunctionAdapterOptions limits{65536, 4 * 1024 * 1024, 256};
+        std::unique_ptr<wftrain::TrainingWaveFunctionBinding> binding;
+        std::exception_ptr preparation_failure;
+        try
+        {
+          binding = std::make_unique<wftrain::TrainingWaveFunctionBinding>(primaryPsi, qmc_system, limits, *comm);
+          binding->setHamiltonian(primaryH);
+        }
+        catch (...)
+        {
+          preparation_failure = std::current_exception();
+        }
+        int failed = preparation_failure ? 1 : 0;
+        comm->allreduce(failed);
+        if (failed)
+        {
+          if (preparation_failure)
+            std::rethrow_exception(preparation_failure);
+          throw UniformCommunicateError("Conventional parameter_file preparation failed on another rank");
+        }
+        binding->importModel(request->path);
+        wavefunction_pool.markParameterFileImported(primaryPsi.getName(), primaryH);
+      }
+    }
 #ifdef QMC_COMPLEX
     requireSelectedComplexCoulombSystem(primaryPsi, primaryH, qmc_system);
     if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&

@@ -29,6 +29,7 @@ namespace qmcplusplus
 {
 class ParticleSetPool;
 class ParticleSet;
+class QMCHamiltonian;
 
 extern template class ObjectPool<TrialWaveFunction>;
 
@@ -52,6 +53,21 @@ public:
   ~WaveFunctionPool();
 
   bool put(xmlNodePtr cur);
+
+  /** Defer model state loading until the selected physical Hamiltonian exists.
+   * This is one-shot model initialization, not optimizer/sampler restart.
+   */
+  struct ParameterFileRequest
+  {
+    std::string path;
+    std::string target;
+    const QMCHamiltonian* imported_hamiltonian = nullptr;
+  };
+
+  const ParameterFileRequest* getParameterFileRequest(const std::string& name) const;
+
+  /// Record successful publication without reopening/reapplying on later sections.
+  void markParameterFileImported(const std::string& name, const QMCHamiltonian& hamiltonian);
 
   /** look up wavefunction by name
    * @param pname wavefunction name to look up
@@ -81,6 +97,8 @@ private:
    * is used as an input object for the evaluations.
    */
   ParticleSetPool& ptcl_pool_;
+
+  std::map<std::string, ParameterFileRequest> parameter_file_requests_;
 };
 } // namespace qmcplusplus
 #endif

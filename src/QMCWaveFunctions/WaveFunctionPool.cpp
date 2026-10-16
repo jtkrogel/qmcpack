@@ -35,12 +35,13 @@ WaveFunctionPool::~WaveFunctionPool() = default;
 
 bool WaveFunctionPool::put(xmlNodePtr cur)
 {
-  std::string target("e"), psi_name("psi0");
+  std::string target("e"), psi_name("psi0"), parameter_file;
   OhmmsAttributeSet pAttrib;
   pAttrib.add(target, "target");
   pAttrib.add(target, "ref");
   pAttrib.add(psi_name, "id");
   pAttrib.add(psi_name, "name");
+  pAttrib.add(parameter_file, "parameter_file");
   pAttrib.put(cur);
 
   ParticleSet* qp = ptcl_pool_.getParticleSet(target);
@@ -57,10 +58,39 @@ bool WaveFunctionPool::put(xmlNodePtr cur)
                                   "\" already exists in the wavefunction pool. Please rename this wavefunction node.");
 
   WaveFunctionFactory psiFactory(*qp, ptcl_pool_.getPool(), myComm);
-  auto psi = psiFactory.buildTWF(cur, runtime_options_, psi_name);
+  std::unique_ptr<TrialWaveFunction> psi;
+  if (xmlHasProp(cur, BAD_CAST "parameter_file"))
+  {
+    if (parameter_file.empty())
+      throw UniformCommunicateError("wavefunction parameter_file must name a conventional model export");
+    // Artifact location is routing metadata, not part of the inline physical
+    // definition stored in the wavefunction and compared with exported identity.
+    std::unique_ptr<xmlNode, decltype(&xmlFreeNode)> definition(xmlCopyNode(cur, 1), xmlFreeNode);
+    if (!definition)
+      throw std::bad_alloc();
+    xmlUnsetProp(definition.get(), BAD_CAST "parameter_file");
+    psi = psiFactory.buildTWF(definition.get(), runtime_options_, psi_name);
+    parameter_file_requests_.emplace(psi_name, ParameterFileRequest{parameter_file, target, nullptr});
+  }
+  else
+    psi = psiFactory.buildTWF(cur, runtime_options_, psi_name);
   add(psi->getName(), std::move(psi));
   app_log() << "  Added \"" << psi_name << "\" to the wavefunction pool" << std::endl;
   return true;
+}
+
+const WaveFunctionPool::ParameterFileRequest* WaveFunctionPool::getParameterFileRequest(const std::string& name) const
+{
+  const auto request = parameter_file_requests_.find(name);
+  return request == parameter_file_requests_.end() ? nullptr : &request->second;
+}
+
+void WaveFunctionPool::markParameterFileImported(const std::string& name, const QMCHamiltonian& hamiltonian)
+{
+  const auto request = parameter_file_requests_.find(name);
+  if (request == parameter_file_requests_.end() || request->second.imported_hamiltonian)
+    throw std::logic_error("Conventional parameter_file import has no pending request");
+  request->second.imported_hamiltonian = &hamiltonian;
 }
 
 OptionalRef<TrialWaveFunction> WaveFunctionPool::getWaveFunction(const std::string& pname)
