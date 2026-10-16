@@ -70,14 +70,53 @@ __global__ void pack(std::size_t count, const double* envelope, const double* re
     fail(status, index);
 }
 
+/// Solve scaled LU columns using its final row permutation, then restore A's scale.
+__device__ bool inverseFromLu(const cuDoubleComplex* a, std::size_t n, double scale,
+    const std::size_t* permutation, cuDoubleComplex* inverse, cuDoubleComplex* solve)
+{
+  for (std::size_t column = 0; column < n; ++column)
+  {
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      auto value = make_cuDoubleComplex(permutation[i] == column ? 1 : 0, 0);
+      for (std::size_t j = 0; j < i; ++j)
+        value = QMC_PF_COMPLEX_SUB(value, QMC_PF_COMPLEX_MUL(a[i * n + j], solve[j]));
+      if (!finite(value))
+        return false;
+      solve[i] = value;
+    }
+    for (std::size_t i = n; i-- > 0;)
+    {
+      auto value = solve[i];
+      for (std::size_t j = i + 1; j < n; ++j)
+        value = QMC_PF_COMPLEX_SUB(value, QMC_PF_COMPLEX_MUL(a[i * n + j], inverse[j * n + column]));
+      inverse[i * n + column] = QMC_PF_COMPLEX_DIV(value, a[i * n + i]);
+      if (!finite(inverse[i * n + column]))
+        return false;
+    }
+  }
+  for (std::size_t i = 0; i < n * n; ++i)
+  {
+    inverse[i] = make_cuDoubleComplex(cuCreal(inverse[i]) / scale, cuCimag(inverse[i]) / scale);
+    if (!finite(inverse[i]))
+      return false;
+  }
+  return true;
+}
+
 /// Serial-per-channel scaled partial-pivot LU; zero pivots are singular, not errors.
 __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* matrices,
-    ComplexValueChannel* metadata, std::uint64_t* status)
+    ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve)
 {
   const auto channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= channels)
     return;
   auto* a = matrices + channel * n * n;
+  auto* perm = permutation ? permutation + channel * n : nullptr;
+  if (perm)
+    for (std::size_t i = 0; i < n; ++i)
+      perm[i] = i;
   metadata[channel] = {make_cuDoubleComplex(0, 0), nodeLog(), 1};
   double scale = 0;
   for (std::size_t i = 0; i < n * n; ++i)
@@ -120,6 +159,12 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
         a[pivot * n + j] = temporary;
       }
       phase = make_cuDoubleComplex(-cuCreal(phase), -cuCimag(phase));
+      if (perm)
+      {
+        const auto temporary = perm[k];
+        perm[k] = perm[pivot];
+        perm[pivot] = temporary;
+      }
     }
     phase = QMC_PF_COMPLEX_MUL(phase, make_cuDoubleComplex(cuCreal(a[k * n + k]) / magnitude,
                                              cuCimag(a[k * n + k]) / magnitude));
@@ -161,12 +206,14 @@ __global__ void factor(std::size_t channels, std::size_t n, cuDoubleComplex* mat
     return;
   }
   metadata[channel] = {make_cuDoubleComplex(cuCreal(phase) / magnitude, cuCimag(phase) / magnitude), log_abs, 0};
+  if (inverse && !inverseFromLu(a, n, scale, perm, inverse + channel * n * n, solve + channel * n))
+    fail(status, channel);
 }
 
 /// Mix channels at a common shift; node outputs never require logarithmic derivatives.
 __global__ void reduce(std::size_t batch, std::size_t determinants, const ComplexValueChannel* channels,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
-    const double* cusp, ComplexValueResult* result, std::uint64_t* status)
+    const double* cusp, ComplexValueResult* result, std::uint64_t* status, std::size_t cusp_stride)
 {
   const auto configuration = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (configuration >= batch)
@@ -215,7 +262,7 @@ __global__ void reduce(std::size_t batch, std::size_t determinants, const Comple
         if (pair.radius == 0)
           return;
       }
-  const double log_abs = shift + log(magnitude) + cusp[configuration];
+  const double log_abs = shift + log(magnitude) + cusp[configuration * cusp_stride];
   if (!device_math::isFiniteBinary64(log_abs))
   {
     fail(status, configuration);
@@ -249,10 +296,11 @@ Error launchComplexValueEnvelopes(Stream stream, OpenOrbitalJetLayout layout, pe
     const double* positions, const double* nuclei, const double* pi_up, const double* pi_down,
     const double* zeta_up, const double* zeta_down, double* envelope, std::uint64_t* status)
 {
-  if (layout.features.mode != SpatialJetMode::VALUE_ONLY || !positions || !nuclei || !pi_up || !pi_down ||
+  if ((layout.features.mode != SpatialJetMode::VALUE_ONLY && layout.features.mode != SpatialJetMode::FULL_VGL) ||
+      !positions || !nuclei || !pi_up || !pi_down ||
       !zeta_up || !zeta_down || !envelope || !status)
     throw std::invalid_argument("Complex VALUE envelope input is invalid");
-  envelopes<<<blocks(spatialJetSpanElements(layout.orbitals)), 128, 0, stream>>>(
+  envelopes<<<blocks(layout.features.configuration_count * layout.orbitals.element_count), 128, 0, stream>>>(
       layout, cell, positions, nuclei, pi_up, pi_down, zeta_up, zeta_down, envelope, status);
   return launched();
 }
@@ -269,23 +317,25 @@ Error launchComplexValuePack(Stream stream, std::size_t count, const double* env
 
 /// Factor the sole complex matrix buffer after its head epoch is consumed.
 Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t n,
-    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status)
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse, std::size_t* permutation, cuDoubleComplex* solve)
 {
-  if (!n || !matrix || !metadata || !status)
+  if (!n || !matrix || !metadata || !status || bool(inverse) != bool(permutation) || bool(inverse) != bool(solve))
     throw std::invalid_argument("Complex VALUE factor storage/size is invalid");
-  factor<<<blocks(channels), 128, 0, stream>>>(channels, n, matrix, metadata, status);
+  factor<<<blocks(channels), 128, 0, stream>>>(channels, n, matrix, metadata, status, inverse, permutation, solve);
   return launched();
 }
 
 /// Publish only the core amplitude and numerical channel diagnostics.
 Error launchComplexValueReduce(Stream stream, std::size_t batch, std::size_t determinants,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
-    const ComplexValueChannel* metadata, const double* cusp, ComplexValueResult* result, std::uint64_t* status)
+    const ComplexValueChannel* metadata, const double* cusp, ComplexValueResult* result, std::uint64_t* status,
+    std::size_t cusp_stride)
 {
-  if (!determinants || !electrons || spin_up > electrons || !positions || !metadata || !cusp || !result || !status)
+  if (!determinants || !electrons || spin_up > electrons || !positions || !metadata || !cusp || !result || !status || !cusp_stride)
     throw std::invalid_argument("Complex VALUE reduction input is invalid");
   reduce<<<blocks(batch), 128, 0, stream>>>(batch, determinants, metadata,
-      electrons, spin_up, cell, positions, cusp, result, status);
+      electrons, spin_up, cell, positions, cusp, result, status, cusp_stride);
   return launched();
 }
 } // namespace qmcplusplus::psiformer::device

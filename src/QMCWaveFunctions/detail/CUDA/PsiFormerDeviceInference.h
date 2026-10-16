@@ -562,6 +562,7 @@ private:
   friend class PreparedDeviceMetropolis;
   friend class PreparedDeviceKineticReverse;
   friend class PreparedDeviceComplexValue;
+  friend class PreparedDeviceComplexSpatial;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -584,11 +585,11 @@ private:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
-    if (real_trunk_only && (mode_ != SpatialJetMode::VALUE_ONLY || retain_score_tape || retain_spatial_tape ||
+    if (real_trunk_only && (retain_score_tape || retain_spatial_tape ||
         retained_targets_ || target_preparation_.max_targets || environment.boundary != BoundaryCondition::PERIODIC ||
         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
-      throw std::invalid_argument("Private real trunk preparation requires the numerical paired VALUE profile");
+      throw std::invalid_argument("Private real trunk preparation requires the numerical paired profile");
     if (batch_ == 0 ||
         environment.parameter_scalar_domain != ScalarDomain::REAL ||
         environment.compute_scalar_domain != ScalarDomain::REAL ||
@@ -676,7 +677,7 @@ private:
       for (DeviceBuffer<double>* buffer : {&term_phase_, &term_log_, &scaled_, &normalized_})
         buffer->reserve(factors_.capacity());
     }
-    if (mode_ == SpatialJetMode::FULL_VGL)
+    if (mode_ == SpatialJetMode::FULL_VGL && !real_trunk_only)
     {
       matrix_product_.reserve(product(batch_, product(ne_, ne_)));
       det_gradient_.reserve(product(batch_, gradient_lanes_));

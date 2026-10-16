@@ -39,13 +39,15 @@ Error launchComplexValueEnvelopes(Stream stream, OpenOrbitalJetLayout layout, pe
 Error launchComplexValuePack(Stream stream, std::size_t count, const double* envelope,
     const double* projected_real, const double* projected_imag, cuDoubleComplex* matrix, std::uint64_t* status);
 
-/// Destroy the private head view by factoring its matrices in place, without inverse scratch.
+/// Factor the private head in place, optionally preparing admitted inverse/solve scratch.
 Error launchComplexValueFactor(Stream stream, std::size_t channels, std::size_t n,
-    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status);
+    cuDoubleComplex* matrix, ComplexValueChannel* metadata, std::uint64_t* status,
+    cuDoubleComplex* inverse = nullptr, std::size_t* permutation = nullptr, cuDoubleComplex* solve = nullptr);
 
 /// Compensate both Cartesian components at one log shift; exact cancellation is a valid node.
 Error launchComplexValueReduce(Stream stream, std::size_t batch, std::size_t determinants,
     std::size_t electrons, std::size_t spin_up, periodic_geometry::Cell cell, const double* positions,
-    const ComplexValueChannel* metadata, const double* cusp, ComplexValueResult* result, std::uint64_t* status);
+    const ComplexValueChannel* metadata, const double* cusp, ComplexValueResult* result, std::uint64_t* status,
+    std::size_t cusp_stride = 1);
 } // namespace qmcplusplus::psiformer::device
 #endif

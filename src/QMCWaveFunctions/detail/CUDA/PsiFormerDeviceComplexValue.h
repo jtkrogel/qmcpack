@@ -15,16 +15,19 @@ struct ComplexValueCost
   std::size_t trunk_bytes, device_bytes, host_bytes, matrices;
 };
 
-/// Count private VALUE trunk plus40M head/32BD channel/48B result/scalar status.
-inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch)
+namespace complex_detail
+{
+/// Count the shared head-free real trunk and mixed head for one admitted jet mode.
+inline ComplexValueCost baseCost(const PsiFormerExecutionPlan& plan, std::size_t batch, SpatialJetMode mode)
 {
   const auto& shape = plan.modelShape();
   const auto& env = plan.environment();
-  if (!batch || env.boundary != BoundaryCondition::PERIODIC || !env.fixed_nuclei ||
+  if (!batch || (mode != SpatialJetMode::VALUE_ONLY && mode != SpatialJetMode::FULL_VGL) ||
+      env.boundary != BoundaryCondition::PERIODIC || !env.fixed_nuclei ||
       env.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
       env.parameter_scalar_domain != ScalarDomain::REAL || env.compute_scalar_domain != ScalarDomain::REAL ||
       env.amplitude_scalar_domain != ScalarDomain::COMPLEX)
-    throw std::invalid_argument("Numerical complex VALUE requires fixed-ion paired-real periodic FULL/G-free metadata");
+    throw std::invalid_argument("Numerical paired jets require fixed-ion real-trunk periodic FULL/G-free metadata");
   const auto mul = [](auto a, auto b) { return spatial_detail::checkedProduct(a, b, "Complex VALUE extent overflow"); };
   const auto add = [](auto a, auto b) { return spatial_detail::checkedAdd(a, b, "Complex VALUE bytes overflow"); };
   const auto n = shape.electrons(), f = shape.feature_dimension, channels = mul(batch, shape.determinants);
@@ -34,17 +37,25 @@ inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& p
       m - 1 > (std::numeric_limits<std::uint64_t>::max() >> 8) ||
       (m - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()))
     throw std::overflow_error("Complex VALUE index/BLAS dimensions exceed admission");
-  const auto features = makePeriodicFeatureJetLayout(batch, n, shape.nuclei, shape.spin_up_electrons, SpatialJetMode::VALUE_ONLY);
+  const auto features = makePeriodicFeatureJetLayout(batch, n, shape.nuclei, shape.spin_up_electrons, mode);
   const auto attention = makeSpatialAttentionJetLayout(batch, n, shape.attention_heads,
-      f / shape.attention_heads, n, SpatialJetMode::VALUE_ONLY);
+      f / shape.attention_heads, n, mode);
+  const auto planes = features.output.plane_count;
   const auto jets = mul(batch, mul(shape.attention_heads, n));
   const auto doubles = add(add(mul(3, mul(batch, n)), spatialJetSpanElements(features.output)),
-      add(mul(8, rows), add(spatialJetSpanElements(attention.attention), batch)));
+      add(mul(8, mul(rows, planes)), add(spatialJetSpanElements(attention.attention), mul(batch, planes))));
   const auto host = add(checkedDeviceBytes<OpenSpatialStatus>(rows), checkedDeviceBytes<device_math::JetMathStatus>(jets));
   const auto trunk = add(add(checkedDeviceBytes<double>(doubles), checkedDeviceBytes<std::size_t>(batch)),
       add(host, sizeof(InferenceStatusWord)));
-  return {trunk, add(add(add(trunk, mul(40, m)), checkedDeviceBytes<ComplexValueChannel>(channels)),
+  return {trunk, add(add(add(trunk, mul(40, mul(m, planes))), checkedDeviceBytes<ComplexValueChannel>(channels)),
       add(checkedDeviceBytes<ComplexValueResult>(batch), sizeof(std::uint64_t))), host, m};
+}
+} // namespace complex_detail
+
+/// Preserve the qualified VALUE estimate and allocation inventory exactly.
+inline ComplexValueCost estimateComplexValueCost(const PsiFormerExecutionPlan& plan, std::size_t batch)
+{
+  return complex_detail::baseCost(plan, batch, SpatialJetMode::VALUE_ONLY);
 }
 
 /** Complete numerical-only complex VALUE over ONE real trunk and canonical image.

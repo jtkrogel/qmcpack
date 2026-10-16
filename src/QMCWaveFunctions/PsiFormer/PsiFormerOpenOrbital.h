@@ -245,7 +245,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     std::size_t orbital, double* output,
     double* retained_backflow = nullptr, double* retained_envelope = nullptr,
     const periodic_geometry::Cell* periodic_cell = nullptr,
-    const double* projected_backflow = nullptr, bool value_envelope_only = false) noexcept
+    const double* projected_backflow = nullptr, bool envelope_only = false) noexcept
 {
   const std::size_t element = outputElement(
       layout, determinant, row_electron, orbital);
@@ -253,17 +253,16 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     output[layout.orbitals.uncheckedPlaneOffset(configuration, plane, element)] = 0.0;
   if (active_electron >= layout.features.electron_count)
     return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
-  if (value_envelope_only && layout.features.mode != SpatialJetMode::VALUE_ONLY)
-    return OpenSpatialStatus::NONFINITE_INPUT_OR_RESULT;
 
   const bool spin_up = row_electron < layout.spin_up_count;
   const double* backflow = spin_up ? backflow_up : backflow_down;
   const double* pi       = spin_up ? pi_up : pi_down;
   const double* zeta     = spin_up ? zeta_up : zeta_down;
-  double backflow_value  = value_envelope_only ? 1.0 : (projected_backflow
+  // A constant unit backflow yields only the shared envelope and its physical jets.
+  double backflow_value  = envelope_only ? 1.0 : (projected_backflow
       ? projected_backflow[layout.orbitals.uncheckedValueOffset(configuration, element)] : 0.0);
   const std::size_t feature_begin = row_electron * layout.feature_row_stride;
-  for (std::size_t feature = 0; !value_envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
+  for (std::size_t feature = 0; !envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
   {
     const double feature_value = features[layout.features.uncheckedValueOffset(
         configuration, feature_begin + feature)];
@@ -340,9 +339,9 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     retained_envelope[retained_offset] = envelope_value;
   for (std::size_t lane = 0; lane < layout.features.gradient_lanes; ++lane)
   {
-    double backflow_gradient = projected_backflow
+    double backflow_gradient = !envelope_only && projected_backflow
         ? projected_backflow[layout.orbitals.uncheckedGradientOffset(configuration, lane, element)] : 0.0;
-    for (std::size_t feature = 0; !projected_backflow && feature < layout.feature_width; ++feature)
+    for (std::size_t feature = 0; !envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
       backflow_gradient += features[layout.features.uncheckedGradientOffset(
           configuration, lane, feature_begin + feature)] *
           backflow[weightOffset(layout, feature, determinant, orbital)];
@@ -366,10 +365,10 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
   for (std::size_t electron = 0; electron < layout.features.laplacian_lanes; ++electron)
   {
     const bool envelope_target = layout.features.physicalTargetElectron(electron) == row_electron;
-    double backflow_laplacian = projected_backflow
+    double backflow_laplacian = !envelope_only && projected_backflow
         ? projected_backflow[layout.orbitals.uncheckedLaplacianOffset(configuration, electron, element)] : 0.0;
     double gradient_dot = 0.0;
-    for (std::size_t feature = 0; !projected_backflow && feature < layout.feature_width; ++feature)
+    for (std::size_t feature = 0; !envelope_only && !projected_backflow && feature < layout.feature_width; ++feature)
     {
       const double weight = backflow[weightOffset(
           layout, feature, determinant, orbital)];
@@ -383,7 +382,7 @@ QMC_PF_ORBITAL_HOST_DEVICE inline OpenSpatialStatus buildElement(
     }
     // A projected jet already contains the affine gradient contraction. Retain
     // the coupled product rule here, independently of the GEMM scheduling.
-    if (projected_backflow && envelope_target)
+    if (!envelope_only && projected_backflow && envelope_target)
       for (std::size_t dimension = 0; dimension < 3; ++dimension)
         gradient_dot += projected_backflow[layout.orbitals.uncheckedGradientOffset(
             configuration, 3 * electron + dimension, element)] * envelope_gradient[dimension];
