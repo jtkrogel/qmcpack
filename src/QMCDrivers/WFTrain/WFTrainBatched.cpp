@@ -1368,6 +1368,10 @@ void WFTrainBatched::process(xmlNodePtr node)
           throw UniformCommunicateError("Conventional LM/ALM/PII updates currently require nonlinear coordinates; CI update normalization is not yet qualified");
       // Fail before population initialization/sampling for unqualified fixed assets.
       conventional_binding_->modelIdentity();
+      app_log() << "WFTrain conventional derivative scratch cap="
+                << training_input_.getLegacyDerivativeScratchBytes()
+                << " scope='adapter rows/channels only; excludes component-owned orbital/J3 P*Ne caches, "
+                   "private clones, retained configurations'" << std::endl;
       providers.emplace_back(*conventional_binding_);
     }
 #ifdef QMC_COMPLEX

@@ -115,7 +115,7 @@ void collectSPOBindings(xmlNodePtr first, std::set<std::string>& definitions, st
     if (node->type != XML_ELEMENT_NODE)
       continue;
     const std::string kind(reinterpret_cast<const char*>(node->name));
-    if (kind == "sposet")
+    if (kind == "sposet" || kind == "rotated_sposet")
     {
       const auto name = attributeText(node, "name");
       if (!name.empty())
