@@ -1344,6 +1344,8 @@ void WFTrainBatched::process(xmlNodePtr node)
           wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
+      // Fail before population initialization/sampling for unqualified fixed assets.
+      conventional_binding_->modelIdentity();
       providers.emplace_back(*conventional_binding_);
     }
 #ifdef QMC_COMPLEX
@@ -1671,6 +1673,8 @@ void WFTrainBatched::run()
       stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
                                     selected_provider_->parameterSchema(), steps_per_block_,
                                     overlap_fingerprint, complex_physical_identity, resident_adam_budget != 0, resident_sr_budget.first != 0)};
+  if (conventional_binding_)
+    stage_state.configuration_fingerprint += ":" + conventional_binding_->modelIdentity();
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;

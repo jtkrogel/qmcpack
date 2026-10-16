@@ -12,18 +12,49 @@
 #include "QMCHamiltonians/QMCHamiltonian.h"
 #include "io/hdf/hdf_archive.h"
 #include <exception>
+#include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 
 namespace qmcplusplus::wftrain
 {
+namespace
+{
+bool hasExternalAssets(xmlNodePtr first)
+{
+  for (auto* node = first; node; node = node->next)
+  {
+    for (auto* attribute = node->properties; attribute; attribute = attribute->next)
+    {
+      const std::string name(reinterpret_cast<const char*>(attribute->name));
+      if (name == "href" || name == "src" || name == "file" || name == "filename")
+        return true;
+    }
+    if (hasExternalAssets(node->children)) return true;
+  }
+  return false;
+}
+}
 TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prototype, ParticleSet& particles,
     LegacyWaveFunctionAdapterOptions options, Communicate& communicator)
-    : prototype_(prototype), prototype_particles_(particles), communicator_(communicator),
+    : prototype_(prototype), communicator_(communicator),
       adapter_("conventional", prototype, options)
 {
   prototype.validatePreparedJastrowActivation(prototype);
+  if (auto* node = prototype.getNode())
+  {
+    external_assets_ = hasExternalAssets(node);
+    xmlBufferPtr xml = xmlBufferCreate();
+    if (!xml) throw std::bad_alloc();
+    const int result = xmlNodeDump(xml, node->doc, node, 0, 1);
+    if (result >= 0)
+      definition_.assign(reinterpret_cast<const char*>(xmlBufferContent(xml)));
+    xmlBufferFree(xml);
+    if (result < 0) throw std::runtime_error("Cannot capture conventional model XML");
+  }
   attachLive(prototype, particles);
 }
 TrainingWaveFunctionBinding::~TrainingWaveFunctionBinding() = default;
@@ -112,6 +143,7 @@ std::size_t TrainingWaveFunctionBinding::publishParameters(
 
 void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path) const
 {
+  const auto identity = modelIdentity();
   const auto snapshot = snapshotParameters();
   hdf_archive output;
   if (!output.create(path, H5F_ACC_EXCL))
@@ -121,6 +153,7 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   output.write(parameterSchema().providerId(), "provider_id");
   output.write(snapshot.schema_fingerprint, "schema_fingerprint");
   output.write(snapshot.values, "parameters");
+  output.write(identity, "model_identity");
   std::vector<std::string> names;
   std::vector<int> types, indices;
   std::vector<double> fixed_values;
@@ -138,16 +171,7 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   output.write(types, "variable_types");
   output.write(indices, "active_indices");
   output.write(fixed_values, "registration_values");
-  xmlBufferPtr xml = xmlBufferCreate();
-  if (!xml) throw std::bad_alloc();
-  std::string definition;
-  if (prototype_.getNode())
-  {
-    xmlNodeDump(xml, prototype_.getNode()->doc, prototype_.getNode(), 0, 1);
-    definition.assign(reinterpret_cast<const char*>(xmlBufferContent(xml)));
-  }
-  xmlBufferFree(xml);
-  output.write(definition, "wavefunction_xml");
+  output.write(definition_, "wavefunction_xml");
   output.write(std::string("conventional-fixed-slater-j1-j2-v1"), "completion_cookie");
   output.pop();
   output.flush();
@@ -157,7 +181,10 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
   hdf_archive input;
   if (!input.open(path, H5F_ACC_RDONLY)) throw std::runtime_error("Cannot read conventional model export");
   input.push("conventional_wavefunction", false);
-  std::string cookie, fingerprint, provider;
+  std::string cookie, fingerprint, provider, definition, identity;
+  std::vector<std::string> names;
+  std::vector<int> types, indices;
+  std::vector<double> values;
   std::vector<int> version;
   auto result = snapshotParameters();
   input.read(version, "format_version");
@@ -165,10 +192,57 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
   input.read(provider, "provider_id");
   input.read(fingerprint, "schema_fingerprint");
   input.read(result.values, "parameters");
+  input.read(definition, "wavefunction_xml");
+  input.read(identity, "model_identity");
+  input.read(names, "variable_names");
+  input.read(types, "variable_types");
+  input.read(indices, "active_indices");
+  input.read(values, "registration_values");
   if (version != std::vector<int>{1, 0, 0} || cookie != "conventional-fixed-slater-j1-j2-v1" ||
-      fingerprint != parameterSchema().fingerprint() || provider != parameterSchema().providerId())
+      fingerprint != parameterSchema().fingerprint() || provider != parameterSchema().providerId() ||
+      definition != definition_ || identity != modelIdentity())
     throw std::runtime_error("Conventional model export identity mismatch");
+  const auto& variables = adapter_.registrationVariables();
+  if (names.size() != variables.size() || types.size() != variables.size() ||
+      indices.size() != variables.size() || values.size() != variables.size())
+    throw std::runtime_error("Conventional model export registration extent mismatch");
+  for (std::size_t i = 0; i < variables.size(); ++i)
+    if (names[i] != variables.name(i) || types[i] != variables.getType(i) ||
+        indices[i] != variables.where(i) || values[i] != std::real(variables[i]))
+      throw std::runtime_error("Conventional model export registration mismatch");
   validateTrainingCandidate(parameterSchema(), snapshotParameters(), result);
   return result;
+}
+
+std::string TrainingWaveFunctionBinding::modelIdentity() const
+{
+  if (definition_.empty())
+    throw std::runtime_error("Conventional checkpoint/export requires the original complete wavefunction XML");
+  if (external_assets_)
+    throw std::runtime_error("Conventional checkpoint/export currently requires inline model assets; external asset content identity is not yet qualified");
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  auto mix = [&](const std::string& text) {
+    for (const unsigned char byte : text)
+    {
+      hash ^= byte;
+      hash *= UINT64_C(1099511628211);
+    }
+    hash ^= 0;
+    hash *= UINT64_C(1099511628211);
+  };
+  mix(definition_);
+  const auto& variables = adapter_.registrationVariables();
+  for (std::size_t i = 0; i < variables.size(); ++i)
+  {
+    mix(variables.name(i));
+    mix(std::to_string(variables.getType(i)));
+    mix(std::to_string(variables.where(i)));
+    std::ostringstream value;
+    value << std::hexfloat << std::real(variables[i]);
+    mix(value.str());
+  }
+  std::ostringstream identity;
+  identity << "conventional-inline-sj-v1:" << std::hex << hash;
+  return identity.str();
 }
 }

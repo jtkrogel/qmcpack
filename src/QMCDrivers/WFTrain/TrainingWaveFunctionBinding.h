@@ -36,14 +36,17 @@ public:
   LegacyWaveFunctionAdapter& adapter() noexcept { return adapter_; }
   void exportModel(const std::filesystem::path&) const;
   StructuredParameterSnapshot readModel(const std::filesystem::path&) const;
+  /// Immutable inline model definition and registration identity for exact continuation.
+  std::string modelIdentity() const;
 
 private:
   TrialWaveFunction& prototype_;
-  ParticleSet& prototype_particles_;
   Communicate& communicator_;
   LegacyWaveFunctionAdapter adapter_;
   QMCHamiltonian* hamiltonian_ = nullptr;
   std::vector<std::pair<TrialWaveFunction*, ParticleSet*>> live_;
+  std::string definition_;
+  bool external_assets_ = false;
 };
 }
 }
