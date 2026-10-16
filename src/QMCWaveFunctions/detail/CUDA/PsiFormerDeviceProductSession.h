@@ -48,6 +48,7 @@ enum class ProductSessionProfile
 class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
 {
   friend class PreparedDeviceSrMetric;
+  friend class PreparedDevicePcg;
   /** Keep the lifted forward/reverse pair absent from a score-only lane. */
   struct KineticWorkspace
   {

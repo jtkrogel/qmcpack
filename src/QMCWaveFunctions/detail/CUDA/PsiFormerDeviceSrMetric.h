@@ -22,7 +22,14 @@ namespace qmcplusplus::psiformer::device
  */
 class PreparedDeviceSrMetric
 {
+  friend class PreparedDevicePcg;
 public:
+  /// Opaque receipts retain this address, so the numerical owner must never move.
+  PreparedDeviceSrMetric(const PreparedDeviceSrMetric&) = delete;
+  PreparedDeviceSrMetric& operator=(const PreparedDeviceSrMetric&) = delete;
+  PreparedDeviceSrMetric(PreparedDeviceSrMetric&&) = delete;
+  PreparedDeviceSrMetric& operator=(PreparedDeviceSrMetric&&) = delete;
+
   using FrozenInterval = std::pair<std::size_t, std::size_t>; // begin, count
   /// Separate exact device and host numeric payloads for explicit admission.
   struct Cost { std::size_t device_bytes, host_bytes; };
@@ -61,6 +68,61 @@ public:
       std::size_t device_cap, std::size_t host_cap)
   {
     std::lock_guard lock(session.mutex_);
+    return prepareUnderControl(session, positions, weights, frozen, version, device_cap, host_cap);
+  }
+
+  /// Explicit cold/test ingress; all-P device finiteness is admitted by apply before projection.
+  Receipt uploadDirection(const std::vector<double>& direction)
+  {
+    std::lock_guard lock(session_.mutex_);
+    validate();
+    input_ready_ = action_ready_ = false;
+    if (direction.size() != direction_.capacity())
+      throw std::invalid_argument("Device SR direction extent mismatch");
+    advance(input_generation_);
+    direction_.upload(direction.data(), direction.size());
+    input_ready_ = true;
+    return Receipt(this, input_generation_, false);
+  }
+
+  /** Apply P_train J^T diag(w/W) (J P_train v - mean_w) in deterministic sample order.
+   * O(B) products/coefficients, cusp scalars and finite statuses may cross host.
+   * There is no P upload, P download, damping, optimizer step or model publication.
+   */
+  Receipt apply(const Receipt& direction)
+  {
+    std::lock_guard lock(session_.mutex_);
+    return applyUnderControl(direction);
+  }
+
+  /// Explicit inspection boundary, outside the warm resident-action transfer window.
+  void downloadAction(const Receipt& action, std::vector<double>& destination)
+  {
+    std::lock_guard lock(session_.mutex_);
+    validate();
+    checkReceipt(action, true);
+    if (destination.size() != action_.capacity())
+      throw std::invalid_argument("Device SR action destination extent mismatch");
+    action_.download(destination.data(), destination.size());
+  }
+
+  /// Fixed admitted numeric capacities; C is the prepared capacity, never live C1.
+  Cost cost() const noexcept { return cost_; }
+
+  /// Count concrete numeric capacities, including the shared fixed C owner once.
+  Cost allocatedBytes()
+  {
+    std::lock_guard lock(session_.mutex_);
+    return allocatedBytesUnderControl();
+  }
+
+private:
+  /// Admit and prepare the metric while the concrete caller owns the same mutex.
+  static std::unique_ptr<PreparedDeviceSrMetric> prepareUnderControl(PreparedDeviceProductSession& session,
+      const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version,
+      std::size_t device_cap, std::size_t host_cap)
+  {
     session.validateContractionControl(version);
     const auto& image = session.image_;
     if (image->periodicCell() || image->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL)
@@ -107,27 +169,9 @@ public:
     return result;
   }
 
-  /// Explicit cold/test ingress; all-P device finiteness is admitted by apply before projection.
-  Receipt uploadDirection(const std::vector<double>& direction)
+  /// Run the unchanged metric law while the concrete caller owns the same mutex.
+  Receipt applyUnderControl(const Receipt& direction)
   {
-    std::lock_guard lock(session_.mutex_);
-    validate();
-    input_ready_ = action_ready_ = false;
-    if (direction.size() != direction_.capacity())
-      throw std::invalid_argument("Device SR direction extent mismatch");
-    advance(input_generation_);
-    direction_.upload(direction.data(), direction.size());
-    input_ready_ = true;
-    return Receipt(this, input_generation_, false);
-  }
-
-  /** Apply P_train J^T diag(w/W) (J P_train v - mean_w) in deterministic sample order.
-   * O(B) products/coefficients, cusp scalars and finite statuses may cross host.
-   * There is no P upload, P download, damping, optimizer step or model publication.
-   */
-  Receipt apply(const Receipt& direction)
-  {
-    std::lock_guard lock(session_.mutex_);
     action_ready_ = false;
     try
     {
@@ -186,24 +230,9 @@ public:
     }
   }
 
-  /// Explicit inspection boundary, outside the warm resident-action transfer window.
-  void downloadAction(const Receipt& action, std::vector<double>& destination)
+  /// Count unchanged fixed capacities while the concrete caller owns the same mutex.
+  Cost allocatedBytesUnderControl()
   {
-    std::lock_guard lock(session_.mutex_);
-    validate();
-    checkReceipt(action, true);
-    if (destination.size() != action_.capacity())
-      throw std::invalid_argument("Device SR action destination extent mismatch");
-    action_.download(destination.data(), destination.size());
-  }
-
-  /// Fixed admitted numeric capacities; C is the prepared capacity, never live C1.
-  Cost cost() const noexcept { return cost_; }
-
-  /// Count concrete numeric capacities, including the shared fixed C owner once.
-  Cost allocatedBytes()
-  {
-    std::lock_guard lock(session_.mutex_);
     validate();
     return {add(mul(8, add(direction_.capacity(), action_.capacity())),
                 add(mul(sizeof(DerivativeFiniteStatus), status_.capacity()), session_.score_contraction_->deviceWorkspaceBytes())),
@@ -212,7 +241,20 @@ public:
                 add(mul(sizeof(DerivativeFiniteStatus), host_status_.capacity()), session_.score_contraction_->hostWorkspaceBytes())))};
   }
 
-private:
+  /// Stage a checked resident P direction without a host view or another mutex acquisition.
+  Receipt stageResidentDirectionUnderControl(const double* source, std::size_t count)
+  {
+    validate();
+    input_ready_ = action_ready_ = false;
+    if (!source || count != direction_.capacity())
+      throw std::invalid_argument("Device SR resident direction extent mismatch");
+    advance(input_generation_);
+    checkRuntime(launchDerivativeCopy(session_.queue_.getNative(), {count, 0, 1, 0, 1},
+        source, direction_.data()), "SR resident direction staging");
+    input_ready_ = true;
+    return Receipt(this, input_generation_, false);
+  }
+
   PreparedDeviceSrMetric(PreparedDeviceProductSession& session, const std::vector<double>& positions,
       const std::vector<double>& weights, const std::vector<FrozenInterval>& frozen, double weight, Cost cost)
       : session_(session), image_(session.image_), positions_(positions), weights_(weights),
