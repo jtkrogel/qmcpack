@@ -36,6 +36,8 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   const int up = species.addSpecies("u"), down = species.addSpecies("d");
   const int mass = species.addAttribute("mass");
   species(mass, up) = species(mass, down) = 1.0;
+  const int charge = species.addAttribute("charge");
+  species(charge, up) = species(charge, down) = -1.0;
   particles.resetGroups();
   using Functor = BsplineFunctor<QMCTraits::RealType>;
   auto functor = std::make_unique<Functor>("binding_functor");
@@ -59,6 +61,11 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   ParticleSet clone_particles(particles);
   auto clone = prototype.makeClone(clone_particles);
   TrainingWaveFunctionBinding binding(prototype, particles, {256, 65536, 16}, comm);
+  CHECK_THROWS(binding.modelIdentity());
+  QMCHamiltonian sampling_hamiltonian;
+  sampling_hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  sampling_hamiltonian.addOperator(std::make_unique<CoulombPotential>(particles, true, false), "ElecElec");
+  binding.setHamiltonian(sampling_hamiltonian);
   binding.attachLive(*clone, clone_particles);
   const auto old = binding.snapshotParameters();
   auto candidate = old;
@@ -116,12 +123,14 @@ TEST_CASE("Conventional binding activates actual Jastrows and rejects failed pre
   auto external = prototype.makeClone(particles);
   external->storeXMLNode(external_definition.getRoot());
   TrainingWaveFunctionBinding external_binding(*external, particles, {256, 65536, 16}, comm);
+  external_binding.setHamiltonian(sampling_hamiltonian);
   CHECK_THROWS(external_binding.modelIdentity());
   Libxml2Document global_spo_definition;
   REQUIRE(global_spo_definition.parseFromString("<wavefunction><determinant sposet='global_spo'/></wavefunction>"));
   auto global_spo = prototype.makeClone(particles);
   global_spo->storeXMLNode(global_spo_definition.getRoot());
   TrainingWaveFunctionBinding global_spo_binding(*global_spo, particles, {256, 65536, 16}, comm);
+  global_spo_binding.setHamiltonian(sampling_hamiltonian);
   CHECK_THROWS(global_spo_binding.modelIdentity());
 
   ParticleSet ions(cell);
