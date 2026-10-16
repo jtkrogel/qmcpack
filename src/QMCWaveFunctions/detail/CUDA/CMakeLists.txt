@@ -105,6 +105,22 @@ else()
                         CUDA_SEPARABLE_COMPILATION ON)
 endif()
 target_link_libraries(psiformer_device_model_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio)
+
+# Focused native crowd concurrency validation with generated parameters only.
+add_executable(psiformer_device_concurrency_validation EXCLUDE_FROM_ALL
+               PsiFormerDeviceConcurrencyValidation.cpp
+               ../../../QMCDrivers/GreenFunctionModifiers/DriftModifierUNR.cpp
+               ../../../Utilities/StdRandom.cpp
+               ../../PsiFormer/PsiFormerAcceleratorExecutor.cpp
+               ../../PsiFormer/PsiFormerAcceleratorPlanning.cpp
+               ../../PsiFormer/PsiFormerExecutionPlan.cpp
+               ../../PsiFormer/PsiFormerInitialization.cpp
+               ../../PsiFormer/PsiFormerGeometry.cpp)
+target_link_libraries(psiformer_device_concurrency_validation PRIVATE psiformer_device IO::HDF5 platform_LA qmcio)
+target_include_directories(psiformer_device_concurrency_validation PRIVATE
+                           "${qmcpack_SOURCE_DIR}/src/Containers"
+                           "${qmcpack_SOURCE_DIR}/src/QMCDrivers"
+                           "${qmcpack_SOURCE_DIR}/src/Particle")
 target_include_directories(psiformer_device_model_validation PRIVATE
                            "${qmcpack_SOURCE_DIR}/src/Containers"
                            "${qmcpack_SOURCE_DIR}/src/QMCDrivers"
@@ -164,7 +180,7 @@ target_link_libraries(psiformer_device_lifted_products_validation PRIVATE psifor
 
 # Correctness oracles must retain IEEE NaN/infinity semantics even when the
 # application's Release flags use fast-math. Library kernel policy is unchanged.
-foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation psiformer_device_lifted_products_validation)
+foreach(validation_target psiformer_device_runtime_validation psiformer_device_model_validation psiformer_device_periodic_validation psiformer_device_benchmark psiformer_device_spatial_trace_validation psiformer_device_lifted_products_validation psiformer_device_concurrency_validation)
   target_compile_options(${validation_target} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>

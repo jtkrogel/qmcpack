@@ -24,13 +24,15 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include "QMCWaveFunctions/PsiFormer/PsiFormerInferenceConcurrency.h"
 
 namespace qmcplusplus::psiformer::device
 {
 
 /** Supply exclusive GPU scratch per batch workspace and one shared model image.
  * The control mutex protects non-atomic model leases. The first synchronous
- * implementation serializes submissions; asynchronous overlap is not claimed.
+ * default serializes submissions. Explicit bounded FP64 inference leases allow
+ * independent queues while publication excludes every in-flight evaluation.
  */
 class PreparedDeviceBatchBackend final : public pf::DirectBatchTileBackend
 {
@@ -42,6 +44,7 @@ public:
                                       DeviceExecutionPreparation preparation = {})
       : image_(checkedImage(std::move(image))),
         preparation_(validatedPreparation(image_->plan(), precision, preparation)),
+        inference_concurrency_(preparation_.active_inference_crowds),
         owner_(PreparedDeviceCrowdHooks::backend(),
                makePsiFormerDeviceLayout(image_->plan()).fingerprint, image_->version()),
         first_dispatch_reporter_(std::move(first_dispatch_reporter))
@@ -80,6 +83,8 @@ public:
       std::size_t score_capacity = 1) const
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
+    if (preparation_.active_inference_crowds != 1)
+      throw std::invalid_argument("Concurrent GPU inference does not admit parameter-product or training sessions");
     if (mixed_parameters_)
       throw std::invalid_argument("Mixed PsiFormer precision does not support optimization or reverse products");
     return std::make_unique<PreparedDeviceProductSession>(
@@ -91,11 +96,18 @@ public:
       pf::DirectBatchMode mode, const double* coordinates, std::size_t size,
       std::size_t parameter_version) const override
   {
-    std::lock_guard<std::mutex> lock(control_mutex_);
+    auto inference_lease = inference_concurrency_.acquire();
+    std::unique_lock<std::mutex> lock(control_mutex_);
     auto* context = dynamic_cast<Context*>(&workspace);
     if (!context || context->owner != this || !coordinates || size == 0 ||
         size > context->capacity || parameter_version != image_->version())
       throw std::invalid_argument("Device batch tile has foreign resources, wrong capacity or stale parameters");
+    std::unique_lock context_lock(context->evaluation_mutex, std::try_to_lock);
+    if (!context_lock.owns_lock())
+      throw std::logic_error("Device inference cannot re-enter the same native crowd resource");
+    // Native DeviceManager binds OpenMP workers. Validate foreign callers too,
+    // before any stream use; never silently select a different process device.
+    image_->validateCurrentDevice();
     const bool spatial = mode != pf::DirectBatchMode::VALUE_ONLY;
     const auto operations = acceleratorOperationBit(spatial ? PsiFormerAcceleratorOperation::VGL
                                                            : PsiFormerAcceleratorOperation::VALUES);
@@ -108,22 +120,28 @@ public:
       throw std::overflow_error("Device tile coordinate generation exhausted");
     const auto generation = ++context->coordinate_generation;
 
-    // Lease transitions and submission use the existing non-atomic control plane.
-    // This explicit correctness lock can be narrowed after asynchronous integration.
+    // Publication stays excluded by the shared inference permit. Only lease
+    // mutations need the control mutex in explicit concurrent inference mode.
     if (context->hooks.modelVersion() != image_->version())
       context->hooks.rebindModel(image_, mixed_parameters_);
     const auto previous_mixed_retries = context->hooks.mixedRetries();
     context->executor.acquire(owner_, context->crowd, context->hooks);
+    if (preparation_.active_inference_crowds > 1)
+      lock.unlock();
     try
     {
       context->hooks.bindRequest(context->positions, operations, generation);
       const auto pending = context->executor.evaluate(owner_, context->crowd, operations, size, generation, context->hooks);
       context->executor.wait(context->crowd, pending.result_generation, context->hooks);
       (void)context->crowd.completedResult(pending.result_generation, generation);
+      if (!lock.owns_lock())
+        lock.lock();
       context->executor.release(owner_, context->crowd, context->hooks);
     }
     catch (...)
     {
+      if (!lock.owns_lock())
+        lock.lock();
       if (context->crowd.poisoned())
       {
         context->sampler.reset();
@@ -135,6 +153,8 @@ public:
         context->executor.release(owner_, context->crowd, context->hooks);
       throw;
     }
+    if (preparation_.active_inference_crowds > 1)
+      lock.unlock();
 
     const auto& layout = context->hooks.resultLayout();
     pf::DirectBatchTileResultView result;
@@ -163,6 +183,9 @@ public:
                 << ", retry_reason=" << context->hooks.mixedRetryReason() << std::endl;
     return result;
   }
+
+  /// Host permit evidence only, not a claim of simultaneous kernel execution.
+  std::size_t peakAdmittedInferenceCalls() const { return inference_concurrency_.peakAdmittedCalls(); }
 
   /// Report the explicit per-crowd sampler admission limit; zero preserves host moves.
   std::size_t metropolisBudget() const noexcept { return preparation_.metropolis_workspace_budget_bytes; }
@@ -322,6 +345,7 @@ public:
   void publishParameters(const std::vector<double>& values, std::size_t version,
                          const std::function<void()>& commit_native) const override
   {
+    auto publication_boundary = inference_concurrency_.publicationBoundary();
     std::lock_guard<std::mutex> lock(control_mutex_);
     if (!commit_native)
       throw std::invalid_argument("Device publication requires an authoritative native commit");
@@ -411,6 +435,7 @@ private:
 
     const PreparedDeviceBatchBackend* const owner;
     const std::size_t capacity;
+    std::mutex evaluation_mutex;
     PsiFormerAcceleratorExecutor executor;
     PsiFormerAcceleratorCrowdState crowd;
     PreparedDeviceCrowdHooks hooks;
@@ -434,6 +459,17 @@ private:
   static DeviceExecutionPreparation validatedPreparation(const PsiFormerExecutionPlan& plan,
       PsiFormerPrecisionPolicy precision, DeviceExecutionPreparation preparation)
   {
+    if (!preparation.active_inference_crowds ||
+        preparation.active_inference_crowds == std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("Active GPU inference crowds must be positive and finite");
+    if (preparation.active_inference_crowds > 1 &&
+        (precision != PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+         preparation.metropolis_workspace_budget_bytes || preparation.adam_workspace_budget_bytes ||
+         preparation.retained_coordinate_workspace_budget_bytes || preparation.kinetic.max_targets ||
+         preparation.select_kinetic_targets))
+      throw std::invalid_argument("Concurrent GPU inference requires FP64 and excludes sampling/training preparations");
+    if (preparation.active_inference_crowds > 1 && !configuredDeviceMemoryAdmission().limit_bytes)
+      throw std::invalid_argument("Concurrent GPU inference requires explicit native aggregate device admission");
     if (preparation.metropolis_drift_budget_bytes && (!preparation.metropolis_workspace_budget_bytes ||
         preparation.metropolis_drift_budget_bytes == std::numeric_limits<std::size_t>::max()))
       throw std::invalid_argument("Explicit device drift requires sampler preparation and a finite additions cap");
@@ -462,6 +498,7 @@ private:
 
   mutable std::shared_ptr<const PreparedDeviceModel> image_;
   const DeviceExecutionPreparation preparation_;
+  mutable PsiFormerInferenceConcurrency inference_concurrency_;
   mutable std::shared_ptr<const PreparedDeviceMixedDenseParameters> mixed_parameters_;
   std::unique_ptr<compute::Queue<PlatformKind::CUDA>> preparation_queue_;
   mutable PublicationHooks publication_hooks_{image_, mixed_parameters_};

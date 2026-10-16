@@ -183,6 +183,40 @@ public:
     metrics_->downloaded(checkedDeviceBytes<T>(count));
   }
 
+  /// Preserve synchronous host lifetime while ordering only the caller's queue.
+  void uploadOnStream(const T* source, std::size_t count, Stream stream)
+  {
+    validateTransfer(source, count);
+    if (!count)
+      return;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemcpyAsync(data_, source, checkedDeviceBytes<T>(count), hipMemcpyHostToDevice, stream), "hipMemcpyAsync H2D");
+    checkRuntime(hipStreamSynchronize(stream), "hipStreamSynchronize H2D");
+#else
+    checkRuntime(cudaMemcpyAsync(data_, source, checkedDeviceBytes<T>(count), cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync H2D");
+    checkRuntime(cudaStreamSynchronize(stream), "cudaStreamSynchronize H2D");
+#endif
+    metrics_->uploaded(checkedDeviceBytes<T>(count));
+  }
+
+  /// Download from an independent inference queue without default-stream fences.
+  void downloadOnStream(T* destination, std::size_t count, Stream stream, std::size_t source_offset = 0) const
+  {
+    if (source_offset > capacity_ || count > capacity_ - source_offset)
+      throw std::length_error("PsiFormer device download interval exceeds capacity");
+    validateTransfer(destination, count);
+    if (!count)
+      return;
+#ifdef QMC_CUDA2HIP
+    checkRuntime(hipMemcpyAsync(destination, data_ + source_offset, checkedDeviceBytes<T>(count), hipMemcpyDeviceToHost, stream), "hipMemcpyAsync D2H");
+    checkRuntime(hipStreamSynchronize(stream), "hipStreamSynchronize D2H");
+#else
+    checkRuntime(cudaMemcpyAsync(destination, data_ + source_offset, checkedDeviceBytes<T>(count), cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync D2H");
+    checkRuntime(cudaStreamSynchronize(stream), "cudaStreamSynchronize D2H");
+#endif
+    metrics_->downloaded(checkedDeviceBytes<T>(count));
+  }
+
   /// Expose the stable prepared pointer without allocation.
   T* data() noexcept { return data_; }
 

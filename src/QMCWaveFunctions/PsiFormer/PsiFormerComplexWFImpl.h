@@ -36,6 +36,7 @@ struct PsiFormerComplexWF::Impl
       if (selection.first || selection.second)
         throw std::invalid_argument("Complex GPU inference requires explicit VGL targets, not automatic selection");
       for (const char* name : {"PSIFORMER_GPU_KINETIC_TARGETS", "PSIFORMER_GPU_LIFTED_CHANNELS",
+          "PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS",
           "PSIFORMER_GPU_RETAINED_COORDINATE_BYTES", "PSIFORMER_GPU_METROPOLIS_BYTES",
           "PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES", "PSIFORMER_GPU_ADAM_BYTES",
           "PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES", "PSIFORMER_GPU_RESIDENT_ENERGY_SR_BYTES",

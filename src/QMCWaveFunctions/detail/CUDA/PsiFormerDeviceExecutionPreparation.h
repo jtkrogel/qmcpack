@@ -40,6 +40,8 @@ struct DeviceExecutionPreparation
   std::size_t adam_workspace_budget_bytes = 0;
   /// Opt-in work/memory selection; resolved VGL is reselected for each actual B.
   bool select_vgl_targets = false, select_kinetic_targets = false;
+  /// Explicit FP64 inference overlap only; prepared inactive owners stay charged.
+  std::size_t active_inference_crowds = 1;
 };
 
 /// Parse a selection request without reading environment or changing explicit defaults.
@@ -144,6 +146,9 @@ inline void reportDeviceTargetSelection(std::ostream& out, const char* operation
 inline void validateDeviceExecutionPreparation(const PsiFormerExecutionPlan& plan,
     const DeviceExecutionPreparation& preparation, std::size_t vgl_capacity = 1)
 {
+  if (!preparation.active_inference_crowds ||
+      preparation.active_inference_crowds == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Active GPU inference crowds must be positive and finite");
   const auto validate = [](std::size_t targets, std::size_t bytes, std::size_t work) {
     if (targets == 0 ? (bytes != 0 || work != 0) : (bytes == 0 || work == 0))
       throw std::invalid_argument("Device target preparation requires positive targets and both per-owner budgets");

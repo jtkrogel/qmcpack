@@ -998,6 +998,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
   const auto retained_coordinates = positive("PSIFORMER_GPU_RETAINED_COORDINATE_BYTES");
   const auto metropolis = positive("PSIFORMER_GPU_METROPOLIS_BYTES");
   const auto metropolis_drift = positive("PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES");
+  const auto active_inference_crowds = positive("PSIFORMER_GPU_ACTIVE_INFERENCE_CROWDS");
   if (metropolis_drift && !metropolis)
     throw std::invalid_argument("PSIFORMER_GPU_METROPOLIS_DRIFT_BYTES requires PSIFORMER_GPU_METROPOLIS_BYTES");
   const auto adam = [&]() -> std::size_t {
@@ -1023,6 +1024,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
       precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE)
     throw std::invalid_argument("GPU target/retained-coordinate preparation requires FP64 reference precision");
   psiformer::device::DeviceExecutionPreparation preparation;
+  preparation.active_inference_crowds = active_inference_crowds ? active_inference_crowds : 1;
   preparation.retained_coordinate_workspace_budget_bytes = retained_coordinates;
   preparation.metropolis_workspace_budget_bytes = metropolis;
   preparation.metropolis_drift_budget_bytes = metropolis_drift;
@@ -1053,6 +1055,7 @@ psiformer::device::DeviceExecutionPreparation configuredGpuTargetPreparation(
             << ", per_provider_retained_coordinate_limit_bytes=" << retained_coordinates
             << ", per_crowd_metropolis_limit_bytes=" << metropolis
             << ", per_optimizer_adam_limit_bytes=" << adam
+            << ", maximum_active_inference_crowds=" << preparation.active_inference_crowds
             << ", aggregate_process_budget=no" << std::endl;
   return preparation;
 }
@@ -1088,6 +1091,7 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
               << ", parameter_version=" << version
               << (preparation.select_vgl_targets ? ", vgl_B1_preflight_targets=" : ", vgl_targets=")
               << preparation.vgl.max_targets
+              << ", maximum_active_inference_crowds=" << preparation.active_inference_crowds
               << ", CPU fallback=no" << std::endl;
   }, precision, preparation);
 #else

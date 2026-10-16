@@ -801,7 +801,7 @@ public:
         positions.size() % coordinates_per_configuration != 0)
       throw std::invalid_argument("Device inference positions exceed capacity or contain an incomplete configuration");
     setBatchCount(positions.size() / coordinates_per_configuration);
-    positions_.upload(positions.data(), positions.size());
+    positions_.uploadOnStream(positions.data(), positions.size(), queue_.getNative());
     evaluateOwnedCoordinates();
   }
 
@@ -1210,9 +1210,9 @@ public:
     if (phases.size() != batch_ || jets.size() != spatialJetSpanElements(result_layout_) ||
         ratios.size() != product(batch_, result_layout_.laplacian_lanes))
       throw std::invalid_argument("Device inference result buffers have wrong extent");
-    (target_preparation_.max_targets ? full_phase_ : phase_).download(phases.data(), phases.size());
-    (target_preparation_.max_targets ? full_output_ : output_).download(jets.data(), jets.size());
-    (target_preparation_.max_targets ? full_lap_ratio_ : lap_ratio_).download(ratios.data(), ratios.size());
+    (target_preparation_.max_targets ? full_phase_ : phase_).downloadOnStream(phases.data(), phases.size(), queue_.getNative());
+    (target_preparation_.max_targets ? full_output_ : output_).downloadOnStream(jets.data(), jets.size(), queue_.getNative());
+    (target_preparation_.max_targets ? full_lap_ratio_ : lap_ratio_).downloadOnStream(ratios.data(), ratios.size(), queue_.getNative());
   }
 
   /// Expose the fixed output layout for result comparison, not internal scratch.
@@ -1462,11 +1462,11 @@ private:
   /// Admit every tile's base before scattering or resetting its sticky status.
   void admitTileBase(bool first)
   {
-    phase_.download(tile_phase_.data(), batch_);
-    combinations_.download(host_combinations_.data(), batch_);
+    phase_.downloadOnStream(tile_phase_.data(), batch_, queue_.getNative());
+    combinations_.downloadOnStream(host_combinations_.data(), batch_, queue_.getNative());
     for (std::size_t configuration = 0; configuration < batch_; ++configuration)
     {
-      output_.download(&tile_log_[configuration], 1, final_.output.uncheckedValueOffset(configuration, 0));
+      output_.downloadOnStream(&tile_log_[configuration], 1, queue_.getNative(), final_.output.uncheckedValueOffset(configuration, 0));
       if (first)
       {
         canonical_phase_[configuration] = tile_phase_[configuration];
@@ -1556,7 +1556,7 @@ private:
       throw std::logic_error("Device inference status belongs to a stale evaluation");
     queue_.sync();
     InferenceStatusWord word;
-    sticky_status_.download(&word, 1);
+    sticky_status_.downloadOnStream(&word, 1, queue_.getNative());
     if (word != std::numeric_limits<InferenceStatusWord>::max())
       throw InferenceStatusError(word, evaluation_generation_);
     status_pending_ = false;
@@ -1578,7 +1578,7 @@ private:
       return;
     }
     queue_.sync();
-    open_status_.download(host_status_.data(), count);
+    open_status_.downloadOnStream(host_status_.data(), count, queue_.getNative());
     for (std::size_t i = 0; i < count; ++i)
       if (host_status_[i] != OpenSpatialStatus::REGULAR)
         throw InferenceStatusError((InferenceStatusWord(stage) << 48) |
@@ -1598,7 +1598,7 @@ private:
       return;
     }
     queue_.sync();
-    jet_status_.download(host_jet_status_.data(), count);
+    jet_status_.downloadOnStream(host_jet_status_.data(), count, queue_.getNative());
     for (std::size_t row = 0; row < count; ++row)
     {
       const auto status = host_jet_status_[row];
