@@ -915,6 +915,10 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     ParticleSet private_particles(electrons), sibling_particles(electrons);
     auto evaluator = source->makeClone(private_particles);
     auto sibling = source->makeClone(sibling_particles);
+    // ParticleSet copies recreate distance tables but do not evaluate their rows.
+    // Cloned LCAO evaluators require these rows before their first evaluateLog.
+    private_particles.update();
+    sibling_particles.update();
     auto& source_msd = source->findMSD()[0].get();
     auto& private_msd = evaluator->findMSD()[0].get();
     auto& sibling_msd = sibling->findMSD()[0].get();
