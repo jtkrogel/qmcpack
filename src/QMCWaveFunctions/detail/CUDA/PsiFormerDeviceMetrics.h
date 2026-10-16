@@ -136,7 +136,7 @@ public:
         throw std::logic_error("PsiFormer aggregate device admission cannot be reconfigured per component");
       return;
     }
-    if (allocation_calls_.load(std::memory_order_relaxed) || live_bytes_.load(std::memory_order_relaxed) || pending_bytes_)
+    if (allocation_started_.load(std::memory_order_relaxed) || pending_bytes_)
       throw std::logic_error("PsiFormer aggregate device admission must be configured before allocation");
     admission_ = policy;
     admission_configured_ = true;
@@ -178,6 +178,7 @@ public:
   /// Record a successful allocation before publishing the new buffer owner.
   void allocated(std::size_t bytes) noexcept
   {
+    allocation_started_.store(true, std::memory_order_relaxed);
     allocation_calls_.fetch_add(1, std::memory_order_relaxed);
     const auto live = live_bytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     auto peak = peak_bytes_.load(std::memory_order_relaxed);
@@ -257,6 +258,7 @@ private:
   mutable std::mutex admission_mutex_;
   DeviceMemoryAdmission admission_;
   bool admission_configured_ = false;
+  std::atomic<bool> allocation_started_{false};
   std::size_t pending_bytes_ = 0;
   std::atomic<std::size_t> allocation_calls_{0}, free_calls_{0}, failed_frees_{0};
   std::atomic<std::size_t> live_bytes_{0}, peak_bytes_{0};

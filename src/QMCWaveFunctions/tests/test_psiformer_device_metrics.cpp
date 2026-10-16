@@ -196,6 +196,14 @@ TEST_CASE("PsiFormer aggregate device admission validates scope and arithmetic",
   first.freed(19);
   second.freed(19);
 
+  DeviceMemoryMetrics late;
+  late.reserveAllocation(16).commit();
+  late.resetInterval();
+  CHECK_THROWS_AS(late.configureAdmission({100, 0}), std::logic_error);
+  late.freed(16);
+  late.resetInterval();
+  CHECK_THROWS_AS(late.configureAdmission({100, 0}), std::logic_error);
+
   DeviceMemoryMetrics unbounded;
   auto pending = unbounded.reserveAllocation(std::numeric_limits<std::size_t>::max());
   CHECK_THROWS_AS(unbounded.reserveAllocation(1), std::overflow_error);
