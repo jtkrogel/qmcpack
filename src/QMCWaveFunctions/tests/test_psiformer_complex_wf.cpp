@@ -13,6 +13,9 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerInitialization.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
+#include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
+#include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
+#include "QMCDrivers/WFTrain/DistributedParameterReduction.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "Utilities/RuntimeOptions.h"
 #include "OhmmsData/Libxml2Doc.h"
@@ -196,7 +199,7 @@ TEST_CASE("PsiFormer explicit complex scalar sibling specializes to the legacy r
   CHECK(complex.isFermionic());
   CHECK(complex.isMultiDet());
   CHECK_FALSE(complex.isOptimizable());
-  CHECK(complex.structuredParameterProvider() == nullptr);
+  CHECK(complex.structuredParameterProvider() == &complex);
   for (int electron = 0; electron < 4; ++electron)
   {
     for (int dimension = 0; dimension < 3; ++dimension)
@@ -726,7 +729,7 @@ TEST_CASE("PsiFormer complex structured provider publishes canonical real tensor
   PsiFormerComplexWF component("provider", initialized, p, source, clone_cap, {.17, -.11, .07});
   auto base_clone = component.makeClone(clone_p);
   auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base_clone);
-  CHECK(component.structuredParameterProvider() == nullptr); // live training discovery stays closed
+  CHECK(component.structuredParameterProvider() == &component); // CPU structured route only; scalar optimizer stays closed
   CHECK_FALSE(component.isOptimizable()); // no P scalar names or legacy optimizer admission
   const auto& schema = component.parameterSchema();
   REQUIRE(schema.blocks().size() == initialized.layouts.size());
@@ -816,7 +819,7 @@ TEST_CASE("PsiFormer complex structured provider publishes canonical real tensor
   invalid.version = std::numeric_limits<std::size_t>::max();
   CHECK_THROWS(component.publishParameters(invalid, invalid.version));
   unchanged();
-  CHECK(component.structuredParameterProvider() == nullptr);
+  CHECK(component.structuredParameterProvider() == &component);
 }
 
 TEST_CASE("PsiFormer complex pending family guard releases on every revocation boundary",
@@ -952,7 +955,7 @@ TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic co
   CHECK(diagnostic.complex_parameter_vectors == 5);
   CHECK(stream->capabilities().maximum_vjp_channels == 3);
   CHECK_FALSE(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
-  CHECK(component.structuredParameterProvider() == nullptr);
+  CHECK(component.structuredParameterProvider() == &component);
   const auto& schema = stream->parameterSchema();
   std::array<std::vector<C>, 3> coefficients{{{{.3, -.2}, {-.4, .1}},
       {{.7, .15}, {.2, -.35}}, {{-.6, .4}, {.8, -.1}}}};
@@ -1100,7 +1103,7 @@ TEST_CASE("PsiFormer complex stream physical finite differences and concrete fac
   clone_p.rejectMove(0);
   sink.reset();
   CHECK_NOTHROW(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
-  CHECK(component.structuredParameterProvider() == nullptr);
+  CHECK(component.structuredParameterProvider() == &component);
 }
 #ifdef ENABLE_CUDA
 TEST_CASE("PsiFormer complex GPU inference shares one capped lane without CPU tapes",
@@ -1237,4 +1240,132 @@ TEST_CASE("PsiFormer complex GPU inference shares one capped lane without CPU ta
   }
 }
 #endif
+
+TEST_CASE("PsiFormer CPU pathwise gradient differentiates the complete reweighted finite objective",
+          "[wavefunction][psiformer][complex_wf][complex_training]")
+{
+  using namespace wftrain;
+  auto lattice = cell();
+  lattice.LR_dim_cutoff = 15;
+  lattice.reset();
+  const SimulationCell simulation_cell(lattice);
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  for (auto* target : {&p, &clone_p})
+  {
+    const int mass = target->getSpeciesSet().findAttribute("mass");
+    target->getSpeciesSet()(mass, 0) = .7;
+    target->getSpeciesSet()(mass, 1) = 1.9;
+    const int charge = target->getSpeciesSet().addAttribute("charge");
+    target->getSpeciesSet()(charge, 0) = target->getSpeciesSet()(charge, 1) = -1;
+    target->resetGroups();
+    target->createSK();
+  }
+  clone_p.R[1][2] += .073;
+  clone_p.update();
+  PsiFormerWaveFunctionBuilder::PSetMap pool;
+  pool.emplace("ion0", std::make_unique<ParticleSet>(ions(simulation_cell)));
+  auto& source = *pool.at("ion0");
+  source.createSK();
+  RuntimeOptions options;
+  TrialWaveFunction trial(options);
+  auto owner = std::make_unique<PsiFormerComplexWF>("pathwise", parameters(), p, source, clone_cap,
+                                                  std::array<double, 3>{.17, -.11, .07});
+  auto& component = *owner;
+  trial.addComponent(std::move(owner));
+  auto clone_trial = trial.makeClone(clone_p);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*clone_trial->getOrbitals()[0]);
+  std::array<TrialWaveFunction*, 2> wavefunctions{&trial, clone_trial.get()};
+  std::array<ParticleSet*, 2> particles{&p, &clone_p};
+  std::array<std::unique_ptr<QMCHamiltonian>, 2> hamiltonians;
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    Libxml2Document input;
+    REQUIRE(input.parseFromString("<hamiltonian>" + coulombTerms + "</hamiltonian>"));
+    HamiltonianFactory factory("pathwise_coulomb", *particles[sample], pool,
+                              OptionalRef<TrialWaveFunction>(*wavefunctions[sample]), OHMMS::Controller);
+    REQUIRE(factory.put(input.getRoot()));
+    hamiltonians[sample] = factory.releaseHamiltonian();
+  }
+  source.update();
+  // Refresh the actual accepted TWF/H pair before borrowing its complete complex energy.
+  const auto observe = [&](std::size_t sample) {
+    auto& target = *particles[sample];
+    target.update();
+    wavefunctions[sample]->evaluateLog(target);
+    const double real_energy = hamiltonians[sample]->evaluate(*wavefunctions[sample], target);
+    auto& actual = sample == 0 ? component : clone;
+    const auto complete = actual.observeCoulombEnergy(target, hamiltonians[sample]->getLocalPotential());
+    CHECK(complete.local_energy.real() == Approx(real_energy).epsilon(2e-11));
+    return std::make_pair(C{wavefunctions[sample]->getLogPsi(), wavefunctions[sample]->getPhase()},
+                          complete.local_energy);
+  };
+  const auto original = component.snapshotParameters();
+  const auto identity = component.trainingConfigurationFingerprint();
+  CHECK(clone.trainingConfigurationFingerprint() == identity);
+  std::array<C, 2> log_reference;
+  PreparedEnergyGradientBatch batch;
+  batch.weights = {.4, 1.3};
+  batch.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    const auto result = observe(sample);
+    log_reference[sample] = result.first;
+    batch.local_energies.push_back(result.second);
+  }
+  CHECK(std::abs(batch.local_energies[0].imag()) > 1e-8);
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  components.push_back(clone);
+  RefVectorWithLeader<ParticleSet> particle_refs(p);
+  particle_refs.push_back(p);
+  particle_refs.push_back(clone_p);
+  batch.derivative_operator = component.makeBudgetedStreamingDerivativeOperator(components, particle_refs,
+      0, 0, 5, component.streamingDerivativeRequiredBytes(2));
+  std::vector<PreparedEnergyGradientBatch> batches;
+  batches.push_back(std::move(batch));
+  PreparedEnergyGradientProducer producer(std::move(batches));
+  EnergyGradientAccumulator accumulator(component.parameterSchema(), original.version,
+                                        EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY);
+  producer.accumulate(original, accumulator);
+  DistributedParameterReduction reduction(*OHMMS::Controller);
+  reduction.reduce(accumulator);
+  const auto gradient = accumulator.finalize();
+  std::vector<double> direction(original.values.size());
+  double analytic = 0;
+  std::size_t index = 0;
+  for (const auto& block : component.parameterSchema().blocks())
+  {
+    direction[block.offset] = (++index % 2) ? .08 : -.05;
+    analytic += direction[block.offset] * gradient.gradient[block.offset];
+  }
+  // Moving the complete normalized finite objective differentiates BOTH weights and local energies.
+  const auto objective = [&](double displacement) {
+    auto candidate = component.snapshotParameters();
+    candidate.values = original.values;
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+      candidate.values[parameter] += displacement * direction[parameter];
+    component.publishParameters(candidate, candidate.version);
+    double numerator = 0, denominator = 0;
+    for (std::size_t sample = 0; sample < 2; ++sample)
+    {
+      const auto result = observe(sample);
+      const double weight = (sample == 0 ? .4 : 1.3) *
+          std::exp(2 * (result.first.real() - log_reference[sample].real()));
+      numerator += weight * result.second.real();
+      denominator += weight;
+    }
+    CHECK(component.trainingConfigurationFingerprint() == identity);
+    return numerator / denominator;
+  };
+  const double epsilon = 2e-5;
+  const double plus = objective(epsilon), minus = objective(-epsilon);
+  CHECK(analytic == Approx((plus - minus) / (2 * epsilon)).margin(3e-5));
+  auto restored = component.snapshotParameters();
+  restored.values = original.values;
+  component.publishParameters(restored, restored.version);
+  CHECK(component.trainingConfigurationFingerprint() == identity);
+  auto other_p = electrons(simulation_cell);
+  PsiFormerComplexWF wrong_twist("pathwise", parameters(), other_p, source, clone_cap, {.18, -.11, .07});
+  CHECK(wrong_twist.trainingConfigurationFingerprint() != identity);
+}
 } // namespace qmcplusplus

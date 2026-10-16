@@ -38,6 +38,7 @@
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerOrbitalTargets.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
@@ -82,13 +83,16 @@ struct RetainedCrowdSamples
 };
 
 /** Copy an observed population before later MC moves overwrite its positions. */
-RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool overlap)
+RetainedCrowdSamples retainCrowdSamples(Crowd& crowd, std::size_t index, bool overlap,
+                                       bool exact_energy_capacity = false)
 {
   RetainedCrowdSamples result;
   result.crowd_index = index;
   const auto& electrons = crowd.get_walker_elecs();
   const auto& wavefunctions = crowd.get_walker_twfs();
   const auto& walkers = crowd.get_walkers();
+  if (exact_energy_capacity)
+    result.local_energies.reserve(crowd.size());
   for (std::size_t sample = 0; sample < crowd.size(); ++sample)
   {
     result.particles.push_back(std::make_unique<ParticleSet>(electrons[sample]));
@@ -294,7 +298,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     std::size_t sample_offset,
     std::size_t maximum_parameter_chunk_size,
     bool has_nonlocal_ecp,
-    bool capture_ecp_jvp_replay)
+    bool capture_ecp_jvp_replay,
+    bool complex_training = false)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -306,6 +311,45 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   batch.weights.assign(walkers.size(), 1.0);
   batch.local_energy_term_mask =
       wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+
+#ifdef QMC_COMPLEX
+  if (complex_training)
+  {
+    const auto& hamiltonians = crowd.get_walker_hamiltonians();
+    RefVectorWithLeader<QMCHamiltonian> hamiltonian_batch(hamiltonians[0], hamiltonians);
+    ResourceCollectionTeamLock<ParticleSet> particle_lock(crowd.getSharedResource().pset_res, electron_batch);
+    ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, twf_batch);
+    ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(crowd.getSharedResource().ham_res, hamiltonian_batch);
+    ParticleSet::mw_update(electron_batch);
+    TrialWaveFunction::mw_evaluateLog(twf_batch, electron_batch);
+    // Resolve actual replay batch leaders/clones; the primary prototype cannot stand in for them.
+    auto componentAt = [&](std::size_t sample) -> PsiFormerComplexWF& {
+      const auto& components = twfs[sample].get().getOrbitals();
+      auto* component = components.size() == 1 ? dynamic_cast<PsiFormerComplexWF*>(components[0].get()) : nullptr;
+      if (!component || component->gpuInferenceEnabled() ||
+          component->parameterSchema().providerId() != provider_id)
+        throw std::invalid_argument("WFTrainBatched: paired CPU batch lost its sole component/provider binding");
+      return *component;
+    };
+    auto& leader = componentAt(0);
+    RefVectorWithLeader<WaveFunctionComponent> component_batch(leader);
+    batch.local_energies.reserve(walkers.size());
+    for (std::size_t sample = 0; sample < walkers.size(); ++sample)
+    {
+      auto& component = componentAt(sample);
+      component_batch.push_back(component);
+      auto& hamiltonian = hamiltonians[sample].get();
+      auto& p = electrons[sample].get();
+      hamiltonian.evaluate(twfs[sample].get(), p);
+      // The actual admitted same-sample Coulomb H supplies V; REAL walker properties are reporting only.
+      batch.local_energies.push_back(component.observeCoulombEnergy(p, hamiltonian.getLocalPotential()).local_energy);
+    }
+    const auto required = leader.streamingDerivativeRequiredBytes(walkers.size());
+    batch.derivative_operator = leader.makeBudgetedStreamingDerivativeOperator(
+        component_batch, electron_batch, batch_ordinal, sample_offset, maximum_parameter_chunk_size, required);
+    return batch;
+  }
+#endif
 
   if (!has_nonlocal_ecp)
   {
@@ -819,10 +863,13 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
                                           const VMCDriverInput& vmc,
                                           const wftrain::StructuredParameterSchema& schema,
                                           std::size_t steps_per_block,
-                                          std::uint64_t resolved_overlap_fingerprint)
+                                          std::uint64_t resolved_overlap_fingerprint,
+                                          const std::string& complex_physical_identity = {})
 {
   std::uint64_t hash = UINT64_C(1469598103934665603);
   extendStageFingerprint(hash, schema.fingerprint());
+  if (!complex_physical_identity.empty())
+    extendStageFingerprint(hash, complex_physical_identity);
   const auto objective = static_cast<std::underlying_type_t<WFTrainDriverInput::Objective>>(
       training.getObjective());
   const auto optimizer = static_cast<std::underlying_type_t<WFTrainDriverInput::Optimizer>>(
@@ -959,6 +1006,23 @@ void WFTrainBatched::process(xmlNodePtr node)
 
     if (population_.get_golden_electrons().isSpinor())
       throw UniformCommunicateError("WFTrainBatched: spinor training is not supported");
+#ifdef QMC_COMPLEX
+    for (const auto& orbital : student_prototype_.getOrbitals())
+      if (const auto* complex = dynamic_cast<const PsiFormerComplexWF*>(orbital.get()))
+      {
+        using O = WFTrainDriverInput::Optimizer;
+        const auto cap = training_input_.getMaximumRetainedBytes();
+        if (complex->gpuInferenceEnabled() || student_prototype_.getOrbitals().size() != 1 ||
+            training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+            (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD) ||
+            training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+            training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
+            training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
+            !cap || cap == std::numeric_limits<std::size_t>::max())
+          throw UniformCommunicateError("WFTrainBatched: paired training requires sole CPU ENERGY Adam/plainSGD, "
+              "unclipped fixed step, no metric/selection controls, and positive finite maximum_retained_bytes");
+      }
+#endif
     if (training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY)
       validateHamiltonianForTraining();
 
@@ -1043,6 +1107,61 @@ void WFTrainBatched::run()
 
   const IndexType num_blocks = qmcdriver_input_.get_max_blocks();
   const int num_iterations = static_cast<int>(training_input_.getIterations());
+  bool complex_training = false;
+  std::size_t complex_expected_prepared_bytes = 0;
+  std::string complex_physical_identity;
+#ifdef QMC_COMPLEX
+  if (const auto* complex = dynamic_cast<const PsiFormerComplexWF*>(selected_provider_))
+  {
+    complex_training = true;
+    std::exception_ptr budget_failure;
+    std::size_t prospective = 0, allowance = 0;
+    try
+    {
+      // One snapshot per walker/block/STEP, not per electron or VMC substep.
+      std::size_t walkers = 0, largest_batch = 0;
+      for (const auto& crowd : crowds_)
+      {
+        walkers = checkedMemoryAdd(walkers, crowd->size());
+        largest_batch = std::max(largest_batch, static_cast<std::size_t>(crowd->size()));
+      }
+      if (!walkers || !num_blocks || !steps_per_block_)
+        throw std::invalid_argument("WFTrainBatched: paired training requires samples on every rank");
+      const auto samples = checkedMemoryMultiply(walkers,
+          checkedMemoryMultiply(static_cast<std::size_t>(num_blocks), steps_per_block_));
+      const auto& target = population_.get_golden_electrons();
+      const auto n = static_cast<std::size_t>(target.getTotalNum());
+      const auto p = selected_provider_->parameterSchema().parameterCount();
+      // R(S) counts the weak-shared family lane ONCE and all disjoint immutable coordinates/masses.
+      complex_expected_prepared_bytes = checkedMemoryAdd(complex->streamingDerivativeRequiredBytes(samples),
+          checkedMemoryMultiply(samples, sizeof(wftrain::DerivativeReal) + sizeof(wftrain::DerivativeValue)));
+      const auto configuration_bytes = checkedMemoryMultiply(samples, checkedMemoryAdd(sizeof(double),
+          checkedMemoryMultiply(n, sizeof(target.R[0]) + sizeof(target.G[0]) + sizeof(target.L[0]))));
+      const auto optimizer_bytes = training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM
+          ? checkedMemoryMultiply(checkedMemoryMultiply(2, p), sizeof(double)) : 0;
+      // Explicit conservative allowance, NOT measured retained storage or a hard process-peak claim.
+      allowance = checkedMemoryAdd(checkedMemoryMultiply(p,
+          12 * sizeof(double) + 3 * sizeof(wftrain::DerivativeValue)),
+          checkedMemoryMultiply(checkedMemoryMultiply(2, largest_batch), sizeof(wftrain::DerivativeValue)));
+      prospective = checkedMemoryAdd(checkedMemoryAdd(complex_expected_prepared_bytes, configuration_bytes),
+          checkedMemoryAdd(optimizer_bytes, allowance));
+      complex_physical_identity = complex->trainingConfigurationFingerprint();
+    }
+    catch (...) { budget_failure = std::current_exception(); }
+    int failed = budget_failure ? 1 : 0;
+    myComm->allreduce(failed);
+    if (failed)
+    {
+      if (budget_failure)
+        std::rethrow_exception(budget_failure);
+      throw UniformCommunicateError("WFTrainBatched: another rank failed paired training preallocation admission");
+    }
+    enforceMemoryBudget(*myComm, prospective, training_input_.getMaximumRetainedBytes());
+    app_log() << "WFTrain paired CPU prospective named numeric bytes plus allowance=" << prospective
+              << ", conservative first-order allowance=" << allowance
+              << "; excludes shared model, inference clones, opaque ParticleSet caches, allocator/RSS" << std::endl;
+  }
+#endif
   estimator_manager_->startDriverRun();
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
@@ -1065,7 +1184,8 @@ void WFTrainBatched::run()
   wftrain::TrainingCapabilities requirements{
       wftrain::TrainingCapability::VALUE_EVALUATION};
   wftrain::HighParameterTraining trainer(
-      requirements, wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+      requirements, complex_training ? wftrain::EnergyGradientEstimator::PATHWISE_LOCAL_ENERGY
+                                    : wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
       reduction);
   const auto initial_parameters = selected_provider_->snapshotParameters();
   if (initial_parameters.schema_fingerprint != selected_provider_->parameterSchema().fingerprint() ||
@@ -1129,7 +1249,7 @@ void WFTrainBatched::run()
       0, 0,
       stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
                                     selected_provider_->parameterSchema(), steps_per_block_,
-                                    overlap_fingerprint)};
+                                    overlap_fingerprint, complex_physical_identity)};
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;
@@ -1260,7 +1380,7 @@ void WFTrainBatched::run()
             if (crowds_[crowd_index]->size())
             {
               retained_samples.push_back(retainCrowdSamples(
-                  *crowds_[crowd_index], crowd_index, determinant_overlap));
+                  *crowds_[crowd_index], crowd_index, determinant_overlap, complex_training));
               const auto& snapshot = retained_samples.back();
               retained_configuration_bytes = checkedMemoryAdd(retained_configuration_bytes,
                   checkedMemoryMultiply(snapshot.local_energies.capacity(), sizeof(double)));
@@ -1564,7 +1684,7 @@ void WFTrainBatched::run()
             batches.push_back(prepareCrowdBatch(
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,
-                capture_ecp_jvp_replay));
+                capture_ecp_jvp_replay, complex_training));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);
@@ -1576,6 +1696,8 @@ void WFTrainBatched::run()
             sample_offset += crowd.size();
           }
           storage_diagnostics = preparedStorageDiagnostics(batches);
+          if (complex_training && storage_diagnostics.retained_numeric_bytes != complex_expected_prepared_bytes)
+            throw std::logic_error("WFTrainBatched: paired prepared capacity differs from exact preallocation admission");
           // RSS covers ParticleSet/teacher caches that numeric diagnostics omit.
         }
         catch (...)
@@ -1628,7 +1750,8 @@ void WFTrainBatched::run()
           storage_diagnostics = producer->storageDiagnostics();
           retained_numeric_bytes = storage_diagnostics.retained_numeric_bytes +
               first_order_optimizer->retainedBytes();
-          enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes),
+          const auto aggregate = checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes);
+          enforceMemoryBudget(*myComm, aggregate,
                               training_input_.getMaximumRetainedBytes());
           iteration_result = trainer.runIteration(*selected_provider_, *producer,
                                                   *decorate(*first_order_optimizer), training_state,

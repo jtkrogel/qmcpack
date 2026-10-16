@@ -15,4 +15,19 @@ if(QMC_COMPLEX AND NOT QMC_MIXED_PRECISION)
                          ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1"
                          TIMEOUT 300 LABELS "deterministic;psiformer;cpu;periodic;complex")
   endforeach()
+  foreach(optimizer adam sgd)
+    set(variant complex_gamma)
+    if(optimizer STREQUAL "sgd")
+      set(variant complex_twist)
+    endif()
+    set(test_name deterministic-LiH-psiformer-cpu-${optimizer}-training)
+    add_test(NAME ${test_name}
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_cpu_training.py
+                     --binary $<TARGET_FILE:qmcpack> --optimizer ${optimizer}
+                     --input ${CMAKE_CURRENT_SOURCE_DIR}/${variant}.xml
+                     --output ${CMAKE_CURRENT_BINARY_DIR}/training_${optimizer})
+    set_tests_properties(${test_name} PROPERTIES
+                         ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1"
+                         TIMEOUT 1200 LABELS "deterministic;psiformer;cpu;periodic;complex;wftrain")
+  endforeach()
 endif()

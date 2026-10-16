@@ -785,6 +785,41 @@ PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const
   return impl_->numericStorage();
 }
 
+/// Bind restart to fixed physical semantics, never mutable parameters or pointer identities.
+std::string PsiFormerComplexWF::trainingConfigurationFingerprint() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  const auto& s = *impl_->state;
+  std::uint64_t hash = PERSISTENT_FINGERPRINT_OFFSET;
+  mixPersistentString(hash, "cpu_complex_pathwise_coulomb_v1");
+  mixPersistentString(hash, s.profile);
+  mixPersistentInteger(hash, s.seed);
+  mixPersistentString(hash, s.schema->fingerprint());
+  mixPersistentInteger(hash, static_cast<std::uint64_t>(s.environment.geometry_feature_policy));
+  for (bool periodic : s.environment.periodic_axes)
+    mixPersistentInteger(hash, periodic);
+  for (const auto& row : s.environment.lattice_vectors)
+    for (double value : row)
+      mixPersistentDouble(hash, value);
+  mixPersistentInteger(hash, s.model.cfg.nup);
+  mixPersistentInteger(hash, s.model.cfg.ndown);
+  mixPersistentInteger(hash, s.model.ndet);
+  mixPersistentInteger(hash, s.model.dim);
+  mixPersistentInteger(hash, s.model.heads);
+  mixPersistentInteger(hash, s.model.blocks);
+  for (const auto* values : {&s.model.cfg.nuclei.x, &s.model.cfg.charges.x})
+    for (double value : *values)
+      mixPersistentDouble(hash, value);
+  for (const auto& twist : {s.reduced_twist, s.cartesian_twist})
+    for (double value : twist)
+      mixPersistentDouble(hash, value);
+  for (double mass : impl_->particles->get_mass_by_group())
+    mixPersistentDouble(hash, mass);
+  std::ostringstream text;
+  text << std::hex << std::setw(16) << std::setfill('0') << hash;
+  return text.str();
+}
+
 /// Preflight an independent derivative budget without constructing either retained tape.
 std::size_t PsiFormerComplexWF::streamingDerivativeRequiredBytes(std::size_t samples) const
 {

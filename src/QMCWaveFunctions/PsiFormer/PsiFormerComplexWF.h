@@ -5,7 +5,7 @@
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexWF.h
  * @brief Native-free paired-head inference sibling with explicit CPU or serialized GPU numerics.
- * Structured provider/state is prepared, but live training discovery remains closed.
+ * CPU first-order structured training is explicit; GPU optimization remains closed.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
@@ -46,8 +46,12 @@ public:
   /// Report the explicitly qualified component rather than impersonating the real adapter.
   std::string getClassName() const override { return "PsiFormerComplexWF"; }
 
-  /// Discovery stays closed until the streaming and complete-energy driver bindings qualify.
-  wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override { return nullptr; }
+  /// Only the CPU sibling participates in qualified structured first-order training.
+  wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override
+  { return gpuInferenceEnabled() ? nullptr : this; }
+
+  /// Stable physical restart identity, independent of parameter values/version and runtime addresses.
+  std::string trainingConfigurationFingerprint() const;
 
   /// Return immutable canonical REAL64 tensors, including distinct w and w_imag blocks.
   const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override;
@@ -62,7 +66,7 @@ public:
   /// Exact two-tape lane plus immutable sample storage, not the inference clone budget.
   std::size_t streamingDerivativeRequiredBytes(std::size_t sample_count) const;
 
-  /// Explicit capped numerical binding; discovery and the unbudgeted factory remain closed.
+  /// Explicit capped numerical binding; the unbudgeted factory remains closed.
   std::unique_ptr<wftrain::StreamingDerivativeOperator> makeBudgetedStreamingDerivativeOperator(
       const RefVectorWithLeader<WaveFunctionComponent>& components,
       const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal,
