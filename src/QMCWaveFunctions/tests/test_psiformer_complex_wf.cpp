@@ -709,4 +709,172 @@ TEST_CASE("PsiFormer public inference rejects unsafe inherited fallback APIs",
   close(gradient[0], C{.3, .4});
   close(ratios[0], C{.7, -.2});
 }
+
+TEST_CASE("PsiFormer complex structured provider publishes canonical real tensors atomically",
+          "[wavefunction][psiformer][complex_wf][complex_provider]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto clone_p = electrons(simulation_cell);
+  auto reference_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  auto initialized = parameters();
+  PsiFormerComplexWF component("provider", initialized, p, source, clone_cap, {.17, -.11, .07});
+  auto base_clone = component.makeClone(clone_p);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base_clone);
+  CHECK(component.structuredParameterProvider() == nullptr); // live training discovery stays closed
+  CHECK_FALSE(component.isOptimizable()); // no P scalar names or legacy optimizer admission
+  const auto& schema = component.parameterSchema();
+  REQUIRE(schema.blocks().size() == initialized.layouts.size());
+  REQUIRE(schema.parameterCount() == initialized.values.size());
+  CHECK(&schema == &clone.parameterSchema());
+  std::size_t imaginary_blocks = 0, changed_index = schema.parameterCount();
+  for (std::size_t i = 0; i < schema.blocks().size(); ++i)
+  {
+    const auto& block = schema.blocks()[i];
+    const auto& layout = initialized.layouts[i];
+    CHECK(block.id == layout.module + "/" + layout.name);
+    CHECK(block.shape == layout.shape);
+    CHECK(block.offset == layout.begin);
+    CHECK(block.count == layout.end - layout.begin);
+    CHECK(block.scalar_domain == wftrain::ParameterScalarDomain::REAL64);
+    if (layout.name == "w_imag")
+    {
+      ++imaginary_blocks;
+      changed_index = block.offset;
+    }
+  }
+  CHECK(imaginary_blocks == 2);
+  REQUIRE(changed_index < schema.parameterCount());
+  const auto original = component.snapshotParameters();
+  CHECK(original.values == initialized.values);
+  CHECK(clone.snapshotParameters().values == original.values);
+  const auto before = evaluate(component, p);
+  evaluate(clone, clone_p);
+  WaveFunctionComponent::WFBufferType buffer;
+  component.registerData(p, buffer);
+  buffer.allocate();
+  buffer.rewind();
+  p.G = 0;
+  p.L = 0;
+  component.updateBuffer(p, buffer);
+  const auto storage = component.numericStorage();
+
+  auto candidate = original;
+  candidate.values[changed_index] += .04; // a real canonical coordinate in an independent imaginary head
+  const auto committed = component.publishParameters(candidate, original.version);
+  CHECK(committed == original.version + 1);
+  CHECK(component.snapshotParameters().values == candidate.values);
+  CHECK(clone.snapshotParameters().version == committed);
+  CHECK(clone.snapshotParameters().values == candidate.values);
+  CHECK_THROWS(component.observeCoulombEnergy(p, -2.7));
+  CHECK_THROWS(clone.observeCoulombEnergy(clone_p, -2.7));
+  buffer.rewind();
+  CHECK_THROWS(clone.copyFromBuffer(clone_p, buffer)); // old version is not a current accepted record
+  initialized.values = candidate.values;
+  PsiFormerComplexWF reference("reference", initialized, reference_p, source, clone_cap, {.17, -.11, .07});
+  const auto after = evaluate(component, p);
+  close(std::exp(after - evaluate(reference, reference_p)), C{1});
+  close(std::exp(after - evaluate(clone, clone_p)), C{1});
+  CHECK(std::abs(std::exp(after - before) - C{1}) > 1e-8);
+  CHECK(component.numericStorage().allocated_bytes == storage.allocated_bytes);
+  CHECK(component.numericStorage().fingerprint == storage.fingerprint);
+
+  const auto baseline = component.snapshotParameters();
+  const auto unchanged = [&] {
+    const auto snapshot = component.snapshotParameters();
+    CHECK(snapshot.version == baseline.version);
+    CHECK(snapshot.values == baseline.values);
+    CHECK(clone.snapshotParameters().version == baseline.version);
+  };
+  auto invalid = baseline;
+  invalid.schema_fingerprint += "/foreign";
+  CHECK_THROWS(component.publishParameters(invalid, baseline.version));
+  unchanged();
+  invalid = baseline;
+  invalid.values.pop_back();
+  CHECK_THROWS(component.publishParameters(invalid, baseline.version));
+  unchanged();
+  for (double nonfinite : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()})
+  {
+    invalid = baseline;
+    invalid.values[changed_index] = nonfinite;
+    CHECK_THROWS(component.publishParameters(invalid, baseline.version));
+    unchanged();
+  }
+  invalid = baseline;
+  invalid.version += 1;
+  CHECK_THROWS(component.publishParameters(invalid, baseline.version));
+  unchanged();
+  CHECK_THROWS(component.publishParameters(candidate, original.version)); // formerly valid but now stale
+  unchanged();
+  invalid = baseline;
+  invalid.version = std::numeric_limits<std::size_t>::max();
+  CHECK_THROWS(component.publishParameters(invalid, invalid.version));
+  unchanged();
+  CHECK(component.structuredParameterProvider() == nullptr);
+}
+
+TEST_CASE("PsiFormer complex pending family guard releases on every revocation boundary",
+          "[wavefunction][psiformer][complex_wf][complex_provider]")
+{
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell);
+  auto clone_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  PsiFormerComplexWF component("pending", parameters(), p, source, clone_cap);
+  auto base_clone = component.makeClone(clone_p);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base_clone);
+  const ParticleSet::PosType displacement{.007, -.011, .013};
+  const auto publish = [&] {
+    const auto snapshot = component.snapshotParameters();
+    CHECK(component.publishParameters(snapshot, snapshot.version) == snapshot.version + 1);
+  };
+  const auto blocked = [&] {
+    const auto snapshot = component.snapshotParameters();
+    CHECK_THROWS(component.publishParameters(snapshot, snapshot.version));
+    CHECK(component.snapshotParameters().version == snapshot.version);
+    CHECK(component.snapshotParameters().values == snapshot.values);
+  };
+
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, displacement);
+  clone.ratio(clone_p, 0);
+  blocked(); // a different clone's proposal still blocks the root provider
+  clone.restore(0);
+  clone_p.rejectMove(0);
+  publish();
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, displacement);
+  clone.ratio(clone_p, 0);
+  CHECK_THROWS(clone.restore(1)); // malformed restore also revokes its proposal count
+  clone_p.rejectMove(0);
+  publish();
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, displacement);
+  clone.ratio(clone_p, 0);
+  CHECK_THROWS(clone.ratio(clone_p, 1)); // failed replacement revokes preceding pending state
+  clone_p.rejectMove(0);
+  publish();
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, displacement);
+  clone.ratio(clone_p, 0);
+  CHECK_THROWS(clone.acceptMove(clone_p, 1));
+  clone_p.rejectMove(0);
+  publish();
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, displacement);
+  clone.ratio(clone_p, 0);
+  clone.acceptMove(clone_p, 0);
+  clone_p.acceptMove(0);
+  publish();
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, displacement);
+  clone.ratio(clone_p, 0);
+  blocked();
+  base_clone.reset(); // destruction must not leave the shared family permanently blocked
+  clone_p.rejectMove(0);
+  publish();
+  CHECK_NOTHROW(evaluate(component, p));
+}
 } // namespace qmcplusplus

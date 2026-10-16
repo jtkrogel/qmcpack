@@ -16,13 +16,13 @@
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_IMPL_H
 #ifdef QMC_COMPLEX
 
-/// Clone-local scalar preparation over one shared immutable paired model.
+/// Clone-local scalar preparation over one versioned, address-stable paired model.
 struct PsiFormerComplexWF::Impl
 {
   using C = psiformer::determinant::Complex;
   using Amplitude = psiformer::determinant::ComplexLogAmplitude;
 
-  /// Immutable state has a stable address before numerical executors bind its model.
+  /// Stable shared ownership keeps metadata/executors fixed while canonical values mutate under mutex.
   struct Model
   {
     /// Preserve paired metadata rather than recreating a default-real environment.
@@ -37,8 +37,8 @@ struct PsiFormerComplexWF::Impl
     }
 
     /// Retain initializer provenance and construct only qualified complex inference owners.
-    Model(InitializedNativeModel initialized, const ParticleSet& electrons, const ParticleSet& ions,
-          std::array<double, 3> reduced)
+    Model(const std::string& component_name, InitializedNativeModel initialized,
+          const ParticleSet& electrons, const ParticleSet& ions, std::array<double, 3> reduced)
         : model(std::move(initialized.model)), profile(std::move(initialized.profile)), seed(initialized.seed),
           environment(environmentFor(electrons)), reduced_twist(reduced),
           cartesian_twist(makeTwistPhase(electrons, reduced).cartesian),
@@ -46,7 +46,8 @@ struct PsiFormerComplexWF::Impl
               {model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0], model.ndet,
                model.dim, model.heads, model.blocks}, environment)), value(model, plan), spatial(model, plan),
           identity(persistentModelIdentity(model, "internal", profile, seed, environment,
-                                           reduced_twist, cartesian_twist)), source(&ions)
+                                           reduced_twist, cartesian_twist)), source(&ions),
+          schema(makeStructuredParameterSchema(component_name, model.p))
     {}
 
     pf::PsiFormer model;
@@ -59,6 +60,9 @@ struct PsiFormerComplexWF::Impl
     const pf::DirectComplexSpatialExecutor spatial;
     const std::uint64_t identity;
     const ParticleSet* const source;
+    const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
+    mutable std::shared_mutex mutex;
+    std::atomic<std::size_t> pending_proposals{0};
   };
 
   /// Validate the explicit initializer profile before consuming its canonical storage.
@@ -72,14 +76,15 @@ struct PsiFormerComplexWF::Impl
   }
 
   /// Prepare distinct VALUE/FULL/ACTIVE scratch; there is no real head or score tape.
-  Impl(psiformer::InitializedPsiFormerParameters initialized, const ParticleSet& electrons,
-       const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
-      : Impl(std::make_shared<const Model>(materialize(std::move(initialized), electrons, ions), electrons, ions, reduced),
+  Impl(const std::string& component_name, psiformer::InitializedPsiFormerParameters initialized,
+       const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
+      : Impl(std::make_shared<Model>(component_name, materialize(std::move(initialized), electrons, ions),
+                                   electrons, ions, reduced),
              electrons, limit)
   {}
 
-  /// Check the full requirement before allocating any clone-local numerical buffers.
-  Impl(std::shared_ptr<const Model> shared, const ParticleSet& electrons, std::size_t limit)
+  /// Check the full requirement before allocation; shared clones enter under their caller's read lease.
+  Impl(std::shared_ptr<Model> shared, const ParticleSet& electrons, std::size_t limit)
       : state(std::move(shared)), particles(&electrons), numeric_limit(limit)
   {
     using namespace psiformer;
@@ -131,8 +136,22 @@ struct PsiFormerComplexWF::Impl
     return {numeric_required, bytes, numeric_limit, fingerprint};
   }
 
+  /// Release exactly this clone's family proposal count under its caller's read transaction.
+  void discardPending() noexcept
+  {
+    if (pending)
+    {
+      pending = false;
+      state->pending_proposals.fetch_sub(1, std::memory_order_relaxed);
+    }
+  }
+
   /// Revoke all accepted/proposed publications without reallocating scratch.
-  void invalidate() noexcept { pending = accepted_valid = own_full_valid = false; }
+  void invalidate() noexcept
+  {
+    discardPending();
+    accepted_valid = own_full_valid = false;
+  }
 
   /// Persistence and energy observation never consume an unresolved particle proposal.
   void requireIdle(const ParticleSet& p) const
@@ -349,10 +368,12 @@ struct PsiFormerComplexWF::Impl
     proposed_particle = electron;
     proposed_key = configurationIdentity(p, electron);
     proposed_version = state->model.p.version();
+    if (!pending)
+      state->pending_proposals.fetch_add(1, std::memory_order_relaxed);
     pending = true;
   }
 
-  std::shared_ptr<const Model> state;
+  std::shared_ptr<Model> state;
   const ParticleSet* particles;
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
   std::unique_ptr<pf::DirectComplexSpatialWorkspace> full, active;
@@ -371,25 +392,86 @@ struct PsiFormerComplexWF::Impl
 /// Construct only the explicit paired profile; the XML builder remains unchanged in this slice.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, psiformer::InitializedPsiFormerParameters initialized,
     const ParticleSet& electrons, const ParticleSet& ions, std::size_t limit, std::array<double, 3> reduced)
-    : WaveFunctionComponent(name), impl_(std::make_unique<Impl>(std::move(initialized), electrons, ions, limit, reduced))
+    : WaveFunctionComponent(name),
+      impl_(std::make_unique<Impl>(name, std::move(initialized), electrons, ions, limit, reduced))
 {}
 
-/// A clone shares only immutable model ownership and starts with invalid evaluation caches.
+/// A clone shares versioned model ownership and starts with invalid evaluation caches.
 PsiFormerComplexWF::PsiFormerComplexWF(std::string name, std::unique_ptr<Impl> impl)
     : WaveFunctionComponent(name), impl_(std::move(impl))
 {}
 
 /// Expose honest per-clone numeric admission rather than the legacy batch-budget policy.
-PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const { return impl_->numericStorage(); }
+PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return impl_->numericStorage();
+}
 
 /// Destroy native numerical state only in the sole owner TU.
-PsiFormerComplexWF::~PsiFormerComplexWF() = default;
+PsiFormerComplexWF::~PsiFormerComplexWF()
+{
+  std::shared_lock read(impl_->state->mutex);
+  impl_->discardPending();
+}
 
 /// Report the actual complete determinant expansion.
-bool PsiFormerComplexWF::isMultiDet() const { return impl_->state->model.ndet > 1; }
+bool PsiFormerComplexWF::isMultiDet() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return impl_->state->model.ndet > 1;
+}
+
+/// Immutable schema ownership is stable across every clone and publication; no read lock is needed.
+const wftrain::StructuredParameterSchema& PsiFormerComplexWF::parameterSchema() const noexcept
+{
+  return *impl_->state->schema;
+}
+
+/// Copy canonical values and their exact version in one read transaction.
+wftrain::StructuredParameterSnapshot PsiFormerComplexWF::snapshotParameters() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  const auto& parameters = impl_->state->model.p;
+  return {parameterSchema().fingerprint(), parameters.version(), parameters.flat_values()};
+}
+
+/// Validate every candidate invariant before the same-size native copy synchronizes graph leaves.
+std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
+                                                std::size_t expected_version)
+{
+  if (candidate.schema_fingerprint != parameterSchema().fingerprint() ||
+      candidate.values.size() != parameterSchema().parameterCount() || candidate.version != expected_version)
+    throw std::invalid_argument("Complex PsiFormer publication schema, extent or source version mismatch");
+  if (expected_version == std::numeric_limits<std::size_t>::max())
+    throw std::overflow_error("Complex PsiFormer parameter version exhausted");
+  for (double value : candidate.values)
+    if (!psiformer::determinant::isFiniteReal(value))
+      throw std::invalid_argument("Complex PsiFormer publication values must be finite");
+
+  std::unique_lock write(impl_->state->mutex);
+  auto& parameters = impl_->state->model.p;
+  if (parameters.version() != expected_version)
+    throw std::runtime_error("Complex PsiFormer publication rejected a stale parameter version");
+  if (impl_->state->pending_proposals.load(std::memory_order_relaxed) != 0)
+    throw std::logic_error("Complex PsiFormer publication requires no family pending proposals");
+  // Native preflight allocates/resolves leaves BEFORE any value mutates; the final copies cannot throw.
+  parameters.set_flat_values(candidate.values);
+  impl_->invalidate();
+  // Other clones reject old accepted/buffer versions lazily; no clone pointer registry is retained.
+  return parameters.version();
+}
 
 /// Validate complete scatter before publishing any accepted amplitude or caller G/L.
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& p,
+    ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l)
+{
+  std::shared_lock read(impl_->state->mutex);
+  return evaluateLogLocked(p, g, l);
+}
+
+/// Perform FULL scatter only under the public caller's existing read transaction.
+PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLogLocked(const ParticleSet& p,
     ParticleSet::ParticleGradient& g, ParticleSet::ParticleLaplacian& l)
 {
   impl_->invalidate();
@@ -434,7 +516,8 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::evaluateLog(const ParticleSet& 
 /// VALUE ratio proposals never allocate a spatial or parameter tape.
 PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratio(ParticleSet& p, int electron)
 {
-  impl_->pending = false;
+  std::shared_lock read(impl_->state->mutex);
+  impl_->discardPending();
   impl_->validate(p, electron, true);
   impl_->positions(*impl_->value, p, electron);
   const auto result = impl_->state->value.evaluate(*impl_->value);
@@ -447,6 +530,7 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratio(ParticleSet& p, int elect
 /// Accepted ACTIVE jets do not overwrite accepted scalar or pending move state.
 PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGrad(ParticleSet& p, int electron)
 {
+  std::shared_lock read(impl_->state->mutex);
   impl_->validate(p, electron);
   if (electron < 0)
     throw std::invalid_argument("Complex PsiFormer gradient electron is negative");
@@ -461,7 +545,8 @@ PsiFormerComplexWF::GradType PsiFormerComplexWF::evalGrad(ParticleSet& p, int el
 /// Form finite ratio/gradient staging before the nonthrowing caller/proposal publication.
 PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGrad(ParticleSet& p, int electron, GradType& gradient)
 {
-  impl_->pending = false;
+  std::shared_lock read(impl_->state->mutex);
+  impl_->discardPending();
   impl_->validate(p, electron, true);
   impl_->positions(*impl_->active, p, electron);
   const auto result = impl_->state->spatial.evaluateActive(*impl_->active, electron);
@@ -482,8 +567,9 @@ PsiFormerComplexWF::PsiValue PsiFormerComplexWF::ratioGrad(ParticleSet& p, int e
 /// Commit cached amplitude only after proving ParticleSet active proposal provenance.
 void PsiFormerComplexWF::acceptMove(ParticleSet& p, int electron, bool)
 {
+  std::shared_lock read(impl_->state->mutex);
   const bool pending = impl_->pending;
-  impl_->pending = false;
+  impl_->discardPending();
   impl_->validate(p, electron, true);
   if (!pending || !impl_->accepted_valid ||
       impl_->accepted_key != configurationIdentity(p) ||
@@ -502,14 +588,18 @@ void PsiFormerComplexWF::acceptMove(ParticleSet& p, int electron, bool)
 /// Reject mismatched restore requests without committing or evaluating any move.
 void PsiFormerComplexWF::restore(int electron)
 {
-  if (impl_->pending && electron != impl_->proposed_particle)
+  std::shared_lock read(impl_->state->mutex);
+  const bool pending = impl_->pending;
+  const int proposed_particle = impl_->proposed_particle;
+  impl_->discardPending();
+  if (pending && electron != proposed_particle)
     throw std::logic_error("Complex PsiFormer restore does not match its cached proposal");
-  impl_->pending = false;
 }
 
 /// Clone immutable provenance, but never accepted state, pending moves or numerical allocations.
 std::unique_ptr<WaveFunctionComponent> PsiFormerComplexWF::makeClone(ParticleSet& particles) const
 {
+  std::shared_lock read(impl_->state->mutex);
   return std::unique_ptr<WaveFunctionComponent>(new PsiFormerComplexWF(getName(),
       std::make_unique<Impl>(impl_->state, particles, impl_->numeric_limit)));
 }
@@ -517,6 +607,7 @@ std::unique_ptr<WaveFunctionComponent> PsiFormerComplexWF::makeClone(ParticleSet
 /// Register scalar extents only; the standard caller allocates and zero-initializes the shared pool.
 void PsiFormerComplexWF::registerData(ParticleSet& p, WFBufferType& buffer)
 {
+  std::shared_lock read(impl_->state->mutex);
   try
   {
     impl_->requireIdle(p);
@@ -531,12 +622,13 @@ void PsiFormerComplexWF::registerData(ParticleSet& p, WFBufferType& buffer)
 /// Persist only own complete products, adding them to caller totals exactly once.
 PsiFormerComplexWF::LogValue PsiFormerComplexWF::updateBuffer(ParticleSet& p, WFBufferType& buffer, bool from_scratch)
 {
+  std::shared_lock read(impl_->state->mutex);
   try
   {
     impl_->requireIdle(p);
     impl_->requireRecordExtent(buffer);
     if (from_scratch || !impl_->fullMatches(p))
-      evaluateLog(p, p.G, p.L);
+      evaluateLogLocked(p, p.G, p.L);
     else
     {
       if (p.G.size() != impl_->own_gradient.size() || p.L.size() != impl_->own_laplacian.size())
@@ -565,6 +657,7 @@ PsiFormerComplexWF::LogValue PsiFormerComplexWF::updateBuffer(ParticleSet& p, WF
 /// Validate all record content before accepted publication; failures revoke every cache.
 void PsiFormerComplexWF::copyFromBuffer(ParticleSet& p, WFBufferType& buffer)
 {
+  std::shared_lock read(impl_->state->mutex);
   const bool pending = impl_->pending;
   impl_->invalidate();
   impl_->requireIdle(p);
@@ -585,6 +678,7 @@ void PsiFormerComplexWF::copyFromBuffer(ParticleSet& p, WFBufferType& buffer)
 PsiFormerComplexWF::CoulombObservation PsiFormerComplexWF::observeCoulombEnergy(
     const ParticleSet& p, FullPrecRealType potential) const
 {
+  std::shared_lock read(impl_->state->mutex);
   impl_->requireIdle(p);
   if (!impl_->fullMatches(p))
     throw std::logic_error("Complex PsiFormer Coulomb observation requires current FULL own products");
@@ -615,10 +709,18 @@ PsiFormerComplexWF::CoulombObservation PsiFormerComplexWF::observeCoulombEnergy(
 }
 
 /// Expose the immutable fixed-source identity solely for final-system admission.
-const ParticleSet& PsiFormerComplexWF::sourceParticles() const { return *impl_->state->source; }
+const ParticleSet& PsiFormerComplexWF::sourceParticles() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return *impl_->state->source;
+}
 
-/// Each clone binds its own actual target independently of the shared immutable model.
-const ParticleSet& PsiFormerComplexWF::targetParticles() const { return *impl_->particles; }
+/// Each clone binds its own actual target independently of the shared parameter values.
+const ParticleSet& PsiFormerComplexWF::targetParticles() const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return *impl_->particles;
+}
 
 /// Every unsupported path fails explicitly before touching caller products or legacy fallback storage.
 void PsiFormerComplexWF::rejectUnsupported(const char* operation)

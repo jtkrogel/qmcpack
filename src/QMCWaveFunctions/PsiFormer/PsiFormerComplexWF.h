@@ -5,11 +5,12 @@
 //////////////////////////////////////////////////////////////////////////////////////
 /** @file PsiFormerComplexWF.h
  * @brief Native-free declaration of the explicit CPU paired-head inference sibling.
- * Builder admission remains disabled until clone/persistence and rejection gates close.
+ * Structured provider/state is prepared, but live training discovery remains closed.
  */
 #ifndef QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
+#include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include <array>
 #include <memory>
 #include <string>
@@ -22,8 +23,8 @@ struct InitializedPsiFormerParameters;
 }
 
 #ifdef QMC_COMPLEX
-/// CPU full/G-free complex inference; real optimization and device paths are not inherited.
-class PsiFormerComplexWF final : public WaveFunctionComponent
+/// CPU full/G-free inference with prepared structured state; live training discovery remains closed.
+class PsiFormerComplexWF final : public WaveFunctionComponent, public wftrain::StructuredParameterProvider
 {
 public:
   /// Consume one explicit paired profile and bind immutable geometry to the target.
@@ -43,6 +44,19 @@ public:
 
   /// Report the explicitly qualified component rather than impersonating the real adapter.
   std::string getClassName() const override { return "PsiFormerComplexWF"; }
+
+  /// Discovery stays closed until the streaming and complete-energy driver bindings qualify.
+  wftrain::StructuredParameterProvider* structuredParameterProvider() noexcept override { return nullptr; }
+
+  /// Return immutable canonical REAL64 tensors, including distinct w and w_imag blocks.
+  const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override;
+
+  /// Copy one version-coherent complete canonical vector under a shared read transaction.
+  wftrain::StructuredParameterSnapshot snapshotParameters() const override;
+
+  /// Atomically replace same-sized real parameters after schema/version/finite/idle admission.
+  std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
+                                std::size_t expected_version) override;
 
   /// This component supplies the complete antisymmetric fermionic ansatz.
   bool isFermionic() const override { return true; }
@@ -153,6 +167,8 @@ public:
 
 private:
   struct Impl;
+  /// Reuse FULL scatter while the caller already holds exactly one model read transaction.
+  LogValue evaluateLogLocked(const ParticleSet&, ParticleSet::ParticleGradient&, ParticleSet::ParticleLaplacian&);
   /// Keep explicit unsupported-operation diagnostics independent of legacy fallbacks.
   [[noreturn]] static void rejectUnsupported(const char* operation);
   /// Internal clone entry point retains immutable model ownership and the explicit numeric cap.
