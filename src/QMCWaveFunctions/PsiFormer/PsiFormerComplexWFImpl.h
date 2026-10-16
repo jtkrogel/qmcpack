@@ -28,6 +28,7 @@ struct PsiFormerComplexWF::Impl
    */
   struct GpuLane
   {
+    /// Freeze the opt-in numerical tile width once when creating a model family.
     static std::size_t configuredCapacity()
     {
       const char* value = std::getenv("PSIFORMER_GPU_COMPLEX_TILE_CAPACITY");
@@ -213,6 +214,7 @@ struct PsiFormerComplexWF::Impl
   /// Stable shared ownership keeps metadata/executors fixed while canonical values mutate under mutex.
   struct Model
   {
+    /// CPU construction never reads GPU controls; successors reuse this frozen width.
     static std::size_t requestedCapacity(std::size_t gpu_limit)
     {
 #ifdef ENABLE_CUDA
@@ -296,10 +298,25 @@ struct PsiFormerComplexWF::Impl
       if (context.plan)
         throw std::invalid_argument("Dense complex GPU resources do not admit a legacy batch_memory plan");
     }
+    /// Log attempted logical HOST ownership before any cold vector growth can fail.
     void prepareTeam(const RefVectorWithLeader<WaveFunctionComponent>& list)
     {
       const auto n = state->model.ne;
       const auto elements = psiformer::spatial_detail::checkedProduct(list.size(), n, "Complex crowd staging overflow");
+      const bool growth = list.size() > components.capacity() || list.size() > amplitude.capacity() ||
+          list.size() > logs.capacity() || list.size() > ratios.capacity() || list.size() > keys.capacity() ||
+          elements > gradient.capacity() || elements > laplacian.capacity();
+      if (growth)
+      {
+        constexpr auto per_walker = sizeof(PsiFormerComplexWF*) + sizeof(Amplitude) + sizeof(LogValue) +
+            sizeof(PsiValue) + sizeof(std::uint64_t);
+        auto requested = pf::checkedStorageProduct(list.size(), per_walker, "Complex crowd HOST request overflow");
+        pf::addStorageBytes(requested, pf::checkedStorageProduct(elements, sizeof(GradType) + sizeof(ValueType),
+            "Complex crowd HOST request overflow"), "Complex crowd HOST request overflow");
+        app_log() << "  Complex PsiFormer crowd HOST preparation: walkers=" << list.size() << ", Ne=" << n
+                  << ", attempted_logical_bytes=" << requested << ", retained_capacity_bytes=" << hostNumericBytes()
+                  << "; before_allocation=yes; aggregate_HOST_bound=no; allocator_growth_and_metadata_excluded=yes" << std::endl;
+      }
       components.resize(list.size());
       amplitude.resize(list.size());
       logs.resize(list.size());
@@ -1054,6 +1071,7 @@ struct PsiFormerComplexWF::Impl
             replacement == electron ? p.activeR(electron)[dimension] : p.R[electron][dimension]);
   }
 
+  /// Capacity is immutable even when publication replaces the generation pointer.
   bool denseEnabled() const noexcept { return state->gpu_capacity > 1; }
 
   /// Match the exact native loan before reading or mutating transaction scratch.
