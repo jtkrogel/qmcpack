@@ -328,7 +328,7 @@ std::unique_ptr<EnergyGradientAccumulator> makeContribution(
 }
 
 /// Form the independent global objective expected from all synthetic ranks.
-EnergyGradientResult makeReferenceResult(int size)
+EnergyGradientResult makeReferenceResult(int size, int sample_rank_offset = 0)
 {
   DerivativeReal weight_sum = 0.0;
   DerivativeValue energy_sum = 0.0;
@@ -341,7 +341,7 @@ EnergyGradientResult makeReferenceResult(int size)
   for (int rank = 0; rank < size; ++rank)
     for (std::size_t sample = 0; sample < localSampleCount(rank, size); ++sample)
     {
-      const double identity = static_cast<double>(10 * rank + sample + 1);
+      const double identity = static_cast<double>(10 * (rank + sample_rank_offset) + sample + 1);
       const double weight   = 1.0 + 0.25 * sample;
       const double energy   = -0.5 + 0.1 * identity;
       ++sample_count;
@@ -447,14 +447,89 @@ private:
   std::size_t version_ = 0;
 };
 
+/// Recording model with real preallocated ownership swaps, not a GPU positive.
+class PreparedRankProvider final : public StructuredParameterProvider,
+                                   public PreparedParameterPublicationContributor
+{
+public:
+  explicit PreparedRankProvider(int group = 0)
+      : schema_(makeSchema("prepared/group/" + std::to_string(group))), values_(5, 0.5 + group)
+  {}
+
+  const StructuredParameterSchema& parameterSchema() const noexcept override { return schema_; }
+  StructuredParameterSnapshot snapshotParameters() const override
+  {
+    return {schema_.fingerprint(), version_, values_};
+  }
+  std::size_t publishParameters(const StructuredParameterSnapshot&, std::size_t) override
+  {
+    ++legacy_calls;
+    throw std::logic_error("Prepared provider must not use legacy publication");
+  }
+
+  std::unique_ptr<PreparedParameterPublication> prepareParameterPublication(
+      const StructuredParameterSnapshot& candidate, std::size_t expected_version) override
+  {
+    ++prepare_calls;
+    if (fail_preparation)
+      throw std::runtime_error("injected successor preparation failure");
+    if (exclusive_ || version_ != expected_version)
+      throw std::logic_error("Prepared provider lost exclusive expected version");
+    validateTrainingCandidate(schema_, snapshotParameters(), candidate);
+    auto action = std::make_unique<Action>(*this, candidate.values, expected_version + 1);
+    exclusive_ = true;
+    return action;
+  }
+
+  bool fail_preparation = false;
+  std::size_t prepare_calls = 0;
+  std::size_t commit_calls = 0;
+  std::size_t discard_calls = 0;
+  std::size_t legacy_calls = 0;
+
+private:
+  class Action final : public PreparedParameterPublication
+  {
+  public:
+    Action(PreparedRankProvider& owner, const std::vector<double>& values, std::size_t next_version)
+        : owner_(owner), values_(values), next_version_(next_version)
+    {}
+    ~Action() override
+    {
+      if (!committed_)
+        ++owner_.discard_calls;
+      owner_.exclusive_ = false;
+    }
+    std::size_t commit() noexcept override
+    {
+      owner_.values_.swap(values_);
+      owner_.version_ = next_version_;
+      ++owner_.commit_calls;
+      committed_ = true;
+      return next_version_;
+    }
+
+  private:
+    PreparedRankProvider& owner_;
+    std::vector<double> values_;
+    const std::size_t next_version_;
+    bool committed_ = false;
+  };
+
+  StructuredParameterSchema schema_;
+  std::vector<double> values_;
+  std::size_t version_ = 0;
+  bool exclusive_ = false;
+};
+
 /// Produce the rank-local synthetic batch through the normal training interface.
 class RankProducer final : public GradientProducer
 {
 public:
   RankProducer(const StructuredParameterSchema& schema,
                Communicate& communicator,
-               std::vector<std::string>* events = nullptr)
-      : schema_(schema), communicator_(communicator), events_(events)
+               std::vector<std::string>* events = nullptr, int sample_rank_offset = 0)
+      : schema_(schema), communicator_(communicator), events_(events), sample_rank_offset_(sample_rank_offset)
   {}
 
   TrainingCapabilities capabilities() const noexcept override
@@ -470,10 +545,10 @@ public:
       events_->push_back("produce");
     const std::size_t count = localSampleCount(communicator_.rank(), communicator_.size());
     RankStreamingOperator derivative_operator(schema_, parameters.version,
-                                               communicator_.rank(), count);
+                                               communicator_.rank() + sample_rank_offset_, count);
     std::vector<DerivativeReal> weights;
     std::vector<DerivativeValue> energies;
-    makeSamples(communicator_.rank(), count, weights, energies);
+    makeSamples(communicator_.rank() + sample_rank_offset_, count, weights, energies);
     accumulateEnergyGradientBatch(
         derivative_operator, {weights.data(), weights.size()},
         {energies.data(), energies.size()}, localEnergyTermBit(LocalEnergyTerm::KINETIC),
@@ -484,6 +559,7 @@ private:
   const StructuredParameterSchema& schema_;
   Communicate& communicator_;
   std::vector<std::string>* events_;
+  int sample_rank_offset_;
 };
 
 /// Deterministic updater with optional rank-local failure or candidate divergence.
@@ -493,9 +569,9 @@ public:
   RankUpdater(Communicate& communicator,
               bool fail_last = false,
               bool diverge_last = false,
-              std::vector<std::string>* events = nullptr)
+              std::vector<std::string>* events = nullptr, double learning_rate = 0.01)
       : communicator_(communicator), fail_last_(fail_last),
-        diverge_last_(diverge_last), events_(events)
+        diverge_last_(diverge_last), events_(events), learning_rate_(learning_rate)
   {}
 
   StructuredParameterSnapshot propose(const StructuredParameterSchema&,
@@ -508,18 +584,29 @@ public:
       throw std::runtime_error("rank-local update failure");
     StructuredParameterSnapshot candidate = parameters;
     for (std::size_t parameter = 0; parameter < candidate.values.size(); ++parameter)
-      candidate.values[parameter] -= 0.01 * objective.gradient[parameter];
+      candidate.values[parameter] -= learning_rate_ * objective.gradient[parameter];
     if (diverge_last_ && communicator_.size() > 1 &&
         communicator_.rank() == communicator_.size() - 1)
       candidate.values.front() += 0.25;
     return candidate;
   }
 
+  void proposalAccepted(const StructuredParameterSchema&, const StructuredParameterSnapshot&,
+                        ParameterGradientView) noexcept override
+  {
+    ++accepted_recurrences;
+  }
+  void proposalRejected() noexcept override { ++rejected_proposals; }
+
+  std::size_t accepted_recurrences = 0;
+  std::size_t rejected_proposals = 0;
+
 private:
   Communicate& communicator_;
   bool fail_last_;
   bool diverge_last_;
   std::vector<std::string>* events_;
+  double learning_rate_;
 };
 
 /// Observe the final cache-refresh barrier in the successful path.
@@ -1336,6 +1423,118 @@ TEST_CASE("Distributed high-parameter iteration preserves publication ordering",
   CHECK(observer.calls == 1);
   CHECK(events ==
         std::vector<std::string>{"produce", "propose", "publish", "observe"});
+}
+
+TEST_CASE("Distributed prepared publication rejects before commit and retries",
+          "[drivers][training][accelerator][prepared_publication][mpi]")
+{
+  Communicate& communicator = *OHMMS::Controller;
+  PreparedRankProvider provider;
+  RankProducer producer(provider.parameterSchema(), communicator);
+  RankUpdater updater(communicator);
+  TrainingIterationState state;
+  std::vector<std::string> events;
+  RankObserver observer(events);
+  HighParameterTraining training({}, EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+                                DistributedParameterReduction{communicator, {2}});
+  const auto original = provider.snapshotParameters();
+
+  if (communicator.size() > 1)
+  {
+    DistributedParameterReduction reduction(communicator, {2});
+    CHECK_THROWS_WITH(
+        reduction.validatePublicationReadiness(0, communicator.rank() == communicator.size() - 1),
+        Catch::Matchers::ContainsSubstring("readiness metadata or decision preparation failed"));
+    CHECK_NOTHROW(reduction.validatePublicationReadiness(0, true));
+  }
+
+  provider.fail_preparation = communicator.rank() == communicator.size() - 1;
+  CHECK_THROWS(training.runIteration(provider, producer, updater, state, &observer));
+  CHECK(provider.snapshotParameters().values == original.values);
+  CHECK(provider.snapshotParameters().version == original.version);
+  CHECK(provider.commit_calls == 0);
+  CHECK(provider.legacy_calls == 0);
+  CHECK(provider.discard_calls == (provider.fail_preparation ? 0 : 1));
+  CHECK(state.completed_iterations == 0);
+  CHECK(state.schema_fingerprint.empty());
+  CHECK(updater.accepted_recurrences == 0);
+  CHECK(updater.rejected_proposals == 1);
+  CHECK(observer.calls == 0);
+
+  provider.fail_preparation = false;
+  const auto result = training.runIteration(provider, producer, updater, state, &observer);
+  CHECK(result.parameter_version == 1);
+  CHECK(provider.snapshotParameters().version == 1);
+  CHECK(provider.prepare_calls == 2);
+  CHECK(provider.commit_calls == 1);
+  CHECK(provider.legacy_calls == 0);
+  CHECK(state.completed_iterations == 1);
+  CHECK(updater.accepted_recurrences == 1);
+  CHECK(updater.rejected_proposals == 1);
+  CHECK(observer.calls == 1);
+  const auto reference = makeReferenceResult(communicator.size());
+  const auto accepted = provider.snapshotParameters();
+  for (std::size_t parameter = 0; parameter < accepted.values.size(); ++parameter)
+    CHECK(accepted.values[parameter] ==
+          Catch::Approx(original.values[parameter] - 0.01 * reference.gradient[parameter]));
+}
+
+TEST_CASE("Prepared publication and objective collectives stay inside ensemble groups",
+          "[drivers][training][accelerator][prepared_publication][subgroup][mpi]")
+{
+  Communicate& world = *OHMMS::Controller;
+  if (world.size() < 4)
+    return;
+
+  Communicate group(world, 2);
+  const int group_id = group.getGroupID();
+  const double rate = 0.01 * (group_id + 1);
+  PreparedRankProvider provider(group_id);
+  RankProducer producer(provider.parameterSchema(), group, nullptr, 10 * group_id);
+  RankUpdater updater(group, false, false, nullptr, rate);
+  TrainingIterationState state;
+  std::vector<std::string> events;
+  RankObserver observer(events);
+  HighParameterTraining training({}, EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN,
+                                DistributedParameterReduction{group, {2}});
+  const auto original = provider.snapshotParameters();
+  provider.fail_preparation = group_id == 0 && group.rank() == group.size() - 1;
+  if (group_id == 0)
+  {
+    CHECK_THROWS(training.runIteration(provider, producer, updater, state, &observer));
+    CHECK(provider.snapshotParameters().values == original.values);
+    CHECK(provider.snapshotParameters().version == 0);
+    CHECK(provider.commit_calls == 0);
+    CHECK(state.completed_iterations == 0);
+    CHECK(updater.accepted_recurrences == 0);
+    CHECK(observer.calls == 0);
+  }
+  else
+  {
+    CHECK_NOTHROW(training.runIteration(provider, producer, updater, state, &observer));
+    CHECK(provider.snapshotParameters().version == 1);
+    CHECK(provider.commit_calls == 1);
+    CHECK(updater.accepted_recurrences == 1);
+    CHECK(observer.calls == 1);
+  }
+
+  // Both groups now retry independently; group 1 advances for the second time.
+  provider.fail_preparation = false;
+  const auto result = training.runIteration(provider, producer, updater, state, &observer);
+  const std::size_t expected_updates = group_id == 0 ? 1 : 2;
+  CHECK(result.parameter_version == expected_updates);
+  CHECK(provider.commit_calls == expected_updates);
+  CHECK(state.completed_iterations == expected_updates);
+  CHECK(updater.accepted_recurrences == expected_updates);
+  CHECK(provider.legacy_calls == 0);
+  const auto reference = makeReferenceResult(group.size(), 10 * group_id);
+  const auto accepted = provider.snapshotParameters();
+  for (std::size_t parameter = 0; parameter < accepted.values.size(); ++parameter)
+  {
+    CHECK(result.objective.gradient[parameter] == Catch::Approx(reference.gradient[parameter]));
+    CHECK(accepted.values[parameter] ==
+          Catch::Approx(original.values[parameter] - expected_updates * rate * reference.gradient[parameter]));
+  }
 }
 
 } // namespace qmcplusplus::wftrain

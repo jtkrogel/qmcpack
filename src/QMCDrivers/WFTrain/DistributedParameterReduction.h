@@ -141,6 +141,15 @@ public:
                          const StructuredParameterSnapshot* candidate,
                          std::exception_ptr local_failure = {}) const;
 
+  /** Admit prepared commit only after every rank has completed fallible preparation.
+   *
+   * The fixed report also agrees optional-role presence, including legacy ranks,
+   * so a mixed provider configuration cannot select different commit schedules.
+   */
+  void validatePublicationReadiness(std::size_t expected_version,
+                                    bool uses_prepared_publication,
+                                    std::exception_ptr local_failure = {}) const;
+
   /// Agree on publication success and return the common committed version.
   std::size_t completePublication(std::size_t local_version,
                                   std::exception_ptr local_failure = {}) const;

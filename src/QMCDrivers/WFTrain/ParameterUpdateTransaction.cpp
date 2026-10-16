@@ -112,12 +112,42 @@ std::size_t completeParameterUpdate(
     return parameters.version;
   }
 
+  auto* prepared_provider = dynamic_cast<PreparedParameterPublicationContributor*>(&provider);
+  std::unique_ptr<PreparedParameterPublication> prepared_publication;
+  std::exception_ptr preparation_failure;
+  try
+  {
+    NativeTimerScope timer(reduction.phaseTimers().preparation);
+    if (prepared_provider)
+    {
+      prepared_publication = prepared_provider->prepareParameterPublication(*candidate, parameters.version);
+      if (!prepared_publication)
+        throw std::logic_error("Prepared parameter provider returned no publication action");
+    }
+  }
+  catch (...)
+  {
+    preparation_failure = std::current_exception();
+  }
+  try
+  {
+    reduction.validatePublicationReadiness(parameters.version, prepared_provider != nullptr, preparation_failure);
+  }
+  catch (...)
+  {
+    update_rule.proposalRejected();
+    throw;
+  }
+
   std::size_t local_committed_version = parameters.version;
   std::exception_ptr publication_failure;
   try
   {
     NativeTimerScope timer(reduction.phaseTimers().publication);
-    local_committed_version = provider.publishParameters(*candidate, parameters.version);
+    local_committed_version = prepared_publication ? prepared_publication->commit()
+                                                 : provider.publishParameters(*candidate, parameters.version);
+    if (prepared_publication && local_committed_version != parameters.version + 1)
+      throw std::logic_error("Prepared parameter publication returned an invalid committed version");
   }
   catch (...)
   {

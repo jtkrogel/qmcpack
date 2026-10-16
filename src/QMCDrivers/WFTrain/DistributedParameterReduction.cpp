@@ -943,6 +943,85 @@ void DistributedParameterReduction::validateCandidate(
     throwMetadataMismatch("candidate", mismatch_rank);
 }
 
+void DistributedParameterReduction::validatePublicationReadiness(
+    std::size_t expected_version, bool uses_prepared_publication,
+    std::exception_ptr local_failure) const
+{
+  const std::size_t participants = participantCount();
+  constexpr std::size_t fields = 5;
+  const std::size_t next_version = expected_version == std::numeric_limits<std::size_t>::max()
+      ? expected_version : expected_version + 1;
+  const std::array<std::uint64_t, fields> local_record{
+      protocol_version, static_cast<std::uint64_t>(uses_prepared_publication),
+      expected_version, next_version,
+      static_cast<std::uint64_t>(local_failure ? AcceleratorPublicationStatus::LOCAL_FAILURE
+                                              : AcceleratorPublicationStatus::READY)};
+
+  // Complete control-storage allocation before the record collective. A rank-local
+  // allocation failure must not strand peers, much less let them commit a model.
+  std::vector<std::uint64_t> records;
+  std::vector<AcceleratorPublicationReport> reports;
+  std::exception_ptr control_failure;
+  try
+  {
+    records.resize(participants * fields);
+    reports.resize(participants);
+  }
+  catch (...)
+  {
+    control_failure = std::current_exception();
+  }
+  int ready = control_failure ? 0 : 1;
+  if (communicator_)
+    communicator_->allreduce(ready);
+  if (ready != participants)
+  {
+    if (participants == 1 && control_failure)
+      std::rethrow_exception(control_failure);
+    throw std::runtime_error("Distributed publication readiness control allocation failed");
+  }
+  if (communicator_)
+  {
+    auto send_record = local_record;
+    communicator_->allgather(send_record.data(), records.data(), fields);
+  }
+  else
+    std::copy(local_record.begin(), local_record.end(), records.begin());
+
+  AcceleratorPublicationDecision decision;
+  try
+  {
+    for (std::size_t rank = 0; rank < participants; ++rank)
+    {
+      const auto* record = records.data() + rank * fields;
+      if (record[0] != protocol_version || record[1] != local_record[1])
+        throw std::invalid_argument("Distributed publication readiness provider-role metadata mismatch");
+      reports[rank] = {rank, participants, static_cast<std::size_t>(record[2]),
+                      static_cast<std::size_t>(record[3]), static_cast<AcceleratorPublicationStatus>(record[4])};
+    }
+    decision = decideAcceleratorPublication(reports);
+  }
+  catch (...)
+  {
+    control_failure = std::current_exception();
+  }
+
+  // The existing pure decision routine allocates its ordered report view. Agree
+  // that this too succeeded BEFORE returning admission to irreversible commit.
+  ready = control_failure ? 0 : 1;
+  if (communicator_)
+    communicator_->allreduce(ready);
+  if (ready != participants)
+  {
+    if (participants == 1 && control_failure)
+      std::rethrow_exception(control_failure);
+    throw std::runtime_error("Distributed publication readiness metadata or decision preparation failed");
+  }
+  if (!decision.accepted)
+    throwConsensusFailure("publication preparation", *decision.failing_rank, ConsensusReason::LOCAL_EXCEPTION,
+                          local_failure, participants);
+}
+
 std::size_t DistributedParameterReduction::completePublication(
     std::size_t local_version,
     std::exception_ptr local_failure) const
