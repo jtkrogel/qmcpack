@@ -324,6 +324,8 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
 
 std::string TrainingWaveFunctionBinding::modelIdentity() const
 {
+  if (physical_definition_.empty())
+    throw std::runtime_error("Conventional checkpoint/export requires an attached physical Hamiltonian and particle identity");
   if (definition_.empty())
     throw std::runtime_error("Conventional checkpoint/export requires the original complete wavefunction XML");
   if (external_assets_)
