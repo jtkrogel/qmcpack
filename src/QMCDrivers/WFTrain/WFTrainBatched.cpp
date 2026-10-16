@@ -1331,9 +1331,12 @@ void WFTrainBatched::process(xmlNodePtr node)
         throw UniformCommunicateError("Conventional-only training has no affine observations required by KFAC");
       if (training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
           (!isFirstOrder(optimizer) && optimizer != O::STOCHASTIC_RECONFIGURATION &&
-           optimizer != O::MINIMUM_STEP_SR && optimizer != O::SPRING) ||
+           optimizer != O::MINIMUM_STEP_SR && optimizer != O::SPRING &&
+           optimizer != O::LINEAR_METHOD && optimizer != O::ACCELERATED_LINEAR_METHOD &&
+           optimizer != O::PROJECTED_INVERSE_ITERATION &&
+           optimizer != O::MINIMUM_PROJECTED_INVERSE_ITERATION) ||
           population_.get_golden_hamiltonian().hasPhysicalNLPP())
-        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY first-order/SR/minSR/SPRING with fixed-Slater J1/J2");
+        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY optimizers with fixed-Slater J1/J2");
       if (!training_input_.getLegacyMaximumParameters() || !training_input_.getLegacyDerivativeScratchBytes())
         throw UniformCommunicateError("Conventional training requires positive legacy_maximum_parameters and legacy_derivative_scratch_bytes");
       if (training_input_.getWeightDecay() != 0)
@@ -1350,6 +1353,10 @@ void WFTrainBatched::process(xmlNodePtr node)
           wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
+      const auto& variables = conventional_binding_->adapter().registrationVariables();
+      for (std::size_t variable = 0; variable < variables.size(); ++variable)
+        if (variables.where(variable) >= 0 && variables.getType(variable) == optimize::LINEAR_P)
+          throw UniformCommunicateError("Conventional optimizer admission currently requires nonlinear Jastrow coordinates; CI update normalization is not yet qualified");
       // Fail before population initialization/sampling for unqualified fixed assets.
       conventional_binding_->modelIdentity();
       providers.emplace_back(*conventional_binding_);
