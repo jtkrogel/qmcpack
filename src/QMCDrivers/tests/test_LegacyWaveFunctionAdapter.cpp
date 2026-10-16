@@ -23,6 +23,11 @@
 #include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "QMCHamiltonians/BareKineticEnergy.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
+#include "QMCHamiltonians/ECPComponentBuilder.h"
+#include "QMCHamiltonians/NonLocalECPComponent.h"
+#include "QMCHamiltonians/LocalECPotential.h"
+#include "ResourceCollection.h"
+#include "Utilities/StdRandom.h"
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
@@ -829,6 +834,200 @@ TEST_CASE("Legacy replay block views share bounded parameter workspace and immut
   invalid->values[0] = std::numeric_limits<double>::quiet_NaN();
   CHECK_THROWS_AS(adapter.makeDerivativeOperator(replay, invalid, 0, 0), std::invalid_argument);
   CHECK_THROWS_AS(adapter.makeDerivativeOperator({}, snapshot, 0, 0), std::invalid_argument);
+}
+
+TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
+          "[drivers][training][legacy_adapter][ecp]")
+{
+#ifdef QMC_COMPLEX
+  SKIP("This gate qualifies real CPU fixed-Slater/Jastrow ECP products");
+#endif
+  ParticleSetPool pool(OHMMS::Controller);
+  auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto& ions = *ion_owner;
+  auto& particles = *electron_owner;
+  ions.setName("ion0");
+  ions.create({1});
+  ions.R[0] = {0, 0, 0};
+  auto& ion_species = ions.getSpeciesSet();
+  const int be = ion_species.addSpecies("Be");
+  const int ion_charge = ion_species.addAttribute("charge");
+  const int atomic_number = ion_species.addAttribute("atomic_number");
+  ion_species(ion_charge, be) = 2;
+  ion_species(atomic_number, be) = 4;
+  ions.resetGroups();
+  particles.setName("e");
+  particles.create({1, 1});
+  particles.R[0] = {0.2, -0.3, 0.4};
+  particles.R[1] = {-0.5, 0.1, 0.7};
+  auto& species = particles.getSpeciesSet();
+  const int up = species.addSpecies("u"), down = species.addSpecies("d");
+  const int mass = species.addAttribute("mass"), charge = species.addAttribute("charge");
+  species(mass, up) = species(mass, down) = 1;
+  species(charge, up) = species(charge, down) = -1;
+  particles.resetGroups();
+  pool.addParticleSet(std::move(ion_owner));
+  pool.addParticleSet(std::move(electron_owner));
+  Libxml2Document definition;
+  REQUIRE(definition.parseFromString(R"(
+    <wavefunction name="psi0" target="e">
+      <sposet_collection type="MolecularOrbital" source="ion0">
+        <basisset keyword="STO" transform="no">
+          <atomicBasisSet type="STO" elementType="Be" normalized="no">
+            <basisGroup rid="R0" l="0" m="0" type="Slater"><radfunc n="1" exponent="1.2"/></basisGroup>
+          </atomicBasisSet>
+        </basisset>
+        <sposet name="fixed" size="1"><coefficient size="1" id="identity">1</coefficient></sposet>
+      </sposet_collection>
+      <determinantset><slaterdeterminant><determinant sposet="fixed"/><determinant sposet="fixed"/></slaterdeterminant></determinantset>
+      <jastrow name="J2" type="Two-Body" function="Bspline">
+        <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+          <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+        </correlation>
+      </jastrow>
+    </wavefunction>)"));
+  WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+  auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+  REQUIRE(source);
+  ions.update();
+  particles.update();
+  source->evaluateLog(particles);
+  const auto initial_positions = particles.R;
+  const auto initial_ions = ions.R;
+  const auto initial_log = source->getLogPsi();
+  ParticleSet private_particles(particles);
+  auto private_wf = source->makeClone(private_particles);
+  private_particles.update();
+  auto replay = std::make_shared<ShiftedLegacyReplay>(*private_wf, private_particles, std::vector<double>{0});
+  LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
+  const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
+  REQUIRE(snapshot->values.size() == 4);
+  auto op = adapter.makeDerivativeOperator(replay, snapshot, 3, 7);
+  auto consumer = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 3, 7);
+  const std::vector<DerivativeValue> unit{1};
+  const auto ecp_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  const auto total_mask = ecp_mask | localEnergyTermBit(LocalEnergyTerm::KINETIC);
+  const VJPCoefficientChannel channel{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), ecp_mask};
+  RecordingParameterSink idle_sink;
+  ECPComponentBuilder builder("Be", OHMMS::Controller, 2, 1);
+  const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/pseudopotentials_for_tests/Be.BFD.xml";
+  REQUIRE(builder.read_pp_file(asset.string()));
+  REQUIRE(builder.pp_nonloc);
+  auto nonlocal = std::make_unique<NonLocalECPotential>(ions, particles, false, true);
+  auto* nonlocal_ptr = nonlocal.get();
+  nonlocal->addComponent(0, std::move(builder.pp_nonloc));
+  auto local = std::make_unique<LocalECPotential>(ions, particles);
+  auto* local_ptr = local.get();
+  local->add(0, std::move(builder.pp_loc), builder.Zeff);
+  QMCHamiltonian ham;
+  ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  ham.addOperator(std::move(local), "LocalECP");
+  ham.addOperator(std::move(nonlocal), "NonLocalECP");
+  StdRandom<QMCTraits::FullPrecRealType> rng(1931);
+  nonlocal_ptr->setRandomGenerator(&rng);
+  RefVectorWithLeader<ParticleSet> p_list(particles, {particles});
+  RefVectorWithLeader<TrialWaveFunction> wf_list(*source, {*source});
+  RefVectorWithLeader<QMCHamiltonian> h_list(ham, {ham});
+  ResourceCollection p_resources("ecp_particles"), w_resources("ecp_wavefunctions"), h_resources("ecp_hamiltonians");
+  particles.createResource(p_resources);
+  source->createResource(w_resources);
+  ham.createResource(h_resources);
+  ResourceCollectionTeamLock<ParticleSet> p_lock(p_resources, p_list);
+  ResourceCollectionTeamLock<TrialWaveFunction> w_lock(w_resources, wf_list);
+  ResourceCollectionTeamLock<QMCHamiltonian> h_lock(h_resources, h_list);
+  const auto accepted = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      h_list, wf_list, p_list, *consumer, {&channel, 1}, idle_sink);
+  CHECK(idle_sink.state() == DerivativeSinkState::IDLE);
+  auto grid = consumer->releaseJVPReplay();
+  REQUIRE(grid);
+  CHECK_THROWS(consumer->releaseJVPReplay());
+  CHECK(grid->gridFingerprint() == accepted.grid_fingerprint);
+  REQUIRE(grid->points().size() > 0);
+  CHECK(grid->evaluationStamps().empty());
+  const std::vector<NonLocalECPReplayPoint> points(grid->points().begin(), grid->points().end());
+  const auto grid_bytes = grid->storageDiagnostics().retained_numeric_bytes;
+  op->bindNonLocalECPJVPReplay(std::move(grid));
+  CHECK(op->capabilities().coversLocalEnergyTerms(total_mask));
+  const auto storage = op->storageDiagnostics();
+  CHECK(storage.retained_numeric_bytes >= storage.shared_workspace_bytes + grid_bytes);
+  CHECK(storage.retained_numeric_bytes == storage.shared_workspace_bytes + storage.sample_position_bytes +
+        storage.sample_auxiliary_bytes);
+  CHECK(storage.real_parameter_vectors == 2);
+  auto unbound = adapter.makeDerivativeOperator(replay, snapshot, 4, 8);
+  CHECK(unbound->storageDiagnostics().shared_workspace_identity == storage.shared_workspace_identity);
+  CHECK_FALSE(unbound->capabilities().coversLocalEnergyTerms(ecp_mask));
+  const double local_value = local_ptr->evaluate(particles);
+  // Independent finite-difference oracle recomputes complete ratios, but never
+  // draws a grid or uses the captured accepted ratio at perturbed parameters.
+  const auto fixed_grid_energy = [&](const StructuredParameterSnapshot& parameters) {
+    ParticleSet test_particles(particles);
+    auto test_wf = source->makeClone(test_particles);
+    test_particles.update();
+    adapter.installSnapshot(*test_wf, test_particles, parameters);
+    const auto reference_log = test_wf->getLogPsi();
+    DerivativeValue energy = kineticEnergy(test_particles) + local_value;
+    for (const auto& point : points)
+    {
+      test_particles.R = initial_positions;
+      for (int d = 0; d < 3; ++d) test_particles.R[point.electron][d] = point.replacement_position[d];
+      test_particles.update();
+      test_wf->evaluateLog(test_particles);
+      energy += point.bare_weight * std::exp(test_wf->getLogPsi() - reference_log);
+    }
+    return energy;
+  };
+  const auto initial_energy = fixed_grid_energy(*snapshot);
+  CHECK(initial_energy.real() == Catch::Approx(accepted.local_energies[0]).epsilon(2e-12).margin(2e-12));
+  const VJPCoefficientChannel total{"total", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), total_mask};
+  RecordingParameterSink transpose, hermitian;
+  op->applyVJPs({&total, 1}, DerivativeAdjoint::TRANSPOSE, transpose);
+  op->applyVJPs({&total, 1}, DerivativeAdjoint::HERMITIAN, hermitian);
+  constexpr double step = 1e-5;
+  std::vector<DerivativeValue> direction{0.5, -0.2, 0.3, -0.1};
+  DerivativeValue expected_direction{};
+  for (std::size_t parameter = 0; parameter < snapshot->values.size(); ++parameter)
+  {
+    auto plus = *snapshot, minus = *snapshot;
+    plus.values[parameter] += step;
+    minus.values[parameter] -= step;
+    const auto fd = (fixed_grid_energy(plus) - fixed_grid_energy(minus)) / (2 * step);
+    CHECK(transpose.result()[0][parameter].real() == Catch::Approx(fd.real()).epsilon(3e-7).margin(3e-8));
+    checkClose(hermitian.result()[0][parameter], std::conj(transpose.result()[0][parameter]));
+    expected_direction += direction[parameter] * transpose.result()[0][parameter];
+  }
+  const auto rng_before_actions = rng;
+  StructuredParameterVectorConstView vector(adapter.parameterSchema(), snapshot->version,
+                                            {direction.data(), direction.size()});
+  RecordingSampleSink first, second;
+  op->applyLocalEnergyJVP(vector, total_mask, first);
+  op->applyLocalEnergyJVP(vector, total_mask, second);
+  checkClose(first.result()[0], expected_direction);
+  CHECK(first.result() == second.result());
+  auto expected_rng = rng_before_actions;
+  CHECK(rng() == expected_rng());
+  for (std::size_t electron = 0; electron < particles.R.size(); ++electron)
+    for (int dimension = 0; dimension < 3; ++dimension)
+      CHECK(particles.R[electron][dimension] == initial_positions[electron][dimension]);
+  for (int dimension = 0; dimension < 3; ++dimension)
+    CHECK(ions.R[0][dimension] == initial_ions[0][dimension]);
+  CHECK(source->getLogPsi() == initial_log);
+  CHECK(adapter.snapshotParameters().values == snapshot->values);
+
+  // Failed and incomplete captures never bind ECP coverage or publish parameters.
+  auto invalid = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 4, 8);
+  NonLocalECPDerivativeContext context{adapter.parameterSchema().providerId(), adapter.parameterSchema().fingerprint(),
+      snapshot->version, 4, 8, 1, 1, 123};
+  const VJPCoefficientChannel bad_channel{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+                                         coefficientsFor(*unbound, unit), ecp_mask};
+  context.localization = NonLocalECPLocalization::DLA;
+  CHECK_THROWS(invalid->preflight(context, {&bad_channel, 1}, idle_sink));
+  context.localization = NonLocalECPLocalization::ORDINARY_LOCALITY;
+  invalid->begin(context, {&bad_channel, 1}, idle_sink);
+  CHECK_THROWS(invalid->end());
+  CHECK_THROWS(invalid->releaseJVPReplay());
+  CHECK_FALSE(unbound->capabilities().coversLocalEnergyTerms(ecp_mask));
 }
 
 TEST_CASE("Legacy orbital products preserve cumulative private rotation history",
