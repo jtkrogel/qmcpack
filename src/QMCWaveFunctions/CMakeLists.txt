@@ -31,6 +31,8 @@ set(WFBASE_SRCS
     Optimization/LegacyWaveFunctionAdapter.cpp
     Optimization/StreamingDerivative.cpp
     Optimization/StructuredParameterProvider.cpp
+    # Generic persistence is also used during wavefunction construction; avoid an upward driver dependency.
+    ../QMCDrivers/WFTrain/TrainingCheckpoint.cpp
     SPOSetBuilder.cpp
     SPOInfo.cpp
     SPOSetInfo.cpp

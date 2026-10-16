@@ -65,7 +65,6 @@ set(QMCDRIVERS
     WFTrain/NativeLineSearch.cpp
     WFTrain/HighParameterTraining.cpp
     WFTrain/PreparedEnergyGradientProducer.cpp
-    WFTrain/TrainingCheckpoint.cpp
     WFTrain/DistributedTrainingCheckpoint.cpp
     WFTrain/WFTrainSamplerCheckpoint.cpp
     WFTrain/FirstOrderOptimizer.cpp
