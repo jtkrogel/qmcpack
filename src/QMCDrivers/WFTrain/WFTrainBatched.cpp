@@ -619,6 +619,68 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
   return batch;
 }
 
+/** Capture conventional energy and accepted ECP grid in one existing traversal.
+ * Retained collection energies belong to older grids and must be replaced along
+ * with the replay. Derivative products keep one shared private iteration worker.
+ */
+wftrain::PreparedEnergyGradientBatch prepareConventionalECPBatch(
+    Crowd& crowd, RetainedCrowdSamples& samples, wftrain::TrainingWaveFunctionBinding& binding,
+    const std::shared_ptr<ConventionalReplayWorker>& worker,
+    const std::shared_ptr<const wftrain::StructuredParameterSnapshot>& parameters,
+    std::size_t batch_ordinal, std::size_t sample_offset)
+{
+  replayCrowdSamples(crowd, samples);
+  const auto& twfs = crowd.get_walker_twfs();
+  const auto& electrons = crowd.get_walker_elecs();
+  const auto& hamiltonians = crowd.get_walker_hamiltonians();
+  RefVectorWithLeader<TrialWaveFunction> twf_batch(twfs[0], twfs);
+  RefVectorWithLeader<ParticleSet> particle_batch(electrons[0], electrons);
+  RefVectorWithLeader<QMCHamiltonian> hamiltonian_batch(hamiltonians[0], hamiltonians);
+  ResourceCollectionTeamLock<ParticleSet> particle_lock(crowd.getSharedResource().pset_res, particle_batch);
+  ResourceCollectionTeamLock<TrialWaveFunction> wavefunction_lock(crowd.getSharedResource().twf_res, twf_batch);
+  ResourceCollectionTeamLock<QMCHamiltonian> hamiltonian_lock(crowd.getSharedResource().ham_res, hamiltonian_batch);
+  ParticleSet::mw_update(particle_batch);
+  TrialWaveFunction::mw_evaluateLog(twf_batch, particle_batch);
+
+  auto replay_samples = std::make_shared<ConventionalReplay>(worker, samples);
+  wftrain::PreparedEnergyGradientBatch batch;
+  batch.weights.assign(samples.particles.size(), 1.0);
+  batch.derivative_operator = binding.adapter().makeDerivativeOperator(
+      replay_samples, parameters, batch_ordinal, sample_offset);
+  logTrainingAllocation("conventional_accepted_ecp_grid", samples.particles.size(),
+                        binding.parameterSchema().parameterCount());
+  auto consumer = binding.adapter().makeNonLocalECPDerivativeConsumer(
+      replay_samples, parameters, batch_ordinal, sample_offset);
+  std::vector<wftrain::DerivativeValue> coefficients(samples.particles.size(), {1.0, 0.0});
+  const wftrain::CoefficientView coefficient_view{
+      binding.parameterSchema().providerId(), binding.parameterSchema().fingerprint(), parameters->version,
+      batch_ordinal, sample_offset, {coefficients.data(), coefficients.size()}};
+  const auto ecp_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::NONLOCAL_ECP);
+  const wftrain::VJPCoefficientChannel channel{
+      wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
+      wftrain::DerivativeProduct::LOCAL_ENERGY_VJP, coefficient_view, ecp_mask};
+  ReplayOnlyECPSink sink;
+  const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      hamiltonian_batch, twf_batch, particle_batch, *consumer, {&channel, 1}, sink);
+  auto replay = consumer->releaseJVPReplay();
+  if (replay->gridFingerprint() != result.grid_fingerprint ||
+      result.local_energies.size() != samples.particles.size())
+    throw std::logic_error("Conventional ECP accepted energy/grid identity mismatch");
+  batch.derivative_operator->bindNonLocalECPJVPReplay(std::move(replay));
+  batch.local_energy_term_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) | ecp_mask;
+  batch.local_energies.reserve(result.local_energies.size());
+  for (double energy : result.local_energies)
+    batch.local_energies.emplace_back(energy, 0.0);
+  samples.local_energies.assign(result.local_energies.begin(), result.local_energies.end());
+  for (std::size_t sample = 0; sample < crowd.size(); ++sample)
+  {
+    electrons[sample].get().saveWalker(crowd.get_walkers()[sample]);
+    crowd.get_walkers()[sample].get().resetProperty(
+        twfs[sample].get().getLogPsi(), twfs[sample].get().getPhase(), result.local_energies[sample]);
+  }
+  return batch;
+}
+
 /** Validate and return the expected complete Hamiltonian-term mask. */
 std::uint32_t completeLocalEnergyTermMask(
     const std::vector<wftrain::PreparedEnergyGradientBatch>& batches,
@@ -1358,6 +1420,8 @@ void WFTrainBatched::process(xmlNodePtr node)
           wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
+      if (population_.get_golden_hamiltonian().hasPhysicalNLPP())
+        throw UniformCommunicateError("Conventional CPU ECP publication awaits the bounded fixed-grid product and identity qualification gates");
       const auto& variables = conventional_binding_->adapter().registrationVariables();
       const bool nonlinear_update = optimizer == O::LINEAR_METHOD || optimizer == O::ACCELERATED_LINEAR_METHOD ||
           optimizer == O::PROJECTED_INVERSE_ITERATION || optimizer == O::MINIMUM_PROJECTED_INVERSE_ITERATION;
@@ -1461,9 +1525,11 @@ void WFTrainBatched::process(xmlNodePtr node)
     createStepContexts(crowds_.size());
     if (conventional_binding_)
     {
-      conventional_binding_->attachLive(population_.get_golden_twf(), population_.get_golden_electrons());
+      conventional_binding_->attachLive(population_.get_golden_twf(), population_.get_golden_electrons(),
+                                        &population_.get_golden_hamiltonian());
       for (std::size_t i = 0; i < population_.get_twfs().size(); ++i)
-        conventional_binding_->attachLive(*population_.get_twfs()[i], *population_.get_elec_particle_sets()[i]);
+        conventional_binding_->attachLive(*population_.get_twfs()[i], *population_.get_elec_particle_sets()[i],
+                                          population_.get_hamiltonians()[i].get());
     }
     initializeDeterminantOverlap();
     // Target construction clones SPOs and may allocate differently on each rank.
@@ -2233,6 +2299,14 @@ void WFTrainBatched::run()
           {
             if (conventional_binding_)
             {
+              if (has_nonlocal_ecp)
+              {
+                batches.push_back(prepareConventionalECPBatch(
+                    *crowds_[samples.crowd_index], samples, *conventional_binding_, conventional_worker,
+                    conventional_parameters, batch_ordinal++, sample_offset));
+                sample_offset += samples.particles.size();
+                continue;
+              }
               wftrain::PreparedEnergyGradientBatch batch;
               batch.weights.assign(samples.particles.size(), 1.0);
               for (double energy : samples.local_energies)

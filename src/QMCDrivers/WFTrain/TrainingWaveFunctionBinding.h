@@ -49,7 +49,7 @@ public:
   /// Cold restore publishes the complete saved frame, never an active-only reset.
   std::size_t publishOrbitalFrame(const StructuredParameterSnapshot&, std::size_t expected_version,
                                  const ConventionalOrbitalFrame&);
-  void attachLive(TrialWaveFunction&, ParticleSet&);
+  void attachLive(TrialWaveFunction&, ParticleSet&, QMCHamiltonian* = nullptr);
   /// Prepare candidate validation against every current population configuration.
   void setHamiltonian(QMCHamiltonian& hamiltonian);
   std::unique_ptr<TrialWaveFunction> makeCandidate(ParticleSet&, const StructuredParameterSnapshot&) const;
@@ -77,12 +77,19 @@ private:
   Communicate& communicator_;
   LegacyWaveFunctionAdapter adapter_;
   QMCHamiltonian* hamiltonian_ = nullptr;
-  std::vector<std::pair<TrialWaveFunction*, ParticleSet*>> live_;
+  struct LiveTarget
+  {
+    TrialWaveFunction* wavefunction;
+    ParticleSet* particles;
+    QMCHamiltonian* hamiltonian;
+  };
+  std::vector<LiveTarget> live_;
   std::string definition_;
   bool external_assets_ = false;
   bool inline_spos_ = true;
   bool multideterminant_ = false;
   bool orbital_rotations_ = false;
+  bool nonlocal_ecp_ = false;
   std::string physical_definition_;
   std::size_t publishPrepared(const StructuredParameterSnapshot&, std::size_t,
                               const ConventionalOrbitalFrame*);

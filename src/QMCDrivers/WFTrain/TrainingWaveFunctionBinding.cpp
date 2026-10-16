@@ -15,6 +15,7 @@
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCHamiltonians/QMCHamiltonian.h"
+#include "QMCHamiltonians/NonLocalECPotential.h"
 #include "io/hdf/hdf_archive.h"
 #include <exception>
 #include <algorithm>
@@ -211,6 +212,21 @@ TrainingWaveFunctionBinding::~TrainingWaveFunctionBinding() = default;
 
 void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
 {
+  const bool nonlocal_ecp = hamiltonian.hasPhysicalNLPP();
+  if (nonlocal_ecp)
+  {
+    const auto& provenance = hamiltonian.ecpModelProvenance();
+    if (!provenance || !provenance->ordinary_locality_vp || provenance->scientific_definition.empty())
+      throw std::runtime_error("Conventional ECP training requires complete parsed-PP content and ordinary-locality VP identity");
+    if (multideterminant_ || orbital_rotations_ || prototype_.findSD().size() != 1)
+      throw std::runtime_error("Conventional ECP training currently requires one fixed single-Slater component");
+    for (const auto& component : prototype_.getOrbitals())
+    {
+      const auto kind = component->getClassName();
+      if (kind != "SlaterDet" && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow")
+        throw std::runtime_error("Conventional ECP training currently admits only fixed Slater and J1/J2");
+    }
+  }
   std::map<std::string, std::string> particles;
   particles.emplace(prototype_particles_.getName(), particleIdentity(prototype_particles_, false));
   for (int table = 0; table < prototype_particles_.getNumDistTables(); ++table)
@@ -231,8 +247,12 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
   {
     const auto* component = hamiltonian.getComponent(i);
     const auto kind = component->getClassName();
-    if (kind != "BareKineticEnergy" && kind != "CoulombPotential")
+    if (kind != "BareKineticEnergy" && kind != "CoulombPotential" &&
+        !(nonlocal_ecp && (kind == "LocalECPotential" || kind == "NonLocalECPotential")))
       throw std::runtime_error("Conventional first training profile requires kinetic plus open Coulomb operators");
+    if (const auto* nonlocal = dynamic_cast<const NonLocalECPotential*>(component))
+      if (nonlocal->usesDLA() || !nonlocal->usesVirtualParticles())
+        throw std::runtime_error("Conventional ECP training requires ordinary locality with virtual particles");
     std::ostringstream description;
     component->get(description);
     if (kind == "CoulombPotential")
@@ -248,24 +268,36 @@ void TrainingWaveFunctionBinding::setHamiltonian(QMCHamiltonian& hamiltonian)
     }
     identity << kind << ':' << component->getName() << ':' << description.str() << ';';
   }
+  if (nonlocal_ecp)
+  {
+    const auto& scientific = hamiltonian.ecpModelProvenance()->scientific_definition;
+    identity << "ecp_scientific_definition:" << scientific.size() << ':' << scientific << ';';
+  }
   physical_definition_ = identity.str();
   hamiltonian_ = &hamiltonian;
+  nonlocal_ecp_ = nonlocal_ecp;
+  for (auto& target : live_)
+    if (target.particles == &prototype_particles_ && !target.hamiltonian)
+      target.hamiltonian = &hamiltonian;
 }
 const StructuredParameterSchema& TrainingWaveFunctionBinding::parameterSchema() const noexcept
 { return adapter_.parameterSchema(); }
 StructuredParameterSnapshot TrainingWaveFunctionBinding::snapshotParameters() const
 { return adapter_.snapshotParameters(); }
-void TrainingWaveFunctionBinding::attachLive(TrialWaveFunction& wf, ParticleSet& particles)
+void TrainingWaveFunctionBinding::attachLive(TrialWaveFunction& wf, ParticleSet& particles, QMCHamiltonian* hamiltonian)
 {
-  for (const auto& target : live_)
-    if (target.first == &wf)
+  for (auto& target : live_)
+    if (target.wavefunction == &wf)
     {
-      if (target.second != &particles)
+      if (target.particles != &particles ||
+          (hamiltonian && target.hamiltonian && hamiltonian != target.hamiltonian))
         throw std::logic_error("Conventional wavefunction has multiple particle targets");
+      if (hamiltonian)
+        target.hamiltonian = hamiltonian;
       return;
     }
   wf.validatePreparedJastrowActivation(wf);
-  live_.emplace_back(&wf, &particles);
+  live_.push_back({&wf, &particles, hamiltonian});
 }
 std::unique_ptr<TrialWaveFunction> TrainingWaveFunctionBinding::makeCandidate(
     ParticleSet& particles, const StructuredParameterSnapshot& snapshot) const
@@ -324,7 +356,7 @@ std::size_t TrainingWaveFunctionBinding::publishPrepared(
     component_indices.reserve(live_.size());
     coefficient_banks.reserve(live_.size());
     rotation_banks.reserve(live_.size());
-    for (const auto& [wf, particles] : live_)
+    for (const auto& [wf, particles, live_hamiltonian] : live_)
     {
       // Only sampled walker configurations are numerical admission points. The
       // unsampled golden prototype may contain coincident/default coordinates.
@@ -338,9 +370,13 @@ std::size_t TrainingWaveFunctionBinding::publishPrepared(
         adapter_.installSnapshot(*validation, validation_particles, candidate);
         if (!isFiniteTrainingReal(validation->getLogPsi()))
           throw std::runtime_error("Nonfinite conventional candidate wavefunction");
-        if (hamiltonian_)
+        if (nonlocal_ecp_ && !live_hamiltonian)
+          throw std::runtime_error("Conventional ECP publication requires each live Hamiltonian's current grid");
+        if (auto* source_hamiltonian = live_hamiltonian ? live_hamiltonian : hamiltonian_)
         {
-          auto ham = hamiltonian_->makeClone(validation_particles, *validation);
+          auto ham = source_hamiltonian->makeClone(validation_particles, *validation);
+          // This keeps the clone's copied current quadrature and cannot draw
+          // from any shared live production RNG. No stochastic refresh here.
           if (!isFiniteTrainingReal(ham->evaluateDeterministic(*validation, validation_particles)))
             throw std::runtime_error("Nonfinite conventional candidate energy");
         }
@@ -403,7 +439,7 @@ std::size_t TrainingWaveFunctionBinding::publishPrepared(
   const auto version = adapter_.commitPreparedParameters(std::move(*detached));
   for (std::size_t i = 0; i < live_.size(); ++i)
   {
-    live_[i].first->activatePreparedJastrows(*prepared[i], component_indices[i]);
+    live_[i].wavefunction->activatePreparedJastrows(*prepared[i], component_indices[i]);
     for (const auto& [target, bank] : coefficient_banks[i])
       target->adoptPreparedCoefficientState(*bank);
     for (const auto& bank : rotation_banks[i])
@@ -426,6 +462,8 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   output.write(snapshot.values, "parameters");
   output.write(identity, "model_identity");
   output.write(physical_definition_, "physical_definition");
+  if (nonlocal_ecp_)
+    output.write(hamiltonian_->ecpModelProvenance()->source_report, "ecp_source_report");
   std::vector<std::string> names;
   std::vector<int> types, indices;
   std::vector<double> fixed_values;
