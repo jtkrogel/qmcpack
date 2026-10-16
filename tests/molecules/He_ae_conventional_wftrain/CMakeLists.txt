@@ -12,8 +12,12 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND NOT ENABLE_OFFLOAD AND Python3_EX
              COMMAND ${Python3_EXECUTABLE} "${ORBITAL_CHECKER}" $<TARGET_FILE:qmcpack>
                      "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_orbital.xml"
                      --orbital-jastrow --companion-optimizer sr --restart)
+    add_test(NAME short-He-ae-conventional-model-import
+             COMMAND ${Python3_EXECUTABLE} "${ORBITAL_CHECKER}" $<TARGET_FILE:qmcpack>
+                     "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_orbital.xml" --model-import)
     set_tests_properties(short-He-ae-conventional-wftrain-orbital
                          short-He-ae-conventional-wftrain-orbital-jastrow
+                         short-He-ae-conventional-model-import
                          PROPERTIES TIMEOUT 300 PROCESSORS 1)
   endif()
 endif()
