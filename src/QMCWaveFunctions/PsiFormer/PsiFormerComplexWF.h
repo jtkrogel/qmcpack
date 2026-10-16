@@ -78,6 +78,7 @@ public:
 
   /** Own a resolved GPU/native replacement and exclusive model publication authority.
    * Discard changes nothing; commit is nonallocating/no-fail and may be invoked once.
+   * Prepare, commit and destruction must stay on the same submitting thread.
    * Do not re-enter the same model while holding this action before commit/discard.
    */
   class PreparedGpuParameterPublication
