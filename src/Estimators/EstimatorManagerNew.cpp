@@ -167,7 +167,7 @@ void EstimatorManagerNew::reset()
   for (int i = 0; i < scalar_ests_.size(); i++)
     scalar_ests_[i]->add2Record(BlockAverages);
   // possibly redundant variable
-  max4ascii += BlockAverages.size();
+  max4ascii = std::max(max4ascii, BlockAverages.size());
 }
 
 void EstimatorManagerNew::makeConfigReport(std::ostream& os) const
@@ -210,6 +210,16 @@ void EstimatorManagerNew::addHeader(std::ostream& o)
 /// \todo clean up this method its a mess
 void EstimatorManagerNew::startDriverRun()
 {
+  startDriverRun(OutputConfig{});
+}
+
+void EstimatorManagerNew::startDriverRun(const OutputConfig& output)
+{
+  if (output.scalar_only && !operator_ests_.empty())
+    throw std::runtime_error("Scalar-only estimator output does not support operator estimators");
+  const std::string& prefix = output.prefix.empty() ? my_comm_->getName() : output.prefix;
+  h_file.reset();
+  h5desc.clear();
   reset();
   RecordCount = 0;
   energyAccumulator.clear();
@@ -223,7 +233,7 @@ void EstimatorManagerNew::startDriverRun()
   if (!DebugArchive)
   {
     std::array<char, 128> fname;
-    if (std::snprintf(fname.data(), fname.size(), "%s.p%03d.scalar.dat", my_comm_->getName().c_str(),
+    if (std::snprintf(fname.data(), fname.size(), "%s.p%03d.scalar.dat", prefix.c_str(),
                       my_comm_->rank()) < 0)
       throw std::runtime_error("Error generating filename");
     DebugArchive = std::make_unique<std::ofstream>(fname.data());
@@ -232,15 +242,19 @@ void EstimatorManagerNew::startDriverRun()
 #endif
   if (my_comm_->rank() == 0)
   {
-    std::filesystem::path fname(my_comm_->getName());
+    std::filesystem::path fname(prefix);
     fname.concat(".scalar.dat");
     Archive = std::make_unique<std::ofstream>(fname);
+    if (!*Archive)
+      throw std::runtime_error("Cannot open scalar estimator output " + fname.string());
     addHeader(*Archive);
     if (h5desc.size())
     {
       h5desc.clear();
     }
-    fname  = my_comm_->getName() + ".stat.h5";
+    if (output.scalar_only)
+      return;
+    fname  = prefix + ".stat.h5";
     h_file = std::make_unique<hdf_archive>();
     h_file->create(fname);
     main_estimator_->registerObservables(h5desc, *h_file);
@@ -251,7 +265,20 @@ void EstimatorManagerNew::startDriverRun()
   }
 }
 
-void EstimatorManagerNew::stopDriverRun() { h_file.reset(); }
+void EstimatorManagerNew::stopDriverRun()
+{
+  h_file.reset();
+  if (Archive)
+  {
+    Archive->flush();
+    if (!*Archive)
+      throw std::runtime_error("Failed to write scalar estimator output");
+  }
+  Archive.reset();
+#if defined(DEBUG_ESTIMATOR_ARCHIVE)
+  DebugArchive.reset();
+#endif
+}
 
 void EstimatorManagerNew::startBlock(int steps)
 {

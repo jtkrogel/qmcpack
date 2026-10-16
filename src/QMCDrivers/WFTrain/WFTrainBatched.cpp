@@ -51,6 +51,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -1426,7 +1427,6 @@ void WFTrainBatched::run()
               << "; excludes shared model, inference clones, opaque ParticleSet caches, allocator/RSS" << std::endl;
   }
 #endif
-  estimator_manager_->startDriverRun();
 
   WalkerLogManager wlog_manager(walker_logs_input, allow_walker_logs, get_root_name(), myComm);
   for (auto& crowd : crowds_)
@@ -1532,27 +1532,14 @@ void WFTrainBatched::run()
       population_, rngs_, global_step, static_cast<std::size_t>(myComm->size()),
       static_cast<std::size_t>(myComm->rank()), crowds_.size());
   const bool resumed = !training_input_.getRestartPath().empty();
+  if (!training_input_.getCheckpointPath().empty() && myComm->rank() == 0)
+    app_warning() << "WFTrain checkpoint_path is deprecated; native checkpoints use "
+                  << get_root_name() << ".training/<iteration>.checkpoint/ and latest pointer "
+                  << get_root_name() << ".last_checkpoint.h5" << std::endl;
   // Scalar blocks remain statistical output. This separate history records one
   // complete optimization attempt, including its sampled and published versions.
   std::ofstream iteration_history;
   bool history_failed = false;
-  if (myComm->rank() == 0)
-  {
-    const std::string history_path = get_root_name() + ".training.csv";
-    std::ifstream previous(history_path);
-    const bool has_header = resumed && previous.peek() != std::ifstream::traits_type::eof();
-    iteration_history.open(history_path, resumed ? std::ios::app : std::ios::trunc);
-    if (!has_header)
-      iteration_history << "iteration,sample_version,parameter_version,objective,optimizer,samples,"
-                           "mean_energy,variance,gradient_norm,overlap_loss,selected_alpha,committed,"
-                           "sampling_seconds,total_seconds,retained_numeric_bytes,resident_bytes,"
-                           "krylov_iterations,krylov_operator_applications,orbital_loss\n";
-    iteration_history.flush();
-    history_failed = !iteration_history;
-  }
-  myComm->bcast(history_failed);
-  if (history_failed)
-    throw UniformCommunicateError("WFTrainBatched: cannot open iteration history");
   if (resumed)
   {
     if (myComm->rank() == 0)
@@ -1569,9 +1556,78 @@ void WFTrainBatched::run()
           "WFTrainBatched: restored training progress is inconsistent with requested iterations");
     if (myComm->rank() == 0)
       app_log() << "WFTrain restored " << stage_state.completed_stage_iterations
-                << " completed update(s) from " << training_input_.getRestartPath()
-                << std::endl;
+                << " completed iteration(s) from " << training_input_.getRestartPath()
+                << "; runtime parameter generation " << training_state.parameter_version
+                << " (checkpoint source generations are rebased to this process)" << std::endl;
   }
+
+  // Validate the entire existing output family before sampling or opening files.
+  // An older checkpoint may branch under a new root, but cannot replace future data.
+  const std::filesystem::path training_directory(get_root_name() + ".training");
+  if (myComm->rank() == 0)
+    try
+    {
+      const auto completed = training_state.completed_iterations;
+      const std::filesystem::path history_path(get_root_name() + ".training_info.csv");
+      const bool has_history = std::filesystem::exists(history_path);
+      if (has_history)
+      {
+        std::ifstream previous(history_path);
+        std::string line;
+        if (!std::getline(previous, line) || line.rfind("iteration,sample_version,parameter_version,", 0) != 0)
+          throw std::runtime_error("Invalid training history header");
+        std::optional<std::size_t> next_iteration;
+        while (std::getline(previous, line))
+        {
+          const auto comma = line.find(',');
+          const auto index = comma == std::string::npos ? std::string{} : line.substr(0, comma);
+          if (index.empty() || index.find_first_not_of("0123456789") != std::string::npos)
+            throw std::runtime_error("Noncontiguous training history");
+          const auto iteration_index = std::stoull(index);
+          if (next_iteration && iteration_index != *next_iteration)
+            throw std::runtime_error("Noncontiguous training history");
+          next_iteration = iteration_index + 1;
+        }
+        if (!resumed || (next_iteration ? *next_iteration != completed : completed != 0))
+          throw std::runtime_error("Training history conflicts with restart progress");
+      }
+      const auto reject_future = [&](const std::filesystem::path& directory) {
+        if (!std::filesystem::exists(directory))
+          return;
+        const std::string prefix = std::filesystem::path(get_root_name()).filename().string() + ".i";
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+        {
+          const auto name = entry.path().filename().string();
+          if (name.rfind(prefix, 0) != 0)
+            continue;
+          const auto end = name.find('.', prefix.size());
+          const auto digits = name.substr(prefix.size(), end - prefix.size());
+          if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos ||
+              std::stoull(digits) >= completed)
+            throw std::runtime_error("Existing training iteration conflicts with restart: " + name);
+        }
+      };
+      reject_future(training_directory);
+      const auto parent = std::filesystem::path(get_root_name()).parent_path();
+      reject_future(parent.empty() ? std::filesystem::path(".") : parent);
+      std::filesystem::create_directories(training_directory);
+      iteration_history.open(history_path, has_history ? std::ios::app : std::ios::out);
+      if (!has_history)
+        iteration_history << "iteration,sample_version,parameter_version,objective,optimizer,samples,"
+                             "mean_energy,variance,gradient_norm,overlap_loss,selected_alpha,committed,"
+                             "sampling_seconds,total_seconds,retained_numeric_bytes,resident_bytes,"
+                             "krylov_iterations,krylov_operator_applications,orbital_loss\n";
+      iteration_history.flush();
+      history_failed = !iteration_history;
+    }
+    catch (const std::exception& error)
+    {
+      app_error() << "WFTrain output validation: " << error.what() << std::endl;
+      history_failed = true;
+    }
+  myComm->bcast(history_failed);
+  if (history_failed)
+    throw UniformCommunicateError("WFTrainBatched: conflicting output family or inaccessible training history");
 
   {
     ScopedTimer initialization_timer(timers_.init_walkers_timer);
@@ -1607,6 +1663,19 @@ void WFTrainBatched::run()
     ScopeGuard<LoopTimer<>> iteration_timer(training_loop);
     Timer iteration_wall;
     const auto sample_version = training_state.parameter_version;
+    std::ostringstream iteration_name;
+    iteration_name << std::filesystem::path(get_root_name()).filename().string()
+                   << ".i" << std::setfill('0') << std::setw(7) << iteration;
+    std::exception_ptr output_failure;
+    try
+    {
+      estimator_manager_->startDriverRun({(training_directory / iteration_name.str()).string(), true});
+    }
+    catch (...) { output_failure = std::current_exception(); }
+    int output_failed = output_failure ? 1 : 0;
+    myComm->allreduce(output_failed);
+    if (output_failed)
+      throw UniformCommunicateError("WFTrainBatched: cannot start scalar-only iteration output");
     // This equilibration is separate from the initial qmc warmup. Warmup moves
     // honor substeps but contribute neither retained samples nor scalar statistics.
     for (std::size_t warmup = 0; warmup < training_input_.getWarmupSteps(); ++warmup)
@@ -1624,7 +1693,7 @@ void WFTrainBatched::run()
       const int statistical_block = iteration * num_blocks + block;
       if (myComm->rank() == 0)
         app_log() << "WFTrain statistical block " << statistical_block
-                  << " iteration " << iteration + 1
+                  << " iteration " << iteration
                   << " version " << training_state.parameter_version << std::endl;
       sampling_state.recalculate_properties_period = qmc_driver_mode_[QMC_UPDATE_MODE]
           ? qmcdriver_input_.get_recalculate_properties_period() : 0;
@@ -1681,10 +1750,15 @@ void WFTrainBatched::run()
       // Statistical rows refer only to this iteration's fixed parameter version.
       endBlock();
       wlog_manager.writeBuffers();
-      recordBlock(statistical_block);
       ++completed_blocks;
     }
 
+    int scalar_write_failed = 0;
+    try { estimator_manager_->stopDriverRun(); }
+    catch (...) { scalar_write_failed = 1; }
+    myComm->allreduce(scalar_write_failed);
+    if (scalar_write_failed)
+      throw UniformCommunicateError("WFTrainBatched: failed to write scalar iteration output");
     const double sampling_seconds = iteration_wall.elapsed();
     wftrain::TrainingIterationResult iteration_result;
     std::optional<ResidentEnergyDiagnostics> resident_diagnostics;
@@ -2449,7 +2523,7 @@ void WFTrainBatched::run()
     if (myComm->rank() == 0)
     {
       app_log() << std::setprecision(12)
-                << "WFTrain iteration " << iteration_result.completed_iteration
+                << "WFTrain iteration " << iteration
                 << " version " << iteration_result.parameter_version;
       if (orbital_diagnostics)
         app_log() << " samples " << orbital_diagnostics->sample_count
@@ -2513,7 +2587,7 @@ void WFTrainBatched::run()
     history_failed = false;
     if (myComm->rank() == 0)
     {
-      iteration_history << std::setprecision(17) << iteration_result.completed_iteration << ','
+      iteration_history << std::setprecision(17) << iteration << ','
                         << sample_version << ',' << iteration_result.parameter_version << ','
                         << (orbital_mse ? "orbital_mse" : determinant_overlap ? "determinant_overlap" : "energy") << ','
                         << wftrain::optimizerName(training_input_.getOptimizer()) << ',';
@@ -2556,22 +2630,19 @@ void WFTrainBatched::run()
     myComm->bcast(stop_requested);
     if (myComm->rank() == 0)
       app_log() << runtime_control.generateProgressMessage("WFTrainBatched", iteration, num_iterations);
-    const int checkpoint_period = qmcdriver_input_.get_check_point_period();
     const bool periodic_checkpoint =
-        checkpoint_period > 0 &&
-        ((iteration + 1) * num_blocks / checkpoint_period > iteration * num_blocks / checkpoint_period);
+        training_state.completed_iterations % training_input_.getCheckpointInterval() == 0;
     const bool final_block = iteration + 1 == num_iterations;
-    if (!training_input_.getCheckpointPath().empty() &&
-        (periodic_checkpoint || final_block || stop_requested))
+    if (periodic_checkpoint || final_block || stop_requested)
     {
       ScopedTimer checkpoint_timer(timers_.checkpoint_timer);
-      wftrain::DistributedTrainingCheckpoint::saveAtomic(
-          training_input_.getCheckpointPath(), *myComm, *selected_provider_,
+      wftrain::DistributedTrainingCheckpoint::saveIterationBundle(
+          get_root_name(), static_cast<std::size_t>(iteration), *myComm, *selected_provider_,
           training_state, stage_state, optimizer_checkpoint, sampler_checkpoint,
           sampler_checkpoint.topology());
       if (myComm->rank() == 0)
         app_log() << "WFTrain checkpointed " << stage_state.completed_stage_iterations
-                  << " completed update(s) to " << training_input_.getCheckpointPath()
+                  << " completed iteration(s) under " << get_root_name()
                   << std::endl;
     }
     if (stop_requested)
@@ -2590,7 +2661,7 @@ void WFTrainBatched::run()
   print_mem("WFTrainBatched ends", app_log());
   wlog_manager.stopRun();
   estimator_manager_->stopDriverRun();
-  finalize(completed_blocks, true);
+  finalize(completed_blocks, false, false);
 }
 
 RefVector<QMCDriverNew::ContextForSteps> WFTrainBatched::getContextForStepsRefs() const

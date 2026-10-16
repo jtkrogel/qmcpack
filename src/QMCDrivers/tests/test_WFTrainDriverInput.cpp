@@ -58,12 +58,25 @@ TEST_CASE("WFTrainDriverInput accepts conventional orbital pretraining", "[drive
     <parameter name="orbital_target">single_reference</parameter></training></qmc>)"));
 }
 
+TEST_CASE("WFTrainDriverInput validates native checkpoint cadence", "[drivers][wf_train]")
+{
+  const auto parse = [](const std::string& value) {
+    return parseTrainingInput("<qmc><training><parameter name=\"checkpoint_interval\">" + value +
+                              "</parameter></training></qmc>");
+  };
+  CHECK(parse("1").getCheckpointInterval() == 1);
+  CHECK(parse("1000").getCheckpointInterval() == 1000);
+  for (const std::string value : {"0", "-1", "1.5", "bad", "184467440737095516160"})
+    CHECK_THROWS(parse(value));
+}
+
 TEST_CASE("WFTrainDriverInput accepts strict energy/adam input", "[drivers][wf_train]")
 {
   SECTION("defaults")
   {
     const auto input = parseTrainingInput(R"(<qmc method="wf_train"><training></training></qmc>)");
     CHECK(input.getIterations() == 1);
+    CHECK(input.getCheckpointInterval() == 1000);
     CHECK(input.getWarmupSteps() == 0);
     CHECK(input.getObjective() == WFTrainDriverInput::Objective::ENERGY);
     CHECK(input.getOptimizer() == WFTrainDriverInput::Optimizer::ADAM);

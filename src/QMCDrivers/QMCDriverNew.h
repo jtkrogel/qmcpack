@@ -199,7 +199,7 @@ public:
    * Accumulate energy and weight is written to a hdf5 file.
    * Finialize the estimators
    */
-  void finalize(int block, bool dumpwalkers = true);
+  void finalize(int block, bool dumpwalkers = true, bool write_rng = true);
 
   ///return current step
   inline IndexType current() const { return current_step_; }

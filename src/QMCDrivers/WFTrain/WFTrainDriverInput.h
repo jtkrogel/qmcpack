@@ -80,8 +80,11 @@ public:
   /** Parse exactly one nested training section from a qmc driver node. */
   void readXML(xmlNodePtr qmc_node);
 
-  /** Return optimizer updates, independent of statistical sample blocks. */
+  /** Total outer optimization attempts, including restored and rejected attempts. */
   std::size_t getIterations() const noexcept { return iterations_; }
+
+  /// Completed outer attempts between native checkpoint exports.
+  std::size_t getCheckpointInterval() const noexcept { return checkpoint_interval_; }
 
   /** Return discarded MC advances before every iteration's sample collection. */
   std::size_t getWarmupSteps() const noexcept { return warmup_steps_; }
@@ -174,6 +177,7 @@ public:
 
 private:
   std::size_t iterations_{1};
+  std::size_t checkpoint_interval_{1000};
   std::size_t warmup_steps_{0};
   double momentum_decay_{0.9};
   double rms_decay_{0.9};

@@ -11,7 +11,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
               1 1 TEST_ADDED wftrain_orbital_mse.xml)
   if(TEST_ADDED)
     set_property(TEST ${ORBITAL_TEST} PROPERTY PASS_REGULAR_EXPRESSION
-                 "WFTrain iteration 2 version 2 samples 2 orbital_loss")
+                 "WFTrain iteration 1 version 2 samples 2 orbital_loss")
   endif()
 
   foreach(POOLED_CASE optimizers search)
@@ -25,7 +25,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
                      "samples 8 mean_energy.*optimizer kfac")
       else()
         set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
-                     "WFTrain iteration 2.*samples 8 mean_energy")
+                     "WFTrain iteration 1.*samples 8 mean_energy")
       endif()
     endif()
   endforeach()
@@ -38,7 +38,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     if(TEST_ADDED)
       math(EXPR POOLED_SAMPLES "8 * ${POOLED_RANKS}")
       set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
-                   "WFTrain iteration 2 version 2 samples ${POOLED_SAMPLES} mean_energy")
+                   "WFTrain iteration 1 version 2 samples ${POOLED_SAMPLES} mean_energy")
     endif()
   endforeach()
   foreach(SEARCH_CASE reference endpoints overlap_search rejected)
@@ -49,7 +49,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
                   ${SEARCH_RANKS} 1 TEST_ADDED wftrain_${SEARCH_CASE}.xml)
       if(TEST_ADDED)
         if(SEARCH_CASE STREQUAL "rejected")
-          set_property(TEST ${SEARCH_TEST} PROPERTY PASS_REGULAR_EXPRESSION "WFTrain iteration 2 version 0")
+          set_property(TEST ${SEARCH_TEST} PROPERTY PASS_REGULAR_EXPRESSION "WFTrain iteration 1 version 0")
         else()
           set_property(TEST ${SEARCH_TEST} PROPERTY PASS_REGULAR_EXPRESSION "selected_alpha")
         endif()
@@ -69,7 +69,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 1 samples 1 mean_energy")
+               "WFTrain iteration 0 version 1 samples 1 mean_energy")
   endif()
 
   set(OVERLAP_TEST_NAME short-H2-ae-psiformer-wftrain-overlap-r1-t1)
@@ -85,7 +85,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${OVERLAP_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 1 samples 2 overlap_loss")
+               "WFTrain iteration 0 version 1 samples 2 overlap_loss")
   endif()
 
   set(PII_TEST_NAME short-H2-ae-psiformer-wftrain-pii-r1-t1)
@@ -101,7 +101,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${PII_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 2 samples 2 mean_energy.*optimizer minpii.*krylov_operator_applications [1-9]")
+               "WFTrain iteration 0 version 2 samples 2 mean_energy.*optimizer minpii.*krylov_operator_applications [1-9]")
   endif()
 
   set(OPTIMIZERS_TEST_NAME short-H2-ae-psiformer-wftrain-optimizers-r1-t1)
@@ -117,7 +117,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${OPTIMIZERS_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 3 samples 2 mean_energy.*optimizer spring.*krylov_operator_applications [1-9]")
+               "WFTrain iteration 0 version 3 samples 2 mean_energy.*optimizer spring.*krylov_operator_applications [1-9]")
   endif()
 
   set(FIRST_ORDER_TEST_NAME short-H2-ae-psiformer-wftrain-first-order-r1-t1)
@@ -131,7 +131,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     wftrain_first_order.xml)
   if(TEST_ADDED)
     set_property(TEST ${FIRST_ORDER_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
-                 "WFTrain iteration 1 version 5 samples 2 mean_energy")
+                 "WFTrain iteration 0 version 5 samples 2 mean_energy")
   endif()
 
   foreach(MATRIX_OPTIMIZER lm alm kfac)
@@ -146,7 +146,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
       wftrain_${MATRIX_OPTIMIZER}.xml)
     if(TEST_ADDED)
       set_property(TEST ${MATRIX_OPTIMIZER_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
-                   "WFTrain iteration 1 version 1 samples 2 mean_energy.*optimizer ${MATRIX_OPTIMIZER}")
+                   "WFTrain iteration 0 version 1 samples 2 mean_energy.*optimizer ${MATRIX_OPTIMIZER}")
     endif()
   endforeach()
 
@@ -161,7 +161,27 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     wftrain_amsgrad_checkpoint.xml)
   if(TEST_ADDED)
     set_property(TEST ${AMSGRAD_CHECKPOINT_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
-                 "WFTrain checkpointed 1 completed update\\(s\\)")
+                 "WFTrain checkpointed 1 completed iteration\\(s\\)")
+  endif()
+
+  set(IGNORED_ESTIMATORS_TEST short-H2-ae-psiformer-wftrain-ignored-estimators-r1-t1)
+  set(TEST_ADDED FALSE)
+  run_qmc_app(${IGNORED_ESTIMATORS_TEST}
+              "${qmcpack_SOURCE_DIR}/tests/molecules/H2_ae_psiformer_wftrain"
+              1 1 TEST_ADDED wftrain_ignored_estimators.xml)
+  if(TEST_ADDED)
+    set_property(TEST ${IGNORED_ESTIMATORS_TEST} PROPERTY PASS_REGULAR_EXPRESSION
+                 "WFTrain ignores supplemental global/local estimator requests")
+    find_program(PSIFORMER_H5DIFF h5diff)
+    if(PSIFORMER_H5DIFF AND Python3_EXECUTABLE)
+      add_test(NAME short-H2-ae-psiformer-wftrain-ignored-estimators-equivalence
+               COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_ignored_estimators.py"
+                 "${CMAKE_CURRENT_BINARY_DIR}/${AMSGRAD_CHECKPOINT_TEST_NAME}/h2_psiformer_amsgrad_checkpoint.s000"
+                 "${CMAKE_CURRENT_BINARY_DIR}/${IGNORED_ESTIMATORS_TEST}/h2_psiformer_ignored_estimators.s000"
+                 --h5diff ${PSIFORMER_H5DIFF})
+      set_property(TEST short-H2-ae-psiformer-wftrain-ignored-estimators-equivalence PROPERTY DEPENDS
+                   "${AMSGRAD_CHECKPOINT_TEST_NAME};${IGNORED_ESTIMATORS_TEST}")
+    endif()
   endif()
 
   set(AMSGRAD_RESTART_TEST_NAME short-H2-ae-psiformer-wftrain-amsgrad-restart-r1-t1)
@@ -183,7 +203,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
       PROPERTY WORKING_DIRECTORY
                "${CMAKE_CURRENT_BINARY_DIR}/${AMSGRAD_CHECKPOINT_TEST_NAME}")
     set_property(TEST ${AMSGRAD_RESTART_TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
-                 "WFTrain iteration 2 version 2")
+                 "WFTrain iteration 1 version 2")
   endif()
 
   set(LIH_AE_TEST_NAME short-LiH-ae-psiformer-wftrain-adam-r1-t1)
@@ -199,7 +219,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${LIH_AE_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 1 version 1 samples 1 mean_energy [-+]?[0-9]")
+               "WFTrain iteration 0 version 1 samples 1 mean_energy [-+]?[0-9]")
   endif()
 
   # Exercise the production manifest/root/shard route in two processes launched
@@ -218,7 +238,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${CHECKPOINT_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain checkpointed 1 completed update\\(s\\)")
+               "WFTrain checkpointed 1 completed iteration\\(s\\)")
   endif()
 
   set(RESTART_TEST_NAME short-H2-ae-psiformer-wftrain-restart-r1-t1)
@@ -242,7 +262,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     set_property(
       TEST ${RESTART_TEST_NAME}
       PROPERTY PASS_REGULAR_EXPRESSION
-               "WFTrain iteration 2 version 2")
+               "WFTrain iteration 1 version 2")
   endif()
 
   if(HAVE_MPI AND TEST_MAX_PROCS GREATER_EQUAL 2)
@@ -259,7 +279,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
       set_property(
         TEST ${TEST_NAME}
         PROPERTY PASS_REGULAR_EXPRESSION
-                 "WFTrain iteration 1 version 1 samples 2 mean_energy")
+                 "WFTrain iteration 0 version 1 samples 2 mean_energy")
     endif()
   endif()
 endif()

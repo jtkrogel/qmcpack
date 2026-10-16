@@ -28,6 +28,7 @@
 #include "Utilities/ProjectData.h"
 #include <stdio.h>
 #include <sstream>
+#include <filesystem>
 
 namespace qmcplusplus
 {
@@ -69,6 +70,7 @@ TEST_CASE("EstimatorManagerNew::EstimatorManagerNew(EstimatorManagerInput,...)",
   emn.constructEstimators(std::move(emi), pset, twf, ham, particle_pool.getPool());
 
   CHECK(emn.getNumEstimators() == 3);
+  CHECK_THROWS(emn.startDriverRun({"unsupported_operator_scalar_only", true}));
   // Because the only scalar estimator becomes the main estimator.
   CHECK(emn.getNumScalarEstimators() == 0);
   EstimatorManagerNewTestAccess emnta(emn);
@@ -147,6 +149,35 @@ TEST_CASE("EstimatorManagerNew::collectMainEstimators", "[estimators]")
   CHECK(embt.em.get_AverageCache()[2] == Approx(correct_value));
   correct_value = 14.0;
   CHECK(embt.em.get_AverageCache()[3] == Approx(correct_value));
+}
+
+TEST_CASE("EstimatorManagerNew supports independent scalar-only output", "[estimators]")
+{
+  Communicate* comm = OHMMS::Controller;
+  QMCHamiltonian ham;
+  testing::EstimatorManagerNewTest fixture(ham, comm, 1);
+  REQUIRE(fixture.testReplaceMainEstimator());
+  const auto original_name = comm->getName();
+  const std::string prefix = "estimator_scalar_only_test";
+  fixture.em.startDriverRun({prefix, true});
+  fixture.em.stopDriverRun();
+  CHECK(comm->getName() == original_name);
+  if (comm->rank() == 0)
+  {
+    CHECK(std::filesystem::exists(prefix + ".scalar.dat"));
+    CHECK_FALSE(std::filesystem::exists(prefix + ".stat.h5"));
+    std::filesystem::remove(prefix + ".scalar.dat");
+  }
+  fixture.em.startDriverRun({prefix + "_full"});
+  fixture.em.stopDriverRun();
+  CHECK(comm->getName() == original_name);
+  if (comm->rank() == 0)
+  {
+    CHECK(std::filesystem::exists(prefix + "_full.scalar.dat"));
+    CHECK(std::filesystem::exists(prefix + "_full.stat.h5"));
+    std::filesystem::remove(prefix + "_full.scalar.dat");
+    std::filesystem::remove(prefix + "_full.stat.h5");
+  }
 }
 
 TEST_CASE("EstimatorManagerNew::collectScalarEstimators", "[estimators]")

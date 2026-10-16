@@ -6,14 +6,24 @@ from pathlib import Path
 import sys
 
 base = Path(sys.argv[1])
-with base.with_suffix(".s000.training.csv").open() as stream:
+root = base.with_suffix(".s000")
+with Path(str(root) + ".training_info.csv").open() as stream:
     rows = list(csv.DictReader(stream))
-scalar = base.with_suffix(".s000.scalar.dat").read_text().splitlines()
-scalar_rows = [line for line in scalar if line.strip() and not line.lstrip().startswith("#")]
-if len(rows) != 2 or len(scalar_rows) != 4:
+if Path(str(root) + ".scalar.dat").exists() or Path(str(root) + ".stat.h5").exists():
+    raise SystemExit("Unexpected top-level scalar/stat output")
+scalar_files = sorted(Path(str(root) + ".training").glob("*.scalar.dat"))
+if len(rows) != 2 or len(scalar_files) != 2:
     raise SystemExit("Expected two optimizer attempts and four statistical blocks")
 for index, row in enumerate(rows):
-    if int(row["iteration"]) != index + 1 or int(row["sample_version"]) != index:
+    expected = Path(str(root) + ".training") / (root.name + f".i{index:07d}.scalar.dat")
+    if scalar_files[index] != expected:
+        raise SystemExit("Incorrect iteration scalar filename")
+    scalar_rows = [line for line in expected.read_text().splitlines()
+                   if line.strip() and not line.lstrip().startswith("#")]
+    stat_path = expected.with_name(expected.name.replace(".scalar.dat", ".stat.h5"))
+    if len(scalar_rows) != 2 or stat_path.exists():
+        raise SystemExit("Expected two scalar blocks per iteration and no stat HDF5")
+    if int(row["iteration"]) != index or int(row["sample_version"]) != index:
         raise SystemExit("Iteration or sampled parameter version mismatch")
     if int(row["samples"]) != 8 or int(row["parameter_version"]) != index + 1:
         raise SystemExit("Pooled sample count or published version mismatch")

@@ -518,22 +518,45 @@ ParticleSet/teacher caches, model storage and allocator overhead. It is a
 boundary check, not an allocator or transient-peak limit; a requested guard
 fails explicitly if RSS cannot be measured. MPI ranks each apply their own limit.
 
-Every training section writes ``<project>.sNNN.training.csv`` with one row per
+Every training section writes ``<project>.sNNN.training_info.csv`` with one row per
 optimizer attempt, independently of scalar statistical blocks. It records the
 sampled/published parameter versions, sample count, energy/variance/gradient
 norm or overlap loss, selected alpha, committed flag, sampling/full-iteration
 wall time, retained numeric bytes, rank-zero RSS and solver diagnostics.
 Full-iteration timing excludes the subsequent checkpoint write. Restart appends
 to an existing history for the same output root, or writes a fresh header when
-the output root changes.
+the output root changes. Iteration indices start at zero and count complete outer
+optimization attempts, including rejected updates. The training ``iterations``
+parameter is the total requested count, including attempts restored from a
+checkpoint. ``sample_version`` and ``parameter_version`` identify process-local
+provider generations; restart republishes the saved source generation into the
+new process and may rebase those version numbers. Outer iteration counts and
+optimizer update/bias-correction counts retain their cumulative saved values.
+Scalar statistics use one file per iteration in
+``R.training/R.i0000000.scalar.dat``, where ``R`` is the series-qualified project
+root. Each contains one row per sampling block at the starting parameter version.
+Training writes no top-level scalar file or statistical HDF5 file. Supplemental
+global/local scalar and operator estimator requests are ignored with a warning
+before estimator construction. Mandatory energy/variance and basic sampling
+diagnostics remain active, with all physical Hamiltonian terms included.
+Restarting an older checkpoint under a root with conflicting future output is
+rejected before sampling; select a new project root to branch that checkpoint.
 
 To suppress the potentially enormous startup parameter table while keeping
 other diagnostics, use ``<wavefunction ... print_parameters="no">``. The default
 is ``yes`` for compatibility; ``no`` prints the parameter count only.
 
-Exact training checkpoints are taken only after a complete iteration. A qmc
-checkpoint period counts statistical blocks; crossing its boundary schedules
-the training checkpoint at the end of the encompassing iteration.
+Exact training checkpoints are taken only after a complete iteration. The training
+parameter ``checkpoint_interval`` (positive integer, default 1000) counts outer
+attempts independently of the qmc block checkpoint period. Thus interval 1000
+writes after indices 999, 1999, and so on. Completion and supported graceful
+runtime stops also write a checkpoint. Each export contains
+``R.training/R.i0000999.parameters.h5`` for direct PsiFormer input and a restart
+bundle ``R.training/R.i0000999.checkpoint/`` with manifest, global state, and rank
+sampler files.
+``R.last_checkpoint.h5`` selects the latest completely published export. Restart
+accepts an archived bundle directory, its manifest, or this latest pointer; it
+does not require the separate parameter export.
 Ordinary-locality ECP training now persists each walker's accepted rotated
 quadrature grids alongside walker and RNG state. Restart validates the grid
 layout and finite unit-sphere coordinates, restores them transactionally, then

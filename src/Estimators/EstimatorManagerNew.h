@@ -99,7 +99,14 @@ public:
    *
    * Replace reportHeader and reset functon.
    */
+  struct OutputConfig
+  {
+    std::string prefix;
+    bool scalar_only = false;
+  };
+
   void startDriverRun();
+  void startDriverRun(const OutputConfig& output);
 
   /** Stop the manager at the end of a driver run().
    * Flush/close files.

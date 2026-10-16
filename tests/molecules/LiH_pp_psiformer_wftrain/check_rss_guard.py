@@ -12,7 +12,7 @@ if result.returncode == 0 or "process RSS exceeds maximum_resident_bytes" not in
     raise SystemExit("Expected explicit measured-RSS rejection, not success or an unrelated failure")
 if "(listing suppressed)" not in result.stdout:
     raise SystemExit("Targeted parameter-listing suppression was not exercised")
-with Path("lih_pp_psiformer_wftrain_adam.s000.training.csv").open() as stream:
+with Path("lih_pp_psiformer_wftrain_adam.s000.training_info.csv").open() as stream:
     if list(csv.DictReader(stream)):
         raise SystemExit("An optimization update ran after the startup RSS limit was exceeded")
 print("Measured RSS guard rejects the run before optimization and preserves targeted startup reporting")

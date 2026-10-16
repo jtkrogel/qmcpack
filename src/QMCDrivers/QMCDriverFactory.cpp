@@ -363,8 +363,13 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
           &sampling_wavefunction == &primaryPsi)
         throw UniformCommunicateError(
             "WFTrain teacher objectives require a wavefunction distinct from the student");
+      // Training owns scalar energy/variance diagnostics. Ignore supplemental
+      // requests before constructing estimator resources, including teacher runs.
+      if ((emi || qmcdriver_input.get_estimator_manager_input()) && comm->rank() == 0)
+        app_warning() << "WFTrain ignores supplemental global/local estimator requests; "
+                         "sampling retains energy, variance and basic diagnostics." << std::endl;
       UPtr<EstimatorManagerNew> estimator_manager = makeEstimatorManager(
-          emi, qmcdriver_input.get_estimator_manager_input(), sampling_wavefunction);
+          std::nullopt, std::nullopt, sampling_wavefunction);
       new_driver = std::make_unique<WFTrainBatched>(
           project_data_, std::move(qmcdriver_input), std::move(estimator_manager), std::move(vmcdriver_input),
           std::move(training_input), qmc_system, primaryPsi,

@@ -28,8 +28,8 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 67> allowed_controls{
-    "iterations", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
+constexpr std::array<std::string_view, 68> allowed_controls{
+    "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
     "line_search", "update_scale", "weight_decay", "weight_decay_scope",
@@ -246,6 +246,7 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   const auto readControl = [&values](const char* name) -> const std::string& { return values.at(name); };
 
   iterations_ = 1;
+  checkpoint_interval_ = 1000;
   warmup_steps_ = 0;
   objective_                        = Objective::ENERGY;
   orbital_target_                    = OrbitalTarget::SINGLE_REFERENCE;
@@ -310,6 +311,8 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   minimum_effective_samples_ = 1.0;
   if (seen_controls.count("iterations"))
     iterations_ = parsePositiveSize(readControl("iterations"), "iterations");
+  if (seen_controls.count("checkpoint_interval"))
+    checkpoint_interval_ = parsePositiveSize(readControl("checkpoint_interval"), "checkpoint_interval");
   if (seen_controls.count("warmupsteps"))
     warmup_steps_ = parseNonnegativeSize(readControl("warmupsteps"), "warmupsteps");
   if (seen_controls.count("momentum_decay"))

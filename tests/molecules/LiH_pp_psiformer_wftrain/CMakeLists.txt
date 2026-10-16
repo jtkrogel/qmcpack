@@ -28,8 +28,8 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     add_test(NAME short-LiH-pp-psiformer-ecp-restart-equivalence
              COMMAND ${Python3_EXECUTABLE}
                "${CMAKE_CURRENT_SOURCE_DIR}/compare_ecp_restart.py"
-               "${CMAKE_CURRENT_BINARY_DIR}/short-LiH-pp-psiformer-ecp-continuous-r1-t1/ecp_continuous.manifest.h5"
-               "${CMAKE_CURRENT_BINARY_DIR}/short-LiH-pp-psiformer-ecp-checkpoint-r1-t1/ecp_resumed.manifest.h5"
+               "${CMAKE_CURRENT_BINARY_DIR}/short-LiH-pp-psiformer-ecp-continuous-r1-t1/lih_pp_ecp_continuous.s000.last_checkpoint.h5"
+               "${CMAKE_CURRENT_BINARY_DIR}/short-LiH-pp-psiformer-ecp-checkpoint-r1-t1/lih_pp_ecp_restart.s000.last_checkpoint.h5"
                --h5diff ${PSIFORMER_H5DIFF} --h5dump ${PSIFORMER_H5DUMP})
     set_property(TEST short-LiH-pp-psiformer-ecp-restart-equivalence PROPERTY DEPENDS
                  "short-LiH-pp-psiformer-ecp-continuous-r1-t1;short-LiH-pp-psiformer-ecp-restart-r1-t1")
@@ -62,7 +62,7 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
                     "${CMAKE_CURRENT_BINARY_DIR}/${POOLED_TEST}/${PP_FILE}")
     endforeach()
     set_property(TEST ${POOLED_TEST} PROPERTY PASS_REGULAR_EXPRESSION
-                 "WFTrain iteration 1 version 1 samples 4 mean_energy.*optimizer adam")
+                 "WFTrain iteration 0 version 1 samples 4 mean_energy.*optimizer adam")
   endif()
   set(SEARCH_TEST short-LiH-pp-psiformer-search-reference-r1-t1)
   set(TEST_ADDED FALSE)
@@ -79,11 +79,11 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
     if(INPUT_NAME STREQUAL "wftrain_adam.xml")
       set(TEST_NAME short-LiH-pp-psiformer-wftrain-adam-r1-t1)
       set(EXPECTED_PATTERN
-          "WFTrain iteration 1 version 1 samples 1 mean_energy.*optimizer adam")
+          "WFTrain iteration 0 version 1 samples 1 mean_energy.*optimizer adam")
     else()
       set(TEST_NAME short-LiH-pp-psiformer-wftrain-pii-r1-t1)
       set(EXPECTED_PATTERN
-          "WFTrain iteration 1 version 2 samples 2 mean_energy.*optimizer minpii.*krylov_operator_applications [1-9]")
+          "WFTrain iteration 0 version 2 samples 2 mean_energy.*optimizer minpii.*krylov_operator_applications [1-9]")
     endif()
 
     set(TEST_ADDED FALSE)
@@ -121,6 +121,6 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
         "${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME}/${PP_FILE}")
     endforeach()
     set_property(TEST ${TEST_NAME} PROPERTY PASS_REGULAR_EXPRESSION
-                                           "WFTrain iteration 1 version 3 samples 2 mean_energy.*optimizer kfac")
+                                           "WFTrain iteration 0 version 3 samples 2 mean_energy.*optimizer kfac")
   endif()
 endif()

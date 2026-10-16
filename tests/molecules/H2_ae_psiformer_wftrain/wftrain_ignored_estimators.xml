@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<simulation>
+  <project id="h2_psiformer_ignored_estimators" series="0">
+    <parameter name="driver_version">batch</parameter>
+  </project>
+  <random seed="81357"/>
+
+  <particleset name="ion0" size="2">
+    <group name="H">
+      <parameter name="charge">1</parameter>
+      <parameter name="valence">1</parameter>
+      <parameter name="atomicnumber">1</parameter>
+    </group>
+    <attrib name="position" datatype="posArray">
+      0.0 0.0 -0.7
+      0.0 0.0  0.7
+    </attrib>
+  </particleset>
+
+  <particleset name="e" random="yes" randomsrc="ion0">
+    <group name="u" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter></group>
+    <group name="d" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter></group>
+  </particleset>
+
+  <wavefunction name="psi0" target="e">
+    <psiformer name="pf" initialization="deepqmc_psiformer_v1"
+               initialization_seed="29" source="ion0" system="all_electron"
+               optimize="yes" optimize_scope="indices" optimize_indices="0"/>
+  </wavefunction>
+
+  <hamiltonian name="h0" type="generic" target="e">
+    <pairpot name="ElecElec" type="coulomb" source="e" target="e"/>
+    <pairpot name="IonElec" type="coulomb" source="ion0" target="e"/>
+    <constant name="IonIon" type="coulomb" source="ion0" target="ion0"/>
+  </hamiltonian>
+
+  <estimators>
+    <estimator type="LocalEnergy" name="supplemental_energy"/>
+    <estimator type="StructureFactor" name="supplemental_global_sk" hdf5="yes"/>
+  </estimators>
+  <qmc method="wf_train" move="pbyp" checkpoint="1">
+    <estimators>
+      <estimator type="StructureFactor" name="supplemental_local_sk" hdf5="yes"/>
+    </estimators>
+    <training objective="energy" optimizer="amsgrad">
+      <parameter name="iterations">1</parameter>
+      <parameter name="learning_rate">1e-10</parameter>
+      <parameter name="parameter_chunk_size">4096</parameter>
+      <parameter name="checkpoint_interval">1000</parameter>
+    </training>
+    <parameter name="walkers_per_rank">1</parameter>
+    <parameter name="crowds">1</parameter>
+    <parameter name="blocks">1</parameter>
+    <parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter>
+    <parameter name="substeps">1</parameter>
+    <parameter name="timestep">1e-4</parameter>
+    <parameter name="usedrift">no</parameter>
+  </qmc>
+</simulation>

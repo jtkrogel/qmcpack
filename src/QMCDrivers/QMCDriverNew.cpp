@@ -206,7 +206,7 @@ void QMCDriverNew::recordBlock(int block)
   }
 }
 
-void QMCDriverNew::finalize(int block, bool dumpwalkers)
+void QMCDriverNew::finalize(int block, bool dumpwalkers, bool write_rng)
 {
   population_.saveWalkerConfigurations(walker_configs_ref_);
   setWalkerOffsets(walker_configs_ref_, myComm);
@@ -220,7 +220,7 @@ void QMCDriverNew::finalize(int block, bool dumpwalkers)
   infoSummary.flush();
   infoLog.flush();
 
-  if (DumpConfig)
+  if (DumpConfig && write_rng)
     RandomNumberControl::write(rngs_, get_root_name(), myComm);
 }
 
