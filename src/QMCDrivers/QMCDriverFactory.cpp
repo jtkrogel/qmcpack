@@ -378,7 +378,7 @@ std::unique_ptr<QMCDriverInterface> QMCDriverFactory::createQMCDriver(xmlNodePtr
       const bool is_pbyp_move = vmcdriver_input.get_move_kind() == VMCDriverInput::MoveKind::PBYP;
 #ifdef QMC_COMPLEX
       if (const auto* complex = selectedComplexProfile(primaryPsi); complex && complex->gpuInferenceEnabled() &&
-          !is_pbyp_move)
+          !is_pbyp_move && !complex->supportsMultiParticleMoves())
         throw UniformCommunicateError("Complex GPU inference requires parsed PBYP VMC_BATCH moves");
 #endif
 
