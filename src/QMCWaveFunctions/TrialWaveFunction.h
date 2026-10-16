@@ -730,6 +730,13 @@ public:
   /// spomap_ reference accessor
   const SPOMap& getSPOMap() const { return *spomap_; }
 
+  /// Original conventional registration identity survives model import and new
+  /// driver construction; clones share this immutable baseline, never P copies.
+  const std::shared_ptr<const OptVariables>& conventionalRegistrationIdentity() const noexcept
+  { return conventional_registration_identity_; }
+
+  void storeConventionalRegistrationIdentity(std::shared_ptr<const OptVariables> identity);
+
   /// find SD WFCs if exist
   RefVector<SlaterDet> findSD() const;
 
@@ -847,6 +854,7 @@ private:
 
   /// Owned SPOSets. Once a TWF is fully built, SPOSet lookup should be done via TWF.
   const std::shared_ptr<SPOMap> spomap_;
+  std::shared_ptr<const OptVariables> conventional_registration_identity_;
 
   ///getName is in the way
   const std::string myName;

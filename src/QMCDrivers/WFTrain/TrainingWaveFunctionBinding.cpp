@@ -32,6 +32,41 @@ namespace qmcplusplus::wftrain
 {
 namespace
 {
+/// Check only this export format's known fields before its HDF proxies can
+/// resize from file dimensions. Every bound comes from the trusted live model.
+void requireArtifactField(hdf_archive& archive, const std::string& name, int rank,
+                          std::size_t count, H5T_class_t category, std::size_t width,
+                          bool variable_strings = false)
+{
+  const hid_t dataset = H5Dopen2(archive.top(), name.c_str(), H5P_DEFAULT);
+  const hid_t space = dataset >= 0 ? H5Dget_space(dataset) : -1;
+  const hid_t type = dataset >= 0 ? H5Dget_type(dataset) : -1;
+  bool valid = space >= 0 && type >= 0 && H5Sget_simple_extent_ndims(space) == rank;
+  hsize_t extent = 0;
+  if (valid && rank == 1)
+    valid = H5Sget_simple_extent_dims(space, &extent, nullptr) >= 0 && extent == count;
+  if (valid)
+    valid = H5Tget_class(type) == category;
+  if (valid && category == H5T_STRING)
+  {
+    valid = (H5Tis_variable_str(type) > 0) == variable_strings;
+    if (valid && variable_strings)
+    {
+      hsize_t bytes = 0;
+      valid = H5Dvlen_get_buf_size(dataset, type, space, &bytes) >= 0 && bytes <= width;
+    }
+    else if (valid)
+      valid = H5Tget_size(type) <= width;
+  }
+  else if (valid)
+    valid = H5Tget_size(type) == width;
+  if (type >= 0) H5Tclose(type);
+  if (space >= 0) H5Sclose(space);
+  if (dataset >= 0) H5Dclose(dataset);
+  if (!valid)
+    throw std::runtime_error("Conventional artifact has an invalid or oversized required field: " + name);
+}
+
 struct RotationLayout
 {
   std::vector<RotatedSPOs*> unique;
@@ -184,6 +219,20 @@ TrainingWaveFunctionBinding::TrainingWaveFunctionBinding(TrialWaveFunction& prot
   for (auto& determinant : prototype.findMSD())
     determinant.get().validatePreparedCoefficientState(determinant.get());
   const auto& variables = adapter_.registrationVariables();
+  registration_identity_ = prototype.conventionalRegistrationIdentity();
+  if (!registration_identity_)
+  {
+    registration_identity_ = std::make_shared<const optimize::VariableSet>(variables);
+    prototype.storeConventionalRegistrationIdentity(registration_identity_);
+  }
+  const auto& original = *registration_identity_;
+  if (original.size() != variables.size())
+    throw std::invalid_argument("Conventional original registration extent changed");
+  for (std::size_t i = 0; i < original.size(); ++i)
+    if (original.name(i) != variables.name(i) || original.getType(i) != variables.getType(i) ||
+        original.where(i) != variables.where(i) ||
+        (original.where(i) < 0 && original[i] != variables[i]))
+      throw std::invalid_argument("Conventional original registration layout or frozen values changed");
   for (std::size_t i = 0; i < variables.size(); ++i)
     if (variables.where(i) >= 0 &&
         (variables.getType(i) == optimize::BACKFLOW_P ||
@@ -467,7 +516,7 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
   std::vector<std::string> names;
   std::vector<int> types, indices;
   std::vector<double> fixed_values;
-  const auto& variables = adapter_.registrationVariables();
+  const auto& variables = *registration_identity_;
   for (std::size_t i = 0; i < variables.size(); ++i)
   {
     names.push_back(variables.name(i));
@@ -491,35 +540,51 @@ void TrainingWaveFunctionBinding::exportModel(const std::filesystem::path& path)
 }
 StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::filesystem::path& path) const
 {
+  return readModelState(path, nullptr);
+}
+
+StructuredParameterSnapshot TrainingWaveFunctionBinding::readModelState(
+    const std::filesystem::path& path, ConventionalOrbitalFrame* complete_frame) const
+{
   hdf_archive input;
   if (!input.open(path, H5F_ACC_RDONLY)) throw std::runtime_error("Cannot read conventional model export");
   input.push("conventional_wavefunction", false);
+  const auto expected_identity = modelIdentity();
+  const std::string expected_cookie = orbital_rotations_ ? "conventional-rotated-lcao-sj-v1"
+                                     : multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
+                                                        : "conventional-fixed-slater-j1-j2-v1";
+  const auto& variables = *registration_identity_;
+  std::size_t name_bytes = 0;
+  for (std::size_t i = 0; i < variables.size(); ++i)
+    name_bytes += variables.name(i).size() + 1;
+  requireArtifactField(input, "format_version", 1, 3, H5T_INTEGER, sizeof(int));
+  requireArtifactField(input, "parameters", 1, parameterSchema().parameterCount(), H5T_FLOAT, sizeof(double));
+  requireArtifactField(input, "variable_names", 1, variables.size(), H5T_STRING, name_bytes, true);
+  for (const auto* name : {"variable_types", "active_indices"})
+    requireArtifactField(input, name, 1, variables.size(), H5T_INTEGER, sizeof(int));
+  requireArtifactField(input, "registration_values", 1, variables.size(), H5T_FLOAT, sizeof(double));
+  for (const auto& [name, bound] : std::vector<std::pair<std::string, std::size_t>>{
+           {"completion_cookie", expected_cookie.size()}, {"provider_id", parameterSchema().providerId().size()},
+           {"schema_fingerprint", parameterSchema().fingerprint().size()}, {"wavefunction_xml", definition_.size()},
+           {"model_identity", expected_identity.size()}, {"physical_definition", physical_definition_.size()}})
+    requireArtifactField(input, name, 1, 1, H5T_STRING, bound);
   std::string cookie, fingerprint, provider, definition, identity, physical;
   std::vector<std::string> names;
   std::vector<int> types, indices;
   std::vector<double> values;
   std::vector<int> version;
   auto result = snapshotParameters();
-  input.read(version, "format_version");
-  input.read(cookie, "completion_cookie");
-  input.read(provider, "provider_id");
-  input.read(fingerprint, "schema_fingerprint");
-  input.read(result.values, "parameters");
-  input.read(definition, "wavefunction_xml");
-  input.read(identity, "model_identity");
-  input.read(physical, "physical_definition");
-  input.read(names, "variable_names");
-  input.read(types, "variable_types");
-  input.read(indices, "active_indices");
-  input.read(values, "registration_values");
-  const std::string expected_cookie = orbital_rotations_ ? "conventional-rotated-lcao-sj-v1"
-                                     : multideterminant_ ? "conventional-fixed-orbital-mdj-v1"
-                                                        : "conventional-fixed-slater-j1-j2-v1";
+  if (!input.readEntry(version, "format_version") || !input.readEntry(cookie, "completion_cookie") ||
+      !input.readEntry(provider, "provider_id") || !input.readEntry(fingerprint, "schema_fingerprint") ||
+      !input.readEntry(result.values, "parameters") || !input.readEntry(definition, "wavefunction_xml") ||
+      !input.readEntry(identity, "model_identity") || !input.readEntry(physical, "physical_definition") ||
+      !input.readEntry(names, "variable_names") || !input.readEntry(types, "variable_types") ||
+      !input.readEntry(indices, "active_indices") || !input.readEntry(values, "registration_values"))
+    throw std::runtime_error("Conventional model export is missing required data");
   if (version != std::vector<int>{1, 0, 0} || cookie != expected_cookie ||
       fingerprint != parameterSchema().fingerprint() || provider != parameterSchema().providerId() ||
-      definition != definition_ || identity != modelIdentity() || physical != physical_definition_)
+      definition != definition_ || identity != expected_identity || physical != physical_definition_)
     throw std::runtime_error("Conventional model export identity mismatch");
-  const auto& variables = adapter_.registrationVariables();
   if (names.size() != variables.size() || types.size() != variables.size() ||
       indices.size() != variables.size() || values.size() != variables.size())
     throw std::runtime_error("Conventional model export registration extent mismatch");
@@ -534,13 +599,49 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
   {
     std::uint64_t source_version = 0;
     input.push("orbital_frame", false);
+    requireArtifactField(input, "source_version", 0, 1, H5T_INTEGER, sizeof(std::uint64_t));
     if (!input.readEntry(source_version, "source_version") ||
         source_version > std::numeric_limits<std::size_t>::max())
       throw std::runtime_error("Conventional orbital export is missing a valid source version");
     input.pop();
-    readOrbitalFrame(input, source_version, result);
+    auto frame = readOrbitalFrame(input, source_version, result);
+    if (complete_frame)
+      *complete_frame = std::move(frame);
   }
+  else if (input.is_group("orbital_frame"))
+    throw std::runtime_error("Unexpected orbital frame in a fixed-orbital conventional export");
   return result;
+}
+
+void TrainingWaveFunctionBinding::importModel(const std::filesystem::path& path)
+{
+  std::optional<StructuredParameterSnapshot> candidate;
+  ConventionalOrbitalFrame frame;
+  std::exception_ptr failure;
+  try
+  {
+#ifdef QMC_COMPLEX
+    throw std::runtime_error("Conventional model import currently requires a real CPU build");
+#endif
+    if (prototype_particles_.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
+      throw std::runtime_error("Conventional model import currently requires CPU particle coordinates");
+    // One artifact read owns both active coordinates and the complete frame;
+    // never reopen a pathname to combine potentially different generations.
+    candidate.emplace(readModelState(path, orbital_rotations_ ? &frame : nullptr));
+  }
+  catch (...) { failure = std::current_exception(); }
+  int failed = failure ? 1 : 0;
+  communicator_.allreduce(failed);
+  if (failed)
+  {
+    if (failure)
+      std::rethrow_exception(failure);
+    throw std::runtime_error("Another rank failed to prepare conventional model import");
+  }
+  if (orbital_rotations_)
+    publishOrbitalFrame(*candidate, candidate->version, frame);
+  else
+    publishParameters(*candidate, candidate->version);
 }
 
 void TrainingWaveFunctionBinding::writeOrbitalFrame(hdf_archive& archive) const
@@ -613,6 +714,10 @@ ConventionalOrbitalFrame TrainingWaveFunctionBinding::readOrbitalFrame(
   }
   const auto layout = rotationLayout(prototype_);
   archive.push("orbital_frame", false);
+  requireArtifactField(archive, "format_version", 1, 3, H5T_INTEGER, sizeof(int));
+  requireArtifactField(archive, "source_version", 0, 1, H5T_INTEGER, sizeof(std::uint64_t));
+  requireArtifactField(archive, "orbital_count", 0, 1, H5T_INTEGER, sizeof(std::uint64_t));
+  requireArtifactField(archive, "determinant_aliases", 1, layout.aliases.size(), H5T_INTEGER, sizeof(int));
   std::vector<int> version;
   std::uint64_t saved_version = 0, count = 0;
   if (!archive.readEntry(version, "format_version") ||
@@ -631,6 +736,12 @@ ConventionalOrbitalFrame TrainingWaveFunctionBinding::readOrbitalFrame(
     const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(*layout.unique[i]->Phi_);
     const auto& reference = lcao.originalRotationCoefficients();
     archive.push("spo_" + std::to_string(i), false);
+    requireArtifactField(archive, "name", 1, 1, H5T_STRING, layout.unique[i]->SPOSet::getName().size());
+    requireArtifactField(archive, "shape", 1, 2, H5T_INTEGER, sizeof(std::uint64_t));
+    requireArtifactField(archive, "full_rotation", 1, layout.unique[i]->fullRotationCoordinates().size(),
+                          H5T_FLOAT, sizeof(double));
+    for (const auto* name : {"accepted_coefficients", "reference_coefficients"})
+      requireArtifactField(archive, name, 1, lcao.C->size(), H5T_FLOAT, sizeof(double));
     if (!archive.readEntry(orbital.name, "name") || !archive.readEntry(shape, "shape") ||
         !archive.readEntry(orbital.full_rotation, "full_rotation") ||
         !archive.readEntry(orbital.accepted_coefficients, "accepted_coefficients") ||
@@ -715,7 +826,7 @@ std::string TrainingWaveFunctionBinding::modelIdentity() const
   };
   mix(definition_);
   mix(physical_definition_);
-  const auto& variables = adapter_.registrationVariables();
+  const auto& variables = *registration_identity_;
   for (std::size_t i = 0; i < variables.size(); ++i)
   {
     mix(variables.name(i));

@@ -1424,6 +1424,13 @@ const SPOSet& TrialWaveFunction::getSPOSet(const std::string& name) const
   return *spoit->second;
 }
 
+void TrialWaveFunction::storeConventionalRegistrationIdentity(std::shared_ptr<const OptVariables> identity)
+{
+  if (!identity || (conventional_registration_identity_ && conventional_registration_identity_ != identity))
+    throw std::logic_error("Original conventional registration identity cannot be replaced");
+  conventional_registration_identity_ = std::move(identity);
+}
+
 RefVector<SlaterDet> TrialWaveFunction::findSD() const
 {
   RefVector<SlaterDet> refs;
@@ -3297,6 +3304,7 @@ std::unique_ptr<TrialWaveFunction> TrialWaveFunction::makeClone(ParticleSet& tqp
   validateRetainedBatchExecutionBinding();
 
   auto myclone                 = std::make_unique<TrialWaveFunction>(runtime_options_, myName, use_tasking_);
+  myclone->conventional_registration_identity_ = conventional_registration_identity_;
   myclone->BufferCursor        = BufferCursor;
   myclone->BufferCursor_scalar = BufferCursor_scalar;
   myclone->complete_batch_memory_accounting_for_testing_ =

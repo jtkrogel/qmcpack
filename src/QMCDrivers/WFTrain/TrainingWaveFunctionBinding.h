@@ -61,6 +61,9 @@ public:
   /// For orbital models this is NOT an import: publishing the returned active
   /// vector loses accumulated rotation history. Restore the complete frame.
   StructuredParameterSnapshot readModel(const std::filesystem::path&) const;
+  /// Fresh model import validates/owns all physical state before collective
+  /// publication. This restores no optimizer, sampler or training counters.
+  void importModel(const std::filesystem::path&);
   /// Immutable inline model definition and registration identity for exact continuation.
   std::string modelIdentity() const;
   bool hasOrbitalRotations() const noexcept { return orbital_rotations_; }
@@ -76,6 +79,7 @@ private:
   ParticleSet& prototype_particles_;
   Communicate& communicator_;
   LegacyWaveFunctionAdapter adapter_;
+  std::shared_ptr<const optimize::VariableSet> registration_identity_;
   QMCHamiltonian* hamiltonian_ = nullptr;
   struct LiveTarget
   {
@@ -95,6 +99,7 @@ private:
                               const ConventionalOrbitalFrame*);
   void restorePrivateOrbitalFrame(TrialWaveFunction&, const ConventionalOrbitalFrame&,
                                   const StructuredParameterSnapshot&) const;
+  StructuredParameterSnapshot readModelState(const std::filesystem::path&, ConventionalOrbitalFrame*) const;
 };
 }
 }
