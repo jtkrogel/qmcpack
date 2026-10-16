@@ -18,6 +18,9 @@
 #include "CPU/VectorOps.h"
 #include "Platforms/OMPTarget/ompReductionComplex.hpp"
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 
 using uint32_t = std::uint32_t;
 
@@ -110,6 +113,63 @@ void MultiSlaterDetTableMethod::isolateOptimizationState()
   C.swap(private_coefficients);
   myVars.swap(private_variables);
   csf_data_.swap(private_csf);
+}
+
+void MultiSlaterDetTableMethod::validatePreparedCoefficientState(const MultiSlaterDetTableMethod& prepared) const
+{
+  for (const auto& determinant : Dets)
+    if (determinant->isOptimizable())
+      throw std::invalid_argument("Coefficient-only multideterminant activation requires fixed orbitals");
+  for (const auto& determinant : prepared.Dets)
+    if (determinant->isOptimizable())
+      throw std::invalid_argument("Prepared coefficient-only multideterminant bank requires fixed orbitals");
+  if (CI_Optimizable != prepared.CI_Optimizable || C2node != prepared.C2node ||
+      !C || !prepared.C || C->empty() || C->size() != prepared.C->size() ||
+      !myVars || !prepared.myVars || myVars->size() != prepared.myVars->size() ||
+      myVars->Index.size() != myVars->size() || prepared.myVars->Index.size() != prepared.myVars->size() ||
+      static_cast<bool>(csf_data_) != static_cast<bool>(prepared.csf_data_))
+    throw std::invalid_argument("Prepared multideterminant coefficient bank has incompatible structure");
+  if ((*C)[0] != (*prepared.C)[0])
+    throw std::invalid_argument("Prepared multideterminant coefficient bank changed the fixed reference");
+  for (std::size_t index = 0; index < myVars->size(); ++index)
+    if (myVars->name(index) != prepared.myVars->name(index) ||
+        myVars->getType(index) != prepared.myVars->getType(index) ||
+        (myVars->where(index) < 0) != (prepared.myVars->where(index) < 0))
+      throw std::invalid_argument("Prepared multideterminant coefficient bank changed the variable layout");
+  if (csf_data_ &&
+      (csf_data_->coeffs.empty() || csf_data_->coeffs.size() != prepared.csf_data_->coeffs.size() ||
+       csf_data_->coeffs[0] != prepared.csf_data_->coeffs[0] ||
+       csf_data_->dets_per_csf != prepared.csf_data_->dets_per_csf ||
+       csf_data_->expansion != prepared.csf_data_->expansion))
+    throw std::invalid_argument("Prepared multideterminant coefficient bank changed the fixed CSF map/reference");
+
+  // Test IEEE exponent bits so -ffast-math cannot erase the admission check.
+  const auto finite_real = [](double value) {
+    static_assert(sizeof(double) == sizeof(std::uint64_t) && std::numeric_limits<double>::is_iec559);
+    std::uint64_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  };
+  const auto finite_value = [&finite_real](ValueType value) {
+    return finite_real(std::real(value)) && finite_real(std::imag(value));
+  };
+  for (const auto coefficient : *prepared.C)
+    if (!finite_value(coefficient))
+      throw std::invalid_argument("Prepared multideterminant coefficient bank contains a non-finite coefficient");
+  if (prepared.csf_data_)
+    for (const auto coefficient : prepared.csf_data_->coeffs)
+      if (!finite_value(coefficient))
+        throw std::invalid_argument("Prepared multideterminant coefficient bank contains a non-finite CSF coefficient");
+  for (const auto& variable : *prepared.myVars)
+    if (!finite_real(variable.second))
+      throw std::invalid_argument("Prepared multideterminant coefficient bank contains a non-finite variable");
+}
+
+void MultiSlaterDetTableMethod::adoptPreparedCoefficientState(const MultiSlaterDetTableMethod& prepared) noexcept
+{
+  C         = prepared.C;
+  myVars    = prepared.myVars;
+  csf_data_ = prepared.csf_data_;
 }
 
 /** Compute VGL of this MultiSlaterDetTableMethod

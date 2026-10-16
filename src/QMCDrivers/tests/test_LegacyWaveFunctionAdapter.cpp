@@ -985,6 +985,24 @@ TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy
     source->checkInVariables(source_variables);
     source_variables.resetIndex();
     CHECK(source_variables[0] == snapshot.values[0]);
+    auto accepted = snapshot;
+    accepted.values[0] = -0.23;
+    adapter.installSnapshot(*evaluator, private_particles, accepted);
+    REQUIRE_NOTHROW(source_msd.validatePreparedCoefficientState(private_msd));
+    REQUIRE_NOTHROW(sibling_msd.validatePreparedCoefficientState(private_msd));
+    const auto* fixed_spo = &source->getSPOSet("spo");
+    const auto* occupation_map = &source_msd.get_C2node();
+    source_msd.adoptPreparedCoefficientState(private_msd);
+    CHECK(source_msd.get_C().data() == private_msd.get_C().data());
+    CHECK(sibling_msd.get_C() == original_coefficients);
+    sibling_msd.adoptPreparedCoefficientState(private_msd);
+    CHECK(sibling_msd.get_C().data() == private_msd.get_C().data());
+    CHECK(&source->getSPOSet("spo") == fixed_spo);
+    CHECK(&source_msd.get_C2node() == occupation_map);
+    CHECK(source_msd.get_C()[0] == original_coefficients[0]);
+    CHECK(source_msd.get_C()[1] == makeValue(-0.23));
+    MultiSlaterDetTableMethod incompatible(electrons, {}, false);
+    CHECK_THROWS_AS(source_msd.validatePreparedCoefficientState(incompatible), std::invalid_argument);
   }
 }
 

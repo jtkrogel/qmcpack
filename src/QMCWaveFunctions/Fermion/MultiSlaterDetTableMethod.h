@@ -233,6 +233,16 @@ public:
    * All fallible copies finish before any ownership changes are activated.
    */
   void isolateOptimizationState();
+
+  /// Fallible preflight for a private coefficient bank with identical fixed structure/gauge.
+  void validatePreparedCoefficientState(const MultiSlaterDetTableMethod& prepared) const;
+
+  /** Activate a previously validated coefficient bank without allocation/reset.
+   * The caller must serialize activation and refresh configuration-dependent
+   * numeric caches before evaluating the accepted physical model. Determinant,
+   * SPO, occupation-map and component identities are preserved.
+   */
+  void adoptPreparedCoefficientState(const MultiSlaterDetTableMethod& prepared) noexcept;
   void evaluateDerivatives(ParticleSet& P,
                            const OptVariables& optvars,
                            Vector<ValueType>& dlogpsi,
