@@ -31,12 +31,14 @@
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceComplexSpatial.h"
 #endif
 #include <algorithm>
+#include <chrono>
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -2334,7 +2336,8 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
     const auto required = gpu.gpuParameterPublicationRequirements();
     const auto initial_storage = gpu.numericStorage();
     CHECK(required.device_bytes == initial_storage.shared_gpu_bytes + initial_storage.shared_image_bytes);
-    CHECK(required.host_bytes == initial_storage.shared_gpu_host_bytes);
+    CHECK(required.host_bytes == initial_storage.shared_gpu_host_bytes +
+        sizeof(double) * gpu.parameterSchema().parameterCount());
     CHECK(metrics.snapshot().live_bytes - outside.live_bytes == required.device_bytes);
     CHECK_THROWS(cpu.gpuParameterPublicationRequirements());
     const auto refresh = [&]() {
@@ -2356,6 +2359,25 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
     };
     refresh();
     const auto original = gpu.snapshotParameters();
+    {
+      auto discarded = original;
+      discarded.values[0] += .017;
+      const auto before_prepare = metrics.snapshot();
+      auto prepared = gpu.prepareBudgetedGpuParameterPublication(discarded, original.version,
+          required.device_bytes, required.host_bytes);
+      CHECK(metrics.snapshot().live_bytes == before_prepare.live_bytes + required.device_bytes);
+      // A reader cannot observe old/new partial state while the action retains authority.
+      auto reader = std::async(std::launch::async, [&] { return gpu.snapshotParameters(); });
+      const bool excluded = reader.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout;
+      prepared.reset();
+      const auto after_discard = reader.get();
+      CHECK(excluded);
+      CHECK(after_discard.values == original.values);
+      CHECK(after_discard.version == original.version);
+      CHECK(metrics.snapshot().live_bytes == before_prepare.live_bytes);
+      CHECK(gpu.numericStorage().shared_image_identity == initial_storage.shared_image_identity);
+      CHECK_NOTHROW(gpu.observeCoulombEnergy(p, -2.7));
+    }
     const auto reject = [&](const StructuredParameterSnapshot& bad, std::size_t version,
                             std::size_t device_cap, std::size_t host_cap) {
       const auto before = metrics.snapshot();
@@ -2430,8 +2452,22 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
       const auto expected_version = candidate.version;
       candidate.values[0] += .001 * (step + 1);
       candidate.values[imaginary->begin] += .002 * (step + 1);
-      CHECK(gpu.publishBudgetedGpuParameters(candidate, expected_version,
-          required.device_bytes, required.host_bytes) == expected_version + 1);
+      if (step == 0)
+      {
+        auto prepared = gpu.prepareBudgetedGpuParameterPublication(candidate, expected_version,
+            required.device_bytes, required.host_bytes);
+        const auto before_commit = metrics.snapshot();
+        CHECK(prepared->commit() == expected_version + 1);
+        const auto after_commit = metrics.snapshot();
+        CHECK(after_commit.allocation_calls == before_commit.allocation_calls);
+        CHECK(after_commit.free_calls == before_commit.free_calls);
+        CHECK(after_commit.upload_calls == before_commit.upload_calls);
+        CHECK(after_commit.download_calls == before_commit.download_calls);
+        CHECK(after_commit.device_copy_calls == before_commit.device_copy_calls);
+      }
+      else
+        CHECK(gpu.publishBudgetedGpuParameters(candidate, expected_version,
+            required.device_bytes, required.host_bytes) == expected_version + 1);
       CHECK(cpu.publishParameters(candidate, expected_version) == expected_version + 1);
       CHECK(gpu.snapshotParameters().version == expected_version + 1);
       CHECK(cpu.snapshotParameters().version == expected_version + 1);
@@ -2469,6 +2505,8 @@ TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete genera
       CHECK(gpu.numericStorage().shared_gpu_bytes == initial_storage.shared_gpu_bytes);
       CHECK_THROWS(gpu.publishParameters(candidate, expected_version));
       CHECK(gpu.structuredParameterProvider() == nullptr);
+      CHECK_THROWS(gpu.prepareBudgetedGpuParameterPublication(original, original.version,
+          required.device_bytes, required.host_bytes));
     }
     std::printf("GPU publication K=%zu generations=2 new_device=%zu new_host=%zu derivative_device=%zu retirement_live=%zu\n",
         targets, required.device_bytes, required.host_bytes, derivative.device_bytes, single_generation);

@@ -67,14 +67,32 @@ public:
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;
 
-  /// Named NEW inference generation only; excludes native/candidate/image HOST storage and retained old generations.
+  /// NEW inference generation plus one owned native P-double candidate; excludes caller/image HOST and retired owners.
   struct GpuParameterPublicationRequirements
   {
     std::size_t device_bytes, host_bytes;
   };
 
-  /// Exact image plus frozen VALUE/SPATIAL owners and HOST staging, not an aggregate transition-peak cap.
+  /// Exact image/frozen owners/HOST staging plus native candidate; excludes O(tensor) leaf/lock metadata.
   GpuParameterPublicationRequirements gpuParameterPublicationRequirements() const;
+
+  /** Own a resolved GPU/native replacement and exclusive model publication authority.
+   * Discard changes nothing; commit is nonallocating/no-fail and may be invoked once.
+   * Do not re-enter the same model while holding this action before commit/discard.
+   */
+  class PreparedGpuParameterPublication
+  {
+  public:
+    virtual ~PreparedGpuParameterPublication() = default;
+
+    /// Publish once, release authority, and return the successor version.
+    virtual std::size_t commit() noexcept = 0;
+  };
+
+  /// Finish every fallible check/allocation/device wait before returning retained publication authority.
+  std::unique_ptr<PreparedGpuParameterPublication> prepareBudgetedGpuParameterPublication(
+      const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version,
+      std::size_t additional_device_cap, std::size_t additional_host_cap);
 
   /// Explicit expert/opt-in hybrid-driver publication; generic GPU discovery/publication remains closed.
   std::size_t publishBudgetedGpuParameters(const wftrain::StructuredParameterSnapshot& candidate,

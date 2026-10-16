@@ -287,6 +287,39 @@ struct PsiFormerComplexWF::Impl
 #endif
   };
 
+#ifdef ENABLE_CUDA
+  /** Retain final model authority and both successor owners until commit/discard.
+   * Declaration order releases the lock before any candidate/retired resources.
+   */
+  struct PreparedGpuPublication final : PreparedGpuParameterPublication
+  {
+    /// Move fully resolved native leaves and final authority into one owning action.
+    PreparedGpuPublication(std::shared_ptr<Model> model, std::shared_ptr<GpuLane> next,
+        pf::Parameters::PreparedFlatValues native, std::unique_lock<std::shared_mutex> authority)
+        : state(std::move(model)), successor(std::move(next)), native_candidate(std::move(native)),
+          write(std::move(authority)) {}
+
+    /// Fixed native copies and pointer adoption only; retirement occurs after unlock.
+    std::size_t commit() noexcept override
+    {
+      if (committed || !write.owns_lock())
+        std::terminate();
+      const auto version = native_candidate.commit();
+      state->gpu.swap(successor);
+      state->gpu_derivative_lane.reset();
+      committed = true;
+      write.unlock();
+      return version;
+    }
+
+    std::shared_ptr<Model> state;
+    std::shared_ptr<GpuLane> successor;
+    pf::Parameters::PreparedFlatValues native_candidate;
+    std::unique_lock<std::shared_mutex> write;
+    bool committed = false;
+  };
+#endif
+
   /** HOST-only transaction staging for one native acquired crowd.
    * No immutable image or GPU scratch is duplicated; every tile borrows GpuLane.
    */
@@ -1728,7 +1761,7 @@ std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParam
   return parameters.version();
 }
 
-/// Admit a complete NEW generation, excluding old generations and image HOST layout/storage (including cusp scalars).
+/// Admit a NEW generation plus owned native P-double candidate, excluding image HOST/leaf metadata and old owners.
 PsiFormerComplexWF::GpuParameterPublicationRequirements
 PsiFormerComplexWF::gpuParameterPublicationRequirements() const
 {
@@ -1739,14 +1772,28 @@ PsiFormerComplexWF::gpuParameterPublicationRequirements() const
     const auto& generation = *impl_->state->gpu;
     const auto device = psiformer::spatial_detail::checkedAdd(generation.device_bytes,
         generation.image->deviceStorageBytes(), "Complex GPU publication device bytes overflow");
-    return {device, generation.host_bytes};
+    const auto native_bytes = psiformer::spatial_detail::checkedProduct(
+        sizeof(double), parameterSchema().parameterCount(), "Complex GPU native candidate bytes overflow");
+    return {device, psiformer::spatial_detail::checkedAdd(generation.host_bytes, native_bytes,
+        "Complex GPU publication HOST bytes overflow")};
   }
 #endif
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
 }
 
-/// Prepare outside model write; native full-vector publication precedes only noexcept generation/cache adoption.
+/// Preserve synchronous expert publication through the same prepared/no-fail boundary.
 std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
+    const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version,
+    std::size_t additional_device_cap, std::size_t additional_host_cap)
+{
+  auto prepared = prepareBudgetedGpuParameterPublication(candidate, expected_version,
+      additional_device_cap, additional_host_cap);
+  return prepared->commit();
+}
+
+/// Build/wait outside write, then resolve native leaves under retained final authority.
+std::unique_ptr<PsiFormerComplexWF::PreparedGpuParameterPublication>
+PsiFormerComplexWF::prepareBudgetedGpuParameterPublication(
     const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version,
     std::size_t additional_device_cap, std::size_t additional_host_cap)
 {
@@ -1770,6 +1817,8 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
     // Capture immutable ownership/profile under read; never wait on GPU under the later write.
     std::shared_ptr<Impl::GpuLane> captured;
     GpuParameterPublicationRequirements required{};
+    const auto native_bytes = psiformer::spatial_detail::checkedProduct(
+        sizeof(double), candidate.values.size(), "Complex GPU native candidate bytes overflow");
     {
       std::shared_lock read(state->mutex);
       if (state->model.p.version() != expected_version)
@@ -1782,33 +1831,37 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
       if (captured->image->version() != expected_version)
         throw std::logic_error("Complex GPU publication current image/native version mismatch");
       required = {psiformer::spatial_detail::checkedAdd(captured->device_bytes,
-          captured->image->deviceStorageBytes(), "Complex GPU publication device bytes overflow"), captured->host_bytes};
+          captured->image->deviceStorageBytes(), "Complex GPU publication device bytes overflow"),
+          psiformer::spatial_detail::checkedAdd(captured->host_bytes, native_bytes,
+              "Complex GPU publication HOST bytes overflow")};
       if (required.device_bytes > additional_device_cap || required.host_bytes > additional_host_cap)
         throw std::length_error("Complex GPU publication exceeds new-generation caps before allocation");
     }
 
+    app_log() << "  Complex GPU prepared publication: attempted_new_device_bytes=" << required.device_bytes
+              << ", attempted_new_host_numeric_bytes=" << required.host_bytes
+              << ", owned_native_candidate_bytes=" << native_bytes
+              << "; excludes caller/image HOST, resolved-leaf/lock metadata and retained old owners" << std::endl;
     // One independent cold generation, with no old P image retained by its metadata.
     const auto next_version = expected_version + 1;
     std::shared_ptr<Impl::GpuLane> successor = Impl::GpuLane::prepareFrozen(state->plan, candidate.values,
         state->model.cfg.nuclei.x, next_version, state->gpu_limit, captured->preparation, captured->capacity);
     if (successor->device_bytes + successor->image->deviceStorageBytes() != required.device_bytes ||
-        successor->host_bytes != required.host_bytes || successor->image->version() != next_version)
+        psiformer::spatial_detail::checkedAdd(successor->host_bytes, native_bytes,
+            "Complex GPU publication HOST bytes overflow") != required.host_bytes ||
+        successor->image->version() != next_version)
       throw std::logic_error("Complex GPU successor capacities/version differ from admitted generation");
 
-    {
-      std::unique_lock write(state->mutex);
-      if (state->model.p.version() != expected_version || state->gpu != captured)
-        throw std::runtime_error("Complex GPU publication lost its captured version/generation");
-      if (state->pending_proposals.load(std::memory_order_relaxed))
-        throw std::logic_error("Complex GPU publication requires no family pending proposals");
-      Impl::validateDerivativeSource(*state);
-      state->model.p.set_flat_values(candidate.values);
-      state->gpu.swap(successor);
-      state->gpu_derivative_lane.reset();
-      impl_->invalidate();
-    }
-    // Retire old resources only after releasing write; old streams may still hold them.
-    return next_version;
+    std::unique_lock write(state->mutex);
+    if (state->model.p.version() != expected_version || state->gpu != captured)
+      throw std::runtime_error("Complex GPU publication lost its captured version/generation");
+    if (state->pending_proposals.load(std::memory_order_relaxed))
+      throw std::logic_error("Complex GPU publication requires no family pending proposals");
+    Impl::validateDerivativeSource(*state);
+    auto native = state->model.p.prepare_flat_values(candidate.values, expected_version);
+    // All clones, including this publisher, reject old accepted caches by version.
+    return std::make_unique<Impl::PreparedGpuPublication>(state, std::move(successor),
+        std::move(native), std::move(write));
   }
 #endif
   throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
