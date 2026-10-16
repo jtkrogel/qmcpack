@@ -12,6 +12,52 @@ namespace qmcplusplus::psiformer::device
 {
 namespace
 {
+/// One bounded partial per block avoids squaring large finite gradients directly.
+__global__ void energyGradient(std::size_t count, const double* channels, const double* parameters,
+    const double* image_parameters, double weight, double energy, double* gradient,
+    double* partials, std::uint64_t* status)
+{
+  __shared__ double values[128];
+  const auto index = std::size_t(blockIdx.x) * 128 + threadIdx.x;
+  double g = 0;
+  if (index < count)
+  {
+    g = 2.0 * (channels[2 * index] + channels[2 * count + 2 * index] -
+        energy * channels[4 * count + 2 * index]) / weight;
+    gradient[index] = g;
+    if (!device_math::isFiniteBinary64(g) || !device_math::isFiniteBinary64(parameters[index]) ||
+        parameters[index] != image_parameters[index])
+      atomicMin(reinterpret_cast<unsigned long long*>(status),
+                static_cast<unsigned long long>((std::uint64_t(index) << 8) | 3));
+  }
+  values[threadIdx.x] = g;
+  __syncthreads();
+  if (threadIdx.x == 0)
+  {
+    double scale = 0, sum = 1;
+    for (unsigned lane = 0; lane < 128; ++lane)
+    {
+      const double value = fabs(values[lane]);
+      if (value != 0)
+      {
+        if (scale < value)
+        {
+          const double ratio = scale / value;
+          sum = 1 + sum * ratio * ratio;
+          scale = value;
+        }
+        else
+        {
+          const double ratio = value / scale;
+          sum += ratio * ratio;
+        }
+      }
+    }
+    partials[2 * blockIdx.x] = scale;
+    partials[2 * blockIdx.x + 1] = sum;
+  }
+}
+
 /// Pending-only recurrence: publication is a later noexcept host pointer swap.
 __global__ void candidate(std::size_t count, const AdamBlock* blocks, std::size_t block_count,
     const double* parameters, double* gradient_candidate, const double* first, const double* second,
@@ -55,6 +101,20 @@ __global__ void candidate(std::size_t count, const AdamBlock* blocks, std::size_
               static_cast<unsigned long long>((std::uint64_t(index) << 8) | 2));
 }
 } // namespace
+
+/// Extents are admitted by the owning Adam preparation before this private seam.
+Error launchAdamEnergyGradient(Stream stream, std::size_t count, const double* channels,
+    const double* parameters, const double* image_parameters, double weight, double energy,
+    double* gradient, double* norm_partials, std::uint64_t* status)
+{
+  energyGradient<<<static_cast<unsigned>((count - 1) / 128 + 1), 128, 0, stream>>>(
+      count, channels, parameters, image_parameters, weight, energy, gradient, norm_partials, status);
+#ifdef QMC_CUDA2HIP
+  return hipPeekAtLastError();
+#else
+  return cudaPeekAtLastError();
+#endif
+}
 
 /// Launch only admitted extents; host status admission precedes candidate exposure.
 Error launchAdamCandidate(Stream stream, std::size_t count, const AdamBlock* blocks,

@@ -17,6 +17,7 @@
 #include "PsiFormerDeviceScoreReverse.h"
 #include "PsiFormerDeviceScoreJvp.h"
 #include "PsiFormerDeviceScoreContraction.h"
+#include "PsiFormerDeviceAdam.h"
 #include "PsiFormerDeviceKineticReverse.h"
 #include "PsiFormerDeviceExecutionPreparation.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorExecutor.h"
@@ -29,6 +30,9 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Ordered ENERGY channels: kinetic response, energy-times-score, then score.
+enum class ScoreContractionRole { GENERIC, ENERGY_T_EO_O };
+
 
 /** Fix the numerical roots and their scratch at an explicit preparation boundary. */
 enum class ProductSessionProfile
@@ -58,6 +62,7 @@ class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
 
 public:
   /// Allocate scratch once while the owning backend's control mutex is held.
+  /// Product graphs are FP64: no mixed adapter is attached, and the backend rejects mixed preparation.
   PreparedDeviceProductSession(const std::shared_ptr<const PreparedDeviceModel>& active_image,
                                PsiFormerAcceleratorSharedModel& owner,
                                std::mutex& control_mutex, std::uint64_t identity,
@@ -183,13 +188,17 @@ public:
 
   /// Explicit cold preparation for the actual admitted score-channel count.
   /// Host/kinetic compatibility callers never need this optional O(CP) storage.
-  void prepareScoreContractions(std::size_t channels, std::size_t version)
+  void prepareScoreContractions(std::size_t channels, std::size_t version,
+      std::size_t budget = std::numeric_limits<std::size_t>::max())
   {
     std::lock_guard lock(mutex_);
     invalidateScoreContraction();
     validateContractionControl(version);
     if (channels == 0 || channels > 3)
       throw std::invalid_argument("Device score contraction supports one to three channels");
+    const auto capacity = std::max(channels, score_contraction_ ? score_contraction_->channelCapacity() : 0);
+    if (PreparedDeviceScoreContraction::requiredBytes(image_->plan().parameterCount(), capacity) > budget)
+      throw std::length_error("Device score contraction exceeds its explicit byte budget");
     if (!score_contraction_ || score_contraction_->channelCapacity() < channels)
     {
       // A previous incomplete transaction may still have ordered AXPYs queued.
@@ -206,14 +215,47 @@ public:
   }
 
   /// Start a versioned contraction under the caller's outer exclusive scratch lease.
-  void beginScoreContraction(std::size_t channels, std::size_t version)
+  std::size_t beginScoreContraction(std::size_t channels, std::size_t version,
+      ScoreContractionRole role = ScoreContractionRole::GENERIC)
   {
     std::lock_guard lock(mutex_);
     invalidateScoreContraction();
     validateContractionControl(version);
     if (!score_contraction_)
       throw std::logic_error("Device score contraction was not prepared");
+    if (contraction_transaction_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Device score contraction transaction generation exhausted");
+    if (role != ScoreContractionRole::GENERIC &&
+        (role != ScoreContractionRole::ENERGY_T_EO_O || channels != 3 || image_->periodicCell() ||
+         image_->plan().environment().amplitude_scalar_domain != ScalarDomain::REAL))
+      throw std::invalid_argument("Device ENERGY contraction requires ordered real/open C3 channels");
     score_contraction_->begin(channels);
+    energy_image_ = role == ScoreContractionRole::ENERGY_T_EO_O ? image_.get() : nullptr;
+    return ++contraction_transaction_;
+  }
+
+  /// Consume only this completed transaction; no device view escapes the owner lock.
+  double consumeEnergyAdam(PreparedDeviceAdam& adam, std::size_t version, std::size_t generation,
+      const std::vector<double>& parameters, double weight, double energy, double beta1, double beta2,
+      double correction1, double correction2, double epsilon, std::vector<double>& candidate)
+  {
+    std::lock_guard lock(mutex_);
+    try
+    {
+      validateContractionControl(version);
+      if (energy_image_ != image_.get() || generation != contraction_transaction_ || !score_contraction_)
+        throw std::invalid_argument("Device ENERGY contraction owner/image/generation is stale or untagged");
+      const auto norm = adam.proposeEnergy(*score_contraction_, image_->parameters(), parameters,
+          weight, energy, beta1, beta2, correction1, correction2, epsilon, candidate);
+      invalidateScoreContraction();
+      return norm;
+    }
+    catch (...)
+    {
+      adam.reject();
+      invalidateScoreContraction();
+      throw;
+    }
   }
 
   /// Keep one sample's canonical score resident and fold all algebraic channels.
@@ -675,6 +717,7 @@ private:
   /// A failed/rebound lane can never publish an earlier partial or completed sum.
   void invalidateScoreContraction() noexcept
   {
+    energy_image_ = nullptr;
     if (score_contraction_)
       score_contraction_->invalidate();
   }
@@ -878,6 +921,8 @@ private:
   std::unique_ptr<KineticWorkspace> kinetic_;
   std::unique_ptr<PreparedDeviceTargetKinetic> target_kinetic_;
   std::unique_ptr<PreparedDeviceScoreContraction> score_contraction_;
+  const PreparedDeviceModel* energy_image_ = nullptr;
+  std::size_t contraction_transaction_ = 0;
   // Publish metadata without exposing a concurrently replaced lazy owner.
   // Provider diagnostics hold the outer scratch mutex for a coherent snapshot.
   std::atomic<std::size_t> contraction_capacity_{0}, contraction_device_bytes_{0}, contraction_host_bytes_{0};

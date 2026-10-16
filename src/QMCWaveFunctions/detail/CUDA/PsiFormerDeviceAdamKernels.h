@@ -10,6 +10,11 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Form all ENERGY gradients and scaled-sum-of-squares partials, including frozen lanes.
+Error launchAdamEnergyGradient(Stream stream, std::size_t count, const double* channels,
+    const double* parameters, const double* image_parameters, double weight, double energy,
+    double* gradient, double* norm_partials, std::uint64_t* status);
+
 /// Compact immutable schema blocks; no per-parameter rate/trainability tensor.
 struct AdamBlock
 {

@@ -39,6 +39,7 @@
 #include "PsiFormerDeviceKineticContractionValidation.h"
 #include "PsiFormerDeviceCoordinatesValidation.h"
 #include "PsiFormerDeviceMetropolisValidation.h"
+#include "PsiFormerDeviceResidentAdamValidation.h"
 
 #include <fstream>
 #include <iostream>
@@ -137,7 +138,7 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] "
+                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] "
                                   "[--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
@@ -151,6 +152,7 @@ int main(int argc, char** argv)
     bool kinetic_trunk_only = false;
     bool target_selection_spot = false;
     bool metropolis_only = false;
+    bool resident_adam_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -174,6 +176,8 @@ int main(int argc, char** argv)
         target_selection_spot = true;
       else if (option == "--metropolis-only" && !metropolis_only)
         metropolis_only = true;
+      else if (option == "--resident-adam-only" && !resident_adam_only)
+        resident_adam_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -200,6 +204,10 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
+    if (resident_adam_only && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
+        target_kinetic_spot || kinetic_trunk_only || target_selection_spot || !score_output.empty() || !jvp_output.empty() ||
+        !kinetic_output.empty() || !nonlocal_output.empty()))
+      throw std::invalid_argument("Resident Adam qualification cannot request other modes or exports");
     if (cpu_only && (!score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Canonical GPU score export is incompatible with --cpu-only");
     if (coordinate_only && (cpu_only || !score_output.empty() || !jvp_output.empty() ||
@@ -251,8 +259,8 @@ int main(int argc, char** argv)
         throw std::runtime_error("Cannot write TARGET kinetic spot output");
       return 0;
     }
-    const auto references = metropolis_only ? std::vector<Reference>{} : cpuReferences(model, plan, coordinate_only ? 3 : 0);
-    if (!metropolis_only)
+    const auto references = (metropolis_only || resident_adam_only) ? std::vector<Reference>{} : cpuReferences(model, plan, coordinate_only ? 3 : 0);
+    if (!metropolis_only && !resident_adam_only)
       writeReferences(argv[3], references);
     if (cpu_only)
     {
@@ -272,6 +280,12 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
+    if (resident_adam_only)
+    {
+      const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+      validateResidentAdam(model, plan, image);
+      return 0;
+    }
     if (metropolis_only)
     {
       // No broad CPU/GPU reference matrix or production sampler is constructed here.

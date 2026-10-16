@@ -23,7 +23,22 @@ namespace qmcplusplus::psiformer::device
  */
 class PreparedDeviceScoreContraction
 {
+  friend class PreparedDeviceProductSession;
+  friend class PreparedDeviceAdam;
 public:
+  /// Exact numeric device capacity, excluding queue/model and allocator bookkeeping.
+  static std::size_t requiredBytes(std::size_t parameters, std::size_t channels)
+  {
+    if (!parameters || !channels)
+      throw std::invalid_argument("Device score contraction requires positive capacity");
+    const auto values = spatial_detail::checkedProduct(parameters, channels,
+        "Score contraction extent overflow");
+    const auto complex_values = spatial_detail::checkedProduct(values, 2, "Score contraction extent overflow");
+    return spatial_detail::checkedAdd(checkedDeviceBytes<double>(complex_values),
+        checkedDeviceBytes<DerivativeFiniteStatus>(complex_values / 4096 + (complex_values % 4096 != 0)),
+        "Score contraction storage overflow");
+  }
+
   PreparedDeviceScoreContraction(std::size_t parameters, std::size_t channels,
                                  compute::Queue<PlatformKind::CUDA>& queue)
       : parameters_(parameters), capacity_(channels), queue_(queue)
