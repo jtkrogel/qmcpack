@@ -587,6 +587,7 @@ private:
   friend class PreparedDeviceKineticReverse;
   friend class PreparedDeviceComplexValue;
   friend class PreparedDeviceComplexSpatial;
+  friend class PreparedDeviceComplexScore;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -609,7 +610,7 @@ private:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
-    if (real_trunk_only && (retain_score_tape || retain_spatial_tape ||
+    if (real_trunk_only && (retain_spatial_tape ||
         retained_targets_ || target_preparation_.max_targets || environment.boundary != BoundaryCondition::PERIODIC ||
         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
@@ -736,8 +737,11 @@ private:
     }
     if (retain_score_tape || retain_spatial_tape)
     {
-      retained_backflow_.reserve(spatialJetSpanElements(orbitals_.orbitals));
-      retained_envelope_.reserve(spatialJetSpanElements(orbitals_.orbitals));
+      if (!real_trunk_only)
+      {
+        retained_backflow_.reserve(spatialJetSpanElements(orbitals_.orbitals));
+        retained_envelope_.reserve(spatialJetSpanElements(orbitals_.orbitals));
+      }
       for (std::size_t layer = 0; layer < shape_.attention_blocks; ++layer)
         value_tape_.push_back(std::make_unique<RetainedBlockTape>(feature_elements, weights_.capacity(), retain_spatial_tape));
     }

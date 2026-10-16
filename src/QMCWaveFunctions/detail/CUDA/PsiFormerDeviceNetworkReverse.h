@@ -107,9 +107,11 @@ public:
   }
 
 private:
-  /// Execute the shared input-adjoint algebra and admit only the selected output.
+  friend class PreparedDeviceComplexScore;
+
+  /// Execute the shared algebra; only the private score composer preserves seeded P.
   void reverseImpl(const PreparedDeviceInference& forward, const std::vector<double>& seed,
-                   const double* device_seed)
+                   const double* device_seed, bool clear_response = true)
   {
     result_ready_ = false;
     model_->validateCurrentDevice();
@@ -128,7 +130,7 @@ private:
           upstream_.data()), "network device seed copy");
     else
       upstream_.upload(seed.data(), seed.size());
-    if (output_ == NetworkReverseOutput::PARAMETER_SCORE)
+    if (output_ == NetworkReverseOutput::PARAMETER_SCORE && clear_response)
       zero(response_, response_.capacity());
     const DenseForwardLayout dense{count * ne, width, width, width, width, width};
     const BatchedValueLayout values{count, ne, width, width, ne * width};

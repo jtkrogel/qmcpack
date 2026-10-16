@@ -128,12 +128,13 @@ public:
 
     // The private head epoch ends here: matrix storage now becomes LU IN PLACE.
     checkRuntime(launchComplexValueFactor(t.queue_.getNative(), t.batch_ * t.shape_.determinants, t.ne_,
-        matrix_.data(), channels_.data(), status_.data()), "complex VALUE factorization");
+        matrix_.data(), channels_.data(), status_.data(), inverse_.data(), permutation_.data(), solve_.data()), "complex VALUE factorization");
     admitStatus();
     checkRuntime(launchComplexValueReduce(t.queue_.getNative(), t.batch_, t.shape_.determinants,
         t.ne_, t.shape_.spin_up_electrons, *t.model_->periodicCell(), t.positions_.data(),
         channels_.data(), t.cusp_jets_.data(), results_.data(), status_.data()), "complex VALUE mixture");
     admitStatus();
+    t.value_tape_valid_ = !t.value_tape_.empty();
     valid_ = true;
   }
 
@@ -159,17 +160,22 @@ public:
   const ComplexValueCost& cost() const noexcept { return cost_; }
 
 private:
+  friend class PreparedDeviceComplexScore;
+
   /// Prepare no real head/determinant/reverse buffers; assert the exact allocation inventory.
   PreparedDeviceComplexValue(std::shared_ptr<const PreparedDeviceModel> image, std::size_t capacity,
-      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost)
+      compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexValueCost cost, bool retain_score = false)
       : cost_(cost), trunk_(new PreparedDeviceInference(std::move(image), capacity, queue, blas,
-          SpatialJetMode::VALUE_ONLY, false, false, configuredInferenceStatusPolicy(), {}, false, true)),
+          SpatialJetMode::VALUE_ONLY, retain_score, false, configuredInferenceStatusPolicy(), {}, false, true)),
         envelope_(cost.matrices), projections_(2 * cost.matrices), matrix_(cost.matrices),
-        channels_(capacity * trunk_->shape_.determinants), results_(capacity), status_(1)
+        channels_(capacity * trunk_->shape_.determinants), results_(capacity), status_(1),
+        inverse_(retain_score ? cost.matrices : 0), solve_(retain_score ? capacity * trunk_->shape_.determinants * trunk_->ne_ : 0),
+        permutation_(solve_.capacity())
   {
     const auto actual = trunk_->deviceWorkspaceBytes() + envelope_.capacity() * sizeof(double) +
         projections_.capacity() * sizeof(double) + matrix_.capacity() * sizeof(cuDoubleComplex) +
-        channels_.capacity() * sizeof(ComplexValueChannel) + results_.capacity() * sizeof(ComplexValueResult) + 8;
+        channels_.capacity() * sizeof(ComplexValueChannel) + results_.capacity() * sizeof(ComplexValueResult) + 8 +
+        (inverse_.capacity() + solve_.capacity()) * sizeof(cuDoubleComplex) + permutation_.capacity() * sizeof(std::size_t);
     if (actual != cost.device_bytes || trunk_->deviceWorkspaceBytes() != cost.trunk_bytes ||
         trunk_->hostWorkspaceBytes() != cost.host_bytes)
       throw std::logic_error("Complex VALUE owned storage differs from exact preflight");
@@ -215,6 +221,8 @@ private:
   DeviceBuffer<ComplexValueChannel> channels_;
   DeviceBuffer<ComplexValueResult> results_;
   DeviceBuffer<std::uint64_t> status_;
+  DeviceBuffer<cuDoubleComplex> inverse_, solve_;
+  DeviceBuffer<std::size_t> permutation_;
   std::size_t generation_ = 0;
   bool valid_ = false;
 };

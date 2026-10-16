@@ -251,6 +251,7 @@ void validate()
 
 #include "PsiFormerDeviceComplexValueValidation.h"
 #include "PsiFormerDeviceComplexSpatialValidation.h"
+#include "PsiFormerDeviceComplexScoreValidation.h"
 
 /// Return a standard unavailable-runtime status without disguising CPU-only work.
 int main(int argc, char** argv)
@@ -258,8 +259,8 @@ int main(int argc, char** argv)
   try
   {
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
-        std::string_view(argv[1]) != "--complex-spatial-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only]");
+        std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -271,7 +272,9 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--complex-score-only")
+      validateComplexScore();
+    else if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-only")
       validateComplexSpatial();
     else if (argc == 2)
       validateComplexValue();
