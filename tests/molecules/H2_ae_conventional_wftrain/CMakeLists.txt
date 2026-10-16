@@ -13,5 +13,12 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
                      $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_sj_j3.xml"
                      --companion-optimizer sr --restart)
     set_tests_properties(short-H2-ae-conventional-wftrain-j3 PROPERTIES TIMEOUT 300 PROCESSORS 1)
+    # OneShiftOnly is the built-in LAPACK route; no optional LMY engine required.
+    if(NOT ENABLE_OFFLOAD)
+      add_test(NAME short-H2-ae-conventional-optimizers-old-new
+               COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_sj_training.py"
+                       $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_compare.xml" --old-new)
+      set_tests_properties(short-H2-ae-conventional-optimizers-old-new PROPERTIES TIMEOUT 300 PROCESSORS 1)
+    endif()
   endif()
 endif()
