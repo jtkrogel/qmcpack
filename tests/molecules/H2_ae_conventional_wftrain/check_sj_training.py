@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--profile-only", action="store_true", help="one bounded Adam/inference case for MPI/OpenMP")
     parser.add_argument("--optimizer-screen", action="store_true", help="six bounded nonlinear SJ optimizer cases")
     parser.add_argument("--family-screen", action="store_true", help="bounded LM/ALM/PII/minPII cases; report rejection honestly")
+    parser.add_argument("--family-method", choices=("lm", "alm", "pii", "minpii"), action="append",
+                        help="restrict a family screen to selected methods, e.g. one corrected fixture")
     args = parser.parse_args()
     if args.threads <= 0 or args.ranks <= 0:
         parser.error("--threads and --ranks must be positive")
@@ -56,6 +58,8 @@ def main():
         parser.error("profile/screen options select their cases; omit --restart/--preflight")
     if sum((args.profile_only, args.optimizer_screen, args.family_screen)) > 1:
         parser.error("select one of --profile-only, --optimizer-screen, --family-screen")
+    if args.family_method and not args.family_screen:
+        parser.error("--family-method requires --family-screen")
     executable = args.executable.resolve()
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
@@ -150,7 +154,7 @@ def main():
 
     if args.family_screen:
         reports = []
-        for optimizer in ("lm", "alm", "pii", "minpii"):
+        for optimizer in (args.family_method or ("lm", "alm", "pii", "minpii")):
             def controls(tree):
                 qmc = tree.find("qmc")
                 qmc.find("parameter[@name='walkers_per_rank']").text = "4"
@@ -160,8 +164,9 @@ def main():
                           "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
                           "krylov_relative_tolerance": "1e-6"}
                 if optimizer in ("lm", "alm"):
-                    limits.update(lm_maximum_subspace_dimension="9", lm_inner_iterations="32",
-                                  lm_inner_restart_length="9")
+                    limits.update(lm_maximum_subspace_dimension="9")
+                    if optimizer == "alm":
+                        limits.update(lm_inner_iterations="32", lm_inner_restart_length="9")
                 else:
                     limits.update(gmres_restart_length="16", maximum_damping_retries="0",
                                   pii_energy_undershoot="1.0")

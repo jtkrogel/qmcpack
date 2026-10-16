@@ -44,8 +44,8 @@ performance. It reuses the same single tiny real CPU fixture.
 ``--family-screen`` selects lm, alm, pii and minpii with32samples/update
 (4walkers x8blocks), P=8 and2iterations, using the same learning rate0.0001.
 Each iterative solve declares64iterations,256operator applications,15seconds,
-damping0.01 and relative tolerance1e-6. LM/ALM use maximum subspace9 and32inner
-iterations/restart9; PII/minPII use GMRES restart16 and no damping retries.
+damping0.01 and relative tolerance1e-6. LM/ALM use maximum subspace9; ALM also
+uses32inner iterations/restart9. PII/minPII use GMRES restart16 and no damping retries.
 The checker records every committed/rejected decision in family_results.csv,
 checks accepted/rejected exported state and version consistency, and retains
 failures rather than altering the numerical algorithm or forcing acceptance.
