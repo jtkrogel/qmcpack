@@ -25,6 +25,7 @@ class PreparedDeviceScoreContraction
 {
   friend class PreparedDeviceProductSession;
   friend class PreparedDeviceAdam;
+  friend class PreparedDeviceSrMetric;
 public:
   /// Exact numeric device capacity, excluding queue/model and allocator bookkeeping.
   static std::size_t requiredBytes(std::size_t parameters, std::size_t channels)

@@ -47,6 +47,7 @@ enum class ProductSessionProfile
  */
 class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
 {
+  friend class PreparedDeviceSrMetric;
   /** Keep the lifted forward/reverse pair absent from a score-only lane. */
   struct KineticWorkspace
   {
@@ -780,6 +781,14 @@ private:
                 const PackedDeviceCoordinatesView* device_input = nullptr)
   {
     std::lock_guard lock(mutex_);
+    executeUnderControl(operation, positions, version, action, count, device_input);
+  }
+
+  /// Preserve the same product protocol while a scoped numerical owner holds mutex_.
+  void executeUnderControl(PsiFormerAcceleratorOperation operation, const double* positions,
+      std::size_t version, const std::function<void()>& action, std::size_t count = 1,
+      const PackedDeviceCoordinatesView* device_input = nullptr)
+  {
     ready_ = false;
     if ((!positions && !device_input) || version != active_image_->version() || count == 0 || count > score_capacity_ ||
         (device_input && (device_input->batchCount() != count || device_input->physicalElectrons() != masses_.size())))

@@ -25,6 +25,7 @@ namespace qmcplusplus::psiformer::device
 /** Own fixed-capacity tangent scratch for one parameter direction and model image. */
 class PreparedDeviceScoreJvp
 {
+  friend class PreparedDeviceSrMetric;
 public:
   /// Prepare O(P) direction storage and bounded tile scratch before evaluation.
   PreparedDeviceScoreJvp(std::shared_ptr<const PreparedDeviceModel> model,
@@ -222,6 +223,23 @@ public:
   }
 
 private:
+  /// Copy an already finite/projected device direction; only cusp scalars cross host.
+  void prepareDirectionDevice(const double* direction)
+  {
+    clearPreparedDirection();
+    model_->validateCurrentDevice();
+    checkRuntime(launchDerivativeCopy(queue_.getNative(), {direction_.capacity(), 0, 1, 0, 1},
+        direction, direction_.data()), "score JVP resident direction");
+    queue_.sync();
+    const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
+    same_alpha_direction_ = 0.0;
+    if (same)
+      direction_.download(&same_alpha_direction_, 1, same->begin);
+    direction_.download(&opposite_alpha_direction_, 1,
+        model_->plan().parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin);
+    direction_ready_ = true;
+  }
+
   /// Check all prepared extents before allocation or layout construction.
   static std::size_t multiply(std::size_t left, std::size_t right)
   { return spatial_detail::checkedProduct(left, right, "Score JVP extent overflow"); }
