@@ -30,6 +30,9 @@
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/WaveFunctionFactory.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
+#include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/RotatedSPOs.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "SimulationCell.h"
 
@@ -824,6 +827,198 @@ TEST_CASE("Legacy replay block views share bounded parameter workspace and immut
   invalid->values[0] = std::numeric_limits<double>::quiet_NaN();
   CHECK_THROWS_AS(adapter.makeDerivativeOperator(replay, invalid, 0, 0), std::invalid_argument);
   CHECK_THROWS_AS(adapter.makeDerivativeOperator({}, snapshot, 0, 0), std::invalid_argument);
+}
+
+TEST_CASE("Legacy orbital products preserve cumulative private rotation history",
+          "[drivers][training][legacy_adapter][orbital_rotation]")
+{
+#ifdef QMC_COMPLEX
+  SKIP("This gate qualifies real CPU orbital coordinates");
+#endif
+  ParticleSetPool pool(OHMMS::Controller);
+  auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto& ions = *ion_owner;
+  auto& particles = *electron_owner;
+  ions.setName("ion0");
+  ions.create({1});
+  ions.R[0] = {0, 0, 0};
+  auto& ion_species = ions.getSpeciesSet();
+  ion_species.addSpecies("He");
+  ions.resetGroups();
+  particles.setName("e");
+  particles.create({1, 1});
+  particles.R[0] = {0.7, 0.2, 0.4};
+  particles.R[1] = {-0.5, 0.3, 0.8};
+  auto& species = particles.getSpeciesSet();
+  const int up = species.addSpecies("u"), down = species.addSpecies("d");
+  const int mass = species.addAttribute("mass");
+  species(mass, up) = species(mass, down) = 1.0;
+  particles.resetGroups();
+  pool.addParticleSet(std::move(ion_owner));
+  pool.addParticleSet(std::move(electron_owner));
+  Libxml2Document definition;
+  // Extend the existing test_RotatedSPOs_LCAO He oracle to three STOs, so the
+  // two occupied-virtual rotations do not commute. Both spins alias one SPO.
+  REQUIRE(definition.parseFromString(R"(
+    <wavefunction name="psi0" target="e">
+      <sposet_collection type="MolecularOrbital" source="ion0">
+        <basisset keyword="STO" transform="no">
+          <atomicBasisSet type="STO" elementType="He" normalized="no">
+            <basisGroup rid="R0" l="0" m="0" type="Slater"><radfunc n="1" exponent="2.0"/></basisGroup>
+            <basisGroup rid="R1" l="0" m="0" type="Slater"><radfunc n="2" exponent="1.0"/></basisGroup>
+            <basisGroup rid="R2" l="0" m="0" type="Slater"><radfunc n="3" exponent="0.7"/></basisGroup>
+          </atomicBasisSet>
+        </basisset>
+        <rotated_sposet name="rot">
+          <sposet name="base" size="3"><coefficient size="3" id="identity">1 0 0  0 1 0  0 0 1</coefficient></sposet>
+        </rotated_sposet>
+      </sposet_collection>
+      <determinantset>
+        <slaterdeterminant><determinant sposet="rot"/><determinant sposet="rot"/></slaterdeterminant>
+      </determinantset>
+      <jastrow name="J2" type="Two-Body" function="Bspline">
+        <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+          <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+        </correlation>
+      </jastrow>
+    </wavefunction>)"));
+  WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+  auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+  REQUIRE(source);
+  ions.update();
+  particles.update();
+  source->evaluateLog(particles);
+  const auto rotation = [](TrialWaveFunction& wavefunction) -> RotatedSPOs& {
+    auto& slater = wavefunction.findSD()[0].get();
+    REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
+    return dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
+  };
+  const auto lcao = [](RotatedSPOs& orbital) -> LCAOrbitalSet& {
+    return dynamic_cast<LCAOrbitalSet&>(*orbital.Phi_);
+  };
+  auto& live_rotation = rotation(*source);
+  auto& live_lcao = lcao(live_rotation);
+  auto* fixed_phi = live_rotation.Phi_.get();
+  auto* fixed_basis = live_lcao.myBasisSet.get();
+  ParticleSet sibling_particles(particles);
+  auto sibling = source->makeClone(sibling_particles);
+  sibling_particles.update();
+  auto& sibling_rotation = rotation(*sibling);
+  CHECK(lcao(sibling_rotation).C == live_lcao.C);
+  const LCAOrbitalSet::OffloadValueMatrix original(live_lcao.originalRotationCoefficients());
+  LegacyWaveFunctionAdapter adapter("legacy/orbital", *source, adapterOptions());
+  REQUIRE(adapter.snapshotParameters().values.size() == 6);
+  const auto make_private = [&](TrialWaveFunction& base, ParticleSet& positions,
+                                 const StructuredParameterSnapshot& snapshot) {
+    auto private_wavefunction = base.makeClone(positions);
+    positions.update();
+    rotation(*private_wavefunction).isolateOptimizationState();
+    adapter.installSnapshot(*private_wavefunction, positions, snapshot);
+    return private_wavefunction;
+  };
+  for (int step = 0; step < 2; ++step)
+  {
+    auto next = adapter.snapshotParameters();
+    next.values[step] += step == 0 ? 0.08 : -0.06;
+    ParticleSet private_particles(particles);
+    auto prepared = make_private(*source, private_particles, next);
+    auto& prepared_rotation = rotation(*prepared);
+    CHECK(lcao(prepared_rotation).C != live_lcao.C);
+    REQUIRE_NOTHROW(live_rotation.validatePreparedRotationState(prepared_rotation));
+    live_rotation.adoptPreparedRotationState(prepared_rotation, prepared_rotation);
+    CHECK(live_rotation.Phi_.get() == fixed_phi);
+    CHECK(live_lcao.myBasisSet.get() == fixed_basis);
+    CHECK(live_lcao.C != lcao(sibling_rotation).C);
+    CHECK(adapter.commitPreparedParameters(std::move(next)) == step + 1);
+  }
+  const auto accepted = adapter.snapshotParameters();
+  const auto full = live_rotation.fullRotationCoordinates();
+  REQUIRE(full.size() == 3);
+  CHECK(std::abs(full[2]) > 1e-4); // virtual-virtual commutator, absent from theta
+  const LCAOrbitalSet::OffloadValueMatrix accepted_coefficients(*live_lcao.C);
+  for (std::size_t i = 0; i < original.size(); ++i)
+    CHECK(lcao(sibling_rotation).C->data()[i] == original.data()[i]);
+
+  ParticleSet evaluator_particles(particles);
+  auto evaluator = make_private(*source, evaluator_particles, accepted);
+  auto& evaluator_rotation = rotation(*evaluator);
+  auto& evaluator_lcao = lcao(evaluator_rotation);
+  auto op = adapter.makeDerivativeOperator(RefVector<TrialWaveFunction>{*evaluator},
+                                            RefVector<ParticleSet>{evaluator_particles}, 0, 0);
+  const std::vector<DerivativeValue> one{1.0};
+  const std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, one), 0},
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, one),
+       localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  RecordingParameterSink rows;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+  for (std::size_t parameter = 0; parameter < accepted.values.size(); ++parameter)
+  {
+    CAPTURE(parameter);
+    constexpr double epsilon = 1e-5;
+    auto plus = accepted, minus = accepted;
+    plus.values[parameter] += epsilon;
+    minus.values[parameter] -= epsilon;
+    ParticleSet plus_particles(particles), minus_particles(particles);
+    // Each sign starts from the same accepted full history, never a prior probe.
+    auto plus_wavefunction = make_private(*source, plus_particles, plus);
+    auto minus_wavefunction = make_private(*source, minus_particles, minus);
+    const DerivativeValue score_fd{(plus_wavefunction->getLogPsi() - minus_wavefunction->getLogPsi()) /
+                                  (2.0 * epsilon)};
+    const auto energy_fd = (kineticEnergy(plus_particles) - kineticEnergy(minus_particles)) / (2.0 * epsilon);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      const auto expected = channel == 0 ? score_fd : energy_fd;
+      CHECK(rows.result()[channel][parameter].real() == Catch::Approx(expected.real()).epsilon(2e-6).margin(2e-7));
+      CHECK(rows.result()[channel][parameter].imag() == Catch::Approx(expected.imag()).margin(2e-7));
+    }
+  }
+  const std::vector<DerivativeValue> direction{0.2, -0.1, 0.3, -0.2, 0.1, -0.4};
+  StructuredParameterVectorConstView direction_view(adapter.parameterSchema(), accepted.version,
+                                                      {direction.data(), direction.size()});
+  for (int repeat = 0; repeat < 3; ++repeat)
+  {
+    RecordingSampleSink score, energy;
+    op->applyScoreJVP(direction_view, score);
+    op->applyLocalEnergyJVP(direction_view, localEnergyTermBit(LocalEnergyTerm::KINETIC), energy);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      DerivativeValue expected{};
+      for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+        expected += rows.result()[channel][parameter] * direction[parameter];
+      checkClose(channel == 0 ? score.result()[0] : energy.result()[0], expected);
+    }
+    CHECK(evaluator_rotation.fullRotationCoordinates() == full);
+    for (std::size_t i = 0; i < accepted_coefficients.size(); ++i)
+      CHECK(evaluator_lcao.C->data()[i] == accepted_coefficients.data()[i]);
+  }
+  ParticleSet restored_particles(sibling_particles);
+  auto restored = make_private(*sibling, restored_particles, accepted);
+  auto& restored_rotation = rotation(*restored);
+  auto& restored_lcao = lcao(restored_rotation);
+  bool different_history = false;
+  for (std::size_t i = 0; i < accepted_coefficients.size(); ++i)
+    different_history |= std::abs(restored_lcao.C->data()[i] - accepted_coefficients.data()[i]) > 1e-5;
+  CHECK(different_history); // same active theta alone does not recover the model
+  auto expected_active = adapter.registrationVariables();
+  for (std::size_t i = 0; i < expected_active.size(); ++i)
+    if (expected_active.where(i) >= 0)
+      expected_active[i] = accepted.values[expected_active.where(i)];
+  restored_rotation.restoreFullRotationState(full, expected_active);
+  restored_lcao.restorePreparedRotationCoefficients(accepted_coefficients, original);
+  adapter.installSnapshot(*restored, restored_particles, accepted);
+  CHECK(restored_rotation.fullRotationCoordinates() == full);
+  for (std::size_t i = 0; i < accepted_coefficients.size(); ++i)
+    CHECK(restored_lcao.C->data()[i] == accepted_coefficients.data()[i]);
+  source->evaluateLog(particles);
+  CHECK(restored->getLogPsi() == source->getLogPsi());
+  checkClose(kineticEnergy(restored_particles), kineticEnergy(particles));
+  auto corrupt = accepted_coefficients;
+  corrupt.data()[0] += makeValue(0.1);
+  CHECK_THROWS_AS(restored_lcao.restorePreparedRotationCoefficients(corrupt, original), std::invalid_argument);
+  restored_lcao.C->data()[0] = makeValue(std::numeric_limits<double>::quiet_NaN());
+  CHECK_THROWS_AS(restored_lcao.restorePreparedRotationCoefficients(accepted_coefficients, original), std::invalid_argument);
 }
 
 TEST_CASE("Legacy polynomial J3 products include full-gradient cross terms and isolated aliases",
