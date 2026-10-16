@@ -89,6 +89,18 @@ struct BsplineFunctor : public OptimizableFunctorBase
 
   OptimizableFunctorBase* makeClone() const override { return new BsplineFunctor(*this); }
 
+  /// Optimization-private evaluators must detach before resetting Parameters.
+  /// Ordinary sampling clones intentionally retain their shared immutable bank.
+  void isolateOptimizationState()
+  {
+    if (spline_coefs_ && !spline_coefs_.unique())
+    {
+      auto detached = std::make_shared<Vector<Real, OffloadAllocator<Real>>>(*spline_coefs_);
+      detached->updateTo();
+      spline_coefs_.swap(detached);
+    }
+  }
+
   constexpr static bool isOMPoffload() { return true; }
 
   void setCusp(Real c) override { CuspValue = c; }

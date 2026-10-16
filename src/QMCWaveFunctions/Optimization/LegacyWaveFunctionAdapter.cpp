@@ -14,6 +14,7 @@
 #include "Particle/ParticleSet.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 
 #include <algorithm>
 #include <array>
@@ -210,6 +211,13 @@ void resetEvaluator(TrialWaveFunction& evaluator,
                       const std::vector<double>& values)
 {
   optimize::VariableSet active = validateEvaluatorRegistration(evaluator, expected);
+  // J1/J2 clone their scalar coordinates but deliberately share the physical
+  // B-spline coefficient bank. Detach each unique functor before a private reset,
+  // including rejected candidate preparation; repeated replay resets are unique.
+  auto objects = evaluator.extractOptimizableObjectRefs();
+  for (OptimizableObject& object : objects)
+    if (auto* spline = dynamic_cast<BsplineFunctor<QMCTraits::RealType>*>(&object))
+      spline->isolateOptimizationState();
   for (std::size_t location = 0; location < active.size(); ++location)
   {
     const int active_index = active.where(static_cast<int>(location));

@@ -33,6 +33,7 @@
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
+#include "QMCWaveFunctions/Jastrow/J1OrbitalSoA.h"
 #include "QMCWaveFunctions/Jastrow/eeI_JastrowBuilder.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/WaveFunctionFactory.h"
@@ -1457,6 +1458,88 @@ TEST_CASE("Legacy orbital products preserve cumulative private rotation history"
   for (int electron = 0; electron < particles.getTotalNum(); ++electron)
     for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
       CHECK(particles.R[electron][dimension] == positions[electron][dimension]);
+}
+
+TEST_CASE("Legacy private J1 and J2 resets preserve live physical banks on rejection",
+          "[drivers][training][legacy_adapter][jastrow][private_banks]")
+{
+  const SimulationCell cell;
+  auto particles = makeTwoSpeciesParticles(cell);
+  ParticleSet ions(cell);
+  ions.setName("ion0");
+  ions.create({1});
+  ions.R[0] = {0, 0, 0};
+  ions.getSpeciesSet().addSpecies("H");
+  ions.resetGroups();
+  ions.update();
+  auto source = makeBsplineJ2WaveFunction(particles, {0.12, -0.08, 0.04, -0.01}, 0.37);
+  using Functor = BsplineFunctor<QMCTraits::RealType>;
+  auto functor = std::make_unique<Functor>("private_j1_functor");
+  functor->cutoff_radius = 4;
+  functor->resize(4);
+  for (int i = 0; i < 4; ++i)
+  {
+    functor->Parameters[i] = 0.03 * (i + 1);
+    functor->myVars.insert("private_j1_" + std::to_string(i), functor->Parameters[i], true, optimize::LOGLINEAR_P);
+  }
+  functor->reset();
+  auto j1 = std::make_unique<J1OrbitalSoA<Functor>>("private_j1", ions, particles, false);
+  j1->addFunc(0, std::move(functor));
+  source->addComponent(std::move(j1));
+  particles.update();
+  source->evaluateLog(particles);
+  const auto source_log = source->getLogPsi();
+  const auto source_kinetic = kineticEnergy(particles);
+  ParticleSet sibling_particles(particles), private_particles(particles);
+  auto sibling = source->makeClone(sibling_particles);
+  auto evaluator = source->makeClone(private_particles);
+  sibling_particles.update();
+  private_particles.update();
+  sibling->evaluateLog(sibling_particles);
+  const auto banks = [](TrialWaveFunction& wf) {
+    std::vector<const void*> result;
+    for (OptimizableObject& object : wf.extractOptimizableObjectRefs())
+      if (auto* spline = dynamic_cast<Functor*>(&object))
+        result.push_back(spline->spline_coefs_.get());
+    return result;
+  };
+  REQUIRE(banks(*source).size() == 2);
+  CHECK(banks(*source) == banks(*sibling));
+  CHECK(banks(*source) == banks(*evaluator));
+  TrainingWaveFunctionBinding binding(*source, particles, adapterOptions(), *OHMMS::Controller);
+  QMCHamiltonian hamiltonian;
+  hamiltonian.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  binding.setHamiltonian(hamiltonian);
+  binding.attachLive(*sibling, sibling_particles);
+  const auto snapshot = binding.snapshotParameters();
+  REQUIRE(snapshot.values.size() == 8);
+  auto displaced = snapshot;
+  for (auto& value : displaced.values)
+    value += 0.03;
+  binding.adapter().installSnapshot(*evaluator, private_particles, displaced);
+  CHECK(banks(*evaluator) != banks(*source));
+  const auto private_banks = banks(*evaluator);
+  binding.adapter().installSnapshot(*evaluator, private_particles, displaced);
+  CHECK(banks(*evaluator) == private_banks);
+  CHECK(evaluator->getLogPsi() != source_log);
+  const auto check_physical_source = [&]() {
+    source->evaluateLog(particles);
+    sibling->evaluateLog(sibling_particles);
+    CHECK(source->getLogPsi() == source_log);
+    CHECK(sibling->getLogPsi() == source_log);
+    CHECK(kineticEnergy(particles) == source_kinetic);
+    CHECK(kineticEnergy(sibling_particles) == source_kinetic);
+    CHECK(binding.snapshotParameters().values == snapshot.values);
+    CHECK(binding.snapshotParameters().version == snapshot.version);
+  };
+  // Do NOT restore the private point before checking physical source isolation.
+  check_physical_source();
+  auto rejected = snapshot;
+  std::fill(rejected.values.begin(), rejected.values.end(), 1e200);
+  CHECK_THROWS_WITH(binding.publishParameters(rejected, snapshot.version),
+                    Catch::Matchers::ContainsSubstring("Nonfinite conventional candidate energy"));
+  check_physical_source();
+  CHECK(banks(*source) == banks(*sibling));
 }
 
 TEST_CASE("Legacy real Gamma HEG products preserve periodicity and full Ewald energy derivatives",
