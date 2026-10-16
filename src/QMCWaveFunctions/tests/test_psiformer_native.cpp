@@ -19,6 +19,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
 
@@ -298,6 +299,69 @@ TEST_CASE("PsiFormer native oracle evaluates canonical one-up one-down pseudo-Li
   CHECK(std::all_of(result.local_energy_param_gradient.begin(),
                     result.local_energy_param_gradient.end(),
                     [](double value) { return std::isfinite(value); }));
+}
+
+TEST_CASE("PsiFormer native prepared flat replacement preserves graph ownership",
+          "[wavefunction][psiformer][prepared_parameters]")
+{
+  using Prepared = pf::Parameters::PreparedFlatValues;
+  static_assert(!std::is_copy_constructible_v<Prepared>);
+  static_assert(std::is_nothrow_move_constructible_v<Prepared>);
+  static_assert(noexcept(std::declval<Prepared&>().commit()));
+
+  pf::Parameters parameters({0.5, -0.25, 0.75},
+                            {{"tiny", "weight", {2}, 0, 2}, {"tiny", "bias", {}, 2, 3}});
+  const auto weight = parameters.nodes.at({"tiny", "weight"});
+  const auto bias = parameters.nodes.at({"tiny", "bias"});
+  const auto original = parameters.flat_values();
+  const auto* flat_storage = parameters.values.data();
+  const auto* weight_storage = weight->value.x.data();
+  const auto* bias_storage = bias->value.x.data();
+  std::vector<double> candidate{0.125, -0.5, 1.25};
+  {
+    auto discarded = parameters.prepare_flat_values(candidate, 0);
+    CHECK(parameters.flat_values() == original);
+    CHECK(parameters.version() == 0);
+    CHECK(weight->value.x == std::vector<double>{0.5, -0.25});
+  }
+  CHECK(parameters.flat_values() == original);
+  CHECK(parameters.version() == 0);
+  auto action = parameters.prepare_flat_values(candidate, 0);
+  candidate.assign(3, 99.0); // The prepared action owns its admitted values.
+  auto moved_action = std::move(action);
+  CHECK(moved_action.commit() == 1);
+  CHECK(parameters.flat_values() == std::vector<double>{0.125, -0.5, 1.25});
+  CHECK(weight->value.x == std::vector<double>{0.125, -0.5});
+  CHECK(bias->value.x == std::vector<double>{1.25});
+  CHECK(parameters.nodes.at({"tiny", "weight"}) == weight);
+  CHECK(parameters.nodes.at({"tiny", "bias"}) == bias);
+  CHECK(parameters.values.data() == flat_storage);
+  CHECK(weight->value.x.data() == weight_storage);
+  CHECK(bias->value.x.data() == bias_storage);
+
+  const auto accepted = parameters.flat_values();
+  CHECK_THROWS_AS(parameters.prepare_flat_values(accepted, 0), std::runtime_error);
+  CHECK_THROWS_AS(parameters.prepare_flat_values({1.0}, 1), std::invalid_argument);
+  auto nonfinite = accepted;
+  nonfinite[1] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(parameters.prepare_flat_values(nonfinite, 1), std::invalid_argument);
+  nonfinite[1] = std::numeric_limits<double>::infinity();
+  CHECK_THROWS_AS(parameters.prepare_flat_values(nonfinite, 1), std::invalid_argument);
+  weight->value.x.push_back(0.0);
+  CHECK_THROWS_AS(parameters.prepare_flat_values(accepted, 1), std::logic_error);
+  weight->value.x.pop_back();
+  parameters.nodes.erase({"tiny", "bias"});
+  CHECK_THROWS_AS(parameters.prepare_flat_values(accepted, 1), std::out_of_range);
+  parameters.nodes.emplace(std::make_pair("tiny", "bias"), bias);
+  CHECK(parameters.flat_values() == accepted);
+  CHECK(parameters.version() == 1);
+  CHECK(weight->value.x == std::vector<double>{0.125, -0.5});
+  CHECK(bias->value.x == std::vector<double>{1.25});
+
+  parameters.parameter_version = std::numeric_limits<std::size_t>::max();
+  CHECK_THROWS_AS(parameters.prepare_flat_values(accepted, parameters.version()), std::overflow_error);
+  CHECK(parameters.flat_values() == accepted);
+  CHECK(parameters.version() == std::numeric_limits<std::size_t>::max());
 }
 
 TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefunction][psiformer]")

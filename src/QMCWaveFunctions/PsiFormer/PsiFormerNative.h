@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -1980,6 +1981,70 @@ struct Parameters
   std::map<std::pair<std::string, std::string>, NodePtr> nodes;
   size_t parameter_version = 0;
 
+  /** One owning, pre-resolved flat replacement; no model lock is implied.
+   *
+   * The caller must keep this Parameters object alive and exclude all model,
+   * layout and graph-leaf mutation from preparation through discard/commit.
+   * Owns one additional P-double candidate plus O(tensors) resolved leaf metadata,
+   * not a per-sample/block allocation. Destruction without commit changes nothing.
+   */
+  class PreparedFlatValues
+  {
+  public:
+    PreparedFlatValues(const PreparedFlatValues&) = delete;
+    PreparedFlatValues& operator=(const PreparedFlatValues&) = delete;
+    PreparedFlatValues& operator=(PreparedFlatValues&&) = delete;
+    PreparedFlatValues(PreparedFlatValues&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), expected_version_(other.expected_version_),
+          flat_storage_(other.flat_storage_), candidate_(std::move(other.candidate_)), leaves_(std::move(other.leaves_))
+    {}
+
+    /** Install once using only pre-resolved fixed-size copies.
+     *
+     * Expected errors belong to prepare_flat_values. Stale, moved-from, repeated
+     * or storage-invalidated commit violates exclusive ownership and is fatal in
+     * release builds too; it cannot be represented as a recoverable rollback.
+     */
+    size_t commit() noexcept
+    {
+      if (!owner_ || owner_->parameter_version != expected_version_ ||
+          owner_->values.size() != candidate_.size() || owner_->values.data() != flat_storage_)
+        std::terminate();
+      for (const Leaf& leaf : leaves_)
+        if (leaf.node->value.x.size() != leaf.end - leaf.begin || leaf.node->value.x.data() != leaf.storage)
+          std::terminate();
+
+      std::copy(candidate_.begin(), candidate_.end(), flat_storage_);
+      for (const Leaf& leaf : leaves_)
+        std::copy(candidate_.begin() + leaf.begin, candidate_.begin() + leaf.end, leaf.storage);
+      const size_t committed_version = ++owner_->parameter_version;
+      owner_ = nullptr;
+      return committed_version;
+    }
+
+  private:
+    friend struct Parameters;
+    struct Leaf
+    {
+      NodePtr node;
+      size_t begin;
+      size_t end;
+      double* storage;
+    };
+
+    PreparedFlatValues(Parameters& owner, size_t expected_version,
+                       const std::vector<double>& candidate, std::vector<Leaf>&& leaves)
+        : owner_(&owner), expected_version_(expected_version), flat_storage_(owner.values.data()),
+          candidate_(candidate), leaves_(std::move(leaves))
+    {}
+
+    Parameters* owner_;
+    const size_t expected_version_;
+    double* flat_storage_;
+    std::vector<double> candidate_;
+    std::vector<Leaf> leaves_;
+  };
+
   /// Load flattened parameters, then use the common in-memory validation path.
   explicit Parameters(const std::string& path)
   {
@@ -2046,6 +2111,37 @@ struct Parameters
 
   /// Return the version incremented after each successful parameter mutation.
   size_t version() const { return parameter_version; }
+
+  /// Validate and resolve all fallible work without modifying canonical/graph values.
+  PreparedFlatValues prepare_flat_values(const std::vector<double>& new_values, size_t expected_version)
+  {
+    if (parameter_version != expected_version)
+      throw std::runtime_error("PsiFormer prepared flat replacement rejected a stale parameter version");
+    if (new_values.size() != values.size())
+      throw std::invalid_argument("PsiFormer flat parameter vector has the wrong size");
+    if (std::any_of(new_values.begin(), new_values.end(),
+                    [](double value) { return !is_finite_parameter_value(value); }))
+      throw std::invalid_argument("PsiFormer flat parameter vector contains a non-finite value");
+    if (parameter_version == std::numeric_limits<size_t>::max())
+      throw std::overflow_error("PsiFormer parameter version exhausted");
+
+    std::vector<PreparedFlatValues::Leaf> leaves;
+    leaves.reserve(layouts.size());
+    size_t expected_begin = 0;
+    for (const Layout& layout : layouts)
+    {
+      NodePtr parameter_node = nodes.at({layout.module, layout.name});
+      if (layout.begin != expected_begin || layout.end > values.size() || layout.begin > layout.end ||
+          !parameter_node || parameter_node->value.shape != layout.shape ||
+          parameter_node->value.x.size() != layout.end - layout.begin)
+        throw std::logic_error("PsiFormer parameter leaf has an inconsistent flat extent");
+      leaves.push_back({parameter_node, layout.begin, layout.end, parameter_node->value.x.data()});
+      expected_begin = layout.end;
+    }
+    if (expected_begin != values.size())
+      throw std::logic_error("PsiFormer parameter layout does not cover the complete flat vector");
+    return PreparedFlatValues(*this, expected_version, new_values, std::move(leaves));
+  }
 
   /// Return a stable fingerprint of the immutable exported tensor layout.
   std::string layout_fingerprint() const
