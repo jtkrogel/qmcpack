@@ -42,6 +42,7 @@
 #include "PsiFormerDeviceResidentAdamValidation.h"
 #include "PsiFormerDeviceSrMetricValidation.h"
 #include "PsiFormerDevicePcgValidation.h"
+#include "PsiFormerDeviceEnergySrValidation.h"
 
 #include <fstream>
 #include <iostream>
@@ -140,7 +141,7 @@ int main(int argc, char** argv)
     }
     if (argc < 4)
       throw std::invalid_argument("Usage: psiformer_device_model_validation --target-cost-check OR PARAMETERS CONFIGURATIONS OUTPUT "
-                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--sr-metric-only] [--resident-pcg-only] "
+                                  "[--cpu-only] [--coordinate-only] [--device-coordinates-only] [--target-kinetic-spot] [--kinetic-trunk-only] [--target-selection-spot] [--metropolis-only] [--resident-adam-only] [--sr-metric-only] [--resident-pcg-only] [--energy-sr-only] "
                                   "[--shape DETERMINANTS WIDTH HEADS BLOCKS] "
                                   "[--score-output CANONICAL_F64] [--jvp-output CONFIGURATION_F64] "
                                   "[--kinetic-output CANONICAL_F64] [--nonlocal-output CANONICAL_F64]");
@@ -157,6 +158,7 @@ int main(int argc, char** argv)
     bool resident_adam_only = false;
     bool sr_metric_only = false;
     bool resident_pcg_only = false;
+    bool energy_sr_only = false;
     std::size_t determinants = 16, width = 256, heads = 4, blocks = 4;
     bool shape_supplied = false;
     std::string score_output;
@@ -186,6 +188,8 @@ int main(int argc, char** argv)
         sr_metric_only = true;
       else if (option == "--resident-pcg-only" && !resident_pcg_only)
         resident_pcg_only = true;
+      else if (option == "--energy-sr-only" && !energy_sr_only)
+        energy_sr_only = true;
       else if (option == "--score-output" && score_output.empty() && argument + 1 < argc)
         score_output = argv[++argument];
       else if (option == "--jvp-output" && jvp_output.empty() && argument + 1 < argc)
@@ -212,9 +216,9 @@ int main(int argc, char** argv)
       else
         throw std::invalid_argument("Unknown, duplicate or incomplete validation option: " + option);
     }
-    if ((sr_metric_only && resident_adam_only) || (resident_pcg_only && (sr_metric_only || resident_adam_only)))
-      throw std::invalid_argument("Resident Adam/SR metric/PCG qualifications are mutually exclusive");
-    if ((resident_adam_only || sr_metric_only || resident_pcg_only) && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
+    if (int(sr_metric_only) + int(resident_adam_only) + int(resident_pcg_only) + int(energy_sr_only) > 1)
+      throw std::invalid_argument("Resident Adam/SR metric/PCG/ENERGY SR qualifications are mutually exclusive");
+    if ((resident_adam_only || sr_metric_only || resident_pcg_only || energy_sr_only) && (cpu_only || coordinate_only || device_coordinates_only || metropolis_only ||
         target_kinetic_spot || kinetic_trunk_only || target_selection_spot || !score_output.empty() || !jvp_output.empty() ||
         !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Resident Adam/SR metric/PCG qualification cannot request other modes or exports");
@@ -231,15 +235,15 @@ int main(int argc, char** argv)
     if (metropolis_only && (cpu_only || coordinate_only || device_coordinates_only || target_kinetic_spot || target_selection_spot ||
         !score_output.empty() || !jvp_output.empty() || !kinetic_output.empty() || !nonlocal_output.empty()))
       throw std::invalid_argument("Metropolis-only validation cannot request other modes or exports");
-    if (resident_pcg_only && (!shape_supplied || determinants != 4 || width != 16 || heads != 4 || blocks != 2))
-      throw std::invalid_argument("Resident PCG gate requires explicit tiny --shape 4 16 4 2");
+    if ((resident_pcg_only || energy_sr_only) && (!shape_supplied || determinants != 4 || width != 16 || heads != 4 || blocks != 2))
+      throw std::invalid_argument("Resident PCG/ENERGY SR gate requires explicit tiny --shape 4 16 4 2");
     pf::PsiFormer model(pf::Parameters(argv[1]), pf::ConfigData(argv[2]),
                         determinants, width, heads, blocks);
     const ModelShape shape{model.cfg.nup, model.cfg.ndown, model.cfg.nuclei.shape[0],
                             model.ndet, model.dim, model.heads, model.blocks};
     const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape);
-    if (resident_pcg_only && (plan.parameterCount() != 3922 || model.ne != 4 || model.cfg.nup != 2))
-      throw std::invalid_argument("Resident PCG gate requires P3922/Ne4/Nup2, before GPU image preparation");
+    if ((resident_pcg_only || energy_sr_only) && (plan.parameterCount() != 3922 || model.ne != 4 || model.cfg.nup != 2))
+      throw std::invalid_argument("Resident PCG/ENERGY SR gate requires P3922/Ne4/Nup2, before GPU image preparation");
     if (target_kinetic_spot || target_selection_spot || kinetic_trunk_only)
     {
       // Branch before CPU references, broad validation owners or parameter traces.
@@ -273,8 +277,8 @@ int main(int argc, char** argv)
         throw std::runtime_error("Cannot write TARGET kinetic spot output");
       return 0;
     }
-    const auto references = (metropolis_only || resident_adam_only || sr_metric_only || resident_pcg_only) ? std::vector<Reference>{} : cpuReferences(model, plan, coordinate_only ? 3 : 0);
-    if (!metropolis_only && !resident_adam_only && !sr_metric_only && !resident_pcg_only)
+    const auto references = (metropolis_only || resident_adam_only || sr_metric_only || resident_pcg_only || energy_sr_only) ? std::vector<Reference>{} : cpuReferences(model, plan, coordinate_only ? 3 : 0);
+    if (!metropolis_only && !resident_adam_only && !sr_metric_only && !resident_pcg_only && !energy_sr_only)
       writeReferences(argv[3], references);
     if (cpu_only)
     {
@@ -294,10 +298,12 @@ int main(int argc, char** argv)
     }
     qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
     AcceleratorBlasHandle handle(queue);
-    if (resident_adam_only || sr_metric_only || resident_pcg_only)
+    if (resident_adam_only || sr_metric_only || resident_pcg_only || energy_sr_only)
     {
       const auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
-      if (resident_pcg_only)
+      if (energy_sr_only)
+        validateEnergySr(model, plan, image);
+      else if (resident_pcg_only)
         validateResidentPcg(model, plan, image);
       else if (sr_metric_only)
         validateSrMetric(model, plan, image);

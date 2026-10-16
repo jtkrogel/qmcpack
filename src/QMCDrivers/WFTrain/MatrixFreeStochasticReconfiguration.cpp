@@ -11,6 +11,7 @@
 
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
+#include "QMCDrivers/WFTrain/SrMetricNumerics.h"
 
 #include <algorithm>
 #include <array>
@@ -155,27 +156,6 @@ void validateOptionalBound(DerivativeReal value, const char* description)
 {
   if (!isFiniteTrainingReal(value) || value < 0.0)
     throw std::invalid_argument(std::string(description) + " must be finite and nonnegative");
-}
-
-/** Bound roundoff in a length-P Hermitian contraction.
- *
- * The product of the vector norms bounds the sum of absolute scalar products.
- * Combining that scale with the standard gamma(P) accumulation bound avoids
- * rejecting a positive-semidefinite metric solely because a large cancellation
- * leaves a tiny negative residual.
- */
-DerivativeReal contractionRoundoffTolerance(std::size_t parameter_count,
-                                             DerivativeValue contraction,
-                                             DerivativeReal product_norm) noexcept
-{
-  const DerivativeReal accumulated_roundoff =
-      static_cast<DerivativeReal>(parameter_count) *
-      std::numeric_limits<DerivativeReal>::epsilon();
-  const DerivativeReal gamma = accumulated_roundoff < 0.5
-      ? accumulated_roundoff / (1.0 - accumulated_roundoff)
-      : 1.0;
-  return 128.0 * gamma *
-      std::max({DerivativeReal{1}, std::abs(contraction.real()), product_norm});
 }
 
 } // namespace
@@ -495,7 +475,7 @@ StructuredParameterSnapshot StochasticReconfigurationUpdateRule::propose(
   const DerivativeReal metric_product_norm =
       parameterVectorNorm(schema, constView(solve.solution)) *
       parameterVectorNorm(schema, constView(metric_action));
-  const DerivativeReal metric_tolerance = contractionRoundoffTolerance(
+  const DerivativeReal metric_tolerance = sr_metric_detail::contractionRoundoffTolerance(
       schema.parameterCount(), metric_squared, metric_product_norm);
   if (std::abs(metric_squared.imag()) > metric_tolerance ||
       metric_squared.real() < -metric_tolerance)

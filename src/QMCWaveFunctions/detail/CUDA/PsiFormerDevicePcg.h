@@ -9,6 +9,7 @@
 #define QMCPLUSPLUS_PSIFORMER_DEVICE_PCG_H
 #include "PsiFormerDeviceSrMetric.h"
 #include "QMCDrivers/WFTrain/KrylovPcgControl.h"
+#include "QMCDrivers/WFTrain/SrMetricNumerics.h"
 
 namespace qmcplusplus::psiformer::device
 {
@@ -54,11 +55,29 @@ public:
   /// Scalar diagnostics do not pretend that a device iterate is a host vector.
   struct Result { wftrain::KrylovSolveDiagnostics diagnostics; IterateReceipt iterate; };
 
+  /// Only candidate_ready makes the final undamped norms and caller candidate valid.
+  struct EnergyResult
+  {
+    wftrain::KrylovSolveDiagnostics solve;
+    double gradient_norm = 0, direction_norm = 0, metric_norm = 0;
+    bool candidate_ready = false;
+  };
+
   /// Include the entire metric/fixed C owner, persistent RHS and distinct PCG scratch.
   static Cost requiredBytes(std::size_t p, std::size_t b, std::size_t ne, std::size_t c, std::size_t f = 0)
   {
     const auto base = Metric::requiredBytes(p, b, ne, c, f), extra = additionalBytes(p);
     return {Metric::add(base.device_bytes, extra.device_bytes), Metric::add(base.host_bytes, extra.host_bytes)};
+  }
+
+  /// Charge optional stable full-gradient partials/status, without another P buffer.
+  static Cost energyRequiredBytes(std::size_t p, std::size_t b, std::size_t ne, std::size_t c, std::size_t f = 0)
+  {
+    if (c != 3)
+      throw std::invalid_argument("Device ENERGY SR requires fixed C3 preparation");
+    const auto base = requiredBytes(p, b, ne, c, f);
+    const auto extra = Metric::add(PreparedDeviceAdam::energyGradientRequiredBytes(p), sizeof(std::uint64_t));
+    return {Metric::add(base.device_bytes, extra), Metric::add(base.host_bytes, extra)};
   }
 
   /// Admit both complete numeric payload caps before even preparing the metric.
@@ -68,22 +87,44 @@ public:
       std::size_t device_cap, std::size_t host_cap)
   {
     std::lock_guard lock(session.mutex_);
+    return prepareUnderControl(session, positions, weights, frozen, version, damping, device_cap, host_cap, false);
+  }
+
+  /// Opt in to exact ENERGY completion storage before any ordinary PCG allocation.
+  static std::unique_ptr<PreparedDevicePcg> prepareEnergy(PreparedDeviceProductSession& session,
+      const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version, double damping,
+      std::size_t device_cap, std::size_t host_cap)
+  {
+    std::lock_guard lock(session.mutex_);
+    return prepareUnderControl(session, positions, weights, frozen, version, damping, device_cap, host_cap, true);
+  }
+
+private:
+  /// Both public factories own the control mutex and admit the complete payload first.
+  static std::unique_ptr<PreparedDevicePcg> prepareUnderControl(PreparedDeviceProductSession& session,
+      const std::vector<double>& positions, const std::vector<double>& weights,
+      const std::vector<FrozenInterval>& frozen, std::size_t version, double damping,
+      std::size_t device_cap, std::size_t host_cap, bool energy)
+  {
     session.validateContractionControl(version);
     if (!device_math::isFiniteBinary64(damping) || damping <= 0.0)
       throw std::invalid_argument("Device PCG requires fixed finite positive damping");
     const auto p = session.image_->plan().parameterCount();
     const auto ne = session.image_->plan().modelShape().electrons();
     const auto c = std::max<std::size_t>(1, session.scoreContractionCapacity());
-    const auto cost = requiredBytes(p, weights.size(), ne, c, frozen.size());
+    const auto cost = energy ? energyRequiredBytes(p, weights.size(), ne, c, frozen.size()) :
+        requiredBytes(p, weights.size(), ne, c, frozen.size());
     const auto finite_cap = [](std::size_t cap) { return cap && cap != std::numeric_limits<std::size_t>::max(); };
     if (!finite_cap(device_cap) || !finite_cap(host_cap) || cost.device_bytes > device_cap || cost.host_bytes > host_cap)
       throw std::length_error("Device PCG exceeds explicit numeric payload caps");
     const auto base = Metric::requiredBytes(p, weights.size(), ne, c, frozen.size());
     auto metric = Metric::prepareUnderControl(session, positions, weights, frozen, version,
         base.device_bytes, base.host_bytes);
-    return std::unique_ptr<PreparedDevicePcg>(new PreparedDevicePcg(session, std::move(metric), damping, cost));
+    return std::unique_ptr<PreparedDevicePcg>(new PreparedDevicePcg(session, std::move(metric), damping, cost, energy));
   }
 
+public:
   /// Cold real host ingress; retain immutable RHS across explicit zero-start solves.
   RhsReceipt uploadRhs(const std::vector<double>& rhs, std::size_t version)
   {
@@ -114,6 +155,13 @@ public:
   Result solve(const RhsReceipt& rhs, const wftrain::KrylovSolverControl& control)
   {
     std::lock_guard lock(session_.mutex_);
+    return solveUnderControl(rhs, control);
+  }
+
+private:
+  /// Delegate unchanged zero-start control while the concrete ENERGY caller keeps the lock.
+  Result solveUnderControl(const RhsReceipt& rhs, const wftrain::KrylovSolverControl& control)
+  {
     iterate_ready_ = false;
     Metric::advance(iterate_generation_);
     validate();
@@ -135,6 +183,91 @@ public:
       failed_ = true;
       rhs_ready_ = false;
       metric_->input_ready_ = metric_->action_ready_ = false;
+      throw;
+    }
+  }
+
+public:
+  /// Consume tagged physical ENERGY once, with all leases retained until candidate download.
+  EnergyResult consumeEnergy(std::size_t version, std::size_t generation,
+      const std::vector<double>& parameters, double weight, double energy, double learning_rate,
+      const wftrain::KrylovSolverControl& control, std::vector<double>& candidate)
+  {
+    std::lock_guard lock(session_.mutex_);
+    rhs_ready_ = iterate_ready_ = false;
+    try
+    {
+      validate();
+      auto* source = session_.score_contraction_.get();
+      if (version != metric_->image_->version() || session_.energy_image_ != metric_->image_.get() ||
+          generation != session_.contraction_transaction_ || !source || !source->ready_ ||
+          source->channels_ != 3 || source->parameters_ != parameters_ ||
+          parameters.size() != parameters_ || candidate.size() != parameters_ ||
+          energy_host_.size() != PreparedDeviceAdam::energyGradientRequiredBytes(parameters_) / sizeof(double) ||
+          energy_partials_.capacity() != energy_host_.size() || energy_status_.capacity() != 1 ||
+          energy_status_host_.size() != 1 || weight != metric_->weight_ ||
+          !device_math::isFiniteBinary64(energy) || !device_math::isFiniteBinary64(learning_rate) || learning_rate <= 0)
+        throw std::invalid_argument("Device ENERGY SR inputs, C3 provenance or preparation are invalid");
+      wftrain::krylov_detail::validateControl(control);
+      Metric::advance(rhs_generation_);
+      try
+      {
+        x_.upload(parameters.data(), parameters_);
+#ifdef QMC_CUDA2HIP
+        checkRuntime(hipMemsetAsync(energy_status_.data(), 0xff, sizeof(std::uint64_t), session_.queue_.getNative()), "SR ENERGY status reset");
+#else
+        checkRuntime(cudaMemsetAsync(energy_status_.data(), 0xff, sizeof(std::uint64_t), session_.queue_.getNative()), "SR ENERGY status reset");
+#endif
+        checkRuntime(launchAdamEnergyGradient(session_.queue_.getNative(), parameters_, source->sums_.data(),
+            x_.data(), metric_->image_->parameters(), weight, energy, rhs_.data(), energy_partials_.data(),
+            energy_status_.data()), "SR resident ENERGY gradient");
+        session_.queue_.sync();
+        energy_status_.download(energy_status_host_.data(), 1);
+        if (energy_status_host_[0] != std::numeric_limits<std::uint64_t>::max())
+          throw std::overflow_error("Device ENERGY SR gradient or canonical old parameters are invalid");
+        energy_partials_.download(energy_host_.data(), energy_host_.size());
+        EnergyResult result;
+        for (std::size_t i = 0; i < energy_host_.size(); i += 2)
+          result.gradient_norm = std::hypot(result.gradient_norm, energy_host_[i] * std::sqrt(energy_host_[i + 1]));
+        if (!device_math::isFiniteBinary64(result.gradient_norm))
+          throw std::overflow_error("Device ENERGY SR full gradient norm is nonfinite");
+        metric_->project(rhs_); // Full-gradient finite/stable norm precedes frozen projection.
+        rhs_ready_ = true;
+        session_.invalidateScoreContraction(); // C1 metric work may now overwrite fixed C3.
+        result.solve = solveUnderControl(RhsReceipt(this, rhs_generation_), control).diagnostics;
+        if (!result.solve.converged)
+          return result;
+        const auto direction = metric_->stageResidentDirectionUnderControl(x_.data(), parameters_);
+        (void)metric_->applyUnderControl(direction); // EXTRA UNDAMPED action, never shifted AP.
+        metric_->action_ready_ = false;
+        const auto squared = dot(Slot::X, Slot::AP);
+        const auto product_norm = norm(Slot::X) * norm(Slot::AP);
+        const auto tolerance = wftrain::sr_metric_detail::contractionRoundoffTolerance(parameters_, squared, product_norm);
+        if (std::abs(squared.imag()) > tolerance || squared.real() < -tolerance)
+          throw wftrain::MatrixFreeNumericalError("SR covariance metric norm is not real and nonnegative");
+        result.direction_norm = norm(Slot::X);
+        result.metric_norm = std::sqrt(std::max(0.0, squared.real()));
+        checkRuntime(launchDerivativeCopy(session_.queue_.getNative(), {parameters_, 0, 1, 0, 1},
+            metric_->image_->parameters(), r_.data()), "SR canonical candidate seed");
+        axpy({-learning_rate, 0.0}, Slot::X, Slot::R);
+        for (const auto& interval : metric_->frozen_)
+          checkRuntime(launchDerivativeCopy(session_.queue_.getNative(),
+              {interval.second, interval.first, 1, interval.first, 1}, metric_->image_->parameters(), r_.data()),
+              "SR frozen candidate preservation");
+        r_.download(candidate.data(), parameters_);
+        result.candidate_ready = true;
+        return result;
+      }
+      catch (...)
+      {
+        failed_ = true;
+        rhs_ready_ = iterate_ready_ = false;
+        throw;
+      }
+    }
+    catch (...)
+    {
+      session_.invalidateScoreContraction();
       throw;
     }
   }
@@ -173,12 +306,16 @@ public:
       actual.device_bytes = Metric::add(actual.device_bytes, checkedDeviceBytes<DerivativeFiniteStatus>(buffer->capacity()));
     actual.host_bytes = Metric::add(actual.host_bytes,
         Metric::add(checkedDeviceBytes<DerivativeFiniteStatus>(host_status_.capacity()), sizeof(host_dot_) + sizeof(host_dot_status_)));
+    actual.device_bytes = Metric::add(actual.device_bytes,
+        Metric::add(checkedDeviceBytes<double>(energy_partials_.capacity()), checkedDeviceBytes<std::uint64_t>(energy_status_.capacity())));
+    actual.host_bytes = Metric::add(actual.host_bytes,
+        Metric::add(checkedDeviceBytes<double>(energy_host_.capacity()), checkedDeviceBytes<std::uint64_t>(energy_status_host_.capacity())));
     return actual;
   }
 
 private:
   /// Prepare only fixed numeric buffers after complete factory admission.
-  PreparedDevicePcg(PreparedDeviceProductSession& session, std::unique_ptr<Metric> metric, double damping, Cost cost)
+  PreparedDevicePcg(PreparedDeviceProductSession& session, std::unique_ptr<Metric> metric, double damping, Cost cost, bool energy)
       : session_(session), metric_(std::move(metric)), damping_(damping), cost_(cost),
         parameters_(metric_->image_->plan().parameterCount()),
         q_(parameters_ / 4096 + (parameters_ % 4096 != 0)), host_status_(q_)
@@ -190,6 +327,13 @@ private:
     finite_status_.reserve(q_);
     dot_.reserve(1);
     dot_status_.reserve(1);
+    if (energy)
+    {
+      energy_host_.resize(PreparedDeviceAdam::energyGradientRequiredBytes(parameters_) / sizeof(double));
+      energy_status_host_.resize(1);
+      energy_partials_.reserve(energy_host_.size());
+      energy_status_.reserve(1);
+    }
   }
 
   /// Charge five realP slots and independent finite/dot/status scratch exactly.
@@ -319,6 +463,10 @@ private:
   Cost cost_;
   const std::size_t parameters_, q_;
   DeviceBuffer<double> x_, r_, z_, p_, rhs_, partials_, dot_;
+  DeviceBuffer<double> energy_partials_;
+  DeviceBuffer<std::uint64_t> energy_status_;
+  std::vector<double> energy_host_;
+  std::vector<std::uint64_t> energy_status_host_;
   DeviceBuffer<DerivativeFiniteStatus> partial_status_, finite_status_, dot_status_;
   std::vector<DerivativeFiniteStatus> host_status_;
   double host_dot_ = 0;
