@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <array>
 
 namespace qmcplusplus::wftrain
 {
@@ -182,6 +183,24 @@ private:
   bool scalar_sums_complete_ = false;
   bool finalized_ = false;
 };
+
+/// Shared finite scalar/coefficients preparation; no parameter-shaped storage.
+struct PreparedEnergyCoefficients
+{
+  DerivativeReal weight_sum = 0, weighted_energy_norm_sum = 0;
+  DerivativeValue weighted_energy_sum = 0, clipped_weighted_energy_sum = 0;
+  std::size_t clipped_sample_count = 0;
+  std::vector<DerivativeValue> weighted_score_coefficients, energy_weighted_score_coefficients;
+
+  /// Preserve generic O/EO/T ordering; resident ENERGY explicitly reorders it.
+  std::array<VJPCoefficientChannel, 3> channels(const StreamingDerivativeOperator& derivative,
+                                             std::uint32_t local_energy_term_mask) const;
+};
+
+/// Reuse the ordinary estimator's checked weighted scalars and O(B) coefficients.
+PreparedEnergyCoefficients prepareEnergyCoefficients(const StreamingDerivativeOperator& derivative,
+    DerivativeArrayView<const DerivativeReal> weights, DerivativeArrayView<const DerivativeValue> energies,
+    EnergyGradientEstimator estimator, const EnergyClippingTransform* clipping = nullptr);
 
 /** Compose the three checked VJP channels required by one energy-gradient batch.
  *

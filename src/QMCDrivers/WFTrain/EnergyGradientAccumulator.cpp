@@ -428,13 +428,12 @@ std::size_t EnergyGradientAccumulator::retainedBytes() const noexcept
        weighted_energy_derivative_sum_.capacity());
 }
 
-void accumulateEnergyGradientBatch(
+/// Share the original finite scalar/coefficient loop across both consumers.
+PreparedEnergyCoefficients prepareEnergyCoefficients(
     const StreamingDerivativeOperator& derivative_operator,
     DerivativeArrayView<const DerivativeReal> weights,
     DerivativeArrayView<const DerivativeValue> local_energies,
-    std::uint32_t local_energy_term_mask,
-    EnergyGradientAccumulator& accumulator,
-    DerivativeAdjoint adjoint,
+    EnergyGradientEstimator estimator,
     const EnergyClippingTransform* clipping_transform)
 {
   if ((weights.size() != 0 && weights.data() == nullptr) ||
@@ -445,13 +444,11 @@ void accumulateEnergyGradientBatch(
   if (weights.size() != sample_count || local_energies.size() != sample_count)
     throw std::invalid_argument("Energy-gradient weights and energies must match the operator batch");
 
-  DerivativeReal weight_sum = 0.0;
-  DerivativeValue weighted_energy_sum = 0.0;
-  DerivativeReal weighted_energy_norm_sum = 0.0;
-  DerivativeValue clipped_weighted_energy_sum = 0.0;
-  std::size_t clipped_sample_count = 0;
-  std::vector<DerivativeValue> weighted_score_coefficients(sample_count);
-  std::vector<DerivativeValue> energy_weighted_score_coefficients(sample_count);
+  PreparedEnergyCoefficients result;
+  auto& [weight_sum, weighted_energy_norm_sum, weighted_energy_sum, clipped_weighted_energy_sum,
+         clipped_sample_count, weighted_score_coefficients, energy_weighted_score_coefficients] = result;
+  weighted_score_coefficients.resize(sample_count);
+  energy_weighted_score_coefficients.resize(sample_count);
   for (std::size_t sample = 0; sample < sample_count; ++sample)
   {
     requireFinite(weights[sample], "sample weight");
@@ -473,7 +470,7 @@ void accumulateEnergyGradientBatch(
     weighted_score_coefficients[sample] = weights[sample];
     energy_weighted_score_coefficients[sample] =
         weights[sample] *
-        (accumulator.estimator() == EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN
+        (estimator == EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN
              ? score_energy
              : DerivativeValue{std::real(score_energy), 0.0});
   }
@@ -481,7 +478,13 @@ void accumulateEnergyGradientBatch(
   requireFinite(weighted_energy_sum, "batch weighted energy sum");
   requireFinite(weighted_energy_norm_sum, "batch weighted energy norm sum");
   requireFinite(clipped_weighted_energy_sum, "batch clipped weighted energy sum");
+  return result;
+}
 
+/// Bind the same three algebraic products to exact sample/model provenance.
+std::array<VJPCoefficientChannel, 3> PreparedEnergyCoefficients::channels(
+    const StreamingDerivativeOperator& derivative_operator, std::uint32_t local_energy_term_mask) const
+{
   const StructuredParameterSchema& schema = derivative_operator.parameterSchema();
   const auto make_coefficients = [&](const std::vector<DerivativeValue>& values) {
     return CoefficientView{schema.providerId(), schema.fingerprint(),
@@ -491,7 +494,7 @@ void accumulateEnergyGradientBatch(
                            {values.data(), values.size()}};
   };
 
-  const std::array<VJPCoefficientChannel, 3> channels{{
+  return {{
       {EnergyGradientAccumulator::WEIGHTED_SCORE_CHANNEL, DerivativeProduct::SCORE_VJP,
        make_coefficients(weighted_score_coefficients), 0},
       {EnergyGradientAccumulator::ENERGY_WEIGHTED_SCORE_CHANNEL,
@@ -501,10 +504,20 @@ void accumulateEnergyGradientBatch(
        DerivativeProduct::LOCAL_ENERGY_VJP,
        make_coefficients(weighted_score_coefficients), local_energy_term_mask}}};
 
+}
+
+void accumulateEnergyGradientBatch(const StreamingDerivativeOperator& derivative_operator,
+    DerivativeArrayView<const DerivativeReal> weights, DerivativeArrayView<const DerivativeValue> local_energies,
+    std::uint32_t local_energy_term_mask, EnergyGradientAccumulator& accumulator,
+    DerivativeAdjoint adjoint, const EnergyClippingTransform* clipping_transform)
+{
+  const auto prepared = prepareEnergyCoefficients(derivative_operator, weights, local_energies,
+                                                 accumulator.estimator(), clipping_transform);
+  const auto channels = prepared.channels(derivative_operator, local_energy_term_mask);
   derivative_operator.applyVJPs({channels.data(), channels.size()}, adjoint, accumulator);
-  accumulator.addScalarSums(sample_count, weight_sum, weighted_energy_sum,
-                            weighted_energy_norm_sum, clipping_transform,
-                            clipped_weighted_energy_sum, clipped_sample_count);
+  accumulator.addScalarSums(derivative_operator.sampleCount(), prepared.weight_sum, prepared.weighted_energy_sum,
+      prepared.weighted_energy_norm_sum, clipping_transform,
+      prepared.clipped_weighted_energy_sum, prepared.clipped_sample_count);
 }
 
 } // namespace qmcplusplus::wftrain

@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace qmcplusplus::psiformer::device
 {
@@ -70,6 +71,20 @@ class FirstOrderOptimizer final : public TrainingUpdateRule,
                                   public OptimizerCheckpointContributor
 {
 public:
+  /// Scoped numeric callback; its producer leases must end before this returns.
+  using ResidentAdamConsumer = std::function<double(psiformer::device::PreparedDeviceAdam&,
+      double, double, double, double, double, std::vector<double>&)>;
+
+  /// Admit the optional small device/host norm capacities before sampling.
+  void prepareResidentAdamNorm(std::size_t bytes);
+
+  /// A distinct proposal contract, never an empty or synthetic host gradient.
+  StructuredParameterSnapshot proposeResidentAdam(const StructuredParameterSchema& schema,
+      const StructuredParameterSnapshot& parameters, const ResidentAdamConsumer& consume, double& norm);
+
+  /// Commit only after successful atomic provider publication.
+  void acceptResidentAdam() noexcept;
+
   FirstOrderOptimizer(const StructuredParameterSchema& schema,
                       FirstOrderOptimizerOptions options);
 
@@ -134,6 +149,10 @@ public:
   bool hasLiveProposal() const noexcept { return proposal_live_; }
 
 private:
+  /// Shared snapshot/schema/counter admission without any fabricated gradient.
+  void validateSnapshot(const StructuredParameterSchema& schema,
+                        const StructuredParameterSnapshot& parameters) const;
+
   /// Compact per-block update metadata avoids per-parameter configuration storage.
   struct BlockUpdate
   {

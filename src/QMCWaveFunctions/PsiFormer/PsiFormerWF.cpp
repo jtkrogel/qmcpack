@@ -1251,6 +1251,8 @@ public:
   /// Pretraining has no retained streaming snapshot to keep its lane alive.
   /// Cache one lane across orbital-loss calls; never one tape per walker/epoch.
   std::shared_ptr<PsiFormerDerivativeScratch> orbital_pretraining_scratch;
+  /// Explicit resident ENERGY keeps one existing lane/tapes alive across iterations.
+  std::shared_ptr<PsiFormerDerivativeScratch> resident_energy_adam_scratch;
 };
 
 /** Optimizer metadata shared by every clone of one PsiFormer component.
@@ -1993,6 +1995,7 @@ std::shared_ptr<PsiFormerDerivativeScratch> acquireDerivativeScratch(
 /** Bind immutable samples to one model version and exclusively leased scratch. */
 class PsiFormerStreamingDerivativeOperator final : public wftrain::StreamingDerivativeOperator
 {
+  friend class PsiFormerWF;
 public:
   static constexpr std::size_t MAXIMUM_VJP_CHANNELS = 3;
 
@@ -2218,15 +2221,24 @@ protected:
       wftrain::DerivativeAdjoint adjoint,
       wftrain::ParameterReductionSink& sink) const override
   {
+    evaluateVJPsImpl(channels, adjoint, &sink);
+  }
+
+  /// A terminal consumer shares physical arithmetic but bypasses host P emission.
+  void evaluateVJPsImpl(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink* sink,
+      const std::function<void(std::size_t)>& terminal = {}) const
+  {
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
       std::shared_lock state_lock(model_state_->mutex);
       requireBoundVersion();
-      for (std::size_t channel = 0; channel < channels.size(); ++channel)
-        std::fill(channel_accumulators_[channel].begin(),
-                  channel_accumulators_[channel].end(),
-                  wftrain::DerivativeValue{});
+      if (!terminal)
+        for (std::size_t channel = 0; channel < channels.size(); ++channel)
+          std::fill(channel_accumulators_[channel].begin(),
+                    channel_accumulators_[channel].end(),
+                    wftrain::DerivativeValue{});
 
       const bool needs_kinetic = std::any_of(
           channels.begin(), channels.end(), [](const auto& channel) {
@@ -2268,6 +2280,9 @@ protected:
       const bool retained_score_input = retained_coordinates_ && !needs_kinetic && !needs_ecp;
       const auto& contracted_channels = resident_kinetic ? device_channels : score_channels;
       const auto contracted_count = resident_kinetic ? device_channel_count : score_channel_count;
+      if (terminal && !resident_kinetic)
+        throw std::invalid_argument("Resident ENERGY requires the qualified fused kinetic traversal");
+      std::size_t contraction_generation = 0;
       psiformer::device::DeviceMemorySnapshot transfer_before;
       // The existing weighted reverse contracts one real channel. Exact API
       // coefficients determine eligibility; real parameters do not imply real
@@ -2286,7 +2301,9 @@ protected:
         // Explicit cold preparation may grow capacity. Repeated requests with
         // the same admitted channel count reuse it without allocation.
         session.prepareScoreContractions(contracted_count, parameter_version_);
-        session.beginScoreContraction(contracted_count, parameter_version_);
+        contraction_generation = session.beginScoreContraction(contracted_count, parameter_version_,
+            terminal ? psiformer::device::ScoreContractionRole::ENERGY_T_EO_O
+                     : psiformer::device::ScoreContractionRole::GENERIC);
       }
 #endif
 
@@ -2441,6 +2458,11 @@ protected:
       {
         auto& session = *shared_scratch_->device_products;
         session.finishScoreContraction(parameter_version_);
+        if (terminal)
+        {
+          terminal(contraction_generation);
+          return; // RAII releases BOTH source leases before caller publication.
+        }
         for (std::size_t slot = 0; slot < contracted_count; ++slot)
         {
           auto& destination = channel_accumulators_[contracted_channels[slot]];
@@ -2484,7 +2506,7 @@ protected:
       {
         const auto* values = channel_accumulators_[channel].data() +
             chunk.parameter_offset;
-        sink.add(channel,
+        sink->add(channel,
                  {chunk, {values, chunk.count}});
       }
   }
@@ -11834,6 +11856,107 @@ PsiFormerWF::LogValue PsiFormerWF::evaluateLogUnderRead(
   const pf::Result result = evaluatePositionsUnderRead(
       transaction, p, -1, nullptr, EvaluationPurpose::FULL_SPATIAL, -1);
   return scatter(result.sign, result.logabs, result.gradient, result.lap_log);
+}
+
+/// Parse only on an actual GPU provider; explicit zero/MAX are not an opt-in cap.
+std::size_t PsiFormerWF::residentEnergyAdamBudget() const
+{
+#ifdef ENABLE_CUDA
+  if (!model_state_->numerical_tile_backend)
+    return 0;
+  const char* value = std::getenv("PSIFORMER_GPU_RESIDENT_ENERGY_ADAM_BYTES");
+  if (!value) return 0;
+  std::size_t bytes = 0;
+  for (const char* digit = value; *digit; ++digit)
+  {
+    if (*digit < '0' || *digit > '9' || bytes > (std::numeric_limits<std::size_t>::max() - (*digit - '0')) / 10)
+      throw std::invalid_argument("Resident ENERGY Adam cap must be positive finite decimal bytes");
+    bytes = 10 * bytes + (*digit - '0');
+  }
+  if (!bytes || bytes == std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("Resident ENERGY Adam cap must be positive finite decimal bytes");
+  return bytes;
+#else
+  return 0;
+#endif
+}
+
+/// Admit C3+norm before either optional allocation, then retain exactly one lane.
+std::size_t PsiFormerWF::prepareResidentEnergyAdam(std::size_t budget) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  std::shared_ptr<PsiFormerDerivativeScratch> scratch;
+  std::size_t p = 0, c3 = 0, norm = 0;
+  {
+    std::shared_lock state_lock(model_state_->mutex);
+    const auto& environment = model_state_->execution_plan.environment();
+    if (!model_state_->numerical_tile_backend ||
+        model_state_->precision != psiformer::PsiFormerPrecisionPolicy::FP64_REFERENCE ||
+        environment.amplitude_scalar_domain != psiformer::ScalarDomain::REAL ||
+        environment.boundary != psiformer::BoundaryCondition::OPEN ||
+        std::any_of(environment.periodic_axes.begin(), environment.periodic_axes.end(), [](bool axis) { return axis; }))
+      throw std::invalid_argument("Resident ENERGY Adam requires ordinary real/open/FP64 GPU products");
+    p = structured_parameter_schema_->parameterCount();
+    c3 = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(p, 3);
+    norm = psiformer::device::PreparedDeviceAdam::energyGradientRequiredBytes(p);
+    if (!budget || budget == std::numeric_limits<std::size_t>::max() ||
+        checkedBatchMemoryAdd(c3, norm, "Resident ENERGY bridge") > budget)
+      throw std::length_error("Resident ENERGY C3+norm exceeds its explicit device bridge cap");
+    scratch = acquireDerivativeScratch(*model_state_, p, 4); // Factory never waits for execution.
+  }
+  // Match evaluation lock order: never wait for the lane while holding a model read.
+  PsiFormerDerivativeLease lease(*scratch);
+  std::shared_lock state_lock(model_state_->mutex);
+  scratch->device_products->prepareScoreContractions(3, model_state_->model.p.version(), c3);
+  app_log() << "Resident ENERGY bridge admitted: C3 device bytes=" << c3 << ", norm device bytes=" << norm
+            << ", C3 status host bytes=" << c3 - 48 * p << ", norm host bytes=" << norm
+            << "; cap covers C3+norm device payload ONLY; existing Adam, model/tapes, host compatibility/canonical/coefficients, sampling, vendor and checkpoints excluded" << std::endl;
+  std::lock_guard factory_lock(model_state_->derivative_scratch_factory_mutex);
+  model_state_->resident_energy_adam_scratch = std::move(scratch);
+  return norm;
+#else
+  throw std::invalid_argument("Resident ENERGY Adam requires a real GPU build");
+#endif
+}
+
+/// Keep the concrete source and both read leases scoped through Adam completion.
+double PsiFormerWF::consumeResidentEnergyAdam(const wftrain::StreamingDerivativeOperator& derivative,
+    wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+    psiformer::device::PreparedDeviceAdam& adam, const std::vector<double>& parameters,
+    double weight, double energy, double beta1, double beta2, double correction1, double correction2,
+    double epsilon, std::vector<double>& candidate) const
+{
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  const auto* source = dynamic_cast<const PsiFormerStreamingDerivativeOperator*>(&derivative);
+  if (!source || source->model_state_.get() != model_state_.get() ||
+      source->shared_scratch_ != model_state_->resident_energy_adam_scratch || derivative.sampleCount() < 7)
+    throw std::invalid_argument("Resident ENERGY requires this provider's current prepared batch");
+  (void)source->validateVJPRequest(channels, wftrain::DerivativeAdjoint::TRANSPOSE);
+  if (channels.size() != 3 || channels[0].product != wftrain::DerivativeProduct::LOCAL_ENERGY_VJP ||
+      channels[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+      channels[1].product != wftrain::DerivativeProduct::SCORE_VJP || channels[2].product != wftrain::DerivativeProduct::SCORE_VJP)
+    throw std::invalid_argument("Resident ENERGY requires this provider's current T/EO/O kinetic batch");
+  double norm = 0;
+  source->evaluateVJPsImpl(channels, wftrain::DerivativeAdjoint::TRANSPOSE, nullptr, [&](std::size_t generation) {
+    auto& session = *source->shared_scratch_->device_products;
+    const auto before = session.transferSnapshot(); // Seed/producer/finish/checkpoint traffic is OUTSIDE.
+    norm = session.consumeEnergyAdam(adam, derivative.parameterVersion(), generation,
+        parameters, weight, energy, beta1, beta2, correction1, correction2, epsilon, candidate);
+    const auto after = session.transferSnapshot();
+    app_log() << "Resident ENERGY terminal consumer: P=" << parameters.size()
+              << ", parameter_version=" << derivative.parameterVersion()
+              << ", uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
+              << ", downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes
+              << ", allocation_calls=" << after.allocation_calls - before.allocation_calls
+              << ", free_calls=" << after.free_calls - before.free_calls
+              << ", expected_uploaded_bytes=" << 8 * parameters.size()
+              << ", expected_downloaded_bytes=" << 8 * parameters.size() + adam.energyGradientDeviceBytes() + 16
+              << ", counter_scope=device_wide, seed_producer_checkpoint_excluded=yes" << std::endl;
+  });
+  return norm;
+#else
+  throw std::invalid_argument("Resident ENERGY Adam requires a real GPU build");
+#endif
 }
 
 /// Expose only the resolved budget; CPU never reads GPU optimizer controls.

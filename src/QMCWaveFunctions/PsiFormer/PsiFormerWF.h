@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+namespace qmcplusplus::psiformer::device { class PreparedDeviceAdam; }
+
 namespace pf
 {
 /// Native PsiFormer evaluator shared by QMCPACK component clones.
@@ -460,6 +462,19 @@ public:
 
   /// Query the GPU-only per-optimizer Adam budget without exposing a model image.
   std::size_t deviceAdamBudget() const;
+
+  /// Explicit numerical bridge cap; CPU profiles do not read its control.
+  std::size_t residentEnergyAdamBudget() const;
+
+  /// Retain one shared lane and admit C3; return separately charged norm bytes.
+  std::size_t prepareResidentEnergyAdam(std::size_t budget) const;
+
+  /// Consume one bound physical batch synchronously; no device views escape.
+  double consumeResidentEnergyAdam(const wftrain::StreamingDerivativeOperator& derivative,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
+      psiformer::device::PreparedDeviceAdam& adam, const std::vector<double>& parameters,
+      double weight, double energy, double beta1, double beta2, double correction1, double correction2,
+      double epsilon, std::vector<double>& candidate) const;
 
   /// Advance injected native-engine substeps; host full VGL must follow before use.
   std::pair<std::size_t, std::size_t> mw_advanceDeviceSampling(

@@ -658,6 +658,10 @@ public:
                            SampleProductSink& sink) const;
 
 protected:
+  /// Reuse identical admission for concrete scoped resident consumers.
+  DerivativeStreamDescriptor validateVJPRequest(DerivativeArrayView<const VJPCoefficientChannel> channels,
+                                               DerivativeAdjoint adjoint) const;
+
   /// Emit chunk-major/channel-minor VJP results after common preflight succeeds.
   virtual void evaluateVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
                             DerivativeAdjoint adjoint,

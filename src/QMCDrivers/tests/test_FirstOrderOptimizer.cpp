@@ -798,6 +798,76 @@ TEST_CASE("Device Adam preserves production selection, accepted moments and chec
     restored.proposalRejected();
   }
 }
+
+TEST_CASE("Resident Adam callback preserves candidate-only transaction boundaries",
+          "[drivers][training][optimizer][resident_adam]")
+{
+  using namespace psiformer::device;
+  int devices = 0;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != success || !devices)
+    SKIP("No usable HIP device for resident Adam callback");
+#else
+  if (cudaGetDeviceCount(&devices) != success || !devices)
+    SKIP("No usable CUDA device for resident Adam callback");
+#endif
+  OptimizerToyProvider provider;
+  const auto& schema = provider.parameterSchema();
+  const auto parameters = provider.snapshotParameters();
+  FirstOrderOptimizer optimizer(schema, makeOptions(FirstOrderMethod::ADAM));
+  optimizer.prepareDeviceAdam(estimateAdamBytes(4, 3));
+  const auto base = optimizer.retainedBytes(), norm_bytes = PreparedDeviceAdam::energyGradientRequiredBytes(4);
+  CHECK_THROWS_AS(optimizer.prepareResidentAdamNorm(norm_bytes - 1), std::length_error);
+  CHECK(optimizer.retainedBytes() == base);
+  optimizer.prepareResidentAdamNorm(norm_bytes);
+  CHECK(optimizer.retainedBytes() == base + 2 * norm_bytes);
+  // Inject only the numeric callback boundary; physical no-gradient transfers are
+  // independently covered by the actual ProductSession/XML route, not this toy.
+  const std::vector<double> gradient{1, -2, .5, 9};
+  double norm = -1;
+  bool fail_after_numeric = false;
+  const auto consume = [&](auto& adam, double b1, double b2, double c1, double c2, double eps, auto& candidate) {
+    adam.propose(parameters.values, gradient.data(), b1, b2, c1, c2, eps, candidate);
+    if (fail_after_numeric)
+      throw std::runtime_error("Injected completed numeric producer failure");
+    return std::sqrt(1 + 4 + .25 + 81);
+  };
+  auto wrong = parameters;
+  wrong.schema_fingerprint = "wrong";
+  CHECK_THROWS_AS(optimizer.proposeResidentAdam(schema, wrong, consume, norm), std::invalid_argument);
+  fail_after_numeric = true;
+  CHECK_THROWS_AS(optimizer.proposeResidentAdam(schema, parameters, consume, norm), std::runtime_error);
+  CHECK(optimizer.acceptedUpdateCount() == 0);
+  CHECK(optimizer.firstMoment() == std::vector<double>(4));
+  fail_after_numeric = false;
+  CHECK_THROWS_AS(optimizer.proposeResidentAdam(schema, parameters,
+      [&](auto& adam, double b1, double b2, double c1, double c2, double eps, auto& values) {
+        consume(adam, b1, b2, c1, c2, eps, values);
+        return std::numeric_limits<double>::quiet_NaN();
+      }, norm), std::invalid_argument);
+  auto candidate = optimizer.proposeResidentAdam(schema, parameters, consume, norm);
+  CHECK(norm == Catch::Approx(std::sqrt(86.25)));
+  auto invalid = candidate;
+  invalid.values.back() += 1;
+  CHECK_THROWS_AS(validateTrainingCandidate(schema, parameters, invalid), std::invalid_argument);
+  optimizer.proposalRejected();
+  candidate = optimizer.proposeResidentAdam(schema, parameters, consume, norm);
+  validateTrainingCandidate(schema, parameters, candidate);
+  provider.rejectNextPublish();
+  CHECK_THROWS_AS(provider.publishParameters(candidate, parameters.version), std::runtime_error);
+  optimizer.proposalRejected();
+  CHECK(provider.snapshotParameters().values == parameters.values);
+  CHECK(optimizer.acceptedUpdateCount() == 0);
+  CHECK(optimizer.firstMoment() == std::vector<double>(4));
+  candidate = optimizer.proposeResidentAdam(schema, parameters, consume, norm);
+  validateTrainingCandidate(schema, parameters, candidate);
+  provider.publishParameters(candidate, parameters.version);
+  optimizer.acceptResidentAdam();
+  CHECK(optimizer.acceptedUpdateCount() == 1);
+  CHECK(optimizer.firstMoment().back() == 0);
+  CHECK(optimizer.secondMoment().back() == 0);
+  CHECK_FALSE(optimizer.checkpointMetadata().state_fingerprint.empty());
+}
 #endif
 
 } // namespace qmcplusplus::wftrain

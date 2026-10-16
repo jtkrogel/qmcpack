@@ -319,9 +319,9 @@ const std::vector<double>& FirstOrderOptimizer::secondMoment() const
   return second_moment_;
 }
 
-void FirstOrderOptimizer::validateInputs(const StructuredParameterSchema& schema,
-                                         const StructuredParameterSnapshot& parameters,
-                                         ParameterGradientView objective) const
+/// Admit the common binding independently of where the gradient is evaluated.
+void FirstOrderOptimizer::validateSnapshot(const StructuredParameterSchema& schema,
+                                           const StructuredParameterSnapshot& parameters) const
 {
   if (proposal_live_)
     throw std::logic_error("First-order optimizer already has a live proposal");
@@ -331,19 +331,84 @@ void FirstOrderOptimizer::validateInputs(const StructuredParameterSchema& schema
   if (parameters.schema_fingerprint != schema_fingerprint_ ||
       parameters.values.size() != parameter_count_)
     throw std::invalid_argument("First-order optimizer parameter snapshot is incompatible");
+  if (!std::all_of(parameters.values.begin(), parameters.values.end(), isFiniteDouble))
+    throw std::invalid_argument("First-order optimizer inputs must be finite");
+  if (accepted_update_count_ == std::numeric_limits<std::uint64_t>::max())
+    throw std::overflow_error("First-order optimizer update count overflow");
+}
+
+void FirstOrderOptimizer::validateInputs(const StructuredParameterSchema& schema,
+                                         const StructuredParameterSnapshot& parameters,
+                                         ParameterGradientView objective) const
+{
+  validateSnapshot(schema, parameters);
   if (objective.schema_fingerprint != schema_fingerprint_ ||
       objective.parameter_version != parameters.version ||
       objective.gradient.size() != parameter_count_)
     throw std::invalid_argument("First-order optimizer objective is incompatible");
   if (objective.reduction_domain != ReductionDomain::GLOBAL)
     throw std::invalid_argument("First-order optimizer requires a globally reduced objective");
-  if (!std::all_of(parameters.values.begin(), parameters.values.end(),
-                   [](double value) { return isFiniteDouble(value); }) ||
-      !std::all_of(objective.gradient.begin(), objective.gradient.end(),
+  if (!std::all_of(objective.gradient.begin(), objective.gradient.end(),
                    [](double value) { return isFiniteDouble(value); }))
     throw std::invalid_argument("First-order optimizer inputs must be finite");
-  if (accepted_update_count_ == std::numeric_limits<std::uint64_t>::max())
-    throw std::overflow_error("First-order optimizer update count overflow");
+}
+
+/// Admit only optional small norm storage; the base device Adam remains unchanged.
+void FirstOrderOptimizer::prepareResidentAdamNorm(std::size_t bytes)
+{
+#ifdef ENABLE_CUDA
+  if (!device_adam_ || proposal_live_)
+    throw std::invalid_argument("Resident ENERGY requires prepared idle device Adam");
+  if (psiformer::device::PreparedDeviceAdam::energyGradientRequiredBytes(parameter_count_) >
+      (std::numeric_limits<std::size_t>::max() - retainedBytes()) / 2)
+    throw std::overflow_error("Resident ENERGY norm host/device accounting overflow");
+  device_adam_->prepareEnergyGradient(bytes);
+#else
+  throw std::invalid_argument("Resident ENERGY Adam is not compiled");
+#endif
+}
+
+/// Complete a resident numeric proposal without inventing a ParameterGradientView.
+StructuredParameterSnapshot FirstOrderOptimizer::proposeResidentAdam(const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot& parameters, const ResidentAdamConsumer& consume, double& norm)
+{
+  validateSnapshot(schema, parameters);
+#ifdef ENABLE_CUDA
+  if (!device_adam_ || options_.method != FirstOrderMethod::ADAM || !consume)
+    throw std::invalid_argument("Resident ENERGY requires real device Adam and a scoped producer");
+  auto candidate = parameters;
+  try
+  {
+    if (!device_adam_->seeded())
+      device_adam_->seed(first_moment_, second_moment_);
+    norm = consume(*device_adam_, options_.adam_beta1, options_.adam_beta2,
+        oneMinusPower(options_.adam_beta1, accepted_update_count_ + 1),
+        oneMinusPower(options_.adam_beta2, accepted_update_count_ + 1), options_.epsilon, candidate.values);
+    if (!isFiniteDouble(norm) || norm < 0)
+      throw std::invalid_argument("Resident ENERGY gradient norm is invalid");
+    proposal_live_ = true;
+    return candidate;
+  }
+  catch (...)
+  {
+    proposalRejected();
+    throw;
+  }
+#else
+  throw std::invalid_argument("Resident ENERGY Adam is not compiled");
+#endif
+}
+
+/// The provider has published; no runtime calls or fallible operations remain.
+void FirstOrderOptimizer::acceptResidentAdam() noexcept
+{
+#ifdef ENABLE_CUDA
+  assert(device_adam_ && proposal_live_);
+  device_adam_->accept();
+  moment_mirrors_stale_ = true;
+  ++accepted_update_count_;
+  proposal_live_ = false;
+#endif
 }
 
 StructuredParameterSnapshot FirstOrderOptimizer::propose(
@@ -479,8 +544,8 @@ void FirstOrderOptimizer::proposalAccepted(const StructuredParameterSchema& sche
 #ifdef ENABLE_CUDA
   if (device_adam_)
   {
-    device_adam_->accept();
-    moment_mirrors_stale_ = true;
+    acceptResidentAdam();
+    return;
   }
   else
 #endif
@@ -503,7 +568,8 @@ std::size_t FirstOrderOptimizer::retainedBytes() const noexcept
   const auto host = (first_moment_.capacity() + second_moment_.capacity() +
                     maximum_second_moment_.capacity()) * sizeof(double);
 #ifdef ENABLE_CUDA
-  return host + (device_adam_ ? device_adam_->deviceBytes() : 0);
+  return host + (device_adam_ ? device_adam_->deviceBytes() + device_adam_->energyGradientDeviceBytes() +
+      device_adam_->energyGradientHostBytes() : 0);
 #else
   return host;
 #endif

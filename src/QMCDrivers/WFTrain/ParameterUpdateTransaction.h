@@ -19,6 +19,10 @@
 
 namespace qmcplusplus::wftrain
 {
+/// Shared candidate-only admission; never fabricates or validates a host gradient.
+void validateTrainingCandidate(const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot& parameters, const StructuredParameterSnapshot& candidate);
+
 
 /// Convert one finalized gradient into a complete candidate parameter snapshot.
 class TrainingUpdateRule

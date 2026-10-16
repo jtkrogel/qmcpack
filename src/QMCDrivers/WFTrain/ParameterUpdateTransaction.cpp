@@ -20,6 +20,24 @@
 namespace qmcplusplus::wftrain
 {
 
+/// Admit every candidate lane and frozen tensor before model publication.
+void validateTrainingCandidate(const StructuredParameterSchema& schema,
+    const StructuredParameterSnapshot& parameters, const StructuredParameterSnapshot& candidate)
+{
+  if (parameters.schema_fingerprint != schema.fingerprint() || parameters.values.size() != schema.parameterCount())
+    throw std::invalid_argument("Training parameter snapshot is incompatible");
+  if (candidate.schema_fingerprint != schema.fingerprint() || candidate.version != parameters.version ||
+      candidate.values.size() != schema.parameterCount())
+    throw std::invalid_argument("Training update rule returned an incompatible candidate snapshot");
+  if (!std::all_of(candidate.values.begin(), candidate.values.end(), isFiniteTrainingReal))
+    throw std::invalid_argument("Training update rule returned a non-finite candidate snapshot");
+  for (const ParameterBlockDescriptor& block : schema.blocks())
+    if (!block.trainable)
+      for (std::size_t parameter = block.offset; parameter < block.offset + block.count; ++parameter)
+        if (candidate.values[parameter] != parameters.values[parameter])
+          throw std::invalid_argument("Training update rule modified frozen parameter block " + block.id);
+}
+
 std::size_t completeParameterUpdate(
     StructuredParameterProvider& provider,
     const StructuredParameterSnapshot& parameters,
@@ -54,22 +72,7 @@ std::size_t completeParameterUpdate(
     proposal_started = true;
     candidate.emplace(update_rule.propose(schema, parameters, objective));
     proposal_live = true;
-    if (candidate->schema_fingerprint != schema.fingerprint() ||
-        candidate->version != parameters.version ||
-        candidate->values.size() != schema.parameterCount())
-      throw std::invalid_argument("Training update rule returned an incompatible candidate snapshot");
-    if (!std::all_of(candidate->values.begin(), candidate->values.end(),
-                     isFiniteTrainingReal))
-      throw std::invalid_argument("Training update rule returned a non-finite candidate snapshot");
-
-    // Frozen tensors are a schema invariant rather than an update-rule convention.
-    for (const ParameterBlockDescriptor& block : schema.blocks())
-      if (!block.trainable)
-        for (std::size_t parameter = block.offset; parameter < block.offset + block.count;
-             ++parameter)
-          if (candidate->values[parameter] != parameters.values[parameter])
-            throw std::invalid_argument("Training update rule modified frozen parameter block " +
-                                        block.id);
+    validateTrainingCandidate(schema, parameters, *candidate);
   }
   catch (...)
   {

@@ -64,6 +64,8 @@ private:
   TrialWaveFunction& student_prototype_;
   std::string selected_provider_id_;
   wftrain::StructuredParameterProvider* selected_provider_ = nullptr;
+  /// Resolved once during pre-draw process admission, never re-read mid-run.
+  std::size_t resident_adam_budget_ = 0, resident_norm_bytes_ = 0;
 
   /// Student clones aligned one-for-one with the frozen-teacher crowd ParticleSets.
   std::vector<UPtrVector<TrialWaveFunction>> overlap_student_twfs_;

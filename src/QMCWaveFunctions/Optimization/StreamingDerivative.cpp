@@ -588,9 +588,9 @@ bool StreamingDerivativeCapabilities::coversLocalEnergyTerms(std::uint32_t reque
   return (local_energy_term_mask & requested_terms) == requested_terms;
 }
 
-void StreamingDerivativeOperator::applyVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
-                                             DerivativeAdjoint adjoint,
-                                             ParameterReductionSink& sink) const
+/// Preserve identical channel/schema/finite admission without starting a host sink.
+DerivativeStreamDescriptor StreamingDerivativeOperator::validateVJPRequest(
+    DerivativeArrayView<const VJPCoefficientChannel> channels, DerivativeAdjoint adjoint) const
 {
   if (channels.empty() || !hasValidStorage(channels))
     throw std::invalid_argument("Streaming VJP requires at least one valid coefficient channel");
@@ -661,7 +661,15 @@ void StreamingDerivativeOperator::applyVJPs(DerivativeArrayView<const VJPCoeffic
                                         support.maximum_parameter_chunk_size,
                                         support.maximum_sample_tile_size};
 
-  sink.begin(descriptor, plan, channels);
+  return descriptor;
+}
+
+void StreamingDerivativeOperator::applyVJPs(DerivativeArrayView<const VJPCoefficientChannel> channels,
+                                             DerivativeAdjoint adjoint,
+                                             ParameterReductionSink& sink) const
+{
+  const auto descriptor = validateVJPRequest(channels, adjoint);
+  sink.begin(descriptor, parameterChunkPlan(), channels);
   try
   {
     if (sampleCount() == 0)

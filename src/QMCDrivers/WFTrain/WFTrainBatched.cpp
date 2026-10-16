@@ -452,6 +452,13 @@ std::uint32_t completeLocalEnergyTermMask(
   return expected_mask;
 }
 
+/// Scalar-only diagnostics are distinct from a host parameter-gradient objective.
+struct ResidentEnergyDiagnostics
+{
+  std::size_t samples = 0;
+  double mean = 0, variance = 0, gradient_norm = 0;
+};
+
 /** Return the Euclidean norm of a real parameter gradient. */
 double gradientNorm(const std::vector<wftrain::DerivativeReal>& gradient)
 {
@@ -864,10 +871,13 @@ std::string stageConfigurationFingerprint(const WFTrainDriverInput& training,
                                           const wftrain::StructuredParameterSchema& schema,
                                           std::size_t steps_per_block,
                                           std::uint64_t resolved_overlap_fingerprint,
-                                          const std::string& complex_physical_identity = {})
+                                          const std::string& complex_physical_identity = {},
+                                          bool resident_energy_adam = false)
 {
   std::uint64_t hash = UINT64_C(1469598103934665603);
   extendStageFingerprint(hash, schema.fingerprint());
+  if (resident_energy_adam)
+    extendStageFingerprint(hash, std::string("resident-energy-c3-adam-v1"));
   if (!complex_physical_identity.empty())
     extendStageFingerprint(hash, complex_physical_identity);
   const auto objective = static_cast<std::underlying_type_t<WFTrainDriverInput::Objective>>(
@@ -1072,6 +1082,37 @@ void WFTrainBatched::process(xmlNodePtr node)
                                               qmcdriver_input_.get_requested_steps(),
                                               qmcdriver_input_.get_max_blocks());
     initPopulationAndCrowds(walker_counts);
+    const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+    resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
+    if (resident_adam_budget_)
+    {
+      if (myComm->size() != 1 || crowds_.size() != 1 || crowds_.front()->size() < 7 ||
+          qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1 ||
+          student_prototype_.getOrbitals().size() != 1 ||
+          training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+          training_input_.getOptimizer() != WFTrainDriverInput::Optimizer::ADAM ||
+          training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+          training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
+          training_input_.getMaximumUpdateNorm() != 0 || training_input_.getMaximumMetricNorm() != 0 ||
+          !device_provider->deviceAdamBudget())
+        throw UniformCommunicateError("Resident ENERGY Adam requires sole real/open/FP64 GPU Adam, rank/crowd/blocks/steps=1, B>=7, fixed unmodified step and both caps");
+      auto& hamiltonian = population_.get_golden_hamiltonian();
+      if (hamiltonian.size() < 2)
+        throw UniformCommunicateError("Resident ENERGY Adam requires an actual Coulomb Hamiltonian");
+      std::size_t kinetic_count = 0;
+      for (int term = 0; term < hamiltonian.size(); ++term)
+      {
+        const auto name = hamiltonian.getComponent(term)->getClassName();
+        if (name == "BareKineticEnergy")
+          ++kinetic_count;
+        else if (name != "CoulombPotential")
+          throw UniformCommunicateError("Resident ENERGY Adam supports only the actual selected open Coulomb Hamiltonian");
+      }
+      if (kinetic_count != 1)
+        throw UniformCommunicateError("Resident ENERGY Adam requires exactly one physical kinetic operator");
+      resident_norm_bytes_ = device_provider->prepareResidentEnergyAdam(resident_adam_budget_);
+    }
+    // ContextForSteps only borrows an RNG reference; all MC draws follow admission.
     createStepContexts(crowds_.size());
     initializeDeterminantOverlap();
     // Target construction clones SPOs and may allocate differently on each rank.
@@ -1108,6 +1149,8 @@ void WFTrainBatched::run()
   if (selected_provider_ == nullptr)
     throw UniformCommunicateError("WFTrainBatched: process() must select a provider before run()");
 
+  const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
+  const auto resident_adam_budget = resident_adam_budget_, resident_norm_bytes = resident_norm_bytes_;
   const IndexType num_blocks = qmcdriver_input_.get_max_blocks();
   const int num_iterations = static_cast<int>(training_input_.getIterations());
   bool complex_training = false;
@@ -1205,7 +1248,6 @@ void WFTrainBatched::run()
     throw UniformCommunicateError(
         "WFTrainBatched: selected provider returned an inconsistent initial snapshot");
   std::unique_ptr<wftrain::FirstOrderOptimizer> first_order_optimizer;
-  const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
   if (!device_provider && selected_provider_->usesAcceleratorParameterProducts())
     if (const char* value = std::getenv("PSIFORMER_GPU_ADAM_BYTES"))
     {
@@ -1228,6 +1270,13 @@ void WFTrainBatched::run()
         makeFirstOrderOptions(selected_provider_->parameterSchema(), training_input_));
   if (device_adam_budget)
     first_order_optimizer->prepareDeviceAdam(device_adam_budget);
+  if (resident_adam_budget)
+  {
+    first_order_optimizer->prepareResidentAdamNorm(resident_norm_bytes);
+    app_log() << "Resident ENERGY Adam bridge device cap(C3+norm only)=" << resident_adam_budget
+              << ", norm device bytes=" << resident_norm_bytes << ", norm host bytes=" << resident_norm_bytes
+              << "; existing derivative tapes/host compatibility channels retained once, not eliminated; not a process feasibility budget" << std::endl;
+  }
   std::unique_ptr<wftrain::SPRINGUpdateRule> spring_optimizer;
   if (training_input_.getOptimizer() == WFTrainDriverInput::Optimizer::SPRING)
     spring_optimizer = std::make_unique<wftrain::SPRINGUpdateRule>(
@@ -1261,7 +1310,7 @@ void WFTrainBatched::run()
       0, 0,
       stageConfigurationFingerprint(training_input_, qmcdriver_input_, vmcdriver_input_,
                                     selected_provider_->parameterSchema(), steps_per_block_,
-                                    overlap_fingerprint, complex_physical_identity)};
+                                    overlap_fingerprint, complex_physical_identity, resident_adam_budget != 0)};
   DirtyCacheObserver cache_observer;
 
   LoopTimer<> training_loop;
@@ -1423,6 +1472,7 @@ void WFTrainBatched::run()
 
     const double sampling_seconds = iteration_wall.elapsed();
     wftrain::TrainingIterationResult iteration_result;
+    std::optional<ResidentEnergyDiagnostics> resident_diagnostics;
     wftrain::PreparedEnergyGradientStorageDiagnostics storage_diagnostics;
     std::size_t retained_numeric_bytes = 0;
     std::optional<std::size_t> krylov_iterations;
@@ -1737,7 +1787,68 @@ void WFTrainBatched::run()
             throw UniformCommunicateError(
                 "WFTrainBatched: First-order methods and parameter-space SR require at least one walker on every rank");
         }
-        if (isFirstOrder(optimizer_kind))
+        if (resident_adam_budget)
+        {
+          const auto parameters = selected_provider_->snapshotParameters();
+          const auto& schema = selected_provider_->parameterSchema();
+          if (batches.size() != 1 || batches[0].weights.size() < 7 || batches[0].additive_local_energy_vjp ||
+              batches[0].local_energy_term_mask != wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC) ||
+              training_state.schema_fingerprint != schema.fingerprint() || training_state.parameter_version != parameters.version ||
+              training_state.completed_iterations == std::numeric_limits<std::size_t>::max())
+            throw std::invalid_argument("Resident ENERGY requires one current complete physical kinetic batch/state");
+          const auto& batch = batches.front();
+          for (const auto energy : batch.local_energies)
+            if (energy.imag() != 0)
+              throw std::invalid_argument("Resident ENERGY requires real physical local energies");
+          const auto coefficients = wftrain::prepareEnergyCoefficients(*batch.derivative_operator,
+              {batch.weights.data(), batch.weights.size()}, {batch.local_energies.data(), batch.local_energies.size()},
+              wftrain::EnergyGradientEstimator::SYMMETRIZED_HAMILTONIAN);
+          if (coefficients.weight_sum <= 0)
+            throw std::invalid_argument("Resident ENERGY requires positive total sample weight");
+          const auto generic = coefficients.channels(*batch.derivative_operator, batch.local_energy_term_mask);
+          const std::array<wftrain::VJPCoefficientChannel, 3> channels{{generic[2], generic[1], generic[0]}}; // T/EO/O
+          auto pending = training_state; // Fallible fingerprint copy precedes proposal/publication.
+          ++pending.completed_iterations;
+          resident_diagnostics.emplace(ResidentEnergyDiagnostics{batch.weights.size(),
+              (coefficients.weighted_energy_sum / coefficients.weight_sum).real(), 0, 0});
+          resident_diagnostics->variance = std::max(0.0, coefficients.weighted_energy_norm_sum / coefficients.weight_sum -
+              std::norm(coefficients.weighted_energy_sum / coefficients.weight_sum));
+          if (!wftrain::isFiniteTrainingReal(resident_diagnostics->mean) ||
+              !wftrain::isFiniteTrainingReal(resident_diagnostics->variance))
+            throw std::invalid_argument("Resident ENERGY scalar diagnostics are nonfinite");
+          storage_diagnostics = preparedStorageDiagnostics(batches);
+          retained_numeric_bytes = checkedMemoryAdd(storage_diagnostics.retained_numeric_bytes, first_order_optimizer->retainedBytes());
+          enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
+          try
+          {
+            const auto candidate = first_order_optimizer->proposeResidentAdam(schema, parameters,
+                [&](auto& adam, double b1, double b2, double c1, double c2, double epsilon, auto& values) {
+                  return device_provider->consumeResidentEnergyAdam(*batch.derivative_operator,
+                      {channels.data(), channels.size()}, adam, parameters.values, coefficients.weight_sum,
+                      resident_diagnostics->mean, b1, b2, c1, c2, epsilon, values);
+                }, resident_diagnostics->gradient_norm);
+            // Both producer leases have ended; only an owning host candidate remains.
+            wftrain::validateTrainingCandidate(schema, parameters, candidate);
+            for (std::size_t p = 0; p < candidate.values.size(); ++p)
+              selected_displacement_norm = std::hypot(selected_displacement_norm, candidate.values[p] - parameters.values[p]);
+            if (!wftrain::isFiniteTrainingReal(selected_displacement_norm))
+              throw std::overflow_error("Resident ENERGY candidate displacement norm is nonfinite");
+            pending.parameter_version = selected_provider_->publishParameters(candidate, parameters.version);
+          }
+          catch (...)
+          {
+            first_order_optimizer->proposalRejected();
+            throw;
+          }
+          first_order_optimizer->acceptResidentAdam();
+          training_state.completed_iterations = pending.completed_iterations;
+          training_state.parameter_version = pending.parameter_version;
+          training_state.schema_fingerprint.swap(pending.schema_fingerprint);
+          cache_observer.parametersPublished(training_state.parameter_version);
+          iteration_result.completed_iteration = training_state.completed_iterations;
+          iteration_result.parameter_version = training_state.parameter_version;
+        }
+        else if (isFirstOrder(optimizer_kind))
         {
           std::unique_ptr<wftrain::PreparedEnergyGradientProducer> producer;
           std::exception_ptr producer_failure;
@@ -2119,6 +2230,9 @@ void WFTrainBatched::run()
                   << " gradient_norm "
                   << gradientNorm(overlap_diagnostics->parameter_gradient);
       }
+      else if (resident_diagnostics)
+        app_log() << " samples " << resident_diagnostics->samples << " mean_energy " << resident_diagnostics->mean
+                  << " variance " << resident_diagnostics->variance << " gradient_norm " << resident_diagnostics->gradient_norm;
       else
       {
         const auto& objective = iteration_result.objective;
@@ -2159,6 +2273,9 @@ void WFTrainBatched::run()
       else if (overlap_diagnostics)
         iteration_history << overlap_diagnostics->sample_count << ",,,,"
                           << overlap_diagnostics->loss;
+      else if (resident_diagnostics)
+        iteration_history << resident_diagnostics->samples << ',' << resident_diagnostics->mean << ','
+                          << resident_diagnostics->variance << ',' << resident_diagnostics->gradient_norm << ',';
       else
         iteration_history << iteration_result.objective.sample_count << ','
                           << std::real(iteration_result.objective.mean_energy) << ','
