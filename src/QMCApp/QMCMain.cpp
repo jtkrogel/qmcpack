@@ -151,6 +151,28 @@ QMCMain::~QMCMain()
   CloneManager::clearClones();
 }
 
+void QMCMain::configureTimerLevel(const std::optional<std::string>& command_line_level)
+{
+  if (xml_doc_stack_.empty())
+    return;
+  OhmmsXPathObject projects("//project", xml_doc_stack_.top()->getXPathContext());
+  if (projects.empty())
+    return;
+  const auto level = ProjectData::readTimerLevel(projects[0]);
+  if (!level)
+    return;
+  if (command_line_level && *command_line_level != *level)
+    app_log() << "  Project timer_level=" << *level << " overrides --enable-timers=" << *command_line_level
+              << std::endl;
+#ifndef ENABLE_TIMERS
+  app_warning() << "The project timer_level parameter will have no effect. This executable was built without "
+                   "ENABLE_TIMERS set."
+                << std::endl;
+#endif
+  getGlobalTimerManager().set_timer_threshold(*level);
+  app_log() << "  Project timer_level: " << *level << std::endl;
+}
+
 bool QMCMain::execute()
 {
   Timer t0;

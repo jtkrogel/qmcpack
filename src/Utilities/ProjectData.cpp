@@ -158,6 +158,7 @@ void ProjectData::reset()
 
 bool ProjectData::put(xmlNodePtr cur)
 {
+  timer_level_ = readTimerLevel(cur);
   cur_   = cur;
   title_ = getXMLAttributeValue(cur, "id");
   const std::string series_str(getXMLAttributeValue(cur, "series"));
@@ -205,6 +206,28 @@ bool ProjectData::put(xmlNodePtr cur)
   }
   reset();
   return true;
+}
+
+std::optional<std::string> ProjectData::readTimerLevel(xmlNodePtr project)
+{
+  std::optional<std::string> level;
+  for (xmlNodePtr node = project ? project->children : nullptr; node; node = node->next)
+  {
+    if (node->type != XML_ELEMENT_NODE || !xmlStrEqual(node->name, BAD_CAST "parameter") ||
+        getXMLAttributeValue(node, "name") != "timer_level")
+      continue;
+    if (level)
+      throw UniformCommunicateError("Duplicate project parameter: timer_level");
+    const std::string content = XMLNodeString(node);
+    const auto first = content.find_first_not_of(" \t\r\n");
+    const auto last  = content.find_last_not_of(" \t\r\n");
+    const std::string value = first == std::string::npos ? "" : content.substr(first, last - first + 1);
+    if (value != "none" && value != "coarse" && value != "medium" && value != "fine")
+      throw UniformCommunicateError("Invalid project timer_level '" + value +
+                                    "': expected none, coarse, medium, or fine");
+    level = value;
+  }
+  return level;
 }
 
 const std::string& ProjectData::getTitle() const noexcept { return title_; }

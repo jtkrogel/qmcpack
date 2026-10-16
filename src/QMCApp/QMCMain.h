@@ -41,6 +41,8 @@ public:
 
   bool validateXML() override;
   bool execute() override;
+  /// Apply project timers after parsing, before any execution timer starts.
+  void configureTimerLevel(const std::optional<std::string>& command_line_level);
 
   ParticleSetPool& getParticlePool() { return *particle_set_pool_; }
 

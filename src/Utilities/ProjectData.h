@@ -18,6 +18,7 @@
 #define QMCPLUSPLUS_PROJECTDATA_H__
 
 #include <unordered_map>
+#include <optional>
 #include "OhmmsData/libxmldefs.h"
 #include "Message/Communicate.h"
 #include "Utilities/RuntimeOptions.h"
@@ -63,6 +64,9 @@ public:
   bool get(std::ostream& os) const;
   bool put(std::istream& is);
   bool put(xmlNodePtr cur);
+  /// Validate the optional project timer parameter without changing the XML or timer manager.
+  static std::optional<std::string> readTimerLevel(xmlNodePtr project);
+  const std::optional<std::string>& getTimerLevel() const noexcept { return timer_level_; }
   void reset();
 
   ///increment a series number and reset project_root_
@@ -140,6 +144,8 @@ private:
 
   // The driver version of the project
   DriverVersion driver_version_;
+
+  std::optional<std::string> timer_level_;
 
   // tracks runtime options for the project: mixed precision, complex
   RuntimeOptions runtime_options_;

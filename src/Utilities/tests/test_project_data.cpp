@@ -9,6 +9,7 @@
 // File created by: Mark Dewing, mdewing@anl.gov, Argonne National Laboratory
 //////////////////////////////////////////////////////////////////////////////////////
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 
 
 #include "OhmmsData/Libxml2Doc.h"
@@ -151,6 +152,64 @@ TEST_CASE("ProjectData::TestIsComplex", "[ohmmsapp]")
 #else
   REQUIRE(!proj.isComplex());
 #endif
+}
+
+TEST_CASE("ProjectData::timer_level", "[ohmmsapp]")
+{
+  ProjectData project;
+  REQUIRE_FALSE(project.getTimerLevel());
+  REQUIRE_FALSE(ProjectData::readTimerLevel(nullptr));
+
+  for (const std::string level : {"none", "coarse", "medium", "fine"})
+  {
+    CAPTURE(level);
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString("<project id='timers' series='0'><parameter name='driver_version'>batch</parameter>"
+                               "<parameter name='timer_level'>\n  " + level + " \t</parameter></project>"));
+    const auto root = doc.getRoot();
+    const auto parameter = root->children->next;
+    const std::string original_content = XMLNodeString(parameter);
+    REQUIRE(ProjectData::readTimerLevel(root) == level);
+    REQUIRE(getXMLAttributeValue(root, "series") == "0");
+    REQUIRE(std::string(XMLNodeString(parameter)) == original_content);
+    project.put(root);
+    REQUIRE(project.getTimerLevel() == level);
+    project.advance();
+    REQUIRE(ProjectData::readTimerLevel(root) == level);
+    REQUIRE(std::string(XMLNodeString(parameter)) == original_content);
+  }
+
+  Libxml2Document absent;
+  REQUIRE(absent.parseFromString("<project id='absent'><parameter name='driver_version'>legacy</parameter></project>"));
+  REQUIRE_FALSE(ProjectData::readTimerLevel(absent.getRoot()));
+  project.put(absent.getRoot());
+  REQUIRE_FALSE(project.getTimerLevel());
+}
+
+TEST_CASE("ProjectData::invalid timer_level", "[ohmmsapp]")
+{
+  for (const std::string value : {"", " ", "invalid", "Fine", "medium fine"})
+  {
+    CAPTURE(value);
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString("<project id='invalid'><parameter name='timer_level'>" + value +
+                               "</parameter></project>"));
+    ProjectData project;
+    REQUIRE_THROWS_WITH(ProjectData::readTimerLevel(doc.getRoot()),
+                        "Invalid project timer_level '" + (value == " " ? "" : value) +
+                            "': expected none, coarse, medium, or fine");
+    REQUIRE_THROWS(project.put(doc.getRoot()));
+  }
+
+  for (const std::string second : {"fine", "coarse"})
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString("<project id='duplicate'><parameter name='timer_level'>fine</parameter>"
+                               "<parameter name='timer_level'>" + second + "</parameter></project>"));
+    ProjectData project;
+    REQUIRE_THROWS_WITH(ProjectData::readTimerLevel(doc.getRoot()), "Duplicate project parameter: timer_level");
+    REQUIRE_THROWS(project.put(doc.getRoot()));
+  }
 }
 
 } // namespace qmcplusplus

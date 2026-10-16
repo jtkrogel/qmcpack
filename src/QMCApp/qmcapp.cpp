@@ -55,6 +55,7 @@ int main(int argc, char** argv)
     //qmc_common  and MPI is initialized
     qmcplusplus::qmc_common.initialize(argc, argv);
     std::vector<std::string> fgroup_names_cmd, fgroup_names_txt;
+    std::optional<std::string> command_line_timer_level;
     int i = 1;
     while (i < argc)
     {
@@ -77,6 +78,7 @@ int main(int argc, char** argv)
           if (pos != std::string::npos)
           {
             std::string timer_level = c.substr(pos + 1);
+            command_line_timer_level = timer_level;
             getGlobalTimerManager().set_timer_threshold(timer_level);
           }
         }
@@ -199,6 +201,7 @@ int main(int argc, char** argv)
     if (!validInput)
       qmcComm->barrier_and_abort("main(). Input invalid.");
 
+    qmc->configureTimerLevel(command_line_timer_level);
     bool qmcSuccess = qmc->execute();
     if (!qmcSuccess)
       qmcComm->barrier_and_abort("main(). QMC Execution failed.");

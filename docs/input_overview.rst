@@ -125,6 +125,24 @@ Driver version
 The ``driver_version`` parameter selects between the current performance-portable batched drivers and the previous drivers (now referred to as the 'legacy drivers').
 The values for this parameter are ``legacy`` or ``batch`` (alternately, ``batched``). The default for this parameter is ``batch``.
 
+Timer granularity
+~~~~~~~~~~~~~~~~~
+The optional ``timer_level`` parameter selects native timer granularity for this calculation:
+
+.. code-block:: xml
+
+  <project id="my_vmc" series="0">
+    <parameter name="driver_version">batch</parameter>
+    <parameter name="timer_level">medium</parameter>
+  </project>
+
+Accepted values are ``none``, ``coarse``, ``medium``, and ``fine``. Levels are cumulative;
+``none`` disables timers. The XML value takes precedence over ``--enable-timers``;
+an override is logged when the values differ. Without this parameter, the command line
+setting or the default ``coarse`` level applies. Invalid or duplicate values are rejected
+before execution begins. Builds without ``ENABLE_TIMERS`` warn that the setting has no effect.
+For ensemble input, each process group uses its own calculation's XML setting.
+
 
 Random number initialization
 ----------------------------
