@@ -120,6 +120,12 @@ def main():
         directory = work / label
         directory.mkdir()
         tree = ET.parse(fixture)
+        # Recipes run in fresh evidence directories, not beside their PP asset.
+        # Keep the tracked source untouched; scientific identity uses its bytes.
+        for pseudo in tree.findall("hamiltonian/pairpot/pseudo"):
+            href = Path(pseudo.get("href"))
+            if not href.is_absolute():
+                pseudo.set("href", str((fixture.parent / href).resolve()))
         orbital_model = tree.find(".//rotated_sposet") is not None
         if args.orbital_jastrow:
             assert orbital_model and tree.find("wavefunction/jastrow") is None, fixture
@@ -230,6 +236,12 @@ def main():
                 previous = parameters
                 if orbital_model:
                     orbital_history.append(check_orbital_frame(group, tree, parameters, row, model))
+                pseudo = tree.find("hamiltonian/pairpot/pseudo")
+                if pseudo is not None:
+                    physical = text_value(group["physical_definition"][()])
+                    assert Path(pseudo.get("href")).read_bytes().decode() in physical, model
+                    assert "rule=2;local_channel=1;" in physical and "knots=4;" in physical, model
+                    assert pseudo.get("href") in text_value(group["ecp_source_report"][()]), model
                 serialized = group["wavefunction_xml"][()]
                 if isinstance(serialized, np.ndarray):
                     serialized = serialized.reshape(-1)[0]
@@ -350,7 +362,25 @@ def main():
         def neural_decay(tree):
             ET.SubElement(tree.find("qmc/training"), "parameter", name="weight_decay").text = "0.01"
         run("reject_neural_decay", reject="weight_decay must be zero", mutate=neural_decay)
-    completed = f"Adam/{args.companion_optimizer} conventional updates, interval inference, frozen SPO/reference, exact inference isolation"
+        if ET.parse(fixture).find("hamiltonian/pairpot/pseudo") is not None:
+            ordinary_vp_reason = "ECP training requires ordinary locality with virtual-particle batching"
+            run("reject_dla", reject=ordinary_vp_reason, mutate=lambda tree: tree.find(
+                "hamiltonian/pairpot[@type='pseudo']").set("DLA", "yes"))
+            run("reject_non_vp", reject=ordinary_vp_reason, mutate=lambda tree: tree.find(
+                "hamiltonian/pairpot[@type='pseudo']").set("algorithm", "non-batched"))
+            # Same scientific radial data with a harmless comment must still
+            # reject exact continuation: identity is actual parsed content, not
+            # the old filename or just the species/header.
+            source = ET.parse(fixture).find("hamiltonian/pairpot/pseudo").get("href")
+            source = (fixture.parent / source).resolve()
+            original = source.read_bytes()
+            changed = work / "changed-pseudopotential.xml"
+            changed.write_bytes(original + b"\n<!-- exact PP identity regression -->\n")
+            run("reject_changed_pp", iterations=3, restart=adam / "sj.s000.last_checkpoint.h5",
+                reject="Training checkpoint stage identity or configuration mismatch",
+                mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)))
+            assert source.read_bytes() == original
+    completed = f"Adam/{args.companion_optimizer} conventional updates, interval inference, immutable model reference, exact inference isolation"
     if args.restart:
         completed += ", exact split restart"
     if args.preflight:
