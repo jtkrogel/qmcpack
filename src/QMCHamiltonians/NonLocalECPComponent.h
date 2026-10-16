@@ -400,6 +400,17 @@ public:
   inline void setLmax(int Lmax) { lmax = Lmax; }
   inline int getLmax() const { return lmax; }
 
+  /// Immutable construction grid, not the randomized sampler quadrature state.
+  const SpherGridType& unrotatedGrid() const noexcept { return sgridxyz_m; }
+
+  /// Scientific quadrature weights used to identify the built pseudopotential.
+  const std::vector<RealType>& quadratureWeights() const noexcept { return sgridweight_m; }
+
+  /// Built angular-channel layout and multiplicities; read-only provenance.
+  const aligned_vector<int>& angularChannels() const noexcept { return angpp_m; }
+
+  const aligned_vector<RealType>& angularWeights() const noexcept { return wgt_angpp_m; }
+
   /// Hash the exact currently rotated quadrature coordinates.
   std::uint64_t rotatedGridFingerprint() const noexcept;
 

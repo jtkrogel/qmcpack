@@ -52,6 +52,11 @@ struct ECPotentialBuilder : public MPIObjectBase, public QMCTraits
 
   void useSimpleTableFormat();
   void useXmlFormat(xmlNodePtr cur);
+
+private:
+  std::string parsed_scientific_identity_;
+  std::string source_reports_;
+  bool parsed_profile_supported_ = true;
 };
 } // namespace qmcplusplus
 #endif

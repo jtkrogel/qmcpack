@@ -159,6 +159,8 @@ bool ECPComponentBuilder::read_pp_file(const std::string& fname)
     myComm->barrier_and_abort("Empty document");
   }
   bool success = put(cur);
+  if (success)
+    parsed_source_content_.assign(buf.contents(), buf.length);
   xmlFreeDoc(m_doc);
   return success;
 }

@@ -100,6 +100,11 @@ struct ECPComponentBuilder : public MPIObjectBase, public QMCTraits
 
   void printECPTable();
   bool read_pp_file(const std::string& fname);
+  /// Exact broadcast bytes consumed by the XML parser; no pathname reread.
+  const std::string& parsedSourceContent() const noexcept { return parsed_source_content_; }
+
+private:
+  std::string parsed_source_content_;
 };
 
 // Read a file into a memory buffer.

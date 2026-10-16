@@ -1450,6 +1450,7 @@ void QMCHamiltonian::releaseResource(ResourceCollection& collection,
 std::unique_ptr<QMCHamiltonian> QMCHamiltonian::makeClone(ParticleSet& qp, TrialWaveFunction& psi) const
 {
   auto myclone = std::make_unique<QMCHamiltonian>(myName);
+  myclone->ecp_model_provenance_ = ecp_model_provenance_;
   for (int i = 0; i < H.size(); ++i)
     H[i]->add2Hamiltonian(qp, psi, *myclone);
   for (int i = 0; i < auxH.size(); ++i)

@@ -66,6 +66,19 @@ public:
   using WP               = WalkerProperties::Indexes;
   using ValueMatrix      = SPOSet::ValueMatrix;
 
+  /// Immutable scientific ECP inputs, shared by clones rather than copied per
+  /// walker. Source paths are diagnostic only, never the content identity.
+  struct ECPModelProvenance
+  {
+    std::string scientific_definition;
+    std::string source_report;
+    bool ordinary_locality_vp = false;
+  };
+  const std::shared_ptr<const ECPModelProvenance>& ecpModelProvenance() const noexcept
+  { return ecp_model_provenance_; }
+  void setECPModelProvenance(std::shared_ptr<const ECPModelProvenance> provenance)
+  { ecp_model_provenance_ = std::move(provenance); }
+
   /// Result of one coherent ordinary-locality energy/ECP-response traversal.
   struct StreamingNonLocalECPResult
   {
@@ -486,6 +499,7 @@ private:
   FullPrecRealType NewLocalEnergy;
   ///getName is in the way
   const std::string myName;
+  std::shared_ptr<const ECPModelProvenance> ecp_model_provenance_;
   ///vector of Hamiltonian components
   std::vector<std::unique_ptr<OperatorBase>> H;
   ///true if H contains NLPP

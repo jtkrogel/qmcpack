@@ -23,9 +23,38 @@
 #include "OhmmsData/AttributeSet.h"
 #include "Numerics/OneDimNumGridFunctor.h"
 #include "Message/UniformCommunicateError.h"
+#include <iomanip>
+#include <sstream>
 
 namespace qmcplusplus
 {
+namespace
+{
+/// Preserve scientific XML while excluding relocatable PP filenames. Actual
+/// parser-consumed content is recorded separately; href remains report metadata.
+std::string scientificECPNode(xmlNodePtr node)
+{
+  std::unique_ptr<xmlNode, decltype(&xmlFreeNode)> copy(xmlCopyNode(node, 1), xmlFreeNode);
+  if (!copy)
+    throw std::bad_alloc();
+  xmlUnsetProp(copy.get(), BAD_CAST "href");
+  for (auto* child = copy->children; child; child = child->next)
+    if (child->type == XML_ELEMENT_NODE && xmlStrEqual(child->name, BAD_CAST "pseudo"))
+      xmlUnsetProp(child, BAD_CAST "href");
+  std::unique_ptr<xmlBuffer, decltype(&xmlBufferFree)> buffer(xmlBufferCreate(), xmlBufferFree);
+  if (!buffer)
+    throw std::bad_alloc();
+  if (xmlNodeDump(buffer.get(), node->doc, copy.get(), 0, 0) < 0)
+    throw std::runtime_error("Cannot capture ECP scientific XML definition");
+  return std::string(reinterpret_cast<const char*>(xmlBufferContent(buffer.get())), xmlBufferLength(buffer.get()));
+}
+
+void appendECPIdentity(std::string& identity, const std::string& label, const std::string& content)
+{
+  identity += label + ':' + std::to_string(content.size()) + ':' + content + ';';
+}
+}
+
 /** constructor
  *\param ions the positions of the ions
  *\param els the positions of the electrons
@@ -46,6 +75,10 @@ ECPotentialBuilder::~ECPotentialBuilder() = default;
 
 bool ECPotentialBuilder::put(xmlNodePtr cur)
 {
+  parsed_scientific_identity_.clear();
+  source_reports_.clear();
+  parsed_profile_supported_ = true;
+  const auto scientific_config = scientificECPNode(cur);
   if (localPot.empty())
   {
     int ng = IonConfig.getSpeciesSet().getTotalNum();
@@ -183,6 +216,21 @@ bool ECPotentialBuilder::put(xmlNodePtr cur)
     targetH.addOperator(std::move(apot), "L2");
   }
 
+  // Immutable provenance is construction metadata only. Numerical evaluation,
+  // randomized quadrature and existing Hamiltonian ownership are unchanged.
+  auto provenance = std::make_shared<QMCHamiltonian::ECPModelProvenance>();
+  if (const auto& previous = targetH.ecpModelProvenance())
+  {
+    provenance->scientific_definition = previous->scientific_definition;
+    provenance->source_report = previous->source_report;
+    parsed_profile_supported_ = parsed_profile_supported_ && previous->ordinary_locality_vp;
+  }
+  appendECPIdentity(provenance->scientific_definition, "operator_config", scientific_config);
+  appendECPIdentity(provenance->scientific_definition, "parsed_pseudopotentials", parsed_scientific_identity_);
+  provenance->source_report += source_reports_;
+  provenance->ordinary_locality_vp = parsed_profile_supported_ && ecpFormat == "xml" &&
+      NLPP_algo == "batched" && use_DLA != "yes" && !targetPtcl.isSpinor() && !hasL2Pot;
+  targetH.setECPModelProvenance(std::move(provenance));
   app_log().flush();
   return true;
 }
@@ -244,6 +292,35 @@ void ECPotentialBuilder::useXmlFormat(xmlNodePtr cur)
         }
         if (success)
         {
+          std::ostringstream built;
+          built << std::hexfloat << "species=" << ionName << ";source=" << IonConfig.getName()
+                << ";target=" << targetPtcl.getName() << ";format=" << format
+                << ";rule=" << ecp.Nrule << ";local_channel=" << ecp.Llocal
+                << ";zval=" << ecp.Zeff << ";cutoff=" << ecp.RcutMax
+                << ";randomize_grid=" << !disable_randomize_grid << ';';
+          if (ecp.pp_nonloc)
+          {
+            const auto& nonlocal = *ecp.pp_nonloc;
+            built << "lmax=" << nonlocal.getLmax() << ";channels=" << nonlocal.getNchannel()
+                  << ";knots=" << nonlocal.getNknot() << ";rmax=" << nonlocal.getRmax() << ';';
+            for (const auto angular : nonlocal.angularChannels())
+              built << "angular=" << angular << ';';
+            for (const auto weight : nonlocal.angularWeights())
+              built << "angular_weight=" << weight << ';';
+            const auto& grid = nonlocal.unrotatedGrid();
+            const auto& weights = nonlocal.quadratureWeights();
+            for (std::size_t point = 0; point < grid.size(); ++point)
+            {
+              built << "grid=" << grid[point][0] << ',' << grid[point][1] << ',' << grid[point][2]
+                    << ";weight=" << weights[point] << ';';
+            }
+          }
+          appendECPIdentity(parsed_scientific_identity_, "built", built.str());
+          appendECPIdentity(parsed_scientific_identity_, "source_content",
+                            href == "none" ? scientificECPNode(cur) : ecp.parsedSourceContent());
+          source_reports_ += "species=" + ionName + " href=" + href + '\n';
+          parsed_profile_supported_ = parsed_profile_supported_ && format == "xml" &&
+              (href == "none" || !ecp.parsedSourceContent().empty()) && !ecp.pp_so && !ecp.pp_L2;
           if (OHMMS::Controller->rank() == 0)
             ecp.printECPTable();
           if (ecp.pp_loc)
