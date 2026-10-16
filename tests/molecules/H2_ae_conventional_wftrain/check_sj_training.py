@@ -71,7 +71,8 @@ def check_orbital_frame(group, tree, parameters, row, model):
         assert not np.array_equal(accepted, reference), model
     # Both bundle representations must carry exactly the same complete frame.
     exported = datasets(model)
-    state = datasets(model.with_name(model.name.replace(".parameters.h5", ".state.h5")))
+    iteration_root = model.name[:-len(".parameters.h5")]
+    state = datasets(model.parent / (iteration_root + ".checkpoint") / (iteration_root + ".state.h5"))
     prefix = "conventional_wavefunction/orbital_frame/"
     for name, values in exported.items():
         if name.startswith(prefix):
