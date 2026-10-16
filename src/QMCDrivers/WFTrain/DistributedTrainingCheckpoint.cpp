@@ -10,6 +10,7 @@
  */
 
 #include "QMCDrivers/WFTrain/DistributedTrainingCheckpoint.h"
+#include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 
 #include "Message/CommOperators.h"
 #include "io/hdf/hdf_archive.h"
@@ -365,12 +366,18 @@ void DistributedTrainingCheckpoint::saveIterationBundle(
       else if (const auto* paired = dynamic_cast<const PsiFormerComplexWF*>(&provider))
         paired->exportModel(temporary_parameters.string());
 #endif
+      else if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
+        conventional->exportModel(temporary_parameters);
       else
-        throw std::runtime_error("Training bundle model export requires a PsiFormer provider");
+        throw std::runtime_error("Training bundle model export requires a supported training binding");
       const auto saved = TrainingCheckpoint::readModelParameters(staging / (root + ".state.h5"),
                                                                 provider.parameterSchema());
-      const auto exported = psiformer::readPsiFormerModelFile(temporary_parameters.string());
-      if (saved.values != exported.parameters.values || provider.snapshotParameters().version != saved.version)
+      const auto exported = [&]() {
+        if (const auto* conventional = dynamic_cast<const TrainingWaveFunctionBinding*>(&provider))
+          return conventional->readModel(temporary_parameters).values;
+        return psiformer::readPsiFormerModelFile(temporary_parameters.string()).parameters.values;
+      }();
+      if (saved.values != exported || provider.snapshotParameters().version != saved.version)
         throw std::runtime_error("Training model export and checkpoint generations disagree");
     }
   }

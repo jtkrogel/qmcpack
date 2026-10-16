@@ -33,6 +33,7 @@
 #include "QMCDrivers/WFTrain/PreparedEnergyGradientProducer.h"
 #include "QMCDrivers/WFTrain/OrbitalPretraining.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
+#include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
 #include "QMCDrivers/WFTrain/WFTrainOptimizerInput.h"
 #include "QMCDrivers/WFTrain/WFTrainSamplerCheckpoint.h"
 #include "QMCDrivers/WFTrain/WFTrainInference.h"
@@ -90,6 +91,34 @@ struct RetainedCrowdSamples
   /// Optional current-version/value evidence only for the admitted resident single snapshot.
   std::optional<std::size_t> replay_version;
   std::vector<std::array<double, 2>> replay_log_phase;
+};
+
+/// One scalar private evaluator reused by every retained conventional replay view.
+struct ConventionalReplayWorker
+{
+  std::unique_ptr<ParticleSet> particles;
+  std::unique_ptr<TrialWaveFunction> wavefunction;
+  ConventionalReplayWorker(TrialWaveFunction& prototype, const ParticleSet& source)
+      : particles(std::make_unique<ParticleSet>(source)), wavefunction(prototype.makeClone(*particles))
+  {}
+};
+
+class ConventionalReplay final : public wftrain::LegacyWaveFunctionReplay
+{
+public:
+  ConventionalReplay(std::shared_ptr<ConventionalReplayWorker> worker, const RetainedCrowdSamples& samples)
+      : worker_(std::move(worker)), samples_(samples)
+  {}
+  std::size_t sampleCount() const noexcept override { return samples_.particles.size(); }
+  wftrain::LegacyWaveFunctionReplaySample prepareSample(std::size_t index) override
+  {
+    worker_->particles->R = samples_.particles.at(index)->R;
+    worker_->particles->update();
+    return {*worker_->wavefunction, *worker_->particles};
+  }
+private:
+  std::shared_ptr<ConventionalReplayWorker> worker_;
+  const RetainedCrowdSamples& samples_;
 };
 
 /** Copy an observed population before later MC moves overwrite its positions. */
@@ -1294,6 +1323,29 @@ void WFTrainBatched::process(xmlNodePtr node)
       validateHamiltonianForTraining();
 
     auto providers = student_prototype_.extractStructuredParameterProviders();
+    if (providers.empty() && !complex_training_component_)
+    {
+      using O = WFTrainDriverInput::Optimizer;
+      if (training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+          (training_input_.getOptimizer() != O::ADAM && training_input_.getOptimizer() != O::SGD) ||
+          population_.get_golden_hamiltonian().hasPhysicalNLPP())
+        throw UniformCommunicateError("Conventional training currently requires all-electron ENERGY Adam/plain SGD with fixed-Slater J1/J2");
+      if (!training_input_.getLegacyMaximumParameters() || !training_input_.getLegacyDerivativeScratchBytes())
+        throw UniformCommunicateError("Conventional training requires positive legacy_maximum_parameters and legacy_derivative_scratch_bytes");
+      if (population_.get_golden_electrons().getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
+        throw UniformCommunicateError("Conventional training currently requires CPU particle coordinates");
+#ifdef QMC_COMPLEX
+      throw UniformCommunicateError("Conventional training currently requires a real CPU build");
+#endif
+      if (student_prototype_.findSD().empty() || !student_prototype_.findMSD().empty())
+        throw UniformCommunicateError("Conventional training currently requires a fixed single Slater determinant");
+      conventional_binding_ = std::make_unique<wftrain::TrainingWaveFunctionBinding>(
+          student_prototype_, population_.get_golden_electrons(),
+          wftrain::LegacyWaveFunctionAdapterOptions{training_input_.getLegacyMaximumParameters(),
+              training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
+      conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
+      providers.emplace_back(*conventional_binding_);
+    }
 #ifdef QMC_COMPLEX
     if (complex_training_component_ && complex_training_component_->gpuInferenceEnabled())
     {
@@ -1381,6 +1433,12 @@ void WFTrainBatched::process(xmlNodePtr node)
     }
     // ContextForSteps only borrows an RNG reference; all MC draws follow admission.
     createStepContexts(crowds_.size());
+    if (conventional_binding_)
+    {
+      conventional_binding_->attachLive(population_.get_golden_twf(), population_.get_golden_electrons());
+      for (std::size_t i = 0; i < population_.get_twfs().size(); ++i)
+        conventional_binding_->attachLive(*population_.get_twfs()[i], *population_.get_elec_particle_sets()[i]);
+    }
     initializeDeterminantOverlap();
     // Target construction clones SPOs and may allocate differently on each rank.
     // Agree on failure before any participant enters the training collectives.
@@ -1964,7 +2022,7 @@ void WFTrainBatched::run()
                               << " loss_difference " << difference
                               << " difference_error " << error << " ess " << ess
                               << " maximum_weight " << weight << " valid " << valid << std::endl;
-                });
+                }, conventional_binding_.get());
             selected_displacement_norm = selected_alpha * norm;
             return selected_alpha;
           });
@@ -2132,10 +2190,33 @@ void WFTrainBatched::run()
           batches.reserve(retained_samples.size());
           std::size_t sample_offset = 0;
           std::size_t batch_ordinal = 0;
+          std::shared_ptr<ConventionalReplayWorker> conventional_worker;
+          std::shared_ptr<const wftrain::StructuredParameterSnapshot> conventional_parameters;
+          if (conventional_binding_)
+          {
+            conventional_worker = std::make_shared<ConventionalReplayWorker>(
+                student_prototype_, population_.get_golden_electrons());
+            conventional_parameters = std::make_shared<const wftrain::StructuredParameterSnapshot>(
+                selected_provider_->snapshotParameters());
+          }
           // Prepare immutable score/kinetic owners only after collection. ECP
           // energies and responses are paired on their accepted replay grids.
           for (auto& samples : retained_samples)
           {
+            if (conventional_binding_)
+            {
+              wftrain::PreparedEnergyGradientBatch batch;
+              batch.weights.assign(samples.particles.size(), 1.0);
+              for (double energy : samples.local_energies)
+                batch.local_energies.emplace_back(energy);
+              batch.local_energy_term_mask = wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC);
+              batch.derivative_operator = conventional_binding_->adapter().makeDerivativeOperator(
+                  std::make_shared<ConventionalReplay>(conventional_worker, samples),
+                  conventional_parameters, batch_ordinal++, sample_offset);
+              sample_offset += samples.particles.size();
+              batches.push_back(std::move(batch));
+              continue;
+            }
             Crowd& crowd = *crowds_[samples.crowd_index];
             const bool resident_single_snapshot = (resident_adam_budget || resident_sr_budget.first) &&
                 !complex_training && !has_nonlocal_ecp && retained_samples.size() == 1 && crowds_.size() == 1 &&
@@ -2158,6 +2239,15 @@ void WFTrainBatched::run()
             sample_offset += crowd.size();
           }
           storage_diagnostics = preparedStorageDiagnostics(batches);
+          if (conventional_parameters)
+          {
+            const auto snapshot_bytes = checkedMemoryMultiply(
+                conventional_parameters->values.capacity(), sizeof(double));
+            storage_diagnostics.derivative_owner_bytes = checkedMemoryAdd(
+                storage_diagnostics.derivative_owner_bytes, snapshot_bytes);
+            storage_diagnostics.retained_numeric_bytes = checkedMemoryAdd(
+                storage_diagnostics.retained_numeric_bytes, snapshot_bytes);
+          }
           if (complex_training && storage_diagnostics.retained_numeric_bytes != complex_expected_prepared_bytes)
             throw std::logic_error("WFTrainBatched: paired prepared capacity differs from exact preallocation admission");
           // RSS covers ParticleSet/teacher caches that numeric diagnostics omit.

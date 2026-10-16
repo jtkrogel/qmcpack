@@ -10,6 +10,7 @@
 #include "NativeLineSearch.h"
 #include "DeterminantOverlapObjective.h"
 #include "TrainingNumerics.h"
+#include "TrainingWaveFunctionBinding.h"
 #include "Message/CommOperators.h"
 #include "Message/Communicate.h"
 #include "Particle/ParticleSet.h"
@@ -164,7 +165,8 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
                         const StructuredParameterSnapshot& full,
                         const DeterminantOverlapObjective* overlap,
                         double maximum_alpha,
-                        const std::function<void(double,double,double,double,double,double,bool)>& report)
+                        const std::function<void(double,double,double,double,double,double,bool)>& report,
+                        const TrainingWaveFunctionBinding* conventional)
 {
   // Each rank retains one private model and one scratch ParticleSet. Empty ranks
   // use no private model but participate in every candidate statistical reduction.
@@ -189,7 +191,8 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
     {
       particles = std::make_unique<ParticleSet>(configurations.front().get());
       wavefunction = prototype.makeClone(*particles);
-      providerOf(*wavefunction, provider_id).isolateParameterState();
+      if (!conventional)
+        providerOf(*wavefunction, provider_id).isolateParameterState();
       ham = hamiltonian.makeClone(*particles, *wavefunction);
     }
   }
@@ -199,6 +202,15 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
 
   auto install = [&](double alpha) {
     if (!wavefunction) return;
+    if (conventional)
+    {
+      auto candidate = old;
+      for (std::size_t i = 0; i < candidate.values.size(); ++i)
+        candidate.values[i] = old.values[i] + alpha * (full.values[i] - old.values[i]);
+      wavefunction = conventional->makeCandidate(*particles, candidate);
+      ham = hamiltonian.makeClone(*particles, *wavefunction);
+      return;
+    }
     auto& provider = providerOf(*wavefunction, provider_id);
     auto candidate = provider.snapshotParameters();
     for (std::size_t i = 0; i < candidate.values.size(); ++i)

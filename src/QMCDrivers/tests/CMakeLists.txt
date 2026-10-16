@@ -104,6 +104,7 @@ list(APPEND DRIVER_TEST_SRC test_AcceleratedLinearMethod.cpp test_SampledLinearM
 list(APPEND DRIVER_TEST_SRC test_OrbitalPretraining.cpp)
 list(APPEND DRIVER_TEST_SRC test_DeterminantOverlapObjective.cpp)
 list(APPEND DRIVER_TEST_SRC test_LegacyWaveFunctionAdapter.cpp)
+list(APPEND DRIVER_TEST_SRC test_TrainingWaveFunctionBinding.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeOperator.cpp)
 list(APPEND DRIVER_TEST_SRC test_KrylovSolver.cpp)
 list(APPEND DRIVER_TEST_SRC test_MatrixFreeStochasticReconfiguration.cpp)

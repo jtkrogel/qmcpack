@@ -110,6 +110,8 @@ public:
   double getLMInnerRelativeTolerance() const noexcept { return lm_inner_relative_tolerance_; }
   double getKFACFallbackDamping() const noexcept { return kfac_fallback_damping_; }
   std::size_t getParameterChunkSize() const noexcept { return parameter_chunk_size_; }
+  std::size_t getLegacyMaximumParameters() const noexcept { return legacy_maximum_parameters_; }
+  std::size_t getLegacyDerivativeScratchBytes() const noexcept { return legacy_derivative_scratch_bytes_; }
   double getLearningRate() const noexcept { return learning_rate_; }
   double getAdamBeta1() const noexcept { return adam_beta1_; }
   double getAdamBeta2() const noexcept { return adam_beta2_; }
@@ -200,6 +202,8 @@ private:
   OrbitalTarget orbital_target_{OrbitalTarget::SINGLE_REFERENCE};
   Optimizer optimizer_{Optimizer::ADAM};
   std::size_t parameter_chunk_size_{65536};
+  std::size_t legacy_maximum_parameters_{0};
+  std::size_t legacy_derivative_scratch_bytes_{0};
   double learning_rate_{1.0e-3};
   double adam_beta1_{0.9};
   double adam_beta2_{0.999};

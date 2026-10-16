@@ -28,7 +28,7 @@ namespace qmcplusplus
 namespace
 {
 
-constexpr std::array<std::string_view, 68> allowed_controls{
+constexpr std::array<std::string_view, 70> allowed_controls{
     "iterations", "checkpoint_interval", "warmupsteps", "momentum_decay", "rms_decay", "lm_overlap_shift", "lm_normalization_xi",
     "lm_maximum_subspace_dimension", "lm_inner_iterations", "lm_inner_restart_length",
     "lm_inner_relative_tolerance", "kfac_fallback_damping",
@@ -47,7 +47,7 @@ constexpr std::array<std::string_view, 68> allowed_controls{
     "teacher", "overlap_target", "overlap_weighting", "target_provenance", "orbital_target",
     "minimum_fidelity", "minimum_effective_samples", "pii_shift_mode",
     "pii_explicit_tau", "pii_energy_undershoot", "maximum_damping_retries",
-    "gmres_restart_length"};
+    "gmres_restart_length", "legacy_maximum_parameters", "legacy_derivative_scratch_bytes"};
 
 /** Return an XML attribute value without changing its spelling or whitespace. */
 std::string readAttribute(xmlNodePtr node, const char* name)
@@ -269,6 +269,8 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   line_search_sampling_steps_ = 10;
   optimizer_                        = Optimizer::ADAM;
   parameter_chunk_size_             = 65536;
+  legacy_maximum_parameters_        = 0;
+  legacy_derivative_scratch_bytes_  = 0;
   learning_rate_                    = 1.0e-3;
   adam_beta1_                       = 0.9;
   adam_beta2_                       = 0.999;
@@ -421,6 +423,12 @@ void WFTrainDriverInput::readXML(xmlNodePtr qmc_node)
   if (seen_controls.find("parameter_chunk_size") != seen_controls.end())
     parameter_chunk_size_ = parsePositiveSize(readControl("parameter_chunk_size"),
                                               "parameter_chunk_size");
+  if (seen_controls.count("legacy_maximum_parameters"))
+    legacy_maximum_parameters_ = parsePositiveSize(readControl("legacy_maximum_parameters"),
+                                                   "legacy_maximum_parameters");
+  if (seen_controls.count("legacy_derivative_scratch_bytes"))
+    legacy_derivative_scratch_bytes_ = parsePositiveSize(readControl("legacy_derivative_scratch_bytes"),
+                                                        "legacy_derivative_scratch_bytes");
   if (seen_controls.find("learning_rate") != seen_controls.end())
   {
     learning_rate_ = parseFiniteReal(readControl("learning_rate"), "learning_rate");

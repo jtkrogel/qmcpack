@@ -1,0 +1,85 @@
+//////////////////////////////////////////////////////////////////////////////////////
+// This file is distributed under the University of Illinois/NCSA Open Source License.
+// See LICENSE file in top directory for details.
+//////////////////////////////////////////////////////////////////////////////////////
+#include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include "Message/Communicate.h"
+#include "Particle/ParticleSet.h"
+#include "QMCDrivers/WFTrain/TrainingWaveFunctionBinding.h"
+#include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
+#include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
+#include "QMCWaveFunctions/TrialWaveFunction.h"
+#include "SimulationCell.h"
+#include <limits>
+
+namespace qmcplusplus::wftrain
+{
+TEST_CASE("Conventional binding activates actual Jastrows and rejects failed preparation collectively",
+          "[drivers][training][conventional_binding][mpi]")
+{
+  Communicate& comm = *OHMMS::Controller;
+  const SimulationCell cell;
+  ParticleSet particles(cell);
+  particles.setName("e");
+  particles.create({1, 1});
+  particles.R[0] = {0.2, -0.3, 0.4};
+  particles.R[1] = {-0.5, 0.1, 0.7};
+  auto& species = particles.getSpeciesSet();
+  const int up = species.addSpecies("u"), down = species.addSpecies("d");
+  const int mass = species.addAttribute("mass");
+  species(mass, up) = species(mass, down) = 1.0;
+  particles.resetGroups();
+  using Functor = BsplineFunctor<QMCTraits::RealType>;
+  auto functor = std::make_unique<Functor>("binding_functor");
+  functor->cutoff_radius = 4.0;
+  functor->resize(4);
+  for (int i = 0; i < 4; ++i)
+  {
+    functor->Parameters[i] = 0.04 * (i + 1);
+    functor->myVars.insert("binding_" + std::to_string(i), functor->Parameters[i], true, optimize::LOGLINEAR_P);
+  }
+  functor->reset();
+  auto j2 = std::make_unique<TwoBodyJastrow<Functor>>("binding_j2", particles, false);
+  j2->addFunc(0, 1, std::move(functor));
+  const RuntimeOptions runtime;
+  TrialWaveFunction prototype(runtime, "binding_test");
+  prototype.addComponent(std::move(j2));
+  particles.update();
+  ParticleSet clone_particles(particles);
+  auto clone = prototype.makeClone(clone_particles);
+  TrainingWaveFunctionBinding binding(prototype, particles, {256, 65536, 16}, comm);
+  binding.attachLive(*clone, clone_particles);
+  const auto old = binding.snapshotParameters();
+  auto candidate = old;
+  candidate.values[0] += 0.07;
+  const auto original_positions = particles.R;
+  const auto original_clone_positions = clone_particles.R;
+  const auto* original = prototype.getOrbitals()[0].get();
+  const auto* original_clone = clone->getOrbitals()[0].get();
+  auto invalid = candidate;
+  if (comm.rank() == 0) invalid.values[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(binding.publishParameters(invalid, old.version));
+  CHECK(binding.snapshotParameters().values == old.values);
+  CHECK(prototype.getOrbitals()[0].get() == original);
+  CHECK(clone->getOrbitals()[0].get() == original_clone);
+  CHECK(binding.publishParameters(candidate, old.version) == old.version + 1);
+  CHECK(prototype.getOrbitals()[0].get() != original);
+  CHECK(clone->getOrbitals()[0].get() != original_clone);
+  optimize::VariableSet actual, actual_clone;
+  prototype.checkInVariables(actual);
+  clone->checkInVariables(actual_clone);
+  CHECK(std::real(actual[0]) == Catch::Approx(candidate.values[0]));
+  CHECK(std::real(actual_clone[0]) == Catch::Approx(candidate.values[0]));
+  for (int electron = 0; electron < 2; ++electron)
+    for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    {
+      CHECK(particles.R[electron][dimension] == original_positions[electron][dimension]);
+      CHECK(clone_particles.R[electron][dimension] == original_clone_positions[electron][dimension]);
+    }
+  auto next = binding.snapshotParameters();
+  next.values[1] -= 0.03;
+  CHECK(binding.publishParameters(next, next.version) == next.version + 1);
+  CHECK_THROWS(binding.publishParameters(candidate, old.version));
+}
+}

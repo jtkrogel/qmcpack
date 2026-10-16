@@ -3312,6 +3312,35 @@ std::unique_ptr<TrialWaveFunction> TrialWaveFunction::makeClone(ParticleSet& tqp
   return myclone;
 }
 
+void TrialWaveFunction::validatePreparedJastrowActivation(const TrialWaveFunction& prepared) const
+{
+  auto idle = [](const TrialWaveFunction& wf) {
+    return !wf.resource_acquired_ && !wf.acquired_resource_collection_ &&
+        !wf.multi_particle_proposal_pending_ && !wf.batch_execution_plan_ && !wf.twf_fastderiv_;
+  };
+  if (!idle(*this) || !idle(prepared) || Z.size() != prepared.Z.size())
+    throw std::logic_error("Conventional Jastrow activation requires idle matching wavefunctions without plans or fast wrappers");
+  for (std::size_t i = 0; i < Z.size(); ++i)
+  {
+    const auto kind = Z[i]->getClassName();
+    if (kind != prepared.Z[i]->getClassName() || Z[i]->getName() != prepared.Z[i]->getName() ||
+        Z[i]->isOptimizable() != prepared.Z[i]->isOptimizable())
+      throw std::logic_error("Conventional Jastrow activation changed component topology");
+    if (Z[i]->isOptimizable() && kind != "J1OrbitalSoA" && kind != "TwoBodyJastrow")
+      throw std::invalid_argument("Conventional training currently admits only fixed-Slater J1/J2 parameters");
+  }
+}
+
+void TrialWaveFunction::activatePreparedJastrows(TrialWaveFunction& prepared) noexcept
+{
+  // Validation and all allocations precede consensus. Fixed Slater/SPO objects,
+  // timers and Hamiltonian references retain their identities. This deliberately
+  // does not claim failure-atomic refresh of particle/walker caches.
+  for (std::size_t i = 0; i < Z.size(); ++i)
+    if (Z[i]->isOptimizable())
+      Z[i].swap(prepared.Z[i]);
+}
+
 /** evaluate derivatives of KE wrt optimizable varibles
  *
  * @todo WaveFunctionComponent objects should take the mass into account.

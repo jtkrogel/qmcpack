@@ -19,6 +19,7 @@ template<typename T> class RandomBase;
 namespace wftrain
 {
 class DeterminantOverlapObjective;
+class TrainingWaveFunctionBinding;
 /// Evaluate a bounded set of isolated inference candidates and return a relative scale.
 double selectNativeStep(
     const WFTrainDriverInput& input, Communicate& communicator,
@@ -31,7 +32,8 @@ double selectNativeStep(
     const StructuredParameterSnapshot& old_parameters,
     const StructuredParameterSnapshot& full_candidate,
     const DeterminantOverlapObjective* overlap, double maximum_alpha,
-    const std::function<void(double, double, double, double, double, double, bool)>& report);
+    const std::function<void(double, double, double, double, double, double, bool)>& report,
+    const TrainingWaveFunctionBinding* conventional = nullptr);
 }
 }
 #endif

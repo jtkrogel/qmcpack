@@ -46,6 +46,7 @@ set(QMCDRIVERS
     WFTrain/TrainingCapabilities.cpp
     WFTrain/WFTrainDriverInput.cpp
     WFTrain/WFTrainBatched.cpp
+    WFTrain/TrainingWaveFunctionBinding.cpp
     WFTrain/AcceleratorTrainingPlan.cpp
     WFTrain/AcceleratorRuntimePlacement.cpp
     WFTrain/AcceleratorCollectiveState.cpp
