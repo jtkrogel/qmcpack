@@ -26,6 +26,7 @@
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
+#include "QMCWaveFunctions/Jastrow/eeI_JastrowBuilder.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/WaveFunctionFactory.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
@@ -823,6 +824,113 @@ TEST_CASE("Legacy replay block views share bounded parameter workspace and immut
   invalid->values[0] = std::numeric_limits<double>::quiet_NaN();
   CHECK_THROWS_AS(adapter.makeDerivativeOperator(replay, invalid, 0, 0), std::invalid_argument);
   CHECK_THROWS_AS(adapter.makeDerivativeOperator({}, snapshot, 0, 0), std::invalid_argument);
+}
+
+TEST_CASE("Legacy polynomial J3 products include full-gradient cross terms and isolated aliases",
+          "[drivers][training][legacy_adapter][jastrow][three_body]")
+{
+  const SimulationCell cell;
+  auto particles = makeTwoSpeciesParticles(cell);
+  ParticleSet ions(cell);
+  ions.setName("ion0");
+  ions.create({1});
+  ions.R[0] = {0.0, 0.0, 0.0};
+  auto& species = ions.getSpeciesSet();
+  species.addSpecies("H");
+  ions.resetGroups();
+  ions.update();
+  auto source = makeBsplineJ2WaveFunction(particles, {0.12, -0.08, 0.04, -0.01}, 0.37);
+  Libxml2Document document;
+  // The u-u default aliases one unique functor across all spin-pair slots.
+  // isize=esize=2 gives eight independent constrained polynomial parameters.
+  REQUIRE(document.parseFromString(R"(
+    <jastrow name="J3" type="eeI" function="polynomial" source="ion0" print="yes">
+      <correlation ispecies="H" especies1="u" especies2="u" isize="2" esize="2" rcut="4">
+        <coefficients id="j3H" type="Array" optimize="yes">
+          0.000001 -0.000002 0.000003 -0.000004 0.000002 -0.000001 0.000003 -0.000002
+        </coefficients>
+      </correlation>
+    </jastrow>)"));
+  eeI_JastrowBuilder builder(OHMMS::Controller, particles, ions);
+  source->addComponent(builder.buildComponent(document.getRoot()));
+  particles.update();
+  source->evaluateLog(particles);
+  const auto original_log = source->getLogPsi();
+  const auto ion_positions = ions.R;
+  ParticleSet private_particles(particles);
+  auto evaluator = source->makeClone(private_particles);
+  private_particles.update();
+  LegacyWaveFunctionAdapter adapter("legacy/j3_fd", *source, adapterOptions());
+  const auto snapshot = adapter.snapshotParameters();
+  REQUIRE(snapshot.values.size() == 12);
+  auto op = adapter.makeDerivativeOperator(RefVector<TrialWaveFunction>{*evaluator},
+                                            RefVector<ParticleSet>{private_particles}, 0, 0);
+  const std::vector<DerivativeValue> coefficient{{0.7, -0.2}};
+  const std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, coefficient), 0},
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, coefficient),
+       localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  RecordingParameterSink transpose, hermitian;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, transpose);
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::HERMITIAN, hermitian);
+  std::vector<DerivativeValue> direction(snapshot.values.size());
+  for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+    direction[parameter] = 0.03 * (static_cast<int>(parameter % 5) - 2);
+  StructuredParameterVectorConstView view(adapter.parameterSchema(), snapshot.version,
+                                           {direction.data(), direction.size()});
+  RecordingSampleSink score_jvp, energy_jvp;
+  op->applyScoreJVP(view, score_jvp);
+  op->applyLocalEnergyJVP(view, localEnergyTermBit(LocalEnergyTerm::KINETIC), energy_jvp);
+  for (std::size_t channel = 0; channel < channels.size(); ++channel)
+  {
+    DerivativeValue contracted{};
+    for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+      contracted += transpose.result()[channel][parameter] * direction[parameter];
+    checkClose(contracted, coefficient[0] * (channel == 0 ? score_jvp.result()[0] : energy_jvp.result()[0]));
+  }
+  for (std::size_t parameter = 0; parameter < snapshot.values.size(); ++parameter)
+  {
+    CAPTURE(parameter);
+    constexpr double epsilon = 1e-5;
+    auto plus = snapshot, minus = snapshot;
+    plus.values[parameter] += epsilon;
+    minus.values[parameter] -= epsilon;
+    adapter.installSnapshot(*evaluator, private_particles, plus);
+    const double plus_log = evaluator->getLogPsi();
+    const auto plus_energy = kineticEnergy(private_particles);
+    adapter.installSnapshot(*evaluator, private_particles, minus);
+    const double minus_log = evaluator->getLogPsi();
+    const auto minus_energy = kineticEnergy(private_particles);
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+    {
+      const auto finite_difference = channel == 0 ? DerivativeValue{(plus_log - minus_log) / (2.0 * epsilon)}
+                                                 : (plus_energy - minus_energy) / (2.0 * epsilon);
+      const auto actual = transpose.result()[channel][parameter] / coefficient[0];
+      CHECK(actual.real() == Catch::Approx(finite_difference.real()).epsilon(2e-6).margin(2e-8));
+      CHECK(actual.imag() == Catch::Approx(finite_difference.imag()).margin(2e-8));
+      checkClose(hermitian.result()[channel][parameter], std::conj(actual) * coefficient[0]);
+    }
+  }
+  // Repeated resets on the clone must not mutate the source functor or ion input.
+  optimize::VariableSet unchanged;
+  source->checkInVariables(unchanged);
+  unchanged.resetIndex();
+  REQUIRE(unchanged.size_of_active() == snapshot.values.size());
+  for (std::size_t parameter = 0; parameter < snapshot.values.size(); ++parameter)
+    CHECK(unchanged[parameter] == snapshot.values[parameter]);
+  source->evaluateLog(particles);
+  CHECK(source->getLogPsi() == Catch::Approx(original_log).margin(1e-12));
+  for (int dimension = 0; dimension < OHMMS_DIM; ++dimension)
+    CHECK(ions.R[0][dimension] == ion_positions[0][dimension]);
+  adapter.installSnapshot(*evaluator, private_particles, snapshot);
+  const auto clone_log = evaluator->getLogPsi();
+  std::swap(private_particles.R[0], private_particles.R[1]);
+  private_particles.update();
+  adapter.installSnapshot(*evaluator, private_particles, snapshot);
+  CHECK(evaluator->getLogPsi() == Catch::Approx(clone_log).margin(1e-12));
+  // The bridge workspace bound covers its two rows/three channels. Production
+  // J3 additionally owns P*Ne gradient/laplacian caches in this one private worker.
+  CHECK(op->storageDiagnostics().shared_workspace_bytes <= adapterOptions().maximum_derivative_scratch_bytes);
 }
 
 TEST_CASE("Legacy MDJ private coefficients preserve source state and true energy derivatives",
