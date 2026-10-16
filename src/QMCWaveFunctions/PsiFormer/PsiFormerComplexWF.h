@@ -11,6 +11,7 @@
 #define QMCPLUSPLUS_PSIFORMER_COMPLEX_WF_H
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
+#include "QMCWaveFunctions/Optimization/StreamingDerivative.h"
 #include <array>
 #include <memory>
 #include <string>
@@ -57,6 +58,16 @@ public:
   /// Atomically replace same-sized real parameters after schema/version/finite/idle admission.
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;
+
+  /// Exact two-tape lane plus immutable sample storage, not the inference clone budget.
+  std::size_t streamingDerivativeRequiredBytes(std::size_t sample_count) const;
+
+  /// Explicit capped numerical binding; discovery and the unbudgeted factory remain closed.
+  std::unique_ptr<wftrain::StreamingDerivativeOperator> makeBudgetedStreamingDerivativeOperator(
+      const RefVectorWithLeader<WaveFunctionComponent>& components,
+      const RefVectorWithLeader<ParticleSet>& particles, std::size_t batch_ordinal,
+      std::size_t sample_offset, std::size_t maximum_parameter_chunk_size,
+      std::size_t maximum_numeric_bytes) const;
 
   /// This component supplies the complete antisymmetric fermionic ansatz.
   bool isFermionic() const override { return true; }

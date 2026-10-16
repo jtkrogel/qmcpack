@@ -234,6 +234,13 @@ public:
   /// Expose the exact FULL numeric requirement, not allocator/shared/aggregate clone costs.
   std::size_t requiredStorageBytes() const { return DirectComplexKineticWorkspace::storageRequirement(shape_); }
 
+  /// Include the real trunk executor's fixed-ion copy in external lane accounting.
+  std::size_t numericMetadataStorageBytes() const { return trunk_.numericMetadataStorageBytes(); }
+
+  /// Track fixed-ion metadata separately from the mutable tape allocation identity.
+  std::size_t numericMetadataStorageFingerprint() const noexcept
+  { return trunk_.numericMetadataStorageFingerprint(); }
+
   /// Reject zero, unbounded or insufficient caps before allocating any numerical clone scratch.
   std::unique_ptr<DirectComplexKineticWorkspace> makeWorkspace(std::size_t maximum_bytes) const
   {

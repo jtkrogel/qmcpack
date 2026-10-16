@@ -26,6 +26,8 @@
 #ifdef QMC_COMPLEX
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexValueExecutor.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexSpatialExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexScoreExecutor.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexKineticExecutor.h"
 #endif
 #ifdef ENABLE_CUDA
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceBatchBackend.h"

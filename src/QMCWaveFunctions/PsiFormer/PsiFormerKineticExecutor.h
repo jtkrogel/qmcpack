@@ -641,6 +641,18 @@ public:
         plan_, GeometryPositionView::interleaved(nuclei_.data(), plan_.modelShape().nuclei), boundary_);
   }
 
+  /// Count the executor's copied fixed-ion numerical metadata, separate from tape buffers.
+  std::size_t numericMetadataStorageBytes() const
+  { return checkedStorageBytes<double>(nuclei_.capacity(), "executor metadata bytes overflow"); }
+
+  /// Include fixed-ion allocation identity in retained-lane stability evidence.
+  std::size_t numericMetadataStorageFingerprint() const noexcept
+  {
+    std::size_t hash = 1469598103934665603ULL;
+    qmcplusplus::psiformer::determinant::detail::mixStorage(hash, nuclei_);
+    return hash;
+  }
+
   /// Admit a positive exact per-tape numeric budget before allocating trunk scratch.
   std::unique_ptr<DirectKineticTrunkWorkspace> makeTrunkWorkspace(std::size_t maximum_bytes) const
   {

@@ -877,4 +877,225 @@ TEST_CASE("PsiFormer complex pending family guard releases on every revocation b
   publish();
   CHECK_NOTHROW(evaluate(component, p));
 }
+
+namespace
+{
+/// Test-only dense output collector; production retains no sample-by-parameter arrays.
+class ComplexStreamingSink final : public wftrain::ParameterReductionSink
+{
+public:
+  std::vector<std::vector<C>> values;
+  bool fail_next = false;
+
+  /// Allocate only test oracle storage after common request preflight.
+  void onBegin(const wftrain::DerivativeStreamDescriptor&, const wftrain::ParameterChunkPlan& plan,
+      wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels) override
+  {
+    std::size_t count = 0;
+    for (const auto& chunk : plan.chunks())
+      count = std::max(count, chunk.parameter_offset + chunk.count);
+    values.assign(channels.size(), std::vector<C>(count));
+  }
+
+  /// Copy all checked canonical chunks and support one injected transactional failure.
+  void consume(std::size_t channel, const wftrain::ParameterChunkConstView& chunk) override
+  {
+    if (fail_next)
+    {
+      fail_next = false;
+      throw std::runtime_error("injected complex stream sink failure");
+    }
+    std::copy(chunk.values().begin(), chunk.values().end(),
+              values[channel].begin() + chunk.descriptor().parameter_offset);
+  }
+};
+} // namespace
+
+TEST_CASE("PsiFormer complex budgeted streams fuse complete score and kinetic contractions",
+          "[wavefunction][psiformer][complex_wf][complex_streaming]")
+{
+  using namespace wftrain;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const int mass = p.getSpeciesSet().findAttribute("mass");
+  p.getSpeciesSet()(mass, 0) = clone_p.getSpeciesSet()(mass, 0) = .7;
+  p.getSpeciesSet()(mass, 1) = clone_p.getSpeciesSet()(mass, 1) = 1.9;
+  p.resetGroups();
+  clone_p.resetGroups();
+  clone_p.R[1][2] += .037;
+  clone_p.update();
+  PsiFormerComplexWF component("stream", parameters(), p, source, clone_cap, {.17, -.11, .07});
+  auto base_clone = component.makeClone(clone_p);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base_clone);
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  components.push_back(clone);
+  RefVectorWithLeader<ParticleSet> particles(p);
+  particles.push_back(p);
+  particles.push_back(clone_p);
+  const auto bytes = component.streamingDerivativeRequiredBytes(2);
+  const auto lane_bytes = component.streamingDerivativeRequiredBytes(0);
+  CHECK(bytes == lane_bytes + 4 * 2 * 4 * sizeof(double));
+  for (const auto cap : {std::size_t{0}, bytes - 1, std::numeric_limits<std::size_t>::max()})
+    CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 5, cap));
+  CHECK_THROWS(component.makeStreamingDerivativeOperator(components, particles, 7, 11, 5));
+  auto stream = component.makeBudgetedStreamingDerivativeOperator(components, particles, 7, 11, 5, bytes);
+  const auto diagnostic = stream->storageDiagnostics();
+  CHECK(diagnostic.retained_numeric_bytes == bytes);
+  CHECK(diagnostic.shared_workspace_bytes == lane_bytes);
+  CHECK(diagnostic.real_parameter_vectors == 2);
+  CHECK(diagnostic.complex_parameter_vectors == 5);
+  CHECK(stream->capabilities().maximum_vjp_channels == 3);
+  CHECK_FALSE(stream->capabilities().supports(DerivativeProduct::SCORE_JVP));
+  CHECK(component.structuredParameterProvider() == nullptr);
+  const auto& schema = stream->parameterSchema();
+  std::array<std::vector<C>, 3> coefficients{{{{.3, -.2}, {-.4, .1}},
+      {{.7, .15}, {.2, -.35}}, {{-.6, .4}, {.8, -.1}}}};
+  std::array<VJPCoefficientChannel, 3> channels;
+  for (std::size_t c = 0; c < 3; ++c)
+  {
+    channels[c] = {c == 0 ? "score0" : c == 1 ? "kinetic" : "score2",
+        c == 1 ? DerivativeProduct::LOCAL_ENERGY_VJP : DerivativeProduct::SCORE_VJP,
+        {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 7, 11,
+          {coefficients[c].data(), 2}}, c == 1 ? localEnergyTermBit(LocalEnergyTerm::KINETIC) : 0};
+  }
+  // Explicit complete rows are test-only; the fused owner never materializes these B-by-P matrices.
+  std::array<std::vector<C>, 2> score, kinetic;
+  const C one{1};
+  for (std::size_t sample = 0; sample < 2; ++sample)
+  {
+    RefVectorWithLeader<WaveFunctionComponent> one_component(component);
+    one_component.push_back(components[sample]);
+    RefVectorWithLeader<ParticleSet> one_particle(p);
+    one_particle.push_back(particles[sample]);
+    auto oracle = component.makeBudgetedStreamingDerivativeOperator(one_component, one_particle, sample, 0, 7,
+        component.streamingDerivativeRequiredBytes(1));
+    CHECK(oracle->storageDiagnostics().shared_workspace_identity == diagnostic.shared_workspace_identity);
+    std::array<VJPCoefficientChannel, 2> probes{{
+        {"score", DerivativeProduct::SCORE_VJP,
+          {schema.providerId(), schema.fingerprint(), oracle->parameterVersion(), sample, 0, {&one, 1}}, 0},
+        {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP,
+          {schema.providerId(), schema.fingerprint(), oracle->parameterVersion(), sample, 0, {&one, 1}},
+          localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+    ComplexStreamingSink sink;
+    oracle->applyVJPs({probes.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink);
+    score[sample] = sink.values[0];
+    kinetic[sample] = sink.values[1];
+  }
+  // Mutable ParticleSets cannot change an already prepared sample snapshot.
+  p.R[0][0] += .019;
+  p.update();
+  ComplexStreamingSink sink;
+  stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink);
+  for (std::size_t c = 0; c < 3; ++c)
+    for (std::size_t parameter = 0; parameter < schema.parameterCount(); ++parameter)
+      close(sink.values[c][parameter], coefficients[c][0] * (c == 1 ? kinetic[0] : score[0])[parameter] +
+          coefficients[c][1] * (c == 1 ? kinetic[1] : score[1])[parameter], 2e-11);
+  sink.reset();
+  sink.fail_next = true;
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
+  CHECK(sink.state() == DerivativeSinkState::POISONED);
+  sink.reset();
+  CHECK_NOTHROW(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
+  CHECK(stream->storageDiagnostics().retained_numeric_bytes == diagnostic.retained_numeric_bytes);
+  CHECK(stream->storageDiagnostics().storage_fingerprint == diagnostic.storage_fingerprint);
+  auto unsupported = channels;
+  unsupported[1].local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+  sink.reset();
+  CHECK_THROWS(stream->applyVJPs({unsupported.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
+  CHECK(sink.state() == DerivativeSinkState::IDLE);
+  const auto snapshot = component.snapshotParameters();
+  component.publishParameters(snapshot, snapshot.version);
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, sink));
+  CHECK(sink.state() == DerivativeSinkState::POISONED);
+}
+
+TEST_CASE("PsiFormer complex stream physical finite differences and concrete factory rejection",
+          "[wavefunction][psiformer][complex_wf][complex_streaming]")
+{
+  using namespace wftrain;
+  const SimulationCell simulation_cell(cell());
+  auto p = electrons(simulation_cell), clone_p = electrons(simulation_cell), foreign_p = electrons(simulation_cell);
+  auto source = ions(simulation_cell);
+  const int mass = p.getSpeciesSet().findAttribute("mass");
+  p.getSpeciesSet()(mass, 0) = clone_p.getSpeciesSet()(mass, 0) = .8;
+  p.getSpeciesSet()(mass, 1) = clone_p.getSpeciesSet()(mass, 1) = 1.7;
+  p.resetGroups();
+  clone_p.resetGroups();
+  PsiFormerComplexWF component("fdstream", parameters(), p, source, clone_cap, {.13, -.09, .04});
+  auto base_clone = component.makeClone(clone_p);
+  auto& clone = dynamic_cast<PsiFormerComplexWF&>(*base_clone);
+  PsiFormerComplexWF foreign("foreign", parameters(), foreign_p, source, clone_cap);
+  RefVectorWithLeader<WaveFunctionComponent> components(component);
+  components.push_back(component);
+  RefVectorWithLeader<ParticleSet> particles(p);
+  particles.push_back(p);
+  const auto cap = component.streamingDerivativeRequiredBytes(1);
+  const auto prepare = [&] {
+    return component.makeBudgetedStreamingDerivativeOperator(components, particles, 0, 0, 3, cap);
+  };
+  const auto original = component.snapshotParameters();
+  const auto log_center = evaluate(component, p);
+  std::vector<C> score, kinetic;
+  const double epsilon = 2e-5;
+  // One independent public-component FD per canonical role, including imaginary heads and cusp.
+  for (const auto& block : component.parameterSchema().blocks())
+  {
+    std::array<C, 2> log, energy;
+    for (std::size_t sign = 0; sign < 2; ++sign)
+    {
+      auto candidate = component.snapshotParameters();
+      candidate.values = original.values;
+      candidate.values[block.offset] += sign == 0 ? epsilon : -epsilon;
+      component.publishParameters(candidate, candidate.version);
+      log[sign] = evaluate(component, p);
+      energy[sign] = component.observeCoulombEnergy(p, 0).kinetic;
+    }
+    score.push_back((std::exp(log[0] - log_center) - std::exp(log[1] - log_center)) / (2 * epsilon));
+    kinetic.push_back((energy[0] - energy[1]) / (2 * epsilon));
+  }
+  auto restored = component.snapshotParameters();
+  restored.values = original.values;
+  component.publishParameters(restored, restored.version);
+  auto stream = prepare();
+  const auto& schema = component.parameterSchema();
+  const C one{1};
+  std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP,
+        {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 0, 0, {&one, 1}}, 0},
+      {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP,
+        {schema.providerId(), schema.fingerprint(), stream->parameterVersion(), 0, 0, {&one, 1}},
+        localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  ComplexStreamingSink sink;
+  stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink);
+  for (std::size_t block = 0; block < schema.blocks().size(); ++block)
+  {
+    close(sink.values[0][schema.blocks()[block].offset], score[block], 3e-6);
+    close(sink.values[1][schema.blocks()[block].offset], kinetic[block], 3e-5);
+  }
+  RefVectorWithLeader<WaveFunctionComponent> wrong(component);
+  wrong.push_back(foreign);
+  CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(wrong, particles, 0, 0, 3, cap));
+  RefVectorWithLeader<ParticleSet> wrong_particles(p);
+  wrong_particles.push_back(clone_p);
+  CHECK_THROWS(component.makeBudgetedStreamingDerivativeOperator(components, wrong_particles, 0, 0, 3, cap));
+  p.getSpeciesSet()(mass, 0) = 0;
+  p.resetGroups();
+  CHECK_THROWS(prepare());
+  p.getSpeciesSet()(mass, 0) = .8;
+  p.resetGroups();
+  CHECK_NOTHROW(prepare());
+  evaluate(clone, clone_p);
+  clone_p.makeMove(0, ParticleSet::PosType{.007, -.011, .013});
+  clone.ratio(clone_p, 0);
+  CHECK_THROWS(prepare()); // another clone's unresolved proposal blocks the whole family
+  sink.reset();
+  CHECK_THROWS(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
+  clone.restore(0);
+  clone_p.rejectMove(0);
+  sink.reset();
+  CHECK_NOTHROW(stream->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, sink));
+  CHECK(component.structuredParameterProvider() == nullptr);
+}
 } // namespace qmcplusplus

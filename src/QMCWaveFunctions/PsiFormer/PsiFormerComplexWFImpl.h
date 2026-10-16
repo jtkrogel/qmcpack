@@ -22,6 +22,9 @@ struct PsiFormerComplexWF::Impl
   using C = psiformer::determinant::Complex;
   using Amplitude = psiformer::determinant::ComplexLogAmplitude;
 
+  /// A weak family reference shares scratch without extending its lifetime or creating a cycle.
+  struct DerivativeLane;
+
   /// Stable shared ownership keeps metadata/executors fixed while canonical values mutate under mutex.
   struct Model
   {
@@ -63,6 +66,208 @@ struct PsiFormerComplexWF::Impl
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
     mutable std::shared_mutex mutex;
     std::atomic<std::size_t> pending_proposals{0};
+    std::mutex derivative_factory_mutex;
+    std::weak_ptr<DerivativeLane> derivative_lane;
+  };
+
+  /// One leased score tape, one complete kinetic tape, and three fixed complex contractions.
+  struct DerivativeLane
+  {
+    /// Derive the same checked shape consumed by both qualified numerical owners.
+    static pf::PsiFormerStorageShape shape(const Model& s)
+    {
+      return {s.model.ne, s.model.cfg.nuclei.shape[0], s.model.ndet, s.model.dim, s.model.heads,
+          s.plan.parameter(psiformer::ParameterRole::ELECTRON_EMBEDDING_WEIGHT).shape[0],
+          s.model.blocks, s.model.p.size()};
+    }
+
+    /// Include both executor ion copies and all channel buffers before any numerical allocation.
+    static std::size_t required(const Model& s, std::size_t samples)
+    {
+      const auto dimensions = shape(s);
+      const char* message = "Complex PsiFormer derivative bytes overflow";
+      std::size_t bytes = pf::DirectComplexScoreWorkspace::storageRequirement(dimensions);
+      pf::addStorageBytes(bytes, pf::DirectComplexKineticWorkspace::storageRequirement(dimensions), message);
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<C>(
+          pf::checkedStorageProduct(3, dimensions.parameter_count, message), message), message);
+      std::size_t doubles = pf::checkedStorageProduct(6, dimensions.nuclei, message);
+      pf::addStorageBytes(doubles, pf::checkedStorageProduct(4,
+          pf::checkedStorageProduct(samples, dimensions.electrons, message), message), message);
+      pf::addStorageBytes(bytes, pf::checkedStorageBytes<double>(doubles, message), message);
+      return bytes;
+    }
+
+    /// Only the already-admitted factory may allocate the lane; there is no probe preparation.
+    explicit DerivativeLane(const Model& s)
+        : score(s.model, s.plan), kinetic(s.model, s.plan, s.cartesian_twist),
+          score_work(score.makeWorkspace()), kinetic_work(kinetic.makeWorkspace(kinetic.requiredStorageBytes()))
+    {
+      for (auto& channel : channels)
+        channel.resize(s.model.p.size());
+    }
+
+    /// Count capacities, including executor metadata that is outside the two workspaces.
+    std::size_t bytes() const
+    {
+      std::size_t result = score_work->vectorStorageBytes();
+      pf::addStorageBytes(result, kinetic_work->vectorStorageBytes(), "derivative lane bytes overflow");
+      for (const auto bytes : {score.numericMetadataStorageBytes(), kinetic.numericMetadataStorageBytes()})
+        pf::addStorageBytes(result, bytes, "derivative lane bytes overflow");
+      for (const auto& channel : channels)
+        pf::addStorageBytes(result, pf::checkedStorageBytes<C>(channel.capacity(), "channel bytes overflow"),
+                            "derivative lane bytes overflow");
+      return result;
+    }
+
+    /// Track all persistent numerical allocations, not evaluation generations.
+    std::size_t fingerprint() const noexcept
+    {
+      std::size_t result = score_work->storageFingerprint() ^ kinetic_work->storageFingerprint();
+      result ^= score.numericMetadataStorageFingerprint() ^ kinetic.numericMetadataStorageFingerprint();
+      for (const auto& channel : channels)
+        psiformer::determinant::detail::mixStorage(result, channel);
+      return result;
+    }
+
+    const pf::DirectComplexScoreExecutor score;
+    const pf::DirectComplexKineticExecutor kinetic;
+    std::unique_ptr<pf::DirectComplexScoreWorkspace> score_work;
+    std::unique_ptr<pf::DirectComplexKineticWorkspace> kinetic_work;
+    std::array<std::vector<C>, 3> channels;
+    std::mutex execution_mutex;
+  };
+
+  /// Immutable sample snapshot; operators in one model family lease a single numerical lane.
+  struct DerivativeStream final : wftrain::StreamingDerivativeOperator
+  {
+    /// Metadata and sample buffers are allocated only after the outer factory's exact cap check.
+    DerivativeStream(std::shared_ptr<Model> model, std::shared_ptr<DerivativeLane> scratch,
+        std::size_t ordinal, std::size_t offset, std::size_t samples, std::size_t chunk)
+        : state(std::move(model)), lane(std::move(scratch)), version(state->model.p.version()),
+          ordinal(ordinal), offset(offset), samples(samples), chunks(*state->schema, version, chunk),
+          positions(3 * samples * state->model.ne), inverse_masses(samples * state->model.ne)
+    {}
+
+    /// Advertise only ordinary-transpose, complete kinetic and score VJPs over real parameters.
+    wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
+    {
+      using namespace wftrain;
+      StreamingDerivativeCapabilities c;
+      c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
+          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
+      c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE);
+      c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+      c.maximum_vjp_channels = 3;
+      c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
+      c.maximum_sample_tile_size = 1;
+      c.fixed_parameter_scratch_vectors = 7;
+      c.block_streaming = true;
+      return c;
+    }
+
+    /// Keep schema identity valid for the complete operator lifetime.
+    const wftrain::StructuredParameterSchema& parameterSchema() const noexcept override { return *state->schema; }
+
+    /// Bind requests to the snapshot version even after later model publication.
+    std::size_t parameterVersion() const noexcept override { return version; }
+
+    /// Preserve the caller's ordered batch identity.
+    std::size_t batchOrdinal() const noexcept override { return ordinal; }
+
+    /// Preserve the caller's sample interval origin.
+    std::size_t sampleOffset() const noexcept override { return offset; }
+
+    /// Empty batches retain the honestly charged lane but emit no parameter chunks.
+    std::size_t sampleCount() const noexcept override { return samples; }
+
+    /// Return the immutable canonical, block-respecting partition.
+    const wftrain::ParameterChunkPlan& parameterChunkPlan() const noexcept override { return chunks; }
+
+    /// Count each lane once in aggregate owners and report every per-operator numeric buffer.
+    wftrain::StreamingDerivativeStorageDiagnostics storageDiagnostics() const override
+    {
+      wftrain::StreamingDerivativeStorageDiagnostics d;
+      d.parameter_count = state->schema->parameterCount();
+      d.sample_count = samples;
+      d.real_parameter_vectors = 2;
+      d.complex_parameter_vectors = 5;
+      d.parameter_scratch_bytes = d.parameter_count * (2 * sizeof(double) + 5 * sizeof(C));
+      d.shared_workspace_bytes = lane->bytes();
+      d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
+      d.sample_position_bytes = positions.capacity() * sizeof(double);
+      d.sample_auxiliary_bytes = inverse_masses.capacity() * sizeof(double);
+      d.retained_numeric_bytes = d.shared_workspace_bytes + d.sample_position_bytes + d.sample_auxiliary_bytes;
+      d.shared_workspace_identity = reinterpret_cast<std::uintptr_t>(lane.get());
+      d.allocation_generation = 1;
+      d.storage_fingerprint = lane->fingerprint();
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, positions);
+      psiformer::determinant::detail::mixStorage(d.storage_fingerprint, inverse_masses);
+      return d;
+    }
+
+    /// Traverse each sample once per requested qualified owner, never once per parameter chunk.
+    void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
+        wftrain::DerivativeAdjoint, wftrain::ParameterReductionSink& sink) const override
+    {
+      using namespace wftrain;
+      std::unique_lock execution(lane->execution_mutex);
+      {
+        std::shared_lock read(state->mutex);
+        if (version != state->model.p.version() || state->pending_proposals.load(std::memory_order_relaxed))
+          throw std::logic_error("Complex PsiFormer derivative snapshot is stale or family has a pending move");
+        bool need_score = false, need_kinetic = false;
+        for (std::size_t channel = 0; channel < requested.size(); ++channel)
+        {
+          std::fill(lane->channels[channel].begin(), lane->channels[channel].end(), C{});
+          need_score |= requested[channel].product == DerivativeProduct::SCORE_VJP;
+          need_kinetic |= requested[channel].product == DerivativeProduct::LOCAL_ENERGY_VJP;
+        }
+        const auto n = state->model.ne, p = state->model.p.size();
+        for (std::size_t sample = 0; sample < samples; ++sample)
+        {
+          const auto coordinates = pf::GeometryPositionView::interleaved(positions.data() + 3 * sample * n, n);
+          const C* score = nullptr;
+          const C* kinetic = nullptr;
+          if (need_score)
+          {
+            lane->score_work->setPositions(coordinates);
+            score = lane->score.evaluate(*lane->score_work).parameter_score;
+          }
+          if (need_kinetic)
+          {
+            lane->kinetic_work->setPositions(coordinates);
+            kinetic = lane->kinetic.evaluate(*lane->kinetic_work, inverse_masses.data() + sample * n, n).parameter_response;
+          }
+          for (std::size_t channel = 0; channel < requested.size(); ++channel)
+          {
+            const auto* response = requested[channel].product == DerivativeProduct::SCORE_VJP ? score : kinetic;
+            const C coefficient = requested[channel].coefficients.values[sample];
+            for (std::size_t parameter = 0; parameter < p; ++parameter)
+              lane->channels[channel][parameter] += coefficient * response[parameter];
+          }
+        }
+        for (std::size_t channel = 0; channel < requested.size(); ++channel)
+          for (const C value : lane->channels[channel])
+            if (!psiformer::determinant::isFiniteComplex(value))
+              throw std::runtime_error("Complex PsiFormer derivative contraction is nonfinite");
+      }
+      // Caller-controlled sink callbacks never run under the model lock; lane storage remains leased.
+      if (samples)
+        for (const auto& chunk : chunks.chunks())
+          for (std::size_t channel = 0; channel < requested.size(); ++channel)
+            sink.add(channel, {chunk, {lane->channels[channel].data() + chunk.parameter_offset, chunk.count}});
+    }
+
+    /// A VJP-only numerical milestone must not fall back to a dense Jacobian JVP.
+    void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView&,
+        wftrain::SampleProductSink&) const override
+    { throw std::logic_error("Complex PsiFormer score JVP is not qualified"); }
+
+    const std::shared_ptr<Model> state;
+    const std::shared_ptr<DerivativeLane> lane;
+    const std::size_t version, ordinal, offset, samples;
+    const wftrain::ParameterChunkPlan chunks;
+    std::vector<double> positions, inverse_masses;
   };
 
   /// Validate the explicit initializer profile before consuming its canonical storage.
@@ -406,6 +611,90 @@ PsiFormerComplexWF::NumericStorage PsiFormerComplexWF::numericStorage() const
 {
   std::shared_lock read(impl_->state->mutex);
   return impl_->numericStorage();
+}
+
+/// Preflight an independent derivative budget without constructing either retained tape.
+std::size_t PsiFormerComplexWF::streamingDerivativeRequiredBytes(std::size_t samples) const
+{
+  std::shared_lock read(impl_->state->mutex);
+  return Impl::DerivativeLane::required(*impl_->state, samples);
+}
+
+/// Validate every concrete binding before allocation; unbudgeted discovery remains deliberately closed.
+std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBudgetedStreamingDerivativeOperator(
+    const RefVectorWithLeader<WaveFunctionComponent>& components,
+    const RefVectorWithLeader<ParticleSet>& particles, std::size_t ordinal, std::size_t offset,
+    std::size_t chunk, std::size_t maximum_bytes) const
+{
+  const auto state = impl_->state;
+  std::shared_lock read(state->mutex);
+  const auto samples = particles.size(), n = state->model.ne;
+  const auto required = Impl::DerivativeLane::required(*state, samples);
+  if (!maximum_bytes || maximum_bytes == std::numeric_limits<std::size_t>::max() || required > maximum_bytes)
+    throw std::length_error("Complex PsiFormer derivative numeric budget exceeded before preparation");
+  if (&components.getLeader() != this || &particles.getLeader() != impl_->particles ||
+      components.size() != samples || !chunk || offset > std::numeric_limits<std::size_t>::max() - samples)
+    throw std::invalid_argument("Complex PsiFormer derivative leader, extent or chunk mismatch");
+  if (state->pending_proposals.load(std::memory_order_relaxed))
+    throw std::logic_error("Complex PsiFormer derivative preparation requires an idle model family");
+  impl_->requireIdle(*impl_->particles);
+  validateRuntimeLattice(*state->source, state->environment, "Complex PsiFormer derivative source");
+  if (state->source->getTotalNum() != static_cast<int>(state->model.cfg.nuclei.shape[0]))
+    throw std::invalid_argument("Complex PsiFormer derivative fixed-source extent mismatch");
+  const auto& species = state->source->getSpeciesSet();
+  const int charge = species.findAttribute("charge");
+  if (charge < 0)
+    throw std::invalid_argument("Complex PsiFormer derivative fixed-source charges are missing");
+  for (int atom = 0; atom < state->source->getTotalNum(); ++atom)
+  {
+    if (species(charge, state->source->GroupID[atom]) != state->model.cfg.charges.x[atom])
+      throw std::invalid_argument("Complex PsiFormer derivative fixed-source charge changed");
+    for (int d = 0; d < 3; ++d)
+      if (state->source->R[atom][d] != state->model.cfg.nuclei.x[3 * atom + d])
+        throw std::invalid_argument("Complex PsiFormer derivative fixed-source configuration changed");
+  }
+  // No clone, schema, physical mass or coordinate failure may follow numerical lane allocation.
+  for (std::size_t sample = 0; sample < samples; ++sample)
+  {
+    const auto* component = dynamic_cast<const PsiFormerComplexWF*>(&components[sample]);
+    if (!component || component->impl_->state != state ||
+        &component->parameterSchema() != state->schema.get())
+      throw std::invalid_argument("Complex PsiFormer derivative clone/model/schema mismatch");
+    component->impl_->requireIdle(particles[sample]);
+    const auto& p = particles[sample];
+    const auto& masses = p.get_mass_by_group();
+    if (masses.size() != static_cast<std::size_t>(p.groups()))
+      throw std::invalid_argument("Complex PsiFormer derivative target mass extent mismatch");
+    for (int group = 0; group < p.groups(); ++group)
+      if (!psiformer::determinant::isFiniteReal(masses[group]) || masses[group] <= 0 ||
+          !psiformer::determinant::isFiniteReal(1.0 / masses[group]))
+        throw std::invalid_argument("Complex PsiFormer derivative masses must have positive finite inverses");
+    for (std::size_t electron = 0; electron < n; ++electron)
+      for (int d = 0; d < 3; ++d)
+        if (!psiformer::determinant::isFiniteReal(p.R[electron][d]))
+          throw std::invalid_argument("Complex PsiFormer derivative sample coordinate is nonfinite");
+  }
+  // Factory serialization never waits on a lane execution lease while holding the model read lock.
+  std::lock_guard preparation(state->derivative_factory_mutex);
+  auto lane = state->derivative_lane.lock();
+  if (!lane)
+    lane = std::make_shared<Impl::DerivativeLane>(*state);
+  auto result = std::make_unique<Impl::DerivativeStream>(state, lane, ordinal, offset, samples, chunk);
+  for (std::size_t sample = 0; sample < samples; ++sample)
+  {
+    const auto& p = particles[sample];
+    const auto& masses = p.get_mass_by_group();
+    for (int group = 0; group < p.groups(); ++group)
+      for (int electron = p.first(group); electron < p.last(group); ++electron)
+        result->inverse_masses[sample * n + electron] = 1.0 / masses[group];
+    for (std::size_t electron = 0; electron < n; ++electron)
+      for (int d = 0; d < 3; ++d)
+        result->positions[3 * (sample * n + electron) + d] = p.R[electron][d];
+  }
+  if (result->storageDiagnostics().retained_numeric_bytes != required)
+    throw std::logic_error("Complex PsiFormer derivative numeric capacity differs from exact admission");
+  state->derivative_lane = lane;
+  return result;
 }
 
 /// Destroy native numerical state only in the sole owner TU.

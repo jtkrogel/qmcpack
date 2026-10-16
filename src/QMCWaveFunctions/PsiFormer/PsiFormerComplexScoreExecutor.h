@@ -32,6 +32,26 @@ class DirectComplexScoreWorkspace
 {
   using C = qmcplusplus::psiformer::determinant::Complex;
 public:
+  /// Count the existing mixed-domain VALUE tape before constructing numerical buffers.
+  static std::size_t storageRequirement(const PsiFormerStorageShape& shape)
+  {
+    using namespace qmcplusplus::psiformer;
+    const char* message = "complex score storage overflow";
+    const auto matrix = checkedStorageProduct(shape.determinants,
+        checkedStorageProduct(shape.electrons, shape.electrons, message), message);
+    const auto features = checkedStorageProduct(shape.electrons, shape.feature_width, message);
+    const auto layout = makeSpatialJetLayout(1, matrix, shape.electrons, SpatialJetMode::VALUE_ONLY);
+    std::size_t bytes = scoreWorkspaceStorageRequirement(shape) -
+        checkedStorageBytes<double>(checkedStorageProduct(3, matrix, message), message) -
+        determinantStorageRequirement(shape.determinants, shape.electrons);
+    addStorageBytes(bytes, ComplexOrbitalHeadWorkspace::storageRequirement(layout), message);
+    addStorageBytes(bytes, determinant::ComplexDeterminantWorkspace::storageRequirement(
+        shape.determinants, shape.electrons), message);
+    addStorageBytes(bytes, checkedStorageBytes<double>(checkedStorageSum(matrix, features, message), message), message);
+    addStorageBytes(bytes, checkedStorageBytes<C>(checkedStorageSum(matrix, shape.parameter_count, message), message), message);
+    return bytes;
+  }
+
   /// Mutable prepared buffers cannot be copied between clones.
   DirectComplexScoreWorkspace(const DirectComplexScoreWorkspace&) = delete;
 
@@ -188,6 +208,13 @@ public:
 
   /// Preserve stable identity under assignment as well.
   DirectComplexScoreExecutor& operator=(DirectComplexScoreExecutor&&) = delete;
+
+  /// Include the real trunk executor's fixed-ion copy in external lane accounting.
+  std::size_t numericMetadataStorageBytes() const { return trunk_.numericMetadataStorageBytes(); }
+
+  /// Track fixed-ion metadata separately from the mutable tape allocation identity.
+  std::size_t numericMetadataStorageFingerprint() const noexcept
+  { return trunk_.numericMetadataStorageFingerprint(); }
 
   /// Prepare one independent clone with only the real taped trunk and complex head.
   std::unique_ptr<DirectComplexScoreWorkspace> makeWorkspace() const
