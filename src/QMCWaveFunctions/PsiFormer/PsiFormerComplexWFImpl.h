@@ -74,6 +74,7 @@ struct PsiFormerComplexWF::Impl
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
         std::size_t limit)
     {
+      psiformer::device::reportCurrentDeviceMemoryAdmission(app_log());
       return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation());
     }
 

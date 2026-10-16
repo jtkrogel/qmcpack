@@ -42,6 +42,18 @@ inline void checkRuntime(Error error, const char* operation)
   throw std::runtime_error(std::string(operation) + ": " + description);
 }
 
+/// Resolve the process-frozen admission before initial image upload on this device.
+inline void reportCurrentDeviceMemoryAdmission(std::ostream& out)
+{
+  int ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipGetDevice(&ordinal), "hipGetDevice for aggregate admission");
+#else
+  checkRuntime(cudaGetDevice(&ordinal), "cudaGetDevice for aggregate admission");
+#endif
+  deviceMemoryMetrics(ordinal).reportAdmission(out, ordinal);
+}
+
 /// Reject byte-count overflow before any allocation or transfer is submitted.
 template<class T>
 inline std::size_t checkedDeviceBytes(std::size_t count)
@@ -107,13 +119,16 @@ public:
     if (data_ && device_ordinal != device_ordinal_)
       throw std::logic_error("PsiFormer device buffer cannot grow on a different owning device");
     auto& metrics = deviceMemoryMetrics(device_ordinal);
+    // Charge old and replacement capacities together. Failed malloc rolls back
+    // the reservation; a failed old-buffer free keeps both allocations charged.
+    auto reservation = metrics.reserveAllocation(bytes);
     void* replacement = nullptr;
 #ifdef QMC_CUDA2HIP
     checkRuntime(hipMalloc(&replacement, bytes), "hipMalloc");
 #else
     checkRuntime(cudaMalloc(&replacement, bytes), "cudaMalloc");
 #endif
-    metrics.allocated(bytes);
+    reservation.commit();
     // Publish new ownership only after allocation succeeds.
     T* previous = data_;
     const auto previous_bytes = capacity_ * sizeof(T);

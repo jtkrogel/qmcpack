@@ -1078,6 +1078,7 @@ std::shared_ptr<const pf::DirectBatchTileBackend> makePsiFormerNumericalTiles(
   if (resolution.backend != PreparedDeviceCrowdHooks::backend())
     throw std::invalid_argument("PsiFormer numerical tile request does not match the compiled device backend");
   const auto preparation = configuredGpuTargetPreparation(plan, precision);
+  reportCurrentDeviceMemoryAdmission(app_log());
   auto image = std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, model.p.version());
   const auto backend = resolution.backend;
   const auto version = model.p.version();
