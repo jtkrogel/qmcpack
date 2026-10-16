@@ -3,6 +3,7 @@
 // See LICENSE file in top directory. Copyright (c) 2026 QMCPACK developers.
 //////////////////////////////////////////////////////////////////////////////////////
 #include "PsiFormerDeviceComplexSpatialKernels.h"
+#include "PsiFormerDeviceComplexWeightedProducts.h"
 #include <limits>
 #include <cfloat>
 #include <stdexcept>
@@ -110,13 +111,6 @@ __device__ cuDoubleComplex squareTrace(const cuDoubleComplex* inverse, const cuD
   return sum.value();
 }
 
-/// Recover an analytic channel weight without any extra BD-sized tensor.
-__device__ cuDoubleComplex weight(const ComplexValueChannel& channel, double shift, cuDoubleComplex total)
-{
-  const auto scale = exp(channel.log_abs - shift);
-  return QMC_PF_DIV(make_cuDoubleComplex(scale * cuCreal(channel.phase), scale * cuCimag(channel.phase)), total);
-}
-
 /// Strict full-population inverse admission, determinant traces, then real cusp composition.
 __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::size_t n,
     const ComplexValueChannel* channels, const ComplexValueResult* amplitude, const cuDoubleComplex* inverse,
@@ -132,7 +126,10 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
   // Every canonical coefficient is1: singular channels cannot be skipped at zero weight.
   for (std::size_t d = 0; d < determinants; ++d)
   {
-    if (records[d].status != 0 || amplitude[b].status != 0)
+    if (records[d].status != 0 || amplitude[b].status != 0 || !finite(records[d].phase) ||
+        !device_math::isFiniteBinary64(records[d].log_abs) || !finite(amplitude[b].phase) ||
+        !device_math::isFiniteBinary64(amplitude[b].log_abs) ||
+        fmax(fabs(cuCreal(amplitude[b].phase)), fabs(cuCimag(amplitude[b].phase))) == 0)
     {
       fail(status, b);
       return;
@@ -145,12 +142,39 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
     const auto scale = exp(records[d].log_abs - shift);
     total.add(make_cuDoubleComplex(scale * cuCreal(records[d].phase), scale * cuCimag(records[d].phase)));
   }
+  // Normalize without overflowing a finite-component norm or losing a subnormal denominator.
+  const auto denominator = total.value();
+  const auto scale = fmax(fabs(cuCreal(denominator)), fabs(cuCimag(denominator)));
+  if (!finite(denominator) || !(scale > 0))
+  {
+    fail(status, b);
+    return;
+  }
+  const auto re = cuCreal(denominator) / scale, im = cuCimag(denominator) / scale;
+  const auto norm = hypot(re, im), log_total = log(scale) + log(norm);
+  const auto phase = make_cuDoubleComplex(re / norm, im / norm);
+  if (!device_math::isFiniteBinary64(log_total) || !finite(phase))
+  {
+    fail(status, b);
+    return;
+  }
   for (std::size_t lane = 0; lane < 3 * n; ++lane)
   {
     ComplexSum sum;
     for (std::size_t d = 0; d < determinants; ++d)
-      sum.add(QMC_PF_MUL(weight(records[d], shift, total.value()), trace(inverse + b * matrix_span + d * nn,
-          head + (1 + lane) * m + b * matrix_span + d * nn, n)));
+    {
+      const auto term = trace(inverse + b * matrix_span + d * nn,
+          head + (1 + lane) * m + b * matrix_span + d * nn, n);
+      cuDoubleComplex weighted;
+      // Tiny weights cannot admit an unweighted overflow or erase a finite weighted trace.
+      if (!finite(term) || !complex_detail::weightedProduct((records[d].log_abs - shift) - log_total,
+          QMC_PF_DIV(records[d].phase, phase), term, weighted))
+      {
+        fail(status, b);
+        return;
+      }
+      sum.add(weighted);
+    }
     gradient[3 * b * n + lane] = sum.value();
   }
   for (std::size_t e = 0; e < n; ++e)
@@ -167,7 +191,15 @@ __global__ void tracesKernel(std::size_t batch, std::size_t determinants, std::s
         const auto t = trace(inverse + offset, derivative, n);
         channel.add(QMC_PF_SUB(QMC_PF_MUL(t, t), squareTrace(inverse + offset, derivative, n, product + b * nn)));
       }
-      ratio.add(QMC_PF_MUL(weight(records[d], shift, total.value()), channel.value()));
+      cuDoubleComplex weighted;
+      // Preserve the original finite unweighted quadratic domain before stable weighting.
+      if (!finite(channel.value()) || !complex_detail::weightedProduct((records[d].log_abs - shift) - log_total,
+          QMC_PF_DIV(records[d].phase, phase), channel.value(), weighted))
+      {
+        fail(status, b);
+        return;
+      }
+      ratio.add(weighted);
     }
     // Ordinary complex squares retain the phase-gradient kinetic cross terms.
     ComplexSum core_square, physical_square;

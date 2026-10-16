@@ -7,6 +7,108 @@
 #include "PsiFormerDeviceComplexSpatial.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerComplexSpatialExecutor.h"
 
+/// Tiny normalized weights must retain finite representable spatial terms, never overflow admission.
+void validateComplexSpatialWeightedLeaves(qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA>& queue)
+{
+  using namespace qmcplusplus::psiformer;
+  using namespace qmcplusplus::psiformer::device;
+  using C = std::complex<double>;
+  const auto pack = [](C z) { return make_cuDoubleComplex(z.real(), z.imag()); };
+  const auto host = [](cuDoubleComplex z) { return C(cuCreal(z), cuCimag(z)); };
+  DeviceBuffer<cuDoubleComplex> matrix(8), inverse(8), solve(4), head(72), product(4), g(6), l(2), r(2);
+  DeviceBuffer<std::size_t> permutation(4);
+  DeviceBuffer<ComplexValueChannel> records(2);
+  DeviceBuffer<ComplexValueResult> amplitude(1);
+  DeviceBuffer<std::uint64_t> status(1);
+  DeviceBuffer<double> cusp(9);
+  const std::vector<double> zero_cusp(9, 0);
+  cusp.upload(zero_cusp.data(), 9);
+  const auto clear = std::numeric_limits<std::uint64_t>::max();
+  const ComplexValueResult regular{make_cuDoubleComplex(1, 0), 0, 1, 0, 0};
+  double max_scaled = 0;
+  const auto launch = [&] {
+    status.upload(&clear, 1);
+    checkRuntime(launchComplexSpatialTraces(queue.getNative(), 1, 2, 2, records.data(), amplitude.data(),
+        inverse.data(), head.data(), cusp.data(), product.data(), g.data(), l.data(), r.data(), status.data()),
+        "finite weighted spatial leaf");
+    queue.sync();
+    std::uint64_t actual;
+    status.download(&actual, 1);
+    return actual == clear;
+  };
+  for (bool phase : {false, true})
+  {
+    const C a = std::polar(1e-200, phase ? 0.3 : 0), b = std::polar(1e-200, phase ? -0.7 : 0);
+    const std::vector<C> matrices{1, 0, 0, 1, a, 0, 0, b};
+    std::vector<C> jets(72), expected_g(6), expected_l(2), expected_r(2);
+    std::copy(matrices.begin(), matrices.end(), jets.begin());
+    jets[8 + 4] = C(1e-50, phase ? 0.2e-50 : 0);
+    jets[7 * 8 + 4] = C(0.4e-50, phase ? -0.1e-50 : 0);
+    determinant::ComplexDeterminantWorkspace oracle(2, 2, 0, 6, 2);
+    oracle.evaluateSpatial(matrices.data(), jets.data() + 8, 6, jets.data() + 56, 2,
+        expected_g.data(), expected_l.data(), expected_r.data());
+    std::vector<cuDoubleComplex> packed(72), raw_inverse(8), after_inverse(8);
+    std::transform(jets.begin(), jets.end(), packed.begin(), pack);
+    matrix.upload(packed.data(), 8);
+    head.upload(packed.data(), 72);
+    amplitude.upload(&regular, 1);
+    status.upload(&clear, 1);
+    checkRuntime(launchComplexValueFactor(queue.getNative(), 2, 2, matrix.data(), records.data(), status.data(),
+        inverse.data(), permutation.data(), solve.data()), "finite weighted spatial inverse");
+    queue.sync();
+    std::uint64_t factor_status;
+    status.download(&factor_status, 1);
+    if (factor_status != clear)
+      throw std::runtime_error("Weighted spatial leaf inverse rejected");
+    inverse.download(raw_inverse.data(), 8);
+    std::vector<ComplexValueChannel> channels(2);
+    records.download(channels.data(), 2);
+    if (std::exp(channels[1].log_abs - channels[0].log_abs) != 0 || !launch())
+      throw std::runtime_error("Weighted spatial fixture did not exercise an admitted underflowed weight");
+    std::vector<cuDoubleComplex> actual_g(6), actual_l(2), actual_r(2);
+    g.download(actual_g.data(), 6); l.download(actual_l.data(), 2); r.download(actual_r.data(), 2);
+    inverse.download(after_inverse.data(), 8);
+    if (std::memcmp(raw_inverse.data(), after_inverse.data(), 8 * sizeof(cuDoubleComplex)))
+      throw std::runtime_error("Stable spatial weighting consumed raw inverse storage");
+    const auto compare = [&](C actual, C expected) {
+      const auto error = std::abs(actual / 1e-250 - expected / 1e-250);
+      max_scaled = std::max(max_scaled, error);
+      near(error, 0, "finite weighted spatial scaled CPU Wide", 2e-11);
+      if (expected != C{} && actual == C{})
+        throw std::runtime_error("Representable weighted spatial term was silently zeroed");
+    };
+    for (std::size_t i = 0; i < 6; ++i) compare(host(actual_g[i]), expected_g[i]);
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+      compare(host(actual_l[i]), expected_l[i]);
+      compare(host(actual_r[i]), expected_r[i]);
+    }
+    // A tiny weight must NOT rescue an overflowing unweighted trace.
+    packed[8 + 4] = make_cuDoubleComplex(1e200, 0);
+    head.upload(packed.data(), 72);
+    if (launch())
+      throw std::runtime_error("Tiny weight admitted an overflowing unweighted spatial term");
+    packed[8 + 4] = pack(jets[8 + 4]);
+    head.upload(packed.data(), 72);
+    const auto saved = channels;
+    channels[0].log_abs = channels[1].log_abs = 0;
+    channels[0].phase = make_cuDoubleComplex(1, 0);
+    channels[1].phase = make_cuDoubleComplex(-1, 0);
+    records.upload(channels.data(), 2);
+    if (launch())
+      throw std::runtime_error("Zero spatial denominator admitted");
+    records.upload(saved.data(), 2);
+    auto node = regular;
+    node.phase = make_cuDoubleComplex(0, 0);
+    node.log_abs = -std::numeric_limits<double>::infinity();
+    amplitude.upload(&node, 1);
+    if (launch())
+      throw std::runtime_error("Expected amplitude node admitted spatial products");
+  }
+  std::cout << "PASS finite weighted complex spatial: tiny_G_L_nonzero=1 max_scaled_error=" << max_scaled
+      << " complex_phase=1 raw_inverse_unchanged=1 unweighted_overflow_rejected=1 node_denominator_rejected=1\n";
+}
+
 /// Numerical FULL oracle, ordinary complex kinetic consumer and lifecycle gate.
 void validateComplexSpatial()
 {
@@ -37,6 +139,7 @@ void validateComplexSpatial()
   pf::DirectComplexValueExecutor values(model, plan);
   auto value_workspace = values.makeWorkspace();
   qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+  validateComplexSpatialWeightedLeaves(queue);
   AcceleratorBlasHandle blas(queue);
   auto image = PreparedDeviceModel::preparePairedComplexValue(plan, parameters, model.cfg.nuclei.x);
   int ordinal = -1;
