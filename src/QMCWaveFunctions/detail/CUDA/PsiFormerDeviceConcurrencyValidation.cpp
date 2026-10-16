@@ -150,6 +150,34 @@ void run(int ordinal)
   for (std::size_t lane = 0; lane < 2; ++lane)
     compare(copyResult(concurrent.evaluate(*workspaces[lane], pf::DirectBatchMode::FULL_VGL,
         positions[lane].data(), 2, 1), shape.electrons()), expected[lane]);
+  auto changed = initialized.values;
+  changed[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin] *= 1.02;
+  std::array<std::vector<double>, 2> changed_expected;
+  {
+    PreparedDeviceBatchBackend serial_changed(image->makeUpdatedImage(changed, 2));
+    auto workspace = serial_changed.prepare(2);
+    for (std::size_t lane = 0; lane < 2; ++lane)
+      changed_expected[lane] = copyResult(serial_changed.evaluate(*workspace, pf::DirectBatchMode::FULL_VGL,
+          positions[lane].data(), 2, 2), shape.electrons());
+  }
+  bool actual_change = false;
+  for (std::size_t i = 0; i < expected[0].size(); ++i)
+    actual_change = actual_change || expected[0][i] != changed_expected[0][i];
+  if (!actual_change)
+    throw std::runtime_error("Changed-weight publication fixture did not change observables");
+  bool native_committed = false;
+  concurrent.publishParameters(changed, 2, [&] { native_committed = true; });
+  if (!native_committed)
+    throw std::runtime_error("Changed-weight publication omitted the authoritative commit");
+  compare(copyResult(borrowed, shape.electrons()), expected[0]);
+  bool stale_rejected = false;
+  try { (void)concurrent.evaluate(*workspaces[0], pf::DirectBatchMode::FULL_VGL, positions[0].data(), 2, 1); }
+  catch (const std::invalid_argument&) { stale_rejected = true; }
+  if (!stale_rejected)
+    throw std::runtime_error("Changed-weight publication accepted stale parameter generation");
+  for (std::size_t lane = 0; lane < 2; ++lane)
+    compare(copyResult(concurrent.evaluate(*workspaces[lane], pf::DirectBatchMode::FULL_VGL,
+        positions[lane].data(), 2, 2), shape.electrons()), changed_expected[lane]);
   bool rejected = false;
   try { (void)concurrent.prepareProductSession(); }
   catch (const std::invalid_argument&) { rejected = true; }
