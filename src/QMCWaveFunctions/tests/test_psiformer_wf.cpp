@@ -22,6 +22,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWaveFunctionBuilder.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerWF.h"
+#include "QMCDrivers/WFTrain/TrainingTimers.h"
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
 #include "Utilities/RuntimeOptions.h"
@@ -7392,6 +7393,63 @@ TEST_CASE("PsiFormer complete model persistence and DeepQMC export round trip", 
   inconsistent_input.close();
   inconsistent_active[0] += 1e-3;
   CHECK_THROWS_AS(inconsistent_generic.resetParametersExclusive(inconsistent_active), std::runtime_error);
+}
+
+TEST_CASE("PsiFormer native timer levels and owner handles", "[wavefunction][psiformer][timers]")
+{
+  auto& manager = getGlobalTimerManager();
+  struct RestoreThreshold
+  {
+    TimerManager<NewTimer>& manager;
+    std::string threshold;
+    ~RestoreThreshold() { manager.set_timer_threshold(threshold); }
+  } restore{manager, manager.get_timer_threshold_string()};
+
+  psiformer::PsiFormerTimers timers;
+  psiformer::PsiFormerTimers clone(timers);
+  wftrain::TrainingTimers training;
+  CHECK(&clone.value != &timers.value);
+  CHECK(clone.value.get_name() == timers.value.get_name());
+  CHECK(timers.value.get_name() == "PsiFormer::VALUE");
+  CHECK(timers.cpu_spatial.get_name() == "PsiFormer::CPU_spatial_complete");
+  CHECK(training.reduction.get_name() == "WFTrain::parameter_metric_reduction");
+
+  manager.set_timer_threshold(timer_level_fine);
+  const auto before_async = clone.value.get_num_calls();
+  auto worker = std::async(std::launch::async, [&] {
+    NativeTimerScope timer(clone.value);
+    psiformer::PsiFormerTimers worker_owner;
+    {
+      NativeTimerScope worker_timer(worker_owner.value);
+    }
+    return worker_owner.value.get_num_calls();
+  });
+  CHECK(worker.get() == 0);
+  CHECK(clone.value.get_num_calls() == before_async);
+
+  for (const auto level : {timer_level_none, timer_level_coarse, timer_level_medium, timer_level_fine})
+  {
+    manager.set_timer_threshold(level);
+    const auto medium_calls = timers.value.get_num_calls();
+    const auto fine_calls = timers.cpu_spatial.get_num_calls();
+    const auto training_calls = training.reduction.get_num_calls();
+    auto* parent = manager.current_timer();
+    {
+      NativeTimerScope medium(timers.value);
+      NativeTimerScope fine(timers.cpu_spatial);
+      NativeTimerScope reduction(training.reduction);
+    }
+#ifdef ENABLE_TIMERS
+    CHECK(timers.value.get_num_calls() - medium_calls == (level >= timer_level_medium ? 1 : 0));
+    CHECK(timers.cpu_spatial.get_num_calls() - fine_calls == (level >= timer_level_fine ? 1 : 0));
+    CHECK(training.reduction.get_num_calls() - training_calls == (level >= timer_level_medium ? 1 : 0));
+#else
+    CHECK(timers.value.get_num_calls() == medium_calls);
+    CHECK(timers.cpu_spatial.get_num_calls() == fine_calls);
+    CHECK(training.reduction.get_num_calls() == training_calls);
+#endif
+    CHECK(manager.current_timer() == parent);
+  }
 }
 
 } // namespace qmcplusplus

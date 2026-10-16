@@ -60,6 +60,7 @@ TrainingIterationResult HighParameterTraining::runIteration(
   std::exception_ptr preflight_failure;
   try
   {
+    NativeTimerScope timer(reduction_.phaseTimers().preparation);
     // Complete all rank-local checks and O(P) allocations before the pre-sampling
     // manifest. A rank that fails here still participates in that fixed control record.
     requireTrainingCapabilities(producer.capabilities(), requirements_,
@@ -100,6 +101,7 @@ TrainingIterationResult HighParameterTraining::runIteration(
   std::exception_ptr production_failure;
   try
   {
+    NativeTimerScope timer(reduction_.phaseTimers().objective);
     producer.accumulate(parameters, *accumulator);
   }
   catch (...)

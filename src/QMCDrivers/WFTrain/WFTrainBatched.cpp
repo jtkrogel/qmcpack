@@ -1775,6 +1775,7 @@ void WFTrainBatched::run()
                 teachers.emplace_back(determinant_overlap ? *samples.teachers[i]
                     : crowds_[samples.crowd_index]->get_walker_twfs()[i].get());
               }
+            NativeTimerScope candidate_timer(phase_timers_.candidate);
             selected_alpha = wftrain::selectNativeStep(training_input_, *myComm,
                 student_prototype_, population_.get_golden_hamiltonian(), selected_provider_id_,
                 configurations, chain_ids, teachers, rngs_[0], qmcdriver_input_.get_tau(), old, full,
@@ -1805,6 +1806,7 @@ void WFTrainBatched::run()
         std::exception_ptr preparation_failure;
         try
         {
+          NativeTimerScope preparation_timer(phase_timers_.preparation);
           parameters.emplace(selected_provider_->snapshotParameters());
           producer = std::make_unique<SampledOrbitalPretrainingProducer>(
               *student, *orbital_target_, retained_samples);
@@ -1949,6 +1951,7 @@ void WFTrainBatched::run()
         std::exception_ptr preparation_failure;
         try
         {
+          NativeTimerScope preparation_timer(phase_timers_.preparation);
           batches.reserve(retained_samples.size());
           std::size_t sample_offset = 0;
           std::size_t batch_ordinal = 0;
@@ -2044,6 +2047,7 @@ void WFTrainBatched::run()
           enforceMemoryBudget(*myComm, checkedMemoryAdd(retained_numeric_bytes, retained_configuration_bytes), training_input_.getMaximumRetainedBytes());
           try
           {
+            NativeTimerScope proposal_timer(phase_timers_.proposal);
             wftrain::StructuredParameterSnapshot candidate;
             if (resident_sr_budget.first)
             {
@@ -2072,7 +2076,10 @@ void WFTrainBatched::run()
               selected_displacement_norm = std::hypot(selected_displacement_norm, candidate.values[p] - parameters.values[p]);
             if (!wftrain::isFiniteTrainingReal(selected_displacement_norm))
               throw std::overflow_error("Resident ENERGY candidate displacement norm is nonfinite");
-            pending.parameter_version = selected_provider_->publishParameters(candidate, parameters.version);
+            {
+              NativeTimerScope publication_timer(phase_timers_.publication);
+              pending.parameter_version = selected_provider_->publishParameters(candidate, parameters.version);
+            }
           }
           catch (...)
           {
@@ -2753,6 +2760,7 @@ void WFTrainBatched::validateHamiltonianForTraining()
 
 void WFTrainBatched::refreshPublishedParameters(std::size_t parameter_version)
 {
+  NativeTimerScope timer(phase_timers_.refresh);
   // Publication modifies shared model state. Fence ranks before any clone evaluates it.
   myComm->barrier();
 

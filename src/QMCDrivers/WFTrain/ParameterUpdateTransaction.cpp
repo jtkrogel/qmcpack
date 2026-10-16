@@ -52,6 +52,7 @@ std::size_t completeParameterUpdate(
   bool proposal_live = false;
   try
   {
+    NativeTimerScope timer(reduction.phaseTimers().proposal);
     if (parameters.schema_fingerprint != schema.fingerprint() ||
         parameters.values.size() != schema.parameterCount())
       throw std::invalid_argument("Training parameter snapshot is incompatible with the provider");
@@ -115,6 +116,7 @@ std::size_t completeParameterUpdate(
   std::exception_ptr publication_failure;
   try
   {
+    NativeTimerScope timer(reduction.phaseTimers().publication);
     local_committed_version = provider.publishParameters(*candidate, parameters.version);
   }
   catch (...)

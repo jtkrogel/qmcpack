@@ -449,6 +449,7 @@ void DistributedParameterReduction::reduce(
     EnergyGradientAccumulator& accumulator,
     std::exception_ptr local_failure) const
 {
+  NativeTimerScope timer(phase_timers_.reduction);
   ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
                                          : ConsensusReason::NONE;
   if (reason == ConsensusReason::NONE &&
@@ -614,6 +615,7 @@ void DistributedParameterReduction::reduce(
     OrbitalPretrainingAccumulator& accumulator,
     std::exception_ptr local_failure) const
 {
+  NativeTimerScope timer(phase_timers_.reduction);
   ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
                                          : ConsensusReason::NONE;
   if (reason == ConsensusReason::NONE &&
@@ -708,6 +710,7 @@ ReductionDomain DistributedParameterReduction::reduceParameterVector(
     DerivativeArrayView<DerivativeValue> values,
     std::exception_ptr local_failure) const
 {
+  NativeTimerScope timer(phase_timers_.reduction);
   ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
                                          : ConsensusReason::NONE;
   constexpr std::size_t complex_dimension = 2;
@@ -804,6 +807,7 @@ DistributedParameterReduction::reduceWeightedSampleMoments(
     const DistributedWeightedSampleMoments& local_moments,
     std::exception_ptr local_failure) const
 {
+  NativeTimerScope timer(phase_timers_.reduction);
   ConsensusReason reason = local_failure ? ConsensusReason::LOCAL_EXCEPTION
                                          : ConsensusReason::NONE;
   constexpr std::size_t complex_dimension = 2;

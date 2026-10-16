@@ -19,6 +19,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerStorageRequirements.h"
 #include "QMCWaveFunctions/PsiFormer/PsiFormerPrecisionPolicy.h"
 #include "ResourceHandle.h"
+#include "QMCWaveFunctions/PsiFormer/PsiFormerTimers.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -1518,6 +1519,9 @@ private:
   void getAcceptedState(const ParticleSet& particles,
                         WFBufferType& buffer,
                         std::size_t parameter_version);
+
+  /// Clone-owned native handles are registered before any evaluation.
+  psiformer::PsiFormerTimers phase_timers_;
 
   /// Versioned native model protected against evaluation/reset overlap.
   std::shared_ptr<PsiFormerSharedState> model_state_;

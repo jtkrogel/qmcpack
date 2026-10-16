@@ -19,6 +19,7 @@
 #include "QMCDrivers/WFTrain/AcceleratorTrainingPlan.h"
 #include "QMCDrivers/WFTrain/EnergyGradientAccumulator.h"
 #include "QMCDrivers/WFTrain/OrbitalPretrainingAccumulator.h"
+#include "QMCDrivers/WFTrain/TrainingTimers.h"
 
 #include <cstddef>
 #include <exception>
@@ -150,7 +151,11 @@ public:
   /// Return the configured logical-parameter chunk limit.
   std::size_t maximumChunkSize() const noexcept { return policy_.maximum_chunk_size; }
 
+  /// Timers belong to this reduction/transaction context, including after copying.
+  const TrainingTimers& phaseTimers() const noexcept { return phase_timers_; }
+
 private:
+  TrainingTimers phase_timers_;
   Communicate* communicator_ = nullptr;
   DistributedReductionPolicy policy_;
 };

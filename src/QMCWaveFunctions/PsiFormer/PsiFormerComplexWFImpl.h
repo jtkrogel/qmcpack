@@ -364,6 +364,7 @@ struct PsiFormerComplexWF::Impl
     void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
         wftrain::DerivativeAdjoint, wftrain::ParameterReductionSink& sink) const override
     {
+      NativeTimerScope timer(phase_timers.parameter_vjp);
       using namespace wftrain;
       std::unique_lock execution(lane->execution_mutex);
       const C* output;
@@ -380,7 +381,10 @@ struct PsiFormerComplexWF::Impl
           lane->channels[c] = {requested[c].product == DerivativeProduct::SCORE_VJP ?
               GpuDerivativeLane::Products::Role::SCORE : GpuDerivativeLane::Products::Role::KINETIC,
               requested[c].coefficients.values.data(), samples};
-        lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels);
+        {
+          NativeTimerScope host_timer(phase_timers.gpu_call);
+          lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels);
+        }
         const auto result = lane->products->resultView();
         lane->products->validate(result);
         output = result.data;
@@ -390,6 +394,7 @@ struct PsiFormerComplexWF::Impl
           sink.add(c, {chunk, {output + c * parameterSchema().parameterCount() + chunk.parameter_offset, chunk.count}});
     }
 
+    psiformer::PsiFormerTimers phase_timers;
     const std::shared_ptr<GpuDerivativeLane> lane;
     const std::size_t version, ordinal, offset, samples;
     const wftrain::ParameterChunkPlan chunks;
@@ -541,6 +546,7 @@ struct PsiFormerComplexWF::Impl
     void evaluateVJPs(wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> requested,
         wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink& sink) const override
     {
+      NativeTimerScope timer(phase_timers.parameter_vjp);
       using namespace wftrain;
       std::unique_lock execution(lane->execution_mutex);
       {
@@ -562,11 +568,13 @@ struct PsiFormerComplexWF::Impl
           const C* kinetic = nullptr;
           if (need_score)
           {
+            NativeTimerScope numerical_timer(phase_timers.cpu_reverse);
             lane->score_work->setPositions(coordinates);
             score = lane->score.evaluate(*lane->score_work).parameter_score;
           }
           if (need_kinetic)
           {
+            NativeTimerScope numerical_timer(phase_timers.cpu_kinetic);
             lane->kinetic_work->setPositions(coordinates);
             kinetic = lane->kinetic.evaluate(*lane->kinetic_work, inverse_masses.data() + sample * n, n).parameter_response;
           }
@@ -595,6 +603,7 @@ struct PsiFormerComplexWF::Impl
     void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
         wftrain::SampleProductSink& sink) const override
     {
+      NativeTimerScope timer(phase_timers.score_jvp);
       std::unique_lock execution(lane->execution_mutex);
       {
         std::shared_lock read(state->mutex);
@@ -622,6 +631,7 @@ struct PsiFormerComplexWF::Impl
       }
     }
 
+    psiformer::PsiFormerTimers phase_timers;
     const std::shared_ptr<Model> state;
     const std::shared_ptr<DerivativeLane> lane;
     const std::size_t version, ordinal, offset, samples;
@@ -934,6 +944,7 @@ struct PsiFormerComplexWF::Impl
   /// Route VALUE/FULL/ACTIVE without duplicating physical twist, ratio or cache algebra.
   CoreResult core(const ParticleSet& p, bool spatial, int replacement = -1, int electron = -1)
   {
+    NativeTimerScope timer(spatial ? (electron < 0 ? phase_timers.vgl : phase_timers.gradient) : phase_timers.value);
     CoreResult result;
 #ifdef ENABLE_CUDA
     if (state->gpu)
@@ -945,8 +956,14 @@ struct PsiFormerComplexWF::Impl
           lane.positions[e * 3 + d] = replacement == e ? p.activeR(e)[d] : p.R[e][d];
       if (spatial)
       {
-        lane.full->evaluate(lane.positions);
-        lane.full->download(lane.full->resultView(), lane.amplitude, lane.gradient, lane.laplacian, lane.ratio);
+        {
+          NativeTimerScope host_timer(phase_timers.gpu_evaluate);
+          lane.full->evaluate(lane.positions);
+        }
+        {
+          NativeTimerScope host_timer(phase_timers.gpu_download);
+          lane.full->download(lane.full->resultView(), lane.amplitude, lane.gradient, lane.laplacian, lane.ratio);
+        }
         for (std::size_t i = 0; i < lane.gradient.size(); ++i)
           lane.converted[i] = {lane.gradient[i].x, lane.gradient[i].y};
         for (std::size_t i = 0; i < lane.laplacian.size(); ++i)
@@ -956,8 +973,14 @@ struct PsiFormerComplexWF::Impl
       }
       else
       {
-        lane.value->evaluate(lane.positions);
-        lane.value->download(lane.value->resultView(), lane.amplitude);
+        {
+          NativeTimerScope host_timer(phase_timers.gpu_evaluate);
+          lane.value->evaluate(lane.positions);
+        }
+        {
+          NativeTimerScope host_timer(phase_timers.gpu_download);
+          lane.value->download(lane.value->resultView(), lane.amplitude);
+        }
       }
       result.amplitude = {{lane.amplitude[0].phase.x, lane.amplitude[0].phase.y}, lane.amplitude[0].log_abs};
       result.parameter_version = lane.image->version();
@@ -966,6 +989,7 @@ struct PsiFormerComplexWF::Impl
 #endif
     if (spatial)
     {
+      NativeTimerScope numerical_timer(phase_timers.cpu_spatial);
       auto& workspace = electron < 0 ? *full : *active;
       positions(workspace, p, replacement);
       static_cast<pf::DirectComplexSpatialResult&>(result) = electron < 0
@@ -1047,6 +1071,7 @@ struct PsiFormerComplexWF::Impl
     pending = true;
   }
 
+  psiformer::PsiFormerTimers phase_timers;
   std::shared_ptr<Model> state;
   const ParticleSet* particles;
   std::unique_ptr<pf::DirectComplexValueWorkspace> value;
@@ -1145,6 +1170,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     const RefVectorWithLeader<ParticleSet>& particles, std::size_t ordinal, std::size_t offset,
     std::size_t chunk, std::size_t maximum_bytes) const
 {
+  NativeTimerScope timer(impl_->phase_timers.preparation);
   if (gpuInferenceEnabled())
     throw std::logic_error("Complex GPU inference does not prepare CPU derivative lanes");
   const auto state = impl_->state;
@@ -1225,6 +1251,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     std::size_t maximum_samples, std::size_t targets, std::size_t chunk,
     std::size_t device_cap, std::size_t host_cap, std::size_t work_cap) const
 {
+  NativeTimerScope timer(impl_->phase_timers.preparation);
 #ifdef ENABLE_CUDA
   if (gpuInferenceEnabled())
   {
@@ -1338,6 +1365,7 @@ wftrain::StructuredParameterSnapshot PsiFormerComplexWF::snapshotParameters() co
 std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                                 std::size_t expected_version)
 {
+  NativeTimerScope timer(impl_->phase_timers.publication);
   if (gpuInferenceEnabled())
     throw std::logic_error("Complex GPU inference image is immutable; parameter publication is unqualified");
   if (candidate.schema_fingerprint != parameterSchema().fingerprint() ||
@@ -1384,6 +1412,7 @@ std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
     const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version,
     std::size_t additional_device_cap, std::size_t additional_host_cap)
 {
+  NativeTimerScope timer(impl_->phase_timers.publication);
 #ifdef ENABLE_CUDA
   if (gpuInferenceEnabled())
   {

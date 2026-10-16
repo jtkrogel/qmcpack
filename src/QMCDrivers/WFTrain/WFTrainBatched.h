@@ -12,6 +12,7 @@
 #include "QMCDrivers/VMC/VMCBatchedSampling.h"
 #include "QMCDrivers/VMC/VMCDriverInput.h"
 #include "QMCDrivers/WFTrain/WFTrainDriverInput.h"
+#include "QMCDrivers/WFTrain/TrainingTimers.h"
 
 #include <cstddef>
 #include <memory>
@@ -59,6 +60,8 @@ public:
   void run() override;
 
 private:
+  wftrain::TrainingTimers phase_timers_;
+
   QMCRunType getRunType() override { return QMCRunType::WF_TRAIN_BATCH; }
 
   VMCDriverInput vmcdriver_input_;

@@ -2051,6 +2051,7 @@ std::shared_ptr<PsiFormerDerivativeScratch> acquireDerivativeScratch(
 class PsiFormerStreamingDerivativeOperator final : public wftrain::StreamingDerivativeOperator
 {
   friend class PsiFormerWF;
+  psiformer::PsiFormerTimers phase_timers_;
 public:
   static constexpr std::size_t MAXIMUM_VJP_CHANNELS = 3;
 
@@ -2284,6 +2285,7 @@ protected:
       wftrain::DerivativeAdjoint adjoint, wftrain::ParameterReductionSink* sink,
       const std::function<void(std::size_t)>& terminal = {}) const
   {
+    NativeTimerScope timer(phase_timers_.parameter_vjp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
@@ -2570,6 +2572,7 @@ protected:
   void evaluateScoreJVP(const wftrain::StructuredParameterVectorConstView& direction,
                         wftrain::SampleProductSink& sink) const override
   {
+    NativeTimerScope timer(phase_timers_.score_jvp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     {
@@ -2650,6 +2653,7 @@ protected:
       std::uint32_t local_energy_term_mask,
       wftrain::SampleProductSink& sink) const override
   {
+    NativeTimerScope timer(phase_timers_.energy_jvp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
     const std::uint32_t kinetic_mask =
@@ -2825,6 +2829,7 @@ private:
   /// Keep retained score inputs separate from host-modified ECP/kinetic workspaces.
   pf::DirectScoreResult evaluateRetainedScoreResponse(std::size_t sample) const
   {
+    NativeTimerScope host_timer(phase_timers_.gpu_call);
     const auto& response = shared_scratch_->device_products->scoreDeviceCoordinates(
         retained_coordinates_->view(sample, 1), parameter_version_);
     reportDeviceProducts();
@@ -2841,6 +2846,7 @@ private:
 #ifdef ENABLE_CUDA
     if (hasDeviceProducts())
     {
+      NativeTimerScope host_timer(phase_timers_.gpu_call);
       const auto& response = shared_scratch_->device_products->score(
           shared_scratch_->device_positions.data(), parameter_version_);
       reportDeviceProducts();
@@ -2850,6 +2856,7 @@ private:
       return result;
     }
 #endif
+    NativeTimerScope numerical_timer(phase_timers_.cpu_reverse);
     return model_state_->direct_score_executor.evaluate(*score_workspace_);
   }
 
@@ -2859,6 +2866,7 @@ private:
 #ifdef ENABLE_CUDA
     if (hasDeviceProducts())
     {
+      NativeTimerScope host_timer(phase_timers_.gpu_call);
       auto& session = *shared_scratch_->device_products;
       const auto* positions = shared_scratch_->device_positions.data();
       const auto& response = session.kinetic(positions, drift, masses, parameter_version_);
@@ -2871,6 +2879,7 @@ private:
       return result;
     }
 #endif
+    NativeTimerScope numerical_timer(phase_timers_.cpu_kinetic);
     if (model_state_->cpu_target_kinetic.targets)
     {
       const auto result = model_state_->direct_kinetic_executor.evaluateTargets(*kinetic_workspace_, drift,
@@ -2895,12 +2904,14 @@ private:
 #ifdef ENABLE_CUDA
     if (hasDeviceProducts())
     {
+      NativeTimerScope host_timer(phase_timers_.gpu_call);
       const auto& response = shared_scratch_->device_products->gradientResponse(
           shared_scratch_->device_positions.data(), drift, masses, parameter_version_);
       reportDeviceProducts();
       return {response.data(), response.size()};
     }
 #endif
+    NativeTimerScope numerical_timer(phase_timers_.cpu_kinetic);
     if (model_state_->cpu_target_kinetic.targets)
       return model_state_->direct_kinetic_executor.evaluateTargetGradientParameterResponse(
           *kinetic_workspace_, drift, 3 * electron_count_, masses, electron_count_);
@@ -6270,6 +6281,7 @@ void PsiFormerWF::bindBatchExecutionPlan(
 void PsiFormerWF::prepareBatchExecutionClone(
     const BatchExecutionParticipantPlan& participant_plan)
 {
+  NativeTimerScope timer(phase_timers_.preparation);
   if (model_state_->cpu_target_vgl.targets)
     throw std::invalid_argument("PsiFormer CPU target VGL does not support planned clone storage");
   if (!participant_plan ||
@@ -6544,6 +6556,7 @@ PsiFormerWF::makeStreamingDerivativeOperator(
     std::size_t sample_offset,
     std::size_t maximum_parameter_chunk_size) const
 {
+  NativeTimerScope timer(phase_timers_.preparation);
   if (this != &wfc_list.getLeader())
     throw std::invalid_argument(
         "PsiFormer streaming derivative factory must be called on the batch leader");
@@ -7095,6 +7108,7 @@ std::size_t PsiFormerWF::publishParameters(
     const wftrain::StructuredParameterSnapshot& candidate,
     std::size_t expected_version)
 {
+  NativeTimerScope timer(phase_timers_.publication);
   requireNoPlannedProposalMutation("structured parameter publication");
   if (candidate.schema_fingerprint != structured_parameter_schema_->fingerprint())
     throw std::invalid_argument("PsiFormer structured update has an incompatible schema fingerprint");
@@ -7133,6 +7147,7 @@ void PsiFormerWF::acquireResource(
     ResourceCollection& collection,
     const RefVectorWithLeader<WaveFunctionComponent>& wfc_list) const
 {
+  NativeTimerScope timer(phase_timers_.resource);
   auto* leader_ptr = dynamic_cast<PsiFormerWF*>(&wfc_list.getLeader());
   if (leader_ptr == nullptr)
     throw std::invalid_argument(
@@ -10966,6 +10981,9 @@ pf::Result PsiFormerWF::evaluatePositionsUnderRead(
   }
 
   // Compatibility outputs are O(N) owning products, outside the numerical-owner cap.
+  NativeTimerScope timer(purpose == EvaluationPurpose::VALUE_ONLY ? phase_timers_.value :
+      purpose == EvaluationPurpose::ACTIVE_ELECTRON_GRADIENT ? phase_timers_.gradient :
+      purpose == EvaluationPurpose::FULL_SPATIAL ? phase_timers_.vgl : phase_timers_.parameter_vjp);
   if (purpose == EvaluationPurpose::FULL_SPATIAL && state.cpu_target_vgl.targets)
   {
     pf::Result result;
@@ -11193,6 +11211,7 @@ pf::DirectValueResult PsiFormerWF::evaluateDirectValuePositionsUnderRead(
     int replaced_particle,
     const PosType* replacement_position)
 {
+  NativeTimerScope timer(phase_timers_.value);
   if (&transaction.state() != model_state_.get())
     throw std::logic_error("PsiFormer value transaction belongs to a different model");
   const pf::PsiFormer& model = transaction.model();
@@ -11201,6 +11220,7 @@ pf::DirectValueResult PsiFormerWF::evaluateDirectValuePositionsUnderRead(
 
   if (transaction.state().numerical_tile_backend)
   {
+    NativeTimerScope host_timer(phase_timers_.gpu_call);
     auto& batch = requireDirectBatchWorkspace();
     batch.resize(pf::DirectBatchMode::VALUE_ONLY, 1);
     for (int electron = 0; electron < p.getTotalNum(); ++electron)
@@ -11238,6 +11258,7 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositionsUnderRead
     EvaluationPurpose purpose,
     int active_gradient_particle)
 {
+  NativeTimerScope timer(purpose == EvaluationPurpose::FULL_SPATIAL ? phase_timers_.vgl : phase_timers_.gradient);
   if (&transaction.state() != model_state_.get())
     throw std::logic_error("PsiFormer spatial transaction belongs to a different model");
   if (purpose != EvaluationPurpose::FULL_SPATIAL &&
@@ -11252,6 +11273,7 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositionsUnderRead
 
   if (transaction.state().numerical_tile_backend)
   {
+    NativeTimerScope host_timer(phase_timers_.gpu_call);
     auto& batch = requireDirectBatchWorkspace();
     const bool full = purpose == EvaluationPurpose::FULL_SPATIAL;
     batch.resize(full ? pf::DirectBatchMode::FULL_VGL : pf::DirectBatchMode::ACTIVE_ELECTRON_GRADIENT, 1);
@@ -11280,6 +11302,7 @@ pf::DirectSpatialResultView PsiFormerWF::evaluateDirectSpatialPositionsUnderRead
       workspace.setPosition(electron, dimension, position[dimension]);
   }
 
+  NativeTimerScope numerical_timer(phase_timers_.cpu_spatial);
   const pf::DirectSpatialResultView result = purpose == EvaluationPurpose::FULL_SPATIAL
       ? transaction.state().direct_spatial_executor.evaluateFull(workspace)
       : transaction.state().direct_spatial_executor.evaluateActive(
@@ -11340,6 +11363,8 @@ pf::DirectBatchWorkspace& PsiFormerWF::requireDirectBatchWorkspace()
 // Stage physical G/L in existing proposal products while keeping accepted state untouched.
 void PsiFormerWF::stageCpuTargetFullVGL(const PsiFormerReadTransaction& transaction, const ParticleSet& particles)
 {
+  NativeTimerScope timer(phase_timers_.vgl);
+  NativeTimerScope numerical_timer(phase_timers_.cpu_spatial);
   if (&transaction.state() != model_state_.get() || !model_state_->cpu_target_vgl.targets || has_proposal_)
     throw std::logic_error("PsiFormer CPU target FULL requires its own model and no pending proposal");
   auto& workspace = requireDirectSpatialWorkspace(EvaluationPurpose::FULL_SPATIAL);
@@ -11908,6 +11933,7 @@ pf::DirectScoreResult PsiFormerWF::evaluateDirectScorePositionsUnderRead(
     const PosType* replacement_position,
     pf::DirectScoreWorkspace& score_workspace)
 {
+  NativeTimerScope timer(phase_timers_.cpu_reverse);
   if (&transaction.state() != model_state_.get())
     throw std::logic_error("PsiFormer score transaction belongs to a different model");
   const pf::PsiFormer& model = transaction.model();
@@ -12405,6 +12431,7 @@ void PsiFormerWF::mw_evaluateLog(
     const RefVector<ParticleSet::ParticleGradient>& gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& laplacian_list) const
 {
+  NativeTimerScope timer(phase_timers_.batch_vgl);
   // Preserve the historical lazy/oracle implementation byte-for-byte behind
   // an explicit no-policy branch.
   if (!batch_execution_plan_)
@@ -12883,6 +12910,7 @@ void PsiFormerWF::mw_evaluateMultiParticleMove(
     const RefVector<ParticleSet::ParticleGradient>& proposed_gradient_list,
     const RefVector<ParticleSet::ParticleLaplacian>& proposed_laplacian_list) const
 {
+  NativeTimerScope timer(phase_timers_.batch_vgl);
   if (model_state_->cpu_target_vgl.targets)
     throw std::logic_error("PsiFormer CPU target VGL supports PBYP inference, not selected-electron proposals");
   const std::size_t walker_count = wfc_list.size();
@@ -14357,6 +14385,7 @@ void PsiFormerWF::mw_calcRatio(
     int particle_index,
     std::vector<PsiValue>& ratios) const
 {
+  NativeTimerScope timer(phase_timers_.batch_value);
   // Preserve the historical lazy/oracle implementation behind the explicit
   // no-policy branch.  Planned execution below never enters an allocating or
   // serialized fallback after its runtime contract has been selected.
@@ -14882,6 +14911,7 @@ void PsiFormerWF::mw_evalGrad(
     int particle_index,
     std::vector<GradType>& gradients) const
 {
+  NativeTimerScope timer(phase_timers_.batch_gradient);
   // Preserve the historical lazy/oracle implementation behind the explicit
   // no-policy branch.
   if (!batch_execution_plan_)
@@ -15278,6 +15308,7 @@ void PsiFormerWF::mw_ratioGrad(
     std::vector<PsiValue>& ratios,
     std::vector<GradType>& gradients) const
 {
+  NativeTimerScope timer(phase_timers_.batch_gradient);
   // Preserve the historical lazy/oracle implementation behind the explicit
   // no-policy branch.
   if (!batch_execution_plan_)
@@ -16508,6 +16539,7 @@ void PsiFormerWF::evaluatePlannedScalarValue(
     const VirtualParticleSet* virtual_particles,
     std::vector<ValueType>& ratios)
 {
+  NativeTimerScope timer(phase_timers_.value);
   const std::size_t configurations = checkedBatchMemoryAdd(
       ratios.size(), 1,
       "PsiFormer planned scalar VALUE configuration count");
