@@ -285,6 +285,59 @@ __global__ void headReverse(ComplexKineticHeadLayout l, periodic_geometry::Cell 
       }
 }
 
+/// Fixed physical masses/kappa generate ordinary complex roots and exactly one tile energy.
+__global__ void coefficients(SpatialJetLayout layout, const C* g, const C* l, const double* cusp,
+    const double* masses, const double* kappa, C* qg, C* ql, C* energy, std::uint64_t* status)
+{
+  const auto k = layout.laplacian_lanes;
+  for (std::size_t e = 0; e < k; ++e)
+  {
+    const auto mu = masses[layout.target_electron_begin + e];
+    auto ratio = add(l[e], make_cuDoubleComplex(cusp[1 + 3 * k + e], 0));
+    if (!device_math::isFiniteBinary64(mu) || !(mu > 0) || !finite(ratio)) { fail(status); return; }
+    ql[e] = make_cuDoubleComplex(-0.5 * mu, 0);
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+      const auto lane = 3 * e + axis;
+      const auto total = add(g[lane], make_cuDoubleComplex(cusp[1 + lane], kappa[axis]));
+      const auto square = QMC_PF_MUL(total, total);
+      qg[lane] = scale(total, -mu);
+      ratio = add(ratio, square);
+      if (!finite(total) || !finite(square) || !finite(qg[lane]) || !finite(ratio)) { fail(status); return; }
+    }
+    *energy = add(*energy, scale(ratio, -0.5 * mu));
+    if (!finite(*energy)) { fail(status); return; }
+  }
+}
+
+/// Pack cusp once per real objective; physical lambdaL has zero imaginary component.
+__global__ void cuspSeed(std::size_t k, const C* qg, const C* ql, std::size_t selected,
+    double* seed, std::uint64_t* status)
+{
+  seed[0] = 0;
+  for (std::size_t i = 0; i < 3 * k; ++i)
+  {
+    if (!finite(qg[i])) { fail(status); return; }
+    seed[1 + i] = component(qg[i], selected);
+  }
+  for (std::size_t i = 0; i < k; ++i)
+  {
+    if (!finite(ql[i])) { fail(status); return; }
+    seed[1 + 3 * k + i] = component(ql[i], selected);
+  }
+}
+
+/// Add one completed realP to its selected complex component; reject a late sum overflow.
+__global__ void packResponse(std::size_t p, const double* real, std::size_t selected,
+    C* output, std::uint64_t* status)
+{
+  const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= p) return;
+  const auto term = selected ? make_cuDoubleComplex(0, real[i]) : make_cuDoubleComplex(real[i], 0);
+  output[i] = add(output[i], term);
+  if (!finite(term) || !finite(output[i])) fail(status);
+}
+
 /// Only packed B1 FULL/compact-K leaves are admitted; numeric extents are checked first.
 void validate(OpenOrbitalJetLayout layout)
 {
@@ -357,6 +410,39 @@ Error launchComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout l,
   const void* outputs[]{feature_seed, response, status};
   rejectAliasedStorage(reads, outputs, "Complex kinetic head storage aliases");
   headReverse<<<1, 1, 0, stream>>>(l, cell, positions, nuclei, p, features, envelope, real, imag, roots, selected, feature_seed, response, status);
+  return launched();
+}
+
+/// Prepared caller supplies disjoint live buffers; no scratch or allocation is hidden here.
+Error launchComplexKineticCoefficients(Stream stream, SpatialJetLayout layout, const C* g, const C* l,
+    const double* cusp, const double* masses, const double* kappa, C* qg, C* ql, C* energy, std::uint64_t* status)
+{
+  validateSpatialJetLayout(layout);
+  if (layout.mode != SpatialJetMode::FULL_VGL || layout.element_count != 1 || layout.configuration_count != 1 ||
+      layout.plane_stride != 1 || layout.configuration_stride != layout.plane_count ||
+      !g || !l || !cusp || !masses || !kappa || !qg || !ql || !energy || !status)
+    throw std::invalid_argument("Complex kinetic physical root inputs invalid");
+  coefficients<<<1, 1, 0, stream>>>(layout, g, l, cusp, masses, kappa, qg, ql, energy, status);
+  return launched();
+}
+
+/// Select a real cusp objective without rerunning physical coefficients or energy.
+Error launchComplexKineticCuspSeed(Stream stream, std::size_t k, const C* qg, const C* ql,
+    std::size_t selected, double* seed, std::uint64_t* status)
+{
+  if (!k || selected > 1 || !qg || !ql || !seed || !status)
+    throw std::invalid_argument("Complex kinetic cusp seed inputs invalid");
+  cuspSeed<<<1, 1, 0, stream>>>(k, qg, ql, selected, seed, status);
+  return launched();
+}
+
+/// Consume immediately admitted oneP; finite accumulation does not publish a partial request.
+Error launchComplexKineticPack(Stream stream, std::size_t p, const double* real,
+    std::size_t selected, C* output, std::uint64_t* status)
+{
+  if (!p || (p - 1) / 128 >= std::size_t(std::numeric_limits<int>::max()) || selected > 1 || !real || !output || !status)
+    throw std::invalid_argument("Complex kinetic P packing inputs invalid");
+  packResponse<<<static_cast<unsigned>((p - 1) / 128 + 1), 128, 0, stream>>>(p, real, selected, output, status);
   return launched();
 }
 } // namespace qmcplusplus::psiformer::device

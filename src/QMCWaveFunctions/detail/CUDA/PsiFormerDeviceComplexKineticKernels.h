@@ -30,5 +30,19 @@ Error launchComplexKineticHeadReverse(Stream stream, ComplexKineticHeadLayout la
     const double* features, const double* envelope, const double* real, const double* imag,
     const cuDoubleComplex* roots, std::size_t component, double* feature_seed, double* response,
     std::uint64_t* status);
+
+/// Prepare physical roots/energy once per tile, with fixed positive masses and common kappa.
+Error launchComplexKineticCoefficients(Stream stream, SpatialJetLayout layout,
+    const cuDoubleComplex* gradient, const cuDoubleComplex* laplacian, const double* cusp,
+    const double* inverse_masses, const double* kappa, cuDoubleComplex* gradient_root,
+    cuDoubleComplex* laplacian_root, cuDoubleComplex* energy, std::uint64_t* status);
+
+/// Seed one real cusp objective from retained complex physical roots.
+Error launchComplexKineticCuspSeed(Stream stream, std::size_t targets, const cuDoubleComplex* gradient_root,
+    const cuDoubleComplex* laplacian_root, std::size_t component, double* seed, std::uint64_t* status);
+
+/// Add the selected completed real response into the sole complexP sum.
+Error launchComplexKineticPack(Stream stream, std::size_t parameters, const double* real,
+    std::size_t component, cuDoubleComplex* output, std::uint64_t* status);
 } // namespace qmcplusplus::psiformer::device
 #endif

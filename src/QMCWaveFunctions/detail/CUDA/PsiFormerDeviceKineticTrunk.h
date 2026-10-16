@@ -51,6 +51,7 @@ public:
 private:
   friend class PreparedDeviceComplexKinetic;
   friend struct KineticTrunkValidationAccess;
+  friend struct ComplexKineticOwnerValidationAccess;
 
   /// Combined admission precedes preparation of either head-free numeric owner.
   static std::unique_ptr<PreparedDeviceKineticTrunk> prepare(std::shared_ptr<const PreparedDeviceModel> image,
