@@ -56,6 +56,9 @@ public:
   std::unique_ptr<TrialWaveFunction> makePrivateClone(ParticleSet&) const;
   LegacyWaveFunctionAdapter& adapter() noexcept { return adapter_; }
   void exportModel(const std::filesystem::path&) const;
+  /// Validate a complete export and return canonical coordinates for comparison.
+  /// For orbital models this is NOT an import: publishing the returned active
+  /// vector loses accumulated rotation history. Restore the complete frame.
   StructuredParameterSnapshot readModel(const std::filesystem::path&) const;
   /// Immutable inline model definition and registration identity for exact continuation.
   std::string modelIdentity() const;

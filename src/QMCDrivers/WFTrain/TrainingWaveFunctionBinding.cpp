@@ -494,9 +494,11 @@ StructuredParameterSnapshot TrainingWaveFunctionBinding::readModel(const std::fi
   // still validate the complete frame rather than silently ignoring it.
   if (orbital_rotations_)
   {
-    std::uint64_t source_version;
+    std::uint64_t source_version = 0;
     input.push("orbital_frame", false);
-    input.read(source_version, "source_version");
+    if (!input.read(source_version, "source_version") ||
+        source_version > std::numeric_limits<std::size_t>::max())
+      throw std::runtime_error("Conventional orbital export is missing a valid source version");
     input.pop();
     readOrbitalFrame(input, source_version, result);
   }
@@ -546,10 +548,11 @@ ConventionalOrbitalFrame TrainingWaveFunctionBinding::readOrbitalFrame(
   archive.push("orbital_frame", false);
   std::vector<int> version;
   std::uint64_t saved_version = 0, count = 0;
-  archive.read(version, "format_version");
-  archive.read(saved_version, "source_version");
-  archive.read(count, "orbital_count");
-  archive.read(frame.determinant_aliases, "determinant_aliases");
+  if (!archive.read(version, "format_version") ||
+      !archive.read(saved_version, "source_version") ||
+      !archive.read(count, "orbital_count") ||
+      !archive.read(frame.determinant_aliases, "determinant_aliases"))
+    throw std::runtime_error("Conventional orbital frame is missing required metadata");
   if (version != std::vector<int>{1, 0, 0} || saved_version != source_version ||
       count != layout.unique.size() || frame.determinant_aliases != layout.aliases)
     throw std::runtime_error("Conventional orbital frame version or alias identity mismatch");
@@ -561,11 +564,11 @@ ConventionalOrbitalFrame TrainingWaveFunctionBinding::readOrbitalFrame(
     const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(*layout.unique[i]->Phi_);
     const auto& reference = lcao.originalRotationCoefficients();
     archive.push("spo_" + std::to_string(i), false);
-    archive.read(orbital.name, "name");
-    archive.read(shape, "shape");
-    archive.read(orbital.full_rotation, "full_rotation");
-    archive.read(orbital.accepted_coefficients, "accepted_coefficients");
-    archive.read(orbital.reference_coefficients, "reference_coefficients");
+    if (!archive.read(orbital.name, "name") || !archive.read(shape, "shape") ||
+        !archive.read(orbital.full_rotation, "full_rotation") ||
+        !archive.read(orbital.accepted_coefficients, "accepted_coefficients") ||
+        !archive.read(orbital.reference_coefficients, "reference_coefficients"))
+      throw std::runtime_error("Conventional orbital frame is missing required state");
     archive.pop();
     if (orbital.name != layout.unique[i]->SPOSet::getName() ||
         shape != std::vector<std::uint64_t>{lcao.C->rows(), lcao.C->cols()} ||
