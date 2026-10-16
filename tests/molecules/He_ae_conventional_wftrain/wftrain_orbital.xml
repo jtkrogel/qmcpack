@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<simulation>
+  <project id="he_conventional_orbital" series="0"><parameter name="driver_version">batch</parameter></project>
+  <random seed="81357"/>
+  <!-- Same three-STO/one-occupied shared-spin model as the orbital product gate.
+       Two occupied-virtual generators do not commute. Explicit coefficients
+       mean Identity=false despite their initial numerical identity. -->
+  <particleset name="ion0" size="1">
+    <group name="He"><parameter name="charge">2</parameter><parameter name="valence">2</parameter>
+      <parameter name="atomicnumber">2</parameter></group>
+    <attrib name="position" datatype="posArray">0 0 0</attrib>
+  </particleset>
+  <particleset name="e">
+    <group name="u" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">0.7 0.2 0.4</attrib></group>
+    <group name="d" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">-0.5 0.3 0.8</attrib></group>
+  </particleset>
+  <wavefunction name="psi0" target="e" print_parameters="no">
+    <sposet_collection type="MolecularOrbital" source="ion0">
+      <basisset keyword="STO" transform="no">
+        <atomicBasisSet type="STO" elementType="He" normalized="no">
+          <basisGroup rid="R0" l="0" m="0" type="Slater"><radfunc n="1" exponent="2.0"/></basisGroup>
+          <basisGroup rid="R1" l="0" m="0" type="Slater"><radfunc n="2" exponent="1.0"/></basisGroup>
+          <basisGroup rid="R2" l="0" m="0" type="Slater"><radfunc n="3" exponent="0.7"/></basisGroup>
+        </atomicBasisSet>
+      </basisset>
+      <rotated_sposet name="rot">
+        <sposet name="base" size="3"><coefficient size="3" id="identity">1 0 0  0 1 0  0 0 1</coefficient></sposet>
+      </rotated_sposet>
+    </sposet_collection>
+    <determinantset><slaterdeterminant>
+      <determinant sposet="rot"/><determinant sposet="rot"/>
+    </slaterdeterminant></determinantset>
+  </wavefunction>
+  <hamiltonian name="h0" type="generic" target="e">
+    <pairpot name="ElecElec" type="coulomb" source="e" target="e"/>
+    <pairpot name="IonElec" type="coulomb" source="ion0" target="e"/>
+  </hamiltonian>
+  <qmc method="wf_train" move="pbyp" checkpoint="1">
+    <training objective="energy" optimizer="adam">
+      <parameter name="iterations">2</parameter><parameter name="learning_rate">0.0001</parameter>
+      <parameter name="parameter_chunk_size">4</parameter>
+      <parameter name="legacy_maximum_parameters">64</parameter>
+      <parameter name="legacy_derivative_scratch_bytes">65536</parameter>
+      <parameter name="checkpoint_interval">1</parameter><parameter name="line_search">off</parameter>
+    </training>
+    <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
+    <parameter name="blocks">2</parameter><parameter name="steps">1</parameter>
+    <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
+    <parameter name="timestep">0.0001</parameter><parameter name="usedrift">no</parameter>
+    <inference interval="1" last="yes" move="pbyp">
+      <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
+      <parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
+      <parameter name="warmupsteps">0</parameter><parameter name="substeps">1</parameter>
+      <parameter name="timestep">0.0001</parameter><parameter name="usedrift">no</parameter>
+    </inference>
+  </qmc>
+</simulation>

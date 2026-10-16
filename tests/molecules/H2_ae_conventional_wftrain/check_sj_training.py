@@ -37,6 +37,49 @@ def history(directory):
         return list(csv.DictReader(handle))
 
 
+def text_value(value):
+    value = np.asarray(value).reshape(-1)[0]
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def check_orbital_frame(group, tree, parameters, row, model):
+    """Check the explicit two-generator model, not arbitrary registered vars."""
+    wrapper = tree.find(".//rotated_sposet")
+    assert wrapper is not None and wrapper.find("sposet").get("size") == "3"
+    wrapper_name = wrapper.get("name")
+    expected = [f"{wrapper_name}_orb_rot_0000_{virtual:04d}_r" for virtual in (1, 2)]
+    names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
+    indices = np.asarray(group["active_indices"][()]).reshape(-1)
+    assert sorted(name for name in names if "_orb_rot_" in name) == expected, (model, names)
+    active = parameters[[int(indices[names.index(name)]) for name in expected]]
+    frame = group["orbital_frame"]
+    np.testing.assert_array_equal(frame["format_version"][()], [1, 0, 0])
+    np.testing.assert_array_equal(frame["determinant_aliases"][()], [0, 0])
+    assert int(np.asarray(frame["source_version"][()]).reshape(-1)[0]) == int(row["parameter_version"])
+    assert int(np.asarray(frame["orbital_count"][()]).reshape(-1)[0]) == 1
+    orbital = frame["spo_0"]
+    assert text_value(orbital["name"][()]) == wrapper_name
+    np.testing.assert_array_equal(orbital["shape"][()], [3, 3])
+    initial = np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()])
+    reference = np.asarray(orbital["reference_coefficients"][()]).reshape(-1)
+    accepted = np.asarray(orbital["accepted_coefficients"][()]).reshape(-1)
+    full = np.asarray(orbital["full_rotation"][()]).reshape(-1)
+    np.testing.assert_array_equal(reference, initial)
+    assert accepted.size == 9 and full.size == 3
+    assert np.isfinite(accepted).all() and np.isfinite(full).all()
+    if row["committed"] == "1":
+        assert not np.array_equal(accepted, reference), model
+    # Both bundle representations must carry exactly the same complete frame.
+    exported = datasets(model)
+    state = datasets(model.with_name(model.name.replace(".parameters.h5", ".state.h5")))
+    prefix = "conventional_wavefunction/orbital_frame/"
+    for name, values in exported.items():
+        if name.startswith(prefix):
+            np.testing.assert_array_equal(values, state["wftrain_checkpoint/orbital_frame/" + name[len(prefix):]],
+                                          err_msg=f"orbital checkpoint/export frame: {name}")
+    return active, full
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
@@ -47,6 +90,8 @@ def main():
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
                         help="optionally express a paired DETS fixture as one-determinant CSFs")
+    parser.add_argument("--orbital-jastrow", action="store_true",
+                        help="add the qualified four-coefficient J2 to the orbital-only fixture")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--ranks", type=int, default=1)
     parser.add_argument("--mpiexec", default="mpirun")
@@ -74,6 +119,15 @@ def main():
         directory = work / label
         directory.mkdir()
         tree = ET.parse(fixture)
+        orbital_model = tree.find(".//rotated_sposet") is not None
+        if args.orbital_jastrow:
+            assert orbital_model and tree.find("wavefunction/jastrow") is None, fixture
+            tree.find("wavefunction").append(ET.fromstring('''
+                <jastrow name="J2" type="Two-Body" function="Bspline">
+                  <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+                    <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+                  </correlation>
+                </jastrow>'''))
         if args.ci_representation == "csf":
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS", fixture
@@ -99,9 +153,12 @@ def main():
             ET.SubElement(training, "parameter", name="restart_path").text = str(restart)
         if mutate:
             mutate(tree)
-        # No generated recipe is allowed to unfreeze the Slater implicitly.
+        # Only the explicit qualified rotation wrapper may unfreeze orbitals.
         if not reject:
-            assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
+            if orbital_model:
+                assert not tree.findall(".//sposet[@optimize='yes']")
+            else:
+                assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
         tree.write(directory / "run.xml")
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
         command = [str(executable), "run.xml"]
@@ -147,10 +204,13 @@ def main():
         determinant_list = tree.find("wavefunction/determinantset/multideterminant/detlist")
         linear_nodes = [] if determinant_list is None else list(determinant_list)
         initial = [float(node.get("coeff")) for node in linear_nodes[1:]]
+        if orbital_model:
+            initial += [0.0, 0.0]
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    for value in node.text.split()]
         previous = np.asarray(initial)
         fixed = tree.find(".//sposet/coefficient")
+        orbital_history = []
         for model, row in zip(models, rows):
             with h5py.File(model, "r") as handle:
                 group = handle["conventional_wavefunction"]
@@ -167,6 +227,8 @@ def main():
                 elif restart is None:
                     np.testing.assert_array_equal(parameters, previous, err_msg=f"rejected model: {model}")
                 previous = parameters
+                if orbital_model:
+                    orbital_history.append(check_orbital_frame(group, tree, parameters, row, model))
                 serialized = group["wavefunction_xml"][()]
                 if isinstance(serialized, np.ndarray):
                     serialized = serialized.reshape(-1)[0]
@@ -176,10 +238,19 @@ def main():
                 coefficients = exported.find(".//sposet/coefficient")
                 assert coefficients.attrib == fixed.attrib, model
                 assert coefficients.text.split() == fixed.text.split(), model
-                assert all(node.get("optimize") == "no" for node in exported.findall(".//sposet")), model
+                if orbital_model:
+                    assert exported.find(".//rotated_sposet").attrib == tree.find(".//rotated_sposet").attrib
+                    assert not exported.findall(".//sposet[@optimize='yes']"), model
+                else:
+                    assert all(node.get("optimize") == "no" for node in exported.findall(".//sposet")), model
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
+        if len(orbital_history) == 2:
+            first, second = orbital_history[0][0], orbital_history[1][0]
+            delta = second - first
+            assert first[0] * delta[1] != first[1] * delta[0], (directory, "fixture updates commute")
+            assert orbital_history[-1][1][2] != 0, (directory, "missing accumulated virtual rotation")
         return directory
 
     if args.family_screen:
@@ -275,13 +346,9 @@ def main():
         run("reject_zero_cap", reject="legacy_maximum_parameters must be positive", mutate=lambda tree: setattr(
             tree.find("qmc/training/parameter[@name='legacy_maximum_parameters']"), "text", "0"))
 
-        def enable_orbitals(tree):
-            spo = tree.find("wavefunction/sposet_collection/sposet")
-            spo.set("optimize", "yes")
-            spo.set("size", "2")
-            spo.find("coefficient").set("size", "2")
-            spo.find("coefficient").text = "0.55 0.55  0.55 -0.55"
-        run("reject_active_spo", reject="only fixed-Slater J1/J2 parameters", mutate=enable_orbitals)
+        def neural_decay(tree):
+            ET.SubElement(tree.find("qmc/training"), "parameter", name="weight_decay").text = "0.01"
+        run("reject_neural_decay", reject="weight_decay must be zero", mutate=neural_decay)
     completed = f"Adam/{args.companion_optimizer} conventional updates, interval inference, frozen SPO/reference, exact inference isolation"
     if args.restart:
         completed += ", exact split restart"

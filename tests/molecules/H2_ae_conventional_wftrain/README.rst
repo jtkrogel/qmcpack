@@ -21,8 +21,8 @@ Run ``python3 check_sj_training.py /absolute/path/to/qmcpack --restart --preflig
 The checker runs Adam and plain SGD, checks committed updates and inference
 version labels, compares inference-on/off model/optimizer/sampler state exactly,
 checks exported bonding coefficients remain fixed, and checks split continuation.
-Preflight cases require rejection of KFAC, zero legacy limits, and active SPOs
-in the initial J1/J2-only binding. Evidence directories and complete logs are
+Preflight cases require rejection of KFAC, zero legacy limits, and nonzero
+neural-only weight decay. Evidence directories and complete logs are
 retained in the system temporary directory, including on failure.
 
 The application tests require a real double-precision CPU build plus Python
