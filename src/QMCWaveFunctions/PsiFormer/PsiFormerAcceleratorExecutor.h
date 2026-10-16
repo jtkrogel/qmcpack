@@ -21,6 +21,7 @@
 #include "QMCWaveFunctions/PsiFormer/PsiFormerAcceleratorPlanning.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -114,7 +115,8 @@ struct PsiFormerAcceleratorModelProvenance
  * the corresponding state transition occurs only after the hook returns.  A staged
  * image never changes the active provenance until completion succeeds.
  * Publication and lease mutations require external serialization by the owning
- * PsiFormerSharedState mutex; this class makes no unsynchronized-concurrency claim.
+ * PsiFormerSharedState mutex. Atomic lease counts permit concurrent reads during
+ * independent crowd submissions only while publication is excluded externally.
  * The shared model and publication hook adapter must outlive every pending
  * publication, and the shared model must outlive every crowd lease naming it.
  */
@@ -176,7 +178,7 @@ private:
   std::size_t staged_version_ = 0;
   std::array<std::size_t, 2> slot_versions_{};
   std::array<std::size_t, 2> slot_publication_generations_{};
-  std::array<std::size_t, 2> slot_leases_{};
+  std::array<std::atomic<std::size_t>, 2> slot_leases_{{0, 0}};
   std::uint8_t active_slot_ = 0;
   bool publication_pending_ = false;
 };

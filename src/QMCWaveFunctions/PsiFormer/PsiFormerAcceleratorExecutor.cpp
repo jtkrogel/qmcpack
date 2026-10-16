@@ -72,7 +72,7 @@ void PsiFormerAcceleratorSharedModel::stage(std::uint64_t layout_fingerprint,
     throw std::invalid_argument("PsiFormer accelerator publication has a stale layout fingerprint");
   if (source_version <= active_version_)
     throw std::invalid_argument("PsiFormer accelerator publication requires a newer model version");
-  if (slot_leases_[stagingSlot()] != 0)
+  if (slot_leases_[stagingSlot()].load(std::memory_order_relaxed) != 0)
     throw std::logic_error("PsiFormer accelerator staging slot is still leased by an older crowd");
 
   hooks.submit(publicationEvent(PsiFormerAcceleratorEventKind::MODEL_STAGE, source_version));
@@ -145,7 +145,8 @@ void PsiFormerAcceleratorSharedModel::acquireLease(
 {
   if (!(activeProvenance() == provenance))
     throw std::logic_error("PsiFormer accelerator lease requested for stale active provenance");
-  slot_leases_[provenance.active_slot] = nextGeneration(slot_leases_[provenance.active_slot]);
+  auto& count = slot_leases_[provenance.active_slot];
+  count.store(nextGeneration(count.load(std::memory_order_relaxed)), std::memory_order_relaxed);
 }
 
 void PsiFormerAcceleratorSharedModel::releaseLease(
@@ -153,7 +154,7 @@ void PsiFormerAcceleratorSharedModel::releaseLease(
 {
   if (!hasLease(provenance))
     throw std::logic_error("PsiFormer accelerator lease release has stale model provenance");
-  --slot_leases_[provenance.active_slot];
+  slot_leases_[provenance.active_slot].fetch_sub(1, std::memory_order_relaxed);
 }
 
 bool PsiFormerAcceleratorSharedModel::hasLease(
@@ -166,7 +167,7 @@ bool PsiFormerAcceleratorSharedModel::hasLease(
     return false;
   return slot_versions_[provenance.active_slot] == provenance.model_version &&
       slot_publication_generations_[provenance.active_slot] == provenance.publication_generation &&
-      slot_leases_[provenance.active_slot] != 0;
+      slot_leases_[provenance.active_slot].load(std::memory_order_relaxed) != 0;
 }
 
 const PsiFormerAcceleratorResultProvenance&
