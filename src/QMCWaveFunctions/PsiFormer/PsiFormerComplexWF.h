@@ -128,7 +128,10 @@ public:
       const RefVector<ParticleSet::ParticleLaplacian>&, bool fromscratch) const override;
   void mw_calcRatio(const RefVectorWithLeader<WaveFunctionComponent>&,
       const RefVectorWithLeader<ParticleSet>&, int electron, std::vector<PsiValue>&) const override;
-  /// Dense proposed FULL gradients; accepted mw_evalGrad intentionally retains scalar dispatch.
+  /// Dense accepted FULL gradients write outputs without mutating ParticleSet or caches.
+  void mw_evalGrad(const RefVectorWithLeader<WaveFunctionComponent>&,
+      const RefVectorWithLeader<ParticleSet>&, int electron, std::vector<GradType>&) const override;
+  /// Dense proposed FULL gradients add outputs and commit proposals only after every tail validates.
   void mw_ratioGrad(const RefVectorWithLeader<WaveFunctionComponent>&,
       const RefVectorWithLeader<ParticleSet>&, int electron, std::vector<PsiValue>&,
       std::vector<GradType>&) const override;

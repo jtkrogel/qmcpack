@@ -2419,6 +2419,17 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
     ResourceCollection resource("paired dense test");
     gpu.createResource(resource);
     ResourceCollectionTeamLock<WaveFunctionComponent> lease(resource, team);
+    using Grad = WaveFunctionComponent::GradType;
+    // Accepted gradients require no accepted-amplitude cache and must not populate one.
+    std::vector<Grad> accepted_gradients(3, Grad(C{9, 7}));
+    const std::array<C, 3> uncached_logs{
+        components[0]->get_log_value(), components[1]->get_log_value(), components[2]->get_log_value()};
+    gpu.mw_evalGrad(team, targets, 0, accepted_gradients);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      CHECK(components[i]->get_log_value() == uncached_logs[i]);
+      CHECK_THROWS(static_cast<PsiFormerComplexWF*>(components[i])->observeCoulombEnergy(*particles[i], 0));
+    }
     const auto refresh = [&] {
       for (auto* p : particles) { p->G = 0; p->L = 0; }
       gpu.mw_evaluateGL(team, targets, gradients, laplacians, true);
@@ -2447,10 +2458,24 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
       CHECK(learned_phase_gradient > 1e-6);
     };
     refresh();
+    for (std::size_t i = 0; i < 3; ++i)
+      for (int d = 0; d < 3; ++d)
+        close(accepted_gradients[i][d], particles[i]->G[0][d], 2e-8);
     const auto warm = metrics.snapshot();
     refresh();
     CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
     CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    accepted_gradients.assign(3, Grad(C{9, 7}));
+    gpu.mw_evalGrad(team, targets, 3, accepted_gradients);
+    CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+    CHECK(metrics.snapshot().free_calls == warm.free_calls);
+    for (std::size_t i = 0; i < 3; ++i)
+      for (int d = 0; d < 3; ++d)
+        close(accepted_gradients[i][d], particles[i]->G[3][d], 2e-8); // WRITE, not additive
+    CHECK_THROWS_AS(gpu.mw_evalGrad(team, targets, -1, accepted_gradients), std::invalid_argument);
+    CHECK_THROWS_AS(gpu.mw_evalGrad(team, targets, 4, accepted_gradients), std::invalid_argument);
+    std::vector<Grad> wrong_accepted_extent(2);
+    CHECK_THROWS_AS(gpu.mw_evalGrad(team, targets, 0, wrong_accepted_extent), std::invalid_argument);
     const auto scalar_gradient = gpu.evalGrad(p0, 0);
     for (int d = 0; d < 3; ++d)
       close(scalar_gradient[d], p0.G[0][d], 2e-8);
@@ -2513,7 +2538,6 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
     refresh();
     // Proposed FULL gradients batch through the same T2 owner, including the tail.
     // A separate CPU clone at the complete proposed configuration is the oracle.
-    using Grad = WaveFunctionComponent::GradType;
     const C additive{.21, -.13};
     std::vector<Grad> proposed_gradients(3, Grad(additive));
     std::array<Grad, 3> expected_gradients;
@@ -2542,11 +2566,35 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
       for (int d = 0; d < 3; ++d)
         close(proposed_gradients[i][d], expected_gradients[i][d], 2e-8);
     }
+    // Even with active proposals, accepted gradients use old R and preserve all cache/P.G/L state.
+    const std::array<ParticleSet::ParticleGradient, 3> accepted_g{p0.G, p1.G, p2.G};
+    const std::array<ParticleSet::ParticleLaplacian, 3> accepted_l{p0.L, p1.L, p2.L};
+    const std::array<C, 3> accepted_logs{
+        components[0]->get_log_value(), components[1]->get_log_value(), components[2]->get_log_value()};
+    accepted_gradients.assign(3, Grad(C{9, 7}));
+    gpu.mw_evalGrad(team, targets, 3, accepted_gradients);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+      CHECK(components[i]->get_log_value() == accepted_logs[i]);
+      for (int d = 0; d < 3; ++d)
+        close(accepted_gradients[i][d], accepted_g[i][3][d], 2e-8);
+      for (std::size_t e = 0; e < 4; ++e)
+      {
+        CHECK(particles[i]->L[e] == accepted_l[i][e]);
+        for (int d = 0; d < 3; ++d)
+          CHECK(particles[i]->G[e][d] == accepted_g[i][e][d]);
+      }
+    }
     ratios.assign(3, C{9, 7});
     proposed_gradients.assign(3, Grad(additive));
     const std::array<C, 3> before_failure_logs{
         components[0]->get_log_value(), components[1]->get_log_value(), components[2]->get_log_value()};
     p2.R[1][0] = std::numeric_limits<double>::quiet_NaN();
+    accepted_gradients.assign(3, Grad(C{9, 7}));
+    CHECK_THROWS(gpu.mw_evalGrad(team, targets, 3, accepted_gradients));
+    for (const auto& gradient : accepted_gradients)
+      for (int d = 0; d < 3; ++d)
+        CHECK(gradient[d] == (C{9, 7}));
     CHECK_THROWS(gpu.mw_ratioGrad(team, targets, 3, ratios, proposed_gradients));
     p2.R[1][0] = saved_position;
     for (std::size_t i = 0; i < 3; ++i)
@@ -2580,6 +2628,7 @@ TEST_CASE("PsiFormer dense paired GPU native tiles preserve phase tails and cach
         references[walker]->restore(3);
         components[walker]->restore(3);
         particles[walker]->rejectMove(3);
+        CHECK_NOTHROW(static_cast<PsiFormerComplexWF*>(components[walker])->observeCoulombEnergy(*particles[walker], 0));
       }
     refresh();
     const auto publication = gpu.gpuParameterPublicationRequirements();
