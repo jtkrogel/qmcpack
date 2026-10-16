@@ -252,6 +252,30 @@ void validate()
 #include "PsiFormerDeviceComplexValueValidation.h"
 #include "PsiFormerDeviceComplexSpatialValidation.h"
 #include "PsiFormerDeviceComplexScoreValidation.h"
+#include "PsiFormerDeviceKineticTrunkValidation.h"
+
+/// Exercise physical K ranges on the existing skew-periodic real and paired fixtures.
+void validateKineticTrunkPeriodic()
+{
+  ExecutionEnvironment environment;
+  environment.boundary = BoundaryCondition::PERIODIC;
+  environment.geometry_feature_policy = GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+  environment.lattice_vectors = {{{4.0, 0.4, -0.2}, {0.7, 5.0, 0.3}, {-0.1, 0.8, 6.0}}};
+  environment.periodic_axes = {true, true, true};
+  for (bool paired : {false, true})
+  {
+    environment.head_representation = paired ? HeadRepresentation::PAIRED_REAL_COMPLEX : HeadRepresentation::REAL;
+    environment.amplitude_scalar_domain = paired ? ScalarDomain::COMPLEX : ScalarDomain::REAL;
+    pf::PsiFormer model(smallParameters(environment), configurations(environment), 4, 16, 2, 2);
+    const ModelShape shape{2, 2, 2, 4, 16, 2, 2};
+    const auto plan = PsiFormerExecutionPlan::fromParameters(model.p, shape, environment);
+    auto image = paired ? PreparedDeviceModel::preparePairedComplexValue(plan, model.p.flat_values(), model.cfg.nuclei.x) :
+        std::make_shared<PreparedDeviceModel>(plan, model.p.flat_values(), model.cfg.nuclei.x, 0);
+    qmcplusplus::compute::Queue<qmcplusplus::PlatformKind::CUDA> queue;
+    AcceleratorBlasHandle blas(queue);
+    KineticTrunkValidationAccess::run(model, image, queue, blas);
+  }
+}
 
 /// Return a standard unavailable-runtime status without disguising CPU-only work.
 int main(int argc, char** argv)
@@ -259,8 +283,8 @@ int main(int argc, char** argv)
   try
   {
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--complex-value-only" &&
-        std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only"))
-      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only]");
+        std::string_view(argv[1]) != "--complex-spatial-only" && std::string_view(argv[1]) != "--complex-score-only" && std::string_view(argv[1]) != "--kinetic-trunk-only"))
+      throw std::invalid_argument("Usage: periodic_validation [--complex-value-only|--complex-spatial-only|--complex-score-only|--kinetic-trunk-only]");
     int count = 0;
 #ifdef QMC_CUDA2HIP
     const auto discovery = hipGetDeviceCount(&count);
@@ -272,7 +296,9 @@ int main(int argc, char** argv)
       std::cout << "NOT_RUN: periodic validator requires a usable GPU\n";
       return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--complex-score-only")
+    if (argc == 2 && std::string_view(argv[1]) == "--kinetic-trunk-only")
+      validateKineticTrunkPeriodic();
+    else if (argc == 2 && std::string_view(argv[1]) == "--complex-score-only")
       validateComplexScore();
     else if (argc == 2 && std::string_view(argv[1]) == "--complex-spatial-only")
       validateComplexSpatial();

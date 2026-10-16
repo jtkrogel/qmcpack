@@ -94,13 +94,15 @@ public:
 
 private:
   friend class PreparedDeviceTargetKinetic;
+  friend class PreparedDeviceKineticTrunk;
+  friend struct KineticTrunkValidationAccess;
 
   /// A separate named owner selects max-K before any reverse reserve.
   PreparedDeviceKineticReverse(std::shared_ptr<const PreparedDeviceModel> model,
                                std::size_t capacity,
                                compute::Queue<PlatformKind::CUDA>& queue,
                                AcceleratorBlasHandle& blas, std::size_t max_targets,
-                               std::size_t lifted_channel_slots = 0)
+                               std::size_t lifted_channel_slots = 0, bool trunk_only = false)
       : model_(std::move(model)), capacity_(capacity), queue_(queue), blas_(blas)
   {
     if (!model_ || capacity_ == 0)
@@ -123,33 +125,36 @@ private:
       buffer->reserve(features);
     probability_.reserve(spatialJetSpanElements(attention_.attention));
     logit_.reserve(probability_.capacity());
-    const auto matrices = spatialJetSpanElements(orbitals_.orbitals);
-    for (auto* buffer : {&factor_, &orbital_, &backflow_, &envelope_})
-      buffer->reserve(matrices);
-    // The optional target backend owns its matrix products; never retain both.
-    if (lifted_channel_slots)
-    {
-      const auto products = planLiftedDeterminantProducts(ne, lifted_channel_slots,
-          std::numeric_limits<std::size_t>::max());
-      lifted_products_ = std::make_unique<PreparedDeviceLiftedDeterminantProducts>(ne, lifted_channel_slots,
-          products.device_workspace_bytes, queue_, blas_);
-      orbital_failure_.reserve(1);
-    }
-    else
-      matrix_scratch_.reserve(multiply(3, multiply(ne, ne)));
     root_adjoint_.reserve(spatialJetSpanElements(root_));
     response_.reserve(model_->plan().parameterCount());
     dummy_bias_.reserve(width);
-    weights_.reserve(capacity_);
-    masses_.reserve(ne);
-    total_gradient_.reserve(multiply(capacity_, multiply(3, ne)));
-    determinant_status_.reserve(1);
-    reverse_status_.reserve(1);
-    open_status_.reserve(1);
     kinetic_status_.reserve(1);
-    host_determinant_status_.resize(1);
-    host_open_status_.resize(1);
-    host_factors_.resize(multiply(capacity_, shape.determinants));
+    if (!trunk_only)
+    {
+      const auto matrices = spatialJetSpanElements(orbitals_.orbitals);
+      for (auto* buffer : {&factor_, &orbital_, &backflow_, &envelope_})
+        buffer->reserve(matrices);
+      // The optional target backend owns its matrix products; never retain both.
+      if (lifted_channel_slots)
+      {
+        const auto products = planLiftedDeterminantProducts(ne, lifted_channel_slots,
+            std::numeric_limits<std::size_t>::max());
+        lifted_products_ = std::make_unique<PreparedDeviceLiftedDeterminantProducts>(ne, lifted_channel_slots,
+            products.device_workspace_bytes, queue_, blas_);
+        orbital_failure_.reserve(1);
+      }
+      else
+        matrix_scratch_.reserve(multiply(3, multiply(ne, ne)));
+      weights_.reserve(capacity_);
+      masses_.reserve(ne);
+      total_gradient_.reserve(multiply(capacity_, multiply(3, ne)));
+      determinant_status_.reserve(1);
+      reverse_status_.reserve(1);
+      open_status_.reserve(1);
+      host_determinant_status_.resize(1);
+      host_open_status_.resize(1);
+      host_factors_.resize(multiply(capacity_, shape.determinants));
+    }
     finite_layout_ = {response_.capacity(), 4096,
         response_.capacity() / 4096 + (response_.capacity() % 4096 != 0), 0, 1};
     finite_status_.reserve(finite_layout_.status_capacity);
@@ -298,57 +303,101 @@ private:
           "kinetic cusp reverse");
       checkKinetic();
 
-      // Remaining neural layers reverse all value/gradient/Laplacian cotangents.
-      for (std::size_t layer = shape.attention_blocks; layer-- > 0;)
-      {
-        const auto& tape = *forward.value_tape_.at(layer);
-        const auto attention_offset = configuration * attention_.attention.configuration_stride;
-        const auto at = [&](const DeviceBuffer<double>& buffer) { return buffer.data() + feature_offset; };
-        copy(feature_, residual_);
-        zero(pre_);
-        checkRuntime(launchTanhJetReverse(stream, elementwise_, at(tape.projected_pre), at(tape.projected),
-            feature_.data(), pre_.data()), "kinetic output tanh reverse");
-        zero(hidden_);
-        denseReverse(at(tape.hidden), pre_, hidden_, ParameterRole::UPDATE_OUTPUT_WEIGHT, layer,
-                     response_.data() + offset(ParameterRole::UPDATE_OUTPUT_BIAS, layer));
-        zero(pre_);
-        checkRuntime(launchTanhJetReverse(stream, elementwise_, at(tape.hidden_pre), at(tape.hidden),
-            hidden_.data(), pre_.data()), "kinetic hidden tanh reverse");
-        denseReverse(at(tape.residual), pre_, residual_, ParameterRole::UPDATE_HIDDEN_WEIGHT, layer,
-                     response_.data() + offset(ParameterRole::UPDATE_HIDDEN_BIAS, layer));
-        copy(residual_, input_);
-        zero(context_);
-        denseReverse(at(tape.context), residual_, context_, ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer);
-        zero(probability_);
-        zero(value_);
-        checkRuntime(launchAttentionContextJetReverse(stream, attention_, tape.probabilities.data() + attention_offset,
-            at(tape.value), context_.data(), probability_.data(), value_.data()), "kinetic context reverse");
-        zero(logit_);
-        checkRuntime(launchSoftmaxJetReverse(stream, makeAttentionSoftmaxJetRowLayout(attention_),
-            tape.logits.data() + attention_offset, tape.probabilities.data() + attention_offset,
-            probability_.data(), logit_.data()), "kinetic softmax reverse");
-        zero(query_);
-        zero(key_);
-        checkRuntime(launchAttentionLogitJetReverse(stream, attention_, at(tape.query), at(tape.key),
-            logit_.data(), query_.data(), key_.data()), "kinetic Q/K reverse");
-        denseReverse(at(tape.input), query_, input_, ParameterRole::ATTENTION_QUERY_WEIGHT, layer);
-        denseReverse(at(tape.input), key_, input_, ParameterRole::ATTENTION_KEY_WEIGHT, layer);
-        denseReverse(at(tape.input), value_, input_, ParameterRole::ATTENTION_VALUE_WEIGHT, layer);
-        copy(input_, feature_);
-      }
-
-      // Feature-layer reverse stops at fixed physical inputs. Fold all spatial
-      // planes for the embedding weight response without allocating raw adjoints.
-      const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
-      auto embedding_layout = makeSpatialDenseJetLayout(1, ne, embedding.shape[0], width, ne, SpatialJetMode::FULL_VGL);
-      embedding_layout.source = withSpatialTargetRange(embedding_layout.source,
-          head.root_layout.target_electron_begin, head.root_layout.laplacian_lanes);
-      embedding_layout.target = withSpatialTargetRange(embedding_layout.target,
-          head.root_layout.target_electron_begin, head.root_layout.laplacian_lanes);
-      accumulateDenseWeightAdjoint(blas_, makeFoldedSpatialDenseLayout(embedding_layout),
-          head.raw_features + configuration * embedding_layout.source.configuration_stride, feature_.data(),
-          response_.data() + embedding.begin);
+      accumulateTrunk(forward, head.root_layout, head.raw_features, configuration);
     }
+  }
+
+  /// Shared lifted attention/embedding tail; preserves head/cusp contributions in P.
+  void accumulateTrunk(const PreparedDeviceInference& forward, const SpatialJetLayout& root_layout,
+      const double* raw_features, std::size_t configuration)
+  {
+    const auto& shape = model_->plan().modelShape();
+    const auto ne = shape.electrons(), width = shape.feature_dimension;
+    const auto stream = queue_.getNative();
+    const auto feature_offset = configuration * dense_.source.configuration_stride;
+    // Remaining neural layers reverse all value/gradient/Laplacian cotangents.
+    for (std::size_t layer = shape.attention_blocks; layer-- > 0;)
+    {
+      const auto& tape = *forward.value_tape_.at(layer);
+      const auto attention_offset = configuration * attention_.attention.configuration_stride;
+      const auto at = [&](const DeviceBuffer<double>& buffer) { return buffer.data() + feature_offset; };
+      copy(feature_, residual_);
+      zero(pre_);
+      checkRuntime(launchTanhJetReverse(stream, elementwise_, at(tape.projected_pre), at(tape.projected),
+          feature_.data(), pre_.data()), "kinetic output tanh reverse");
+      zero(hidden_);
+      denseReverse(at(tape.hidden), pre_, hidden_, ParameterRole::UPDATE_OUTPUT_WEIGHT, layer,
+                   response_.data() + offset(ParameterRole::UPDATE_OUTPUT_BIAS, layer));
+      zero(pre_);
+      checkRuntime(launchTanhJetReverse(stream, elementwise_, at(tape.hidden_pre), at(tape.hidden),
+          hidden_.data(), pre_.data()), "kinetic hidden tanh reverse");
+      denseReverse(at(tape.residual), pre_, residual_, ParameterRole::UPDATE_HIDDEN_WEIGHT, layer,
+                   response_.data() + offset(ParameterRole::UPDATE_HIDDEN_BIAS, layer));
+      copy(residual_, input_);
+      zero(context_);
+      denseReverse(at(tape.context), residual_, context_, ParameterRole::ATTENTION_OUTPUT_WEIGHT, layer);
+      zero(probability_);
+      zero(value_);
+      checkRuntime(launchAttentionContextJetReverse(stream, attention_, tape.probabilities.data() + attention_offset,
+          at(tape.value), context_.data(), probability_.data(), value_.data()), "kinetic context reverse");
+      zero(logit_);
+      checkRuntime(launchSoftmaxJetReverse(stream, makeAttentionSoftmaxJetRowLayout(attention_),
+          tape.logits.data() + attention_offset, tape.probabilities.data() + attention_offset,
+          probability_.data(), logit_.data()), "kinetic softmax reverse");
+      zero(query_);
+      zero(key_);
+      checkRuntime(launchAttentionLogitJetReverse(stream, attention_, at(tape.query), at(tape.key),
+          logit_.data(), query_.data(), key_.data()), "kinetic Q/K reverse");
+      denseReverse(at(tape.input), query_, input_, ParameterRole::ATTENTION_QUERY_WEIGHT, layer);
+      denseReverse(at(tape.input), key_, input_, ParameterRole::ATTENTION_KEY_WEIGHT, layer);
+      denseReverse(at(tape.input), value_, input_, ParameterRole::ATTENTION_VALUE_WEIGHT, layer);
+      copy(input_, feature_);
+    }
+
+    // Feature-layer reverse stops at fixed physical inputs. Fold all spatial
+    // planes for the embedding weight response without allocating raw adjoints.
+    const auto& embedding = model_->plan().parameter(ParameterRole::ELECTRON_EMBEDDING_WEIGHT);
+    auto embedding_layout = makeSpatialDenseJetLayout(1, ne, embedding.shape[0], width, ne, SpatialJetMode::FULL_VGL);
+    embedding_layout.source = withSpatialTargetRange(embedding_layout.source,
+        root_layout.target_electron_begin, root_layout.laplacian_lanes);
+    embedding_layout.target = withSpatialTargetRange(embedding_layout.target,
+        root_layout.target_electron_begin, root_layout.laplacian_lanes);
+    accumulateDenseWeightAdjoint(blas_, makeFoldedSpatialDenseLayout(embedding_layout),
+        raw_features + configuration * embedding_layout.source.configuration_stride, feature_.data(),
+        response_.data() + embedding.begin);
+  }
+
+  /// Consume only the current immediate trunk ticket after the private producer seeds it.
+  void accumulateTrunkSeeds(const PreparedDeviceInference::KineticTrunkTicket& ticket)
+  {
+    if (!ticket.owner)
+      throw std::invalid_argument("Kinetic trunk reverse requires a nonnull ticket owner");
+    ticket.owner->validateKineticTrunk(ticket);
+    if (ticket.image != model_.get())
+      throw std::invalid_argument("Kinetic trunk reverse image differs");
+    setTargetRange(ticket.features.target_electron_begin, ticket.features.laplacian_lanes);
+    // Strict arbitrary-seed admission reuses bounded P-status scratch, even for masked roots.
+    for (const auto* seed : {&feature_, &root_adjoint_})
+    {
+      const auto count = liveSpan(*seed), pieces = std::min(count, finite_status_.capacity());
+      const auto interval = count / pieces + (count % pieces != 0);
+      const auto live_status = count / interval + (count % interval != 0);
+      checkRuntime(launchDerivativeFiniteScan(queue_.getNative(), {count, interval, pieces, 0, 1},
+          seed->data(), finite_status_.data()), "kinetic trunk seed finite scan");
+      queue_.sync();
+      finite_status_.download(host_finite_status_.data(), live_status);
+      for (std::size_t i = 0; i < live_status; ++i)
+        if (host_finite_status_[i].nonfinite_count)
+          throw std::runtime_error("Kinetic trunk seeds must be finite");
+    }
+    const auto* same = model_->plan().optionalParameter(ParameterRole::CUSP_SAME_ALPHA);
+    const OpenCuspKineticReverseLayout layout{cusp_, response_.capacity(), same ? same->begin : 0,
+        offset(ParameterRole::CUSP_OPPOSITE_ALPHA), same != nullptr};
+    checkRuntime(launchOpenCuspKineticReverse(queue_.getNative(), layout, ticket.positions,
+        model_->sameAlpha(), model_->oppositeAlpha(), root_adjoint_.data(), response_.data(),
+        kinetic_status(), model_->periodicCell()), "seeded trunk cusp reverse");
+    checkKinetic();
+    accumulateTrunk(*ticket.owner, ticket.cusp, ticket.raw, 0);
   }
 
   /// Admit the final complete P sum only after all target tiles have succeeded.
@@ -454,6 +503,8 @@ private:
         return spatialJetSpanElements(dense_.source);
     if (&buffer == &probability_ || &buffer == &logit_)
       return spatialJetSpanElements(attention_.attention);
+    if (&buffer == &root_adjoint_)
+      return spatialJetSpanElements(root_);
     for (const auto* orbital : {&factor_, &orbital_, &backflow_, &envelope_})
       if (&buffer == orbital)
         return spatialJetSpanElements(orbitals_.orbitals);

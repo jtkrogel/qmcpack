@@ -588,6 +588,8 @@ private:
   friend class PreparedDeviceComplexValue;
   friend class PreparedDeviceComplexSpatial;
   friend class PreparedDeviceComplexScore;
+  friend class PreparedDeviceKineticTrunk;
+  friend struct KineticTrunkValidationAccess;
 
   /// Only the target kinetic owner may prepare partial retained spatial tapes.
   PreparedDeviceInference(std::shared_ptr<const PreparedDeviceModel> model,
@@ -596,10 +598,11 @@ private:
                           AcceleratorBlasHandle& blas,
                           SpatialJetMode mode, bool retain_score_tape, bool retain_spatial_tape,
                           InferenceStatusPolicy status_policy,
-                          TargetVglPreparation target_preparation, bool retained_targets, bool real_trunk_only = false)
+                          TargetVglPreparation target_preparation, bool retained_targets, bool real_trunk_only = false,
+                          bool kinetic_trunk_only = false)
       : model_(std::move(model)), plan_(checkedPlan(model_)), shape_(plan_.modelShape()),
         batch_(batch_size), batch_capacity_(batch_size), queue_(queue), blas_(blas), mode_(mode),
-        target_preparation_(target_preparation), retained_targets_(retained_targets)
+        target_preparation_(target_preparation), retained_targets_(retained_targets), kinetic_trunk_only_(kinetic_trunk_only)
   {
     model_->validateCurrentDevice();
     setStatusPolicy(status_policy);
@@ -610,7 +613,11 @@ private:
     if (retain_spatial_tape && mode_ != SpatialJetMode::FULL_VGL)
       throw std::invalid_argument("Spatial reverse tape requires a full-VGL graph");
     const auto& environment = plan_.environment();
-    if (real_trunk_only && (retain_spatial_tape ||
+    if (kinetic_trunk_only && (!real_trunk_only || batch_size != 1 || !retain_spatial_tape ||
+        retain_score_tape || retained_targets || !target_preparation.max_targets ||
+        target_preparation.max_targets > shape_.electrons()))
+      throw std::invalid_argument("Private kinetic trunk requires one explicitly bounded retained spatial graph");
+    if (real_trunk_only && !kinetic_trunk_only && (retain_spatial_tape ||
         retained_targets_ || target_preparation_.max_targets || environment.boundary != BoundaryCondition::PERIODIC ||
         environment.head_representation != HeadRepresentation::PAIRED_REAL_COMPLEX ||
         environment.amplitude_scalar_domain != ScalarDomain::COMPLEX))
@@ -628,7 +635,7 @@ private:
       if (target_preparation_.device_workspace_budget_bytes != 0 || target_preparation_.scalar_work_budget != 0)
         throw std::invalid_argument("Target VGL budgets require an explicit positive target capacity");
     }
-    else
+    else if (!kinetic_trunk_only)
     {
       if (mode_ != SpatialJetMode::FULL_VGL || retain_score_tape ||
           (retain_spatial_tape && !retained_targets_))
@@ -721,7 +728,7 @@ private:
     jet_status_.reserve(product(batch_, product(shape_.attention_heads, ne_)));
     host_jet_status_.resize(jet_status_.capacity());
     sticky_status_.reserve(1);
-    if (target_preparation_.max_targets)
+    if (target_preparation_.max_targets && !kinetic_trunk_only)
     {
       full_phase_.reserve(batch_);
       full_output_.reserve(spatialJetSpanElements(result_layout_));
@@ -836,6 +843,75 @@ private:
         view.head.root_layout.target_electron_begin != final_.output.target_electron_begin ||
         view.head.root_layout.laplacian_lanes != final_.output.laplacian_lanes)
       throw std::logic_error("Retained target tape view is stale or belongs to another request");
+  }
+
+  /// Private head-free borrow, valid only in its immediate physical-target callback.
+  struct KineticTrunkTicket
+  {
+    const PreparedDeviceInference* owner;
+    const PreparedDeviceModel* image;
+    std::size_t generation, ordinal;
+    SpatialJetLayout features, cusp;
+    const double *positions, *raw, *final_features, *cusp_jets;
+  };
+
+  /// Reject saved, foreign, mutated or successor-image trunk borrows before launch.
+  void validateKineticTrunk(const KineticTrunkTicket& ticket) const
+  {
+    model_->validateCurrentDevice();
+    if (!kinetic_trunk_only_ || !target_tape_valid_ || ticket.owner != this || ticket.image != model_.get() ||
+        ticket.generation != evaluation_generation_ || ticket.ordinal != admitted_target_tiles_ ||
+        ticket.features.target_electron_begin != dense_.source.target_electron_begin ||
+        ticket.features.configuration_count != 1 || ticket.features.element_count != dense_.source.element_count ||
+        ticket.features.electron_count != ne_ || ticket.features.mode != SpatialJetMode::FULL_VGL ||
+        ticket.features.gradient_lanes != dense_.source.gradient_lanes ||
+        ticket.features.laplacian_lanes != dense_.source.laplacian_lanes ||
+        ticket.features.plane_count != dense_.source.plane_count ||
+        ticket.features.plane_stride != dense_.source.plane_stride ||
+        ticket.features.configuration_stride != dense_.source.configuration_stride ||
+        ticket.cusp.target_electron_begin != cusp_.output.target_electron_begin ||
+        ticket.cusp.configuration_count != cusp_.output.configuration_count ||
+        ticket.cusp.element_count != cusp_.output.element_count || ticket.cusp.electron_count != ne_ ||
+        ticket.cusp.mode != cusp_.output.mode || ticket.cusp.gradient_lanes != cusp_.output.gradient_lanes ||
+        ticket.cusp.laplacian_lanes != cusp_.output.laplacian_lanes ||
+        ticket.cusp.plane_stride != cusp_.output.plane_stride ||
+        ticket.cusp.configuration_stride != cusp_.output.configuration_stride ||
+        ticket.cusp.plane_count != cusp_.output.plane_count || ticket.positions != positions_.data() ||
+        ticket.raw != raw_.data() || ticket.final_features != a_.data() || ticket.cusp_jets != cusp_jets_.data())
+      throw std::logic_error("Kinetic trunk ticket is stale or foreign");
+  }
+
+  /// Upload once; publish no head, factors, normalized weights or full-Ne fallback.
+  template<class Consumer>
+  void evaluateKineticTrunk(const std::vector<double>& positions, Consumer&& consume)
+  {
+    beginCoordinateEvaluation();
+    if (!kinetic_trunk_only_ || positions.size() != product(3, ne_))
+      throw std::invalid_argument("Kinetic trunk requires one complete physical configuration");
+    positions_.upload(positions.data(), positions.size());
+    try
+    {
+      for (std::size_t begin = 0; begin < ne_;)
+      {
+        const auto count = std::min(target_preparation_.max_targets, ne_ - begin);
+        setTargetRange(begin, count);
+        resetStatusAdmission();
+        evaluatePreparedTrunk();
+        evaluateCusp();
+        checkOpen(1);
+        target_tape_valid_ = true;
+        consume(KineticTrunkTicket{this, model_.get(), evaluation_generation_, admitted_target_tiles_,
+            dense_.source, cusp_.output, positions_.data(), raw_.data(), a_.data(), cusp_jets_.data()});
+        target_tape_valid_ = false;
+        ++admitted_target_tiles_;
+        begin += count;
+      }
+    }
+    catch (...)
+    {
+      target_tape_valid_ = false;
+      throw;
+    }
   }
 
   /// Upload once and consume each retained tile before reusing its max-K storage.
@@ -1578,6 +1654,7 @@ private:
   DeviceBuffer<double> full_phase_, full_output_, full_lap_ratio_;
   std::vector<double> tile_phase_, tile_log_, canonical_phase_, canonical_log_;
   std::vector<device_determinant::CombinationMetadata> host_combinations_;
+  bool kinetic_trunk_only_ = false;
   bool value_tape_valid_ = false;
   bool result_valid_ = false;
   std::size_t evaluation_generation_ = 0;
