@@ -74,10 +74,17 @@ struct PsiFormerComplexWF::Impl
         const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
         std::size_t limit)
     {
+      return prepareFrozen(plan, parameters, nuclei, version, limit, configuredPreparation());
+    }
+
+    /// Successors preserve the admitted family profile without reading mutable process controls again.
+    static std::unique_ptr<GpuLane> prepareFrozen(const psiformer::PsiFormerExecutionPlan& plan,
+        const std::vector<double>& parameters, const std::vector<double>& nuclei, std::size_t version,
+        std::size_t limit, psiformer::device::TargetVglPreparation preparation)
+    {
       using namespace psiformer::device;
       if (!limit || limit == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU inference requires a positive finite shared-lane byte cap");
-      const auto preparation = configuredPreparation();
       const auto value = estimateComplexValueCost(plan, 1);
       const auto spatial = preparation.max_targets
           ? estimateComplexSpatialTargetCost(plan, preparation.max_targets) : estimateComplexSpatialCost(plan, 1);
@@ -112,7 +119,7 @@ struct PsiFormerComplexWF::Impl
               : psiformer::device::PreparedDeviceComplexSpatial::prepare(image, 1, queue, blas, spatial_cost.device_bytes)),
           positions(3 * plan.modelShape().electrons()), amplitude(1), gradient(positions.size()),
           laplacian(plan.modelShape().electrons()), ratio(laplacian.size()), converted(4 * laplacian.size()),
-          device_bytes(bytes), host_bytes(host)
+          device_bytes(bytes), host_bytes(host), preparation(preparation)
     {
       const auto actual_host = value_cost.host_bytes + spatial_cost.host_bytes +
               sizeof(double) * positions.capacity() + sizeof(psiformer::device::ComplexValueResult) * amplitude.capacity() +
@@ -120,6 +127,8 @@ struct PsiFormerComplexWF::Impl
               sizeof(C) * converted.capacity();
       if (actual_host != host_bytes)
         throw std::logic_error("Complex GPU host capacities differ from checked preparation");
+      if (value->cost().device_bytes + full->cost().device_bytes != device_bytes)
+        throw std::logic_error("Complex GPU owner capacities differ from checked preparation");
       app_log() << "  Complex PsiFormer GPU inference prepared: mode="
                 << (preparation.max_targets ? "EXPLICIT_TARGET" : "FULL") << ", K=" << preparation.max_targets
                 << ", spatial_owner_device_bytes=" << spatial_cost.device_bytes << ", shared_device_bytes=" << bytes
@@ -137,6 +146,7 @@ struct PsiFormerComplexWF::Impl
     std::vector<cuDoubleComplex> gradient, laplacian, ratio;
     std::vector<C> converted;
     const std::size_t device_bytes, host_bytes;
+    const psiformer::device::TargetVglPreparation preparation;
     std::mutex mutex;
   };
 #endif
@@ -197,7 +207,7 @@ struct PsiFormerComplexWF::Impl
     const std::shared_ptr<const wftrain::StructuredParameterSchema> schema;
     const std::size_t gpu_limit;
 #ifdef ENABLE_CUDA
-    std::unique_ptr<GpuLane> gpu;
+    std::shared_ptr<GpuLane> gpu;
 #endif
     mutable std::shared_mutex mutex;
     std::atomic<std::size_t> pending_proposals{0};
@@ -256,14 +266,16 @@ struct PsiFormerComplexWF::Impl
     /// Allocate only after both domains and maximum request work have been admitted.
     GpuDerivativeLane(std::shared_ptr<Model> model, std::size_t maximum_samples, std::size_t targets,
         std::size_t chunk, const PsiFormerComplexWF::GpuDerivativeRequirements& budget)
-        : state(std::move(model)), maximum_samples(maximum_samples), targets(targets), chunk(chunk),
-          products(Products::prepare(state->gpu->image, targets, maximum_samples, 3, chunk,
-              state->gpu->queue, state->gpu->blas, budget.device_bytes,
+        : state(std::move(model)), generation(state->gpu), maximum_samples(maximum_samples), targets(targets), chunk(chunk),
+          products(Products::prepare(generation->image, targets, maximum_samples, 3, chunk,
+              generation->queue, generation->blas, budget.device_bytes,
               budget.host_bytes - maximum_samples * sizeof(C), budget.matrix_work)),
           zeros(maximum_samples), channels(3)
     {}
 
     const std::shared_ptr<Model> state;
+    /// Declare before Products: borrowers die before their exact queue/BLAS/image generation.
+    const std::shared_ptr<GpuLane> generation;
     const std::size_t maximum_samples, targets, chunk;
     const std::unique_ptr<Products> products;
     const std::vector<C> zeros;
@@ -356,10 +368,11 @@ struct PsiFormerComplexWF::Impl
       std::unique_lock execution(lane->execution_mutex);
       const C* output;
       {
-        std::unique_lock gpu(lane->state->gpu->mutex);
         std::shared_lock read(lane->state->mutex);
-        if (version != lane->state->model.p.version() || lane->state->pending_proposals.load(std::memory_order_relaxed))
+        if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
+            lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
+        std::unique_lock gpu(lane->generation->mutex);
         validateDerivativeSource(*lane->state);
         for (auto& channel : lane->channels)
           channel = {GpuDerivativeLane::Products::Role::SCORE, lane->zeros.data(), samples};
@@ -1220,9 +1233,9 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
         wavefunctions.getLeader().getOrbitals().size() != 1 ||
         wavefunctions.getLeader().getOrbitals()[0].get() != this)
       throw std::invalid_argument("Complex GPU derivative sole TrialWF leader/extent mismatch");
-    // Never wait on GPU execution while holding the model lock; inference uses the same image/queue.
-    std::unique_lock gpu(state->gpu->mutex);
+    // Match inference: model read BEFORE its current generation GPU mutex, never wait for an execution lease here.
     std::shared_lock read(state->mutex);
+    std::unique_lock gpu(state->gpu->mutex);
     if (state->pending_proposals.load(std::memory_order_relaxed))
       throw std::logic_error("Complex GPU derivative preparation requires an idle model family");
     Impl::validateDerivativeSource(*state);
@@ -1255,6 +1268,8 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     }
     std::lock_guard preparation(state->derivative_factory_mutex);
     auto lane = state->gpu_derivative_lane.lock();
+    if (lane && lane->generation != state->gpu)
+      lane.reset();
     if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets || lane->chunk != chunk))
       throw std::invalid_argument("Complex GPU derivative live lane profile mismatch");
     if (!lane)
@@ -1337,6 +1352,91 @@ std::size_t PsiFormerComplexWF::publishParameters(const wftrain::StructuredParam
   impl_->invalidate();
   // Other clones reject old accepted/buffer versions lazily; no clone pointer registry is retained.
   return parameters.version();
+}
+
+/// Admit a complete NEW generation, excluding old generations and image HOST layout/storage (including cusp scalars).
+PsiFormerComplexWF::GpuParameterPublicationRequirements
+PsiFormerComplexWF::gpuParameterPublicationRequirements() const
+{
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    std::shared_lock read(impl_->state->mutex);
+    const auto& generation = *impl_->state->gpu;
+    const auto device = psiformer::spatial_detail::checkedAdd(generation.device_bytes,
+        generation.image->deviceStorageBytes(), "Complex GPU publication device bytes overflow");
+    return {device, generation.host_bytes};
+  }
+#endif
+  throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
+}
+
+/// Prepare outside model write; native full-vector publication precedes only noexcept generation/cache adoption.
+std::size_t PsiFormerComplexWF::publishBudgetedGpuParameters(
+    const wftrain::StructuredParameterSnapshot& candidate, std::size_t expected_version,
+    std::size_t additional_device_cap, std::size_t additional_host_cap)
+{
+#ifdef ENABLE_CUDA
+  if (gpuInferenceEnabled())
+  {
+    const auto state = impl_->state;
+    if (candidate.schema_fingerprint != parameterSchema().fingerprint() ||
+        candidate.values.size() != parameterSchema().parameterCount() || candidate.version != expected_version)
+      throw std::invalid_argument("Complex GPU publication schema, extent or source version mismatch");
+    if (expected_version == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex GPU publication version exhausted");
+    for (const auto cap : {additional_device_cap, additional_host_cap})
+      if (!cap || cap == std::numeric_limits<std::size_t>::max())
+        throw std::invalid_argument("Complex GPU publication requires positive finite new-generation caps");
+    for (double value : candidate.values)
+      if (!psiformer::determinant::isFiniteReal(value))
+        throw std::invalid_argument("Complex GPU publication values must be finite");
+
+    // Capture immutable ownership/profile under read; never wait on GPU under the later write.
+    std::shared_ptr<Impl::GpuLane> captured;
+    GpuParameterPublicationRequirements required{};
+    {
+      std::shared_lock read(state->mutex);
+      if (state->model.p.version() != expected_version)
+        throw std::runtime_error("Complex GPU publication rejected a stale parameter version");
+      if (state->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex GPU publication requires no family pending proposals");
+      Impl::validateDerivativeSource(*state);
+      captured = state->gpu;
+      captured->image->validateCurrentDevice();
+      if (captured->image->version() != expected_version)
+        throw std::logic_error("Complex GPU publication current image/native version mismatch");
+      required = {psiformer::spatial_detail::checkedAdd(captured->device_bytes,
+          captured->image->deviceStorageBytes(), "Complex GPU publication device bytes overflow"), captured->host_bytes};
+      if (required.device_bytes > additional_device_cap || required.host_bytes > additional_host_cap)
+        throw std::length_error("Complex GPU publication exceeds new-generation caps before allocation");
+    }
+
+    // One independent cold generation, with no old P image retained by its metadata.
+    const auto next_version = expected_version + 1;
+    std::shared_ptr<Impl::GpuLane> successor = Impl::GpuLane::prepareFrozen(state->plan, candidate.values,
+        state->model.cfg.nuclei.x, next_version, state->gpu_limit, captured->preparation);
+    if (successor->device_bytes + successor->image->deviceStorageBytes() != required.device_bytes ||
+        successor->host_bytes != required.host_bytes || successor->image->version() != next_version)
+      throw std::logic_error("Complex GPU successor capacities/version differ from admitted generation");
+
+    {
+      std::unique_lock write(state->mutex);
+      if (state->model.p.version() != expected_version || state->gpu != captured)
+        throw std::runtime_error("Complex GPU publication lost its captured version/generation");
+      if (state->pending_proposals.load(std::memory_order_relaxed))
+        throw std::logic_error("Complex GPU publication requires no family pending proposals");
+      Impl::validateDerivativeSource(*state);
+      state->model.p.set_flat_values(candidate.values);
+      state->gpu.swap(successor);
+      state->gpu_derivative_lane.reset();
+      impl_->invalidate();
+    }
+    // Retire old resources only after releasing write; old streams may still hold them.
+    return next_version;
+  }
+#endif
+  throw std::logic_error("Explicit GPU publication requires a GPU inference profile");
 }
 
 /// Validate complete scatter before publishing any accepted amplitude or caller G/L.

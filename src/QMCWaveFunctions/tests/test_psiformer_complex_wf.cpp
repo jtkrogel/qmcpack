@@ -2041,5 +2041,205 @@ TEST_CASE("PsiFormer immutable GPU analysis streams preserve complete physical p
   CHECK_THROWS(component.makeBudgetedGpuDerivativeOperator(trials, particles, 7, 11, 2, 3, 7,
       r2.device_bytes, r2.host_bytes, r2.matrix_work));
 }
+
+TEST_CASE("PsiFormer explicit GPU parameter publication replaces complete generations atomically",
+          "[wavefunction][psiformer][complex_gpu_publication]")
+{
+  using namespace wftrain;
+  namespace dev = ps::device;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  {
+    WARN("NOT_RUN: GPU publication requires an available HIP device");
+    return;
+  }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  {
+    WARN("NOT_RUN: GPU publication requires an available CUDA device");
+    return;
+  }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedComplexGpuControls controls;
+  auto& metrics = dev::deviceMemoryMetrics(ordinal);
+  const auto outside = metrics.snapshot();
+  {
+    const auto lattice = cell();
+    const SimulationCell simulation_cell(lattice);
+    auto p = electrons(simulation_cell), cpu_p = electrons(simulation_cell), clone_p = electrons(simulation_cell);
+    auto source = ions(simulation_cell);
+    const auto initialized = parameters();
+    const std::array<double, 3> twist{.17, -.11, .07};
+    ps::ExecutionEnvironment env;
+    env.boundary = ps::BoundaryCondition::PERIODIC;
+    env.geometry_feature_policy = ps::GeometryFeaturePolicy::PERIODIC_TORUS_V1;
+    env.periodic_axes = {true, true, true};
+    env.head_representation = ps::HeadRepresentation::PAIRED_REAL_COMPLEX;
+    env.amplitude_scalar_domain = ps::ScalarDomain::COMPLEX;
+    for (int a = 0; a < 3; ++a)
+      for (int d = 0; d < 3; ++d) env.lattice_vectors[a][d] = lattice.R(a, d);
+    const auto plan = ps::PsiFormerExecutionPlan::fromParameters(initialized, initialized.model_shape, env);
+    std::size_t targets = 0;
+    SECTION("FULL") {}
+    SECTION("K3 tail") { targets = 3; }
+    if (targets)
+      controls.target(targets, dev::estimateComplexSpatialTargetCost(plan, targets).device_bytes,
+          dev::estimateHeadFreeTargetPrefixCost(plan, targets).charged_scalar_work_units);
+    PsiFormerComplexWF cpu("publication", initialized, cpu_p, source, clone_cap, twist);
+    RuntimeOptions options;
+    TrialWaveFunction trial(options);
+    auto owner = std::make_unique<PsiFormerComplexWF>("publication", initialized, p, source, clone_cap,
+                                                     twist, 64 * 1024 * 1024);
+    auto& gpu = *owner;
+    trial.addComponent(std::move(owner));
+    auto clone_owner = gpu.makeClone(clone_p);
+    auto& clone = dynamic_cast<PsiFormerComplexWF&>(*clone_owner);
+    RefVectorWithLeader<TrialWaveFunction> trials(trial, {trial});
+    RefVectorWithLeader<ParticleSet> particles(p, {p});
+    const auto required = gpu.gpuParameterPublicationRequirements();
+    const auto initial_storage = gpu.numericStorage();
+    CHECK(required.device_bytes == initial_storage.shared_gpu_bytes + initial_storage.shared_image_bytes);
+    CHECK(required.host_bytes == initial_storage.shared_gpu_host_bytes);
+    CHECK(metrics.snapshot().live_bytes - outside.live_bytes == required.device_bytes);
+    CHECK_THROWS(cpu.gpuParameterPublicationRequirements());
+    const auto refresh = [&]() {
+      close(evaluate(gpu, p), evaluate(cpu, cpu_p));
+      close(evaluate(clone, clone_p), cpu.get_log_value());
+      for (int e = 0; e < 4; ++e)
+      {
+        for (int d = 0; d < 3; ++d)
+        {
+          close(p.G[e][d], cpu_p.G[e][d]);
+          close(clone_p.G[e][d], cpu_p.G[e][d]);
+        }
+        close(p.L[e], cpu_p.L[e]);
+        close(clone_p.L[e], cpu_p.L[e]);
+      }
+      close(gpu.observeCoulombEnergy(p, -2.7).kinetic, cpu.observeCoulombEnergy(cpu_p, -2.7).kinetic);
+    };
+    refresh();
+    const auto original = gpu.snapshotParameters();
+    const auto reject = [&](const StructuredParameterSnapshot& bad, std::size_t version,
+                            std::size_t device_cap, std::size_t host_cap) {
+      const auto before = metrics.snapshot();
+      CHECK_THROWS(gpu.publishBudgetedGpuParameters(bad, version, device_cap, host_cap));
+      CHECK(metrics.snapshot().allocation_calls == before.allocation_calls);
+      CHECK(gpu.snapshotParameters().values == original.values);
+      CHECK(gpu.snapshotParameters().version == original.version);
+      CHECK(gpu.numericStorage().shared_image_identity == initial_storage.shared_image_identity);
+      CHECK_NOTHROW(gpu.observeCoulombEnergy(p, -2.7));
+    };
+    reject(original, original.version, required.device_bytes - 1, required.host_bytes);
+    reject(original, original.version, required.device_bytes, required.host_bytes - 1);
+    reject(original, original.version, 0, required.host_bytes);
+    reject(original, original.version, required.device_bytes, std::numeric_limits<std::size_t>::max());
+    auto bad = original;
+    bad.schema_fingerprint += "bad";
+    reject(bad, original.version, required.device_bytes, required.host_bytes);
+    bad = original;
+    bad.values.pop_back();
+    reject(bad, original.version, required.device_bytes, required.host_bytes);
+    bad = original;
+    bad.version = original.version + 1;
+    reject(bad, bad.version, required.device_bytes, required.host_bytes);
+    bad = original;
+    bad.values[0] = std::numeric_limits<double>::quiet_NaN();
+    reject(bad, original.version, required.device_bytes, required.host_bytes);
+    bad = original;
+    bad.version = std::numeric_limits<std::size_t>::max();
+    reject(bad, bad.version, required.device_bytes, required.host_bytes);
+    clone_p.makeMove(0, ParticleSet::PosType{.01, 0, 0});
+    clone.ratio(clone_p, 0);
+    reject(original, original.version, required.device_bytes, required.host_bytes);
+    clone.restore(0);
+    clone_p.rejectMove(0);
+    const auto saved_source = source.R[0][0];
+    source.R[0][0] += .01;
+    // Do not use observation while source differs; check native/image identity here.
+    const auto before_source = metrics.snapshot();
+    CHECK_THROWS(gpu.publishBudgetedGpuParameters(original, original.version, required.device_bytes, required.host_bytes));
+    CHECK(metrics.snapshot().allocation_calls == before_source.allocation_calls);
+    CHECK(gpu.snapshotParameters().values == original.values);
+    CHECK(gpu.numericStorage().shared_image_identity == initial_storage.shared_image_identity);
+    source.R[0][0] = saved_source;
+    refresh();
+
+    const auto derivative = gpu.gpuDerivativeRequirements(1, 1, 3, 7);
+    const auto make_stream = [&](std::size_t ordinal) {
+      return gpu.makeBudgetedGpuDerivativeOperator(trials, particles, ordinal, 0, 1, 3, 7,
+          derivative.device_bytes, derivative.host_bytes, derivative.matrix_work);
+    };
+    const auto apply = [&](StreamingDerivativeOperator& stream, ComplexStreamingSink& sink) {
+      const std::vector<C> coefficient{{.3, -.2}};
+      const auto& schema = stream.parameterSchema();
+      const VJPCoefficientChannel channel{"score", DerivativeProduct::SCORE_VJP,
+          {schema.providerId(), schema.fingerprint(), stream.parameterVersion(), stream.batchOrdinal(), 0,
+           {coefficient.data(), 1}}, 0};
+      stream.applyVJPs({&channel, 1}, DerivativeAdjoint::TRANSPOSE, sink);
+    };
+    auto old_stream = make_stream(1);
+    ComplexStreamingSink old_output;
+    apply(*old_stream, old_output);
+    const auto completed_old_values = old_output.values;
+    const auto single_generation = metrics.snapshot().live_bytes;
+    const auto imaginary = std::find_if(initialized.layouts.begin(), initialized.layouts.end(),
+        [](const auto& leaf) { return leaf.name == "w_imag"; });
+    REQUIRE(imaginary != initialized.layouts.end());
+    // Invalid process controls AFTER construction must not alter the frozen FULL/K3 profile.
+    controls.set("PSIFORMER_GPU_VGL_TARGETS", "not-a-number");
+    for (std::size_t step = 0; step < 2; ++step)
+    {
+      auto candidate = gpu.snapshotParameters();
+      const auto expected_version = candidate.version;
+      candidate.values[0] += .001 * (step + 1);
+      candidate.values[imaginary->begin] += .002 * (step + 1);
+      CHECK(gpu.publishBudgetedGpuParameters(candidate, expected_version,
+          required.device_bytes, required.host_bytes) == expected_version + 1);
+      CHECK(cpu.publishParameters(candidate, expected_version) == expected_version + 1);
+      CHECK(gpu.snapshotParameters().version == expected_version + 1);
+      CHECK(cpu.snapshotParameters().version == expected_version + 1);
+      CHECK(gpu.snapshotParameters().values == cpu.snapshotParameters().values);
+      CHECK(metrics.snapshot().live_bytes == single_generation + required.device_bytes);
+      CHECK_THROWS(gpu.observeCoulombEnergy(p, -2.7));
+      CHECK_THROWS(clone.observeCoulombEnergy(clone_p, -2.7));
+      ComplexStreamingSink stale;
+      const auto before_stale = metrics.snapshot();
+      CHECK_THROWS(apply(*old_stream, stale));
+      CHECK(metrics.snapshot().allocation_calls == before_stale.allocation_calls);
+      CHECK(old_output.values == completed_old_values);
+      refresh();
+      auto next_stream = make_stream(step + 2);
+      CHECK(next_stream->storageDiagnostics().shared_workspace_identity != old_stream->storageDiagnostics().shared_workspace_identity);
+      CHECK(metrics.snapshot().live_bytes == single_generation + required.device_bytes + derivative.device_bytes);
+      auto shared = make_stream(step + 9);
+      CHECK(shared->storageDiagnostics().shared_workspace_identity == next_stream->storageDiagnostics().shared_workspace_identity);
+      ComplexStreamingSink next_output;
+      apply(*next_stream, next_output);
+      RefVectorWithLeader<WaveFunctionComponent> cpu_components(cpu, {cpu});
+      RefVectorWithLeader<ParticleSet> cpu_particles(cpu_p, {cpu_p});
+      auto oracle = cpu.makeBudgetedStreamingDerivativeOperator(cpu_components, cpu_particles, step + 2, 0, 7,
+          cpu.streamingDerivativeRequiredBytes(1));
+      ComplexStreamingSink expected;
+      apply(*oracle, expected);
+      for (std::size_t parameter = 0; parameter < candidate.values.size(); ++parameter)
+        close(next_output.values[0][parameter], expected.values[0][parameter], 3e-9);
+      shared.reset();
+      old_stream.reset();
+      CHECK(metrics.snapshot().live_bytes == single_generation);
+      old_stream = std::move(next_stream);
+      CHECK(gpu.gpuParameterPublicationRequirements().device_bytes == required.device_bytes);
+      CHECK(gpu.gpuParameterPublicationRequirements().host_bytes == required.host_bytes);
+      CHECK(gpu.numericStorage().shared_gpu_bytes == initial_storage.shared_gpu_bytes);
+      CHECK_THROWS(gpu.publishParameters(candidate, expected_version));
+      CHECK(gpu.structuredParameterProvider() == nullptr);
+    }
+    std::printf("GPU publication K=%zu generations=2 new_device=%zu new_host=%zu derivative_device=%zu retirement_live=%zu\n",
+        targets, required.device_bytes, required.host_bytes, derivative.device_bytes, single_generation);
+  }
+  CHECK(metrics.snapshot().live_bytes == outside.live_bytes);
+}
 #endif
 } // namespace qmcplusplus

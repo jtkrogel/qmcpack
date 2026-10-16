@@ -65,6 +65,19 @@ public:
   std::size_t publishParameters(const wftrain::StructuredParameterSnapshot& candidate,
                                 std::size_t expected_version) override;
 
+  /// Named NEW inference generation only; excludes native/candidate/image HOST storage and retained old generations.
+  struct GpuParameterPublicationRequirements
+  {
+    std::size_t device_bytes, host_bytes;
+  };
+
+  /// Exact image plus frozen VALUE/SPATIAL owners and HOST staging, not an aggregate transition-peak cap.
+  GpuParameterPublicationRequirements gpuParameterPublicationRequirements() const;
+
+  /// Explicit expert publication only; generic GPU discovery/publication and GPU training remain closed.
+  std::size_t publishBudgetedGpuParameters(const wftrain::StructuredParameterSnapshot& candidate,
+      std::size_t expected_version, std::size_t additional_device_cap, std::size_t additional_host_cap);
+
   /// Exact two-tape lane plus immutable samples/JVP output, not the inference clone budget.
   std::size_t streamingDerivativeRequiredBytes(std::size_t sample_count) const;
 
