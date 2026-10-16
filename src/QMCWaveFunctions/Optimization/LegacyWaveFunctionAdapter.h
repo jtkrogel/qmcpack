@@ -10,7 +10,8 @@
  *
  * This bridge intentionally retains the scalar legacy derivative implementation.  It
  * provides O(P) streaming contractions for ordinary, modest parameter sets, but does
- * not claim neural-scale batching, threading, device, or nonlocal-ECP capabilities.
+ * not claim neural-scale batching or device capabilities. Accepted-grid ECP
+ * products are separately restricted to real CPU fixed-Slater/J1/J2 profiles.
  */
 
 #ifndef QMCPLUSPLUS_LEGACY_WAVEFUNCTION_ADAPTER_H

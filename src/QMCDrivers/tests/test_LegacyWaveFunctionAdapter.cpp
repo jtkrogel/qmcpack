@@ -330,8 +330,10 @@ public:
       : wavefunction_(wavefunction), particles_(particles), shifts_(std::move(shifts))
   {}
   std::size_t sampleCount() const noexcept override { return shifts_.size(); }
+  std::size_t prepareCalls() const noexcept { return prepare_calls_; }
   LegacyWaveFunctionReplaySample prepareSample(std::size_t index) override
   {
+    ++prepare_calls_;
     particles_.R[0] = {0.2 + shifts_.at(index), -0.3, 0.4};
     particles_.R[1] = {-0.5, 0.1 + shifts_.at(index), 0.7};
     particles_.update();
@@ -341,6 +343,7 @@ private:
   TrialWaveFunction& wavefunction_;
   ParticleSet& particles_;
   std::vector<double> shifts_;
+  std::size_t prepare_calls_ = 0;
 };
 
 /// Required nonzero ceilings for the small deterministic fixture.
@@ -1018,8 +1021,86 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   CHECK(source->getLogPsi() == initial_log);
   CHECK(adapter.snapshotParameters().values == snapshot->values);
 
+  const VJPCoefficientChannel score_only{"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0};
+  const auto calls_before_score = replay->prepareCalls();
+  RecordingParameterSink score_sink;
+  op->applyVJPs({&score_only, 1}, DerivativeAdjoint::TRANSPOSE, score_sink);
+  CHECK(replay->prepareCalls() == calls_before_score + 1); // No ECP replay in metric actions.
+
+  // Exercise empty/ragged tiles, zero accepted ratios and stale binding without
+  // a fresh energy traversal. Zero ratios have zero response ONLY because every
+  // active parameter is a Jastrow and the fixed Slater node cannot move.
+  const auto capture_tiles = [&](std::size_t version) {
+    auto parameters = std::make_shared<StructuredParameterSnapshot>(*snapshot);
+    parameters->version = version;
+    auto captured = adapter.makeNonLocalECPDerivativeConsumer(replay, parameters, 4, 8);
+    NonLocalECPDerivativeContext context{adapter.parameterSchema().providerId(), adapter.parameterSchema().fingerprint(),
+        version, 4, 8, 1, points.size(), 456};
+    const CoefficientView coefficients{adapter.parameterSchema().providerId(), adapter.parameterSchema().fingerprint(),
+        version, 4, 8, {unit.data(), unit.size()}};
+    const VJPCoefficientChannel coefficient{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP, coefficients, ecp_mask};
+    captured->begin(context, {&coefficient, 1}, idle_sink);
+    std::size_t ordinal = 0;
+    const std::vector<std::size_t> empty_offsets{0};
+    const std::vector<VirtualParticleBatch::Segment> no_segments;
+    const std::vector<ParticleSet::PosType> no_positions;
+    VirtualParticleBatch empty(1, empty_offsets, no_segments, no_positions);
+    captured->consume({empty, {}, {}, {}, ordinal++, 456});
+    for (std::size_t i = 0; i < points.size(); ++i)
+    {
+      const auto& point = points[i];
+      const std::vector<std::size_t> offsets{0, 1};
+      const std::vector<VirtualParticleBatch::Segment> segments{{0, static_cast<int>(point.electron), true, 0}};
+      std::vector<ParticleSet::PosType> positions(1);
+      for (int d = 0; d < 3; ++d) positions[0][d] = point.replacement_position[d];
+      VirtualParticleBatch tile(1, offsets, segments, positions);
+      const QMCTraits::ValueType bare = point.bare_weight.real();
+      const QMCTraits::ValueType ratio = i == 0 ? 0.0 : point.complete_ratio.real();
+      captured->consume({tile, {&bare, 1}, {&ratio, 1}, {}, ordinal++, 456});
+    }
+    captured->end();
+    return captured->releaseJVPReplay();
+  };
+  auto stale = capture_tiles(snapshot->version + 1);
+  CHECK_THROWS(unbound->bindNonLocalECPJVPReplay(std::move(stale)));
+  CHECK_FALSE(unbound->capabilities().coversLocalEnergyTerms(ecp_mask));
+  unbound->bindNonLocalECPJVPReplay(capture_tiles(snapshot->version));
+  CHECK(unbound->capabilities().coversLocalEnergyTerms(ecp_mask));
+  const VJPCoefficientChannel zero_channel{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+                                         coefficientsFor(*unbound, unit), ecp_mask};
+  RecordingParameterSink zero_response;
+  unbound->applyVJPs({&zero_channel, 1}, DerivativeAdjoint::TRANSPOSE, zero_response);
+  // An independent ratio finite difference on precisely the retained nonzero knots.
+  const auto nonzero_energy = [&](const StructuredParameterSnapshot& parameters) {
+    ParticleSet test_particles(particles);
+    auto test_wf = source->makeClone(test_particles);
+    test_particles.update();
+    adapter.installSnapshot(*test_wf, test_particles, parameters);
+    const auto reference_log = test_wf->getLogPsi();
+    DerivativeValue result{};
+    for (std::size_t i = 1; i < points.size(); ++i)
+    {
+      const auto& point = points[i];
+      test_particles.R = initial_positions;
+      for (int d = 0; d < 3; ++d) test_particles.R[point.electron][d] = point.replacement_position[d];
+      test_particles.update();
+      test_wf->evaluateLog(test_particles);
+      result += point.bare_weight * std::exp(test_wf->getLogPsi() - reference_log);
+    }
+    return result;
+  };
+  for (std::size_t p = 0; p < snapshot->values.size(); ++p)
+  {
+    auto plus = *snapshot, minus = *snapshot;
+    plus.values[p] += step;
+    minus.values[p] -= step;
+    const auto fd = (nonzero_energy(plus) - nonzero_energy(minus)) / (2 * step);
+    CHECK(zero_response.result()[0][p].real() == Catch::Approx(fd.real()).epsilon(3e-7).margin(3e-8));
+  }
+
   // Failed and incomplete captures never bind ECP coverage or publish parameters.
   auto invalid = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 4, 8);
+  auto incomplete_op = adapter.makeDerivativeOperator(replay, snapshot, 4, 8);
   NonLocalECPDerivativeContext context{adapter.parameterSchema().providerId(), adapter.parameterSchema().fingerprint(),
       snapshot->version, 4, 8, 1, 1, 123};
   const VJPCoefficientChannel bad_channel{"ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
@@ -1030,7 +1111,7 @@ TEST_CASE("Legacy fixed-Slater ECP products reuse the accepted physical grid",
   invalid->begin(context, {&bad_channel, 1}, idle_sink);
   CHECK_THROWS(invalid->end());
   CHECK_THROWS(invalid->releaseJVPReplay());
-  CHECK_FALSE(unbound->capabilities().coversLocalEnergyTerms(ecp_mask));
+  CHECK_FALSE(incomplete_op->capabilities().coversLocalEnergyTerms(ecp_mask));
 }
 
 TEST_CASE("Legacy orbital products preserve cumulative private rotation history",
