@@ -10,6 +10,220 @@
 
 namespace qmcplusplus::psiformer::device
 {
+/// Exercise owning numerical proposals only, without publishing a native HOST model.
+inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
+    const std::shared_ptr<const PreparedDeviceModel>& initial)
+{
+  const auto p = plan.parameterCount(), ne = model.ne;
+  const auto require = [](bool okay, const char* message) {
+    if (!okay) throw std::runtime_error(message);
+  };
+  const auto fails = [&](const auto& action) {
+    bool rejected = false;
+    try { action(); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "DEVICE candidate accepted invalid admission/provenance");
+  };
+  const auto near = [&](double actual, double expected) {
+    require(device_math::isFiniteBinary64(actual) && std::abs(actual - expected) < 5e-10 * (1 + std::abs(expected)),
+        "DEVICE candidate differs from independent CPU arithmetic");
+  };
+  require(p < 100000 && ne >= 3 && model.cfg.nconfig >= 3,
+      "DEVICE candidate qualification requires a bounded, two-cusp fixture");
+  const auto bytes = PreparedDeviceModel::candidateDeviceBytes(p);
+  const std::vector<AdamBlock> blocks{{0, p - 1, 0.0017, 1}, {p - 1, 1, 0, 0}};
+  auto adam = PreparedDeviceAdam::prepare(p, blocks, estimateAdamBytes(p, blocks.size()));
+  std::vector<double> zero(p), first(p), second(p), expected = model.p.flat_values();
+  adam->seed(zero, zero);
+  adam->prepareEnergyGradient(PreparedDeviceAdam::energyGradientRequiredBytes(p));
+  auto active = initial;
+  const auto fingerprint = makePsiFormerDeviceLayout(plan).fingerprint;
+  PsiFormerAcceleratorSharedModel owner(PreparedDeviceCrowdHooks::backend(), fingerprint, active->version());
+  std::mutex mutex;
+  struct RecordingHooks final : PsiFormerAcceleratorHooks
+  {
+    void submit(const PsiFormerAcceleratorEvent&) override {}
+  } hooks;
+  PreparedDeviceProductSession session(active, owner, mutex, 41001);
+  session.prepareScoreContractions(3, active->version());
+  const auto foreign = initial->makeUpdatedImage(expected, initial->version() + 99);
+  const auto foreign_family = std::make_shared<PreparedDeviceModel>(plan, expected, model.cfg.nuclei.x, 0);
+  std::vector<double> masses(ne), drift(3 * ne), imaginary(3 * ne);
+  for (std::size_t i = 0; i < ne; ++i) masses[i] = 0.7 + 0.13 * i;
+  for (std::size_t i = 0; i < drift.size(); ++i) drift[i] = 0.01 * (int(i % 5) - 2);
+  constexpr double b1 = 0.9, b2 = 0.999, epsilon = 1e-8;
+  double weight = 0, energy_sum = 0;
+  for (std::size_t s = 0; s < 5; ++s)
+  { weight += 0.8 + 0.07 * s; energy_sum += (0.8 + 0.07 * s) * (-2.3 + 0.09 * s); }
+  const double energy = energy_sum / weight;
+  const auto position = [&](std::size_t s) {
+    return model.cfg.electrons.x.data() + (s % model.cfg.nconfig) * 3 * ne;
+  };
+  const auto build = [&] {
+    const auto version = active->version();
+    const auto generation = session.beginScoreContraction(3, version, ScoreContractionRole::ENERGY_T_EO_O);
+    for (std::size_t s = 0; s < 5; ++s)
+    {
+      const double w = 0.8 + 0.07 * s;
+      const std::complex<double> score[3]{{}, w * (-2.3 + 0.09 * s), w};
+      const std::complex<double> kinetic[3]{w, {}, {}}, imag[3]{};
+      session.accumulateKineticContraction(position(s), drift.data(), imaginary.data(), masses.data(),
+          score, kinetic, imag, 3, version);
+    }
+    session.finishScoreContraction(version);
+    return generation;
+  };
+  const auto consume = [&](std::size_t generation, std::size_t step, std::size_t cap) {
+    return session.consumeEnergyAdamDeviceCandidate(*adam, active->version(), generation, weight, energy,
+        b1, b2, 1 - std::pow(b1, step), 1 - std::pow(b2, step), epsilon, cap);
+  };
+  auto generation = build();
+  auto before = session.transferSnapshot();
+  fails([&] { consume(generation, 1, bytes - 1); });
+  require(session.transferSnapshot().allocation_calls == before.allocation_calls,
+      "DEVICE candidate cap denial allocated storage");
+  generation = build();
+  auto rejected = consume(generation, 1, bytes);
+  fails([&] { adam->validateHostCandidateAcceptance(); });
+  auto replacement = consume(build(), 1, bytes);
+  fails([&] { active->makeUpdatedImage(*rejected.snapshot, bytes); });
+  adam->reject();
+  fails([&] { active->makeUpdatedImage(*replacement.snapshot, bytes); });
+  generation = build();
+  fails([&] {
+    session.consumeEnergyAdamDeviceCandidate(*adam, active->version(), generation,
+        std::ldexp(1.0, -600), std::ldexp(1.0, 600), b1, b2, 0.1, 0.001, epsilon, bytes);
+  });
+  fails([&] { adam->validateHostCandidateAcceptance(); });
+  std::weak_ptr<const PreparedDeviceModel> intermediate;
+  for (std::size_t step = 1; step <= 3; ++step)
+  {
+    // This HOST model is an independent oracle, never the GPU publication source.
+    pf::DirectScoreExecutor score_cpu(model, plan);
+    pf::DirectKineticExecutor kinetic_cpu(model, plan);
+    auto sw = score_cpu.makeWorkspace();
+    auto kw = kinetic_cpu.makeWorkspace();
+    std::vector<double> t(p), eo(p), o(p);
+    for (std::size_t s = 0; s < 5; ++s)
+    {
+      sw->setPositions(pf::GeometryPositionView::interleaved(position(s), ne));
+      kw->setPositions(pf::GeometryPositionView::interleaved(position(s), ne));
+      const auto score = score_cpu.evaluate(*sw);
+      const auto kinetic = kinetic_cpu.evaluate(*kw, drift.data(), drift.size(), masses.data(), masses.size());
+      const double w = 0.8 + 0.07 * s;
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        t[i] += w * kinetic.kinetic_parameter_response[i];
+        eo[i] += w * (-2.3 + 0.09 * s) * score.parameter_score[i];
+        o[i] += w * score.parameter_score[i];
+      }
+    }
+    double norm = 0;
+    for (std::size_t i = 0; i < p; ++i)
+    {
+      const double g = 2 * (t[i] + eo[i] - energy * o[i]) / weight;
+      norm = std::hypot(norm, g);
+      if (i + 1 == p) continue;
+      first[i] = b1 * first[i] + (1 - b1) * g;
+      second[i] = b2 * second[i] + (1 - b2) * g * g;
+      expected[i] -= 0.0017 * (first[i] / (1 - std::pow(b1, step))) /
+          (std::sqrt(second[i] / (1 - std::pow(b2, step))) + epsilon);
+    }
+    generation = build();
+    before = session.transferSnapshot();
+    auto receipt = consume(generation, step, bytes);
+    fails([&] { adam->validateHostCandidateAcceptance(); });
+    fails([&] { foreign->makeUpdatedImage(*receipt.snapshot, bytes); });
+    fails([&] { foreign_family->makeUpdatedImage(*receipt.snapshot, bytes); });
+    fails([&] { active->makeUpdatedImage(*receipt.snapshot, bytes - 1); });
+    auto next = active->makeUpdatedImage(*receipt.snapshot, bytes);
+    const auto after = session.transferSnapshot();
+    require(after.uploaded_bytes == before.uploaded_bytes &&
+        after.allocation_calls - before.allocation_calls == 2 &&
+        after.device_copied_bytes - before.device_copied_bytes == 2 * bytes &&
+        after.downloaded_bytes - before.downloaded_bytes == adam->energyGradientHostBytes() + 32,
+        "DEVICE candidate warm window transferred HOST P or lost exact D2D/cusp accounting");
+    near(receipt.gradient_norm, norm);
+    near(next->sameAlpha(), expected[plan.parameter(ParameterRole::CUSP_SAME_ALPHA).begin]);
+    near(next->oppositeAlpha(), expected[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin]);
+    fails([&] { adam->acceptDeviceCandidate(*receipt.snapshot, foreign); });
+    adam->acceptDeviceCandidate(*receipt.snapshot, next);
+    fails([&] { adam->acceptDeviceCandidate(*receipt.snapshot, next); });
+    fails([&] { active->makeUpdatedImage(*receipt.snapshot, bytes); });
+    if (step == 1) intermediate = next;
+    owner.stage(fingerprint, next->version(), hooks);
+    owner.complete(next->version(), hooks);
+    active = next;
+    model.p.set_flat_values(expected);
+    std::cout << "DEVICE_CANDIDATE step=" << step << " H2D=0 D2D=" << 2 * bytes
+              << " D2H=" << after.downloaded_bytes - before.downloaded_bytes << '\n';
+  }
+  require(intermediate.expired(), "DEVICE proposal retained an obsolete P image");
+  std::vector<double> actual(p), actual_first(p), actual_second(p);
+  // Explicit terminal inspection is outside every measured warm window.
+#ifdef QMC_CUDA2HIP
+  checkRuntime(hipMemcpy(actual.data(), active->parameters(), bytes, hipMemcpyDeviceToHost), "Inspect DEVICE candidate");
+#else
+  checkRuntime(cudaMemcpy(actual.data(), active->parameters(), bytes, cudaMemcpyDeviceToHost), "Inspect DEVICE candidate");
+#endif
+  adam->download(actual_first, actual_second);
+  for (std::size_t i = 0; i < p; ++i)
+  { near(actual[i], expected[i]); near(actual_first[i], first[i]); near(actual_second[i], second[i]); }
+  {
+    compute::Queue<PlatformKind::CUDA> queue;
+    AcceleratorBlasHandle blas(queue);
+    PreparedDeviceInference inference(active, 1, queue, blas);
+    inference.evaluate(std::vector<double>(position(0), position(0) + 3 * ne));
+    const auto& layout = inference.resultLayout();
+    std::vector<double> phase(1), jets(spatialJetSpanElements(layout)), ratios(ne);
+    inference.downloadResults(phase, jets, ratios);
+    pf::DirectValueExecutor value_cpu(model, plan);
+    pf::DirectSpatialExecutor spatial_cpu(model, value_cpu, plan);
+    auto workspace = spatial_cpu.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+    workspace->setPositions(pf::GeometryPositionView::interleaved(position(0), ne));
+    const auto oracle = spatial_cpu.evaluateFull(*workspace);
+    near(phase[0], oracle.sign);
+    near(jets[layout.uncheckedValueOffset(0, 0)], oracle.logabs);
+    for (std::size_t i = 0; i < 3 * ne; ++i)
+      near(jets[layout.uncheckedGradientOffset(0, i, 0)], oracle.gradient[i]);
+    for (std::size_t i = 0; i < ne; ++i)
+    {
+      near(jets[layout.uncheckedLaplacianOffset(0, i, 0)], oracle.lap_log[i]);
+      near(ratios[i], oracle.lap_ratio[i]);
+    }
+  }
+  generation = build();
+  auto orphan = consume(generation, 4, bytes);
+  // A live optimizer control does not keep the source P image alive either.
+  auto worker = PreparedDeviceAdam::prepare(p, blocks, estimateAdamBytes(p, blocks.size()));
+  worker->seed(zero, zero);
+  worker->prepareEnergyGradient(PreparedDeviceAdam::energyGradientRequiredBytes(p));
+  PreparedDeviceAdam::DeviceEnergyCandidate source_orphan;
+  std::weak_ptr<const PreparedDeviceModel> expired_source;
+  {
+    auto source = active->makeUpdatedImage(*orphan.snapshot, bytes);
+    expired_source = source;
+    PsiFormerAcceleratorSharedModel worker_owner(PreparedDeviceCrowdHooks::backend(), fingerprint, source->version());
+    std::mutex worker_mutex;
+    PreparedDeviceProductSession worker_session(source, worker_owner, worker_mutex, 41002);
+    worker_session.prepareScoreContractions(3, source->version());
+    const auto token = worker_session.beginScoreContraction(3, source->version(), ScoreContractionRole::ENERGY_T_EO_O);
+    const std::complex<double> score[3]{{}, energy, 1}, kinetic[3]{1, {}, {}}, imag[3]{};
+    worker_session.accumulateKineticContraction(position(0), drift.data(), imaginary.data(), masses.data(),
+        score, kinetic, imag, 3, source->version());
+    worker_session.finishScoreContraction(source->version());
+    source_orphan = worker_session.consumeEnergyAdamDeviceCandidate(*worker, source->version(), token, 1, energy,
+        b1, b2, 0.1, 0.001, epsilon, bytes);
+  }
+  require(expired_source.expired() && source_orphan.snapshot->deviceBytes() == bytes,
+      "Snapshot retained its source or lost its independent buffer");
+  fails([&] { active->makeUpdatedImage(*source_orphan.snapshot, bytes); });
+  adam.reset();
+  require(orphan.snapshot->deviceBytes() == bytes, "Owner expiry destroyed snapshot storage");
+  fails([&] { active->makeUpdatedImage(*orphan.snapshot, bytes); });
+  std::cout << "DEVICE_CANDIDATE PASS: three CPU-oracle updates, FULL VGL, reject, finite status, caps, foreign/stale/source/owner expiry; "
+               "native authority unchanged; wrong-GPU execution NOT_RUN on single-device qualification\n";
+}
+
 /// Qualify only the numerical ENERGY C3/Adam bridge, not a training driver binding.
 inline void validateResidentAdam(pf::PsiFormer& model, const PsiFormerExecutionPlan& plan,
     const std::shared_ptr<const PreparedDeviceModel>& image)

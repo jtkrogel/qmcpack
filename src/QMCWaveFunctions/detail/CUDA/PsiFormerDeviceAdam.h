@@ -272,18 +272,23 @@ public:
         successor->metadata_ != candidate.metadata_ || successor->version() != candidate.source_version_ + 1)
       throw std::invalid_argument("Device Adam moment acceptance has a foreign, rejected or stale candidate");
     successor->validateCurrentDevice();
-    accept();
+    commitMoments();
     device_image_ = successor;
     device_bound_ = true;
   }
 
-  /// Publish already admitted moments with no runtime call, copy or allocation.
+  /// Check the legacy HOST receipt before entering its no-fail commit boundary.
+  void validateHostCandidateAcceptance() const
+  {
+    if (!pending_ || pending_control_)
+      throw std::logic_error("Legacy Adam acceptance requires a pending HOST candidate");
+  }
+
+  /// Publish a HOST candidate only; misuse of this no-fail boundary terminates.
   void accept() noexcept
   {
-    assert(pending_);
-    committed_.swap(staged_);
-    pending_ = false;
-    revokeCandidate();
+    validateHostCandidateAcceptance();
+    commitMoments();
     device_image_.reset();
     device_bound_ = false;
   }
@@ -317,6 +322,14 @@ public:
   std::size_t deviceBytes() const noexcept { return bytes_; }
 
 private:
+  /// Swap admitted moments without bypassing the caller's receipt validation.
+  void commitMoments() noexcept
+  {
+    committed_.swap(staged_);
+    pending_ = false;
+    revokeCandidate();
+  }
+
   /// Revocation invalidates receipts, not their independently owned numeric buffers.
   void revokeCandidate() noexcept
   {

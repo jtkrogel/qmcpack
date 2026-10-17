@@ -403,7 +403,7 @@ public:
     std::size_t proposalGeneration() const noexcept { return generation_; }
 
   private:
-    /// Only a finite-admitted Adam completion can construct this owning snapshot.
+    /// Allocate private storage now; expose it only after finite Adam admission.
     CandidateSnapshot(const std::shared_ptr<CandidateControl>& control,
         const std::shared_ptr<const PreparedDeviceModel>& source)
         : control_(control), metadata_(source->metadata_), source_version_(source->version_),
