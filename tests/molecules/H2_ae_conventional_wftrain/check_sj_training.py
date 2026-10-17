@@ -349,7 +349,11 @@ def main():
         result, text = launch(directory)
         if reject:
             assert result.returncode != 0, (directory, text[-4000:])
-            assert reject in text, (directory, reject, text[-4000:])
+            if isinstance(reject, tuple):
+                assert label == "reject_changed_import_pp", "alternative diagnostics are limited to PP identity rejection"
+                assert any(message in text for message in reject), (directory, reject, text[-4000:])
+            else:
+                assert reject in text, (directory, reject, text[-4000:])
             assert not list(directory.glob("*.training/*/*.state.h5")), directory
             return directory
         assert result.returncode == 0, (directory, text[-6000:])
@@ -732,7 +736,10 @@ def main():
             changed.write_bytes(original + b"\n<!-- imported model PP identity regression -->\n")
             run("reject_changed_import_pp", parameter_file=exported, vmc=True,
                 mutate=lambda tree: tree.find("hamiltonian/pairpot/pseudo").set("href", str(changed)),
-                reject="Conventional model export identity mismatch")
+                # A changed variable-width hex fingerprint may fail the trusted
+                # model_identity string-width guard before content comparison.
+                reject=("Conventional model export identity mismatch",
+                        "Conventional artifact has an invalid or oversized required field: model_identity"))
             assert source.read_bytes() == original
         if args.periodic_heg:
             print("PASS: real Gamma HEG14 Adam/SR, 8 samples/update, actual Ewald identity and changed cell/cutoff rejection")
