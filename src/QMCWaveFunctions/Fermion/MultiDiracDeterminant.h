@@ -232,6 +232,11 @@ public:
   /// Fixed real CPU virtual determinants / accepted reference, including virtual
   /// nodes. Requires initialized invertible accepted caches; never updates them.
   void evaluateDetsToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, Vector<ValueType>& ratios);
+
+  /// Fixed-reference generator tangent: d(phi_p)=phi_q, d(phi_q)=-phi_p.
+  /// Returns dD(Q)/D_ref(R) in distinct owning outputs, not a canonical frame coordinate.
+  void evaluateOrbitalGeneratorToAcceptedReference(const ParticleSet& P, int iat, int refPtcl, int p, int q,
+                                                  Vector<ValueType>& ratios, Vector<ValueType>& derivatives);
   /// multi walker version of evaluateDetsForPtclMove
   void static mw_evaluateDetsForPtclMove(const RefVectorWithLeader<MultiDiracDeterminant>& det_list,
                                          const RefVectorWithLeader<ParticleSet>& P_list,
@@ -299,6 +304,10 @@ public:
 private:
   /// Replace one orbital row against accepted caches, without inverting the replacement.
   void evaluateRowToAcceptedReference(int row, const ValueType* values, ValueType* ratios);
+
+  /// Evaluate one signed excitation with the already prepared accepted-row projection.
+  ValueType evaluateConfigurationRowToAcceptedReference(int row, const ValueType* values, int k,
+      const int* positions, const int* replacements, RealType sign);
 
   void mw_InverseUpdateByColumn(MultiDiracDetMultiWalkerResource& mw_res,
                                 const int working_index,
@@ -560,6 +569,8 @@ private:
   /// Reusable rank-(k+1) virtual scratch, independent of quadrature count.
   Matrix<ValueType> accepted_reference_border_;
   std::vector<int> accepted_reference_pivots_;
+  /// Reusable O(n) occupation-substitution metadata, never retained per virtual point.
+  std::vector<int> accepted_reference_occupations_, accepted_reference_positions_, accepted_reference_replacements_;
   /// new value of the reference determinant over the old value upon a proposed move
   ValueType curRatio;
   /// log value of the reference determinant

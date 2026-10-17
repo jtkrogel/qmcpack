@@ -31,6 +31,22 @@ using uint32_t = std::uint32_t;
 
 namespace qmcplusplus
 {
+namespace
+{
+/// Keep finite admission meaningful under fast-math, including exact accepted nodes.
+template<class T> bool finiteAcceptedReferenceValue(T value)
+{
+  for (double component : {double(std::real(value)), double(std::imag(value))})
+  {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(component) && std::numeric_limits<double>::is_iec559);
+    std::memcpy(&bits, &component, sizeof(bits));
+    if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000)) return false;
+  }
+  return true;
+}
+}
+
 /** shared function used by buildTableMatrix_calculateRatios */
 void MultiDiracDeterminant::buildTableMatrix_calculateRatios_impl(
     int ref,
@@ -517,28 +533,18 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
 void MultiDiracDeterminant::evaluateRowToAcceptedReference(
     int row, const ValueType* values, ValueType* ratios)
 {
-  // IEEE bits retain finite admission under fast-math, including accepted nodes.
-  const auto finite_real = [](double value) {
-    std::uint64_t bits;
-    static_assert(sizeof(bits) == sizeof(value) && std::numeric_limits<double>::is_iec559);
-    std::memcpy(&bits, &value, sizeof(bits));
-    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
-  };
-  const auto finite_value = [&](ValueType value) {
-    return finite_real(std::real(value)) && finite_real(std::imag(value));
-  };
   bool inverse_nonzero = false;
   for (const auto value : psiMinv)
   {
-    if (!finite_value(value)) throw std::domain_error("Accepted reference inverse is nonfinite");
+    if (!finiteAcceptedReferenceValue(value)) throw std::domain_error("Accepted reference inverse is nonfinite");
     inverse_nonzero |= value != ValueType{};
   }
-  if (!inverse_nonzero || !finite_real(log_value_ref_det_.real()) || !finite_real(log_value_ref_det_.imag()))
+  if (!inverse_nonzero || !finiteAcceptedReferenceValue(log_value_ref_det_))
     throw std::domain_error("Accepted reference determinant is uninitialized or singular");
   for (const auto value : psiM)
-    if (!finite_value(value)) throw std::domain_error("Accepted orbital values are nonfinite");
+    if (!finiteAcceptedReferenceValue(value)) throw std::domain_error("Accepted orbital values are nonfinite");
   for (int orbital = 0; orbital < NumOrbitals; ++orbital)
-    if (!finite_value(values[orbital])) throw std::domain_error("Replacement orbital values are nonfinite");
+    if (!finiteAcceptedReferenceValue(values[orbital])) throw std::domain_error("Replacement orbital values are nonfinite");
   // Rebuild only the existing accepted excitation-table entries, not an inverse.
   for (std::size_t pair = 0; pair < uniquePairs->size(); ++pair)
   {
@@ -565,36 +571,98 @@ void MultiDiracDeterminant::evaluateRowToAcceptedReference(
     if (k < 0 || rank > maximum_rank) throw std::logic_error("Invalid accepted-reference excitation rank");
     const int* positions = excitation + 1;
     const int* replacements = positions + k;
-    for (int electron = 0; electron < NumPtcls; ++electron) workV2[electron] = workV1[electron];
-    for (int i = 0; i < k; ++i)
-    {
-      const int position = positions[i], replacement = replacements[i], original = (*refdet_occup)[position];
-      const auto extra = values[replacement] - psiM(row, replacement) - (values[original] - psiM(row, original));
-      for (int electron = 0; electron < NumPtcls; ++electron)
-        workV2[electron] += extra * psiMinv(position, electron);
-    }
-    auto* border = accepted_reference_border_.data();
-    for (int i = 0; i < k; ++i)
-    {
-      for (int j = 0; j < k; ++j) border[i * rank + j] = table_matrix(positions[i], replacements[j]);
-      border[i * rank + k] = psiMinv(positions[i], row);
-    }
-    for (int j = 0; j < k; ++j)
-    {
-      ValueType value{};
-      for (int electron = 0; electron < NumPtcls; ++electron)
-        value += workV2[electron] * (psiM(electron, replacements[j]) -
-            psiM(electron, (*refdet_occup)[positions[j]]));
-      border[k * rank + j] = value;
-    }
-    border[k * rank + k] = ValueType(1) + workV2[row];
-    for (int entry = 0; entry < rank * rank; ++entry)
-      if (!finite_value(border[entry])) throw std::domain_error("Accepted-reference bordered determinant is nonfinite");
-    const auto value = (*DetSigns)[determinant] *
-        Determinant(border, rank, rank, accepted_reference_pivots_.data());
-    if (!finite_value(value)) throw std::domain_error("Accepted-reference virtual determinant is nonfinite");
-    ratios[determinant] = value;
+    ratios[determinant] = evaluateConfigurationRowToAcceptedReference(
+        row, values, k, positions, replacements, (*DetSigns)[determinant]);
     excitation += 3 * k + 1;
+  }
+}
+
+MultiDiracDeterminant::ValueType MultiDiracDeterminant::evaluateConfigurationRowToAcceptedReference(
+    int row, const ValueType* values, int k, const int* positions, const int* replacements, RealType sign)
+{
+  const int rank = k + 1;
+  if (accepted_reference_border_.rows() < rank)
+  {
+    accepted_reference_border_.resize(rank, rank);
+    accepted_reference_pivots_.resize(rank);
+  }
+  for (int electron = 0; electron < NumPtcls; ++electron) workV2[electron] = workV1[electron];
+  for (int i = 0; i < k; ++i)
+  {
+    const int position = positions[i], replacement = replacements[i], original = (*refdet_occup)[position];
+    const auto extra = values[replacement] - psiM(row, replacement) - (values[original] - psiM(row, original));
+    for (int electron = 0; electron < NumPtcls; ++electron)
+      workV2[electron] += extra * psiMinv(position, electron);
+  }
+  auto* border = accepted_reference_border_.data();
+  for (int i = 0; i < k; ++i)
+  {
+    for (int j = 0; j < k; ++j) border[i * rank + j] = table_matrix(positions[i], replacements[j]);
+    border[i * rank + k] = psiMinv(positions[i], row);
+  }
+  for (int j = 0; j < k; ++j)
+  {
+    ValueType value{};
+    for (int electron = 0; electron < NumPtcls; ++electron)
+      value += workV2[electron] * (psiM(electron, replacements[j]) -
+          psiM(electron, (*refdet_occup)[positions[j]]));
+    border[k * rank + j] = value;
+  }
+  border[k * rank + k] = ValueType(1) + workV2[row];
+  for (int entry = 0; entry < rank * rank; ++entry)
+    if (!finiteAcceptedReferenceValue(border[entry])) throw std::domain_error("Accepted-reference bordered determinant is nonfinite");
+  const auto value = sign * Determinant(border, rank, rank, accepted_reference_pivots_.data());
+  if (!finiteAcceptedReferenceValue(value)) throw std::domain_error("Accepted-reference virtual determinant is nonfinite");
+  return value;
+}
+
+void MultiDiracDeterminant::evaluateOrbitalGeneratorToAcceptedReference(
+    const ParticleSet& P, int iat, int refPtcl, int p, int q,
+    Vector<ValueType>& ratios, Vector<ValueType>& derivatives)
+{
+  if (p < 0 || p >= q || q >= NumOrbitals || &ratios == &derivatives ||
+      ratios.isAttached() || derivatives.isAttached())
+    throw std::invalid_argument("Accepted-reference orbital generator has invalid indices or aliased outputs");
+  // Retain the public fixed-Phi guards and the fresh accepted-cache validation.
+  evaluateDetsToAcceptedReference(P, iat, refPtcl, ratios);
+  derivatives.resize(getNumDets());
+  derivatives = ValueType{};
+  accepted_reference_occupations_.resize(NumPtcls);
+  accepted_reference_positions_.resize(NumPtcls);
+  accepted_reference_replacements_.resize(NumPtcls);
+  auto& occupations = accepted_reference_occupations_;
+  auto& positions = accepted_reference_positions_;
+  auto& replacements = accepted_reference_replacements_;
+  const int row = refPtcl - FirstIndex;
+  for (int determinant = 0; determinant < getNumDets(); ++determinant)
+  {
+    const auto& source = getConfiguration(determinant).occup;
+    const auto ip = std::find(source.begin(), source.end(), p), iq = std::find(source.begin(), source.end(), q);
+    if ((ip == source.end()) == (iq == source.end())) continue;
+    std::copy(source.begin(), source.end(), occupations.begin());
+    RealType sign = ip != source.end() ? 1 : -1;
+    occupations[(ip != source.end() ? ip : iq) - source.begin()] = ip != source.end() ? q : p;
+    for (int i = 0; i < NumPtcls; ++i)
+      for (int j = i + 1; j < NumPtcls; ++j)
+        if (occupations[i] > occupations[j]) { std::swap(occupations[i], occupations[j]); sign = -sign; }
+    int k = 0, count = 0;
+    for (int i = 0; i < NumPtcls; ++i)
+      if (std::find(occupations.begin(), occupations.end(), (*refdet_occup)[i]) == occupations.end()) positions[k++] = i;
+    for (const int orbital : occupations)
+      if (std::find(refdet_occup->begin(), refdet_occup->end(), orbital) == refdet_occup->end()) replacements[count++] = orbital;
+    if (count != k) throw std::logic_error("Accepted-reference orbital substitution has inconsistent occupations");
+    const auto mapped = [&](int i) {
+      for (int j = 0; j < k; ++j) if (positions[j] == i) return replacements[j];
+      return static_cast<int>((*refdet_occup)[i]);
+    };
+    for (int i = 0; i < NumPtcls; ++i)
+      for (int j = i + 1; j < NumPtcls; ++j) if (mapped(i) > mapped(j)) sign = -sign;
+    // Substituted occupations can be absent from uniquePairs: form every needed entry.
+    for (int i = 0; i < k; ++i)
+      for (int j = 0; j < k; ++j)
+        table_matrix(positions[i], replacements[j]) = simd::dot(psiMinv[positions[i]], TpsiM[replacements[j]], NumPtcls);
+    derivatives[determinant] = evaluateConfigurationRowToAcceptedReference(
+        row, psiV.data(), k, positions.data(), replacements.data(), sign);
   }
 }
 
