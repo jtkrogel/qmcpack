@@ -2162,6 +2162,19 @@ TEST_CASE("Legacy Gamma HEG products preserve scalar domains, periodicity and fu
   TrainingWaveFunctionBinding imported(*fresh.wavefunction, *fresh.particles, adapterOptions(), *OHMMS::Controller);
   imported.setHamiltonian(fresh.hamiltonian);
   const auto initial = imported.snapshotParameters();
+  // A valid artifact is insufficient without successful local profile/Ham
+  // admission. A failed admission must not leave a usable partial identity.
+  TrainingWaveFunctionBinding unattached(*fresh.wavefunction, *fresh.particles, adapterOptions(), *OHMMS::Controller);
+  CHECK_THROWS_WITH(unattached.importModel(file), Catch::Matchers::ContainsSubstring("attached physical Hamiltonian"));
+  CHECK(unattached.snapshotParameters().version == 0);
+  CHECK(unattached.snapshotParameters().values == initial.values);
+  HEG unsupported("5", "6");
+  unsupported.particles->setTwist({0.1, 0, 0});
+  TrainingWaveFunctionBinding rejected(*unsupported.wavefunction, *unsupported.particles, adapterOptions(), *OHMMS::Controller);
+  CHECK_THROWS_WITH(rejected.setHamiltonian(unsupported.hamiltonian), Catch::Matchers::ContainsSubstring("does not admit twist"));
+  CHECK_THROWS_WITH(rejected.importModel(file), Catch::Matchers::ContainsSubstring("attached physical Hamiltonian"));
+  CHECK(rejected.snapshotParameters().version == 0);
+  CHECK(rejected.snapshotParameters().values == initial.values);
   {
     // A real-representation payload cannot masquerade as the complex model,
     // even with the same XML, real parameter layout and completion cookie.
