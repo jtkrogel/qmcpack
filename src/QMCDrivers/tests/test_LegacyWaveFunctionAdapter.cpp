@@ -4391,10 +4391,11 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
   // The nodal model uses the supported octahedral BFD rule and a counting
   // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
   const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
-  for (int model = 0; model < 7; ++model)
+  for (int model = 0; model < 9; ++model)
   {
     CAPTURE(model);
     const bool joint = model >= 5;
+    const bool polarized = model >= 7;
     const bool md = model >= 3, node = model == 1 || model == 4 || model == 6;
     const bool many = model >= 2;
     ParticleSetPool pool(OHMMS::Controller);
@@ -4425,11 +4426,28 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         spin = xmlNextElementSibling(spin);
       }
     }
+    if (polarized)
+    {
+      // C^- is charged: five electrons, not the neutral four-electron case.
+      INFO("C^- unequal-spin model; three-electron group=" << (model == 7 ? "u" : "d"));
+      auto* spin = xmlFirstElementChild(xmlNextElementSibling(xmlFirstElementChild(particle_xml.getRoot())));
+      if (model == 8) spin = xmlNextElementSibling(spin);
+      xmlSetProp(spin, BAD_CAST "size", BAD_CAST "3");
+      for (auto* child = xmlFirstElementChild(spin); child; child = xmlNextElementSibling(child))
+        if (xmlStrEqual(child->name, BAD_CAST "attrib"))
+          xmlNodeSetContent(child, BAD_CAST (model == 7 ? ".2 -.3 .4  .6 .2 -.5  .4 -.7 .6" :
+                                                         "-.5 .1 .7  -.8 -.4 -.2  .4 -.7 .6"));
+    }
     REQUIRE(pool.put(xmlFirstElementChild(particle_xml.getRoot())));
     REQUIRE(pool.put(xmlNextElementSibling(xmlFirstElementChild(particle_xml.getRoot()))));
     auto& ions = *pool.getParticleSet("ion0");
     auto& particles = *pool.getParticleSet("e");
     ions.update();
+    if (polarized)
+    {
+      REQUIRE(particles.groupsize(0) == (model == 7 ? 3 : 2));
+      REQUIRE(particles.groupsize(1) == (model == 7 ? 2 : 3));
+    }
     if (model == 1)
     {
       particles.R[0] = {1, 0, 0};
@@ -4492,6 +4510,18 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       }
     }
     REQUIRE(definition.parseFromString(wavefunction_xml));
+    if (polarized)
+    {
+      auto* detlist = xmlFirstElementChild(xmlFirstElementChild(
+          xmlNextElementSibling(xmlFirstElementChild(definition.getRoot()))));
+      REQUIRE(xmlStrEqual(detlist->name, BAD_CAST "detlist"));
+      const char* electron_count = model == 7 ? "ne0" : "ne1";
+      const char* occupation = model == 7 ? "occ0" : "occ1";
+      xmlSetProp(detlist, BAD_CAST electron_count, BAD_CAST "3");
+      auto* ci = xmlFirstElementChild(detlist);
+      xmlSetProp(ci, BAD_CAST occupation, BAD_CAST "1110");
+      xmlSetProp(xmlNextElementSibling(ci), BAD_CAST occupation, BAD_CAST "1101");
+    }
     WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
     auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
     REQUIRE(source);
@@ -4532,12 +4562,37 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
     auto options = adapterOptions();
     if (joint) options.maximum_parameter_count = 17;
     LegacyWaveFunctionAdapter adapter("conventional", *source, options);
-    REQUIRE(adapter.snapshotParameters().values.size() == (joint ? 17 : md ? 16 : many ? 8 : 6));
+    REQUIRE(adapter.snapshotParameters().values.size() == (polarized ? 16 : joint ? 17 : md ? 16 : many ? 8 : 6));
     if (joint)
     {
       REQUIRE(adapter.registrationVariables().name(0) == "CI1");
       REQUIRE(adapter.snapshotParameters().values[0] == 0.1);
     }
+    std::array<std::array<int, 2>, 2> history_indices{};
+    std::array<int, 2> generated_index{};
+    if (polarized)
+      for (int spin = 0; spin < 2; ++spin)
+      {
+        const bool three = particles.groupsize(spin) == 3;
+        const auto& variables = rotated(*source, spin).activeRotationVariables();
+        REQUIRE(variables.size() == (three ? 5 : 6));
+        const auto name = [&](int p, int q) {
+          std::ostringstream text;
+          text << (spin ? "rot_dn" : "rot") << "_orb_rot_" << std::setfill('0') << std::setw(4)
+               << p << '_' << std::setw(4) << q << "_r";
+          return text.str();
+        };
+        for (int pair = 0; pair < 2; ++pair)
+        {
+          const auto key = name(0, (three ? 2 : 1) + pair);
+          const int local = variables.getLoc(key);
+          REQUIRE(local >= 0);
+          history_indices[spin][pair] = variables.where(local);
+          REQUIRE(history_indices[spin][pair] >= 0);
+        }
+        generated_index[spin] = variables.getLoc(three ? name(2, 3) : name(1, 2));
+        REQUIRE(generated_index[spin] >= 0);
+      }
     ParticleSet unsupported_j3_particles(particles);
     auto unsupported_j3 = source->makeClone(unsupported_j3_particles);
     addPolynomialJ3(*unsupported_j3, unsupported_j3_particles, ions);
@@ -4573,7 +4628,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
     ham.createResource(ham_resources);
     const auto positions = particles.R;
     const auto ion_positions = ions.R;
-    for (int step = 0; step < (model == 0 || model == 3 || model == 5 ? 3 : 1); ++step)
+    for (int step = 0; step < (model == 0 || model == 3 || model == 5 || polarized ? 3 : 1); ++step)
     {
       CAPTURE(step);
       if (step > 0)
@@ -4581,20 +4636,30 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         auto candidate = adapter.snapshotParameters();
         const int offset = joint ? 1 : 0;
         if (joint) candidate.values[0] += 0.002;
-        candidate.values[offset] += step == 1 ? 0.03 : -0.02;
-        candidate.values[offset + 1] += step == 1 ? -0.01 : 0.04;
-        candidate.values[offset + 2] += 0.002;
-        if (md)
+        if (polarized)
+          for (int spin = 0; spin < 2; ++spin)
+          {
+            candidate.values[history_indices[spin][0]] += step == 1 ? .03 : -.02;
+            candidate.values[history_indices[spin][1]] += step == 1 ? -.01 : .04;
+          }
+        else
         {
-          candidate.values[offset + 6] += step == 1 ? -0.025 : 0.015;
-          candidate.values[offset + 7] += step == 1 ? 0.01 : -0.035;
+          candidate.values[offset] += step == 1 ? 0.03 : -0.02;
+          candidate.values[offset + 1] += step == 1 ? -0.01 : 0.04;
+          candidate.values[offset + 2] += 0.002;
+          if (md)
+          {
+            candidate.values[offset + 6] += step == 1 ? -0.025 : 0.015;
+            candidate.values[offset + 7] += step == 1 ? 0.01 : -0.035;
+          }
         }
         adapter.installSnapshot(*source, particles, candidate);
         adapter.publishParameters(candidate, candidate.version);
         if (step == 2 && !md)
           CHECK(rotated(*source).fullRotationCoordinates()[2] != 0.0);
         if (step == 2 && md)
-          for (int spin = 0; spin < 2; ++spin) CHECK(rotated(*source, spin).fullRotationCoordinates()[3] != 0.0);
+          for (int spin = 0; spin < 2; ++spin)
+            CHECK(rotated(*source, spin).fullRotationCoordinates()[polarized ? generated_index[spin] : 3] != 0.0);
       }
       const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
       const auto source_log = source->getLogPsi();
@@ -4614,7 +4679,9 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         auto candidate = source->makeClone(candidate_particles);
         isolate(*candidate);
         auto point = *snapshot;
-        point.values[0] += .003; point.values[1] += .01; point.values[7] -= .02;
+        point.values[0] += .003;
+        point.values[polarized ? history_indices[0][0] : 1] += .01;
+        point.values[polarized ? history_indices[1][0] : 7] -= .02;
         candidate_particles.update(); adapter.installSnapshot(*candidate, candidate_particles, point);
         const auto& ci = candidate->findMSD().front().get().get_C();
         CHECK(ci[0] == QMCTraits::ValueType{1});
@@ -4725,17 +4792,25 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       for (int electron = 0; electron < particles.getTotalNum(); ++electron)
         for (int other = 0; other < electron; ++other)
           fixed_potential += 1.0 / std::sqrt(dot(positions[electron] - positions[other], positions[electron] - positions[other]));
-      // Independent physical MD numerator: signed occupied 2x2 matrices,
+      // Independent physical MD numerator: signed occupied 2x2/3x3 matrices,
       // fixed CI contraction and separately evaluated J, including at nodes.
       const auto dense_value = [&](TrialWaveFunction& wf, ParticleSet& p) {
         std::array<QMCTraits::ValueType, 2> products{1, 1};
         for (int spin = 0; spin < 2; ++spin)
         {
-          SPOSet::ValueMatrix values(2, 4), laps(2, 4);
-          SPOSet::GradMatrix gradients(2, 4);
-          rotated(wf, spin).evaluate_notranspose(p, 2 * spin, 2 * spin + 2, values, gradients, laps);
+          const int n = p.groupsize(spin), first = p.first(spin);
+          SPOSet::ValueMatrix values(n, 4), laps(n, 4);
+          SPOSet::GradMatrix gradients(n, 4);
+          rotated(wf, spin).evaluate_notranspose(p, first, first + n, values, gradients, laps);
           for (int term = 0; term < 2; ++term)
-            products[term] *= values(0, 0) * values(1, 1 + term) - values(0, 1 + term) * values(1, 0);
+          {
+            const int last = n - 1 + term;
+            const auto determinant = n == 2 ? values(0, 0) * values(1, last) - values(0, last) * values(1, 0) :
+                values(0, 0) * (values(1, 1) * values(2, last) - values(1, last) * values(2, 1)) -
+                values(0, 1) * (values(1, 0) * values(2, last) - values(1, last) * values(2, 0)) +
+                values(0, last) * (values(1, 0) * values(2, 1) - values(1, 1) * values(2, 0));
+            products[term] *= determinant;
+          }
         }
         double j = 0;
         p.G = QMCTraits::GradType{}; p.L = QMCTraits::ValueType{};
