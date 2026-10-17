@@ -146,7 +146,12 @@ sources; the new numerical policy is separately reviewed, while ECP/orbital
 mixed LM rejection remains in force. No old default or strict comparison changes.
 
 The same ``--mdj-alm`` helper accepts ``--ranks 2 --mpiexec mpirun`` for a
-separately reviewed two-rank consumer gate (qualification pending). Physics and
+separately reviewed two-rank consumer gate (round119 FIRSTPASS). Physics and
 solver caps stay unchanged: training W4/blocks8 gives 32 samples per rank,
 64 global, with existing inference W2 and strict full/import/initialized restart.
 No one-rank versus two-rank trajectory equality or additional CTest is implied.
+The frozen later application source ``2b8f88a99``/SHA256
+``5bf1fe0bbcce5e35d208ff29ce3088b4faa02790b4cb5ee388e086fe248f59a4``
+passed 64-global-sample updates and strict initialized two-rank checkpoint
+restart. It is not the original round110 binary. The old PASS message's
+hardcoded 32 was diagnostic only; actual CSV sample counts were 64.

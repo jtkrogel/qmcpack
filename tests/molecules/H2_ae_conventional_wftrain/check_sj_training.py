@@ -1420,7 +1420,7 @@ def main():
             print(f"PASS: H2 SJ Adam {mode} search, {detail}, "
                   "natural decisions/accepted-state preservation and strict exact initialized restart")
         elif args.mdj_alm:
-            print("PASS: real CPU fixed-orbital H4 DETS/J2 AE ALM P9, two committed 32-sample updates, "
+            print(f"PASS: real CPU fixed-orbital H4 DETS/J2 AE ALM P9, two committed {32 * args.ranks}-sample updates, "
                   "frozen C0/SPO, exported inference/model reuse and strict exact initialized restart")
         elif args.csf_orbital_ecp:
             print("PASS: real CPU signed-child CSF/orbital/J2 ECP Adam P17, frozen outer CSF0=.6/expanded C0=.48, "
