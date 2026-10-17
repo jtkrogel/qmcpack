@@ -75,5 +75,6 @@ then protects the actual input file hash throughout its run.
 
 The helper preserves separate pilot and ``--pilot-report`` continuation modes;
 ``--full-workflow`` runs the same already-qualified pilot/split/resume sequence
-under one180s deadline,60s per child. An explicit output directory must be new;
-preserve prior evidence or select a new directory before repeating a manual run.
+under one180s deadline,60s per child. Manual ``--output`` must name a new
+directory. CTest uses ``--output-parent`` to retain a unique per-invocation
+subdirectory, so repeats preserve prior evidence without deleting anything.

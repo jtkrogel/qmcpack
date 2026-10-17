@@ -40,7 +40,7 @@ if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND NOT QMC_COMPLEX AND NOT MIXED_PRECISION 
                      --binary $<TARGET_FILE:qmcpack> --source ${qmcpack_SOURCE_DIR}
                      --input ${CMAKE_CURRENT_SOURCE_DIR}/input.xml
                      --model "$ENV{PSIFORMER_TEST_RESIDENT_MODEL_EXPORT}"
-                     --output ${CMAKE_CURRENT_BINARY_DIR}/device_sr_native
+                     --output-parent ${CMAKE_CURRENT_BINARY_DIR}/device_sr_native
                      --source-commit ${DEVICE_SR_SOURCE_COMMIT} --full-workflow)
     SET_TEST_GPU_RESOURCES(deterministic-LiH-ae-psiformer-device-sr-restart)
     set_tests_properties(deterministic-LiH-ae-psiformer-device-sr-restart PROPERTIES

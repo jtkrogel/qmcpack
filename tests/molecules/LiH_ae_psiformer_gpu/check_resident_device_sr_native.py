@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Inert-until-authorized AE DEVICE SR pilot, then explicit exact restart qualification."""
-import argparse, csv, hashlib, json, math, os, re, runpy, signal, subprocess, time
+"""Narrow AE DEVICE SR pilot and exact initialized restart validation."""
+import argparse, csv, hashlib, json, math, os, re, runpy, signal, subprocess, tempfile, time
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import numpy as np
 
 p = argparse.ArgumentParser(description=__doc__)
-for name in ('binary', 'source', 'input', 'model', 'output'):
+for name in ('binary', 'source', 'input', 'model'):
     p.add_argument('--'+name, type=Path, required=True)
+outputs = p.add_mutually_exclusive_group(required=True)
+outputs.add_argument('--output', type=Path, help='new manual evidence directory')
+outputs.add_argument('--output-parent', type=Path, help='retain a unique evidence subdirectory per invocation')
 p.add_argument('--source-commit', required=True)
 p.add_argument('--pilot-report', type=Path)
 p.add_argument('--full-workflow', action='store_true', help='qualified bounded pilot plus exact split/resume')
@@ -15,10 +18,18 @@ a = p.parse_args()
 if a.full_workflow and a.pilot_report:
     p.error('--full-workflow and --pilot-report are mutually exclusive')
 signal.signal(signal.SIGTERM, signal.default_int_handler)
+
+def output_directory(output, parent):
+    if parent:
+        parent.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix='run-', dir=parent))
+    output.mkdir(exist_ok=False)
+    return output
+
 utility = runpy.run_path(str(a.source/'tests/molecules/LiH_ae_psiformer_gpu/check_resident_device_authority.py'))
 sha, fields, selected, render = (utility[key] for key in ('sha','fields','selected','render'))
 envelopes = runpy.run_path(str(a.source/'tests/molecules/LiH_ae_psiformer_gpu/check_rejected_full_reuse.py'))['envelopes']
-a.output.mkdir(exist_ok=False)
+a.output = output_directory(a.output, a.output_parent)
 identity = dict(source=a.source_commit, binary_sha256=sha(a.binary), input_sha256=sha(a.input), model_sha256=sha(a.model))
 initial = fields(a.model)
 assert initial['values'].size == 666 and np.isfinite(initial['values']).all()
