@@ -1468,11 +1468,30 @@ void WFTrainBatched::process(xmlNodePtr node)
               training_input_.getLegacyDerivativeScratchBytes(), training_input_.getParameterChunkSize()}, *myComm);
       conventional_binding_->setHamiltonian(population_.get_golden_hamiltonian());
       const auto& variables = conventional_binding_->adapter().registrationVariables();
-      const bool nonlinear_update = optimizer == O::LINEAR_METHOD || optimizer == O::ACCELERATED_LINEAR_METHOD ||
-          optimizer == O::PROJECTED_INVERSE_ITERATION || optimizer == O::MINIMUM_PROJECTED_INVERSE_ITERATION;
+      const bool linear_method = optimizer == O::LINEAR_METHOD || optimizer == O::ACCELERATED_LINEAR_METHOD;
+      const bool inverse_iteration = optimizer == O::PROJECTED_INVERSE_ITERATION ||
+          optimizer == O::MINIMUM_PROJECTED_INVERSE_ITERATION;
+      std::size_t active_variables = 0, active_linear = 0;
       for (std::size_t variable = 0; variable < variables.size(); ++variable)
-        if (nonlinear_update && variables.where(variable) >= 0 && variables.getType(variable) == optimize::LINEAR_P)
-          throw UniformCommunicateError("Conventional LM/ALM/PII updates currently require nonlinear coordinates; CI update normalization is not yet qualified");
+        if (variables.where(variable) >= 0)
+        {
+          ++active_variables;
+          active_linear += variables.getType(variable) == optimize::LINEAR_P;
+        }
+      if (active_linear && linear_method)
+        throw UniformCommunicateError("Conventional LM/ALM updates require nonlinear coordinates; CI normalization remains unqualified");
+      if (active_linear && inverse_iteration)
+      {
+        if (active_linear != active_variables || conventional_binding_->hasOrbitalRotations() ||
+            multideterminants.size() != 1 || multideterminants[0].get().hasCSFExpansion())
+          throw UniformCommunicateError("Conventional PII/minPII CI updates require pure active DETS coefficients and fixed orbitals; mixed/CSF updates remain unqualified");
+        // MultiSlater's registration/reset excludes C[0]; the prepared bank validates its fixed gauge.
+        const auto& coefficients = multideterminants[0].get().get_C();
+        if (coefficients.empty() || coefficients.front() == QMCTraits::ValueType{} ||
+            !wftrain::isFiniteTrainingReal(std::real(coefficients.front())) ||
+            !wftrain::isFiniteTrainingReal(std::imag(coefficients.front())))
+          throw UniformCommunicateError("Conventional PII/minPII CI updates require a finite nonzero frozen first DETS coefficient");
+      }
       // Fail before population initialization/sampling for unqualified fixed assets.
       conventional_binding_->modelIdentity();
       app_log() << "WFTrain conventional derivative scratch cap="
