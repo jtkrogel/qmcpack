@@ -202,6 +202,9 @@ public:
     return result_.data();
   }
 
+  /// Allocation identity for alias admission only; this is not published numeric data.
+  const void* outputStorageAddress() const noexcept { return result_.data(); }
+
   /// Borrow true paired affine jets before envelope/phase multiplication, even at E=0.
   const C* affineProjectionData() const
   {

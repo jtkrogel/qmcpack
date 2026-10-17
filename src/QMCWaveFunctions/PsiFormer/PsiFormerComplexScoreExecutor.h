@@ -354,12 +354,12 @@ public:
     };
     rejects_output_alias(arguments.target, target_bytes);
     rejects_output_alias(parameters_.flat_values().data(), output_bytes);
-    rejects_output_alias(w.head_.data(), target_bytes);
+    rejects_output_alias(w.head_.outputStorageAddress(), target_bytes);
     rejects_output_alias(w.score_.data(), checkedStorageBytes<C>(w.score_.size(), "complex MSE score bytes"));
     rejects_output_alias(w.matrix_adjoint_.data(), target_bytes);
     rejects_output_alias(w.feature_seed_.data(), checkedStorageBytes<double>(w.feature_seed_.size(), "complex MSE seeds"));
     rejects_output_alias(w.envelopes_.data(), checkedStorageBytes<double>(w.envelopes_.size(), "complex MSE envelopes"));
-    if (memoryOverlap(arguments.target, target_bytes, w.head_.data(), target_bytes))
+    if (memoryOverlap(arguments.target, target_bytes, w.head_.outputStorageAddress(), target_bytes))
       throw std::invalid_argument("PsiFormer complex orbital-MSE target aliases mutable raw matrices");
     for (std::size_t i = 0; i < arguments.target_size; ++i)
       if (!determinant::isFiniteReal(arguments.target[i].real()) || !determinant::isFiniteReal(arguments.target[i].imag()))
