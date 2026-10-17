@@ -92,15 +92,14 @@ spinor and offload derivative paths are unchanged. CSF, orbital rotations, J3, c
 offload and DLA are excluded from this fixed-DETS ECP profile. No timing or
 overall memory benchmark is claimed.
 
-Mixed fixed-orbital DETS/J2 LM/ALM (conditional numerical-first stage)
--------------------------------------------------------------------
+Mixed fixed-orbital DETS/J2 LM/ALM (CPU ONLY)
+------------------------------------------
 The bounded mixed-normalization consumer reuses ``wftrain_mdj_ecp.xml``:
 real CPU/open, fixed inline orbitals, frozen C0=.6, active C1 and four J2
 coordinates, ordinary-locality Be BFD. CSF, orbital, J3, offload and DLA
-compositions remain excluded from this LM/ALM extension. Production admission
-and native qualification await the independent P5 physical/dense proof.
+compositions remain excluded from this LM/ALM extension.
 
-After root accepts that proof and the admission change, one ALM workflow is::
+The guarded real-FP64/non-offload CTest registers one ALM workflow::
 
   python3 ../H2_ae_conventional_wftrain/check_sj_training.py /absolute/qmcpack wftrain_mdj_ecp.xml --mdj-ecp-alm
 
@@ -110,3 +109,24 @@ initialized split restart. No seed, source asset, numerical tolerance or root
 selection is changed. A genuine first-iteration ``untrusted_root`` is reported
 as EXPECTED REFUSAL only with no history rows, HDF output or publication;
 that outcome does not qualify positive updates, inference or restart.
+
+The independent numerical foundation120 passed 1,986 assertions, including
+same-grid all-P physical finite differences, dense 6x6 S/symmetric/raw H
+actions and mixed normalization. Its synthetic Ritz-vector checks establish
+the coordinate map, not convergence of an actual ALM eigensolve.
+
+Actual native122 separately passed two committed 32-sample ALM updates,
+scheduled inference, export/direct parameter-file VMC/import/re-export and
+strict initialized full/split restart. Frozen C0/SPO and the intended mixed-CSF
+driver rejection were checked. The unchanged app was built from
+``c2d41dbf40f211f087178fb831c3f563078418ce`` (SHA256 ``b2de0edcaa133a58631829b474945b640e868833e8bc235ab29b7a803b3cf781``);
+the executed helper-only correction was ``d50592398`` (SHA256 ``5f5a884300701a332b11b90b13478c7c3b9670f790027e353b5e52f9d67d1a24``).
+The first native121 whole-checker failure remains preserved: its last CSF-LM
+negative incorrectly inherited ALM-only inner controls and stopped at parser
+validation. The correction gates those controls on the actual optimizer;
+native122 reached the intended driver guard. Neither seeds/tolerances nor the
+app were changed between these attempts. This does not qualify CSF/orbital
+mixed ECP LM/ALM, a second optimizer trajectory, or converged optimization.
+Compact proof is recorded under Task46
+``validation/mixed_ecp_native_c2d41dbf/qualification_C.rst``; no HDF payload is
+duplicated in that archive.
