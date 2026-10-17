@@ -42,6 +42,7 @@ private:
   mutable std::vector<DerivativeValue> d_, l_, adjoint_, coefficients_, local_gradient_;
 };
 
+/// Nonlinear xi damping or exact linear-state retraction with a frozen reference coefficient.
 enum class LinearMethodNormalization
 {
   NONLINEAR,
@@ -53,6 +54,7 @@ class LinearMethodUpdateRule final : public TrainingUpdateRule
 {
 public:
   /// Bind a converged eigensolve to its immutable sampled metric and step controls.
+  /// Linear batch views are nonowning: producers, weights and energies must outlive the rule.
   LinearMethodUpdateRule(const ScoreCovarianceFactor& factor,
                         MatrixFreeLinearMethodResult result, double learning_rate,
                         double normalization_xi,

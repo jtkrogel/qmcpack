@@ -1478,19 +1478,20 @@ void WFTrainBatched::process(xmlNodePtr node)
           ++active_variables;
           active_linear += variables.getType(variable) == optimize::LINEAR_P;
         }
-      if (active_linear && linear_method)
-        throw UniformCommunicateError("Conventional LM/ALM updates require nonlinear coordinates; CI normalization remains unqualified");
-      if (active_linear && inverse_iteration)
+      if (active_linear && (linear_method || inverse_iteration))
       {
         if (active_linear != active_variables || conventional_binding_->hasOrbitalRotations() ||
             multideterminants.size() != 1 || multideterminants[0].get().hasCSFExpansion())
-          throw UniformCommunicateError("Conventional PII/minPII CI updates require pure active DETS coefficients and fixed orbitals; mixed/CSF updates remain unqualified");
+          throw UniformCommunicateError("Conventional LM/ALM/PII/minPII CI updates require pure active DETS coefficients and fixed orbitals; mixed/CSF updates remain unqualified");
+        if (linear_method && (population_.get_golden_hamiltonian().ecpModelProvenance() ||
+                              population_.get_golden_hamiltonian().hasPhysicalNLPP()))
+          throw UniformCommunicateError("Conventional LM/ALM pure-CI qualification requires all-electron Hamiltonians");
         // MultiSlater's registration/reset excludes C[0]; the prepared bank validates its fixed gauge.
         const auto& coefficients = multideterminants[0].get().get_C();
         if (coefficients.empty() || coefficients.front() == QMCTraits::ValueType{} ||
             !wftrain::isFiniteTrainingReal(std::real(coefficients.front())) ||
             !wftrain::isFiniteTrainingReal(std::imag(coefficients.front())))
-          throw UniformCommunicateError("Conventional PII/minPII CI updates require a finite nonzero frozen first DETS coefficient");
+          throw UniformCommunicateError("Conventional LM/ALM/PII/minPII CI updates require a finite nonzero frozen first DETS coefficient");
       }
       // Fail before population initialization/sampling for unqualified fixed assets.
       conventional_binding_->modelIdentity();
@@ -2813,8 +2814,16 @@ void WFTrainBatched::run()
             krylov_iterations = result.iterations;
             krylov_operator_applications = result.operator_applications;
             applied_scale = training_input_.getLearningRate();
+            // The process gate admits legacy_linear here only for pure fixed-C0 DETS CI.
+            const bool fixed_ci = conventional_binding_ && !schema.blocks().empty() &&
+                std::all_of(schema.blocks().begin(), schema.blocks().end(),
+                    [](const auto& block) { return block.update_group == "legacy_linear"; });
             wftrain::LinearMethodUpdateRule update_rule(factor, std::move(result),
-                training_input_.getLearningRate(), training_input_.getLMNormalizationXi());
+                training_input_.getLearningRate(), training_input_.getLMNormalizationXi(),
+                fixed_ci ? wftrain::LinearMethodNormalization::FIXED_REFERENCE_LINEAR
+                         : wftrain::LinearMethodNormalization::NONLINEAR,
+                fixed_ci ? wftrain::DerivativeArrayView<const wftrain::ScoreCovarianceBatch>{score_batches.data(), score_batches.size()}
+                         : wftrain::DerivativeArrayView<const wftrain::ScoreCovarianceBatch>{});
             iteration_result = runScoreFactorIteration(*selected_provider_, *parameters, factor,
                 *decorate(update_rule), training_state, reduction, cache_observer,
                 energy_moments.weight_sum, energy_moments.variance);
