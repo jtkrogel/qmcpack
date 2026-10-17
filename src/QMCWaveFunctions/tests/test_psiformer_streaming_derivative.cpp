@@ -1419,10 +1419,12 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   }
   const VirtualParticleBatch batch(1, offsets, segments, points);
   const std::vector<std::vector<DerivativeValue>> coefficients{{{.7, -.2}}, {{-.3, .4}}, {{.1, .6}}};
+  // Channel IDs are borrowed string_views; their storage must outlive every descriptor.
+  const char* const channel_ids[]{"ecp0", "ecp1", "ecp2"};
   const auto channelsFor = [&](const StreamingDerivativeOperator& op) {
     std::vector<VJPCoefficientChannel> channels;
     for (std::size_t i = 0; i < coefficients.size(); ++i)
-      channels.push_back({"ecp" + std::to_string(i), DerivativeProduct::LOCAL_ENERGY_VJP,
+      channels.push_back({channel_ids[i], DerivativeProduct::LOCAL_ENERGY_VJP,
                           coefficientsFor(op, coefficients[i]), ecp});
     return channels;
   };
