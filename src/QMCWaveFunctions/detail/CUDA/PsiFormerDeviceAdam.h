@@ -172,7 +172,7 @@ private:
       const auto norm = proposeEnergyImpl(source, image->parameters(), nullptr, weight, energy,
           beta1, beta2, correction1, correction2, epsilon, nullptr,
           with_displacement_norm ? &displacement : nullptr);
-      snapshot->parameters_.copyFromDevice(gradient_candidate_, count_);
+      snapshot->parameters_->copyFromDevice(gradient_candidate_, count_);
       pending_control_ = std::move(control);
       device_image_ = image;
       device_bound_ = true;

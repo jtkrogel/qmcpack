@@ -83,11 +83,27 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
       "DEVICE candidate cap denial allocated storage");
   generation = build();
   auto rejected = consume(generation, 1, bytes);
+  before = session.transferSnapshot();
+  auto discarded_shared = active->makeSharedUpdatedImage(*rejected.snapshot);
+  const auto* candidate_pointer = discarded_shared->parameters();
+  require(session.transferSnapshot().allocation_calls == before.allocation_calls &&
+      session.transferSnapshot().device_copied_bytes == before.device_copied_bytes,
+      "Shared successor allocated or copied its already owning candidate");
+  discarded_shared.reset();
+  require(rejected.snapshot->deviceBytes() == bytes &&
+      session.transferSnapshot().free_calls == before.free_calls,
+      "Discarded image destroyed the receipt's retryable numeric payload");
+  discarded_shared = active->makeSharedUpdatedImage(*rejected.snapshot);
+  require(discarded_shared->parameters() == candidate_pointer,
+      "Shared successor retry changed immutable payload identity");
+  discarded_shared.reset();
   fails([&] { adam->validateHostCandidateAcceptance(); });
   auto replacement = consume(build(), 1, bytes);
   fails([&] { active->makeUpdatedImage(*rejected.snapshot, bytes); });
+  fails([&] { active->makeSharedUpdatedImage(*rejected.snapshot); });
   adam->reject();
   fails([&] { active->makeUpdatedImage(*replacement.snapshot, bytes); });
+  fails([&] { active->makeSharedUpdatedImage(*replacement.snapshot); });
   generation = build();
   fails([&] {
     session.consumeEnergyAdamDeviceCandidate(*adam, active->version(), generation,
@@ -140,21 +156,51 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
     fails([&] { adam->validateHostCandidateAcceptance(); });
     fails([&] { foreign->makeUpdatedImage(*receipt.snapshot, bytes); });
     fails([&] { foreign_family->makeUpdatedImage(*receipt.snapshot, bytes); });
+    fails([&] { foreign->makeSharedUpdatedImage(*receipt.snapshot); });
+    fails([&] { foreign_family->makeSharedUpdatedImage(*receipt.snapshot); });
+    fails([&] { active->makeUpdatedImage(*receipt.snapshot, 0); });
+    fails([&] { active->makeUpdatedImage(*receipt.snapshot, std::numeric_limits<std::size_t>::max()); });
     fails([&] { active->makeUpdatedImage(*receipt.snapshot, bytes - 1); });
-    auto next = active->makeUpdatedImage(*receipt.snapshot, bytes);
+    auto next = active->makeSharedUpdatedImage(*receipt.snapshot);
     const auto after = session.transferSnapshot();
     require(after.uploaded_bytes == before.uploaded_bytes &&
-        after.allocation_calls - before.allocation_calls == 2 &&
-        after.device_copied_bytes - before.device_copied_bytes == 2 * bytes &&
+        after.allocation_calls - before.allocation_calls == 1 &&
+        after.device_copied_bytes - before.device_copied_bytes == bytes &&
+        after.live_bytes - before.live_bytes == bytes &&
         after.downloaded_bytes - before.downloaded_bytes == adam->energyGradientHostBytes() + 32,
         "DEVICE candidate warm window transferred HOST P or lost exact D2D/cusp accounting");
     near(receipt.gradient_norm, norm);
+    require(next->metadataFamily() == active->metadataFamily() && next->version() == active->version() + 1,
+        "Shared successor changed immutable family or skipped its exact version");
     near(next->sameAlpha(), expected[plan.parameter(ParameterRole::CUSP_SAME_ALPHA).begin]);
     near(next->oppositeAlpha(), expected[plan.parameter(ParameterRole::CUSP_OPPOSITE_ALPHA).begin]);
+    // The established copying factory remains independent and cap-admitted.
+    const auto before_copy = session.transferSnapshot();
+    auto copied = active->makeUpdatedImage(*receipt.snapshot, bytes);
+    require(copied->parameters() != next->parameters() &&
+        session.transferSnapshot().live_bytes - before_copy.live_bytes == bytes &&
+        session.transferSnapshot().device_copied_bytes - before_copy.device_copied_bytes == bytes,
+        "Legacy copying successor no longer owns an independent admitted allocation");
+    near(copied->sameAlpha(), next->sameAlpha());
+    near(copied->oppositeAlpha(), next->oppositeAlpha());
+    std::vector<double> shared_values(p), copied_values(p);
+    next->downloadCanonical(shared_values);
+    copied->downloadCanonical(copied_values);
+    for (std::size_t i = 0; i < p; ++i)
+    { near(shared_values[i], expected[i]); near(copied_values[i], expected[i]); }
+    copied.reset();
     fails([&] { adam->acceptDeviceCandidate(*receipt.snapshot, foreign); });
     adam->acceptDeviceCandidate(*receipt.snapshot, next);
     fails([&] { adam->acceptDeviceCandidate(*receipt.snapshot, next); });
     fails([&] { active->makeUpdatedImage(*receipt.snapshot, bytes); });
+    fails([&] { active->makeSharedUpdatedImage(*receipt.snapshot); });
+    const auto before_receipt_release = session.transferSnapshot();
+    receipt.snapshot.reset(); // The accepted image alone must keep its payload alive.
+    require(session.transferSnapshot().free_calls == before_receipt_release.free_calls &&
+        next->deviceStorageBytes() >= bytes,
+        "Receipt destruction retired its accepted image's shared allocation");
+    next->downloadCanonical(shared_values);
+    for (std::size_t i = 0; i < p; ++i) near(shared_values[i], expected[i]);
     if (step == 1) intermediate = next;
     owner.stage(fingerprint, next->version(), hooks);
     owner.complete(next->version(), hooks);
@@ -172,7 +218,7 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
     near(cached_result.logabs, fresh_result.logabs);
     for (std::size_t i = 0; i < 3 * ne; ++i) near(cached_result.gradient[i], fresh_result.gradient[i]);
     for (std::size_t i = 0; i < ne; ++i) near(cached_result.lap_log[i], fresh_result.lap_log[i]);
-    std::cout << "DEVICE_CANDIDATE step=" << step << " H2D=0 D2D=" << 2 * bytes
+    std::cout << "DEVICE_CANDIDATE step=" << step << " H2D=0 D2D=" << bytes
               << " D2H=" << after.downloaded_bytes - before.downloaded_bytes << '\n';
   }
   require(intermediate.expired(), "DEVICE proposal retained an obsolete P image");
@@ -235,9 +281,18 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
   require(expired_source.expired() && source_orphan.snapshot->deviceBytes() == bytes,
       "Snapshot retained its source or lost its independent buffer");
   fails([&] { active->makeUpdatedImage(*source_orphan.snapshot, bytes); });
+  fails([&] { active->makeSharedUpdatedImage(*source_orphan.snapshot); });
+  auto survivor = active->makeSharedUpdatedImage(*orphan.snapshot);
+  std::vector<double> survivor_values(p), after_expiry(p);
+  survivor->downloadCanonical(survivor_values);
   adam.reset();
   require(orphan.snapshot->deviceBytes() == bytes, "Owner expiry destroyed snapshot storage");
   fails([&] { active->makeUpdatedImage(*orphan.snapshot, bytes); });
+  fails([&] { active->makeSharedUpdatedImage(*orphan.snapshot); });
+  orphan.snapshot.reset();
+  survivor->downloadCanonical(after_expiry);
+  require(survivor_values == after_expiry,
+      "Shared payload changed after both receipt and optimizer owner expiry");
   std::cout << "DEVICE_CANDIDATE PASS: three CPU-oracle updates, FULL VGL, reject, finite status, caps, foreign/stale/source/owner expiry; "
                "native authority unchanged; wrong-GPU execution NOT_RUN on single-device qualification\n";
 }

@@ -12559,7 +12559,8 @@ PsiFormerWF::ResidentDeviceAuthorityRequirements PsiFormerWF::prepareResidentDev
   const auto bytes = checkedBatchMemoryMultiply(structured_parameter_schema_->parameterCount(),
       sizeof(double), "Resident DEVICE authority canonical image");
   model_state_->resident_device_authority_enabled = true;
-  return {bytes, bytes, bytes};
+  // The finite snapshot and immutable successor share ONE physical P allocation.
+  return {bytes, 0, bytes};
 #else
   throw std::invalid_argument("Resident DEVICE authority requires a real GPU build");
 #endif
@@ -12617,7 +12618,9 @@ PsiFormerWF::prepareResidentDeviceAdamPublication(std::unique_ptr<ResidentDevice
       throw std::invalid_argument("Resident DEVICE source version changed");
     source = backend->currentImage();
   }
-  auto successor = source->makeUpdatedImage(*proposal->candidate.snapshot, successor_device_cap);
+  if (successor_device_cap != 0)
+    throw std::invalid_argument("Shared DEVICE successor requires zero additional numeric allocation allowance");
+  auto successor = source->makeSharedUpdatedImage(*proposal->candidate.snapshot);
   auto publication = std::make_unique<ResidentAuthorityPublication>();
   publication->authority = std::unique_lock<std::shared_mutex>(model_state_->mutex);
   requireNoPlannedProposalMutation("resident DEVICE publication");
