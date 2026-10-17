@@ -19,6 +19,10 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_sj_training.py"
                        $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_sj.xml" --sj-reference-line-search)
       set_tests_properties(short-H2-ae-conventional-wftrain-reference-search PROPERTIES TIMEOUT 300 PROCESSORS 1)
+      add_test(NAME short-H2-ae-conventional-wftrain-endpoint-search
+               COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_sj_training.py"
+                       $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_sj.xml" --sj-endpoints-line-search)
+      set_tests_properties(short-H2-ae-conventional-wftrain-endpoint-search PROPERTIES TIMEOUT 300 PROCESSORS 1)
       add_test(NAME short-H2-ae-conventional-optimizers-old-new
                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/check_sj_training.py"
                        $<TARGET_FILE:qmcpack> "${CMAKE_CURRENT_SOURCE_DIR}/wftrain_compare.xml" --old-new)

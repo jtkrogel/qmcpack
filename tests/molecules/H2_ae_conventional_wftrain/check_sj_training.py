@@ -448,7 +448,7 @@ def main():
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
     if j3_ecp:
         assert not md_ecp and fixture_tree.find(".//rotated_sposet") is None
-    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.periodic_spline or args.md_orbital or args.external_lcao or orbital_ecp_profile or ci_workflow or md_ecp or j3_ecp else None
+    deadline = time.monotonic() + 300 if args.old_new or args.sj_reference_line_search or periodic_profile or args.periodic_spline or args.md_orbital or args.external_lcao or orbital_ecp_profile or ci_workflow or md_ecp or j3_ecp else None
     external_asset = None
     external_reference = None
     if args.external_lcao:

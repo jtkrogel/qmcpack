@@ -128,3 +128,18 @@ isolation remains component-unit proof only. Strict initialized restart passed.
 One guarded real/full-precision/nonoffload/Python CTest uses the same 300-second
 limit. Existing off defaults stay unchanged; no ECP or other search profile is
 implied by this result.
+
+The ``--sj-endpoints-line-search`` mode uses the same H2 P8 Adam workflow
+with private warmup/sampling of one step each, unchanged ESS/weight/confidence
+controls, and natural endpoint expansion or fallback. Native round 118 passed
+on its first attempt using application source ``2b8f88a99`` (SHA256
+``5bf1fe0bbcce5e35d208ff29ce3088b4faa02790b4cb5ee388e086fe248f59a4``)
+and checker source ``4a8f03a5d`` (SHA256
+``5d13587c22abb662d29bcdc8192af7e0302928f01939908fb874bac59972254d``).
+All six full/import/split/resumed iterations naturally selected alpha 2 with
+seven finite phase receipts; artifact reuse, inference and strict initialized
+restart passed. Native fallback and alpha-zero rejection were NOT exercised;
+only their receipt branches were checked offline. Existing component units,
+not native pointer telemetry, establish private-bank isolation. One additional
+guarded CPU CTest uses a 300-second whole-checker limit. No new production
+behavior, ECP/orbital variant or optimizer/profile matrix is implied.
