@@ -2309,7 +2309,6 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
     retry.reset(); fresh.reset();
     gpu.releaseResidentEnergySRWorkspace(); host.releaseResidentEnergySRWorkspace();
     std::cout << "PASS component DEVICE SR: three_updates=3, samples=7/two_distinct, CPU_rank_one=1, HOST_oracle=1, cold_fence=1, public_driver=0\n";
-    return;
   }
   SECTION("DEVICE Adam")
   {
