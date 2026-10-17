@@ -680,6 +680,14 @@ void determinantTargetReuse(Queue& queue)
   run(true);
   if (!download(metadata)[0].inverse_available)
     throw std::runtime_error("target receipt recovery");
+  source[0] = 1; source[1] = 2; source[2] = 2; source[3] = 4;
+  run(true);
+  if (download(metadata)[0].status != device_determinant::FactorizationStatus::SINGULAR ||
+      download(metadata)[0].inverse_available)
+    throw std::runtime_error("singular target receipt");
+  source[0] = 1.2; source[1] = 0.0; source[2] = -0.3; source[3] = 1.8;
+  run(true);
+  near(download(inverse)[0], first_inverse[0], "singular target recovery inverse");
   lu.upload(sentinel.data(), sentinel.size());
   run(false);
   for (const auto element : download(lu))
