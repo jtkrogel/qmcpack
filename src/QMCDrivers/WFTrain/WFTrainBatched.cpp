@@ -1552,9 +1552,10 @@ void WFTrainBatched::process(xmlNodePtr node)
                                               qmcdriver_input_.get_requested_steps(),
                                               qmcdriver_input_.get_max_blocks());
     initPopulationAndCrowds(walker_counts);
-    if (complex_gpu_provider_ &&
-        (crowds_.size() != 1 || qmcdriver_input_.get_max_blocks() != 1 || steps_per_block_ != 1))
-      throw UniformCommunicateError("WFTrainBatched: paired GPU requires actual crowd1/blocks1/steps1 before sampling");
+    // Each statistical block retains its own samples; one serialized Products
+    // lane is shared across those snapshots under the checked S=W*blocks preflight.
+    if (complex_gpu_provider_ && (crowds_.size() != 1 || steps_per_block_ != 1))
+      throw UniformCommunicateError("WFTrainBatched: paired GPU requires actual crowd1/steps1 before sampling");
     const auto* device_provider = dynamic_cast<const PsiFormerWF*>(selected_provider_);
     resident_adam_budget_ = device_provider ? device_provider->residentEnergyAdamBudget() : 0;
     resident_device_authority_ = device_provider && device_provider->residentDeviceAuthorityRequested();
