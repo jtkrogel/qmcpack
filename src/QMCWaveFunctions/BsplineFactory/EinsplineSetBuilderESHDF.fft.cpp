@@ -67,8 +67,14 @@ std::string EinsplineSetBuilder::captureSourceImage(hdf_archive& archive) noexce
       if (dataset >= 0) H5Dclose(dataset);
       return contained ? 0 : -1;
     };
-    if (H5Lvisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, links, nullptr) < 0 ||
-        H5Ovisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, datasets, nullptr) < 0) return {};
+    herr_t links_status, objects_status;
+    H5E_BEGIN_TRY
+    {
+      links_status = H5Lvisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, links, nullptr);
+      objects_status = H5Ovisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, datasets, nullptr);
+    }
+    H5E_END_TRY;
+    if (links_status < 0 || objects_status < 0) return {};
     std::vector<unsigned char> image(static_cast<std::size_t>(extent));
     if (H5Fget_file_image(file, image.data(), image.size()) != extent) return {};
     constexpr char digits[] = "0123456789abcdef";

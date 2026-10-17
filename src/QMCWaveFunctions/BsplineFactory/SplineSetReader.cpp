@@ -225,7 +225,10 @@ std::unique_ptr<SPOSet> SplineSetReader<ST>::create_spline_set(const std::string
     app_log() << "  Time to bcast the table = " << now.elapsed() << std::endl;
   }
 
-  if (capture)
+  // Bound cold used-lane hash work, not ordinary table allocation or padding.
+  int table_ready = capture && multi_splines.sizeInByte() / multi_splines.num_splines_padded() * N <= 16 * 1024 * 1024;
+  myComm->allreduce(table_ready);
+  if (table_ready == myComm->size())
   {
     int ready = mybuilder->source_image_consistent;
     if (myComm->rank() == 0)
