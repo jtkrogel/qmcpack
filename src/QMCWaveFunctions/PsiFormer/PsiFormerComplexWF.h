@@ -70,9 +70,13 @@ public:
 
   /// Explicit score-only CPU owner; excludes caller gradient/target, SPO and inference owners.
   struct OrbitalMSEStorage { std::size_t required_bytes, prepared_bytes, storage_fingerprint; };
+  /// Report this score-only owner's required/prepared bytes and warmed allocation identity.
   OrbitalMSEStorage orbitalMSEStorage() const;
+  /// Prepare once under a positive finite numeric cap before evaluating any samples.
   void prepareOrbitalMSE(std::size_t maximum_bytes);
+  /// Return the immutable common boundary twist for matching a frozen target convention.
   std::array<double, 3> reducedTwist() const;
+  /// Evaluate a prepared CPU raw-orbital loss without changing accepted state or caller output on failure.
   double evaluateOrbitalMSE(const ParticleSet& particles, const std::vector<std::complex<double>>& target,
       std::vector<double>& gradient, std::size_t expected_version) const;
 
