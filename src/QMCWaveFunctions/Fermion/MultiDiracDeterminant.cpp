@@ -204,6 +204,12 @@ void MultiDiracDeterminant::evaluateForWalkerMove(const ParticleSet& P, bool fro
                                    table_matrix, ratios_to_ref_);
   ///Pinning ratios_to_ref_ to the device.
 
+#ifndef QMC_COMPLEX
+  const bool accepted_row_fallback = !is_spinor_ && !Phi->isOMPoffload() && !Phi->isOptimizable() &&
+      P.getCoordinates().getKind() == DynamicCoordinateKind::DC_POS;
+#else
+  const bool accepted_row_fallback = false;
+#endif
 
   for (size_t iat = 0; iat < NumPtcls; iat++)
   {
@@ -219,6 +225,20 @@ void MultiDiracDeterminant::evaluateForWalkerMove(const ParticleSet& P, bool fro
     lapls(ReferenceDeterminant, iat) = ratioLapl;
     for (size_t idim = 0; idim < OHMMS_DIM; idim++)
     {
+      if (accepted_row_fallback && gradRatio[idim] == ValueType{})
+      {
+        // A derivative reference may vanish although the accepted inverse is
+        // regular. Previous derivative directions may have changed this column.
+        for (size_t orbital = 0; orbital < NumOrbitals; ++orbital)
+        {
+          TpsiM(orbital, iat) = psiM(iat, orbital);
+          psiV[orbital] = dpsiM(iat, orbital)[idim];
+        }
+        evaluateRowToAcceptedReference(iat, psiV.data(), WorkSpace.data());
+        for (size_t determinant = 0; determinant < getNumDets(); ++determinant)
+          grads(determinant, iat)[idim] = WorkSpace[determinant];
+        continue;
+      }
       dpsiMinv = psiMinv;
       it       = confgList[ReferenceDeterminant].occup.begin();
       for (size_t i = 0; i < NumPtcls; i++)
@@ -229,15 +249,29 @@ void MultiDiracDeterminant::evaluateForWalkerMove(const ParticleSet& P, bool fro
       buildTableMatrix_calculateGradRatios(ReferenceDeterminant, dpsiMinv, TpsiM, *detData, *uniquePairs, *DetSigns,
                                            gradRatio[idim], table_matrix, idim, iat, grads);
     }
-    dpsiMinv = psiMinv;
-    it       = confgList[ReferenceDeterminant].occup.begin();
-    for (size_t i = 0; i < NumPtcls; i++)
-      psiV_temp[i] = d2psiM(iat, *(it++));
-    InverseUpdateByColumn(dpsiMinv, psiV_temp, workV1, workV2, iat, ratioLapl);
-    for (size_t i = 0; i < NumOrbitals; i++)
-      TpsiM(i, iat) = d2psiM(iat, i);
-    buildTableMatrix_calculateRatiosValueMatrixOneParticle(ReferenceDeterminant, dpsiMinv, TpsiM, *detData,
-                                                           *uniquePairs, *DetSigns, table_matrix, iat, lapls);
+    if (accepted_row_fallback && ratioLapl == ValueType{})
+    {
+      for (size_t orbital = 0; orbital < NumOrbitals; ++orbital)
+      {
+        TpsiM(orbital, iat) = psiM(iat, orbital);
+        psiV[orbital] = d2psiM(iat, orbital);
+      }
+      evaluateRowToAcceptedReference(iat, psiV.data(), WorkSpace.data());
+      for (size_t determinant = 0; determinant < getNumDets(); ++determinant)
+        lapls(determinant, iat) = WorkSpace[determinant];
+    }
+    else
+    {
+      dpsiMinv = psiMinv;
+      it       = confgList[ReferenceDeterminant].occup.begin();
+      for (size_t i = 0; i < NumPtcls; i++)
+        psiV_temp[i] = d2psiM(iat, *(it++));
+      InverseUpdateByColumn(dpsiMinv, psiV_temp, workV1, workV2, iat, ratioLapl);
+      for (size_t i = 0; i < NumOrbitals; i++)
+        TpsiM(i, iat) = d2psiM(iat, i);
+      buildTableMatrix_calculateRatiosValueMatrixOneParticle(ReferenceDeterminant, dpsiMinv, TpsiM, *detData,
+                                                             *uniquePairs, *DetSigns, table_matrix, iat, lapls);
+    }
     // restore matrix
     for (size_t i = 0; i < NumOrbitals; i++)
       TpsiM(i, iat) = psiM(iat, i);

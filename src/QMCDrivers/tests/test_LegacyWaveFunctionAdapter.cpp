@@ -2253,6 +2253,43 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   std::vector<ci_configuration2> configurations(4);
   configurations[0].occup = {0, 1}; configurations[1].occup = {0, 2};
   configurations[2].occup = {1, 2}; configurations[3].occup = {2, 3};
+  // Dense derivative-row oracle: two reference choices exercise zero transverse
+  // gradients and zero Laplacians, retaining rank-2 excitations/signs.
+  for (int reference : {0, 1})
+    for (int spin = 0; spin < 2; ++spin)
+    {
+      MultiDiracDeterminant block(std::make_unique<PolynomialSPO>(), false, 2 * spin, 2);
+      std::vector<std::size_t> map;
+      block.createDetData(reference, configurations, {0, 1, 2, 3}, map);
+      ParticleSet derivative_particles(accepted);
+      const double first_x = reference == 0 ? 0 : 1;
+      derivative_particles.R[2 * spin][0] = first_x;
+      derivative_particles.update();
+      block.evaluateForWalkerMove(derivative_particles);
+      const auto values = [](double x, int derivative) {
+        if (derivative == 0) return std::array<double, 4>{1, x * x, x, x * x * x};
+        if (derivative == 1) return std::array<double, 4>{0, 2 * x, 1, 3 * x * x};
+        if (derivative == 2) return std::array<double, 4>{0, 2, 0, 6 * x};
+        return std::array<double, 4>{0, 0, 0, 0};
+      };
+      const auto x = values(first_x, 0), y = values(2, 0);
+      const auto& ref = configurations[reference].occup;
+      const double denominator = x[ref[0]] * y[ref[1]] - x[ref[1]] * y[ref[0]];
+      for (int determinant = 0; determinant < 4; ++determinant)
+        for (int row = 0; row < 2; ++row)
+        {
+          const auto& occ = block.getConfiguration(determinant).occup;
+          const auto oracle = [&](int derivative) {
+            const auto replacement = values(row == 0 ? first_x : 2, derivative);
+            return (row == 0 ? replacement[occ[0]] * y[occ[1]] - replacement[occ[1]] * y[occ[0]]
+                             : x[occ[0]] * replacement[occ[1]] - x[occ[1]] * replacement[occ[0]]) / denominator;
+          };
+          CHECK(std::real(block.getGrads()(determinant, row)[0]) == Catch::Approx(oracle(1)).margin(3e-13));
+          for (int dimension = 1; dimension < 3; ++dimension)
+            CHECK(std::real(block.getGrads()(determinant, row)[dimension]) == Catch::Approx(oracle(3)).margin(3e-13));
+          CHECK(std::real(block.getLapls()(determinant, row)) == Catch::Approx(oracle(2)).margin(3e-13));
+        }
+    }
   std::array<std::unique_ptr<MultiDiracDeterminant>, 2> spins;
   std::array<std::vector<std::size_t>, 2> mappings;
   for (int spin = 0; spin < 2; ++spin)
@@ -2370,6 +2407,19 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     return component.evaluateLog(particles, g, l);
   };
   const auto source_log = evaluate(source, accepted);
+  // Original x-only physical model: Psi=3, G_x={0,2,0,2}, log-L=-2,
+  // hence kinetic energy is zero despite zero derivative references.
+  accepted.G = QMCTraits::GradType{};
+  accepted.L = QMCTraits::ValueType{};
+  source.evaluateLog(accepted, accepted.G, accepted.L);
+  for (int electron = 0; electron < 4; ++electron)
+  {
+    CHECK(std::real(accepted.G[electron][0]) == Catch::Approx(electron % 2 ? 2 : 0).margin(3e-13));
+    for (int dimension = 1; dimension < 3; ++dimension)
+      CHECK(std::real(accepted.G[electron][dimension]) == Catch::Approx(0).margin(3e-13));
+    CHECK(std::real(accepted.L[electron]) == Catch::Approx(-2).margin(3e-13));
+  }
+  checkClose(kineticEnergy(accepted), 0);
   ParticleSet owned(accepted), sibling_particles(accepted), descendant_particles(accepted);
   auto owned_component = source.makeClone(owned), sibling_component = source.makeClone(sibling_particles);
   auto& private_msd = dynamic_cast<MultiSlaterDetTableMethod&>(*owned_component);

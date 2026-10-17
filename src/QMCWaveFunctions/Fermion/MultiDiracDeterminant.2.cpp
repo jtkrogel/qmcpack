@@ -508,6 +508,15 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
       psiMinv.rows() != NumPtcls || psiMinv.cols() != NumPtcls ||
       psiM.rows() != NumPtcls || psiM.cols() != NumOrbitals)
     throw std::invalid_argument("Accepted-reference virtual determinants require initialized fixed CPU caches and valid indices");
+  Vector<ValueType> psi_view(psiV.data(), psiV.size());
+  Phi->evaluateValue(P, iat, psi_view);
+  ratios.resize(getNumDets());
+  evaluateRowToAcceptedReference(row, psiV.data(), ratios.data());
+}
+
+void MultiDiracDeterminant::evaluateRowToAcceptedReference(
+    int row, const ValueType* values, ValueType* ratios)
+{
   // IEEE bits retain finite admission under fast-math, including accepted nodes.
   const auto finite_real = [](double value) {
     std::uint64_t bits;
@@ -528,10 +537,8 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
     throw std::domain_error("Accepted reference determinant is uninitialized or singular");
   for (const auto value : psiM)
     if (!finite_value(value)) throw std::domain_error("Accepted orbital values are nonfinite");
-  Vector<ValueType> psi_view(psiV.data(), psiV.size());
-  Phi->evaluateValue(P, iat, psi_view);
-  for (const auto value : psiV)
-    if (!finite_value(value)) throw std::domain_error("Virtual orbital values are nonfinite");
+  for (int orbital = 0; orbital < NumOrbitals; ++orbital)
+    if (!finite_value(values[orbital])) throw std::domain_error("Replacement orbital values are nonfinite");
   // Rebuild only the existing accepted excitation-table entries, not an inverse.
   for (std::size_t pair = 0; pair < uniquePairs->size(); ++pair)
   {
@@ -543,7 +550,7 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
   {
     workV1[electron] = ValueType{};
     for (int orbital = 0; orbital < NumPtcls; ++orbital)
-      workV1[electron] += (psiV[(*refdet_occup)[orbital]] - psiM(row, (*refdet_occup)[orbital])) *
+      workV1[electron] += (values[(*refdet_occup)[orbital]] - psiM(row, (*refdet_occup)[orbital])) *
           psiMinv(orbital, electron);
   }
   const int maximum_rank = getMaxExcLevel() + 1;
@@ -551,7 +558,6 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
     throw std::logic_error("Invalid accepted-reference maximum excitation rank");
   accepted_reference_border_.resize(maximum_rank, maximum_rank);
   accepted_reference_pivots_.resize(maximum_rank);
-  ratios.resize(getNumDets());
   const int* excitation = detData->data();
   for (int determinant = 0; determinant < getNumDets(); ++determinant)
   {
@@ -563,7 +569,7 @@ void MultiDiracDeterminant::evaluateDetsToAcceptedReference(
     for (int i = 0; i < k; ++i)
     {
       const int position = positions[i], replacement = replacements[i], original = (*refdet_occup)[position];
-      const auto extra = psiV[replacement] - psiM(row, replacement) - (psiV[original] - psiM(row, original));
+      const auto extra = values[replacement] - psiM(row, replacement) - (values[original] - psiM(row, original));
       for (int electron = 0; electron < NumPtcls; ++electron)
         workV2[electron] += extra * psiMinv(position, electron);
     }

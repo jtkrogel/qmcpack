@@ -297,6 +297,9 @@ public:
   LogValue getLogValueRefDet() const { return log_value_ref_det_; }
 
 private:
+  /// Replace one orbital row against accepted caches, without inverting the replacement.
+  void evaluateRowToAcceptedReference(int row, const ValueType* values, ValueType* ratios);
+
   void mw_InverseUpdateByColumn(MultiDiracDetMultiWalkerResource& mw_res,
                                 const int working_index,
                                 const OffloadVector<ValueType>& curRatio_list,
