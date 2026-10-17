@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -159,9 +158,6 @@ public:
     int lwork = std::max(1, 8 * m);
     std::vector<double> work(lwork);
     double unused;
-    if (m == 2)
-      std::fprintf(stderr, "ALM TEMP pencil H %.17g %.17g %.17g %.17g S %.17g %.17g %.17g %.17g\n",
-          hp[0], hp[2], hp[1], hp[3], sp[0], sp[2], sp[1], sp[3]);
     dggev(&no, &yes, &m, hp.data(), &m, sp.data(), &m, ar.data(), ai.data(), beta.data(),
           &unused, &one, vr.data(), &m, work.data(), &lwork, &info);
     checkTime();
@@ -170,9 +166,6 @@ public:
     std::vector<Ritz> candidates;
     for (int root = 0; root < m; ++root)
     {
-      if (m == 2)
-        std::fprintf(stderr, "ALM TEMP root %d ar %.17g ai %.17g beta %.17g\n",
-            root, ar[root], ai[root], beta[root]);
       // DGGEV stores a complex pair in adjacent columns; neither is a real vector.
       if (!isFiniteTrainingReal(ai[root]) || !isFiniteTrainingReal(ar[root]) ||
           !isFiniteTrainingReal(beta[root]) || ai[root] != 0 || beta[root] == 0 ||
@@ -186,10 +179,6 @@ public:
         axpy(vr[j + stride * root], b.s[j], pair.s);
       }
       const double snorm2 = dot(pair.x, pair.s);
-      if (m == 2)
-        std::fprintf(stderr, "ALM TEMP admission snorm2 %.17g x0 %.17g xnorm %.17g minS %.17g minRef %.17g\n",
-            snorm2, pair.x[0].real(), norm(pair.x), c_.outer.minimum_overlap_norm,
-            c_.outer.minimum_reference_overlap);
       if (!isFiniteTrainingReal(snorm2) || snorm2 <= c_.outer.minimum_overlap_norm * c_.outer.minimum_overlap_norm)
         continue;
       const double snorm = std::sqrt(snorm2);
