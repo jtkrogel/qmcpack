@@ -130,3 +130,21 @@ mixed ECP LM/ALM, a second optimizer trajectory, or converged optimization.
 Compact proof is recorded under Task46
 ``validation/mixed_ecp_native_c2d41dbf/qualification_C.rst``; no HDF payload is
 duplicated in that archive.
+
+Fixed-orbital signed-CSF/J2 full LM preparation
+---------------------------------------------
+
+``--csf-j2-ecp-lm`` derives the same Be Ne2/two-MO model used by numerical130:
+frozen outer CSF0=.6 with child .8 (expanded C0=.48), and active CSF1=.05
+with signed sqrt(.5) s/px spin-interchanged children, plus four J2 coordinates.
+It preserves the tracked fixture/PP/seed81357, requests full LM only, and reuses
+32 samples/update, damping.01, Krylov64/256/15s, relative tolerance1e-6 and
+maximum augmented subspace6. ALM-only inner controls are absent. One rank/OMP1,
+180s/application and300s/helper bounds apply. The existing two-update inference,
+model import/re-export/direct VMC and strict initialized split restart checks
+remain exact; immutable CSF children/outer gauge and fixed SPO are checked.
+This is preparation, not native qualification or an ALM root-selection fix.
+Numerical130 passed2,742 assertions including the reused same-grid P5 dense/FD
+foundation. Inverse routes are not negative capabilities here and receive no new
+native claim. Obsolete CSF-ECP mixed-LM guard negatives are retired; genuine
+model/identity/unsupported-import-driver failures remain checked.

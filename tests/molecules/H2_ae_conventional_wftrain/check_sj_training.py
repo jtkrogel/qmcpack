@@ -318,6 +318,8 @@ def main():
                         help="one fixed-orbital H4 DETS/J2 AE ALM full model-import round trip")
     parser.add_argument("--mdj-ecp-alm", action="store_true",
                         help="one fixed-orbital Be DETS/J2 locality-ECP ALM workflow or honest pre-update root refusal")
+    parser.add_argument("--csf-j2-ecp-lm", action="store_true",
+                        help="one fixed-orbital Be signed-CSF/J2 locality-ECP full LM workflow")
     parser.add_argument("--sj-reference-line-search", action="store_true",
                         help="H2 SJ Adam reference search with existing five alphas and natural decisions")
     parser.add_argument("--sj-endpoints-line-search", action="store_true",
@@ -333,6 +335,10 @@ def main():
             parser.error("--csf-orbital-ecp-alm selects one single-rank signed-child CSF recipe")
         args.csf_orbital_ecp = True
     orbital_alm = args.joint_ci_orbital_ecp_alm or args.csf_orbital_ecp_alm
+    if args.csf_j2_ecp_lm:
+        if args.ranks != 1 or args.threads != 1 or args.mdj_alm or args.mdj_ecp_alm:
+            parser.error("--csf-j2-ecp-lm selects one single-rank Be CSF/J2 LM recipe")
+        args.mdj_ecp_alm = True  # Reuse strict P5 model/import/restart checks, not its optimizer.
     if args.mdj_ecp_alm:
         if args.mdj_alm:
             parser.error("select only one AE or locality-ECP mixed ALM profile")
@@ -558,7 +564,7 @@ def main():
         directory = work / label
         directory.mkdir()
         if optimizer is None:
-            optimizer = "alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
+            optimizer = "lm" if args.csf_j2_ecp_lm else "alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
         if args.sj_reference_line_search:
             require_committed = False
         if args.mdj_alm or orbital_alm:
@@ -579,6 +585,21 @@ def main():
             expansion.set("ne0", "3")
             expansion[0].set("occ0", "1110")
             expansion[1].set("occ0", "1101")
+        if args.csf_j2_ecp_lm:
+            # Exact Ne2/two-MO physical model4: outer gauge is .6, not child-weighted .48.
+            expansion = tree.find(".//multideterminant/detlist")
+            expansion.set("type", "CSF")
+            for old, new in (("nc0", "nca"), ("nc1", "ncb"), ("ne0", "nea"), ("ne1", "neb")):
+                expansion.set(new, expansion.attrib.pop(old))
+            for node in list(expansion):
+                expansion.remove(node)
+            expansion.extend(ET.fromstring('''<recipe>
+              <csf id="CI0" coeff="0.6" occ="20" exctLvl="0"><det coeff="0.8" alpha="10" beta="10"/></csf>
+              <csf id="CI1" coeff="0.05" occ="11" exctLvl="1">
+                <det coeff="0.7071067811865475244" alpha="10" beta="01"/>
+                <det coeff="-0.7071067811865475244" alpha="01" beta="10"/>
+              </csf></recipe>'''))
+            assert float(expansion[0].get("coeff")) * float(expansion[0][0].get("coeff")) == 0.48
         if args.csf_orbital_ecp:
             expansion = tree.find(".//multideterminant/detlist")
             expansion.set("type", "CSF"); expansion.set("cutoff", "0")
@@ -844,7 +865,8 @@ def main():
                 assert 0 < int(row["krylov_operator_applications"]) <= 256, row
                 assert 0 <= int(row["krylov_iterations"]) <= 64, row
             if args.mdj_alm or orbital_alm:
-                assert row["optimizer"] == "alm" and 0 < int(row["krylov_operator_applications"]) <= 256, row
+                assert row["optimizer"] == ("lm" if args.csf_j2_ecp_lm else "alm"), row
+                assert 0 < int(row["krylov_operator_applications"]) <= 256, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + int(row["committed"]), row
         assert (directory / "sj.s000.last_checkpoint.h5").is_file(), directory
         family = directory / "sj.s000.inference"
@@ -1040,11 +1062,15 @@ def main():
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
-                    if args.md_orbital_ecp:
+                    if args.md_orbital_ecp or args.csf_j2_ecp_lm:
                         assert [node.attrib for node in exported_list] == [node.attrib for node in linear_nodes], model
-                        if args.csf_orbital_ecp:
+                        if args.csf_orbital_ecp or args.csf_j2_ecp_lm:
                             assert [[child.attrib for child in outer] for outer in exported_list] == \
                                    [[child.attrib for child in outer] for outer in linear_nodes], model
+                        if args.csf_j2_ecp_lm:
+                            assert exported_list.get("type") == "CSF" and [len(outer) for outer in exported_list] == [1, 2]
+                            assert float(exported_list[0].get("coeff")) == 0.6
+                            assert float(exported_list[0][0].get("coeff")) == 0.8
                     if csf_ci or csf_ecp:
                         assert exported_list.get("type") == "CSF"
                         for original, retained in zip(linear_nodes, list(exported_list)):
@@ -1174,32 +1200,19 @@ def main():
         assert all(status == "complete" or (args.csf_lm and method == "alm" and
                    status == "expected_untrusted_root") for method, status, _ in reports), work
         if linear_ci:
-            def mixed_ci_j2(tree):
-                tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
-            if md_ecp:
-                run("reject_mixed_csf_j2_lm", optimizer="lm", mutate=mixed_ci_j2, ci_representation="csf",
-                    reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
             methods = "LM positive and ALM pre-update complex-root refusal" if args.csf_lm else "LM/ALM projective updates"
             physics = "ordinary-locality ECP" if md_ecp else "all-electron"
             print(f"PASS: {representation} {physics} {methods}, fixed reference/SPO/J2/expansion, "
                   "exact positive exported inference/restart; AE mixed CI/J2 has separate qualification")
         elif args.ci_pii or args.csf_pii:
-            if args.csf_pii and md_ecp:
-                def mixed_csf_j2(tree):
-                    tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
-                run("reject_mixed_csf_j2_lm", optimizer="lm", mutate=mixed_csf_j2,
-                    reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_pii else "pure-DETS"
             print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
         elif mixed_ci:
-            if args.mdj_pii and md_ecp:
-                run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
-                    reject="mixed updates remain unqualified")
             representation = "nontrivial CSF/J2" if args.csf_j2_pii else "DETS/J2"
             physics = "ordinary-locality ECP" if md_ecp else "all-electron"
             print(f"PASS: mixed {representation} {physics} PII/minPII updates, fixed reference/SPO/expansion, "
-                  "exact exported inference/restart; CSF ECP mixed LM remains rejected")
+                  "exact exported inference/restart; mixed LM has a separate bounded workflow")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
@@ -1224,7 +1237,7 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+    adam = run("lm" if args.csf_j2_ecp_lm else "alm" if args.mdj_alm or orbital_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
                samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
     if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
@@ -1476,10 +1489,9 @@ def main():
             print(f"PASS: H2 SJ Adam {mode} search, {detail}, "
                   "natural decisions/accepted-state preservation and strict exact initialized restart")
         elif args.mdj_alm:
-            if args.mdj_ecp_alm:
-                run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
-                    reject="mixed updates remain unqualified")
-            profile = "Be DETS/J2 locality-ECP ALM P5" if args.mdj_ecp_alm else "H4 DETS/J2 AE ALM P9"
+            profile = ("Be signed-CSF/J2 locality-ECP LM P5, outer CSF0=.6/expanded C0=.48"
+                       if args.csf_j2_ecp_lm else "Be DETS/J2 locality-ECP ALM P5"
+                       if args.mdj_ecp_alm else "H4 DETS/J2 AE ALM P9")
             print(f"PASS: real CPU fixed-orbital {profile}, two committed {32 * args.ranks}-sample updates, "
                   "frozen C0/SPO, exported inference/model reuse and strict exact initialized restart")
         elif args.csf_orbital_ecp:
