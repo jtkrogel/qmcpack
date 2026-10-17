@@ -68,11 +68,13 @@ def text_value(value):
 
 
 def check_orbital_frame(group, tree, parameters, row, model):
-    """Check qualified three-MO frames against each explicit inline AO definition."""
+    """Check qualified frames against each explicit inline AO definition."""
     wrappers = tree.findall(".//rotated_sposet")
     multideterminant = tree.find(".//multideterminant") is not None
     assert len(wrappers) == (2 if multideterminant else 1)
-    pairs = ((0, 1), (0, 2), (1, 2)) if multideterminant else ((0, 1), (0, 2))
+    many_occupied = wrappers[0].find("sposet").get("size") == "4"
+    pairs = (((0, 2), (0, 3), (1, 2), (1, 3)) if many_occupied else
+             ((0, 1), (0, 2), (1, 2)) if multideterminant else ((0, 1), (0, 2)))
     expected = [f"{wrapper.get('name')}_orb_rot_{i:04d}_{j:04d}_r"
                 for wrapper in wrappers for i, j in pairs]
     names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
@@ -86,17 +88,18 @@ def check_orbital_frame(group, tree, parameters, row, model):
     assert int(np.asarray(frame["orbital_count"][()]).reshape(-1)[0]) == len(wrappers)
     full_coordinates = []
     for ordinal, wrapper in enumerate(wrappers):
-        assert wrapper.find("sposet").get("size") == "3"
+        size = int(wrapper.find("sposet").get("size"))
+        assert size == (4 if many_occupied else 3)
         orbital = frame[f"spo_{ordinal}"]
         assert text_value(orbital["name"][()]) == wrapper.get("name")
         initial = np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()])
-        assert initial.size in (9, 12)
-        np.testing.assert_array_equal(orbital["shape"][()], [3, initial.size // 3])
+        assert (initial.size == 16 if many_occupied else initial.size in (9, 12))
+        np.testing.assert_array_equal(orbital["shape"][()], [size, initial.size // size])
         reference = np.asarray(orbital["reference_coefficients"][()]).reshape(-1)
         accepted = np.asarray(orbital["accepted_coefficients"][()]).reshape(-1)
         full = np.asarray(orbital["full_rotation"][()]).reshape(-1)
         np.testing.assert_array_equal(reference, initial)
-        assert accepted.size == initial.size and full.size == 3
+        assert accepted.size == initial.size and full.size == size * (size - 1) // 2
         assert np.isfinite(accepted).all() and np.isfinite(full).all()
         if row["committed"] == "1":
             assert not np.array_equal(accepted, reference), model
@@ -182,6 +185,8 @@ def main():
                         help="bounded LiH CPU external LCAO Adam, exact source identity and model reuse")
     parser.add_argument("--orbital-ecp", action="store_true",
                         help="bounded one-occupied Be orbital/J2 ECP Adam with complete-frame model reuse")
+    parser.add_argument("--many-occupied-orbital-ecp", action="store_true",
+                        help="bounded neutral-C two-occupied/four-MO P8 orbital/J2 ECP Adam")
     parser.add_argument("--complex-periodic-heg", action="store_true",
                         help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
@@ -211,11 +216,12 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    orbital_ecp_profile = args.orbital_ecp or args.many_occupied_orbital_ecp
     periodic_profile = args.periodic_heg or args.complex_periodic_heg
     if args.complex_periodic_heg:
         assert args.threads == 1 and args.ranks > 0
         assert args.ci_representation == "dets"
-        assert not any((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
+        assert not any((args.periodic_heg, args.md_orbital, args.external_lcao, orbital_ecp_profile,
                         args.orbital_jastrow, args.old_new, args.optimizer_screen,
                         args.family_screen, args.profile_only, args.ci_pii, args.ci_lm, args.csf_lm,
                         args.csf_pii, args.mdj_pii, args.csf_j2_pii))
@@ -229,7 +235,7 @@ def main():
     if ci_workflow:
         if args.ranks != 1 or args.threads != 1 or any((args.family_screen, args.family_method,
                 args.profile_only, args.optimizer_screen, args.model_import, args.restart, args.preflight,
-                args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, args.orbital_ecp,
+                args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, orbital_ecp_profile,
                 args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm, args.csf_pii, args.mdj_pii, args.csf_j2_pii)) != 1:
             parser.error("select one single-rank --ci-pii/--ci-lm/--csf-lm/--csf-pii/--mdj-pii/--csf-j2-pii workflow")
         args.family_screen = True
@@ -252,8 +258,9 @@ def main():
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
-    if args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp:
-        assert sum((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp)) == 1, "select one bounded qualification profile"
+    if args.periodic_heg or args.md_orbital or args.external_lcao or orbital_ecp_profile:
+        assert sum((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
+                    args.many_occupied_orbital_ecp)) == 1, "select one bounded qualification profile"
         assert args.ranks == 1 and args.threads == 1, "first qualification is bounded 1 MPI x 1 OpenMP"
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
@@ -266,7 +273,7 @@ def main():
               fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
     if j3_ecp:
         assert not md_ecp and fixture_tree.find(".//rotated_sposet") is None
-    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp or j3_ecp else None
+    deadline = time.monotonic() + 300 if args.old_new or periodic_profile or args.md_orbital or args.external_lcao or orbital_ecp_profile or ci_workflow or md_ecp or j3_ecp else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
@@ -356,11 +363,15 @@ def main():
             if not href.is_absolute():
                 pseudo.set("href", str((fixture.parent / href).resolve()))
         orbital_model = tree.find(".//rotated_sposet") is not None
-        if args.orbital_ecp:
+        if orbital_ecp_profile:
             assert orbital_model and tree.find(".//multideterminant") is None
             coefficients = tree.find(".//rotated_sposet/sposet/coefficient")
-            assert coefficients.get("size") == "3" and len(coefficients.text.split()) == 12
-            assert [group.get("size") for group in tree.findall("particleset[@name='e']/group")] == ["1", "1"]
+            size, occupied = (4, 2) if args.many_occupied_orbital_ecp else (3, 1)
+            assert coefficients.get("size") == str(size) and len(coefficients.text.split()) == 4 * size
+            assert [group.get("size") for group in tree.findall("particleset[@name='e']/group")] == [str(occupied)] * 2
+            if args.many_occupied_orbital_ecp:
+                np.testing.assert_array_equal(np.asarray(coefficients.text.split(), dtype=float).reshape(4, 4), np.eye(4))
+                assert tree.find("hamiltonian/pairpot/pseudo").get("elementType") == "C"
         if args.orbital_jastrow:
             assert orbital_model and tree.find("wavefunction/jastrow") is None, fixture
             tree.find("wavefunction").append(ET.fromstring('''
@@ -469,7 +480,7 @@ def main():
         linear_nodes = [] if determinant_list is None else list(determinant_list)
         initial = [float(node.get("coeff")) for node in linear_nodes[1:]]
         if orbital_model:
-            initial += [0.0] * (6 if linear_nodes else 2)
+            initial += [0.0] * (4 if args.many_occupied_orbital_ecp else 6 if linear_nodes else 2)
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    if node.get("optimize") != "no"
                    for value in node.text.split()]
@@ -502,6 +513,15 @@ def main():
                     assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
+                    if args.many_occupied_orbital_ecp:
+                        assert parameters.size == 8
+                        names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
+                        indices = np.asarray(group["active_indices"][()]).reshape(-1)
+                        orbital_indices = [int(index) for name, index in zip(names, indices) if "_orb_rot_" in name]
+                        j2_indices = [int(index) for name, index in zip(names, indices) if name.startswith("ud_")]
+                        assert len(orbital_indices) == len(j2_indices) == 4 and min(orbital_indices + j2_indices) >= 0
+                        assert not np.array_equal(parameters[orbital_indices], previous[orbital_indices]), (model, "orbital block did not update")
+                        assert not np.array_equal(parameters[j2_indices], previous[j2_indices]), (model, "J2 block did not update")
                     if csf_ecp or (md_ecp and args.mdj_pii):
                         assert parameters.size == 5 and len(linear_nodes) == 2, model
                         active_indices = np.asarray(group["active_indices"][()]).reshape(-1)
@@ -592,6 +612,14 @@ def main():
                     initial_generator, delta_generator = generator(first[start:start + 3]), generator(delta[start:start + 3])
                     assert np.linalg.norm(initial_generator @ delta_generator - delta_generator @ initial_generator) > 0, (
                         directory, start, "fixture updates commute")
+            elif args.many_occupied_orbital_ecp:
+                def generator(values):
+                    matrix = np.zeros((4, 4))
+                    matrix[0, 2], matrix[0, 3], matrix[1, 2], matrix[1, 3] = values
+                    return matrix - matrix.T
+                first_generator, delta_generator = generator(first), generator(delta)
+                assert np.linalg.norm(first_generator @ delta_generator - delta_generator @ first_generator) > 0, directory
+                assert np.any(orbital_history[-1][1][[0, 5]] != 0), (directory, "missing accumulated internal rotations")
             else:
                 assert first[0] * delta[1] != first[1] * delta[0], (directory, "fixture updates commute")
                 assert orbital_history[-1][1][2] != 0, (directory, "missing accumulated virtual rotation")
@@ -940,6 +968,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.many_occupied_orbital_ecp:
+            print("PASS: real CPU neutral-C two-occupied orbital/J2 ordinary-locality ECP Adam P8, 4AO/4MO full frames, "
+                  "physical VMC model reuse and exact initialized restart; numerical coverage is the separate unit gate")
         elif args.orbital_ecp:
             print("PASS: real CPU one-occupied Be orbital/J2 ordinary-locality ECP Adam, 4AO/3MO full frames, "
                   "physical VMC model reuse and exact initialized restart; mathematical nodal coverage is the separate unit gate")
