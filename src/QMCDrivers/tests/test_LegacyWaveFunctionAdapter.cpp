@@ -4753,9 +4753,14 @@ TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapt
     auto plus = snapshot, minus = snapshot;
     plus.values[parameter] += 1e-5;
     minus.values[parameter] -= 1e-5;
+    // ECP JVP leaves the worker at its last virtual point, not the sample.
+    replay->prepareSample(0);
+    if (ecp) for (int electron = 0; electron < particles.getTotalNum(); ++electron)
+      CHECK(private_particles.R[electron] == source_positions[electron]);
     adapter.installSnapshot(*evaluator, private_particles, plus);
     const double plus_log = evaluator->getLogPsi();
     const auto plus_energy = ecp ? full_energy(plus) : kineticEnergy(private_particles);
+    replay->prepareSample(0);
     adapter.installSnapshot(*evaluator, private_particles, minus);
     CHECK(rows.result()[0][parameter].real() == Catch::Approx((plus_log - evaluator->getLogPsi()) / 2e-5).margin(2e-8));
     const auto minus_energy = ecp ? full_energy(minus) : kineticEnergy(private_particles);
