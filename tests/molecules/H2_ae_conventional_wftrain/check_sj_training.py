@@ -206,17 +206,20 @@ def main():
                         help="two-DETS-per-CSF PII/minPII additive updates, inference and restart")
     parser.add_argument("--mdj-pii", action="store_true",
                         help="mixed DETS/J2 PII/minPII tangent updates, inference and restart")
+    parser.add_argument("--csf-j2-pii", action="store_true",
+                        help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
     linear_ci = args.ci_lm or args.csf_lm
-    csf_ci = args.csf_lm or args.csf_pii
+    csf_ci = args.csf_lm or args.csf_pii or args.csf_j2_pii
     pure_ci = args.ci_pii or args.csf_pii or linear_ci
-    ci_workflow = pure_ci or args.mdj_pii
+    mixed_ci = args.mdj_pii or args.csf_j2_pii
+    ci_workflow = pure_ci or mixed_ci
     if ci_workflow:
         if args.ranks != 1 or args.threads != 1 or any((args.family_screen, args.family_method,
                 args.profile_only, args.optimizer_screen, args.model_import, args.restart, args.preflight,
                 args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, args.orbital_ecp,
-                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm, args.csf_pii, args.mdj_pii)) != 1:
-            parser.error("select one single-rank --ci-pii/--ci-lm/--csf-lm/--csf-pii/--mdj-pii workflow")
+                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm, args.csf_pii, args.mdj_pii, args.csf_j2_pii)) != 1:
+            parser.error("select one single-rank --ci-pii/--ci-lm/--csf-lm/--csf-pii/--mdj-pii/--csf-j2-pii workflow")
         args.family_screen = True
         args.family_method = ("lm", "alm") if linear_ci else ("pii", "minpii")
     if args.threads <= 0 or args.ranks <= 0:
@@ -591,7 +594,7 @@ def main():
                     loaded = run(f"{optimizer}_export_vmc", vmc=True, parameter_file=final)
                     reference = run(f"{optimizer}_explicit_vmc", vmc=True, reference_file=final)
                     np.testing.assert_array_equal(vmc_physical_trace(loaded), vmc_physical_trace(reference))
-                if linear_ci or args.csf_pii or args.mdj_pii:
+                if linear_ci or args.csf_pii or mixed_ci:
                     split = run(f"{optimizer}_split", optimizer=optimizer, iterations=1,
                                 mutate=controls, samples_per_rank=32)
                     resumed = run(f"{optimizer}_resumed", optimizer=optimizer,
@@ -634,15 +637,17 @@ def main():
             if args.csf_pii:
                 def mixed_csf_j2(tree):
                     tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
-                run("reject_mixed_csf_j2_pii", optimizer="pii", mutate=mixed_csf_j2,
+                run("reject_mixed_csf_j2_lm", optimizer="lm", mutate=mixed_csf_j2,
                     reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_pii else "pure-DETS"
             print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
-        elif args.mdj_pii:
+        elif mixed_ci:
             run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
-            run("reject_mixed_csf_j2_pii", optimizer="pii", ci_representation="csf",
-                reject="mixed updates remain unqualified")
-            print("PASS: mixed DETS/J2 PII/minPII updates, fixed C0/SPO, exact exported inference/restart; mixed LM and CSF rejected")
+            if args.mdj_pii:
+                run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
+                    reject="mixed updates remain unqualified")
+            representation = "nontrivial CSF/J2" if args.csf_j2_pii else "DETS/J2"
+            print(f"PASS: mixed {representation} PII/minPII updates, fixed reference/SPO/expansion, exact exported inference/restart; mixed LM rejected")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return

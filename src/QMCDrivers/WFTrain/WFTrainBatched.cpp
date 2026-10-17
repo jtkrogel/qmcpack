@@ -1480,17 +1480,17 @@ void WFTrainBatched::process(xmlNodePtr node)
         }
       if (active_linear && (linear_method || inverse_iteration))
       {
-        // Only PII/minPII have a qualified additive mixed DETS/J2 tangent map.
-        const bool joint_dets_j2 = inverse_iteration && active_linear != active_variables &&
-            multideterminants.size() == 1 && !multideterminants[0].get().hasCSFExpansion() &&
+        // Only PII/minPII have a qualified additive mixed CI/J2 tangent map.
+        const bool joint_ci_j2 = inverse_iteration && active_linear != active_variables &&
+            multideterminants.size() == 1 &&
             std::all_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
                 [](const auto& component) {
                   return component->getClassName() == "MultiSlaterDetTableMethod" ||
                       component->getClassName() == "TwoBodyJastrow";
                 });
-        if ((active_linear != active_variables && !joint_dets_j2) || conventional_binding_->hasOrbitalRotations() ||
+        if ((active_linear != active_variables && !joint_ci_j2) || conventional_binding_->hasOrbitalRotations() ||
             multideterminants.size() != 1)
-          throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit fixed-orbital DETS with J2; other mixed updates remain unqualified");
+          throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit fixed-orbital CI with J2; other mixed updates remain unqualified");
         if (population_.get_golden_hamiltonian().ecpModelProvenance() ||
             population_.get_golden_hamiltonian().hasPhysicalNLPP())
           throw UniformCommunicateError("Conventional LM/ALM/PII/minPII coefficient-family qualification requires all-electron Hamiltonians");
