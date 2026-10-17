@@ -1483,11 +1483,9 @@ void WFTrainBatched::process(xmlNodePtr node)
         if (active_linear != active_variables || conventional_binding_->hasOrbitalRotations() ||
             multideterminants.size() != 1)
           throw UniformCommunicateError("Conventional LM/ALM/PII/minPII CI updates require pure active coefficients and fixed orbitals; mixed updates remain unqualified");
-        if (multideterminants[0].get().hasCSFExpansion() && !linear_method)
-          throw UniformCommunicateError("Conventional CSF PII/minPII updates remain unqualified");
-        if (linear_method && (population_.get_golden_hamiltonian().ecpModelProvenance() ||
-                              population_.get_golden_hamiltonian().hasPhysicalNLPP()))
-          throw UniformCommunicateError("Conventional LM/ALM pure-CI qualification requires all-electron Hamiltonians");
+        if (population_.get_golden_hamiltonian().ecpModelProvenance() ||
+            population_.get_golden_hamiltonian().hasPhysicalNLPP())
+          throw UniformCommunicateError("Conventional LM/ALM/PII/minPII pure-CI qualification requires all-electron Hamiltonians");
         // The frozen CSF reference precedes its fixed determinant expansion.
         const auto reference = multideterminants[0].get().fixedCoefficientReference();
         if (reference == QMCTraits::ValueType{} || !wftrain::isFiniteTrainingReal(std::real(reference)) ||

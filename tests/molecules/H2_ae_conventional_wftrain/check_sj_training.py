@@ -202,15 +202,18 @@ def main():
                         help="bounded pure-DETS H4 LM/ALM retraction, exported inference and exact restart")
     parser.add_argument("--csf-lm", action="store_true",
                         help="two-DETS-per-CSF LM positive and sampled complex-root ALM refusal")
+    parser.add_argument("--csf-pii", action="store_true",
+                        help="two-DETS-per-CSF PII/minPII additive updates, inference and restart")
     args = parser.parse_args()
     linear_ci = args.ci_lm or args.csf_lm
-    pure_ci = args.ci_pii or linear_ci
+    csf_ci = args.csf_lm or args.csf_pii
+    pure_ci = args.ci_pii or args.csf_pii or linear_ci
     if pure_ci:
         if args.ranks != 1 or args.threads != 1 or any((args.family_screen, args.family_method,
                 args.profile_only, args.optimizer_screen, args.model_import, args.restart, args.preflight,
                 args.old_new, args.md_orbital, args.periodic_heg, args.external_lcao, args.orbital_ecp,
-                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm)) != 1:
-            parser.error("--ci-pii/--ci-lm/--csf-lm select separate single-rank pure-CI bounded workflows")
+                args.orbital_jastrow)) or args.ci_representation != "dets" or sum((args.ci_pii, args.ci_lm, args.csf_lm, args.csf_pii)) != 1:
+            parser.error("--ci-pii/--ci-lm/--csf-lm/--csf-pii select separate single-rank pure-CI bounded workflows")
         args.family_screen = True
         args.family_method = ("lm", "alm") if linear_ci else ("pii", "minpii")
     if args.threads <= 0 or args.ranks <= 0:
@@ -301,7 +304,7 @@ def main():
             assert tree.find(".//rotated_sposet") is None
             for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
                 node.set("optimize", "no")
-            if args.csf_lm:
+            if csf_ci:
                 expansion.set("type", "CSF")
                 for old, new in (("nc0", "nca"), ("nc1", "ncb"), ("ne0", "nea"), ("ne1", "neb")):
                     expansion.set(new, expansion.attrib.pop(old))
@@ -508,7 +511,7 @@ def main():
                 if linear_nodes:
                     exported_list = exported.find(".//multideterminant/detlist")
                     assert list(exported_list)[0].attrib == linear_nodes[0].attrib, model
-                    if args.csf_lm:
+                    if csf_ci:
                         assert exported_list.get("type") == "CSF"
                         for original, retained in zip(linear_nodes, list(exported_list)):
                             assert len(original) == len(retained) == 2
@@ -584,7 +587,7 @@ def main():
                     loaded = run(f"{optimizer}_export_vmc", vmc=True, parameter_file=final)
                     reference = run(f"{optimizer}_explicit_vmc", vmc=True, reference_file=final)
                     np.testing.assert_array_equal(vmc_physical_trace(loaded), vmc_physical_trace(reference))
-                if linear_ci:
+                if linear_ci or args.csf_pii:
                     split = run(f"{optimizer}_split", optimizer=optimizer, iterations=1,
                                 mutate=controls, samples_per_rank=32)
                     resumed = run(f"{optimizer}_resumed", optimizer=optimizer,
@@ -623,8 +626,14 @@ def main():
             representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
             methods = "LM positive and ALM pre-update complex-root refusal" if args.csf_lm else "LM/ALM projective updates"
             print(f"PASS: {representation} {methods}, fixed reference/SPO/J2/expansion, exact positive exported inference/restart; mixed CI/J2 rejected")
-        elif args.ci_pii:
-            print("PASS: pure-CI PII/minPII committed updates, fixed C0/SPO/J2 and exact exported inference; not mixed CI/Jastrow qualification")
+        elif args.ci_pii or args.csf_pii:
+            if args.csf_pii:
+                def mixed_csf_j2(tree):
+                    tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
+                run("reject_mixed_csf_j2_pii", optimizer="pii", mutate=mixed_csf_j2,
+                    reject="mixed updates remain unqualified")
+            representation = "two-DETS-per-CSF" if args.csf_pii else "pure-DETS"
+            print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
