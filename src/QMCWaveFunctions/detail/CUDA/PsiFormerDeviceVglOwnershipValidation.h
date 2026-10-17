@@ -8,6 +8,7 @@
 #include "PsiFormerDeviceInference.h"
 #include <chrono>
 #include <iomanip>
+#include <iostream>
 #include <ostream>
 
 namespace qmcplusplus::psiformer::device
@@ -108,7 +109,8 @@ inline void measureVglOwnership(pf::PsiFormer& model, const PsiFormerExecutionPl
               << " warm_allocations=0 H2D=" << after.uploaded_bytes - before.uploaded_bytes
               << " D2H=" << after.downloaded_bytes - before.downloaded_bytes
               << " D2D=" << after.device_copied_bytes - before.device_copied_bytes
-              << " vendor_private=EXCLUDED_RESERVED native_CPU_model_and_output_HOST=EXCLUDED\n";
+              << " kinetic_unit_electron_masses=yes vendor_private=EXCLUDED_RESERVED"
+              << " native_CPU_model_and_output_HOST=EXCLUDED physical_device_peak=NOT_MEASURED\n";
   }
   catch (...)
   {
