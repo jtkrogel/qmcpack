@@ -5756,6 +5756,13 @@ TEST_CASE("Diamond Gamma spline Jastrow products preserve the captured physical 
   };
   auto* system = child(input.getRoot(), "qmcsystem");
   auto* cell = child(system, "simulationcell");
+  // Original diamond uses default Esler at 15; dedicated Ewald tests use 30.
+  for (auto* node = xmlFirstElementChild(cell); node; node = xmlNextElementSibling(node))
+  {
+    auto* name = xmlGetProp(node, BAD_CAST "name");
+    if (name && xmlStrEqual(name, BAD_CAST "LR_dim_cutoff")) xmlNodeSetContent(node, BAD_CAST "30");
+    xmlFree(name);
+  }
   auto* policy = xmlNewChild(cell, nullptr, BAD_CAST "parameter", BAD_CAST "ewald");
   xmlSetProp(policy, BAD_CAST "name", BAD_CAST "LR_handler");
   ParticleSetPool pool(OHMMS::Controller);
@@ -5873,6 +5880,7 @@ TEST_CASE("Diamond Gamma spline Jastrow products preserve the captured physical 
   ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
   auto ee = std::make_unique<CoulombPBCAA>(particles, true, false, false);
   CHECK(ee->ewaldModelDefinition().find("handler=EwaldHandler3D;") != std::string::npos);
+  CHECK(ee->ewaldModelDefinition().find(";lr_dim_cutoff=0x1.ep+4;") != std::string::npos);
   ham.addOperator(std::move(ee), "ElecElec");
   ham.addOperator(std::make_unique<CoulombPBCAA>(ions, false, false, false), "IonIon");
   auto* pp = child(child(system, "hamiltonian"), "pairpot");
