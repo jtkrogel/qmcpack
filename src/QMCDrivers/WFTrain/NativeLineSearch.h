@@ -9,6 +9,9 @@
 #include "QMCWaveFunctions/Optimization/StructuredParameterProvider.h"
 #include <functional>
 #include <vector>
+#ifdef QMC_COMPLEX
+#include "QMCWaveFunctions/PsiFormer/PsiFormerComplexWF.h"
+#endif
 class Communicate;
 namespace qmcplusplus
 {
@@ -20,6 +23,16 @@ namespace wftrain
 {
 class DeterminantOverlapObjective;
 class TrainingWaveFunctionBinding;
+struct PairedFixedGridNativeEnergy;
+#ifdef QMC_COMPLEX
+/// Nonowning accepted component bindings plus immutable same-traversal references.
+/// The driver owns the stable one-block population and admits these retained owners.
+struct PairedFixedGridNativeEnergy
+{
+  std::vector<std::reference_wrapper<const PsiFormerComplexWF>> sources;
+  std::vector<std::shared_ptr<const PsiFormerComplexWF::FixedGridEnergyReference>> references;
+};
+#endif
 /// Evaluate a bounded set of isolated inference candidates and return a relative scale.
 double selectNativeStep(
     const WFTrainDriverInput& input, Communicate& communicator,
@@ -33,7 +46,8 @@ double selectNativeStep(
     const StructuredParameterSnapshot& full_candidate,
     const DeterminantOverlapObjective* overlap, double maximum_alpha,
     const std::function<void(double, double, double, double, double, double, bool)>& report,
-    const TrainingWaveFunctionBinding* conventional = nullptr);
+    const TrainingWaveFunctionBinding* conventional = nullptr,
+    const PairedFixedGridNativeEnergy* paired_fixed_grid = nullptr);
 }
 }
 #endif

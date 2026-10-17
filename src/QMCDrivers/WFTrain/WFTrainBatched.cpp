@@ -515,7 +515,8 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     bool has_nonlocal_ecp,
     bool capture_ecp_jvp_replay,
     bool complex_training = false,
-    const WFTrainDriverInput::ComplexGpuTraining* gpu_training = nullptr)
+    const WFTrainDriverInput::ComplexGpuTraining* gpu_training = nullptr,
+    wftrain::PairedFixedGridNativeEnergy* fixed_grid = nullptr)
 {
   const auto& twfs      = crowd.get_walker_twfs();
   const auto& electrons = crowd.get_walker_elecs();
@@ -552,6 +553,15 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
     if (gpu_training && has_nonlocal_ecp)
     {
       const auto samples = walkers.size();
+      if (fixed_grid)
+      {
+        if (!fixed_grid->references.empty() || samples < 2)
+          throw std::logic_error("Paired fixed-grid selection requires one stable multiwalker batch");
+        fixed_grid->sources.reserve(samples);
+        fixed_grid->references.reserve(samples);
+        if (fixed_grid->sources.capacity() != samples || fixed_grid->references.capacity() != samples)
+          throw std::length_error("Paired fixed-grid binding capacities exceed preallocation admission");
+      }
       const auto points = pairedECPPointCapacity(hamiltonians[0], electrons[0], samples);
       const auto capacity = checkedMemoryAdd(samples, points); // Adam/VJP: B accepted plus Q virtual.
       const auto chunk = std::min(maximum_parameter_chunk_size, leader.parameterSchema().parameterCount());
@@ -570,12 +580,14 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
       const wftrain::VJPCoefficientChannel channel{wftrain::EnergyGradientAccumulator::WEIGHTED_LOCAL_ENERGY_CHANNEL,
           wftrain::DerivativeProduct::LOCAL_ENERGY_VJP, coefficients, ecp_mask};
       ReplayOnlyECPSink sink;
+      const auto native_cap = fixed_grid ? hamiltonians[0].get().nativeCaptureRequirements(samples).total_host_bytes : 0;
       const auto result = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
-          hamiltonian_batch, twf_batch, electron_batch, *consumer, {&channel, 1}, sink);
+          hamiltonian_batch, twf_batch, electron_batch, *consumer, {&channel, 1}, sink, native_cap);
       auto replay = consumer->releaseJVPReplay();
       if (replay->gridFingerprint() != result.grid_fingerprint)
         throw std::logic_error("Paired ECP accepted-grid identity changed before binding");
       const auto actual_points = replay->points().size();
+      const auto replay_host_bytes = fixed_grid ? replay->storageDiagnostics().retained_numeric_bytes : 0;
       batch.derivative_operator->bindNonLocalECPJVPReplay(std::move(replay));
       batch.local_energy_term_mask |= ecp_mask;
       double maximum_imaginary_nonlocal = 0;
@@ -586,6 +598,15 @@ wftrain::PreparedEnergyGradientBatch prepareCrowdBatch(
             *batch.derivative_operator, sample, hamiltonians[sample].get().getLocalPotential());
         batch.local_energies.push_back(observation.local_energy);
         maximum_imaginary_nonlocal = std::max(maximum_imaginary_nonlocal, std::abs(observation.nonlocal.imag()));
+        if (fixed_grid)
+        {
+          const auto requirement = componentAt(sample).fixedGridEnergyReferenceRequirements();
+          const auto cap = checkedMemoryAdd(checkedMemoryAdd(requirement.new_reference_host_bytes,
+              requirement.shared_replay_descriptor_bytes), checkedMemoryAdd(replay_host_bytes, native_cap));
+          fixed_grid->sources.emplace_back(componentAt(sample));
+          fixed_grid->references.push_back(componentAt(sample).makeBudgetedFixedGridEnergyReference(
+              electrons[sample], *batch.derivative_operator, sample, result.native_capture, cap));
+        }
       }
       app_log() << std::setprecision(17) << "WFTrain paired accepted-grid ECP: Q=" << actual_points
                 << " grid=" << result.grid_fingerprint << " version=" << batch.derivative_operator->parameterVersion()
@@ -1489,11 +1510,12 @@ void WFTrainBatched::process(xmlNodePtr node)
         if (population_.get_golden_hamiltonian().hasPhysicalNLPP() &&
             (!complex->gpuInferenceEnabled() || optimizer != O::ADAM ||
              training_input_.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
-             training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF ||
+             (training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::OFF &&
+              training_input_.getLineSearch() != WFTrainDriverInput::LineSearch::REFERENCE) ||
              inference_input_.enabled ||
              training_input_.getUpdateScale() != 1 || training_input_.getWeightDecay() != 0 ||
              training_input_.getMaximumUpdateNorm() != 0))
-          throw UniformCommunicateError("Paired ECP training requires GPU ENERGY Adam/OFF with default update controls");
+          throw UniformCommunicateError("Paired ECP training requires GPU ENERGY Adam/OFF or REFERENCE with default update controls");
         // GPU reference candidates require the separate budgeted private lane/image route.
         const bool energy_reference =
             training_input_.getObjective() == WFTrainDriverInput::Objective::ENERGY &&
@@ -1845,6 +1867,7 @@ void WFTrainBatched::run()
   const int num_iterations = static_cast<int>(training_input_.getIterations());
   bool complex_training = false;
   std::size_t complex_expected_prepared_bytes = 0;
+  std::size_t complex_fixed_grid_host_bytes = 0;
   std::string complex_physical_identity;
 #ifdef QMC_COMPLEX
   if (const auto* complex = complex_training_component_)
@@ -1878,6 +1901,20 @@ void WFTrainBatched::run()
         const auto r = complex->gpuDerivativeRequirements(samples, checkedMemoryAdd(largest_batch, points), limits.kinetic_targets,
             std::min(p, training_input_.getParameterChunkSize()));
         const auto replay_bytes = ecp ? complex->gpuNonLocalReplayRequirements(largest_batch, points).bound_host_extra_bytes : 0;
+        if (ecp && training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE)
+        {
+          if (largest_batch < 2)
+            throw std::invalid_argument("Paired ECP reference selection requires at least two walker clusters");
+          const auto native = population_.get_golden_hamiltonian().nativeCaptureRequirements(largest_batch);
+          const auto reference = complex->fixedGridEnergyReferenceRequirements();
+          // Replay arrays are already in derivative admission; only these NEW owners join its ledger.
+          complex_fixed_grid_host_bytes = checkedMemoryAdd(native.total_host_bytes,
+              checkedMemoryAdd(reference.shared_replay_descriptor_bytes,
+                  checkedMemoryAdd(sizeof(wftrain::PairedFixedGridNativeEnergy), checkedMemoryMultiply(largest_batch,
+                      checkedMemoryAdd(reference.new_reference_host_bytes,
+                          sizeof(std::reference_wrapper<const PsiFormerComplexWF>) +
+                          sizeof(std::shared_ptr<const PsiFormerComplexWF::FixedGridEnergyReference>))))));
+        }
         const auto q = complex->gpuParameterPublicationRequirements();
         auto generation_device = q.device_bytes, generation_host = q.host_bytes;
         if (training_input_.getLineSearch() == WFTrainDriverInput::LineSearch::REFERENCE)
@@ -1889,7 +1926,8 @@ void WFTrainBatched::run()
           generation_host = checkedMemoryAdd(isolation.host_bytes, checkedMemoryMultiply(2, q.host_bytes));
         }
         const auto device = checkedMemoryAdd(r.device_bytes, generation_device);
-        const auto host = checkedMemoryAdd(checkedMemoryAdd(r.host_bytes, replay_bytes), generation_host);
+        const auto host = checkedMemoryAdd(checkedMemoryAdd(checkedMemoryAdd(r.host_bytes, replay_bytes),
+            generation_host), complex_fixed_grid_host_bytes);
         if (device > limits.device_bytes || host > limits.host_bytes || r.matrix_work > limits.maximum_matrix_work)
           throw std::length_error(
               "WFTrainBatched: paired GPU derivative+successor device/HOST/work cap exceeded before sampling");
@@ -1943,6 +1981,7 @@ void WFTrainBatched::run()
       prospective = checkedMemoryAdd(checkedMemoryAdd(complex_expected_prepared_bytes, configuration_bytes),
           checkedMemoryAdd(covariance_bytes, checkedMemoryAdd(optimizer_bytes, allowance)));
       prospective = checkedMemoryAdd(prospective, successor_bytes);
+      prospective = checkedMemoryAdd(prospective, complex_fixed_grid_host_bytes);
       if (training_input_.getObjective() == WFTrainDriverInput::Objective::ORBITAL_MSE)
         prospective = checkedMemoryAdd(prospective, orbital_target_bytes_);
       complex_physical_identity = complex->trainingConfigurationFingerprint();
@@ -2275,7 +2314,7 @@ void WFTrainBatched::run()
     }
 
     std::vector<RetainedCrowdSamples> retained_samples;
-    std::size_t retained_configuration_bytes = resident_authority_extra_bytes_;
+    std::size_t retained_configuration_bytes = checkedMemoryAdd(resident_authority_extra_bytes_, complex_fixed_grid_host_bytes);
     for (int block = 0; block < num_blocks; ++block)
     {
       const int statistical_block = iteration * num_blocks + block;
@@ -2362,6 +2401,11 @@ void WFTrainBatched::run()
     std::optional<wftrain::OrbitalPretrainingResult> orbital_diagnostics;
     double selected_alpha = 1.0;
     double selected_displacement_norm = 0.0;
+#ifdef QMC_COMPLEX
+    std::optional<wftrain::PairedFixedGridNativeEnergy> fixed_grid;
+    if (complex_fixed_grid_host_bytes)
+      fixed_grid.emplace();
+#endif
     auto decorate = [&](wftrain::TrainingUpdateRule& optimizer) {
       wftrain::ProposalSelectionControl control;
       control.update_scale = training_input_.getUpdateScale();
@@ -2452,7 +2496,11 @@ void WFTrainBatched::run()
                               << " loss_difference " << difference
                               << " difference_error " << error << " ess " << ess
                               << " maximum_weight " << weight << " valid " << valid << std::endl;
-                }, conventional_binding_.get());
+                }, conventional_binding_.get()
+#ifdef QMC_COMPLEX
+                , fixed_grid ? &*fixed_grid : nullptr
+#endif
+                );
             selected_displacement_norm = selected_alpha * norm;
             return selected_alpha;
           });
@@ -2682,7 +2730,11 @@ void WFTrainBatched::run()
                 crowd, selected_provider_id_, batch_ordinal++, sample_offset,
                 training_input_.getParameterChunkSize(), has_nonlocal_ecp,
                 capture_ecp_jvp_replay, complex_training,
-                complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr));
+                complex_gpu_provider_ ? &training_input_.getComplexGpuTraining() : nullptr
+#ifdef QMC_COMPLEX
+                , fixed_grid ? &*fixed_grid : nullptr
+#endif
+                ));
             for (std::size_t sample = 0; sample < crowd.size(); ++sample)
             {
               crowd.get_walker_elecs()[sample].get().saveWalker(crowd.get_walkers()[sample]);

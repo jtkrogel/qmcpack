@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <optional>
@@ -174,7 +175,8 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
                         const DeterminantOverlapObjective* overlap,
                         double maximum_alpha,
                         const std::function<void(double,double,double,double,double,double,bool)>& report,
-                        const TrainingWaveFunctionBinding* conventional)
+                        const TrainingWaveFunctionBinding* conventional,
+                        const PairedFixedGridNativeEnergy* paired_fixed_grid)
 {
   // Each rank retains one private model and one scratch ParticleSet. Empty ranks
   // use no private model but participate in every candidate statistical reduction.
@@ -187,6 +189,17 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
   std::size_t local_chain_count = 0;
   try
   {
+#ifdef QMC_COMPLEX
+    if (paired_fixed_grid && (conventional || overlap ||
+        input.getObjective() != WFTrainDriverInput::Objective::ENERGY ||
+        input.getLineSearch() != WFTrainDriverInput::LineSearch::REFERENCE ||
+        paired_fixed_grid->sources.size() != configurations.size() ||
+        paired_fixed_grid->references.size() != configurations.size()))
+      throw std::invalid_argument("Paired fixed-grid selection requires complete ENERGY reference bindings");
+#else
+    if (paired_fixed_grid)
+      throw std::invalid_argument("Paired fixed-grid selection requires a complex build");
+#endif
     if (configuration_chain_ids.size() != configurations.size())
       throw std::invalid_argument("Line-search configurations and chain identities differ in size");
     for (const auto id : configuration_chain_ids)
@@ -212,7 +225,8 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
 #endif
           provider.isolateParameterState();
       }
-      ham = hamiltonian.makeClone(*particles, *wavefunction);
+      if (!paired_fixed_grid)
+        ham = hamiltonian.makeClone(*particles, *wavefunction);
     }
   }
   catch (...) { ready = false; }
@@ -306,14 +320,34 @@ double selectNativeStep(const WFTrainDriverInput& input, Communicate& comm,
       quadrature_rng = production_rng.makeClone();
       if (ham)
         ham->setRandomGenerator(quadrature_rng.get());
-      for (const auto& position : positions)
+      for (std::size_t sample = 0; sample < positions.size(); ++sample)
       {
-        particles->R = position;
+        particles->R = positions[sample];
         particles->update();
         const double logpsi = wavefunction->evaluateLog(*particles);
         // Replay one private RNG stream across the fixed population, pairing
         // quadrature rotations between candidates while varying them by sample.
-        const double energy = ham->evaluate(*wavefunction, *particles);
+        double energy;
+#ifdef QMC_COMPLEX
+        if (paired_fixed_grid)
+        {
+          const auto* candidate = dynamic_cast<const PsiFormerComplexWF*>(
+              &providerOf(*wavefunction, provider_id));
+          if (!candidate || !candidate->gpuInferenceEnabled())
+            throw std::logic_error("Paired fixed-grid selection lost its private GPU family");
+          const auto observed = paired_fixed_grid->sources[sample].get().evaluateFixedGridCandidateEnergy(
+              paired_fixed_grid->references[sample], *candidate, *particles);
+          paired_fixed_grid->sources[sample].get().validateFixedGridCandidateEnergy(observed, *candidate);
+          energy = observed.local_energy.real();
+          app_log() << std::setprecision(17) << "WFTrain paired fixed-grid candidate: alpha=" << alpha
+                    << " sample=" << sample << " grid=" << observed.grid_fingerprint
+                    << " source_version=" << observed.source_version << " candidate_version=" << observed.candidate_version
+                    << " ReEL=" << energy << " ImEL=" << observed.local_energy.imag()
+                    << " no_rng_draw=yes" << std::endl;
+        }
+        else
+#endif
+          energy = ham->evaluate(*wavefunction, *particles);
         if (!isFiniteTrainingReal(logpsi) || !isFiniteTrainingReal(energy))
           throw std::runtime_error("Nonfinite candidate inference");
         logs.push_back(logpsi);
