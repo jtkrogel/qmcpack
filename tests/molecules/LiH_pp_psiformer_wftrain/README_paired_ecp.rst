@@ -29,3 +29,25 @@ native child has60s; restart180s, orchestrator190s, CTest200s.  The existing
 remain; no cap growth, forced phase/alpha/seed or source/PP mutation.  Direct
 parameter-only import/VMC, nonGamma, CPU, other optimizers and line search are
 outside this qualification.  Checkpoint restart is the proven import route.
+
+Separate fresh training import (manual, not the registered default)
+-----------------------------------------------------------------
+
+The pilot helper's optional ``--import-model MODEL`` retains the qualified
+input's current Hamiltonian/PP/geometry/MC controls, removes initialization/seed,
+and loads standalone values into NEW version0 training.  It is NOT sampler
+restart, original-PP provenance or ordinary/interval inference admission.
+The standalone file validates system/spins/ordered ionic positions/effective
+charges/cell/twist and value/layout integrity, not the original PP bytes/Ewald.
+
+Component88 at sourcef7619051a passed5263/1 assertions: exact loaded values,
+new version0, Gamma G/L and complete same-grid complex energy, source unchanged;
+CPU/wrong-kind/nonGamma requests refused.  Native89 at that source/app33e3f50c
+returned0 with two fresh commits (2.7192s/RSS656436KiB), actualQ12, finite PP
+exports and1,611,777 changed values in each update.  The original helper then
+failed only while reporting a shadowed path; the failure is preserved.  A
+reviewed separate OFFLINE validator completed all tail/input/evidence checks
+without a scientific rerun or overwrite.  The fixed optional helper itself was
+not rerun.  See Task43 validation_A_paired_pp_model_f7619051a and its separate
+native89 qualification.  The registered test above still covers the original
+internally initialized checkpoint-restart workflow only.
