@@ -136,7 +136,7 @@ def execute(root, allocation):
     previous = {number: signal.signal(number, stop) for number in (signal.SIGTERM, signal.SIGINT)}
     environment = dict(os.environ, OMP_NUM_THREADS="1", OMP_DYNAMIC="FALSE", OPENBLAS_NUM_THREADS="1",
                        MKL_NUM_THREADS="1", BLIS_NUM_THREADS="1")
-    environment["LD_LIBRARY_PATH"] = manifest["runtime_library_path"] + ":" + environment.get("LD_LIBRARY_PATH", "")
+    environment["LD_LIBRARY_PATH"] = manifest["runtime_library_path"]
     try:
         for label in manifest["cases"]:
             assert 120 - (time.monotonic() - started) >= 35, "insufficient aggregate budget; no retry"
