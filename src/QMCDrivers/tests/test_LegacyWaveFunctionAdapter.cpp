@@ -4643,6 +4643,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       REQUIRE(record->gridFingerprint() == accepted.grid_fingerprint);
       const std::vector<NonLocalECPReplayPoint> points(record->points().begin(), record->points().end());
       REQUIRE(points.size() >= 2);
+      std::size_t md_node = points.size();
       if (node)
       {
         std::ostringstream diagnostic;
@@ -4658,9 +4659,27 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
                      << point.replacement_position[1] << ',' << point.replacement_position[2]
                      << " captured_ratio=" << point.complete_ratio << " occupied=" << values[0]
                      << " virtuals=" << values[1] << ',' << values[2] << '\n';
+          if (md && md_node == points.size())
+          {
+            SPOSet::ValueMatrix occupied(2, 4), laps(2, 4);
+            SPOSet::GradMatrix gradients(2, 4);
+            const int spin = point.electron / 2;
+            rotated(*evaluator, spin).evaluate_notranspose(private_particles, 2 * spin, 2 * spin + 2,
+                                                          occupied, gradients, laps);
+            if (occupied(0, 0) * occupied(1, 1) - occupied(0, 1) * occupied(1, 0) == QMCTraits::ValueType{} &&
+                occupied(0, 0) * occupied(1, 2) - occupied(0, 2) * occupied(1, 0) == QMCTraits::ValueType{})
+              md_node = &point - points.data();
+          }
         }
         INFO(diagnostic.str());
-        REQUIRE(std::any_of(points.begin(), points.end(), [](const auto& point) { return point.complete_ratio == DerivativeValue{}; }));
+        if (md)
+        {
+          // Exact independent node; the bordered ratio may retain roundoff.
+          REQUIRE(md_node < points.size());
+          checkClose(points[md_node].complete_ratio, {});
+        }
+        else
+          REQUIRE(std::any_of(points.begin(), points.end(), [](const auto& point) { return point.complete_ratio == DerivativeValue{}; }));
         replay->prepareSample(0);
       }
       op->bindNonLocalECPJVPReplay(std::move(record));
@@ -4788,8 +4807,8 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
             laplacian += plus + dense_value(*spatial, spatial_particles) - 2.0 * psi;
           }
         CHECK(std::real(-0.5 * laplacian / (h * h * psi)) == Catch::Approx(source_energy.real()).epsilon(3e-5).margin(3e-6));
-        const auto zero = std::find_if(points.begin(), points.end(), [](const auto& p) { return p.complete_ratio == DerivativeValue{}; });
-        REQUIRE(zero != points.end());
+        REQUIRE(md_node < points.size());
+        const auto zero = points.begin() + md_node;
         replay->prepareSample(0);
         adapter.installSnapshot(*evaluator, private_particles, *snapshot);
         for (int d = 0; d < 3; ++d) private_particles.R[zero->electron][d] = zero->replacement_position[d];
@@ -4801,9 +4820,10 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         for (int term = 0; term < 2; ++term)
           CHECK(values(0, 0) * values(1, 1 + term) - values(0, 1 + term) * values(1, 0) == QMCTraits::ValueType{});
         std::vector<QMCTraits::ValueType> derivative(snapshot->values.size());
-        CHECK(evaluator->findMSD().front().get().evaluateAcceptedReferenceOrbitalRatioDerivatives(
+        checkClose(derivativeValue(evaluator->findMSD().front().get().evaluateAcceptedReferenceOrbitalRatioDerivatives(
             private_particles, zero->electron, zero->electron, adapter.registrationVariables(),
-            {derivative.data(), derivative.size()}) == QMCTraits::ValueType{});
+            {derivative.data(), derivative.size()})), {});
+        for (const auto value : derivative) CHECK(std::isfinite(std::real(value)) && std::isfinite(std::imag(value)));
         CHECK(std::any_of(derivative.begin(), derivative.end(), [](auto x) { return std::abs(x) > 1e-8; }));
         // Accepted reference is regular but its py excitation is exactly zero.
         replay->prepareSample(0);
