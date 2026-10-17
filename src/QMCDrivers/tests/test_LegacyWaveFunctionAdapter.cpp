@@ -55,6 +55,8 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <memory>
 #include <stdexcept>
 #include <system_error>
@@ -2656,7 +2658,25 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
       const std::vector<NonLocalECPReplayPoint> points(record->points().begin(), record->points().end());
       REQUIRE(points.size() >= 2);
       if (model == 1)
+      {
+        std::ostringstream diagnostic;
+        diagnostic << std::setprecision(17);
+        for (const auto& point : points)
+        {
+          private_particles.R = positions;
+          for (int d = 0; d < 3; ++d) private_particles.R[point.electron][d] = point.replacement_position[d];
+          private_particles.update();
+          SPOSet::ValueVector values(3);
+          rotated(*evaluator).Phi_->evaluateValue(private_particles, point.electron, values);
+          diagnostic << "electron=" << point.electron << " q=" << point.replacement_position[0] << ','
+                     << point.replacement_position[1] << ',' << point.replacement_position[2]
+                     << " captured_ratio=" << point.complete_ratio << " occupied=" << values[0]
+                     << " virtuals=" << values[1] << ',' << values[2] << '\n';
+        }
+        INFO(diagnostic.str());
         REQUIRE(std::any_of(points.begin(), points.end(), [](const auto& point) { return point.complete_ratio == DerivativeValue{}; }));
+        replay->prepareSample(0);
+      }
       op->bindNonLocalECPJVPReplay(std::move(record));
       CHECK(op->storageDiagnostics().real_parameter_vectors == 2);
       const double fixed_potential = loc->evaluate(particles) + 1.0 / std::sqrt(dot(positions[0] - positions[1], positions[0] - positions[1]));
