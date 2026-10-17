@@ -42,11 +42,12 @@ private:
   mutable std::vector<DerivativeValue> d_, l_, adjoint_, coefficients_, local_gradient_;
 };
 
-/// Nonlinear xi damping or exact linear-state retraction with a frozen reference coefficient.
+/// Pure-route normalizations or one common category-aware mixed reference shear.
 enum class LinearMethodNormalization
 {
   NONLINEAR,
-  FIXED_REFERENCE_LINEAR
+  FIXED_REFERENCE_LINEAR,
+  MIXED_FIXED_REFERENCE
 };
 
 /** Stateless live LM update with explicit coordinate normalization, never publication. */

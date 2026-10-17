@@ -232,9 +232,128 @@ StructuredParameterSnapshot LinearMethodUpdateRule::propose(const StructuredPara
 {
   const bool stale = parameters.version != result_.parameter_version || objective.parameter_version != parameters.version ||
       objective.schema_fingerprint != schema.fingerprint();
-  if (stale && normalization_ != LinearMethodNormalization::FIXED_REFERENCE_LINEAR)
+  bool linear_fallback = false;
+  if (normalization_ == LinearMethodNormalization::MIXED_FIXED_REFERENCE)
+  {
+    bool nonlinear_tangent = false;
+    std::vector<DerivativeValue> masked, sample;
+    std::exception_ptr failure;
+    try
+    {
+      if (stale || factor_.sampleDomain() != ScoreSampleDomain::REAL ||
+          result_.stop_reason != LinearMethodStopReason::CONVERGED || result_.provider_id != schema.providerId() ||
+          result_.schema_fingerprint != schema.fingerprint() || parameters.schema_fingerprint != schema.fingerprint() ||
+          parameters.values.size() != schema.parameterCount() || result_.eigenvector.size() != schema.parameterCount() + 1 ||
+          factor_.parameterVersion() != parameters.version || factor_.parameterSchema().fingerprint() != schema.fingerprint())
+        throw std::invalid_argument("Mixed LM retraction has an incompatible solved state");
+      double magnitude = 0;
+      for (const auto value : result_.eigenvector)
+      {
+        if (!isFiniteTrainingReal(value.real()) || !isFiniteTrainingReal(value.imag()) || value.imag() != 0)
+          throw std::invalid_argument("Mixed LM Ritz coefficients must be finite and real");
+        magnitude = std::max(magnitude, std::abs(value.real()));
+      }
+      for (const auto value : parameters.values)
+        if (!isFiniteTrainingReal(value))
+          throw std::invalid_argument("Mixed LM accepted parameters must be finite");
+      for (const auto& block : schema.blocks())
+        for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+        {
+          const auto value = result_.eigenvector[i + 1];
+          if (!block.trainable && value != DerivativeValue{})
+            throw std::invalid_argument("Mixed LM retraction cannot update frozen coordinates");
+          nonlinear_tangent |= block.trainable && block.update_group != "legacy_linear" && value != DerivativeValue{};
+        }
+      std::size_t local_samples = 0;
+      for (const auto& batch : linear_batches_)
+      {
+        if (!batch.derivative_operator || batch.weights.size() != batch.derivative_operator->sampleCount() ||
+            batch.derivative_operator->parameterVersion() != parameters.version ||
+            batch.derivative_operator->parameterSchema().fingerprint() != schema.fingerprint())
+          throw std::invalid_argument("Mixed LM retraction has incompatible samples");
+        local_samples += batch.weights.size();
+      }
+      if (local_samples != factor_.localSampleVectorSize())
+        throw std::invalid_argument("Mixed LM samples do not match its centered factor");
+      if (nonlinear_tangent)
+      {
+        if (std::abs(result_.eigenvector[0].real()) <= 1e-10 * magnitude)
+          throw std::invalid_argument("Mixed LM nonlinear reference chart is unusable");
+        masked.resize(schema.parameterCount());
+        sample.resize(factor_.localSampleVectorSize());
+      }
+    }
+    catch (...) { failure = std::current_exception(); }
+    // Agree local validation/allocation and the fallback schedule before any products.
+    const double nonlinear_ranks = factor_.reduceSampleScalar({nonlinear_tangent ? 1.0 : 0.0, 0}, failure).real();
+    const double ranks = factor_.reduceSampleScalar({1, 0}).real();
+    if (nonlinear_ranks != 0 && nonlinear_ranks != ranks)
+      throw std::invalid_argument("Mixed LM ranks disagree on the nonlinear tangent chart");
+    linear_fallback = nonlinear_ranks == 0;
+    if (!linear_fallback)
+    {
+      const double reference = result_.eigenvector[0].real();
+      for (const auto& block : schema.blocks())
+        if (block.trainable && block.update_group == "legacy_linear")
+          for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+            masked[i] = result_.eigenvector[i + 1].real() / reference;
+      double weighted = 0, absolute = 0, weight = 0;
+      try
+      {
+        const StructuredParameterVectorConstView linear(schema, parameters.version, {masked.data(), masked.size()});
+        for (const auto& batch : linear_batches_)
+        {
+          LinearScoreMeanSink sink(batch);
+          batch.derivative_operator->applyScoreJVP(linear, sink);
+          weighted += sink.weighted;
+          absolute += sink.absolute;
+          weight += sink.weight;
+        }
+        if (!isFiniteTrainingReal(weighted) || !isFiniteTrainingReal(absolute) || !isFiniteTrainingReal(weight))
+          throw std::overflow_error("Mixed LM linear score mean overflow");
+      }
+      catch (...) { failure = std::current_exception(); }
+      const double total_weight = factor_.reduceSampleScalar({weight, 0}, failure).real();
+      const double mean = factor_.reduceSampleScalar({weighted, 0}).real() / total_weight;
+      const double absolute_mean = factor_.reduceSampleScalar({absolute, 0}).real() / total_weight;
+      if (!(total_weight > 0) || !isFiniteTrainingReal(total_weight) ||
+          !isFiniteTrainingReal(mean) || !isFiniteTrainingReal(absolute_mean))
+        throw std::invalid_argument("Mixed LM linear score mean is invalid");
+      std::fill(masked.begin(), masked.end(), DerivativeValue{});
+      for (const auto& block : schema.blocks())
+        if (block.trainable && block.update_group != "legacy_linear")
+          for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+            masked[i] = result_.eigenvector[i + 1].real() / reference;
+      factor_.apply({schema, parameters.version, {masked.data(), masked.size()}}, {sample.data(), sample.size()});
+      double local_norm = 0;
+      try
+      {
+        for (const auto value : sample) local_norm += std::norm(value);
+        if (!isFiniteTrainingReal(local_norm)) throw std::overflow_error("Mixed LM nonlinear norm overflow");
+      }
+      catch (...) { failure = std::current_exception(); }
+      const double q = factor_.reduceSampleScalar({local_norm, 0}, failure).real();
+      const double beta = (1 - xi_) * q / (1 - xi_ + xi_ * std::sqrt(1 + q));
+      const double denominator = 1 - mean + beta;
+      // One shear preserves the Ritz tangent direction; q deliberately uses only NN.
+      if (!isFiniteTrainingReal(q) || q < 0 || !isFiniteTrainingReal(beta) || !isFiniteTrainingReal(denominator) ||
+          std::abs(denominator) <= 1e-10 * (1 + absolute_mean + std::abs(beta)))
+        throw std::invalid_argument("Mixed LM common projective denominator is unusable");
+      auto candidate = parameters;
+      for (const auto& block : schema.blocks())
+        for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+        {
+          if (block.trainable)
+            candidate.values[i] += learning_rate_ * (result_.eigenvector[i + 1].real() / reference) / denominator;
+          if (!isFiniteTrainingReal(candidate.values[i]))
+            throw std::overflow_error("Mixed LM retracted parameter is nonfinite");
+        }
+      return candidate;
+    }
+  }
+  if (stale && normalization_ != LinearMethodNormalization::FIXED_REFERENCE_LINEAR && !linear_fallback)
     throw std::invalid_argument("Live LM update has a stale parameter binding");
-  if (normalization_ == LinearMethodNormalization::FIXED_REFERENCE_LINEAR)
+  if (normalization_ == LinearMethodNormalization::FIXED_REFERENCE_LINEAR || linear_fallback)
   {
     double weighted = 0, absolute = 0, weight = 0;
     std::exception_ptr failure;
