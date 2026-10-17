@@ -97,7 +97,11 @@ def suite(app, backend, directory, args):
     first, _ = run(app, split, "lih_pp_ecp_checkpoint", backend, 1, args)
     resumed, resumed_rows = run(app, split, "lih_pp_ecp_restart", backend, 2, args, first.name)
     # Reuse the established latest-index -> manifest -> ROOT/shard resolution.
-    for original, restored in zip(envelopes(latest, args.h5dump), envelopes(resumed, args.h5dump)):
+    original_files = envelopes(latest, args.h5dump)
+    restored_files = envelopes(resumed, args.h5dump)
+    if len(original_files) != len(restored_files) or len(original_files) != 2:
+        raise AssertionError("Expected matching ROOT and rank-zero sampler envelopes")
+    for original, restored in zip(original_files, restored_files):
         subprocess.run([args.h5diff, str(original), str(restored)], check=True, timeout=args.timeout)
     for key in ("iteration", "sample_version", "parameter_version", "samples", "mean_energy",
                 "variance", "gradient_norm", "selected_alpha", "committed"):
@@ -132,7 +136,8 @@ def main():
     parser.add_argument("--walkers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--blocks", type=int, choices=(1, 2), default=2)
     parser.add_argument("--timeout", type=float, default=180)
-    parser.add_argument("--device-bytes", type=int, default=8 * 1024**3)
+    parser.add_argument("--device-bytes", type=int, default=3 * 1024**3,
+                        help="Aggregate admission cap, not a claim about available device memory")
     parser.add_argument("--h5diff", default=shutil.which("h5diff"))
     parser.add_argument("--h5dump", default=shutil.which("h5dump"))
     parser.add_argument("--profile-only", action="store_true", help="Two uninterrupted updates only, no restart claim")
@@ -142,6 +147,10 @@ def main():
     args = parser.parse_args()
     args.app = args.app.resolve()
     args.source = args.source.resolve()
+    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.device_bytes <= 0:
+        parser.error("timeout and device admission cap must be positive and finite")
+    if not all(math.isfinite(value) and value >= 0 for value in (args.rtol, args.atol)):
+        parser.error("comparison tolerances must be finite and nonnegative")
     if args.cpu_app and args.backend != "cuda":
         parser.error("--cpu-app is meaningful only with --backend cuda")
     if not args.h5diff or not args.h5dump:
@@ -167,6 +176,7 @@ def main():
         raise AssertionError("Native check changed a protected template or BFD asset")
     report = dict(backend=args.backend, app_sha256=digest(args.app), pseudopotential="BFD",
                   walkers=args.walkers, blocks=args.blocks, updates=2,
+                  device_admission_cap=args.device_bytes if args.backend == "cuda" else None,
                   exact_restart=not args.profile_only, cpu_parity=bool(args.cpu_app), protected_sha256=before)
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS:", json.dumps(report, sort_keys=True))
