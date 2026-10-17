@@ -27,14 +27,33 @@ def datasets(path):
     return result
 
 
-def compare_archives(left, right, pattern):
+def compare_archives(left, right, pattern, *, optimizer_max_ulps=0):
     first = sorted(left.rglob(pattern))
     second = sorted(right.rglob(pattern))
     assert first and len(first) == len(second), (pattern, first, second)
     for a, b in zip(first, second):
         lhs, rhs = datasets(a), datasets(b)
         assert lhs.keys() == rhs.keys(), (a, b)
+        moment_names = {"wftrain_checkpoint/optimizer/first_moment", "wftrain_checkpoint/optimizer/second_moment"}
+        moment_difference = False
+        if optimizer_max_ulps:
+            # MD-only cold-process legacy roundoff: callers must first actually
+            # restore BOTH own bundles, validating each fingerprint/payload.
+            assert pattern == "*.state.h5" and optimizer_max_ulps == 8
+            assert moment_names <= lhs.keys()
+            for name in sorted(moment_names):
+                first_moment, second_moment = np.asarray(lhs[name]), np.asarray(rhs[name])
+                assert first_moment.dtype == second_moment.dtype == np.dtype("float64")
+                assert first_moment.shape == second_moment.shape
+                assert np.isfinite(first_moment).all() and np.isfinite(second_moment).all()
+                distance = np.testing.assert_array_max_ulp(first_moment, second_moment, maxulp=optimizer_max_ulps)
+                maximum = int(np.max(distance, initial=0))
+                moment_difference |= maximum != 0
+                print(f"MD-only legacy cold-process roundoff: {name} max_ULP={maximum} cap={optimizer_max_ulps}", flush=True)
         for name in lhs:
+            if optimizer_max_ulps and (name in moment_names or
+                    (moment_difference and name == "wftrain_checkpoint/optimizer/state_fingerprint")):
+                continue
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"{pattern}: {name}")
 
 
@@ -240,7 +259,7 @@ def main():
 
     def run(label, *, optimizer="adam", inference=True, iterations=2, restart=None, mutate=None, reject=False,
             samples_per_rank=4, require_committed=True, parameter_file=None, vmc=False, reference_file=None,
-            legacy_vp=None, legacy_reference=None):
+            legacy_vp=None, legacy_reference=None, completed_restore=False):
         directory = work / label
         directory.mkdir()
         if args.periodic_heg:
@@ -314,6 +333,12 @@ def main():
             assert not list(directory.glob("*.training/*/*.state.h5")), directory
             return directory
         assert result.returncode == 0, (directory, text[-6000:])
+        if completed_restore:
+            assert args.md_orbital and restart is not None and not vmc
+            assert f"WFTrain restored {iterations} completed iteration(s)" in text, directory
+            assert "0 committed update(s)" in text and "WFTrain iteration " not in text, directory
+            assert not list(directory.glob("*.training/**/*.parameters.h5")), directory
+            return directory
         if vmc:
             vmc_physical_trace(directory)
             assert not list(directory.glob("*.training")), directory
@@ -574,6 +599,12 @@ def main():
                       restart=split / "sj.s000.last_checkpoint.h5")
         for name in ("samples", "mean_energy", "variance", "gradient_norm", "selected_alpha", "committed"):
             assert history(trained)[-1][name] == history(resumed)[0][name], name
+        if args.md_orbital:
+            original_row, resumed_row = history(trained)[-1], history(resumed)[0]
+            diagnostic_fields = {"sampling_seconds", "total_seconds", "retained_numeric_bytes", "resident_bytes"}
+            assert original_row.keys() == resumed_row.keys()
+            for name in original_row.keys() - diagnostic_fields:
+                assert original_row[name] == resumed_row[name], (name, original_row[name], resumed_row[name])
         final = sorted((trained / "sj.s000.training").rglob("*.parameters.h5"))[-1]
         restored = sorted((resumed / "sj.s000.training").rglob("*.parameters.h5"))[-1]
         lhs, rhs = datasets(final), datasets(restored)
@@ -582,8 +613,15 @@ def main():
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"initialized restart: {name}")
         final_bundle = final.parent / (final.name[:-len(".parameters.h5")] + ".checkpoint")
         restored_bundle = restored.parent / (restored.name[:-len(".parameters.h5")] + ".checkpoint")
+        if args.md_orbital:
+            # Validate each serialized optimizer state with production restore,
+            # including its OWN fingerprint. Do not sample or apply an update.
+            for label, directory in (("validate_full_optimizer", trained), ("validate_resumed_optimizer", resumed)):
+                run(label, parameter_file=exported, iterations=2, completed_restore=True,
+                    restart=directory / "sj.s000.last_checkpoint.h5")
         for pattern in ("*.state.h5", "*.rank_*.h5"):
-            compare_archives(final_bundle, restored_bundle, pattern)
+            compare_archives(final_bundle, restored_bundle, pattern,
+                             optimizer_max_ulps=8 if args.md_orbital and pattern == "*.state.h5" else 0)
         # A second import still uses ORIGINAL inline XML and original registration
         # identity, rather than a rewritten XML whose baseline masks a loader bug.
         second_vmc = run("reimported_vmc", vmc=True, parameter_file=final)
@@ -632,9 +670,12 @@ def main():
         if args.periodic_heg:
             print("PASS: real Gamma HEG14 Adam/SR, 8 samples/update, actual Ewald identity and changed cell/cutoff rejection")
         if args.md_orbital:
-            print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection")
-        print("PASS: conventional model import physical VMC reference, fresh training/re-export/re-import, "
-              "exact initialized split restart and malformed/unsupported import rejection")
+            print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
+                  "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
+                  "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        else:
+            print("PASS: conventional model import physical VMC reference, fresh training/re-export/re-import, "
+                  "exact initialized split restart and malformed/unsupported import rejection")
         return
     if args.profile_only:
         print(f"PASS: bounded conventional Adam/inference {args.ranks} MPI x {args.threads} OpenMP; accepted model export")
