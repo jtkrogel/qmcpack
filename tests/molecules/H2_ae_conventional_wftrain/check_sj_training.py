@@ -49,32 +49,40 @@ def text_value(value):
 
 
 def check_orbital_frame(group, tree, parameters, row, model):
-    """Check the explicit two-generator model, not arbitrary registered vars."""
-    wrapper = tree.find(".//rotated_sposet")
-    assert wrapper is not None and wrapper.find("sposet").get("size") == "3"
-    wrapper_name = wrapper.get("name")
-    expected = [f"{wrapper_name}_orb_rot_0000_{virtual:04d}_r" for virtual in (1, 2)]
+    """Check the qualified three-basis SD or distinct-spin MD models."""
+    wrappers = tree.findall(".//rotated_sposet")
+    multideterminant = tree.find(".//multideterminant") is not None
+    assert len(wrappers) == (2 if multideterminant else 1)
+    pairs = ((0, 1), (0, 2), (1, 2)) if multideterminant else ((0, 1), (0, 2))
+    expected = [f"{wrapper.get('name')}_orb_rot_{i:04d}_{j:04d}_r"
+                for wrapper in wrappers for i, j in pairs]
     names = [text_value(value) for value in np.asarray(group["variable_names"][()]).reshape(-1)]
     indices = np.asarray(group["active_indices"][()]).reshape(-1)
-    assert sorted(name for name in names if "_orb_rot_" in name) == expected, (model, names)
+    assert sorted(name for name in names if "_orb_rot_" in name) == sorted(expected), (model, names)
     active = parameters[[int(indices[names.index(name)]) for name in expected]]
     frame = group["orbital_frame"]
     np.testing.assert_array_equal(frame["format_version"][()], [1, 0, 0])
-    np.testing.assert_array_equal(frame["determinant_aliases"][()], [0, 0])
+    np.testing.assert_array_equal(frame["determinant_aliases"][()], [0, 1] if multideterminant else [0, 0])
     assert int(np.asarray(frame["source_version"][()]).reshape(-1)[0]) == int(row["parameter_version"])
-    assert int(np.asarray(frame["orbital_count"][()]).reshape(-1)[0]) == 1
-    orbital = frame["spo_0"]
-    assert text_value(orbital["name"][()]) == wrapper_name
-    np.testing.assert_array_equal(orbital["shape"][()], [3, 3])
-    initial = np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()])
-    reference = np.asarray(orbital["reference_coefficients"][()]).reshape(-1)
-    accepted = np.asarray(orbital["accepted_coefficients"][()]).reshape(-1)
-    full = np.asarray(orbital["full_rotation"][()]).reshape(-1)
-    np.testing.assert_array_equal(reference, initial)
-    assert accepted.size == 9 and full.size == 3
-    assert np.isfinite(accepted).all() and np.isfinite(full).all()
-    if row["committed"] == "1":
-        assert not np.array_equal(accepted, reference), model
+    assert int(np.asarray(frame["orbital_count"][()]).reshape(-1)[0]) == len(wrappers)
+    full_coordinates = []
+    for ordinal, wrapper in enumerate(wrappers):
+        assert wrapper.find("sposet").get("size") == "3"
+        orbital = frame[f"spo_{ordinal}"]
+        assert text_value(orbital["name"][()]) == wrapper.get("name")
+        np.testing.assert_array_equal(orbital["shape"][()], [3, 3])
+        initial = np.asarray([float(value) for value in wrapper.find("sposet/coefficient").text.split()])
+        reference = np.asarray(orbital["reference_coefficients"][()]).reshape(-1)
+        accepted = np.asarray(orbital["accepted_coefficients"][()]).reshape(-1)
+        full = np.asarray(orbital["full_rotation"][()]).reshape(-1)
+        np.testing.assert_array_equal(reference, initial)
+        assert accepted.size == 9 and full.size == 3
+        assert np.isfinite(accepted).all() and np.isfinite(full).all()
+        if row["committed"] == "1":
+            assert not np.array_equal(accepted, reference), model
+        full_coordinates.append(full)
+    cookie = "conventional-rotated-lcao-mdj-v1" if multideterminant else "conventional-rotated-lcao-sj-v1"
+    assert text_value(group["completion_cookie"][()]) == cookie
     # Both bundle representations must carry exactly the same complete frame.
     exported = datasets(model)
     iteration_root = model.name[:-len(".parameters.h5")]
@@ -84,7 +92,7 @@ def check_orbital_frame(group, tree, parameters, row, model):
         if name.startswith(prefix):
             np.testing.assert_array_equal(values, state["wftrain_checkpoint/orbital_frame/" + name[len(prefix):]],
                                           err_msg=f"orbital checkpoint/export frame: {name}")
-    return active, full
+    return active, np.concatenate(full_coordinates)
 
 
 def apply_model_reference(tree, model):
@@ -102,14 +110,13 @@ def apply_model_reference(tree, model):
         for node in tree.findall(".//multideterminant/detlist/*"):
             if node.get("id") in active:
                 node.set("coeff", str(active[node.get("id")]))
-        wrapper = tree.find(".//rotated_sposet")
-        if wrapper is not None:
+        for ordinal, wrapper in enumerate(tree.findall(".//rotated_sposet")):
             # Remove the coordinate wrapper entirely: the independent VMC oracle
             # starts from exact accepted C, not an exp(active) reconstruction.
             spo = wrapper.find("sposet")
             spo.set("name", wrapper.get("name"))
             spo.find("coefficient").text = " ".join(str(value) for value in np.asarray(
-                group["orbital_frame/spo_0/accepted_coefficients"][()]).reshape(-1))
+                group[f"orbital_frame/spo_{ordinal}/accepted_coefficients"][()]).reshape(-1))
             collection = tree.find("wavefunction/sposet_collection")
             collection.remove(wrapper)
             collection.append(spo)
@@ -149,6 +156,8 @@ def main():
                         help="bounded original batched OneShiftOnly versus new Adam integration comparison")
     parser.add_argument("--periodic-heg", action="store_true",
                         help="bounded HEG14 Gamma Adam/SR, full model import/restart and periodic identity negatives")
+    parser.add_argument("--md-orbital", action="store_true",
+                        help="bounded distinct-spin MD orbital/CI/J2 Adam/SR and complete-frame model reuse")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
                         help="second representative optimizer in the main workflow")
     parser.add_argument("--ci-representation", choices=("dets", "csf"), default="dets",
@@ -182,12 +191,13 @@ def main():
     fixture = args.fixture.resolve()
     work = Path(tempfile.mkdtemp(prefix="conventional_sj_verify_"))
     print(work, flush=True)
-    if args.periodic_heg:
-        assert args.ranks == 1 and args.threads == 1, "first HEG qualification is bounded 1 MPI x 1 OpenMP"
+    if args.periodic_heg or args.md_orbital:
+        assert not (args.periodic_heg and args.md_orbital), "select one bounded qualification profile"
+        assert args.ranks == 1 and args.threads == 1, "first qualification is bounded 1 MPI x 1 OpenMP"
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg else None
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital else None
 
     def launch(directory):
         environment = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1")
@@ -339,7 +349,7 @@ def main():
         linear_nodes = [] if determinant_list is None else list(determinant_list)
         initial = [float(node.get("coeff")) for node in linear_nodes[1:]]
         if orbital_model:
-            initial += [0.0, 0.0]
+            initial += [0.0] * (6 if linear_nodes else 2)
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
                    for value in node.text.split()]
         previous = (np.asarray(initial) if parameter_file is None else
@@ -402,8 +412,18 @@ def main():
         if len(orbital_history) == 2:
             first, second = orbital_history[0][0], orbital_history[1][0]
             delta = second - first
-            assert first[0] * delta[1] != first[1] * delta[0], (directory, "fixture updates commute")
-            assert orbital_history[-1][1][2] != 0, (directory, "missing accumulated virtual rotation")
+            if linear_nodes:
+                def generator(values):
+                    matrix = np.zeros((3, 3))
+                    matrix[0, 1], matrix[0, 2], matrix[1, 2] = values
+                    return matrix - matrix.T
+                for start in (0, 3):
+                    initial_generator, delta_generator = generator(first[start:start + 3]), generator(delta[start:start + 3])
+                    assert np.linalg.norm(initial_generator @ delta_generator - delta_generator @ initial_generator) > 0, (
+                        directory, start, "fixture updates commute")
+            else:
+                assert first[0] * delta[1] != first[1] * delta[0], (directory, "fixture updates commute")
+                assert orbital_history[-1][1][2] != 0, (directory, "missing accumulated virtual rotation")
         return directory
 
     if args.family_screen:
@@ -465,7 +485,7 @@ def main():
         return
 
     adam = run("adam", samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
-    if args.periodic_heg:
+    if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
             limits = {"damping": "0.01", "krylov_maximum_iterations": "32",
                       "krylov_maximum_operator_applications": "128", "krylov_maximum_seconds": "10",
@@ -581,6 +601,16 @@ def main():
         run("reject_unsupported_import_driver", parameter_file=exported, vmc=True,
             mutate=lambda tree: tree.find("qmc").set("method", "dmc"),
             reject="parameter_file supports only CPU batched VMC and WFTrain")
+        if args.md_orbital:
+            def one_active_spin(tree):
+                collection = tree.find("wavefunction/sposet_collection")
+                wrapper = collection.findall("rotated_sposet")[1]
+                spo = wrapper.find("sposet")
+                spo.set("name", wrapper.get("name"))
+                collection.remove(wrapper)
+                collection.append(spo)
+            run("reject_one_active_md_spin", mutate=one_active_spin,
+                reject="Optimizing the SPOSet of only only species is not supported!")
         if args.periodic_heg:
             for label, name, value in (("cell", "rs", "5.1"), ("cutoff", "LR_dim_cutoff", "7")):
                 def change_periodic_identity(tree, name=name, value=value):
@@ -601,6 +631,8 @@ def main():
             assert source.read_bytes() == original
         if args.periodic_heg:
             print("PASS: real Gamma HEG14 Adam/SR, 8 samples/update, actual Ewald identity and changed cell/cutoff rejection")
+        if args.md_orbital:
+            print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection")
         print("PASS: conventional model import physical VMC reference, fresh training/re-export/re-import, "
               "exact initialized split restart and malformed/unsupported import rejection")
         return
