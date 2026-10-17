@@ -4232,6 +4232,72 @@ TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
     for (std::size_t i = 0; i < accepted.size(); ++i) CHECK(accepted.data()[i] == original.data()[i]);
     for (std::size_t i = 0; i < inverse.size(); ++i) CHECK(inverse.data()[i] == det.getAcceptedInverseTranspose().data()[i]);
   }
+  // Map local active deltas after noncommuting history, not full-log coordinates.
+  {
+    auto owner = rotated.makeClone();
+    auto& accepted_rot = dynamic_cast<RotatedSPOs&>(*owner);
+    accepted_rot.isolateOptimizationState();
+    auto history = active;
+    history[0] = .17; accepted_rot.resetParametersExclusive(history);
+    history[1] = -.11; accepted_rot.resetParametersExclusive(history);
+    const auto full = accepted_rot.fullRotationCoordinates();
+    REQUIRE(full[5] != 0); // generated virtual/virtual component
+    auto& leaf = dynamic_cast<LCAOrbitalSet&>(*accepted_rot.Phi_);
+    const auto coefficients = *leaf.C, reference = leaf.originalRotationCoefficients();
+    auto fixed = accepted_rot.Phi_->makeClone();
+    dynamic_cast<LCAOrbitalSet&>(*fixed).isolateOptimizationState();
+    CHECK(dynamic_cast<LCAOrbitalSet&>(*fixed).C != leaf.C);
+    MultiDiracDeterminant block(std::move(fixed), false, 0, 2);
+    std::vector<ci_configuration2> configurations(4);
+    configurations[0].occup = {0, 1}; configurations[1].occup = {0, 2};
+    configurations[2].occup = {1, 2}; configurations[3].occup = {2, 3};
+    std::vector<std::size_t> mapping;
+    block.createDetData(0, configurations, {0, 1, 2, 3}, mapping);
+    block.evaluateForWalkerMove(particles);
+    Matrix base(2, 4), laps(2, 4);
+    SPOSet::GradMatrix gradients(2, 4);
+    accepted_rot.evaluate_notranspose(particles, 0, 2, base, gradients, laps);
+    const auto denominator = determinant(base);
+    REQUIRE(std::abs(denominator) > 1e-8);
+    ParticleSet moved(particles); moved.R[0] = {.1, -.6, .9}; moved.update();
+    Vector ratios(4), generated(4);
+    for (int parameter = 0; parameter < 4; ++parameter)
+    {
+      const int p = parameter / 2, q = 2 + parameter % 2;
+      block.evaluateOrbitalGeneratorToAcceptedReference(moved, 0, 0, p, q, ratios, generated);
+      const auto dense = [&](double delta) {
+        auto probe = accepted_rot.makeClone();
+        auto& rotation = dynamic_cast<RotatedSPOs&>(*probe);
+        rotation.isolateOptimizationState(); // fresh bank/frame for EACH +/- probe
+        auto point = history; point[parameter] += delta; rotation.resetParametersExclusive(point);
+        Matrix values(2, 4);
+        rotation.evaluate_notranspose(moved, 0, 2, values, gradients, laps);
+        std::array<QMCTraits::ValueType, 4> result;
+        for (int term = 0; term < 4; ++term)
+        {
+          const auto& occ = block.getConfiguration(term).occup;
+          result[term] = (values(0, occ[0]) * values(1, occ[1]) -
+                          values(0, occ[1]) * values(1, occ[0])) / denominator;
+        }
+        return result;
+      };
+      const auto plus = dense(1e-5), minus = dense(-1e-5), zero = dense(0);
+      for (int term = 0; term < 4; ++term)
+      {
+        CHECK(std::real(ratios[term]) == Catch::Approx(std::real(zero[term])).margin(2e-12));
+        CHECK(std::real(generated[term]) == Catch::Approx(std::real((plus[term] - minus[term]) / 2e-5)).epsilon(3e-6).margin(3e-8));
+      }
+    }
+    CHECK(accepted_rot.fullRotationCoordinates() == full);
+    optimize::VariableSet after; accepted_rot.checkInVariablesExclusive(after);
+    for (int i = 0; i < 4; ++i) CHECK(after[i] == history[i]);
+    for (std::size_t i = 0; i < coefficients.size(); ++i)
+    { CHECK(leaf.C->data()[i] == coefficients.data()[i]); CHECK(leaf.originalRotationCoefficients().data()[i] == reference.data()[i]); }
+    MultiDiracDeterminant rejected(accepted_rot.makeClone(), false, 0, 2);
+    rejected.createDetData(0, configurations, {0, 1, 2, 3}, mapping); rejected.evaluateForWalkerMove(particles);
+    REQUIRE(rejected.getPhi()->isOptimizable());
+    CHECK_THROWS_AS(rejected.evaluateOrbitalGeneratorToAcceptedReference(moved, 0, 0, 0, 2, ratios, generated), std::invalid_argument);
+  }
   // Binary-exact, signed nonsymmetric reference makes orientation errors visible.
   Matrix accepted(2, 4), inverse(2, 2);
   const double entries[]{1, 2, 3, 5, 0, -2, 7, 11};
