@@ -322,7 +322,10 @@ def main():
         if ci_workflow:
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
-            assert float(expansion[0].get("coeff")) != 0 and float(expansion[1].get("coeff")) == 0
+            assert float(expansion[0].get("coeff")) != 0
+            assert (md_ecp and args.mdj_pii) or float(expansion[1].get("coeff")) == 0
+            if md_ecp:
+                assert args.mdj_pii, "the bounded ECP coefficient-family native profile is DETS/J2"
             assert tree.find(".//rotated_sposet") is None
             if pure_ci:
                 for node in tree.findall("wavefunction/jastrow/correlation/coefficients"):
@@ -487,11 +490,11 @@ def main():
                     assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
-                    if csf_ecp:
+                    if csf_ecp or (md_ecp and args.mdj_pii):
                         assert parameters.size == 5 and len(linear_nodes) == 2, model
                         active_indices = np.asarray(group["active_indices"][()]).reshape(-1)
                         ci_index = int(active_indices[names.index(linear_nodes[1].get("id"))])
-                        assert ci_index >= 0 and parameters[ci_index] != previous[ci_index], (model, "CSF did not update")
+                        assert ci_index >= 0 and parameters[ci_index] != previous[ci_index], (model, "CI/CSF did not update")
                         assert not np.array_equal(np.delete(parameters, ci_index), np.delete(previous, ci_index)), \
                             (model, "J2 did not update")
                 elif restart is None:
@@ -672,11 +675,17 @@ def main():
             print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
         elif mixed_ci:
             run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
+            if md_ecp:
+                run("reject_pure_ci_ecp_lm", optimizer="lm", mutate=lambda tree: tree.find(
+                    "wavefunction/jastrow/correlation/coefficients").set("optimize", "no"),
+                    reject="Conventional LM/ALM coefficient-family qualification requires all-electron Hamiltonians")
             if args.mdj_pii:
                 run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
                     reject="mixed updates remain unqualified")
             representation = "nontrivial CSF/J2" if args.csf_j2_pii else "DETS/J2"
-            print(f"PASS: mixed {representation} PII/minPII updates, fixed reference/SPO/expansion, exact exported inference/restart; mixed LM rejected")
+            physics = "ordinary-locality ECP" if md_ecp else "all-electron"
+            print(f"PASS: mixed {representation} {physics} PII/minPII updates, fixed reference/SPO/expansion, "
+                  "exact exported inference/restart; mixed LM rejected")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
