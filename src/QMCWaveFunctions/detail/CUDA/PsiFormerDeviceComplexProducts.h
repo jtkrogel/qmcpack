@@ -14,7 +14,11 @@ namespace qmcplusplus::psiformer::device
 enum class ComplexProductsHostOutput { RETAINED, CHUNKED };
 
 /// One domain-neutral virtual move, supplied by an immutable caller-owned accessor.
-struct ComplexVirtualReplacement { std::size_t electron; std::array<double, 3> xyz; };
+struct ComplexVirtualReplacement
+{
+  std::size_t electron;
+  std::array<double, 3> xyz;
+};
 
 /// Complete numerical ownership, excluding shared immutable image/vendor/caller inputs.
 struct ComplexProductsCost
@@ -275,8 +279,8 @@ private:
       return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
     };
     for (double value : base_positions)
-        if (!device_math::isFiniteBinary64(value))
-          throw std::invalid_argument("Complex nonlocal nonfinite coordinate");
+      if (!device_math::isFiniteBinary64(value))
+        throw std::invalid_argument("Complex nonlocal nonfinite coordinate");
     for (std::size_t point = 0; point < q; ++point)
     {
       if (references[point] >= b)
@@ -327,7 +331,7 @@ private:
       const auto weighted = coefficients[references[point]] *
           (hermitian ? std::conj(complete_weights[point]) : complete_weights[point]);
       load_virtual(point);
-      accumulateNonlocalScore(positions_.data(), weighted, hermitian, energy_channel);
+      accumulateLoadedNonlocalScore(weighted, hermitian, energy_channel);
     }
     // Evaluate even zero-weight references/virtuals: undefined node scores are not zero.
     for (std::size_t sample = 0; sample < b; ++sample)
@@ -767,10 +771,9 @@ private:
     }
   }
 
-  /// Accumulate one admitted B1 score with the same TRANSPOSE/HERMITIAN algebra as ordinary products.
-  void accumulateNonlocalScore(const double* positions, Complex coefficient, bool hermitian, std::size_t channel = 0)
+  /// Accumulate the loaded B1 scratch score with ordinary TRANSPOSE/HERMITIAN algebra.
+  void accumulateLoadedNonlocalScore(Complex coefficient, bool hermitian, std::size_t channel = 0)
   {
-    std::copy_n(positions, positions_.size(), positions_.data());
     score_->evaluate(positions_);
     const auto score = score_->resultView();
     if (score.image != image_.get() || score.count != cost_.parameters)
