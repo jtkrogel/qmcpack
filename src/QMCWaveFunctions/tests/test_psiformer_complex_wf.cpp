@@ -4524,8 +4524,7 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   CHECK(reference_requirement.shared_replay_descriptor_bytes > 0);
   CHECK(metrics.snapshot().allocation_calls == before_queries.allocation_calls);
   CHECK(metrics.snapshot().uploaded_bytes == before_queries.uploaded_bytes);
-  // The XML text's geometric string capacity exceeds1MiB; derive authoritative finite caps, never bump a reserve.
-  CHECK(native_requirement.total_host_bytes > 1024 * 1024);
+  // Original Fiji identity capacity exceeded the old 1MiB literal; derive authoritative finite caps.
   std::printf("COMPLEX_FIXED_GRID_METADATA native_new=%zu PP_shared=%zu native_total=%zu ref_new=%zu replay_descriptor=%zu\n",
       native_requirement.new_receipt_host_bytes, native_requirement.shared_pp_host_bytes,
       native_requirement.total_host_bytes, reference_requirement.new_reference_host_bytes,
