@@ -246,7 +246,10 @@ def main():
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow else None
+    fixture_tree = ET.parse(fixture)
+    md_ecp = (fixture_tree.find("wavefunction/determinantset/multideterminant") is not None and
+              fixture_tree.find("hamiltonian/pairpot/pseudo") is not None)
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow or md_ecp else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")
@@ -913,6 +916,15 @@ def main():
         assert lhs.keys() == rhs.keys()
         for name in lhs:
             np.testing.assert_array_equal(lhs[name], rhs[name], err_msg=f"restart model: {name}")
+        if md_ecp:
+            final_bundle = final.parent / (final.name[:-len(".parameters.h5")] + ".checkpoint")
+            restored_bundle = restored.parent / (restored.name[:-len(".parameters.h5")] + ".checkpoint")
+            for pattern in ("*.state.h5", "*.rank_*.h5"):
+                compare_archives(final_bundle, restored_bundle, pattern)
+            expected, actual = history(adam)[-1], history(resumed)[0]
+            assert expected.keys() == actual.keys()
+            ignored = {"sampling_seconds", "total_seconds", "resident_bytes"}
+            assert all(expected[key] == actual[key] for key in expected if key not in ignored)
     if args.preflight:
         run("reject_kfac", optimizer="kfac", reject="no affine observations required by KFAC")
         run("reject_zero_cap", reject="legacy_maximum_parameters must be positive", mutate=lambda tree: setattr(

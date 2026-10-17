@@ -2475,6 +2475,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   auto& live_msd = wf->findMSD().front().get();
   live_msd.isolateOptimizationState();
   live_msd.enableAcceptedReferenceVirtualRatios();
+  p.update(); // J2 construction added its AA distance table after the ion table.
   wf->evaluateLog(p);
   const auto live_log = wf->getLogPsi();
   const auto live_energy = kineticEnergy(p);
