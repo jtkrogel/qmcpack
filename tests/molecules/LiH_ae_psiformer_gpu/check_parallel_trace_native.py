@@ -20,13 +20,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('app', 'model', 'output'):
         parser.add_argument('--' + name, required=True, type=Path)
+    parser.add_argument('--walkers', type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
     args.app, args.model = args.app.resolve(), args.model.resolve()
     assert sha(args.model) == '12f7fcedfbdad544d2f7a2b4e5e4fac6b405ef0f04b88100ccc8c394d0f76321'
     fixture = Path(__file__).with_name('input.xml')
     protected = {str(path): sha(path) for path in (args.model, fixture)}
     args.output.mkdir(parents=True, exist_ok=False)
-    report = dict(status='FAIL', app_sha256=sha(args.app), protected=protected, cases={}, benchmark=False)
+    report = dict(status='FAIL', app_sha256=sha(args.app), protected=protected, cases={}, benchmark=False, walkers=args.walkers)
     deadline, active = time.monotonic() + 120, None
 
     def stop(signum=None, frame=None):
@@ -43,13 +44,13 @@ def main():
     previous = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGINT)}
 
     def run(label, iterations, targets=1, parallel=True, restart=None):
-        """Prepare exactly one walker/crowd; inference and derivative owners remain distinct."""
+        """Prepare one crowd with the requested walkers; inference and derivative owners stay distinct."""
         directory = args.output / label
         directory.mkdir()
         render(ET.parse(fixture), args.model, directory / 'input.xml', iterations, restart)
         tree = ET.parse(directory / 'input.xml')
         qmc = tree.find('qmc')
-        qmc.find("parameter[@name='walkers_per_rank']").text = '1'
+        qmc.find("parameter[@name='walkers_per_rank']").text = str(args.walkers)
         inference = ET.SubElement(qmc, 'inference', interval='1', last='yes', move='alle')
         for node in qmc.findall('parameter'):
             ET.SubElement(inference, 'parameter', name=node.get('name')).text = node.text
@@ -73,10 +74,15 @@ def main():
                 assert active.wait(timeout=remaining) == 0, directory
             finally:
                 stop()
-        assert 'numerical device tile completed: backend=cuda' in (directory / 'console.log').read_text()
+        console = (directory / 'console.log').read_text()
+        assert 'numerical device tile completed: backend=cuda' in console
+        if parallel and args.walkers == 2:
+            assert any('operation=VGL_parallel_actual_owner,' in line and ' B=2,' in line for line in console.splitlines())
+            assert 'parallel VGL tile completed: configurations=2, capacity=2' in console
         rows = list(csv.DictReader(next(directory.glob('*.training_info.csv')).open()))
         assert [int(r['iteration']) for r in rows] == list(range(1 if restart else 0, iterations))
-        assert all(r['committed'] == '1' and int(r['parameter_version']) == int(r['iteration']) + 1 and
+        assert all(r['committed'] == '1' and int(r['samples']) == args.walkers and
+            int(r['parameter_version']) == int(r['iteration']) + 1 and
             float(r['gradient_norm']) > 0 and all(math.isfinite(float(r[k])) for k in
             ('mean_energy', 'variance', 'gradient_norm')) for r in rows)
         scalars = sorted(directory.glob('*.inference/*.scalar.dat'))
@@ -89,7 +95,7 @@ def main():
             values, = [line.split() for line in lines if line.strip() and not line.startswith('#')]
             assert len(values) == len(header), path
             row = {k: float(v) for k, v in zip(header, values) if k != 'BlockCPU'}
-            assert row['BlockWeight'] == 1 and all(map(math.isfinite, row.values()))
+            assert row['BlockWeight'] == args.walkers and all(map(math.isfinite, row.values()))
             physical.append(row)
         latest, = directory.glob('*.last_checkpoint.h5')
         record = [fields(path) for path in envelopes(latest)]
@@ -118,7 +124,7 @@ def main():
         assert saved == {p: sha(Path(p)) for p in saved}
         assert protected == {p: sha(Path(p)) for p in protected}
         report.update(status='PASS', exact_parallel_restart=True, rtol=2e-10, atol=2e-11,
-                      scope='real/open FP64 B1 crowd1; no warm-allocation or throughput claim')
+                      scope=f'real/open FP64 B{args.walkers} crowd1; no warm-allocation or throughput claim')
     finally:
         stop()
         (args.output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')

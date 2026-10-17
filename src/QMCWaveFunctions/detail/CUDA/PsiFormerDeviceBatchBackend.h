@@ -181,6 +181,13 @@ public:
     }
     if (numerical_tiles_.fetch_add(1, std::memory_order_relaxed) == 0 && first_dispatch_reporter_)
       first_dispatch_reporter_();
+    // Distinguish a completed batched request from capacity-only preparation, once per exclusive Context.
+    if (preparation_.vgl.parallel_trace_workspace_budget_bytes && spatial && size > 1 && !context->parallel_batch_reported)
+    {
+      std::clog << "PsiFormer parallel VGL tile completed: configurations=" << size
+                << ", capacity=" << context->capacity << std::endl;
+      context->parallel_batch_reported = true;
+    }
     if (mixed_parameters_ && (!mixed_reported_.exchange(true, std::memory_order_relaxed) ||
                              context->hooks.mixedRetries() != previous_mixed_retries))
       std::clog << "PsiFormer explicit mixed inference completed: mixed_batches=" << context->hooks.mixedBatches()
@@ -533,6 +540,7 @@ private:
     std::size_t sampler_version = 0;
     std::vector<double> positions;
     std::size_t coordinate_generation = 0;
+    bool parallel_batch_reported = false;
   };
 
   /// Reject absent images before model provenance construction.
