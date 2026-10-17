@@ -238,6 +238,12 @@ try:
             assert all(int(entry[2]) == int(receipts[iteration][1]) and int(entry[3]) == int(receipts[iteration][2])
                        and math.isfinite(float(entry[5])) and math.isfinite(float(entry[6])) for entry in observed)
             assert [int(entry[4]) for entry in observed] == [int(receipts[iteration][2]) + 1 + i // 2 for i in range(14)]
+            initial = np.asarray([[float(entry[5]), float(entry[6])] for entry in observed[:2]])
+            repeated = np.asarray([[float(entry[5]), float(entry[6])] for entry in observed[2:4]])
+            # Same source aliases/grid must reproduce the native training objective, not merely finite trials.
+            np.testing.assert_allclose(repeated, initial, rtol=3e-9, atol=3e-9)
+            np.testing.assert_allclose([candidates[0][1], float(row["mean_energy"])], initial[:, 0].mean(),
+                                       rtol=3e-9, atol=3e-9)
             with h5py.File(states[iteration]) as archive:
                 group = archive["wftrain_checkpoint"]
                 np.testing.assert_array_equal(group["model/values"][()], values[iteration])
@@ -264,7 +270,7 @@ try:
             imported_model_sha256=protected[str(imported_model_path)],
             fresh_initialization=True,
             first_update_changed_values=changed_from_import,
-        scope="fresh_version0_current_Hamiltonian_not_sampler_or_PP_provenance_restart",
+            scope="fresh_version0_current_Hamiltonian_not_sampler_or_PP_provenance_restart",
         )
     assert all(sha(Path(path)) == digest for path, digest in protected.items())
     rss = re.search(
