@@ -836,7 +836,10 @@ def main():
                 def change_periodic_identity(tree, name=name, value=value):
                     tree.find(f".//simulationcell/parameter[@name='{name}']").text = value
                 run(f"reject_changed_{label}_import", parameter_file=exported, vmc=True,
-                    mutate=change_periodic_identity, reject="Conventional model export identity mismatch")
+                    mutate=change_periodic_identity,
+                    reject=("Conventional model export identity mismatch",
+                            "Conventional artifact has an invalid or oversized required field: model_identity")
+                           if args.complex_periodic_heg else "Conventional model export identity mismatch")
                 run(f"reject_changed_{label}_restart", restart=adam / "sj.s000.last_checkpoint.h5", iterations=3,
                     mutate=change_periodic_identity,
                     reject="Training checkpoint stage identity or configuration mismatch")
