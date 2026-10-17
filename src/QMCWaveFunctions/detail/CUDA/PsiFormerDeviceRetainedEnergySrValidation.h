@@ -336,6 +336,164 @@ inline void validateRetainedEnergySr(pf::PsiFormer& model, const PsiFormerExecut
       cost.device_bytes, cost.host_bytes, 8 * p); });
   require(device_backend->currentImage()->version() == stopped_version, "Failed DEVICE SR published a model");
   model.p.set_flat_values(original_parameters);
+  // Numerical-only complete ECP C3 -> retained PCG. Component/native guards are untouched.
+  {
+    constexpr std::size_t samples = 2, knots = 9;
+    const std::vector<double> w{1, 2}, e{-2.3, -1.9};
+    const double total = 3, mean = (w[0] * e[0] + w[1] * e[1]) / total;
+    auto values = original_parameters;
+    auto ecp_backend = std::make_shared<PreparedDeviceBatchBackend>(caller_image->makeUpdatedImage(values, first_version));
+    auto ecp_session = ecp_backend->prepareProductSession(ProductSessionProfile::SCORE_AND_KINETIC, 4);
+    ecp_session->prepareScoreContractions(3, first_version);
+    std::vector<double> accepted(samples * 3 * ne);
+    for (std::size_t s = 0; s < samples; ++s)
+      std::copy_n(model.cfg.electrons.x.data() + s * 3 * ne, 3 * ne, accepted.data() + s * 3 * ne);
+    require(!std::equal(accepted.begin(), accepted.begin() + 3 * ne, accepted.begin() + 3 * ne),
+        "ECP SR oracle requires two distinct accepted configurations");
+    const auto bytes = Owner::energyRequiredBytes(p, samples, ne, 3, frozen.size());
+    std::shared_ptr<Owner> owner = Owner::prepareRetainedEnergy(*ecp_session, accepted, w, frozen, first_version,
+        damping, bytes.device_bytes, bytes.host_bytes);
+    for (std::size_t step = 0; step < 2; ++step)
+    {
+      const auto version = first_version + step;
+      model.p.set_flat_values(values);
+      std::vector<double> score(samples * p), complete_t(p), rhs(p), delta(p), wanted(p), actual(p);
+      std::vector<double> virtual_positions(samples * knots * 3 * ne), complete_weights(samples * knots);
+      double squared = 0, dot = 0, gradient_norm = 0, nonzero_ecp = 0;
+      for (std::size_t s = 0; s < samples; ++s)
+      {
+        const auto* position = accepted.data() + s * 3 * ne;
+        score_workspace->setPositions(pf::GeometryPositionView::interleaved(position, ne));
+        const auto base = cpu_score.evaluate(*score_workspace);
+        require(base.sign != 0 && device_math::isFiniteBinary64(base.logabs), "ECP SR accepted node");
+        const double sign = base.sign, logabs = base.logabs;
+        std::copy_n(base.parameter_score.data, p, score.data() + s * p);
+        kinetic_workspace->setPositions(pf::GeometryPositionView::interleaved(position, ne));
+        const auto t = cpu_kinetic.evaluate(*kinetic_workspace, drift.data(), drift.size(), masses.data(), masses.size());
+        for (std::size_t i = 0; i < p; ++i)
+          complete_t[i] += w[s] * t.kinetic_parameter_response[i];
+        for (std::size_t q = 0; q < knots; ++q)
+        {
+          const auto moved = q < 5 ? 0 : 1; // Existing signed ragged5+4 grid, streamed without Q*P storage.
+          auto* point = virtual_positions.data() + (s * knots + q) * 3 * ne;
+          std::copy_n(position, 3 * ne, point);
+          point[3 * moved] += .003 * (q + 1); point[3 * moved + 1] -= .011; point[3 * moved + 2] += .007;
+          score_workspace->setPositions(pf::GeometryPositionView::interleaved(point, ne));
+          const auto displaced = cpu_score.evaluate(*score_workspace);
+          const double ratio = displaced.sign / sign * std::exp(displaced.logabs - logabs);
+          const double factor = (q % 2 ? -.13 : .21) / (q + 1) * ratio;
+          require(device_math::isFiniteBinary64(factor), "ECP SR complete ratio/weight is nonfinite");
+          complete_weights[s * knots + q] = factor;
+          for (std::size_t i = 0; i < p; ++i)
+          {
+            const double contribution = w[s] * factor * (displaced.parameter_score[i] - score[s * p + i]);
+            complete_t[i] += contribution;
+            nonzero_ecp = std::max(nonzero_ecp, std::abs(contribution));
+          }
+        }
+      }
+      require(nonzero_ecp > 0, "ECP SR test silently lost the nonlocal contribution");
+      // Independent two-configuration covariance and Sherman-Morrison solve, not GPU PCG replay.
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        const double g = 2 / total * (complete_t[i] + w[0] * (e[0] - mean) * score[i] +
+            w[1] * (e[1] - mean) * score[p + i]);
+        gradient_norm = std::hypot(gradient_norm, g);
+        const bool active = i >= 2 && i + 1 != p;
+        rhs[i] = active ? g : 0; delta[i] = active ? score[i] - score[p + i] : 0;
+        squared += delta[i] * delta[i]; dot += delta[i] * rhs[i];
+      }
+      const double a = w[0] * w[1] / (total * total);
+      double displacement = 0;
+      for (std::size_t i = 0; i < p; ++i)
+      {
+        const double direction = rhs[i] / damping - a * delta[i] * dot / (damping * (damping + a * squared));
+        volatile double product = -learning_rate * direction;
+        wanted[i] = values[i] + product;
+        displacement = std::hypot(displacement, wanted[i] - values[i]);
+      }
+      const auto build_complete = [&](bool node = false) {
+        const auto generation = ecp_session->beginScoreContraction(3, version, ScoreContractionRole::ENERGY_T_EO_O);
+        try
+        {
+          for (std::size_t s = 0; s < samples; ++s)
+          {
+            const auto* position = accepted.data() + s * 3 * ne;
+            const std::complex<double> scores_c[]{0, w[s] * e[s], w[s]}, kinetic_c[]{w[s], 0, 0}, imaginary_c[3]{};
+            ecp_session->accumulateKineticContraction(position, drift.data(), imaginary.data(), masses.data(),
+                scores_c, kinetic_c, imaginary_c, 3, version);
+            double sum = 0;
+            for (std::size_t q = 0; q < knots; ++q)
+            {
+              const auto* point = virtual_positions.data() + (s * knots + q) * 3 * ne;
+              std::vector<double> zero_node;
+              if (node && s == 0 && q == 0)
+              {
+                zero_node.assign(point, point + 3 * ne);
+                std::copy_n(zero_node.data() + 3, 3, zero_node.data()); point = zero_node.data();
+              }
+              const double factor = node && s == 0 && q == 0 ? 0 : complete_weights[s * knots + q];
+              const std::complex<double> coefficient[]{w[s] * factor, 0, 0};
+              ecp_session->accumulateScoreContraction(point, coefficient, 3, version);
+              sum += factor;
+            }
+            const std::complex<double> reference[]{-w[s] * sum, 0, 0};
+            ecp_session->accumulateScoreContraction(position, reference, 3, version);
+          }
+          ecp_session->finishScoreContraction(version); // ONE finite admission after complete T+ECP.
+          return generation;
+        }
+        catch (...) { ecp_session->abortScoreContraction(); throw; }
+      };
+      if (step == 0) fails([&] { build_complete(true); }); // Zero weight does not excuse a nodal score.
+      auto generation = build_complete();
+      auto ordinary = Owner::prepareEnergy(*ecp_session, accepted, w, frozen, version, damping,
+          bytes.device_bytes, bytes.host_bytes);
+      const auto host_before = ecp_session->transferSnapshot();
+      const auto host = ordinary->consumeEnergy(version, generation, values, total, mean, learning_rate, control, actual);
+      const auto host_after = ecp_session->transferSnapshot();
+      require(host.candidate_ready && host.solve.converged, "ECP SR low-level HOST oracle did not converge");
+      for (std::size_t i = 0; i < p; ++i) near(actual[i], wanted[i]);
+      ordinary.reset();
+      const auto propose = [&] {
+        return owner->consumeRetainedEnergyDevice(owner, accepted, w, frozen, version, build_complete(),
+            total, mean, damping, learning_rate, control, bytes.device_bytes, bytes.host_bytes, 8 * p);
+      };
+      { auto discarded = propose(); owner->rejectDeviceCandidate(); }
+      generation = build_complete();
+      const auto warm_before = ecp_session->transferSnapshot();
+      auto proposal = owner->consumeRetainedEnergyDevice(owner, accepted, w, frozen, version, generation,
+          total, mean, damping, learning_rate, control, bytes.device_bytes, bytes.host_bytes, 8 * p);
+      const auto warm_after = ecp_session->transferSnapshot();
+      require(proposal.result.solve.converged && proposal.result.solve.iterations == host.solve.iterations &&
+          proposal.result.solve.operator_applications == host.solve.operator_applications &&
+          warm_after.live_bytes == warm_before.live_bytes + 8 * p &&
+          warm_after.allocation_calls == warm_before.allocation_calls + 1, "ECP SR snapshot ownership/solve changed");
+      require(warm_after.uploaded_bytes - warm_before.uploaded_bytes == host_after.uploaded_bytes - host_before.uploaded_bytes - 8 * p &&
+          warm_after.downloaded_bytes - warm_before.downloaded_bytes == host_after.downloaded_bytes - host_before.downloaded_bytes - 8 * p +
+              64 * (p / 4096 + (p % 4096 != 0)) + 24, "ECP SR DEVICE added a HOST P payload");
+      near(proposal.result.gradient_norm, gradient_norm); near(proposal.displacement_norm, displacement);
+      auto source = ecp_backend->currentImage();
+      auto successor = source->makeSharedUpdatedImage(*proposal.snapshot);
+      owner->validateDeviceAcceptance(*proposal.snapshot, successor);
+      {
+        PreparedDeviceBatchBackend::PreparedDevicePublication publication(ecp_backend, source, successor);
+        const auto before_commit = ecp_session->transferSnapshot();
+        publication.commit(); owner->acceptPreparedDeviceCandidate(*proposal.snapshot, successor);
+        const auto after_commit = ecp_session->transferSnapshot();
+        require(after_commit.allocation_calls == before_commit.allocation_calls && after_commit.free_calls == before_commit.free_calls &&
+            after_commit.uploaded_bytes == before_commit.uploaded_bytes && after_commit.downloaded_bytes == before_commit.downloaded_bytes &&
+            after_commit.device_copied_bytes == before_commit.device_copied_bytes, "ECP SR commit used numerical runtime");
+        publication.unlock();
+      }
+      successor->downloadCanonical(actual); // Explicit cold full-P oracle, not warm traffic.
+      for (std::size_t i = 0; i < p; ++i) near(actual[i], wanted[i]);
+      require(actual[0] == values[0] && actual[1] == values[1] && actual.back() == values.back(), "ECP SR changed frozen bits");
+      values = actual;
+    }
+    model.p.set_flat_values(original_parameters);
+    std::cout << "PASS numerical ECP DEVICE SR two_updates=2 samples=2 Q=18 CPU_rank_one=1 HOST_oracle=1 zero_weight_node_retry=1 component_driver_guards_unchanged=1\n";
+  }
   std::cout << "PASS DEVICE retained ENERGY SR three_updates=3 immutable_shared_successor=1 public_authority=0 raw_square_displacement_domain=1\n";
   std::cout << "PASS retained numerical ENERGY SR cold_device_allocations=15 two_successor_steps=2 weak_old_image_expired=1"
             << " max_ordinary_candidate=" << max_candidate << " aggregate_publication_peak_unchanged=0 production_bound=0\n";
