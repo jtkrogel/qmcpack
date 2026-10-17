@@ -38,9 +38,23 @@ def main():
     report = {"workdir": str(root), "executable": str(executable), "app_sha256": digest(executable),
               "fixture_sha256": digest(fixture), "scope": "CPU complex fixed-gauge FreeOrbital orbital-MSE only"}
     print(f"Evidence: {root}", flush=True)
+    active = None
+
+    def interrupted(signum, frame):
+        """Do not leave an owned native child behind when the checker is stopped."""
+        if active is not None and active.poll() is None:
+            try:
+                os.killpg(active.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            active.wait()
+        raise SystemExit(f"checker interrupted by signal {signum}")
+
+    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGTERM, signal.SIGINT)}
 
     def run(label, iterations=2, restart=None, mutate=None, rejection=None):
         """Run once inside the aggregate deadline and retain the first failure."""
+        nonlocal active
         directory = root / label
         directory.mkdir()
         tree = ET.parse(fixture)
@@ -57,6 +71,7 @@ def main():
         with (directory / "console.log").open("w") as output:
             process = subprocess.Popen([str(executable), "run.xml"], cwd=directory, env=env,
                                        stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            active = process
             try:
                 code = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
@@ -140,10 +155,12 @@ def main():
         assert protected == {str(path): digest(path) for path in split.rglob("*.h5")}
         report.update(status="PASS", committed_updates=2, samples_per_update=1,
                       exact_model_optimizer_sampler_restart=True, imaginary_head_changed=True)
-    except Exception as error:
+    except BaseException as error:
         report.update(status="FAIL", error=str(error))
         raise
     finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
         (root / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2), flush=True)
 
