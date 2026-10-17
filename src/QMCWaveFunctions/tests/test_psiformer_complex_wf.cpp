@@ -4448,6 +4448,14 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
   auto trial1 = trial.makeClone(p1);
   auto& gpu1 = dynamic_cast<PsiFormerComplexWF&>(*trial1->getOrbitals()[0]);
   QMCHamiltonian ham("paired_operator_observation");
+  // This manually constructed radial fixture owns its exact immutable input identity, like ECPotentialBuilder.
+  auto provenance = std::make_shared<QMCHamiltonian::ECPModelProvenance>();
+  std::ifstream pp_input(pp_path, std::ios::binary);
+  REQUIRE(pp_input.good());
+  provenance->scientific_definition = "ordinary_scalar_LiBFD_rule4:" +
+      std::string(std::istreambuf_iterator<char>(pp_input), std::istreambuf_iterator<char>());
+  provenance->ordinary_locality_vp = true;
+  ham.setECPModelProvenance(provenance);
   ham.addOperator(std::make_unique<BareKineticEnergy>(p), "Kinetic", true);
   ham.addOperator(std::move(nonlocal), "NonLocalECP", true);
   ham.addObservables(p);
@@ -4495,8 +4503,17 @@ TEST_CASE("PsiFormer paired captures an actual ordinary nonlocal traversal and c
       {schema.providerId(), schema.fingerprint(), 0, 19, 23, {coefficients.data(), 2}},
       localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
   ComplexStreamingSink replay_sink;
+  CHECK_THROWS(QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, 1));
+  CHECK(replay_sink.state() == DerivativeSinkState::IDLE);
   const auto actual = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
-      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink);
+      hamiltonians, trials, particles, *consumer, {&channel, 1}, replay_sink, 1024 * 1024);
+  REQUIRE(actual.native_capture);
+  CHECK(actual.native_capture->hostBytes() <= 1024 * 1024);
+  CHECK(actual.native_capture->scientificDefinition() == provenance->scientific_definition);
+  CHECK(actual.native_capture->gridFingerprint() == actual.grid_fingerprint);
+  for (std::size_t b = 0; b < 2; ++b)
+    CHECK(actual.native_capture->reportedPotentials()[b] == hamiltonians[b].getLocalPotential());
   CHECK(replay_sink.state() == DerivativeSinkState::IDLE);
   auto replay = consumer->releaseJVPReplay();
   CHECK_THROWS(consumer->releaseJVPReplay());

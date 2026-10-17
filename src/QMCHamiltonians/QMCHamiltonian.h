@@ -84,6 +84,7 @@ public:
   {
     std::vector<FullPrecRealType> local_energies;
     std::uint64_t grid_fingerprint = 0;
+    std::shared_ptr<const wftrain::NonLocalECPNativeCapture> native_capture;
   };
   enum
   {
@@ -288,7 +289,8 @@ public:
       const RefVectorWithLeader<ParticleSet>& p_list,
       wftrain::NonLocalECPDerivativeConsumer& consumer,
       wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
-      wftrain::ParameterReductionSink& sink);
+      wftrain::ParameterReductionSink& sink,
+      std::size_t native_capture_host_cap = 0);
 
   /** evaluate Local energy with Toperators updated.
    * @param P ParticleSEt

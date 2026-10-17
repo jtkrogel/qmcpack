@@ -27,8 +27,36 @@
 #include <string>
 #include <string_view>
 
+namespace qmcplusplus { class QMCHamiltonian; }
+
 namespace qmcplusplus::wftrain
 {
+
+/// Native-only seal of one accepted ordinary-locality traversal, not caller-supplied potential data.
+class NonLocalECPNativeCapture
+{
+public:
+  /// Borrow the immutable scientific identity pinned by the native Hamiltonian.
+  std::string_view scientificDefinition() const noexcept { return scientific_definition_; }
+  /// Match this native result to the exact one-shot replay producer.
+  const std::shared_ptr<const void>& captureIdentity() const noexcept { return capture_identity_; }
+  /// Identify the completed grid and its per-sample REAL potential, including Re(nonlocal).
+  std::uint64_t gridFingerprint() const noexcept { return grid_; }
+  DerivativeArrayView<const double> reportedPotentials() const noexcept
+  { return {potentials_.data(), potentials_.size()}; }
+  /// Account newly retained receipt storage separately from the shared immutable PP owner.
+  std::size_t hostBytes() const noexcept
+  { return sizeof(*this) + potentials_.capacity() * sizeof(double) + shared_provenance_bytes_; }
+
+private:
+  friend class qmcplusplus::QMCHamiltonian;
+  NonLocalECPNativeCapture() = default;
+  std::shared_ptr<const void> provenance_owner_, capture_identity_;
+  std::string_view scientific_definition_;
+  std::vector<double> potentials_;
+  std::size_t shared_provenance_bytes_ = 0;
+  std::uint64_t grid_ = 0;
+};
 
 /// Identify the localization rule used to construct one live ECP traversal.
 enum class NonLocalECPLocalization
@@ -169,6 +197,9 @@ public:
   NonLocalECPDerivativeConsumer(const NonLocalECPDerivativeConsumer&) = delete;
   NonLocalECPDerivativeConsumer& operator=(const NonLocalECPDerivativeConsumer&) = delete;
   virtual ~NonLocalECPDerivativeConsumer() = default;
+
+  /// Optional one-shot replay identity; ordinary response consumers retain their existing empty contract.
+  virtual std::shared_ptr<const void> nativeCaptureIdentity() const noexcept { return {}; }
 
   /** Validate immutable identity and channel metadata before any grid draw.
    *

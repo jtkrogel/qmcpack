@@ -655,7 +655,8 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
     const RefVectorWithLeader<ParticleSet>& p_list,
     wftrain::NonLocalECPDerivativeConsumer& consumer,
     wftrain::DerivativeArrayView<const wftrain::VJPCoefficientChannel> channels,
-    wftrain::ParameterReductionSink& sink)
+    wftrain::ParameterReductionSink& sink,
+    std::size_t native_capture_host_cap)
 {
   if (wf_list.size() != ham_list.size() || p_list.size() != ham_list.size())
     throw std::invalid_argument(
@@ -671,6 +672,39 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
         "Streaming nonlocal-ECP Hamiltonian requires an idle response sink");
 
   auto& leader = ham_list.getLeader();
+  // Optional component-only receipt: admit all new storage and the shared PP identity before any grid draw.
+  std::shared_ptr<wftrain::NonLocalECPNativeCapture> native_capture;
+  if (native_capture_host_cap)
+  {
+    const auto& provenance = leader.ecpModelProvenance();
+    auto identity = consumer.nativeCaptureIdentity();
+    if (!provenance || provenance->scientific_definition.empty() || !provenance->ordinary_locality_vp || !identity)
+      throw std::invalid_argument("Native fixed-grid capture requires scientific PP provenance and a replay identity");
+    const auto add = [](std::size_t a, std::size_t b) {
+      if (b > std::numeric_limits<std::size_t>::max() - a)
+        throw std::overflow_error("Native fixed-grid capture HOST admission overflow");
+      return a + b;
+    };
+    std::size_t shared_bytes = add(sizeof(ECPModelProvenance), provenance->scientific_definition.capacity());
+    shared_bytes = add(shared_bytes, provenance->source_report.capacity());
+    shared_bytes = add(shared_bytes, 2); // Include both immutable string terminators.
+    std::size_t bytes = add(sizeof(wftrain::NonLocalECPNativeCapture), shared_bytes);
+    for (std::size_t b = 0; b < ham_list.size(); ++b) bytes = add(bytes, sizeof(double));
+    if (native_capture_host_cap == std::numeric_limits<std::size_t>::max() || bytes > native_capture_host_cap)
+      throw std::length_error("Native fixed-grid capture exceeds finite HOST admission before allocation");
+    for (const auto& h : ham_list)
+      if (!h.get().ecpModelProvenance() || !h.get().ecpModelProvenance()->ordinary_locality_vp ||
+          h.get().ecpModelProvenance()->scientific_definition != provenance->scientific_definition)
+        throw std::invalid_argument("Native fixed-grid capture clone PP scientific identity differs");
+    native_capture.reset(new wftrain::NonLocalECPNativeCapture);
+    native_capture->provenance_owner_ = provenance;
+    native_capture->scientific_definition_ = provenance->scientific_definition;
+    native_capture->capture_identity_ = std::move(identity);
+    native_capture->shared_provenance_bytes_ = shared_bytes;
+    native_capture->potentials_.resize(ham_list.size());
+    if (native_capture->hostBytes() > native_capture_host_cap)
+      throw std::length_error("Native fixed-grid capture actual capacity exceeds HOST admission");
+  }
   std::size_t nonlocal_index = leader.H.size();
   for (std::size_t operator_index = 0; operator_index < leader.H.size(); ++operator_index)
   {
@@ -740,8 +774,19 @@ QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
   {
     updateKinetic(ham_list[walker], p_list[walker]);
     result.local_energies[walker] = ham_list[walker].getLocalEnergy();
+    if (native_capture)
+    {
+      const auto potential = ham_list[walker].getLocalPotential();
+      if (!std::isfinite(potential)) throw std::overflow_error("Native fixed-grid capture potential is nonfinite");
+      native_capture->potentials_[walker] = potential;
+    }
   }
   result.grid_fingerprint = grid_fingerprint;
+  if (native_capture)
+  {
+    native_capture->grid_ = grid_fingerprint;
+    result.native_capture = std::move(native_capture);
+  }
   return result;
 }
 

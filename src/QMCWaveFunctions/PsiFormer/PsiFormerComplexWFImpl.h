@@ -332,6 +332,10 @@ struct PsiFormerComplexWF::Impl
 #ifdef ENABLE_CUDA
     psiformer::PsiFormerInferenceConcurrency inference_concurrency;
     std::shared_ptr<GpuLane> gpu;
+    // Only budgeted GPU isolation establishes this lineage; publication never changes its source generation.
+    std::weak_ptr<Model> private_origin;
+    std::weak_ptr<const psiformer::device::PreparedDeviceModel> private_origin_image;
+    std::size_t private_origin_version = 0;
 #endif
     mutable std::shared_mutex mutex;
     std::atomic<std::size_t> pending_proposals{0};
@@ -933,6 +937,7 @@ struct PsiFormerComplexWF::Impl
   struct GpuNonLocalReplay final : wftrain::NonLocalECPJVPReplay
   {
     const std::shared_ptr<Model> state;
+    const std::shared_ptr<const std::size_t> capture_identity = std::make_shared<const std::size_t>(0);
     const std::size_t version, ordinal, offset, samples;
     std::uint64_t grid = 0;
     std::vector<double> reference_positions;
@@ -992,6 +997,7 @@ struct PsiFormerComplexWF::Impl
       d.reference_position_bytes = pf::checkedStorageBytes<double>(reference_positions.capacity(), error);
       d.point_bytes = pf::checkedStorageBytes<wftrain::NonLocalECPReplayPoint>(point_records.capacity(), error);
       d.provenance_bytes = pf::checkedStorageBytes<wftrain::NonLocalECPReplaySegment>(segment_records.capacity(), error);
+      pf::addStorageBytes(d.provenance_bytes, sizeof(std::size_t), error);
       pf::addStorageBytes(d.provenance_bytes,
           pf::checkedStorageBytes<wftrain::NonLocalECPReplayTile>(tile_records.capacity(), error), error);
       pf::addStorageBytes(d.provenance_bytes,
@@ -1034,6 +1040,7 @@ struct PsiFormerComplexWF::Impl
       if (!samples || !electrons) throw std::invalid_argument("Complex ECP capture shape is empty");
       const auto stride = pf::checkedStorageProduct(3, electrons, error);
       std::size_t bytes = pf::checkedStorageBytes<double>(pf::checkedStorageProduct(samples, stride, error), error);
+      pf::addStorageBytes(bytes, sizeof(std::size_t), error);
       pf::addStorageBytes(bytes, pf::checkedStorageBytes<const ParticleSet*>(samples, error), error);
       for (auto size : {sizeof(wftrain::NonLocalECPReplayPoint), sizeof(wftrain::NonLocalECPReplaySegment),
           sizeof(wftrain::NonLocalECPReplayTile), sizeof(WaveFunctionComponent::EvaluationStamp)})
@@ -1069,7 +1076,11 @@ struct PsiFormerComplexWF::Impl
         throw std::length_error("Complex ECP actual capture capacities exceed admission");
     }
 
-    /// Every phase rechecks version, pending moves, fixed source and exact accepted references.
+    /// Share only a one-shot identity, never mutable replay storage, with the native traversal seal.
+    std::shared_ptr<const void> nativeCaptureIdentity() const noexcept override
+    { return record ? record->capture_identity : std::shared_ptr<const void>{}; }
+
+    /// Recheck the accepted family and geometry before reading any live tile.
     void requireCurrent() const
     {
       std::shared_lock read(lane->state->mutex);
@@ -2730,6 +2741,9 @@ void PsiFormerComplexWF::isolateBudgetedGpuParameterState(std::size_t device_cap
   auto state = std::make_shared<Impl::Model>(getName(),
       InitializedNativeModel{std::move(model), original->profile, original->seed},
       *impl_->particles, *original->source, original->reduced_twist, original->gpu_limit, original->system_kind, std::move(lane));
+  state->private_origin = original;
+  state->private_origin_image = image;
+  state->private_origin_version = version;
   auto independent = std::make_unique<Impl>(std::move(state), *impl_->particles, impl_->numeric_limit);
   {
     std::shared_lock read(original->mutex);
