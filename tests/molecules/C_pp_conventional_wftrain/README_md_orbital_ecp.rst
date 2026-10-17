@@ -75,3 +75,14 @@ the newer helper-only source is ``7dcbd12fa`` (checker SHA256
 One guarded exact-recipe CSF mode is registered with unchanged strict
 model-reuse/restart checks and no ULP exception. The separate independent
 physical gate passed 7,133 assertions; no other CSF layout is qualified here.
+
+The optional ``--joint-ci-orbital-ecp-alm`` prepares one ALM consumer of the
+same qualified joint-DETS P17 recipe. It retains the original seed, physics,
+frozen C0 and both complete frames; training W4/blocks8 gives 32 samples.
+Existing limits are damping .01, Krylov64/256/15s/rtol1e-6, augmented18,
+ALM inner32/restart10. The full/import/inference/initialized-split comparisons
+remain exact. A genuine initial untrusted-root refusal is negative only, with
+no update/export/restart claim; no seed, shift or tolerance tuning is allowed.
+A same-recipe fixed-CI optimize=no negative must reach the capability guard.
+This mode awaits separate driver admission and native qualification; physical
+round123 supplies dense actions/local mixed retraction, not a converged ALM root.

@@ -280,6 +280,8 @@ def main():
                         help="derive joint P17 CI1/orbital/J2 ECP Adam from the fixed-CI XML")
     parser.add_argument("--joint-ci-orbital-ecp-minpii", action="store_true",
                         help="same joint P17 round trip with minPII only; strict initialized restart")
+    parser.add_argument("--joint-ci-orbital-ecp-alm", action="store_true",
+                        help="same joint P17 ALM round trip or honest initial untrusted-root refusal")
     parser.add_argument("--unequal-spin-orbital-ecp", action="store_true",
                         help="derive one charged C^- 3up/2down joint P16 orbital ECP case")
     parser.add_argument("--csf-orbital-ecp", action="store_true",
@@ -355,6 +357,11 @@ def main():
         if any((args.joint_ci_orbital_ecp, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
                 args.csf_orbital_ecp)) or args.ci_representation != "dets":
             parser.error("--joint-ci-orbital-ecp-minpii selects its own equal-spin DETS recipe")
+        args.joint_ci_orbital_ecp = True
+    if args.joint_ci_orbital_ecp_alm:
+        if any((args.joint_ci_orbital_ecp, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
+                args.csf_orbital_ecp, args.mdj_alm)) or args.ci_representation != "dets":
+            parser.error("--joint-ci-orbital-ecp-alm selects its own equal-spin DETS recipe")
         args.joint_ci_orbital_ecp = True
     if args.external_orbital_ecp:
         if args.external_lcao:
@@ -539,10 +546,10 @@ def main():
         directory = work / label
         directory.mkdir()
         if optimizer is None:
-            optimizer = "alm" if args.mdj_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
+            optimizer = "alm" if args.mdj_alm or args.joint_ci_orbital_ecp_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam"
         if args.sj_reference_line_search:
             require_committed = False
-        if args.mdj_alm:
+        if args.mdj_alm or args.joint_ci_orbital_ecp_alm:
             samples_per_rank = 32
         if periodic_profile:
             samples_per_rank = 8
@@ -681,13 +688,14 @@ def main():
             for name, value in (("line_search_maximum_weight", "0.5"),
                                 ("line_search_minimum_ess_fraction", "0.5"), ("line_search_confidence", "2")):
                 ET.SubElement(training, "parameter", name=name).text = value
-        if args.mdj_alm:
-            # Each profile uses its complete augmented subspace: Be P5 or H4 P9.
+        if args.mdj_alm or args.joint_ci_orbital_ecp_alm:
+            # Complete augmented subspace: Be P5, H4 P9 or joint-orbital P17.
             qmc.find("parameter[@name='walkers_per_rank']").text = "4"
             qmc.find("parameter[@name='blocks']").text = "8"
             limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
                       "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
-                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension": "6" if args.mdj_ecp_alm else "10"}
+                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension":
+                      "18" if args.joint_ci_orbital_ecp_alm else "6" if args.mdj_ecp_alm else "10"}
             if optimizer == "alm":
                 limits.update(lm_inner_iterations="32", lm_inner_restart_length="10")
             for name, value in limits.items():
@@ -733,7 +741,7 @@ def main():
                 assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
         tree.write(directory / "run.xml")
         result, text = launch(directory)
-        if args.mdj_ecp_alm and label == "alm" and result.returncode != 0 and \
+        if (args.mdj_ecp_alm or args.joint_ci_orbital_ecp_alm) and label == "alm" and result.returncode != 0 and \
                 "Live LM solve failed: untrusted_root" in text:
             # A nonphysical sampled root is a protected refusal, never a tuned positive.
             csv_file = directory / "sj.s000.training_info.csv"
@@ -741,10 +749,11 @@ def main():
             assert not list(directory.rglob("*.h5")), directory
             assert "WFTrain refreshed parameter version" not in text and "WFTrain iteration 0 version" not in text
             definition = ET.parse(directory / "run.xml")
-            assert [node.get("coeff") for node in definition.findall(".//detlist/ci")] == ["0.6", "0.05"]
+            assert [node.get("coeff") for node in definition.findall(".//detlist/ci")] == \
+                [node.get("coeff") for node in fixture_tree.findall(".//detlist/ci")]
             assert ET.tostring(definition.find("wavefunction/sposet_collection")) == \
                 ET.tostring(fixture_tree.find("wavefunction/sposet_collection"))
-            print("EXPECTED REFUSAL: Be mixed DETS/J2 ALM untrusted root before update/publication; "
+            print("EXPECTED REFUSAL: selected mixed DETS/J2 or joint-orbital ALM untrusted root before update/publication; "
                   "no positive inference/import/restart qualification", flush=True)
             raise SystemExit(0)
         if reject:
@@ -818,7 +827,7 @@ def main():
             if args.joint_ci_orbital_ecp_minpii:
                 assert 0 < int(row["krylov_operator_applications"]) <= 256, row
                 assert 0 <= int(row["krylov_iterations"]) <= 64, row
-            if args.mdj_alm:
+            if args.mdj_alm or args.joint_ci_orbital_ecp_alm:
                 assert row["optimizer"] == "alm" and 0 < int(row["krylov_operator_applications"]) <= 256, row
             assert int(row["parameter_version"]) == int(row["sample_version"]) + int(row["committed"]), row
         assert (directory / "sj.s000.last_checkpoint.h5").is_file(), directory
@@ -1199,7 +1208,7 @@ def main():
         print("PASS: bounded momentum_sgd/rmsprop/amsgrad/sr/minsr/spring SJ updates and inference")
         return
 
-    adam = run("alm" if args.mdj_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
+    adam = run("alm" if args.mdj_alm or args.joint_ci_orbital_ecp_alm else "minpii" if args.joint_ci_orbital_ecp_minpii else "adam",
                samples_per_rank=32 if args.old_new else 4, inference=not args.old_new)
     if args.periodic_heg or args.md_orbital:
         def sr_controls(tree):
@@ -1457,9 +1466,11 @@ def main():
             print("PASS: real CPU charged C^- 3up/2down joint CI1/orbital/J2 ECP P16, "
                   "five/six-pair frames, frozen C0/original XML and strict exact initialized restart")
         elif args.joint_ci_orbital_ecp:
-            if args.joint_ci_orbital_ecp_minpii:
-                run("reject_joint_orbital_ecp_lm", optimizer="lm", reject="mixed updates remain unqualified")
-            method = "minPII" if args.joint_ci_orbital_ecp_minpii else "Adam"
+            if args.joint_ci_orbital_ecp_alm:
+                run("reject_fixed_ci_orbital_alm", optimizer="alm",
+                    mutate=lambda tree: tree.find(".//multideterminant").set("optimize", "no"),
+                    reject="mixed updates remain unqualified")
+            method = "ALM" if args.joint_ci_orbital_ecp_alm else "minPII" if args.joint_ci_orbital_ecp_minpii else "Adam"
             print(f"PASS: real CPU joint CI1/distinct-spin orbital/J2 ordinary-locality ECP {method} P17, "
                   "frozen C0/original XML, two complete frames, physical VMC reuse and strict exact initialized restart")
         elif args.md_orbital_ecp:
