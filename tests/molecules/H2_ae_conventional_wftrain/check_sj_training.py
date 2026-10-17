@@ -489,8 +489,11 @@ def main():
                     assert not np.array_equal(parameters, previous), model
                     if csf_ecp:
                         assert parameters.size == 5 and len(linear_nodes) == 2, model
-                        assert parameters[0] != previous[0], (model, "CSF coordinate did not update")
-                        assert not np.array_equal(parameters[1:], previous[1:]), (model, "J2 did not update")
+                        active_indices = np.asarray(group["active_indices"][()]).reshape(-1)
+                        ci_index = int(active_indices[names.index(linear_nodes[1].get("id"))])
+                        assert ci_index >= 0 and parameters[ci_index] != previous[ci_index], (model, "CSF did not update")
+                        assert not np.array_equal(np.delete(parameters, ci_index), np.delete(previous, ci_index)), \
+                            (model, "J2 did not update")
                 elif restart is None:
                     np.testing.assert_array_equal(parameters, previous, err_msg=f"rejected model: {model}")
                 previous = parameters
