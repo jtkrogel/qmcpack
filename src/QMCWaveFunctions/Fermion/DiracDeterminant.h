@@ -253,6 +253,9 @@ public:
   ValueMatrix& getPsiMinv() { return psiM; }
 #endif
 
+  /// Accepted inverse transpose; callers must first drain delayed updates.
+  const ValueMatrix& getAcceptedInverseTranspose() const { return psiM; }
+
   /// psiM(j,i) \f$= \psi_j({\bf r}_i)\f$
   ValueMatrix psiM_temp;
 

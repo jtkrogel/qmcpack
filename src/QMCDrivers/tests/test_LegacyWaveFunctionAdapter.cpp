@@ -46,6 +46,7 @@
 #include "QMCWaveFunctions/WaveFunctionFactory.h"
 #include "QMCWaveFunctions/Fermion/MultiSlaterDetTableMethod.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
+#include "QMCWaveFunctions/Fermion/DiracDeterminant.h"
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalBuilder.h"
@@ -3999,6 +4000,137 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     CHECK(adapter.snapshotParameters().values[0] == (ecp ? 0.05 : 0));
     if (ecp) CHECK(rng() == rng_before_actions());
   }
+}
+
+TEST_CASE("two-occupied orbital ratio tangents use only the accepted inverse",
+          "[legacy_adapter][two_occupied_ratio]")
+{
+  ParticleSetPool pool(OHMMS::Controller);
+  Libxml2Document particle_xml, definition;
+  REQUIRE(particle_xml.parseFromString(R"(<qmcsystem>
+    <particleset name="ion0" size="1"><group name="Be"><parameter name="charge">2</parameter>
+      </group><attrib name="position" datatype="posArray">0 0 0</attrib></particleset>
+    <particleset name="e"><group name="u" size="2"><parameter name="charge">-1</parameter>
+      <parameter name="mass">1</parameter><attrib name="position" datatype="posArray">
+      .3 .2 .4  -.5 .3 .7</attrib></group>
+      <group name="d" size="2"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+      <attrib name="position" datatype="posArray">.6 -.2 .3  -.4 -.3 .8</attrib></group>
+    </particleset></qmcsystem>)"));
+  REQUIRE(pool.put(xmlFirstElementChild(particle_xml.getRoot())));
+  REQUIRE(pool.put(xmlNextElementSibling(xmlFirstElementChild(particle_xml.getRoot()))));
+  REQUIRE(definition.parseFromString(R"(<wavefunction name="psi0" target="e">
+    <sposet_collection type="MolecularOrbital" source="ion0">
+      <basisset keyword="STO" transform="no"><atomicBasisSet type="STO" elementType="Be"
+        angular="cartesian" normalized="no">
+        <basisGroup rid="S" n="1" l="0" m="0" type="Slater"><radfunc n="1" exponent="1.2"/></basisGroup>
+        <basisGroup rid="P" n="2" l="1" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
+      </atomicBasisSet></basisset>
+      <rotated_sposet name="rot"><sposet name="base" size="4"><coefficient size="4" id="C">
+        1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1
+      </coefficient></sposet></rotated_sposet>
+    </sposet_collection><determinantset><slaterdeterminant>
+      <determinant sposet="rot"/><determinant sposet="rot"/>
+    </slaterdeterminant></determinantset></wavefunction>)"));
+  auto& particles = *pool.getParticleSet("e");
+  pool.getParticleSet("ion0")->update();
+  WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+  auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+  REQUIRE(source);
+  particles.update();
+  source->evaluateLog(particles);
+  auto& slater = source->findSD().front().get();
+  auto& rotated = dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
+  REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
+  LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
+  const auto active = adapter.registrationVariables();
+  REQUIRE(active.size_of_active() == 4);
+  const auto initial = adapter.snapshotParameters();
+  using Matrix = SPOSet::ValueMatrix;
+  using Vector = SPOSet::ValueVector;
+  // Independent determinant: no production matrix inverse or ratio helper.
+  const auto determinant = [](const Matrix& m) { return m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0); };
+  for (int spin = 0; spin < 2; ++spin)
+  {
+    auto& det = dynamic_cast<DiracDeterminant<>&>(slater.getDet(spin));
+    const int first = det.getFirstIndex();
+    Matrix accepted(2, 4), laplacians(2, 4);
+    SPOSet::GradMatrix gradients(2, 4);
+    rotated.Phi_->evaluate_notranspose(particles, first, first + 2, accepted, gradients, laplacians);
+    const Matrix inverse = det.getAcceptedInverseTranspose(), original = accepted;
+    for (int electron = 0; electron < 2; ++electron)
+    {
+      Vector replacement(4), output(4);
+      // Use a fresh private point for a full LCAO coefficient-rotation FD oracle.
+      ParticleSet moved(particles);
+      moved.R[first + electron] = {.1, -.6, .9}; moved.update();
+      auto moved_wf = source->makeClone(moved);
+      auto& moved_rot = dynamic_cast<RotatedSPOs&>(moved_wf->findSD()[0].get().getPhi(spin));
+      moved_rot.Phi_->evaluateValue(moved, first + electron, replacement);
+      output = 0;
+      const auto ratio = rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, electron, active, output);
+      Matrix virtual_matrix = accepted;
+      for (int q = 0; q < 4; ++q) virtual_matrix(electron, q) = replacement[q];
+      CHECK(ratio == Catch::Approx(determinant(virtual_matrix) / determinant(accepted)).epsilon(2e-12).margin(2e-12));
+      for (int parameter = 0; parameter < 4; ++parameter)
+      {
+        const auto physical_ratio = [&](double displacement) {
+          ParticleSet p(particles);
+          auto wf = source->makeClone(p);
+          auto point = initial; point.values[parameter] += displacement;
+          adapter.installSnapshot(*wf, p, point);
+          const double base_log = wf->getLogPsi(), base_phase = wf->getPhase();
+          p.R[first + electron] = moved.R[first + electron]; p.update(); wf->evaluateLog(p);
+          return std::exp(wf->getLogPsi() - base_log) * std::cos(wf->getPhase() - base_phase);
+        };
+        CHECK(output[parameter] == Catch::Approx((physical_ratio(1e-5) - physical_ratio(-1e-5)) / 2e-5)
+              .epsilon(3e-6).margin(3e-8));
+      }
+    }
+    for (std::size_t i = 0; i < accepted.size(); ++i) CHECK(accepted.data()[i] == original.data()[i]);
+    for (std::size_t i = 0; i < inverse.size(); ++i) CHECK(inverse.data()[i] == det.getAcceptedInverseTranspose().data()[i]);
+  }
+  // Binary-exact, signed nonsymmetric reference makes orientation errors visible.
+  Matrix accepted(2, 4), inverse(2, 2);
+  const double entries[]{1, 2, 3, 5, 0, -2, 7, 11};
+  std::copy(std::begin(entries), std::end(entries), accepted.data());
+  inverse(0, 0) = 1; inverse(0, 1) = 0;
+  inverse(1, 0) = 1; inverse(1, 1) = -.5;
+  Vector replacement(4), output(4);
+  replacement[0] = 0; replacement[1] = -2; replacement[2] = 13; replacement[3] = 17;
+  output = 0;
+  CHECK(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output) == 0);
+  CHECK(output[0] == 6); CHECK(output[1] == 6);
+  CHECK(output[2] == 0); CHECK(output[3] == 0);
+  for (int parameter = 0; parameter < 4; ++parameter)
+  {
+    const int occupied = parameter / 2, virtual_orbital = 2 + parameter % 2;
+    const auto dense_ratio = [&](double angle) {
+      Matrix a = accepted, q = accepted;
+      for (int row = 0; row < 2; ++row)
+        a(row, occupied) = std::cos(angle) * accepted(row, occupied) +
+            std::sin(angle) * accepted(row, virtual_orbital);
+      q = a;
+      for (int orbital = 0; orbital < 4; ++orbital) q(0, orbital) = replacement[orbital];
+      q(0, occupied) = std::cos(angle) * replacement[occupied] +
+          std::sin(angle) * replacement[virtual_orbital];
+      return determinant(q) / determinant(a);
+    };
+    CHECK(output[parameter] == Catch::Approx((dense_ratio(1e-6) - dense_ratio(-1e-6)) / 2e-6)
+          .epsilon(2e-9).margin(2e-9));
+  }
+  for (int electron = 0; electron < 2; ++electron)
+  {
+    for (int q = 0; q < 4; ++q) replacement[q] = accepted(electron, q);
+    output = 0;
+    CHECK(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, electron, active, output) == 1);
+    for (int parameter = 0; parameter < 4; ++parameter) CHECK(output[parameter] == 0);
+  }
+  CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 2, active, output));
+  replacement[3] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output));
+  replacement[3] = 17;
+  accepted(0, 0) = 0;
+  CHECK_THROWS(rotated.evaluateTwoOccupiedRatioDerivatives(accepted, inverse, replacement, 0, active, output));
 }
 
 TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
