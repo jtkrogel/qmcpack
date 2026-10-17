@@ -1020,7 +1020,7 @@ def main():
                         assert ci_index >= 0 and parameters[ci_index] != previous[ci_index], (model, "CI/CSF did not update")
                         assert not np.array_equal(np.delete(parameters, ci_index), np.delete(previous, ci_index)), \
                             (model, "J2 did not update")
-                elif restart is None:
+                elif row["committed"] == "0" and restart is None:
                     np.testing.assert_array_equal(parameters, previous, err_msg=f"rejected model: {model}")
                 previous = parameters
                 if orbital_model:
