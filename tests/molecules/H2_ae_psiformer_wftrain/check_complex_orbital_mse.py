@@ -143,7 +143,7 @@ def main():
             values = next(line.split() for line in text if line.strip() and not line.startswith("#"))
             assert len(header) == len(values)
             # Wall-clock CPU time is not a physical inference result or restart state.
-            return {name: value for name, value in zip(header, values) if name != "BlockCPU"}
+            return header, {name: value for name, value in zip(header, values) if name != "BlockCPU"}
 
         assert physical_row(final_scalar) == physical_row(restored_scalar), "exact restart inference"
 
