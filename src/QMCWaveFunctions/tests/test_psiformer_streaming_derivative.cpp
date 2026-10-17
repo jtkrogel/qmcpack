@@ -2230,10 +2230,13 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
       auto proposal = propose();
       if (step)
       {
-        CHECK(metrics.snapshot().downloaded_bytes - warm.downloaded_bytes < bytes);
-        CHECK(metrics.snapshot().uploaded_bytes - warm.uploaded_bytes < bytes);
+        // Fixed P666/B7: source-derived coordinate/scalar/status traffic, not P payloads.
+        CHECK(p == 666);
+        CHECK(metrics.snapshot().downloaded_bytes - warm.downloaded_bytes == 17620);
+        CHECK(metrics.snapshot().uploaded_bytes - warm.uploaded_bytes == 6552);
       }
       CHECK(proposal->diagnostics().solve.converged);
+      CHECK(proposal->diagnostics().solve.iterations == 2);
       CHECK(proposal->displacementNorm() == Catch::Approx(norm).epsilon(2e-7).margin(2e-9));
       CHECK_THROWS(gpu.prepareResidentDeviceSRPublication(std::move(proposal), step + 1, 0));
       proposal = propose();
@@ -2265,7 +2268,10 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
         CHECK(actual.values[i] == Catch::Approx(expected.values[i]).epsilon(2e-7).margin(2e-9));
         CHECK(actual.values[i] == Catch::Approx(host_candidate[i]).epsilon(2e-7).margin(2e-9));
       }
-      cpu.publishParameters(expected, step); host.publishParameters(expected, step);
+      // Independent candidates were checked above; fence comparisons require identical accepted values.
+      auto accepted = expected;
+      accepted.values = actual.values;
+      cpu.publishParameters(accepted, step); host.publishParameters(accepted, step);
       samples.front()->G = QMCTraits::GradType{}; samples.front()->L = QMCTraits::ValueType{};
       cpu.evaluateLog(*samples.front(), samples.front()->G, samples.front()->L);
       for (std::size_t i = 0; i < 4; ++i)
