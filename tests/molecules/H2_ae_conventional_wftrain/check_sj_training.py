@@ -243,7 +243,7 @@ def main():
         assert not any((args.old_new, args.optimizer_screen, args.family_screen, args.profile_only,
                         args.restart, args.preflight)), "--periodic-heg selects its own bounded workflow"
         args.model_import = True
-    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp or pure_ci else None
+    deadline = time.monotonic() + 300 if args.old_new or args.periodic_heg or args.md_orbital or args.external_lcao or args.orbital_ecp or ci_workflow else None
     external_asset = None
     if args.external_lcao:
         collection = ET.parse(fixture).find("wavefunction/sposet_collection")

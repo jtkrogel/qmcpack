@@ -1493,7 +1493,7 @@ void WFTrainBatched::process(xmlNodePtr node)
           throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit fixed-orbital DETS with J2; other mixed updates remain unqualified");
         if (population_.get_golden_hamiltonian().ecpModelProvenance() ||
             population_.get_golden_hamiltonian().hasPhysicalNLPP())
-          throw UniformCommunicateError("Conventional LM/ALM/PII/minPII pure-CI qualification requires all-electron Hamiltonians");
+          throw UniformCommunicateError("Conventional LM/ALM/PII/minPII coefficient-family qualification requires all-electron Hamiltonians");
         // The frozen CSF reference precedes its fixed determinant expansion.
         const auto reference = multideterminants[0].get().fixedCoefficientReference();
         if (reference == QMCTraits::ValueType{} || !wftrain::isFiniteTrainingReal(std::real(reference)) ||
