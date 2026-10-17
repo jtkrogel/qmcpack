@@ -4091,7 +4091,7 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
   CHECK(metrics.snapshot().allocation_calls == device_before_bind.allocation_calls);
   CHECK(metrics.snapshot().live_bytes == device_before_bind.live_bytes);
   CHECK_THROWS(op->bindNonLocalECPJVPReplay(replayFor(*op)));
-  REQUIRE(op->capabilities().maximum_vjp_channels == 1);
+  REQUIRE(op->capabilities().maximum_vjp_channels == 3);
   REQUIRE(op->capabilities().local_energy_term_mask ==
       (localEnergyTermBit(LocalEnergyTerm::KINETIC) | localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)));
   const auto storage = op->storageDiagnostics();
@@ -4186,6 +4186,44 @@ TEST_CASE("PsiFormer paired captured-grid ECP binds existing numerical ownership
             complete_actual.values[0][i]) * direction[i];
       close(lhs, rhs, 3e-9);
     }
+  // EO/O ordering is caller-defined; one complete channel shares the same base score and final receipt.
+  std::vector<C> eo{{.23, -.19}, {-.31, .07}}, overlap{{-.12, .29}, {.43, -.17}};
+  for (std::size_t energy_slot = 0; energy_slot < 3; ++energy_slot)
+    for (const auto adjoint : {DerivativeAdjoint::TRANSPOSE, DerivativeAdjoint::HERMITIAN})
+    {
+      std::array<VJPCoefficientChannel, 3> request{channel, channel, channel};
+      for (std::size_t c = 0; c < 3; ++c)
+      {
+        request[c].id = c == 0 ? "first" : c == 1 ? "second" : "third";
+        if (c == energy_slot) request[c].local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+        else
+        {
+          request[c].product = DerivativeProduct::SCORE_VJP;
+          request[c].local_energy_term_mask = 0;
+          const auto& values = c == (energy_slot + 1) % 3 ? eo : overlap;
+          request[c].coefficients.values = {values.data(), values.size()};
+        }
+      }
+      ComplexStreamingSink cpu_channels, ecp_channel, gpu_channels;
+      base_oracle->applyVJPs({request.data(), request.size()}, adjoint, cpu_channels);
+      op->applyVJPs({&channel, 1}, adjoint, ecp_channel);
+      request[energy_slot].local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+      const auto warm = metrics.snapshot();
+      op->applyVJPs({request.data(), request.size()}, adjoint, gpu_channels);
+      CHECK(metrics.snapshot().allocation_calls == warm.allocation_calls);
+      for (std::size_t c = 0; c < 3; ++c)
+        for (std::size_t i = 0; i < direction.size(); ++i)
+          close(gpu_channels.values[c][i], cpu_channels.values[c][i] +
+              (c == energy_slot ? ecp_channel.values[0][i] : C{}), 3e-9);
+      request[(energy_slot + 1) % 3] = request[energy_slot];
+      request[(energy_slot + 1) % 3].id = "duplicate_energy";
+      gpu_channels.reset();
+      CHECK_THROWS(op->applyVJPs({request.data(), request.size()}, adjoint, gpu_channels));
+      CHECK(gpu_channels.state() == DerivativeSinkState::POISONED);
+      for (const auto& values : gpu_channels.values)
+        CHECK(std::all_of(values.begin(), values.end(), [](C value) { return value == C{}; }));
+    }
+  std::printf("COMPLEX_CAPTURED_COMPLETE_C3 PASS B=2 Q=9 energy_slots=3 EO_O=1 both_adjoints=1 one_owner=1\n");
   actual.reset(); actual.fail_next = true;
   CHECK_THROWS(op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual));
   actual.reset(); CHECK_NOTHROW(op->applyVJPs({&channel, 1}, DerivativeAdjoint::HERMITIAN, actual));

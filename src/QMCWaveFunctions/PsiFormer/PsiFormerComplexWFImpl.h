@@ -555,7 +555,7 @@ struct PsiFormerComplexWF::Impl
       {
         c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
         c.local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
-        c.maximum_vjp_channels = 1; // One complete local-energy response in the existing C3 owner.
+        c.maximum_vjp_channels = 3; // One complete energy channel plus SCORE EO/O, in any caller order.
       }
       return c;
     }
@@ -833,10 +833,22 @@ struct PsiFormerComplexWF::Impl
       GpuDerivativeLane::Products::CompletedResult result;
       {
         std::shared_lock read(lane->state->mutex);
-        if (replay && requested.size() != 1)
-          throw std::invalid_argument("Complex bound replay requires current C1 request admission");
-        if (replay && requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP)
-          localTerms(requested[0].local_energy_term_mask);
+        std::size_t energy_channel = requested.size();
+        if (replay)
+        {
+          if (requested.empty() || requested.size() > lane->channels.size())
+            throw std::invalid_argument("Complex bound replay channel extent invalid");
+          for (std::size_t c = 0; c < requested.size(); ++c)
+            if (requested[c].product == DerivativeProduct::LOCAL_ENERGY_VJP)
+            {
+              if (energy_channel != requested.size())
+                throw std::invalid_argument("Complex bound replay admits only one complete energy channel");
+              localTerms(requested[c].local_energy_term_mask);
+              energy_channel = c;
+            }
+            else if (requested[c].product != DerivativeProduct::SCORE_VJP)
+              throw std::invalid_argument("Complex bound replay requires energy/SCORE channels");
+        }
         if (version != lane->state->model.p.version() || lane->generation != lane->state->gpu ||
             lane->state->pending_proposals.load(std::memory_order_relaxed))
           throw std::logic_error("Complex GPU derivative snapshot is stale or family has a pending move");
@@ -850,12 +862,13 @@ struct PsiFormerComplexWF::Impl
               requested[c].coefficients.values.data(), samples};
         {
           NativeTimerScope host_timer(phase_timers.gpu_call);
-          if (replay && requested[0].product == DerivativeProduct::LOCAL_ENERGY_VJP)
+          if (replay && energy_channel != requested.size())
           {
-            std::copy_n(requested[0].coefficients.values.data(), samples, sample_coefficients.data());
+            std::copy_n(requested[energy_channel].coefficients.values.data(), samples, sample_coefficients.data());
             lane->products->evaluateLocalEnergyVJP(positions, virtual_positions, references, complete_weights,
                 sample_coefficients, inverse_masses, lane->state->cartesian_twist,
-                localTerms(requested[0].local_energy_term_mask), adjoint == DerivativeAdjoint::HERMITIAN);
+                localTerms(requested[energy_channel].local_energy_term_mask), adjoint == DerivativeAdjoint::HERMITIAN,
+                requested.size() > 1 ? &lane->channels : nullptr, energy_channel);
           }
           else
             lane->products->evaluate(positions, inverse_masses, lane->state->cartesian_twist, lane->channels,

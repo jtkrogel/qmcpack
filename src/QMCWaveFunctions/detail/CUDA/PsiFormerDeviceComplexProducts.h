@@ -221,7 +221,8 @@ public:
       const std::vector<double>& virtual_positions, const std::vector<std::size_t>& references,
       const std::vector<Complex>& complete_weights, const std::vector<Complex>& coefficients,
       const std::vector<double>& inverse_masses, const std::array<double, 3>& kappa,
-      LocalTerms terms, bool hermitian = false)
+      LocalTerms terms, bool hermitian = false, const std::vector<Channel>* channels = nullptr,
+      std::size_t energy_channel = 0)
   {
     ready_ = jvp_ready_ = false;
     if (generation_ == std::numeric_limits<std::size_t>::max())
@@ -245,6 +246,24 @@ public:
           throw std::invalid_argument("Complex nonlocal nonfinite coordinate");
     for (auto value : coefficients)
       if (!finite(value)) throw std::invalid_argument("Complex nonlocal nonfinite sample coefficient");
+    // Optional SCORE EO/O channels share the base score and the single finite publication.
+    if (energy_channel >= cost_.channels || (!channels && energy_channel != 0))
+      throw std::invalid_argument("Complex complete response energy slot invalid");
+    if (channels)
+    {
+      if (channels->size() != cost_.channels)
+        throw std::invalid_argument("Complex complete response channel extent mismatch");
+      for (std::size_t slot = 0; slot < channels->size(); ++slot)
+      {
+        const auto& channel = (*channels)[slot];
+        if (channel.role != (slot == energy_channel ? Role::KINETIC : Role::SCORE) ||
+            !channel.values || channel.count != b)
+          throw std::invalid_argument("Complex complete response requires one energy and SCORE channels");
+        for (std::size_t sample = 0; sample < b; ++sample)
+          if (!finite(channel.values[sample]) || (slot == energy_channel && channel.values[sample] != coefficients[sample]))
+            throw std::invalid_argument("Complex complete response coefficient mismatch/nonfinite");
+      }
+    }
     // Revoke JVP views before reusing their bounded O(B) storage for base weights.
     std::fill_n(sample_products_.begin(), b, Complex{});
     for (std::size_t point = 0; nonlocal && point < q; ++point)
@@ -265,22 +284,32 @@ public:
     {
       const auto weighted = coefficients[references[point]] *
           (hermitian ? std::conj(complete_weights[point]) : complete_weights[point]);
-      accumulateNonlocalScore(virtual_positions.data() + point * stride, weighted, hermitian);
+      accumulateNonlocalScore(virtual_positions.data() + point * stride, weighted, hermitian, energy_channel);
     }
     // Evaluate even zero-weight references/virtuals: undefined node scores are not zero.
     for (std::size_t sample = 0; sample < b; ++sample)
     {
-      if (nonlocal)
-        accumulateNonlocalScore(base_positions.data() + sample * stride, sample_products_[sample], hermitian);
+      std::copy_n(base_positions.data() + sample * stride, stride, positions_.data());
+      if (nonlocal || channels)
+      {
+        score_->evaluate(positions_);
+        const auto response = score_->resultView();
+        if (response.image != image_.get() || response.count != cost_.parameters)
+          throw std::logic_error("Complex complete response base score binding changed");
+        if (nonlocal) accumulateResponse(response.data, sample_products_[sample], hermitian, energy_channel);
+        if (channels)
+          for (std::size_t slot = 0; slot < channels->size(); ++slot)
+            if (slot != energy_channel)
+              accumulateResponse(response.data, (*channels)[slot].values[sample], hermitian, slot);
+      }
       if (kinetic)
       {
-        std::copy_n(base_positions.data() + sample * stride, stride, positions_.data());
         std::copy_n(inverse_masses.data() + sample * cost_.electrons, cost_.electrons, masses_.data());
         kinetic_->evaluate(positions_, masses_, kappa);
         const auto response = kinetic_->resultView();
         if (response.image != image_.get() || response.count != cost_.parameters)
           throw std::logic_error("Complex local-energy kinetic binding changed");
-        accumulateResponse(response.data, coefficients[sample], hermitian);
+        accumulateResponse(response.data, coefficients[sample], hermitian, energy_channel);
       }
     }
     publishCompleted();
@@ -601,14 +630,14 @@ private:
   }
 
   /// Accumulate one admitted B1 score with the same TRANSPOSE/HERMITIAN algebra as ordinary products.
-  void accumulateNonlocalScore(const double* positions, Complex coefficient, bool hermitian)
+  void accumulateNonlocalScore(const double* positions, Complex coefficient, bool hermitian, std::size_t channel = 0)
   {
     std::copy_n(positions, positions_.size(), positions_.data());
     score_->evaluate(positions_);
     const auto score = score_->resultView();
     if (score.image != image_.get() || score.count != cost_.parameters)
       throw std::logic_error("Complex nonlocal score binding changed");
-    accumulateResponse(score.data, coefficient, hermitian);
+    accumulateResponse(score.data, coefficient, hermitian, channel);
   }
 
   /// Publish only a complete finite contraction; both product routes share the same receipt protocol.

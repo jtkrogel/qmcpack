@@ -545,9 +545,14 @@ void validateComplexProducts()
       kinetic_rows[sample].assign(value.parameter_response, value.parameter_response + p);
       for (std::size_t i = 0; i < p; ++i) kinetic_dots[sample] += kinetic_rows[sample][i] * tangent[i].real();
     }
+    std::array<std::array<std::size_t, 2>, 3> local_traffic{};
+    std::size_t term_index = 0;
     for (auto terms : {Terms::KINETIC, Terms::NONLOCAL_ECP, Terms::COMPLETE})
     {
+      const auto before_jvp = metrics.snapshot();
       nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa, terms, tangent.data(), p);
+      local_traffic[term_index++] = {metrics.snapshot().uploaded_bytes - before_jvp.uploaded_bytes,
+          metrics.snapshot().downloaded_bytes - before_jvp.downloaded_bytes};
       const auto local = nonlocal->localEnergyJvpView();
       nonlocal->validate(local);
       fails([&] { (void)nonlocal->scoreJvpView(); });
@@ -592,6 +597,9 @@ void validateComplexProducts()
         require(std::abs(contracted - dual) <= 3e-9 * (1 + std::abs(dual)), "Complete local-energy duality mismatch");
       }
     }
+    require(local_traffic[2][0] == local_traffic[0][0] + local_traffic[1][0] - 8 * p &&
+        local_traffic[2][1] == local_traffic[0][1] + local_traffic[1][1],
+        "Complete JVP must reuse one realP direction ingress and only ordinary scalar/status egress");
     std::array<std::array<C, b>, 2> complete_sides{};
     for (std::size_t side = 0; side < 2; ++side)
     {
@@ -628,6 +636,24 @@ void validateComplexProducts()
     require(metrics.snapshot().uploaded_bytes == before_invalid.uploaded_bytes, "Invalid complete request launched");
     nonlocal->evaluateLocalEnergyJVP(joined, b, refs, weights, masses, kappa, Terms::COMPLETE, tangent.data(), p);
     nonlocal->validate(nonlocal->localEnergyJvpView());
+    auto score_coefficients = contractions;
+    std::vector<Owner::Channel> complete_channels{{Owner::Role::SCORE, score_coefficients.data(), b},
+        {Owner::Role::KINETIC, contractions.data(), b}, {Owner::Role::SCORE, score_coefficients.data(), b}};
+    nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa,
+        Terms::COMPLETE, false, &complete_channels, 1);
+    const auto complete_receipt = nonlocal->completedResult();
+    const auto before_bad_channel = metrics.snapshot();
+    score_coefficients.back() = {std::numeric_limits<double>::infinity(), 0};
+    fails([&] { nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa,
+        Terms::COMPLETE, false, &complete_channels, 1); });
+    fails([&] { (void)nonlocal->completedResult(); });
+    require(metrics.snapshot().uploaded_bytes == before_bad_channel.uploaded_bytes &&
+        metrics.snapshot().downloaded_bytes == before_bad_channel.downloaded_bytes, "Invalid EO/O coefficient launched");
+    std::copy(contractions.begin(), contractions.end(), score_coefficients.begin());
+    nonlocal->evaluateLocalEnergyVJP(positions, virtuals, refs, weights, contractions, masses, kappa,
+        Terms::COMPLETE, false, &complete_channels, 1);
+    fails([&] { nonlocal->downloadCompletedChunk(complete_receipt, 1, 0, 1); });
+    std::cout << "PASS complex complete C3 energy_slot=1 finite_publication=1 stale_retry=1 same_storage=1\n";
     std::cout << "PASS complex complete response B=2 Q=9 capacity=13 K_ECP_BOTH=1 CPU_allP=1 physical_FD=1 typed=1 retry=1\n";
     require(nonlocal->storageFingerprint() == nf && metrics.snapshot().allocation_calls == nw.allocation_calls &&
         metrics.snapshot().free_calls == nw.free_calls, "Nonlocal warm request changed prepared ownership");
