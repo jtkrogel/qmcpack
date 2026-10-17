@@ -27,6 +27,8 @@ namespace qmcplusplus
 
 TEST_CASE("WalkerLogCollector::collect", "[estimators]")
 {
+  WalkerLogCollector disabled(WalkerLogState{});
+  CHECK_FALSE(disabled.logsActive());
   app_log() << "\n\n=======================================================\n";
   app_log() << "test WalkerLogCollector::collect\n";
 
@@ -75,6 +77,7 @@ TEST_CASE("WalkerLogCollector::collect", "[estimators]")
 
   WalkerLogState state{true, 1, false};
   WalkerLogCollector wlc(state);
+  CHECK(wlc.logsActive());
 
   auto& bsi = wlc.walker_property_int_buffer;
   auto& bsr = wlc.walker_property_real_buffer;

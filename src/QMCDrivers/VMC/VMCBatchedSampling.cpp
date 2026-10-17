@@ -51,8 +51,11 @@ const PsiFormerWF* deviceSamplingComponent(const TrialWaveFunction& wavefunction
 /// Requested walker logging cannot consume intentionally unmaterialized HOST state.
 void validateResidentWalkerLogs(const VMCBatchedSampling::State& state, const UPtrVector<Crowd>& crowds)
 {
-  if (state.resident_device_observation && !Crowd::getWalkerLogCollectorRefs(crowds).empty())
-    throw UniformCommunicateError("Resident device observation excludes active walker logging.");
+  if (!state.resident_device_observation)
+    return;
+  for (const WalkerLogCollector& collector : Crowd::getWalkerLogCollectorRefs(crowds))
+    if (collector.logsActive())
+      throw UniformCommunicateError("Resident device observation excludes active walker logging.");
 }
 
 /** Scale proposed coordinate displacements by the species time steps. */

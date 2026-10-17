@@ -108,6 +108,9 @@ private:
   WalkerLogState state_;
 
 public:
+  /// Report actual collection activity, including always-created disabled collectors.
+  bool logsActive() const noexcept { return state_.logs_active; }
+
   /// constructor. The state should be given by the manager.
   WalkerLogCollector(const WalkerLogState& state);
   WalkerLogCollector(WalkerLogCollector&& other)            = default;
