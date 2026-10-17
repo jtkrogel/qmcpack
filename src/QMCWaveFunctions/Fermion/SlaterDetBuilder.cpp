@@ -636,6 +636,7 @@ std::unique_ptr<MultiSlaterDetTableMethod> SlaterDetBuilder::createMSDFast(
       break;
     }
   }
+  const bool csf_orbital = csf_data_ptr && any_optimizable;
   if (any_optimizable)
   {
     for (int grp = 0; grp < nGroups; grp++)
@@ -643,9 +644,6 @@ std::unique_ptr<MultiSlaterDetTableMethod> SlaterDetBuilder::createMSDFast(
       if (dets[grp]->isOptimizable() != true)
         APP_ABORT("Optimizing the SPOSet of only only species is not supported!\n");
     }
-    if (csf_data_ptr)
-      APP_ABORT("Currently, Using CSF is not available with MSJ Orbital Optimization!\n");
-
     for (int grp = 0; grp < nGroups; grp++)
       for (int i = 0; i < targetPtcl.groupsize(grp); i++)
       {
@@ -662,6 +660,20 @@ std::unique_ptr<MultiSlaterDetTableMethod> SlaterDetBuilder::createMSDFast(
   auto msd_fast = std::make_unique<MultiSlaterDetTableMethod>(targetPtcl, std::move(dets), use_precompute);
   msd_fast->initialize(std::move(C2nodes_sorted_ptr), std::move(C_ptr), std::move(myVars_ptr), std::move(csf_data_ptr),
                        Optimizable, CI_Optimizable);
+  if (csf_orbital)
+  {
+    // Structural admission only: never enable private evaluation on the built source.
+    try
+    {
+      if (targetPtcl.getLattice().SuperCellEnum != SUPERCELL_OPEN)
+        throw std::invalid_argument("CSF orbital construction requires an open cell");
+      msd_fast->validateAcceptedReferenceOrbitalProfile();
+    }
+    catch (const std::exception&)
+    {
+      APP_ABORT("Currently, Using CSF is not available with MSJ Orbital Optimization!\n");
+    }
+  }
 
   return msd_fast;
 }

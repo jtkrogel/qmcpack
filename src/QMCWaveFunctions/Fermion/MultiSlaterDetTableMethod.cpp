@@ -896,13 +896,32 @@ MultiSlaterDetTableMethod::ValueType MultiSlaterDetTableMethod::evaluateAccepted
 
 void MultiSlaterDetTableMethod::validateAcceptedReferenceOrbitalProfile() const
 {
-  if (csf_data_ || Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 || Dets[1]->getNumPtcls() <= 1)
-    throw std::invalid_argument("Private orbital ECP rows require DETS and two multiple-occupied spins");
+  if (Dets.size() != 2 || Dets[0]->getNumPtcls() <= 1 || Dets[1]->getNumPtcls() <= 1)
+    throw std::invalid_argument("Private orbital ECP rows require two multiple-occupied spins");
   validatePreparedRotatedCoefficientState(*this);
+  if (csf_data_)
+  {
+    if (csf_data_->coeffs.front() == ValueType{})
+      throw std::invalid_argument("Private orbital ECP rows require a nonzero frozen CSF0");
+    if (csf_data_->dets_per_csf.size() != csf_data_->coeffs.size() || csf_data_->expansion.size() != C->size())
+      throw std::invalid_argument("Private orbital ECP rows have an inconsistent CSF map");
+    std::size_t remaining = C->size();
+    for (const auto count : csf_data_->dets_per_csf)
+    {
+      if (count > remaining)
+        throw std::invalid_argument("Private orbital ECP rows have an inconsistent CSF extent");
+      remaining -= count;
+    }
+    if (remaining || std::any_of(csf_data_->expansion.begin(), csf_data_->expansion.end(),
+          [](RealType value) { return !finiteAcceptedRatio(ValueType(value)); }))
+      throw std::invalid_argument("Private orbital ECP rows have an incomplete or nonfinite CSF map");
+  }
   if (CI_Optimizable)
   {
-    if (C->size() != myVars->size() + 1 || C->front() == ValueType{} || !finiteAcceptedRatio(C->front()))
-      throw std::invalid_argument("Private joint CI/orbital ECP rows require finite nonzero frozen C0 and C[1:] variables");
+    const auto& coefficients = csf_data_ ? csf_data_->coeffs : *C;
+    if (coefficients.size() != myVars->size() + 1 || coefficients.front() == ValueType{} ||
+        !finiteAcceptedRatio(coefficients.front()))
+      throw std::invalid_argument("Private joint CI/orbital ECP rows require finite nonzero frozen C0/CSF0 and remaining variables");
     for (int variable = 0; variable < myVars->size(); ++variable)
       if (myVars->getType(variable) != optimize::LINEAR_P)
         throw std::invalid_argument("Private joint CI/orbital ECP rows require linear coefficient variables");
