@@ -22,6 +22,12 @@
 
 namespace qmcplusplus
 {
+/// Opt-in immutable identity of the actual serial HDF image used by an LCAO reader.
+struct LCAOFileImageIdentity
+{
+  std::string source_report, image_hex;
+  std::size_t byteCount() const noexcept { return image_hex.size() / 2; }
+};
 /** class to handle linear combinations of basis orbitals used to evaluate the Dirac determinants.
    *
    * SoA verson of LCOrtbitalSet
@@ -58,6 +64,7 @@ public:
   bool isOMPoffload() const override { return useOMPoffload_; }
 
   std::string getClassName() const final { return "LCAOrbitalSet"; }
+  const std::shared_ptr<const LCAOFileImageIdentity>& fileImageIdentity() const noexcept { return file_identity_; }
 
   bool isRotationSupported() const final { return true; }
 
@@ -268,6 +275,8 @@ protected:
   vghgh_type Tempghv;
 
 private:
+  friend class LCAOrbitalBuilder;
+  std::shared_ptr<const LCAOFileImageIdentity> file_identity_;
   ///helper functions to handle Identity
   void evaluate_vgl_impl(const vgl_type& temp, ValueVector& psi, GradVector& dpsi, ValueVector& d2psi) const;
 

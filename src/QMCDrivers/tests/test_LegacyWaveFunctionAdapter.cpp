@@ -41,6 +41,7 @@
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/RotatedSPOs.h"
 #include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalBuilder.h"
 #include "QMCWaveFunctions/WaveFunctionComponent.h"
 #include "SimulationCell.h"
 #include "io/hdf/hdf_archive.h"
@@ -2482,5 +2483,165 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
   CHECK(restored_stage.completed_stage_iterations == 2);
   CHECK(restored_optimizer.acceptedUpdateCount() == optimizer.acceptedUpdateCount());
 }
+
+#ifndef QMC_COMPLEX
+TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapter][external_lcao]")
+{
+  ParticleSetPool pool(OHMMS::Controller);
+  auto ion_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto electron_owner = std::make_unique<ParticleSet>(pool.getSimulationCell());
+  auto& ions = *ion_owner;
+  auto& particles = *electron_owner;
+  ions.setName("ion0");
+  ions.create({1, 1});
+  ions.R[0] = {0, 0, 0};
+  ions.R[1] = {0, 0, 3.0139239778};
+  auto& ion_species = ions.getSpeciesSet();
+  const int li = ion_species.addSpecies("Li"), h = ion_species.addSpecies("H");
+  const int charge = ion_species.addAttribute("charge");
+  ion_species(charge, li) = 3;
+  ion_species(charge, h) = 1;
+  ions.resetGroups();
+  particles.setName("e");
+  particles.create({2, 2});
+  particles.R[0] = {0.2, -0.3, 0.4};
+  particles.R[1] = {-0.5, 0.1, 1.7};
+  particles.R[2] = {0.4, 0.2, -0.7};
+  particles.R[3] = {-0.2, -0.4, 2.9};
+  auto& species = particles.getSpeciesSet();
+  const int u = species.addSpecies("u"), d = species.addSpecies("d");
+  const int mass = species.addAttribute("mass"), electron_charge = species.addAttribute("charge");
+  species(mass, u) = species(mass, d) = 1;
+  species(electron_charge, u) = species(electron_charge, d) = -1;
+  particles.resetGroups();
+  pool.addParticleSet(std::move(ion_owner));
+  pool.addParticleSet(std::move(electron_owner));
+  const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+      "tests/molecules/LiH_ae_pyscf/LiH-pyscf.h5";
+  const auto temporary = std::filesystem::temp_directory_path() /
+      ("lcao_identity_" + std::to_string(OHMMS::Controller->rank()) + "_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".h5");
+  FileCleanup cleanup(temporary);
+  std::filesystem::copy_file(asset, temporary);
+  const auto xml = [](const std::filesystem::path& file, std::size_t cap = 1048576) {
+    return "<wavefunction name='psi0' target='e'><sposet_collection type='MolecularOrbital' name='LCAOBSet' "
+        "source='ion0' transform='yes' source_identity='file_image' source_identity_max_bytes='" +
+        std::to_string(cap) + "' href='" + file.string() + R"('>
+        <sposet name="spo-ud" size="2"><occupation mode="ground"/><coefficient size="135" spindataset="0"/></sposet>
+      </sposet_collection><determinantset><slaterdeterminant>
+        <determinant sposet="spo-ud"/><determinant sposet="spo-ud"/>
+      </slaterdeterminant></determinantset>
+      <jastrow name="J2" type="Two-Body" function="Bspline">
+        <correlation rcut="4" size="4" speciesA="u" speciesB="u">
+          <coefficients id="uu" type="Array" optimize="yes">0.04 -0.02 0.01 -0.005</coefficients>
+        </correlation><correlation rcut="4" size="4" speciesA="u" speciesB="d">
+          <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+        </correlation>
+      </jastrow></wavefunction>)";
+  };
+  const auto build = [&](Libxml2Document& document, const std::string& input) {
+    REQUIRE(document.parseFromString(input));
+    WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+    auto result = factory.buildTWF(document.getRoot(), RuntimeOptions{});
+    REQUIRE(result);
+    result->storeXMLNode(document.getRoot());
+    return result;
+  };
+  Libxml2Document definition, relocated_definition;
+  auto source = build(definition, xml(asset));
+  auto relocated = build(relocated_definition, xml(temporary));
+  const auto& lcao = dynamic_cast<const LCAOrbitalSet&>(source->findSD()[0].get().getPhi(0));
+  REQUIRE(lcao.fileImageIdentity());
+  CHECK(lcao.fileImageIdentity()->byteCount() == std::filesystem::file_size(asset));
+  particles.update();
+  source->evaluateLog(particles);
+  const double original_log = source->getLogPsi();
+  const auto original_energy = kineticEnergy(particles);
+  ParticleSet private_particles(particles);
+  auto evaluator = source->makeClone(private_particles);
+  private_particles.update();
+  const auto& cloned_lcao = dynamic_cast<const LCAOrbitalSet&>(evaluator->findSD()[0].get().getPhi(0));
+  CHECK(cloned_lcao.fileImageIdentity() == lcao.fileImageIdentity());
+  QMCHamiltonian ham;
+  ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+  TrainingWaveFunctionBinding binding(*source, particles, adapterOptions(), *OHMMS::Controller);
+  TrainingWaveFunctionBinding relocated_binding(*relocated, particles, adapterOptions(), *OHMMS::Controller);
+  binding.setHamiltonian(ham);
+  relocated_binding.setHamiltonian(ham);
+  CHECK(binding.modelIdentity() == relocated_binding.modelIdentity());
+  LegacyWaveFunctionAdapter adapter("legacy/external", *source, adapterOptions());
+  const auto snapshot = adapter.snapshotParameters();
+  auto op = adapter.makeDerivativeOperator(
+      std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles, std::vector<double>{0}),
+      std::make_shared<const StructuredParameterSnapshot>(snapshot), 0, 0);
+  const std::vector<DerivativeValue> unit{1};
+  const std::array<VJPCoefficientChannel, 2> channels{{
+      {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0},
+      {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), localEnergyTermBit(LocalEnergyTerm::KINETIC)}}};
+  RecordingParameterSink rows;
+  op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+  std::vector<DerivativeValue> direction(snapshot.values.size(), 0.125);
+  const StructuredParameterVectorConstView vector(adapter.parameterSchema(), op->parameterVersion(),
+                                                 {direction.data(), direction.size()});
+  RecordingSampleSink score_jvp, energy_jvp;
+  op->applyScoreJVP(vector, score_jvp);
+  op->applyLocalEnergyJVP(vector, localEnergyTermBit(LocalEnergyTerm::KINETIC), energy_jvp);
+  DerivativeValue score_dual{}, energy_dual{};
+  for (std::size_t parameter = 0; parameter < direction.size(); ++parameter)
+  {
+    score_dual += direction[parameter] * rows.result()[0][parameter];
+    energy_dual += direction[parameter] * rows.result()[1][parameter];
+  }
+  checkClose(score_jvp.result()[0], score_dual);
+  checkClose(energy_jvp.result()[0], energy_dual);
+  for (std::size_t parameter = 0; parameter < snapshot.values.size(); ++parameter)
+  {
+    auto plus = snapshot, minus = snapshot;
+    plus.values[parameter] += 1e-5;
+    minus.values[parameter] -= 1e-5;
+    adapter.installSnapshot(*evaluator, private_particles, plus);
+    const double plus_log = evaluator->getLogPsi();
+    const auto plus_energy = kineticEnergy(private_particles);
+    adapter.installSnapshot(*evaluator, private_particles, minus);
+    CHECK(rows.result()[0][parameter].real() == Catch::Approx((plus_log - evaluator->getLogPsi()) / 2e-5).margin(2e-8));
+    CHECK(rows.result()[1][parameter].real() == Catch::Approx(((plus_energy - kineticEnergy(private_particles)) / 2e-5).real()).epsilon(2e-6).margin(2e-8));
+  }
+  source->evaluateLog(particles);
+  CHECK(source->getLogPsi() == original_log);
+  CHECK(kineticEnergy(particles) == original_energy);
+  Libxml2Document too_small;
+  CHECK_THROWS_WITH(build(too_small, xml(asset, 1024)), Catch::Matchers::ContainsSubstring("source_identity_max_bytes"));
+  // Capture basis bytes, then change only a disposable file before the actual
+  // coefficient open. The old immutable record must reject this second image.
+  Libxml2Document changed;
+  REQUIRE(changed.parseFromString(xml(temporary)));
+  auto* collection = changed.getRoot()->children;
+  while (collection && collection->type != XML_ELEMENT_NODE) collection = collection->next;
+  LCAOrbitalBuilder builder(particles, ions, OHMMS::Controller, collection);
+  const hid_t file = H5Fopen(temporary.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+  REQUIRE(file >= 0);
+  const hid_t space = H5Screate(H5S_SCALAR);
+  const hid_t attribute = H5Acreate2(file, "changed_after_basis", H5T_NATIVE_INT, space, H5P_DEFAULT, H5P_DEFAULT);
+  REQUIRE(attribute >= 0);
+  H5Aclose(attribute);
+  H5Sclose(space);
+  H5Fclose(file);
+  auto* spo = collection->children;
+  while (spo && spo->type != XML_ELEMENT_NODE) spo = spo->next;
+  CHECK_THROWS_WITH(builder.createSPOSetFromXML(spo), Catch::Matchers::ContainsSubstring("changed between actual reader handles"));
+  const hid_t linked_file = H5Fopen(temporary.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+  REQUIRE(linked_file >= 0);
+  REQUIRE(H5Lcreate_external("untracked.h5", "/data", linked_file, "external", H5P_DEFAULT, H5P_DEFAULT) >= 0);
+  H5Fclose(linked_file);
+  Libxml2Document linked;
+  CHECK_THROWS_WITH(build(linked, xml(temporary)), Catch::Matchers::ContainsSubstring("rejects non-hard links"));
+  // Qualification of one recognized collection never authorizes unrelated
+  // paths elsewhere in the model XML.
+  xmlSetProp(definition.getRoot(), BAD_CAST "filename", BAD_CAST "unqualified.h5");
+  TrainingWaveFunctionBinding unrelated(*source, particles, adapterOptions(), *OHMMS::Controller);
+  unrelated.setHamiltonian(ham);
+  CHECK_THROWS_WITH(unrelated.modelIdentity(), Catch::Matchers::ContainsSubstring("external"));
+}
+#endif
 
 } // namespace qmcplusplus::wftrain

@@ -15,6 +15,7 @@ namespace qmcplusplus
 {
 class QMCHamiltonian;
 class hdf_archive;
+struct LCAOFileImageIdentity;
 namespace wftrain
 {
 /// Complete accepted orbital frame; active parameters alone are path dependent.
@@ -91,6 +92,7 @@ private:
   };
   std::vector<LiveTarget> live_;
   std::string definition_;
+  std::shared_ptr<const LCAOFileImageIdentity> lcao_source_;
   bool external_assets_ = false;
   bool inline_spos_ = true;
   bool multideterminant_ = false;

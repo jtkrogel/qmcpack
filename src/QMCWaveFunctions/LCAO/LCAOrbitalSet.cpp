@@ -108,6 +108,7 @@ LCAOrbitalSet::LCAOrbitalSet(const LCAOrbitalSet& in)
       basis_timer_(in.basis_timer_),
       mo_timer_(in.mo_timer_)
 {
+  file_identity_ = in.file_identity_;
   Temp.resize(BasisSetSize);
   Temph.resize(BasisSetSize);
   Tempgh.resize(BasisSetSize);

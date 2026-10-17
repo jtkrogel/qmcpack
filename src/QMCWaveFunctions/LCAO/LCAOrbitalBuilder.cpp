@@ -134,10 +134,22 @@ LCAOrbitalBuilder::LCAOrbitalBuilder(ParticleSet& els, ParticleSet& ions, Commun
   aAttrib.add(PBCImages, "PBCimages");
   aAttrib.add(SuperTwist, "twist");
   aAttrib.add(useGPU, "gpu", CPUOMPTargetSelector::candidate_values);
+  aAttrib.add(source_identity_, "source_identity", {"", "file_image"});
+  aAttrib.add(source_identity_max_bytes_, "source_identity_max_bytes");
   aAttrib.put(cur);
 
   if (cuspC == "yes")
     doCuspCorrection = true;
+  if (!source_identity_.empty())
+  {
+#ifdef QMC_COMPLEX
+    throw std::runtime_error("LCAO file-image identity currently requires a real CPU build");
+#endif
+    if (h5_path.empty() || source_identity_max_bytes_ == 0 || source_identity_max_bytes_ > 1048576 ||
+        doCuspCorrection || PBCImages != TinyVector<int, 3>(0) || SuperTwist != PosType(0) ||
+        targetPtcl.getLattice().SuperCellEnum != SUPERCELL_OPEN)
+      throw std::runtime_error("LCAO file-image identity requires open CPU/no-cusp input and a positive cap <=1048576");
+  }
   //Evaluate the Phase factor. Equals 1 for OBC.
   EvalPeriodicImagePhaseFactors(SuperTwist, PeriodicImagePhaseFactors, PeriodicImageDisplacements);
 
@@ -176,6 +188,72 @@ LCAOrbitalBuilder::LCAOrbitalBuilder(ParticleSet& els, ParticleSet& ions, Commun
 LCAOrbitalBuilder::~LCAOrbitalBuilder()
 {
   //properly cleanup
+}
+
+void LCAOrbitalBuilder::checkSourceIdentity(hdf_archive& archive)
+{
+  if (source_identity_.empty())
+    return;
+  std::string error, hex;
+  if (myComm->rank() == 0)
+    try
+    {
+      const hid_t file = archive.getFileID(), properties = H5Fget_access_plist(file);
+      const bool serial = properties >= 0 && H5Pget_driver(properties) == H5FD_SEC2;
+      if (properties >= 0) H5Pclose(properties);
+      unsigned intent = ~0U;
+      if (!serial || H5Fget_intent(file, &intent) < 0 || intent != H5F_ACC_RDONLY)
+        throw std::runtime_error("LCAO file-image identity requires read-only SEC2 without SWMR");
+      const auto extent = H5Fget_file_image(file, nullptr, 0);
+      if (extent <= 0 || static_cast<std::size_t>(extent) > source_identity_max_bytes_)
+        throw std::runtime_error("LCAO file-image size " + std::to_string(extent) +
+                                 " exceeds positive source_identity_max_bytes " + std::to_string(source_identity_max_bytes_));
+      const auto links = [](hid_t, const char*, const H5L_info_t* info, void*) -> herr_t {
+        return info->type == H5L_TYPE_HARD ? 0 : -1;
+      };
+      const auto datasets = [](hid_t location, const char* name, const H5O_info_t* info, void*) -> herr_t {
+        if (info->type != H5O_TYPE_DATASET) return 0;
+        const hid_t dataset = H5Dopen2(location, name, H5P_DEFAULT);
+        const hid_t creation = dataset >= 0 ? H5Dget_create_plist(dataset) : -1;
+        const bool contained = creation >= 0 && H5Pget_external_count(creation) == 0 &&
+            H5Pget_layout(creation) != H5D_VIRTUAL && H5Pget_layout(creation) != H5D_LAYOUT_ERROR;
+        if (creation >= 0) H5Pclose(creation);
+        if (dataset >= 0) H5Dclose(dataset);
+        return contained ? 0 : -1;
+      };
+      if (H5Lvisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, links, nullptr) < 0 ||
+          H5Ovisit(file, H5_INDEX_NAME, H5_ITER_NATIVE, datasets, nullptr) < 0)
+        throw std::runtime_error("LCAO file-image identity rejects non-hard links, external storage and virtual datasets");
+      std::vector<unsigned char> image(static_cast<std::size_t>(extent));
+      if (H5Fget_file_image(file, image.data(), image.size()) != extent)
+        throw std::runtime_error("LCAO file-image capture failed");
+      constexpr char digits[] = "0123456789abcdef";
+      hex.resize(image.size() * 2);
+      for (std::size_t i = 0; i < image.size(); ++i)
+      {
+        hex[2 * i] = digits[image[i] >> 4];
+        hex[2 * i + 1] = digits[image[i] & 15];
+      }
+      if (file_identity_ && file_identity_->image_hex != hex)
+        throw std::runtime_error("LCAO source image changed between actual reader handles");
+    }
+    catch (const std::exception& failure) { error = failure.what(); }
+  // No rank reaches the following basis/coefficient broadcast after a failed
+  // reader check. Ordinary construction never enters this opt-in collective.
+  myComm->bcast(error);
+  if (!error.empty()) throw std::runtime_error(error);
+  if (!file_identity_)
+  {
+    myComm->bcast(hex);
+    std::shared_ptr<const LCAOFileImageIdentity> prepared;
+    int ready = 1;
+    try { prepared = std::make_shared<const LCAOFileImageIdentity>(LCAOFileImageIdentity{h5_path, std::move(hex)}); }
+    catch (const std::exception&) { ready = 0; }
+    myComm->allreduce(ready);
+    if (ready != myComm->size())
+      throw std::runtime_error("LCAO file-image record allocation failed on a rank");
+    file_identity_ = std::move(prepared);
+  }
 }
 
 int LCAOrbitalBuilder::determineRadialOrbType(xmlNodePtr cur) const
@@ -278,7 +356,10 @@ std::unique_ptr<BasisSet_t> LCAOrbitalBuilder::loadBasisSetFromH5(xmlNodePtr par
   {
     if (!hin.open(h5_path, H5F_ACC_RDONLY))
       PRE.error("Could not open H5 file", true);
-
+  }
+  checkSourceIdentity(hin);
+  if (myComm->rank() == 0)
+  {
     hin.push("basisset", false);
 
     std::string sph;
@@ -289,9 +370,9 @@ std::unique_ptr<BasisSet_t> LCAOrbitalBuilder::loadBasisSetFromH5(xmlNodePtr par
     if (!hin.readEntry(sph, "angular"))
       PRE.error("Could not find name of  basisset group in H5; Probably Corrupt H5 file", true);
     ylm = (sph == "cartesian") ? 0 : 1;
-    hin.close();
   }
-
+  checkSourceIdentity(hin);
+  if (myComm->rank() == 0) hin.close();
   myComm->bcast(ylm);
   if (ylm < 0)
     PRE.error("Missing angular attribute of atomicBasisSet.", true);
@@ -407,7 +488,10 @@ LCAOrbitalBuilder::BasisSet_t* LCAOrbitalBuilder::createBasisSetH5()
   {
     if (!hin.open(h5_path, H5F_ACC_RDONLY))
       PRE.error("Could not open H5 file", true);
-
+  }
+  checkSourceIdentity(hin);
+  if (myComm->rank() == 0)
+  {
     hin.push("basisset", false);
 
     hin.read(Nb_Elements, "NbElements");
@@ -456,6 +540,7 @@ LCAOrbitalBuilder::BasisSet_t* LCAOrbitalBuilder::createBasisSetH5()
       hin.pop();
   }
 
+  checkSourceIdentity(hin);
   if (myComm->rank() == 0)
   {
     hin.pop();
@@ -490,6 +575,8 @@ std::unique_ptr<SPOSet> LCAOrbitalBuilder::createSPOSetFromXML(xmlNodePtr cur)
     if (cname.find("coeff") < cname.size() || cname == "parameter" || cname == "Var")
       identity = false;
   });
+  if (!source_identity_.empty() && (useOffload || identity || !cusp_file.empty()))
+    throw std::runtime_error("LCAO file-image identity requires CPU coefficients without cusp inputs");
 
   std::unique_ptr<BasisSet_t> myBasisSet;
   if (basisset_map_.find(basisset_name) == basisset_map_.end())
@@ -526,6 +613,7 @@ std::unique_ptr<SPOSet> LCAOrbitalBuilder::createSPOSetFromXML(xmlNodePtr cur)
     auto lcos = std::make_unique<LCAOrbitalSet>(spo_name, std::move(myBasisSet), norbs, identity, useOffload);
     if (!identity)
       loadMO(*lcos, cur);
+    lcos->file_identity_ = file_identity_;
     sposet = std::move(lcos);
   }
 
@@ -637,7 +725,10 @@ bool LCAOrbitalBuilder::loadMO(LCAOrbitalSet& spo, xmlNodePtr cur)
     {
       if (!hin.open(h5_path, H5F_ACC_RDONLY))
         APP_ABORT("LCAOrbitalBuilder::putFromH5 missing or incorrect path to H5 file.");
-
+    }
+    checkSourceIdentity(hin);
+    if (myComm->rank() == 0)
+    {
       try
       {
         hin.push("PBC", false);
@@ -652,9 +743,12 @@ bool LCAOrbitalBuilder::loadMO(LCAOrbitalSet& spo, xmlNodePtr cur)
       if (PBC)
         hin.read(PBC, "PBC");
 
-      hin.close();
     }
+    checkSourceIdentity(hin);
+    if (myComm->rank() == 0) hin.close();
     myComm->bcast(PBC);
+    if (PBC && !source_identity_.empty())
+      throw std::runtime_error("LCAO file-image identity currently requires nonperiodic HDF coefficients");
     if (PBC)
       success = putPBCFromH5(spo, coeff_ptr);
     else
@@ -725,7 +819,10 @@ bool LCAOrbitalBuilder::putFromH5(LCAOrbitalSet& spo, xmlNodePtr coeff_ptr)
   {
     if (!hin.open(h5_path, H5F_ACC_RDONLY))
       APP_ABORT("LCAOrbitalBuilder::putFromH5 missing or incorrect path to H5 file.");
-
+  }
+  checkSourceIdentity(hin);
+  if (myComm->rank() == 0)
+  {
     Matrix<RealType> Ctemp;
     std::array<char, 72> name;
 
@@ -743,7 +840,6 @@ bool LCAOrbitalBuilder::putFromH5(LCAOrbitalSet& spo, xmlNodePtr coeff_ptr)
       setname = std::string(name.data(), name_len);
       hin.read(Ctemp, setname);
     }
-    hin.close();
 
     if (Ctemp.cols() != spo.getBasisSetSize())
     {
@@ -773,6 +869,8 @@ bool LCAOrbitalBuilder::putFromH5(LCAOrbitalSet& spo, xmlNodePtr coeff_ptr)
       n++;
     }
   }
+  checkSourceIdentity(hin);
+  if (myComm->rank() == 0) hin.close();
   myComm->bcast(*spo.C);
   return true;
 }

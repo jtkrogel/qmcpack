@@ -117,6 +117,11 @@ protected:
                             Matrix<LCAOrbitalBuilder::RealType>& Creal) const;
 
 private:
+  std::string source_identity_;
+  std::size_t source_identity_max_bytes_ = 0;
+  std::shared_ptr<const LCAOFileImageIdentity> file_identity_;
+  /// Collective admission around each actual HDF read, before its next data broadcast.
+  void checkSourceIdentity(hdf_archive& archive);
   ///load a basis set from XML input
   std::unique_ptr<BasisSet_t> loadBasisSetFromXML(xmlNodePtr cur, xmlNodePtr parent);
   ///load a basis set from h5 file
