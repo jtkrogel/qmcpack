@@ -285,11 +285,18 @@ StructuredParameterSnapshot LinearMethodUpdateRule::propose(const StructuredPara
     }
     catch (...) { failure = std::current_exception(); }
     // Agree local validation/allocation and the fallback schedule before any products.
-    const double nonlinear_ranks = factor_.reduceSampleScalar({nonlinear_tangent ? 1.0 : 0.0, 0}, failure).real();
-    const double ranks = factor_.reduceSampleScalar({1, 0}).real();
-    if (nonlinear_ranks != 0 && nonlinear_ranks != ranks)
-      throw std::invalid_argument("Mixed LM ranks disagree on the nonlinear tangent chart");
-    linear_fallback = nonlinear_ranks == 0;
+    const double local_samples = factor_.localSampleVectorSize();
+    const double nonlinear_samples = factor_.reduceSampleScalar({nonlinear_tangent ? local_samples : 0, 0}, failure).real();
+    const double samples = factor_.reduceSampleScalar({local_samples, 0}).real();
+    try
+    {
+      if ((nonlinear_samples != 0 && nonlinear_samples != samples) || nonlinear_tangent != (nonlinear_samples != 0))
+        throw std::invalid_argument("Mixed LM ranks disagree on the nonlinear tangent chart");
+    }
+    catch (...) { failure = std::current_exception(); }
+    // Empty ranks must contribute zero numeric moments, but still agree on readiness.
+    factor_.reduceSampleScalar({}, failure);
+    linear_fallback = nonlinear_samples == 0;
     if (!linear_fallback)
     {
       const double reference = result_.eigenvector[0].real();
