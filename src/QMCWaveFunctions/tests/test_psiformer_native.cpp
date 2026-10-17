@@ -364,6 +364,58 @@ TEST_CASE("PsiFormer native prepared flat replacement preserves graph ownership"
   CHECK(parameters.version() == std::numeric_limits<std::size_t>::max());
 }
 
+TEST_CASE("PsiFormer same-version mirror refresh preserves graph storage",
+          "[wavefunction][psiformer][prepared_parameters]")
+{
+  pf::Parameters parameters({0.5, -0.25, 0.75},
+                            {{"tiny", "weight", {2}, 0, 2}, {"tiny", "bias", {}, 2, 3}});
+  const auto weight = parameters.nodes.at({"tiny", "weight"});
+  const auto bias = parameters.nodes.at({"tiny", "bias"});
+  const auto* flat_storage = parameters.values.data();
+  const auto* weight_storage = weight->value.x.data();
+  const auto* bias_storage = bias->value.x.data();
+  const auto original = parameters.flat_values();
+  parameters.parameter_version = 3; // DEVICE publication already advanced metadata.
+  {
+    auto discarded = parameters.prepare_same_version_flat_values({0.125, -0.5, 1.25}, 3);
+    CHECK(parameters.flat_values() == original);
+  }
+  CHECK(parameters.version() == 3);
+  std::vector<double> downloaded{0.125, -0.5, 1.25};
+  auto action = parameters.prepare_same_version_flat_values(std::move(downloaded), 3);
+  CHECK(downloaded.empty()); // Preparation took ownership, rather than copying P.
+  CHECK(parameters.flat_values() == original);
+  auto moved = std::move(action);
+  CHECK(moved.commit() == 3);
+  CHECK(parameters.version() == 3);
+  CHECK(parameters.flat_values() == std::vector<double>{0.125, -0.5, 1.25});
+  CHECK(weight->value.x == std::vector<double>{0.125, -0.5});
+  CHECK(bias->value.x == std::vector<double>{1.25});
+  CHECK(parameters.values.data() == flat_storage);
+  CHECK(weight->value.x.data() == weight_storage);
+  CHECK(bias->value.x.data() == bias_storage);
+  CHECK(parameters.nodes.at({"tiny", "weight"}) == weight);
+  CHECK(parameters.nodes.at({"tiny", "bias"}) == bias);
+
+  const auto accepted = parameters.flat_values();
+  CHECK_THROWS_AS(parameters.prepare_same_version_flat_values(std::vector<double>(accepted), 2), std::runtime_error);
+  CHECK_THROWS_AS(parameters.prepare_same_version_flat_values({1.0}, 3), std::invalid_argument);
+  auto nonfinite = accepted;
+  nonfinite[0] = std::numeric_limits<double>::quiet_NaN();
+  CHECK_THROWS_AS(parameters.prepare_same_version_flat_values(std::move(nonfinite), 3), std::invalid_argument);
+  weight->value.x.push_back(0.0);
+  CHECK_THROWS_AS(parameters.prepare_same_version_flat_values(std::vector<double>(accepted), 3), std::logic_error);
+  weight->value.x.pop_back();
+  CHECK(parameters.flat_values() == accepted);
+  CHECK(parameters.version() == 3);
+
+  parameters.parameter_version = std::numeric_limits<std::size_t>::max();
+  auto last_version_refresh = parameters.prepare_same_version_flat_values(std::vector<double>(accepted), parameters.version());
+  CHECK(last_version_refresh.commit() == std::numeric_limits<std::size_t>::max());
+  CHECK(parameters.values.data() == flat_storage);
+  CHECK(weight->value.x.data() == weight_storage);
+}
+
 TEST_CASE("PsiFormer synchronized flat parameter mutation and export", "[wavefunction][psiformer]")
 {
   GeneratedFiles files = generateFiles("lih");

@@ -1996,7 +1996,8 @@ struct Parameters
     PreparedFlatValues& operator=(PreparedFlatValues&&) = delete;
     PreparedFlatValues(PreparedFlatValues&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), expected_version_(other.expected_version_),
-          flat_storage_(other.flat_storage_), candidate_(std::move(other.candidate_)), leaves_(std::move(other.leaves_))
+          flat_storage_(other.flat_storage_), candidate_(std::move(other.candidate_)), leaves_(std::move(other.leaves_)),
+          advance_version_(other.advance_version_)
     {}
 
     /** Install once using only pre-resolved fixed-size copies.
@@ -2017,7 +2018,7 @@ struct Parameters
       std::copy(candidate_.begin(), candidate_.end(), flat_storage_);
       for (const Leaf& leaf : leaves_)
         std::copy(candidate_.begin() + leaf.begin, candidate_.begin() + leaf.end, leaf.storage);
-      const size_t committed_version = ++owner_->parameter_version;
+      const size_t committed_version = advance_version_ ? ++owner_->parameter_version : owner_->parameter_version;
       owner_ = nullptr;
       return committed_version;
     }
@@ -2033,9 +2034,9 @@ struct Parameters
     };
 
     PreparedFlatValues(Parameters& owner, size_t expected_version,
-                       const std::vector<double>& candidate, std::vector<Leaf>&& leaves)
+                       std::vector<double>&& candidate, std::vector<Leaf>&& leaves, bool advance_version)
         : owner_(&owner), expected_version_(expected_version), flat_storage_(owner.values.data()),
-          candidate_(candidate), leaves_(std::move(leaves))
+          candidate_(std::move(candidate)), leaves_(std::move(leaves)), advance_version_(advance_version)
     {}
 
     Parameters* owner_;
@@ -2043,6 +2044,7 @@ struct Parameters
     double* flat_storage_;
     std::vector<double> candidate_;
     std::vector<Leaf> leaves_;
+    const bool advance_version_;
   };
 
   /// Load flattened parameters, then use the common in-memory validation path.
@@ -2115,6 +2117,26 @@ struct Parameters
   /// Validate and resolve all fallible work without modifying canonical/graph values.
   PreparedFlatValues prepare_flat_values(const std::vector<double>& new_values, size_t expected_version)
   {
+    auto leaves = resolve_flat_replacement(new_values, expected_version, true);
+    return PreparedFlatValues(*this, expected_version, std::vector<double>(new_values), std::move(leaves), true);
+  }
+
+  /** Prepare a cold HOST mirror refresh of an already-current DEVICE version.
+   *
+   * Owns the moved download without another P-sized copy. Commit preserves the
+   * authoritative version and canonical/leaf storage identities. The caller
+   * must hold exclusive model authority and verify the source image/version.
+   */
+  PreparedFlatValues prepare_same_version_flat_values(std::vector<double>&& new_values, size_t expected_version)
+  {
+    auto leaves = resolve_flat_replacement(new_values, expected_version, false);
+    return PreparedFlatValues(*this, expected_version, std::move(new_values), std::move(leaves), false);
+  }
+
+private:
+  std::vector<PreparedFlatValues::Leaf> resolve_flat_replacement(const std::vector<double>& new_values,
+                                                               size_t expected_version, bool advance_version) const
+  {
     if (parameter_version != expected_version)
       throw std::runtime_error("PsiFormer prepared flat replacement rejected a stale parameter version");
     if (new_values.size() != values.size())
@@ -2122,7 +2144,7 @@ struct Parameters
     if (std::any_of(new_values.begin(), new_values.end(),
                     [](double value) { return !is_finite_parameter_value(value); }))
       throw std::invalid_argument("PsiFormer flat parameter vector contains a non-finite value");
-    if (parameter_version == std::numeric_limits<size_t>::max())
+    if (advance_version && parameter_version == std::numeric_limits<size_t>::max())
       throw std::overflow_error("PsiFormer parameter version exhausted");
 
     std::vector<PreparedFlatValues::Leaf> leaves;
@@ -2140,9 +2162,10 @@ struct Parameters
     }
     if (expected_begin != values.size())
       throw std::logic_error("PsiFormer parameter layout does not cover the complete flat vector");
-    return PreparedFlatValues(*this, expected_version, new_values, std::move(leaves));
+    return leaves;
   }
 
+public:
   /// Return a stable fingerprint of the immutable exported tensor layout.
   std::string layout_fingerprint() const
   {
