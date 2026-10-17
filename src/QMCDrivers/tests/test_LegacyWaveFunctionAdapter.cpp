@@ -3773,8 +3773,8 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapter][ci_family_oracle]")
 {
   // Preserve the existing AE DETS/CSF cases, then exercise pure DETS ECP.
-  const int model = GENERATE(0, 1, 2);
-  const bool csf = model == 1, ecp = model == 2;
+  const int model = GENERATE(0, 1, 2, 3);
+  const bool csf = model == 1, mixed_ecp = model == 3, ecp = model >= 2;
   CAPTURE(model);
   ParticleSetPool pool(OHMMS::Controller);
   Libxml2Document definition;
@@ -3813,7 +3813,7 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     xmlFreeNode(removed);
   }
   for (auto* j = xmlFirstElementChild(wavefunction); j; j = xmlNextElementSibling(j))
-    if (xmlStrEqual(j->name, BAD_CAST "jastrow"))
+    if (!mixed_ecp && xmlStrEqual(j->name, BAD_CAST "jastrow"))
       for (auto* correlation = xmlFirstElementChild(j); correlation; correlation = xmlNextElementSibling(correlation))
         for (auto* coefficient = xmlFirstElementChild(correlation); coefficient; coefficient = xmlNextElementSibling(coefficient))
           xmlSetProp(coefficient, BAD_CAST "optimize", BAD_CAST "no");
@@ -3834,7 +3834,7 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     CHECK(std::abs(fixed_coefficients[0] - 0.6) > 0.1);
   }
   LegacyWaveFunctionAdapter adapter("ci/family-oracle", *source, adapterOptions());
-  REQUIRE(adapter.parameterSchema().parameterCount() == 1);
+  REQUIRE(adapter.parameterSchema().parameterCount() == (mixed_ecp ? 5 : 1));
   REQUIRE(adapter.parameterSchema().blocks()[0].update_group == "legacy_linear");
   ParticleSet private_particles(particles);
   auto evaluator = source->makeClone(private_particles);
@@ -3881,6 +3881,191 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
       for (int j = 0; j < i; ++j) energy += 1.0 / std::sqrt(dot(ions.R[i] - ions.R[j], ions.R[i] - ions.R[j]));
     return energy;
   };
+  if (mixed_ecp)
+  {
+    // Actual fixed-SPO Be CI/J2: independent scalar evaluations reuse each
+    // captured physical grid, never newly randomized candidate quadrature.
+    constexpr std::size_t n = 5, m = 4, augmented = n + 1;
+    const auto parameters = adapter.snapshotParameters();
+    const auto frame = std::make_shared<const StructuredParameterSnapshot>(parameters);
+    const auto& schema = adapter.parameterSchema();
+    ParticleSet sibling_particles(particles);
+    auto sibling = source->makeClone(sibling_particles);
+    sibling_particles.update(); sibling->evaluateLog(sibling_particles);
+    const auto sibling_log = sibling->getLogPsi();
+    const auto source_kinetic = kineticEnergy(particles), sibling_kinetic = kineticEnergy(sibling_particles);
+    for (const auto& block : schema.blocks())
+      CHECK((block.update_group == "legacy_linear") == (block.offset == 0));
+    const auto* source_spo = &source->getSPOSet("fixed");
+    struct PhysicalRecord
+    {
+      ParticleSet::ParticlePos positions;
+      std::vector<NonLocalECPReplayPoint> points;
+      double local, log, phase;
+    };
+    std::array<PhysicalRecord, m> physical;
+    std::array<std::array<double, n>, m> scores{}, del{};
+    std::array<DerivativeValue, m> energies{};
+    const std::array<double, m> weights{1, 2, 1, 2};
+    std::array<double, n> mean{};
+    std::vector<std::unique_ptr<StreamingDerivativeOperator>> owners;
+    std::vector<ScoreCovarianceBatch> batches;
+    const auto scalar = [&](std::size_t sample, const StructuredParameterSnapshot& point) {
+      const auto& record = physical[sample];
+      ParticleSet p(particles); p.R = record.positions; p.update();
+      auto wf = source->makeClone(p);
+      wf->findMSD()[0].get().isolateOptimizationState();
+      wf->findMSD()[0].get().enableAcceptedReferenceVirtualRatios();
+      adapter.installSnapshot(*wf, p, point);
+      const double log = wf->getLogPsi(), phase = wf->getPhase();
+      const auto separation = p.R[0] - p.R[1];
+      double energy = kineticEnergy(p).real() + record.local + 1 / std::sqrt(dot(separation, separation));
+      for (const auto& knot : record.points)
+      {
+        p.R = record.positions;
+        for (int d = 0; d < 3; ++d) p.R[knot.electron][d] = knot.replacement_position[d];
+        p.update(); wf->evaluateLog(p);
+        CHECK(knot.bare_weight.imag() == 0);
+        energy += knot.bare_weight.real() * std::exp(wf->getLogPsi() - log) * std::cos(wf->getPhase() - phase);
+      }
+      CHECK(wf->findMSD()[0].get().fixedCoefficientReference() == .6);
+      return std::array<double, 2>{std::exp(log - record.log) * std::cos(phase - record.phase), energy};
+    };
+    for (std::size_t sample = 0; sample < m; ++sample)
+    {
+      replay->prepareSample(sample);
+      adapter.installSnapshot(*evaluator, private_particles, parameters);
+      auto one = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
+          std::vector<double>{sample_shifts[sample]});
+      auto products = adapter.makeDerivativeOperator(one, frame, sample + 1, sample);
+      auto consumer = adapter.makeNonLocalECPDerivativeConsumer(one, frame, sample + 1, sample);
+      physical[sample].positions = private_particles.R;
+      physical[sample].log = evaluator->getLogPsi(); physical[sample].phase = evaluator->getPhase();
+      physical[sample].local = local->evaluate(private_particles);
+      const std::vector<DerivativeValue> unit{1};
+      const VJPCoefficientChannel capture{"capture", DerivativeProduct::LOCAL_ENERGY_VJP,
+          coefficientsFor(*products, unit), localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+      RecordingParameterSink sink;
+      {
+        ResourceCollectionTeamLock<ParticleSet> pl(pr, ps);
+        ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, ws);
+        ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hs);
+        energies[sample] = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+            hs, ws, ps, *consumer, {&capture, 1}, sink).local_energies[0];
+      }
+      auto grid = consumer->releaseJVPReplay();
+      physical[sample].points.assign(grid->points().begin(), grid->points().end());
+      products->bindNonLocalECPJVPReplay(std::move(grid));
+      REQUIRE(!physical[sample].points.empty());
+      const auto base = scalar(sample, parameters);
+      CHECK(base[0] == Catch::Approx(1).margin(2e-12));
+      CHECK(base[1] == Catch::Approx(energies[sample].real()).epsilon(3e-12).margin(3e-12));
+      const std::array<VJPCoefficientChannel, 2> channels{{
+          {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*products, unit), 0},
+          {"energy", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*products, unit), terms}}};
+      RecordingParameterSink rows;
+      products->applyVJPs({channels.data(), 2}, DerivativeAdjoint::TRANSPOSE, rows);
+      for (std::size_t p = 0; p < n; ++p)
+      {
+        auto plus = parameters, minus = parameters;
+        plus.values[p] += 1e-5; minus.values[p] -= 1e-5;
+        const auto positive = scalar(sample, plus), negative = scalar(sample, minus);
+        scores[sample][p] = (positive[0] - negative[0]) / 2e-5;
+        del[sample][p] = (positive[1] - negative[1]) / 2e-5;
+        CHECK(rows.result()[0][p].real() == Catch::Approx(scores[sample][p]).epsilon(3e-6).margin(3e-8));
+        CHECK(rows.result()[1][p].real() == Catch::Approx(del[sample][p]).epsilon(3e-6).margin(3e-8));
+        mean[p] += weights[sample] * scores[sample][p] / 6;
+      }
+      batches.push_back({products.get(), {&weights[sample], 1}, {&energies[sample], 1}});
+      owners.push_back(std::move(products));
+    }
+    const auto rng_before = rng;
+    const DerivativeArrayView<const ScoreCovarianceBatch> views{batches.data(), batches.size()};
+    ScoreCovarianceFactor factor(schema, parameters.version, views);
+    SampledLinearMethodOperator h(factor, views, terms, false, true, 0);
+    SampledLinearMethodOperator raw_h(factor, views, terms, false, false, 0);
+    SampledLinearMethodOperator s(factor, views, terms, true, false, 0);
+    std::array<std::array<double, augmented>, augmented> dense_s{}, dense_raw{}, dense_h{};
+    for (std::size_t sample = 0; sample < m; ++sample)
+    {
+      std::array<double, augmented> d{1}, l{energies[sample].real()};
+      for (std::size_t p = 0; p < n; ++p)
+      { d[p + 1] = scores[sample][p] - mean[p]; l[p + 1] = del[sample][p] + energies[sample].real() * d[p + 1]; }
+      for (std::size_t row = 0; row < augmented; ++row)
+        for (std::size_t column = 0; column < augmented; ++column)
+        {
+          dense_s[row][column] += weights[sample] * d[row] * d[column] / 6;
+          dense_raw[row][column] += weights[sample] * d[row] * l[column] / 6;
+          dense_h[row][column] += weights[sample] * (d[row] * l[column] + l[row] * d[column]) / 12;
+        }
+    }
+    REQUIRE(std::abs(dense_s[1][2]) > 1e-10); // Actual CI/J2 cross covariance stays in the pencil.
+    for (std::size_t column = 0; column < augmented; ++column)
+    {
+      std::array<DerivativeValue, augmented> direction{}, ha{}, sa{}, raw{};
+      direction[column] = 1;
+      h.apply({direction.data(), augmented}, {ha.data(), augmented});
+      s.apply({direction.data(), augmented}, {sa.data(), augmented});
+      raw_h.apply({direction.data(), augmented}, {raw.data(), augmented});
+      for (std::size_t row = 0; row < augmented; ++row)
+      {
+        CHECK(ha[row].real() == Catch::Approx(dense_h[row][column]).epsilon(3e-6).margin(3e-8));
+        CHECK(sa[row].real() == Catch::Approx(dense_s[row][column]).epsilon(3e-6).margin(3e-8));
+        CHECK(raw[row].real() == Catch::Approx(dense_raw[row][column]).epsilon(3e-6).margin(3e-8));
+      }
+    }
+    // A common reference/tangent shear applies to LM and ALM alike; a finite
+    // mixed Jastrow candidate equals the Ritz state only to first order.
+    MatrixFreeLinearMethodResult solved;
+    solved.provider_id = schema.providerId(); solved.schema_fingerprint = schema.fingerprint();
+    solved.parameter_version = parameters.version; solved.converged = true;
+    solved.stop_reason = LinearMethodStopReason::CONVERGED;
+    solved.eigenvector = {1, .03, .02, -.01, .015, -.025};
+    double qn = 0;
+    for (std::size_t p = 1; p < n; ++p)
+      for (std::size_t q = 1; q < n; ++q)
+        qn += solved.eigenvector[p + 1].real() * dense_s[p + 1][q + 1] * solved.eigenvector[q + 1].real();
+    const double denominator = 1 - .03 * mean[0] + qn / (1 + std::sqrt(1 + qn));
+    const auto gradient = factor.scoreCovarianceGradient();
+    const ParameterGradientView objective{schema.fingerprint(), parameters.version, ReductionDomain::GLOBAL,
+        {gradient.data(), gradient.size()}};
+    for (double rate : {1e-3, 5e-4})
+    {
+      LinearMethodUpdateRule update(factor, solved, rate, .5, LinearMethodNormalization::MIXED_FIXED_REFERENCE, views);
+      const auto mapped = update.propose(schema, parameters, objective);
+      auto opposite = parameters;
+      for (std::size_t p = 0; p < n; ++p)
+      {
+        const double tangent = solved.eigenvector[p + 1].real() / denominator;
+        CHECK(mapped.values[p] == Catch::Approx(parameters.values[p] + rate * tangent).margin(3e-12));
+        opposite.values[p] -= rate * tangent;
+      }
+      for (std::size_t sample = 0; sample < m; ++sample)
+      {
+        double log_tangent = 0, energy_tangent = 0;
+        for (std::size_t p = 0; p < n; ++p)
+        {
+          log_tangent += scores[sample][p] * solved.eigenvector[p + 1].real() / denominator;
+          energy_tangent += del[sample][p] * solved.eigenvector[p + 1].real() / denominator;
+        }
+        const auto positive = scalar(sample, mapped), negative = scalar(sample, opposite);
+        CHECK((positive[0] - negative[0]) / (2 * rate) == Catch::Approx(log_tangent).epsilon(3e-6).margin(3e-8));
+        CHECK((positive[1] - negative[1]) / (2 * rate) == Catch::Approx(energy_tangent).epsilon(3e-6).margin(3e-8));
+      }
+    }
+    auto rng_after = rng, expected_rng = rng_before;
+    CHECK(rng_after() == expected_rng());
+    source->evaluateLog(particles);
+    sibling->evaluateLog(sibling_particles);
+    CHECK(source->getLogPsi() == source_log);
+    CHECK(kineticEnergy(particles) == source_kinetic);
+    CHECK(kineticEnergy(sibling_particles) == sibling_kinetic);
+    CHECK(source->findMSD()[0].get().get_C() == fixed_coefficients);
+    CHECK(sibling->findMSD()[0].get().get_C() == fixed_coefficients);
+    CHECK(&source->getSPOSet("fixed") == source_spo);
+    CHECK(sibling->getLogPsi() == sibling_log);
+    return;
+  }
   for (double coefficient : {0.0, 0.1})
   {
     CAPTURE(coefficient);
