@@ -1,7 +1,7 @@
 Diamond fixed-spline conventional CPU consumer
 ==============================================
 
-The candidate shared-checker ``--periodic-spline`` mode derives a task-owned
+The qualified shared-checker ``--periodic-spline`` mode derives a task-owned
 training XML from qmc_short_vmcbatch.in.xml; it does not duplicate or edit the
 tracked ES-HDF or C.BFD.xml. It preserves Ne8 (4/4), C2, lattice, Gamma twist,
 shared four-MO double CPU spline and all 24 original J1/J2 coefficients.
@@ -19,6 +19,9 @@ physical VMC reuse, fresh import/re-export and strict exact initialized split
 restart. One tightened cutoff32 import/restart negative preserves accuracy.
 
 Independent direct-adapter physical/cache proof passed 335 assertions at
-source ``232a533ae``, separately from Binding/native admission. Native qualification
-and CTest registration remain pending root's application gate. CPU real/full
+source ``232a533ae``, separately from Binding/native admission. Native round117
+passed at application source ``2b8f88a99`` with checker-only correction
+``86b8347d9``: all positive workflows, strict initialized restart and identity
+negatives passed. CTest ``short-diamondC-conventional-wftrain-spline`` registers
+this one profile with a 300-second deadline. CPU real/full
 precision only; no complex, offload, orbital rotation, MD or other loader claim.
