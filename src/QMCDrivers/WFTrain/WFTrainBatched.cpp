@@ -1504,7 +1504,7 @@ void WFTrainBatched::process(xmlNodePtr node)
         }
       if (active_linear && (linear_method || inverse_iteration))
       {
-        // Only PII/minPII have a qualified additive mixed CI/J2 tangent map.
+        // PII/minPII form additive local-chart steps, not mixed Ritz-state retractions.
         const bool joint_ci_j2 = inverse_iteration && active_linear != active_variables &&
             multideterminants.size() == 1 &&
             std::all_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
@@ -1512,9 +1512,16 @@ void WFTrainBatched::process(xmlNodePtr node)
                   return component->getClassName() == "MultiSlaterDetTableMethod" ||
                       component->getClassName() == "TwoBodyJastrow";
                 });
-        if ((active_linear != active_variables && !joint_ci_j2) || conventional_binding_->hasOrbitalRotations() ||
+        const bool joint_ci_orbital_ecp = joint_ci_j2 && conventional_binding_->hasOrbitalRotations() &&
+            population_.get_golden_hamiltonian().hasPhysicalNLPP() && !multideterminants[0].get().hasCSFExpansion() &&
+            std::any_of(student_prototype_.getOrbitals().begin(), student_prototype_.getOrbitals().end(),
+                [](const auto& component) { return component->getClassName() == "TwoBodyJastrow"; });
+        if (joint_ci_orbital_ecp)
+          multideterminants[0].get().validateAcceptedReferenceOrbitalProfile();
+        if ((active_linear != active_variables && !joint_ci_j2) ||
+            (conventional_binding_->hasOrbitalRotations() && !joint_ci_orbital_ecp) ||
             multideterminants.size() != 1)
-          throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit fixed-orbital CI with J2; other mixed updates remain unqualified");
+          throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit CI/J2 and qualified DETS orbital/J2 locality-ECP; other mixed updates remain unqualified");
         // Keep this locality-ECP boundary explicit beside the general mixed guard.
         if (!inverse_iteration &&
             (population_.get_golden_hamiltonian().ecpModelProvenance() || population_.get_golden_hamiltonian().hasPhysicalNLPP()) &&
