@@ -18,6 +18,7 @@
 #include "QMCDrivers/WFTrain/HighParameterTraining.h"
 #include "QMCDrivers/WFTrain/MatrixFreeStochasticReconfiguration.h"
 #include "QMCDrivers/WFTrain/MinimumStepStochasticReconfiguration.h"
+#include "QMCDrivers/WFTrain/SampledLinearMethod.h"
 #include "QMCDrivers/WFTrain/TrainingNumerics.h"
 
 #include <algorithm>
@@ -993,7 +994,7 @@ TEST_CASE("Distributed streaming SR matches one global centered dense population
 }
 
 TEST_CASE("Distributed minSR handles uneven and zero-sample ranks",
-          "[drivers][training][minsr][mpi]")
+          "[drivers][training][minsr][mixed_lm][mpi]")
 {
   Communicate& communicator = *OHMMS::Controller;
   const StructuredParameterSchema schema = makeSRSchema();
@@ -1094,6 +1095,52 @@ TEST_CASE("Distributed minSR handles uneven and zero-sample ranks",
   for (int rank = 0; rank < communicator.size(); ++rank)
     expected_global_count += localSampleCount(rank, communicator.size());
   CHECK(factor.globalSampleVectorSize() == expected_global_count);
+
+  // Reuse this unequal/empty partition for the mixed rule's chart readiness.
+  const StructuredParameterSchema mixed_schema{"distributed/mixed_lm",
+      {{"ci", {1}, 0, 1, ParameterScalarDomain::REAL64, true, "legacy_linear"},
+       {"jastrow", {1}, 1, 1, ParameterScalarDomain::REAL64, true, "legacy_loglinear"}}};
+  DistributedSRStreamingOperator mixed_stream(mixed_schema, version, communicator.rank(), local_count,
+                                              &fail_jvp, &fail_vjp);
+  const ScoreCovarianceBatch mixed_batch{&mixed_stream, {weights.data(), weights.size()},
+                                         {energies.data(), energies.size()}};
+  const auto mixed_batches = local_count ? DerivativeArrayView<const ScoreCovarianceBatch>{&mixed_batch, 1}
+                                        : DerivativeArrayView<const ScoreCovarianceBatch>{};
+  ScoreCovarianceFactor mixed_factor(mixed_schema, version, mixed_batches, ScoreSampleDomain::REAL,
+                                     DistributedParameterReduction(communicator, {1}));
+  StructuredParameterSnapshot parameters{mixed_schema.fingerprint(), version, {0.1, -0.2}};
+  MatrixFreeLinearMethodResult solved;
+  solved.provider_id = mixed_schema.providerId(); solved.schema_fingerprint = mixed_schema.fingerprint();
+  solved.parameter_version = version; solved.converged = true;
+  solved.stop_reason = LinearMethodStopReason::CONVERGED; solved.eigenvector = {1, 0.001, 0.002};
+  const ParameterGradientView objective{mixed_schema.fingerprint(), version, ReductionDomain::GLOBAL,
+                                        {gradient.data(), gradient.size()}};
+  const auto mixed_propose = [&](MatrixFreeLinearMethodResult result) {
+    LinearMethodUpdateRule rule(mixed_factor, std::move(result), 1, 0.5,
+                               LinearMethodNormalization::MIXED_FIXED_REFERENCE, mixed_batches);
+    return rule.propose(mixed_schema, parameters, objective);
+  };
+  const double q = covariance[3] * 0.002 * 0.002;
+  const double denominator = 1 - mean_score[0] * 0.001 + q / (1 + std::sqrt(1 + q));
+  const auto candidate = mixed_propose(solved);
+  CHECK(candidate.values[0] == Catch::Approx(0.1 + 0.001 / denominator).margin(1e-12));
+  CHECK(candidate.values[1] == Catch::Approx(-0.2 + 0.002 / denominator).margin(1e-12));
+  auto pure_linear = solved;
+  pure_linear.eigenvector[2] = 0;
+  CHECK(mixed_propose(pure_linear).values[0] ==
+        Catch::Approx(0.1 + 0.001 / (1 - mean_score[0] * 0.001)).margin(1e-12));
+  fail_jvp = communicator.rank() == 0;
+  CHECK_THROWS(mixed_propose(solved));
+  fail_jvp = false;
+  CHECK(mixed_propose(solved).values == candidate.values);
+  if (communicator.size() > 1)
+  {
+    auto mismatched = solved;
+    if (communicator.rank() == 1) mismatched.eigenvector[2] = 0;
+    CHECK_THROWS(mixed_propose(mismatched));
+    CHECK(mixed_propose(solved).values == candidate.values);
+  }
+  CHECK(parameters.values == std::vector<double>{0.1, -0.2});
 }
 
 TEST_CASE("Distributed matrix-free vector failures precede data collectives",
