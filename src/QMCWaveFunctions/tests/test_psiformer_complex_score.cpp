@@ -271,17 +271,26 @@ TEST_CASE("Complex orbital MSE remains finite at an exact determinant node",
 {
   auto model = tinyModel(true, true);
   const auto execution_plan = plan(model, true, true);
+  // Exactly zero paired heads produce an exact determinant node at distinct positions.
+  auto parameters = model.p.flat_values();
+  for (auto role : {ps::ParameterRole::BACKFLOW_UP_WEIGHT, ps::ParameterRole::BACKFLOW_DOWN_WEIGHT})
+    for (auto component : {ps::HeadTensorComponent::REAL, ps::HeadTensorComponent::IMAG})
+    {
+      const auto& tensor = execution_plan.parameter(role, ps::NO_ATTENTION_BLOCK, component);
+      std::fill(parameters.begin() + tensor.begin, parameters.begin() + tensor.end, 0.0);
+    }
+  model.p.set_flat_values(parameters);
   pf::DirectComplexScoreExecutor executor(model, execution_plan);
   auto workspace = executor.makeWorkspace();
   const auto positions = model.cfg.configuration(0);
   workspace->setPositions(pf::GeometryPositionView::interleaved(positions.x.data(), model.ne));
-  for (std::size_t dimension = 0; dimension < 3; ++dimension)
-    workspace->setPosition(1, dimension, positions.x[dimension]);
   CHECK_THROWS_AS(executor.evaluate(*workspace), std::domain_error);
   std::vector<C> target(model.ndet * model.ne * model.ne, C{0.2, -0.4});
   std::vector<double> gradient(model.p.size());
   const auto result = executor.evaluateOrbitalMSE(*workspace,
       {target.data(), target.size(), gradient.data(), gradient.size()});
+  for (std::size_t index = 0; index < result.orbital_count; ++index)
+    CHECK(result.orbital_matrices[index] == C{});
   ps::determinant::ComplexDeterminantWorkspace determinant(model.ndet, model.ne);
   CHECK(determinant.evaluate(result.orbital_matrices).amplitude.isZero());
   CHECK(std::isfinite(result.loss));
