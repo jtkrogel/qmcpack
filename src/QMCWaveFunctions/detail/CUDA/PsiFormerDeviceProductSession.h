@@ -63,6 +63,18 @@ class PreparedDeviceProductSession final : private PsiFormerAcceleratorHooks
   };
 
 public:
+  /** Pin completed numeric provenance, not session lifetime. The outer owner and
+   * exclusive provider lease must retain this session/backend through all reads.
+   */
+  struct CompletedScoreContraction
+  {
+  private:
+    friend class PreparedDeviceProductSession;
+    const PreparedDeviceProductSession* owner = nullptr;
+    std::shared_ptr<const PreparedDeviceModel> image;
+    std::size_t generation = 0, channels = 0;
+  };
+
   /// Allocate scratch once while the owning backend's control mutex is held.
   /// Product graphs are FP64: no mixed adapter is attached, and the backend rejects mixed preparation.
   PreparedDeviceProductSession(const std::shared_ptr<const PreparedDeviceModel>& active_image,
@@ -461,6 +473,43 @@ public:
       validateContractionControl(version);
       if (!score_contraction_)
         throw std::logic_error("Device score contraction was not prepared");
+      score_contraction_->downloadChunk(channel, offset, destination, count);
+    }
+    catch (...)
+    {
+      invalidateScoreContraction();
+      throw;
+    }
+  }
+
+  /// Freeze admitted output before releasing model authority for caller callbacks.
+  CompletedScoreContraction completedScoreContraction(std::size_t version)
+  {
+    std::lock_guard lock(mutex_);
+    validateContractionControl(version);
+    if (!score_contraction_ || !score_contraction_->completedChannels())
+      throw std::logic_error("Device score contraction has no completed generation");
+    CompletedScoreContraction result;
+    result.owner = this;
+    result.image = image_;
+    result.generation = contraction_transaction_;
+    result.channels = score_contraction_->completedChannels();
+    return result;
+  }
+
+  /// Read the frozen old generation without adopting a newly published image.
+  void downloadScoreContractionChunk(const CompletedScoreContraction& receipt,
+      std::size_t channel, std::size_t offset, std::complex<double>* destination, std::size_t count)
+  {
+    std::lock_guard lock(mutex_);
+    if (receipt.owner != this || !receipt.image || receipt.image.get() != image_.get() ||
+        receipt.generation != contraction_transaction_ || !score_contraction_ ||
+        receipt.channels != score_contraction_->completedChannels() || !receipt.channels ||
+        crowd_.acquired() || crowd_.poisoned())
+      throw std::invalid_argument("Device score contraction receipt is foreign, stale or revoked");
+    receipt.image->validateCurrentDevice();
+    try
+    {
       score_contraction_->downloadChunk(channel, offset, destination, count);
     }
     catch (...)

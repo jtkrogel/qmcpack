@@ -2078,8 +2078,13 @@ struct PsiFormerDerivativeScratch
       throw std::logic_error("PsiFormer CPU target kinetic owner differs from admitted numeric bytes");
     checkedBatchMemoryMultiply(parameters, sizeof(wftrain::DerivativeValue),
                                "PsiFormer shared derivative channels");
-    for (auto& channel : channels)
-      channel.resize(parameters);
+    bool full_host_channels = true;
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    full_host_channels = !state.numerical_tile_backend;
+#endif
+    if (full_host_channels)
+      for (auto& channel : channels)
+        channel.resize(parameters);
 #ifdef ENABLE_CUDA
     if (state.numerical_tile_backend)
     {
@@ -2094,6 +2099,25 @@ struct PsiFormerDerivativeScratch
     }
 #endif
   }
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  /// Cold numeric preparation under the exclusive lease, before any model read.
+  void prepareHostOutputs(std::size_t parameters, std::size_t chunk, bool fallback)
+  {
+    const auto allowance = checkedBatchMemoryMultiply(checkedBatchMemoryMultiply(parameters,
+        std::size_t{3}, "GPU HOST channel allowance"), sizeof(wftrain::DerivativeValue), "GPU HOST channel bytes");
+    const auto chunk_bytes = checkedBatchMemoryMultiply(chunk, sizeof(wftrain::DerivativeValue), "GPU HOST output chunk");
+    const bool grow = device_ecp_chunk.size() < chunk || (fallback && channels[0].size() < parameters);
+    if (grow)
+      app_log() << "  PsiFormer GPU HOST outputs before allocation: bounded_chunk_bytes=" << chunk_bytes
+                << ", fallback_channel_allowance_bytes=" << allowance << ", materialize_fallback=" << fallback
+                << "; numeric HOST only; model/vendor/metadata excluded" << std::endl;
+    if (device_ecp_chunk.size() < chunk) device_ecp_chunk.resize(chunk);
+    if (fallback)
+      for (auto& channel : channels)
+        if (channel.size() < parameters) channel.resize(parameters);
+  }
+#endif
 
   std::recursive_mutex execution_mutex;
   bool active = false;
@@ -2213,6 +2237,18 @@ public:
       throw std::invalid_argument("PsiFormer streaming derivative schema does not match the execution plan");
     checkedBatchMemoryAdd(sample_offset_, sample_count_,
                           "PsiFormer streaming derivative sample interval");
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    std::optional<PsiFormerDerivativeLease> preparation_lease;
+    std::optional<PsiFormerReadTransaction> preparation_read;
+    if (hasDeviceProducts())
+    {
+      preparation_lease.emplace(*shared_scratch_);
+      shared_scratch_->prepareHostOutputs(schema_->parameterCount(), chunk_plan_.maximumChunkSize(),
+          sample_count_ <= 2 * MAXIMUM_VJP_CHANNELS);
+      preparation_read.emplace(*model_state_, model_state_->resident_device_authority_enabled);
+      requireBoundVersion();
+    }
+#endif
 #ifdef ENABLE_CUDA
     // Immutable samples belong to this operator, not its shared derivative lane.
     // Empty operators need no allocation/upload. Enabled admission failures throw;
@@ -2237,7 +2273,7 @@ public:
     initializeStorageDiagnostics();
   }
 
-  /// Advertise score and kinetic products with the exact six-vector O(P) bound.
+  /// Advertise the conservative full-channel fallback O(P) bound.
   wftrain::StreamingDerivativeCapabilities capabilities() const noexcept override
   {
     wftrain::StreamingDerivativeCapabilities result;
@@ -2373,6 +2409,7 @@ public:
     if (hasDeviceProducts())
     {
       PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
+      shared_scratch_->prepareHostOutputs(schema_->parameterCount(), chunk_plan_.maximumChunkSize(), true);
       PsiFormerReadTransaction state_lock(*model_state_, model_state_->deviceOnlyValueReads());
       requireBoundVersion();
       const auto bytes = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(
@@ -2420,6 +2457,20 @@ protected:
     NativeTimerScope timer(phase_timers_.parameter_vjp);
     PsiFormerDerivativeLease scratch_lease(*shared_scratch_);
     has_evaluated_.store(true, std::memory_order_release);
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    std::optional<psiformer::device::PreparedDeviceProductSession::CompletedScoreContraction> completed;
+    std::array<std::size_t, MAXIMUM_VJP_CHANNELS> completed_slots{};
+    completed_slots.fill(MAXIMUM_VJP_CHANNELS);
+    if (hasDeviceProducts() && !terminal)
+    {
+      const bool has_contracted_response = std::any_of(channels.begin(), channels.end(), [](const auto& channel) {
+        return channel.product == wftrain::DerivativeProduct::SCORE_VJP ||
+            (channel.local_energy_term_mask & wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC));
+      });
+      shared_scratch_->prepareHostOutputs(schema_->parameterCount(), chunk_plan_.maximumChunkSize(),
+          sample_count_ <= 2 * MAXIMUM_VJP_CHANNELS || ecp_replay_ || !has_contracted_response);
+    }
+#endif
     {
       PsiFormerReadTransaction state_lock(*model_state_, device_authority_terminal && model_state_->resident_device_authority_enabled);
       requireBoundVersion();
@@ -2665,6 +2716,21 @@ protected:
           terminal(contraction_generation);
           return; // RAII releases BOTH source leases before caller publication.
         }
+#if !defined(QMC_COMPLEX)
+        if (!needs_ecp && sample_count_ > 2 * MAXIMUM_VJP_CHANNELS)
+        {
+          completed = session.completedScoreContraction(parameter_version_);
+          for (std::size_t slot = 0; slot < contracted_count; ++slot)
+            completed_slots[contracted_channels[slot]] = slot;
+          app_log() << "  PsiFormer resident HOST-VJP output: channels=" << contracted_count
+                    << ", parameters=" << schema_->parameterCount() << ", chunk_capacity="
+                    << shared_scratch_->device_ecp_chunk.capacity() << ", retained_full_HOST_channel_bytes="
+                    << (channel_accumulators_[0].capacity() + channel_accumulators_[1].capacity() +
+                        channel_accumulators_[2].capacity()) * sizeof(wftrain::DerivativeValue)
+                    << "; completed generation pinned through sink callbacks" << std::endl;
+        }
+        else
+#endif
         for (std::size_t slot = 0; slot < contracted_count; ++slot)
         {
           auto& destination = channel_accumulators_[contracted_channels[slot]];
@@ -2703,14 +2769,38 @@ protected:
     }
 
     // Never invoke caller-controlled sink code while holding the model lock.
-    for (const wftrain::ParameterChunkDescriptor& chunk : chunk_plan_.chunks())
-      for (std::size_t channel = 0; channel < channels.size(); ++channel)
-      {
-        const auto* values = channel_accumulators_[channel].data() +
-            chunk.parameter_offset;
-        sink->add(channel,
-                 {chunk, {values, chunk.count}});
-      }
+    try
+    {
+      for (const wftrain::ParameterChunkDescriptor& chunk : chunk_plan_.chunks())
+        for (std::size_t channel = 0; channel < channels.size(); ++channel)
+        {
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+          if (completed)
+          {
+            auto& output = shared_scratch_->device_ecp_chunk;
+            if (completed_slots[channel] == MAXIMUM_VJP_CHANNELS)
+              std::fill_n(output.data(), chunk.count, wftrain::DerivativeValue{});
+            else
+              shared_scratch_->device_products->downloadScoreContractionChunk(*completed,
+                  completed_slots[channel], chunk.parameter_offset, output.data(), chunk.count);
+            sink->add(channel, {chunk, {output.data(), chunk.count}});
+            continue;
+          }
+#endif
+          const auto* values = channel_accumulators_[channel].data() + chunk.parameter_offset;
+          sink->add(channel, {chunk, {values, chunk.count}});
+        }
+    }
+    catch (...)
+    {
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+      if (completed) shared_scratch_->device_products->abortScoreContraction();
+#endif
+      throw;
+    }
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+    if (completed) shared_scratch_->device_products->abortScoreContraction();
+#endif
   }
 
   /// Contract scores with one direction; device execution retains the uploaded direction.
@@ -3674,10 +3764,13 @@ private:
     if (fingerprint == 0)
       fingerprint = 1;
 
+    const auto fallback_allowance = hasDeviceProducts() ? checkedBatchMemoryMultiply(schema_->parameterCount(),
+        MAXIMUM_VJP_CHANNELS * sizeof(wftrain::DerivativeValue), "GPU HOST fallback allowance") : 0;
     return {schema_->parameterCount(),
             sample_count_,
             hasDeviceProducts() ? std::size_t{8} + 2 * deviceScoreContractionCapacity() : std::size_t{3},
-            MAXIMUM_VJP_CHANNELS,
+            static_cast<std::size_t>(std::count_if(channel_accumulators_.begin(), channel_accumulators_.end(),
+                [](const auto& channel) { return !channel.empty(); })),
             parameter_bytes,
             workspace_bytes,
             position_bytes,
@@ -3689,7 +3782,8 @@ private:
             reinterpret_cast<std::uintptr_t>(shared_scratch_.get()),
             checkedBatchMemoryAdd(workspace_bytes, channel_bytes,
                                   "PsiFormer shared scratch retained bytes"),
-            device_position_bytes};
+            device_position_bytes,
+            fallback_allowance > channel_bytes ? fallback_allowance - channel_bytes : 0};
   }
 
   std::shared_ptr<PsiFormerSharedState> model_state_;
@@ -6921,10 +7015,10 @@ PsiFormerWF::makeStreamingDerivativeOperator(
     throw std::invalid_argument(
         "PsiFormer streaming derivative requires a positive parameter chunk size");
 
-  // Bind the copied configurations and both direct workspaces to one immutable
-  // parameter version.  Publication needs the exclusive side of this lock and
-  // therefore cannot race the factory snapshot or operator construction.
-  PsiFormerReadTransaction state_lock(*model_state_, model_state_->resident_device_authority_enabled);
+  // Capture positions/drifts/version coherently. GPU scratch preparation waits
+  // outside this read; stale operators reject before numerical execution.
+  std::optional<PsiFormerReadTransaction> state_lock;
+  state_lock.emplace(*model_state_, model_state_->resident_device_authority_enabled);
   if (model_state_->direct_score_mode != DirectBackendMode::DIRECT)
     throw std::runtime_error(
         "PsiFormer streaming derivative requires the direct score backend");
@@ -7024,6 +7118,9 @@ PsiFormerWF::makeStreamingDerivativeOperator(
   }
 
   const std::size_t parameter_version = model_state_->model.p.version();
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+  if (model_state_->numerical_tile_backend) state_lock.reset();
+#endif
   return std::make_unique<PsiFormerStreamingDerivativeOperator>(
       model_state_, structured_parameter_schema_, parameter_version, batch_ordinal,
       sample_offset, sample_count, std::move(positions),

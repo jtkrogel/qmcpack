@@ -34,6 +34,8 @@
 #include <complex>
 #include <cstddef>
 #include <cstdlib>
+#include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -139,6 +141,9 @@ public:
   /// Make the next accepted chunk fail after the checked transaction begins.
   void armConsumeFailure() noexcept { fail_next_consume_ = true; }
 
+  /// Run one caller-controlled action while a numerical output remains borrowed.
+  void onConsumeOnce(std::function<void()> callback) { callback_ = std::move(callback); }
+
 protected:
   void onBegin(const wftrain::DerivativeStreamDescriptor&,
                const ParameterChunkPlan&,
@@ -151,6 +156,11 @@ protected:
 
   void consume(std::size_t channel, const ParameterChunkConstView& chunk) override
   {
+    if (callback_)
+    {
+      auto callback = std::move(callback_);
+      callback();
+    }
     if (fail_next_consume_)
     {
       fail_next_consume_ = false;
@@ -175,6 +185,7 @@ protected:
   }
 
 private:
+  std::function<void()> callback_;
   std::vector<std::size_t> selected_;
   std::vector<std::vector<DerivativeValue>> results_;
   std::size_t consumed_records_ = 0;
@@ -1812,6 +1823,162 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
 #endif
 
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+TEST_CASE("PsiFormer real resident HOST outputs retain bounded chunks",
+          "[wavefunction][psiformer][training][gpu_host_chunks]")
+{
+  using namespace testing::psiformer;
+  using wftrain::DerivativeAdjoint;
+  using wftrain::StructuredParameterVectorConstView;
+  namespace ps = psiformer;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  { WARN("NOT_RUN: HOST chunks require a HIP device"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  { WARN("NOT_RUN: HOST chunks require a CUDA device"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  auto leaves = makeLayout(4, 2, true, 1, 4);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256 || extent == 64) extent = 8;
+  ps::InitializedPsiFormerParameters initialized;
+  initialized.model_shape = {2, 2, 2, 2, 8, 2, 1};
+  initialized.profile = ps::DEEPQMC_PSIFORMER_V1; initialized.seed = 37;
+  initialized.values = makeParameters("lih", leaves);
+  std::size_t cursor = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto begin = cursor; cursor += product(leaf.shape);
+    initialized.layouts.push_back({leaf.module, leaf.name, leaf.shape, begin, cursor});
+  }
+  const SimulationCell cell;
+  auto electrons = makeElectrons(cell);
+  ParticleSet ions(cell); ions.setName("ion0"); ions.create({1, 1});
+  auto& species = ions.getSpeciesSet(); species.addSpecies("Li"); species.addSpecies("H");
+  const int charge = species.addAttribute("charge"); species(charge, 0) = 3; species(charge, 1) = 1;
+  ions.R[0] = {0, 0, 0}; ions.R[1] = {0, 0, 3.01392421}; ions.resetGroups(); ions.update();
+  ps::PsiFormerAcceleratorResolution resolution;
+#ifdef QMC_CUDA2HIP
+  resolution.backend = ps::PsiFormerAcceleratorBackend::HIP;
+#else
+  resolution.backend = ps::PsiFormerAcceleratorBackend::CUDA;
+#endif
+  resolution.reason = ps::PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY;
+  resolution.readiness_records_consulted = 1;
+  resolution.validated_operations = ps::psiFormerAcceleratorInferenceOperations();
+  PsiFormerWF cpu("host_chunks", initialized, electrons, ions);
+  PsiFormerWF gpu("host_chunks", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
+  const auto p = cpu.parameterSchema().parameterCount();
+  std::vector<std::size_t> selected(p); std::iota(selected.begin(), selected.end(), 0);
+  std::vector<std::unique_ptr<ParticleSet>> samples;
+  RefVectorWithLeader<WaveFunctionComponent> gc(gpu), cc(cpu);
+  for (int i = 0; i < 8; ++i)
+  {
+    samples.push_back(std::make_unique<ParticleSet>(electrons));
+    samples.back()->R[0][0] += .003 * i; samples.back()->update();
+    samples.back()->G = QMCTraits::GradType{}; samples.back()->L = QMCTraits::ValueType{};
+    cpu.evaluateLog(*samples.back(), samples.back()->G, samples.back()->L);
+    gc.push_back(gpu); cc.push_back(cpu);
+  }
+  // RefVectorWithLeader requires the first stored sample to be its actual leader.
+  RefVectorWithLeader<ParticleSet> batch(*samples.front());
+  for (auto& sample : samples) batch.push_back(*sample);
+  auto reference = cpu.makeStreamingDerivativeOperator(cc, batch, 0, 0, 17);
+  auto products = gpu.makeStreamingDerivativeOperator(gc, batch, 0, 0, 17);
+  REQUIRE(p % 17 != 0);
+  const auto cold = products->storageDiagnostics();
+  CHECK(cold.complex_parameter_vectors == 0);
+  CHECK(cold.shared_workspace_reserved_bytes == 48 * p);
+  const std::array<std::vector<DerivativeValue>, 3> weights{{
+      std::vector<DerivativeValue>(8, {.3, -.2}), std::vector<DerivativeValue>(8, {-.4, .7}),
+      std::vector<DerivativeValue>(8, DerivativeValue{})}};
+  const auto channels = [&](const StreamingDerivativeOperator& op) {
+    return std::array<VJPCoefficientChannel, 3>{{
+        {"kinetic", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(op, weights[0]),
+            wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)},
+        {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(op, weights[1]), 0},
+        {"zero", DerivativeProduct::SCORE_VJP, coefficientsFor(op, weights[2]), 0}}};
+  };
+  auto expected_channels = channels(*reference), actual_channels = channels(*products);
+  SelectedParameterSink expected(selected), actual(selected);
+  reference->applyVJPs({expected_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
+  products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  const auto compare = [&]() {
+    for (std::size_t channel = 0; channel < 3; ++channel)
+      for (std::size_t j = 0; j < p; ++j) checkClose(actual.results()[channel][j], expected.results()[channel][j]);
+  };
+  compare();
+  CHECK(actual.consumedRecords() == 3 * products->parameterChunkPlan().chunks().size());
+  auto mixed_zero = actual_channels;
+  mixed_zero[2].product = DerivativeProduct::LOCAL_ENERGY_VJP;
+  mixed_zero[2].local_energy_term_mask = 0;
+  mixed_zero[2].coefficients = coefficientsFor(*products, weights[0]);
+  actual.reset();
+  CHECK_THROWS_WITH(products->applyVJPs({mixed_zero.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual),
+      Catch::Matchers::ContainsSubstring("lacks requested local-energy term coverage"));
+  CHECK(actual.state() == DerivativeSinkState::IDLE); // Empty energy masks are not an admitted physical term.
+  const auto warm = products->storageDiagnostics();
+  CHECK(warm.complex_parameter_vectors == 0);
+  CHECK(warm.shared_workspace_reserved_bytes == 48 * p);
+  actual.reset(); actual.armConsumeFailure();
+  CHECK_THROWS(products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  CHECK(actual.state() == DerivativeSinkState::POISONED);
+  actual.reset();
+  std::vector<DerivativeValue> zero(p);
+  const StructuredParameterVectorConstView direction(gpu.parameterSchema(), products->parameterVersion(), {zero.data(), p});
+  actual.onConsumeOnce([&]() { RecordingSampleSink nested; products->applyScoreJVP(direction, nested); });
+  CHECK_THROWS_WITH(products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual),
+      Catch::Matchers::ContainsSubstring("cannot be re-entered"));
+  actual.reset();
+  const auto before = ps::device::deviceMemoryMetrics(ordinal).snapshot();
+  products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  compare();
+  const auto after = ps::device::deviceMemoryMetrics(ordinal).snapshot();
+  CHECK(after.allocation_calls == before.allocation_calls);
+  CHECK(after.live_bytes == before.live_bytes);
+  CHECK(products->storageDiagnostics().storage_fingerprint == warm.storage_fingerprint);
+  auto candidate = gpu.snapshotParameters(); candidate.values[0] += .001;
+  actual.reset();
+  actual.onConsumeOnce([&]() { gpu.publishParameters(candidate, candidate.version); });
+  products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  compare(); // Every later chunk must still be the OLD numerical generation.
+  CHECK(gpu.parameterVersion() == candidate.version + 1);
+  actual.reset();
+  CHECK_THROWS(products->applyVJPs({actual_channels.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual));
+  cpu.publishParameters(candidate, candidate.version);
+  for (auto& sample : samples)
+  {
+    sample->G = QMCTraits::GradType{}; sample->L = QMCTraits::ValueType{};
+    cpu.evaluateLog(*sample, sample->G, sample->L);
+  }
+  auto fresh_reference = cpu.makeStreamingDerivativeOperator(cc, batch, 1, 0, 17);
+  auto fresh_products = gpu.makeStreamingDerivativeOperator(gc, batch, 1, 0, 17);
+  auto fresh_expected = channels(*fresh_reference), fresh_actual = channels(*fresh_products);
+  expected.reset(); actual.reset();
+  fresh_reference->applyVJPs({fresh_expected.data(), 3}, DerivativeAdjoint::TRANSPOSE, expected);
+  fresh_products->applyVJPs({fresh_actual.data(), 3}, DerivativeAdjoint::TRANSPOSE, actual);
+  compare();
+  const auto before_fallback = fresh_products->storageDiagnostics();
+  auto zero_energy = fresh_actual[0];
+  zero_energy.local_energy_term_mask = 0;
+  SelectedParameterSink zero_only(selected);
+  CHECK_THROWS(fresh_products->applyVJPs({&zero_energy, 1}, DerivativeAdjoint::TRANSPOSE, zero_only));
+  CHECK(zero_only.state() == DerivativeSinkState::IDLE);
+  RefVectorWithLeader<WaveFunctionComponent> single(gpu, {gpu});
+  RefVectorWithLeader<ParticleSet> one(*samples.front(), {*samples.front()});
+  auto fallback = gpu.makeStreamingDerivativeOperator(single, one, 2, 0, 17);
+  const auto materialized = fallback->storageDiagnostics();
+  CHECK(materialized.complex_parameter_vectors == 3);
+  CHECK(materialized.shared_workspace_reserved_bytes == 0);
+  CHECK(materialized.shared_workspace_bytes == before_fallback.shared_workspace_bytes + 48 * p);
+  CHECK(materialized.shared_workspace_bytes == before_fallback.shared_workspace_bytes +
+        before_fallback.shared_workspace_reserved_bytes);
+  std::cout << "PASS real HOST chunks: W8/C3 tail/complex-zero, cold_HOST_channels=0, reserved=48P, publication/reentry/abort/retry\n";
+}
+
 TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
           "[wavefunction][psiformer][training][gpu_resident_authority]")
 {

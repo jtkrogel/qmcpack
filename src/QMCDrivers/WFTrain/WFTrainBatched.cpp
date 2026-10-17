@@ -58,6 +58,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -880,11 +881,14 @@ std::vector<wftrain::ScoreCovarianceBatch> makeScoreBatches(
   return result;
 }
 
-/** Count exact numeric storage held by raw prepared batches. */
+std::size_t checkedMemoryAdd(std::size_t lhs, std::size_t rhs);
+
+/** Admit actual numeric storage plus explicit unmaterialized fallback reservations. */
 wftrain::PreparedEnergyGradientStorageDiagnostics preparedStorageDiagnostics(
     const std::vector<wftrain::PreparedEnergyGradientBatch>& batches)
 {
   wftrain::PreparedEnergyGradientStorageDiagnostics result;
+  std::unordered_map<std::uintptr_t, std::size_t> shared_workspace_max;
   result.batch_count = batches.size();
   for (const auto& batch : batches)
   {
@@ -893,19 +897,15 @@ wftrain::PreparedEnergyGradientStorageDiagnostics preparedStorageDiagnostics(
           "WFTrainBatched: prepared batch has no derivative operator");
     result.sample_count += batch.weights.size();
     const auto storage = batch.derivative_operator->storageDiagnostics();
-    result.derivative_owner_bytes += storage.retained_numeric_bytes;
+    result.derivative_owner_bytes = checkedMemoryAdd(result.derivative_owner_bytes,
+        checkedMemoryAdd(storage.retained_numeric_bytes, storage.shared_workspace_reserved_bytes));
     if (storage.shared_workspace_identity)
-      for (const auto& previous : batches)
-      {
-        if (&previous == &batch)
-          break;
-        if (previous.derivative_operator->storageDiagnostics().shared_workspace_identity ==
-            storage.shared_workspace_identity)
-        {
-          result.derivative_owner_bytes -= storage.shared_workspace_bytes;
-          break;
-        }
-      }
+    {
+      auto& previous_max = shared_workspace_max[storage.shared_workspace_identity];
+      const auto shared_bytes = checkedMemoryAdd(storage.shared_workspace_bytes, storage.shared_workspace_reserved_bytes);
+      result.derivative_owner_bytes -= std::min(previous_max, shared_bytes);
+      previous_max = std::max(previous_max, shared_bytes);
+    }
     result.sample_scalar_bytes += batch.weights.capacity() * sizeof(wftrain::DerivativeReal) +
         batch.local_energies.capacity() * sizeof(wftrain::DerivativeValue);
     if (batch.additive_local_energy_vjp)

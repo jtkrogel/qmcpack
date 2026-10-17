@@ -109,6 +109,9 @@ public:
     ready_ = true;
   }
 
+  /// Zero until all active channels have passed the common finite admission.
+  std::size_t completedChannels() const noexcept { return ready_ ? channels_ : 0; }
+
   /// Download once per channel after admission, with no response-size host staging.
   void download(std::size_t channel, std::complex<double>* destination, std::size_t count) const
   {

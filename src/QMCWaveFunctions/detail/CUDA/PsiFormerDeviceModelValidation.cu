@@ -2973,6 +2973,38 @@ int main(int argc, char** argv)
           near(chunk_output[i].imag(), contracted[1][offset + i].imag(), "score chunk imaginary parity");
         }
       }
+      const auto receipt = product_session->completedScoreContraction(contraction_version);
+      const auto before_receipt = contraction_metrics.snapshot();
+      for (std::size_t offset = 0; offset < plan.parameterCount(); offset += chunk_capacity)
+        for (std::size_t channel = 0; channel < 2; ++channel)
+        {
+          const auto count = std::min(chunk_capacity, plan.parameterCount() - offset);
+          product_session->downloadScoreContractionChunk(receipt, channel, offset, chunk_output.data(), count);
+          for (std::size_t i = 0; i < count; ++i)
+          {
+            near(chunk_output[i].real(), expected[channel][offset + i].real(), "frozen chunk real CPU parity");
+            near(chunk_output[i].imag(), expected[channel][offset + i].imag(), "frozen chunk imaginary CPU parity");
+          }
+        }
+      const auto after_receipt = contraction_metrics.snapshot();
+      if (after_receipt.live_bytes != before_receipt.live_bytes ||
+          after_receipt.allocation_calls != before_receipt.allocation_calls ||
+          after_receipt.downloaded_bytes - before_receipt.downloaded_bytes != 4 * plan.parameterCount() * sizeof(double))
+        throw std::runtime_error("Completed receipt added numeric ownership or changed transfer bytes");
+      bool foreign_receipt = false;
+      try { score_only_session->downloadScoreContractionChunk(receipt, 0, 0, chunk_output.data(), 1); }
+      catch (const std::invalid_argument&) { foreign_receipt = true; }
+      if (!foreign_receipt) throw std::runtime_error("Completed receipt accepted a foreign session");
+      product_session->abortScoreContraction();
+      bool revoked_receipt = false;
+      try { product_session->downloadScoreContractionChunk(receipt, 0, 0, chunk_output.data(), 1); }
+      catch (const std::invalid_argument&) { revoked_receipt = true; }
+      if (!revoked_receipt) throw std::runtime_error("Aborted completed receipt remained readable");
+      run_contraction();
+      bool stale_receipt = false;
+      try { product_session->downloadScoreContractionChunk(receipt, 0, 0, chunk_output.data(), 1); }
+      catch (const std::invalid_argument&) { stale_receipt = true; }
+      if (!stale_receipt) throw std::runtime_error("Reused contraction accepted an old receipt");
       bool invalid_chunk_rejected = false;
       try { product_session->downloadScoreContractionChunk(0, plan.parameterCount(), chunk_output.data(), 1,
                                                            contraction_version); }
@@ -3028,9 +3060,22 @@ int main(int argc, char** argv)
         throw std::runtime_error("Score contraction accepted a nonfinite algebraic coefficient");
       expect_no_contraction();
       run_contraction();
+      const auto publication_receipt = product_session->completedScoreContraction(contraction_version);
       backend_tiles->publishParameters(accepted_values, contraction_version + 1,
                                        [&]() { model.p.set_flat_values(accepted_values); });
+      // Publication changes the live image, not this completed old generation.
+      product_session->downloadScoreContractionChunk(publication_receipt, 1, 0, chunk_output.data(), chunk_capacity);
+      for (std::size_t i = 0; i < chunk_capacity; ++i)
+      {
+        near(chunk_output[i].real(), expected[1][i].real(), "published old receipt real CPU parity");
+        near(chunk_output[i].imag(), expected[1][i].imag(), "published old receipt imaginary CPU parity");
+      }
       expect_no_contraction();
+      bool control_revoked_receipt = false;
+      try { product_session->downloadScoreContractionChunk(publication_receipt, 0, 0, chunk_output.data(), 1); }
+      catch (const std::invalid_argument&) { control_revoked_receipt = true; }
+      if (!control_revoked_receipt) throw std::runtime_error("Legacy control revocation retained a completed receipt");
+      std::cout << "PASS frozen score contraction receipts: tails/order/complex coefficients, foreign/abort/reuse, publication\n";
 
       // Finite responses and coefficients can overflow only after contraction.
       PreparedDeviceScoreContraction overflow_contraction(1, 1, queue);

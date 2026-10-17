@@ -589,6 +589,8 @@ struct StreamingDerivativeStorageDiagnostics
   std::size_t shared_workspace_bytes           = 0;
   /// Independent per-provider device coordinates; included in retained bytes once.
   std::size_t device_sample_position_bytes      = 0;
+  /// Unmaterialized numeric fallback allowance, additional to actual shared bytes.
+  std::size_t shared_workspace_reserved_bytes  = 0;
 };
 
 /** Common checked front end for bounded multi-channel VJP and score JVP kernels.
