@@ -2494,7 +2494,7 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
     const auto ratio = private_msd.evaluateAcceptedReferenceRatioDerivatives(vp, point, 0, active,
         {row.data(), row.size()});
     CHECK(ratio == physical[point]);
-    CHECK(row[1] == 123);
+    CHECK(row[1] == QMCTraits::ValueType{123});
     const double x = vp.R[point][0];
     const double a = (4 - x * x) / 3, b = (2 - x) / 9;
     const auto oracle = [=](double c) { return (a + c * b) / (1 + c / 9); };
@@ -2556,9 +2556,9 @@ TEST_CASE("Accepted-reference virtual determinants remain finite at exact nodes"
   vp.makeMoves(owned, 0, displacements);
   private_msd.evaluateRatios(vp, physical);
   CHECK(std::real(physical[1]) == Catch::Approx(0).margin(2e-13));
-  CHECK(private_msd.fixedCoefficientReference() == 1);
-  CHECK(source.get_C()[1] == -6);
-  CHECK(sibling.get_C()[1] == -6);
+  CHECK(private_msd.fixedCoefficientReference() == QMCTraits::ValueType{1});
+  CHECK(source.get_C()[1] == QMCTraits::ValueType{-6});
+  CHECK(sibling.get_C()[1] == QMCTraits::ValueType{-6});
   CHECK(evaluate(source, accepted) == source_log);
   source.evaluateRatios(ordinary, ordinary_after);
   CHECK(ordinary_before == ordinary_after);
@@ -3779,7 +3779,7 @@ TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][
         private_particles.update();
         rotated(*evaluator).Phi_->evaluateValue(private_particles, zero->electron, replacement);
         derivative = 0;
-        CHECK(rotated(*evaluator).evaluateOneOccupiedRatioDerivatives(reference, replacement, adapter.registrationVariables(), derivative) == 0);
+        CHECK(rotated(*evaluator).evaluateOneOccupiedRatioDerivatives(reference, replacement, adapter.registrationVariables(), derivative) == QMCTraits::ValueType{});
         CHECK(std::abs(derivative[0]) > 1e-8);
         reference[0] = std::numeric_limits<double>::quiet_NaN();
         CHECK_THROWS(rotated(*evaluator).evaluateOneOccupiedRatioDerivatives(reference, replacement, adapter.registrationVariables(), derivative));
