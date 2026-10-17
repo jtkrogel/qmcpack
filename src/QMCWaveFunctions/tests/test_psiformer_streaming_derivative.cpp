@@ -185,6 +185,8 @@ private:
 class RecordingSampleSink final : public SampleProductSink
 {
 public:
+  void armConsumeFailure() noexcept { fail_next_consume_ = true; }
+
   const std::vector<DerivativeValue>& results() const
   {
     if (state() != DerivativeSinkState::COMPLETE)
@@ -201,6 +203,11 @@ protected:
 
   void consume(const SampleProductTileConstView& tile) override
   {
+    if (fail_next_consume_)
+    {
+      fail_next_consume_ = false;
+      throw std::runtime_error("Injected sample sink consume failure");
+    }
     REQUIRE(tile.values().size() == 1);
     results_[tile.descriptor().sample_offset - first_sample_] = tile.values()[0];
   }
@@ -216,6 +223,7 @@ protected:
 private:
   std::size_t first_sample_ = 0;
   std::vector<DerivativeValue> results_;
+  bool fail_next_consume_ = false;
 };
 
 /** Attempt a nested product while the outer sink still consumes leased scratch. */
@@ -1512,6 +1520,41 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   RecordingSampleSink cpu_jvp, gpu_jvp;
   reference->applyLocalEnergyJVP(vector, ecp, cpu_jvp); first->applyLocalEnergyJVP(vector, ecp, gpu_jvp);
   checkClose(gpu_jvp.results()[0], cpu_jvp.results()[0]);
+  REQUIRE(first->capabilities().maximum_sample_tile_size == 4);
+  // Warm Q9 uses 4+4+1 virtual tiles, plus one unchanged accepted-reference call.
+  // Actual completion markers are checked in the root CUDA gate with printout enabled.
+  const auto jvp_storage = first->storageDiagnostics();
+  const auto before_real_jvp = metrics.snapshot();
+  RecordingSampleSink warm_real;
+  first->applyLocalEnergyJVP(vector, ecp, warm_real);
+  const auto after_real_jvp = metrics.snapshot();
+  CHECK(after_real_jvp.allocation_calls == before_real_jvp.allocation_calls);
+  CHECK(after_real_jvp.live_bytes == before_real_jvp.live_bytes);
+  std::vector<DerivativeValue> complex_direction(direction);
+  for (std::size_t i = 0; i < p; ++i)
+    complex_direction[i].imag(.003 * (int(i % 5) - 2));
+  const wftrain::StructuredParameterVectorConstView complex_vector(cpu.parameterSchema(),
+      cpu.snapshotParameters().version, {complex_direction.data(), complex_direction.size()});
+  RecordingSampleSink cpu_complex, gpu_complex;
+  reference->applyLocalEnergyJVP(complex_vector, ecp, cpu_complex);
+  const auto before_complex_jvp = metrics.snapshot();
+  first->applyLocalEnergyJVP(complex_vector, ecp, gpu_complex);
+  const auto after_complex_jvp = metrics.snapshot();
+  checkClose(gpu_complex.results()[0], cpu_complex.results()[0]);
+  CHECK(after_complex_jvp.uploaded_bytes - before_complex_jvp.uploaded_bytes ==
+        2 * (after_real_jvp.uploaded_bytes - before_real_jvp.uploaded_bytes));
+  CHECK(after_complex_jvp.allocation_calls == before_complex_jvp.allocation_calls);
+  CHECK(after_complex_jvp.live_bytes == before_complex_jvp.live_bytes);
+  CHECK(first->storageDiagnostics().storage_fingerprint == jvp_storage.storage_fingerprint);
+  CHECK(first->storageDiagnostics().retained_numeric_bytes == jvp_storage.retained_numeric_bytes);
+  RecordingSampleSink failed_jvp;
+  failed_jvp.armConsumeFailure();
+  CHECK_THROWS(first->applyLocalEnergyJVP(complex_vector, ecp, failed_jvp));
+  CHECK(failed_jvp.state() == DerivativeSinkState::POISONED);
+  CHECK_THROWS(failed_jvp.results());
+  RecordingSampleSink retried_jvp;
+  first->applyLocalEnergyJVP(complex_vector, ecp, retried_jvp);
+  checkClose(retried_jvp.results()[0], cpu_complex.results()[0]);
   SelectedParameterSink dual(selected);
   auto dual_channels = channelsFor(*first);
   const auto before_scalar_c1 = metrics.snapshot();
@@ -1520,6 +1563,9 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   DerivativeValue dot{};
   for (std::size_t i = 0; i < p; ++i) dot += direction[i] * dual.results()[0][i];
   checkClose(dot, coefficients[0][0] * gpu_jvp.results()[0]);
+  DerivativeValue complex_dot{};
+  for (std::size_t i = 0; i < p; ++i) complex_dot += complex_direction[i] * dual.results()[0][i];
+  checkClose(complex_dot, coefficients[0][0] * gpu_complex.results()[0]);
   // Exact-real C1 reuses the existing B4 score owner for Q9 => 4+4+tail1.
   const std::vector<DerivativeValue> real_coefficient{{.7, 0}};
   auto real_channels = [&](const StreamingDerivativeOperator& op) {
@@ -1568,6 +1614,9 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
                                                   scalar_gpu.snapshotParameters().version)));
   auto scalar = capture(scalar_gpu, 94, 5, true);
   CHECK(scalar->capabilities().maximum_sample_tile_size == 1);
+  RecordingSampleSink scalar_jvp;
+  scalar->applyLocalEnergyJVP(complex_vector, ecp, scalar_jvp);
+  checkClose(scalar_jvp.results()[0], cpu_complex.results()[0]);
   auto scalar_channels = real_channels(*scalar);
   SelectedParameterSink scalar_result(selected);
   scalar->applyVJPs({scalar_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, scalar_result);
@@ -1619,6 +1668,14 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
     SelectedParameterSink rejected(selected);
     node->applyVJPs({node_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, rejected);
   }()));
+  CHECK_THROWS(([&]() {
+    auto node = capture(gpu, 95, 5, true, false, true);
+    RecordingSampleSink rejected;
+    node->applyLocalEnergyJVP(complex_vector, ecp, rejected);
+  }()));
+  RecordingSampleSink after_node_failure;
+  first->applyLocalEnergyJVP(complex_vector, ecp, after_node_failure);
+  checkClose(after_node_failure.results()[0], cpu_complex.results()[0]);
 }
 #endif
 
