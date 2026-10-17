@@ -21,3 +21,10 @@ Only this narrow profile is registered, on real full-precision CPU builds
 without offload and with Python h5py/numpy. No convergence or timing claim
 is intended. The original neutral-C single-Slater strict-reproducibility
 failure remains separate and open.
+
+The optional ``--joint-ci-orbital-ecp`` checker mode derives P17 from the
+same XML by changing only CI optimization to yes. It requires active CI1
+to change while frozen C0, original XML provenance, both original orbital
+references and strict restart contracts remain intact. Its native runtime
+qualification and registration are pending; the independent joint physical
+gate passed separately (3,836 assertions). The fixed-P16 route is unchanged.

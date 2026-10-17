@@ -190,6 +190,8 @@ def main():
                         help="bounded neutral-C two-occupied/four-MO P8 orbital/J2 ECP Adam")
     parser.add_argument("--md-orbital-ecp", action="store_true",
                         help="bounded neutral-C fixed-CI two-owner MD orbital/J2 ECP Adam P16")
+    parser.add_argument("--joint-ci-orbital-ecp", action="store_true",
+                        help="derive joint P17 CI1/orbital/J2 ECP Adam from the fixed-CI XML")
     parser.add_argument("--complex-periodic-heg", action="store_true",
                         help="CPU complex Gamma HEG14 real-J2 Adam, complete split restart; no model import")
     parser.add_argument("--companion-optimizer", choices=("sgd", "sr"), default="sgd",
@@ -219,6 +221,10 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.joint_ci_orbital_ecp:
+        if args.md_orbital_ecp:
+            parser.error("select either fixed --md-orbital-ecp or --joint-ci-orbital-ecp")
+        args.md_orbital_ecp = True
     orbital_ecp_profile = args.orbital_ecp or args.many_occupied_orbital_ecp or args.md_orbital_ecp
     periodic_profile = args.periodic_heg or args.complex_periodic_heg
     if args.complex_periodic_heg:
@@ -338,6 +344,11 @@ def main():
         if periodic_profile:
             samples_per_rank = 8
         tree = ET.parse(fixture)
+        if args.joint_ci_orbital_ecp:
+            # The only model-input delta from the qualified fixed-CI fixture.
+            expansion = tree.find(".//multideterminant")
+            assert expansion is not None and expansion.get("optimize") == "no"
+            expansion.set("optimize", "yes")
         if ci_workflow:
             expansion = tree.find("wavefunction/determinantset/multideterminant/detlist")
             assert expansion is not None and expansion.get("type") == "DETS" and len(expansion) == 2
@@ -382,7 +393,8 @@ def main():
                 assert tree.find("hamiltonian/pairpot/pseudo").get("elementType") == "C"
             if args.md_orbital_ecp:
                 expansion = tree.find(".//multideterminant")
-                assert expansion.get("optimize") == "no" and expansion.find("detlist").get("type") == "DETS"
+                assert expansion.get("optimize") == ("yes" if args.joint_ci_orbital_ecp else "no")
+                assert expansion.find("detlist").get("type") == "DETS"
                 assert [node.attrib for node in expansion.find("detlist")] == [
                     dict(id="CI0", coeff="1", occ0="1100", occ1="1100"),
                     dict(id="CI1", coeff="0.1", occ0="1010", occ1="1010")]
@@ -497,7 +509,8 @@ def main():
         assert len(models) == expected_rows, (directory, models)
         determinant_list = tree.find("wavefunction/determinantset/multideterminant/detlist")
         linear_nodes = [] if determinant_list is None else list(determinant_list)
-        initial = [] if args.md_orbital_ecp else [float(node.get("coeff")) for node in linear_nodes[1:]]
+        initial = ([] if args.md_orbital_ecp and not args.joint_ci_orbital_ecp else
+                   [float(node.get("coeff")) for node in linear_nodes[1:]])
         if orbital_model:
             initial += [0.0] * (12 if args.md_orbital_ecp else 4 if args.many_occupied_orbital_ecp else 6 if linear_nodes else 2)
         initial += [float(value) for node in tree.findall("wavefunction/jastrow/correlation/coefficients")
@@ -529,15 +542,18 @@ def main():
                     names = [value.decode() if isinstance(value, bytes) else str(value)
                              for value in np.asarray(group["variable_names"][()]).reshape(-1)]
                     assert linear_nodes[0].get("id") not in names, model
-                    if args.md_orbital_ecp:
+                    if args.md_orbital_ecp and not args.joint_ci_orbital_ecp:
                         assert all(node.get("id") not in names for node in linear_nodes), model
                     else:
                         assert all(node.get("id") in names for node in linear_nodes[1:]), model
                 if row["committed"] == "1":
                     assert not np.array_equal(parameters, previous), model
                     if args.md_orbital_ecp:
-                        assert parameters.size == 16
+                        assert parameters.size == (17 if args.joint_ci_orbital_ecp else 16)
                         indices = np.asarray(group["active_indices"][()]).reshape(-1)
+                        if args.joint_ci_orbital_ecp:
+                            assert int(indices[names.index("CI1")]) == 0
+                            assert parameters[0] != previous[0], (model, "CI1 did not update")
                         for prefix, count in (("rot_orb_rot_", 6), ("rot_dn_orb_rot_", 6), ("ud_", 4)):
                             block = [int(index) for name, index in zip(names, indices) if name.startswith(prefix)]
                             assert len(block) == count and min(block) >= 0, (model, prefix)
@@ -1018,6 +1034,9 @@ def main():
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
                   "physical/model/sampler/scientific CSV exact restart, own optimizer payloads validated, "
                   "legacy cold-process moments <=8 ULP (NOT bitwise optimizer restart)")
+        elif args.joint_ci_orbital_ecp:
+            print("PASS: real CPU joint CI1/distinct-spin orbital/J2 ordinary-locality ECP Adam P17, "
+                  "frozen C0/original XML, two complete frames, physical VMC reuse and strict exact initialized restart")
         elif args.md_orbital_ecp:
             print("PASS: real CPU fixed-CI distinct-spin MD orbital/J2 ordinary-locality ECP Adam P16, "
                   "two complete 4AO/4MO frames, physical VMC model reuse and strict exact initialized restart")
