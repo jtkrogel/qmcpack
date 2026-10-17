@@ -160,5 +160,12 @@ Scientific identity explicitly records REAL64 parameters, COMPLEX128 wavefunctio
 representation, actual fixed k-vectors and built Ewald data. SGD, line search,
 twist and changed cell/cutoff continuation are rejected. No CI, orbital rotations,
 ECP, backflow, arbitrary periodic models or performance claim follows.
-Binding-level cold import is covered separately; public parameter_file routing
-remains real-only in this profile. Default real workflows are unchanged.
+Binding-level cold import is covered separately. Public parameter_file reuse
+uses the same strict selected-pair Binding/Hamiltonian checks before publication.
+Its follow-up native qualification is pending; the bounded command is:
+
+  python3 ../../molecules/H2_ae_conventional_wftrain/check_sj_training.py /absolute/complex/qmcpack wftrain_heg.xml --complex-periodic-heg --model-import --ranks 2
+
+This compares seeded imported-artifact VMC with explicit accepted-J2 XML, then
+fresh training/re-export/re-import and complete exact initialized split restart.
+Default real workflows are unchanged; no arbitrary complex model is admitted.

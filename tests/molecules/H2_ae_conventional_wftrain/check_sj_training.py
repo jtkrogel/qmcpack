@@ -216,10 +216,11 @@ def main():
         assert args.threads == 1 and args.ranks > 0
         assert args.ci_representation == "dets"
         assert not any((args.periodic_heg, args.md_orbital, args.external_lcao, args.orbital_ecp,
-                        args.orbital_jastrow, args.model_import, args.old_new, args.optimizer_screen,
+                        args.orbital_jastrow, args.old_new, args.optimizer_screen,
                         args.family_screen, args.profile_only, args.ci_pii, args.ci_lm, args.csf_lm,
                         args.csf_pii, args.mdj_pii, args.csf_j2_pii))
-        args.restart = args.preflight = True
+        if not args.model_import:
+            args.restart = args.preflight = True
     linear_ci = args.ci_lm or args.csf_lm
     csf_ci = args.csf_lm or args.csf_pii or args.csf_j2_pii
     pure_ci = args.ci_pii or args.csf_pii or linear_ci
@@ -830,7 +831,7 @@ def main():
                 collection.append(spo)
             run("reject_one_active_md_spin", mutate=one_active_spin,
                 reject="Optimizing the SPOSet of only only species is not supported!")
-        if args.periodic_heg:
+        if periodic_profile:
             for label, name, value in (("cell", "rs", "5.1"), ("cutoff", "LR_dim_cutoff", "7")):
                 def change_periodic_identity(tree, name=name, value=value):
                     tree.find(f".//simulationcell/parameter[@name='{name}']").text = value
@@ -889,7 +890,10 @@ def main():
                 reject=("Conventional model export identity mismatch",
                         "Conventional artifact has an invalid or oversized required field: model_identity"))
             assert source.read_bytes() == original
-        if args.periodic_heg:
+        if args.complex_periodic_heg:
+            print("PASS: CPU complex Gamma HEG14 real-J2 artifact VMC reference, fresh training/re-export/re-import, "
+                  "complete exact initialized split restart and changed identity/import rejection")
+        elif args.periodic_heg:
             print("PASS: real Gamma HEG14 Adam/SR, 8 samples/update, actual Ewald identity and changed cell/cutoff rejection")
         if args.md_orbital:
             print("PASS: distinct-spin MD orbital/CI/J2 P11 Adam/SR, noncommuting full frames and early one-active-spin rejection; "
