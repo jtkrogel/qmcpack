@@ -312,6 +312,8 @@ def main():
                         help="mixed DETS/J2 PII/minPII tangent updates, inference and restart")
     parser.add_argument("--mdj-alm", action="store_true",
                         help="one fixed-orbital H4 DETS/J2 AE ALM full model-import round trip")
+    parser.add_argument("--mdj-ecp-alm", action="store_true",
+                        help="one fixed-orbital Be DETS/J2 locality-ECP ALM workflow or honest pre-update root refusal")
     parser.add_argument("--sj-reference-line-search", action="store_true",
                         help="H2 SJ Adam reference search with existing five alphas and natural decisions")
     parser.add_argument("--sj-endpoints-line-search", action="store_true",
@@ -319,6 +321,10 @@ def main():
     parser.add_argument("--csf-j2-pii", action="store_true",
                         help="nontrivial mixed CSF/J2 PII/minPII updates, inference and restart")
     args = parser.parse_args()
+    if args.mdj_ecp_alm:
+        if args.mdj_alm:
+            parser.error("select only one AE or locality-ECP mixed ALM profile")
+        args.mdj_alm = True  # Reuse strict initialized import/restart, not a second solver workflow.
     if args.sj_endpoints_line_search:
         if args.sj_reference_line_search:
             parser.error("select only one SJ line-search mode")
@@ -343,7 +349,7 @@ def main():
                 args.orbital_ecp, args.many_occupied_orbital_ecp, args.md_orbital_ecp,
                 args.joint_ci_orbital_ecp, args.joint_ci_orbital_ecp_minpii,
                 args.unequal_spin_orbital_ecp, args.csf_orbital_ecp, args.orbital_jastrow)):
-            parser.error("--mdj-alm selects one 1/2-rank fixed-orbital DETS/J2 AE workflow")
+            parser.error("mixed ALM selects one 1/2-rank fixed-orbital DETS/J2 workflow")
         args.model_import = True
     if args.joint_ci_orbital_ecp_minpii:
         if any((args.joint_ci_orbital_ecp, args.md_orbital_ecp, args.unequal_spin_orbital_ecp,
@@ -434,8 +440,14 @@ def main():
         assert sum(len(node.text.split()) for node in fixture_tree.findall(".//jastrow/correlation/coefficients")) == 8
     if args.mdj_alm:
         assert fixture_tree.find(".//detlist").get("type") == "DETS"
-        assert not fixture_tree.findall(".//rotated_sposet") and not fixture_tree.findall(".//pseudo")
-        assert [node.get("coeff") for node in fixture_tree.findall(".//detlist/ci")] == ["0.6", "0"]
+        assert not fixture_tree.findall(".//rotated_sposet")
+        assert bool(fixture_tree.findall(".//pseudo")) == args.mdj_ecp_alm
+        assert [node.get("coeff") for node in fixture_tree.findall(".//detlist/ci")] == \
+            (["0.6", "0.05"] if args.mdj_ecp_alm else ["0.6", "0"])
+        if args.mdj_ecp_alm:
+            assert [node.get("elementType") for node in fixture_tree.findall(".//pseudo")] == ["Be"]
+            assert sum(len(node.text.split()) for node in fixture_tree.findall(
+                ".//jastrow/correlation/coefficients")) == 4
     external_ecp = args.external_lcao and bool(fixture_tree.findall("hamiltonian/pairpot/pseudo"))
     if external_ecp:
         assert [node.get("size") for node in fixture_tree.findall("particleset[@name='e']/group")] == ["1", "1"]
@@ -670,12 +682,12 @@ def main():
                                 ("line_search_minimum_ess_fraction", "0.5"), ("line_search_confidence", "2")):
                 ET.SubElement(training, "parameter", name=name).text = value
         if args.mdj_alm:
-            # The P9 fixture uses its full ten-dimensional augmented subspace.
+            # Each profile uses its complete augmented subspace: Be P5 or H4 P9.
             qmc.find("parameter[@name='walkers_per_rank']").text = "4"
             qmc.find("parameter[@name='blocks']").text = "8"
             limits = {"damping": "0.01", "krylov_maximum_iterations": "64",
                       "krylov_maximum_operator_applications": "256", "krylov_maximum_seconds": "15",
-                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension": "10",
+                      "krylov_relative_tolerance": "1e-6", "lm_maximum_subspace_dimension": "6" if args.mdj_ecp_alm else "10",
                       "lm_inner_iterations": "32", "lm_inner_restart_length": "10"}
             for name, value in limits.items():
                 ET.SubElement(training, "parameter", name=name).text = value
@@ -720,6 +732,20 @@ def main():
                 assert all(node.get("optimize") == "no" for node in tree.findall(".//sposet"))
         tree.write(directory / "run.xml")
         result, text = launch(directory)
+        if args.mdj_ecp_alm and label == "alm" and result.returncode != 0 and \
+                "Live LM solve failed: untrusted_root" in text:
+            # A nonphysical sampled root is a protected refusal, never a tuned positive.
+            csv_file = directory / "sj.s000.training_info.csv"
+            assert not csv_file.exists() or not history(directory), directory
+            assert not list(directory.rglob("*.h5")), directory
+            assert "WFTrain refreshed parameter version" not in text and "WFTrain iteration 0 version" not in text
+            definition = ET.parse(directory / "run.xml")
+            assert [node.get("coeff") for node in definition.findall(".//detlist/ci")] == ["0.6", "0.05"]
+            assert ET.tostring(definition.find("wavefunction/sposet_collection")) == \
+                ET.tostring(fixture_tree.find("wavefunction/sposet_collection"))
+            print("EXPECTED REFUSAL: Be mixed DETS/J2 ALM untrusted root before update/publication; "
+                  "no positive inference/import/restart qualification", flush=True)
+            raise SystemExit(0)
         if reject:
             assert result.returncode != 0, (directory, text[-4000:])
             if isinstance(reject, tuple):
@@ -872,7 +898,7 @@ def main():
                         assert not np.array_equal(parameters[:8], previous[:8]), (model, "J1 did not update")
                         assert not np.array_equal(parameters[8:], previous[8:]), (model, "J2 did not update")
                     if args.mdj_alm:
-                        assert parameters.size == 9 and names[0] == "CI1", model
+                        assert parameters.size == (5 if args.mdj_ecp_alm else 9) and names[0] == "CI1", model
                         assert parameters[0] != previous[0], (model, "CI1 did not update")
                         assert not np.array_equal(parameters[1:], previous[1:]), (model, "J2 did not update")
                     if args.external_orbital_ecp:
@@ -1125,7 +1151,7 @@ def main():
             def mixed_ci_j2(tree):
                 tree.find("wavefunction/jastrow/correlation/coefficients").set("optimize", "yes")
             if md_ecp:
-                run("reject_mixed_ci_j2_lm", optimizer="lm", mutate=mixed_ci_j2,
+                run("reject_mixed_csf_j2_lm", optimizer="lm", mutate=mixed_ci_j2, ci_representation="csf",
                     reject="mixed updates remain unqualified")
             representation = "two-DETS-per-CSF" if args.csf_lm else "pure-DETS"
             methods = "LM positive and ALM pre-update complex-root refusal" if args.csf_lm else "LM/ALM projective updates"
@@ -1141,16 +1167,13 @@ def main():
             representation = "two-DETS-per-CSF" if args.csf_pii else "pure-DETS"
             print(f"PASS: {representation} PII/minPII committed updates, fixed reference/SPO/J2/expansion and exact exported inference; not mixed CI/Jastrow qualification")
         elif mixed_ci:
-            if md_ecp:
-                run("reject_mixed_mdj_lm", optimizer="lm", reject="mixed updates remain unqualified")
-                run("reject_mixed_ci_ecp_alm", optimizer="alm", reject="mixed updates remain unqualified")
             if args.mdj_pii and md_ecp:
                 run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
                     reject="mixed updates remain unqualified")
             representation = "nontrivial CSF/J2" if args.csf_j2_pii else "DETS/J2"
             physics = "ordinary-locality ECP" if md_ecp else "all-electron"
             print(f"PASS: mixed {representation} {physics} PII/minPII updates, fixed reference/SPO/expansion, "
-                  "exact exported inference/restart; ECP mixed LM remains rejected")
+                  "exact exported inference/restart; CSF ECP mixed LM remains rejected")
         else:
             print("PASS: bounded LM/ALM/PII/minPII physical-state consistency; decisions recorded without forcing acceptance")
         return
@@ -1420,7 +1443,11 @@ def main():
             print(f"PASS: H2 SJ Adam {mode} search, {detail}, "
                   "natural decisions/accepted-state preservation and strict exact initialized restart")
         elif args.mdj_alm:
-            print(f"PASS: real CPU fixed-orbital H4 DETS/J2 AE ALM P9, two committed {32 * args.ranks}-sample updates, "
+            if args.mdj_ecp_alm:
+                run("reject_mixed_csf_j2_lm", optimizer="lm", ci_representation="csf",
+                    reject="mixed updates remain unqualified")
+            profile = "Be DETS/J2 locality-ECP ALM P5" if args.mdj_ecp_alm else "H4 DETS/J2 AE ALM P9"
+            print(f"PASS: real CPU fixed-orbital {profile}, two committed {32 * args.ranks}-sample updates, "
                   "frozen C0/SPO, exported inference/model reuse and strict exact initialized restart")
         elif args.csf_orbital_ecp:
             print("PASS: real CPU signed-child CSF/orbital/J2 ECP Adam P17, frozen outer CSF0=.6/expanded C0=.48, "

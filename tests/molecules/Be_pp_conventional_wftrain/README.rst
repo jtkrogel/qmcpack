@@ -91,3 +91,22 @@ its dense-oracle gate and two-MPI native restart passed. Complex, optimized-SPO,
 spinor and offload derivative paths are unchanged. CSF, orbital rotations, J3, complex,
 offload and DLA are excluded from this fixed-DETS ECP profile. No timing or
 overall memory benchmark is claimed.
+
+Mixed fixed-orbital DETS/J2 LM/ALM (conditional numerical-first stage)
+-------------------------------------------------------------------
+The bounded mixed-normalization consumer reuses ``wftrain_mdj_ecp.xml``:
+real CPU/open, fixed inline orbitals, frozen C0=.6, active C1 and four J2
+coordinates, ordinary-locality Be BFD. CSF, orbital, J3, offload and DLA
+compositions remain excluded from this LM/ALM extension. Production admission
+and native qualification await the independent P5 physical/dense proof.
+
+After root accepts that proof and the admission change, one ALM workflow is::
+
+  python3 ../H2_ae_conventional_wftrain/check_sj_training.py /absolute/qmcpack wftrain_mdj_ecp.xml --mdj-ecp-alm
+
+It uses 32 samples, fixed damping .01, the full six-dimensional augmented
+space, existing finite work/time caps, and strict inference/import/re-export/
+initialized split restart. No seed, source asset, numerical tolerance or root
+selection is changed. A genuine first-iteration ``untrusted_root`` is reported
+as EXPECTED REFUSAL only with no history rows, HDF output or publication;
+that outcome does not qualify positive updates, inference or restart.
