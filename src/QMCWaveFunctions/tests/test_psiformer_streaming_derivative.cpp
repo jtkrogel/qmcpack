@@ -2218,7 +2218,7 @@ TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
         norm = std::hypot(norm, expected.values[i] - old);
       }
       // Seven numerical repeats preserve the old HOST terminal's S>=7 policy.
-      std::vector<double> host_candidate;
+      std::vector<double> host_candidate(p);
       const auto host_diagnostics = host.consumeResidentEnergySR(*ho, {h.data(), h.size()}, weights,
           host.snapshotParameters().values, total_weight, mean_energy, damping, rate, control, budget, host_candidate);
       REQUIRE(host_diagnostics.solve.converged);
