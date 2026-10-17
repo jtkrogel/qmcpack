@@ -24,6 +24,7 @@
 #if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceRuntime.h"
 #include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceMetrics.h"
+#include "QMCWaveFunctions/detail/CUDA/PsiFormerDeviceAdam.h"
 #endif
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "ResourceCollection.h"
@@ -1558,6 +1559,195 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
     SelectedParameterSink rejected(selected);
     node->applyVJPs({node_channels.data(), node_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, rejected);
   }()));
+}
+#endif
+
+#if defined(ENABLE_CUDA) && !defined(QMC_COMPLEX)
+TEST_CASE("PsiFormer real resident DEVICE authority fences cold readers",
+          "[wavefunction][psiformer][training][gpu_resident_authority]")
+{
+  using namespace testing::psiformer;
+  namespace ps = psiformer;
+  int devices = 0, ordinal = -1;
+#ifdef QMC_CUDA2HIP
+  if (hipGetDeviceCount(&devices) != hipSuccess || !devices)
+  { WARN("NOT_RUN: resident authority requires a HIP device"); return; }
+  REQUIRE(hipGetDevice(&ordinal) == hipSuccess);
+#else
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+  { WARN("NOT_RUN: resident authority requires a CUDA device"); return; }
+  REQUIRE(cudaGetDevice(&ordinal) == cudaSuccess);
+#endif
+  ScopedEnvironmentVariable authority_flag("PSIFORMER_GPU_RESIDENT_DEVICE_AUTHORITY", "1");
+  auto leaves = makeLayout(4, 2, true, 1, 4);
+  for (auto& leaf : leaves)
+    for (auto& extent : leaf.shape)
+      if (extent == 256 || extent == 64) extent = 8;
+  ps::InitializedPsiFormerParameters initialized;
+  initialized.model_shape = {2, 2, 2, 2, 8, 2, 1};
+  initialized.profile = ps::DEEPQMC_PSIFORMER_V1;
+  initialized.seed = 37;
+  initialized.values = makeParameters("lih", leaves);
+  std::size_t cursor = 0;
+  for (const auto& leaf : leaves)
+  {
+    const auto begin = cursor; cursor += product(leaf.shape);
+    initialized.layouts.push_back({leaf.module, leaf.name, leaf.shape, begin, cursor});
+  }
+  const SimulationCell cell;
+  auto electrons = makeElectrons(cell);
+  ParticleSet ions(cell); ions.setName("ion0"); ions.create({1, 1});
+  auto& species = ions.getSpeciesSet(); species.addSpecies("Li"); species.addSpecies("H");
+  const int charge = species.addAttribute("charge"); species(charge, 0) = 3; species(charge, 1) = 1;
+  ions.R[0] = {0, 0, 0}; ions.R[1] = {3.0154361724853516, 0, 0}; ions.resetGroups(); ions.update();
+  auto resolution = ps::PsiFormerAcceleratorResolution{};
+#ifdef QMC_CUDA2HIP
+  resolution.backend = ps::PsiFormerAcceleratorBackend::HIP;
+#else
+  resolution.backend = ps::PsiFormerAcceleratorBackend::CUDA;
+#endif
+  resolution.reason = ps::PsiFormerAcceleratorResolutionReason::ACCELERATOR_READY;
+  resolution.readiness_records_consulted = 1;
+  resolution.validated_operations = ps::psiFormerAcceleratorInferenceOperations();
+  PsiFormerWF cpu("authority", initialized, electrons, ions, true, {0, 5, 10});
+  PsiFormerWF gpu("authority", initialized, electrons, ions, true, {0, 5, 10}, false, {}, {}, resolution);
+  cpu.validateSystem(electrons, ions, "all_electron");
+  gpu.validateSystem(electrons, ions, "all_electron");
+  CHECK_FALSE(cpu.residentDeviceAuthorityRequested());
+  REQUIRE(gpu.residentDeviceAuthorityRequested());
+  if (const char* path = std::getenv("PSIFORMER_TEST_RESIDENT_MODEL_EXPORT"))
+    gpu.exportModel(path); // Explicit test-only fixture export before any mutation.
+  const auto p = gpu.parameterSchema().parameterCount();
+  const auto bytes = 8 * p;
+  const auto norm_bytes = gpu.prepareResidentEnergyAdam(48 * p + 4096);
+  const auto allowances = gpu.prepareResidentDeviceAuthority();
+  CHECK(allowances.snapshot_device_bytes == bytes);
+  CHECK(allowances.successor_device_bytes == bytes);
+  CHECK(allowances.cold_host_bytes == bytes);
+  std::vector<ps::device::AdamBlock> blocks;
+  for (const auto& block : gpu.parameterSchema().blocks())
+    blocks.push_back({block.offset, block.count, block.trainable ? .0017 : 0, block.trainable ? 1u : 0u});
+  std::shared_ptr<ps::device::PreparedDeviceAdam> adam = ps::device::PreparedDeviceAdam::prepare(
+      p, blocks, ps::device::estimateAdamBytes(p, blocks.size()));
+  std::vector<double> zero(p), first(p), second(p);
+  adam->seed(zero, zero); adam->prepareEnergyGradient(norm_bytes);
+  std::vector<std::size_t> selected(p); std::iota(selected.begin(), selected.end(), 0);
+  RefVectorWithLeader<WaveFunctionComponent> gpu_components(gpu, {gpu}), cpu_components(cpu, {cpu});
+  RefVectorWithLeader<ParticleSet> particles(electrons, {electrons});
+  RefVector<ParticleSet::ParticleGradient> gradients{electrons.G};
+  RefVector<ParticleSet::ParticleLaplacian> laplacians{electrons.L};
+  ResourceCollection prototype("resident_authority"); gpu.createResource(prototype);
+  ResourceCollection resources(prototype);
+  ResourceCollectionTeamLock<WaveFunctionComponent> team(resources, gpu_components);
+  const auto cpu_active = registerSelectedParameters(cpu), gpu_active = registerSelectedParameters(gpu);
+  const auto legacy = [&](PsiFormerWF& component, const OptVariables& active) {
+    Vector<QMCTraits::ValueType> score(active.size()), kinetic(active.size()), score_only(active.size());
+    score = QMCTraits::ValueType{}; kinetic = QMCTraits::ValueType{}; score_only = QMCTraits::ValueType{};
+    component.evaluateDerivatives(electrons, active, score, kinetic);
+    component.evaluateDerivativesWF(electrons, active, score_only);
+    std::vector<double> values;
+    for (std::size_t i = 0; i < active.size(); ++i)
+    { values.push_back(std::real(score[i])); values.push_back(std::real(kinetic[i])); values.push_back(std::real(score_only[i])); }
+    return values;
+  };
+  const auto full = [&] {
+    electrons.G = QMCTraits::GradType{}; electrons.L = QMCTraits::ValueType{};
+    gpu.mw_evaluateLog(gpu_components, particles, gradients, laplacians);
+  };
+  constexpr double beta1 = .9, beta2 = .999, epsilon = 1e-8, energy = -2.3;
+  full();
+  (void)legacy(gpu, gpu_active); // Prime cached CPU score/kinetic/affine leaves.
+  for (std::size_t step = 1; step <= 3; ++step)
+  {
+    full();
+    auto cpu_op = cpu.makeStreamingDerivativeOperator(cpu_components, particles, step, 0, 17);
+    auto gpu_op = gpu.makeStreamingDerivativeOperator(gpu_components, particles, step, 0, 17);
+    const std::vector<DerivativeValue> one{{1, 0}}, eo{{energy, 0}};
+    const auto channelsFor = [&](const StreamingDerivativeOperator& op) {
+      return std::vector<VJPCoefficientChannel>{
+        {"T", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(op, one), wftrain::localEnergyTermBit(wftrain::LocalEnergyTerm::KINETIC)},
+        {"EO", DerivativeProduct::SCORE_VJP, coefficientsFor(op, eo)},
+        {"O", DerivativeProduct::SCORE_VJP, coefficientsFor(op, one)}};
+    };
+    auto cpu_channels = channelsFor(*cpu_op), gpu_channels = channelsFor(*gpu_op);
+    SelectedParameterSink oracle(selected);
+    cpu_op->applyVJPs({cpu_channels.data(), cpu_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, oracle);
+    auto expected = cpu.snapshotParameters();
+    double gradient_norm = 0, displacement_norm = 0;
+    for (const auto& block : cpu.parameterSchema().blocks())
+      for (std::size_t i = block.offset; i < block.offset + block.count; ++i)
+      {
+        const double g = 2 * (oracle.results()[0][i].real() + oracle.results()[1][i].real() - energy * oracle.results()[2][i].real());
+        gradient_norm = std::hypot(gradient_norm, g);
+        if (!block.trainable) continue;
+        first[i] = beta1 * first[i] + (1 - beta1) * g;
+        second[i] = beta2 * second[i] + (1 - beta2) * g * g;
+        const double prior = expected.values[i];
+        expected.values[i] -= .0017 * (first[i] / (1 - std::pow(beta1, step))) /
+            (std::sqrt(second[i] / (1 - std::pow(beta2, step))) + epsilon);
+        displacement_norm = std::hypot(displacement_norm, expected.values[i] - prior);
+      }
+    const auto propose = [&] {
+      return gpu.consumeResidentEnergyAdamDevice(*gpu_op, {gpu_channels.data(), gpu_channels.size()}, adam,
+          1, energy, beta1, beta2, 1 - std::pow(beta1, step), 1 - std::pow(beta2, step), epsilon, bytes);
+    };
+    // Denial and discard preserve both the active image and exact retry receipt.
+    auto proposal = propose();
+    CHECK(proposal->gradientNorm() == Catch::Approx(gradient_norm).epsilon(2e-8).margin(2e-8));
+    CHECK(proposal->displacementNorm() == Catch::Approx(displacement_norm).epsilon(2e-8).margin(2e-10));
+    CHECK_THROWS(gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes - 1));
+    proposal = propose();
+    CHECK_THROWS(gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step, bytes));
+    proposal = propose();
+    CHECK_THROWS(cpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes));
+    proposal = propose();
+    { auto discarded = gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes); }
+    CHECK(gpu.parameterVersion() == step - 1);
+    proposal = propose();
+    auto publication = gpu.prepareResidentDeviceAdamPublication(std::move(proposal), step - 1, bytes);
+    auto& metrics = ps::device::deviceMemoryMetrics(ordinal);
+    const auto before = metrics.snapshot();
+    CHECK(publication->commit() == step);
+    const auto after = metrics.snapshot();
+    CHECK(after.uploaded_bytes == before.uploaded_bytes);
+    CHECK(after.downloaded_bytes == before.downloaded_bytes);
+    CHECK(after.allocation_calls == before.allocation_calls);
+    CHECK(after.free_calls == before.free_calls);
+    CHECK(after.device_copied_bytes == before.device_copied_bytes);
+    publication.reset();
+    cpu.publishParameters(expected, step - 1);
+    // Include a post-publication GPU FULL before the explicit cold HOST fence.
+    const auto warm = metrics.snapshot(); full();
+    CHECK(metrics.snapshot().downloaded_bytes - warm.downloaded_bytes < bytes);
+    const auto gpu_gradient = electrons.G; const auto gpu_laplacian = electrons.L;
+    const auto cold = metrics.snapshot();
+    const auto cached_cpu = legacy(gpu, gpu_active); // Default owner fence, not flat_values alone.
+    const auto actual = gpu.snapshotParameters();
+    CHECK(metrics.snapshot().downloaded_bytes - cold.downloaded_bytes == bytes);
+    REQUIRE(actual.version == step);
+    for (std::size_t i = 0; i < p; ++i)
+      CHECK(actual.values[i] == Catch::Approx(expected.values[i]).epsilon(2e-8).margin(2e-10));
+    const auto fresh = metrics.snapshot(); (void)gpu.snapshotParameters();
+    CHECK(metrics.snapshot().downloaded_bytes == fresh.downloaded_bytes);
+    const auto expected_cpu = legacy(cpu, cpu_active);
+    REQUIRE(cached_cpu.size() == expected_cpu.size());
+    for (std::size_t i = 0; i < cached_cpu.size(); ++i)
+      CHECK(cached_cpu[i] == Catch::Approx(expected_cpu[i]).epsilon(2e-7).margin(2e-7));
+    electrons.G = QMCTraits::GradType{}; electrons.L = QMCTraits::ValueType{};
+    cpu.evaluateLog(electrons, electrons.G, electrons.L);
+    for (std::size_t i = 0; i < 4; ++i)
+    {
+      for (int d = 0; d < 3; ++d) checkClose(gpu_gradient[i][d], electrons.G[i][d]);
+      checkClose(gpu_laplacian[i], electrons.L[i]);
+    }
+  }
+  std::vector<double> actual_first(p), actual_second(p);
+  adam->download(actual_first, actual_second);
+  for (std::size_t i = 0; i < p; ++i)
+  {
+    CHECK(actual_first[i] == Catch::Approx(first[i]).epsilon(2e-8).margin(2e-9));
+    CHECK(actual_second[i] == Catch::Approx(second[i]).epsilon(2e-8).margin(2e-9));
+  }
 }
 #endif
 

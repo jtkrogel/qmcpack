@@ -94,14 +94,20 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
         std::ldexp(1.0, -600), std::ldexp(1.0, 600), b1, b2, 0.1, 0.001, epsilon, bytes);
   });
   fails([&] { adam->validateHostCandidateAcceptance(); });
+  // Keep CPU affine/score/kinetic/spatial caches alive across same-version refresh.
+  pf::DirectValueExecutor cached_value(model, plan);
+  pf::DirectSpatialExecutor cached_spatial(model, cached_value, plan);
+  pf::DirectScoreExecutor score_cpu(model, plan);
+  pf::DirectKineticExecutor kinetic_cpu(model, plan);
+  auto cached_full = cached_spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+  auto sw = score_cpu.makeWorkspace();
+  auto kw = kinetic_cpu.makeWorkspace();
+  cached_full->setPositions(pf::GeometryPositionView::interleaved(position(0), ne));
+  (void)cached_spatial.evaluateFull(*cached_full);
   std::weak_ptr<const PreparedDeviceModel> intermediate;
   for (std::size_t step = 1; step <= 3; ++step)
   {
     // This HOST model is an independent oracle, never the GPU publication source.
-    pf::DirectScoreExecutor score_cpu(model, plan);
-    pf::DirectKineticExecutor kinetic_cpu(model, plan);
-    auto sw = score_cpu.makeWorkspace();
-    auto kw = kinetic_cpu.makeWorkspace();
     std::vector<double> t(p), eo(p), o(p);
     for (std::size_t s = 0; s < 5; ++s)
     {
@@ -153,7 +159,19 @@ inline void validateDeviceAdamCandidates(pf::PsiFormer& model, const PsiFormerEx
     owner.stage(fingerprint, next->version(), hooks);
     owner.complete(next->version(), hooks);
     active = next;
-    model.p.set_flat_values(expected);
+    ++model.p.parameter_version;
+    const auto authoritative_version = model.p.version();
+    auto refresh = model.p.prepare_same_version_flat_values(std::vector<double>(expected), authoritative_version);
+    require(refresh.commit() == authoritative_version, "Cold native refresh advanced authoritative version");
+    pf::DirectValueExecutor fresh_value(model, plan);
+    pf::DirectSpatialExecutor fresh_spatial(model, fresh_value, plan);
+    auto fresh_full = fresh_spatial.makeWorkspace(pf::DirectSpatialMode::FULL_VGL);
+    fresh_full->setPositions(pf::GeometryPositionView::interleaved(position(0), ne));
+    const auto cached_result = cached_spatial.evaluateFull(*cached_full);
+    const auto fresh_result = fresh_spatial.evaluateFull(*fresh_full);
+    near(cached_result.logabs, fresh_result.logabs);
+    for (std::size_t i = 0; i < 3 * ne; ++i) near(cached_result.gradient[i], fresh_result.gradient[i]);
+    for (std::size_t i = 0; i < ne; ++i) near(cached_result.lap_log[i], fresh_result.lap_log[i]);
     std::cout << "DEVICE_CANDIDATE step=" << step << " H2D=0 D2D=" << 2 * bytes
               << " D2H=" << after.downloaded_bytes - before.downloaded_bytes << '\n';
   }
