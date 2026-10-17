@@ -18,8 +18,9 @@ maintained ``06_intensive_impl_tasks`` archive, not a bundled binary release.
 * CPU_MULTINODE: actual BESMS CPU-complex R4 orbital-MSE, four WORLD ranks,
   two independent groups spanning two nodes, matched-slot isolation and exact
   state passed. It is not GPU MPI or a general complex ENERGY claim.
-* HIP_COMPILE: prior-source compile/link only. Neither AMD execution nor a HIP
-  compile of this new batched-parallel snapshot is claimed.
+* HIP_COMPILE: source cc009ec36 compiled and linked the model validator and
+  its device library for gfx90a with ROCm 7.14.1. This is not AMD execution,
+  a full application build or combined CUDA/OpenMP-target qualification.
 * PRODUCTION_PENDING: AMD runtime, multiple GPUs/device-aware MPI, 40--80+ GiB
   calibration and combined CUDA/OpenMP-target toolchain remain separate gates.
 

@@ -32,9 +32,12 @@
       "nodes": "or-condo-c[555-556]", "seconds": 35
     },
     "HIP_COMPILE": {
-      "status": "PRIOR_SOURCE_COMPILE_ONLY", "runtime_qualified": false,
-      "evidence": "35_gpu_production_validation; source-specific prior compile/link records",
-      "limits": "No AMD runtime or new batched-parallel snapshot HIP compilation is claimed"
+      "status": "COMPILE_LINK_ONLY", "runtime_qualified": false,
+      "source": "cc009ec3687175626cb46b21b3d8600b6d4c854f",
+      "target": "psiformer_device_model_validation", "architecture": "gfx90a",
+      "binary_sha256": "482425d3073b34de0f9533dc8edbd2901b0a694ef5f2d9fcdf471614e30099ef",
+      "evidence": "35_gpu_production_validation/validation_C_hip_cc009ec36/qualification_C.rst",
+      "limits": "Validator and linked device library compile/link only; no AMD runtime, full application or combined CUDA/OpenMP-target claim"
     },
     "PRODUCTION_PENDING": {
       "status": "PENDING", "runtime_qualified": false,

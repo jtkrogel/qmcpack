@@ -38,7 +38,9 @@ def main():
         for field in ('source', 'binary_sha256'):
             int(profiles[name][field], 16)
     assert not profiles['HIP_COMPILE']['runtime_qualified'] and not profiles['PRODUCTION_PENDING']['runtime_qualified']
-    assert profiles['HIP_COMPILE']['status'] == 'PRIOR_SOURCE_COMPILE_ONLY' and profiles['PRODUCTION_PENDING']['status'] == 'PENDING'
+    assert profiles['HIP_COMPILE']['status'] == 'COMPILE_LINK_ONLY' and profiles['PRODUCTION_PENDING']['status'] == 'PENDING'
+    assert profiles['HIP_COMPILE']['architecture'] == 'gfx90a' and profiles['HIP_COMPILE']['target'] == 'psiformer_device_model_validation'
+    assert len(profiles['HIP_COMPILE']['source']) == 40 and len(profiles['HIP_COMPILE']['binary_sha256']) == 64
     assert len(profiles['CPU_MULTINODE']['input_sha256']) == 2
     template = base / profiles['SINGLE_GPU']['template']
     assert digest(template) == profiles['SINGLE_GPU']['template_sha256']
