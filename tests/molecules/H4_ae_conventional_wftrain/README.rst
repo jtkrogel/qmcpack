@@ -87,7 +87,8 @@ coefficient updates rather than LM's Ritz-vector retraction. The physical
 oracle compares both methods to the dense centered scalar system and checks
 actual private wavefunction ratios and every fixed expansion term.
 
-The native regression passed on source ``f2544a843``: both methods commit two
+The native regression passed on full built source ``27a46961f`` (conventional
+guard ``f2544a843``): both methods commit two
 32-sample updates, preserve CSF0/expansion/SPO/J2, and pass exact exported-model
 inference and full/split model/state/sampler/scientific history. Mixed CSF/J2
 is explicitly rejected by this profile. There is no mixed-coordinate, orbital,
