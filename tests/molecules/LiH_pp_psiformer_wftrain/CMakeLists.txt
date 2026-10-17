@@ -124,3 +124,26 @@ if(NOT QMC_COMPLEX AND NOT MIXED_PRECISION)
                                            "WFTrain iteration 0 version 3 samples 2 mean_energy.*optimizer kfac")
   endif()
 endif()
+
+# Existing internally initialized BFD model: no external trained asset or generator.
+if(ENABLE_CUDA AND NOT QMC_CUDA2HIP AND NOT QMC_COMPLEX AND NOT MIXED_PRECISION AND Python3_EXECUTABLE)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import h5py, numpy"
+                  RESULT_VARIABLE ECP_DEVICE_SR_PYTHON_MODULES OUTPUT_QUIET ERROR_QUIET)
+  if(ECP_DEVICE_SR_PYTHON_MODULES EQUAL 0)
+    execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${qmcpack_SOURCE_DIR}
+                    OUTPUT_VARIABLE ECP_DEVICE_SR_SOURCE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT ECP_DEVICE_SR_SOURCE_COMMIT)
+      set(ECP_DEVICE_SR_SOURCE_COMMIT unavailable)
+    endif()
+    add_test(NAME deterministic-LiH-pp-psiformer-device-sr-restart
+             COMMAND ${QMC_GPU_TEST_LAUNCHER} ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/check_resident_device_sr_native.py
+                     --binary $<TARGET_FILE:qmcpack> --source ${qmcpack_SOURCE_DIR}
+                     --input ${CMAKE_CURRENT_SOURCE_DIR}/wftrain_ecp_checkpoint.xml
+                     --output-parent ${CMAKE_CURRENT_BINARY_DIR}/device_sr_native
+                     --source-commit ${ECP_DEVICE_SR_SOURCE_COMMIT} --full-workflow)
+    SET_TEST_GPU_RESOURCES(deterministic-LiH-pp-psiformer-device-sr-restart)
+    set_tests_properties(deterministic-LiH-pp-psiformer-device-sr-restart PROPERTIES
+                         TIMEOUT 200 PROCESSORS 1 LABELS "deterministic;psiformer;gpu;sr;ecp;restart")
+  endif()
+endif()
