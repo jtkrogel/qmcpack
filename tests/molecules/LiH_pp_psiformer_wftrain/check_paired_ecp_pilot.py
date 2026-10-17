@@ -47,9 +47,9 @@ assert training.find("parameter[@name='learning_rate']").text.strip() == "1e-10"
 protected = {str(a.input.resolve()): sha(a.input)}
 imported_values = None
 if a.import_model:
-    model = a.import_model.resolve(strict=True)
-    protected[str(model)] = sha(model)
-    with h5py.File(model) as archive:
+    imported_model_path = a.import_model.resolve(strict=True)
+    protected[str(imported_model_path)] = sha(imported_model_path)
+    with h5py.File(imported_model_path) as archive:
         assert text(archive["psiformer_model/system"][()]) == "pseudopotential"
         assert (
             int(
@@ -62,7 +62,7 @@ if a.import_model:
     # Keep current PP/XML/MC controls: standalone values are fresh initialization only.
     for key in ("initialization", "initialization_seed"):
         del head.attrib[key]
-    head.set("parameters", str(model))
+    head.set("parameters", str(imported_model_path))
 for pseudo in root.findall("qmcsystem/hamiltonian/pairpot/pseudo"):
     path = (a.input.parent / pseudo.get("href")).resolve()
     protected[str(path)] = sha(path)
@@ -196,7 +196,7 @@ try:
             "No trainable value changed on the first fresh imported-model update"
         )
         report.update(
-            imported_model_sha256=protected[str(model)],
+            imported_model_sha256=protected[str(imported_model_path)],
             fresh_initialization=True,
             first_update_changed_values=changed_from_import,
             scope="fresh_version0_current_Hamiltonian_not_sampler_or_PP_provenance_restart",
