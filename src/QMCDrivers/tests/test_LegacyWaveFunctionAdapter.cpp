@@ -4391,11 +4391,12 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
   // The nodal model uses the supported octahedral BFD rule and a counting
   // identity-rotation RNG. Pure px vanishes on an exact q_x=0 symmetry axis.
   const std::string node_coefficients = "0 1 0 0  1 0 0 0  0 0 1 0";
-  for (int model = 0; model < 9; ++model)
+  for (int model = 0; model < 10; ++model)
   {
     CAPTURE(model);
     const bool joint = model >= 5;
-    const bool polarized = model >= 7;
+    const bool polarized = model == 7 || model == 8;
+    const bool csf = model == 9;
     const bool md = model >= 3, node = model == 1 || model == 4 || model == 6;
     const bool many = model >= 2;
     ParticleSetPool pool(OHMMS::Controller);
@@ -4510,6 +4511,25 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       }
     }
     REQUIRE(definition.parseFromString(wavefunction_xml));
+    if (csf)
+    {
+      // Deliberately unnormalized frozen CSF basis: actual CI0=.6, expanded C0=.48.
+      // Active CI1 is a genuine signed open-shell two-determinant combination.
+      Libxml2Document expansion;
+      REQUIRE(expansion.parseFromString(R"(<detlist size="2" type="CSF" nca="0" ncb="0"
+          nea="2" neb="2" nstates="4" cutoff="0">
+        <csf id="CI0" coeff="0.6" occ="2200" exctLvl="0">
+          <det coeff="0.8" alpha="1100" beta="1100"/>
+        </csf>
+        <csf id="CI1" coeff="0.1" occ="2110" exctLvl="1">
+          <det coeff="0.7071067811865475244" alpha="1100" beta="1010"/>
+          <det coeff="-0.7071067811865475244" alpha="1010" beta="1100"/>
+        </csf></detlist>)"));
+      auto* determinantset = xmlNextElementSibling(xmlFirstElementChild(definition.getRoot()));
+      auto* old_list = xmlFirstElementChild(xmlFirstElementChild(determinantset));
+      auto* removed = xmlReplaceNode(old_list, xmlDocCopyNode(expansion.getRoot(), definition.getRoot()->doc, 1));
+      xmlFreeNode(removed);
+    }
     if (polarized)
     {
       auto* detlist = xmlFirstElementChild(xmlFirstElementChild(
@@ -4628,7 +4648,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
     ham.createResource(ham_resources);
     const auto positions = particles.R;
     const auto ion_positions = ions.R;
-    for (int step = 0; step < (model == 0 || model == 3 || model == 5 || polarized ? 3 : 1); ++step)
+    for (int step = 0; step < (model == 0 || model == 3 || model == 5 || polarized || csf ? 3 : 1); ++step)
     {
       CAPTURE(step);
       if (step > 0)
@@ -4672,6 +4692,17 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       const auto down_reference = md ? dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_).originalRotationCoefficients() : source_reference;
       const auto down_full = md ? rotated(*source, 1).fullRotationCoordinates() : source_full;
       const auto source_ci = md ? source->findMSD().front().get().get_C() : std::vector<QMCTraits::ValueType>{};
+      const auto source_map = md ? source->findMSD().front().get().get_C2node() : std::vector<std::vector<std::size_t>>{};
+      if (csf)
+      {
+        REQUIRE(source->findMSD().front().get().hasCSFExpansion());
+        CHECK(source->findMSD().front().get().fixedCoefficientReference() == QMCTraits::ValueType{.6});
+        REQUIRE(source_ci.size() == 3);
+        CHECK(source_ci[0] == QMCTraits::ValueType{.48});
+        CHECK((source_map == std::vector<std::vector<std::size_t>>{{0, 0, 1}, {0, 1, 0}}));
+        checkClose(derivativeValue(source_ci[1]), snapshot->values[0] * std::sqrt(.5));
+        checkClose(derivativeValue(source_ci[2]), -snapshot->values[0] * std::sqrt(.5));
+      }
       if (joint)
       {
         // One candidate jointly changes CI and BOTH frames on detached banks.
@@ -4684,8 +4715,17 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         point.values[polarized ? history_indices[1][0] : 7] -= .02;
         candidate_particles.update(); adapter.installSnapshot(*candidate, candidate_particles, point);
         const auto& ci = candidate->findMSD().front().get().get_C();
-        CHECK(ci[0] == QMCTraits::ValueType{1});
-        CHECK(std::real(ci[1]) == point.values[0]);
+        CHECK(ci[0] == QMCTraits::ValueType(csf ? .48 : 1));
+        if (csf)
+        {
+          REQUIRE(ci.size() == 3);
+          checkClose(derivativeValue(ci[1]), point.values[0] * std::sqrt(.5));
+          checkClose(derivativeValue(ci[2]), -point.values[0] * std::sqrt(.5));
+          CHECK(candidate->findMSD().front().get().fixedCoefficientReference() == QMCTraits::ValueType{.6});
+          CHECK(candidate->findMSD().front().get().get_C2node() == source_map);
+        }
+        else
+          CHECK(std::real(ci[1]) == point.values[0]);
         CHECK(candidate->findMSD().front().get().get_C().data() != source->findMSD().front().get().get_C().data());
         CHECK(rotated(*candidate).fullRotationCoordinates() != source_full);
         CHECK(rotated(*candidate, 1).fullRotationCoordinates() != down_full);
@@ -4794,8 +4834,9 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
           fixed_potential += 1.0 / std::sqrt(dot(positions[electron] - positions[other], positions[electron] - positions[other]));
       // Independent physical MD numerator: signed occupied 2x2/3x3 matrices,
       // fixed CI contraction and separately evaluated J, including at nodes.
-      const auto dense_value = [&](TrialWaveFunction& wf, ParticleSet& p) {
+      const auto dense_value = [&](TrialWaveFunction& wf, ParticleSet& p, double actual_csf1) {
         std::array<QMCTraits::ValueType, 2> products{1, 1};
+        std::array<std::array<QMCTraits::ValueType, 2>, 2> occupied{};
         for (int spin = 0; spin < 2; ++spin)
         {
           const int n = p.groupsize(spin), first = p.first(spin);
@@ -4810,15 +4851,44 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
                 values(0, 1) * (values(1, 0) * values(2, last) - values(1, last) * values(2, 0)) +
                 values(0, last) * (values(1, 0) * values(2, 1) - values(1, 1) * values(2, 0));
             products[term] *= determinant;
+            occupied[spin][term] = determinant;
           }
         }
         double j = 0;
         p.G = QMCTraits::GradType{}; p.L = QMCTraits::ValueType{};
         for (auto& component : wf.getOrbitals())
           if (!component->isFermionic()) j += component->evaluateLog(p, p.G, p.L).real();
+        if (csf)
+        {
+          // Independent literal XML weights with ACTUAL CSF variables, not expanded get_C.
+          const auto actual_csf0 = wf.findMSD().front().get().fixedCoefficientReference();
+          return (actual_csf0 * .8 * occupied[0][0] * occupied[1][0] +
+              actual_csf1 * std::sqrt(.5) * (occupied[0][0] * occupied[1][1] -
+                                            occupied[0][1] * occupied[1][0])) * std::exp(j);
+        }
         const auto& c = wf.findMSD().front().get().get_C();
         return (c[0] * products[0] + c[1] * products[1]) * std::exp(j);
       };
+      if (csf)
+      {
+        // Independent spatial finite difference of complete signed Psi checks kinetic energy.
+        ParticleSet spatial_particles(particles);
+        auto spatial = source->makeClone(spatial_particles);
+        isolate(*spatial);
+        spatial_particles.update(); adapter.installSnapshot(*spatial, spatial_particles, *snapshot);
+        const auto psi = dense_value(*spatial, spatial_particles, snapshot->values[0]);
+        QMCTraits::ValueType laplacian{};
+        constexpr double h = 1e-4;
+        for (int electron = 0; electron < 4; ++electron)
+          for (int dimension = 0; dimension < 3; ++dimension)
+          {
+            spatial_particles.R = positions; spatial_particles.R[electron][dimension] += h; spatial_particles.update();
+            const auto plus = dense_value(*spatial, spatial_particles, snapshot->values[0]);
+            spatial_particles.R = positions; spatial_particles.R[electron][dimension] -= h; spatial_particles.update();
+            laplacian += plus + dense_value(*spatial, spatial_particles, snapshot->values[0]) - 2.0 * psi;
+          }
+        CHECK(std::real(-.5 * laplacian / (h * h * psi)) == Catch::Approx(source_energy.real()).epsilon(3e-5).margin(3e-6));
+      }
       // Independent signed complete-ratio FD oracle uses ordinary proposed
       // moves and rejects them, never a virtual-point inverse/logarithm.
       const auto fixed_grid_energy = [&](const StructuredParameterSnapshot& candidate, bool kinetic) {
@@ -4830,13 +4900,13 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         DerivativeValue energy = kinetic ? kineticEnergy(p) + fixed_potential : DerivativeValue{};
         if (md)
         {
-          const auto accepted_value = dense_value(*wf, p);
+          const auto accepted_value = dense_value(*wf, p, csf ? candidate.values[0] : 0);
           for (const auto& point : points)
           {
             p.R = positions;
             for (int d = 0; d < 3; ++d) p.R[point.electron][d] = point.replacement_position[d];
             p.update();
-            energy += point.bare_weight * derivativeValue(dense_value(*wf, p) / accepted_value);
+            energy += point.bare_weight * derivativeValue(dense_value(*wf, p, csf ? candidate.values[0] : 0) / accepted_value);
           }
           return energy;
         }
@@ -4858,7 +4928,7 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         p.update();
         isolate(*wf);
         adapter.installSnapshot(*wf, p, candidate);
-        return md ? std::log(std::abs(dense_value(*wf, p))) : wf->getLogPsi();
+        return md ? std::log(std::abs(dense_value(*wf, p, csf ? candidate.values[0] : 0))) : wf->getLogPsi();
       };
       const std::array<VJPCoefficientChannel, 3> channels{{
           {"total", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), total_mask},
@@ -4907,16 +4977,16 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
         auto spatial = source->makeClone(spatial_particles);
         isolate(*spatial);
         spatial_particles.update(); adapter.installSnapshot(*spatial, spatial_particles, *snapshot);
-        const auto psi = dense_value(*spatial, spatial_particles);
+        const auto psi = dense_value(*spatial, spatial_particles, 0);
         QMCTraits::ValueType laplacian{};
         constexpr double h = 1e-4;
         for (int electron = 0; electron < 4; ++electron)
           for (int dimension = 0; dimension < 3; ++dimension)
           {
             spatial_particles.R = positions; spatial_particles.R[electron][dimension] += h; spatial_particles.update();
-            const auto plus = dense_value(*spatial, spatial_particles);
+            const auto plus = dense_value(*spatial, spatial_particles, 0);
             spatial_particles.R = positions; spatial_particles.R[electron][dimension] -= h; spatial_particles.update();
-            laplacian += plus + dense_value(*spatial, spatial_particles) - 2.0 * psi;
+            laplacian += plus + dense_value(*spatial, spatial_particles, 0) - 2.0 * psi;
           }
         CHECK(std::real(-0.5 * laplacian / (h * h * psi)) == Catch::Approx(source_energy.real()).epsilon(3e-5).margin(3e-6));
         REQUIRE(md_node < points.size());
@@ -5000,9 +5070,27 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
       if (md)
       {
         CHECK(source->findMSD().front().get().get_C() == source_ci);
-        CHECK(source_ci[0] == QMCTraits::ValueType{1});
+        CHECK(source_ci[0] == QMCTraits::ValueType(csf ? .48 : 1));
+        CHECK(source->findMSD().front().get().get_C2node() == source_map);
         CHECK(sibling->findMSD().front().get().get_C() == source_ci);
-        CHECK((ordinary->findMSD().front().get().get_C() == std::vector<QMCTraits::ValueType>{1, .1}));
+        if (csf)
+        {
+          const std::vector<QMCTraits::ValueType> original_ci{.48, .1 * std::sqrt(.5), -.1 * std::sqrt(.5)};
+          CHECK(ordinary->findMSD().front().get().get_C() == original_ci);
+          CHECK(source->findMSD().front().get().fixedCoefficientReference() == QMCTraits::ValueType{.6});
+          CHECK(sibling->findMSD().front().get().fixedCoefficientReference() == QMCTraits::ValueType{.6});
+          CHECK(ordinary->findMSD().front().get().get_C2node() == source_map);
+          // With no selected updates, rebuild expanded C from its ACTUAL private CSF bank.
+          // This exposes accidental CSF-bank sharing even if the expanded vector stayed detached.
+          auto& source_msd = source->findMSD().front().get();
+          OptVariables inactive;
+          source_msd.checkOutVariables(inactive);
+          source_msd.resetParametersExclusive(inactive);
+          source_msd.checkOutVariables(adapter.registrationVariables());
+          CHECK(source_msd.get_C() == source_ci);
+        }
+        else
+          CHECK((ordinary->findMSD().front().get().get_C() == std::vector<QMCTraits::ValueType>{1, .1}));
         CHECK(ordinary_sibling->findMSD().front().get().get_C() == ordinary->findMSD().front().get().get_C());
         auto& down = dynamic_cast<LCAOrbitalSet&>(*rotated(*source, 1).Phi_);
         CHECK(*down.C == down_coefficients);
