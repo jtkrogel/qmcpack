@@ -13005,7 +13005,7 @@ std::unique_ptr<PsiFormerWF::ResidentDeviceSRProposal> PsiFormerWF::consumeResid
               << ", uploaded_bytes=" << after.uploaded_bytes - before.uploaded_bytes
               << ", downloaded_bytes=" << after.downloaded_bytes - before.downloaded_bytes
               << ", allocation_calls=" << after.allocation_calls - before.allocation_calls
-              << "; raw_square_displacement_domain=yes; public_driver_admission=no" << std::endl;
+              << "; raw_square_displacement_domain=yes; component_terminal_only=yes; caller_owns_profile_admission=yes" << std::endl;
   }, true);
   return proposal;
 #else
