@@ -639,6 +639,7 @@ void MultiDiracDeterminant::evaluateOrbitalGeneratorToAcceptedReference(
 void MultiDiracDeterminant::evaluateOrbitalGeneratorRowToAcceptedReference(
     int row, const ValueType* values, int p, int q, Vector<ValueType>& derivatives)
 {
+  // Prepare workV1 for this SAME row/values via evaluateRowToAcceptedReference first.
   derivatives.resize(getNumDets());
   derivatives = ValueType{};
   accepted_reference_occupations_.resize(NumPtcls);
@@ -734,6 +735,8 @@ void MultiDiracDeterminant::evaluatePrivateAcceptedOrbitalDerivatives(
     throw std::invalid_argument("Private accepted orbital rows require valid caches and distinct owning outputs");
   // The denominator remains the original regular accepted reference. Column
   // substitution differentiates the WHOLE determinant, including the replaced row.
+  workspace.resize(getNumDets());
+  evaluateRowToAcceptedReference(0, psiM.data(), workspace.data());
   evaluateOrbitalGeneratorRowToAcceptedReference(0, psiM.data(), p, q, derivatives);
   kinetic.resize(getNumDets());
   kinetic = ValueType{};
@@ -743,6 +746,7 @@ void MultiDiracDeterminant::evaluatePrivateAcceptedOrbitalDerivatives(
     for (int orbital = 0; orbital < NumOrbitals; ++orbital)
       psiV[orbital] = d2psiM(row, orbital) +
           RealType(2) * dot((*jastrow_gradients)[FirstIndex + row], dpsiM(row, orbital));
+    evaluateRowToAcceptedReference(row, psiV.data(), workspace.data());
     evaluateOrbitalGeneratorRowToAcceptedReference(row, psiV.data(), p, q, workspace);
     for (int determinant = 0; determinant < getNumDets(); ++determinant)
       kinetic[determinant] += workspace[determinant];

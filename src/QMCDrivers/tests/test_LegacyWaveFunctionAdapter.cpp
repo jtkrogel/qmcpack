@@ -5051,6 +5051,15 @@ TEST_CASE("accepted-reference orbital ECP products are nodal safe", "[legacy_ada
                                                               derivative, spatial, workspace);
         checkClose(derivativeValue(derivative[0]), {});
         checkClose(derivativeValue(derivative[1]), {-1, 0});
+        // Spatial row projections must not contaminate a subsequent accepted row.
+        ParticleSet::ParticleGradient zero_jastrow(particles.getTotalNum());
+        zero_jastrow = QMCTraits::GradType{};
+        determinant.evaluatePrivateAcceptedOrbitalDerivatives(particles, 1, 2, &zero_jastrow,
+                                                              derivative, spatial, workspace);
+        determinant.evaluatePrivateAcceptedOrbitalDerivatives(particles, 1, 2, nullptr,
+                                                              derivative, spatial, workspace);
+        checkClose(derivativeValue(derivative[0]), {});
+        checkClose(derivativeValue(derivative[1]), {-1, 0});
       }
       if (joint)
       {
