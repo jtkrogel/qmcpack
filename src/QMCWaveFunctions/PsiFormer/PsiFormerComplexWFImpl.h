@@ -500,12 +500,24 @@ struct PsiFormerComplexWF::Impl
   {
     using Products = psiformer::device::PreparedDeviceComplexProducts;
 
+    /// Validate the public domain scope before estimating or allocating numerical owners.
+    static auto numericalScope(GpuDerivativeScope scope)
+    {
+      using Scope = psiformer::device::ComplexProductsScope;
+      switch (scope)
+      {
+      case GpuDerivativeScope::COMPLETE: return Scope::COMPLETE;
+      case GpuDerivativeScope::SCORE_ECP_ONLY: return Scope::SCORE_ECP_ONLY;
+      }
+      throw std::invalid_argument("Complex GPU derivative preparation scope is invalid");
+    }
+
     /// Aggregate R(S) permits S>maxB; a single operator is separately restricted to B<=maxB.
     static PsiFormerComplexWF::GpuDerivativeRequirements required(const Model& state, std::size_t samples,
-        std::size_t maximum_samples, std::size_t targets, std::size_t chunk)
+        std::size_t maximum_samples, std::size_t targets, std::size_t chunk, GpuDerivativeScope scope)
     {
       const auto cost = psiformer::device::estimateComplexProductsCost(state.plan, targets, maximum_samples, 3, chunk,
-          psiformer::device::ComplexProductsHostOutput::CHUNKED);
+          psiformer::device::ComplexProductsHostOutput::CHUNKED, numericalScope(scope));
       const char* message = "Complex GPU derivative bytes overflow";
       std::size_t host = cost.host_bytes;
       pf::addStorageBytes(host, pf::checkedStorageBytes<C>(maximum_samples, message), message);
@@ -518,12 +530,13 @@ struct PsiFormerComplexWF::Impl
 
     /// Allocate only after both domains and maximum request work have been admitted.
     GpuDerivativeLane(std::shared_ptr<Model> model, std::size_t maximum_samples, std::size_t targets,
-        std::size_t chunk, const PsiFormerComplexWF::GpuDerivativeRequirements& budget)
+        std::size_t chunk, const PsiFormerComplexWF::GpuDerivativeRequirements& budget, GpuDerivativeScope scope)
         : state(std::move(model)), generation(state->gpu), maximum_samples(maximum_samples), targets(targets), chunk(chunk),
+          scope(scope),
           products(Products::prepare(generation->image, targets, maximum_samples, 3, chunk,
               generation->queue, generation->blas, budget.device_bytes,
-              budget.host_bytes - maximum_samples * sizeof(C), budget.matrix_work,
-              psiformer::device::ComplexProductsHostOutput::CHUNKED)),
+              budget.host_bytes - maximum_samples * sizeof(C), std::max(std::size_t{1}, budget.matrix_work),
+              psiformer::device::ComplexProductsHostOutput::CHUNKED, numericalScope(scope))),
           zeros(maximum_samples), channels(3)
     {}
 
@@ -531,6 +544,7 @@ struct PsiFormerComplexWF::Impl
     /// Declare before Products: borrowers die before their exact queue/BLAS/image generation.
     const std::shared_ptr<GpuLane> generation;
     const std::size_t maximum_samples, targets, chunk;
+    const GpuDerivativeScope scope;
     const std::unique_ptr<Products> products;
     const std::vector<C> zeros;
     std::vector<Products::Channel> channels;
@@ -553,18 +567,23 @@ struct PsiFormerComplexWF::Impl
     {
       using namespace wftrain;
       StreamingDerivativeCapabilities c;
-      c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) |
-          derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) | derivativeProductBit(DerivativeProduct::SCORE_JVP);
+      c.product_mask = derivativeProductBit(DerivativeProduct::SCORE_VJP) | derivativeProductBit(DerivativeProduct::SCORE_JVP);
       c.adjoint_mask = derivativeAdjointBit(DerivativeAdjoint::TRANSPOSE) | derivativeAdjointBit(DerivativeAdjoint::HERMITIAN);
-      c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+      if (lane->scope == GpuDerivativeScope::COMPLETE)
+      {
+        c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP);
+        c.local_energy_term_mask = localEnergyTermBit(LocalEnergyTerm::KINETIC);
+      }
       c.maximum_vjp_channels = 3;
       c.maximum_parameter_chunk_size = chunks.maximumChunkSize();
       c.maximum_sample_tile_size = 1;
-      c.fixed_parameter_scratch_vectors = 10; // Three retained complex-P HOST outputs became bounded chunks.
+      // Conservative vector-count upper bound; exact mixed-width bytes are in storageDiagnostics().
+      c.fixed_parameter_scratch_vectors = lane->scope == GpuDerivativeScope::COMPLETE ? 10 : 8;
       c.block_streaming = true;
       if (replay_bound.load(std::memory_order_acquire))
       {
-        c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
+        c.product_mask |= derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_VJP) |
+            derivativeProductBit(DerivativeProduct::LOCAL_ENERGY_JVP);
         c.local_energy_term_mask |= localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
         c.maximum_vjp_channels = 3; // One complete energy channel plus SCORE EO/O, in any caller order.
       }
@@ -597,9 +616,10 @@ struct PsiFormerComplexWF::Impl
       const auto& cost = lane->products->cost();
       d.parameter_count = cost.parameters;
       d.sample_count = samples;
-      d.real_parameter_vectors = 4;
-      d.complex_parameter_vectors = 5;
-      d.parameter_scratch_bytes = 112 * cost.parameters + 32 * cost.chunk;
+      const bool complete = lane->scope == GpuDerivativeScope::COMPLETE;
+      d.real_parameter_vectors = complete ? 4 : 3;
+      d.complex_parameter_vectors = complete ? 5 : 4;
+      d.parameter_scratch_bytes = (complete ? 112 : 88) * cost.parameters + 32 * cost.chunk;
       d.shared_workspace_bytes = cost.device_bytes + cost.host_bytes + lane->zeros.capacity() * sizeof(C);
       d.evaluator_workspace_bytes = d.shared_workspace_bytes - d.parameter_scratch_bytes;
       d.sample_position_bytes = positions.capacity() * sizeof(double);
@@ -2448,7 +2468,7 @@ std::unique_ptr<wftrain::NonLocalECPDerivativeConsumer> PsiFormerComplexWF::make
 
 /// Checked additional two-domain ownership; generic GPU discovery stays closed.
 PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeRequirements(
-    std::size_t samples, std::size_t maximum_samples, std::size_t targets, std::size_t chunk) const
+    std::size_t samples, std::size_t maximum_samples, std::size_t targets, std::size_t chunk, GpuDerivativeScope scope) const
 {
 #ifdef ENABLE_CUDA
   if (gpuInferenceEnabled())
@@ -2458,7 +2478,7 @@ PsiFormerComplexWF::GpuDerivativeRequirements PsiFormerComplexWF::gpuDerivativeR
     // Multiple inference crowds still cannot share the serialized training lane.
     if (impl_->state->gpu_crowds > 1)
       throw std::logic_error("Concurrent complex inference does not support GPU derivatives or training");
-    return Impl::GpuDerivativeLane::required(*impl_->state, samples, maximum_samples, targets, chunk);
+    return Impl::GpuDerivativeLane::required(*impl_->state, samples, maximum_samples, targets, chunk, scope);
   }
 #endif
   throw std::logic_error("Explicit GPU derivatives require an immutable GPU inference profile");
@@ -2469,7 +2489,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     const RefVectorWithLeader<TrialWaveFunction>& wavefunctions,
     const RefVectorWithLeader<ParticleSet>& particles, std::size_t ordinal, std::size_t offset,
     std::size_t maximum_samples, std::size_t targets, std::size_t chunk,
-    std::size_t device_cap, std::size_t host_cap, std::size_t work_cap) const
+    std::size_t device_cap, std::size_t host_cap, std::size_t work_cap, GpuDerivativeScope scope) const
 {
   NativeTimerScope timer(impl_->phase_timers.preparation);
 #ifdef ENABLE_CUDA
@@ -2483,7 +2503,7 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
         throw std::logic_error("Concurrent complex inference does not support GPU derivatives or training");
     }
     const auto samples = particles.size(), n = state->model.ne;
-    const auto required = Impl::GpuDerivativeLane::required(*state, samples, maximum_samples, targets, chunk);
+    const auto required = Impl::GpuDerivativeLane::required(*state, samples, maximum_samples, targets, chunk, scope);
     for (const auto cap : {device_cap, host_cap, work_cap})
       if (!cap || cap == std::numeric_limits<std::size_t>::max())
         throw std::invalid_argument("Complex GPU derivatives require positive finite device/host/work caps");
@@ -2531,11 +2551,11 @@ std::unique_ptr<wftrain::StreamingDerivativeOperator> PsiFormerComplexWF::makeBu
     auto lane = state->gpu_derivative_lane.lock();
     if (lane && lane->generation != state->gpu)
       lane.reset();
-    if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets || lane->chunk != chunk))
+    if (lane && (lane->maximum_samples != maximum_samples || lane->targets != targets || lane->chunk != chunk || lane->scope != scope))
       throw std::invalid_argument("Complex GPU derivative live lane profile mismatch");
     if (!lane)
       lane = std::make_shared<Impl::GpuDerivativeLane>(state, maximum_samples, targets, chunk,
-          Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk));
+          Impl::GpuDerivativeLane::required(*state, 0, maximum_samples, targets, chunk, scope), scope);
     auto result = std::make_unique<Impl::GpuDerivativeStream>(lane, ordinal, offset, samples, host_cap);
     for (std::size_t sample = 0; sample < samples; ++sample)
     {
