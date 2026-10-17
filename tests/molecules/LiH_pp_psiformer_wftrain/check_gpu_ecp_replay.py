@@ -100,6 +100,10 @@ def run(app, directory, project, backend, iterations, args, restart=None):
         subprocess.run([str(app), "run.xml"], cwd=directory, env=environment,
                        stdout=output, stderr=subprocess.STDOUT, timeout=remaining(args), check=True)
     rows = history(directory, project)
+    if args.resident_ecp_profile:
+        assert all(int(row["samples"]) == args.walkers for row in rows)
+        if args.walkers == 2:
+            assert all(float(row["variance"]) > 0 for row in rows), "W2 must retain distinct sample energies"
     if int(rows[-1]["parameter_version"]) != iterations:
         raise AssertionError("Native BFD model version did not advance to the requested update")
     if backend == "cuda":
@@ -178,9 +182,9 @@ def main():
     args = parser.parse_args()
     args.resident_ecp_profile = args.resident_device_authority
     args.deadline = time.monotonic() + 285 if args.resident_ecp_profile else None
-    if args.resident_ecp_profile and (args.backend != "cuda" or args.blocks != 1 or args.walkers != 1 or
+    if args.resident_ecp_profile and (args.backend != "cuda" or args.blocks != 1 or
             args.cpu_app or args.profile_only or args.timeout > 90 or args.device_bytes != 2 * 1024**3):
-        parser.error("resident ECP requires CUDA W1/blocks1, full suite, no CPU repeat, <=90s child and exact2GiB cap")
+        parser.error("resident ECP requires CUDA W1/W2, blocks1, full suite, no CPU repeat, <=90s child and exact2GiB cap")
     args.app = args.app.resolve()
     args.source = args.source.resolve()
     if not math.isfinite(args.timeout) or args.timeout <= 0 or args.device_bytes <= 0:
@@ -238,7 +242,10 @@ def main():
         assert tuple(map(int, mirrors[0].groups())) == (8 * parameters.size, 2)
         moments = list(re.finditer(r"Resident DEVICE Adam HOST moments before sampling: actual_bytes=(\d+), cold_allowance=(\d+)", log))
         assert len(moments) == 2 and all(tuple(map(int, row.groups())) == (0, 16 * parameters.size) for row in moments)
-        appends = list(re.finditer(r"Resident ENERGY accepted-grid ECP appended: points=12, prepared_score_capacity=4, weighted_virtual_tiles=3, weighted_virtual_configurations=12, last_virtual_tile_count=4, final_parameter_download_bytes=0", log))
+        point_count = 12 * args.walkers
+        tile_count = (point_count + 3) // 4
+        tail_count = (point_count - 1) % 4 + 1
+        appends = list(re.finditer(fr"Resident ENERGY accepted-grid ECP appended: points={point_count}, prepared_score_capacity=4, weighted_virtual_tiles={tile_count}, weighted_virtual_configurations={point_count}, last_virtual_tile_count={tail_count}, final_parameter_download_bytes=0", log))
         assert len(appends) == 2
     if args.cpu_app:
         cpu = args.output / "cpu"
@@ -253,7 +260,8 @@ def main():
     if args.resident_ecp_profile:
         report.update(device_authority=True, all_active_count=1593857, same_cuda_host_authority_oracle=True,
                       warm_transfer_windows=[tuple(map(int, row.groups())) for row in windows],
-                      no_warm_host_mirror=True, resident_ecp_q12_cap4_tiles3=True)
+                      no_warm_host_mirror=True, resident_ecp_point_count=point_count,
+                      resident_ecp_tile_count=tile_count, resident_ecp_tail_count=tail_count)
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS:", json.dumps(report, sort_keys=True))
 
