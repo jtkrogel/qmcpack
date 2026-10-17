@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<simulation>
+  <project id="release_lih" series="0"><parameter name="driver_version">batch</parameter></project>
+  <random seed="202610133"/>
+  <particleset name="ion0" size="2">
+    <group name="Li" size="1"><parameter name="charge">3</parameter><parameter name="valence">3</parameter>
+      <parameter name="atomicnumber">3</parameter><attrib name="position" datatype="posArray">0 0 0</attrib></group>
+    <group name="H" size="1"><parameter name="charge">1</parameter><parameter name="valence">1</parameter>
+      <parameter name="atomicnumber">1</parameter><attrib name="position" datatype="posArray">3.0154361724853516 0 0</attrib></group>
+  </particleset>
+  <particleset name="e" random="yes" randomsrc="ion0">
+    <group name="u" size="2"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter></group>
+    <group name="d" size="2"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter></group>
+  </particleset>
+  <wavefunction name="psi0" target="e" print_parameters="no">
+    <psiformer name="pf" source="ion0" system="all_electron" optimize="no" gpu="cuda" precision="fp64_reference" parameters="@MODEL@"/>
+  </wavefunction>
+  <hamiltonian name="h0" type="generic" target="e">
+    <pairpot name="ElecElec" type="coulomb" source="e" target="e"/>
+    <pairpot name="IonIon" type="coulomb" source="ion0" target="ion0"/>
+    <pairpot name="ElecIon" type="coulomb" source="ion0" target="e"/>
+  </hamiltonian>
+  <qmc method="vmc_batch" move="alle" checkpoint="0">
+    <parameter name="walkers_per_rank">2</parameter><parameter name="crowds">1</parameter>
+    <parameter name="warmupsteps">0</parameter><parameter name="blocks">1</parameter><parameter name="steps">1</parameter>
+    <parameter name="substeps">1</parameter><parameter name="timestep">1e-8</parameter><parameter name="usedrift">no</parameter>
+  </qmc>
+</simulation>

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-10-17",
+  "scope": "Immutable source-specific evidence, not a current-HEAD or production-wide release",
+  "profiles": {
+    "SINGLE_GPU": {
+      "status": "PASS", "runtime_qualified": true,
+      "source": "abd918b2368d553d2b14a082019c2b8c479fcbfa",
+      "binary_sha256": "5364e693a2e347bfe4f5c5264543fd3eb9b088781b9bdeb45835fe396989d070",
+      "evidence": "45_memory_runtime_execution_policy/validation/batched_parallel_vgl_abd918b23/qualification_C.rst",
+      "recipe_evidence": "44_gpu_production_tuning/validation/release_recipe_abd918b23/qualification_C.rst",
+      "profile": "Fiji CUDA, real/open AE LiH, FP64, Ne4/up2/down2, D2/width8/heads2/blocks1/P666, B2/crowd1, explicit K1",
+      "template": "lih_gpu_vmc.xml", "template_sha256": "4685ce77b7bda9efa013a2218946ae437d5727a9434a18140a107f1dcc0714f1",
+      "model_sha256": "12f7fcedfbdad544d2f7a2b4e5e4fac6b405ef0f04b88100ccc8c394d0f76321",
+      "seconds": 45,
+      "environment": {
+        "PSIFORMER_GPU_AGGREGATE_DEVICE_BYTES": "2147483648", "PSIFORMER_GPU_EXTERNAL_RESERVE_BYTES": "268435456",
+        "PSIFORMER_GPU_VGL_TARGETS": "1", "PSIFORMER_GPU_VGL_PARALLEL_TRACE_BYTES": "1048576",
+        "PSIFORMER_GPU_TARGET_WORKSPACE_BYTES": "268435456", "PSIFORMER_GPU_TARGET_SCALAR_WORK_BUDGET": "1000000000",
+        "PSIFORMER_GPU_STATUS_CHECKS": "synchronous", "OMPI_MCA_memory": "^patcher", "OMPI_MCA_pml": "ob1", "OMPI_MCA_btl": "self,tcp"
+      }
+    },
+    "CPU_MULTINODE": {
+      "status": "PASS", "runtime_qualified": true,
+      "source": "e3c5c1eaade5144e3a05feb1e03f4ecd6463b4cf",
+      "binary_sha256": "d414e7fe6e5b8c277431ea88a07c54178928d4ea096a371f63f49c18e288d231",
+      "evidence": "36_distributed_gpu_training/validation/cpu_complex_native_ensemble_e3c5c1eaa",
+      "profile": "BESMS CPU complex Ne2 R4 orbital-MSE, two groups of two ranks across two nodes, OMP1, two Adam updates",
+      "list_sha256": "639ed25fc22beabdbeb181037ea4bc4e0e8e8a963dd3f7921d57db65a78ce57a",
+      "input_sha256": ["031958174d944402cf9b4d4a7fbba701c5de3e05a0dca1b8466f05b6151a3e4c", "204c99155668378873c52ee481d4e67935106e671e1ed8e93f36dac1dd3a96fe"],
+      "runtime_path_sha256": "817387704b107d4d8decd9c14fca1a1934c926d6588250c8f27bcb878c92b333",
+      "nodes": "or-condo-c[555-556]", "seconds": 35
+    },
+    "HIP_COMPILE": {
+      "status": "PRIOR_SOURCE_COMPILE_ONLY", "runtime_qualified": false,
+      "evidence": "35_gpu_production_validation; source-specific prior compile/link records",
+      "limits": "No AMD runtime or new batched-parallel snapshot HIP compilation is claimed"
+    },
+    "PRODUCTION_PENDING": {
+      "status": "PENDING", "runtime_qualified": false,
+      "limits": ["AMD runtime", "multiple GPUs/device-aware MPI", "production 40-80+ GiB calibration", "combined CUDA/OpenMP-target toolchain"]
+    }
+  }
+}
