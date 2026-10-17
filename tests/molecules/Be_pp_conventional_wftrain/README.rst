@@ -131,8 +131,8 @@ Compact proof is recorded under Task46
 ``validation/mixed_ecp_native_c2d41dbf/qualification_C.rst``; no HDF payload is
 duplicated in that archive.
 
-Fixed-orbital signed-CSF/J2 full LM preparation
----------------------------------------------
+Fixed-orbital signed-CSF/J2 full LM (CPU ONLY)
+--------------------------------------------
 
 ``--csf-j2-ecp-lm`` derives the same Be Ne2/two-MO model used by numerical130:
 frozen outer CSF0=.6 with child .8 (expanded C0=.48), and active CSF1=.05
@@ -143,8 +143,22 @@ maximum augmented subspace6. ALM-only inner controls are absent. One rank/OMP1,
 180s/application and300s/helper bounds apply. The existing two-update inference,
 model import/re-export/direct VMC and strict initialized split restart checks
 remain exact; immutable CSF children/outer gauge and fixed SPO are checked.
-This is preparation, not native qualification or an ALM root-selection fix.
 Numerical130 passed2,742 assertions including the reused same-grid P5 dense/FD
 foundation. Inverse routes are not negative capabilities here and receive no new
 native claim. Obsolete CSF-ECP mixed-LM guard negatives are retired; genuine
 model/identity/unsupported-import-driver failures remain checked.
+
+Actual native131 separately passed two committed 32-sample full-LM updates,
+scheduled inference, export/direct VMC/import/re-export and strict initialized
+split restart, with frozen outer .6/expanded .48 gauge, immutable signed children
+and fixed SPO preserved. Source ``91269943829be4e44b4abd439d9fc6c55115b456``,
+app SHA256 ``6ac1b912971492c9a202b161ddb87b49ad2f49d8dff0a45143b9dd1437688a13``
+and helper SHA256 ``1911f017c41c522609f3073af68b6da07c40577e9c0dd9975f124a576cdcef16``
+identify that one workflow, not converged optimization or a repair/retry of the
+distinct joint-orbital ALM refusal128/129. No ALM/inverse-method positive claim
+is added. Compact proof: Task46
+``validation/fixed_csf_ecp_lm_native131/qualification_C.rst``.
+
+One guarded real-FP64/non-offload CTest registers that SAME full-LM command as
+``short-Be-pp-conventional-wftrain-csf-lm``. CMake discovery/help checks for the
+registration are not an additional scientific run or an optimizer matrix.
