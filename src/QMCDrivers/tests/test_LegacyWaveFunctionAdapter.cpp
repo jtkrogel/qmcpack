@@ -3631,12 +3631,15 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 #ifndef QMC_COMPLEX
 TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapter][ci_family_oracle]")
 {
-  const bool csf = GENERATE(false, true);
-  CAPTURE(csf);
+  // Preserve the existing AE DETS/CSF cases, then exercise pure DETS ECP.
+  const int model = GENERATE(0, 1, 2);
+  const bool csf = model == 1, ecp = model == 2;
+  CAPTURE(model);
   ParticleSetPool pool(OHMMS::Controller);
   Libxml2Document definition;
   const auto fixture = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
-      "tests/molecules/H4_ae_conventional_wftrain/wftrain_mdj.xml";
+      (ecp ? "tests/molecules/Be_pp_conventional_wftrain/wftrain_mdj_ecp.xml" :
+             "tests/molecules/H4_ae_conventional_wftrain/wftrain_mdj.xml");
   REQUIRE(definition.parse(fixture.string()));
   xmlNodePtr wavefunction = nullptr;
   for (auto* node = xmlFirstElementChild(definition.getRoot()); node; node = xmlNextElementSibling(node))
@@ -3698,6 +3701,34 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
   evaluator->findMSD()[0].get().isolateOptimizationState();
   auto replay = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles,
       std::vector<double>{-0.12, -0.03, 0.07, 0.18});
+  QMCHamiltonian ham;
+  LocalECPotential* local = nullptr;
+  StdRandom<QMCTraits::FullPrecRealType> rng(1931);
+  ResourceCollection pr("linear_ecp_P"), wr("linear_ecp_W"), hr("linear_ecp_H");
+  RefVectorWithLeader<ParticleSet> ps(private_particles, {private_particles});
+  RefVectorWithLeader<TrialWaveFunction> ws(*evaluator, {*evaluator});
+  RefVectorWithLeader<QMCHamiltonian> hs(ham, {ham});
+  const auto terms = localEnergyTermBit(LocalEnergyTerm::KINETIC) |
+      (ecp ? localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP) : 0);
+  if (ecp)
+  {
+    evaluator->findMSD()[0].get().enableAcceptedReferenceVirtualRatios();
+    ECPComponentBuilder builder("Be", OHMMS::Controller, 2, 1);
+    REQUIRE(builder.read_pp_file((fixture.parent_path().parent_path().parent_path() /
+        "pseudopotentials_for_tests/Be.BFD.xml").string()));
+    auto nonlocal = std::make_unique<NonLocalECPotential>(ions, private_particles, false, true);
+    nonlocal->setRandomGenerator(&rng);
+    nonlocal->addComponent(0, std::move(builder.pp_nonloc));
+    auto local_owner = std::make_unique<LocalECPotential>(ions, private_particles);
+    local = local_owner.get();
+    local->add(0, std::move(builder.pp_loc), builder.Zeff);
+    ham.addOperator(std::make_unique<BareKineticEnergy>(private_particles), "Kinetic");
+    ham.addOperator(std::make_unique<CoulombPotential>(private_particles, private_particles, true), "ElecElec");
+    ham.addOperator(std::move(local_owner), "LocalECP");
+    ham.addOperator(std::move(nonlocal), "NonLocalECP");
+    ham.addObservables(private_particles);
+    private_particles.createResource(pr); evaluator->createResource(wr); ham.createResource(hr);
+  }
   const auto coulomb = [&](const ParticleSet& p) {
     double energy = 0;
     for (int i = 0; i < p.getTotalNum(); ++i)
@@ -3714,7 +3745,10 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     CAPTURE(coefficient);
     auto parameters = adapter.snapshotParameters();
     parameters.values[0] = coefficient;
-    auto op = adapter.makeDerivativeOperator(replay, std::make_shared<const StructuredParameterSnapshot>(parameters), 0, 0);
+    const auto frame = std::make_shared<const StructuredParameterSnapshot>(parameters);
+    auto op = adapter.makeDerivativeOperator(replay, frame, 0, 0);
+    std::vector<std::unique_ptr<StreamingDerivativeOperator>> ecp_operators;
+    std::vector<ScoreCovarianceBatch> batches;
     const auto& schema = adapter.parameterSchema();
     std::array<double, 4> score{}, del{}, log{}, phase{}, weights{1, 1, 1, 1};
     std::array<DerivativeValue, 4> energies{};
@@ -3733,6 +3767,67 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
       evaluator->evaluateDerivatives(private_particles, active, scores, local_energy);
       score[sample] = scores[0];
       del[sample] = local_energy[0];
+      if (ecp)
+      {
+        auto one = std::make_shared<ShiftedLegacyReplay>(*evaluator, private_particles, std::vector<double>{0});
+        auto products = adapter.makeDerivativeOperator(one, frame, sample + 1, sample);
+        auto consumer = adapter.makeNonLocalECPDerivativeConsumer(one, frame, sample + 1, sample);
+        const std::vector<DerivativeValue> unit{1};
+        const VJPCoefficientChannel capture{"capture", DerivativeProduct::LOCAL_ENERGY_VJP,
+            coefficientsFor(*products, unit), localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP)};
+        RecordingParameterSink idle;
+        {
+          ResourceCollectionTeamLock<ParticleSet> pl(pr, ps);
+          ResourceCollectionTeamLock<TrialWaveFunction> wl(wr, ws);
+          ResourceCollectionTeamLock<QMCHamiltonian> hl(hr, hs);
+          energies[sample] = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(
+              hs, ws, ps, *consumer, {&capture, 1}, idle).local_energies[0];
+        }
+        auto grid = consumer->releaseJVPReplay();
+        const auto points = std::vector<NonLocalECPReplayPoint>(grid->points().begin(), grid->points().end());
+        products->bindNonLocalECPJVPReplay(std::move(grid));
+        const auto positions = private_particles.R;
+        const double local_value = local->evaluate(private_particles);
+        // Independent signed scalar wavefunction ratios on the same fixed grid.
+        const auto fixed_energy = [&](const StructuredParameterSnapshot& point) {
+          ParticleSet p(private_particles);
+          p.R = positions; p.update();
+          auto wf = source->makeClone(p);
+          wf->findMSD()[0].get().isolateOptimizationState();
+          adapter.installSnapshot(*wf, p, point);
+          const double base_log = wf->getLogPsi(), base_phase = wf->getPhase();
+          const auto separation = positions[0] - positions[1];
+          DerivativeValue energy = kineticEnergy(p) + local_value + 1.0 / std::sqrt(dot(separation, separation));
+          for (const auto& knot : points)
+          {
+            p.R = positions;
+            for (int d = 0; d < 3; ++d) p.R[knot.electron][d] = knot.replacement_position[d];
+            p.update(); wf->evaluateLog(p);
+            energy += knot.bare_weight * std::exp(wf->getLogPsi() - base_log) * std::cos(wf->getPhase() - base_phase);
+          }
+          const double ratio = std::exp(base_log - log[sample]) * std::cos(base_phase - phase[sample]);
+          return std::make_pair(energy, ratio);
+        };
+        auto plus = parameters, minus = parameters;
+        // Psi and H*Psi are exactly linear in this coordinate. A finite signed
+        // secant avoids the truncation/cancellation of differentiating E_L alone.
+        constexpr double step = 0.125;
+        plus.values[0] += step; minus.values[0] -= step;
+        const auto positive = fixed_energy(plus), negative = fixed_energy(minus);
+        const double physical_score = (positive.second - negative.second) / (2 * step);
+        CHECK(physical_score == Catch::Approx(score[sample]).epsilon(2e-12).margin(2e-12));
+        score[sample] = physical_score;
+        del[sample] = ((positive.first * positive.second - negative.first * negative.second) / (2 * step)).real() -
+            energies[sample].real() * physical_score;
+        CHECK(fixed_energy(parameters).first.real() == Catch::Approx(energies[sample].real()).epsilon(2e-12).margin(2e-12));
+        const VJPCoefficientChannel response{"response", DerivativeProduct::LOCAL_ENERGY_VJP,
+            coefficientsFor(*products, unit), terms};
+        RecordingParameterSink rows;
+        products->applyVJPs({&response, 1}, DerivativeAdjoint::TRANSPOSE, rows);
+        CHECK(rows.result()[0][0].real() == Catch::Approx(del[sample]).epsilon(3e-6).margin(3e-8));
+        batches.push_back({products.get(), {&weights[sample], 1}, {&energies[sample], 1}});
+        ecp_operators.push_back(std::move(products));
+      }
       if (csf)
       {
         const double epsilon = 1e-5;
@@ -3752,7 +3847,7 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     }
     double mean = 0, mean_energy = 0;
     for (int i = 0; i < 4; ++i) { mean += score[i] / 4; mean_energy += energies[i].real() / 4; }
-    std::array<double, 4> dense_s{}, dense_h{};
+    std::array<double, 4> dense_s{}, dense_h{}, dense_raw{};
     for (int i = 0; i < 4; ++i)
     {
       const double d[] = {1, score[i] - mean}, l[] = {energies[i].real(), del[i] + energies[i].real() * d[1]};
@@ -3761,24 +3856,29 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
         {
           dense_s[2 * row + column] += d[row] * d[column] / 4;
           dense_h[2 * row + column] += (d[row] * l[column] + l[row] * d[column]) / 8;
+          dense_raw[2 * row + column] += d[row] * l[column] / 4;
         }
     }
     REQUIRE(dense_s[3] > 1e-10);
-    const ScoreCovarianceBatch batch{op.get(), {weights.data(), 4}, {energies.data(), 4}};
-    ScoreCovarianceFactor factor(schema, parameters.version, {&batch, 1});
-    const auto kinetic = localEnergyTermBit(LocalEnergyTerm::KINETIC);
-    SampledLinearMethodOperator h(factor, {&batch, 1}, kinetic, false, true, 0);
-    SampledLinearMethodOperator s(factor, {&batch, 1}, kinetic, true, false, 0);
+    if (!ecp) batches.push_back({op.get(), {weights.data(), 4}, {energies.data(), 4}});
+    const DerivativeArrayView<const ScoreCovarianceBatch> views{batches.data(), batches.size()};
+    ScoreCovarianceFactor factor(schema, parameters.version, views);
+    auto rng_before_actions = rng;
+    SampledLinearMethodOperator h(factor, views, terms, false, true, 0);
+    SampledLinearMethodOperator s(factor, views, terms, true, false, 0);
+    SampledLinearMethodOperator raw_h(factor, views, terms, false, false, 0);
     for (int column = 0; column < 2; ++column)
     {
-      std::array<DerivativeValue, 2> direction{}, h_action{}, s_action{};
+      std::array<DerivativeValue, 2> direction{}, h_action{}, s_action{}, raw_action{};
       direction[column] = 1;
       h.apply({direction.data(), 2}, {h_action.data(), 2});
       s.apply({direction.data(), 2}, {s_action.data(), 2});
+      raw_h.apply({direction.data(), 2}, {raw_action.data(), 2});
       for (int row = 0; row < 2; ++row)
       {
         CHECK(h_action[row].real() == Catch::Approx(dense_h[2 * row + column]).epsilon(2e-10).margin(2e-10));
         CHECK(s_action[row].real() == Catch::Approx(dense_s[2 * row + column]).epsilon(2e-10).margin(2e-10));
+        CHECK(raw_action[row].real() == Catch::Approx(dense_raw[2 * row + column]).epsilon(2e-10).margin(2e-10));
       }
     }
     MatrixFreeLinearMethodControl lm;
@@ -3791,17 +3891,29 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     const auto result = solveSymmetrizedMatrixFreeLinearMethod(h, s, preconditioner, {initial.data(), 2}, lm);
     INFO(linearMethodStopReasonName(result.stop_reason));
     REQUIRE(result.converged);
-    SampledLinearMethodOperator raw_h(factor, {&batch, 1}, kinetic, false, false, 0);
     AcceleratedLinearMethodControl alm;
     alm.outer = lm;
     const auto accelerated = solveAcceleratedMatrixFreeLinearMethod(raw_h, s, preconditioner,
         {initial.data(), 2}, alm);
     INFO(linearMethodStopReasonName(accelerated.stop_reason));
-    REQUIRE(accelerated.converged);
+    // S is diag(1, variance) in the centered P1 basis. Preserve a genuine
+    // complex-conjugate raw pencil instead of tuning samples to force a root.
+    const double trace = dense_raw[0] + dense_raw[3] / dense_s[3];
+    const double determinant = (dense_raw[0] * dense_raw[3] - dense_raw[1] * dense_raw[2]) / dense_s[3];
+    CAPTURE(dense_raw, dense_s, trace, determinant);
+    if (ecp && trace * trace - 4 * determinant < 0)
+    {
+      CHECK_FALSE(accelerated.converged);
+      CHECK(accelerated.stop_reason == LinearMethodStopReason::UNTRUSTED_ROOT);
+    }
+    else
+      REQUIRE(accelerated.converged);
     const auto gradient = factor.scoreCovarianceGradient();
     const ParameterGradientView objective{schema.fingerprint(), parameters.version, ReductionDomain::GLOBAL,
                                          {gradient.data(), gradient.size()}};
     for (const auto& solved : {result, accelerated})
+    {
+      if (!solved.converged) continue; // Only the independently proved complex-root ECP case above.
       for (double rate : {1.0, 0.25})
         for (double xi : {0.0, 0.8})
         {
@@ -3809,7 +3921,7 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
           const double gauge = v0 - mean * v1;
           REQUIRE(std::abs(gauge) > 1e-10);
           LinearMethodUpdateRule update(factor, solved, rate, xi,
-              LinearMethodNormalization::FIXED_REFERENCE_LINEAR, {&batch, 1});
+              LinearMethodNormalization::FIXED_REFERENCE_LINEAR, views);
           const auto mapped = update.propose(schema, parameters, objective);
           CHECK(mapped.values[0] == Catch::Approx(coefficient + rate * v1 / gauge).epsilon(2e-10).margin(2e-10));
           for (std::size_t sample = 0; sample < 4; ++sample)
@@ -3826,7 +3938,8 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
               CHECK(evaluator->findMSD()[0].get().get_C()[1] == fixed_coefficients[1]);
           }
         }
-    ProjectedInverseIterationFactor pii_factor(factor, kinetic);
+    }
+    ProjectedInverseIterationFactor pii_factor(factor, terms);
     PIIUpdateControl control;
     control.shift_mode = PIIShiftMode::EXPLICIT;
     control.explicit_shift = mean_energy - 1;
@@ -3878,7 +3991,8 @@ TEST_CASE("CI-only centered family actions and fixed-C0 ratios", "[legacy_adapte
     source->evaluateLog(particles);
     CHECK(source->getLogPsi() == source_log);
     CHECK(source->findMSD()[0].get().get_C() == fixed_coefficients);
-    CHECK(adapter.snapshotParameters().values[0] == 0);
+    CHECK(adapter.snapshotParameters().values[0] == (ecp ? 0.05 : 0));
+    if (ecp) CHECK(rng() == rng_before_actions());
   }
 }
 

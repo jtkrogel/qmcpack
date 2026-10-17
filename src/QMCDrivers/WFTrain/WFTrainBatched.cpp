@@ -1502,9 +1502,11 @@ void WFTrainBatched::process(xmlNodePtr node)
         if ((active_linear != active_variables && !joint_ci_j2) || conventional_binding_->hasOrbitalRotations() ||
             multideterminants.size() != 1)
           throw UniformCommunicateError("Conventional LM/ALM require pure coefficients; PII/minPII additionally admit fixed-orbital CI with J2; other mixed updates remain unqualified");
+        // Keep this locality-ECP boundary explicit beside the general mixed guard.
         if (!inverse_iteration &&
-            (population_.get_golden_hamiltonian().ecpModelProvenance() || population_.get_golden_hamiltonian().hasPhysicalNLPP()))
-          throw UniformCommunicateError("Conventional LM/ALM coefficient-family qualification requires all-electron Hamiltonians");
+            (population_.get_golden_hamiltonian().ecpModelProvenance() || population_.get_golden_hamiltonian().hasPhysicalNLPP()) &&
+            (active_linear != active_variables || conventional_binding_->hasOrbitalRotations() || multideterminants.size() != 1))
+          throw UniformCommunicateError("Conventional locality-ECP LM/ALM require pure coefficients with one fixed-orbital MSD");
         // The frozen CSF reference precedes its fixed determinant expansion.
         const auto reference = multideterminants[0].get().fixedCoefficientReference();
         if (reference == QMCTraits::ValueType{} || !wftrain::isFiniteTrainingReal(std::real(reference)) ||
