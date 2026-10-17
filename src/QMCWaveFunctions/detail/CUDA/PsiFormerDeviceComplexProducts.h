@@ -186,22 +186,65 @@ public:
         }
       }
     }
-    checkRuntime(launchDerivativeFiniteScan(queue_.getNative(), {2 * accumulated_.capacity(), 4096, cost_.statuses, 0, 1},
-        reinterpret_cast<const double*>(accumulated_.data()), status_.data()), "complex products finite publication");
-    queue_.sync(); // Nonblocking compute queues must complete before synchronous default-stream downloads.
-    status_.download(host_status_.data(), host_status_.size());
-    for (const auto& status : host_status_)
-      if (status.nonfinite_count) throw std::runtime_error("Complex products complete contraction is nonfinite");
-    // Only final channels cross D2H, in bounded format-conversion chunks, never per sample.
-    for (std::size_t offset = 0; cost_.host_output == ComplexProductsHostOutput::RETAINED &&
-        offset < completed_.size(); offset += cost_.chunk)
+    publishCompleted();
+  }
+
+  /** One regular-node complete nonlocal response, with caller-owned immutable grid/ratios.
+   * C1 only; B+Q counts all scalar score evaluations in the prepared request bound.
+   * W contains the COMPLETE bare*total virtual/reference ratio, including fixed
+   * components/outer phase. No public Hamiltonian or quadrature construction.
+   */
+  void evaluateNonlocalVJP(const std::vector<double>& base_positions,
+      const std::vector<double>& virtual_positions, const std::vector<std::size_t>& references,
+      const std::vector<Complex>& complete_weights, const std::vector<Complex>& coefficients,
+      bool hermitian = false)
+  {
+    ready_ = jvp_ready_ = false;
+    if (generation_ == std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("Complex products generation exhausted");
+    ++generation_;
+    image_->validateCurrentDevice();
+    const auto stride = 3 * cost_.electrons;
+    const auto b = base_positions.size() / stride, q = virtual_positions.size() / stride;
+    if (cost_.channels != 1 || !b || b > cost_.maximum_samples || q > cost_.maximum_samples - b ||
+        base_positions.size() % stride || virtual_positions.size() % stride ||
+        coefficients.size() != b || references.size() != q || complete_weights.size() != q)
+      throw std::invalid_argument("Complex nonlocal C1 packed grid/request extent mismatch");
+    const auto finite = [](Complex value) {
+      return device_math::isFiniteBinary64(value.real()) && device_math::isFiniteBinary64(value.imag());
+    };
+    for (const auto* positions : {&base_positions, &virtual_positions})
+      for (double value : *positions)
+        if (!device_math::isFiniteBinary64(value))
+          throw std::invalid_argument("Complex nonlocal nonfinite coordinate");
+    for (auto value : coefficients)
+      if (!finite(value)) throw std::invalid_argument("Complex nonlocal nonfinite sample coefficient");
+    // Revoke JVP views before reusing their bounded O(B) storage for base weights.
+    std::fill_n(sample_products_.begin(), b, Complex{});
+    for (std::size_t point = 0; point < q; ++point)
     {
-      const auto count = std::min(cost_.chunk, completed_.size() - offset);
-      accumulated_.download(staging_.data(), count, offset);
-      for (std::size_t i = 0; i < count; ++i)
-        completed_[offset + i] = Complex(cuCreal(staging_[i]), cuCimag(staging_[i]));
+      const auto reference = references[point];
+      if (reference >= b || !finite(complete_weights[point]))
+        throw std::invalid_argument("Complex nonlocal invalid reference/complete weight");
+      const auto weighted = coefficients[reference] *
+          (hermitian ? std::conj(complete_weights[point]) : complete_weights[point]);
+      if (!finite(weighted)) throw std::overflow_error("Complex nonlocal weighted coefficient overflow");
+      sample_products_[reference] -= weighted;
+      if (!finite(sample_products_[reference]))
+        throw std::overflow_error("Complex nonlocal base coefficient overflow");
     }
-    ready_ = true;
+    checkRuntime(launchDerivativeZero(queue_.getNative(), {2 * accumulated_.capacity(), 0, 0, 0, 1},
+        reinterpret_cast<double*>(accumulated_.data())), "complex nonlocal zero");
+    for (std::size_t point = 0; point < q; ++point)
+    {
+      const auto weighted = coefficients[references[point]] *
+          (hermitian ? std::conj(complete_weights[point]) : complete_weights[point]);
+      accumulateNonlocalScore(virtual_positions.data() + point * stride, weighted, hermitian);
+    }
+    // Evaluate even zero-weight references/virtuals: undefined node scores are not zero.
+    for (std::size_t sample = 0; sample < b; ++sample)
+      accumulateNonlocalScore(base_positions.data() + sample * stride, sample_products_[sample], hermitian);
+    publishCompleted();
   }
 
   /** Full-score-then-device-dot JVP for a REAL canonical direction.
@@ -331,6 +374,44 @@ public:
   }
 
 private:
+  /// Accumulate one admitted B1 score with the same TRANSPOSE/HERMITIAN algebra as ordinary products.
+  void accumulateNonlocalScore(const double* positions, Complex coefficient, bool hermitian)
+  {
+    std::copy_n(positions, positions_.size(), positions_.data());
+    score_->evaluate(positions_);
+    const auto score = score_->resultView();
+    if (score.image != image_.get() || score.count != cost_.parameters)
+      throw std::logic_error("Complex nonlocal score binding changed");
+    for (std::size_t component = 0; component < 2; ++component)
+    {
+      const double sign = hermitian && component ? -1 : 1;
+      checkRuntime(launchRealToComplexAxpy(queue_.getNative(), {cost_.parameters, component, 2, 0, 2},
+          sign * (component ? -coefficient.imag() : coefficient.real()),
+          sign * (component ? coefficient.real() : coefficient.imag()), reinterpret_cast<const double*>(score.data),
+          reinterpret_cast<double*>(accumulated_.data())), "complex nonlocal score AXPY");
+    }
+  }
+
+  /// Publish only a complete finite contraction; both product routes share the same receipt protocol.
+  void publishCompleted()
+  {
+    checkRuntime(launchDerivativeFiniteScan(queue_.getNative(), {2 * accumulated_.capacity(), 4096, cost_.statuses, 0, 1},
+        reinterpret_cast<const double*>(accumulated_.data()), status_.data()), "complex products finite publication");
+    queue_.sync(); // Nonblocking compute queues must complete before synchronous default-stream downloads.
+    status_.download(host_status_.data(), host_status_.size());
+    for (const auto& status : host_status_)
+      if (status.nonfinite_count) throw std::runtime_error("Complex products complete contraction is nonfinite");
+    for (std::size_t offset = 0; cost_.host_output == ComplexProductsHostOutput::RETAINED &&
+        offset < completed_.size(); offset += cost_.chunk)
+    {
+      const auto count = std::min(cost_.chunk, completed_.size() - offset);
+      accumulated_.download(staging_.data(), count, offset);
+      for (std::size_t i = 0; i < count; ++i)
+        completed_[offset + i] = Complex(cuCreal(staging_[i]), cuCimag(staging_[i]));
+    }
+    ready_ = true;
+  }
+
   /// Materialize only checked capacities, including finite partials in BOTH memory domains.
   PreparedDeviceComplexProducts(std::shared_ptr<const PreparedDeviceModel> image, std::size_t targets,
       compute::Queue<PlatformKind::CUDA>& queue, AcceleratorBlasHandle& blas, ComplexProductsCost cost)
