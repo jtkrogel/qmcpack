@@ -2095,6 +2095,7 @@ struct PsiFormerDerivativeScratch
   std::vector<double> device_positions;
   std::vector<double> device_direction;
   std::vector<wftrain::DerivativeValue> device_ecp_chunk;
+  std::vector<double> device_ecp_positions, device_ecp_weights;
   bool reported_device_products = false;
   bool reported_device_score_contraction = false;
   bool reported_device_score_tiles = false;
@@ -2367,13 +2368,24 @@ public:
       const auto bytes = psiformer::device::PreparedDeviceScoreContraction::requiredBytes(
           schema_->parameterCount(), MAXIMUM_VJP_CHANNELS);
       const auto chunk = std::min(schema_->parameterCount(), chunk_plan_.maximumChunkSize());
+      const auto capacity = replay->points().empty() || deviceScoreCapacity() == 1 ? 0 : deviceScoreCapacity();
+      const auto coordinates = checkedBatchMemoryMultiply(capacity,
+          checkedPositionCount(1, electron_count_), "GPU ECP coordinate tile");
+      const auto tile_bytes = checkedBatchMemoryMultiply(
+          checkedBatchMemoryAdd(coordinates, capacity, "GPU ECP HOST tile elements"),
+          sizeof(double), "GPU ECP HOST tile bytes");
       app_log() << "  PsiFormer regular-node real GPU ECP replay before allocation: DEVICE_channels="
                 << MAXIMUM_VJP_CHANNELS << ", DEVICE_bytes=" << bytes
                 << ", HOST_chunk_bytes=" << chunk * sizeof(wftrain::DerivativeValue)
+                << ", HOST_virtual_tile_bytes=" << tile_bytes << ", virtual_tile_capacity=" << capacity
                 << "; native aggregate DEVICE admission applies; metadata/vendor excluded" << std::endl;
       shared_scratch_->device_products->prepareScoreContractions(MAXIMUM_VJP_CHANNELS, parameter_version_, bytes);
       if (shared_scratch_->device_ecp_chunk.size() < chunk)
         shared_scratch_->device_ecp_chunk.resize(chunk);
+      if (shared_scratch_->device_ecp_positions.size() < coordinates)
+        shared_scratch_->device_ecp_positions.resize(coordinates);
+      if (shared_scratch_->device_ecp_weights.size() < capacity)
+        shared_scratch_->device_ecp_weights.resize(capacity);
     }
 #endif
     ecp_replay_ = std::move(replay);
@@ -3190,10 +3202,29 @@ private:
         return;
       auto& session = *shared_scratch_->device_products;
       const auto transfer_before = session.transferSnapshot();
+      const auto before_tiles = session.weightedScoreTiles();
+      const auto before_configurations = session.weightedScoreConfigurations();
+      const auto capacity = session.scoreCapacity();
+      const auto& coefficient_values = channels[active[0]].coefficients.values;
+      const bool tile_virtuals = count == 1 && capacity > 1 && !ecp_replay_->points().empty() &&
+          std::all_of(coefficient_values.begin(), coefficient_values.end(),
+              [](const auto& value) { return value.imag() == 0.0; }) &&
+          std::all_of(ecp_replay_->points().begin(), ecp_replay_->points().end(),
+              [](const auto& point) { return point.bare_weight.imag() == 0.0 && point.complete_ratio.imag() == 0.0; });
+      std::size_t tile_count = 0, last_tile_count = 0;
+      if (tile_virtuals && (shared_scratch_->device_ecp_weights.size() < capacity ||
+          shared_scratch_->device_ecp_positions.size() < checkedPositionCount(capacity, electron_count_)))
+        throw std::logic_error("GPU ECP virtual tile exceeds its cold HOST preparation");
       try
       {
         session.beginScoreContraction(count, parameter_version_);
         std::array<wftrain::DerivativeValue, MAXIMUM_VJP_CHANNELS> coefficients{};
+        const auto flush = [&]() {
+          session.accumulateWeightedScoreTile(shared_scratch_->device_ecp_positions.data(),
+              shared_scratch_->device_ecp_weights.data(), tile_count, parameter_version_);
+          last_tile_count = tile_count;
+          tile_count = 0;
+        };
         for (const auto& point : ecp_replay_->points())
         {
           const auto weight = point.bare_weight * point.complete_ratio;
@@ -3202,11 +3233,27 @@ private:
           requireFinite(replay_weight_sums_[point.sample], "accepted-grid sample weight sum");
           for (std::size_t slot = 0; slot < count; ++slot)
             coefficients[slot] = channels[active[slot]].coefficients.values[point.sample] * weight;
-          setReplayPointPositions(point);
-          // Even zero coefficients must validate the virtual score's regular node.
-          session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
-                                             count, parameter_version_);
+          if (tile_virtuals)
+          {
+            // Pack immutable accepted references, not coordinates from a previous virtual point.
+            const auto elements = 3 * electron_count_;
+            auto* destination = shared_scratch_->device_ecp_positions.data() + tile_count * elements;
+            std::copy_n(positions_.data() + point.sample * elements, elements, destination);
+            std::copy_n(point.replacement_position.data(), 3, destination + 3 * point.electron);
+            shared_scratch_->device_ecp_weights[tile_count++] = coefficients[0].real();
+            // The existing weighted reverse still validates zero-weight configurations.
+            if (tile_count == capacity)
+              flush();
+          }
+          else
+          {
+            setReplayPointPositions(point);
+            session.accumulateScoreContraction(shared_scratch_->device_positions.data(), coefficients.data(),
+                                               count, parameter_version_);
+          }
         }
+        if (tile_count)
+          flush();
         for (std::size_t sample = 0; sample < sample_count_; ++sample)
         {
           setScoreWorkspacePositions(sample);
@@ -3234,6 +3281,9 @@ private:
         const auto after = session.transferSnapshot();
         app_log() << "  PsiFormer regular-node real GPU accepted-grid ECP replay: points="
                   << ecp_replay_->points().size() << ", channels=" << count
+                  << ", weighted_virtual_tiles=" << session.weightedScoreTiles() - before_tiles
+                  << ", weighted_virtual_configurations=" << session.weightedScoreConfigurations() - before_configurations
+                  << ", last_virtual_tile_count=" << last_tile_count
                   << ", full_parameter_downloads_per_point=0, final_channel_parameter_bytes="
                   << count * schema_->parameterCount() * sizeof(wftrain::DerivativeValue)
                   << ", measured_downloaded_bytes=" << after.downloaded_bytes - transfer_before.downloaded_bytes
@@ -3449,6 +3499,10 @@ private:
       workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
           checkedBatchMemoryMultiply(shared_scratch_->device_ecp_chunk.capacity(), sizeof(wftrain::DerivativeValue),
                                       "PsiFormer shared ECP chunk bytes"), "PsiFormer device provider scratch");
+      workspace_bytes = checkedBatchMemoryAdd(workspace_bytes,
+          checkedBatchMemoryMultiply(checkedBatchMemoryAdd(shared_scratch_->device_ecp_positions.capacity(),
+              shared_scratch_->device_ecp_weights.capacity(), "GPU ECP HOST tile capacity"), sizeof(double),
+              "GPU ECP HOST tile bytes"), "PsiFormer device provider scratch");
     }
     else
 #endif
@@ -3490,6 +3544,10 @@ private:
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_positions.data()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_direction.data()));
       mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_ecp_chunk.data()));
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_ecp_positions.data()));
+      mixFingerprint(fingerprint, shared_scratch_->device_ecp_positions.capacity());
+      mixFingerprint(fingerprint, reinterpret_cast<std::uintptr_t>(shared_scratch_->device_ecp_weights.data()));
+      mixFingerprint(fingerprint, shared_scratch_->device_ecp_weights.capacity());
     }
 #endif
     mixFingerprint(fingerprint,

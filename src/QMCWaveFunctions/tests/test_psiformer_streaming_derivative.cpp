@@ -1514,10 +1514,64 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
   checkClose(gpu_jvp.results()[0], cpu_jvp.results()[0]);
   SelectedParameterSink dual(selected);
   auto dual_channels = channelsFor(*first);
+  const auto before_scalar_c1 = metrics.snapshot();
   first->applyVJPs({dual_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, dual);
+  const auto scalar_c1_download_calls = metrics.snapshot().download_calls - before_scalar_c1.download_calls;
   DerivativeValue dot{};
   for (std::size_t i = 0; i < p; ++i) dot += direction[i] * dual.results()[0][i];
   checkClose(dot, coefficients[0][0] * gpu_jvp.results()[0]);
+  // Exact-real C1 reuses the existing B4 score owner for Q9 => 4+4+tail1.
+  const std::vector<DerivativeValue> real_coefficient{{.7, 0}};
+  auto real_channels = [&](const StreamingDerivativeOperator& op) {
+    return std::vector<VJPCoefficientChannel>{{"real_ecp", DerivativeProduct::LOCAL_ENERGY_VJP,
+        coefficientsFor(op, real_coefficient), ecp}};
+  };
+  const auto c1_storage = first->storageDiagnostics();
+  std::size_t tiled_download_calls = 0;
+  for (const auto adjoint : {wftrain::DerivativeAdjoint::TRANSPOSE, wftrain::DerivativeAdjoint::HERMITIAN})
+  {
+    auto expected_channels = real_channels(*reference), actual_channels = real_channels(*first);
+    SelectedParameterSink expected(selected), actual(selected);
+    reference->applyVJPs({expected_channels.data(), 1}, adjoint, expected);
+    const auto before = metrics.snapshot();
+    first->applyVJPs({actual_channels.data(), 1}, adjoint, actual);
+    const auto after = metrics.snapshot();
+    tiled_download_calls = after.download_calls - before.download_calls;
+    CHECK(after.allocation_calls == before.allocation_calls);
+    CHECK(after.live_bytes == before.live_bytes);
+    DerivativeValue real_dot{};
+    for (std::size_t i = 0; i < p; ++i)
+    {
+      checkClose(actual.results()[0][i], expected.results()[0][i]);
+      real_dot += direction[i] * actual.results()[0][i];
+    }
+    checkClose(real_dot, real_coefficient[0] * gpu_jvp.results()[0]);
+  }
+  CHECK(tiled_download_calls < scalar_c1_download_calls);
+  CHECK(first->storageDiagnostics().storage_fingerprint == c1_storage.storage_fingerprint);
+  CHECK(first->storageDiagnostics().retained_numeric_bytes == c1_storage.retained_numeric_bytes);
+  auto c1_channels = real_channels(*first);
+  SelectedParameterSink c1_failed(selected);
+  c1_failed.armConsumeFailure();
+  CHECK_THROWS(first->applyVJPs({c1_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, c1_failed));
+  CHECK(c1_failed.state() == DerivativeSinkState::POISONED);
+  SelectedParameterSink c1_retry(selected), c1_expected(selected);
+  first->applyVJPs({c1_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, c1_retry);
+  auto c1_reference = real_channels(*reference);
+  reference->applyVJPs({c1_reference.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, c1_expected);
+  for (std::size_t i = 0; i < p; ++i) checkClose(c1_retry.results()[0][i], c1_expected.results()[0][i]);
+  // A retained pretraining lane is genuinely capacity one: never grow it implicitly.
+  PsiFormerWF scalar_gpu("ecp_grid", initialized, electrons, ions, false, {}, false, {}, {}, resolution);
+  const auto ne = electrons.getTotalNum();
+  std::vector<double> orbital_target(initialized.model_shape.determinants * ne * ne, 0.0), orbital_gradient(p);
+  CHECK(std::isfinite(scalar_gpu.evaluateOrbitalMSE(electrons, orbital_target, orbital_gradient,
+                                                  scalar_gpu.snapshotParameters().version)));
+  auto scalar = capture(scalar_gpu, 94, 5, true);
+  CHECK(scalar->capabilities().maximum_sample_tile_size == 1);
+  auto scalar_channels = real_channels(*scalar);
+  SelectedParameterSink scalar_result(selected);
+  scalar->applyVJPs({scalar_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, scalar_result);
+  for (std::size_t i = 0; i < p; ++i) checkClose(scalar_result.results()[0][i], c1_expected.results()[0][i]);
   SelectedParameterSink failed(selected); failed.armConsumeFailure();
   auto channels = channelsFor(*first);
   CHECK_THROWS(first->applyVJPs({channels.data(), channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, failed));
@@ -1558,6 +1612,12 @@ TEST_CASE("PsiFormer real GPU accepted-grid ECP replay shares bounded products",
     auto node_channels = channelsFor(*node);
     SelectedParameterSink rejected(selected);
     node->applyVJPs({node_channels.data(), node_channels.size()}, wftrain::DerivativeAdjoint::TRANSPOSE, rejected);
+  }()));
+  CHECK_THROWS(([&]() {
+    auto node = capture(gpu, 93, 5, true, false, true);
+    auto node_channels = real_channels(*node);
+    SelectedParameterSink rejected(selected);
+    node->applyVJPs({node_channels.data(), 1}, wftrain::DerivativeAdjoint::TRANSPOSE, rejected);
   }()));
 }
 #endif
