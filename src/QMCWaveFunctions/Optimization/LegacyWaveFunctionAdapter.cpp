@@ -15,6 +15,8 @@
 #include "QMCWaveFunctions/TrialWaveFunction.h"
 #include "QMCWaveFunctions/Fermion/SlaterDet.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
+#include "QMCWaveFunctions/RotatedSPOs.h"
+#include "QMCWaveFunctions/LCAO/LCAOrbitalSet.h"
 
 #include <algorithm>
 #include <array>
@@ -245,8 +247,9 @@ void validateMasses(const ParticleSet& particles)
 
 DerivativeValue asDerivativeValue(QMCTraits::ValueType value) noexcept;
 
-/// Reject profiles for which a zero virtual ratio need not have zero derivative.
-void validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
+/// Orbital ECP derivatives are separately qualified only for inline real CPU
+/// one-occupied Slaters. The old fixed-Slater/Jastrow profile stays unchanged.
+bool validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
 {
 #ifdef QMC_COMPLEX
   throw std::invalid_argument("Legacy ECP products require a real CPU build");
@@ -255,20 +258,32 @@ void validateECPProfile(const LegacyWaveFunctionReplaySample& sample)
       sample.particles.getCoordinates().getKind() != DynamicCoordinateKind::DC_POS)
     throw std::invalid_argument("Legacy ECP products require CPU scalar electron coordinates");
   std::size_t slaters = 0;
+  bool orbital = false;
   for (const auto& component : sample.wavefunction.getOrbitals())
     if (const auto* slater = dynamic_cast<const SlaterDet*>(component.get()))
     {
       ++slaters;
-      if (slater->isOptimizable())
-        throw std::invalid_argument("Legacy ECP products require fixed Slater orbitals");
+      orbital = slater->isOptimizable();
+      if (orbital && (slater->getNumDets() != 2 || sample.particles.groups() != 2 ||
+          sample.particles.groupsize(0) != 1 || sample.particles.groupsize(1) != 1 ||
+          sample.particles.getLattice().SuperCellEnum != SUPERCELL_OPEN))
+        throw std::invalid_argument("Legacy orbital ECP products require open one-occupied spin determinants");
       for (int determinant = 0; determinant < slater->getNumDets(); ++determinant)
-        if (slater->getPhi(determinant).isOptimizable() || slater->getPhi(determinant).isOMPoffload())
-          throw std::invalid_argument("Legacy ECP products reject active or offloaded orbitals");
+      {
+        const auto& phi = slater->getPhi(determinant);
+        const auto* rotated = dynamic_cast<const RotatedSPOs*>(&phi);
+        const auto* lcao = rotated ? dynamic_cast<const LCAOrbitalSet*>(rotated->Phi_.get()) : nullptr;
+        if (phi.isOMPoffload() || (!orbital && phi.isOptimizable()) || (orbital && (!phi.isOptimizable() || !lcao || lcao->isOMPoffload() ||
+            lcao->fileImageIdentity() || rotated->nel_major_ != 1 || phi.getOrbitalSetSize() != 3 ||
+            rotated->m_act_rot_inds_ != RotatedSPOs::RotationIndices{{0, 1}, {0, 2}})))
+          throw std::invalid_argument("Legacy orbital ECP products require two CPU inline three-orbital (0,q) owners");
+      }
     }
     else if (component->getClassName() != "J1OrbitalSoA" && component->getClassName() != "TwoBodyJastrow")
       throw std::invalid_argument("Legacy ECP products admit only fixed Slater and J1/J2 components");
   if (slaters != 1)
     throw std::invalid_argument("Legacy ECP products require exactly one fixed Slater component");
+  return orbital;
 }
 
 /// Check finite inputs without permitting fast-math to remove the check.
@@ -680,7 +695,10 @@ public:
     for (std::size_t sample = 0; sample < sampleCount(); ++sample)
     {
       auto state = replay_->prepareSample(sample);
-      validateECPProfile(state);
+      const bool orbital = validateECPProfile(state);
+      if (sample > 0 && orbital_ecp_ != orbital)
+        throw std::invalid_argument("Legacy ECP replay mixes fixed and active orbital profiles");
+      orbital_ecp_ = orbital;
       if (replay->electronCount() != state.particles.getTotalNum())
         throw std::invalid_argument("Legacy ECP replay electron extent differs from private evaluator");
       for (std::size_t electron = 0; electron < replay->electronCount(); ++electron)
@@ -757,6 +775,14 @@ protected:
         }
       if (requested_ecp)
       {
+        if (orbital_ecp_)
+        {
+          forEachECPPoint(sample, [&](const auto& point) {
+            evaluateECPRatioRow(sample, point);
+            accumulateECPRow(channels, adjoint, sample, point.bare_weight);
+          });
+          continue;
+        }
         DerivativeValue weight_sum{};
         forEachECPPoint(sample, [&](const auto& point) { weight_sum += point.bare_weight * point.complete_ratio; });
         // Subtract the reference score before reusing its row at virtual points.
@@ -810,7 +836,14 @@ private:
       if (mask == 0) product = reference;
       if (mask & localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP))
         forEachECPPoint(sample, [&](const auto& point) {
-          if (point.complete_ratio != DerivativeValue{})
+          if (orbital_ecp_)
+          {
+            evaluateECPRatioRow(sample, point);
+            for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
+              product += point.bare_weight * asDerivativeValue(workspace_->score_row[parameter]) *
+                  direction.values()[parameter];
+          }
+          else if (point.complete_ratio != DerivativeValue{})
           {
             evaluateRows(sample, &point);
             DerivativeValue replacement{};
@@ -828,6 +861,61 @@ private:
                                                    1,
                                                    sample};
       sink.add({descriptor, {&product, 1}});
+    }
+  }
+
+  /** Form d(Psi_q/Psi_ref) without ever evaluating a nodal full virtual TWF.
+   * Baseline products have already consumed both P rows. First consume the
+   * Jastrow difference, then reuse its source row for the unnormalized orbital
+   * derivative. Only six stack orbital values accompany the two existing rows.
+   */
+  void evaluateECPRatioRow(std::size_t sample, const NonLocalECPReplayPoint& point) const
+  {
+    auto state = replay_->prepareSample(sample);
+    validateMasses(state.particles);
+    resetEvaluator(state.wavefunction, *active_, snapshot_->values);
+    state.wavefunction.evaluateLog(state.particles);
+    auto& slater = state.wavefunction.findSD().front().get();
+    auto& rotated = dynamic_cast<RotatedSPOs&>(slater.getPhi(state.particles.GroupID[point.electron]));
+    std::array<QMCTraits::ValueType, 3> reference_storage, replacement_storage;
+    SPOSet::ValueVector reference(reference_storage.data(), 3), replacement(replacement_storage.data(), 3);
+    rotated.Phi_->evaluateValue(state.particles, point.electron, reference);
+    workspace_->score_row = QMCTraits::ValueType{};
+    double reference_jastrow_log = 0;
+    for (const auto& component : state.wavefunction.getOrbitals())
+      if (!component->isFermionic())
+      {
+        reference_jastrow_log += component->get_log_value().real();
+        component->evaluateDerivativesWF(state.particles, *active_, workspace_->score_row);
+      }
+    for (int dimension = 0; dimension < 3; ++dimension)
+      state.particles.R[point.electron][dimension] = point.replacement_position[dimension];
+    state.particles.update();
+    rotated.Phi_->evaluateValue(state.particles, point.electron, replacement);
+    state.particles.G = QMCTraits::GradType{};
+    state.particles.L = QMCTraits::ValueType{};
+    workspace_->kinetic_row = QMCTraits::ValueType{};
+    double replacement_jastrow_log = 0;
+    for (const auto& component : state.wavefunction.getOrbitals())
+      if (!component->isFermionic())
+      {
+        replacement_jastrow_log += component->evaluateLog(state.particles, state.particles.G, state.particles.L).real();
+        component->evaluateDerivativesWF(state.particles, *active_, workspace_->kinetic_row);
+      }
+    requireFiniteECP({reference_jastrow_log, 0});
+    requireFiniteECP({replacement_jastrow_log, 0});
+    const double jastrow_ratio = std::exp(replacement_jastrow_log - reference_jastrow_log);
+    requireFiniteECP({jastrow_ratio, 0});
+    for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
+      workspace_->kinetic_row[parameter] = point.complete_ratio.real() *
+          (workspace_->kinetic_row[parameter] - workspace_->score_row[parameter]);
+    workspace_->score_row = QMCTraits::ValueType{};
+    rotated.evaluateOneOccupiedRatioDerivatives(reference, replacement, *active_, workspace_->score_row);
+    for (std::size_t parameter = 0; parameter < schema_->parameterCount(); ++parameter)
+    {
+      workspace_->score_row[parameter] = jastrow_ratio * workspace_->score_row[parameter] +
+          workspace_->kinetic_row[parameter];
+      requireFiniteECP(asDerivativeValue(workspace_->score_row[parameter]));
     }
   }
 
@@ -917,6 +1005,7 @@ private:
   std::shared_ptr<const optimize::VariableSet> active_;
   std::shared_ptr<const StructuredParameterSnapshot> snapshot_;
   std::unique_ptr<NonLocalECPJVPReplay> ecp_replay_;
+  bool orbital_ecp_ = false;
   std::vector<std::size_t> ecp_segment_offsets_, ecp_segment_indices_;
   std::size_t parameter_version_ = 0;
   std::shared_ptr<LegacyWaveFunctionReplay> replay_;
@@ -1093,7 +1182,7 @@ std::unique_ptr<NonLocalECPDerivativeConsumer> LegacyWaveFunctionAdapter::makeNo
     }
     if (record->electrons != state.particles.getTotalNum())
       throw std::invalid_argument("Legacy ECP capture requires equal electron extents");
-    // Registration checking excludes active variables outside the admitted Jastrows.
+    // Registration checking excludes active variables outside admitted Jastrows/rotations.
     validateEvaluatorRegistration(state.wavefunction, *registration_template_);
     for (const auto& position : state.particles.R)
       for (int dimension = 0; dimension < 3; ++dimension)

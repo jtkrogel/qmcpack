@@ -1610,6 +1610,45 @@ void RotatedSPOs::isolateOptimizationState()
   lcao->isolateOptimizationState();
 }
 
+RotatedSPOs::ValueType RotatedSPOs::evaluateOneOccupiedRatioDerivatives(
+    const ValueVector& reference, const ValueVector& replacement,
+    const OptVariables& active, ValueVector& output) const
+{
+#ifdef QMC_COMPLEX
+  throw std::invalid_argument("One-occupied orbital ratio derivatives require real CPU orbitals");
+#endif
+  const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(Phi_.get());
+  if (!lcao || lcao->isOMPoffload() || lcao->fileImageIdentity() || nel_major_ != 1 ||
+      reference.size() != OrbitalSetSize || replacement.size() != reference.size() ||
+      output.size() < active.size_of_active() || myVars.size() != m_act_rot_inds_.size())
+    throw std::invalid_argument("One-occupied orbital ratio derivative layout is unsupported");
+  for (std::size_t i = 0; i < reference.size(); ++i)
+    if (!finiteRotationCoordinate(reference[i]) || !finiteRotationCoordinate(replacement[i]))
+      throw std::invalid_argument("One-occupied orbital values must be finite");
+  if (reference[0] == ValueType{})
+    throw std::invalid_argument("One-occupied orbital reference is nodal");
+  const ValueType ratio = replacement[0] / reference[0];
+  if (!finiteRotationCoordinate(ratio))
+    throw std::invalid_argument("One-occupied orbital ratio is nonfinite");
+  for (std::size_t i = 0; i < myVars.size(); ++i)
+  {
+    const auto [p, q] = m_act_rot_inds_[i];
+    const int location = active.getLoc(myVars.name(i)), index = myVars.where(i);
+    if (p != 0 || q <= 0 || q >= reference.size() || location < 0 ||
+        active.where(location) != index || (index >= 0 && index >= output.size()))
+      throw std::invalid_argument("One-occupied orbital requires registered (0,q) tangents");
+    if (index >= 0)
+    {
+      const ValueType derivative = (replacement[q] - ratio * reference[q]) / reference[0];
+      const ValueType accumulated = output[index] + derivative;
+      if (!finiteRotationCoordinate(derivative) || !finiteRotationCoordinate(accumulated))
+        throw std::invalid_argument("One-occupied orbital ratio derivative is nonfinite");
+      output[index] = accumulated;
+    }
+  }
+  return ratio;
+}
+
 void RotatedSPOs::validatePreparedRotationState(const RotatedSPOs& prepared) const
 {
   const auto* lcao = dynamic_cast<const LCAOrbitalSet*>(Phi_.get());

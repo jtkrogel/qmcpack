@@ -27,9 +27,11 @@
 #include "QMCHamiltonians/NonLocalECPComponent.h"
 #include "QMCHamiltonians/LocalECPotential.h"
 #include "QMCHamiltonians/CoulombPBCAA.h"
+#include "QMCHamiltonians/CoulombPotential.h"
 #include "QMCWaveFunctions/ElectronGas/FreeOrbital.h"
 #include "ResourceCollection.h"
 #include "Utilities/StdRandom.h"
+#include "Utilities/FakeRandom.h"
 #include "QMCWaveFunctions/Optimization/LegacyWaveFunctionAdapter.h"
 #include "QMCWaveFunctions/Jastrow/BsplineFunctor.h"
 #include "QMCWaveFunctions/Jastrow/TwoBodyJastrow.h"
@@ -2485,6 +2487,293 @@ TEST_CASE("Legacy adapter supports repeated high-parameter updates and checkpoin
 }
 
 #ifndef QMC_COMPLEX
+TEST_CASE("one-occupied orbital ECP products are nodal safe", "[legacy_adapter][orbital_ecp]")
+{
+  // The nodal model uses the ordinary tetrahedral BFD rule and a counting
+  // identity-rotation RNG, making px-py cancellation exact, not tolerance-zero.
+  const std::string node_coefficients = "0 1 -1  1 0 0  0 1 1";
+  for (int model = 0; model < 2; ++model)
+  {
+    CAPTURE(model);
+    ParticleSetPool pool(OHMMS::Controller);
+    Libxml2Document particle_xml;
+    REQUIRE(particle_xml.parseFromString(R"(<qmcsystem>
+      <particleset name="ion0" size="1"><group name="Be">
+        <parameter name="charge">2</parameter><parameter name="atomicnumber">4</parameter>
+        </group><attrib name="position" datatype="posArray">0 0 0</attrib></particleset>
+      <particleset name="e"><group name="u" size="1">
+        <parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+        <attrib name="position" datatype="posArray">0.2 -0.3 0.4</attrib></group>
+        <group name="d" size="1"><parameter name="charge">-1</parameter><parameter name="mass">1</parameter>
+        <attrib name="position" datatype="posArray">-0.5 0.1 0.7</attrib></group></particleset>
+      </qmcsystem>)"));
+    REQUIRE(pool.put(xmlFirstElementChild(particle_xml.getRoot())));
+    REQUIRE(pool.put(xmlNextElementSibling(xmlFirstElementChild(particle_xml.getRoot()))));
+    auto& ions = *pool.getParticleSet("ion0");
+    auto& particles = *pool.getParticleSet("e");
+    ions.update();
+    if (model == 1)
+    {
+      particles.R[0] = {0, 1, 0};
+      particles.R[1] = {1, 0, 0};
+    }
+    const std::string coefficients = model == 0 ? "1 0 0  0 1 0  0 0 1" : node_coefficients;
+    REQUIRE(!coefficients.empty());
+    Libxml2Document definition;
+    REQUIRE(definition.parseFromString(std::string{R"(<wavefunction name="psi0" target="e">
+      <sposet_collection type="MolecularOrbital" source="ion0">
+        <basisset keyword="STO" transform="no"><atomicBasisSet type="STO" elementType="Be"
+            angular="cartesian" expandYlm="no" normalized="no">
+          <basisGroup rid="S" n="1" l="0" m="0" type="Slater"><radfunc n="1" exponent="1.2"/></basisGroup>
+          <basisGroup rid="X" n="2" l="1" m="-1" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
+          <basisGroup rid="Y" n="2" l="1" m="0" type="Slater"><radfunc n="2" exponent="1.2"/></basisGroup>
+        </atomicBasisSet></basisset>
+        <rotated_sposet name="rot"><sposet name="base" size="3">
+          <coefficient size="3" id="accepted">)"} + coefficients + R"(</coefficient>
+        </sposet></rotated_sposet>
+      </sposet_collection><determinantset><slaterdeterminant>
+        <determinant sposet="rot"/><determinant sposet="rot"/>
+      </slaterdeterminant></determinantset>
+      <jastrow name="J2" type="Two-Body" function="Bspline">
+        <correlation rcut="4" size="4" speciesA="u" speciesB="d">
+          <coefficients id="ud" type="Array" optimize="yes">0.12 -0.08 0.04 -0.01</coefficients>
+        </correlation>
+      </jastrow></wavefunction>)"));
+    WaveFunctionFactory factory(particles, pool.getPool(), OHMMS::Controller);
+    auto source = factory.buildTWF(definition.getRoot(), RuntimeOptions{});
+    REQUIRE(source);
+    const auto rotated = [](TrialWaveFunction& wf) -> RotatedSPOs& {
+      auto& slater = wf.findSD().front().get();
+      REQUIRE(&slater.getPhi(0) == &slater.getPhi(1));
+      return dynamic_cast<RotatedSPOs&>(slater.getPhi(0));
+    };
+    particles.update();
+    source->evaluateLog(particles);
+    LegacyWaveFunctionAdapter adapter("conventional", *source, adapterOptions());
+    REQUIRE(adapter.snapshotParameters().values.size() == 6);
+    ECPComponentBuilder builder("Be", OHMMS::Controller, 2, 1);
+    const auto asset = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+        "tests/pseudopotentials_for_tests/Be.BFD.xml";
+    REQUIRE(builder.read_pp_file(asset.string()));
+    auto nonlocal = std::make_unique<NonLocalECPotential>(ions, particles, false, true);
+    auto* nl = nonlocal.get();
+    nonlocal->addComponent(0, std::move(builder.pp_nonloc));
+    auto local = std::make_unique<LocalECPotential>(ions, particles);
+    auto* loc = local.get();
+    local->add(0, std::move(builder.pp_loc), builder.Zeff);
+    QMCHamiltonian ham;
+    ham.addOperator(std::make_unique<BareKineticEnergy>(particles), "Kinetic");
+    ham.addOperator(std::make_unique<CoulombPotential>(particles, true, false), "ElecElec");
+    ham.addOperator(std::move(local), "LocalECP");
+    ham.addOperator(std::move(nonlocal), "NonLocalECP");
+    ham.addObservables(particles);
+    StdRandom<QMCTraits::FullPrecRealType> rng(1931);
+    class CountingZeroRandom final : public FakeRandom<QMCTraits::FullPrecRealType>
+    {
+    public:
+      QMCTraits::FullPrecRealType operator()() override { ++draws; return 0; }
+      std::size_t draws = 0;
+    } zero_rng;
+    nl->setRandomGenerator(model == 0 ? static_cast<RandomBase<QMCTraits::FullPrecRealType>*>(&rng) : &zero_rng);
+    ResourceCollection ps_resources("orb_ecp_P"), wf_resources("orb_ecp_WF"), ham_resources("orb_ecp_H");
+    particles.createResource(ps_resources);
+    source->createResource(wf_resources);
+    ham.createResource(ham_resources);
+    const auto positions = particles.R;
+    for (int step = 0; step < (model == 0 ? 3 : 1); ++step)
+    {
+      CAPTURE(step);
+      if (step > 0)
+      {
+        auto candidate = adapter.snapshotParameters();
+        candidate.values[0] += step == 1 ? 0.03 : -0.02;
+        candidate.values[1] += step == 1 ? -0.01 : 0.04;
+        candidate.values[2] += 0.002;
+        adapter.installSnapshot(*source, particles, candidate);
+        adapter.publishParameters(candidate, candidate.version);
+        if (step == 2)
+          CHECK(rotated(*source).fullRotationCoordinates()[2] != 0.0);
+      }
+      const auto snapshot = std::make_shared<const StructuredParameterSnapshot>(adapter.snapshotParameters());
+      const auto source_log = source->getLogPsi();
+      const auto source_energy = kineticEnergy(particles);
+      auto& source_lcao = dynamic_cast<LCAOrbitalSet&>(*rotated(*source).Phi_);
+      const auto source_coefficients = *source_lcao.C;
+      const auto source_reference = source_lcao.originalRotationCoefficients();
+      const auto source_full = rotated(*source).fullRotationCoordinates();
+      ParticleSet private_particles(particles), sibling_particles(particles);
+      auto evaluator = source->makeClone(private_particles), sibling = source->makeClone(sibling_particles);
+      private_particles.update();
+      sibling_particles.update();
+      rotated(*evaluator).isolateOptimizationState();
+      sibling->evaluateLog(sibling_particles);
+      const auto sibling_log = sibling->getLogPsi();
+      const auto sibling_energy = kineticEnergy(sibling_particles);
+      class RecoverableReplay final : public LegacyWaveFunctionReplay
+      {
+      public:
+        RecoverableReplay(TrialWaveFunction& wf, ParticleSet& p) : wf(wf), p(p), positions(p.R) {}
+        std::size_t sampleCount() const noexcept override { return 1; }
+        LegacyWaveFunctionReplaySample prepareSample(std::size_t index) override
+        {
+          if (until_failure == 0) { until_failure = -1; throw std::runtime_error("private replay failure"); }
+          if (until_failure > 0) --until_failure;
+          REQUIRE(index == 0);
+          p.R = positions;
+          p.update();
+          return {wf, p};
+        }
+        int until_failure = -1;
+        TrialWaveFunction& wf;
+        ParticleSet& p;
+        ParticleSet::ParticlePos positions;
+      };
+      auto replay = std::make_shared<RecoverableReplay>(*evaluator, private_particles);
+      auto op = adapter.makeDerivativeOperator(replay, snapshot, 2, 5);
+      auto consumer = adapter.makeNonLocalECPDerivativeConsumer(replay, snapshot, 2, 5);
+      const auto ecp_mask = localEnergyTermBit(LocalEnergyTerm::NONLOCAL_ECP);
+      const auto total_mask = ecp_mask | localEnergyTermBit(LocalEnergyTerm::KINETIC);
+      const std::vector<DerivativeValue> unit{1};
+      const VJPCoefficientChannel capture{"capture", DerivativeProduct::LOCAL_ENERGY_VJP,
+          coefficientsFor(*op, unit), ecp_mask};
+      RecordingParameterSink idle;
+      RefVectorWithLeader<ParticleSet> ps(particles, {particles});
+      RefVectorWithLeader<TrialWaveFunction> wfs(*source, {*source});
+      RefVectorWithLeader<QMCHamiltonian> hs(ham, {ham});
+      QMCHamiltonian::StreamingNonLocalECPResult accepted;
+      {
+        ResourceCollectionTeamLock<ParticleSet> p_lock(ps_resources, ps);
+        ResourceCollectionTeamLock<TrialWaveFunction> w_lock(wf_resources, wfs);
+        ResourceCollectionTeamLock<QMCHamiltonian> h_lock(ham_resources, hs);
+        accepted = QMCHamiltonian::mw_evaluateWithStreamingNonLocalECPDerivatives(hs, wfs, ps, *consumer, {&capture, 1}, idle);
+      }
+      const auto rng_after_capture = rng;
+      const auto zero_draws_after_capture = zero_rng.draws;
+      if (model == 1) CHECK(zero_draws_after_capture > 0);
+      const auto quadrature = nl->captureQuadratureState();
+      auto record = consumer->releaseJVPReplay();
+      REQUIRE(record->gridFingerprint() == accepted.grid_fingerprint);
+      const std::vector<NonLocalECPReplayPoint> points(record->points().begin(), record->points().end());
+      REQUIRE(points.size() >= 2);
+      if (model == 1)
+        REQUIRE(std::any_of(points.begin(), points.end(), [](const auto& point) { return point.complete_ratio == DerivativeValue{}; }));
+      op->bindNonLocalECPJVPReplay(std::move(record));
+      CHECK(op->storageDiagnostics().real_parameter_vectors == 2);
+      const double fixed_potential = loc->evaluate(particles) + 1.0 / std::sqrt(dot(positions[0] - positions[1], positions[0] - positions[1]));
+      // Independent signed complete-ratio FD oracle uses ordinary proposed
+      // moves and rejects them, never a virtual-point inverse/logarithm.
+      const auto fixed_grid_energy = [&](const StructuredParameterSnapshot& candidate, bool kinetic) {
+        ParticleSet p(particles);
+        auto wf = source->makeClone(p);
+        p.update();
+        rotated(*wf).isolateOptimizationState();
+        adapter.installSnapshot(*wf, p, candidate);
+        DerivativeValue energy = kinetic ? kineticEnergy(p) + fixed_potential : DerivativeValue{};
+        for (const auto& point : points)
+        {
+          auto replacement = p.R[point.electron];
+          for (int d = 0; d < 3; ++d) replacement[d] = point.replacement_position[d];
+          p.makeMove(point.electron, replacement - p.R[point.electron]);
+          energy += point.bare_weight * derivativeValue(wf->calcRatio(p, point.electron));
+          wf->rejectMove(point.electron);
+          p.rejectMove(point.electron);
+        }
+        return energy;
+      };
+      CHECK(fixed_grid_energy(*snapshot, true).real() == Catch::Approx(accepted.local_energies[0]).epsilon(3e-12).margin(3e-12));
+      const auto reference_log = [&](const StructuredParameterSnapshot& candidate) {
+        ParticleSet p(particles);
+        auto wf = source->makeClone(p);
+        p.update();
+        rotated(*wf).isolateOptimizationState();
+        adapter.installSnapshot(*wf, p, candidate);
+        return wf->getLogPsi();
+      };
+      const std::array<VJPCoefficientChannel, 3> channels{{
+          {"total", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), total_mask},
+          {"ecp", DerivativeProduct::LOCAL_ENERGY_VJP, coefficientsFor(*op, unit), ecp_mask},
+          {"score", DerivativeProduct::SCORE_VJP, coefficientsFor(*op, unit), 0}}};
+      RecordingParameterSink rows, hermitian;
+      op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, rows);
+      op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::HERMITIAN, hermitian);
+      std::vector<DerivativeValue> direction(snapshot->values.size());
+      DerivativeValue dual{}, score_dual{};
+      for (std::size_t parameter = 0; parameter < snapshot->values.size(); ++parameter)
+      {
+        CAPTURE(parameter);
+        auto plus = *snapshot, minus = *snapshot;
+        plus.values[parameter] += 1e-5;
+        minus.values[parameter] -= 1e-5;
+        for (int channel = 0; channel < 2; ++channel)
+        {
+          const auto fd = (fixed_grid_energy(plus, channel == 0) - fixed_grid_energy(minus, channel == 0)) / 2e-5;
+          CHECK(rows.result()[channel][parameter].real() == Catch::Approx(fd.real()).epsilon(3e-6).margin(3e-8));
+          checkClose(hermitian.result()[channel][parameter], std::conj(rows.result()[channel][parameter]));
+        }
+        CHECK(rows.result()[2][parameter].real() ==
+              Catch::Approx((reference_log(plus) - reference_log(minus)) / 2e-5).epsilon(3e-6).margin(3e-8));
+        direction[parameter] = 0.1 * (parameter + 1);
+        dual += direction[parameter] * rows.result()[0][parameter];
+        score_dual += direction[parameter] * rows.result()[2][parameter];
+      }
+      if (model == 1)
+      {
+        // The zero-ratio knot itself contributes a finite NONZERO derivative.
+        const auto zero = std::find_if(points.begin(), points.end(), [](const auto& p) { return p.complete_ratio == DerivativeValue{}; });
+        replay->prepareSample(0);
+        adapter.installSnapshot(*evaluator, private_particles, *snapshot);
+        SPOSet::ValueVector reference(3), replacement(3), derivative(snapshot->values.size());
+        rotated(*evaluator).Phi_->evaluateValue(private_particles, zero->electron, reference);
+        for (int d = 0; d < 3; ++d) private_particles.R[zero->electron][d] = zero->replacement_position[d];
+        private_particles.update();
+        rotated(*evaluator).Phi_->evaluateValue(private_particles, zero->electron, replacement);
+        derivative = 0;
+        CHECK(rotated(*evaluator).evaluateOneOccupiedRatioDerivatives(reference, replacement, adapter.registrationVariables(), derivative) == 0);
+        CHECK(std::abs(derivative[0]) > 1e-8);
+        reference[0] = std::numeric_limits<double>::quiet_NaN();
+        CHECK_THROWS(rotated(*evaluator).evaluateOneOccupiedRatioDerivatives(reference, replacement, adapter.registrationVariables(), derivative));
+        reference = 0;
+        replacement = 0;
+        derivative = 0;
+        reference[0] = 0.5;
+        replacement[1] = std::numeric_limits<double>::max() / 2;
+        derivative[0] = std::numeric_limits<double>::max();
+        CHECK_THROWS(rotated(*evaluator).evaluateOneOccupiedRatioDerivatives(reference, replacement, adapter.registrationVariables(), derivative));
+      }
+      StructuredParameterVectorConstView vector(adapter.parameterSchema(), snapshot->version, {direction.data(), direction.size()});
+      RecordingSampleSink first, second, score;
+      op->applyLocalEnergyJVP(vector, total_mask, first);
+      op->applyLocalEnergyJVP(vector, total_mask, second);
+      op->applyScoreJVP(vector, score);
+      checkClose(first.result()[0], dual);
+      checkClose(score.result()[0], score_dual);
+      CHECK(first.result() == second.result());
+      replay->until_failure = 2;
+      RecordingParameterSink failed, recovered;
+      CHECK_THROWS_WITH(op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, failed),
+                        Catch::Matchers::ContainsSubstring("private replay failure"));
+      CHECK(failed.state() == DerivativeSinkState::POISONED);
+      op->applyVJPs({channels.data(), channels.size()}, DerivativeAdjoint::TRANSPOSE, recovered);
+      CHECK(recovered.result() == rows.result());
+      auto expected_rng = rng_after_capture;
+      CHECK(rng() == expected_rng());
+      CHECK(zero_rng.draws == zero_draws_after_capture);
+      CHECK(nl->captureQuadratureState().coordinates == quadrature.coordinates);
+      source->evaluateLog(particles);
+      sibling->evaluateLog(sibling_particles);
+      CHECK(source->getLogPsi() == source_log);
+      CHECK(kineticEnergy(particles) == source_energy);
+      CHECK(sibling->getLogPsi() == sibling_log);
+      CHECK(kineticEnergy(sibling_particles) == sibling_energy);
+      CHECK(*source_lcao.C == source_coefficients);
+      CHECK(source_lcao.originalRotationCoefficients() == source_reference);
+      CHECK(rotated(*source).fullRotationCoordinates() == source_full);
+      for (int e = 0; e < 2; ++e)
+        for (int d = 0; d < 3; ++d) CHECK(particles.R[e][d] == positions[e][d]);
+    }
+  }
+}
+
 TEST_CASE("external LCAO file-image reader and bounded products", "[legacy_adapter][external_lcao]")
 {
   ParticleSetPool pool(OHMMS::Controller);

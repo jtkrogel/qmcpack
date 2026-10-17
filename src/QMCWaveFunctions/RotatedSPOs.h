@@ -132,6 +132,12 @@ public:
    */
   void adoptPreparedRotationState(RotatedSPOs& prepared, const RotatedSPOs& canonical_bank) noexcept;
   const std::vector<ValueType>& fullRotationCoordinates() const noexcept { return myVarsFull_; }
+  /// One occupied real CPU orbital: ratio derivatives use only the reference
+  /// denominator, including when the replacement occupied value is exactly zero.
+  ValueType evaluateOneOccupiedRatioDerivatives(const ValueVector& reference,
+                                              const ValueVector& replacement,
+                                              const OptVariables& active,
+                                              ValueVector& output) const;
   /// Private evaluator only; install complete history and matching active values without a delta.
   void restoreFullRotationState(const std::vector<ValueType>& full, const OptVariables& expected_active);
 
